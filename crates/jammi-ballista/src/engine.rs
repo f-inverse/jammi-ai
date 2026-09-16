@@ -104,9 +104,7 @@ pub fn stage_device_kind(plan: &Arc<dyn ExecutionPlan>) -> Option<ComputeDeviceK
     if let Some(exec) = plan.downcast_ref::<InferenceExec>() {
         return Some(exec.device_kind());
     }
-    plan.children()
-        .into_iter()
-        .find_map(stage_device_kind)
+    plan.children().into_iter().find_map(stage_device_kind)
 }
 
 impl ExecutionEngine for JammiExecutionEngine {

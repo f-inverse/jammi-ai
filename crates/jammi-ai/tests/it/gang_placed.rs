@@ -25,10 +25,10 @@ use jammi_ai::fine_tune::worker::{training_test_hooks, JobWorker, PlacedGangSubm
 use jammi_ai::operator::gang_exec::{GangDescriptor, PlacedOutcome};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::Catalog;
-use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_db::config::JammiConfig;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::store::manifest::ComputeDeviceKind;
 use tempfile::TempDir;
 
 use crate::common;

@@ -157,7 +157,10 @@ async fn refuses_a_gang_exec_stage_whose_descriptor_names_a_different_device_kin
         )
         .expect_err("a device-kind mismatch on a GangExec must be refused, never silently run");
     let msg = err.to_string();
-    assert!(msg.contains("K7"), "the refusal must name the property: {msg}");
+    assert!(
+        msg.contains("K7"),
+        "the refusal must name the property: {msg}"
+    );
     assert!(msg.contains("Cuda") && msg.contains("Cpu"), "{msg}");
 }
 

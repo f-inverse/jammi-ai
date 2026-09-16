@@ -329,6 +329,7 @@ impl WorkerProc {
 pub struct Fleet {
     workers: Vec<WorkerProc>,
     backends_for_respawn: (String, String), // (pg_url snapshot unused placeholder)
+    run_id: String,
 }
 
 impl Fleet {
@@ -359,6 +360,7 @@ impl Fleet {
         Self {
             workers,
             backends_for_respawn: (String::new(), String::new()),
+            run_id,
         }
     }
 
@@ -369,6 +371,21 @@ impl Fleet {
     /// The `i`-th spawned worker's label (0-indexed), in spawn order.
     pub fn label(&self, i: usize) -> &str {
         self.workers[i].label.as_str()
+    }
+
+    /// Spawn ONE more process into this already-running fleet, labelled
+    /// with the SAME run id (`lane-{run_id}-{n}`, `n` continuing the
+    /// existing sequence) — a LATE-joining process (e.g. a5's independent
+    /// reclaimer), added only after the earlier processes' own claim/
+    /// placement race has already resolved, so it plays no part in that
+    /// race. Returns the new process's own index (for `Fleet::label`).
+    pub fn spawn_more(&mut self, backends: &Backends, result_root: &str, spec: ProcSpec) -> usize {
+        let exe = jammi_server_binary();
+        let idx = self.workers.len();
+        let label = format!("lane-{}-{}", self.run_id, idx + 1);
+        self.workers
+            .push(spawn_one(&exe, backends, result_root, &label, spec));
+        idx
     }
 
     pub fn scheduler_url_of(&self, label: &str) -> String {
@@ -403,7 +420,8 @@ impl Fleet {
     /// process's listener is released). Used by (b1). The replacement is a
     /// freshly-minted instance (a new `instances` row): `instance_id` is
     /// minted at session construction, never externally supplied
-    /// (`crates/jammi-ai/src/session.rs:464`), so a killed-then-respawned
+    /// (`instance_id`, crates/jammi-ai/src/session.rs:468), so a
+    /// killed-then-respawned
     /// process cannot literally keep the OLD instance id — (b1)'s own
     /// assertion (contract acceptance list) only needs the OTHER executors'
     /// registrations and the job status rows to survive, which the shared
@@ -592,7 +610,10 @@ pub async fn await_condition(timeout: Duration, mut predicate: impl FnMut() -> b
 /// Build the harness's own observer session against the shared Postgres +
 /// MinIO, rooted at `result_root`. `[worker] enabled = false`: it only
 /// submits and observes.
-pub async fn harness_session(backends: &Backends, result_root: &str) -> (Arc<InferenceSession>, TempDir) {
+pub async fn harness_session(
+    backends: &Backends,
+    result_root: &str,
+) -> (Arc<InferenceSession>, TempDir) {
     let dir = TempDir::new().expect("harness artifact_dir");
     let config = JammiConfig {
         artifact_dir: dir.path().to_path_buf(),
@@ -686,7 +707,16 @@ impl JobSize {
     fn epochs(self) -> usize {
         match self {
             JobSize::Quick => 3,
-            JobSize::Crashable => 60,
+            // The placed path (a working Ballista fleet, unlike a plain
+            // in-process claim) resolves the placement round-trip almost
+            // instantly on localhost — 60 epochs of `tiny_bert` LoRA
+            // completed in under the harness's own detect+kill window
+            // (executed: a5 read a single-entry `claimed_by` sequence,
+            // meaning the job finished before the kill landed). 900
+            // epochs gives real margin under `TERMINAL_TIMEOUT` while
+            // still comfortably shorter than the reclaim's own lease
+            // window once killed.
+            JobSize::Crashable => 900,
         }
     }
 }

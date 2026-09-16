@@ -2214,13 +2214,25 @@ impl JobWorker {
             // `InferenceExec`.
             device_kind: session.compute_device().kind(),
         };
+        // JobRun -> Awaiting BEFORE the plan crosses the wire, never after
+        // `submit()` resolves (LANE pressure-round finding, executed:
+        // when the submitter's own host ALSO hosts the scheduler role —
+        // `roles::host_scheduler`'s in-process case, exercised end-to-end
+        // by `crates/jammi-ballista/tests/distributed`'s (a4)/(a5)) — the
+        // scheduler's own binder can dispatch the task and the placed
+        // executor can dial this host's RunRank BEFORE `submitter.submit`'s
+        // async call returns to this line, since the round-trip and the
+        // scheduler's background bind loop share the same process/runtime.
+        // Awaiting was found still refusing every dial with "this host's
+        // job slot is busy" (`Holder::JobRun`, `admit_rank`'s busy arm) —
+        // red until this line moved ahead of the submit call.
+        session
+            .host_admission()
+            .begin_awaiting_placement(job_id, attempt);
         let mut stream = match submitter.submit(descriptor).await {
             Ok(stream) => stream,
             Err(e) => return Err(self.placed_submit_end(catalog, job_id, e).await),
         };
-        session
-            .host_admission()
-            .begin_awaiting_placement(job_id, attempt);
         use futures::StreamExt;
         let mut saw_batch = false;
         let mut end_err: Option<JammiError> = None;
@@ -2243,7 +2255,10 @@ impl JobWorker {
             // which a multi-process harness cannot read) can confirm this
             // process ran `run_placed_gang`/`submit_placed` and handed off.
             tracing::info!(
-                job_id, attempt, world, "run_placed_gang: submitter HandedOff after the placed \
+                job_id,
+                attempt,
+                world,
+                "run_placed_gang: submitter HandedOff after the placed \
                  gang's stream completed"
             );
             return Err(WorkerJobError::HandedOff);

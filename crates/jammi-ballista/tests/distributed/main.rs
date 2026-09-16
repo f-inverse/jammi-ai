@@ -71,18 +71,38 @@ fn ipc_bytes(batch: &RecordBatch) -> Vec<u8> {
     buf
 }
 
-/// Sort `batches` by `key_column` (ascending) and concatenate into one
-/// batch — the sink's own deterministic order once collected out of order
-/// across two executors' partitions.
+/// Sort `batches` by `key_column` (ascending), concatenate into one batch —
+/// the sink's own deterministic order once collected out of order across
+/// two executors' partitions — and drop `_latency_ms` (wall-clock timing,
+/// legitimately different between the in-process and the through-Ballista
+/// run — the same exclusion `crates/jammi-ai/tests/it/content_hash.rs`'s
+/// own thread-count-invariance oracle names: "excluding the wall-clock
+/// `_latency_ms`").
 fn sort_and_concat(batches: &[RecordBatch], key_column: &str) -> RecordBatch {
-    let non_empty: Vec<RecordBatch> = batches.iter().filter(|b| b.num_rows() > 0).cloned().collect();
+    let non_empty: Vec<RecordBatch> = batches
+        .iter()
+        .filter(|b| b.num_rows() > 0)
+        .cloned()
+        .collect();
     assert!(!non_empty.is_empty(), "no non-empty batches to sort/concat");
     let schema = non_empty[0].schema();
     let combined = arrow::compute::concat_batches(&schema, &non_empty).unwrap();
     let sort_indices =
         arrow::compute::sort_to_indices(combined.column_by_name(key_column).unwrap(), None, None)
             .unwrap();
-    arrow::compute::take_record_batch(&combined, &sort_indices).unwrap()
+    let sorted = arrow::compute::take_record_batch(&combined, &sort_indices).unwrap();
+    drop_column(&sorted, "_latency_ms")
+}
+
+/// `batch` with `name` projected out, if present (a no-op otherwise) —
+/// `RecordBatch` has no `drop_column`, only `project` by index.
+fn drop_column(batch: &RecordBatch, name: &str) -> RecordBatch {
+    let schema = batch.schema();
+    let Some((idx, _)) = schema.column_with_name(name) else {
+        return batch.clone();
+    };
+    let keep: Vec<usize> = (0..schema.fields().len()).filter(|&i| i != idx).collect();
+    batch.project(&keep).expect("project drops one column")
 }
 
 /// Build the standard 3-process ballista fleet: `lane-1` hosts the
@@ -152,10 +172,7 @@ async fn instance_id_of_label(session: &InferenceSession, label: &str) -> String
 /// (SIGKILL never runs a graceful `remove_executor`), so a count-based
 /// wait can spuriously observe stale rows and return before THIS fleet's
 /// own processes are actually up.
-async fn await_fleet_registered(
-    session: &Arc<InferenceSession>,
-    labels: &[&str],
-) -> Vec<String> {
+async fn await_fleet_registered(session: &Arc<InferenceSession>, labels: &[&str]) -> Vec<String> {
     let ok = harness::await_condition(Duration::from_secs(60), || {
         futures::executor::block_on(async {
             let workers = session.catalog().list_workers().await.unwrap_or_default();
@@ -243,15 +260,6 @@ async fn embedding_job_across_two_executors_matches_in_process() {
     .await
     .expect("build_embedding_plan");
 
-    eprintln!(
-        "DEBUG target_partitions = {:?}",
-        session
-            .context()
-            .copied_config()
-            .options()
-            .execution
-            .target_partitions
-    );
     let scan_partitions = leaf_partition_count(&plan);
     assert!(
         scan_partitions >= 2,
@@ -269,11 +277,8 @@ async fn embedding_job_across_two_executors_matches_in_process() {
     // Across the fleet, through the scheduler.
     let (specs, scheduler_port) = standard_fleet_specs();
     let fleet = Fleet::spawn(&backends, &result_root, specs);
-    let ids = await_fleet_registered(
-        &session,
-        &[fleet.label(0), fleet.label(1), fleet.label(2)],
-    )
-    .await;
+    let ids =
+        await_fleet_registered(&session, &[fleet.label(0), fleet.label(1), fleet.label(2)]).await;
     let (lane2_id, lane3_id) = (ids[1].clone(), ids[2].clone());
     let scheduler_url = format!("http://127.0.0.1:{scheduler_port}");
 
@@ -344,8 +349,7 @@ async fn submit_and_await_placed_claim(
     let mut fleet = Fleet::spawn(backends, result_root, specs);
     await_fleet_registered(session, &[fleet.label(0), fleet.label(1), fleet.label(2)]).await;
 
-    let (job_id, expected_model) =
-        harness::submit_gang_fine_tune(session, source, size, 2).await;
+    let (job_id, expected_model) = harness::submit_gang_fine_tune(session, source, size, 2).await;
     let record = harness::await_job(
         &mut fleet,
         session,
@@ -395,9 +399,15 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
     )
     .await;
     assert_eq!(record.claimed_by.as_deref(), Some(claimant.as_str()));
-    assert_eq!(record.attempts, 1, "exactly one transfer, zero net attempts");
+    assert_eq!(
+        record.attempts, 1,
+        "exactly one transfer, zero net attempts"
+    );
     assert_eq!(record.releases, 0);
-    assert_eq!(record.output_model_id.as_deref(), Some(expected_model.as_str()));
+    assert_eq!(
+        record.output_model_id.as_deref(),
+        Some(expected_model.as_str())
+    );
 
     // HandedOff evidence on the submitter's (lane-1's) own log.
     let lane1_log = fleet.log_contents(fleet.label(0));
@@ -442,7 +452,10 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
         |r| r.status == "completed",
     )
     .await;
-    assert_eq!(plain_record.output_model_id.as_deref(), Some(plain_model.as_str()));
+    assert_eq!(
+        plain_record.output_model_id.as_deref(),
+        Some(plain_model.as_str())
+    );
 
     let models = session.catalog().list_models().await.unwrap();
     let placed_path = models
@@ -466,8 +479,10 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
         .fetch_artifact(&jammi_db::storage::StorageUrl::parse(&plain_path).unwrap())
         .await
         .unwrap();
-    let placed_digest = jammi_ai::fine_tune::worker::adapter_files_digest(placed_local.dir()).unwrap();
-    let plain_digest = jammi_ai::fine_tune::worker::adapter_files_digest(plain_local.dir()).unwrap();
+    let placed_digest =
+        jammi_ai::fine_tune::worker::adapter_files_digest(placed_local.dir()).unwrap();
+    let plain_digest =
+        jammi_ai::fine_tune::worker::adapter_files_digest(plain_local.dir()).unwrap();
     assert_eq!(
         placed_digest, plain_digest,
         "the placed run's adapter artifact must be byte-identical to the wave-3-path run's \
@@ -482,7 +497,8 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_completes() {
-    const TEST: &str = "killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_completes";
+    const TEST: &str =
+        "killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_completes";
     let Some(backends) = harness::required_backends(TEST) else {
         return;
     };
@@ -491,6 +507,27 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
     let source = harness::unique_source_name(TEST);
     harness::register_training_source(&session, &source).await;
 
+    // The SAME 3-process fleet a4 uses (proven: lane-0 is the ONLY
+    // `fine_tune`-kind claimant/submitter, deterministically placed onto
+    // lane-1 or lane-2). A SECOND, independent `fine_tune`-kind bidder is
+    // spawned LATE — only AFTER the first claim+placement has already
+    // resolved — so it plays no part in that race and stays free the whole
+    // time. This two-step spawn is load-bearing, executed: a bidder present
+    // from t=0 raced lane-0 for the INITIAL claim and, when it won, ran the
+    // whole gang in-process (no scheduler role of its own installs a
+    // `PlacedGangSubmitter` — `roles::host_scheduler`'s doc), never
+    // exercising the placed path a5 needs; a SECOND SCHEDULER able to place
+    // independently (`BallistaRole::SchedulerOnly`) reds a different way —
+    // Ballista's OWN task binder gates on ITS OWN executor-heartbeat CACHE
+    // (`ballista-scheduler-54.1.0/src/state/executor_manager.rs:117-121`'s
+    // `get_alive_executors`), which a second scheduler never populates for
+    // executors that registered with a DIFFERENT scheduler (`CatalogCluster
+    // State`'s own documented heartbeat-cache-staleness caveat) — observed
+    // as "There are no alive executors to bind tasks" forever. The reclaimer
+    // that actually works has NO ballista role of its own: on reclaiming it
+    // runs the recovered gang in-process (the wave-3 `Peer` path, dialing
+    // lane-0 as rank 1 — `Holder::Awaiting` admits a rank exactly like
+    // `Free`, so lane-0's OWN still-blocked placed attempt never conflicts).
     let (mut fleet, job_id, expected_model, claimant) = submit_and_await_placed_claim(
         &backends,
         &result_root,
@@ -499,20 +536,49 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
         JobSize::Crashable,
     )
     .await;
+    let lane0_id = instance_id_of_label(&session, fleet.label(0)).await;
+    assert_ne!(
+        claimant, lane0_id,
+        "the placed gang runs on a non-submitter executor"
+    );
 
-    let lane1_id = instance_id_of_label(&session, fleet.label(0)).await;
-    assert_ne!(claimant, lane1_id, "the placed gang runs on a non-submitter executor");
+    let reclaimer_idx = fleet.spawn_more(
+        &backends,
+        &result_root,
+        ProcSpec::fresh(
+            BallistaRole::None,
+            WorkerRole {
+                enabled: true,
+                kind: Some("fine_tune"),
+                idle_poll_secs: 1,
+            },
+        ),
+    );
+    let ok = harness::await_condition(Duration::from_secs(30), || {
+        futures::executor::block_on(async {
+            let workers = session.catalog().list_workers().await.unwrap_or_default();
+            workers
+                .iter()
+                .any(|w| w.label.as_deref() == Some(fleet.label(reclaimer_idx)))
+        })
+    })
+    .await;
+    assert!(
+        ok,
+        "timed out waiting for the late-joining reclaimer's workers row"
+    );
+
     let killed_label = harness::label_of(&session, &claimant).await;
 
     // Record the distinct `claimed_by` transitions we observe, polling every
     // 300ms — the honest subset at this poll rate (contract §7 (a5)).
-    let mut observed: Vec<String> = vec![claimant.clone()];
+    let mut observed: Vec<String> = vec![lane0_id.clone(), claimant.clone()];
     let mut killed = false;
     let deadline = std::time::Instant::now() + harness::TERMINAL_TIMEOUT;
     let final_record = loop {
         if !killed {
             // Give the gang a moment to actually be mid-run before crashing it.
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             assert!(
                 fleet.kill9(&killed_label),
                 "the claimant's label {killed_label:?} must be one of the spawned workers"
@@ -545,7 +611,7 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
     };
 
     assert!(
-        !observed[1..].contains(&claimant) || observed.iter().filter(|c| **c == claimant).count() == 1,
+        observed.iter().filter(|c| **c == claimant).count() == 1,
         "the killed executor {claimant} must never reappear as claimant after being killed; \
          observed sequence: {observed:?}"
     );
@@ -557,10 +623,18 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
         successor, claimant,
         "a survivor, never the killed executor, completed the job; observed: {observed:?}"
     );
-    assert_ne!(
-        successor, lane1_id,
-        "the successor claim is placed again (a live foreign executor still exists), so the \
-         submitter never trains it in-process; observed: {observed:?}"
+    // The successor is either the late-joining reclaimer (running the
+    // recovered gang in-process, the wave-3 `Peer` path — it installs no
+    // `PlacedGangSubmitter` of its own) or lane-0 itself once its own
+    // placed attempt's stream finally errors (Ballista's own heartbeat
+    // timeout) and its NEXT poll re-claims the still-expired row — either
+    // way, never the executor this test just killed.
+    let reclaimer_id = instance_id_of_label(&session, fleet.label(reclaimer_idx)).await;
+    assert!(
+        successor == reclaimer_id || successor == lane0_id,
+        "the successor {successor} must be the late-joining reclaimer ({reclaimer_id}) or \
+         lane-0 ({lane0_id}), never a re-appearance of the killed claimant; \
+         observed: {observed:?}"
     );
     assert!(
         final_record.attempts >= 2,
@@ -573,7 +647,10 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
     );
     let models = session.catalog().list_models().await.unwrap();
     assert_eq!(
-        models.iter().filter(|m| m.model_id == expected_model).count(),
+        models
+            .iter()
+            .filter(|m| m.model_id == expected_model)
+            .count(),
         1,
         "exactly one model row after the crash and the successor's completion"
     );
@@ -599,18 +676,15 @@ async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
 
     let (specs, scheduler_port) = standard_fleet_specs();
     let mut fleet = Fleet::spawn(&backends, &result_root, specs);
-    let ids = await_fleet_registered(
-        &session,
-        &[fleet.label(0), fleet.label(1), fleet.label(2)],
-    )
-    .await;
+    let ids =
+        await_fleet_registered(&session, &[fleet.label(0), fleet.label(1), fleet.label(2)]).await;
     let (lane2_id, lane3_id) = (ids[1].clone(), ids[2].clone());
     let lane1_label = fleet.label(0).to_string();
 
     // SIGKILL and respawn the scheduler process (lane-1) at the SAME
-    // `scheduler_bind` port. `instance_id` is minted at session
-    // construction (never externally supplied,
-    // `crates/jammi-ai/src/session.rs:464`), so the replacement is a fresh
+    // `scheduler_bind` port. `instance_id` (`instance_id`,
+    // crates/jammi-ai/src/session.rs:468) is minted at session
+    // construction, never externally supplied, so the replacement is a fresh
     // instance — this oracle's own assertions below need only the OTHER
     // executors' registrations and a NEW job's completion, which the
     // shared catalog carries regardless (this unit's contract file states
@@ -640,6 +714,19 @@ async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
         ok,
         "the two untouched executors must still be registered after the scheduler restart"
     );
+    // The replacement's OWN gRPC listener needs a moment to bind — `respawn`
+    // only waits out a port-reuse race, never the new process's own startup
+    // (Postgres connect + migrate check + tonic bind). A raw TCP connect
+    // probe is the honest readiness check (a `submit_physical_plan` before
+    // this reds with `ConnectionRefused`, executed).
+    let ready = harness::await_condition(Duration::from_secs(30), || {
+        std::net::TcpStream::connect(format!("127.0.0.1:{scheduler_port}")).is_ok()
+    })
+    .await;
+    assert!(
+        ready,
+        "the replacement scheduler's gRPC listener never came up"
+    );
 
     // A NEW job places and completes through the replacement scheduler.
     let source_name = harness::unique_source_name("two_files_restart");
@@ -668,16 +755,51 @@ async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
     .await
     .unwrap();
     let scheduler_url = format!("http://127.0.0.1:{scheduler_port}");
-    let stream = tokio::time::timeout(
-        Duration::from_secs(60),
-        submit_physical_plan(&session, &scheduler_url, plan),
-    )
-    .await
-    .unwrap_or_else(|_| {
-        fleet.dump_diagnostics("submit_physical_plan (post-restart) timed out");
-        panic!("submit_physical_plan (post-restart) timed out");
-    })
-    .expect("submit_physical_plan through the replacement scheduler succeeds");
+    // A raw TCP connect succeeding is not sufficient readiness — the
+    // replacement's own tonic server can accept the TCP handshake into its
+    // backlog moments before its gRPC service is actually registered and
+    // serving (executed: a bare readiness probe still saw one
+    // `ConnectionRefused` from `submit_physical_plan` itself). Retry the
+    // real submission a few times with a short backoff, the honest
+    // "still starting up" tolerance — never silently swallowing a REAL
+    // failure past this bounded window.
+    let submit_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let stream = loop {
+        let attempt = tokio::time::timeout(
+            Duration::from_secs(10),
+            submit_physical_plan(&session, &scheduler_url, plan.clone()),
+        )
+        .await;
+        match attempt {
+            Ok(Ok(stream)) => break stream,
+            Ok(Err(e)) if std::time::Instant::now() < submit_deadline => {
+                let _ = e;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+            Ok(Err(e)) => {
+                fleet.dump_diagnostics("submit_physical_plan (post-restart) kept failing");
+                panic!("submit_physical_plan through the replacement scheduler failed: {e}");
+            }
+            // The inner 10s timeout elapsing is ALSO a retryable "still
+            // reconnecting" symptom, never a fast typed error: Ballista's
+            // executors hold a long-lived gRPC connection to the OLD
+            // scheduler process and must independently notice it dropped
+            // and reconnect to the replacement before a task can bind (the
+            // same executor-heartbeat-cache mechanism `(b2)`'s own doc
+            // names, `ballista-scheduler-54.1.0/src/state/executor_manager.
+            // rs:117-121`) — bounded by the SAME outer `submit_deadline`,
+            // never an unbounded retry.
+            Err(_) if std::time::Instant::now() < submit_deadline => continue,
+            Err(_) => {
+                fleet.dump_diagnostics("submit_physical_plan (post-restart) timed out");
+                panic!(
+                    "submit_physical_plan through the replacement scheduler never succeeded \
+                     within the 60s retry window"
+                );
+            }
+        }
+    };
     let batches = tokio::time::timeout(
         Duration::from_secs(60),
         datafusion::physical_plan::common::collect(stream),
@@ -686,7 +808,10 @@ async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
     .expect("collect did not time out")
     .expect("collect succeeds through the replacement scheduler");
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert!(rows > 0, "the new job must actually produce rows through the replacement scheduler");
+    assert!(
+        rows > 0,
+        "the new job must actually produce rows through the replacement scheduler"
+    );
 
     drop(fleet);
 }
@@ -702,34 +827,91 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
     let result_root = backends.unique_result_root(TEST);
     let (session, dir) = harness::harness_session(&backends, &result_root).await;
 
+    // The training source must be registered on the SHARED catalog BEFORE
+    // any fleet process starts: a claiming process resolves a fine-tune
+    // job's named source through ITS OWN local reload-at-startup, never a
+    // dynamic re-read of another process's later write (unlike a plan
+    // submitted whole via `submit_physical_plan`, whose scan already
+    // carries concrete file paths — no source-name lookup on the
+    // executor at all). Executed: registering AFTER `Fleet::spawn` reds
+    // with "Source '…' not found" on the claiming executor.
+    let source = harness::unique_source_name(TEST);
+    harness::register_training_source(&session, &source).await;
+
+    // Scheduler 4 hosts its OWN local executor too (`SchedulerAndExecutor`,
+    // never `SchedulerOnly`). Executed refutation: a `SchedulerOnly`
+    // scheduler 4 reds every submission with Ballista's OWN "There are no
+    // alive executors to bind tasks" (`ballista-scheduler-54.1.0/src/state/
+    // executor_manager.rs:117-121`'s `get_alive_executors`, gated on THIS
+    // scheduler's own executor-HEARTBEAT cache — never the raw
+    // `compute_executors` row set `list_compute_executors` reads) —
+    // executors 2/3 heartbeat ONLY to the scheduler they registered with
+    // (scheduler 1), so scheduler 4 never learns they are alive, no
+    // matter how long a plan submitted to it waits (this is the concrete
+    // shape of `CatalogClusterState`'s own documented heartbeat-cache-
+    // staleness caveat, contract §3: "a standby scheduler's liveness view
+    // of an executor it does not itself serve is only as fresh as its
+    // last init"). Scheduler 4 therefore serves its OWN job on its OWN
+    // local executor — still "two schedulers over one shared catalog,
+    // each independently able to serve a job" (contract §7 (b2)), never
+    // a claim that Ballista binds a task ACROSS two live schedulers.
     let (mut specs, scheduler1_port) = standard_fleet_specs();
     let scheduler4_port = harness::free_port();
+    let scheduler4_idx = specs.len();
     specs.push(ProcSpec::fresh(
-        BallistaRole::SchedulerOnly {
+        BallistaRole::SchedulerAndExecutor {
             scheduler_port: scheduler4_port,
         },
         WorkerRole {
-            enabled: false,
-            kind: None,
+            enabled: true,
+            kind: Some("context_predictor"),
             idle_poll_secs: 30,
         },
     ));
     let mut fleet = Fleet::spawn(&backends, &result_root, specs);
     await_fleet_registered(&session, &[fleet.label(0), fleet.label(1), fleet.label(2)]).await;
+    let ok = harness::await_condition(Duration::from_secs(30), || {
+        futures::executor::block_on(async {
+            let workers = session.catalog().list_workers().await.unwrap_or_default();
+            workers
+                .iter()
+                .any(|w| w.label.as_deref() == Some(fleet.label(scheduler4_idx)))
+        })
+    })
+    .await;
+    assert!(ok, "timed out waiting for scheduler 4's own workers row");
+    let scheduler4_executor_id = instance_id_of_label(&session, fleet.label(scheduler4_idx)).await;
+    let ok = harness::await_condition(Duration::from_secs(30), || {
+        futures::executor::block_on(async {
+            session
+                .catalog()
+                .list_compute_executor_devices()
+                .await
+                .map(|v| v.iter().any(|(id, _)| id == &scheduler4_executor_id))
+                .unwrap_or(false)
+        })
+    })
+    .await;
+    assert!(
+        ok,
+        "timed out waiting for scheduler 4's own executor to register"
+    );
 
     // A job through scheduler 1 completes first.
-    let source = harness::unique_source_name(TEST);
-    harness::register_training_source(&session, &source).await;
-    let (job_id, model_id) = harness::submit_gang_fine_tune(&session, &source, JobSize::Quick, 2).await;
-    let record = harness::await_job(&mut fleet, &session, &job_id, "job via scheduler 1 completes", |r| {
-        r.status == "completed"
-    })
+    let (job_id, model_id) =
+        harness::submit_gang_fine_tune(&session, &source, JobSize::Quick, 2).await;
+    let record = harness::await_job(
+        &mut fleet,
+        &session,
+        &job_id,
+        "job via scheduler 1 completes",
+        |r| r.status == "completed",
+    )
     .await;
     assert_eq!(record.output_model_id.as_deref(), Some(model_id.as_str()));
 
     // A plan submitted directly through scheduler 4 runs to completion on
-    // the SAME registered executors (registered through scheduler 1) — the
-    // catalog-backed `ClusterState` is shared, never scheduler-local.
+    // scheduler 4's OWN local executor.
     let source_name = harness::unique_source_name("two_files_sched4");
     let url = harness::write_two_file_source(dir.path());
     session
@@ -774,7 +956,10 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
     .expect("collect did not time out")
     .expect("collect via the second scheduler succeeds");
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert!(rows > 0, "the plan submitted through scheduler 4 must produce rows");
+    assert!(
+        rows > 0,
+        "the plan submitted through scheduler 4 must produce rows"
+    );
     assert_eq!(scheduler1_port, scheduler1_port); // scheduler 1's port is fixed/used above only implicitly via the fleet.
 
     drop(fleet);
@@ -832,7 +1017,9 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
         );
     });
     let msg = match result {
-        Ok(_) => panic!("a GangExec plan must be refused on a device-less cluster, but it was accepted"),
+        Ok(_) => {
+            panic!("a GangExec plan must be refused on a device-less cluster, but it was accepted")
+        }
         Err(e) => e.to_string(),
     };
     assert!(
@@ -892,11 +1079,8 @@ async fn list_workers_and_compute_executor_devices_report_registered_devices() {
 
     let (specs, _scheduler_port) = standard_fleet_specs();
     let fleet = Fleet::spawn(&backends, &result_root, specs);
-    let ids = await_fleet_registered(
-        &session,
-        &[fleet.label(0), fleet.label(1), fleet.label(2)],
-    )
-    .await;
+    let ids =
+        await_fleet_registered(&session, &[fleet.label(0), fleet.label(1), fleet.label(2)]).await;
 
     let cpu = jammi_db::catalog::instance::DeviceFact {
         kind: "cpu".to_string(),
@@ -919,7 +1103,11 @@ async fn list_workers_and_compute_executor_devices_report_registered_devices() {
     // Filtered to THIS fleet's own executor ids — the shared Postgres
     // catalog carries other test runs' rows too (see
     // `await_fleet_registered`'s doc), so a bare row count would be wrong.
-    let executor_devices = session.catalog().list_compute_executor_devices().await.unwrap();
+    let executor_devices = session
+        .catalog()
+        .list_compute_executor_devices()
+        .await
+        .unwrap();
     for id in &ids {
         let devices = executor_devices
             .iter()

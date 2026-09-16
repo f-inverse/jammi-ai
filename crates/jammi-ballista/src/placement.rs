@@ -75,16 +75,23 @@ use ballista_scheduler::state::task_manager::JobInfoCache;
 
 use jammi_db::catalog::Catalog;
 
-/// The submitter instance id a stage's `GangExec` must never be bound to, if
-/// the stage contains one — a `GangExec` is a leaf (zero children,
-/// `crate::codec`'s decode never wraps it), so a plain depth-first search
-/// over `.children()` finds it wherever the stage's shuffle-writer wrapping
-/// placed it.
-fn gang_submitter_of(plan: &Arc<dyn ExecutionPlan>) -> Option<String> {
+/// The `GangExec`'s own descriptor found anywhere in `plan`, if any — a
+/// `GangExec` is a leaf (zero children, `crate::codec`'s decode never wraps
+/// it), so a plain depth-first search over `.children()` finds it wherever
+/// the stage's shuffle-writer wrapping placed it. `descriptor().job_id` is
+/// jammi's OWN fine-tune catalog job id — DISTINCT from the `JobId` key
+/// `bind_tasks`' own `running_jobs` map uses, which is Ballista's
+/// internally-minted submission id (unrelated id spaces: a real Ballista
+/// submission never gives them the same value, only a hermetic test
+/// fixture that deliberately aliases them would) — refinement 3's re-launch
+/// guard below reads THIS job_id, never the outer loop's.
+fn gang_descriptor_of(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Option<jammi_ai::operator::gang_exec::GangDescriptor> {
     if let Some(exec) = plan.downcast_ref::<jammi_ai::operator::gang_exec::GangExec>() {
-        return Some(exec.descriptor().submitter.clone());
+        return Some(exec.descriptor().clone());
     }
-    plan.children().into_iter().find_map(gang_submitter_of)
+    plan.children().into_iter().find_map(gang_descriptor_of)
 }
 
 /// jammi's shipped scheduler task-distribution policy (see the module doc).
@@ -142,24 +149,16 @@ impl DistributionPolicy for DevicePlacement {
             .into_iter()
             .collect();
 
-        // Refinement 3: one row read per running job id present this round.
-        // `None` (unclaimed, should not occur for a `running` row but is not
-        // itself a fault) never triggers the guard; an unreadable row is
-        // folded into "claimed by someone unverifiable" via a sentinel that
-        // can never equal a real submitter id.
+        // Refinement 3's row-read cache, keyed by the FINE-TUNE catalog
+        // job_id (`GangDescriptor::job_id`, read lazily below — never
+        // Ballista's own `JobId`, see `gang_descriptor_of`'s doc) so a
+        // job with multiple runnable gang stages across rounds reads its
+        // row at most once per `bind_tasks` call. `None` (unclaimed,
+        // should not occur for a `running` row but is not itself a fault)
+        // never triggers the guard; an unreadable row is folded into
+        // "claimed by someone unverifiable" via a sentinel that can never
+        // equal a real submitter id.
         let mut claim_of: HashMap<String, Option<String>> = HashMap::new();
-        for job_id in running_jobs.keys() {
-            let jid = job_id.to_string();
-            let row = jammi_db::tenant_scope::TenantBinding::admin_scope(async {
-                self.catalog.get_job(&jid).await
-            })
-            .await;
-            claim_of.insert(
-                jid,
-                row.map(|r| r.claimed_by)
-                    .unwrap_or_else(|_| Some(String::new())),
-            );
-        }
 
         // Descending by capacity, same shape Ballista's own round robin uses.
         slots.sort_by(|a, b| b.slots.cmp(&a.slots));
@@ -173,15 +172,29 @@ impl DistributionPolicy for DevicePlacement {
             let session_id = graph.session_id().to_string();
             let mut black_list: Vec<usize> = Vec::new();
             while let Some((stage, task_id_gen)) = graph.fetch_running_stage(&black_list) {
-                let gang_submitter = gang_submitter_of(&stage.plan);
-                if let Some(submitter) = &gang_submitter {
-                    let claim = claim_of.get(job_id.as_ref()).cloned().flatten();
+                let gang_descriptor = gang_descriptor_of(&stage.plan);
+                if let Some(descriptor) = &gang_descriptor {
+                    let claim = match claim_of.get(&descriptor.job_id) {
+                        Some(cached) => cached.clone(),
+                        None => {
+                            let row = jammi_db::tenant_scope::TenantBinding::admin_scope(async {
+                                self.catalog.get_job(&descriptor.job_id).await
+                            })
+                            .await;
+                            let claim = row
+                                .map(|r| r.claimed_by)
+                                .unwrap_or_else(|_| Some(String::new()));
+                            claim_of.insert(descriptor.job_id.clone(), claim.clone());
+                            claim
+                        }
+                    };
                     if let Some(claimant) = &claim {
-                        if claimant != submitter {
+                        if claimant != &descriptor.submitter {
                             tracing::warn!(
-                                job_id = %job_id,
+                                job_id = %descriptor.job_id,
+                                ballista_job_id = %job_id,
                                 stage_id = stage.stage_id,
-                                attempt = ?submitter,
+                                submitter = %descriptor.submitter,
                                 claimed_by = %claimant,
                                 "jammi-ballista DevicePlacement: refusing to bind a GangExec \
                                  whose job row is already claimed by another instance — the \
@@ -192,6 +205,7 @@ impl DistributionPolicy for DevicePlacement {
                         }
                     }
                 }
+                let gang_submitter = gang_descriptor.as_ref().map(|d| d.submitter.clone());
                 let required_kind = crate::engine::stage_device_kind(&stage.plan);
                 let runnable_partitions: Vec<usize> = stage
                     .task_infos
@@ -266,6 +280,8 @@ impl DistributionPolicy for DevicePlacement {
                             stage_id = stage.stage_id,
                             partition_id,
                             executor_id = %executor_id,
+                            gang_submitter = ?gang_submitter,
+                            required_kind = ?required_kind,
                             "jammi-ballista DevicePlacement: bound task"
                         );
                         bound.push((

@@ -48,7 +48,9 @@ pub async fn submit_physical_plan(
             .await
             .map_err(Error::Catalog)?;
         let wire = crate::engine::device_kind_wire_str(required_kind);
-        let has_match = devices.iter().any(|(_, ds)| ds.iter().any(|d| d.kind == wire));
+        let has_match = devices
+            .iter()
+            .any(|(_, ds)| ds.iter().any(|d| d.kind == wire));
         if !has_match {
             return Err(Error::Config(format!(
                 "jammi-ballista: this plan requires device_kind {required_kind:?} but no \

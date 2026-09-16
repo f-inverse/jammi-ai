@@ -685,11 +685,47 @@ rp_session_load() {
   rp_init
 }
 
+# THE readiness predicate for a rented host: its sshd answers an executed
+# connect. RunPod's `RUNNING` status and a mapped port say the CONTAINER is
+# up; the image's entrypoint installs openssh-server after boot
+# (`_rp_entrypoint_setup`), so the mapped port refuses connections for tens
+# of seconds first (gpu-cluster run 35163325352: both pods RUNNING and
+# GN-enabled at 224 s, the first ssh to rank 0 refused 0.1 s later). Every
+# leg decides "usable" with this ONE probe -- never with the API status.
+#   rp_sshd_answers <host> <port> [extra ssh options...]
+rp_sshd_answers() {
+  local host="${1:?rp_sshd_answers needs a host}" port="${2:?rp_sshd_answers needs a port}"
+  shift 2
+  ssh "${RP_SSHO[@]}" "$@" -p "$port" "root@${host}" true 2>/dev/null
+}
+
+# The bounded wait on that predicate, for a host whose endpoint is already
+# known: probe every 5 s until sshd answers or `bound` seconds elapse.
+# Prints one line on success; on the bound a named `::error::` and rc 1 --
+# the caller never issues a remote command after rc 1.
+#   rp_wait_sshd <host> <port> <bound-seconds> <label> [extra ssh options...]
+rp_wait_sshd() {
+  local host="${1:?rp_wait_sshd needs a host}" port="${2:?rp_wait_sshd needs a port}" \
+        bound="${3:?rp_wait_sshd needs a bound in seconds}" label="${4:?rp_wait_sshd needs a label}"
+  shift 4
+  local deadline=$(( SECONDS + bound )) started=$SECONDS attempts=0
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    attempts=$(( attempts + 1 ))
+    if rp_sshd_answers "$host" "$port" "$@"; then
+      echo "sshd up on ${label} (${host}:${port}) after $(( SECONDS - started ))s, ${attempts} probe(s)"
+      return 0
+    fi
+    sleep 5
+  done
+  echo "::error::sshd on ${label} (${host}:${port}) answered no connect within ${bound}s (${attempts} probes) -- the pod is RUNNING but its entrypoint has not started sshd; refusing to issue a remote command" >&2
+  return 1
+}
+
 # A recorded pod is not a live pod — the reaper may have collected it, or the
 # host may have died. Callers must confirm before treating a session as usable.
 rp_session_alive() {
   [ -n "$RP_POD_ID" ] && [ -n "$RP_HOST" ] && [ -n "$RP_PORT" ] || return 1
-  ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" true 2>/dev/null
+  rp_sshd_answers "$RP_HOST" "$RP_PORT"
 }
 
 # The whole session table — header included, so the row format exists once. The
@@ -2232,7 +2268,7 @@ else:
       read -r RP_HOST RP_PORT < <(printf '%s' "$R" | python3 -c 'import sys,json
 p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
 [print(x["ip"], x["publicPort"]) for x in (p.get("ports") or []) if x.get("privatePort")==22 and x.get("isIpPublic")]' | head -1)
-      if [ -n "${RP_HOST:-}" ] && ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" true 2>/dev/null; then
+      if [ -n "${RP_HOST:-}" ] && rp_sshd_answers "$RP_HOST" "$RP_PORT"; then
         # Reachable — now gate on the driver floor. A pod below r560 cannot JIT
         # the image's CUDA 12.6 PTX, so it is unusable for this build; fail over
         # to the next candidate rather than run every test into the #304 floor.

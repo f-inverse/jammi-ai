@@ -1995,6 +1995,63 @@ else
 fi
 
 # ----------------------------------------------------------------------------
+# P11: no remote command before an EXECUTED connect to that member succeeded
+# once (run 35163325352: both pods RUNNING + GN-enabled, the first ssh to
+# rank 0 refused 0.1 s later -- sshd is installed by the entrypoint AFTER
+# boot). The library probes `ssh ... true` under a bound; both
+# transports call `rp_wait_sshd` (runpod_lib.sh: ONE predicate, `rp_sshd_answers`,
+# shared with `rp_session_alive` and `_rp_deploy`) for BOTH members before
+# their first `_rpc_remote_script`.
+# ----------------------------------------------------------------------------
+run_ssh_ready() { # $1=refusals before success (-1 = never) $2=bound(s)
+  P11_REFUSALS="$1" bash -c '
+    source "'"$CLUSTER_SH"'" >/dev/null 2>&1
+    RP_SSHO=(-o Fixture=yes)
+    n=0
+    ssh() { echo "ssh $*" >> "'"$SANDBOX"'/p11-ssh-calls"; n=$((n+1)); [ "$P11_REFUSALS" -ge 0 ] && [ "$n" -gt "$P11_REFUSALS" ]; }
+    sleep() { :; }
+    rp_wait_sshd "10.0.0.1" "2222" "'"$2"'" "rank 0" -o "ProxyJump=root@jump:1"
+  '
+}
+rm -f "$SANDBOX/p11-ssh-calls"
+out="$(run_ssh_ready 2 300 2>&1)"; rc=$?
+calls="$(grep -c '^ssh ' "$SANDBOX/p11-ssh-calls" 2>/dev/null || echo 0)"
+if [ "$rc" -eq 0 ] && [ "$calls" -eq 3 ] && printf '%s' "$out" | grep -q "sshd up on rank 0 (10.0.0.1:2222)" && grep -q -- "-o Fixture=yes -o ProxyJump=root@jump:1 -p 2222 root@10.0.0.1 true" "$SANDBOX/p11-ssh-calls"; then
+  ok "P11: two refused connects then success -> rc 0 after exactly 3 probes, RP_SSHO + the member's extra options + the port on every probe"
+else
+  bad "P11: expected rc 0 after 3 probes with the options threaded; got rc=$rc calls=$calls out=$out"
+fi
+rm -f "$SANDBOX/p11-ssh-calls"
+out="$(run_ssh_ready -1 1 2>&1)"; rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "::error::sshd on rank 0 (10.0.0.1:2222) answered no connect within 1s"; then
+  ok "P11: a member whose sshd never answers -> rc 1 within the bound, named ::error:: (never a remote command)"
+else
+  bad "P11: expected rc 1 with the named ::error:: on the bound; got rc=$rc out=$out"
+fi
+# Static ordering, both arms (the F10/P3 precedent): each arm's TWO wait calls
+# precede that arm's first `_rpc_remote_script 0 | ssh` launch.
+p11_waits="$(grep -n '^rp_wait_sshd "\$primary_host"' "$CLUSTER_SH" | cut -d: -f1 | tr '\n' ' ')"
+p11_launch="$(grep -n '^_rpc_remote_script 0 | ssh' "$CLUSTER_SH" | cut -d: -f1 | tr '\n' ' ')"
+p11_ok=1
+set -- $p11_launch
+for launch in "$@"; do
+  seen=0
+  for w in $p11_waits; do
+    [ "$w" -lt "$launch" ] && [ $(( launch - w )) -lt 40 ] && seen=1
+  done
+  [ "$seen" -eq 1 ] || p11_ok=0
+done
+if [ "$p11_ok" -eq 1 ] && [ "$(printf '%s' "$p11_waits" | wc -w)" -eq 2 ] && [ "$(printf '%s' "$p11_launch" | wc -w)" -eq 2 ]; then
+  ok "P11: both arms (cluster, pods) wait for sshd on rank 0 within 40 lines before their own rank-0 launch (waits at ${p11_waits}; launches at ${p11_launch})"
+else
+  bad "P11: expected a rank-0 sshd wait shortly before EACH arm's rank-0 launch; waits=${p11_waits} launches=${p11_launch}"
+fi
+if [ "$(grep -c '^rp_wait_sshd "\$member_host"' "$CLUSTER_SH")" -eq 2 ]; then
+  ok "P11: both arms wait for sshd on rank 1 too"
+else
+  bad "P11: expected two rank-1 sshd waits (one per arm)"
+fi
+# ----------------------------------------------------------------------------
 # P10: prose == code.
 # ----------------------------------------------------------------------------
 for site in "$CLUSTER_SH" "$CLUSTER_YML" "$DEV_GPU_MD"; do

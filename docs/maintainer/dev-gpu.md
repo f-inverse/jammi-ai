@@ -864,7 +864,12 @@ may still drive the two-host test BY HAND with the primitives above:
    center at `MEDIUM` or better — co-placement needs exactly one.
 2. `rp_cluster_create <gpuTypeId> [dataCenterIds]`; poll `rp_cluster_get`/
    `rp_cluster_pods` until both members are `RUNNING` with a reachable
-   `ssh.direct` (or the overlay-ip fallback through the primary).
+   `ssh.direct` (or the overlay-ip fallback through the primary), then
+   probe each member with `ssh … true` until it answers
+   (`_rpc_wait_ssh_ready`, bounded by `RP_SSH_WAIT_SECS`): a `RUNNING`
+   pod's entrypoint installs sshd after boot, so the endpoint RunPod
+   reports refuses connections for a while first. Both transports run
+   this probe for both members before any remote command.
 3. On BOTH members: clone this tree at the commit under test and build the
    `gpu_capability` test target.
 4. On the member running rank 0: export `JAMMI_GANG_TWO_HOSTS_RANK=0`,

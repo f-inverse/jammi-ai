@@ -1434,6 +1434,9 @@ member_extra_sshopts=()
 # explicitly instead of one shared array with an embedded, flag-specific
 # `-p`/`-P`).
 [ "$proxy_flag" = "1" ] && member_extra_sshopts=(-o "ProxyJump=root@${primary_host}:${primary_port}")
+_rpc_phase "waiting for sshd on both members (an executed connect per member)"
+rp_wait_sshd "$primary_host" "$primary_port" "$RP_SSH_WAIT_SECS" "rank 0" || exit 76
+rp_wait_sshd "$member_host" "$member_port" "$RP_SSH_WAIT_SECS" "rank 1" "${member_extra_sshopts[@]}" || exit 76
 
 _rpc_phase "build + two-host proof"
 rank0_log="$(mktemp)"; rank1_log="$(mktemp)"
@@ -1676,6 +1679,9 @@ echo "both pods RUNNING, GN-enabled, co-located in ${measured_dc} (rank 0 GN ip:
 # interface name.
 export RP_TWO_HOST_GN_IP_0 RP_TWO_HOST_GN_IP_1
 member_extra_sshopts=()  # the pods transport never proxies -- both pods carry their own direct endpoint (P2's own refusal above).
+_rpc_phase "waiting for sshd on both pods (an executed connect per member)"
+rp_wait_sshd "$primary_host" "$primary_port" "$RP_SSH_WAIT_SECS" "rank 0" || exit 76
+rp_wait_sshd "$member_host" "$member_port" "$RP_SSH_WAIT_SECS" "rank 1" || exit 76
 
 _rpc_phase "build + two-host proof"
 rank0_log="$(mktemp)"; rank1_log="$(mktemp)"

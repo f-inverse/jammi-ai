@@ -54,14 +54,18 @@ pub struct InferenceSession {
     /// identity, and `catalog::lease_keeper::LeaseTarget::Instance`
     /// registers the SAME id `jobs.claimed_by` carries.
     instance_id: String,
-    /// This process's `InstanceRegistration` — the ONE carrier
-    /// [`Self::instance_id`]'s row is written from
+    /// This host's admission state ([`crate::fine_tune::worker::HostAdmission`]):
+    /// the shutdown phase, the single job-slot holder, and this process's
+    /// `InstanceRegistration` — the ONE carrier [`Self::instance_id`]'s row
+    /// is written from
     /// ([`jammi_db::catalog::instance::InstanceRegistration::from_config`]),
     /// shared with the lease keeper's [`jammi_db::catalog::lease_keeper::
     /// LeaseTarget::Instance`] hold below. [`crate::fine_tune::worker::
     /// JobWorker`] and [`crate::fine_tune::worker::EmbeddedWorker`] are the
-    /// SOLE owners of its worker half (see [`Self::instance_registration`]).
-    instance_registration: Arc<jammi_db::catalog::instance::InstanceRegistration>,
+    /// SOLE owners of the registration's worker half (see
+    /// [`Self::instance_registration`]); the gang admission handler and the
+    /// claim loop contend for the holder; DRAIN/RELEASE flip the phase.
+    host_admission: Arc<crate::fine_tune::worker::HostAdmission>,
     /// The process's one lease-renewal thread (N3) — every claimed lease
     /// this session (or a job/table it owns) holds is held open here instead
     /// of spawning its own `tokio::spawn` heartbeat task, so a CPU-bound
@@ -388,7 +392,7 @@ impl InferenceSession {
             hub,
             ephemeral_sessions: jammi_db::ephemeral::ActiveSessions::new(),
             instance_id,
-            instance_registration: registration,
+            host_admission: crate::fine_tune::worker::HostAdmission::new(registration),
             lease_keeper,
             _instance_hold: instance_hold,
             worker_gate,
@@ -418,7 +422,10 @@ impl InferenceSession {
 
     /// RELEASE this session's job leases without a loop to stop — the
     /// library's `release_and_stop` when no worker was spawned, and the
-    /// server's when `[worker] enabled = false`: 2b (the keeper releases
+    /// server's when `[worker] enabled = false`: the phase flips to
+    /// `Releasing` first ([`crate::fine_tune::worker::HostAdmission::begin_release`],
+    /// so every gang rank held on this host ends with the `Drain` reason),
+    /// then 2b (the keeper releases
     /// every `LeaseTarget::Job` hold it holds — inline holds return
     /// `Ok(false)` and are left alone) then 2c (the jobs sweep and the
     /// jobs-linked building sweep). With no loop-claimed row on this
@@ -435,6 +442,7 @@ impl InferenceSession {
         crate::fine_tune::worker::HoldReleaseOutcome,
         crate::fine_tune::worker::ReleaseSweep,
     )> {
+        self.host_admission.begin_release();
         let heartbeat = self.worker_intervals()?.heartbeat;
         let holds = match self.lease_keeper.release_job_holds(heartbeat).await {
             Ok(hr) => crate::fine_tune::worker::HoldReleaseOutcome::Observed(hr),
@@ -477,7 +485,14 @@ impl InferenceSession {
     pub(crate) fn instance_registration(
         &self,
     ) -> &Arc<jammi_db::catalog::instance::InstanceRegistration> {
-        &self.instance_registration
+        self.host_admission.registry()
+    }
+
+    /// This host's admission state: the shutdown phase every claim loop and
+    /// every held gang rank on this process reads, and the one job-slot
+    /// holder they contend for ([`crate::fine_tune::worker::HostAdmission`]).
+    pub fn host_admission(&self) -> &Arc<crate::fine_tune::worker::HostAdmission> {
+        &self.host_admission
     }
 
     /// This process's one lease-renewal thread (N3). A

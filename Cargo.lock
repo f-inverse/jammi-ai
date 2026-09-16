@@ -4405,6 +4405,7 @@ dependencies = [
  "jammi-test-utils",
  "jammi-wire",
  "libc",
+ "object_store",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-proto",
@@ -4426,6 +4427,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-opentelemetry",
@@ -4641,6 +4643,8 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "candle-core",
+ "candle-nn",
  "chrono",
  "clap",
  "datafusion",
@@ -6431,7 +6435,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -7795,7 +7799,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "54254b8531cafa275c5e096f62d48c81435d1015405a91198ddb11e967301d40"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",

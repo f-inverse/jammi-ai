@@ -1428,6 +1428,66 @@ impl Catalog {
             .await?)
     }
 
+    /// The STRICT tenant-pinned resolver a gang rank resolves its job's
+    /// `training_set_location` through (I-GANG, `world_size > 1`): the row
+    /// named `name` whose `tenant_id` is IDENTICAL to `tenant` — `tenant_id =
+    /// $t OR (tenant_id IS NULL AND $t IS NULL)` — never the relaxed
+    /// `(tenant_id = $t OR tenant_id IS NULL)` read [`Self::get_result_table`]
+    /// uses, which also hands a real tenant every GLOBAL (`tenant_id IS
+    /// NULL`) row of the same name. A NULL-tenant row therefore resolves for
+    /// a NULL-tenant caller ONLY, and a real tenant's row for that tenant
+    /// only.
+    ///
+    /// `tenant` is an EXPLICIT argument, never the session's binding, and
+    /// this verb reads NEITHER [`TenantBinding::is_admin_scope`] nor
+    /// [`Self::current_tenant`]: ambient admin scope does not widen it (the
+    /// predicate is the same under `with_admin_scope` as outside it), so a
+    /// caller that captured a tenant off a `jobs` row gets exactly that
+    /// tenant's row regardless of what task-local scope it happens to run
+    /// under. This is the one resolver in this crate with that shape — the
+    /// caller (the gang admission handler) refuses ambient admin scope
+    /// before ever calling it, and this verb would not resolve cross-tenant
+    /// even if it did not.
+    ///
+    /// `Ok(None)` when no row of that name belongs to exactly `tenant` —
+    /// whether none exists at all, or one exists under another tenant (or
+    /// under no tenant): the strict predicate does not, and must not,
+    /// distinguish the two for the caller. `Err` means the read itself
+    /// faulted.
+    ///
+    /// **Enumerating-caller oracle** (`crates/jammi-server/tests/it/
+    /// gang_rank_admission_oracle.rs`): the only call site outside this
+    /// crate's own tests is the gang `RunRank` handler's training-set
+    /// resolution.
+    pub async fn get_result_table_for_tenant(
+        &self,
+        name: &str,
+        tenant: Option<TenantId>,
+    ) -> Result<Option<ResultTableRecord>> {
+        let name = name.to_string();
+        let tenant = tenant.map(|t| t.to_string());
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query_opt(
+                            "SELECT * FROM result_tables WHERE table_name = $1 \
+                               AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
+                            &[SqlValue::TextOwned(name), SqlValue::from(tenant)],
+                            parse_row,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?)
+    }
+
     /// List result tables with a given status, scoped to the session tenant.
     ///
     /// Inside a [`crate::session::JammiSession::with_admin_scope`] closure the

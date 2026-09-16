@@ -96,6 +96,7 @@ use std::time::Instant;
 use candle_core::Device;
 use candle_nn::VarMap;
 
+use jammi_ai::fine_tune::collective::BlockingCall;
 use jammi_ai::fine_tune::data::TrainingDataLoader;
 use jammi_ai::fine_tune::resume::load_bundle;
 use jammi_ai::fine_tune::source::TrainingSource;
@@ -1158,6 +1159,7 @@ fn build_encoder_adapters(
         rank_pattern: &empty_ranks,
         init_mode: lora_init,
         seed,
+        dropout_seed: seed,
     };
     let (mut encoder, tower) = match (family, task) {
         (EncoderFamily::ModernBert, Task::Text) => {
@@ -1341,6 +1343,7 @@ fn build_encoder_adapters(
         rank_pattern: &empty_ranks,
         init_mode: lora_init,
         seed,
+        dropout_seed: seed,
     };
     // `model_type` is the base ARCHITECTURE id (`EncoderFamily::
     // adapter_model_type`); `tower` says WHICH tower of a multi-tower
@@ -1552,9 +1555,10 @@ pub(crate) fn fused_dispatch_proof_gate(
 /// `eval_cadence` and unconditionally on the last epoch. See this module's
 /// own doc for the full design rationale.
 pub fn run(
+    call: &BlockingCall,
     params: &FinetuneRunParams,
 ) -> Result<FinetuneRunTier, Box<dyn std::error::Error + Send + Sync>> {
-    run_impl(params, true).map(|(tier, _final_varmap)| tier)
+    run_impl(call, params, true).map(|(tier, _final_varmap)| tier)
 }
 
 /// [`run`]'s real body, plus a test-only `probe_at_init` escape hatch and the
@@ -1567,6 +1571,7 @@ pub fn run(
 /// including the actual trained weights, not merely the reported numbers —
 /// bit for bit.
 fn run_impl(
+    call: &BlockingCall,
     params: &FinetuneRunParams,
     probe_at_init: bool,
 ) -> Result<(FinetuneRunTier, VarMap), Box<dyn std::error::Error + Send + Sync>> {
@@ -2095,7 +2100,7 @@ fn run_impl(
                         epoch_idx - 1
                     )
                 })?;
-            Some(load_bundle(fetched.dir(), &device)?)
+            load_bundle(fetched.dir(), &device)?
         };
 
         let mut builder = TrainingLoopBuilder::new(target, varmap, config)
@@ -2140,7 +2145,7 @@ fn run_impl(
         // epoch leg before the timed span starts.
         let train_loader = train_rows.loader(params.objective)?;
         let train_run_t0 = Instant::now();
-        let result = training_loop.run(TrainingSource::Resident(train_loader))?;
+        let result = training_loop.run(call, TrainingSource::Resident(train_loader))?;
         train_run_wall_s += train_run_t0.elapsed().as_secs_f64();
         // The DIRECT media front-end wall (contract P1-b(v)), summed across
         // resume legs exactly as `train_run_wall_s` above is —
@@ -3441,12 +3446,12 @@ mod tests {
         let params_without = non_perturbation_test_params(work_dir_without.path().to_path_buf());
 
         let (tier_with, varmap_with) =
-            tokio::task::spawn_blocking(move || run_impl(&params_with, true))
+            BlockingCall::spawn_blocking(move |call| run_impl(&call, &params_with, true))
                 .await
                 .expect("join with-probe task")
                 .expect("finetune-run WITH the init probe");
         let (tier_without, varmap_without) =
-            tokio::task::spawn_blocking(move || run_impl(&params_without, false))
+            BlockingCall::spawn_blocking(move |call| run_impl(&call, &params_without, false))
                 .await
                 .expect("join without-probe task")
                 .expect("finetune-run WITHOUT the init probe");
@@ -3504,10 +3509,11 @@ mod tests {
         let work_dir = tempfile::tempdir().expect("tempdir");
         let params = non_perturbation_test_params(work_dir.path().to_path_buf());
         let outer_t0 = Instant::now();
-        let (tier, _varmap) = tokio::task::spawn_blocking(move || run_impl(&params, true))
-            .await
-            .expect("join run_impl task")
-            .expect("finetune-run");
+        let (tier, _varmap) =
+            BlockingCall::spawn_blocking(move |call| run_impl(&call, &params, true))
+                .await
+                .expect("join run_impl task")
+                .expect("finetune-run");
         let outer_wall_s = outer_t0.elapsed().as_secs_f64();
 
         assert!(
@@ -3559,10 +3565,10 @@ mod tests {
         let work_dir = tempfile::tempdir().expect("tempdir");
         let params = non_perturbation_test_params(work_dir.path().to_path_buf());
         const INJECTED_MS: u64 = 250;
-        let (run_result, outer_wall_s) = tokio::task::spawn_blocking(move || {
+        let (run_result, outer_wall_s) = BlockingCall::spawn_blocking(move |call| {
             LOADER_BUILD_SLEEP_MS_FOR_TEST.with(|c| c.set(INJECTED_MS));
             let outer_t0 = Instant::now();
-            let result = run_impl(&params, true);
+            let result = run_impl(&call, &params, true);
             let outer_wall_s = outer_t0.elapsed().as_secs_f64();
             // Reset before this blocking-pool thread is returned to the pool
             // and might serve a different, unrelated test.
@@ -3631,10 +3637,11 @@ mod tests {
     async fn finetune_run_tier_json_actually_emits_layers_to_transform_and_train_run_wall_s() {
         let work_dir = tempfile::tempdir().expect("tempdir");
         let params = non_perturbation_test_params(work_dir.path().to_path_buf());
-        let (tier, _varmap) = tokio::task::spawn_blocking(move || run_impl(&params, true))
-            .await
-            .expect("join run_impl task")
-            .expect("finetune-run");
+        let (tier, _varmap) =
+            BlockingCall::spawn_blocking(move |call| run_impl(&call, &params, true))
+                .await
+                .expect("join run_impl task")
+                .expect("finetune-run");
 
         let report = crate::report::Report::new(
             "finetune-run",
@@ -3773,7 +3780,9 @@ mod tests {
             params.mutant_id = mutant_id.clone();
             params.mutant_base_sha = mutant_base_sha.clone();
             params.mutant_patch_sha256 = mutant_patch_sha256.clone();
-            let result = run_impl(&params, true);
+            let result = BlockingCall::spawn_thread(move |call| run_impl(&call, &params, true))
+                .join()
+                .expect("join run_impl thread");
             let err = match result {
                 Ok(_) => panic!(
                     "a partial mutant subset must be refused: mutant_id={mutant_id:?}, \
@@ -3820,8 +3829,11 @@ mod tests {
         params.mutant_id = Some(String::new());
         params.mutant_base_sha = Some(String::new());
         params.mutant_patch_sha256 = Some(String::new());
+        let result = BlockingCall::spawn_thread(move |call| run_impl(&call, &params, true))
+            .join()
+            .expect("join run_impl thread");
         let err = expect_refused(
-            run_impl(&params, true),
+            result,
             "an explicitly-empty trio must be refused, not treated as absent",
         );
         let msg = err.to_string();
@@ -3845,8 +3857,11 @@ mod tests {
         params.mutant_id = Some("   ".to_string());
         params.mutant_base_sha = Some("\t\n".to_string());
         params.mutant_patch_sha256 = Some(" ".to_string());
+        let result = BlockingCall::spawn_thread(move |call| run_impl(&call, &params, true))
+            .join()
+            .expect("join run_impl thread");
         let err = expect_refused(
-            run_impl(&params, true),
+            result,
             "an explicitly-whitespace trio must be refused, not treated as absent",
         );
         assert!(
@@ -3878,8 +3893,11 @@ mod tests {
             params.mutant_id = mutant_id.clone();
             params.mutant_base_sha = mutant_base_sha.clone();
             params.mutant_patch_sha256 = mutant_patch_sha256.clone();
+            let result = BlockingCall::spawn_thread(move |call| run_impl(&call, &params, true))
+                .join()
+                .expect("join run_impl thread");
             let err = expect_refused(
-                run_impl(&params, true),
+                result,
                 &format!(
                     "one empty/whitespace among three (otherwise valid) values must be \
                      refused: mutant_id={mutant_id:?}, mutant_base_sha={mutant_base_sha:?}, \
@@ -3905,10 +3923,10 @@ mod tests {
         too_short_base.mutant_id = Some("eps-0.10".to_string());
         too_short_base.mutant_base_sha = Some("abc123".to_string()); // 6 hex chars, below the 7 floor
         too_short_base.mutant_patch_sha256 = Some("a".repeat(64));
-        let err = expect_refused(
-            run_impl(&too_short_base, true),
-            "a too-short mutant-base-sha must be refused",
-        );
+        let result = BlockingCall::spawn_thread(move |call| run_impl(&call, &too_short_base, true))
+            .join()
+            .expect("join run_impl thread");
+        let err = expect_refused(result, "a too-short mutant-base-sha must be refused");
         assert!(
             err.to_string().contains("--mutant-base-sha"),
             "refusal must name the offending flag: {err}"
@@ -3918,10 +3936,10 @@ mod tests {
         non_hex_base.mutant_id = Some("eps-0.10".to_string());
         non_hex_base.mutant_base_sha = Some("not-a-hex-sha!!".to_string());
         non_hex_base.mutant_patch_sha256 = Some("a".repeat(64));
-        let err = expect_refused(
-            run_impl(&non_hex_base, true),
-            "a non-hex mutant-base-sha must be refused",
-        );
+        let result = BlockingCall::spawn_thread(move |call| run_impl(&call, &non_hex_base, true))
+            .join()
+            .expect("join run_impl thread");
+        let err = expect_refused(result, "a non-hex mutant-base-sha must be refused");
         assert!(
             err.to_string().contains("--mutant-base-sha"),
             "refusal must name the offending flag: {err}"
@@ -3931,10 +3949,11 @@ mod tests {
         wrong_len_patch.mutant_id = Some("eps-0.10".to_string());
         wrong_len_patch.mutant_base_sha = Some("f".repeat(40));
         wrong_len_patch.mutant_patch_sha256 = Some("a".repeat(63)); // one short of 64
-        let err = expect_refused(
-            run_impl(&wrong_len_patch, true),
-            "a wrong-length mutant-patch-sha256 must be refused",
-        );
+        let result =
+            BlockingCall::spawn_thread(move |call| run_impl(&call, &wrong_len_patch, true))
+                .join()
+                .expect("join run_impl thread");
+        let err = expect_refused(result, "a wrong-length mutant-patch-sha256 must be refused");
         assert!(
             err.to_string().contains("--mutant-patch-sha256"),
             "refusal must name the offending flag: {err}"
@@ -3944,10 +3963,10 @@ mod tests {
         non_hex_patch.mutant_id = Some("eps-0.10".to_string());
         non_hex_patch.mutant_base_sha = Some("f".repeat(40));
         non_hex_patch.mutant_patch_sha256 = Some("z".repeat(64)); // right length, not hex
-        let err = expect_refused(
-            run_impl(&non_hex_patch, true),
-            "a non-hex mutant-patch-sha256 must be refused",
-        );
+        let result = BlockingCall::spawn_thread(move |call| run_impl(&call, &non_hex_patch, true))
+            .join()
+            .expect("join run_impl thread");
+        let err = expect_refused(result, "a non-hex mutant-patch-sha256 must be refused");
         assert!(
             err.to_string().contains("--mutant-patch-sha256"),
             "refusal must name the offending flag: {err}"
@@ -3968,10 +3987,11 @@ mod tests {
         params.mutant_base_sha = Some(format!("  {}  ", "f".repeat(40)));
         params.mutant_patch_sha256 = Some(format!("\t{}\n", "a".repeat(64)));
 
-        let (tier, _varmap) = tokio::task::spawn_blocking(move || run_impl(&params, true))
-            .await
-            .expect("join run_impl task")
-            .expect("a fully-supplied, non-empty (once trimmed) trio must be accepted");
+        let (tier, _varmap) =
+            BlockingCall::spawn_blocking(move |call| run_impl(&call, &params, true))
+                .await
+                .expect("join run_impl task")
+                .expect("a fully-supplied, non-empty (once trimmed) trio must be accepted");
 
         assert_eq!(tier.mutant_id, Some("eps-0.10".to_string()));
         assert_eq!(tier.mutant_base_sha, Some("f".repeat(40)));

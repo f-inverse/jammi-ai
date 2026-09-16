@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "git_sha": "02eb39438f6a970fce9e19f8f4331beeefa0715a",
+  "box": "NVIDIA A100-SXM4-80GB x2, driver 580.159.04",
+  "producer": {
+    "path": "ci/scripts/runpod_gpu_gang.sh",
+    "kind": "script",
+    "invocation": "bash ci/scripts/runpod_gpu_gang.sh",
+    "gating": "none"
+  },
+  "status": "GREEN",
+  "artifact_kind": "gang",
+  "gang": {
+    "leg": "pod",
+    "world": 2,
+    "collective": "nccl",
+    "ranks": [
+      {
+        "rank": 0,
+        "device": "cuda:0 NVIDIA A100-SXM4-80GB"
+      },
+      {
+        "rank": 1,
+        "device": "cuda:1 NVIDIA A100-SXM4-80GB"
+      }
+    ],
+    "digests": [
+      {
+        "seed": 4242,
+        "digest": "71dd7958d06f23ac9ab171c464b712a9bc5b6486add2ba641f5db6389525efbc"
+      },
+      {
+        "seed": 4242,
+        "digest": "71dd7958d06f23ac9ab171c464b712a9bc5b6486add2ba641f5db6389525efbc"
+      }
+    ],
+    "per_step_loss_delta": [
+      0.0,
+      0.0
+    ],
+    "epsilon": {
+      "value": 0.0002,
+      "derivation": "2e-4 = 2x the CPU-hermetic gather-exactness floor (1e-4, gather_exactness_w2_matches_w1_within_pre_registered_epsilon's GATHER_EXACTNESS_EPSILON in crates/jammi-ai/src/fine_tune/trainer.rs), admitting exactly one further fp32 reduction reassociation a real GPU pod run adds beyond that CPU oracle: cuBLAS's own forward/backward accumulation order plus NCCL's ring/tree ncclAllReduce summation order. Analytically bounded: an (n-1)*eps_f32*max|term| reassociation-error bound (eps_f32 = 2^-23 ~= 1.19e-7, n <= 4 terms this fixture's global batch sums) is ~= 3.6e-7, three orders of magnitude under 2e-4, while staying more than three orders of magnitude below the O(1) divergence a real gradient-routing bug produces (the same oracle's own executed red-proof measured 0.37497652 vs 1.0657526).",
+      "registered_sha": "e7440afd5398ae08d531df1826f92efc946fe2ac"
+    },
+    "verdict": "pass",
+    "reason": ""
+  }
+}

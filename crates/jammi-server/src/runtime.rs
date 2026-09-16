@@ -586,22 +586,47 @@ impl OssServer {
                 // one cannot fail in practice; still handled, never
                 // `.unwrap()`ed, since a config reload between `new` and
                 // `bind` is not something this method can rule out).
-                let lease = self
+                let intervals = self
                     .session
                     .inner_config()
                     .lease
                     .intervals()
-                    .map_err(|e| ServerError::Config(e.to_string()))?
-                    .lease();
-                let gang_server = GangServer::new(Arc::clone(&self.session), lease);
+                    .map_err(|e| ServerError::Config(e.to_string()))?;
+                let gang_server = GangServer::new(
+                    Arc::clone(&self.session),
+                    intervals.lease(),
+                    intervals.heartbeat(),
+                );
+                // The process that mounts the gang listener is the process
+                // that can coordinate a `Peer` gang: the coordinator body's
+                // one transport seam (`MemberDialer`) is installed here, over
+                // `gang_rounds::dial_member`. Write-once on the session; a
+                // second `bind` of the same session keeps the first.
+                self.session
+                    .host_admission()
+                    .install_member_dialer(Arc::new(crate::grpc::gang_rounds::GangDialer));
                 #[cfg(feature = "test-hooks")]
                 {
                     gang_refusal_handle = Some(gang_server.refusal_reason_handle());
                 }
-                let routes = tonic::service::Routes::new(PeerServiceServer::new(PeerServer::new(
-                    Arc::clone(&self.session),
-                )))
-                .add_service(GangServiceServer::new(gang_server));
+                // `[server.limits].max_message_bytes` bounds EVERY listener's
+                // inbound decode, this one included: the same per-service
+                // `max_decoding_message_size` setter `assemble_grpc_chain`
+                // applies to every public service (see `crate::limits`'s N5
+                // rustdoc). Without it tonic's own 4 MiB default would be
+                // this listener's cap regardless of the deployment's setting
+                // — a gang round's chunks are sized to the CONFIGURED value.
+                let max_message_bytes: usize =
+                    usize::try_from(self.session.inner_config().server.limits.max_message_bytes)
+                        .unwrap_or(usize::MAX);
+                let routes = tonic::service::Routes::new(
+                    PeerServiceServer::new(PeerServer::new(Arc::clone(&self.session)))
+                        .max_decoding_message_size(max_message_bytes),
+                )
+                .add_service(
+                    GangServiceServer::new(gang_server)
+                        .max_decoding_message_size(max_message_bytes),
+                );
                 Some((listener, routes, Arc::clone(&self.metrics)))
             }
             None => None,
@@ -1110,6 +1135,12 @@ impl BoundServer {
             };
             if let Some(preempted) = preempted {
                 readiness.begin_drain();
+                // Every gang rank held on this host ends `Drain` — with or
+                // without a claim loop to stop (the RELEASE arm's
+                // `release_and_stop`/`release_job_leases` flips the phase
+                // to `Releasing` themselves; the DRAIN arm has no
+                // worker-less entry, so the phase is flipped here).
+                session.host_admission().begin_drain();
                 // W2/R6: the outcome must reflect what THIS arm actually
                 // DID, never merely which signal fired. On EITHER exit — a
                 // signal preempting the preload, or the preload itself
@@ -1245,9 +1276,14 @@ impl BoundServer {
             let readiness_ref = Arc::clone(&readiness);
             // The gated join half: nothing here runs until DRAIN is
             // signalled, so the worker is never stopped at t = 0.
+            let session_ref = Arc::clone(&session);
             let gated_join = async move {
                 let _ = drain_gate.wait_for(|v| *v).await;
                 readiness_ref.begin_drain();
+                // Held gang ranks end `Drain` the same instant — with or
+                // without a worker (`EmbeddedWorker::begin_drain` flips the
+                // same session-owned phase; this call is idempotent).
+                session_ref.host_admission().begin_drain();
                 match worker_ref {
                     Some(w) => {
                         w.begin_drain().await;
@@ -2562,10 +2598,8 @@ mod audit_master_key_tests {
 ///   (`stop_and_join`, unbounded by design) takes the handle — deterministically,
 ///   via a single hand-driven poll rather than a scheduler race — and waits
 ///   on an in-flight job the test parks mid-materialization with a real hold
-///   registered (`jammi_db::store::mutable::test_hook`, never a wall clock or
-///   the process-global `training_test_hooks::arm_pause_before_spawn_blocking`,
-///   which is not scoped per test and was measured to let a concurrently
-///   running fine-tune test steal the park), and a concurrent RELEASE loses
+///   registered (`jammi_db::store::mutable::test_hook`, never a wall clock),
+///   and a concurrent RELEASE loses
 ///   the handle race (`stop_resolved == false`) and then times out at 2f
 ///   within one heartbeat (`state_witnessed == false`) because the
 ///   still-parked loop never transitions. A prior round of this doc claimed

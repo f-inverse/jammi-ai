@@ -157,6 +157,42 @@ idle_poll_secs = 1
 # one grouped count per tick on a dedicated task, never on a `/metrics`
 # scrape and never on the claim loop. Must be >= 1. Default: 5.
 metrics_sample_secs = 5
+# How many ranks THIS HOST places on its own `[gpu] devices` for a
+# distributed training job it runs entirely in-process - one rank per
+# device, rank `i` on `[gpu] devices[i]`. Must be >= 1 (the default, 1, is
+# the single-rank deployment: no gang, no collective) and never more than
+# the configured device count. Orthogonal to a submitted job's own
+# `world_size` (a separate, per-job knob) and to `[distributed]
+# max_world_size` (the fleet-wide bound on a `Peer` gang across hosts) -
+# the three knobs load independently, with no cross-check between any
+# pair. A claimed job whose `world_size` is within `local_ranks` runs every
+# rank in this process over a `Local` gang; one wider than `local_ranks`
+# makes this process rank 0 of a `Peer` gang whose other ranks are fleet
+# members it assembles and dials.
+local_ranks = 1
+# Which collective a multi-rank worker reduces gradients over. Default:
+# "auto" (the best collective this process can actually reach: NCCL on a
+# CUDA build, the host CPU reduction otherwise). "nccl" on a build without
+# the `cuda` feature is refused at session open. Configuration, not a build
+# feature.
+collective = "auto"
+# How long a rank waits on its peers at a gang boundary before the wait is a
+# failure: on the coordinator, a member silent this long retires the attempt
+# (requeued from its checkpoint, one attempt spent). Must be > 0 - a zero
+# deadline expires before any peer can answer, turning every gang into an
+# immediate failure. Default: 120.
+rank_timeout_secs = 120
+
+[distributed]
+# The widest `Peer` gang any coordinator on this deployment may admit,
+# bounding a job's own `world_size` ACROSS FLEET MEMBERS: a submitted
+# `world_size` past it is refused at submit, from configuration alone; one
+# within it submits even when it is wider than this host's own `[gpu]
+# devices`, and is decided by assembly on the claiming coordinator. Loads
+# independently of `[worker]`'s own per-host rank count -- the two knobs
+# are checked against each other by nothing. Must be >= 1 (1, the default,
+# admits no fleet gang at all).
+max_world_size = 1
 
 [jobs]
 # How many days a terminal (completed/failed) job row survives before the
@@ -201,9 +237,9 @@ preload_models = [
 # coordinator -- the owner/member trusts the channel; the peer side binds no
 # tenant and enforces only that each requested segment belongs to the named
 # table (the coordinator resolved that table through its own tenant-scoped
-# catalog read before fanning out); the gang side reads no tenant value at
-# all today -- never the caller's, and the admission row it reads carries no
-# tenant column (tenant-scoped resolution is U5a-2's, #566). Bind it on a
+# catalog read before fanning out); the gang side never reads the caller's
+# tenant either -- a rank's tenant is derived from the verified `jobs` row,
+# and its training set is resolved under that tenant alone. Bind it on a
 # private interface behind
 # network policy / mTLS from the runtime: on a routable interface without
 # them it exposes cross-tenant reads. See security.md "The peer listener"
@@ -263,8 +299,10 @@ preload_models = [
 # any of these is refused at the edge -- before any tenant-scoped catalog
 # read runs, so a refusal never leaks cross-tenant existence -- with a typed
 # gRPC status and a jammi_grpc_refused_total{reason} counter increment.
-# Maximum inbound message size, in bytes. Must be > 0. Default: 67108864
-# (64 MiB). There is no outbound cap.
+# Maximum inbound message size, in bytes, on EVERY listener: the public
+# chain and the internal `peer_bind` listener (a gang round's chunks are
+# sized to it). Must be > 0. Default: 67108864 (64 MiB). There is no
+# outbound cap.
 max_message_bytes = 67108864
 # Global cap on unary requests in flight across every connection.
 # 0 = unbounded. Default: 256.

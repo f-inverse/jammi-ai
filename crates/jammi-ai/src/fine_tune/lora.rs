@@ -29,24 +29,35 @@ impl LoraModel {
     }
 }
 
-/// Build one `ZerosB` head LoRA layer at `vb.pp(name)`, seeded from
-/// `config.seed` and carrying `config.lora_dropout` (seeded dropout). The
-/// `varmap` receives the seeded trainable A/B tensors. Centralising this keeps
-/// every head builder's per-layer construction identical — seed and dropout
-/// thread through one place.
-fn build_head_layer(
+/// Build one `ZerosB` head LoRA layer at `vb.pp(name)`, carrying
+/// `config.lora_dropout` (seeded dropout). The `varmap` receives the seeded
+/// trainable A/B tensors. Centralising this keeps every head builder's
+/// per-layer construction identical — seed and dropout thread through one
+/// place.
+///
+/// The weight init is always keyed by `config.seed` alone (identical on
+/// every rank of a real gang; DESIGN.md §4's "every rank starts with
+/// identical weights"); `dropout_seed` is INDEPENDENT of it (U4b tail) —
+/// `RankContext::dropout_seed(config.seed)` / the free
+/// `rank_dropout_seed(config.seed, rank)` (`trainer.rs`) at a real gang's
+/// per-rank call site, and `config.seed` itself (rank 0's identity) at
+/// every `build_*_head` function's own W=1 convenience wrapper below — see
+/// [`jammi_lora::LoraLinear::new_seeded`]'s doc for why the two draws must
+/// use independent seeds.
+fn build_head_layer_for_rank(
     base: Linear,
     config: &super::FineTuneConfig,
     varmap: &VarMap,
     vb: &VarBuilder,
     name: &str,
+    dropout_seed: u64,
 ) -> Result<LoraLinear> {
     let dropout = if config.lora_dropout > 0.0 {
         Some(config.lora_dropout as f32)
     } else {
         None
     };
-    LoraLinear::new(
+    LoraLinear::new_seeded(
         base,
         config.lora_rank,
         config.lora_alpha,
@@ -54,6 +65,7 @@ fn build_head_layer(
         jammi_lora::LoraInitMode::ZerosB,
         dropout,
         config.seed,
+        dropout_seed,
         varmap,
         &vb.pp(name),
     )
@@ -71,17 +83,32 @@ pub fn build_classification_head(
     varmap: &VarMap,
     vb: &VarBuilder,
 ) -> Result<LoraModel> {
+    build_classification_head_for_rank(hidden_size, num_classes, config, varmap, vb, config.seed)
+}
+
+/// U4b tail: [`build_classification_head`] with every layer's dropout mask
+/// keyed by `dropout_seed` — see `build_head_layer_for_rank`'s doc.
+pub fn build_classification_head_for_rank(
+    hidden_size: usize,
+    num_classes: usize,
+    config: &super::FineTuneConfig,
+    varmap: &VarMap,
+    vb: &VarBuilder,
+    dropout_seed: u64,
+) -> Result<LoraModel> {
     // Layer 0: projection (identity base, same as embedding)
     let proj_base = Tensor::eye(hidden_size, DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("Projection identity: {e}")))?;
     let proj_linear = Linear::new(proj_base, None);
-    let projection = build_head_layer(proj_linear, config, varmap, vb, "projection")?;
+    let projection =
+        build_head_layer_for_rank(proj_linear, config, varmap, vb, "projection", dropout_seed)?;
 
     // Layer 1: classifier (zeros base, trained from scratch via LoRA)
     let cls_base = Tensor::zeros((num_classes, hidden_size), DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("Classifier zeros: {e}")))?;
     let cls_linear = Linear::new(cls_base, None);
-    let classifier = build_head_layer(cls_linear, config, varmap, vb, "classifier")?;
+    let classifier =
+        build_head_layer_for_rank(cls_linear, config, varmap, vb, "classifier", dropout_seed)?;
 
     Ok(LoraModel {
         layers: vec![
@@ -106,15 +133,36 @@ pub fn build_distribution_head(
     varmap: &VarMap,
     vb: &VarBuilder,
 ) -> Result<LoraModel> {
+    build_distribution_head_for_rank(hidden_size, output_dim, config, varmap, vb, config.seed)
+}
+
+/// U4b tail: [`build_distribution_head`] with every layer's dropout mask
+/// keyed by `dropout_seed` — see `build_head_layer_for_rank`'s doc.
+pub fn build_distribution_head_for_rank(
+    hidden_size: usize,
+    output_dim: usize,
+    config: &super::FineTuneConfig,
+    varmap: &VarMap,
+    vb: &VarBuilder,
+    dropout_seed: u64,
+) -> Result<LoraModel> {
     let proj_base = Tensor::eye(hidden_size, DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("Regression projection identity: {e}")))?;
     let proj_linear = Linear::new(proj_base, None);
-    let projection = build_head_layer(proj_linear, config, varmap, vb, "projection")?;
+    let projection =
+        build_head_layer_for_rank(proj_linear, config, varmap, vb, "projection", dropout_seed)?;
 
     let head_base = Tensor::zeros((output_dim, hidden_size), DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("Distribution head zeros: {e}")))?;
     let head_linear = Linear::new(head_base, None);
-    let distribution = build_head_layer(head_linear, config, varmap, vb, "distribution")?;
+    let distribution = build_head_layer_for_rank(
+        head_linear,
+        config,
+        varmap,
+        vb,
+        "distribution",
+        dropout_seed,
+    )?;
 
     Ok(LoraModel {
         layers: vec![
@@ -135,17 +183,38 @@ pub fn build_ner_head(
     varmap: &VarMap,
     vb: &VarBuilder,
 ) -> Result<LoraModel> {
+    build_ner_head_for_rank(hidden_size, num_labels, config, varmap, vb, config.seed)
+}
+
+/// U4b tail: [`build_ner_head`] with every layer's dropout mask keyed by
+/// `dropout_seed` — see `build_head_layer_for_rank`'s doc.
+pub fn build_ner_head_for_rank(
+    hidden_size: usize,
+    num_labels: usize,
+    config: &super::FineTuneConfig,
+    varmap: &VarMap,
+    vb: &VarBuilder,
+    dropout_seed: u64,
+) -> Result<LoraModel> {
     // Layer 0: projection (identity base, same as embedding/classification)
     let proj_base = Tensor::eye(hidden_size, DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("NER projection identity: {e}")))?;
     let proj_linear = Linear::new(proj_base, None);
-    let projection = build_head_layer(proj_linear, config, varmap, vb, "projection")?;
+    let projection =
+        build_head_layer_for_rank(proj_linear, config, varmap, vb, "projection", dropout_seed)?;
 
     // Layer 1: token classifier (zeros base, trained from scratch via LoRA)
     let cls_base = Tensor::zeros((num_labels, hidden_size), DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("NER classifier zeros: {e}")))?;
     let cls_linear = Linear::new(cls_base, None);
-    let classifier = build_head_layer(cls_linear, config, varmap, vb, "token_classifier")?;
+    let classifier = build_head_layer_for_rank(
+        cls_linear,
+        config,
+        varmap,
+        vb,
+        "token_classifier",
+        dropout_seed,
+    )?;
 
     Ok(LoraModel {
         layers: vec![
@@ -167,10 +236,29 @@ pub fn build_projection_head(
     varmap: &VarMap,
     vb: &VarBuilder,
 ) -> Result<LoraModel> {
+    build_projection_head_for_rank(hidden_size, config, varmap, vb, config.seed)
+}
+
+/// U4b tail: [`build_projection_head`] with the dropout mask keyed by
+/// `dropout_seed` — see `build_head_layer_for_rank`'s doc. The ONE layer
+/// this head builds still inits from `config.seed` alone (identical on
+/// every rank), so two ranks built through this function with the SAME
+/// `config` and DIFFERENT `dropout_seed` start with byte-identical
+/// `lora_a`/`lora_b` weights and diverge only in their dropout Philox
+/// stream — the property `gang_determinism_oracle`'s
+/// `dropout_seed_split_leaves_init_identical_and_dropout_distinct` (U4b
+/// tail) pins directly.
+pub fn build_projection_head_for_rank(
+    hidden_size: usize,
+    config: &super::FineTuneConfig,
+    varmap: &VarMap,
+    vb: &VarBuilder,
+    dropout_seed: u64,
+) -> Result<LoraModel> {
     let base_weight = Tensor::eye(hidden_size, DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("Identity weight: {e}")))?;
     let base = Linear::new(base_weight, None);
-    let lora = build_head_layer(base, config, varmap, vb, "projection")?;
+    let lora = build_head_layer_for_rank(base, config, varmap, vb, "projection", dropout_seed)?;
     Ok(LoraModel {
         layers: vec![("projection".into(), lora)],
     })

@@ -344,7 +344,13 @@ impl MetricsRegistry {
                     for (kind, n) in sample.running {
                         w.jobs_running.with_label_values(&[&kind]).set(n);
                     }
-                    w.jobs_in_flight.set(shared.in_flight() as i64);
+                    // A loop-claimed job runs under a hold iff the host's
+                    // slot holder is `JobRun` — never a `ClaimProbe` (claim
+                    // in flight), never a held gang `Rank` (not loop work).
+                    w.jobs_in_flight.set(matches!(
+                        shared.admission().holder(),
+                        jammi_ai::fine_tune::worker::Holder::JobRun
+                    ) as i64);
                     w.claim_loop_up
                         .set((shared.loop_state() == LoopState::Running) as i64);
                 }

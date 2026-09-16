@@ -21,12 +21,17 @@ use sha2::Digest;
 use crate::fine_tune::adamw::{AdamW, ParamsAdamW};
 use jammi_db::error::{JammiError, Result};
 
+use super::collective::{BlockingCall, Collective, Noop};
 use super::data::{TextChunk, TrainingDataLoader, TrainingFormat};
-use super::optimizer::{accumulate_grads, clip_and_step, DEFAULT_NORM_CHECK_INTERVAL};
+use super::optimizer::{
+    accumulate_grads, canonical_reduce, clip_and_step, DEFAULT_NORM_CHECK_INTERVAL,
+};
+use super::partition::{PartitionRule, PartitionSpec};
 use super::regression_loss::{crps_gaussian_loss, gaussian_nll_loss, pinball_loss, TargetScaler};
 use super::resume::{
     capture_bundle, NamedMoments, RestoredCheckpoint, ResumeState, RESUME_STATE_SCHEMA_VERSION,
 };
+use super::role::RunnerRole;
 use super::target::TrainingTarget;
 use super::{EarlyStoppingMetric, FineTuneConfig, LrSchedule};
 use crate::model::{LoadedModel, ModelTask};
@@ -297,6 +302,222 @@ struct SimStats {
     count: usize,
 }
 
+/// One rank's identity and step context inside a gang (DESIGN.md §4, "The
+/// gang"): the collective this rank reduces over, and the partition
+/// assignment (`rank`, `world`, per-rank `batch`, the partition rule) every
+/// step's row slice and gather-count vector derives from.
+///
+/// `W = 1` holds [`Noop`] over [`PartitionSpec::single_rank`] — [`Self::
+/// single_rank`] is the [`TrainingLoopBuilder`]'s own default when no
+/// [`RankContext`] is set explicitly, so every pre-U4b single-rank run and
+/// test builds this SAME value: wiring `RankContext` through the trainer
+/// changes zero bytes at W=1. The trainer's collective calls (`all_gather`/
+/// `all_reduce_sum`/`all_reduce_max_flags`) run at every world size through
+/// `Self::collective` — never an `if world == 1` fast path that skips
+/// them; [`Noop`]'s verbs ARE the W=1 fast path (DESIGN.md §4).
+pub struct RankContext {
+    collective: Arc<dyn Collective>,
+    partition: PartitionSpec,
+}
+
+impl RankContext {
+    /// A gang of one: [`Noop`] over [`PartitionSpec::single_rank`].
+    pub fn single_rank(batch: usize, rule: PartitionRule) -> Self {
+        Self {
+            collective: Arc::new(Noop::new()),
+            partition: PartitionSpec::single_rank(batch, rule),
+        }
+    }
+
+    /// A named rank of a real gang: `partition.rank()`/`partition.world()`
+    /// must already agree with `collective.rank()`/`collective.world()` —
+    /// callers build both from the SAME `(rank, world)` pair (e.g.
+    /// `LocalGang::rank(r)` paired with `PartitionSpec::for_gang(r, world,
+    /// ..)`), so this constructor does not re-check it; a caller that hands
+    /// in a mismatched pair gets a gang whose `all_gather` calls disagree
+    /// with its own row slicing, which is a caller bug this module has no
+    /// way to detect from the two values alone (a `Collective` does not
+    /// expose the partition rule it was built for).
+    pub fn new(collective: Arc<dyn Collective>, partition: PartitionSpec) -> Self {
+        Self {
+            collective,
+            partition,
+        }
+    }
+
+    /// This rank's index in `0..world`.
+    pub fn rank(&self) -> u32 {
+        self.collective.rank()
+    }
+
+    /// How many ranks this gang has.
+    pub fn world(&self) -> u32 {
+        self.collective.world()
+    }
+
+    /// The partition assignment this rank steps by.
+    pub fn partition(&self) -> PartitionSpec {
+        self.partition
+    }
+
+    /// [`Collective::all_gather`], routed through this ONE seam — every
+    /// trainer call site goes through here rather than reaching into
+    /// `self.collective` directly. Each wrapper takes the [`BlockingCall`]
+    /// witness every `Collective` verb requires and forwards it unchanged:
+    /// the trainer receives ONE witness at [`TrainingLoop::run`] and threads
+    /// it down every path that reaches a wrapper (the gather, the flag
+    /// reduce, `optimizer::canonical_reduce`, the checkpoint gates), so a
+    /// verb is reachable only from a thread that may block — a
+    /// `spawn_blocking` thread or a plain OS thread, never a runtime worker
+    /// (the collective module doc, "The blocking-call witness").
+    pub fn all_gather(
+        &self,
+        call: &BlockingCall,
+        local: &Tensor,
+        counts: &[usize],
+    ) -> Result<Tensor> {
+        self.collective.all_gather(call, local, counts)
+    }
+
+    /// [`Collective::all_reduce_sum`], routed through this ONE seam.
+    pub fn all_reduce_sum(&self, call: &BlockingCall, tensors: &mut [Tensor]) -> Result<()> {
+        self.collective.all_reduce_sum(call, tensors)
+    }
+
+    /// [`Collective::all_reduce_max_flags`], routed through this ONE seam.
+    pub fn all_reduce_max_flags(&self, call: &BlockingCall, flags: u32) -> Result<u32> {
+        self.collective.all_reduce_max_flags(call, flags)
+    }
+
+    /// [`Collective::broadcast`], routed through this ONE seam.
+    pub fn broadcast(&self, call: &BlockingCall, t: &mut Tensor, root: u32) -> Result<()> {
+        self.collective.broadcast(call, t, root)
+    }
+
+    /// [`Collective::barrier`], routed through this ONE seam.
+    pub fn barrier(&self, call: &BlockingCall) -> Result<()> {
+        self.collective.barrier(call)
+    }
+
+    /// A stable digest of the CANONICAL `trainable_vars` name order this
+    /// gang's reduce must agree on (the same order [`super::optimizer::
+    /// sorted_trainable_vars`] produces, threaded through
+    /// `optimizer::canonical_reduce`) — exposed here for the
+    /// concurrently-built `Peer` collective (U5b-1b-i), whose round
+    /// descriptor carries this as `agreement`: a wire round only publishes
+    /// once every rank's descriptor (root, counts, tensor signatures, AND
+    /// this digest) agrees, so two ranks that would otherwise silently
+    /// reduce two DIFFERENT var orderings together fault symmetrically
+    /// instead. Computed HERE — not re-derived by that future unit — so
+    /// there is exactly one function that decides what "the canonical
+    /// layout" hashes to. A plain, non-cryptographic fold is enough: this
+    /// is a MISMATCH detector between cooperating ranks, never a security
+    /// boundary.
+    pub fn canonical_vars_digest(names: &[String]) -> String {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        for name in names {
+            hasher.update(name.as_bytes());
+            // A separator byte no valid var name can itself contain (LoRA
+            // names are `.`/alnum-joined path segments), so two adjacent
+            // names can never be confused with one longer name.
+            hasher.update([0u8]);
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Bind [`Self::canonical_vars_digest`] of `names` — the canonical
+    /// trainable-variable layout this rank's reduce walks — on the
+    /// collective as the round descriptor's `agreement`
+    /// ([`Collective::bind_agreement`]): the post-target-build seam
+    /// [`TrainingLoop::run`] calls once the varmap is final and before the
+    /// first collective, so a rank whose layout differs from its peers'
+    /// (a different trainable set, a different name order) is a typed
+    /// descriptor disagreement on EVERY rank at the next round, never a
+    /// silently wrong fold of mismatched positions. At W=1 the `Noop`
+    /// accepts and ignores it.
+    pub fn bind_agreement(&self, names: &[String]) -> Result<()> {
+        self.collective
+            .bind_agreement(Self::canonical_vars_digest(names))
+    }
+
+    /// DESIGN.md §4: "each rank's dropout seed derives as `f(seed, rank)`".
+    /// Rank 0 gets `base_seed` back UNCHANGED — the W=1/rank-0 byte-parity
+    /// property every existing seeded-dropout test already pins (this
+    /// crate's model-building call sites pass a run's `FineTuneConfig::seed`
+    /// straight to `LoraLinear::new` today; a rank-0 run must keep deriving
+    /// the IDENTICAL seed, never a "same formula, different constant" value
+    /// that happens to differ from the raw seed at rank 0 too). Every other
+    /// rank gets a distinct, deterministic value folded from `base_seed` and
+    /// `rank` via a fixed-constant XOR-multiply — not itself claimed
+    /// cryptographically strong, only INJECTIVE-in-practice and exactly
+    /// reproducible (family J: no unseeded RNG).
+    pub fn dropout_seed(&self, base_seed: u64) -> u64 {
+        rank_dropout_seed(base_seed, self.rank())
+    }
+}
+
+/// A `u64` dropout position as four 16-bit limbs, least significant first,
+/// each exact in `f32` (`<= 0xFFFF < 2^24`) — the encoding
+/// `TrainingLoop::gather_dropout_positions` carries over a collective, so
+/// the gathered tensor is a dtype every collective carries (`f32`; the
+/// `Peer` wire refuses `f64`) and EVERY `u64` round-trips exactly
+/// ([`decode_dropout_positions`]), not only those below `2^53`.
+pub(crate) fn encode_dropout_positions(positions: &[u64]) -> Vec<f32> {
+    positions
+        .iter()
+        .flat_map(|&v| (0..4).map(move |limb| ((v >> (16 * limb)) & 0xFFFF) as f32))
+        .collect()
+}
+
+/// The inverse of [`encode_dropout_positions`]; a row whose length is not a
+/// multiple of four, or a limb outside `0..=0xFFFF` or non-integral, is a
+/// typed error — a gathered row that is not this encoding is a gang whose
+/// ranks disagree about what they gathered.
+pub(crate) fn decode_dropout_positions(limbs: &[f32]) -> Result<Vec<u64>> {
+    if !limbs.len().is_multiple_of(4) {
+        return Err(JammiError::FineTune(format!(
+            "dropout position gather: a row of {} limbs is not four per position",
+            limbs.len()
+        )));
+    }
+    limbs
+        .chunks_exact(4)
+        .map(|chunk| {
+            let mut value = 0u64;
+            for (limb, &raw) in chunk.iter().enumerate() {
+                if !(0.0..=65535.0).contains(&raw) || raw.fract() != 0.0 {
+                    return Err(JammiError::FineTune(format!(
+                        "dropout position gather: limb {raw} is not a 16-bit integer"
+                    )));
+                }
+                value |= (raw as u64) << (16 * limb);
+            }
+            Ok(value)
+        })
+        .collect()
+}
+
+/// DESIGN.md §4/§6's lockstep control word: the bit [`TrainingLoop::
+/// process_batch_loss`] sets in its `all_reduce_max_flags` call when THIS
+/// rank's own micro-batch loss is `NaN` or `> 100`. `all_reduce_max_flags`
+/// takes the max over every rank's flags, so a divergence forced on ANY
+/// rank is seen — and acted on identically — by every rank, never only the
+/// rank whose own loss actually diverged.
+const LOCKSTEP_FLAG_DIVERGED: u32 = 1 << 0;
+
+/// The free function [`RankContext::dropout_seed`] wraps — free so a caller
+/// building per-rank models BEFORE a `RankContext` exists (`worker.rs`'s
+/// per-rank model construction, which must derive each rank's seed before
+/// it can build that rank's `TrainingLoop`) can call it directly.
+pub fn rank_dropout_seed(base_seed: u64, rank: u32) -> u64 {
+    if rank == 0 {
+        return base_seed;
+    }
+    const RANK_SEED_FOLD: u64 = 0x9E37_79B9_7F4A_7C15;
+    base_seed ^ (rank as u64).wrapping_mul(RANK_SEED_FOLD)
+}
+
 /// The training loop: runs LoRA fine-tuning with gradient accumulation,
 /// early stopping, LR scheduling, and checkpointing.
 pub struct TrainingLoop {
@@ -425,6 +646,23 @@ pub struct TrainingLoop {
     /// into the returned [`TrainingResult`] at the end — see that field's
     /// own doc for the exact boundary and the per-`run`-call reset contract.
     media_front_end_wall: std::cell::Cell<std::time::Duration>,
+    /// This rank's identity and step context inside the gang (DESIGN.md §4).
+    /// [`TrainingLoopBuilder::build`] defaults this to [`RankContext::
+    /// single_rank`] when the builder's own `rank_context` is never set —
+    /// the same value every pre-U4b caller's absence of a setting produces
+    /// today, so this field's mere existence changes zero bytes at W=1.
+    rank_ctx: RankContext,
+    /// What this loop runs AS (`super::role`): the lease holder — the ONE
+    /// writer of the job's durable state — or a rank `>= 1` of a gang,
+    /// which writes nothing durable. The gate every durable write in this
+    /// loop consults ([`Self::save_resume_checkpoint`],
+    /// [`Self::save_epoch_checkpoint`]) — HERE, in the trainer, never
+    /// inside the store, which stays role-agnostic. Agrees with
+    /// `rank_ctx.rank()` by construction ([`TrainingLoopBuilder::build`]
+    /// derives it from the rank when unset and refuses a mismatch when
+    /// set), so rank 0 alone may write and the single-rank default is the
+    /// loop claimer — byte-identical to every pre-role run.
+    role: RunnerRole,
     /// Test seam: runs on the gradients every optimizer step is about to
     /// consume, right after `backward` (and, on the GradCache arm, after the
     /// two-pass `gradcache_backward`), keyed by the 1-based index of that
@@ -469,6 +707,14 @@ pub struct TrainingLoopBuilder {
     resume: Option<RestoredCheckpoint>,
     /// See [`TrainingLoop::tenant`]. Defaults to `None`.
     tenant: Option<TenantId>,
+    /// See [`TrainingLoop::rank_ctx`]. `None` until [`Self::rank_context`] is
+    /// called; [`Self::build`] defaults it to [`RankContext::single_rank`]
+    /// over `config.batch_size` — every pre-U4b caller's W=1 shape.
+    rank_ctx: Option<RankContext>,
+    /// See [`TrainingLoop::role`]. `None` until [`Self::runner_role`] is
+    /// called; [`Self::build`] then derives it from the rank context
+    /// (`RunnerRole::implied_by_rank`).
+    runner_role: Option<RunnerRole>,
 }
 
 impl TrainingLoopBuilder {
@@ -495,7 +741,30 @@ impl TrainingLoopBuilder {
             result_store: None,
             resume: None,
             tenant: None,
+            rank_ctx: None,
+            runner_role: None,
         }
+    }
+
+    /// Set what this loop runs AS — see `TrainingLoop::role`. The
+    /// production worker sets it on every rank (the lease holder on rank 0,
+    /// `Rank { rank }` on every other); omit it and [`Self::build`] derives
+    /// the role the rank context implies (rank 0 → the loop claimer, the
+    /// pre-gang default; rank `r` → `Rank { r }`). A role that disagrees
+    /// with the rank context's own rank is refused at `build`.
+    pub fn runner_role(mut self, role: RunnerRole) -> Self {
+        self.runner_role = Some(role);
+        self
+    }
+
+    /// Set this rank's [`RankContext`] — the collective it reduces over and
+    /// the partition assignment it steps by. Omit it for a single-rank run
+    /// ([`Self::build`] defaults to [`RankContext::single_rank`] over
+    /// `config.batch_size`, under [`super::partition::PartitionRule::
+    /// BlockByGlobalBatch`] — the only rule this plan defines).
+    pub fn rank_context(mut self, rank_ctx: RankContext) -> Self {
+        self.rank_ctx = Some(rank_ctx);
+        self
     }
 
     /// Set the job's tenant — the first prefix segment every checkpoint this
@@ -648,6 +917,29 @@ impl TrainingLoopBuilder {
         // collision is a hard, typed refusal at construction time, never
         // a silent correlated-dropout defect discovered later.
         self.target.assert_dropout_layer_ids_are_collision_free()?;
+        // Defaults to a gang of one — the same value every pre-U4b caller's
+        // absence of a `rank_context()` call produces, so this changes zero
+        // bytes at W=1 (`RankContext`'s own doc).
+        let rank_ctx = self.rank_ctx.unwrap_or_else(|| {
+            RankContext::single_rank(self.config.batch_size, PartitionRule::BlockByGlobalBatch)
+        });
+        // The role agrees with the rank by construction: derived from it
+        // when unset, refused when set to a value the rank contradicts — so
+        // "rank 0 alone writes" and "a `Rank` never writes" are the same
+        // fact stated once.
+        let role = match self.runner_role {
+            None => RunnerRole::implied_by_rank(rank_ctx.rank()),
+            Some(role) if role.rank() == rank_ctx.rank() => role,
+            Some(role) => {
+                return Err(JammiError::FineTune(format!(
+                    "TrainingLoopBuilder: runner role {role} names rank {} but the rank \
+                     context is rank {} of {}: the role and the rank must agree",
+                    role.rank(),
+                    rank_ctx.rank(),
+                    rank_ctx.world()
+                )));
+            }
+        };
         let mut training_loop = TrainingLoop {
             target: self.target,
             base_model: self.base_model,
@@ -671,6 +963,8 @@ impl TrainingLoopBuilder {
             tenant: self.tenant,
             epoch_checkpoints: Vec::new(),
             media_front_end_wall: std::cell::Cell::new(std::time::Duration::ZERO),
+            rank_ctx,
+            role,
             #[cfg(test)]
             after_backward: None,
         };
@@ -838,7 +1132,21 @@ impl TrainingLoop {
     /// - With `base_model`: text-based loaders encode through the frozen base
     ///   model, project through LoRA, and compute loss on the projected embeddings.
     /// - Without `base_model`: precomputed tensor batches go directly to loss.
-    pub fn run(&mut self, source: super::source::TrainingSource) -> Result<TrainingResult> {
+    ///
+    /// `call` is the [`BlockingCall`] witness: the ONE place the trainer
+    /// receives it. Every collective the run makes — the per-step gather
+    /// (`Self::compute_loss_gathered`), the lockstep flag reduce and the
+    /// window-boundary `canonical_reduce` (`Self::process_batch_loss`),
+    /// the trailing-window `canonical_reduce`, and the epoch-boundary
+    /// dropout-position gather (`Self::save_resume_checkpoint`) — takes
+    /// this same witness, so `run` is callable only from a thread that may
+    /// block: production mints it at the worker's `spawn_blocking`
+    /// boundary (`worker.rs`), never here.
+    pub fn run(
+        &mut self,
+        call: &BlockingCall,
+        source: super::source::TrainingSource,
+    ) -> Result<TrainingResult> {
         use super::source::TrainingSource;
 
         // Reset the media front-end accumulator for THIS `run` call — see
@@ -872,6 +1180,71 @@ impl TrainingLoop {
                      `source::whole_set_arm` must have selected Resident for this \
                      configuration — internal invariant violated"
                 )));
+            }
+            // U4b tail: the per-rank stream's own zero-row-at-the-trailing-
+            // step hazard (the SAME hazard the Resident arm's fix closes,
+            // below) is now closed at the stream's own layer
+            // (`stream.rs::run_pump`'s `step_bound`, derived identically to
+            // `train_batches_per_epoch` below): a zero-row chunk at an
+            // in-bound step is real content, never end-of-epoch, and the
+            // pump's own bound can never drift from this loop's, since both
+            // are `partition::batches_per_epoch` over the SAME
+            // `(train_count, world, batch)`. `world > 1` is no longer
+            // refused here — see the Streamed arm of the epoch loop below.
+        }
+
+        // U4b (design pressure round, finding 4): the three arms with NO
+        // gather story at all — hard-negative mining, GradCache, and the
+        // `Precomputed` test loader — are refused, typed, at `world > 1`,
+        // rather than silently run through a per-rank slice `if world == 1`
+        // would have skipped:
+        //   - mining (`mining_eligible`) retrieves from THIS PROCESS's own
+        //     index over its own local corpus view — a per-rank index would
+        //     mine a different negative pool per rank, never the objective a
+        //     gang is supposed to compute (the SAME reasoning
+        //     `RankAdmission::admit`'s existing `world_size > 1` +
+        //     `hard_negatives.mine` submit-time refusal already applies; this
+        //     is the SAME rule re-stated at the run-time edge, in case a
+        //     `TrainingLoop` is ever driven directly, past that admission).
+        //   - GradCache (`gradcache_eligible`) computes a LOCAL in-batch-
+        //     negative loss over the whole (local) train prefix — gathering
+        //     its result would silently score a DIFFERENT objective than
+        //     the caller asked for, not the real GradCache one (the same
+        //     submit-time refusal `RankAdmission::admit` already applies for
+        //     `config.cached`; restated here at the run-time edge).
+        //   - a `Precomputed` loader (trainer-internal tests only) ignores
+        //     `PartitionSpec` entirely — every rank would see the IDENTICAL
+        //     rows, so an oracle built on it would be vacuous, never
+        //     exercising the partition rule at all.
+        // None of the three has a gather story built in this unit; each is a
+        // named, deferred follow-up, not a silent gap.
+        if self.rank_ctx.world() > 1 {
+            if self.mining_eligible() {
+                return Err(JammiError::FineTune(
+                    "hard-negative mining at world > 1 is refused: the miner retrieves from \
+                     this process's own index over its own local corpus view, so each rank \
+                     would mine a different negative pool — not yet built for a real gang"
+                        .into(),
+                ));
+            }
+            if self.gradcache_eligible() {
+                return Err(JammiError::FineTune(
+                    "GradCache at world > 1 is refused: it computes a local in-batch-negative \
+                     loss over this rank's own train prefix, and gathering that result would \
+                     score a different objective than a real GradCache run — not yet built \
+                     for a real gang"
+                        .into(),
+                ));
+            }
+            if let TrainingSource::Resident(loader) = &source {
+                if loader.is_precomputed() {
+                    return Err(JammiError::FineTune(
+                        "a Precomputed loader at world > 1 is refused: it ignores PartitionSpec \
+                         entirely (every rank would see the identical rows), so it is a \
+                         trainer-internal test affordance only, never a real gang's source"
+                            .into(),
+                    ));
+                }
             }
         }
 
@@ -984,12 +1357,13 @@ impl TrainingLoop {
         // DESIGN.md §2: `batches_per_epoch = ceil(train_count / (W·B))`, every
         // step quantity (this, the LR horizon via `total_steps` below, and the
         // trailing-window scale via `EpochContext::batches_per_epoch`) indexed
-        // by the GLOBAL batch. `world` is fixed at `1` at this commit — the
-        // only value a [`super::partition::PartitionSpec::single_rank`] spec
-        // ever carries (U4b is what would ever spawn more than one rank) — so
-        // this is byte-identical to `train_loader.num_batches
-        // (self.config.batch_size)` — the W=1 parity oracle
-        // `partition::batches_per_epoch_at_world_one_matches_div_ceil` pins.
+        // by the GLOBAL batch. `world` is `self.rank_ctx.world()` — `1` for
+        // every pre-U4b caller and every trainer-internal test that never
+        // calls `TrainingLoopBuilder::rank_context`, so this is byte-identical
+        // to `train_loader.num_batches(self.config.batch_size)` there — the
+        // W=1 parity oracle
+        // `partition::batches_per_epoch_at_world_one_matches_div_ceil` pins —
+        // and `ceil(train_count / (W·B))` at a real gang's `W > 1`.
         //
         // The `Precomputed` test arm is split BY BATCH COUNT, not by row
         // count (`TrainingDataLoader::num_batches` returns `batches.len()`
@@ -1004,6 +1378,7 @@ impl TrainingLoop {
         // the `Resident` text arm uses, so a `Streamed` and a `Resident`
         // source over the identical `(train_count, batch_size)` compute the
         // identical horizon (the W=1 parity oracle this doc already names).
+        let world = self.rank_ctx.world() as usize;
         let train_batches_per_epoch = match &source {
             Source::Resident { train_loader, .. } => {
                 if train_loader.is_precomputed() {
@@ -1011,13 +1386,13 @@ impl TrainingLoop {
                 } else {
                     super::partition::batches_per_epoch(
                         train_loader.len(),
-                        1,
+                        world,
                         self.config.batch_size,
                     )
                 }
             }
             Source::Streamed(streamed) => {
-                super::partition::batches_per_epoch(streamed.train_count, 1, streamed.batch)
+                super::partition::batches_per_epoch(streamed.train_count, world, streamed.batch)
             }
         };
         let total_steps = train_batches_per_epoch
@@ -1186,6 +1561,17 @@ impl TrainingLoop {
         // the correlation is independent of any HashMap iteration order.
         let optim_param_names = self.optimizer_param_names(&trainable_vars)?;
 
+        // The agreement binding (DESIGN.md §4, the canonical layout): the
+        // target is built and the varmap is final, so this rank's canonical
+        // trainable-variable NAME order is known and is bound on the
+        // collective before the first collective call — a rank whose layout
+        // differs from its peers' is a typed descriptor disagreement at the
+        // next round on every rank (`RankContext::bind_agreement`), never a
+        // wrong fold. The names come from the SAME lock and sort as
+        // `trainable_vars` above (`sorted_trainable_var_names`).
+        self.rank_ctx
+            .bind_agreement(&super::optimizer::sorted_trainable_var_names(&self.varmap))?;
+
         // Restore from a discovered resume bundle (weights + optimizer moments +
         // scaler + dropout positions). The persisted scaler is authoritative — it
         // overrides the just-computed one so a source mutated between crash and
@@ -1322,6 +1708,7 @@ impl TrainingLoop {
                             Self::accumulate_sim_stats(&batch, &mut sim_stats);
                             let loss = self.compute_loss(&batch)?;
                             self.process_batch_loss(
+                                call,
                                 loss,
                                 EpochState {
                                     batch_count: &mut batch_count,
@@ -1365,47 +1752,55 @@ impl TrainingLoop {
                         // compute loss. Walks `epoch_loader` by PartitionSpec-selected
                         // GLOBAL step (DESIGN.md §2) rather than a pre-collected
                         // `Vec<TextChunk>` — one step's row slice is decoded at a
-                        // time, never the whole epoch's chunks at once. The spec is
-                        // always [`super::partition::PartitionSpec::single_rank`]
-                        // (rank 0 of world 1, the only assignment reachable at this
-                        // commit — U4b is what would ever spawn more than one rank),
-                        // under which `rows_for_step` walks exactly the same `[s*B,
-                        // (s+1)*B)` row slices `epoch_loader.chunks(batch_size)` would
-                        // have collected, terminating at the same boundary — the
-                        // first empty chunk, which falls exactly at
-                        // `epoch_loader.len().div_ceil(batch_size)` steps — so this is
-                        // a control-flow change only; the W=1 parity oracle is the
-                        // whole existing trainer suite passing byte-for-byte.
+                        // time, never the whole epoch's chunks at once.
                         //
-                        // Bound by `epoch_loader`'s OWN row count via the
-                        // empty-chunk terminator, never by `train_batches_per_epoch`
-                        // (computed once from `train_loader`, before the loop): a
-                        // hard-negative-mined `epoch_loader` can hold a different row
-                        // count than `train_loader` on a refresh epoch (see the
-                        // `total_optimizer_steps` doc above), and this loop must keep
-                        // iterating exactly as many chunks as THIS epoch's loader
-                        // actually holds, as `text_chunks` always did.
-                        let partition_spec = super::partition::PartitionSpec::single_rank(
-                            self.config.batch_size,
-                            super::partition::PartitionRule::BlockByGlobalBatch,
-                        );
-                        // `EpochSource::Resident`'s `next_chunk` is a pure
-                        // control-flow rewrap of `text_chunk_for_rank` (see
-                        // its own doc) — zero bytes of this arm's output
-                        // change; it exists so the Resident and Streamed
-                        // production text arms share one chunk-source
-                        // interface.
-                        let mut epoch_source = super::stream::EpochSource::Resident(epoch_loader);
-                        let mut step = 0usize;
-                        loop {
-                            let Some(chunk) = epoch_source.next_chunk(&partition_spec, step)?
-                            else {
-                                break;
-                            };
+                        // U4b: bounded by the FIXED, once-computed
+                        // `train_batches_per_epoch` (`ceil(train_count / (W·B))`,
+                        // identical on every rank), never by "this rank's own
+                        // chunk happened to come back empty" — the two coincide
+                        // at W=1 (a zero-row chunk can only ever occur at
+                        // `step == train_batches_per_epoch`, one past this
+                        // loop's last real step, so the W=1 parity oracle is
+                        // the whole existing trainer suite passing
+                        // byte-for-byte) but DIVERGE at W>1: the partition
+                        // rule's own zero-row-rank case (DESIGN.md §2 — a rank
+                        // whose slice is empty at the trailing global batch
+                        // while a PEER rank's slice at that SAME step is not)
+                        // falls strictly BEFORE `train_batches_per_epoch`, and
+                        // terminating on this rank's own empty chunk there
+                        // would make this rank reach the gather/reduce
+                        // collectives fewer times than its peers — exactly the
+                        // rank-count-skew hazard DESIGN.md §6's lockstep oracle
+                        // names. Calls `text_chunk_for_rank` directly rather
+                        // than through a None-collapsing wrapper (the
+                        // now-removed `EpochSource::Resident` arm this loop
+                        // used pre-U4b), since a genuinely empty-but-in-bound
+                        // chunk must be encoded (as a 0-row batch, `Self::
+                        // encode_texts`'s own empty-batch guard) and gathered,
+                        // never treated as "no more work this epoch".
+                        //
+                        // Bound by `epoch_loader`'s OWN row count (via THIS
+                        // per-step `counts_for_step`/`text_chunk_for_rank`
+                        // pair, both over `epoch_loader.len()`), never by a
+                        // `train_batches_per_epoch` computed once from
+                        // `train_loader` before the loop: a hard-negative-mined
+                        // `epoch_loader` can hold a different row count than
+                        // `train_loader` on a refresh epoch (see the
+                        // `total_optimizer_steps` doc above) — mining is W=1
+                        // only (K2), so at W>1 `epoch_loader` and `train_loader`
+                        // are always the same loader and this distinction is
+                        // moot, but the per-step derivation still reads the
+                        // loader it actually walks, not a cached count.
+                        let partition_spec = self.rank_ctx.partition();
+                        let train_count = epoch_loader.len();
+                        for step in 0..train_batches_per_epoch {
+                            let chunk = epoch_loader.text_chunk_for_rank(&partition_spec, step)?;
+                            let counts = partition_spec.counts_for_step(train_count, step);
                             let batch = self.encode_chunk(&chunk)?;
-                            let loss = self.compute_loss(&batch)?;
+                            let loss = self.compute_loss_gathered(call, &batch, &counts)?;
                             Self::accumulate_sim_stats(&batch, &mut sim_stats);
                             self.process_batch_loss(
+                                call,
                                 loss,
                                 EpochState {
                                     batch_count: &mut batch_count,
@@ -1424,40 +1819,53 @@ impl TrainingLoop {
                                     batches_per_epoch: train_batches_per_epoch,
                                 },
                             )?;
-                            step += 1;
                         }
                     }
                 }
                 Source::Streamed(streamed) => {
                     // Production path over a fresh per-epoch stream (#500
                     // U2c §10): the SAME per-step body as the Resident text
-                    // arm above (encode → loss → accumulate sim stats →
-                    // `process_batch_loss`), sourcing its chunks from a
-                    // [`super::stream::EpochSource::Stream`] instead of an
-                    // already-resident loader. `PartitionSpec::single_rank`
-                    // is baked into the stream's own `Slice::PerRank` at
-                    // `open` (never re-applied per chunk, unlike the
-                    // Resident arm, which re-derives the slice on every
-                    // `text_chunk_for_rank` call — both land on the
-                    // identical `[s*B, (s+1)*B)` row range for the SAME
-                    // step, the W=1 parity property P6 pins).
-                    let partition_spec = super::partition::PartitionSpec::single_rank(
-                        self.config.batch_size,
-                        super::partition::PartitionRule::BlockByGlobalBatch,
-                    );
-                    let window = super::stream::RowWindow::new(0, streamed.train_count);
+                    // arm above (encode → gather → loss → accumulate sim
+                    // stats → `process_batch_loss`), sourcing its chunks from
+                    // a [`super::stream::EpochSource`] instead of an
+                    // already-resident loader. `self.rank_ctx.partition()` is
+                    // baked into the stream's own `Slice::PerRank` at `open`
+                    // (never re-applied per chunk, unlike the Resident arm,
+                    // which re-derives the slice on every `text_chunk_for_rank`
+                    // call — both land on the identical `[s*B, (s+1)*B)` row
+                    // range for the SAME step, the W=1 parity property P6
+                    // pins).
+                    //
+                    // U4b tail: bounded by the SAME fixed, once-computed
+                    // `train_batches_per_epoch` the Resident arm uses above,
+                    // never "the stream came back empty" — `EpochSource::
+                    // next_chunk` now hands back a real (possibly 0-row)
+                    // chunk for every `step` short of this bound (the
+                    // pump's own `step_bound`, `stream.rs::run_pump`, is
+                    // `partition::batches_per_epoch` over the identical
+                    // `(train_count, world, batch)`, so the two bounds can
+                    // never disagree). `compute_loss_gathered` (not
+                    // `compute_loss`) is required now that `world > 1` is
+                    // reachable here: every rank must compute the identical
+                    // GLOBAL loss over the gathered batch (DESIGN.md §4), the
+                    // same rule the Resident arm's per-step gather already
+                    // applies — at `world == 1` `all_gather` is the identity
+                    // (`Noop`), so this is byte-identical to the prior
+                    // `compute_loss` call there.
+                    let partition_spec = self.rank_ctx.partition();
+                    let train_count = streamed.train_count;
+                    let window = super::stream::RowWindow::new(0, train_count);
                     let slice = super::stream::Slice::PerRank(partition_spec);
                     let opened = self.open_streamed_source(streamed, window, slice)?;
-                    let mut epoch_source = super::stream::EpochSource::Stream(opened);
-                    let mut step = 0usize;
-                    loop {
-                        let Some(chunk) = epoch_source.next_chunk(&partition_spec, step)? else {
-                            break;
-                        };
+                    let mut epoch_source = super::stream::EpochSource::new(opened);
+                    for step in 0..train_batches_per_epoch {
+                        let chunk = epoch_source.next_chunk(step)?;
+                        let counts = partition_spec.counts_for_step(train_count, step);
                         let batch = self.encode_chunk(&chunk)?;
-                        let loss = self.compute_loss(&batch)?;
+                        let loss = self.compute_loss_gathered(call, &batch, &counts)?;
                         Self::accumulate_sim_stats(&batch, &mut sim_stats);
                         self.process_batch_loss(
+                            call,
                             loss,
                             EpochState {
                                 batch_count: &mut batch_count,
@@ -1476,7 +1884,6 @@ impl TrainingLoop {
                                 batches_per_epoch: train_batches_per_epoch,
                             },
                         )?;
-                        step += 1;
                     }
                 }
             }
@@ -1504,6 +1911,16 @@ impl TrainingLoop {
                 // run shorter than `DEFAULT_NORM_CHECK_INTERVAL` steps (see
                 // `clip_and_step`'s doc).
                 let is_last_step = last_step_horizon.is_last_step(global_step + 1);
+                // Same canonical-order reduce as the in-window flush above
+                // (`process_batch_loss`'s own call site) — the trailing
+                // partial window is an optimizer-step boundary like any
+                // other and must sum across the gang before it clips/steps.
+                canonical_reduce(
+                    call,
+                    &self.rank_ctx,
+                    &trainable_vars,
+                    &mut accumulated_grads,
+                )?;
                 clip_and_step(
                     &mut optimizer,
                     &trainable_vars,
@@ -1650,6 +2067,7 @@ impl TrainingLoop {
             // A `None` store disables durable checkpointing (trainer-internal tests).
             if !self.cancel.load(Ordering::Relaxed) {
                 self.save_resume_checkpoint(
+                    call,
                     &checkpoint_dir,
                     epoch,
                     global_step,
@@ -2067,6 +2485,30 @@ impl TrainingLoop {
             .base_model
             .as_ref()
             .ok_or_else(|| JammiError::FineTune("encode_texts requires a base model".into()))?;
+        // DESIGN.md §4's zero-row rank: "it encodes nothing and contributes a
+        // 0-row tensor to every gather of that step". Never runs a real
+        // forward over zero rows here — the encoder's own positional/RoPE
+        // kernel refuses a zero element count outright (measured: `rope_fused:
+        // cos/sin element count 0 is not a positive multiple of head_dim`),
+        // so this builds the SAME trailing (hidden) width a real forward
+        // would produce directly, with no model call at all — the row-major
+        // dim-0 `all_gather` this feeds already treats a 0-row contribution
+        // as a normal case (`Local::all_gather` skips a 0-row slot; DESIGN.md
+        // §4's own "counts vector" wording).
+        if texts.is_empty() {
+            let hidden = match &self.target {
+                TrainingTarget::ProjectionHead { .. } => base.embedding_dim().ok_or_else(|| {
+                    JammiError::FineTune(
+                        "encode_texts: ProjectionHead target requires an embedding-capable \
+                         base model"
+                            .into(),
+                    )
+                })?,
+                TrainingTarget::EncoderAdapters(state) => state.encoder.hidden_size(),
+            };
+            return Tensor::zeros((0, hidden), DType::F32, &self.device)
+                .map_err(|e| JammiError::FineTune(format!("encode_texts: empty batch: {e}")));
+        }
         match &self.target {
             TrainingTarget::ProjectionHead { .. } => {
                 let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
@@ -2543,10 +2985,16 @@ impl TrainingLoop {
             }
             TextChunk::Classification { texts, labels } => {
                 let proj = encode(texts)?;
+                // U4b: the classification head runs HERE, on this rank's own
+                // LOCAL embeddings, so the batch carries LOGITS — already
+                // downstream of the trainable head — never the raw
+                // embeddings a gather would otherwise have to cross (see
+                // `TrainingBatch::Classification`'s own doc).
+                let logits = self.classify(&proj)?;
                 let labels_tensor = Tensor::from_vec(labels.clone(), (labels.len(),), &self.device)
                     .map_err(|e| JammiError::FineTune(format!("Labels tensor: {e}")))?;
                 Ok(super::data::TrainingBatch::Classification {
-                    embeddings: proj,
+                    logits,
                     labels: labels_tensor,
                 })
             }
@@ -2797,6 +3245,7 @@ impl TrainingLoop {
     /// is taken once every `gradient_accumulation_steps` micro-batches.
     fn process_batch_loss(
         &mut self,
+        call: &BlockingCall,
         loss: Tensor,
         epoch: EpochState<'_>,
         ctx: StepContext<'_>,
@@ -2878,7 +3327,27 @@ impl TrainingLoop {
         // merged into `epoch.accumulated_grads` — the extra `backward` this
         // batch cost (versus the old skip-before-backward order) is spent
         // only on the rare diverged batch, never on the healthy common case.
-        if loss_val.is_nan() || loss_val > 100.0 {
+        //
+        // U4b's lockstep (DESIGN.md §4/§6): divergence is decided by
+        // `all_reduce_max_flags` at this SAME micro-batch boundary on every
+        // rank, never by this rank's own `loss_val` alone — a divergence
+        // forced on ONE rank (a test hook, or a genuine NaN on one rank's own
+        // slice) must be seen, and acted on identically, by every rank, or
+        // one rank would keep accumulating a window its peers have already
+        // abandoned. At `W = 1` (`Noop`) `all_reduce_max_flags` is the
+        // identity, so `diverged == local_diverged` exactly — byte-identical
+        // to the pre-U4b local-only check.
+        let local_diverged = loss_val.is_nan() || loss_val > 100.0;
+        let flags = self.rank_ctx.all_reduce_max_flags(
+            call,
+            if local_diverged {
+                LOCKSTEP_FLAG_DIVERGED
+            } else {
+                0
+            },
+        )?;
+        let diverged = flags & LOCKSTEP_FLAG_DIVERGED != 0;
+        if diverged {
             self.divergence_count += 1;
             if self.divergence_count >= 3 {
                 return Err(JammiError::FineTune(
@@ -2916,6 +3385,19 @@ impl TrainingLoop {
             // See the flush-window call site's doc: this names the run's
             // actual final optimizer step, not just this epoch's.
             let is_last_step = ctx.last_step_horizon.is_last_step(*epoch.global_step + 1);
+            // DESIGN.md §4's canonical-order reduce: every rank's window-end
+            // `GradStore` is laid out in the canonical `trainable_vars` order
+            // (zero-filled for a var this rank's own window never populated),
+            // `all_reduce_sum`med, and written back — so `clip_and_step`
+            // below clips and steps over the IDENTICAL, already-summed
+            // gradient on every rank. At `W = 1` this is the zero-filling
+            // identity (`optimizer::canonical_reduce`'s own doc).
+            canonical_reduce(
+                call,
+                &self.rank_ctx,
+                ctx.trainable_vars,
+                epoch.accumulated_grads,
+            )?;
             clip_and_step(
                 ctx.optimizer,
                 ctx.trainable_vars,
@@ -2994,9 +3476,8 @@ impl TrainingLoop {
                     self.triplet_loss(&dims[0], &dims[1], &dims[2])
                 }),
             },
-            super::data::TrainingBatch::Classification { embeddings, labels } => {
-                let logits = self.classify(embeddings)?;
-                self.cross_entropy_loss(&logits, labels)
+            super::data::TrainingBatch::Classification { logits, labels } => {
+                self.cross_entropy_loss(logits, labels)
             }
             super::data::TrainingBatch::Ner {
                 hidden_states,
@@ -3005,6 +3486,112 @@ impl TrainingLoop {
             super::data::TrainingBatch::Regression { input, target } => {
                 self.regression_loss(input, target)
             }
+        }
+    }
+
+    /// The gather rule (DESIGN.md §4, "Step (the gather rule)"): gather
+    /// every rank's slice of this step's batch across the gang, THEN compute
+    /// the IDENTICAL global loss on every rank through the exact same
+    /// [`Self::compute_loss`] every batch kind already dispatches through.
+    ///
+    /// At `W = 1` (`self.rank_ctx`'s collective is [`super::collective::
+    /// Noop`]) every `all_gather` call is the identity (`counts` is one
+    /// entry, equal to the local row count), so this is byte-for-byte
+    /// [`Self::compute_loss`] on the unchanged batch — the W=1 parity oracle
+    /// the whole existing trainer suite already pins.
+    ///
+    /// **Gather points, per arm** (DESIGN.md §4's own wording): `Contrastive`
+    /// / `Pairs` / `Triplet` gather the POST-PROJECTION encoder outputs
+    /// (already computed, locally, by [`Self::encode_chunk`] before this
+    /// call ever runs) and the scores. `Classification` gathers the LOGITS —
+    /// [`Self::encode_chunk`]'s `Classification` arm calls [`Self::classify`]
+    /// on this rank's own LOCAL embeddings at BATCH-CONSTRUCTION time (never
+    /// here), so by the time this function sees the batch the trainable
+    /// classification head has already run on local-only input and the
+    /// gather point sits strictly downstream of it; `embeddings` themselves
+    /// are never gathered (DESIGN.md §4 names this exactly: "never
+    /// `embeddings`") — they do not even reach this call, since
+    /// `TrainingBatch::Classification` no longer carries them (see that
+    /// variant's own doc). `Regression` gathers `input` — already `Self::
+    /// head_forward`'s output (`Self::encode_chunk`'s `Regression` arm runs
+    /// it before this function ever sees the batch) — and the targets, the
+    /// SAME rule, not a special case any more. `Ner` stays refused, exactly
+    /// as [`Self::compute_loss`] itself refuses it; this function never
+    /// reaches a `Ner` batch in production (`Self::encode_chunk` never
+    /// builds one).
+    ///
+    /// **Why this closes the W× gradient hazard.** [`super::collective::
+    /// Collective::all_gather`]'s own contract: only the calling rank's own
+    /// slot carries a gradient; every other rank's slot is a detached value.
+    /// Since every gathered tensor here is the OUTPUT of this rank's own
+    /// trainable-parameter forward (an encoder output, a classification
+    /// logit, a regression head output — never a raw input a trainable
+    /// parameter has not yet touched), backward through the loss this
+    /// function computes over the gathered batch flows gradient into this
+    /// rank's own trainable parameters exactly ONCE per rank's own rows,
+    /// never `world` times — see this module's own
+    /// `gather_backward_keeps_only_the_local_slot` oracle, which reds when a
+    /// trainable op is moved AFTER the gather (the hazard this rule exists
+    /// to close).
+    fn compute_loss_gathered(
+        &self,
+        call: &BlockingCall,
+        batch: &super::data::TrainingBatch,
+        counts: &[usize],
+    ) -> Result<Tensor> {
+        use super::data::TrainingBatch;
+        let rank_ctx = &self.rank_ctx;
+        match batch {
+            TrainingBatch::Contrastive {
+                embeddings_a,
+                embeddings_b,
+                scores,
+            } => {
+                let embeddings_a = rank_ctx.all_gather(call, embeddings_a, counts)?;
+                let embeddings_b = rank_ctx.all_gather(call, embeddings_b, counts)?;
+                let scores = rank_ctx.all_gather(call, scores, counts)?;
+                self.compute_loss(&TrainingBatch::Contrastive {
+                    embeddings_a,
+                    embeddings_b,
+                    scores,
+                })
+            }
+            TrainingBatch::Pairs { anchors, positives } => {
+                let anchors = rank_ctx.all_gather(call, anchors, counts)?;
+                let positives = rank_ctx.all_gather(call, positives, counts)?;
+                self.compute_loss(&TrainingBatch::Pairs { anchors, positives })
+            }
+            TrainingBatch::Triplet {
+                anchor,
+                positive,
+                negative,
+            } => {
+                let anchor = rank_ctx.all_gather(call, anchor, counts)?;
+                let positive = rank_ctx.all_gather(call, positive, counts)?;
+                let negative = rank_ctx.all_gather(call, negative, counts)?;
+                self.compute_loss(&TrainingBatch::Triplet {
+                    anchor,
+                    positive,
+                    negative,
+                })
+            }
+            TrainingBatch::Classification { logits, labels } => {
+                // `logits` is already the classification head's OUTPUT
+                // (`Self::encode_chunk`'s `Classification` arm calls
+                // `Self::classify` on this rank's own local embeddings
+                // before this function ever sees the batch) — gathering it
+                // is the same "downstream of every trainable parameter"
+                // rule as `Regression`'s `input`, not a special case.
+                let logits = rank_ctx.all_gather(call, logits, counts)?;
+                let labels = rank_ctx.all_gather(call, labels, counts)?;
+                self.compute_loss(&TrainingBatch::Classification { logits, labels })
+            }
+            TrainingBatch::Regression { input, target } => {
+                let input = rank_ctx.all_gather(call, input, counts)?;
+                let target = rank_ctx.all_gather(call, target, counts)?;
+                self.compute_loss(&TrainingBatch::Regression { input, target })
+            }
+            TrainingBatch::Ner { .. } => self.compute_loss(batch),
         }
     }
 
@@ -3112,9 +3699,8 @@ impl TrainingLoop {
                         .into(),
                 )),
             },
-            super::data::TrainingBatch::Classification { embeddings, labels } => {
-                let logits = self.classify(embeddings)?;
-                cross_entropy_per_row(&logits, labels)
+            super::data::TrainingBatch::Classification { logits, labels } => {
+                cross_entropy_per_row(logits, labels)
             }
             super::data::TrainingBatch::Ner { .. } => Err(JammiError::FineTune(
                 "evaluate_held_out: NER's natural unit is a token, not a held-out example — \
@@ -3589,7 +4175,7 @@ impl TrainingLoop {
     /// accumulation `Self::evaluate` uses for a `Resident` source.
     ///
     /// Asserts `chunks_seen == ceil(val_count / batch)` (F4's own oracle):
-    /// every `EpochSource::Stream` consumer terminates on the first
+    /// every `EpochSource` consumer terminates on the first
     /// zero-row chunk and never encodes it, so a correct pump emits exactly
     /// that many non-empty chunks before its terminal one.
     fn evaluate_streamed(&self, streamed: &super::source::StreamedSet) -> Result<f64> {
@@ -4057,12 +4643,62 @@ impl TrainingLoop {
         Ok((by_name, step_t))
     }
 
+    /// Gather every rank's own per-layer dropout positions to rank 0
+    /// (DESIGN.md §4): a REAL collective call — every rank must take part,
+    /// in lockstep, even though only rank 0's caller
+    /// ([`Self::save_resume_checkpoint`]) ever reads the result. Returns the
+    /// SAME map on every rank, never a partial one only rank 0 gets, so this
+    /// function's own type never leaks which rank is about to use it.
+    ///
+    /// Encodes each rank's positions as one row of a `(1, 4n)` `f32` tensor
+    /// (`n` = this run's dropout-layer count, identical on every rank — the
+    /// same architecture), name-sorted so every rank fills the SAME columns
+    /// for the SAME layer without exchanging names, each `u64` position as
+    /// its four 16-bit limbs ([`encode_dropout_positions`] — every limb is
+    /// exact in `f32`, so every `u64` round-trips, and `f32` is a dtype every
+    /// collective carries: the `Peer` wire refuses `f64`, U5b-1b-i P9);
+    /// `all_gather`s it (one row per rank, rank order); reads the `(world,
+    /// 4n)` result back into a per-rank map ([`decode_dropout_positions`]).
+    ///
+    /// At `W = 1` (`Noop`) `all_gather` is the identity, so the returned map
+    /// always has exactly the one entry for rank 0 — the pre-U4b flat
+    /// `dropout_positions` shape, now wrapped one level deeper (see
+    /// [`ResumeState::dropout_positions`]'s own doc).
+    fn gather_dropout_positions(
+        &self,
+        call: &BlockingCall,
+    ) -> Result<HashMap<u32, HashMap<String, u64>>> {
+        let local = self.target.dropout_positions()?;
+        let mut names: Vec<String> = local.keys().cloned().collect();
+        names.sort();
+        let positions: Vec<u64> = names.iter().map(|n| local[n]).collect();
+        let values = encode_dropout_positions(&positions);
+        let local_tensor = Tensor::from_vec(values, (1, names.len() * 4), &self.device)
+            .map_err(|e| JammiError::FineTune(format!("dropout position tensor: {e}")))?;
+        let counts = vec![1usize; self.rank_ctx.world() as usize];
+        let gathered = self.rank_ctx.all_gather(call, &local_tensor, &counts)?;
+        let gathered_rows: Vec<Vec<f32>> = gathered
+            .to_vec2()
+            .map_err(|e| JammiError::FineTune(format!("dropout position gather readback: {e}")))?;
+        let mut by_rank = HashMap::with_capacity(gathered_rows.len());
+        for (rank, row) in gathered_rows.into_iter().enumerate() {
+            let decoded = decode_dropout_positions(&row)?;
+            let mut m = HashMap::with_capacity(names.len());
+            for (name, v) in names.iter().zip(decoded) {
+                m.insert(name.clone(), v);
+            }
+            by_rank.insert(rank as u32, m);
+        }
+        Ok(by_rank)
+    }
+
     /// Assemble the full resume bundle at an epoch boundary: adapter weights, the
-    /// name-keyed optimizer moments, the scaler's `(μ, σ)`, the dropout-stream
-    /// positions, and the run counters. The single routine both the durable save
-    /// and the test's reference snapshot drive.
+    /// name-keyed optimizer moments, the scaler's `(μ, σ)`, the PER-RANK dropout-
+    /// stream positions (gathered to rank 0), and the run counters. The single
+    /// routine both the durable save and the test's reference snapshot drive.
     fn capture_resume_bundle(
         &self,
+        call: &BlockingCall,
         scratch_dir: &Path,
         last_completed_epoch: usize,
         global_step: usize,
@@ -4071,6 +4707,10 @@ impl TrainingLoop {
     ) -> Result<Vec<(String, bytes::Bytes)>> {
         let weights = self.target.named_trainable_weights()?;
         let (moments, step_t) = Self::capture_moments_by_name(optimizer, optim_param_names)?;
+        // A real collective call every rank takes part in — see this
+        // function's own doc and `Self::save_resume_checkpoint`'s rank-0-only
+        // write gate immediately after its own call to this function.
+        let dropout_positions = self.gather_dropout_positions(call)?;
         let state = ResumeState {
             schema_version: RESUME_STATE_SCHEMA_VERSION,
             last_completed_epoch,
@@ -4078,17 +4718,29 @@ impl TrainingLoop {
             step_t,
             seed: self.config.seed,
             scaler: self.target_scaler.map(|s| (s.mean(), s.std())),
-            dropout_positions: self.target.dropout_positions()?,
+            dropout_positions,
         };
         capture_bundle(scratch_dir, &weights, &moments, &state)
     }
 
     /// Write the durable resume checkpoint to `{job_id}/_resume/` via the artifact
     /// store, overwriting the prior epoch. A `None` store is a no-op (a
-    /// trainer-internal run with no durable checkpointing). The caller has already
-    /// confirmed the lease is held (`!cancel`).
+    /// trainer-internal run with no durable checkpointing) — checked BEFORE the
+    /// gather below, since it is derived from configuration and therefore
+    /// identical on every rank of a real gang, so every rank takes this early
+    /// exit the same way (no lockstep hazard). The caller has already confirmed
+    /// the lease is held (`!cancel`).
+    ///
+    /// DESIGN.md §4: the lease holder (rank 0) alone writes the durable
+    /// resume checkpoint; every OTHER rank's call is a no-op — the runner
+    /// role is the gate ([`TrainingLoop::role`]: a `Rank` holds no
+    /// `LeaseHolder`, so it never writes) — but only past the point where it
+    /// has already taken part in [`Self::capture_resume_bundle`]'s
+    /// dropout-position gather, a real collective call every rank must make
+    /// in lockstep.
     fn save_resume_checkpoint(
         &self,
+        call: &BlockingCall,
         checkpoint_dir: &Path,
         epoch: usize,
         global_step: usize,
@@ -4099,8 +4751,17 @@ impl TrainingLoop {
             return Ok(());
         };
         let scratch = checkpoint_dir.join("_resume_scratch");
-        let bundle =
-            self.capture_resume_bundle(&scratch, epoch, global_step, optimizer, optim_param_names)?;
+        let bundle = self.capture_resume_bundle(
+            call,
+            &scratch,
+            epoch,
+            global_step,
+            optimizer,
+            optim_param_names,
+        )?;
+        if self.role.lease_holder().is_none() {
+            return Ok(());
+        }
         tokio::runtime::Handle::current().block_on(store.put_resume_checkpoint(
             self.tenant.as_ref(),
             &self.job_id,
@@ -4206,6 +4867,14 @@ impl TrainingLoop {
         let Some(store) = self.artifact_store.clone() else {
             return Ok(());
         };
+        // DESIGN.md §4: the lease holder alone publishes; every other rank's
+        // call is a no-op (the runner role is the gate — `TrainingLoop::role`).
+        // No collective call happens anywhere in this function (unlike
+        // `Self::save_resume_checkpoint`'s dropout-position gather), so an
+        // early return here carries no lockstep hazard.
+        if self.role.lease_holder().is_none() {
+            return Ok(());
+        }
         let scratch = checkpoint_dir.join(Self::EPOCH_CHECKPOINT_SCRATCH);
         let files = self.checkpoint_adapter_files(&scratch)?;
         let prefix = tokio::runtime::Handle::current().block_on(store.put_epoch_checkpoint(
@@ -4389,9 +5058,20 @@ impl TrainingLoop {
             .map(|(mean, std)| TargetScaler::from_mean_std(mean, std));
 
         // Replay each dropout stream to its epoch-boundary position so the next
-        // forwards draw the same masks the uninterrupted run drew (R3).
+        // forwards draw the same masks the uninterrupted run drew (R3). U4b:
+        // `state.dropout_positions` is keyed by RANK — this rank restores only
+        // its OWN entry, never rank 0's; an entry missing for this rank (a
+        // resume at a different world size than the checkpoint was taken at)
+        // restores nothing, leaving every stream at its from-scratch origin —
+        // the same "a missing key leaves that layer at the origin" contract
+        // `restore_dropout_positions` already documents, one level up.
+        let this_rank_positions = state
+            .dropout_positions
+            .get(&self.rank_ctx.rank())
+            .cloned()
+            .unwrap_or_default();
         self.target
-            .restore_dropout_positions(&state.dropout_positions)?;
+            .restore_dropout_positions(&this_rank_positions)?;
 
         Ok((state.last_completed_epoch + 1, state.global_step))
     }
@@ -4874,7 +5554,7 @@ fn batch_row_count(batch: &super::data::TrainingBatch) -> Result<usize> {
         super::data::TrainingBatch::Contrastive { embeddings_a, .. } => dim0(embeddings_a),
         super::data::TrainingBatch::Pairs { anchors, .. } => dim0(anchors),
         super::data::TrainingBatch::Triplet { anchor, .. } => dim0(anchor),
-        super::data::TrainingBatch::Classification { embeddings, .. } => dim0(embeddings),
+        super::data::TrainingBatch::Classification { logits, .. } => dim0(logits),
         super::data::TrainingBatch::Ner { hidden_states, .. } => dim0(hidden_states),
         super::data::TrainingBatch::Regression { input, .. } => dim0(input),
     }
@@ -5161,6 +5841,72 @@ mod tests {
     fn grad_norm(g: &Tensor) -> f64 {
         let sq: f32 = g.sqr().unwrap().sum_all().unwrap().to_scalar().unwrap();
         (sq as f64).sqrt()
+    }
+
+    /// U4b (design pressure round, finding 9): `canonical_vars_digest` must
+    /// be a pure function of the NAME SEQUENCE — the same names in the same
+    /// order always hash to the same digest (two ranks agreeing on the
+    /// reduce layout independently compute the identical value), and either
+    /// a reordering or a genuinely different name set must change it (the
+    /// mismatch this digest exists to let a future `Peer` round detect).
+    #[test]
+    fn canonical_vars_digest_is_order_sensitive_and_content_sensitive() {
+        let a = vec!["aux.lora_a".to_string(), "projection.lora_a".to_string()];
+        let a_again = vec!["aux.lora_a".to_string(), "projection.lora_a".to_string()];
+        let reordered = vec!["projection.lora_a".to_string(), "aux.lora_a".to_string()];
+        let different = vec!["aux.lora_a".to_string(), "projection.lora_b".to_string()];
+        let empty: Vec<String> = Vec::new();
+
+        assert_eq!(
+            RankContext::canonical_vars_digest(&a),
+            RankContext::canonical_vars_digest(&a_again),
+            "the identical name sequence must always digest identically"
+        );
+        assert_ne!(
+            RankContext::canonical_vars_digest(&a),
+            RankContext::canonical_vars_digest(&reordered),
+            "reordering the same names must change the digest — the canonical order IS \
+             the thing two ranks must agree on"
+        );
+        assert_ne!(
+            RankContext::canonical_vars_digest(&a),
+            RankContext::canonical_vars_digest(&different),
+            "a different name set must change the digest"
+        );
+        // Never panics on the degenerate empty case (a target with no
+        // trainable vars at all is not this function's problem to refuse).
+        let _ = RankContext::canonical_vars_digest(&empty);
+    }
+
+    /// U4b: `RankContext::dropout_seed`'s own contract — rank 0 reproduces
+    /// `base_seed` EXACTLY (the W=1/rank-0 byte-parity property every
+    /// existing seeded-dropout test relies on), every other rank gets a
+    /// distinct, deterministic value, and two calls with the same inputs
+    /// agree (family J: no unseeded RNG).
+    #[test]
+    fn rank_context_dropout_seed_is_identity_at_rank_zero_and_distinct_elsewhere() {
+        let base_seed = 424_242u64;
+        let ctx0 = RankContext::single_rank(
+            4,
+            super::super::partition::PartitionRule::BlockByGlobalBatch,
+        );
+        assert_eq!(ctx0.dropout_seed(base_seed), base_seed);
+
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(base_seed);
+        for rank in 1..8u32 {
+            let derived = rank_dropout_seed(base_seed, rank);
+            assert_ne!(
+                derived, base_seed,
+                "rank {rank} must not collide with rank 0's own (unmodified) seed"
+            );
+            assert!(
+                seen.insert(derived),
+                "rank {rank}'s derived seed must not collide with an earlier rank's"
+            );
+            // Determinism: calling again must reproduce the identical value.
+            assert_eq!(rank_dropout_seed(base_seed, rank), derived);
+        }
     }
 
     /// Secondary to `last_step_run_harness::gradcache_arm_refuses_a_nonfinite_
@@ -6304,27 +7050,30 @@ mod host_read_discipline {
 
         let loss_before = per_micro_batch_host_read_count();
         let clip_before = crate::fine_tune::optimizer::sync_read_count();
-        loop_
-            .process_batch_loss(
-                loss,
-                EpochState {
-                    batch_count: &mut batch_count,
-                    epoch_loss: &mut epoch_loss,
-                    accumulated_grads: &mut accumulated_grads,
-                    grads_pending: &mut grads_pending,
-                    global_step: &mut global_step,
-                },
-                StepContext {
-                    trainable_vars: &trainable_vars,
-                    optimizer: &mut optimizer,
-                    checkpoint_dir: checkpoint_dir.path(),
-                    checkpoint_interval: 0,
-                    lr_horizon: 1,
-                    last_step_horizon: &mut LastStepHorizon::new(1),
-                    batches_per_epoch: 1,
-                },
-            )
-            .unwrap();
+        crate::fine_tune::collective::witness(|call| {
+            loop_
+                .process_batch_loss(
+                    &call,
+                    loss,
+                    EpochState {
+                        batch_count: &mut batch_count,
+                        epoch_loss: &mut epoch_loss,
+                        accumulated_grads: &mut accumulated_grads,
+                        grads_pending: &mut grads_pending,
+                        global_step: &mut global_step,
+                    },
+                    StepContext {
+                        trainable_vars: &trainable_vars,
+                        optimizer: &mut optimizer,
+                        checkpoint_dir: checkpoint_dir.path(),
+                        checkpoint_interval: 0,
+                        lr_horizon: 1,
+                        last_step_horizon: &mut LastStepHorizon::new(1),
+                        batches_per_epoch: 1,
+                    },
+                )
+                .unwrap()
+        });
 
         assert_eq!(
             per_micro_batch_host_read_count(),
@@ -6950,9 +7699,12 @@ mod f6_streamed_refusal_oracle {
                     .unwrap();
 
             let streamed = tiny_streamed_set().await;
-            let err = loop_
-                .run(TrainingSource::Streamed(Box::new(streamed)))
-                .unwrap_err();
+            let err = crate::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+                loop_.run(&call, TrainingSource::Streamed(Box::new(streamed)))
+            })
+            .await
+            .unwrap()
+            .unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("Streamed") && msg.contains("whole-set arm") && msg.contains("Mining"),
@@ -7049,6 +7801,7 @@ mod last_step_run_harness {
     /// given, resuming from a hand-built bundle whose `global_step` is that
     /// value (the current weights, zero moments, epoch 0 completed).
     pub(super) fn run_text_loop(
+        call: &crate::fine_tune::collective::BlockingCall,
         tag: &str,
         config: FineTuneConfig,
         loader: TrainingDataLoader,
@@ -7118,7 +7871,10 @@ mod last_step_run_harness {
         });
         loop_.after_backward = hook;
         let _enter = rt.enter();
-        loop_.run(crate::fine_tune::source::TrainingSource::Resident(loader))
+        loop_.run(
+            call,
+            crate::fine_tune::source::TrainingSource::Resident(loader),
+        )
     }
     /// The typed grad-norm refusal, discriminated from every other error the
     /// run could end in: it must name the poisoned step.
@@ -7140,24 +7896,34 @@ mod last_step_run_harness {
     /// `refuse_nonfinite_params`'s epoch-boundary refusal, not this one).
     #[test]
     fn accumulation_window_arm_refuses_a_nonfinite_gradient_on_the_runs_last_step() {
-        let config = FineTuneConfig {
-            gradient_accumulation_steps: 2,
-            ..text_config()
-        };
-        let healthy =
-            run_text_loop("last-step-accum-ok", config.clone(), pairs(8), None, None).unwrap();
-        assert_eq!(healthy.total_steps, 2, "control: the arm's horizon");
-        assert!(healthy.total_steps < DEFAULT_NORM_CHECK_INTERVAL);
+        crate::fine_tune::collective::witness(|call| {
+            let config = FineTuneConfig {
+                gradient_accumulation_steps: 2,
+                ..text_config()
+            };
+            let healthy = run_text_loop(
+                &call,
+                "last-step-accum-ok",
+                config.clone(),
+                pairs(8),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(healthy.total_steps, 2, "control: the arm's horizon");
+            assert!(healthy.total_steps < DEFAULT_NORM_CHECK_INTERVAL);
 
-        let err = run_text_loop(
-            "last-step-accum",
-            config,
-            pairs(8),
-            Some(poison_grad_at(2)),
-            None,
-        )
-        .expect_err("a NaN gradient on the run's last window must be refused");
-        assert_grad_norm_refusal(&err, 2);
+            let err = run_text_loop(
+                &call,
+                "last-step-accum",
+                config,
+                pairs(8),
+                Some(poison_grad_at(2)),
+                None,
+            )
+            .expect_err("a NaN gradient on the run's last window must be refused");
+            assert_grad_norm_refusal(&err, 2);
+        });
     }
 
     /// Arm: the trailing partial-window flush at `run`'s epoch end — 6
@@ -7169,23 +7935,33 @@ mod last_step_run_harness {
     /// `clip_and_step` in `run` — RED.
     #[test]
     fn trailing_flush_arm_refuses_a_nonfinite_gradient_on_the_runs_last_step() {
-        let config = FineTuneConfig {
-            gradient_accumulation_steps: 2,
-            ..text_config()
-        };
-        let healthy =
-            run_text_loop("last-step-flush-ok", config.clone(), pairs(6), None, None).unwrap();
-        assert_eq!(healthy.total_steps, 2, "control: the arm's horizon");
+        crate::fine_tune::collective::witness(|call| {
+            let config = FineTuneConfig {
+                gradient_accumulation_steps: 2,
+                ..text_config()
+            };
+            let healthy = run_text_loop(
+                &call,
+                "last-step-flush-ok",
+                config.clone(),
+                pairs(6),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(healthy.total_steps, 2, "control: the arm's horizon");
 
-        let err = run_text_loop(
-            "last-step-flush",
-            config,
-            pairs(6),
-            Some(poison_grad_at(2)),
-            None,
-        )
-        .expect_err("a NaN gradient on the run's trailing flush must be refused");
-        assert_grad_norm_refusal(&err, 2);
+            let err = run_text_loop(
+                &call,
+                "last-step-flush",
+                config,
+                pairs(6),
+                Some(poison_grad_at(2)),
+                None,
+            )
+            .expect_err("a NaN gradient on the run's trailing flush must be refused");
+            assert_grad_norm_refusal(&err, 2);
+        });
     }
 
     /// Arm: plain per-batch stepping (`grad_accum: 1`) — 6 pairs = 3
@@ -7197,20 +7973,30 @@ mod last_step_run_harness {
     /// `clip_and_step` — RED.
     #[test]
     fn per_batch_arm_refuses_a_nonfinite_gradient_on_the_runs_last_step() {
-        let config = text_config();
-        let healthy =
-            run_text_loop("last-step-plain-ok", config.clone(), pairs(6), None, None).unwrap();
-        assert_eq!(healthy.total_steps, 3, "control: the arm's horizon");
+        crate::fine_tune::collective::witness(|call| {
+            let config = text_config();
+            let healthy = run_text_loop(
+                &call,
+                "last-step-plain-ok",
+                config.clone(),
+                pairs(6),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(healthy.total_steps, 3, "control: the arm's horizon");
 
-        let err = run_text_loop(
-            "last-step-plain",
-            config,
-            pairs(6),
-            Some(poison_grad_at(3)),
-            None,
-        )
-        .expect_err("a NaN gradient on the run's last per-batch step must be refused");
-        assert_grad_norm_refusal(&err, 3);
+            let err = run_text_loop(
+                &call,
+                "last-step-plain",
+                config,
+                pairs(6),
+                Some(poison_grad_at(3)),
+                None,
+            )
+            .expect_err("a NaN gradient on the run's last per-batch step must be refused");
+            assert_grad_norm_refusal(&err, 3);
+        });
     }
 
     /// Arm: GradCache (non-precomputed loader, `cached` + in-batch-negative
@@ -7224,25 +8010,35 @@ mod last_step_run_harness {
     /// (step 2 is then neither the horizon nor past it).
     #[test]
     fn gradcache_arm_refuses_a_nonfinite_gradient_on_the_runs_last_step() {
-        let config = FineTuneConfig {
-            cached: true,
-            embedding_loss: Some(EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
-            epochs: 2,
-            ..text_config()
-        };
-        let healthy =
-            run_text_loop("last-step-gc-ok", config.clone(), pairs(6), None, None).unwrap();
-        assert_eq!(healthy.total_steps, 2, "control: one step per epoch");
+        crate::fine_tune::collective::witness(|call| {
+            let config = FineTuneConfig {
+                cached: true,
+                embedding_loss: Some(EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
+                epochs: 2,
+                ..text_config()
+            };
+            let healthy = run_text_loop(
+                &call,
+                "last-step-gc-ok",
+                config.clone(),
+                pairs(6),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(healthy.total_steps, 2, "control: one step per epoch");
 
-        let err = run_text_loop(
-            "last-step-gc",
-            config,
-            pairs(6),
-            Some(poison_grad_at(2)),
-            None,
-        )
-        .expect_err("a NaN gradient on the run's last GradCache epoch must be refused");
-        assert_grad_norm_refusal(&err, 2);
+            let err = run_text_loop(
+                &call,
+                "last-step-gc",
+                config,
+                pairs(6),
+                Some(poison_grad_at(2)),
+                None,
+            )
+            .expect_err("a NaN gradient on the run's last GradCache epoch must be refused");
+            assert_grad_norm_refusal(&err, 2);
+        });
     }
 
     /// The epoch-boundary backstop: a NaN gradient on a step that is neither
@@ -7259,18 +8055,1306 @@ mod last_step_run_harness {
     /// saves a NaN adapter).
     #[test]
     fn checkpoint_best_refuses_a_nonfinite_parameter_the_monitored_loss_cannot_see() {
-        let err = run_text_loop(
-            "ckpt-best-nan",
-            text_config(),
-            pairs(6),
-            Some(poison_grad_at(2)),
-            None,
+        crate::fine_tune::collective::witness(|call| {
+            let err = run_text_loop(
+                &call,
+                "ckpt-best-nan",
+                text_config(),
+                pairs(6),
+                Some(poison_grad_at(2)),
+                None,
+            )
+            .expect_err("a NaN adapter must not be saved as checkpoint_best");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("checkpoint_best") && msg.contains("non-finite trainable parameter"),
+                "expected the checkpoint_best refusal, got: {msg}"
+            );
+        });
+    }
+}
+
+/// U4b acceptance (d): lockstep, on a REAL two-rank `Local` gang driven
+/// through the full production `TrainingLoop::run` (not a hand-rolled
+/// per-step harness) — DESIGN.md §6's own lockstep oracle: "one rank's batch
+/// forced to diverge; one rank's batch yields no gradient for a Var; the
+/// gang completes".
+#[cfg(test)]
+mod gang_lockstep_oracle {
+    use std::sync::Arc;
+
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{VarBuilder, VarMap};
+
+    use super::super::data::TrainingDataLoader;
+    use super::super::lora::build_projection_head;
+    use super::super::partition::{PartitionRule, PartitionSpec};
+    use super::super::target::TrainingTarget;
+    use super::super::{EarlyStoppingMetric, FineTuneConfig};
+    use super::{AfterBackwardHook, RankContext, TrainingLoopBuilder, TrainingResult};
+    use crate::fine_tune::collective::LocalGang;
+
+    const HIDDEN: usize = 32; // tiny_bert's hidden width.
+
+    fn gang_config(batch_size: usize) -> FineTuneConfig {
+        FineTuneConfig {
+            epochs: 1,
+            batch_size,
+            validation_fraction: 0.0,
+            warmup_steps: 0,
+            gradient_accumulation_steps: 1,
+            lora_rank: 2,
+            lora_dropout: 0.0,
+            early_stopping_metric: EarlyStoppingMetric::TrainLoss,
+            early_stopping_patience: 10_000,
+            learning_rate: 1e-3,
+            ..Default::default()
+        }
+    }
+
+    fn pairs(n: usize) -> TrainingDataLoader {
+        TrainingDataLoader::from_pairs(
+            (0..n)
+                .map(|i| (format!("anchor text {i}"), format!("positive text {i}")))
+                .collect(),
         )
-        .expect_err("a NaN adapter must not be saved as checkpoint_best");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("checkpoint_best") && msg.contains("non-finite trainable parameter"),
-            "expected the checkpoint_best refusal, got: {msg}"
+    }
+
+    /// A hook that REMOVES the first trainable var's gradient entirely on
+    /// optimizer step `step` (1-based) — the "a Var absent from one rank's
+    /// `GradStore`" case, distinct from [`poison_grad_at`]'s "present but
+    /// NaN" case: this rank's OWN accumulation genuinely never populates the
+    /// entry, exactly as if this step's loss legitimately never routed
+    /// through it.
+    fn remove_grad_at(step: usize) -> AfterBackwardHook {
+        Box::new(move |s, grads, vars| {
+            if s == step {
+                let t: &Tensor = &vars[0];
+                grads.remove(t);
+            }
+            Ok(())
+        })
+    }
+
+    /// A hook that replaces the first trainable var's gradient with NaN on
+    /// optimizer step `step` (1-based) — mirrors `last_step_run_harness::
+    /// poison_grad_at` (private to that module; redefined here rather than
+    /// exposed across modules for a single shared use).
+    fn poison_grad_at(step: usize) -> AfterBackwardHook {
+        Box::new(move |s, grads, vars| {
+            if s == step {
+                let t: &Tensor = &vars[0];
+                let nan = Tensor::full(f32::NAN, t.dims(), t.device())
+                    .map_err(|e| jammi_db::error::JammiError::FineTune(e.to_string()))?;
+                grads.insert(t, nan);
+            }
+            Ok(())
+        })
+    }
+
+    /// Run one rank of a 2-rank gang to completion, on its OWN dedicated
+    /// tokio runtime — mirrors `last_step_run_harness::run_text_loop`'s own
+    /// "own runtime, enter it, drive `run` synchronously" shape, needed
+    /// because each rank's `run()` reads its OWN catalog via
+    /// `Handle::current()` while ALSO rendezvousing with its peer through a
+    /// REAL `Local` collective on a separate OS thread.
+    fn run_gang_rank(
+        call: &crate::fine_tune::collective::BlockingCall,
+        tag: String,
+        config: FineTuneConfig,
+        loader: TrainingDataLoader,
+        rank_ctx: RankContext,
+        hook: Option<AfterBackwardHook>,
+    ) -> jammi_db::error::Result<TrainingResult> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mut loop_, _dir) = rt.block_on(async {
+            let base_model = super::test_fixtures::tiny_bert().await;
+            let (catalog, dir) = super::test_fixtures::claimed_job(&tag).await;
+            let device = Device::Cpu;
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+            let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
+            let builder =
+                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                    .device(device)
+                    .job_id(tag.clone())
+                    .worker_id(format!("{tag}-worker"))
+                    .catalog(catalog)
+                    .artifact_dir(dir.path().to_path_buf())
+                    .base_model(base_model)
+                    .rank_context(rank_ctx);
+            (builder.build().unwrap(), dir)
+        });
+        loop_.after_backward = hook;
+        let _enter = rt.enter();
+        loop_.run(
+            call,
+            crate::fine_tune::source::TrainingSource::Resident(loader),
+        )
+    }
+
+    /// A shared, in-memory-materialised "pairs" training-set table
+    /// (`anchor`, `positive` text columns, `n` rows) — built ONCE per test
+    /// (outside any per-rank runtime) and shared, via `Arc<InferenceSession>`
+    /// / `TrainingSetTable::clone`, across the gang's ranks: `stream.rs`'s
+    /// own module doc's "W independent `TrainingSetStream`s over the SAME
+    /// table, not W slices of one shared read" — the TABLE is shared here,
+    /// only the per-rank READ (via [`run_gang_rank_streamed`]) is
+    /// independent, matching production's own shape (one coordinator
+    /// materializes, every rank streams its own view).
+    async fn streamed_pairs_table(
+        tag: &str,
+        n: usize,
+    ) -> (
+        Arc<crate::session::InferenceSession>,
+        jammi_db::store::TrainingSetTable,
+    ) {
+        use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let session = Arc::new(
+            crate::session::InferenceSession::new(jammi_test_utils::test_config(dir.path()))
+                .await
+                .unwrap(),
+        );
+        let mut lines = String::from("anchor,positive\n");
+        for i in 0..n {
+            lines.push_str(&format!("anchor text {i},positive text {i}\n"));
+        }
+        let csv = dir.path().join(format!("{tag}.csv"));
+        std::fs::write(&csv, lines).unwrap();
+        session
+            .add_source(
+                tag,
+                SourceType::File,
+                SourceConnection {
+                    url: Some(format!("file://{}", csv.display())),
+                    format: Some(FileFormat::Csv),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let columns = vec!["anchor".to_string(), "positive".to_string()];
+        let table = super::super::training_set::materialize_projection_table(
+            &session,
+            tag,
+            &columns,
+            crate::model::ModelTask::TextEmbedding,
+            tag,
+        )
+        .await
+        .unwrap();
+        // The table's own parquet file lives under `dir` — table-only
+        // construction (`materialize_projection_table`) never reads a row
+        // back, but the PER-RANK stream this feeds does, later, on its own
+        // runtime; `dir` must outlive every such read. Leaked (test-only;
+        // the OS reclaims it at process exit) — the same `TempDir::keep()`
+        // precedent `gang_determinism_oracle::file_store` already uses for
+        // an identical "must outlive this closure" reason.
+        let _ = dir.keep();
+        (session, table)
+    }
+
+    /// [`run_gang_rank`]'s Streamed-source twin (U4b tail, item 1): drives
+    /// the SAME `TrainingLoop::run`, on the SAME per-rank-dedicated-runtime
+    /// shape, over a `TrainingSource::Streamed` instead of a `Resident`
+    /// loader — `session`/`table` are the ONE shared, already-materialised
+    /// table [`streamed_pairs_table`] built; each rank opens its OWN
+    /// [`crate::fine_tune::stream::TrainingSetStream`] over it
+    /// (`Self::open_streamed_source`, `trainer.rs`'s production Streamed
+    /// arm), never a second materialisation.
+    fn run_gang_rank_streamed(
+        call: &crate::fine_tune::collective::BlockingCall,
+        tag: String,
+        config: FineTuneConfig,
+        session: Arc<crate::session::InferenceSession>,
+        table: jammi_db::store::TrainingSetTable,
+        train_count: usize,
+        rank_ctx: RankContext,
+    ) -> jammi_db::error::Result<TrainingResult> {
+        let batch = config.batch_size;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mut loop_, streamed) = rt.block_on(async {
+            let base_model = super::test_fixtures::tiny_bert().await;
+            let (catalog, dir) = super::test_fixtures::claimed_job(&tag).await;
+            let device = Device::Cpu;
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+            let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
+            let builder =
+                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                    .device(device)
+                    .job_id(tag.clone())
+                    .worker_id(format!("{tag}-worker"))
+                    .catalog(catalog)
+                    .artifact_dir(dir.path().to_path_buf())
+                    .base_model(base_model)
+                    .rank_context(rank_ctx);
+            let streamed = super::super::source::StreamedSet {
+                session,
+                table,
+                columns: vec!["anchor".to_string(), "positive".to_string()],
+                task: crate::model::ModelTask::TextEmbedding,
+                total_rows: train_count,
+                train_count,
+                batch,
+                stream_cfg: super::super::stream::StreamConfig::new(2).unwrap(),
+                tenant: None,
+                label_vocab: None,
+            };
+            (builder.build().unwrap(), streamed)
+        });
+        let _enter = rt.enter();
+        loop_.run(
+            call,
+            crate::fine_tune::source::TrainingSource::Streamed(Box::new(streamed)),
+        )
+    }
+
+    /// A gang whose gang-wide `train_count` (5) is NOT a multiple of `W·B`
+    /// (`W=2, B=1` → global batch 2): the LAST global step (index 2) is
+    /// `rows[4, 6)` clamped to `[4, 5)` — rank 0 holds 1 row, rank 1 holds
+    /// **zero** (DESIGN.md §2's own worked case). Neither rank installs a
+    /// gradient hook here — this oracle is the ZERO-ROW-RANK case alone.
+    ///
+    /// EXECUTED RED-PROOF (applied, run, and reverted by hand — not left in
+    /// this tree): added `if chunk.row_count() == 0 { break; }` right after
+    /// building each step's chunk, restoring the pre-U4b "this rank's own
+    /// empty chunk ends the epoch" termination. Rank 1 then exits its loop
+    /// ONE STEP EARLIER than rank 0 (it sees the empty chunk at step 2 and
+    /// calls it end-of-epoch, so it never takes step 2's collective calls at
+    /// all), which deadlocks rank 0 forever waiting for rank 1 at that
+    /// step's `all_gather`/`all_reduce_max_flags`/`canonical_reduce`
+    /// rendezvous. Observed: the mutated test did not complete within 25 s
+    /// (vs. 0.34 s for all three tests in this module healthy) — a hang,
+    /// not merely a failure, exactly as this property predicts; not run to
+    /// `Local`'s own 120 s rendezvous-timeout resolution, since the
+    /// discriminating signal (no progress vs. sub-second completion) was
+    /// already unambiguous.
+    #[test]
+    fn a_zero_row_rank_the_gang_completes() {
+        let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
+        let mut handles = Vec::new();
+        for rank in 0..2u32 {
+            let local = gang.rank(rank).unwrap();
+            let partition =
+                PartitionSpec::for_gang(rank as usize, 2, 1, PartitionRule::BlockByGlobalBatch)
+                    .unwrap();
+            let rank_ctx = RankContext::new(Arc::new(local), partition);
+            let tag = format!("zero-row-rank-{rank}");
+            handles.push(crate::fine_tune::collective::BlockingCall::spawn_thread(
+                move |call| run_gang_rank(&call, tag, gang_config(1), pairs(5), rank_ctx, None),
+            ));
+        }
+        for (rank, handle) in handles.into_iter().enumerate() {
+            let result = handle
+                .join()
+                .unwrap_or_else(|e| panic!("rank {rank} panicked: {e:?}"));
+            result.unwrap_or_else(|e| panic!("rank {rank} must complete cleanly, got: {e}"));
+        }
+    }
+
+    /// [`a_zero_row_rank_the_gang_completes`]'s Streamed-source twin (U4b
+    /// tail, item 1): the IDENTICAL `train_count = 5`, `W = 2`, `B = 1`
+    /// shape (global batch 2, last global step `rows[4, 6)` clamped to
+    /// `[4, 5)` — rank 0 holds 1 row, rank 1 holds zero), but sourced
+    /// through a REAL `TrainingSetStream` over a materialised table
+    /// (`streamed_pairs_table`/`run_gang_rank_streamed`) instead of an
+    /// already-resident `TrainingDataLoader`. Before this unit, `TrainingLoop
+    /// ::run` refused a `Streamed` source at `world > 1` outright (this
+    /// unit's contract, U4b's Deviation 3) — this test could not even reach
+    /// the pump/consumer protocol; now `EpochSource::next_chunk`/`run_pump`'s
+    /// `step_bound` (`stream.rs`) apply the SAME "in-bound empty is real,
+    /// only the shared step bound is terminal" rule the Resident arm's
+    /// `text_chunk_for_rank` loop already used, at the stream's own layer.
+    ///
+    /// RED at base: this test cannot even compile-reach a passing state pre-
+    /// unit — `TrainingLoop::run` returns the typed `world > 1` refusal for
+    /// EVERY `Streamed` source, so `result.unwrap_or_else(..)` below panics
+    /// on the refusal's own message before any pump/consumer code runs at
+    /// all.
+    ///
+    /// EXECUTED RED-PROOF (applied, run to its own resolution, reverted —
+    /// see the contract): restored the pre-unit "row_count() == 0 means end
+    /// of epoch" termination at the Streamed arm's own consumer loop
+    /// (`trainer.rs::run`, `if chunk.row_count() == 0 { break; }` right
+    /// after `epoch_source.next_chunk(step)?`) — rank 1 then exits its own
+    /// loop one step early (it never asks for step 2 at all), deadlocking
+    /// rank 0 at that step's collective rendezvous. Observed (run to
+    /// `Local`'s own rendezvous-timeout resolution, not just "did not
+    /// complete"): `rank 0 must complete cleanly, got: Fine-tune error:
+    /// all_gather: timed out after 120s waiting for every peer to arrive`,
+    /// 120.23 s wall clock (vs. ~0.2 s healthy, this test's own green
+    /// runtime) — a hang, not merely a failure, mirroring
+    /// `a_zero_row_rank_the_gang_completes`'s own RED-PROOF shape exactly,
+    /// one layer down (the stream's pump/consumer protocol instead of the
+    /// Resident arm's step-bounded loop).
+    #[test]
+    fn a_zero_row_rank_via_a_streamed_source_the_gang_completes() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (session, table) = rt.block_on(streamed_pairs_table("streamed-zero-row", 5));
+        let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
+        let mut handles = Vec::new();
+        for rank in 0..2u32 {
+            let local = gang.rank(rank).unwrap();
+            let partition =
+                PartitionSpec::for_gang(rank as usize, 2, 1, PartitionRule::BlockByGlobalBatch)
+                    .unwrap();
+            let rank_ctx = RankContext::new(Arc::new(local), partition);
+            let tag = format!("streamed-zero-row-rank-{rank}");
+            let session = Arc::clone(&session);
+            let table = table.clone();
+            handles.push(crate::fine_tune::collective::BlockingCall::spawn_thread(
+                move |call| {
+                    run_gang_rank_streamed(&call, tag, gang_config(1), session, table, 5, rank_ctx)
+                },
+            ));
+        }
+        for (rank, handle) in handles.into_iter().enumerate() {
+            let result = handle
+                .join()
+                .unwrap_or_else(|e| panic!("rank {rank} panicked: {e:?}"));
+            result.unwrap_or_else(|e| panic!("rank {rank} must complete cleanly, got: {e}"));
+        }
+    }
+
+    /// A Var absent from rank 1's `GradStore` at step 1 (this rank's own
+    /// accumulation genuinely never populates it, e.g. a batch whose loss
+    /// does not route through it) — rank 0's own accumulation is untouched.
+    /// The gang must still complete: `canonical_reduce`'s presence-set fix
+    /// means this reduces to rank 0's own (sole) contribution, never an
+    /// error and never a hang.
+    #[test]
+    fn a_var_absent_from_one_ranks_gradstore_the_gang_completes() {
+        let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
+        let mut handles = Vec::new();
+        for rank in 0..2u32 {
+            let local = gang.rank(rank).unwrap();
+            let partition =
+                PartitionSpec::for_gang(rank as usize, 2, 2, PartitionRule::BlockByGlobalBatch)
+                    .unwrap();
+            let rank_ctx = RankContext::new(Arc::new(local), partition);
+            let tag = format!("absent-var-rank-{rank}");
+            let hook: Option<AfterBackwardHook> = if rank == 1 {
+                Some(remove_grad_at(1))
+            } else {
+                None
+            };
+            handles.push(crate::fine_tune::collective::BlockingCall::spawn_thread(
+                move |call| run_gang_rank(&call, tag, gang_config(2), pairs(4), rank_ctx, hook),
+            ));
+        }
+        for (rank, handle) in handles.into_iter().enumerate() {
+            let result = handle
+                .join()
+                .unwrap_or_else(|e| panic!("rank {rank} panicked: {e:?}"));
+            result.unwrap_or_else(|e| panic!("rank {rank} must complete cleanly, got: {e}"));
+        }
+    }
+
+    /// A divergence FORCED on rank 1 alone (a NaN gradient at step 1, via
+    /// the `after_backward` test seam — the only hermetic way to reach this
+    /// through the REAL `run`, since the gather already makes the two
+    /// ranks' forward losses agree in the honest case) must be seen, and
+    /// acted on IDENTICALLY, by BOTH ranks: `canonical_reduce`'s
+    /// `all_reduce_sum` propagates the NaN into the SAME reduced gradient on
+    /// every rank, so both end in the SAME typed non-finite-norm refusal at
+    /// the SAME step — never one rank erroring while its peer hangs or
+    /// silently trains on.
+    ///
+    /// RED-PROOF: this property is unreachable before U4b — `canonical_
+    /// reduce`/`RankContext` do not exist at base, so there is no second
+    /// rank for a poisoned gradient to propagate to at all.
+    #[test]
+    fn forced_divergence_on_one_rank_both_ranks_end_in_the_same_refusal() {
+        let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
+        let mut handles = Vec::new();
+        for rank in 0..2u32 {
+            let local = gang.rank(rank).unwrap();
+            let partition =
+                PartitionSpec::for_gang(rank as usize, 2, 2, PartitionRule::BlockByGlobalBatch)
+                    .unwrap();
+            let rank_ctx = RankContext::new(Arc::new(local), partition);
+            let tag = format!("forced-divergence-rank-{rank}");
+            let hook: Option<AfterBackwardHook> = if rank == 1 {
+                Some(poison_grad_at(1))
+            } else {
+                None
+            };
+            handles.push(crate::fine_tune::collective::BlockingCall::spawn_thread(
+                move |call| run_gang_rank(&call, tag, gang_config(2), pairs(4), rank_ctx, hook),
+            ));
+        }
+        let results: Vec<jammi_db::error::Result<TrainingResult>> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for (rank, result) in results.iter().enumerate() {
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!(
+                    "rank {rank} must refuse (a NaN gradient reduced across the gang must \
+                     poison every rank's post-reduce norm), got Ok"
+                ),
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("non-finite total gradient norm") && msg.contains("step 1"),
+                "rank {rank}: expected the grad-norm refusal naming step 1, got: {msg}"
+            );
+        }
+    }
+}
+
+/// Plan 67 U5b-1b-iii: the runner role as the trainer's durable-write gate,
+/// and the agreement binding at the post-target-build seam — both on a REAL
+/// two-rank `Local` gang through the full production `TrainingLoop::run`.
+#[cfg(test)]
+mod runner_role_and_agreement_oracle {
+    use std::sync::Arc;
+
+    use candle_core::{DType, Device};
+    use candle_nn::{VarBuilder, VarMap};
+    use jammi_db::storage::{StorageRegistry, StorageUrl};
+    use jammi_db::store::ArtifactStore;
+
+    use super::super::collective::{BlockingCall, LocalGang};
+    use super::super::data::TrainingDataLoader;
+    use super::super::lora::build_projection_head;
+    use super::super::partition::{PartitionRule, PartitionSpec};
+    use super::super::role::{LeaseHolder, RunnerRole};
+    use super::super::target::TrainingTarget;
+    use super::super::{EarlyStoppingMetric, FineTuneConfig};
+    use super::{RankContext, TrainingLoopBuilder, TrainingResult};
+
+    const HIDDEN: usize = 32; // tiny_bert's hidden width.
+
+    fn gang_config() -> FineTuneConfig {
+        FineTuneConfig {
+            epochs: 1,
+            batch_size: 2,
+            validation_fraction: 0.0,
+            warmup_steps: 0,
+            gradient_accumulation_steps: 1,
+            lora_rank: 2,
+            lora_dropout: 0.0,
+            early_stopping_metric: EarlyStoppingMetric::TrainLoss,
+            early_stopping_patience: 10_000,
+            learning_rate: 1e-3,
+            ..Default::default()
+        }
+    }
+
+    fn pairs(n: usize) -> TrainingDataLoader {
+        TrainingDataLoader::from_pairs(
+            (0..n)
+                .map(|i| (format!("anchor text {i}"), format!("positive text {i}")))
+                .collect(),
+        )
+    }
+
+    fn file_store() -> Arc<ArtifactStore> {
+        let root_dir = tempfile::TempDir::new().unwrap().keep();
+        let cache = tempfile::TempDir::new().unwrap().keep();
+        let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
+        Arc::new(ArtifactStore::with_root(root, StorageRegistry::new(), cache).unwrap())
+    }
+
+    /// One rank's `TrainingLoop` over `rank_ctx`, built with its OWN
+    /// artifact store (so what each rank wrote durably is observable per
+    /// rank) and, when `rename` is set, over a varmap whose keys carry that
+    /// prefix — the SAME `Var`s under different names, so the tensors, the
+    /// shapes and the sorted order all agree with an unrenamed rank and ONLY
+    /// the canonical layout's digest differs. Run on the current thread.
+    fn run_rank(
+        call: &BlockingCall,
+        tag: String,
+        store: Arc<ArtifactStore>,
+        rename: Option<&str>,
+        rank_ctx: RankContext,
+        role: Option<RunnerRole>,
+    ) -> jammi_db::error::Result<TrainingResult> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let config = gang_config();
+        let (loop_, _dir) = rt.block_on(async {
+            let base_model = super::test_fixtures::tiny_bert().await;
+            let (catalog, dir) = super::test_fixtures::claimed_job(&tag).await;
+            let device = Device::Cpu;
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+            let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
+            let varmap = match rename {
+                None => varmap,
+                Some(prefix) => {
+                    let renamed = VarMap::new();
+                    for (name, var) in varmap.data().lock().unwrap().iter() {
+                        renamed
+                            .data()
+                            .lock()
+                            .unwrap()
+                            .insert(format!("{prefix}{name}"), var.clone());
+                    }
+                    renamed
+                }
+            };
+            let mut builder =
+                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                    .device(device)
+                    .job_id(tag.clone())
+                    .worker_id(format!("{tag}-worker"))
+                    .catalog(catalog)
+                    .artifact_dir(dir.path().to_path_buf())
+                    .base_model(base_model)
+                    .artifact_store(store)
+                    .rank_context(rank_ctx);
+            if let Some(role) = role {
+                builder = builder.runner_role(role);
+            }
+            (builder.build(), dir)
+        });
+        let mut loop_ = loop_?;
+        let _enter = rt.enter();
+        loop_.run(
+            call,
+            crate::fine_tune::source::TrainingSource::Resident(pairs(4)),
+        )
+    }
+
+    fn two_rank_contexts() -> Vec<RankContext> {
+        let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
+        (0..2u32)
+            .map(|rank| {
+                let partition =
+                    PartitionSpec::for_gang(rank as usize, 2, 2, PartitionRule::BlockByGlobalBatch)
+                        .unwrap();
+                RankContext::new(Arc::new(gang.rank(rank).unwrap()), partition)
+            })
+            .collect()
+    }
+
+    /// The single-writer rule at the trainer's own durable write: over a
+    /// real two-rank gang, every rank takes the epoch-boundary
+    /// dropout-position gather (lockstep — both complete), the lease holder
+    /// (rank 0) writes the resume checkpoint into ITS store, and the `Rank`
+    /// (rank 1) writes NOTHING into its own. Mutation: the role gate in
+    /// `save_resume_checkpoint` removed → rank 1's store holds a bundle →
+    /// RED.
+    #[test]
+    fn a_rank_of_a_gang_never_writes_the_resume_checkpoint_and_the_holder_does() {
+        let stores: Vec<Arc<ArtifactStore>> = (0..2).map(|_| file_store()).collect();
+        let mut handles = Vec::new();
+        for (rank, rank_ctx) in two_rank_contexts().into_iter().enumerate() {
+            let tag = format!("role-gate-r{rank}");
+            let store = Arc::clone(&stores[rank]);
+            handles.push(BlockingCall::spawn_thread(move |call| {
+                run_rank(&call, tag, store, None, rank_ctx, None)
+            }));
+        }
+        for (rank, handle) in handles.into_iter().enumerate() {
+            handle
+                .join()
+                .unwrap()
+                .unwrap_or_else(|e| panic!("rank {rank} must complete: {e}"));
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let written: Vec<bool> = (0..2)
+            .map(|rank| {
+                rt.block_on(
+                    stores[rank].fetch_resume_checkpoint(None, &format!("role-gate-r{rank}")),
+                )
+                .unwrap()
+                .is_some()
+            })
+            .collect();
+        assert_eq!(
+            written,
+            vec![true, false],
+            "the lease holder (rank 0) alone writes the resume checkpoint; the Rank writes nothing"
+        );
+    }
+
+    /// The agreement binding: two ranks whose canonical trainable-variable
+    /// layouts differ (the same `Var`s, the same shapes and order, different
+    /// NAMES on rank 1) are refused at the first reduce — on BOTH ranks,
+    /// naming BOTH digests — never folded. Mutation: the `bind_agreement`
+    /// call in `run` removed → both ranks complete `Ok` (the positions
+    /// happen to line up, so the fold proceeds silently) → RED.
+    #[test]
+    fn two_ranks_whose_canonical_layouts_differ_are_refused_naming_both_digests() {
+        let mut handles = Vec::new();
+        for (rank, rank_ctx) in two_rank_contexts().into_iter().enumerate() {
+            let tag = format!("agreement-r{rank}");
+            let rename = (rank == 1).then_some("zz_");
+            handles.push(BlockingCall::spawn_thread(move |call| {
+                run_rank(&call, tag, file_store(), rename, rank_ctx, None)
+            }));
+        }
+        let results: Vec<jammi_db::error::Result<TrainingResult>> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        // The two digests, from the same names and the same function the
+        // trainer binds with: a head built exactly as each rank's was.
+        let names = {
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+            let _head = build_projection_head(HIDDEN, &gang_config(), &varmap, &vb).unwrap();
+            super::super::optimizer::sorted_trainable_var_names(&varmap)
+        };
+        assert!(!names.is_empty());
+        let digest0 = RankContext::canonical_vars_digest(&names);
+        let renamed: Vec<String> = names.iter().map(|n| format!("zz_{n}")).collect();
+        let digest1 = RankContext::canonical_vars_digest(&renamed);
+        assert_ne!(digest0, digest1);
+        for (rank, result) in results.iter().enumerate() {
+            let msg = match result {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!(
+                    "rank {rank} must refuse: the ranks' canonical layouts differ, yet the fold \
+                     proceeded"
+                ),
+            };
+            assert!(
+                msg.contains("disagree about what this round computes"),
+                "rank {rank}: a typed descriptor disagreement, got: {msg}"
+            );
+            assert!(
+                msg.contains(&digest0) && msg.contains(&digest1),
+                "rank {rank}: the refusal names BOTH digests ({digest0}, {digest1}): {msg}"
+            );
+        }
+    }
+
+    /// The role and the rank must agree at `build`: a holder role on a
+    /// rank-1 context, or a `Rank` naming another index, is a typed
+    /// refusal; the matching role (and no role at all) builds.
+    #[test]
+    fn a_runner_role_that_contradicts_the_rank_context_is_refused_at_build() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let build = |rank: u32, role: Option<RunnerRole>| -> Result<(), String> {
+            let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
+            let partition =
+                PartitionSpec::for_gang(rank as usize, 2, 2, PartitionRule::BlockByGlobalBatch)
+                    .unwrap();
+            let rank_ctx = RankContext::new(Arc::new(gang.rank(rank).unwrap()), partition);
+            rt.block_on(async {
+                let (catalog, dir) = super::test_fixtures::claimed_job("role-build").await;
+                let config = gang_config();
+                let varmap = VarMap::new();
+                let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+                let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
+                let mut builder = TrainingLoopBuilder::new(
+                    TrainingTarget::ProjectionHead { head },
+                    varmap,
+                    config,
+                )
+                .job_id("role-build".into())
+                .worker_id("w".into())
+                .catalog(catalog)
+                .artifact_dir(dir.path().to_path_buf())
+                .rank_context(rank_ctx);
+                if let Some(role) = role {
+                    builder = builder.runner_role(role);
+                }
+                builder.build().map(|_| ()).map_err(|e| e.to_string())
+            })
+        };
+        let refused = |rank: u32, role: RunnerRole| {
+            let err = build(rank, Some(role)).expect_err("the role contradicts the rank");
+            assert!(
+                err.contains("the role and the rank must agree"),
+                "rank {rank}, role {role}: {err}"
+            );
+        };
+        refused(1, RunnerRole::Holder(LeaseHolder::LoopClaimer));
+        refused(1, RunnerRole::Holder(LeaseHolder::Coordinator));
+        refused(1, RunnerRole::Rank { rank: 2 });
+        refused(0, RunnerRole::Rank { rank: 1 });
+        build(0, Some(RunnerRole::Holder(LeaseHolder::Coordinator))).unwrap();
+        build(1, Some(RunnerRole::Rank { rank: 1 })).unwrap();
+        build(1, None).unwrap();
+        build(0, None).unwrap();
+    }
+}
+
+/// U4b acceptance (a): equal-topology reproducibility on a REAL two-rank
+/// `Local` gang — two independent runs from scratch produce byte-identical
+/// weights, and a run interrupted at an epoch boundary and resumed produces
+/// weights byte-identical to an uninterrupted run over the same epoch count.
+#[cfg(test)]
+mod gang_determinism_oracle {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{VarBuilder, VarMap};
+
+    use jammi_db::storage::{StorageRegistry, StorageUrl};
+    use jammi_db::store::ArtifactStore;
+
+    use super::super::data::TrainingDataLoader;
+    use super::super::lora::build_projection_head_for_rank;
+    use super::super::partition::{PartitionRule, PartitionSpec};
+    use super::super::target::TrainingTarget;
+    use super::super::{EarlyStoppingMetric, FineTuneConfig};
+    use super::{RankContext, TrainingLoop, TrainingLoopBuilder, TrainingResult};
+    use crate::fine_tune::collective::LocalGang;
+
+    const HIDDEN: usize = 32; // tiny_bert's hidden width.
+
+    /// `lora_dropout`: `0.0` for `w2_twice_is_byte_identical`/`resume_
+    /// after_a_kill_matches_an_uninterrupted_run` (unchanged from before
+    /// this unit); `> 0.0` for the `*_with_dropout` rows below, so the
+    /// per-rank dropout-position gather/restore is load-bearing (a vacuous
+    /// check at `0.0` — see this unit's contract, Uncovered §3 in the
+    /// folded U4b section).
+    fn gang_config_with_dropout(epochs: usize, lora_dropout: f64) -> FineTuneConfig {
+        FineTuneConfig {
+            epochs,
+            batch_size: 2,
+            validation_fraction: 0.0,
+            warmup_steps: 0,
+            gradient_accumulation_steps: 1,
+            lora_rank: 2,
+            lora_dropout,
+            seed: 99,
+            early_stopping_metric: EarlyStoppingMetric::TrainLoss,
+            early_stopping_patience: 10_000,
+            learning_rate: 1e-4,
+            ..Default::default()
+        }
+    }
+
+    fn pairs(n: usize) -> TrainingDataLoader {
+        TrainingDataLoader::from_pairs(
+            (0..n)
+                .map(|i| (format!("anchor text {i}"), format!("positive text {i}")))
+                .collect(),
+        )
+    }
+
+    /// A fresh `file://` artifact store under a kept tempdir — mirrors
+    /// `resume_invariant::file_store`'s own precedent.
+    fn file_store() -> Arc<ArtifactStore> {
+        let root_dir = tempfile::tempdir().unwrap().keep();
+        let cache = tempfile::tempdir().unwrap().keep();
+        let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
+        Arc::new(ArtifactStore::with_root(root, StorageRegistry::new(), cache).unwrap())
+    }
+
+    /// Flatten a weights map to a sorted `(key, bytes)` list for byte-equality
+    /// assertions independent of `HashMap` order.
+    fn weight_bytes(map: &HashMap<String, Tensor>) -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<(String, Vec<u8>)> = map
+            .iter()
+            .map(|(k, t)| {
+                let v: Vec<f32> = t.flatten_all().unwrap().to_vec1().unwrap();
+                let bytes = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+                (k.clone(), bytes)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Run one rank of a 2-rank gang against a CALLER-SUPPLIED artifact store
+    /// — so two independent calls sharing the SAME `job_id` and the SAME
+    /// store observe the SAME durable `{job_id}/_resume/` bundle (only rank
+    /// 0 ever writes or reads it; every other rank's own artifact_store
+    /// argument is present only to satisfy the builder, never actually read
+    /// from or written to). Discovers a resume bundle itself (mirroring
+    /// `worker.rs::discover_resume`) before building, so a second call with
+    /// the SAME `job_id`/store after a shorter first call resumes from where
+    /// that first call left off.
+    ///
+    /// `cancel_after_step`, when set, installs a cooperative-cancellation
+    /// flag that flips true once the `after_backward` seam observes optimizer
+    /// step `>= cancel_after_step` — simulating a crash WITHOUT shrinking
+    /// `config.epochs` (a shrunk config would give the LR schedule a
+    /// DIFFERENT horizon than the run being "interrupted" actually has,
+    /// which is a real trajectory divergence, not the property under test).
+    ///
+    /// The epoch-boundary cancel check (`self.cancel`, at the TOP of each
+    /// epoch's iteration) and the epoch-boundary checkpoint SAVE (at the
+    /// BOTTOM of that same iteration, gated on `!self.cancel`) share the
+    /// SAME flag read — so a flag that flips true DURING epoch `E`'s own
+    /// last step is ALSO visible to epoch `E`'s own end-of-iteration save
+    /// gate, skipping it (there is no step boundary between "last batch of
+    /// epoch `E` processed" and "epoch `E`'s own save gate checked" for this
+    /// hook to land in between). The caller that wants epoch `K − 1`'s
+    /// checkpoint to durably survive must therefore set `cancel_after_step`
+    /// to a step INSIDE epoch `K` (never epoch `K − 1`'s own last step) —
+    /// epoch `K` still runs to completion (its OWN top-check already passed
+    /// before the flag flipped) but its OWN save is skipped, and epoch
+    /// `K + 1`'s top-check bails before doing any work. Net effect: exactly
+    /// epochs `0..K` are durable; epoch `K`'s in-memory work is discarded,
+    /// matching a real crash mid-epoch-`K`.
+    // The rank's whole configuration is this helper's argument list; the
+    // witness makes it eight.
+    #[allow(clippy::too_many_arguments)]
+    fn run_gang_rank(
+        call: &crate::fine_tune::collective::BlockingCall,
+        tag: String,
+        job_id: String,
+        config: FineTuneConfig,
+        loader: TrainingDataLoader,
+        rank_ctx: RankContext,
+        store: Arc<ArtifactStore>,
+        cancel_after_step: Option<usize>,
+    ) -> (jammi_db::error::Result<TrainingResult>, TrainingLoop) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut loop_ = rt.block_on(async {
+            let base_model = super::test_fixtures::tiny_bert().await;
+            let (catalog, dir) = super::test_fixtures::claimed_job(&tag).await;
+            let device = Device::Cpu;
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+            // U4b tail: the per-rank dropout seed, `f(config.seed, rank)` —
+            // rank 0 reproduces `config.seed` exactly (byte-identical to
+            // every pre-U4b caller), every other rank draws a distinct,
+            // deterministic dropout mask stream while its A/B init stays
+            // keyed by `config.seed` alone (identical on every rank).
+            // Computed BEFORE `rank_ctx` moves into the builder below —
+            // `w2_twice_is_byte_identical`/`resume_after_a_kill_matches_an_
+            // uninterrupted_run` run at `lora_dropout = 0.0`, where this
+            // value is unread; `dropout_seed_split_*` (below) is where it
+            // is load-bearing.
+            let dropout_seed = rank_ctx.dropout_seed(config.seed);
+            let head = build_projection_head_for_rank(HIDDEN, &config, &varmap, &vb, dropout_seed)
+                .unwrap();
+            let mut builder =
+                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                    .device(device.clone())
+                    .job_id(job_id.clone())
+                    .worker_id(format!("{tag}-worker"))
+                    .catalog(catalog)
+                    .artifact_dir(dir.path().to_path_buf())
+                    .base_model(base_model)
+                    .artifact_store(Arc::clone(&store))
+                    .cancel(Arc::clone(&cancel))
+                    .rank_context(rank_ctx);
+            if let Some(local) = store.fetch_resume_checkpoint(None, &job_id).await.unwrap() {
+                if let Some(restored) =
+                    super::super::resume::load_bundle(local.dir(), &device).unwrap()
+                {
+                    builder = builder.resume(restored);
+                }
+            }
+            builder.build().unwrap()
+        });
+        if let Some(cancel_after_step) = cancel_after_step {
+            let cancel = Arc::clone(&cancel);
+            loop_.after_backward = Some(Box::new(move |s, _grads, _vars| {
+                if s >= cancel_after_step {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(())
+            }));
+        }
+        let _enter = rt.enter();
+        let result = loop_.run(
+            call,
+            crate::fine_tune::source::TrainingSource::Resident(loader),
+        );
+        (result, loop_)
+    }
+
+    /// Drive a fresh (or resuming) 2-rank gang, always at `config.epochs =
+    /// TOTAL_EPOCHS` (the REAL intended horizon — see `run_gang_rank`'s own
+    /// doc for why a shrunk config would give a different LR schedule), from
+    /// scratch or resuming from `store`'s existing bundle if `job_id` already
+    /// has one. `cancel_after_step` simulates a crash partway through, when
+    /// set. Returns rank 0's final trainable weights.
+    ///
+    /// `lora_dropout` (U4b tail): `0.0` for `w2_twice_is_byte_identical`/
+    /// `resume_after_a_kill_matches_an_uninterrupted_run` (unchanged from
+    /// before this unit); `> 0.0` for `dropout_seed_split_*`/`*_with_dropout`
+    /// below, so the per-rank dropout-position gather/restore is
+    /// load-bearing.
+    ///
+    /// `train_rows` (U4b tail): `8` reproduces every pre-existing call
+    /// (`8` pairs, `batch_size: 2`, `W = 2` → global batch 4 → both ranks
+    /// hold EQUAL counts every step, so a cross-rank dropout-position swap
+    /// would be numerically vacuous — see `resume_after_a_kill_matches_an_
+    /// uninterrupted_run_with_dropout`'s own doc for why THAT test passes
+    /// `6` instead.
+    #[allow(clippy::too_many_arguments)]
+    fn drive_gang(
+        job_prefix: &str,
+        job_id: &str,
+        total_epochs: usize,
+        lora_dropout: f64,
+        train_rows: usize,
+        store: Arc<ArtifactStore>,
+        cancel_after_step: Option<usize>,
+    ) -> HashMap<String, Tensor> {
+        let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
+        let mut handles = Vec::new();
+        for rank in 0..2u32 {
+            let local = gang.rank(rank).unwrap();
+            let partition =
+                PartitionSpec::for_gang(rank as usize, 2, 2, PartitionRule::BlockByGlobalBatch)
+                    .unwrap();
+            let rank_ctx = RankContext::new(Arc::new(local), partition);
+            let tag = format!("{job_prefix}-{rank}-{job_id}");
+            let job_id = job_id.to_string();
+            let store = Arc::clone(&store);
+            handles.push(crate::fine_tune::collective::BlockingCall::spawn_thread(
+                move |call| {
+                    run_gang_rank(
+                        &call,
+                        tag,
+                        job_id,
+                        gang_config_with_dropout(total_epochs, lora_dropout),
+                        pairs(train_rows),
+                        rank_ctx,
+                        store,
+                        cancel_after_step,
+                    )
+                },
+            ));
+        }
+        let mut rank0_weights = None;
+        for (rank, handle) in handles.into_iter().enumerate() {
+            let (result, loop_) = handle.join().unwrap();
+            if cancel_after_step.is_some() {
+                let err = result.expect_err("a cancelled leg must return the cancellation Err");
+                assert!(
+                    err.to_string().contains("training cancelled"),
+                    "rank {rank}: expected the cooperative-cancellation error, got: {err}"
+                );
+            } else {
+                result.unwrap_or_else(|e| panic!("rank {rank} must complete cleanly, got: {e}"));
+            }
+            if rank == 0 {
+                rank0_weights = Some(loop_.target.named_trainable_weights().unwrap());
+            }
+        }
+        rank0_weights.expect("rank 0 must have run")
+    }
+
+    /// Two independent from-scratch gangs (same seed, same data) produce
+    /// byte-identical rank-0 final weights — a real two-thread `Local` gang
+    /// each time, not a single-rank stand-in.
+    ///
+    /// An unseeded RNG anywhere on the trainable-parameter path (init,
+    /// dropout) would make this flaky across the two calls; this crate's
+    /// `family J` discipline (fixed fold order, no unseeded RNG) is what
+    /// makes it deterministic instead.
+    ///
+    /// EXECUTED RED-PROOF (applied, run, reverted): changed the second call
+    /// from `drive_gang("det-b", .., 2, ..)` to `drive_gang("det-b", .., 3,
+    /// ..)` (3 epochs instead of 2) — confirming the byte-comparison itself
+    /// discriminates a real difference rather than vacuously passing;
+    /// reverted to `2` before this test was committed.
+    #[test]
+    fn w2_twice_is_byte_identical() {
+        let store_a = file_store();
+        let store_b = file_store();
+        let weights_a = drive_gang("det-a", "det-job-a", 2, 0.0, 8, store_a, None);
+        let weights_b = drive_gang("det-b", "det-job-b", 2, 0.0, 8, store_b, None);
+        assert_eq!(
+            weight_bytes(&weights_a),
+            weight_bytes(&weights_b),
+            "two independent W=2 runs from the same seed/data must produce byte-identical \
+             final weights"
+        );
+    }
+
+    /// U4b tail: [`w2_twice_is_byte_identical`] re-run at `lora_dropout >
+    /// 0.0` — the per-rank dropout Philox mask (`dropout_seed = f(config.
+    /// seed, rank)`, item 2 of this unit) is now load-bearing on EVERY
+    /// step, not just at resume, so this pins the SAME determinism property
+    /// under the condition that actually exercises it.
+    ///
+    /// EXECUTED RED-PROOF (applied, run, reverted): changed the second
+    /// call's epoch count `2` → `3` (mirroring `w2_twice_is_byte_
+    /// identical`'s own red-proof) — confirmed red, reverted.
+    #[test]
+    fn w2_twice_is_byte_identical_with_dropout() {
+        let store_a = file_store();
+        let store_b = file_store();
+        let weights_a = drive_gang("det-drop-a", "det-drop-job-a", 2, 0.3, 8, store_a, None);
+        let weights_b = drive_gang("det-drop-b", "det-drop-job-b", 2, 0.3, 8, store_b, None);
+        assert_eq!(
+            weight_bytes(&weights_a),
+            weight_bytes(&weights_b),
+            "two independent W=2 runs from the same seed/data must produce byte-identical \
+             final weights, even with a per-rank dropout mask installed"
+        );
+    }
+
+    /// A gang killed at epoch boundary `K` and resumed must reproduce an
+    /// UNINTERRUPTED run's final weights byte-for-byte. 8 pairs at
+    /// `batch_size: 2`, `W = 2` → global batch 4 → 2 optimizer steps/epoch
+    /// (`STEPS_PER_EPOCH`); the kill fires via `cancel_after_step`, never by
+    /// shrinking `config.epochs` (see `run_gang_rank`'s own doc for why that
+    /// would be a different LR-schedule horizon, not the property under
+    /// test).
+    ///
+    /// This fixture's `lora_dropout = 0.0`, so `dropout_positions` is empty
+    /// on every rank and this test does NOT exercise the per-rank
+    /// dropout-position gather/restore specifically (see this unit's
+    /// contract, Uncovered, for that determinant — restoring the WRONG
+    /// rank's positions is vacuous when every rank's own map is empty). What
+    /// this test DOES exercise, end to end, on a REAL two-rank gang: weight
+    /// restore, optimizer-moment restore (by name, positionally reordered),
+    /// and the LR schedule computed from the FULL (never-shrunk)
+    /// `config.epochs` on both legs.
+    ///
+    /// EXECUTED RED-PROOF (applied, run, reverted): commented out
+    /// `optimizer.load_state(&ordered, state.step_t)` in `restore_from_
+    /// checkpoint` (a no-op stand-in), leaving every rank's optimizer at its
+    /// freshly-constructed zero moments post-resume instead of the
+    /// persisted trajectory. Confirmed red — panicked with a real (if
+    /// small) byte divergence between `left`/`right`, e.g. `lora_a[0]`
+    /// `178` vs `229` — then reverted. This is also what caught this test's
+    /// OWN first-draft bug (using a shrunk `config.epochs` for the "killed"
+    /// leg, and cancelling mid-epoch's own last step): both silently made
+    /// the "resumed" leg train from scratch, matching "uninterrupted" for
+    /// the wrong reason (identical fresh runs, not a real resume) — this
+    /// mutation still passed under that bug, which is exactly why an
+    /// executed RED-PROOF is required rather than trusting the test's own
+    /// green result at face value.
+    #[test]
+    fn resume_after_a_kill_matches_an_uninterrupted_run() {
+        const TOTAL_EPOCHS: usize = 3;
+        const STEPS_PER_EPOCH: usize = 2;
+        const KILL_AFTER_EPOCHS: usize = 1;
+
+        // ── Uninterrupted: TOTAL_EPOCHS straight through, never cancelled ──
+        let uninterrupted_store = file_store();
+        let uninterrupted = drive_gang(
+            "uninterrupted",
+            "det-job-uninterrupted",
+            TOTAL_EPOCHS,
+            0.0,
+            8,
+            uninterrupted_store,
+            None,
+        );
+
+        // ── Killed after KILL_AFTER_EPOCHS, then resumed to TOTAL_EPOCHS,
+        // SAME job_id/store, `config.epochs = TOTAL_EPOCHS` on BOTH calls ──
+        let resume_store = file_store();
+        let job_id = "det-job-resume";
+        let _ = drive_gang(
+            "killed",
+            job_id,
+            TOTAL_EPOCHS,
+            0.0,
+            8,
+            Arc::clone(&resume_store),
+            // One step INTO epoch `KILL_AFTER_EPOCHS` (never epoch
+            // `KILL_AFTER_EPOCHS - 1`'s own last step) — see `run_gang_rank`'s
+            // own doc for why: epoch `KILL_AFTER_EPOCHS` still runs to
+            // completion but its OWN save is skipped, so exactly epochs
+            // `0..KILL_AFTER_EPOCHS` end up durable.
+            Some(KILL_AFTER_EPOCHS * STEPS_PER_EPOCH + 1),
+        );
+        let resumed = drive_gang("resumed", job_id, TOTAL_EPOCHS, 0.0, 8, resume_store, None);
+
+        assert_eq!(
+            weight_bytes(&uninterrupted),
+            weight_bytes(&resumed),
+            "a gang killed after epoch {KILL_AFTER_EPOCHS} and resumed to {TOTAL_EPOCHS} \
+             epochs must match an uninterrupted {TOTAL_EPOCHS}-epoch run byte-for-byte"
+        );
+    }
+
+    /// U4b tail: [`resume_after_a_kill_matches_an_uninterrupted_run`]
+    /// re-run at `lora_dropout > 0.0` over a fixture whose per-rank forward
+    /// COUNTS genuinely diverge (`6` rows, `batch_size: 2`, `W = 2` → global
+    /// batch 4: step 0 gives each rank 2 rows; step 1's global slice `[4,
+    /// 6)` gives rank 0 its trailing 2 rows but rank 1 NONE — a real
+    /// zero-row-rank step, DESIGN.md §4 — so rank 0 takes ONE MORE training
+    /// forward than rank 1 over the run, and `dropout_position()`'s own
+    /// per-rank COUNT genuinely differs between them). This is what makes
+    /// "restore THIS rank's own entry, never rank 0's"
+    /// (`restore_from_checkpoint`, `trainer.rs`) load-bearing: with an EQUAL
+    /// split (this module's other tests, `8` rows) every rank's count
+    /// coincides regardless of whose entry gets restored, so a cross-rank
+    /// swap would be numerically vacuous there.
+    ///
+    /// EXECUTED RED-PROOF (applied, run, reverted): changed
+    /// `restore_from_checkpoint`'s `state.dropout_positions.get(&self.
+    /// rank_ctx.rank())` to `state.dropout_positions.get(&0u32)` (always
+    /// rank 0's entry, on every rank) — confirmed a real byte divergence
+    /// between the uninterrupted and resumed legs' final weights, then
+    /// reverted.
+    #[test]
+    fn resume_after_a_kill_matches_an_uninterrupted_run_with_dropout() {
+        const TOTAL_EPOCHS: usize = 3;
+        const STEPS_PER_EPOCH: usize = 2;
+        const KILL_AFTER_EPOCHS: usize = 1;
+        const TRAIN_ROWS: usize = 6;
+        const LORA_DROPOUT: f64 = 0.3;
+
+        let uninterrupted_store = file_store();
+        let uninterrupted = drive_gang(
+            "uninterrupted-drop",
+            "det-job-uninterrupted-drop",
+            TOTAL_EPOCHS,
+            LORA_DROPOUT,
+            TRAIN_ROWS,
+            uninterrupted_store,
+            None,
+        );
+
+        let resume_store = file_store();
+        let job_id = "det-job-resume-drop";
+        let _ = drive_gang(
+            "killed-drop",
+            job_id,
+            TOTAL_EPOCHS,
+            LORA_DROPOUT,
+            TRAIN_ROWS,
+            Arc::clone(&resume_store),
+            Some(KILL_AFTER_EPOCHS * STEPS_PER_EPOCH + 1),
+        );
+        let resumed = drive_gang(
+            "resumed-drop",
+            job_id,
+            TOTAL_EPOCHS,
+            LORA_DROPOUT,
+            TRAIN_ROWS,
+            resume_store,
+            None,
+        );
+
+        assert_eq!(
+            weight_bytes(&uninterrupted),
+            weight_bytes(&resumed),
+            "a gang killed after epoch {KILL_AFTER_EPOCHS} and resumed to {TOTAL_EPOCHS} \
+             epochs must match an uninterrupted {TOTAL_EPOCHS}-epoch run byte-for-byte, even \
+             when the two ranks' own dropout-position counts diverge (a real zero-row-rank step)"
+        );
+    }
+}
+
+/// U4b tail (item 2): the LoRA init seed split from the dropout seed —
+/// `build_projection_head_for_rank`'s `dropout_seed` argument must vary the
+/// dropout Philox stream ALONE, never the A/B weight init.
+#[cfg(test)]
+mod lora_seed_split_oracle {
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{VarBuilder, VarMap};
+
+    use super::super::lora::build_projection_head_for_rank;
+    use super::super::{EarlyStoppingMetric, FineTuneConfig};
+    use super::rank_dropout_seed;
+
+    const HIDDEN: usize = 8;
+
+    fn config() -> FineTuneConfig {
+        FineTuneConfig {
+            lora_rank: 2,
+            lora_dropout: 0.4,
+            seed: 4242,
+            early_stopping_metric: EarlyStoppingMetric::TrainLoss,
+            ..Default::default()
+        }
+    }
+
+    fn flat_bytes(t: &Tensor) -> Vec<u8> {
+        t.flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect()
+    }
+
+    /// Two ranks built through `build_projection_head_for_rank` with the
+    /// SAME `config` (so the SAME `init_seed = config.seed`) and DIFFERENT
+    /// `dropout_seed` (`rank_dropout_seed(config.seed, rank)`) report
+    /// byte-identical `lora_a`/`lora_b` before any forward — the A/B init
+    /// draw is keyed by `config.seed` alone, never `dropout_seed` — while
+    /// their dropout Philox SEED (`LoraLinear::dropout_run_seed`) genuinely
+    /// differs. `dropout_position()` (the forward COUNT) is deliberately
+    /// NOT the property checked here: it is invariant of which seed drew
+    /// the mask (both ranks take the same number of forwards in this
+    /// fixture), so it cannot itself distinguish the two ranks — see that
+    /// method's own doc.
+    ///
+    /// EXECUTED RED-PROOF (applied, run, reverted — see the contract):
+    /// built BOTH ranks by threading each rank's OWN dropout seed into
+    /// `config.seed` (the init seed) instead of `dropout_seed` — i.e.
+    /// `build_projection_head_for_rank(HIDDEN, &Config{seed: rank_seed,
+    /// ..cfg}, .., cfg.seed)` — confirmed the pre-forward `lora_a` bytes
+    /// diverge between rank 0 and rank 1, then reverted.
+    #[test]
+    fn dropout_seed_split_leaves_init_identical_and_dropout_distinct() {
+        let cfg = config();
+        let device = Device::Cpu;
+
+        let build = |dropout_seed: u64| {
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+            build_projection_head_for_rank(HIDDEN, &cfg, &varmap, &vb, dropout_seed).unwrap()
+        };
+
+        let dropout_seed0 = rank_dropout_seed(cfg.seed, 0);
+        let dropout_seed1 = rank_dropout_seed(cfg.seed, 1);
+        assert_ne!(
+            dropout_seed0, dropout_seed1,
+            "fixture sanity: rank 0 and rank 1 must actually draw distinct dropout seeds"
+        );
+
+        let rank0 = build(dropout_seed0);
+        let rank1 = build(dropout_seed1);
+        let layer0 = &rank0.layers[0].1;
+        let layer1 = &rank1.layers[0].1;
+
+        assert_eq!(
+            flat_bytes(&layer0.lora_a),
+            flat_bytes(&layer1.lora_a),
+            "rank 0/1 lora_a must be byte-identical before any forward (init_seed == \
+             config.seed on every rank, independent of dropout_seed)"
+        );
+        assert_eq!(
+            flat_bytes(&layer0.lora_b),
+            flat_bytes(&layer1.lora_b),
+            "rank 0/1 lora_b must be byte-identical before any forward"
+        );
+
+        let seed0 = layer0
+            .dropout_run_seed()
+            .expect("lora_dropout > 0 installs a dropout mask");
+        let seed1 = layer1
+            .dropout_run_seed()
+            .expect("lora_dropout > 0 installs a dropout mask");
+        assert_eq!(
+            seed0, dropout_seed0,
+            "rank 0's layer must carry the dropout seed it was constructed with"
+        );
+        assert_eq!(
+            seed1, dropout_seed1,
+            "rank 1's layer must carry the dropout seed it was constructed with"
+        );
+        assert_ne!(
+            seed0, seed1,
+            "rank 0's and rank 1's dropout Philox seed must differ"
+        );
+        assert_eq!(
+            seed0, cfg.seed,
+            "rank 0's dropout seed is the identity: config.seed unchanged (W=1/rank-0 byte \
+             parity)"
         );
     }
 }
@@ -7335,15 +9419,18 @@ mod last_step_horizon_run_oracles {
     /// (always) and step 3 (the exact last step); step 2 is neither.
     #[test]
     fn fresh_short_run_reads_the_norm_on_step_one_and_the_last_step_only() {
-        let before = thread_sync_read_count();
-        let result = run_text_loop("horizon-fresh", text_config(), pairs(6), None, None).unwrap();
-        assert_eq!(result.total_steps, 3, "control: the run's horizon");
-        assert!(result.total_steps < DEFAULT_NORM_CHECK_INTERVAL);
-        assert_eq!(
-            thread_sync_read_count() - before,
-            2,
-            "a fresh 3-step run must read the norm on step 1 and step 3 only"
-        );
+        crate::fine_tune::collective::witness(|call| {
+            let before = thread_sync_read_count();
+            let result =
+                run_text_loop(&call, "horizon-fresh", text_config(), pairs(6), None, None).unwrap();
+            assert_eq!(result.total_steps, 3, "control: the run's horizon");
+            assert!(result.total_steps < DEFAULT_NORM_CHECK_INTERVAL);
+            assert_eq!(
+                thread_sync_read_count() - before,
+                2,
+                "a fresh 3-step run must read the norm on step 1 and step 3 only"
+            );
+        });
     }
 
     /// PR #381 fix-round item 2 (the 246-vs-249 `clip_gradients` call-count
@@ -7434,24 +9521,27 @@ mod last_step_horizon_run_oracles {
     /// paragraph replaces it with a mutant that was actually run.)
     #[test]
     fn clip_call_count_matches_total_optimizer_steps_for_a_fixed_config() {
-        let config = FineTuneConfig {
-            epochs: 3,
-            ..text_config()
-        };
-        let clip_calls_before = thread_clip_call_count();
-        let result = run_text_loop("clip-count-fixed", config, pairs(8), None, None).unwrap();
-        assert_eq!(
-            result.total_steps, 12,
-            "control: 8 pairs / batch_size 2 = 4 steps/epoch * 3 epochs"
-        );
-        let clip_calls = thread_clip_call_count() - clip_calls_before;
-        assert_eq!(
-            clip_calls, result.total_steps as u64,
-            "clip_gradients must be invoked exactly once per optimizer step: {clip_calls} \
+        crate::fine_tune::collective::witness(|call| {
+            let config = FineTuneConfig {
+                epochs: 3,
+                ..text_config()
+            };
+            let clip_calls_before = thread_clip_call_count();
+            let result =
+                run_text_loop(&call, "clip-count-fixed", config, pairs(8), None, None).unwrap();
+            assert_eq!(
+                result.total_steps, 12,
+                "control: 8 pairs / batch_size 2 = 4 steps/epoch * 3 epochs"
+            );
+            let clip_calls = thread_clip_call_count() - clip_calls_before;
+            assert_eq!(
+                clip_calls, result.total_steps as u64,
+                "clip_gradients must be invoked exactly once per optimizer step: {clip_calls} \
              clip-path calls vs {} trainer-path steps for this fixed (n_pairs=8, batch_size=2, \
              epochs=3) config",
-            result.total_steps
-        );
+                result.total_steps
+            );
+        });
     }
 
     /// The shrunk-horizon resume fixture: 8 pairs at `batch_size: 2`
@@ -7478,28 +9568,31 @@ mod last_step_horizon_run_oracles {
     /// this fixture is pinned alongside it.
     #[test]
     fn resumed_run_past_a_shrunk_horizon_checks_the_overshoot_once() {
-        let before = thread_sync_read_count();
-        let result = run_text_loop(
-            "horizon-overshoot",
-            shrunk_horizon_config(),
-            pairs(8),
-            None,
-            Some(100),
-        )
-        .unwrap();
-        let n = result.total_steps - 100;
-        assert_eq!(n, 8, "control: epochs 1 and 2 of 3, 4 steps each");
-        let reads = thread_sync_read_count() - before;
-        let bound = (n.div_ceil(DEFAULT_NORM_CHECK_INTERVAL) + 2) as u64;
-        assert!(
+        crate::fine_tune::collective::witness(|call| {
+            let before = thread_sync_read_count();
+            let result = run_text_loop(
+                &call,
+                "horizon-overshoot",
+                shrunk_horizon_config(),
+                pairs(8),
+                None,
+                Some(100),
+            )
+            .unwrap();
+            let n = result.total_steps - 100;
+            assert_eq!(n, 8, "control: epochs 1 and 2 of 3, 4 steps each");
+            let reads = thread_sync_read_count() - before;
+            let bound = (n.div_ceil(DEFAULT_NORM_CHECK_INTERVAL) + 2) as u64;
+            assert!(
             reads <= bound,
             "a resumed run past its horizon must not re-sync on every step: {reads} reads over \
              {n} steps, bound {bound}"
         );
-        assert_eq!(
-            reads, 1,
-            "exactly one overshoot check (step 101), then the cadence decides"
-        );
+            assert_eq!(
+                reads, 1,
+                "exactly one overshoot check (step 101), then the cadence decides"
+            );
+        });
     }
 
     /// Cell `step > horizon`, armed: the one-shot overshoot check is a REAL
@@ -7511,19 +9604,22 @@ mod last_step_horizon_run_oracles {
     /// the NaN trains in).
     #[test]
     fn resumed_run_past_a_shrunk_horizon_refuses_a_nan_on_its_first_overshoot_step() {
-        let err = run_text_loop(
-            "horizon-overshoot-nan",
-            shrunk_horizon_config(),
-            pairs(8),
-            Some(poison_grad_at(101)),
-            Some(100),
-        )
-        .expect_err("the one-shot overshoot check must refuse a NaN on step 101");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("non-finite total gradient norm") && msg.contains("step 101"),
-            "expected the grad-norm refusal naming step 101, got: {msg}"
-        );
+        crate::fine_tune::collective::witness(|call| {
+            let err = run_text_loop(
+                &call,
+                "horizon-overshoot-nan",
+                shrunk_horizon_config(),
+                pairs(8),
+                Some(poison_grad_at(101)),
+                Some(100),
+            )
+            .expect_err("the one-shot overshoot check must refuse a NaN on step 101");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("non-finite total gradient norm") && msg.contains("step 101"),
+                "expected the grad-norm refusal naming step 101, got: {msg}"
+            );
+        });
     }
 
     /// Cell `step > horizon`, disarmed: after the one-shot check, later
@@ -7535,26 +9631,29 @@ mod last_step_horizon_run_oracles {
     /// adapter such a run leaves behind.
     #[test]
     fn resumed_run_past_a_shrunk_horizon_leaves_later_overshoot_steps_to_the_cadence() {
-        let before = thread_sync_read_count();
-        let outcome = run_text_loop(
-            "horizon-overshoot-later",
-            shrunk_horizon_config(),
-            pairs(8),
-            Some(poison_grad_at(102)),
-            Some(100),
-        );
-        let err = outcome.expect_err("the NaN adapter is refused at the epoch boundary");
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("gradient norm") && msg.contains("checkpoint_best"),
-            "step 102 is past the one-shot check and off the cadence; the epoch-boundary \
+        crate::fine_tune::collective::witness(|call| {
+            let before = thread_sync_read_count();
+            let outcome = run_text_loop(
+                &call,
+                "horizon-overshoot-later",
+                shrunk_horizon_config(),
+                pairs(8),
+                Some(poison_grad_at(102)),
+                Some(100),
+            );
+            let err = outcome.expect_err("the NaN adapter is refused at the epoch boundary");
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("gradient norm") && msg.contains("checkpoint_best"),
+                "step 102 is past the one-shot check and off the cadence; the epoch-boundary \
              backstop must be what refuses it: {msg}"
-        );
-        assert_eq!(
-            thread_sync_read_count() - before,
-            1,
-            "the disarmed overshoot must not read the norm again"
-        );
+            );
+            assert_eq!(
+                thread_sync_read_count() - before,
+                1,
+                "the disarmed overshoot must not read the norm again"
+            );
+        });
     }
 }
 
@@ -7734,82 +9833,85 @@ mod loss_curve_metrics {
     /// KNOWN, not merely "however many happened to run".
     #[test]
     fn metrics_json_loss_curves_match_the_epoch_complete_tracing_event() {
-        install();
-        TRAIN_CAPTURE.with(|c| c.borrow_mut().clear());
-        VAL_CAPTURE.with(|c| c.borrow_mut().clear());
+        crate::fine_tune::collective::witness(|call| {
+            install();
+            TRAIN_CAPTURE.with(|c| c.borrow_mut().clear());
+            VAL_CAPTURE.with(|c| c.borrow_mut().clear());
 
-        let config = FineTuneConfig {
-            epochs: 3,
-            validation_fraction: 0.34,
-            early_stopping_metric: EarlyStoppingMetric::ValLoss,
-            ..text_config()
-        };
-        let result = run_text_loop("loss-curve-metrics", config, pairs(20), None, None).unwrap();
+            let config = FineTuneConfig {
+                epochs: 3,
+                validation_fraction: 0.34,
+                early_stopping_metric: EarlyStoppingMetric::ValLoss,
+                ..text_config()
+            };
+            let result =
+                run_text_loop(&call, "loss-curve-metrics", config, pairs(20), None, None).unwrap();
 
-        let metrics: serde_json::Value =
-            serde_json::from_str(&result.metrics_json).expect("metrics_json must be valid JSON");
-        let train_curve = metrics["train_loss_curve"]
-            .as_array()
-            .expect("train_loss_curve must be present and an array");
-        let val_curve = metrics["val_loss_curve"]
-            .as_array()
-            .expect("val_loss_curve must be present (this run measures ValLoss every epoch)");
+            let metrics: serde_json::Value = serde_json::from_str(&result.metrics_json)
+                .expect("metrics_json must be valid JSON");
+            let train_curve = metrics["train_loss_curve"]
+                .as_array()
+                .expect("train_loss_curve must be present and an array");
+            let val_curve = metrics["val_loss_curve"]
+                .as_array()
+                .expect("val_loss_curve must be present (this run measures ValLoss every epoch)");
 
-        let captured_train = TRAIN_CAPTURE.with(|c| c.borrow().clone());
-        let captured_val = VAL_CAPTURE.with(|c| c.borrow().clone());
+            let captured_train = TRAIN_CAPTURE.with(|c| c.borrow().clone());
+            let captured_val = VAL_CAPTURE.with(|c| c.borrow().clone());
 
-        assert_eq!(
-            train_curve.len(),
-            3,
-            "no early stopping fires (patience 10_000): all 3 configured epochs must have a \
+            assert_eq!(
+                train_curve.len(),
+                3,
+                "no early stopping fires (patience 10_000): all 3 configured epochs must have a \
              train_loss_curve row, got {train_curve:?}"
-        );
-        assert_eq!(
+            );
+            assert_eq!(
             val_curve.len(),
             3,
             "ValLoss is measured every epoch: val_loss_curve must have 3 rows too, got {val_curve:?}"
         );
-        assert_eq!(
-            train_curve.len(),
-            captured_train.len(),
-            "metrics_json's train_loss_curve must be exactly as long as the tracing capture: \
-             {captured_train:?}"
-        );
-        assert_eq!(
-            val_curve.len(),
-            captured_val.len(),
-            "metrics_json's val_loss_curve must be exactly as long as the tracing capture: \
-             {captured_val:?}"
-        );
-
-        for (row, (epoch, loss)) in train_curve.iter().zip(captured_train.iter()) {
-            let json_epoch = row["epoch"].as_u64().expect("row.epoch is a u64");
-            let json_loss = row["loss"].as_f64().expect("row.loss is an f64");
-            assert!(
-                json_loss.is_finite(),
-                "train_loss_curve row must be finite: {row:?}"
-            );
-            assert_eq!(json_epoch, *epoch, "epoch must match the tracing capture");
             assert_eq!(
-                json_loss, *loss,
-                "metrics_json's avg_train_loss must be the SAME f64 the tracing event carried \
+                train_curve.len(),
+                captured_train.len(),
+                "metrics_json's train_loss_curve must be exactly as long as the tracing capture: \
+             {captured_train:?}"
+            );
+            assert_eq!(
+                val_curve.len(),
+                captured_val.len(),
+                "metrics_json's val_loss_curve must be exactly as long as the tracing capture: \
+             {captured_val:?}"
+            );
+
+            for (row, (epoch, loss)) in train_curve.iter().zip(captured_train.iter()) {
+                let json_epoch = row["epoch"].as_u64().expect("row.epoch is a u64");
+                let json_loss = row["loss"].as_f64().expect("row.loss is an f64");
+                assert!(
+                    json_loss.is_finite(),
+                    "train_loss_curve row must be finite: {row:?}"
+                );
+                assert_eq!(json_epoch, *epoch, "epoch must match the tracing capture");
+                assert_eq!(
+                    json_loss, *loss,
+                    "metrics_json's avg_train_loss must be the SAME f64 the tracing event carried \
                  (bit-identical: both read off the same in-memory `avg_train_loss` local, never \
                  re-derived)"
-            );
-        }
-        for (row, (epoch, loss)) in val_curve.iter().zip(captured_val.iter()) {
-            let json_epoch = row["epoch"].as_u64().expect("row.epoch is a u64");
-            let json_loss = row["loss"].as_f64().expect("row.loss is an f64");
-            assert!(
-                json_loss.is_finite(),
-                "val_loss_curve row must be finite: {row:?}"
-            );
-            assert_eq!(json_epoch, *epoch, "epoch must match the tracing capture");
-            assert_eq!(
-                json_loss, *loss,
-                "metrics_json's avg_val_loss must be the SAME f64 the tracing event carried"
-            );
-        }
+                );
+            }
+            for (row, (epoch, loss)) in val_curve.iter().zip(captured_val.iter()) {
+                let json_epoch = row["epoch"].as_u64().expect("row.epoch is a u64");
+                let json_loss = row["loss"].as_f64().expect("row.loss is an f64");
+                assert!(
+                    json_loss.is_finite(),
+                    "val_loss_curve row must be finite: {row:?}"
+                );
+                assert_eq!(json_epoch, *epoch, "epoch must match the tracing capture");
+                assert_eq!(
+                    json_loss, *loss,
+                    "metrics_json's avg_val_loss must be the SAME f64 the tracing event carried"
+                );
+            }
+        });
     }
 
     /// The `TrainLoss`-monitored arm: `avg_val_loss` is never measured
@@ -7819,26 +9921,30 @@ mod loss_curve_metrics {
     /// claim from the honest "not applicable to this run").
     #[test]
     fn metrics_json_omits_val_loss_curve_when_only_train_loss_is_monitored() {
-        let config = FineTuneConfig {
-            epochs: 2,
-            ..text_config()
-        };
-        let result = run_text_loop("loss-curve-train-only", config, pairs(6), None, None).unwrap();
-        let metrics: serde_json::Value =
-            serde_json::from_str(&result.metrics_json).expect("metrics_json must be valid JSON");
-        let train_curve = metrics["train_loss_curve"]
-            .as_array()
-            .expect("train_loss_curve must still be present");
-        assert_eq!(
-            train_curve.len(),
-            2,
-            "both configured epochs must have a row"
-        );
-        assert!(
+        crate::fine_tune::collective::witness(|call| {
+            let config = FineTuneConfig {
+                epochs: 2,
+                ..text_config()
+            };
+            let result =
+                run_text_loop(&call, "loss-curve-train-only", config, pairs(6), None, None)
+                    .unwrap();
+            let metrics: serde_json::Value = serde_json::from_str(&result.metrics_json)
+                .expect("metrics_json must be valid JSON");
+            let train_curve = metrics["train_loss_curve"]
+                .as_array()
+                .expect("train_loss_curve must still be present");
+            assert_eq!(
+                train_curve.len(),
+                2,
+                "both configured epochs must have a row"
+            );
+            assert!(
             metrics.get("val_loss_curve").is_none(),
             "a TrainLoss-monitored run must never measure avg_val_loss, so val_loss_curve must \
              be absent, not an empty array: {metrics:?}"
         );
+        });
     }
 }
 
@@ -10289,16 +12395,27 @@ mod resume_invariant {
     async fn persist(
         store: &Arc<ArtifactStore>,
         job: &str,
-        loop_: &TrainingLoop,
+        loop_: &mut TrainingLoop,
         scratch: &std::path::Path,
         last_completed_epoch: usize,
         global_step: usize,
         opt: &AdamW,
         names: &[String],
     ) {
-        let bundle = loop_
-            .capture_resume_bundle(scratch, last_completed_epoch, global_step, opt, names)
-            .unwrap();
+        // The capture's dropout-position gather is a collective call, so it
+        // runs under a witness on a scoped OS thread (`&mut TrainingLoop` is
+        // `Send`; `&TrainingLoop` is not, the loop holds a `Cell`).
+        let bundle = crate::fine_tune::collective::witness(move |call| {
+            loop_.capture_resume_bundle(
+                &call,
+                scratch,
+                last_completed_epoch,
+                global_step,
+                opt,
+                names,
+            )
+        })
+        .unwrap();
         store
             .put_resume_checkpoint(None, job, &bundle)
             .await
@@ -10325,7 +12442,7 @@ mod resume_invariant {
         let store = file_store();
 
         // ── Reference ──────────────────────────────────────────────────────────
-        let (ref_loop, ref_varmap) =
+        let (mut ref_loop, ref_varmap) =
             build_three_layer_loop(42, &targets, &device, Arc::clone(&store), None, "ref-job")
                 .await;
         let (mut ref_opt, ref_names) = build_opt(&ref_varmap, &ref_loop);
@@ -10341,7 +12458,7 @@ mod resume_invariant {
         persist(
             &store,
             "ref-job",
-            &ref_loop,
+            &mut ref_loop,
             scratch.path(),
             K - 1,
             K,
@@ -10358,7 +12475,8 @@ mod resume_invariant {
                 .dir(),
             &device,
         )
-        .unwrap();
+        .unwrap()
+        .expect("a same-version bundle must restore in this test");
         // Continue N steps → the reference forward trajectory.
         for _ in 0..N {
             step_epoch(&ref_loop, &mut ref_opt, &feats, &targets);
@@ -10366,7 +12484,7 @@ mod resume_invariant {
         let w_ref: HashMap<String, Tensor> = ref_loop.target.named_trainable_weights().unwrap();
 
         // ── Crashed ────────────────────────────────────────────────────────────
-        let (crash_loop, crash_varmap) =
+        let (mut crash_loop, crash_varmap) =
             build_three_layer_loop(42, &targets, &device, Arc::clone(&store), None, "crash-job")
                 .await;
         let (mut crash_opt, crash_names) = build_opt(&crash_varmap, &crash_loop);
@@ -10377,7 +12495,7 @@ mod resume_invariant {
         persist(
             &store,
             "crash-job",
-            &crash_loop,
+            &mut crash_loop,
             crash_scratch.path(),
             K - 1,
             K,
@@ -10394,7 +12512,8 @@ mod resume_invariant {
                 .dir(),
             &device,
         )
-        .unwrap();
+        .unwrap()
+        .expect("a same-version bundle must restore in this test");
         drop(crash_loop); // simulate process death
 
         // ── Assertion (1): restored state BYTE-EQUAL to S_ref@K ──────────────────
@@ -10456,7 +12575,8 @@ mod resume_invariant {
                 .dir(),
             &device,
         )
-        .unwrap();
+        .unwrap()
+        .expect("a same-version bundle must restore in this test");
         let (start_epoch, _gstep) = {
             // Borrow the loop mutably to restore weights/scaler/dropout, and the
             // opt to restore moments — the exact `restore_from_checkpoint` routine.
@@ -10525,7 +12645,7 @@ mod resume_invariant {
         let feats = features(n, &device);
         let store = file_store();
 
-        let (ref_loop, ref_varmap) =
+        let (mut ref_loop, ref_varmap) =
             build_three_layer_loop(7, &targets, &device, Arc::clone(&store), None, "wo-ref-job")
                 .await;
         let (mut ref_opt, ref_names) = build_opt(&ref_varmap, &ref_loop);
@@ -10536,7 +12656,7 @@ mod resume_invariant {
         persist(
             &store,
             "wo-ref-job",
-            &ref_loop,
+            &mut ref_loop,
             scratch.path(),
             K - 1,
             K,
@@ -10553,7 +12673,8 @@ mod resume_invariant {
                 .dir(),
             &device,
         )
-        .unwrap();
+        .unwrap()
+        .expect("a same-version bundle must restore in this test");
         for _ in 0..N {
             step_epoch(&ref_loop, &mut ref_opt, &feats, &targets);
         }
@@ -10564,9 +12685,11 @@ mod resume_invariant {
         let (mut wo_loop, wo_varmap) =
             build_three_layer_loop(7, &targets, &device, Arc::clone(&store), None, "wo-job").await;
         wo_loop.target.load_weights(&bundle.weights).unwrap();
+        // This harness is always single-rank, so the gathered map holds
+        // exactly rank 0's entry.
         wo_loop
             .target
-            .restore_dropout_positions(&bundle.state.dropout_positions)
+            .restore_dropout_positions(&bundle.state.dropout_positions[&0u32])
             .unwrap();
         let (mut wo_opt, _wo_names) = build_opt(&wo_varmap, &wo_loop); // fresh zero moments
         for _ in 0..N {
@@ -10757,8 +12880,11 @@ mod resume_invariant {
                 .unwrap();
 
         // The cancelled run bails at the first epoch-boundary check.
-        let err = tokio::task::spawn_blocking(move || {
-            zombie.run(crate::fine_tune::source::TrainingSource::Resident(loader))
+        let err = crate::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+            zombie.run(
+                &call,
+                crate::fine_tune::source::TrainingSource::Resident(loader),
+            )
         })
         .await
         .unwrap()
@@ -10779,7 +12905,8 @@ mod resume_invariant {
                 .dir(),
             &device,
         )
-        .unwrap();
+        .unwrap()
+        .expect("a same-version bundle must restore in this test");
         assert_eq!(
             after.state.last_completed_epoch, 5,
             "the zombie's stale write must not have regressed the checkpoint below \
@@ -11766,19 +13893,26 @@ mod held_out_eval_tests {
         (loop_, varmap)
     }
 
-    fn classification_batch(device: &Device) -> TrainingBatch {
+    /// U4b: `TrainingBatch::Classification` now carries the head's LOGITS,
+    /// not the pre-head embeddings — `classify()` is called HERE (matching
+    /// `TrainingLoop::encode_chunk`'s own production call site), so the
+    /// classifier layer's seeded dropout mask still draws exactly where it
+    /// did before this shape change, just one call earlier.
+    fn classification_batch(loop_: &TrainingLoop, device: &Device) -> TrainingBatch {
+        let embeddings = Tensor::new(&[[1.0f32, 0.2], [0.1, -0.4]], device).unwrap();
+        let logits = loop_.classify(&embeddings).unwrap();
         TrainingBatch::Classification {
-            embeddings: Tensor::new(&[[1.0f32, 0.2], [0.1, -0.4]], device).unwrap(),
+            logits,
             labels: Tensor::new(&[0u32, 1u32], device).unwrap(),
         }
     }
 
-    /// One real training micro-step: forward `compute_loss` (drawing the
-    /// classifier layer's seeded dropout mask when training is on),
-    /// backward, `AdamW::step`. Mirrors `resume_invariant::step_epoch`'s
+    /// One real training micro-step: forward `classify` + `compute_loss`
+    /// (drawing the classifier layer's seeded dropout mask when training is
+    /// on), backward, `AdamW::step`. Mirrors `resume_invariant::step_epoch`'s
     /// shape.
     fn train_step(loop_: &TrainingLoop, opt: &mut AdamW, device: &Device) {
-        let batch = classification_batch(device);
+        let batch = classification_batch(loop_, device);
         let loss = loop_.compute_loss(&batch).unwrap();
         let grads = loss.backward().unwrap();
         opt.step(&grads).unwrap();
@@ -11829,8 +13963,23 @@ mod held_out_eval_tests {
         train_step(&b_loop, &mut b_opt, &device);
         train_step(&b_loop, &mut b_opt, &device);
 
-        let held_out_loader =
-            TrainingDataLoader::from_precomputed(vec![classification_batch(&device)]);
+        // U4b: `classify()` now runs at batch-CONSTRUCTION time (matching
+        // `encode_chunk`'s production shape), so building this Precomputed
+        // held-out batch's logits under `with_dropout_disabled` is what
+        // reproduces the pre-U4b eval-time call's own dropout-off scope —
+        // never advancing the seeded stream this test asserts stays
+        // undisturbed.
+        let held_out_batch = b_loop
+            .with_dropout_disabled(|loop_| {
+                let embeddings = Tensor::new(&[[1.0f32, 0.2], [0.1, -0.4]], &device).unwrap();
+                let logits = loop_.classify(&embeddings)?;
+                Ok(TrainingBatch::Classification {
+                    logits,
+                    labels: Tensor::new(&[0u32, 1u32], &device).unwrap(),
+                })
+            })
+            .unwrap();
+        let held_out_loader = TrainingDataLoader::from_precomputed(vec![held_out_batch]);
         let held_out_ids = ids(&["ho-0", "ho-1"]);
         let held_out = b_loop
             .evaluate_held_out(&held_out_loader, &held_out_ids)
@@ -12097,6 +14246,7 @@ mod encoder_adapters_training_state_tests {
             rank_pattern: &empty_ranks,
             init_mode: LoraInitMode::ZerosB,
             seed: 7,
+            dropout_seed: 7,
         };
         let adapter_cfg = AdapterConfig::from_build(
             "modernbert",
@@ -12383,6 +14533,7 @@ mod media_front_end_wall_tests {
             rank_pattern: &empty_ranks,
             init_mode: LoraInitMode::ZerosB,
             seed: 7,
+            dropout_seed: 7,
         };
         let adapter_cfg = AdapterConfig::from_build(
             "clap_audio_model",
@@ -12466,12 +14617,16 @@ mod media_front_end_wall_tests {
         let loader = one_row_audio_loader();
 
         let started = Instant::now();
-        let result: TrainingResult = tokio::task::spawn_blocking(move || {
-            audio_loop.run(crate::fine_tune::source::TrainingSource::Resident(loader))
-        })
-        .await
-        .unwrap()
-        .expect("the audio EncoderAdapters run must complete");
+        let result: TrainingResult =
+            crate::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+                audio_loop.run(
+                    &call,
+                    crate::fine_tune::source::TrainingSource::Resident(loader),
+                )
+            })
+            .await
+            .unwrap()
+            .expect("the audio EncoderAdapters run must complete");
         let total_wall = started.elapsed();
 
         assert!(
@@ -12528,10 +14683,11 @@ mod media_front_end_wall_tests {
         .artifact_dir(dir.path().to_path_buf())
         .build()
         .unwrap();
-        let text_result = tokio::task::spawn_blocking(move || {
-            text_loop.run(crate::fine_tune::source::TrainingSource::Resident(
-                text_loader,
-            ))
+        let text_result = crate::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+            text_loop.run(
+                &call,
+                crate::fine_tune::source::TrainingSource::Resident(text_loader),
+            )
         })
         .await
         .unwrap()
@@ -12679,16 +14835,19 @@ mod media_front_end_wall_tests {
 /// versus an independently-built natural-width forward pass.
 #[cfg(test)]
 mod encode_texts_bucketing_oracle {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use candle_core::{Device, Tensor};
     use candle_nn::VarMap;
     use serial_test::serial;
 
+    use super::super::data::TextChunk;
     use super::super::target::TrainingTarget;
     use super::super::FineTuneConfig;
     use super::encoder_adapters_training_state_tests::build_encoder_adapters_target;
-    use super::TrainingLoopBuilder;
+    use super::{RankContext, TrainingLoop, TrainingLoopBuilder};
+    use crate::fine_tune::optimizer;
     use crate::model::{LoadedModel, ModelSource, ModelTask};
 
     // The three tests below all call into `tokenize_and_bucket`/
@@ -13140,6 +15299,248 @@ mod encode_texts_bucketing_oracle {
              to be meaningful, got {pass_1:?}"
         );
     }
+
+    /// U4b acceptance (b): gather exactness, on a REAL two-rank `Local` gang
+    /// sharing one `tiny_modernbert` base model, driven through the
+    /// PRODUCTION per-step body (`TrainingLoop::encode_chunk` ->
+    /// `TrainingLoop::compute_loss_gathered` -> `backward` ->
+    /// `optimizer::canonical_reduce`) — compared against a W=1 reference
+    /// over the IDENTICAL rows, one combined batch, through the same
+    /// per-step body at `world = 1` (`Noop`).
+    ///
+    /// PRE-REGISTERED ε (design pressure round, finding 1) —
+    /// [`GATHER_EXACTNESS_EPSILON`], written BEFORE this test measures
+    /// anything: `1e-4` absolute, on both the loss scalar and every element
+    /// of the reduced adapter gradient. Derivation: W=2's gather
+    /// concatenates two INDEPENDENTLY-bucketed per-rank batches (each rank
+    /// buckets its own local batch to its OWN natural width — DESIGN.md
+    /// §2/§6; no rung is exchanged, design pressure round finding 6) before
+    /// computing the SAME loss W=1 computes over one combined batch bucketed
+    /// to ITS OWN (generally different) natural width — the attention
+    /// softmax over a differently-wide masked tail rounds slightly
+    /// differently depending on the padding width. This is `batch_bucket.
+    /// rs`'s OWN already-measured padding-variance tolerance
+    /// (`encode_texts_bucketing_oracle`'s sibling test
+    /// `encode_texts_output_is_bucket_invariant_at_the_real_call_site`'s own
+    /// `TOLERANCE: f32 = 1e-4`), not a bound invented for this oracle. The
+    /// discriminator this ε must catch is the W× gradient hazard (moving a
+    /// trainable op after the gather, or dropping the reduce): either
+    /// produces an O(1)-or-larger error, orders of magnitude past `1e-4` —
+    /// never reassociation noise (`~1e-6`), which `1e-4` does not even
+    /// measure at (bit-identity is claimed only for acceptance (a) and the
+    /// resume-vs-uninterrupted comparison, never here).
+    ///
+    /// RED-PROOF: this test is RED at base (`compute_loss_gathered`,
+    /// `RankContext`, and `PartitionSpec::for_gang` do not exist there).
+    /// EXECUTED mutation (applied, run, and reverted by hand — not left in
+    /// this tree): `compute_loss_gathered`'s `Contrastive` arm changed to
+    /// `.clone()` each tensor instead of `rank_ctx.all_gather(..)`-ing it —
+    /// the gather never runs, so each rank scores only its own 2-row local
+    /// slice as if it were the whole batch. RED output's first line:
+    /// `rank 0: gathered global loss 0.37497652 must match the W=1
+    /// reference 1.0657526 within 0.0001` — an O(1) divergence, orders of
+    /// magnitude past `1e-4`, immediately distinguishable from the
+    /// reassociation-noise band this ε is calibrated to ignore.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(tokenize_dispatch_calls)]
+    async fn gather_exactness_w2_matches_w1_within_pre_registered_epsilon() {
+        use super::super::partition::{PartitionRule, PartitionSpec};
+        use crate::fine_tune::collective::LocalGang;
+
+        const GATHER_EXACTNESS_EPSILON: f32 = 1e-4;
+
+        let device = Device::Cpu;
+        let base_model = tiny_modernbert_base_model().await;
+
+        // 4 contrastive rows, deliberately of varying length so each rank's
+        // OWN 2-row half buckets independently of the W=1 reference's
+        // combined 4-row batch (exercising the padding-variance ε, not a
+        // vacuous bit-identical case).
+        let rows: Vec<(String, String, f32)> = vec![
+            ("a b".to_string(), "a b c".to_string(), 0.9),
+            (
+                "a b c d e f".to_string(),
+                "a b c d e f g h i".to_string(),
+                0.4,
+            ),
+            ("a".to_string(), "a b".to_string(), 0.7),
+            (
+                "a b c d e f g h i j k l m n o".to_string(),
+                "a b".to_string(),
+                0.1,
+            ),
+        ];
+
+        // Build one TrainingLoop's worth of scaffolding (its own VarMap,
+        // seeded identically across every instance — `build_encoder_adapters_
+        // target` has no seed parameter, so every call is the SAME seeded
+        // init) plus a per-instance catalog/tempdir. Catalog creation is
+        // async, so every instance is built HERE, before any thread spawns.
+        async fn build_loop(
+            device: &Device,
+            base_model: Arc<LoadedModel>,
+            job_id: &str,
+        ) -> (TrainingLoop, VarMap) {
+            let varmap = VarMap::new();
+            let target = build_encoder_adapters_target(device, &varmap);
+            let dir = tempfile::tempdir().unwrap();
+            let dir_path = dir.keep();
+            let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+            let loop_ = TrainingLoopBuilder::new(target, varmap.clone(), FineTuneConfig::default())
+                .device(device.clone())
+                .base_model(base_model)
+                .job_id(job_id.into())
+                .worker_id(format!("{job_id}-worker"))
+                .catalog(catalog)
+                .artifact_dir(dir_path)
+                .build()
+                .unwrap();
+            (loop_, varmap)
+        }
+
+        // ── W=1 reference: one combined 4-row batch, Noop, single rank ──
+        let (mut ref_loop, _ref_varmap) =
+            build_loop(&device, base_model.clone(), "gather-ref").await;
+        // `build_encoder_adapters_target`'s fixture bakes in `lora_dropout =
+        // 0.3` (unconditionally — it has no override parameter), and a
+        // Philox dropout mask draw is keyed by its OWN forward's tensor
+        // shape: a 4-row combined forward and two independent 2-row forwards
+        // draw DIFFERENT masks even from the identical seed, which would
+        // swamp this oracle's ε with an irrelevant confound. Eval mode
+        // (`set_training(false)`) disables dropout deterministically on
+        // every instance, isolating the property this test actually checks
+        // — the GATHER's numerical correctness — from dropout's own,
+        // already-covered behaviour (`resume_invariant`'s and this module's
+        // other suites pin dropout separately).
+        ref_loop.set_training(false);
+        let ref_chunk = TextChunk::Contrastive {
+            texts_a: rows.iter().map(|(a, _, _)| a.clone()).collect(),
+            texts_b: rows.iter().map(|(_, b, _)| b.clone()).collect(),
+            scores: rows.iter().map(|(_, _, s)| *s).collect(),
+        };
+        let ref_batch = ref_loop.encode_chunk(&ref_chunk).unwrap();
+        let ref_loss = ref_loop.compute_loss(&ref_batch).unwrap();
+        let ref_loss_val: f32 = ref_loss.to_scalar().unwrap();
+        let ref_trainable_vars = optimizer::sorted_trainable_vars(&_ref_varmap);
+        let ref_names: Vec<String> = {
+            let data = _ref_varmap.data().lock().unwrap();
+            let id_to_name: std::collections::HashMap<_, _> = data
+                .iter()
+                .map(|(name, var)| (var.id(), name.clone()))
+                .collect();
+            ref_trainable_vars
+                .iter()
+                .map(|v| id_to_name[&v.id()].clone())
+                .collect()
+        };
+        let mut ref_grads = ref_loss.backward().unwrap();
+        let ref_grad_by_name: HashMap<String, Vec<f32>> = ref_names
+            .iter()
+            .zip(&ref_trainable_vars)
+            .filter_map(|(name, var)| {
+                ref_grads
+                    .remove(var.as_tensor())
+                    .map(|g| (name.clone(), g.flatten_all().unwrap().to_vec1().unwrap()))
+            })
+            .collect();
+
+        // ── W=2 gang: two ranks, each its own 2-row half, real Local gang ──
+        let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
+        let mut handles = Vec::new();
+        for rank in 0..2u32 {
+            let (loop_, varmap) =
+                build_loop(&device, base_model.clone(), &format!("gather-gang-{rank}")).await;
+            let local = gang.rank(rank).unwrap();
+            let partition =
+                PartitionSpec::for_gang(rank as usize, 2, 2, PartitionRule::BlockByGlobalBatch)
+                    .unwrap();
+            let rank_ctx = RankContext::new(Arc::new(local), partition);
+            let mut loop_ = loop_;
+            loop_.rank_ctx = rank_ctx;
+            // See the W=1 reference's own comment: eval mode isolates the
+            // gather's numerical correctness from dropout's shape-keyed mask
+            // draw, which otherwise differs between a combined and a split
+            // forward even from an identical seed.
+            loop_.set_training(false);
+            let rows = rows.clone();
+            handles.push(crate::fine_tune::collective::BlockingCall::spawn_thread(
+                move |call| {
+                    let range = partition.rows_for_step(rows.len(), 0);
+                    let slice = &rows[range];
+                    let chunk = TextChunk::Contrastive {
+                        texts_a: slice.iter().map(|(a, _, _)| a.clone()).collect(),
+                        texts_b: slice.iter().map(|(_, b, _)| b.clone()).collect(),
+                        scores: slice.iter().map(|(_, _, s)| *s).collect(),
+                    };
+                    let batch = loop_.encode_chunk(&chunk).unwrap();
+                    let counts = partition.counts_for_step(rows.len(), 0);
+                    let loss = loop_.compute_loss_gathered(&call, &batch, &counts).unwrap();
+                    let loss_val: f32 = loss.to_scalar().unwrap();
+                    let trainable_vars = optimizer::sorted_trainable_vars(&varmap);
+                    let names: Vec<String> = {
+                        let data = varmap.data().lock().unwrap();
+                        let id_to_name: std::collections::HashMap<_, _> = data
+                            .iter()
+                            .map(|(name, var)| (var.id(), name.clone()))
+                            .collect();
+                        trainable_vars
+                            .iter()
+                            .map(|v| id_to_name[&v.id()].clone())
+                            .collect()
+                    };
+                    let mut grads = loss.backward().unwrap();
+                    optimizer::canonical_reduce(
+                        &call,
+                        &loop_.rank_ctx,
+                        &trainable_vars,
+                        &mut grads,
+                    )
+                    .unwrap();
+                    let grad_by_name: HashMap<String, Vec<f32>> = names
+                        .iter()
+                        .zip(&trainable_vars)
+                        .filter_map(|(name, var)| {
+                            grads.remove(var.as_tensor()).map(|g| {
+                                (name.clone(), g.flatten_all().unwrap().to_vec1().unwrap())
+                            })
+                        })
+                        .collect();
+                    (loss_val, grad_by_name)
+                },
+            ));
+        }
+        let results: Vec<(f32, HashMap<String, Vec<f32>>)> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        for (rank, (loss_val, grad_by_name)) in results.iter().enumerate() {
+            assert!(
+                (loss_val - ref_loss_val).abs() <= GATHER_EXACTNESS_EPSILON,
+                "rank {rank}: gathered global loss {loss_val} must match the W=1 reference \
+                 {ref_loss_val} within {GATHER_EXACTNESS_EPSILON}"
+            );
+            assert_eq!(
+                grad_by_name.len(),
+                ref_grad_by_name.len(),
+                "rank {rank}: the reduced gradient must cover the same named vars as the \
+                 W=1 reference"
+            );
+            for (name, ref_vals) in &ref_grad_by_name {
+                let vals = &grad_by_name[name];
+                assert_eq!(
+                    vals.len(),
+                    ref_vals.len(),
+                    "rank {rank}: var '{name}' shape"
+                );
+                for (i, (v, rv)) in vals.iter().zip(ref_vals).enumerate() {
+                    assert!(
+                        (v - rv).abs() <= GATHER_EXACTNESS_EPSILON,
+                        "rank {rank}: var '{name}'[{i}] = {v} must match the W=1 reference \
+                         {rv} within {GATHER_EXACTNESS_EPSILON}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Finding 7 (audit round 63): a per-objective decomposition ORACLE for every
@@ -13335,14 +15736,15 @@ mod decomposition_oracle_tests {
         assert_decomposition_matches(&loop_, &triplet_batch(&device), "Triplet margin");
     }
 
-    /// Objective 4: Classification cross-entropy. `lora_dropout: 0.0` is
-    /// load-bearing here, not incidental: `compute_loss` and
-    /// `compute_loss_per_example` each independently call
-    /// `Self::classify(embeddings)`, which draws a FRESH seeded dropout mask
-    /// per call when dropout is on — with dropout on, the two calls would
-    /// score two DIFFERENT forward passes and the oracle would be comparing
-    /// unlike quantities, not testing the decomposition. Zero dropout keeps
-    /// both calls' forward pass identical.
+    /// Objective 4: Classification cross-entropy. U4b moved `classify()` out
+    /// of `compute_loss`/`compute_loss_per_example` and into batch
+    /// construction (`TrainingBatch::Classification` now carries LOGITS,
+    /// matching `TrainingLoop::encode_chunk`'s production shape) — `classify`
+    /// is therefore called exactly ONCE here, by the test, and both
+    /// `compute_loss` and `compute_loss_per_example` read the SAME logits, so
+    /// `lora_dropout: 0.0` is no longer load-bearing for this oracle (no two
+    /// independent forward passes to keep in sync); kept anyway for parity
+    /// with this suite's other fixtures.
     #[tokio::test(flavor = "multi_thread")]
     async fn classification_decomposition_matches_compute_loss() {
         let device = Device::Cpu;
@@ -13351,8 +15753,10 @@ mod decomposition_oracle_tests {
             ..Default::default()
         };
         let loop_ = minimal_classification_loop(&device, config).await;
+        let embeddings = Tensor::new(&[[1.0f32, 0.2], [0.1, -0.4], [-0.3, 0.9]], &device).unwrap();
+        let logits = loop_.classify(&embeddings).unwrap();
         let batch = TrainingBatch::Classification {
-            embeddings: Tensor::new(&[[1.0f32, 0.2], [0.1, -0.4], [-0.3, 0.9]], &device).unwrap(),
+            logits,
             labels: Tensor::new(&[0u32, 1u32, 2u32], &device).unwrap(),
         };
         assert_decomposition_matches(&loop_, &batch, "Classification");
@@ -13450,5 +15854,44 @@ mod decomposition_oracle_tests {
             .unwrap(),
         };
         assert_decomposition_matches(&loop_, &batch, "Matryoshka MNRL/Pairs (dims=[4, 2])");
+    }
+}
+
+#[cfg(test)]
+mod dropout_position_codec_tests {
+    use super::{decode_dropout_positions, encode_dropout_positions};
+
+    /// Every `u64` round-trips through the four-limb `f32` encoding — the
+    /// values `f64` could NOT carry (`2^53 + 1`, `u64::MAX`) included — and
+    /// a row that is not the encoding is refused, never mis-decoded.
+    #[test]
+    fn every_u64_position_round_trips_through_four_f32_limbs() {
+        let positions = [
+            0u64,
+            1,
+            0xFFFF,
+            0x1_0000,
+            (1 << 24) + 1,
+            (1 << 53) + 1,
+            u64::MAX,
+        ];
+        let limbs = encode_dropout_positions(&positions);
+        assert_eq!(limbs.len(), positions.len() * 4);
+        assert!(limbs
+            .iter()
+            .all(|l| (0.0..=65535.0).contains(l) && l.fract() == 0.0));
+        assert_eq!(decode_dropout_positions(&limbs).unwrap(), positions);
+        assert!(
+            decode_dropout_positions(&limbs[..3]).is_err(),
+            "not four per position"
+        );
+        assert!(
+            decode_dropout_positions(&[0.5, 0.0, 0.0, 0.0]).is_err(),
+            "a non-integral limb is refused"
+        );
+        assert!(
+            decode_dropout_positions(&[65536.0, 0.0, 0.0, 0.0]).is_err(),
+            "a limb past 16 bits is refused"
+        );
     }
 }

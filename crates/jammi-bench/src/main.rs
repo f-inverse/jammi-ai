@@ -1564,7 +1564,11 @@ fn load_heldout_fixture(
 /// directly on this async task (which would panic: "cannot start a runtime
 /// from within a runtime").
 async fn run_finetune_run(params: finetune_run::FinetuneRunParams) -> std::process::ExitCode {
-    let tier = match tokio::task::spawn_blocking(move || finetune_run::run(&params)).await {
+    let tier = match jammi_ai::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+        finetune_run::run(&call, &params)
+    })
+    .await
+    {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
             eprintln!("finetune-run failed: {e}");

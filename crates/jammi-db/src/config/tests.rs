@@ -643,7 +643,7 @@ fn lease_and_worker_config_round_trip() {
             kinds: WorkerKinds::All(AllSentinel::All),
             idle_poll_secs: 1,
             metrics_sample_secs: 5,
-            world_size: 1,
+            local_ranks: 1,
             collective: CollectiveSelection::Auto,
             rank_timeout_secs: 120,
         }
@@ -765,6 +765,68 @@ fn worker_kinds_toml_all_forms_parse_like_services() {
 
     let empty: JammiConfig = toml::from_str("[worker]\nkinds = []\n").unwrap();
     assert_eq!(empty.worker.kinds, WorkerKinds::Only(Vec::new()));
+}
+
+// ── `[distributed] max_world_size` ─────────────────────────────────────────
+
+#[test]
+fn distributed_config_default_is_single_rank() {
+    assert_eq!(DistributedConfig::default().max_world_size, 1);
+    assert_eq!(JammiConfig::default().distributed.max_world_size, 1);
+}
+
+#[test]
+fn distributed_config_toml_round_trips_max_world_size() {
+    let cfg: JammiConfig = toml::from_str("[distributed]\nmax_world_size = 8\n").unwrap();
+    assert_eq!(cfg.distributed.max_world_size, 8);
+}
+
+/// `max_world_size = 0` is refused at load, naming the key -- both via
+/// direct `validate()` and via `JammiConfig::load_from` (the production
+/// path), matching `JobsConfig::retention_days`'s own refusal shape.
+#[test]
+fn distributed_config_zero_max_world_size_is_refused_at_load() {
+    assert!(DistributedConfig { max_world_size: 1 }.validate().is_ok());
+
+    let err = DistributedConfig { max_world_size: 0 }
+        .validate()
+        .unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("max_world_size")),
+        "expected a typed Config error naming the field, got {err:?}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jammi.toml");
+    std::fs::write(&path, "[distributed]\nmax_world_size = 0\n").unwrap();
+    let err = JammiConfig::load_from(Some(&path), std::iter::empty()).unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("max_world_size")),
+        "load_from must refuse max_world_size = 0, got {err:?}"
+    );
+}
+
+/// `[distributed]` loads independently of `[worker]`: setting one section's
+/// knob leaves the other at its own default, and neither section's loader
+/// consults the other's value (DESIGN.md § 7 — "the two knobs load
+/// independently, with no cross-check").
+#[test]
+fn distributed_config_loads_independently_of_worker() {
+    let cfg: JammiConfig = toml::from_str("[distributed]\nmax_world_size = 4\n").unwrap();
+    assert_eq!(cfg.distributed.max_world_size, 4);
+    assert_eq!(
+        cfg.worker.local_ranks, 1,
+        "[worker]'s own default must be untouched by [distributed]"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jammi.toml");
+    // `[worker] local_ranks = 1` alone (a single device) must load a
+    // deployment-wide gang bound of the DEFAULT (1), never a value derived
+    // from or checked against `[worker]`.
+    std::fs::write(&path, "[worker]\nlocal_ranks = 1\n").unwrap();
+    let loaded = JammiConfig::load_from(Some(&path), std::iter::empty()).unwrap();
+    assert_eq!(loaded.distributed.max_world_size, 1);
 }
 
 // ── `[jobs] retention_days` ───────────────────────────────────────────────
@@ -3129,7 +3191,7 @@ fn the_two_arities_get_the_same_verdict_on_the_same_deployment() {
 #[test]
 fn worker_rank_knobs_default_to_the_single_rank_deployment() {
     let w = WorkerConfig::default();
-    assert_eq!(w.world_size, 1);
+    assert_eq!(w.local_ranks, 1);
     assert_eq!(w.collective, CollectiveSelection::Auto);
     assert_eq!(w.rank_timeout_secs, 120);
 
@@ -3138,7 +3200,7 @@ fn worker_rank_knobs_default_to_the_single_rank_deployment() {
     let cfg = load_src("artifact_dir = \"/tmp/jammi\"\n").unwrap();
     assert_eq!(cfg.worker, WorkerConfig::default());
     let topo = cfg.worker.topology(&cfg.gpu).unwrap();
-    assert_eq!(topo.world_size(), 1);
+    assert_eq!(topo.local_ranks(), 1);
     assert_eq!(topo.devices(), &[0]);
     assert_eq!(topo.rank_devices(), &[0]);
     assert_eq!(topo.collective(), CollectiveSelection::Auto);
@@ -3155,13 +3217,13 @@ fn worker_rank_knobs_round_trip_from_toml() {
             devices = [0, 1]
 
             [worker]
-            world_size = 2
+            local_ranks = 2
             collective = "cpu"
             rank_timeout_secs = 45
         "#,
     )
     .unwrap();
-    assert_eq!(cfg.worker.world_size, 2);
+    assert_eq!(cfg.worker.local_ranks, 2);
     assert_eq!(cfg.worker.collective, CollectiveSelection::Cpu);
     assert_eq!(cfg.worker.rank_timeout_secs, 45);
     let topo = cfg.worker.topology(&cfg.gpu).unwrap();
@@ -3177,7 +3239,7 @@ fn worker_config_equality_sees_the_rank_knobs() {
     let base = WorkerConfig::default();
     for other in [
         WorkerConfig {
-            world_size: 2,
+            local_ranks: 2,
             ..WorkerConfig::default()
         },
         WorkerConfig {
@@ -3254,42 +3316,42 @@ fn collective_requires_cuda_is_the_nccl_arm_only() {
 }
 
 #[test]
-fn load_refuses_world_size_zero() {
-    let err = load_src("[worker]\nworld_size = 0\n").unwrap_err();
+fn load_refuses_local_ranks_zero() {
+    let err = load_src("[worker]\nlocal_ranks = 0\n").unwrap_err();
     assert!(
-        matches!(&err, JammiError::Config(m) if m.contains("world_size")),
+        matches!(&err, JammiError::Config(m) if m.contains("local_ranks")),
         "expected a typed Config error naming the key, got {err:?}"
     );
     // At the validator that owns it, too.
     let err = WorkerConfig {
-        world_size: 0,
+        local_ranks: 0,
         ..Default::default()
     }
     .topology(&GpuConfig::default())
     .unwrap_err();
     assert!(
-        matches!(&err, JammiError::Config(m) if m.contains("world_size")),
+        matches!(&err, JammiError::Config(m) if m.contains("local_ranks")),
         "{err:?}"
     );
 }
 
 #[test]
-fn load_refuses_world_size_wider_than_the_devices() {
-    let err = load_src("[worker]\nworld_size = 4\n").unwrap_err();
+fn load_refuses_local_ranks_wider_than_the_devices() {
+    let err = load_src("[worker]\nlocal_ranks = 4\n").unwrap_err();
     let JammiError::Config(msg) = &err else {
         panic!("expected a typed Config error, got {err:?}");
     };
     assert!(
-        msg.contains("world_size = 4") && msg.contains("device"),
+        msg.contains("local_ranks = 4") && msg.contains("device"),
         "the refusal must name the width and the devices: {msg}"
     );
 
     // The boundary: equal loads, one more does not — on a plural, too.
-    let equal = load_src("[gpu]\ndevices = [0, 1]\n\n[worker]\nworld_size = 2\n").unwrap();
-    assert_eq!(equal.worker.topology(&equal.gpu).unwrap().world_size(), 2);
-    let over = load_src("[gpu]\ndevices = [0, 1]\n\n[worker]\nworld_size = 3\n").unwrap_err();
+    let equal = load_src("[gpu]\ndevices = [0, 1]\n\n[worker]\nlocal_ranks = 2\n").unwrap();
+    assert_eq!(equal.worker.topology(&equal.gpu).unwrap().local_ranks(), 2);
+    let over = load_src("[gpu]\ndevices = [0, 1]\n\n[worker]\nlocal_ranks = 3\n").unwrap_err();
     assert!(
-        matches!(&over, JammiError::Config(m) if m.contains("world_size = 3")),
+        matches!(&over, JammiError::Config(m) if m.contains("local_ranks = 3")),
         "{over:?}"
     );
 }
@@ -3307,7 +3369,7 @@ fn load_refuses_a_zero_rank_timeout() {
 fn topology_maps_exactly_the_ranks_it_has_to_devices() {
     // A gang narrower than the device list: the extra device belongs to the
     // process (a per-device cache), never to a rank.
-    let cfg = load_src("[gpu]\ndevices = [0, 1, 2]\n\n[worker]\nworld_size = 2\n").unwrap();
+    let cfg = load_src("[gpu]\ndevices = [0, 1, 2]\n\n[worker]\nlocal_ranks = 2\n").unwrap();
     let topo = cfg.worker.topology(&cfg.gpu).unwrap();
     assert_eq!(topo.devices(), &[0, 1, 2]);
     assert_eq!(topo.rank_devices(), &[0, 1]);
@@ -3343,7 +3405,7 @@ fn load_of_a_pre_distributed_config_is_unchanged() {
     assert_eq!(cfg.gpu.device, -1);
     assert_eq!(cfg.gpu.device_list(), vec![-1]);
     assert_eq!(cfg.worker.idle_poll_secs, 2);
-    assert_eq!(cfg.worker.world_size, 1);
+    assert_eq!(cfg.worker.local_ranks, 1);
     assert_eq!(cfg.worker.collective, CollectiveSelection::Auto);
     assert_eq!(cfg.worker.rank_timeout_secs, 120);
     assert!(!cfg.worker.topology(&cfg.gpu).unwrap().is_distributed());

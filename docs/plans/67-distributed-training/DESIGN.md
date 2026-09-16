@@ -245,8 +245,8 @@ catalog read to it. Nothing dialable travels on the wire: the assignment carries
 `peers[rank → instance_id]`; each peer resolves addresses through U5b-1a's `peer_addr_of(instance_id,
 window) -> Option<PeerAddr>` and refuses a rank naming any instance that resolves to `None` — not
 a fresh member (the NCCL id, an opaque secret, is the only out-of-band value). `RunRank` sits in its own `GANG_LISTENER_ALLOWLIST` bucket in `tenant_isolation_oracle.rs` (its text
-states the ground the shipped W=1 lattice actually has — no tenant value read on the path; the
-derivation claim returns with U5a-2's cross-tenant-denial case, #566), unioned like D7's, with the public-listener `UNIMPLEMENTED` assertion, and its
+states the derivation claim beside its executed cross-tenant-denial cases in `gang_service.rs`,
+#566), unioned like D7's, with the public-listener `UNIMPLEMENTED` assertion, and its
 `api_freeze_baseline.txt` lines land in the same commit. Peers fence on **`job_id`**: a `RunRank`
 at attempt N aborts every local runner of that job with attempt < N; a lesser or equal attempt is
 refused; `(job_id, rank)` is the runner's identity only. Mutual transport auth stays the

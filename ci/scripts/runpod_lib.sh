@@ -109,6 +109,14 @@ RP_MIN_DRIVER_MAJOR="${RP_MIN_DRIVER_MAJOR:-560}"
 RP_SESSION="${RP_SESSION:-}"
 RP_KEEP="${RP_KEEP:-0}"
 RP_TTL_HOURS="${RP_TTL_HOURS:-8}"
+# The wall-clock bound on ONE `_rp_rest` REST v2 call (round 3 U7b-A2b F1:
+# `_rp_rest`'s own curl carried no bound at all, so a caller sequencing work
+# behind it -- e.g. a cleanup trap's own cluster-teardown REST calls -- could
+# hang indefinitely on a dropped connection). 30s is generous above every
+# observed RunPod REST latency in this file's own probes; a transport that
+# has not completed by then is exactly the "no response at all" case
+# `_rp_rest`'s own doc already documents as a nonzero return, never a status.
+RP_REST_MAX_TIME="${RP_REST_MAX_TIME:-30}"
 # Every pod this tooling rents is named "<prefix>-ttl<H>". The deadline travels
 # with the pod so a sweeper can honour each pod's OWN limit instead of imposing
 # its own — otherwise a CI sweep (3h) reaps a developer's 8h session.
@@ -364,6 +372,13 @@ rp_gql() { curl -s "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" -H 
 # as "not found" or "refused"; those are STATUSES on a successful transport,
 # never this function's own return code.
 #
+# Bounded by `RP_REST_MAX_TIME` (round 3 U7b-A2b F1: this curl carried no
+# bound at all before this fix — a caller that sequences its OWN cleanup
+# behind a REST call here, e.g. a cleanup trap's own cluster-teardown, could
+# hang indefinitely on a dropped connection with nothing else to time it
+# out) — a transport that has not completed within it is exactly the
+# "TRANSPORT failure" case above, never a status.
+#
 # $1=METHOD (GET/POST/PATCH/DELETE) $2=PATH (e.g. "/v2/clusters", leading
 # slash) $3=optional JSON BODY (POST/PATCH only).
 _rp_rest() {
@@ -372,10 +387,10 @@ _rp_rest() {
   body_file="$(mktemp "${TMPDIR:-/tmp}/jammi-rp-rest.XXXXXX")" \
     || { echo "::error::_rp_rest could not create a capture file" >&2; return 1; }
   if [ -n "$body" ]; then
-    status="$(curl -s -o "$body_file" -w '%{http_code}' -X "$method" "https://api.runpod.io${path}" \
+    status="$(curl -s --max-time "$RP_REST_MAX_TIME" -o "$body_file" -w '%{http_code}' -X "$method" "https://api.runpod.io${path}" \
       -H "Authorization: Bearer ${RUNPOD_API_KEY}" -H 'Content-Type: application/json' --data-binary "$body")"
   else
-    status="$(curl -s -o "$body_file" -w '%{http_code}' -X "$method" "https://api.runpod.io${path}" \
+    status="$(curl -s --max-time "$RP_REST_MAX_TIME" -o "$body_file" -w '%{http_code}' -X "$method" "https://api.runpod.io${path}" \
       -H "Authorization: Bearer ${RUNPOD_API_KEY}")"
   fi
   rc=$?
@@ -1419,8 +1434,8 @@ PY
 }
 
 # The "zero tests matched" tripwire (F13), shared by EVERY gang leg's remote
-# text — today the pod leg (`runpod_gpu_gang.sh`'s `gang-proof` group); a
-# future cluster leg's own remote text sources this SAME check too.
+# text — the pod leg (`runpod_gpu_gang.sh`'s `gang-proof` group) and the
+# cluster leg (`runpod_gpu_cluster.sh`'s per-rank build+run heredoc) alike.
 # A `cargo test ... <name-filter> ...` invocation whose own filter matches NO
 # tests exits 0 with "running 0 tests ... test result: ok" printed to its
 # log — a false green a leg with no proof must never read as a pass (the

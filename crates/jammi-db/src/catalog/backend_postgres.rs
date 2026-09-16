@@ -17,6 +17,10 @@ pub struct PostgresBackend {
     /// The pool's configured `max_connections`, retained since `sqlx::Pool`
     /// exposes live connection counts but not the configured ceiling.
     pool_size: u32,
+    /// The park on this pool's connection returns (see
+    /// [`super::pool_test_hooks`]).
+    #[cfg(feature = "test-hooks")]
+    return_park: Arc<super::pool_test_hooks::ReturnPark>,
 }
 
 impl PostgresBackend {
@@ -37,8 +41,24 @@ impl PostgresBackend {
         if let Some(secs) = max_lifetime_secs {
             builder = builder.max_lifetime(Duration::from_secs(secs as u64));
         }
+        #[cfg(feature = "test-hooks")]
+        let return_park = Arc::new(super::pool_test_hooks::ReturnPark::default());
+        #[cfg(feature = "test-hooks")]
+        let builder = super::pool_test_hooks::install(builder, &return_park);
         let pool = builder.connect_with(opts).await.map_err(classify)?;
-        Ok(Arc::new(Self { pool, pool_size }))
+        Ok(Arc::new(Self {
+            pool,
+            pool_size,
+            #[cfg(feature = "test-hooks")]
+            return_park,
+        }))
+    }
+
+    /// The park on this pool's connection returns (see
+    /// [`super::pool_test_hooks`]).
+    #[cfg(feature = "test-hooks")]
+    pub fn return_park(&self) -> &Arc<super::pool_test_hooks::ReturnPark> {
+        &self.return_park
     }
 }
 
@@ -118,7 +138,9 @@ impl CatalogBackend for PostgresBackend {
     /// contract is the same one the SQLite backend needs, so the seam is
     /// uniform.
     fn close(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async move { super::backend::close_pool_and_drain(&self.pool).await })
+        Box::pin(async move {
+            super::backend::close_pool_and_drain(&self.pool, BackendKind::Postgres).await
+        })
     }
 
     fn backend_kind(&self) -> BackendKind {

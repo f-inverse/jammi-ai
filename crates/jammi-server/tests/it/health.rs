@@ -435,7 +435,10 @@ mod gauges {
         let shared = served.shared.as_ref().unwrap().upgrade().unwrap();
         served.session.enqueue(fine_tune(20_000), 0).await.unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-        while shared.in_flight() != 1 {
+        while !matches!(
+            shared.admission().holder(),
+            jammi_ai::fine_tune::worker::Holder::JobRun
+        ) {
             assert!(tokio::time::Instant::now() < deadline, "never in flight");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

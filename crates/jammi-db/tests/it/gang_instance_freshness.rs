@@ -1,13 +1,18 @@
 //! `Catalog::fresh_instance`: is a gang
 //! coordinator's `instances` row FRESH within
-//! `instance_liveness_margin(lease) == 2 * lease` on the DB clock?
-//! Parameterized (sqlite/postgres, the `migrations.rs` shape):
-//! `fresh_instance` resolves through `stale_before_clause`
-//! (`super::lease`), which renders a DIFFERENT SQL expression per backend,
-//! so this predicate has no oracle at all on the Postgres arm without it —
+//! `instance_liveness_margin(lease) == 2 * lease`? Decoded in RUST from
+//! `last_seen_at`'s raw stored text (`jammi_db::catalog::lease::
+//! last_seen_at_is_fresh`, since <https://github.com/f-inverse/jammi-ai/issues/574>)
+//! against THIS PROCESS's own clock — never a SQL-side `col::timestamptz`
+//! cast — because `last_seen_at` is ALWAYS an application-clock stamp on
+//! either backend (`Catalog::upsert_instance` never writes the database
+//! clock here). Parameterized (sqlite/postgres, the `migrations.rs` shape):
 //! every test here also runs a `::postgres` arm gated by
 //! `live-postgres-tests`, skipping (never failing) when `JAMMI_TEST_PG_URL`
-//! is unset.
+//! is unset — kept parameterized even though the decode itself is now
+//! backend-independent, so the parity oracle
+//! (`fresh_instance_malformed_last_seen_at_is_not_fresh_on_both_backends`)
+//! actually proves the two backends agree, not merely that each compiles.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -276,4 +281,93 @@ async fn fresh_instance_false_just_outside_the_liveness_margin(kind: BackendKind
         !fresh,
         "61s ago is 1s past the 2x30s=60s margin and must read as stale"
     );
+}
+
+/// #574's own parity oracle: a `last_seen_at` that does not parse as a
+/// timestamp at all (planted by raw SQL — nothing in this crate writes such
+/// a value) reads `fresh_instance() == Ok(false)` on BOTH backends,
+/// identically — never a fault on either. Before the fix
+/// (`fresh_instance` comparing via a SQL-side `stale_before_clause` cast),
+/// this same planted value read as `Ok(false)` on SQLite (a plain string
+/// compare, never erroring) but `Err` on Postgres (`last_seen_at::timestamptz`
+/// raises a genuine SQL error) — the exact backend-dependent classification
+/// issue #574 reports for this column too.
+#[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn fresh_instance_malformed_last_seen_at_is_not_fresh_on_both_backends(kind: BackendKind) {
+    // The require-gate itself: a direct, crate-qualified call to the
+    // registered `shared:` helper (`ci/kernel-oracle-helpers.txt`), textually
+    // in THIS test fn's own body — `base_catalog_kind`'s internal `?` on
+    // `make_test_session` is one function away and does not dominate this
+    // skip for the KO-7 scanner, which is per-`#[test]`-fn textual, not
+    // whole-file (`migrations.rs`'s own parameterized tests use this exact
+    // shape).
+    if matches!(kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none() {
+        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+        return;
+    }
+    let (_dir, catalog) = base_catalog_kind(kind).await.expect(
+        "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
+    );
+    let instance_id = format!(
+        "inst-lease-undecodable-{}",
+        jammi_test_utils::unique_suffix()
+    );
+    catalog
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            &instance_id,
+            Some("label"),
+            Some("host"),
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            let instance_id = instance_id.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE instances SET last_seen_at = 'not-a-timestamp' \
+                     WHERE instance_id = $1",
+                    &[SqlValue::TextOwned(instance_id)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+
+    let fresh = catalog
+        .fresh_instance(&instance_id, Duration::from_secs(30))
+        .await
+        .expect(
+            "a malformed last_seen_at must be a row fact, never a read fault, on EITHER backend",
+        );
+    assert!(
+        !fresh,
+        "a last_seen_at that does not parse as a timestamp must never read as fresh"
+    );
+    // Tests own their rows: on the shared Postgres database a malformed
+    // `last_seen_at` left behind would fault every sibling's SQL-side sweep
+    // (`prune_instances` casts the column) — the row is removed here.
+    catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            let instance_id = instance_id.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "DELETE FROM instances WHERE instance_id = $1",
+                    &[SqlValue::TextOwned(instance_id)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
 }

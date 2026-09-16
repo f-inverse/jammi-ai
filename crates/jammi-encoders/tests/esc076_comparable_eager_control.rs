@@ -554,6 +554,7 @@ fn build_model(
             rank_pattern: &rank_pattern,
             init_mode: jammi_lora::LoraInitMode::Gaussian,
             seed: 1,
+            dropout_seed: 1,
         }
     } else {
         LoraBuildConfig::frozen()

@@ -28,11 +28,12 @@
 //! to be a call, is exactly the drift this oracle exists to catch, so a
 //! false positive costs nothing and a false negative is the failure mode
 //! that matters); and it MUST contain `admission_catalog_fault` at least
-//! twice (`get_job_for_rank`'s and `fresh_instance`'s own `Err` arms) — a
-//! sanity floor so a version of this file that deleted BOTH call sites
-//! (leaving no catalog-fault mapping at all) still fails, rather than
-//! passing vacuously on "no `map_engine_error` found because nothing reads
-//! a catalog at all".
+//! three times (`get_job_for_rank`'s, the strict training-set resolver's
+//! and `fresh_instance`'s own `Err` arms — every admission-time catalog
+//! read on the path) — a sanity floor so a version of this file that
+//! deleted the call sites (leaving no catalog-fault mapping at all) still
+//! fails, rather than passing vacuously on "no `map_engine_error` found
+//! because nothing reads a catalog at all".
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -215,7 +216,8 @@ fn run_rank_body_span(masked: &str) -> &str {
 
 /// The oracle itself: within `fn run_rank`'s own body span, `map_engine_error`
 /// is never named as code, and `admission_catalog_fault` is named at least
-/// twice (`get_job_for_rank`'s and `fresh_instance`'s own `Err` arms).
+/// three times (`get_job_for_rank`'s, the strict training-set resolver's
+/// and `fresh_instance`'s own `Err` arms).
 #[test]
 fn run_rank_never_calls_map_engine_error() {
     let path = repo_root().join(GANG_RS);
@@ -232,11 +234,12 @@ fn run_rank_never_calls_map_engine_error() {
     );
     let admission_catalog_fault_count = body.matches("admission_catalog_fault").count();
     assert!(
-        admission_catalog_fault_count >= 2,
-        "fn run_rank must call admission_catalog_fault at least twice (get_job_for_rank's \
-         and fresh_instance's own Err arms) — found {admission_catalog_fault_count}; a \
-         version of this file with `map_engine_error` simply deleted, rather than replaced, \
-         would otherwise pass this oracle vacuously"
+        admission_catalog_fault_count >= 3,
+        "fn run_rank must call admission_catalog_fault at least three times \
+         (get_job_for_rank's, the strict training-set resolver's and fresh_instance's own \
+         Err arms) — found {admission_catalog_fault_count}; a version of this file with \
+         `map_engine_error` simply deleted, rather than replaced, would otherwise pass this \
+         oracle vacuously"
     );
 }
 
@@ -250,7 +253,7 @@ fn run_rank_body_span_excludes_neighboring_functions() {
     // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — decoy fn before run_rank
     let before = "fn before() { map_engine_error(1) }\n";
     // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — the scanned fn itself
-    let target = "fn run_rank() { admission_catalog_fault(1); admission_catalog_fault(2); }\n";
+    let target = "fn run_rank() { admission_catalog_fault(1); admission_catalog_fault(2); admission_catalog_fault(3); }\n";
     // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — decoy fn after run_rank
     let after = "fn after() { map_engine_error(2) }\n";
     let fixture = format!("{before}{target}{after}");
@@ -262,8 +265,8 @@ fn run_rank_body_span_excludes_neighboring_functions() {
     );
     assert_eq!(
         body.matches("admission_catalog_fault").count(),
-        2,
-        "the extracted span must include exactly run_rank's own two calls, got: {body:?}"
+        3,
+        "the extracted span must include exactly run_rank's own three calls, got: {body:?}"
     );
 }
 

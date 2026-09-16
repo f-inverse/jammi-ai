@@ -70,7 +70,10 @@ jobs:
           # Advisory: the crash-window tests race a SIGKILL against an
           # in-flight publish and stay timing-sensitive until a measured
           # flake-free streak. A red result is visible but does not block.
-          # Promote (advisory: false) after a flake-free streak.
+          # Promote (advisory: false) after a flake-free streak. The two
+          # `gang_chaos` rows SIGKILL one process of a two-rank gang (a peer,
+          # then the coordinator) and need the server's rank body for the
+          # cross-process gang to complete.
           - name: chaos
             display: SIGKILL crash-window chaos
             advisory: true
@@ -78,6 +81,8 @@ jobs:
               killed_worker_job_is_reclaimed_and_completed_once
               crash_between_publish_and_finalize_commits_only_the_winner
               artifact_written_on_worker_is_readable_by_a_different_client
+              killed_peer_job_is_reclaimed_and_completed_by_a_new_gang
+              killed_coordinator_job_is_reclaimed_and_completed_by_a_new_gang
     continue-on-error: ${{ matrix.advisory }}
     container:
       image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}

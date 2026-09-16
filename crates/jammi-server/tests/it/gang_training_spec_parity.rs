@@ -87,19 +87,44 @@ fn context_predictor_spec() -> TrainingSpec {
 /// different REAL producer variant — `TrainingSpec::ContextPredictor`,
 /// which names no `world_size` anywhere — decodes to the documented absent
 /// default, `Decoded(DEFAULT_WORLD_SIZE)`.
+///
+/// Parameterized over BOTH backends (the gap #566 named): the SQLite arm
+/// always; the Postgres arm against `JAMMI_TEST_PG_URL`, skipping (never
+/// failing) when it is unset — `jammi_test_utils::make_test_session`'s own
+/// contract, the same shape `jammi-db`'s `test_case`-parameterized gang
+/// tests use (this crate carries no `test_case` dev-dependency, so the two
+/// arms are two named test fns over one body). Job ids are unique per run:
+/// the Postgres lane shares one database across the whole run.
 #[tokio::test]
-async fn get_job_for_rank_world_size_matches_the_real_training_spec_producer() {
+async fn get_job_for_rank_world_size_matches_the_real_training_spec_producer_sqlite() {
+    parity_over(BackendKind::Sqlite).await;
+}
+
+#[tokio::test]
+async fn get_job_for_rank_world_size_matches_the_real_training_spec_producer_postgres() {
+    if jammi_test_utils::pg_url_for_tests().is_none() {
+        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+        return;
+    }
+    parity_over(BackendKind::Postgres).await;
+}
+
+async fn parity_over(kind: BackendKind) {
     let dir = tempfile::tempdir().unwrap();
-    let session = jammi_test_utils::make_test_session(BackendKind::Sqlite, dir.path())
+    let session = jammi_test_utils::make_test_session(kind, dir.path())
         .await
-        .expect("sqlite session");
+        .expect("the backend is available (the postgres arm skipped above when it is not)");
     let catalog = Arc::clone(session.catalog());
+    let suffix = jammi_test_utils::unique_suffix();
+    let world_two_id = format!("job-parity-world-two-{suffix}");
+    let world_absent_id = format!("job-parity-world-absent-{suffix}");
+    let coord = format!("coord-parity-{suffix}");
 
     let world_two_json =
         serde_json::to_string(&fine_tune_spec_world_two()).expect("TrainingSpec serializes");
     catalog
         .submit_job(SubmitJobParams {
-            job_id: "job-parity-world-two",
+            job_id: &world_two_id,
             kind: "fine_tune",
             execution: JobExecution::Queued,
             spec: &world_two_json,
@@ -111,12 +136,12 @@ async fn get_job_for_rank_world_size_matches_the_real_training_spec_producer() {
         .await
         .unwrap();
     catalog
-        .claim_next("coord-1", &["fine_tune"], Duration::from_secs(30))
+        .claim_next(&coord, &["fine_tune"], Duration::from_secs(30))
         .await
         .unwrap()
         .expect("must claim the queued job");
     let row = catalog
-        .get_job_for_rank("job-parity-world-two")
+        .get_job_for_rank(&world_two_id)
         .await
         .unwrap()
         .expect("the row exists");
@@ -136,7 +161,7 @@ async fn get_job_for_rank_world_size_matches_the_real_training_spec_producer() {
     );
     catalog
         .submit_job(SubmitJobParams {
-            job_id: "job-parity-world-absent",
+            job_id: &world_absent_id,
             kind: "context_predictor",
             execution: JobExecution::Queued,
             spec: &absent_json,
@@ -148,12 +173,12 @@ async fn get_job_for_rank_world_size_matches_the_real_training_spec_producer() {
         .await
         .unwrap();
     catalog
-        .claim_next("coord-1", &["context_predictor"], Duration::from_secs(30))
+        .claim_next(&coord, &["context_predictor"], Duration::from_secs(30))
         .await
         .unwrap()
         .expect("must claim the queued job");
     let row_absent = catalog
-        .get_job_for_rank("job-parity-world-absent")
+        .get_job_for_rank(&world_absent_id)
         .await
         .unwrap()
         .expect("the row exists");

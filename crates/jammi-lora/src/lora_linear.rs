@@ -605,6 +605,41 @@ impl LoraLinear {
         )
     }
 
+    /// U4b tail: the SAME construction as [`Self::new`], with the A/B
+    /// weight-init draw and the dropout-mask draw keyed by INDEPENDENT
+    /// seeds — see [`Self::new_with_base_seeded`]'s doc for why one seed
+    /// cannot vary per rank. [`Self::new`] is the `init_seed == dropout_seed`
+    /// special case (W=1, and every pre-U4b caller), a thin wrapper over
+    /// [`Self::new_with_base_seeded`] — so every EXISTING caller of
+    /// [`Self::new`] (every production and test call site in this
+    /// workspace) is unaffected byte-for-byte by this function's addition.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_seeded(
+        base: Linear,
+        rank: usize,
+        alpha: f64,
+        use_rslora: bool,
+        init_mode: LoraInitMode,
+        dropout: Option<f32>,
+        init_seed: u64,
+        dropout_seed: u64,
+        varmap: &VarMap,
+        vb: &VarBuilder,
+    ) -> Result<Self, LoraError> {
+        Self::new_with_base_seeded(
+            FrozenBase::Dense(base),
+            rank,
+            alpha,
+            use_rslora,
+            init_mode,
+            dropout,
+            init_seed,
+            dropout_seed,
+            varmap,
+            vb,
+        )
+    }
+
     /// Wrap ANY [`FrozenBase`] — dense OR GGUF-quantized — with a LoRA
     /// adapter. [`Self::new`] is the Dense-only convenience wrapper every
     /// EXISTING construction path uses unchanged (`FrozenBase::Dense(base)`,
@@ -630,6 +665,35 @@ impl LoraLinear {
         init_mode: LoraInitMode,
         dropout: Option<f32>,
         seed: u64,
+        varmap: &VarMap,
+        vb: &VarBuilder,
+    ) -> Result<Self, LoraError> {
+        Self::new_with_base_seeded(
+            base, rank, alpha, use_rslora, init_mode, dropout, seed, seed, varmap, vb,
+        )
+    }
+
+    /// U4b tail: [`Self::new_with_base`] with the A/B weight-init draw and
+    /// the dropout-mask draw keyed by INDEPENDENT seeds — `init_seed`
+    /// (identical on every rank of a real gang: the A/B init must produce
+    /// byte-identical starting weights on every rank, DESIGN.md §4) and
+    /// `dropout_seed` (`f(seed, rank)` per rank, `RankContext::dropout_seed`/
+    /// the free `rank_dropout_seed`, `trainer.rs`). [`Self::new_with_base`]
+    /// is this function's `init_seed == dropout_seed` special case (W=1, and
+    /// every pre-U4b caller) — a thin wrapper over this one, so no EXISTING
+    /// caller of `new_with_base`/`new` (worker.rs's construction path,
+    /// jammi-encoders' `lora_site.rs`, every test in this workspace) is
+    /// affected byte-for-byte by this split.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_base_seeded(
+        base: FrozenBase,
+        rank: usize,
+        alpha: f64,
+        use_rslora: bool,
+        init_mode: LoraInitMode,
+        dropout: Option<f32>,
+        init_seed: u64,
+        dropout_seed: u64,
         varmap: &VarMap,
         vb: &VarBuilder,
     ) -> Result<Self, LoraError> {
@@ -720,15 +784,20 @@ impl LoraLinear {
             let (a_values, b_values): (Vec<f32>, Vec<f32>) = match init_mode {
                 LoraInitMode::ZerosB => {
                     // A: Kaiming-uniform over fan_in = in_features. B: zeros.
-                    let mut rng = SplitMix64::new(seed_for_param(seed, &a_name));
+                    // Keyed by `init_seed` — identical on every rank of a
+                    // real gang, so every rank's A/B start byte-identical
+                    // regardless of `dropout_seed` (U4b tail).
+                    let mut rng = SplitMix64::new(seed_for_param(init_seed, &a_name));
                     let a = kaiming_uniform_fill(&mut rng, rank * in_features, in_features);
                     let b = vec![0.0_f32; out_features * rank];
                     (a, b)
                 }
                 LoraInitMode::Gaussian => {
-                    // Both A and B ~ Normal(0, 0.02), independent name-keyed streams.
-                    let mut rng_a = SplitMix64::new(seed_for_param(seed, &a_name));
-                    let mut rng_b = SplitMix64::new(seed_for_param(seed, &b_name));
+                    // Both A and B ~ Normal(0, 0.02), independent name-keyed
+                    // streams, keyed by `init_seed` (see the `ZerosB` arm's
+                    // comment above).
+                    let mut rng_a = SplitMix64::new(seed_for_param(init_seed, &a_name));
+                    let mut rng_b = SplitMix64::new(seed_for_param(init_seed, &b_name));
                     let a = gaussian_fill(&mut rng_a, rank * in_features, 0.02);
                     let b = gaussian_fill(&mut rng_b, out_features * rank, 0.02);
                     (a, b)
@@ -764,9 +833,12 @@ impl LoraLinear {
         // routes through the same function) — see its own doc.
         let scaling = lora_scaling(alpha, rank, use_rslora)?;
 
+        // Keyed by `dropout_seed` — `f(seed, rank)` on a real gang (U4b
+        // tail), independent of `init_seed`, so a rank's own dropout Philox
+        // stream can differ from its peers' without perturbing its A/B init.
         let dropout_masks = dropout
             .filter(|p| *p > 0.0)
-            .map(|_| DropoutMasks::new(seed, &vb.prefix()));
+            .map(|_| DropoutMasks::new(dropout_seed, &vb.prefix()));
 
         let dweight_needed = base.dweight_needed()?;
         // #428 P2b: only a `Dense` base ever gets a `bias_pack` — the
@@ -1106,6 +1178,21 @@ impl LoraLinear {
     /// masks byte-match the uninterrupted run.
     pub fn dropout_position(&self) -> Result<Option<u64>, LoraError> {
         Ok(self.dropout_masks.as_ref().map(DropoutMasks::position))
+    }
+
+    /// This layer's own dropout Philox SEED (the value passed as
+    /// `dropout_seed` at construction, [`Self::new_seeded`]/
+    /// [`Self::new_with_base_seeded`]) — `None` when the layer has no
+    /// dropout mask source (`lora_dropout == 0`). U4b tail: exposed for the
+    /// cross-rank oracle that pins the init/dropout seed split
+    /// (`jammi_ai::fine_tune::lora`'s `_for_rank` builders): two ranks built
+    /// with the SAME `init_seed` and DIFFERENT `dropout_seed` must report
+    /// two different values here even though their `lora_a`/`lora_b`
+    /// weights are byte-identical — [`Self::dropout_position`] (the forward
+    /// COUNT) cannot itself distinguish them, since it advances identically
+    /// on both ranks regardless of which seed drew the mask.
+    pub fn dropout_run_seed(&self) -> Option<u64> {
+        self.dropout_masks.as_ref().map(DropoutMasks::seed)
     }
 
     /// Restore this layer's dropout forward counter to `position` — O(1),

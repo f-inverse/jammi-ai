@@ -23,7 +23,7 @@ are pinned identically.)
 
 | Format | On-disk file | Stability stamp | Reject semantics on load |
 |--------|--------------|-----------------|--------------------------|
-| Materialization manifest | `.materialization.json` | `manifest_version` (`u32`) | **Reject-newer** — `found > MANIFEST_VERSION` → `ManifestError::UnsupportedManifestVersion`. One older SHAPE is named on its own: an object at the current version with no `leaves` inventory (written before the inventory existed) is `ManifestError::PreLeavesSidecar`, which `ResultStore::read_materialization_manifest` reads as *absent* (re-materialise) — never a hit, and never how a newer version or a corrupt body is read |
+| Materialization manifest | `.materialization.json` | `manifest_version` (`u32`) | **Exact-version** — `found != MANIFEST_VERSION`, older or newer, → `ManifestError::UnsupportedManifestVersion` (an older version names a superseded determinant set, so it is never read as a hit). One older SHAPE is named on its own: an object at the current version with no `leaves` inventory (written before the inventory existed) is `ManifestError::PreLeavesSidecar`, which `ResultStore::read_materialization_manifest` reads as *absent* (re-materialise) — never a hit, and never how a newer version or a corrupt body is read |
 | ANN row map | `.rowmap` | leading `u32` version header | **Reject-newer** — `found > ROWMAP_VERSION` → `JammiError::IncompatibleFormat { artifact: "rowmap", .. }` |
 | ANN sidecar manifest | `.manifest.json` | `version` (`u32`) | **Reject-newer** — `found > ANN_MANIFEST_VERSION` → `JammiError::IncompatibleFormat { artifact: "ann-manifest", .. }` |
 | ANN binary threshold companion | `.threshold` | *none embedded* — required whenever the sidecar manifest's `scalar_kind` is `Binary`, confirmed by the manifest's `binary_threshold_kind` field | **Fail-loud, not versioned** — a missing `binary_threshold_kind`, a missing file, or a byte length not matching `dimensions` `f32`s → `JammiError::Other` |
@@ -36,23 +36,35 @@ are pinned identically.)
 
 Two distinct kinds of stamp appear above, and the difference is deliberate:
 
-- **Reject-newer** for formats that carry a *compatibility ordering*. An older
-  or equal version is readable by construction (the layout only grew); only a
-  newer version carries a layout this build does not know. This is the
-  materialization manifest's idiom (`MaterializationManifest::from_json_bytes`),
-  and the `.rowmap` and ANN `.manifest.json` follow it.
+- **Reject-newer** for formats that carry a *compatibility ordering*: only a
+  newer version carries a layout this build does not know, so only a newer
+  version is refused on the stamp. The `.rowmap` and ANN `.manifest.json` are
+  this kind (`found > ROWMAP_VERSION`, `found > ANN_MANIFEST_VERSION`).
+- **Exact-version** for the materialization manifest
+  (`MaterializationManifest::from_json_bytes`), whose version names a
+  *determinant set* rather than a layout: an older version is a superseded
+  determinant set, so a body that still decodes is refused on any inequality
+  (`found != MANIFEST_VERSION`), never trusted as a hit. The decode runs before
+  the stamp is inspected, so a body that lacks a field the current shape
+  requires — a producer variant that grew a required determinant at the same
+  version, as the fine-tune descriptor's topology fields did — is the typed
+  `ManifestError::Serde`; the one older shape the reader names on its own (an
+  object at the current version with no `leaves`) is read as *absent*.
 - **Strict** for the USearch `backend_version`, because the USearch serialized
   graph format carries **no** compatibility ordering between releases. A version
   that differs *at all* may mis-deserialise the graph and return wrong
   neighbours, so any inequality is incompatible — there is no "older is fine"
   here.
 
-## Materialization manifest — reject-newer
+## Materialization manifest — exact-version
 
 `.materialization.json` carries `manifest_version` (`MANIFEST_VERSION`). The
-reader rejects a newer version as the typed
-`ManifestError::UnsupportedManifestVersion { found, supported }`. This is the
-gold idiom every other stamped format is modeled on; the full contract is in
+reader rejects any other version, older or newer, as the typed
+`ManifestError::UnsupportedManifestVersion { found, supported }` — the version
+names the determinant set the hash was computed over, and a superseded set is
+never a hit. The version is checked after the decode and before the parsed
+manifest is handed back. Every other stamped format is modeled on this
+fail-loud shape (the ordered ones relax it to reject-newer); the full contract is in
 [The Materialization Contract](./materialization-contract.md). Its error lives
 in its own domain (`ManifestError`) and is intentionally *not* folded into the
 shared `IncompatibleFormat` variant — it carries the manifest-specific recovery

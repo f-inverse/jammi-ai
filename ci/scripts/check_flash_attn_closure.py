@@ -112,6 +112,15 @@ EXEMPT_SCOPE: dict[str, str] = {
         "release artifact is built from. Its tuples' off-merge-path residual is carried by "
         "`ci/scripts/execution_surface_reachability_allowlist.txt`'s own gang section"
     ),
+    "ci/scripts/runpod_gpu_cluster.sh": (
+        "gang cluster leg (2 pods x 1 GPU on one RunPod cluster): the two-host arm of the "
+        "same distributed-training correctness surface as the pod leg, not the release "
+        "prove lane's shipped surface. It declares nothing in `prove_lane.crates`, compiles "
+        "and runs the same ONE target (jammi-ai's `gpu_capability` under the cluster name "
+        "filter) on each host, and no release artifact is built from it. Its tuples' "
+        "off-merge-path residual is carried by "
+        "`ci/scripts/execution_surface_reachability_allowlist.txt`'s own cluster section"
+    ),
     "ci/scripts/pod_seed_target.sh": (
         "seed cache lane: T1 precedes CUTLASS provisioning, T1/T1b main-only "
         "split — a dedicated tuple-lockstep follow-up is tracked separately, "
@@ -1048,6 +1057,16 @@ def _write_prove_surface_fixture(root: Path, script_body: str, manifest: dict | 
         "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests "
         "--test gpu_capability ${GANG_TEST_FILTER} -- --nocapture --test-threads=1 "
         '2>&1 | tee "\\$gang_log"\n'
+    )
+    # The gang cluster leg's two tuples: the same `--no-run` compile-check and
+    # live run as the pod leg, under the cluster name filter, per host.
+    (root / "ci" / "scripts" / "runpod_gpu_cluster.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests "
+        "--test gpu_capability --no-run || grc=\\$?\n"
+        "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests "
+        "--test gpu_capability ${CLUSTER_TEST_FILTER} -- --nocapture --test-threads=1 "
+        '2>&1 | tee "\\$rank_log"\n'
     )
     for perf_name in (
         "finetune_ab.sh",

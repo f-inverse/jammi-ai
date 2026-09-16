@@ -44,7 +44,7 @@
 #      over `Strict` (`crates/jammi-kernels/src/admission.rs:62-64`), and
 #      `--expect-kernels-disabled` hard-errors before a single step runs if
 #      `JAMMI_KERNELS_DISABLE` was dropped, mistyped, or not forwarded to
-#      this process — `params.expect_kernels_disabled` (`finetune_step.rs:745-758`)
+#      this process — `params.expect_kernels_disabled` (`finetune_step.rs:746-758`)
 #      checks it FIRST, before any device/checkpoint/tensor work — so a
 #      silently-clean env var can never masquerade as a real eager leg.
 #      `kernels_disabled_requested`/`kernels_disabled_fired` are surfaced on
@@ -174,7 +174,7 @@
 # happened to notice it. Both `jammi-fused` legs additionally pass
 # `--expect-kernels-disabled ""` (F5, adversarial audit): an EMPTY
 # expectation, checked via the SAME exact-SET-equality
-# `params.expect_kernels_disabled` (`finetune_step.rs:745-758`) machinery
+# `params.expect_kernels_disabled` (`finetune_step.rs:746-758`) machinery
 # the eager leg's own nonempty list uses —
 # `parse_disable_list` (`crates/jammi-kernels/src/admission.rs:1037-1046`)
 # is the empty set for `Some("")`, so
@@ -336,7 +336,7 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # `crates/jammi-encoders/src/modernbert.rs:485`, `softmax_last_dim_fused`
 # `crates/jammi-encoders/src/attention_cascade.rs:636` (moved out of
 # `crate::modernbert`, issue #462), `lora_linear_fused`
-# `crates/jammi-lora/src/lora_linear.rs:1007`, `adamw_step_fused`
+# `crates/jammi-lora/src/lora_linear.rs:1079`, `adamw_step_fused`
 # `crates/jammi-ai/src/fine_tune/adamw.rs:259`, `mem_efficient_attention`
 # `crates/jammi-encoders/src/attention_cascade.rs:859` (`admit_cascade`, the
 # per-layer memeff cascade — consulted on EVERY training-mode attention

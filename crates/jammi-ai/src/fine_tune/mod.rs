@@ -36,6 +36,9 @@ pub mod partition;
 pub(crate) mod regression_loss;
 #[cfg(feature = "local")]
 pub mod resume;
+/// Who runs one attempt's body and who may write — the single-writer rule
+/// as types (`RunnerRole`, `LeaseHolder`).
+pub mod role;
 #[cfg(feature = "local")]
 pub mod source;
 #[cfg(feature = "local")]

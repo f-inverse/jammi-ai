@@ -137,6 +137,7 @@ fn bert_loads_with_target_modules() {
         rank_pattern: &empty_pattern,
         init_mode: LoraInitMode::ZerosB,
         seed: 0,
+        dropout_seed: 0,
     };
 
     let bert = Bert::builder()
@@ -208,6 +209,7 @@ fn build_bert_with_lora_on_biased_sites(
         rank_pattern: &empty_pattern,
         init_mode: LoraInitMode::ZerosB,
         seed: 0,
+        dropout_seed: 0,
     };
     Bert::builder()
         .pooling(Pooling::Mean)
@@ -546,6 +548,7 @@ fn bert_lora_bias_site_eval_matches_a_hand_composed_eager_reference_at_nonzero_a
         rank_pattern: &empty_pattern,
         init_mode: LoraInitMode::Gaussian,
         seed: 7,
+        dropout_seed: 7,
     };
     let mut bert = Bert::builder()
         .pooling(Pooling::Mean)
@@ -1352,6 +1355,7 @@ fn quantized_base_bert_reports_zero_lora_sites_wrapped_with_a_dense_twin_control
         rank_pattern: &empty_pattern,
         init_mode: LoraInitMode::Gaussian,
         seed: 0x5eed_1234,
+        dropout_seed: 0x5eed_1234,
     };
 
     let input_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).unwrap();

@@ -1265,6 +1265,8 @@ mod tests {
             spec_schema_version: 1,
             base_model_id: "bert-base-uncased".into(),
             world_size: 1,
+            collective: "noop".into(),
+            local_ranks: 1,
         }
     }
 

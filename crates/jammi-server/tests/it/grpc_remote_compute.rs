@@ -1315,7 +1315,7 @@ async fn an_unset_cache_policy_persists_the_identical_bypass_spec_on_both_paths(
 }
 
 /// REFUSAL, over the REMOTE path. A count the deployment cannot serve
-/// (`world_size > devices`) is refused at the submit edge from the wire, not
+/// (`world_size > serveable_world`, `[distributed] max_world_size`) is refused at the submit edge from the wire, not
 /// only from the embedded API: the refusal is a property of the submit edge,
 /// and the submit edge has more than one entrance.
 ///

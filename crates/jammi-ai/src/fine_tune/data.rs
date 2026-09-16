@@ -50,9 +50,13 @@ pub enum TrainingBatch {
         positive: Tensor,
         negative: Tensor,
     },
-    /// Classification: embeddings + integer class labels.
+    /// Classification: the trainable head's LOGITS (never the pre-head
+    /// embeddings — U4b, DESIGN.md §4: the gather point for this arm must
+    /// sit downstream of the classification head, so the head is applied at
+    /// BATCH-CONSTRUCTION time, in `TrainingLoop::encode_chunk`, rather than
+    /// inside the loss dispatch) + integer class labels.
     Classification {
-        embeddings: Tensor,
+        logits: Tensor,
         labels: Tensor, // shape (batch_size,) u32
     },
     /// NER: hidden states for all tokens + per-token labels.
@@ -390,6 +394,24 @@ enum TrainingRow {
 }
 
 impl TrainingDataLoader {
+    /// A second loader over the SAME rows (or precomputed batches), for
+    /// another rank of an in-process gang: the format and the data are
+    /// copied, the pool reservation is NOT — it stays with the loader the
+    /// eager read attached it to (rank 0's), and is freed when that one
+    /// drops. A rank's loader is read-only over resident rows, so the copies
+    /// see identical rows in identical order, which is what every rank's
+    /// partition slicing assumes (`partition.rs`).
+    pub(crate) fn replicate(&self) -> Self {
+        Self {
+            format: self.format,
+            data: match &self.data {
+                LoaderData::TextRows(rows) => LoaderData::TextRows(rows.clone()),
+                LoaderData::Precomputed(batches) => LoaderData::Precomputed(batches.clone()),
+            },
+            reservation: None,
+        }
+    }
+
     /// Create a loader from contrastive pair rows.
     pub fn from_contrastive(rows: Vec<(String, String, f32)>) -> Self {
         Self {

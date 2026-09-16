@@ -8,12 +8,17 @@
 //! come up and then refuse every job it is handed.
 //!
 //! **The submit edge** decides whether this DEPLOYMENT can serve the count a
-//! particular job asks for. It is the last point at which refusing costs
-//! nothing: past it the spec is a durable row a worker will claim, fail and
-//! retry. Every refusal here is asserted on two things — the typed error
-//! variant, and that the `jobs` table is unchanged — because a refusal that
-//! leaves a queued row behind is a job that later runs with a count the
-//! deployment cannot serve.
+//! particular job asks for — the FLEET's bound, `[distributed]
+//! max_world_size` (the serveable world), never this host's own device
+//! count: a count within the serveable world but beyond this host's devices
+//! submits and is decided by assembly on the claiming coordinator (plan 67
+//! U5b-1b-ii). It is the last point at which refusing costs nothing: past it
+//! the spec is a durable row a worker will claim, fail and retry. Every
+//! refusal here is asserted on two things — the typed error variant, and
+//! that the `jobs` table is unchanged — because a refusal that leaves a
+//! queued row behind is a job that later runs with a count the deployment
+//! cannot serve. The rule reads no catalog: `RankAdmission` holds no handle
+//! to one, so the refusal is decided from configuration alone.
 //!
 //! The submit edge has more than one entrance, and this file ranges over the
 //! set of them:
@@ -49,19 +54,14 @@ use tempfile::TempDir;
 
 use crate::common;
 
-/// A session over a deployment that declares `devices` devices.
-///
-/// Real ordinals with `device = 0`, which is what `GpuConfig::validate`
-/// requires of a multi-entry list (a list mixing the CPU with real ordinals
-/// is refused: a gang runs on one kind of device). Hermetic anyway —
-/// `require_gpu` stays false, so a host with no such device degrades to the
-/// CPU exactly as every other fixture's session does, and it is the declared
-/// COUNT, not the execution device, that the submit edge reads.
-async fn session_with_devices(devices: usize) -> (Arc<InferenceSession>, TempDir) {
+/// A session over a deployment whose serveable world is `world`
+/// (`[distributed] max_world_size`), on ONE device (the fixture's CPU): the
+/// submit edge reads the fleet bound, never the device count, and every
+/// refusal below is a statement about that bound.
+async fn session_with_serveable_world(world: u32) -> (Arc<InferenceSession>, TempDir) {
     let dir = TempDir::new().unwrap();
     let mut config = common::test_config(dir.path());
-    config.gpu.device = 0;
-    config.gpu.devices = Some((0..devices as i32).collect());
+    config.distributed.max_world_size = world;
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
     (session, dir)
 }
@@ -99,8 +99,8 @@ async fn job_count(session: &Arc<InferenceSession>) -> usize {
 /// everything.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
-    // One device: a two-rank job is unservable here.
-    let (session, _dir) = session_with_devices(1).await;
+    // A serveable world of one: a two-rank job is unservable here.
+    let (session, _dir) = session_with_serveable_world(1).await;
     let before = job_count(&session).await;
 
     let cached = FineTuneConfig {
@@ -115,8 +115,8 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
         ..FineTuneConfig::default()
     };
 
-    // The two bounds a ONE-device deployment can state. The two
-    // single-rank-only mechanisms need a deployment where the device bound
+    // The two bounds a serveable-world-of-one deployment can state. The two
+    // single-rank-only mechanisms need a deployment where the world bound
     // does not bite first, so they are checked on the wide session below.
     // The expectation is the WHOLE sentence, not a fragment of it: a message
     // is what the operator acts on, and a fragment-only assertion cannot see
@@ -128,10 +128,11 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
             "world_size must be >= 1 (1 is the single-rank job; 0 has no rank to run on)",
         ),
         (
-            "a count beyond the deployment's devices",
+            "a count beyond the deployment's serveable world",
             spec_with_world_size(2),
-            "world_size = 2 exceeds the 1 configured device(s): one rank per device, so list \
-             more in `[gpu] devices` or submit a smaller rank count",
+            "world_size = 2 exceeds the serveable world of 1 ([distributed] max_world_size): a \
+             gang is assembled from fleet members up to that bound, so raise it on every \
+             coordinator or submit a smaller rank count",
         ),
     ];
 
@@ -179,9 +180,9 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
         );
     }
 
-    // Two devices: the device bound no longer bites, so the two
+    // A serveable world of two: the world bound no longer bites, so the two
     // single-rank-only mechanisms are the reason a two-rank job is refused.
-    let (wide, _wide_dir) = session_with_devices(2).await;
+    let (wide, _wide_dir) = session_with_serveable_world(2).await;
     let wide_before = job_count(&wide).await;
     for (name, spec, expected) in [
         (
@@ -218,12 +219,20 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
     );
 
     // The control: the SAME two-rank submission with neither
-    // single-rank-only mechanism is admitted on the two-device deployment and
-    // does write a row. Without this the refusals above could all be a
-    // submit edge that refuses everything.
+    // single-rank-only mechanism is admitted on the serveable-world-of-two
+    // deployment and does write a row — on ONE device: plan 67 U5b-1b-ii
+    // (d), a count within the serveable world but beyond this host's own
+    // devices submits and is decided by assembly (the coordinator body's
+    // own oracle, `gang_coordinator.rs`), never refused here. Without this
+    // the refusals above could all be a submit edge that refuses everything.
+    assert_eq!(
+        wide.inner_config().gpu.device_list().len(),
+        1,
+        "the fixture declares one device, so the admitted count is beyond this host's devices"
+    );
     wide.run_training_spec(spec_with_world_size(2))
         .await
-        .expect("a two-rank job on a two-device deployment is servable");
+        .expect("a two-rank job within the serveable world submits on a one-device host");
     assert_eq!(
         job_count(&wide).await,
         wide_before + 1,
@@ -237,7 +246,7 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
 /// must still refuse it before writing a row.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fine_tune_cache_use_is_refused_through_enqueue_too() {
-    let (session, _dir) = session_with_devices(1).await;
+    let (session, _dir) = session_with_serveable_world(1).await;
     let before = job_count(&session).await;
 
     let spec = TrainingSpec::FineTune {
@@ -286,11 +295,11 @@ async fn a_fine_tune_cache_use_is_refused_through_enqueue_too() {
 }
 
 /// The single-rank job every caller that names no count submits is still
-/// admitted on a one-device deployment — the no-regression case the refusals
-/// above must not have swept up.
+/// admitted on a serveable world of one — the no-regression case the
+/// refusals above must not have swept up.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_single_rank_job_is_admitted_on_a_one_device_deployment() {
-    let (session, _dir) = session_with_devices(1).await;
+async fn a_single_rank_job_is_admitted_on_a_serveable_world_of_one() {
+    let (session, _dir) = session_with_serveable_world(1).await;
     let before = job_count(&session).await;
     session
         .run_training_spec(spec_with_world_size(1))
@@ -309,7 +318,7 @@ async fn a_single_rank_job_is_admitted_on_a_one_device_deployment() {
 async fn the_serialized_request_entrance_carries_the_count_to_the_same_edge() {
     use prost::Message;
 
-    let (session, _dir) = session_with_devices(1).await;
+    let (session, _dir) = session_with_serveable_world(1).await;
     let before = job_count(&session).await;
 
     let mut body = Vec::new();
@@ -329,7 +338,7 @@ async fn the_serialized_request_entrance_carries_the_count_to_the_same_edge() {
     let error = session
         .run_training_spec(decoded)
         .await
-        .expect_err("a two-rank job on a one-device deployment is unservable");
+        .expect_err("a two-rank job on a serveable world of one is unservable");
     assert!(matches!(error, JammiError::Config(_)), "{error:?}");
     assert_eq!(
         job_count(&session).await,
@@ -413,6 +422,35 @@ fn the_admission_rule_reads_the_build_as_data() {
     }
 }
 
+/// Plan 67 U5b-1b-ii (d), the refusing half, at the rule itself: a
+/// `world_size` past the serveable world is refused naming `[distributed]
+/// max_world_size`, and one within it is admitted — decided with NO
+/// catalog in scope at all. `RankAdmission` is three plain values (the
+/// serveable world, the collective, the build flag): it holds no catalog
+/// handle, so no catalog read is even expressible from `admit` — the
+/// structural half of "refuses at submit with no catalog read"; the
+/// session-level half (the `jobs` table unchanged) is
+/// `every_unservable_rank_count_is_refused_at_both_submit_entrances`.
+#[test]
+fn a_count_past_the_serveable_world_is_refused_from_configuration_alone() {
+    let narrow = RankAdmission::new(1, CollectiveSelection::Auto, false);
+    let error = narrow
+        .admit(&spec_with_world_size(2))
+        .expect_err("two ranks on a serveable world of one");
+    assert!(matches!(error, JammiError::Config(_)), "{error:?}");
+    assert!(
+        error.to_string().contains("[distributed] max_world_size"),
+        "the refusal names the knob that bounds it: {error}"
+    );
+    assert_eq!(narrow.serveable_world(), 1);
+
+    let wide = RankAdmission::new(2, CollectiveSelection::Auto, false);
+    wide.admit(&spec_with_world_size(2))
+        .expect("two ranks within a serveable world of two are admitted");
+    wide.admit(&spec_with_world_size(3))
+        .expect_err("three ranks past a serveable world of two are refused");
+}
+
 /// Every refusal the rule can raise reads as one sentence.
 ///
 /// A multi-line Rust string literal joins its lines only through a trailing
@@ -448,7 +486,7 @@ fn every_admission_refusal_reads_as_one_sentence() {
             spec_with_world_size(0),
         ),
         (
-            "world_size > devices",
+            "world_size > serveable_world",
             RankAdmission::new(1, CollectiveSelection::Auto, false),
             spec_with_world_size(2),
         ),

@@ -53,8 +53,14 @@ services:
     restart: unless-stopped
     # `docker stop` / `docker compose down` send SIGTERM (DRAIN: the in-flight
     # job finishes) and SIGKILL after this grace; 120 s covers a small epoch.
-    # `docker compose kill -s SIGINT jammi-server` is RELEASE — the job's lease
-    # is handed back at once and the restarted container reclaims it.
+    # SIGINT is RELEASE — the job's lease is handed back at once and the next
+    # process to claim it resumes it. `docker compose kill -s SIGINT` delivers
+    # that signal but the daemon records a kill as a MANUAL stop, and a manually
+    # stopped container is exempt from `restart: unless-stopped`: nothing comes
+    # back on its own. To release AND have this policy restart the container,
+    # signal the process from the host (`kill -INT $(docker inspect -f
+    # '{{.State.Pid}}' <container>)`, what tests/compose/shape_b_release.py
+    # does), or follow a compose kill with `docker compose start jammi-server`.
     stop_grace_period: 120s
     healthcheck:
       test: ["CMD", "/usr/local/bin/jammi-server", "probe"]

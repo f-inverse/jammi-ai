@@ -704,13 +704,12 @@ pub enum ProducingDescriptor {
     /// this variant's [`DefinitionHash`] (that field's own doc carries the
     /// tracking issue).
     ///
-    /// `world_size` is the only topology field `TrainingCommon` carries;
-    /// distributed (gang) training adds per-rank batch, partition-rule
-    /// version, collective backend, and reduction policy as new named
-    /// fields on this variant when it lands (see
-    /// `docs/plans/67-distributed-training/UNITS.md`) — the completeness
-    /// test's exhaustive destructuring (no `..`) fails to compile the
-    /// moment they land until each is bound and mutated, so the
+    /// `world_size` (`TrainingCommon`'s own topology field) and `collective`/
+    /// `local_ranks` (below, #500 U4b) are this variant's topology fields
+    /// today; per-rank batch and partition-rule version are still future
+    /// additions (see `docs/plans/67-distributed-training/UNITS.md`) — the
+    /// completeness test's exhaustive destructuring (no `..`) fails to
+    /// compile the moment they land until each is bound and mutated, so the
     /// determinant set can never silently grow unaccounted-for.
     FineTune {
         /// The training-set table's own [`DefinitionHash`], hex — binds this
@@ -754,6 +753,24 @@ pub enum ProducingDescriptor {
         /// and batch layout depend on it, so two runs of the same spec at
         /// different world sizes are two different definitions.
         world_size: u32,
+        /// The collective this run reduced over — a canonical, lowercase
+        /// token (`"noop"`, `"local"`, `"peer"`, `"nccl"`), the db-local
+        /// primitive standing in for `jammi-ai`'s `Collective` trait
+        /// implementations (crate-layering rule, DESIGN §3: this crate
+        /// depends on no jammi crate). Two otherwise-identical specs
+        /// reduced over a DIFFERENT collective can disagree in their last
+        /// bits (fold order, transport-specific rounding), so this is a
+        /// determinant like every other field here, not metadata (#500
+        /// U4b).
+        collective: String,
+        /// How many ranks THIS HOST ran on its own devices for this run —
+        /// read off the topology the run executed at, never off a
+        /// configured capacity: one for a single rank, the whole gang for
+        /// an in-process (`"local"`) gang, one for the coordinator of a
+        /// multi-host (`"peer"`) gang whose other ranks live elsewhere.
+        /// Orthogonal to `world_size` above (the per-job identity field) and
+        /// recorded alongside it, never instead of it (#500 U4b).
+        local_ranks: u32,
     },
     /// A table produced by a verb the engine does not own: a consumer built the
     /// rows through its own producer and asked the engine only to publish them
@@ -2686,6 +2703,8 @@ mod tests {
         spec_schema_version: u32,
         base_model_id: String,
         world_size: u32,
+        collective: String,
+        local_ranks: u32,
     }
 
     fn fine_tune_descriptor(f: &FineTuneFields) -> ProducingDescriptor {
@@ -2699,6 +2718,8 @@ mod tests {
             spec_schema_version,
             base_model_id,
             world_size,
+            collective,
+            local_ranks,
         } = f.clone();
         ProducingDescriptor::FineTune {
             training_set_definition_hash,
@@ -2708,6 +2729,8 @@ mod tests {
             spec_schema_version,
             base_model_id,
             world_size,
+            collective,
+            local_ranks,
         }
     }
 
@@ -2723,6 +2746,8 @@ mod tests {
             spec_schema_version: 1,
             base_model_id: "bert-base-uncased".into(),
             world_size: 2,
+            collective: "local".into(),
+            local_ranks: 2,
         }
     }
 
@@ -2762,6 +2787,8 @@ mod tests {
             spec_schema_version: _,
             base_model_id: _,
             world_size: _,
+            collective: _,
+            local_ranks: _,
         } = fine_tune_fields();
 
         assert_each_change_moves_hash(
@@ -2787,6 +2814,8 @@ mod tests {
                     f.base_model_id = "distilbert-base-uncased".into()
                 }),
                 ("world_size", |f| f.world_size = 4),
+                ("collective", |f| f.collective = "nccl".into()),
+                ("local_ranks", |f| f.local_ranks = 4),
             ],
         );
     }

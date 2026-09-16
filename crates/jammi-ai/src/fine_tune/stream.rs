@@ -24,8 +24,9 @@
 //! `Streamed` arm opens a fresh [`Self`] each epoch
 //! (`TrainingLoop::open_streamed_source`) over the train window
 //! (`Slice::PerRank`) and a second one for validation (`Slice::All`) —
-//! `EpochSource` gives both the `Resident` and the `Streamed` arm one
-//! `next_chunk` call shape, and refuses (typed) a whole-set arm ever
+//! `EpochSource` (U4b: the Streamed arm's own type now — the
+//! Resident arm calls `text_chunk_for_rank` directly, see that type's own
+//! doc) refuses (typed) a whole-set arm ever
 //! reaching this dispatch with a `Streamed` source (F6). P6.ii's "unchanged
 //! with the production path streaming" property is therefore the real
 //! claim, not a vacuous one: the pinned parity fixtures
@@ -104,9 +105,9 @@ use jammi_db::store::TrainingSetTable;
 use crate::model::ModelTask;
 use crate::session::InferenceSession;
 
-use super::data::{TextChunk, TrainingDataLoader};
+use super::data::TextChunk;
 use super::decode::{self, ChunkAccumulator, DetectedFormat, LabelVocabulary};
-use super::partition::PartitionSpec;
+use super::partition::{self, PartitionSpec};
 use super::training_set::read_back_sql;
 
 /// The fixed double-buffer depth production trains a `Streamed` text arm
@@ -463,19 +464,93 @@ impl TrainingSetStream {
 /// ([`decode::DecodedBatch`]), and every selection is appended from that one
 /// decode — at a range end, and at the batch end when the range continues
 /// into the next batch. The instant `local_idx` reaches `range.end`, the
-/// accumulated chunk is finished and sent, `step` advances, and the next
-/// range is computed; an
-/// EMPTY next range (which [`PartitionSpec::rows_for_step`]'s clamp only ever
-/// produces once `range.start >= window.len()`) is the terminal state: emit
-/// it (an empty [`OwnedChunk`], the trainer's own end-of-epoch signal) and
-/// return — this rank has nothing left to contribute regardless of how many
-/// rows the underlying read still has (a sibling rank's rows), so the pump
-/// does not keep draining `df_stream` to its end.
+/// accumulated chunk is finished and sent and the next step's range is
+/// computed — [`walk_past_empty_steps`] decides from there whether that next
+/// range is real (in-bound) content, another empty-but-real step, or the
+/// true end of epoch; see that function's own doc for the rule (U4b tail).
 ///
 /// If `df_stream` itself ends (the table had fewer rows than `window`
 /// promised) while `local_idx < window.len()`, that is P7's early-end
 /// refusal — the ONLY way this function's post-loop code is reached, since
 /// every other termination path returns from inside the loop.
+///
+/// Walk past a (possibly empty) run of steps whose `range` is empty, sending
+/// each as a REAL chunk or stopping at the true end of epoch, per
+/// `step_bound`:
+///
+/// - `step_bound = None` (`Slice::All`, the validation shape — never
+///   per-rank-partitioned): an empty range is UNCONDITIONALLY the terminal
+///   signal (unchanged from before U4b tail) — sent once, here, and the pump
+///   returns.
+/// - `step_bound = Some(bound)` (`Slice::PerRank`): `bound` is
+///   [`partition::batches_per_epoch`] over this stream's own
+///   `(window.len(), spec.world(), spec.batch())` — the IDENTICAL formula
+///   the trainer's `train_batches_per_epoch` computes over the SAME
+///   `(train_count, world, batch)` (`trainer.rs::run`'s Streamed arm), so
+///   the two bounds can never drift apart. An empty range at `step < bound`
+///   is DESIGN.md §4's zero-row-rank case: this rank holds zero rows at
+///   this global step while a peer rank may still hold some — real content
+///   (an empty chunk of the right trailing width), sent as such, never
+///   end-of-epoch; the loop then checks the NEXT step (the range can only
+///   ever be empty again, in practice, at `bound - 1` itself, since
+///   `batches_per_epoch` is defined so SOME rank holds rows at every step
+///   short of it — but this loop makes no such assumption and simply keeps
+///   walking). Terminal once `step == bound`: every real step (including a
+///   trailing empty one) has already been sent by a prior iteration (or
+///   never existed, when `bound == 0`), so NOTHING more is sent here — the
+///   consumer's own bounded loop (`0..train_batches_per_epoch`) never asks
+///   past `bound - 1` anyway.
+///
+/// Returns `Some((step, range, acc))` once `range` is non-empty — ready for
+/// the caller's per-batch consumption loop, with `acc` the fresh (unused)
+/// accumulator for that step — or `None` once the terminal condition above
+/// has been reached (or a downstream send failed), in which case the caller
+/// must return immediately without reading `df_stream` further.
+#[allow(clippy::too_many_arguments)]
+async fn walk_past_empty_steps(
+    tx: &tokio::sync::mpsc::Sender<Result<OwnedChunk>>,
+    detected: DetectedFormat,
+    label_vocab: Option<&LabelVocabulary>,
+    slice: &Slice,
+    window_len: usize,
+    step_bound: Option<usize>,
+    mut step: usize,
+    mut range: Range<usize>,
+    mut acc: ChunkAccumulator,
+    root_reservation: &mut MemoryReservation,
+) -> Option<(usize, Range<usize>, ChunkAccumulator)> {
+    while range.is_empty() {
+        let real_step = matches!(step_bound, Some(bound) if step < bound);
+        if !real_step {
+            if step_bound.is_none() {
+                // Slice::All: the empty range IS the terminal signal.
+                emit_step(tx, step, acc, root_reservation).await;
+            }
+            // Slice::PerRank at the true bound: nothing left to send (the
+            // last real, possibly-empty step already went out, or `bound`
+            // was `0` and there was never anything to send at all).
+            return None;
+        }
+        // An in-bound empty step (Slice::PerRank's zero-row-rank case
+        // only — `real_step` is never true when `step_bound` is `None`):
+        // send it as REAL, non-terminal content, then check the next step.
+        let fresh = match ChunkAccumulator::new_for(detected, label_vocab) {
+            Ok(a) => a,
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return None;
+            }
+        };
+        let finished = std::mem::replace(&mut acc, fresh);
+        if !emit_step(tx, step, finished, root_reservation).await {
+            return None;
+        }
+        step += 1;
+        range = slice.rows_for_step(window_len, step);
+    }
+    Some((step, range, acc))
+}
+
 /// Append `selected` (indices within `batch`) to `acc`, decoding `batch`
 /// into `decoded` on the first call for that batch; `selected` is drained.
 fn append_selected<'a>(
@@ -510,10 +585,25 @@ async fn run_pump(
     tx: tokio::sync::mpsc::Sender<Result<OwnedChunk>>,
     label_vocab: Option<LabelVocabulary>,
 ) {
-    let mut step = 0usize;
-    let mut range = slice.rows_for_step(window.len(), step);
+    // U4b tail: for `Slice::PerRank`, the true end of epoch is the SAME
+    // global step bound the trainer computes (`partition::
+    // batches_per_epoch`), never "this rank's own range came back empty" —
+    // see `walk_past_empty_steps`'s doc. `Slice::All` (validation) keeps its
+    // original "an empty range is always terminal" contract (`step_bound =
+    // None`).
+    let step_bound = match &slice {
+        Slice::PerRank(spec) => Some(partition::batches_per_epoch(
+            window.len(),
+            spec.world(),
+            spec.batch(),
+        )),
+        Slice::All { .. } => None,
+    };
 
-    let mut acc = match ChunkAccumulator::new_for(detected, label_vocab.as_ref()) {
+    let step = 0usize;
+    let range = slice.rows_for_step(window.len(), step);
+
+    let acc = match ChunkAccumulator::new_for(detected, label_vocab.as_ref()) {
         Ok(a) => a,
         Err(e) => {
             let _ = tx.send(Err(e)).await;
@@ -521,12 +611,23 @@ async fn run_pump(
         }
     };
 
-    if range.is_empty() {
-        // A degenerate (zero-row) window: the terminal chunk is the very
-        // first one.
-        emit_step(&tx, step, acc, &mut root_reservation).await;
-        return;
-    }
+    let (mut step, mut range, mut acc) = match walk_past_empty_steps(
+        &tx,
+        detected,
+        label_vocab.as_ref(),
+        &slice,
+        window.len(),
+        step_bound,
+        step,
+        range,
+        acc,
+        &mut root_reservation,
+    )
+    .await
+    {
+        Some(v) => v,
+        None => return,
+    };
 
     let mut global_idx = 0usize;
     let mut local_idx = 0usize;
@@ -592,13 +693,28 @@ async fn run_pump(
                 if !emit_step(&tx, step, finished, &mut root_reservation).await {
                     return;
                 }
-                step += 1;
-                range = slice.rows_for_step(window.len(), step);
-                if range.is_empty() {
-                    // Terminal: `acc` is the fresh, empty accumulator just
-                    // installed above.
-                    emit_step(&tx, step, acc, &mut root_reservation).await;
-                    return;
+                let next_step = step + 1;
+                let next_range = slice.rows_for_step(window.len(), next_step);
+                match walk_past_empty_steps(
+                    &tx,
+                    detected,
+                    label_vocab.as_ref(),
+                    &slice,
+                    window.len(),
+                    step_bound,
+                    next_step,
+                    next_range,
+                    acc,
+                    &mut root_reservation,
+                )
+                .await
+                {
+                    Some((s, r, a)) => {
+                        step = s;
+                        range = r;
+                        acc = a;
+                    }
+                    None => return,
                 }
             }
         }
@@ -815,63 +931,64 @@ pub async fn build_label_vocabulary(
     ))
 }
 
-/// One epoch's row source for the trainer's production text loop (#500 U2c
-/// §10): either an already-resident [`TrainingDataLoader`] or a fresh
-/// per-epoch [`TrainingSetStream`]. [`Self::next_chunk`] gives both arms one
-/// call shape, so `trainer.rs::run`'s text loop walks either one identically.
-pub(crate) enum EpochSource<'a> {
-    Resident(&'a TrainingDataLoader),
-    Stream(TrainingSetStream),
-}
+/// One epoch's row source for the trainer's production STREAMED text loop
+/// (#500 U2c §10): a thin [`Self::next_chunk`] wrapper over a per-epoch
+/// [`TrainingSetStream`].
+///
+/// U4b: the Resident production arm no longer goes through this type —
+/// `trainer.rs::run`'s Resident branch calls `text_chunk_for_rank` directly,
+/// over a FIXED step bound (`train_batches_per_epoch`). U4b tail: this type
+/// now takes the SAME shape for the Streamed arm — `trainer.rs::run`'s
+/// Streamed branch walks `step` in `0..train_batches_per_epoch` and this
+/// type's [`Self::next_chunk`] always hands back the real chunk for that
+/// step (never an "empty means done" sentinel): the underlying pump
+/// (`run_pump`'s `step_bound`, via [`walk_past_empty_steps`]) is bounded
+/// identically, so a genuinely empty-but-in-bound chunk at a real gang's
+/// `world > 1` (DESIGN.md §4's zero-row-rank case) is never collapsed into
+/// "no more work" here either — the SAME rule the Resident arm's direct
+/// `text_chunk_for_rank` call already applies, at this type's own layer.
+pub(crate) struct EpochSource(TrainingSetStream);
 
-impl<'a> EpochSource<'a> {
-    /// The chunk this source holds for global `step`. `Ok(None)` is the
-    /// end-of-epoch signal — mirroring
-    /// [`TrainingDataLoader::text_chunk_for_rank`]'s own "an empty chunk
-    /// means the epoch is over" contract exactly, so the caller's loop looks
-    /// identical for either arm.
+impl EpochSource {
+    /// Wrap an opened per-epoch stream.
+    pub(crate) fn new(stream: TrainingSetStream) -> Self {
+        Self(stream)
+    }
+
+    /// The chunk this source holds for global `step`. The caller (the
+    /// trainer's Streamed epoch loop) walks `step` in `0..
+    /// train_batches_per_epoch` — the SAME fixed, once-computed bound the
+    /// underlying pump agrees on (`run_pump`'s `step_bound`, identically
+    /// derived) — so every call inside that bound yields a REAL chunk
+    /// (possibly 0 rows, DESIGN.md §4's zero-row-rank case), never an
+    /// end-of-epoch signal; end-of-epoch is the caller's own loop bound
+    /// alone, never anything this method returns.
     ///
-    /// `spec` is the Resident arm's per-rank partition (the Stream arm
-    /// already baked its own [`Slice::PerRank`] in at [`TrainingSetStream::
-    /// open`], so `spec` goes unused there — kept as a shared parameter
-    /// rather than stored twice, once on this enum and once inside the
-    /// stream that built it).
-    ///
-    /// The Stream arm asserts `owned.step() == step` (#500 U2c §11's
-    /// advisory: "the consumer asserts `owned.step() == step`") — the pump
-    /// emits steps strictly in order over one channel, so any desync here is
-    /// an internal invariant violation, not a caller input error.
-    pub(crate) fn next_chunk(
-        &mut self,
-        spec: &PartitionSpec,
-        step: usize,
-    ) -> Result<Option<TextChunk>> {
-        match self {
-            EpochSource::Resident(loader) => {
-                let chunk = loader.text_chunk_for_rank(spec, step)?;
-                if chunk.row_count() == 0 {
-                    Ok(None)
-                } else {
-                    Ok(Some(chunk))
-                }
+    /// Asserts `owned.step() == step` (#500 U2c §11's advisory: "the
+    /// consumer asserts `owned.step() == step`") — the pump emits steps
+    /// strictly in order over one channel, so any desync here is an
+    /// internal invariant violation, not a caller input error. A `None`
+    /// from the underlying stream this early is likewise an internal
+    /// invariant violation (the pump task died, or its own `step_bound`
+    /// disagreed with the caller's, before the step the caller asked for)
+    /// — a typed error, never silently treated as an early epoch end.
+    pub(crate) fn next_chunk(&mut self, step: usize) -> Result<TextChunk> {
+        match self.0.next_chunk()? {
+            None => Err(JammiError::FineTune(format!(
+                "EpochSource::next_chunk: the stream ended before step {step} — the pump task \
+                 must have died, or its own step bound disagreed with the caller's, before the \
+                 shared bound every rank computes identically"
+            ))),
+            Some(owned) => {
+                assert_eq!(
+                    owned.step(),
+                    step,
+                    "EpochSource::next_chunk: pump/consumer step desync (pump emitted step {}, \
+                     consumer asked for step {step})",
+                    owned.step()
+                );
+                Ok(owned.into_chunk())
             }
-            EpochSource::Stream(stream) => match stream.next_chunk()? {
-                None => Ok(None),
-                Some(owned) => {
-                    assert_eq!(
-                        owned.step(),
-                        step,
-                        "EpochSource::Stream: pump/consumer step desync (pump emitted step {}, \
-                         consumer asked for step {step})",
-                        owned.step()
-                    );
-                    if owned.chunk().row_count() == 0 {
-                        Ok(None)
-                    } else {
-                        Ok(Some(owned.into_chunk()))
-                    }
-                }
-            },
         }
     }
 }

@@ -523,8 +523,9 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
 /// future without any of its own code (the explicit
 /// `drop(hold); drop(cancel_watcher);` included) ever running again — at a
 /// checkpoint chosen so the reproduction is deterministic rather than a
-/// wall-clock race: `training_test_hooks::arm_pause_before_spawn_blocking`
-/// parks the run right after the lease hold and cancel-request watcher are
+/// wall-clock race: `training_test_hooks::arm_pause_before_spawn_blocking`,
+/// armed for this job alone, parks its run right after the lease hold and
+/// cancel-request watcher are
 /// both live, and BEFORE any training thread (or its own `Arc<Catalog>`
 /// clone) exists, so the only two holders of the per-attempt catalog handle
 /// at that point are `run_claimed_job`'s own local and the watcher's clone.
@@ -604,9 +605,11 @@ async fn a_dropped_run_claimed_jobs_future_leaves_no_leaked_cancel_watcher_or_ca
         .unwrap()
         .expect("the queued job is claimable");
 
-    // Arm the one-shot pause BEFORE the run starts, so it is guaranteed to
-    // be the one this specific attempt takes.
-    let parked = training_test_hooks::arm_pause_before_spawn_blocking();
+    // Arm the one-shot pause for THIS job before the run starts, so it is
+    // guaranteed to be the one this specific attempt takes — and, keyed by
+    // job, one that no concurrently-running sibling training test's run can
+    // take instead.
+    let parked = training_test_hooks::arm_pause_before_spawn_blocking(&job_id);
 
     let session_for_task = Arc::clone(&session);
     let run = tokio::spawn(async move {

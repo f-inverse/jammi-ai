@@ -508,6 +508,13 @@ receive gradients, exactly as with a dense base.
 - **Divergence detection:** if loss is NaN or >100 for 3 consecutive batches, the job fails with a clear error
 - **Early stopping:** training stops when validation loss doesn't improve for `patience` epochs, best checkpoint weights are restored
 - **Checkpoints:** saved at ~10% intervals for crash recovery
+- **Multi-host runs (`world_size > 1`):** a rank that aborts, drops its
+  stream, or stays silent past `[worker] rank_timeout_secs` retires the
+  whole attempt — no partial model is ever published and nothing terminal
+  is written; the job is requeued from its last epoch checkpoint and the
+  retry costs one attempt, unless the rank's host was draining (a rolling
+  restart), which costs none. A job whose ranks keep failing fails once its
+  attempts are exhausted, never retries forever.
 
 ## Memory
 

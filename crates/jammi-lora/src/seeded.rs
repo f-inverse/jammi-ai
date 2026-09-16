@@ -198,6 +198,17 @@ impl DropoutMasks {
         self.counter.load(Ordering::Relaxed)
     }
 
+    /// This layer's own Philox `seed` component (U4b tail) — see
+    /// [`crate::LoraLinear::dropout_run_seed`]'s doc for why this needs to
+    /// be independently observable from [`Self::position`]: the forward
+    /// COUNT is deliberately rank-invariant (both ranks of a gang take the
+    /// same number of training forwards per step in the common case), so it
+    /// alone cannot distinguish two ranks whose dropout SEED differs; this
+    /// can.
+    pub(crate) fn seed(&self) -> u64 {
+        self.run_seed
+    }
+
     /// Restore the forward counter. O(1): the mask is a pure function of
     /// the counter, so there is nothing to replay.
     pub(crate) fn restore_position(&self, position: u64) {

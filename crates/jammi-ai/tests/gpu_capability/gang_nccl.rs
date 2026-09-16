@@ -24,14 +24,15 @@
 //! leg (`ncclCommInitAll` over two devices in one process — the RunPod POD
 //! lane, `ci/scripts/runpod_gpu_gang.sh`). [`gang_nccl_two_hosts_reduce_a_known_vector`]
 //! is the TWO-HOST leg (`ncclCommInitRank` on each of two separate processes,
-//! one per host). It has no automated driver or workflow on this tree today
-//! — that two-host cluster driver is filed as unit U7b-A2b. Until it ships,
-//! a maintainer drives this leg BY HAND with `ci/scripts/runpod_lib.sh`'s own
-//! cluster primitives (`rp_cluster_create`/`rp_cluster_get`/`rp_cluster_pods`/
-//! `rp_cluster_delete`): rent a 2×1 cluster, `scp` the 128-byte NCCL id
-//! between the two members, and export each rank's `JAMMI_GANG_TWO_HOSTS_*`
-//! env below before running this test on each host — see
-//! `docs/maintainer/dev-gpu.md`'s cluster-leg section for the exact steps.
+//! one per host — the RunPod CLUSTER lane, `ci/scripts/runpod_gpu_cluster.sh`,
+//! U7b-A2b). Until a run of that lane has actually happened, or as a
+//! fallback if it is ever unavailable, a maintainer may still drive this leg
+//! BY HAND with `ci/scripts/runpod_lib.sh`'s own cluster primitives
+//! (`rp_cluster_create`/`rp_cluster_get`/`rp_cluster_pods`/`rp_cluster_delete`):
+//! rent a 2×1 cluster, `scp` the 128-byte NCCL id between the two members,
+//! and export each rank's `JAMMI_GANG_TWO_HOSTS_*` env below before running
+//! this test on each host — see `docs/maintainer/dev-gpu.md`'s cluster-leg
+//! section for the exact steps, now the fallback the driver automates.
 //! Both call the SAME [`assert_gang_checks`] helper so the two legs prove the
 //! identical property (rank-ordered sum, unequal-count gather, lockstep
 //! flags, barrier, not-aborted) rather than two hand-maintained copies that
@@ -41,7 +42,8 @@
 //!
 //! The two-host leg is a no-op with none of this env set: without it it
 //! skips loudly (never `#[ignore]`, never a vacuous pass). Whoever runs it —
-//! U7b-A2b's driver once it ships, or a maintainer by hand until then — sets:
+//! U7b-A2b's driver (`ci/scripts/runpod_gpu_cluster.sh`), or a maintainer by
+//! hand as the fallback — sets:
 //!
 //! - `JAMMI_GANG_TWO_HOSTS_RANK` — this process's rank, `0` or `1`.
 //! - `JAMMI_GANG_TWO_HOSTS_WORLD` — must be `2`; any other value is a named
@@ -97,6 +99,8 @@
 // build.
 use crate::harness;
 use crate::skip_without_gpu;
+#[cfg(feature = "cuda")]
+use jammi_ai::fine_tune::collective::Collective;
 
 /// [`harness::serial_cuda_device`], or a hard failure when `JAMMI_REQUIRE_CUDA`
 /// is set and no usable CUDA device opens. Same require-gate idiom as
@@ -216,8 +220,8 @@ fn two_hosts_env_or_require(test: &str) -> Option<TwoHostsEnv> {
             }
             tracing::warn!(
                 "SKIP: no two-host gang env (JAMMI_GANG_TWO_HOSTS_RANK / _WORLD / _ID_FILE / \
-                 JAMMI_GANG_ARTIFACT_DIR set); this leg has no automated driver on this tree \
-                 today (U7b-A2b) and is otherwise run by hand"
+                 JAMMI_GANG_ARTIFACT_DIR set); this leg runs from \
+                 ci/scripts/runpod_gpu_cluster.sh, or by hand as the fallback"
             );
             return None;
         }
@@ -264,11 +268,11 @@ fn two_hosts_env_or_require(test: &str) -> Option<TwoHostsEnv> {
 /// run.
 #[cfg(feature = "cuda")]
 fn assert_gang_checks(
+    call: &jammi_ai::fine_tune::collective::BlockingCall,
     rank: &jammi_ai::fine_tune::collective::nccl::Nccl,
     device: &candle_core::Device,
 ) -> Vec<f32> {
     use candle_core::Tensor;
-    use jammi_ai::fine_tune::collective::Collective;
 
     let r = rank.rank();
     assert_eq!(rank.world(), 2);
@@ -280,7 +284,8 @@ fn assert_gang_checks(
             Tensor::from_vec(vec![1.0 * scale, 2.0 * scale, 3.0 * scale], 3, device)
                 .expect("tensor"),
         ];
-    rank.all_reduce_sum(&mut tensors).expect("all_reduce_sum");
+    rank.all_reduce_sum(call, &mut tensors)
+        .expect("all_reduce_sum");
     let summed = tensors[0].to_vec1::<f32>().expect("read back");
     assert_eq!(
         summed.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
@@ -299,7 +304,7 @@ fn assert_gang_checks(
         Tensor::from_vec(Vec::<f32>::new(), (0, 2), device)
     }
     .expect("tensor");
-    let gathered = rank.all_gather(&local, &counts).expect("all_gather");
+    let gathered = rank.all_gather(call, &local, &counts).expect("all_gather");
     assert_eq!(gathered.dims(), &[2, 2], "rank {r}: gathered shape");
     assert_eq!(
         gathered
@@ -322,18 +327,18 @@ fn assert_gang_checks(
     // runs — the same predicate the hermetic `Noop` and `Local` oracles pin
     // in `fine_tune::collective::tests`.
     let scalar = Tensor::new(1.0f32, device).expect("0-dim scalar");
-    rank.all_gather(&scalar, &[0, 0])
+    rank.all_gather(call, &scalar, &[0, 0])
         .expect_err("a 0-dim tensor has no row count to gather along");
 
     // (3) The lockstep control word: a flag set on ONE rank is seen by both.
     let mine = if r == 1 { 0b100 } else { 0 };
     assert_eq!(
-        rank.all_reduce_max_flags(mine).expect("flags"),
+        rank.all_reduce_max_flags(call, mine).expect("flags"),
         0b100,
         "rank {r}: a flag set on any rank must be seen by all"
     );
 
-    rank.barrier().expect("barrier");
+    rank.barrier(call).expect("barrier");
     assert!(!rank.is_aborted(), "rank {r} must not have aborted");
 
     summed
@@ -390,8 +395,8 @@ fn gang_nccl_reduces_a_known_vector_over_two_devices() {
             .into_iter()
             .zip(devices)
             .map(|(rank, device)| {
-                std::thread::spawn(move || {
-                    assert_gang_checks(&rank, &device);
+                jammi_ai::fine_tune::collective::BlockingCall::spawn_thread(move |call| {
+                    assert_gang_checks(&call, &rank, &device);
                     rank
                 })
             })
@@ -409,8 +414,15 @@ fn gang_nccl_reduces_a_known_vector_over_two_devices() {
             rank.abort();
             rank.abort();
             assert!(rank.is_aborted());
+            let refused = std::thread::scope(|scope| {
+                jammi_ai::fine_tune::collective::BlockingCall::spawn_scoped(scope, |call| {
+                    rank.all_reduce_max_flags(&call, 0).is_err()
+                })
+                .join()
+                .expect("witness thread")
+            });
             assert!(
-                rank.all_reduce_max_flags(0).is_err(),
+                refused,
                 "an aborted communicator must refuse rather than read the garbage buffer \
                  an aborted collective leaves behind"
             );
@@ -640,8 +652,8 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// See the module doc's "The two-host leg's env contract" for the four env
 /// vars this test reads and what an incomplete/malformed one means. Without
 /// them this test skips loudly (never `#[ignore]`) — it is a no-op unless
-/// something sets that env: U7b-A2b's driver once it ships, or a maintainer
-/// running it by hand today (see the module doc's own procedure).
+/// something sets that env: U7b-A2b's driver (`ci/scripts/runpod_gpu_cluster.sh`),
+/// or a maintainer running it by hand as the fallback (module doc procedure).
 #[test]
 fn gang_nccl_two_hosts_reduce_a_known_vector() {
     const TEST: &str = "gang_nccl_two_hosts_reduce_a_known_vector";
@@ -726,7 +738,13 @@ fn gang_nccl_two_hosts_reduce_a_known_vector() {
             let joined = Nccl::from_rank(&device, rank, world, id).unwrap_or_else(|e| {
                 panic!("{TEST}: ncclCommInitRank failed for rank {rank} of {world}: {e}")
             });
-            let reduced = assert_gang_checks(&joined, &device);
+            let reduced = std::thread::scope(|scope| {
+                jammi_ai::fine_tune::collective::BlockingCall::spawn_scoped(scope, |call| {
+                    assert_gang_checks(&call, &joined, &device)
+                })
+                .join()
+                .expect("witness thread")
+            });
             assert!(!joined.is_aborted(), "rank {rank} must not have aborted");
             reduced
         }));

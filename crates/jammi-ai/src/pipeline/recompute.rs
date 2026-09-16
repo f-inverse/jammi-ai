@@ -414,6 +414,14 @@ impl InferenceSession {
                 spec_schema_version,
                 base_model_id: _,
                 world_size: _,
+                // #500 U4b: this run's own gang topology at claim time —
+                // recorded on the descriptor, but not itself an input the
+                // recompute arm (K1: retrain) needs to name, since retrain
+                // resubmits the SAME spec and lets a fresh claim resolve
+                // its OWN worker/gang topology, never replaying the prior
+                // attempt's recorded one.
+                collective: _,
+                local_ranks: _,
             } => {
                 self.recompute_fine_tune(table, &spec_canonical, spec_schema_version)
                     .await

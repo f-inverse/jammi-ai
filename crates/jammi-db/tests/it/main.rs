@@ -1,3 +1,4 @@
+mod assembly_outcome;
 mod audit;
 mod backup_recipe;
 mod bans_names_resolve;

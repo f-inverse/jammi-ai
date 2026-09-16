@@ -29,14 +29,17 @@
 //!   with opposite verdicts.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use jammi_db::error::{JammiError, Result};
 
-use candle_core::{DType, Device, Tensor};
+use candle_core::{Device, Tensor};
 
-use super::{checked_gather_counts, checked_root, Collective};
+use super::{
+    checked_gather_counts, checked_root, BlockingCall, Collective, Descriptor, TensorSignature,
+    Verb,
+};
 
 /// How long a rank waits at a rendezvous before the round is declared failed.
 ///
@@ -63,111 +66,17 @@ enum Contribution {
 }
 
 impl Contribution {
-    /// The operation name — this is [`Descriptor::verb`], so a round in
-    /// which the ranks are executing DIFFERENT collectives is caught by the
-    /// same descriptor-agreement check as every other disagreement, rather
-    /// than by a check of its own.
-    fn kind(&self) -> &'static str {
+    /// The operation — this is [`Descriptor::verb`], so a round in which the
+    /// ranks are executing DIFFERENT collectives is caught by the same
+    /// descriptor-agreement check as every other disagreement, rather than
+    /// by a check of its own.
+    fn kind(&self) -> Verb {
         match self {
-            Self::Gather(_) => "all_gather",
-            Self::ReduceSum(_) => "all_reduce_sum",
-            Self::MaxFlags(_) => "all_reduce_max_flags",
-            Self::Broadcast(_) => "broadcast",
-            Self::Barrier => "barrier",
-        }
-    }
-}
-
-/// One rank's declaration of what a round computes: the verb, and every
-/// per-call argument other than the tensor bytes that determines the round's
-/// result.
-///
-/// `Shared::exchange` publishes a round ONLY once every rank's descriptor for
-/// it is equal (checked by [`Descriptor::agrees_with`]); on any disagreement
-/// the round is never published, and every rank gets a typed error naming
-/// both descriptors instead. This is the ONE place a cross-rank agreement
-/// check lives — no verb's trait method runs its own peer-specific check
-/// outside it.
-#[derive(Clone, Debug, PartialEq)]
-struct Descriptor {
-    /// The operation name — see [`Contribution::kind`].
-    verb: &'static str,
-    /// [`Collective::world`] as this rank sees it.
-    world: usize,
-    /// [`Collective::broadcast`]'s `root`; `None` for every other verb.
-    root: Option<u32>,
-    /// [`Collective::all_gather`]'s full `counts` vector; `None` for every
-    /// other verb.
-    counts: Option<Vec<usize>>,
-    /// One entry per tensor this call carries, in the order the verb defines
-    /// it: `all_gather`'s single `local`, `all_reduce_sum`'s slice in
-    /// canonical order, or `broadcast`'s `t`. Empty for
-    /// `all_reduce_max_flags` and `barrier`, which carry no tensor.
-    tensors: Vec<TensorSignature>,
-}
-
-/// One tensor's shape and dtype, as far as a round's descriptor cares.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TensorSignature {
-    dims: Vec<usize>,
-    dtype: DType,
-}
-
-impl TensorSignature {
-    /// The full shape and dtype of `t`.
-    fn of(t: &Tensor) -> Self {
-        Self {
-            dims: t.dims().to_vec(),
-            dtype: t.dtype(),
-        }
-    }
-
-    /// [`Self::of`] with dim 0 dropped: `all_gather`'s row count is already
-    /// the descriptor's [`Descriptor::counts`] and legitimately differs by
-    /// rank (a zero-row rank, an uneven partition), so only the TRAILING
-    /// shape is a determinant of agreement for a gathered tensor.
-    ///
-    /// Every caller reaches this only after
-    /// [`checked_gather_counts`](super::checked_gather_counts) has already
-    /// refused a 0-dim tensor for this exact call, so `dims` always has at
-    /// least one entry here. This does not fall back to signing an empty
-    /// trailing shape for a shape it cannot honestly sign — a 0-dim tensor
-    /// used to reach this via `unwrap_or_default()` and be signed exactly
-    /// like a 1-D tensor of the same (empty) trailing shape, which was the
-    /// defect.
-    fn of_gather_slice(t: &Tensor) -> Self {
-        let dims = t.dims();
-        let trailing = dims.get(1..).expect(
-            "checked_gather_counts already refused a 0-dim tensor before this call reaches \
-             of_gather_slice",
-        );
-        Self {
-            dims: trailing.to_vec(),
-            dtype: t.dtype(),
-        }
-    }
-}
-
-impl Descriptor {
-    /// `Ok(())` when every field this round's result depends on agrees with
-    /// `other`; `Err(())` on any disagreement.
-    ///
-    /// Delegates to the derived [`PartialEq`] rather than repeating a
-    /// hand-written per-field comparison: [`Descriptor`] carries no field
-    /// that is not itself a determinant of a round's result (a different
-    /// root, a different partition, a different trainable-variable count, a
-    /// differently shaped or typed tensor, or a different world size — see
-    /// the struct's own field docs), so the derive already computes exactly
-    /// the comparison this round needs. A hand-written comparison is exactly
-    /// what a NEW field could be added without — silently exempting it from
-    /// agreement; `agrees_with_matches_derived_equality_over_a_per_field_mutation_sweep`
-    /// destructures [`Descriptor`] field-by-field with no `..`, so a field
-    /// added to the struct without a matching arm there fails to COMPILE.
-    fn agrees_with(&self, other: &Descriptor) -> std::result::Result<(), ()> {
-        if self == other {
-            Ok(())
-        } else {
-            Err(())
+            Self::Gather(_) => Verb::AllGather,
+            Self::ReduceSum(_) => Verb::AllReduceSum,
+            Self::MaxFlags(_) => Verb::AllReduceMaxFlags,
+            Self::Broadcast(_) => Verb::Broadcast,
+            Self::Barrier => Verb::Barrier,
         }
     }
 }
@@ -254,10 +163,10 @@ impl Shared {
     fn exchange(
         &self,
         rank: usize,
-        descriptor: Descriptor,
+        mut descriptor: Descriptor,
         contribution: Contribution,
     ) -> Result<Arc<Vec<Contribution>>> {
-        let kind = descriptor.verb;
+        let kind = descriptor.verb.as_str();
         let deadline = Instant::now() + self.timeout;
         let mut round = self.round.lock().unwrap_or_else(PoisonError::into_inner);
 
@@ -292,6 +201,9 @@ impl Shared {
             return Err(self.fail(&mut round, reason));
         }
         let generation = round.generation;
+        // The round index is a field of the agreed descriptor: stamped here,
+        // under the lock, from the round this rank actually deposits into.
+        descriptor.round = generation;
         round.slots[rank] = Some((generation, descriptor, contribution));
         round.arrived += 1;
 
@@ -330,7 +242,7 @@ impl Shared {
             // trainable-variable count or shape or dtype are all caught
             // here, symmetrically, before the round exists for anyone.
             for (peer, other) in descriptors.iter().enumerate().skip(1) {
-                if descriptors[0].agrees_with(other).is_err() {
+                if !descriptors[0].agrees_with(other) {
                     let reason = format!(
                         "{kind}: rank 0's round descriptor is {:?} but rank {peer}'s is {:?} \
                          — the ranks disagree about what this round computes, so no rank may \
@@ -557,6 +469,7 @@ impl LocalGang {
         Ok(Local {
             rank,
             shared: Arc::clone(&self.shared),
+            agreement: OnceLock::new(),
         })
     }
 }
@@ -566,12 +479,46 @@ impl LocalGang {
 pub struct Local {
     rank: u32,
     shared: Arc<Shared>,
+    /// The caller-bound [`Descriptor::agreement`] this rank signs every
+    /// round with; unset until [`Self::with_agreement`] or
+    /// [`Collective::bind_agreement`] binds one.
+    agreement: OnceLock<String>,
 }
 
 impl Local {
     /// The device this rank trains on.
     pub fn device(&self) -> &Device {
         &self.shared.devices[self.rank as usize]
+    }
+
+    /// Bind the opaque [`Descriptor::agreement`] digest this rank signs
+    /// every round with. Per rank, not per gang: the caller binds it on
+    /// each rank's own handle from what that rank derived, so a rank that
+    /// derived a different digest disagrees at the next round on every
+    /// rank, symmetrically — which is the property the slot exists for.
+    pub fn with_agreement(mut self, digest: impl Into<String>) -> Self {
+        self.agreement = OnceLock::from(digest.into());
+        self
+    }
+
+    /// The descriptor of a round this rank is about to enter.
+    fn descriptor(
+        &self,
+        contribution: &Contribution,
+        root: Option<u32>,
+        counts: Option<Vec<usize>>,
+        tensors: Vec<TensorSignature>,
+    ) -> Descriptor {
+        Descriptor {
+            // Stamped by `Shared::exchange` under the round's lock.
+            round: 0,
+            verb: contribution.kind(),
+            world: self.shared.world,
+            root,
+            counts,
+            tensors,
+            agreement: self.agreement.get().cloned(),
+        }
     }
 
     /// Rank 0's device: the one every reduction folds on, so the fold's
@@ -608,17 +555,16 @@ impl Local {
 }
 
 impl Collective for Local {
-    fn all_gather(&self, local: &Tensor, counts: &[usize]) -> Result<Tensor> {
+    fn all_gather(&self, _call: &BlockingCall, local: &Tensor, counts: &[usize]) -> Result<Tensor> {
         self.guarded("all_gather", || {
             let total = checked_gather_counts(self.rank, self.world(), local, counts)?;
             let contribution = Contribution::Gather(local.clone());
-            let descriptor = Descriptor {
-                verb: contribution.kind(),
-                world: self.shared.world,
-                root: None,
-                counts: Some(counts.to_vec()),
-                tensors: vec![TensorSignature::of_gather_slice(local)],
-            };
+            let descriptor = self.descriptor(
+                &contribution,
+                None,
+                Some(counts.to_vec()),
+                vec![TensorSignature::of_gather_slice(local)],
+            );
             let contributions =
                 self.shared
                     .exchange(self.rank as usize, descriptor, contribution)?;
@@ -673,16 +619,15 @@ impl Collective for Local {
         })
     }
 
-    fn all_reduce_sum(&self, tensors: &mut [Tensor]) -> Result<()> {
+    fn all_reduce_sum(&self, _call: &BlockingCall, tensors: &mut [Tensor]) -> Result<()> {
         self.guarded("all_reduce_sum", || {
             let contribution = Contribution::ReduceSum(tensors.to_vec());
-            let descriptor = Descriptor {
-                verb: contribution.kind(),
-                world: self.shared.world,
-                root: None,
-                counts: None,
-                tensors: tensors.iter().map(TensorSignature::of).collect(),
-            };
+            let descriptor = self.descriptor(
+                &contribution,
+                None,
+                None,
+                tensors.iter().map(TensorSignature::of).collect(),
+            );
             let contributions =
                 self.shared
                     .exchange(self.rank as usize, descriptor, contribution)?;
@@ -721,16 +666,10 @@ impl Collective for Local {
         })
     }
 
-    fn all_reduce_max_flags(&self, flags: u32) -> Result<u32> {
+    fn all_reduce_max_flags(&self, _call: &BlockingCall, flags: u32) -> Result<u32> {
         self.guarded("all_reduce_max_flags", || {
             let contribution = Contribution::MaxFlags(flags);
-            let descriptor = Descriptor {
-                verb: contribution.kind(),
-                world: self.shared.world,
-                root: None,
-                counts: None,
-                tensors: Vec::new(),
-            };
+            let descriptor = self.descriptor(&contribution, None, None, Vec::new());
             let contributions =
                 self.shared
                     .exchange(self.rank as usize, descriptor, contribution)?;
@@ -745,19 +684,14 @@ impl Collective for Local {
         })
     }
 
-    fn broadcast(&self, t: &mut Tensor, root: u32) -> Result<()> {
+    fn broadcast(&self, _call: &BlockingCall, t: &mut Tensor, root: u32) -> Result<()> {
         self.guarded("broadcast", || {
             let root_index = checked_root(self.world(), root)?;
             let descriptor_tensor = TensorSignature::of(t);
             let payload = (self.rank == root).then(|| t.clone());
             let contribution = Contribution::Broadcast(payload);
-            let descriptor = Descriptor {
-                verb: contribution.kind(),
-                world: self.shared.world,
-                root: Some(root),
-                counts: None,
-                tensors: vec![descriptor_tensor],
-            };
+            let descriptor =
+                self.descriptor(&contribution, Some(root), None, vec![descriptor_tensor]);
             let contributions =
                 self.shared
                     .exchange(self.rank as usize, descriptor, contribution)?;
@@ -780,16 +714,10 @@ impl Collective for Local {
         })
     }
 
-    fn barrier(&self) -> Result<()> {
+    fn barrier(&self, _call: &BlockingCall) -> Result<()> {
         self.guarded("barrier", || {
             let contribution = Contribution::Barrier;
-            let descriptor = Descriptor {
-                verb: contribution.kind(),
-                world: self.shared.world,
-                root: None,
-                counts: None,
-                tensors: Vec::new(),
-            };
+            let descriptor = self.descriptor(&contribution, None, None, Vec::new());
             self.shared
                 .exchange(self.rank as usize, descriptor, contribution)?;
             Ok(())
@@ -803,6 +731,10 @@ impl Collective for Local {
     fn world(&self) -> u32 {
         self.shared.world as u32
     }
+
+    fn bind_agreement(&self, digest: String) -> Result<()> {
+        super::bind_agreement_once(&self.agreement, digest)
+    }
 }
 
 /// White-box oracles for the rendezvous state the public API cannot reach on
@@ -810,6 +742,16 @@ impl Collective for Local {
 #[cfg(test)]
 mod rendezvous_state_tests {
     use super::*;
+
+    /// A witness for a test body that runs on the test's own thread — a
+    /// plain OS thread, which is a valid minting site; routed through
+    /// [`BlockingCall::spawn_thread`] so no test reaches the private
+    /// constructor.
+    fn on_this_thread<T: Send + 'static>(f: impl FnOnce(&BlockingCall) -> T + Send + 'static) -> T {
+        BlockingCall::spawn_thread(move |call| f(&call))
+            .join()
+            .expect("witness thread")
+    }
 
     /// The round a rank walks away from holds NOTHING afterwards.
     ///
@@ -823,9 +765,11 @@ mod rendezvous_state_tests {
         let gang =
             LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_millis(50)).expect("gang");
         let rank0 = gang.rank(0).expect("rank 0");
-        rank0
-            .all_reduce_max_flags(0b1011)
-            .expect_err("rank 1 never arrives inside the deadline");
+        on_this_thread(move |call| {
+            rank0
+                .all_reduce_max_flags(call, 0b1011)
+                .expect_err("rank 1 never arrives inside the deadline");
+        });
 
         let round = gang.shared.round.lock().expect("round");
         assert!(
@@ -876,7 +820,7 @@ mod rendezvous_state_tests {
         let rank1 = gang.rank(1).expect("rank 1");
 
         std::thread::scope(|scope| {
-            let parked = scope.spawn(move || rank0.barrier());
+            let parked = BlockingCall::spawn_scoped(scope, move |call| rank0.barrier(&call));
 
             // Wait until rank 0's contribution is in the round, then move the
             // round on without taking that contribution with it.
@@ -890,8 +834,7 @@ mod rendezvous_state_tests {
                 std::thread::yield_now();
             }
 
-            let completing = rank1
-                .barrier()
+            let completing = on_this_thread(move |call| rank1.barrier(call))
                 .expect_err("rank 0's contribution is from the round before this one");
             let message = completing.to_string();
             assert!(
@@ -959,7 +902,7 @@ mod rendezvous_state_tests {
         let rank1 = gang.rank(1).expect("rank 1");
 
         let outcome = std::thread::scope(|scope| {
-            let parked = scope.spawn(move || rank1.barrier());
+            let parked = BlockingCall::spawn_scoped(scope, move |call| rank1.barrier(&call));
 
             // Spin until rank 1 has deposited into the round and is parked
             // waiting for the round to publish — rank 0 never calls in, so
@@ -1044,7 +987,9 @@ mod constructor_verb_tests {
         let rank0 = gang.rank(0).expect("rank 0");
         std::thread::scope(|scope| {
             let local = Tensor::from_vec(vec![1.0f32, 2.0], (1, 2), &Device::Cpu).expect("tensor");
-            let parked = scope.spawn(move || rank0.all_gather(&local, &[1, 1]).map(|_| ()));
+            let parked = BlockingCall::spawn_scoped(scope, move |call| {
+                rank0.all_gather(&call, &local, &[1, 1]).map(|_| ())
+            });
             let verb = loop {
                 let round = gang.shared.round.lock().expect("round");
                 if let Some((_, descriptor, _)) = round.slots[0].as_ref() {
@@ -1054,7 +999,8 @@ mod constructor_verb_tests {
                 std::thread::yield_now();
             };
             assert_eq!(
-                verb, "all_gather",
+                verb,
+                Verb::AllGather,
                 "the all_gather constructor must sign its own verb, never a hardcoded one"
             );
             parked
@@ -1070,10 +1016,10 @@ mod constructor_verb_tests {
             .expect("gang");
         let rank0 = gang.rank(0).expect("rank 0");
         std::thread::scope(|scope| {
-            let parked = scope.spawn(move || {
+            let parked = BlockingCall::spawn_scoped(scope, move |call| {
                 let mut tensors =
                     vec![Tensor::from_vec(vec![1.0f32], 1, &Device::Cpu).expect("tensor")];
-                rank0.all_reduce_sum(&mut tensors)
+                rank0.all_reduce_sum(&call, &mut tensors)
             });
             let verb = loop {
                 let round = gang.shared.round.lock().expect("round");
@@ -1084,7 +1030,8 @@ mod constructor_verb_tests {
                 std::thread::yield_now();
             };
             assert_eq!(
-                verb, "all_reduce_sum",
+                verb,
+                Verb::AllReduceSum,
                 "the all_reduce_sum constructor must sign its own verb, never a hardcoded one"
             );
             parked
@@ -1100,9 +1047,9 @@ mod constructor_verb_tests {
             .expect("gang");
         let rank0 = gang.rank(0).expect("rank 0");
         std::thread::scope(|scope| {
-            let parked = scope.spawn(move || {
+            let parked = BlockingCall::spawn_scoped(scope, move |call| {
                 let mut t = Tensor::from_vec(vec![1.0f32], 1, &Device::Cpu).expect("tensor");
-                rank0.broadcast(&mut t, 0)
+                rank0.broadcast(&call, &mut t, 0)
             });
             let verb = loop {
                 let round = gang.shared.round.lock().expect("round");
@@ -1113,7 +1060,8 @@ mod constructor_verb_tests {
                 std::thread::yield_now();
             };
             assert_eq!(
-                verb, "broadcast",
+                verb,
+                Verb::Broadcast,
                 "the broadcast constructor must sign its own verb, never a hardcoded one"
             );
             parked
@@ -1128,19 +1076,22 @@ mod constructor_verb_tests {
 /// independent determinant of agreement: [`Descriptor::agrees_with`]
 /// delegates to the derived [`PartialEq`], so a mismatch on any one field —
 /// a different root, a different partition, a different trainable-variable
-/// count, a differently shaped or typed tensor, or a different world size —
-/// is a distinct way for two ranks to be handed `Ok` from a round they never
-/// actually agreed on. The sweep test at the end of this module additionally
+/// count, a differently shaped or typed tensor, a different world size, or a
+/// different caller-bound agreement — is a distinct way for two ranks to be
+/// handed `Ok` from a round they never actually agreed on. The sweep test at the end of this module additionally
 /// destructures [`Descriptor`] with no `..`, so a field the struct gains
 /// later without a matching entry there fails to COMPILE rather than
 /// silently going unchecked.
 #[cfg(test)]
 mod descriptor_tests {
+    use candle_core::DType;
+
     use super::*;
 
     fn gather_descriptor(counts: Vec<usize>) -> Descriptor {
         Descriptor {
-            verb: "all_gather",
+            round: 0,
+            verb: Verb::AllGather,
             world: 2,
             root: None,
             counts: Some(counts),
@@ -1148,16 +1099,19 @@ mod descriptor_tests {
                 dims: vec![2],
                 dtype: DType::F32,
             }],
+            agreement: None,
         }
     }
 
     fn reduce_descriptor(tensors: Vec<TensorSignature>) -> Descriptor {
         Descriptor {
-            verb: "all_reduce_sum",
+            round: 0,
+            verb: Verb::AllReduceSum,
             world: 2,
             root: None,
             counts: None,
             tensors,
+            agreement: None,
         }
     }
 
@@ -1167,21 +1121,18 @@ mod descriptor_tests {
     fn identical_descriptors_agree() {
         let a = gather_descriptor(vec![1, 1]);
         let b = gather_descriptor(vec![1, 1]);
-        assert!(
-            a.agrees_with(&b).is_ok(),
-            "identical descriptors must agree"
-        );
+        assert!(a.agrees_with(&b), "identical descriptors must agree");
     }
 
     #[test]
     fn a_verb_mismatch_disagrees() {
         let a = gather_descriptor(vec![1, 1]);
         let b = Descriptor {
-            verb: "barrier",
+            verb: Verb::Barrier,
             ..a.clone()
         };
         assert!(
-            a.agrees_with(&b).is_err(),
+            !a.agrees_with(&b),
             "two ranks running different collectives must never agree"
         );
     }
@@ -1194,7 +1145,7 @@ mod descriptor_tests {
             ..a.clone()
         };
         assert!(
-            a.agrees_with(&b).is_err(),
+            !a.agrees_with(&b),
             "two ranks reporting different world sizes must never agree"
         );
     }
@@ -1202,7 +1153,8 @@ mod descriptor_tests {
     #[test]
     fn a_root_mismatch_disagrees() {
         let a = Descriptor {
-            verb: "broadcast",
+            round: 0,
+            verb: Verb::Broadcast,
             world: 2,
             root: Some(0),
             counts: None,
@@ -1210,13 +1162,14 @@ mod descriptor_tests {
                 dims: vec![1],
                 dtype: DType::F32,
             }],
+            agreement: None,
         };
         let b = Descriptor {
             root: Some(1),
             ..a.clone()
         };
         assert!(
-            a.agrees_with(&b).is_err(),
+            !a.agrees_with(&b),
             "two ranks each naming themselves root must never agree — this is the root field"
         );
     }
@@ -1226,7 +1179,7 @@ mod descriptor_tests {
         let a = gather_descriptor(vec![1, 1]);
         let b = gather_descriptor(vec![1, 2]);
         assert!(
-            a.agrees_with(&b).is_err(),
+            !a.agrees_with(&b),
             "two ranks with different partition vectors must never agree — this is the counts field"
         );
     }
@@ -1239,7 +1192,7 @@ mod descriptor_tests {
         }]);
         let b = reduce_descriptor(vec![]);
         assert!(
-            a.agrees_with(&b).is_err(),
+            !a.agrees_with(&b),
             "two ranks reducing a different number of trainable variables must never agree"
         );
     }
@@ -1255,15 +1208,14 @@ mod descriptor_tests {
             dtype: DType::F32,
         }]);
         assert!(
-            a.agrees_with(&b).is_err(),
+            !a.agrees_with(&b),
             "two ranks reducing a differently shaped tensor at the same index must never agree"
         );
     }
 
-    /// `agrees_with(a, b).is_ok()` must equal `a == b` — trivially true now
-    /// that [`Descriptor::agrees_with`] delegates to the derived
-    /// [`PartialEq`] — over a sweep that mutates ONE field of a base
-    /// descriptor at a time.
+    /// `agrees_with(a, b)` must equal `a == b` — trivially true now that
+    /// [`Descriptor::agrees_with`] delegates to the derived [`PartialEq`] —
+    /// over a sweep that mutates ONE field of a base descriptor at a time.
     ///
     /// The exhaustive destructure below, naming every one of
     /// [`Descriptor`]'s fields with no `..`, is what keeps this sweep
@@ -1275,7 +1227,8 @@ mod descriptor_tests {
     #[test]
     fn agrees_with_matches_derived_equality_over_a_per_field_mutation_sweep() {
         let base = Descriptor {
-            verb: "all_gather",
+            round: 0,
+            verb: Verb::AllGather,
             world: 2,
             root: None,
             counts: Some(vec![1, 1]),
@@ -1283,21 +1236,32 @@ mod descriptor_tests {
                 dims: vec![2],
                 dtype: DType::F32,
             }],
+            agreement: None,
         };
         // A field `Descriptor` gains later, and is not named here, fails
         // THIS destructure to compile — see the test's own doc comment.
         let Descriptor {
+            round: _,
             verb: _,
             world: _,
             root: _,
             counts: _,
             tensors: _,
+            agreement: _,
         } = &base;
 
         let mutations: Vec<Descriptor> = vec![
             base.clone(),
             Descriptor {
-                verb: "barrier",
+                verb: Verb::Barrier,
+                ..base.clone()
+            },
+            Descriptor {
+                agreement: Some("sha256:keys".into()),
+                ..base.clone()
+            },
+            Descriptor {
+                round: base.round + 1,
                 ..base.clone()
             },
             Descriptor {
@@ -1338,7 +1302,7 @@ mod descriptor_tests {
 
         for (index, other) in mutations.iter().enumerate() {
             let derived_equal = base == *other;
-            let agrees = base.agrees_with(other).is_ok();
+            let agrees = base.agrees_with(other);
             assert_eq!(
                 agrees, derived_equal,
                 "mutation {index} ({other:?}): agrees_with says {agrees} but derived equality \
@@ -1346,6 +1310,47 @@ mod descriptor_tests {
                  only diverge if that delegation itself regresses"
             );
         }
+    }
+
+    /// The round index is a determinant of its own: the same declaration in
+    /// a different round never agrees.
+    #[test]
+    fn a_round_mismatch_disagrees() {
+        let a = gather_descriptor(vec![1, 1]);
+        let b = Descriptor {
+            round: a.round + 1,
+            ..a.clone()
+        };
+        assert!(
+            !a.agrees_with(&b),
+            "a contribution from a different round must never agree — this is the round field"
+        );
+    }
+
+    /// The caller-bound agreement slot is a determinant of its own: a rank
+    /// bound to a different digest, or to none at all, disagrees.
+    #[test]
+    fn an_agreement_mismatch_disagrees_including_bound_versus_unbound() {
+        let a = Descriptor {
+            agreement: Some("sha256:a".into()),
+            ..gather_descriptor(vec![1, 1])
+        };
+        let b = Descriptor {
+            agreement: Some("sha256:b".into()),
+            ..a.clone()
+        };
+        let unbound = Descriptor {
+            agreement: None,
+            ..a.clone()
+        };
+        assert!(
+            !a.agrees_with(&b),
+            "two different bound digests must never agree"
+        );
+        assert!(
+            !a.agrees_with(&unbound),
+            "a bound rank and an unbound rank must never agree"
+        );
     }
 
     #[test]
@@ -1359,7 +1364,7 @@ mod descriptor_tests {
             dtype: DType::F64,
         }]);
         assert!(
-            a.agrees_with(&b).is_err(),
+            !a.agrees_with(&b),
             "two ranks reducing a differently typed tensor at the same index must never agree"
         );
     }

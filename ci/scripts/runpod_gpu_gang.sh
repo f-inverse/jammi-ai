@@ -294,6 +294,15 @@ echo "::endgroup::"
 cd /root && rm -rf jammi-ai
 git clone --depth 1 -b "${GIT_REF}" "${GIT_REPO}" jammi-ai 2>&1 | tail -1
 cd jammi-ai
+# The artifact registry's rule (k) checks ANCESTRY on the pod: the pod-leg
+# producer's own shape oracles (gang_pod_leg::synthetic_artifact_tests) run the
+# checker against a written artifact, and the checker asks git whether the
+# epsilon's registration commit precedes the measured tree. A depth-1 clone
+# answers "not an ancestor" for every commit but HEAD, so the history is
+# fetched here WITHOUT blobs (commits and trees only, seconds, no source
+# bytes) — the same blobless shape gpu-dev.sh's seed clone uses.
+git fetch --quiet --filter=blob:none --unshallow origin \
+  || { echo "::error::could not deepen the pod's clone (blobless --unshallow failed) — the registry's ancestry rule cannot run on a depth-1 history" >&2; exit 1; }
 echo "PROVE_SHA=\$(git rev-parse HEAD)"
 rc=0
 # The vendored FlashAttention-2 build needs the CUTLASS submodule; a shallow

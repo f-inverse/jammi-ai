@@ -38,6 +38,7 @@ use super::{EmbeddingLoss, FineTuneConfig};
 /// materialised table's manifest), and `train_count` is
 /// `super::data::split_index` applied to it, the SAME arithmetic
 /// [`TrainingDataLoader::split`] uses over an already-resident row count.
+#[derive(Clone)]
 pub struct StreamedSet {
     pub(crate) session: Arc<InferenceSession>,
     pub(crate) table: TrainingSetTable,
@@ -98,6 +99,20 @@ impl StreamedSet {
 pub enum TrainingSource {
     Resident(TrainingDataLoader),
     Streamed(Box<StreamedSet>),
+}
+
+impl TrainingSource {
+    /// The same source for ANOTHER rank of an in-process gang
+    /// (`worker.rs`'s local fan-out): a `Resident` loader is replicated
+    /// over the same rows ([`TrainingDataLoader::replicate`]); a `Streamed`
+    /// set is cloned — every rank opens its own per-epoch stream over the
+    /// same committed table and window.
+    pub(crate) fn replicate(&self) -> Self {
+        match self {
+            Self::Resident(loader) => Self::Resident(loader.replicate()),
+            Self::Streamed(streamed) => Self::Streamed(streamed.clone()),
+        }
+    }
 }
 
 /// The two whole-table training arms a [`StreamedSet`] is exempted from

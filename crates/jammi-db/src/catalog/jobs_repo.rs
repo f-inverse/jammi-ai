@@ -162,11 +162,9 @@ pub struct JobRecord {
     pub training_set_ref: Option<String>,
     /// The `result_tables` NAME the coordinator
     /// materialized the training set under — the one coordinate a rank
-    /// resolves with a single tenant-pinned lookup. The strict-predicate
-    /// resolver that once backed that lookup (`get_result_table_for_tenant`)
-    /// is `HostAdmission`'s to rebuild from the filed property
-    /// (<https://github.com/f-inverse/jammi-ai/issues/566>), not parked code
-    /// in this crate. See [`Self::training_set_ref`]'s pairing note.
+    /// resolves with a single tenant-pinned lookup, the strict resolver
+    /// [`Catalog::get_result_table_for_tenant`] under the job's own
+    /// `tenant_id`. See [`Self::training_set_ref`]'s pairing note.
     pub training_set_location: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -200,26 +198,190 @@ pub enum TrainingSetFillOutcome {
     Aborted,
 }
 
+/// The coordinator's call-site wrapper of [`TrainingSetFillOutcome`], named
+/// in DESIGN.md § 4's own vocabulary ("the coordinator materializes or
+/// reuses the training set") — see
+/// [`Catalog::materialize_or_reuse_training_set`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrainingSetAssembly {
+    /// This call's own values won the write-once CAS.
+    Won,
+    /// A pair already existed, set to the SAME values this call passed — a
+    /// concurrent racer or a retry observing its own would-be write.
+    Reused,
+    /// The claim moved (a different claimant/attempt now holds the row, or
+    /// an existing pair holds DIFFERENT values) between this call being
+    /// issued and its CAS running — NO write happened. The coordinator that
+    /// issued this call is no longer the row's current attempt and must
+    /// abandon assembly rather than proceed under a pair it does not
+    /// actually own.
+    Moved,
+}
+
+/// The closed set of reasons a coordinator's ASSEMBLY attempt (membership →
+/// dispatch, DESIGN.md § 4) did not proceed to a run, each carrying its own
+/// cooldown/counting rule
+/// (`docs/plans/67-distributed-training/UNITS.md` § U5b-1b-ii). A new
+/// variant with no rule is a COMPILE error — `AssemblyOutcome::effect`
+/// matches every variant explicitly, never a wildcard arm.
+///
+/// The rule, by variant (see `AssemblyEffect`):
+///
+/// - [`Self::Refuted`] / [`Self::AllRootDivergent`] — a genuine, terminal-
+///   looking refusal of THIS attempt: counted AND cooled down.
+/// - [`Self::Unavailable`] / [`Self::StoreUnavailable`] / [`Self::ShortListed`]
+///   — a member-scoped or transient condition (OPS D10): cooled down so the
+///   next attempt does not immediately repeat the same failed dispatch, but
+///   NOT counted — the job itself did nothing wrong.
+/// - [`Self::NoBody`] / [`Self::Drain`] / [`Self::Cancelled`] — assembly
+///   never actually ran (no coordinator body to dispatch to, a draining
+///   host, an external cancel): NEITHER counted nor cooled down, since no
+///   assembly ATTEMPT happened at all.
+/// - [`Self::Success`] — assembly proceeded: RESETS both the counter and
+///   the cooldown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssemblyOutcome {
+    /// The coordinator's own row was refuted at re-verification.
+    Refuted,
+    /// Every listed member's result-root identity diverged from the
+    /// coordinator's own (U5b-1a-A2's root predicate): no admissible member
+    /// existed for this attempt at all.
+    AllRootDivergent,
+    /// A member the listing named answered unavailable/unreachable at
+    /// dispatch.
+    Unavailable,
+    /// The shared object store this attempt's training set would
+    /// materialize into was itself unavailable.
+    StoreUnavailable,
+    /// Fewer members answered than `world_size - 1` requires.
+    ShortListed,
+    /// No coordinator body exists to run this attempt at all.
+    NoBody,
+    /// The host is draining (68 OPS) and refuses new assembly.
+    Drain,
+    /// The job was cancelled before assembly completed.
+    Cancelled,
+    /// Assembly proceeded to a run.
+    Success,
+}
+
+/// The effect class `AssemblyOutcome::effect` maps every variant onto — a
+/// proper enum, not a `(bool, bool)` pair, so "counted but not cooled down"
+/// (a combination the design never calls for) is not even representable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssemblyEffect {
+    /// Neither counted nor cooled down — the counter and cooldown columns
+    /// are left exactly as they were.
+    Neither,
+    /// Cooled down (a fresh `next_assembly_after`, on the current counter
+    /// value), NOT counted.
+    CooldownOnly,
+    /// Cooled down AND counted: `assembly_failures` bumps by one, and the
+    /// fresh cooldown is computed on the NEW (post-bump) count.
+    CooldownAndCounted,
+    /// Success: both columns reset (`assembly_failures = 0`,
+    /// `next_assembly_after = NULL`).
+    Reset,
+}
+
+impl AssemblyOutcome {
+    /// Whether this outcome COUNTS toward `assembly_failures` — the
+    /// terminal-refusal class ([`Self::Refuted`], [`Self::AllRootDivergent`]),
+    /// which the coordinator leaves for reclaim on its lease (an attempt
+    /// spent), as opposed to every other outcome, which costs the job no
+    /// attempt (the coordinator hands its lease back at once, OPS D10).
+    /// Derived from `Self::effect` — never a second table.
+    pub fn counts_toward_failures(self) -> bool {
+        self.effect() == AssemblyEffect::CooldownAndCounted
+    }
+
+    fn effect(self) -> AssemblyEffect {
+        match self {
+            Self::Refuted | Self::AllRootDivergent => AssemblyEffect::CooldownAndCounted,
+            Self::Unavailable | Self::StoreUnavailable | Self::ShortListed => {
+                AssemblyEffect::CooldownOnly
+            }
+            Self::NoBody | Self::Drain | Self::Cancelled => AssemblyEffect::Neither,
+            Self::Success => AssemblyEffect::Reset,
+        }
+    }
+}
+
+/// Bounded exponential backoff on a count of COUNTED assembly failures:
+/// `BASE * 2^min(failures, CLAMP_EXPONENT)`, capped at [`CEILING`] — the
+/// clamp on the exponent guards the `u32` shift against overflow
+/// regardless of how large `failures` grows (an 8-bit exponent already
+/// saturates the ceiling: `2s * 2^8 = 512s > 300s`), and the final `.min`
+/// pins the documented ceiling exactly: no cooldown this function computes
+/// ever exceeds five minutes, however many counted failures accumulate.
+const ASSEMBLY_BACKOFF_BASE: Duration = Duration::from_secs(2);
+const ASSEMBLY_BACKOFF_CLAMP_EXPONENT: u32 = 8;
+/// The documented backoff ceiling: five minutes.
+const ASSEMBLY_BACKOFF_CEILING: Duration = Duration::from_secs(300);
+
+fn assembly_backoff(failures: u32) -> Duration {
+    let exponent = failures.min(ASSEMBLY_BACKOFF_CLAMP_EXPONENT);
+    let multiplier = 1u32
+        .checked_shl(exponent)
+        .expect("exponent clamped to ASSEMBLY_BACKOFF_CLAMP_EXPONENT, always < 32");
+    ASSEMBLY_BACKOFF_BASE
+        .saturating_mul(multiplier)
+        .min(ASSEMBLY_BACKOFF_CEILING)
+}
+
 /// The row [`Catalog::get_job_for_rank`] returns — every field the I-GANG
 /// row predicate needs (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A1),
-/// computed in ONE statement. No `tenant_id` column: the `world_size == 1`
-/// I-GANG lattice this unit ships derives no determinant from tenant at all
-/// (`status`/`claimed_by`/`attempts`/`lease_live`/`world_size` are the whole
-/// predicate) — a caller that DOES need the row's tenant (e.g. a future
-/// tenant-scoped sidecar lookup) reads it from [`Catalog::get_job`], never
-/// from this row.
+/// computed in ONE statement, plus the three row facts the `world_size > 1`
+/// conjunct reads ([`Self::tenant_id`], [`Self::training_set_ref`],
+/// [`Self::training_set_location`]). Every column decode here is
+/// INFALLIBLE by construction — `tenant_id` is carried as the row's raw
+/// text, never parsed here (see that field) — so `Err` from
+/// `get_job_for_rank` means the read itself faulted, never that this
+/// row's content failed to decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RankAdmissionRow {
     pub status: String,
     pub claimed_by: Option<String>,
     pub attempts: u32,
-    /// `NOT(lease_expired_clause)`, computed against the SAME clock
-    /// [`super::lease::lease_remaining_seconds_expr`] used for
-    /// [`Self::remaining`] — `false` for a `NULL` lease column (no
-    /// live-by-default), matching `lease.rs`'s own stated semantics.
-    pub lease_live: bool,
-    /// The remaining lease window, floored at zero once expired (or absent).
-    pub remaining: Duration,
+    /// The `jobs.tenant_id` column's raw text (`None` for a job submitted
+    /// outside any tenant binding — a GLOBAL job). Carried as TEXT, never
+    /// parsed into a [`crate::TenantId`] here, so a value that does not
+    /// parse is a ROW FACT the caller (the gang admission handler) refuses,
+    /// exactly like an undecodable `world_size` — never an `Err` from the
+    /// read that found it. The caller pins every training-set read to the
+    /// tenant this text names (I-GANG: tenant is derived from the row, never
+    /// accepted from the caller) through the strict resolver
+    /// [`Catalog::get_result_table_for_tenant`].
+    pub tenant_id: Option<String>,
+    /// [`JobRecord::training_set_ref`] as it stands on the row — the
+    /// `ArtifactDigest` the coordinator's write-once CAS
+    /// ([`Catalog::fill_training_set_identity`]) recorded, `None` until
+    /// filled. Read only for a `world_size > 1` row; paired with
+    /// [`Self::training_set_location`] at the schema edge (migration 034's
+    /// `CHECK`), so the two are `Some` together or `None` together.
+    pub training_set_ref: Option<String>,
+    /// [`JobRecord::training_set_location`] as it stands on the row — the
+    /// `result_tables` NAME a rank resolves with ONE strict tenant-pinned
+    /// lookup ([`Catalog::get_result_table_for_tenant`]) under
+    /// [`Self::tenant_id`], then verifies against the sidecar manifest's
+    /// `artifact` digest (must equal [`Self::training_set_ref`]).
+    pub training_set_location: Option<String>,
+    /// [`super::lease::LeaseFact`], decoded in RUST from `lease_expires_at`'s
+    /// raw stored text (never a SQL-side `col::timestamptz` cast) via
+    /// [`super::lease::decode_lease_expires_at`] — infallible by
+    /// construction on EITHER backend, exactly like [`Self::world_size`]:
+    /// text that does not parse is [`super::lease::LeaseFact::Undecodable`],
+    /// a ROW FACT the caller refuses, never a fault of the read that found
+    /// it (the resolution of
+    /// <https://github.com/f-inverse/jammi-ai/issues/574>).
+    pub lease: super::lease::LeaseFact,
+    /// The row's `spec` column VERBATIM — the same JSON the claiming worker
+    /// reconstructs its run from, and what an admitted member's rank body
+    /// reconstructs ITS run from (`jammi-ai`'s `run_member_rank`): the
+    /// job's training spec is a row fact a member reads through the
+    /// admission it was granted, never a value the coordinator sends on the
+    /// wire (DESIGN.md §4: no URL and no spec travels in the `Assign`).
+    pub spec: String,
     /// The ROW's own rank count, decoded from the SAME `spec` JSON the
     /// claiming worker reconstructs its run from — never the caller's own
     /// `Assign.world`. A gang admission gate keyed on the caller's claim
@@ -241,11 +403,11 @@ pub struct RankAdmissionRow {
     /// about the content this claimant wrote, never a fault of the read that
     /// found it: [`Catalog::get_job_for_rank`] still returns `Ok(Some(row))`
     /// with every other column populated, and the caller (the gang admission
-    /// handler) decides how to refuse it. `Err` from `get_job_for_rank`
-    /// means the read itself faulted, never that this row's `spec` failed to
-    /// decode; a malformed `lease_expires_at` is still re-parsed in SQL on
-    /// Postgres and surfaces there as `Err` (tracked at
-    /// <https://github.com/f-inverse/jammi-ai/issues/574>).
+    /// handler) decides how to refuse it. `Err` from `get_job_for_rank` means
+    /// the read itself faulted — never that this row's `spec` failed to
+    /// decode a `world_size`, and never (since
+    /// <https://github.com/f-inverse/jammi-ai/issues/574>) that this row's
+    /// `lease_expires_at` failed to decode a lease: see [`Self::lease`].
     pub world_size: WorldSizeFact,
 }
 
@@ -902,16 +1064,29 @@ impl Catalog {
         let kind_in = kind_placeholders.join(", ");
         params.push(SqlValue::TextOwned(queued_execution));
         let execution_bind = params.len();
+        // The cooldown term (migration 037's `jobs.next_assembly_after`):
+        // in the CANDIDATE subselect only, never the outer CAS `UPDATE`'s
+        // own guard, so a job cooling down after a non-proceeding assembly
+        // outcome is simply never a candidate a higher-priority row could
+        // block a lower-priority ready one behind — the ORDER BY / LIMIT 1
+        // never even considers it. `lease_expired_clause` is reused
+        // VERBATIM (never a second clock helper, never a new stored
+        // representation): "the deadline is absent or has passed" is
+        // exactly the same predicate for a cooldown as for a lease, on the
+        // SAME backend clock the lease columns use (`super::lease`'s
+        // module docs) — no bind at all on Postgres, so a skewed calling
+        // process's clock cannot affect that arm.
+        let cooldown_clause = lease_expired_clause("next_assembly_after", kind, &mut params);
 
         let candidate = match kind {
             BackendKind::Postgres => format!(
                 "(SELECT job_id FROM jobs WHERE status = $3 AND execution = ${execution_bind} \
-                  AND claimable AND kind IN ({kind_in}) \
+                  AND claimable AND kind IN ({kind_in}) AND {cooldown_clause} \
                   ORDER BY priority DESC, created_at LIMIT 1 FOR UPDATE SKIP LOCKED)"
             ),
             BackendKind::Sqlite => format!(
                 "(SELECT job_id FROM jobs WHERE status = $3 AND execution = ${execution_bind} \
-                  AND claimable AND kind IN ({kind_in}) \
+                  AND claimable AND kind IN ({kind_in}) AND {cooldown_clause} \
                   ORDER BY priority DESC, created_at LIMIT 1)"
             ),
         };
@@ -1976,38 +2151,177 @@ impl Catalog {
             .await?)
     }
 
+    /// The coordinator's call site into [`Self::fill_training_set_identity`]
+    /// — DESIGN.md § 4's own vocabulary ("the coordinator materializes or
+    /// reuses the training set"), returned as [`TrainingSetAssembly`] rather
+    /// than the lower-level [`TrainingSetFillOutcome`] so the coordinator's
+    /// own call site never has to re-derive "moved" from "aborted".
+    ///
+    /// This crate ships the verb and its own oracle here; the production
+    /// caller is the coordinator body (`jammi-ai`'s `fine_tune/worker.rs`,
+    /// U5b-1b-i / U5a-2) — DEFERRED, not built in this crate.
+    pub async fn materialize_or_reuse_training_set(
+        &self,
+        job_id: &str,
+        claimed_by: &str,
+        attempts: u32,
+        training_set_ref: &str,
+        training_set_location: &str,
+    ) -> Result<TrainingSetAssembly> {
+        Ok(
+            match self
+                .fill_training_set_identity(
+                    job_id,
+                    claimed_by,
+                    attempts,
+                    training_set_ref,
+                    training_set_location,
+                )
+                .await?
+            {
+                TrainingSetFillOutcome::Filled => TrainingSetAssembly::Won,
+                TrainingSetFillOutcome::Reused => TrainingSetAssembly::Reused,
+                TrainingSetFillOutcome::Aborted => TrainingSetAssembly::Moved,
+            },
+        )
+    }
+
+    /// Apply `AssemblyOutcome::effect`'s rule to `job_id`'s attempt
+    /// `attempt`, in ONE `UPDATE`: `assembly_failures` bumps by one only for
+    /// `AssemblyEffect::CooldownAndCounted` reasons, `next_assembly_after`
+    /// is stamped `now + backoff(k)` (`k` the NEW, post-bump count for a
+    /// counted reason, the UNCHANGED current count for a cooldown-only
+    /// reason) for every reason that carries a cooldown at all, and a
+    /// [`AssemblyOutcome::Success`] resets both columns — always on the
+    /// BACKEND's own clock (`super::lease::lease_deadline_expr`, never a
+    /// bound application timestamp on Postgres).
+    ///
+    /// A guard read (`SELECT … WHERE job_id = $1 AND attempts = $2`,
+    /// row-locked on Postgres via `FOR UPDATE` — SQLite is already
+    /// serialized for the whole transaction under `BEGIN IMMEDIATE`) learns
+    /// the CURRENT `assembly_failures` count before the one `UPDATE` writes
+    /// it (never a second, independent write): a moved claim — `attempt` no
+    /// longer names the row's current attempt, or the job is gone — is
+    /// caught here and the call returns `Ok(false)` with NO write at all,
+    /// the exact "moved claim aborts with no write" shape
+    /// [`Self::fill_training_set_identity`]'s own CAS uses.
+    ///
+    /// Returns `true` when the guarded row was found and updated, `false`
+    /// when the attempt had already moved.
+    pub async fn record_assembly_outcome(
+        &self,
+        job_id: &str,
+        attempt: u32,
+        outcome: AssemblyOutcome,
+    ) -> Result<bool> {
+        let job_id = job_id.to_string();
+        let attempt_i = attempt as i64;
+        let now = now_sortable();
+        let kind = self.backend().backend_kind();
+        let effect = outcome.effect();
+
+        self.backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    let select_sql = match kind {
+                        BackendKind::Postgres => {
+                            "SELECT assembly_failures FROM jobs \
+                             WHERE job_id = $1 AND attempts = $2 FOR UPDATE"
+                        }
+                        BackendKind::Sqlite => {
+                            "SELECT assembly_failures FROM jobs \
+                             WHERE job_id = $1 AND attempts = $2"
+                        }
+                    };
+                    let current: Option<i32> = tx
+                        .query_opt(
+                            select_sql,
+                            &[
+                                SqlValue::TextOwned(job_id.clone()),
+                                SqlValue::Int(attempt_i),
+                            ],
+                            |row| row.get::<i32>("assembly_failures"),
+                        )
+                        .await?;
+                    let Some(current) = current else {
+                        // The attempt already moved (or the job never
+                        // existed): no write, matching the CAS's own
+                        // "moved claim aborts with no write" shape.
+                        return Ok(false);
+                    };
+
+                    let new_failures: i32 = match effect {
+                        AssemblyEffect::CooldownAndCounted => current.saturating_add(1),
+                        AssemblyEffect::CooldownOnly | AssemblyEffect::Neither => current,
+                        AssemblyEffect::Reset => 0,
+                    };
+
+                    let mut params: Vec<SqlValue<'static>> =
+                        vec![SqlValue::Int(i64::from(new_failures))];
+                    let failures_bind = params.len();
+                    let cooldown_expr = match effect {
+                        AssemblyEffect::Neither | AssemblyEffect::Reset => "NULL".to_string(),
+                        AssemblyEffect::CooldownOnly | AssemblyEffect::CooldownAndCounted => {
+                            let backoff =
+                                assembly_backoff(u32::try_from(new_failures).unwrap_or(u32::MAX));
+                            lease_deadline_expr(kind, backoff, &mut params)
+                        }
+                    };
+                    params.push(SqlValue::TextOwned(now));
+                    let updated_at_bind = params.len();
+                    params.push(SqlValue::TextOwned(job_id));
+                    let job_id_bind = params.len();
+                    params.push(SqlValue::Int(attempt_i));
+                    let attempt_bind = params.len();
+                    let sql = format!(
+                        "UPDATE jobs SET assembly_failures = ${failures_bind}, \
+                             next_assembly_after = {cooldown_expr}, \
+                             updated_at = ${updated_at_bind} \
+                         WHERE job_id = ${job_id_bind} AND attempts = ${attempt_bind}"
+                    );
+                    let n = tx.execute(&sql, &params).await?;
+                    Ok(n == 1)
+                })
+            })
+            .await
+            .map_err(Into::into)
+    }
+
     /// The row `GangService::run_rank`'s I-GANG row predicate reads
     /// (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A1; `GangService` is a
     /// `jammi-server` type this crate has no visibility into — named here
     /// only in prose, never as an intra-doc link).
     /// Primary-key only (`WHERE job_id = $1`) — no tenant
     /// predicate, never [`TenantBinding::is_admin_scope`] (this method does
-    /// not consult it at all, and returns no `tenant_id` column either: the
-    /// `world_size == 1` I-GANG lattice this unit ships derives no
-    /// determinant from tenant at all, per
-    /// `docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P3) — "tenant is
-    /// derived, never accepted" — a caller that DOES need the row's tenant
-    /// reads it from [`Catalog::get_job`], never from this row).
-    /// ONE statement: the row's `status`/`claimed_by`/`attempts`
-    /// alongside [`super::lease::lease_remaining_seconds_expr`]'s computed
-    /// remaining window, from which [`RankAdmissionRow::lease_live`] is
-    /// derived — never a second round trip, and never the caller's OWN
-    /// clock standing in for the remaining-window computation (see that
-    /// function's docs). `Ok(None)` when no such job exists. `Err` means the
-    /// read itself faulted, or — on Postgres only — that the row's
-    /// `lease_expires_at` text did not parse as a timestamp (tracked at
-    /// <https://github.com/f-inverse/jammi-ai/issues/574>); never that the
-    /// row's `spec` failed to decode a `world_size`: that outcome is a ROW
-    /// FACT, represented in
-    /// [`RankAdmissionRow::world_size`] as [`WorldSizeFact::Undecodable`],
-    /// and still returned `Ok(Some(row))` with every other column populated
-    /// (see that type's docs).
+    /// not consult it at all). The row's OWN `tenant_id` comes back as raw
+    /// text ([`RankAdmissionRow::tenant_id`]) for the CALLER to derive and
+    /// pin — "tenant is derived, never accepted"
+    /// (`docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P3)) — together with
+    /// the training-set identity pair the `world_size > 1` conjunct
+    /// resolves under that tenant.
+    /// ONE statement: the row's `status`/`claimed_by`/`attempts`/`spec`/
+    /// `tenant_id`/training-set pair, alongside `lease_expires_at`'s RAW
+    /// stored text — no SQL-side `col::timestamptz` cast or `EXTRACT(...)`
+    /// here, unlike the CLAIM/RECLAIM path's
+    /// [`super::lease::lease_expired_clause`] /
+    /// [`super::lease::lease_remaining_seconds_expr`]. The text is decoded in
+    /// RUST, after the read, via [`super::lease::decode_lease_expires_at`]
+    /// into [`RankAdmissionRow::lease`] — never a second round trip. `Ok(None)`
+    /// when no such job exists. `Err` means the READ ITSELF faulted — never
+    /// that a row's content failed to decode: neither `spec` failing to
+    /// decode a `world_size` ([`RankAdmissionRow::world_size`] as
+    /// [`WorldSizeFact::Undecodable`]) nor (since
+    /// <https://github.com/f-inverse/jammi-ai/issues/574>) `lease_expires_at`
+    /// failing to parse ([`RankAdmissionRow::lease`] as
+    /// [`super::lease::LeaseFact::Undecodable`]) is ever conflated with the
+    /// read faulting — both are returned `Ok(Some(row))` with every other
+    /// column populated (see each type's docs).
     ///
     /// This method decides NOTHING beyond that lookup — it is a plain
     /// row-by-primary-key read, never itself the I-GANG decider. Every
     /// determinant the returned [`RankAdmissionRow`] feeds (`status`,
-    /// `claimed_by`, `attempts`, `lease_live`, and — critically —
-    /// [`RankAdmissionRow::world_size`], the ROW's own rank count, never a
+    /// `claimed_by`, `attempts`, [`RankAdmissionRow::lease`], and — critically
+    /// — [`RankAdmissionRow::world_size`], the ROW's own rank count, never a
     /// caller-supplied `Assign.world`) is decided by the caller
     /// (`GangService::run_rank`, the gang admission handler). A gate keyed
     /// on the caller's own claim about `world` rather than this field's
@@ -2030,38 +2344,29 @@ impl Catalog {
                 },
                 |tx| {
                     Box::pin(async move {
-                        let mut params: Vec<SqlValue<'static>> = Vec::new();
-                        let remaining_expr = super::lease::lease_remaining_seconds_expr(
-                            "lease_expires_at",
-                            kind,
-                            &mut params,
-                        );
-                        params.push(SqlValue::TextOwned(job_id));
-                        let job_bind = params.len();
-                        let sql = format!(
-                            "SELECT status, claimed_by, attempts, spec, \
-                                 {remaining_expr} AS remaining_secs \
-                             FROM jobs WHERE job_id = ${job_bind}"
-                        );
-                        tx.query_opt(&sql, &params, |row| {
+                        let params: Vec<SqlValue<'static>> = vec![SqlValue::TextOwned(job_id)];
+                        let sql = "SELECT status, claimed_by, attempts, spec, tenant_id, \
+                                 training_set_ref, training_set_location, lease_expires_at \
+                             FROM jobs WHERE job_id = $1";
+                        tx.query_opt(sql, &params, |row| {
                             let spec: String = row.get("spec")?;
                             let world_size = world_size_from_spec_json(&spec);
-                            let remaining_secs: Option<f64> = row.try_get("remaining_secs")?;
-                            // NULL (no lease) is treated exactly like an
-                            // expired one -- zero remaining, never live --
-                            // matching `lease_expired_clause`'s own `col IS
-                            // NULL` arm (`lease.rs`'s module docs: NULL means
-                            // remaining 0, never live-by-default).
-                            let remaining = remaining_secs
-                                .map(|s| Duration::from_secs_f64(s.max(0.0)))
-                                .unwrap_or(Duration::ZERO);
-                            let lease_live = remaining_secs.is_some_and(|s| s >= 0.0);
+                            let lease_expires_at: Option<String> =
+                                row.try_get("lease_expires_at")?;
+                            let lease = super::lease::decode_lease_expires_at(
+                                kind,
+                                lease_expires_at.as_deref(),
+                                super::lease::app_clock_now(),
+                            );
                             Ok(RankAdmissionRow {
                                 status: row.get("status")?,
                                 claimed_by: row.try_get("claimed_by")?,
                                 attempts: row.get::<i32>("attempts")? as u32,
-                                lease_live,
-                                remaining,
+                                tenant_id: row.try_get("tenant_id")?,
+                                training_set_ref: row.try_get("training_set_ref")?,
+                                training_set_location: row.try_get("training_set_location")?,
+                                spec,
+                                lease,
                                 world_size,
                             })
                         })
@@ -2210,14 +2515,25 @@ impl Catalog {
     /// present, and last seen within [`super::lease::instance_liveness_margin`]
     /// (`2 * lease`) on the DB clock? Primary-key lookup; `instances` carries
     /// no tenant column, so there is no tenant predicate to drop or keep.
-    /// `false` for an absent OR a stale row alike — the caller (a gang rank
-    /// checking its coordinator) maps either to the same member-scoped
-    /// `FailedPrecondition`, disclosing nothing about which.
+    /// `false` for an absent, a malformed, OR a stale row alike — the caller
+    /// (a gang rank checking its coordinator) maps every one to the same
+    /// member-scoped `FailedPrecondition`, disclosing nothing about which.
+    /// `last_seen_at`'s raw stored text is decoded in RUST
+    /// ([`super::lease::last_seen_at_is_fresh`]) — never a SQL-side
+    /// `col::timestamptz` cast — so a malformed value never faults the read
+    /// (the resolution of
+    /// <https://github.com/f-inverse/jammi-ai/issues/574> for this column);
+    /// this column is ALWAYS an application-clock stamp on either backend
+    /// (`Catalog::upsert_instance` / `Catalog::reregister_instance` /
+    /// `Catalog::touch_instance` never write the database clock here), so
+    /// the decode needs no [`BackendKind`] at
+    /// all.
     pub async fn fresh_instance(&self, instance_id: &str, lease: Duration) -> Result<bool> {
         let instance_id = instance_id.to_string();
-        let kind = self.backend().backend_kind();
         let margin = instance_liveness_margin(lease);
-        Ok(self
+        // `last_seen_at TEXT NOT NULL` (`schema.rs`) — a present row always
+        // carries SOME text; an absent row is the only `None` here.
+        let last_seen_at: Option<String> = self
             .backend()
             .transaction(
                 TxOptions {
@@ -2226,21 +2542,22 @@ impl Catalog {
                 },
                 |tx| {
                     Box::pin(async move {
-                        let mut params: Vec<SqlValue<'static>> = Vec::new();
-                        let stale = stale_before_clause("last_seen_at", kind, margin, &mut params);
-                        params.push(SqlValue::TextOwned(instance_id));
-                        let id_bind = params.len();
-                        let sql = format!(
-                            "SELECT 1 AS present FROM instances \
-                             WHERE instance_id = ${id_bind} AND NOT ({stale})"
-                        );
-                        tx.query_opt(&sql, &params, |row| row.get::<i32>("present"))
-                            .await
+                        let sql = "SELECT last_seen_at FROM instances WHERE instance_id = $1";
+                        tx.query_opt(sql, &[SqlValue::TextOwned(instance_id)], |row| {
+                            row.get::<String>("last_seen_at")
+                        })
+                        .await
                     })
                 },
             )
-            .await?
-            .is_some())
+            .await?;
+        Ok(last_seen_at.is_some_and(|last_seen_at| {
+            super::lease::last_seen_at_is_fresh(
+                &last_seen_at,
+                margin,
+                super::lease::app_clock_now(),
+            )
+        }))
     }
 
     /// The ONE by-id peer-address resolution verb (DESIGN.md § 4): `Some`

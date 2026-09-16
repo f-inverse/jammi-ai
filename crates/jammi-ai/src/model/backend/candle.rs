@@ -2930,6 +2930,7 @@ impl ModelBackend for CandleBackend {
                 // Inference path: the seeded init is immediately overwritten by
                 // the loaded adapter weights, so the seed is never observed.
                 seed: 0,
+                dropout_seed: 0,
             },
             _ => jammi_lora::LoraBuildConfig::frozen(),
         };

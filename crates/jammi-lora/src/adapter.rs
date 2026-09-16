@@ -206,6 +206,7 @@ mod tests {
                 rank_pattern: &self.rank_pattern,
                 init_mode: crate::init::LoraInitMode::default(),
                 seed: 7,
+                dropout_seed: 7,
             }
         }
     }

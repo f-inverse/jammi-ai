@@ -380,6 +380,7 @@ fn loading_the_same_adapter_twice_into_one_varmap_is_not_a_collision() {
         rank_pattern: &rank_pattern,
         init_mode: LoraInitMode::Gaussian,
         seed: 11,
+        dropout_seed: 11,
     };
     save_adapter(
         dir.path(),

@@ -245,6 +245,7 @@ fn build_distilbert_with_lora_on_biased_sites(
         rank_pattern: &empty_pattern,
         init_mode,
         seed,
+        dropout_seed: seed,
     };
     DistilBert::builder()
         .pooling(Pooling::Mean)

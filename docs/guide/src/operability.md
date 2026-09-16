@@ -139,7 +139,7 @@ full `[server.limits]` reference and every default.
 
 | Knob | Refusal | `reason` label | Notes |
 |------|---------|-----------------|-------|
-| `max_message_bytes` (default 64 MiB) | `OUT_OF_RANGE` | `message_size` | Enforced by tonic's own per-service codec (`max_decoding_message_size`), below the refusal-counting layer stack — verified against the vendored tonic 0.14.5 source; this is NOT `RESOURCE_EXHAUSTED`. No outbound cap: a large result set is never truncated. |
+| `max_message_bytes` (default 64 MiB) | `OUT_OF_RANGE` | `message_size` | Enforced by tonic's own per-service codec (`max_decoding_message_size`), below the refusal-counting layer stack — verified against the vendored tonic 0.14.5 source; this is NOT `RESOURCE_EXHAUSTED`. Applied on every listener: the public gRPC + Flight SQL chain and the internal `peer_bind` listener's `PeerService` and `GangService`; a gang round's chunks are sized to it, and a coordinator's client bounds its own inbound decode at the same value. A message of exactly this many encoded bytes decodes; one more byte is refused naming the configured value. No outbound cap: a large result set is never truncated. |
 | `max_in_flight` (default 256) | `RESOURCE_EXHAUSTED` | `in_flight` | Global, UNARY methods only. `0` = unbounded. |
 | `max_in_flight_per_connection` (default 64) | `RESOURCE_EXHAUSTED` | `in_flight_per_connection` | Per TCP connection, UNARY methods only. `0` = unbounded. |
 | `request_timeout_secs` (default unset) | `DEADLINE_EXCEEDED` | `timeout` | UNARY methods only; unset means no server-imposed timeout. |

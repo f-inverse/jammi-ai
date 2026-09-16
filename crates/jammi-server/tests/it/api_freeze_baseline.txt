@@ -25,9 +25,9 @@ PACKAGE jammi.v1.eval
 # ADDED (additive, minor-compatible): the coordinator-to-member gang-admission
 # seam for a multi-host training run. Served ONLY on the internal
 # `[server] peer_bind` listener, beside `jammi.v1.peer` — the public listener
-# answers UNIMPLEMENTED for its rpcs. No tenant value is read on this path at
-# W=1 — never the caller's, and the admission row carries no tenant column
-# (I-GANG; tenant-scoped resolution is U5a-2's, #566).
+# answers UNIMPLEMENTED for its rpcs. The caller's tenant is never read; the
+# member derives the tenant from the verified `jobs` row and resolves a
+# multi-host job's training set under that tenant alone (I-GANG).
 PACKAGE jammi.v1.gang
 PACKAGE jammi.v1.inference
 # ADDED (additive, minor-compatible, #485/#486): the durable job queue's own

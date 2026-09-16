@@ -25,6 +25,11 @@ libc.workspace = true
 jammi-ai.workspace = true
 jammi-db.workspace = true
 jammi-numerics.workspace = true
+# The Ballista compute plane: `OssServer::bind` hosts the scheduler/executor
+# roles from `[ballista]`. No cargo feature — roles are config-shaped (B4).
+jammi-ballista.workspace = true
+ballista-core.workspace = true
+ballista-scheduler.workspace = true
 axum.workspace = true
 arrow.workspace = true
 arrow-flight.workspace = true

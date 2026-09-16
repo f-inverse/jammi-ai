@@ -334,8 +334,8 @@ impl Catalog {
     /// CAS-decrement `available_slots` by `n` iff `available_slots >= n`.
     /// `false` (no row changed) when no row exists for `executor_id` OR the
     /// executor does not currently have `n` free slots — the two arms are
-    /// indistinguishable to the caller BY DESIGN, the same way [`Self::
-    /// heartbeat_job`](super::jobs_repo::Catalog::heartbeat_job)'s attempt
+    /// indistinguishable to the caller BY DESIGN, the same way
+    /// [`Self::heartbeat_job`]'s attempt
     /// guard collapses "row gone" and "attempt guard missed" into one
     /// boolean: a placement decision that lost a CAS race retries against a
     /// fresh read either way.

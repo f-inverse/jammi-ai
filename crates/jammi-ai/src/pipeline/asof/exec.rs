@@ -82,6 +82,21 @@ impl AsofJoinExec {
         })
     }
 
+    /// The validated join spec.
+    pub fn spec(&self) -> &AsofJoinSpec {
+        &self.spec
+    }
+
+    /// The left (spine) child plan.
+    pub fn left(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.left
+    }
+
+    /// The right (facts) child plan.
+    pub fn right(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.right
+    }
+
     /// The lexicographic ordering requirement for one side: ascending by
     /// (`by`..., `time`), and — under a `ByColumnDesc` tie-break — by that
     /// secondary column last so the maximal value of a coincident-time run is the

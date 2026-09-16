@@ -7,6 +7,7 @@ members = [
     "crates/jammi-admin",
     "crates/jammi-client",
     "crates/jammi-ai",
+    "crates/jammi-ballista",
     "crates/jammi-server",
     "crates/jammi-python",
     "crates/jammi-cli",
@@ -24,6 +25,7 @@ default-members = [
     "crates/jammi-admin",
     "crates/jammi-client",
     "crates/jammi-ai",
+    "crates/jammi-ballista",
     "crates/jammi-server",
     "crates/jammi-cli",
     "crates/jammi-lora",
@@ -51,6 +53,13 @@ jammi-wire = { version = "0.49.1", path = "crates/jammi-wire" }
 jammi-admin = { version = "0.49.1", path = "crates/jammi-admin" }
 jammi-client = { version = "0.49.1", path = "crates/jammi-client" }
 jammi-ai = { version = "0.49.1", path = "crates/jammi-ai" }
+# The Ballista compute plane: `JammiCodec`/`JammiExecutionEngine`, role
+# hosting (scheduler/executor), the client. Depends on jammi-ai/jammi-db/
+# jammi-wire only (dep direction: ballista -> ai/db/wire, server -> ballista);
+# jammi-ai never depends on it (the `PlacedGangSubmitter`/`PlacedGangRunner`
+# seams jammi-ai exposes are installed BY this crate's roles, not called
+# from jammi-ai's own dependency graph).
+jammi-ballista = { version = "0.49.1", path = "crates/jammi-ballista" }
 jammi-server = { version = "0.49.1", path = "crates/jammi-server" }
 # Default features OFF at the workspace root so a consumer can pull jammi-lora's
 # candle-free config vocabulary without the candle stack (jammi-ai's thin
@@ -75,6 +84,20 @@ jammi-test-utils = { path = "crates/jammi-test-utils" }
 # the graph.
 datafusion = "54.1"
 datafusion-federation = "=0.5.5"
+# The physical-plan protobuf codec framework `jammi-ballista`'s `JammiCodec`
+# implements against (`PhysicalExtensionCodec`) — same DataFusion 54 line as
+# the rest of the workspace (`datafusion_version` oracle).
+datafusion-proto = "54"
+# Ballista 54.1 — jammi's compute-plane dependency line. Its own transitive
+# deps (`arrow-flight 58.3`, `datafusion 54`, `datafusion-proto 54`,
+# `object_store 0.13.2`, `prost 0.14`, `tonic 0.14`) match the workspace's
+# exactly, so `deny.toml`'s multiple-version bans hold with no line bump
+# (contract `feat_500-wave4` §1). `default-features = false` on the
+# scheduler/executor crates: no `rest-api`/`keda-scaler` surface, no CLI
+# binaries — jammi hosts both roles itself (`jammi_ballista::roles`).
+ballista-core = "54.1"
+ballista-scheduler = { version = "54.1", default-features = false }
+ballista-executor = { version = "54.1", default-features = false, features = ["arrow-ipc-optimizations"] }
 arrow = "58.3"
 arrow-flight = { version = "58.3", features = ["flight-sql"] }
 arrow-schema = "58.3"

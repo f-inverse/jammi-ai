@@ -4,7 +4,7 @@ description: Write-owner for the wire + server surface — jammi-wire (proto/ton
 tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 isolation: worktree
-owns: [crates/jammi-wire/**, crates/jammi-admin/**, crates/jammi-client/**, crates/jammi-server/**]
+owns: [crates/jammi-wire/**, crates/jammi-admin/**, crates/jammi-client/**, crates/jammi-server/**, crates/jammi-ballista/**]
 ---
 
 # wire-server
@@ -17,6 +17,7 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
 - `crates/jammi-admin` — admin surface.
 - `crates/jammi-client` — the remote client.
 - `crates/jammi-server` — Flight SQL + gRPC services (catalog, embedding, eval, audit, …).
+- `crates/jammi-ballista` — the Ballista compute plane: `JammiCodec`, `JammiExecutionEngine`, scheduler/executor role hosting, the client.
 
 **Shared-declaration class is not yours to freely edit.** Each crate's `src/lib.rs`, `Cargo.toml`, and `error.rs` are the lead/`docs-ci` shared class; coordinate through the lead and note it in `scope_amendments`.
 

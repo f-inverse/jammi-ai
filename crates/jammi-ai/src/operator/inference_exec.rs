@@ -15,6 +15,7 @@ use crate::inference::runner::InferenceRunner;
 use crate::inference::schema::build_output_schema;
 use crate::model::cache::ModelCache;
 use crate::model::{BackendType, ModelSource, ModelTask};
+use jammi_db::store::manifest::ComputeDeviceKind;
 
 /// InferenceExec — the core intelligence operator.
 /// Reads input RecordBatches, runs model inference, and outputs
@@ -36,6 +37,16 @@ pub struct InferenceExec {
     regression_form: Option<DistributionForm>,
     /// Input columns copied verbatim to the end of every output batch.
     passthrough: Vec<String>,
+    /// The device KIND (contract `feat_500-wave4` §9 B3) this descriptor
+    /// declares it must run on. `None` when unset at construction — every
+    /// in-process pipeline call site today (unmodified: out of this file's
+    /// grant) — in which case a decoding executor treats the descriptor as
+    /// "run on whatever this executor's own session runs on" (`jammi-
+    /// ballista`'s codec fills this from the SUBMITTING session's
+    /// `compute_device().kind()` at encode time when `None`, which is the
+    /// same effective default this field's doc names, applied at the wire
+    /// boundary rather than at every construction call site).
+    device_kind: Option<ComputeDeviceKind>,
     properties: Arc<PlanProperties>,
 }
 
@@ -64,6 +75,7 @@ pub struct InferenceExecBuilder {
     embedding_dim: Option<usize>,
     regression_form: Option<DistributionForm>,
     passthrough: Vec<String>,
+    device_kind: Option<ComputeDeviceKind>,
 }
 
 impl InferenceExecBuilder {
@@ -90,6 +102,7 @@ impl InferenceExecBuilder {
             embedding_dim: None,
             regression_form: None,
             passthrough: Vec::new(),
+            device_kind: None,
         }
     }
 
@@ -106,6 +119,16 @@ impl InferenceExecBuilder {
         self
     }
 
+    /// Explicit backend override (`None` defers to the model cache's own
+    /// resolution). Needed to round-trip a decoded node's exact backend
+    /// choice (`jammi-ballista`'s codec); `with_new_children` below now
+    /// threads it through too (a pre-existing gap this fixes as a side
+    /// effect of adding the setter).
+    pub fn backend(mut self, backend: Option<BackendType>) -> Self {
+        self.backend = backend;
+        self
+    }
+
     pub fn observer(mut self, observer: Option<Arc<dyn InferenceObserver>>) -> Self {
         self.observer = observer;
         self
@@ -118,6 +141,15 @@ impl InferenceExecBuilder {
 
     pub fn regression_form(mut self, form: Option<DistributionForm>) -> Self {
         self.regression_form = form;
+        self
+    }
+
+    /// Explicit device-kind override — a submitter placing this plan onto a
+    /// different device kind than its own sets this. `None` (the default)
+    /// means "run on whatever executes this plan" (see the field's doc on
+    /// [`InferenceExec`]).
+    pub fn device_kind(mut self, kind: Option<ComputeDeviceKind>) -> Self {
+        self.device_kind = kind;
         self
     }
 
@@ -145,12 +177,75 @@ impl InferenceExecBuilder {
             embedding_dim: self.embedding_dim,
             regression_form: self.regression_form,
             passthrough: self.passthrough,
+            device_kind: self.device_kind,
             properties: Arc::new(properties),
         })
     }
 }
 
 impl InferenceExec {
+    /// The model source this node runs inference against.
+    pub fn source(&self) -> &ModelSource {
+        &self.source
+    }
+
+    /// The inference task this node performs.
+    pub fn task(&self) -> ModelTask {
+        self.task
+    }
+
+    /// The input columns whose content this node reads.
+    pub fn content_columns(&self) -> &[String] {
+        &self.content_columns
+    }
+
+    /// The row-identity column threaded through to the output.
+    pub fn key_column(&self) -> &str {
+        &self.key_column
+    }
+
+    /// The catalog source id this node's output is attributed to.
+    pub fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    /// The explicit backend override, if any (`None` defers to the model
+    /// cache's own resolution).
+    pub fn backend(&self) -> Option<BackendType> {
+        self.backend
+    }
+
+    /// The inference batch size.
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    /// The embedding output width, for tasks that produce one.
+    pub fn embedding_dim(&self) -> Option<usize> {
+        self.embedding_dim
+    }
+
+    /// The served regression head's persisted distribution form, if any.
+    pub fn regression_form(&self) -> Option<&DistributionForm> {
+        self.regression_form.as_ref()
+    }
+
+    /// Input columns copied verbatim to the end of every output batch.
+    pub fn passthrough(&self) -> &[String] {
+        &self.passthrough
+    }
+
+    /// The child plan this node reads from.
+    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
+
+    /// The device-kind override this descriptor declares, if any (contract
+    /// `feat_500-wave4` §9 B3). See the field's doc for the `None` case.
+    pub fn device_kind(&self) -> Option<ComputeDeviceKind> {
+        self.device_kind
+    }
+
     fn compute_properties(schema: SchemaRef) -> PlanProperties {
         PlanProperties::new(
             EquivalenceProperties::new(schema),
@@ -199,10 +294,12 @@ impl ExecutionPlan for InferenceExec {
                 Arc::clone(&self.model_cache),
             )
             .batch_size(self.batch_size)
+            .backend(self.backend)
             .observer(self.observer.clone())
             .embedding_dim(self.embedding_dim)
             .regression_form(self.regression_form.clone())
             .passthrough(self.passthrough.clone())
+            .device_kind(self.device_kind)
             .build()
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
         ))

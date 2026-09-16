@@ -65,6 +65,7 @@ edges, by design — not a discrepancy.
 ```
 jammi-admin -> jammi-db, jammi-wire
 jammi-ai -> jammi-ai, jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics, jammi-test-utils, jammi-wire
+jammi-ballista -> jammi-ai, jammi-db, jammi-test-utils, jammi-wire
 jammi-bench -> jammi-ai, jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics
 jammi-cli -> jammi-admin, jammi-db
 jammi-client -> jammi-admin, jammi-db, jammi-wire
@@ -74,7 +75,7 @@ jammi-kernels
 jammi-lora -> jammi-kernels, jammi-numerics
 jammi-numerics
 jammi-python -> jammi-ai, jammi-db
-jammi-server -> jammi-admin, jammi-ai, jammi-client, jammi-db, jammi-numerics, jammi-test-utils, jammi-wire
+jammi-server -> jammi-admin, jammi-ai, jammi-ballista, jammi-client, jammi-db, jammi-numerics, jammi-test-utils, jammi-wire
 jammi-test-utils -> jammi-db
 jammi-wire -> jammi-db, jammi-lora, jammi-numerics
 ```
@@ -103,8 +104,10 @@ jammi-client ──► jammi-wire, jammi-admin, jammi-db               [data-pla
 jammi-ai ──► jammi-db, jammi-numerics, jammi-lora, jammi-wire,   [EMBEDDED ENGINE]
              jammi-encoders(opt, `local`), jammi-kernels(opt, `cuda`),
              candle(opt, `local`)
-   ▲   ▲
-jammi-server ──► jammi-wire, jammi-ai, jammi-db, jammi-numerics  [serves the wire over the engine]
+   ▲
+jammi-ballista ──► jammi-ai, jammi-db, jammi-wire        [BALLISTA COMPUTE PLANE — codec, roles, client]
+   ▲
+jammi-server ──► jammi-wire, jammi-ai, jammi-ballista, jammi-db, jammi-numerics  [serves the wire over the engine]
    │
 jammi-python ──► jammi-ai, jammi-db, jammi-lora                  [LOCAL-ONLY PyO3 cdylib]
 
@@ -114,14 +117,14 @@ jammi-encoders ──► jammi-numerics, jammi-kernels, jammi-lora(features=["ca
 The publish topological order (the canonical DAG statement,
 `.github/workflows/crates.yml`, the publish-order list) is:
 `jammi-numerics → jammi-db → jammi-kernels → jammi-lora → jammi-encoders →
-jammi-wire → jammi-admin → jammi-client → jammi-ai → jammi-server → jammi-cli`.
+jammi-wire → jammi-admin → jammi-client → jammi-ai → jammi-ballista → jammi-server → jammi-cli`.
 `jammi-kernels` sits before `jammi-lora`, not after: `jammi-lora`'s default
 feature set (`default = ["candle"]`, `crates/jammi-lora/Cargo.toml`) enables
 the optional `jammi-kernels` dependency, so `cargo publish -p jammi-lora`
 (no explicit feature flags in the publish step) needs `jammi-kernels` already
 resolvable on crates.io.
 
-Workspace membership (`Cargo.toml`, `[workspace] members`): 13 members;
+Workspace membership (`Cargo.toml`, `[workspace] members`): 15 members;
 `default-members` excludes `jammi-python` (PyO3 cdylib, built by maturin) and
 `jammi-test-utils`. `jammi-bench` *is* a default member.
 
@@ -532,7 +535,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `true` (default `true`); **not** the unconditional `with_embedded_worker`
   form. This is the SAME key the server's chain assembly and the Python embedded
   arm read before deciding whether THEIR process claims —
-  `worker.enabled` (`crates/jammi-server/src/runtime.rs:2104`) and
+  `worker.enabled` (`crates/jammi-server/src/runtime.rs:2210`) and
   `worker.enabled` (`crates/jammi-python/src/database.rs:121`) — so a wire
   deployment and an in-process one answer "does THIS process claim?"
   identically rather than by three private conventions. `Target`

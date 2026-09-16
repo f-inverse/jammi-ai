@@ -2388,6 +2388,21 @@ impl BallistaConfig {
                     ));
                 }
             }
+
+            // The scheduler dials the executor's flight/task ports back
+            // (registration + task push); an unspecified `bind` host
+            // (`0.0.0.0`/`::`) unwraps to a real peer IP ONLY on the
+            // scheduler's own side of that connection, never on the
+            // executor's, so this process must name an `advertise_host`
+            // whenever `bind`'s host is unspecified (contract
+            // `feat_500-wave4` §9 A3).
+            if executor.advertise_host.is_none() && bind.ip().is_unspecified() {
+                return Err(JammiError::Config(format!(
+                    "ballista.executor.advertise_host must be set when \
+                     ballista.executor.bind '{}' has an unspecified host (0.0.0.0/::)",
+                    executor.bind
+                )));
+            }
         }
 
         if let Ok(addr) = server.health_listen.parse::<SocketAddr>() {

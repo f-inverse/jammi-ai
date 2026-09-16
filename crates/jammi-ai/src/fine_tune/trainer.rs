@@ -312,7 +312,7 @@ struct SimStats {
 /// test builds this SAME value: wiring `RankContext` through the trainer
 /// changes zero bytes at W=1. The trainer's collective calls (`all_gather`/
 /// `all_reduce_sum`/`all_reduce_max_flags`) run at every world size through
-/// [`Self::collective`] — never an `if world == 1` fast path that skips
+/// `Self::collective` — never an `if world == 1` fast path that skips
 /// them; [`Noop`]'s verbs ARE the W=1 fast path (DESIGN.md §4).
 pub struct RankContext {
     collective: Arc<dyn Collective>,
@@ -401,7 +401,7 @@ impl RankContext {
     /// A stable digest of the CANONICAL `trainable_vars` name order this
     /// gang's reduce must agree on (the same order [`super::optimizer::
     /// sorted_trainable_vars`] produces, threaded through
-    /// [`optimizer::canonical_reduce`]) — exposed here for the
+    /// `optimizer::canonical_reduce`) — exposed here for the
     /// concurrently-built `Peer` collective (U5b-1b-i), whose round
     /// descriptor carries this as `agreement`: a wire round only publishes
     /// once every rank's descriptor (root, counts, tensor signatures, AND
@@ -1074,10 +1074,10 @@ impl TrainingLoop {
     ///
     /// `call` is the [`BlockingCall`] witness: the ONE place the trainer
     /// receives it. Every collective the run makes — the per-step gather
-    /// ([`Self::compute_loss_gathered`]), the lockstep flag reduce and the
-    /// window-boundary `canonical_reduce` ([`Self::process_batch_loss`]),
+    /// (`Self::compute_loss_gathered`), the lockstep flag reduce and the
+    /// window-boundary `canonical_reduce` (`Self::process_batch_loss`),
     /// the trailing-window `canonical_reduce`, and the epoch-boundary
-    /// dropout-position gather ([`Self::save_resume_checkpoint`]) — takes
+    /// dropout-position gather (`Self::save_resume_checkpoint`) — takes
     /// this same witness, so `run` is callable only from a thread that may
     /// block: production mints it at the worker's `spawn_blocking`
     /// boundary (`worker.rs`), never here.

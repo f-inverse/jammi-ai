@@ -27,7 +27,7 @@
 //! tenant's table.
 //!
 //! Only once every determinant holds does the handler contend for this
-//! host's single job slot — [`HostAdmission::admit_rank`]'s
+//! host's single job slot — `HostAdmission::admit_rank`'s
 //! compare-and-set on the holder cell (`Free` admits; a `ClaimProbe` is
 //! waited on for at most one heartbeat; `JobRun` or another `Rank` refuse
 //! `Unavailable` at once — transient, no assembly budget consumed) — and

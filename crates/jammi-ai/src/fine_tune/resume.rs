@@ -85,7 +85,7 @@ fn unversioned_schema_version() -> u32 {
 pub struct ResumeState {
     /// The schema version this bundle was written under — see
     /// [`RESUME_STATE_SCHEMA_VERSION`]. `#[serde(default)]` to
-    /// [`UNVERSIONED_SCHEMA_VERSION`] (`0`): a checkpoint captured before
+    /// `UNVERSIONED_SCHEMA_VERSION` (`0`): a checkpoint captured before
     /// this field existed (pre-C7) has no `schema_version` key in its JSON
     /// at all, and parses as version `0` rather than failing the whole
     /// deserialize — [`load_bundle`]'s ONE version check then treats it

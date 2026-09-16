@@ -348,7 +348,7 @@ fn parse_app_clock_stamp(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
 /// Parse `jobs.lease_expires_at`'s stored text into a UTC instant, per the
 /// shape THIS BACKEND's own write path ([`lease_deadline_expr`]) actually
-/// stamps it in: [`parse_app_clock_stamp`] (an application-clock stamp) on
+/// stamps it in: `parse_app_clock_stamp` (an application-clock stamp) on
 /// SQLite, Postgres's own default `timestamptz`-cast-to-`text` rendering (a
 /// DATABASE-clock stamp — `YYYY-MM-DD HH:MM:SS[.ffffff]±HH[:MM]`, the
 /// fractional part omitted entirely when it is exactly zero, the offset
@@ -412,7 +412,7 @@ pub fn decode_lease_expires_at(
 /// `col::timestamptz` cast) into "is this row fresh" — present, parseable,
 /// and within `margin` of `now` — against `now`, infallibly, on EITHER
 /// backend: this column is ALWAYS an application-clock
-/// [`parse_app_clock_stamp`] stamp (`Catalog::upsert_instance` /
+/// `parse_app_clock_stamp` stamp (`Catalog::upsert_instance` /
 /// `Catalog::reregister_instance` / `Catalog::touch_instance` all write
 /// `now_sortable()`, never the database clock, on either backend), so unlike
 /// [`decode_lease_expires_at`] this needs no [`BackendKind`] at all. Text

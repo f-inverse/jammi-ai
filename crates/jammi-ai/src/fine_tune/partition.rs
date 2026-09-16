@@ -39,7 +39,7 @@ pub enum PartitionRule {
 /// `for_gang`'s bounds (or is the trivially-valid `single_rank`). Tests that
 /// need an arbitrary `(rank, world)` assignment to exercise the partition
 /// RULE itself (never a real trainer/gang) use the `#[cfg(test)]`-only
-/// [`Self::for_test`] instead, which does not exist in a release build.
+/// `Self::for_test` instead, which does not exist in a release build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartitionSpec {
     rank: usize,

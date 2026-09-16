@@ -222,10 +222,10 @@ pub enum TrainingSetAssembly {
 /// dispatch, DESIGN.md § 4) did not proceed to a run, each carrying its own
 /// cooldown/counting rule
 /// (`docs/plans/67-distributed-training/UNITS.md` § U5b-1b-ii). A new
-/// variant with no rule is a COMPILE error — [`AssemblyOutcome::effect`]
+/// variant with no rule is a COMPILE error — `AssemblyOutcome::effect`
 /// matches every variant explicitly, never a wildcard arm.
 ///
-/// The rule, by variant (see [`AssemblyEffect`]):
+/// The rule, by variant (see `AssemblyEffect`):
 ///
 /// - [`Self::Refuted`] / [`Self::AllRootDivergent`] — a genuine, terminal-
 ///   looking refusal of THIS attempt: counted AND cooled down.
@@ -265,7 +265,7 @@ pub enum AssemblyOutcome {
     Success,
 }
 
-/// The effect class [`AssemblyOutcome::effect`] maps every variant onto — a
+/// The effect class `AssemblyOutcome::effect` maps every variant onto — a
 /// proper enum, not a `(bool, bool)` pair, so "counted but not cooled down"
 /// (a combination the design never calls for) is not even representable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,7 +290,7 @@ impl AssemblyOutcome {
     /// which the coordinator leaves for reclaim on its lease (an attempt
     /// spent), as opposed to every other outcome, which costs the job no
     /// attempt (the coordinator hands its lease back at once, OPS D10).
-    /// Derived from [`Self::effect`] — never a second table.
+    /// Derived from `Self::effect` — never a second table.
     pub fn counts_toward_failures(self) -> bool {
         self.effect() == AssemblyEffect::CooldownAndCounted
     }
@@ -2179,9 +2179,9 @@ impl Catalog {
         )
     }
 
-    /// Apply [`AssemblyOutcome::effect`]'s rule to `job_id`'s attempt
+    /// Apply `AssemblyOutcome::effect`'s rule to `job_id`'s attempt
     /// `attempt`, in ONE `UPDATE`: `assembly_failures` bumps by one only for
-    /// [`AssemblyEffect::CooldownAndCounted`] reasons, `next_assembly_after`
+    /// `AssemblyEffect::CooldownAndCounted` reasons, `next_assembly_after`
     /// is stamped `now + backoff(k)` (`k` the NEW, post-bump count for a
     /// counted reason, the UNCHANGED current count for a cooldown-only
     /// reason) for every reason that carries a cooldown at all, and a
@@ -2518,7 +2518,7 @@ impl Catalog {
     /// this column is ALWAYS an application-clock stamp on either backend
     /// (`Catalog::upsert_instance` / `Catalog::reregister_instance` /
     /// `Catalog::touch_instance` never write the database clock here), so
-    /// the decode needs no [`BackendKind`](super::backend::BackendKind) at
+    /// the decode needs no [`BackendKind`] at
     /// all.
     pub async fn fresh_instance(&self, instance_id: &str, lease: Duration) -> Result<bool> {
         let instance_id = instance_id.to_string();

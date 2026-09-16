@@ -640,7 +640,7 @@ pub const DEFAULT_NORM_CHECK_INTERVAL: usize = 50;
 /// is what lets this scale to the real LoRA var count (224 on a
 /// ModernBERT-large r16 config) without chunking into 32-var words.
 ///
-/// This is the seam [`TrainingLoop::process_batch_loss`]'s window-boundary
+/// This is the seam `TrainingLoop::process_batch_loss`'s window-boundary
 /// flush and its epoch-end trailing-window flush both call before
 /// [`clip_and_step`], so every rank clips and steps over the identical,
 /// already-summed gradient AND the identical presence set, and "every rank
@@ -658,7 +658,6 @@ pub const DEFAULT_NORM_CHECK_INTERVAL: usize = 50;
 /// every var, the shape this function held before the presence-set fix,
 /// reds it — the absent var gains an entry it must not have).
 ///
-/// [`TrainingLoop::process_batch_loss`]: super::trainer::TrainingLoop::process_batch_loss
 pub fn canonical_reduce(
     call: &super::collective::BlockingCall,
     rank_ctx: &super::trainer::RankContext,

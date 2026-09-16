@@ -87,7 +87,7 @@ pub fn build_classification_head(
 }
 
 /// U4b tail: [`build_classification_head`] with every layer's dropout mask
-/// keyed by `dropout_seed` — see [`build_head_layer_for_rank`]'s doc.
+/// keyed by `dropout_seed` — see `build_head_layer_for_rank`'s doc.
 pub fn build_classification_head_for_rank(
     hidden_size: usize,
     num_classes: usize,
@@ -137,7 +137,7 @@ pub fn build_distribution_head(
 }
 
 /// U4b tail: [`build_distribution_head`] with every layer's dropout mask
-/// keyed by `dropout_seed` — see [`build_head_layer_for_rank`]'s doc.
+/// keyed by `dropout_seed` — see `build_head_layer_for_rank`'s doc.
 pub fn build_distribution_head_for_rank(
     hidden_size: usize,
     output_dim: usize,
@@ -187,7 +187,7 @@ pub fn build_ner_head(
 }
 
 /// U4b tail: [`build_ner_head`] with every layer's dropout mask keyed by
-/// `dropout_seed` — see [`build_head_layer_for_rank`]'s doc.
+/// `dropout_seed` — see `build_head_layer_for_rank`'s doc.
 pub fn build_ner_head_for_rank(
     hidden_size: usize,
     num_labels: usize,
@@ -240,7 +240,7 @@ pub fn build_projection_head(
 }
 
 /// U4b tail: [`build_projection_head`] with the dropout mask keyed by
-/// `dropout_seed` — see [`build_head_layer_for_rank`]'s doc. The ONE layer
+/// `dropout_seed` — see `build_head_layer_for_rank`'s doc. The ONE layer
 /// this head builds still inits from `config.seed` alone (identical on
 /// every rank), so two ranks built through this function with the SAME
 /// `config` and DIFFERENT `dropout_seed` start with byte-identical

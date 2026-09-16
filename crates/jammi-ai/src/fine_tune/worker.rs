@@ -4402,7 +4402,7 @@ pub struct TrainedArtifact {
 ///   at config load).
 /// - `world_size > local_ranks` → [`Self::Peer`]: this process is rank 0,
 ///   the coordinator; ranks `1..world_size` are fleet members it assembles
-///   and dials ([`JobWorker::coordinate`]).
+///   and dials (`JobWorker::coordinate`).
 ///
 /// `[distributed] max_world_size` plays no part here: it bounded the job at
 /// submit (`RankAdmission`), and a claimed row is already within it.

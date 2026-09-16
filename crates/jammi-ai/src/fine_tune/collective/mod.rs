@@ -374,7 +374,7 @@ impl TensorSignature {
     /// rank (a zero-row rank, an uneven partition), so only the TRAILING
     /// shape is a determinant of agreement for a gathered tensor.
     ///
-    /// Every caller reaches this only after [`checked_gather_counts`] has
+    /// Every caller reaches this only after `checked_gather_counts` has
     /// already refused a 0-dim tensor for this exact call, so `dims` always
     /// has at least one entry here. This does not fall back to signing an
     /// empty trailing shape for a shape it cannot honestly sign — a 0-dim

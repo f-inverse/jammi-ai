@@ -2771,6 +2771,15 @@ Three defects on `main` surfaced from CI on the #580 merge tip and were each roo
 
 ## 10. Gates (the merge path)
 
+**Expected red at merge: `SWARM_GATE_TOUCHED`.** This branch adds one gate definition,
+`ci/scripts/check_cookbook_session_lifecycle.py` (C1, issue #539 — a plan unit whose deliverable
+IS a gate), and U7b-A2b extends `check_gpu_prove_once.py`'s P7 judgement and
+`check_cuda_run_artifacts.py`'s cluster-leg producer registry. Gate definitions are
+human-amend-only by design, so the swarm guard reds on them and the PR is admin-merged once every
+other check is green (the standing authorization: admin merge when `SWARM_GATE_TOUCHED` is the
+sole red). The reviewer's attention belongs on those three files.
+
+
 `bash ci/scripts/merge_path.sh` on the consolidated tip with `JAMMI_TEST_PG_URL` pointing at a
 local PostgreSQL 16 in the CI lane's shape — run ONCE by the lead, never per implementer; the
 phase-5 oracle dispatched after every other stage is green; only `docs/rigor/**` committed

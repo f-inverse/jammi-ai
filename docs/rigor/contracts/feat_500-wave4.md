@@ -273,9 +273,74 @@ accelerator dimension stays out of band in `workers.devices` (the one upstream P
 README r43); object-store shuffle is out of v1 (D2 condition 3); active/active scheduling is
 out (README r43).
 
-## 9. Pressure round
+## 9. Pressure round (REFINE at `bcfda3ca`, 2026-09-16; every premise reproduced or refuted with an executed check — the row is in `docs/rigor/feat_500-wave4.jsonl`)
 
-Recorded here after the verdict, with each block's disposition.
+Seven blocks, ten advisories. Each disposition below is the design as built; the sections
+above are read WITH these corrections.
+
+- **B1 — a placed task on the submitter's own host is refused forever** (the submitter holds
+  `Holder::JobRun` for the whole await, `worker.rs:1380`/`:1404`). Disposition: placement
+  EXCLUDES the submitter's own executor by construction — the placement policy is jammi's from
+  U8a on (a `Custom` policy that never binds a `GangExec` to the executor whose id equals
+  `descriptor.submitter`, round-robin otherwise; U8b adds the device predicate to the same
+  policy), and the submitter seam reports `placement_available()` = "a registered executor
+  OTHER than this instance exists"; when it is false the job runs in-process (the wave-3
+  path) — placement is a property of the claimant's cluster view, decided BEFORE topology.
+  Both roles on one process is therefore a single node that never places, stated in the guide.
+- **B2 — the submitter's host cannot serve a rank while it awaits** (a two-pod overlay could
+  not assemble). Disposition: the `Placed` arm moves the host's holder `JobRun → Awaiting`
+  right after submitting: `Awaiting` admits a `RunRank` session (the host runs no compute) and
+  refuses a second claim exactly as `JobRun` does; the claim loop returns to `Free` when the
+  await ends. A placed `Peer` gang of world W therefore needs W hosts able to hold a rank, the
+  submitter's included; the overlay's replica count and the guide state that arithmetic.
+- **B3 — `InferenceExec` names no device** (`inference_exec.rs:22-40`; the device is the
+  executing session's, `session.rs:894`). Disposition: `InferenceExec` gains a `device_kind:
+  ComputeDeviceKind` (cpu | cuda | metal) stamped by `InferenceExecBuilder` from the building
+  session's `compute_device()` kind (an explicit `.device_kind(k)` override exists for a
+  submitter placing onto another kind); the codec carries it; the executor refuses a plan whose
+  kind is not its own (K7); the policy's GPU-bound predicate reads it. An in-process run is
+  byte-unchanged (the builder's default is the session's own kind).
+- **B4 — the manifest records the submitter's device.** Disposition: in v1 no pipeline verb
+  is rewired through Ballista — `submit_physical_plan` is a client seam exercised by the
+  oracles, and the gang path writes its manifest on the executor that IS the coordinator — so
+  no `MaterializationEnv` is written for a placed inference plan in wave 4; the rebuild unit
+  "pipeline verbs through Ballista" is a NAMED CUT (§8d) that must carry the executor's
+  device back to the writer. K4 is stated per device kind (README r44): bytes through
+  Ballista == bytes in-process ON THE SAME KIND; oracle (a3) runs both on CPU.
+- **B5 — `workers.devices` exists only under `[worker] enabled`.** Disposition: the device
+  list is the EXECUTOR registration's own fact — `compute_executors.devices TEXT` (JSON
+  `[{kind, ordinal}]`, no `memory`: the tree has no source for it), written by the executor
+  role at registration from the session's `WorkerTopology::rank_devices()` × its device kind;
+  `DevicePlacement` joins on it alone. `workers.devices` stays as the `ListWorkers` mirror for
+  worker-enabled processes (acceptance b4), never the join's authority.
+- **B6 — DRAIN must not tear down the executor under a running placed gang.** Disposition:
+  DRAIN stops task admission (the executor reports `Terminating`; the scheduler stops binding
+  to it) and WAITS for its in-flight tasks; only RELEASE fires the `ShutdownNotifier`. The
+  scheduler role stops last, after the process's own drain completes.
+- **B7 — per-pod DNS and one scheduler.** Disposition: `publishNotReadyAddresses: true` on the
+  headless Service (shipped in U9b). The scheduler is ONE dedicated single-replica
+  `Deployment` (`jammi-server-scheduler`: `[ballista] scheduler_bind`, `[worker] enabled =
+  true` for the training kinds, CPU) that claims and places; the compute `StatefulSet` pods host
+  executors and are worker-enabled fleet members. A training job claimed by a compute pod runs
+  there in-process (byte-identical, K4); one claimed by the scheduler pod is placed. The guide
+  states the split and that every training job (W ≥ 1) claimed by a scheduler host is placed
+  when a foreign executor exists — `GangExec`'s `world` is informational; topology is decided
+  on the executor from its own `[worker] local_ranks`.
+- Advisories folded: A1 the codec magic's first byte is `0x07` (field 0, wire type 7 — never a
+  legal prost tag), pinned by a test over Ballista's five oneof tag bytes; A2 the six-address
+  collision rule is a `&JammiConfig` cross-section validator (precedent `MembershipConfig::
+  validate`), never a second parse; A3 the executor decodes with the codec passed to
+  `executor_server::startup`, `advertise_host` is required whenever `bind` is unspecified
+  (`0.0.0.0`/`::`); A4 acceptance (a4)'s determinant is "exactly one transfer" read from the
+  row, never `task_attempt`; A5 every distributed oracle pins `[worker] enabled` to the
+  scheduler process only; A6 there is no note-counting oracle — the three note sites are
+  `deploy/kubernetes/README.md`, the deleted `deployment-compute.yaml`, and
+  `docs/guide/src/reference-topologies.md` (U9a); A7 the README's Deployment-shaped rollout
+  arithmetic is rewritten for the StatefulSet (U9a); A8 the fifth registration site is
+  `docs/guide/src/api-stability.md`'s published-crate enumeration (U9a); A10 the scheduler's
+  binder takes the slot CAS BEFORE stamping the graph's task info, and a lost CAS leaves the
+  task unstamped; `ballista-scheduler` with `default-features = false` is load-bearing for the
+  restart property (the REST API's `get_running_jobs` errors on a status row with no graph).
 
 ## 10. Gate table
 

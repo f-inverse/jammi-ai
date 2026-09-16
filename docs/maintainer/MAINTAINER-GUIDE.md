@@ -535,7 +535,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `true` (default `true`); **not** the unconditional `with_embedded_worker`
   form. This is the SAME key the server's chain assembly and the Python embedded
   arm read before deciding whether THEIR process claims —
-  `worker.enabled` (`crates/jammi-server/src/runtime.rs:2210`) and
+  `worker.enabled` (`crates/jammi-server/src/runtime.rs:2224`) and
   `worker.enabled` (`crates/jammi-python/src/database.rs:121`) — so a wire
   deployment and an in-process one answer "does THIS process claim?"
   identically rather than by three private conventions. `Target`
@@ -3016,7 +3016,7 @@ is pinned by `p_r_a_resident_loader_holds_its_eager_reservation_while_training_r
 
 **A task-local tenant scope does not cross `tokio::spawn` or a `block_on` from the
 blocking pool.** `tenant` (`crates/jammi-ai/src/fine_tune/source.rs:60`) on `StreamedSet`
-captures the job's tenant via `tenant` (`crates/jammi-ai/src/session.rs:746`) on
+captures the job's tenant via `tenant` (`crates/jammi-ai/src/session.rs:764`) on
 `InferenceSession` while `run_spec` (`crates/jammi-ai/src/fine_tune/worker.rs:3193`) is still
 executing inside the caller's `with_tenant_scoped` task-local scope; `open_streamed_source`
 (`crates/jammi-ai/src/fine_tune/trainer.rs:4098`) drives the stream's own `open` through

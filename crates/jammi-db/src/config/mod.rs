@@ -2155,6 +2155,24 @@ impl<'de> Deserialize<'de> for PreloadEntry {
     }
 }
 
+/// Two of the six `[server]`/`[ballista]` fixed listener addresses collide
+/// iff their ports are equal and non-zero AND (their hosts are equal, OR
+/// either host is UNSPECIFIED — `0.0.0.0` / `[::]` binds every local
+/// interface, so it always overlaps a host-specific bind on the same port,
+/// and the two unspecified wildcards of different families, `0.0.0.0` and
+/// `[::]`, overlap each other on a dual-stack listener the same way). An
+/// ephemeral (`:0`) address never collides with anything — the kernel
+/// assigns each bind a distinct free port, so two `:0` addresses (even the
+/// identical host) are never a collision. The ONE definition
+/// [`ServerConfig::validate`]'s three-way check and [`BallistaConfig::validate`]'s
+/// six-way check both apply, so the two call sites can never diverge on what
+/// "collide" means.
+pub(crate) fn addresses_collide(a: std::net::SocketAddr, b: std::net::SocketAddr) -> bool {
+    a.port() != 0
+        && a.port() == b.port()
+        && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
+}
+
 impl ServerConfig {
     /// Validate server configuration.
     pub fn validate(&self) -> Result<()> {
@@ -2172,32 +2190,30 @@ impl ServerConfig {
                 self.flight_listen
             ))
         })?;
-        // Two surfaces must not bind the same concrete address. An ephemeral
-        // (`:0`) request never collides — the kernel assigns each bind a distinct
-        // free port — so identical `:0` addresses are allowed; only identical
-        // FIXED addresses would land both surfaces on one port.
-        if health == flight && health.port() != 0 {
+        // Two surfaces must not bind an address whose port collides —
+        // [`addresses_collide`]: equal ports, non-zero, on equal or
+        // either-unspecified hosts. An ephemeral (`:0`) request never
+        // collides — the kernel assigns each bind a distinct free port.
+        if addresses_collide(health, flight) {
             return Err(crate::error::JammiError::Config(
                 "health_listen and flight_listen must be different addresses".into(),
             ));
         }
-        // The third listener, when set, joins the same fixed-address rule
+        // The third listener, when set, joins the same collision rule
         // against BOTH of the others (a 3-way check).
         if let Some(raw) = &self.peer_bind {
             let peer: SocketAddr = raw.parse().map_err(|e| {
                 crate::error::JammiError::Config(format!("Invalid peer_bind address '{raw}': {e}"))
             })?;
-            if peer.port() != 0 {
-                if peer == flight {
-                    return Err(crate::error::JammiError::Config(
-                        "peer_bind and flight_listen must be different addresses".into(),
-                    ));
-                }
-                if peer == health {
-                    return Err(crate::error::JammiError::Config(
-                        "peer_bind and health_listen must be different addresses".into(),
-                    ));
-                }
+            if addresses_collide(peer, flight) {
+                return Err(crate::error::JammiError::Config(
+                    "peer_bind and flight_listen must be different addresses".into(),
+                ));
+            }
+            if addresses_collide(peer, health) {
+                return Err(crate::error::JammiError::Config(
+                    "peer_bind and health_listen must be different addresses".into(),
+                ));
             }
         }
         if self.peer_local_load_bytes == Some(0) {
@@ -2421,9 +2437,10 @@ impl BallistaConfig {
             for j in (i + 1)..fixed.len() {
                 let (name_a, addr_a) = fixed[i];
                 let (name_b, addr_b) = fixed[j];
-                if addr_a == addr_b && addr_a.port() != 0 {
+                if addresses_collide(addr_a, addr_b) {
                     return Err(JammiError::Config(format!(
-                        "{name_a} and {name_b} must not bind the same fixed address ({addr_a})"
+                        "{name_a} ({addr_a}) and {name_b} ({addr_b}) must not bind colliding \
+                         addresses (equal ports on equal, or either unspecified, hosts)"
                     )));
                 }
             }

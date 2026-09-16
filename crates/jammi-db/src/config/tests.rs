@@ -3868,6 +3868,11 @@ fn ballista_ports_fixture(overrides: &[(&str, &str)]) -> JammiConfig {
             scheduler_address: "127.0.0.1:41000".to_string(),
             bind: "127.0.0.1:41001".to_string(),
             grpc_bind: "127.0.0.1:41002".to_string(),
+            // Fixed so an override that swaps `executor.bind` for an
+            // unspecified host (0.0.0.0/::, the collision arm below) never
+            // ALSO trips the separate `advertise_host` requirement — this
+            // fixture's purpose is the collision rule alone.
+            advertise_host: Some("127.0.0.1".to_string()),
             ..BallistaExecutorConfig::default()
         }),
     };
@@ -3924,6 +3929,72 @@ fn ballista_every_fixed_port_collision_pair_is_refused_naming_both_keys() {
                 "pair ({key_i}, {key_j}): message must name both keys, got {msg}"
             );
         }
+    }
+}
+
+/// The same "every pair" property as above, but with one side's host
+/// UNSPECIFIED (`0.0.0.0`) and the other CONCRETE, same port — the
+/// divergence-prone case a naive whole-`SocketAddr` `==` comparison lets
+/// through uncaught (a `scheduler_bind = "127.0.0.1:N"` beside a
+/// `peer_bind = "0.0.0.0:N"` would load, then collide at bind time).
+/// [`addresses_collide`]'s rule refuses every such pair too, naming both
+/// keys the same way.
+#[test]
+fn ballista_every_fixed_port_collision_pair_is_refused_when_one_host_is_unspecified() {
+    const KEYS: [&str; 6] = [
+        "ballista.scheduler_bind",
+        "ballista.executor.bind",
+        "ballista.executor.grpc_bind",
+        "server.health_listen",
+        "server.flight_listen",
+        "server.peer_bind",
+    ];
+    for (i, key_i) in KEYS.iter().enumerate() {
+        for key_j in KEYS.iter().skip(i + 1) {
+            let cfg =
+                ballista_ports_fixture(&[(key_i, "0.0.0.0:49999"), (key_j, "127.0.0.1:49999")]);
+            let err = BallistaConfig::validate(&cfg).expect_err(&format!(
+                "pair ({key_i}, {key_j}) must collide when one host is unspecified"
+            ));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(key_i) && msg.contains(key_j),
+                "pair ({key_i}, {key_j}): message must name both keys, got {msg}"
+            );
+        }
+    }
+}
+
+/// [`addresses_collide`]'s own unit-test table — the ONE definition
+/// [`ServerConfig::validate`]'s three-way check and
+/// [`BallistaConfig::validate`]'s six-way check both apply: equal fixed
+/// addresses collide; equal `:0` (ephemeral) addresses never collide;
+/// `127.0.0.1` vs `0.0.0.0` on the same port collides (an unspecified host
+/// binds every local interface); `127.0.0.1` vs `127.0.0.2` on the same
+/// port does not (two distinct concrete hosts); `[::]` vs `0.0.0.0` on the
+/// same port collides (both unspecified, in different families).
+#[test]
+fn addresses_collide_table() {
+    let cases: &[(&str, &str, bool)] = &[
+        ("127.0.0.1:9000", "127.0.0.1:9000", true),
+        ("127.0.0.1:0", "127.0.0.1:0", false),
+        ("127.0.0.1:9000", "0.0.0.0:9000", true),
+        ("127.0.0.1:9000", "127.0.0.2:9000", false),
+        ("[::]:9000", "0.0.0.0:9000", true),
+    ];
+    for (a, b, want) in cases {
+        let addr_a: std::net::SocketAddr = a.parse().unwrap();
+        let addr_b: std::net::SocketAddr = b.parse().unwrap();
+        assert_eq!(
+            addresses_collide(addr_a, addr_b),
+            *want,
+            "addresses_collide({a}, {b}) must be {want}"
+        );
+        assert_eq!(
+            addresses_collide(addr_b, addr_a),
+            *want,
+            "addresses_collide is symmetric: ({b}, {a}) must also be {want}"
+        );
     }
 }
 

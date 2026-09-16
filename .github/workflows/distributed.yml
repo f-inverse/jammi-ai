@@ -42,12 +42,17 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Pinned MinIO + mc versions. A versioned `archive/` release URL is immutable,
-  # so the lane is reproducible and a `dl.min.io` "latest" reshuffle can never
-  # silently change the binary under us; the `actions/cache` step below means a
-  # `dl.min.io` outage on a re-run can't red the lane either.
+  # Pinned MinIO + mc versions, fetched from each project's GitHub release
+  # (an immutable, per-release asset) and verified against the checksum the
+  # release publishes, so the lane is reproducible and no "latest" reshuffle
+  # can change the binary under us. `dl.min.io`'s versioned `archive/` URLs
+  # answer 410 since 2025-09 (MinIO withdrew binary hosting there), which is
+  # why the GitHub release is the source; the `actions/cache` step below means
+  # a GitHub outage on a re-run can't red the lane either.
   MINIO_RELEASE: "RELEASE.2025-09-07T16-13-09Z"
+  MINIO_SHA256: "7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f"
   MC_RELEASE: "RELEASE.2025-08-13T08-35-41Z"
+  MC_SHA256: "01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891"
 
 jobs:
   distributed:
@@ -150,13 +155,16 @@ jobs:
 
       - name: Download the pinned MinIO + mc binaries (cache miss)
         if: steps.minio-cache.outputs.cache-hit != 'true'
-        # Pull the exact pinned versions from the immutable `archive/` path. On a
-        # cache hit this step is skipped entirely, so a `dl.min.io` outage on a
-        # re-run cannot red the lane.
+        # Pull the exact pinned release assets from GitHub and verify each
+        # against the checksum that release publishes. On a cache hit this step
+        # is skipped entirely, so a GitHub outage on a re-run cannot red the lane.
         run: |
+          set -euo pipefail
           mkdir -p /opt/minio-bin
-          curl -fsSL "https://dl.min.io/server/minio/release/linux-amd64/archive/minio.${MINIO_RELEASE}" -o /opt/minio-bin/minio
-          curl -fsSL "https://dl.min.io/client/mc/release/linux-amd64/archive/mc.${MC_RELEASE}" -o /opt/minio-bin/mc
+          curl -fsSL "https://github.com/minio/minio/releases/download/${MINIO_RELEASE}/minio.linux-amd64.${MINIO_RELEASE}" -o /opt/minio-bin/minio
+          echo "${MINIO_SHA256}  /opt/minio-bin/minio" | sha256sum -c -
+          curl -fsSL "https://github.com/minio/mc/releases/download/${MC_RELEASE}/mc.linux-amd64.${MC_RELEASE}" -o /opt/minio-bin/mc
+          echo "${MC_SHA256}  /opt/minio-bin/mc" | sha256sum -c -
           chmod +x /opt/minio-bin/minio /opt/minio-bin/mc
 
       - name: Start MinIO + create the bucket

@@ -3133,7 +3133,8 @@ after it.
 | `2e43af22` | static, guards, swarm, tests (all four; the three Postgres lanes included) | 117 ok; red: rustdoc (the three module-doc links, §8d) and `SWARM_GATE_TOUCHED` |
 | `2f27d6a1` | closure row + doc links | `check_flash_attn_closure` PASS, rustdoc links verified; the phase-5 oracle PASS here found the topology-determinant defect (§8d) |
 | `0ae786fc` | static, guards, swarm | rustdoc red again (explicit targets rustdoc refuses as redundant where the bare link resolves, §8d); the phase-5 oracle PASS here returned the three doc findings (§8d) |
-| `c21492b9` | static, guards, swarm; then the hermetic lane for `jammi-ai`, `jammi-server`, `jammi-bench` (`jammi-ai`'s reverse dependency closure, §8d) | 112 ok, the only red `SWARM_GATE_TOUCHED` (expected, above); tests: 17 targets, 2024 passed, 0 failed |
+| `c21492b9` | static, guards, swarm; then the hermetic lane for `jammi-ai`, `jammi-server`, `jammi-bench` (`jammi-ai`'s reverse dependency closure, §8d) | 112 ok, the only red `SWARM_GATE_TOUCHED` (expected, above); tests: 17 targets, 2024 passed, 0 failed; the phase-5 oracle PASS here returned the exact-version finding (§8d) |
+| `6fd5aeff` (docs only) | static, guards, swarm | 112 ok, the only red `SWARM_GATE_TOUCHED`; the phase-5 oracle PASS at this tip is the record below (its `head_sha`), and every commit after it is `docs/rigor/**` only |
 
 The phase-5 oracle's record of the final tip is `docs/rigor/feat_500-wave3c.oracle.jsonl`; the
 pressure row is `docs/rigor/feat_500-wave3c.jsonl`.

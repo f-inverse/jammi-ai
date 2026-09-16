@@ -903,14 +903,12 @@ derives its renting-closure subject set from a REVIEWED ROOT LIST —
 `_rp_deploy_payload` for the pod surface, `rp_cluster_create` for the
 cluster surface — so a second renting mechanism gets a table row through
 the same derivation the pod legs always have the moment a real DRIVER
-calls it. `rp_cluster_create` has no such caller on this tree today: it
-contributes no derived DRIVER, so P7's per-driver rules (a `PAID_POD_LANE_
-TABLE` row, or `_check_derived_driver_cannot_rent`) have nothing to hold to
-those rules yet — the root is registered precisely so the FIRST real
-caller becomes that judged driver, the moment U7b-A2b's driver ships. Three
-tracked files DO word-match the `rp_cluster_create` literal today and are
-each independently derived and cleared through the same predicate as any
-other file (none is a renting driver and none is exempted for being ours):
+calls it. `rp_cluster_create`'s own real caller is now `ci/scripts/
+runpod_gpu_cluster.sh`, carrying its own `PAID_POD_LANE_TABLE` row
+(`"gpu-cluster.yml"`) — the root's FIRST real driver, judged by P7 like any
+other. Three OTHER tracked files also word-match the `rp_cluster_create`
+literal and are each independently derived and cleared through the same
+predicate (none is a renting driver and none is exempted for being ours):
 `ci/scripts/test_check_gpu_prove_once.py` (its fixtures spell the literal),
 `ci/scripts/test_runpod_cluster_lib.sh` (the mocks-only primitives
 suite, which genuinely calls it) and `ci/scripts/check_gpu_prove_once.py`
@@ -920,9 +918,9 @@ definition — see that file's own disclosure of this, alongside its
 pre-existing `test_check_gpu_prove_once.py` self-match). P8 additionally
 demands that ANY paid pod lane's `schedule:` trigger, if one is ever added,
 is a reviewed `PAID_LANE_CRON_ALLOWLIST` entry naming its own never-vacuous
-arm — a lever that makes a future cron on a driver for this lane a
-deliberate, reviewed act rather than a silent default. Nothing about a
-release depends on this leg; the release verdict is the prove lane's.
+arm — `gpu-cluster.yml` carries no `schedule:` at all today, so this leg
+adds nothing to that allowlist. Nothing about a release depends on this
+leg; the release verdict is the prove lane's.
 
 **Known-unmeasured.** This leg proves world 2 only. Whether the NCCL pin set
 (`NCCL_SOCKET_IFNAME=ens1` and friends) that works at world 2 still suffices

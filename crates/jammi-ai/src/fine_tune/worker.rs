@@ -3105,10 +3105,10 @@ impl JobWorker {
         // lease hold and cancel-request watcher already live and no other
         // `Arc<Catalog>` clone constructed yet (in particular, before
         // `RunFineTuneParams`'s own clone below), when a test has armed
-        // `training_test_hooks::arm_pause_before_spawn_blocking` — see that
-        // function's doc.
+        // `training_test_hooks::arm_pause_before_spawn_blocking` for THIS
+        // job — see that function's doc.
         #[cfg(feature = "test-hooks")]
-        training_test_hooks::checkpoint_before_spawn_blocking().await;
+        training_test_hooks::checkpoint_before_spawn_blocking(job_id).await;
 
         let base_model = common.base_model.clone();
         let cancel_for_classify = Arc::clone(cancel);
@@ -5855,42 +5855,69 @@ pub mod training_test_hooks {
             .collect()
     }
 
-    /// One-shot pause slot: `Some` once armed, taken (and thereby disarmed)
-    /// the first time [`checkpoint_before_spawn_blocking`] runs after that.
-    fn pause_slot() -> &'static Mutex<Option<oneshot::Sender<()>>> {
-        static SLOT: OnceLock<Mutex<Option<oneshot::Sender<()>>>> = OnceLock::new();
-        SLOT.get_or_init(|| Mutex::new(None))
+    /// One armed pause, keyed by the job whose `train_fine_tune` call it is
+    /// for.
+    struct ArmedPause {
+        job_id: String,
+        tx: oneshot::Sender<()>,
     }
 
-    /// Arm a one-shot pause just before the NEXT `train_fine_tune` call
+    /// Every pause currently armed, one entry per job. Keyed by job — never
+    /// a process-global "the next caller" slot — for the same reason every
+    /// other park in this module is keyed (`ParkPoint` by job, the reclaim
+    /// and rendezvous parks by instance): the test binary runs its tests
+    /// concurrently in ONE process, so an unkeyed one-shot is taken by
+    /// whichever fine-tune run happens to reach the checkpoint first — a
+    /// sibling test's run as readily as the arming test's own — and a
+    /// sibling that takes it parks forever before its trainer exists, so
+    /// its epoch-boundary `cancel` read never happens and every bound that
+    /// test placed on observing a cancel or a lease loss elapses.
+    fn armed_pauses() -> &'static Mutex<Vec<ArmedPause>> {
+        static ARMED: OnceLock<Mutex<Vec<ArmedPause>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Arm a one-shot pause just before `job_id`'s `train_fine_tune` call
     /// dispatches its training loop to `spawn_blocking`. The returned
-    /// receiver resolves once the run has actually reached that checkpoint —
-    /// with the job's lease hold and cancel-request watcher already
-    /// constructed and live, and no training thread spawned yet — so a test
-    /// can force `run_claimed_job`'s future to be dropped (or its owning
-    /// task aborted, reproducing `EmbeddedWorker::drop`'s exact action)
-    /// right there, with no `spawn_blocking` training thread in the picture
-    /// to hold its own independent `Arc<Catalog>` clone and confound the
-    /// release check this hook exists for.
-    pub fn arm_pause_before_spawn_blocking() -> oneshot::Receiver<()> {
+    /// receiver resolves once THAT job's run has actually reached the
+    /// checkpoint — with the job's lease hold and cancel-request watcher
+    /// already constructed and live, and no training thread spawned yet —
+    /// so a test can force `run_claimed_job`'s future to be dropped (or its
+    /// owning task aborted, reproducing `EmbeddedWorker::drop`'s exact
+    /// action) right there, with no `spawn_blocking` training thread in the
+    /// picture to hold its own independent `Arc<Catalog>` clone and
+    /// confound the release check this hook exists for. Any other job's run
+    /// passes the checkpoint untouched (see [`armed_pauses`]).
+    pub fn arm_pause_before_spawn_blocking(job_id: &str) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
-        *pause_slot().lock().unwrap_or_else(PoisonError::into_inner) = Some(tx);
+        armed_pauses()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(ArmedPause {
+                job_id: job_id.to_string(),
+                tx,
+            });
         rx
     }
 
     /// Called from inside `train_fine_tune`, immediately before it
-    /// dispatches to `spawn_blocking`. A no-op unless a pause is armed; when
-    /// one is, this signals arrival on the armed receiver and then parks
+    /// dispatches `job_id`'s training loop to `spawn_blocking`. A no-op
+    /// unless a pause is armed for THIS job; when one is, this takes it
+    /// (disarming it), signals arrival on the armed receiver and then parks
     /// forever (never resolves on its own) — the test that armed the pause
     /// is expected to abort the task holding this `.await` (or otherwise
     /// drop the future) rather than release it, so nothing here needs a
     /// resume path.
-    pub(crate) async fn checkpoint_before_spawn_blocking() {
-        let armed = pause_slot()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(tx) = armed {
+    pub(crate) async fn checkpoint_before_spawn_blocking(job_id: &str) {
+        let armed = {
+            let mut list = armed_pauses()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            list.iter()
+                .position(|a| a.job_id == job_id)
+                .map(|i| list.remove(i))
+        };
+        if let Some(ArmedPause { tx, .. }) = armed {
             let _ = tx.send(());
             std::future::pending::<()>().await;
         }
@@ -5959,6 +5986,56 @@ pub mod training_test_hooks {
             .rev()
             .find(|p| p.job_id == job_id)
             .map(|p| p.catalog.strong_count())
+    }
+}
+
+#[cfg(all(test, feature = "test-hooks"))]
+mod training_test_hooks_tests {
+    use std::time::Duration;
+
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    use super::training_test_hooks::{
+        arm_pause_before_spawn_blocking, checkpoint_before_spawn_blocking,
+    };
+
+    /// For every armed pause and every job: the pause is taken by the
+    /// checkpoint of exactly the job it was armed for — a sibling job's
+    /// checkpoint passes through without signalling or parking, the armed
+    /// job's checkpoint signals arrival and parks, and once taken the pause
+    /// is disarmed for that job too.
+    #[tokio::test]
+    async fn an_armed_pause_is_taken_only_by_the_job_it_was_armed_for() {
+        let mut parked = arm_pause_before_spawn_blocking("job-armed");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            checkpoint_before_spawn_blocking("job-sibling"),
+        )
+        .await
+        .expect("a sibling job's checkpoint must pass through a pause armed for another job");
+        assert!(
+            matches!(parked.try_recv(), Err(TryRecvError::Empty)),
+            "the sibling's pass-through must not signal the armed receiver"
+        );
+
+        let own = tokio::spawn(checkpoint_before_spawn_blocking("job-armed"));
+        tokio::time::timeout(Duration::from_secs(5), parked)
+            .await
+            .expect("the armed job's checkpoint must signal its arrival")
+            .expect("the armed sender is only ever consumed by a send");
+        assert!(
+            !own.is_finished(),
+            "the armed job's checkpoint parks after signalling"
+        );
+        own.abort();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            checkpoint_before_spawn_blocking("job-armed"),
+        )
+        .await
+        .expect("a taken pause is disarmed: the same job's next checkpoint passes through");
     }
 }
 

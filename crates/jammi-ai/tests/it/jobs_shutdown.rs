@@ -1333,11 +1333,9 @@ async fn release_and_stop_report_matches_release_job_leases_on_the_pair_that_act
 /// (`jammi_db::store::mutable::test_hook`, the same mechanism and
 /// `#[serial_test::serial(materialization_park)]` key
 /// `release_mid_materialization_resumes_on_the_successor_without_backoff`
-/// uses above) rather than the process-global one-shot
-/// `training_test_hooks::arm_pause_before_spawn_blocking`, whose lack of
-/// per-test scoping was measured to let a DIFFERENT concurrently-running
-/// fine-tune test steal this test's park under full-suite load, silently
-/// turning the parked job into an ordinary one that finishes normally. And
+/// uses above) rather than `training_test_hooks::arm_pause_before_spawn_
+/// blocking`, which parks a fine-tune run and this test's in-flight job is
+/// a compute materialization. And
 /// "the DRAIN wins the handle" is not left to whichever task the runtime
 /// happens to schedule first -- `stop_and_join`'s future is polled EXACTLY
 /// ONCE by hand, off the runtime, with a no-op waker. Its own body runs

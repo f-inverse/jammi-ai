@@ -353,4 +353,21 @@ async fn fresh_instance_malformed_last_seen_at_is_not_fresh_on_both_backends(kin
         !fresh,
         "a last_seen_at that does not parse as a timestamp must never read as fresh"
     );
+    // Tests own their rows: on the shared Postgres database a malformed
+    // `last_seen_at` left behind would fault every sibling's SQL-side sweep
+    // (`prune_instances` casts the column) — the row is removed here.
+    catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            let instance_id = instance_id.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "DELETE FROM instances WHERE instance_id = $1",
+                    &[SqlValue::TextOwned(instance_id)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
 }

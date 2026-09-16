@@ -166,7 +166,24 @@ fn mask_non_code(text: &str) -> String {
         }
         i += 1;
     }
-    out.into_iter().collect()
+    // Byte-preserving: a masked character becomes as many spaces as it
+    // had bytes, so every byte offset computed on the masked text indexes
+    // the SAME position in the original — the fn-body slices below are
+    // taken from the original (its SQL string literals intact) at offsets
+    // found on the masked copy, which a multi-byte character in a comment
+    // (an em-dash) otherwise shifts.
+    let mut masked = String::with_capacity(text.len());
+    for (orig, m) in chars.iter().zip(out.iter()) {
+        if *m == ' ' && *orig != ' ' {
+            for _ in 0..orig.len_utf8() {
+                masked.push(' ');
+            }
+        } else {
+            masked.push(*m);
+        }
+    }
+    debug_assert_eq!(masked.len(), text.len());
+    masked
 }
 
 fn is_ident_byte(b: u8) -> bool {

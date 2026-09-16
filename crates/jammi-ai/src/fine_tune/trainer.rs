@@ -746,7 +746,7 @@ impl TrainingLoopBuilder {
         }
     }
 
-    /// Set what this loop runs AS — see [`TrainingLoop::role`]. The
+    /// Set what this loop runs AS — see `TrainingLoop::role`. The
     /// production worker sets it on every rank (the lease holder on rank 0,
     /// `Rank { rank }` on every other); omit it and [`Self::build`] derives
     /// the role the rank context implies (rank 0 → the loop claimer, the

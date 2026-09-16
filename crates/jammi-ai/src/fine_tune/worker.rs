@@ -102,7 +102,7 @@
 //!
 //! | # | site (function, arm) | holder(s) |
 //! |---|---|---|
-//! | 1 | [`register_job_hold_or_release`] — the lease-hold registration, the `Releasing` self-release arm, the holder accounting (`HostAdmission::job_running`) | training arm: `LoopClaimer`, `Coordinator`; compute arm: `LoopClaimer` |
+//! | 1 | `register_job_hold_or_release` — the lease-hold registration, the `Releasing` self-release arm, the holder accounting (`HostAdmission::job_running`) | training arm: `LoopClaimer`, `Coordinator`; compute arm: `LoopClaimer` |
 //! | 2 | `run_claimed_job_under` — undeserialisable training spec (`mark_acceleration_undetermined` then `record_failed`) | `LoopClaimer` (no spec, no topology) |
 //! | 3 | `run_claimed_job_under` — `Cancelled` with a cancel request observed (`record_failed`) | `LoopClaimer`, `Coordinator` |
 //! | 4 | `run_claimed_job_under` — `Failed` (`record_failed`) | `LoopClaimer`, `Coordinator` |
@@ -117,7 +117,7 @@
 //! | 13 | `run_claimed_compute_job` — partial-result serialisation failure (`record_failed`) | `LoopClaimer` |
 //! | 14 | `run_claimed_compute_job` — result serialisation failure (`record_failed`) | `LoopClaimer` |
 //! | 15 | `run_claimed_compute_job` — `execute_compute` failure (`record_failed`) | `LoopClaimer` |
-//! | 16 | the acceleration report: `compute_and_persist_acceleration_report` (a `Rank` computes and discards) → [`persist_acceleration_report`]; `mark_acceleration_not_applicable`; `mark_acceleration_undetermined` | `LoopClaimer`, `Coordinator` |
+//! | 16 | the acceleration report: `compute_and_persist_acceleration_report` (a `Rank` computes and discards) → `persist_acceleration_report`; `mark_acceleration_not_applicable`; `mark_acceleration_undetermined` | `LoopClaimer`, `Coordinator` |
 //! | 17 | `JobWorker::coordinate` — `record_assembly_outcome`, `release_job_lease` | `Coordinator` |
 //!
 //! `finish_job` (the compute arm's CAS) is reachable only from
@@ -127,7 +127,7 @@
 //! never inside the store. A `Peer` member's body ([`run_member_rank`]) runs
 //! as `RunnerRole::Rank` and ends its session with `RankEvent::Outcome`;
 //! the coordinator publishes only on receipt of every member's `Trained`
-//! outcome carrying its own artifact digest ([`JobWorker::assemble_and_run`]).
+//! outcome carrying its own artifact digest (`JobWorker::assemble_and_run`).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -5405,12 +5405,12 @@ async fn reconcile_member_ends(
 }
 
 /// The digest of the adapter files a rank holds after its run — exactly the
-/// file set [`publish_artifact`] publishes (every regular file directly in
+/// file set `publish_artifact` publishes (every regular file directly in
 /// `dir`, in name order; subdirectories are scratch and are skipped), each
 /// folded as `name`, a NUL, the byte length, the bytes. What a `Peer`
 /// member reports in `Outcome{Trained}` and what the coordinator computes
 /// over its own files to compare against
-/// ([`reconcile_member_ends`]): every rank holds identical weights after
+/// (`reconcile_member_ends`): every rank holds identical weights after
 /// the last step (DESIGN.md §4), so a gang that converged reports one
 /// digest. Not the store's per-file manifest hash: this is a rank-side
 /// fact about local bytes, computed by the ONE function on both sides.
@@ -5486,7 +5486,7 @@ pub enum RankOutcome {
 /// order, under the row's own tenant scope: the spec is reconstructed from
 /// the row (a column-source `fine_tune`, the one kind a `Peer` gang
 /// serves); the recorded training set is bound by name and digest exactly
-/// as a retrying coordinator binds it ([`bind_recorded_training_set`] —
+/// as a retrying coordinator binds it (`bind_recorded_training_set` —
 /// the identity U5a-2 verified at admission, re-verified here); every leaf
 /// of the table this rank's partition reads is verified against the
 /// sidecar's inventory BEFORE the first collective
@@ -5494,7 +5494,7 @@ pub enum RankOutcome {
 /// `BlockByGlobalBatch` every row group carries rows of every rank, so the
 /// partition's leaves are the object's; a bad leaf is the member-scoped
 /// `Aborted{StoreUnavailable}`); the source is bound through the SAME
-/// [`bind_training_source`] rank 0 used; the base model is loaded; the
+/// `bind_training_source` rank 0 used; the base model is loaded; the
 /// member's `Peer` is built over `link` at the deployment's rank timeout
 /// and cap; and `run_fine_tune_blocking` runs on the blocking pool under
 /// the witness minted at ITS OWN `BlockingCall::spawn_blocking` — the third
@@ -7177,7 +7177,6 @@ fn run_fine_tune_blocking(
         cancel,
         hub,
     } = params;
-    let rank = role.rank();
     #[cfg(feature = "test-hooks")]
     training_test_hooks::note_runner_role(&job_id, role);
     // DESIGN.md §4: "each rank's dropout seed derives as `f(seed, rank)`" —
@@ -7332,7 +7331,7 @@ fn run_fine_tune_blocking(
     // so a gang oracle can assert distinct dropout seeds over byte-identical
     // initial weights through the real `run_spec`.
     #[cfg(feature = "test-hooks")]
-    training_test_hooks::note_rank_target(&job_id, rank, dropout_seed, &target)?;
+    training_test_hooks::note_rank_target(&job_id, role.rank(), dropout_seed, &target)?;
 
     let tenant = catalog.current_tenant();
     let resume = discover_resume(&artifact_store, tenant, &job_id, &device)?;

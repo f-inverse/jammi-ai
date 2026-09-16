@@ -483,6 +483,12 @@ pub async fn start_engine_server_with_devices(devices: usize) -> EngineServer {
     let mut cfg = jammi_test_utils::test_config(dir.path());
     cfg.gpu.device = 0;
     cfg.gpu.devices = Some((0..devices as i32).collect());
+    // The submit edge is bounded by the serveable world (`[distributed]
+    // max_world_size`, U5b-1b-ii), not by this host's device count: a
+    // fixture that declares `devices` ranks serveable declares both, so a
+    // two-rank submit is admitted on a two-device fixture and refused on a
+    // one-device one, as the wire-vs-embedded parity rows expect.
+    cfg.distributed.max_world_size = devices as u32;
     cfg.gpu
         .validate()
         .expect("this fixture's device list is a loadable one");

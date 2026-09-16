@@ -90,6 +90,8 @@ crates/jammi-ai/tests/gpu_capability/gang_nccl.rs::serial_cuda_device_or_require
 crates/jammi-ai/tests/gpu_capability/gang_nccl.rs::second_cuda_device_or_require
 crates/jammi-ai/tests/gpu_capability/gang_nccl.rs::serial_cuda_device_or_require_two_hosts
 crates/jammi-ai/tests/gpu_capability/gang_nccl.rs::two_hosts_env_or_require
+crates/jammi-ai/tests/gpu_capability/gang_pod_leg.rs::serial_cuda_device_or_require
+crates/jammi-ai/tests/gpu_capability/gang_pod_leg.rs::second_cuda_device_or_require
 crates/jammi-ai/tests/it/channel_contract.rs::regenerate_goldens_requested
 crates/jammi-ai/tests/it/fine_tune.rs::chmod_bypassed
 crates/jammi-ai/tests/it/models.rs::chmod_bypassed

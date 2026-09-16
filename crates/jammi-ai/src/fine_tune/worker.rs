@@ -3107,12 +3107,15 @@ impl JobWorker {
                 spec_schema_version: crate::fine_tune::spec::FINE_TUNE_SPEC_SCHEMA_VERSION,
                 base_model_id: canonical_model_id,
                 world_size: common.world_size,
-                // #500 U4b: this deployment's own gang topology at claim
-                // time — `[worker] collective`'s canonical `Display` token
-                // and `[worker] local_ranks` — recorded alongside (never
-                // instead of) the job's own declared `world_size` above.
-                collective: session.inner_config().worker.collective.to_string(),
-                local_ranks: session.inner_config().worker.local_ranks,
+                // #500 U4b/U5b-1b-ii: the topology THIS run executes at —
+                // the collective it reduces over and the ranks this host
+                // runs — read off the decided `topology`, never off the
+                // `[worker]` selection (`auto` resolves differently on
+                // different hosts, and `[worker] local_ranks` is a capacity,
+                // not what the run used); recorded alongside (never instead
+                // of) the job's own declared `world_size` above.
+                collective: topology.collective_token().to_string(),
+                local_ranks: topology.host_ranks(),
             };
             // NO input anchor is recorded for the `FineTune` materialization
             // — removed, not reshaped into a new kind, because the prior
@@ -4494,6 +4497,34 @@ enum RankTopology {
     Single,
     Local { world: u32 },
     Peer { world: u32, coordinator: Arc<Peer> },
+}
+
+impl RankTopology {
+    /// The canonical token `ProducingDescriptor::FineTune::collective`
+    /// records: the collective THIS run reduces over (`Single` runs the
+    /// gang-of-one `Noop`, `Local` the in-process `LocalGang`, `Peer` the
+    /// coordinator's `Peer`) —
+    /// a total function of the decided topology, so the manifest names what
+    /// the run used rather than the `[worker] collective` selection it was
+    /// configured with.
+    fn collective_token(&self) -> &'static str {
+        match self {
+            Self::Single => "noop",
+            Self::Local { .. } => "local",
+            Self::Peer { .. } => "peer",
+        }
+    }
+
+    /// The ranks THIS HOST runs for the attempt —
+    /// `ProducingDescriptor::FineTune::local_ranks`: one for `Single`, the
+    /// whole gang for an in-process `Local` gang, and one (rank 0, the
+    /// coordinator) for a `Peer` gang whose other ranks live on other hosts.
+    fn host_ranks(&self) -> u32 {
+        match self {
+            Self::Single | Self::Peer { .. } => 1,
+            Self::Local { world } => *world,
+        }
+    }
 }
 
 /// The training-set identity pair the coordinator writes onto the job row
@@ -8619,6 +8650,49 @@ mod tests {
     use candle_core::Tensor;
 
     use super::*;
+
+    /// The manifest's topology determinants name what the run EXECUTED at,
+    /// as a total function of the decided `RankTopology` — never the
+    /// `[worker]` selection: `Single` is the gang-of-one `Noop` on one
+    /// rank, `Local { world }` is the in-process gang with every rank on
+    /// this host, and `Peer { world }` is rank 0 alone on this host over
+    /// the coordinator's collective. Every arm is sampled; the match in
+    /// each method is exhaustive, so a new variant fails to compile before
+    /// it can record the wrong token. (A tokio test: a `CoordinatorLink`
+    /// binds the runtime its stream lives on at construction.)
+    #[tokio::test]
+    async fn rank_topology_records_the_executed_collective_and_host_ranks() {
+        let (_c_out_tx, c_out_rx) = tokio::sync::mpsc::channel(4);
+        let (c_in_tx, _c_in_rx) = tokio::sync::mpsc::channel(4);
+        let link = CoordinatorLink::from_channels(1, c_out_rx, c_in_tx).expect("link");
+        let coordinator = Arc::new(
+            Peer::coordinator(vec![link], candle_core::Device::Cpu, 1 << 20)
+                .expect("a one-member coordinator"),
+        );
+        let samples = [
+            (RankTopology::Single, "noop", 1),
+            (RankTopology::Local { world: 3 }, "local", 3),
+            (
+                RankTopology::Peer {
+                    world: 2,
+                    coordinator,
+                },
+                "peer",
+                1,
+            ),
+        ];
+        for (topology, token, ranks) in &samples {
+            assert_eq!(topology.collective_token(), *token);
+            assert_eq!(topology.host_ranks(), *ranks);
+        }
+        // Non-degeneracy: the three arms are pairwise distinct on the
+        // token, so a collapsed match could not pass.
+        let tokens: std::collections::BTreeSet<&str> = samples
+            .iter()
+            .map(|(t, _, _)| t.collective_token())
+            .collect();
+        assert_eq!(tokens.len(), 3);
+    }
 
     /// UNITS.md § U5b-1b-ii: every exit arm of the coordinator body records
     /// exactly one `AssemblyOutcome` through the total table — and only the

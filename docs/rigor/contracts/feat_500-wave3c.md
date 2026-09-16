@@ -27,8 +27,14 @@ non-pytest lanes, issue #539), #574 (a malformed lease timestamp as a row fact o
 U7b-A2b (the two-host cluster driver, its label-only workflow and the id-secrecy scan — once
 "filed, not scheduled"; built here because the wave's cluster-leg artifact cannot exist without
 it), and the three `main` defects of §9a. The pod-leg and cluster-leg artifacts are produced by
-live RunPod runs ON THIS BRANCH (the pod leg dispatched at `b172ea8c`; the cluster leg once A2b
-lands) and committed as their own `artifact(...)` commits under the registry's rules.
+live RunPod runs ON THIS BRANCH and committed as their own `artifact(...)` commits under the
+registry's rules. The pod leg's is committed (§8d). The cluster leg ran once here (workflow
+35055952682, the `run-cluster` label at `2e43af22`) and exited 75: no SECURE data center offered
+`NVIDIA A100-SXM4-80GB` at `MEDIUM` for the CLUSTER product (every one `LOW`; the same for H100 and
+H200 when the lead read the catalog), nothing billed. Its artifact is committed from the first
+capacity-green run — `workflow_dispatch` on `main` after this merges, or a re-label here — and plan
+row C9 stays open on that run alone; the driver's per-data-center threshold is kept (A1 in its
+header: co-placement needs ONE data center, and the account-wide figure does not establish it).
 
 Each unit's section below is the implementer's contract file, folded by the lead after the
 lead opened every cited line and re-ran every named oracle on the consolidated tree; every
@@ -133,8 +139,10 @@ fields landed, as designed).
 updated to match (the only other production-shape construction site in that crate).
 
 **`crates/jammi-ai/src/fine_tune/worker.rs`**: `train_fine_tune`'s manifest-descriptor
-construction populates `collective`/`local_ranks` from `session.inner_config().worker` at
-claim time.
+construction populated `collective`/`local_ranks` from `session.inner_config().worker` at
+claim time — U4b's stage, where the config was the only source. Since §6 decides the run's
+topology before this site, it records the topology the run executes at (§8d, the phase-5
+oracle's finding).
 
 **`crates/jammi-db/src/config/mod.rs`, `config/tests.rs`, `config/host_memory.rs`,
 `crates/jammi-ai/src/fine_tune/collective/mod.rs`, `docs/guide/src/configuration.md`**:
@@ -3005,6 +3013,33 @@ c752cccd fix(ci): #500 U7b-A2b — F1's own SIGINT oracle was flaky, unrelated t
 - Four server tests red on the consolidated tree: the terminal-write oracle's source mask kept the CHAR count while its offsets are BYTES (a multi-byte character in a comment shifted the fn-body slice) — the mask is byte-preserving now, in both oracles; three remote-compute rows submit two-rank specs under the new serveable-world bound — the server fixture declares `n` ranks serveable beside `n` devices.
 - The Postgres test-hooks lane: #574's malformed-stamp row, left on the shared database, faulted the sibling prune test's SQL-side sweep — the test deletes its row; the product-side residual (one unreadable stamp faults every SQL-side sweep: `prune_instances`, `list_gang_members`, `peer_addr_of`, claim/reclaim) is **issue #585**, UNCOVERED here; the root fix is a schema-edge domain on the stamp columns, which would also retire #574's `Undecodable` arm.
 - Four CI lanes (OSS-only build, Python, Smoke, dep-DAG freshness) red on one cause: a `rank` binding in the rank body read only under test-hooks, dead under every other build's denied warnings.
+- The draft PR's CI on `2e43af22`: `check_flash_attn_closure` refused the cluster driver's two cuda-bearing
+  tuples as unlisted — the gate enumerates every gated tuple's origin under `ci/scripts/**` and admits it
+  only from `PROVE_SCOPE` or `EXEMPT_SCOPE`, and A2b registered the driver with every other gate but this
+  one. The driver has its own `EXEMPT_SCOPE` row (the same reason as the pod leg's: a distributed-training
+  correctness surface that declares nothing in `prove_lane.crates`) and the self-test fixture the row
+  requires (a row without a fixture reds the GOOD fixture by construction). Rustdoc under `-D warnings`
+  refused three intra-doc links in the `worker.rs`/`role.rs` module docs that named `LeaseHolder`,
+  `RunnerRole` and `LeaseHolder::LoopClaimer` bare from a scope where they are not imported; they name
+  `crate::fine_tune::role::…` now. Both in one commit; the merge path's static, guard and swarm stages were
+  re-run on it (§10) and the tests stage's evidence from `2e43af22` carries: the delta is a gate's scope
+  table, its fixture, and doc comments — no test target's code changed.
+- The phase-5 oracle (PASS at `2f27d6a1`, §10) found the manifest's `collective` determinant recording
+  the `[worker] collective` SELECTION (`auto|nccl|cpu`) where the field's own contract says the
+  collective the run reduced over (`noop|local|peer|nccl`): `auto` resolves differently on different
+  hosts, so the recorded token was neither the determinant nor a stable name for it; `local_ranks`
+  recorded the `[worker] local_ranks` CAPACITY where the field says the width this host ran at. Both
+  are total functions of the `RankTopology` §6 decides before the descriptor is built, and the
+  descriptor reads them off it (`RankTopology::collective_token`/`host_ranks`: `Single` → `noop`/1,
+  `Local { world }` → `local`/`world`, `Peer` → `peer`/1 — rank 0 alone on this host); the unit oracle
+  `rank_topology_records_the_executed_collective_and_host_ranks` samples every arm with a
+  non-degeneracy check, and each match is exhaustive. The identity consequence of the old token was
+  bounded (the environment folds the device; `Peer` ≡ `Local` bit-for-bit by §3's parity oracles), which
+  is why the oracle did not block; it is fixed at the root rather than reconciled in the doc. The oracle's
+  second residual — required fields added to the persisted `FineTune` descriptor at an unchanged
+  `MANIFEST_VERSION` make a pre-existing FineTune sidecar a hard decode error — is the variant's
+  designed behaviour for determinant growth (K1 replay for this variant is retrain; no external
+  consumers; the release is held), stated here, not changed.
 - The pod leg: run 3 measured the property (§2c) and its artifact is committed; run 4 (workflow 35054325406, on `ddd68928`) is the fully green job after the pod's clone was deepened blobless for the registry's ancestry rule.
 
 ## 9. Pressure round (phase 1, executed at `856ec8dd` before the code landed) — REFINE, eight blocks folded

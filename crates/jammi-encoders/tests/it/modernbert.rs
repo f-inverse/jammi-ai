@@ -78,6 +78,7 @@ fn modernbert_loads_with_target_modules() {
         rank_pattern: &empty_pattern,
         init_mode: LoraInitMode::ZerosB,
         seed: 0,
+        dropout_seed: 0,
     };
 
     let model = ModernBert::builder()
@@ -379,6 +380,7 @@ fn lora_targets_wqkv_wo() -> LoraBuildConfig<'static> {
         rank_pattern: empty_pattern,
         init_mode: LoraInitMode::ZerosB,
         seed: 42,
+        dropout_seed: 42,
     }
 }
 

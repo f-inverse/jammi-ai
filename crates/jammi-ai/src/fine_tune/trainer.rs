@@ -441,6 +441,47 @@ impl RankContext {
     }
 }
 
+/// A `u64` dropout position as four 16-bit limbs, least significant first,
+/// each exact in `f32` (`<= 0xFFFF < 2^24`) — the encoding
+/// `TrainingLoop::gather_dropout_positions` carries over a collective, so
+/// the gathered tensor is a dtype every collective carries (`f32`; the
+/// `Peer` wire refuses `f64`) and EVERY `u64` round-trips exactly
+/// ([`decode_dropout_positions`]), not only those below `2^53`.
+pub(crate) fn encode_dropout_positions(positions: &[u64]) -> Vec<f32> {
+    positions
+        .iter()
+        .flat_map(|&v| (0..4).map(move |limb| ((v >> (16 * limb)) & 0xFFFF) as f32))
+        .collect()
+}
+
+/// The inverse of [`encode_dropout_positions`]; a row whose length is not a
+/// multiple of four, or a limb outside `0..=0xFFFF` or non-integral, is a
+/// typed error — a gathered row that is not this encoding is a gang whose
+/// ranks disagree about what they gathered.
+pub(crate) fn decode_dropout_positions(limbs: &[f32]) -> Result<Vec<u64>> {
+    if limbs.len() % 4 != 0 {
+        return Err(JammiError::FineTune(format!(
+            "dropout position gather: a row of {} limbs is not four per position",
+            limbs.len()
+        )));
+    }
+    limbs
+        .chunks_exact(4)
+        .map(|chunk| {
+            let mut value = 0u64;
+            for (limb, &raw) in chunk.iter().enumerate() {
+                if !(0.0..=65535.0).contains(&raw) || raw.fract() != 0.0 {
+                    return Err(JammiError::FineTune(format!(
+                        "dropout position gather: limb {raw} is not a 16-bit integer"
+                    )));
+                }
+                value |= (raw as u64) << (16 * limb);
+            }
+            Ok(value)
+        })
+        .collect()
+}
+
 /// DESIGN.md §4/§6's lockstep control word: the bit [`TrainingLoop::
 /// process_batch_loss`] sets in its `all_reduce_max_flags` call when THIS
 /// rank's own micro-batch loss is `NaN` or `> 100`. `all_reduce_max_flags`
@@ -4537,13 +4578,15 @@ impl TrainingLoop {
     /// SAME map on every rank, never a partial one only rank 0 gets, so this
     /// function's own type never leaks which rank is about to use it.
     ///
-    /// Encodes each rank's positions as one row of a `(1, n)` `f64` tensor
+    /// Encodes each rank's positions as one row of a `(1, 4n)` `f32` tensor
     /// (`n` = this run's dropout-layer count, identical on every rank — the
-    /// same architecture), name-sorted so every rank fills the SAME column
-    /// for the SAME layer without exchanging names; `all_gather`s it (one
-    /// row per rank, rank order); reads the `(world, n)` result back into a
-    /// per-rank map. `f64` carries a Philox forward-counter value (a small
-    /// integer) exactly — no rounding risk for any realistic run length.
+    /// same architecture), name-sorted so every rank fills the SAME columns
+    /// for the SAME layer without exchanging names, each `u64` position as
+    /// its four 16-bit limbs ([`encode_dropout_positions`] — every limb is
+    /// exact in `f32`, so every `u64` round-trips, and `f32` is a dtype every
+    /// collective carries: the `Peer` wire refuses `f64`, U5b-1b-i P9);
+    /// `all_gather`s it (one row per rank, rank order); reads the `(world,
+    /// 4n)` result back into a per-rank map ([`decode_dropout_positions`]).
     ///
     /// At `W = 1` (`Noop`) `all_gather` is the identity, so the returned map
     /// always has exactly the one entry for rank 0 — the pre-U4b flat
@@ -4556,19 +4599,21 @@ impl TrainingLoop {
         let local = self.target.dropout_positions()?;
         let mut names: Vec<String> = local.keys().cloned().collect();
         names.sort();
-        let values: Vec<f64> = names.iter().map(|n| local[n] as f64).collect();
-        let local_tensor = Tensor::from_vec(values, (1, names.len()), &self.device)
+        let positions: Vec<u64> = names.iter().map(|n| local[n]).collect();
+        let values = encode_dropout_positions(&positions);
+        let local_tensor = Tensor::from_vec(values, (1, names.len() * 4), &self.device)
             .map_err(|e| JammiError::FineTune(format!("dropout position tensor: {e}")))?;
         let counts = vec![1usize; self.rank_ctx.world() as usize];
         let gathered = self.rank_ctx.all_gather(call, &local_tensor, &counts)?;
-        let gathered_rows: Vec<Vec<f64>> = gathered
+        let gathered_rows: Vec<Vec<f32>> = gathered
             .to_vec2()
             .map_err(|e| JammiError::FineTune(format!("dropout position gather readback: {e}")))?;
         let mut by_rank = HashMap::with_capacity(gathered_rows.len());
         for (rank, row) in gathered_rows.into_iter().enumerate() {
+            let decoded = decode_dropout_positions(&row)?;
             let mut m = HashMap::with_capacity(names.len());
-            for (name, v) in names.iter().zip(row) {
-                m.insert(name.clone(), v.round() as u64);
+            for (name, v) in names.iter().zip(decoded) {
+                m.insert(name.clone(), v);
             }
             by_rank.insert(rank as u32, m);
         }
@@ -13852,6 +13897,7 @@ mod encoder_adapters_training_state_tests {
             rank_pattern: &empty_ranks,
             init_mode: LoraInitMode::ZerosB,
             seed: 7,
+            dropout_seed: 7,
         };
         let adapter_cfg = AdapterConfig::from_build(
             "modernbert",
@@ -14138,6 +14184,7 @@ mod media_front_end_wall_tests {
             rank_pattern: &empty_ranks,
             init_mode: LoraInitMode::ZerosB,
             seed: 7,
+            dropout_seed: 7,
         };
         let adapter_cfg = AdapterConfig::from_build(
             "clap_audio_model",
@@ -15458,5 +15505,44 @@ mod decomposition_oracle_tests {
             .unwrap(),
         };
         assert_decomposition_matches(&loop_, &batch, "Matryoshka MNRL/Pairs (dims=[4, 2])");
+    }
+}
+
+#[cfg(test)]
+mod dropout_position_codec_tests {
+    use super::{decode_dropout_positions, encode_dropout_positions};
+
+    /// Every `u64` round-trips through the four-limb `f32` encoding — the
+    /// values `f64` could NOT carry (`2^53 + 1`, `u64::MAX`) included — and
+    /// a row that is not the encoding is refused, never mis-decoded.
+    #[test]
+    fn every_u64_position_round_trips_through_four_f32_limbs() {
+        let positions = [
+            0u64,
+            1,
+            0xFFFF,
+            0x1_0000,
+            (1 << 24) + 1,
+            (1 << 53) + 1,
+            u64::MAX,
+        ];
+        let limbs = encode_dropout_positions(&positions);
+        assert_eq!(limbs.len(), positions.len() * 4);
+        assert!(limbs
+            .iter()
+            .all(|l| (0.0..=65535.0).contains(l) && l.fract() == 0.0));
+        assert_eq!(decode_dropout_positions(&limbs).unwrap(), positions);
+        assert!(
+            decode_dropout_positions(&limbs[..3]).is_err(),
+            "not four per position"
+        );
+        assert!(
+            decode_dropout_positions(&[0.5, 0.0, 0.0, 0.0]).is_err(),
+            "a non-integral limb is refused"
+        );
+        assert!(
+            decode_dropout_positions(&[65536.0, 0.0, 0.0, 0.0]).is_err(),
+            "a limb past 16 bits is refused"
+        );
     }
 }

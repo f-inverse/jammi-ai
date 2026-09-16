@@ -2420,7 +2420,12 @@ staleness→recompute loop — that is the platform's, not the engine's
   `LoraBuildConfig` struct): borrowed-ref, `Copy`, stack-built per call.
   `should_apply_lora` uses **suffix** match (`ends_with`); `effective_rank` uses
   **substring** match (`contains`) — *different semantics, do not conflate*.
-  `LoraBuildConfig::frozen()` is the no-LoRA default.
+  `LoraBuildConfig::frozen()` is the no-LoRA default. Two seeds, split (plan 67 U4b):
+  `seed` keys the A/B init draw, `dropout_seed` the mask draw — every tower site
+  (`LoraSite::wrap` and the BERT family's own builders) calls
+  `LoraLinear::new_with_base_seeded(.., seed, dropout_seed, ..)`; a gang's ranks share
+  `seed` and differ in `dropout_seed` (§2.8d), a single-rank run passes one value for
+  both.
 - **`layers_to_transform` and the UNINDEXED site** — `crates/jammi-lora/src/config.rs`
   (the `should_apply_lora` fn) takes `layer_idx: Option<usize>`, the single authority for
   both halves of the selection. `None` means the site belongs to no numbered repeating
@@ -3864,7 +3869,15 @@ rank 0 on the blocking pool, every other local rank on its own
 `BlockingCall::spawn_thread`; the other ranks are joined before rank 0's
 result is read, and a rank that errored or panicked makes the whole run a
 failure — rank 0's artifact is never published over a gang that did not
-complete. Rank 0 alone persists the acceleration report.
+complete. Rank 0 alone persists the acceleration report. **Every rank's model is built
+with its own dropout seed** (`run_fine_tune_blocking`): `RankContext::dropout_seed(config.seed)`
+— rank 0 (and the single rank) is the identity, so W=1 is byte-unchanged — goes to the
+`_for_rank` head builders (`fine_tune/lora.rs`) and to `LoraBuildConfig::dropout_seed` for an
+encoder-adapters target, while the A/B init seed stays `config.seed` on every rank: the ranks
+start from byte-identical adapter weights and draw distinct masks (DESIGN.md §4). The
+`test-hooks` record `training_test_hooks::rank_targets_for` captures each rank's dropout seed,
+its head layers' `dropout_run_seed`s and a pre-step weight digest, and the fan-out oracle
+asserts distinct seeds over equal digests through the real `run_spec`.
 
 **The coordinator body** (`JobWorker::coordinate` → `assemble_and_run`), in
 order: (1) the write-once CAS of the training-set identity pair —

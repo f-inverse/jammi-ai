@@ -450,6 +450,7 @@ fn build_fixture(
         rank_pattern: &empty_ranks,
         init_mode: jammi_lora::LoraInitMode::ZerosB,
         seed: params.seed,
+        dropout_seed: params.seed,
     };
 
     let mut encoder = jammi_encoders::ModernBert::builder()

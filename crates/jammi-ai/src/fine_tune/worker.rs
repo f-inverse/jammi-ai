@@ -1612,17 +1612,49 @@ impl JobWorker {
         // `get_model` runs inside (or after) a `spawn_blocking` thread, which
         // does not inherit the task-local; the predictor's async reads are
         // covered by this scope.
+        // The training-set identity pair a PRIOR attempt of this job
+        // recorded (write-once, `materialize_or_reuse_training_set`): a
+        // retry binds THAT table rather than materializing a fresh one, so
+        // the job's identity — what every member was and will be admitted
+        // against — never moves under a retry. `None` for every job no
+        // coordinator has run yet (and for every single-rank job).
+        let recorded_pair = match (record.training_set_ref, record.training_set_location) {
+            (Some(training_set_ref), Some(training_set_location)) => {
+                Some(TrainingSetIdentityPair {
+                    training_set_ref,
+                    training_set_location,
+                })
+            }
+            _ => None,
+        };
         let outcome = match record.tenant_id {
             Some(tenant) => {
+                let recorded_pair = recorded_pair.clone();
                 session
                     .with_tenant_scoped(tenant, |_scope| {
-                        self.run_spec(session, &catalog, &job_id, spec, &cancel, attempt)
+                        self.run_spec(
+                            session,
+                            &catalog,
+                            &job_id,
+                            spec,
+                            &cancel,
+                            attempt,
+                            recorded_pair,
+                        )
                     })
                     .await
             }
             None => {
-                self.run_spec(session, &catalog, &job_id, spec, &cancel, attempt)
-                    .await
+                self.run_spec(
+                    session,
+                    &catalog,
+                    &job_id,
+                    spec,
+                    &cancel,
+                    attempt,
+                    recorded_pair,
+                )
+                .await
             }
         };
 
@@ -2475,6 +2507,14 @@ impl JobWorker {
         skip(self, session, catalog, spec, cancel),
         fields(job_id = %job_id, worker_id = %self.worker_id)
     )]
+    ///
+    /// `recorded_pair` is the training-set identity pair a prior attempt of
+    /// this job recorded on the row, if any: the FineTune arm then BINDS that
+    /// table ([`bind_recorded_training_set`]) instead of materializing a
+    /// fresh one — a registered source is anchored unpinned, so a fresh
+    /// materialization would mint a new table and the write-once CAS would
+    /// read the retry as a moved claim.
+    #[allow(clippy::too_many_arguments)]
     async fn run_spec(
         &self,
         session: &Arc<InferenceSession>,
@@ -2483,6 +2523,7 @@ impl JobWorker {
         spec: TrainingSpec,
         cancel: &Arc<AtomicBool>,
         attempt: u32,
+        recorded_pair: Option<TrainingSetIdentityPair>,
     ) -> std::result::Result<TrainedArtifact, WorkerJobError> {
         match spec {
             TrainingSpec::FineTune {
@@ -2515,14 +2556,14 @@ impl JobWorker {
                 // is always `true` here.
                 let whole_set_arm = crate::fine_tune::source::whole_set_arm(&common.config, true);
 
-                let (table, training_source) = if whole_set_arm.is_some() {
-                    // Resident: the eager arm — materialise, then read the
-                    // whole table back into memory, HOLDING the eager
-                    // read's pool reservation for the loader's own lifetime
-                    // (#500 U2c c3c, P-R) rather than checking-then-
-                    // releasing it (`training_set::read_back`'s own
-                    // contract, which every OTHER caller still gets).
-                    let table = training_set::materialize_projection_table(
+                // The table: a retry binds the one the row already names
+                // (the job's identity, write-once); a first attempt
+                // materialises (or reuses on the engine's own key).
+                let table = match &recorded_pair {
+                    Some(pair) => bind_recorded_training_set(session, catalog, pair)
+                        .await
+                        .map_err(WorkerJobError::from)?,
+                    None => training_set::materialize_projection_table(
                         session,
                         &source,
                         &columns,
@@ -2530,7 +2571,16 @@ impl JobWorker {
                         detected.format_tag(),
                     )
                     .await
-                    .map_err(WorkerJobError::from)?;
+                    .map_err(WorkerJobError::from)?,
+                };
+
+                let (table, training_source) = if whole_set_arm.is_some() {
+                    // Resident: the eager arm — read the whole table back
+                    // into memory, HOLDING the eager read's pool reservation
+                    // for the loader's own lifetime (#500 U2c c3c, P-R)
+                    // rather than checking-then-releasing it
+                    // (`training_set::read_back`'s own contract, which every
+                    // OTHER caller still gets).
                     let (batches, reservation) =
                         training_set::read_back_with_reservation(session, &table, &columns)
                             .await
@@ -2558,15 +2608,6 @@ impl JobWorker {
                 } else {
                     // Streamed (#500 U2c §10/§11): table only — no row is
                     // ever collected into memory for this arm (F1).
-                    let table = training_set::materialize_projection_table(
-                        session,
-                        &source,
-                        &columns,
-                        task,
-                        detected.format_tag(),
-                    )
-                    .await
-                    .map_err(WorkerJobError::from)?;
                     let total_rows = table.record.row_count;
                     let train_count = crate::fine_tune::data::split_index(
                         total_rows,
@@ -4600,6 +4641,64 @@ pub(crate) fn assign_ranks(
         .collect())
 }
 
+/// Bind the training set a prior attempt recorded on the job row (the
+/// write-once identity pair) for THIS attempt to train from — the retry's
+/// half of "the coordinator materializes or reuses the training set"
+/// (DESIGN.md §4). Resolved by name through the job's own tenant-pinned
+/// catalog, it must be `ready` and its sidecar must verify the recorded
+/// digest — the SAME verify every member is admitted against
+/// (`GangService::run_rank`'s world>1 conjunct) — else the attempt is
+/// refused, typed: a job whose recorded training set is gone or no longer
+/// verifies has lost its identity, and a fresh materialization would train
+/// a different job under the same row. The table is bound on the session
+/// context exactly as the producer's own reuse arm binds one, so the eager
+/// read-back and the streamed opens resolve it like a fresh table.
+async fn bind_recorded_training_set(
+    session: &Arc<InferenceSession>,
+    catalog: &Arc<Catalog>,
+    pair: &TrainingSetIdentityPair,
+) -> Result<jammi_db::store::TrainingSetTable> {
+    let Some(record) = catalog
+        .get_result_table(&pair.training_set_location)
+        .await?
+    else {
+        return Err(JammiError::FineTune(format!(
+            "the job row names training set '{}' but no such table resolves under the job's \
+             tenant: the recorded training set is gone",
+            pair.training_set_location
+        )));
+    };
+    if record.status != jammi_db::catalog::status::ResultTableStatus::Ready.to_string() {
+        return Err(JammiError::FineTune(format!(
+            "the job row names training set '{}' but its status is '{}', not ready",
+            pair.training_set_location, record.status
+        )));
+    }
+    let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path)?;
+    let store = session.result_store();
+    let Some(manifest) = store.read_materialization_manifest(&url).await? else {
+        return Err(JammiError::FineTune(format!(
+            "the job row names training set '{}' but it carries no verifiable sidecar",
+            pair.training_set_location
+        )));
+    };
+    if manifest.artifact.0 != pair.training_set_ref {
+        return Err(JammiError::FineTune(format!(
+            "the job row names training set '{}' at digest {} but its sidecar reads {}: the \
+             recorded training set no longer verifies",
+            pair.training_set_location, pair.training_set_ref, manifest.artifact.0
+        )));
+    }
+    store.bind_result_table(session.context(), &record).await?;
+    Ok(jammi_db::store::TrainingSetTable {
+        record,
+        definition_hash: manifest.definition_hash,
+        outcome: jammi_db::store::CacheOutcome::Reused {
+            table: pair.training_set_location.clone(),
+        },
+    })
+}
+
 /// End every admitted member session in `links` cooperatively (one
 /// `Cancel` each) — the stream close for an attempt that ends before its
 /// `Peer` exists.
@@ -4669,7 +4768,14 @@ impl JobWorker {
                 ),
             }
         }
-        tracing::info!(job_id = %job_id, attempt, world, end = %end, "coordinator attempt ended");
+        tracing::info!(
+            job_id = %job_id,
+            attempt,
+            world,
+            end = %end,
+            end_ordinal = end.ordinal(),
+            "coordinator attempt ended"
+        );
         match (end, artifact, outcome) {
             (CoordinatorEnd::Published, Some(artifact), _) => Ok(artifact),
             (CoordinatorEnd::Published, None, _) => Err(WorkerJobError::Failed(
@@ -5643,6 +5749,82 @@ pub mod training_test_hooks {
             .collect()
     }
 
+    /// One rank's target as built by `run_fine_tune_blocking`, before any
+    /// step: the dropout seed it was given, each head layer's own dropout
+    /// Philox seed (`LoraLinear::dropout_run_seed`; empty for an
+    /// encoder-adapters target, whose per-site seeds are not enumerable
+    /// through `AnyEncoder`), and a SHA-256 over the trainable weights in
+    /// canonical name order.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RankTarget {
+        pub rank: u32,
+        pub dropout_seed: u64,
+        pub layer_dropout_seeds: Vec<Option<u64>>,
+        pub weights_digest: String,
+    }
+
+    fn rank_targets() -> &'static Mutex<Vec<(String, RankTarget)>> {
+        static PROBES: OnceLock<Mutex<Vec<(String, RankTarget)>>> = OnceLock::new();
+        PROBES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub(super) fn note_rank_target(
+        job_id: &str,
+        rank: u32,
+        dropout_seed: u64,
+        target: &crate::fine_tune::target::TrainingTarget,
+    ) -> jammi_db::error::Result<()> {
+        use sha2::Digest;
+        let layer_dropout_seeds = match target {
+            crate::fine_tune::target::TrainingTarget::ProjectionHead { head } => head
+                .layers
+                .iter()
+                .map(|(_, layer)| layer.dropout_run_seed())
+                .collect(),
+            crate::fine_tune::target::TrainingTarget::EncoderAdapters(_) => Vec::new(),
+        };
+        let weights = target.named_trainable_weights()?;
+        let mut names: Vec<&String> = weights.keys().collect();
+        names.sort();
+        let mut hasher = sha2::Sha256::new();
+        for name in names {
+            hasher.update(name.as_bytes());
+            hasher.update([0u8]);
+            let values: Vec<f32> = weights[name]
+                .flatten_all()
+                .map_err(|e| jammi_db::error::JammiError::FineTune(e.to_string()))?
+                .to_vec1()
+                .map_err(|e| jammi_db::error::JammiError::FineTune(e.to_string()))?;
+            for value in values {
+                hasher.update(value.to_le_bytes());
+            }
+        }
+        rank_targets()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((
+                job_id.to_string(),
+                RankTarget {
+                    rank,
+                    dropout_seed,
+                    layer_dropout_seeds,
+                    weights_digest: format!("{:x}", hasher.finalize()),
+                },
+            ));
+        Ok(())
+    }
+
+    /// Every rank target recorded for `job_id`, in build order.
+    pub fn rank_targets_for(job_id: &str) -> Vec<RankTarget> {
+        rank_targets()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(id, _)| id == job_id)
+            .map(|(_, target)| target.clone())
+            .collect()
+    }
+
     /// One recorded coordinator end per attempt: `(attempt, the end's
     /// `Display`, its `ordinal`)`.
     type End = (String, u32, String, usize);
@@ -6027,6 +6209,15 @@ fn run_fine_tune_blocking(
         hub,
     } = params;
     let persist_report = rank == 0;
+    // DESIGN.md §4: "each rank's dropout seed derives as `f(seed, rank)`" —
+    // `RankContext::dropout_seed` (rank 0 is the identity, so the single-rank
+    // run and every rank 0 keep `config.seed` exactly). The A/B INIT seed is
+    // `config.seed` on every rank (the `_for_rank` builders and
+    // `LoraBuildConfig::seed`), so a gang's ranks start from byte-identical
+    // adapter weights and draw distinct masks.
+    let dropout_seed = rank_ctx
+        .as_ref()
+        .map_or(config.seed, |ctx| ctx.dropout_seed(config.seed));
 
     let device = crate::model::backend::candle::select_device(&device_config)?;
     let varmap = VarMap::new();
@@ -6065,27 +6256,35 @@ fn run_fine_tune_blocking(
                     })?
                 }
             };
-            crate::fine_tune::lora::build_classification_head(
+            crate::fine_tune::lora::build_classification_head_for_rank(
                 hidden_size,
                 num_classes,
                 &config,
                 &varmap,
                 &vb,
+                dropout_seed,
             )?
         } else if task == ModelTask::Regression {
             let output_dim = match config.regression_loss.unwrap_or_default() {
                 crate::fine_tune::RegressionLoss::Pinball => config.quantile_levels.len(),
                 _ => 2,
             };
-            crate::fine_tune::lora::build_distribution_head(
+            crate::fine_tune::lora::build_distribution_head_for_rank(
                 hidden_size,
                 output_dim,
                 &config,
                 &varmap,
                 &vb,
+                dropout_seed,
             )?
         } else {
-            crate::fine_tune::lora::build_projection_head(hidden_size, &config, &varmap, &vb)?
+            crate::fine_tune::lora::build_projection_head_for_rank(
+                hidden_size,
+                &config,
+                &varmap,
+                &vb,
+                dropout_seed,
+            )?
         };
         // esc-075: `backbone_dtype` never takes effect on this arm (see
         // `validate_backbone_precision`'s doc), so there is no encoder to probe
@@ -6116,6 +6315,7 @@ fn run_fine_tune_blocking(
             varmap: &varmap,
             device: &device,
             hub: &hub,
+            dropout_seed,
         })?;
         // esc-075: right after `build_encoder_adapters` (which calls
         // `validate_backbone_precision` and materialises the real, dtype-typed
@@ -6155,6 +6355,14 @@ fn run_fine_tune_blocking(
     // tenant regardless of task-local scope, so both the resume-checkpoint
     // read below and every checkpoint the trainer writes land under the
     // SAME tenant segment.
+    // The seed-split oracle's observation point: this rank's target as
+    // BUILT — the dropout seed it was given, each head layer's own dropout
+    // Philox seed, and a digest of the trainable weights before any step —
+    // so a gang oracle can assert distinct dropout seeds over byte-identical
+    // initial weights through the real `run_spec`.
+    #[cfg(feature = "test-hooks")]
+    training_test_hooks::note_rank_target(&job_id, rank, dropout_seed, &target)?;
+
     let tenant = catalog.current_tenant();
     let resume = discover_resume(&artifact_store, tenant, &job_id, &device)?;
 
@@ -6947,6 +7155,12 @@ struct BuildEncoderAdaptersParams<'a> {
     /// the HF-fallback arm threads this through rather than building its own
     /// `hf_hub::api::sync::Api`.
     hub: &'a HubSource,
+    /// This rank's dropout-mask seed (`RankContext::dropout_seed(config.seed)`
+    /// — rank 0 is the identity, so a single-rank run passes `config.seed`):
+    /// the A/B init seed stays `config.seed` on every rank, so every rank of
+    /// a gang starts from identical adapter weights and draws its own masks
+    /// (`LoraBuildConfig::dropout_seed`).
+    dropout_seed: u64,
 }
 
 fn build_encoder_adapters(
@@ -6961,6 +7175,7 @@ fn build_encoder_adapters(
         varmap,
         device,
         hub,
+        dropout_seed,
     } = params;
     use std::path::Path;
 
@@ -7156,6 +7371,7 @@ fn build_encoder_adapters(
         rank_pattern: &config.rank_pattern,
         init_mode: config.init_lora_weights,
         seed: config.seed,
+        dropout_seed,
     };
 
     validate_backbone_precision(config.backbone_dtype, device)?;
@@ -8837,6 +9053,7 @@ mod tests {
                 catalog: &catalog,
                 artifact_store: &artifact_store,
                 config: &training_config,
+                dropout_seed: training_config.seed,
                 task: ModelTask::TextEmbedding,
                 varmap: &varmap,
                 device: &device,
@@ -8931,6 +9148,7 @@ mod tests {
                 catalog: &catalog,
                 artifact_store: &artifact_store,
                 config: &training_config,
+                dropout_seed: training_config.seed,
                 task: ModelTask::TextEmbedding,
                 varmap: &varmap,
                 device: &device,
@@ -9050,6 +9268,7 @@ mod tests {
                 catalog: &catalog,
                 artifact_store: &artifact_store,
                 config: &training_config,
+                dropout_seed: training_config.seed,
                 task: ModelTask::TextEmbedding,
                 varmap: &varmap,
                 device: &device,

@@ -2990,7 +2990,7 @@ impl<'a, 'b> LoraSite<'a, 'b> {
             self.lora.layers_to_transform,
         ) {
             let rank = effective_rank(target_name, self.lora.lora_rank, self.lora.rank_pattern);
-            let lora_linear = LoraLinear::new_with_base(
+            let lora_linear = LoraLinear::new_with_base_seeded(
                 base,
                 rank,
                 self.lora.lora_alpha,
@@ -2998,6 +2998,7 @@ impl<'a, 'b> LoraSite<'a, 'b> {
                 self.lora.init_mode,
                 self.lora.lora_dropout,
                 self.lora.seed,
+                self.lora.dropout_seed,
                 self.varmap,
                 &self.lora_layer_vb.pp(target_name),
             )?;
@@ -5630,6 +5631,7 @@ mod tests {
             rank_pattern: &rank_pattern,
             init_mode: jammi_lora::LoraInitMode::Gaussian,
             seed,
+            dropout_seed: seed,
         };
         let mut model = ModernBert::builder()
             .pooling(Pooling::Mean)

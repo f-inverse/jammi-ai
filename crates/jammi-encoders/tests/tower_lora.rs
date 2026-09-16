@@ -101,6 +101,7 @@ impl LoraFixture {
             rank_pattern: &self.rank_pattern,
             init_mode,
             seed: 0x5eed_1234,
+            dropout_seed: 0x5eed_1234,
         }
     }
 }
@@ -1157,6 +1158,7 @@ fn htsat_layers_to_transform_selects_stages_and_excludes_the_unindexed_head() {
         rank_pattern: &rank_pattern,
         init_mode: LoraInitMode::Gaussian,
         seed: 7,
+        dropout_seed: 7,
     };
     let varmap = VarMap::new();
     let tower = HtsatAudio::builder()

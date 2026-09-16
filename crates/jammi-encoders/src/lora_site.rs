@@ -94,7 +94,7 @@ impl LoraSite<'_> {
             return Ok(MaybeLoraLinear::Frozen(base));
         }
         let rank = effective_rank(module_name, self.lora.lora_rank, self.lora.rank_pattern);
-        let lora_linear = LoraLinear::new_with_base(
+        let lora_linear = LoraLinear::new_with_base_seeded(
             base,
             rank,
             self.lora.lora_alpha,
@@ -102,6 +102,7 @@ impl LoraSite<'_> {
             self.lora.init_mode,
             self.lora.lora_dropout,
             self.lora.seed,
+            self.lora.dropout_seed,
             self.varmap,
             &self.lora_vb.pp(lora_subpath),
         )?;
@@ -144,5 +145,82 @@ impl FrozenSiteHolder {
             lora: &self.lora,
             varmap: &self.varmap,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{Linear, VarBuilder, VarMap};
+    use jammi_lora::{FrozenBase, LoraBuildConfig, LoraInitMode, MaybeLoraLinear};
+
+    use super::LoraSite;
+
+    fn flat(t: &Tensor) -> Vec<u32> {
+        t.flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Wrap one selected site under `(seed, dropout_seed)` and return the
+    /// adapter's `lora_a` bits and its dropout run seed.
+    fn wrap(seed: u64, dropout_seed: u64) -> (Vec<u32>, Option<u64>) {
+        let targets = vec!["q".to_string()];
+        let layers = None;
+        let pattern = HashMap::new();
+        let lora = LoraBuildConfig {
+            target_modules: &targets,
+            layers_to_transform: &layers,
+            lora_rank: 2,
+            lora_alpha: 4.0,
+            use_rslora: false,
+            lora_dropout: Some(0.3),
+            rank_pattern: &pattern,
+            init_mode: LoraInitMode::default(),
+            seed,
+            dropout_seed,
+        };
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+        let site = LoraSite {
+            lora_vb: &vb,
+            layer_idx: None,
+            lora: &lora,
+            varmap: &varmap,
+        };
+        let weight = Tensor::zeros((4, 4), DType::F32, &Device::Cpu).unwrap();
+        let base = FrozenBase::from(Linear::new(weight, None));
+        match site.wrap(base, "q", "q").expect("selected site wraps") {
+            MaybeLoraLinear::Lora(layer) => (flat(&layer.lora_a), layer.dropout_run_seed()),
+            MaybeLoraLinear::Frozen(_) => panic!("`q` is selected: the site must wrap"),
+        }
+    }
+
+    /// Plan 67 U4b's seed split at the tower seam every non-BERT tower's
+    /// sites go through: `LoraBuildConfig::seed` keys the A/B init draw and
+    /// `dropout_seed` keys the mask draw, independently — two sites built
+    /// with the same `seed` and different `dropout_seed`s have byte-identical
+    /// `lora_a` and report each their own dropout run seed, while a different
+    /// `seed` moves `lora_a` (the positive control).
+    #[test]
+    fn the_site_keys_init_by_seed_and_the_masks_by_dropout_seed() {
+        let (a0, run0) = wrap(7, 100);
+        let (a1, run1) = wrap(7, 200);
+        assert_eq!(a0, a1, "the same init seed: byte-identical lora_a");
+        assert_eq!(run0, Some(100));
+        assert_eq!(
+            run1,
+            Some(200),
+            "the mask draw is keyed by dropout_seed alone"
+        );
+        let (a2, run2) = wrap(8, 100);
+        assert_ne!(a0, a2, "a different init seed moves lora_a");
+        assert_eq!(run2, Some(100));
     }
 }

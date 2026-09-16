@@ -1159,6 +1159,7 @@ fn build_encoder_adapters(
         rank_pattern: &empty_ranks,
         init_mode: lora_init,
         seed,
+        dropout_seed: seed,
     };
     let (mut encoder, tower) = match (family, task) {
         (EncoderFamily::ModernBert, Task::Text) => {
@@ -1342,6 +1343,7 @@ fn build_encoder_adapters(
         rank_pattern: &empty_ranks,
         init_mode: lora_init,
         seed,
+        dropout_seed: seed,
     };
     // `model_type` is the base ARCHITECTURE id (`EncoderFamily::
     // adapter_model_type`); `tower` says WHICH tower of a multi-tower

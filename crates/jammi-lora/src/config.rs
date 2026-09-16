@@ -28,10 +28,18 @@ pub struct LoraBuildConfig<'a> {
     pub rank_pattern: &'a HashMap<String, usize>,
     /// How the LoRA A/B matrices are initialised.
     pub init_mode: LoraInitMode,
-    /// Run seed for the LoRA A/B init and the dropout mask. Every adapter draw
-    /// is a pure function of this seed and the parameter's fully-qualified name,
-    /// so the same seed reproduces byte-identical adapters across processes.
+    /// The LoRA A/B INIT seed. Every adapter init draw is a pure function of
+    /// this seed and the parameter's fully-qualified name, so the same seed
+    /// reproduces byte-identical adapters across processes — and across the
+    /// ranks of a gang, which all build from the same value.
     pub seed: u64,
+    /// The dropout-mask seed, split from [`Self::seed`] (plan 67 U4b: "each
+    /// rank's dropout seed derives as `f(seed, rank)`"): a gang's ranks share
+    /// `seed` and differ here, so every rank starts from identical adapter
+    /// weights and draws its own masks. A single-rank run passes the same
+    /// value for both (`LoraLinear::new_with_base`'s own `init_seed ==
+    /// dropout_seed` shape).
+    pub dropout_seed: u64,
 }
 
 static EMPTY_TARGETS: &[String] = &[];
@@ -52,9 +60,10 @@ impl LoraBuildConfig<'static> {
             lora_dropout: None,
             rank_pattern: &EMPTY_RANK_PATTERN,
             init_mode: LoraInitMode::ZerosB,
-            // A frozen encoder installs no adapter, so the seed is never drawn
-            // from; a fixed value keeps `frozen()` const-constructible.
+            // A frozen encoder installs no adapter, so neither seed is ever
+            // drawn from; fixed values keep `frozen()` const-constructible.
             seed: 0,
+            dropout_seed: 0,
         }
     }
 }

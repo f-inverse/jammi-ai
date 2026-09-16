@@ -823,7 +823,7 @@ impl LoraSlot<'_, '_> {
             self.lora.layers_to_transform,
         ) {
             let rank = effective_rank(module_name, self.lora.lora_rank, self.lora.rank_pattern);
-            let lora_linear = LoraLinear::new_with_base(
+            let lora_linear = LoraLinear::new_with_base_seeded(
                 base,
                 rank,
                 self.lora.lora_alpha,
@@ -831,6 +831,7 @@ impl LoraSlot<'_, '_> {
                 self.lora.init_mode,
                 self.lora.lora_dropout,
                 self.lora.seed,
+                self.lora.dropout_seed,
                 self.varmap,
                 &self.lora_layer_vb.pp(module_path),
             )?;

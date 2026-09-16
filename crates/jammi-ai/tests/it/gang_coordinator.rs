@@ -35,7 +35,7 @@ use jammi_ai::fine_tune::data::TrainingDataLoader;
 use jammi_ai::fine_tune::graph_sampler::{
     EdgeProvenance, GraphEdge, GraphFineTuneSources, GraphSampleConfig, GraphSampler, TextNode,
 };
-use jammi_ai::fine_tune::lora::build_projection_head;
+use jammi_ai::fine_tune::lora::build_projection_head_for_rank;
 use jammi_ai::fine_tune::partition::{PartitionRule, PartitionSpec};
 use jammi_ai::fine_tune::source::TrainingSource;
 use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
@@ -67,6 +67,13 @@ pub(crate) fn pairs() -> Vec<(String, String)> {
 /// The U4b gang oracle's config: two epochs, per-rank batch 2, no dropout,
 /// no validation split, a fixed seed.
 pub(crate) fn gang_config(epochs: usize) -> FineTuneConfig {
+    gang_config_with_dropout(epochs, 0.0)
+}
+
+/// [`gang_config`] at an explicit `lora_dropout` — the seed-split oracle
+/// needs a live mask source (`LoraLinear::dropout_run_seed` is `None` at
+/// `lora_dropout == 0`).
+pub(crate) fn gang_config_with_dropout(epochs: usize, lora_dropout: f64) -> FineTuneConfig {
     FineTuneConfig {
         epochs,
         batch_size: 2,
@@ -74,7 +81,7 @@ pub(crate) fn gang_config(epochs: usize) -> FineTuneConfig {
         warmup_steps: 0,
         gradient_accumulation_steps: 1,
         lora_rank: 2,
-        lora_dropout: 0.0,
+        lora_dropout,
         seed: 99,
         early_stopping_metric: EarlyStoppingMetric::TrainLoss,
         early_stopping_patience: 10_000,
@@ -184,13 +191,19 @@ fn graph_loader() -> TrainingDataLoader {
     TrainingDataLoader::from_graph(&sampler).unwrap()
 }
 
+/// The fan-out fixture: `lora_dropout = 0.3`, so the per-rank dropout seed
+/// is a live determinant of the run (and of the byte equality below).
+fn fan_out_config() -> FineTuneConfig {
+    gang_config_with_dropout(2, 0.3)
+}
+
 fn two_rank_graph_spec() -> TrainingSpec {
     TrainingSpec::GraphFineTune {
         sources: graph_sources(),
         sample_config: graph_sample_config(),
         common: TrainingCommon {
             base_model: tiny_bert_model(),
-            config: gang_config(2),
+            config: fan_out_config(),
             world_size: 2,
         },
     }
@@ -418,7 +431,8 @@ fn file_store() -> Arc<ArtifactStore> {
 
 /// The reference: the U4b gang oracle's shape — a two-rank `LocalGang` on
 /// the CPU, each rank a `TrainingLoop` built directly (projection head over
-/// tiny_bert, `gang_config(2)`, `PartitionSpec::for_gang(r, 2, 2, ..)`),
+/// tiny_bert through `build_projection_head_for_rank` at the rank's own
+/// `RankContext::dropout_seed`, `PartitionSpec::for_gang(r, 2, 2, ..)`),
 /// driven through the real `TrainingLoop::run` on its own
 /// `BlockingCall::spawn_thread`; returns rank 0's saved `adapter.safetensors`
 /// bytes. `session` supplies the base model through its model cache (the
@@ -427,6 +441,7 @@ pub(crate) async fn reference_rank0_adapter_bytes(
     session: &Arc<InferenceSession>,
     tag: &str,
     loader: fn() -> TrainingDataLoader,
+    config: FineTuneConfig,
 ) -> Vec<u8> {
     let source = ModelSource::parse(&tiny_bert_model());
     let guard = session
@@ -448,17 +463,19 @@ pub(crate) async fn reference_rank0_adapter_bytes(
             PartitionSpec::for_gang(rank as usize, 2, 2, PartitionRule::BlockByGlobalBatch)
                 .unwrap();
         let rank_ctx = RankContext::new(Arc::new(local), partition);
+        let dropout_seed = rank_ctx.dropout_seed(config.seed);
         let (catalog, dir) = claimed_loop_env(&format!("{tag}-ref-{rank}")).await;
         let base = Arc::clone(&base);
         let store = Arc::clone(&store);
         let runtime = runtime.clone();
         let job_id = job_id.clone();
+        let config = config.clone();
         threads.push(BlockingCall::spawn_thread(move |call| {
             let _runtime = runtime.enter();
-            let config = gang_config(2);
             let varmap = VarMap::new();
             let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
-            let head = build_projection_head(hidden, &config, &varmap, &vb).unwrap();
+            let head = build_projection_head_for_rank(hidden, &config, &varmap, &vb, dropout_seed)
+                .unwrap();
             let mut training_loop =
                 TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
                     .device(Device::Cpu)
@@ -635,8 +652,49 @@ async fn a_local_ranks_two_host_fans_a_two_rank_job_out_through_run_spec_and_pub
     assert_eq!(after.status, "completed", "{after:?}");
     assert_eq!(after.error, None);
 
+    // The seed split, through the real `run_spec` (DESIGN.md §4): the two
+    // ranks' dropout seeds differ (rank 0 keeps `config.seed`, the identity)
+    // and every head layer's own dropout Philox seed is the one its rank was
+    // given, while the ranks' pre-step adapter weights are byte-identical —
+    // the A/B init is keyed by `config.seed` on every rank.
+    let mut targets = training_test_hooks::rank_targets_for(&job_id);
+    targets.sort_by_key(|t| t.rank);
+    assert_eq!(
+        targets.iter().map(|t| t.rank).collect::<Vec<_>>(),
+        vec![0, 1],
+        "one target per rank, both through run_fine_tune_blocking: {targets:?}"
+    );
+    assert_eq!(
+        targets[0].dropout_seed,
+        fan_out_config().seed,
+        "rank 0 is the identity"
+    );
+    assert_ne!(
+        targets[0].dropout_seed, targets[1].dropout_seed,
+        "rank 1 draws its own dropout seed"
+    );
+    for target in &targets {
+        assert!(
+            !target.layer_dropout_seeds.is_empty(),
+            "a projection head has layers"
+        );
+        assert!(
+            target
+                .layer_dropout_seeds
+                .iter()
+                .all(|s| *s == Some(target.dropout_seed)),
+            "every layer's dropout run seed is the rank's own: {target:?}"
+        );
+    }
+    assert_eq!(
+        targets[0].weights_digest, targets[1].weights_digest,
+        "both ranks start from byte-identical adapter weights"
+    );
+
     let published = published_adapter_bytes(&session, &job_id).await;
-    let reference = reference_rank0_adapter_bytes(&session, "local-fanout", graph_loader).await;
+    let reference =
+        reference_rank0_adapter_bytes(&session, "local-fanout", graph_loader, fan_out_config())
+            .await;
     assert!(!published.is_empty());
     assert_eq!(
         published, reference,

@@ -1013,7 +1013,9 @@ fn a_member_that_aborts_its_session_faults_the_coordinator_naming_the_reason() {
         "the round's fault is the coordinator's permanent state"
     );
     assert!(
-        members.iter().all(|member| member.member_aborts().is_empty()),
+        members
+            .iter()
+            .all(|member| member.member_aborts().is_empty()),
         "a member records no aborts: the record is the coordinator's"
     );
 }

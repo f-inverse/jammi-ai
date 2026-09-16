@@ -557,6 +557,7 @@ fn probe_dtype(config: &ModernBertConfig, weights: &Path, dtype: DType, device: 
         rank_pattern: &HashMap::new(),
         init_mode: LoraInitMode::Gaussian,
         seed: 1,
+        dropout_seed: 1,
     };
     let mut model = ModernBert::builder()
         .pooling(Pooling::Mean)
@@ -665,6 +666,7 @@ fn bert_probe_dtype(config: &BertConfig, weights: &Path, dtype: DType, device: &
         rank_pattern: &HashMap::new(),
         init_mode: LoraInitMode::Gaussian,
         seed: 1,
+        dropout_seed: 1,
     };
     let mut model = Bert::builder()
         .pooling(Pooling::Mean)

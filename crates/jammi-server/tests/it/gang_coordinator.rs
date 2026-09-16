@@ -47,7 +47,7 @@ use candle_core::{DType, Device};
 use candle_nn::{VarBuilder, VarMap};
 use jammi_ai::fine_tune::collective::{BlockingCall, LocalGang, Peer};
 use jammi_ai::fine_tune::data::TrainingDataLoader;
-use jammi_ai::fine_tune::lora::build_projection_head;
+use jammi_ai::fine_tune::lora::build_projection_head_for_rank;
 use jammi_ai::fine_tune::partition::{PartitionRule, PartitionSpec};
 use jammi_ai::fine_tune::source::TrainingSource;
 use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
@@ -385,7 +385,14 @@ fn try_run_rank(
     let config = gang_config(2);
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
-    let head = build_projection_head(env.hidden, &config, &varmap, &vb).unwrap();
+    let head = build_projection_head_for_rank(
+        env.hidden,
+        &config,
+        &varmap,
+        &vb,
+        rank_ctx.dropout_seed(config.seed),
+    )
+    .unwrap();
     let mut training_loop =
         TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
             .device(Device::Cpu)

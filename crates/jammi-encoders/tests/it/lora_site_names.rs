@@ -87,6 +87,7 @@ impl Targets {
             // is about WHICH sites exist, never about their values.
             init_mode: LoraInitMode::ZerosB,
             seed: 0x51_7e5,
+            dropout_seed: 0x51_7e5,
         }
     }
 }

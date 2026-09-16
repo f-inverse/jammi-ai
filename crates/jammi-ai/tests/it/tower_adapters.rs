@@ -179,6 +179,7 @@ fn inference_lora(cfg: &AdapterConfig) -> LoraBuildConfig<'_> {
         rank_pattern: &cfg.rank_pattern,
         init_mode: LoraInitMode::ZerosB,
         seed: 0,
+        dropout_seed: 0,
     }
 }
 

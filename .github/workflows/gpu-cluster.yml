@@ -1,8 +1,11 @@
 name: GPU cluster (RunPod)
 
 # Runs the two-HOST NCCL leg (`gang_nccl_two_hosts_reduce_a_known_vector`) on
-# a RunPod CLUSTER — two pods, one A100 each, joined over the cluster's own
-# private overlay network. Driven by `ci/scripts/runpod_gpu_cluster.sh` (see
+# a RunPod CLUSTER — two pods, one GPU each (A100 SXM4 by default; the
+# `gpu_type` input may name another sm_80/86/89/90 part, which the driver
+# maps to the compute capability the members build for and refuses outside
+# that domain before renting), joined over the cluster's own private overlay
+# network. Driven by `ci/scripts/runpod_gpu_cluster.sh` (see
 # that script's own header for the exit contract, the cost derivation, and
 # the artifact it assembles and pulls back). NEVER `gpu-gang.yml` — a
 # separate driver, a separate RunPod object type (a cluster is retired by
@@ -26,7 +29,9 @@ name: GPU cluster (RunPod)
 # `ci/scripts/test_gpu_cluster_lane.sh` re-derives both figures from the
 # driver's own RP_TTL_HOURS and the $1.908 rate and fails if the printed
 # figure and the mechanism disagree. Standing spend authorization
-# (2026-09-13): <= 1 h billed, <= 2 runs.
+# (2026-09-13): <= 1 h billed, <= 2 runs. The figures are for the DEFAULT
+# part: an operator-chosen `gpu_type` bills at RunPod's cluster rate for that
+# part, which nothing here bounds — choosing it is the cost decision.
 #
 # Off the merge path, and NEVER in the critical path of an automated
 # workflow (the same doctrine gpu-prove.yml/gpu-gang.yml both state): GPU
@@ -49,10 +54,13 @@ on:
     inputs:
       gpu_type:
         description: >-
-          RunPod gpuTypeId for BOTH hosts (a cluster is homogeneous). The leg
-          proves two-host NCCL bit-exactness on whatever CUDA part it rents; the
-          default is the plan's A100 SXM4 shape. A cheaper part keeps the cost
-          bound below an upper bound; a dearer one is a deliberate cost decision.
+          RunPod gpuTypeId for BOTH hosts (a cluster is homogeneous). The driver
+          maps it to the compute capability the members build for (sm_80: the
+          A100 parts; sm_86: A40/RTX A6000/A5000; sm_89: L4/L40S/L40/RTX 4090;
+          sm_90: H100 SXM/PCIe/NVL, H200 -- `_rpc_compute_cap_for_gpu_type`) and
+          refuses any other id before renting. The default is the plan's A100
+          SXM4 shape, the one the cost bound is derived for; another part bills
+          at its own cluster rate, a deliberate cost decision.
         required: false
         default: "NVIDIA A100-SXM4-80GB"
         type: string

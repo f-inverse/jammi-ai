@@ -10,8 +10,11 @@
 # runpod_lib.sh's own `rp_cluster_delete`/`rp_cluster_sweep`).
 #
 # WHAT IT RENTS: one RunPod CLUSTER, `podCount: 2`, `gpuCountPerPod: 1`, the
-# `NVIDIA A100-SXM4-80GB` SECURE candidate (`RP_CLUSTER_GPU_TYPE` below) —
-# the one shape S4 measured co-placed on ONE data center. `dataCenterIds` is
+# `RP_CLUSTER_GPU_TYPE` SECURE candidate (default `NVIDIA A100-SXM4-80GB`,
+# the one shape S4 measured co-placed on ONE data center; the workflow's
+# `gpu_type` input may name another part in the sm_80/86/89/90 domain
+# `_rpc_compute_cap_for_gpu_type` maps, and the leg then proves THAT part's
+# SASS — any other gpuTypeId is refused before phase 0). `dataCenterIds` is
 # never left to the scheduler: this driver reads per-data-center
 # availability itself (`GET /v2/catalog/gpus?include=AVAILABILITY&
 # product=CLUSTER&count=1&cloud=SECURE`) and passes only the data
@@ -20,7 +23,12 @@
 # alone does not establish that any single one actually has it (A1).
 #
 # COST BOUND (human-approved, S4's measured $1.908/GPU/h for a SECURE
-# cluster GPU — the catalog's own $1.59 is the POD price, a different rate):
+# cluster GPU — the catalog's own $1.59 is the POD price, a different rate).
+# The figures below are for the DEFAULT part; an operator-chosen
+# `gpu_type` bills at RunPod's cluster rate for that part, which this header
+# and `test_gpu_cluster_lane.sh`'s G4 re-derivation do not bound — choosing
+# it is the cost decision (an H100 SXM cluster ran at ~$6.6/h in run
+# 35127869122):
 #
 #   2 GPUs x $1.908/GPU/h = $3.816/h.
 #
@@ -165,8 +173,27 @@ RP_CLUSTER_MIN_AVAILABILITY="${RP_CLUSTER_MIN_AVAILABILITY:-MEDIUM}"
 RP_CLUSTER_POD_COUNT=2
 RP_CLUSTER_GPU_COUNT_PER_POD=1
 
-# sm_80 (A100) is this leg's device, the same floor the pod leg proves.
-NATIVE_COMPUTE_CAP=80
+# The rented part's compute capability, DERIVED from the gpuTypeId (never a
+# second literal): each member exports it as `CUDA_COMPUTE_CAP` and refuses
+# to build when `nvidia-smi`'s own `compute_cap` disagrees (the tripwire in
+# `_rpc_remote_script`), so the SASS this leg proves is the SASS the rented
+# silicon runs. The domain is the sm_XX set `runpod_gpu_prove.sh` names
+# (sm_80/86/89/90); a gpuTypeId outside it is refused HERE, before phase 0
+# and before anything is rented (exit 2), never on the members after a
+# cluster is billing. `$1`=gpuTypeId -> stdout: the bare numeric cap; rc 1
+# when unknown.
+_rpc_compute_cap_for_gpu_type() {
+  case "${1:?_rpc_compute_cap_for_gpu_type needs a gpuTypeId}" in
+    "NVIDIA A100-SXM4-80GB"|"NVIDIA A100 80GB PCIe"|"NVIDIA A100-PCIE-40GB") echo 80 ;; # sm_80 (Ampere floor)
+    "NVIDIA A40"|"NVIDIA RTX A6000"|"NVIDIA RTX A5000") echo 86 ;;                       # sm_86 (Ampere workstation)
+    "NVIDIA L4"|"NVIDIA L40S"|"NVIDIA L40"|"NVIDIA GeForce RTX 4090") echo 89 ;;         # sm_89 (Ada)
+    "NVIDIA H100 80GB HBM3"|"NVIDIA H100 PCIe"|"NVIDIA H100 NVL"|"NVIDIA H200") echo 90 ;; # sm_90 (Hopper)
+    *) return 1 ;;
+  esac
+}
+# Empty when the gpuTypeId is outside the domain: the main path below
+# refuses on it before phase 0 (a sourced fixture must never `exit`).
+NATIVE_COMPUTE_CAP="$(_rpc_compute_cap_for_gpu_type "$RP_CLUSTER_GPU_TYPE" || true)"
 
 GIT_REPO="${GIT_REPO:-https://github.com/${GITHUB_REPOSITORY:-f-inverse/jammi-ai}.git}"
 GIT_REF="${GIT_REF:-${GITHUB_SHA:-main}}"
@@ -983,6 +1010,10 @@ _rpc_phase() { echo "=== PHASE ($(( SECONDS )))s: $* ==="; }
 
 DEADLINE=$(( SECONDS + RP_TTL_HOURS * 3600 - 600 ))  # T-10m budget cut (F16).
 
+if [ -z "$NATIVE_COMPUTE_CAP" ]; then
+  echo "::error::RP_CLUSTER_GPU_TYPE '${RP_CLUSTER_GPU_TYPE}' is outside this leg's domain (no compute capability mapping in _rpc_compute_cap_for_gpu_type: sm_80/86/89/90 parts only) -- refused before any rent"
+  exit 2
+fi
 _rpc_phase "availability read (product=CLUSTER, cloud=SECURE)"
 avail_resp="$(_rp_rest GET "/v2/catalog/gpus?include=AVAILABILITY&product=CLUSTER&count=1&cloud=SECURE")"
 avail_status="$(printf '%s\n' "$avail_resp" | head -n1)"

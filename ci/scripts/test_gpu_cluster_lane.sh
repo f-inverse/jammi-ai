@@ -1077,6 +1077,40 @@ else
 fi
 
 # ============================================================================
+# A3 (wave 4, closing round 2 F1): the rented part's compute capability is
+# DERIVED from the gpuTypeId at source time (never a second literal), and a
+# gpuTypeId outside the sm_80/86/89/90 domain leaves NATIVE_COMPUTE_CAP
+# empty so the main path refuses BEFORE phase 0 (exit 2) -- never on the
+# members after a cluster is billing. Sourced with the netprobe guard
+# (G0 above) so no rent path can run.
+# ============================================================================
+cap_for() { # $1=gpuTypeId -> stdout: NATIVE_COMPUTE_CAP after sourcing with that id
+  RP_CLUSTER_GPU_TYPE="$1" bash -c 'source "'"$CLUSTER_SH"'" >/dev/null 2>&1; printf "%s" "$NATIVE_COMPUTE_CAP"'
+}
+for pair in "NVIDIA A100-SXM4-80GB:80" "NVIDIA A40:86" "NVIDIA GeForce RTX 4090:89" "NVIDIA L40S:89" "NVIDIA H100 80GB HBM3:90"; do
+  gpu="${pair%:*}"; want="${pair##*:}"
+  got="$(cap_for "$gpu")"
+  if [ "$got" = "$want" ]; then
+    ok "A3: RP_CLUSTER_GPU_TYPE='$gpu' -> NATIVE_COMPUTE_CAP=$want (derived, no literal)"
+  else
+    bad "A3: expected NATIVE_COMPUTE_CAP=$want for '$gpu'; got '$got'"
+  fi
+done
+got="$(cap_for "NVIDIA Tesla V100-SXM2-16GB")"
+if [ -z "$got" ]; then
+  ok "A3: an out-of-domain gpuTypeId (V100, sm_70) leaves NATIVE_COMPUTE_CAP empty -- the main path's pre-rent refusal arm"
+else
+  bad "A3: expected an empty NATIVE_COMPUTE_CAP for an out-of-domain id; got '$got'"
+fi
+if grep -q 'if \[ -z "\$NATIVE_COMPUTE_CAP" \]; then' "$CLUSTER_SH" \
+  && awk '/-z "\$NATIVE_COMPUTE_CAP"/{f=1} f && /exit 2/{print "refuses"; exit}' "$CLUSTER_SH" | grep -q refuses \
+  && [ "$(grep -n 'if \[ -z "\$NATIVE_COMPUTE_CAP" \]; then' "$CLUSTER_SH" | cut -d: -f1)" -lt "$(grep -n '_rpc_phase "availability read' "$CLUSTER_SH" | cut -d: -f1)" ]; then
+  ok "A3: the empty-cap refusal (exit 2) sits BEFORE phase 0's availability read -- nothing is rented on an out-of-domain id"
+else
+  bad "A3: the empty-cap refusal is missing or sits after phase 0"
+fi
+
+# ============================================================================
 # F11: the 128-byte id-file-ready gate (_rpc_id_file_ready).
 # ============================================================================
 for size in 127 128 129; do

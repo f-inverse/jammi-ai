@@ -766,7 +766,7 @@ A squash, or a rebase performed *after* measuring, rewrites both commits and the
 artifact fails from the merge onwards, so do not rebase a measured branch:
 land it, or re-measure.
 
-## The cluster leg — two hosts, one A100 each
+## The cluster leg — two hosts, one GPU each
 
 A CLUSTER is a SEPARATE RunPod object type from a pod: member pods on one
 private overlay network, created and destroyed as a unit — it is retired by
@@ -803,7 +803,12 @@ flags, barrier), over a real cross-host communicator instead of
 `ncclCommInitAll`'s single-process one, and each writes its own
 `rank-<r>.json` report into `$JAMMI_GANG_ARTIFACT_DIR`.
 
-**The driver: `ci/scripts/runpod_gpu_cluster.sh`.** It rents a 2×1 cluster,
+**The driver: `ci/scripts/runpod_gpu_cluster.sh`.** It rents a 2×1 cluster
+of the part `RP_CLUSTER_GPU_TYPE` names (the workflow's `gpu_type` input;
+A100 SXM4 by default, or any sm_80/86/89/90 part the driver's
+`_rpc_compute_cap_for_gpu_type` maps to the compute capability the members
+build for — an unmapped id is refused before anything is rented, and the
+availability floor is the `min_availability` input),
 waits for both members reachable (tracked by DISTINCT rank, never a raw
 count — two rows both reading back as rank 0 must never satisfy readiness),
 ships the id between hosts, pulls both ranks' reports, assembles the one

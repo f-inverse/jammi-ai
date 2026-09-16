@@ -21,6 +21,12 @@ name: Distributed validation
 #     `continue-on-error: true` (`advisory: true`) to surface a red without
 #     blocking. Promote (flip `advisory` to false) after a flake-free streak.
 #
+#   * `ballista` — the compute-plane tests (three `jammi-server` processes
+#     hosting a Ballista scheduler and executors over the shared catalog: the
+#     placed gang, device-kind refusal, drain/stop). Their outcome is decided
+#     by catalog CAS and Ballista's own task binding, so this leg runs WITHOUT
+#     `continue-on-error` (`advisory: false`) like `deterministic`.
+#
 # All three are the heaviest lanes (process spawn + a real object store), so none
 # is on the default hermetic PR path. There is no `pull_request` trigger: this
 # lane never gates a merge (it would be branch protection by another name).

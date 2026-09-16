@@ -49,6 +49,8 @@ jammi-db = { workspace = true, features = ["test-hooks"] }
 jammi-test-utils.workspace = true
 tempfile = "3"
 env_logger = "0.11"
+libc.workspace = true
+parquet.workspace = true
 
 [features]
 default = []

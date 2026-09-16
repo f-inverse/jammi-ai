@@ -238,6 +238,22 @@ impl DistributionPolicy for DevicePlacement {
                             stage_id: stage.stage_id,
                             partition_id,
                         };
+                        // The distributed lane's per-executor task-binding
+                        // determinant (contract §2.5, acceptance (a3)): the
+                        // Ballista client API exposes no `job_id`/task
+                        // attribution to a `submit_physical_plan` caller, so
+                        // the lane's own oracle (`tests/distributed/main.rs`)
+                        // greps the scheduler process's OWN log for this line
+                        // naming which registered executor each stage/
+                        // partition bound to, rather than fabricating a
+                        // weaker check.
+                        tracing::info!(
+                            job_id = %job_id,
+                            stage_id = stage.stage_id,
+                            partition_id,
+                            executor_id = %executor_id,
+                            "jammi-ballista DevicePlacement: bound task"
+                        );
                         bound.push((
                             executor_id.clone(),
                             TaskDescription {

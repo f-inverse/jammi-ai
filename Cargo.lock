@@ -4658,6 +4658,8 @@ dependencies = [
  "jammi-db",
  "jammi-test-utils",
  "jammi-wire",
+ "libc",
+ "parquet",
  "prost",
  "prost-types",
  "protoc-bin-vendored",

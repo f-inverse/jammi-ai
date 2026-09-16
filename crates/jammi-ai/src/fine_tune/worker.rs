@@ -2227,6 +2227,18 @@ impl JobWorker {
             }
         }
         if saw_batch {
+            // The ONE `tracing::info!` line this crate grants
+            // `crates/jammi-ballista`'s distributed lane (contract
+            // `feat_500-wave4` §7 acceptance (a4)): a process-visible,
+            // stdout-captured line naming the job/attempt on the placed
+            // submitter's `HandedOff` arm, so a spawned worker's captured
+            // log (never the in-process `training_test_hooks` recorder,
+            // which a multi-process harness cannot read) can confirm this
+            // process ran `run_placed_gang`/`submit_placed` and handed off.
+            tracing::info!(
+                job_id, attempt, world, "run_placed_gang: submitter HandedOff after the placed \
+                 gang's stream completed"
+            );
             return Err(WorkerJobError::HandedOff);
         }
         let e = end_err.unwrap_or_else(|| {

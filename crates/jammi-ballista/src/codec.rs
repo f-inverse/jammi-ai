@@ -35,7 +35,8 @@
 use std::sync::{Arc, Weak};
 
 use datafusion::error::Result as DfResult;
-use datafusion::execution::TaskContext;
+use datafusion::execution::{FunctionRegistry, TaskContext};
+use datafusion::logical_expr::ScalarUDF;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use prost::Message;
@@ -178,6 +179,30 @@ impl PhysicalExtensionCodec for JammiCodec {
         // delegate's own typed "Unsupported plan node" error naming it —
         // this codec adds no catch-all of its own.
         self.inner.try_encode(node, buf)
+    }
+
+    /// A jammi source scan's `_content_hash` projection (`build_embedding_
+    /// plan`'s doc: "rides through to the sink as the table's fifth
+    /// column") is a live `ScalarFunctionExpr` call to `jammi_content_hash`
+    /// in the SUBMITTED physical plan, not a value already materialized
+    /// before the wire — `datafusion-proto`'s own physical-expr encoding
+    /// therefore asks THIS codec to encode/decode that (and every other
+    /// jammi-registered) scalar UDF (`datafusion-proto-54.1.0/src/
+    /// physical_plan/mod.rs:3859-3864`'s default `not_impl_err!` is what a
+    /// codec that skips this override hits: "PhysicalExtensionCodec is not
+    /// provided for scalar function …", discovered by executing
+    /// `submit_physical_plan` of a `build_embedding_plan` plan end-to-end).
+    /// Every jammi UDF is registered identically, by NAME, on every
+    /// session (`InferenceSession::wrap`/`register_query_functions`), so
+    /// there is nothing to serialize: encode writes zero bytes, decode
+    /// looks the name up on the DECODING process's own session.
+    fn try_encode_udf(&self, _node: &ScalarUDF, _buf: &mut Vec<u8>) -> DfResult<()> {
+        Ok(())
+    }
+
+    fn try_decode_udf(&self, name: &str, _buf: &[u8]) -> DfResult<Arc<ScalarUDF>> {
+        let session = self.session().map_err(Error::into_df_error)?;
+        session.context().udf(name)
     }
 }
 

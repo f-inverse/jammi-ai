@@ -2019,7 +2019,7 @@ the replacement, which the shared catalog carries regardless.
   executor id per task. The public Ballista client API (`execute_physical_
   plan`) never exposes the internally-minted job id to a `submit_physical_
   plan` caller (confirmed by reading `ballista-core-54.1.0/src/
-  execution_plans/distributed_query.rs:332-405` — the job id lives only in a
+  ballista-core-54.1.0 src/execution_plans/distributed_query.rs lines 332–405` — the job id lives only in a
   private `Arc<Mutex<Option<JobId>>>` the function never returns), so a
   `SchedulerGrpcClient::get_job_status`-based determinant (the contract's own
   suggested shape) is not reachable from outside the scheduler process. The
@@ -2085,7 +2085,7 @@ wire-server brief's ownership rule; flagged as a scope amendment.
 - `crates/jammi-db/src/config/mod.rs`: new `pub(crate) fn addresses_collide(a: SocketAddr, b: SocketAddr) -> bool` — `a.port() != 0 && a.port() == b.port() && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())`. `ServerConfig::validate`'s three-way check (health/flight/peer) and `BallistaConfig::validate`'s six-way pairwise loop both now call this one definition, replacing their separate `addr_a == addr_b && addr_a.port() != 0` / `health == flight && health.port() != 0` comparisons. The six-way loop's refusal message now names both colliding addresses (previously only one) — the existing test only asserts the message contains both KEY names, not the address text, so this is not a breaking change to any assertion.
 - `crates/jammi-db/src/config/tests.rs`: `ballista_ports_fixture` gains a fixed `advertise_host` on the base executor config (decouples the collision-rule tests from the unrelated `advertise_host`-required-when-`bind`-is-unspecified rule, so overriding `ballista.executor.bind` to `0.0.0.0:N` in a collision test never also trips that other refusal). New `ballista_every_fixed_port_collision_pair_is_refused_when_one_host_is_unspecified` (the unspecified-host arm requested for the existing "every pair" test, same six keys, same "names both keys" assertion) and new standalone `addresses_collide_table` (the five cases the brief named, run bidirectionally for symmetry).
 - Searched for a fixture relying on the OLD, narrower rule (a `127.0.0.1:N` beside a `0.0.0.0:N` on the SAME port, which used to load and now is refused): `git grep` over every `jammi.toml`/example config in `jammi-server`/`jammi-db` (`crates/jammi-server/examples/jammi.toml`, `crates/jammi-db/examples/sample-postgres.toml`) and the `jammi-server` it-suite (`server.rs`, `serve_bind_race.rs`, `readiness_preload.rs`, plus `ephemeral_addr()`'s `127.0.0.1 port 0` helper every in-process fixture uses). None found: every health/flight pair in these files uses either distinct ports (8080/8081) or the ephemeral `:0` host/port every in-process test fixture assembles at. `deploy/kubernetes/overlays/shape-d/*.toml` also has no same-port cross-host pair (each is a separate process's config; ports differ within each file) — out of scope (deploy/** is the docs unit's) but checked since the brief said "find and fix any such fixture", not "find and fix any such fixture in your scope".
-- Incidental fix: my `addresses_collide` insertion (17 lines) shifted every subsequent line in `crates/jammi-db/src/config/mod.rs`, staling one citation in `crates/jammi-ai/src/model/backend/gguf.rs:468` (`jammi-db/src/config/mod.rs:2675` -> `:2692`, caught by `check_citations.py`). Re-anchored the one line. `jammi-ai` is outside my four owned crates; this is a single-line citation-number fix caused directly by my edit, not a substantive change to that file.
+- Incidental fix: my `addresses_collide` insertion (17 lines) shifted every subsequent line in `crates/jammi-db/src/config/mod.rs`, staling one citation in `crates/jammi-ai/src/model/backend/gguf.rs:468` (`crates/jammi-db/src/config/mod.rs:2675` -> `:2692`, caught by `check_citations.py`). Re-anchored the one line. `jammi-ai` is outside my four owned crates; this is a single-line citation-number fix caused directly by my edit, not a substantive change to that file.
 
 ##### 2. Properties
 
@@ -2201,7 +2201,7 @@ No `crates/**` edit. Every finding below is the audit's own numbering (see
    per process regardless of `[gpu] devices` count — a placed gang and the
    pod's own claim contend for that single slot, not for two independent
    Ballista task slots.
-8. **Journey markers removed**: `deployment-scheduler.yaml:2`,
+8. **Journey markers removed**: `deploy/kubernetes/overlays/shape-d/deployment-scheduler.yaml:2`,
    `statefulset-compute.yaml` (its trailing `(design contract
    feat_500-wave4.md §9 B7)`), `jammi-compute.toml` (top-of-executor-block
    citation), and `MAINTAINER-GUIDE.md` at the `2.8f`/`2.8g` section opens

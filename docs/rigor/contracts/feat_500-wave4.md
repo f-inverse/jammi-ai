@@ -267,11 +267,49 @@ note count. U9a: docs gates.
 
 ## 8. Residuals and cuts
 
-§8d is written at consolidation. Named at contract time: `MaskExec` is not distributable in
-v1 (typed refusal at encode; its rebuild unit is "masked scans under Ballista"); the
-accelerator dimension stays out of band in `workers.devices` (the one upstream PR 67 owes,
-README r43); object-store shuffle is out of v1 (D2 condition 3); active/active scheduling is
-out (README r43).
+Named at contract time: `MaskExec` is not distributable in v1 (typed refusal at encode; its
+rebuild unit is "masked scans under Ballista"); the accelerator dimension stays out of band in
+`workers.devices` (the one upstream PR 67 owes, README r43); object-store shuffle is out of v1
+(D2 condition 3); active/active scheduling is out (README r43).
+
+### 8d. Residuals at consolidation (each with its executed refutation or its filed rebuild)
+
+- **`MaskExec` cut.** `JammiCodec` refuses it at encode with a typed error naming the node; the
+  rebuild unit is "masked scans under Ballista" (a plan carrying a `MaskExec` runs in-process,
+  never placed). Oracle: the codec's refusal test in `crates/jammi-ballista/tests/it/codec.rs`.
+- **No pipeline verb runs through Ballista.** The compute plane places training gangs
+  (`GangExec`) and embedding plans (`InferenceExec`, the lane's (a3) oracle); `stage_*`/`register_*`
+  pipeline verbs stay in-process by design (§1). Not a defect: the plane is a placement
+  substrate, the verbs are its future callers.
+- **Local shared-database hazard.** On one host, the hermetic Postgres arms and the lane share a
+  server; every executor-registering test now owns its rows on every arm (§9b F3) and the lane
+  runs on its own database (`jammi_dist`) in the lead's merge path. CI provisions one Postgres
+  per leg, so the hazard is local only.
+- **Ballista's heartbeat cache.** `CatalogClusterState`'s `executor_heartbeats()` is a
+  per-process cache (the trait requires it synchronous): a scheduler sees only the heartbeats
+  that land on IT plus what its own `init` read. Placement and the submit edge never read the
+  cache — they read the catalog with `executor_is_live` (§9b F2/A5) — so a second scheduler's
+  view of liveness is the row's, not its cache's. Ballista's own expiry sweep
+  (`expire_dead_executor_interval_seconds`) runs off the cache and is therefore per-scheduler;
+  the 180 s window is the same constant, so the two agree on what is dead.
+- **`SCHEDULER_CONNECT_WINDOW` is a 60 s constant** (`crates/jammi-ballista/src/roles.rs`), no
+  knob: an executor whose scheduler binds later than that exits typed and the pod restarts; a
+  slow scheduler rollout resolves through restart. Filed as the audit's own note; a knob is one
+  config field away if an operator ever needs it.
+- **Chaos leg flake.** `artifact_crash_window::crash_between_publish_and_finalize_commits_only_the_winner`
+  (crates/jammi-ai/tests/distributed) is red on the tip's CI run and on main's (pre-existing,
+  timing-sensitive, the leg is `advisory: true`); outside this PR's diff; no issue filed by this
+  wave — the nightly watcher's streak rule governs its promotion.
+- **Cluster leg (row C9 of the wave-3 remainder).** Two driver defects were found the moment a
+  cluster was ever provisioned (§9b: the provisioning read refused at once; the sm_80 literal
+  would have refused every non-A100 part on the members) and are fixed with fixtures. Every
+  create since (H100 SXM ×2, A100 SXM4, A100 PCIe, A40, RTX 4090, H200 — runs 35127546685,
+  35127748415, 35127869122, 35131603637, 35131815180, 35131941870, 35132052118, 35132060825)
+  was refused by RunPod with `Insufficient resources` (exit 75, nothing billed) except the one
+  that provisioned (35127869122, then refused at phase 4 by the now-fixed read; cleanup ran, the
+  billing read shows no charge). The artifact lands from the first run that provisions AND
+  completes; the dispatcher retries the sm_80/sm_90 parts every 20 min. The row stays open,
+  capacity-gated, exactly as the wave-3 handoff states — never a fabricated artifact.
 
 ## 9. Pressure round (REFINE at `bcfda3ca`, 2026-09-16; every premise reproduced or refuted with an executed check — the row is in `docs/rigor/feat_500-wave4.jsonl`)
 
@@ -377,6 +415,65 @@ are fixed at the root, never reconciled in prose. Dispositions:
   maintainer guide (finding 8); the StatefulSet rollout statement made exact (finding 9); the
   third arm — a registered executor without the plan's kind refuses before submit and leaves
   the row for reclaim — stated (finding 10).
+
+### 9b. Closing round 2 (adversarial-audit BLOCK at `306c9d55`, 2026-09-16 17:51 UTC — three blocks, five advisories — and the two CI reds at the same tip; every finding fixed at the root with an executed oracle)
+
+The stop rule, written before the round ran: the closing audit #5 at the tip that carries these
+fixes is the last full-scope audit. A #5 BLOCK whose findings are mechanism defects inside this
+round's own diff is fixed once and re-audited (#6, scoped to that diff); a #5 with prose-only
+findings is folded without a further audit; #6 is terminal either way, and whatever it leaves
+standing is filed in §8d as a residual with its executed refutation, never re-litigated.
+
+- **CI red 1 (run 35127543679, ballista leg — `placed_gang_completes_on_a_registered_executor_other_than_the_submitter`).**
+  Root: the HandedOff assertion read the submitter's log once, 240 ms after the job finished; the
+  line lands only after the gang's result stream drains, which is after the coordinator's
+  `completed` row the test had awaited. Fix: `harness::await_log_contains` polls with the fleet's
+  diagnostics on an early exit or the timeout (ca4f8152). Executed: the lane 7/7 on the tip.
+- **CI red 1, second defect in the same log.** Ballista removed an executor whose task launch
+  failed (a stale row from an earlier test) and THEN unbound its slots; `unbind_tasks` refused the
+  whole batch on the missing row. Fix: the removed id's slots are dropped, the rest returned
+  (ca4f8152); oracle `unbind_tasks_drops_a_removed_executors_slots_and_returns_the_rest`
+  (crates/jammi-ballista/tests/it/cluster.rs), red on the filter's removal.
+- **CI red 2 (cluster leg, run 35127869122 — the first run ever to reach phase 4).** The wait
+  loop read "both ranks READBACK_OK" (overlay ip assigned, `ssh.direct` still null: provisioning)
+  as ready and refused one second after create. Fix: the loop breaks early only when both members
+  carry a direct endpoint and otherwise polls to the deadline (bd5193fb); fixtures A2 (stateful
+  two-read mock, deadline arm, revert-RED) in `ci/scripts/test_gpu_cluster_lane.sh`.
+- **F1 BLOCK — `gpu_type` input vs. the sm_80 literal (a paid failure).** Fix at the root:
+  `_rpc_compute_cap_for_gpu_type` derives the cap from the gpuTypeId (sm_80/86/89/90); an unmapped
+  id exits 2 before phase 0, nothing rented; the input description, the workflow and driver
+  headers and `docs/maintainer/dev-gpu.md` state the domain (a153cad1). Fixtures A3: five
+  in-domain ids, one out-of-domain (empty cap), the refusal's position before phase 0 — 98 passed.
+- **F2 BLOCK — "DRAIN stops admission at once" was false at the code.** Fix at the root, three
+  parts (ca4f8152): `ExecutorRole::begin_drain` (the Terminating flip + heartbeat) runs at the
+  DRAIN instant in both runtime arms, before the worker join; `cluster::executor_is_live`
+  (`Active` + heartbeat within `EXECUTOR_LIVENESS_WINDOW` = Ballista's 180 s executor timeout) is
+  the ONE predicate the binder and the submit edge share, so a Terminating row is never bound;
+  `HostAdmission::probe_claim` refuses outside `Running`, so `run_placed_gang` refuses a draining
+  host by name before any claim transfer. Oracles: `begin_drain_reports_terminating_to_the_catalog_before_the_executor_stops`
+  (tests/it/roles.rs), `terminating_and_stale_executors_are_never_bound` (tests/it/cluster.rs),
+  `probe_claim_refuses_once_a_drain_or_release_has_begun` (worker.rs unit), gang_placed.rs p9.
+  Prose (aa9b7e32): deploy README, the topology page, the maintainer guide, CHANGELOG, §9 B6.
+- **F3 BLOCK — test rows leak on the red arm; the sibling file never cleaned.** Fix: every
+  executor-registering test in `crates/jammi-ballista/tests/it/cluster.rs` (nine) and
+  `crates/jammi-db/tests/it/compute_repo.rs` (five) runs under `with_owned_rows` — `catch_unwind`,
+  remove the owned rows, resume the panic (ca4f8152, bedd7a40).
+- **A4 (cost bound conditional on the input).** Stated for the DEFAULT part in both headers and
+  the input description; an operator-chosen part bills at its own rate and choosing it is the
+  cost decision (a153cad1). No clamp: the leg's spend authorization is the operator's dispatch.
+- **A5 (the refusal read dead executors).** Fixed at the read with F2's predicate: the submit edge
+  reads `list_compute_executors` and applies `executor_is_live`; oracle
+  `a_stale_cuda_row_never_admits_a_cuda_plan_at_the_submit_edge` (stale cuda row → refused by
+  name; fresh row → past the refusal, a different error) (ca4f8152).
+- **A6 (header/dev-gpu.md still A100-shaped).** Rewritten (a153cad1).
+- **A7 (distributed.yml enumeration).** The `ballista` bullet added (a153cad1).
+- **A8 (`begin_awaiting_placement`'s bool discarded).** The CAS's refusal is read: a `Free` holder
+  (a direct `run_claimed_job` with no `ClaimGuard`, which admits ranks already) still submits;
+  any other holder ends `submit_placed` typed with nothing submitted (ca4f8152). Executed: the
+  first cut refused on EVERY false arm and red gang_placed p2/p5/p8 (the direct-call tests) —
+  the scope is the executed boundary, not a guess. The B2 unit test asserts the false arm.
+- **Noted, not a finding (the audit's own note).** `SCHEDULER_CONNECT_WINDOW` is a 60 s constant
+  with no knob; a slow scheduler rollout resolves through pod restart. Left; filed in §8d.
 
 ## 10. Gate table
 

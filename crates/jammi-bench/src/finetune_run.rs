@@ -2100,7 +2100,7 @@ fn run_impl(
                         epoch_idx - 1
                     )
                 })?;
-            Some(load_bundle(fetched.dir(), &device)?)
+            load_bundle(fetched.dir(), &device)?
         };
 
         let mut builder = TrainingLoopBuilder::new(target, varmap, config)
@@ -3780,7 +3780,9 @@ mod tests {
             params.mutant_id = mutant_id.clone();
             params.mutant_base_sha = mutant_base_sha.clone();
             params.mutant_patch_sha256 = mutant_patch_sha256.clone();
-            let result = run_impl(&params, true);
+            let result = BlockingCall::spawn_thread(move |call| run_impl(&call, &params, true))
+                .join()
+                .expect("join run_impl thread");
             let err = match result {
                 Ok(_) => panic!(
                     "a partial mutant subset must be refused: mutant_id={mutant_id:?}, \
@@ -3827,8 +3829,11 @@ mod tests {
         params.mutant_id = Some(String::new());
         params.mutant_base_sha = Some(String::new());
         params.mutant_patch_sha256 = Some(String::new());
+        let result = BlockingCall::spawn_thread(move |call| run_impl(&call, &params, true))
+            .join()
+            .expect("join run_impl thread");
         let err = expect_refused(
-            run_impl(&params, true),
+            result,
             "an explicitly-empty trio must be refused, not treated as absent",
         );
         let msg = err.to_string();
@@ -3852,8 +3857,11 @@ mod tests {
         params.mutant_id = Some("   ".to_string());
         params.mutant_base_sha = Some("\t\n".to_string());
         params.mutant_patch_sha256 = Some(" ".to_string());
+        let result = BlockingCall::spawn_thread(move |call| run_impl(&call, &params, true))
+            .join()
+            .expect("join run_impl thread");
         let err = expect_refused(
-            run_impl(&params, true),
+            result,
             "an explicitly-whitespace trio must be refused, not treated as absent",
         );
         assert!(
@@ -3885,8 +3893,11 @@ mod tests {
             params.mutant_id = mutant_id.clone();
             params.mutant_base_sha = mutant_base_sha.clone();
             params.mutant_patch_sha256 = mutant_patch_sha256.clone();
+            let result = BlockingCall::spawn_thread(move |call| run_impl(&call, &params, true))
+                .join()
+                .expect("join run_impl thread");
             let err = expect_refused(
-                run_impl(&params, true),
+                result,
                 &format!(
                     "one empty/whitespace among three (otherwise valid) values must be \
                      refused: mutant_id={mutant_id:?}, mutant_base_sha={mutant_base_sha:?}, \
@@ -3912,10 +3923,10 @@ mod tests {
         too_short_base.mutant_id = Some("eps-0.10".to_string());
         too_short_base.mutant_base_sha = Some("abc123".to_string()); // 6 hex chars, below the 7 floor
         too_short_base.mutant_patch_sha256 = Some("a".repeat(64));
-        let err = expect_refused(
-            run_impl(&too_short_base, true),
-            "a too-short mutant-base-sha must be refused",
-        );
+        let result = BlockingCall::spawn_thread(move |call| run_impl(&call, &too_short_base, true))
+            .join()
+            .expect("join run_impl thread");
+        let err = expect_refused(result, "a too-short mutant-base-sha must be refused");
         assert!(
             err.to_string().contains("--mutant-base-sha"),
             "refusal must name the offending flag: {err}"
@@ -3925,10 +3936,10 @@ mod tests {
         non_hex_base.mutant_id = Some("eps-0.10".to_string());
         non_hex_base.mutant_base_sha = Some("not-a-hex-sha!!".to_string());
         non_hex_base.mutant_patch_sha256 = Some("a".repeat(64));
-        let err = expect_refused(
-            run_impl(&non_hex_base, true),
-            "a non-hex mutant-base-sha must be refused",
-        );
+        let result = BlockingCall::spawn_thread(move |call| run_impl(&call, &non_hex_base, true))
+            .join()
+            .expect("join run_impl thread");
+        let err = expect_refused(result, "a non-hex mutant-base-sha must be refused");
         assert!(
             err.to_string().contains("--mutant-base-sha"),
             "refusal must name the offending flag: {err}"
@@ -3938,10 +3949,11 @@ mod tests {
         wrong_len_patch.mutant_id = Some("eps-0.10".to_string());
         wrong_len_patch.mutant_base_sha = Some("f".repeat(40));
         wrong_len_patch.mutant_patch_sha256 = Some("a".repeat(63)); // one short of 64
-        let err = expect_refused(
-            run_impl(&wrong_len_patch, true),
-            "a wrong-length mutant-patch-sha256 must be refused",
-        );
+        let result =
+            BlockingCall::spawn_thread(move |call| run_impl(&call, &wrong_len_patch, true))
+                .join()
+                .expect("join run_impl thread");
+        let err = expect_refused(result, "a wrong-length mutant-patch-sha256 must be refused");
         assert!(
             err.to_string().contains("--mutant-patch-sha256"),
             "refusal must name the offending flag: {err}"
@@ -3951,10 +3963,10 @@ mod tests {
         non_hex_patch.mutant_id = Some("eps-0.10".to_string());
         non_hex_patch.mutant_base_sha = Some("f".repeat(40));
         non_hex_patch.mutant_patch_sha256 = Some("z".repeat(64)); // right length, not hex
-        let err = expect_refused(
-            run_impl(&non_hex_patch, true),
-            "a non-hex mutant-patch-sha256 must be refused",
-        );
+        let result = BlockingCall::spawn_thread(move |call| run_impl(&call, &non_hex_patch, true))
+            .join()
+            .expect("join run_impl thread");
+        let err = expect_refused(result, "a non-hex mutant-patch-sha256 must be refused");
         assert!(
             err.to_string().contains("--mutant-patch-sha256"),
             "refusal must name the offending flag: {err}"

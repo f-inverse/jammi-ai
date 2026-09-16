@@ -143,7 +143,10 @@ lifecycle:
 A `preStop` hook runs before SIGTERM is sent and inside the grace countdown.
 Alternatives: a derived image with `STOPSIGNAL SIGINT`; `lifecycle.stopSignal`
 once the `ContainerStopSignals` feature gate leaves alpha; and, outside
-Kubernetes, `docker kill --signal=INT` / `docker compose kill -s SIGINT`.
+Kubernetes, `docker kill --signal=INT` / `docker compose kill -s SIGINT` — note
+that the daemon records a kill as a manual stop, so a `restart` policy does not
+bring that container back; signal the process from the host (`kill -INT` on
+`docker inspect`'s `.State.Pid`) when the policy is meant to restart it.
 
 **Autoscaling** input: `jammi_jobs_queued{kind}` on `/metrics` (a worker
 process samples it from the catalog every `[worker] metrics_sample_secs`) is

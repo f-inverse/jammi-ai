@@ -77,6 +77,12 @@ path = "tests/it/main.rs"
 name = "roles_drain"
 path = "tests/roles_drain.rs"
 
+# ITS OWN process too: `begin_drain` stores the same crate-wide
+# `TERMINATING` static (see tests/roles_begin_drain.rs's module doc).
+[[test]]
+name = "roles_begin_drain"
+path = "tests/roles_begin_drain.rs"
+
 [[test]]
 name = "distributed"
 path = "tests/distributed/main.rs"

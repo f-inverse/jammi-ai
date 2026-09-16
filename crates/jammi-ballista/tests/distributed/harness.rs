@@ -788,11 +788,15 @@ impl JobSize {
             // instantly on localhost — 60 epochs of `tiny_bert` LoRA
             // completed in under the harness's own detect+kill window
             // (executed: a5 read a single-entry `claimed_by` sequence,
-            // meaning the job finished before the kill landed). 900
-            // epochs gives real margin under `TERMINAL_TIMEOUT` while
-            // still comfortably shorter than the reclaim's own lease
-            // window once killed.
-            JobSize::Crashable => 900,
+            // meaning the job finished before the kill landed). The kill
+            // lands ~1 s after the placed claim, so the job must outlive
+            // that; the SUCCESSOR then runs the whole job again from
+            // scratch and must finish inside the reclaim wait. Measured
+            // rates: ~15 epochs/s locally, ~5 epochs/s on a CI runner
+            // (run 35136370236: 900 epochs reached epoch 734 at the 150 s
+            // deadline). 450 epochs keeps the job crashable (≥ 30 s at
+            // the fast rate) and completes in ~90 s at the slow one.
+            JobSize::Crashable => 450,
         }
     }
 }

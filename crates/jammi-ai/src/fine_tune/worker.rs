@@ -542,14 +542,19 @@ impl HostAdmission {
     /// ([`Self::try_hold_rank`]'s `Awaiting` arm admits exactly as `Free`
     /// does) — a two-host fleet could not otherwise assemble if its only
     /// free-looking host were the one busy awaiting a placement result. A
-    /// no-op (`false`) unless the holder is exactly `JobRun` — a direct
+    /// refused (`Err(the holder the CAS saw)`) unless the holder is exactly `JobRun` — a direct
     /// `run_claimed_job`/an inline `run_now` (no [`ClaimGuard`]) or a slot
     /// already superseded never observes this transition. No corresponding
     /// "end awaiting" call is needed: the loop's own [`ClaimGuard`], still
     /// held across the whole submit-and-await, resets `Awaiting` to `Free`
     /// on drop exactly as it resets `ClaimProbe`/`JobRun`.
-    pub(crate) fn begin_awaiting_placement(&self, job_id: &str, attempt: u32) -> bool {
-        self.holder.send_if_modified(|h| {
+    pub(crate) fn begin_awaiting_placement(
+        &self,
+        job_id: &str,
+        attempt: u32,
+    ) -> std::result::Result<(), Holder> {
+        let mut found: Option<Holder> = None;
+        let moved = self.holder.send_if_modified(|h| {
             if *h == Holder::JobRun {
                 *h = Holder::Awaiting {
                     job_id: job_id.to_string(),
@@ -557,9 +562,17 @@ impl HostAdmission {
                 };
                 true
             } else {
+                found = Some(h.clone());
                 false
             }
-        })
+        });
+        if moved {
+            Ok(())
+        } else {
+            // The holder the CAS saw, in the SAME critical section — the
+            // caller decides on that value, never on a second read.
+            Err(found.unwrap_or(Holder::Free))
+        }
     }
 
     /// This process's registration — the ONE carrier its `instances` row
@@ -2242,7 +2255,7 @@ impl JobWorker {
         // Awaiting was found still refusing every dial with "this host's
         // job slot is busy" (`Holder::JobRun`, `admit_rank`'s busy arm) —
         // red until this line moved ahead of the submit call.
-        if !session
+        if let Err(holder) = session
             .host_admission()
             .begin_awaiting_placement(job_id, attempt)
         {
@@ -2257,7 +2270,6 @@ impl JobWorker {
             // its gang assembles, so the descriptor is refused BEFORE the
             // submit, typed — the row is still this instance's claim and is
             // left for reclaim.
-            let holder = session.host_admission().holder();
             if holder != Holder::Free {
                 return Err(self
                     .placed_submit_end(
@@ -11840,15 +11852,20 @@ mod tests {
         // directly (it needs a live catalog/session to call for real).
         cell.job_running();
         assert_eq!(cell.holder(), Holder::JobRun);
-        assert!(
+        assert_eq!(
             cell.begin_awaiting_placement("job-a", 1),
+            Ok(()),
             "JobRun -> Awaiting"
         );
-        assert!(
-            !cell.begin_awaiting_placement("job-a", 1),
-            "the move is a CAS from exactly JobRun: from Awaiting it refuses (false); \
-             `submit_placed` submits on that refusal only from Free, and ends typed \
-             from any other holder"
+        assert_eq!(
+            cell.begin_awaiting_placement("job-a", 1),
+            Err(Holder::Awaiting {
+                job_id: "job-a".into(),
+                attempt: 1
+            }),
+            "the move is a CAS from exactly JobRun: from Awaiting it refuses with the \
+             holder it SAW (one critical section, never a second read); `submit_placed` \
+             submits on that refusal only for Free, and ends typed for any other holder"
         );
         assert_eq!(
             cell.holder(),
@@ -11885,7 +11902,7 @@ mod tests {
         // guard alone returns the host to `Free` once the await ends.
         let claim2 = cell.probe_claim().expect("Free admits the claim's probe");
         cell.job_running();
-        assert!(cell.begin_awaiting_placement("job-c", 1));
+        assert_eq!(cell.begin_awaiting_placement("job-c", 1), Ok(()));
         drop(claim2);
         assert_eq!(
             cell.holder(),

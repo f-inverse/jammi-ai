@@ -235,18 +235,24 @@ impl jammi_ai::fine_tune::worker::PlacedGangSubmitter for SchedulerPlacedGangSub
 
     fn placement_available(&self) -> bool {
         let own_id = self.session.instance_id().to_string();
-        let cluster_state = Arc::clone(&self.cluster_state);
-        // `ClusterState::registered_executor_metadata` is async; this trait
-        // method is not (the seam `jammi-ai`'s `run_claimed_job_under`
-        // checks synchronously before deciding whether to place). Same
-        // block-in-place shape as `codec.rs`'s `block_on_catalog` — requires
-        // a MULTI-THREADED tokio runtime, a precondition every
-        // `jammi-server` process satisfies.
-        let executors = tokio::task::block_in_place(|| {
+        let catalog = Arc::clone(self.session.catalog_arc());
+        // The catalog read is async; this trait method is not (the seam
+        // `jammi-ai`'s `run_claimed_job_under` checks synchronously before
+        // deciding whether to place). Same block-in-place shape as
+        // `codec.rs`'s `block_on_catalog` — requires a MULTI-THREADED tokio
+        // runtime, a precondition every `jammi-server` process satisfies.
+        // LIVE executors only (`cluster::executor_is_live`, the binder's and
+        // the submit edge's own predicate): a row a dead executor left
+        // behind must not divert a claim into the placed path only to have
+        // the submit edge refuse it (an attempt spent for nothing).
+        let rows = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(async move { cluster_state.registered_executor_metadata().await })
-        });
-        executors.iter().any(|m| m.id != own_id)
+                .block_on(async move { catalog.list_compute_executors().await })
+        })
+        .unwrap_or_default();
+        let now = chrono::Utc::now();
+        rows.iter()
+            .any(|r| r.executor_id != own_id && crate::cluster::executor_is_live(r, now))
     }
 }
 

@@ -30,7 +30,7 @@ use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec};
 use jammi_ai::operator::inference_exec::InferenceExecBuilder;
 use jammi_ballista::client::submit_physical_plan;
-use jammi_ballista::cluster::{executor_is_live, CatalogClusterState, EXECUTOR_LIVENESS_WINDOW};
+use jammi_ballista::cluster::{executor_is_live, executor_liveness_window, CatalogClusterState};
 use jammi_ballista::placement::DevicePlacement;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::compute_repo::ComputeExecutorRecord;
@@ -648,7 +648,6 @@ async fn already_transferred_gang_is_never_bound() {
                 .unwrap();
 
             let job_id_s = format!("gang-job-{}", jammi_test_utils::unique_suffix());
-            owned.borrow_mut().push(job_id_s.clone());
             catalog
                 .submit_job(SubmitJobParams {
                     job_id: &job_id_s,
@@ -663,7 +662,6 @@ async fn already_transferred_gang_is_never_bound() {
                 .await
                 .expect("submit_job");
             let transferee = format!("transferee-{}", jammi_test_utils::unique_suffix());
-            owned.borrow_mut().push(transferee.clone());
             catalog
                 .claim_by_id(&job_id_s, &transferee, Duration::from_secs(300))
                 .await
@@ -671,7 +669,6 @@ async fn already_transferred_gang_is_never_bound() {
                 .expect("row claimed");
 
             let submitter = format!("submitter-{}", jammi_test_utils::unique_suffix());
-            owned.borrow_mut().push(submitter.clone());
             let descriptor = GangDescriptor {
                 job_id: job_id_s.clone(),
                 attempt: 0,
@@ -777,7 +774,7 @@ fn record(id: &str, status: &str, heartbeat_at: String) -> ComputeExecutorRecord
 
 /// `executor_is_live` — the ONE predicate the binder and the submit-edge
 /// refusal share — is `Active` AND a heartbeat within
-/// `EXECUTOR_LIVENESS_WINDOW`; every other row (a `Terminating` heartbeat,
+/// `executor_liveness_window()`; every other row (a `Terminating` heartbeat,
 /// an `Unknown` one, a stale timestamp, an unparseable one) is not live.
 /// Mutation: drop the status arm and the `Terminating` row reads live;
 /// drop the window and the stale row reads live.
@@ -792,9 +789,9 @@ fn executor_is_live_table() {
         now
     ));
     assert!(!executor_is_live(&record("e", "Unknown", fresh), now));
-    let inside = stamp(now - EXECUTOR_LIVENESS_WINDOW + chrono::Duration::seconds(1));
+    let inside = stamp(now - executor_liveness_window() + chrono::Duration::seconds(1));
     assert!(executor_is_live(&record("e", "Active", inside), now));
-    let outside = stamp(now - EXECUTOR_LIVENESS_WINDOW - chrono::Duration::seconds(1));
+    let outside = stamp(now - executor_liveness_window() - chrono::Duration::seconds(1));
     assert!(!executor_is_live(&record("e", "Active", outside), now));
     assert!(!executor_is_live(
         &record("e", "Active", "2026-01-01T00:00:00.000000000Z".into()),
@@ -901,70 +898,73 @@ async fn terminating_and_stale_executors_are_never_bound() {
 #[tokio::test]
 async fn a_stale_cuda_row_never_admits_a_cuda_plan_at_the_submit_edge() {
     let session = inference_session().await;
-    let catalog = session.catalog();
-    let stale_id = format!("stale-cuda-{}", jammi_test_utils::unique_suffix());
-    let cuda = vec![DeviceFact {
-        kind: "cuda".to_string(),
-        ordinal: 0,
-    }];
-    let mut stale = record(
-        &stale_id,
-        "Active",
-        "2026-01-01T00:00:00.000000000Z".to_string(),
-    );
-    stale.devices = cuda.clone();
-    catalog.upsert_compute_executor(&stale).await.unwrap();
+    let catalog = Arc::clone(session.catalog_arc());
+    let owned = RefCell::new(Vec::<String>::new());
+    with_owned_rows(&catalog, &owned, async {
+        let stale_id = format!("stale-cuda-{}", jammi_test_utils::unique_suffix());
+        owned.borrow_mut().push(stale_id.clone());
+        let cuda = vec![DeviceFact {
+            kind: "cuda".to_string(),
+            ordinal: 0,
+        }];
+        let mut stale = record(
+            &stale_id,
+            "Active",
+            "2026-01-01T00:00:00.000000000Z".to_string(),
+        );
+        stale.devices = cuda.clone();
+        catalog.upsert_compute_executor(&stale).await.unwrap();
 
-    let cuda_plan = || -> Arc<dyn ExecutionPlan> {
-        Arc::new(
-            InferenceExecBuilder::new(
-                scan(),
-                ModelSource::hf("m"),
-                ModelTask::TextEmbedding,
-                vec!["text".to_string()],
-                "text".to_string(),
-                "src-1".to_string(),
-                Arc::clone(session.model_cache()),
-                jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+        let cuda_plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                InferenceExecBuilder::new(
+                    scan(),
+                    ModelSource::hf("m"),
+                    ModelTask::TextEmbedding,
+                    vec!["text".to_string()],
+                    "text".to_string(),
+                    "src-1".to_string(),
+                    Arc::clone(session.model_cache()),
+                    jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+                )
+                .embedding_dim(Some(2))
+                .build()
+                .unwrap(),
             )
-            .embedding_dim(Some(2))
-            .build()
-            .unwrap(),
+        };
+        let unreachable = "http://127.0.0.1:9";
+        let err = submit_physical_plan(&session, unreachable, cuda_plan())
+            .await
+            .err()
+            .expect("a stale cuda row admits nothing");
+        assert!(
+            err.to_string()
+                .contains("no live registered compute executor lists a cuda device"),
+            "refused by name at the submit edge: {err}"
+        );
+
+        let fresh_id = format!("fresh-cuda-{}", jammi_test_utils::unique_suffix());
+        owned.borrow_mut().push(fresh_id.clone());
+        let mut fresh = record(
+            &fresh_id,
+            "Active",
+            jammi_db::catalog::backend::now_sortable(),
+        );
+        fresh.devices = cuda;
+        catalog.upsert_compute_executor(&fresh).await.unwrap();
+        let err = tokio::time::timeout(
+            Duration::from_secs(30),
+            submit_physical_plan(&session, unreachable, cuda_plan()),
         )
-    };
-    let unreachable = "http://127.0.0.1:9";
-    let err = submit_physical_plan(&session, unreachable, cuda_plan())
         .await
+        .expect("the unreachable scheduler fails fast")
         .err()
-        .expect("a stale cuda row admits nothing");
-    assert!(
-        err.to_string()
-            .contains("no live registered compute executor lists a cuda device"),
-        "refused by name at the submit edge: {err}"
-    );
-
-    let fresh_id = format!("fresh-cuda-{}", jammi_test_utils::unique_suffix());
-    let mut fresh = record(
-        &fresh_id,
-        "Active",
-        jammi_db::catalog::backend::now_sortable(),
-    );
-    fresh.devices = cuda;
-    catalog.upsert_compute_executor(&fresh).await.unwrap();
-    let err = tokio::time::timeout(
-        Duration::from_secs(30),
-        submit_physical_plan(&session, unreachable, cuda_plan()),
-    )
-    .await
-    .expect("the unreachable scheduler fails fast")
-    .err()
-    .expect("no scheduler listens on the address");
-    assert!(
-        !err.to_string()
-            .contains("no live registered compute executor"),
-        "a fresh cuda row admits the plan past the refusal: {err}"
-    );
-
-    catalog.remove_compute_executor(&stale_id).await.ok();
-    catalog.remove_compute_executor(&fresh_id).await.ok();
+        .expect("no scheduler listens on the address");
+        assert!(
+            !err.to_string()
+                .contains("no live registered compute executor"),
+            "a fresh cuda row admits the plan past the refusal: {err}"
+        );
+    })
+    .await;
 }

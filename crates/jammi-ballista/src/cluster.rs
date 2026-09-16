@@ -58,18 +58,23 @@ fn ballista_err(e: jammi_db::error::JammiError) -> BallistaError {
 }
 
 /// How long a registered executor's last heartbeat may lie in the past
-/// before the catalog stops treating the row as a LIVE executor. Equal to
-/// Ballista's own scheduler liveness notion (`SchedulerConfig::
-/// executor_timeout_seconds`, 180 s by default — the window after which
-/// `ballista-scheduler` expires an executor it has stopped hearing from),
-/// so "live to placement" and "live to Ballista" are one definition.
-pub const EXECUTOR_LIVENESS_WINDOW: chrono::Duration = chrono::Duration::seconds(180);
+/// before the catalog stops treating the row as a LIVE executor: DERIVED
+/// from Ballista's own scheduler liveness notion (`SchedulerConfig::
+/// default().executor_timeout_seconds`, the window after which
+/// `ballista-scheduler` expires an executor it has stopped hearing from —
+/// the default `roles::scheduler_config` keeps), never a second literal,
+/// so "live to placement" and "live to Ballista" are one definition and
+/// cannot drift apart.
+pub fn executor_liveness_window() -> chrono::Duration {
+    let secs = ballista_scheduler::config::SchedulerConfig::default().executor_timeout_seconds;
+    chrono::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
+}
 
 /// The ONE liveness predicate every read that decides on executors shares
 /// (`bind_schedulable_tasks`, `client::submit_physical_plan`'s device-kind
 /// refusal): the row's `status` is `Active` (a `Terminating` heartbeat —
 /// `roles::ExecutorRole::begin_drain` — or an `Unknown` one is not) AND its
-/// `heartbeat_at` lies within [`EXECUTOR_LIVENESS_WINDOW`] of `now`. A row
+/// `heartbeat_at` lies within [`executor_liveness_window`] of `now`. A row
 /// left behind by a process that never ran its graceful `remove_executor`
 /// (SIGKILL, a crashed pod) therefore stops counting after the window, and
 /// a test row written with a stale timestamp never counts at all. A
@@ -84,7 +89,7 @@ pub fn executor_is_live(
     }
     match chrono::DateTime::parse_from_rfc3339(&rec.heartbeat_at) {
         Ok(hb) => {
-            now.signed_duration_since(hb.with_timezone(&chrono::Utc)) <= EXECUTOR_LIVENESS_WINDOW
+            now.signed_duration_since(hb.with_timezone(&chrono::Utc)) <= executor_liveness_window()
         }
         Err(_) => false,
     }

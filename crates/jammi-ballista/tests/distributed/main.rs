@@ -606,7 +606,10 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
     // 300ms — the honest subset at this poll rate (contract §7 (a5)).
     let mut observed: Vec<String> = vec![lane0_id.clone(), claimant.clone()];
     let mut killed = false;
-    let deadline = std::time::Instant::now() + harness::TERMINAL_TIMEOUT;
+    // The successor re-runs the whole job from scratch, so this wait is
+    // the job's own length plus the reclaim: twice the single-job bound.
+    let reclaim_timeout = harness::TERMINAL_TIMEOUT * 2;
+    let deadline = std::time::Instant::now() + reclaim_timeout;
     let final_record = loop {
         if !killed {
             // Give the gang a moment to actually be mid-run before crashing it.
@@ -636,7 +639,7 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
             panic!(
                 "timed out after {:?} awaiting reclaim + successor completion; observed \
                  claimed_by sequence: {observed:?}",
-                harness::TERMINAL_TIMEOUT
+                reclaim_timeout
             );
         }
         tokio::time::sleep(Duration::from_millis(300)).await;

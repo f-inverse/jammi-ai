@@ -36,6 +36,8 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use super::jobs_repo::WorkerState;
 use crate::error::{JammiError, Result};
 use crate::storage::{BuilderSeeds, Scheme, StorageUrl};
@@ -375,6 +377,51 @@ fn canonical_local_root(root: &str, path: &str) -> Result<String> {
             resolved.display()
         ))
     })
+}
+
+/// One device a process names as its own: a KIND (`"cpu"` | `"cuda"` |
+/// `"metal"`, opaque here — never interpreted by this crate; a placement
+/// policy reads it as an exact-match token) and its ORDINAL within that
+/// kind (rank 0's device is ordinal 0, etc. — never a global, cross-kind
+/// index). Serialized as JSON `{kind, ordinal}` — no other field (67
+/// pressure-round delta 3 drops a `memory_bytes` this tree has no source
+/// for). The ONE shape both device columns 67's wave-4 migration adds
+/// carry a `Vec` of: `workers.devices`
+/// ([`WorkerFacts::devices`], the `[worker]` process's own inventory,
+/// carried for `ListWorkers` only) and `compute_executors.devices`
+/// (`super::compute_repo::ComputeExecutorRecord::devices`, the compute
+/// executor's OWN registration fact and the placement join's sole
+/// authority) — so a device claim reads identically wherever it is
+/// registered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceFact {
+    /// The device kind.
+    pub kind: String,
+    /// The device's ordinal within `kind`.
+    pub ordinal: u32,
+}
+
+/// Decode a `devices` JSON column (`workers.devices` /
+/// `compute_executors.devices`) into its device list. Non-`NULL` text that
+/// does not parse as `[{kind, ordinal}]` is a ROW FACT on both backends,
+/// never a read FAULT — the shape issue #574 established for
+/// `jobs.lease_expires_at` ([`super::lease::LeaseFact`]): the read that
+/// found the row still succeeds, with an EMPTY device list AND a
+/// `tracing::warn!` naming `row_label` (the executor/instance id) — never a
+/// silent `unwrap_or_default()`, which would make the identical failure
+/// invisible instead of an observable, attributed row fact.
+pub fn decode_devices_json(raw: &str, row_label: &str) -> Vec<DeviceFact> {
+    match serde_json::from_str::<Vec<DeviceFact>>(raw) {
+        Ok(devices) => devices,
+        Err(error) => {
+            tracing::warn!(
+                row = row_label,
+                %error,
+                "malformed `devices` JSON; treating this row as having no devices"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// The claim-loop half of a registration: the `kinds` this worker claims and

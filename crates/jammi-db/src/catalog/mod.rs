@@ -4,6 +4,7 @@ pub mod backend_sqlite;
 pub mod channel_repo;
 #[cfg(feature = "test-hooks")]
 pub mod claim_test_hooks;
+pub mod compute_repo;
 pub mod eval_repo;
 pub mod instance;
 pub mod jobs_repo;

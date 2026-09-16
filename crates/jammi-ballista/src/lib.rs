@@ -20,6 +20,7 @@
 //! (`crates/jammi-ai/src/fine_tune/worker.rs`).
 
 pub mod client;
+pub mod cluster;
 pub mod codec;
 pub mod engine;
 pub mod error;

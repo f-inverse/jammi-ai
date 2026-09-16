@@ -23,6 +23,7 @@ use datafusion::prelude::SessionContext;
 
 use ballista_core::utils::{default_config_producer, default_session_builder};
 use ballista_scheduler::cluster::BallistaCluster;
+use ballista_scheduler::config::TaskDistributionPolicy;
 
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::client::submit_physical_plan;
@@ -92,9 +93,14 @@ async fn scheduler_and_executor_host_in_one_process_and_submit_round_trips() {
         Arc::new(default_session_builder),
         Arc::new(default_config_producer),
     );
-    let scheduler = host_scheduler(&session, "127.0.0.1:0", cluster)
-        .await
-        .expect("scheduler role hosts");
+    let scheduler = host_scheduler(
+        &session,
+        "127.0.0.1:0",
+        cluster,
+        TaskDistributionPolicy::RoundRobin,
+    )
+    .await
+    .expect("scheduler role hosts");
 
     let executor_cfg = BallistaExecutorConfig {
         scheduler_address: format!("127.0.0.1:{}", scheduler.addr.port()),

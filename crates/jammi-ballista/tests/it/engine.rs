@@ -12,6 +12,7 @@ use datafusion::prelude::SessionConfig;
 use ballista_executor::execution_engine::ExecutionEngine;
 
 use jammi_ai::model::{ModelSource, ModelTask};
+use jammi_ai::operator::gang_exec::GangExec;
 use jammi_ai::operator::inference_exec::InferenceExecBuilder;
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::engine::JammiExecutionEngine;
@@ -119,5 +120,48 @@ async fn does_not_refuse_a_matching_device_kind() {
     assert!(
         !err.to_string().contains("K7"),
         "a matching device kind must not be refused by the K7 gate: {err}"
+    );
+}
+
+/// README r41 (contract §2.2/§9): a stage plan wrapping a `GangExec` under a
+/// MULTI-partition node is refused typed — one gang mechanism, never a
+/// multi-partition fan-out of the coordinator body. Two `GangExec` leaves
+/// under a `UnionExec` (partition count 2, `GangExec` itself is always
+/// single-partition) exercises the "under" wording literally: the refusal
+/// looks at the STAGE's own output partitioning, not each leaf's.
+#[tokio::test]
+async fn refuses_a_gang_exec_stage_with_more_than_one_partition() {
+    let session = session().await;
+    let descriptor = jammi_ai::operator::gang_exec::GangDescriptor {
+        job_id: "job-1".to_string(),
+        attempt: 0,
+        world: 2,
+        submitter: "submitter-1".to_string(),
+    };
+    let left: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(descriptor.clone()));
+    let right: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(descriptor));
+    let plan = datafusion::physical_plan::union::UnionExec::try_new(vec![left, right])
+        .expect("two same-schema GangExec leaves union");
+    assert_eq!(
+        plan.properties().output_partitioning().partition_count(),
+        2,
+        "test precondition: the wrapping node is multi-partition"
+    );
+
+    let engine = JammiExecutionEngine::new(Arc::clone(&session));
+    let err = engine
+        .create_query_stage_exec(
+            "job-1".to_string().into(),
+            0,
+            0,
+            plan,
+            "/tmp",
+            &SessionConfig::default(),
+        )
+        .expect_err("a multi-partition stage containing a GangExec must be refused, never run");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("GangExec") && msg.contains('2'),
+        "the refusal must name the mechanism and the partition count found: {msg}"
     );
 }

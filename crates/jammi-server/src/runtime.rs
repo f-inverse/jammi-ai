@@ -651,22 +651,31 @@ impl OssServer {
             None => None,
         };
         // `[ballista]`: the Ballista compute-plane roles, beside the peer
-        // listener above — U8a: an in-memory cluster + round-robin (U8b
-        // swaps the cluster and the policy behind this one constructor
-        // argument, kept visible per the design contract). The
-        // `PlacedGangSubmitter`/`PlacedGangRunner` seams this design names
-        // are installed by the GANG unit's integration commit — `GangExec`
-        // does not exist in this tree yet, so there is nothing to install
-        // against (named here so it is not silently forgotten).
+        // listener above. The cluster/job state is ALWAYS catalog-backed
+        // (contract §3 U8b) and the distribution policy is ALWAYS
+        // `DevicePlacement` — there is no knob (`roles::host_scheduler`
+        // keeps both as constructor arguments only so a bare in-memory
+        // cluster stays reachable as a TEST fixture, never a second
+        // production path).
         let scheduler = match self.ballista.scheduler_bind.as_deref() {
             Some(bind) => {
-                let cluster = ballista_scheduler::cluster::BallistaCluster::new_memory(
-                    "jammi-ballista",
-                    Arc::new(ballista_core::utils::default_session_builder),
-                    Arc::new(ballista_core::utils::default_config_producer),
+                let catalog = Arc::clone(self.session.catalog_arc());
+                let cluster = ballista_scheduler::cluster::BallistaCluster::new(
+                    Arc::new(jammi_ballista::cluster::CatalogClusterState::new(Arc::clone(
+                        &catalog,
+                    ))),
+                    Arc::new(jammi_ballista::cluster::CatalogJobState::new(
+                        Arc::clone(&catalog),
+                        self.session.instance_id().to_string(),
+                        Arc::new(ballista_core::utils::default_session_builder),
+                        Arc::new(ballista_core::utils::default_config_producer),
+                    )),
+                );
+                let distribution = ballista_scheduler::config::TaskDistributionPolicy::Custom(
+                    Arc::new(jammi_ballista::placement::DevicePlacement::new(catalog)),
                 );
                 Some(
-                    jammi_ballista::roles::host_scheduler(&self.session, bind, cluster)
+                    jammi_ballista::roles::host_scheduler(&self.session, bind, cluster, distribution)
                         .await
                         .map_err(|e| ServerError::Config(e.to_string()))?,
                 )

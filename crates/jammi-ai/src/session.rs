@@ -681,8 +681,11 @@ impl InferenceSession {
     }
 
     /// The shared catalog handle behind an `Arc` — the form a [`TrainingJob`]
-    /// handle clones to poll its job after the submitting call returns.
-    pub(crate) fn catalog_arc(&self) -> &Arc<jammi_db::catalog::Catalog> {
+    /// handle clones to poll its job after the submitting call returns, and
+    /// the form `jammi-ballista`'s `CatalogClusterState`/`CatalogJobState`/
+    /// `DevicePlacement` (contract `feat_500-wave4.md` §3) need to hold
+    /// their own long-lived handle rather than borrowing this session's.
+    pub fn catalog_arc(&self) -> &Arc<jammi_db::catalog::Catalog> {
         self.inner.catalog()
     }
 

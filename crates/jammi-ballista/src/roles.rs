@@ -45,7 +45,7 @@ use ballista_executor::metrics::LoggingMetricsCollector;
 use ballista_executor::shutdown::ShutdownNotifier;
 
 use ballista_scheduler::cluster::BallistaCluster;
-use ballista_scheduler::config::SchedulerConfig;
+use ballista_scheduler::config::{SchedulerConfig, TaskDistributionPolicy};
 use ballista_scheduler::scheduler_process::create_scheduler;
 
 use jammi_ai::operator::gang_exec::GangDescriptor;
@@ -56,7 +56,6 @@ use jammi_ai::session::InferenceSession;
 use crate::codec::JammiCodec;
 use crate::engine::JammiExecutionEngine;
 use crate::error::{Error, Result};
-use crate::placement::PlacementPolicy;
 
 /// A hosted Ballista scheduler.
 pub struct SchedulerRole {
@@ -77,13 +76,18 @@ impl SchedulerRole {
 /// Build the scheduler role: `create_scheduler::<LogicalPlanNode,
 /// PhysicalPlanNode>` over `cluster`, served on `bind` with jammi's own
 /// shutdown. Push-staged, `task_max_failures = stage_max_failures = 0`
-/// (README r40), placement is ALWAYS `PlacementPolicy` (contract §9 B1 —
-/// U8b extends this SAME policy with the device predicate rather than
-/// replacing it).
+/// (README r40). `cluster`/`distribution` are the ONE constructor argument
+/// U8b swaps behind (contract §3): `jammi-server`'s own hosting always
+/// passes `BallistaCluster::new(CatalogClusterState, CatalogJobState)` and
+/// `TaskDistributionPolicy::Custom(Arc::new(DevicePlacement))` — there is no
+/// knob, `DevicePlacement` is the shipped policy — kept as parameters here
+/// only so the in-memory cluster + a bare policy stay reachable as a TEST
+/// fixture (`tests/it/roles.rs`), never a second production path.
 pub async fn host_scheduler(
     session: &Arc<InferenceSession>,
     bind: &str,
     cluster: BallistaCluster,
+    distribution: TaskDistributionPolicy,
 ) -> Result<SchedulerRole> {
     let addr: SocketAddr = bind
         .parse()
@@ -114,6 +118,7 @@ pub async fn host_scheduler(
         local_addr.port(),
         codec,
         config_producer,
+        distribution,
     ));
 
     // Cloned before `cluster` moves into `create_scheduler` — the
@@ -167,15 +172,14 @@ fn scheduler_config(
     bind_port: u16,
     codec: Arc<dyn PhysicalExtensionCodec>,
     config_producer: ballista_core::ConfigProducer,
+    distribution: TaskDistributionPolicy,
 ) -> SchedulerConfig {
     SchedulerConfig {
         external_host: bind_ip.clone(),
         bind_host: bind_ip,
         bind_port,
         scheduling_policy: TaskSchedulingPolicy::PushStaged,
-        task_distribution: ballista_scheduler::config::TaskDistributionPolicy::Custom(Arc::new(
-            PlacementPolicy,
-        )),
+        task_distribution: distribution,
         // `None` here falls back to `BallistaLogicalExtensionCodec::default()`
         // inside `create_scheduler` (confirmed by reading
         // `ballista-scheduler-54.1.0/src/scheduler_process.rs:61-69`) — no
@@ -512,6 +516,47 @@ pub async fn host_executor(
 
     let devices = device_facts(session);
 
+    // Stamp this executor's OWN device claim onto its `compute_executors`
+    // row (contract §9 B5) — `ClusterState::register_executor`'s fixed
+    // signature (the gRPC call `executor_server::startup` just completed
+    // above triggered) carries no device field, so this process patches its
+    // own row directly over the SAME shared catalog right after
+    // registration completes, deterministically the LAST write of this
+    // startup sequence (`cluster::CatalogClusterState::register_executor`'s
+    // doc names this ordering). A missing row here would mean the
+    // registration call above never landed — `executor_server::startup`
+    // already returned `Ok`, so this is defensive, not the expected path.
+    match session.catalog().get_compute_executor(&executor_id).await {
+        Ok(Some(existing)) => {
+            let rec = jammi_db::catalog::compute_repo::ComputeExecutorRecord {
+                devices: devices.clone(),
+                ..existing
+            };
+            if let Err(e) = session.catalog().upsert_compute_executor(&rec).await {
+                tracing::warn!(
+                    executor_id = %executor_id,
+                    error = %e,
+                    "jammi-ballista: failed to record this executor's device claim"
+                );
+            }
+        }
+        Ok(None) => {
+            tracing::warn!(
+                executor_id = %executor_id,
+                "jammi-ballista: no compute_executors row yet to attach this executor's \
+                 device claim to"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                executor_id = %executor_id,
+                error = %e,
+                "jammi-ballista: could not read this executor's own row to record its \
+                 device claim"
+            );
+        }
+    }
+
     // Install the `PlacedGangRunner` seam (contract §2.3): `GangExec::
     // execute` reaches this process's coordinator body through it, since a
     // Ballista executor's `TaskContext` carries no jammi session.
@@ -561,7 +606,13 @@ mod scheduler_config_tests {
             Arc::new(ballista_core::serde::BallistaPhysicalExtensionCodec::default());
         let config_producer: ballista_core::ConfigProducer =
             Arc::new(ballista_core::utils::default_config_producer);
-        let cfg = scheduler_config("127.0.0.1".into(), 0, codec, config_producer);
+        let cfg = scheduler_config(
+            "127.0.0.1".into(),
+            0,
+            codec,
+            config_producer,
+            TaskDistributionPolicy::RoundRobin,
+        );
         assert_eq!(cfg.task_max_failures, 0);
         assert_eq!(cfg.stage_max_failures, 0);
         assert!(matches!(

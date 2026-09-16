@@ -572,7 +572,9 @@ comment — `docs/guide/src/security.md` named no Ballista listener. Fixed:
   (crates/jammi-ballista/tests/it/codec.rs): a table created under tenant A; a descriptor built
   directly on the wire package (`jammi_ballista::codec::pb`, `MAGIC`, `NodeTag` made public for
   exactly this) naming it under tenant B → refused (not-found); under no tenant → refused; under
-  A → resolves. Mutation: relaxing the decode to the ambient read resolves both refusal arms.
+  A → resolves. Mutation (the oracle's own, executed in a private copy): replacing the strict read
+  with the admin-scoped ambient read — the idiom the placed-gang job read already uses — reds the
+  first refusal arm; the plain ambient read on an unbound session reds the positive arm instead.
 - **The listeners inside the partition.** `BALLISTA_LISTENER_ALLOWLIST`
   (crates/jammi-server/tests/it/tenant_isolation_oracle.rs) names `SchedulerGrpc`, `ExecutorGrpc`
   and `FlightService` with the I-PEER text the peer allowlist requires, and
@@ -610,7 +612,9 @@ Actions run ids. Every row is an executed run at the named tip.
 | 13abddd9 | merge path static + tests stages | 13/13 green (incl. the three Postgres lanes) | `final-static-tests.log`, `mp-final-1/` |
 | 5de2ab11 | rigor record committed (7 rows); anticipation record (43 files, 8 gate rows) at cdbb4f96; `check_rigor_record.py` OK | green | — |
 | 5de2ab11 | phase-5 oracle | HARD_BLOCK (tenant isolation per RPC) → §9e | ledger |
-| final tip | oracle re-run; records stage; PR CI | (recorded at close) | |
+| eadd4db1 | codec it (the cross-tenant denial oracle) 1/1; server it tenant_isolation_oracle 3/3 (incl. the Ballista public-listener case); clippy + rustdoc `-D warnings`; citations 1067 | all green (lead and the oracle both executed them) | `fix9-tests.log` |
+| eadd4db1 | phase-5 oracle re-run | PASS (all hard-block gates; the oracle's own mutation reds the denial oracle) | ledger |
+| final tip | records stage; PR CI | (recorded at close) | |
 
 ## 11. Units as built — the implementers' contract files, folded by the lead
 

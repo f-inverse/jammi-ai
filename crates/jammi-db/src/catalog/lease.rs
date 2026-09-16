@@ -58,7 +58,17 @@ pub const LEASE_TS_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6fZ";
 /// the application clock, through the one helper. Never used to build a
 /// Postgres lease predicate; see the module docs.
 pub fn lease_now() -> String {
-    chrono::Utc::now().format(LEASE_TS_FORMAT).to_string()
+    app_clock_now().format(LEASE_TS_FORMAT).to_string()
+}
+
+/// The application clock, read in ONE place. Every app-clock stamp and every
+/// client-side comparison against a stored stamp (`lease_now`,
+/// `lease_deadline`, `decode_lease_expires_at`'s and `last_seen_at_is_fresh`'s
+/// `now`) derives from this call, so `jobs_repo.rs` never reads a clock of its
+/// own — the property `assembly_outcome::cooldown_sql_has_no_second_clock_source`
+/// pins by source scan.
+pub fn app_clock_now() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
 }
 
 /// `now + lease`, formatted as a lease deadline — the application-clock
@@ -66,7 +76,7 @@ pub fn lease_now() -> String {
 /// lease predicate; see the module docs.
 pub fn lease_deadline(lease: Duration) -> String {
     let expiry =
-        chrono::Utc::now() + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
+        app_clock_now() + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
     expiry.format(LEASE_TS_FORMAT).to_string()
 }
 

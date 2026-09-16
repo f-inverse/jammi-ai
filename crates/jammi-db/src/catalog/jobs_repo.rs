@@ -2356,7 +2356,7 @@ impl Catalog {
                             let lease = super::lease::decode_lease_expires_at(
                                 kind,
                                 lease_expires_at.as_deref(),
-                                chrono::Utc::now(),
+                                super::lease::app_clock_now(),
                             );
                             Ok(RankAdmissionRow {
                                 status: row.get("status")?,
@@ -2552,7 +2552,7 @@ impl Catalog {
             )
             .await?;
         Ok(last_seen_at.is_some_and(|last_seen_at| {
-            super::lease::last_seen_at_is_fresh(&last_seen_at, margin, chrono::Utc::now())
+            super::lease::last_seen_at_is_fresh(&last_seen_at, margin, super::lease::app_clock_now())
         }))
     }
 

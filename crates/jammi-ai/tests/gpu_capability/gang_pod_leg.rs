@@ -167,7 +167,7 @@ pub(crate) const GANG_POD_LEG_EPSILON_DERIVATION: &str = "2e-4 = 2x the CPU-herm
 /// (`_gang_check_epsilon`/`_gang_evidence_anchor`) requires this to be a
 /// STRICT ancestor of the artifact's own measured `git_sha`.
 pub(crate) const GANG_POD_LEG_EPSILON_REGISTERED_SHA: &str =
-    "6a9ced97614890d8c50880b33b3bd70d2e2a67d1";
+    "e7440afd5398ae08d531df1826f92efc946fe2ac";
 
 /// This leg's sole registered producer path —
 /// `GANG_LEG_PRODUCER_PATH[GANG_LEG_POD]` in

@@ -342,6 +342,37 @@ above are read WITH these corrections.
   task unstamped; `ballista-scheduler` with `default-features = false` is load-bearing for the
   restart property (the REST API's `get_running_jobs` errors on a status row with no graph).
 
+### 9a. Doc-lens round (adversarial-audit BLOCK at `8785ba33`, prose against code; ten findings, seven blocks)
+
+Three findings named mechanisms the prose described better than the code implemented; those
+are fixed at the root, never reconciled in prose. Dispositions:
+
+- **Placement matched "any GPU", not the plan's device kind** (finding 6; and, once read
+  against a CPU fleet, the reason an all-CPU gang could never bind at all): the predicate
+  becomes a KIND MATCH — `GangDescriptor` gains `device_kind` stamped by the submitter's
+  session (as `InferenceExec` already carries), `stage_device_kind(plan) -> Option<
+  ComputeDeviceKind>` replaces the boolean, `DevicePlacement` binds only to an executor whose
+  registered devices list that kind (`cpu` is a kind), `submit_physical_plan` refuses typed
+  when no registered executor lists the plan's kind, and the engine's K7 refusal compares the
+  same kind for `GangExec`. Built with the distributed lane (§11.8).
+- **`ListWorkers` did not carry `devices`** (finding 1): `WorkerSummary` gains `repeated
+  DeviceFact devices = 8` (an additive field; the freeze covers packages and RPC paths), the
+  server maps `WorkerRecord.devices`, the admin/client mirrors carry it (§11.9).
+- **"May never share a fixed port" was stronger than the validator** (finding 5): the guide's
+  rule is the property — two of the six addresses collide iff their ports are equal and
+  non-zero and their hosts are equal or either host is unspecified; one `addresses_collide`
+  serves `ServerConfig::validate` and `BallistaConfig::validate` (§11.9).
+- Prose/overlay corrections (§11.10): placement is decided before topology for every
+  `fine_tune`/`graph_fine_tune` attempt a scheduler-role process claims (finding 2); the
+  shipped overlay admits single-pod gangs — the submit edge (`base/jammi.toml`) gains
+  `[distributed] max_world_size = 2`, the cross-pod `Peer` narrative is replaced by the
+  arithmetic a cross-pod gang needs (finding 3); the scheduler pod claims the two placeable
+  kinds only (finding 4); `task_slots = 1`, since a placed task and a loop claim share the one
+  host job slot (finding 7); design-contract coordinates removed from manifests and the
+  maintainer guide (finding 8); the StatefulSet rollout statement made exact (finding 9); the
+  third arm — a registered executor without the plan's kind refuses before submit and leaves
+  the row for reclaim — stated (finding 10).
+
 ## 10. Gate table
 
 Written at consolidation: tip, stage, result, log.

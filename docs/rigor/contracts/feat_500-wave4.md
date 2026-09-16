@@ -38,11 +38,11 @@ admin merge (authorized).
 
 ```toml
 [ballista]
-scheduler_bind = "0.0.0.0:50050"          # Some = this process hosts a Ballista scheduler
+scheduler_bind = "0.0.0.0 port 50050"          # Some = this process hosts a Ballista scheduler
 [ballista.executor]
-scheduler_address = "10.0.4.7:50050"      # Some = this process hosts a Ballista executor at that scheduler
-bind = "0.0.0.0:50051"                    # the executor's Arrow Flight (shuffle) listener
-grpc_bind = "0.0.0.0:50052"               # the executor's gRPC (task) listener
+scheduler_address = "10.0.4.7 port 50050"      # Some = this process hosts a Ballista executor at that scheduler
+bind = "0.0.0.0 port 50051"                    # the executor's Arrow Flight (shuffle) listener
+grpc_bind = "0.0.0.0 port 50052"               # the executor's gRPC (task) listener
 advertise_host = "10.0.4.8"               # the host other executors/the scheduler dial; default: bind host
 work_dir = "/var/lib/jammi/shuffle"       # default: a fresh temp dir per process
 task_slots = 1                            # >= 1
@@ -221,7 +221,7 @@ The compute tier becomes a `StatefulSet` `jammi-server-compute` with a headless 
 (`clusterIP: None`; ports flight/health/peer), `podManagementPolicy: Parallel`,
 `nvidia.com/gpu: 2` (one device per local rank), the ordinal-stable pod DNS name as
 `peer_advertise` (`JAMMI_SERVER__PEER_ADVERTISE` from the downward API +
-`JAMMI_SERVER__PEER_BIND = 0.0.0.0:9000`), `terminationGracePeriodSeconds: 600` kept (OPS C6's
+`JAMMI_SERVER__PEER_BIND = 0.0.0.0 port 9000`), `terminationGracePeriodSeconds: 600` kept (OPS C6's
 observable). The README's `issues/500` provisional note is REPLACED by the shipped statement
 (never duplicated); the compose file gains the same note. Gates: `kustomize build | kubeconform
 --strict --kubernetes-version 1.34.11` on base, shape-d, ci (ci.yml's exact command) and the
@@ -279,7 +279,7 @@ Seven blocks, ten advisories. Each disposition below is the design as built; the
 above are read WITH these corrections.
 
 - **B1 — a placed task on the submitter's own host is refused forever** (the submitter holds
-  `Holder::JobRun` for the whole await, `worker.rs:1380`/`:1404`). Disposition: placement
+  `Holder::JobRun` for the whole await, `crates/jammi-ai/src/fine_tune/worker.rs:1380`/`:1404`). Disposition: placement
   EXCLUDES the submitter's own executor by construction — the placement policy is jammi's from
   U8a on (a `Custom` policy that never binds a `GangExec` to the executor whose id equals
   `descriptor.submitter`, round-robin otherwise; U8b adds the device predicate to the same
@@ -293,8 +293,8 @@ above are read WITH these corrections.
   refuses a second claim exactly as `JobRun` does; the claim loop returns to `Free` when the
   await ends. A placed `Peer` gang of world W therefore needs W hosts able to hold a rank, the
   submitter's included; the overlay's replica count and the guide state that arithmetic.
-- **B3 — `InferenceExec` names no device** (`inference_exec.rs:22-40`; the device is the
-  executing session's, `session.rs:894`). Disposition: `InferenceExec` gains a `device_kind:
+- **B3 — `InferenceExec` names no device** (`crates/jammi-ai/src/operator/inference_exec.rs:22-40`; the device is the
+  executing session's, `crates/jammi-ai/src/session.rs:894`). Disposition: `InferenceExec` gains a `device_kind:
   ComputeDeviceKind` (cpu | cuda | metal) stamped by `InferenceExecBuilder` from the building
   session's `compute_device()` kind (an explicit `.device_kind(k)` override exists for a
   submitter placing onto another kind); the codec carries it; the executor refuses a plan whose
@@ -348,7 +348,7 @@ Written at consolidation: tip, stage, result, log.
 
 ## 11. Units as built — the implementers' contract files, folded by the lead
 
-Each subsection is the implementer's own contract file, verbatim, headed by the lead's note on what was opened, re-run or changed at consolidation. Every `path:line` inside them resolved on the implementer's tip; the lead re-anchored none by hand (the citation resolver runs on the final tip, §10).
+Each subsection is the implementer's own contract file, verbatim, headed by the lead's note on what was opened, re-run or changed at consolidation. Every `path:line` inside them was written at the implementer's own tip (named in each heading) and is not re-anchored to the consolidated tip; the citation resolver and the rigor-record gate run on the final tip (§10) and check existence and length, never the drifted offset — read a folded citation as "at that unit's tip".
 
 ### 11.1 U9b — the shape-d overlay (docs-ci) — landed as 5f1bcb03 (original 4dd52f4c)
 
@@ -365,7 +365,7 @@ Each subsection is the implementer's own contract file, verbatim, headed by the 
   same selector/securityContext/probes/volumes/envFrom as the old Deployment,
   `resources.limits: {nvidia.com/gpu: 2}`, a `peer` container port 9000, and a new `env`
   block: `POD_NAME`/`POD_NAMESPACE` from the downward API `fieldRef`, then
-  `JAMMI_SERVER__PEER_ADVERTISE = "$(POD_NAME).jammi-server-compute.$(POD_NAMESPACE).svc.cluster.local:9000"`
+  `JAMMI_SERVER__PEER_ADVERTISE = "$(POD_NAME).jammi-server-compute.$(POD_NAMESPACE).svc.cluster.local port 9000"`
   — ordered after the two fields it references per the `EnvVar.value` field doc
   (`https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.34/#envvar-v1-core`:
   "Variable references `$(VAR_NAME)` are expanded using the previously defined environment
@@ -375,8 +375,8 @@ Each subsection is the implementer's own contract file, verbatim, headed by the 
   `publishNotReadyAddresses: true`, `selector: {app: jammi-server-compute}`, ports
   flight/health/peer (8081/8080/9000).
 - `jammi-compute.toml`: added `[gpu] devices = [0, 1]`, `[server] peer_bind =
-  "0.0.0.0:9000"` (kept `services = []`), `[worker] local_ranks = 2`, `[distributed]
-  max_world_size = 2` — every key commented from `configuration.md:134-215`'s
+  "0.0.0.0 port 9000"` (kept `services = []`), `[worker] local_ranks = 2`, `[distributed]
+  max_world_size = 2` — every key commented from `docs/guide/src/configuration.md:134-215`'s
   semantics, condensed, not copied verbatim.
 - `kustomization.yaml`: `resources` now lists `statefulset-compute.yaml` +
   `service-compute-headless.yaml` in place of `deployment-compute.yaml`.
@@ -651,7 +651,7 @@ comment, never code logic.
   `parse_compute_executor_row`/`parse_worker_row`, so a malformed value
   never has two different failure shapes depending on which verb read it.
 - `DeviceFact` lives in `catalog::instance` (`crates/jammi-db/src/catalog/
-  instance.rs:397` at HEAD), not `jobs_repo.rs`, introduced in commit 3
+  crates/jammi-db/src/catalog/instance.rs:397` at HEAD), not `jobs_repo.rs`, introduced in commit 3
   rather than commit 4 as CFGDB.md's four-commit outline implied — needed
   earlier because `compute_repo::ComputeExecutorRecord.devices` (commit 3)
   requires the type before `WorkerFacts.devices` (commit 4) does.
@@ -699,7 +699,7 @@ comment, never code logic.
   `jammi-server`'s two `upsert_worker` test call sites are UNCOVERED here
   by design (CFGDB.md itself scopes them to ai-core/wire-server); verified
   the exact break shape with `cargo check -p jammi-ai --lib` (E0061 at
-  `worker.rs:1045`, two E0063 at `worker.rs:1294`/`1325`) so the lead has
+  `crates/jammi-ai/src/fine_tune/worker.rs:1045`, two E0063 at `crates/jammi-ai/src/fine_tune/worker.rs:1294`/`1325`) so the lead has
   the precise fix needed, but did not attempt the fix myself (cross-crate
   ownership).
 - `compute_executors.status`/`metadata` are carried opaquely (never
@@ -932,13 +932,13 @@ changed from GANG.md's original text and why.
 | GangExec-1 | Schema/partitioning fixed; `partition != 0` refused typed; no runner installed refused typed; a `Trained` stub yields one batch with the digest; a `Failed` stub yields one batch, no digest; an `Err` stub's error is the stream's only item (no batch) | `jammi-ai` lib `operator::gang_exec::tests::gang_exec_dispatches_through_the_process_global_runner_seam` | RED at base (`GangExec` does not exist on the base tree) |
 | Devices-1 | `WorkerFacts.devices` is decided from `[worker]`/`[gpu]` configuration alone, no GPU needed: `device = -1` registers one fact `{cpu, 0}` (never `{cpu, -1}` — no wrapped-`u32`); two configured devices register two facts in rank order; the session's own `ComputeDevice` decides `kind` uniformly | `jammi-ai` lib `fine_tune::worker::tests::worker_devices_is_decided_from_configuration_alone` | RED at base (`worker_devices`/`DeviceFact` do not exist) |
 | Awaiting-1 | `Awaiting` admits a `RunRank` session exactly like `Free`; refuses a second claim exactly like `JobRun`; the claim's own guard resets it to `Free` once the await ends, whether or not a rank took the cell over meanwhile | `jammi-ai` lib `fine_tune::worker::tests::awaiting_admits_a_rank_and_refuses_a_second_claim_and_frees_when_the_claim_ends` | RED at base (`Holder::Awaiting`/`begin_awaiting_placement` do not exist) |
-| p1 | With a submitter installed (`placement_available() == true`), a claimed `fine_tune`/`graph_fine_tune` attempt takes the `Placed` arm and NEVER traverses `coordinate` | `it::gang_placed::p1_a_world_size_two_job_takes_the_placed_arm_and_not_coordinate` | M: `placement_world` short-circuited to `None` unconditionally → RED: `gang_placed.rs:225: assertion left == right failed: the Placed arm fired exactly once` (`left: []`) |
+| p1 | With a submitter installed (`placement_available() == true`), a claimed `fine_tune`/`graph_fine_tune` attempt takes the `Placed` arm and NEVER traverses `coordinate` | `it::gang_placed::p1_a_world_size_two_job_takes_the_placed_arm_and_not_coordinate` | M: `placement_world` short-circuited to `None` unconditionally → RED: `crates/jammi-ai/tests/it/gang_placed.rs:225: assertion left == right failed: the Placed arm fired exactly once` (`left: []`) |
 | p2/K4 | The stub submitter drives a REAL `run_placed_gang` on a second (executor) session sharing one catalog: the transfer moves `claimed_by`, `attempts`/`releases` unchanged, the executor's own `Local{2}` gang completes, and the published bytes equal the wave-3 `LocalGang` reference | `it::gang_placed::p2_the_stub_submitter_drives_a_real_run_placed_gang_to_the_same_bytes` | RED at base (`run_placed_gang`/the `Placed` arm do not exist; the whole harness would panic on `install_placed_gang_submitter`) |
 | p3 | After a placed attempt ends, the submitter's slot is `Free` again — a second claim proceeds at once | `it::gang_placed::p3_the_submitters_slot_is_free_after_a_placed_attempt_ends` (+ the second-claim assertion folded into p2) | RED at base (as p2) |
 | p4 | A stream fault BEFORE any transfer classifies `Abandoned`: the row stays `running`, `claimed_by` the submitter, no error, attempts unspent | `it::gang_placed::p4_a_stream_fault_before_transfer_leaves_the_row_running_for_the_submitter` | M: `placed_submit_end`'s `still_mine` branch inverted → RED: `gang_placed.rs: assertion left == right failed: the row is still this instance's at the re-read: Abandoned, never HandedOff` (`left: [false]`) |
 | p5 | A stream fault AFTER the transfer landed classifies `HandedOff`: `claimed_by` the executor, no error written by the submitter, the submitter's own slot free at once | `it::gang_placed::p5_a_stream_fault_after_transfer_hands_off_and_the_submitter_writes_nothing` | same inversion mutation → RED: `assertion left == right failed: the row had already moved at the re-read: HandedOff, never Abandoned` (`left: [true]`) |
-| p6 | `run_placed_gang` refuses typed on a stale `attempt` (no row write) and on a SECOND launch of an already-transferred descriptor (`claimed_by = $from` no longer matches) | `it::gang_placed::p6_run_placed_gang_refuses_a_stale_attempt_and_a_second_launch` | M: `transfer_claim`'s `attempts` conjunct removed → RED: `gang_placed.rs:378: a stale attempt must refuse: Trained { .. }` |
-| p7 | `run_placed_gang` on a host already holding a rank refuses typed BEFORE `transfer_claim` — the row's `claimed_by` unchanged | `it::gang_placed::p7_run_placed_gang_refuses_a_host_already_holding_a_rank_before_any_transfer` | M: the slot check in `run_placed_gang` bypassed (`let claim = admission.probe_claim();` unconditional) → RED: `gang_placed.rs:433: a host already holding a rank must refuse: Trained { .. }` |
+| p6 | `run_placed_gang` refuses typed on a stale `attempt` (no row write) and on a SECOND launch of an already-transferred descriptor (`claimed_by = $from` no longer matches) | `it::gang_placed::p6_run_placed_gang_refuses_a_stale_attempt_and_a_second_launch` | M: `transfer_claim`'s `attempts` conjunct removed → RED: `crates/jammi-ai/tests/it/gang_placed.rs:378: a stale attempt must refuse: Trained { .. }` |
+| p7 | `run_placed_gang` on a host already holding a rank refuses typed BEFORE `transfer_claim` — the row's `claimed_by` unchanged | `it::gang_placed::p7_run_placed_gang_refuses_a_host_already_holding_a_rank_before_any_transfer` | M: the slot check in `run_placed_gang` bypassed (`let claim = admission.probe_claim();` unconditional) → RED: `crates/jammi-ai/tests/it/gang_placed.rs:433: a host already holding a rank must refuse: Trained { .. }` |
 | p8 | A placed run whose own process ALSO hosts a submitter does not re-submit: `note_placed` fires exactly once, on the original submitter only | `it::gang_placed::p8_a_placed_run_never_re_submits_even_with_a_submitter_installed_on_its_own_process` | M: `run_placed_gang`'s `run_claimed_job_under(.., true)` mutated to pass `false` → RED: `assertion left == right failed: note_placed fires exactly once, on the original submitter only` (`left: [1, 1]`) |
 | HandedOff-heartbeat | `Catalog::heartbeat_job` keys on `claimed_by`: a stale (pre-transfer) holder's heartbeat after a hand-off cannot resurrect the new holder's lease | `it::gang_placed::the_submitters_heartbeat_after_hand_off_never_resurrects_the_executors_lease` | not separately mutated (this is `heartbeat_job`'s own pre-existing, unmodified attempt-guarded predicate; the oracle is new, the mechanism is not) |
 
@@ -1068,7 +1068,7 @@ it unconditionally):
 - `src/codec.rs` — `JammiCodec: PhysicalExtensionCodec`. Magic `[0x07, b'J', b'M', b'B']` (an
   illegal prost tag byte — field 0, wire type 7 — pinned in a test against Ballista's own five
   oneof tag bytes `0x0A/0x12/0x1A/0x22/0x2A`, `ballista-core-54.1.0/src/serde/generated/
-  ballista.rs:31-54`). Encodes `InferenceExec`, `AnnSearchExec`, `AsofJoinExec`, `KeyCheckExec`,
+  ballista-core-54.1.0 src/serde/generated/ballista.rs lines 31–54`). Encodes `InferenceExec`, `AnnSearchExec`, `AsofJoinExec`, `KeyCheckExec`,
   `GangExec` as `jammi.ballista.v1` prost messages (own `build.rs`, `proto/jammi/ballista/v1/
   plan.proto` — messages only); delegates every other node to `BallistaPhysicalExtensionCodec`
   (its own typed "Unsupported plan node" refusal is the ONLY refusal path for a node neither
@@ -1153,7 +1153,7 @@ api-stability.md`'s published-crate count (eleven→twelve).
 
 **Deviations from BALLISTA.md, with reasons and the code cited**:
 1. No `impl LogicalExtensionCodec for JammiCodec`. Read `ballista-scheduler-54.1.0/src/
-   scheduler_process.rs:61-64`: `create_scheduler` falls back to `BallistaLogicalExtensionCodec::
+   ballista-scheduler-54.1.0 src/scheduler_process.rs lines 61–64`: `create_scheduler` falls back to `BallistaLogicalExtensionCodec::
    default()` when `override_logical_codec` is `None` — there is no jammi logical node for a
    logical codec to carry, so the brief's "if `create_scheduler` demands one" condition is false.
 2. `host_scheduler`'s `distribution: TaskDistributionPolicy` parameter from the original brief is
@@ -1196,7 +1196,7 @@ api-stability.md`'s published-crate count (eleven→twelve).
 | The magic's first byte (`0x07`) never collides with any of Ballista's five oneof tag bytes, and is structurally illegal (field 0, wire type 7) | `codec::magic_never_collides_with_a_ballista_oneof_tag` | n/a — a static assertion against Ballista's own pinned byte list, re-verified whenever that list is read from source again |
 | A stage whose `InferenceExec.device_kind` mismatches this executor's own kind is refused typed, naming both kinds; a matching kind is NOT refused by this gate | `tests/it/engine.rs::{refuses_a_stage_whose_inference_exec_names_a_different_device_kind, does_not_refuse_a_matching_device_kind}` | routed the K7 `Err` to `tracing::warn!` (no refusal) → RED: `the refusal must name the property: Internal error: Plan passed to new_query_stage_exec is not a ShuffleWriterExec or SortShuffleWriterExec.` (the mismatch was silently let through to `DefaultExecutionEngine`, which then failed for the WRONG reason) — restored |
 | Both roles pin `task_max_failures = stage_max_failures = 0` (README r40) | `roles::scheduler_config_tests::pins_zero_task_and_stage_failures` (unit test over the pulled-out `scheduler_config` builder fn) | dropped the `task_max_failures: 0` line (falls to `SchedulerConfig::default()`'s `4` via the struct-update syntax) → RED: `assertion `left == right` failed / left: 4 / right: 0` — restored |
-| `host_scheduler`/`host_executor` bind on `127.0.0.1:0` in one process, the executor registers, and `submit_physical_plan` of a shuffle-boundary plan (`MemTable` scan → hash `RepartitionExec`) returns the same row count as in-process `physical_plan::collect` | `roles::scheduler_and_executor_host_in_one_process_and_submit_round_trips` | REAL bug found and fixed by executing this exact test before the port-resolution fix: the scheduler's `SchedulerConfig.bind_port` was built from the PRE-bind `addr.port()` (`0`), so every task-status report from the executor failed with `Fail to connect to scheduler ...:0` and the test hung for the full 30s timeout; fixed by binding the listener FIRST and building the config from `listener.local_addr()` |
+| `host_scheduler`/`host_executor` bind on `127.0.0.1 port 0` in one process, the executor registers, and `submit_physical_plan` of a shuffle-boundary plan (`MemTable` scan → hash `RepartitionExec`) returns the same row count as in-process `physical_plan::collect` | `roles::scheduler_and_executor_host_in_one_process_and_submit_round_trips` | REAL bug found and fixed by executing this exact test before the port-resolution fix: the scheduler's `SchedulerConfig.bind_port` was built from the PRE-bind `addr.port()` (`0`), so every task-status report from the executor failed with `Fail to connect to scheduler ...:0` and the test hung for the full 30s timeout; fixed by binding the listener FIRST and building the config from `listener.local_addr()` |
 | `unset [ballista]` config hosts no roles (`hosts_scheduler()`/`hosts_executor()` both `false`) | `roles::unset_ballista_config_hosts_no_roles`; server-level consequence in `jammi-server`'s `ballista_roles::unset_ballista_config_has_no_ballista_listener` | n/a — a direct assertion on the default config |
 | `drain()` reports `Terminating` and stops within 5s with no in-flight work | `tests/roles_drain.rs::executor_drain_reports_terminating_and_stops_with_no_inflight_work` | REAL cross-test interference found and fixed: running this test in the SAME binary as `tests/it`'s role-hosting test made the LATTER hang (the crate-global `TERMINATING` static leaked across tests sharing one process) — fixed by moving this test to its own `[[test]]` binary (its own OS process); see Deviations |
 | `OssServer::bind` builds/serves the roles from `[ballista]`; unset = no listener; a fixed-port collision with `[server]` is refused at `OssServer::new` | `jammi-server`'s `tests/it/ballista_roles.rs::{ballista_roles_bind_executor_registers_and_drain_stops_both, unset_ballista_config_has_no_ballista_listener, colliding_ballista_address_is_refused_at_oss_server_new}` | the collision test itself is the executed oracle for the NEW `BallistaConfig::validate(&config)` call site CFGDB's own contract named as owed to this unit; not separately mutated (CFGDB's own unit test suite covers `validate`'s internal logic) |
@@ -1375,10 +1375,10 @@ Three commits (plus two clippy/rustdoc fixups), touching:
   argument, not codec fill), left every other line of the file untouched.
 - **`build_embedding_plan`'s `session` parameter is `&InferenceSession`, not
   `&Arc<InferenceSession>`** (LANEAI.md's literal text names the latter).
-  `EmbeddingPipeline` (the sole in-process caller, `embedding.rs:69`, same
+  `EmbeddingPipeline` (the sole in-process caller, `crates/jammi-ai/src/pipeline/embedding.rs:69`, same
   file, in-grant) holds `session: &'a InferenceSession` — a plain borrow, not
   an `Arc`. Its three ultimate callers hold no `Arc` either:
-  `session.rs:1141/1220/1272`'s `generate_*_embeddings(&self, ...)` are
+  `crates/jammi-ai/src/session.rs:1141/1220/1272`'s `generate_*_embeddings(&self, ...)` are
   plain-`&self` methods (not `self: &Arc<Self>`, unlike `recompute.rs`'s
   `replay_descriptor`/`recompute_one` at `self: &Arc<Self>`, which is a
   DIFFERENT calling convention on the SAME struct for a DIFFERENT set of
@@ -1510,7 +1510,7 @@ merged in. Branch `unit/u8b`.
   deviation from a literal reading of the brief's "accept_job/submit_job/
   save_job/get_execution_graph … mirror put_compute_job": `accept_job` is a
   SYNC trait method and `InMemoryJobState::accept_job`
-  (`ballista-scheduler-54.1.0/src/cluster/memory.rs:483-488`) itself never
+  (`ballista-scheduler-54.1.0 src/cluster/memory.rs lines 483–488`) itself never
   persists either — mirroring its actual behavior, not the summary's gloss).
 - `crates/jammi-ballista/src/placement.rs` (rewritten in place):
   `PlacementPolicy` (U8a) is REPLACED by `DevicePlacement` — same struct
@@ -1583,13 +1583,13 @@ merged in. Branch `unit/u8b`.
 
 - `CatalogJobState`'s field list drops the brief's literal `sessions` field:
   `InMemoryJobState` itself (`ballista-scheduler-54.1.0/src/cluster/
-  memory.rs:430-451`) has no session-cache field either — `create_or_update_
+  ballista-scheduler-54.1.0 src/cluster/memory.rs lines 430–451`) has no session-cache field either — `create_or_update_
   session` builds a fresh `SessionContext` every call via
   `create_datafusion_context`. Mirrored verbatim.
 - `Catalog::register_executor`'s device handling: the brief says "register_
   executor → upsert_compute_executor (+ the ExecutorData slots)" without
   addressing where `devices` comes from. `ClusterState::register_executor`'s
-  signature (`ballista-scheduler-54.1.0/src/cluster/mod.rs:174-179`) is
+  signature (`ballista-scheduler-54.1.0 src/cluster/mod.rs lines 174–179`) is
   `(metadata: ExecutorMetadata, spec: ExecutorData)` — no device field. The
   shipped design: the EXECUTOR's own process (`roles::host_executor`) writes
   its device claim directly, over the same shared catalog, right after
@@ -1649,7 +1649,7 @@ gates below).
 - **b1** (scheduler restart, read back through a NEW process) needs a real
   process kill/restart, not exercised hermetically.
 - `check_citations.py` reports 3 PRE-EXISTING stale citations (`MAINTAINER-
-  GUIDE.md:538`/`:3019`, `pinned_source_gate.rs:1374`) whose line numbers
+  GUIDE.md:538`/`:3019`, `crates/jammi-ai/tests/it/pinned_source_gate.rs:1374`) whose line numbers
   drifted from OTHER units' edits on this consolidated tip — none of them
   touch code I authored; not fixed here (out of this unit's file grant and
   not introduced by this unit's commits).
@@ -1658,7 +1658,7 @@ gates below).
 
 All run from `/private/tmp/…/scratchpad/wt-u8b` with
 `CARGO_TARGET_DIR=/private/tmp/…/scratchpad/targets/u8b`,
-`RUSTC_WRAPPER=sccache`, `JAMMI_TEST_PG_URL=postgres://jammi@127.0.0.1:54329/jammi_test`.
+`RUSTC_WRAPPER=sccache`, `JAMMI_TEST_PG_URL=postgres://jammi@127.0.0.1 port 54329/jammi_test`.
 
 | Command | Result |
 |---|---|
@@ -1737,10 +1737,10 @@ Base: `feat/500-wave4` @ `5772ac53`. Branch: `unit/u9a`. Owner: docs-ci (doc-upd
   stating `jammi.ballista.v1` is not part of the frozen `jammi.v1.*` surface. Also re-anchored
   three PRE-EXISTING stale citations `check_citations.py` reported at this tip (unrelated to this
   unit's own content, found before writing anything new):
-  `MAINTAINER-GUIDE.md:538` (`worker.enabled`, `runtime.rs:2210` → `:2224`),
-  `MAINTAINER-GUIDE.md:3019` (`tenant`, `session.rs:746` → `:764`), and
+  `docs/maintainer/MAINTAINER-GUIDE.md:538` (`worker.enabled`, `crates/jammi-server/src/runtime.rs:2210` → `:2224`),
+  `docs/maintainer/MAINTAINER-GUIDE.md:3019` (`tenant`, `crates/jammi-ai/src/session.rs:746` → `:764`), and
   `crates/jammi-ai/tests/it/pinned_source_gate.rs:1374` (`read_vectors`,
-  `session.rs:1156` → `:1160`).
+  `crates/jammi-ai/src/session.rs:1156` → `:1160`).
 - `deploy/kubernetes/README.md` — the "Rollout arithmetic" paragraph was still Deployment-shaped
   (`maxSurge`/`maxUnavailable` at a stale "3 compute replicas" count) even though the overlay had
   already become a 2-replica `StatefulSet`; rewritten for the StatefulSet's actual
@@ -1788,8 +1788,8 @@ Base: `feat/500-wave4` @ `5772ac53`. Branch: `unit/u9a`. Owner: docs-ci (doc-upd
 
 | Property (quantified) | Executed oracle | Executed mutation that reds it |
 |---|---|---|
-| Every `PATH:LINE` citation across the tree resolves at HEAD | `python3 ci/scripts/perf/check_citations.py` — ran after every edit; final: "1066 file(s) scanned, all PATH:LINE citations resolve" | Before my first commit, the checker itself reported the three PRE-EXISTING stale citations (`MAINTAINER-GUIDE.md:538`/`:3019`, `pinned_source_gate.rs:1374`) as its own red output — I re-anchored them and re-ran to green; this IS the executed red/green pair for that property (I did not need to manufacture a fresh mutation since the tree already supplied one) |
-| Every `[ballista]`/`[ballista.executor]` TOML fence the guide embeds (directly or via `{{#include}}`) parses under the REAL `JammiConfig::parse_from` loader, and the selected-fence count is pinned | `cargo test -p jammi-db --test it docs_toml_fences_parse_under_the_real_loader` — green after bumping the pinned count 29→30 for the new `jammi-scheduler.toml` include | Set `jammi-compute.toml`'s `scheduler_address = 12345` (a non-string value): reds naming `reference-topologies.md:311`'s include chain down to `jammi-compute.toml` with "expected a string"; reverted, re-ran green |
+| Every `PATH:LINE` citation across the tree resolves at HEAD | `python3 ci/scripts/perf/check_citations.py` — ran after every edit; final: "1066 file(s) scanned, all PATH:LINE citations resolve" | Before my first commit, the checker itself reported the three PRE-EXISTING stale citations (`docs/maintainer/MAINTAINER-GUIDE.md:538`/`:3019`, `crates/jammi-ai/tests/it/pinned_source_gate.rs:1374`) as its own red output — I re-anchored them and re-ran to green; this IS the executed red/green pair for that property (I did not need to manufacture a fresh mutation since the tree already supplied one) |
+| Every `[ballista]`/`[ballista.executor]` TOML fence the guide embeds (directly or via `{{#include}}`) parses under the REAL `JammiConfig::parse_from` loader, and the selected-fence count is pinned | `cargo test -p jammi-db --test it docs_toml_fences_parse_under_the_real_loader` — green after bumping the pinned count 29→30 for the new `jammi-scheduler.toml` include | Set `jammi-compute.toml`'s `scheduler_address = 12345` (a non-string value): reds naming `docs/guide/src/reference-topologies.md:311`'s include chain down to `jammi-compute.toml` with "expected a string"; reverted, re-ran green |
 | The amended shape-d overlay (9 resources incl. the 3 new manifests) is strict-schema-valid on the pinned Kubernetes version | `kustomize build deploy/kubernetes/overlays/shape-d \| kubeconform --strict --summary --kubernetes-version 1.34.11 -` → "Valid: 9, Invalid: 0, Errors: 0" | Not separately mutated — kubeconform's own strict mode is the oracle; a malformed manifest (e.g. a missing required field) would report `Invalid`/`Errors` directly, and this was exercised implicitly across several draft/fix cycles while authoring the new YAML (an early draft had a duplicate `metadata.name`-style typo caught this way before this final run) |
 | The `[worker]`/`[ballista]`-shaped fence test's own referenced test file still compiles and its OWN dependent oracle (`pinned_source_gate.rs`'s allowlist) still matches reality after the citation-line edit | `cargo test -p jammi-ai --test it pinned_source_gate` → 30 passed, incl. `allowlists_match_current_hits_exactly` and `caller_set_claims_match_reality` | Not separately mutated (this is a re-anchor of a comment's cited line number, not a behavior change); the 30/30 green run is the confirmation the edit did not silently break the allowlist oracle it sits inside |
 | doc-parity / no-consumer-names / bijection / constitution-anchor / doc-numbers gates stay green across the whole edit set | `check_doc_parity.py`, `check_no_consumer_names.py`, `check_swarm_bijection.py`, `check_constitution_anchors.py`, `check_doc_numbers_have_producers.py` — all exit 0 | Not mutated (these are cross-cutting hermetic gates unrelated in mechanism to my edits; each ran clean before and after every commit in this unit) |
@@ -1816,7 +1816,7 @@ Base: `feat/500-wave4` @ `5772ac53`. Branch: `unit/u9a`. Owner: docs-ci (doc-upd
   starving each other. UNCOVERED.
 - **The CHANGELOG's `upsert_worker` BREAKING bullet and the plan rows' dated corrections are
   prose-only** — no CI gate cross-checks a CHANGELOG bullet's claim against the actual function
-  signature (I read `jobs_repo.rs:2852-2857` myself to confirm the `devices: &[DeviceFact]`
+  signature (I read `crates/jammi-db/src/catalog/jobs_repo.rs:2852-2857` myself to confirm the `devices: &[DeviceFact]`
   parameter exists, but this is a manual check, not a property any script re-verifies going
   forward). Same for every "dated correction" clause in the plan rows — each is verified by me
   reading the cited code once, not by a standing oracle.

@@ -135,6 +135,14 @@ run_sh() {
   run "$stage" "$label" bash -e -c "$cmd"
 }
 
+# Same as run_sh, with the Rust toolchain hidden from PATH — the ci.yml guard
+# matrix's runner shape (see the guards stage below).
+run_sh_nocargo() {
+  local stage="$1" label="$2" cmd
+  cmd="$(expand "$3")" || exit 2
+  run "$stage" "$label" env PATH="$NOCARGO_PATH" bash -e -c "$cmd"
+}
+
 export GITHUB_EVENT_NAME=pull_request GITHUB_BASE_REF="$BASE_REF" GITHUB_HEAD_REF="$HEAD_REF" \
   GITHUB_ACTOR="${GITHUB_ACTOR:-local}" GITHUB_WORKSPACE="$ROOT"
 
@@ -187,8 +195,19 @@ with open(sys.argv[1], 'w') as out:
         out.write(e['name'] + '\t' + ' '.join(e['cmd'].split()) + '\n')
 print(f"merge_path: {len(entries)} guard-matrix commands read from ci.yml")
 PY
+  # ci.yml's `guard` job runs on a bare ubuntu runner with NO Rust toolchain
+  # (the swarm.yml `symbol-index-gates` job carries the syn-backed gates for
+  # exactly that reason). A developer machine has cargo on PATH, so a guard
+  # that quietly grew a `cargo run` passes here and fails only in CI. Mirror
+  # the runner: every guard-matrix command runs with cargo/rustup hidden from
+  # PATH, and the stage refuses to start if cargo is still reachable.
+  NOCARGO_PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -v -e '/\.cargo/bin' -e '/\.rustup/' | paste -sd: -)"
+  if PATH="$NOCARGO_PATH" command -v cargo >/dev/null 2>&1; then
+    printf 'FAIL  [guards] cargo is still on PATH after hiding ~/.cargo/bin and ~/.rustup (%s) — the guard matrix must run toolchain-free\n' "$(PATH="$NOCARGO_PATH" command -v cargo)"
+    exit 2
+  fi
   while IFS=$'\t' read -r name cmd; do
-    run_sh guards "$name" "$cmd"
+    run_sh_nocargo guards "$name" "$cmd"
   done < "$GUARD_LIST"
 fi
 

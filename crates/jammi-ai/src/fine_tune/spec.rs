@@ -328,17 +328,14 @@ impl RankAdmission {
 /// the admitted value back only through `AdmittedTrainingSpec::spec`, so
 /// that one function body has no path left that could serialize/submit the
 /// pre-admission value alongside (or instead of) the admitted one -- the
-/// double-value footgun a `&spec` borrow (this module's shape before this
-/// round) left open.
+/// double-value footgun a `&spec` borrow would leave open.
 ///
-/// What this closed BEFORE this round's seam (#573 round 3, stated
-/// honestly): the three durable-write call sites were not consolidated
-/// behind one shared function that took `AdmittedTrainingSpec` as its
-/// parameter type -- each edge built its own `SubmitJobParams` inline, so a
-/// fourth edge that skipped this type entirely and handed a raw JSON string
-/// straight to `jammi_db::Catalog::submit_job`/`submit_job_deduped` was
-/// still source-syntactically possible. [`submit_admitted_training`] is that
-/// consolidation: it is now the ONLY function in the workspace that builds a
+/// What the witness alone does NOT close (#573): three durable-write call
+/// sites each building their own `SubmitJobParams` inline would let a
+/// fourth edge skip this type entirely and hand a raw JSON string straight
+/// to `jammi_db::Catalog::submit_job`/`submit_job_deduped`.
+/// [`submit_admitted_training`] closes that: it is the ONLY function in the
+/// workspace that builds a
 /// [`jammi_db::catalog::jobs_repo::SubmitJobParams`] for a training kind, so
 /// a hand-rolled bypass has to duplicate this function's body verbatim
 /// rather than merely skip a witness read -- `
@@ -370,12 +367,12 @@ impl AdmittedTrainingSpec {
 /// Consumes `spec` and, on success, returns it wrapped in
 /// [`AdmittedTrainingSpec`] -- the type-level half of "every durable submit
 /// edge calls this before writing a row" (#573): unlike a `&spec` borrow
-/// (this function's shape before round 2), a caller cannot hand the
+/// a caller cannot hand the
 /// ORIGINAL `spec` value to a durable-write path expecting
 /// [`AdmittedTrainingSpec`] without first passing it through here -- the
 /// witness is the only surviving handle to the spec after this call.
 ///
-/// `pub` (not `pub(crate)`, round 3): `jammi-bench`'s finetune-run tier
+/// `pub` (not `pub(crate)`): `jammi-bench`'s finetune-run tier
 /// (`crates/jammi-bench/src/finetune_run.rs`) submits a REAL training job
 /// through this same admission + [`submit_admitted_training`] rather than a
 /// hand-built, unadmitted placeholder row — the seam is the control here,

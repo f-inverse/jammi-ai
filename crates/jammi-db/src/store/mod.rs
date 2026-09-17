@@ -341,8 +341,8 @@ impl TrainingSetTable {
 /// the bare `jammi.{name}` identifier) into a [`RelationKey`] safe for SQL
 /// interpolation.
 ///
-/// The general-purpose sibling of [`TrainingSetTable::sql_relation`] (#551,
-/// round 3, N2-gate): a training-set caller that already holds a
+/// The general-purpose sibling of [`TrainingSetTable::sql_relation`] (#551):
+/// a training-set caller that already holds a
 /// [`TrainingSetTable`] handle uses that method directly, but every OTHER
 /// reader of a registered relation across the workspace — an inference
 /// result table, a neighbor-graph table, an embedding index, a bench

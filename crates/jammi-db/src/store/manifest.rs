@@ -248,7 +248,7 @@ pub struct MaterializationEnv {
     /// addition changes not one byte of any [`DefinitionHash`] computed
     /// before it existed.
     ///
-    /// **Production coverage (#546, wave-5 F3, CLOSED).** `jammi-db` cannot
+    /// **Production coverage (#546).** `jammi-db` cannot
     /// itself observe a training loop's admission outcomes (it depends on no
     /// `jammi-kernels` type), so populating it is entirely the producing
     /// caller's responsibility. The `FineTune` producer in `jammi-ai` calls

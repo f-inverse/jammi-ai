@@ -1544,7 +1544,7 @@ pub struct ReleaseReport {
 /// process (or N for a pool); [`Self::run_until`] is the long-lived loop
 /// the embedded engine and the server's worker tier both drive, spawned
 /// ONLY through [`EmbeddedWorker::spawn`]/[`EmbeddedWorker::spawn_worker`]
-/// (the session's single claim-loop slot, #500 wave 5 group E1 P7) — this
+/// (the session's single claim-loop slot) — this
 /// type carries no bare, ungated entry point onto `run_until` of its own.
 pub struct JobWorker {
     /// Weak back-reference to the session — upgraded each tick. `None` means the
@@ -4607,8 +4607,8 @@ impl EmbeddedWorker {
     /// normal flow `JammiConfig::load` already validated the timing, so that
     /// half only surfaces for a hand-built config. Returns
     /// [`JammiError::FineTune`] when a loop already owns this session's
-    /// single claim-loop slot (`HostAdmission::try_claim_loop`, #500 wave 5
-    /// group E1 P7): "one claim loop per session" is structural — a second
+    /// single claim-loop slot (`HostAdmission::try_claim_loop`): "one claim
+    /// loop per session" is structural — a second
     /// spawn is refused before any task exists, never a second loop whose
     /// hold-release blast radius the phase barrier alone would have to
     /// cover. Spawn a successor only after the prior guard has fully

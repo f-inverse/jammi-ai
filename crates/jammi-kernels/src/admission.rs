@@ -1360,7 +1360,7 @@ fn admit_inner(
 /// decision this function has always made.
 ///
 /// `op` is a [`ProbedOp`] — never a bare string — so a call site is bound to
-/// [`PROBED_OPS`] at compile time (#546 F3): a dtype-ambiguous op
+/// [`PROBED_OPS`] at compile time (#546): a dtype-ambiguous op
 /// ([`CAST_SCALE`]/[`CAST_ADD`]) cannot resolve here (see
 /// [`ProbedOp::dtype_neutral_key`]'s own panic doc) and must go through
 /// `jammi-kernels`' own dtype-aware cast-boundary entry point instead — this
@@ -2166,7 +2166,7 @@ impl ProbedOp {
 /// failure would be reported as `holds: false` with the verbatim `dtype_f32`
 /// key, never as an absent row.
 ///
-/// **`attention_block_flash` IS a row** (wave-5 #546 F3, reversing this
+/// **`attention_block_flash` IS a row** (#546, reversing this
 /// constant's own earlier "deliberately not a row" exclusion): every
 /// `admit`/`admit_cascade` call site now takes this typed `&'static ProbedOp`
 /// rather than a bare `&'static str`, so a cascade with no row would have no
@@ -2302,7 +2302,7 @@ pub const MEM_EFFICIENT_ATTENTION: ProbedOp = ProbedOp {
     dry_run: dry_run_mem_efficient_attention,
 };
 /// See this constant's sibling doc paragraph above ("`attention_block_flash`
-/// IS a row") for why this row exists at all (#546 F3).
+/// IS a row") for why this row exists at all (#546).
 pub const ATTENTION_BLOCK_FLASH: ProbedOp = ProbedOp {
     report_key: "attention_block_flash",
     kind: ProbedOpKind::Cascade,

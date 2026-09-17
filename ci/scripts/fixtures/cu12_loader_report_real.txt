@@ -1,0 +1,26 @@
+# captured: pending
+#
+# PLACEHOLDER. This file must hold the VERBATIM output of
+# `ci/scripts/capture_loader_report.sh <staged-lib-dir> <path-to-jammi-server>`
+# run against the REAL cu12 `jammi-server` binary and its REAL staged `lib/`,
+# on a driver-only-style Linux host (a host with an NVIDIA driver and no
+# system CUDA toolkit) — never hand-typed, never inferred from intent. #534's
+# closing audit measured that a hand-typed or inferred report fixture is
+# exactly how the retired loader arm's `libnvrtc -> libnvrtc-builtins` defect
+# happened in the first place (see `test_bundle_cuda_libs.sh`'s module doc).
+#
+# `ci/scripts/test_bundle_cuda_libs.sh` REFUSES to run at all while this
+# header line reads `# captured: pending`, unless the caller explicitly sets
+# `BUNDLE_FIXTURE_PROVISIONAL=1` — the merge path itself must never set that
+# variable, so the suite (and therefore the merge path) stays red on this
+# file until the real report replaces this placeholder as its own commit.
+#
+# To replace this file:
+#   1. Stage the real cu12 tarball's lib/ on a driver-only-style host (a
+#      rented GPU pod with the NVIDIA driver installed and no CUDA toolkit
+#      package on the base image is the intended shape).
+#   2. Run: ci/scripts/capture_loader_report.sh <staged-lib-dir> <binary> >
+#      /tmp/report.txt
+#   3. Replace this file's content (below this header block) with that
+#      file's contents VERBATIM — delete this entire header, including the
+#      `# captured: pending` line, so the suite recognizes it as real.

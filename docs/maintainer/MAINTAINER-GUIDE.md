@@ -4323,7 +4323,7 @@ instance → `Abandoned` (left `running` for reclaim, an attempt spent at the
 successor's claim); `claimed_by` moved → `HandedOff` (the executor's own
 lease expiry requeues it, never this instance's).
 
-`transfer_claim` (`crates/jammi-db/src/catalog/jobs_repo.rs:1262`) is the hand-off: an `UPDATE` guarded by FOUR conjuncts —
+`transfer_claim` (`crates/jammi-db/src/catalog/jobs_repo.rs:1279`) is the hand-off: an `UPDATE` guarded by FOUR conjuncts —
 `claimed_by = $from` (a stale runner, or a SECOND launch of the same task
 via Ballista's own reset-on-`ExecutorLost`, cannot transfer a claim it does
 not hold — the re-launch guard's second half, `DevicePlacement`'s bind-time

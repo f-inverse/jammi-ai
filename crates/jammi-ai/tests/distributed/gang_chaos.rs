@@ -137,7 +137,10 @@ async fn killed_peer_job_is_reclaimed_and_completed_by_a_new_gang() {
         &job_id,
         None,
         "a worker claims the two-rank job and marks it running",
-        |r| r.status == "running" && r.claimed_by.is_some(),
+        |r| {
+            r.status == jammi_db::catalog::status::JobStatus::Running.to_string()
+                && r.claimed_by.is_some()
+        },
     )
     .await
     .claimed_by
@@ -159,7 +162,7 @@ async fn killed_peer_job_is_reclaimed_and_completed_by_a_new_gang() {
         &job_id,
         None,
         "the killed peer's job is retired, requeued after the lease and completed by a new gang",
-        |r| r.status == "completed",
+        |r| r.status == jammi_db::catalog::status::JobStatus::Completed.to_string(),
     )
     .await;
     assert_completed_by_a_new_gang(&session, &record, &expected_model).await;
@@ -185,7 +188,10 @@ async fn killed_coordinator_job_is_reclaimed_and_completed_by_a_new_gang() {
         &job_id,
         None,
         "a worker claims the two-rank job and marks it running",
-        |r| r.status == "running" && r.claimed_by.is_some(),
+        |r| {
+            r.status == jammi_db::catalog::status::JobStatus::Running.to_string()
+                && r.claimed_by.is_some()
+        },
     )
     .await
     .claimed_by
@@ -204,7 +210,7 @@ async fn killed_coordinator_job_is_reclaimed_and_completed_by_a_new_gang() {
         &job_id,
         None,
         "the killed coordinator's job expires its lease, is requeued and completed by a new gang",
-        |r| r.status == "completed",
+        |r| r.status == jammi_db::catalog::status::JobStatus::Completed.to_string(),
     )
     .await;
     assert_ne!(

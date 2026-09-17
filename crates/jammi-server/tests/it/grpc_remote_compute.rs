@@ -384,7 +384,7 @@ async fn remote_fine_tune_start_defers_failure_to_the_worker() {
     ) {
         for _ in 0..600 {
             let status = session.status(job).await.expect("fine_tune_status");
-            if status == "failed" {
+            if status == jammi_db::catalog::status::JobStatus::Failed.to_string() {
                 return;
             }
             assert_ne!(
@@ -545,7 +545,7 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
     ) {
         for _ in 0..600 {
             let status = session.status(job).await.expect("fine_tune_status");
-            if status == "completed" {
+            if status == jammi_db::catalog::status::JobStatus::Completed.to_string() {
                 return;
             }
             assert_ne!(

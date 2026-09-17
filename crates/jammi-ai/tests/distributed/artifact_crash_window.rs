@@ -90,7 +90,10 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
         &job_id,
         None,
         "a worker claims and starts running before its lease window closes",
-        |r| r.status == "running" && r.claimed_by.is_some(),
+        |r| {
+            r.status == jammi_db::catalog::status::JobStatus::Running.to_string()
+                && r.claimed_by.is_some()
+        },
     )
     .await
     .claimed_by
@@ -108,7 +111,7 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
         &job_id,
         None,
         "the survivor reclaims the crashed job and completes it",
-        |r| r.status == "completed",
+        |r| r.status == jammi_db::catalog::status::JobStatus::Completed.to_string(),
     )
     .await;
 
@@ -208,7 +211,7 @@ async fn artifact_written_on_worker_is_readable_by_a_different_client() {
         &job_id,
         None,
         "the single worker completes the job",
-        |r| r.status == "completed",
+        |r| r.status == jammi_db::catalog::status::JobStatus::Completed.to_string(),
     )
     .await;
     assert_eq!(

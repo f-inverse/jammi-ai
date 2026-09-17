@@ -210,8 +210,17 @@ impl JobService for JobServer {
         tokio::spawn(async move {
             let mut record = first;
             loop {
-                if jammi_db::catalog::status::JobStatus::Completed.to_string() == record.status
-                    || jammi_db::catalog::status::JobStatus::Failed.to_string() == record.status
+                // Derived from `JobStatus::is_terminal` (the ONE terminality
+                // predicate, `status.rs:70-72`) via a round-trip parse,
+                // rather than a per-status literal compare — a future
+                // terminal status joining the vocabulary ends the stream
+                // with a one-line edit, not a hunt for every literal
+                // compare (G6).
+                if record
+                    .status
+                    .parse::<jammi_db::catalog::status::JobStatus>()
+                    .map(|s| s.is_terminal())
+                    .unwrap_or(false)
                 {
                     let event = job_status_response_from_record(&job_id, &record).map(|done| {
                         pb::JobEvent {
@@ -377,7 +386,9 @@ fn job_status_response_from_record(
     };
 
     let result = match record.result.as_deref() {
-        Some(raw) if record.status == "completed" => {
+        Some(raw)
+            if record.status == jammi_db::catalog::status::JobStatus::Completed.to_string() =>
+        {
             let parsed: EngineJobResult = serde_json::from_str(raw).map_err(|e| {
                 Status::internal(format!(
                     "job '{job_id}' recorded an unparseable result: {e}"

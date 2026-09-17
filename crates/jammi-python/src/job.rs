@@ -376,23 +376,24 @@ async fn wait_for_result(
             .status
             .parse()
             .map_err(|e| JammiError::FineTune(format!("{e}")))?;
-        match status {
-            JobStatus::Completed => {
-                let raw = record.result.ok_or_else(|| {
-                    JammiError::Catalog(format!("job '{job_id}' completed with no recorded result"))
-                })?;
-                return serde_json::from_str(&raw).map_err(|e| {
-                    JammiError::Catalog(format!(
-                        "job '{job_id}' recorded an unparseable result: {e}"
-                    ))
-                });
-            }
-            JobStatus::Failed => {
-                let msg = record.error.unwrap_or_else(|| "job failed".into());
-                return Err(JammiError::FineTune(msg));
-            }
-            _ => tokio::time::sleep(Duration::from_millis(100)).await,
+        // Derived from `JobStatus::is_terminal_unsuccessful`/`Completed` (the
+        // ONE terminality predicate) rather than a per-variant match arm, so
+        // a future terminal-unsuccessful status joining the vocabulary ends
+        // this wait with a one-line edit, not a hunt for every match arm.
+        if status == JobStatus::Completed {
+            let raw = record.result.ok_or_else(|| {
+                JammiError::Catalog(format!("job '{job_id}' completed with no recorded result"))
+            })?;
+            return serde_json::from_str(&raw).map_err(|e| {
+                JammiError::Catalog(format!(
+                    "job '{job_id}' recorded an unparseable result: {e}"
+                ))
+            });
+        } else if status.is_terminal_unsuccessful() {
+            let msg = record.error.unwrap_or_else(|| "job failed".into());
+            return Err(JammiError::FineTune(msg));
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

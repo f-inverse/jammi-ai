@@ -63,6 +63,7 @@ mod sqlite_single_process_seam;
 mod storage_cloud;
 mod store;
 mod tenant_scope;
+mod terminality_source_gate;
 mod trigger;
 #[cfg(feature = "live-broker-tests")]
 mod trigger_jetstream;

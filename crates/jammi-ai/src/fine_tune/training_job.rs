@@ -52,14 +52,18 @@ impl TrainingJob {
                 .status
                 .parse()
                 .map_err(|e| JammiError::FineTune(format!("{e}")))?;
-            match status {
-                JobStatus::Completed => return Ok(()),
-                JobStatus::Failed => {
-                    let msg = record.error.unwrap_or_else(|| "Job failed".into());
-                    return Err(JammiError::FineTune(msg));
-                }
-                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            // Derived from `JobStatus::is_terminal_unsuccessful`/`Completed`
+            // (the ONE terminality predicate, `status.rs:70-72`/`:78-85`)
+            // rather than a per-variant match arm, so a new terminal-
+            // unsuccessful status joining the vocabulary ends this wait with a
+            // one-line edit, not a hunt for every per-variant match arm.
+            if status == JobStatus::Completed {
+                return Ok(());
+            } else if status.is_terminal_unsuccessful() {
+                let msg = record.error.unwrap_or_else(|| "Job failed".into());
+                return Err(JammiError::FineTune(msg));
             }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 

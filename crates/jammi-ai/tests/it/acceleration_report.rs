@@ -106,7 +106,7 @@ async fn wait_for_terminal(
     job_id: &str,
 ) -> jammi_db::catalog::jobs_repo::JobRecord {
     let record = wait_for_any_terminal(catalog, job_id).await;
-    if record.status != "completed" {
+    if record.status != jammi_db::catalog::status::JobStatus::Completed.to_string() {
         panic!("job {job_id} failed unexpectedly: {:?}", record.error);
     }
     record
@@ -133,13 +133,16 @@ async fn wait_for_any_terminal(
 ) -> jammi_db::catalog::jobs_repo::JobRecord {
     loop {
         let record = catalog.get_job(job_id).await.unwrap();
-        match record.status.as_str() {
-            "completed" | "failed" => {
-                assert_terminal_report_is_not_pending(&record, job_id);
-                return record;
-            }
-            _ => tokio::time::sleep(Duration::from_millis(50)).await,
+        // Derived from `JobRecord::is_terminal` (the ONE terminality
+        // predicate) rather than an enumerated `"completed" | "failed"`
+        // match arm, so a future terminal status joining the vocabulary
+        // still ends this wait with a one-line edit, not a hunt for every
+        // match arm.
+        if record.is_terminal() {
+            assert_terminal_report_is_not_pending(&record, job_id);
+            return record;
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -156,7 +159,7 @@ async fn terminal_record(
 ) -> jammi_db::catalog::jobs_repo::JobRecord {
     let record = catalog.get_job(job_id).await.unwrap();
     assert!(
-        matches!(record.status.as_str(), "completed" | "failed"),
+        record.is_terminal(),
         "{label}: expected an already-terminal row, got status {:?}",
         record.status
     );
@@ -1327,7 +1330,7 @@ fn assert_terminal_report_is_not_pending(
     label: &str,
 ) -> serde_json::Value {
     assert!(
-        matches!(record.status.as_str(), "completed" | "failed"),
+        record.is_terminal(),
         "{label}: this oracle only speaks about a TERMINAL row, got status {:?}",
         record.status
     );

@@ -142,7 +142,17 @@ where
             .await
             .expect("training_status")
             .into_inner();
-        if resp.status == "completed" || resp.status == "failed" {
+        // Derived from `JobStatus::is_terminal` (the ONE terminality
+        // predicate) rather than an enumerated `completed || failed` pair,
+        // so a future terminal status joining the vocabulary still ends
+        // this poll with a one-line edit, not a hunt for every enumerated
+        // pair.
+        let terminal = resp
+            .status
+            .parse::<jammi_db::catalog::status::JobStatus>()
+            .map(|s| s.is_terminal())
+            .unwrap_or(false);
+        if terminal {
             return resp;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1497,7 +1507,7 @@ async fn worker_enabled_lets_the_submitted_job_leave_queued() {
             .await
             .expect("training_status")
             .into_inner();
-        if wire.status != "queued" {
+        if wire.status != jammi_db::catalog::status::JobStatus::Queued.to_string() {
             left_queued = Some(wire);
             break;
         }

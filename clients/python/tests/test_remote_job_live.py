@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 import jammi
+from jammi._database import _QUEUED_STATE
 from jammi.errors import BackendError
 
 SERVER_BIN = os.environ.get("JAMMI_SERVER_BIN")
@@ -89,7 +90,7 @@ def _seed(artifact_dir: Path, monkeypatch) -> tuple[str, dict, dict, str]:
         db.close()
     monkeypatch.delenv("JAMMI_WORKER__ENABLED", raising=False)
 
-    assert status == "queued"
+    assert status == _QUEUED_STATE
     assert len(summaries) == 1, summaries
     return job_id, summaries[0], report, status
 
@@ -132,7 +133,7 @@ def test_remote_and_embedded_attach_and_list_agree(tmp_path, monkeypatch, live_s
     # The comparison was on real content, not on two empty answers.
     assert embedded_summary["job_id"] == job_id
     assert set(embedded_summary.keys()) == _SUMMARY_KEYS
-    assert embedded_summary["status"] == "queued"
+    assert embedded_summary["status"] == _QUEUED_STATE
     # The deterministic output id is stamped at submit time (it depends only
     # on job_id, never on the run's outcome) — never empty for this kind.
     assert embedded_summary["output_model_id"] == f"jammi:fine-tuned:{job_id}"

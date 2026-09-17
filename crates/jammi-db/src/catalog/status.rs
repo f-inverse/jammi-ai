@@ -52,7 +52,11 @@ impl FromStr for ResultTableStatus {
 /// `Running` are non-terminal; `Completed` and `Failed` are terminal — the
 /// two states [`crate::catalog::jobs_repo::JobRecord::is_terminal`] and the
 /// retention age-predicate ([`crate::catalog::model_repo`]'s `REFERENCE_EDGES`)
-/// both key on.
+/// both key on. `Failed` is additionally TERMINAL-UNSUCCESSFUL
+/// ([`Self::is_terminal_unsuccessful`]). A `Cancelled` variant is NOT
+/// declared here: a status with no writer is dead vocabulary — it belongs
+/// with whatever unit actually retires a row to it (the deferred #515 job-
+/// dependency graph), not ahead of that writer landing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, VariantArray)]
 pub enum JobStatus {
     /// Job created, waiting to be claimed.
@@ -71,6 +75,17 @@ impl JobStatus {
     /// for retention once past `[jobs] retention_days`.
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Completed | Self::Failed)
+    }
+
+    /// Whether this status is terminal AND unsuccessful (`Failed`) — DERIVED
+    /// from [`Self::is_terminal`] rather than naming `Failed` a second time,
+    /// so every future terminal-unsuccessful status this vocabulary ever
+    /// gains (e.g. a future `Cancelled`) is picked up here with no second
+    /// edit. The one predicate every hand-enumerated terminality decision in
+    /// this crate (and the Python client's mirror) derives from — never a
+    /// literal string compare.
+    pub fn is_terminal_unsuccessful(&self) -> bool {
+        self.is_terminal() && !matches!(self, Self::Completed)
     }
 
     /// Every status, in declaration (lifecycle) order — the one list the
@@ -260,6 +275,57 @@ mod tests {
         assert!(!JobStatus::Running.is_terminal());
         assert!(JobStatus::Completed.is_terminal());
         assert!(JobStatus::Failed.is_terminal());
+    }
+
+    #[test]
+    fn terminal_unsuccessful_is_terminal_minus_completed() {
+        // Quantified over the WHOLE vocabulary (`JobStatus::ALL`), not a
+        // hand-picked subset. Mutation executed (applied to
+        // `is_terminal_unsuccessful`'s body, run, reverted): changed
+        // `self.is_terminal() && !matches!(self, Self::Completed)` to bare
+        // `self.is_terminal()` (dropping the `Completed` exclusion) -> RED,
+        // first line: "assertion `left == right` failed: Completed:
+        // terminal-unsuccessful must equal terminal-minus-completed
+        //   left: true
+        //  right: false".
+        for status in JobStatus::ALL {
+            let expected = status.is_terminal() && *status != JobStatus::Completed;
+            assert_eq!(
+                status.is_terminal_unsuccessful(),
+                expected,
+                "{status:?}: terminal-unsuccessful must equal terminal-minus-completed"
+            );
+        }
+        assert!(JobStatus::Failed.is_terminal_unsuccessful());
+        assert!(!JobStatus::Completed.is_terminal_unsuccessful());
+        assert!(!JobStatus::Queued.is_terminal_unsuccessful());
+        assert!(!JobStatus::Running.is_terminal_unsuccessful());
+    }
+
+    #[test]
+    fn terminal_sql_list_and_non_terminal_sql_list_partition_all() {
+        // ALL must split exactly between the two lists with no overlap and
+        // no omission — derived from `JobStatus::ALL`, so a status added to
+        // `ALL` without a `Display` impl breaking compilation is still
+        // caught here if it were ever added to neither predicate.
+        let terminal = JobStatus::terminal_sql_list();
+        let non_terminal = JobStatus::non_terminal_sql_list();
+        for status in JobStatus::ALL {
+            let literal = format!("'{status}'");
+            if status.is_terminal() {
+                assert!(
+                    terminal.contains(&literal),
+                    "{status:?} must be in terminal_sql_list"
+                );
+                assert!(!non_terminal.contains(&literal));
+            } else {
+                assert!(
+                    non_terminal.contains(&literal),
+                    "{status:?} must be in non_terminal_sql_list"
+                );
+                assert!(!terminal.contains(&literal));
+            }
+        }
     }
 
     #[test]

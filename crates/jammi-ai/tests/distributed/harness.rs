@@ -545,6 +545,14 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
 ///   instant one is seen, the helper dumps full fleet diagnostics and panics
 ///   naming that worker — never silently waiting out the 120 s timeout on a
 ///   fleet that is already dead.
+/// - **Wrong terminal status:** [`jammi_db::catalog::jobs_repo::JobRecord::
+///   is_terminal`] derives from `JobStatus::is_terminal` (the ONE terminality
+///   predicate — G6, #515). A terminal row never mutates further, so if the
+///   row IS terminal and `want` still rejects it, waiting out the rest of
+///   [`TERMINAL_TIMEOUT`] cannot help: the helper fails now, naming the
+///   status and error it actually settled on, rather than a fixture polling
+///   for one specific literal (e.g. `"completed"`) burning the full timeout
+///   the moment the job settles on a DIFFERENT terminal status instead.
 /// - **Timeout:** if `want` never holds within [`TERMINAL_TIMEOUT`], the helper
 ///   dumps full fleet diagnostics (every worker's effective config + captured
 ///   stdout/stderr) and the job's FINAL catalog row (status / claimed_by /
@@ -566,6 +574,20 @@ pub async fn await_job(
         if let Ok(record) = catalog.get_job(job_id).await {
             if want(&record) {
                 return record;
+            }
+            if record.is_terminal() {
+                fleet.dump_diagnostics(&format!(
+                    "job {job_id} settled on status={:?} error={:?}, which does not satisfy: \
+                     {label}",
+                    record.status, record.error
+                ));
+                panic!(
+                    "distributed lane: job {job_id} reached a TERMINAL status ({:?}) that does \
+                     not satisfy: {label} (error: {:?}) — a terminal row never mutates further, \
+                     so waiting out the remaining timeout cannot help. See the dumped worker \
+                     config + log above.",
+                    record.status, record.error
+                );
             }
         }
 

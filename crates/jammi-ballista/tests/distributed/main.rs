@@ -381,7 +381,10 @@ async fn submit_and_await_placed_claim(
         session,
         &job_id,
         "the job is claimed, running, and transferred to a placed executor",
-        |r| r.status == "running" && r.claimed_by.as_deref().is_some_and(|c| c != submitter_id),
+        |r| {
+            r.status == jammi_db::catalog::status::JobStatus::Running.to_string()
+                && r.claimed_by.as_deref().is_some_and(|c| c != submitter_id)
+        },
     )
     .await;
     let claimant = record.claimed_by.expect("running job has a claimant");
@@ -421,7 +424,7 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
         &session,
         &job_id,
         "the placed gang completes",
-        |r| r.status == "completed",
+        |r| r.status == jammi_db::catalog::status::JobStatus::Completed.to_string(),
     )
     .await;
     assert_eq!(record.claimed_by.as_deref(), Some(claimant.as_str()));
@@ -481,7 +484,7 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
         &session,
         &plain_job_id,
         "the plain (non-Ballista) gang completes",
-        |r| r.status == "completed",
+        |r| r.status == jammi_db::catalog::status::JobStatus::Completed.to_string(),
     )
     .await;
     assert_eq!(
@@ -631,7 +634,7 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
                 observed.push(cb.clone());
             }
         }
-        if record.status == "completed" {
+        if record.status == jammi_db::catalog::status::JobStatus::Completed.to_string() {
             break record;
         }
         if std::time::Instant::now() >= deadline {
@@ -949,7 +952,7 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
         &session,
         &job_id,
         "job via scheduler 1 completes",
-        |r| r.status == "completed",
+        |r| r.status == jammi_db::catalog::status::JobStatus::Completed.to_string(),
     )
     .await;
     assert_eq!(record.output_model_id.as_deref(), Some(model_id.as_str()));

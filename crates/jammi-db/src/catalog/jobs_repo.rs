@@ -176,10 +176,27 @@ pub struct JobRecord {
 impl JobRecord {
     /// Whether this row is terminal (`completed` or `failed`) — no further
     /// lease-guarded write is accepted, and the row is eligible for
-    /// retention once past `[jobs] retention_days`.
+    /// retention once past `[jobs] retention_days`. Derived from
+    /// [`JobStatus::is_terminal`] (the ONE terminality predicate,
+    /// `status.rs:70-72`) rather than a hand-typed literal set, so a status
+    /// added to [`JobStatus::ALL`] is reflected here without a second edit.
+    /// An unparseable `status` (never written by this crate) is treated as
+    /// non-terminal — fail OPEN on lease-guard eligibility, never silently
+    /// terminal.
     pub fn is_terminal(&self) -> bool {
-        self.status == JobStatus::Completed.to_string()
-            || self.status == JobStatus::Failed.to_string()
+        self.status
+            .parse::<JobStatus>()
+            .map(|s| s.is_terminal())
+            .unwrap_or(false)
+    }
+
+    /// Whether this row is terminal AND unsuccessful (`failed`). See
+    /// [`JobStatus::is_terminal_unsuccessful`].
+    pub fn is_terminal_unsuccessful(&self) -> bool {
+        self.status
+            .parse::<JobStatus>()
+            .map(|s| s.is_terminal_unsuccessful())
+            .unwrap_or(false)
     }
 }
 
@@ -3029,9 +3046,10 @@ impl Catalog {
         Ok(deleted as usize)
     }
 
-    /// Delete terminal (`completed`/`failed`) job rows whose `updated_at` is
-    /// at least `retention` in the past. A non-terminal job is never pruned,
-    /// regardless of age. Returns the count deleted.
+    /// Delete terminal (`completed`/`failed` — [`JobStatus::
+    /// terminal_sql_list`], never a hand-typed pair) job rows whose
+    /// `updated_at` is at least `retention` in the past. A non-terminal job
+    /// is never pruned, regardless of age. Returns the count deleted.
     ///
     /// Tenant-scoped with the same STRICT predicate [`Self::cancel_request`]
     /// uses: a caller prunes only rows whose `tenant_id` equals its own (or

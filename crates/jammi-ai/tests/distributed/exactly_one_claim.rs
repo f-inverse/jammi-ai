@@ -83,7 +83,7 @@ async fn one_job_n_workers_exactly_one_wins() {
         &job_id,
         None,
         "the single job reaches `completed` under one of the racing workers",
-        |r| r.status == "completed",
+        |r| r.status == jammi_db::catalog::status::JobStatus::Completed.to_string(),
     )
     .await;
 

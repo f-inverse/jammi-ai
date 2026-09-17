@@ -1035,7 +1035,7 @@ async fn release_subcommand_sends_sigint_and_the_child_exits_zero_within_two_hea
             .unwrap()
             .into_inner()
             .status;
-        if status == "running" {
+        if status == jammi_db::catalog::status::JobStatus::Running.to_string() {
             break;
         }
         assert!(

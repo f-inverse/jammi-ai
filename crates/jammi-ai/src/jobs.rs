@@ -918,27 +918,29 @@ impl JobHandle {
                 .status
                 .parse()
                 .map_err(|e| JammiError::Catalog(format!("{e}")))?;
-            match status {
-                JobStatus::Completed => {
-                    let result_json = record.result.ok_or_else(|| {
-                        JammiError::Catalog(format!(
-                            "job '{}' completed with no recorded result",
-                            self.job_id
-                        ))
-                    })?;
-                    return serde_json::from_str(&result_json).map_err(|e| {
-                        JammiError::Catalog(format!(
-                            "job '{}' recorded an unparseable result: {e}",
-                            self.job_id
-                        ))
-                    });
-                }
-                JobStatus::Failed => {
-                    let msg = record.error.unwrap_or_else(|| "job failed".into());
-                    return Err(JammiError::FineTune(msg));
-                }
-                _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            // Derived from `JobStatus::is_terminal_unsuccessful`/`Completed`
+            // (the ONE terminality predicate) rather than a per-variant
+            // match arm, so a future terminal-unsuccessful status joining
+            // the vocabulary ends this wait with a one-line edit, not a
+            // hunt for every per-variant match arm.
+            if status == JobStatus::Completed {
+                let result_json = record.result.ok_or_else(|| {
+                    JammiError::Catalog(format!(
+                        "job '{}' completed with no recorded result",
+                        self.job_id
+                    ))
+                })?;
+                return serde_json::from_str(&result_json).map_err(|e| {
+                    JammiError::Catalog(format!(
+                        "job '{}' recorded an unparseable result: {e}",
+                        self.job_id
+                    ))
+                });
+            } else if status.is_terminal_unsuccessful() {
+                let msg = record.error.unwrap_or_else(|| "job failed".into());
+                return Err(JammiError::FineTune(msg));
             }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
 

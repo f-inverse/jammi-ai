@@ -2910,7 +2910,7 @@ async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
     };
 
     let after = session.catalog().get_job(&job_id).await.unwrap();
-    if after.status != "completed" {
+    if after.status != jammi_db::catalog::status::JobStatus::Completed.to_string() {
         restore_epoch0();
         panic!("the run must complete and finalize as the sole winner, got status {after:?}");
     }

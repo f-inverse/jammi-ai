@@ -735,6 +735,97 @@ def find_missing_required_lanes(
 
 
 # --------------------------------------------------------------------------- #
+# step 6 -- the DERIVED third closure (#532)
+# --------------------------------------------------------------------------- #
+# #532: `find_gaps` (cargo-metadata-required targets) and `find_missing_
+# required_lanes` (the committed registry) together leave a real gap -- a
+# merge-path clippy lane whose loss is invisible to BOTH, because it covers
+# no `required-features` target and was never given a registry row. On the
+# audited head, four of `ci.yml`'s twelve lanes were exactly this shape.
+# This closure is DERIVED rather than a hand-maintained per-lane list: it
+# is the SAME empirical method `lint_surface_required_lanes.txt`'s own
+# header describes as how the four were originally found (delete a lane,
+# re-run both other halves of the gate, see whether either goes red) --
+# automated so it runs on every invocation, over the CURRENT lane corpus,
+# rather than a one-time hand sweep whose result rots the moment a lane is
+# added, moved, or deleted.
+# A lane reported as undetectable-on-loss SOLELY because ANOTHER,
+# reviewed lane -- still present -- provides byte-identical redundant
+# coverage for the same crate scope/features/target-selection is a
+# residual a registry row structurally cannot close: ANY row the
+# narrower lane would satisfy is, by the same features/selection, ALSO
+# satisfied by the wider one, so removing either alone never changes
+# either row's satisfaction. Recorded here rather than hidden (never a
+# silent skip -- see `find_unprotected_lanes`'s own NOTE line, printed
+# every run): each entry names BOTH exact raw invocations; a change to
+# EITHER text (a rewritten flag, a moved crate) falls straight back out
+# of this set and the pair is judged unprotected again until re-reviewed.
+REVIEWED_REDUNDANT_LANE_PAIRS: frozenset[frozenset[str]] = frozenset(
+    {
+        frozenset(
+            {
+                "cargo clippy --workspace --all-targets -- -D warnings",
+                "cargo clippy -p jammi-wire -p jammi-admin -p jammi-client --all-targets -- -D warnings",
+            }
+        ),
+    }
+)
+
+
+def find_unprotected_lanes(
+    lanes: list[ClippyLane],
+    feature_maps: dict[str, dict[str, list[str]]],
+    targets: list[GatedTarget],
+    required: list[RequiredLane],
+    exec_mod,
+    crate_dirs: dict[str, tuple[str, ...]],
+) -> tuple[list[str], list[str]]:
+    """(fail_findings, reviewed_notes). A lane is a candidate when its
+    deletion changes NEITHER `find_gaps`'s own result NOR `find_missing_
+    required_lanes`'s own result -- i.e. no other closure in this gate
+    would ever notice losing it. Each candidate lane is removed from a
+    COPY of `lanes` (identity, `is`, so two textually-identical lines at
+    different workflow lines are still distinguished) and both other
+    closures are recomputed against the SAME `targets`/`required` this
+    run already computed -- no cargo re-invocation, no re-scan of the
+    workflow tree; this is pure set arithmetic over the already-
+    discovered corpus, costing nothing beyond what `main` already
+    computed. A candidate whose ONLY surviving cover is a `REVIEWED_
+    REDUNDANT_LANE_PAIRS` partner is downgraded to `reviewed_notes`
+    (still printed, never a FAIL) rather than `fail_findings`."""
+    base_gaps = set(find_gaps(targets, lanes, feature_maps))
+    base_missing = set(find_missing_required_lanes(required, lanes, feature_maps, exec_mod, crate_dirs))
+    fail_findings: list[str] = []
+    reviewed_notes: list[str] = []
+    for i, lane in enumerate(lanes):
+        without = lanes[:i] + lanes[i + 1 :]
+        gaps_without = set(find_gaps(targets, without, feature_maps))
+        missing_without = set(find_missing_required_lanes(required, without, feature_maps, exec_mod, crate_dirs))
+        if gaps_without != base_gaps or missing_without != base_missing:
+            continue
+        host = lane.origin.workflow if lane.origin is not None else "<no recorded host workflow>"
+        reviewed_partner = next(
+            (o.raw for o in without if frozenset({lane.raw, o.raw}) in REVIEWED_REDUNDANT_LANE_PAIRS),
+            None,
+        )
+        if reviewed_partner is not None:
+            reviewed_notes.append(
+                f"NOTE (reviewed, not a FAIL): {host}: `{lane.raw}` is undetectable-on-loss only "
+                f"because `{reviewed_partner}` (still present) provides byte-identical redundant "
+                f"coverage for the same surface -- a {REQUIRED_LANES_PATH.name} row cannot separate "
+                "them (see that file's own header); reviewed and accepted."
+            )
+            continue
+        fail_findings.append(
+            f"{host}: `{lane.raw}` is undetectable-on-loss -- deleting it changes neither the "
+            "cargo-metadata closure (find_gaps) nor the required-lane registry's own "
+            "satisfaction (find_missing_required_lanes). Add a "
+            f"{REQUIRED_LANES_PATH.name} row naming the surface it uniquely protects."
+        )
+    return sorted(set(fail_findings)), sorted(set(reviewed_notes))
+
+
+# --------------------------------------------------------------------------- #
 # self-test
 # --------------------------------------------------------------------------- #
 #: The step the host-workflow controls move around. Written once, asserted to
@@ -1094,6 +1185,96 @@ def self_test() -> int:
         else:  # pragma: no cover
             raise AssertionError(f"self-test FAILED: malformed registry row {bad!r} was accepted")
 
+    # ----- #532: find_unprotected_lanes ---------------------------------- #
+    # A synthetic corpus with exactly ONE lane covering a crate that has NO
+    # required-features target and NO registry row -- must be reported
+    # unprotected (the exact esc-059-adjacent shape: a lane nothing else
+    # would ever notice losing).
+    lonely_lane = parse_clippy_lane(
+        "cargo clippy -p jammi-cli --all-targets -- -D warnings", origin=UNFILTERED_PR_ORIGIN
+    )
+    assert lonely_lane is not None
+    fails, notes = find_unprotected_lanes([lonely_lane], feature_maps, [], [], exec_mod, crate_dirs)
+    assert notes == [], f"self-test FAILED: a lone, unreviewed lane produced a NOTE instead of a FAIL: {notes}"
+    assert any("jammi-cli" in f for f in fails), (
+        f"self-test FAILED: a lane covering no required-features target and no registry row was "
+        f"not reported unprotected: {fails}"
+    )
+
+    # Adding a SECOND, wider lane covering the SAME crate/selection must
+    # clear the finding for the NARROWER one (redundant coverage), while
+    # the wider one -- still unique on ITS OWN removal -- is unaffected: a
+    # workspace-wide lane also covers jammi-cli, so deleting the -p
+    # jammi-cli lane changes nothing (the workspace one still covers it).
+    wide_lane = parse_clippy_lane(
+        "cargo clippy --workspace --all-targets -- -D warnings", origin=UNFILTERED_PR_ORIGIN
+    )
+    assert wide_lane is not None
+    fails2, notes2 = find_unprotected_lanes(
+        [lonely_lane, wide_lane], feature_maps, [], [], exec_mod, crate_dirs
+    )
+    assert notes2 == [], f"self-test FAILED: an unreviewed redundant pair produced a NOTE: {notes2}"
+    assert any("jammi-cli" in f for f in fails2), (
+        "self-test FAILED: with two lanes covering the SAME crate/selection redundantly, NEITHER "
+        f"is reported unprotected (removing either alone changes nothing): {fails2}"
+    )
+
+    # A registry row that the lonely lane satisfies clears the finding --
+    # closure (b), the row-based remedy.
+    cli_row = RequiredLane("jammi-cli", (), (), "all-targets", 0)
+    fails3, notes3 = find_unprotected_lanes(
+        [lonely_lane], feature_maps, [], [cli_row], exec_mod, crate_dirs
+    )
+    assert fails3 == [] and notes3 == [], (
+        f"self-test FAILED: a registry row the lonely lane satisfies did not clear the finding: "
+        f"fails={fails3} notes={notes3}"
+    )
+
+    # A cargo-metadata-required target the lonely lane covers clears the
+    # finding too -- closure (a), `find_gaps`'s own mechanism.
+    cli_target = GatedTarget(crate="jammi-cli", target="synthetic", kind="lib", required_features=())
+    fails4, notes4 = find_unprotected_lanes(
+        [lonely_lane], feature_maps, [cli_target], [], exec_mod, crate_dirs
+    )
+    assert fails4 == [] and notes4 == [], (
+        f"self-test FAILED: a required-features target the lonely lane covers did not clear the "
+        f"finding: fails={fails4} notes={notes4}"
+    )
+
+    # A REVIEWED redundant pair (the real committed pair) downgrades to a
+    # NOTE, never a FAIL -- and the reviewed set is matched by EXACT raw
+    # text, so a rewritten partner (even a single added space) falls back
+    # OUT of the reviewed set and reddens again.
+    reviewed_a, reviewed_b = sorted(next(iter(REVIEWED_REDUNDANT_LANE_PAIRS)))
+    lane_a = parse_clippy_lane(reviewed_a, origin=UNFILTERED_PR_ORIGIN)
+    lane_b = parse_clippy_lane(reviewed_b, origin=UNFILTERED_PR_ORIGIN)
+    assert lane_a is not None and lane_b is not None
+    fails5, notes5 = find_unprotected_lanes([lane_a, lane_b], feature_maps, [], [], exec_mod, crate_dirs)
+    assert fails5 == [], f"self-test FAILED: the reviewed pair produced a FAIL, not a NOTE: {fails5}"
+    assert len(notes5) == 2, f"self-test FAILED: the reviewed pair should produce one NOTE per side: {notes5}"
+    rewritten = parse_clippy_lane(reviewed_a + " ", origin=UNFILTERED_PR_ORIGIN)
+    assert rewritten is not None and rewritten.raw != reviewed_a
+    fails6, notes6 = find_unprotected_lanes([rewritten, lane_b], feature_maps, [], [], exec_mod, crate_dirs)
+    assert any("jammi-wire" in f or "workspace" in f for f in fails6), (
+        f"self-test FAILED: a REWRITTEN partner (no longer exact-matching the reviewed pair) must "
+        f"fall back to a real FAIL, not stay silently reviewed: fails={fails6} notes={notes6}"
+    )
+
+    # The real tree's own two reviewed-pair lanes must each appear in
+    # `reviewed_notes`, never in `fail_findings`, when run against the
+    # REAL corpus/targets/registry -- the control that proves the
+    # synthetic legs above match production, not a toy shape.
+    real_targets = feature_gated_targets(metadata)
+    real_required = load_required_lanes()
+    real_fails, real_notes = find_unprotected_lanes(
+        lanes, feature_maps, real_targets, real_required, exec_mod, crate_dirs
+    )
+    assert real_fails == [], f"self-test FAILED: the real tree has an unprotected clippy lane: {real_fails}"
+    assert len(real_notes) == 2, (
+        f"self-test FAILED: the real tree's reviewed-redundant pair should produce exactly two "
+        f"NOTE lines (one per side), got {len(real_notes)}: {real_notes}"
+    )
+
     print("self-test: ok")
     return 0
 
@@ -1168,10 +1349,14 @@ def main(argv: list[str]) -> int:
         tag = "MISSING" if r in missing else "OK"
         print(f"lint-surface-closure[required-lane {r}]: {tag}")
 
-    # Both halves are reported before returning: a run that stops at the
-    # first finding hides the second, and a reader fixing one would then
-    # discover the other only on the next CI round.
-    if missing or gaps:
+    unprotected, reviewed_notes = find_unprotected_lanes(lanes, feature_maps, targets, required, exec_mod, crate_dirs)
+    for note in reviewed_notes:
+        print(f"lint-surface-closure: {note}")
+
+    # All three halves are reported before returning: a run that stops at
+    # the first finding hides the others, and a reader fixing one would
+    # then discover the next only on the next CI round.
+    if missing or gaps or unprotected:
         print("lint-surface-closure: FAIL", file=sys.stderr)
     if missing:
         for r in missing:
@@ -1213,12 +1398,16 @@ def main(argv: list[str]) -> int:
                 "(the exact esc-059 shape). Add or widen a lane in .github/workflows/ci.yml.",
                 file=sys.stderr,
             )
-    if missing or gaps:
+    if unprotected:
+        for msg in unprotected:
+            print(f"  - {msg}", file=sys.stderr)
+    if missing or gaps or unprotected:
         return 1
 
     print(
-        f"lint-surface-closure: all {len(targets)} feature-gated target(s) are covered, and "
-        f"all {len(required)} committed required lane(s) are present."
+        f"lint-surface-closure: all {len(targets)} feature-gated target(s) are covered, all "
+        f"{len(required)} committed required lane(s) are present, and every merge-path clippy "
+        "lane's own coverage is protected by one of the three closures."
     )
     return 0
 

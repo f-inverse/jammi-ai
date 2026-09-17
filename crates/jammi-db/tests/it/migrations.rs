@@ -2742,3 +2742,154 @@ async fn migration_038_is_ordered_after_035_and_037_and_creates_compute_tables(
         "workers.devices defaults to the empty JSON array"
     );
 }
+
+/// The 13 `(table, column)` pairs `catalog::lease`'s schema-edge domain
+/// (migration `039_canonical_stamps`) enforces — the universe gate this
+/// oracle enumerates against (R5: "a future rebuild-dance migration cannot
+/// silently drop enforcement").
+const CANONICAL_STAMP_COLUMNS: &[(&str, &str)] = &[
+    ("jobs", "lease_expires_at"),
+    ("jobs", "next_assembly_after"),
+    ("jobs", "updated_at"),
+    ("jobs", "created_at"),
+    ("instances", "last_seen_at"),
+    ("instances", "started_at"),
+    ("result_tables", "lease_expires_at"),
+    ("result_tables", "created_at"),
+    ("result_table_versions", "lease_expires_at"),
+    ("compute_executors", "heartbeat_at"),
+    ("models", "created_at"),
+    ("models", "updated_at"),
+    ("applied_migrations", "applied_at"),
+];
+
+/// Migration `039_canonical_stamps` (R5, `catalog::lease`'s pin sites) is
+/// ordered after `038_compute_cluster_state` (K5: relative position, never
+/// `.last()` — it names `compute_executors`, which `038` creates), and the
+/// enforcement set it installs — on SQLite, a `BEFORE INSERT` AND a
+/// `BEFORE UPDATE OF <col>` trigger per [`CANONICAL_STAMP_COLUMNS`] entry
+/// (26 triggers); on Postgres, one `sdchk__<table>__<column>` `CHECK`
+/// constraint per entry (13 constraints) — equals exactly that set on a
+/// freshly migrated catalog. A future migration that rebuilds one of these
+/// tables (SQLite's create-new/copy/drop/rename dance, migration 012's own
+/// shape) without reinstalling its two triggers would silently drop
+/// enforcement for that column; this oracle catches it by enumerating
+/// `sqlite_master`/`pg_constraint` directly rather than trusting that the
+/// DDL which installed them once still applies.
+#[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn migration_039_is_ordered_after_038_and_the_enforcement_set_is_exact(
+    kind: jammi_db::catalog::backend::BackendKind,
+) {
+    use jammi_db::catalog::backend::{BackendKind, SqlValue};
+
+    let position = |name: &str| {
+        EXPECTED_MIGRATION_NAMES
+            .iter()
+            .position(|m| *m == name)
+            .unwrap_or_else(|| panic!("{name} missing from EXPECTED_MIGRATION_NAMES"))
+    };
+    assert!(
+        position("039_canonical_stamps") > position("038_compute_cluster_state"),
+        "039_canonical_stamps must follow 038 (it enforces compute_executors.heartbeat_at, \
+         which 038 creates)"
+    );
+
+    let dir = tempdir().unwrap();
+    let backend = match kind {
+        BackendKind::Sqlite => {
+            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
+        }
+        BackendKind::Postgres => {
+            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+                return;
+            };
+            BackendImpl::Postgres(
+                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
+                    &url, 4, None,
+                )
+                .await
+                .unwrap(),
+            )
+        }
+    };
+    backend.migrate().await.unwrap();
+
+    match kind {
+        BackendKind::Sqlite => {
+            let expected: std::collections::BTreeSet<String> = CANONICAL_STAMP_COLUMNS
+                .iter()
+                .flat_map(|(t, c)| {
+                    [
+                        format!("trg_{t}_{c}_canonical_ins"),
+                        format!("trg_{t}_{c}_canonical_upd"),
+                    ]
+                })
+                .collect();
+            assert_eq!(expected.len(), CANONICAL_STAMP_COLUMNS.len() * 2);
+            let actual: std::collections::BTreeSet<String> = backend
+                .transaction(
+                    TxOptions {
+                        read_only: true,
+                        ..Default::default()
+                    },
+                    |tx| {
+                        Box::pin(async move {
+                            tx.query(
+                                "SELECT name FROM sqlite_master WHERE type = 'trigger' \
+                                 AND name LIKE 'trg_%_canonical_%'",
+                                &[],
+                                |row| row.get::<String>("name"),
+                            )
+                            .await
+                        })
+                    },
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "the SQLite trigger set must equal CANONICAL_STAMP_COLUMNS exactly"
+            );
+        }
+        BackendKind::Postgres => {
+            let expected: std::collections::BTreeSet<String> = CANONICAL_STAMP_COLUMNS
+                .iter()
+                .map(|(t, c)| format!("sdchk__{t}__{c}"))
+                .collect();
+            let actual: std::collections::BTreeSet<String> = backend
+                .transaction(
+                    TxOptions {
+                        read_only: true,
+                        ..Default::default()
+                    },
+                    |tx| {
+                        Box::pin(async move {
+                            tx.query(
+                                "SELECT conname FROM pg_constraint \
+                                 WHERE contype = 'c' AND conname LIKE $1",
+                                &[SqlValue::TextOwned("sdchk\\_\\_%".to_string())],
+                                |row| row.get::<String>("conname"),
+                            )
+                            .await
+                        })
+                    },
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "the Postgres sdchk__ constraint set must equal CANONICAL_STAMP_COLUMNS exactly"
+            );
+        }
+    }
+}

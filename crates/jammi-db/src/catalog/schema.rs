@@ -242,7 +242,9 @@ UPDATE sources SET source_type = '"file"' WHERE source_type = '"local"';
 /// would force dialect-aware DDL whereas `TEXT` decodes identically on
 /// both backends. `backing_table` references the Phase-2 mutable table
 /// that persists the event log; `ON DELETE RESTRICT` keeps the topic and
-/// its backing table aligned. Tenant scope follows ADR-00 — nullable.
+/// its backing table aligned. Tenant scope follows the engine's
+/// tenant-identifier discipline — nullable (see
+/// `docs/guide/src/philosophy.md#the-one-rule-everything-else-follows-from`).
 pub(super) const MIGRATION_009_TOPICS: &str = r#"
 CREATE TABLE topics (
     topic_id          TEXT PRIMARY KEY,

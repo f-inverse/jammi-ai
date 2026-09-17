@@ -36,7 +36,8 @@ impl MutableBackend for SqliteMutableBackend {
                 )
             })
             .collect();
-        // ADR-00: always emit the tenant_id column.
+        // Always emit the tenant_id column (the engine's tenant-identifier
+        // discipline — docs/guide/src/philosophy.md#the-one-rule-everything-else-follows-from).
         cols.push("tenant_id TEXT".to_string());
 
         let pk = def

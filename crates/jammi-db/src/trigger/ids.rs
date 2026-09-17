@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Catalog-assigned topic identifier. UUIDv7 — time-ordered for index
-/// locality per ADR-00.
+/// locality, following the engine's tenant-identifier discipline (see
+/// `docs/guide/src/philosophy.md#the-one-rule-everything-else-follows-from`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TopicId(Uuid);

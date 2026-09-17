@@ -693,7 +693,9 @@ fn session_id_from_request<T>(request: &Request<T>) -> Result<SessionId, Status>
 
 /// Parse a wire-format [`pb::Tenant`] into the engine's [`TenantId`] newtype.
 /// Empty string is interpreted as "no tenant" → `Ok(None)`. Any other value
-/// must parse as a non-nil UUID per ADR-00.
+/// must parse as a non-nil UUID, per the engine's tenant-identifier
+/// discipline (see
+/// `docs/guide/src/philosophy.md#the-one-rule-everything-else-follows-from`).
 fn parse_tenant(t: &pb::Tenant) -> Result<Option<TenantId>, Status> {
     if t.id.is_empty() {
         return Ok(None);

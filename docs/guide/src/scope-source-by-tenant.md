@@ -5,7 +5,9 @@
 The session-scoped tenant binding ([`multi-tenant.md`](./multi-tenant.md))
 relies on every table the engine reads carrying a `tenant_id` column. That
 works for mutable companion tables and Parquet result tables Jammi
-produced itself — both emit the column by ADR-00. But a *federated* source
+produced itself — both emit the column per the tenant-identifier discipline
+([Design Philosophy](./philosophy.md#the-one-rule-everything-else-follows-from)).
+But a *federated* source
 — a remote Postgres warehouse, a S3 Parquet lake, a CSV from someone
 else's pipeline — usually doesn't. It may carry a `customer_id`, an
 `organization`, a `workspace` column, or no tenant discriminator at all.
@@ -150,8 +152,9 @@ discriminator, two options are open: (1) re-shape upstream so each
 tenant lands in its own table, registered as a separate source, or
 (2) accept that the source is globally visible to every session and
 gate access at a higher layer (Flight SQL session interceptor, gRPC
-auth middleware). The engine itself does not authenticate; ADR-00 §
-*Engine does not invent tenants* applies.
+auth middleware). The engine itself does not authenticate;
+[Design Philosophy](./philosophy.md#the-one-rule-everything-else-follows-from) §
+*the engine does not invent tenants* applies.
 
 ## See also
 

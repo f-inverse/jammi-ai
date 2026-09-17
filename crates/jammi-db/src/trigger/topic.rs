@@ -36,7 +36,9 @@ pub struct TopicDefinition {
     pub name: String,
     /// Arrow schema for batch payloads. Validated on every publish.
     pub schema: SchemaRef,
-    /// Tenant scope per ADR-00. `None` is the engine-default global topic.
+    /// Tenant scope, per the engine's tenant-identifier discipline (see
+    /// `docs/guide/src/philosophy.md#the-one-rule-everything-else-follows-from`).
+    /// `None` is the engine-default global topic.
     pub tenant: Option<TenantId>,
     /// Broker-driver-specific configuration (retention, replication, etc.).
     /// Opaque to the engine; surfaced to the driver via

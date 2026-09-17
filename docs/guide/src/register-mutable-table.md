@@ -54,7 +54,8 @@ their natural numeric encoding (`Int64` epoch milliseconds, scaled `Int64`)
 so the schema stays narrow and the rule stays one-line at the boundary.
 
 The engine reserves `tenant_id` and any column whose name starts with `_`
-— the schema builder rejects them at build time per ADR-00. (The
+— the schema builder rejects them at build time, per the tenant-identifier
+discipline ([Design Philosophy](./philosophy.md#the-one-rule-everything-else-follows-from)). (The
 `tenant_id` column is always present on the storage table; the engine
 appends it implicitly.)
 

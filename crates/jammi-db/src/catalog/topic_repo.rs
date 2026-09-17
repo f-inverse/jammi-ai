@@ -112,8 +112,9 @@ impl TopicRepo {
 
     /// Look up a topic by its fully-qualified name. Tenant-filtered: a
     /// scoped session sees only its own topics plus the global (`NULL`)
-    /// rows, per ADR-00's `tenant_id = $session OR tenant_id IS NULL`
-    /// predicate.
+    /// rows, per the engine's tenant-identifier discipline's
+    /// `tenant_id = $session OR tenant_id IS NULL` predicate (see
+    /// `docs/guide/src/philosophy.md#the-one-rule-everything-else-follows-from`).
     pub async fn lookup_by_name(
         &self,
         name: &str,

@@ -440,7 +440,7 @@ fn parse_lease_expires_at(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 /// `col::timestamptz` cast — see [`LeaseFact`]'s docs) into a [`LeaseFact`]
 /// against `now`, on either backend, infallibly. Takes no [`BackendKind`]:
 /// since migration `039_canonical_stamps` both backends store the identical
-/// `CANONICAL_STAMP` shape (see [`parse_lease_expires_at`]).
+/// `CANONICAL_STAMP` shape (see `parse_lease_expires_at`).
 ///
 /// **The split, and why it is the same clock discipline as
 /// [`lease_expired_clause`] / [`lease_remaining_seconds_expr`].** Those two

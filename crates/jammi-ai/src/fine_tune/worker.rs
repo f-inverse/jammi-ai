@@ -3,8 +3,12 @@
 //! renewing the lease, and records the terminal outcome.
 //!
 //! One worker drives every job kind (item 2 — [`COMPILED_KINDS`]). A
-//! [`JobWorker::run`] tick first reclaims expired leases (re-queuing a dead
-//! worker's job, or failing it past the attempts cap), then atomically
+//! [`JobWorker::run_until`] tick — run only under
+//! [`EmbeddedWorker::spawn`]/[`EmbeddedWorker::spawn_worker`]'s claimed
+//! session slot (#500 wave 5 group E1 P7: one claim loop per session is
+//! structural, not merely conventional) — first reclaims expired leases
+//! (re-queuing a dead worker's job, or failing it past the attempts cap),
+//! then atomically
 //! claims the oldest queued job of one of its configured kinds
 //! (`execution = 'queued'` only — an `inline` row is never selected by the
 //! poll loop). On a claim it deserialises the spec and dispatches: a
@@ -1054,11 +1058,10 @@ impl WorkerShared {
     /// this state's birth snapshot of `HostAdmission::release_epoch` —
     /// callers that go through `HostAdmission::try_claim_loop`
     /// ([`EmbeddedWorker::spawn_worker`]) pass the epoch that call
-    /// returned; a fresh, un-looped single-job run (`JobWorker::
-    /// run_claimed_job`, `run_placed_gang`, `JobWorker::run`'s own
-    /// never-claimed loop) passes `admission.release_epoch()` read live,
-    /// the same value `phase()` would have read before this snapshot
-    /// existed.
+    /// returned; `for_single_run` is the OTHER shape (a fresh,
+    /// un-looped single-job run outside the claim-loop slot) and passes
+    /// `admission.release_epoch()` read live, the same value `phase()`
+    /// would have read before this snapshot existed.
     pub fn new(
         admission: Arc<HostAdmission>,
         instance_id: String,
@@ -1075,6 +1078,21 @@ impl WorkerShared {
             samples_taken: AtomicU64::new(0),
             spawn_release_epoch,
         })
+    }
+
+    /// Fresh shared state for ONE claimed-job run OUTSIDE the claim-loop
+    /// slot — `JobWorker::run_claimed_job`'s and `run_placed_gang`'s shared
+    /// shape (`worker.rs`'s single private constructor for it, rather than
+    /// each caller inlining its own `Self::new` + live epoch read): the
+    /// hold sites read the session's phase/epoch, and — holding no claim
+    /// probe — leave the session's holder exactly as they found it, sitting
+    /// beside the loop's slot the way an inline `run_now` does. The
+    /// release-epoch snapshot is read live, right before use, matching what
+    /// a bare `phase()` read would have observed before `WorkerShared`
+    /// carried a birth snapshot at all.
+    fn for_single_run(admission: &Arc<HostAdmission>, worker_id: String) -> Arc<Self> {
+        let epoch = admission.release_epoch();
+        Self::new(Arc::clone(admission), worker_id, epoch)
     }
 
     /// The sampler's last snapshot (a copy).
@@ -1523,8 +1541,11 @@ pub struct ReleaseReport {
 
 /// Runs jobs of every kind — the three training kinds via `run_spec` AND
 /// compute — from the shared catalog under a lease. Construct one per
-/// process (or N for a pool); [`Self::run`] is the long-lived loop the
-/// embedded engine and the server's worker tier both drive.
+/// process (or N for a pool); [`Self::run_until`] is the long-lived loop
+/// the embedded engine and the server's worker tier both drive, spawned
+/// ONLY through [`EmbeddedWorker::spawn`]/[`EmbeddedWorker::spawn_worker`]
+/// (the session's single claim-loop slot, #500 wave 5 group E1 P7) — this
+/// type carries no bare, ungated entry point onto `run_until` of its own.
 pub struct JobWorker {
     /// Weak back-reference to the session — upgraded each tick. `None` means the
     /// session dropped, which is the loop's exit condition (no refcycle keeps
@@ -1602,21 +1623,6 @@ impl JobWorker {
     /// on lease ownership.
     pub fn worker_id(&self) -> &str {
         &self.worker_id
-    }
-
-    /// Run the claim→reconstruct→train loop until the session drops.
-    ///
-    /// Equivalent to [`Self::run_until`] over fresh, never-stopped shared
-    /// state — for callers that rely solely on the session dropping (the
-    /// `Weak` upgrade failing) to stop the worker.
-    pub async fn run(&self) {
-        let epoch = self.admission.release_epoch();
-        self.run_until(WorkerShared::new(
-            Arc::clone(&self.admission),
-            self.worker_id.clone(),
-            epoch,
-        ))
-        .await
     }
 
     /// Run the claim→reconstruct→train loop until `shared`'s stop is set,
@@ -1915,18 +1921,9 @@ impl JobWorker {
         record: jammi_db::catalog::jobs_repo::JobRecord,
     ) {
         // A caller driving one claimed job outside a loop task runs it under
-        // fresh shared state over the session's own admission: the hold
-        // sites read the session's phase, and — holding no claim probe —
-        // leave the session's holder exactly as they found it (a direct run
-        // sits beside the loop's slot the way an inline `run_now` does).
-        // The release-epoch snapshot is read live, right before use — the
-        // same value `phase()` would have read before `WorkerShared` gained
-        // that snapshot (`released_since_birth`'s doc).
-        let shared = WorkerShared::new(
-            Arc::clone(&self.admission),
-            self.worker_id.clone(),
-            self.admission.release_epoch(),
-        );
+        // fresh shared state over the session's own admission — see
+        // `WorkerShared::for_single_run`'s own doc.
+        let shared = WorkerShared::for_single_run(&self.admission, self.worker_id.clone());
         self.run_claimed_job_under(session, record, &shared, false)
             .await;
     }
@@ -2591,11 +2588,7 @@ impl JobWorker {
                 return Err(e);
             }
         };
-        let shared = WorkerShared::new(
-            Arc::clone(admission),
-            worker.worker_id.clone(),
-            admission.release_epoch(),
-        );
+        let shared = WorkerShared::for_single_run(admission, worker.worker_id.clone());
         let end = worker
             .run_claimed_job_under(session, record, &shared, true)
             .await;

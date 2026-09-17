@@ -20,7 +20,15 @@ pub type DynObjectStore = Arc<dyn ObjectStore>;
 ///
 /// Returns [`StorageError::SchemeNotEnabled`] when the URL points at a
 /// cloud that wasn't compiled in.
-pub fn build_object_store(
+///
+/// `pub(crate)`, not `pub`: this is the ONE place a raw `Arc<dyn
+/// ObjectStore>` — on which `ObjectStoreExt::delete` is unguarded, with no
+/// `models/` refusal — comes into existence. Outside this crate, get a
+/// guarded [`super::object_store_handle::JammiObjectStore`] instead, via
+/// [`super::registry::StorageRegistry::handle_for`] or
+/// [`super::object_store_handle::JammiObjectStore::open`] (#588) — neither
+/// returns or passes the raw driver to caller code.
+pub(crate) fn build_object_store(
     url: &StorageUrl,
     config: Option<&CloudConfig>,
 ) -> Result<DynObjectStore, StorageError> {
@@ -347,7 +355,7 @@ fn configure_r2(
 }
 
 /// The starting builders [`location_determinants`] derives from: the process
-/// environment (`from_env()` — what [`build_object_store`] itself starts
+/// environment (`from_env()` — what `build_object_store` itself starts
 /// from) or, for a test, an explicit variable set fed through the SAME
 /// `<PREFIX>_` filter and key table `from_env` applies, so a spelling
 /// object_store accepts in the environment is accepted here and nothing
@@ -451,7 +459,7 @@ impl BuilderSeeds {
 }
 
 /// The values that decide WHICH location the store dials for `url` under
-/// `config` — read back from the SAME builder [`build_object_store`]
+/// `config` — read back from the SAME builder `build_object_store`
 /// constructs (the environment first, `config` on top, exactly the order
 /// the `build_*` functions apply) and folded through the driver's own
 /// resolution: for S3 and R2 the bucket endpoint `build()` dials

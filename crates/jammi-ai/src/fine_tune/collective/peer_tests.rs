@@ -1234,19 +1234,29 @@ impl object_store::ObjectStore for RecordingStore {
 #[test]
 fn verify_partition_leaves_over_a_file_store_reads_one_bounded_range_per_leaf_and_names_a_corrupted_leaf(
 ) {
-    use jammi_db::storage::{build_object_store, JammiObjectStore, StorageUrl};
+    use jammi_db::storage::{JammiObjectStore, StorageUrl};
     let rt = runtime();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("data.parquet");
     let bytes = three_row_group_parquet();
     std::fs::write(&path, &bytes).expect("write");
-    let url = StorageUrl::parse(&format!("file://{}", path.display())).expect("url");
+    // The test builds its OWN driver directly (route 4 — no crate boundary
+    // can seal direct `object_store` construction against paths this
+    // process can already reach): a `LocalFileSystem` rooted at the tempdir
+    // itself, never a bare `LocalFileSystem::new()` rooted at `/` — jammi-db
+    // never hands this test a raw driver to wrap (`JammiObjectStore::open`
+    // has no such seam since #588's closing audit removed `open_with`).
+    let url = StorageUrl::parse("file:///data.parquet").expect("url");
     let ranges = Arc::new(Mutex::new(Vec::new()));
-    let driver: Arc<dyn object_store::ObjectStore> = Arc::new(RecordingStore {
-        inner: build_object_store(&url, None).expect("driver"),
-        ranges: Arc::clone(&ranges),
-    });
-    let handle = JammiObjectStore::new(driver, url);
+    let driver = object_store::local::LocalFileSystem::new_with_prefix(dir.path())
+        .expect("local driver rooted at the tempdir");
+    let handle = JammiObjectStore::new(
+        Arc::new(RecordingStore {
+            inner: Arc::new(driver),
+            ranges: Arc::clone(&ranges),
+        }),
+        url,
+    );
     let leaves = parquet_leaves(&bytes).expect("leaves");
 
     rt.block_on(super::peer::verify_partition_leaves(&handle, &leaves))

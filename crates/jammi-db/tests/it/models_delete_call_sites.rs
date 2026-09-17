@@ -16,20 +16,77 @@
 //! a caller anywhere cargo compiles is in scope, while `driver` is sealed to
 //! this crate by the compiler.
 //!
-//! **The residual this oracle does NOT close, stated rather than claimed:**
-//! a raw `Arc<dyn ObjectStore>` — on which `ObjectStoreExt::delete` is
-//! unguarded — is obtainable WITHOUT the handle by three routes, all outside
-//! this review: `StorageRegistry::driver_for` and `storage::build_object_store`
-//! (both `pub`); `JammiSession::context()` (`pub`, re-exposed by `jammi-ai`'s
-//! `InferenceSession::context()`), whose DataFusion
-//! `runtime_env().object_store(url)` returns the registered store (the
-//! session's default registry pre-registers `file://`, and this crate registers
-//! its cloud drivers there); and direct construction with the `object_store`
-//! crate by any code holding the same credentials, which no crate can seal.
-//! The wave-5 contract (`docs/rigor/contracts/feat_500-wave5.md` §2.12,
-//! committed with that PR's rigor record) enumerates the present acquisition
-//! sites of the first route; sealing the first two is the jammi-db
-//! capability-sealing unit filed from it (#588).
+//! **The residual this oracle does NOT close, stated rather than claimed
+//! (#588, SEAL-STORE unit):** a raw `Arc<dyn ObjectStore>` — on which
+//! `ObjectStoreExt::delete` is unguarded — is obtainable WITHOUT the handle
+//! by three routes; one is now closed, one was attempted and excised
+//! (recorded here, not silently dropped), and one is inherent (no seal can
+//! close it):
+//!
+//! 1. **CLOSED.** `jammi_db::storage::registry::StorageRegistry::driver_for`
+//!    and `jammi_db::storage::builder::build_object_store` are `pub(crate)`
+//!    (`storage/mod.rs`'s `compile_fail,E0624`/`E0603`/`E0425` doctests
+//!    measure it); every external acquisition site uses
+//!    `StorageRegistry::handle_for` or `JammiObjectStore::open`, both of
+//!    which hand back the guarded handle, never the driver, to caller
+//!    code. `JammiObjectStore::new` is the ONE remaining door in this
+//!    module's `pub` surface that touches a raw driver at all, and it only
+//!    ACCEPTS one a caller already built (route 4, below) — nothing here
+//!    returns or passes one to caller code, per that constructor's own
+//!    doc.
+//! 2. **OPEN.** `JammiSession::context()` (`pub`, re-exposed by `jammi-ai`'s
+//!    `InferenceSession::context()`, and held by
+//!    `jammi-ballista`'s executor wiring) hands out the live
+//!    `SessionContext`. Its default `RuntimeEnv` pre-registers a
+//!    `LocalFileSystem` rooted at `/` for `file://`, so
+//!    `context().runtime_env().object_store(url)` yields a writable store.
+//!    A registry-level wrapper cannot close this route:
+//!    `datafusion::execution::context::SessionContext::state_ref` is `pub`
+//!    (datafusion 54.1.0, `src/execution/context/mod.rs:2043`) and returns
+//!    the SHARED `Arc<RwLock<SessionState>>` — any holder of the
+//!    `&SessionContext` this crate hands out can
+//!    `SessionStateBuilder::new_from_existing(guard.clone())
+//!    .with_runtime_env(Arc::new(RuntimeEnv::default())).build()` and write
+//!    the rebuilt state back through that same lock, using DataFusion types
+//!    only, no `object_store` API at all, replacing any registry-level
+//!    wrapper with a fresh, unwrapped default. Measured directly against a
+//!    live `JammiSession`: a `delete` through this seam returns `Ok`, with
+//!    the target file gone, once the swap has run; the same `delete`
+//!    before the swap observably resolved a different (guarded) store.
+//!    Closing this route needs a mechanism other than a registry wrapper
+//!    (e.g. a context
+//!    facade that never exposes `state_ref`/the runtime env at all), left
+//!    as future work on #588.
+//! 3. **OPEN, by design (route 4 in this crate's own prose).** Direct
+//!    construction with the `object_store` crate by any code holding the
+//!    same credentials — `object_store` is a normal dependency of
+//!    `jammi-ai`/`jammi-server`, and no crate boundary can seal a
+//!    capability a dependent crate can rebuild from raw credentials.
+//!    Stated, not attempted.
+//! 4. Raw catalog SQL (`Tx::{execute,query,query_opt}`,
+//!    `BackendImpl::transaction`, `Catalog::backend_arc`) is a SEPARATE
+//!    property from this file's byte-delete guard and was investigated and
+//!    explicitly NOT sealed: `BackendImpl` is a `pub` enum over `pub`
+//!    backend types whose own `open`/`open_with_options` constructors are
+//!    `pub` (121 direct constructions outside `jammi-db/src` on `main`
+//!    @ `b8052978`, including `jammi-ai`'s `jobs_shutdown.rs:1735` opening
+//!    its own backend on the same catalog file), so sealing the
+//!    transaction-closure surface alone would not remove the capability,
+//!    only its most convenient door — and 113 `backend_arc()` call sites
+//!    plus 192 `tx.{execute,query,query_opt}` call sites across five crates
+//!    (`crates/jammi-db/tests/it` is itself a SEPARATE crate under Rust's
+//!    privacy rules, so `pub(crate)` would lock out jammi-db's OWN 166
+//!    negative-path fixtures — `migrations.rs`'s pre-migration schema probes,
+//!    `grpc_job.rs:891`/`jobs.rs:132`'s hand-built `jobs` rows — which exist
+//!    precisely because the engine's typed verbs refuse the states those
+//!    tests must construct). The property "a training-kind `jobs` row is
+//!    writable only through `submit_job_deduped`" is instead carried, for
+//!    PRODUCTION code, by the wave-5 submit-seam oracle
+//!    (`crates/jammi-ai/tests/it/rank_admission.rs`, `fdf28c27`), which
+//!    already scans every crate's `src/`; test code and direct backend
+//!    construction keep raw SQL by design, consistent with the engine's
+//!    documented trust posture (`docs/guide/src/security.md`: a trusted
+//!    network, not a security boundary against code running alongside it).
 //!
 //! **Keyed by `(file, function, ordinal)`, not `(file, line)`** (F2's
 //! second delta): a bare line number goes stale on every UNRELATED edit

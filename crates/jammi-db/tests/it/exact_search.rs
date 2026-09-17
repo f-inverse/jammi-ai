@@ -15,7 +15,7 @@ use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, Stri
 use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use jammi_db::index::exact::exact_vector_search;
-use jammi_db::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
+use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_numerics::distance::cosine_distance;
 use tempfile::tempdir;
@@ -61,8 +61,7 @@ async fn register_embedding_table(
     let parquet_path = dir.join(format!("{table_name}.parquet"));
     let url = StorageUrl::parse(parquet_path.to_str().unwrap()).unwrap();
     let registry = StorageRegistry::new();
-    let driver = registry.driver_for(&url, None).unwrap();
-    let handle = JammiObjectStore::new(driver, url.clone());
+    let handle = registry.handle_for(&url, None).unwrap();
     let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema))
         .await
         .unwrap();
@@ -102,8 +101,7 @@ async fn register_embedding_table_chunked(
     let parquet_path = dir.join(format!("{table_name}.parquet"));
     let url = StorageUrl::parse(parquet_path.to_str().unwrap()).unwrap();
     let registry = StorageRegistry::new();
-    let driver = registry.driver_for(&url, None).unwrap();
-    let handle = JammiObjectStore::new(driver, url.clone());
+    let handle = registry.handle_for(&url, None).unwrap();
     let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema))
         .await
         .unwrap();

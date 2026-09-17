@@ -10,7 +10,7 @@ use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::exact::exact_vector_search;
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
-use jammi_db::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
+use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 use jammi_db::store::schema::embedding_table_schema;
 use tempfile::tempdir;
 
@@ -209,8 +209,7 @@ async fn exact_search_resolves_row_ids_under_default_schema() {
     let parquet_path = dir.path().join("exact_table.parquet");
     let url = StorageUrl::parse(parquet_path.to_str().unwrap()).unwrap();
     let registry = StorageRegistry::new();
-    let driver = registry.driver_for(&url, None).unwrap();
-    let handle = JammiObjectStore::new(driver, url.clone());
+    let handle = registry.handle_for(&url, None).unwrap();
     let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema))
         .await
         .unwrap();
@@ -275,7 +274,7 @@ async fn exact_table(
     .unwrap();
     let url = StorageUrl::parse(dir.join(format!("{name}.parquet")).to_str().unwrap()).unwrap();
     let registry = StorageRegistry::new();
-    let handle = JammiObjectStore::new(registry.driver_for(&url, None).unwrap(), url.clone());
+    let handle = registry.handle_for(&url, None).unwrap();
     let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema))
         .await
         .unwrap();
@@ -377,7 +376,7 @@ async fn exact_search_refuses_a_zero_width_scan_column_typed_engine_fault() {
     .unwrap();
     let url = StorageUrl::parse(dir.path().join("zero_width.parquet").to_str().unwrap()).unwrap();
     let registry = StorageRegistry::new();
-    let handle = JammiObjectStore::new(registry.driver_for(&url, None).unwrap(), url.clone());
+    let handle = registry.handle_for(&url, None).unwrap();
     let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema))
         .await
         .unwrap();

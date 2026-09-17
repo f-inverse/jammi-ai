@@ -11,6 +11,7 @@ use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
 
 use super::builder::DynObjectStore;
+use super::config::CloudConfig;
 use super::error::StorageError;
 use super::url::{Scheme, StorageUrl};
 
@@ -74,8 +75,44 @@ pub struct JammiObjectStore {
 impl JammiObjectStore {
     /// Construct a handle from a previously-built driver and the URL it
     /// was opened against.
+    ///
+    /// This is an INPUT door, not an emission route: it never MANUFACTURES
+    /// a raw driver, it only accepts one a caller already owns — direct
+    /// construction with the `object_store` crate against the same
+    /// credentials/paths this process can already reach, which no crate
+    /// boundary can seal by construction (see [`Self::open`]'s own doc for
+    /// why no constructor here takes a caller-supplied decorator). Nothing
+    /// else in this module's `pub` surface returns or passes a
+    /// `DynObjectStore`/`Arc<dyn ObjectStore>` to caller code:
+    /// `driver_for`/`build_object_store` are `pub(crate)`; `Self::driver`
+    /// is `pub(crate)`.
     pub fn new(driver: DynObjectStore, url: StorageUrl) -> Self {
         Self { driver, url }
+    }
+
+    /// Build a fresh, UNCACHED driver for `url` and wrap it in this handle —
+    /// the non-registry replacement for a raw
+    /// `crate::storage::builder::build_object_store` call: a one-shot
+    /// caller (a test fixture with no [`crate::storage::StorageRegistry`] at
+    /// hand) gets the guarded handle directly, never the bare driver. Use
+    /// [`crate::storage::StorageRegistry::handle_for`] instead when the caller
+    /// already owns a registry, so the driver is shared with every other
+    /// user of the same `(scheme, root)`.
+    ///
+    /// This constructor takes no caller-supplied decorator (no
+    /// `wrap: impl FnOnce(DynObjectStore) -> DynObjectStore` parameter):
+    /// such a closure IS caller code, so its own parameter would hand that
+    /// code the undecorated `Arc<dyn ObjectStore>` directly — capable of
+    /// deleting a live `models/` key, or any other path the underlying
+    /// scheme's root can reach (a `file://` driver is a bare
+    /// `LocalFileSystem` rooted at `/`, not scoped to `url`), turning this
+    /// constructor into an emission route out of the crate rather than an
+    /// input door into it. A caller that needs a decorated driver (a test
+    /// spy that records every read, say) builds its OWN driver directly
+    /// and wraps it before calling [`Self::new`].
+    pub fn open(url: &StorageUrl, config: Option<&CloudConfig>) -> Result<Self, StorageError> {
+        let driver = super::builder::build_object_store(url, config)?;
+        Ok(Self::new(driver, url.clone()))
     }
 
     /// The URL this handle was opened against.
@@ -96,13 +133,39 @@ impl JammiObjectStore {
     /// it to another crate (a compiler refusal), and inside this crate every
     /// reference to `driver` — this accessor and the private field — is a
     /// reviewed row of the raw byte-delete oracle
-    /// (`tests/it/models_delete_call_sites.rs`). The raw store is still
-    /// obtainable without a handle — through `StorageRegistry::driver_for`
-    /// and `build_object_store`, through `JammiSession::context()`'s
-    /// DataFusion runtime registry (re-exposed by `jammi-ai`'s
-    /// `InferenceSession::context()`), or by constructing an `object_store`
-    /// client directly with the same credentials; that is the oracle's
-    /// stated residual, not something this accessor's visibility closes.
+    /// (`tests/it/models_delete_call_sites.rs`).
+    ///
+    /// `StorageRegistry::driver_for` and `build_object_store` are
+    /// `pub(crate)` too (#588): the ONLY door THIS HANDLE opens for storage
+    /// access is its own typed operations (or [`Self::open`], which never
+    /// leaks the driver it builds). TWO routes to a raw, writable store
+    /// remain outside this handle, stated rather than claimed closed:
+    ///
+    /// - `JammiSession::context()` (`pub`, re-exposed by `jammi-ai`'s
+    ///   `InferenceSession::context()`) hands out a writable driver: its
+    ///   default `RuntimeEnv` pre-registers a `LocalFileSystem` rooted at
+    ///   `/` for `file://`, so `context().runtime_env().object_store(url)`
+    ///   resolves it. A registry-level wrapper cannot close this route:
+    ///   `datafusion::execution::context::SessionContext::state_ref` is
+    ///   `pub` (datafusion 54.1.0, `src/execution/context/mod.rs:2043`) and
+    ///   returns the SHARED `Arc<RwLock<SessionState>>`, so any holder of
+    ///   the `&SessionContext` this crate hands out can rebuild the
+    ///   `SessionState` with a fresh `RuntimeEnv` (DataFusion types only,
+    ///   no `object_store` API) and write it back through that lock,
+    ///   replacing any registry-level wrapper outright — measured directly:
+    ///   a `delete` through this seam returns `Ok`, with the target file
+    ///   gone, once the swap has run; the same `delete` before the swap
+    ///   observably resolved a different (guarded) store. Closing this
+    ///   route needs a mechanism other than a
+    ///   registry wrapper (e.g. a context facade that never exposes
+    ///   `state_ref`/the runtime env at all) — recorded on #588, out of
+    ///   scope for this handle.
+    /// - Direct construction with the `object_store` crate by code holding
+    ///   the same credentials/paths this process can already reach — no
+    ///   crate boundary can seal that either. Stated, not attempted.
+    ///
+    /// Both are filed as the residual of #588 on
+    /// `models_delete_call_sites.rs`'s module doc.
     pub(crate) fn driver(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.driver)
     }

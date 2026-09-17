@@ -506,8 +506,14 @@ for sig in TERM HUP; do
   while [ ! -f "$F1_ARMED_MARKER" ] && kill -0 "$driver_pid" 2>/dev/null && [ "$SECONDS" -lt "$armed_deadline" ]; do sleep 0.05; done
   [ -f "$F1_ARMED_MARKER" ] || bad "F1: the SIG${sig} fixture's subshell never reported its traps armed within 60s (a wedged machine, or the driver failed to source) -- refusing to read a missing cleanup marker as the driver's fault"
   kill "-${sig}" "$driver_pid" 2>/dev/null
-  wait_deadline=$((SECONDS + 5))
-  while kill -0 "$driver_pid" 2>/dev/null && [ "$SECONDS" -lt "$wait_deadline" ]; do sleep 0.1; done
+  # Read the marker only after the subshell has EXITED (the trap handler
+  # runs to completion before the process ends), never after a fixed
+  # window: the handler's own work is not paced by this fixture, and on a
+  # loaded machine a guessed window reads a still-running handler as "the
+  # trap never fired". The bound is a backstop against a wedged machine.
+  exit_deadline=$((SECONDS + 60))
+  while kill -0 "$driver_pid" 2>/dev/null && [ "$SECONDS" -lt "$exit_deadline" ]; do sleep 0.05; done
+  kill -0 "$driver_pid" 2>/dev/null && bad "F1: the SIG${sig} fixture's subshell was still alive 60s after the signal (a wedged machine, or a handler that never exits)"
   if [ -f "$F1_SIG_MARKER" ]; then
     ok "F1: the cleanup trap fires under SIG${sig} (registered on EXIT/INT/TERM/HUP, never EXIT alone)"
   else

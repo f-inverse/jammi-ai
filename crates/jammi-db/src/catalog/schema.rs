@@ -1421,6 +1421,11 @@ ALTER TABLE workers ADD COLUMN devices TEXT NOT NULL DEFAULT '[]';
 /// applied_at`. `models.updated_at` and `applied_migrations.applied_at` join
 /// the domain even though no SQL predicate compares them TODAY — one shape
 /// everywhere, not "one shape everywhere a predicate happens to read it".
+/// A domain column's legacy schema `DEFAULT (CAST(CURRENT_TIMESTAMP AS
+/// TEXT))` is NOT a writer: its space-separated shape is refused at the
+/// edge like any other non-canonical value, so a raw `INSERT` that omits
+/// the column fails loudly (`<table>.<column>: not a canonical stamp`) and
+/// every writer — the crate's own and any test fixture — stamps explicitly.
 /// `compute_jobs.{queued_at, updated_at}`'s `queued_at` is a decimal epoch
 /// counter (`jammi-ballista/src/cluster.rs`), not this shape, at all — out
 /// of the universe entirely, a different domain. Every remaining `*_at`

@@ -62,12 +62,10 @@ pub fn is_compiled_non_test_source(rel: &str) -> bool {
     // deeper down (`examples/tests/main.rs`, `src/x/tests/mod.rs`) is a
     // compiled target or module and stays in the universe.
     let parts: Vec<&str> = rel.split('/').collect();
-    let crate_tests_dir = match parts.as_slice() {
-        ["crates", _, "tests", ..] => true,
-        ["ci", "tools", _, "tests", ..] => true,
-        _ => false,
-    };
-    !crate_tests_dir
+    !matches!(
+        parts.as_slice(),
+        ["crates", _, "tests", ..] | ["ci", "tools", _, "tests", ..]
+    )
 }
 
 /// Every tracked `.rs` file under `root` that [`is_compiled_non_test_source`]

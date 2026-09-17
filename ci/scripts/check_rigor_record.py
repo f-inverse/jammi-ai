@@ -2517,6 +2517,105 @@ def fixture_rr31_no_fail_reporting_entry_shape_duplicate() -> None:
             "restoring fix round 6 Z14's deleted duplicate must make this detector non-empty — it did not")
 
 
+# --------------------------------------------------------------------------- #
+# issue #557 items 1-2: the committed mutations/exclusions attestation
+# record + its required, CI-derived reader (`check_attestation_witnesses`).
+# --------------------------------------------------------------------------- #
+
+
+def _rr_attestation_block_setup(work: Path, attestation_jsonl: str | None) -> None:
+    """Shared setup: one open second-round BLOCK naming `a.py`
+    (`finding_locations`), a real NEW `def compute_thing()` committed
+    INSIDE `a.py` (so the diff's own AST-derived new-definition surfaces,
+    `mod._parse_new_surfaces`, land inside a `finding_locations` file --
+    item 8b's own arming condition), and (when `attestation_jsonl` is not
+    `None`) a committed `docs/rigor/feat_rr-fixture.attestation.jsonl`."""
+    pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+    block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                             "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                             "class_enumeration": ["a.py:1"]})
+    files = {
+        "ci/scripts/probe.py": "print('x')\n",
+        "a.py": "def compute_thing():\n    return 1\n",
+        "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+        "docs/README-fixture.md": "line one\n",
+        "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+    }
+    if attestation_jsonl is not None:
+        files["docs/rigor/feat_rr-fixture.attestation.jsonl"] = attestation_jsonl
+    _commit(work, "ci: touch a gate script (new def in a.py, item 8b armed)", files)
+
+
+def fixture_rr34_missing_attestation_when_armed_fails() -> None:
+    """issue #557 items 1-2: the fix's own diff adds `a.py::compute_thing`,
+    a NEW definition inside `a.py` -- the SAME file the open BLOCK's own
+    `finding_locations` names -- so item 8b is armed by RE-DERIVATION
+    alone (no relay artifact exists or is read here at all). No
+    `docs/rigor/feat_rr-fixture.attestation.jsonl` is committed. Must FAIL
+    naming the export command."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_attestation_block_setup(work, attestation_jsonl=None)
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR34", "a new definition inside a finding_locations file with no "
+                                      "committed attestation must FAIL")
+        _assert(any("attestation.jsonl" in f and "--export-attestation" in f for f in r.failures),
+                "RR34", f"{r.failures}")
+
+
+def fixture_rr35_attestation_file_with_no_valid_row_fails() -> None:
+    """issue #557 items 1-2: a committed attestation file EXISTS, but its
+    one row's `mutations` is an empty array (fails
+    `_r12_mutations_array_rejection`'s own shape check) -- no row
+    satisfies item 8b's requirement, so this must still FAIL, naming that
+    no committed row carries a shape-valid array."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        bad_row = json.dumps({"kind": "lead-relay-attestation", "unit_branch": "feat/rr-fixture",
+                               "agent_type": "adversarial-audit", "mutations": []})
+        _rr_attestation_block_setup(work, attestation_jsonl=bad_row + "\n")
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR35", "an attestation file with no shape-valid row must FAIL")
+        _assert(any("no committed row carries a shape-valid" in f for f in r.failures), "RR35", f"{r.failures}")
+
+
+def fixture_rr36_foreign_attestation_row_refused() -> None:
+    """issue #557 items 1-2: a committed attestation file carries a row
+    whose `kind` is NOT `lead-relay-attestation` (a hand-edit, or a row
+    copied from the anticipation stream) -- REFUSED by name, never
+    silently ignored or selected as evidence."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        foreign_row = json.dumps({"kind": "lead-anticipation", "unit_branch": "feat/rr-fixture",
+                                   "attacks": {}, "residual_risk": "x"})
+        _rr_attestation_block_setup(work, attestation_jsonl=foreign_row + "\n")
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR36", "a foreign-kind row in the attestation stream must FAIL")
+        _assert(any("not `lead-relay-attestation`" in f for f in r.failures), "RR36", f"{r.failures}")
+
+
+def fixture_rr37_valid_attestation_row_satisfies() -> None:
+    """issue #557 items 1-2, positive control: a committed attestation
+    file carries ONE real, shape-valid `lead-relay-attestation` row with a
+    non-empty `mutations` array -- item 8b's own requirement is satisfied;
+    `check_attestation_witnesses` itself reports NO failure (other readers
+    in the same run, e.g. the anticipation record, are not this fixture's
+    concern and are asserted separately elsewhere)."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        good_row = json.dumps({
+            "kind": "lead-relay-attestation", "unit_branch": "feat/rr-fixture",
+            "agent_type": "adversarial-audit", "block_ts": "2026-01-01T00:01:00Z",
+            "mutations": [{"site": "a.py:1", "command": "python3 -c \"print('ok')\"",
+                            "rc_before": 0, "rc_after": 1, "marker_after": "test result: FAILED"}],
+        })
+        _rr_attestation_block_setup(work, attestation_jsonl=good_row + "\n")
+        r = _run_check_in(work)
+        joined_failures = " | ".join(r.failures)
+        _assert("attestation" not in joined_failures, "RR37",
+                f"a shape-valid attestation row must satisfy item 8b, got: {r.failures}")
+
+
 RR_FIXTURES = [
     ("RR1", fixture_rr1_not_armed_docs_only),
     ("RR2", fixture_rr2_armed_no_record),
@@ -2558,6 +2657,10 @@ RR_FIXTURES = [
     ("RR31", fixture_rr31_no_fail_reporting_entry_shape_duplicate),
     ("RR32", fixture_rr32_mixed_naive_aware_ts_pool_fails_loudly_not_a_crash),
     ("RR33", fixture_rr33_same_instant_different_text_ts_ties),
+    ("RR34", fixture_rr34_missing_attestation_when_armed_fails),
+    ("RR35", fixture_rr35_attestation_file_with_no_valid_row_fails),
+    ("RR36", fixture_rr36_foreign_attestation_row_refused),
+    ("RR37", fixture_rr37_valid_attestation_row_satisfies),
 ]
 
 

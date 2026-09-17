@@ -65,17 +65,30 @@ and no construction path escapes the REGISTRY. This fixture, however, only
 WATCHES the registry for the span of one test: it subscribes at that test's
 own setup and reads the diff in its own ``finally``, before any coarser
 fixture tears down. So the window this guard actually covers is a single
-test's own fixture window, and the suite rule is that a test-opened session
-is closed by that SAME test. A session registered before this fixture
-subscribes — at import time, or in a module- or session-scoped fixture's own
-setup — is outside the window and invisible to it; and a session that spans
-tests (opened by one test, left open past that test's own teardown, and only
-closed later by a different test or a coarser fixture) is reported, if it is
-reported at all, against the test that OPENED it, never the one that
-eventually closes it. That gap — plus the registry ledger's unbounded size
-and its ``label=""`` default — is filed as issue #552. What this guard does
-NOT reach at all is the non-pytest lanes (scripts, recipes, quickstart, the
-executed chapter cells) — those are covered instead by the AST gate
+test's own fixture window, and **the suite rule is that a test-opened
+session is closed by that SAME test** — that rule is what makes the
+per-test guard sound at all: a session opened in test A and closed in test
+B is reported against A (the OPENER), never against B (the closer, which
+did nothing wrong), because A's own window closes with the session still
+registered and B's window never saw a `register` event for it at all, only
+an `unregister` it did not ask for. `test_session_lifecycle_guard.py`'s
+``test_a_session_opened_in_one_test_and_closed_in_a_later_test_is_reported_against_the_opener``
+pins this by name. A session registered before this fixture subscribes — at
+import time, or in a module- or session-scoped fixture's own setup — is
+outside a single test's window and invisible to the per-test guard; that gap
+is covered by a SECOND mechanism, process-wide rather than per-test (below):
+a session-scope baseline taken at ``pytest_sessionstart`` (before collection
+runs, so even an import-time ``jammi.connect(...)`` at module scope is
+inside its window) and a sweep at ``pytest_sessionfinish`` that fails the
+WHOLE RUN, by label, for every handle registered anywhere in the process
+during the session and never unregistered by the time the session ends —
+independent of which single test's window (if any) the registration fell
+inside. The per-test guard stays: it attributes a leak to the exact test
+that caused it, which the session-wide sweep cannot do (by the time it runs,
+every test has already finished) — the two are complementary, not
+redundant. What neither guard reaches at all is the non-pytest lanes
+(scripts, recipes, quickstart, the executed chapter cells) — those are
+covered instead by the AST gate
 ``ci/scripts/check_cookbook_session_lifecycle.py`` (issue #539), which reads
 the tree statically rather than running under any test harness.
 """
@@ -140,6 +153,80 @@ def remote():
 # --------------------------------------------------------------------------- #
 # the rail
 # --------------------------------------------------------------------------- #
+
+# Process-wide baseline for the `pytest_sessionfinish` sweep below (issue
+# #552 item 1): every handle `jammi.observe()` reports registered ANYWHERE
+# in this process during the run, and every handle it reports unregistered.
+# Module globals, not fixture state — `pytest_sessionstart` fires before
+# `pytest_collection`, so subscribing there sees even a module-import-time
+# `jammi.connect(...)` (a construction the per-test `_no_leaked_sessions`
+# fixture below can never see, since collection/import happens before any
+# fixture — even a session-scoped one — gets to run its own setup).
+_session_registered: dict[int, str] = {}
+_session_unregistered: set[int] = set()
+_session_unsubscribe = None
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:  # noqa: ARG001
+    """Subscribe to the registry for the WHOLE run, before collection —
+    the process-wide half of the leak rail (issue #552 item 1). Runs even
+    when `_RAIL_ACTIVE` is False; the capability check below is what makes
+    subscribing a no-op in that case, same as the per-test fixture."""
+    global _session_unsubscribe
+    if not _RAIL_ACTIVE:
+        return
+
+    def _on_register(handle: int, label: str) -> None:
+        _session_registered[handle] = label
+
+    def _on_unregister(handle: int, label: str) -> None:  # noqa: ARG001
+        _session_unregistered.add(handle)
+
+    _session_unsubscribe = jammi.observe(_on_register, _on_unregister)
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:  # noqa: ARG001
+    """The process-wide sweep (issue #552 item 1): every session registered
+    anywhere in this process during the run and never unregistered by the
+    time it ends fails the WHOLE RUN, by label — independent of whether any
+    single test's own `_no_leaked_sessions` window ever saw it (a
+    module-/session-scoped fixture's setup, or an import-time construction,
+    both fall outside every per-test window and so are invisible to that
+    fixture; this sweep is the only guard that reaches them). Runs after
+    every test has already finished, so it cannot attribute the leak to one
+    test the way the per-test guard does — it can only say the run, as a
+    whole, leaked.
+    """
+    if not _RAIL_ACTIVE or _session_unsubscribe is None:
+        return
+    _session_unsubscribe()
+
+    leaked = {
+        handle: label
+        for handle, label in _session_registered.items()
+        if handle not in _session_unregistered
+    }
+    if not leaked:
+        return
+
+    names = ", ".join(
+        f"{label!r} (handle {handle})"
+        for handle, label in sorted(leaked.items(), key=lambda kv: kv[1])
+    )
+    message = (
+        f"SESSION-WIDE LEAK: {len(leaked)} jammi session(s) were opened "
+        f"somewhere in this process and never closed by the end of the "
+        f"run, outside any single test's own fixture window: {names}. This "
+        "is the process-wide sweep, not the per-test guard — it catches a "
+        "session opened at import time or in a module-/session-scoped "
+        "fixture's own setup, neither of which `_no_leaked_sessions` can "
+        "see."
+    )
+    # stdout, not stderr: pytest's own capture/report machinery (and this
+    # rail's own pytester-based non-vacuity test, which reads `result.
+    # outlines`/`result.stdout`) both look at the process's stdout stream.
+    print(f"\n{message}\n")
+    session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 @pytest.fixture(scope="session", autouse=True)

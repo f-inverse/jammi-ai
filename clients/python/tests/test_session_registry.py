@@ -326,3 +326,93 @@ def test_concurrent_open_close_produce_balanced_events():
         assert set(rec.registered) == set(rec.unregistered)
     finally:
         unsubscribe()
+
+
+class _Orphan:
+    """A minimal stand-in "session" for exercising `_sessions.register()`
+    directly, without a real `EmbeddedBackend`/`RemoteDatabase` — needs
+    only to support weak references (a plain `object()` does not, and
+    `register()` weak-references it via `_live`/`_session_handles`)."""
+
+
+# --- issue #552 item 4: a falsy label is never stored/delivered as "" -------
+
+
+def test_direct_construction_with_no_label_reports_a_non_empty_label():
+    """`EmbeddedBackend(native)` (no `label=`) defaults to `label=""` at the
+    call site — the registry must not deliver or store that verbatim: `''`
+    collapses "nobody gave this session a label" with "a caller explicitly
+    labelled it the empty string", and a leak report naming `''` reads as
+    blank rather than as a real (if uninformative) name."""
+    rec = _Recorder()
+    unsubscribe = jammi.observe(rec.on_register, rec.on_unregister)
+    try:
+        db = EmbeddedBackend(_FakeNative())
+        try:
+            assert len(rec.registered) == 1
+            handle, label = rec.registered[0]
+            assert label != ""
+            assert label
+            assert dict(jammi.open_session_labels())[handle] == label
+        finally:
+            db.close()
+    finally:
+        unsubscribe()
+
+
+def test_remote_direct_construction_with_no_label_also_reports_non_empty():
+    """Same property, other transport: `RemoteDatabase`'s own registration
+    call in `_database.py` always passes `endpoint` today, but the registry
+    itself must not depend on every future call site remembering to — the
+    non-empty guarantee lives at the ONE seam (`register()`), not at each
+    caller."""
+    from jammi import _sessions as _sessions_module
+
+    rec = _Recorder()
+    unsubscribe = jammi.observe(rec.on_register, rec.on_unregister)
+    try:
+        handle = _sessions_module.register(_Orphan(), "")
+        try:
+            assert len(rec.registered) == 1
+            _, label = rec.registered[0]
+            assert label != ""
+            assert label
+        finally:
+            _sessions_module._open_ledger.pop(handle, None)
+    finally:
+        unsubscribe()
+
+
+# --- issue #552 item 3: the non-weak ledger is bounded ----------------------
+
+
+def test_ledger_stays_bounded_when_thousands_of_sessions_are_dropped_without_close():
+    """Executed refutation of the pre-fix shape (issue #552 item 3): "5000
+    dropped sessions -> 5000 retained entries, forever" — register far more
+    sessions than `_LEDGER_CAP` without ever closing them and confirm the
+    ledger's own size never exceeds the stated cap, rather than growing
+    without bound for the life of the process. A leak DETECTOR must not
+    itself retain the leaked quantity unboundedly."""
+    from jammi import _sessions as _sessions_module
+
+    before = len(_sessions_module._open_ledger)
+    n = _sessions_module._LEDGER_CAP + 3000
+    handles = [
+        _sessions_module.register(_Orphan(), f"orphan-{i}") for i in range(n)
+    ]
+
+    after = len(_sessions_module._open_ledger)
+    assert after <= _sessions_module._LEDGER_CAP, (
+        f"ledger grew to {after} entries registering {n} never-closed "
+        f"sessions, past its own stated cap of {_sessions_module._LEDGER_CAP}"
+    )
+    # The cap bites (this test's own registrations alone exceed it), not
+    # merely "still small because nothing else happened to grow it" —
+    # otherwise this assertion would pass vacuously on an unbounded ledger
+    # too, as long as no prior test had pushed it over the cap yet.
+    assert after < before + n
+
+    # The MOST RECENTLY registered handles are the ones still present — a
+    # FIFO-by-registration-order eviction, not an arbitrary one.
+    assert handles[-1] in _sessions_module._open_ledger
+    assert handles[0] not in _sessions_module._open_ledger

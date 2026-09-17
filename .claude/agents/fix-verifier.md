@@ -18,6 +18,7 @@ Phase 6 of the rigor chain (ARCHITECTURE §4), the exit gate for a **defect fix*
 1. Identify the production hunk(s) and the test(s) claimed to cover them from the contract.
 2. In an isolated copy (worktree with a unique `CARGO_TARGET_DIR` — never a shared target dir, which serves stale artifacts and tests the wrong code), revert **only** the production hunk, keep the test, and run it. It **must** fail (RED). Then restore and confirm it passes (GREEN). A test that passes on the reverted code is **tautological** → BLOCK.
 3. Inspect any negative/"the bad path still fails" control for non-finite and unmodelled failure modes.
+4. **If you construct CPU/concurrency load directly in Bash** (rather than inside the test binary's own process — e.g. a race you must reproduce with concurrent shell-level traffic), reap it with something stronger than a trailing `kill`: `trap 'kill ${=LOADPIDS} 2>/dev/null' EXIT INT TERM` (zsh does not word-split `kill $PIDS` the way bash does — an unbraced expansion silently kills one bogus argument and orphans the rest) **and** a self-limiting body (`timeout 300 sh -c 'while :; do :; done'` or a bounded loop), so a burner that escapes your parent shell still dies on its own. A leaked busy loop reparents to `ppid 1` and spins forever, degrading every later timing-sensitive measurement on the machine — including your own red/green comparison.
 
 ## Principle rubric — reason from the principle, not the instance
 

@@ -871,8 +871,9 @@ may still drive the two-host test BY HAND with the primitives above:
    pod's entrypoint installs sshd after boot, so the endpoint RunPod
    reports refuses connections for a while first. Both transports run
    this probe for both members before any remote command.
-3. On BOTH members, concurrently: clone this tree at the commit under test
-   and build the `gpu_capability` test target (only the proof needs the id,
+3. On BOTH members, concurrently: fetch this tree at the EXACT commit under
+   test (`PROVE_EXPECT_SHA`, by hash — never a branch name, which can move
+   between dispatch and clone) and build the `gpu_capability` test target (only the proof needs the id,
    so neither build waits on the other; the driver's one watch loop bounds
    both by log growth within `RP_INACTIVITY` and the T-10m budget).
 4. On the member running rank 0: export `JAMMI_GANG_TWO_HOSTS_RANK=0`,

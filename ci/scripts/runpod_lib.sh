@@ -2478,6 +2478,33 @@ rp_parse_prove_marker() {
   return 1
 }
 
+# The REMOTE checkout text every GPU leg ships to its host: the tree it
+# proves is the exact commit the workflow ran at (`PROVE_EXPECT_SHA`,
+# fetched by sha, depth 1 — a branch name is a moving target: gpu-cluster
+# run 35167650156 cloned `-b unit/e0` after a push had moved that branch,
+# and the wrong-tree guard below fired). Without an expected sha (a hand
+# run) the ref is cloned. Emits shell lines for the remote script's
+# heredoc: `cd /root`, a fresh `jammi-ai` dir, and leaves the caller INSIDE
+# it. `$1` = the ref (used only without PROVE_EXPECT_SHA), `$2` = the repo.
+rp_remote_checkout_lines() {
+  local ref="${1:?rp_remote_checkout_lines needs a ref}" repo="${2:?rp_remote_checkout_lines needs a repo url}"
+  if [ -n "${PROVE_EXPECT_SHA:-}" ]; then
+    cat <<LINES
+cd /root && rm -rf jammi-ai && mkdir jammi-ai && cd jammi-ai
+git init -q && git remote add origin "${repo}"
+git fetch -q --depth 1 origin "${PROVE_EXPECT_SHA}" \\
+  || { echo "::error::could not fetch the exact commit ${PROVE_EXPECT_SHA} from ${repo}" >&2; exit 1; }
+git checkout -q --detach FETCH_HEAD
+LINES
+  else
+    cat <<LINES
+cd /root && rm -rf jammi-ai
+git clone --depth 1 -b "${ref}" "${repo}" jammi-ai 2>&1 | tail -1
+cd jammi-ai
+LINES
+  fi
+}
+
 # ONE grammar, hand-mirrored across languages (esc-084/#454) -- bash cannot
 # `import` `ci/scripts/prove_surface.py`'s `PROVE_SHA_RE`, so
 # this function's `[0-9a-f]+`-after-`PROVE_SHA=`, first-match-only, no-

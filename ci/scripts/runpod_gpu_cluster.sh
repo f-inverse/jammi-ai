@@ -999,8 +999,9 @@ _rpc_run_two_ranks_inner() {
 # shared, transport-agnostic.
 _rpc_remote_script() {
   local rank="${1:?_rpc_remote_script needs a rank}"
-  local two_host_iface_lines id_wait_lines=""
+  local two_host_iface_lines id_wait_lines="" remote_checkout_lines
   two_host_iface_lines="$(_rpc_two_host_iface_lines "$rank")"
+  remote_checkout_lines="$(rp_remote_checkout_lines "${GIT_REF}" "${GIT_REPO}")"
   # Every rank but 0 blocks between its build and its proof until the id
   # rank 0 minted has been shipped to it (128 bytes exactly); the heartbeat
   # line keeps the driver's inactivity watchdog fed while it waits. Rank 0
@@ -1038,9 +1039,7 @@ if [ "\${compute_cap_norm}" != "\${CUDA_COMPUTE_CAP:-}" ]; then
   exit 97
 fi
 echo "::endgroup::"
-cd /root && rm -rf jammi-ai
-git clone --depth 1 -b "${GIT_REF}" "${GIT_REPO}" jammi-ai 2>&1 | tail -1
-cd jammi-ai
+${remote_checkout_lines}
 echo "PROVE_SHA=\$(git rev-parse HEAD)"
 rc=0
 git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass \\

@@ -2146,6 +2146,39 @@ else
   bad "P12: expected the id wait only in rank 1's script, between build and proof; got: $p12_scripts"
 fi
 # ----------------------------------------------------------------------------
+# P13: a member proves the EXACT commit the run was dispatched on. With
+# PROVE_EXPECT_SHA set the remote checkout fetches that sha by hash and
+# never names the ref (run 35167650156: a `-b unit/e0` clone landed on a
+# tip that had moved after dispatch and the wrong-tree guard fired); without
+# it (a hand run) the ref is cloned. ONE library helper, used by all three
+# GPU legs.
+# ----------------------------------------------------------------------------
+p13_sha_text="$(PROVE_EXPECT_SHA=0123456789abcdef0123456789abcdef01234567 bash -c 'source "'"$DIR"'/runpod_lib.sh" >/dev/null 2>&1; rp_remote_checkout_lines "some-branch" "https://example.invalid/r.git"')"
+p13_ref_text="$(bash -c 'unset PROVE_EXPECT_SHA; source "'"$DIR"'/runpod_lib.sh" >/dev/null 2>&1; rp_remote_checkout_lines "some-branch" "https://example.invalid/r.git"')"
+if printf '%s' "$p13_sha_text" | grep -qF 'git fetch -q --depth 1 origin "0123456789abcdef0123456789abcdef01234567"' \
+   && printf '%s' "$p13_sha_text" | grep -qF 'git checkout -q --detach FETCH_HEAD' \
+   && ! printf '%s' "$p13_sha_text" | grep -qF 'some-branch' \
+   && printf '%s' "$p13_sha_text" | grep -qF 'could not fetch the exact commit'; then
+  ok "P13: with PROVE_EXPECT_SHA the remote checkout fetches that exact sha and never names the ref; a failed fetch is a named error"
+else
+  bad "P13: expected a by-sha fetch with no ref; got: ${p13_sha_text}"
+fi
+if printf '%s' "$p13_ref_text" | grep -qF 'git clone --depth 1 -b "some-branch" "https://example.invalid/r.git" jammi-ai' \
+   && ! printf '%s' "$p13_ref_text" | grep -qF 'FETCH_HEAD'; then
+  ok "P13: without PROVE_EXPECT_SHA (a hand run) the ref is cloned"
+else
+  bad "P13: expected the ref clone without PROVE_EXPECT_SHA; got: ${p13_ref_text}"
+fi
+p13_legs=0
+for leg in runpod_gpu_cluster.sh runpod_gpu_gang.sh runpod_gpu_prove.sh; do
+  grep -qF '$(rp_remote_checkout_lines "${GIT_REF}" "${GIT_REPO}")' "$DIR/$leg" && ! grep -qF 'git clone --depth 1 -b "${GIT_REF}"' "$DIR/$leg" && p13_legs=$((p13_legs + 1))
+done
+if [ "$p13_legs" -eq 3 ]; then
+  ok "P13: all three GPU legs (cluster, gang, prove) check out through the ONE library helper; no leg clones the ref itself"
+else
+  bad "P13: expected all three legs on rp_remote_checkout_lines with no own clone line; got $p13_legs/3"
+fi
+# ----------------------------------------------------------------------------
 # P10: prose == code.
 # ----------------------------------------------------------------------------
 for site in "$CLUSTER_SH" "$CLUSTER_YML" "$DEV_GPU_MD"; do

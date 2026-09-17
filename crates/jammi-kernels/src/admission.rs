@@ -1752,9 +1752,283 @@ pub enum ProbedOpKind {
     },
 }
 
+/// The device KIND [`DryRunCtx`] needs — the same three-variant shape as
+/// `jammi_db::store::manifest::ComputeDeviceKind`, restated here because
+/// this crate has NO `jammi-*` dependency at all (a leaf crate every other
+/// `jammi-*` crate builds on): `jammi-ai`, the one caller that has both
+/// types in scope, converts a `ComputeDeviceKind` to this type with a
+/// trivial, lossless three-arm match at the [`DryRunCtx`] construction
+/// site, rather than this crate depending "up" into `jammi-db` for one enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    /// CPU.
+    Cpu,
+    /// A CUDA device, any ordinal.
+    Cuda,
+    /// An Apple Metal device, any ordinal.
+    Metal,
+}
+
+/// #546's DETERMINISTIC, PRE-TRAINING inputs (wave-5 second pressure
+/// round): build features, this attempt's resolved device kind, its
+/// backbone dtype class, and whether the ENCODER arm is even reachable at
+/// all (a `target_modules`-empty `ProjectionHead` run never builds an
+/// encoder, so every encoder op is [`DryRunVerdict::NotReached`] for such a
+/// run, never merely undetermined). Everything a [`ProbedOp::dry_run`] fn
+/// needs and nothing else — no tensor, no catalog handle, no I/O.
+#[derive(Debug, Clone, Copy)]
+pub struct DryRunCtx {
+    pub device_kind: DeviceKind,
+    pub dtype: DtypeClass,
+    /// `!config.target_modules.is_empty()` — the SAME predicate
+    /// `jammi-ai`'s `train_fine_tune` itself branches on to decide
+    /// `ProjectionHead` vs `EncoderAdapters`.
+    pub encoder_reachable: bool,
+}
+
+impl DryRunCtx {
+    /// [`device_is_supported`]'s own rule (`d.is_cpu() || (cfg!(feature =
+    /// "cuda") && d.is_cuda())`), restated over [`DeviceKind`] rather than a
+    /// real `candle_core::Device` — the SAME two build/device facts, read
+    /// without ever constructing one.
+    pub fn device_supported(self) -> bool {
+        match self.device_kind {
+            DeviceKind::Cpu => true,
+            DeviceKind::Cuda => CUDA_COMPILED,
+            DeviceKind::Metal => false,
+        }
+    }
+
+    pub fn is_cuda(self) -> bool {
+        self.device_kind == DeviceKind::Cuda && CUDA_COMPILED
+    }
+}
+
+/// One [`ProbedOp`]'s deterministic, pre-training admission verdict (#546,
+/// wave-5 second pressure round) — a pure function of [`DryRunCtx`], never a
+/// real tensor, never a dispatch counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DryRunVerdict {
+    /// Every gate this dry-run can resolve holds; no further domain
+    /// condition this dry-run lacks the data to resolve exists FOR THIS OP
+    /// (contrast [`Self::DataDependent`]).
+    Holds,
+    /// A gate this dry-run CAN resolve fully (device support, a build
+    /// feature, a dtype domain) refuses — names which one.
+    Declines(&'static str),
+    /// This op's real call site is never reached for this job's config at
+    /// all: an encoder op under a `ProjectionHead` target, or
+    /// `cast_scale`/`cast_add` for an `F32` backbone (their own call sites
+    /// only ever reach the cast-boundary admission on the `BF16`/`F16` arms
+    /// of a `match base_dtype`), or an [`ProbedOpKind::InternalSubkernel`]
+    /// row, which carries no independent admission at all.
+    NotReached(&'static str),
+    /// Every gate this dry-run CAN resolve holds, but the REAL predicate
+    /// also checks a condition this dry-run has no data for (a real batch's
+    /// sequence length, a real base checkpoint's own bias shape) — named
+    /// explicitly, never silently rounded up to [`Self::Holds`].
+    ///
+    /// **This variant is why the claim "the data-dependent `seq` arm is the
+    /// ONLY residual" does not hold for the real predicates, read directly
+    /// rather than taken on trust:** `attention_block`'s predicate ALSO
+    /// refuses on `seq_within_attention_block_max_seq`;
+    /// `mem_efficient_attention`'s ENTIRE admission is gated on `seq <=
+    /// ATTENTION_BLOCK_MAX_SEQ` — it exists specifically as the large-`seq`
+    /// arm `attention_block` cannot serve; and `lora_linear`'s predicate
+    /// refuses `bias_is_frozen_leaf` for a base checkpoint whose bias is a
+    /// trainable `Var` rather than frozen — a per-CHECKPOINT fact this
+    /// dry-run has no principled way to resolve without loading and
+    /// inspecting the base model's own bias tensor (out of scope for a
+    /// "no I/O" pre-training fold). Each is stated here, not silently
+    /// folded into [`Self::Holds`].
+    DataDependent(&'static str),
+}
+
+impl DryRunVerdict {
+    /// The profile string's per-op value — `"holds"`, `"declines:{reason}"`,
+    /// `"not_reached:{reason}"`, or `"data_dependent:{reason}"`. A plain,
+    /// grep-able tag rather than nested JSON, so two profiles differing in
+    /// exactly one op's verdict differ in exactly one substring.
+    pub fn render(self) -> String {
+        match self {
+            DryRunVerdict::Holds => "holds".to_string(),
+            DryRunVerdict::Declines(r) => format!("declines:{r}"),
+            DryRunVerdict::NotReached(r) => format!("not_reached:{r}"),
+            DryRunVerdict::DataDependent(r) => format!("data_dependent:{r}"),
+        }
+    }
+}
+
+/// The uniform "device-supported, dtype in {F32,BF16,F16} on either device"
+/// shape [`LAYER_NORM`]/[`ROPE`]/[`SOFTMAX`]/[`GEGLU`] all share
+/// (`fused_admission_predicate` layer_norm.rs, `rope_admission_predicate`
+/// modernbert.rs, `softmax_admission_predicate` attention_cascade.rs,
+/// `geglu_admission_predicate` modernbert.rs) — [`DtypeClass`] only ever
+/// names F32/Bf16/F16 (`jammi_numerics::ComputePrecision`'s own three
+/// variants), so the dtype half of this gate is trivially always satisfied;
+/// only the device half can refuse. The remaining contiguity/rank/
+/// `MAX_HIDDEN` checks each predicate also makes are assumed satisfied by
+/// this trainer's own tower construction for every shape it produces,
+/// never independently re-verified per shape here.
+fn dry_run_uniform_device_gate(ctx: &DryRunCtx) -> DryRunVerdict {
+    if !ctx.encoder_reachable {
+        return DryRunVerdict::NotReached("projection_head_target_builds_no_encoder");
+    }
+    if ctx.device_supported() {
+        DryRunVerdict::Holds
+    } else {
+        DryRunVerdict::Declines("device_is_cpu_or_cuda")
+    }
+}
+
+/// `gelu_admission_predicate`, `crates/jammi-encoders/src/activations.rs`:
+/// the ONE two-arm op whose dtype domain genuinely differs BY DEVICE —
+/// `F32`-only on CPU, `F32`/`BF16`/`F16` on CUDA. Resolved fully here: no
+/// residual.
+fn dry_run_gelu_erf(ctx: &DryRunCtx) -> DryRunVerdict {
+    if !ctx.encoder_reachable {
+        return DryRunVerdict::NotReached("projection_head_target_builds_no_encoder");
+    }
+    if !ctx.device_supported() {
+        return DryRunVerdict::Declines("device_is_cpu_or_cuda");
+    }
+    if ctx.is_cuda() || ctx.dtype == DtypeClass::F32 {
+        DryRunVerdict::Holds
+    } else {
+        DryRunVerdict::Declines("dtype_f32_only_on_cpu")
+    }
+}
+
+/// `attention_block_admission_predicate`,
+/// `crates/jammi-encoders/src/attention_cascade.rs`: device/dtype resolved
+/// here (CPU: F32-only; CUDA: all three, mirroring [`dry_run_gelu_erf`]'s
+/// split) — but the predicate ALSO refuses
+/// `seq_within_attention_block_max_seq` and requires a fixed
+/// `ATTENTION_BLOCK_HEAD_DIM`, both real-batch/architecture facts this
+/// dry-run does not have. See [`DryRunVerdict::DataDependent`]'s own doc
+/// for why this is stated, not rounded to `Holds`.
+fn dry_run_attention_block(ctx: &DryRunCtx) -> DryRunVerdict {
+    if !ctx.encoder_reachable {
+        return DryRunVerdict::NotReached("projection_head_target_builds_no_encoder");
+    }
+    if !ctx.device_supported() {
+        return DryRunVerdict::Declines("device_is_cpu_or_cuda");
+    }
+    let dtype_ok = ctx.is_cuda() || ctx.dtype == DtypeClass::F32;
+    if !dtype_ok {
+        return DryRunVerdict::Declines("dtype_f32_matching_between_qkv_and_mask_on_cpu");
+    }
+    DryRunVerdict::DataDependent("seq_within_attention_block_max_seq_and_fixed_head_dim")
+}
+
+/// `lora_linear_admission_predicate`,
+/// `crates/jammi-lora/src/lora_linear.rs`: device resolved here;
+/// `lora_dtype != F32` is assumed always false per that predicate's own doc
+/// ("today's workspace fact is that lora_a/lora_b are always built F32");
+/// `bias_is_frozen_leaf` is a per-BASE-CHECKPOINT fact (whether the frozen
+/// base's bias is a trainable `Var`) this dry-run cannot resolve without
+/// loading and inspecting the base model. Shared by [`DROPOUT`] and
+/// [`LOW_RANK_RESIDUAL_LINEAR`] — same dispatch decision, two report keys.
+fn dry_run_low_rank_residual_linear(ctx: &DryRunCtx) -> DryRunVerdict {
+    if !ctx.encoder_reachable {
+        return DryRunVerdict::NotReached("projection_head_target_builds_no_encoder");
+    }
+    if !ctx.device_supported() {
+        return DryRunVerdict::Declines("device_is_cpu_or_cuda");
+    }
+    DryRunVerdict::DataDependent("bias_is_frozen_leaf_depends_on_the_base_checkpoint")
+}
+
+/// `admit_cast_boundary`'s own callers (`low_rank_residual_linear.rs`'s
+/// `bwd`) only ever reach it on the `BF16`/`F16` arms of a `match
+/// base_dtype` — never `F32` — and `admit_cast_boundary` passes
+/// `predicate_holds = true` unconditionally once reached. So this op is
+/// either not reached at all (`F32` backbone) or deterministically holds
+/// (`BF16`/`F16`) — no residual either way. Shared by [`CAST_SCALE`] and
+/// [`CAST_ADD`].
+fn dry_run_cast_boundary(ctx: &DryRunCtx) -> DryRunVerdict {
+    if !ctx.encoder_reachable {
+        DryRunVerdict::NotReached("projection_head_target_builds_no_encoder")
+    } else if ctx.dtype == DtypeClass::F32 {
+        DryRunVerdict::NotReached("f32_backbone_never_reaches_the_cast_boundary")
+    } else {
+        DryRunVerdict::Holds
+    }
+}
+
+/// `fused_admission_predicate`, `crates/jammi-ai/src/fine_tune/adamw.rs`:
+/// device only — the optimizer's own tensors are F32 regardless of
+/// backbone dtype (`PROBED_OPS`'s own "the optimizer's dtype domain is not
+/// a dtype class" doc), and the trainer always reaches the optimizer step,
+/// `ProjectionHead` target included (unlike every encoder op, no
+/// `encoder_reachable` gate here).
+fn dry_run_adamw_step(ctx: &DryRunCtx) -> DryRunVerdict {
+    if ctx.device_supported() {
+        DryRunVerdict::Holds
+    } else {
+        DryRunVerdict::Declines("device_is_cpu_or_cuda")
+    }
+}
+
+/// `mem_efficient_attention_predicate`, `attention_cascade.rs`: device/dtype
+/// resolved here (identical CPU/CUDA split to [`dry_run_attention_block`]);
+/// its admission is EXCLUSIVELY seq-dependent beyond that (`seq <=
+/// ATTENTION_BLOCK_MAX_SEQ` declines — this op exists as the large-`seq`
+/// arm `attention_block` cannot serve — and it also declines whenever the
+/// flash cascade already fused).
+fn dry_run_mem_efficient_attention(ctx: &DryRunCtx) -> DryRunVerdict {
+    if !ctx.encoder_reachable {
+        return DryRunVerdict::NotReached("projection_head_target_builds_no_encoder");
+    }
+    if !ctx.device_supported() {
+        return DryRunVerdict::Declines("device_is_cpu_or_cuda");
+    }
+    let dtype_ok = ctx.is_cuda() || ctx.dtype == DtypeClass::F32;
+    if !dtype_ok {
+        return DryRunVerdict::Declines("dtype_f32_only_on_cpu");
+    }
+    DryRunVerdict::DataDependent("seq_within_attention_block_max_seq_and_flash_outcome")
+}
+
+/// The cascade's own compiled/device short-circuit ([`CUDA_COMPILED`]/
+/// [`FLASH_COMPILED`], this run's device kind) is fully resolved here —
+/// #546's own literally-named defect (two CUDA builds differing only in
+/// `--features flash-attn`) is closed by THIS fn alone. Beyond that gate,
+/// the real cascade decision is real-batch shape/seq dependent — genuinely
+/// singular for THIS op.
+fn dry_run_attention_block_flash(ctx: &DryRunCtx) -> DryRunVerdict {
+    if !ctx.encoder_reachable {
+        return DryRunVerdict::NotReached("projection_head_target_builds_no_encoder");
+    }
+    if !CUDA_COMPILED {
+        return DryRunVerdict::Declines("cuda_not_compiled");
+    }
+    if !FLASH_COMPILED {
+        return DryRunVerdict::Declines("flash_not_compiled");
+    }
+    if !ctx.is_cuda() {
+        return DryRunVerdict::Declines("device_is_cpu_or_metal_not_cuda");
+    }
+    DryRunVerdict::DataDependent("real_batch_shape_and_sequence_length")
+}
+
+/// [`ProbedOpKind::InternalSubkernel`] rows ([`ROPE_POSITIONS`],
+/// [`SCALED_CAST_ADD`]) carry no registry key and no independent
+/// admission — their execution is proven only by their `parent`'s fused
+/// arm dispatching. Every [`ProbedOp`] instance needs a `dry_run` fn (a
+/// required struct field), so these two get one that states that plainly;
+/// callers filter `InternalSubkernel` rows out of any rendered profile by
+/// `kind`, never by re-checking this verdict.
+fn dry_run_internal_subkernel(_ctx: &DryRunCtx) -> DryRunVerdict {
+    DryRunVerdict::NotReached(
+        "internal_subkernel_carries_no_independent_admission_the_parents_fused_dispatch_proves_it",
+    )
+}
+
 /// One row of [`PROBED_OPS`]: a dtype-neutral report key, how its dispatch
-/// is observable, and the registry key(s) its kernel's own `admit()` /
-/// `admit_cascade()` call site passes, per dtype class.
+/// is observable, the registry key(s) its kernel's own `admit()` /
+/// `admit_cascade()` call site passes per dtype class, and this row's OWN
+/// deterministic, pre-training dry-run verdict function.
 #[derive(Debug, Clone, Copy)]
 pub struct ProbedOp {
     /// The dtype-NEUTRAL key this op appears under in a durable acceleration
@@ -1766,6 +2040,17 @@ pub struct ProbedOp {
     /// passes to [`admit`]/[`admit_cascade`], reused VERBATIM. Empty for a
     /// [`ProbedOpKind::InternalSubkernel`], which has no key at all.
     pub registry: &'static [(DtypeClass, &'static str)],
+    /// This row's own deterministic, pre-training dry-run verdict function
+    /// (#546, wave-5 second pressure round) — moved onto the row itself so
+    /// a new [`PROBED_OPS`] row cannot exist without a `dry_run` fn (a
+    /// missing field in a struct literal does not compile), replacing a
+    /// SECOND, string-keyed enumeration of these same ops that used to live
+    /// in `jammi-ai` as a `match report_key { "layer_norm" => ..., ... }` —
+    /// a rival enumeration a test could only check was complete at runtime.
+    /// `jammi-ai`'s `dry_run_admission_profile`-shaped caller is now
+    /// `PROBED_OPS.iter().map(|op| (op.report_key, (op.dry_run)(ctx)))` —
+    /// no match over `report_key` anywhere in that crate.
+    pub dry_run: fn(&DryRunCtx) -> DryRunVerdict,
 }
 
 impl ProbedOp {
@@ -1931,31 +2216,37 @@ pub const LAYER_NORM: ProbedOp = ProbedOp {
     report_key: "layer_norm",
     kind: ProbedOpKind::TwoArm,
     registry: &[(DtypeClass::Any, "layer_norm_fused")],
+    dry_run: dry_run_uniform_device_gate,
 };
 pub const ROPE: ProbedOp = ProbedOp {
     report_key: "rope",
     kind: ProbedOpKind::TwoArm,
     registry: &[(DtypeClass::Any, "rope_fused")],
+    dry_run: dry_run_uniform_device_gate,
 };
 pub const SOFTMAX: ProbedOp = ProbedOp {
     report_key: "softmax",
     kind: ProbedOpKind::TwoArm,
     registry: &[(DtypeClass::Any, "softmax_last_dim_fused")],
+    dry_run: dry_run_uniform_device_gate,
 };
 pub const GEGLU: ProbedOp = ProbedOp {
     report_key: "geglu",
     kind: ProbedOpKind::TwoArm,
     registry: &[(DtypeClass::Any, "geglu_fused")],
+    dry_run: dry_run_uniform_device_gate,
 };
 pub const GELU_ERF: ProbedOp = ProbedOp {
     report_key: "gelu_erf",
     kind: ProbedOpKind::TwoArm,
     registry: &[(DtypeClass::Any, "gelu_erf_fused")],
+    dry_run: dry_run_gelu_erf,
 };
 pub const ATTENTION_BLOCK: ProbedOp = ProbedOp {
     report_key: "attention_block",
     kind: ProbedOpKind::TwoArm,
     registry: &[(DtypeClass::Any, "attention_block_fused")],
+    dry_run: dry_run_attention_block,
 };
 /// The `dropout` REPORT row — same dispatch decision as
 /// [`LOW_RANK_RESIDUAL_LINEAR`] (both are `lora_linear_fused`, one dispatch,
@@ -1966,6 +2257,7 @@ pub const DROPOUT: ProbedOp = ProbedOp {
     report_key: "dropout",
     kind: ProbedOpKind::TwoArm,
     registry: &[(DtypeClass::Any, "lora_linear_fused")],
+    dry_run: dry_run_low_rank_residual_linear,
 };
 /// The call-site-facing const for `lora_linear_fused` — `jammi-lora`'s
 /// `lora_linear.rs` admits under this one.
@@ -1973,6 +2265,7 @@ pub const LOW_RANK_RESIDUAL_LINEAR: ProbedOp = ProbedOp {
     report_key: "low_rank_residual_linear",
     kind: ProbedOpKind::TwoArm,
     registry: &[(DtypeClass::Any, "lora_linear_fused")],
+    dry_run: dry_run_low_rank_residual_linear,
 };
 pub const CAST_SCALE: ProbedOp = ProbedOp {
     report_key: "cast_scale",
@@ -1981,6 +2274,7 @@ pub const CAST_SCALE: ProbedOp = ProbedOp {
         (DtypeClass::Bf16, "cast_scale_bf16_f32"),
         (DtypeClass::F16, "cast_scale_f16_f32"),
     ],
+    dry_run: dry_run_cast_boundary,
 };
 pub const CAST_ADD: ProbedOp = ProbedOp {
     report_key: "cast_add",
@@ -1989,6 +2283,7 @@ pub const CAST_ADD: ProbedOp = ProbedOp {
         (DtypeClass::Bf16, "cast_add_bf16"),
         (DtypeClass::F16, "cast_add_f16"),
     ],
+    dry_run: dry_run_cast_boundary,
 };
 pub const ADAMW_STEP: ProbedOp = ProbedOp {
     report_key: "adamw_step",
@@ -1998,11 +2293,13 @@ pub const ADAMW_STEP: ProbedOp = ProbedOp {
     // F32-only; the JOB's backbone dtype is a different axis, and it is
     // the job's that `DtypeClass` selects on.
     registry: &[(DtypeClass::Any, "adamw_step_fused")],
+    dry_run: dry_run_adamw_step,
 };
 pub const MEM_EFFICIENT_ATTENTION: ProbedOp = ProbedOp {
     report_key: "mem_efficient_attention",
     kind: ProbedOpKind::Cascade,
     registry: &[(DtypeClass::Any, "mem_efficient_attention")],
+    dry_run: dry_run_mem_efficient_attention,
 };
 /// See this constant's sibling doc paragraph above ("`attention_block_flash`
 /// IS a row") for why this row exists at all (#546 F3).
@@ -2010,6 +2307,7 @@ pub const ATTENTION_BLOCK_FLASH: ProbedOp = ProbedOp {
     report_key: "attention_block_flash",
     kind: ProbedOpKind::Cascade,
     registry: &[(DtypeClass::Any, "attention_block_flash")],
+    dry_run: dry_run_attention_block_flash,
 };
 pub const ROPE_POSITIONS: ProbedOp = ProbedOp {
     report_key: "rope_positions",
@@ -2017,6 +2315,7 @@ pub const ROPE_POSITIONS: ProbedOp = ProbedOp {
         parent: "attention_block_flash",
     },
     registry: &[],
+    dry_run: dry_run_internal_subkernel,
 };
 pub const SCALED_CAST_ADD: ProbedOp = ProbedOp {
     report_key: "scaled_cast_add",
@@ -2024,6 +2323,7 @@ pub const SCALED_CAST_ADD: ProbedOp = ProbedOp {
         parent: "low_rank_residual_linear",
     },
     registry: &[],
+    dry_run: dry_run_internal_subkernel,
 };
 
 pub const PROBED_OPS: &[ProbedOp] = &[
@@ -2049,6 +2349,33 @@ pub fn probed_op(report_key: &str) -> Option<&'static ProbedOp> {
     PROBED_OPS.iter().find(|op| op.report_key == report_key)
 }
 
+/// Every non-[`ProbedOpKind::InternalSubkernel`] [`PROBED_OPS`] row's OWN
+/// dry-run verdict, keyed by `report_key` — the exact enumeration
+/// `jammi-ai`'s `dry_run_admission_profile` renders into a profile string.
+///
+/// **Lives here, not in `jammi-ai`, on purpose.** The `(op.dry_run)(ctx)`
+/// fn-pointer struct-field call this loop makes is EXACTLY the shape
+/// `jammi-ai/tests/it/pinned_source_gate.rs`'s
+/// `fine_tune_reachable_sites_are_all_reviewed` call-graph oracle traces
+/// and fails closed on when it cannot find a `dry_run: ...` assignment
+/// anywhere in ITS OWN traced universe (`jammi-db`/`jammi-ai`'s
+/// reverse-dependency closure within the workspace, that gate's own
+/// documented "binding surface" — `jammi-kernels` is a FORWARD dependency
+/// of both, correctly outside it). Every `dry_run: ...` assignment IS
+/// here, in [`PROBED_OPS`]'s own const declarations — so keeping the
+/// dispatch loop here too means the fn-pointer call and its every
+/// assignment live in the SAME file the gate never scans, rather than
+/// asking that gate to special-case a crate outside its own documented
+/// universe, or asking `jammi-ai` to carry a call shape that crate's own
+/// reachability oracle cannot resolve.
+pub fn dry_run_all(ctx: &DryRunCtx) -> std::collections::BTreeMap<&'static str, DryRunVerdict> {
+    PROBED_OPS
+        .iter()
+        .filter(|op| !matches!(op.kind, ProbedOpKind::InternalSubkernel { .. }))
+        .map(|op| (op.report_key, (op.dry_run)(ctx)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2067,12 +2394,23 @@ mod tests {
     /// expands the literal INLINE at each `const OP: ProbedOp =
     /// test_two_arm!("...")`  call, so promotion sees the same shape as a
     /// hand-written literal.
+    /// A `dry_run` fn for a fixture [`ProbedOp`] whose admission-mechanism
+    /// test never exercises the dry-run system at all — every `test_two_arm`/
+    /// `test_cascade` row needs SOME value for the field (it is required),
+    /// and `Holds` is the least surprising placeholder for a row that
+    /// exists purely to drive `admit`/`admit_cascade`'s own gate-order and
+    /// counter tests.
+    fn dry_run_test_fixture(_ctx: &DryRunCtx) -> DryRunVerdict {
+        DryRunVerdict::Holds
+    }
+
     macro_rules! test_two_arm {
         ($key:expr) => {
             ProbedOp {
                 report_key: $key,
                 kind: ProbedOpKind::TwoArm,
                 registry: &[(DtypeClass::Any, $key)],
+                dry_run: dry_run_test_fixture,
             }
         };
     }
@@ -2085,6 +2423,7 @@ mod tests {
                 report_key: $key,
                 kind: ProbedOpKind::Cascade,
                 registry: &[(DtypeClass::Any, $key)],
+                dry_run: dry_run_test_fixture,
             }
         };
     }

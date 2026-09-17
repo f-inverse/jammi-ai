@@ -805,8 +805,8 @@ fn ops_keys(report: &serde_json::Value) -> std::collections::BTreeSet<String> {
 /// before/after delta on `cast_scale_f16_f32` / `cast_add_f16` — the exact
 /// registry keys the table names for `DtypeClass::F16` — actually moved,
 /// i.e. if some workspace call site really does resolve to those keys
-/// (`"cast_scale_f16_f32"`, `crates/jammi-kernels/src/admission.rs:1982`, and
-/// `"cast_add_f16"`, `crates/jammi-kernels/src/admission.rs:1990`,
+/// (`"cast_scale_f16_f32"`, `crates/jammi-kernels/src/admission.rs:2275`, and
+/// `"cast_add_f16"`, `crates/jammi-kernels/src/admission.rs:2284`,
 /// both reached from `LowRankResidualLinear::bwd`'s `admit_cast_boundary(&CAST_SCALE, DtypeClass::F16, ..)`/
 /// `admit_cast_boundary(&CAST_ADD, DtypeClass::F16, ..)` calls, #546 F3's typed migration, during
 /// the probe's backward pass). Before the fix the shipped table named only

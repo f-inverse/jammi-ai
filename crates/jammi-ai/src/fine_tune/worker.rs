@@ -3977,8 +3977,8 @@ impl JobWorker {
             // where this unit's "seq is the only residual" framing does
             // NOT hold for the real predicates.
             let dtype = dtype_class_of(common.config.backbone_dtype);
-            let ctx = DryRunCtx {
-                device_kind: device.kind(),
+            let ctx = jammi_kernels::admission::DryRunCtx {
+                device_kind: kernels_device_kind(device.kind()),
                 dtype,
                 encoder_reachable: !common.config.target_modules.is_empty(),
             };
@@ -9002,318 +9002,50 @@ fn reason_from_probe_window(
         .to_string()
 }
 
-/// #546's DETERMINISTIC, PRE-TRAINING inputs (wave-5 F3): build features,
-/// this attempt's resolved device kind, its backbone dtype class, and
-/// whether the ENCODER arm is even reachable at all (a `target_modules`-empty
-/// `ProjectionHead` run never builds an encoder — see `train_fine_tune`,
-/// `TrainingTarget::ProjectionHead` — so every encoder op is
-/// [`DryRunVerdict::NotReached`] for such a run, never merely undetermined).
-/// Everything [`dry_run_admission_profile`] needs and nothing else — no
-/// tensor, no catalog handle, no I/O.
-#[derive(Debug, Clone, Copy)]
-struct DryRunCtx {
-    device_kind: jammi_db::store::manifest::ComputeDeviceKind,
-    dtype: jammi_kernels::admission::DtypeClass,
-    /// `!config.target_modules.is_empty()` — the SAME predicate
-    /// `train_fine_tune` itself branches on to decide `ProjectionHead` vs
-    /// `EncoderAdapters`.
-    encoder_reachable: bool,
-}
-
-impl DryRunCtx {
-    /// [`jammi_kernels::admission::device_is_supported`]'s own rule
-    /// (`d.is_cpu() || (cfg!(feature = "cuda") && d.is_cuda())`), restated
-    /// over [`jammi_db::store::manifest::ComputeDeviceKind`] rather than a
-    /// real `candle_core::Device` — the SAME two build/device facts, read
-    /// without ever constructing one.
-    fn device_supported(self) -> bool {
-        use jammi_db::store::manifest::ComputeDeviceKind;
-        match self.device_kind {
-            ComputeDeviceKind::Cpu => true,
-            ComputeDeviceKind::Cuda => jammi_kernels::admission::CUDA_COMPILED,
-            ComputeDeviceKind::Metal => false,
-        }
-    }
-
-    fn is_cuda(self) -> bool {
-        self.device_kind == jammi_db::store::manifest::ComputeDeviceKind::Cuda
-            && jammi_kernels::admission::CUDA_COMPILED
+/// Converts a `jammi_db::store::manifest::ComputeDeviceKind` to the
+/// dependency-free `jammi_kernels::admission::DeviceKind` a
+/// [`jammi_kernels::admission::DryRunCtx`] needs — `jammi-kernels` has no
+/// `jammi-*` dependency of its own (a leaf crate), so this conversion lives
+/// here, in the one crate that has both types in scope, rather than in
+/// either of them.
+fn kernels_device_kind(
+    kind: jammi_db::store::manifest::ComputeDeviceKind,
+) -> jammi_kernels::admission::DeviceKind {
+    use jammi_db::store::manifest::ComputeDeviceKind;
+    match kind {
+        ComputeDeviceKind::Cpu => jammi_kernels::admission::DeviceKind::Cpu,
+        ComputeDeviceKind::Cuda => jammi_kernels::admission::DeviceKind::Cuda,
+        ComputeDeviceKind::Metal => jammi_kernels::admission::DeviceKind::Metal,
     }
 }
 
-/// One [`jammi_kernels::admission::PROBED_OPS`] row's deterministic,
-/// pre-training admission verdict (#546 F3) — a pure function of
-/// [`DryRunCtx`], never a real tensor, never a dispatch counter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DryRunVerdict {
-    /// Every gate this dry-run can resolve holds; no further domain
-    /// condition this dry-run lacks the data to resolve exists FOR THIS OP
-    /// (contrast [`Self::DataDependent`]).
-    Holds,
-    /// A gate this dry-run CAN resolve fully (device support, a build
-    /// feature, a dtype domain) refuses — names which one.
-    Declines(&'static str),
-    /// This op's real call site is never reached for this job's config at
-    /// all: an encoder op under a `ProjectionHead` target, or
-    /// `cast_scale`/`cast_add` for an `F32` backbone (their own call sites,
-    /// `low_rank_residual_linear.rs`'s `bwd`, only ever reach
-    /// `admit_cast_boundary` on the `BF16`/`F16` arms of a `match
-    /// base_dtype`).
-    NotReached(&'static str),
-    /// Every gate this dry-run CAN resolve holds, but the REAL predicate
-    /// also checks a condition this dry-run has no data for (a real batch's
-    /// sequence length, a real base checkpoint's own bias shape) — named
-    /// explicitly, never silently rounded up to [`Self::Holds`].
-    ///
-    /// **This variant is why F3's "the data-dependent `seq` arm is the ONLY
-    /// stated residual" does not hold for the real predicates, read
-    /// directly rather than taken on trust (COMMON.md's "check deviations
-    /// yourself"):** `attention_block_admission_predicate` ALSO refuses on
-    /// `seq_within_attention_block_max_seq` (`attention_cascade.rs`);
-    /// `mem_efficient_attention_predicate`'s ENTIRE admission is gated on
-    /// `seq <= ATTENTION_BLOCK_MAX_SEQ` (`attention_cascade.rs`) — it
-    /// exists specifically as the large-`seq` arm `attention_block` cannot
-    /// serve; and `lora_linear_admission_predicate` refuses
-    /// `bias_is_frozen_leaf` for a base checkpoint whose bias is a
-    /// trainable `Var` rather than frozen (`lora_linear.rs`) — a
-    /// per-CHECKPOINT fact this dry-run has no principled way to resolve
-    /// without loading and inspecting the base model's own bias tensor
-    /// (out of scope for a "no I/O" pre-training fold). Each is stated
-    /// here, not silently folded into [`Self::Holds`].
-    DataDependent(&'static str),
-}
-
-impl DryRunVerdict {
-    /// The profile string's per-op value — `"holds"`, `"declines:{reason}"`,
-    /// `"not_reached:{reason}"`, or `"data_dependent:{reason}"`. A plain,
-    /// grep-able tag rather than nested JSON, so two profiles differing in
-    /// exactly one op's verdict differ in exactly one substring.
-    fn render(self) -> String {
-        match self {
-            DryRunVerdict::Holds => "holds".to_string(),
-            DryRunVerdict::Declines(r) => format!("declines:{r}"),
-            DryRunVerdict::NotReached(r) => format!("not_reached:{r}"),
-            DryRunVerdict::DataDependent(r) => format!("data_dependent:{r}"),
-        }
-    }
-}
-
-/// The dry-run verdict for the [`jammi_kernels::admission::PROBED_OPS`] row
-/// named `report_key`, derived from that row's OWN real predicate function
-/// (cited per arm below) — never a fresh re-derivation of admission logic
-/// this module invents independently. `InternalSubkernel` rows
-/// (`rope_positions`, `scaled_cast_add`) are never passed here: they carry
-/// no registry key of their own (`ProbedOpKind::InternalSubkernel`'s own
-/// doc), so [`dry_run_admission_profile`] never calls this for them.
+/// #546's canonical, sorted-key `kernel_admission_profile` string (wave-5
+/// second pressure round) folded into
+/// [`jammi_db::store::manifest::MaterializationEnv::kernel_admission_profile`]:
+/// one entry per [`jammi_kernels::admission::PROBED_OPS`] row whose
+/// [`jammi_kernels::admission::ProbedOpKind`] is `TwoArm` or `Cascade` (an
+/// `InternalSubkernel` row carries no registry key of its own and no
+/// independent admission — filtered by `kind`, never by `report_key`),
+/// valued by that row's OWN `dry_run` fn
+/// ([`jammi_kernels::admission::DryRunVerdict::render`]). Plus the two
+/// build-feature booleans explicitly (never left implicit in a verdict's
+/// reason string alone), so a build differing only in a feature moves this
+/// string even in an edge case where every verdict's rendered text happened
+/// to coincide.
 ///
-/// # Panics
-/// On a `report_key` this match does not name. The completeness proof is
-/// [`dry_run_admission_profile`]'s own doc and its paired test
-/// (`dry_run_admission_profile_enumerates_every_probed_ops_key`): a new
-/// `TwoArm`/`Cascade` `PROBED_OPS` row with no arm here panics the FIRST
-/// time this runs (any test exercising it, or a live job), which is the
-/// honest failure mode for an enumeration this module cannot make the
-/// compiler refuse on its own (`report_key` is a runtime string, not a
-/// closed Rust type — see I1's own "honest syntactic half" for the SAME
-/// limitation stated plainly rather than oversold).
-fn dry_run_verdict(report_key: &str, ctx: &DryRunCtx) -> DryRunVerdict {
-    use jammi_kernels::admission::DtypeClass;
-    // The uniform "device-supported, dtype in {F32,BF16,F16} on either
-    // device" shape every row in this arm's real predicate shares
-    // (`fused_admission_predicate` layer_norm.rs, `rope_admission_predicate`
-    // modernbert.rs, `softmax_admission_predicate`/
-    // `attention_block_admission_predicate`... no: attention_block is CPU-F32-only,
-    // handled in its own arm below) — `DtypeClass` only ever names F32/Bf16/
-    // F16 (`jammi_numerics::ComputePrecision`'s own three variants), so the
-    // dtype half of this gate is trivially always satisfied; only the
-    // device half can refuse.
-    let uniform_device_gate = || {
-        if !ctx.encoder_reachable {
-            return DryRunVerdict::NotReached("projection_head_target_builds_no_encoder");
-        }
-        if ctx.device_supported() {
-            DryRunVerdict::Holds
-        } else {
-            DryRunVerdict::Declines("device_is_cpu_or_cuda")
-        }
-    };
-    match report_key {
-        // `fused_admission_predicate`, `crates/jammi-encoders/src/layer_norm.rs`:
-        // device + dtype only (F32/BF16/F16 uniform on CPU and CUDA); the
-        // remaining contiguity/rank/`MAX_HIDDEN` checks hold for every
-        // shape this trainer's own tower construction ever produces
-        // (assumed, not independently re-verified per shape here).
-        "layer_norm" => uniform_device_gate(),
-        // `rope_admission_predicate`, `modernbert.rs`: same uniform shape.
-        "rope" => uniform_device_gate(),
-        // `softmax_admission_predicate`, `attention_cascade.rs`: same
-        // uniform device/dtype shape (its rank/last-dim/`mask_broadcast_class`
-        // checks are the same "assumed satisfied by this trainer's own
-        // construction" simplification as layer_norm's).
-        "softmax" => uniform_device_gate(),
-        // `geglu_admission_predicate`, `modernbert.rs`: same uniform shape
-        // (F16 accepted on CPU too — `geglu_admission_predicate_now_accepts_f16`).
-        "geglu" => uniform_device_gate(),
-        // `gelu_admission_predicate`, `activations.rs`: the ONE two-arm op
-        // whose dtype domain genuinely differs BY DEVICE — `F32`-only on
-        // CPU, `F32`/`BF16`/`F16` on CUDA. Resolved fully here: no residual.
-        "gelu_erf" => {
-            if !ctx.encoder_reachable {
-                return DryRunVerdict::NotReached("projection_head_target_builds_no_encoder");
-            }
-            if !ctx.device_supported() {
-                return DryRunVerdict::Declines("device_is_cpu_or_cuda");
-            }
-            if ctx.is_cuda() || ctx.dtype == DtypeClass::F32 {
-                DryRunVerdict::Holds
-            } else {
-                DryRunVerdict::Declines("dtype_f32_only_on_cpu")
-            }
-        }
-        // `attention_block_admission_predicate`, `attention_cascade.rs`:
-        // device/dtype resolved here (CPU: F32-only; CUDA: all three,
-        // mirroring `gelu_erf`'s split) — but the predicate ALSO refuses
-        // `seq_within_attention_block_max_seq` and requires a fixed
-        // `ATTENTION_BLOCK_HEAD_DIM`, both real-batch/architecture facts
-        // this dry-run does not have. See `DryRunVerdict::DataDependent`'s
-        // own doc for why this is stated, not rounded to `Holds`.
-        "attention_block" => {
-            if !ctx.encoder_reachable {
-                return DryRunVerdict::NotReached("projection_head_target_builds_no_encoder");
-            }
-            if !ctx.device_supported() {
-                return DryRunVerdict::Declines("device_is_cpu_or_cuda");
-            }
-            let dtype_ok = ctx.is_cuda() || ctx.dtype == DtypeClass::F32;
-            if !dtype_ok {
-                return DryRunVerdict::Declines("dtype_f32_matching_between_qkv_and_mask_on_cpu");
-            }
-            DryRunVerdict::DataDependent("seq_within_attention_block_max_seq_and_fixed_head_dim")
-        }
-        // `lora_linear_admission_predicate`, `crates/jammi-lora/src/lora_linear.rs`:
-        // device resolved here; `lora_dtype != F32` is assumed always false
-        // per that predicate's own doc ("today's workspace fact is that
-        // lora_a/lora_b are always built F32"); `bias_is_frozen_leaf` is a
-        // per-BASE-CHECKPOINT fact (whether the frozen base's bias is a
-        // trainable `Var`) this dry-run cannot resolve without loading and
-        // inspecting the base model.
-        "dropout" | "low_rank_residual_linear" => {
-            if !ctx.encoder_reachable {
-                return DryRunVerdict::NotReached("projection_head_target_builds_no_encoder");
-            }
-            if !ctx.device_supported() {
-                return DryRunVerdict::Declines("device_is_cpu_or_cuda");
-            }
-            DryRunVerdict::DataDependent("bias_is_frozen_leaf_depends_on_the_base_checkpoint")
-        }
-        // `admit_cast_boundary`'s own callers (`low_rank_residual_linear.rs`'s
-        // `bwd`) only ever reach it on the `BF16`/`F16` arms of a `match
-        // base_dtype` — never `F32` — and `admit_cast_boundary` passes
-        // `predicate_holds = true` UNCONDITIONALLY once reached (that
-        // function's own doc: making it a real check "would only change
-        // behaviour on a branch already proven unreachable"). So this op is
-        // either not reached at all (`F32` backbone) or deterministically
-        // holds (`BF16`/`F16`) — no residual either way.
-        "cast_scale" | "cast_add" => {
-            if !ctx.encoder_reachable {
-                DryRunVerdict::NotReached("projection_head_target_builds_no_encoder")
-            } else if ctx.dtype == DtypeClass::F32 {
-                DryRunVerdict::NotReached("f32_backbone_never_reaches_the_cast_boundary")
-            } else {
-                DryRunVerdict::Holds
-            }
-        }
-        // `fused_admission_predicate`, `crates/jammi-ai/src/fine_tune/adamw.rs`:
-        // device only — the optimizer's own tensors are F32 regardless of
-        // backbone dtype (`PROBED_OPS`'s own "the optimizer's dtype domain
-        // is not a dtype class" doc), and the trainer always reaches the
-        // optimizer step, `ProjectionHead` target included.
-        "adamw_step" => {
-            if ctx.device_supported() {
-                DryRunVerdict::Holds
-            } else {
-                DryRunVerdict::Declines("device_is_cpu_or_cuda")
-            }
-        }
-        // `mem_efficient_attention_predicate`, `attention_cascade.rs`:
-        // device/dtype resolved here (identical CPU/CUDA split to
-        // `attention_block`); its admission is EXCLUSIVELY seq-dependent
-        // beyond that (`seq <= ATTENTION_BLOCK_MAX_SEQ` declines — this op
-        // exists as the large-`seq` arm `attention_block` cannot serve —
-        // and it also declines whenever the flash cascade already fused).
-        "mem_efficient_attention" => {
-            if !ctx.encoder_reachable {
-                return DryRunVerdict::NotReached("projection_head_target_builds_no_encoder");
-            }
-            if !ctx.device_supported() {
-                return DryRunVerdict::Declines("device_is_cpu_or_cuda");
-            }
-            let dtype_ok = ctx.is_cuda() || ctx.dtype == DtypeClass::F32;
-            if !dtype_ok {
-                return DryRunVerdict::Declines("dtype_f32_only_on_cpu");
-            }
-            DryRunVerdict::DataDependent("seq_within_attention_block_max_seq_and_flash_outcome")
-        }
-        // The cascade's own compiled/device short-circuit
-        // (`jammi_kernels::admission::CUDA_COMPILED`/`FLASH_COMPILED`, this
-        // run's device kind) is fully resolved here — #546's own literally-
-        // named defect (two CUDA builds differing only in `--features
-        // flash-attn`) is closed by THIS arm alone. Beyond that gate, the
-        // real cascade decision is real-batch shape/seq dependent (F3's own
-        // named residual, genuinely singular for THIS op).
-        "attention_block_flash" => {
-            if !ctx.encoder_reachable {
-                return DryRunVerdict::NotReached("projection_head_target_builds_no_encoder");
-            }
-            if !jammi_kernels::admission::CUDA_COMPILED {
-                return DryRunVerdict::Declines("cuda_not_compiled");
-            }
-            if !jammi_kernels::admission::FLASH_COMPILED {
-                return DryRunVerdict::Declines("flash_not_compiled");
-            }
-            if !ctx.is_cuda() {
-                return DryRunVerdict::Declines("device_is_cpu_or_metal_not_cuda");
-            }
-            DryRunVerdict::DataDependent("real_batch_shape_and_sequence_length")
-        }
-        other => panic!(
-            "dry_run_verdict: no arm for PROBED_OPS report_key {other:?} — add one (see this \
-             fn's own panic doc)"
-        ),
-    }
-}
-
-/// The canonical, sorted-key `kernel_admission_profile` string #546 folds
-/// into [`jammi_db::store::manifest::MaterializationEnv::kernel_admission_profile`]
-/// (wave-5 F3): one entry per [`jammi_kernels::admission::PROBED_OPS`] row
-/// whose [`jammi_kernels::admission::ProbedOpKind`] is `TwoArm` or
-/// `Cascade` (an `InternalSubkernel` row carries no registry key of its
-/// own — its execution is implied by its parent's dispatch, never an
-/// independent admission decision — so it is never a key here), keyed by
-/// `report_key` and valued by [`dry_run_verdict`]'s
-/// [`DryRunVerdict::render`]. Plus the two build-feature booleans
-/// explicitly (never left implicit in a verdict's reason string alone), so
-/// a build differing only in a feature moves this string even in an edge
-/// case where every verdict's rendered text happened to coincide.
-///
-/// **Completeness, proved by the paired test, not by this function's own
-/// shape**: `dry_run_admission_profile_enumerates_every_probed_ops_key`
-/// reads the REAL, linked-in `PROBED_OPS` constant and asserts this
-/// profile's key set equals exactly its `TwoArm`/`Cascade` report keys — a
-/// new row with no [`dry_run_verdict`] arm reds that test (and panics on
-/// first use, per that function's own panic doc) rather than silently
-/// missing from every profile ever computed from that point on.
-fn dry_run_admission_profile(ctx: &DryRunCtx) -> String {
-    let mut ops: std::collections::BTreeMap<&str, String> = std::collections::BTreeMap::new();
-    for op in jammi_kernels::admission::PROBED_OPS {
-        if matches!(
-            op.kind,
-            jammi_kernels::admission::ProbedOpKind::InternalSubkernel { .. }
-        ) {
-            continue;
-        }
-        ops.insert(op.report_key, dry_run_verdict(op.report_key, ctx).render());
-    }
+/// **By construction, not by a match this crate maintains**: this function
+/// renders [`jammi_kernels::admission::dry_run_all`]'s own map — no `match
+/// report_key { "layer_norm" => ..., ... }` anywhere in this crate, and no
+/// `(op.dry_run)(ctx)` fn-pointer call in this crate's own source either
+/// (`dry_run_all`'s own doc has why that call lives in `jammi-kernels`,
+/// not here). A new `PROBED_OPS` row with no `dry_run` fn does not compile
+/// (a required struct field), so this profile cannot silently omit a row
+/// the way a second, string-keyed enumeration could.
+fn dry_run_admission_profile(ctx: &jammi_kernels::admission::DryRunCtx) -> String {
+    let ops: std::collections::BTreeMap<&str, String> = jammi_kernels::admission::dry_run_all(ctx)
+        .into_iter()
+        .map(|(key, verdict)| (key, verdict.render()))
+        .collect();
     serde_json::json!({
         "cuda_compiled": jammi_kernels::admission::CUDA_COMPILED,
         "flash_compiled": jammi_kernels::admission::FLASH_COMPILED,
@@ -10831,16 +10563,18 @@ mod tests {
         );
     }
 
-    /// #546's completeness proof (wave-5 F3): `dry_run_admission_profile`'s
-    /// `ops` key set must equal EXACTLY the `TwoArm`/`Cascade` report keys
-    /// the REAL, linked-in `PROBED_OPS` names — read live off the constant,
-    /// never a hand-copied list, so a new row with no `dry_run_verdict` arm
-    /// (which panics the first time it runs) is caught here too, at a
-    /// fixed `DryRunCtx` this test controls.
+    /// #546's completeness proof (wave-5 second pressure round):
+    /// `dry_run_admission_profile`'s `ops` key set must equal EXACTLY the
+    /// `TwoArm`/`Cascade` report keys the REAL, linked-in `PROBED_OPS`
+    /// names — read live off the constant, never a hand-copied list. Since
+    /// `dry_run` is now a REQUIRED field of `ProbedOp`, a new row with no
+    /// verdict fn does not compile at all (the stronger, by-construction
+    /// version of what this test used to have to catch at runtime); this
+    /// test still pins the SET, at a fixed `DryRunCtx` it controls.
     #[test]
     fn dry_run_admission_profile_enumerates_every_probed_ops_key() {
-        let ctx = DryRunCtx {
-            device_kind: jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+        let ctx = jammi_kernels::admission::DryRunCtx {
+            device_kind: jammi_kernels::admission::DeviceKind::Cuda,
             dtype: jammi_kernels::admission::DtypeClass::Bf16,
             encoder_reachable: true,
         };
@@ -10863,8 +10597,8 @@ mod tests {
         assert_eq!(
             got, want,
             "the profile's key set must equal PROBED_OPS's TwoArm/Cascade report keys exactly — \
-             a mismatch means a row was added without a dry_run_verdict arm, or a stale key \
-             survives a row's removal"
+             a mismatch means a stale key survives a row's removal (a NEW row with no dry_run \
+             fn cannot compile at all, so that half of this drift is no longer reachable)"
         );
     }
 
@@ -10875,8 +10609,8 @@ mod tests {
     /// above) while carrying no honest information.
     #[test]
     fn dry_run_admission_profile_every_value_is_a_known_tag() {
-        let ctx = DryRunCtx {
-            device_kind: jammi_db::store::manifest::ComputeDeviceKind::Cpu,
+        let ctx = jammi_kernels::admission::DryRunCtx {
+            device_kind: jammi_kernels::admission::DeviceKind::Cpu,
             dtype: jammi_kernels::admission::DtypeClass::F32,
             encoder_reachable: false,
         };
@@ -10902,8 +10636,8 @@ mod tests {
     /// collide on one profile string.
     #[test]
     fn projection_head_target_marks_every_encoder_op_not_reached() {
-        let ctx = DryRunCtx {
-            device_kind: jammi_db::store::manifest::ComputeDeviceKind::Cpu,
+        let ctx = jammi_kernels::admission::DryRunCtx {
+            device_kind: jammi_kernels::admission::DeviceKind::Cpu,
             dtype: jammi_kernels::admission::DtypeClass::F32,
             encoder_reachable: false,
         };
@@ -10933,43 +10667,27 @@ mod tests {
 
     /// #546's own literally-named defect, closed: two contexts differing
     /// ONLY in a build feature (`CUDA_COMPILED` here, standing in for
-    /// `--features cuda`/`flash-attn` — driven hermetically by feeding
-    /// `dry_run_verdict` the feature constant directly rather than an
-    /// actual two-build CI matrix, exactly as F3 asks) move
-    /// `attention_block_flash`'s verdict, and therefore the whole profile
-    /// string.
+    /// `--features cuda`/`flash-attn`, driven hermetically by feeding
+    /// `ATTENTION_BLOCK_FLASH.dry_run` the feature constant directly rather
+    /// than an actual two-build CI matrix) move `attention_block_flash`'s
+    /// verdict, and therefore the whole profile string.
     #[test]
     fn attention_block_flash_verdict_moves_with_cuda_compiled() {
-        let ctx_no_cuda = DryRunCtx {
-            device_kind: jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+        let ctx_no_cuda = jammi_kernels::admission::DryRunCtx {
+            device_kind: jammi_kernels::admission::DeviceKind::Cuda,
             dtype: jammi_kernels::admission::DtypeClass::Bf16,
             encoder_reachable: true,
         };
         // On THIS build (no `cuda` feature), a `Cuda`-kind context still
-        // resolves `device_supported() == false` inside `dry_run_verdict`'s
-        // `attention_block_flash` arm's FIRST gate
+        // resolves `device_supported() == false` inside
+        // `ATTENTION_BLOCK_FLASH.dry_run`'s FIRST gate
         // (`!jammi_kernels::admission::CUDA_COMPILED`), so the verdict names
         // that gate — never silently falls through to the flash-specific
         // gates below it.
         assert_eq!(
-            dry_run_verdict("attention_block_flash", &ctx_no_cuda),
-            DryRunVerdict::Declines("cuda_not_compiled")
+            (jammi_kernels::admission::ATTENTION_BLOCK_FLASH.dry_run)(&ctx_no_cuda),
+            jammi_kernels::admission::DryRunVerdict::Declines("cuda_not_compiled")
         );
-    }
-
-    /// MUTATION for the completeness test: an unhandled `report_key` must
-    /// panic, not silently return a placeholder — executed directly against
-    /// [`dry_run_verdict`] (never a hypothetical), so the panic message and
-    /// the "must be added" instruction are proven to actually fire.
-    #[test]
-    #[should_panic(expected = "no arm for PROBED_OPS report_key")]
-    fn dry_run_verdict_panics_on_an_unknown_report_key() {
-        let ctx = DryRunCtx {
-            device_kind: jammi_db::store::manifest::ComputeDeviceKind::Cpu,
-            dtype: jammi_kernels::admission::DtypeClass::F32,
-            encoder_reachable: true,
-        };
-        dry_run_verdict("a_report_key_no_arm_names", &ctx);
     }
 
     /// The premise the bf16-on-CPU refusal rests on, pinned rather than

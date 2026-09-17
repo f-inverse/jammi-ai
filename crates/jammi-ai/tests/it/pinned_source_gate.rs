@@ -4106,6 +4106,29 @@ fn ddl_literal_occurrences_are_all_reviewed() {
     assert_occurrences_reviewed(&found, &allow, "DDL literal");
 }
 
+/// #549's own DDL-position list: a module-level `const SQL: &str = "CREATE
+/// TABLE .."` -- exactly the real shape `crates/jammi-db/src/catalog/
+/// schema.rs`'s 13 reviewed module-scope hits already are, reproduced here
+/// as a clean, minimal fixture (a bare per-literal `visit_lit_str` hit, not
+/// buried inside a macro or a fn body).
+#[test]
+fn falsification_module_level_const_ddl_is_detected() {
+    let dir = repo_root();
+    let source = concat!(
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the module-level const SQL DDL position -- synthetic producer text, not real code in this file
+        "const PROBE_TABLE_DDL: &str = \"CREATE TABLE probe (id INT)\";\n",
+        "\n",
+        "fn unrelated() {}\n",
+    );
+    let (hits, _unresolved) = ddl_hit_lines(&dir, source);
+    assert_eq!(
+        hits,
+        vec![1],
+        "a module-level const string literal containing a DDL statement must be detected at its \
+         own real line, got {hits:?}"
+    );
+}
+
 /// #554 item 2: a DDL keyword split across two `concat!` string-literal
 /// arguments on separate lines is invisible to a per-literal check (neither
 /// `"CREATE "` nor `"TABLE probe"` is independently DDL-shaped) but visible

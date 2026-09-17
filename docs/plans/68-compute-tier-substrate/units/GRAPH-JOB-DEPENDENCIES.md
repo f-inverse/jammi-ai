@@ -3,8 +3,8 @@
 **Status: EXCISED from wave 5.** This plan's design (below) was re-attempted and killed, before
 any propagation code, by its own contract's pre-committed stop rule — the executed record is
 https://github.com/f-inverse/jammi-ai/issues/515#issuecomment-5708043270. What shipped from the
-attempt, as standalone commits independent of this unit's own propagation body (`97d97c71`,
-`7eace0f7` on `feat/500-wave5`): every hand-enumerated job-status terminality decision, in both
+attempt, as standalone commits independent of this unit's own propagation body (`af9ef9a1`,
+`ed76e7fe` on `feat/500-wave5`): every hand-enumerated job-status terminality decision, in both
 Rust and Python, now derives from `JobStatus::is_terminal`/`is_terminal_unsuccessful` (the one
 Rust-side predicate) or its Python mirror, instead of a literal string compare — explicitly NOT
 adding a `Cancelled` status (a status with no writer is dead vocabulary; it returns with this

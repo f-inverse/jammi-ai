@@ -352,7 +352,7 @@ the unset default, `:16:8` differs), so it belongs in the `MaterializationEnv` k
 not a default setting; the `NCCL_ALGO`/`PROTO`/`NCHANNELS` pin set is untested — at world size 2
 the reduction is commutative, so it needs world size ≥ 3 on the cluster leg. The shared
 `capability_surface.rs` TIER-PREEMPTION oracle every nightly `gpu-prove.yml` run exercises (the
-window this plan's byte-equality claims stand on) is fixed at `a378a3be` (`capsurf`: the
+window this plan's byte-equality claims stand on) is fixed at `0179471e` (`capsurf`: the
 `attention_block_fused` before/after window no longer leaks `bert_probe_dtype`'s own dispatch);
 run `35171308424` is green on sm_80/86/89/90 with that fix on the branch. **S6** (→ U8a/U8b;
 supersedes S2) a scratch crate on Ballista 54.1 with `override_execution_engine`, a custom

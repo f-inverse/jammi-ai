@@ -4,7 +4,7 @@
 GRAPH is EXCISED from wave 5 by its own contract's pre-committed stop rule (record:
 https://github.com/f-inverse/jammi-ai/issues/515#issuecomment-5708043270); the attempt's
 one-predicate terminality fold and its no-`jobs`-rebuild ledger oracle are standalone commits on
-`feat/500-wave5` (`97d97c71`, `7eace0f7`), and `units/GRAPH-JOB-DEPENDENCIES.md`'s own Status line
+`feat/500-wave5` (`af9ef9a1`, `ed76e7fe`), and `units/GRAPH-JOB-DEPENDENCIES.md`'s own Status line
 names what stays open (dependencies, parent groups, migration 040) for the next attempt. PR-C (the jobs fleet)
 **merged as #501** (`4ecc0230`, 2026-09-10); PR-K is **#502**. Owned
 together with `67-distributed-training/` since 2026-09-10; the single cross-plan schedule is

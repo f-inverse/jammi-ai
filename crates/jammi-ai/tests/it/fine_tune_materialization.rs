@@ -1,14 +1,194 @@
 //! The `FineTune` producer's materialization identity and its publish path.
 //!
-//! `CachePolicy::Use` is refused, typed, by `admit_training_spec` — model-level
-//! cache reuse is not yet supported (see
-//! <https://github.com/f-inverse/jammi-ai/issues/562>). Every `FineTune` run
-//! computes and owns its own attempt-unique prefix.
+//! Model-level cache reuse (`CachePolicy::Use` probing a prior model row by
+//! materialization definition and finalizing a second row against its
+//! already-published prefix) is not yet supported: `Use` is refused, typed,
+//! at submit (`InferenceSession::submit_fine_tune_spec_deduped`), for both
+//! the in-process spec-construction path and a spec decoded off the wire —
+//! see <https://github.com/f-inverse/jammi-ai/issues/562>. Every `FineTune`
+//! run therefore computes and owns its own attempt-unique prefix; no two
+//! model rows this suite produces ever share one.
 
+use std::sync::Arc;
+
+use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
+use jammi_ai::fine_tune::worker::JobWorker;
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
+use jammi_ai::jobs::JobResult;
 use jammi_ai::model::ModelTask;
+use jammi_db::error::JammiError;
+use jammi_db::store::CachePolicy;
 
 use crate::fine_tune::{session_with_training_data, tiny_bert_model};
+
+/// A `TrainingSpec::FineTune` over the shared `training` fixture, small
+/// enough to train in milliseconds on CPU, carrying `cache`.
+fn spec_with_cache(cache: CachePolicy) -> TrainingSpec {
+    TrainingSpec::FineTune {
+        source: "training".into(),
+        columns: vec![
+            "text_a".to_string(),
+            "text_b".to_string(),
+            "score".to_string(),
+        ],
+        method: FineTuneMethod::Lora,
+        task: ModelTask::TextEmbedding,
+        common: TrainingCommon {
+            base_model: tiny_bert_model(),
+            config: FineTuneConfig {
+                epochs: 1,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                ..Default::default()
+            },
+            world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
+        },
+        cache,
+    }
+}
+
+/// Submit `spec`, claim it with a fresh [`JobWorker`], and drive it to
+/// completion — returning the completed job's own model id, whether ITS OWN
+/// `jobs.result` recorded run-metrics, and the result's own `cache_outcome`.
+async fn submit_and_run(
+    session: &Arc<jammi_ai::session::InferenceSession>,
+    spec: TrainingSpec,
+) -> (String, bool, String) {
+    let job = session.run_training_spec(spec).await.unwrap();
+    let worker = JobWorker::new(session).expect("default worker intervals are valid");
+    let claimed = session
+        .catalog()
+        .claim_next(
+            worker.worker_id(),
+            &["fine_tune"],
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+        .unwrap()
+        .expect("the queued job is claimable");
+    worker.run_claimed_job(session, claimed).await;
+    let after = session.catalog().get_job(&job.job_id).await.unwrap();
+    assert_eq!(
+        after.status, "completed",
+        "the job must complete for either outcome (fresh train or cache hit): {after:?}"
+    );
+    let result: JobResult = serde_json::from_str(
+        after
+            .result
+            .as_deref()
+            .expect("a completed job has a result"),
+    )
+    .expect("a fine-tune job's result is a JobResult::Model");
+    let JobResult::Model {
+        metrics,
+        cache_outcome,
+        ..
+    } = result
+    else {
+        panic!("a training kind's result must be JobResult::Model, got {result:?}");
+    };
+    (job.model_id.clone(), metrics.is_some(), cache_outcome)
+}
+
+/// `cache = Use` on `TrainingSpec::FineTune` is refused, typed, at the ONE
+/// point every submission path — in-process or decoded off the wire —
+/// passes through before any row is written
+/// (`InferenceSession::submit_fine_tune_spec_deduped`). Exercises the
+/// in-process construction path: [`InferenceSession::submit_fine_tune`]
+/// builds the spec directly from a [`jammi_wire::request::FineTuneRequest`],
+/// never touching the wire decode.
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_use_is_refused_at_submit_on_the_embedded_path() {
+    let (session, _dir) = session_with_training_data().await;
+
+    let request = jammi_wire::request::FineTuneRequest {
+        source: "training".into(),
+        base_model: tiny_bert_model(),
+        columns: vec![
+            "text_a".to_string(),
+            "text_b".to_string(),
+            "score".to_string(),
+        ],
+        method: FineTuneMethod::Lora,
+        task: ModelTask::TextEmbedding,
+        config: None,
+        world_size: None,
+        cache: CachePolicy::Use,
+    };
+    let err = session
+        .submit_fine_tune(request)
+        .await
+        .expect_err("cache = Use must be refused before any row is written");
+    assert!(
+        matches!(&err, JammiError::Config(msg) if msg.contains("model-level cache reuse is not yet supported")),
+        "got {err:?}"
+    );
+
+    // The refusal leaves no row behind.
+    assert!(
+        session.catalog().list_jobs().await.unwrap().is_empty(),
+        "a refused submit must never write a `jobs` row"
+    );
+}
+
+/// [`cache_use_is_refused_at_submit_on_the_embedded_path`]'s peer for the
+/// WIRE decode path: a spec decoded off the wire
+/// (`jammi_ai::wire::training_spec_from_bytes`, the same seam the gRPC
+/// handler and the Python binding both drive) reaches the SAME refusal
+/// through [`InferenceSession::run_training_spec`], never a separate
+/// wire-only check.
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_use_is_refused_at_submit_on_a_spec_decoded_off_the_wire() {
+    let (session, _dir) = session_with_training_data().await;
+
+    let spec = spec_with_cache(CachePolicy::Use);
+    let proto = jammi_ai::wire::training_spec_to_proto(&spec);
+    let bytes = prost::Message::encode_to_vec(&proto);
+    let decoded = jammi_ai::wire::training_spec_from_bytes(&bytes)
+        .expect("a well-formed request decodes: the refusal is not a decode-time one");
+
+    let err = session
+        .run_training_spec(decoded)
+        .await
+        .expect_err("cache = Use must be refused before any row is written");
+    assert!(
+        matches!(&err, JammiError::Config(msg) if msg.contains("model-level cache reuse is not yet supported")),
+        "got {err:?}"
+    );
+}
+
+/// `CachePolicy::Bypass` (the default) never probes: two submissions of the
+/// identical spec both train for real, each under its own name, and (being
+/// real, independent trainer runs) do NOT share a prefix.
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_bypass_never_reuses() {
+    let (session, _dir) = session_with_training_data().await;
+
+    let (first_model_id, first_trained, first_cache_outcome) =
+        submit_and_run(&session, spec_with_cache(CachePolicy::Bypass)).await;
+    let (second_model_id, second_trained, second_cache_outcome) =
+        submit_and_run(&session, spec_with_cache(CachePolicy::Bypass)).await;
+
+    assert!(
+        first_trained,
+        "Bypass never probes: the first run must train"
+    );
+    assert!(
+        second_trained,
+        "Bypass never probes: the second run must train too, never short-circuiting"
+    );
+    assert_eq!(first_cache_outcome, "computed");
+    assert_eq!(second_cache_outcome, "computed");
+
+    let catalog = session.catalog();
+    let first = catalog.get_model(&first_model_id).await.unwrap().unwrap();
+    let second = catalog.get_model(&second_model_id).await.unwrap().unwrap();
+    assert_ne!(
+        first.artifact_path, second.artifact_path,
+        "two independent Bypass runs must never share a prefix"
+    );
+}
 
 /// Bundle flatness is an ORACLE, not an assumption: the containment-aware
 /// predicate `ResultStore::prefix_is_referenced` (a row's `artifact_path` is

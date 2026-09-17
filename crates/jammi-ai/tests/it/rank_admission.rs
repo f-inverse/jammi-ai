@@ -775,20 +775,33 @@ fn scan_submit_source(file: &str, text: &str) -> Vec<SubmitCallSite> {
     scanner.hits
 }
 
-/// Every [`SubmitCallSite`] in the production code of every crate that
-/// holds a `Catalog` handle — `crates/jammi-db/src` (the definitions and
-/// their in-crate callers) and `crates/jammi-ai/src` — sorted; the
+/// Every [`SubmitCallSite`] in the production code of EVERY workspace
+/// crate — every git-tracked `.rs` file under `crates/*/src` — sorted; the
 /// enumerated universe [`every_submit_job_call_in_production_code_is_the_seam_or_a_reviewed_non_training_site`]
-/// checks against its allow-list. Reuses
-/// [`crate::pinned_source_gate::scan_surface`]'s tracked-file enumeration
-/// (`git ls-files` over its surface dirs) rather than a second, independent
-/// file walk — "the SAME machinery, never a parallel scanner". A crate that
-/// gains a `Catalog` handle joins that surface list, and with it this
-/// universe.
+/// checks against its allow-list. `Catalog::submit_job`/`submit_job_deduped`
+/// and `SubmitJobParams` are `pub`, so a caller in any crate is in scope
+/// (`jammi-server`, `jammi-ballista` and `jammi-bench` hold `Catalog`
+/// handles today); a universe narrower than the workspace would let a
+/// hand-built training-kind submit in one of them pass unseen. The file
+/// list comes from `git ls-files` (never a hand-maintained walk), through
+/// the same `tracked_rs_files` helper the pinned source gate uses.
 fn submit_call_sites_in_production_code() -> Vec<SubmitCallSite> {
+    let root = crate::pinned_source_gate::repo_root();
+    let files: Vec<String> = crate::pinned_source_gate::tracked_rs_files(&root, "crates")
+        .into_iter()
+        .filter(|f| f.split('/').nth(2) == Some("src"))
+        .collect();
+    assert!(
+        files.len() > 100,
+        "git ls-files crates returned suspiciously few production .rs files ({}); the \
+         universe quantifier is broken, not the tree",
+        files.len()
+    );
     let mut hits = Vec::new();
-    for (file, text) in crate::pinned_source_gate::scan_surface() {
-        hits.extend(scan_submit_source(&file, &text));
+    for file in &files {
+        let text = std::fs::read_to_string(root.join(file))
+            .unwrap_or_else(|e| panic!("reading {file}: {e}"));
+        hits.extend(scan_submit_source(file, &text));
     }
     hits.sort();
     hits
@@ -828,7 +841,13 @@ fn submit_call_sites_in_production_code() -> Vec<SubmitCallSite> {
 ///   definition side of the seam, inside the crate that owns the `jobs`
 ///   table. It mints no spec of its own; whatever reaches it already came
 ///   through one of the three `jammi-ai` sites above, which are the only
-///   production callers in the scanned surface.
+///   production callers of the catalog in the workspace.
+/// - `jammi-client/src/lib.rs::submit_fine_tune` — a `submit_job` by NAME
+///   only: the generated gRPC client's `JobService::submit_job` RPC, called
+///   with a `SubmitJobRequest`, which lands in `jammi-server`'s handler and
+///   from there in `jammi-ai`'s `enqueue` (a reviewed site above). It never
+///   touches a `Catalog`; the scan keys on the identifier, so the homonym is
+///   reviewed here rather than special-cased out of the universe.
 ///
 /// RED (executed, reverted, never shipped): adding a FOURTH call —
 /// `catalog.submit_job(SubmitJobParams { kind: "fine_tune", .. })` built by
@@ -902,6 +921,7 @@ fn every_submit_job_call_in_production_code_is_the_seam_or_a_reviewed_non_traini
         ("crates/jammi-ai/src/jobs.rs", "enqueue"),
         ("crates/jammi-ai/src/jobs.rs", "run_now"),
         ("crates/jammi-db/src/catalog/jobs_repo.rs", "submit_job"),
+        ("crates/jammi-client/src/lib.rs", "submit_fine_tune"),
     ];
 
     let hits = submit_call_sites_in_production_code();

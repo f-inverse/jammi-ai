@@ -214,7 +214,7 @@ const SURFACE_DIRS: &[&str] = &["crates/jammi-db/src", "crates/jammi-ai/src"];
 /// (`crates/jammi-ai`) rather than the process's `cwd` — `cargo test` can be
 /// invoked from anywhere, but `CARGO_MANIFEST_DIR` is always this crate's
 /// directory.
-fn repo_root() -> PathBuf {
+pub(crate) fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
@@ -229,7 +229,7 @@ fn repo_root() -> PathBuf {
 /// `src/pipeline/asof/`. There is nothing here for a "did the walk reach
 /// every tracked file" sentinel to check, because there is no second walk
 /// to disagree with the tracked list — the tracked list IS what is scanned.
-fn tracked_rs_files(root: &Path, dir: &str) -> Vec<String> {
+pub(crate) fn tracked_rs_files(root: &Path, dir: &str) -> Vec<String> {
     let output = Command::new("git")
         .args([
             "-C",

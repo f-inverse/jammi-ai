@@ -6,7 +6,8 @@
 //! [`jammi_db::storage::JammiObjectStore::delete_if_exists`] and
 //! [`jammi_db::store::ArtifactStore::delete_artifact_prefix`] (`pub(crate)`,
 //! confirmed by reading its definition) — across every git-tracked `.rs`
-//! file under `crates/jammi-db/src` and `crates/jammi-ai/src`.
+//! file under every crate's `src/` tree (`crates/*/src`), because
+//! `delete_if_exists` is `pub` and a caller in any crate is in scope.
 //!
 //! **Keyed by `(file, function, ordinal)`, not `(file, line)`** (F2's
 //! second delta): a bare line number goes stale on every UNRELATED edit
@@ -508,8 +509,13 @@ fn repo_root() -> PathBuf {
 fn every_raw_models_byte_delete_call_site_is_reviewed() {
     let repo_root = repo_root();
 
-    let mut files = tracked_rs_files(&repo_root, "crates/jammi-db/src");
-    files.extend(tracked_rs_files(&repo_root, "crates/jammi-ai/src"));
+    // Every crate's production tree: `delete_if_exists` is `pub`, so the
+    // universe is every `crates/*/src`, never the two crates that call it
+    // today.
+    let mut files: Vec<String> = tracked_rs_files(&repo_root, "crates")
+        .into_iter()
+        .filter(|f| f.split('/').nth(2) == Some("src"))
+        .collect();
     assert!(
         files.len() > 50,
         "git ls-files returned suspiciously few files ({}); the scan's quantifier is likely \

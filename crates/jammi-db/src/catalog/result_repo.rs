@@ -1288,7 +1288,7 @@ impl Catalog {
     /// [`Self::list_live_building_tables`]: every `status = 'building'` row
     /// additionally matching `lease_predicate` (a full boolean SQL
     /// expression, built entirely from the backend's own clock on Postgres
-    /// (a bound [`crate::catalog::lease::lease_now`] on SQLite, per
+    /// (a bound [`crate::catalog::lease::canonical_stamp_now`] on SQLite, per
     /// `catalog::lease`'s module docs) — its own bind, if any, is threaded
     /// through so the tenant bind that follows numbers correctly regardless
     /// of backend). `live` selects expired (`false`) vs. live (`true`);

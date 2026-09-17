@@ -169,7 +169,7 @@ async fn remaining_cooldown_secs(
 /// via raw SQL -- Postgres: `now() + make_interval(...)`, entirely computed
 /// by the server; SQLite: the application clock (the "backend" clock for a
 /// single embedded process, `catalog::lease`'s own module docs), the SAME
-/// source `lease_deadline`/`lease_now` use. Never a value this test reads
+/// source `lease_deadline`/`canonical_stamp_now` use. Never a value this test reads
 /// back and re-asserts equality against -- only ever a relative offset, so
 /// this fixture cannot itself fabricate the property under test.
 async fn set_next_assembly_after_offset(

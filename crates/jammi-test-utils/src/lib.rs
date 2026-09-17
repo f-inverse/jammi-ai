@@ -328,7 +328,7 @@ pub async fn abandon_building(
     // The catalog's own backend-correct liveness predicate, not a Rust-side
     // string compare against `lease_expires_at` — that stored value is a
     // Postgres-clock expression's text rendering on Postgres, not a
-    // `lease_now()`-shaped string a naive `>` compare here would assume.
+    // `canonical_stamp_now()`-shaped string a naive `>` compare here would assume.
     assert!(
         TenantBinding::admin_scope(catalog.list_live_building_tables())
             .await

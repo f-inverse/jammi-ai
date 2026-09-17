@@ -2579,8 +2579,8 @@ def _r12_mutations_array_rejection(mutations: object) -> str | None:
     marker_after}` with EITHER an ACCEPTED mutation (`rc_before == 0 ∧
     rc_after != 0 ∧ marker_after` matches a committed TEST-failure
     marker, distinct from a build-failure marker) OR an explicit
-    `uncovered` reason (R11's own disposition precedent, see
-    `_claims_rejection`), each `uncovered` reason WITHIN-ARRAY-distinct
+    `uncovered` reason (the SAME disposition precedent `_claims_rejection`
+    already establishes), each `uncovered` reason WITHIN-ARRAY-distinct
     (normalized). NO hash-reproduction — like `gates`, this is a
     lead-attested record, never re-executed.
 
@@ -2804,8 +2804,8 @@ def _exclusions_rejection(new_test_surfaces: dict[str, str], data: dict, unit_sl
     PREVIOUS relay of the SAME agent_type (an earlier `ts`, checked only
     HERE — this hook-only arm needs the relay ledger's own on-disk
     state) — the anti-templating cousin of `_claims_rejection`'s own
-    uncovered-reason check. LIMIT, stated as plainly as R11's own: this
-    cannot prove an exclusion is TRUE, only that two are not one."""
+    uncovered-reason check. LIMIT, stated as plainly as that check's own:
+    this cannot prove an exclusion is TRUE, only that two are not one."""
     if not new_test_surfaces:
         return None
     exclusions = data.get("exclusions")
@@ -3742,7 +3742,7 @@ def cmd_export_attestation(argv: list[str]) -> int:
 
     `check_rigor_record.py`'s new reader REFUSES, loudly and by name, any
     row it finds in THIS stream whose `kind` is not `lead-relay-
-    attestation` — the same foreign-row-refusal property (Z12/Z18)
+    attestation` — the SAME foreign-row-refusal property
     `check_anticipation_witnesses` already holds for its own stream,
     extended here rather than re-derived."""
     if len(argv) < 3 or not argv[2].strip():

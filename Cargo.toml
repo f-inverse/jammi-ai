@@ -16,8 +16,14 @@ members = [
     "crates/jammi-encoders",
     "crates/jammi-test-utils",
     "crates/jammi-bench",
+    "ci/tools/symbol-index",
 ]
 # jammi-python is a PyO3 cdylib — build via maturin, not cargo build --workspace
+# ci/tools/symbol-index is a CI-only, unpublished bin (a real syn AST index the
+# swarm's own Rust-source-facing gates share — see its own Cargo.toml) — a
+# workspace member so `cargo run -p symbol-index` resolves against the SAME
+# lockfile every other crate does, but never in default-members: it is not
+# part of the product and must not slow down a bare `cargo build --workspace`.
 default-members = [
     "crates/jammi-db",
     "crates/jammi-numerics",

@@ -333,8 +333,8 @@ fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
 /// or a string literal that merely mentions the name is not a call), and a
 /// found site outside any named function panics loudly rather than being
 /// dropped. Executed falsifications for every shape live below
-/// (`shape_*` tests); the same seven-direction argument for the sibling
-/// construction oracle is `crates/jammi-kernels/tests/probed_op_construction_sites.rs`.
+/// (`shape_*` tests); `crates/jammi-ai/tests/it/rank_admission.rs`'s
+/// submit-seam scanner records the same three shapes.
 struct DeleteCallScanner {
     /// The stack of enclosing named-function names — only `visit_item_fn`
     /// (free functions) and `visit_impl_item_fn` (methods) push; a closure

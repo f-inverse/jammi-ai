@@ -2,14 +2,20 @@
 //! (twice): the `models/` byte-delete guard is not a compile-time proof
 //! (the models root is a RUNTIME value, `models_root(&root)`, not a type),
 //! so completeness is instead an ENUMERATING source oracle over every
-//! reachable call site of the two raw byte-deleters this crate exposes —
+//! reference to the three ways this crate's code can delete bytes under a
+//! store — the two raw byte-deleters,
 //! [`jammi_db::storage::JammiObjectStore::delete_if_exists`] and
 //! [`jammi_db::store::ArtifactStore::delete_artifact_prefix`] (`pub(crate)`,
-//! confirmed by reading its definition) — across every git-tracked `.rs`
-//! file that is compiled non-test source (every workspace member's `src/`,
-//! every `build.rs`; not `tests/`, `benches/`, `examples/` or the
-//! `ci/fixtures/` tokenizer inputs), because `delete_if_exists` is `pub`
-//! and a caller anywhere in the workspace is in scope.
+//! confirmed by reading its definition), and the raw driver accessor
+//! `JammiObjectStore::driver` (`pub(crate)`; the `Arc<dyn ObjectStore>` it
+//! returns deletes any key with no guard, so every reference to it is a
+//! reviewed row, today the parquet reader and writer only) — across every
+//! `.rs` file cargo compiles outside a test target (the universe
+//! `jammi_test_utils::source_universe` defines: every workspace member's
+//! `src/`, every `build.rs`, every `examples/` and `benches/` target; not
+//! `tests/` or the `ci/fixtures/` tokenizer inputs), because
+//! `delete_if_exists` is `pub` and a caller anywhere cargo compiles is in
+//! scope, while `driver` is sealed to this crate by the compiler.
 //!
 //! **Keyed by `(file, function, ordinal)`, not `(file, line)`** (F2's
 //! second delta): a bare line number goes stale on every UNRELATED edit
@@ -73,8 +79,7 @@
 //! already-reviewed three-call function is caught even though ordinals
 //! 1-3 still resolve.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SiteClass {
@@ -101,9 +106,29 @@ struct ReviewedSite {
 
 /// One row per raw-delete call site this scan is expected to find in
 /// today's tree, reviewed by hand (see this file's own module doc for the
-/// three classes). Adding a new call site — in EITHER crate — means adding a
-/// row here, with a reviewed reason; that is the point of this test.
+/// three classes). Adding a new reference — anywhere cargo compiles outside
+/// a test target — means adding a row here, with a reviewed reason; that is
+/// the point of this test.
 const REVIEWED: &[ReviewedSite] = &[
+    // ── `JammiObjectStore::driver` (the raw `Arc<dyn ObjectStore>`) ─────
+    ReviewedSite {
+        file: "crates/jammi-db/src/storage/reader.rs",
+        function: "read_all_record_batches",
+        ordinal: 1,
+        count: 1,
+        class: SiteClass::NonModels,
+        reason: "the parquet reader hands the raw driver to `ParquetObjectReader::new` to READ \
+                 the handle's own path; no delete is issued on it.",
+    },
+    ReviewedSite {
+        file: "crates/jammi-db/src/storage/writer.rs",
+        function: "open",
+        ordinal: 1,
+        count: 1,
+        class: SiteClass::NonModels,
+        reason: "the parquet writer hands the raw driver to `ParquetObjectWriter::new` to WRITE \
+                 the handle's own path; no delete is issued on it.",
+    },
     // ── `JammiObjectStore::delete_if_exists` ────────────────────────────
     ReviewedSite {
         file: "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
@@ -252,28 +277,6 @@ const REVIEWED: &[ReviewedSite] = &[
     },
 ];
 
-/// `git ls-files`, scoped to `dir`, relative to the repository root —
-/// mirrors `pinned_source_gate.rs`'s own quantifier (recursive, version-
-/// control-derived, never a hand-rolled directory walk).
-fn tracked_rs_files(repo_root: &Path, dir: &str) -> Vec<String> {
-    let output = Command::new("git")
-        .current_dir(repo_root)
-        .args(["ls-files", "--", dir])
-        .output()
-        .unwrap_or_else(|e| panic!("git ls-files {dir}: {e}"));
-    assert!(
-        output.status.success(),
-        "git ls-files {dir} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .unwrap_or_else(|e| panic!("git ls-files {dir}: non-utf8 output: {e}"))
-        .lines()
-        .filter(|l| l.ends_with(".rs"))
-        .map(str::to_string)
-        .collect()
-}
-
 /// One raw-delete call this scan found: `file` is repo-root-relative
 /// (matching [`ReviewedSite::file`]); `function` is the innermost named
 /// `fn`/method enclosing the call (never a closure — a closure creates no
@@ -351,6 +354,9 @@ struct DeleteCallScanner {
     /// only ever writes directly inside a named `async fn`'s own body, per
     /// every site reviewed above — never inside a further-nested closure).
     fn_stack: Vec<String>,
+    /// The repo-relative path being scanned, for file-scoped target rules
+    /// (`driver` counts inside `crates/jammi-db/src` only).
+    file: String,
     /// Running per-`(function)` counter for THIS file, used to assign each
     /// found call's ordinal — reset per file by constructing a fresh
     /// scanner per `syn::File`.
@@ -359,8 +365,9 @@ struct DeleteCallScanner {
 }
 
 impl DeleteCallScanner {
-    fn new() -> Self {
+    fn new(file: &str) -> Self {
         Self {
+            file: file.to_string(),
             fn_stack: Vec::new(),
             counts: std::collections::HashMap::new(),
             found: Vec::new(),
@@ -368,7 +375,14 @@ impl DeleteCallScanner {
     }
 
     fn record_if_match(&mut self, method: &str) {
-        if method != "delete_if_exists" && method != "delete_artifact_prefix" {
+        let is_deleter = method == "delete_if_exists" || method == "delete_artifact_prefix";
+        // `JammiObjectStore::driver` is `pub(crate)`: outside `crates/jammi-db/src`
+        // the compiler refuses the reference (E0624), so a `driver` identifier
+        // there is a homonym on some other type and never the raw store. Inside
+        // this crate the compiler proves nothing, so every `driver` reference
+        // is a site.
+        let is_raw_driver = method == "driver" && self.file.starts_with("crates/jammi-db/src/");
+        if !is_deleter && !is_raw_driver {
             return;
         }
         let Some(func) = self.fn_stack.last() else {
@@ -433,8 +447,14 @@ impl<'ast> syn::visit::Visit<'ast> for DeleteCallScanner {
     /// in `qself` and out of the segments entirely) is a prefix this scan
     /// must be indifferent to.
     fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
-        if let Some(last) = node.path.segments.last() {
-            self.record_if_match(&last.ident.to_string());
+        // An inherent method is only ever spelled with an owner —
+        // `Type::name`, `crate::m::Type::name`, `<Type>::name` — so a bare
+        // single-segment path (`name`) is a local variable or a free fn of
+        // that name, never the deleter; recording it would review homonyms.
+        if node.qself.is_some() || node.path.segments.len() >= 2 {
+            if let Some(last) = node.path.segments.last() {
+                self.record_if_match(&last.ident.to_string());
+            }
         }
         syn::visit::visit_expr_path(self, node);
     }
@@ -488,7 +508,7 @@ fn scan_file(repo_root: &Path, file: &str) -> Vec<FoundSite> {
 fn scan_source(file: &str, text: &str) -> Vec<FoundSite> {
     let parsed = syn::parse_file(text)
         .unwrap_or_else(|e| panic!("models_delete_call_sites: syn could not parse {file}: {e}"));
-    let mut scanner = DeleteCallScanner::new();
+    let mut scanner = DeleteCallScanner::new(file);
     syn::visit::Visit::visit_file(&mut scanner, &parsed);
     scanner
         .found
@@ -501,34 +521,15 @@ fn scan_source(file: &str, text: &str) -> Vec<FoundSite> {
         .collect()
 }
 
-fn repo_root() -> PathBuf {
-    // `CARGO_MANIFEST_DIR` is `crates/jammi-db`; the repo root is two levels
-    // up (`crates/jammi-db/../..`).
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .unwrap_or_else(|| panic!("CARGO_MANIFEST_DIR has no grandparent: {manifest_dir:?}"))
-        .to_path_buf()
-}
+use jammi_test_utils::source_universe::repo_root;
 
 #[test]
 fn every_raw_models_byte_delete_call_site_is_reviewed() {
     let repo_root = repo_root();
 
-    // The repository's compiled non-test Rust: every git-tracked `.rs`
-    // not under `tests/`, `benches/` or `examples/` and not a tokenizer
-    // fixture under `ci/fixtures/` — every workspace member's `src/`
-    // (crates and `ci/tools/*`) and every `build.rs`. `delete_if_exists`
-    // is `pub`, so a caller anywhere in that set is in scope.
-    let files: Vec<String> = tracked_rs_files(&repo_root, ".")
-        .into_iter()
-        .filter(|f| {
-            !f.split('/')
-                .any(|p| p == "tests" || p == "benches" || p == "examples")
-                && !f.starts_with("ci/fixtures/")
-        })
-        .collect();
+    // The one universe both call-site oracles share: every `.rs` cargo
+    // compiles outside a test target (`jammi_test_utils::source_universe`).
+    let files = jammi_test_utils::source_universe::compiled_non_test_rs_files(&repo_root);
     assert!(
         files.len() > 50,
         "git ls-files returned suspiciously few files ({}); the scan's quantifier is likely \
@@ -727,6 +728,35 @@ fn shape_4_a_path_captured_as_a_value_is_found_wherever_it_appears() {
             "shape 4 ({name}): a value reference must be found"
         );
     }
+}
+
+#[test]
+fn shape_5_a_raw_driver_reference_is_a_site_inside_this_crate_only() {
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_5 (raw driver) — not real code in this file
+    let src = "async fn f(h: H, p: P) { let _ = h.driver().delete(&p).await; }";
+    let rows = |file: &str| -> Vec<String> {
+        scan_source(file, src)
+            .into_iter()
+            .map(|s| format!("{} #{}", s.function, s.ordinal))
+            .collect()
+    };
+    assert_eq!(
+        rows("crates/jammi-db/src/store/fixture.rs"),
+        vec!["f #1"],
+        "a `driver()` reference inside jammi-db must be a reviewed site"
+    );
+    assert_eq!(
+        rows("crates/jammi-bench/src/fixture.rs"),
+        Vec::<String>::new(),
+        "outside jammi-db a `driver` identifier is a homonym the compiler already keeps off the raw store"
+    );
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_5 (local named driver) — not real code in this file
+    let local = "fn f(d: D) { let driver = d; driver.run(); }";
+    assert_eq!(
+        scan_source("crates/jammi-db/src/store/fixture.rs", local).len(),
+        0,
+        "a bare local named `driver` is not a reference to the inherent method"
+    );
 }
 
 #[test]

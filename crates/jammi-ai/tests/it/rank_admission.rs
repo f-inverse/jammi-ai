@@ -721,8 +721,14 @@ impl<'ast> syn::visit::Visit<'ast> for SubmitCallScanner {
     /// scan is indifferent to. `syn` reaches a call's callee through this
     /// same visitor, so a call is not a separate direction.
     fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
-        if let Some(last) = node.path.segments.last() {
-            self.record_if_submit(&last.ident.to_string());
+        // An inherent method is only ever spelled with an owner —
+        // `Type::name`, `crate::m::Type::name`, `<Type>::name` — so a bare
+        // single-segment path is a local or a free fn of that name, never
+        // the catalog's method; recording it would review homonyms.
+        if node.qself.is_some() || node.path.segments.len() >= 2 {
+            if let Some(last) = node.path.segments.last() {
+                self.record_if_submit(&last.ident.to_string());
+            }
         }
         syn::visit::visit_expr_path(self, node);
     }
@@ -784,32 +790,25 @@ fn scan_submit_source(file: &str, text: &str) -> Vec<SubmitCallSite> {
     scanner.hits
 }
 
-/// Every [`SubmitCallSite`] in the repository's compiled non-test Rust —
-/// every git-tracked `.rs` file that is not under a `tests/`, `benches/`
-/// or `examples/` directory and not a tokenizer fixture under
-/// `ci/fixtures/` (inputs, never compiled): every workspace member's
-/// `src/` (the crates AND the `ci/tools/*` members), every `build.rs`.
-/// `#[cfg(test)]` items inside those files are skipped by the scanner.
-/// The enumerated universe [`every_submit_job_call_in_production_code_is_the_seam_or_a_reviewed_non_training_site`]
+/// Every [`SubmitCallSite`] in every `.rs` file cargo COMPILES outside a
+/// test target — the one universe
+/// [`jammi_test_utils::source_universe::compiled_non_test_rs_files`] defines
+/// and the raw byte-delete oracle in `jammi-db` shares: every workspace
+/// member's `src/` (the crates AND the `ci/tools/*` members), every
+/// `build.rs`, every `examples/` and `benches/` target; not `tests/`
+/// directories and not the `ci/fixtures/` tokenizer inputs. `#[cfg(test)]`
+/// items inside those files are skipped by the scanner. The enumerated
+/// universe [`every_submit_job_call_in_production_code_is_the_seam_or_a_reviewed_non_training_site`]
 /// checks against its allow-list. `Catalog::submit_job`/`submit_job_deduped`
-/// and `SubmitJobParams` are `pub`, so a caller in any crate is in scope
-/// (`jammi-server`, `jammi-ballista` and `jammi-bench` hold `Catalog`
-/// handles today); a universe narrower than that would let a hand-built
-/// training-kind submit pass unseen. The file list comes from
-/// `git ls-files` (never a hand-maintained walk), through the same
-/// `tracked_rs_files` helper the pinned source gate uses.
+/// and `SubmitJobParams` are `pub`, so a caller anywhere cargo compiles is
+/// in scope (`jammi-server`, `jammi-ballista` and `jammi-bench` hold
+/// `Catalog` handles today, and `jammi-bench` has an example target); a
+/// universe narrower than that would let a hand-built training-kind
+/// submit pass unseen. The file list comes from `git ls-files`, never a
+/// hand-maintained walk.
 fn submit_call_sites_in_production_code() -> Vec<SubmitCallSite> {
-    let root = crate::pinned_source_gate::repo_root();
-    let files: Vec<String> = crate::pinned_source_gate::tracked_rs_files(&root, ".")
-        .into_iter()
-        .filter(|f| crate::pinned_source_gate::is_compiled_non_test_source(f))
-        .collect();
-    assert!(
-        files.len() > 100,
-        "git ls-files returned suspiciously few compiled non-test .rs files ({}); the \
-         universe quantifier is broken, not the tree",
-        files.len()
-    );
+    let root = jammi_test_utils::source_universe::repo_root();
+    let files = jammi_test_utils::source_universe::compiled_non_test_rs_files(&root);
     let mut hits = Vec::new();
     for file in &files {
         let text = std::fs::read_to_string(root.join(file))
@@ -821,7 +820,7 @@ fn submit_call_sites_in_production_code() -> Vec<SubmitCallSite> {
 }
 
 /// #573 round 3 (N3-seam): every `Catalog::submit_job`/`submit_job_deduped`
-/// call in `crates/jammi-ai/src`'s production code is on this exact,
+/// reference in any compiled non-test `.rs` file in the workspace is on this exact,
 /// reviewed allow-list — the universe is derived from a REAL parse of every
 /// tracked file ([`submit_call_sites_in_production_code`]), not from a
 /// hand-picked list of "the three functions round 1 happened to name": a

@@ -1,6 +1,7 @@
 //! Shared test helpers for jammi-db and jammi-ai integration tests.
 
 pub mod child;
+pub mod source_universe;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

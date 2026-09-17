@@ -90,9 +90,13 @@ impl JammiObjectStore {
         self.url.scheme()
     }
 
-    /// Underlying `Arc<dyn ObjectStore>`. Exposed for the writer / reader
-    /// helpers; user code should never reach for it directly.
-    pub fn driver(&self) -> Arc<dyn ObjectStore> {
+    /// Underlying `Arc<dyn ObjectStore>`, for this crate's own writer and
+    /// reader helpers only. `pub(crate)`, not `pub`: the raw driver can
+    /// delete any key with no `models/` guard, so no other crate can reach
+    /// it (a compiler refusal), and inside this crate every reference to
+    /// `driver` is a reviewed row of the raw byte-delete oracle
+    /// (`tests/it/models_delete_call_sites.rs`).
+    pub(crate) fn driver(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.driver)
     }
 

@@ -62,15 +62,35 @@ exactly the kind of unverified citation this gate exists to prevent. The
 migration work) are what this gate governs today; the remaining sweep is
 named as a follow-up, not silently declared done.
 
+**Rust resolution is a REAL `syn` AST parse, never a regex reader.** Every
+`rust`/`bare_rust` citation resolves against `ci/tools/symbol-index`
+(`cargo run --release -p symbol-index`), a compiled tool that parses every
+`.rs` file with `syn` and emits a JSON index of items, impl methods, enum
+variants, struct fields, and call sites, each with file + line. An earlier
+version of this gate carried its own regex/brace-counting Rust reader —
+this repo's own recorded lesson ("regex readers over YAML/Rust lost five
+audits") is why that reader was replaced, not merely improved: its very
+first real run against this tree found and silently mis-resolved
+`Catalog::fail_job` (a one-line sibling method's own braces spuriously
+closed the enclosing `impl` block one line early), a defect class `syn`'s
+real parser cannot produce. See `ci/tools/symbol-index/src/main.rs`'s own
+module doc for the index's exact scope and stated limits.
+
 Run: `python3 ci/scripts/check_plan_citations.py`
 Self-test: `python3 ci/scripts/check_plan_citations.py --self-test`
-Hermetic: reads the working tree only; no network, no build, no `cargo`.
-Wired in `swarm.yml` beside `check_doc_parity.py`.
+NOT hermetic in the no-toolchain sense: TOML/heading/proto resolution reads
+the working tree only, but Rust resolution shells out to `cargo run
+--release -p symbol-index`, which needs the pinned Rust toolchain (a cold
+build pays once; sccache/CI-cache carries it after). Wired in `swarm.yml`'s
+Rust-toolchain job (`symbol-index-gates`), not the toolchain-free
+`swarm-gates` job `check_doc_parity.py`/`check_journey_markers.py` run in.
 """
 
 from __future__ import annotations
 
+import json
 import re
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -157,137 +177,83 @@ def extract_citations(doc_path: Path, text: str) -> list[Citation]:
 
 
 # --------------------------------------------------------------------------- #
-# rust symbol index
+# rust symbol index (ci/tools/symbol-index -- a real `syn` AST parse)
 # --------------------------------------------------------------------------- #
 
-# The same shape of regex-based item scan `check_no_consumer_names.py`'s own
-# `PUB_DECL_RE` already uses for this repo's Rust source (precedent, not a
-# full `syn`-AST parse — a real Rust AST walk would need a compiled helper
-# this Python gate does not carry; see the contract deviation this scope
-# note names). Any visibility (not `pub`-only, since a plan doc legitimately
-# cites a crate-private helper), plus `#[test] fn NAME` bodies.
-_PUB_PREFIX = r"(?:pub(?:\s*\([^)]*\))?\s+)?"
-IMPL_RE = re.compile(
-    r"^\s*impl(?:<[^>]*>)?\s+(?:[\w:]+(?:<[^>]*>)?\s+for\s+)?([A-Za-z_][\w:]*)"
-)
-ENUM_RE = re.compile(rf"^\s*{_PUB_PREFIX}enum\s+([A-Za-z_][A-Za-z0-9_]*)")
-STRUCT_RE = re.compile(rf"^\s*{_PUB_PREFIX}struct\s+([A-Za-z_][A-Za-z0-9_]*)")
-FN_RE = re.compile(rf"^\s*{_PUB_PREFIX}(?:async\s+)?(?:unsafe\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)")
-OTHER_ITEM_RE = re.compile(
-    rf"^\s*{_PUB_PREFIX}(?:unsafe\s+)?(?:trait|type|const|static|mod)\s+"
-    r"([A-Za-z_][A-Za-z0-9_]*)"
-)
-VARIANT_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\b")
-# A struct FIELD line: `[pub[(...)]] name: Type,` — scoped to a `struct`
-# container only (see the char-scan loop), so it never mistakes a `match`
-# arm or a block-local `let` binding for a field.
-FIELD_RE = re.compile(rf"^\s*{_PUB_PREFIX}([A-Za-z_][A-Za-z0-9_]*)\s*:\s*[^:]")
+SYMBOL_INDEX_CRATE = "symbol-index"
 
 
-def _rust_items_in_text(text: str) -> set[str]:
-    """Every bare item name (`fn`/`struct`/`enum`/`trait`/`type`/`const`/
-    `static`/`mod`, a `#[test]` fn included -- `#[test]` itself never
-    matches `FN_RE`, but the plain `fn NAME` line right after it always
-    does, `pub` or not), PLUS a qualified `Type::member` for every method
-    defined directly inside an `impl Type { ... }` / `impl Trait for Type
-    { ... }` block and every variant defined directly inside an `enum Name
-    { ... }` body -- both of these are exactly the shapes this repo's plan
-    docs actually cite (`Catalog::claim_next`, `AnchorKind::
-    UnpinnedAtInstant`).
+def build_symbol_index(roots: list[str], cwd: Path = REPO_ROOT) -> dict:
+    """Runs the REAL `symbol-index` tool (`ci/tools/symbol-index`) over
+    `roots` (each a path, relative to `cwd` or absolute) and returns the
+    parsed JSON index: `{"items": [{"path", "kind", "name", "qualified",
+    "vis", "line", "line_end", "is_test"}, ...], "calls": [...],
+    "files_scanned": N, "files_skipped": [...]}`. `cargo run --release` so
+    a cold build pays once and every later invocation against the SAME
+    `CARGO_TARGET_DIR` is incremental; this function never sets its own
+    `CARGO_TARGET_DIR`/`RUSTC_WRAPPER` — the caller's environment (if any)
+    is inherited unchanged, the same discipline every cargo-invoking
+    gate/agent in this repo already follows.
 
-    A brace-depth-tracked pass, rustfmt-style-assuming (a block's opening
-    `{` is on the SAME line as its `impl`/`enum` keyword — this repo's
-    `cargo fmt --check` gate makes that a checked assumption, not an
-    unverified one). Braces are walked CHARACTER BY CHARACTER, in true
-    left-to-right order, never as a per-line "count every `}` then count
-    every `{`" batch — a one-line method (`pub fn is_empty(&self) -> bool {
-    self.len == 0 }`, common after `rustfmt`) carries both an open and a
-    close on the SAME line, and batching would process that close BEFORE
-    the open even though the open comes first in the text, spuriously
-    popping the ENCLOSING `impl` block off the stack for the rest of the
-    file (the exact defect an executed run against this repo's own
-    `crates/jammi-db/src/catalog/jobs_repo.rs` found: every method after
-    the first one-line method in `impl Catalog` silently stopped
-    qualifying). Nested items past one level (a closure or a local `fn`
-    inside a method body) are still recorded as bare names but never
-    qualified — a stated, narrow limit: this repo's plan docs do not cite
-    those.
+    Raises `RuntimeError` (never returns a partial/guessed index) on a
+    non-zero exit or unparseable stdout — a build failure must be LOUD,
+    never silently read as "zero items, nothing resolves" (which would
+    make every citation in the tree look stale at once).
     """
-    names: set[str] = set()
-    depth = 0
-    stack: list[tuple[int, str, str]] = []  # (body_depth, kind, name)
-    for raw_line in text.splitlines():
-        # Declarations are always the FIRST token on their own line
-        # (rustfmt), so the depth/container to classify them by is the
-        # depth as of the START of this line -- untouched by any brace
-        # this same line goes on to open or close.
-        container = stack[-1] if stack and stack[-1][0] == depth else None
-
-        m_impl = IMPL_RE.match(raw_line)
-        m_enum = ENUM_RE.match(raw_line)
-        m_struct = STRUCT_RE.match(raw_line)
-        m_fn = FN_RE.match(raw_line)
-        m_other = OTHER_ITEM_RE.match(raw_line)
-
-        if m_impl:
-            names.add(m_impl.group(1).split("::")[-1])
-        elif m_enum:
-            names.add(m_enum.group(1))
-        elif m_struct:
-            names.add(m_struct.group(1))
-        elif m_fn:
-            name = m_fn.group(1)
-            names.add(name)
-            if container is not None and container[1] == "impl":
-                names.add(f"{container[2]}::{name}")
-        elif m_other:
-            names.add(m_other.group(1))
-        elif container is not None and container[1] == "enum":
-            vm = VARIANT_RE.match(raw_line)
-            if vm:
-                names.add(f"{container[2]}::{vm.group(1)}")
-        elif container is not None and container[1] == "struct":
-            fm = FIELD_RE.match(raw_line)
-            if fm:
-                names.add(f"{container[2]}::{fm.group(1)}")
-
-        # Now walk this line's braces left to right, updating depth/stack.
-        # `impl`/`enum`/`struct` push the block they open using the body
-        # depth their OWN opening brace produces -- found via the same char
-        # scan, not assumed to be "the only brace on the line". A
-        # brace-less tuple/unit struct (`struct Foo(i32);`) never matches a
-        # `{` on this line, so nothing is pushed for it -- correct, it has
-        # no field-body to scan.
-        pending_push: tuple[str, str] | None = None
-        if m_impl:
-            pending_push = ("impl", m_impl.group(1).split("::")[-1])
-        elif m_enum:
-            pending_push = ("enum", m_enum.group(1))
-        elif m_struct:
-            pending_push = ("struct", m_struct.group(1))
-        for ch in raw_line:
-            if ch == "{":
-                depth += 1
-                if pending_push is not None:
-                    stack.append((depth, pending_push[0], pending_push[1]))
-                    pending_push = None
-            elif ch == "}":
-                if stack and stack[-1][0] == depth:
-                    stack.pop()
-                depth -= 1
-    return names
+    proc = subprocess.run(
+        ["cargo", "run", "--release", "-p", SYMBOL_INDEX_CRATE, "--", *roots],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"{SYMBOL_INDEX_CRATE} failed (rc={proc.returncode}) over {roots}:\n"
+            f"{proc.stderr.strip()[-4000:]}"
+        )
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"{SYMBOL_INDEX_CRATE} did not emit valid JSON on stdout ({exc}); "
+            f"stderr tail:\n{proc.stderr.strip()[-2000:]}"
+        ) from exc
 
 
-def rust_file_defines(file_text: str, symbol: str) -> bool:
-    return symbol in _rust_items_in_text(file_text)
+def _index_paths(index: dict) -> list[str]:
+    """Every distinct file path the index carries at least one item for
+    (exactly as `symbol-index` recorded it — relative to whatever root was
+    given, or absolute if the root was)."""
+    return sorted({it["path"] for it in index["items"]})
 
 
-def find_rust_files(roots: list[Path]) -> list[Path]:
-    out: list[Path] = []
-    for root in roots:
-        if root.is_dir():
-            out.extend(sorted(root.rglob("*.rs")))
-    return out
+def _index_paths_matching_suffix(given: str, candidate_paths: list[str]) -> list[str]:
+    """Every path string in `candidate_paths` equal to `given`, or ending
+    with `/` + `given` (a bare/partial suffix) — string-suffix matching,
+    deliberately never `Path.relative_to`: the index's own paths may be
+    absolute (a self-test root outside the repo) or repo-relative (the
+    real `crates` root), and a plain string comparison works identically
+    either way with no rebasing."""
+    norm = given.lstrip("/")
+    exact = [p for p in candidate_paths if p == norm]
+    if exact:
+        return exact
+    return [p for p in candidate_paths if p.endswith("/" + norm)]
+
+
+def _file_defines(index: dict, path: str, symbol: str) -> bool:
+    return any(
+        it["path"] == path and (it["name"] == symbol or it.get("qualified") == symbol)
+        for it in index["items"]
+    )
+
+
+def _files_defining(index: dict, symbol: str) -> set[str]:
+    return {
+        it["path"]
+        for it in index["items"]
+        if it["name"] == symbol or it.get("qualified") == symbol
+    }
 
 
 def find_md_files(roots: list[Path]) -> list[Path]:
@@ -416,7 +382,7 @@ class Finding:
 
 
 def resolve_citation(
-    c: Citation, rust_files: list[Path], md_files: list[Path] | None = None, base: Path = REPO_ROOT
+    c: Citation, index: dict | None, md_files: list[Path] | None = None, base: Path = REPO_ROOT
 ) -> Finding | None:
     md_files = md_files if md_files is not None else []
     if c.kind == "toml":
@@ -480,26 +446,24 @@ def resolve_citation(
         return None
 
     if c.kind in ("rust", "bare_rust"):
+        if index is None:
+            return Finding(c, "no symbol index available to resolve against")
         if c.kind == "rust":
-            matches = resolve_path_suffix(c.target_path, rust_files, base=base)
+            matches = _index_paths_matching_suffix(c.target_path, _index_paths(index))
             if not matches:
                 return Finding(c, f"no file resolves for path `{c.target_path}`")
             if len(matches) > 1:
-                shown = ", ".join(str(p.relative_to(base)) for p in matches[:5])
+                shown = ", ".join(matches[:5])
                 return Finding(
                     c, f"ambiguous path `{c.target_path}` -- {len(matches)} files match: {shown}"
                 )
-            candidates = matches
+            hits = [p for p in matches if _file_defines(index, p, c.member)]
         else:
-            candidates = rust_files
-        hits = [
-            f for f in candidates
-            if rust_file_defines(f.read_text(errors="ignore"), c.member)
-        ]
+            hits = sorted(_files_defining(index, c.member))
         if not hits:
             return Finding(c, f"symbol `{c.member}` not found")
         if len(hits) > 1:
-            shown = ", ".join(str(p.relative_to(base)) for p in hits[:5])
+            shown = ", ".join(hits[:5])
             return Finding(
                 c, f"ambiguous symbol `{c.member}` -- defined in {len(hits)} files: {shown}"
             )
@@ -514,9 +478,9 @@ def scan_plan_docs() -> list[Finding]:
     for doc in docs:
         citations.extend(extract_citations(doc, doc.read_text(errors="ignore")))
     if not any(c.kind in ("rust", "bare_rust") for c in citations):
-        rust_files: list[Path] = []
+        index: dict | None = None
     else:
-        rust_files = find_rust_files([REPO_ROOT / "crates"])
+        index = build_symbol_index(["crates"])
     if not any(c.kind == "heading" for c in citations):
         md_files: list[Path] = []
     else:
@@ -528,7 +492,7 @@ def scan_plan_docs() -> list[Finding]:
         md_files = find_md_files([REPO_ROOT / "docs"]) + sorted(REPO_ROOT.glob("*.md"))
     findings: list[Finding] = []
     for c in citations:
-        f = resolve_citation(c, rust_files, md_files)
+        f = resolve_citation(c, index, md_files)
         if f is not None:
             findings.append(f)
     return findings
@@ -599,44 +563,54 @@ def self_test() -> int:
 
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
-        crate = root / "crates" / "fake_crate" / "src"
 
-        # --- renamed fn: RED when the cited name no longer exists ----------
+        # --- renamed fn: RED when the cited name no longer exists, against
+        # the REAL compiled symbol-index tool (a genuine end-to-end
+        # RED->GREEN, not a mocked/synthetic index) --------------------------
         rust_before = "pub fn compute_thing() -> i32 { 1 }\n"
         rust_after = "pub fn compute_thing_renamed() -> i32 { 1 }\n"
         f = _write(root, "crates/fake_crate/src/lib.rs", rust_before)
+        idx_before = build_symbol_index([str(root)])
         check(
-            "renamed fn: original name resolves before rename",
-            rust_file_defines(f.read_text(), "compute_thing"),
+            "renamed fn: original name resolves before rename (real symbol-index run)",
+            _files_defining(idx_before, "compute_thing") != set(),
         )
         f.write_text(rust_after)
+        idx_after = build_symbol_index([str(root)])
         check(
-            "renamed fn: old citation does NOT resolve after rename (RED)",
-            not rust_file_defines(f.read_text(), "compute_thing"),
+            "renamed fn: old citation does NOT resolve after rename (RED, real run)",
+            _files_defining(idx_after, "compute_thing") == set(),
         )
         check(
-            "renamed fn: new name resolves",
-            rust_file_defines(f.read_text(), "compute_thing_renamed"),
+            "renamed fn: new name resolves (real run)",
+            _files_defining(idx_after, "compute_thing_renamed") != set(),
         )
 
         # --- deleted struct ---------------------------------------------------
         struct_src = "pub struct Widget { pub x: i32 }\n"
         g = _write(root, "crates/fake_crate/src/widget.rs", struct_src)
-        check("deleted struct: resolves before deletion", rust_file_defines(g.read_text(), "Widget"))
-        g.write_text("// Widget removed.\n")
+        idx_before2 = build_symbol_index([str(root)])
         check(
-            "deleted struct: citation does NOT resolve after deletion (RED)",
-            not rust_file_defines(g.read_text(), "Widget"),
+            "deleted struct: resolves before deletion (real run)",
+            _files_defining(idx_before2, "Widget") != set(),
+        )
+        g.write_text("// Widget removed.\n")
+        idx_after2 = build_symbol_index([str(root)])
+        check(
+            "deleted struct: citation does NOT resolve after deletion (RED, real run)",
+            _files_defining(idx_after2, "Widget") == set(),
         )
 
         # --- ambiguous bare basename: two files define the SAME symbol -----
-        h1 = _write(root, "crates/a/src/training.rs", "pub fn shared_name() {}\n")
-        h2 = _write(root, "crates/b/src/training.rs", "pub fn shared_name() {}\n")
-        all_files = [h1, h2]
+        h1_rel = "crates/a/src/training.rs"
+        h2_rel = "crates/b/src/training.rs"
+        _write(root, h1_rel, "pub fn shared_name() {}\n")
+        _write(root, h2_rel, "pub fn shared_name() {}\n")
+        idx_amb = build_symbol_index([str(root)])
         c = Citation("x.md", 1, "`training.rs::shared_name`", "rust", "training.rs", "shared_name")
-        matches = resolve_path_suffix(c.target_path, all_files, base=root)
-        check("ambiguous bare basename: two files match the suffix", len(matches) == 2)
-        finding = resolve_citation(c, all_files, base=root)
+        matches = _index_paths_matching_suffix(c.target_path, _index_paths(idx_amb))
+        check("ambiguous bare basename: two files match the suffix (real index)", len(matches) == 2)
+        finding = resolve_citation(c, idx_amb)
         check("ambiguous bare basename: produces a finding", finding is not None)
         check(
             "ambiguous bare basename: finding names 'ambiguous'",
@@ -644,17 +618,16 @@ def self_test() -> int:
         )
         # A FULL (non-ambiguous) path to one of the two resolves cleanly.
         c_full = Citation(
-            "x.md", 1, "`crates/a/src/training.rs::shared_name`", "rust",
-            "crates/a/src/training.rs", "shared_name",
+            "x.md", 1, f"`{h1_rel}::shared_name`", "rust", h1_rel, "shared_name",
         )
-        matches_full = resolve_path_suffix(c_full.target_path, all_files, base=root)
+        matches_full = _index_paths_matching_suffix(c_full.target_path, _index_paths(idx_amb))
         check(
-            "full path to one of the two ambiguous files narrows to one",
-            matches_full == [h1],
+            "full path to one of the two ambiguous files narrows to one (real index)",
+            len(matches_full) == 1 and matches_full[0].endswith(h1_rel),
         )
         check(
-            "full path resolves cleanly through resolve_citation (no finding)",
-            resolve_citation(c_full, all_files, base=root) is None,
+            "full path resolves cleanly through resolve_citation (no finding, real index)",
+            resolve_citation(c_full, idx_amb) is None,
         )
 
         # --- heading rename ---------------------------------------------------
@@ -697,8 +670,10 @@ def self_test() -> int:
         return 1
     print(
         "check_plan_citations self-test: OK -- a renamed fn, a deleted struct, an "
-        "ambiguous bare basename, a heading rename, and a proto field removal all "
-        "reproduce the RED->GREEN shape; TOML key resolution and the placeholder "
+        "ambiguous bare basename, and a full-path disambiguation all reproduce the "
+        "RED->GREEN shape against the REAL, compiled symbol-index tool (never a "
+        "mocked index); a heading rename and a proto field removal reproduce it for "
+        "their own file-based resolution; TOML key resolution and the placeholder "
         "skip both hold."
     )
     return 0

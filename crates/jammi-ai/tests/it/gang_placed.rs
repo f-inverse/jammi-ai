@@ -21,7 +21,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::error::DataFusionError;
 use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream};
-use jammi_ai::fine_tune::worker::{training_test_hooks, JobWorker, PlacedGangSubmitter};
+use jammi_ai::fine_tune::worker::{
+    loop_test_hooks, training_test_hooks, JobWorker, PlacedGangSubmitter,
+};
 use jammi_ai::operator::gang_exec::{GangDescriptor, PlacedOutcome};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::Catalog;
@@ -588,4 +590,99 @@ async fn the_submitters_heartbeat_after_hand_off_never_resurrects_the_executors_
         before.lease_expires_at, after.lease_expires_at,
         "the lease is untouched by the stale holder's heartbeat"
     );
+}
+
+/// #500 wave 5 group E1, P7 pressure-round fix (adversarial-audit finding on
+/// `register_job_hold_or_release`): `run_placed_gang` takes its claim
+/// (`probe_claim`), snapshots its `WorkerShared` birth release-epoch in the
+/// SAME synchronous step, then makes two catalog round trips
+/// (`Catalog::transfer_claim`, `Catalog::get_job`) before the hold is
+/// registered. A RELEASE landing anywhere in that window — parked here
+/// immediately after the birth snapshot, before `transfer_claim` even runs —
+/// must still be caught by `register_job_hold_or_release`'s
+/// `released_since_birth` check and self-release the claim: never dispatch,
+/// never register a lease hold, `coordinate` never reached. The sweeps run
+/// before the transfer lands (the row is still the SUBMITTER's at that
+/// instant) and find nothing of this job's; the epoch comparison alone is
+/// what catches it.
+///
+/// Mutation (executed): in `JobWorker::run_placed_gang`, changing the final
+/// `WorkerShared::for_single_run(admission, worker.worker_id.clone(),
+/// claim_epoch)` call to ignore `claim_epoch` and read
+/// `admission.release_epoch()` live at that call site instead (the pre-fix
+/// shape, which reads the epoch only after both catalog round trips) reds
+/// this test: `run_placed_gang` returns `Ok(PlacedOutcome::Trained { .. })`
+/// instead of the expected `Err`, because by the time of that live read the
+/// RELEASE has already landed and is folded into the very value compared
+/// against itself, so `released_since_birth` reads `false` and the claim
+/// dispatches straight through the RELEASE. First line of the red output:
+/// `a claim that raced RELEASE must self-release, never dispatch: called
+/// \`Result::expect_err\` on an \`Ok\` value: Trained { artifact_digest: ...
+/// }`.
+#[tokio::test(flavor = "multi_thread")]
+async fn release_landing_between_probe_claim_and_transfer_self_releases_a_placed_gang() {
+    let (submitter, executor, _dir) = fleet().await;
+    let worker = JobWorker::new(&submitter).unwrap();
+    let record = submit_and_claim(&submitter, &worker, two_rank_graph_spec()).await;
+    let job_id = record.job_id.clone();
+    let submitter_id = submitter.instance_id().to_string();
+    let executor_id = executor.instance_id().to_string();
+
+    let descriptor = GangDescriptor {
+        job_id: job_id.clone(),
+        attempt: 1,
+        world: 2,
+        submitter: submitter_id.clone(),
+        device_kind: ComputeDeviceKind::Cpu,
+    };
+
+    let park = loop_test_hooks::arm(
+        &job_id,
+        loop_test_hooks::ParkPoint::PlacedGangBeforeTransfer,
+    );
+    let running = {
+        let executor = Arc::clone(&executor);
+        tokio::spawn(async move { JobWorker::run_placed_gang(&executor, descriptor).await })
+    };
+    park.wait_parked().await;
+
+    // The claim's own `WorkerShared` birth epoch is already snapshotted;
+    // land a RELEASE on the SAME session's admission now, before
+    // `transfer_claim` has even run — exactly the window a live
+    // `EmbeddedWorker` sharing this process's `HostAdmission` could deliver
+    // one in.
+    let (_holds, sweep) = executor.release_job_leases().await.unwrap();
+    assert_eq!(
+        sweep.jobs,
+        Some(0),
+        "the row is still the submitter's at this instant (no transfer yet); \
+         the sweep must not be what releases it here"
+    );
+    park.release();
+
+    let err = tokio::time::timeout(Duration::from_secs(30), running)
+        .await
+        .expect("run_placed_gang must return once the prologue self-releases")
+        .unwrap()
+        .expect_err("a claim that raced RELEASE must self-release, never dispatch");
+    assert!(
+        err.to_string().contains("left running for reclaim"),
+        "{err}"
+    );
+    assert!(
+        training_test_hooks::coordinator_ends_for(&job_id).is_empty(),
+        "coordinate must never run: the claim self-released before dispatch"
+    );
+
+    let after = row(submitter.catalog(), &job_id).await;
+    assert_eq!(after.status, "running", "{after:?}");
+    assert_eq!(
+        after.claimed_by.as_deref(),
+        Some(executor_id.as_str()),
+        "transfer_claim still lands (it runs after the park release); the \
+         self-release hands the lease back under the EXECUTOR's own \
+         claimed_by, never the submitter's"
+    );
+    assert!(after.lease_expires_at.is_none(), "{after:?}");
+    assert_eq!(after.releases, 1, "{after:?}");
 }

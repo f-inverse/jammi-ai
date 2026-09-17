@@ -1083,16 +1083,35 @@ impl WorkerShared {
     /// Fresh shared state for ONE claimed-job run OUTSIDE the claim-loop
     /// slot — `JobWorker::run_claimed_job`'s and `run_placed_gang`'s shared
     /// shape (`worker.rs`'s single private constructor for it, rather than
-    /// each caller inlining its own `Self::new` + live epoch read): the
-    /// hold sites read the session's phase/epoch, and — holding no claim
-    /// probe — leave the session's holder exactly as they found it, sitting
-    /// beside the loop's slot the way an inline `run_now` does. The
-    /// release-epoch snapshot is read live, right before use, matching what
-    /// a bare `phase()` read would have observed before `WorkerShared`
-    /// carried a birth snapshot at all.
-    fn for_single_run(admission: &Arc<HostAdmission>, worker_id: String) -> Arc<Self> {
-        let epoch = admission.release_epoch();
-        Self::new(Arc::clone(admission), worker_id, epoch)
+    /// each caller inlining its own `Self::new`): the hold sites read the
+    /// session's phase/epoch, and — holding no claim probe — leave the
+    /// session's holder exactly as they found it, sitting beside the loop's
+    /// slot the way an inline `run_now` does.
+    ///
+    /// `birth_epoch` is THIS run's true birth snapshot — the caller's own
+    /// job, not this function's: `run_claimed_job` has no earlier commit
+    /// event to align to (its record is already claimed when it is called),
+    /// so it reads `admission.release_epoch()` live, right before this call,
+    /// matching what a bare `phase()` read would have observed before
+    /// `WorkerShared` carried a birth snapshot at all. `run_placed_gang`'s
+    /// commit event is its own `HostAdmission::probe_claim()` — every byte
+    /// of work after that (`Catalog::transfer_claim`, `Catalog::get_job`,
+    /// both `.await`s) must be covered by the SAME birth snapshot a RELEASE
+    /// landing during either round trip has to race, so it reads the epoch
+    /// synchronously, right after `probe_claim()` returns, and carries that
+    /// value here rather than letting this constructor re-read it after the
+    /// round trips have already let a RELEASE slip past unseen (#500 wave 5
+    /// group E1, P7 pressure-round fix — the prior shape read the epoch
+    /// live IN this constructor, which for `run_placed_gang` ran only after
+    /// those two round trips: a RELEASE landing in that window bumped the
+    /// epoch before this constructor's own read, so `released_since_birth`
+    /// compared the post-release epoch against itself and read `false`).
+    fn for_single_run(
+        admission: &Arc<HostAdmission>,
+        worker_id: String,
+        birth_epoch: u64,
+    ) -> Arc<Self> {
+        Self::new(Arc::clone(admission), worker_id, birth_epoch)
     }
 
     /// The sampler's last snapshot (a copy).
@@ -1922,8 +1941,14 @@ impl JobWorker {
     ) {
         // A caller driving one claimed job outside a loop task runs it under
         // fresh shared state over the session's own admission — see
-        // `WorkerShared::for_single_run`'s own doc.
-        let shared = WorkerShared::for_single_run(&self.admission, self.worker_id.clone());
+        // `WorkerShared::for_single_run`'s own doc. No earlier commit event
+        // to align to here, so the birth epoch is read live, right before
+        // the call.
+        let shared = WorkerShared::for_single_run(
+            &self.admission,
+            self.worker_id.clone(),
+            self.admission.release_epoch(),
+        );
         self.run_claimed_job_under(session, record, &shared, false)
             .await;
     }
@@ -2546,8 +2571,15 @@ impl JobWorker {
     /// (i) takes this host's job slot through [`HostAdmission::probe_claim`]
     /// — exactly as the claim loop does (`Free → ClaimProbe`; a host
     /// already holding a rank, a loop-claimed job, or another placement's
-    /// probe/await refuses typed BEFORE any row write — OPS D6); (ii)
-    /// [`Catalog::transfer_claim`] moves `claimed_by` from
+    /// probe/await refuses typed BEFORE any row write — OPS D6) and, in the
+    /// SAME synchronous step (no `.await` between them), snapshots
+    /// `HostAdmission::release_epoch` as this run's `WorkerShared` birth —
+    /// the claim's true commit instant, not the moment `WorkerShared` is
+    /// later constructed (#500 wave 5 group E1, P7 pressure-round fix: a
+    /// RELEASE landing during (ii)/(iii) below must still be caught, and
+    /// only a birth snapshot taken THIS early, before either `.await`,
+    /// guarantees that — see `WorkerShared::for_single_run`'s own doc);
+    /// (ii) [`Catalog::transfer_claim`] moves `claimed_by` from
     /// `descriptor.submitter` to this instance at the SAME `attempts`,
     /// arming a fresh lease (`false` — the transfer never happened, a
     /// stale runner, or a second launch of an already-transferred attempt
@@ -2583,6 +2615,17 @@ impl JobWorker {
                 )
             }));
         };
+        // The birth snapshot for this run's `WorkerShared`, taken in the
+        // SAME synchronous step as `probe_claim()`'s own success (no
+        // `.await` above this line since the claim committed) — see this
+        // function's own doc, point (i), and `WorkerShared::for_single_run`.
+        let claim_epoch = admission.release_epoch();
+        #[cfg(feature = "test-hooks")]
+        loop_test_hooks::maybe_park(
+            &descriptor.job_id,
+            loop_test_hooks::ParkPoint::PlacedGangBeforeTransfer,
+        )
+        .await;
         let catalog = session.catalog();
         let lease = session.inner_config().lease.intervals()?.lease();
         let worker = JobWorker::new(session)?;
@@ -2626,7 +2669,7 @@ impl JobWorker {
                 return Err(e);
             }
         };
-        let shared = WorkerShared::for_single_run(admission, worker.worker_id.clone());
+        let shared = WorkerShared::for_single_run(admission, worker.worker_id.clone(), claim_epoch);
         let end = worker
             .run_claimed_job_under(session, record, &shared, true)
             .await;
@@ -5073,6 +5116,13 @@ pub mod loop_test_hooks {
         /// and before the hold is registered — the claim→hold prologue, on
         /// both the fine-tune and the compute path.
         BeforeHold,
+        /// Inside `JobWorker::run_placed_gang`, immediately after
+        /// `HostAdmission::probe_claim` succeeds and this run's
+        /// `WorkerShared` birth release-epoch is snapshotted, before
+        /// `Catalog::transfer_claim`/`Catalog::get_job` — the two catalog
+        /// round trips a RELEASE landing during them must still be caught
+        /// across (#500 wave 5 group E1, P7 pressure-round fix).
+        PlacedGangBeforeTransfer,
     }
 
     struct Armed {

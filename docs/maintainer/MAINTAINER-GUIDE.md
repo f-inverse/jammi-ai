@@ -3042,7 +3042,7 @@ this stream keeps, `PerRank(PartitionSpec)` for training or `All { batch }` for 
 prefetch depth (typed); production trains at `PRODUCTION_PREFETCH_DEPTH`
 (`crates/jammi-ai/src/fine_tune/stream.rs:121`, `= 2`) — a named constant, the regression
 pin for a `prefetch = 2` deadlock an earlier design hit, never a literal at the call site:
-`StreamConfig::new` (`crates/jammi-ai/src/fine_tune/worker.rs:6041`). `open`
+`StreamConfig::new` (`crates/jammi-ai/src/fine_tune/worker.rs:6091`). `open`
 (`crates/jammi-ai/src/fine_tune/stream.rs:379`) runs ONE bounded-memory pre-pass over its
 whole window BEFORE the first training step — a schema check plus, for a numeric target, a
 null/NaN aggregate — so a column-level refusal fires before step 0, not after thousands of
@@ -3055,13 +3055,13 @@ against the full corpus) and GradCache (treats the whole dataset as one in-batch
 batch) both need every row resident before an epoch begins, so a config taking either arm
 gets `Resident` (`crates/jammi-ai/src/fine_tune/source.rs:100`); every other text arm at
 `W = 1` gets `TrainingSource::Streamed`. `worker.rs`'s source selection calls this same
-`whole_set_arm` (`crates/jammi-ai/src/fine_tune/worker.rs:5985`) that the trainer's own
+`whole_set_arm` (`crates/jammi-ai/src/fine_tune/worker.rs:6035`) that the trainer's own
 dispatch refuses a mismatch against, so the two decisions can never come apart. A
 `Streamed` source never collects a `Vec<RecordBatch>` for the training set at all — the
 worker calls only `training_set::materialize_projection_table`
-(`crates/jammi-ai/src/fine_tune/worker.rs:3601`), never `read_back`/
+(`crates/jammi-ai/src/fine_tune/worker.rs:3644`), never `read_back`/
 `read_back_with_reservation` — while a `Resident` loader's construction reads back through
-`read_back_with_reservation` (`crates/jammi-ai/src/fine_tune/worker.rs:5993`) — defined at
+`read_back_with_reservation` (`crates/jammi-ai/src/fine_tune/worker.rs:6043`) — defined at
 `read_back_with_reservation` (`crates/jammi-ai/src/fine_tune/training_set.rs:238`) — and
 attaches the live
 `MemoryReservation` to the loader via `with_reservation`
@@ -3080,7 +3080,7 @@ is pinned by `p_r_a_resident_loader_holds_its_eager_reservation_while_training_r
 **A task-local tenant scope does not cross `tokio::spawn` or a `block_on` from the
 blocking pool.** `tenant` (`crates/jammi-ai/src/fine_tune/source.rs:60`) on `StreamedSet`
 captures the job's tenant via `tenant` (`crates/jammi-ai/src/session.rs:764`) on
-`InferenceSession` while `run_spec` (`crates/jammi-ai/src/fine_tune/worker.rs:3561`) is still
+`InferenceSession` while `run_spec` (`crates/jammi-ai/src/fine_tune/worker.rs:3604`) is still
 executing inside the caller's `with_tenant_scoped` task-local scope; `open_streamed_source`
 (`crates/jammi-ai/src/fine_tune/trainer.rs:4098`) drives the stream's own `open` through
 `Handle::block_on` from the `spawn_blocking` pool, which starts a FRESH top-level poll on a
@@ -4314,8 +4314,8 @@ two-host fleet could not otherwise assemble a `Peer` gang if its only
 free-looking host were the one awaiting its own placement result.
 `probe_claim` still refuses `Awaiting`, exactly like `JobRun`.
 
-`submit_placed` (`crates/jammi-ai/src/fine_tune/worker.rs:2404`) submits the descriptor and awaits the
-stream; its exit arms are total — `submit_placed` (`crates/jammi-ai/src/fine_tune/worker.rs:2404`) documents them: the stream ends
+`submit_placed` (`crates/jammi-ai/src/fine_tune/worker.rs:2429`) submits the descriptor and awaits the
+stream; its exit arms are total — `submit_placed` (`crates/jammi-ai/src/fine_tune/worker.rs:2429`) documents them: the stream ends
 with at least one batch → `WorkerJobError::HandedOff` (the executor owns
 the attempt now: no terminal write, no release); the stream ends in an
 error or with no batch → re-read the row — `claimed_by` still this
@@ -4335,7 +4335,7 @@ must FAIL a transfer, the opposite of how a reclaim sweep reads that same
 `NULL`). `attempts`/`releases` are untouched by design: a hand-off is zero
 net attempts, never a re-claim.
 
-`run_placed_gang` (`crates/jammi-ai/src/fine_tune/worker.rs:2568`, called from the
+`run_placed_gang` (`crates/jammi-ai/src/fine_tune/worker.rs:2600`, called from the
 executor role's `PlacedGangRunner`) — (i) takes this host's job slot
 through `HostAdmission::probe_claim` (a host already holding a rank, a
 loop-claimed job, or another placement refuses typed BEFORE any row write,

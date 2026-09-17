@@ -980,7 +980,13 @@ def check_required_call_site_set(cwd: Path, unit_slug: str, rows: list[dict],
 
     try:
         required_set, index = _r12_required_call_site_set(cwd, added)
-    except RuntimeError as exc:
+    except (RuntimeError, OSError) as exc:
+        # `OSError` (its own `FileNotFoundError` subclass included) covers
+        # the ONE environment this reader cannot assume: `check_rigor_
+        # record.py`'s OTHER checks are deliberately toolchain-free (this
+        # script's own module doc), so a run with no `cargo` on `PATH` at
+        # all must degrade to advisory here, never crash the whole script
+        # for every OTHER check this same invocation still owes a verdict.
         result.warn(f"{path}: could not build the symbol-index required call-site set — {exc} "
                     "(advisory; the shape check above still applies)")
         return
@@ -3270,6 +3276,26 @@ def fixture_rr43_mutation_site_resolves_to_real_call_satisfies() -> None:
                 f"a mutations site naming a real call expression must resolve, got: {r.failures}")
 
 
+def fixture_rr44_no_cargo_on_path_degrades_to_advisory() -> None:
+    """issue #557 item 2, robustness: `check_rigor_record.py`'s OTHER
+    checks are deliberately toolchain-free (this script's own module
+    doc) -- a run with no `cargo` on `PATH` at all must never CRASH the
+    whole script (an unhandled `FileNotFoundError` would deny every
+    OTHER check this same invocation still owes a verdict); it degrades
+    to a named advisory instead. `PATH` is overridden to `/usr/bin:/bin`
+    (a real, minimal PATH carrying no `cargo`) for this ONE invocation
+    only -- never the process-wide environment."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        rust = "pub fn compute_new() -> i32 {\n    1\n}\n"
+        _rr_call_site_setup(work, rust, mutations_site="src/lib.rs:1")
+        r = _run_check_in(work, env_overrides={"PATH": "/usr/bin:/bin"})
+        _assert(any("could not build the symbol-index required call-site set" in w for w in r.warnings),
+                "RR44", f"a missing cargo must degrade to a named advisory, got warnings: {r.warnings}")
+        _assert(not any("phantom site" in f for f in r.failures), "RR44",
+                f"a missing cargo must never be reported as a phantom site, got: {r.failures}")
+
+
 RR_FIXTURES = [
     ("RR1", fixture_rr1_not_armed_docs_only),
     ("RR2", fixture_rr2_armed_no_record),
@@ -3321,6 +3347,7 @@ RR_FIXTURES = [
     ("RR41", fixture_rr41_mutation_site_resolves_to_real_def_satisfies),
     ("RR42", fixture_rr42_phantom_mutation_site_fails),
     ("RR43", fixture_rr43_mutation_site_resolves_to_real_call_satisfies),
+    ("RR44", fixture_rr44_no_cargo_on_path_degrades_to_advisory),
 ]
 
 

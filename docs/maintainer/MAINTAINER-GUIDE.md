@@ -725,7 +725,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   table, migration 029) and a `building` `result_tables` row both share —
   `LEASE_TS_FORMAT` (a fixed-width UTC format whose lexicographic
   order matches chronological order, so `lease_expires_at < $now` needs no
-  dialect-specific interval arithmetic), `lease_now()`/`lease_deadline(lease)`,
+  dialect-specific interval arithmetic), `canonical_stamp_now()`/`lease_deadline(lease)`,
   `LeaseIntervals { lease,
   heartbeat }` (only buildable through `config::LeaseConfig::intervals()` or
   `Default`, enforcing `heartbeat * 2 < lease` and both non-zero at

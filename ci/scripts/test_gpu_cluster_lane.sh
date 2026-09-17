@@ -2076,6 +2076,7 @@ run_two_ranks_fixture() { # $1=rank0 script body $2=rank1 script body $3=RP_INAC
             last="${@: -1}"; case "$last" in "'"$P12_DIR"'"/*) head -c 128 /dev/zero > "$last" ;; esac; }
     _rpc_remote_id_size() { cat "'"$P12_DIR"'/idsize" 2>/dev/null; }
     _rpc_phase() { echo "=== PHASE ($SECONDS)s: $* ==="; }
+    CLUSTER_ARTIFACT_DIR="'"$P12_DIR"'/artifact"
     sleep() { command sleep 0.1; }
     _rpc_run_two_ranks "10.0.0.1" "2201" "10.0.0.2" "2202"; rc=$?
     echo "RC=$rc id_landed=${id_landed} rank0_rc=${rank0_rc:-?} rank1_rc=${rank1_rc:-?}"
@@ -2097,8 +2098,9 @@ else
 fi
 r0_dies='echo start0; command sleep 0.2; exit 3'
 out="$(run_two_ranks_fixture "$r0_dies" "$r1_happy" 30 600)"
-if printf '%s' "$out" | grep -q "RC=76" && printf '%s' "$out" | grep -q "::error::rank 0 ended (rc=3) before minting the 128-byte id file"; then
-  ok "P12: rank 0 exiting before the id is minted -> 76 with rank 0's own rc named; no scp ever attempted"
+if printf '%s' "$out" | grep -q "RC=76" && printf '%s' "$out" | grep -q "::error::rank 0 ended (rc=3) before minting the 128-byte id file" \
+   && grep -q "start0" "$P12_DIR/artifact/rank0.log" && grep -q "start1" "$P12_DIR/artifact/rank1.log"; then
+  ok "P12: rank 0 exiting before the id is minted -> 76 with rank 0's own rc named; no scp ever attempted; BOTH rank logs shipped into the artifact dir on this refusal arm"
 else
   bad "P12: expected 76 naming rank 0's rc; out=$out"
 fi

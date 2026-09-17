@@ -848,6 +848,24 @@ export NCCL_SOCKET_IFNAME="\$iface"
 IFACE
 }
 
+# Every rank log the run produced ships in the artifact on EVERY exit arm —
+# a refusal that leaves only "rank 0 ended (rc=97)" in run.log and the
+# reason on a terminated pod is not a diagnosis (run 35166195386). The
+# id-secrecy scan already covers `$CLUSTER_ARTIFACT_DIR`, so the logs are
+# scanned like every other carrier before upload.
+_rpc_ship_rank_logs() {
+  mkdir -p "$CLUSTER_ARTIFACT_DIR"
+  [ -n "${rank0_log:-}" ] && cp -f "$rank0_log" "${CLUSTER_ARTIFACT_DIR}/rank0.log" 2>/dev/null || echo "::warning::could not copy rank 0's own log into ${CLUSTER_ARTIFACT_DIR}"
+  [ -n "${rank1_log:-}" ] && cp -f "$rank1_log" "${CLUSTER_ARTIFACT_DIR}/rank1.log" 2>/dev/null || echo "::warning::could not copy rank 1's own log into ${CLUSTER_ARTIFACT_DIR}"
+}
+
+_rpc_run_two_ranks() {
+  local rc=0
+  _rpc_run_two_ranks_inner "$@" || rc=$?
+  _rpc_ship_rank_logs
+  return "$rc"
+}
+
 # The size of rank 0's id file, read over ssh: the ONE probe the id crossing
 # polls. A helper so the lane suite can drive `_rpc_run_two_ranks` with a
 # fixture that mints the id after N polls.
@@ -870,7 +888,7 @@ _rpc_remote_id_size() { # $1=host $2=port
 #   `member_extra_sshopts[@]` (global; empty under `pods`) rides on every
 #   member call. Sets the globals the assembly step reads: rank0_log,
 #   rank1_log, rank0_rc, rank1_rc, STAGING_ID_FILE, id_landed.
-_rpc_run_two_ranks() {
+_rpc_run_two_ranks_inner() {
   local primary_host="${1:?_rpc_run_two_ranks needs the primary host}" \
         primary_port="${2:?_rpc_run_two_ranks needs the primary port}" \
         member_host="${3:?_rpc_run_two_ranks needs the member host}" \
@@ -1563,9 +1581,7 @@ _rpc_run_two_ranks "$primary_host" "$primary_port" "$member_host" "$member_port"
 # too, pass or fail alike -- copied here, unconditionally, before any
 # pass/fail branching below, rather than only on a path that might exit
 # early.
-mkdir -p "$CLUSTER_ARTIFACT_DIR"
-cp -f "$rank0_log" "${CLUSTER_ARTIFACT_DIR}/rank0.log" 2>/dev/null || echo "::warning::could not copy rank 0's own log into ${CLUSTER_ARTIFACT_DIR}"
-cp -f "$rank1_log" "${CLUSTER_ARTIFACT_DIR}/rank1.log" 2>/dev/null || echo "::warning::could not copy rank 1's own log into ${CLUSTER_ARTIFACT_DIR}"
+mkdir -p "$CLUSTER_ARTIFACT_DIR"  # rank logs already shipped by _rpc_run_two_ranks, on every arm
 
 rp_cluster_rank_verdict "$rank0_rc" "$rank0_log"; rank0_final=$?
 rp_cluster_rank_verdict "$rank1_rc" "$rank1_log"; rank1_final=$?
@@ -1715,9 +1731,7 @@ rp_wait_sshd "$member_host" "$member_port" "$RP_SSH_WAIT_SECS" "rank 1" || exit 
 
 _rpc_run_two_ranks "$primary_host" "$primary_port" "$member_host" "$member_port" || exit $?
 
-mkdir -p "$CLUSTER_ARTIFACT_DIR"
-cp -f "$rank0_log" "${CLUSTER_ARTIFACT_DIR}/rank0.log" 2>/dev/null || echo "::warning::could not copy rank 0's own log into ${CLUSTER_ARTIFACT_DIR}"
-cp -f "$rank1_log" "${CLUSTER_ARTIFACT_DIR}/rank1.log" 2>/dev/null || echo "::warning::could not copy rank 1's own log into ${CLUSTER_ARTIFACT_DIR}"
+mkdir -p "$CLUSTER_ARTIFACT_DIR"  # rank logs already shipped by _rpc_run_two_ranks, on every arm
 
 rp_cluster_rank_verdict "$rank0_rc" "$rank0_log"; rank0_final=$?
 rp_cluster_rank_verdict "$rank1_rc" "$rank1_log"; rank1_final=$?

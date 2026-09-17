@@ -1914,17 +1914,17 @@ def fixture_rr24_inspector_only_fails() -> None:
 
 def fixture_rr27_shared_validator_entry_not_object_denies() -> None:
     """issue #569: the shared validator's OWN "is not an object" arm
-    (`_r12_anticipation_rejection`, marked `# R12-RESIDUAL` in
-    `lead-gate-lib.py`) -- reader 3 has no by-file pre-check at all (its
-    own preceding loop explicitly SKIPS a non-dict `entry`, see this
-    file's own `check_anticipation_witnesses`), so a malformed
-    `attacks[key]` reaches the shared validator's marked arm DIRECTLY,
-    never `_r12_validate_and_run_entry`'s per-entry runner (reader 1's
-    OWN second implementation of the identical three checks). Binds to
-    the arm's OWN producer text (`anticipation-validator:`), asserting the
-    OTHER producer's text (`anticipation artifact`) is ABSENT -- the two
-    are satisfiable by the same substring `is not an object` alone, which
-    is exactly what let this arm's own coverage go unexercised before."""
+    (`_r12_anticipation_rejection` in `lead-gate-lib.py`) -- reader 3 has
+    no by-file pre-check at all (its own preceding loop explicitly SKIPS a
+    non-dict `entry`, see this file's own `check_anticipation_witnesses`),
+    so a malformed `attacks[key]` reaches the shared validator's own arm
+    DIRECTLY, never `_r12_validate_and_run_entry`'s per-entry runner
+    (reader 1's OWN second implementation of the identical three checks).
+    Binds to the arm's OWN producer text (`anticipation-validator:`),
+    asserting the OTHER producer's text (`anticipation artifact`) is
+    ABSENT -- the two are satisfiable by the same substring `is not an
+    object` alone, which is exactly what let this arm's own coverage go
+    unexercised before."""
     with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
         _origin, work = _pr_repo(Path(td))
         _rr_anticipation_commit(work, {

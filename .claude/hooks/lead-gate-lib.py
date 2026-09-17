@@ -2678,7 +2678,7 @@ def _r12_normalize_ts_instant(ts: object) -> datetime | None:
     `None` for: not a non-empty string; a string that does not parse via
     `datetime.fromisoformat` (a trailing `Z` is rewritten to `+00:00`
     first, the one substitution `fromisoformat` itself does not accept);
-    and — the case fix round 6's own `_row_instant` got wrong — a value
+    and — the shape a naive `datetime` parse alone gets wrong — a value
     that PARSES but is NAIVE (no UTC offset at all). A naive value is
     refused as unparseable, exactly like a missing one, rather than fed
     into a `datetime` comparison against an aware sibling: mixing a naive

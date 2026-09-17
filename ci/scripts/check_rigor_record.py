@@ -123,6 +123,42 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LEAD_GATE_LIB = REPO_ROOT / ".claude" / "hooks" / "lead-gate-lib.py"
 RIGOR_DIR = REPO_ROOT / "docs" / "rigor"
+
+# --------------------------------------------------------------------------- #
+# rust symbol index (ci/tools/symbol-index -- a real `syn` AST parse). This
+# repo's convention (see check_plan_citations.py / check_no_consumer_names.py,
+# its first two consumers) is a small, independently-maintained COPY of this
+# one function per CI script that needs it, never a cross-script import — the
+# tool's own module doc names this file as its third intended consumer
+# (issue #557 item 2, the AST-derived required call-site set).
+# --------------------------------------------------------------------------- #
+
+SYMBOL_INDEX_CRATE = "symbol-index"
+
+
+def build_symbol_index(roots: list[str], cwd: Path = REPO_ROOT) -> dict:
+    """Runs the REAL `symbol-index` tool over `roots` and returns the parsed
+    JSON index (`{"items": [...], "calls": [...], ...}`). Raises
+    `RuntimeError` on a non-zero exit or unparseable stdout — never returns a
+    partial/guessed index."""
+    proc = subprocess.run(
+        ["cargo", "run", "--release", "-p", SYMBOL_INDEX_CRATE, "--", *roots],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"{SYMBOL_INDEX_CRATE} failed (rc={proc.returncode}) over {roots}:\n"
+            f"{proc.stderr.strip()[-4000:]}"
+        )
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"{SYMBOL_INDEX_CRATE} did not emit valid JSON on stdout ({exc}); "
+            f"stderr tail:\n{proc.stderr.strip()[-2000:]}"
+        ) from exc
 ALLOWLIST_PATH = REPO_ROOT / "ci" / "scripts" / "rigor_record_allowlist.txt"
 # esc-lead-gate-R12 (M3'): in-flight units whose second-round BLOCK predates
 # fix round 1's anticipation mechanism land without a
@@ -742,6 +778,224 @@ def check_attestation_witnesses(cwd: Path, unit_slug: str, rows: list[dict],
         )
 
 
+_RR_HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def _rust_added_lines_by_file(cwd: Path, range_spec: str) -> dict[str, set[int]]:
+    """`{path: {new_line_no, ...}}` for every ADDED (`+`) line in a `.rs`
+    file under `git diff --unified=0 <range_spec>` — the SAME `+++
+    b/<path>` / `@@ -a,b +c,d @@` tracking `check_no_consumer_names.py`'s
+    `added_crate_lines_with_paths` already established, applied here to ANY
+    `.rs` path (never scoped to `crates/` alone — a `mutations[].site` can
+    legitimately name a file under `ci/tools/**` too) and returning a
+    per-file LINE SET (never text) since `_r12_required_call_site_set`
+    cross-references the symbol-index's OWN line numbers, not the diff's
+    raw text a second time."""
+    ok, diff_out = _git(cwd, "diff", "--unified=0", "--end-of-options", range_spec)
+    if not ok:
+        return {}
+    out: dict[str, set[int]] = {}
+    current_file: str | None = None
+    new_line_no = 0
+    for line in diff_out.splitlines():
+        if line.startswith("+++ "):
+            raw_path = line[len("+++ "):]
+            if raw_path.startswith("b/"):
+                raw_path = raw_path[2:]
+            current_file = None if raw_path == "/dev/null" else raw_path
+            continue
+        if line.startswith("+++"):
+            continue
+        if line.startswith("@@ "):
+            m = _RR_HUNK_HEADER_RE.match(line)
+            if m:
+                new_line_no = int(m.group(1))
+            continue
+        if line.startswith("+") and current_file is not None:
+            if current_file.endswith(".rs"):
+                out.setdefault(current_file, set()).add(new_line_no)
+            new_line_no += 1
+    return out
+
+
+def _r12_required_call_site_set(cwd: Path, added: dict[str, set[int]]) -> tuple[set[str], dict]:
+    """issue #557 item 2: the REQUIRED call-site set, derived from a REAL
+    `syn` AST parse (`ci/tools/symbol-index`), never a regex reader and
+    never a hand list — `{"path:line", ...}` covering:
+
+      (a) every NEW non-test fn/method DEFINITION this diff's own added
+          lines (`added`) introduce, and
+      (b) every NEW call site this diff's own added lines add, whose
+          callee's bare name matches a fn/method whose OWN pre-existing
+          definition span this SAME diff also touches (`changed_fn_names`
+          — a "changed fn", never a "new fn": (a) and (b) are disjoint
+          categories of the ONE property, "this diff makes new or
+          different code run").
+
+    `index` (the raw symbol-index JSON, covering the FULL text of every
+    scanned file, not just added lines) is returned alongside so a caller
+    can also ask "does this path:line resolve to ANY real position at
+    HEAD" (`_r12_site_resolves`, below) without a second `cargo run`.
+    `roots` are the PARENT DIRECTORIES of `added`'s own files, de-
+    duplicated — `symbol-index`'s own `walkdir` then covers every sibling
+    file in the same directory too (a legitimate `mutations[].site` in an
+    UNTOUCHED sibling file inside a touched directory still resolves), a
+    stated, bounded widening, never the whole `crates/` tree."""
+    if not added:
+        return set(), {"items": [], "calls": []}
+    roots = sorted({str((cwd / rel).parent) for rel in added})
+    index = build_symbol_index(roots)
+
+    def _rel(index_path: str) -> str | None:
+        for rel in added:
+            if index_path == rel or index_path.endswith("/" + rel):
+                return rel
+        return None
+
+    fn_items = [it for it in index.get("items", [])
+                if it.get("kind") == "fn" and not it.get("is_test")]
+    new_defs: set[str] = set()
+    changed_fn_names: set[str] = set()
+    for it in fn_items:
+        rel = _rel(it["path"])
+        if rel is None:
+            continue
+        new_lines = added.get(rel, set())
+        line, line_end = it["line"], it.get("line_end", it["line"])
+        if line in new_lines:
+            new_defs.add(f"{rel}:{line}")
+        elif any(l in new_lines for l in range(line, line_end + 1)):
+            changed_fn_names.add(it["name"])
+
+    new_call_sites: set[str] = set()
+    for c in index.get("calls", []):
+        rel = _rel(c["path"])
+        if rel is None or c.get("in_test"):
+            continue
+        new_lines = added.get(rel, set())
+        if c["line"] in new_lines and c["callee"] in changed_fn_names:
+            new_call_sites.add(f"{rel}:{c['line']}")
+
+    return new_defs | new_call_sites, index
+
+
+def _r12_site_resolves(site: str, index: dict) -> bool:
+    """`True` iff `site` (a `mutations[].site` string, `"path:line"` per
+    `_r12_mutations_array_rejection`'s own shape check) names a REAL
+    position in `index` — either inside an item's own `[line, line_end]`
+    span or exactly a call site's own `line` — matched by path SUFFIX
+    (`index`'s own `path` is however `symbol-index` reported it,
+    ABSOLUTE when `roots` were absolute; `site`'s own path is always the
+    diff/repo-relative form `_r12_mutations_array_rejection` never
+    normalizes). Never "the file exists" alone — that would accept ANY
+    line number in a real file as if it named something; a phantom site
+    is exactly a `path:line` this returns `False` for."""
+    if ":" not in site:
+        return False
+    rel_path, _, line_txt = site.rpartition(":")
+    if not line_txt.isdigit():
+        return False
+    line = int(line_txt)
+
+    def _matches(index_path: str) -> bool:
+        return index_path == rel_path or index_path.endswith("/" + rel_path)
+
+    for it in index.get("items", []):
+        if _matches(it["path"]) and it["line"] <= line <= it.get("line_end", it["line"]):
+            return True
+    for c in index.get("calls", []):
+        if _matches(c["path"]) and c["line"] == line:
+            return True
+    return False
+
+
+def check_required_call_site_set(cwd: Path, unit_slug: str, rows: list[dict],
+                                  range_spec: str, result: Result) -> None:
+    """issue #557 item 2 (Reader 3's AST-derived required call-site set):
+    `mutations[].site` is LEAD-ATTESTED text a human cannot mechanically
+    catch FABRICATION in merely by re-validating its JSON SHAPE
+    (`_r12_mutations_array_rejection`, already run by
+    `check_attestation_witnesses`, above — shape alone accepts
+    `"site": "nowhere.rs:99999"` exactly as readily as a real one). This
+    reader independently derives, from a REAL `syn` AST parse of the
+    diff's own touched `.rs` files (`ci/tools/symbol-index`, never a
+    regex reader and never a hand list), whether EACH committed
+    `mutations[].site` resolves to a real definition or call site at
+    HEAD — an unresolvable ("phantom") site is a hard FAIL, named by
+    text, LAYERED ON TOP OF the shape check above, never a re-derivation
+    of it.
+
+    Armed only over rows whose `mutations` array ALREADY passes the
+    shared shape check (never re-derives THAT arming a second time — the
+    exact class RR31 exists to catch) and only over `.rs`-named sites (a
+    Python `mutations[].site` stays covered by the shape check alone —
+    this reader carries a Rust index only, stated, never silently
+    widened to a language it cannot parse). A no-op whenever the diff
+    touches no `.rs` file, or no committed row carries a shape-valid,
+    non-empty `mutations` array at all."""
+    mod = _lib_module()
+    block_rows = _r12_second_round_block_rows(mod, rows)
+    if not block_rows:
+        return
+
+    path = f"docs/rigor/{unit_slug}.attestation.jsonl"
+    ok, text = _git(cwd, "show", f"HEAD:{path}")
+    if not ok or not text.strip():
+        return  # check_attestation_witnesses already reports a missing-when-required file
+
+    art_rows: list[tuple[int, dict]] = []
+    for i, line in enumerate(text.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            art_rows.append((i + 1, parsed))
+    quiet = Result()
+    art_rows = _r12_reject_foreign_attestation_rows(path, art_rows, quiet)
+
+    mutation_sites: list[tuple[int, str]] = []
+    for lineno, row in art_rows:
+        mutations = row.get("mutations")
+        if mod._r12_mutations_array_rejection(mutations) is not None:
+            continue  # not shape-valid -- check_attestation_witnesses already names this
+        for entry in mutations:
+            site = entry.get("site")
+            if isinstance(site, str) and site.strip():
+                mutation_sites.append((lineno, site))
+    if not mutation_sites:
+        return  # no shape-valid `mutations` row to examine -- nothing for this reader to add
+
+    rust_sites = [(lineno, site) for lineno, site in mutation_sites
+                  if site.rpartition(":")[0].endswith(".rs")]
+    if not rust_sites:
+        return  # every committed site names a non-Rust file
+
+    added = _rust_added_lines_by_file(cwd, range_spec)
+    if not added:
+        return  # this diff touches no `.rs` file -- nothing to derive a required set from
+
+    try:
+        required_set, index = _r12_required_call_site_set(cwd, added)
+    except RuntimeError as exc:
+        result.warn(f"{path}: could not build the symbol-index required call-site set — {exc} "
+                    "(advisory; the shape check above still applies)")
+        return
+
+    for lineno, site in rust_sites:
+        if _r12_site_resolves(site, index):
+            continue
+        hint = sorted(required_set)[:3] or "(none — this diff adds no new Rust definition or " \
+            "call site of a changed fn)"
+        result.fail(
+            f"{path}:{lineno}: mutations `site` {site!r} does not resolve to a real definition "
+            f"or call site at HEAD (symbol-index, issue #557 item 2) — a phantom site; the "
+            f"diff's own AST-derived required set names, e.g., {hint}"
+        )
+
+
 def _r12_select_governing_anticipation_row(mod, path: str, text: str) -> dict | None:
     """The SAME governing-row selection `check_required_gates` runs (head
     match, else the greatest normalized `ts` instant), reused here rather
@@ -1042,6 +1296,13 @@ def run_check(cwd: Path = REPO_ROOT) -> Result:
         # additionally re-derives (never reads) whether item 8b/8c's own
         # requirement actually fired for THIS diff.
         check_attestation_witnesses(
+            cwd, unit_slug, [r for r in rows if isinstance(r, dict)], range_spec, result)
+
+        # issue #557 item 2: the CI-derived required call-site set (a real
+        # `syn` AST parse via ci/tools/symbol-index, never a regex reader
+        # or a hand list) — layered on top of check_attestation_witnesses'
+        # own shape check; a phantom `mutations[].site` is a hard FAIL.
+        check_required_call_site_set(
             cwd, unit_slug, [r for r in rows if isinstance(r, dict)], range_spec, result)
 
         # esc-lead-gate-R12 fix round 3 item 8a READER 3 — armed
@@ -2921,6 +3182,88 @@ def fixture_rr40_correctly_named_residual_satisfies() -> None:
                 f"a correctly-named residual must satisfy #570, got: {r.failures}")
 
 
+# --------------------------------------------------------------------------- #
+# issue #557 item 2: the CI-derived required call-site set
+# (`check_required_call_site_set`), a real `syn` AST parse via
+# `ci/tools/symbol-index` -- never a regex reader, never a hand list.
+# --------------------------------------------------------------------------- #
+
+def _rr_call_site_setup(work: Path, rust_file_content: str, mutations_site: str) -> None:
+    """Shared setup for RR41-43: an open second-round BLOCK naming
+    `src/lib.rs` (`finding_locations`), a real committed `src/lib.rs` (so
+    item 8b's own `mod._parse_new_surfaces` arming ALSO fires -- the SAME
+    arming condition `_rr_attestation_block_setup` uses for `a.py`, a
+    `.rs` file this time so `check_required_call_site_set` arms too), plus
+    a `lead-relay-attestation` row whose ONE `mutations` entry's `site` is
+    `mutations_site` -- the caller's own choice, real for a positive
+    control, fabricated for the phantom-site fixture."""
+    pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+    block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                             "verdict": "BLOCK", "finding_locations": ["src/lib.rs:1"],
+                             "class_enumeration": ["src/lib.rs:1"]})
+    good_row = json.dumps({
+        "kind": "lead-relay-attestation", "unit_branch": "feat/rr-fixture",
+        "agent_type": "adversarial-audit", "block_ts": "2026-01-01T00:01:00Z",
+        "mutations": [{"site": mutations_site, "command": "python3 -c \"print('ok')\"",
+                        "rc_before": 0, "rc_after": 1, "marker_after": "test result: FAILED"}],
+    })
+    files = {
+        "ci/scripts/probe.py": "print('x')\n",
+        "src/lib.rs": rust_file_content,
+        "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+        "docs/rigor/feat_rr-fixture.attestation.jsonl": good_row + "\n",
+        "docs/README-fixture.md": "line one\n",
+        "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+    }
+    _commit(work, "ci: touch a gate script (new .rs def, item 8b + #557 item 2 armed)", files)
+
+
+def fixture_rr41_mutation_site_resolves_to_real_def_satisfies() -> None:
+    """issue #557 item 2, positive control: `mutations[0].site` names the
+    EXACT line of a real, newly-added `pub fn compute_new()` in
+    `src/lib.rs` -- the symbol-index-derived required set's own `new_defs`
+    entry. `check_required_call_site_set` must report no failure."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        rust = "pub fn compute_new() -> i32 {\n    1\n}\n"
+        _rr_call_site_setup(work, rust, mutations_site="src/lib.rs:1")
+        r = _run_check_in(work)
+        joined = " | ".join(r.failures)
+        _assert("phantom site" not in joined, "RR41",
+                f"a mutations site naming a real new definition must resolve, got: {r.failures}")
+
+
+def fixture_rr42_phantom_mutation_site_fails() -> None:
+    """issue #557 item 2: `mutations[0].site` names `src/lib.rs:999` --
+    the real committed file has only 3 lines. Must FAIL by name as a
+    phantom site, never merely accepted because the FILE exists."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        rust = "pub fn compute_new() -> i32 {\n    1\n}\n"
+        _rr_call_site_setup(work, rust, mutations_site="src/lib.rs:999")
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR42", "a mutations site naming a non-existent line must FAIL")
+        _assert(any("phantom site" in f and "src/lib.rs:999" in f for f in r.failures),
+                "RR42", f"{r.failures}")
+
+
+def fixture_rr43_mutation_site_resolves_to_real_call_satisfies() -> None:
+    """issue #557 item 2, positive control (the CALL-SITE half of the
+    required set, not just definitions): `mutations[0].site` names the
+    EXACT line of a real, newly-added call expression (`helper()` inside
+    `compute_new`) -- resolved via the index's own `calls` list, not its
+    `items` list. Must satisfy; proves `_r12_site_resolves` checks BOTH,
+    never definitions alone."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        rust = "pub fn compute_new() -> i32 {\n    helper()\n}\n\npub fn helper() -> i32 {\n    1\n}\n"
+        _rr_call_site_setup(work, rust, mutations_site="src/lib.rs:2")
+        r = _run_check_in(work)
+        joined = " | ".join(r.failures)
+        _assert("phantom site" not in joined, "RR43",
+                f"a mutations site naming a real call expression must resolve, got: {r.failures}")
+
+
 RR_FIXTURES = [
     ("RR1", fixture_rr1_not_armed_docs_only),
     ("RR2", fixture_rr2_armed_no_record),
@@ -2969,6 +3312,9 @@ RR_FIXTURES = [
     ("RR38", fixture_rr38_new_residual_marker_not_named_forward_fails),
     ("RR39", fixture_rr39_over_claimed_residual_backward_fails),
     ("RR40", fixture_rr40_correctly_named_residual_satisfies),
+    ("RR41", fixture_rr41_mutation_site_resolves_to_real_def_satisfies),
+    ("RR42", fixture_rr42_phantom_mutation_site_fails),
+    ("RR43", fixture_rr43_mutation_site_resolves_to_real_call_satisfies),
 ]
 
 

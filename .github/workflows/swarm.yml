@@ -57,6 +57,31 @@ jobs:
           GITHUB_BASE_REF: ${{ github.base_ref }}
         run: python3 ci/scripts/check_no_consumer_names.py
 
+      # Issue #555: diff-scoped journey-marker gate (unit ids, round numbers,
+      # ruling ids, "at this commit" hedges) — blocks on a published surface
+      # (rustdoc on a `pub` item, a `.proto` comment, a python docstring),
+      # advisory on a private comment/test.
+      - name: Assert the journey-marker self-test fixtures fire correctly
+        if: ${{ !cancelled() }}
+        run: python3 ci/scripts/check_journey_markers.py --self-test
+
+      - name: Assert no journey marker on a published surface in the diff
+        if: ${{ !cancelled() }}
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: python3 ci/scripts/check_journey_markers.py
+
+      # Issue #556: plan docs under docs/plans/** cite CONSTRUCTS
+      # (path::symbol / path#heading / TOML key / proto member), resolved
+      # against the real tree — never a bare line offset.
+      - name: Assert the plan-citations self-test fixtures fire correctly
+        if: ${{ !cancelled() }}
+        run: python3 ci/scripts/check_plan_citations.py --self-test
+
+      - name: Assert every construct citation under docs/plans/** resolves
+        if: ${{ !cancelled() }}
+        run: python3 ci/scripts/check_plan_citations.py
+
       # The lead-proactivity gate's own CI leg: runs the REAL hook scripts
       # (lead-gate-{start,stop,pre}.sh) against fixture payloads in a temp
       # state dir — R1-R10 + S1 required-RED fixtures, N1-N7 must-still-count

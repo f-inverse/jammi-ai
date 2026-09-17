@@ -782,9 +782,10 @@ EUR-IS-2, EUR-IS-4, OC-AU-1, US-CA-2, US-GA-2, US-IL-1, US-KS-2, US-NC-1,
 US-TX-3, US-TX-4, US-WA-1). Rank is assigned by CREATION ORDER (the first
 pod created is rank 0, the second rank 1), and each member DERIVES its own
 `NCCL_SOCKET_IFNAME` from its Global-Networking ip at run time
-(`ip -o -4 addr show`, matching the interface whose own CIDR carries that
-ip) rather than the cluster path's `ens1` literal — a member with no
-matching interface refuses (97) by name, echoing `DERIVED_NCCL_IFACE=` so
+(the kernel route table, `/proc/net/route`: the interface whose route
+covers that ip by longest prefix — the image ships no `ip` binary) rather
+than the cluster path's `ens1` literal — a member whose route table covers
+no such ip refuses (97) by name, echoing `DERIVED_NCCL_IFACE=` so
 the driver's own post-run proof reads which interface it actually used.
 `cluster` is kept, byte-for-byte what it always was (below) — the SAME
 proof over a different, near-zero-capacity rental mechanism (measured: 8 of

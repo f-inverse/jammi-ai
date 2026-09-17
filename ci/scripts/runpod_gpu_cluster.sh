@@ -27,9 +27,10 @@
 #   EUR-IS-2, EUR-IS-4, OC-AU-1, US-CA-2, US-GA-2, US-IL-1, US-KS-2,
 #   US-NC-1, US-TX-3, US-TX-4, US-WA-1). Rank is OURS to assign: the first
 #   pod created is rank 0, the second rank 1. Each member derives its OWN
-#   NCCL_SOCKET_IFNAME from its Global-Networking ip at run time (`ip -o -4
-#   addr show`) — never a literal interface name; a member with no matching
-#   interface refuses (97) by name.
+#   NCCL_SOCKET_IFNAME from its Global-Networking ip at run time (the
+#   kernel route table, /proc/net/route, longest matching prefix — the image
+#   ships no `ip` binary) — never a literal interface name; a member whose
+#   route table covers no such ip refuses (97) by name.
 #
 #   `cluster` (kept, never removed — the SAME proof over a different rental
 #   mechanism). One RunPod CLUSTER, `podCount: 2`, `gpuCountPerPod: 1`, the
@@ -822,10 +823,11 @@ rp_cluster_verdict() {
 # TEXT that DERIVES the interface ON THE REMOTE HOST, at run time, from that
 # rank's own Global-Networking ip (`RP_TWO_HOST_GN_IP_<rank>`, set by the
 # executed block once the readback wait resolves it — never a literal
-# interface name): `ip -o -4 addr show` lists every interface's own CIDR:s,
-# `awk` picks the one whose address matches the GN ip exactly; no match is
-# a NAMED refusal (97), never a silent fall-through to some other
-# interface. Echoes `DERIVED_NCCL_IFACE=<iface>` right after a successful
+# interface name): /proc/net/route lists every route as little-endian hex
+# Destination/Mask per Iface; the interface whose route covers the GN ip by
+# LONGEST prefix wins (the default route, mask 0, never matches); no match
+# is a NAMED refusal (97), never a silent fall-through to some other
+# interface. No iproute2 anywhere — the image ships none. Echoes `DERIVED_NCCL_IFACE=<iface>` right after a successful
 # derivation so the LOCAL driver's own post-run proof
 # (`_rpc_parse_derived_iface`/`_rpc_net_iface_seen`) reads which interface
 # this rank actually used, never re-guessing it.

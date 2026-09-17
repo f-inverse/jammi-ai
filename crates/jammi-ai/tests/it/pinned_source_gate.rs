@@ -3483,7 +3483,7 @@ fn registration_verb_occurrences(
 ///    scanned as if its content were inlined -- a hard failure naming the
 ///    file when the target cannot be read, the same "fails closed" discipline
 ///    [`scan_surface`] already applies to a tracked `.rs` file.
-fn ddl_hit_lines(file_dir: &Path, text: &str) -> (Vec<usize>, Vec<usize>) {
+fn ddl_hit_lines(file_dir: &Path, text: &str) -> (Vec<usize>, Vec<(usize, String)>) {
     let parsed = syn::parse_file(text)
         .unwrap_or_else(|e| panic!("ddl_hit_lines: syn could not parse this source ({e})"));
     let mut scanner = DdlLiteralScanner {
@@ -3506,8 +3506,13 @@ struct DdlLiteralScanner {
     /// line) rather than silently skipped, so
     /// [`unresolved_include_str_targets_are_reviewed`] can assert the
     /// UNRESOLVABLE set is itself a fixed, reviewed list, never a silent gap
-    /// a new occurrence could hide inside.
-    unresolved_includes: Vec<usize>,
+    /// a new occurrence could hide inside. Recorded as `(line, argument
+    /// text)`: the line is for the failure message, the ARGUMENT TEXT (the
+    /// macro's own token stream, whitespace-normalised) is the review key --
+    /// a line number drifts under every edit above the site (this entry went
+    /// stale twice inside one wave with nothing about the site changing),
+    /// the argument text changes only when the site itself does.
+    unresolved_includes: Vec<(usize, String)>,
 }
 
 /// Every string-literal `Literal` token anywhere in `ts` (recursing into
@@ -3543,6 +3548,19 @@ fn string_literals_in_tokens(ts: proc_macro2::TokenStream) -> Vec<syn::LitStr> {
         }
     }
     out
+}
+
+/// A macro invocation's argument token stream rendered as one
+/// whitespace-normalised string (`proc_macro2`'s `Display` inserts spaces
+/// between tokens deterministically, so two renderings of the same source
+/// text are equal) -- the line-independent identity of an `include_str!`
+/// site [`UNRESOLVED_INCLUDE_STR_TARGETS`] reviews.
+fn macro_argument_text(tokens: &proc_macro2::TokenStream) -> String {
+    tokens
+        .to_string()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl<'ast> syn::visit::Visit<'ast> for DdlLiteralScanner {
@@ -3621,9 +3639,13 @@ impl<'ast> syn::visit::Visit<'ast> for DdlLiteralScanner {
                                 self.hits.push(s.span().start().line);
                             }
                         }
-                        _ => self.unresolved_includes.push(macro_line),
+                        _ => self
+                            .unresolved_includes
+                            .push((macro_line, macro_argument_text(&node.tokens))),
                     },
-                    _ => self.unresolved_includes.push(macro_line),
+                    _ => self
+                        .unresolved_includes
+                        .push((macro_line, macro_argument_text(&node.tokens))),
                 }
             }
             // Every OTHER macro (`assert!`, `println!`, `tokio::select!`,
@@ -3674,12 +3696,17 @@ fn ddl_literal_occurrences(
 /// Every `include_str!(..)` invocation anywhere under [`SURFACE_DIRS`] whose
 /// argument [`ddl_hit_lines`] could not resolve to a path (not a single
 /// top-level string literal -- e.g. `include_str!(concat!(env!(
-/// "CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))`), keyed `(file, line)`, so a
-/// NEW unresolvable `include_str!` is a NAMED finding requiring its own
-/// review entry here rather than a silently-skipped scan gap.
-fn unresolved_include_str_targets(surface: &[(String, String)]) -> BTreeSet<(String, usize)> {
+/// "CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))`), keyed
+/// `(file, argument text) -> occurrence count` with the lines carried for
+/// the failure message, so a NEW unresolvable `include_str!` is a NAMED
+/// finding requiring its own review entry here rather than a
+/// silently-skipped scan gap -- and an edit ABOVE a reviewed site is not.
+fn unresolved_include_str_targets(
+    surface: &[(String, String)],
+) -> std::collections::BTreeMap<(String, String), (usize, Vec<usize>)> {
     let root = repo_root();
-    let mut out = BTreeSet::new();
+    let mut out: std::collections::BTreeMap<(String, String), (usize, Vec<usize>)> =
+        std::collections::BTreeMap::new();
     for (file, text) in surface {
         let file_dir = root
             .join(file)
@@ -3687,8 +3714,12 @@ fn unresolved_include_str_targets(surface: &[(String, String)]) -> BTreeSet<(Str
             .map(Path::to_path_buf)
             .unwrap_or_else(|| root.clone());
         let (_hits, unresolved) = ddl_hit_lines(&file_dir, text);
-        for line in unresolved {
-            out.insert((file.clone(), line));
+        for (line, argument) in unresolved {
+            let entry = out
+                .entry((file.clone(), argument))
+                .or_insert((0, Vec::new()));
+            entry.0 += 1;
+            entry.1.push(line);
         }
     }
     out
@@ -3696,12 +3727,16 @@ fn unresolved_include_str_targets(surface: &[(String, String)]) -> BTreeSet<(Str
 
 /// The reviewed, exhaustive set [`unresolved_include_str_targets_are_reviewed`]
 /// checks against: every `include_str!(..)` under [`SURFACE_DIRS`] whose
-/// argument this gate cannot statically resolve to a path, with a human
-/// account of why its UNKNOWN content cannot be a DataFusion DDL statement
-/// anyway. One entry today.
-const UNRESOLVED_INCLUDE_STR_TARGETS: &[(&str, usize, &str)] = &[(
+/// argument this gate cannot statically resolve to a path, keyed by the
+/// file and the macro's own argument text (never a line number: a line
+/// drifts under every edit above the site and this entry went stale twice
+/// inside one wave with nothing about the site changing), with the number
+/// of occurrences and a human account of why its UNKNOWN content cannot be
+/// a DataFusion DDL statement anyway. One entry today.
+const UNRESOLVED_INCLUDE_STR_TARGETS: &[(&str, &str, usize, &str)] = &[(
     "crates/jammi-ai/src/fine_tune/trainer.rs",
-    5772,
+    "concat ! (env ! (\"CARGO_MANIFEST_DIR\") , \"/../../Cargo.lock\")",
+    1,
     "include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../../Cargo.lock\")) -- reads the \
      workspace's own Cargo.lock text into a test assertion (a lockfile-pinning check); Cargo.lock \
      is TOML, never a DataFusion DDL statement, so leaving its content unresolved here cannot hide \
@@ -3712,22 +3747,61 @@ const UNRESOLVED_INCLUDE_STR_TARGETS: &[(&str, usize, &str)] = &[(
 fn unresolved_include_str_targets_are_reviewed() {
     let surface = scan_surface();
     let found = unresolved_include_str_targets(&surface);
-    let allow: BTreeSet<(String, usize)> = UNRESOLVED_INCLUDE_STR_TARGETS
+    let allow: std::collections::BTreeMap<(String, String), usize> = UNRESOLVED_INCLUDE_STR_TARGETS
         .iter()
-        .map(|(f, l, _)| (f.to_string(), *l))
+        .map(|(f, arg, n, _)| ((f.to_string(), arg.to_string()), *n))
         .collect();
-    let unreviewed: Vec<_> = found.difference(&allow).collect();
+    let unreviewed: Vec<_> = found
+        .iter()
+        .filter(|(key, (count, _))| allow.get(key) != Some(count))
+        .map(|((file, arg), (count, lines))| {
+            format!("{file}: include_str!({arg}) x{count} at lines {lines:?}")
+        })
+        .collect();
     assert!(
         unreviewed.is_empty(),
-        "unresolved include_str! target(s) with no reviewed entry: {unreviewed:?} -- add an entry \
-         to UNRESOLVED_INCLUDE_STR_TARGETS naming why its unknown content cannot hide a DDL \
+        "unresolved include_str! target(s) with no reviewed entry (or a count that moved): \
+         {unreviewed:?} -- add/update the (file, argument text, count) entry in \
+         UNRESOLVED_INCLUDE_STR_TARGETS naming why its unknown content cannot hide a DDL \
          literal, or make the argument statically resolvable."
     );
-    let stale: Vec<_> = allow.difference(&found).collect();
+    let stale: Vec<_> = allow
+        .keys()
+        .filter(|key| !found.contains_key(*key))
+        .map(|(file, arg)| format!("{file}: include_str!({arg})"))
+        .collect();
     assert!(
         stale.is_empty(),
         "reviewed unresolved-include_str! entr(y/ies) {stale:?} are now resolvable (or gone) -- \
          shrink UNRESOLVED_INCLUDE_STR_TARGETS to match reality."
+    );
+}
+
+/// The review key must survive an edit ABOVE the site (the drift that made
+/// the line-keyed form of this list go stale twice inside one wave) and
+/// must NOT survive a change to the site itself: the same source shifted
+/// down by a blank line yields the identical key; the same site with a
+/// different argument yields a different key.
+#[test]
+fn unresolved_include_str_review_key_is_line_independent_and_argument_sensitive() {
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fed to `ddl_hit_lines` to pin the review key's shape, not real code in this file
+    let src = "fn f() -> &'static str { include_str!(concat!(env!(\"X\"), \"/a.txt\")) }\n";
+    let dir = repo_root();
+    let (_, a) = ddl_hit_lines(&dir, src);
+    let (_, b) = ddl_hit_lines(&dir, &format!("\n\n{src}"));
+    let (_, c) = ddl_hit_lines(&dir, &src.replace("/a.txt", "/b.txt"));
+    assert_eq!(a.len(), 1);
+    assert_eq!(
+        a[0].1, b[0].1,
+        "an edit above the site must not change its review key"
+    );
+    assert_ne!(
+        a[0].0, b[0].0,
+        "the carried line still moves (it is for the message only)"
+    );
+    assert_ne!(
+        a[0].1, c[0].1,
+        "a changed argument must change the review key"
     );
 }
 

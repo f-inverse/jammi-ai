@@ -119,6 +119,7 @@ pub fn resolve_model_id(
     record: &jammi_db::catalog::jobs_repo::JobRecord,
 ) -> Result<String> {
     use crate::fine_tune::spec::TrainingSpec;
+    use crate::jobs::JobSpec;
 
     if let Some(model_id) = &record.output_model_id {
         return Ok(model_id.clone());
@@ -127,13 +128,17 @@ pub fn resolve_model_id(
         "fine_tune" | "graph_fine_tune" => Ok(fine_tuned_model_id(job_id)),
         "context_predictor" => {
             let raw = record.spec.as_str();
-            let spec: TrainingSpec = serde_json::from_str(raw).map_err(|parse_err| {
+            // Decode the one persisted type (`JobSpec`'s own doc), then
+            // project to `TrainingSpec` — the same rule every other
+            // `jobs.spec`/`training_spec` production reader follows
+            // (`crate::fine_tune::worker`'s three decode sites).
+            let job_spec: JobSpec = serde_json::from_str(raw).map_err(|parse_err| {
                 JammiError::Catalog(format!(
                     "training job {job_id}: training_spec failed to parse as JSON: {parse_err}"
                 ))
             })?;
-            match spec {
-                TrainingSpec::ContextPredictor { predictor_spec, .. } => {
+            match job_spec.as_training_spec() {
+                Some(TrainingSpec::ContextPredictor { predictor_spec, .. }) => {
                     Ok(predictor_spec.model_id)
                 }
                 _ => Err(JammiError::Catalog(format!(

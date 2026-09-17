@@ -1972,7 +1972,15 @@ impl JobWorker {
             return AttemptEnd::LeftForReclaim;
         }
 
-        let spec: TrainingSpec = match serde_json::from_str(&record.spec) {
+        // `crate::jobs::JobSpec` is the one type every persisted `jobs.spec`
+        // row decodes as (that type's own doc); this loop-claimer path
+        // projects the decoded value to `TrainingSpec` with
+        // `JobSpec::as_training_spec` rather than decoding `TrainingSpec`
+        // directly, so a stray field anywhere in the row — including inside
+        // a nested config struct now that every one of them denies unknown
+        // fields too — is caught at the SAME decode `JobSpec`'s own byte-pin
+        // tests exercise, not a second, independent one that could drift.
+        let job_spec: crate::jobs::JobSpec = match serde_json::from_str(&record.spec) {
             Ok(s) => s,
             Err(e) => {
                 // esc-075 (Phase-4 audit finding 4): this fails BEFORE the
@@ -2001,6 +2009,36 @@ impl JobWorker {
                 .await;
                 return AttemptEnd::Failed { reason };
             }
+        };
+        let Some(spec) = job_spec.as_training_spec() else {
+            // `record.kind` (the `jobs.kind` column) named a training kind,
+            // routing this attempt here at all (the `is_compute_kind` guard
+            // above), but the persisted `spec` JSON's own `kind` decoded to
+            // a compute variant — the two columns disagree. Same failure
+            // shape as an undeserialisable spec: nothing has run yet.
+            mark_acceleration_undetermined(
+                LeaseHolder::LoopClaimer,
+                &catalog,
+                &job_id,
+                &self.worker_id,
+                attempt,
+            )
+            .await;
+            let reason = format!(
+                "training claim path: jobs.kind names a training kind but the persisted spec \
+                 decoded as compute kind {}",
+                job_spec.kind()
+            );
+            record_failed(
+                LeaseHolder::LoopClaimer,
+                &catalog,
+                &job_id,
+                &self.worker_id,
+                attempt,
+                reason.clone(),
+            )
+            .await;
+            return AttemptEnd::Failed { reason };
         };
         // Who this attempt runs as — derived ONCE from the spec and this
         // host's `[worker] local_ranks` (the module doc's writer table), and
@@ -3247,7 +3285,10 @@ impl JobWorker {
         partial_result: Option<&str>,
         tenant_id: Option<jammi_db::TenantId>,
     ) {
-        let spec: crate::jobs::ComputeSpec = match serde_json::from_str(spec_json) {
+        // Decode the one persisted type (`crate::jobs::JobSpec`'s own doc),
+        // then project to `ComputeSpec` — see the loop-claimer training path
+        // above for why, and `JobSpec::as_compute_spec`'s doc.
+        let job_spec: crate::jobs::JobSpec = match serde_json::from_str(spec_json) {
             Ok(s) => s,
             Err(e) => {
                 record_failed(
@@ -3261,6 +3302,25 @@ impl JobWorker {
                 .await;
                 return;
             }
+        };
+        let Some(spec) = job_spec.as_compute_spec() else {
+            // `record.kind` named a compute kind, routing this attempt here
+            // at all, but the persisted spec JSON decoded as a training
+            // variant — the two columns disagree.
+            record_failed(
+                LeaseHolder::LoopClaimer,
+                catalog,
+                job_id,
+                &self.worker_id,
+                attempt,
+                format!(
+                    "compute claim path: jobs.kind names a compute kind but the persisted spec \
+                     decoded as training kind {}",
+                    job_spec.kind()
+                ),
+            )
+            .await;
+            return;
         };
 
         // Post-claim checkpoint: a cancel requested while the job sat
@@ -6496,9 +6556,19 @@ async fn member_rank_body(
     };
     let catalog = Arc::new(session.catalog().pinned_to_tenant(tenant));
 
-    let spec: TrainingSpec = match serde_json::from_str(&spec_json) {
+    // Decode the one persisted type (`crate::jobs::JobSpec`'s own doc), then
+    // project to `TrainingSpec` — see the loop-claimer training path's own
+    // comment for why.
+    let job_spec: crate::jobs::JobSpec = match serde_json::from_str(&spec_json) {
         Ok(spec) => spec,
         Err(e) => return failed(format!("undeserialisable training_spec: {e}")),
+    };
+    let Some(spec) = job_spec.as_training_spec() else {
+        return failed(format!(
+            "a Peer gang serves a column-source fine_tune only; the row's spec is a compute \
+             kind {}",
+            job_spec.kind()
+        ));
     };
     let TrainingSpec::FineTune {
         columns,

@@ -306,7 +306,11 @@ impl TrainingSetTable {
     /// The key the table is registered under on the session it was bound to:
     /// the single bare identifier `jammi.{table_name}` — what
     /// `TableReference::bare` takes. NOT safe to interpolate into SQL as-is;
-    /// use [`Self::sql_relation`] for that.
+    /// use [`Self::sql_relation`] for that. Returns a plain `String` (not
+    /// [`RelationKey`]): the UNQUOTED registration name is a different risk
+    /// class from a raw-SQL relation string, already covered by
+    /// `pinned_source_gate.rs`'s session-registration-literal pattern (a
+    /// `TableReference::bare(...)`-shaped call site), not this newtype.
     pub fn registered_name(&self) -> String {
         format!("jammi.{}", self.record.table_name)
     }
@@ -318,8 +322,44 @@ impl TrainingSetTable {
     /// nanosecond timestamp), so the unquoted form re-parses as arithmetic and
     /// as a multi-part relation reference — never the table. Quoting the WHOLE
     /// key (not each dot-separated part) is what matches the provider's key.
-    pub fn sql_relation(&self) -> String {
-        crate::sql::quote_ident(&self.registered_name())
+    ///
+    /// Returns [`RelationKey`], not a plain `String` (#551): the only way
+    /// ANY code in this crate can mint one of these values is through this
+    /// method (the type's field is private to this module), so a function
+    /// that requires a `RelationKey` parameter cannot be handed a hand-built
+    /// `format!("SELECT * FROM \"jammi.{{}}\"", name)` string instead — that
+    /// value is a plain `String`, not this type.
+    pub fn sql_relation(&self) -> RelationKey {
+        RelationKey(crate::sql::quote_ident(&self.registered_name()))
+    }
+}
+
+/// A session-registered `jammi.{table}` relation, quoted for SQL
+/// interpolation — [`TrainingSetTable::sql_relation`]'s own return type, and
+/// the only public constructor: the field is private to this module, so no
+/// other module in this crate (or a downstream crate) can construct one from
+/// a hand-built string, only read one back (#551). Does not itself prevent a
+/// SQL-building function from accepting a bare `&str` instead and being
+/// handed an independently hand-built string there — every SQL sink in this
+/// codebase still takes `&str` (`Display`, below, is what lets a
+/// `RelationKey` interpolate into a `format!` string unchanged) — but it
+/// does mean a NEW call site that wants a value ALREADY KNOWN to be a
+/// correctly quoted session-registered relation must go through
+/// [`TrainingSetTable::sql_relation`] to get one, rather than being able to
+/// forge an equally-typed value by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationKey(String);
+
+impl RelationKey {
+    /// The quoted relation string, e.g. `"jammi.my-table"`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RelationKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 

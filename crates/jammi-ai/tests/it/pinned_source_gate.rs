@@ -2751,7 +2751,7 @@ fn allowlists_match_current_hits_exactly() {
 //     catalog and returned"), the identical silent-overwrite shape
 //     `register_catalog`/`register_udf` already have above;
 //     `deregister_schema` is its inverse. `ResultStore`'s own
-//     `install_result_schema`, `crates/jammi-db/src/store/mod.rs:1182` calls
+//     `install_result_schema`, `crates/jammi-db/src/store/mod.rs:1222` calls
 //     exactly this verb — which is why this literal set had to widen past
 //     `SessionContext`'s own surface rather than staying a pure enumeration
 //     of it.
@@ -4041,6 +4041,21 @@ const DDL_LITERAL_SITES: &[ReviewedRegistrationSite] = &[
         property: "a unit test asserting on the built DDL STRING's own content \
                    (`ddl.starts_with(\"CREATE TABLE \\\"widgets\\\"\")`) -- the DDL text lives in a \
                    test assertion, never executed as SQL by this test at all.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/catalog/migrations.rs",
+        function: "a_create_trigger_body_is_one_statement_despite_its_internal_semicolons",
+        ordinal: 1,
+        // 3 -- the one `sql` fixture string literal contains three DDL-shaped
+        // statements (`CREATE TABLE`, `CREATE TRIGGER`, `CREATE INDEX`), each
+        // its own `ddl_statement_shape` hit inside this one function.
+        allowed: 3,
+        property: "a unit test's synthetic `sql` fixture (`CREATE TABLE t (c TEXT); CREATE TRIGGER \
+                   trg .. END; CREATE INDEX idx_t_c ON t(c)`) fed through `split_statements` to \
+                   prove a `BEGIN..END` trigger body's internal `;` survives as ONE statement -- the \
+                   DDL text lives in a local `let sql = ..` binding never executed as SQL by this \
+                   test at all, same disclosure as `sqlite.rs::create_table_ddl_emits_implicit_tenant_id` \
+                   above.",
     },
 ];
 

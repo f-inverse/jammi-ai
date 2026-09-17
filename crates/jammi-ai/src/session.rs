@@ -1989,11 +1989,16 @@ impl InferenceSession {
         // `train_context_predictor_deduped` are the other two durable
         // edges; all three call
         // [`crate::fine_tune::spec::admit_training_spec`]. A refusal leaves
-        // no row behind, because no row has been written yet.
-        crate::fine_tune::spec::admit_training_spec(self.inner.config(), &spec)?;
+        // no row behind, because no row has been written yet. Consuming
+        // `spec` here and reading it back only through `admitted.spec()` is
+        // the witness enforcement (#573 round 2): there is no path below
+        // this line that could serialize/submit the pre-admission `spec`
+        // value, because that binding no longer exists.
+        let admitted = crate::fine_tune::spec::admit_training_spec(self.inner.config(), spec)?;
+        let spec = admitted.spec();
         let job_id = uuid::Uuid::new_v4().to_string();
-        let links = self.training_job_links(&spec, &job_id).await?;
-        let spec_json = serde_json::to_string(&spec)?;
+        let links = self.training_job_links(spec, &job_id).await?;
+        let spec_json = serde_json::to_string(spec)?;
         let recorded_job_id = self
             .inner
             .catalog()

@@ -26,7 +26,7 @@
 //! | entry path | reaches the edge through |
 //! |---|---|
 //! | embedded, per-verb (`fine_tune`, `fine_tune_graph`, `submit_fine_tune`) | `InferenceSession::submit_fine_tune_spec_deduped` |
-//! | embedded, generic (`InferenceSession::enqueue(JobSpec::Training)`) | `InferenceSession::enqueue` |
+//! | embedded, generic (`InferenceSession::enqueue(JobSpec::FineTune { .. })`) | `InferenceSession::enqueue` |
 //! | wire (`JobService::SubmitJob`) | `run_training_spec_deduped` → `submit_fine_tune_spec_deduped` |
 //! | Python (`Database._start_training_proto`) | `jammi_ai::wire::training_spec_from_bytes` → `run_training_spec_deduped` → the same |
 //!
@@ -153,10 +153,7 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
 
         // Entrance 2: the generic enqueue, which takes an already-built spec
         // and so does not pass the per-verb entry points at all.
-        let generic = match session
-            .enqueue(JobSpec::Training(Box::new(spec.clone())), 0)
-            .await
-        {
+        let generic = match session.enqueue(JobSpec::from(spec.clone()), 0).await {
             Ok(handle) => panic!(
                 "{name}: the generic entrance admitted job {}",
                 handle.job_id
@@ -203,7 +200,7 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
         let error = wide.run_training_spec(spec.clone()).await.expect_err(name);
         assert!(matches!(error, JammiError::Config(_)), "{name}: {error:?}");
         assert!(error.to_string().contains(expected), "{name}: got {error}");
-        let generic = match wide.enqueue(JobSpec::Training(Box::new(spec)), 0).await {
+        let generic = match wide.enqueue(JobSpec::from(spec), 0).await {
             Ok(handle) => panic!(
                 "{name}: the generic entrance admitted job {}",
                 handle.job_id
@@ -271,7 +268,7 @@ async fn a_fine_tune_cache_use_is_refused_through_enqueue_too() {
         "the refusal must be typed, got {per_verb:?}"
     );
 
-    let generic = match session.enqueue(JobSpec::Training(Box::new(spec)), 0).await {
+    let generic = match session.enqueue(JobSpec::from(spec), 0).await {
         Ok(handle) => panic!(
             "the generic enqueue entrance admitted a cache=Use job {}",
             handle.job_id
@@ -544,6 +541,52 @@ fn a_context_predictor_spec_has_no_rank_count_to_admit() {
     RankAdmission::new(1, CollectiveSelection::Auto, false)
         .admit(&spec)
         .expect("a predictor spec has no count, so there is nothing to refuse");
+}
+
+/// #573's context-predictor behavioural oracle: the edge's only admission
+/// effect for this kind is `ContextPredictorTrainConfig::validate` (the
+/// spec above shows `RankAdmission::admit` is a no-op for it), so this is
+/// the ONE test that can go red if that validation is ever skipped —
+/// submit an invalid predictor config through the real durable edge
+/// (`InferenceSession::train_context_predictor`, which calls
+/// `train_context_predictor_deduped`) and assert a typed refusal with
+/// nothing enqueued. RED (executed and reverted): replacing
+/// `train_context_predictor_deduped`'s `let admitted = admit_training_spec(
+/// ..., training_spec)?; let training_spec = admitted.spec();` with `let
+/// training_spec = &training_spec;` (bypassing admission and borrowing the
+/// spec directly — compiles fine, since nothing here forces every edge to
+/// use the witness) turns this AND
+/// `every_durable_training_submit_edge_calls_the_one_admission_function`
+/// red: this test fails with an untyped `Catalog` error from further
+/// downstream (validation never ran) and the source oracle reports 0 calls
+/// in the edge's body.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalid_context_predictor_config_is_refused_through_the_real_edge() {
+    let (session, _dir) = session_with_serveable_world(1).await;
+    let before = job_count(&session).await;
+
+    let mut invalid = predictor_config();
+    // `ContextPredictorTrainConfig::validate` refuses `context_k == 0`
+    // (there must be at least one context point).
+    invalid.context_k = 0;
+
+    let error = session
+        .train_context_predictor("episodes", &invalid)
+        .await
+        .expect_err("an invalid predictor config must be refused, never enqueued");
+    assert!(
+        matches!(error, JammiError::FineTune(_)),
+        "the refusal must be typed, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("context_k"),
+        "the refusal must name the invalid field, got {error}"
+    );
+    assert_eq!(
+        job_count(&session).await,
+        before,
+        "an invalid predictor config must enqueue nothing"
+    );
 }
 
 fn predictor_config() -> jammi_ai::pipeline::context_predictor::ContextPredictorTrainConfig {

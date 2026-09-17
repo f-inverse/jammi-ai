@@ -57,7 +57,7 @@ pub const DEFAULT_EXACT_MAX_ROWS: usize = 50_000;
 
 /// Parameters for [`InferenceSession::build_neighbor_graph`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BuildNeighborGraph {
     /// Number of nearest neighbours per node (required, `>= 1`).
     pub k: usize,

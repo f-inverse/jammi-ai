@@ -161,6 +161,7 @@ pub enum PropagationOutput {
 /// edge source and direction reuse the shared graph-neighbourhood config types;
 /// the loader here is propagation's own bounded, tenant-scoped scan.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PropagateRequest {
     /// The source whose embedding table holds `X⁽⁰⁾`.
     pub source_id: String,

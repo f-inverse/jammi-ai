@@ -627,7 +627,7 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
     // claim across two independent runs is only honest if this fixture is
     // bit-deterministic across independent executions, and this suite does
     // not establish that: both jobs share the default seed
-    // (`DEFAULT_FINE_TUNE_SEED`, `crates/jammi-wire/src/fine_tune.rs:517`),
+    // (`DEFAULT_FINE_TUNE_SEED`, `crates/jammi-wire/src/fine_tune.rs:519`),
     // and `crates/jammi-ai/src/fine_tune/trainer.rs`'s
     // `same_seed_byte_identical_through_trained_forward` proves a same-seed
     // CPU run is byte-identical through the production
@@ -703,7 +703,7 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
     // `train_loss_curve` above — not merely compared for equal-length-with-
     // remote, which would pass vacuously if both sides simply omitted the
     // key. The default `FineTuneConfig`
-    // (`crates/jammi-wire/src/fine_tune.rs:486-520`) runs `epochs: 3` with
+    // (`crates/jammi-wire/src/fine_tune.rs:488-520`) runs `epochs: 3` with
     // `early_stopping_metric: EarlyStoppingMetric::ValLoss` (`:505`), so
     // `avg_val_loss` is measured every epoch and a row is pushed onto
     // `val_loss_curve` (`trainer.rs`'s `val_loss_curve.push`, immediately

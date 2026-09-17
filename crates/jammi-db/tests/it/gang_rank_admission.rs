@@ -430,6 +430,74 @@ async fn get_job_for_rank_reflects_the_row_world_size() {
     );
 }
 
+/// N4 oracle (iv) (#548): `world_size_from_spec_json` (this module,
+/// module-private) reads `jammi_ai::jobs::JobSpec`'s new flat-derive shape
+/// unchanged, for every training kind and for a compute kind — `jammi-db`
+/// cannot import `jammi-ai` (the dependency runs the other way), so these
+/// fixtures are hand-written JSON matching that type's own byte-pin tests
+/// (`crates/jammi-ai/src/jobs.rs`'s `job_spec_byte_pins_every_compiled_kind_
+/// against_its_own_type`/`job_spec_fine_tune_literal_byte_pin`) rather than
+/// constructed through it. `fine_tune`/`graph_fine_tune` carry `common.
+/// world_size` and decode it explicitly; `context_predictor` has no
+/// `common` field at all (`TrainingSpec::ContextPredictor` never did, tag
+/// merge or not) and `neighbor_graph` (a compute kind) has no `world_size`
+/// field either — both default to `1` through the SAME absent-field path,
+/// which is the property this test pins: a row's kind never changes how
+/// `world_size` is read, only whether the field exists. Not parameterized
+/// (sqlite only): the read is a plain JSON field lookup with no
+/// backend-specific SQL, already covered on both backends by the
+/// `world_size`-decoding tests around it.
+#[tokio::test]
+async fn get_job_for_rank_reads_world_size_the_same_way_for_every_compiled_job_spec_kind_shape() {
+    let (_dir, catalog) = base_catalog().await;
+    let fixtures: &[(&str, &str, WorldSizeFact)] = &[
+        (
+            "job-shape-fine-tune",
+            r#"{"kind":"fine_tune","source":"s","columns":["text"],"method":"lora","task":"text_embedding","common":{"base_model":"b","world_size":2},"cache":"bypass"}"#,
+            WorldSizeFact::Decoded(2),
+        ),
+        (
+            "job-shape-graph-fine-tune",
+            r#"{"kind":"graph_fine_tune","sources":{},"sample_config":{},"common":{"base_model":"b","world_size":3}}"#,
+            WorldSizeFact::Decoded(3),
+        ),
+        (
+            "job-shape-context-predictor",
+            r#"{"kind":"context_predictor","source":"s","predictor_spec":{}}"#,
+            WorldSizeFact::Decoded(1),
+        ),
+        (
+            "job-shape-neighbor-graph",
+            r#"{"kind":"neighbor_graph","source_id":"s","embedding_table":null,"params":{},"cache":"bypass"}"#,
+            WorldSizeFact::Decoded(1),
+        ),
+    ];
+    for (job_id, spec, expected) in fixtures {
+        catalog
+            .submit_job(SubmitJobParams {
+                job_id,
+                kind: KIND,
+                execution: JobExecution::Queued,
+                spec,
+                model_ref: Some("q-base::1"),
+                output_model_id: None,
+                model_source: None,
+                priority: 0,
+            })
+            .await
+            .unwrap();
+        let row = catalog
+            .get_job_for_rank(job_id)
+            .await
+            .unwrap()
+            .expect("the row was just submitted");
+        assert_eq!(
+            row.world_size, *expected,
+            "job {job_id} (spec {spec}) must read world_size as {expected:?}"
+        );
+    }
+}
+
 /// A spec naming no `world_size` at all (`job_params`'s `"{}"`, every
 /// existing fixture in this file) reads back `1` — the single-rank default,
 /// never an error and never left undefined. Parameterized (sqlite/postgres,

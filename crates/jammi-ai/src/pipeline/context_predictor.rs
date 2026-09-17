@@ -77,6 +77,7 @@ use crate::session::InferenceSession;
 /// objective scores — the S18 output families, selected by config rather than by
 /// a tensor op the caller writes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum PredictiveHead {
     /// A 2-wide `(mean, raw_std)` Gaussian head.
     Gaussian {
@@ -224,6 +225,7 @@ impl PredictiveHead {
 /// is not a text row. The episodic knobs live here, with the pipeline that uses
 /// them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextPredictorTrainConfig {
     /// The model id the trained predictor registers under in the catalog.
     pub model_id: String,
@@ -560,13 +562,18 @@ impl InferenceSession {
             predictor_spec: spec.clone(),
         };
         // One of the three durable submit edges for a `TrainingSpec` — see
-        // `admit_training_spec`'s own doc for the other two.
-        crate::fine_tune::spec::admit_training_spec(self.jammi_config(), &training_spec)?;
+        // `admit_training_spec`'s own doc for the other two. Consuming
+        // `training_spec` here (the witness enforcement, #573 round 2)
+        // leaves no path below this line that could submit the
+        // pre-admission value.
+        let admitted =
+            crate::fine_tune::spec::admit_training_spec(self.jammi_config(), training_spec)?;
+        let training_spec = admitted.spec();
         // `model_ref`/`output_model_id` come from the one derivation every
         // training submitter shares (`InferenceSession::training_job_links`):
         // the source's embedding model's PK, and the predictor's own id.
-        let links = self.training_job_links(&training_spec, &job_id).await?;
-        let spec_json = serde_json::to_string(&training_spec)?;
+        let links = self.training_job_links(training_spec, &job_id).await?;
+        let spec_json = serde_json::to_string(training_spec)?;
         let recorded_job_id = self
             .catalog()
             .submit_job_deduped(

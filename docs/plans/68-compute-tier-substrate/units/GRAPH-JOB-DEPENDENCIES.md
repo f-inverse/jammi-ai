@@ -1,5 +1,24 @@
 # PLAN-GRAPH-v5 — job dependencies (`depends_on`) and grouping (`parent_id`) on the `jobs` table
 
+**Status: EXCISED from wave 5.** This plan's design (below) was re-attempted and killed, before
+any propagation code, by its own contract's pre-committed stop rule — the executed record is
+https://github.com/f-inverse/jammi-ai/issues/515#issuecomment-5708043270. What shipped from the
+attempt, as standalone commits independent of this unit's own propagation body (`97d97c71`,
+`7eace0f7` on `feat/500-wave5`): every hand-enumerated job-status terminality decision, in both
+Rust and Python, now derives from `JobStatus::is_terminal`/`is_terminal_unsuccessful` (the one
+Rust-side predicate) or its Python mirror, instead of a literal string compare — explicitly NOT
+adding a `Cancelled` status (a status with no writer is dead vocabulary; it returns with this
+unit's own migration, which is what would actually retire a row to it) — plus a source-tree
+oracle enforcing that one-predicate rule and a companion ledger oracle pinning that no migration
+today rebuilds the `jobs` table (protecting any future FK-referencing row under `PRAGMA
+foreign_keys = ON`, the hazard this unit's own migration would introduce). What stays open for
+the next attempt: the direct-vs-transitive `depends_on` doom decision, the parent-group cascade,
+and migration 040 (`parent_id`, `job_dependencies`, index rebuilds) — none of it is built. The
+next attempt starts from the issue's closing comment's own "where the next attempt starts" list
+(write-time convergence via `pending_deps` + one status seam + node-only `WITH RECURSIVE`, AND an
+attach-time derivation that walks the parent chain under lock at submit — the write-time-only
+design lets a later submit attach a child under an already-doomed ancestor and never doom it).
+
 Supersedes `plans/PLAN-GRAPH-v4.md` (body and its Round-3 amendments) in full. One PR, cut after PR-C merges; migration 033.
 
 **Tree.** `WT` = `the `feat/deploy-shapes-C-jobs` worktree of this repo @ 95993a06 (`git show 95993a06:<path>`) @ 95993a06` (branch `feat/deploy-shapes-C-jobs`; the on-disk HEAD `8314d9db` differs from it by one cookbook-only commit touching no cited file). `MAIN` = `this repo @ 7561658e` (philosophy, CONSTITUTION only). Every `path:line` is relative to `WT` unless prefixed `MAIN`; every one was re-opened on this tree for this document.

@@ -512,7 +512,7 @@ fn every_raw_models_byte_delete_call_site_is_reviewed() {
     // Every crate's production tree: `delete_if_exists` is `pub`, so the
     // universe is every `crates/*/src`, never the two crates that call it
     // today.
-    let mut files: Vec<String> = tracked_rs_files(&repo_root, "crates")
+    let files: Vec<String> = tracked_rs_files(&repo_root, "crates")
         .into_iter()
         .filter(|f| f.split('/').nth(2) == Some("src"))
         .collect();

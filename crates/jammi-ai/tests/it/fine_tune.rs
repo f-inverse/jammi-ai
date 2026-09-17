@@ -2577,7 +2577,8 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "epoch_0's checkpoint manifest never appeared within 30s at {epoch0_manifest:?}"
+            "a generous backstop against a wedged or starved machine: {epoch0_manifest:?} never \
+             appeared"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -2642,10 +2643,14 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
 
     // Worker-a's own heartbeat notices the loss within one interval and sets
     // `cancel`; the training loop bails at its next epoch boundary via
-    // `WorkerJobError::Cancelled`. Bounded wait for the spawned task.
+    // `WorkerJobError::Cancelled`. Bounded wait for the spawned task -- a
+    // generous backstop against a wedged or starved machine.
     tokio::time::timeout(Duration::from_secs(30), handle)
         .await
-        .expect("worker-a's run_claimed_job must finish once its lease is lost")
+        .expect(
+            "a generous backstop against a wedged or starved machine: worker-a's \
+             run_claimed_job never returned",
+        )
         .unwrap();
 
     // Worker-a never finalized (the `Cancelled` arm records no terminal
@@ -2862,7 +2867,8 @@ async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
     while !epoch0_dir.join("manifest.json").exists() {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "epoch_0's checkpoint manifest never appeared within 30s at {epoch0_dir:?}"
+            "a generous backstop against a wedged or starved machine: {epoch0_dir:?} never \
+             appeared"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -2894,7 +2900,7 @@ async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
     // WINNER path). Bounded wait.
     tokio::time::timeout(Duration::from_secs(60), handle)
         .await
-        .expect("the run must complete")
+        .expect("a generous backstop against a wedged or starved machine: the run never returned")
         .unwrap();
 
     // Un-chmod immediately so the tempdir's own cleanup (on drop) can

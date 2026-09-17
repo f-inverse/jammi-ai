@@ -587,8 +587,9 @@ pub async fn await_job(
             ));
             dump_final_job_row(session, job_id, tenant, label).await;
             panic!(
-                "distributed lane: timed out after {TERMINAL_TIMEOUT:?} awaiting: {label}. \
-                 See the dumped worker configs/logs and final job row above."
+                "a generous backstop against a wedged or starved machine: timed out after \
+                 {TERMINAL_TIMEOUT:?} awaiting: {label}. See the dumped worker configs/logs and \
+                 final job row above."
             );
         }
         tokio::time::sleep(POLL_INTERVAL).await;

@@ -39,6 +39,23 @@ reasons and neither depends on the other landing.
 
 Hermetic: three file reads, stdlib only, no network, no wheel, no binary.
 
+## A fourth binding: the cu12 TARBALL restates the same partition
+
+`ci/scripts/bundle_cuda_libs.sh` answers the identical classification
+question — "is this SONAME the tarball's to carry, the host's, or the
+driver's" — for the cu12 TARBALL rather than the WHEEL. Two artifacts, one
+partition, and the pressure round on wave 5's TARBALL unit (F2) named the
+failure mode directly: a SECOND, independent enumeration in the shell script
+(a `BUNDLE_FLOOR_STEMS`/platform/driver list restated by hand) is exactly the
+kind of copy this whole unit exists to remove — the tarball's now-fixed
+seven-name HAND LIST (#535) was one; a second one here, never checked against
+`verify_link_set.py`, would just be a fifth statement of the same fact.
+`BundleScriptContract` below is that binding, added in the same idiom as
+`ComponentContract` above: read each side's OWN enumeration (here, by
+sourcing the real shell script in a subprocess and asking its real
+functions/constants — no re-parsing of shell text by regex) and assert
+agreement.
+
 Run: `python3 ci/scripts/test_cu12_component_contract.py`
 """
 
@@ -47,6 +64,8 @@ from __future__ import annotations
 import ast
 import importlib.util
 import re
+import shlex
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -57,6 +76,7 @@ VERIFY_PATH = PACKAGING / "verify_link_set.py"
 ENTRY_PATH = PACKAGING / "jammi_server" / "_entry.py"
 PYPROJECT_PATH = PACKAGING / "pyproject.toml"
 README_PATH = PACKAGING / "README.md"
+BUNDLE_SCRIPT = REPO_ROOT / "ci" / "scripts" / "bundle_cuda_libs.sh"
 
 
 def load_verify_module():
@@ -99,6 +119,42 @@ def pinned_distributions() -> dict:
 def distribution_for(component: str) -> str:
     """`cuda_runtime` -> `nvidia-cuda-runtime-cu12`."""
     return f"nvidia-{component.replace('_', '-')}-cu12"
+
+
+def _run_bundle_script(body: str) -> str:
+    """Sources `bundle_cuda_libs.sh` in a real `bash` subprocess (never a
+    regex over its text) and runs `body` in that same shell, returning
+    stdout. Sourcing (not executing) means `bundle_main` never runs — the
+    script's own `if [ "${BASH_SOURCE[0]}" = "$0" ]; then bundle_main "$@";
+    fi` guard is false under `source`, the exact seam
+    `test_bundle_cuda_libs.sh` already relies on."""
+    script = f"set -e; . {shlex.quote(str(BUNDLE_SCRIPT))}; {body}"
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, check=True
+    )
+    return result.stdout
+
+
+def bundle_floor_stems() -> set:
+    """`bundle_cuda_libs.sh`'s `BUNDLE_FLOOR_STEMS` — the fixed seven stems
+    the tarball's floor stages independently of the `DT_NEEDED` closure."""
+    out = _run_bundle_script('printf "%s" "$BUNDLE_FLOOR_STEMS"')
+    return set(out.split())
+
+
+def bundle_classify(soname: str) -> str:
+    """`platform` | `driver` | `neither`, via the script's OWN predicate
+    functions (`bundle_is_platform_soname`/`bundle_is_driver_soname`) — the
+    ONE classifier `bundle_verify_loader_resolution` (the loader arm) and
+    `bundle_resolve_closure` (the derivation's host-provided exclusion) both
+    call, never a second copy restated for either."""
+    q = shlex.quote(soname)
+    out = _run_bundle_script(
+        f"if bundle_is_platform_soname {q}; then echo platform; "
+        f"elif bundle_is_driver_soname {q}; then echo driver; "
+        f"else echo neither; fi"
+    )
+    return out.strip()
 
 
 class ComponentContract(unittest.TestCase):
@@ -158,6 +214,79 @@ class ComponentContract(unittest.TestCase):
                 self.assertTrue(
                     any(stem in readme for stem in stems),
                     f"{README_PATH.name} names none of {sorted(stems)} for component {component!r}",
+                )
+
+
+class BundleScriptContract(unittest.TestCase):
+    """`ci/scripts/bundle_cuda_libs.sh` (the cu12 TARBALL's derivation +
+    loader-verification arm) restates the SAME COVERED/PLATFORM/
+    DRIVER_PROVIDED partition `verify_link_set.py` states for the cu12 WHEEL
+    (F2, wave-5 pressure round). This is the cross-file agreement for that
+    second statement: neither script's classification can drift from the
+    other without going red here."""
+
+    def setUp(self):
+        self.verify = load_verify_module()
+
+    def test_floor_stems_equal_covered_union(self):
+        """The floor's fixed seven stems must be EXACTLY the union of every
+        `COVERED` component's stems — the tarball's floor and the wheel's
+        `COVERED` map both enumerate "every CUDA/NCCL library stem this
+        binary needs that a bare `DT_NEEDED` walk cannot be trusted to find
+        on its own for every path" from the SAME measured facts."""
+        covered_union = {stem for stems in self.verify.COVERED.values() for stem in stems}
+        self.assertEqual(
+            bundle_floor_stems(),
+            covered_union,
+            "bundle_cuda_libs.sh's BUNDLE_FLOOR_STEMS and verify_link_set.py's "
+            "COVERED union disagree",
+        )
+
+    def test_platform_stems_agree(self):
+        """Every `verify_link_set.py` `PLATFORM` stem, restated as a
+        representative versioned soname, classifies as `platform` under
+        `bundle_cuda_libs.sh`'s own predicate — and the loader's own prefix
+        family (`PLATFORM_PREFIXES`) does too."""
+        for stem in sorted(self.verify.PLATFORM):
+            with self.subTest(stem=stem):
+                self.assertEqual(
+                    bundle_classify(f"{stem}.so.6"),
+                    "platform",
+                    f"{stem}.so.6 not classified platform by bundle_cuda_libs.sh",
+                )
+        for prefix in self.verify.PLATFORM_PREFIXES:
+            soname = f"{prefix}-x86-64.so.2"
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    bundle_classify(soname),
+                    "platform",
+                    f"{soname} (PLATFORM_PREFIXES member) not classified platform by bundle_cuda_libs.sh",
+                )
+
+    def test_driver_stems_agree(self):
+        """Every `verify_link_set.py` `DRIVER_PROVIDED` stem, restated as a
+        representative versioned soname, classifies as `driver` under
+        `bundle_cuda_libs.sh`'s own predicate."""
+        for stem in sorted(self.verify.DRIVER_PROVIDED):
+            with self.subTest(stem=stem):
+                self.assertEqual(
+                    bundle_classify(f"{stem}.so.1"),
+                    "driver",
+                    f"{stem}.so.1 not classified driver by bundle_cuda_libs.sh",
+                )
+
+    def test_covered_stems_are_neither_platform_nor_driver(self):
+        """Every stem the wheel's `COVERED` map delivers (and therefore the
+        tarball's floor stages) must NOT be classified platform or driver by
+        `bundle_cuda_libs.sh` — the three buckets are a true partition, on
+        both sides at once."""
+        covered_union = {stem for stems in self.verify.COVERED.values() for stem in stems}
+        for stem in sorted(covered_union):
+            with self.subTest(stem=stem):
+                self.assertEqual(
+                    bundle_classify(f"{stem}.so.12"),
+                    "neither",
+                    f"{stem}.so.12 (a COVERED/floor member) misclassified as platform or driver",
                 )
 
 

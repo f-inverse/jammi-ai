@@ -1836,6 +1836,29 @@ jobs:
           # a wheel that bundles no NCCL.
           - name: cu12 link-set classification suite
             cmd: python3 ci/scripts/test_verify_link_set.py
+          # The cu12 TARBALL's derivation + loader-verification arm
+          # (`ci/scripts/bundle_cuda_libs.sh`, excised and re-fixed twice:
+          # #535 the derivation, #534 the loader arm — see that script's own
+          # module doc). Hermetic: no readelf, no real `ldd`, no ELF, no
+          # network — the ONE ELF-reading function and the ONE
+          # readelf-dynamic-section-reading function are both replaced by
+          # fixtures; the loader-verification checks parse committed/literal
+          # report TEXT, never a real loader invocation. Includes T4(3)'s own
+          # real-report integration check, which REFUSES to run against the
+          # fixture's `captured: pending` placeholder at all — this leg goes
+          # RED the moment it lands until `check_bundle_fixture.py` below
+          # (or the lead's own real-report commit) is satisfied; that is the
+          # intended, fail-closed state, not a flake.
+          - name: cu12 tarball bundle suite
+            cmd: bash ci/scripts/test_bundle_cuda_libs.sh
+          # F7: the provisional-fixture refusal as its OWN committed gate, no
+          # environment-variable escape (unlike the suite above, which
+          # accepts BUNDLE_FIXTURE_PROVISIONAL=1 for local iteration on its
+          # OTHER 100+ checks) — this leg has no such knob at all.
+          - name: cu12 tarball fixture provisional refusal
+            cmd: python3 ci/scripts/check_bundle_fixture.py
+          - name: cu12 tarball fixture provisional refusal self-test
+            cmd: python3 ci/scripts/check_bundle_fixture.py --self-test
           # Completeness tripwire for this very guard class: every
           # ci/scripts/check_*.py|.sh gate script must be referenced by at
           # least one workflow (this file included), so a new check script

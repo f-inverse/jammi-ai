@@ -1093,19 +1093,29 @@ impl WorkerShared {
     /// event to align to (its record is already claimed when it is called),
     /// so it reads `admission.release_epoch()` live, right before this call,
     /// matching what a bare `phase()` read would have observed before
-    /// `WorkerShared` carried a birth snapshot at all. `run_placed_gang`'s
-    /// commit event is its own `HostAdmission::probe_claim()` — every byte
-    /// of work after that (`Catalog::transfer_claim`, `Catalog::get_job`,
-    /// both `.await`s) must be covered by the SAME birth snapshot a RELEASE
-    /// landing during either round trip has to race, so it reads the epoch
-    /// synchronously, right after `probe_claim()` returns, and carries that
-    /// value here rather than letting this constructor re-read it after the
-    /// round trips have already let a RELEASE slip past unseen (#500 wave 5
-    /// group E1, P7 pressure-round fix — the prior shape read the epoch
-    /// live IN this constructor, which for `run_placed_gang` ran only after
-    /// those two round trips: a RELEASE landing in that window bumped the
-    /// epoch before this constructor's own read, so `released_since_birth`
-    /// compared the post-release epoch against itself and read `false`).
+    /// `WorkerShared` carried a birth snapshot at all. `run_placed_gang`
+    /// instead reads the epoch BEFORE its own `HostAdmission::probe_claim()`
+    /// call and carries that value all the way here — every byte of work
+    /// after the snapshot (`probe_claim()` itself, `Catalog::transfer_claim`,
+    /// `Catalog::get_job`) must be covered by the SAME birth snapshot any
+    /// RELEASE landing during them has to race: a RELEASE whose epoch bump
+    /// is not yet visible when the snapshot is read cannot have flipped the
+    /// phase yet either (`HostAdmission::begin_release` orders the phase
+    /// flip strictly before the epoch bump), so `probe_claim()`'s own phase
+    /// check refuses it typed; a RELEASE whose epoch bump IS already
+    /// visible when the snapshot is read is instead caught by
+    /// `released_since_birth` downstream. No RELEASE lands in the gap
+    /// between the two catches (#500 wave 5 group E1, P7 pressure-round
+    /// fix, round 2 — round 1 read the epoch synchronously right AFTER
+    /// `probe_claim()` returned rather than before it: that closed the
+    /// window across the two catalog round trips but left the read itself
+    /// racing a RELEASE landing between `probe_claim()`'s own phase check
+    /// and the read, since `probe_claim` commits on the phase read alone
+    /// and `begin_release` bumps the epoch after flipping the phase; such a
+    /// RELEASE bumped the epoch before this constructor's read snapshotted
+    /// it, so `released_since_birth` compared the post-release epoch
+    /// against itself and read `false`, and the gang dispatched on a
+    /// releasing host).
     fn for_single_run(
         admission: &Arc<HostAdmission>,
         worker_id: String,
@@ -2568,17 +2578,22 @@ impl JobWorker {
     /// caller (the executor role, `crates/jammi-ballista`) holds only the
     /// session, never a `JobWorker`.
     ///
-    /// (i) takes this host's job slot through [`HostAdmission::probe_claim`]
-    /// — exactly as the claim loop does (`Free → ClaimProbe`; a host
-    /// already holding a rank, a loop-claimed job, or another placement's
-    /// probe/await refuses typed BEFORE any row write) and, in the
-    /// SAME synchronous step (no `.await` between them), snapshots
-    /// `HostAdmission::release_epoch` as this run's `WorkerShared` birth —
-    /// the claim's true commit instant, not the moment `WorkerShared` is
-    /// later constructed (a
-    /// RELEASE landing during (ii)/(iii) below must still be caught, and
-    /// only a birth snapshot taken THIS early, before either `.await`,
-    /// guarantees that — see `WorkerShared::for_single_run`'s own doc);
+    /// (i) snapshots `HostAdmission::release_epoch` as this run's
+    /// `WorkerShared` birth BEFORE taking this host's job slot through
+    /// [`HostAdmission::probe_claim`] (`Free → ClaimProbe`; a host already
+    /// holding a rank, a loop-claimed job, or another placement's
+    /// probe/await refuses typed BEFORE any row write) — a two-catch
+    /// lattice with no gap between the catches: a RELEASE whose epoch bump
+    /// is not yet visible when the snapshot is read has, a fortiori, not
+    /// yet flipped the phase either (`HostAdmission::begin_release` orders
+    /// the phase flip strictly BEFORE the epoch bump), so `probe_claim`'s
+    /// own phase check refuses it typed; a RELEASE whose epoch bump IS
+    /// already visible when the snapshot is read is instead caught
+    /// downstream by the epoch compare (`WorkerShared::released_since_birth`),
+    /// since the snapshot this run carries is then already stale for it —
+    /// covering `probe_claim()` itself and every byte of (ii)/(iii) below —
+    /// see `WorkerShared::for_single_run`'s own doc for the prior (windowed)
+    /// shape this replaced;
     /// (ii) [`Catalog::transfer_claim`] moves `claimed_by` from
     /// `descriptor.submitter` to this instance at the SAME `attempts`,
     /// arming a fresh lease (`false` — the transfer never happened, a
@@ -2602,6 +2617,19 @@ impl JobWorker {
         descriptor: GangDescriptor,
     ) -> Result<PlacedOutcome> {
         let admission = session.host_admission();
+        // The birth snapshot for this run's `WorkerShared`, read BEFORE
+        // `probe_claim()` itself — see this function's own doc, point (i),
+        // and `WorkerShared::for_single_run` for the lattice argument (a
+        // RELEASE lands either before this read, and is then caught by
+        // `probe_claim`'s own phase check below, or after it, and is then
+        // caught downstream by the epoch compare — no gap between the two).
+        let claim_epoch = admission.release_epoch();
+        #[cfg(feature = "test-hooks")]
+        loop_test_hooks::maybe_park(
+            &descriptor.job_id,
+            loop_test_hooks::ParkPoint::PlacedGangBeforeProbeClaim,
+        )
+        .await;
         let Some(claim) = admission.probe_claim() else {
             let phase = *admission.phase_receiver().borrow();
             return Err(JammiError::FineTune(if phase == WorkerPhase::Running {
@@ -2615,11 +2643,6 @@ impl JobWorker {
                 )
             }));
         };
-        // The birth snapshot for this run's `WorkerShared`, taken in the
-        // SAME synchronous step as `probe_claim()`'s own success (no
-        // `.await` above this line since the claim committed) — see this
-        // function's own doc, point (i), and `WorkerShared::for_single_run`.
-        let claim_epoch = admission.release_epoch();
         #[cfg(feature = "test-hooks")]
         loop_test_hooks::maybe_park(
             &descriptor.job_id,
@@ -5132,9 +5155,17 @@ pub mod loop_test_hooks {
         /// and before the hold is registered — the claim→hold prologue, on
         /// both the fine-tune and the compute path.
         BeforeHold,
+        /// Inside `JobWorker::run_placed_gang`, immediately after this
+        /// run's `WorkerShared` birth release-epoch is read and before
+        /// `HostAdmission::probe_claim` itself runs — the window a RELEASE
+        /// landing between the epoch snapshot and `probe_claim`'s own phase
+        /// check must still be caught in, by `probe_claim` refusing typed
+        /// (#500 wave 5 group E1, P7 pressure-round fix, round 2: the
+        /// window round 1 left open — the epoch read sat AFTER
+        /// `probe_claim()` returned).
+        PlacedGangBeforeProbeClaim,
         /// Inside `JobWorker::run_placed_gang`, immediately after
-        /// `HostAdmission::probe_claim` succeeds and this run's
-        /// `WorkerShared` birth release-epoch is snapshotted, before
+        /// `HostAdmission::probe_claim` succeeds, before
         /// `Catalog::transfer_claim`/`Catalog::get_job` — the two catalog
         /// round trips a RELEASE landing during them must still be caught
         /// across (#500 wave 5 group E1, P7 pressure-round fix).

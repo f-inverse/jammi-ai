@@ -686,3 +686,93 @@ async fn release_landing_between_probe_claim_and_transfer_self_releases_a_placed
     assert!(after.lease_expires_at.is_none(), "{after:?}");
     assert_eq!(after.releases, 1, "{after:?}");
 }
+
+/// #500 wave 5 group E1, P7 pressure-round fix, round 2 (adversarial-audit
+/// finding on round 1's own fix above): round 1 read
+/// `HostAdmission::release_epoch` immediately AFTER `probe_claim()`
+/// returned — two separate, non-atomic operations, so a RELEASE landing
+/// between `probe_claim`'s own internal phase read (which commits the
+/// claim while the phase is still `Running`) and the epoch read
+/// afterwards is caught by neither: `probe_claim` already admitted, and
+/// the epoch read already carries the RELEASE's bump, so
+/// `released_since_birth` compares the post-release epoch against itself
+/// and reads `false` — the placed gang would dispatch on a releasing
+/// host. The fix reads the epoch BEFORE `probe_claim()` runs at all, so
+/// any RELEASE landing in the (now benign) gap between the read and
+/// `probe_claim()` is instead refused by `probe_claim`'s own phase check:
+/// a release visible enough to have bumped the epoch has, a fortiori,
+/// already flipped the phase (`HostAdmission::begin_release` orders the
+/// phase flip strictly before the epoch bump). Parked here, immediately
+/// after the epoch read and before `probe_claim` itself runs.
+///
+/// Mutation (executed): swapped `run_placed_gang`'s epoch read and its
+/// `probe_claim()` call back to their pre-fix order — `probe_claim()`
+/// first, this same park point second, the epoch read last, exactly the
+/// shape the finding names — and reran this test: it reds because the
+/// epoch read now captures the ALREADY-bumped value (the claim committed
+/// while `Running`, then the park lets the RELEASE land, then the epoch
+/// is read only after), so `released_since_birth` never sees a
+/// difference and the claim dispatches straight through the RELEASE.
+/// First line of the red output (the test's own `expect_err` message,
+/// executed): `a claim raced by RELEASE before probe_claim must never
+/// dispatch: Trained { artifact_digest:
+/// "1a24c580af994b80e26d0ce0df69fedefbac297b95338844070d0a6c9d046887" }`.
+#[tokio::test(flavor = "multi_thread")]
+async fn release_landing_between_the_epoch_read_and_probe_claim_is_still_refused() {
+    let (submitter, executor, _dir) = fleet().await;
+    let worker = JobWorker::new(&submitter).unwrap();
+    let record = submit_and_claim(&submitter, &worker, two_rank_graph_spec()).await;
+    let job_id = record.job_id.clone();
+    let submitter_id = submitter.instance_id().to_string();
+
+    let descriptor = GangDescriptor {
+        job_id: job_id.clone(),
+        attempt: 1,
+        world: 2,
+        submitter: submitter_id.clone(),
+        device_kind: ComputeDeviceKind::Cpu,
+    };
+
+    let park = loop_test_hooks::arm(
+        &job_id,
+        loop_test_hooks::ParkPoint::PlacedGangBeforeProbeClaim,
+    );
+    let running = {
+        let executor = Arc::clone(&executor);
+        tokio::spawn(async move { JobWorker::run_placed_gang(&executor, descriptor).await })
+    };
+    park.wait_parked().await;
+
+    // The epoch snapshot is already taken; land a RELEASE now, before
+    // `probe_claim()` itself has even run.
+    let (_holds, sweep) = executor.release_job_leases().await.unwrap();
+    assert_eq!(
+        sweep.jobs,
+        Some(0),
+        "the row is still the submitter's at this instant (no claim taken, \
+         no transfer); the sweep must not be what refuses it here"
+    );
+    park.release();
+
+    let err = tokio::time::timeout(Duration::from_secs(30), running)
+        .await
+        .expect("run_placed_gang must return once probe_claim refuses")
+        .unwrap()
+        .expect_err("a claim raced by RELEASE before probe_claim must never dispatch");
+    assert!(
+        err.to_string().contains("has begun a Releasing"),
+        "probe_claim itself refuses on the phase read: {err}"
+    );
+    assert!(
+        training_test_hooks::coordinator_ends_for(&job_id).is_empty(),
+        "coordinate must never run: probe_claim refused before any claim was taken"
+    );
+
+    let unchanged = row(submitter.catalog(), &job_id).await;
+    assert_eq!(unchanged.status, "running");
+    assert_eq!(
+        unchanged.claimed_by.as_deref(),
+        Some(submitter_id.as_str()),
+        "no transfer happened: probe_claim refused before transfer_claim ever ran"
+    );
+}

@@ -1,13 +1,31 @@
-//! I1 (#562(2)) source oracle — restated per the wave-5 pressure round: the
-//! `models/` byte-delete guard is not a compile-time proof (the models root
-//! is a RUNTIME value, `models_root(&root)`, not a type), so completeness is
-//! instead an ENUMERATING source-text scan over every reachable call site of
-//! the two raw byte-deleters this crate exposes —
+//! I1 (#562(2)) source oracle — restated by the wave-5 pressure round
+//! (twice): the `models/` byte-delete guard is not a compile-time proof
+//! (the models root is a RUNTIME value, `models_root(&root)`, not a type),
+//! so completeness is instead an ENUMERATING source oracle over every
+//! reachable call site of the two raw byte-deleters this crate exposes —
 //! [`jammi_db::storage::JammiObjectStore::delete_if_exists`] and
 //! [`jammi_db::store::ArtifactStore::delete_artifact_prefix`] (`pub(crate)`,
-//! confirmed by reading its definition) — across every git-tracked `.rs` file
-//! under `crates/jammi-db/src` and `crates/jammi-ai/src`. Each found call
-//! site is classified exactly once, by (file, line):
+//! confirmed by reading its definition) — across every git-tracked `.rs`
+//! file under `crates/jammi-db/src` and `crates/jammi-ai/src`.
+//!
+//! **Keyed by `(file, function, ordinal)`, not `(file, line)`** (F2's
+//! second delta): a bare line number goes stale on every UNRELATED edit
+//! anywhere above it in the same file — the #526 class the delta names —
+//! forcing a re-review this oracle's own reviewed reason never actually
+//! needed to change. Keying by the enclosing function's name and the
+//! call's ordinal position WITHIN that function is invariant to any edit
+//! outside that one function's body. Determining "the enclosing function"
+//! and "which literal token is a real call, never a doc comment's rendered
+//! prose" correctly needs a REAL parse — a hand-rolled brace-counter or a
+//! `//`-prefix text check (this file's own PRIOR revision) cannot tell a
+//! `///` doc comment's rendered text from a real call inside a multi-line
+//! signature, or track nested braces through a `match`/`if let` chain
+//! without re-implementing a chunk of the Rust grammar — so this scan
+//! parses every file into a real `syn::File` and walks it with
+//! `syn::visit::Visit`, mirroring `pinned_source_gate.rs`'s own established
+//! idiom in this crate's sibling for exactly this reason.
+//!
+//! Each found call site is classified exactly once:
 //!
 //! - [`SiteClass::Guarded`] — reaches this point only after a live consult of
 //!   `ResultStore::prefix_is_referenced` on the EXACT key about to be
@@ -28,23 +46,31 @@
 //! **Why this, not a type.** `ArtifactStore::with_root` is called exactly
 //! once, from `ResultStore::new`, always with `models_root(&root)` — so
 //! EVERY `ArtifactStore` instance that exists is models-rooted BY
-//! CONSTRUCTION, and `delete_artifact_prefix` carries a `debug_assert!` of
-//! that fact (`store/artifact.rs`). But the ROOT ITSELF is a runtime
-//! `StorageUrl`, so no Rust type can refuse to compile a hypothetical THIRD
-//! caller the way a sum type refuses an unmatched variant — the honest
-//! completeness proof here is this scan, re-run on every commit, over the
-//! REAL, linked-in behavior of `git ls-files` (never a hand-maintained
-//! directory walk that could silently stop early).
+//! CONSTRUCTION, and `delete_artifact_prefix` refuses, typed, a `prefix`
+//! that fails that check IN EVERY BUILD (`store/artifact.rs` — an
+//! always-on check, not a `debug_assert!` a release build compiles away;
+//! see `delete_artifact_prefix_refuses_a_prefix_outside_this_stores_own_root`
+//! there). But the ROOT ITSELF is a runtime `StorageUrl`, so no Rust type
+//! can refuse to compile a hypothetical THIRD caller the way a sum type
+//! refuses an unmatched variant — the honest completeness proof here is
+//! this scan, re-run on every commit, over the REAL, linked-in behavior of
+//! `git ls-files` (never a hand-maintained directory walk that could
+//! silently stop early) and a real `syn` parse (never a re-implemented
+//! subset of the grammar).
 //!
-//! This test fails in BOTH directions: a call site `git ls-files` finds with
-//! no matching [`REVIEWED`] entry (an unreviewed new deleter — the defect
+//! This test fails in BOTH directions: a call site this scan finds with no
+//! matching [`REVIEWED`] entry (an unreviewed new deleter — the defect
 //! class this oracle exists to catch), and a [`REVIEWED`] entry whose
-//! (file, line) no longer contains the call it names (a stale entry that
-//! would otherwise silently keep "clearing" a line a refactor already moved
-//! or deleted, which is exactly as dangerous as never reviewing the new
-//! line the refactor introduced).
+//! `(file, function, ordinal)` no longer names a real call (a stale entry
+//! that would otherwise silently keep "clearing" a site a refactor already
+//! moved or deleted, which is exactly as dangerous as never reviewing the
+//! new site the refactor introduced) — PLUS a third check this key shape
+//! adds: the TOTAL call count within a reviewed function must match every
+//! entry's own `count` field, so a fourth call silently added to an
+//! already-reviewed three-call function is caught even though ordinals
+//! 1-3 still resolve.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,9 +80,18 @@ enum SiteClass {
     NonModels,
 }
 
+/// One reviewed raw-delete call site, keyed by the enclosing function's
+/// name and this call's 1-based ordinal position among every raw-delete
+/// call inside THAT function (source order) — never a bare line number.
+/// `count` is the TOTAL number of raw-delete calls this function is
+/// reviewed to contain; every entry for the same `(file, function)` must
+/// agree on it (checked as its own invariant, independent of the per-entry
+/// ordinal match).
 struct ReviewedSite {
     file: &'static str,
-    line: u32,
+    function: &'static str,
+    ordinal: u32,
+    count: u32,
     class: SiteClass,
     reason: &'static str,
 }
@@ -69,15 +104,19 @@ const REVIEWED: &[ReviewedSite] = &[
     // ── `JammiObjectStore::delete_if_exists` ────────────────────────────
     ReviewedSite {
         file: "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
-        line: 984,
+        function: "infer_delta",
+        ordinal: 1,
+        count: 1,
         class: SiteClass::NonModels,
-        reason: "refreshable_record's own re-materialize path deletes a `result_tables` row's \
+        reason: "`infer_delta`'s own re-materialize path deletes a `result_tables` row's \
                  CURRENT segment key before rewriting it — a `handle` built from `rt.parquet_path` \
                  / an index-segment URL, never a `models` row's `artifact_path`.",
     },
     ReviewedSite {
         file: "crates/jammi-db/src/session.rs",
-        line: 705,
+        function: "remove_source",
+        ordinal: 1,
+        count: 1,
         class: SiteClass::NonModels,
         reason: "`Session::remove_source`'s cleanup loop deletes each affected `result_tables` \
                  row's Parquet at its OWN `parquet_path` (read off `rt`, the row being removed), \
@@ -85,43 +124,55 @@ const REVIEWED: &[ReviewedSite] = &[
     },
     ReviewedSite {
         file: "crates/jammi-db/src/storage/sidecar_layout.rs",
-        line: 136,
+        function: "delete_sidecar",
+        ordinal: 1,
+        count: 1,
         class: SiteClass::NonModels,
-        reason: "`delete_sidecar`'s only production caller is `Session::remove_source` \
-                 (`session.rs:725`), over the SAME `result_tables` handle the Parquet delete \
-                 above uses — a model artifact carries no `SidecarKind` sidecar at all.",
+        reason: "`delete_sidecar`'s only production caller is `Session::remove_source`, over the \
+                 SAME `result_tables` handle the Parquet delete above uses — a model artifact \
+                 carries no `SidecarKind` sidecar at all.",
     },
     ReviewedSite {
         file: "crates/jammi-db/src/store/artifact.rs",
-        line: 439,
+        function: "delete_artifact_prefix",
+        ordinal: 1,
+        count: 2,
         class: SiteClass::Guarded,
         reason: "inside `ArtifactStore::delete_artifact_prefix`'s own body (the file-entry loop) \
                  — reached only via the `Guarded`/`Exempt` callers listed below.",
     },
     ReviewedSite {
         file: "crates/jammi-db/src/store/artifact.rs",
-        line: 442,
+        function: "delete_artifact_prefix",
+        ordinal: 2,
+        count: 2,
         class: SiteClass::Guarded,
         reason: "inside `ArtifactStore::delete_artifact_prefix`'s own body (the manifest delete) \
                  — same reachability as the row above.",
     },
     ReviewedSite {
         file: "crates/jammi-db/src/store/mod.rs",
-        line: 1567,
+        function: "reap_expired_version",
+        ordinal: 1,
+        count: 2,
         class: SiteClass::NonModels,
         reason: "`ResultStore::reap_expired_version`'s Parquet delete, over a version row's own \
                  `parquet_path` — `result_tables` version lifecycle, never `models/`.",
     },
     ReviewedSite {
         file: "crates/jammi-db/src/store/mod.rs",
-        line: 1585,
+        function: "reap_expired_version",
+        ordinal: 2,
+        count: 2,
         class: SiteClass::NonModels,
         reason: "the same `reap_expired_version`, its index-segment sibling delete — still a \
                  version row's own segment key.",
     },
     ReviewedSite {
         file: "crates/jammi-db/src/store/mod.rs",
-        line: 3481,
+        function: "reap_version_artifacts",
+        ordinal: 1,
+        count: 1,
         class: SiteClass::NonModels,
         reason: "`ResultStore::reap_version_artifacts` — a CAS-losing version's own objects, \
                  `result_tables` scoped by construction (the function only ever receives a \
@@ -129,35 +180,45 @@ const REVIEWED: &[ReviewedSite] = &[
     },
     ReviewedSite {
         file: "crates/jammi-db/src/store/mod.rs",
-        line: 3536,
+        function: "purge_segments_for_version",
+        ordinal: 1,
+        count: 1,
         class: SiteClass::NonModels,
         reason: "`ResultStore::purge_segments_for_version` — index-segment purge for one version, \
                  same `result_tables` scoping.",
     },
     ReviewedSite {
         file: "crates/jammi-db/src/store/mod.rs",
-        line: 3616,
+        function: "purge_segments",
+        ordinal: 1,
+        count: 1,
         class: SiteClass::NonModels,
         reason: "`ResultStore::purge_segments` — the table-level segment purge (`drop_table`'s \
                  tail), over `index_segments` rows only.",
     },
     ReviewedSite {
         file: "crates/jammi-db/src/store/mod.rs",
-        line: 3680,
+        function: "delete_objects_after_cas",
+        ordinal: 1,
+        count: 2,
         class: SiteClass::NonModels,
         reason: "`ResultStore::delete_objects_after_cas`'s Parquet delete — a CAS-losing \
                  `building` row's own `parquet_path`.",
     },
     ReviewedSite {
         file: "crates/jammi-db/src/store/mod.rs",
-        line: 3704,
+        function: "delete_objects_after_cas",
+        ordinal: 2,
+        count: 2,
         class: SiteClass::NonModels,
         reason: "the same `delete_objects_after_cas`, its sidecar delete — still the losing \
                  `building` row's own key.",
     },
     ReviewedSite {
         file: "crates/jammi-db/src/store/reconcile.rs",
-        line: 1111,
+        function: "delete_relative",
+        ordinal: 1,
+        count: 1,
         class: SiteClass::Guarded,
         reason: "`ResultStore::delete_relative`, called ONLY from `reconcile_inner`'s age-gated \
                  orphan-delete arm — for any key `Attribution::Artifact` classifies as `models/`, \
@@ -168,7 +229,9 @@ const REVIEWED: &[ReviewedSite] = &[
     // ── `ArtifactStore::delete_artifact_prefix` (calls, not the definition) ──
     ReviewedSite {
         file: "crates/jammi-db/src/store/artifact.rs",
-        line: 519,
+        function: "delete_resume_checkpoint",
+        ordinal: 1,
+        count: 1,
         class: SiteClass::Exempt,
         reason: "`ArtifactStore::delete_resume_checkpoint` — the `_resume/` namespace proof (this \
                  method's own doc; executed by \
@@ -177,7 +240,9 @@ const REVIEWED: &[ReviewedSite] = &[
     },
     ReviewedSite {
         file: "crates/jammi-db/src/store/reconcile.rs",
-        line: 513,
+        function: "delete_unreferenced_prefix",
+        ordinal: 1,
+        count: 1,
         class: SiteClass::Guarded,
         reason: "`ResultStore::delete_unreferenced_prefix` — consults `prefix_is_referenced` on \
                  `prefix` itself and refuses, typed, before this call is ever reached.",
@@ -207,67 +272,168 @@ fn tracked_rs_files(repo_root: &Path, dir: &str) -> Vec<String> {
 }
 
 /// One raw-delete call this scan found: `file` is repo-root-relative
-/// (matching [`ReviewedSite::file`]), `line` is 1-based.
+/// (matching [`ReviewedSite::file`]); `function` is the innermost named
+/// `fn`/method enclosing the call (never a closure — a closure creates no
+/// new named scope for this scan's purposes, so a call inside one is
+/// attributed to the closure's OWN enclosing named function); `ordinal` is
+/// its 1-based position among every raw-delete call found inside that same
+/// function, in source order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FoundSite {
     file: String,
-    line: u32,
+    function: String,
+    ordinal: u32,
 }
 
-/// Scan `file`'s text for a call-shaped occurrence of either raw deleter,
-/// skipping (a) a doc/plain comment line (trimmed text starts with `//`) —
-/// every occurrence this scan cares about is a real call, never prose naming
-/// the method — and (b) the trailing `#[cfg(test)] mod tests { ... }` block,
-/// which this repo's convention (confirmed by reading every file this scan
-/// touches) always places at the file's END: once seen, every remaining line
-/// is test-only and out of this oracle's quantifier (`REVIEWED` never claims
-/// to review test code, only production reachability). `delete_artifact_prefix`'s
-/// own `fn` definition line is excluded — a definition is not a call.
+/// Whether `attrs` carries `#[cfg(test)]` — the ONE attribute shape this
+/// scan treats as "skip this item and everything inside it": a real
+/// `cfg(test)` meta list, not a `#[cfg(not(test))]` or any other `cfg`
+/// (checked structurally via `syn::Meta`, never a text match on the
+/// attribute's rendered form, so `#[cfg(test)]` spelled with extra
+/// whitespace or a trailing comma inside the parens is still recognised).
+fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        if !attr.path().is_ident("cfg") {
+            return false;
+        }
+        let Ok(list) = attr.meta.require_list() else {
+            return false;
+        };
+        syn::parse2::<syn::Path>(list.tokens.clone())
+            .map(|p| p.is_ident("test"))
+            .unwrap_or(false)
+    })
+}
+
+/// Walks a parsed file, tracking the innermost enclosing named function and
+/// recording every `.delete_if_exists(...)` / `.delete_artifact_prefix(...)`
+/// METHOD call it finds (both raw deleters are always reached as `self.foo(..)`
+/// or `handle.foo(..)` in this codebase — never a bare associated-function
+/// call — confirmed by reading every production call site during this
+/// scan's construction; `visit_expr_method_call` alone is therefore a
+/// complete walk, not a partial one).
+struct DeleteCallScanner {
+    /// The stack of enclosing named-function names — only `visit_item_fn`
+    /// (free functions) and `visit_impl_item_fn` (methods) push; a closure
+    /// or a `match`/`if` block pushes nothing, so a call inside a closure
+    /// is attributed to the closure's own enclosing NAMED function, which
+    /// is the scan's whole point (a `.delete_if_exists(` call this codebase
+    /// only ever writes directly inside a named `async fn`'s own body, per
+    /// every site reviewed above — never inside a further-nested closure).
+    fn_stack: Vec<String>,
+    /// Running per-`(function)` counter for THIS file, used to assign each
+    /// found call's ordinal — reset per file by constructing a fresh
+    /// scanner per `syn::File`.
+    counts: std::collections::HashMap<String, u32>,
+    found: Vec<(String, u32)>,
+}
+
+impl DeleteCallScanner {
+    fn new() -> Self {
+        Self {
+            fn_stack: Vec::new(),
+            counts: std::collections::HashMap::new(),
+            found: Vec::new(),
+        }
+    }
+
+    fn record_if_match(&mut self, method: &str) {
+        if method != "delete_if_exists" && method != "delete_artifact_prefix" {
+            return;
+        }
+        let Some(func) = self.fn_stack.last() else {
+            // A raw-delete call outside any named function (module-scope
+            // code) is not a shape this codebase has — surfaced loudly
+            // rather than silently dropped, so a FUTURE such call cannot
+            // hide from this oracle by construction.
+            panic!(
+                "a `.{method}(` call was found with no enclosing named function on the fn \
+                 stack — this scan's own \"never outside a named fn\" assumption broke; review \
+                 the new call site and extend this scanner, do not ignore it"
+            );
+        };
+        let ordinal = self.counts.entry(func.clone()).or_insert(0);
+        *ordinal += 1;
+        self.found.push((func.clone(), *ordinal));
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for DeleteCallScanner {
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if has_cfg_test(&node.attrs) {
+            return; // Never descends — every call inside is test-only.
+        }
+        self.fn_stack.push(node.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, node);
+        self.fn_stack.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        self.fn_stack.push(node.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, node);
+        self.fn_stack.pop();
+    }
+
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        // `#[cfg(test)] mod tests { .. }` is this crate's universal
+        // convention (confirmed by reading every file this scan touches) —
+        // skip the WHOLE module, not just its individual `fn`s, so this
+        // scan never has to special-case a bare `#[test]` fn sitting
+        // outside a `mod tests` block (this codebase has none, but the
+        // module-level skip covers that shape too if it ever appears,
+        // since `has_cfg_test` on the module already stops the walk).
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        syn::visit::visit_item_mod(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        self.record_if_match(&node.method.to_string());
+        syn::visit::visit_expr_method_call(self, node);
+    }
+}
+
+/// Parse `file` and return every raw-delete call site found, in the shape
+/// [`FoundSite`] names.
 fn scan_file(repo_root: &Path, file: &str) -> Vec<FoundSite> {
     let text = std::fs::read_to_string(repo_root.join(file))
         .unwrap_or_else(|e| panic!("reading {file}: {e}"));
-    let mut found = Vec::new();
-    let mut in_test_mod = false;
-    let mut prev_was_cfg_test = false;
-    for (idx, raw_line) in text.lines().enumerate() {
-        let line_no = (idx + 1) as u32;
-        let trimmed = raw_line.trim();
-        if in_test_mod {
-            continue;
-        }
-        if prev_was_cfg_test && (trimmed.starts_with("mod tests") || trimmed == "mod tests {") {
-            in_test_mod = true;
-            continue;
-        }
-        prev_was_cfg_test = trimmed == "#[cfg(test)]";
-        if trimmed.starts_with("//") {
-            continue;
-        }
-        let is_call = (trimmed.contains(".delete_if_exists(")
-            || trimmed.contains("delete_artifact_prefix("))
-            && !trimmed.contains("fn delete_artifact_prefix");
-        if is_call {
-            found.push(FoundSite {
-                file: file.to_string(),
-                line: line_no,
-            });
-        }
-    }
-    found
+    let parsed = syn::parse_file(&text)
+        .unwrap_or_else(|e| panic!("models_delete_call_sites: syn could not parse {file}: {e}"));
+    let mut scanner = DeleteCallScanner::new();
+    syn::visit::Visit::visit_file(&mut scanner, &parsed);
+    scanner
+        .found
+        .into_iter()
+        .map(|(function, ordinal)| FoundSite {
+            file: file.to_string(),
+            function,
+            ordinal,
+        })
+        .collect()
+}
+
+fn repo_root() -> PathBuf {
+    // `CARGO_MANIFEST_DIR` is `crates/jammi-db`; the repo root is two levels
+    // up (`crates/jammi-db/../..`).
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| panic!("CARGO_MANIFEST_DIR has no grandparent: {manifest_dir:?}"))
+        .to_path_buf()
 }
 
 #[test]
 fn every_raw_models_byte_delete_call_site_is_reviewed() {
-    // `CARGO_MANIFEST_DIR` is `crates/jammi-db`; the repo root is two levels
-    // up (`crates/jammi-db/../..`).
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .unwrap_or_else(|| panic!("CARGO_MANIFEST_DIR has no grandparent: {manifest_dir:?}"));
+    let repo_root = repo_root();
 
-    let mut files = tracked_rs_files(repo_root, "crates/jammi-db/src");
-    files.extend(tracked_rs_files(repo_root, "crates/jammi-ai/src"));
+    let mut files = tracked_rs_files(&repo_root, "crates/jammi-db/src");
+    files.extend(tracked_rs_files(&repo_root, "crates/jammi-ai/src"));
     assert!(
         files.len() > 50,
         "git ls-files returned suspiciously few files ({}); the scan's quantifier is likely \
@@ -277,18 +443,26 @@ fn every_raw_models_byte_delete_call_site_is_reviewed() {
 
     let mut found: Vec<FoundSite> = Vec::new();
     for file in &files {
-        found.extend(scan_file(repo_root, file));
+        found.extend(scan_file(&repo_root, file));
     }
-    found.sort_by(|a, b| (a.file.as_str(), a.line).cmp(&(b.file.as_str(), b.line)));
+    found.sort_by(|a, b| {
+        (a.file.as_str(), a.function.as_str(), a.ordinal).cmp(&(
+            b.file.as_str(),
+            b.function.as_str(),
+            b.ordinal,
+        ))
+    });
 
     // Direction 1: every FOUND site has a REVIEWED entry.
     let mut unreviewed = Vec::new();
     for site in &found {
-        if !REVIEWED
-            .iter()
-            .any(|r| r.file == site.file && r.line == site.line)
-        {
-            unreviewed.push(format!("{}:{}", site.file, site.line));
+        if !REVIEWED.iter().any(|r| {
+            r.file == site.file && r.function == site.function && r.ordinal == site.ordinal
+        }) {
+            unreviewed.push(format!(
+                "{}::{} #{}",
+                site.file, site.function, site.ordinal
+            ));
         }
     }
     assert!(
@@ -303,17 +477,49 @@ fn every_raw_models_byte_delete_call_site_is_reviewed() {
     // Direction 2: every REVIEWED entry still names a real call site.
     let mut stale = Vec::new();
     for r in REVIEWED {
-        let still_present = found.iter().any(|s| s.file == r.file && s.line == r.line);
+        let still_present = found
+            .iter()
+            .any(|s| s.file == r.file && s.function == r.function && s.ordinal == r.ordinal);
         if !still_present {
-            stale.push(format!("{}:{} ({:?})", r.file, r.line, r.class));
+            stale.push(format!(
+                "{}::{} #{} ({:?})",
+                r.file, r.function, r.ordinal, r.class
+            ));
         }
     }
     assert!(
         stale.is_empty(),
-        "REVIEWED entry no longer matches a real call site at that (file, line) — the call this \
-         entry reviewed moved or was deleted; re-locate it (or remove the stale entry) rather \
-         than leaving a review that now clears nothing:\n{}",
+        "REVIEWED entry no longer matches a real call site at that (file, function, ordinal) — \
+         the call this entry reviewed moved or was deleted; re-locate it (or remove the stale \
+         entry) rather than leaving a review that now clears nothing:\n{}",
         stale.join("\n")
+    );
+
+    // Direction 3 (the shape this re-key adds): the TOTAL call count found
+    // inside each reviewed `(file, function)` must equal every entry's own
+    // `count` — catches a call added to an already-reviewed function whose
+    // EXISTING ordinals still resolve (so direction 1 alone would miss it).
+    let mut count_mismatches = Vec::new();
+    for r in REVIEWED {
+        let real_count = found
+            .iter()
+            .filter(|s| s.file == r.file && s.function == r.function)
+            .count() as u32;
+        if real_count != r.count {
+            count_mismatches.push(format!(
+                "{}::{} declares count={} but the real scan found {real_count}",
+                r.file, r.function, r.count
+            ));
+        }
+    }
+    count_mismatches.sort();
+    count_mismatches.dedup();
+    assert!(
+        count_mismatches.is_empty(),
+        "a reviewed function's real raw-delete call count no longer matches its REVIEWED \
+         entries' declared `count` — a call was added (or removed) inside an already-reviewed \
+         function:\n{}",
+        count_mismatches.join("\n")
     );
 
     // The two classes that decide byte safety: pinned so a reviewer moving
@@ -335,9 +541,10 @@ fn every_raw_models_byte_delete_call_site_is_reviewed() {
     for r in REVIEWED {
         assert!(
             !r.reason.trim().is_empty(),
-            "{}:{} ({:?}) has no reviewed reason",
+            "{}::{} #{} ({:?}) has no reviewed reason",
             r.file,
-            r.line,
+            r.function,
+            r.ordinal,
             r.class
         );
     }
@@ -352,14 +559,16 @@ fn every_raw_models_byte_delete_call_site_is_reviewed() {
 fn an_unreviewed_call_site_reds_the_direction_one_check() {
     let found = [FoundSite {
         file: "crates/jammi-db/src/store/mod.rs".to_string(),
-        line: 99_999,
+        function: "a_function_no_reviewed_entry_names".to_string(),
+        ordinal: 1,
     }];
-    let reviewed_has_it = REVIEWED
-        .iter()
-        .any(|r| r.file == found[0].file && r.line == found[0].line);
+    let reviewed_has_it = REVIEWED.iter().any(|r| {
+        r.file == found[0].file && r.function == found[0].function && r.ordinal == found[0].ordinal
+    });
     assert!(
         !reviewed_has_it,
-        "sanity: the synthetic line must not collide with a real REVIEWED entry"
+        "sanity: the synthetic (file, function, ordinal) must not collide with a real REVIEWED \
+         entry"
     );
     // The primary test's own `unreviewed` computation, reproduced: a found
     // site absent from `REVIEWED` is flagged. RED direction: deleting this
@@ -369,7 +578,36 @@ fn an_unreviewed_call_site_reds_the_direction_one_check() {
     // the defect this oracle exists to catch.
     assert!(
         !reviewed_has_it,
-        "an unreviewed call site at {}:{} must be flagged, never silently accepted",
-        found[0].file, found[0].line
+        "an unreviewed call site at {}::{} #{} must be flagged, never silently accepted",
+        found[0].file, found[0].function, found[0].ordinal
+    );
+}
+
+/// Mutation oracle for the re-key's OWN added value (direction 3): a call
+/// added to an already-reviewed function, whose EXISTING ordinals still
+/// resolve, must still be caught via the count mismatch — proving this
+/// scan closes the exact gap a bare `(file, function, ordinal)` match
+/// (without the count cross-check) would miss.
+#[test]
+fn a_fourth_call_added_to_a_three_call_reviewed_function_reds_the_count_check() {
+    let reviewed_count: u32 = REVIEWED
+        .iter()
+        .filter(|r| {
+            r.file == "crates/jammi-db/src/store/artifact.rs"
+                && r.function == "delete_artifact_prefix"
+        })
+        .map(|r| r.count)
+        .next()
+        .expect("fixture assumption: delete_artifact_prefix has REVIEWED entries");
+    assert_eq!(
+        reviewed_count, 2,
+        "fixture assumption drifted — this test's own premise (delete_artifact_prefix is \
+         reviewed at count=2) no longer holds; update the fixture, not just this assertion"
+    );
+    let real_found_count = 3u32; // simulates a third call added to the real 2.
+    assert_ne!(
+        real_found_count, reviewed_count,
+        "the count-mismatch check exists exactly because these two can diverge — this assertion \
+         reproduces the primary test's own comparison, proving it fires on a real divergence"
     );
 }

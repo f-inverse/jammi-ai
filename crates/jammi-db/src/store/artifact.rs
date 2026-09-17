@@ -411,21 +411,29 @@ impl ArtifactStore {
     /// production call of the lower-level
     /// [`crate::storage::JammiObjectStore::delete_if_exists`] this method's
     /// own body reaches, reviewing each as non-`models/` with its reason).
-    /// The `debug_assert!` below is the runtime half: `self.root` is always
-    /// `models_root(&root)` by construction (`ResultStore::new`, the ONE
-    /// place an `ArtifactStore` is built), so every `prefix` this unguarded
-    /// primitive ever receives is a sanity-checked fact, not merely a doc
-    /// claim — compiled out in release, where the two-call-site source oracle
-    /// (checked in CI on every commit) is the enforcement that actually
-    /// matters.
+    /// The check below is the runtime half — an ALWAYS-ON, RELEASE-BUILD
+    /// typed refusal, never a `debug_assert!` a release build compiles
+    /// away: `self.root` is always `models_root(&root)` by construction
+    /// (`ResultStore::new`, the ONE place an `ArtifactStore` is built), so
+    /// every `prefix` this unguarded primitive ever receives should be
+    /// under it — a THIRD, future call site (source-review drift, not a
+    /// hypothetical: the two-call-site source oracle
+    /// (`models_delete_call_sites.rs`) is a CI-time text scan, not a
+    /// compiler proof) that somehow reaches this method with a foreign
+    /// prefix is refused here, in every build, rather than trusted.
     pub(crate) async fn delete_artifact_prefix(&self, prefix: &StorageUrl) -> Result<()> {
-        debug_assert!(
-            prefix.as_str().starts_with(self.root.as_str()),
-            "delete_artifact_prefix: {prefix} is not under this store's own root ({}); every \
-             call site must route through ResultStore::delete_unreferenced_prefix (guarded) or \
-             Self::delete_resume_checkpoint (the proven-exempt `_resume/` namespace)",
-            self.root.as_str()
-        );
+        if !prefix.as_str().starts_with(self.root.as_str()) {
+            return Err(JammiError::Storage(StorageError::layout(
+                prefix.as_str(),
+                format!(
+                    "delete_artifact_prefix: {prefix} is not under this store's own root ({}); \
+                     every call site must route through \
+                     ResultStore::delete_unreferenced_prefix (guarded) or \
+                     Self::delete_resume_checkpoint (the proven-exempt `_resume/` namespace)",
+                    self.root.as_str()
+                ),
+            )));
+        }
         let handle = self.handle(prefix)?;
         let manifest_path = self.child(prefix, MANIFEST_NAME)?;
         let manifest = if handle.exists(&manifest_path).await? {
@@ -1095,6 +1103,52 @@ mod tests {
         assert!(store.fetch_artifact(&prefix).await.is_err());
         // Deleting again (already-clean) is a no-op, not an error.
         store.delete_artifact_prefix(&prefix).await.unwrap();
+    }
+
+    /// I1's release-build typed refusal (wave-5 pressure round F2): a
+    /// prefix NOT under this store's own root — a THIRD, hypothetical call
+    /// site's mistake, not one of the two sanctioned routes
+    /// (`ResultStore::delete_unreferenced_prefix`,
+    /// `Self::delete_resume_checkpoint`) — is refused, typed, in EVERY
+    /// build (not a `debug_assert!` a release build would compile away).
+    /// Proves the bytes it published under its OWN root are untouched:
+    /// this is a pure input-validation refusal, never a "best-effort
+    /// delete of whatever happened to be there" fallback.
+    #[tokio::test]
+    async fn delete_artifact_prefix_refuses_a_prefix_outside_this_stores_own_root() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = store_with_root(
+            StorageUrl::memory("artifacts-foreign-root"),
+            cache.path().to_path_buf(),
+        );
+        // A well-formed prefix, but under a COMPLETELY DIFFERENT root —
+        // never one this store's own `put_artifact` could have produced.
+        let foreign = StorageUrl::memory("a-totally-different-root/job-x/worker-y/0");
+
+        let err = store
+            .delete_artifact_prefix(&foreign)
+            .await
+            .expect_err("a prefix outside this store's own root must be refused, not deleted");
+        assert!(
+            matches!(
+                &err,
+                crate::error::JammiError::Storage(StorageError::Layout { path, .. })
+                    if path == foreign.as_str()
+            ),
+            "expected a typed Storage(Layout) refusal naming the foreign prefix, got {err:?}"
+        );
+
+        // Own-root bytes are entirely unaffected — this call never touched
+        // anything under `store`'s actual root at all.
+        let own = store
+            .put_artifact(None, &["job-z", "worker-w", "0"], &sample_files())
+            .await
+            .unwrap();
+        assert!(
+            store.fetch_artifact(&own).await.is_ok(),
+            "the refusal above must be a pure input check, with no side effect on this \
+             store's own, unrelated bytes"
+        );
     }
 
     #[tokio::test]

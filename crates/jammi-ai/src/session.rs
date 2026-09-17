@@ -2305,7 +2305,10 @@ impl InferenceSession {
 /// regardless of how the underlying Parquet scan or model batches arrive on
 /// a later read.
 fn infer_ordered_read_back_sql(table: &str) -> String {
-    format!("SELECT * FROM \"jammi.{table}\" ORDER BY _row_id, _ordinal")
+    format!(
+        "SELECT * FROM {} ORDER BY _row_id, _ordinal",
+        jammi_db::store::result_table_relation(table)
+    )
 }
 
 /// Normalize every `Utf8View`/`BinaryView` column of `batches` back to the

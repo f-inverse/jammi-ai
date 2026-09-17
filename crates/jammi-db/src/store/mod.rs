@@ -325,28 +325,57 @@ impl TrainingSetTable {
     ///
     /// Returns [`RelationKey`], not a plain `String` (#551): the only way
     /// ANY code in this crate can mint one of these values is through this
-    /// method (the type's field is private to this module), so a function
-    /// that requires a `RelationKey` parameter cannot be handed a hand-built
+    /// method or [`result_table_relation`] (the type's field is private to
+    /// this module — both live here), so a function that requires a
+    /// `RelationKey` parameter cannot be handed a hand-built
     /// `format!("SELECT * FROM \"jammi.{{}}\"", name)` string instead — that
     /// value is a plain `String`, not this type.
     pub fn sql_relation(&self) -> RelationKey {
-        RelationKey(crate::sql::quote_ident(&self.registered_name()))
+        result_table_relation(&self.record.table_name)
     }
 }
 
+/// Quote `table_name` (any session-registered result table's bare name —
+/// `TrainingSetTable::table_name()`, a [`crate::catalog::result_repo::ResultTableRecord::table_name`],
+/// or any other value known to be a table this session registered under
+/// the bare `jammi.{name}` identifier) into a [`RelationKey`] safe for SQL
+/// interpolation.
+///
+/// The general-purpose sibling of [`TrainingSetTable::sql_relation`] (#551,
+/// round 3, N2-gate): a training-set caller that already holds a
+/// [`TrainingSetTable`] handle uses that method directly, but every OTHER
+/// reader of a registered relation across the workspace — an inference
+/// result table, a neighbor-graph table, an embedding index, a bench
+/// corpus — has only the bare table NAME, never a `TrainingSetTable`. Both
+/// functions construct the SAME private-field [`RelationKey`] from the
+/// SAME module, so "no code outside `store/mod.rs` can construct a
+/// `RelationKey`" still holds with two minters instead of one; every
+/// production call site that used to hand-build
+/// `format!("SELECT .. FROM \"jammi.{{name}}\"")` now calls this instead —
+/// `crates/jammi-ai/tests/it/pinned_source_gate.rs`'s quoted-relation
+/// pattern is the enumerating oracle over that migration (see its own doc
+/// for the two exclusions: a source-side federation relation
+/// `"{source_id}".public."{table}"`, and a `FROM "{backing}"` read of a
+/// caller-named backing table, neither of which is a session-registered
+/// `jammi.{name}` relation this minter's contract covers).
+pub fn result_table_relation(table_name: &str) -> RelationKey {
+    RelationKey(crate::sql::quote_ident(&format!("jammi.{table_name}")))
+}
+
 /// A session-registered `jammi.{table}` relation, quoted for SQL
-/// interpolation — [`TrainingSetTable::sql_relation`]'s own return type, and
-/// the only public constructor: the field is private to this module, so no
-/// other module in this crate (or a downstream crate) can construct one from
-/// a hand-built string, only read one back (#551). Does not itself prevent a
-/// SQL-building function from accepting a bare `&str` instead and being
-/// handed an independently hand-built string there — every SQL sink in this
-/// codebase still takes `&str` (`Display`, below, is what lets a
-/// `RelationKey` interpolate into a `format!` string unchanged) — but it
-/// does mean a NEW call site that wants a value ALREADY KNOWN to be a
-/// correctly quoted session-registered relation must go through
-/// [`TrainingSetTable::sql_relation`] to get one, rather than being able to
-/// forge an equally-typed value by hand.
+/// interpolation — [`TrainingSetTable::sql_relation`]'s and
+/// [`result_table_relation`]'s shared return type, and the only public
+/// constructors: the field is private to this module, so no other module in
+/// this crate (or a downstream crate) can construct one from a hand-built
+/// string, only read one back (#551). Does not itself prevent a SQL-building
+/// function from accepting a bare `&str` instead and being handed an
+/// independently hand-built string there — every SQL sink in this codebase
+/// still takes `&str` (`Display`, below, is what lets a `RelationKey`
+/// interpolate into a `format!` string unchanged) — but it does mean a NEW
+/// call site that wants a value ALREADY KNOWN to be a correctly quoted
+/// session-registered relation must go through one of the two minters above
+/// to get one, rather than being able to forge an equally-typed value by
+/// hand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationKey(String);
 

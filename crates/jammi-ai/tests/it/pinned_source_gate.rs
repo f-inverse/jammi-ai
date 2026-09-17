@@ -1592,16 +1592,12 @@ const SELF_FETCHED_RECORD_ALLOWED: &[(&str, &str, usize)] = &[
 /// see [`assign_ordinals`]'s doc for why an ORDINAL, not a line number, is
 /// the stable third element).
 const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
-    (
-        "crates/jammi-ai/src/pipeline/graph_propagation.rs",
-        "edge_scan_sql",
-        1, // ordinal 1 — the only `edge_scan_sql` in this file; line 854 today
-        1,
-        // The S9 `neighbor_graph` edge scan — the EDGE relation, never the
-        // pinned embedding table `PinnedSource` covers. See this same file's
-        // `edge_source_anchor` note in `ANCHOR_RETURN_ALLOWED` for the
-        // anchor/content pairing this residual leaves open.
-    ),
+    // `graph_propagation.rs::edge_scan_sql` (the S9 `neighbor_graph` edge
+    // scan) was HERE — round 3 (#551, N2-gate) migrated it onto
+    // `jammi_db::store::result_table_relation`, so its `"jammi.{` literal is
+    // gone from this function's body; the SAME literal now lives at the
+    // minter's own site (`crates/jammi-db/src/store/mod.rs::
+    // result_table_relation`, below), and this list shrank to match.
     (
         "crates/jammi-ai/src/pipeline/graph_neighbourhood.rs",
         "load_neighbor_graph_edges",
@@ -1609,18 +1605,10 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
         1,
         // Same class, the S9 edge relation.
     ),
-    (
-        "crates/jammi-db/src/index/exact.rs",
-        "exact_vector_search",
-        1, // ordinal 1 — the only `exact_vector_search` in this file; line 135 today
-        1,
-        // The exact-match ANN fallback, reading THIS session's own
-        // registration. `pin_current_version`'s own doc names this exact
-        // function as the disclosed "candidate SELECTION is not pinned"
-        // residual (M4): a pinned producer's pooled vectors are single-
-        // version, but the candidate set this function returns may have
-        // been chosen from a different, unpinned view.
-    ),
+    // `jammi-db/src/index/exact.rs::exact_vector_search` was HERE — round 3
+    // (#551, N2-gate) migrated it onto `crate::store::result_table_relation`
+    // too, for the same reason: its `"jammi.{` literal moved to the
+    // minter's site.
     (
         "crates/jammi-db/src/session.rs",
         "read_vectors",
@@ -1754,20 +1742,34 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
         // would not be caught by anything here and would need a fresh
         // review, not a renewed allowlist entry.
     ),
+    // `session.rs::infer_ordered_read_back_sql` was HERE — round 3 (#551,
+    // N2-gate) migrated it onto `jammi_db::store::result_table_relation`
+    // too; its `"jammi.{` literal moved to the minter's site, below.
     (
-        "crates/jammi-ai/src/session.rs",
-        "infer_ordered_read_back_sql",
-        1, // ordinal 1 — the only `infer_ordered_read_back_sql` in this file; line 2094 today
+        "crates/jammi-db/src/store/mod.rs",
+        "result_table_relation",
+        1, // ordinal 1 — the only `result_table_relation` in this file; line 361 today
         1,
-        // An INFERENCE task-result table's own read-back of what
-        // `InferenceSession::infer` just wrote in the same call, immediately
-        // after the write, in-process. This is a different table kind (task
-        // results, never a `current_version`-bearing embedding table
-        // `PinnedSource` covers) and a different hazard shape (read-your-
-        // own-write, not a version straddle across two independent
-        // resolutions) — listed here because the literal check cannot
-        // distinguish table kinds, not because it shares the embedding-
-        // provenance risk this contract is about.
+        // #551 round 3 (N2-gate): the general-purpose minter every OTHER
+        // reader of a session-registered `jammi.{name}` relation across the
+        // workspace now calls (`TrainingSetTable::sql_relation` delegates to
+        // it too) instead of hand-building the quoted string itself. This is
+        // the ONE reviewed construction site the `"jammi.{` literal is
+        // allowed to exist at for the quoted-relation class this round
+        // migrated — every quoted call site this round found
+        // (`session.rs::infer_ordered_read_back_sql`,
+        // `graph_propagation.rs::edge_scan_sql`,
+        // `index/exact.rs::exact_vector_search`, plus
+        // `jammi-bench`'s `propagate.rs`/`search_rss.rs`/`corpus.rs`, which
+        // this gate's `SURFACE_DIRS` does not scan) now calls this function
+        // and carries no literal of its own. The pre-existing UNQUOTED
+        // `TableReference::bare(format!("jammi.{{name}}"))` registration
+        // sites (`registered_name`, `load_neighbor_graph_edges`,
+        // `jammi-db/src/session.rs::read_vectors`/`read_vector_by_key`,
+        // `register_table`, `bind_result_table`) are a DIFFERENT risk class
+        // (what a name registers AS, not what a raw-SQL read quotes) this
+        // round did not migrate — reviewed and left as-is, their own
+        // existing entries unchanged.
     ),
 ];
 
@@ -2751,7 +2753,7 @@ fn allowlists_match_current_hits_exactly() {
 //     catalog and returned"), the identical silent-overwrite shape
 //     `register_catalog`/`register_udf` already have above;
 //     `deregister_schema` is its inverse. `ResultStore`'s own
-//     `install_result_schema`, `crates/jammi-db/src/store/mod.rs:1222` calls
+//     `install_result_schema`, `crates/jammi-db/src/store/mod.rs:1251` calls
 //     exactly this verb — which is why this literal set had to widen past
 //     `SessionContext`'s own surface rather than staying a pure enumeration
 //     of it.
@@ -3699,7 +3701,7 @@ fn unresolved_include_str_targets(surface: &[(String, String)]) -> BTreeSet<(Str
 /// anyway. One entry today.
 const UNRESOLVED_INCLUDE_STR_TARGETS: &[(&str, usize, &str)] = &[(
     "crates/jammi-ai/src/fine_tune/trainer.rs",
-    5763,
+    5772,
     "include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../../Cargo.lock\")) -- reads the \
      workspace's own Cargo.lock text into a test assertion (a lockfile-pinning check); Cargo.lock \
      is TOML, never a DataFusion DDL statement, so leaving its content unresolved here cannot hide \

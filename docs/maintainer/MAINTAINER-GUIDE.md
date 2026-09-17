@@ -2899,27 +2899,27 @@ read as passed-by-skipping.
 A tabular fine-tune's rows are a **producer output**, not a run's private scan (§3.5
 narrates the whole submit → claim → train → finalize path; this section is the
 data-plane primitive underneath the "Train" step). `materialize_training_set`
-(`crates/jammi-db/src/store/mod.rs:4151`) commits the projected columns once into an
+(`crates/jammi-db/src/store/mod.rs:4180`) commits the projected columns once into an
 immutable `TrainingSet` result table; every reader re-applies the SAME committed order,
 and a session reads it either eagerly (collected into memory) or through a per-rank,
 residency-bounded stream — which arm a run takes is a single predicate, stated below.
 
 **The committed order: one key list, two renderers, declared at both registration
-paths.** `training_set_sort_keys` (`crates/jammi-db/src/store/mod.rs:386`) is the ONE
+paths.** `training_set_sort_keys` (`crates/jammi-db/src/store/mod.rs:415`) is the ONE
 source — every projected column, ascending, NULLs first, in declared order — that both
-`training_set_order_by` (`crates/jammi-db/src/store/mod.rs:413`, the SQL `ORDER BY` clause
+`training_set_order_by` (`crates/jammi-db/src/store/mod.rs:442`, the SQL `ORDER BY` clause
 a reader re-applies) and `training_set_file_sort_order`
-(`crates/jammi-db/src/store/mod.rs:461`, the DataFusion `ListingOptions::with_file_sort_order`
+(`crates/jammi-db/src/store/mod.rs:490`, the DataFusion `ListingOptions::with_file_sort_order`
 form a provider DECLARES) render from — a reader that hand-wrote either form independently
 could silently disagree with the producer's own commitment. `bind_result_table`
-(`crates/jammi-db/src/store/mod.rs:2905`) passes the declared order to `register_table`
+(`crates/jammi-db/src/store/mod.rs:2934`) passes the declared order to `register_table`
 for every single-fragment `TrainingSet` row, on BOTH registration paths: fresh
 materialization (inside `BuildingTable::finish`) and crash recovery
 (`load_existing_tables`, on a session that never saw the write) — so a read-back query
 plans no `SortExec` regardless of which path bound the table:
 `a_training_sets_registration_declares_its_order_so_the_read_back_plans_no_sort`
 (`crates/jammi-db/tests/it/materialization.rs:872`). `training_set_registration_sort_order`
-(`crates/jammi-db/src/store/mod.rs:2999`) is where that declaration is actually read back
+(`crates/jammi-db/src/store/mod.rs:3028`) is where that declaration is actually read back
 off the table's `.materialization.json` sidecar; it can legitimately fail to declare one —
 no sidecar at all (a pre-migration-021 table), the sidecar present but UNREADABLE (an
 object-store error, or a body that fails to parse as the manifest JSON — #500 U2c closing
@@ -2970,7 +2970,7 @@ edge, `map_engine_error` (`crates/jammi-server/src/grpc/wire.rs:109`) maps it to
 **The writer: one partition, no merge — and the deployment rule.** The training set's
 own write plans its full-tuple sort through `single_partition_context`
 (`crates/jammi-db/src/session.rs:1180`) inside `plan_training_set_rows`
-(`crates/jammi-db/src/store/mod.rs:4320`): a `target_partitions = 1` derivation of the
+(`crates/jammi-db/src/store/mod.rs:4349`): a `target_partitions = 1` derivation of the
 caller's session state, so the write is ONE external sort at ONE output partition, never a
 partitioned local-sort-plus-`SortPreservingMergeExec` merge — there is only ever one
 partition to recombine, so no merge operator (with its own real pool reservation on top of
@@ -2978,7 +2978,7 @@ every partition's already-buffered sorted run) is ever planned. The residency th
 O(one batch) plus DataFusion's own spill reservation for that single sort, never O(the
 whole table) — **the deployment rule**, stated where the write is planned: a single
 `[engine] batch_size` batch larger than `[engine] memory_limit`
-`cannot be sorted` (`crates/jammi-db/src/store/mod.rs:4089`), because no batch-granular
+`cannot be sorted` (`crates/jammi-db/src/store/mod.rs:4118`), because no batch-granular
 operator (a spilling external sort, a decoded chunk) can ever hold one. Sized correctly
 the arithmetic is comfortable — a fixture with ~100 KB rows under a 64 MiB pool needs
 `engine.batch_size = 32` (`32 × ~100,000 B ≈ 3.1 MB` per batch) rather than
@@ -3002,7 +3002,7 @@ construction), and the mutable provider's own `MemTable::try_new`
 one partition). The edge this excludes: a hand-built MULTI-partition `MemTable` under
 `single_partition_context` plans a `SortPreservingMergeExec` over N per-partition
 `SortExec`s that still collapses to ONE output partition — the writer's own
-`partition_count` (`crates/jammi-db/src/store/mod.rs:4354`) guard cannot see that shape,
+`partition_count` (`crates/jammi-db/src/store/mod.rs:4383`) guard cannot see that shape,
 because a `MemTable`'s partition count is fixed at construction and never collapses just
 because `target_partitions` changed (unlike a `ListingTable`'s file groups). No production
 source registers one: `MemTable::try_new` has exactly one call site in the workspace, the
@@ -3013,7 +3013,7 @@ rather than `MemTable`-backed.
 
 **A pinned/versioned result table is NOT this universe (#500 U2c closing round, A3).** A
 VERSIONED result table's provider is `build_masked_provider`
-(`crates/jammi-db/src/store/mod.rs:3066`): one `ListingTable` per manifest fragment,
+(`crates/jammi-db/src/store/mod.rs:3095`): one `ListingTable` per manifest fragment,
 combined by `MaskedTableProvider`'s `scan` (`crates/jammi-db/src/store/masked_provider.rs:104`)
 into a `UnionExec` (`crates/jammi-db/src/store/masked_provider.rs:153`) when there is more
 than one fragment — a shape that follows the manifest's OWN fragment count, never
@@ -4581,7 +4581,7 @@ id and the missing field, never silently resolved as an ordinary model or served
 unadapted base.
 
 `load_context_predictor`'s own id-shape backstop
-(`record.model_type`, `crates/jammi-ai/src/pipeline/context_predictor.rs:1224`)
+(`record.model_type`, `crates/jammi-ai/src/pipeline/context_predictor.rs:1220`)
 mirrors the resolver's `FINE_TUNED_ID_PREFIX` cross-check, but a context-predictor id is
 caller-chosen — it carries no reserved prefix a fresh reload can cross-check by shape the way
 `try_catalog_lookup` does — so this surface asserts its own row-shape invariant directly,
@@ -4616,29 +4616,29 @@ Both reload surfaces match on these two variants explicitly and re-type BOTH int
 fine-tuned reload arm, matches `StorageError::NotPublished`
 (`crates/jammi-ai/src/model/resolver.rs:262`) and `StorageError::Layout`
 (`crates/jammi-ai/src/model/resolver.rs:273`) into `JammiError::Model`, and
-`load_context_predictor` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1205`) matches
+`load_context_predictor` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1201`) matches
 the identical pair — `StorageError::NotPublished`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1412`) and `StorageError::Layout`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1422`) — into `JammiError::Model` as
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1408`) and `StorageError::Layout`
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1418`) — into `JammiError::Model` as
 well, never its own `JammiError::Inference`. A catalog record that never recorded an
 `artifact_path` at all is a separate, earlier refusal on each surface that never reaches
 `fetch_artifact` — the resolver's arm also raises `JammiError::Model`
 (`crates/jammi-ai/src/model/resolver.rs:288`), and so does the predictor's own
-`JammiError::Model` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1369`). Any OTHER
+`JammiError::Model` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1365`). Any OTHER
 storage fault propagates unchanged past both surfaces' own catch-all —
 `Err(e) => return Err(e)` (`crates/jammi-ai/src/model/resolver.rs:283`) and the identical
-`Err(e) => return Err(e)` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1431`).
+`Err(e) => return Err(e)` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1427`).
 
 Every corrupted-catalog-record refusal EARLIER in this reload path — before `fetch_artifact` is
 even reached — is the SAME `JammiError::Model` variant too: an
 absent `config_json`
 (`crates/jammi-ai/src/pipeline/context_predictor.rs:1246`), an unparseable `config_json`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1250`, a DISTINCT message from "absent",
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1246`, a DISTINCT message from "absent",
 never collapsed), and a parseable-but-incomplete config (missing `head`/`architecture`/
 `feature_dim`/`context_k`/`hidden_dim`/`num_heads`/`num_layers`/`head_width`/`value_column`/
 `target_scaler`) each name the model id and the specific field. The `varmap.load` arm — a
 manifest-verified bundle missing `model.safetensors`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1433`) — matches `CandleBackend::load`'s
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1429`) — matches `CandleBackend::load`'s
 peer refusal for a fine-tuned model's weights file, `"Failed to load safetensors: {e}"`
 (`crates/jammi-ai/src/model/backend/candle.rs:2767`), instead of its own
 `JammiError::Inference`.

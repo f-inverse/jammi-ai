@@ -326,7 +326,7 @@ impl RankAdmission {
 ///
 /// What this closes: within EACH of the three edges below, `spec`/
 /// `training_spec` is CONSUMED by [`admit_training_spec`] and the edge reads
-/// the admitted value back only through [`AdmittedTrainingSpec::spec`], so
+/// the admitted value back only through `AdmittedTrainingSpec::spec`, so
 /// that one function body has no path left that could serialize/submit the
 /// pre-admission value alongside (or instead of) the admitted one -- the
 /// double-value footgun a `&spec` borrow (this module's shape before this
@@ -387,7 +387,7 @@ impl AdmittedTrainingSpec {
 /// one" rule an in-crate caller is.
 ///
 /// Every edge that can turn a `TrainingSpec` into a durable row calls this:
-/// [`crate::session::InferenceSession::submit_fine_tune_spec_deduped`],
+/// `crate::session::InferenceSession::submit_fine_tune_spec_deduped`,
 /// [`crate::session::InferenceSession::enqueue`], and
 /// [`crate::pipeline::context_predictor`]'s
 /// `train_context_predictor_deduped` (in-crate), plus `jammi-bench`'s
@@ -446,10 +446,11 @@ pub struct SubmittedJob {
 /// The ONE function in the workspace that builds a
 /// [`jammi_db::catalog::jobs_repo::SubmitJobParams`] for a training kind and
 /// submits it -- every durable training submit edge calls this rather than
-/// constructing `SubmitJobParams` itself: [`crate::session::
-/// InferenceSession::submit_fine_tune_spec_deduped`], [`crate::session::
-/// InferenceSession::enqueue`]'s training arm, [`crate::pipeline::
-/// context_predictor`]'s `train_context_predictor_deduped`, and (across the
+/// constructing `SubmitJobParams` itself:
+/// `crate::session::InferenceSession::submit_fine_tune_spec_deduped`,
+/// [`crate::session::InferenceSession::enqueue`]'s training arm,
+/// [`crate::pipeline::context_predictor`]'s `train_context_predictor_deduped`,
+/// and (across the
 /// crate boundary) `jammi-bench`'s finetune-run tier. `jammi_db::Catalog::
 /// submit_job`/`submit_job_deduped` themselves stay generic, kind-agnostic
 /// APIs -- `jammi-db` never depends on `jammi-ai` and so cannot know this
@@ -464,8 +465,8 @@ pub struct SubmittedJob {
 /// whatever else it needs the admitted spec for (`training_job_links`, in
 /// every in-crate caller). `model_ref`/`output_model_id` are the base
 /// model's catalog PK and the output NAME every training kind's row
-/// carries -- derived by [`crate::session::InferenceSession::
-/// training_job_links`] for the three in-crate edges, or resolved however
+/// carries -- derived by `crate::session::InferenceSession::
+/// training_job_links` for the three in-crate edges, or resolved however
 /// the caller needs to for a cross-crate one. `execution` is always
 /// [`jammi_db::catalog::status::JobExecution::Queued`] (a training row is
 /// never submitted `Inline` — see [`crate::session::InferenceSession::

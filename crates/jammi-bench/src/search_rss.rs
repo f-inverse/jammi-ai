@@ -161,7 +161,8 @@ async fn scan_only_drain(
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let df = ctx
         .sql(&format!(
-            "SELECT _row_id, vector FROM \"jammi.{table_name}\""
+            "SELECT _row_id, vector FROM {}",
+            jammi_db::store::result_table_relation(table_name)
         ))
         .await?;
     let mut stream = df.execute_stream().await?;
@@ -203,7 +204,8 @@ async fn naive_collect_all_search(
 ) -> Result<Vec<(String, f32)>, Box<dyn std::error::Error>> {
     let df = ctx
         .sql(&format!(
-            "SELECT _row_id, vector FROM \"jammi.{table_name}\""
+            "SELECT _row_id, vector FROM {}",
+            jammi_db::store::result_table_relation(table_name)
         ))
         .await?;
     let mut stream = df.execute_stream().await?;

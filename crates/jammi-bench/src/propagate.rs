@@ -494,8 +494,8 @@ async fn read_sorted_vectors(
 ) -> Result<Vec<(String, Vec<f32>)>, Box<dyn std::error::Error>> {
     let batches = session
         .sql(&format!(
-            "SELECT _row_id, vector FROM \"jammi.{}\"",
-            table.table_name
+            "SELECT _row_id, vector FROM {}",
+            jammi_db::store::result_table_relation(&table.table_name)
         ))
         .await?;
     let mut rows: Vec<(String, Vec<f32>)> = Vec::new();

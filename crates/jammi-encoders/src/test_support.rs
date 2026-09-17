@@ -87,9 +87,9 @@ use crate::{AnyEncoder, FusibleSiteCensus};
 //    `jammi-encoders`' own `cfg(test)` build cannot cover that key without
 //    an ALWAYS-ON API change to `jammi_lora` itself — which would move the
 //    shipped bench path at `lora_linear_fused_dispatch_before`
-//    (`crates/jammi-bench/src/finetune_run.rs:2023`) /
+//    (`crates/jammi-bench/src/finetune_run.rs:2060`) /
 //    `lora_linear_fused_dispatch_after`
-//    (`crates/jammi-bench/src/finetune_run.rs:2195`) that reads the SAME
+//    (`crates/jammi-bench/src/finetune_run.rs:2232`) that reads the SAME
 //    process-wide counter today.
 // 2. `jammi-bench`'s own positive-proof equation (`fused + eager == census
 //    x steps_measured`, `FusibleSiteCensus`'s own doc) reads the SAME

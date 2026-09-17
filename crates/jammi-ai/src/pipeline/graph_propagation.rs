@@ -862,7 +862,8 @@ impl InferenceSession {
                         "SELECT arrow_cast(src, 'Utf8') AS _src, \
                          arrow_cast(dst, 'Utf8') AS _dst, \
                          arrow_cast(similarity, 'Float64') AS _weight \
-                         FROM \"jammi.{table_name}\""
+                         FROM {}",
+                        jammi_db::store::result_table_relation(table_name)
                     ),
                     Some("_weight"),
                 ))

@@ -742,6 +742,210 @@ def check_attestation_witnesses(cwd: Path, unit_slug: str, rows: list[dict],
         )
 
 
+def _r12_select_governing_anticipation_row(mod, path: str, text: str) -> dict | None:
+    """The SAME governing-row selection `check_required_gates` runs (head
+    match, else the greatest normalized `ts` instant), reused here rather
+    than re-derived a third time. Returns `None` — SILENTLY, never a
+    SECOND `result.fail(...)` — on ANY ambiguity (no parseable rows, an
+    all-foreign stream, unreliable ordering evidence, or a tie):
+    `check_required_gates` already reports that EXACT ambiguity, over the
+    SAME committed data, in the SAME `run_check` pass; a second report of
+    the identical problem from a different reader would be noise, not a
+    second finding."""
+    raw_rows: list[tuple[int, dict]] = []
+    for i, line in enumerate(text.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            raw_rows.append((i + 1, parsed))
+    if not raw_rows:
+        return None
+    quiet = Result()
+    rows_with_lineno = _r12_reject_foreign_anticipation_rows(path, raw_rows, quiet)
+    if not rows_with_lineno:
+        return None
+
+    ok_head, head_now_raw = _git(REPO_ROOT, "rev-parse", "HEAD")
+    head_now = head_now_raw.strip() if ok_head else None
+
+    def _row_head(r: dict) -> str | None:
+        h = r.get("head_sha")
+        return h if isinstance(h, str) and h else None
+
+    def _row_instant(r: dict):
+        return mod._r12_normalize_ts_instant(r.get("ts"))
+
+    matching = [(ln, r) for ln, r in rows_with_lineno if head_now and _row_head(r) == head_now]
+    pool = matching if matching else rows_with_lineno
+    if len(pool) >= 2 and any(_row_instant(r) is None for _, r in pool):
+        return None
+    max_instant = max(_row_instant(r) for _, r in pool)
+    tied = [(ln, r) for ln, r in pool if _row_instant(r) == max_instant]
+    if len(tied) >= 2:
+        return None
+    return tied[0][1]
+
+
+_R12_RESIDUAL_MARKER_RE = re.compile(r"#\s*R12-RESIDUAL:")
+_BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)`")
+
+
+def _residual_marker_enclosing_functions(source: str) -> dict[int, str]:
+    """`{marker_line_no: enclosing_function_name}` for every `#
+    R12-RESIDUAL:` -marked line in `source` (a real `ast.parse` of
+    `lead-gate-lib.py`'s own text, never a text scan for "def") — the
+    SMALLEST enclosing `FunctionDef`/`AsyncFunctionDef` span, so a marker
+    inside a nested closure attributes to the closure, not its outer
+    function. A marker line outside every function span (module level) is
+    simply absent from the returned map — this repo's own markers are
+    always inside a function body, a checked-against-the-real-file scope,
+    not an unverified assumption."""
+    tree = ast.parse(source)
+    lines = source.splitlines()
+    marker_lines = {i + 1 for i, line in enumerate(lines) if _R12_RESIDUAL_MARKER_RE.search(line)}
+    if not marker_lines:
+        return {}
+    spans: list[tuple[int, int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            end = getattr(node, "end_lineno", node.lineno)
+            spans.append((node.lineno, end, node.name))
+    spans.sort(key=lambda s: s[1] - s[0])  # smallest span first
+    out: dict[int, str] = {}
+    for ml in marker_lines:
+        for start, end, name in spans:
+            if start <= ml <= end:
+                out[ml] = name
+                break
+    return out
+
+
+def _all_function_names(source: str) -> set[str]:
+    tree = ast.parse(source)
+    return {
+        node.name for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _r12_new_residual_marker_lines(cwd: Path, range_spec: str) -> set[int]:
+    """Line numbers, in `.claude/hooks/lead-gate-lib.py`'s OWN file, that
+    are BOTH a `# R12-RESIDUAL:` marker AND a line `base...HEAD` itself
+    ADDS — never the whole file's accumulated history of markers (this
+    repo's own `lead-gate-lib.py` carries many pre-existing, already-
+    reviewed residuals no CURRENT unit's own `residual_risk` was ever
+    meant to re-name). The SAME `-U0` diff-hunk line-number technique
+    `check_attestation_witnesses` already uses, scoped to this one file."""
+    ok, diff_out = _git(cwd, "diff", "-U0", "--end-of-options", range_spec,
+                         "--", ".claude/hooks/lead-gate-lib.py")
+    if not ok:
+        return set()
+    lines: set[int] = set()
+    new_line_no = 0
+    for line in diff_out.splitlines():
+        if line.startswith("@@ "):
+            m = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            if m:
+                new_line_no = int(m.group(1))
+            continue
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            if _R12_RESIDUAL_MARKER_RE.search(line[1:]):
+                lines.add(new_line_no)
+            new_line_no += 1
+    return lines
+
+
+def check_residual_risk_bidirectional(cwd: Path, unit_slug: str, range_spec: str, result: Result) -> None:
+    """issue #570: an admission that a property is UNCOVERED is a
+    committed, machine-readable record a reader ENFORCES — never prose
+    alone. Bidirectional cross-reference between `lead-gate-lib.py`'s own
+    `# R12-RESIDUAL` markers and the committed anticipation record's
+    GOVERNING row's `residual_risk` field:
+
+      FORWARD — every `# R12-RESIDUAL`-marked line THIS UNIT'S OWN DIFF
+      ADDS (`_r12_new_residual_marker_lines` — never a pre-existing,
+      already-reviewed marker from before this unit's own fix; the
+      original closing-audit finding #570 rebuilds was about a NEWLY
+      introduced residual, not the file's whole history) has its own
+      enclosing function name (`_residual_marker_enclosing_functions`, a
+      real `ast.parse`) appear as a literal substring in `residual_risk`.
+
+      BACKWARD — every backtick-quoted identifier in `residual_risk` that
+      is ALSO a real function name in `lead-gate-lib.py` must carry AT
+      LEAST ONE `# R12-RESIDUAL` marker somewhere in its own span (checked
+      against the WHOLE file, not diff-scoped — a residual_risk citing a
+      function with NO marker anywhere is over-claimed regardless of
+      when that function was last touched) — an over-claimed residual is
+      refused the same way an under-claimed one is.
+
+    Armed only when THIS UNIT'S OWN DIFF adds at least one new `#
+    R12-RESIDUAL` marker AND a governing anticipation row is selectable
+    (silently no-ops on ambiguity — see `_r12_select_governing_
+    anticipation_row`'s own docstring for why that is never a SECOND
+    report of the same ambiguity)."""
+    ok, source = _git(cwd, "show", "HEAD:.claude/hooks/lead-gate-lib.py")
+    if not ok:
+        return  # nothing to check (file missing at HEAD is another reader's concern)
+    new_marker_lines = _r12_new_residual_marker_lines(cwd, range_spec)
+    if not new_marker_lines:
+        return  # this unit's own diff adds no NEW residual marker -- nothing to require
+    try:
+        enclosing = _residual_marker_enclosing_functions(source)
+    except SyntaxError:
+        result.fail(".claude/hooks/lead-gate-lib.py does not parse at HEAD -- cannot verify the "
+                    "# R12-RESIDUAL <-> residual_risk bidirectional property (issue #570)")
+        return
+    marked_functions = {name for line, name in enclosing.items() if line in new_marker_lines}
+    if not marked_functions:
+        return  # every new marker line fell outside every function span (module level) -- nothing to require
+
+    path = f"docs/rigor/{unit_slug}.anticipation.jsonl"
+    ok, text = _git(cwd, "show", f"HEAD:{path}")
+    if not ok or not text.strip():
+        return  # no anticipation record -- check_anticipation_witnesses owns that absence
+
+    mod = _lib_module()
+    governing = _r12_select_governing_anticipation_row(mod, path, text)
+    if governing is None:
+        return  # no unambiguous governing row -- check_required_gates already reports why
+
+    residual_risk = governing.get("residual_risk")
+    if not isinstance(residual_risk, str) or not residual_risk.strip():
+        return  # check_anticipation_witnesses already requires a non-empty residual_risk
+
+    missing_forward = sorted(fn for fn in marked_functions if fn not in residual_risk)
+    if missing_forward:
+        result.fail(
+            f"{path}: the governing row's residual_risk does not name "
+            f"{len(missing_forward)} `# R12-RESIDUAL`-marked function(s) in lead-gate-lib.py, "
+            f"e.g. {missing_forward[:3]} (issue #570)"
+        )
+
+    # BACKWARD is checked against the WHOLE file's marker set (every
+    # function with a `# R12-RESIDUAL` marker ANYWHERE, not just a new
+    # one this unit's own diff adds) — a residual_risk citing an OLDER,
+    # already-marked function is legitimate; only a citation naming a
+    # function with NO marker at all, anywhere, is over-claimed.
+    all_marked_functions = set(enclosing.values())
+    all_function_names = _all_function_names(source)
+    cited = set(_BACKTICK_IDENT_RE.findall(residual_risk))
+    over_claimed = sorted(
+        name for name in cited if name in all_function_names and name not in all_marked_functions
+    )
+    if over_claimed:
+        result.fail(
+            f"{path}: the governing row's residual_risk names {over_claimed[:3]} as a residual, "
+            "but lead-gate-lib.py carries no `# R12-RESIDUAL` marker anywhere inside that "
+            "function's own span (issue #570)"
+        )
+
+
 def _unit_allowlisted(unit_slug: str) -> bool:
     if not ALLOWLIST_PATH.exists():
         return False
@@ -846,6 +1050,13 @@ def run_check(cwd: Path = REPO_ROOT) -> Result:
         # silent skip when it is absent); shape+value only, never
         # re-executed.
         check_required_gates(cwd, unit_slug, result)
+
+        # issue #570: the bidirectional # R12-RESIDUAL <-> residual_risk
+        # property — armed unconditionally whenever lead-gate-lib.py
+        # carries at least one marker; silently no-ops when there is no
+        # unambiguous governing anticipation row (check_required_gates
+        # already reports that ambiguity).
+        check_residual_risk_bidirectional(cwd, unit_slug, range_spec, result)
 
     contract_paths = [p for p in changed if _matches_contract_glob(p)]
     if not contract_paths:
@@ -2616,6 +2827,100 @@ def fixture_rr37_valid_attestation_row_satisfies() -> None:
                 f"a shape-valid attestation row must satisfy item 8b, got: {r.failures}")
 
 
+# --------------------------------------------------------------------------- #
+# issue #570: the bidirectional # R12-RESIDUAL <-> residual_risk property.
+# --------------------------------------------------------------------------- #
+
+
+def _rr_residual_setup(work: Path, extra_lib_marker: str | None, residual_risk: str) -> None:
+    """Commits a real anticipation record with `residual_risk` set as
+    given, plus (when `extra_lib_marker` is not `None`) a MUTATED copy of
+    `.claude/hooks/lead-gate-lib.py` that injects `extra_lib_marker` as a
+    NEW statement right inside the real `slugify` function -- a stable,
+    always-present anchor every copy of the file carries -- so THIS
+    unit's own diff (against `origin/main`'s UNMUTATED copy, from
+    `_pr_repo`'s own scaffold commit) adds exactly one NEW `#
+    R12-RESIDUAL` line, never the file's whole pre-existing history."""
+    if extra_lib_marker is not None:
+        lib_path = work / ".claude" / "hooks" / "lead-gate-lib.py"
+        original = lib_path.read_text()
+        anchor = "def slugify(branch: str) -> str:\n"
+        if anchor not in original:  # pragma: no cover - guards fixture drift, not swarm behavior
+            raise AssertionError("RR38/39/40 anchor drifted from the real lead-gate-lib.py's slugify()")
+        mutated = original.replace(anchor, anchor + f"    pass  {extra_lib_marker}\n", 1)
+        lib_path.write_text(mutated)
+    pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+    block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                             "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                             "class_enumeration": ["a.py:1"]})
+    anticipation_row = json.dumps({
+        "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40, "agent_type": "lead-anticipation",
+        "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+        "residual_risk": residual_risk,
+        "gates": {_RR_BASELINE_REQUIRED_COMMAND: {"rc": 0}},
+    })
+    _commit(work, "fix: touch a gate script + lead-gate-lib.py residual state", {
+        "ci/scripts/probe.py": "print('x')\n",
+        "a.py": "def compute_thing():\n    return 1\n",
+        "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+        "docs/rigor/feat_rr-fixture.anticipation.jsonl": anticipation_row + "\n",
+        "docs/README-fixture.md": "line one\n",
+        "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+    })
+
+
+def fixture_rr38_new_residual_marker_not_named_forward_fails() -> None:
+    """issue #570 FORWARD: the fix's own diff adds a NEW `#
+    R12-RESIDUAL:` marker inside `slugify` in lead-gate-lib.py, but the
+    governing row's `residual_risk` never names `slugify`. Must FAIL."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_residual_setup(work, "# R12-RESIDUAL: fixture-injected residual for RR38",
+                            residual_risk="unrelated residual text naming nothing real")
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR38", "a new residual marker not named in residual_risk must FAIL")
+        _assert(any("does not name" in f and "slugify" in f for f in r.failures), "RR38", f"{r.failures}")
+
+
+def fixture_rr39_over_claimed_residual_backward_fails() -> None:
+    """issue #570 BACKWARD: `residual_risk` backtick-cites `state_dir` — a
+    REAL function in lead-gate-lib.py that carries NO `# R12-RESIDUAL`
+    marker anywhere — an over-claimed residual. Must FAIL by name, even
+    though `residual_risk` ALSO correctly names `slugify` (the function
+    the fixture's own new marker actually sits inside), satisfying
+    FORWARD: BACKWARD's own over-claim check is independent of whether
+    FORWARD passed."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        lib_text = (work / ".claude" / "hooks" / "lead-gate-lib.py").read_text()
+        marker_lines = [l for l in lib_text.splitlines() if _R12_RESIDUAL_MARKER_RE.search(l)]
+        _assert("def state_dir(" in lib_text and not any("state_dir" in l for l in marker_lines),
+                "RR39 setup", "`state_dir` must be real and carry no marker in the unmutated file")
+        _rr_residual_setup(
+            work, "# R12-RESIDUAL: fixture-injected residual for RR39",
+            residual_risk="the `slugify` gap is real; see `state_dir` for another untracked one",
+        )
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR39", "an over-claimed residual (citing an unmarked real function) must FAIL")
+        _assert(any("state_dir" in f and "no `# R12-RESIDUAL` marker" in f for f in r.failures),
+                "RR39", f"{r.failures}")
+
+
+def fixture_rr40_correctly_named_residual_satisfies() -> None:
+    """issue #570, positive control: `residual_risk` names `slugify`,
+    exactly the function the new marker sits inside -- both FORWARD and
+    BACKWARD are satisfied; `check_residual_risk_bidirectional` itself
+    reports no failure."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_residual_setup(work, "# R12-RESIDUAL: fixture-injected residual for RR40",
+                            residual_risk="the `slugify` fixture-injected gap for RR40 is untracked")
+        r = _run_check_in(work)
+        joined = " | ".join(r.failures)
+        _assert("issue #570" not in joined, "RR40",
+                f"a correctly-named residual must satisfy #570, got: {r.failures}")
+
+
 RR_FIXTURES = [
     ("RR1", fixture_rr1_not_armed_docs_only),
     ("RR2", fixture_rr2_armed_no_record),
@@ -2661,6 +2966,9 @@ RR_FIXTURES = [
     ("RR35", fixture_rr35_attestation_file_with_no_valid_row_fails),
     ("RR36", fixture_rr36_foreign_attestation_row_refused),
     ("RR37", fixture_rr37_valid_attestation_row_satisfies),
+    ("RR38", fixture_rr38_new_residual_marker_not_named_forward_fails),
+    ("RR39", fixture_rr39_over_claimed_residual_backward_fails),
+    ("RR40", fixture_rr40_correctly_named_residual_satisfies),
 ]
 
 

@@ -101,7 +101,7 @@ impl Catalog {
     ) -> Result<bool> {
         let cas_in_tx = cas.clone();
         let index_path = index_path.to_string();
-        let created_at = crate::catalog::backend::now_sortable();
+        let created_at = crate::catalog::lease::canonical_stamp_now();
         let tenant = self.current_tenant();
         let kind = self.backend().backend_kind();
         let outcome = self
@@ -290,7 +290,7 @@ impl Catalog {
     ) -> Result<bool> {
         let cas_in_tx = cas.clone();
         let index_path = index_path.to_string();
-        let created_at = crate::catalog::backend::now_sortable();
+        let created_at = crate::catalog::lease::canonical_stamp_now();
         let tenant = self.current_tenant();
         let outcome = self
             .backend()

@@ -1309,7 +1309,7 @@ impl ResultStore {
                 // shared default, while still honoring an explicit override.
                 storage_precision,
                 oversample: self.ann.effective_oversample_for(storage_precision),
-                created_at: crate::catalog::backend::now_sortable(),
+                created_at: crate::catalog::lease::canonical_stamp_now(),
                 writer_id: Some(&self.writer_id),
                 lease: Some(self.lease.lease()),
                 job_attempt,
@@ -4234,7 +4234,7 @@ impl ResultStore {
     /// The catalog's own `ORDER BY` is not trusted as the tie-break of record
     /// (r32): the candidates are re-sorted in Rust on the total key
     /// `(created_at DESC, table_name DESC)`, so two rows created in the same
-    /// nanosecond still resolve to one deterministic winner. A reaped artifact
+    /// microsecond still resolve to one deterministic winner. A reaped artifact
     /// falls through to the next candidate rather than failing the whole probe
     /// — the same soundness rule [`Self::probe_cache_record`] applies.
     async fn probe_ready_training_set(

@@ -34,13 +34,13 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::backend::{now_sortable, BackendError, BackendKind, Row, SqlValue, TxOptions};
+use super::backend::{BackendError, BackendKind, Row, SqlValue, TxOptions};
 use super::instance::{
     decode_devices_json, DeviceFact, GangListing, GangMember, InstanceRegistration, PeerAddr,
 };
 use super::lease::{
-    instance_liveness_margin, lease_deadline_expr, lease_expired_clause, lease_live_clause,
-    stale_before_clause,
+    canonical_stamp_now, instance_liveness_margin, lease_deadline_expr, lease_expired_clause,
+    lease_live_clause, stale_before_clause,
 };
 use super::status::{JobExecution, JobStatus};
 use super::Catalog;
@@ -846,7 +846,7 @@ impl Catalog {
         let model_source = p.model_source.map(str::to_string);
         let priority = p.priority as i64;
         let tenant = self.current_tenant();
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         let key = idempotency_key
             .filter(|k| !k.is_empty())
             .map(str::to_string);
@@ -1065,7 +1065,7 @@ impl Catalog {
         let instance_id = instance_id.to_string();
         #[cfg(feature = "test-hooks")]
         let instance_for_hook = instance_id.clone();
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         let kind = self.backend().backend_kind();
 
         let mut params: Vec<SqlValue<'static>> = vec![
@@ -1158,7 +1158,7 @@ impl Catalog {
         let inline = JobExecution::Inline.to_string();
         let job_id = job_id.to_string();
         let instance_id = instance_id.to_string();
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         let kind = self.backend().backend_kind();
 
         let mut params: Vec<SqlValue<'static>> = vec![
@@ -1212,7 +1212,7 @@ impl Catalog {
         let job_id = job_id.to_string();
         let instance_id = instance_id.to_string();
         let attempts = attempts as i64;
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         let kind = self.backend().backend_kind();
         let mut params: Vec<SqlValue<'static>> = Vec::new();
         let deadline_expr = lease_deadline_expr(kind, lease, &mut params);
@@ -1272,7 +1272,7 @@ impl Catalog {
         let from_instance = from_instance.to_string();
         let to_instance = to_instance.to_string();
         let attempts = attempts as i64;
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         let kind = self.backend().backend_kind();
 
         let mut params: Vec<SqlValue<'static>> = Vec::new();
@@ -1325,7 +1325,7 @@ impl Catalog {
         let instance_id = p.instance_id.to_string();
         let attempts = p.attempts as i64;
         let result = p.result.to_string();
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         let retire = retire_pending_report_clause(3, 4);
         let sql = format!(
             "UPDATE jobs SET status = $1, result = $2, {retire}, lease_expires_at = NULL, \
@@ -1430,7 +1430,7 @@ impl Catalog {
         let output_model_id = output_model_id.to_string();
         let output_model_version = output_model_version as i64;
         let artifact_path = artifact_path.to_string();
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         let tenant = self.current_tenant();
         let retire = retire_pending_report_clause(3, 4);
         let job_sql = format!(
@@ -1572,7 +1572,7 @@ impl Catalog {
         let instance_id = instance_id.to_string();
         let attempts = attempts as i64;
         let error = error.to_string();
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         let retire = retire_pending_report_clause(3, 4);
         let sql = format!(
             "UPDATE jobs SET status = $1, error = $2, {retire}, lease_expires_at = NULL, \
@@ -1620,7 +1620,7 @@ impl Catalog {
         let instance_id = instance_id.to_string();
         let phase = phase.map(str::to_string);
         let attempts = attempts as i64;
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         let sql = "UPDATE jobs SET progress_rows_done = $1, progress_rows_total = $2, \
                    progress_phase = $3, updated_at = $4 \
                    WHERE job_id = $5 AND claimed_by = $6 AND status = $7 AND attempts = $8";
@@ -1676,7 +1676,7 @@ impl Catalog {
         let job_id = job_id.to_string();
         let instance_id = instance_id.to_string();
         let attempts = attempts as i64;
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         let sql = "UPDATE jobs SET lease_expires_at = NULL, releases = releases + 1, \
                    updated_at = $1 \
                    WHERE job_id = $2 AND status = $3 AND execution = $4 AND claimed_by = $5 \
@@ -1717,7 +1717,7 @@ impl Catalog {
         let running = JobStatus::Running.to_string();
         let queued_execution = JobExecution::Queued.to_string();
         let instance_id = instance_id.to_string();
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         let sql = "UPDATE jobs SET lease_expires_at = NULL, releases = releases + 1, \
                    updated_at = $1 \
                    WHERE claimed_by = $2 AND status = $3 AND execution = $4 \
@@ -1770,7 +1770,7 @@ impl Catalog {
         let instance_id = instance_id.to_string();
         let table_name = table_name.to_string();
         let attempts = attempts as i64;
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         let sql = "UPDATE jobs SET partial_result = NULL, updated_at = $1 \
                    WHERE job_id = $2 AND claimed_by = $3 AND status = $4 AND attempts = $5 \
                      AND partial_result = $6";
@@ -1814,7 +1814,7 @@ impl Catalog {
         let instance_id = instance_id.to_string();
         let table_name = table_name.to_string();
         let attempts = attempts as i64;
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         let sql = "UPDATE jobs SET partial_result = $1, updated_at = $2 \
                    WHERE job_id = $3 AND claimed_by = $4 AND status = $5 AND attempts = $6";
         let updated = self
@@ -1875,7 +1875,7 @@ impl Catalog {
         let instance_id = instance_id.to_string();
         let report_json = report_json.to_string();
         let attempts = attempts as i64;
-        let now = now_sortable();
+        let now = canonical_stamp_now();
 
         let updated = self
             .backend()
@@ -1910,7 +1910,7 @@ impl Catalog {
         let admin = TenantBinding::is_admin_scope();
         let job_id_s = job_id.to_string();
         let tenant = self.current_tenant();
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         let non_terminal = JobStatus::non_terminal_sql_list();
         let sql = if admin {
             format!(
@@ -2011,7 +2011,7 @@ impl Catalog {
         let queued_execution = JobExecution::Queued.to_string();
         let inline_execution = JobExecution::Inline.to_string();
         let max_attempts_i = max_attempts as i64;
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         let kind = self.backend().backend_kind();
         let scope_job = only_job_id.map(str::to_string);
         let exhausted_error = "job lease expired after exhausting max attempts".to_string();
@@ -2179,7 +2179,7 @@ impl Catalog {
         let training_set_ref = training_set_ref.to_string();
         let training_set_location = training_set_location.to_string();
         let attempts_i = attempts as i64;
-        let now = now_sortable();
+        let now = canonical_stamp_now();
 
         Ok(self
             .backend()
@@ -2305,7 +2305,7 @@ impl Catalog {
     ) -> Result<bool> {
         let job_id = job_id.to_string();
         let attempt_i = attempt as i64;
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         let kind = self.backend().backend_kind();
         let effect = outcome.effect();
 
@@ -2423,7 +2423,6 @@ impl Catalog {
     /// crate's own tests is the gang `RunRank` handler.
     pub async fn get_job_for_rank(&self, job_id: &str) -> Result<Option<RankAdmissionRow>> {
         let job_id = job_id.to_string();
-        let kind = self.backend().backend_kind();
         Ok(self
             .backend()
             .transaction(
@@ -2443,7 +2442,6 @@ impl Catalog {
                             let lease_expires_at: Option<String> =
                                 row.try_get("lease_expires_at")?;
                             let lease = super::lease::decode_lease_expires_at(
-                                kind,
                                 lease_expires_at.as_deref(),
                                 super::lease::app_clock_now(),
                             );
@@ -2483,7 +2481,7 @@ impl Catalog {
             .member_root
             .as_ref()
             .map(|c| c.identity().as_str().to_string());
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         self.backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
@@ -2546,7 +2544,7 @@ impl Catalog {
                 Ok::<_, JammiError>((w, devices_json))
             })
             .transpose()?;
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         self.backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
@@ -2598,7 +2596,7 @@ impl Catalog {
     /// absent (recovery pruned it before this beat landed).
     pub async fn touch_instance(&self, instance_id: &str) -> Result<bool> {
         let instance_id = instance_id.to_string();
-        let now = now_sortable();
+        let now = canonical_stamp_now();
         let updated = self
             .backend()
             .transaction(TxOptions::default(), |tx| {

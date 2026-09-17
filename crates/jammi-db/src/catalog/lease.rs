@@ -21,7 +21,7 @@
 //! `now()`, evaluated once, by the one database, inside the one statement.
 //! On SQLite (always a single embedded process; there is no peer replica to
 //! skew against) the application clock stays the one source of truth,
-//! through this module's [`lease_now`] / [`lease_deadline`] pair — the ONE
+//! through this module's [`canonical_stamp_now`] / [`lease_deadline`] pair — the ONE
 //! helper every SQLite lease stamp and comparison goes through.
 
 use std::time::Duration;
@@ -29,10 +29,10 @@ use std::time::Duration;
 use crate::catalog::backend::{BackendKind, SqlValue};
 
 /// Format SQLite's app-clock lease stamps write into `lease_expires_at`
-/// ([`lease_now`] / [`lease_deadline`], the SQLite arm's one helper).
+/// ([`canonical_stamp_now`] / [`lease_deadline`], the SQLite arm's one helper).
 /// Lexicographic ordering of two timestamps in this fixed-width UTC form
 /// matches chronological ordering, so [`lease_expired_clause`]'s SQLite arm
-/// — [`lease_now`] bound as a parameter, compared with a plain string `<` —
+/// — [`canonical_stamp_now`] bound as a parameter, compared with a plain string `<` —
 /// is exact at full microsecond precision. SQLite itself has no SQL-visible
 /// clock finer than milliseconds (`datetime('now')` truncates to whole
 /// seconds; `strftime('%f','now')` and `unixepoch('now','subsec')` cap out
@@ -44,25 +44,47 @@ use crate::catalog::backend::{BackendKind, SqlValue};
 /// relies on, even though a real deployment's lease (tens of seconds,
 /// `heartbeat * 2 < lease`) would have tolerated any of those truncations.
 ///
-/// **Postgres stores something else entirely for this column.** A Postgres
-/// lease stamp is `(now() + make_interval(secs => $n))::text`
-/// ([`lease_deadline_expr`]) — Postgres's OWN default `timestamptz` text
-/// rendering (space-separated, zone-suffixed), not this format, and every
-/// comparison casts back through `col::timestamptz` rather than comparing
-/// the stored strings lexicographically at all. `LEASE_TS_FORMAT` names the
-/// SQLite shape only; do not assume a `result_tables.lease_expires_at` value
-/// is in this format without checking which backend wrote it.
+/// **Postgres writes the SAME shape, through a different mechanism.** A
+/// Postgres lease stamp is [`pg_canonical_stamp`]`("now() + make_interval(secs
+/// => $n)")` ([`lease_deadline_expr`]) — computed from the database's own
+/// clock, then rendered through the identical [`LEASE_TS_FORMAT`] picture via
+/// `to_char`, so the stored TEXT is byte-for-byte the same shape this
+/// function produces. Every comparison on Postgres still casts back through
+/// `col::timestamptz` (this module's clock discipline — see "Whose clock"
+/// above — never a lexical compare there), but the STORED shape itself is
+/// now backend-independent: a `result_tables.lease_expires_at` value is in
+/// this format regardless of which backend wrote it.
 pub const LEASE_TS_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6fZ";
 
-/// `now`, formatted for a SQLite (single-process) lease comparison or stamp —
-/// the application clock, through the one helper. Never used to build a
-/// Postgres lease predicate; see the module docs.
-pub fn lease_now() -> String {
+/// `now`, rendered in [`LEASE_TS_FORMAT`] — the ONE canonical catalog stamp
+/// (`CANONICAL_STAMP`), UTC, `T`-separated, exactly six fraction digits, a
+/// literal `Z`. This is the ONE application-side formatter every TEXT
+/// timestamp column this crate writes goes through, whether or not the
+/// column happens to carry "lease" in its name: a SQLite lease deadline
+/// ([`lease_deadline`]), an `instances.started_at`/`last_seen_at` stamp
+/// (`Catalog::upsert_instance`), a `jobs.created_at`/`updated_at` stamp, and
+/// every other app-clock `*_at` column bind through this function so the
+/// catalog never grows a second timestamp shape by accident. The Postgres
+/// SQL-side counterpart is [`pg_canonical_stamp`] — the two together are the
+/// stamp's ONLY two producers, on either backend.
+pub fn canonical_stamp_now() -> String {
     app_clock_now().format(LEASE_TS_FORMAT).to_string()
 }
 
+/// The Postgres SQL expression that renders `expr` (any SQL expression
+/// evaluating to a `timestamp`/`timestamptz`) as [`LEASE_TS_FORMAT`]'s exact
+/// text shape: UTC, `T`-separated, exactly six fraction digits, a literal
+/// `Z` — `to_char`, with an explicit picture, so the rendering never depends
+/// on the session's `DateStyle`/`TimeZone` GUCs the way `::text` does. This
+/// is the ONE Postgres-side stamp renderer; every Postgres writer of an
+/// in-class TEXT timestamp column composes its value through this function
+/// (see [`lease_deadline_expr`]), never a bare `::text` cast.
+pub fn pg_canonical_stamp(expr: &str) -> String {
+    format!("to_char(({expr}) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')")
+}
+
 /// The application clock, read in ONE place. Every app-clock stamp and every
-/// client-side comparison against a stored stamp (`lease_now`,
+/// client-side comparison against a stored stamp (`canonical_stamp_now`,
 /// `lease_deadline`, `decode_lease_expires_at`'s and `last_seen_at_is_fresh`'s
 /// `now`) derives from this call, so `jobs_repo.rs` never reads a clock of its
 /// own — the property `assembly_outcome::cooldown_sql_has_no_second_clock_source`
@@ -137,7 +159,7 @@ impl Default for LeaseIntervals {
 ///   expression names no `$n` at all on this backend.
 /// - SQLite (single process; the application clock IS the "database"
 ///   clock — there is no peer replica to skew against): appends
-///   [`lease_now`] as ONE bind and compares `(col IS NULL OR col < $n)` —
+///   [`canonical_stamp_now`] as ONE bind and compares `(col IS NULL OR col < $n)` —
 ///   full [`LEASE_TS_FORMAT`] microsecond precision, lexicographically.
 ///   Deliberately NOT a no-bind SQLite clock function: `datetime('now')`
 ///   truncates to WHOLE SECONDS, `strftime('%f','now')` and
@@ -150,7 +172,7 @@ impl Default for LeaseIntervals {
 ///   `heartbeat * 2 < lease` guarantees never occurs in a real deployment,
 ///   where truncation to whole seconds would be harmless). SQLite has no
 ///   SQL-visible clock finer than milliseconds, so matching this format's
-///   microsecond precision requires evaluating [`lease_now`] in the
+///   microsecond precision requires evaluating [`canonical_stamp_now`] in the
 ///   application and binding it — the "keep the app clock through ONE
 ///   helper" alternative for the single-process backend.
 pub fn lease_expired_clause(
@@ -161,7 +183,7 @@ pub fn lease_expired_clause(
     match kind {
         BackendKind::Postgres => format!("({col} IS NULL OR {col}::timestamptz < now())"),
         BackendKind::Sqlite => {
-            params.push(SqlValue::TextOwned(lease_now()));
+            params.push(SqlValue::TextOwned(canonical_stamp_now()));
             format!("({col} IS NULL OR {col} < ${})", params.len())
         }
     }
@@ -190,7 +212,7 @@ pub fn lease_live_clause(
     match kind {
         BackendKind::Postgres => format!("({col} IS NOT NULL AND {col}::timestamptz > now())"),
         BackendKind::Sqlite => {
-            params.push(SqlValue::TextOwned(lease_now()));
+            params.push(SqlValue::TextOwned(canonical_stamp_now()));
             format!("({col} IS NOT NULL AND {col} > ${})", params.len())
         }
     }
@@ -203,9 +225,11 @@ pub fn lease_live_clause(
 /// no leading `=`, ready to drop into `SET col = <expr>` or a `VALUES` list —
 /// the counterpart [`lease_expired_clause`] later compares against.
 ///
-/// - Postgres: `(now() + make_interval(secs => $n))::text` — the deadline is
-///   computed entirely inside the database, from its own clock; `$n` binds
-///   only the lease WINDOW (a duration), never a timestamp.
+/// - Postgres: [`pg_canonical_stamp`]`("now() + make_interval(secs => $n)")`
+///   — the deadline is computed entirely inside the database, from its own
+///   clock, then rendered in `CANONICAL_STAMP` shape so this column holds the
+///   identical text shape on either backend; `$n` binds only the lease
+///   WINDOW (a duration), never a timestamp.
 /// - SQLite: binds [`lease_deadline`]'s application-clock stamp directly.
 pub fn lease_deadline_expr(
     kind: BackendKind,
@@ -215,7 +239,7 @@ pub fn lease_deadline_expr(
     match kind {
         BackendKind::Postgres => {
             params.push(SqlValue::Float(lease.as_secs_f64()));
-            format!("(now() + make_interval(secs => ${}))::text", params.len())
+            pg_canonical_stamp(&format!("now() + make_interval(secs => ${})", params.len()))
         }
         BackendKind::Sqlite => {
             params.push(SqlValue::TextOwned(lease_deadline(lease)));
@@ -268,8 +292,8 @@ pub fn stale_before_clause(
 /// compares against: the backend's OWN `now()` on Postgres (stable for the
 /// whole enclosing transaction, so a sibling `lease_expired_clause` call in
 /// the same statement agrees with this one even though each names `now()`
-/// independently), or the bound [`lease_now`] app-clock value on SQLite —
-/// bound HERE, once, since two independent [`lease_now`] reads do not carry
+/// independently), or the bound [`canonical_stamp_now`] app-clock value on SQLite —
+/// bound HERE, once, since two independent [`canonical_stamp_now`] reads do not carry
 /// Postgres's same-transaction guarantee.
 ///
 /// `Catalog::get_job_for_rank` (`docs/rigor/contracts/feat_500-C-U5a-1.md` §
@@ -308,7 +332,7 @@ pub fn lease_remaining_seconds_expr(
             format!("EXTRACT(EPOCH FROM ({col}::timestamptz - now()))::double precision")
         }
         BackendKind::Sqlite => {
-            params.push(SqlValue::TextOwned(lease_now()));
+            params.push(SqlValue::TextOwned(canonical_stamp_now()));
             format!(
                 "((julianday({col}) - julianday(${})) * 86400.0)",
                 params.len()
@@ -370,43 +394,53 @@ impl LeaseFact {
     }
 }
 
-/// Parse an APPLICATION-CLOCK ISO-8601-with-trailing-`Z` stamp — the shape
-/// every `now_sortable()` write uses (`instances.last_seen_at`,
-/// `instances.started_at`: see `Catalog::upsert_instance` — that column is
-/// NEVER database-clock stamped, on EITHER backend, so decoding it needs no
-/// [`BackendKind`] at all) and the shape SQLite's own [`lease_now`] /
-/// [`lease_deadline`] write for `jobs.lease_expires_at`. Accepts any
-/// fractional-second width (`now_sortable` writes 9 digits, [`lease_now`] /
-/// [`lease_deadline`] write 6 — [`LEASE_TS_FORMAT`] is a fixed-width special
-/// case of this same shape); `None` for text that is not this shape at all.
+/// Parse a `CANONICAL_STAMP`-shaped ISO-8601-with-trailing-`Z`
+/// stamp — the ONE shape every writer produces on EITHER backend since S1/S3
+/// (`instances.last_seen_at`, `instances.started_at`: see
+/// `Catalog::upsert_instance`; SQLite's [`canonical_stamp_now`] /
+/// [`lease_deadline`] for `jobs.lease_expires_at`; and, after the schema-edge
+/// domain (migration `039_canonical_stamps`) makes it the ONLY representable
+/// shape, Postgres's own `lease_expires_at` text too — see
+/// [`parse_lease_expires_at`]). Accepts any fractional-second width up to six
+/// digits ([`LEASE_TS_FORMAT`] is the fixed six-digit case this crate always
+/// writes); `None` for text that is not this shape at all, OR that names a
+/// calendar instant chrono refuses — e.g. a month field of `13`,
+/// `…T00:00:00.000000Z` with `…` = `2026-13-01`: the schema-edge CHECK's
+/// regex (`S3`) is shape-only and admits it, and this writer never produces
+/// one, but a stored value like it decodes as [`LeaseFact::Undecodable`], its
+/// documented home. (A leap second, `…T23:59:60.000000Z`, was considered for
+/// this role and executed against both chrono and this crate's decode path:
+/// chrono's `%S`/`%.f` parser DOES accept `:60` and represents it as a valid
+/// `NaiveTime` — `decode_lease_expires_at` reads it as an ordinary, slightly
+/// later instant, never `Undecodable` — so it is not this arm's example.)
 fn parse_app_clock_stamp(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.fZ")
         .ok()
         .map(|naive| chrono::DateTime::from_naive_utc_and_offset(naive, chrono::Utc))
 }
 
-/// Parse `jobs.lease_expires_at`'s stored text into a UTC instant, per the
-/// shape THIS BACKEND's own write path ([`lease_deadline_expr`]) actually
-/// stamps it in: `parse_app_clock_stamp` (an application-clock stamp) on
-/// SQLite, Postgres's own default `timestamptz`-cast-to-`text` rendering (a
-/// DATABASE-clock stamp — `YYYY-MM-DD HH:MM:SS[.ffffff]±HH[:MM]`, the
-/// fractional part omitted entirely when it is exactly zero, the offset
-/// without a leading zero and without a colon at whole-hour magnitudes, e.g.
-/// `2026-09-15 22:46:57.675567-04` or `2026-01-01 00:00:00-05`, verified
-/// against a live Postgres 16) on Postgres. `None` for text that does not
-/// parse under that backend's own shape — [`LeaseFact::Undecodable`].
-fn parse_lease_expires_at(kind: BackendKind, text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    match kind {
-        BackendKind::Sqlite => parse_app_clock_stamp(text),
-        BackendKind::Postgres => chrono::DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f%#z")
-            .ok()
-            .map(|dt| dt.with_timezone(&chrono::Utc)),
-    }
+/// Parse `jobs.lease_expires_at`'s stored text into a UTC instant.
+///
+/// Before migration `039_canonical_stamps`, Postgres wrote this column in its
+/// own default `timestamptz`-cast-to-`text` rendering (a DATABASE-clock
+/// stamp, DateStyle/TimeZone-dependent) while SQLite wrote the application
+/// clock through [`canonical_stamp_now`]/[`lease_deadline`] — two shapes, one
+/// per backend. `039` fixes the WRITER ([`pg_canonical_stamp`] renders every
+/// Postgres write in [`LEASE_TS_FORMAT`] too) and enforces the domain at the
+/// schema edge on both backends, so after it there is exactly ONE shape this
+/// column can hold regardless of which backend wrote it — `kind` is no longer
+/// needed to choose a parser, and this function is [`parse_app_clock_stamp`]
+/// under a name that documents which column it decodes. `None` for text that
+/// does not parse — [`LeaseFact::Undecodable`].
+fn parse_lease_expires_at(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    parse_app_clock_stamp(text)
 }
 
 /// Decode `jobs.lease_expires_at`'s raw stored text (never a SQL-side
 /// `col::timestamptz` cast — see [`LeaseFact`]'s docs) into a [`LeaseFact`]
-/// against `now`, on either backend, infallibly.
+/// against `now`, on either backend, infallibly. Takes no [`BackendKind`]:
+/// since migration `039_canonical_stamps` both backends store the identical
+/// `CANONICAL_STAMP` shape (see [`parse_lease_expires_at`]).
 ///
 /// **The split, and why it is the same clock discipline as
 /// [`lease_expired_clause`] / [`lease_remaining_seconds_expr`].** Those two
@@ -427,14 +461,13 @@ fn parse_lease_expires_at(kind: BackendKind, text: &str) -> Option<chrono::DateT
 /// reap a live claimant always compares against the shared DB clock; a READ
 /// that only refuses never does.
 pub fn decode_lease_expires_at(
-    kind: BackendKind,
     text: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> LeaseFact {
     let Some(text) = text else {
         return LeaseFact::Dead;
     };
-    match parse_lease_expires_at(kind, text) {
+    match parse_lease_expires_at(text) {
         None => LeaseFact::Undecodable,
         // `lease_expired_clause`'s predicate is `col < now()` (expired);
         // live is its negation, `col >= now()` — matching the OLD SQL-side
@@ -453,7 +486,7 @@ pub fn decode_lease_expires_at(
 /// backend: this column is ALWAYS an application-clock
 /// `parse_app_clock_stamp` stamp (`Catalog::upsert_instance` /
 /// `Catalog::reregister_instance` / `Catalog::touch_instance` all write
-/// `now_sortable()`, never the database clock, on either backend), so unlike
+/// [`canonical_stamp_now`], never the database clock, on either backend), so unlike
 /// [`decode_lease_expires_at`] this needs no [`BackendKind`] at all. Text
 /// that does not parse is treated exactly like text that parses but is stale
 /// — NOT fresh, a ROW FACT (`Catalog::fresh_instance`'s own docs: "`false`
@@ -527,8 +560,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_app_clock_stamp_accepts_now_sortable_and_lease_ts_widths() {
-        // `now_sortable()`'s 9-digit width.
+    fn parse_app_clock_stamp_accepts_any_fractional_width_up_to_nine_digits() {
+        // A nine-digit width (no writer in this crate produces one, but a
+        // column this crate does not enforce the domain of — an out-of-class
+        // `*_at` column, S3's "no opt-in" universe gate names the class —
+        // could still hold a pre-existing value at this width).
         assert_eq!(
             parse_app_clock_stamp("2026-01-01T00:00:00.123456789Z"),
             Some(utc(2026, 1, 1, 0, 0, 0, 123456) + chrono::Duration::nanoseconds(789))
@@ -543,44 +579,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_lease_expires_at_postgres_accepts_its_own_default_text_rendering() {
-        // Captured verbatim from a live Postgres 16:
-        // `select (now() + make_interval(secs => 30))::text;`
+    fn parse_lease_expires_at_is_the_one_canonical_shape_on_either_backend() {
+        // Since migration `039_canonical_stamps` this is the ONLY shape the
+        // column can hold, on EITHER backend — `parse_lease_expires_at` takes
+        // no `BackendKind` (see its docs).
         assert_eq!(
-            parse_lease_expires_at(BackendKind::Postgres, "2026-09-15 22:46:57.675567-04"),
-            Some(utc(2026, 9, 16, 2, 46, 57, 675567)),
-        );
-        // The fractional part is OMITTED ENTIRELY when it is exactly zero
-        // (captured: `select ('2026-01-01 00:00:00'::timestamptz)::text`).
-        assert_eq!(
-            parse_lease_expires_at(BackendKind::Postgres, "2026-01-01 00:00:00-05"),
-            Some(utc(2026, 1, 1, 5, 0, 0, 0)),
-        );
-        // A positive, two-part offset.
-        assert_eq!(
-            parse_lease_expires_at(BackendKind::Postgres, "2026-01-01 00:00:00+05:30"),
-            Some(utc(2025, 12, 31, 18, 30, 0, 0)),
-        );
-        assert_eq!(
-            parse_lease_expires_at(BackendKind::Postgres, "not-a-timestamp"),
-            None,
-        );
-    }
-
-    #[test]
-    fn parse_lease_expires_at_sqlite_uses_the_app_clock_shape_only() {
-        assert_eq!(
-            parse_lease_expires_at(BackendKind::Sqlite, "2026-01-01T00:00:00.000000Z"),
+            parse_lease_expires_at("2026-01-01T00:00:00.000000Z"),
             Some(utc(2026, 1, 1, 0, 0, 0, 0)),
         );
-        // Postgres's OWN rendering must NOT parse under the SQLite arm (a
-        // mismatch here would silently cross-decode a value this backend
-        // never wrote in this shape).
+        // Postgres's PRE-039 default rendering (space-separated, zone offset)
+        // must NOT parse: it is not a shape any writer produces once the
+        // schema-edge domain is in force, and a decoder that silently
+        // accepted it would defeat the point of collapsing the parser.
         assert_eq!(
-            parse_lease_expires_at(BackendKind::Sqlite, "2026-09-15 22:46:57.675567-04"),
+            parse_lease_expires_at("2026-09-15 22:46:57.675567-04"),
             None,
         );
-        assert_eq!(parse_lease_expires_at(BackendKind::Sqlite, "garbage"), None);
+        assert_eq!(parse_lease_expires_at("not-a-timestamp"), None);
+        assert_eq!(parse_lease_expires_at("garbage"), None);
+        // Shape-valid, calendar-invalid: the schema-edge CHECK's regex
+        // (`S3`, shape only) admits a month of `13`, but no calendar has one
+        // — this writer never produces such a value, and a stored one
+        // decodes as `Undecodable` (see
+        // `decode_lease_expires_at_treats_a_calendar_invalid_stamp_as_undecodable`).
+        // A leap second (`…T23:59:60.000000Z`) was tried for this role
+        // first and executed against chrono directly: chrono's `%S`/`%.f`
+        // parser ACCEPTS `:60` as a valid `NaiveTime`, so it is not
+        // calendar-invalid from this decoder's point of view and is not
+        // used here.
+        assert_eq!(parse_lease_expires_at("2026-13-01T00:00:00.000000Z"), None);
     }
 
     #[test]
@@ -588,25 +615,19 @@ mod tests {
         let now = utc(2026, 1, 1, 0, 0, 30, 0);
         // NULL column: Dead, matching `lease_expired_clause`'s own `IS NULL`
         // arm — never live-by-default.
+        assert_eq!(decode_lease_expires_at(None, now), LeaseFact::Dead);
+        // Malformed text: `Undecodable`, `Ok(Some(row))` territory — never
+        // propagated as a read fault (issue #574), identically on either
+        // backend since both store the same shape.
         assert_eq!(
-            decode_lease_expires_at(BackendKind::Postgres, None, now),
-            LeaseFact::Dead
-        );
-        // Malformed text on EITHER backend: `Undecodable`, `Ok(Some(row))`
-        // territory — never propagated as a read fault (issue #574).
-        assert_eq!(
-            decode_lease_expires_at(BackendKind::Postgres, Some("not-a-timestamp"), now),
-            LeaseFact::Undecodable
-        );
-        assert_eq!(
-            decode_lease_expires_at(BackendKind::Sqlite, Some("not-a-timestamp"), now),
+            decode_lease_expires_at(Some("not-a-timestamp"), now),
             LeaseFact::Undecodable
         );
         // A deadline strictly in the future: Live, with the exact remaining
         // duration.
         let future = "2026-01-01T00:01:00.000000Z";
         assert_eq!(
-            decode_lease_expires_at(BackendKind::Sqlite, Some(future), now),
+            decode_lease_expires_at(Some(future), now),
             LeaseFact::Live {
                 remaining: Duration::from_secs(30)
             }
@@ -615,16 +636,28 @@ mod tests {
         // itself draws: expired is strict `<`).
         let exactly_now = "2026-01-01T00:00:30.000000Z";
         assert_eq!(
-            decode_lease_expires_at(BackendKind::Sqlite, Some(exactly_now), now),
+            decode_lease_expires_at(Some(exactly_now), now),
             LeaseFact::Live {
                 remaining: Duration::ZERO
             }
         );
         // A deadline in the past: Dead.
         let past = "2026-01-01T00:00:00.000000Z";
+        assert_eq!(decode_lease_expires_at(Some(past), now), LeaseFact::Dead);
+    }
+
+    /// The shape-valid/calendar-invalid determinant named in
+    /// `parse_lease_expires_at`'s docs: the schema-edge CHECK's regex (`S3`)
+    /// is shape-only and admits a month of `13`, but no writer this crate
+    /// owns ever produces one, and no calendar has a thirteenth month, so it
+    /// decodes as `Undecodable` rather than panicking or silently
+    /// misreading a different month.
+    #[test]
+    fn decode_lease_expires_at_treats_a_calendar_invalid_stamp_as_undecodable() {
+        let now = utc(2026, 6, 30, 23, 59, 0, 0);
         assert_eq!(
-            decode_lease_expires_at(BackendKind::Sqlite, Some(past), now),
-            LeaseFact::Dead
+            decode_lease_expires_at(Some("2026-13-01T00:00:00.000000Z"), now),
+            LeaseFact::Undecodable
         );
     }
 
@@ -694,7 +727,7 @@ mod tests {
 
     #[test]
     fn deadline_is_after_now_and_sorts_lexicographically() {
-        let now = lease_now();
+        let now = canonical_stamp_now();
         let later = lease_deadline(Duration::from_secs(30));
         assert!(later > now, "{later} must sort after {now}");
         assert_eq!(now.len(), later.len(), "fixed-width form");
@@ -722,14 +755,18 @@ mod tests {
             clause,
             "(lease_expires_at IS NULL OR lease_expires_at < $1)"
         );
-        assert_eq!(params.len(), 1, "one bind: lease_now(), the app clock");
+        assert_eq!(params.len(), 1, "one bind: canonical_stamp_now(), the app clock");
     }
 
     #[test]
     fn deadline_expr_postgres_binds_only_the_duration_never_a_timestamp() {
         let mut params = Vec::new();
         let expr = lease_deadline_expr(BackendKind::Postgres, Duration::from_secs(30), &mut params);
-        assert_eq!(expr, "(now() + make_interval(secs => $1))::text");
+        assert_eq!(
+            expr,
+            "to_char((now() + make_interval(secs => $1)) AT TIME ZONE 'UTC', \
+             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
+        );
         assert_eq!(params.len(), 1, "one bind: the duration, not a timestamp");
         assert!(
             matches!(params[0], SqlValue::Float(secs) if secs == 30.0),
@@ -770,7 +807,7 @@ mod tests {
             expr,
             "((julianday(lease_expires_at) - julianday($1)) * 86400.0)"
         );
-        assert_eq!(params.len(), 1, "one bind: lease_now(), the app clock");
+        assert_eq!(params.len(), 1, "one bind: canonical_stamp_now(), the app clock");
     }
 
     #[test]
@@ -809,7 +846,7 @@ mod tests {
         assert_eq!(clause, "updated_at < $1");
         assert_eq!(params.len(), 1);
         match &params[0] {
-            SqlValue::TextOwned(s) => assert_eq!(s.len(), lease_now().len(), "fixed-width form"),
+            SqlValue::TextOwned(s) => assert_eq!(s.len(), canonical_stamp_now().len(), "fixed-width form"),
             other => panic!("expected a TextOwned cutoff bind, got {other:?}"),
         }
     }

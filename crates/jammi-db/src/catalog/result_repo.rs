@@ -129,7 +129,7 @@ pub struct CreateResultTableParams<'a> {
     /// creation time. A search request may still override it for one call.
     pub oversample: usize,
     /// The row's creation timestamp, stamped by the caller via
-    /// [`crate::catalog::backend::now_sortable`] rather than left to a SQL
+    /// [`crate::catalog::lease::canonical_stamp_now`] rather than left to a SQL
     /// `DEFAULT` — a backend-computed default would give SQLite and Postgres
     /// different resolutions and shapes for the same column, which is exactly
     /// the ordering-key parity bug [`Catalog::resolve_embedding_table`] used
@@ -826,11 +826,7 @@ impl Catalog {
     ) -> Result<()> {
         let completed_at = if matches!(status, ResultTableStatus::Ready | ResultTableStatus::Failed)
         {
-            Some(
-                chrono::Utc::now()
-                    .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                    .to_string(),
-            )
+            Some(crate::catalog::lease::canonical_stamp_now())
         } else {
             None
         };
@@ -887,9 +883,7 @@ impl Catalog {
     /// affected exactly one row; the caller deletes the row's objects only
     /// after `Ok(true)`.
     pub async fn fail_ready_result_table(&self, name: &str) -> Result<bool> {
-        let completed_at = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
+        let completed_at = crate::catalog::lease::canonical_stamp_now();
         let name = name.to_string();
         let arm = TenantArm::in_force(self.current_tenant());
         let tenant = self.current_tenant();
@@ -1107,9 +1101,7 @@ impl Catalog {
     /// the row's objects only after this returns `Ok(())` — a writer aborting
     /// its own table, or recovery reaping an expired-lease row.
     pub async fn fail_building_table(&self, cas: &ResultTableCas) -> Result<()> {
-        let completed_at = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
+        let completed_at = crate::catalog::lease::canonical_stamp_now();
         self.building_row_cas(
             cas,
             "status = 'failed', row_count = 0, completed_at = $1, lease_expires_at = NULL",
@@ -1214,9 +1206,7 @@ impl Catalog {
         definition_hash: &str,
         input_anchors_json: &str,
     ) -> Result<Option<TenantId>> {
-        let completed_at = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
+        let completed_at = crate::catalog::lease::canonical_stamp_now();
         let cas_in_tx = cas.clone();
         let rows_i64 = rows as i64;
         let definition_hash = definition_hash.to_string();
@@ -1596,11 +1586,12 @@ impl Catalog {
     /// `(definition_hash, input_anchors)` match is the caller's anchor-set
     /// comparison.
     ///
-    /// `created_at` is app-supplied (`backend::now_sortable`) at nanosecond
-    /// resolution, identical in shape on both backends; `table_name DESC` is a
-    /// deterministic final tiebreak for a same-nanosecond collision (every
-    /// table name carries a uuid suffix, so the pick is at least
-    /// deterministic), the same idiom [`Self::resolve_embedding_table`] uses.
+    /// `created_at` is app-supplied (`lease::canonical_stamp_now`) at
+    /// microsecond resolution, identical in shape on both backends;
+    /// `table_name DESC` is a deterministic final tiebreak for a
+    /// same-microsecond collision (every table name carries a uuid suffix, so
+    /// the pick is at least deterministic), the same idiom
+    /// [`Self::resolve_embedding_table`] uses.
     pub async fn find_ready_result_tables_by_definition(
         &self,
         definition_hash: &str,
@@ -1837,16 +1828,16 @@ impl Catalog {
         // relation) whose `task` column still names the source embedding's
         // task — only genuine model outputs resolve as an embedding source.
         //
-        // `created_at` is app-supplied (`backend::now_sortable`) at
-        // nanosecond resolution and identical in shape on both backends, so
+        // `created_at` is app-supplied (`lease::canonical_stamp_now`) at
+        // microsecond resolution and identical in shape on both backends, so
         // it is the correct primary ordering key — no `rowid` (SQLite has
         // one, Postgres does not; this query used to hard-error on Postgres
         // reaching for it). `table_name DESC` is a deterministic final
-        // tiebreak, not a correctness guarantee: `now_sortable` is wall-clock
-        // (`chrono::Utc::now`), which is not monotonic, so a coarse or
-        // backward clock step could in principle collide two genuinely
-        // distinct creation instants. The tiebreak resolves a true
-        // same-nanosecond collision correctly (every table name carries a
+        // tiebreak, not a correctness guarantee: `canonical_stamp_now` is
+        // wall-clock (`chrono::Utc::now`), which is not monotonic, so a
+        // coarse or backward clock step could in principle collide two
+        // genuinely distinct creation instants. The tiebreak resolves a true
+        // same-microsecond collision correctly (every table name carries a
         // uuid suffix, so the pick is at least deterministic); it does not
         // repair a clock-caused false collision between otherwise-ordered
         // rows.

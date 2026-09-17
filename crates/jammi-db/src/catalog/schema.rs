@@ -84,8 +84,8 @@ INSERT INTO evidence_channels (channel_name, schema_json, priority) VALUES
 
 /// Result tables: Parquet-backed embedding and inference outputs with sidecar ANN indexes.
 ///
-/// `created_at` is always app-supplied via `backend::now_sortable` — no SQL
-/// `DEFAULT`, so a forgotten bind fails loudly at `NOT NULL` instead of
+/// `created_at` is always app-supplied via `lease::canonical_stamp_now` — no
+/// SQL `DEFAULT`, so a forgotten bind fails loudly at `NOT NULL` instead of
 /// silently persisting an unsortable/oldest row.
 pub(super) const MIGRATION_002_RESULT_TABLES: &str = r#"
 CREATE TABLE result_tables (

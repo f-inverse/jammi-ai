@@ -294,7 +294,7 @@ async fn remote_describe_source_carries_a_training_set_kind_like_local() {
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
-            created_at: jammi_db::catalog::backend::now_sortable(),
+            created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
         })
         .await

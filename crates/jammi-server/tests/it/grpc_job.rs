@@ -871,7 +871,7 @@ async fn seed_training_job_row(
     let lease_expires_at = claimed_by
         .is_some()
         .then(|| "9999-12-31T23:59:59.000000Z".to_string());
-    let now = jammi_db::catalog::backend::now_sortable();
+    let now = jammi_db::catalog::lease::canonical_stamp_now();
 
     catalog
         .backend_arc()

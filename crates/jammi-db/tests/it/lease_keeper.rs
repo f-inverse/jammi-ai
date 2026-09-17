@@ -622,7 +622,7 @@ async fn release_job_holds_flips_lost_and_skips_inline_holds() {
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
-            created_at: jammi_db::catalog::backend::now_sortable(),
+            created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             writer_id: Some("writer-rjh"),
             lease: Some(lease),
             job_attempt: Some(JobAttempt {

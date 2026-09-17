@@ -281,7 +281,7 @@ async fn placement_available_counts_live_peers_only() {
     catalog
         .upsert_compute_executor(&record(
             &live_id,
-            jammi_db::catalog::backend::now_sortable(),
+            jammi_db::catalog::lease::canonical_stamp_now(),
         ))
         .await
         .unwrap();

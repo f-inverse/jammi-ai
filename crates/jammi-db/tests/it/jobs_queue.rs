@@ -2503,7 +2503,7 @@ fn result_table_params<'a>(
         text_columns: None,
         storage_precision: StoragePrecision::F32,
         oversample: 4,
-        created_at: jammi_db::catalog::backend::now_sortable(),
+        created_at: jammi_db::catalog::lease::canonical_stamp_now(),
         writer_id: None,
         lease: None,
         job_attempt: Some(job_attempt),

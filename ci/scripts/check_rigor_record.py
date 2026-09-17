@@ -3304,14 +3304,26 @@ def fixture_rr44_no_cargo_on_path_degrades_to_advisory() -> None:
     doc) -- a run with no `cargo` on `PATH` at all must never CRASH the
     whole script (an unhandled `FileNotFoundError` would deny every
     OTHER check this same invocation still owes a verdict); it degrades
-    to a named advisory instead. `PATH` is overridden to `/usr/bin:/bin`
-    (a real, minimal PATH carrying no `cargo`) for this ONE invocation
-    only -- never the process-wide environment."""
+    to a named advisory instead. The no-cargo `PATH` is ONE private
+    directory holding a symlink to the `git` this process resolves --
+    the only tool the check runs by name -- so the fixture never depends
+    on where a host installs git (`/usr/bin` on a bare runner and macOS,
+    `/usr/local/bin` in the CI image) and cannot reach a `cargo` from any
+    host directory. The override applies to this ONE invocation only --
+    never the process-wide environment."""
     with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
         _origin, work = _pr_repo(Path(td))
         rust = "pub fn compute_new() -> i32 {\n    1\n}\n"
         _rr_call_site_setup(work, rust, mutations_site="src/lib.rs:1")
-        r = _run_check_in(work, env_overrides={"PATH": "/usr/bin:/bin"})
+        import shutil  # used by this fixture alone
+        git = shutil.which("git")
+        _assert(git is not None, "RR44", "this self-test needs a `git` on PATH to build its no-cargo PATH")
+        no_cargo_bin = Path(td) / "no-cargo-bin"
+        no_cargo_bin.mkdir()
+        (no_cargo_bin / "git").symlink_to(git)
+        _assert(shutil.which("cargo", path=str(no_cargo_bin)) is None, "RR44",
+                f"the no-cargo PATH {no_cargo_bin} must not resolve cargo")
+        r = _run_check_in(work, env_overrides={"PATH": str(no_cargo_bin)})
         _assert(any("could not build the symbol-index required call-site set" in w for w in r.warnings),
                 "RR44", f"a missing cargo must degrade to a named advisory, got warnings: {r.warnings}")
         _assert(not any("phantom site" in f for f in r.failures), "RR44",

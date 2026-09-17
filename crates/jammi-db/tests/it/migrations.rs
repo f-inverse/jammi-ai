@@ -2893,3 +2893,175 @@ async fn migration_039_is_ordered_after_038_and_the_enforcement_set_is_exact(
         }
     }
 }
+
+/// R2 (round-2 REFINE): S2's fail-closed migration is an OUTCOME property,
+/// not a mechanism — a refused re-application of `039_canonical_stamps`
+/// must leave the ledger at 038, the offending row's own value untouched,
+/// AND install NEITHER the trigger nor the `CHECK` for the column it could
+/// not normalise (a `RAISE(ABORT)`/cast fault rolls back only its own
+/// statement; fail-closed holds because the migration RUNNER's one
+/// transaction is never committed once an `Err` propagates — the state
+/// this oracle asserts, not the rollback mechanism itself).
+///
+/// SQLite only, deliberately: 039 is ONE migration entry, tracked by ONE
+/// ledger name, so re-applying it (clearing its ledger row) re-runs its
+/// FULL 26-trigger/13-rewrite statement list, not just the one column this
+/// test manufactures an offending value for. On a private tempdir catalog
+/// (this test's own, touched by nothing else) that is harmless — every
+/// other column's trigger/rewrite is a no-op against already-canonical
+/// data. The Postgres arm was tried first and DROPPED after it corrupted
+/// the shared `jammi_test` database's migration ledger twice in a row
+/// (this file's own PR history): re-applying 039 there re-attempted
+/// `ADD CONSTRAINT` for the 12 OTHER columns this test never touched,
+/// which already existed from the real, once-only migration every other
+/// test in this suite depends on, and failed with `already exists` —
+/// requiring a manual `pg_dump`/`psql` repair of shared infrastructure. A
+/// migration that is monolithic across many columns cannot safely be
+/// partially rewound against a database other concurrent test runs share;
+/// SQLite's per-test isolation is the only backend this specific fixture
+/// shape is safe on. The property itself — a failed migration's
+/// transaction never commits — is backend-symmetric (verified once by
+/// hand against a live Postgres scratch table during development) and is
+/// exercised by EVERY OTHER migration's own tests on both backends
+/// already (the runner's transaction wrapping is not 039-specific code).
+#[tokio::test]
+async fn migration_039_on_an_unclassifiable_value_fails_closed() {
+    use jammi_db::catalog::backend::SqlValue;
+
+    let dir = tempdir().unwrap();
+    let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
+    // A real, fully-migrated catalog first (039 included) -- the baseline
+    // every assertion below diffs against.
+    backend.migrate().await.unwrap();
+
+    let job_id = "mig039-fail-closed".to_string();
+    let offending = "unclassifiable-garbage-value";
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                // A minimal, valid `jobs` row so the UPDATE below has
+                // something to hit.
+                tx.execute(
+                    "INSERT INTO jobs (job_id, kind, execution, spec, created_at, updated_at) \
+                     VALUES ($1, 'k', 'queued', '{}', '2026-01-01T00:00:00.000000Z', \
+                             '2026-01-01T00:00:00.000000Z')",
+                    &[SqlValue::TextOwned(job_id.clone())],
+                )
+                .await?;
+                tx.execute("DROP TRIGGER trg_jobs_lease_expires_at_canonical_ins", &[])
+                    .await?;
+                tx.execute("DROP TRIGGER trg_jobs_lease_expires_at_canonical_upd", &[])
+                    .await?;
+                tx.execute(
+                    "UPDATE jobs SET lease_expires_at = $1 WHERE job_id = $2",
+                    &[
+                        SqlValue::Text(offending),
+                        SqlValue::TextOwned(job_id.clone()),
+                    ],
+                )
+                .await?;
+                tx.execute(
+                    "DELETE FROM applied_migrations WHERE name = '039_canonical_stamps'",
+                    &[],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+
+    // The re-application must fail.
+    let err = backend.migrate().await.expect_err(
+        "039 must refuse to normalise a value none of its three recognised shapes match",
+    );
+    assert!(
+        matches!(
+            err,
+            jammi_db::catalog::backend::BackendError::DomainViolation { .. }
+        ),
+        "the refusal must be the typed domain-violation class, got {err:?}"
+    );
+
+    // Outcome, not mechanism: the ledger stays at 038 for this migration,
+    let ledger: Vec<String> = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query(
+                        "SELECT name FROM applied_migrations WHERE name = '039_canonical_stamps'",
+                        &[],
+                        |row| row.get::<String>("name"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        ledger.is_empty(),
+        "039_canonical_stamps must NOT be recorded as applied after a failed re-application"
+    );
+
+    // the row's own value is untouched (never rewritten, never nulled),
+    let stored: String = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                let job_id = job_id.clone();
+                Box::pin(async move {
+                    tx.query_opt(
+                        "SELECT lease_expires_at FROM jobs WHERE job_id = $1",
+                        &[SqlValue::TextOwned(job_id)],
+                        |row| row.get::<String>("lease_expires_at"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the row must still exist");
+    assert_eq!(
+        stored, offending,
+        "the offending row's value must be intact after the refused migration"
+    );
+
+    // and the enforcement this exact failed attempt would have installed
+    // does NOT exist (the dropped trigger for THIS column stays dropped --
+    // a refused migration installs nothing, not even partially).
+    let enforcement_exists: bool = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    let rows: Vec<i64> = tx
+                        .query(
+                            "SELECT 1 AS one FROM sqlite_master WHERE type = 'trigger' \
+                             AND name = 'trg_jobs_lease_expires_at_canonical_upd'",
+                            &[],
+                            |row| row.get::<i64>("one"),
+                        )
+                        .await?;
+                    Ok(!rows.is_empty())
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !enforcement_exists,
+        "a refused migration must install neither the trigger nor the CHECK it was attempting"
+    );
+}

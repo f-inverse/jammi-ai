@@ -229,6 +229,19 @@ pub(crate) fn repo_root() -> PathBuf {
 /// `src/pipeline/asof/`. There is nothing here for a "did the walk reach
 /// every tracked file" sentinel to check, because there is no second walk
 /// to disagree with the tracked list — the tracked list IS what is scanned.
+/// Whether a repo-relative `.rs` path is compiled, non-test source: not
+/// under a `tests/`, `benches/` or `examples/` directory and not a
+/// tokenizer fixture under `ci/fixtures/` (inputs, never compiled). Every
+/// workspace member's `src/` and every `build.rs` qualify. Shared by the
+/// call-site oracles that quantify over "the workspace's production code".
+pub(crate) fn is_compiled_non_test_source(rel: &str) -> bool {
+    let parts: Vec<&str> = rel.split('/').collect();
+    !parts
+        .iter()
+        .any(|p| *p == "tests" || *p == "benches" || *p == "examples")
+        && !rel.starts_with("ci/fixtures/")
+}
+
 pub(crate) fn tracked_rs_files(root: &Path, dir: &str) -> Vec<String> {
     let output = Command::new("git")
         .args([

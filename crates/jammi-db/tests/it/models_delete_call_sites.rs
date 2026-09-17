@@ -6,8 +6,10 @@
 //! [`jammi_db::storage::JammiObjectStore::delete_if_exists`] and
 //! [`jammi_db::store::ArtifactStore::delete_artifact_prefix`] (`pub(crate)`,
 //! confirmed by reading its definition) — across every git-tracked `.rs`
-//! file under every crate's `src/` tree (`crates/*/src`), because
-//! `delete_if_exists` is `pub` and a caller in any crate is in scope.
+//! file that is compiled non-test source (every workspace member's `src/`,
+//! every `build.rs`; not `tests/`, `benches/`, `examples/` or the
+//! `ci/fixtures/` tokenizer inputs), because `delete_if_exists` is `pub`
+//! and a caller anywhere in the workspace is in scope.
 //!
 //! **Keyed by `(file, function, ordinal)`, not `(file, line)`** (F2's
 //! second delta): a bare line number goes stale on every UNRELATED edit
@@ -307,20 +309,25 @@ fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
 }
 
 /// Walks a parsed file, tracking the innermost enclosing named function and
-/// recording every call of `delete_if_exists` / `delete_artifact_prefix` it
-/// finds, in EVERY shape a same-tree caller can spell one — never only the
-/// shape today's call sites happen to use ("confirmed by reading every
-/// production call site" is a review of the present tree, not a control
-/// over the next commit's, and an enumerating gate that enumerates one
-/// shape fails open on the others):
+/// recording every REFERENCE to `delete_if_exists` / `delete_artifact_prefix`
+/// it finds — a call or a value — in the shapes the grammar allows, never
+/// only the shape today's call sites happen to use ("confirmed by reading
+/// every production call site" is a review of the present tree, not a
+/// control over the next commit's, and an enumerating gate that enumerates
+/// one shape fails open on the others):
 ///
 /// 1. a method call, `handle.delete_if_exists(..)` (`visit_expr_method_call`);
-/// 2. a path call under ANY qualifying prefix or qualified-self syntax —
+/// 2. a path expression naming the fn in ANY position — the callee of
 ///    `JammiObjectStore::delete_if_exists(&h, ..)`,
 ///    `crate::storage::JammiObjectStore::delete_if_exists(..)`,
-///    `<JammiObjectStore>::delete_if_exists(..)` — matched by the path's own
-///    LAST segment, never by a fixed-length segment-vector equality
-///    (`visit_expr_call`);
+///    `<JammiObjectStore>::delete_if_exists(..)`, and equally a fn-item
+///    captured as a value and invoked later (`let raw =
+///    JammiObjectStore::delete_if_exists; raw(&h, &p)`), handed to a
+///    combinator or stored in a field — matched by the path's own LAST
+///    segment, never by a fixed-length segment-vector equality
+///    (`visit_expr_path`, which fires wherever a path appears, so a call
+///    position is not a special case; a value reference is a site because
+///    the fn it names can be invoked anywhere afterwards);
 /// 3. a call inside a macro INVOCATION's argument stream —
 ///    `tokio::try_join!(h.delete_if_exists(&a), ..)`, `assert!(..)`, a
 ///    `macro_rules!` body — which `syn` parses as an opaque token stream
@@ -334,7 +341,7 @@ fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
 /// found site outside any named function panics loudly rather than being
 /// dropped. Executed falsifications for every shape live below
 /// (`shape_*` tests); `crates/jammi-ai/tests/it/rank_admission.rs`'s
-/// submit-seam scanner records the same three shapes.
+/// submit-seam scanner records the same shapes.
 struct DeleteCallScanner {
     /// The stack of enclosing named-function names — only `visit_item_fn`
     /// (free functions) and `visit_impl_item_fn` (methods) push; a closure
@@ -419,17 +426,17 @@ impl<'ast> syn::visit::Visit<'ast> for DeleteCallScanner {
         syn::visit::visit_expr_method_call(self, node);
     }
 
-    /// Shape 2: a path call. Only the path's LAST segment is the function
-    /// name; everything before it (`Type::`, `crate::m::Type::`, or a
-    /// `<Type>` qualified self, which `syn` keeps in `qself` and out of the
-    /// segments entirely) is a prefix this scan must be indifferent to.
-    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-        if let syn::Expr::Path(p) = &*node.func {
-            if let Some(last) = p.path.segments.last() {
-                self.record_if_match(&last.ident.to_string());
-            }
+    /// Shape 2: a path expression in ANY position (a call's callee, a
+    /// captured value, an argument, a field). Only the path's LAST segment
+    /// is the function name; everything before it (`Type::`,
+    /// `crate::m::Type::`, or a `<Type>` qualified self, which `syn` keeps
+    /// in `qself` and out of the segments entirely) is a prefix this scan
+    /// must be indifferent to.
+    fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+        if let Some(last) = node.path.segments.last() {
+            self.record_if_match(&last.ident.to_string());
         }
-        syn::visit::visit_expr_call(self, node);
+        syn::visit::visit_expr_path(self, node);
     }
 
     /// Shape 3: a macro invocation (expression, statement or item position
@@ -509,12 +516,18 @@ fn repo_root() -> PathBuf {
 fn every_raw_models_byte_delete_call_site_is_reviewed() {
     let repo_root = repo_root();
 
-    // Every crate's production tree: `delete_if_exists` is `pub`, so the
-    // universe is every `crates/*/src`, never the two crates that call it
-    // today.
-    let files: Vec<String> = tracked_rs_files(&repo_root, "crates")
+    // The repository's compiled non-test Rust: every git-tracked `.rs`
+    // not under `tests/`, `benches/` or `examples/` and not a tokenizer
+    // fixture under `ci/fixtures/` — every workspace member's `src/`
+    // (crates and `ci/tools/*`) and every `build.rs`. `delete_if_exists`
+    // is `pub`, so a caller anywhere in that set is in scope.
+    let files: Vec<String> = tracked_rs_files(&repo_root, ".")
         .into_iter()
-        .filter(|f| f.split('/').nth(2) == Some("src"))
+        .filter(|f| {
+            !f.split('/')
+                .any(|p| p == "tests" || p == "benches" || p == "examples")
+                && !f.starts_with("ci/fixtures/")
+        })
         .collect();
     assert!(
         files.len() > 50,
@@ -692,6 +705,28 @@ fn shape_3_a_call_inside_a_macro_invocation_is_found_per_occurrence() {
         // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_3 (macro_rules body) — not real code in this file
         "fn f() { macro_rules! reap { ($h:expr, $p:expr) => { $h.delete_if_exists($p).await } } }";
     assert_eq!(shape_sites(body), vec!["f #1"]);
+}
+
+#[test]
+fn shape_4_a_path_captured_as_a_value_is_found_wherever_it_appears() {
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_4 (fn-item capture) — not real code in this file
+    let captured = "async fn f(h: H, p: P) { let raw = JammiObjectStore::delete_if_exists; raw(&h, &p).await; }";
+    let combinator =
+        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_4 (combinator argument) — not real code in this file
+        "fn f(ps: Vec<P>) { let _ = ps.iter().map(ArtifactStore::delete_artifact_prefix); }";
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_4 (struct field) — not real code in this file
+    let field = "fn f() -> Ops { Ops { del: <JammiObjectStore>::delete_if_exists } }";
+    for (name, src) in [
+        ("captured", captured),
+        ("combinator", combinator),
+        ("field", field),
+    ] {
+        assert_eq!(
+            shape_sites(src),
+            vec!["f #1"],
+            "shape 4 ({name}): a value reference must be found"
+        );
+    }
 }
 
 #[test]

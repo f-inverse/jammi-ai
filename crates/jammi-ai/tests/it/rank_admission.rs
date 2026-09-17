@@ -645,18 +645,26 @@ fn attr_is_cfg_test(attr: &syn::Attribute) -> bool {
 }
 
 /// [`syn::visit::Visit`] over one file's AST: records a [`SubmitCallSite`]
-/// for every call of `submit_job`/`submit_job_deduped` in EVERY shape a
-/// same-tree caller can spell one — a method call `x.submit_job(..)`
-/// (`visit_expr_method_call`); a path call under any prefix or qualified
-/// self, `Catalog::submit_job(&c, ..)`, `crate::db::Catalog::submit_job(..)`,
-/// `<Catalog>::submit_job(..)`, matched by the path's LAST segment
-/// (`visit_expr_call`); and a call inside any macro invocation's argument
-/// stream, `tokio::try_join!(c.submit_job(..))`, which `syn` never descends
-/// into as an expression — `visit_macro` walks the tokens through every
-/// nested group and records each exact `Ident` spelled as either name
-/// (never a substring, never a string literal). Each hit is tagged with its
-/// nearest enclosing named `fn` — free function or `impl`/trait method
-/// alike. Never descends into an item (a `mod`, a `fn`) carrying
+/// for every REFERENCE to `submit_job`/`submit_job_deduped` — a call or a
+/// value — in the shapes the grammar allows: a method call
+/// `x.submit_job(..)` (`visit_expr_method_call`); a path expression naming
+/// the fn in ANY position, matched by the path's LAST segment under any
+/// prefix or qualified self — the callee of `Catalog::submit_job(&c, ..)`,
+/// `crate::db::Catalog::submit_job(..)`, `<Catalog>::submit_job(..)`, and
+/// equally a fn-item captured as a value and invoked later
+/// (`let route = Catalog::submit_job; route(&c, ..)`), handed to a
+/// combinator (`.map(Catalog::submit_job)`) or stored in a field
+/// (`visit_expr_path`, which fires for a path wherever it appears, so a
+/// call position is not a special case); and a reference inside any macro
+/// invocation's argument stream, `tokio::try_join!(c.submit_job(..))`,
+/// which `syn` never descends into as an expression — `visit_macro` walks
+/// the tokens through every nested group and records each exact `Ident`
+/// spelled as either name (never a substring, never a string literal).
+/// A value reference is recorded as a site because the fn it names can be
+/// invoked anywhere afterwards; reviewing the reference is the only place
+/// the review can happen. Each hit is tagged with its nearest enclosing
+/// named `fn` — free function or `impl`/trait method alike. Never descends
+/// into an item (a `mod`, a `fn`) carrying
 /// `#[cfg(test)]` at all — see [`attr_is_cfg_test`] — which is what keeps
 /// `fine_tune/worker.rs`'s and `fine_tune/trainer.rs`'s `mod tests { .. }`
 /// fixture rows out of [`submit_call_sites_in_production_code`]'s universe.
@@ -706,16 +714,17 @@ impl<'ast> syn::visit::Visit<'ast> for SubmitCallScanner {
         syn::visit::visit_expr_method_call(self, node);
     }
 
-    /// A path call: only the LAST segment is the function name; a `<T>`
-    /// qualified self lives in `qself`, outside the segments, and every
-    /// prefix before the name is one this scan is indifferent to.
-    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-        if let syn::Expr::Path(p) = &*node.func {
-            if let Some(last) = p.path.segments.last() {
-                self.record_if_submit(&last.ident.to_string());
-            }
+    /// A path expression in ANY position — the callee of a call, a value
+    /// bound to a local, an argument, a struct field: only the LAST segment
+    /// is the function name; a `<T>` qualified self lives in `qself`,
+    /// outside the segments, and every prefix before the name is one this
+    /// scan is indifferent to. `syn` reaches a call's callee through this
+    /// same visitor, so a call is not a separate direction.
+    fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+        if let Some(last) = node.path.segments.last() {
+            self.record_if_submit(&last.ident.to_string());
         }
-        syn::visit::visit_expr_call(self, node);
+        syn::visit::visit_expr_path(self, node);
     }
 
     /// A macro invocation in expression, statement or item position —
@@ -775,25 +784,29 @@ fn scan_submit_source(file: &str, text: &str) -> Vec<SubmitCallSite> {
     scanner.hits
 }
 
-/// Every [`SubmitCallSite`] in the production code of EVERY workspace
-/// crate — every git-tracked `.rs` file under `crates/*/src` — sorted; the
-/// enumerated universe [`every_submit_job_call_in_production_code_is_the_seam_or_a_reviewed_non_training_site`]
+/// Every [`SubmitCallSite`] in the repository's compiled non-test Rust —
+/// every git-tracked `.rs` file that is not under a `tests/`, `benches/`
+/// or `examples/` directory and not a tokenizer fixture under
+/// `ci/fixtures/` (inputs, never compiled): every workspace member's
+/// `src/` (the crates AND the `ci/tools/*` members), every `build.rs`.
+/// `#[cfg(test)]` items inside those files are skipped by the scanner.
+/// The enumerated universe [`every_submit_job_call_in_production_code_is_the_seam_or_a_reviewed_non_training_site`]
 /// checks against its allow-list. `Catalog::submit_job`/`submit_job_deduped`
 /// and `SubmitJobParams` are `pub`, so a caller in any crate is in scope
 /// (`jammi-server`, `jammi-ballista` and `jammi-bench` hold `Catalog`
-/// handles today); a universe narrower than the workspace would let a
-/// hand-built training-kind submit in one of them pass unseen. The file
-/// list comes from `git ls-files` (never a hand-maintained walk), through
-/// the same `tracked_rs_files` helper the pinned source gate uses.
+/// handles today); a universe narrower than that would let a hand-built
+/// training-kind submit pass unseen. The file list comes from
+/// `git ls-files` (never a hand-maintained walk), through the same
+/// `tracked_rs_files` helper the pinned source gate uses.
 fn submit_call_sites_in_production_code() -> Vec<SubmitCallSite> {
     let root = crate::pinned_source_gate::repo_root();
-    let files: Vec<String> = crate::pinned_source_gate::tracked_rs_files(&root, "crates")
+    let files: Vec<String> = crate::pinned_source_gate::tracked_rs_files(&root, ".")
         .into_iter()
-        .filter(|f| f.split('/').nth(2) == Some("src"))
+        .filter(|f| crate::pinned_source_gate::is_compiled_non_test_source(f))
         .collect();
     assert!(
         files.len() > 100,
-        "git ls-files crates returned suspiciously few production .rs files ({}); the \
+        "git ls-files returned suspiciously few compiled non-test .rs files ({}); the \
          universe quantifier is broken, not the tree",
         files.len()
     );
@@ -901,6 +914,29 @@ fn submit_shape_3_a_call_inside_a_macro_invocation_is_found_per_occurrence() {
     // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_3 (nested group) — not real code in this file
     let nested = "async fn f(c: C, p: P) { assert!(matches!(c.submit_job(p).await, Ok(()))); }";
     assert_eq!(submit_shape_fns(nested), vec!["f"]);
+}
+
+#[test]
+fn submit_shape_4_a_path_captured_as_a_value_is_found_wherever_it_appears() {
+    let captured =
+        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_4 (fn-item capture) — not real code in this file
+        "async fn f(c: C, p: P) { let route = Catalog::submit_job; route(&c, p).await; }";
+    let combinator =
+        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_4 (combinator argument) — not real code in this file
+        "fn f(c: C, ps: Vec<P>) { let _ = ps.into_iter().map(Catalog::submit_job_deduped); }";
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_4 (struct field) — not real code in this file
+    let field = "fn f() -> Routes { Routes { submit: <Catalog>::submit_job } }";
+    for (name, src) in [
+        ("captured", captured),
+        ("combinator", combinator),
+        ("field", field),
+    ] {
+        assert_eq!(
+            submit_shape_fns(src),
+            vec!["f"],
+            "submit shape 4 ({name}): a path naming the fn as a VALUE must be found"
+        );
+    }
 }
 
 #[test]

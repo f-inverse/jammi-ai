@@ -359,6 +359,31 @@ async fn fresh_instance_malformed_last_seen_at_is_not_fresh_on_sqlite_and_a_writ
                 "SQLite's trigger checks shape only; a calendar-invalid but shape-valid \
                  value is admitted",
             );
+            let fresh = catalog
+                .fresh_instance(&instance_id, Duration::from_secs(30))
+                .await
+                .expect(
+                    "a calendar-invalid last_seen_at must be a row fact, never a read fault, \
+                     on SQLite",
+                );
+            assert!(
+                !fresh,
+                "a last_seen_at that does not parse as a timestamp must never read as fresh"
+            );
+            catalog
+                .backend_arc()
+                .transaction(TxOptions::default(), |tx| {
+                    let instance_id = instance_id.clone();
+                    Box::pin(async move {
+                        tx.execute(
+                            "DELETE FROM instances WHERE instance_id = $1",
+                            &[SqlValue::TextOwned(instance_id)],
+                        )
+                        .await
+                    })
+                })
+                .await
+                .unwrap();
         }
         BackendKind::Postgres => {
             let err = write_result.expect_err(
@@ -388,32 +413,8 @@ async fn fresh_instance_malformed_last_seen_at_is_not_fresh_on_sqlite_and_a_writ
                 })
                 .await
                 .unwrap();
-            return;
         }
     }
-
-    let fresh = catalog
-        .fresh_instance(&instance_id, Duration::from_secs(30))
-        .await
-        .expect(
-            "a calendar-invalid last_seen_at must be a row fact, never a read fault, on SQLite",
-        );
-    assert!(
-        !fresh,
-        "a last_seen_at that does not parse as a timestamp must never read as fresh"
-    );
-    catalog
-        .backend_arc()
-        .transaction(TxOptions::default(), |tx| {
-            let instance_id = instance_id.clone();
-            Box::pin(async move {
-                tx.execute(
-                    "DELETE FROM instances WHERE instance_id = $1",
-                    &[SqlValue::TextOwned(instance_id)],
-                )
-                .await
-            })
-        })
-        .await
-        .unwrap();
+    // Both arms above are terminal assertions of their backend's own
+    // behaviour; no arm returns early, so nothing here is a runtime skip.
 }

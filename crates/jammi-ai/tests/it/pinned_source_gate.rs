@@ -99,17 +99,30 @@
 //!    into a bare `current_version` local remains disclosed, not covered —
 //!    see that same doc for why.
 //!
-//! **What this file does NOT claim.** It is source-text pattern matching
-//! over a hand-written (but string/char/comment-literal-aware — see
-//! [`mask_non_code`]) approximation of Rust's grammar, not a real parser and
-//! not a call-graph or dataflow analysis. Stated failure modes, per R-A:
-//! nested (non-doc) block comments are treated as non-nesting (the first
-//! `*/` closes them — Rust allows `/* /* */ */` to nest; this crate's source
-//! was checked and contains no such nesting today, but a future one would
-//! have its interior treated as code); a function-pointer type parameter
-//! written with unconventional spacing (`fn (i32) -> bool`, a space after
-//! `fn`) would be mistaken for a function item — checked: `grep -rn 'fn (\['
-//! crates/jammi-db/src crates/jammi-ai/src` finds none; and detectors 2 and
+//! **What this file does NOT claim.** [`find_fn_regions`] itself is still
+//! source-text pattern matching over an approximation of Rust's grammar (a
+//! function-pointer type parameter written with unconventional spacing
+//! (`fn (i32) -> bool`, a space after `fn`) would be mistaken for a function
+//! item — checked: `grep -rn 'fn (\[' crates/jammi-db/src crates/jammi-ai/src`
+//! finds none), not a real call-graph or dataflow analysis. The masking layer
+//! underneath it ([`mask_non_code`]/[`mask_comments_only`]) is NOT
+//! hand-rolled: both delegate to [`real_tokenizer_mask`], which walks the
+//! REAL token stream `proc-macro2`'s fallback lexer produces (the same lexer
+//! `rustc` itself is built on) and uses each token's own `Span::byte_range()`
+//! to decide what is code, what is a string/char literal, and what is a
+//! comment — never a hand-counted quote or `/*`/`*/` pair. This closes the
+//! R-A limits a prior hand-rolled scanner had here (closing audit #9 of
+//! U2a, 2026-09-14, measured them live on this tree: 22 code lines blanked as
+//! comments and 12 real comments left unblanked around raw strings in
+//! `crates/jammi-db/src/{storage/config.rs,config/tests.rs,config/secret.rs,
+//! sql/ident.rs}`) rather than merely disclosing them: a raw string's
+//! `r#"..."#` delimiter (any hash count, any number of embedded physical
+//! newlines) is a single [`proc_macro2::Literal`] token regardless of what
+//! `"`/`//`/`/*` text it contains, and a (non-doc) block comment nests
+//! correctly because the tokenizer's own trivia-skipping — not this file's
+//! character loop — decides where one ends; see
+//! [`falsification_real_tokenizer_mask_handles_raw_strings_and_nested_comments`]
+//! for the executed proof, both directions. Detectors 2 and
 //! 4 do not follow a value ACROSS function boundaries (a helper that reads
 //! `.current_version` — off a parameter for pattern 2, off a self-fetched
 //! record for pattern 4 — and hands the bare version to a second,
@@ -180,7 +193,21 @@ use std::process::Command;
 
 /// The whole surface this gate's property quantifies over
 /// (`CONTRACT-DELTA-fix7.md`: "every Rust source in `crates/jammi-db/src`
-/// and `crates/jammi-ai/src`"), relative to the repo root.
+/// and `crates/jammi-ai/src`"), relative to the repo root — stated honestly,
+/// not merely by construction: a registration verb or DDL literal living
+/// anywhere OUTSIDE these two trees is outside every check in this file's
+/// "literal-occurrence gate" section (below) entirely, whether that is a
+/// third crate ([`falsification_registration_verb_scan_states_its_universe_honestly`]
+/// exercises `crates/jammi-bench/src/corpus.rs`'s real
+/// `ctx.register_parquet(TableReference::bare(format!("jammi.{table_name}")),
+/// ..)` call, live and unreviewed by this file today, precisely because
+/// `jammi-bench` is not one of these two directories) or `tests/it/` in
+/// either crate named here (five `.register_table(` calls this file's own
+/// review list cites live under `crates/jammi-db/tests/it/materialization.rs`,
+/// outside `crates/jammi-db/src`, and so outside this constant's reach too).
+/// [`fine_tune_reachable_sites`]'s own universe (derived from `cargo
+/// metadata`'s dependency closure, not this constant) is wider on purpose —
+/// see that function's doc.
 const SURFACE_DIRS: &[&str] = &["crates/jammi-db/src", "crates/jammi-ai/src"];
 
 /// The repo root, derived from this crate's manifest dir
@@ -263,238 +290,252 @@ pub(crate) fn scan_surface() -> Vec<(String, String)> {
     out
 }
 
-// ── A comment/string/char-literal-aware mask, so brace/paren counting and
-// pattern search never mistake a `format!("jammi.{}")`'s own braces, or a
-// doc comment's prose, for code. ──────────────────────────────────────────
+/// #554 item 4: [`SURFACE_DIRS`]'s "stated honestly" claim, executed rather
+/// than taken on prose. `crates/jammi-bench/src/corpus.rs` carries a real,
+/// live `ctx.register_parquet(TableReference::bare(format!(
+/// "jammi.{table_name}")), ..)` call today -- checked directly below, not
+/// assumed -- and [`scan_surface`]'s own output is asserted to contain ZERO
+/// `crates/jammi-bench/` files, so that call is provably outside every
+/// check in the "literal-occurrence gate" section, not merely claimed to be.
+#[test]
+fn falsification_registration_verb_scan_states_its_universe_honestly() {
+    let root = repo_root();
+    let corpus_path = root.join("crates/jammi-bench/src/corpus.rs");
+    let corpus_text = std::fs::read_to_string(&corpus_path).unwrap_or_else(|e| {
+        panic!("crates/jammi-bench/src/corpus.rs must exist for this test to be meaningful ({e})")
+    });
+    assert!(
+        corpus_text.contains("register_parquet("),
+        "crates/jammi-bench/src/corpus.rs must still contain the motivating out-of-universe \
+         register_parquet( call this test proves lies outside SURFACE_DIRS -- if this fails, the \
+         call moved or was removed and this test's own premise needs re-checking, not silencing"
+    );
 
-/// Replace every line comment, block comment, string literal (plain and
-/// raw), and char literal in `text` with spaces — same length, same
-/// newlines, so every downstream line/column number still matches the
-/// original file, and brace/paren counting on the result never miscounts a
-/// `{`/`}` that appears inside a string (e.g. `format!("jammi.{}", ..)`) or
-/// treats commented-out code as live.
-///
-/// **Stated limit (R-A):** block comments are treated as non-nesting (the
-/// first `*/` closes one opened by `/*`, even though Rust itself nests
-/// them). Checked rather than assumed: `grep -rn '/\*.*/\*' crates/jammi-db/src
-/// crates/jammi-ai/src` finds no nested block comment in this surface today,
-/// so this limit is inert on the current tree; a future nested block
-/// comment would have its interior treated as code, which could only ever
-/// make a detector below fire MORE often (spurious code seen inside a dead
-/// comment), never mask a real hit.
-fn mask_non_code(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let mut out: Vec<char> = chars.clone();
-    let mut i = 0usize;
-    while i < n {
-        let c = chars[i];
-        // Line comment: `//` to end of line.
-        if c == '/' && i + 1 < n && chars[i + 1] == '/' {
-            let mut j = i;
-            while j < n && chars[j] != '\n' {
-                out[j] = ' ';
-                j += 1;
-            }
-            i = j;
-            continue;
-        }
-        // Block comment: `/* ... */`, non-nesting (see doc above).
-        if c == '/' && i + 1 < n && chars[i + 1] == '*' {
-            let mut j = i + 2;
-            while j + 1 < n && !(chars[j] == '*' && chars[j + 1] == '/') {
-                j += 1;
-            }
-            let end = (j + 2).min(n);
-            for k in i..end {
-                if chars[k] != '\n' {
-                    out[k] = ' ';
-                }
-            }
-            i = end;
-            continue;
-        }
-        // Raw string: `r`/`r#`.../`r###..."`, matched against the same
-        // number of trailing `#` after the closing `"`.
-        if c == 'r' && i + 1 < n && (chars[i + 1] == '"' || chars[i + 1] == '#') {
-            let mut k = i + 1;
-            let mut hashes = 0usize;
-            while k < n && chars[k] == '#' {
-                hashes += 1;
-                k += 1;
-            }
-            if k < n && chars[k] == '"' {
-                let content_start = k + 1;
-                let mut j = content_start;
-                let end = loop {
-                    if j >= n {
-                        break n;
-                    }
-                    if chars[j] == '"'
-                        && chars[j + 1..(j + 1 + hashes).min(n)]
-                            .iter()
-                            .all(|ch| *ch == '#')
-                        && j + 1 + hashes <= n
-                    {
-                        break j + 1 + hashes;
-                    }
-                    j += 1;
-                };
-                for k2 in i..end {
-                    if chars[k2] != '\n' {
-                        out[k2] = ' ';
-                    }
-                }
-                i = end;
-                continue;
-            }
-        }
-        // Plain string literal: `"..."`, with `\`-escapes.
-        if c == '"' {
-            let mut j = i + 1;
-            while j < n {
-                if chars[j] == '\\' {
-                    j += 2;
-                    continue;
-                }
-                if chars[j] == '"' {
-                    j += 1;
-                    break;
-                }
-                j += 1;
-            }
-            let end = j.min(n);
-            for k in i..end {
-                if chars[k] != '\n' {
-                    out[k] = ' ';
-                }
-            }
-            i = end;
-            continue;
-        }
-        // Char literal, distinguished from a lifetime (`'a`, `'static`) by
-        // requiring a closing `'` within an escape's width: `'\''`, `'\n'`,
-        // `'\u{2019}'`, or a plain `'x'`.
-        if c == '\'' {
-            if i + 1 < n && chars[i + 1] == '\\' {
-                let mut j = i + 2;
-                let mut steps = 0;
-                while j < n && chars[j] != '\'' && steps < 10 {
-                    j += 1;
-                    steps += 1;
-                }
-                if j < n && chars[j] == '\'' {
-                    let end = j + 1;
-                    for k in i..end {
-                        if chars[k] != '\n' {
-                            out[k] = ' ';
-                        }
-                    }
-                    i = end;
-                    continue;
-                }
-            } else if i + 2 < n && chars[i + 2] == '\'' {
-                out[i] = ' ';
-                out[i + 1] = ' ';
-                out[i + 2] = ' ';
-                i += 3;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out.into_iter().collect()
+    let surface = scan_surface();
+    let bench_files: Vec<&String> = surface
+        .iter()
+        .map(|(f, _)| f)
+        .filter(|f| f.starts_with("crates/jammi-bench/"))
+        .collect();
+    assert!(
+        bench_files.is_empty(),
+        "SURFACE_DIRS's own doc claims crates/jammi-bench is outside its universe -- \
+         scan_surface() must never return a jammi-bench file, got {bench_files:?}"
+    );
 }
 
-/// Blank every line comment and block comment in `text` (same length and
-/// newlines preserved, so line numbers still match the original), leaving
-/// string and char literal CONTENT untouched — unlike [`mask_non_code`],
-/// which blanks comments AND string/char literals and so cannot be used to
-/// find a DDL keyword that lives inside a string
-/// ([`fine_tune_ddl_relation_binding_hits`]'s exact requirement). String
-/// literals are still recognised (and skipped over without masking) so that
-/// a `//` or `/*` appearing inside one — a URL, say — is never mistaken for
-/// the start of a comment on the next iteration; raw strings and char
-/// literals are not specially recognised here. This function has TWO
-/// callers today, with two different scopes: [`fine_tune_ddl_relation_binding_hits`],
-/// scoped to `crates/jammi-ai/src/fine_tune/**`, and [`ddl_literal_occurrences`],
-/// unscoped over both crates' whole `src` trees ([`SURFACE_DIRS`]). Not
-/// recognising raw strings or char literals is a LIVE desync today, not a
-/// disclosed-but-inert limit: this scanner pairs the FIRST `"` it meets with
-/// the NEXT `"` it meets, with no notion of an `r#`/`r##` delimiter or of
-/// the hash count a raw string's real closing quote must match, so its
-/// "inside a string" bookkeeping can invert and run across lines — this is
-/// not one enumerable mechanism, so no fixed list of triggers is claimed
-/// here. Measured with this exact function, compiled verbatim (not a
-/// transcription), over both `src` trees at this head: 22 code lines get
-/// blanked as if they were comments and 12 real `//` comment lines are left
-/// completely unblanked, across `storage/config.rs:555`/`:619`,
-/// `config/tests.rs`, `config/secret.rs`, and `sql/ident.rs` — the complete
-/// set. The `grep -rn 'r#*".*\(//\|/\*\)'
-/// crates/jammi-db/src crates/jammi-ai/src` command finds exactly the two
-/// SINGLE-LINE raw strings responsible for part of the code-blanking above —
-/// `storage/config.rs:555` and `:619` — and nothing else, but that describes
-/// the one grep, not the tree: a delimiter-aware scan of `config/tests.rs`
-/// alone finds 12 further raw strings that span MULTIPLE physical lines
-/// (URL-carrying TOML fixtures), invisible to a single-line pattern by
-/// construction — the grep is a description of what it matches, not a
-/// completeness instrument over what raw strings exist. The
-/// consequence for this function's callers: a DDL-shaped string literal
-/// sitting on a desynced line is invisible to [`ddl_literal_occurrences`] —
-/// a FIFTH residual alongside the four the "literal-occurrence gate" section
-/// below already names, tracked on the same issue,
-/// <https://github.com/f-inverse/jammi-ai/issues/554> (amended with this
-/// residual; the rebuild that closes it replaces this hand-rolled masking
-/// with a real tokenizer that knows raw-string hash counts).
-fn mask_comments_only(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let mut out: Vec<char> = chars.clone();
-    let mut i = 0usize;
-    while i < n {
-        let c = chars[i];
-        if c == '/' && i + 1 < n && chars[i + 1] == '/' {
-            let mut j = i;
-            while j < n && chars[j] != '\n' {
-                out[j] = ' ';
-                j += 1;
+// ── A comment/string/char-literal-aware mask, so brace/paren counting and
+// pattern search never mistake a `format!("jammi.{}")`'s own braces, or a
+// doc comment's prose, for code. Both masks below are thin wrappers over
+// [`real_tokenizer_mask`] — a REAL tokenizer (proc-macro2's fallback lexer,
+// the same one `rustc` itself is built on), not a hand-counted quote/`/*`
+// scanner. ───────────────────────────────────────────────────────────────
+
+/// Whether a rendered [`proc_macro2::Literal`] token's OWN source spelling
+/// (`Literal::to_string()`, which reproduces the exact original text —
+/// `r##"..."##` hash count included, never a re-escaped copy) is a
+/// string/byte-string/C-string/char/byte literal, as opposed to a numeric or
+/// boolean one — the distinction [`real_tokenizer_mask`] needs to know
+/// whether a literal's CONTENT is ever a masking candidate at all. Delegated
+/// to `syn::Lit`'s own parser rather than a hand-written prefix check (`b`?
+/// `r`? how many `#`? `'` vs `"`?) precisely so the raw-string hash-counting
+/// class of bug this function replaces can never recur here by
+/// reintroducing a hand-rolled parse of the same shape one layer up.
+fn literal_is_string_or_char(rendered: &str) -> bool {
+    matches!(
+        syn::parse_str::<syn::Lit>(rendered),
+        Ok(syn::Lit::Str(_))
+            | Ok(syn::Lit::ByteStr(_))
+            | Ok(syn::Lit::CStr(_))
+            | Ok(syn::Lit::Char(_))
+            | Ok(syn::Lit::Byte(_))
+    )
+}
+
+/// What [`collect_mask_units`] found at one byte range of the source: never
+/// blanked on its own (an identifier, a punctuation character, a group
+/// delimiter, a numeric/bool literal); blanked only when the caller asks for
+/// string/char literal content to be masked too ([`mask_non_code`]'s mode);
+/// or blanked UNCONDITIONALLY, because the tokenizer identified it as a
+/// `///`/`//!`/`/** */`/`/*! */` doc comment synthesized into a
+/// `#[doc = "..."]` attribute — see that function's doc for the detection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MaskKind {
+    Code,
+    Literal,
+    AlwaysBlank,
+}
+
+/// Depth-first flatten of `ts` into `(byte range, MaskKind)` units, in
+/// source order. A [`proc_macro2::Group`]'s own delimiter characters are not
+/// tokens of their own in the stream, so they are emitted explicitly via
+/// [`proc_macro2::Group::span_open`]/`span_close` — otherwise the character
+/// AT that position would fall into an inter-token "gap"
+/// ([`real_tokenizer_mask`]'s own doc) and be blanked as if it were
+/// whitespace-or-comment, corrupting every paren/brace count downstream.
+///
+/// **Doc-comment detection.** `///x`/`//!x`/`/** x */`/`/*! x */` are not
+/// comments to the tokenizer at all — the lexer synthesizes them into a
+/// `#[doc = "x"]` (or `#![doc = "x"]`) attribute, and every token of that
+/// synthesized attribute (the `#`, the `!` when present, the brackets,
+/// `doc`, `=`, and the literal) shares ONE collapsed span: the doc comment's
+/// own original extent, not the narrow span each token would carry if a
+/// human had actually typed `#[doc = "x"]` by hand. A hand-written `#` is
+/// always exactly one byte wide; a synthesized one carries the WHOLE
+/// original comment's byte range instead — that width discrepancy is the
+/// signal checked here, and is the ONLY signal: `Span::byte_range()` never
+/// exposes "this token came from a doc comment" more directly than the span
+/// it silently widens. Detected, the entire synthesized attribute is
+/// emitted as ONE `AlwaysBlank` unit over the `#`'s own (collapsed, whole-
+/// comment) span and its inner tokens are never descended into — walking
+/// them individually would each re-claim that SAME byte range, and
+/// [`real_tokenizer_mask`]'s cursor only ever advances forward.
+/// [`falsification_real_tokenizer_mask_handles_raw_strings_and_nested_comments`]
+/// exercises this directly: a doc comment is blanked in BOTH
+/// [`mask_non_code`] and [`mask_comments_only`], the same as a plain `//`
+/// line comment, matching this file's pre-existing behaviour (the old
+/// hand-rolled scanner treated `///` as an ordinary `//` line comment too,
+/// since it never inspected the third `/`).
+fn collect_mask_units(
+    ts: proc_macro2::TokenStream,
+    out: &mut Vec<(std::ops::Range<usize>, MaskKind)>,
+) {
+    let mut iter = ts.into_iter().peekable();
+    while let Some(tt) = iter.next() {
+        match tt {
+            proc_macro2::TokenTree::Punct(p)
+                if p.as_char() == '#' && p.span().byte_range().len() > 1 =>
+            {
+                let range = p.span().byte_range();
+                if let Some(proc_macro2::TokenTree::Punct(bang)) = iter.peek() {
+                    if bang.as_char() == '!' {
+                        iter.next();
+                    }
+                }
+                if let Some(proc_macro2::TokenTree::Group(_)) = iter.peek() {
+                    iter.next();
+                }
+                out.push((range, MaskKind::AlwaysBlank));
             }
-            i = j;
-            continue;
-        }
-        if c == '/' && i + 1 < n && chars[i + 1] == '*' {
-            let mut j = i + 2;
-            while j + 1 < n && !(chars[j] == '*' && chars[j + 1] == '/') {
-                j += 1;
+            proc_macro2::TokenTree::Punct(p) => out.push((p.span().byte_range(), MaskKind::Code)),
+            proc_macro2::TokenTree::Ident(id) => out.push((id.span().byte_range(), MaskKind::Code)),
+            proc_macro2::TokenTree::Literal(lit) => {
+                let kind = if literal_is_string_or_char(&lit.to_string()) {
+                    MaskKind::Literal
+                } else {
+                    MaskKind::Code
+                };
+                out.push((lit.span().byte_range(), kind));
             }
-            let end = (j + 2).min(n);
-            for k in i..end {
-                if chars[k] != '\n' {
-                    out[k] = ' ';
+            proc_macro2::TokenTree::Group(g) => {
+                if g.delimiter() != proc_macro2::Delimiter::None {
+                    out.push((g.span_open().byte_range(), MaskKind::Code));
+                }
+                collect_mask_units(g.stream(), out);
+                if g.delimiter() != proc_macro2::Delimiter::None {
+                    out.push((g.span_close().byte_range(), MaskKind::Code));
                 }
             }
-            i = end;
-            continue;
         }
-        if c == '"' {
-            let mut j = i + 1;
-            while j < n {
-                if chars[j] == '\\' {
-                    j += 2;
-                    continue;
-                }
-                if chars[j] == '"' {
-                    j += 1;
-                    break;
-                }
-                j += 1;
-            }
-            i = j.min(n);
-            continue;
-        }
-        i += 1;
     }
-    out.into_iter().collect()
+}
+
+/// Blank `original[from..to]` in `out`, byte for byte, leaving `\n` bytes
+/// alone so line numbers never shift. A UTF-8 continuation byte is never
+/// `0x0A` (`\n`'s own byte value only ever occurs as a genuine newline in
+/// valid UTF-8), so operating byte-wise rather than char-wise here is safe:
+/// every blanked byte becomes the single ASCII byte `0x20`, so `out` stays
+/// valid UTF-8 no matter how many bytes a multi-byte character in the
+/// ORIGINAL text occupied (this file's own prose is full of multi-byte `—`
+/// em dashes inside comments, which is exactly the case this must not
+/// corrupt).
+fn blank_byte_range(out: &mut [u8], original: &[u8], from: usize, to: usize) {
+    for k in from..to.min(out.len()) {
+        if original[k] != b'\n' {
+            out[k] = b' ';
+        }
+    }
+}
+
+/// The real-tokenizer mask both [`mask_non_code`] and [`mask_comments_only`]
+/// delegate to. Lexes `text` with `proc-macro2`'s fallback tokenizer (the
+/// same lexer `rustc` itself is built on — never a hand-rolled quote/`/*`
+/// scanner) and walks the resulting `(byte range, MaskKind)` units in source
+/// order, blanking every inter-token GAP unconditionally (nothing but
+/// whitespace and comments — LINE or BLOCK, correctly nested, since the
+/// tokenizer's own trivia-skipping, not a hand-counted `*/`, decided where
+/// each one ends — can appear between two real tokens in syntactically
+/// valid Rust) and additionally blanking a token's own span when its
+/// [`MaskKind`] calls for it (`AlwaysBlank` always; `Literal` only when
+/// `blank_literals` is set). `Span::byte_range()` (`span-locations` feature)
+/// is documented accurate for a process that is not itself running AS a
+/// procedural macro — a `cargo test` binary, exactly like `main.rs`/
+/// `build.rs` in that same doc — which every caller here is.
+///
+/// Fails closed on a lex error (this file's "read a tracked file" discipline
+/// applied to tokenizing, not just reading, a tracked file): source
+/// `git ls-files` reports as tracked that this tokenizer cannot lex is a
+/// hard failure naming the file's own error, never a silent fall-through to
+/// the unmasked original text, which could hide a hit inside whatever bytes
+/// defeated the lexer.
+fn real_tokenizer_mask(text: &str, blank_literals: bool) -> String {
+    let stream =
+        <proc_macro2::TokenStream as std::str::FromStr>::from_str(text).unwrap_or_else(|e| {
+            panic!(
+                "real_tokenizer_mask: proc-macro2 could not lex this source ({e}) -- refusing to \
+             fall back to unmasked text, which could hide a hit inside the unlexed bytes"
+            )
+        });
+    let mut units = Vec::new();
+    collect_mask_units(stream, &mut units);
+    units.sort_by_key(|(r, _)| r.start);
+
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = bytes.to_vec();
+    let mut cursor = 0usize;
+    for (range, kind) in &units {
+        let start = range.start.max(cursor);
+        let end = range.end.max(start);
+        blank_byte_range(&mut out, bytes, cursor, start);
+        let should_blank =
+            *kind == MaskKind::AlwaysBlank || (blank_literals && *kind == MaskKind::Literal);
+        if should_blank {
+            blank_byte_range(&mut out, bytes, start, end);
+        }
+        cursor = end;
+    }
+    blank_byte_range(&mut out, bytes, cursor, bytes.len());
+    String::from_utf8(out).expect(
+        "blanking only ever overwrites a byte with the single ASCII byte 0x20, which stays \
+         valid UTF-8 regardless of what multi-byte character occupied that position before",
+    )
+}
+
+/// Replace every line comment, block comment, doc comment, string literal
+/// (plain and raw, any hash count), and char literal in `text` with spaces —
+/// same length, same newlines, so every downstream line/column number still
+/// matches the original file, and brace/paren counting on the result never
+/// miscounts a `{`/`}` that appears inside a string (e.g.
+/// `format!("jammi.{}", ..)`) or treats commented-out code as live. A thin
+/// wrapper over [`real_tokenizer_mask`]; see that function's doc for the
+/// mechanism.
+fn mask_non_code(text: &str) -> String {
+    real_tokenizer_mask(text, true)
+}
+
+/// Blank every line comment, block comment, and doc comment in `text` (same
+/// length and newlines preserved, so line numbers still match the original),
+/// leaving string and char literal CONTENT untouched — unlike
+/// [`mask_non_code`], which blanks comments AND string/char literals and so
+/// cannot be used to find a DDL keyword that lives inside a string
+/// ([`fine_tune_ddl_relation_binding_hits`]'s exact requirement). A thin
+/// wrapper over [`real_tokenizer_mask`]; see that function's doc for the
+/// mechanism. This function has TWO callers today, with two different
+/// scopes: [`fine_tune_ddl_relation_binding_hits`], scoped to
+/// `crates/jammi-ai/src/fine_tune/**`, and [`ddl_literal_occurrences`],
+/// unscoped over both crates' whole `src` trees ([`SURFACE_DIRS`]).
+fn mask_comments_only(text: &str) -> String {
+    real_tokenizer_mask(text, false)
 }
 
 fn is_ident_char(c: char) -> bool {
@@ -2377,6 +2418,76 @@ fn mask_non_code_ignores_comments_and_string_braces() {
     );
 }
 
+/// The real-tokenizer masking rebuild's own executed proof, both directions
+/// -- closing audit #9 of U2a's fifth residual (raw strings) plus the R-A
+/// nested-block-comment limit the module doc used to disclose as inert:
+///
+/// 1. A raw string containing an escaped quote and an embedded `//`/`/*`
+///    must have its content (and ONLY its content) blanked by
+///    [`mask_non_code`] -- a hand-counted quote scanner (the deleted
+///    implementation) pairs the FIRST `"` with the NEXT `"`, closing the
+///    raw string early at the escaped `\"` and leaving everything after it
+///    (including a REAL `//comment`) unmasked as if it were code.
+/// 2. That SAME raw string's embedded `"jammi.{table}"`-shaped text must
+///    NOT be seen by [`mask_comments_only`] as a real session-registration
+///    literal candidate outside the string -- it stays untouched, inside
+///    the (still-visible) string, exactly where it belongs.
+/// 3. A `///` doc comment must be blanked the same as a plain `//` comment
+///    by BOTH masks (matching this file's pre-existing behaviour, since the
+///    old scanner never inspected the third `/`).
+/// 4. A NESTED block comment (`/* outer /* inner */ still-outer */`) must
+///    have its ENTIRE extent blanked, not just up to the first `*/` -- the
+///    R-A limit the deleted scanner disclosed as inert is closed here by
+///    construction: the tokenizer's own trivia-skipping decides where the
+///    comment ends, not a hand-counted `*/`.
+#[test]
+fn falsification_real_tokenizer_mask_handles_raw_strings_and_nested_comments() {
+    let src = concat!(
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the real-tokenizer mask -- synthetic producer text, not real code in this file
+        "/// a doc comment mentioning CREATE TABLE in prose\n",
+        "fn f() {\n",
+        "    let raw = r#\"a \\\" quote, a // comment, and a /* block */ all inside\"#;\n",
+        "    /* outer /* inner */ still-outer */\n",
+        "    let _ = raw;\n",
+        "}\n",
+    );
+
+    let non_code = mask_non_code(src);
+    assert!(
+        !non_code.contains("comment, and a"),
+        "the raw string's CONTENT must be blanked by mask_non_code, got {non_code:?}"
+    );
+    assert!(
+        non_code.contains("let raw =") && non_code.contains("let _ = raw"),
+        "real code surrounding the raw string must survive mask_non_code, got {non_code:?}"
+    );
+    assert!(
+        !non_code.to_ascii_lowercase().contains("create table"),
+        "the doc comment's prose must be blanked by mask_non_code too, got {non_code:?}"
+    );
+    assert!(
+        !non_code.contains("still-outer"),
+        "a nested block comment must be blanked in its ENTIRE extent, including the text after \
+         the FIRST `*/`, got {non_code:?}"
+    );
+
+    let comments_only = mask_comments_only(src);
+    assert!(
+        comments_only.contains("a // comment, and a /* block */ all inside"),
+        "mask_comments_only must leave the raw string's CONTENT untouched (a `//`/`/*` inside a \
+         string is not a real comment), got {comments_only:?}"
+    );
+    assert!(
+        !comments_only.to_ascii_lowercase().contains("create table"),
+        "the doc comment's prose must be blanked by mask_comments_only too, got {comments_only:?}"
+    );
+    assert!(
+        !comments_only.contains("still-outer"),
+        "a nested block comment must be blanked in its ENTIRE extent by mask_comments_only too, \
+         got {comments_only:?}"
+    );
+}
+
 #[test]
 fn allowlists_match_current_hits_exactly() {
     // The inverse control, generalized to all four patterns: an allowance
@@ -3232,7 +3343,16 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
 /// never a declaration LINE, which drifts under an unrelated edit above it
 /// (see [`assign_ordinals`]'s doc) -- carries a `property`, the reviewed,
 /// human-written account of what this site actually does and why a second
-/// call/occurrence at the same site can never silently corrupt state. Every
+/// call/occurrence at the same site can never silently corrupt state, and an
+/// `allowed` COUNT: how many times this exact (file, function, ordinal) site
+/// is reviewed to occur, never merely whether it occurs at all. A `BTreeSet`
+/// key alone cannot see a SECOND `ctx.register_table(...)` planted inside an
+/// already-reviewed function collapse onto the same key — closing audit #8
+/// of U2a (2026-09-14, head d1fee4e7) executed exactly that escape and it
+/// stayed green under the set-only scheme; `registration_verb_occurrences`/
+/// `ddl_literal_occurrences` (below) now return a per-key COUNT, and
+/// [`assert_occurrences_reviewed`] fails a key whose real count exceeds its
+/// `allowed` one, not merely a key that is altogether missing or stale. Every
 /// field is read: `file`/`function`/`ordinal` key the comparison against the
 /// live scan ([`registration_verb_occurrences_are_all_reviewed`],
 /// [`ddl_literal_occurrences_are_all_reviewed`]); `property` is asserted
@@ -3245,6 +3365,7 @@ struct ReviewedRegistrationSite {
     file: &'static str,
     function: &'static str,
     ordinal: usize,
+    allowed: usize,
     property: &'static str,
 }
 
@@ -3283,65 +3404,329 @@ fn attribute_hit_to_enclosing_fn(regions: &[FnRegion], line_no: usize) -> (Strin
 /// Every occurrence, anywhere under [`SURFACE_DIRS`] (both crates, every
 /// directory -- not scoped to `fine_tune/`), of a
 /// [`PAIRED_REGISTRATION_VERBS`]/[`UNPAIRED_REGISTRATION_VERBS`] call-site
-/// PATTERN, attributed to its enclosing function. Deliberately a superset of
-/// "genuine calls": the same substring match `fine_tune_session_registration_hits`
-/// uses also matches the verb's own `fn register_x(`/`fn deregister_x(`
-/// DECLARATION line, which this file's hand-rolled scan cannot distinguish
-/// from a call site without becoming a real parser -- disclosed, not hidden:
-/// [`REGISTRATION_VERB_SITES`]'s entries for `store/mod.rs::register_table`
-/// and `store/result_schema.rs::{register_table,deregister_table}` say so
-/// directly.
+/// PATTERN, attributed to its enclosing function and COUNTED, not merely
+/// noted present -- a `(file, function, ordinal)` key maps to how many times
+/// the pattern occurs there, so a SECOND occurrence planted inside an
+/// already-reviewed function (closing audit #8 of U2a, 2026-09-14, head
+/// d1fee4e7, executed exactly this escape against the earlier `BTreeSet`
+/// version of this function) bumps the count past its `allowed` ceiling
+/// instead of collapsing onto the same, already-present key. Deliberately a
+/// superset of "genuine calls": the same substring match
+/// `fine_tune_session_registration_hits` uses also matches the verb's own
+/// `fn register_x(`/`fn deregister_x(` DECLARATION line, which this file's
+/// hand-rolled scan cannot distinguish from a call site without becoming a
+/// real parser -- disclosed, not hidden: [`REGISTRATION_VERB_SITES`]'s
+/// entries for `store/mod.rs::register_table` and
+/// `store/result_schema.rs::{register_table,deregister_table}` say so
+/// directly. A `deregister_X(` occurrence is never double-counted as a
+/// SEPARATE `register_X(` occurrence even though the former's text contains
+/// the latter as a substring (`"de"` + `"register_X("`): counting only the
+/// `"register_{verb}("` pattern already counts each `deregister_X(`
+/// occurrence once (via its embedded substring) and each standalone
+/// `register_X(` occurrence once, with no double pass needed --
+/// [`falsification_paired_verb_occurrence_count_does_not_double_count_deregister`]
+/// proves the arithmetic directly.
 fn registration_verb_occurrences(
     surface: &[(String, String)],
-) -> BTreeSet<(String, String, usize)> {
-    let mut hits = BTreeSet::new();
+) -> std::collections::BTreeMap<(String, String, usize), usize> {
+    let mut hits: std::collections::BTreeMap<(String, String, usize), usize> =
+        std::collections::BTreeMap::new();
     for (file, text) in surface {
         let masked = mask_non_code(text);
         let regions = find_fn_regions(&masked);
         for (line_idx, line) in masked.lines().enumerate() {
             let line_no = line_idx + 1;
-            let mut hit_here = false;
+            let mut count_here = 0usize;
             for verb in PAIRED_REGISTRATION_VERBS {
-                if line.contains(format!("deregister_{verb}(").as_str())
-                    || line.contains(format!("register_{verb}(").as_str())
-                {
-                    hit_here = true;
-                }
+                count_here += line.matches(format!("register_{verb}(").as_str()).count();
             }
             for verb in UNPAIRED_REGISTRATION_VERBS {
-                if line.contains(format!("register_{verb}(").as_str()) {
-                    hit_here = true;
-                }
+                count_here += line.matches(format!("register_{verb}(").as_str()).count();
             }
-            if hit_here {
+            if count_here > 0 {
                 let (name, ordinal) = attribute_hit_to_enclosing_fn(&regions, line_no);
-                hits.insert((file.clone(), name, ordinal));
+                *hits.entry((file.clone(), name, ordinal)).or_insert(0) += count_here;
             }
         }
     }
     hits
 }
 
-/// Every [`ddl_statement_shape`] occurrence anywhere under [`SURFACE_DIRS`]
-/// (both crates, every directory), on [`mask_comments_only`]'s output (string
-/// content visible, comments blanked -- the same reasoning
-/// [`fine_tune_ddl_relation_binding_hits`] already documents), attributed to
-/// its enclosing function.
-fn ddl_literal_occurrences(surface: &[(String, String)]) -> BTreeSet<(String, String, usize)> {
-    let mut hits = BTreeSet::new();
+/// A [`syn`]-driven scan (never a masked-line substring search) collecting
+/// every 1-based source LINE at which a DDL-shaped string occurs anywhere in
+/// `text`, from three independent sources -- #554's items 2 and 3:
+///
+/// 1. Any single [`syn::LitStr`]'s own DECODED `.value()` (`visit_lit_str`,
+///    syn's normal AST traversal, so it finds a plain `SessionContext::sql(
+///    "CREATE TABLE ..")` call argument the same way the old scan did) --
+///    immune to the raw-string/masking-desync class of bug entirely, by
+///    construction: `syn` decodes the literal's real VALUE, so an `r#"..`
+///    delimiter or an escaped `\"` plays no part in what this sees.
+/// 2. The ARGUMENT-ORDER STRING-LITERAL CONCATENATION of every
+///    `format!`/`concat!`/`write!`/`writeln!` invocation anywhere in `text`
+///    (`visit_macro`'s special case below), so a DDL keyword split across
+///    two literal arguments on separate lines (`concat!("CREATE ",
+///    "TABLE")`) is seen as ONE statement -- invisible to `visit_lit_str`
+///    alone, since neither `"CREATE "` nor `"TABLE"` is independently
+///    DDL-shaped.
+/// 3. Every OTHER macro invocation's raw token stream (`visit_macro`'s
+///    general case), walked for `Literal` tokens that are themselves string
+///    literals -- so a DDL string buried inside `assert!(..)`,
+///    `println!(..)`, or any custom macro (none of which `syn::visit::Visit`
+///    descends into as typed `Expr`/`Lit` nodes on its own, since a macro's
+///    body is opaque `TokenStream` to the AST) is still found, matching what
+///    the deleted line-based scan saw regardless of macro boundaries.
+/// 4. `include_str!(..)`'s own TARGET FILE, resolved the same way `rustc`
+///    resolves it (relative to the INCLUDING file's own directory), read and
+///    scanned as if its content were inlined -- a hard failure naming the
+///    file when the target cannot be read, the same "fails closed" discipline
+///    [`scan_surface`] already applies to a tracked `.rs` file.
+fn ddl_hit_lines(file_dir: &Path, text: &str) -> (Vec<usize>, Vec<usize>) {
+    let parsed = syn::parse_file(text)
+        .unwrap_or_else(|e| panic!("ddl_hit_lines: syn could not parse this source ({e})"));
+    let mut scanner = DdlLiteralScanner {
+        file_dir: file_dir.to_path_buf(),
+        hits: Vec::new(),
+        unresolved_includes: Vec::new(),
+    };
+    syn::visit::Visit::visit_file(&mut scanner, &parsed);
+    (scanner.hits, scanner.unresolved_includes)
+}
+
+struct DdlLiteralScanner {
+    file_dir: PathBuf,
+    hits: Vec<usize>,
+    /// `include_str!(..)` invocations whose argument is not a single
+    /// top-level string literal (e.g. `include_str!(concat!(env!(
+    /// "CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))`, `fine_tune/trainer.rs`)
+    /// -- resolving that target would mean evaluating `env!`/`concat!`
+    /// ourselves, which this scanner does not attempt; recorded here (by
+    /// line) rather than silently skipped, so
+    /// [`unresolved_include_str_targets_are_reviewed`] can assert the
+    /// UNRESOLVABLE set is itself a fixed, reviewed list, never a silent gap
+    /// a new occurrence could hide inside.
+    unresolved_includes: Vec<usize>,
+}
+
+/// Every string-literal `Literal` token anywhere in `ts` (recursing into
+/// every [`proc_macro2::Group`]), decoded via `syn::Lit::new`, in source
+/// order -- the shared walk [`DdlLiteralScanner::visit_macro`]'s general
+/// case uses so a macro this scanner does not otherwise special-case still
+/// has its own literal arguments seen. `syn::Lit::new` (NOT
+/// `syn::parse_str`, which this function used at first and which every
+/// caller's line attribution silently read `1` from ever after) decodes the
+/// token's OWN `proc_macro2::Literal` value directly, preserving its REAL
+/// span in the original file -- `syn::parse_str::<syn::Lit>(&lit.to_string())`
+/// instead RE-LEXES the token's rendered text as a brand-new, one-line
+/// source of its own, so every literal returned carries a PHANTOM span
+/// (line 1, wherever it actually lives) -- exactly why every
+/// `format!`/`concat!`/general-macro DDL hit this scanner found, in the
+/// Postgres and SQLite arms of the "mutable table" backend
+/// (`store/mutable/postgres.rs`, `store/mutable/sqlite.rs`), was reported at
+/// line 1 (that file's own module doc comment line, an innocent coincidence
+/// of line-1 attribution landing on line 1's `<module-scope>` sentinel)
+/// rather than the DDL literal's real line, until this fix; caught directly
+/// by [`falsification_general_macro_ddl_literal_is_attributed_to_its_real_line`].
+fn string_literals_in_tokens(ts: proc_macro2::TokenStream) -> Vec<syn::LitStr> {
+    let mut out = Vec::new();
+    for tt in ts {
+        match tt {
+            proc_macro2::TokenTree::Literal(lit) => {
+                if let syn::Lit::Str(s) = syn::Lit::new(lit) {
+                    out.push(s);
+                }
+            }
+            proc_macro2::TokenTree::Group(g) => out.extend(string_literals_in_tokens(g.stream())),
+            _ => {}
+        }
+    }
+    out
+}
+
+impl<'ast> syn::visit::Visit<'ast> for DdlLiteralScanner {
+    fn visit_attribute(&mut self, node: &'ast syn::Attribute) {
+        // A `///`/`//!`/`/** */`/`/*! */` doc comment is, to `syn`, an
+        // ordinary `#[doc = "prose"]` attribute -- its literal's decoded
+        // VALUE is human prose (this file's own module doc, two paragraphs
+        // up, literally contains the words "CREATE TABLE" inside backticks),
+        // not a DataFusion statement, so it must never reach
+        // `visit_lit_str` below. Detected the same way
+        // `collect_mask_units` detects it for masking: a hand-written `#` is
+        // always exactly one byte wide; a doc-comment-synthesized one
+        // carries the whole original comment's collapsed span instead.
+        if node.pound_token.span.byte_range().len() > 1 {
+            return;
+        }
+        syn::visit::visit_attribute(self, node);
+    }
+
+    fn visit_lit_str(&mut self, node: &'ast syn::LitStr) {
+        if ddl_statement_shape(&node.value()) {
+            self.hits.push(node.span().start().line);
+        }
+        syn::visit::visit_lit_str(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        let name = node.path.segments.last().map(|s| s.ident.to_string());
+        let macro_line = node
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.span().start().line)
+            .unwrap_or(0);
+
+        match name.as_deref() {
+            // `format!`/`concat!`/`write!`/`writeln!`: the ARGUMENT-ORDER
+            // concatenation of every string-literal argument is the ONLY
+            // check run for these four -- it already subsumes the
+            // single-literal case (concatenating one literal with nothing
+            // else IS that literal), so also running the general
+            // per-literal scan below for these four would double-COUNT the
+            // common one-literal-template shape (the general scan flags the
+            // literal on its own line, the combined check flags the SAME
+            // text again at the macro's line) --
+            // [`falsification_format_macro_ddl_literal_is_not_double_counted`]
+            // proves the arithmetic.
+            Some("format") | Some("concat") | Some("write") | Some("writeln") => {
+                let mut combined = String::new();
+                for lit in string_literals_in_tokens(node.tokens.clone()) {
+                    combined.push_str(&lit.value());
+                }
+                if !combined.is_empty() && ddl_statement_shape(&combined) {
+                    self.hits.push(macro_line);
+                }
+            }
+            Some("include_str") => {
+                let top_level: Vec<proc_macro2::TokenTree> =
+                    node.tokens.clone().into_iter().collect();
+                match top_level.as_slice() {
+                    [proc_macro2::TokenTree::Literal(lit)] => match syn::Lit::new(lit.clone()) {
+                        syn::Lit::Str(s) => {
+                            let target = self.file_dir.join(s.value());
+                            let content = std::fs::read_to_string(&target).unwrap_or_else(|e| {
+                                panic!(
+                                    "ddl_hit_lines: include_str!({:?}) at line {} resolves to \
+                                     {} which could not be read ({e}) -- this gate fails \
+                                     closed rather than silently skipping an unreadable \
+                                     include target",
+                                    s.value(),
+                                    s.span().start().line,
+                                    target.display()
+                                )
+                            });
+                            if ddl_statement_shape(&content) {
+                                self.hits.push(s.span().start().line);
+                            }
+                        }
+                        _ => self.unresolved_includes.push(macro_line),
+                    },
+                    _ => self.unresolved_includes.push(macro_line),
+                }
+            }
+            // Every OTHER macro (`assert!`, `println!`, `tokio::select!`,
+            // any custom `macro_rules!`-defined one): its own literal
+            // arguments, individually -- `visit_lit_str` above never sees
+            // these on its own, since a macro's `tokens` are opaque to
+            // syn's typed AST traversal. Not run for the four formatter
+            // macros above, which already cover their own literals via the
+            // combined-string check (running both would double-count the
+            // common single-literal-template shape).
+            _ => {
+                for lit in string_literals_in_tokens(node.tokens.clone()) {
+                    if ddl_statement_shape(&lit.value()) {
+                        self.hits.push(lit.span().start().line);
+                    }
+                }
+            }
+        }
+        syn::visit::visit_macro(self, node);
+    }
+}
+
+/// Every [`ddl_hit_lines`] occurrence anywhere under [`SURFACE_DIRS`] (both
+/// crates, every directory), attributed to its enclosing function and
+/// COUNTED -- same discipline as [`registration_verb_occurrences`].
+fn ddl_literal_occurrences(
+    surface: &[(String, String)],
+) -> std::collections::BTreeMap<(String, String, usize), usize> {
+    let root = repo_root();
+    let mut hits: std::collections::BTreeMap<(String, String, usize), usize> =
+        std::collections::BTreeMap::new();
     for (file, text) in surface {
         let regions = find_fn_regions(&mask_non_code(text));
-        let masked_comments = mask_comments_only(text);
-        for (line_idx, line) in masked_comments.lines().enumerate() {
-            if !ddl_statement_shape(line) {
-                continue;
-            }
-            let line_no = line_idx + 1;
+        let file_dir = root
+            .join(file)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.clone());
+        let (hit_lines, _unresolved) = ddl_hit_lines(&file_dir, text);
+        for line_no in hit_lines {
             let (name, ordinal) = attribute_hit_to_enclosing_fn(&regions, line_no);
-            hits.insert((file.clone(), name, ordinal));
+            *hits.entry((file.clone(), name, ordinal)).or_insert(0) += 1;
         }
     }
     hits
+}
+
+/// Every `include_str!(..)` invocation anywhere under [`SURFACE_DIRS`] whose
+/// argument [`ddl_hit_lines`] could not resolve to a path (not a single
+/// top-level string literal -- e.g. `include_str!(concat!(env!(
+/// "CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))`), keyed `(file, line)`, so a
+/// NEW unresolvable `include_str!` is a NAMED finding requiring its own
+/// review entry here rather than a silently-skipped scan gap.
+fn unresolved_include_str_targets(surface: &[(String, String)]) -> BTreeSet<(String, usize)> {
+    let root = repo_root();
+    let mut out = BTreeSet::new();
+    for (file, text) in surface {
+        let file_dir = root
+            .join(file)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.clone());
+        let (_hits, unresolved) = ddl_hit_lines(&file_dir, text);
+        for line in unresolved {
+            out.insert((file.clone(), line));
+        }
+    }
+    out
+}
+
+/// The reviewed, exhaustive set [`unresolved_include_str_targets_are_reviewed`]
+/// checks against: every `include_str!(..)` under [`SURFACE_DIRS`] whose
+/// argument this gate cannot statically resolve to a path, with a human
+/// account of why its UNKNOWN content cannot be a DataFusion DDL statement
+/// anyway. One entry today.
+const UNRESOLVED_INCLUDE_STR_TARGETS: &[(&str, usize, &str)] = &[(
+    "crates/jammi-ai/src/fine_tune/trainer.rs",
+    5763,
+    "include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../../Cargo.lock\")) -- reads the \
+     workspace's own Cargo.lock text into a test assertion (a lockfile-pinning check); Cargo.lock \
+     is TOML, never a DataFusion DDL statement, so leaving its content unresolved here cannot hide \
+     a DDL literal.",
+)];
+
+#[test]
+fn unresolved_include_str_targets_are_reviewed() {
+    let surface = scan_surface();
+    let found = unresolved_include_str_targets(&surface);
+    let allow: BTreeSet<(String, usize)> = UNRESOLVED_INCLUDE_STR_TARGETS
+        .iter()
+        .map(|(f, l, _)| (f.to_string(), *l))
+        .collect();
+    let unreviewed: Vec<_> = found.difference(&allow).collect();
+    assert!(
+        unreviewed.is_empty(),
+        "unresolved include_str! target(s) with no reviewed entry: {unreviewed:?} -- add an entry \
+         to UNRESOLVED_INCLUDE_STR_TARGETS naming why its unknown content cannot hide a DDL \
+         literal, or make the argument statically resolvable."
+    );
+    let stale: Vec<_> = allow.difference(&found).collect();
+    assert!(
+        stale.is_empty(),
+        "reviewed unresolved-include_str! entr(y/ies) {stale:?} are now resolvable (or gone) -- \
+         shrink UNRESOLVED_INCLUDE_STR_TARGETS to match reality."
+    );
 }
 
 /// This list IS the gate's own output at this head, never a hand-typed
@@ -3371,6 +3756,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-ai/src/query/content_hash_udf.rs",
         function: "register_content_hash_udf",
         ordinal: 1,
+        allowed: 1,
         property: "register_udf(..) under the UDF's own FIXED `.name()` (`jammi_content_hash`), \
                    called once per session at construction (`InferenceSession`'s own \
                    `with_observer`/`wrap_with` chain) -- a session-wide singleton, never a \
@@ -3382,6 +3768,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-ai/src/query/content_hash_udf.rs",
         function: "udf_hashes_the_runner_rendering",
         ordinal: 1,
+        allowed: 1,
         property: "a unit test's own `SessionContext::new()`, local and discarded at the end of \
                    the test -- never the shared production session, so there is no reclaim-shaped \
                    collision surface here at all.",
@@ -3390,6 +3777,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-ai/src/query/vector_agg_udaf.rs",
         function: "empty_group_is_null_vector",
         ordinal: 1,
+        allowed: 1,
         property: "a unit test's own `SessionContext::new()`, local and discarded at the end of \
                    the test -- same as `content_hash_udf.rs::udf_hashes_the_runner_rendering`.",
     },
@@ -3397,6 +3785,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-ai/src/query/vector_agg_udaf.rs",
         function: "grouped_reduction_per_group",
         ordinal: 1,
+        allowed: 1,
         property: "a unit test's own `SessionContext::new()`, local and discarded at the end of \
                    the test.",
     },
@@ -3404,6 +3793,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-ai/src/query/vector_agg_udaf.rs",
         function: "register_vector_agg_udafs",
         ordinal: 1,
+        allowed: 1,
         property: "register_udaf(..) three times (`vector_mean`/`vector_sum`/`vector_max`), each \
                    under that UDAF's own FIXED `.name()`, called once per session at construction \
                    (`InferenceSession::register_query_functions`'s own call) -- the same \
@@ -3413,6 +3803,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-ai/src/query/vector_agg_udaf.rs",
         function: "run_reduce",
         ordinal: 1,
+        allowed: 1,
         property: "a unit-test helper's own `SessionContext::new()`, local and discarded at the \
                    end of each call.",
     },
@@ -3420,6 +3811,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-ai/src/query/vector_agg_udaf.rs",
         function: "wrong_argument_type_is_planning_error",
         ordinal: 1,
+        allowed: 1,
         property: "a unit test's own `SessionContext::new()`, local and discarded at the end of \
                    the test.",
     },
@@ -3427,6 +3819,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-ai/src/session.rs",
         function: "register_query_functions",
         ordinal: 1,
+        allowed: 1,
         property: "register_udtf(..) under the FIXED `AnnotateTableFunction::NAME` -- this \
                    function's own doc: \"must be called once per session, after the session is \
                    behind an Arc\" -- a session-construction-time singleton, never called from \
@@ -3436,6 +3829,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/session.rs",
         function: "build",
         ordinal: 1,
+        allowed: 1,
         property: "register_catalog(\"mutable\", ..) under the FIXED literal name \"mutable\", \
                    once at session-build time -- a session-construction-time singleton.",
     },
@@ -3443,6 +3837,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/session.rs",
         function: "register_source_tables",
         ordinal: 1,
+        allowed: 1,
         property: "register_catalog(source_id, ..) keyed by the data SOURCE's own stable, \
                    admin-configured identifier, called once per configured source at session \
                    build/reload time -- never per fine_tune call, never per job; two DIFFERENT \
@@ -3453,6 +3848,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/source/file_format.rs",
         function: "register_driver_for_url",
         ordinal: 1,
+        allowed: 1,
         property: "register_object_store(..) keyed by the URL's own scheme+authority, with the \
                    driver resolved through `StorageRegistry::driver_for`'s per-(scheme,root) \
                    cache -- the identical idempotent-rebind shape reviewed for \
@@ -3463,6 +3859,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/mod.rs",
         function: "bind_result_table",
         ordinal: 1,
+        allowed: 1,
         property: "binds by calling `self.register_table(..)` -- jammi's OWN 4-argument method, a \
                    name collision this substring scan cannot itself tell apart from DataFusion's \
                    `SessionContext::register_table`, but the resolution IS the real one here: \
@@ -3475,6 +3872,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/mod.rs",
         function: "build_result_table_provider",
         ordinal: 1,
+        allowed: 1,
         property: "for a non-file/-memory URL, calls `ctx.runtime_env().register_object_store(&parsed, driver)` \
                    keyed by the URL's own scheme+authority, where `driver` is \
                    `StorageRegistry::driver_for`'s CACHED value for that key -- two calls for one \
@@ -3490,6 +3888,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/mod.rs",
         function: "install_result_schema",
         ordinal: 1,
+        allowed: 1,
         property: "calls `catalog.register_schema(&catalog_opts.default_schema, ..)` under the \
                    session's FIXED default-schema name -- this function's own doc: \"Idempotent: \
                    re-installing the same provider preserves the tables it already holds\" -- \
@@ -3501,6 +3900,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/mod.rs",
         function: "register_table",
         ordinal: 1,
+        allowed: 1,
         // kernel-oracles: fn-in-literal reviewed: the property string below names the literal shape `fn register_table(` in prose, describing a real declaration elsewhere in this file — not a fn-keyword desync in this line
         property: "this hit is the `fn register_table(` DECLARATION line, not a call site (see \
                    `registration_verb_occurrences`'s own doc on this scan's inability to tell the \
@@ -3517,6 +3917,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/result_schema.rs",
         function: "register_table",
         ordinal: 1,
+        allowed: 1,
         property: "this hit is the `SchemaProvider::register_table` trait-method DECLARATION for \
                    `ResultTableSchemaProvider`, not a call site written in this crate: the only \
                    in-tree paths that dispatch to it are DataFusion's own `SessionContext::register_table` \
@@ -3555,6 +3956,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/result_schema.rs",
         function: "deregister_table",
         ordinal: 1,
+        allowed: 1,
         property: "the `SchemaProvider::deregister_table` trait-method DECLARATION, the inverse of \
                    `register_table` immediately above -- same disclosure, both commands stated \
                    exactly: `grep -rn '\\.deregister_table(' crates/jammi-db/src crates/jammi-ai/src` \
@@ -3568,6 +3970,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/mod.rs",
         function: "register_object_store_twice_for_one_url_rebinds_the_same_driver_and_errors_on_neither",
         ordinal: 1,
+        allowed: 2,
         property: "the unit test that is `build_result_table_provider`'s own \
                    EXECUTED oracle above -- it calls `ctx.runtime_env().register_object_store(..)` \
                    directly, twice, against an in-memory driver and a raw `url::Url`, on a session \
@@ -3585,6 +3988,7 @@ const DDL_LITERAL_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/catalog/migrations.rs",
         function: "<module-scope>",
         ordinal: 0,
+        allowed: 1,
         property: "the ordered `MIGRATIONS` table naming each migration's SQL constant -- the DDL \
                    text itself lives in `catalog/schema.rs` (reviewed below); this file only lists \
                    the constants. Every migration executes through `CatalogBackend`'s own SQL \
@@ -3598,6 +4002,12 @@ const DDL_LITERAL_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/catalog/schema.rs",
         function: "<module-scope>",
         ordinal: 0,
+        // 13 -- transcribed from the gate's own output (the real-tokenizer
+        // rebuild's `ddl_hit_lines`, #554), never hand-counted: this module
+        // holds MANY migration-SQL constants (`CREATE TABLE sources`,
+        // `result_tables`, and every other table this catalog's migrations
+        // create), each its own `ddl_statement_shape` hit at module scope.
+        allowed: 13,
         property: "the migration SQL constants themselves (`CREATE TABLE sources`, \
                    `result_tables`, etc.) -- same disclosure as `catalog/migrations.rs`: executed \
                    only through `CatalogBackend`'s own connection, never a DataFusion \
@@ -3608,6 +4018,7 @@ const DDL_LITERAL_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/mutable/postgres.rs",
         function: "create_table_ddl",
         ordinal: 1,
+        allowed: 1,
         property: "builds a `CREATE TABLE ..` STRING for the companion \"mutable table\" Postgres \
                    backend, executed through that backend's own direct SQL connection -- never a \
                    DataFusion `SessionContext::sql` call, and never reachable from `fine_tune/` by \
@@ -3618,6 +4029,7 @@ const DDL_LITERAL_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/mutable/sqlite.rs",
         function: "create_table_ddl",
         ordinal: 1,
+        allowed: 1,
         property: "the SQLite arm of the same \"mutable table\" backend -- same disclosure as the \
                    Postgres arm above.",
     },
@@ -3625,34 +4037,56 @@ const DDL_LITERAL_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/mutable/sqlite.rs",
         function: "create_table_ddl_emits_implicit_tenant_id",
         ordinal: 1,
+        allowed: 1,
         property: "a unit test asserting on the built DDL STRING's own content \
                    (`ddl.starts_with(\"CREATE TABLE \\\"widgets\\\"\")`) -- the DDL text lives in a \
                    test assertion, never executed as SQL by this test at all.",
     },
 ];
 
-/// Both directions of the comparison every allowlist in this file already
-/// checks (`allowlists_match_current_hits_exactly`'s own discipline, applied
-/// here to the two whole-surface scans): an occurrence with no reviewed entry
-/// is UNREVIEWED (fails naming the site); a reviewed entry whose site no
-/// longer produces a hit is STALE (also fails -- an allowance is never
-/// permanent slack a later, different site can spend).
+/// Three-way comparison every allowlist in this file already checks
+/// (`allowlists_match_current_hits_exactly`'s own discipline, applied here to
+/// the two whole-surface, COUNTED scans): an occurrence with no reviewed
+/// entry is UNREVIEWED (fails naming the site); a reviewed entry whose site
+/// no longer produces a hit is STALE (also fails -- an allowance is never
+/// permanent slack a later, different site can spend); and a reviewed entry
+/// whose site's REAL count exceeds its `allowed` one is OVER-COUNT -- the
+/// check closing audit #8 of U2a's escape needed and the set-only version of
+/// this file never had: a second `ctx.register_table(...)` planted inside an
+/// already-reviewed function does not create a NEW key, it bumps an
+/// EXISTING one's count past what was reviewed.
 fn assert_occurrences_reviewed(
-    found: &BTreeSet<(String, String, usize)>,
-    allow: &BTreeSet<(String, String, usize)>,
+    found: &std::collections::BTreeMap<(String, String, usize), usize>,
+    allow: &[&ReviewedRegistrationSite],
     what: &str,
 ) {
-    let unreviewed: Vec<_> = found.difference(allow).collect();
+    let allow_keys: BTreeSet<(String, String, usize)> = allow.iter().map(|e| e.key()).collect();
+    let found_keys: BTreeSet<(String, String, usize)> = found.keys().cloned().collect();
+
+    let unreviewed: Vec<_> = found_keys.difference(&allow_keys).collect();
     assert!(
         unreviewed.is_empty(),
         "{what}: unreviewed occurrence(s) {unreviewed:?} -- add a reviewed entry naming the \
          (file, function, ordinal) and its property, or remove the offending call/literal."
     );
-    let stale: Vec<_> = allow.difference(found).collect();
+    let stale: Vec<_> = allow_keys.difference(&found_keys).collect();
     assert!(
         stale.is_empty(),
         "{what}: reviewed entr(y/ies) {stale:?} no longer produce a hit -- shrink the allowlist \
          to match reality."
+    );
+    let over_count: Vec<_> = allow
+        .iter()
+        .filter_map(|e| {
+            let real = *found.get(&e.key()).unwrap_or(&0);
+            (real > e.allowed).then_some((e.key(), real, e.allowed))
+        })
+        .collect();
+    assert!(
+        over_count.is_empty(),
+        "{what}: site(s) occur MORE often than their reviewed `allowed` count \
+         (key, real count, allowed count) = {over_count:?} -- a new, unreviewed occurrence was \
+         planted at an already-reviewed site; add its own review or remove it."
     );
 }
 
@@ -3660,10 +4094,7 @@ fn assert_occurrences_reviewed(
 fn registration_verb_occurrences_are_all_reviewed() {
     let surface = scan_surface();
     let found = registration_verb_occurrences(&surface);
-    let allow: BTreeSet<_> = REGISTRATION_VERB_SITES
-        .iter()
-        .map(ReviewedRegistrationSite::key)
-        .collect();
+    let allow: Vec<&ReviewedRegistrationSite> = REGISTRATION_VERB_SITES.iter().collect();
     assert_occurrences_reviewed(&found, &allow, "registration verb");
 }
 
@@ -3671,11 +4102,116 @@ fn registration_verb_occurrences_are_all_reviewed() {
 fn ddl_literal_occurrences_are_all_reviewed() {
     let surface = scan_surface();
     let found = ddl_literal_occurrences(&surface);
-    let allow: BTreeSet<_> = DDL_LITERAL_SITES
-        .iter()
-        .map(ReviewedRegistrationSite::key)
-        .collect();
+    let allow: Vec<&ReviewedRegistrationSite> = DDL_LITERAL_SITES.iter().collect();
     assert_occurrences_reviewed(&found, &allow, "DDL literal");
+}
+
+/// #554 item 2: a DDL keyword split across two `concat!` string-literal
+/// arguments on separate lines is invisible to a per-literal check (neither
+/// `"CREATE "` nor `"TABLE probe"` is independently DDL-shaped) but visible
+/// to the ARGUMENT-ORDER CONCATENATION `ddl_hit_lines` builds for
+/// `concat!`/`format!`/`write!`/`writeln!` -- RED under the deleted
+/// line-based scan (each half sits on its own line, neither DDL-shaped
+/// alone), GREEN here.
+#[test]
+fn falsification_ddl_keyword_split_across_concat_arguments_is_detected() {
+    let dir = repo_root();
+    let source = concat!(
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the concat!-split DDL shape -- synthetic producer text, not real code in this file
+        "fn build_ddl() -> &'static str {\n",
+        "    concat!(\n",
+        "        \"CREATE \",\n",
+        "        \"TABLE probe (id INT)\"\n",
+        "    )\n",
+        "}\n",
+    );
+    let (hits, _unresolved) = ddl_hit_lines(&dir, source);
+    assert!(
+        !hits.is_empty(),
+        "a DDL keyword split across two concat! string-literal arguments must be detected as one \
+         statement, got no hits"
+    );
+}
+
+/// #554 item 3: `include_str!(..)`'s own target file content is scanned as
+/// if inlined -- a fixture file containing `CREATE TABLE` is included by a
+/// synthetic source and must be detected.
+#[test]
+fn falsification_include_str_target_ddl_is_detected() {
+    let scratch_dir = std::env::temp_dir().join(format!(
+        "pinned_source_gate_include_str_probe_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&scratch_dir).expect("create scratch dir for the include_str! probe");
+    let included_path = scratch_dir.join("probe_included.sql");
+    std::fs::write(&included_path, "CREATE TABLE probe_included (id INT);\n")
+        .expect("write the include_str! probe's target file");
+    let source = concat!(
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the include_str! DDL shape -- synthetic producer text, not real code in this file
+        "fn embedded_ddl() -> &'static str {\n",
+        "    include_str!(\"probe_included.sql\")\n",
+        "}\n",
+    );
+    let (hits, unresolved) = ddl_hit_lines(&scratch_dir, source);
+    std::fs::remove_dir_all(&scratch_dir).ok();
+    assert!(
+        !hits.is_empty(),
+        "an include_str! target containing a DDL statement must be scanned and flagged, got no \
+         hits (unresolved: {unresolved:?})"
+    );
+}
+
+/// The general per-literal macro scan and the format!/concat!-combined
+/// check must never BOTH fire for the common single-literal-template shape
+/// (`format!("CREATE TABLE ..", ..)`) -- exactly the double count this file
+/// measured live in `store/mutable/{postgres,sqlite}.rs::create_table_ddl`
+/// before the fix (real count 2 against a reviewed `allowed: 1`).
+#[test]
+fn falsification_format_macro_ddl_literal_is_not_double_counted() {
+    let dir = repo_root();
+    let source = concat!(
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture proving the format!-template DDL count is 1, not 2 -- synthetic producer text, not real code in this file
+        "fn build_ddl(name: &str) -> String {\n",
+        "    format!(\"CREATE TABLE {} (id INT)\", name)\n",
+        "}\n",
+    );
+    let (hits, _unresolved) = ddl_hit_lines(&dir, source);
+    assert_eq!(
+        hits.len(),
+        1,
+        "a single-literal format! DDL template must be counted once, not once per detection path, \
+         got {hits:?}"
+    );
+}
+
+/// [`string_literals_in_tokens`]'s span-preservation fix, executed directly:
+/// a literal buried two macro-groups deep must be reported on ITS OWN real
+/// source line, never line 1 (`syn::parse_str::<syn::Lit>(&lit.to_string())`
+/// -- the bug this replaces -- re-lexes the token's rendered text as a
+/// brand-new one-line source, so every literal it returned carried a
+/// PHANTOM `line 1` span regardless of where it actually lived; this is
+/// exactly how the real `postgres.rs`/`sqlite.rs` hits were misattributed
+/// to `<module-scope>` at line 1 before the fix).
+#[test]
+fn falsification_general_macro_ddl_literal_is_attributed_to_its_real_line() {
+    let dir = repo_root();
+    let source = concat!(
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture proving real-span attribution for a macro-nested literal -- synthetic producer text, not real code in this file
+        "fn f() {\n",
+        "    // five filler lines push the DDL literal well past line 1\n",
+        "    let _ = 1;\n",
+        "    let _ = 2;\n",
+        "    let _ = 3;\n",
+        "    assert!(some_call(\"CREATE TABLE probe (id INT)\").is_ok());\n",
+        "}\n",
+    );
+    let (hits, _unresolved) = ddl_hit_lines(&dir, source);
+    assert_eq!(
+        hits,
+        vec![6],
+        "a DDL literal inside an assert!(..) argument must be attributed to its REAL source line \
+         (6), not a phantom line 1, got {hits:?}"
+    );
 }
 
 /// No field on [`ReviewedRegistrationSite`] is decorative: `property` is read
@@ -3725,13 +4261,94 @@ fn falsification_new_verb_occurrence_in_a_new_file_is_flagged() {
         1usize,
     );
     assert!(
-        found.contains(&key),
+        found.contains_key(&key),
         "a register_table( call in a new file must be found by the scan, got {found:?}"
     );
     assert!(
         !allow.contains(&key),
         "the planted site must not already be on the reviewed list -- this control is vacuous \
          otherwise"
+    );
+}
+
+/// Non-vacuousness for the OVER-COUNT arm [`assert_occurrences_reviewed`]
+/// added (#554 item 1): a site already reviewed at `allowed: 1` that the
+/// real scan now finds TWICE (a second `ctx.register_table(...)` planted
+/// inside the same, already-reviewed function -- exactly closing audit #8 of
+/// U2a's own escape, reproduced here as a fixture rather than against the
+/// live 600+-file surface) is reported OVER-COUNT, never silently absorbed
+/// the way a `BTreeSet`-keyed version of this gate absorbed it.
+#[test]
+fn falsification_a_second_occurrence_inside_an_already_reviewed_function_is_over_count() {
+    let surface = vec![(
+        "crates/jammi-db/src/store/__probe_double_registration__.rs".to_string(),
+        concat!(
+            // kernel-oracles: fn-in-literal reviewed: falsification fixture for the count-keyed over-count arm -- synthetic producer text, not real code in this file
+            "fn bind_result_table(ctx: &SessionContext, provider: Arc<dyn TableProvider>) {\n",
+            "    ctx.register_table(\"a\", provider.clone()).unwrap();\n",
+            "    ctx.register_table(\"b\", provider).unwrap();\n",
+            "}\n",
+        )
+        .to_string(),
+    )];
+    let found = registration_verb_occurrences(&surface);
+    let key = (
+        "crates/jammi-db/src/store/__probe_double_registration__.rs".to_string(),
+        "bind_result_table".to_string(),
+        1usize,
+    );
+    assert_eq!(
+        found.get(&key).copied(),
+        Some(2),
+        "two `.register_table(` calls in one reviewed function must be counted as 2, got {found:?}"
+    );
+    let reviewed = ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/__probe_double_registration__.rs",
+        function: "bind_result_table",
+        ordinal: 1,
+        allowed: 1,
+        property: "a stand-in reviewed entry allowing exactly one occurrence, for this test only.",
+    };
+    let allow = vec![&reviewed];
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_occurrences_reviewed(&found, &allow, "probe");
+    }));
+    assert!(
+        result.is_err(),
+        "a site reviewed at allowed: 1 whose real count is 2 must fail assert_occurrences_reviewed, \
+         not pass silently"
+    );
+}
+
+/// Paired-verb occurrence counting does not double-count a `deregister_X(`
+/// call as a separate `register_X(` one, even though `"deregister_table("`
+/// contains `"register_table("` as a literal substring -- see
+/// [`registration_verb_occurrences`]'s doc for the arithmetic this proves.
+#[test]
+fn falsification_paired_verb_occurrence_count_does_not_double_count_deregister() {
+    let surface = vec![(
+        "crates/jammi-db/src/store/__probe_paired_verb_count__.rs".to_string(),
+        concat!(
+            // kernel-oracles: fn-in-literal reviewed: falsification fixture proving paired-verb occurrence counting arithmetic -- synthetic producer text, not real code in this file
+            "fn both_forms(ctx: &SessionContext, provider: Arc<dyn TableProvider>) {\n",
+            "    ctx.register_table(\"a\", provider).unwrap();\n",
+            "    ctx.deregister_table(\"a\").unwrap();\n",
+            "}\n",
+        )
+        .to_string(),
+    )];
+    let found = registration_verb_occurrences(&surface);
+    let key = (
+        "crates/jammi-db/src/store/__probe_paired_verb_count__.rs".to_string(),
+        "both_forms".to_string(),
+        1usize,
+    );
+    assert_eq!(
+        found.get(&key).copied(),
+        Some(2),
+        "one register_table( and one deregister_table( call must count as 2 occurrences, not 3 \
+         (the embedded `register_table(` substring inside `deregister_table(` double-counted), \
+         got {found:?}"
     );
 }
 
@@ -3756,10 +4373,12 @@ fn falsification_removing_a_reviewed_entry_leaves_its_site_unreviewed() {
         .to_string(),
     )];
     let found = registration_verb_occurrences(&surface);
-    let empty_allow: BTreeSet<(String, String, usize)> = BTreeSet::new();
-    let unreviewed: Vec<_> = found.difference(&empty_allow).collect();
+    let empty_allow: Vec<&ReviewedRegistrationSite> = Vec::new();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_occurrences_reviewed(&found, &empty_allow, "probe");
+    }));
     assert!(
-        !unreviewed.is_empty(),
+        result.is_err(),
         "an allowlist missing a real hit's entry must report it unreviewed, not silently pass -- \
          found {found:?} against an empty allowlist"
     );

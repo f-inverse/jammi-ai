@@ -81,6 +81,8 @@ jammi-python -> jammi-ai, jammi-db
 jammi-server -> jammi-admin, jammi-ai, jammi-ballista, jammi-client, jammi-db, jammi-numerics, jammi-test-utils, jammi-wire
 jammi-test-utils -> jammi-db
 jammi-wire -> jammi-db, jammi-lora, jammi-numerics
+probed-ops-index -> jammi-kernels
+symbol-index
 ```
 <!-- END GENERATED: dep-dag -->
 

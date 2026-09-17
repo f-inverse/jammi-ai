@@ -4895,7 +4895,17 @@ def _r12_exclusions_setup(unit: str):
 
 def fixture_r12x1_missing_exclusions_denies() -> None:
     """item 8c: the fix's own diff adds a new test definition
-    (`test_thing`), and the relay carries no `exclusions` object at all."""
+    (`test_thing`), and the relay carries no `exclusions` object at all.
+
+    `_exclusions_rejection`'s OWN `why == "carries no `exclusions` object"`
+    special case (its distinguishing text: the whole diff's own new test
+    definition(s) named, "each must name the case ... does NOT cover") is
+    what must fire HERE -- never merely the generic passthrough arm
+    (`_r12_exclusions_shape_rejection`'s SAME bare string wrapped only in
+    the item-8c parenthetical suffix, which is unreachable via THIS caller
+    for a missing-object shape but shares the SAME bare substring the OLD
+    assertion alone could not tell apart from the special case -- the
+    exact #569-class defect a bare substring check misses)."""
     unit = "feat/r12x1"
     root, row, fix_head = _r12_exclusions_setup(unit)
     a = _auto_r12_attack("a.py")
@@ -4906,6 +4916,10 @@ def fixture_r12x1_missing_exclusions_denies() -> None:
         "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
     _assert(p.returncode == 2, "R12X1", f"missing `exclusions` must deny, got {p.returncode}: {p.stderr}")
     _assert("no `exclusions` object" in p.stderr, "R12X1", p.stderr)
+    _assert("does NOT cover" in p.stderr, "R12X1",
+            f"the special-case producer's OWN text must fire, got: {p.stderr}")
+    _assert("`exclusions` object (esc-lead-gate-R12 item 8c)" not in p.stderr, "R12X1",
+            f"the generic passthrough producer's text must be ABSENT, got: {p.stderr}")
 
 
 def fixture_r12x2_exclusions_present_allows() -> None:

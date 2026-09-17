@@ -2591,7 +2591,7 @@ def _r12_mutations_array_rejection(mutations: object) -> str | None:
     implementation of this shape check, never two: a second, independently
     maintained copy is exactly the class this repo's own R12sweepast/RR31
     detectors exist to catch."""
-    if not isinstance(mutations, list) or not mutations:
+    if not isinstance(mutations, list) or not mutations:  # R12-RESIDUAL: unreachable from `_mutations_rejection`'s own real dispatch path below -- its OWN identical pre-check intercepts a missing/empty `mutations` array first and returns ITS OWN, context-carrying message (naming the scoped file this requirement armed against) before this shared function is ever called on that path; reachable ONLY via `check_rigor_record.py`'s committed-attestation reader (`check_attestation_witnesses`), which has no such pre-check -- exercised by that file's own RR35 fixture, invisible to this check_lead_gate.py-scoped sweep
         return "carries no non-empty `mutations` array"
     if len(mutations) > 3:
         return f"`mutations` carries {len(mutations)} row(s) -- capped at K<=3, a LABELED sample, never an exhaustive sweep"

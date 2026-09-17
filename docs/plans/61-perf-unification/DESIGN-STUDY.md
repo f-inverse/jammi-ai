@@ -48,9 +48,11 @@ for what phase 3's tags can point at)
 at build time, else `"unknown"`), `target`, `profile`, and `build_features` (linked-crate constants —
 `jammi_kernels::admission::FLASH_COMPILED`/`CUDA_COMPILED`, never `CARGO_FEATURE_*`, which is a
 build-script-only value) into a `Provenance` struct on every `Report`. This closes the `tip_sha`
-defect: the pre-existing `grad_oracle.rs::tip_sha()` read `git rev-parse HEAD` at RUN time, so a
-provenance value could silently drift from the binary that actually produced the numbers around it if
-the checkout moved between build and run.
+defect: the removed `grad_oracle.rs` helper `tip_sha` (no longer present — see
+`crates/jammi-bench/src/grad_oracle.rs`'s own doc comment on `Provenance::baked` for the
+still-current account) used to read `git rev-parse HEAD` at RUN time, so a provenance value could
+silently drift from the binary that actually produced the numbers around it if the checkout moved
+between build and run.
 
 ## 3. Rule (g) — leg identity on self-declaring v2 legs
 

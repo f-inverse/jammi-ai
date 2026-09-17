@@ -226,13 +226,13 @@ those still in force are restated here in their v4 form. Principle in parenthese
     frees the lost task's slot and `SuccessfulStage::reset_tasks` re-fails its COMPLETED tasks as
     `ResultLost` (`retryable: true, count_to_failures: false`), which `update_task_status` resets
     **without consulting `task_max_failures`**. The `ExecutorLost` arm itself
-    (`scheduler_server/query_stage_scheduler.rs::QueryStageScheduler::on_receive`, the
+    (Ballista's `scheduler_server/query_stage_scheduler.rs::QueryStageScheduler::on_receive`, the
     `QueryStageSchedulerEvent::ExecutorLost` match arm) only resets the freed/re-failed tasks; it posts no
     `ReviveOffers` and no failure. **Re-launch on a surviving executor is conditional**, not
     automatic: `ReviveOffers` fires only from a later, independent event — a new executor
-    registering under push-staged scheduling (`do_register_executor`, `scheduler_server/mod.rs:
+    registering under push-staged scheduling (Ballista's `do_register_executor`, `scheduler_server/mod.rs:
     419`) or a subsequent `TaskUpdating` success under push-staged scheduling
-    (`scheduler_server/query_stage_scheduler.rs::QueryStageScheduler::on_receive`, the
+    (Ballista's `scheduler_server/query_stage_scheduler.rs::QueryStageScheduler::on_receive`, the
     `QueryStageSchedulerEvent::TaskUpdating` match arm's `ReviveOffers` post) — so with both retry knobs at 0, a `GangExec` on a killed
     executor is picked up only if one of those triggers fires afterward; with no other executor
     registering and no other in-flight task reporting status, the freed task can sit unscheduled

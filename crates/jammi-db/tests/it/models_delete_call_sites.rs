@@ -8,24 +8,27 @@
 //! (`pub(crate)`, confirmed by reading its definition), and the handle's own
 //! raw driver, as the `pub(crate)` accessor `JammiObjectStore::driver` and as
 //! the private field `self.driver` inside the handle's file (every reference
-//! to either is a reviewed row) — across every
+//! to either is a reviewed row) — across every `.rs` file cargo compiles
+//! outside a test target (the universe `jammi_test_utils::source_universe`
+//! defines: every workspace member's `src/`, every `build.rs`, every
+//! `examples/` and `benches/` target; not a crate's top-level `tests/` or the
+//! `ci/fixtures/` tokenizer inputs), because `delete_if_exists` is `pub` and
+//! a caller anywhere cargo compiles is in scope, while `driver` is sealed to
+//! this crate by the compiler.
 //!
 //! **The residual this oracle does NOT close, stated rather than claimed:**
-//! the raw `Arc<dyn ObjectStore>` is also obtainable WITHOUT the handle,
-//! through `StorageRegistry::driver_for` and `storage::build_object_store`
-//! (both `pub`; the non-test acquisition sites in the workspace are
-//! enumerated in the wave-5 contract, `docs/rigor/contracts/feat_500-wave5.md`
-//! §2.12), and `ObjectStoreExt::delete` on such a value is unguarded. Closing
-//! that door is a jammi-db capability-sealing unit (the registry hands out
-//! guarded handles only, the raw builders become crate-private), filed from
-//! that contract; until it lands, a raw driver obtained that way is outside
-//! this review.
-//! `.rs` file cargo compiles outside a test target (the universe
-//! `jammi_test_utils::source_universe` defines: every workspace member's
-//! `src/`, every `build.rs`, every `examples/` and `benches/` target; not
-//! `tests/` or the `ci/fixtures/` tokenizer inputs), because
-//! `delete_if_exists` is `pub` and a caller anywhere cargo compiles is in
-//! scope, while `driver` is sealed to this crate by the compiler.
+//! a raw `Arc<dyn ObjectStore>` — on which `ObjectStoreExt::delete` is
+//! unguarded — is obtainable WITHOUT the handle by three routes, all outside
+//! this review: `StorageRegistry::driver_for` and `storage::build_object_store`
+//! (both `pub`); `JammiSession::context()` (`pub`), whose DataFusion
+//! `runtime_env().object_store(url)` returns the registered store (the
+//! session's default registry pre-registers `file://`, and this crate registers
+//! its cloud drivers there); and direct construction with the `object_store`
+//! crate by any code holding the same credentials, which no crate can seal.
+//! The wave-5 contract (`docs/rigor/contracts/feat_500-wave5.md` §2.12,
+//! committed with that PR's rigor record) enumerates the present acquisition
+//! sites of the first route; sealing the first two is the jammi-db
+//! capability-sealing unit filed from it (#588).
 //!
 //! **Keyed by `(file, function, ordinal)`, not `(file, line)`** (F2's
 //! second delta): a bare line number goes stale on every UNRELATED edit

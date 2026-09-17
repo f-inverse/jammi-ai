@@ -1976,11 +1976,14 @@ jobs:
             cmd: python3 ci/scripts/perf/test_ab_merge.py
           # `finetune_ab.sh`'s forced-eager disable-key enumeration
           # (`ci/scripts/perf/test_finetune_ab_disable_op_keys.py`) is NOT a
-          # matrix leg: it COMPILES two workspace tools (`cargo run --release
-          # -p probed-ops-index`, `-p symbol-index`), and this bare runner has
-          # no linker (`collect2: cannot find 'ld'`, PR #587) — a `toolchain:
-          # true` leg only gets sccache and a fetched registry, enough for
-          # `cargo metadata`, never for a build. It runs in the container-
+          # matrix leg: it BUILDS two workspace tools (`cargo run --release
+          # -p probed-ops-index`, `-p symbol-index`), and a workspace crate
+          # cannot be built on this bare runner — `.cargo/config.toml` mandates
+          # `-fuse-ld=mold` for x86_64 Linux and the runner has no mold
+          # (`collect2: cannot find 'ld'`, PR #587). A `toolchain: true` leg
+          # gets sccache and a fetched registry, enough for `cargo metadata`
+          # and for a fixture workspace's own build (`pod build substrate`),
+          # never for a workspace crate. The sweep runs in the container-
           # backed `symbol-index-gates` job below, aggregated by `ci-summary`.
           # `finetune_ab.sh` ITSELF (the redesigned single-binary A/B
           # producer, #352): dry-run smoke over the whole pipeline, the
@@ -2489,13 +2492,14 @@ jobs:
       # build.rs sources under $CARGO_HOME/registry, which needs an actual
       # toolchain + a fetched registry. This bare runner carries cargo and
       # rustc but NOT `sccache` (`.cargo/config.toml` makes it the mandatory
-      # rustc wrapper for every cargo call) and NOT a linker — so a matrix leg
-      # may declare `toolchain: true` only for metadata-class cargo use
-      # (`setup-rust-ci` installs sccache, `cargo fetch` the registry); a
-      # guard that must BUILD Rust lives in the container-backed
-      # `symbol-index-gates` job instead. `ci/scripts/merge_path.sh`'s guards
-      # stage mirrors the wrapper split (an unexecutable wrapper for the
-      # other legs).
+      # rustc wrapper for every cargo call) and NOT `mold` (the same file's
+      # mandatory linker for x86_64 Linux) — so a matrix leg may declare
+      # `toolchain: true` for `cargo metadata` and for a FIXTURE workspace's
+      # build (`setup-rust-ci` installs sccache, `cargo fetch` the registry,
+      # the runner's own ld links a plain crate); a guard that must build a
+      # WORKSPACE crate lives in the container-backed `symbol-index-gates`
+      # job instead. `ci/scripts/merge_path.sh`'s guards stage mirrors the
+      # wrapper split (an unexecutable wrapper for the other legs).
       - name: Rust toolchain (toolchain legs only)
         if: matrix.toolchain == true
         uses: ./.github/actions/setup-rust-ci

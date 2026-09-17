@@ -216,10 +216,16 @@ PY
     printf 'FAIL  [guards] %s exists — the non-toolchain mirror needs an unexecutable wrapper path\n' "$NOSCCACHE_WRAPPER"
     exit 2
   fi
-  if ! command -v sccache >/dev/null 2>&1; then
-    printf 'FAIL  [guards] sccache is not on PATH here — the toolchain legs (and every cargo stage) need it\n'
-    exit 2
-  fi
+  # A toolchain leg gets sccache and a fetched registry on the runner and
+  # links with the runner's own `ld` — which is enough for `cargo metadata`
+  # and for building a FIXTURE workspace (`pod build substrate` does both),
+  # but not for building a WORKSPACE crate: `.cargo/config.toml` mandates
+  # `-fuse-ld=mold` for x86_64 Linux and the bare runner has no mold (PR #587:
+  # `collect2: cannot find 'ld'` from the eager-disable sweep's `cargo run -p
+  # probed-ops-index`). That divergence has no macOS mirror; the rule is
+  # placement — a guard that builds a workspace crate lives in ci.yml's
+  # container-backed `symbol-index-gates` job — and the draft PR's CI is the
+  # check. Toolchain legs run as-is here.
   while IFS=$'\t' read -r name toolchain cmd; do
     if [ "$toolchain" = "true" ]; then
       run_sh guards "$name" "$cmd"

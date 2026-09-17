@@ -122,8 +122,14 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
     );
 
     // (b) The committed served pointer roots under the WINNER's per-attempt
-    // prefix on the shared bucket — never the crashed loser's. The prefix layout
-    // is `{result_root}/models/{job_id}/{worker_id}/{attempt}`.
+    // prefix on the shared bucket — never the crashed loser's. `winner_prefix`
+    // is built through `ArtifactStore::prefix_url` -- the SAME function
+    // `put_artifact` itself uses to lay out a published bundle's prefix --
+    // rather than a hand-built layout string, so a future layout change
+    // (e.g. the tenant-prefixed `_global` segment `5fef1ac8` added) can
+    // never silently misalign this assertion from the real committed shape
+    // the way the prior hand-built `{result_root}/models/{job_id}/{winner}/`
+    // string did.
     let model = session
         .catalog()
         .get_model(&expected_model)
@@ -134,7 +140,14 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
         .artifact_path
         .as_deref()
         .expect("the finalize CAS commits the served artifact_path");
-    let winner_prefix = format!("{result_root}/models/{job_id}/{winner}/");
+    let winner_prefix = format!(
+        "{}/",
+        session
+            .artifact_store()
+            .prefix_url(None, &[job_id.as_str(), winner])
+            .unwrap()
+            .as_str()
+    );
     assert!(
         artifact_path.starts_with(&winner_prefix),
         "committed artifact_path {artifact_path:?} must root under the WINNER's prefix \

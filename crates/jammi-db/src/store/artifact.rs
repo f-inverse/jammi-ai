@@ -623,7 +623,15 @@ impl ArtifactStore {
     /// `{root}/{TenantSegment::of(tenant)}/{segments…}`. Each segment is
     /// sanitized so a `job_id`/`worker_id` carrying a `/` cannot escape the
     /// prefix or collide across attempts.
-    fn prefix_url(&self, tenant: Option<&TenantId>, segments: &[&str]) -> Result<StorageUrl> {
+    ///
+    /// `pub`: this is the ONE place [`Self::put_artifact`] builds the prefix
+    /// a published artifact roots under, so a test asserting on the SHAPE of
+    /// a committed `artifact_path` (never its bytes) calls this instead of
+    /// hand-building the layout string — the shape can never drift out from
+    /// under a hand-built copy again the way `artifact_crash_window.rs`'s
+    /// `winner_prefix` did across commit `5fef1ac8`'s tenant-prefixed
+    /// layout change.
+    pub fn prefix_url(&self, tenant: Option<&TenantId>, segments: &[&str]) -> Result<StorageUrl> {
         let root = self.root.as_str().trim_end_matches('/');
         let mut joined = String::from(root);
         joined.push('/');

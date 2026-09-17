@@ -25,25 +25,33 @@
 //! the row. A fresh host (a second `KillableHost`, simulating the process
 //! restarting) then reclaims and completes the job.
 //!
-//! Two rows:
+//! Two rows, EACH run under both topologies (`Peer` and `Local`), so
+//! neither row's proof rests on the other topology's execution:
 //!
 //! - the parity property itself: attempt 2's published adapter, rank 0, is
 //!   byte-identical whether the crash-and-resume ran under `Peer` or under
 //!   `Local`;
-//! - the mutation this property is blind to, closed separately: on
-//!   `Device::Cpu` the trainer's whole trajectory is a pure function of
-//!   `(seed, source rows, config)` (`resume.rs`'s own doc), so a resumed
-//!   attempt 2 and a silently-skipped-resume attempt 2 that just retrains
-//!   both epochs from scratch reach the IDENTICAL final bytes for this
-//!   fixture — final-byte equality alone cannot prove `discover_resume` ran
-//!   for either topology. The second row corrupts the ONLY durable evidence
-//!   `discover_resume` reads (`optimizer.safetensors` under the shared
-//!   `_resume/` prefix) between the kill and the successor's claim:
-//!   `ArtifactStore::fetch_resume_checkpoint`'s own contract (`artifact.rs`)
-//!   makes a present-but-corrupt bundle a HARD ERROR, never a silent
-//!   from-scratch restart — so attempt 2 failing here, naming the digest
-//!   mismatch, is the executed proof that the rank body genuinely calls back
-//!   into `discover_resume` rather than skipping it.
+//! - the mutation the parity property above is blind to: on `Device::Cpu`
+//!   the trainer's whole trajectory is a pure function of `(seed, source
+//!   rows, config)` (`resume.rs`'s own doc), so a resumed attempt 2 and a
+//!   silently-skipped-resume attempt 2 that just retrains both epochs from
+//!   scratch reach the IDENTICAL final bytes for this fixture — final-byte
+//!   equality alone cannot prove `discover_resume` ran, under either
+//!   topology. This row corrupts the ONLY durable evidence `discover_resume`
+//!   reads (`optimizer.safetensors` under the shared `_resume/` prefix)
+//!   between the kill and the successor's claim: `ArtifactStore::
+//!   fetch_resume_checkpoint`'s own contract (`artifact.rs`) makes a
+//!   present-but-corrupt bundle a HARD ERROR, never a silent from-scratch
+//!   restart — so attempt 2 failing here, naming the digest mismatch, is the
+//!   executed proof that the rank body genuinely calls back into
+//!   `discover_resume` rather than skipping it. Run once under `Local`
+//!   (`..._under_local`, `[worker] local_ranks = 2`, no fleet dial) and once
+//!   under `Peer` (`..._under_peer`, a real loopback member over the same
+//!   `GangServiceServer` `gang_chaos.rs` uses, unmodified, serving both
+//!   attempts): the Peer arm is the executed proof that a member-hosted
+//!   rank's resume path is exercised too, not only the in-process one — the
+//!   two rows share one driver (`run_corrupted_epoch_1_checkpoint`), never
+//!   duplicated per topology.
 
 #![cfg(feature = "test-hooks")]
 
@@ -59,7 +67,7 @@ use jammi_server::grpc::gang_rounds::GangDialer;
 use tempfile::TempDir;
 
 use crate::gang_chaos::{Fleet, Member};
-use crate::gang_coordinator::{published_adapter_bytes, row, two_rank_spec, write_pairs_csv};
+use crate::gang_coordinator::{published_adapter_bytes, row, two_rank_spec, write_pairs_csv, Row};
 
 /// The killed host's own lease: short, so attempt 2's reclaim is observed in
 /// seconds.
@@ -360,20 +368,23 @@ async fn peer_and_local_w2_gangs_resume_from_epoch_1s_checkpoint_and_publish_byt
 }
 
 /// The mutation the byte-parity property above is blind to (this module's
-/// doc): corrupt the persisted `_resume/` bundle between the kill and
-/// attempt 2's claim; `fetch_resume_checkpoint` must surface it as a hard
-/// error, never a silent from-scratch restart that happens to reach the
-/// same bytes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_corrupted_epoch_1_checkpoint_fails_attempt_2_loudly_never_a_silent_restart() {
-    let fleet = Fleet::new();
-    let configure = |cfg: &mut JammiConfig| {
-        cfg.gpu.device = 0;
-        cfg.gpu.devices = Some(vec![0, 1]);
-        cfg.worker.local_ranks = 2;
-    };
-    let mut host = KillableHost::start(&fleet, false, configure).await;
-    add_pairs_source(&host.session, &fleet).await;
+/// doc), the shared driver: kill attempt 1 once epoch 1's resume checkpoint
+/// is durably written, corrupt the ONE file `discover_resume` reads back
+/// (`optimizer.safetensors`), then claim and run attempt 2 to its terminal
+/// state. `member`, when `Some`, is the `Peer` topology's own dialed
+/// loopback fleet member (unmodified, serving both attempts, exactly
+/// `run_peer_w2_resumed`'s own shape) — its slot is awaited free between
+/// the kill and the second host's claim, the same wait that row performs.
+/// Shared by both topology tests below so the corrupted-bundle assertion is
+/// written once, never duplicated per topology.
+async fn run_corrupted_epoch_1_checkpoint(
+    fleet: &Fleet,
+    install_dialer: bool,
+    member: Option<&Member>,
+    configure: impl Fn(&mut JammiConfig) + Copy,
+) -> Row {
+    let mut host = KillableHost::start(fleet, install_dialer, configure).await;
+    add_pairs_source(&host.session, fleet).await;
 
     let job = host
         .session
@@ -389,6 +400,9 @@ async fn a_corrupted_epoch_1_checkpoint_fails_attempt_2_loudly_never_a_silent_re
     host.spawn_claimed_run(record);
     wait_for_resume_checkpoint_written(bundle_written).await;
     host.kill();
+    if let Some(member) = member {
+        member.wait_slot_free(Duration::from_secs(15)).await;
+    }
 
     // Corrupt the ONE durable file `discover_resume` reads back: a fresh
     // sha256 mismatch against the untouched manifest, `artifact.rs`'s own
@@ -409,12 +423,17 @@ async fn a_corrupted_epoch_1_checkpoint_fails_attempt_2_loudly_never_a_silent_re
     )
     .expect("corrupt the checkpoint");
 
-    let host2 = KillableHost::start(&fleet, false, configure).await;
+    let host2 = KillableHost::start(fleet, install_dialer, configure).await;
     let record2 = host2.claim(LEASE + Duration::from_secs(20)).await;
     assert_eq!(record2.attempts, 2);
     host2.run(record2).await;
 
-    let after = row(&host2.session, &job_id).await;
+    row(&host2.session, &job_id).await
+}
+
+/// The corrupted-bundle assertion both topology rows below share: a hard
+/// error, never a silent from-scratch restart, naming the digest mismatch.
+fn assert_corrupted_resume_failed_loudly(after: &Row) {
     assert_eq!(
         after.status, "failed",
         "a corrupted resume bundle is a hard error, never a silent from-scratch restart: \
@@ -424,4 +443,36 @@ async fn a_corrupted_epoch_1_checkpoint_fails_attempt_2_loudly_never_a_silent_re
         after.error.as_deref().is_some_and(|e| e.contains("sha256")),
         "the digest mismatch names itself in the row's error: {after:?}"
     );
+}
+
+/// The `Local` arm: a `local_ranks = 2` host runs both ranks in-process, no
+/// fleet dial — `run_local_w2_resumed`'s own topology.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_corrupted_epoch_1_checkpoint_fails_attempt_2_loudly_never_a_silent_restart_under_local()
+{
+    let fleet = Fleet::new();
+    let configure = |cfg: &mut JammiConfig| {
+        cfg.gpu.device = 0;
+        cfg.gpu.devices = Some(vec![0, 1]);
+        cfg.worker.local_ranks = 2;
+    };
+    let after = run_corrupted_epoch_1_checkpoint(&fleet, false, None, configure).await;
+    assert_corrupted_resume_failed_loudly(&after);
+}
+
+/// The `Peer` arm: a coordinator plus one real fleet member dialed over the
+/// loopback `GangServiceServer` (`gang_chaos::Member`, unmodified — the SAME
+/// member serves both attempts, `run_peer_w2_resumed`'s own topology) — the
+/// executed proof that a member-hosted rank's resume path is exercised too,
+/// not only the in-process one this row's `Local` sibling covers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_corrupted_epoch_1_checkpoint_fails_attempt_2_loudly_never_a_silent_restart_under_peer() {
+    let fleet = Fleet::new();
+    let configure = |cfg: &mut JammiConfig| {
+        cfg.server.peer_advertise = Some("127.0.0.1:1".into());
+        cfg.distributed.max_world_size = 2;
+    };
+    let member = Member::start(&fleet).await;
+    let after = run_corrupted_epoch_1_checkpoint(&fleet, true, Some(&member), configure).await;
+    assert_corrupted_resume_failed_loudly(&after);
 }

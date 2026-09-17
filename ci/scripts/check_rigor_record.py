@@ -364,11 +364,14 @@ def _r12_reject_foreign_anticipation_rows(path: str, rows: list[tuple[int, dict]
     required_gates` selects (hiding a real `gates` object behind "no
     `gates` object"), or simply deny `check_anticipation_witnesses`
     outright ("no non-empty `residual_risk`"). The exporter's own
-    attestation-row half was later reverted entirely (mutations/
-    exclusions are HOOK-ATTESTED ONLY — visible in the relay artifact
-    readers 1 and 2 already read, never exported or committed); a
-    `lead-relay-attestation` row found HERE is therefore always a
-    FOREIGN row — a stale pre-revert export still committed, or a
+    attestation-row half was later reverted entirely; `mutations`/
+    `exclusions` are now exported by a SEPARATE command
+    (`--export-attestation`) into a SEPARATE committed stream
+    (`docs/rigor/<slug>.attestation.jsonl`, read by `check_attestation_
+    witnesses`, never this function) — never folded back into THIS
+    stream. A `lead-relay-attestation` row found HERE is therefore always
+    a FOREIGN row for THIS stream — a stale pre-revert export still
+    committed, a row exported into the wrong file by hand, or a
     hand-edit. This function REFUSES it with a loud, NAMED FAIL — never
     silently ignores it (which would let a tampered/legacy row go
     undetected) and never silently SELECTS it (the earlier bug this
@@ -381,9 +384,9 @@ def _r12_reject_foreign_anticipation_rows(path: str, rows: list[tuple[int, dict]
             result.fail(
                 f"{path}:{lineno}: row carries agent_type={agent_type!r}, not "
                 "`lead-anticipation` -- a foreign row (e.g. a `lead-relay-attestation` row -- "
-                "mutations/exclusions are hook-attested only and never exported) does not "
-                "belong in the anticipation stream; it is REFUSED here, never ignored and "
-                "never selected as governing (esc-lead-gate-R12 fix round 6 Z12)")
+                "mutations/exclusions export into docs/rigor/<slug>.attestation.jsonl instead, "
+                "never here) does not belong in the anticipation stream; it is REFUSED here, "
+                "never ignored and never selected as governing (esc-lead-gate-R12 fix round 6 Z12)")
             continue
         kept.append((lineno, row))
     return kept
@@ -585,6 +588,160 @@ def check_anticipation_witnesses(cwd: Path, unit_slug: str, rows: list[dict], re
                 _git(cwd, "worktree", "remove", "--force", str(tmp_wt))
 
 
+def _r12_reject_foreign_attestation_rows(path: str, rows: list[tuple[int, dict]],
+                                          result: Result) -> list[tuple[int, dict]]:
+    """The attestation stream's own Z12/Z18-shaped foreign-row refusal:
+    every committed row's `kind` must be exactly `"lead-relay-
+    attestation"` (`cmd_export_attestation`'s own stamp) — a row of any
+    other shape (a hand-edit, a row copied from the anticipation stream)
+    is REFUSED here, loudly and by name, never ignored and never selected
+    as evidence."""
+    kept: list[tuple[int, dict]] = []
+    for lineno, row in rows:
+        kind = row.get("kind")
+        if kind != "lead-relay-attestation":
+            result.fail(
+                f"{path}:{lineno}: row carries kind={kind!r}, not `lead-relay-attestation` -- "
+                "a foreign row does not belong in the attestation stream; it is REFUSED here, "
+                "never ignored and never selected as evidence (issue #557 item 1)"
+            )
+            continue
+        kept.append((lineno, row))
+    return kept
+
+
+def check_attestation_witnesses(cwd: Path, unit_slug: str, rows: list[dict],
+                                 range_spec: str, result: Result) -> None:
+    """issue #557 items 1-2, half 1 (the committed record) + half 2 (the
+    CI-derived required set): `mutations`/`exclusions` (item 8b/8c) are
+    LEAD-ATTESTED, visible to the hook at decision time from the
+    (gitignored, ephemeral) relay artifact — never from anything this CI
+    script can read. Reader 3 therefore never tries to see WHAT a relay
+    attested; it RE-DERIVES, from the SAME two committed facts the hook's
+    own arming conditions already key off (an open second-round BLOCK
+    row's `finding_locations`/`class_enumeration`, and the fix's own
+    `base...HEAD` diff), WHETHER an attestation was ever REQUIRED at all —
+    then requires the committed `docs/rigor/<unit_slug>.attestation.jsonl`
+    to carry real evidence for each requirement THAT RE-DERIVATION FINDS,
+    never for a requirement it cannot see (the hook's own attack-budget-
+    bounded per-relay scoping stays hook-side; this is a per-unit, whole-
+    diff derivation, a stated widening, never a narrower re-check).
+
+    Armed the SAME way `check_anticipation_witnesses` is (an open
+    second-round BLOCK row, not on the shrink-only R12 grandfather list).
+    `mutations` required iff the diff's own new-definition surfaces
+    (`mod._parse_new_surfaces`, the SAME AST-derived enumeration item 8b
+    itself uses) include one inside a file the open BLOCK(s)' own
+    `finding_locations`/`class_enumeration` also name. `exclusions`
+    required iff `mod._r12_new_test_surfaces` (the SAME subset item 8c
+    uses) is non-empty. EITHER arming condition requires the committed
+    file to exist and carry, across its rows, real shape-checked evidence
+    for the arming(s) that fired — never a placeholder, never a file that
+    exists but proves nothing (an empty stream, or a stream carrying only
+    the OTHER field)."""
+    mod = _lib_module()
+    block_rows = _r12_second_round_block_rows(mod, rows)
+    if not block_rows:
+        return  # nothing to attest -- no open second-round BLOCK in this record
+
+    by_file: set[str] = set()
+    for row in block_rows:
+        locs = {s for s in (row.get("finding_locations") or []) if isinstance(s, str)}
+        enum = {s for s in (row.get("class_enumeration") or []) if isinstance(s, str)}
+        for key in locs | enum:
+            by_file.add(mod._key_to_file(key))
+
+    ok_diff, diff_out = _git(cwd, "diff", "-U0", "--end-of-options", range_spec)
+    new_surfaces = mod._parse_new_surfaces(diff_out) if ok_diff else {}
+    new_surface_files = {mod._key_to_file(k) for k in new_surfaces}
+    mutations_required = bool(by_file & new_surface_files)
+    new_test_surfaces = mod._r12_new_test_surfaces(new_surfaces)
+    exclusions_required = bool(new_test_surfaces)
+
+    if not (mutations_required or exclusions_required):
+        return  # armed by the BLOCK, but this diff never widens either 8b/8c set
+
+    path = f"docs/rigor/{unit_slug}.attestation.jsonl"
+    ok, text = _git(cwd, "show", f"HEAD:{path}")
+    has_file = ok and bool(text.strip())
+
+    if unit_slug in _r12_grandfathered_slugs():
+        if not has_file:
+            result.warn(f"{unit_slug!r} is on the shrink-only R12 grandfather list "
+                        f"({_display_path(R12_GRANDFATHER_PATH)}) — no {path} carried; not required")
+            return
+    elif not has_file:
+        requirement = "mutations" if mutations_required and not exclusions_required else (
+            "exclusions" if exclusions_required and not mutations_required else "mutations and exclusions")
+        result.fail(
+            f"the fix's own diff ({requirement}) arms item 8b/8c's committed attestation "
+            f"requirement but no {path} — export one with `python3 .claude/hooks/lead-gate-lib.py "
+            f"--export-attestation {unit_slug} > {path}` and commit it (issue #557 items 1-2); an "
+            f"in-flight unit whose BLOCK predates this mechanism is exempted only via "
+            f"{_display_path(R12_GRANDFATHER_PATH)} (shrink-only, human-added)")
+        return
+
+    if not has_file:
+        return
+
+    art_rows: list[tuple[int, dict]] = []
+    for i, line in enumerate(text.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError as exc:
+            result.fail(f"{path}:{i + 1}: not valid JSON ({exc})")
+            continue
+        if not isinstance(parsed, dict):
+            result.fail(f"{path}:{i + 1}: not a JSON object")
+            continue
+        art_rows.append((i + 1, parsed))
+
+    art_rows = _r12_reject_foreign_attestation_rows(path, art_rows, result)
+    if not art_rows:
+        result.fail(f"{path}: carries no parseable lead-relay-attestation row")
+        return
+
+    # Every row's own `mutations`/`exclusions` is judged through the SAME
+    # shared shape functions the hook itself validated it against before
+    # the relay was ever accepted (`mod._r12_mutations_array_rejection`/
+    # `mod._r12_exclusions_shape_rejection`) — never a second,
+    # independently maintained copy of those checks in THIS file (the
+    # exact class the R12sweepast/RR31 detectors exist to catch). A row
+    # that fails the shared check is reported (so a hand-edit-after-export
+    # drift is visible) but does not by itself deny the whole check — only
+    # the ABSENCE of any row that satisfies the requirement does.
+    mutations_ok = False
+    exclusions_ok = False
+    for lineno, row in art_rows:
+        if "mutations" in row:
+            why = mod._r12_mutations_array_rejection(row["mutations"])
+            if why is None:
+                mutations_ok = True
+            else:
+                result.warn(f"{path}:{lineno}: mutations {why}")
+        if "exclusions" in row:
+            why = mod._r12_exclusions_shape_rejection(new_test_surfaces, row["exclusions"])
+            if why is None:
+                exclusions_ok = True
+            else:
+                result.warn(f"{path}:{lineno}: exclusions {why}")
+
+    if mutations_required and not mutations_ok:
+        result.fail(
+            f"{path}: the fix's own diff adds a new definition in a file the open BLOCK's own "
+            "finding_locations/class_enumeration also names (item 8b), but no committed row "
+            "carries a shape-valid, non-empty `mutations` array"
+        )
+    if exclusions_required and not exclusions_ok:
+        result.fail(
+            f"{path}: the fix's own diff adds {len(new_test_surfaces)} new TEST definition(s) "
+            f"(item 8c), e.g. {list(new_test_surfaces)[:3]}, but no committed row carries a "
+            "shape-valid `exclusions` object covering all of them"
+        )
+
+
 def _unit_allowlisted(unit_slug: str) -> bool:
     if not ALLOWLIST_PATH.exists():
         return False
@@ -675,6 +832,13 @@ def run_check(cwd: Path = REPO_ROOT) -> Result:
         # shrink-only grandfather list; a shape-only hard fail, re-execution
         # ADVISORY.
         check_anticipation_witnesses(cwd, unit_slug, [r for r in rows if isinstance(r, dict)], result)
+
+        # issue #557 items 1-2: the committed mutations/exclusions
+        # attestation record — armed by the SAME open-BLOCK condition, but
+        # additionally re-derives (never reads) whether item 8b/8c's own
+        # requirement actually fired for THIS diff.
+        check_attestation_witnesses(
+            cwd, unit_slug, [r for r in rows if isinstance(r, dict)], range_spec, result)
 
         # esc-lead-gate-R12 fix round 3 item 8a READER 3 — armed
         # UNCONDITIONALLY (fix round 5 Z4 made a missing/empty/all-comment

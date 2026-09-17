@@ -2570,6 +2570,75 @@ def _r12_anticipation_rejection(rows: list[dict], required_commands: list[str], 
 _R12_TEST_FAILURE_MARKERS = ("test result: FAILED", "FAIL —", "= FAILURES =")
 
 
+def _r12_mutations_array_rejection(mutations: object) -> str | None:
+    """item 8b, the ARRAY-level shape/value check ALONE — no arming logic
+    (that stays in `_mutations_rejection`, below, which is the only
+    caller that knows about `finding_locations`/`new_surfaces`/scoping).
+    `None` iff `mutations` is a list of 1..3 entries — LABELED a sample,
+    never exhaustive — each shaped `{site, command, rc_before, rc_after,
+    marker_after}` with EITHER an ACCEPTED mutation (`rc_before == 0 ∧
+    rc_after != 0 ∧ marker_after` matches a committed TEST-failure
+    marker, distinct from a build-failure marker) OR an explicit
+    `uncovered` reason (R11's own disposition precedent, see
+    `_claims_rejection`), each `uncovered` reason WITHIN-ARRAY-distinct
+    (normalized). NO hash-reproduction — like `gates`, this is a
+    lead-attested record, never re-executed.
+
+    Shared by the hook's own `_mutations_rejection` (armed by the fix's
+    diff + the BLOCK's own `finding_locations`) and `check_rigor_
+    record.py`'s committed-attestation reader (re-derives the SAME
+    requirement from committed facts alone, issue #557 items 1-2) — ONE
+    implementation of this shape check, never two: a second, independently
+    maintained copy is exactly the class this repo's own R12sweepast/RR31
+    detectors exist to catch."""
+    if not isinstance(mutations, list) or not mutations:
+        return "carries no non-empty `mutations` array"
+    if len(mutations) > 3:
+        return f"`mutations` carries {len(mutations)} row(s) -- capped at K<=3, a LABELED sample, never an exhaustive sweep"
+    seen_uncovered: dict[str, int] = {}
+    for i, entry in enumerate(mutations):
+        if not isinstance(entry, dict):
+            return f"`mutations`[{i}] is not an object"
+        site = entry.get("site")
+        if not isinstance(site, str) or not site.strip():
+            return f"`mutations`[{i}] carries no `site`"
+        command = entry.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return f"`mutations`[{i}] carries no `command`"
+        uncovered = entry.get("uncovered")
+        if uncovered is not None:
+            if not isinstance(uncovered, str) or not uncovered.strip():
+                return f"`mutations`[{i}] `uncovered` is present but empty"
+            # Fix round 5 Z11 (audit advisory 8): three identical `uncovered`
+            # strings would otherwise satisfy the row-shape obligation three
+            # times over with ONE real disposition — reuse R11's own
+            # distinctness precedent (`_claims_rejection`'s uncovered-reason
+            # check), never a length/word-count proxy.
+            norm = _probe_normalize(uncovered)
+            if norm in seen_uncovered:
+                return (f"`mutations`[{i}] and `mutations`[{seen_uncovered[norm]}] carry the "
+                         "IDENTICAL `uncovered` reason (normalized) — a templated disposition is "
+                         "not a per-site examination")
+            seen_uncovered[norm] = i
+            continue
+        rc_before = entry.get("rc_before")
+        rc_after = entry.get("rc_after")
+        marker_after = entry.get("marker_after")
+        if not (isinstance(rc_before, int) and not isinstance(rc_before, bool)):
+            return f"`mutations`[{i}] carries no integer `rc_before`"
+        if not (isinstance(rc_after, int) and not isinstance(rc_after, bool)):
+            return f"`mutations`[{i}] carries no integer `rc_after`"
+        if not (isinstance(marker_after, str) and marker_after.strip()):
+            return f"`mutations`[{i}] carries no `marker_after`"
+        accepted = (rc_before == 0 and rc_after != 0
+                    and any(m in marker_after for m in _R12_TEST_FAILURE_MARKERS))
+        if not accepted:
+            return (f"`mutations`[{i}] does not satisfy the ACCEPT rule (rc_before==0, "
+                     "rc_after!=0, marker_after names a committed TEST-failure marker) and "
+                     "carries no `uncovered` reason either")
+    return None
+
+
 def _mutations_rejection(row: dict, data: dict, new_surfaces: dict[str, str] | None) -> str | None:
     """item 8b: scoped to call sites in files the open BLOCK's own
     `finding_locations` name — armed by the DATA, never merely by
@@ -2578,14 +2647,9 @@ def _mutations_rejection(row: dict, data: dict, new_surfaces: dict[str, str] | N
     touched a finding's own file at all): the fix's own diff must ADD at
     least one new definition (`new_surfaces`, the hook's own derived
     enumeration, reduced to files) inside a file `finding_locations` also
-    names. `None` iff the relay's `mutations` array then carries 1..3 rows
-    — LABELED a sample, never exhaustive — each shaped `{site, command,
-    rc_before, rc_after, marker_after}` with EITHER an ACCEPTED mutation
-    (`rc_before == 0 ∧ rc_after != 0 ∧ marker_after` matches a committed
-    TEST-failure marker, distinct from a build-failure marker) OR an
-    explicit `uncovered` reason (R11's own disposition precedent, see
-    `_claims_rejection`). NO hash-reproduction here — like `gates`, this
-    is a lead-attested record, never re-executed by the hook."""
+    names. `None` iff the relay's `mutations` array then satisfies
+    `_r12_mutations_array_rejection` (above, the shared shape/value
+    check)."""
     finding_files = {_key_to_file(s) for s in (row.get("finding_locations") or []) if isinstance(s, str)}
     new_surface_files = {_key_to_file(k) for k in (new_surfaces or {}).keys()}
     scoped_files = finding_files & new_surface_files
@@ -2597,50 +2661,9 @@ def _mutations_rejection(row: dict, data: dict, new_surfaces: dict[str, str] | N
                 f"definition in {sorted(scoped_files)[:3]} — a file the BLOCK's own "
                 "finding_locations also names — esc-lead-gate-R12 item 8b: record 1-3 "
                 "lead-chosen mutation rows (a sample, never exhaustive)")
-    if len(mutations) > 3:
-        return (f"relay `mutations` carries {len(mutations)} row(s) — esc-lead-gate-R12 item 8b "
-                "caps this at K<=3, a LABELED sample, never an exhaustive sweep")
-    seen_uncovered: dict[str, int] = {}
-    for i, entry in enumerate(mutations):
-        if not isinstance(entry, dict):
-            return f"relay `mutations`[{i}] is not an object (esc-lead-gate-R12 item 8b)"
-        site = entry.get("site")
-        if not isinstance(site, str) or not site.strip():
-            return f"relay `mutations`[{i}] carries no `site` (esc-lead-gate-R12 item 8b)"
-        command = entry.get("command")
-        if not isinstance(command, str) or not command.strip():
-            return f"relay `mutations`[{i}] carries no `command` (esc-lead-gate-R12 item 8b)"
-        uncovered = entry.get("uncovered")
-        if uncovered is not None:
-            if not isinstance(uncovered, str) or not uncovered.strip():
-                return f"relay `mutations`[{i}] `uncovered` is present but empty (esc-lead-gate-R12 item 8b)"
-            # Fix round 5 Z11 (audit advisory 8): three identical `uncovered`
-            # strings would otherwise satisfy the row-shape obligation three
-            # times over with ONE real disposition — reuse R11's own
-            # distinctness precedent (`_claims_rejection`'s uncovered-reason
-            # check), never a length/word-count proxy.
-            norm = _probe_normalize(uncovered)
-            if norm in seen_uncovered:
-                return (f"relay `mutations`[{i}] and `mutations`[{seen_uncovered[norm]}] carry the "
-                         "IDENTICAL `uncovered` reason (normalized) — a templated disposition is "
-                         "not a per-site examination (esc-lead-gate-R12 item 8b)")
-            seen_uncovered[norm] = i
-            continue
-        rc_before = entry.get("rc_before")
-        rc_after = entry.get("rc_after")
-        marker_after = entry.get("marker_after")
-        if not (isinstance(rc_before, int) and not isinstance(rc_before, bool)):
-            return f"relay `mutations`[{i}] carries no integer `rc_before` (esc-lead-gate-R12 item 8b)"
-        if not (isinstance(rc_after, int) and not isinstance(rc_after, bool)):
-            return f"relay `mutations`[{i}] carries no integer `rc_after` (esc-lead-gate-R12 item 8b)"
-        if not (isinstance(marker_after, str) and marker_after.strip()):
-            return f"relay `mutations`[{i}] carries no `marker_after` (esc-lead-gate-R12 item 8b)"
-        accepted = (rc_before == 0 and rc_after != 0
-                    and any(m in marker_after for m in _R12_TEST_FAILURE_MARKERS))
-        if not accepted:
-            return (f"relay `mutations`[{i}] does not satisfy the ACCEPT rule (rc_before==0, "
-                     "rc_after!=0, marker_after names a committed TEST-failure marker) and "
-                     "carries no `uncovered` reason either (esc-lead-gate-R12 item 8b)")
+    why = _r12_mutations_array_rejection(mutations)
+    if why is not None:
+        return f"relay {why} (esc-lead-gate-R12 item 8b)"
     return None
 
 
@@ -2739,42 +2762,66 @@ def _r12_previous_relay_row(sdir: Path, unit_slug: str, row: dict) -> dict | Non
     return max(candidates, key=lambda pair: pair[0])[1]
 
 
+def _r12_exclusions_shape_rejection(new_test_surfaces: dict[str, str] | None, exclusions: object) -> str | None:
+    """item 8c, the shape/coverage/WITHIN-SET distinctness check ALONE —
+    never the cross-relay-history distinctness arm (that needs the
+    RELAY LEDGER's own on-disk state, hook-only; see `_exclusions_
+    rejection`'s own cross-relay block, below). `None` iff `exclusions`
+    is an object covering EVERY key in `new_test_surfaces`, each with a
+    non-empty, normalized-distinct-from-its-siblings reason.
+
+    Shared by the hook's own `_exclusions_rejection` and `check_rigor_
+    record.py`'s committed-attestation reader (issue #557 items 1-2) —
+    ONE implementation of this shape check, never two."""
+    if not isinstance(exclusions, dict):
+        return "carries no `exclusions` object"
+    missing = [k for k in (new_test_surfaces or {}) if k not in exclusions]
+    if missing:
+        return f"`exclusions` omits {len(missing)} new test definition(s), e.g. {missing[:3]}"
+    normalized: dict[str, str] = {}
+    for key in (new_test_surfaces or {}):
+        reason = exclusions.get(key)
+        if not isinstance(reason, str) or not reason.strip():
+            return f"`exclusions`[{key!r}] is empty"
+        normalized[key] = _probe_normalize(reason)
+    seen: dict[str, str] = {}
+    for key, norm in normalized.items():
+        if norm in seen:
+            return (f"`exclusions`[{key!r}] and `exclusions`[{seen[norm]!r}] carry the "
+                     "IDENTICAL exclusion (normalized) — a templated exclusion is not a "
+                     "per-test examination")
+        seen[norm] = key
+    return None
+
+
 def _exclusions_rejection(new_test_surfaces: dict[str, str], data: dict, unit_slug: str,
                            sdir: Path, row: dict) -> str | None:
     """item 8c: `None` iff every NEW test definition the fix's own diff
     adds (`new_test_surfaces`, derived from `_parse_new_surfaces`, never
     lead-supplied) carries a non-empty entry in the relay's `exclusions`
-    object, each NORMALIZED-DISTINCT from its siblings in THIS relay and
-    from the unit's own PREVIOUS relay of the SAME agent_type (an earlier
-    `ts`) — the anti-templating cousin of `_claims_rejection`'s own
+    object, each NORMALIZED-DISTINCT from its siblings in THIS relay
+    (`_r12_exclusions_shape_rejection`, above) and from the unit's own
+    PREVIOUS relay of the SAME agent_type (an earlier `ts`, checked only
+    HERE — this hook-only arm needs the relay ledger's own on-disk
+    state) — the anti-templating cousin of `_claims_rejection`'s own
     uncovered-reason check. LIMIT, stated as plainly as R11's own: this
     cannot prove an exclusion is TRUE, only that two are not one."""
     if not new_test_surfaces:
         return None
     exclusions = data.get("exclusions")
-    if not isinstance(exclusions, dict):
-        return (f"relay carries no `exclusions` object, but the fix's own diff adds "
-                f"{len(new_test_surfaces)} new test definition(s), e.g. "
-                f"{list(new_test_surfaces)[:3]} — esc-lead-gate-R12 item 8c: each must name "
-                "the case the attack you just ran does NOT cover")
-    missing = [k for k in new_test_surfaces if k not in exclusions]
-    if missing:
-        return (f"relay `exclusions` omits {len(missing)} new test definition(s) the fix's own "
-                f"diff adds, e.g. {missing[:3]} (esc-lead-gate-R12 item 8c)")
-    normalized: dict[str, str] = {}
-    for key in new_test_surfaces:
-        reason = exclusions.get(key)
-        if not isinstance(reason, str) or not reason.strip():
-            return (f"relay `exclusions`[{key!r}] is empty — esc-lead-gate-R12 item 8c: name "
-                     "the case this test does NOT cover")
-        normalized[key] = _probe_normalize(reason)
-    seen: dict[str, str] = {}
-    for key, norm in normalized.items():
-        if norm in seen:
-            return (f"relay `exclusions`[{key!r}] and `exclusions`[{seen[norm]!r}] carry the "
-                     "IDENTICAL exclusion (normalized) — a templated exclusion is not a "
-                     "per-test examination (esc-lead-gate-R12 item 8c)")
-        seen[norm] = key
+    why = _r12_exclusions_shape_rejection(new_test_surfaces, exclusions)
+    if why is not None:
+        if why == "carries no `exclusions` object":
+            return (f"relay {why}, but the fix's own diff adds "
+                    f"{len(new_test_surfaces)} new test definition(s), e.g. "
+                    f"{list(new_test_surfaces)[:3]} — esc-lead-gate-R12 item 8c: each must name "
+                    "the case the attack you just ran does NOT cover")
+        return f"relay {why} (esc-lead-gate-R12 item 8c)"
+    # `_r12_exclusions_shape_rejection` already proved coverage + within-set
+    # distinctness; `normalized` is rebuilt here (cheap, `exclusions` is
+    # already known well-shaped) ONLY for the cross-relay comparison below,
+    # which needs the per-key normalized text this hook-only arm alone uses.
+    normalized: dict[str, str] = {key: _probe_normalize(exclusions[key]) for key in new_test_surfaces}
     prev_row = _r12_previous_relay_row(sdir, unit_slug, row)
     if prev_row is not None:
         prev_path = relay_artifact_path(sdir, unit_slug, prev_row.get("agent_type") or "",
@@ -3622,13 +3669,15 @@ def cmd_export_anticipation(argv: list[str]) -> int:
     REFUSES, loudly and by name, any row it still finds in that stream
     whose `agent_type` is not `lead-anticipation` (a stale export or a
     hand-edit), never silently ignoring or selecting it. The lead's own
-    `mutations`/`exclusions` attestations are HOOK-ATTESTED ONLY: they
-    live in the relay artifacts under `.jammi/gate-state/<slug>.relay.
-    *.json`, read directly by readers 1 and 2, and are never exported,
-    never written to a committed file, and never counted by this
-    command. A committed, reader-required attestation record and a
-    CI-derived required call-site set are both tracked as one
-    separately-scoped unit: https://github.com/f-inverse/jammi-ai/issues/557."""
+    `mutations`/`exclusions` attestations stay HOOK-ATTESTED at DECISION
+    TIME (read directly from the relay artifacts by readers 1 and 2) but
+    are now ALSO exportable to a SEPARATE committed stream —
+    `--export-attestation` (below), never folded into THIS stream: this
+    exporter's own `lead-anticipation` row shape carries no `mutations`/
+    `exclusions` keys, and reader 3's foreign-row refusal on THIS stream
+    would reject a `lead-relay-attestation` row exactly as it rejects any
+    other unrecognized `agent_type` — the two streams, and the two
+    exporters, stay separate by construction."""
     if len(argv) < 3 or not argv[2].strip():
         sys.stderr.write("lead-gate-lib: usage: lead-gate-lib.py --export-anticipation <unit_slug>\n")
         return 2
@@ -3661,16 +3710,89 @@ def cmd_export_anticipation(argv: list[str]) -> int:
             sys.stdout.write("\n")
             n += 1
 
-    # Round-6 stop rule (audit #5 BLOCK at da30f0b2): the exporter writes
-    # EXACTLY ONE committed stream. `mutations`/`exclusions` are the
-    # lead's own attestations, written into the (gitignored, CI-invisible)
-    # RELAY artifact under `.jammi/gate-state/<slug>.relay.*.json` — read
-    # directly by readers 1 and 2 — and stay there: they are never
-    # exported, never written to a second committed file, and never
-    # counted by this command. A committed, reader-required attestation
-    # record is filed as its own, separately-scoped unit:
-    # https://github.com/f-inverse/jammi-ai/issues/557.
+    # This command writes EXACTLY ONE stream — `mutations`/`exclusions`
+    # export through `--export-attestation` (below), a SEPARATE command
+    # into a SEPARATE committed file, never folded in here.
     sys.stderr.write(f"lead-gate-lib: exported {n} anticipation row(s) to stdout for {slug!r}\n")
+    return 0
+
+
+def cmd_export_attestation(argv: list[str]) -> int:
+    """issue #557 items 1-2: `--export-attestation <unit_slug>` prints
+    every `<unit_slug>.relay.*.json` artifact under `.jammi/gate-state/`
+    that carries a NON-EMPTY `mutations` array or a NON-EMPTY `exclusions`
+    object, one JSON object per line, to stdout — each row stamped `kind:
+    "lead-relay-attestation"`. The lead runs this alongside `--export`/
+    `--export-oracle`/`--export-anticipation` in the commit ritual,
+    redirecting stdout into `docs/rigor/<slug>.attestation.jsonl`. A pure
+    READ: no stdin, no payload, never touches `decide_pre` or any gate
+    decision. A relay carrying NEITHER a non-empty `mutations` array NOR a
+    non-empty `exclusions` object emits NO row — this stream is never
+    padded with an empty placeholder just to prove the export ran; `n ==
+    0` and an empty stdout are the correct, honest output for a unit whose
+    relays never needed either attestation.
+
+    `ts` (the artifact FILE's own mtime, ISO-8601 UTC) and `head_sha` (the
+    relay's own `fix_head` when present, else its `pre_fix_sha`) are
+    stamped the SAME way `cmd_export_anticipation` stamps them, for the
+    SAME reason: `check_rigor_record.py`'s governing-row selection needs
+    order-independent evidence (via the shared `_r12_normalize_ts_instant`
+    both exporters' own consumers key off), never append/sort position —
+    a relay artifact's filename is a content hash, not a timestamp.
+
+    `check_rigor_record.py`'s new reader REFUSES, loudly and by name, any
+    row it finds in THIS stream whose `kind` is not `lead-relay-
+    attestation` — the same foreign-row-refusal property (Z12/Z18)
+    `check_anticipation_witnesses` already holds for its own stream,
+    extended here rather than re-derived."""
+    if len(argv) < 3 or not argv[2].strip():
+        sys.stderr.write("lead-gate-lib: usage: lead-gate-lib.py --export-attestation <unit_slug>\n")
+        return 2
+    slug = argv[2]
+    sdir = state_dir()
+    n = 0
+    prefix = f"{slug}.relay."
+    if sdir.exists():
+        for entry in sorted(sdir.iterdir()):
+            if not (entry.name.startswith(prefix) and entry.name.endswith(".json")):
+                continue
+            try:
+                data = json.loads(entry.read_text())
+            except Exception:  # R12-RESIDUAL: requires a relay artifact to be malformed JSON on disk at export time; not exercised by a fast self-test fixture (a real relay is always written by this same module's own json.dumps)
+                continue
+            if not isinstance(data, dict):
+                continue
+            mutations = data.get("mutations")
+            exclusions = data.get("exclusions")
+            has_mutations = isinstance(mutations, list) and len(mutations) > 0
+            has_exclusions = isinstance(exclusions, dict) and len(exclusions) > 0
+            if not (has_mutations or has_exclusions):
+                continue
+            row: dict = {
+                "kind": "lead-relay-attestation",
+                "unit_branch": data.get("unit_branch"),
+                "agent_type": data.get("agent_type"),
+                "block_ts": data.get("block_ts"),
+            }
+            if has_mutations:
+                row["mutations"] = mutations
+            if has_exclusions:
+                row["exclusions"] = exclusions
+            fix_head = data.get("fix_head")
+            pre_fix_sha = data.get("pre_fix_sha")
+            if isinstance(fix_head, str) and fix_head:
+                row["head_sha"] = fix_head
+            elif isinstance(pre_fix_sha, str) and pre_fix_sha:
+                row["head_sha"] = pre_fix_sha
+            try:
+                mtime = entry.stat().st_mtime
+                row["ts"] = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+            except OSError:  # R12-RESIDUAL: requires the artifact file to vanish between the `iterdir()` listing and this `stat()` call, a TOCTOU race not exercised by a fast self-test fixture
+                row["ts"] = now_iso()
+            sys.stdout.write(json.dumps(row, sort_keys=True))
+            sys.stdout.write("\n")
+            n += 1
+    sys.stderr.write(f"lead-gate-lib: exported {n} attestation row(s) to stdout for {slug!r}\n")
     return 0
 
 
@@ -3679,13 +3801,15 @@ def main(argv: list[str]) -> int:
         return cmd_export_oracle(argv)
     if len(argv) >= 2 and argv[1] == "--export-anticipation":
         return cmd_export_anticipation(argv)
+    if len(argv) >= 2 and argv[1] == "--export-attestation":
+        return cmd_export_attestation(argv)
     if len(argv) >= 2 and argv[1] == "--export":
         return cmd_export(argv)
     if len(argv) < 2 or argv[1] not in ("start", "stop", "pre"):
         sys.stderr.write(
             "lead-gate-lib: usage: lead-gate-lib.py {start|stop|pre} < payload.json "
             "| --export <unit_slug> | --export-oracle <unit_slug> | "
-            "--export-anticipation <unit_slug>\n")
+            "--export-anticipation <unit_slug> | --export-attestation <unit_slug>\n")
         return 2
     cmd = argv[1]
 

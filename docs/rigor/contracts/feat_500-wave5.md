@@ -446,7 +446,10 @@ fifth round. TARBALL's chroot half and GATES' #517 followed their contracts' own
 - GPU prove run 35171308424 (all four arches green on the capability-surface fix); GPU cluster run
   35171132263 (row C9's artifact); the cookbook render workflow dispatched on the branch; the
   distributed lane with the chaos leg promoted.
-- The mining byte pin: the constant captured from the PR's first Linux CI run and committed.
+- The mining byte pin: NOT captured in this PR. The shipped mining oracle compares two digests taken live
+  in one run and prints no constant (`training_set.rs`, the `hard_negative_mining_at_w1_…` test), so there is
+  nothing in a CI log to pin; capturing a Linux constant needs a print, a CI run and a committed pair — a
+  follow-up on #551, which stays OPEN (partial per §11), not a closer of this PR.
 - The adversarial audit, then the oracle LAST after every non-rigor edit, then the record export.
 - Lead-built fixes landed at consolidation, each with an executed RED: a793f572 (the pinned source
   gate's `include_str!` review list keyed by argument text and count, never by line); 49b804ac (the

@@ -272,6 +272,17 @@ seahash = "4"
 bytemuck = "1"
 hf-hub = { version = "0.5", default-features = false, features = ["tokio", "ureq", "rustls-tls"] }
 thiserror = "2"
+# Enum-inventory-by-construction (#550): `VariantArray`'s derive reads the
+# enum's own variant list at macro-expansion time and emits a `VARIANTS`
+# array from it, so a hand-maintained `ALL`/`VARIANTS` array can never drift
+# from the variant list the way a hand-written match's ARM SET can stay
+# exhaustive while its separately hand-typed array literal goes stale (the
+# defect #550 names). `derive` is the only feature: no `Display`/`EnumString`
+# macros are pulled in, since every enum here already hand-writes
+# `Display`/`FromStr` for its SQL/wire string form, deliberately decoupled
+# from the Rust variant identifier (`ResultTableKind::NeighborGraph` <->
+# `"neighbor_graph"`).
+strum = { version = "0.26", default-features = false, features = ["derive"] }
 directories = "6"
 url = "2"
 async-trait = "0.1"

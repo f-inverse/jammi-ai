@@ -7,6 +7,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use strum::VariantArray;
+
 use crate::error::JammiError;
 
 /// Status of a result table (Parquet-backed embedding/inference output).
@@ -51,7 +53,7 @@ impl FromStr for ResultTableStatus {
 /// two states [`crate::catalog::jobs_repo::JobRecord::is_terminal`] and the
 /// retention age-predicate ([`crate::catalog::model_repo`]'s `REFERENCE_EDGES`)
 /// both key on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, VariantArray)]
 pub enum JobStatus {
     /// Job created, waiting to be claimed.
     Queued,
@@ -71,11 +73,16 @@ impl JobStatus {
         matches!(self, Self::Completed | Self::Failed)
     }
 
-    /// Every status, in lifecycle order — the one list the SQL-side
-    /// helpers below derive their literals from, so a status added here
-    /// is reflected in every `status IN (...)` predicate without a second
-    /// hand-typed vocabulary.
-    pub const ALL: [JobStatus; 4] = [Self::Queued, Self::Running, Self::Completed, Self::Failed];
+    /// Every status, in declaration (lifecycle) order — the one list the
+    /// SQL-side helpers below derive their literals from, so a status added
+    /// here is reflected in every `status IN (...)` predicate without a
+    /// second hand-typed vocabulary. `#[derive(VariantArray)]` (`strum`)
+    /// reads this enum's own variant list at macro-expansion time, so a
+    /// status added above and covered by every exhaustive match on `Self`
+    /// (e.g. [`Display`](fmt::Display) below) is in `ALL` automatically —
+    /// unlike a hand-typed array, which the compiler cannot check for
+    /// completeness against the variant set.
+    pub const ALL: &'static [Self] = <Self as VariantArray>::VARIANTS;
 
     /// The comma-joined, single-quoted SQL literal list of every TERMINAL
     /// status (`'completed', 'failed'`), for a `status IN (...)` predicate —
@@ -224,18 +231,25 @@ impl FromStr for JobExecution {
 mod tests {
     use super::*;
 
+    /// Iterates the DERIVED inventory ([`JobStatus::ALL`]), not a
+    /// hand-typed literal list here: a status added to the enum and given a
+    /// `Display`/`FromStr` spelling (required to compile) is exercised by
+    /// this loop automatically, with no second edit to this test.
     #[test]
     fn job_status_round_trips_through_display_and_from_str() {
-        for status in [
-            JobStatus::Queued,
-            JobStatus::Running,
-            JobStatus::Completed,
-            JobStatus::Failed,
-        ] {
+        for status in JobStatus::ALL {
             let rendered = status.to_string();
             let parsed = JobStatus::from_str(&rendered).expect("canonical status parses");
-            assert_eq!(parsed, status, "round-trip must be identity for {status:?}");
+            assert_eq!(
+                &parsed, status,
+                "round-trip must be identity for {status:?}"
+            );
         }
+        assert_eq!(
+            JobStatus::ALL.len(),
+            4,
+            "every declared JobStatus variant is in ALL"
+        );
         assert_eq!(JobStatus::Failed.to_string(), "failed");
         assert!(JobStatus::from_str("cancelled").is_err());
     }

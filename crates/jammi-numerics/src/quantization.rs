@@ -54,6 +54,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use strum::VariantArray;
 
 use crate::error::NumericsError;
 
@@ -68,7 +69,7 @@ use crate::error::NumericsError;
 /// whether a weight is quantized at all, and to which format, is inherent
 /// to the GGUF file it was loaded from, never a knob with a sensible
 /// implicit value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, VariantArray)]
 #[serde(rename_all = "lowercase")]
 pub enum WeightQuantization {
     /// 4-bit, block size 32, one `f16` scale per block, no zero point.
@@ -120,22 +121,16 @@ impl WeightQuantization {
         }
     }
 
-    /// Every variant, in [`Self::gguf_wire_id`] ascending order — the
-    /// canonical enumeration a caller building a manifest/table over every
-    /// known format should iterate, rather than hand-listing variants
-    /// (which could silently drift from this module's own variant list).
-    pub const ALL: [Self; 10] = [
-        Self::Q4_0,
-        Self::Q4_1,
-        Self::Q5_0,
-        Self::Q5_1,
-        Self::Q8_0,
-        Self::Q2K,
-        Self::Q3K,
-        Self::Q4K,
-        Self::Q5K,
-        Self::Q6K,
-    ];
+    /// Every variant, in declaration order — which the module doc's "Wire
+    /// order" section pins as [`Self::gguf_wire_id`] ascending order too
+    /// (deliberate, not incidental). `#[derive(VariantArray)]` (`strum`)
+    /// reads the variant list straight from this enum's own declaration at
+    /// macro-expansion time, so a variant added above is in `ALL`
+    /// automatically the moment [`Self::gguf_wire_id`] (an exhaustive
+    /// match, forced to cover it to compile) is extended — there is no
+    /// second, hand-typed array here for a future variant to be left out
+    /// of.
+    pub const ALL: &'static [Self] = <Self as VariantArray>::VARIANTS;
 }
 
 impl PartialOrd for WeightQuantization {
@@ -200,7 +195,7 @@ mod tests {
     fn display_and_from_str_round_trip() {
         for wq in WeightQuantization::ALL {
             let s = wq.to_string();
-            assert_eq!(s.parse::<WeightQuantization>().unwrap(), wq);
+            assert_eq!(&s.parse::<WeightQuantization>().unwrap(), wq);
         }
     }
 
@@ -300,8 +295,8 @@ mod tests {
 
     #[test]
     fn ord_is_total_and_consistent_with_eq() {
-        for a in WeightQuantization::ALL {
-            for b in WeightQuantization::ALL {
+        for a in WeightQuantization::ALL.iter().copied() {
+            for b in WeightQuantization::ALL.iter().copied() {
                 let by_cmp = a.cmp(&b);
                 let by_partial = a.partial_cmp(&b).unwrap();
                 assert_eq!(by_cmp, by_partial);

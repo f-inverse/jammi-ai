@@ -1,6 +1,8 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+use strum::VariantArray;
+
 use crate::catalog::backend::{BackendError, BackendKind, Row, SqlValue, Transaction, TxOptions};
 #[cfg(feature = "test-hooks")]
 use crate::catalog::lease::LEASE_TS_FORMAT;
@@ -23,7 +25,7 @@ use crate::tenant_scope::TenantBinding;
 /// excludes it from embedding-table resolution. Keeping the distinction here
 /// rather than in `ModelTask` leaves that enum a pristine catalogue of model
 /// tasks (S9 §5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, strum::VariantArray)]
 pub enum ResultTableKind {
     /// An embedding or inference table produced by running a model.
     Model,
@@ -48,29 +50,17 @@ impl ResultTableKind {
     /// Every kind, in declaration order — the single set the string codec's
     /// round-trip oracle and its "expected" error text both range over.
     ///
-    /// Produced by `Self::all`, an exhaustive match over every variant of
-    /// `Self`: the match arm's pattern must name every variant joined by
-    /// `|`, or the match fails to compile ("non-exhaustive patterns"). The
-    /// compiler checks only that pattern, not the arm's value — E0004 binds
-    /// the pattern, not the `[Self; 4]` array literal — so a variant named
-    /// in the pattern but omitted from the array still compiles. `ALL`
-    /// therefore names every variant the pattern names, not necessarily
-    /// every variant of `Self`
-    /// (<https://github.com/f-inverse/jammi-ai/issues/550> tracks giving
-    /// enum inventories like this one exhaustiveness by construction).
-    pub const ALL: [Self; 4] = Self::all();
-
-    /// The exhaustive match backing [`Self::ALL`]; see that constant's doc.
-    const fn all() -> [Self; 4] {
-        match Self::Model {
-            Self::Model | Self::NeighborGraph | Self::AsofJoin | Self::TrainingSet => [
-                Self::Model,
-                Self::NeighborGraph,
-                Self::AsofJoin,
-                Self::TrainingSet,
-            ],
-        }
-    }
+    /// `#[derive(VariantArray)]` (`strum`) reads this enum's own variant
+    /// list at macro-expansion time and emits [`VariantArray::VARIANTS`]
+    /// directly from it — unlike a hand-written exhaustive match, whose
+    /// pattern the compiler checks (E0004: every variant must appear in the
+    /// pattern) but whose hand-typed ARRAY VALUE it does not: a variant
+    /// named in the match pattern but omitted from a hand-typed array still
+    /// compiled. There is no second list here to omit a variant from: adding a variant to
+    /// this enum either compiles into `ALL` automatically (the derive sees
+    /// it) or fails to compile (every other exhaustive match on `Self` in
+    /// this module, e.g. [`Self::as_db_str`], demands a new arm).
+    pub const ALL: &'static [Self] = <Self as VariantArray>::VARIANTS;
 
     /// Canonical string stored in the `result_tables.kind` column. The single
     /// source of truth — [`try_from_db_str`](Self::try_from_db_str) decodes it.
@@ -89,7 +79,8 @@ impl ResultTableKind {
     /// hand-written: the two can never drift apart.
     pub fn try_from_db_str(s: &str) -> Result<Self> {
         Self::ALL
-            .into_iter()
+            .iter()
+            .copied()
             .find(|kind| kind.as_db_str() == s)
             .ok_or_else(|| {
                 let expected: Vec<&'static str> =
@@ -1903,21 +1894,17 @@ mod tests {
     use super::*;
 
     /// Family M: `as_db_str` and `try_from_db_str` are inverse over the set
-    /// [`ResultTableKind::ALL`], not necessarily the whole enum. A variant
-    /// added to the enum without a spelling fails to compile (`as_db_str`'s
-    /// match is exhaustive), but a variant named in `Self::all`'s match
-    /// pattern and omitted from its `[Self; 4]` array value still compiles
-    /// (see that constant's doc) and is missing from this round-trip test
-    /// exactly as it is missing from `ALL`
-    /// (<https://github.com/f-inverse/jammi-ai/issues/550>). The injectivity
-    /// assertion below then checks a property that mechanism cannot enforce:
-    /// that no two listed kinds share one spelling.
+    /// [`ResultTableKind::ALL`], which [`Self::ALL`]'s doc explains IS the
+    /// whole enum by construction (the `VariantArray` derive, not a
+    /// hand-typed array a future variant could be left out of). The
+    /// injectivity assertion below then checks a property that mechanism
+    /// cannot enforce: that no two listed kinds share one spelling.
     #[test]
     fn every_result_table_kind_round_trips_through_its_db_string() {
         for kind in ResultTableKind::ALL {
             assert_eq!(
                 ResultTableKind::try_from_db_str(kind.as_db_str()).unwrap(),
-                kind,
+                *kind,
                 "{kind:?} must decode from its own canonical spelling"
             );
         }
@@ -1931,12 +1918,8 @@ mod tests {
     }
 
     /// The refusal names the offending value and every entry of
-    /// [`ResultTableKind::ALL`], the hand-listed array checked above — not
-    /// necessarily every variant of the enum. A variant named in
-    /// `ResultTableKind::all`'s pattern but left out of `ALL` would be
-    /// missing from this message exactly as it is missing from the round-trip
-    /// test above; see
-    /// <https://github.com/f-inverse/jammi-ai/issues/550>.
+    /// [`ResultTableKind::ALL`] — every variant of the enum, by construction
+    /// (see that constant's doc).
     #[test]
     fn an_unknown_result_table_kind_is_refused_naming_every_accepted_spelling() {
         let err = ResultTableKind::try_from_db_str("embedding_index")

@@ -59,6 +59,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "036_instances_result_root_identity",
     "037_jobs_assembly_failures_next_after",
     "038_compute_cluster_state",
+    "039_canonical_stamps",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -242,8 +243,8 @@ async fn migration_019_normalizes_available_status_to_registered() {
             Box::pin(async move {
                 for (id, status) in [("legacy::1", "available"), ("modern::1", "registered")] {
                     tx.execute(
-                        "INSERT INTO models (model_id, name, model_type, task, version, status) \
-                         VALUES ($1, $2, 'embedding', 'text-embedding', 1, $3)",
+                        "INSERT INTO models (model_id, name, model_type, task, version, status, created_at, updated_at) \
+                         VALUES ($1, $2, 'embedding', 'text-embedding', 1, $3, '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')",
                         &[
                             SqlValue::TextOwned(id.into()),
                             SqlValue::TextOwned(id.into()),
@@ -856,14 +857,27 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                 // drops, and those are non-idempotent — replaying 038 would
                 // fail on "table already exists". The reopened `workers`
                 // table below is missing `devices` as a result, which this
-                // test's `jobs`-only assertions never observe.
+                // test's `jobs`-only assertions never observe. `039` DOES
+                // join this list (replay-idempotence, R5): its `jobs`/
+                // `instances` triggers were dropped along with the tables
+                // above (`DROP TABLE` drops a table's own triggers in
+                // SQLite), so it must replay to reinstall them, or the
+                // reopened `jobs`/`instances` would carry NO schema-edge
+                // stamp domain at all. Replaying it is safe for the tables
+                // this test does NOT drop (`result_tables`, `models`,
+                // `compute_executors`, `applied_migrations`): their triggers
+                // survive intact, `CREATE TRIGGER IF NOT EXISTS` makes
+                // reinstalling them a no-op, and the data-rewrite `UPDATE`s
+                // are naturally idempotent (their `WHERE` excludes
+                // already-canonical rows).
                 tx.execute(
                     "DELETE FROM applied_migrations WHERE name IN ( \
                        '029_jobs_instances_workers', '030_jobs_idempotency_key', \
                        '031_jobs_releases_workers_state', '034_jobs_training_set_identity', \
                        '035_instances_peer_addr_result_root', \
                        '036_instances_result_root_identity', \
-                       '037_jobs_assembly_failures_next_after')",
+                       '037_jobs_assembly_failures_next_after', \
+                       '039_canonical_stamps')",
                     &[],
                 )
                 .await?;
@@ -871,8 +885,9 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                 // requires — the copy's `base_model_id -> model_ref` value
                 // must resolve.
                 tx.execute(
-                    "INSERT INTO models (model_id, name, model_type, task) \
-                     VALUES ('base::1', 'base', 'embedding', 'text-embedding')",
+                    "INSERT INTO models (model_id, name, model_type, task, created_at, updated_at) \
+                     VALUES ('base::1', 'base', 'embedding', 'text-embedding', \
+                             '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')",
                     &[],
                 )
                 .await?;
@@ -1606,7 +1621,7 @@ async fn migration_032_creates_result_table_versions(
                 let name = format!("mig032_{}", jammi_test_utils::unique_suffix());
                 tx.execute(
                     "INSERT INTO result_tables (table_name, source_id, model_id, task, \
-                     parquet_path, created_at) VALUES ($1, 's', 'm', 'text_embedding', 'p', 'now')",
+                     parquet_path, created_at) VALUES ($1, 's', 'm', 'text_embedding', 'p', '2026-01-01T00:00:00.000000Z')",
                     &[jammi_db::catalog::backend::SqlValue::TextOwned(
                         name.clone(),
                     )],
@@ -1818,8 +1833,9 @@ async fn migration_033_is_ordered_after_032_and_adds_model_materialization_colum
             let pk = pk.clone();
             Box::pin(async move {
                 tx.execute(
-                    "INSERT INTO models (model_id, name, model_type, task, version) \
-                     VALUES ($1, $1, 'lora', 'text_embedding', 1)",
+                    "INSERT INTO models (model_id, name, model_type, task, version, created_at, updated_at) \
+                     VALUES ($1, $1, 'lora', 'text_embedding', 1, \
+                             '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')",
                     &[jammi_db::catalog::backend::SqlValue::TextOwned(pk)],
                 )
                 .await
@@ -1963,7 +1979,7 @@ async fn migration_034_is_ordered_after_033_and_pins_the_pair_at_the_schema_edge
     let job_id = format!("mig033_{}", jammi_test_utils::unique_suffix());
     let insert_bare = format!(
         "INSERT INTO jobs (job_id, kind, execution, spec, created_at, updated_at) \
-         VALUES ('{job_id}', 'k', 'queued', '{{}}', 'now', 'now')"
+         VALUES ('{job_id}', 'k', 'queued', '{{}}', '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')"
     );
 
     // Both NULL succeeds — the default, every existing and every `world_size
@@ -1985,7 +2001,7 @@ async fn migration_034_is_ordered_after_033_and_pins_the_pair_at_the_schema_edge
                 tx.execute(
                     "INSERT INTO jobs (job_id, kind, execution, spec, created_at, updated_at, \
                          training_set_ref, training_set_location) \
-                     VALUES ($1, 'k', 'queued', '{}', 'now', 'now', 'digest-x', 'table-y')",
+                     VALUES ($1, 'k', 'queued', '{}', '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z', 'digest-x', 'table-y')",
                     &[SqlValue::TextOwned(job_id2)],
                 )
                 .await
@@ -2161,7 +2177,7 @@ async fn migration_035_is_ordered_after_034_and_adds_instances_peer_addr_result_
             Box::pin(async move {
                 tx.execute(
                     "INSERT INTO instances (instance_id, started_at, last_seen_at) \
-                     VALUES ($1, 'now', 'now')",
+                     VALUES ($1, '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')",
                     &[SqlValue::TextOwned(id_null)],
                 )
                 .await
@@ -2176,7 +2192,7 @@ async fn migration_035_is_ordered_after_034_and_adds_instances_peer_addr_result_
                 tx.execute(
                     "INSERT INTO instances \
                          (instance_id, started_at, last_seen_at, peer_addr, result_root) \
-                     VALUES ($1, 'now', 'now', '10.0.0.1:9000', 'file:///data/jammi_db')",
+                     VALUES ($1, '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z', '10.0.0.1:9000', 'file:///data/jammi_db')",
                     &[SqlValue::TextOwned(id_set)],
                 )
                 .await
@@ -2396,7 +2412,7 @@ async fn migration_037_is_ordered_after_036_and_adds_assembly_failures_next_afte
                 tx.execute(
                     "INSERT INTO jobs \
                      (job_id, kind, status, execution, spec, created_at, updated_at) \
-                     VALUES ($1, 'fine_tune', 'queued', 'queued', '{}', 'now', 'now')",
+                     VALUES ($1, 'fine_tune', 'queued', 'queued', '{}', '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')",
                     &[jammi_db::catalog::backend::SqlValue::TextOwned(job_id)],
                 )
                 .await
@@ -2594,7 +2610,7 @@ async fn migration_038_is_ordered_after_035_and_037_and_creates_compute_tables(
                     "INSERT INTO compute_executors \
                      (executor_id, instance_id, host, port, grpc_port, task_slots, \
                       available_slots, status, heartbeat_at, metadata) \
-                     VALUES ($1, 'inst-1', 'localhost', 50051, 50052, 1, 1, 'live', 'now', '{}')",
+                     VALUES ($1, 'inst-1', 'localhost', 50051, 50052, 1, 1, 'live', '2026-01-01T00:00:00.000000Z', '{}')",
                     &[SqlValue::TextOwned(executor_id.clone())],
                 )
                 .await
@@ -2687,7 +2703,7 @@ async fn migration_038_is_ordered_after_035_and_037_and_creates_compute_tables(
             Box::pin(async move {
                 tx.execute(
                     "INSERT INTO instances (instance_id, started_at, last_seen_at) \
-                     VALUES ($1, 'now', 'now')",
+                     VALUES ($1, '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')",
                     &[SqlValue::TextOwned(instance_id.clone())],
                 )
                 .await?;

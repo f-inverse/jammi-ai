@@ -1537,9 +1537,15 @@ async fn refusal_scenario(
         }
         GangRefusalReason::LeaseUndecodable => {
             // Issue #574's own row fact: `lease_expires_at` text that does
-            // not parse as a timestamp on THIS backend — refused the same
-            // fixed way `LeaseDead` is, under its own distinguishable
-            // variant, never surfaced as `admission_catalog_fault`.
+            // not parse as a timestamp — refused the same fixed way
+            // `LeaseDead` is, under its own distinguishable variant, never
+            // surfaced as `admission_catalog_fault`. Since migration
+            // `039_canonical_stamps` the schema-edge domain refuses a
+            // shape-invalid value at the WRITE (this harness's SQLite
+            // catalog), so the planted text must be shape-valid,
+            // calendar-invalid instead (a month of `13` — `catalog::lease`'s
+            // own docs state why a leap second does not serve this role) to
+            // still reach the Rust decode's `Undecodable` arm.
             fresh_coordinator(&server, "nd-coord-lease-undecodable").await;
             let attempt = submit_and_claim(
                 &server,
@@ -1551,7 +1557,7 @@ async fn refusal_scenario(
             .await;
             raw_sql(
                 &server,
-                "UPDATE jobs SET lease_expires_at = 'not-a-timestamp' \
+                "UPDATE jobs SET lease_expires_at = '2026-13-01T00:00:00.000000Z' \
                  WHERE job_id = 'nd-job-lease-undecodable'"
                     .into(),
             )

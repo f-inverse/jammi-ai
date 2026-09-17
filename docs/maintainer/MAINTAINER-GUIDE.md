@@ -685,6 +685,26 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `adjust_compute_slots`/`bind_compute_slots` (the placement policy's slot
   CAS), `put_compute_job`/`get_compute_job`/`list_compute_jobs`/
   `delete_compute_job`, `list_compute_executor_devices`.
+- **Migration `039_canonical_stamps`** (`schema.rs`; `catalog::lease`'s
+  `CANONICAL_STAMP` — `YYYY-MM-DDTHH:MM:SS.ffffffZ`, UTC, exactly six
+  fraction digits) — the ONE catalog stamp shape, enforced at the schema
+  edge on both backends for `jobs.{lease_expires_at, next_assembly_after,
+  updated_at, created_at}`, `instances.{last_seen_at, started_at}`,
+  `result_tables.{lease_expires_at, created_at}`,
+  `result_table_versions.lease_expires_at`, `compute_executors.heartbeat_at`,
+  `models.{created_at, updated_at}`, `applied_migrations.applied_at`.
+  SQLite: a `BEFORE INSERT`/`BEFORE UPDATE OF <col>` trigger per column
+  (shape only — SQLite has no calendar parser); Postgres: `CHECK` per column
+  (shape AND `::timestamptz` cast validity), named
+  `sdchk__<table>__<column>` so `catalog::backend::classify` can recover
+  which column refused a write. Existing rows are normalised first (a
+  nine-digit ISO fraction truncates to six; Postgres's own pre-039
+  `timestamptz`-cast-to-text/`CAST(CURRENT_TIMESTAMP AS TEXT)` rendering
+  casts directly). `now_sortable()` (nine fraction digits) is deleted;
+  `catalog::lease::canonical_stamp_now`/`pg_canonical_stamp` are the ONE
+  writer on either backend, MigrationSql::PerBackend (this is the first
+  migration whose SQLite/Postgres DDL text cannot be unified — a trigger
+  body has no Postgres equivalent syntax).
 - **Typed status enums** — `crates/jammi-db/src/catalog/status.rs`:
   `ResultTableStatus`, `JobStatus`, `EvalRunStatus`, `ModelStatus`. Each
   impls `Display`+`FromStr`. **Contract: the DB value set is total over the enum**

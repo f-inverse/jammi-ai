@@ -155,7 +155,7 @@ async fn submit_referencing_job(
 /// `"completed"`, `"failed"`, or any other string a caller wants to probe).
 async fn force_job_age(cat: &Catalog, job_id: &str, status: &str, days_ago: i64) {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(days_ago))
-        .format("%Y-%m-%dT%H:%M:%S%.9fZ")
+        .format("%Y-%m-%dT%H:%M:%S%.6fZ")
         .to_string();
     cat.backend_arc()
         .transaction(TxOptions::default(), |tx| {

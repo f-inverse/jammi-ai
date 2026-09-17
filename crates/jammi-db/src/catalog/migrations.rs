@@ -48,26 +48,50 @@ impl MigrationSql {
 /// type and constraint set. Any change that alters the schema shape (new
 /// column, dropped column, different constraint) belongs in a new migration.
 const MIGRATIONS: &[(&str, MigrationSql)] = &[
-    ("001_core_tables", MigrationSql::Same(schema::MIGRATION_001_CORE_TABLES)),
-    ("002_result_tables", MigrationSql::Same(schema::MIGRATION_002_RESULT_TABLES)),
-    ("003_eval_columns", MigrationSql::Same(schema::MIGRATION_003_EVAL_COLUMNS)),
+    (
+        "001_core_tables",
+        MigrationSql::Same(schema::MIGRATION_001_CORE_TABLES),
+    ),
+    (
+        "002_result_tables",
+        MigrationSql::Same(schema::MIGRATION_002_RESULT_TABLES),
+    ),
+    (
+        "003_eval_columns",
+        MigrationSql::Same(schema::MIGRATION_003_EVAL_COLUMNS),
+    ),
     (
         "004_drop_embedding_sets",
         MigrationSql::Same(schema::MIGRATION_004_DROP_EMBEDDING_SETS),
     ),
-    ("005_tenant_scope", MigrationSql::Same(schema::MIGRATION_005_TENANT_SCOPE)),
-    ("006_channel_columns", MigrationSql::Same(schema::MIGRATION_006_CHANNEL_COLUMNS)),
-    ("007_mutable_tables", MigrationSql::Same(schema::MIGRATION_007_MUTABLE_TABLES)),
+    (
+        "005_tenant_scope",
+        MigrationSql::Same(schema::MIGRATION_005_TENANT_SCOPE),
+    ),
+    (
+        "006_channel_columns",
+        MigrationSql::Same(schema::MIGRATION_006_CHANNEL_COLUMNS),
+    ),
+    (
+        "007_mutable_tables",
+        MigrationSql::Same(schema::MIGRATION_007_MUTABLE_TABLES),
+    ),
     (
         "008_mutable_order_column",
         MigrationSql::Same(schema::MIGRATION_008_MUTABLE_ORDER_COLUMN),
     ),
-    ("009_topics", MigrationSql::Same(schema::MIGRATION_009_TOPICS)),
+    (
+        "009_topics",
+        MigrationSql::Same(schema::MIGRATION_009_TOPICS),
+    ),
     (
         "010_rename_source_type_local_to_file",
         MigrationSql::Same(schema::MIGRATION_010_RENAME_SOURCE_TYPE_LOCAL_TO_FILE),
     ),
-    ("011_eval_per_query", MigrationSql::Same(schema::MIGRATION_011_EVAL_PER_QUERY)),
+    (
+        "011_eval_per_query",
+        MigrationSql::Same(schema::MIGRATION_011_EVAL_PER_QUERY),
+    ),
     (
         "012_topics_tenant_unique",
         MigrationSql::Same(schema::MIGRATION_012_TOPICS_TENANT_UNIQUE),
@@ -76,7 +100,10 @@ const MIGRATIONS: &[(&str, MigrationSql)] = &[
         "013_result_table_kind",
         MigrationSql::Same(schema::MIGRATION_013_RESULT_TABLE_KIND),
     ),
-    ("014_bm25_channel", MigrationSql::Same(schema::MIGRATION_014_BM25_CHANNEL)),
+    (
+        "014_bm25_channel",
+        MigrationSql::Same(schema::MIGRATION_014_BM25_CHANNEL),
+    ),
     (
         "015_fine_tune_job_queue",
         MigrationSql::Same(schema::MIGRATION_015_FINE_TUNE_JOB_QUEUE),
@@ -113,8 +140,14 @@ const MIGRATIONS: &[(&str, MigrationSql)] = &[
         "023_storage_precision",
         MigrationSql::Same(schema::MIGRATION_023_STORAGE_PRECISION),
     ),
-    ("024_claim_policy", MigrationSql::Same(schema::MIGRATION_024_CLAIM_POLICY)),
-    ("025_index_segments", MigrationSql::Same(schema::MIGRATION_025_INDEX_SEGMENTS)),
+    (
+        "024_claim_policy",
+        MigrationSql::Same(schema::MIGRATION_024_CLAIM_POLICY),
+    ),
+    (
+        "025_index_segments",
+        MigrationSql::Same(schema::MIGRATION_025_INDEX_SEGMENTS),
+    ),
     (
         "026_acceleration_report",
         MigrationSql::Same(schema::MIGRATION_026_ACCELERATION_REPORT),
@@ -166,6 +199,13 @@ const MIGRATIONS: &[(&str, MigrationSql)] = &[
     (
         "038_compute_cluster_state",
         MigrationSql::Same(schema::MIGRATION_038_COMPUTE_CLUSTER_STATE),
+    ),
+    (
+        "039_canonical_stamps",
+        MigrationSql::PerBackend {
+            sqlite: schema::MIGRATION_039_CANONICAL_STAMPS_SQLITE,
+            postgres: schema::MIGRATION_039_CANONICAL_STAMPS_POSTGRES,
+        },
     ),
 ];
 
@@ -276,7 +316,10 @@ pub(crate) async fn run<B: CatalogBackend + ?Sized>(backend: &B) -> Result<(), B
                         BackendKind::Sqlite => {
                             tx.execute(
                                 "INSERT INTO applied_migrations (name, applied_at) VALUES ($1, $2)",
-                                &[SqlValue::Text(name), SqlValue::TextOwned(canonical_stamp_now())],
+                                &[
+                                    SqlValue::Text(name),
+                                    SqlValue::TextOwned(canonical_stamp_now()),
+                                ],
                             )
                             .await?;
                         }

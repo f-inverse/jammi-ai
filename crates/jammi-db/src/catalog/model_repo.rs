@@ -777,7 +777,7 @@ impl Catalog {
                     let affected = tx
                         .execute(
                             "UPDATE models SET definition_hash = $1, input_anchors_json = $2, \
-                             updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
+                             updated_at = $6 \
                              WHERE name = $3 AND version = $4 \
                                AND (tenant_id = $5 OR (tenant_id IS NULL AND $5 IS NULL)) \
                                AND artifact_path IS NOT NULL",
@@ -787,6 +787,7 @@ impl Catalog {
                                 SqlValue::TextOwned(model_id_for_tx.clone()),
                                 SqlValue::Int(version_i64),
                                 tenant_val.clone(),
+                                SqlValue::TextOwned(canonical_stamp_now()),
                             ],
                         )
                         .await?;

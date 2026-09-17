@@ -268,7 +268,7 @@ async fn placement_available_counts_live_peers_only() {
     catalog
         .upsert_compute_executor(&record(
             &stale_id,
-            "2026-01-01T00:00:00.000000000Z".to_string(),
+            "2026-01-01T00:00:00.000000Z".to_string(),
         ))
         .await
         .unwrap();

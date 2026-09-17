@@ -61,7 +61,7 @@ async fn base_catalog_kind(kind: BackendKind) -> Option<(tempfile::TempDir, Arc<
 /// `gang_instance_freshness.rs`'s own helper.
 async fn force_stale_instance(catalog: &Catalog, instance_id: &str, ago: Duration) {
     let cutoff = (chrono::Utc::now() - chrono::Duration::from_std(ago).unwrap())
-        .format("%Y-%m-%dT%H:%M:%S%.9fZ")
+        .format("%Y-%m-%dT%H:%M:%S%.6fZ")
         .to_string();
     let instance_id = instance_id.to_string();
     catalog

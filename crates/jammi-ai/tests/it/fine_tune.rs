@@ -2613,7 +2613,7 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
         .transaction(TxOptions::default(), |tx| {
             Box::pin(async move {
                 tx.execute(
-                    "UPDATE jobs SET lease_expires_at = '2000-01-01T00:00:00Z' \
+                    "UPDATE jobs SET lease_expires_at = '2000-01-01T00:00:00.000000Z' \
                      WHERE job_id = $1",
                     &[SqlValue::TextOwned(force_job_id)],
                 )

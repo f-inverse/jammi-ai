@@ -781,7 +781,7 @@ fn record(id: &str, status: &str, heartbeat_at: String) -> ComputeExecutorRecord
 #[test]
 fn executor_is_live_table() {
     let now = chrono::Utc::now();
-    let stamp = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string();
+    let stamp = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
     let fresh = stamp(now);
     assert!(executor_is_live(&record("e", "Active", fresh.clone()), now));
     assert!(!executor_is_live(
@@ -794,7 +794,7 @@ fn executor_is_live_table() {
     let outside = stamp(now - executor_liveness_window() - chrono::Duration::seconds(1));
     assert!(!executor_is_live(&record("e", "Active", outside), now));
     assert!(!executor_is_live(
-        &record("e", "Active", "2026-01-01T00:00:00.000000000Z".into()),
+        &record("e", "Active", "2026-01-01T00:00:00.000000Z".into()),
         now
     ));
     assert!(!executor_is_live(
@@ -848,7 +848,7 @@ async fn terminating_and_stale_executors_are_never_bound() {
                 .upsert_compute_executor(&record(
                     &stale_id,
                     "Active",
-                    "2026-01-01T00:00:00.000000000Z".to_string(),
+                    "2026-01-01T00:00:00.000000Z".to_string(),
                 ))
                 .await
                 .unwrap();
@@ -910,7 +910,7 @@ async fn a_stale_cuda_row_never_admits_a_cuda_plan_at_the_submit_edge() {
         let mut stale = record(
             &stale_id,
             "Active",
-            "2026-01-01T00:00:00.000000000Z".to_string(),
+            "2026-01-01T00:00:00.000000Z".to_string(),
         );
         stale.devices = cuda.clone();
         catalog.upsert_compute_executor(&stale).await.unwrap();

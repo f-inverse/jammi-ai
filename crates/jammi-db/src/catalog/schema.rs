@@ -336,10 +336,17 @@ CREATE INDEX idx_eval_per_query_tenant ON _jammi_eval_per_query(tenant_id);
 /// are all tenant-pinned, so this matches existing behaviour. The
 /// `idx_topics_tenant` and `idx_topics_name` secondary indexes are recreated.
 ///
-/// `PRAGMA foreign_keys` is OFF inside the migration transaction (sqlx opens
-/// SQLite connections without it), so the temporary FK-less window during the
-/// table swap does not trip referential checks; the `backing_table` FK is
-/// restored on the rebuilt table.
+/// `PRAGMA foreign_keys` is ON for every connection this crate opens
+/// (`backend_sqlite.rs`'s `SqliteConnectOptions::foreign_keys(true)`),
+/// migration transaction included, so the rebuild's DROP of `topics`
+/// mid-transaction fires every `ON DELETE`/`ON UPDATE` action any OTHER
+/// table's FK declares against it — the `backing_table` FK this migration
+/// itself restores on the rebuilt table is unaffected (that reference points
+/// FROM `topics` TO `mutable_tables`, never the other way), but a future
+/// rebuild of a table something else references by FK must account for
+/// cascading actions firing during the swap, not assume a quiet FK-less
+/// window (the false premise a `v1` design for a different migration was
+/// refuted on).
 pub(super) const MIGRATION_012_TOPICS_TENANT_UNIQUE: &str = r#"
 CREATE TABLE topics_new (
     topic_id          TEXT PRIMARY KEY,
@@ -478,8 +485,11 @@ ALTER TABLE models ADD COLUMN artifact_path TEXT;
 /// same shape migration 012 uses for `topics`), preserving every other column,
 /// default, and the `model_id` FK. The secondary indexes
 /// (`model`, `type`, `created`, `tenant`) are recreated. `PRAGMA foreign_keys`
-/// is OFF inside the migration transaction, so the FK-less window during the
-/// swap does not trip referential checks.
+/// is ON for every connection this crate opens, migration transaction
+/// included (`backend_sqlite.rs`'s `SqliteConnectOptions::foreign_keys(true)`)
+/// — nothing else's FK references `eval_runs`, so this particular rebuild's
+/// DROP fires no cascading action, but that is a fact about `eval_runs`'
+/// referents, not a quiet FK-less window during the swap.
 pub(super) const MIGRATION_018_EVAL_RUNS_MODEL_ID_NULLABLE: &str = r#"
 CREATE TABLE eval_runs_new (
     run_id        TEXT PRIMARY KEY,
@@ -1378,4 +1388,526 @@ CREATE TABLE compute_jobs (
     updated_at TEXT NOT NULL
 );
 ALTER TABLE workers ADD COLUMN devices TEXT NOT NULL DEFAULT '[]';
+"#;
+
+/// Migration 039 (issues #585, #574; `catalog::lease`'s S1-S6) — the ONE
+/// canonical catalog stamp, enforced at the schema edge on both backends.
+///
+/// Every writer of a TEXT column holding an instant used to pick its own
+/// shape: SQLite leases (`lease.rs`'s `LEASE_TS_FORMAT`, six fraction
+/// digits), Postgres leases (the database's own `timestamptz`-cast-to-text
+/// rendering, DateStyle/TimeZone-dependent), instance/job app-clock stamps
+/// (the deleted `now_sortable()`, nine fraction digits, on EITHER backend —
+/// application code is backend-agnostic), and the `applied_migrations`
+/// ledger / `models` (`CAST(CURRENT_TIMESTAMP AS TEXT)`, a backend-native
+/// rendering distinct from all three). A reader-side fix cannot close this
+/// (SQLite's lexical stamp comparisons are only correct when every row
+/// shares one shape; a Postgres-side `col::timestamptz` cast faults the
+/// whole statement on one unreadable row). The writer is fixed instead
+/// (`catalog::lease::canonical_stamp_now` / `pg_canonical_stamp`, already
+/// the shape every writer produces going into this migration — see their
+/// call sites), and this migration (a) normalises every EXISTING value to
+/// that one shape and (b) enforces the domain going forward so a third
+/// shape can never reappear.
+///
+/// The universe (every TEXT column a reader compares, `catalog::lease`'s
+/// docs enumerate the readers): `jobs.{lease_expires_at,
+/// next_assembly_after, updated_at, created_at}`, `instances.{last_seen_at,
+/// started_at}`, `result_tables.{lease_expires_at, created_at}`,
+/// `result_table_versions.lease_expires_at`, `compute_executors.
+/// heartbeat_at`, `models.{created_at, updated_at}`, `applied_migrations.
+/// applied_at`. `models.updated_at` and `applied_migrations.applied_at` join
+/// the domain even though no SQL predicate compares them TODAY — one shape
+/// everywhere, not "one shape everywhere a predicate happens to read it".
+/// `compute_jobs.{queued_at, updated_at}`'s `queued_at` is a decimal epoch
+/// counter (`jammi-ballista/src/cluster.rs`), not this shape, at all — out
+/// of the universe entirely, a different domain. Every remaining `*_at`
+/// column (`sources`, `eval_runs`, `evidence_channels`,
+/// `evidence_channel_columns`, `mutable_tables`, `topics`, `index_segments`,
+/// `result_table_versions.created_at`/`completed_at`,
+/// `result_tables.completed_at`, `compute_jobs.updated_at`) keeps its
+/// schema `DEFAULT`/hand-rolled writer shape: no reader compares it (an
+/// `ORDER BY` or a `catalog::lease` helper), so its shape cannot corrupt an
+/// ordering or fault a sweep — verified by grep over every SQL string this
+/// crate authors, not assumed. The `fine_tune_jobs`/`training_jobs` lineage
+/// (migrations 001-016) is dead — migration 029 drops the table entirely
+/// after copying its rows into `jobs`, so there is no live column to
+/// enforce; the copied VALUES persist forward into `jobs.created_at`/
+/// `updated_at`, which this migration's `jobs` rewrite already covers.
+///
+/// SQLite (`MIGRATION_039_CANONICAL_STAMPS_SQLITE`): a `BEFORE INSERT` and a
+/// `BEFORE UPDATE OF <col>` trigger per column, installed FIRST — SQLite has
+/// no `ALTER TABLE ADD CONSTRAINT` and this crate does not rebuild tables to
+/// add one (`PRAGMA foreign_keys` is ON for every connection this crate
+/// opens, so a rebuild's DROP fires cascading FK actions against whatever
+/// else references the table — migration 012's/018's own docs, corrected in
+/// this same change). The triggers check SHAPE ONLY (`GLOB` over a
+/// digit-class pattern — SQLite has no calendar parser, so a month of `13`
+/// passes; `catalog::lease::LeaseFact::Undecodable` stays reachable for
+/// exactly this reason, see its docs). Then ONE `UPDATE … SET c = CASE …
+/// END` per column rewrites by shape: a nine-digit ISO fraction truncates to
+/// six; a space-separated, no-offset value (SQLite's own historical
+/// `CAST(CURRENT_TIMESTAMP AS TEXT)`, inherited by `jobs`/`applied_migrations`/
+/// `models` — SQLite never receives Postgres's own WITH-offset rendering,
+/// a separate installation) becomes `T`-separated with `.000000Z`; an
+/// already-canonical value is excluded by the `WHERE` and left untouched;
+/// anything else falls to the `CASE`'s `ELSE` arm — an identity assignment
+/// that still fires the `BEFORE UPDATE OF <col>` trigger (SQLite fires an
+/// UPDATE trigger because the column is named in `SET`, regardless of
+/// whether the value actually changes), which then refuses it by name —
+/// fail-closed, the ledger left at 038 (the transaction the migration runner
+/// wraps every migration and the ledger read in never reaches the
+/// `INSERT INTO applied_migrations` this migration's own entry needs), the
+/// row intact (`RAISE(ABORT, …)` undoes only the failing statement, and the
+/// runner's transaction is never committed once an `Err` propagates —
+/// `CatalogBackend::transaction`'s sqlx `Transaction` rolls back on drop
+/// without a commit).
+///
+/// Postgres (`MIGRATION_039_CANONICAL_STAMPS_POSTGRES`): the rewrite runs
+/// FIRST (there is no pre-installed enforcement to install ahead of it) —
+/// `UPDATE … SET c = to_char((…)::timestamptz AT TIME ZONE 'UTC', …)` per
+/// column, where the `CASE` inside truncates a nine-digit ISO fraction to
+/// six BEFORE the cast (`left(c, 26) || 'Z'`): `::timestamptz` ROUNDS a
+/// cast's fractional seconds to Postgres's native microsecond resolution
+/// rather than truncating, so an untruncated nine-digit value ending
+/// `.999999600Z` would silently roll into the NEXT second — a different
+/// instant than SQLite's own truncation-based rewrite produces for the
+/// identical seed. Every other shape (Postgres's own with-offset rendering,
+/// already at microsecond precision with an explicit, unambiguous zone) is
+/// cast directly with no truncation. A value the cast cannot parse or whose
+/// calendar fields are out of range faults the statement immediately
+/// (SQLSTATE `22007`/`22008`) — fail-closed by the backend itself, the same
+/// transactional guarantee as the SQLite arm, `BackendError::DomainViolation`
+/// naming neither table nor column for this specific fault class (`backend.
+/// rs`'s `classify` docs state the asymmetry). THEN `ALTER TABLE … ADD
+/// CONSTRAINT sdchk__<table>__<column> CHECK (…)` per column, validating
+/// every now-rewritten row: shape (the same regex the SQLite trigger's GLOB
+/// expresses) AND `::timestamptz` cast-validity, via a `CASE … END`
+/// expression rather than a bare `AND` — Postgres does not guarantee an
+/// `AND`'s operand evaluation order, so a bare `c ~ '…' AND c::timestamptz
+/// IS NOT NULL` could attempt the cast on shape-invalid text first and
+/// fault on the WRONG SQLSTATE for a shape refusal. The constraint name is
+/// `sdchk__<table>__<column>` (double-underscore separated: a table or
+/// column name may itself carry a single underscore —
+/// `result_table_versions`, `lease_expires_at` — which a single-underscore
+/// split could not place unambiguously) so `classify`'s domain-violation
+/// arm can recover which column refused a write without Postgres's own
+/// protocol naming one directly (`backend.rs::parse_domain_violation_
+/// constraint_name`).
+pub(super) const MIGRATION_039_CANONICAL_STAMPS_SQLITE: &str = r#"
+-- Install the schema-edge domain triggers FIRST (S3), then rewrite (S2):
+-- the rewrite's own UPDATEs are validated by these same triggers, so a
+-- legacy shape this migration cannot classify (the CASE's ELSE arm, an
+-- identity assignment) is refused by the UPDATE itself -- fail-closed,
+-- named by column, the ledger left at 038, the row intact.
+CREATE TRIGGER IF NOT EXISTS trg_jobs_lease_expires_at_canonical_ins
+BEFORE INSERT ON jobs
+WHEN NEW.lease_expires_at IS NOT NULL AND NEW.lease_expires_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'jobs.lease_expires_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_jobs_lease_expires_at_canonical_upd
+BEFORE UPDATE OF lease_expires_at ON jobs
+WHEN NEW.lease_expires_at IS NOT NULL AND NEW.lease_expires_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'jobs.lease_expires_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_jobs_next_assembly_after_canonical_ins
+BEFORE INSERT ON jobs
+WHEN NEW.next_assembly_after IS NOT NULL AND NEW.next_assembly_after NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'jobs.next_assembly_after: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_jobs_next_assembly_after_canonical_upd
+BEFORE UPDATE OF next_assembly_after ON jobs
+WHEN NEW.next_assembly_after IS NOT NULL AND NEW.next_assembly_after NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'jobs.next_assembly_after: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_jobs_updated_at_canonical_ins
+BEFORE INSERT ON jobs
+WHEN NEW.updated_at IS NOT NULL AND NEW.updated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'jobs.updated_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_jobs_updated_at_canonical_upd
+BEFORE UPDATE OF updated_at ON jobs
+WHEN NEW.updated_at IS NOT NULL AND NEW.updated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'jobs.updated_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_jobs_created_at_canonical_ins
+BEFORE INSERT ON jobs
+WHEN NEW.created_at IS NOT NULL AND NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'jobs.created_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_jobs_created_at_canonical_upd
+BEFORE UPDATE OF created_at ON jobs
+WHEN NEW.created_at IS NOT NULL AND NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'jobs.created_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_instances_last_seen_at_canonical_ins
+BEFORE INSERT ON instances
+WHEN NEW.last_seen_at IS NOT NULL AND NEW.last_seen_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'instances.last_seen_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_instances_last_seen_at_canonical_upd
+BEFORE UPDATE OF last_seen_at ON instances
+WHEN NEW.last_seen_at IS NOT NULL AND NEW.last_seen_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'instances.last_seen_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_instances_started_at_canonical_ins
+BEFORE INSERT ON instances
+WHEN NEW.started_at IS NOT NULL AND NEW.started_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'instances.started_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_instances_started_at_canonical_upd
+BEFORE UPDATE OF started_at ON instances
+WHEN NEW.started_at IS NOT NULL AND NEW.started_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'instances.started_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_result_tables_lease_expires_at_canonical_ins
+BEFORE INSERT ON result_tables
+WHEN NEW.lease_expires_at IS NOT NULL AND NEW.lease_expires_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'result_tables.lease_expires_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_result_tables_lease_expires_at_canonical_upd
+BEFORE UPDATE OF lease_expires_at ON result_tables
+WHEN NEW.lease_expires_at IS NOT NULL AND NEW.lease_expires_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'result_tables.lease_expires_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_result_tables_created_at_canonical_ins
+BEFORE INSERT ON result_tables
+WHEN NEW.created_at IS NOT NULL AND NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'result_tables.created_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_result_tables_created_at_canonical_upd
+BEFORE UPDATE OF created_at ON result_tables
+WHEN NEW.created_at IS NOT NULL AND NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'result_tables.created_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_result_table_versions_lease_expires_at_canonical_ins
+BEFORE INSERT ON result_table_versions
+WHEN NEW.lease_expires_at IS NOT NULL AND NEW.lease_expires_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'result_table_versions.lease_expires_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_result_table_versions_lease_expires_at_canonical_upd
+BEFORE UPDATE OF lease_expires_at ON result_table_versions
+WHEN NEW.lease_expires_at IS NOT NULL AND NEW.lease_expires_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'result_table_versions.lease_expires_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_compute_executors_heartbeat_at_canonical_ins
+BEFORE INSERT ON compute_executors
+WHEN NEW.heartbeat_at IS NOT NULL AND NEW.heartbeat_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'compute_executors.heartbeat_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_compute_executors_heartbeat_at_canonical_upd
+BEFORE UPDATE OF heartbeat_at ON compute_executors
+WHEN NEW.heartbeat_at IS NOT NULL AND NEW.heartbeat_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'compute_executors.heartbeat_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_models_created_at_canonical_ins
+BEFORE INSERT ON models
+WHEN NEW.created_at IS NOT NULL AND NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'models.created_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_models_created_at_canonical_upd
+BEFORE UPDATE OF created_at ON models
+WHEN NEW.created_at IS NOT NULL AND NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'models.created_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_models_updated_at_canonical_ins
+BEFORE INSERT ON models
+WHEN NEW.updated_at IS NOT NULL AND NEW.updated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'models.updated_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_models_updated_at_canonical_upd
+BEFORE UPDATE OF updated_at ON models
+WHEN NEW.updated_at IS NOT NULL AND NEW.updated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'models.updated_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_applied_migrations_applied_at_canonical_ins
+BEFORE INSERT ON applied_migrations
+WHEN NEW.applied_at IS NOT NULL AND NEW.applied_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'applied_migrations.applied_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_applied_migrations_applied_at_canonical_upd
+BEFORE UPDATE OF applied_at ON applied_migrations
+WHEN NEW.applied_at IS NOT NULL AND NEW.applied_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'applied_migrations.applied_at: not a canonical stamp');
+END;
+-- Data rewrite: nine-digit ISO -> truncate to six; space-separated (no
+-- offset -- SQLite never receives Postgres's own with-offset rendering,
+-- a separate installation) -> 'T' + '.000000Z'; already canonical ->
+-- excluded by the WHERE, untouched; anything else -> the CASE's identity
+-- ELSE arm, refused by the trigger above.
+UPDATE jobs SET lease_expires_at = CASE
+    WHEN lease_expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z' THEN substr(lease_expires_at,1,19) || substr(lease_expires_at,20,7) || 'Z'
+    WHEN lease_expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' THEN substr(lease_expires_at,1,10) || 'T' || substr(lease_expires_at,12,8) || '.000000Z'
+    ELSE lease_expires_at
+END
+WHERE lease_expires_at IS NOT NULL AND lease_expires_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z';
+UPDATE jobs SET next_assembly_after = CASE
+    WHEN next_assembly_after GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z' THEN substr(next_assembly_after,1,19) || substr(next_assembly_after,20,7) || 'Z'
+    WHEN next_assembly_after GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' THEN substr(next_assembly_after,1,10) || 'T' || substr(next_assembly_after,12,8) || '.000000Z'
+    ELSE next_assembly_after
+END
+WHERE next_assembly_after IS NOT NULL AND next_assembly_after NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z';
+UPDATE jobs SET updated_at = CASE
+    WHEN updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z' THEN substr(updated_at,1,19) || substr(updated_at,20,7) || 'Z'
+    WHEN updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' THEN substr(updated_at,1,10) || 'T' || substr(updated_at,12,8) || '.000000Z'
+    ELSE updated_at
+END
+WHERE updated_at IS NOT NULL AND updated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z';
+UPDATE jobs SET created_at = CASE
+    WHEN created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z' THEN substr(created_at,1,19) || substr(created_at,20,7) || 'Z'
+    WHEN created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' THEN substr(created_at,1,10) || 'T' || substr(created_at,12,8) || '.000000Z'
+    ELSE created_at
+END
+WHERE created_at IS NOT NULL AND created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z';
+UPDATE instances SET last_seen_at = CASE
+    WHEN last_seen_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z' THEN substr(last_seen_at,1,19) || substr(last_seen_at,20,7) || 'Z'
+    WHEN last_seen_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' THEN substr(last_seen_at,1,10) || 'T' || substr(last_seen_at,12,8) || '.000000Z'
+    ELSE last_seen_at
+END
+WHERE last_seen_at IS NOT NULL AND last_seen_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z';
+UPDATE instances SET started_at = CASE
+    WHEN started_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z' THEN substr(started_at,1,19) || substr(started_at,20,7) || 'Z'
+    WHEN started_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' THEN substr(started_at,1,10) || 'T' || substr(started_at,12,8) || '.000000Z'
+    ELSE started_at
+END
+WHERE started_at IS NOT NULL AND started_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z';
+UPDATE result_tables SET lease_expires_at = CASE
+    WHEN lease_expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z' THEN substr(lease_expires_at,1,19) || substr(lease_expires_at,20,7) || 'Z'
+    WHEN lease_expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' THEN substr(lease_expires_at,1,10) || 'T' || substr(lease_expires_at,12,8) || '.000000Z'
+    ELSE lease_expires_at
+END
+WHERE lease_expires_at IS NOT NULL AND lease_expires_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z';
+UPDATE result_tables SET created_at = CASE
+    WHEN created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z' THEN substr(created_at,1,19) || substr(created_at,20,7) || 'Z'
+    WHEN created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' THEN substr(created_at,1,10) || 'T' || substr(created_at,12,8) || '.000000Z'
+    ELSE created_at
+END
+WHERE created_at IS NOT NULL AND created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z';
+UPDATE result_table_versions SET lease_expires_at = CASE
+    WHEN lease_expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z' THEN substr(lease_expires_at,1,19) || substr(lease_expires_at,20,7) || 'Z'
+    WHEN lease_expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' THEN substr(lease_expires_at,1,10) || 'T' || substr(lease_expires_at,12,8) || '.000000Z'
+    ELSE lease_expires_at
+END
+WHERE lease_expires_at IS NOT NULL AND lease_expires_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z';
+UPDATE compute_executors SET heartbeat_at = CASE
+    WHEN heartbeat_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z' THEN substr(heartbeat_at,1,19) || substr(heartbeat_at,20,7) || 'Z'
+    WHEN heartbeat_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' THEN substr(heartbeat_at,1,10) || 'T' || substr(heartbeat_at,12,8) || '.000000Z'
+    ELSE heartbeat_at
+END
+WHERE heartbeat_at IS NOT NULL AND heartbeat_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z';
+UPDATE models SET created_at = CASE
+    WHEN created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z' THEN substr(created_at,1,19) || substr(created_at,20,7) || 'Z'
+    WHEN created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' THEN substr(created_at,1,10) || 'T' || substr(created_at,12,8) || '.000000Z'
+    ELSE created_at
+END
+WHERE created_at IS NOT NULL AND created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z';
+UPDATE models SET updated_at = CASE
+    WHEN updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z' THEN substr(updated_at,1,19) || substr(updated_at,20,7) || 'Z'
+    WHEN updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' THEN substr(updated_at,1,10) || 'T' || substr(updated_at,12,8) || '.000000Z'
+    ELSE updated_at
+END
+WHERE updated_at IS NOT NULL AND updated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z';
+UPDATE applied_migrations SET applied_at = CASE
+    WHEN applied_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z' THEN substr(applied_at,1,19) || substr(applied_at,20,7) || 'Z'
+    WHEN applied_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' THEN substr(applied_at,1,10) || 'T' || substr(applied_at,12,8) || '.000000Z'
+    ELSE applied_at
+END
+WHERE applied_at IS NOT NULL AND applied_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z';
+"#;
+
+/// The Postgres arm of migration 039 — see
+/// [`MIGRATION_039_CANONICAL_STAMPS_SQLITE`]'s docs for the shared design;
+/// this constant's own doc block states only what differs.
+pub(super) const MIGRATION_039_CANONICAL_STAMPS_POSTGRES: &str = r#"
+-- Rewrite FIRST (S2): a value this UPDATE cannot cast faults the statement
+-- (fail-closed by the backend itself, the value named in its own error) --
+-- there is no pre-installed enforcement to install ahead of it the way
+-- SQLite's triggers are. A nine-digit ISO fraction is TRUNCATED to six
+-- digits BEFORE the cast (never left to `::timestamptz`'s own rounding,
+-- which can carry the value into the next second): PostgreSQL rounds a
+-- cast's fractional seconds to its native microsecond resolution rather
+-- than truncating, so a value like `...:59.999999600Z` would silently
+-- become `...:00.000000Z` of the NEXT second one row apart from the SAME
+-- instant SQLite's own six-digit truncation preserves as `...:59.999999Z`
+-- -- explicit text truncation keeps both backends' migration converging on
+-- the identical canonical value for the identical nine-digit seed.
+-- Postgres's own with-offset rendering (`lease_expires_at`,
+-- `next_assembly_after`, `applied_at`, `models.created_at`/`updated_at`'s
+-- pre-039 `CAST(CURRENT_TIMESTAMP AS TEXT)`/`now()+interval` shapes) is
+-- ALREADY at microsecond precision with an explicit offset, so it casts
+-- directly with no truncation step and no ambiguity about which zone it
+-- names.
+UPDATE jobs SET lease_expires_at = to_char(
+    (CASE
+        WHEN lease_expires_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$' THEN (left(lease_expires_at, 26) || 'Z')
+        ELSE lease_expires_at
+    END)::timestamptz AT TIME ZONE 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+)
+WHERE lease_expires_at IS NOT NULL AND lease_expires_at !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$';
+UPDATE jobs SET next_assembly_after = to_char(
+    (CASE
+        WHEN next_assembly_after ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$' THEN (left(next_assembly_after, 26) || 'Z')
+        ELSE next_assembly_after
+    END)::timestamptz AT TIME ZONE 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+)
+WHERE next_assembly_after IS NOT NULL AND next_assembly_after !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$';
+UPDATE jobs SET updated_at = to_char(
+    (CASE
+        WHEN updated_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$' THEN (left(updated_at, 26) || 'Z')
+        ELSE updated_at
+    END)::timestamptz AT TIME ZONE 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+)
+WHERE updated_at IS NOT NULL AND updated_at !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$';
+UPDATE jobs SET created_at = to_char(
+    (CASE
+        WHEN created_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$' THEN (left(created_at, 26) || 'Z')
+        ELSE created_at
+    END)::timestamptz AT TIME ZONE 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+)
+WHERE created_at IS NOT NULL AND created_at !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$';
+UPDATE instances SET last_seen_at = to_char(
+    (CASE
+        WHEN last_seen_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$' THEN (left(last_seen_at, 26) || 'Z')
+        ELSE last_seen_at
+    END)::timestamptz AT TIME ZONE 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+)
+WHERE last_seen_at IS NOT NULL AND last_seen_at !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$';
+UPDATE instances SET started_at = to_char(
+    (CASE
+        WHEN started_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$' THEN (left(started_at, 26) || 'Z')
+        ELSE started_at
+    END)::timestamptz AT TIME ZONE 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+)
+WHERE started_at IS NOT NULL AND started_at !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$';
+UPDATE result_tables SET lease_expires_at = to_char(
+    (CASE
+        WHEN lease_expires_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$' THEN (left(lease_expires_at, 26) || 'Z')
+        ELSE lease_expires_at
+    END)::timestamptz AT TIME ZONE 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+)
+WHERE lease_expires_at IS NOT NULL AND lease_expires_at !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$';
+UPDATE result_tables SET created_at = to_char(
+    (CASE
+        WHEN created_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$' THEN (left(created_at, 26) || 'Z')
+        ELSE created_at
+    END)::timestamptz AT TIME ZONE 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+)
+WHERE created_at IS NOT NULL AND created_at !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$';
+UPDATE result_table_versions SET lease_expires_at = to_char(
+    (CASE
+        WHEN lease_expires_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$' THEN (left(lease_expires_at, 26) || 'Z')
+        ELSE lease_expires_at
+    END)::timestamptz AT TIME ZONE 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+)
+WHERE lease_expires_at IS NOT NULL AND lease_expires_at !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$';
+UPDATE compute_executors SET heartbeat_at = to_char(
+    (CASE
+        WHEN heartbeat_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$' THEN (left(heartbeat_at, 26) || 'Z')
+        ELSE heartbeat_at
+    END)::timestamptz AT TIME ZONE 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+)
+WHERE heartbeat_at IS NOT NULL AND heartbeat_at !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$';
+UPDATE models SET created_at = to_char(
+    (CASE
+        WHEN created_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$' THEN (left(created_at, 26) || 'Z')
+        ELSE created_at
+    END)::timestamptz AT TIME ZONE 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+)
+WHERE created_at IS NOT NULL AND created_at !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$';
+UPDATE models SET updated_at = to_char(
+    (CASE
+        WHEN updated_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$' THEN (left(updated_at, 26) || 'Z')
+        ELSE updated_at
+    END)::timestamptz AT TIME ZONE 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+)
+WHERE updated_at IS NOT NULL AND updated_at !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$';
+UPDATE applied_migrations SET applied_at = to_char(
+    (CASE
+        WHEN applied_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$' THEN (left(applied_at, 26) || 'Z')
+        ELSE applied_at
+    END)::timestamptz AT TIME ZONE 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+)
+WHERE applied_at IS NOT NULL AND applied_at !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$';
+-- The domain, enforced going forward (S3): shape-before-cast (a CASE, not
+-- a bare AND -- Postgres does not guarantee AND's operand evaluation order,
+-- so a bare `c ~ '...' AND c::timestamptz IS NOT NULL` could attempt the
+-- cast on shape-invalid text first).
+ALTER TABLE jobs ADD CONSTRAINT sdchk__jobs__lease_expires_at CHECK (
+    lease_expires_at IS NULL OR (CASE WHEN lease_expires_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$' THEN lease_expires_at::timestamptz IS NOT NULL ELSE false END)
+);
+ALTER TABLE jobs ADD CONSTRAINT sdchk__jobs__next_assembly_after CHECK (
+    next_assembly_after IS NULL OR (CASE WHEN next_assembly_after ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$' THEN next_assembly_after::timestamptz IS NOT NULL ELSE false END)
+);
+ALTER TABLE jobs ADD CONSTRAINT sdchk__jobs__updated_at CHECK (
+    updated_at IS NULL OR (CASE WHEN updated_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$' THEN updated_at::timestamptz IS NOT NULL ELSE false END)
+);
+ALTER TABLE jobs ADD CONSTRAINT sdchk__jobs__created_at CHECK (
+    created_at IS NULL OR (CASE WHEN created_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$' THEN created_at::timestamptz IS NOT NULL ELSE false END)
+);
+ALTER TABLE instances ADD CONSTRAINT sdchk__instances__last_seen_at CHECK (
+    last_seen_at IS NULL OR (CASE WHEN last_seen_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$' THEN last_seen_at::timestamptz IS NOT NULL ELSE false END)
+);
+ALTER TABLE instances ADD CONSTRAINT sdchk__instances__started_at CHECK (
+    started_at IS NULL OR (CASE WHEN started_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$' THEN started_at::timestamptz IS NOT NULL ELSE false END)
+);
+ALTER TABLE result_tables ADD CONSTRAINT sdchk__result_tables__lease_expires_at CHECK (
+    lease_expires_at IS NULL OR (CASE WHEN lease_expires_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$' THEN lease_expires_at::timestamptz IS NOT NULL ELSE false END)
+);
+ALTER TABLE result_tables ADD CONSTRAINT sdchk__result_tables__created_at CHECK (
+    created_at IS NULL OR (CASE WHEN created_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$' THEN created_at::timestamptz IS NOT NULL ELSE false END)
+);
+ALTER TABLE result_table_versions ADD CONSTRAINT sdchk__result_table_versions__lease_expires_at CHECK (
+    lease_expires_at IS NULL OR (CASE WHEN lease_expires_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$' THEN lease_expires_at::timestamptz IS NOT NULL ELSE false END)
+);
+ALTER TABLE compute_executors ADD CONSTRAINT sdchk__compute_executors__heartbeat_at CHECK (
+    heartbeat_at IS NULL OR (CASE WHEN heartbeat_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$' THEN heartbeat_at::timestamptz IS NOT NULL ELSE false END)
+);
+ALTER TABLE models ADD CONSTRAINT sdchk__models__created_at CHECK (
+    created_at IS NULL OR (CASE WHEN created_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$' THEN created_at::timestamptz IS NOT NULL ELSE false END)
+);
+ALTER TABLE models ADD CONSTRAINT sdchk__models__updated_at CHECK (
+    updated_at IS NULL OR (CASE WHEN updated_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$' THEN updated_at::timestamptz IS NOT NULL ELSE false END)
+);
+ALTER TABLE applied_migrations ADD CONSTRAINT sdchk__applied_migrations__applied_at CHECK (
+    applied_at IS NULL OR (CASE WHEN applied_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$' THEN applied_at::timestamptz IS NOT NULL ELSE false END)
+);
 "#;

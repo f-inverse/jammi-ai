@@ -180,7 +180,7 @@ async fn set_claim_policy(catalog: &Catalog, job_id: &str, priority: i64, claima
 /// dead process leaves behind (nothing heartbeats it any more).
 async fn force_stale_instance(catalog: &Catalog, instance_id: &str, days_ago: i64) {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(days_ago))
-        .format("%Y-%m-%dT%H:%M:%S%.9fZ")
+        .format("%Y-%m-%dT%H:%M:%S%.6fZ")
         .to_string();
     let instance_id = instance_id.to_string();
     catalog
@@ -1304,7 +1304,7 @@ async fn submit_job_deduped_accepts_a_key_exactly_at_the_bound(backend: BackendK
 
 async fn force_job_status_and_age(catalog: &Catalog, job_id: &str, status: &str, days_ago: i64) {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(days_ago))
-        .format("%Y-%m-%dT%H:%M:%S%.9fZ")
+        .format("%Y-%m-%dT%H:%M:%S%.6fZ")
         .to_string();
     let job_id = job_id.to_string();
     let status = status.to_string();

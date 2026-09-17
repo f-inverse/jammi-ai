@@ -755,7 +755,11 @@ mod tests {
             clause,
             "(lease_expires_at IS NULL OR lease_expires_at < $1)"
         );
-        assert_eq!(params.len(), 1, "one bind: canonical_stamp_now(), the app clock");
+        assert_eq!(
+            params.len(),
+            1,
+            "one bind: canonical_stamp_now(), the app clock"
+        );
     }
 
     #[test]
@@ -807,7 +811,11 @@ mod tests {
             expr,
             "((julianday(lease_expires_at) - julianday($1)) * 86400.0)"
         );
-        assert_eq!(params.len(), 1, "one bind: canonical_stamp_now(), the app clock");
+        assert_eq!(
+            params.len(),
+            1,
+            "one bind: canonical_stamp_now(), the app clock"
+        );
     }
 
     #[test]
@@ -846,7 +854,9 @@ mod tests {
         assert_eq!(clause, "updated_at < $1");
         assert_eq!(params.len(), 1);
         match &params[0] {
-            SqlValue::TextOwned(s) => assert_eq!(s.len(), canonical_stamp_now().len(), "fixed-width form"),
+            SqlValue::TextOwned(s) => {
+                assert_eq!(s.len(), canonical_stamp_now().len(), "fixed-width form")
+            }
             other => panic!("expected a TextOwned cutoff bind, got {other:?}"),
         }
     }

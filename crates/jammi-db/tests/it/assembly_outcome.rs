@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::jobs_repo::{AssemblyOutcome, SubmitJobParams, TrainingSetAssembly};
-use jammi_db::catalog::lease::lease_remaining_seconds_expr;
+use jammi_db::catalog::lease::{lease_remaining_seconds_expr, pg_canonical_stamp};
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
@@ -185,10 +185,13 @@ async fn set_next_assembly_after_offset(
             Box::pin(async move {
                 match kind {
                     BackendKind::Postgres => {
-                        tx.execute(
-                            "UPDATE jobs SET next_assembly_after = \
-                                 (now() + make_interval(secs => $1))::text \
+                        let sql = format!(
+                            "UPDATE jobs SET next_assembly_after = {} \
                              WHERE job_id = $2",
+                            pg_canonical_stamp("now() + make_interval(secs => $1)")
+                        );
+                        tx.execute(
+                            &sql,
                             &[
                                 SqlValue::Float(offset_secs as f64),
                                 SqlValue::TextOwned(job_id),

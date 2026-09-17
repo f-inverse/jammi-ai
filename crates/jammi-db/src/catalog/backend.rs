@@ -398,7 +398,6 @@ pub enum SqlNullType {
     Bytes,
 }
 
-
 /// Engine-owned parameter value. Backend impls translate to driver-native
 /// types in `bind_sqlite` / `bind_postgres`.
 #[derive(Debug, Clone)]
@@ -895,6 +894,25 @@ fn parse_domain_violation_message(detail: &str) -> (Option<String>, Option<Strin
     }
 }
 
+/// Postgres names a CHECK violation's constraint but not (reliably) a
+/// column at the protocol level, so this crate's own stamp-domain CHECK
+/// constraints are named `sdchk__<table>__<column>` — double-underscore
+/// separated, since a table or column name may itself contain a single
+/// underscore (`result_table_versions`, `lease_expires_at`), which a
+/// single-underscore split could not place unambiguously. `None` for a
+/// constraint name that is not in this shape (any OTHER check constraint —
+/// `execution IN (...)`, `training_set_ref`/`training_set_location`'s
+/// paired-nullability CHECK, `workers.state`'s vocabulary CHECK — is a
+/// different, pre-existing class this function never claims to parse).
+fn parse_domain_violation_constraint_name(name: &str) -> Option<(String, String)> {
+    let rest = name.strip_prefix("sdchk__")?;
+    let (table, column) = rest.split_once("__")?;
+    if table.is_empty() || column.is_empty() {
+        return None;
+    }
+    Some((table.to_string(), column.to_string()))
+}
+
 /// Classify a raw `sqlx::Error` into the engine-owned [`BackendError`]
 /// taxonomy. Constraint and retry detection rely on backend-specific
 /// `DatabaseError` flags exposed by sqlx.
@@ -908,22 +926,25 @@ pub fn classify(err: sqlx::Error) -> BackendError {
         Database(db_err) if db_err.code().as_deref() == Some("40001") => {
             BackendError::Retry(db_err.message().to_string())
         }
-        // Postgres `CHECK … canonical` (SQLSTATE 23514): `table()` is
-        // populated by the backend; this crate's own message shape carries
-        // `column` (Postgres does not attribute a CHECK violation to one
-        // column at the protocol level, so the message is the one reliable
-        // source — see `parse_domain_violation_message`).
+        // A `CHECK` violation (SQLSTATE 23514 on Postgres; SQLite never
+        // raises this class for the stamp domain — see the trigger arm
+        // below). Only this crate's OWN `sdchk__<table>__<column>` stamp-
+        // domain constraints parse a column (`parse_domain_violation_
+        // constraint_name`); any other CHECK constraint on the schema
+        // still classifies as `DomainViolation` (it IS a domain violation
+        // in the general sense) but with `column: None` — `table()` is
+        // Postgres's own protocol field, populated regardless.
         Database(db_err) if db_err.is_check_violation() => {
-            let message = db_err.message();
-            let (parsed_table, column) = parse_domain_violation_message(message);
+            let table = db_err.table().map(str::to_string);
+            let parsed = db_err
+                .constraint()
+                .and_then(parse_domain_violation_constraint_name);
             BackendError::DomainViolation {
-                table: db_err
-                    .table()
-                    .map(str::to_string)
-                    .or(parsed_table)
+                table: table
+                    .or_else(|| parsed.as_ref().map(|(t, _)| t.clone()))
                     .unwrap_or_else(|| "<unknown>".to_string()),
-                column,
-                detail: message.to_string(),
+                column: parsed.map(|(_, c)| c),
+                detail: db_err.message().to_string(),
             }
         }
         // SQLite `RAISE(ABORT, '<table>.<column>: not a canonical stamp')`
@@ -1001,6 +1022,66 @@ fn bind_postgres<'q>(
         SqlValue::Uuid(u) => q.bind(*u),
         SqlValue::Json(j) => q.bind(j.clone()),
         SqlValue::Timestamp(t) => q.bind(*t),
+    }
+}
+
+#[cfg(test)]
+mod domain_violation_parsing_tests {
+    use super::{parse_domain_violation_constraint_name, parse_domain_violation_message};
+
+    #[test]
+    fn message_shape_parses_table_and_column() {
+        assert_eq!(
+            parse_domain_violation_message("jobs.lease_expires_at: not a canonical stamp"),
+            (
+                Some("jobs".to_string()),
+                Some("lease_expires_at".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn message_shape_is_none_for_text_outside_the_shape() {
+        assert_eq!(
+            parse_domain_violation_message("some other trigger's ordinary message"),
+            (None, None)
+        );
+        assert_eq!(
+            parse_domain_violation_message("no-colon-at-all"),
+            (None, None)
+        );
+        assert_eq!(
+            parse_domain_violation_message(": leading colon"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn constraint_name_shape_parses_table_and_column_despite_internal_underscores() {
+        // Both the table and the column name carry an underscore of their
+        // own — a single-underscore split could not place the boundary
+        // unambiguously; the double-underscore separator can.
+        assert_eq!(
+            parse_domain_violation_constraint_name(
+                "sdchk__result_table_versions__lease_expires_at"
+            ),
+            Some((
+                "result_table_versions".to_string(),
+                "lease_expires_at".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn constraint_name_shape_is_none_for_an_unrelated_constraint() {
+        assert_eq!(
+            parse_domain_violation_constraint_name("workers_state_check"),
+            None
+        );
+        assert_eq!(
+            parse_domain_violation_constraint_name("sdchk__no_column"),
+            None
+        );
     }
 }
 

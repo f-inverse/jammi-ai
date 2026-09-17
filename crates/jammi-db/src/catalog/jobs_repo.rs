@@ -1527,11 +1527,12 @@ impl Catalog {
                                 "config_json": serde_json::Value::Null,
                             })
                             .to_string();
+                            let now = canonical_stamp_now();
                             tx.execute(
                                 "INSERT INTO models \
                                  (model_id, name, model_type, task, backend, version, \
-                                  status, metadata, artifact_path, tenant_id) \
-                                 VALUES ($1, $2, $3, $4, 'candle', 1, 'checkpoint', $5, $6, $7)",
+                                  status, metadata, artifact_path, tenant_id, created_at, updated_at) \
+                                 VALUES ($1, $2, $3, $4, 'candle', 1, 'checkpoint', $5, $6, $7, $8, $8)",
                                 &[
                                     SqlValue::TextOwned(pk),
                                     SqlValue::TextOwned(model_id),
@@ -1540,6 +1541,7 @@ impl Catalog {
                                     SqlValue::TextOwned(metadata),
                                     SqlValue::TextOwned(path),
                                     tenant_val.clone(),
+                                    SqlValue::TextOwned(now),
                                 ],
                             )
                             .await?;

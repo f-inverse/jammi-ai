@@ -3,10 +3,43 @@
 //! Backend-agnostic: works through [`CatalogBackend`].
 
 use super::backend::{BackendError, BackendKind, CatalogBackend, SqlValue, TxOptions};
+use super::lease::{canonical_stamp_now, pg_canonical_stamp};
 use super::schema;
 
+/// A migration's DDL text: [`Self::Same`] on both backends (every migration
+/// through `038`, and the overwhelming common case — SQLite and Postgres
+/// share enough SQL dialect that one text serves both), or
+/// [`Self::PerBackend`] where the two engines' dialects cannot be unified at
+/// all. `039_canonical_stamps` is the first of the latter: SQLite's
+/// schema-edge domain enforcement is a `CREATE TRIGGER … BEGIN … END`
+/// (SQLite's `ALTER TABLE` cannot add a constraint to an existing column,
+/// and this crate does not rebuild tables — `catalog::lease`'s S2 docs),
+/// Postgres's is `ALTER TABLE … ADD CONSTRAINT … CHECK (…)` (invalid syntax
+/// on SQLite) — there is no single SQL text valid, let alone correct, on
+/// both.
+enum MigrationSql {
+    Same(&'static str),
+    PerBackend {
+        sqlite: &'static str,
+        postgres: &'static str,
+    },
+}
+
+impl MigrationSql {
+    fn for_backend(&self, kind: BackendKind) -> &'static str {
+        match self {
+            MigrationSql::Same(sql) => sql,
+            MigrationSql::PerBackend { sqlite, postgres } => match kind {
+                BackendKind::Sqlite => sqlite,
+                BackendKind::Postgres => postgres,
+            },
+        }
+    }
+}
+
 /// Ordered list of migrations. Each entry's first element is the name
-/// recorded in `applied_migrations`; the second is the SQL DDL.
+/// recorded in `applied_migrations`; the second is the SQL DDL
+/// ([`MigrationSql`]).
 ///
 /// Entries are append-only: a new migration is appended; names are never
 /// renamed or reordered. The SQL itself may be edited only when the change
@@ -14,125 +47,125 @@ use super::schema;
 /// `DEFAULT` expression for a portable one that produces the same column
 /// type and constraint set. Any change that alters the schema shape (new
 /// column, dropped column, different constraint) belongs in a new migration.
-const MIGRATIONS: &[(&str, &str)] = &[
-    ("001_core_tables", schema::MIGRATION_001_CORE_TABLES),
-    ("002_result_tables", schema::MIGRATION_002_RESULT_TABLES),
-    ("003_eval_columns", schema::MIGRATION_003_EVAL_COLUMNS),
+const MIGRATIONS: &[(&str, MigrationSql)] = &[
+    ("001_core_tables", MigrationSql::Same(schema::MIGRATION_001_CORE_TABLES)),
+    ("002_result_tables", MigrationSql::Same(schema::MIGRATION_002_RESULT_TABLES)),
+    ("003_eval_columns", MigrationSql::Same(schema::MIGRATION_003_EVAL_COLUMNS)),
     (
         "004_drop_embedding_sets",
-        schema::MIGRATION_004_DROP_EMBEDDING_SETS,
+        MigrationSql::Same(schema::MIGRATION_004_DROP_EMBEDDING_SETS),
     ),
-    ("005_tenant_scope", schema::MIGRATION_005_TENANT_SCOPE),
-    ("006_channel_columns", schema::MIGRATION_006_CHANNEL_COLUMNS),
-    ("007_mutable_tables", schema::MIGRATION_007_MUTABLE_TABLES),
+    ("005_tenant_scope", MigrationSql::Same(schema::MIGRATION_005_TENANT_SCOPE)),
+    ("006_channel_columns", MigrationSql::Same(schema::MIGRATION_006_CHANNEL_COLUMNS)),
+    ("007_mutable_tables", MigrationSql::Same(schema::MIGRATION_007_MUTABLE_TABLES)),
     (
         "008_mutable_order_column",
-        schema::MIGRATION_008_MUTABLE_ORDER_COLUMN,
+        MigrationSql::Same(schema::MIGRATION_008_MUTABLE_ORDER_COLUMN),
     ),
-    ("009_topics", schema::MIGRATION_009_TOPICS),
+    ("009_topics", MigrationSql::Same(schema::MIGRATION_009_TOPICS)),
     (
         "010_rename_source_type_local_to_file",
-        schema::MIGRATION_010_RENAME_SOURCE_TYPE_LOCAL_TO_FILE,
+        MigrationSql::Same(schema::MIGRATION_010_RENAME_SOURCE_TYPE_LOCAL_TO_FILE),
     ),
-    ("011_eval_per_query", schema::MIGRATION_011_EVAL_PER_QUERY),
+    ("011_eval_per_query", MigrationSql::Same(schema::MIGRATION_011_EVAL_PER_QUERY)),
     (
         "012_topics_tenant_unique",
-        schema::MIGRATION_012_TOPICS_TENANT_UNIQUE,
+        MigrationSql::Same(schema::MIGRATION_012_TOPICS_TENANT_UNIQUE),
     ),
     (
         "013_result_table_kind",
-        schema::MIGRATION_013_RESULT_TABLE_KIND,
+        MigrationSql::Same(schema::MIGRATION_013_RESULT_TABLE_KIND),
     ),
-    ("014_bm25_channel", schema::MIGRATION_014_BM25_CHANNEL),
+    ("014_bm25_channel", MigrationSql::Same(schema::MIGRATION_014_BM25_CHANNEL)),
     (
         "015_fine_tune_job_queue",
-        schema::MIGRATION_015_FINE_TUNE_JOB_QUEUE,
+        MigrationSql::Same(schema::MIGRATION_015_FINE_TUNE_JOB_QUEUE),
     ),
     (
         "016_rename_training_jobs",
-        schema::MIGRATION_016_RENAME_TRAINING_JOBS,
+        MigrationSql::Same(schema::MIGRATION_016_RENAME_TRAINING_JOBS),
     ),
     (
         "017_model_artifact_path_column",
-        schema::MIGRATION_017_MODEL_ARTIFACT_PATH_COLUMN,
+        MigrationSql::Same(schema::MIGRATION_017_MODEL_ARTIFACT_PATH_COLUMN),
     ),
     (
         "018_eval_runs_model_id_nullable",
-        schema::MIGRATION_018_EVAL_RUNS_MODEL_ID_NULLABLE,
+        MigrationSql::Same(schema::MIGRATION_018_EVAL_RUNS_MODEL_ID_NULLABLE),
     ),
     (
         "019_normalize_model_status",
-        schema::MIGRATION_019_NORMALIZE_MODEL_STATUS,
+        MigrationSql::Same(schema::MIGRATION_019_NORMALIZE_MODEL_STATUS),
     ),
     (
         "020_channel_tenant_scope",
-        schema::MIGRATION_020_CHANNEL_TENANT_SCOPE,
+        MigrationSql::Same(schema::MIGRATION_020_CHANNEL_TENANT_SCOPE),
     ),
     (
         "021_materialization_contract",
-        schema::MIGRATION_021_MATERIALIZATION_CONTRACT,
+        MigrationSql::Same(schema::MIGRATION_021_MATERIALIZATION_CONTRACT),
     ),
     (
         "022_definition_hash_index",
-        schema::MIGRATION_022_DEFINITION_HASH_INDEX,
+        MigrationSql::Same(schema::MIGRATION_022_DEFINITION_HASH_INDEX),
     ),
     (
         "023_storage_precision",
-        schema::MIGRATION_023_STORAGE_PRECISION,
+        MigrationSql::Same(schema::MIGRATION_023_STORAGE_PRECISION),
     ),
-    ("024_claim_policy", schema::MIGRATION_024_CLAIM_POLICY),
-    ("025_index_segments", schema::MIGRATION_025_INDEX_SEGMENTS),
+    ("024_claim_policy", MigrationSql::Same(schema::MIGRATION_024_CLAIM_POLICY)),
+    ("025_index_segments", MigrationSql::Same(schema::MIGRATION_025_INDEX_SEGMENTS)),
     (
         "026_acceleration_report",
-        schema::MIGRATION_026_ACCELERATION_REPORT,
+        MigrationSql::Same(schema::MIGRATION_026_ACCELERATION_REPORT),
     ),
     (
         "027_result_table_lease",
-        schema::MIGRATION_027_RESULT_TABLE_LEASE,
+        MigrationSql::Same(schema::MIGRATION_027_RESULT_TABLE_LEASE),
     ),
     (
         "028_topics_next_offset",
-        schema::MIGRATION_028_TOPICS_NEXT_OFFSET,
+        MigrationSql::Same(schema::MIGRATION_028_TOPICS_NEXT_OFFSET),
     ),
     (
         "029_jobs_instances_workers",
-        schema::MIGRATION_029_JOBS_INSTANCES_WORKERS,
+        MigrationSql::Same(schema::MIGRATION_029_JOBS_INSTANCES_WORKERS),
     ),
     (
         "030_jobs_idempotency_key",
-        schema::MIGRATION_030_JOBS_IDEMPOTENCY_KEY,
+        MigrationSql::Same(schema::MIGRATION_030_JOBS_IDEMPOTENCY_KEY),
     ),
     (
         "031_jobs_releases_workers_state",
-        schema::MIGRATION_031_JOBS_RELEASES_WORKERS_STATE,
+        MigrationSql::Same(schema::MIGRATION_031_JOBS_RELEASES_WORKERS_STATE),
     ),
     (
         "032_result_table_versions",
-        schema::MIGRATION_032_RESULT_TABLE_VERSIONS,
+        MigrationSql::Same(schema::MIGRATION_032_RESULT_TABLE_VERSIONS),
     ),
     (
         "033_model_materialization",
-        schema::MIGRATION_033_MODEL_MATERIALIZATION,
+        MigrationSql::Same(schema::MIGRATION_033_MODEL_MATERIALIZATION),
     ),
     (
         "034_jobs_training_set_identity",
-        schema::MIGRATION_034_JOBS_TRAINING_SET_IDENTITY,
+        MigrationSql::Same(schema::MIGRATION_034_JOBS_TRAINING_SET_IDENTITY),
     ),
     (
         "035_instances_peer_addr_result_root",
-        schema::MIGRATION_035_INSTANCES_PEER_ADDR_RESULT_ROOT,
+        MigrationSql::Same(schema::MIGRATION_035_INSTANCES_PEER_ADDR_RESULT_ROOT),
     ),
     (
         "036_instances_result_root_identity",
-        schema::MIGRATION_036_INSTANCES_RESULT_ROOT_IDENTITY,
+        MigrationSql::Same(schema::MIGRATION_036_INSTANCES_RESULT_ROOT_IDENTITY),
     ),
     (
         "037_jobs_assembly_failures_next_after",
-        schema::MIGRATION_037_JOBS_ASSEMBLY_FAILURES_NEXT_AFTER,
+        MigrationSql::Same(schema::MIGRATION_037_JOBS_ASSEMBLY_FAILURES_NEXT_AFTER),
     ),
     (
         "038_compute_cluster_state",
-        schema::MIGRATION_038_COMPUTE_CLUSTER_STATE,
+        MigrationSql::Same(schema::MIGRATION_038_COMPUTE_CLUSTER_STATE),
     ),
 ];
 
@@ -218,7 +251,7 @@ pub(crate) async fn run<B: CatalogBackend + ?Sized>(backend: &B) -> Result<(), B
                 #[cfg(feature = "test-hooks")]
                 crate::store::mutable::test_hook::maybe_signal_migration_ledger_read(kind).await;
 
-                for (name, ddl) in MIGRATIONS {
+                for (name, sql) in MIGRATIONS {
                     if applied_set.contains(name) {
                         continue;
                     }
@@ -226,14 +259,35 @@ pub(crate) async fn run<B: CatalogBackend + ?Sized>(backend: &B) -> Result<(), B
                     // separated by `;`. sqlx's `execute()` for SQLite only
                     // runs the first statement; we split and run each in
                     // turn, inside the same transaction.
-                    for stmt in split_statements(ddl) {
+                    for stmt in split_statements(sql.for_backend(kind)) {
                         tx.execute(&stmt, &[]).await?;
                     }
-                    tx.execute(
-                        "INSERT INTO applied_migrations (name) VALUES ($1)",
-                        &[SqlValue::Text(name)],
-                    )
-                    .await?;
+                    // `applied_at` is explicitly bound in `CANONICAL_STAMP`
+                    // shape rather than left to the ledger's own
+                    // `DEFAULT CURRENT_TIMESTAMP` (a THIRD, backend-native
+                    // shape neither `catalog::lease` writer produces) —
+                    // migration `039_canonical_stamps` enforces this
+                    // column's domain exactly like every other in-class
+                    // `*_at` column, and the FIRST row it enforces against
+                    // is 039's own ledger entry, recorded by this same
+                    // statement a few lines below in the very same
+                    // transaction.
+                    match kind {
+                        BackendKind::Sqlite => {
+                            tx.execute(
+                                "INSERT INTO applied_migrations (name, applied_at) VALUES ($1, $2)",
+                                &[SqlValue::Text(name), SqlValue::TextOwned(canonical_stamp_now())],
+                            )
+                            .await?;
+                        }
+                        BackendKind::Postgres => {
+                            let sql = format!(
+                                "INSERT INTO applied_migrations (name, applied_at) VALUES ($1, {})",
+                                pg_canonical_stamp("now()")
+                            );
+                            tx.execute(&sql, &[SqlValue::Text(name)]).await?;
+                        }
+                    }
                 }
                 Ok(())
             })
@@ -364,7 +418,8 @@ mod split_statements_tests {
         // with a trigger body, where the two splitters legitimately diverge
         // (that is the whole point of R1) — asserting equality over it here
         // would contradict the very property `039`'s own tests pin.
-        for (name, ddl) in super::MIGRATIONS.iter().take(38) {
+        for (name, sql) in super::MIGRATIONS.iter().take(38) {
+            let ddl = sql.for_backend(super::BackendKind::Sqlite);
             assert_eq!(
                 split_statements(ddl),
                 naive_split(ddl),

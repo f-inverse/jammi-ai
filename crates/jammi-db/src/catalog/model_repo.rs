@@ -1,7 +1,7 @@
 use crate::catalog::backend::{
     BackendError, BackendKind, IsolationLevel, Row, SqlValue, Transaction, TxOptions,
 };
-use crate::catalog::lease::stale_before_clause;
+use crate::catalog::lease::{canonical_stamp_now, stale_before_clause};
 use crate::error::{JammiError, Result};
 use crate::model_task::ModelTask;
 use crate::tenant::TenantId;
@@ -167,6 +167,14 @@ impl Catalog {
         let backend = params.backend.to_string();
         let version = params.version as i64;
         let artifact_path = params.artifact_path.map(str::to_string);
+        // `models.created_at` is compared (`list_models`'s `ORDER BY
+        // created_at`) and `models.updated_at` joins the schema-edge
+        // enforced domain unconditionally (`catalog::lease`'s universe gate,
+        // R4) — both are bound explicitly, in `CANONICAL_STAMP` shape,
+        // rather than left to the schema's `DEFAULT (CAST(CURRENT_TIMESTAMP
+        // AS TEXT))` / a literal `CAST(CURRENT_TIMESTAMP AS TEXT)` in the SET
+        // clause, either of which renders a THIRD, backend-native shape.
+        let now = canonical_stamp_now();
 
         self.backend()
             .transaction(TxOptions::default(), |tx| {
@@ -174,15 +182,15 @@ impl Catalog {
                     tx.set_tenant(tenant);
                     tx.assert_tenant_matches(tenant, "models")?;
                     tx.execute(
-                        "INSERT INTO models (model_id, name, model_type, task, backend, version, status, metadata, artifact_path, tenant_id) \
-                         VALUES ($1, $2, $3, $4, $5, $6, 'registered', $7, $8, $9) \
+                        "INSERT INTO models (model_id, name, model_type, task, backend, version, status, metadata, artifact_path, tenant_id, created_at, updated_at) \
+                         VALUES ($1, $2, $3, $4, $5, $6, 'registered', $7, $8, $9, $10, $11) \
                          ON CONFLICT(model_id) DO UPDATE SET \
                              metadata = excluded.metadata, \
                              backend = excluded.backend, \
                              task = excluded.task, \
                              model_type = excluded.model_type, \
                              artifact_path = COALESCE(excluded.artifact_path, models.artifact_path), \
-                             updated_at = CAST(CURRENT_TIMESTAMP AS TEXT)",
+                             updated_at = excluded.updated_at",
                         &[
                             SqlValue::TextOwned(pk),
                             SqlValue::TextOwned(model_id),
@@ -193,6 +201,8 @@ impl Catalog {
                             SqlValue::TextOwned(metadata),
                             SqlValue::from(artifact_path),
                             SqlValue::from(tenant.map(|t| t.to_string())),
+                            SqlValue::TextOwned(now.clone()),
+                            SqlValue::TextOwned(now),
                         ],
                     )
                     .await?;

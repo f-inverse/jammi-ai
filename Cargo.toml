@@ -17,6 +17,7 @@ members = [
     "crates/jammi-test-utils",
     "crates/jammi-bench",
     "ci/tools/symbol-index",
+    "ci/tools/probed-ops-index",
 ]
 # jammi-python is a PyO3 cdylib — build via maturin, not cargo build --workspace
 # ci/tools/symbol-index is a CI-only, unpublished bin (a real syn AST index the
@@ -24,6 +25,11 @@ members = [
 # workspace member so `cargo run -p symbol-index` resolves against the SAME
 # lockfile every other crate does, but never in default-members: it is not
 # part of the product and must not slow down a bare `cargo build --workspace`.
+# ci/tools/probed-ops-index is the same CI-only shape, one dump of
+# jammi-kernels' own PROBED_OPS constant for
+# ci/scripts/perf/test_finetune_ab_disable_op_keys.py (wave-5 identity's
+# typed-op migration retired that script's own text scan of admit()/
+# admit_cascade() call sites — see this crate's own Cargo.toml description).
 default-members = [
     "crates/jammi-db",
     "crates/jammi-numerics",

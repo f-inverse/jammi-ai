@@ -1,0 +1,21 @@
+[package]
+name = "probed-ops-index"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "CI-only: dumps jammi_kernels::admission::PROBED_OPS's own registry/report keys as JSON -- the authoritative source ci/scripts/perf/test_finetune_ab_disable_op_keys.py reads its live standalone op-key set from. Wave-5 identity's typed-op migration (#546) made every admit()/admit_cascade() call site pass a typed &'static ProbedOp const rather than a bare string literal, so a text scan over source has nothing left at the call site to read the op key from -- PROBED_OPS's own `registry` field is, and was always meant to be, the single source of truth this tool exposes directly instead. Never a product crate, never published, never part of `cargo build --workspace`'s default members (mirrors ci/tools/symbol-index's own placement rationale exactly)."
+
+[[bin]]
+name = "probed-ops-index"
+path = "src/main.rs"
+
+[dependencies]
+# Path dependency on the real, in-tree crate -- this tool reads the SAME
+# `PROBED_OPS` constant every admit()/admit_cascade() call site in the
+# workspace is compiler-bound to, never a copy of its shape.
+jammi-kernels = { path = "../../../crates/jammi-kernels" }
+# Already resolved workspace-wide (jammi-db, jammi-ai, ci/tools/symbol-index
+# all depend on it); this crate adds no new package to Cargo.lock.
+serde_json.workspace = true

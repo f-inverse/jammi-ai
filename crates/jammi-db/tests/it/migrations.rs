@@ -3167,3 +3167,115 @@ async fn pg_canonical_stamp_is_independent_of_session_datestyle_and_timezone() {
          effect, so pg_canonical_stamp's invariance above is not a vacuous pass"
     );
 }
+
+/// GRAPH (#515) contracts/graph.md §4.6/§5 G8: a ledger-level source oracle.
+/// `jobs` is (or, once the still-held migration lands, will be) the FIRST FK
+/// PARENT in this schema, and `PRAGMA foreign_keys` is ON for the pool
+/// migrations run on (`backend_sqlite.rs`'s `.foreign_keys(true)`) — so a
+/// FUTURE migration that rebuilds `jobs` with this codebase's own canonical
+/// SQLite create-new/copy/DROP-old/RENAME idiom (schema.rs already uses it
+/// for `topics`, `eval_runs`, `evidence_channels`, `training_jobs`) would
+/// silently CASCADE-delete every row of any table that FK-references
+/// `jobs(job_id) ON DELETE CASCADE` the moment the old `jobs` table is
+/// dropped, unless that migration explicitly disables FK enforcement (or
+/// otherwise preserves the referencing rows) for the swap. No migration in
+/// `MIGRATIONS` does this today (verified by this test — 040's future
+/// `job_dependencies`/`job_ancestors` tables have not landed yet, and every
+/// EXISTING rebuild targets a different table); this oracle pins that state
+/// so a future migration cannot introduce the hazard unnoticed. Scoped by
+/// TABLE NAME, not substring: `training_jobs` (migration 029's own DROP) is
+/// a DIFFERENT table and must not false-positive.
+#[test]
+fn no_migration_text_rebuilds_the_jobs_table_without_a_stated_preserving_idiom() {
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/catalog/schema.rs"
+    ))
+    .expect("read schema.rs");
+
+    let forbidden = jobs_table_rebuild_hits(&source);
+    assert!(
+        forbidden.is_empty(),
+        "a migration text rebuilds (or renames away) the `jobs` table without a stated \
+         preserving idiom -- this can silently drop every FK-referencing row \
+         (job_dependencies/job_ancestors) once `jobs` is a FK parent under \
+         PRAGMA foreign_keys = ON: {forbidden:?}. Either this migration explicitly disables \
+         FK enforcement for the swap (documented in its own rustdoc, matching \
+         schema.rs:1438-1444's rule for 039) or the change belongs elsewhere."
+    );
+}
+
+/// Every line in `source` matching a `jobs`-table rebuild/rename shape,
+/// scoped to the EXACT table name (never a substring like `training_jobs`).
+fn jobs_table_rebuild_hits(source: &str) -> Vec<(usize, String)> {
+    let mut hits = Vec::new();
+    for (idx, line) in source.lines().enumerate() {
+        let has_drop_jobs = contains_word_pair(line, "DROP TABLE", "jobs");
+        let has_rename_to_jobs = contains_word_pair(line, "RENAME TO", "jobs");
+        let has_alter_jobs_rename = line.contains("ALTER TABLE jobs") && line.contains("RENAME");
+        if has_drop_jobs || has_rename_to_jobs || has_alter_jobs_rename {
+            hits.push((idx + 1, line.trim().to_string()));
+        }
+    }
+    hits
+}
+
+/// True when `line` contains `prefix` immediately followed by whitespace and
+/// EXACTLY the identifier `word` (not a longer identifier it is a suffix of
+/// — `training_jobs` must not match `word = "jobs"`).
+fn contains_word_pair(line: &str, prefix: &str, word: &str) -> bool {
+    let Some(pos) = line.find(prefix) else {
+        return false;
+    };
+    let rest = line[pos + prefix.len()..].trim_start();
+    let ident_end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    &rest[..ident_end] == word
+}
+
+#[cfg(test)]
+mod jobs_table_rebuild_hits_self_tests {
+    use super::{contains_word_pair, jobs_table_rebuild_hits};
+
+    #[test]
+    fn a_bare_drop_table_jobs_is_a_hit() {
+        assert_eq!(
+            jobs_table_rebuild_hits("DROP TABLE jobs;\n"),
+            vec![(1, "DROP TABLE jobs;".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_rename_to_jobs_is_a_hit() {
+        assert_eq!(
+            jobs_table_rebuild_hits("ALTER TABLE jobs_new RENAME TO jobs;\n"),
+            vec![(1, "ALTER TABLE jobs_new RENAME TO jobs;".to_string())]
+        );
+    }
+
+    /// The negative control naming the exact false-positive this scoping
+    /// exists to avoid: `training_jobs` is a DIFFERENT table.
+    #[test]
+    fn drop_table_training_jobs_is_not_a_hit() {
+        assert!(jobs_table_rebuild_hits("DROP TABLE training_jobs;\n").is_empty());
+    }
+
+    #[test]
+    fn rename_to_training_jobs_is_not_a_hit() {
+        assert!(
+            jobs_table_rebuild_hits("ALTER TABLE fine_tune_jobs RENAME TO training_jobs;\n")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn contains_word_pair_rejects_a_longer_identifier() {
+        assert!(!contains_word_pair(
+            "DROP TABLE training_jobs;",
+            "DROP TABLE",
+            "jobs"
+        ));
+        assert!(contains_word_pair("DROP TABLE jobs;", "DROP TABLE", "jobs"));
+    }
+}

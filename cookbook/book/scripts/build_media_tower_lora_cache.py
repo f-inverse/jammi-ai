@@ -783,6 +783,19 @@ def emit(server: GpuLiveServer, vision_checkpoint: str, audio_checkpoint: str, d
     (ARTIFACTS / "golden_metrics.json").write_text(
         json.dumps(metrics, indent=2, sort_keys=True))
 
+    # `db` is the audio tower's post-restart client (the last of the three
+    # `measure_tower` round trips, held open through the corrupt-rows
+    # measurement above) — never closed before this fix, so the LAST live
+    # client session outlived `server.stop()` and the caller's own
+    # `shutil.rmtree(artifact_dir)` right after it (issue #539's G5): the
+    # server process racing that rmtree with its catalog still nominally
+    # "connected to" is exactly the ordering this whole gate exists to rule
+    # out, even though this specific chain (mkdtemp -> constructor argument
+    # -> instance attribute -> a THIRD method's grpc endpoint string with no
+    # textual relationship to the removed path) is outside what this
+    # AST-only, intra-procedural gate can prove structurally (see the module
+    # docstring's "Known limits").
+    db.close()
     server.stop()
 
     # drop the working corpora + per-probe parquet scratch files — sources

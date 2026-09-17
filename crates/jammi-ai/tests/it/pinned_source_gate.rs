@@ -2443,8 +2443,8 @@ fn mask_non_code_ignores_comments_and_string_braces() {
 #[test]
 fn falsification_real_tokenizer_mask_handles_raw_strings_and_nested_comments() {
     let src = concat!(
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the real-tokenizer mask -- synthetic producer text, not real code in this file
         "/// a doc comment mentioning CREATE TABLE in prose\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn f() {\n",
         "    let raw = r#\"a \\\" quote, a // comment, and a /* block */ all inside\"#;\n",
         "    /* outer /* inner */ still-outer */\n",
@@ -4115,9 +4115,9 @@ fn ddl_literal_occurrences_are_all_reviewed() {
 fn falsification_module_level_const_ddl_is_detected() {
     let dir = repo_root();
     let source = concat!(
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the module-level const SQL DDL position -- synthetic producer text, not real code in this file
         "const PROBE_TABLE_DDL: &str = \"CREATE TABLE probe (id INT)\";\n",
         "\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn unrelated() {}\n",
     );
     let (hits, _unresolved) = ddl_hit_lines(&dir, source);
@@ -5120,7 +5120,6 @@ const FINE_TUNE_REACHABLE_SITES: &[ReviewedRegistrationSite] = &[
         function: "register_table",
         ordinal: 1,
         allowed: 1,
-        // kernel-oracles: fn-in-literal reviewed: the property string below names the literal shape `fn register_table(` in prose, describing a real declaration elsewhere in this file — not a fn-keyword desync in this line
         property: "already reviewed at REGISTRATION_VERB_SITES's own entry: this hit is the `fn \
                    register_table(` DECLARATION line -- the function ITSELF is the one \
                    bind_result_table/build_result_table_provider/install_result_schema chain \
@@ -5313,13 +5312,15 @@ fn reachable_contains_fn(graph: &CallGraph, reachable: &HashSet<usize>, name: &s
 /// fn-pointer `for_each` receives, never spelled as a call site of its own.
 #[test]
 fn falsification_fn_pointer_argument_edge_is_found() {
-    // kernel-oracles: fn-in-literal reviewed: falsification fixture for the fn-pointer-argument call-graph edge -- synthetic producer text fed to build_call_graph, not real code in this file
     let (graph, reachable) = probe_reachability(concat!(
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn caller(items: &[i32]) {\n",
         "    items.iter().for_each(|_| callee());\n",
         "    items.iter().for_each(direct_callee);\n",
         "}\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn direct_callee() {}\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn callee() {}\n",
     ));
     assert!(
@@ -5333,13 +5334,14 @@ fn falsification_fn_pointer_argument_edge_is_found() {
 /// `for_each(b)`, with a multi-segment path instead of a bare identifier.
 #[test]
 fn falsification_map_self_method_argument_edge_is_found() {
-    // kernel-oracles: fn-in-literal reviewed: falsification fixture for the map(Self::b) call-graph edge -- synthetic producer text fed to build_call_graph, not real code in this file
     let (graph, reachable) = probe_reachability(concat!(
         "struct S;\n",
         "impl S {\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "    fn caller(items: Vec<i32>) -> Vec<i32> {\n",
         "        items.into_iter().map(Self::b).collect()\n",
         "    }\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "    fn b(x: i32) -> i32 { x }\n",
         "}\n",
     ));
@@ -5354,11 +5356,12 @@ fn falsification_map_self_method_argument_edge_is_found() {
 /// ([`call_shaped_idents_in_tokens`]) can see it at all.
 #[test]
 fn falsification_call_inside_assert_macro_edge_is_found() {
-    // kernel-oracles: fn-in-literal reviewed: falsification fixture for the assert!(..) macro call-graph edge -- synthetic producer text fed to build_call_graph, not real code in this file
     let (graph, reachable) = probe_reachability(concat!(
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn caller() {\n",
         "    assert!(callee().is_ok());\n",
         "}\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn callee() -> Result<(), ()> { Ok(()) }\n",
     ));
     assert!(
@@ -5372,13 +5375,14 @@ fn falsification_call_inside_assert_macro_edge_is_found() {
 /// be found by the same raw token walk as the `assert!` case.
 #[test]
 fn falsification_call_inside_tokio_select_arm_edge_is_found() {
-    // kernel-oracles: fn-in-literal reviewed: falsification fixture for the tokio::select! arm call-graph edge -- synthetic producer text fed to build_call_graph, not real code in this file
     let (graph, reachable) = probe_reachability(concat!(
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "async fn caller() {\n",
         "    tokio::select! {\n",
         "        _ = callee() => {}\n",
         "    }\n",
         "}\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "async fn callee() {}\n",
     ));
     assert!(
@@ -5392,17 +5396,19 @@ fn falsification_call_inside_tokio_select_arm_edge_is_found() {
 /// the (synthetic, here single-file) binding surface.
 #[test]
 fn falsification_fn_pointer_struct_field_edge_is_found() {
-    // kernel-oracles: fn-in-literal reviewed: falsification fixture for the fn-pointer struct-field call-graph edge -- synthetic producer text fed to build_call_graph, not real code in this file
     let (graph, reachable) = probe_reachability(concat!(
         "struct Handlers {\n",
         "    f: fn(),\n",
         "}\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn make() -> Handlers {\n",
         "    Handlers { f: callee }\n",
         "}\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn caller(s: &Handlers) {\n",
         "    (s.f)();\n",
         "}\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn callee() {}\n",
     ));
     assert!(
@@ -5429,10 +5435,10 @@ fn falsification_unresolved_fn_pointer_field_call_fails_closed() {
     let surface = vec![(
         "crates/jammi-ai/src/fine_tune/__probe_unresolved_field__.rs".to_string(),
         concat!(
-            // kernel-oracles: fn-in-literal reviewed: falsification fixture for the unresolved fn-pointer field call finding -- synthetic producer text fed to build_call_graph, not real code in this file
             "struct Handlers {\n",
             "    f: fn(),\n",
             "}\n",
+            // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
             "fn caller(s: &Handlers) {\n",
             "    (s.f)();\n",
             "}\n",
@@ -5458,7 +5464,6 @@ fn falsification_macro_rules_template_binding_site_is_flagged() {
     let surface = vec![(
         "crates/jammi-ai/src/fine_tune/__probe_macro_rules__.rs".to_string(),
         concat!(
-            // kernel-oracles: fn-in-literal reviewed: falsification fixture for the macro_rules!-template binding-site finding -- synthetic producer text fed to build_call_graph, not real code in this file
             "macro_rules! register_probe_table {\n",
             "    ($ctx:expr, $name:expr, $provider:expr) => {\n",
             "        $ctx.register_table($name, $provider).unwrap();\n",
@@ -5487,8 +5492,10 @@ fn falsification_name_keyed_over_approximation_reports_a_new_same_named_binder()
     let (graph, reachable) = probe_reachability(concat!(
         // kernel-oracles: fn-in-literal reviewed: falsification fixture for name-keyed safe-direction over-approximation -- synthetic producer text fed to build_call_graph, not real code in this file
         "fn caller() { helper(); }\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn helper() {}\n",
         "mod other {\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "    pub fn helper() {}\n",
         "}\n",
     ));

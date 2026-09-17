@@ -839,7 +839,7 @@ def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
             "reliable ordering evidence (at least one has no non-empty, parseable, "
             "timezone-aware `ts`) -- the GOVERNING row is AMBIGUOUS; re-export with "
             "`lead-gate-lib.py --export-anticipation` (which stamps `ts`/`head_sha` on every "
-            "row since fix round 5) and commit the result (esc-lead-gate-R12 fix round 5 Z5)"
+            "row it emits) and commit the result (esc-lead-gate-R12)"
         )
         return
 

@@ -480,7 +480,8 @@ rm -rf "$SANDBOX/f1-artifact" "$F1_ORDER_LOG"
 # this suite runs in.
 for sig in TERM HUP; do
   F1_SIG_MARKER="$SANDBOX/f1-sig-${sig}.marker"
-  rm -f "$F1_SIG_MARKER"
+  F1_ARMED_MARKER="$SANDBOX/f1-armed-${sig}.marker"
+  rm -f "$F1_SIG_MARKER" "$F1_ARMED_MARKER"
   bash -c '
     source "'"$CLUSTER_SH"'"
     cluster_id=""
@@ -489,15 +490,21 @@ for sig in TERM HUP; do
     trap "_rpc_cleanup_cluster 129" HUP
     trap "_rpc_cleanup_cluster 130" INT
     trap "_rpc_cleanup_cluster 143" TERM
+    : > "'"$F1_ARMED_MARKER"'"   # the observed event the fixture waits on: every trap is registered
     sleep 30 &
     wait "$!"
   ' &
   driver_pid=$!
-  # Give the subshell a moment to reach the `wait` (its traps must be
-  # registered by then) before signalling it -- traps are registered as
-  # the very first thing this subshell does, well before the 30s sleep, so
-  # a short fixed wait is generous rather than a race.
-  sleep 0.5
+  # Signal only once the subshell has OBSERVABLY registered its traps (the
+  # armed marker), never after a fixed sleep: sourcing the driver takes
+  # longer than any guessed delay on a loaded machine, and a signal that
+  # lands before `trap` runs kills the subshell without the trap -- a
+  # false F1 failure that says nothing about the driver. The bound below
+  # is a generous backstop against a wedged machine, not the pace of the
+  # work.
+  armed_deadline=$((SECONDS + 60))
+  while [ ! -f "$F1_ARMED_MARKER" ] && kill -0 "$driver_pid" 2>/dev/null && [ "$SECONDS" -lt "$armed_deadline" ]; do sleep 0.05; done
+  [ -f "$F1_ARMED_MARKER" ] || bad "F1: the SIG${sig} fixture's subshell never reported its traps armed within 60s (a wedged machine, or the driver failed to source) -- refusing to read a missing cleanup marker as the driver's fault"
   kill "-${sig}" "$driver_pid" 2>/dev/null
   wait_deadline=$((SECONDS + 5))
   while kill -0 "$driver_pid" 2>/dev/null && [ "$SECONDS" -lt "$wait_deadline" ]; do sleep 0.1; done

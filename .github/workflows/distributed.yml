@@ -16,10 +16,20 @@ name: Distributed validation
 #
 #   * `chaos` — the SIGKILL crash-window tests (kill-9 reclaim, the
 #     publish/finalize crash, the cross-host artifact round-trip). These race a
-#     kill against an in-flight publish and stay timing-sensitive until a
-#     measured flake-free streak earns them promotion, so this leg keeps
-#     `continue-on-error: true` (`advisory: true`) to surface a red without
-#     blocking. Promote (flip `advisory` to false) after a flake-free streak.
+#     kill against an in-flight publish. Promoted off `advisory` (#500 wave 5
+#     E6): every observed red on this leg was `crash_between_publish_and_
+#     finalize_commits_only_the_winner` failing on a stale hand-built
+#     `winner_prefix` layout string that never accounted for the tenant-
+#     prefixed `_global` segment `5fef1ac8` added to `ArtifactStore::
+#     put_artifact` three months after this test was written — a
+#     deterministic, 100%-reproducible assertion mismatch (reproduced 3/3),
+#     never a genuine race against the SIGKILL timing window. Fixed at the
+#     root: the test now derives its expected prefix through `ArtifactStore::
+#     prefix_url` (the same function `put_artifact` itself lays a bundle out
+#     through), never a hand-built copy, and a mutation that reverts to the
+#     old hand-built string reproducibly reds it (verified 3/3 clean runs
+#     post-fix). This leg now runs WITHOUT `continue-on-error`
+#     (`advisory: false`), like `deterministic`.
 #
 #   * `ballista` — the compute-plane tests (three `jammi-server` processes
 #     hosting a Ballista scheduler and executors over the shared catalog: the
@@ -79,17 +89,15 @@ jobs:
             tests: >-
               one_job_n_workers_exactly_one_wins
               mixed_tenant_queue_completes_each_under_its_own_scope
-          # Advisory: the crash-window tests race a SIGKILL against an
-          # in-flight publish and stay timing-sensitive until a measured
-          # flake-free streak. A red result is visible but does not block.
-          # Promote (advisory: false) after a flake-free streak. The two
-          # `gang_chaos` rows SIGKILL one process of a two-rank gang (a peer,
-          # then the coordinator) and need the server's rank body for the
-          # cross-process gang to complete.
+          # Promoted off `advisory` (#500 wave 5 E6 — see this file's header
+          # comment for the root cause). The two `gang_chaos` rows SIGKILL
+          # one process of a two-rank gang (a peer, then the coordinator)
+          # and need the server's rank body for the cross-process gang to
+          # complete.
           - name: chaos
             display: SIGKILL crash-window chaos
             crate: jammi-ai
-            advisory: true
+            advisory: false
             tests: >-
               killed_worker_job_is_reclaimed_and_completed_once
               crash_between_publish_and_finalize_commits_only_the_winner

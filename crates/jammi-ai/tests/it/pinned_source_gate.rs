@@ -4383,3 +4383,1107 @@ fn falsification_removing_a_reviewed_entry_leaves_its_site_unreviewed() {
          found {found:?} against an empty allowlist"
     );
 }
+
+// ── #549 -- fine_tune/ reachability over the binding surface ───────────────
+//
+// The literal-occurrence gate above reviews every registration-verb/DDL
+// occurrence under SURFACE_DIRS UNCONDITIONALLY -- reachable from
+// `fine_tune/` or not. This section answers the narrower, harder question:
+// which of those reviewed sites can `fine_tune/` actually REACH, tracing
+// through every indirection shape a hand-rolled reachability sweep can miss
+// (a fn-pointer argument, a `Self::method` path handed to `.map(..)`, a call
+// buried inside `assert!`/`tokio::select!`, a fn-pointer struct field, a
+// `macro_rules!`-generated fn item)? A prior attempt at this (U2a fix round
+// 7, `call_graph_gate.rs`) was excised at fix round 8 after its own closing
+// audit #7 found it unsound on exactly these five call shapes and four DDL
+// positions -- this section's own fixtures are that same list, executed.
+//
+// **The universe is NOT jammi-ai's own (forward) dependency closure.**
+// `cargo metadata`'s FULL package graph (no `--no-deps`) is 697 packages,
+// 10.4M lines -- clearly the wrong universe -- and jammi-ai's forward
+// closure (the crates jammi-ai itself depends on) EXCLUDES the motivating
+// case entirely: `crates/jammi-bench/src/corpus.rs` depends ON jammi-ai (the
+// reverse direction), so its live `ctx.register_parquet(TableReference::bare(
+// format!("jammi.{table_name}")), ..)` call (also see this file's own
+// `falsification_registration_verb_scan_states_its_universe_honestly`,
+// above) is never IN jammi-ai's forward closure no matter how it is
+// computed. The universe this section actually needs is THE BINDING
+// SURFACE: every WORKSPACE member whose source can bind a table on a
+// session `fine_tune/` (or anything downstream of it) could also touch --
+// derived as the REVERSE-dependency closure of `jammi-db`/`jammi-ai` within
+// the workspace (a workspace member is in scope the moment ITS OWN forward
+// closure contains `jammi-db` or `jammi-ai`), from `cargo metadata
+// --no-deps`'s own `dependencies[].path` edges (a workspace-LOCAL dependency
+// always carries a `path`; an external registry/git dependency never does,
+// so third-party crates are excluded by construction -- no name-based filter
+// needed). Measured at this head via [`binding_surface_crates`]: 11 of the
+// workspace's 15 members (`jammi-admin`, `jammi-ai`, `jammi-ballista`,
+// `jammi-bench`, `jammi-cli`, `jammi-client`, `jammi-db`, `jammi-python`,
+// `jammi-server`, `jammi-test-utils`, `jammi-wire`), 337 tracked `.rs` files
+// under their `src/` trees.
+//
+// **Soundness posture: safe-direction over-approximation, name-keyed.**
+// Every edge below is keyed by NAME, never by a resolved type -- two
+// unrelated functions sharing a name are treated as ONE reachability target,
+// so a call this graph cannot actually prove distinct is still followed (a
+// FALSE reachable is the safe direction; a false NOT-reachable is the
+// failure mode this whole rebuild exists to close). Two shapes this section
+// cannot resolve BY NAME are handled by FAILING CLOSED instead, per G2:  a
+// fn-pointer struct field call `(s.f)(ctx)` is resolved by finding every
+// site anywhere in the binding surface that assigns a value into a field of
+// that SAME name (also name-keyed) -- if NONE exists, the call is reported
+// UNRESOLVED and the gate refuses to pass rather than silently treating it
+// as a dead end; a `macro_rules!` definition whose OWN template body
+// contains a registration-verb call shape or a DDL-shaped literal is a
+// NAMED, unconditional finding (never traced through expansion, since the
+// generated function's NAME is a macro metavariable resolved only per
+// invocation site) that the gate also refuses to pass silently.
+
+/// Every workspace member (name only) whose OWN forward path-dependency
+/// closure contains `jammi-ai` or `jammi-db` -- see the module comment
+/// above for why this is the reverse-, not forward-, dependency closure, and
+/// why it is derived from `cargo metadata --no-deps` rather than the full
+/// (`--no-deps`-less) package graph.
+fn binding_surface_crates() -> Vec<String> {
+    let root = repo_root();
+    let manifest = root.join("Cargo.toml");
+    let output = Command::new("cargo")
+        .args([
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--manifest-path",
+        ])
+        .arg(&manifest)
+        .output()
+        .expect("spawn cargo metadata --no-deps");
+    assert!(
+        output.status.success(),
+        "cargo metadata --no-deps failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("cargo metadata --no-deps must produce valid JSON");
+    let packages = parsed["packages"]
+        .as_array()
+        .expect("cargo metadata output has a top-level `packages` array");
+
+    // name -> its own DIRECT workspace-local (a `path`-carrying dependency
+    // entry always denotes a workspace-local crate; an external registry/git
+    // dependency never carries a `path`) dependency names.
+    let mut direct: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut all_names: Vec<String> = Vec::new();
+    for pkg in packages {
+        let name = pkg["name"]
+            .as_str()
+            .expect("package name is a string")
+            .to_string();
+        all_names.push(name.clone());
+        let deps = pkg["dependencies"]
+            .as_array()
+            .expect("package dependencies is an array")
+            .iter()
+            .filter(|d| !d["path"].is_null())
+            .map(|d| {
+                d["name"]
+                    .as_str()
+                    .expect("dependency name is a string")
+                    .to_string()
+            })
+            .filter(|d| d != &name)
+            .collect();
+        direct.insert(name, deps);
+    }
+
+    let forward_closure = |start: &str| -> HashSet<String> {
+        let mut seen = HashSet::new();
+        let mut stack = vec![start.to_string()];
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n.clone()) {
+                continue;
+            }
+            for d in direct.get(&n).into_iter().flatten() {
+                if !seen.contains(d) {
+                    stack.push(d.clone());
+                }
+            }
+        }
+        seen
+    };
+
+    let mut reverse: Vec<String> = all_names
+        .into_iter()
+        .filter(|n| {
+            let closure = forward_closure(n);
+            closure.contains("jammi-ai") || closure.contains("jammi-db")
+        })
+        .collect();
+    reverse.sort();
+    reverse
+}
+
+/// The `(repo-relative path, source text)` surface [`build_call_graph`] and
+/// [`fine_tune_reachable_sites_are_all_reviewed`] scan: every tracked `.rs`
+/// file under `src/` of every [`binding_surface_crates`] entry -- the WHOLE
+/// binding surface, not just [`SURFACE_DIRS`] (the narrower pair
+/// [`registration_verb_occurrences_are_all_reviewed`]/
+/// [`ddl_literal_occurrences_are_all_reviewed`] review).
+fn binding_surface() -> Vec<(String, String)> {
+    let root = repo_root();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for krate in binding_surface_crates() {
+        let dir = format!("crates/{krate}/src");
+        let files = tracked_rs_files(&root, &dir);
+        assert!(
+            !files.is_empty(),
+            "git ls-files -- {dir} returned no tracked .rs files"
+        );
+        for rel in files {
+            assert!(
+                seen.insert(rel.clone()),
+                "{rel} tracked twice across the binding surface"
+            );
+            let text = std::fs::read_to_string(root.join(&rel))
+                .unwrap_or_else(|e| panic!("{rel} is git-tracked but could not be read ({e})"));
+            out.push((rel, text));
+        }
+    }
+    out
+}
+
+/// One `fn`-like item (free fn, inherent/trait `impl` method, or a trait's
+/// own declaration) found anywhere in [`binding_surface`] by a REAL parse
+/// (`syn::parse_file`, never text/regex) -- a call-graph NODE.
+struct GraphFn {
+    file: String,
+    name: String,
+    ordinal: usize,
+    line: usize,
+}
+
+/// A name-keyed call graph over [`binding_surface`] (see the module comment
+/// above for the soundness posture) plus the two residual, fail-closed
+/// findings sets [`build_call_graph`] could not resolve into edges at all.
+struct CallGraph {
+    nodes: Vec<GraphFn>,
+    by_name: std::collections::HashMap<String, Vec<usize>>,
+    /// node index -> the set of NAMES its body calls, in the edge-shape
+    /// sense the module comment lists (direct/method/UFCS call, a bare path
+    /// handed to a call as an argument, a name found inside any macro
+    /// invocation's token stream in call position).
+    calls: std::collections::HashMap<usize, BTreeSet<String>>,
+    /// `(file, line, field name)` for every `(EXPR.field)(..)` call site this
+    /// graph COULD resolve (every RHS ever assigned to a field of that name
+    /// anywhere in the binding surface) -- human-readable, always populated
+    /// (even when resolved), so a reader can audit every one, not merely the
+    /// failures.
+    field_ptr_findings: Vec<String>,
+    /// `(file, line, field name)` for every `(EXPR.field)(..)` call site this
+    /// graph could NOT resolve (no assignment to that field name found
+    /// anywhere) -- [`fine_tune_reachable_sites_are_all_reviewed`] fails
+    /// closed whenever this is non-empty.
+    unresolved_field_ptr_sites: Vec<String>,
+    /// `(file, line, macro name)` for every `macro_rules!` DEFINITION whose
+    /// own template body contains a registration-verb call shape or a
+    /// DDL-shaped literal -- [`fine_tune_reachable_sites_are_all_reviewed`]
+    /// fails closed whenever this is non-empty (see the module comment for
+    /// why this can never be resolved into an ordinary edge).
+    macro_rules_findings: Vec<String>,
+}
+
+/// Strip `Paren`/`Reference`/`Group` wrappers to reach the expression a
+/// caller actually cares about -- `(b)`, `&b`, and `b` must all be seen as
+/// the same bare path `b` when it is handed to a call as an argument.
+fn unwrap_trivial(e: &syn::Expr) -> &syn::Expr {
+    match e {
+        syn::Expr::Paren(p) => unwrap_trivial(&p.expr),
+        syn::Expr::Reference(r) => unwrap_trivial(&r.expr),
+        syn::Expr::Group(g) => unwrap_trivial(&g.expr),
+        _ => e,
+    }
+}
+
+/// Every NAME this graph treats as "called" inside a macro invocation's raw
+/// token stream (recursing into every [`proc_macro2::Group`]): an `Ident`
+/// token immediately followed by a `(`-delimited [`proc_macro2::Group`]
+/// (`b(ctx)`, the `assert!(b(ctx).is_ok())`/`tokio::select!` arm shape) or
+/// immediately preceded by a `.` or `:` [`proc_macro2::Punct`] (`.b(`/`::b(`
+/// -- also catches a qualified path used as a bare value, `Self::b`, the
+/// same shape [`FileGraphBuilder::visit_expr_call`]'s argument scan handles
+/// for a NON-macro call site). A macro's `tokens` are opaque to `syn`'s
+/// typed AST, so this is the only way any of these three shapes inside a
+/// macro invocation are ever seen at all.
+fn call_shaped_idents_in_tokens(ts: proc_macro2::TokenStream) -> Vec<String> {
+    let mut out = Vec::new();
+    let toks: Vec<proc_macro2::TokenTree> = ts.into_iter().collect();
+    for (i, tt) in toks.iter().enumerate() {
+        match tt {
+            proc_macro2::TokenTree::Ident(id) => {
+                let followed_by_paren = matches!(
+                    toks.get(i + 1),
+                    Some(proc_macro2::TokenTree::Group(g))
+                        if g.delimiter() == proc_macro2::Delimiter::Parenthesis
+                );
+                let preceded_by_dot_or_colon = i > 0
+                    && matches!(
+                        &toks[i - 1],
+                        proc_macro2::TokenTree::Punct(p) if p.as_char() == '.' || p.as_char() == ':'
+                    );
+                if followed_by_paren || preceded_by_dot_or_colon {
+                    out.push(id.to_string());
+                }
+            }
+            proc_macro2::TokenTree::Group(g) => {
+                out.extend(call_shaped_idents_in_tokens(g.stream()))
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether `tokens` (a `macro_rules!` DEFINITION's own body -- every match
+/// arm and its expansion template, not one specific invocation) contains a
+/// registration-verb call shape or a DDL-shaped literal ANYWHERE -- see the
+/// module comment for why this can never be traced through to a specific
+/// generated function without expanding the macro, and so is reported as an
+/// unconditional, named finding instead.
+fn macro_rules_template_is_a_binding_site(tokens: proc_macro2::TokenStream) -> bool {
+    let idents = call_shaped_idents_in_tokens(tokens.clone());
+    let verb_hit = PAIRED_REGISTRATION_VERBS
+        .iter()
+        .chain(UNPAIRED_REGISTRATION_VERBS)
+        .any(|verb| idents.iter().any(|id| id == &format!("register_{verb}")));
+    if verb_hit {
+        return true;
+    }
+    string_literals_in_tokens(tokens)
+        .into_iter()
+        .any(|lit| ddl_statement_shape(&lit.value()))
+}
+
+/// Per-file accumulator [`build_call_graph`] drives with `syn::visit::Visit`
+/// over ONE file's parsed AST; every field is relative to THIS file only
+/// (`build_call_graph` offsets `fn_names_in_order`'s indices by the running
+/// node count once the walk finishes, and reassigns ordinals the same way
+/// [`assign_ordinals`] does -- per file, by declaration order -- so the
+/// resulting `(file, name, ordinal)` triples key into the SAME space
+/// [`registration_verb_occurrences`]/[`ddl_literal_occurrences`] already
+/// use).
+#[derive(Default)]
+struct FileGraphBuilder {
+    fn_names_in_order: Vec<String>,
+    fn_lines: Vec<usize>,
+    calls: Vec<BTreeSet<String>>,
+    /// `(fn index into fn_names_in_order, field name, line)` for every
+    /// `(EXPR.field)(..)` call site found in this file.
+    field_ptr_sites: Vec<(usize, String, usize)>,
+    /// `(field name, target name)` for every place in this file that
+    /// assigns a bare path value into a field of that name (a struct-literal
+    /// field-init or a plain `x.field = path;` assignment).
+    field_assignments: Vec<(String, String)>,
+    /// `(line, macro name)` for every `macro_rules!` definition in this file
+    /// whose template body is itself a registration/DDL binding site.
+    macro_rules_findings: Vec<(usize, String)>,
+    /// Stack of `fn_names_in_order` indices; the top is the innermost
+    /// enclosing NAMED function a visited expression attributes to (a
+    /// closure has no name of its own, so its calls attribute to whichever
+    /// named `fn` encloses it).
+    current: Vec<usize>,
+}
+
+impl FileGraphBuilder {
+    fn enter_fn(&mut self, name: String, line: usize) {
+        let idx = self.fn_names_in_order.len();
+        self.fn_names_in_order.push(name);
+        self.fn_lines.push(line);
+        self.calls.push(BTreeSet::new());
+        self.current.push(idx);
+    }
+
+    fn exit_fn(&mut self) {
+        self.current.pop();
+    }
+
+    fn add_call_edge(&mut self, name: String) {
+        if let Some(&idx) = self.current.last() {
+            self.calls[idx].insert(name);
+        }
+    }
+
+    fn record_field_ptr_site(&mut self, field: String, line: usize) {
+        if let Some(&idx) = self.current.last() {
+            self.field_ptr_sites.push((idx, field, line));
+        }
+    }
+
+    /// Every direct ARGUMENT of a call/method-call that is (after unwrapping
+    /// `Paren`/`Reference`/`Group`) a bare `Expr::Path` -- the `for_each(b)`
+    /// and `.map(Self::b)` edge shapes G8 requires, handled uniformly since
+    /// neither is anything more than "a path expression sitting directly in
+    /// argument position", regardless of how many segments the path has.
+    fn record_path_arguments(
+        &mut self,
+        args: &syn::punctuated::Punctuated<syn::Expr, syn::token::Comma>,
+    ) {
+        for arg in args {
+            if let syn::Expr::Path(p) = unwrap_trivial(arg) {
+                if let Some(last) = p.path.segments.last() {
+                    self.add_call_edge(last.ident.to_string());
+                }
+            }
+        }
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for FileGraphBuilder {
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        self.enter_fn(
+            node.sig.ident.to_string(),
+            node.sig.ident.span().start().line,
+        );
+        syn::visit::visit_item_fn(self, node);
+        self.exit_fn();
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        self.enter_fn(
+            node.sig.ident.to_string(),
+            node.sig.ident.span().start().line,
+        );
+        syn::visit::visit_impl_item_fn(self, node);
+        self.exit_fn();
+    }
+
+    fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+        self.enter_fn(
+            node.sig.ident.to_string(),
+            node.sig.ident.span().start().line,
+        );
+        syn::visit::visit_trait_item_fn(self, node);
+        self.exit_fn();
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        match unwrap_trivial(&node.func) {
+            syn::Expr::Path(p) => {
+                if let Some(last) = p.path.segments.last() {
+                    self.add_call_edge(last.ident.to_string());
+                }
+            }
+            syn::Expr::Field(f) => {
+                // `(s.f)(ctx)` -- a fn-pointer/closure stored in a struct
+                // field, called through it. This scanner cannot know WHICH
+                // function was ever assigned there without a second,
+                // whole-surface pass (`build_call_graph`'s field-pointer
+                // resolution, below); recorded here, resolved there.
+                if let syn::Member::Named(ident) = &f.member {
+                    self.record_field_ptr_site(ident.to_string(), f.dot_token.span.start().line);
+                }
+            }
+            _ => {}
+        }
+        self.record_path_arguments(&node.args);
+        syn::visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        self.add_call_edge(node.method.to_string());
+        self.record_path_arguments(&node.args);
+        syn::visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+        for fv in &node.fields {
+            if let syn::Member::Named(ident) = &fv.member {
+                if let syn::Expr::Path(p) = unwrap_trivial(&fv.expr) {
+                    if let Some(last) = p.path.segments.last() {
+                        self.field_assignments
+                            .push((ident.to_string(), last.ident.to_string()));
+                    }
+                }
+            }
+        }
+        syn::visit::visit_expr_struct(self, node);
+    }
+
+    fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
+        if let syn::Expr::Field(f) = unwrap_trivial(&node.left) {
+            if let syn::Member::Named(ident) = &f.member {
+                if let syn::Expr::Path(p) = unwrap_trivial(&node.right) {
+                    if let Some(last) = p.path.segments.last() {
+                        self.field_assignments
+                            .push((ident.to_string(), last.ident.to_string()));
+                    }
+                }
+            }
+        }
+        syn::visit::visit_expr_assign(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        if node.path.is_ident("macro_rules") {
+            // The definition's own template body, checked directly -- see
+            // the module comment for why this is an unconditional finding,
+            // never an edge.
+            if macro_rules_template_is_a_binding_site(node.tokens.clone()) {
+                let name = node
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                let line = node
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.span().start().line)
+                    .unwrap_or(0);
+                self.macro_rules_findings.push((line, name));
+            }
+        } else {
+            for name in call_shaped_idents_in_tokens(node.tokens.clone()) {
+                self.add_call_edge(name);
+            }
+        }
+        syn::visit::visit_macro(self, node);
+    }
+}
+
+/// Builds the whole-surface [`CallGraph`] over `surface`: one
+/// [`FileGraphBuilder`] walk per file, ordinals reassigned per file
+/// (matching [`assign_ordinals`]'s own discipline exactly -- checked
+/// directly by [`syn_fn_ordinals_match_hand_rolled_regions`], below), then a
+/// SECOND pass resolving every fn-pointer field-call site now that
+/// `field_assignments` is complete across the WHOLE surface (a field can be
+/// assigned in one file and called through in another).
+fn build_call_graph(surface: &[(String, String)]) -> CallGraph {
+    let mut nodes: Vec<GraphFn> = Vec::new();
+    let mut calls: std::collections::HashMap<usize, BTreeSet<String>> =
+        std::collections::HashMap::new();
+    let mut field_assignments: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut field_ptr_sites: Vec<(usize, String, String)> = Vec::new();
+    let mut macro_rules_findings = Vec::new();
+
+    for (file, text) in surface {
+        let parsed = syn::parse_file(text).unwrap_or_else(|e| {
+            panic!(
+                "build_call_graph: syn could not parse {file} ({e}) -- refusing to build an \
+                 unsound graph over unparsed source"
+            )
+        });
+        let mut builder = FileGraphBuilder::default();
+        syn::visit::Visit::visit_file(&mut builder, &parsed);
+
+        let base = nodes.len();
+        let mut per_name_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for (i, name) in builder.fn_names_in_order.iter().enumerate() {
+            let counter = per_name_counts.entry(name.clone()).or_insert(0);
+            *counter += 1;
+            nodes.push(GraphFn {
+                file: file.clone(),
+                name: name.clone(),
+                ordinal: *counter,
+                line: builder.fn_lines[i],
+            });
+        }
+        for (i, edges) in builder.calls.into_iter().enumerate() {
+            calls.insert(base + i, edges);
+        }
+        for (fn_idx, field, line) in builder.field_ptr_sites {
+            field_ptr_sites.push((base + fn_idx, field, format!("{file}:{line}")));
+        }
+        for (field, target) in builder.field_assignments {
+            field_assignments.entry(field).or_default().push(target);
+        }
+        macro_rules_findings.extend(
+            builder
+                .macro_rules_findings
+                .into_iter()
+                .map(|(line, name)| format!("{file}:{line}: macro_rules! {name}")),
+        );
+    }
+
+    let mut field_ptr_findings = Vec::new();
+    let mut unresolved_field_ptr_sites = Vec::new();
+    for (idx, field, loc) in &field_ptr_sites {
+        match field_assignments.get(field) {
+            Some(targets) if !targets.is_empty() => {
+                for t in targets {
+                    calls.entry(*idx).or_default().insert(t.clone());
+                }
+                field_ptr_findings.push(format!(
+                    "{loc}: fn-pointer call via `.{field}` -- resolved to {targets:?} (every RHS \
+                     ever assigned to a `.{field}` field anywhere in the binding surface)"
+                ));
+            }
+            _ => {
+                unresolved_field_ptr_sites.push(format!(
+                    "{loc}: fn-pointer call via `.{field}` -- UNRESOLVED, no assignment to a \
+                     `.{field}` field found anywhere in the binding surface"
+                ));
+            }
+        }
+    }
+
+    let mut by_name: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, node) in nodes.iter().enumerate() {
+        by_name.entry(node.name.clone()).or_default().push(i);
+    }
+
+    CallGraph {
+        nodes,
+        by_name,
+        calls,
+        field_ptr_findings,
+        unresolved_field_ptr_sites,
+        macro_rules_findings,
+    }
+}
+
+/// Breadth-first NAME-keyed reachability from `entries` (node indices) over
+/// `graph.calls`: an edge to a name expands to EVERY node sharing that name
+/// (the safe-direction over-approximation the module comment describes), so
+/// two functions in different files/types that merely share a name are
+/// still both marked reachable the moment either is.
+fn reachable_node_indices(graph: &CallGraph, entries: &[usize]) -> HashSet<usize> {
+    let mut visited_nodes: HashSet<usize> = entries.iter().copied().collect();
+    let mut visited_names: HashSet<String> = HashSet::new();
+    let mut queue: std::collections::VecDeque<usize> = entries.iter().copied().collect();
+    while let Some(idx) = queue.pop_front() {
+        let Some(targets) = graph.calls.get(&idx) else {
+            continue;
+        };
+        for name in targets {
+            if !visited_names.insert(name.clone()) {
+                continue;
+            }
+            for &tid in graph.by_name.get(name).into_iter().flatten() {
+                if visited_nodes.insert(tid) {
+                    queue.push_back(tid);
+                }
+            }
+        }
+    }
+    visited_nodes
+}
+
+/// This list IS the gate's own output at this head, transcribed the same
+/// way [`REGISTRATION_VERB_SITES`] was: every `registration_verb_occurrences`/
+/// `ddl_literal_occurrences` site over the WHOLE binding surface (not just
+/// [`SURFACE_DIRS`]) that this section's call graph marks reachable from a
+/// `fn` under `crates/jammi-ai/src/fine_tune/`, kept in sync by
+/// [`fine_tune_reachable_sites_are_all_reviewed`].
+const FINE_TUNE_REACHABLE_SITES: &[ReviewedRegistrationSite] = &[
+    ReviewedRegistrationSite {
+        file: "crates/jammi-ai/src/query/content_hash_udf.rs",
+        function: "register_content_hash_udf",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry for this site (a \
+                   session-wide singleton, called once at construction, never per-call): this \
+                   graph marks it reachable because the embedded-engine session-construction path \
+                   (InferenceSession's own `with_observer`/`wrap_with` chain) shares a caller with \
+                   fine_tune/'s worker construction, name-keyed the same way every other verb-name \
+                   collision here is -- the SAME clearance already carries the safety argument.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-ai/src/query/vector_agg_udaf.rs",
+        function: "register_vector_agg_udafs",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: register_udaf(..) \
+                   three times under each UDAF's own FIXED name, called once per session at \
+                   construction -- the same session-construction-time singleton shape as \
+                   register_content_hash_udf, reachable for the same reason.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-ai/src/session.rs",
+        function: "register_query_functions",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: register_udtf(..) \
+                   under the FIXED AnnotateTableFunction::NAME, \"must be called once per session, \
+                   after the session is behind an Arc\" per its own doc -- a session-construction \
+                   singleton, reachable for the same reason as the two UDF/UDAF registrars above.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-bench/src/corpus.rs",
+        function: "register",
+        ordinal: 1,
+        allowed: 1,
+        property: "a SAFE-DIRECTION OVER-APPROXIMATION false positive, not a real reachability \
+                   path: `crates/jammi-bench` depends ON `crates/jammi-ai` (verified directly by \
+                   `binding_surface_crates`'s own reverse-dependency computation, which is exactly \
+                   why jammi-bench is IN this section's binding surface in the first place), so no \
+                   fn under `crates/jammi-ai/src/fine_tune/` can call FORWARD into it -- this \
+                   graph is NAME-keyed, not crate-direction-aware, and jammi-bench's own `register` \
+                   (a benchmark harness helper that calls `ctx.register_parquet(TableReference::bare( \
+                   format!(\"jammi.{table_name}\")), ..)` on a session it builds itself, \
+                   `SessionContext::new()`) happens to share its name with something fine_tune/ \
+                   calls elsewhere in this same graph. Reviewed and accepted as the cost of a \
+                   sound (never a false NOT-reachable), name-keyed over-approximation -- see the \
+                   module comment's own soundness-posture paragraph, and \
+                   `falsification_name_keyed_over_approximation_reports_a_new_same_named_binder` \
+                   for the same shape proven directly.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/session.rs",
+        function: "build",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: register_catalog( \
+                   \"mutable\", ..) under the FIXED literal name \"mutable\", once at session-build \
+                   time -- a session-construction-time singleton, reachable because every job's \
+                   session (including fine_tune/'s) is built through this same path.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/session.rs",
+        function: "register_source_tables",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: register_catalog( \
+                   source_id, ..) keyed by the data source's own stable identifier, called once \
+                   per configured source at session build/reload time -- never per fine_tune call, \
+                   reachable via the same session-construction path as `build` above.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/source/file_format.rs",
+        function: "register_driver_for_url",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: register_object_store( \
+                   ..) keyed by the URL's own scheme+authority, idempotent-rebind shape, executed \
+                   by `register_object_store_twice_for_one_url_rebinds_the_same_driver_and_errors_on_neither`.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mod.rs",
+        function: "bind_result_table",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: binds by calling \
+                   self.register_table(..), rebinding an EARLIER call's own already-written, \
+                   immutable Parquet bytes -- the training-set materialization path fine_tune/ \
+                   calls into directly, so this one is a GENUINE reachable path, not merely a name \
+                   collision. EXECUTED oracle: \
+                   materialization.rs::two_runs_over_one_pinned_definition_share_one_training_set.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mod.rs",
+        function: "build_result_table_provider",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: idempotent-rebind of \
+                   the cached driver for a URL's scheme+authority -- reachable via the same \
+                   materialization path as bind_result_table, a genuine reachable site.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mod.rs",
+        function: "install_result_schema",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: idempotent \
+                   re-installation of the same provider under the session's FIXED default-schema \
+                   name -- reachable via the same materialization path, a genuine reachable site.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mod.rs",
+        function: "register_table",
+        ordinal: 1,
+        allowed: 1,
+        // kernel-oracles: fn-in-literal reviewed: the property string below names the literal shape `fn register_table(` in prose, describing a real declaration elsewhere in this file — not a fn-keyword desync in this line
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: this hit is the `fn \
+                   register_table(` DECLARATION line -- the function ITSELF is the one \
+                   bind_result_table/build_result_table_provider/install_result_schema chain \
+                   above, so it is reachable as the same materialization entry point.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mutable/postgres.rs",
+        function: "create_table_ddl",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at DDL_LITERAL_SITES's own entry: builds a CREATE TABLE STRING \
+                   for the companion \"mutable table\" Postgres backend, executed only through \
+                   that backend's own direct SQL connection, never a DataFusion \
+                   SessionContext::sql call -- reachable here as a NAME-keyed call-graph node (the \
+                   trait method dispatch chain), not because fine_tune/ ever executes this SQL \
+                   through DataFusion; the DDL text itself never reaches a DataFusion catalog \
+                   bind, per that entry's own disclosure.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mutable/sqlite.rs",
+        function: "create_table_ddl",
+        ordinal: 1,
+        allowed: 1,
+        property: "the SQLite arm of the same \"mutable table\" backend -- same disclosure as the \
+                   Postgres arm above.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/result_schema.rs",
+        function: "register_table",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: the \
+                   SchemaProvider::register_table trait-method DECLARATION for \
+                   ResultTableSchemaProvider -- reachable as the trait-dispatch target of the \
+                   store/mod.rs::register_table chain above (the same name-keyed method-dispatch \
+                   edge DataFusion's own SessionContext::register_table/CREATE TABLE DDL execution \
+                   use in production).",
+    },
+];
+
+#[test]
+fn fine_tune_reachable_sites_are_all_reviewed() {
+    let surface = binding_surface();
+    let graph = build_call_graph(&surface);
+
+    assert!(
+        graph.macro_rules_findings.is_empty(),
+        "macro_rules! definition(s) whose OWN template is a registration/DDL binding site \
+         require review (cannot be traced through expansion without expanding it): {:?}",
+        graph.macro_rules_findings
+    );
+    assert!(
+        graph.unresolved_field_ptr_sites.is_empty(),
+        "fn-pointer field call site(s) with no discoverable assignment anywhere in the binding \
+         surface require review: {:?}",
+        graph.unresolved_field_ptr_sites
+    );
+
+    let entries: Vec<usize> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.file.starts_with("crates/jammi-ai/src/fine_tune/"))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "crates/jammi-ai/src/fine_tune/ must contain at least one fn, or this test is vacuous"
+    );
+    let reachable = reachable_node_indices(&graph, &entries);
+    let reachable_keys: BTreeSet<(String, String, usize)> = reachable
+        .iter()
+        .map(|&i| {
+            let n = &graph.nodes[i];
+            (n.file.clone(), n.name.clone(), n.ordinal)
+        })
+        .collect();
+
+    let verb_hits = registration_verb_occurrences(&surface);
+    let ddl_hits = ddl_literal_occurrences(&surface);
+
+    // Every REAL occurrence site must have a MATCHING node in this section's
+    // own (syn-derived) call graph -- if the syn-derived and hand-rolled
+    // fn-identification schemes ever disagreed on a site the occurrence
+    // scan actually found, reachability for it could never be soundly
+    // determined (a silent, structural under-approximation this assertion
+    // exists to catch before it ever reaches the reviewed-list comparison).
+    let all_node_keys: BTreeSet<(String, String, usize)> = graph
+        .nodes
+        .iter()
+        .map(|n| (n.file.clone(), n.name.clone(), n.ordinal))
+        .collect();
+    // `<module-scope>` (ordinal 0) sites are never call-graph NODES at all
+    // by construction (nothing "calls" a module-level const) -- excluded
+    // from this check the same way `DDL_LITERAL_SITES`'s own module-scope
+    // entries are reviewed as "unreachable from any DataFusion
+    // SessionContext, and so from fine_tune/, regardless": they can never
+    // appear in `reachable_keys` either, so the effect is identical to
+    // treating them as structurally not-reachable, never a silent gap.
+    let missing_nodes: Vec<_> = verb_hits
+        .keys()
+        .chain(ddl_hits.keys())
+        .filter(|k| k.1 != "<module-scope>")
+        .filter(|k| !all_node_keys.contains(*k))
+        .collect();
+    assert!(
+        missing_nodes.is_empty(),
+        "occurrence site(s) with no matching call-graph node -- the syn-derived and hand-rolled \
+         fn-identification schemes disagree on these, so reachability cannot be soundly \
+         determined for them: {missing_nodes:?}"
+    );
+
+    let found: std::collections::BTreeMap<(String, String, usize), usize> = verb_hits
+        .keys()
+        .chain(ddl_hits.keys())
+        .filter(|k| reachable_keys.contains(*k))
+        .map(|k| (k.clone(), 1))
+        .collect();
+
+    let allow: Vec<&ReviewedRegistrationSite> = FINE_TUNE_REACHABLE_SITES.iter().collect();
+    assert_occurrences_reviewed(&found, &allow, "fine_tune/-reachable registration/DDL site");
+}
+
+/// G8's own wall-time bound, measured and stated (not merely claimed): the
+/// reachability computation over the REAL binding surface (337 tracked
+/// `.rs` files at this head) must complete in under 10 seconds.
+#[test]
+fn fine_tune_reachability_wall_time_is_under_ten_seconds() {
+    let start = std::time::Instant::now();
+    let surface = binding_surface();
+    let graph = build_call_graph(&surface);
+    let entries: Vec<usize> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.file.starts_with("crates/jammi-ai/src/fine_tune/"))
+        .map(|(i, _)| i)
+        .collect();
+    let _reachable = reachable_node_indices(&graph, &entries);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_secs_f64() < 10.0,
+        "the reachability gate's wall time over the real binding surface (cargo metadata + \
+         syn-parsing 337 files + BFS) must stay under 10s, got {elapsed:?}"
+    );
+}
+
+/// [`GraphFn::line`] is never decorative: a node whose line is `0` (this
+/// crate's own sentinel for "no real line found", used nowhere in
+/// [`FileGraphBuilder::enter_fn`]) would mean a node's own source position
+/// was silently lost -- checked directly over the real binding surface.
+#[test]
+fn graph_fn_lines_are_never_zero() {
+    let surface = binding_surface();
+    let graph = build_call_graph(&surface);
+    let zero_line: Vec<_> = graph
+        .nodes
+        .iter()
+        .filter(|n| n.line == 0)
+        .map(|n| (&n.file, &n.name, n.ordinal))
+        .collect();
+    assert!(
+        zero_line.is_empty(),
+        "every call-graph node must carry a real, 1-based source line, got zero for: {zero_line:?}"
+    );
+}
+
+/// Test-only harness for the falsification fixtures below: parses `source`
+/// as a single synthetic file under `crates/jammi-ai/src/fine_tune/` (so
+/// every `fn` in it is, by construction, an ENTRY the real gate's own file
+/// prefix would also pick up) and returns the resulting graph plus the set
+/// of node indices reachable from every fn in that one file.
+fn probe_reachability(source: &str) -> (CallGraph, HashSet<usize>) {
+    let surface = vec![(
+        "crates/jammi-ai/src/fine_tune/__probe__.rs".to_string(),
+        source.to_string(),
+    )];
+    let graph = build_call_graph(&surface);
+    let entries: Vec<usize> = (0..graph.nodes.len()).collect();
+    let reachable = reachable_node_indices(&graph, &entries);
+    (graph, reachable)
+}
+
+fn reachable_contains_fn(graph: &CallGraph, reachable: &HashSet<usize>, name: &str) -> bool {
+    reachable.iter().any(|&i| graph.nodes[i].name == name)
+}
+
+/// G8 edge shape 1: a bare function NAME handed directly to a call as an
+/// argument (`for_each(callee)`) -- the callee is invoked THROUGH the
+/// fn-pointer `for_each` receives, never spelled as a call site of its own.
+#[test]
+fn falsification_fn_pointer_argument_edge_is_found() {
+    // kernel-oracles: fn-in-literal reviewed: falsification fixture for the fn-pointer-argument call-graph edge -- synthetic producer text fed to build_call_graph, not real code in this file
+    let (graph, reachable) = probe_reachability(concat!(
+        "fn caller(items: &[i32]) {\n",
+        "    items.iter().for_each(|_| callee());\n",
+        "    items.iter().for_each(direct_callee);\n",
+        "}\n",
+        "fn direct_callee() {}\n",
+        "fn callee() {}\n",
+    ));
+    assert!(
+        reachable_contains_fn(&graph, &reachable, "direct_callee"),
+        "a bare fn NAME handed directly to for_each(..) as an argument must be a reachability edge"
+    );
+}
+
+/// G8 edge shape 2: a qualified path (`Self::b`) handed directly to
+/// `.map(..)` as an argument -- the same argument-position shape as
+/// `for_each(b)`, with a multi-segment path instead of a bare identifier.
+#[test]
+fn falsification_map_self_method_argument_edge_is_found() {
+    // kernel-oracles: fn-in-literal reviewed: falsification fixture for the map(Self::b) call-graph edge -- synthetic producer text fed to build_call_graph, not real code in this file
+    let (graph, reachable) = probe_reachability(concat!(
+        "struct S;\n",
+        "impl S {\n",
+        "    fn caller(items: Vec<i32>) -> Vec<i32> {\n",
+        "        items.into_iter().map(Self::b).collect()\n",
+        "    }\n",
+        "    fn b(x: i32) -> i32 { x }\n",
+        "}\n",
+    ));
+    assert!(
+        reachable_contains_fn(&graph, &reachable, "b"),
+        "a qualified path (Self::b) handed to .map(..) as an argument must be a reachability edge"
+    );
+}
+
+/// G8 edge shape 3a: a call inside an `assert!(..)` macro invocation's
+/// token stream -- opaque to `syn`'s typed AST, so only the raw token walk
+/// ([`call_shaped_idents_in_tokens`]) can see it at all.
+#[test]
+fn falsification_call_inside_assert_macro_edge_is_found() {
+    // kernel-oracles: fn-in-literal reviewed: falsification fixture for the assert!(..) macro call-graph edge -- synthetic producer text fed to build_call_graph, not real code in this file
+    let (graph, reachable) = probe_reachability(concat!(
+        "fn caller() {\n",
+        "    assert!(callee().is_ok());\n",
+        "}\n",
+        "fn callee() -> Result<(), ()> { Ok(()) }\n",
+    ));
+    assert!(
+        reachable_contains_fn(&graph, &reachable, "callee"),
+        "a call inside an assert!(..) argument must be a reachability edge"
+    );
+}
+
+/// G8 edge shape 3b: a call inside a `tokio::select!` arm -- a macro DSL
+/// `syn` cannot parse as ordinary expressions at all, so this shape can only
+/// be found by the same raw token walk as the `assert!` case.
+#[test]
+fn falsification_call_inside_tokio_select_arm_edge_is_found() {
+    // kernel-oracles: fn-in-literal reviewed: falsification fixture for the tokio::select! arm call-graph edge -- synthetic producer text fed to build_call_graph, not real code in this file
+    let (graph, reachable) = probe_reachability(concat!(
+        "async fn caller() {\n",
+        "    tokio::select! {\n",
+        "        _ = callee() => {}\n",
+        "    }\n",
+        "}\n",
+        "async fn callee() {}\n",
+    ));
+    assert!(
+        reachable_contains_fn(&graph, &reachable, "callee"),
+        "a call inside a tokio::select! arm must be a reachability edge"
+    );
+}
+
+/// G8 edge shape 4: a fn-pointer struct field `(s.f)(ctx)` -- resolved by
+/// finding every RHS ever assigned to a field of that SAME name anywhere in
+/// the (synthetic, here single-file) binding surface.
+#[test]
+fn falsification_fn_pointer_struct_field_edge_is_found() {
+    // kernel-oracles: fn-in-literal reviewed: falsification fixture for the fn-pointer struct-field call-graph edge -- synthetic producer text fed to build_call_graph, not real code in this file
+    let (graph, reachable) = probe_reachability(concat!(
+        "struct Handlers {\n",
+        "    f: fn(),\n",
+        "}\n",
+        "fn make() -> Handlers {\n",
+        "    Handlers { f: callee }\n",
+        "}\n",
+        "fn caller(s: &Handlers) {\n",
+        "    (s.f)();\n",
+        "}\n",
+        "fn callee() {}\n",
+    ));
+    assert!(
+        reachable_contains_fn(&graph, &reachable, "callee"),
+        "a fn-pointer struct field call (s.f)(..) must be resolved into a reachability edge \
+         once a matching field assignment exists anywhere in the binding surface"
+    );
+    assert!(
+        graph
+            .field_ptr_findings
+            .iter()
+            .any(|f| f.contains("callee")),
+        "a RESOLVED fn-pointer field call must be recorded in field_ptr_findings (human-auditable \
+         even on success, not merely on failure), got {:?}",
+        graph.field_ptr_findings
+    );
+}
+
+/// G2, applied to G8's fn-pointer-field shape: when NO assignment to the
+/// field exists anywhere, the gate refuses to pass silently -- it is a
+/// NAMED, unresolved finding, never a silent dead end.
+#[test]
+fn falsification_unresolved_fn_pointer_field_call_fails_closed() {
+    let surface = vec![(
+        "crates/jammi-ai/src/fine_tune/__probe_unresolved_field__.rs".to_string(),
+        concat!(
+            // kernel-oracles: fn-in-literal reviewed: falsification fixture for the unresolved fn-pointer field call finding -- synthetic producer text fed to build_call_graph, not real code in this file
+            "struct Handlers {\n",
+            "    f: fn(),\n",
+            "}\n",
+            "fn caller(s: &Handlers) {\n",
+            "    (s.f)();\n",
+            "}\n",
+        )
+        .to_string(),
+    )];
+    let graph = build_call_graph(&surface);
+    assert!(
+        !graph.unresolved_field_ptr_sites.is_empty(),
+        "a fn-pointer field call with NO discoverable assignment anywhere must be reported \
+         UNRESOLVED, got {:?}",
+        graph.unresolved_field_ptr_sites
+    );
+}
+
+/// G8 edge shape 5: a `macro_rules!`-generated fn item -- the generated
+/// function's NAME is a macro metavariable resolved only per invocation
+/// site, so it can never be traced through to a specific call-graph node;
+/// instead, the DEFINITION's own template body is checked directly for a
+/// registration-verb call shape or DDL literal, unconditionally.
+#[test]
+fn falsification_macro_rules_template_binding_site_is_flagged() {
+    let surface = vec![(
+        "crates/jammi-ai/src/fine_tune/__probe_macro_rules__.rs".to_string(),
+        concat!(
+            // kernel-oracles: fn-in-literal reviewed: falsification fixture for the macro_rules!-template binding-site finding -- synthetic producer text fed to build_call_graph, not real code in this file
+            "macro_rules! register_probe_table {\n",
+            "    ($ctx:expr, $name:expr, $provider:expr) => {\n",
+            "        $ctx.register_table($name, $provider).unwrap();\n",
+            "    };\n",
+            "}\n",
+        )
+        .to_string(),
+    )];
+    let graph = build_call_graph(&surface);
+    assert!(
+        !graph.macro_rules_findings.is_empty(),
+        "a macro_rules! template containing a registration-verb call shape must be flagged, got \
+         {:?}",
+        graph.macro_rules_findings
+    );
+}
+
+/// G8's own soundness posture, executed directly: "name-keyed
+/// over-approximation is safe-direction (a new same-named binder is
+/// REPORTED)". A call to `helper()` must mark EVERY node named `helper`
+/// reachable, including one this graph cannot prove is a DIFFERENT
+/// function -- the safe direction is over-inclusion, never silently
+/// resolving to "the one true `helper`" by guesswork.
+#[test]
+fn falsification_name_keyed_over_approximation_reports_a_new_same_named_binder() {
+    let (graph, reachable) = probe_reachability(concat!(
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for name-keyed safe-direction over-approximation -- synthetic producer text fed to build_call_graph, not real code in this file
+        "fn caller() { helper(); }\n",
+        "fn helper() {}\n",
+        "mod other {\n",
+        "    pub fn helper() {}\n",
+        "}\n",
+    ));
+    let helper_nodes: Vec<usize> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.name == "helper")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        helper_nodes.len(),
+        2,
+        "the fixture must define two distinct `helper` fns for this control to be non-vacuous"
+    );
+    assert!(
+        helper_nodes.iter().all(|i| reachable.contains(i)),
+        "a call to helper() must mark EVERY node named `helper` reachable (name-keyed, \
+         safe-direction over-approximation), got reachable={reachable:?} helper_nodes={helper_nodes:?}"
+    );
+}

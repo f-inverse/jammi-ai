@@ -836,11 +836,29 @@ _rpc_two_host_iface_lines() {
     return 0
   fi
   local gn_ip_var="RP_TWO_HOST_GN_IP_${rank}"
+  # The interface is read from the kernel's own route table (/proc/net/route:
+  # little-endian hex Destination/Mask per Iface), never from iproute2 — the
+  # CI image ships no `ip` binary (run 35166917277: both ranks refused with
+  # "ip: command not found"). Longest matching prefix wins; the default
+  # route (mask 0) never matches. RP_ROUTE_TABLE lets the lane suite feed a
+  # fixture table; a member always reads the real one.
   cat <<IFACE
 gn_ip="${!gn_ip_var}"
-iface="\$(ip -o -4 addr show | awk -v ip="\$gn_ip" '\$4 ~ "^"ip"/" {print \$2; exit}')"
+route_table="\${RP_ROUTE_TABLE:-/proc/net/route}"
+IFS=. read -r _a _b _c _d <<< "\$gn_ip"
+gn_le=\$(( (_d << 24) | (_c << 16) | (_b << 8) | _a ))
+iface=""; best_mask=-1
+while read -r _ifn _dest _gw _flags _ref _use _metric _mask _rest; do
+  [ "\$_ifn" = "Iface" ] && continue
+  [ -n "\$_mask" ] || continue
+  _m=\$(( 16#\$_mask )); _dst=\$(( 16#\$_dest ))
+  [ "\$_m" -eq 0 ] && continue
+  if [ \$(( gn_le & _m )) -eq "\$_dst" ] && [ "\$_m" -gt "\$best_mask" ]; then
+    best_mask=\$_m; iface="\$_ifn"
+  fi
+done < "\$route_table"
 if [ -z "\$iface" ]; then
-  echo "::error::no local interface carries the Global-Networking ip \$gn_ip -- refusing to derive NCCL_SOCKET_IFNAME" >&2
+  echo "::error::no route in \$route_table covers the Global-Networking ip \$gn_ip -- refusing to derive NCCL_SOCKET_IFNAME" >&2
   exit 97
 fi
 echo "DERIVED_NCCL_IFACE=\$iface"

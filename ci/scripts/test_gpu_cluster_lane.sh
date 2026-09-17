@@ -1777,7 +1777,8 @@ fi
 
 pods_iface_text="$(RP_TWO_HOST_TRANSPORT=pods RP_TWO_HOST_GN_IP_0=10.0.0.9 bash -c 'source "'"$CLUSTER_SH"'"; _rpc_two_host_iface_lines 0')"
 if printf '%s' "$pods_iface_text" | grep -q 'gn_ip="10.0.0.9"' \
-  && printf '%s' "$pods_iface_text" | grep -qF 'ip -o -4 addr show' \
+  && printf '%s' "$pods_iface_text" | grep -qF '/proc/net/route' \
+  && ! printf '%s' "$pods_iface_text" | grep -qF 'ip -o -4 addr show' \
   && printf '%s' "$pods_iface_text" | grep -qF 'DERIVED_NCCL_IFACE=' \
   && ! printf '%s' "$pods_iface_text" | grep -qF 'NCCL_SOCKET_IFNAME=ens1'; then
   ok "P4: under RP_TWO_HOST_TRANSPORT=pods, _rpc_two_host_iface_lines derives the interface from the rank's own GN ip -- never the ens1 literal"
@@ -1785,18 +1786,19 @@ else
   bad "P4: expected the pods transport's iface text to derive from RP_TWO_HOST_GN_IP_0 with no ens1 literal; got: ${pods_iface_text}"
 fi
 
-# Execute the REAL derivation text end to end (a real subshell, a PATH-
-# shimmed `ip` returning a fixed interface listing) -- both the match and
-# the no-match (refusal) arms.
-IFACE_BIN="$SANDBOX/iface-bin"
-mkdir -p "$IFACE_BIN"
-cat > "$IFACE_BIN/ip" <<'IPSTUB'
-#!/usr/bin/env bash
-echo "2: eth0    inet 172.16.0.4/24 brd 172.16.0.255 scope global eth0"
-echo "3: ens7    inet 10.0.0.9/24 brd 10.0.0.255 scope global ens7"
-IPSTUB
-chmod +x "$IFACE_BIN/ip"
-match_out="$(PATH="$IFACE_BIN:$PATH" bash -c "$pods_iface_text"; echo "RC=$?")"
+# Execute the REAL derivation text end to end (a real subshell, a route
+# table in /proc/net/route's format fed through RP_ROUTE_TABLE) -- both the
+# match and the no-match (refusal) arms. No `ip` binary anywhere: the CI
+# image ships none (run 35166917277).
+# A route table in /proc/net/route's own format (little-endian hex): a
+# default route on eth0 (mask 0, never a match), a /16 on eth0 that also
+# covers 10.0.0.9, and the /24 on ens7 that must win by longest prefix.
+IFACE_ROUTES="$SANDBOX/iface-route"
+printf 'Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n' > "$IFACE_ROUTES"
+printf 'eth0\t00000000\t0100A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n' >> "$IFACE_ROUTES"
+printf 'eth0\t0000000A\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n' >> "$IFACE_ROUTES"
+printf 'ens7\t0000000A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n' >> "$IFACE_ROUTES"
+match_out="$(RP_ROUTE_TABLE="$IFACE_ROUTES" bash -c "$pods_iface_text"; echo "RC=$?")"
 if printf '%s' "$match_out" | grep -q 'DERIVED_NCCL_IFACE=ens7' && printf '%s' "$match_out" | grep -q 'RC=0'; then
   ok "P4: executed end to end, the derivation picks 'ens7' (the interface actually carrying the GN ip) and exits 0"
 else
@@ -1804,8 +1806,8 @@ else
 fi
 
 nomatch_iface_text="$(RP_TWO_HOST_TRANSPORT=pods RP_TWO_HOST_GN_IP_0=10.9.9.9 bash -c 'source "'"$CLUSTER_SH"'"; _rpc_two_host_iface_lines 0')"
-nomatch_out="$(PATH="$IFACE_BIN:$PATH" bash -c "$nomatch_iface_text" 2>&1; echo "RC=$?")"
-if printf '%s' "$nomatch_out" | grep -q 'no local interface carries the Global-Networking ip 10.9.9.9' && printf '%s' "$nomatch_out" | grep -q 'RC=97'; then
+nomatch_out="$(RP_ROUTE_TABLE="$IFACE_ROUTES" bash -c "$nomatch_iface_text" 2>&1; echo "RC=$?")"
+if printf '%s' "$nomatch_out" | grep -q 'covers the Global-Networking ip 10.9.9.9' && printf '%s' "$nomatch_out" | grep -q 'RC=97'; then
   ok "P4: executed end to end, an ip with NO matching interface is a NAMED refusal (97), never a silent pass"
 else
   bad "P4: expected the executed derivation to refuse (97) naming the ip; got: ${nomatch_out}"
@@ -1818,17 +1820,25 @@ P4_SCRATCH_DIR="$SANDBOX/p4-revert-red"
 mkdir -p "$P4_SCRATCH_DIR"
 cp "$DIR/runpod_lib.sh" "$P4_SCRATCH_DIR/runpod_lib.sh"
 P4_SCRATCH="$P4_SCRATCH_DIR/runpod_gpu_cluster.sh"
-python3 - "$CLUSTER_SH" "$P4_SCRATCH" <<'PY'
+if ! python3 - "$CLUSTER_SH" "$P4_SCRATCH" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src).read()
-old = '''iface="\\$(ip -o -4 addr show | awk -v ip="\\$gn_ip" '\\$4 ~ "^"ip"/" {print \\$2; exit}')"'''
-new = '''iface="ens1"  # revert-RED: hardcoded, ignoring gn_ip entirely'''
-assert old in text, "P4 revert-RED fixture: derivation line not found verbatim"
+# The derivation's refusal arm: replace it with a hardcoded interface so the
+# no-match fixture "succeeds" -- the shape the real derivation must NOT have.
+old = '''if [ -z "\\$iface" ]; then
+  echo "::error::no route in \\$route_table covers the Global-Networking ip \\$gn_ip -- refusing to derive NCCL_SOCKET_IFNAME" >&2
+  exit 97
+fi'''
+new = '''iface="ens1"  # revert-RED: hardcoded, ignoring gn_ip and the route table entirely'''
+assert old in text, "P4 revert-RED fixture: the refusal arm was not found verbatim -- the fixture is stale, not the driver"
 open(dst, "w").write(text.replace(old, new, 1))
 PY
+then
+  bad "P4 revert-RED: the scratch patch did not apply (fixture stale) -- refusing to read a vacuous RC=0 as evidence"
+fi
 nomatch_iface_text_red="$(RP_TWO_HOST_TRANSPORT=pods RP_TWO_HOST_GN_IP_0=10.9.9.9 bash -c 'source "'"$P4_SCRATCH"'"; _rpc_two_host_iface_lines 0')"
-nomatch_out_red="$(PATH="$IFACE_BIN:$PATH" bash -c "$nomatch_iface_text_red"; echo "RC=$?")"
+nomatch_out_red="$(RP_ROUTE_TABLE="$IFACE_ROUTES" bash -c "$nomatch_iface_text_red"; echo "RC=$?")"
 if printf '%s' "$nomatch_out_red" | grep -q 'RC=0'; then
   ok "P4 revert-RED: the hardcoded (pre-fix) shape reads the no-match fixture as a SUCCESS (RC=0) -- confirms the real derivation above is load-bearing"
 else

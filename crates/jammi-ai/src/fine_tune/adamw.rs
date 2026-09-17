@@ -17,6 +17,7 @@ use candle_core::backprop::GradStore;
 use candle_core::{DType, Result, Tensor, Var};
 use jammi_kernels::admission::{
     admission_mode, admit, counters_for, device_is_supported, DispatchCounters, DispatchOutcome,
+    ADAMW_STEP,
 };
 use jammi_kernels::ops::{adamw_step_fused_t, AdamWParams};
 
@@ -256,7 +257,7 @@ impl AdamW {
                 // `Fallback` mode, the default, never errors).
                 let outcome = admit(
                     admission_mode(),
-                    "adamw_step_fused",
+                    &ADAMW_STEP,
                     predicate,
                     holds,
                     *ADAMW_DISPATCH_COUNTERS,

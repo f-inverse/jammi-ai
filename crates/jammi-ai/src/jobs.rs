@@ -552,11 +552,14 @@ pub enum JobResult {
         /// Run-metrics JSON, or `None` when the run recorded none.
         metrics: Option<String>,
         /// Shares [`Self::Table::cache_outcome`]'s
-        /// `"computed"`/`"reused:{name}"` vocabulary, but every training
-        /// kind always records `"computed"` today: model-level cache reuse
-        /// is not yet supported (`TrainingSpec::FineTune`'s own `cache`
-        /// field refuses `Use` at submit; see
-        /// <https://github.com/f-inverse/jammi-ai/issues/562>).
+        /// `"computed"`/`"reused:{name}"` vocabulary (#562, wave-5 F5):
+        /// `TrainingSpec::FineTune`'s own `cache` field admits `Use`, and
+        /// `"reused:{model}"` names the REUSED row's `model_id` when an
+        /// exact-definition cache hit skipped training — see
+        /// `fine_tune::worker::JobWorker::publish_and_finalize`'s own
+        /// `cache_outcome` computation. `GraphFineTune`/a context predictor
+        /// always record `"computed"`: neither kind's `TrainingSpec`
+        /// variant carries a `cache` field at all.
         cache_outcome: String,
     },
     /// A compute kind's result table.

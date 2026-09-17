@@ -36,11 +36,11 @@
 //! `SOFTMAX_DISPATCH_COUNTERS`, `GEGLU_DISPATCH_COUNTERS`) have SINCE been
 //! migrated onto this registry themselves — each is now a
 //! `LazyLock<&'static DispatchCounters>` that calls `counters_for(..)`
-//! under the hood: `LN_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/layer_norm.rs:128`;
-//! `ROPE_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:180`;
-//! `SOFTMAX_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:194`;
-//! `GEGLU_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:1387`
-//! (`ATTENTION_BLOCK_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:587`
+//! under the hood: `LN_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/layer_norm.rs:129`;
+//! `ROPE_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:181`;
+//! `SOFTMAX_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:195`;
+//! `GEGLU_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:1388`
+//! (`ATTENTION_BLOCK_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:588`
 //! is a fifth, added the same way rather than as a sixth hand-declared static).
 //! The paragraph above is kept for its historical rationale (why the
 //! registry exists at all), not as a description of the current state —
@@ -84,11 +84,14 @@
 //! [`unmatched_disables`] below: the entry never fires, so it is reported
 //! unmatched rather than silently accepted).
 //!
-//! **Live standalone** (reachable directly, own call site, own predicate):
-//! `"layer_norm_fused"` (`jammi-encoders/src/layer_norm.rs:585`),
-//! `"geglu_fused"` (`jammi-encoders/src/modernbert.rs:1433`),
-//! `"lora_linear_fused"` (`jammi-lora/src/lora_linear.rs:1079`), and
-//! `"attention_block_fused"` (`jammi-encoders/src/attention_cascade.rs:905`) itself.
+//! **Live standalone** (reachable directly, own call site, own predicate —
+//! each call site now passes the typed [`ProbedOp`] const the line cited
+//! below names in its own registry, per #546 F3's typed migration, rather
+//! than this literal string):
+//! `"layer_norm_fused"` (`jammi-encoders/src/layer_norm.rs:130`),
+//! `"geglu_fused"` (`jammi-encoders/src/modernbert.rs:1389`),
+//! `"lora_linear_fused"` (`jammi-lora/src/lora_linear.rs:227`), and
+//! `"attention_block_fused"` (`jammi-encoders/src/attention_cascade.rs:400`) itself.
 //!
 //! **Subsumed** (reachable ONLY when `"attention_block_fused"` is ALSO
 //! disabled, forcing `forward_training_attention` into
@@ -99,7 +102,7 @@
 //! (`modernbert.rs:1188`).
 //!
 //! **Subsumed by `"lora_linear_fused"`** (reachable ONLY when
-//! `"lora_linear_fused"` (`jammi-lora/src/lora_linear.rs:1079`) itself
+//! `"lora_linear_fused"` (`jammi-lora/src/lora_linear.rs:227`) itself
 //! admits Fused — `crate::ops::LowRankResidualLinear::bwd` is the sole
 //! call site that ever passes either key to [`admit`], and
 //! `LowRankResidualLinear` is only constructed on the branch where
@@ -402,12 +405,13 @@ pub fn op_disabled(op: &'static str) -> bool {
 /// two-arm [`admit`] op.
 pub fn admit_cascade(
     mode: AdmissionMode,
-    op: &'static str,
+    op: &'static ProbedOp,
     predicate_name: &'static str,
     outcome: PredicateOutcome,
     next_arm_can_run: bool,
     counters: &CascadeDispatchCounters,
 ) -> Result<CascadeOutcome> {
+    let op = op.dtype_neutral_key();
     if op_is_disabled(disabled_ops(), fired_disables(), op) {
         counters.declined.fetch_add(1, Ordering::Relaxed);
         // Campaign #446 finding 3's channel, closed here too (audit round,
@@ -1354,7 +1358,42 @@ fn admit_inner(
 /// empty), `disabled_ops` is an empty set and `op_is_disabled` returns
 /// `false` for every `op`, so this reduces to exactly the two-outcome
 /// decision this function has always made.
+///
+/// `op` is a [`ProbedOp`] — never a bare string — so a call site is bound to
+/// [`PROBED_OPS`] at compile time (#546 F3): a dtype-ambiguous op
+/// ([`CAST_SCALE`]/[`CAST_ADD`]) cannot resolve here (see
+/// [`ProbedOp::dtype_neutral_key`]'s own panic doc) and must go through
+/// `jammi-kernels`' own dtype-aware cast-boundary entry point instead — this
+/// function's `pub(crate)` sibling `admit_by_key` is that entry point's
+/// only legitimate caller outside this function itself, kept crate-private
+/// so no OTHER crate regains an untyped escape hatch around the table.
 pub fn admit(
+    mode: AdmissionMode,
+    op: &'static ProbedOp,
+    predicate_name: &'static str,
+    predicate_holds: bool,
+    counters: &DispatchCounters,
+) -> Result<DispatchOutcome> {
+    admit_by_key(
+        mode,
+        op.dtype_neutral_key(),
+        predicate_name,
+        predicate_holds,
+        counters,
+    )
+}
+
+/// The string-keyed admission decision [`admit`] delegates to once it has
+/// resolved a [`ProbedOp`] to its registry key — `pub(crate)` rather than
+/// private because `jammi-kernels`' OWN dtype-branching cast-boundary sites
+/// (`ops::low_rank_residual_linear`'s `admit_cast_boundary`) need to resolve
+/// [`CAST_SCALE`]/[`CAST_ADD`] against a REAL dtype (known only at the call
+/// site, from the tensor already in hand) before a key exists to pass here.
+/// Never exported beyond this crate: every OTHER crate's call site goes
+/// through the typed [`admit`], which is the actual completeness proof (a
+/// new admission-gated dispatch elsewhere in the workspace has no string to
+/// reach for without first adding — and importing — a [`PROBED_OPS`] row).
+pub(crate) fn admit_by_key(
     mode: AdmissionMode,
     op: &'static str,
     predicate_name: &'static str,
@@ -1756,6 +1795,37 @@ impl ProbedOp {
     pub fn all_registry_keys(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.registry.iter().map(|&(_, key)| key)
     }
+
+    /// The registry key for a row whose dispatch does NOT branch by dtype
+    /// (every [`PROBED_OPS`] row except [`CAST_SCALE`]/[`CAST_ADD`]) — what
+    /// [`admit`]/[`admit_cascade`] resolve their `op: &'static ProbedOp`
+    /// argument through. Equivalent to
+    /// `self.registry_keys_for(DtypeClass::Any).next()`, since a
+    /// dtype-neutral row's sole registry entry is filed under
+    /// [`DtypeClass::Any`] and therefore matches regardless of the class
+    /// argument (`registry_keys_for`'s own filter: `*class == Any || *class
+    /// == dtype`).
+    ///
+    /// # Panics
+    /// If `self.registry` branches by a CONCRETE dtype class (`CAST_SCALE`/
+    /// `CAST_ADD` today, `probed_ops_resolve_to_at_most_one_registry_key_per_dtype_class`
+    /// pins there are no others) — those two ops resolve through the
+    /// dtype-aware entry point instead
+    /// (`jammi_kernels::ops::low_rank_residual_linear`'s `admit_cast_boundary`),
+    /// never through this method. A call site reaching this panic named the
+    /// wrong op for `admit()`/`admit_cascade()`, not a runtime state a
+    /// caller should ever recover from.
+    pub fn dtype_neutral_key(&self) -> &'static str {
+        self.registry_keys_for(DtypeClass::Any)
+            .next()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{:?}'s registry branches by dtype ({:?}) — this op resolves through a \
+                 dtype-aware admission entry point, never admit()/admit_cascade() directly",
+                    self.report_key, self.registry
+                )
+            })
+    }
 }
 
 /// The ONE static fact about which ops an acceleration report / capability
@@ -1768,20 +1838,20 @@ impl ProbedOp {
 ///
 /// | report key | kind | registry key(s) | call site |
 /// |---|---|---|---|
-/// | `layer_norm` | TwoArm | `layer_norm_fused` | `layer_norm_fused`, `crates/jammi-encoders/src/layer_norm.rs:129` |
-/// | `rope` | TwoArm | `rope_fused` | `rope_fused`, `crates/jammi-encoders/src/modernbert.rs:181` |
-/// | `softmax` | TwoArm | `softmax_last_dim_fused` | `softmax_last_dim_fused`, `crates/jammi-encoders/src/attention_cascade.rs:404` |
-/// | `geglu` | TwoArm | `geglu_fused` | `geglu_fused`, `crates/jammi-encoders/src/modernbert.rs:1388` |
+/// | `layer_norm` | TwoArm | `layer_norm_fused` | `layer_norm_fused`, `crates/jammi-encoders/src/layer_norm.rs:130` |
+/// | `rope` | TwoArm | `rope_fused` | `rope_fused`, `crates/jammi-encoders/src/modernbert.rs:182` |
+/// | `softmax` | TwoArm | `softmax_last_dim_fused` | `softmax_last_dim_fused`, `crates/jammi-encoders/src/attention_cascade.rs:405` |
+/// | `geglu` | TwoArm | `geglu_fused` | `geglu_fused`, `crates/jammi-encoders/src/modernbert.rs:1389` |
 /// | `gelu_erf` | TwoArm | `gelu_erf_fused` | `gelu_erf_fused`, `crates/jammi-kernels/src/ops/gelu_erf.rs`'s `GeluErfFused::name()`; the `admit()` CALL SITE is `crates/jammi-encoders/src/activations.rs`'s `gelu_erf(x, training)`, reachable on every training-mode erf-GELU call for a head_dim-agnostic BERT-family MLP — `BertIntermediate::forward` (`bert.rs:296`) and `DistilBertFfn::forward` (`distilbert.rs:211`) both call it. |
-/// | `attention_block` | TwoArm | `attention_block_fused` | `attention_block_fused`, `crates/jammi-encoders/src/attention_cascade.rs:399` |
-/// | `dropout` | TwoArm | `lora_linear_fused` | `lora_linear_fused`, `crates/jammi-lora/src/lora_linear.rs:1079` (`admit` call site) |
-/// | `low_rank_residual_linear` | TwoArm | `lora_linear_fused` | `lora_linear_fused`, `crates/jammi-lora/src/lora_linear.rs:1079` (`admit` call site) |
-/// | `cast_scale` | TwoArm | bf16 → `cast_scale_bf16_f32`, f16 → `cast_scale_f16_f32` | `cast_scale_bf16_f32`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1054`; `cast_scale_f16_f32`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1068` |
-/// | `cast_add` | TwoArm | bf16 → `cast_add_bf16`, f16 → `cast_add_f16` | `cast_add_bf16`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1153`; `cast_add_f16`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1165` |
-/// | `adamw_step` | TwoArm | `adamw_step_fused` | `adamw_step_fused`, `crates/jammi-ai/src/fine_tune/adamw.rs:33` (`admit`, `crates/jammi-ai/src/fine_tune/adamw.rs:257`) |
-/// | `mem_efficient_attention` | Cascade | `mem_efficient_attention` | `mem_efficient_attention`, `crates/jammi-encoders/src/attention_cascade.rs:859` |
+/// | `attention_block` | TwoArm | `attention_block_fused` | `attention_block_fused`, `crates/jammi-encoders/src/attention_cascade.rs:400` |
+/// | `dropout` | TwoArm | `lora_linear_fused` | `lora_linear_fused`, `crates/jammi-lora/src/lora_linear.rs:227` (`admit` call site's own counters accessor; the typed call site itself is `lora_linear.rs:1079`, passing `&LOW_RANK_RESIDUAL_LINEAR`) |
+/// | `low_rank_residual_linear` | TwoArm | `lora_linear_fused` | `lora_linear_fused`, `crates/jammi-lora/src/lora_linear.rs:227` (same call site as the row above) |
+/// | `cast_scale` | TwoArm | bf16 → `cast_scale_bf16_f32`, f16 → `cast_scale_f16_f32` | `cast_scale_bf16_f32`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1046`; `cast_scale_f16_f32`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1047` (both call sites are typed, `&CAST_SCALE` plus a `DtypeClass`, via `admit_cast_boundary`) |
+/// | `cast_add` | TwoArm | bf16 → `cast_add_bf16`, f16 → `cast_add_f16` | `cast_add_bf16`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1153`; `cast_add_f16`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1153` (both call sites are typed, `&CAST_ADD` plus a `DtypeClass`, via `admit_cast_boundary`) |
+/// | `adamw_step` | TwoArm | `adamw_step_fused` | `adamw_step_fused`, `crates/jammi-ai/src/fine_tune/adamw.rs:34` (`admit`, `crates/jammi-ai/src/fine_tune/adamw.rs:258`) |
+/// | `mem_efficient_attention` | Cascade | `mem_efficient_attention` | `mem_efficient_attention`, `crates/jammi-encoders/src/attention_cascade.rs:864` |
 /// | `rope_positions` | InternalSubkernel(`attention_block_flash`) | — | `rope_positions`, `crates/jammi-kernels/src/ops/flash_attention.rs:645` |
-/// | `scaled_cast_add` | InternalSubkernel(`low_rank_residual_linear`) | — | `ScaledCastAdd`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:946` (CPU), `ScaledCastAdd`, `crates/jammi-kernels/src/cuda/low_rank_residual_linear.rs:142` (CUDA) |
+/// | `scaled_cast_add` | InternalSubkernel(`low_rank_residual_linear`) | — | `ScaledCastAdd`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:953` (CPU), `ScaledCastAdd`, `crates/jammi-kernels/src/cuda/low_rank_residual_linear.rs:142` (CUDA) |
 ///
 /// **`adamw_step`: the optimizer's dtype DOMAIN is not a dtype CLASS.**
 /// `adamw_step_fused`'s own admission predicate requires
@@ -1811,17 +1881,25 @@ impl ProbedOp {
 /// failure would be reported as `holds: false` with the verbatim `dtype_f32`
 /// key, never as an absent row.
 ///
+/// **`attention_block_flash` IS a row** (wave-5 #546 F3, reversing this
+/// constant's own earlier "deliberately not a row" exclusion): every
+/// `admit`/`admit_cascade` call site now takes this typed `&'static ProbedOp`
+/// rather than a bare `&'static str`, so a cascade with no row would have no
+/// value any call site could pass — the exclusion could not survive that
+/// migration. This changes nothing about REPORTING: `probed_report_keys`
+/// (`crates/jammi-ai/src/fine_tune/worker.rs`) still filters to
+/// [`ProbedOpKind::TwoArm`] only, so a `Cascade` row (this one, and
+/// `mem_efficient_attention`) never populates the esc-075 report's `ops` map
+/// — the flash cascade still surfaces ONLY through that report's dedicated
+/// `flash` field, and `ci/release-feature-manifest.json` still declares it
+/// as `flash_compiled`/`flash_dtypes`, never as a `fused_op_admission`
+/// entry. Being a PROBED_OPS row and being an esc-075 `ops`-map entry are
+/// now two independent facts, not one merged into the other by omission.
+///
 /// **Registry keys that exist but are deliberately NOT rows** (each read at
 /// the cited call site during this population, and excluded for a stated
 /// reason — an omission with no reason is how finding 2 happened):
 ///
-/// - `attention_block_flash` (`crates/jammi-encoders/src/modernbert.rs:1106`,
-///   `:1999`) — a real cascade, but the esc-075 report surfaces it through
-///   its OWN dedicated top-level `flash` field (with the compiled/device
-///   short-circuit reasons a plain `ops` entry cannot express), and
-///   `ci/release-feature-manifest.json` declares it as `flash_compiled` +
-///   `flash_dtypes`, not as a `fused_op_admission` entry. Adding it here
-///   would make the same fact appear twice in one artifact.
 /// - `lora_dropout` (`crates/jammi-lora/src/lora_linear.rs:37`) and
 ///   `lora_epilogue` (`:66`) — registry entries with NO `admit()` call site
 ///   anywhere: both are documented as "permanently `{fused: 0, eager: 0}`",
@@ -1839,91 +1917,131 @@ impl ProbedOp {
 /// pass). They have no key for any probe to read a delta from; their
 /// execution is proven by the PARENT dispatching fused, and must never be
 /// claimed as an independent admission.
+/// #546's compiler-anchored binding: every one of these is the SAME value
+/// [`PROBED_OPS`] is built from below, and every production `admit`/
+/// `admit_cascade` call site across `jammi-kernels`/`jammi-encoders`/
+/// `jammi-lora`/`jammi-ai` passes one of these named consts (never a bare
+/// string) — a NEW admission-gated call site therefore either references an
+/// EXISTING row (correctly, since the row already exists) or has no const to
+/// reference at all, which does not compile until a new row (and const) is
+/// added here. That is the completeness proof `PROBED_OPS`'s own doc used to
+/// call merely "hand-populated": the table and the call sites are now the
+/// SAME memory, not two things a reviewer keeps in sync by re-reading source.
+pub const LAYER_NORM: ProbedOp = ProbedOp {
+    report_key: "layer_norm",
+    kind: ProbedOpKind::TwoArm,
+    registry: &[(DtypeClass::Any, "layer_norm_fused")],
+};
+pub const ROPE: ProbedOp = ProbedOp {
+    report_key: "rope",
+    kind: ProbedOpKind::TwoArm,
+    registry: &[(DtypeClass::Any, "rope_fused")],
+};
+pub const SOFTMAX: ProbedOp = ProbedOp {
+    report_key: "softmax",
+    kind: ProbedOpKind::TwoArm,
+    registry: &[(DtypeClass::Any, "softmax_last_dim_fused")],
+};
+pub const GEGLU: ProbedOp = ProbedOp {
+    report_key: "geglu",
+    kind: ProbedOpKind::TwoArm,
+    registry: &[(DtypeClass::Any, "geglu_fused")],
+};
+pub const GELU_ERF: ProbedOp = ProbedOp {
+    report_key: "gelu_erf",
+    kind: ProbedOpKind::TwoArm,
+    registry: &[(DtypeClass::Any, "gelu_erf_fused")],
+};
+pub const ATTENTION_BLOCK: ProbedOp = ProbedOp {
+    report_key: "attention_block",
+    kind: ProbedOpKind::TwoArm,
+    registry: &[(DtypeClass::Any, "attention_block_fused")],
+};
+/// The `dropout` REPORT row — same dispatch decision as
+/// [`LOW_RANK_RESIDUAL_LINEAR`] (both are `lora_linear_fused`, one dispatch,
+/// two report keys per this table's own row-provenance doc). No call site
+/// admits under this const directly; it exists for the esc-075 report's
+/// `ops.dropout` key.
+pub const DROPOUT: ProbedOp = ProbedOp {
+    report_key: "dropout",
+    kind: ProbedOpKind::TwoArm,
+    registry: &[(DtypeClass::Any, "lora_linear_fused")],
+};
+/// The call-site-facing const for `lora_linear_fused` — `jammi-lora`'s
+/// `lora_linear.rs` admits under this one.
+pub const LOW_RANK_RESIDUAL_LINEAR: ProbedOp = ProbedOp {
+    report_key: "low_rank_residual_linear",
+    kind: ProbedOpKind::TwoArm,
+    registry: &[(DtypeClass::Any, "lora_linear_fused")],
+};
+pub const CAST_SCALE: ProbedOp = ProbedOp {
+    report_key: "cast_scale",
+    kind: ProbedOpKind::TwoArm,
+    registry: &[
+        (DtypeClass::Bf16, "cast_scale_bf16_f32"),
+        (DtypeClass::F16, "cast_scale_f16_f32"),
+    ],
+};
+pub const CAST_ADD: ProbedOp = ProbedOp {
+    report_key: "cast_add",
+    kind: ProbedOpKind::TwoArm,
+    registry: &[
+        (DtypeClass::Bf16, "cast_add_bf16"),
+        (DtypeClass::F16, "cast_add_f16"),
+    ],
+};
+pub const ADAMW_STEP: ProbedOp = ProbedOp {
+    report_key: "adamw_step",
+    kind: ProbedOpKind::TwoArm,
+    // `DtypeClass::Any`, NOT `F32` — see this table's "the optimizer's
+    // dtype domain is not a dtype CLASS" note. The op's own tensors are
+    // F32-only; the JOB's backbone dtype is a different axis, and it is
+    // the job's that `DtypeClass` selects on.
+    registry: &[(DtypeClass::Any, "adamw_step_fused")],
+};
+pub const MEM_EFFICIENT_ATTENTION: ProbedOp = ProbedOp {
+    report_key: "mem_efficient_attention",
+    kind: ProbedOpKind::Cascade,
+    registry: &[(DtypeClass::Any, "mem_efficient_attention")],
+};
+/// See this constant's sibling doc paragraph above ("`attention_block_flash`
+/// IS a row") for why this row exists at all (#546 F3).
+pub const ATTENTION_BLOCK_FLASH: ProbedOp = ProbedOp {
+    report_key: "attention_block_flash",
+    kind: ProbedOpKind::Cascade,
+    registry: &[(DtypeClass::Any, "attention_block_flash")],
+};
+pub const ROPE_POSITIONS: ProbedOp = ProbedOp {
+    report_key: "rope_positions",
+    kind: ProbedOpKind::InternalSubkernel {
+        parent: "attention_block_flash",
+    },
+    registry: &[],
+};
+pub const SCALED_CAST_ADD: ProbedOp = ProbedOp {
+    report_key: "scaled_cast_add",
+    kind: ProbedOpKind::InternalSubkernel {
+        parent: "low_rank_residual_linear",
+    },
+    registry: &[],
+};
+
 pub const PROBED_OPS: &[ProbedOp] = &[
-    ProbedOp {
-        report_key: "layer_norm",
-        kind: ProbedOpKind::TwoArm,
-        registry: &[(DtypeClass::Any, "layer_norm_fused")],
-    },
-    ProbedOp {
-        report_key: "rope",
-        kind: ProbedOpKind::TwoArm,
-        registry: &[(DtypeClass::Any, "rope_fused")],
-    },
-    ProbedOp {
-        report_key: "softmax",
-        kind: ProbedOpKind::TwoArm,
-        registry: &[(DtypeClass::Any, "softmax_last_dim_fused")],
-    },
-    ProbedOp {
-        report_key: "geglu",
-        kind: ProbedOpKind::TwoArm,
-        registry: &[(DtypeClass::Any, "geglu_fused")],
-    },
-    ProbedOp {
-        report_key: "gelu_erf",
-        kind: ProbedOpKind::TwoArm,
-        registry: &[(DtypeClass::Any, "gelu_erf_fused")],
-    },
-    ProbedOp {
-        report_key: "attention_block",
-        kind: ProbedOpKind::TwoArm,
-        registry: &[(DtypeClass::Any, "attention_block_fused")],
-    },
-    ProbedOp {
-        report_key: "dropout",
-        kind: ProbedOpKind::TwoArm,
-        registry: &[(DtypeClass::Any, "lora_linear_fused")],
-    },
-    ProbedOp {
-        report_key: "low_rank_residual_linear",
-        kind: ProbedOpKind::TwoArm,
-        registry: &[(DtypeClass::Any, "lora_linear_fused")],
-    },
-    ProbedOp {
-        report_key: "cast_scale",
-        kind: ProbedOpKind::TwoArm,
-        registry: &[
-            (DtypeClass::Bf16, "cast_scale_bf16_f32"),
-            (DtypeClass::F16, "cast_scale_f16_f32"),
-        ],
-    },
-    ProbedOp {
-        report_key: "cast_add",
-        kind: ProbedOpKind::TwoArm,
-        registry: &[
-            (DtypeClass::Bf16, "cast_add_bf16"),
-            (DtypeClass::F16, "cast_add_f16"),
-        ],
-    },
-    ProbedOp {
-        report_key: "adamw_step",
-        kind: ProbedOpKind::TwoArm,
-        // `DtypeClass::Any`, NOT `F32` — see this table's "the optimizer's
-        // dtype domain is not a dtype CLASS" note. The op's own tensors are
-        // F32-only; the JOB's backbone dtype is a different axis, and it is
-        // the job's that `DtypeClass` selects on.
-        registry: &[(DtypeClass::Any, "adamw_step_fused")],
-    },
-    ProbedOp {
-        report_key: "mem_efficient_attention",
-        kind: ProbedOpKind::Cascade,
-        registry: &[(DtypeClass::Any, "mem_efficient_attention")],
-    },
-    ProbedOp {
-        report_key: "rope_positions",
-        kind: ProbedOpKind::InternalSubkernel {
-            parent: "attention_block_flash",
-        },
-        registry: &[],
-    },
-    ProbedOp {
-        report_key: "scaled_cast_add",
-        kind: ProbedOpKind::InternalSubkernel {
-            parent: "low_rank_residual_linear",
-        },
-        registry: &[],
-    },
+    LAYER_NORM,
+    ROPE,
+    SOFTMAX,
+    GEGLU,
+    GELU_ERF,
+    ATTENTION_BLOCK,
+    DROPOUT,
+    LOW_RANK_RESIDUAL_LINEAR,
+    CAST_SCALE,
+    CAST_ADD,
+    ADAMW_STEP,
+    MEM_EFFICIENT_ATTENTION,
+    ATTENTION_BLOCK_FLASH,
+    ROPE_POSITIONS,
+    SCALED_CAST_ADD,
 ];
 
 /// The [`PROBED_OPS`] row with this `report_key`, or `None`.
@@ -1934,6 +2052,44 @@ pub fn probed_op(report_key: &str) -> Option<&'static ProbedOp> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A test-only, unregistered [`ProbedOp`] for a two-arm ([`admit`])
+    /// call — never a [`PROBED_OPS`] row, so it can never collide with a
+    /// real op's registry key. `report_key` and the sole registry key are
+    /// both `key`, matching every real dtype-neutral row's own shape.
+    ///
+    /// A macro, not a `const fn`: a `const fn` taking `key` as a PARAMETER
+    /// cannot have its `&[(.., key)]` array literal promoted to `'static`
+    /// (rvalue static promotion needs the literal to appear directly at
+    /// the `const`-binding site, not behind a function parameter — a
+    /// `const fn` call gets `error[E0716]: temporary value dropped while
+    /// borrowed` the moment its result is referenced with `&`). A macro
+    /// expands the literal INLINE at each `const OP: ProbedOp =
+    /// test_two_arm!("...")`  call, so promotion sees the same shape as a
+    /// hand-written literal.
+    macro_rules! test_two_arm {
+        ($key:expr) => {
+            ProbedOp {
+                report_key: $key,
+                kind: ProbedOpKind::TwoArm,
+                registry: &[(DtypeClass::Any, $key)],
+            }
+        };
+    }
+
+    /// The [`admit_cascade`] sibling of [`test_two_arm`] (same macro
+    /// reason).
+    macro_rules! test_cascade {
+        ($key:expr) => {
+            ProbedOp {
+                report_key: $key,
+                kind: ProbedOpKind::Cascade,
+                registry: &[(DtypeClass::Any, $key)],
+            }
+        };
+    }
+
+    const TEST_OP: ProbedOp = test_two_arm!("test_op");
 
     #[test]
     fn compute_capability_meets_minimum_is_lexicographic() {
@@ -2138,7 +2294,7 @@ mod tests {
         let counters = DispatchCounters::new();
         let outcome = admit(
             AdmissionMode::Fallback,
-            "test_op",
+            &TEST_OP,
             "always_false",
             false,
             &counters,
@@ -2153,7 +2309,7 @@ mod tests {
         let counters = DispatchCounters::new();
         let err = admit(
             AdmissionMode::Strict,
-            "test_op",
+            &TEST_OP,
             "always_false",
             false,
             &counters,
@@ -2177,7 +2333,7 @@ mod tests {
         let counters = DispatchCounters::new();
         let outcome = admit(
             AdmissionMode::Strict,
-            "test_op",
+            &TEST_OP,
             "always_true",
             true,
             &counters,
@@ -2638,10 +2794,11 @@ mod tests {
     fn lattice_cell_03_predicate_failure_warn_is_recorded_through_the_real_admit() {
         if std::env::var_os("JAMMI_KERNELS_DISABLE").is_none() {
             let op = "lattice_cell_03_real_admit_warn_op";
+            const OP: ProbedOp = test_two_arm!("lattice_cell_03_real_admit_warn_op");
             let counters = DispatchCounters::new();
             let outcome = admit(
                 AdmissionMode::Fallback,
-                op,
+                &OP,
                 "warn_observability_pred",
                 false,
                 &counters,
@@ -2818,15 +2975,10 @@ mod tests {
         // this test run (see `op_is_disabled`'s doc for why an in-process
         // `std::env::set_var` test is not attempted here).
         if std::env::var_os("JAMMI_KERNELS_DISABLE").is_none() {
+            const OP: ProbedOp = test_two_arm!("cell9_never_disabled_op");
             let counters = DispatchCounters::new();
-            let outcome = admit(
-                AdmissionMode::Strict,
-                "cell9_never_disabled_op",
-                "always_true",
-                true,
-                &counters,
-            )
-            .expect("undisabled, satisfied predicate never errors");
+            let outcome = admit(AdmissionMode::Strict, &OP, "always_true", true, &counters)
+                .expect("undisabled, satisfied predicate never errors");
             assert_eq!(outcome, DispatchOutcome::Fused);
             assert_eq!(counters.snapshot(), DispatchSnapshot { fused: 1, eager: 0 });
             assert!(disabled_ops().is_empty());
@@ -2985,17 +3137,12 @@ mod tests {
 
     #[test]
     fn cascade_holds_records_fused_in_either_mode() {
+        const OP: ProbedOp = test_cascade!("cascade_test_op_holds");
         for mode in [AdmissionMode::Fallback, AdmissionMode::Strict] {
             let counters = CascadeDispatchCounters::new();
-            let outcome = admit_cascade(
-                mode,
-                "cascade_test_op_holds",
-                "pred",
-                PredicateOutcome::Holds,
-                true,
-                &counters,
-            )
-            .expect("Holds never errors");
+            let outcome =
+                admit_cascade(mode, &OP, "pred", PredicateOutcome::Holds, true, &counters)
+                    .expect("Holds never errors");
             assert_eq!(outcome, CascadeOutcome::Fused);
             assert_eq!(
                 counters.snapshot(),
@@ -3013,11 +3160,12 @@ mod tests {
         // The load-bearing cell distinguishing `DomainMiss` from
         // `CapabilityMiss`: a domain miss is never a Strict error,
         // regardless of `next_arm_can_run`.
+        const OP: ProbedOp = test_cascade!("cascade_test_op_domain_miss");
         for next_arm_can_run in [true, false] {
             let counters = CascadeDispatchCounters::new();
             let outcome = admit_cascade(
                 AdmissionMode::Strict,
-                "cascade_test_op_domain_miss",
+                &OP,
                 "pred_domain",
                 PredicateOutcome::DomainMiss,
                 next_arm_can_run,
@@ -3026,10 +3174,11 @@ mod tests {
             .expect("DomainMiss must never error, in either mode, regardless of next_arm_can_run");
             assert_eq!(outcome, CascadeOutcome::Declined);
         }
+        const OP_FB: ProbedOp = test_cascade!("cascade_test_op_domain_miss_fb");
         let counters = CascadeDispatchCounters::new();
         let outcome = admit_cascade(
             AdmissionMode::Fallback,
-            "cascade_test_op_domain_miss_fb",
+            &OP_FB,
             "pred_domain",
             PredicateOutcome::DomainMiss,
             false,
@@ -3049,10 +3198,11 @@ mod tests {
 
     #[test]
     fn cascade_capability_miss_fallback_mode_declines_without_error() {
+        const OP: ProbedOp = test_cascade!("cascade_test_op_cap_fb");
         let counters = CascadeDispatchCounters::new();
         let outcome = admit_cascade(
             AdmissionMode::Fallback,
-            "cascade_test_op_cap_fb",
+            &OP,
             "pred_cap",
             PredicateOutcome::CapabilityMiss,
             false,
@@ -3072,10 +3222,11 @@ mod tests {
 
     #[test]
     fn cascade_capability_miss_strict_declines_when_next_arm_can_run() {
+        const OP: ProbedOp = test_cascade!("cascade_test_op_cap_strict_ok");
         let counters = CascadeDispatchCounters::new();
         let outcome = admit_cascade(
             AdmissionMode::Strict,
-            "cascade_test_op_cap_strict_ok",
+            &OP,
             "pred_cap",
             PredicateOutcome::CapabilityMiss,
             true,
@@ -3098,10 +3249,11 @@ mod tests {
         // The other load-bearing cell: Strict DOES still have teeth for a
         // cascade — if nothing downstream can run either, this must error,
         // not silently decline.
+        const OP: ProbedOp = test_cascade!("cascade_test_op_cap_strict_err");
         let counters = CascadeDispatchCounters::new();
         let err = admit_cascade(
             AdmissionMode::Strict,
-            "cascade_test_op_cap_strict_err",
+            &OP,
             "pred_cap",
             PredicateOutcome::CapabilityMiss,
             false,
@@ -3145,10 +3297,11 @@ mod tests {
         // proves `admit_cascade` records to `declined` (not `fused`/`eager`)
         // when disabled, which `admit`/`admit_inner` cannot express at all
         // (they only have `fused`/`eager`).
+        const OP: ProbedOp = test_cascade!("cascade_test_op_never_in_env");
         assert!(!op_disabled("cascade_test_op_never_in_env"));
         let outcome = admit_cascade(
             AdmissionMode::Strict,
-            "cascade_test_op_never_in_env",
+            &OP,
             "pred",
             PredicateOutcome::Holds,
             true,
@@ -3171,13 +3324,15 @@ mod tests {
     /// `admit_inner`).
     #[test]
     fn cascade_decline_feeds_the_same_probe_capture_window_admit_inner_uses() {
+        const OP: ProbedOp = test_cascade!("cascade_probe_test_op");
+        const OP_UNARMED: ProbedOp = test_cascade!("cascade_probe_test_op_unarmed");
         let counters = CascadeDispatchCounters::new();
 
         // Window OPEN.
         let guard = probe_capture_begin();
         let outcome = admit_cascade(
             AdmissionMode::Fallback,
-            "cascade_probe_test_op",
+            &OP,
             "cascade_probe_test_predicate",
             PredicateOutcome::DomainMiss,
             false,
@@ -3198,7 +3353,7 @@ mod tests {
         assert!(!probe_capture_is_armed());
         let outcome = admit_cascade(
             AdmissionMode::Fallback,
-            "cascade_probe_test_op_unarmed",
+            &OP_UNARMED,
             "cascade_probe_test_predicate",
             PredicateOutcome::CapabilityMiss,
             true,
@@ -3227,11 +3382,12 @@ mod tests {
     /// identically-shaped, already-tested call.
     #[test]
     fn cascade_holds_records_nothing_into_an_armed_probe_window() {
+        const OP: ProbedOp = test_cascade!("cascade_probe_test_op_holds");
         let counters = CascadeDispatchCounters::new();
         let guard = probe_capture_begin();
         let outcome = admit_cascade(
             AdmissionMode::Strict,
-            "cascade_probe_test_op_holds",
+            &OP,
             "cascade_probe_test_predicate_holds",
             PredicateOutcome::Holds,
             true,
@@ -3252,11 +3408,12 @@ mod tests {
     /// BEFORE the mode match, mirroring `admit_inner`'s own placement").
     #[test]
     fn cascade_strict_capability_miss_hard_error_still_records_into_the_probe_window() {
+        const OP: ProbedOp = test_cascade!("cascade_probe_test_op_strict_err");
         let counters = CascadeDispatchCounters::new();
         let guard = probe_capture_begin();
         let err = admit_cascade(
             AdmissionMode::Strict,
-            "cascade_probe_test_op_strict_err",
+            &OP,
             "cascade_probe_test_predicate_strict_err",
             PredicateOutcome::CapabilityMiss,
             false,

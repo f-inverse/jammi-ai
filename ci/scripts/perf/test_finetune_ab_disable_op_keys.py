@@ -10,9 +10,9 @@ eye.
 
 WHY THIS EXISTS: an eight-key version of `JAMMI_EAGER_DISABLE_OP_KEYS`
 shipped with a real gap (`mem_efficient_attention`, a live per-layer
-`admit_cascade` (`crates/jammi-encoders/src/attention_cascade.rs:857`) site AND
+`admit_cascade` (`crates/jammi-encoders/src/attention_cascade.rs:858`) site AND
 a live once-per-forward `op_disabled`
-(`crates/jammi-encoders/src/modernbert.rs:2359`) gate) that went
+(`crates/jammi-encoders/src/modernbert.rs:2360`) gate) that went
 undetected because every `finetune_ab.sh` sweep config has `seq <= 512`,
 and that op's own domain predicate DomainMisses unconditionally for
 `seq <= ATTENTION_BLOCK_MAX_SEQ` (4096) — a coincidence of the SWEEP's own
@@ -54,7 +54,7 @@ modernbert.rs:2571/2582/2748`, can never be mistaken for a real attribute
 either — and balance braces from there to the item's own close; the audit
 named two REAL, in-scope test call sites this excludes,
 `strict_mode_errors_instead_of_falling_back_on_a_failed_predicate`
-(`crates/jammi-encoders/src/layer_norm.rs:2427`) and
+(`crates/jammi-encoders/src/layer_norm.rs:2428`) and
 `attention_block_strict_mode_errors_instead_of_falling_back_on_a_failed_predicate`
 (`crates/jammi-encoders/src/modernbert.rs:10677`), both `admit(AdmissionMode::Strict, "<a key
 already found at its own production site>", ...)` calls that exist purely

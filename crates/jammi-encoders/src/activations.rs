@@ -5,6 +5,7 @@ use std::sync::LazyLock;
 use candle_core::{DType, Tensor};
 use jammi_kernels::admission::{
     admission_mode, admit, counters_for, device_is_supported, DispatchCounters, DispatchOutcome,
+    GELU_ERF,
 };
 
 use crate::error::EncoderError;
@@ -170,7 +171,7 @@ pub(crate) fn gelu_erf(x: &Tensor, training: bool) -> Result<Tensor, EncoderErro
     crate::seam_gate("activations::gelu_erf");
     let outcome = admit(
         admission_mode(),
-        "gelu_erf_fused",
+        &GELU_ERF,
         predicate,
         holds,
         *GELU_DISPATCH_COUNTERS,

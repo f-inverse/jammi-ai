@@ -248,21 +248,42 @@ pub struct MaterializationEnv {
     /// addition changes not one byte of any [`DefinitionHash`] computed
     /// before it existed.
     ///
-    /// **No production caller writes this field.** `jammi-db` cannot itself
-    /// observe a training loop's per-op fused/eager admission outcomes (it
-    /// depends on no `jammi-kernels` type), so populating it is entirely the
-    /// producing caller's responsibility, and the `FineTune` producer in
-    /// `jammi-ai` does not call [`Self::with_kernel_admission_profile`]. The
-    /// kernel-admission determinant of a fine-tuned model's produced bytes is
-    /// therefore UNCOVERED by [`DefinitionHash`] at this base: two runs whose
-    /// fused/eager admission genuinely differs (e.g. a build-feature or
-    /// hardware difference that changes which ops fuse) can hash identically.
-    /// Folding a real, per-op admission outcome into this field is tracked at
-    /// <https://github.com/f-inverse/jammi-ai/issues/546>. The field stays
-    /// declared, `serde`-default and skip-if-`None`, and its builder
-    /// (below) is exercised by this crate's own hash-completeness tests —
-    /// setting it DOES move [`DefinitionHash`] — so the seam is ready the
-    /// moment #546 lands a real write.
+    /// **Production coverage (#546, wave-5 F3, CLOSED).** `jammi-db` cannot
+    /// itself observe a training loop's admission outcomes (it depends on no
+    /// `jammi-kernels` type), so populating it is entirely the producing
+    /// caller's responsibility. The `FineTune` producer in `jammi-ai` calls
+    /// [`Self::with_kernel_admission_profile`] with a DETERMINISTIC,
+    /// PRE-TRAINING value covering EVERY `jammi_kernels::admission::PROBED_OPS`
+    /// row of kind `TwoArm`/`Cascade` — `jammi-ai`'s
+    /// `fine_tune::worker::dry_run_admission_profile`'s own doc has the
+    /// per-op derivation, each arm citing the real predicate function it is
+    /// read from (`fine_tune::worker::dry_run_verdict`), never a fresh
+    /// re-derivation. This closes the issue's own named defect (two CUDA
+    /// builds differing only in `--features flash-attn` no longer hash
+    /// identically) AND folds a per-op admission decision for every OTHER
+    /// row — `layer_norm`, `rope`, `softmax`, `geglu`, `gelu_erf`,
+    /// `attention_block`, `lora_linear_fused`'s two report keys,
+    /// `cast_scale`, `cast_add`, `adamw_step`, `mem_efficient_attention` —
+    /// rather than leaving them entirely unconsulted.
+    ///
+    /// **What this does NOT claim.** Several rows resolve only their
+    /// device/build-feature/dtype gate fully; a further, genuinely
+    /// data-dependent condition (a real batch's sequence length for
+    /// `attention_block`/`mem_efficient_attention`/`attention_block_flash`,
+    /// a real base checkpoint's own bias shape for `lora_linear_fused`) is
+    /// recorded as its OWN explicit `data_dependent:{reason}` value, never
+    /// silently rounded to "holds" — see `DryRunVerdict`'s own doc for why
+    /// this is MORE than the single `seq` residual #546's own restatement
+    /// named, read directly from each real predicate rather than assumed.
+    /// A `data_dependent` value is itself part of the hashed string (a run
+    /// whose config makes an op data-dependent hashes differently from one
+    /// where that op is `not_reached` or `holds`), but it cannot
+    /// distinguish two runs that are BOTH data-dependent on the same op —
+    /// that residual is real, stated, and left open at
+    /// <https://github.com/f-inverse/jammi-ai/issues/546> only for the
+    /// `admit`/`admit_cascade` predicate functions themselves to close by
+    /// being called with the real batch, which this pre-training fold
+    /// structurally cannot do.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_admission_profile: Option<String>,
 }
@@ -723,13 +744,11 @@ pub enum ProducingDescriptor {
     /// use for the model they invoke — so `base_model_id` (below) is the
     /// db-local mirror of `env.models[0].model_id`, not a second identity.
     /// The fused-kernel admission profile is an environment fact, not a
-    /// spec knob, when it IS folded — but for this variant it is not: the
-    /// `FineTune` producer never calls
-    /// [`MaterializationEnv::with_kernel_admission_profile`], so
-    /// [`MaterializationEnv::kernel_admission_profile`] stays `None` here
-    /// and the real per-op fused/eager admission outcome is UNCOVERED by
-    /// this variant's [`DefinitionHash`] (that field's own doc carries the
-    /// tracking issue).
+    /// spec knob — folded via [`MaterializationEnv::with_kernel_admission_profile`]
+    /// (never `None` for this variant, unlike the producers above it) with a
+    /// value covering every `jammi_kernels::admission::PROBED_OPS` row — see
+    /// [`MaterializationEnv::kernel_admission_profile`]'s own doc for the
+    /// per-op detail and its stated `data_dependent` residual.
     ///
     /// `world_size` (`TrainingCommon`'s own topology field) and `collective`/
     /// `local_ranks` (below, #500 U4b) are this variant's topology fields

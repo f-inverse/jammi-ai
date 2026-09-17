@@ -176,7 +176,7 @@
 # expectation, checked via the SAME exact-SET-equality
 # `params.expect_kernels_disabled` (`finetune_step.rs:746-758`) machinery
 # the eager leg's own nonempty list uses —
-# `parse_disable_list` (`crates/jammi-kernels/src/admission.rs:1037-1046`)
+# `parse_disable_list` (`crates/jammi-kernels/src/admission.rs:1041-1046`)
 # is the empty set for `Some("")`, so
 # this hard-fails the run if `JAMMI_KERNELS_DISABLE` carries ANYTHING at
 # all when this process starts, catching an AMBIENT/leaked env var (a
@@ -326,23 +326,23 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # ten LIVE, STANDALONE `admit()`/`admit_cascade()`/`op_disabled()` op keys
 # this crate's fused finetune-step call graph actually reaches on a real
 # training step (confirmed at this contract's tip: `layer_norm_fused`
-# `crates/jammi-encoders/src/layer_norm.rs:585`, `geglu_fused`
-# `crates/jammi-encoders/src/modernbert.rs:1433`, `gelu_erf_fused`
-# `crates/jammi-encoders/src/activations.rs:173`, `attention_block_flash`
-# `crates/jammi-encoders/src/modernbert.rs:2002` (`op_disabled`, the
+# `crates/jammi-encoders/src/layer_norm.rs:130`, `geglu_fused`
+# `crates/jammi-encoders/src/modernbert.rs:1389`, `gelu_erf_fused`
+# `crates/jammi-encoders/src/activations.rs:32`, `attention_block_flash`
+# `crates/jammi-encoders/src/modernbert.rs:2000` (`op_disabled`, the
 # cascade's own capability gate), `attention_block_fused`
-# `crates/jammi-encoders/src/attention_cascade.rs:905` (moved out of
+# `crates/jammi-encoders/src/attention_cascade.rs:400` (moved out of
 # `crate::modernbert`, issue #462), `rope_fused`
-# `crates/jammi-encoders/src/modernbert.rs:485`, `softmax_last_dim_fused`
-# `crates/jammi-encoders/src/attention_cascade.rs:636` (moved out of
+# `crates/jammi-encoders/src/modernbert.rs:182`, `softmax_last_dim_fused`
+# `crates/jammi-encoders/src/attention_cascade.rs:405` (moved out of
 # `crate::modernbert`, issue #462), `lora_linear_fused`
-# `crates/jammi-lora/src/lora_linear.rs:1079`, `adamw_step_fused`
-# `crates/jammi-ai/src/fine_tune/adamw.rs:259`, `mem_efficient_attention`
-# `crates/jammi-encoders/src/attention_cascade.rs:859` (`admit_cascade`, the
+# `crates/jammi-lora/src/lora_linear.rs:227`, `adamw_step_fused`
+# `crates/jammi-ai/src/fine_tune/adamw.rs:34`, `mem_efficient_attention`
+# `crates/jammi-encoders/src/attention_cascade.rs:864` (`admit_cascade`, the
 # per-layer memeff cascade — consulted on EVERY training-mode attention
 # layer once the flash cascade has declined, BEFORE the block arm's own
 # `admit()`) and `op_disabled`
-# (`crates/jammi-encoders/src/modernbert.rs:2359`) is the once-per-forward
+# (`crates/jammi-encoders/src/modernbert.rs:2360`) is the once-per-forward
 # gate that suppresses the block/eager mask bundle when memeff is going to
 # fire.
 # `mem_efficient_attention` is the NINTH key, added by adversarial-audit
@@ -404,7 +404,7 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 #     than accepting a name that never fired.
 #   * NOT `lora_epilogue`/`lora_dropout`/`cast_scale_bf16_f32`/
 #     `cast_add_bf16` — subsumed by `lora_linear_fused`
-#     (`crates/jammi-kernels/src/admission.rs:101-115`):
+#     (`crates/jammi-kernels/src/admission.rs:104-115`):
 #     `lora_epilogue`/`lora_dropout` are REGISTERED but PERMANENTLY DEAD
 #     (their stand-alone call sites were superseded by the fused LoRA
 #     site's single `CustomOp3`, which never calls `admit` for either name

@@ -1,13 +1,14 @@
 //! The `FineTune` producer's materialization identity and its publish path.
 //!
-//! Model-level cache reuse (`CachePolicy::Use` probing a prior model row by
-//! materialization definition and finalizing a second row against its
-//! already-published prefix) is not yet supported: `Use` is refused, typed,
-//! at submit (`InferenceSession::submit_fine_tune_spec_deduped`), for both
-//! the in-process spec-construction path and a spec decoded off the wire —
-//! see <https://github.com/f-inverse/jammi-ai/issues/562>. Every `FineTune`
-//! run therefore computes and owns its own attempt-unique prefix; no two
-//! model rows this suite produces ever share one.
+//! Model-level cache reuse (#562, wave-5 F5): `CachePolicy::Use` probes a
+//! prior model row by materialization definition and finalizes a SECOND row
+//! against its already-published prefix, without training —
+//! `JobWorker::train_fine_tune`'s own doc has the probe mechanism;
+//! `FineTuneMaterializationOutcome::Reused`'s doc has the N:1 byte-safety
+//! argument (I1/I2's guard makes a prefix reachable for as long as EITHER
+//! row exists, in any tenant). `CachePolicy::Bypass` (the default) never
+//! probes: every `FineTune` run under it computes and owns its own
+//! attempt-unique prefix, exactly as before this unit.
 
 use std::sync::Arc;
 
@@ -16,7 +17,6 @@ use jammi_ai::fine_tune::worker::JobWorker;
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::jobs::JobResult;
 use jammi_ai::model::ModelTask;
-use jammi_db::error::JammiError;
 use jammi_db::store::CachePolicy;
 
 use crate::fine_tune::{session_with_training_data, tiny_bert_model};
@@ -91,73 +91,6 @@ async fn submit_and_run(
     (job.model_id.clone(), metrics.is_some(), cache_outcome)
 }
 
-/// `cache = Use` on `TrainingSpec::FineTune` is refused, typed, at the ONE
-/// point every submission path — in-process or decoded off the wire —
-/// passes through before any row is written
-/// (`InferenceSession::submit_fine_tune_spec_deduped`). Exercises the
-/// in-process construction path: [`InferenceSession::submit_fine_tune`]
-/// builds the spec directly from a [`jammi_wire::request::FineTuneRequest`],
-/// never touching the wire decode.
-#[tokio::test(flavor = "multi_thread")]
-async fn cache_use_is_refused_at_submit_on_the_embedded_path() {
-    let (session, _dir) = session_with_training_data().await;
-
-    let request = jammi_wire::request::FineTuneRequest {
-        source: "training".into(),
-        base_model: tiny_bert_model(),
-        columns: vec![
-            "text_a".to_string(),
-            "text_b".to_string(),
-            "score".to_string(),
-        ],
-        method: FineTuneMethod::Lora,
-        task: ModelTask::TextEmbedding,
-        config: None,
-        world_size: None,
-        cache: CachePolicy::Use,
-    };
-    let err = session
-        .submit_fine_tune(request)
-        .await
-        .expect_err("cache = Use must be refused before any row is written");
-    assert!(
-        matches!(&err, JammiError::Config(msg) if msg.contains("model-level cache reuse is not yet supported")),
-        "got {err:?}"
-    );
-
-    // The refusal leaves no row behind.
-    assert!(
-        session.catalog().list_jobs().await.unwrap().is_empty(),
-        "a refused submit must never write a `jobs` row"
-    );
-}
-
-/// [`cache_use_is_refused_at_submit_on_the_embedded_path`]'s peer for the
-/// WIRE decode path: a spec decoded off the wire
-/// (`jammi_ai::wire::training_spec_from_bytes`, the same seam the gRPC
-/// handler and the Python binding both drive) reaches the SAME refusal
-/// through [`InferenceSession::run_training_spec`], never a separate
-/// wire-only check.
-#[tokio::test(flavor = "multi_thread")]
-async fn cache_use_is_refused_at_submit_on_a_spec_decoded_off_the_wire() {
-    let (session, _dir) = session_with_training_data().await;
-
-    let spec = spec_with_cache(CachePolicy::Use);
-    let proto = jammi_ai::wire::training_spec_to_proto(&spec);
-    let bytes = prost::Message::encode_to_vec(&proto);
-    let decoded = jammi_ai::wire::training_spec_from_bytes(&bytes)
-        .expect("a well-formed request decodes: the refusal is not a decode-time one");
-
-    let err = session
-        .run_training_spec(decoded)
-        .await
-        .expect_err("cache = Use must be refused before any row is written");
-    assert!(
-        matches!(&err, JammiError::Config(msg) if msg.contains("model-level cache reuse is not yet supported")),
-        "got {err:?}"
-    );
-}
-
 /// `CachePolicy::Bypass` (the default) never probes: two submissions of the
 /// identical spec both train for real, each under its own name, and (being
 /// real, independent trainer runs) do NOT share a prefix.
@@ -188,6 +121,112 @@ async fn cache_bypass_never_reuses() {
         first.artifact_path, second.artifact_path,
         "two independent Bypass runs must never share a prefix"
     );
+}
+
+/// HEADLINE (#562 item 3, wave-5 F5): `cache = Use` reuses an exact
+/// definition match through the REAL submit→claim→run path (never a
+/// hand-built fixture). The FIRST submission has no candidate to match, so
+/// it MISSES and trains for real (`cache_outcome = "computed"`); the
+/// SECOND, textually identical submission HITS — no training happens (no
+/// run-metrics recorded), `cache_outcome = "reused:{first_model_id}"`
+/// (the wire/server parity claim: `jammi-server`'s
+/// `job_status_response_from_record` copies `EngineJobResult::Model`'s
+/// `cache_outcome` field into `pb::ModelResult` verbatim, with no
+/// transformation — read directly, `crates/jammi-server/src/grpc/job.rs`
+/// — so this string IS the wire value, not a proxy for it), and both
+/// catalog rows serve the EXACT SAME `artifact_path`.
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_use_reuses_an_exact_definition_match() {
+    let (session, _dir) = session_with_training_data().await;
+
+    let (first_model_id, first_trained, first_cache_outcome) =
+        submit_and_run(&session, spec_with_cache(CachePolicy::Use)).await;
+    assert!(
+        first_trained,
+        "no candidate exists yet: the first Use submission must train for real"
+    );
+    assert_eq!(first_cache_outcome, "computed");
+
+    let (second_model_id, second_trained, second_cache_outcome) =
+        submit_and_run(&session, spec_with_cache(CachePolicy::Use)).await;
+    assert!(
+        !second_trained,
+        "an exact-definition hit must never train — no run-metrics recorded"
+    );
+    assert_eq!(second_cache_outcome, format!("reused:{first_model_id}"));
+    assert_ne!(
+        first_model_id, second_model_id,
+        "each submission still gets its own output model_id — only the PREFIX is shared"
+    );
+
+    let catalog = session.catalog();
+    let first = catalog.get_model(&first_model_id).await.unwrap().unwrap();
+    let second = catalog.get_model(&second_model_id).await.unwrap().unwrap();
+    assert!(first.artifact_path.is_some());
+    assert_eq!(
+        first.artifact_path, second.artifact_path,
+        "a cache-hit row must name the EXACT SAME prefix the reused row serves"
+    );
+}
+
+/// #562 item 3's N:1 byte-safety oracle, exercised through the SAME real
+/// submit→claim→run path as the headline test above (never a hand-built
+/// fixture): after a cache hit, deleting EITHER row leaves the OTHER one
+/// loadable and the shared prefix reachable; deleting BOTH makes it
+/// reclaimable. Complements (never duplicates) the catalog-level I5 oracle
+/// in `crates/jammi-db/tests/it/model_prefix_ownership.rs`, which proves the
+/// SAME property against hand-registered rows including the cross-tenant
+/// shape — this test's own value is proving the REAL job path produces
+/// exactly that shape, not a synthetic stand-in for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_one_of_two_reused_rows_leaves_the_other_loadable_and_the_prefix_referenced() {
+    let (session, _dir) = session_with_training_data().await;
+    let (first_model_id, _, _) = submit_and_run(&session, spec_with_cache(CachePolicy::Use)).await;
+    let (second_model_id, _, _) = submit_and_run(&session, spec_with_cache(CachePolicy::Use)).await;
+
+    let catalog = session.catalog();
+    let prefix_str = catalog
+        .get_model(&first_model_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .artifact_path
+        .unwrap();
+    let prefix = jammi_db::storage::StorageUrl::parse(&prefix_str).unwrap();
+    let store = session.result_store();
+
+    assert_eq!(
+        store.prefix_is_referenced(&prefix).await.unwrap(),
+        2,
+        "both rows naming the prefix must count"
+    );
+
+    // Delete the OWNER (first-registered) row — never refused
+    // (`Catalog::delete_model` scans no `models` edge at all): the reuser
+    // still loads, and the prefix stays referenced by it alone.
+    catalog
+        .delete_model(&first_model_id, None, false, 0)
+        .await
+        .unwrap();
+    assert!(
+        catalog.get_model(&second_model_id).await.unwrap().is_some(),
+        "the surviving reuser row must still load after the owner is gone"
+    );
+    assert_eq!(store.prefix_is_referenced(&prefix).await.unwrap(), 1);
+    assert!(matches!(
+        store.delete_unreferenced_prefix(&prefix).await,
+        Err(jammi_db::error::JammiError::Storage(
+            jammi_db::storage::StorageError::Referenced { count: 1, .. }
+        ))
+    ));
+
+    // Delete the reuser too — both rows are gone, the prefix is unreferenced.
+    catalog
+        .delete_model(&second_model_id, None, false, 0)
+        .await
+        .unwrap();
+    assert_eq!(store.prefix_is_referenced(&prefix).await.unwrap(), 0);
+    store.delete_unreferenced_prefix(&prefix).await.unwrap();
 }
 
 /// Bundle flatness is an ORACLE, not an assumption: the containment-aware

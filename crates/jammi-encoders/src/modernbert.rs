@@ -36,7 +36,8 @@ use candle_nn::{embedding, linear_no_bias, Embedding, VarBuilder, VarMap};
 use jammi_kernels::admission::{
     admission_mode, admit, admit_cascade, cascade_counters_for, counters_for, device_is_supported,
     flash_validated_arches, op_disabled, probe_cuda_compute_capability, CascadeOutcome,
-    ComputeCapability, DispatchCounters, DispatchOutcome, PredicateOutcome,
+    ComputeCapability, DispatchCounters, DispatchOutcome, PredicateOutcome, ATTENTION_BLOCK_FLASH,
+    GEGLU, ROPE,
 };
 use jammi_kernels::ops::{apply1, apply3, FullyMaskedPolicy, RopeFused, MAX_HEAD_DIM};
 use jammi_lora::{
@@ -482,7 +483,7 @@ impl RotaryEmbedding {
         crate::seam_gate("modernbert::RotaryEmbedding::apply_training");
         let outcome = admit(
             admission_mode(),
-            "rope_fused",
+            &ROPE,
             predicate,
             holds,
             *ROPE_DISPATCH_COUNTERS,
@@ -1103,7 +1104,7 @@ impl ModernBertAttention {
         crate::seam_gate("modernbert::ModernBertAttention::forward_padded_transport_attention");
         let flash_dispatch = admit_cascade(
             admission_mode(),
-            "attention_block_flash",
+            &ATTENTION_BLOCK_FLASH,
             flash.reason(),
             flash.outcome(),
             false,
@@ -1430,7 +1431,7 @@ fn geglu_apply_training(wi_out: &Tensor) -> Result<Tensor, EncoderError> {
     crate::seam_gate("modernbert::geglu_apply_training");
     let outcome = admit(
         admission_mode(),
-        "geglu_fused",
+        &GEGLU,
         predicate,
         holds,
         *GEGLU_DISPATCH_COUNTERS,
@@ -10675,11 +10676,11 @@ mod tests {
     /// `cargo test`'s parallel thread pool would be racy).
     #[test]
     fn attention_block_strict_mode_errors_instead_of_falling_back_on_a_failed_predicate() {
-        use jammi_kernels::admission::AdmissionMode;
+        use jammi_kernels::admission::{AdmissionMode, ATTENTION_BLOCK};
         let counters = jammi_kernels::admission::DispatchCounters::new();
         let err = admit(
             AdmissionMode::Strict,
-            "attention_block_fused",
+            &ATTENTION_BLOCK,
             "mask_shape_batch_or_one_1_1_seq",
             false,
             &counters,

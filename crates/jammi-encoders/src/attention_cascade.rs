@@ -125,7 +125,8 @@ use std::sync::LazyLock;
 use candle_core::{DType, Device, Tensor, D};
 use jammi_kernels::admission::{
     admission_mode, admit, admit_cascade, cascade_counters_for, counters_for, device_is_supported,
-    CascadeOutcome, DispatchCounters, DispatchOutcome, PredicateOutcome,
+    CascadeOutcome, DispatchCounters, DispatchOutcome, PredicateOutcome, ATTENTION_BLOCK,
+    ATTENTION_BLOCK_FLASH, MEM_EFFICIENT_ATTENTION, SOFTMAX,
 };
 use jammi_kernels::ops::{
     apply2, apply3, mem_efficient_attention, AttentionBlockFused, FullyMaskedPolicy,
@@ -633,7 +634,7 @@ pub(crate) fn softmax_apply_training(
     crate::seam_gate("attention_cascade::softmax_apply_training");
     let outcome = admit(
         admission_mode(),
-        "softmax_last_dim_fused",
+        &SOFTMAX,
         predicate,
         holds,
         *SOFTMAX_DISPATCH_COUNTERS,
@@ -830,7 +831,7 @@ pub(crate) fn training_attention_cascade(
     // `flash` is always `Declined { CapabilityMiss, "flash_transport_not_wired" }`.
     let flash_dispatch = admit_cascade(
         admission_mode(),
-        "attention_block_flash",
+        &ATTENTION_BLOCK_FLASH,
         flash.reason(),
         flash.outcome(),
         true,
@@ -856,7 +857,7 @@ pub(crate) fn training_attention_cascade(
         mem_efficient_attention_predicate(qkv.device(), qkv.dtype(), seq, flash);
     let memeff_dispatch = admit_cascade(
         admission_mode(),
-        "mem_efficient_attention",
+        &MEM_EFFICIENT_ATTENTION,
         memeff_reason,
         memeff_outcome,
         true,
@@ -902,7 +903,7 @@ pub(crate) fn training_attention_cascade(
     );
     let outcome = admit(
         admission_mode(),
-        "attention_block_fused",
+        &ATTENTION_BLOCK,
         predicate,
         holds,
         *ATTENTION_BLOCK_DISPATCH_COUNTERS,

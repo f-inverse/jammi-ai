@@ -3065,3 +3065,105 @@ async fn migration_039_on_an_unclassifiable_value_fails_closed() {
         "a refused migration must install neither the trigger nor the CHECK it was attempting"
     );
 }
+
+/// `catalog::lease::pg_canonical_stamp`'s GUC-independence (S1's own oracle
+/// requirement): `to_char` with an explicit picture must render the SAME
+/// text regardless of the session's `DateStyle`/`TimeZone`, unlike a bare
+/// `::text` cast. `SET LOCAL` (transaction-scoped, reverted automatically
+/// at commit or rollback) rather than `SET`, since this runs on a POOLED
+/// connection another test could reuse afterward. Self-contained: no
+/// table at all, a plain `SELECT` of a literal expression, never touching
+/// the shared schema.
+#[cfg(feature = "live-postgres-tests")]
+#[tokio::test]
+async fn pg_canonical_stamp_is_independent_of_session_datestyle_and_timezone() {
+    use jammi_db::catalog::lease::pg_canonical_stamp;
+
+    let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+        eprintln!("skipping: JAMMI_TEST_PG_URL unset");
+        return;
+    };
+    let backend = BackendImpl::Postgres(
+        jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(&url, 2, None)
+            .await
+            .unwrap(),
+    );
+
+    let default_render: String = backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                let sql = format!(
+                    "SELECT {} AS s",
+                    pg_canonical_stamp("'2026-01-01T00:00:00.123456Z'::timestamptz")
+                );
+                tx.query_opt(&sql, &[], |row| row.get::<String>("s")).await
+            })
+        })
+        .await
+        .unwrap()
+        .expect("one row");
+
+    let altered_render: String = backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute("SET LOCAL datestyle = 'SQL, MDY'", &[]).await?;
+                tx.execute("SET LOCAL timezone = 'Asia/Kolkata'", &[])
+                    .await?;
+                let sql = format!(
+                    "SELECT {} AS s",
+                    pg_canonical_stamp("'2026-01-01T00:00:00.123456Z'::timestamptz")
+                );
+                tx.query_opt(&sql, &[], |row| row.get::<String>("s")).await
+            })
+        })
+        .await
+        .unwrap()
+        .expect("one row");
+
+    assert_eq!(
+        default_render, "2026-01-01T00:00:00.123456Z",
+        "the default-session rendering must already be canonical"
+    );
+    assert_eq!(
+        default_render, altered_render,
+        "pg_canonical_stamp's rendering must not depend on DateStyle/TimeZone"
+    );
+
+    // Control: a bare `::text` cast (what the pre-039 writer used) DOES
+    // depend on these GUCs -- proving the oracle's altered-session arm
+    // actually changed something observable, not merely a no-op SET.
+    let bare_cast_default: String = backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.query_opt(
+                    "SELECT ('2026-01-01T00:00:00.123456Z'::timestamptz)::text AS s",
+                    &[],
+                    |row| row.get::<String>("s"),
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap()
+        .expect("one row");
+    let bare_cast_altered: String = backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute("SET LOCAL datestyle = 'SQL, MDY'", &[]).await?;
+                tx.query_opt(
+                    "SELECT ('2026-01-01T00:00:00.123456Z'::timestamptz)::text AS s",
+                    &[],
+                    |row| row.get::<String>("s"),
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap()
+        .expect("one row");
+    assert_ne!(
+        bare_cast_default, bare_cast_altered,
+        "control: a bare ::text cast DOES vary with DateStyle -- confirms the SET actually took \
+         effect, so pg_canonical_stamp's invariance above is not a vacuous pass"
+    );
+}

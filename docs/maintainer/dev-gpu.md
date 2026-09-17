@@ -866,12 +866,14 @@ may still drive the two-host test BY HAND with the primitives above:
    `rp_cluster_pods` until both members are `RUNNING` with a reachable
    `ssh.direct` (or the overlay-ip fallback through the primary), then
    probe each member with `ssh … true` until it answers
-   (`_rpc_wait_ssh_ready`, bounded by `RP_SSH_WAIT_SECS`): a `RUNNING`
+   (`rp_wait_sshd`, bounded by `RP_SSH_WAIT_SECS`): a `RUNNING`
    pod's entrypoint installs sshd after boot, so the endpoint RunPod
    reports refuses connections for a while first. Both transports run
    this probe for both members before any remote command.
-3. On BOTH members: clone this tree at the commit under test and build the
-   `gpu_capability` test target.
+3. On BOTH members, concurrently: clone this tree at the commit under test
+   and build the `gpu_capability` test target (only the proof needs the id,
+   so neither build waits on the other; the driver's one watch loop bounds
+   both by log growth within `RP_INACTIVITY` and the T-10m budget).
 4. On the member running rank 0: export `JAMMI_GANG_TWO_HOSTS_RANK=0`,
    `JAMMI_GANG_TWO_HOSTS_WORLD=2`, `JAMMI_GANG_TWO_HOSTS_ID_FILE=<path>`,
    `JAMMI_GANG_ARTIFACT_DIR=<path>`, `NCCL_SOCKET_IFNAME=ens1`,
@@ -884,8 +886,10 @@ may still drive the two-host test BY HAND with the primitives above:
    --test-threads=1`.
 5. Once rank 0's id file holds exactly 128 bytes, `scp` it to the member
    running rank 1 (mode 0600; delete the local copy once the id has
-   crossed) and start rank 1 with the SAME env (including
-   `JAMMI_REQUIRE_CUDA_TWO_HOSTS=1`), `JAMMI_GANG_TWO_HOSTS_RANK=1`.
+   crossed). Rank 1 runs with the SAME env (including
+   `JAMMI_REQUIRE_CUDA_TWO_HOSTS=1`), `JAMMI_GANG_TWO_HOSTS_RANK=1`, and its
+   script blocks between its build and its proof until that file holds
+   128 bytes — the proof, never the build, waits for the id.
 6. Read both `rank-<r>.json` reports back; `rp_cluster_delete` the cluster
    when done — do not rely on member self-removal alone (below).
 7. Treat the id as a secret throughout: it must never appear in a

@@ -1758,7 +1758,7 @@ else
   bad "P3: expected each create call to name its own rank literal"
 fi
 if grep -qF '_rpc_remote_script 0 | ssh "${RP_SSHO[@]}" -p "$primary_port" "root@${primary_host}"' "$CLUSTER_SH" \
-  && grep -qF '_rpc_remote_script 1 | ssh "${RP_SSHO[@]}" -p "$member_port" "root@${member_host}"' "$CLUSTER_SH"; then
+  && grep -qF '_rpc_remote_script 1 | ssh "${RP_SSHO[@]}" "${member_extra_sshopts[@]}" -p "$member_port" "root@${member_host}"' "$CLUSTER_SH"; then
   ok "P3: rank 0's remote script runs on the primary (rank 0's own pod), rank 1's on the member (rank 1's own pod)"
 else
   bad "P3: expected rank 0/1's remote script to run on the primary/member host respectively"
@@ -1981,9 +1981,10 @@ fi
 # the module doc's own EXIT CONTRACT documents the SAME closed set for
 # both transports.
 # ----------------------------------------------------------------------------
-if grep -qF 'exit 75' "$CLUSTER_SH" && grep -qF 'exit 76' "$CLUSTER_SH" \
-  && grep -qF 'exit 77' "$CLUSTER_SH" && grep -qF 'exit 97' "$CLUSTER_SH" && grep -qF 'exit 124' "$CLUSTER_SH"; then
-  ok "P8: every named exit code (75/76/77/97/124) appears in the pods branch too (grep over the whole file, both branches share the set)"
+if grep -qE '(exit|return) 75' "$CLUSTER_SH" && grep -qE '(exit|return) 76' "$CLUSTER_SH" \
+  && grep -qE '(exit|return) 77' "$CLUSTER_SH" && grep -qE '(exit|return) 97' "$CLUSTER_SH" && grep -qE '(exit|return) 124' "$CLUSTER_SH" \
+  && [ "$(grep -c '_rpc_run_two_ranks "\$primary_host" "\$primary_port" "\$member_host" "\$member_port" || exit \$?' "$CLUSTER_SH")" -eq 2 ]; then
+  ok "P8: every named exit code (75/76/77/97/124) appears in the driver (the shared rank runner returns 76/77/124 and BOTH arms exit with its status verbatim)"
 else
   bad "P8: one or more named exit codes is missing from the driver text"
 fi
@@ -2031,7 +2032,7 @@ fi
 # Static ordering, both arms (the F10/P3 precedent): each arm's TWO wait calls
 # precede that arm's first `_rpc_remote_script 0 | ssh` launch.
 p11_waits="$(grep -n '^rp_wait_sshd "\$primary_host"' "$CLUSTER_SH" | cut -d: -f1 | tr '\n' ' ')"
-p11_launch="$(grep -n '^_rpc_remote_script 0 | ssh' "$CLUSTER_SH" | cut -d: -f1 | tr '\n' ' ')"
+p11_launch="$(grep -n '^_rpc_run_two_ranks "\$primary_host"' "$CLUSTER_SH" | cut -d: -f1 | tr '\n' ' ')"
 p11_ok=1
 set -- $p11_launch
 for launch in "$@"; do
@@ -2042,14 +2043,95 @@ for launch in "$@"; do
   [ "$seen" -eq 1 ] || p11_ok=0
 done
 if [ "$p11_ok" -eq 1 ] && [ "$(printf '%s' "$p11_waits" | wc -w)" -eq 2 ] && [ "$(printf '%s' "$p11_launch" | wc -w)" -eq 2 ]; then
-  ok "P11: both arms (cluster, pods) wait for sshd on rank 0 within 40 lines before their own rank-0 launch (waits at ${p11_waits}; launches at ${p11_launch})"
+  ok "P11: both arms (cluster, pods) wait for sshd on rank 0 within 40 lines before their own _rpc_run_two_ranks call (waits at ${p11_waits}; launches at ${p11_launch})"
 else
-  bad "P11: expected a rank-0 sshd wait shortly before EACH arm's rank-0 launch; waits=${p11_waits} launches=${p11_launch}"
+  bad "P11: expected a rank-0 sshd wait shortly before EACH arm's _rpc_run_two_ranks call; waits=${p11_waits} launches=${p11_launch}"
 fi
 if [ "$(grep -c '^rp_wait_sshd "\$member_host"' "$CLUSTER_SH")" -eq 2 ]; then
   ok "P11: both arms wait for sshd on rank 1 too"
 else
   bad "P11: expected two rank-1 sshd waits (one per arm)"
+fi
+# ----------------------------------------------------------------------------
+# P12: the two ranks run through ONE shared function on both transports;
+# both build concurrently; the id crossing is a phase of the watch loop
+# bounded by rank 0's liveness, log growth and the budget -- never a wall
+# clock of its own (run 35164486335: the crossing was bounded by
+# RP_SSH_WAIT_SECS=300 s while a cold build takes far longer). Every exit
+# arm of `_rpc_run_two_ranks` is driven here with stubbed ssh/scp/remote
+# scripts (the REAL function, the REAL `_rpc_id_file_ready`).
+# ----------------------------------------------------------------------------
+P12_DIR="$SANDBOX/p12"
+run_two_ranks_fixture() { # $1=rank0 script body $2=rank1 script body $3=RP_INACTIVITY $4=deadline offset (s)
+  rm -rf "$P12_DIR"; mkdir -p "$P12_DIR"
+  P12_R0="$1" P12_R1="$2" P12_INACT="$3" P12_DL="$4" bash -c '
+    source "'"$CLUSTER_SH"'" >/dev/null 2>&1
+    RP_SSHO=(-o Fixture=yes); member_extra_sshopts=(-o "ProxyJump=root@jump:1")
+    RP_WORK="'"$P12_DIR"'/work"; mkdir -p "$RP_WORK"  # the driver'"'"'s own EXIT cleanup removes RP_WORK -- never the fixture dir itself
+    CLUSTER_REMOTE_ID_FILE=/remote/nccl.id; RP_TIMEOUT=30
+    RP_INACTIVITY="$P12_INACT"; DEADLINE=$(( SECONDS + P12_DL )); id_landed=0; unset PROVE_EXPECT_SHA
+    _rpc_remote_script() { [ "$1" = "0" ] && printf "%s\n" "$P12_R0" || printf "%s\n" "$P12_R1"; }
+    ssh() { echo "ssh $*" >> "'"$P12_DIR"'/calls"; bash -s; }
+    scp() { echo "scp $*" >> "'"$P12_DIR"'/calls"; case "$*" in *"root@"*":"*" "*) : ;; esac
+            last="${@: -1}"; case "$last" in "'"$P12_DIR"'"/*) head -c 128 /dev/zero > "$last" ;; esac; }
+    _rpc_remote_id_size() { cat "'"$P12_DIR"'/idsize" 2>/dev/null; }
+    _rpc_phase() { echo "=== PHASE ($SECONDS)s: $* ==="; }
+    sleep() { command sleep 0.1; }
+    _rpc_run_two_ranks "10.0.0.1" "2201" "10.0.0.2" "2202"; rc=$?
+    echo "RC=$rc id_landed=${id_landed} rank0_rc=${rank0_rc:-?} rank1_rc=${rank1_rc:-?}"
+  ' 2>&1
+}
+r0_happy='echo start0; command sleep 0.4; echo 128 > "'"$P12_DIR"'/idsize"; command sleep 0.4; echo done0'
+r1_happy='echo start1; command sleep 0.6; echo done1'
+out="$(run_two_ranks_fixture "$r0_happy" "$r1_happy" 30 600)"
+if printf '%s' "$out" | grep -q "RC=0 id_landed=1 rank0_rc=0 rank1_rc=0" \
+   && printf '%s' "$out" | grep -q "the id crossed to the member" \
+   && [ "$(grep -c '^ssh ' "$P12_DIR/calls")" -eq 2 ] \
+   && [ "$(grep -n '^scp ' "$P12_DIR/calls" | wc -l | tr -d ' ')" -eq 2 ] \
+   && grep -m1 '^scp ' "$P12_DIR/calls" | grep -q "root@10.0.0.1:/remote/nccl.id" \
+   && grep '^scp ' "$P12_DIR/calls" | tail -1 | grep -q -- "-o ProxyJump=root@jump:1 -P 2202 .* root@10.0.0.2:/remote/nccl.id" \
+   && grep '^ssh ' "$P12_DIR/calls" | tail -1 | grep -q -- "-o ProxyJump=root@jump:1 -p 2202 root@10.0.0.2"; then
+  ok "P12: happy path -- both ranks launched up front (2 ssh, rank 1 with its own options), the id scp'd down from the primary then up to the member exactly once each, both ranks rc 0, id_landed=1"
+else
+  bad "P12: happy path off; out=$out calls=$(cat "$P12_DIR/calls" 2>/dev/null)"
+fi
+r0_dies='echo start0; command sleep 0.2; exit 3'
+out="$(run_two_ranks_fixture "$r0_dies" "$r1_happy" 30 600)"
+if printf '%s' "$out" | grep -q "RC=76" && printf '%s' "$out" | grep -q "::error::rank 0 ended (rc=3) before minting the 128-byte id file"; then
+  ok "P12: rank 0 exiting before the id is minted -> 76 with rank 0's own rc named; no scp ever attempted"
+else
+  bad "P12: expected 76 naming rank 0's rc; out=$out"
+fi
+r0_silent='command sleep 5'
+r1_silent='command sleep 5'
+out="$(run_two_ranks_fixture "$r0_silent" "$r1_silent" 1 600)"
+if printf '%s' "$out" | grep -q "RC=76" && printf '%s' "$out" | grep -q "::error::inactivity: no new output on either rank's log for 1s"; then
+  ok "P12: no log growth on either rank within RP_INACTIVITY -> 76, named inactivity (the crossing wait has no clock of its own)"
+else
+  bad "P12: expected the inactivity arm; out=$out"
+fi
+out="$(run_two_ranks_fixture "$r0_happy" "$r1_happy" 30 0)"
+if printf '%s' "$out" | grep -q "RC=124" && printf '%s' "$out" | grep -q "budget cut at T-10m"; then
+  ok "P12: the T-10m budget cuts the leg at 124 during the crossing wait"
+else
+  bad "P12: expected the budget arm (124); out=$out"
+fi
+p12_calls="$(grep -c '^_rpc_run_two_ranks "\$primary_host" "\$primary_port" "\$member_host" "\$member_port" || exit \$?' "$CLUSTER_SH")"
+if [ "$p12_calls" -eq 2 ] && ! grep -q 'id_deadline=' "$CLUSTER_SH" && ! grep -q 'never produced a 128-byte id file within' "$CLUSTER_SH"; then
+  ok "P12: both transport arms run the ranks through the ONE shared function; the wall-clock id poll is gone from the tree"
+else
+  bad "P12: expected exactly two shared-function calls and no wall-clock id poll; calls=$p12_calls"
+fi
+p12_scripts="$(RP_TWO_HOST_GN_IP_0=10.0.0.1 RP_TWO_HOST_GN_IP_1=10.0.0.2 bash -c '
+  source "'"$CLUSTER_SH"'" >/dev/null 2>&1
+  export RP_TWO_HOST_GN_IP_0 RP_TWO_HOST_GN_IP_1
+  echo "r1=$(_rpc_remote_script 1 | grep -c "=== id-wait: rank 1 built") r0=$(_rpc_remote_script 0 | grep -c "id-wait")"
+  _rpc_remote_script 1 | awk "/::group::cluster-build/{b=NR} /=== id-wait: rank 1 built/{w=NR} /::group::cluster-proof/{p=NR} END{print (b<w && w<p) ? \"order-ok\" : \"order-bad\"}" | head -1
+' 2>&1 | tr '\n' ' ')"
+if printf '%s' "$p12_scripts" | grep -q "r1=1 r0=0" && printf '%s' "$p12_scripts" | grep -q "order-ok"; then
+  ok "P12: rank 1's remote script waits for the 128-byte id BETWEEN its build and its proof; rank 0's never waits"
+else
+  bad "P12: expected the id wait only in rank 1's script, between build and proof; got: $p12_scripts"
 fi
 # ----------------------------------------------------------------------------
 # P10: prose == code.

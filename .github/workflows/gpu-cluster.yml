@@ -130,10 +130,11 @@ jobs:
     # A job-timeout kill is another trap bypass, so this budget sits ABOVE
     # the driver's own T-10m internal budget cut. Derived from the SAME
     # terms as the cost bound above: the member-readiness poll
-    # (RP_SSH_WAIT_SECS=300s=5m) + the id-file poll (another
+    # (RP_SSH_WAIT_SECS=300s=5m) + the sshd probe (bounded by the same
     # RP_SSH_WAIT_SECS=5m) + the remote job's own RP_TIMEOUT (50m,
-    # runpod_lib.sh's library default -- this lane declares no second one)
-    # + 10m runner overhead = 70m. The cluster's own 1h entrypoint deadline
+    # runpod_lib.sh's library default -- this lane declares no second one;
+    # both ranks build concurrently and the id crossing is inside that
+    # budget, never a wall clock of its own) + 10m runner overhead = 70m. The cluster's own 1h entrypoint deadline
     # is what actually bounds the spend; this only bounds the runner.
     timeout-minutes: 70
     steps:

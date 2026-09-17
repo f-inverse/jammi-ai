@@ -112,7 +112,12 @@
 # atomically, to its own host's id file; this driver polls that file (via
 # `stat` over ssh) until it reports EXACTLY 128 bytes, `scp`s it down to a
 # LOCAL staging copy (`$RP_WORK/nccl.id`, mode 0600), then `scp`s that
-# staging copy up to the member host — ONLY THEN does rank 1 start. The id
+# staging copy up to the member host — ONLY THEN does rank 1's PROOF start
+# (both ranks clone and build concurrently; rank 1's script blocks between
+# its build and its proof until that file holds 128 bytes). The crossing is
+# a phase of the one watch loop, bounded by rank 0's liveness, log growth
+# within RP_INACTIVITY and the T-10m budget — never a separate wall clock
+# (`_rpc_run_two_ranks`). The id
 # never rides inside `JAMMI_GANG_ARTIFACT_DIR` and never reaches this
 # driver's own stdout/log in the clear. The moment the download from the
 # primary is ATTEMPTED, this driver's own cleanup trap starts scanning: on
@@ -843,6 +848,107 @@ export NCCL_SOCKET_IFNAME="\$iface"
 IFACE
 }
 
+# The size of rank 0's id file, read over ssh: the ONE probe the id crossing
+# polls. A helper so the lane suite can drive `_rpc_run_two_ranks` with a
+# fixture that mints the id after N polls.
+_rpc_remote_id_size() { # $1=host $2=port
+  ssh "${RP_SSHO[@]}" -p "$2" "root@${1}" "stat -c%s '${CLUSTER_REMOTE_ID_FILE}' 2>/dev/null"
+}
+
+# Run the two ranks, shared by BOTH transports (the same defect lived in two
+# copies of this text). Both members clone and build CONCURRENTLY — only the
+# PROOF needs the id — and the id crossing is a phase of the watch loop,
+# bounded by the SAME three rules as everything else (rank 0's liveness and
+# log growth within RP_INACTIVITY, the wrong-tree check, the T-10m budget),
+# never by a wall clock unrelated to the work it waits on (run 35164486335:
+# the crossing was bounded by RP_SSH_WAIT_SECS=300 s while rank 0's cold
+# build alone takes far longer, so no cold run could ever pass). Rank 1's
+# own remote script blocks between its build and its proof until the id file
+# it was shipped holds exactly 128 bytes; the id still travels ONLY through
+# the staging copy, after rank 0 minted it (`_rpc_remote_script`'s doc).
+#   $1=primary host $2=primary port $3=member host $4=member port;
+#   `member_extra_sshopts[@]` (global; empty under `pods`) rides on every
+#   member call. Sets the globals the assembly step reads: rank0_log,
+#   rank1_log, rank0_rc, rank1_rc, STAGING_ID_FILE, id_landed.
+_rpc_run_two_ranks() {
+  local primary_host="${1:?_rpc_run_two_ranks needs the primary host}" \
+        primary_port="${2:?_rpc_run_two_ranks needs the primary port}" \
+        member_host="${3:?_rpc_run_two_ranks needs the member host}" \
+        member_port="${4:?_rpc_run_two_ranks needs the member port}"
+  _rpc_phase "build (both ranks, concurrently) + two-host proof"
+  rank0_log="$(mktemp)"; rank1_log="$(mktemp)"
+  STAGING_ID_FILE="$RP_WORK/nccl.id"
+  _rpc_remote_script 0 | ssh "${RP_SSHO[@]}" -p "$primary_port" "root@${primary_host}" "timeout ${RP_TIMEOUT:-3000} bash -s" > "$rank0_log" 2>&1 &
+  rank0_pid=$!
+  _rpc_remote_script 1 | ssh "${RP_SSHO[@]}" "${member_extra_sshopts[@]}" -p "$member_port" "root@${member_host}" "timeout ${RP_TIMEOUT:-3000} bash -s" > "$rank1_log" 2>&1 &
+  rank1_pid=$!
+  _rpc_phase "watching both ranks (id crossing + inactivity + wrong-tree + budget)"
+  local last_growth=$SECONDS last_size0=0 last_size1=0 sz0 sz1 remote_size wrong_tree candidate_log line
+  while kill -0 "$rank0_pid" 2>/dev/null || kill -0 "$rank1_pid" 2>/dev/null; do
+    sleep 5
+    if [ "${id_landed:-0}" -ne 1 ]; then
+      if ! kill -0 "$rank0_pid" 2>/dev/null; then
+        wait "$rank0_pid" 2>/dev/null; rank0_rc=$?
+        echo "::error::rank 0 ended (rc=${rank0_rc}) before minting the 128-byte id file -- the proof never started (its log is in the artifact)"
+        kill -TERM "$rank1_pid" 2>/dev/null; wait "$rank1_pid" 2>/dev/null
+        return 76
+      fi
+      remote_size="$(_rpc_remote_id_size "$primary_host" "$primary_port")"
+      if [ "$remote_size" = "128" ]; then
+        id_landed=1
+        scp "${RP_SSHO[@]}" -P "$primary_port" "root@${primary_host}:${CLUSTER_REMOTE_ID_FILE}" "$STAGING_ID_FILE" \
+          || { echo "::error::could not scp the id down from the primary"; kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null; return 76; }
+        chmod 600 "$STAGING_ID_FILE"
+        _rpc_id_file_ready "$STAGING_ID_FILE" \
+          || { echo "::error::the staged id copy is not exactly 128 bytes -- refusing to ship it"; kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null; return 76; }
+        scp "${RP_SSHO[@]}" "${member_extra_sshopts[@]}" -P "$member_port" "$STAGING_ID_FILE" "root@${member_host}:${CLUSTER_REMOTE_ID_FILE}" \
+          || { echo "::error::could not scp the id up to the member"; kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null; return 76; }
+        echo "the id crossed to the member at $(( SECONDS ))s"
+      fi
+    fi
+    sz0=$(wc -c < "$rank0_log" 2>/dev/null || echo 0)
+    sz1=$(wc -c < "$rank1_log" 2>/dev/null || echo 0)
+    if [ "$sz0" -gt "$last_size0" ] || [ "$sz1" -gt "$last_size1" ]; then
+      last_growth=$SECONDS
+      last_size0=$sz0; last_size1=$sz1
+    fi
+    if [ -n "${PROVE_EXPECT_SHA:-}" ]; then
+      wrong_tree=0
+      for candidate_log in "$rank0_log" "$rank1_log"; do
+        while IFS= read -r line; do
+          if rp_parse_prove_sha "$line" && [ "$RP_PARSED_PROVE_SHA" != "$PROVE_EXPECT_SHA" ]; then
+            wrong_tree=1
+            break
+          fi
+        done < "$candidate_log"
+        [ "$wrong_tree" -eq 1 ] && break
+      done
+      if [ "$wrong_tree" -eq 1 ]; then
+        echo "::error::wrong tree: a rank's own PROVE_SHA disagreed with PROVE_EXPECT_SHA=${PROVE_EXPECT_SHA}"
+        kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null
+        return 77
+      fi
+    fi
+    if [ $(( SECONDS - last_growth )) -ge "${RP_INACTIVITY}" ]; then
+      echo "::error::inactivity: no new output on either rank's log for ${RP_INACTIVITY}s"
+      kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null
+      return 76
+    fi
+    if [ "$SECONDS" -ge "$DEADLINE" ]; then
+      echo "::error::budget cut at T-10m (per-phase breakdown above)"
+      kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null
+      return 124
+    fi
+  done
+  wait "$rank0_pid"; rank0_rc=$?
+  wait "$rank1_pid"; rank1_rc=$?
+  if [ "${id_landed:-0}" -ne 1 ]; then
+    echo "::error::both ranks ended (rank 0 rc=${rank0_rc}, rank 1 rc=${rank1_rc}) and the id never crossed"
+    return 76
+  fi
+  return 0
+}
+
 # The shared per-rank remote script text (F13: the zero-test tripwire lives
 # HERE, spliced via the pre-computed `${cluster_zero_test_tripwire}`
 # variable — never a bare `$(...)` inside this heredoc). $1=rank (0|1).
@@ -855,8 +961,20 @@ IFACE
 # shared, transport-agnostic.
 _rpc_remote_script() {
   local rank="${1:?_rpc_remote_script needs a rank}"
-  local two_host_iface_lines
+  local two_host_iface_lines id_wait_lines=""
   two_host_iface_lines="$(_rpc_two_host_iface_lines "$rank")"
+  # Every rank but 0 blocks between its build and its proof until the id
+  # rank 0 minted has been shipped to it (128 bytes exactly); the heartbeat
+  # line keeps the driver's inactivity watchdog fed while it waits. Rank 0
+  # mints the id inside its own proof and never waits.
+  if [ "$rank" != "0" ]; then
+    id_wait_lines='echo "=== id-wait: rank 1 built; waiting for the 128-byte id file rank 0 mints ==="
+while [ "$(stat -c%s "${JAMMI_GANG_TWO_HOSTS_ID_FILE}" 2>/dev/null)" != "128" ]; do
+  echo "id-wait: not yet (${SECONDS}s)"
+  sleep 10
+done
+echo "=== id-wait: the id landed ==="'
+  fi
   cat <<EOF
 export CARGO_TERM_COLOR=never
 export CARGO_BUILD_RUSTC_WRAPPER=  # wrapper-off (ledger row 17: no cross-target-dir reuse on this image)
@@ -897,6 +1015,7 @@ cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capa
 echo "PROVE_GROUP_RC name=cluster-build rc=\${grc}"
 echo "::endgroup::"
 
+${id_wait_lines}
 echo "::group::cluster-proof"
 grc=0
 mkdir -p "\${JAMMI_GANG_ARTIFACT_DIR}"
@@ -1438,96 +1557,7 @@ _rpc_phase "waiting for sshd on both members (an executed connect per member)"
 rp_wait_sshd "$primary_host" "$primary_port" "$RP_SSH_WAIT_SECS" "rank 0" || exit 76
 rp_wait_sshd "$member_host" "$member_port" "$RP_SSH_WAIT_SECS" "rank 1" "${member_extra_sshopts[@]}" || exit 76
 
-_rpc_phase "build + two-host proof"
-rank0_log="$(mktemp)"; rank1_log="$(mktemp)"
-STAGING_ID_FILE="$RP_WORK/nccl.id"
-
-_rpc_remote_script 0 | ssh "${RP_SSHO[@]}" -p "$primary_port" "root@${primary_host}" "timeout ${RP_TIMEOUT:-3000} bash -s" > "$rank0_log" 2>&1 &
-rank0_pid=$!
-
-_rpc_phase "polling the primary for the 128-byte id file"
-id_deadline=$(( SECONDS + RP_SSH_WAIT_SECS ))
-id_ready=0
-while [ "$SECONDS" -lt "$id_deadline" ]; do
-  if ! kill -0 "$rank0_pid" 2>/dev/null; then
-    break  # rank 0 already exited -- stop polling; `wait` below reads its rc.
-  fi
-  remote_size="$(ssh "${RP_SSHO[@]}" -p "$primary_port" "root@${primary_host}" "stat -c%s '${CLUSTER_REMOTE_ID_FILE}' 2>/dev/null")"
-  if [ "$remote_size" = "128" ]; then
-    id_ready=1
-    break
-  fi
-  sleep 3
-done
-if [ "$id_ready" -ne 1 ]; then
-  echo "::error::rank 0 never produced a 128-byte id file within ${RP_SSH_WAIT_SECS}s"
-  kill -TERM "$rank0_pid" 2>/dev/null; wait "$rank0_pid" 2>/dev/null
-  exit 76
-fi
-
-# P-A: from THIS line on, the id is about to exist locally on this runner
-# -- every exit arm from here onward (a failed download, a bad staging
-# size, a failed upload to the member, the watch loop's own inactivity/
-# wrong-tree/budget exits, a failed pull, a refused assembly) is scanned by
-# the EXIT trap before anything can be uploaded. Set BEFORE the download is
-# attempted, not after it succeeds, so a partially-written staging file
-# from a failed transfer is scanned (and refused as UNEXAMINABLE by its
-# own wrong byte-length, never silently skipped) rather than ignored.
-id_landed=1
-
-scp "${RP_SSHO[@]}" -P "$primary_port" "root@${primary_host}:${CLUSTER_REMOTE_ID_FILE}" "$STAGING_ID_FILE" \
-  || { echo "::error::could not scp the id down from the primary"; kill -TERM "$rank0_pid" 2>/dev/null; wait "$rank0_pid" 2>/dev/null; exit 76; }
-chmod 600 "$STAGING_ID_FILE"
-_rpc_id_file_ready "$STAGING_ID_FILE" \
-  || { echo "::error::the staged id copy is not exactly 128 bytes -- refusing to ship it"; kill -TERM "$rank0_pid" 2>/dev/null; wait "$rank0_pid" 2>/dev/null; exit 76; }
-
-scp "${RP_SSHO[@]}" "${member_extra_sshopts[@]}" -P "$member_port" "$STAGING_ID_FILE" "root@${member_host}:${CLUSTER_REMOTE_ID_FILE}" \
-  || { echo "::error::could not scp the id up to the member"; kill -TERM "$rank0_pid" 2>/dev/null; wait "$rank0_pid" 2>/dev/null; exit 76; }
-
-_rpc_remote_script 1 | ssh "${RP_SSHO[@]}" "${member_extra_sshopts[@]}" -p "$member_port" "root@${member_host}" "timeout ${RP_TIMEOUT:-3000} bash -s" > "$rank1_log" 2>&1 &
-rank1_pid=$!
-
-_rpc_phase "watching both ranks (inactivity + wrong-tree + budget)"
-last_growth=$SECONDS
-last_size0=0; last_size1=0
-while kill -0 "$rank0_pid" 2>/dev/null || kill -0 "$rank1_pid" 2>/dev/null; do
-  sleep 5
-  sz0=$(wc -c < "$rank0_log" 2>/dev/null || echo 0)
-  sz1=$(wc -c < "$rank1_log" 2>/dev/null || echo 0)
-  if [ "$sz0" -gt "$last_size0" ] || [ "$sz1" -gt "$last_size1" ]; then
-    last_growth=$SECONDS
-    last_size0=$sz0; last_size1=$sz1
-  fi
-  if [ -n "${PROVE_EXPECT_SHA:-}" ]; then
-    wrong_tree=0
-    for candidate_log in "$rank0_log" "$rank1_log"; do
-      while IFS= read -r line; do
-        if rp_parse_prove_sha "$line" && [ "$RP_PARSED_PROVE_SHA" != "$PROVE_EXPECT_SHA" ]; then
-          wrong_tree=1
-          break
-        fi
-      done < "$candidate_log"
-      [ "$wrong_tree" -eq 1 ] && break
-    done
-    if [ "$wrong_tree" -eq 1 ]; then
-      echo "::error::wrong tree: a rank's own PROVE_SHA disagreed with PROVE_EXPECT_SHA=${PROVE_EXPECT_SHA}"
-      kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null
-      exit 77
-    fi
-  fi
-  if [ $(( SECONDS - last_growth )) -ge "${RP_INACTIVITY}" ]; then
-    echo "::error::inactivity: no new output on either rank's log for ${RP_INACTIVITY}s"
-    kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null
-    exit 76
-  fi
-  if [ "$SECONDS" -ge "$DEADLINE" ]; then
-    echo "::error::budget cut at T-10m (per-phase breakdown above)"
-    kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null
-    exit 124
-  fi
-done
-wait "$rank0_pid"; rank0_rc=$?
-wait "$rank1_pid"; rank1_rc=$?
+_rpc_run_two_ranks "$primary_host" "$primary_port" "$member_host" "$member_port" || exit $?
 
 # F6 advisory: both ranks' own logs land in the uploaded/scanned directory
 # too, pass or fail alike -- copied here, unconditionally, before any
@@ -1683,88 +1713,7 @@ _rpc_phase "waiting for sshd on both pods (an executed connect per member)"
 rp_wait_sshd "$primary_host" "$primary_port" "$RP_SSH_WAIT_SECS" "rank 0" || exit 76
 rp_wait_sshd "$member_host" "$member_port" "$RP_SSH_WAIT_SECS" "rank 1" || exit 76
 
-_rpc_phase "build + two-host proof"
-rank0_log="$(mktemp)"; rank1_log="$(mktemp)"
-STAGING_ID_FILE="$RP_WORK/nccl.id"
-
-_rpc_remote_script 0 | ssh "${RP_SSHO[@]}" -p "$primary_port" "root@${primary_host}" "timeout ${RP_TIMEOUT:-3000} bash -s" > "$rank0_log" 2>&1 &
-rank0_pid=$!
-
-_rpc_phase "polling the primary for the 128-byte id file"
-id_deadline=$(( SECONDS + RP_SSH_WAIT_SECS ))
-id_ready=0
-while [ "$SECONDS" -lt "$id_deadline" ]; do
-  if ! kill -0 "$rank0_pid" 2>/dev/null; then
-    break
-  fi
-  remote_size="$(ssh "${RP_SSHO[@]}" -p "$primary_port" "root@${primary_host}" "stat -c%s '${CLUSTER_REMOTE_ID_FILE}' 2>/dev/null")"
-  if [ "$remote_size" = "128" ]; then
-    id_ready=1
-    break
-  fi
-  sleep 3
-done
-if [ "$id_ready" -ne 1 ]; then
-  echo "::error::rank 0 never produced a 128-byte id file within ${RP_SSH_WAIT_SECS}s"
-  kill -TERM "$rank0_pid" 2>/dev/null; wait "$rank0_pid" 2>/dev/null
-  exit 76
-fi
-
-id_landed=1
-
-scp "${RP_SSHO[@]}" -P "$primary_port" "root@${primary_host}:${CLUSTER_REMOTE_ID_FILE}" "$STAGING_ID_FILE" \
-  || { echo "::error::could not scp the id down from the primary"; kill -TERM "$rank0_pid" 2>/dev/null; wait "$rank0_pid" 2>/dev/null; exit 76; }
-chmod 600 "$STAGING_ID_FILE"
-_rpc_id_file_ready "$STAGING_ID_FILE" \
-  || { echo "::error::the staged id copy is not exactly 128 bytes -- refusing to ship it"; kill -TERM "$rank0_pid" 2>/dev/null; wait "$rank0_pid" 2>/dev/null; exit 76; }
-
-scp "${RP_SSHO[@]}" -P "$member_port" "$STAGING_ID_FILE" "root@${member_host}:${CLUSTER_REMOTE_ID_FILE}" \
-  || { echo "::error::could not scp the id up to the member"; kill -TERM "$rank0_pid" 2>/dev/null; wait "$rank0_pid" 2>/dev/null; exit 76; }
-
-_rpc_remote_script 1 | ssh "${RP_SSHO[@]}" -p "$member_port" "root@${member_host}" "timeout ${RP_TIMEOUT:-3000} bash -s" > "$rank1_log" 2>&1 &
-rank1_pid=$!
-
-_rpc_phase "watching both ranks (inactivity + wrong-tree + budget)"
-last_growth=$SECONDS
-last_size0=0; last_size1=0
-while kill -0 "$rank0_pid" 2>/dev/null || kill -0 "$rank1_pid" 2>/dev/null; do
-  sleep 5
-  sz0=$(wc -c < "$rank0_log" 2>/dev/null || echo 0)
-  sz1=$(wc -c < "$rank1_log" 2>/dev/null || echo 0)
-  if [ "$sz0" -gt "$last_size0" ] || [ "$sz1" -gt "$last_size1" ]; then
-    last_growth=$SECONDS
-    last_size0=$sz0; last_size1=$sz1
-  fi
-  if [ -n "${PROVE_EXPECT_SHA:-}" ]; then
-    wrong_tree=0
-    for candidate_log in "$rank0_log" "$rank1_log"; do
-      while IFS= read -r line; do
-        if rp_parse_prove_sha "$line" && [ "$RP_PARSED_PROVE_SHA" != "$PROVE_EXPECT_SHA" ]; then
-          wrong_tree=1
-          break
-        fi
-      done < "$candidate_log"
-      [ "$wrong_tree" -eq 1 ] && break
-    done
-    if [ "$wrong_tree" -eq 1 ]; then
-      echo "::error::wrong tree: a rank's own PROVE_SHA disagreed with PROVE_EXPECT_SHA=${PROVE_EXPECT_SHA}"
-      kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null
-      exit 77
-    fi
-  fi
-  if [ $(( SECONDS - last_growth )) -ge "${RP_INACTIVITY}" ]; then
-    echo "::error::inactivity: no new output on either rank's log for ${RP_INACTIVITY}s"
-    kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null
-    exit 76
-  fi
-  if [ "$SECONDS" -ge "$DEADLINE" ]; then
-    echo "::error::budget cut at T-10m (per-phase breakdown above)"
-    kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null
-    exit 124
-  fi
-done
-wait "$rank0_pid"; rank0_rc=$?
-wait "$rank1_pid"; rank1_rc=$?
+_rpc_run_two_ranks "$primary_host" "$primary_port" "$member_host" "$member_port" || exit $?
 
 mkdir -p "$CLUSTER_ARTIFACT_DIR"
 cp -f "$rank0_log" "${CLUSTER_ARTIFACT_DIR}/rank0.log" 2>/dev/null || echo "::warning::could not copy rank 0's own log into ${CLUSTER_ARTIFACT_DIR}"

@@ -1912,6 +1912,65 @@ def fixture_rr24_inspector_only_fails() -> None:
         _assert(any("inspector-class" in f for f in r.failures), "RR24", f"{r.failures}")
 
 
+def fixture_rr27_shared_validator_entry_not_object_denies() -> None:
+    """issue #569: the shared validator's OWN "is not an object" arm
+    (`_r12_anticipation_rejection`, marked `# R12-RESIDUAL` in
+    `lead-gate-lib.py`) -- reader 3 has no by-file pre-check at all (its
+    own preceding loop explicitly SKIPS a non-dict `entry`, see this
+    file's own `check_anticipation_witnesses`), so a malformed
+    `attacks[key]` reaches the shared validator's marked arm DIRECTLY,
+    never `_r12_validate_and_run_entry`'s per-entry runner (reader 1's
+    OWN second implementation of the identical three checks). Binds to
+    the arm's OWN producer text (`anticipation-validator:`), asserting the
+    OTHER producer's text (`anticipation artifact`) is ABSENT -- the two
+    are satisfiable by the same substring `is not an object` alone, which
+    is exactly what let this arm's own coverage go unexercised before."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_anticipation_commit(work, {
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+            "attacks": {"a.py": "not-an-object"},
+            "residual_risk": "fixture residual",
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR27", "a non-object attacks[a.py] entry must FAIL")
+        joined = " | ".join(r.failures)
+        _assert("anticipation-validator: attacks['a.py'] is not an object" in joined, "RR27", joined)
+        _assert("anticipation artifact" not in joined, "RR27", joined)
+
+
+def fixture_rr28_shared_validator_entry_no_command_denies() -> None:
+    """issue #569: the shared validator's OWN "has no `command`" arm."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_anticipation_commit(work, {
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+            "attacks": {"a.py": {"hash": "a" * 64}},
+            "residual_risk": "fixture residual",
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR28", "an attacks[a.py] entry with no command must FAIL")
+        joined = " | ".join(r.failures)
+        _assert("anticipation-validator: attacks['a.py'] has no `command`" in joined, "RR28", joined)
+        _assert("anticipation artifact" not in joined, "RR28", joined)
+
+
+def fixture_rr29_shared_validator_entry_no_valid_hash_denies() -> None:
+    """issue #569: the shared validator's OWN "has no valid `hash`" arm."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_anticipation_commit(work, {
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+            "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "not-hex"}},
+            "residual_risk": "fixture residual",
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR29", "an attacks[a.py] entry with an invalid hash must FAIL")
+        joined = " | ".join(r.failures)
+        _assert("anticipation-validator: attacks['a.py'] has no valid `hash`" in joined, "RR29", joined)
+        _assert("anticipation artifact" not in joined, "RR29", joined)
+
+
 def fixture_rr25_mixed_stream_via_real_export_selects_anticipation_only() -> None:
     """esc-lead-gate-R12 fix round 6 Z12, round-6 stop rule Z18: the
     production-shaped case — ONE real anticipation artifact AND ONE real
@@ -2323,6 +2382,9 @@ RR_FIXTURES = [
     ("RR22", fixture_rr22_no_residual_risk_fails),
     ("RR23", fixture_rr23_identical_pair_reused_fails),
     ("RR24", fixture_rr24_inspector_only_fails),
+    ("RR27", fixture_rr27_shared_validator_entry_not_object_denies),
+    ("RR28", fixture_rr28_shared_validator_entry_no_command_denies),
+    ("RR29", fixture_rr29_shared_validator_entry_no_valid_hash_denies),
     ("RR14", fixture_rr14_missing_gates_fails),
     ("RR15", fixture_rr15_complete_gates_rc_zero_allows),
     ("RR16", fixture_rr16_nonzero_rc_fails),

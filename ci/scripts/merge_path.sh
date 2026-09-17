@@ -197,11 +197,14 @@ with open(sys.argv[1], 'w') as out:
         out.write(e['name'] + '\t' + tc + '\t' + ' '.join(e['cmd'].split()) + '\n')
 print(f"merge_path: {len(entries)} guard-matrix commands read from ci.yml")
 PY
-  # ci.yml's `guard` runner carries cargo and rustc but NOT `sccache`, and
-  # `.cargo/config.toml` makes sccache the mandatory rustc wrapper for every
-  # cargo call — so a guard that shells out to cargo fails there ("could not
-  # execute process `sccache ... rustc -vV`") unless its matrix entry declares
-  # `toolchain: true` (then `setup-rust-ci` installs sccache). A developer
+  # ci.yml's `guard` runner is bare ubuntu (no container): cargo and rustc
+  # are present, `sccache` — which `.cargo/config.toml` makes the mandatory
+  # rustc wrapper — is not, and neither is a linker. A guard that shells out
+  # to cargo fails there ("could not execute process `sccache ... rustc -vV`")
+  # unless its matrix entry declares `toolchain: true` (then `setup-rust-ci`
+  # installs sccache — enough for `cargo metadata`, never for a build; a guard
+  # that builds Rust lives in ci.yml's container-backed `symbol-index-gates`
+  # job, which the swarm stage below runs). A developer
   # machine has sccache, so the same guard passes here. Mirror the runner:
   # every NON-toolchain leg runs with RUSTC_WRAPPER pointed at a path that
   # does not exist (the env var overrides config.toml, so cargo fails exactly

@@ -100,19 +100,24 @@ use jammi_ai::fine_tune::collective::BlockingCall;
 use jammi_ai::fine_tune::data::TrainingDataLoader;
 use jammi_ai::fine_tune::resume::load_bundle;
 use jammi_ai::fine_tune::source::TrainingSource;
+use jammi_ai::fine_tune::spec::{
+    admit_training_spec, submit_admitted_training, TrainingCommon, TrainingSpec, DEFAULT_WORLD_SIZE,
+};
 use jammi_ai::fine_tune::target::{EncoderAdaptersTarget, TrainingTarget};
 use jammi_ai::fine_tune::trainer::TrainingLoopBuilder;
-use jammi_ai::fine_tune::{EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig, LrSchedule};
+use jammi_ai::fine_tune::training_job::fine_tuned_model_id;
+use jammi_ai::fine_tune::{
+    EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig, FineTuneMethod, LrSchedule,
+};
 use jammi_ai::model::arch::{self, EncoderFamily};
 use jammi_ai::model::backend::candle::CandleBackend;
 use jammi_ai::model::backend::{DeviceConfig, ModelBackend};
 use jammi_ai::model::{BackendType, LoadedModel, ModelId, ResolvedModel, TokenizerSource};
-use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::RegisterModelParams;
-use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
+use jammi_db::config::JammiConfig;
 use jammi_db::storage::{StorageRegistry, StorageUrl};
-use jammi_db::store::ArtifactStore;
+use jammi_db::store::{ArtifactStore, CachePolicy};
 use jammi_db::ModelTask;
 use jammi_encoders::AnyEncoder;
 use jammi_lora::{AdapterConfig, LoraInitMode};
@@ -1867,16 +1872,48 @@ fn run_impl(
         artifact_path: None,
         config_json: None,
     }))?;
-    tokio::runtime::Handle::current().block_on(catalog.submit_job(SubmitJobParams {
-        job_id: &job_id,
-        kind: "fine_tune",
-        execution: JobExecution::Queued,
-        spec: "{}",
-        model_ref: Some(&model_catalog_pk),
-        output_model_id: None,
-        model_source: None,
-        priority: 0,
-    }))?;
+    // A REAL admitted `TrainingSpec::FineTune`, submitted through the SAME
+    // seam every production training submit edge uses (#573 round 3,
+    // N3-seam) — never a hand-built `SubmitJobParams` carrying a
+    // placeholder `spec: "{}"`. This crate drives `TrainingLoop::run`
+    // directly afterward (this module's own doc explains why: the row
+    // exists to obtain a real, claimable `job_id`, not to be reconstructed
+    // by a worker from this spec), so `source`/`columns` describe what this
+    // run actually reads (the committed fixture, not a materialized SQL
+    // source) rather than naming one that does not exist here — honest
+    // about the shape, not a fabricated production source string.
+    // `admit_training_spec` takes a `&JammiConfig`; this tier stands up no
+    // deployment config of its own (it drives the trainer directly, never
+    // through a `[distributed]`-gated coordinator), so `JammiConfig::
+    // default()` — single-rank, `[distributed] max_world_size` at its
+    // default — is what a spec built from this tier's own parameters
+    // (always `world_size = DEFAULT_WORLD_SIZE`) admits against.
+    let output_model_id = fine_tuned_model_id(&job_id);
+    let training_spec = TrainingSpec::FineTune {
+        source: format!("finetune-run:{}", params.model_dir.display()),
+        columns: match params.objective {
+            Objective::Triplet => vec!["anchor".into(), "positive".into(), "negative".into()],
+            Objective::Mnrl => vec!["anchor".into(), "positive".into()],
+        },
+        method: FineTuneMethod::Lora,
+        task: params.task.model_task(),
+        common: TrainingCommon {
+            base_model: model_row_id.clone(),
+            config: base_config(params, params.epochs),
+            world_size: DEFAULT_WORLD_SIZE,
+        },
+        cache: CachePolicy::Bypass,
+    };
+    let admitted = admit_training_spec(&JammiConfig::default(), training_spec)?;
+    tokio::runtime::Handle::current().block_on(submit_admitted_training(
+        &catalog,
+        &admitted,
+        &job_id,
+        &model_catalog_pk,
+        &output_model_id,
+        0,
+        None,
+    ))?;
     tokio::runtime::Handle::current()
         .block_on(catalog.claim_next(
             &worker_id,

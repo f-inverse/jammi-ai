@@ -1993,29 +1993,24 @@ impl InferenceSession {
         // `spec` here and reading it back only through `admitted.spec()` is
         // the witness enforcement (#573 round 2): there is no path below
         // this line that could serialize/submit the pre-admission `spec`
-        // value, because that binding no longer exists.
+        // value, because that binding no longer exists. This function
+        // builds no `SubmitJobParams` of its own (#573 round 3, N3-seam):
+        // [`crate::fine_tune::spec::submit_admitted_training`] is the one
+        // place that construction happens.
         let admitted = crate::fine_tune::spec::admit_training_spec(self.inner.config(), spec)?;
-        let spec = admitted.spec();
         let job_id = uuid::Uuid::new_v4().to_string();
-        let links = self.training_job_links(spec, &job_id).await?;
-        let spec_json = serde_json::to_string(spec)?;
-        let recorded_job_id = self
-            .inner
-            .catalog()
-            .submit_job_deduped(
-                jammi_db::catalog::jobs_repo::SubmitJobParams {
-                    job_id: &job_id,
-                    kind: spec.kind(),
-                    execution: jammi_db::catalog::status::JobExecution::Queued,
-                    spec: &spec_json,
-                    model_ref: Some(&links.model_ref),
-                    output_model_id: Some(&links.output_model_id),
-                    model_source: None,
-                    priority: 0,
-                },
-                idempotency_key,
-            )
-            .await?;
+        let links = self.training_job_links(admitted.spec(), &job_id).await?;
+        let submitted = crate::fine_tune::spec::submit_admitted_training(
+            self.inner.catalog(),
+            &admitted,
+            &job_id,
+            &links.model_ref,
+            &links.output_model_id,
+            0,
+            idempotency_key,
+        )
+        .await?;
+        let recorded_job_id = submitted.recorded_job_id;
 
         if recorded_job_id == job_id {
             Ok(TrainingJob::new(

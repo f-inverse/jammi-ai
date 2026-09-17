@@ -977,47 +977,60 @@ impl InferenceSession {
         // already-built `JobSpec`, so a training spec reaches the queue
         // through it without passing the per-verb entry points. Same
         // admission — [`crate::fine_tune::spec::admit_training_spec`] — same
-        // typed refusals, nothing enqueued on any of them. `as_training_spec`
-        // is `None` for a compute kind, so the admission call and the links
-        // derivation below both no-op for one and run for the other off the
-        // SAME reconstructed, then admitted, value (computed once). `spec`
-        // itself (the `JobSpec` this row actually persists) is untouched by
-        // admission — it is a byte-identical but SEPARATE value from the
-        // reconstructed `TrainingSpec` `admit_training_spec` consumes (see
-        // `JobSpec`'s own doc on the two independent shapes) — so this edge
-        // does not gain the "cannot serialize the pre-admission value"
-        // property the other two edges do; it gains the same PROPERTY
-        // `every_durable_training_submit_edge_calls_the_one_admission_function`
-        // pins instead: admission runs before this row is ever written.
-        let admitted = match spec.as_training_spec() {
-            Some(training) => Some(crate::fine_tune::spec::admit_training_spec(
-                self.jammi_config(),
-                training,
-            )?),
-            None => None,
-        };
+        // typed refusals, nothing enqueued on any of them.
+        //
+        // For a training kind this function builds no `SubmitJobParams` of
+        // its own (#573 round 3, N3-seam):
+        // [`crate::fine_tune::spec::submit_admitted_training`] is the ONE
+        // place that construction happens, so this arm submits through it
+        // rather than the `submit_job` call below. It writes the
+        // RECONSTRUCTED, admitted `TrainingSpec`'s own serialization — not
+        // `spec` (the `JobSpec`) — which is a byte-identical but SEPARATE
+        // value (see `JobSpec`'s own doc on the two independent shapes; the
+        // byte-pin tests are what makes this substitution sound). A compute
+        // kind is untouched by N3 (scoped to training kinds only) and keeps
+        // building `SubmitJobParams` from `spec`'s own `JobSpec::Serialize`
+        // exactly as before.
         let job_id = uuid::Uuid::new_v4().to_string();
         let kind = spec.kind();
-        let spec_json = serde_json::to_string(&spec)?;
-        let (model_ref, output_model_id, model_source) = match &admitted {
-            Some(witness) => {
-                let links = self.training_job_links(witness.spec(), &job_id).await?;
-                (Some(links.model_ref), Some(links.output_model_id), None)
+        match spec.as_training_spec() {
+            Some(training) => {
+                let admitted =
+                    crate::fine_tune::spec::admit_training_spec(self.jammi_config(), training)?;
+                let links = self.training_job_links(admitted.spec(), &job_id).await?;
+                let submitted = crate::fine_tune::spec::submit_admitted_training(
+                    self.catalog(),
+                    &admitted,
+                    &job_id,
+                    &links.model_ref,
+                    &links.output_model_id,
+                    priority,
+                    None,
+                )
+                .await?;
+                debug_assert_eq!(
+                    submitted.recorded_job_id, job_id,
+                    "enqueue never dedupes (idempotency_key = None), so the recorded id is \
+                     always the one this call minted"
+                );
             }
-            None => (None, None, spec.model_source()),
-        };
-        self.catalog()
-            .submit_job(SubmitJobParams {
-                job_id: &job_id,
-                kind,
-                execution: JobExecution::Queued,
-                spec: &spec_json,
-                model_ref: model_ref.as_deref(),
-                output_model_id: output_model_id.as_deref(),
-                model_source: model_source.as_deref(),
-                priority,
-            })
-            .await?;
+            None => {
+                let spec_json = serde_json::to_string(&spec)?;
+                let model_source = spec.model_source();
+                self.catalog()
+                    .submit_job(SubmitJobParams {
+                        job_id: &job_id,
+                        kind,
+                        execution: JobExecution::Queued,
+                        spec: &spec_json,
+                        model_ref: None,
+                        output_model_id: None,
+                        model_source: model_source.as_deref(),
+                        priority,
+                    })
+                    .await?;
+            }
+        }
         Ok(JobHandle::new(
             job_id,
             kind.to_string(),

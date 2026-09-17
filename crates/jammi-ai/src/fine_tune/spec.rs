@@ -317,9 +317,12 @@ impl RankAdmission {
 }
 
 /// A [`TrainingSpec`] that has passed [`admit_training_spec`] -- its field is
-/// private to this module, so the ONLY way any other module in this crate
-/// can construct one is by calling [`admit_training_spec`] and getting one
-/// back; a value of this type is proof admission ran.
+/// private to this module (never `pub`, even though the TYPE itself is —
+/// see [`admit_training_spec`]'s own doc on why the type must be nameable
+/// outside this crate), so the ONLY way ANY caller, in this crate or across
+/// the `jammi-bench` boundary, can construct one is by calling
+/// [`admit_training_spec`] and getting one back; a value of this type is
+/// proof admission ran.
 ///
 /// What this closes: within EACH of the three edges below, `spec`/
 /// `training_spec` is CONSUMED by [`admit_training_spec`] and the edge reads
@@ -329,21 +332,23 @@ impl RankAdmission {
 /// double-value footgun a `&spec` borrow (this module's shape before this
 /// round) left open.
 ///
-/// What this does NOT close, stated honestly rather than assumed (the
-/// executed falsification: borrowing `spec` directly instead of calling
-/// [`admit_training_spec`] still COMPILES, since nothing forces a NEW edge
-/// to route through the witness at all): the three durable-write call sites
-/// are not consolidated behind one shared function that takes
-/// `AdmittedTrainingSpec` as its parameter type -- each edge still builds
-/// its own `SubmitJobParams` inline. A fourth edge that skips this type
-/// entirely and hands a raw JSON string straight to
-/// `jammi_db::Catalog::submit_job`/`submit_job_deduped` (a generic,
-/// kind-agnostic API `jammi-db` exposes for every job kind, not only
-/// training ones, and cannot depend on this crate's `TrainingSpec` shape)
-/// is still source-syntactically possible and is caught only by
-/// `every_durable_training_submit_edge_calls_the_one_admission_function`'s
-/// source-level oracle over the three named edge files, not by this type.
-pub(crate) struct AdmittedTrainingSpec(TrainingSpec);
+/// What this closed BEFORE this round's seam (#573 round 3, stated
+/// honestly): the three durable-write call sites were not consolidated
+/// behind one shared function that took `AdmittedTrainingSpec` as its
+/// parameter type -- each edge built its own `SubmitJobParams` inline, so a
+/// fourth edge that skipped this type entirely and handed a raw JSON string
+/// straight to `jammi_db::Catalog::submit_job`/`submit_job_deduped` was
+/// still source-syntactically possible. [`submit_admitted_training`] is that
+/// consolidation: it is now the ONLY function in the workspace that builds a
+/// [`jammi_db::catalog::jobs_repo::SubmitJobParams`] for a training kind, so
+/// a hand-rolled bypass has to duplicate this function's body verbatim
+/// rather than merely skip a witness read -- `
+/// every_durable_training_submit_edge_calls_the_one_admission_function`'s
+/// source-level oracle is still what catches that duplication (Rust's
+/// privacy model cannot forbid a caller from writing the same match/insert
+/// logic again under a different name), stated as the ORACLE being the
+/// enforcement, not the type.
+pub struct AdmittedTrainingSpec(TrainingSpec);
 
 impl AdmittedTrainingSpec {
     /// The admitted spec, by reference -- for serializing to `jobs.spec` and
@@ -366,18 +371,29 @@ impl AdmittedTrainingSpec {
 /// Consumes `spec` and, on success, returns it wrapped in
 /// [`AdmittedTrainingSpec`] -- the type-level half of "every durable submit
 /// edge calls this before writing a row" (#573): unlike a `&spec` borrow
-/// (this function's shape before this round), a caller cannot hand the
+/// (this function's shape before round 2), a caller cannot hand the
 /// ORIGINAL `spec` value to a durable-write path expecting
 /// [`AdmittedTrainingSpec`] without first passing it through here -- the
 /// witness is the only surviving handle to the spec after this call.
+///
+/// `pub` (not `pub(crate)`, round 3): `jammi-bench`'s finetune-run tier
+/// (`crates/jammi-bench/src/finetune_run.rs`) submits a REAL training job
+/// through this same admission + [`submit_admitted_training`] rather than a
+/// hand-built, unadmitted placeholder row — the seam is the control here,
+/// not the visibility, so raising it is not a bypass of anything this type
+/// protects. [`AdmittedTrainingSpec`]'s own field stays private to this
+/// module regardless of which crate calls this function, so a caller across
+/// the crate boundary is bound by exactly the same "only this call can mint
+/// one" rule an in-crate caller is.
 ///
 /// Every edge that can turn a `TrainingSpec` into a durable row calls this:
 /// [`crate::session::InferenceSession::submit_fine_tune_spec_deduped`],
 /// [`crate::session::InferenceSession::enqueue`], and
 /// [`crate::pipeline::context_predictor`]'s
-/// `train_context_predictor_deduped`. A refusal here leaves no row behind,
+/// `train_context_predictor_deduped` (in-crate), plus `jammi-bench`'s
+/// finetune-run tier (cross-crate). A refusal here leaves no row behind,
 /// because no row has been written yet.
-pub(crate) fn admit_training_spec(
+pub fn admit_training_spec(
     config: &jammi_db::config::JammiConfig,
     spec: TrainingSpec,
 ) -> Result<AdmittedTrainingSpec> {
@@ -406,6 +422,84 @@ pub(crate) fn admit_training_spec(
     }
     RankAdmission::from_config(config).admit(&spec)?;
     Ok(AdmittedTrainingSpec(spec))
+}
+
+/// The catalog's durable record of a [`submit_admitted_training`] call --
+/// the caller reads [`Self::recorded_job_id`] to build whatever handle its
+/// own crate returns ([`crate::fine_tune::training_job::TrainingJob`] for
+/// the two `_deduped` edges, [`crate::jobs::JobHandle`] for `enqueue`, a
+/// bench tier's own claim-by-id call for `jammi-bench`), since those handle
+/// types differ by caller and this function stays training-shape-agnostic
+/// about what the caller does with the id.
+#[derive(Debug, Clone)]
+pub struct SubmittedJob {
+    /// The job id OF RECORD: `job_id` (this call's own argument) on a fresh
+    /// insert -- always, for `idempotency_key = None` -- or a still-live
+    /// PRIOR submission's id when `Some(key)` collided (see
+    /// [`jammi_db::catalog::Catalog::submit_job_deduped`]'s own doc). A
+    /// caller that cares about the dedup outcome compares this against the
+    /// `job_id` it passed in; a caller that never dedupes (`enqueue`, the
+    /// bench tier) always gets that same `job_id` back.
+    pub recorded_job_id: String,
+}
+
+/// The ONE function in the workspace that builds a
+/// [`jammi_db::catalog::jobs_repo::SubmitJobParams`] for a training kind and
+/// submits it -- every durable training submit edge calls this rather than
+/// constructing `SubmitJobParams` itself: [`crate::session::
+/// InferenceSession::submit_fine_tune_spec_deduped`], [`crate::session::
+/// InferenceSession::enqueue`]'s training arm, [`crate::pipeline::
+/// context_predictor`]'s `train_context_predictor_deduped`, and (across the
+/// crate boundary) `jammi-bench`'s finetune-run tier. `jammi_db::Catalog::
+/// submit_job`/`submit_job_deduped` themselves stay generic, kind-agnostic
+/// APIs -- `jammi-db` never depends on `jammi-ai` and so cannot know this
+/// crate's `TrainingSpec` shape at all -- this function is `jammi-ai`'s own
+/// only caller of them for a training kind (pinned by
+/// `every_durable_training_submit_edge_calls_the_one_admission_function`'s
+/// enumerating source oracle, which now also asserts this function itself
+/// is the only training-kind `SubmitJobParams` construction site in
+/// `crates/jammi-ai/src`).
+///
+/// `admitted` is taken by reference so the caller keeps its own handle for
+/// whatever else it needs the admitted spec for (`training_job_links`, in
+/// every in-crate caller). `model_ref`/`output_model_id` are the base
+/// model's catalog PK and the output NAME every training kind's row
+/// carries -- derived by [`crate::session::InferenceSession::
+/// training_job_links`] for the three in-crate edges, or resolved however
+/// the caller needs to for a cross-crate one. `execution` is always
+/// [`jammi_db::catalog::status::JobExecution::Queued`] (a training row is
+/// never submitted `Inline` — see [`crate::session::InferenceSession::
+/// run_now`]'s own doc, which is `ComputeSpec`-only). `idempotency_key`
+/// forwards unchanged to [`jammi_db::catalog::Catalog::submit_job_deduped`]
+/// (`None` reproduces a plain, always-fresh insert -- see that method's own
+/// doc for the dedup semantics `Some(key)` applies).
+pub async fn submit_admitted_training(
+    catalog: &jammi_db::catalog::Catalog,
+    admitted: &AdmittedTrainingSpec,
+    job_id: &str,
+    model_ref: &str,
+    output_model_id: &str,
+    priority: i32,
+    idempotency_key: Option<&str>,
+) -> Result<SubmittedJob> {
+    let spec = admitted.spec();
+    let spec_json = serde_json::to_string(spec)?;
+    let recorded_job_id = catalog
+        .submit_job_deduped(
+            jammi_db::catalog::jobs_repo::SubmitJobParams {
+                job_id,
+                kind: spec.kind(),
+                execution: jammi_db::catalog::status::JobExecution::Queued,
+                spec: &spec_json,
+                model_ref: Some(model_ref),
+                output_model_id: Some(output_model_id),
+                model_source: None,
+                priority,
+            },
+            idempotency_key,
+        )
+        .await?;
+    Ok(SubmittedJob { recorded_job_id })
 }
 
 impl TrainingSpec {

@@ -73,7 +73,8 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -514,7 +515,171 @@ def check_leak_smells(rows: list[AllowlistRow]) -> tuple[list[str], list[str]]:
     return findings, waived
 
 
+# --------------------------------------------------------------------------- #
+# self-test (#508 contract delta: one fixture per rot rule 1-7, plus the
+# duplicate-pair vs. same-identifier-different-path distinction)
+# --------------------------------------------------------------------------- #
+def self_test() -> int:
+    failures: list[str] = []
+
+    def check(label: str, cond: bool, detail: object = "") -> None:
+        if not cond:
+            failures.append(f"{label}: {detail}")
+
+    # The REAL, committed row this repo already ships -- reused as the
+    # baseline for every mutation below, rather than a synthetic tempdir
+    # tree: `register_content_hash_udf` genuinely exists at this exact
+    # path, its ruling_sha is a genuine ancestor of HEAD, and the
+    # identifier genuinely appears elsewhere in the crates tree (its OWN
+    # second row, `pinned_source_gate.rs`) -- so a mutation on ONE field
+    # exercises exactly the rule that field governs, nothing else.
+    good_row = AllowlistRow(
+        identifier="register_content_hash_udf",
+        declaring_path="crates/jammi-ai/src/query/content_hash_udf.rs",
+        ruling_sha="c0e1faec00a3de0d59499801755e705579dbe202",
+        ruling_ref="#508",
+        reason=(
+            "Installs a Datafusion scalar UDF into the query session's function catalog so SQL "
+            "statements can invoke it by name."
+        ),
+        line_no=1,
+    )
+
+    # Positive control: the real, committed row must produce ZERO findings
+    # -- proves this checker can find a genuinely correct row, not merely
+    # reject everything handed to it.
+    got = check_allowlist_rot([good_row])
+    check("positive control (the real committed row)", got == [], got)
+
+    # Rule 1: identifier no longer matches a public declaration at
+    # declaring_path (a rename must re-earn its ruling).
+    renamed = replace(good_row, identifier="register_content_hash_udf_renamed_xyz")
+    got = check_allowlist_rot([renamed])
+    check("rule 1 (renamed identifier)", any("(rule 1)" in g for g in got), got)
+
+    # Rule 2: declaring_path does not exist.
+    missing_path = replace(good_row, declaring_path="crates/jammi-ai/src/does_not_exist_xyz.rs")
+    got = check_allowlist_rot([missing_path])
+    check("rule 2 (missing declaring_path)", any("(rule 2)" in g for g in got), got)
+
+    # Rule 3a: ruling_sha is not a well-formed 40-hex sha at all.
+    bad_shape = replace(good_row, ruling_sha="not-a-real-sha")
+    got = check_allowlist_rot([bad_shape])
+    check("rule 3 (malformed ruling_sha)", any("(rule 3)" in g and "well-formed" in g for g in got), got)
+
+    # Rule 3b: well-formed 40-hex sha that is NOT an ancestor of HEAD.
+    non_ancestor = replace(good_row, ruling_sha="f" * 40)
+    got = check_allowlist_rot([non_ancestor])
+    check(
+        "rule 3 (well-formed but non-ancestor ruling_sha)",
+        any("(rule 3)" in g and "not an ancestor" in g for g in got),
+        got,
+    )
+
+    # Rule 4: ruling_ref does not resolve (neither an issue/PR number nor a
+    # `<doc-path>#<heading>` citation).
+    bad_ref = replace(good_row, ruling_ref="not-a-real-citation")
+    got = check_allowlist_rot([bad_ref])
+    check("rule 4 (unresolvable ruling_ref)", any("(rule 4)" in g for g in got), got)
+
+    # Rule 5: identifier appears NOWHERE in the scanned engine-runtime tree
+    # -- a dead waiver.
+    dead = replace(good_row, identifier="definitely_absent_identifier_98765_xyz")
+    got = check_allowlist_rot([dead])
+    check("rule 5 (dead identifier, appears nowhere)", any("(rule 5)" in g for g in got), got)
+
+    # Rule 6a: reason is trivially short.
+    short_reason = replace(good_row, reason="ok")
+    got = check_allowlist_rot([short_reason])
+    check(
+        "rule 6 (trivially short reason)",
+        any("(rule 6)" in g and "trivially short" in g for g in got),
+        got,
+    )
+
+    # Rule 6b: reason itself leads with a governance-verb stem as its main
+    # verb -- "confirmed, it's fine" phrased as a restatement, refused.
+    verb_reason = replace(
+        good_row,
+        reason="Registers a new content-hash row so downstream code can look it up by name later.",
+    )
+    got = check_allowlist_rot([verb_reason])
+    check(
+        "rule 6 (reason leads with a governance verb)",
+        any("(rule 6)" in g and "leads with governance-verb" in g for g in got),
+        got,
+    )
+
+    # Rule 6c: reason carries a bare line-number citation instead of a
+    # mechanism sentence.
+    line_reason = replace(good_row, reason="Confirmed clean per the ruling discussion at content_hash_udf.rs:42")
+    got = check_allowlist_rot([line_reason])
+    check(
+        "rule 6 (bare line-number citation)",
+        any("(rule 6)" in g and "bare line-number citation" in g for g in got),
+        got,
+    )
+
+    # Rule 7: an EXACT duplicate (identifier, declaring_path) PAIR is a
+    # hard parse failure at load time (never seen by check_allowlist_rot
+    # at all), and only the FIRST occurrence survives into `rows`.
+    with tempfile.TemporaryDirectory() as td:
+        allow_path = Path(td) / "allow.txt"
+        allow_path.write_text(
+            f"{good_row.identifier}\t{good_row.declaring_path}\t{good_row.ruling_sha}\t"
+            f"{good_row.ruling_ref}\t{good_row.reason}\n"
+            f"{good_row.identifier}\t{good_row.declaring_path}\t{good_row.ruling_sha}\t"
+            "#999\tA second, differently-worded ruling for the identical pair.\n",
+            encoding="utf-8",
+        )
+        rows, parse_failures = load_allowlist(allow_path)
+        check(
+            "rule 7 (duplicate pair is a hard parse failure)",
+            any("rule 7" in f for f in parse_failures),
+            parse_failures,
+        )
+        check("rule 7 (only the first occurrence survives into rows)", len(rows) == 1, rows)
+
+    # Negative control: the SAME identifier at a DIFFERENT declaring_path
+    # is NOT rule 7 -- the real committed allowlist carries exactly this
+    # shape (register_content_hash_udf at two distinct paths) and must
+    # load with zero parse failures.
+    with tempfile.TemporaryDirectory() as td:
+        allow_path = Path(td) / "allow.txt"
+        allow_path.write_text(
+            f"{good_row.identifier}\t{good_row.declaring_path}\t{good_row.ruling_sha}\t"
+            f"{good_row.ruling_ref}\t{good_row.reason}\n"
+            f"{good_row.identifier}\tcrates/jammi-ai/tests/it/pinned_source_gate.rs\t"
+            f"{good_row.ruling_sha}\t#554\tA different site, its own row, not a duplicate pair.\n",
+            encoding="utf-8",
+        )
+        rows, parse_failures = load_allowlist(allow_path)
+        check(
+            "same identifier, different declaring_path is NOT rule 7",
+            parse_failures == [] and len(rows) == 2,
+            (parse_failures, rows),
+        )
+
+    if failures:
+        print("no-consumer-names self-test: FAIL", file=sys.stderr)
+        for f in failures:
+            print(f"  - {f}", file=sys.stderr)
+        return 1
+    print(
+        "no-consumer-names self-test: OK — every allowlist rot rule (1-7) bites: a renamed "
+        "identifier, a missing declaring_path, a malformed AND a well-formed-but-non-ancestor "
+        "ruling_sha, an unresolvable ruling_ref, a dead identifier, a trivially-short / "
+        "governance-verb-leading / bare-line-cited reason, and a duplicate (identifier, "
+        "declaring_path) pair (with the SAME identifier at a DIFFERENT path staying clean) -- "
+        "plus a positive control on the real, committed register_content_hash_udf row."
+    )
+    return 0
+
+
 def main() -> int:
+    if "--self-test" in sys.argv[1:]:
+        return self_test()
+
     allowlist_rows, allowlist_parse_failures = load_allowlist()
     rot_findings = check_allowlist_rot(allowlist_rows) if not allowlist_parse_failures else []
     gov_findings, gov_waived = check_governance_tripwire(allowlist_rows)

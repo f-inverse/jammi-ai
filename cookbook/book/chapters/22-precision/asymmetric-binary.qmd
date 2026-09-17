@@ -237,8 +237,11 @@ Wave-2 shipped the corpus-fit threshold as the ONLY way `storage_precision = "bi
 behaves now — there is no `[embedding.ann]` TOML key, and no `AnnIndexConfig` field, that
 selects the old fixed-`0` packing or chooses between the mean/median reduction. We confirm
 this two ways: the config surface itself carries no such field, and — the stronger,
-measured proof — passing an UNSUPPORTED key through the same config file every other
-chapter uses has no effect at all on the resulting table.
+measured proof — a config file naming a key `AnnIndexConfig` does not have is refused loud
+at load time, never accepted and silently dropped. `AnnIndexConfig` derives
+`#[serde(deny_unknown_fields)]` (`crates/jammi-db/src/config/mod.rs`), so every key under
+`[embedding.ann]` is either one of the five fields above or a load-time error — there is no
+third outcome where an unrecognized key is parsed and ignored.
 
 ```{python}
 import glob
@@ -269,8 +272,8 @@ pq.write_table(
 def build_table(extra_toml: str = "", oversample: int | None = None):
     """Open a fresh session at storage_precision="binary" through the public
     jammi.connect(config=...) front door, optionally with an EXTRA (real or
-    bogus) TOML line appended to [embedding.ann] — used below to show an
-    unsupported binary_threshold_kind key has no effect."""
+    unsupported) TOML line appended to [embedding.ann] — used below to show
+    an unsupported binary_threshold_kind key is refused at load time."""
     cfg_dir = tempfile.mkdtemp(prefix="asym_binary_cfg_")
     cfg_path = f"{cfg_dir}/jammi.toml"
     body = '[embedding.ann]\nstorage_precision = "binary"\n'
@@ -314,23 +317,40 @@ print("helpers ready")
 
 ```{python}
 db_default, art_default = build_table()
-db_bogus, art_bogus = build_table(extra_toml='binary_threshold_kind = "mean"\n')
 
 recall1_default = recall_at_k(db_default, 1)
-recall1_bogus = recall_at_k(db_bogus, 1)
 recall10_default = recall_at_k(db_default, K)
-recall10_bogus = recall_at_k(db_bogus, K)
 
-print(f"default config, no threshold-kind key:                  recall@1={recall1_default:.4f}  recall@{K}={recall10_default:.4f}")
-print(f"config carries an UNSUPPORTED binary_threshold_kind key: recall@1={recall1_bogus:.4f}  recall@{K}={recall10_bogus:.4f}")
+print(f"default config, no threshold-kind key: recall@1={recall1_default:.4f}  recall@{K}={recall10_default:.4f}")
+```
 
-assert recall1_default == recall1_bogus and recall10_default == recall10_bogus, (
-    "an unsupported binary_threshold_kind TOML key must have ZERO effect — there is no "
-    "public knob that selects a different ThresholdKind or reverts to the old fixed-0 "
-    "packing; every Binary table gets the engine's own compiled-in median default"
-)
-print("\nconfirmed: no config surface changes the threshold reduction — median is the "
-      "engine's only reachable behaviour.")
+An unsupported key is a different case from an unsupported *value*: it never reaches the
+point of having any effect on recall to measure, because `AnnIndexConfig` — like every
+config struct in this engine — derives `#[serde(deny_unknown_fields)]`
+(`crates/jammi-db/src/config/mod.rs`), so `jammi.connect(..., config=...)` itself raises
+before a session, or a table, ever exists:
+
+```{python}
+try:
+    build_table(extra_toml='binary_threshold_kind = "mean"\n')
+    raise RuntimeError(
+        "an unsupported embedding.ann.binary_threshold_kind key must be REFUSED at "
+        "config load — it loaded silently instead"
+    )
+except jammi.errors.JammiError as exc:
+    print(f"caught {type(exc).__name__}: {exc}")
+    assert isinstance(exc, jammi.errors.InvalidArgument), (
+        "a deny_unknown_fields config refusal is a caller-facing InvalidArgument "
+        f"(the engine's JammiError::Config -> InvalidArgument mapping), got {type(exc).__name__}"
+    )
+    message = str(exc)
+    for token in ("embedding.ann.binary_threshold_kind", "unknown field `binary_threshold_kind`"):
+        assert token in message, f"expected {token!r} in the refusal message: {message}"
+
+print("\nconfirmed: an unsupported ANN config key is refused loud, at load time, naming the "
+      "offending key — never parsed and silently dropped, and never a knob that selects a "
+      "different ThresholdKind or reverts to the old fixed-0 packing. Every Binary table "
+      "reachable through a valid config gets the engine's own compiled-in median default.")
 ```
 
 ## The measured recall — no-rescore proxy and the real rescored default, through the engine
@@ -491,7 +511,8 @@ free. It is a floor raised, not a ceiling reached.
 > [@ethayarajh2019anisotropy], and that assumption costs real Hamming-distance information
 > on the dimensions where it is most wrong. Fitting a per-dimension threshold from the
 > corpus itself (`sign(v − τ)`, median by default, no separate config knob — confirmed here
-> by showing an unsupported key changes nothing) eliminates the collapsed dimensions and
+> by an unsupported key being refused loud at load, never parsed and silently ignored)
+> eliminates the collapsed dimensions and
 > measurably improves no-rescore recall, both in an isolated numpy fold and through the
 > real engine's own `search()`. It stays exactly as narrow as its design claims: the
 > exact-`f32` rescore companion is confirmed to hold the same L2-normalized vectors every

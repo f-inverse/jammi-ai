@@ -161,6 +161,7 @@ pub enum PropagationOutput {
 /// edge source and direction reuse the shared graph-neighbourhood config types;
 /// the loader here is propagation's own bounded, tenant-scoped scan.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PropagateRequest {
     /// The source whose embedding table holds `X⁽⁰⁾`.
     pub source_id: String,
@@ -861,7 +862,8 @@ impl InferenceSession {
                         "SELECT arrow_cast(src, 'Utf8') AS _src, \
                          arrow_cast(dst, 'Utf8') AS _dst, \
                          arrow_cast(similarity, 'Float64') AS _weight \
-                         FROM \"jammi.{table_name}\""
+                         FROM {}",
+                        jammi_db::store::result_table_relation(table_name)
                     ),
                     Some("_weight"),
                 ))

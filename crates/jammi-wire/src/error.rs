@@ -590,6 +590,24 @@ impl From<&BackendError> for pb::BackendErrorDetail {
             }),
             BackendError::Sqlx(e) => Variant::Sqlx(e.to_string()),
             BackendError::Busy(m) => Variant::Execution(m.clone()),
+            // A schema-edge stamp-domain refusal (`catalog::lease`'s S3) is
+            // a constraint violation in the general sense — closest
+            // existing wire shape, `ConstraintViolation { table, detail }`,
+            // which has no `column` field; `column` (when the backend named
+            // one) is folded into `detail` rather than widening the wire
+            // message for a class no caller distinguishes from any other
+            // constraint refusal today.
+            BackendError::DomainViolation {
+                table,
+                column,
+                detail,
+            } => Variant::Constraint(pb::ConstraintViolation {
+                table: table.clone(),
+                detail: match column {
+                    Some(c) => format!("{c}: {detail}"),
+                    None => detail.clone(),
+                },
+            }),
         };
         pb::BackendErrorDetail {
             variant: Some(variant),

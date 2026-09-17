@@ -38,7 +38,7 @@ engine-controlled columns prepended:
 | `_row_idx`      | `BIGINT NOT NULL`                         | Position within a publish, for the composite PK.       |
 | `_produced_at`  | `BIGINT NOT NULL` (UTC microseconds)      | Publisher-side timestamp, single value per offset.     |
 | *…user cols…*   | per `TopicDefinition.schema`              | Payload columns.                                       |
-| `tenant_id`     | `TEXT` (nullable, added by Phase 2)       | Tenant scope per ADR-00.                               |
+| `tenant_id`     | `TEXT` (nullable, added by Phase 2)       | Tenant scope per the [tenant-identifier discipline](./philosophy.md#the-one-rule-everything-else-follows-from). |
 
 The primary key is `(_offset, _row_idx)`; `_offset` is the order column
 so `scan_after` and `ORDER BY _offset` agree.

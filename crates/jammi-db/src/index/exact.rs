@@ -141,7 +141,8 @@ pub async fn exact_vector_search(
 ) -> Result<Vec<(String, f32)>> {
     let df = ctx
         .sql(&format!(
-            "SELECT _row_id, vector FROM \"jammi.{table_name}\""
+            "SELECT _row_id, vector FROM {}",
+            crate::store::result_table_relation(table_name)
         ))
         .await?;
     // The scan schema's `FixedSizeList` width is the width every row below

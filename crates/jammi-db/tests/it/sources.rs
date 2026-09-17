@@ -296,8 +296,8 @@ async fn remove_source_refuses_and_touches_nothing_with_a_live_building_table(
 
     let ready_url = format!("file://{}", ready_path.display());
     let building_url = format!("file://{}", building_path.display());
-    let created_at_ready = jammi_db::catalog::backend::now_sortable();
-    let created_at_building = jammi_db::catalog::backend::now_sortable();
+    let created_at_ready = jammi_db::catalog::lease::canonical_stamp_now();
+    let created_at_building = jammi_db::catalog::lease::canonical_stamp_now();
 
     // A terminal row: created `building` then flipped `ready` (no lease to
     // clear — `update_result_table_status` is the non-building-CAS arm every

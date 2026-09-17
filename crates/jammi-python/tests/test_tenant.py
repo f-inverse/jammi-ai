@@ -90,8 +90,10 @@ def test_set_tenant_filters_federated_source(tmp_path):
 
 
 def test_set_tenant_rejects_invalid_uuid(tmp_path):
-    """ADR-00 invariant: a non-UUID tenant id raises `ValueError`
-    (PyO3 mapping of `JammiError::Tenant`)."""
+    """Tenant-identifier discipline invariant (see
+    docs/guide/src/philosophy.md#the-one-rule-everything-else-follows-from):
+    a non-UUID tenant id raises `ValueError` (PyO3 mapping of
+    `JammiError::Tenant`)."""
     db = jammi.connect(f"file://{tmp_path}")
     with pytest.raises((ValueError, RuntimeError)) as info:
         db.set_tenant("not-a-uuid")

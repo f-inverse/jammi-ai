@@ -26,7 +26,7 @@
 //! | entry path | reaches the edge through |
 //! |---|---|
 //! | embedded, per-verb (`fine_tune`, `fine_tune_graph`, `submit_fine_tune`) | `InferenceSession::submit_fine_tune_spec_deduped` |
-//! | embedded, generic (`InferenceSession::enqueue(JobSpec::Training)`) | `InferenceSession::enqueue` |
+//! | embedded, generic (`InferenceSession::enqueue(JobSpec::FineTune { .. })`) | `InferenceSession::enqueue` |
 //! | wire (`JobService::SubmitJob`) | `run_training_spec_deduped` → `submit_fine_tune_spec_deduped` |
 //! | Python (`Database._start_training_proto`) | `jammi_ai::wire::training_spec_from_bytes` → `run_training_spec_deduped` → the same |
 //!
@@ -153,10 +153,7 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
 
         // Entrance 2: the generic enqueue, which takes an already-built spec
         // and so does not pass the per-verb entry points at all.
-        let generic = match session
-            .enqueue(JobSpec::Training(Box::new(spec.clone())), 0)
-            .await
-        {
+        let generic = match session.enqueue(JobSpec::from(spec.clone()), 0).await {
             Ok(handle) => panic!(
                 "{name}: the generic entrance admitted job {}",
                 handle.job_id
@@ -203,7 +200,7 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
         let error = wide.run_training_spec(spec.clone()).await.expect_err(name);
         assert!(matches!(error, JammiError::Config(_)), "{name}: {error:?}");
         assert!(error.to_string().contains(expected), "{name}: got {error}");
-        let generic = match wide.enqueue(JobSpec::Training(Box::new(spec)), 0).await {
+        let generic = match wide.enqueue(JobSpec::from(spec), 0).await {
             Ok(handle) => panic!(
                 "{name}: the generic entrance admitted job {}",
                 handle.job_id
@@ -271,7 +268,7 @@ async fn a_fine_tune_cache_use_is_refused_through_enqueue_too() {
         "the refusal must be typed, got {per_verb:?}"
     );
 
-    let generic = match session.enqueue(JobSpec::Training(Box::new(spec)), 0).await {
+    let generic = match session.enqueue(JobSpec::from(spec), 0).await {
         Ok(handle) => panic!(
             "the generic enqueue entrance admitted a cache=Use job {}",
             handle.job_id
@@ -546,6 +543,52 @@ fn a_context_predictor_spec_has_no_rank_count_to_admit() {
         .expect("a predictor spec has no count, so there is nothing to refuse");
 }
 
+/// #573's context-predictor behavioural oracle: the edge's only admission
+/// effect for this kind is `ContextPredictorTrainConfig::validate` (the
+/// spec above shows `RankAdmission::admit` is a no-op for it), so this is
+/// the ONE test that can go red if that validation is ever skipped —
+/// submit an invalid predictor config through the real durable edge
+/// (`InferenceSession::train_context_predictor`, which calls
+/// `train_context_predictor_deduped`) and assert a typed refusal with
+/// nothing enqueued. RED (executed and reverted): replacing
+/// `train_context_predictor_deduped`'s `let admitted = admit_training_spec(
+/// ..., training_spec)?; let training_spec = admitted.spec();` with `let
+/// training_spec = &training_spec;` (bypassing admission and borrowing the
+/// spec directly — compiles fine, since nothing here forces every edge to
+/// use the witness) turns this AND
+/// `every_durable_training_submit_edge_calls_the_one_admission_function`
+/// red: this test fails with an untyped `Catalog` error from further
+/// downstream (validation never ran) and the source oracle reports 0 calls
+/// in the edge's body.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalid_context_predictor_config_is_refused_through_the_real_edge() {
+    let (session, _dir) = session_with_serveable_world(1).await;
+    let before = job_count(&session).await;
+
+    let mut invalid = predictor_config();
+    // `ContextPredictorTrainConfig::validate` refuses `context_k == 0`
+    // (there must be at least one context point).
+    invalid.context_k = 0;
+
+    let error = session
+        .train_context_predictor("episodes", &invalid)
+        .await
+        .expect_err("an invalid predictor config must be refused, never enqueued");
+    assert!(
+        matches!(error, JammiError::FineTune(_)),
+        "the refusal must be typed, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("context_k"),
+        "the refusal must name the invalid field, got {error}"
+    );
+    assert_eq!(
+        job_count(&session).await,
+        before,
+        "an invalid predictor config must enqueue nothing"
+    );
+}
+
 fn predictor_config() -> jammi_ai::pipeline::context_predictor::ContextPredictorTrainConfig {
     use jammi_ai::pipeline::context_predictor::{
         ContextArchitecture, ContextPredictorTrainConfig, GaussianObjective, PredictiveHead,
@@ -572,43 +615,412 @@ fn predictor_config() -> jammi_ai::pipeline::context_predictor::ContextPredictor
     }
 }
 
-/// Structural oracle: the CLOSED set of durable submit edges for a
-/// `TrainingSpec` — `InferenceSession::submit_fine_tune_spec_deduped`,
-/// `InferenceSession::enqueue`, and
-/// `pipeline::context_predictor::InferenceSession::train_context_predictor_deduped`
-/// — each calls `crate::fine_tune::spec::admit_training_spec`, the ONE
-/// function holding the rank admission, the per-kind validation, and the
-/// `cache = Use` refusal. This is deliberately source-level, not behavioural
-/// only: a re-implementation of the SAME checks inline at an edge, without
-/// going through the shared function, would pass every behavioural oracle
-/// above yet violate the property this test exists to pin — "ONE admission
-/// function", not merely "equivalent behaviour, duplicated". This oracle
-/// reads only the three named files, so a fourth edge in another file is
-/// outside its universe; deriving the edge universe from the tracked source
-/// tree, and a behavioural refusal oracle for the context-predictor edge,
-/// are tracked at <https://github.com/f-inverse/jammi-ai/issues/573>.
+/// One `Catalog::submit_job`/`submit_job_deduped` call site a REAL parse
+/// (`syn::parse_file`, never grep/text) found in `crates/jammi-ai/src`'s
+/// PRODUCTION code — a `#[cfg(test)]` module (the `mod tests { .. }`
+/// blocks in `fine_tune/worker.rs`/`fine_tune/trainer.rs` that build a
+/// placeholder job row directly, to drive the CLAIM/EXECUTE machinery under
+/// test, never a submit edge a caller reaches) is never recursed into, so
+/// no test fixture appears here — see
+/// [`submit_call_sites_in_production_code`]'s own doc for why that scope
+/// line is drawn there and not, say, at "every call in the crate".
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SubmitCallSite {
+    file: String,
+    enclosing_fn: String,
+}
+
+/// `#[cfg(test)]` exactly (a single bare `test` inside the `cfg(..)`
+/// parens) — not `#[cfg(not(test))]`/`#[cfg(feature = "x")]`, which parse
+/// as something other than one bare ident and so return `false` here,
+/// leaving whatever they gate IN the scanned production surface (the
+/// fail-closed direction: a body this predicate does not recognise as
+/// test-only stays scanned, never silently exempted).
+fn attr_is_cfg_test(attr: &syn::Attribute) -> bool {
+    attr.path().is_ident("cfg")
+        && attr
+            .parse_args::<syn::Ident>()
+            .map(|id| id == "test")
+            .unwrap_or(false)
+}
+
+/// [`syn::visit::Visit`] over one file's AST: records a [`SubmitCallSite`]
+/// for every REFERENCE to `submit_job`/`submit_job_deduped` — a call or a
+/// value — in the shapes the grammar allows: a method call
+/// `x.submit_job(..)` (`visit_expr_method_call`); a path expression naming
+/// the fn in ANY position, matched by the path's LAST segment under any
+/// prefix or qualified self — the callee of `Catalog::submit_job(&c, ..)`,
+/// `crate::db::Catalog::submit_job(..)`, `<Catalog>::submit_job(..)`, and
+/// equally a fn-item captured as a value and invoked later
+/// (`let route = Catalog::submit_job; route(&c, ..)`), handed to a
+/// combinator (`.map(Catalog::submit_job)`) or stored in a field
+/// (`visit_expr_path`, which fires for a path wherever it appears, so a
+/// call position is not a special case); and a reference inside any macro
+/// invocation's argument stream, `tokio::try_join!(c.submit_job(..))`,
+/// which `syn` never descends into as an expression — `visit_macro` walks
+/// the tokens through every nested group and records each exact `Ident`
+/// spelled as either name (never a substring, never a string literal).
+/// A value reference is recorded as a site because the fn it names can be
+/// invoked anywhere afterwards; reviewing the reference is the only place
+/// the review can happen. Each hit is tagged with its nearest enclosing
+/// named `fn` — free function or `impl`/trait method alike. Never descends
+/// into an item (a `mod`, a `fn`) carrying
+/// `#[cfg(test)]` at all — see [`attr_is_cfg_test`] — which is what keeps
+/// `fine_tune/worker.rs`'s and `fine_tune/trainer.rs`'s `mod tests { .. }`
+/// fixture rows out of [`submit_call_sites_in_production_code`]'s universe.
+struct SubmitCallScanner {
+    file: String,
+    fn_stack: Vec<String>,
+    hits: Vec<SubmitCallSite>,
+}
+
+impl SubmitCallScanner {
+    fn current_fn(&self) -> String {
+        self.fn_stack
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "<no enclosing fn>".to_string())
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for SubmitCallScanner {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if node.attrs.iter().any(attr_is_cfg_test) {
+            return;
+        }
+        syn::visit::visit_item_mod(self, node);
+    }
+
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if node.attrs.iter().any(attr_is_cfg_test) {
+            return;
+        }
+        self.fn_stack.push(node.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, node);
+        self.fn_stack.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if node.attrs.iter().any(attr_is_cfg_test) {
+            return;
+        }
+        self.fn_stack.push(node.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, node);
+        self.fn_stack.pop();
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        self.record_if_submit(&node.method.to_string());
+        syn::visit::visit_expr_method_call(self, node);
+    }
+
+    /// A path expression in ANY position — the callee of a call, a value
+    /// bound to a local, an argument, a struct field: only the LAST segment
+    /// is the function name; a `<T>` qualified self lives in `qself`,
+    /// outside the segments, and every prefix before the name is one this
+    /// scan is indifferent to. `syn` reaches a call's callee through this
+    /// same visitor, so a call is not a separate direction.
+    fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+        // An inherent method is only ever spelled with an owner —
+        // `Type::name`, `crate::m::Type::name`, `<Type>::name` — so a bare
+        // single-segment path is a local or a free fn of that name, never
+        // the catalog's method; recording it would review homonyms.
+        if node.qself.is_some() || node.path.segments.len() >= 2 {
+            if let Some(last) = node.path.segments.last() {
+                self.record_if_submit(&last.ident.to_string());
+            }
+        }
+        syn::visit::visit_expr_path(self, node);
+    }
+
+    /// A macro invocation in expression, statement or item position —
+    /// `syn` routes all three here with the arguments as opaque tokens.
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        for name in submit_idents_in_tokens(node.tokens.clone()) {
+            self.record_if_submit(&name);
+        }
+        syn::visit::visit_macro(self, node);
+    }
+}
+
+impl SubmitCallScanner {
+    fn record_if_submit(&mut self, name: &str) {
+        if name == "submit_job" || name == "submit_job_deduped" {
+            self.hits.push(SubmitCallSite {
+                file: self.file.clone(),
+                enclosing_fn: self.current_fn(),
+            });
+        }
+    }
+}
+
+/// Every `Ident` token in `ts` (through every nested delimited group)
+/// spelled `submit_job` or `submit_job_deduped`, in source order. A string
+/// literal naming either is a `Literal` token, never an `Ident`.
+fn submit_idents_in_tokens(ts: proc_macro2::TokenStream) -> Vec<String> {
+    let mut out = Vec::new();
+    for tt in ts {
+        match tt {
+            proc_macro2::TokenTree::Ident(i) => {
+                let s = i.to_string();
+                if s == "submit_job" || s == "submit_job_deduped" {
+                    out.push(s);
+                }
+            }
+            proc_macro2::TokenTree::Group(g) => out.extend(submit_idents_in_tokens(g.stream())),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The scan over one file's SOURCE TEXT — what
+/// [`submit_call_sites_in_production_code`] runs on every tracked file and
+/// what the `submit_shape_*` falsifications run on a synthetic fixture, so
+/// a fixture exercises exactly the visitor the real gate uses.
+fn scan_submit_source(file: &str, text: &str) -> Vec<SubmitCallSite> {
+    let parsed = syn::parse_file(text)
+        .unwrap_or_else(|e| panic!("{file}: could not parse as Rust source: {e}"));
+    let mut scanner = SubmitCallScanner {
+        file: file.to_string(),
+        fn_stack: Vec::new(),
+        hits: Vec::new(),
+    };
+    syn::visit::Visit::visit_file(&mut scanner, &parsed);
+    scanner.hits
+}
+
+/// Every [`SubmitCallSite`] in every `.rs` file cargo COMPILES outside a
+/// test target — the one universe
+/// [`jammi_test_utils::source_universe::compiled_non_test_rs_files`] defines
+/// and the raw byte-delete oracle in `jammi-db` shares: every workspace
+/// member's `src/` (the crates AND the `ci/tools/*` members), every
+/// `build.rs`, every `examples/` and `benches/` target; not `tests/`
+/// directories and not the `ci/fixtures/` tokenizer inputs. `#[cfg(test)]`
+/// items inside those files are skipped by the scanner. The enumerated
+/// universe [`every_submit_job_call_in_production_code_is_the_seam_or_a_reviewed_non_training_site`]
+/// checks against its allow-list. `Catalog::submit_job`/`submit_job_deduped`
+/// and `SubmitJobParams` are `pub`, so a caller anywhere cargo compiles is
+/// in scope (`jammi-server`, `jammi-ballista` and `jammi-bench` hold
+/// `Catalog` handles today, and `jammi-bench` has an example target); a
+/// universe narrower than that would let a hand-built training-kind
+/// submit pass unseen. The file list comes from `git ls-files`, never a
+/// hand-maintained walk.
+fn submit_call_sites_in_production_code() -> Vec<SubmitCallSite> {
+    let root = jammi_test_utils::source_universe::repo_root();
+    let files = jammi_test_utils::source_universe::compiled_non_test_rs_files(&root);
+    let mut hits = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(root.join(file))
+            .unwrap_or_else(|e| panic!("reading {file}: {e}"));
+        hits.extend(scan_submit_source(file, &text));
+    }
+    hits.sort();
+    hits
+}
+
+/// #573 round 3 (N3-seam): every `Catalog::submit_job`/`submit_job_deduped`
+/// reference in any compiled non-test `.rs` file in the workspace is on this exact,
+/// reviewed allow-list — the universe is derived from a REAL parse of every
+/// tracked file ([`submit_call_sites_in_production_code`]), not from a
+/// hand-picked list of "the three functions round 1 happened to name": a
+/// fourth edge added ANYWHERE in the crate, in a file this test never
+/// named before, still shows up as an entry the allow-list does not
+/// contain.
+///
+/// The allow-list, and why each entry is sound:
+///
+/// - `fine_tune/spec.rs::submit_admitted_training` — the training seam
+///   (#573 round 3): its ONLY caller-visible parameter that can produce a
+///   training-kind row is `admitted: &AdmittedTrainingSpec`, a type whose
+///   single field is private to this module, so the ONLY way any caller —
+///   in this crate, or across the `jammi-bench` crate boundary, since this
+///   function and `admit_training_spec` are both `pub` — can ever call this
+///   with a training spec is by having called `admit_training_spec` first.
+///   That is structural, not textual: see this test's own executed
+///   falsification below of "does this actually block a bypass", and
+///   `AdmittedTrainingSpec`'s own doc.
+/// - `jobs.rs::enqueue` — its one call sits inside the `None` arm of
+///   `match spec.as_training_spec() { Some(training) => { .. calls the
+///   seam .. } None => { .. this call .. } }`: structurally unreachable
+///   for a training kind, since that arm only runs when the training
+///   projection returned nothing.
+/// - `jobs.rs::run_now` — takes `spec: ComputeSpec` (never `TrainingSpec`)
+///   as its OWN parameter type: the signature itself proves this call can
+///   never carry a training kind, independent of what the body does.
+/// - `jammi-db/src/catalog/jobs_repo.rs::submit_job` — the catalog's own
+///   `submit_job` forwarding to `submit_job_deduped(p, None)`: the
+///   definition side of the seam, inside the crate that owns the `jobs`
+///   table. It mints no spec of its own; whatever reaches it already came
+///   through one of the three `jammi-ai` sites above, which are the only
+///   production callers of the catalog in the workspace.
+/// - `jammi-client/src/lib.rs::submit_fine_tune` — a `submit_job` by NAME
+///   only: the generated gRPC client's `JobService::submit_job` RPC, called
+///   with a `SubmitJobRequest`, which lands in `jammi-server`'s handler and
+///   from there in `jammi-ai`'s `enqueue` (a reviewed site above). It never
+///   touches a `Catalog`; the scan keys on the identifier, so the homonym is
+///   reviewed here rather than special-cased out of the universe.
+///
+/// RED (executed, reverted, never shipped): adding a FOURTH call —
+/// `catalog.submit_job(SubmitJobParams { kind: "fine_tune", .. })` built by
+/// hand inside a brand-new `pub(crate) async fn submit_training_spec_unadmitted`
+/// in `crate::jobs` (a file already on the allow-list, but under a NAME the
+/// list does not contain) — makes this test fail, printing the new
+/// `(file, fn)` pair `("crates/jammi-ai/src/jobs.rs",
+/// "submit_training_spec_unadmitted")` as an entry the allow-list does not
+/// authorize. This is exactly the #573 issue text's own fourth-edge
+/// reproducer (`local_session.rs::submit_training_spec_unadmitted`), proven
+/// against THIS oracle rather than the round-1 text scan it superseded.
+/// Run the real scanner over a synthetic fixture and return `fn` names —
+/// what every `submit_shape_*` falsification below asserts on.
+fn submit_shape_fns(src: &str) -> Vec<String> {
+    scan_submit_source("fixture.rs", src)
+        .into_iter()
+        .map(|h| h.enclosing_fn)
+        .collect()
+}
+
+#[test]
+fn submit_shape_1_a_method_call_is_found() {
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_1 — not real code in this file
+    let src = "async fn f(c: C, p: P) { c.submit_job(p).await.unwrap(); }";
+    assert_eq!(submit_shape_fns(src), vec!["f"]);
+}
+
+#[test]
+fn submit_shape_2_a_path_call_is_found_under_any_prefix_and_qualified_self() {
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_2 (bare type path) — not real code in this file
+    let bare = "async fn f(c: C, p: P) { Catalog::submit_job(&c, p).await; }";
+    let qualified =
+        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_2 (crate-qualified path) — not real code in this file
+        "async fn f(c: C, p: P) { crate::db::Catalog::submit_job_deduped(&c, p, None).await; }";
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_2 (qualified self) — not real code in this file
+    let qself = "async fn f(c: C, p: P) { <Catalog>::submit_job(&c, p).await; }";
+    for (name, src) in [("bare", bare), ("qualified", qualified), ("qself", qself)] {
+        assert_eq!(
+            submit_shape_fns(src),
+            vec!["f"],
+            "submit shape 2 ({name}): a path-call spelling must be found"
+        );
+    }
+}
+
+#[test]
+fn submit_shape_3_a_call_inside_a_macro_invocation_is_found_per_occurrence() {
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_3 (try_join!) — not real code in this file
+    let joined = "async fn f(c: C, a: P, b: P) { tokio::try_join!(c.submit_job(a), c.submit_job_deduped(b, None)).unwrap(); }";
+    assert_eq!(submit_shape_fns(joined), vec!["f", "f"]);
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_3 (nested group) — not real code in this file
+    let nested = "async fn f(c: C, p: P) { assert!(matches!(c.submit_job(p).await, Ok(()))); }";
+    assert_eq!(submit_shape_fns(nested), vec!["f"]);
+}
+
+#[test]
+fn submit_shape_4_a_path_captured_as_a_value_is_found_wherever_it_appears() {
+    let captured =
+        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_4 (fn-item capture) — not real code in this file
+        "async fn f(c: C, p: P) { let route = Catalog::submit_job; route(&c, p).await; }";
+    let combinator =
+        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_4 (combinator argument) — not real code in this file
+        "fn f(c: C, ps: Vec<P>) { let _ = ps.into_iter().map(Catalog::submit_job_deduped); }";
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_4 (struct field) — not real code in this file
+    let field = "fn f() -> Routes { Routes { submit: <Catalog>::submit_job } }";
+    for (name, src) in [
+        ("captured", captured),
+        ("combinator", combinator),
+        ("field", field),
+    ] {
+        assert_eq!(
+            submit_shape_fns(src),
+            vec!["f"],
+            "submit shape 4 ({name}): a path naming the fn as a VALUE must be found"
+        );
+    }
+}
+
+#[test]
+fn submit_shape_controls_a_near_miss_identifier_or_a_string_literal_is_not_a_call() {
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_controls — not real code in this file
+    let src = "async fn f(c: C, p: P) { c.submit_jobs(p).await; let _ = submit_job_count(); \
+               tracing::warn!(\"submit_job refused\"); format!(\"submit_job_deduped\"); }";
+    assert_eq!(submit_shape_fns(src), Vec::<String>::new());
+}
+
+#[test]
+fn every_submit_job_call_in_production_code_is_the_seam_or_a_reviewed_non_training_site() {
+    let allow: &[(&str, &str)] = &[
+        (
+            "crates/jammi-ai/src/fine_tune/spec.rs",
+            "submit_admitted_training",
+        ),
+        ("crates/jammi-ai/src/jobs.rs", "enqueue"),
+        ("crates/jammi-ai/src/jobs.rs", "run_now"),
+        ("crates/jammi-db/src/catalog/jobs_repo.rs", "submit_job"),
+        ("crates/jammi-client/src/lib.rs", "submit_fine_tune"),
+    ];
+
+    let hits = submit_call_sites_in_production_code();
+
+    let mut unexpected = Vec::new();
+    let mut counts: std::collections::BTreeMap<(&str, &str), usize> =
+        allow.iter().map(|&(f, n)| ((f, n), 0usize)).collect();
+    for hit in &hits {
+        let key = allow
+            .iter()
+            .find(|&&(f, n)| f == hit.file && n == hit.enclosing_fn);
+        match key {
+            Some(&(f, n)) => {
+                *counts.get_mut(&(f, n)).unwrap() += 1;
+            }
+            None => unexpected.push(format!("{}::{}", hit.file, hit.enclosing_fn)),
+        }
+    }
+
+    assert!(
+        unexpected.is_empty(),
+        "a `submit_job`/`submit_job_deduped` call exists outside the reviewed allow-list — a \
+         new training submit edge, or a review of this list, is needed: {unexpected:?}"
+    );
+    for (&(file, name), &count) in &counts {
+        assert_eq!(
+            count, 1,
+            "{file}::{name} is on the allow-list with exactly one reviewed call, found {count}"
+        );
+    }
+    assert_eq!(
+        hits.len(),
+        allow.len(),
+        "the enumerated universe must equal the allow-list exactly: {hits:?}"
+    );
+}
+
+/// #573's context-predictor edge and `submit_fine_tune_spec_deduped` are
+/// NOT on the allow-list above (round 3 shape): both now reach
+/// `submit_admitted_training` themselves rather than calling
+/// `Catalog::submit_job_deduped` directly, so their OWN admission is pinned
+/// by this behavioural check — each calls
+/// `crate::fine_tune::spec::admit_training_spec` in its own body before
+/// calling the seam, source-verified the same way round 1/2 verified it,
+/// now over the two files whose training-kind row NEVER touches
+/// `Catalog::submit_job`/`submit_job_deduped` directly at all.
 ///
 /// Mutation (executed and reverted, never shipped): deleting the
-/// `admit_training_spec` call from `enqueue` drops the call count to 2 and
-/// this test fails, naming the file.
+/// `admit_training_spec` call from `train_context_predictor_deduped` drops
+/// this file's own call count to 0 and this test fails, naming the file.
 #[test]
-fn every_durable_training_submit_edge_calls_the_one_admission_function() {
+fn the_two_seam_calling_edges_admit_before_calling_the_seam() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
         .expect("crates/jammi-ai has two ancestors: crates/, then the repo root")
         .to_path_buf();
 
-    // The stated, closed universe: (path relative to the repo root, the
-    // function whose body must call the admission fn).
     let edges: &[(&str, &str)] = &[
         (
             "crates/jammi-ai/src/session.rs",
             // kernel-oracles: fn-in-literal reviewed: the edge function's own signature text, searched for verbatim below — not code in this file
             "async fn submit_fine_tune_spec_deduped(",
         ),
-        // kernel-oracles: fn-in-literal reviewed: the edge function's own signature text, searched for verbatim below — not code in this file
-        ("crates/jammi-ai/src/jobs.rs", "pub async fn enqueue("),
         (
             "crates/jammi-ai/src/pipeline/context_predictor.rs",
             // kernel-oracles: fn-in-literal reviewed: the edge function's own signature text, searched for verbatim below — not code in this file
@@ -616,12 +1028,9 @@ fn every_durable_training_submit_edge_calls_the_one_admission_function() {
         ),
     ];
 
-    // The call site every edge below must use, verbatim — the fully
-    // qualified path, never a bare `admit_training_spec(` (which would also
-    // match the function's OWN definition, `fn admit_training_spec(`).
-    const CALL: &str = "fine_tune::spec::admit_training_spec(";
+    const ADMIT_CALL: &str = "fine_tune::spec::admit_training_spec(";
+    const SEAM_CALL: &str = "fine_tune::spec::submit_admitted_training(";
 
-    let mut total_calls = 0usize;
     for (path, fn_sig) in edges {
         let full = root.join(path);
         let src =
@@ -629,38 +1038,19 @@ fn every_durable_training_submit_edge_calls_the_one_admission_function() {
         let fn_start = src.find(fn_sig).unwrap_or_else(|| {
             panic!("{path} no longer defines `{fn_sig}` — this oracle's edge list is stale")
         });
-        // The function body: from the signature to the next line holding
-        // only a closing brace at the SAME (four-space method) indent —
-        // exact enough for these three concretely-indented methods, and any
-        // false match only widens the search window, never narrows it past
-        // the real body.
         let after_sig = &src[fn_start..];
         let body_end = after_sig.find("\n    }\n").unwrap_or(after_sig.len());
         let body = &after_sig[..body_end];
-        let calls_in_body = body.matches(CALL).count();
-        assert!(
-            calls_in_body >= 1,
-            "{path}'s `{fn_sig}` must call `{CALL}` before writing a jobs row \
-             (found {calls_in_body} calls in its body)"
+        assert_eq!(
+            body.matches(ADMIT_CALL).count(),
+            1,
+            "{path}'s `{fn_sig}` must call `{ADMIT_CALL}` exactly once before writing a jobs row"
         );
-        total_calls += calls_in_body;
+        assert_eq!(
+            body.matches(SEAM_CALL).count(),
+            1,
+            "{path}'s `{fn_sig}` must call `{SEAM_CALL}` exactly once — the seam, not a hand-built \
+             `SubmitJobParams`"
+        );
     }
-
-    // Within the three files, no call sits outside its edge's own body — a
-    // stray call there would mean a call site drifted out of the edge.
-    let mut whole_crate_calls = 0usize;
-    for (path, _) in edges {
-        let full = root.join(path);
-        let src = std::fs::read_to_string(&full).unwrap();
-        whole_crate_calls += src.matches(CALL).count();
-    }
-    assert_eq!(
-        whole_crate_calls, total_calls,
-        "a call to the admission function exists in one of the three edge files \
-         but outside its edge's own function body"
-    );
-    assert_eq!(
-        total_calls, 3,
-        "expected exactly one admission call per edge across the three-edge universe, got {total_calls}"
-    );
 }

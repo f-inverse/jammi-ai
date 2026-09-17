@@ -1,0 +1,24 @@
+[package]
+name = "symbol-index"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "CI-only: a real syn AST index of Rust items/impl-methods/enum-variants/struct-fields with file+line spans, shared by every gate that used to grep Rust source (check_plan_citations.py, check_no_consumer_names.py) — never a product crate, never published, never part of `cargo build --workspace`'s default members."
+
+[[bin]]
+name = "symbol-index"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned to the exact version already resolved transitively in Cargo.lock
+# (jammi-ai's own dev-dependency, `cargo tree -p syn -p proc-macro2`) so this
+# workspace member moves nothing else in the lock, matching this repo's own
+# stated convention for adding a syn-parsing edge (see
+# crates/jammi-ai/Cargo.toml's own comment on the same pin).
+syn = { version = "2.0.117", features = ["full", "visit"] }
+proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
+serde.workspace = true
+serde_json.workspace = true
+walkdir = "2"

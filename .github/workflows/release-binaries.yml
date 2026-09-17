@@ -373,26 +373,27 @@ jobs:
 
   # ---- CUDA jammi-server tarball ----
   # Built in the CUDA CI base image (CUDA 12.6 toolkit). The tarball is
-  # self-sufficient: it bundles the CUDA-enabled binary, the seven CUDA
-  # runtime shared libraries the binary needs on a host with only an NVIDIA
-  # driver (libcudart / libcublas / libcublasLt / libcurand / libnvrtc /
-  # libnvrtc-builtins out of the toolkit, plus libnccl, which `jammi-ai`'s
-  # `cuda` feature pulls in through `candle-core/nccl`), and a `jammi-server`
-  # launcher that prepends the bundled `lib/` to LD_LIBRARY_PATH then execs
-  # the binary. The candle/cudarc binary has hard DT_NEEDED entries for six
-  # of those seven libraries — every one but libnvrtc-builtins, which
-  # libnvrtc dlopens at runtime instead of linking — so it will not exec
-  # without the six on the loader path; bundling all seven still makes the
-  # tarball run on any host with only an NVIDIA driver. That set is a HAND
-  # LIST (seven names), not a derivation off the binary's own `DT_NEEDED`
-  # closure: a derivation arm existed and was EXCISED (#535) after the
-  # hermetic suite sourcing it — under its own `set +e`, not the script's
-  # fail-closed `set -euo pipefail`, which does not survive `source` —
-  # reported green with `libnccl` and `libnvrtc-builtins` missing from the
-  # stage directory; the hand list below fails the step by name instead.
-  # The driver's own libraries (`libcuda.so.1`, `libnvidia-*`)
-  # are deliberately NOT bundled — they must match the host's driver. A
-  # GPU-less runner is fine — nothing runs the binary here.
+  # self-sufficient: it bundles the CUDA-enabled binary, every CUDA runtime
+  # shared library the binary needs on a host with only an NVIDIA driver, and
+  # a `jammi-server` launcher that prepends the bundled `lib/` to
+  # `LD_LIBRARY_PATH` then execs the binary. The set to bundle is DERIVED —
+  # `ci/scripts/bundle_cuda_libs.sh`, sourced by the Package step below —
+  # from the binary's own transitive `DT_NEEDED` closure plus a measured
+  # floor of dlopen-only members (`libnvrtc-builtins`, which `libnvrtc.so.12`
+  # never links, only `dlopen`s — see that script's own module doc for the
+  # `readelf -d` measurement), never a hand-kept list of names: a HAND LIST
+  # shipped here once, and a derivation arm existed, was EXCISED (#535) after
+  # the hermetic suite sourcing it reported green with `libnccl` and
+  # `libnvrtc-builtins` missing from the stage directory, and its
+  # loader-verification arm was separately EXCISED (#534) after four measured
+  # defects made it unsound. Both are fixed in `bundle_cuda_libs.sh` and its
+  # suite; the derivation, the RPATH/RUNPATH assertion, and the real-loader
+  # verification below are what actually run here now — see that script's
+  # module doc for the full argument. The driver's own libraries
+  # (`libcuda.so.1`, `libnvidia-*`) are deliberately NOT bundled — they must
+  # match the host's driver. A GPU-less runner is fine — nothing runs the
+  # binary here; the loader-verification step below only asks the loader
+  # WHERE it would resolve each entry, never executes the binary itself.
   gpu-proof:
     name: GPU proof required
     # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
@@ -508,53 +509,43 @@ jobs:
           strip target/release/jammi-server
           cp target/release/jammi-server "${stage}/bin-jammi-server"
 
-          # Source the CUDA runtime `.so`s the binary links from the toolkit
-          # baked into the CUDA CI base (CUDA 12.6 lives at
-          # /usr/local/cuda-12.6/lib64), falling back to /usr/lib64 (where
-          # this image's `libnccl` RPM installs `libnccl.so.2` — the toolkit
-          # dir carries no NCCL at all). This is a HAND LIST of seven names —
-          # the six the toolkit itself carries, plus `libnccl`, the soname
-          # `jammi-ai`'s `cuda` feature pulls in through `candle-core/nccl`.
-          # A derivation that read this set off the binary's own `DT_NEEDED`
-          # closure existed and was EXCISED (#535, filed there): the script
-          # itself ran fail-closed (`set -euo pipefail`), but the hermetic
-          # suite that sourced it took `set +e` right after — needed to
-          # assert on exit codes without dying itself — and errexit does
-          # not survive `source`; under that `set +e` the suite reported
-          # green with `libnccl` and `libnvrtc-builtins` missing from the
-          # stage directory — this hand list's whole reason to fail closed
-          # by name, below, is closing exactly that failure mode without
-          # re-taking on the derivation's own risk surface.
-          # `libnvrtc-builtins` carries no `DT_NEEDED` entry naming it at
-          # all — MEASURED: `readelf -d` against the CUDA 12.6 toolkit's own
-          # `libnvrtc.so.12` (run inside `nvidia/cuda:12.6.3-devel-ubi8`)
-          # shows NVRTC `dlopen`s it at runtime rather than linking it — so
-          # it stays on this hand list rather than being left to a
-          # `DT_NEEDED` walk that could never discover it anyway. `cp -L`
-          # follows the dev symlinks to the real versioned object; a name
-          # that resolves to no versioned file in EITHER directory FAILS
-          # this step by name (unlike the loop this one replaces on `main`,
-          # which tolerated a missing name silently).
-          cuda_lib="/usr/local/cuda-12.6/lib64"
-          for soname in libcudart libcublas libcublasLt libcurand libnvrtc libnvrtc-builtins libnccl; do
-            staged=""
-            for dir in "${cuda_lib}" /usr/lib64; do
-              # Grab every matching versioned object (e.g. libcudart.so.12,
-              # libcudart.so.12.6.x) so the loader finds the SONAME it
-              # wants; the first directory that holds any match wins.
-              for so in "${dir}/${soname}.so".*; do
-                if [ -e "$so" ]; then
-                  cp -L "$so" "${stage}/lib/"
-                  staged=1
-                fi
-              done
-              [ -n "$staged" ] && break
-            done
-            if [ -z "$staged" ]; then
-              echo "::error::server-cu12-build: no versioned object for '${soname}' found in ${cuda_lib} or /usr/lib64" >&2
-              exit 1
-            fi
-          done
+          # DERIVED staging (#535/#534, both fixed): source the script rather
+          # than exec it, so this shell keeps `bundle_needed_sonames` and
+          # `bundle_verify_loader_resolution` in scope for the loader
+          # verification right below — the release lane's own `set -euo
+          # pipefail` stays in effect (unlike the hermetic suite, which takes
+          # it back off deliberately to assert on exit codes; nothing here
+          # does that). `bundle_main` itself asserts no `DT_RPATH`/
+          # `DT_RUNPATH` first, then stages the binary's transitive
+          # `DT_NEEDED` closure (minus the host-provided set) union the
+          # measured dlopen-only floor, then asserts every required soname
+          # landed as a same-named file — failing by name, never silently,
+          # on anything it cannot satisfy. No search path is passed: this
+          # image's default (`/usr/local/cuda-12.6/lib64` then `/usr/lib64`,
+          # where the `libnccl` RPM installs) is `bundle_cuda_libs.sh`'s own
+          # `BUNDLE_DEFAULT_SEARCH_PATH`.
+          . ci/scripts/bundle_cuda_libs.sh
+          bundle_main target/release/jammi-server "${stage}/lib"
+
+          # Loader verification (#534, arm 1a — the release lane's own real
+          # execution; `ci/scripts/test_bundle_cuda_libs.sh` is arm 1b, the
+          # hermetic fixture-parse half; see `bundle_cuda_libs.sh`'s module
+          # doc). Runs the REAL loader against the REAL stage, in this
+          # container (toolkit present, no NVIDIA driver — the `not found`
+          # driver lines this arm tolerates by name are expected here), and
+          # pipes the report through the SAME parser the hermetic suite
+          # drives over committed fixture text.
+          loader_report="$(LD_LIBRARY_PATH="${stage}/lib" ldd target/release/jammi-server 2>&1 || true)"
+          # shellcheck disable=SC2046
+          bundle_verify_loader_resolution "${stage}/lib" "$loader_report" $(bundle_needed_sonames target/release/jammi-server)
+
+          # Captured verbatim for `ci/scripts/fixtures/cu12_loader_report_real.txt`
+          # (T4(3)'s own real-report fixture; see that file's own header) —
+          # uploaded as a workflow artifact below so the lead can commit it
+          # in place of the provisional placeholder without renting a pod:
+          # this container already has the toolkit and no driver, which is
+          # exactly the shape the shipped arm sees on a release.
+          printf '%s\n' "$loader_report" > cu12_loader_report_real.txt
 
           # The launcher: a host with only an NVIDIA driver has no system CUDA,
           # so put the bundled libs on the loader path before exec. `exec`
@@ -581,6 +572,20 @@ jobs:
         with:
           name: jammi-server-cu12-tarball
           path: ${{ steps.package.outputs.asset }}
+
+      # F6: the real loader-report fixture, captured where the arm actually
+      # runs (this container: toolkit present, driver absent) rather than a
+      # rented pod. Runs on EVERY dispatch/tag push, same as the tarball
+      # itself; `workflow_dispatch` on a branch ref already runs this leg
+      # artifact-only with no release touched (`server-cu12-promote` below
+      # requires a `v*` tag — see this workflow's own module doc), so the
+      # lead dispatches on a branch, downloads this artifact, and commits its
+      # content over `ci/scripts/fixtures/cu12_loader_report_real.txt`'s
+      # `captured: pending` placeholder. No pod rental for this fixture.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cu12-loader-report
+          path: cu12_loader_report_real.txt
 
   server-cu12-promote:
     name: Promote jammi-server (CUDA) to the release

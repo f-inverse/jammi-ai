@@ -2298,8 +2298,13 @@ def fixture_r12p20_non_dict_attack_entry_denies() -> None:
     """`_r12_validate_and_run_entry`'s own "is not an object" arm,
     exercised through READER 1's by-file loop (never reader 2's relay
     path, which pre-checks `isinstance(entry, dict)` itself before ever
-    delegating — see R12R2g) — an `attacks["a.py"]` value that is a plain
-    string, not a `{command, hash}` object."""
+    delegating — see R12R2g, and never the SHARED validator's own marked
+    arm, reached only via a key OUTSIDE by_file — see R12P27) — an
+    `attacks["a.py"]` value that is a plain string, not a `{command,
+    hash}` object, where `a.py` is itself the (only) REQUIRED key. Binds
+    to its own producer's text (`anticipation artifact`), asserting the
+    shared validator's text (`anticipation-validator:`) is ABSENT — the
+    two are satisfiable by the same substring `is not an object` alone."""
     unit = "feat/r12p20"
     root = _temp_repo(unit)
     row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
@@ -2308,7 +2313,63 @@ def fixture_r12p20_non_dict_attack_entry_denies() -> None:
     })
     p = _r12_dispatch(root, unit)
     _assert(p.returncode == 2, "R12P20", f"a non-object attacks[f] entry must deny, got {p.returncode}: {p.stderr}")
-    _assert("is not an object" in p.stderr, "R12P20", p.stderr)
+    _assert("anticipation artifact" in p.stderr and "is not an object" in p.stderr, "R12P20", p.stderr)
+    _assert("anticipation-validator:" not in p.stderr, "R12P20", p.stderr)
+
+
+def fixture_r12p27_shared_validator_entry_not_object_denies() -> None:
+    """issue #569: the SHARED validator's own "is not an object" arm,
+    reached (unlike R12P20's) only via a key OUTSIDE the required
+    `by_file` set — `extra.py` is not named by the BLOCK's own
+    `finding_locations`/`class_enumeration`, so reader 1's per-file loop
+    (`_r12_validate_and_run_entry`) never even looks at it; it reaches
+    ONLY the shared validator's own second pass over the FULL `attacks`
+    dict. `a.py` (the required key) is a real, re-executable,
+    execution-class entry so the required-key loop passes cleanly before
+    the shared validator's own pass ever runs."""
+    unit = "feat/r12p27"
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": "python3 -c \"print('ok')\"", "hash": _r12_hash(0, "ok\n", "")},
+        "extra.py": "not-an-object",
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12P27", f"a non-object attacks[extra.py] entry must deny, got {p.returncode}: {p.stderr}")
+    _assert("anticipation-validator: attacks['extra.py'] is not an object" in p.stderr, "R12P27", p.stderr)
+    _assert("anticipation artifact" not in p.stderr, "R12P27", p.stderr)
+
+
+def fixture_r12p28_shared_validator_entry_no_command_denies() -> None:
+    """issue #569: the shared validator's own "has no `command`" arm,
+    reached the same way R12P27's is — a key outside `by_file`."""
+    unit = "feat/r12p28"
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": "python3 -c \"print('ok')\"", "hash": _r12_hash(0, "ok\n", "")},
+        "extra.py": {"hash": "a" * 64},
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12P28", f"an attacks[extra.py] entry with no command must deny, got {p.returncode}: {p.stderr}")
+    _assert("anticipation-validator: attacks['extra.py'] has no `command`" in p.stderr, "R12P28", p.stderr)
+    _assert("anticipation artifact" not in p.stderr, "R12P28", p.stderr)
+
+
+def fixture_r12p29_shared_validator_entry_no_valid_hash_denies() -> None:
+    """issue #569: the shared validator's own "has no valid `hash`" arm,
+    reached the same way R12P27's is — a key outside `by_file`."""
+    unit = "feat/r12p29"
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": "python3 -c \"print('ok')\"", "hash": _r12_hash(0, "ok\n", "")},
+        "extra.py": {"command": "python3 -c \"print('x')\"", "hash": "not-hex"},
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12P29", f"an attacks[extra.py] entry with an invalid hash must deny, got {p.returncode}: {p.stderr}")
+    _assert("anticipation-validator: attacks['extra.py'] has no valid `hash`" in p.stderr, "R12P29", p.stderr)
+    _assert("anticipation artifact" not in p.stderr, "R12P29", p.stderr)
 
 
 def _r12_empty_set_repo(unit: str) -> Path:
@@ -2590,6 +2651,15 @@ def fixture_r12r2f_partial_attacks_post_coverage_denies() -> None:
 
 
 def fixture_r12r2g_attacks_post_entry_not_object_denies() -> None:
+    """issue #569 fold-in: `_post_fix_attacks_rejection`'s OWN inline
+    `isinstance(entry, dict)` pre-check (`relay attacks_post[{f!r}] is
+    not an object`) — a THIRD producer of the unmarked substring `is not
+    an object`, distinct from BOTH `_r12_validate_and_run_entry`'s own
+    text (`anticipation artifact ...`) and the shared validator's marked
+    text (`anticipation-validator: ...`), since `attacks_post` is never
+    routed through the shared validator at all (only the pre-fix
+    `attacks` path is, see R12P27). Binds to its own producer's exact
+    text, asserting the other two are ABSENT."""
     root, row, cmd, pre_hash = _r12_post_setup("feat/r12r2g")
     (root / "state.txt").write_text("FIXED\nv1\n")
     _git(root, "add", "-A")
@@ -2600,7 +2670,9 @@ def fixture_r12r2g_attacks_post_entry_not_object_denies() -> None:
     p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
         "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/r12r2g"}}, root)
     _assert(p.returncode == 2, "R12R2g", f"a non-object attacks_post entry must deny, got {p.returncode}")
-    _assert("is not an object" in p.stderr, "R12R2g", p.stderr)
+    _assert("relay `attacks_post['state.txt']` is not an object" in p.stderr, "R12R2g", p.stderr)
+    _assert("anticipation artifact" not in p.stderr and "anticipation-validator:" not in p.stderr,
+            "R12R2g", p.stderr)
 
 
 def fixture_r12r2h_attacks_post_command_differs_from_pre_fix_denies() -> None:
@@ -3921,7 +3993,8 @@ _R12_SWEEP_FUNCS = {
     "_post_fix_attacks_rejection", "_r12_find_pre_fix_artifact",
     "_r12_required_commands_path", "_r12_required_commands_or_deny",
     "_r12_gates_shape_rejection", "_r12_anticipation_rejection",
-    "_mutations_rejection", "_r12_new_test_surfaces", "_r12_previous_relay_row",
+    "_r12_mutations_array_rejection", "_mutations_rejection", "_r12_new_test_surfaces",
+    "_r12_normalize_ts_instant", "_r12_previous_relay_row", "_r12_exclusions_shape_rejection",
     "_exclusions_rejection",
 }
 
@@ -4822,7 +4895,17 @@ def _r12_exclusions_setup(unit: str):
 
 def fixture_r12x1_missing_exclusions_denies() -> None:
     """item 8c: the fix's own diff adds a new test definition
-    (`test_thing`), and the relay carries no `exclusions` object at all."""
+    (`test_thing`), and the relay carries no `exclusions` object at all.
+
+    `_exclusions_rejection`'s OWN `why == "carries no `exclusions` object"`
+    special case (its distinguishing text: the whole diff's own new test
+    definition(s) named, "each must name the case ... does NOT cover") is
+    what must fire HERE -- never merely the generic passthrough arm
+    (`_r12_exclusions_shape_rejection`'s SAME bare string wrapped only in
+    the item-8c parenthetical suffix, which is unreachable via THIS caller
+    for a missing-object shape but shares the SAME bare substring the OLD
+    assertion alone could not tell apart from the special case -- the
+    exact #569-class defect a bare substring check misses)."""
     unit = "feat/r12x1"
     root, row, fix_head = _r12_exclusions_setup(unit)
     a = _auto_r12_attack("a.py")
@@ -4833,6 +4916,10 @@ def fixture_r12x1_missing_exclusions_denies() -> None:
         "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
     _assert(p.returncode == 2, "R12X1", f"missing `exclusions` must deny, got {p.returncode}: {p.stderr}")
     _assert("no `exclusions` object" in p.stderr, "R12X1", p.stderr)
+    _assert("does NOT cover" in p.stderr, "R12X1",
+            f"the special-case producer's OWN text must fire, got: {p.stderr}")
+    _assert("`exclusions` object (esc-lead-gate-R12 item 8c)" not in p.stderr, "R12X1",
+            f"the generic passthrough producer's text must be ABSENT, got: {p.stderr}")
 
 
 def fixture_r12x2_exclusions_present_allows() -> None:
@@ -5172,6 +5259,9 @@ FIXTURES = [
     ("R12P18", fixture_r12p18_no_linked_worktree_denies),
     ("R12P19", fixture_r12p19_execution_class_direct_program_name_allows),
     ("R12P20", fixture_r12p20_non_dict_attack_entry_denies),
+    ("R12P27", fixture_r12p27_shared_validator_entry_not_object_denies),
+    ("R12P28", fixture_r12p28_shared_validator_entry_no_command_denies),
+    ("R12P29", fixture_r12p29_shared_validator_entry_no_valid_hash_denies),
     ("R12E1", fixture_r12e1_empty_derived_set_fewer_than_two_keys_denies),
     ("R12E2", fixture_r12e2_empty_derived_set_key_outside_changed_files_denies),
     ("R12E3", fixture_r12e3_empty_derived_set_all_inspector_denies),

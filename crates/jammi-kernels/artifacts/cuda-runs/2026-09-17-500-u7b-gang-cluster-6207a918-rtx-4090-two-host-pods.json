@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "git_sha": "6207a918afde72bf4cfac4acca9c8174ba1ccdff",
+  "box": "a100-sxm4-two-host-pods",
+  "producer": {
+    "path": "ci/scripts/runpod_gpu_cluster.sh",
+    "kind": "script",
+    "invocation": "bash ci/scripts/runpod_gpu_cluster.sh",
+    "gating": "env:JAMMI_REQUIRE_CUDA_TWO_HOSTS"
+  },
+  "status": "GREEN",
+  "artifact_kind": "gang",
+  "gang": {
+    "leg": "cluster",
+    "world": 2,
+    "collective": "nccl",
+    "hosts": 2,
+    "ranks": [
+      {
+        "rank": 0,
+        "host": "28c9c817bcc5",
+        "device": "cuda:0",
+        "iface": "podnet1",
+        "reduced_vector_digest": "58020d46488f254a9823b57c4283d6a8c61b13c7b5455bde33e477efba49d739"
+      },
+      {
+        "rank": 1,
+        "host": "ef466c0eab8e",
+        "device": "cuda:0",
+        "iface": "podnet1",
+        "reduced_vector_digest": "58020d46488f254a9823b57c4283d6a8c61b13c7b5455bde33e477efba49d739"
+      }
+    ],
+    "reduced_vector_digest": "58020d46488f254a9823b57c4283d6a8c61b13c7b5455bde33e477efba49d739",
+    "verdict": "pass",
+    "pod_count": 2,
+    "gpu_count_per_pod": 1,
+    "ttl_hours": 1,
+    "transport": "global-networking"
+  }
+}

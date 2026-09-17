@@ -185,6 +185,21 @@ tracing-subscriber.workspace = true
 # `gen-tonic` for the generated server trait + tonic-prost codec; `trace` for
 # the trace-service message types. Test-only.
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace"] }
+# The real-tokenizer masking step and the fine_tune/ reachability call graph
+# in `tests/it/pinned_source_gate.rs` (#554, #549): a hand-rolled char scanner
+# cannot tell a raw string's `r#"..."#` delimiter from a plain string's `"`
+# (closing audit #9 of U2a measured the desync live on this tree), and a
+# line-based literal scan cannot see a DataFusion-registration call passed as
+# a bare fn-pointer argument or embedded in a `tokio::select!`/`assert!` arm.
+# Both gates instead tokenize with the SAME lexer `rustc` itself is built on
+# (`proc-macro2`'s fallback, non-proc-macro tokenizer) and walk the resulting
+# token stream with `syn`'s AST types. Pinned to the exact versions already
+# resolved transitively in `Cargo.lock` (`cargo tree -p proc-macro2 -p syn`),
+# so adding this dev-only edge moves nothing in the lock and `cargo deny`'s
+# advisory scan sees no new dependency. Test-only: no production code parses
+# Rust source.
+proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
+syn = { version = "2.0.117", features = ["full", "visit", "extra-traits"] }
 
 [features]
 default = ["local"]

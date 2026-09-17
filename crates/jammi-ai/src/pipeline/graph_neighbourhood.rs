@@ -220,6 +220,7 @@ pub const DEFAULT_HOP_CAP: usize = 3;
 
 /// Which declared edge relation to gather over, tenant-scoped.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum EdgeSourceRef {
     /// An S9 `neighbor_graph` result table (`src`/`dst`/`rank`/`similarity`).
     /// `similarity` carries the edge weight; edges are untyped.

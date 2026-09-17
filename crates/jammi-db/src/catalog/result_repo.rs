@@ -1,6 +1,8 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+use strum::VariantArray;
+
 use crate::catalog::backend::{BackendError, BackendKind, Row, SqlValue, Transaction, TxOptions};
 #[cfg(feature = "test-hooks")]
 use crate::catalog::lease::LEASE_TS_FORMAT;
@@ -23,7 +25,7 @@ use crate::tenant_scope::TenantBinding;
 /// excludes it from embedding-table resolution. Keeping the distinction here
 /// rather than in `ModelTask` leaves that enum a pristine catalogue of model
 /// tasks (S9 §5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, strum::VariantArray)]
 pub enum ResultTableKind {
     /// An embedding or inference table produced by running a model.
     Model,
@@ -48,29 +50,17 @@ impl ResultTableKind {
     /// Every kind, in declaration order — the single set the string codec's
     /// round-trip oracle and its "expected" error text both range over.
     ///
-    /// Produced by `Self::all`, an exhaustive match over every variant of
-    /// `Self`: the match arm's pattern must name every variant joined by
-    /// `|`, or the match fails to compile ("non-exhaustive patterns"). The
-    /// compiler checks only that pattern, not the arm's value — E0004 binds
-    /// the pattern, not the `[Self; 4]` array literal — so a variant named
-    /// in the pattern but omitted from the array still compiles. `ALL`
-    /// therefore names every variant the pattern names, not necessarily
-    /// every variant of `Self`
-    /// (<https://github.com/f-inverse/jammi-ai/issues/550> tracks giving
-    /// enum inventories like this one exhaustiveness by construction).
-    pub const ALL: [Self; 4] = Self::all();
-
-    /// The exhaustive match backing [`Self::ALL`]; see that constant's doc.
-    const fn all() -> [Self; 4] {
-        match Self::Model {
-            Self::Model | Self::NeighborGraph | Self::AsofJoin | Self::TrainingSet => [
-                Self::Model,
-                Self::NeighborGraph,
-                Self::AsofJoin,
-                Self::TrainingSet,
-            ],
-        }
-    }
+    /// `#[derive(VariantArray)]` (`strum`) reads this enum's own variant
+    /// list at macro-expansion time and emits [`VariantArray::VARIANTS`]
+    /// directly from it — unlike a hand-written exhaustive match, whose
+    /// pattern the compiler checks (E0004: every variant must appear in the
+    /// pattern) but whose hand-typed ARRAY VALUE it does not: a variant
+    /// named in the match pattern but omitted from a hand-typed array still
+    /// compiled. There is no second list here to omit a variant from: adding a variant to
+    /// this enum either compiles into `ALL` automatically (the derive sees
+    /// it) or fails to compile (every other exhaustive match on `Self` in
+    /// this module, e.g. [`Self::as_db_str`], demands a new arm).
+    pub const ALL: &'static [Self] = <Self as VariantArray>::VARIANTS;
 
     /// Canonical string stored in the `result_tables.kind` column. The single
     /// source of truth — [`try_from_db_str`](Self::try_from_db_str) decodes it.
@@ -89,7 +79,8 @@ impl ResultTableKind {
     /// hand-written: the two can never drift apart.
     pub fn try_from_db_str(s: &str) -> Result<Self> {
         Self::ALL
-            .into_iter()
+            .iter()
+            .copied()
             .find(|kind| kind.as_db_str() == s)
             .ok_or_else(|| {
                 let expected: Vec<&'static str> =
@@ -129,7 +120,7 @@ pub struct CreateResultTableParams<'a> {
     /// creation time. A search request may still override it for one call.
     pub oversample: usize,
     /// The row's creation timestamp, stamped by the caller via
-    /// [`crate::catalog::backend::now_sortable`] rather than left to a SQL
+    /// [`crate::catalog::lease::canonical_stamp_now`] rather than left to a SQL
     /// `DEFAULT` — a backend-computed default would give SQLite and Postgres
     /// different resolutions and shapes for the same column, which is exactly
     /// the ordering-key parity bug [`Catalog::resolve_embedding_table`] used
@@ -826,11 +817,7 @@ impl Catalog {
     ) -> Result<()> {
         let completed_at = if matches!(status, ResultTableStatus::Ready | ResultTableStatus::Failed)
         {
-            Some(
-                chrono::Utc::now()
-                    .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                    .to_string(),
-            )
+            Some(crate::catalog::lease::canonical_stamp_now())
         } else {
             None
         };
@@ -887,9 +874,7 @@ impl Catalog {
     /// affected exactly one row; the caller deletes the row's objects only
     /// after `Ok(true)`.
     pub async fn fail_ready_result_table(&self, name: &str) -> Result<bool> {
-        let completed_at = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
+        let completed_at = crate::catalog::lease::canonical_stamp_now();
         let name = name.to_string();
         let arm = TenantArm::in_force(self.current_tenant());
         let tenant = self.current_tenant();
@@ -1107,9 +1092,7 @@ impl Catalog {
     /// the row's objects only after this returns `Ok(())` — a writer aborting
     /// its own table, or recovery reaping an expired-lease row.
     pub async fn fail_building_table(&self, cas: &ResultTableCas) -> Result<()> {
-        let completed_at = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
+        let completed_at = crate::catalog::lease::canonical_stamp_now();
         self.building_row_cas(
             cas,
             "status = 'failed', row_count = 0, completed_at = $1, lease_expires_at = NULL",
@@ -1214,9 +1197,7 @@ impl Catalog {
         definition_hash: &str,
         input_anchors_json: &str,
     ) -> Result<Option<TenantId>> {
-        let completed_at = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
+        let completed_at = crate::catalog::lease::canonical_stamp_now();
         let cas_in_tx = cas.clone();
         let rows_i64 = rows as i64;
         let definition_hash = definition_hash.to_string();
@@ -1307,7 +1288,7 @@ impl Catalog {
     /// [`Self::list_live_building_tables`]: every `status = 'building'` row
     /// additionally matching `lease_predicate` (a full boolean SQL
     /// expression, built entirely from the backend's own clock on Postgres
-    /// (a bound [`crate::catalog::lease::lease_now`] on SQLite, per
+    /// (a bound [`crate::catalog::lease::canonical_stamp_now`] on SQLite, per
     /// `catalog::lease`'s module docs) — its own bind, if any, is threaded
     /// through so the tenant bind that follows numbers correctly regardless
     /// of backend). `live` selects expired (`false`) vs. live (`true`);
@@ -1596,11 +1577,12 @@ impl Catalog {
     /// `(definition_hash, input_anchors)` match is the caller's anchor-set
     /// comparison.
     ///
-    /// `created_at` is app-supplied (`backend::now_sortable`) at nanosecond
-    /// resolution, identical in shape on both backends; `table_name DESC` is a
-    /// deterministic final tiebreak for a same-nanosecond collision (every
-    /// table name carries a uuid suffix, so the pick is at least
-    /// deterministic), the same idiom [`Self::resolve_embedding_table`] uses.
+    /// `created_at` is app-supplied (`lease::canonical_stamp_now`) at
+    /// microsecond resolution, identical in shape on both backends;
+    /// `table_name DESC` is a deterministic final tiebreak for a
+    /// same-microsecond collision (every table name carries a uuid suffix, so
+    /// the pick is at least deterministic), the same idiom
+    /// [`Self::resolve_embedding_table`] uses.
     pub async fn find_ready_result_tables_by_definition(
         &self,
         definition_hash: &str,
@@ -1837,16 +1819,16 @@ impl Catalog {
         // relation) whose `task` column still names the source embedding's
         // task — only genuine model outputs resolve as an embedding source.
         //
-        // `created_at` is app-supplied (`backend::now_sortable`) at
-        // nanosecond resolution and identical in shape on both backends, so
+        // `created_at` is app-supplied (`lease::canonical_stamp_now`) at
+        // microsecond resolution and identical in shape on both backends, so
         // it is the correct primary ordering key — no `rowid` (SQLite has
         // one, Postgres does not; this query used to hard-error on Postgres
         // reaching for it). `table_name DESC` is a deterministic final
-        // tiebreak, not a correctness guarantee: `now_sortable` is wall-clock
-        // (`chrono::Utc::now`), which is not monotonic, so a coarse or
-        // backward clock step could in principle collide two genuinely
-        // distinct creation instants. The tiebreak resolves a true
-        // same-nanosecond collision correctly (every table name carries a
+        // tiebreak, not a correctness guarantee: `canonical_stamp_now` is
+        // wall-clock (`chrono::Utc::now`), which is not monotonic, so a
+        // coarse or backward clock step could in principle collide two
+        // genuinely distinct creation instants. The tiebreak resolves a true
+        // same-microsecond collision correctly (every table name carries a
         // uuid suffix, so the pick is at least deterministic); it does not
         // repair a clock-caused false collision between otherwise-ordered
         // rows.
@@ -1912,21 +1894,17 @@ mod tests {
     use super::*;
 
     /// Family M: `as_db_str` and `try_from_db_str` are inverse over the set
-    /// [`ResultTableKind::ALL`], not necessarily the whole enum. A variant
-    /// added to the enum without a spelling fails to compile (`as_db_str`'s
-    /// match is exhaustive), but a variant named in `Self::all`'s match
-    /// pattern and omitted from its `[Self; 4]` array value still compiles
-    /// (see that constant's doc) and is missing from this round-trip test
-    /// exactly as it is missing from `ALL`
-    /// (<https://github.com/f-inverse/jammi-ai/issues/550>). The injectivity
-    /// assertion below then checks a property that mechanism cannot enforce:
-    /// that no two listed kinds share one spelling.
+    /// [`ResultTableKind::ALL`], which [`Self::ALL`]'s doc explains IS the
+    /// whole enum by construction (the `VariantArray` derive, not a
+    /// hand-typed array a future variant could be left out of). The
+    /// injectivity assertion below then checks a property that mechanism
+    /// cannot enforce: that no two listed kinds share one spelling.
     #[test]
     fn every_result_table_kind_round_trips_through_its_db_string() {
         for kind in ResultTableKind::ALL {
             assert_eq!(
                 ResultTableKind::try_from_db_str(kind.as_db_str()).unwrap(),
-                kind,
+                *kind,
                 "{kind:?} must decode from its own canonical spelling"
             );
         }
@@ -1940,12 +1918,8 @@ mod tests {
     }
 
     /// The refusal names the offending value and every entry of
-    /// [`ResultTableKind::ALL`], the hand-listed array checked above — not
-    /// necessarily every variant of the enum. A variant named in
-    /// `ResultTableKind::all`'s pattern but left out of `ALL` would be
-    /// missing from this message exactly as it is missing from the round-trip
-    /// test above; see
-    /// <https://github.com/f-inverse/jammi-ai/issues/550>.
+    /// [`ResultTableKind::ALL`] — every variant of the enum, by construction
+    /// (see that constant's doc).
     #[test]
     fn an_unknown_result_table_kind_is_refused_naming_every_accepted_spelling() {
         let err = ResultTableKind::try_from_db_str("embedding_index")

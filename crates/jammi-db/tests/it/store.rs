@@ -82,7 +82,7 @@ async fn result_table_crud_lifecycle() {
             text_columns: Some("abstract"),
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
-            created_at: jammi_db::catalog::backend::now_sortable(),
+            created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
         })
         .await
@@ -118,7 +118,7 @@ async fn result_table_crud_lifecycle() {
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
-            created_at: jammi_db::catalog::backend::now_sortable(),
+            created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
         })
         .await
@@ -165,7 +165,7 @@ async fn find_result_tables_filters_by_source_and_task() {
                 text_columns: None,
                 storage_precision: jammi_db::config::StoragePrecision::F32,
                 oversample: 4,
-                created_at: jammi_db::catalog::backend::now_sortable(),
+                created_at: jammi_db::catalog::lease::canonical_stamp_now(),
                 job_attempt: None,
             })
             .await
@@ -367,7 +367,7 @@ async fn resolve_embedding_table_picks_newest_by_created_at_not_table_name(backe
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
-            created_at: jammi_db::catalog::backend::now_sortable(),
+            created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
         })
         .await
@@ -400,7 +400,7 @@ async fn resolve_embedding_table_picks_newest_by_created_at_not_table_name(backe
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
-            created_at: jammi_db::catalog::backend::now_sortable(),
+            created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
         })
         .await
@@ -475,7 +475,7 @@ async fn recovery_skips_index_rebuild_for_non_embedding_task() {
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
-            created_at: jammi_db::catalog::backend::now_sortable(),
+            created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
         })
         .await
@@ -832,7 +832,7 @@ async fn recovery_marks_missing_parquet_as_failed() {
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
-            created_at: jammi_db::catalog::backend::now_sortable(),
+            created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
         })
         .await
@@ -880,7 +880,7 @@ async fn recovery_deletes_invalid_parquet_and_marks_failed() {
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
-            created_at: jammi_db::catalog::backend::now_sortable(),
+            created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
         })
         .await
@@ -945,7 +945,7 @@ async fn recovery_promotes_valid_parquet_to_ready() {
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
-            created_at: jammi_db::catalog::backend::now_sortable(),
+            created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
         })
         .await
@@ -965,14 +965,16 @@ async fn recovery_promotes_valid_parquet_to_ready() {
 
 // ─── typed-null catalog bind (dimensions: Option<i32> -> INTEGER) ───────────
 
-/// A deterministic, strictly-increasing `now_sortable`-format `created_at`
-/// for tests that assert "newest wins" — `now_sortable` is wall-clock
-/// (`chrono::Utc::now`), which is not monotonic and has no guaranteed
-/// resolution, so back-to-back un-slept inserts must not rely on it to
-/// order themselves. Binding explicit values here makes the ordering the
-/// test asserts on independent of clock behavior entirely.
+/// A deterministic, strictly-increasing `CANONICAL_STAMP`-shaped `created_at`
+/// (`lease::canonical_stamp_now`'s six-fraction-digit shape — `result_tables`
+/// enforces this domain at the schema edge, so a nine-digit value here would
+/// be refused) for tests that assert "newest wins": `canonical_stamp_now` is
+/// wall-clock (`chrono::Utc::now`), which is not monotonic, so back-to-back
+/// un-slept inserts must not rely on it to order themselves. Binding explicit
+/// values here makes the ordering the test asserts on independent of clock
+/// behavior entirely.
 fn sortable_at(seq: u64) -> String {
-    format!("2020-01-01T00:00:00.{seq:09}Z")
+    format!("2020-01-01T00:00:00.{seq:06}Z")
 }
 
 /// A dimensionless result table (e.g. a classifier, whose output isn't a
@@ -1029,7 +1031,7 @@ async fn result_table_none_dimensions_round_trips_as_null(backend: BackendKind) 
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
-            created_at: jammi_db::catalog::backend::now_sortable(),
+            created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
         })
         .await

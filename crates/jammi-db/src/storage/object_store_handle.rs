@@ -90,9 +90,20 @@ impl JammiObjectStore {
         self.url.scheme()
     }
 
-    /// Underlying `Arc<dyn ObjectStore>`. Exposed for the writer / reader
-    /// helpers; user code should never reach for it directly.
-    pub fn driver(&self) -> Arc<dyn ObjectStore> {
+    /// Underlying `Arc<dyn ObjectStore>`, for this crate's own writer and
+    /// reader helpers only. `pub(crate)`, not `pub`: the raw driver can
+    /// delete any key with no `models/` guard, so this HANDLE never hands
+    /// it to another crate (a compiler refusal), and inside this crate every
+    /// reference to `driver` — this accessor and the private field — is a
+    /// reviewed row of the raw byte-delete oracle
+    /// (`tests/it/models_delete_call_sites.rs`). The raw store is still
+    /// obtainable without a handle — through `StorageRegistry::driver_for`
+    /// and `build_object_store`, through `JammiSession::context()`'s
+    /// DataFusion runtime registry (re-exposed by `jammi-ai`'s
+    /// `InferenceSession::context()`), or by constructing an `object_store`
+    /// client directly with the same credentials; that is the oracle's
+    /// stated residual, not something this accessor's visibility closes.
+    pub(crate) fn driver(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.driver)
     }
 

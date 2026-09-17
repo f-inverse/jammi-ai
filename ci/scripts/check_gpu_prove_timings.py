@@ -22,7 +22,9 @@ Rules:
         unparseable, and FAILS if the two `${RP_TIMEOUT:-N}` occurrences in
         `runpod_lib.sh` ever disagree with each other. Separately, a
         stdlib-only, fail-closed SETTER-PREDICATE scan over comment-stripped
-        `ci/scripts/**` (`^\\s*(export\\s+)?RP_(TIMEOUT|INACTIVITY)=`) and
+        `ci/scripts/**` except the lane test suites `ci/scripts/test_*.sh`
+        (they parameterise the library through its env input inside fixture
+        subshells and set no default) (`^\\s*(export\\s+)?RP_(TIMEOUT|INACTIVITY)=`) and
         `.github/workflows/**` (`^\\s*RP_(TIMEOUT|INACTIVITY)\\s*:`) catches
         any OTHER committed setter (a workflow `env:`/`with:` key, a
         hardcoded override in some other script) outside the two legitimate
@@ -123,6 +125,13 @@ _YAML_SETTER_RE = re.compile(r"^\s*RP_(TIMEOUT|INACTIVITY)\s*:")
 ALLOWED_SETTER_SITES = frozenset({(RUNPOD_LIB_REL, "INACTIVITY"), (RUNPOD_PROVE_REL, "TIMEOUT")})
 
 
+def _is_lane_test_suite(rel: str) -> bool:
+    """`ci/scripts/test_*.sh`: the lane test suites (the consumers of the
+    runpod library's env inputs), out of the committed-setter scan's
+    universe by rule -- see `scan_setters`."""
+    return rel.startswith("ci/scripts/test_") and rel.endswith(".sh")
+
+
 def _strip_shell_comments(text: str) -> str:
     return "\n".join("" if line.strip().startswith("#") else line for line in text.splitlines())
 
@@ -149,6 +158,19 @@ def scan_setters(repo_root: Path = REPO_ROOT) -> list[tuple[str, str, int, str]]
     a second source of truth for the default and must not count as one."""
     found: list[tuple[str, str, int, str]] = []
     for rel in _tracked_files(repo_root):
+        if _is_lane_test_suite(rel):
+            # A lane test suite (`ci/scripts/test_*.sh`) drives the REAL
+            # driver functions under stubbed ssh/scp and must set
+            # RP_INACTIVITY/RP_TIMEOUT to seconds-scale values to reach the
+            # inactivity and budget arms in a test's lifetime. It does so
+            # through the library's own documented env input
+            # (`RP_INACTIVITY="${RP_INACTIVITY:-N}"` reads the environment)
+            # inside a fixture subshell that never runs in production, so it
+            # sets no competing DEFAULT: the rule this scan enforces is "one
+            # committed default per var", and a fixture parameter is not a
+            # default. Stated as a universe rule here, never as a per-line
+            # exemption: every other `ci/scripts/**` file stays in scope.
+            continue
         if rel.startswith("ci/scripts/"):
             regex = _SHELL_SETTER_RE
             stripper = _strip_shell_comments
@@ -779,6 +801,28 @@ def _self_test() -> int:
         check(
             "comment-mention-does-not-fire",
             not any("999" in p or "RP_TIMEOUT: \"1\"" in p for p in r1),
+            f"{r1}",
+        )
+
+    # --- a lane test suite parameterising the library through its env
+    # input is NOT a committed default; the identical line in a driver
+    # script IS (the universe rule, both directions). ---
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _write_fixture_repo(root, lib_body=_GOOD_LIB, prove_body=_GOOD_PROVE)
+        fixture_line = 'RP_INACTIVITY="$P12_INACT"; DEADLINE=$(( SECONDS + P12_DL ))\n'
+        (root / "ci" / "scripts" / "test_gpu_cluster_lane.sh").write_text(fixture_line)
+        (root / "ci" / "scripts" / "runpod_gpu_cluster.sh").write_text(fixture_line)
+        subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+        setters = scan_setters(root)
+        suite_hits = [s for s in setters if s[0] == "ci/scripts/test_gpu_cluster_lane.sh"]
+        driver_hits = [s for s in setters if s[0] == "ci/scripts/runpod_gpu_cluster.sh"]
+        check("lane-test-suite-parameter-not-a-setter", suite_hits == [], f"{setters}")
+        check("same-line-in-a-driver-is-a-setter", len(driver_hits) == 1, f"{setters}")
+        r1, _ = check_r1(root)
+        check(
+            "lane-test-suite-r1-clean-driver-r1-caught",
+            not any("test_gpu_cluster_lane.sh" in p for p in r1) and any("runpod_gpu_cluster.sh" in p for p in r1),
             f"{r1}",
         )
 

@@ -476,6 +476,133 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
     );
 }
 
+/// #551's mining W=1 byte-parity oracle (second half; GANG3A round 3,
+/// N2-gate) — the non-vacuity control #551 names: U2b's own attempted
+/// digest test set `hard_negatives.mine = true` with NO `embedding_loss` at
+/// all, so `mining_eligible()` (which ALSO requires the in-batch-negative
+/// objective, `source.rs`'s own doc) never admitted mining, and flipping
+/// `mine` off left the pinned bytes identical because the miner never ran
+/// either way — it measured nothing. This test sets an `embedding_loss` the
+/// predicate admits (`MultipleNegativesRanking`) and drives the SAME
+/// fixture twice, `mine` the only field that differs, then asserts the
+/// trained adapter bytes MOVE.
+///
+/// **Mining asserted to have run, not merely configured.** `cached: false`
+/// on both runs is load-bearing: `whole_set_arm` checks `mining_eligible`
+/// BEFORE `gradcache_eligible` (`source.rs::whole_set_arm`'s own doc), but a
+/// bare `Resident` source-kind observation is ambiguous between the two
+/// arms when both COULD be eligible — no test hook distinguishing them
+/// directly exists (a gap disclosed here, not closed). Pinning
+/// `cached: false` removes that ambiguity structurally instead: with
+/// GradCache ineligible on this config, `Resident` cannot be explained by
+/// anything other than `WholeSetArm::Mining`.
+///
+/// **No committed byte-for-byte pin, unlike [`gradcache_completes_at_w1_with_a_pinned_adapter_digest`]
+/// right above** — stated honestly, not silently narrowed: that oracle pins
+/// TWO separate constants precisely because this crate's CPU backprop is
+/// demonstrably not byte-identical across `target_os` (a measured
+/// divergence on this very fixture, not a hypothetical one). Producing that
+/// same pair for a mining run needs a measurement on a Linux host, which
+/// was not available to this implementer this round — UNCOVERED, not
+/// attempted at low confidence (see this unit's contract). This oracle
+/// instead compares two digests captured LIVE in the SAME test run (mining
+/// on vs. off): exactly as sensitive to a mining regression (an identical
+/// adapter print with mining flipped on is exactly the failure mode a
+/// missing pin would also have caught), and needs no per-platform constant
+/// at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it_unreached() {
+    use jammi_ai::fine_tune::{EmbeddingLoss, HardNegativeConfig};
+
+    async fn run(dir: &TempDir, mine: bool) -> (Option<&'static str>, String) {
+        let session = session_over(dir, &common::fixture_url("training_triplets.csv")).await;
+        let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+            .expect("default worker intervals are valid");
+        let job = session
+            .fine_tune(
+                "training",
+                &tiny_bert_model(),
+                &["anchor".to_string(), "positive".to_string()],
+                FineTuneMethod::Lora,
+                ModelTask::TextEmbedding,
+                Some(FineTuneConfig {
+                    epochs: 1,
+                    batch_size: 4,
+                    lora_rank: 4,
+                    warmup_steps: 0,
+                    cached: false,
+                    embedding_loss: Some(EmbeddingLoss::MultipleNegativesRanking {
+                        temperature: 20.0,
+                    }),
+                    hard_negatives: HardNegativeConfig {
+                        mine,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let job_id = job.job_id.clone();
+        job.wait()
+            .await
+            .expect("a W=1 mining-config run must complete");
+
+        let source_kind =
+            jammi_ai::fine_tune::worker::training_test_hooks::source_kind_for(&job_id);
+
+        let models = session.catalog().list_models().await.unwrap();
+        let ft = models
+            .iter()
+            .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
+            .expect("the run registers its output model");
+        let prefix =
+            jammi_db::storage::StorageUrl::parse(ft.artifact_path.as_deref().unwrap()).unwrap();
+        let local = session
+            .artifact_store()
+            .fetch_artifact(&prefix)
+            .await
+            .expect("the published adapter fetches and verifies");
+        let prints = pinned_prints(local.dir());
+        let adapter_print = prints
+            .get("adapter.safetensors")
+            .expect("every run publishes adapter.safetensors")
+            .clone();
+        (source_kind, adapter_print)
+    }
+
+    let mining_dir = TempDir::new().unwrap();
+    let (mining_kind, mining_print) = run(&mining_dir, true).await;
+    assert_eq!(
+        mining_kind,
+        Some("resident"),
+        "mine=true under MultipleNegativesRanking, cached=false, must select Resident \
+         (mining_eligible) — cached=false on this same config rules out GradCache as an \
+         alternative explanation, so Resident here is proof the Mining arm, specifically, ran"
+    );
+
+    let off_dir = TempDir::new().unwrap();
+    let (off_kind, off_print) = run(&off_dir, false).await;
+    assert_eq!(
+        off_kind,
+        Some("streamed"),
+        "mine=false, cached=false leaves whole_set_arm() with no eligible arm at all — the run \
+         must take the Streamed path, never Resident, confirming the ONLY difference between the \
+         two runs is whether the miner ran"
+    );
+
+    assert_ne!(
+        mining_print, off_print,
+        "hard-negative mining must change the trained adapter bytes — an identical adapter print \
+         with mining flipped on would mean the miner's replaced (anchor, positive, mined-negative) \
+         triplets never reached the trainer. #551's non-vacuity control: U2b's own attempted pin \
+         found this identical because `mining_eligible()` never admitted mining without an \
+         `embedding_loss` set at all; this run sets one, so a regression that silently dropped the \
+         mined loader (falling back to the original triplets) reproduces exactly U2b's vacuous \
+         result and this assertion catches it."
+    );
+}
+
 /// (a) A fine-tune job creates a `ready` `TrainingSet` result table carrying a
 /// definition hash and a manifest attestation, and trains from it.
 #[tokio::test(flavor = "multi_thread")]

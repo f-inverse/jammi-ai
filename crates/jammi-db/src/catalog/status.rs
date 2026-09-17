@@ -7,6 +7,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use strum::VariantArray;
+
 use crate::error::JammiError;
 
 /// Status of a result table (Parquet-backed embedding/inference output).
@@ -50,8 +52,12 @@ impl FromStr for ResultTableStatus {
 /// `Running` are non-terminal; `Completed` and `Failed` are terminal — the
 /// two states [`crate::catalog::jobs_repo::JobRecord::is_terminal`] and the
 /// retention age-predicate ([`crate::catalog::model_repo`]'s `REFERENCE_EDGES`)
-/// both key on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// both key on. `Failed` is additionally TERMINAL-UNSUCCESSFUL
+/// ([`Self::is_terminal_unsuccessful`]). A `Cancelled` variant is NOT
+/// declared here: a status with no writer is dead vocabulary — it belongs
+/// with whatever unit actually retires a row to it (the deferred #515 job-
+/// dependency graph), not ahead of that writer landing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, VariantArray)]
 pub enum JobStatus {
     /// Job created, waiting to be claimed.
     Queued,
@@ -71,11 +77,27 @@ impl JobStatus {
         matches!(self, Self::Completed | Self::Failed)
     }
 
-    /// Every status, in lifecycle order — the one list the SQL-side
-    /// helpers below derive their literals from, so a status added here
-    /// is reflected in every `status IN (...)` predicate without a second
-    /// hand-typed vocabulary.
-    pub const ALL: [JobStatus; 4] = [Self::Queued, Self::Running, Self::Completed, Self::Failed];
+    /// Whether this status is terminal AND unsuccessful (`Failed`) — DERIVED
+    /// from [`Self::is_terminal`] rather than naming `Failed` a second time,
+    /// so every future terminal-unsuccessful status this vocabulary ever
+    /// gains (e.g. a future `Cancelled`) is picked up here with no second
+    /// edit. The one predicate every hand-enumerated terminality decision in
+    /// this crate (and the Python client's mirror) derives from — never a
+    /// literal string compare.
+    pub fn is_terminal_unsuccessful(&self) -> bool {
+        self.is_terminal() && !matches!(self, Self::Completed)
+    }
+
+    /// Every status, in declaration (lifecycle) order — the one list the
+    /// SQL-side helpers below derive their literals from, so a status added
+    /// here is reflected in every `status IN (...)` predicate without a
+    /// second hand-typed vocabulary. `#[derive(VariantArray)]` (`strum`)
+    /// reads this enum's own variant list at macro-expansion time, so a
+    /// status added above and covered by every exhaustive match on `Self`
+    /// (e.g. [`Display`](fmt::Display) below) is in `ALL` automatically —
+    /// unlike a hand-typed array, which the compiler cannot check for
+    /// completeness against the variant set.
+    pub const ALL: &'static [Self] = <Self as VariantArray>::VARIANTS;
 
     /// The comma-joined, single-quoted SQL literal list of every TERMINAL
     /// status (`'completed', 'failed'`), for a `status IN (...)` predicate —
@@ -224,18 +246,25 @@ impl FromStr for JobExecution {
 mod tests {
     use super::*;
 
+    /// Iterates the DERIVED inventory ([`JobStatus::ALL`]), not a
+    /// hand-typed literal list here: a status added to the enum and given a
+    /// `Display`/`FromStr` spelling (required to compile) is exercised by
+    /// this loop automatically, with no second edit to this test.
     #[test]
     fn job_status_round_trips_through_display_and_from_str() {
-        for status in [
-            JobStatus::Queued,
-            JobStatus::Running,
-            JobStatus::Completed,
-            JobStatus::Failed,
-        ] {
+        for status in JobStatus::ALL {
             let rendered = status.to_string();
             let parsed = JobStatus::from_str(&rendered).expect("canonical status parses");
-            assert_eq!(parsed, status, "round-trip must be identity for {status:?}");
+            assert_eq!(
+                &parsed, status,
+                "round-trip must be identity for {status:?}"
+            );
         }
+        assert_eq!(
+            JobStatus::ALL.len(),
+            4,
+            "every declared JobStatus variant is in ALL"
+        );
         assert_eq!(JobStatus::Failed.to_string(), "failed");
         assert!(JobStatus::from_str("cancelled").is_err());
     }
@@ -246,6 +275,57 @@ mod tests {
         assert!(!JobStatus::Running.is_terminal());
         assert!(JobStatus::Completed.is_terminal());
         assert!(JobStatus::Failed.is_terminal());
+    }
+
+    #[test]
+    fn terminal_unsuccessful_is_terminal_minus_completed() {
+        // Quantified over the WHOLE vocabulary (`JobStatus::ALL`), not a
+        // hand-picked subset. Mutation executed (applied to
+        // `is_terminal_unsuccessful`'s body, run, reverted): changed
+        // `self.is_terminal() && !matches!(self, Self::Completed)` to bare
+        // `self.is_terminal()` (dropping the `Completed` exclusion) -> RED,
+        // first line: "assertion `left == right` failed: Completed:
+        // terminal-unsuccessful must equal terminal-minus-completed
+        //   left: true
+        //  right: false".
+        for status in JobStatus::ALL {
+            let expected = status.is_terminal() && *status != JobStatus::Completed;
+            assert_eq!(
+                status.is_terminal_unsuccessful(),
+                expected,
+                "{status:?}: terminal-unsuccessful must equal terminal-minus-completed"
+            );
+        }
+        assert!(JobStatus::Failed.is_terminal_unsuccessful());
+        assert!(!JobStatus::Completed.is_terminal_unsuccessful());
+        assert!(!JobStatus::Queued.is_terminal_unsuccessful());
+        assert!(!JobStatus::Running.is_terminal_unsuccessful());
+    }
+
+    #[test]
+    fn terminal_sql_list_and_non_terminal_sql_list_partition_all() {
+        // ALL must split exactly between the two lists with no overlap and
+        // no omission — derived from `JobStatus::ALL`, so a status added to
+        // `ALL` without a `Display` impl breaking compilation is still
+        // caught here if it were ever added to neither predicate.
+        let terminal = JobStatus::terminal_sql_list();
+        let non_terminal = JobStatus::non_terminal_sql_list();
+        for status in JobStatus::ALL {
+            let literal = format!("'{status}'");
+            if status.is_terminal() {
+                assert!(
+                    terminal.contains(&literal),
+                    "{status:?} must be in terminal_sql_list"
+                );
+                assert!(!non_terminal.contains(&literal));
+            } else {
+                assert!(
+                    non_terminal.contains(&literal),
+                    "{status:?} must be in non_terminal_sql_list"
+                );
+                assert!(!terminal.contains(&literal));
+            }
+        }
     }
 
     #[test]

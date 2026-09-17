@@ -3,8 +3,12 @@
 //! renewing the lease, and records the terminal outcome.
 //!
 //! One worker drives every job kind (item 2 — [`COMPILED_KINDS`]). A
-//! [`JobWorker::run`] tick first reclaims expired leases (re-queuing a dead
-//! worker's job, or failing it past the attempts cap), then atomically
+//! [`JobWorker::run_until`] tick — run only under
+//! [`EmbeddedWorker::spawn`]/[`EmbeddedWorker::spawn_worker`]'s claimed
+//! session slot (#500 wave 5 group E1 P7: one claim loop per session is
+//! structural, not merely conventional) — first reclaims expired leases
+//! (re-queuing a dead worker's job, or failing it past the attempts cap),
+//! then atomically
 //! claims the oldest queued job of one of its configured kinds
 //! (`execution = 'queued'` only — an `inline` row is never selected by the
 //! poll loop). On a claim it deserialises the spec and dispatches: a
@@ -393,6 +397,45 @@ pub struct HostAdmission {
     /// reaches this process's coordinator body (see [`placed_gang_runner`]'s
     /// doc for the process-global seam this backs).
     placed_gang_runner: OnceLock<Arc<dyn PlacedGangRunner>>,
+    /// The single claim-loop slot (#500 wave 5 group E1, P7): `0` (free) or
+    /// a nonzero GENERATION id — the id [`HostAdmission::try_claim_loop`]
+    /// handed out to whichever [`EmbeddedWorker`] currently owns the slot.
+    /// A second `spawn`/`spawn_worker` while a generation is live finds this
+    /// nonzero and is refused with a typed error before it builds any task
+    /// — "one claim loop per session" is therefore a compare-and-set on
+    /// this cell, not a premise the RELEASE mechanism merely assumes (issue
+    /// #525: the phase/hold barrier alone is necessary but was never, on
+    /// its own, sufficient — nothing stopped a second loop from existing in
+    /// the first place).
+    ///
+    /// The slot is held from a successful claim until [`EmbeddedWorker::
+    /// release_and_stop`] completes OR the [`EmbeddedWorker`] value is
+    /// dropped, whichever comes first — both release through
+    /// [`HostAdmission::release_loop_claim`], a compare-and-set against the
+    /// CALLER's OWN generation id, so a release that lands after a
+    /// successor has already claimed a NEW generation is a harmless no-op
+    /// rather than stealing the successor's slot.
+    loop_owner: AtomicU64,
+    /// The next generation id [`HostAdmission::try_claim_loop`] hands out —
+    /// monotonic, never reused, never zero (zero is reserved for "free").
+    next_generation: AtomicU64,
+    /// How many times [`HostAdmission::begin_release`] has run, on this
+    /// session, ever — bumped on EVERY call, whether or not the phase
+    /// actually changed. The session-scoped release barrier is EPOCH-based,
+    /// not phase-based, because [`HostAdmission::try_claim_loop`] resets
+    /// `phase` to `Running` for each new generation (a fresh loop must not
+    /// be born already refusing every claim), so `phase() == Releasing`
+    /// alone cannot distinguish "this generation was released" from "a
+    /// LATER generation reset the phase after an earlier release": a claim
+    /// loop's own [`WorkerShared`] instead snapshots this counter at spawn
+    /// (`WorkerShared::spawn_release_epoch`) and treats ANY later value as
+    /// "I have been released", however far its own task's execution lags
+    /// behind an `abort()` request (`register_job_hold_or_release`'s
+    /// self-release check and [`WorkerShared::admits_claim`] both read it).
+    /// A generation born AFTER a release therefore snapshots the
+    /// already-bumped counter and is never stopped by that release — only a
+    /// LATER one.
+    release_epoch: AtomicU64,
 }
 
 /// The process-global weak link to whichever session's [`HostAdmission`]
@@ -487,7 +530,46 @@ impl HostAdmission {
             dialer: OnceLock::new(),
             placed_gang_submitter: OnceLock::new(),
             placed_gang_runner: OnceLock::new(),
+            loop_owner: AtomicU64::new(0),
+            next_generation: AtomicU64::new(1),
+            release_epoch: AtomicU64::new(0),
         })
+    }
+
+    /// Claim the session's single claim-loop slot. `Some((generation,
+    /// release_epoch))` means this call won the slot (no loop was live):
+    /// `generation` is this claim's unique, nonzero id — the caller's own
+    /// key for [`Self::release_loop_claim`] — and `release_epoch` is the
+    /// count of [`Self::begin_release`] calls THIS SESSION HAS EVER SEEN,
+    /// snapshotted at birth (`WorkerShared::spawn_release_epoch`'s source):
+    /// a fresh generation is never stopped by a release that predates it.
+    /// `None` means a loop already owns the slot and the caller must not
+    /// spawn a second one. Resets `phase` to `Running` on a win — a new
+    /// generation must not be born already refusing every claim because a
+    /// PRIOR generation's `Draining`/`Releasing` phase was left in the
+    /// cell.
+    pub(crate) fn try_claim_loop(&self) -> Option<(u64, u64)> {
+        let candidate = self.next_generation.fetch_add(1, Ordering::SeqCst);
+        self.loop_owner
+            .compare_exchange(0, candidate, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        self.phase.send_replace(WorkerPhase::Running);
+        Some((candidate, self.release_epoch.load(Ordering::SeqCst)))
+    }
+
+    /// Release the claim-loop slot ONLY if it is still held by `generation`
+    /// — a compare-and-set, not an unconditional write, so a release that
+    /// lands after a successor has already claimed a NEW generation (e.g.
+    /// `release_and_stop` freeing it, a caller immediately spawning a
+    /// successor, and only THEN this same guard's own `Drop` running) is a
+    /// harmless no-op instead of stealing the successor's slot. Called from
+    /// both [`EmbeddedWorker::release_and_stop`] (on success) and
+    /// [`EmbeddedWorker`]'s `Drop` (unconditionally attempted, idempotent
+    /// either way it lands).
+    pub(crate) fn release_loop_claim(&self, generation: u64) {
+        let _ = self
+            .loop_owner
+            .compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
 
     /// Install the process's [`MemberDialer`] — once. `false` when one is
@@ -608,8 +690,35 @@ impl HostAdmission {
     }
 
     /// Begin a RELEASE: the phase is `Releasing` from this instant, whatever
-    /// it was (a RELEASE wins over a DRAIN in progress).
-    pub fn begin_release(&self) {
+    /// it was (a RELEASE wins over a DRAIN in progress), AND the session's
+    /// release epoch is bumped — UNCONDITIONALLY, even when the phase was
+    /// already `Releasing`, since a distinct RELEASE call (e.g.
+    /// `InferenceSession::release_job_leases` racing an in-flight
+    /// `EmbeddedWorker::release_and_stop`) is still a distinct release event
+    /// any generation born before it must be sensitive to (see the
+    /// `release_epoch` field's own doc). This is the ONE session-scoped
+    /// signal `WorkerShared::admits_claim` and `register_job_hold_or_
+    /// release`'s self-release check both read — `phase()` alone cannot
+    /// serve that role because `try_claim_loop` resets it for every new
+    /// generation.
+    ///
+    /// The phase flip runs strictly BEFORE the epoch bump — LOAD-BEARING,
+    /// not incidental: `run_placed_gang`'s own doc and `WorkerShared::
+    /// for_single_run`'s (the two-catch lattice over a birth-epoch snapshot
+    /// taken before `probe_claim()`) both depend on "the bump is visible ⇒
+    /// the flip already happened", which only holds in THIS order. Swapping
+    /// the two statements admits a gang on a releasing host: a birth-epoch
+    /// snapshot taken inside the (now relocated) window between the bump
+    /// and the flip already contains the bump, so `released_since_birth`
+    /// reads `false` downstream, while `probe_claim`'s phase check — racing
+    /// the same window from the other side — still reads `Running` and
+    /// admits. Pinned by `begin_release_bumps_the_epoch_strictly_after_the_
+    /// phase_flip_is_already_visible` (`fine_tune::worker::tests`), which
+    /// parks a live `begin_release` call between the two statements
+    /// (`loop_test_hooks::ParkPoint::BeginReleaseBetweenFlipAndBump`) and
+    /// asserts `probe_claim` already refuses while the epoch is still
+    /// unbumped.
+    pub async fn begin_release(&self) {
         self.phase.send_if_modified(|p| {
             if *p == WorkerPhase::Releasing {
                 false
@@ -618,6 +727,19 @@ impl HostAdmission {
                 true
             }
         });
+        #[cfg(feature = "test-hooks")]
+        loop_test_hooks::maybe_park(
+            &self.registry.instance_id,
+            loop_test_hooks::ParkPoint::BeginReleaseBetweenFlipAndBump,
+        )
+        .await;
+        self.release_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// How many times [`Self::begin_release`] has run on this session, ever
+    /// — see the `release_epoch` field's own doc.
+    pub(crate) fn release_epoch(&self) -> u64 {
+        self.release_epoch.load(Ordering::SeqCst)
     }
 
     /// Test-only: set the phase WITHOUT any stop request or row write —
@@ -933,6 +1055,13 @@ pub struct WorkerShared {
     /// How many catalog samples the sampler has taken — the oracle that a
     /// scrape issues no catalog statement of its own.
     samples_taken: AtomicU64,
+    /// [`HostAdmission::release_epoch`], snapshotted at construction (#500
+    /// wave 5 group E1, P7): any LATER value observed on `admission` means
+    /// a RELEASE has happened since this shared state was born, and is
+    /// treated as "I have been released" regardless of what `phase()`
+    /// currently reads (a later generation may have reset it to `Running`)
+    /// — see [`Self::released_since_birth`].
+    spawn_release_epoch: u64,
 }
 
 /// The queue-depth snapshot the gauge sampler last read from the catalog:
@@ -948,8 +1077,19 @@ pub struct WorkerSample {
 
 impl WorkerShared {
     /// Fresh shared state for one loop task over the session's
-    /// `admission`: stop unset, state `Running`.
-    pub fn new(admission: Arc<HostAdmission>, instance_id: String) -> Arc<Self> {
+    /// `admission`: stop unset, state `Running`. `spawn_release_epoch` is
+    /// this state's birth snapshot of `HostAdmission::release_epoch` —
+    /// callers that go through `HostAdmission::try_claim_loop`
+    /// ([`EmbeddedWorker::spawn_worker`]) pass the epoch that call
+    /// returned; `for_single_run` is the OTHER shape (a fresh,
+    /// un-looped single-job run outside the claim-loop slot) and passes
+    /// `admission.release_epoch()` read live, the same value `phase()`
+    /// would have read before this snapshot existed.
+    pub fn new(
+        admission: Arc<HostAdmission>,
+        instance_id: String,
+        spawn_release_epoch: u64,
+    ) -> Arc<Self> {
         let (stop, _) = watch::channel(false);
         let (state_tx, _) = watch::channel(LoopState::Running);
         Arc::new(Self {
@@ -959,7 +1099,56 @@ impl WorkerShared {
             instance_id,
             sample: std::sync::RwLock::new(WorkerSample::default()),
             samples_taken: AtomicU64::new(0),
+            spawn_release_epoch,
         })
+    }
+
+    /// Fresh shared state for ONE claimed-job run OUTSIDE the claim-loop
+    /// slot — `JobWorker::run_claimed_job`'s and `run_placed_gang`'s shared
+    /// shape (`worker.rs`'s single private constructor for it, rather than
+    /// each caller inlining its own `Self::new`): the hold sites read the
+    /// session's phase/epoch, and — holding no claim probe — leave the
+    /// session's holder exactly as they found it, sitting beside the loop's
+    /// slot the way an inline `run_now` does.
+    ///
+    /// `birth_epoch` is THIS run's true birth snapshot — the caller's own
+    /// job, not this function's: `run_claimed_job` has no earlier commit
+    /// event to align to (its record is already claimed when it is called),
+    /// so it reads `admission.release_epoch()` live, right before this call,
+    /// matching what a bare `phase()` read would have observed before
+    /// `WorkerShared` carried a birth snapshot at all. `run_placed_gang`
+    /// instead reads the epoch BEFORE its own `HostAdmission::probe_claim()`
+    /// call and carries that value all the way here — every byte of work
+    /// after the snapshot (`probe_claim()` itself, `Catalog::transfer_claim`,
+    /// `Catalog::get_job`) must be covered by the SAME birth snapshot any
+    /// RELEASE landing during them has to race: because `HostAdmission::
+    /// begin_release` flips the phase strictly BEFORE it bumps the epoch, a
+    /// snapshot whose epoch bump is already visible implies the flip already
+    /// happened too, so `probe_claim()`'s own phase check — run immediately
+    /// after the snapshot — refuses it typed directly; a snapshot whose
+    /// epoch bump is NOT yet visible carries no such guarantee about the
+    /// phase (the flip may land at any point after the snapshot, including
+    /// inside `probe_claim()`'s own check), so that case relies instead on
+    /// `released_since_birth` downstream once the bump does become visible.
+    /// No RELEASE lands in the gap between the two catches (#500 wave 5
+    /// group E1, P7 pressure-round fix, round 2 — round 1 read the epoch
+    /// synchronously right AFTER `probe_claim()` returned rather than
+    /// before it: that closed the window across the two catalog round
+    /// trips but left the read itself racing a RELEASE landing between
+    /// `probe_claim()`'s own phase check and the read, since `probe_claim`
+    /// commits on the phase read alone and `begin_release` bumps the epoch
+    /// after flipping the phase; such a RELEASE bumped the epoch before
+    /// this constructor's read snapshotted it, so `released_since_birth`
+    /// compared the post-release epoch against itself and read `false`,
+    /// and the gang dispatched on a releasing host; round 3 pins the flip-
+    /// before-bump ORDER itself, load-bearing but previously unpinned —
+    /// see `HostAdmission::begin_release`'s own doc).
+    fn for_single_run(
+        admission: &Arc<HostAdmission>,
+        worker_id: String,
+        birth_epoch: u64,
+    ) -> Arc<Self> {
+        Self::new(Arc::clone(admission), worker_id, birth_epoch)
     }
 
     /// The sampler's last snapshot (a copy).
@@ -1035,17 +1224,33 @@ impl WorkerShared {
         *self.stop.borrow()
     }
 
+    /// Whether a RELEASE has landed on `admission` since this state was
+    /// born (#500 wave 5 group E1, P7) — see the `spawn_release_epoch`
+    /// field's doc for why this, rather than a bare `phase()` read, is the
+    /// authoritative "have I been released" signal: `phase()` is reset to
+    /// `Running` for every new generation
+    /// ([`HostAdmission::try_claim_loop`]), so a STALE task whose own
+    /// execution lags behind an `abort()` request could otherwise read a
+    /// LATER generation's fresh `Running` phase and wrongly conclude it was
+    /// never released.
+    fn released_since_birth(&self) -> bool {
+        self.admission.release_epoch() != self.spawn_release_epoch
+    }
+
     /// Whether the loop may initiate a new `claim_next`: no stop has been
-    /// requested AND the phase is still `Running`. `EmbeddedWorker::run_until`
-    /// reads this ONE predicate at two sites — the loop's top-of-iteration
-    /// gate and again, with no `.await` between that second read and the
-    /// `claim_next` call itself, immediately after `reclaim_expired_jobs`
-    /// returns — so the two reads can never drift apart (P1',
-    /// `CONTRACT-RELEASE-SPIN.md`): a RELEASE landing anywhere in the
-    /// reclaim round trip is caught by the second read even when the first,
-    /// now-stale read had already admitted the iteration.
+    /// requested, the phase is still `Running`, AND no RELEASE has landed
+    /// since this state was born. `EmbeddedWorker::run_until` reads this ONE
+    /// predicate at two sites — the loop's top-of-iteration gate and again,
+    /// with no `.await` between that second read and the `claim_next` call
+    /// itself, immediately after `reclaim_expired_jobs` returns — so the two
+    /// reads can never drift apart (P1', `CONTRACT-RELEASE-SPIN.md`): a
+    /// RELEASE landing anywhere in the reclaim round trip is caught by the
+    /// second read even when the first, now-stale read had already admitted
+    /// the iteration.
     fn admits_claim(&self) -> bool {
-        !self.stop_requested() && self.phase() == WorkerPhase::Running
+        !self.stop_requested()
+            && self.phase() == WorkerPhase::Running
+            && !self.released_since_birth()
     }
 
     fn request_stop(&self) {
@@ -1108,9 +1313,14 @@ impl Drop for LoopExitGuard {
 /// both sites ([`JobWorker::run_claimed_job`]'s fine-tune arm and its
 /// compute arm) call, so the RELEASE check exists in exactly one place.
 ///
-/// Registers the hold with the session's keeper, then reads the phase
-/// (`SeqCst`): under [`WorkerPhase::Releasing`] the claim raced a RELEASE
-/// (it committed after the keeper's per-hold pass snapshotted, or after the
+/// Registers the hold with the session's keeper, then reads whether a
+/// RELEASE has landed on `shared`'s session since `shared` was born
+/// ([`WorkerShared::released_since_birth`], #500 wave 5 group E1 P7 — an
+/// epoch comparison, never a bare `phase() == Releasing` read: a STALE call
+/// from a task an `abort()` has not yet actually torn down could otherwise
+/// observe a LATER generation's freshly-reset `Running` phase and wrongly
+/// conclude it was never released): if so, the claim raced a RELEASE (it
+/// committed after the keeper's per-hold pass snapshotted, or after the
 /// first sweep), so this releases its OWN row through
 /// `Catalog::release_job_lease` (idempotent — 0 rows if a sweep already
 /// took it), drops the hold and returns `None`: the caller returns without
@@ -1143,7 +1353,7 @@ async fn register_job_hold_or_release(
         instance_id: shared.instance_id.clone(),
         attempts,
     });
-    if shared.phase() == WorkerPhase::Releasing {
+    if shared.released_since_birth() {
         match catalog
             .release_job_lease(job_id, &shared.instance_id, attempts)
             .await
@@ -1387,8 +1597,11 @@ pub struct ReleaseReport {
 
 /// Runs jobs of every kind — the three training kinds via `run_spec` AND
 /// compute — from the shared catalog under a lease. Construct one per
-/// process (or N for a pool); [`Self::run`] is the long-lived loop the
-/// embedded engine and the server's worker tier both drive.
+/// process (or N for a pool); [`Self::run_until`] is the long-lived loop
+/// the embedded engine and the server's worker tier both drive, spawned
+/// ONLY through [`EmbeddedWorker::spawn`]/[`EmbeddedWorker::spawn_worker`]
+/// (the session's single claim-loop slot) — this
+/// type carries no bare, ungated entry point onto `run_until` of its own.
 pub struct JobWorker {
     /// Weak back-reference to the session — upgraded each tick. `None` means the
     /// session dropped, which is the loop's exit condition (no refcycle keeps
@@ -1466,19 +1679,6 @@ impl JobWorker {
     /// on lease ownership.
     pub fn worker_id(&self) -> &str {
         &self.worker_id
-    }
-
-    /// Run the claim→reconstruct→train loop until the session drops.
-    ///
-    /// Equivalent to [`Self::run_until`] over fresh, never-stopped shared
-    /// state — for callers that rely solely on the session dropping (the
-    /// `Weak` upgrade failing) to stop the worker.
-    pub async fn run(&self) {
-        self.run_until(WorkerShared::new(
-            Arc::clone(&self.admission),
-            self.worker_id.clone(),
-        ))
-        .await
     }
 
     /// Run the claim→reconstruct→train loop until `shared`'s stop is set,
@@ -1615,7 +1815,7 @@ impl JobWorker {
                 break;
             }
             // The slot: `Free → ClaimProbe` before `claim_next` (a peer never
-            // claims while it holds a rank — OPS D6); the guard resets the
+            // claims while it holds a rank); the guard resets the
             // holder to `Free` on every exit of this iteration. A held slot
             // (an admitted rank, or a job already running) skips the claim
             // and sleeps the idle poll exactly like a claim that found
@@ -1777,11 +1977,15 @@ impl JobWorker {
         record: jammi_db::catalog::jobs_repo::JobRecord,
     ) {
         // A caller driving one claimed job outside a loop task runs it under
-        // fresh shared state over the session's own admission: the hold
-        // sites read the session's phase, and — holding no claim probe —
-        // leave the session's holder exactly as they found it (a direct run
-        // sits beside the loop's slot the way an inline `run_now` does).
-        let shared = WorkerShared::new(Arc::clone(&self.admission), self.worker_id.clone());
+        // fresh shared state over the session's own admission — see
+        // `WorkerShared::for_single_run`'s own doc. No earlier commit event
+        // to align to here, so the birth epoch is read live, right before
+        // the call.
+        let shared = WorkerShared::for_single_run(
+            &self.admission,
+            self.worker_id.clone(),
+            self.admission.release_epoch(),
+        );
         self.run_claimed_job_under(session, record, &shared, false)
             .await;
     }
@@ -1830,7 +2034,15 @@ impl JobWorker {
             return AttemptEnd::LeftForReclaim;
         }
 
-        let spec: TrainingSpec = match serde_json::from_str(&record.spec) {
+        // `crate::jobs::JobSpec` is the one type every persisted `jobs.spec`
+        // row decodes as (that type's own doc); this loop-claimer path
+        // projects the decoded value to `TrainingSpec` with
+        // `JobSpec::as_training_spec` rather than decoding `TrainingSpec`
+        // directly, so a stray field anywhere in the row — including inside
+        // a nested config struct now that every one of them denies unknown
+        // fields too — is caught at the SAME decode `JobSpec`'s own byte-pin
+        // tests exercise, not a second, independent one that could drift.
+        let job_spec: crate::jobs::JobSpec = match serde_json::from_str(&record.spec) {
             Ok(s) => s,
             Err(e) => {
                 // esc-075 (Phase-4 audit finding 4): this fails BEFORE the
@@ -1859,6 +2071,36 @@ impl JobWorker {
                 .await;
                 return AttemptEnd::Failed { reason };
             }
+        };
+        let Some(spec) = job_spec.as_training_spec() else {
+            // `record.kind` (the `jobs.kind` column) named a training kind,
+            // routing this attempt here at all (the `is_compute_kind` guard
+            // above), but the persisted `spec` JSON's own `kind` decoded to
+            // a compute variant — the two columns disagree. Same failure
+            // shape as an undeserialisable spec: nothing has run yet.
+            mark_acceleration_undetermined(
+                LeaseHolder::LoopClaimer,
+                &catalog,
+                &job_id,
+                &self.worker_id,
+                attempt,
+            )
+            .await;
+            let reason = format!(
+                "training claim path: jobs.kind names a training kind but the persisted spec \
+                 decoded as compute kind {}",
+                job_spec.kind()
+            );
+            record_failed(
+                LeaseHolder::LoopClaimer,
+                &catalog,
+                &job_id,
+                &self.worker_id,
+                attempt,
+                reason.clone(),
+            )
+            .await;
+            return AttemptEnd::Failed { reason };
         };
         // Who this attempt runs as — derived ONCE from the spec and this
         // host's `[worker] local_ranks` (the module doc's writer table), and
@@ -2363,11 +2605,25 @@ impl JobWorker {
     /// caller (the executor role, `crates/jammi-ballista`) holds only the
     /// session, never a `JobWorker`.
     ///
-    /// (i) takes this host's job slot through [`HostAdmission::probe_claim`]
-    /// — exactly as the claim loop does (`Free → ClaimProbe`; a host
-    /// already holding a rank, a loop-claimed job, or another placement's
-    /// probe/await refuses typed BEFORE any row write — OPS D6); (ii)
-    /// [`Catalog::transfer_claim`] moves `claimed_by` from
+    /// (i) snapshots `HostAdmission::release_epoch` as this run's
+    /// `WorkerShared` birth BEFORE taking this host's job slot through
+    /// [`HostAdmission::probe_claim`] (`Free → ClaimProbe`; a host already
+    /// holding a rank, a loop-claimed job, or another placement's
+    /// probe/await refuses typed BEFORE any row write) — a two-catch
+    /// lattice with no gap between the catches: because `HostAdmission::
+    /// begin_release` orders the phase flip strictly BEFORE the epoch
+    /// bump, a snapshot whose epoch bump IS already visible implies the
+    /// flip already happened too, so `probe_claim`'s own phase check —
+    /// run immediately after the snapshot — refuses it typed directly; a
+    /// snapshot whose epoch bump is NOT yet visible carries no such
+    /// guarantee (the flip can still land at any point up to and including
+    /// inside `probe_claim`'s own check), so that case is instead caught
+    /// downstream by the epoch compare (`WorkerShared::released_since_birth`)
+    /// once the bump does become visible — covering `probe_claim()` itself
+    /// and every byte of (ii)/(iii) below — see `WorkerShared::
+    /// for_single_run`'s own doc for the prior (windowed) shape this
+    /// replaced;
+    /// (ii) [`Catalog::transfer_claim`] moves `claimed_by` from
     /// `descriptor.submitter` to this instance at the SAME `attempts`,
     /// arming a fresh lease (`false` — the transfer never happened, a
     /// stale runner, or a second launch of an already-transferred attempt
@@ -2390,6 +2646,19 @@ impl JobWorker {
         descriptor: GangDescriptor,
     ) -> Result<PlacedOutcome> {
         let admission = session.host_admission();
+        // The birth snapshot for this run's `WorkerShared`, read BEFORE
+        // `probe_claim()` itself — see this function's own doc, point (i),
+        // and `WorkerShared::for_single_run` for the lattice argument (a
+        // RELEASE lands either before this read, and is then caught by
+        // `probe_claim`'s own phase check below, or after it, and is then
+        // caught downstream by the epoch compare — no gap between the two).
+        let claim_epoch = admission.release_epoch();
+        #[cfg(feature = "test-hooks")]
+        loop_test_hooks::maybe_park(
+            &descriptor.job_id,
+            loop_test_hooks::ParkPoint::PlacedGangBeforeProbeClaim,
+        )
+        .await;
         let Some(claim) = admission.probe_claim() else {
             let phase = *admission.phase_receiver().borrow();
             return Err(JammiError::FineTune(if phase == WorkerPhase::Running {
@@ -2403,6 +2672,12 @@ impl JobWorker {
                 )
             }));
         };
+        #[cfg(feature = "test-hooks")]
+        loop_test_hooks::maybe_park(
+            &descriptor.job_id,
+            loop_test_hooks::ParkPoint::PlacedGangBeforeTransfer,
+        )
+        .await;
         let catalog = session.catalog();
         let lease = session.inner_config().lease.intervals()?.lease();
         let worker = JobWorker::new(session)?;
@@ -2446,7 +2721,7 @@ impl JobWorker {
                 return Err(e);
             }
         };
-        let shared = WorkerShared::new(Arc::clone(admission), worker.worker_id.clone());
+        let shared = WorkerShared::for_single_run(admission, worker.worker_id.clone(), claim_epoch);
         let end = worker
             .run_claimed_job_under(session, record, &shared, true)
             .await;
@@ -3105,7 +3380,10 @@ impl JobWorker {
         partial_result: Option<&str>,
         tenant_id: Option<jammi_db::TenantId>,
     ) {
-        let spec: crate::jobs::ComputeSpec = match serde_json::from_str(spec_json) {
+        // Decode the one persisted type (`crate::jobs::JobSpec`'s own doc),
+        // then project to `ComputeSpec` — see the loop-claimer training path
+        // above for why, and `JobSpec::as_compute_spec`'s doc.
+        let job_spec: crate::jobs::JobSpec = match serde_json::from_str(spec_json) {
             Ok(s) => s,
             Err(e) => {
                 record_failed(
@@ -3119,6 +3397,25 @@ impl JobWorker {
                 .await;
                 return;
             }
+        };
+        let Some(spec) = job_spec.as_compute_spec() else {
+            // `record.kind` named a compute kind, routing this attempt here
+            // at all, but the persisted spec JSON decoded as a training
+            // variant — the two columns disagree.
+            record_failed(
+                LeaseHolder::LoopClaimer,
+                catalog,
+                job_id,
+                &self.worker_id,
+                attempt,
+                format!(
+                    "compute claim path: jobs.kind names a compute kind but the persisted spec \
+                     decoded as training kind {}",
+                    job_spec.kind()
+                ),
+            )
+            .await;
+            return;
         };
 
         // Post-claim checkpoint: a cancel requested while the job sat
@@ -4256,6 +4553,11 @@ pub struct EmbeddedWorker {
     heartbeat: Duration,
     /// The gauge sampler task; aborted with the loop on every stop path.
     sampler: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// This guard's own generation id — the key
+    /// [`HostAdmission::release_loop_claim`] releases (#500 wave 5 group E1
+    /// P7), a compare-and-set so this guard can never free a SUCCESSOR's
+    /// slot.
+    loop_generation: u64,
 }
 
 impl EmbeddedWorker {
@@ -4267,7 +4569,14 @@ impl EmbeddedWorker {
     /// session's `[worker]` configuration. Returns [`JammiError::Config`] if
     /// that timing (or `kinds`) violates the worker invariants — in the
     /// normal flow `JammiConfig::load` already validated the timing, so that
-    /// half only surfaces for a hand-built config.
+    /// half only surfaces for a hand-built config. Returns
+    /// [`JammiError::FineTune`] when a loop already owns this session's
+    /// single claim-loop slot (`HostAdmission::try_claim_loop`): "one claim
+    /// loop per session" is structural — a second
+    /// spawn is refused before any task exists, never a second loop whose
+    /// hold-release blast radius the phase barrier alone would have to
+    /// cover. Spawn a successor only after the prior guard has fully
+    /// dropped.
     ///
     /// The loop task's own first statement upserts this process's `workers`
     /// row (`warming`, then `claiming` once the session's worker gate is
@@ -4279,10 +4588,23 @@ impl EmbeddedWorker {
 
     /// Spawn an already-built worker (used by [`Self::spawn`] and any test
     /// harness that needs explicit timing/kinds via
-    /// [`JobWorker::with_intervals_and_kinds`]).
+    /// [`JobWorker::with_intervals_and_kinds`]). See [`Self::spawn`]'s doc
+    /// for the single-claim-loop-slot refusal.
     pub fn spawn_worker(session: &Arc<InferenceSession>, worker: JobWorker) -> Result<Self> {
         let admission = Arc::clone(session.host_admission());
-        let shared = WorkerShared::new(Arc::clone(&admission), session.instance_id().to_string());
+        let Some((loop_generation, spawn_release_epoch)) = admission.try_claim_loop() else {
+            return Err(JammiError::FineTune(format!(
+                "a claim loop is already spawned on session instance {}; only one claim loop \
+                 per session may run at once (spawn a successor only after the prior \
+                 EmbeddedWorker's release_and_stop completes or its guard is dropped)",
+                session.instance_id()
+            )));
+        };
+        let shared = WorkerShared::new(
+            Arc::clone(&admission),
+            session.instance_id().to_string(),
+            spawn_release_epoch,
+        );
         let heartbeat = worker.intervals.heartbeat;
         let task_shared = Arc::clone(&shared);
         let handle = tokio::spawn(async move { worker.run_until(task_shared).await });
@@ -4303,6 +4625,7 @@ impl EmbeddedWorker {
             writer_id: session.result_store().writer_id().to_string(),
             heartbeat,
             sampler: std::sync::Mutex::new(Some(sampler)),
+            loop_generation,
         })
     }
 
@@ -4500,13 +4823,17 @@ impl EmbeddedWorker {
     /// catalog error inside any statement is logged and the arm continues
     /// (the affected lease falls to the expiry path).
     pub async fn release_and_stop(&self) -> Result<ReleaseReport> {
-        // 2a — phase and stop together, in the same synchronous statement
-        // pair (no `.await` between them), mirroring `begin_drain`'s own
-        // shape (P2, `CONTRACT-RELEASE-SPIN.md`'s design-pass fold): a
-        // poll-once test proves both setters resolve this pair before their
-        // first yield, so exit latency after either flip is bounded by the
-        // in-flight job, never by `idle_poll`.
-        self.admission.begin_release();
+        // 2a — phase and stop together, in the same statement pair,
+        // mirroring `begin_drain`'s own shape (P2, `CONTRACT-RELEASE-
+        // SPIN.md`'s design-pass fold): `begin_release` carries a syntactic
+        // `.await` (its own doc: the test-only park pinning the phase-
+        // flip/epoch-bump order), but that inner future resolves within
+        // this SAME poll — no genuine yield — unless a test has armed
+        // `ParkPoint::BeginReleaseBetweenFlipAndBump` for THIS instance, so
+        // a poll-once test proves both setters resolve this pair before
+        // their first genuine yield, and exit latency after either flip is
+        // bounded by the in-flight job, never by `idle_poll`.
+        self.admission.begin_release().await;
         self.shared.request_stop();
         // 2b
         let holds = match self.keeper.release_job_holds(self.heartbeat).await {
@@ -4605,6 +4932,16 @@ impl EmbeddedWorker {
         // Cell before delete (§8 B1) — same as `stop_and_join`.
         self.registration.set_worker(None);
         self.catalog.delete_worker(&self.instance_id).await?;
+        // 2i (#500 wave 5 group E1, P7): the loop task is joined or aborted
+        // by 2e above — this call is what it means for RELEASE to
+        // "complete" the guard's slot-holding lifetime — so a successor
+        // `spawn`/`spawn_worker` on this SAME session is admitted from this
+        // instant, without waiting for THIS guard to be dropped. `Drop`'s
+        // own release later is a compare-and-set against `loop_generation`
+        // and finds the slot already free (or already reclaimed by a
+        // successor), so it never double-releases or steals a successor's
+        // slot.
+        self.admission.release_loop_claim(self.loop_generation);
         Ok(ReleaseReport {
             loop_state,
             holds,
@@ -4630,9 +4967,20 @@ impl Drop for EmbeddedWorker {
     /// process's own caller cancelled before it could join or abort it (F1)
     /// — is aborted here too: total match, nothing is ever silently lost to
     /// a bare `JoinHandle` drop (which would DETACH rather than abort).
+    ///
+    /// Also releases the session's single claim-loop slot
+    /// (`HostAdmission::release_loop_claim`, #500 wave 5 group E1 P7),
+    /// compare-and-set against this guard's OWN `loop_generation` — a
+    /// no-op when `release_and_stop` already released it (2i), or when a
+    /// successor has since claimed a NEW generation, so this can never
+    /// steal a successor's slot. `Drop` runs exactly once per guard
+    /// regardless of whether `stop_and_join`, `release_and_stop`, both (one
+    /// cancelled), or neither ran first, so this is the backstop for every
+    /// stop path OTHER than a completed `release_and_stop`.
     fn drop(&mut self) {
         self.shared.request_stop();
         self.stop_sampler();
+        self.admission.release_loop_claim(self.loop_generation);
         let task = std::mem::replace(
             &mut *self
                 .handle
@@ -4693,6 +5041,34 @@ pub mod loop_test_hooks {
         /// and before the hold is registered — the claim→hold prologue, on
         /// both the fine-tune and the compute path.
         BeforeHold,
+        /// Inside `JobWorker::run_placed_gang`, immediately after this
+        /// run's `WorkerShared` birth release-epoch is read and before
+        /// `HostAdmission::probe_claim` itself runs — the window a RELEASE
+        /// landing between the epoch snapshot and `probe_claim`'s own phase
+        /// check must still be caught in, by `probe_claim` refusing typed
+        /// (#500 wave 5 group E1, P7 pressure-round fix, round 2: the
+        /// window round 1 left open — the epoch read sat AFTER
+        /// `probe_claim()` returned).
+        PlacedGangBeforeProbeClaim,
+        /// Inside `JobWorker::run_placed_gang`, immediately after
+        /// `HostAdmission::probe_claim` succeeds, before
+        /// `Catalog::transfer_claim`/`Catalog::get_job` — the two catalog
+        /// round trips a RELEASE landing during them must still be caught
+        /// across (#500 wave 5 group E1, P7 pressure-round fix).
+        PlacedGangBeforeTransfer,
+        /// Inside `HostAdmission::begin_release`, between the phase flip
+        /// (→ `Releasing`) and the release-epoch bump — pins the load-
+        /// bearing order the two-catch lattice in `run_placed_gang`'s own
+        /// doc and `WorkerShared::for_single_run`'s depends on: while
+        /// parked here the phase is already `Releasing` (a concurrent
+        /// `probe_claim` refuses) but the epoch is not yet bumped (a
+        /// concurrent birth-epoch snapshot would not yet contain it).
+        /// Keyed by the owning `HostAdmission`'s `registry().instance_id`
+        /// (`arm`'s key doubles as either a job id or an instance id — no
+        /// job is claimed yet at this point) (#500 wave 5 group E1, P7
+        /// pressure-round fix, round 3: pins the ORDER of the two
+        /// statements, which round 2's fix only ever assumed).
+        BeginReleaseBetweenFlipAndBump,
     }
 
     struct Armed {
@@ -4968,6 +5344,108 @@ pub mod loop_test_hooks {
             let (hit, rest): (Vec<_>, Vec<_>) = list
                 .drain(..)
                 .partition(|a| a.which == which && a.instance_id == instance_id);
+            *list = rest;
+            hit
+        };
+        for armed in taken {
+            armed.fired.store(true, Ordering::SeqCst);
+            armed.notify.notify_one();
+        }
+    }
+
+    /// A discrete, test-observable moment on ONE job's attempt — never a
+    /// poll tick, never a wall-clock guess at when one MIGHT have happened.
+    /// Generalises [`Rendezvous`]'s notify-only shape (never blocks the
+    /// producer, unlike [`ParkPoint`]/[`arm`]) over an ENUM keyed by
+    /// `job_id` instead of `instance_id`, so a new observable site extends
+    /// this ONE `arm_observed`/`fire_observed` pair rather than growing a
+    /// bespoke pair of its own (#527/#567/#578: a `timeout`/deadline-loop
+    /// bound that races a training-progress event's real cadence, rather
+    /// than observing the event itself, is the flake class this closes).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Event {
+        /// [`spawn_cancel_request_watcher`] has just read
+        /// `cancel_requested = true` off the row and flipped
+        /// `cancel_requested_seen` — never merely "a poll tick happened" (a
+        /// tick that reads `false` does not fire this).
+        CancelObserved,
+        /// The training loop has just written a durable resume checkpoint
+        /// (`TrainingLoop::save_resume_checkpoint`'s `put_resume_checkpoint`
+        /// call returned `Ok`) for `job_id` — the earliest instant a test
+        /// may observe `fetch_resume_checkpoint` return `Some` for it.
+        ResumeCheckpointWritten,
+        /// The rank body identified by the carried rank number is ABOUT TO
+        /// call `discover_resume` for `job_id` — fired unconditionally,
+        /// immediately before that call, so it still fires even when
+        /// `discover_resume` goes on to return `Err` (a corrupted resume
+        /// bundle, `artifact.rs`'s hard-error contract) or the function
+        /// returns early via `?`. The rank-attributed positive proof that
+        /// THIS rank's body reached the resume seam — needed because the
+        /// `_resume/` bundle is job-scoped, read independently by every
+        /// rank, so a job's terminal `failed` row with a resume-related
+        /// error cannot by itself attribute which rank's read produced it
+        /// (a `Peer` gang's rank-0 coordinator and its member's rank 1 both
+        /// read the identical bundle and would fail identically).
+        ResumeAttempted(u32),
+    }
+
+    struct ArmedEvent {
+        job_id: String,
+        which: Event,
+        fired: Arc<AtomicBool>,
+        notify: Arc<Notify>,
+    }
+
+    fn events() -> &'static Mutex<Vec<ArmedEvent>> {
+        static ARMED: OnceLock<Mutex<Vec<ArmedEvent>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// The test's side of an armed job event.
+    pub struct Observed {
+        fired: Arc<AtomicBool>,
+        notify: Arc<Notify>,
+    }
+
+    impl Observed {
+        /// Resolve once the event has fired. A test bounds this call with
+        /// its OWN generous backstop — this method itself never times out.
+        pub async fn wait_fired(&self) {
+            while !self.fired.load(Ordering::SeqCst) {
+                self.notify.notified().await;
+            }
+        }
+    }
+
+    /// Arm `which` for the next occurrence on `job_id`. One-shot; keyed so
+    /// sibling tests in one binary never fire each other's.
+    pub fn arm_observed(job_id: &str, which: Event) -> Observed {
+        let fired = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(Notify::new());
+        events()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(ArmedEvent {
+                job_id: job_id.to_string(),
+                which,
+                fired: Arc::clone(&fired),
+                notify: Arc::clone(&notify),
+            });
+        Observed { fired, notify }
+    }
+
+    /// Fire every handle armed for (`job_id`, `which`). Never parks, never
+    /// blocks the caller — the opposite contract from [`maybe_park`]:
+    /// firing is a notification, not a rendezvous the producer waits on.
+    /// `pub(crate)` (not `pub(super)`): [`crate::fine_tune::trainer`] is a
+    /// SIBLING module of `worker`, not a descendant, and is the only other
+    /// caller ([`Event::ResumeCheckpointWritten`]'s fire point).
+    pub(crate) fn fire_observed(job_id: &str, which: Event) {
+        let taken: Vec<ArmedEvent> = {
+            let mut list = events().lock().unwrap_or_else(PoisonError::into_inner);
+            let (hit, rest): (Vec<_>, Vec<_>) = list
+                .drain(..)
+                .partition(|a| a.which == which && a.job_id == job_id);
             *list = rest;
             hit
         };
@@ -6218,9 +6696,19 @@ async fn member_rank_body(
     };
     let catalog = Arc::new(session.catalog().pinned_to_tenant(tenant));
 
-    let spec: TrainingSpec = match serde_json::from_str(&spec_json) {
+    // Decode the one persisted type (`crate::jobs::JobSpec`'s own doc), then
+    // project to `TrainingSpec` — see the loop-claimer training path's own
+    // comment for why.
+    let job_spec: crate::jobs::JobSpec = match serde_json::from_str(&spec_json) {
         Ok(spec) => spec,
         Err(e) => return failed(format!("undeserialisable training_spec: {e}")),
+    };
+    let Some(spec) = job_spec.as_training_spec() else {
+        return failed(format!(
+            "a Peer gang serves a column-source fine_tune only; the row's spec is a compute \
+             kind {}",
+            job_spec.kind()
+        ));
     };
     let TrainingSpec::FineTune {
         columns,
@@ -6919,6 +7407,8 @@ fn spawn_cancel_request_watcher(
                 Ok(record) if record.cancel_requested => {
                     cancel_requested_seen.store(true, Ordering::SeqCst);
                     cancel.store(true, Ordering::SeqCst);
+                    #[cfg(feature = "test-hooks")]
+                    loop_test_hooks::fire_observed(&job_id, loop_test_hooks::Event::CancelObserved);
                     return;
                 }
                 Ok(_) => {}
@@ -8101,6 +8591,17 @@ fn run_fine_tune_blocking(
     #[cfg(feature = "test-hooks")]
     training_test_hooks::note_rank_target(&job_id, role.rank(), dropout_seed, &target)?;
 
+    // Fired UNCONDITIONALLY, before the call: the rank-attributed proof
+    // that THIS rank's body reached the resume seam, regardless of what
+    // `discover_resume` goes on to return (`Ok(None)`, `Ok(Some(_))`, or an
+    // `Err` this `?` propagates on a corrupted bundle) — see
+    // `Event::ResumeAttempted`'s own doc.
+    #[cfg(feature = "test-hooks")]
+    loop_test_hooks::fire_observed(
+        &job_id,
+        loop_test_hooks::Event::ResumeAttempted(role.rank()),
+    );
+
     let tenant = catalog.current_tenant();
     let resume = discover_resume(&artifact_store, tenant, &job_id, &device)?;
 
@@ -8303,11 +8804,11 @@ fn validate_backbone_precision(
 // carries, because neither wires the encoder-boundary flash transport
 // protocol — see `BERT never wires the encoder-boundary flash transport` (`crates/jammi-encoders/src/bert.rs:428-430`)
 // and the sibling `FlashDecision::Declined` (`crates/jammi-encoders/src/distilbert.rs:331-334`). `admit_cascade`
-// (`crates/jammi-kernels/src/admission.rs:403-453`) now records every decline
+// (`crates/jammi-kernels/src/admission.rs:406-457`) now records every decline
 // — disabled, `DomainMiss`, and `CapabilityMiss` alike — into the SAME
 // thread-local probe-capture sink `admit_inner` uses
 // (`record_probe_miss(op, predicate_name)`,
-// `crates/jammi-kernels/src/admission.rs:427,437`), not just an atomic
+// `crates/jammi-kernels/src/admission.rs:431,441`), not just an atomic
 // increment on `CascadeDispatchCounters`. [`flash_report`] reads that entry
 // back through `jammi_kernels::admission::probe_capture_reason_for(window,
 // "attention_block_flash")` on a decline, exactly the way
@@ -8372,11 +8873,11 @@ fn probed_report_keys(
 ) -> Vec<(&'static str, &'static str)> {
     jammi_kernels::admission::PROBED_OPS
         .iter()
-        .filter(|op| op.kind == jammi_kernels::admission::ProbedOpKind::TwoArm)
+        .filter(|op| op.kind() == jammi_kernels::admission::ProbedOpKind::TwoArm)
         .filter_map(|op| {
             op.registry_keys_for(dtype)
                 .next()
-                .map(|key| (op.report_key, key))
+                .map(|key| (op.report_key(), key))
         })
         .collect()
 }
@@ -8406,7 +8907,7 @@ impl AdmissionProbeSnapshot {
     /// kernels' own `admit()` sites accumulate into (the
     /// `jammi_encoders::ln_dispatch_snapshot()`-style accessors this used to
     /// call are themselves `counters_for("layer_norm_fused")`,
-    /// `crates/jammi-encoders/src/layer_norm.rs:129`, under the hood).
+    /// `crates/jammi-encoders/src/layer_norm.rs:130`, under the hood).
     fn capture(dtype: jammi_kernels::admission::DtypeClass) -> Self {
         let two_arm = probed_report_keys(dtype)
             .into_iter()
@@ -9925,7 +10426,7 @@ mod tests {
 
     /// Issue #462/#463 follow-up: `admit_cascade`'s decline path now records
     /// `(op, predicate)` into the SAME probe-capture window `admit_inner`
-    /// uses — `record_probe_miss(op, predicate_name)` (`crates/jammi-kernels/src/admission.rs:427,437`), which is what
+    /// uses — `record_probe_miss(op, predicate_name)` (`crates/jammi-kernels/src/admission.rs:431,441`), which is what
     /// lets [`flash_cascade_decline_reason`] — the function [`flash_report`]
     /// itself calls on a decline — read a verbatim reason back for the
     /// `"attention_block_flash"` cascade key instead of the coarse
@@ -9957,7 +10458,7 @@ mod tests {
         let counters = jammi_kernels::admission::cascade_counters_for("attention_block_flash");
         let outcome = jammi_kernels::admission::admit_cascade(
             jammi_kernels::admission::AdmissionMode::Fallback,
-            "attention_block_flash",
+            &jammi_kernels::admission::ATTENTION_BLOCK_FLASH,
             "flash_transport_not_wired",
             jammi_kernels::admission::PredicateOutcome::CapabilityMiss,
             true,
@@ -11822,17 +12323,98 @@ mod tests {
     /// admission are this one predicate. Mutation: drop the phase check at
     /// the top of `probe_claim` and the `Draining` assertion reds (the
     /// holder cell is `Free`, so the CAS alone would admit).
-    #[test]
-    fn probe_claim_refuses_once_a_drain_or_release_has_begun() {
+    #[tokio::test]
+    async fn probe_claim_refuses_once_a_drain_or_release_has_begun() {
         let cell = cell();
         assert!(cell.probe_claim().is_some(), "Running admits");
         assert!(cell.begin_drain());
         assert!(cell.probe_claim().is_none(), "Draining refuses a new claim");
         assert_eq!(cell.holder(), Holder::Free, "the refusal moved nothing");
-        cell.begin_release();
+        cell.begin_release().await;
         assert!(
             cell.probe_claim().is_none(),
             "Releasing refuses a new claim"
+        );
+    }
+
+    /// Adversarial-audit finding on `begin_release`'s own two statements:
+    /// nothing PINNED the phase flip landing strictly before the epoch
+    /// bump — the two-catch lattice `run_placed_gang`'s own doc and
+    /// `WorkerShared::for_single_run`'s depend on ("a snapshot whose epoch
+    /// bump is already visible implies the flip already happened too")
+    /// only holds in that order, and the sole existing regression test for
+    /// the lattice (`gang_placed::
+    /// release_landing_between_the_epoch_read_and_probe_claim_is_still_
+    /// refused`) cannot falsify the ORDER because its own RELEASE runs to
+    /// full completion (both statements) inside one park, never observing
+    /// the gap between them.
+    ///
+    /// This test parks a live `begin_release` call between its two
+    /// statements and reads BOTH sides of the window directly: while
+    /// parked, the phase must already read `Releasing` (so a concurrent
+    /// `probe_claim` refuses) while the epoch must NOT yet be bumped.
+    ///
+    /// Mutation (executed): swapped `begin_release`'s two statements (bump
+    /// then flip) and moved the park between the (now-reordered) bump and
+    /// flip. RED, first line: `assertion `left == right` failed: phase must
+    /// already be Releasing while parked between the flip and the bump` /
+    /// `left: Running` / `right: Releasing` — under the swap, the epoch is
+    /// already bumped but the phase has not yet flipped at the park, so
+    /// this assertion catches it before the `probe_claim` assertion below
+    /// even runs. Reverted after capturing the line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn begin_release_bumps_the_epoch_strictly_after_the_phase_flip_is_already_visible() {
+        let admission = HostAdmission::new(Arc::new(InstanceRegistration::new(
+            "release-window-cell",
+            None,
+            None,
+            None,
+            None,
+        )));
+        let birth_epoch = admission.release_epoch();
+        assert_eq!(birth_epoch, 0, "a fresh admission starts at epoch 0");
+
+        let park = loop_test_hooks::arm(
+            &admission.registry().instance_id,
+            loop_test_hooks::ParkPoint::BeginReleaseBetweenFlipAndBump,
+        );
+        let releasing = {
+            let admission = Arc::clone(&admission);
+            tokio::spawn(async move { admission.begin_release().await })
+        };
+        park.wait_parked().await;
+
+        // Parked strictly between the flip and the bump: the flip must
+        // already be visible ...
+        assert_eq!(
+            admission.phase(),
+            WorkerPhase::Releasing,
+            "phase must already be Releasing while parked between the flip and the bump"
+        );
+        // ... while the bump must NOT be visible yet.
+        assert_eq!(
+            admission.release_epoch(),
+            birth_epoch,
+            "the epoch must not be bumped yet while parked between the flip and the bump"
+        );
+        // A concurrent `probe_claim` — exactly `run_placed_gang`'s own
+        // check, racing this window — must refuse on the phase alone, with
+        // no epoch compare available to it at all.
+        assert!(
+            admission.probe_claim().is_none(),
+            "probe_claim must refuse on the phase read alone while the epoch is still unbumped"
+        );
+
+        park.release();
+        tokio::time::timeout(Duration::from_secs(10), releasing)
+            .await
+            .expect("begin_release must resume and return once released")
+            .unwrap();
+
+        assert_eq!(
+            admission.release_epoch(),
+            birth_epoch + 1,
+            "the bump lands once begin_release resumes"
         );
     }
 

@@ -314,7 +314,7 @@ impl ClusterState for CatalogClusterState {
             .map_err(ballista_err)?
             .map(|r| r.devices)
             .unwrap_or_default();
-        let now = jammi_db::catalog::backend::now_sortable();
+        let now = jammi_db::catalog::lease::canonical_stamp_now();
         let rec = ComputeExecutorRecord {
             executor_id: metadata.id.clone(),
             instance_id: metadata.id.clone(),
@@ -368,7 +368,7 @@ impl ClusterState for CatalogClusterState {
                 metadata.specification.task_slots,
                 Vec::new(),
                 "Active".to_string(),
-                jammi_db::catalog::backend::now_sortable(),
+                jammi_db::catalog::lease::canonical_stamp_now(),
             ),
         };
         let rec = ComputeExecutorRecord {
@@ -428,7 +428,7 @@ impl ClusterState for CatalogClusterState {
             .record_compute_heartbeat(
                 &heartbeat.executor_id,
                 status_text,
-                &jammi_db::catalog::backend::now_sortable(),
+                &jammi_db::catalog::lease::canonical_stamp_now(),
             )
             .await
             .map_err(ballista_err)?;
@@ -644,7 +644,7 @@ impl JobState for CatalogJobState {
             owner: self.scheduler.clone(),
             status: "running".to_string(),
             queued_at: queued_at.to_string(),
-            updated_at: jammi_db::catalog::backend::now_sortable(),
+            updated_at: jammi_db::catalog::lease::canonical_stamp_now(),
         };
         self.catalog
             .put_compute_job(&rec)
@@ -733,7 +733,7 @@ impl JobState for CatalogJobState {
                 .map_err(ballista_err)?
                 .map(|r| r.queued_at)
                 .unwrap_or_default(),
-            updated_at: jammi_db::catalog::backend::now_sortable(),
+            updated_at: jammi_db::catalog::lease::canonical_stamp_now(),
         };
         self.catalog
             .put_compute_job(&rec)
@@ -768,7 +768,7 @@ impl JobState for CatalogJobState {
             owner: self.scheduler.clone(),
             status: "failed".to_string(),
             queued_at: queued_at.to_string(),
-            updated_at: jammi_db::catalog::backend::now_sortable(),
+            updated_at: jammi_db::catalog::lease::canonical_stamp_now(),
         };
         self.catalog
             .put_compute_job(&rec)

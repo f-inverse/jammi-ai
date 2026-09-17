@@ -1560,11 +1560,18 @@ def load_helper_registry(path: Path = HELPERS_REGISTRY_PATH) -> list[tuple[str, 
         stripped_line = line.strip()
         if not stripped_line or stripped_line.startswith("#"):
             continue
-        if "::" not in stripped_line:
+        # #513 G7': a line may carry a trailing, OPT-IN ` resource=<tag>`
+        # annotation (`load_resource_bindings`'s own concern) — stripped
+        # HERE, before the `<file>::<fn_name>` split, so it never becomes
+        # part of `fn_part` itself; this function's own `<file>::<fn_name>`
+        # shape is unchanged either way.
+        entry_line = _RESOURCE_ANNOTATION_RE.match(stripped_line)
+        entry_line = entry_line.group(1).strip() if entry_line else stripped_line
+        if "::" not in entry_line:
             raise OracleError(
                 f"{path.name}:{line_no}: malformed line (expected `<file>::<fn_name>`): {line!r}"
             )
-        file_part, fn_part = stripped_line.rsplit("::", 1)
+        file_part, fn_part = entry_line.rsplit("::", 1)
         key = (file_part, fn_part)
         if key in seen:
             raise OracleError(
@@ -1880,6 +1887,150 @@ def verify_helper_registry(
         verified.add((SHARED_HELPER_PREFIX + owner_file, fn_name))
 
     return verified, failures
+
+
+# --------------------------------------------------------------------------- #
+# Resource binding (#513 G7', contract delta 2026-09-16): `verify_helper_
+# registry`'s fixed-point delegation pass proves a delegating candidate
+# genuinely reaches SOME registered, panicking require-gate — it says
+# nothing about WHICH resource that gate governs. A caller whose skip is
+# nominally about one resource (Postgres) can delegate to a registered
+# accessor actually gated on an unrelated resource's variable (JAMMI_
+# REQUIRE_GPU) and still be credited: "genuinely reaches a genuine gate"
+# is true regardless of which JAMMI_REQUIRE_* name that gate reads. This
+# pass closes that gap for every registry line a human has OPTED IN to a
+# resource claim (` resource=<tag>` trailing the `<file>::<fn_name>`
+# entry) by verifying the accessor's OWN direct env-read resolves to the
+# JAMMI_REQUIRE_* variable that tag names — never opt-out, and never
+# retroactively required of every existing un-annotated line (the
+# existing 50+ entries carry no resource claim at all and are untouched
+# by this pass; annotating one is a reviewed act, exactly like adding a
+# registry row).
+# --------------------------------------------------------------------------- #
+_RESOURCE_ANNOTATION_RE = re.compile(r"^(.*?)\s+resource=([A-Za-z0-9_]+)\s*$")
+
+# Maps a reviewed resource tag to the JAMMI_REQUIRE_* variable name(s) that
+# tag is reviewed to mean. Extending this is exactly as reviewed an act as
+# adding a registry row — never inferred, never guessed from a name.
+RESOURCE_REQUIRE_VARS: dict[str, frozenset[str]] = {
+    "pg": frozenset({"JAMMI_REQUIRE_PG"}),
+    "gpu": frozenset({"JAMMI_REQUIRE_GPU", "JAMMI_REQUIRE_CUDA"}),
+    "nats": frozenset({"JAMMI_REQUIRE_NATS"}),
+    "storage": frozenset({"JAMMI_REQUIRE_STORAGE"}),
+    "distributed": frozenset({"JAMMI_REQUIRE_DISTRIBUTED"}),
+}
+
+_ANY_ENV_READ_CALL_RE = re.compile(
+    rf'{ENV_READ_CALL_ALTERNATION}\s*\(\s*(?:"(JAMMI_REQUIRE_[A-Z0-9_]*)"|([A-Za-z_][A-Za-z0-9_]*))\s*\)'
+)
+
+
+def _resolved_require_vars(fn_body_stripped: str, file_stripped: str) -> set[str]:
+    """Every JAMMI_REQUIRE_* variable name a runtime env-read ANYWHERE in
+    this fn's own body resolves to — a literal string, or a bare
+    identifier resolved same-file to a `const NAME: &str = "JAMMI_
+    REQUIRE_...";` (`_resolve_require_const`, the SAME resolver `helper_
+    shape_ok` itself uses). An over-approximation of `helper_shape_ok`'s
+    own precisely-scoped match (which exact conjunct/arm gates the
+    panic) — safe here, because this pass only ever needs to know a
+    mismatch is IMPOSSIBLE (no resolved name anywhere in the body agrees
+    with the declared resource), never to pin the one matched conjunct.
+    Empty when the body carries no resolvable env-read at all (a
+    delegated entry with no direct env-read of its own)."""
+    names: set[str] = set()
+    for m in _ANY_ENV_READ_CALL_RE.finditer(fn_body_stripped):
+        literal, ident = m.group(1), m.group(2)
+        if literal is not None:
+            names.add(literal)
+            continue
+        value = _resolve_require_const(file_stripped, ident)
+        if value is not None and _REQUIRE_CONST_PREFIX_RE.match(value):
+            names.add(value)
+    return names
+
+
+def load_resource_bindings(path: Path = HELPERS_REGISTRY_PATH) -> dict[tuple[str, str], tuple[str, int]]:
+    """{(real_file, fn_name): (resource_tag, line_no)} for every registry
+    line carrying a reviewed, OPT-IN trailing ` resource=<tag>`
+    annotation. A line with no such annotation makes no resource claim
+    at all and is absent from this dict — `check_resource_binding` never
+    checks it. Malformed shapes (a bad `<file>::<fn_name>` prefix) are
+    silently skipped here: `load_helper_registry`'s own pass already
+    fails that same line for its OWN reason, and this function is never
+    the one that owns "is this line well-formed at all"."""
+    bindings: dict[tuple[str, str], tuple[str, int]] = {}
+    if not path.is_file():
+        return bindings
+    for line_no, raw in enumerate(path.read_text().splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _RESOURCE_ANNOTATION_RE.match(line)
+        if not m:
+            continue
+        entry_part, tag = m.group(1).strip(), m.group(2)
+        if "::" not in entry_part:
+            continue
+        file_part, fn_part = entry_part.rsplit("::", 1)
+        real_file = file_part[len(SHARED_HELPER_PREFIX) :] if file_part.startswith(SHARED_HELPER_PREFIX) else file_part
+        bindings[(real_file, fn_part)] = (tag, line_no)
+    return bindings
+
+
+def check_resource_binding(
+    bindings: dict[tuple[str, str], tuple[str, int]], source_texts: dict[str, str]
+) -> list[str]:
+    """For every registry entry carrying a reviewed `resource=<tag>`
+    annotation, its OWN direct env-read must resolve to a JAMMI_REQUIRE_*
+    variable `RESOURCE_REQUIRE_VARS[tag]` names — never merely "reaches
+    some registered gate" (that is `verify_helper_registry`'s own,
+    weaker property). Scope: checks only entries whose own body carries
+    a resolvable direct env-read at all; an annotated entry with NO
+    resolvable env-read of its own (a delegated wrapper with no direct
+    read) is a FAIL here by name, fail-closed, rather than silently
+    unresolved — resolving a delegated entry's transitive resource would
+    require rebuilding the same fixed-point graph `verify_helper_
+    registry` already computes internally, tracked as a follow-up rather
+    than done here."""
+    findings: list[str] = []
+    for (real_file, fn_name), (tag, line_no) in sorted(bindings.items()):
+        loc = f"{HELPERS_REGISTRY_PATH.name}:{line_no}"
+        expected = RESOURCE_REQUIRE_VARS.get(tag)
+        if expected is None:
+            findings.append(
+                f"{loc}: resource={tag!r} is not a known tag (known: "
+                f"{sorted(RESOURCE_REQUIRE_VARS)}) — fix the annotation, or extend "
+                "RESOURCE_REQUIRE_VARS (a reviewed act, exactly like a registry row)"
+            )
+            continue
+        text = source_texts.get(real_file)
+        if text is None:
+            findings.append(f"{loc}: {real_file} not found among scanned files")
+            continue
+        candidates = [f for f in find_fns(text, real_file) if f.name == fn_name]
+        if len(candidates) != 1:
+            findings.append(
+                f"{loc}: {real_file}::{fn_name} does not resolve to exactly one fn in this file "
+                "— cannot verify its resource binding"
+            )
+            continue
+        resolved = _resolved_require_vars(candidates[0].body_stripped, _strip_rust(text))
+        if not resolved:
+            findings.append(
+                f"{loc}: {real_file}::{fn_name} carries resource={tag!r} but its own body has no "
+                "resolvable direct env-read (a delegated entry's transitive resource is out of "
+                "this pass's scope) — this annotation cannot be verified"
+            )
+            continue
+        if not resolved & expected:
+            findings.append(
+                f"{loc}: {real_file}::{fn_name} is annotated resource={tag!r} (expects one of "
+                f"{sorted(expected)}) but its own env-read resolves to {sorted(resolved)} instead "
+                "— the registered accessor's JAMMI_REQUIRE_* variable does not govern the "
+                "resource this line claims; a delegating caller would be silently gated on the "
+                "WRONG resource"
+            )
+    return findings
 
 
 @dataclass(frozen=True)
@@ -2326,7 +2477,10 @@ def scan_files() -> dict[str, str]:
 
 
 def run_gate(
-    source_texts: dict[str, str], shipped_ops: set[str], registry_entries: list[tuple[str, str]]
+    source_texts: dict[str, str],
+    shipped_ops: set[str],
+    registry_entries: list[tuple[str, str]],
+    resource_bindings: dict[tuple[str, str], tuple[str, int]] | None = None,
 ) -> tuple[
     list[UngatedSkip],
     list[Ko2Finding],
@@ -2349,6 +2503,17 @@ def run_gate(
         all_markers.extend(parse_markers(text, file_label))
 
     verified_helpers, registry_failures = verify_helper_registry(registry_entries, source_texts)
+    # `resource_bindings` defaults to `{}` (no claims, no check) — NEVER to
+    # reading the real committed registry file here: `run_gate` is the
+    # pure-orchestration self-test seam, driven against synthetic
+    # `source_texts` that may not cover every real file the committed
+    # registry names. `main()` is the one real caller that passes the
+    # REAL `load_resource_bindings()` result explicitly, exactly mirroring
+    # how `registry_entries` itself is loaded once in `main()` and
+    # threaded through, never re-read inside this function.
+    if resource_bindings is None:
+        resource_bindings = {}
+    registry_failures = list(registry_failures) + check_resource_binding(resource_bindings, source_texts)
     ko7 = check_ko7(all_fns, verified_helpers, source_texts)
     ko2 = check_ko2(all_markers, all_fns)
     ko5 = check_ko5(all_markers)
@@ -2376,8 +2541,9 @@ def main() -> int:
         source_texts = scan_files()
         shipped_ops = load_shipped_ops()
         registry_entries = load_helper_registry()
+        resource_bindings = load_resource_bindings()
         ko7, ko2, ko5, covered, declared_uncontrolled, pending, recon_failures, registry_failures = run_gate(
-            source_texts, shipped_ops, registry_entries
+            source_texts, shipped_ops, registry_entries, resource_bindings
         )
     except OracleError as exc:
         print(f"kernel-oracles: FAIL (uncomputable) — {exc}", file=sys.stderr)

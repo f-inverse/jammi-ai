@@ -611,6 +611,20 @@ jobs:
       - name: Self-test the flash-attn closure guard
         run: python3 ci/scripts/check_flash_attn_closure.py --self-test
 
+      # #511: jammi-db's postgres/mysql features link a native TLS stack
+      # (OpenSSL) this repo's release/CI images deliberately omit, and the
+      # runtime image cannot load it if a shipped build enabled either —
+      # nothing ships broken TODAY only because no release lane enables
+      # them. This walks the SAME workspace feature graph
+      # check_flash_attn_closure.py's own Graph walker builds (reused, not
+      # re-implemented) and fails the moment any manifest lane's
+      # cargo_features selection reaches jammi-db/postgres or jammi-db/mysql.
+      - name: Assert no release lane's feature closure reaches jammi-db/postgres|mysql
+        run: python3 ci/scripts/check_release_manifest_pg_mysql_closure.py
+
+      - name: Self-test the release-manifest postgres/mysql closure guard
+        run: python3 ci/scripts/check_release_manifest_pg_mysql_closure.py --self-test
+
   lint-surface-closure:
     name: Guard (lint-surface closure)
     runs-on: ubuntu-latest
@@ -1109,9 +1123,14 @@ jobs:
       # direction in the lockfile. cargo-deny fetches/updates the RustSec DB
       # itself, so the advisory check reads the current database, not a stale
       # snapshot — and knowingly-carried advisories live as documented exceptions
-      # in `deny.toml`, never a blanket silence.
+      # in `deny.toml`, never a blanket silence. The TOOL's own version is
+      # pinned (#511) — deny.toml's own config shape asserts this major
+      # version's schema behavior; an unpinned `cargo install` could silently
+      # pick up a newer cargo-deny release that reads the SAME file
+      # differently, which is a different risk from the advisory DB's own
+      # deliberate freshness above and is not relaxed by pinning this.
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: cargo install cargo-deny --version 0.20.2 --locked
       - name: cargo deny (advisories + licenses + bans + sources)
         run: cargo deny check advisories licenses bans sources
 
@@ -1676,6 +1695,7 @@ jobs:
           # ci/scripts/test_pod_substrate.sh's own module doc.
           - name: pod build substrate
             cmd: JAMMI_REQUIRE_LOCK_TEST=1 bash ci/scripts/test_pod_substrate.sh
+            toolchain: true
           # Pod-build-timings artifact schema + provenance guard (the
           # accepted-debt item the pod-substrate-followups audit named):
           # every ci/artifacts/pod-build-timings/*.json must carry a
@@ -1817,6 +1837,29 @@ jobs:
           # a wheel that bundles no NCCL.
           - name: cu12 link-set classification suite
             cmd: python3 ci/scripts/test_verify_link_set.py
+          # The cu12 TARBALL's derivation + loader-verification arm
+          # (`ci/scripts/bundle_cuda_libs.sh`, excised and re-fixed twice:
+          # #535 the derivation, #534 the loader arm — see that script's own
+          # module doc). Hermetic: no readelf, no real `ldd`, no ELF, no
+          # network — the ONE ELF-reading function and the ONE
+          # readelf-dynamic-section-reading function are both replaced by
+          # fixtures; the loader-verification checks parse committed/literal
+          # report TEXT, never a real loader invocation. Includes T4(3)'s own
+          # real-report integration check, which REFUSES to run against the
+          # fixture's `captured: pending` placeholder at all — this leg goes
+          # RED the moment it lands until `check_bundle_fixture.py` below
+          # (or the lead's own real-report commit) is satisfied; that is the
+          # intended, fail-closed state, not a flake.
+          - name: cu12 tarball bundle suite
+            cmd: bash ci/scripts/test_bundle_cuda_libs.sh
+          # F7: the provisional-fixture refusal as its OWN committed gate, no
+          # environment-variable escape (unlike the suite above, which
+          # accepts BUNDLE_FIXTURE_PROVISIONAL=1 for local iteration on its
+          # OTHER 100+ checks) — this leg has no such knob at all.
+          - name: cu12 tarball fixture provisional refusal
+            cmd: python3 ci/scripts/check_bundle_fixture.py
+          - name: cu12 tarball fixture provisional refusal self-test
+            cmd: python3 ci/scripts/check_bundle_fixture.py --self-test
           # Completeness tripwire for this very guard class: every
           # ci/scripts/check_*.py|.sh gate script must be referenced by at
           # least one workflow (this file included), so a new check script
@@ -1931,12 +1974,17 @@ jobs:
           # zero-execution gap as `compare_grad_oracle`'s suite above.
           - name: perf ab_merge suite
             cmd: python3 ci/scripts/perf/test_ab_merge.py
-          # `finetune_ab.sh`'s forced-eager disable-key enumeration (#352's
-          # harness redesign): mechanically enumerates every admit/
-          # op_disabled site and REDs on an unresolved one — stdlib-only,
-          # same zero-execution reasoning as the `ab_merge` suite above.
-          - name: perf finetune_ab disable-op-keys suite
-            cmd: python3 ci/scripts/perf/test_finetune_ab_disable_op_keys.py
+          # `finetune_ab.sh`'s forced-eager disable-key enumeration
+          # (`ci/scripts/perf/test_finetune_ab_disable_op_keys.py`) is NOT a
+          # matrix leg: it BUILDS two workspace tools (`cargo run --release
+          # -p probed-ops-index`, `-p symbol-index`), and a workspace crate
+          # cannot be built on this bare runner — `.cargo/config.toml` mandates
+          # `-fuse-ld=mold` for x86_64 Linux and the runner has no mold
+          # (`collect2: cannot find 'ld'`, PR #587). A `toolchain: true` leg
+          # gets sccache and a fetched registry, enough for `cargo metadata`
+          # and for a fixture workspace's own build (`pod build substrate`),
+          # never for a workspace crate. The sweep runs in the container-
+          # backed `symbol-index-gates` job below, aggregated by `ci-summary`.
           # `finetune_ab.sh` ITSELF (the redesigned single-binary A/B
           # producer, #352): dry-run smoke over the whole pipeline, the
           # same hermetic discipline `gpu_inference_ab.sh`'s own dry-run
@@ -2441,14 +2489,22 @@ jobs:
       # every guard here instant. The "pod build substrate" leg is the one
       # exception: its RED tests (i)/(ii) enumerate every build-script
       # package from a REAL `cargo metadata` and read real vendored
-      # build.rs sources under $CARGO_HOME/registry (round-2 audit finding
-      # 6), which needs an actual toolchain + a fetched registry — gated
-      # behind `if:` so no OTHER leg pays this cost.
-      - name: Rust toolchain (pod build substrate only)
-        if: matrix.name == 'pod build substrate'
+      # build.rs sources under $CARGO_HOME/registry, which needs an actual
+      # toolchain + a fetched registry. This bare runner carries cargo and
+      # rustc but NOT `sccache` (`.cargo/config.toml` makes it the mandatory
+      # rustc wrapper for every cargo call) and NOT `mold` (the same file's
+      # mandatory linker for x86_64 Linux) — so a matrix leg may declare
+      # `toolchain: true` for `cargo metadata` and for a FIXTURE workspace's
+      # build (`setup-rust-ci` installs sccache, `cargo fetch` the registry,
+      # the runner's own ld links a plain crate); a guard that must build a
+      # WORKSPACE crate lives in the container-backed `symbol-index-gates`
+      # job instead. `ci/scripts/merge_path.sh`'s guards stage mirrors the
+      # wrapper split (an unexecutable wrapper for the other legs).
+      - name: Rust toolchain (toolchain legs only)
+        if: matrix.toolchain == true
         uses: ./.github/actions/setup-rust-ci
-      - name: Fetch the registry (pod build substrate only)
-        if: matrix.name == 'pod build substrate'
+      - name: Fetch the registry (toolchain legs only)
+        if: matrix.toolchain == true
         run: cargo fetch --locked
       # `convert_legacy_bert_checkpoint.py`'s file-level suite needs the
       # real `safetensors` package (see that matrix entry's own comment,
@@ -2697,6 +2753,91 @@ jobs:
   # as a pass. `if: always()` makes it emit on every run, so the required check
   # never hangs "waiting for status". `test-live` is deliberately excluded — it
   # is `continue-on-error` (a live-network lane allowed to fail).
+  # A SEPARATE job (not a step folded into swarm.yml's `swarm-gates`) because these
+  # two gates resolve Rust construct citations / public-declaration scans
+  # against a REAL `syn` AST parse (`ci/tools/symbol-index`, `cargo run
+  # --release -p symbol-index`) rather than a regex reader — this repo's own
+  # recorded lesson ("regex readers over YAML/Rust lost five audits") is why
+  # `check_plan_citations.py`'s Rust resolution and `check_no_consumer_
+  # names.py`'s PUB_DECL_RE scan were both migrated onto that ONE shared
+  # tool rather than each carrying (or re-carrying) its own text scanner.
+  # That real parse needs the repo's pinned Rust toolchain, which the
+  # toolchain-free `swarm-gates` job (swarm.yml) deliberately does not carry —
+  # hence this job lives here, with its own `container:` (the repo-provided CI
+  # image, `./.github/actions/setup-rust-ci` for the sccache GHA-cache
+  # backend), and is aggregated by the required `ci-summary` below so a red
+  # gate blocks a merge without any branch-protection wiring. No `paths:`
+  # filter (the #245 trap) — this job always runs, on every PR and push.
+  symbol-index-gates:
+    name: Guard (symbol-index gates)
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-rust-ci
+
+      - name: Assert symbol-index's own unit tests + fmt + clippy pass
+        if: ${{ !cancelled() }}
+        run: |
+          cargo fmt -p symbol-index -- --check
+          cargo clippy -p symbol-index --all-targets -- -D warnings
+          cargo test -p symbol-index
+
+      # Issue #555 is journey-markers (toolchain-free, `swarm-gates`); this
+      # is issue #556's Rust construct resolution — a bare `path::symbol`
+      # citation under docs/plans/** resolved against the real syn index.
+      - name: Assert the plan-citations self-test fixtures fire correctly
+        if: ${{ !cancelled() }}
+        run: python3 ci/scripts/check_plan_citations.py --self-test
+
+      - name: Assert every construct citation under docs/plans/** resolves
+        if: ${{ !cancelled() }}
+        run: python3 ci/scripts/check_plan_citations.py
+
+      # The mechanical half of the discipline test: no governance-verb leak in
+      # the diff, no philosophy leak-smell token in the engine tree. Advisory-
+      # labelled. Migrated off `PUB_DECL_RE` onto the real symbol-index tool.
+      - name: Assert the no-consumer-names self-test fixtures fire correctly
+        if: ${{ !cancelled() }}
+        run: python3 ci/scripts/check_no_consumer_names.py --self-test
+
+      - name: Assert no consumer-name / governance leak in the engine tree
+        if: ${{ !cancelled() }}
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: python3 ci/scripts/check_no_consumer_names.py
+
+      # `ci/tools/probed-ops-index` is the other CI-only syn tool (the
+      # eager-disable key sweep's source of truth; the sweep itself runs
+      # below).
+      - name: Assert probed-ops-index's own fmt + clippy pass
+        if: ${{ !cancelled() }}
+        run: |
+          cargo fmt -p probed-ops-index -- --check
+          cargo clippy -p probed-ops-index --all-targets -- -D warnings
+
+      # `finetune_ab.sh`'s forced-eager disable-key enumeration: the key set
+      # is derived from the real `PROBED_OPS` table through
+      # `ci/tools/probed-ops-index` and the admit/admit_cascade call-site
+      # census through `ci/tools/symbol-index` — both real `cargo run`s, so
+      # this suite needs this job's container (toolchain, sccache, linker),
+      # never the bare guard-matrix runner.
+      - name: Assert the eager-disable key sweep derives from the real PROBED_OPS table
+        if: ${{ !cancelled() }}
+        run: python3 ci/scripts/perf/test_finetune_ab_disable_op_keys.py
+
+      # The rigor-record self-test's two index-backed fixtures (RR42 phantom
+      # site, RR43 real-call resolution) need `ci/tools/symbol-index` built;
+      # the toolchain-free swarm lane runs the same self-test and takes its
+      # named toolchain-less arm there, so THIS job is where those two arms
+      # are exercised.
+      - name: Assert the rigor-record self-test's index-backed fixtures fire with the toolchain
+        if: ${{ !cancelled() }}
+        run: python3 ci/scripts/check_rigor_record.py --self-test
+
   ci-summary:
     needs:
       - check
@@ -2718,6 +2859,7 @@ jobs:
       - test-broker
       - test-python
       - test-pg
+      - symbol-index-gates
     if: always()
     uses: ./.github/workflows/_summary.yml
     with:

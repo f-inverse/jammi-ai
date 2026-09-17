@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use jammi_ai::fine_tune::training_job::fine_tuned_model_id;
+use jammi_ai::fine_tune::worker::loop_test_hooks::{arm_observed, Event};
 use jammi_ai::fine_tune::worker::{training_test_hooks, EmbeddedWorker, JobWorker};
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::jobs::compute_test_hooks::{arm, ParkPoint};
@@ -476,6 +477,10 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
          cancel -- raise `epochs` further so this genuinely races a live training run"
     );
 
+    // #527/#567/#578: arm the observed-event rendezvous BEFORE requesting
+    // the cancel, so the watcher's fire can never race ahead of the arm.
+    let cancel_observed = arm_observed(&handle.job_id, Event::CancelObserved);
+
     assert!(
         session
             .catalog()
@@ -485,9 +490,31 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
         "a cancel on the running training job is recorded"
     );
 
-    tokio::time::timeout(Duration::from_secs(15), run)
+    // Wait on the REAL event — the watcher reading `cancel_requested = true`
+    // off the row and flipping `cancel_requested_seen` — never on a
+    // wall-clock guess at its poll cadence (the SAME cadence the lease
+    // keeper renews at, so a busy test binary's scheduler delay can push an
+    // observation arbitrarily far past any fixed bound a parallel run
+    // happens to pick — #567/#578's flake). A generous 60s backstop: firing
+    // means the machine is wedged or starved, not that this property is
+    // false.
+    tokio::time::timeout(Duration::from_secs(60), cancel_observed.wait_fired())
         .await
-        .expect("the cancel-request watcher's next poll tick observes the request promptly")
+        .expect(
+            "a generous backstop against a wedged or starved machine: the cancel-request \
+             watcher never observed the request",
+        );
+
+    // From here the race is ONLY real thread-scheduling latency after
+    // cancellation is already known to have landed -- never the watcher's
+    // poll interval -- so a modest bound suffices.
+    tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect(
+            "once the watcher has observed the cancel request, the run must finish within a \
+             few epoch boundaries -- this is bounded by scheduling latency alone, not by the \
+             watcher's poll cadence",
+        )
         .unwrap();
 
     let row = session.catalog().get_job(&handle.job_id).await.unwrap();
@@ -731,6 +758,10 @@ async fn a_lease_loss_on_the_owning_worker_lands_the_lease_lost_outcome_never_th
         idle_poll_secs: 1,
         ..Default::default()
     };
+    // Captured BEFORE `config` moves into `InferenceSession::new` below --
+    // the derived bail bound (#527, further down) reads these.
+    let lease_secs = config.lease.duration_secs;
+    let heartbeat_secs = config.lease.heartbeat_secs;
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
     session
         .add_source(
@@ -811,11 +842,22 @@ async fn a_lease_loss_on_the_owning_worker_lands_the_lease_lost_outcome_never_th
     // write to `jobs` — the row is never touched by this step at all.
     session.lease_keeper().kill_thread_for_test();
 
-    tokio::time::timeout(Duration::from_secs(15), run)
+    // #527: no discrete watcher tick to rendezvous on here (unlike the
+    // cancel-request test above) -- `hold.lost_flag()` is flipped by the
+    // lease keeper's own CONTINUOUS renewal-miss check, not a single
+    // observable event this crate's test hooks can key on. DERIVED instead
+    // of a bald guess: `lease_secs` (3) is the longest the keeper
+    // can go without a renewal landing before the hold reads `lost`, and
+    // `heartbeat_secs` (1) bounds how stale that read can be before
+    // the training loop's own next epoch-boundary check observes it;
+    // `* 12` is a generous multiple of the heartbeat on top of the full
+    // lease duration.
+    tokio::time::timeout(Duration::from_secs(lease_secs + heartbeat_secs * 12), run)
         .await
         .expect(
-            "the training loop's next epoch-boundary check must observe the keeper's death \
-             promptly and bail",
+            "derived from lease_secs + heartbeat_secs * 12: the training loop's \
+             next epoch-boundary check must observe the keeper's death and bail within one \
+             lease duration plus a generous multiple of the heartbeat",
         )
         .unwrap();
 

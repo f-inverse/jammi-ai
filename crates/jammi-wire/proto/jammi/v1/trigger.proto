@@ -41,7 +41,9 @@ message PublishRequest {
   TopicName topic = 1;
   ArrowBatch batch = 2;
   // Optional tenant scope override; if unset, the session's tenant
-  // (set via CatalogService.SetTenant) applies. See ADR-00 for TenantId.
+  // (set via CatalogService.SetTenant) applies. See the engine's
+  // tenant-identifier discipline:
+  // docs/guide/src/philosophy.md#the-one-rule-everything-else-follows-from
   string tenant_id = 3;
 }
 

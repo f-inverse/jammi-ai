@@ -594,7 +594,13 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Poll the shared catalog for `job_id` until `want(&record)` holds. Fails
 /// loudly (fleet diagnostics + final job row) on an early unexpected worker
-/// exit or the timeout, never silently waiting it out.
+/// exit or the timeout, never silently waiting it out. Also fails loudly the
+/// moment the row reaches a TERMINAL status (`JobRecord::is_terminal`, the
+/// ONE terminality predicate — G6, #515) `want` does not accept: a terminal
+/// row never mutates further, so a fixture polling for one specific literal
+/// status fails immediately naming the status it actually settled on,
+/// rather than burning the rest of [`TERMINAL_TIMEOUT`] on a DIFFERENT
+/// terminal status instead.
 pub async fn await_job(
     fleet: &mut Fleet,
     session: &Arc<InferenceSession>,
@@ -608,6 +614,19 @@ pub async fn await_job(
         if let Ok(record) = catalog.get_job(job_id).await {
             if want(&record) {
                 return record;
+            }
+            if record.is_terminal() {
+                fleet.dump_diagnostics(&format!(
+                    "job {job_id} settled on status={:?} error={:?}, which does not satisfy: \
+                     {label}",
+                    record.status, record.error
+                ));
+                panic!(
+                    "distributed ballista lane: job {job_id} reached a TERMINAL status ({:?}) \
+                     that does not satisfy: {label} (error: {:?}) — a terminal row never \
+                     mutates further, so waiting out the remaining timeout cannot help.",
+                    record.status, record.error
+                );
             }
         }
         if let Some((worker, status)) = fleet.first_unexpected_exit() {

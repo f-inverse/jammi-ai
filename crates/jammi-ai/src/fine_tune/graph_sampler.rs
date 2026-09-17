@@ -134,6 +134,7 @@ impl GraphEdge {
 /// graph-fine-tune entry point takes one typed argument instead of a long
 /// positional list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraphFineTuneSources {
     /// Catalog source holding the node text.
     pub node_source: String,
@@ -155,6 +156,7 @@ pub struct GraphFineTuneSources {
 /// Sampling configuration: node2vec walk knobs plus the structure-aware
 /// negative-sampling knobs.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraphSampleConfig {
     /// Walk length `L`. The positive for an anchor is drawn from the nodes the
     /// walk visits, so `L` controls how far up the graph the positive can be.

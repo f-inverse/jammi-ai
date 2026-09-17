@@ -52,37 +52,36 @@
 # WHAT THIS REGISTRY PROMISES, AND WHAT IT DOES NOT
 #
 # The merge-path corpus holds twelve `cargo clippy ... -D warnings` lanes.
-# Deleting each one in turn and re-running both halves of the gate (the
-# per-lane sweep in this file's own history, reproducible by removing a lane
-# from `lanes_from_workflows`' output and re-running `find_gaps` /
-# `find_missing_required_lanes`) splits them in two: five lanes are the only
-# cover for some `required-features` target, so the `cargo metadata` closure
-# half REDs on their loss all by itself and they need no row here; the other
-# seven are covered by nothing derived.
+# `check_lint_surface_closure.py` derives, on every run, which of them are
+# covered by nothing at all: `find_unprotected_lanes` removes each lane in
+# turn from the discovered corpus and re-runs both OTHER closures (`find_
+# gaps` over `cargo metadata`'s own `required-features` targets, and this
+# registry's own `find_missing_required_lanes`) — the identical per-lane
+# sweep this file's own history once did by hand, now automatic and rerun
+# every invocation rather than a one-time snapshot that rots the moment a
+# lane is added, moved, or deleted (#532).
 #
-# The three rows below are three of those seven — the cuda-feature lanes.
-# They are here because a cuda lint regression is invisible until a GPU pod
-# run, off the merge path entirely, which makes their loss the most expensive
-# of the seven to discover.
+# Five lanes are the only cover for some `required-features` target, so the
+# `cargo metadata` closure REDs on their loss by itself and needs no row.
+# Five more are rowed below — the three cuda-feature lanes (a cuda lint
+# regression there is invisible until a GPU pod run, off the merge path
+# entirely, the most expensive of the seven to discover) plus `jammi-db`'s
+# `postgres,mysql` lane and `jammi-server`'s `test-hooks` lane: each row
+# states the crate/feature-set/target-selection surface ONLY that lane
+# activates on the merge path, so deleting it un-satisfies the row and
+# `find_missing_required_lanes` REDs.
 #
-# The remaining four are NOT rowed here, and that is a gap this file states
-# rather than hides: `.github/workflows/ci.yml:43` (`--workspace
-# --all-targets`), `:90` (`-p jammi-server --tests --features test-hooks`),
-# `:113` (`-p jammi-db --features postgres,mysql --all-targets`) and `:516`
-# (`-p jammi-wire -p jammi-admin -p jammi-client --all-targets`). Deleting any
-# of them reddens no gate that reads a clippy invocation at all: the candidate
-# detector set is `grep -rl clippy ci/scripts` (this gate,
-# `check_execution_surface_reachability.py`, and pod-side artifacts that never
-# read `ci.yml`'s merge lanes), and deleting each of the four lines in turn,
-# with both halves of this gate plus `check_execution_surface_reachability.py`
-# and `check_ci_guard_wiring.py` re-run, exits 0 every time. That is the
-# measured scope of the claim, not "no check anywhere".
-# Rowing them is a follow-up, recorded in
-# `docs/rigor/contracts/ci_500-cuda-image-nccl.md` § "Adjacent gap found,
-# deferred"; it is deliberately not done in passing here, because each row must state
-# WHICH surface it protects (the `feature-set`/`target-selection` fields are
-# a claim about a lint surface, not a copy of a command line), and that is
-# four separate readings of what those lanes uniquely compile.
+# The remaining TWO are not, and cannot be, rowed: `.github/workflows/
+# ci.yml`'s `--workspace --all-targets` lane and its `-p jammi-wire -p
+# jammi-admin -p jammi-client --all-targets` lane both compile `jammi-wire`/
+# `jammi-admin`/`jammi-client` under DEFAULT features with `--all-targets` —
+# genuinely REDUNDANT with each other for closure purposes. Any row the
+# narrower lane would satisfy is, by the same features/selection, ALSO
+# satisfied by the workspace-wide one (and vice versa): deleting either
+# ALONE never un-satisfies a row the other still holds up. `find_unprotected_
+# lanes` is the only mechanism that can name this pair at all — it reports
+# BOTH of them, every run, as the standing (not merely hypothetical) gap
+# they are, precisely because a row cannot close it.
 
 # `jammi-ai`'s `cuda` arm: `#[cfg(feature = "cuda")]` items in `src/` and the
 # `#[test] #[cfg(feature = "cuda")]` fns in its `cfg(test)` half (e.g.
@@ -100,3 +99,19 @@ jammi-ai        cuda             tests
 # catch.
 jammi-encoders  cuda,!flash-attn  tests
 jammi-encoders  cuda,flash-attn   tests
+
+# `jammi-db`'s `postgres`/`mysql` provider arms: `#[cfg(feature =
+# "postgres")]`/`#[cfg(feature = "mysql")]` code (the SQLx driver adapters
+# and their own `cfg(test)` halves) that no other merge-path lane activates
+# at all -- the workspace-wide default lane (`ci.yml`'s `--workspace
+# --all-targets`) never turns either feature on. Lives in `ci.yml`'s own
+# `Clippy jammi-db postgres,mysql` step (#532).
+jammi-db        postgres,mysql    all-targets
+
+# `jammi-server`'s `test-hooks` arm: `#[cfg(feature = "test-hooks")]` test
+# scaffolding no other merge-path lane compiles (the workspace-wide default
+# lane never turns it on, and jammi-server's own `--features live-gpu-
+# tests,live-distributed-tests` lane is a DIFFERENT feature combination that
+# does not imply it). Lives in `ci.yml`'s `Clippy jammi-server test-hooks`
+# step (#532).
+jammi-server    test-hooks        tests

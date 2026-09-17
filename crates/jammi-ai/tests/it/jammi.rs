@@ -312,7 +312,7 @@ async fn front_door_with_the_default_config_claims_the_submitted_job() {
     let mut left_queued = None;
     for _ in 0..600 {
         let status = session.fine_tune_status(&job_id).await.expect("status");
-        if status != "queued" {
+        if status != jammi_db::catalog::status::JobStatus::Queued.to_string() {
             left_queued = Some(status);
             break;
         }

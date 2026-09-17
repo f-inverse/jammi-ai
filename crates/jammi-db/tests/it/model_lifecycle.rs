@@ -155,7 +155,7 @@ async fn submit_referencing_job(
 /// `"completed"`, `"failed"`, or any other string a caller wants to probe).
 async fn force_job_age(cat: &Catalog, job_id: &str, status: &str, days_ago: i64) {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(days_ago))
-        .format("%Y-%m-%dT%H:%M:%S%.9fZ")
+        .format("%Y-%m-%dT%H:%M:%S%.6fZ")
         .to_string();
     cat.backend_arc()
         .transaction(TxOptions::default(), |tx| {
@@ -229,7 +229,7 @@ async fn delete_blocked_by_result_table_name_edge(backend: BackendKind) {
         text_columns: None,
         storage_precision: jammi_db::config::StoragePrecision::F32,
         oversample: 4,
-        created_at: jammi_db::catalog::backend::now_sortable(),
+        created_at: jammi_db::catalog::lease::canonical_stamp_now(),
         job_attempt: None,
     })
     .await
@@ -535,7 +535,7 @@ async fn delete_blocked_under_volume(backend: BackendKind) {
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
-            created_at: jammi_db::catalog::backend::now_sortable(),
+            created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             job_attempt: None,
         })
         .await
@@ -562,7 +562,7 @@ async fn delete_blocked_under_volume(backend: BackendKind) {
         text_columns: None,
         storage_precision: jammi_db::config::StoragePrecision::F32,
         oversample: 4,
-        created_at: jammi_db::catalog::backend::now_sortable(),
+        created_at: jammi_db::catalog::lease::canonical_stamp_now(),
         job_attempt: None,
     })
     .await

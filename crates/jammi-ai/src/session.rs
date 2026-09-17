@@ -442,7 +442,7 @@ impl InferenceSession {
         crate::fine_tune::worker::HoldReleaseOutcome,
         crate::fine_tune::worker::ReleaseSweep,
     )> {
-        self.host_admission.begin_release();
+        self.host_admission.begin_release().await;
         let heartbeat = self.worker_intervals()?.heartbeat;
         let holds = match self.lease_keeper.release_job_holds(heartbeat).await {
             Ok(hr) => crate::fine_tune::worker::HoldReleaseOutcome::Observed(hr),
@@ -1989,28 +1989,28 @@ impl InferenceSession {
         // `train_context_predictor_deduped` are the other two durable
         // edges; all three call
         // [`crate::fine_tune::spec::admit_training_spec`]. A refusal leaves
-        // no row behind, because no row has been written yet.
-        crate::fine_tune::spec::admit_training_spec(self.inner.config(), &spec)?;
+        // no row behind, because no row has been written yet. Consuming
+        // `spec` here and reading it back only through `admitted.spec()` is
+        // the witness enforcement (#573 round 2): there is no path below
+        // this line that could serialize/submit the pre-admission `spec`
+        // value, because that binding no longer exists. This function
+        // builds no `SubmitJobParams` of its own (#573 round 3, N3-seam):
+        // [`crate::fine_tune::spec::submit_admitted_training`] is the one
+        // place that construction happens.
+        let admitted = crate::fine_tune::spec::admit_training_spec(self.inner.config(), spec)?;
         let job_id = uuid::Uuid::new_v4().to_string();
-        let links = self.training_job_links(&spec, &job_id).await?;
-        let spec_json = serde_json::to_string(&spec)?;
-        let recorded_job_id = self
-            .inner
-            .catalog()
-            .submit_job_deduped(
-                jammi_db::catalog::jobs_repo::SubmitJobParams {
-                    job_id: &job_id,
-                    kind: spec.kind(),
-                    execution: jammi_db::catalog::status::JobExecution::Queued,
-                    spec: &spec_json,
-                    model_ref: Some(&links.model_ref),
-                    output_model_id: Some(&links.output_model_id),
-                    model_source: None,
-                    priority: 0,
-                },
-                idempotency_key,
-            )
-            .await?;
+        let links = self.training_job_links(admitted.spec(), &job_id).await?;
+        let submitted = crate::fine_tune::spec::submit_admitted_training(
+            self.inner.catalog(),
+            &admitted,
+            &job_id,
+            &links.model_ref,
+            &links.output_model_id,
+            0,
+            idempotency_key,
+        )
+        .await?;
+        let recorded_job_id = submitted.recorded_job_id;
 
         if recorded_job_id == job_id {
             Ok(TrainingJob::new(
@@ -2305,7 +2305,10 @@ impl InferenceSession {
 /// regardless of how the underlying Parquet scan or model batches arrive on
 /// a later read.
 fn infer_ordered_read_back_sql(table: &str) -> String {
-    format!("SELECT * FROM \"jammi.{table}\" ORDER BY _row_id, _ordinal")
+    format!(
+        "SELECT * FROM {} ORDER BY _row_id, _ordinal",
+        jammi_db::store::result_table_relation(table)
+    )
 }
 
 /// Normalize every `Utf8View`/`BinaryView` column of `batches` back to the

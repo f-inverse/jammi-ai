@@ -4,7 +4,7 @@
 
 **Delivers:** four engine generalisations that turn Jammi into an audit-native, event-driven, multi-tenant substrate without the engine codifying any tenant's domain — data-driven `ChannelContribution`/`merge_channels` over a catalog-registered channel table; durable `MutableTableRegistry` companion tables federated through one DataFusion `SessionContext`; `Option<TenantId>` propagation via a `TenantScopeAnalyzerRule` and write-side `assert_tenant_matches`; topic / publish / subscribe via `TriggerBroker` with backing-table replay.
 
-This guide tests **only new functionality** introduced by cp9. Regression for everything else is automated via `cargo test --workspace`, `cargo test --test smoke`, and `python3 tests/smoke_test.py` per [PLAN-META §Checkpoints](../PLAN-META.md). For the structural decisions that underpin every primitive, see [ADR-00](./ADR-00-tenant-identifier.md), [ADR-01](./ADR-01-wire-surface.md), [ADR-02](./ADR-02-transaction-ownership.md); for the per-phase contracts, see [SPEC-01](./SPEC-01-provenance-channels.md) – [SPEC-04](./SPEC-04-trigger-stream.md).
+This guide tests **only new functionality** introduced by cp9. Regression for everything else is automated via `cargo test --workspace`, `cargo test --test smoke`, and `python3 tests/smoke_test.py` per [PLAN-META §Checkpoints](../PLAN-META.md). For the tenant-identifier decision that underpins every primitive, see [Design Philosophy § the one rule everything else follows from](../../guide/src/philosophy.md#the-one-rule-everything-else-follows-from) (ADR-01/ADR-02 and SPEC-01–SPEC-04, cited elsewhere in this guide by the same now-absent-ADR convention, are tracked separately and out of this fix's scope — see #495).
 
 ---
 
@@ -207,7 +207,7 @@ jammi --tenant "$TENANT_B" sources list
 # → src_b (Local)
 ```
 
-The unscoped session sees only `tenant_id IS NULL` rows (the legacy single-tenant identity per [ADR-00 §"Existing single-tenant users"](./ADR-00-tenant-identifier.md)):
+The unscoped session sees only `tenant_id IS NULL` rows (the legacy single-tenant identity per [Design Philosophy](../../guide/src/philosophy.md#the-one-rule-everything-else-follows-from)):
 
 ```bash
 jammi sources list
@@ -624,7 +624,7 @@ The operator ticks every box; the PR is merge-blocked until all are checked.
 | `connection refused` against NATS | `nats-server -js` not running | `nats-server -js --port 4222 &`; confirm `nats stream ls` lists `jammi.topic.*` streams |
 | `connection refused` against Postgres | `JAMMI_TEST_PG_URL` set but server not up | Start Postgres or unset the env var; Shape A still works without it |
 | `EvidenceChannel("…already declared")` on `register` | Channel id already registered (engine seed includes `vector` and `inference`) | Use `channels add-column` to extend; channel registration is one-shot per [SPEC-01 §3.3](./SPEC-01-provenance-channels.md) |
-| `mutable create` fails with "reserved column name" | Schema includes a literal `tenant_id` column | Drop the column — the engine appends it implicitly per [ADR-00 §"Phase 2"](./ADR-00-tenant-identifier.md) |
+| `mutable create` fails with "reserved column name" | Schema includes a literal `tenant_id` column | Drop the column — the engine appends it implicitly per [Design Philosophy](../../guide/src/philosophy.md#the-one-rule-everything-else-follows-from) |
 | `trigger publish` fails with `--row` and `--json-file` together | clap argument-group conflict | Choose one input mode per invocation |
 | `trigger publish` fails with "json file … must be a JSON object or an array of JSON objects" | Top-level JSON value is a scalar or null | Wrap the row(s) in a `[ … ]` array, or pass one object literal |
 | Federation JOIN errors with "table not found" | Mutable table not registered into the current session | Registration is per-`SessionContext`; reopen or call `create_mutable_table` at startup |
@@ -636,7 +636,7 @@ The operator ticks every box; the PR is merge-blocked until all are checked.
 ## References
 
 - [`README.md`](./README.md) — the cp9 plan-group index.
-- [`ADR-00-tenant-identifier.md`](./ADR-00-tenant-identifier.md) — `TenantId(Uuid)` newtype and nullable column rule.
+- [Design Philosophy](../../guide/src/philosophy.md#the-one-rule-everything-else-follows-from) — `TenantId(Uuid)` newtype and nullable column rule; the engine's one tenant-identifier decision (see #495 for the citation-migration record).
 - [`ADR-01-wire-surface.md`](./ADR-01-wire-surface.md) — `TriggerService` and `SessionService` proto surface.
 - [`ADR-02-transaction-ownership.md`](./ADR-02-transaction-ownership.md) — backend-owned `transaction(|tx| ...)`.
 - [`SPEC-01-provenance-channels.md`](./SPEC-01-provenance-channels.md) — Phase 1 contract.

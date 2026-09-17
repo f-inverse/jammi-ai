@@ -1,6 +1,7 @@
 //! Shared test helpers for jammi-db and jammi-ai integration tests.
 
 pub mod child;
+pub mod source_universe;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -327,7 +328,7 @@ pub async fn abandon_building(
     // The catalog's own backend-correct liveness predicate, not a Rust-side
     // string compare against `lease_expires_at` — that stored value is a
     // Postgres-clock expression's text rendering on Postgres, not a
-    // `lease_now()`-shaped string a naive `>` compare here would assume.
+    // `canonical_stamp_now()`-shaped string a naive `>` compare here would assume.
     assert!(
         TenantBinding::admin_scope(catalog.list_live_building_tables())
             .await

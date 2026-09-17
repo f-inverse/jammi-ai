@@ -18,6 +18,7 @@ Phase 4 of the rigor chain (ARCHITECTURE §4). You are given a diff and its cont
 1. `git diff <base>...<head>` — the exact range from the contract. Read every hunk.
 2. For each hunk, walk the rubric below and ask which lens it triggers. Open the surrounding file with Read to see the states the diff does *not* show.
 3. For every axis you assert, cite the concrete `path:line` your refutation rests on — the citation-checker re-reads it.
+4. **If refuting a concurrency claim needs CPU load constructed directly in Bash** (rather than inside a test binary's own process), reap it with something stronger than a trailing `kill`: `trap 'kill ${=LOADPIDS} 2>/dev/null' EXIT INT TERM` (zsh does not word-split `kill $PIDS` the way bash does — an unbraced expansion silently kills one bogus argument and orphans the rest) **and** a self-limiting body (`timeout 300 sh -c 'while :; do :; done'` or a bounded loop), so a burner that escapes your parent shell still dies on its own. A leaked busy loop reparents to `ppid 1` and spins forever, degrading every later timing-sensitive measurement on the machine, including the next audit's own.
 
 ## Principle rubric — reason from the principle, not the instance
 

@@ -1,419 +1,208 @@
 #!/usr/bin/env python3
-"""F4 (adversarial audit fold-in — "the ninth key"), B2 (round-2
-adversarial audit — "the scanner silently drops unresolvable sites"): the
-MECHANICAL sweep `finetune_ab.sh`'s own `JAMMI_EAGER_DISABLE_OP_KEYS`
-constant names as its own enumeration method — run this after touching any
-admission call graph in `crates/jammi-encoders/src/`, `crates/jammi-lora/
-src/`, or `crates/jammi-ai/src/fine_tune/` to catch an ELEVENTH addition (or
-a stale entry) mechanically, never by re-reading the whole call graph by
-eye.
+"""F4 (adversarial audit fold-in — "the ninth key"), B2 (round-2 adversarial
+audit — "the scanner silently drops unresolvable sites"), wave-5 identity
+(#546's typed-op migration retired the text scan entirely): the MECHANICAL
+sweep `finetune_ab.sh`'s own `JAMMI_EAGER_DISABLE_OP_KEYS` constant names as
+its own enumeration method — run this after touching
+`crates/jammi-kernels/src/admission.rs`'s `PROBED_OPS` table to catch an
+ELEVENTH addition (or a stale entry) mechanically, never by re-reading the
+whole call graph by eye.
 
 WHY THIS EXISTS: an eight-key version of `JAMMI_EAGER_DISABLE_OP_KEYS`
-shipped with a real gap (`mem_efficient_attention`, a live per-layer
-`admit_cascade` (`crates/jammi-encoders/src/attention_cascade.rs:857`) site AND
-a live once-per-forward `op_disabled`
-(`crates/jammi-encoders/src/modernbert.rs:2359`) gate) that went
-undetected because every `finetune_ab.sh` sweep config has `seq <= 512`,
-and that op's own domain predicate DomainMisses unconditionally for
-`seq <= ATTENTION_BLOCK_MAX_SEQ` (4096) — a coincidence of the SWEEP's own
-shape, not proof the key was unneeded. A hand-re-read of the call graph
-missed it once; this script performs the identical sweep mechanically,
-every run. This is exactly the mechanism that caught the TENTH key,
-issue #463's `gelu_erf_fused` (a live standalone `admit` site in
-`crates/jammi-encoders/src/activations.rs`) — this constant's own set
-went stale the moment that op landed, and this test's set-equality
-assertion REDed until `JAMMI_EAGER_DISABLE_OP_KEYS` named it too.
+shipped with a real gap (`mem_efficient_attention`) that went undetected
+because every `finetune_ab.sh` sweep config has `seq <= 512`, and that op's
+own domain predicate declines unconditionally for `seq <= ATTENTION_BLOCK_MAX_SEQ`
+(4096) — a coincidence of the SWEEP's own shape, not proof the key was
+unneeded. A hand-re-read of the call graph missed it once; this script
+performs the identical sweep mechanically, every run.
 
-B2 (round-2 audit): a FIRST version of this scanner's own `_STR_RE.search`
-step silently returned NOTHING (an empty discovered set, no error, no
-report) for any call it could not resolve a literal op key from — which
-is exactly the same "absent counters is not evidence of zero" class of
-bug `admission.rs`'s own `unmatched_disables()` doc warns against, one
-level up: a call this scanner cannot understand read IDENTICALLY to "no
-call exists here at all". `discover_live_standalone_op_keys` now returns
-`(keys, unresolved_sites)` — a NON-EMPTY `unresolved_sites` (each entry a
-`path:line` description) is a LOUD, mechanically-checked finding
-(`RealSourceParityTests.test_no_unresolved_call_sites`), never a silent
-drop. See METHOD below for exactly what makes a site "unresolved" versus
-correctly excluded from the scan entirely.
+METHOD, REBUILT (wave-5 identity, #546): every `admit`/`admit_cascade` call
+site across the workspace now passes a typed `&'static
+jammi_kernels::admission::ProbedOp` const (`crates/jammi-kernels/src/
+admission.rs`'s own `PROBED_OPS` table), never a bare string literal — the
+PRIOR version of this script read the op key off a text scan of each call
+site's own quoted-string argument (a balanced-paren extraction over
+`crates/jammi-encoders/src`, `crates/jammi-lora/src`,
+`crates/jammi-ai/src/fine_tune`), which the typed migration makes
+structurally impossible: there is no literal left at an `admit`/
+`admit_cascade` call site for a regex to read at all. Fixing this by
+teaching the old regex the const names would be exactly the "second,
+string-keyed enumeration" wave-5 identity's own I4 fix eliminated at the
+Rust layer — re-introducing the identical shape here, one layer down, is
+not a fix.
 
-METHOD: over every `.rs` file under the SCAN ROOTS (below), with comment
-LINES stripped first (any line whose trimmed content starts with `//` —
-covers plain `//`, `///`, and `//!` uniformly; a doc comment mentioning
-`op_disabled("...")` as PROSE, e.g. `crates/jammi-encoders/src/
-modernbert.rs:1460`, or a bare `// ... admit() ...` mention, e.g. that
-same file's lines 1221-1222, must never be mistaken for a real call —
-this is a LINE-level heuristic, never a `/* ... */` block-comment strip;
-no block comment currently sits over a real call site in the scanned
-crates, and this scope limitation is deliberate, not an oversight) and
-`#[cfg(test)]`-attributed items excluded (a cheap brace-balanced span:
-find the `{` immediately after each `#[cfg(test)]` attribute — already
-comment-stripped, so a DOC COMMENT merely mentioning the literal text
-"#[cfg(test)]" as prose, e.g. `crates/jammi-encoders/src/
-modernbert.rs:2571/2582/2748`, can never be mistaken for a real attribute
-either — and balance braces from there to the item's own close; the audit
-named two REAL, in-scope test call sites this excludes,
-`strict_mode_errors_instead_of_falling_back_on_a_failed_predicate`
-(`crates/jammi-encoders/src/layer_norm.rs:2427`) and
-`attention_block_strict_mode_errors_instead_of_falling_back_on_a_failed_predicate`
-(`crates/jammi-encoders/src/modernbert.rs:10575`), both `admit(AdmissionMode::Strict, "<a key
-already found at its own production site>", ...)` calls that exist purely
-to unit-test THAT op's Strict-mode error path, not a second live call
-site) — for every remaining `admit(`/`admit_cascade(`/`op_disabled(` call,
-a BALANCED-PAREN scan (never a fixed lookahead window, which mis-attributes
-a wrapper call's own literal from LATER, unrelated code) extracts the call's
-own argument list, SPLITS it into top-level comma-separated arguments
-(respecting nested parens/brackets/braces and string literals, so a nested
-call or a string containing a comma never mis-splits), and reads OFF THE
-OP-KEY ARGUMENT'S OWN POSITION specifically (`op_disabled`'s sole arg, at
-index 0; `admit`/`admit_cascade`'s SECOND arg, at index 1 — both fixed by
-their own `pub fn` signature in `admission.rs`, never inferred) — the
-FIRST quoted string ANYWHERE in the call is deliberately NOT good enough:
-`admit(mode, op, "some_predicate_name", holds, counters)` with a
-*variable* `op` has ITS OWN first quoted string sitting at the PREDICATE
-position, not the op-key position (the exact shape `admission.rs:1881`'s
-own test cell has), and reading that off as if it were the op key would
-silently manufacture a bogus discovered key from unrelated text. If the
-op-position argument, after trimming, is not of the exact shape
-`"[a-z0-9_]+"` (a bare double-quoted literal — a variable name, a `const`
-reference, a method call, anything else) the site is UNRESOLVED, reported
-with its own `path:line`, never silently dropped and never mis-attributed
-to some OTHER literal found elsewhere in the same call.
+The live standalone op-key set is `PROBED_OPS` itself. This script reads it
+from `ci/tools/probed-ops-index` (`cargo run --release -p probed-ops-index`),
+a tiny CI-only Rust binary that imports `jammi_kernels::admission::PROBED_OPS`
+directly and prints its own `registry_keys`/`report_keys` as JSON — the
+SAME "run the real, compiled tool, never a regex over source" posture
+`ci/tools/symbol-index` already established for `check_plan_citations.py`/
+`check_no_consumer_names.py` (this repo's own recorded lesson: "regex
+readers over YAML/Rust lost five audits"). `JAMMI_EAGER_DISABLE_OP_KEYS`'s
+own live set is `PROBED_OPS`'s registry keys MINUS
+`KNOWN_NON_STANDALONE_REGISTRY_KEYS` (the dtype-branching cast-boundary
+rows, reached only through `jammi-kernels`'s own internal
+`admit_cast_boundary` wrapper, never a standalone call site any sweep
+config could disable directly) — a set-equality assertion, never a subset
+check either direction, in `test_declared_set_equals_the_live_standalone_registry_key_set`.
 
-Two shapes that match `_CALL_RE` textually are excluded from the scan
-before the balanced-paren extraction above ever runs, because neither can
-be a call to `crates/jammi-kernels/src/admission.rs`'s own `admit`/
-`admit_cascade`/`op_disabled`:
+B2's own concern — "an unresolved call site must never read identically to
+'no call exists here'" — is answered differently now than it was by the
+retired text scan, but not abandoned. Precisely what the compiler proves, stated on its own: `admit`/`admit_cascade`'s
+own `pub fn` signature (`crates/jammi-kernels/src/admission.rs`) requires
+a `&'static jammi_kernels::admission::ProbedOp` argument, and that type is
+sealed against every OTHER crate by two separate compiler mechanisms:
+`#[non_exhaustive]` refuses struct-literal CONSTRUCTION from outside the
+crate (`error[E0639]: cannot create non-exhaustive struct using struct
+expression`), and every field being `pub(crate)`, not `pub`, refuses field
+ASSIGNMENT on a value already held from outside the crate, including a
+`Copy` of a real `PROBED_OPS` row (`error[E0616]: field `report_key` of
+struct `ProbedOp` is private`). So on every `cargo build` a call site
+OUTSIDE `jammi-kernels` cannot pass anything but one of `PROBED_OPS`'s own
+named consts. Neither mechanism has any effect INSIDE the defining crate:
+a same-crate forgery in `jammi-kernels` itself is syntactically possible
+and is NOT sealed — and nothing needs it to be, because no durable
+artifact (no `DefinitionHash`, see
+`jammi_db::store::manifest::MaterializationEnv::kernel_admission_profile`'s
+own doc) folds a `ProbedOp` row's admission outcome in; a same-crate
+forgery has no downstream property to violate. This script and
+`ci/tools/probed-ops-index` enumerate the TABLE's rows, which is exactly
+what they claim. Separately, this
+script still checks NON-VACUITY: that real
+`admit`/`admit_cascade` call sites genuinely exist under the scan roots at
+all (`admit_call_sites`, via
+`ci/tools/symbol-index`'s real `syn` parse — never a regex — filtered to
+non-test call sites by callee name) — a scan root silently returning zero
+hits (a typo'd path, a directory that stopped existing) is the failure mode
+this residual check still catches; WHICH op each site passes needs no
+further verification, because the type system already did it.
 
-* A **definition** — the matched name immediately preceded (ignoring
-  whitespace) by the `fn` keyword, e.g. `pub fn admit(&self, spec:
-  &TrainingSpec)`. `admission.rs`'s three functions are the only
-  definitions of these names this scan's own premise depends on
-  (`AdmissionRsFreeFunctionPremiseTests` below grounds that premise
-  mechanically); any OTHER type is free to define its own method sharing
-  one of these names, and that method's signature line is not a call
-  site.
-* A **method call** — the matched name immediately preceded (ignoring
-  whitespace) by `.`, e.g. `RankAdmission::new().admit(spec)`. Every name
-  this scan looks for is a FREE function in `admission.rs` (same premise
-  as above), and a free function can never be invoked with receiver-dot
-  syntax — that stays true regardless of whether some OTHER type defines
-  its own method sharing the name (`TrainingSpec`'s own `admit` does), so
-  `.admit(`/`.admit_cascade(`/`.op_disabled(` can never resolve to a call
-  of `admission.rs`'s free functions specifically — excluding it is not a
-  widening of what this scan misses, it is narrowing the scan to calls the
-  excluded syntax cannot possibly be. A bare, undotted
-  `admit(...)`/`admit_cascade(...)`/`op_disabled(...)` call is unaffected
-  and, if its op-key argument is not a literal, is still reported
-  unresolved exactly as before.
-
-SCAN ROOTS: `crates/jammi-encoders/src/`, `crates/jammi-lora/src/`,
-`crates/jammi-ai/src/fine_tune/` — every `crates/jammi-bench/src/
-finetune_step.rs`-adjacent crate a live standalone `admit`/`admit_cascade`/
-`op_disabled` call for THIS constant's own purpose can appear in.
-
-SCOPE, DELIBERATELY NOT `crates/jammi-kernels/src/` (corrected rationale,
-round-2 audit fix (e) — the audit verified the OPERATIVE reason
-empirically, and it is NOT primarily the cast-wrapper shape below, which
-this scanner now handles correctly regardless): `admission.rs` itself (in
-that crate) is the DEFINITION site of `admit`/`admit_cascade`/
-`op_disabled`, and its own substantial `#[cfg(test)] mod tests` block unit
--tests the ADMISSION MACHINERY directly with dozens of literal, PURELY
-SYNTHETIC op-key strings that name nothing real at all (e.g.
-`"lattice_cell_03_real_admit_warn_op"`) — a scan of that crate is
-therefore dominated by test-fixture noise this constant has no interest
-in, regardless of how precisely the `#[cfg(test)]` heuristic resolves it.
-Secondarily (now correctly handled, never an excuse to skip the crate
-outright, just a genuinely-out-of-reach case even with a perfect scanner):
-the SUBSUMED `cast_scale_bf16_f32`/`cast_add_bf16` keys live there too,
-behind `ops/low_rank_residual_linear.rs`'s `admit_cast_boundary` wrapper,
-whose OWN internal `admit(mode, op, ...)` call passes a *variable* `op` —
-this scan correctly reports that as UNRESOLVED (never mis-attributes it to
-some unrelated literal), which is exactly why it is not, and never can be,
-a reason this scan needs to include that crate: nothing resolvable lives
-there for THIS constant's purpose. `JAMMI_EAGER_DISABLE_OP_KEYS` must
-never name either of those two directly regardless (see the constant's own
-"NOT lora_epilogue/lora_dropout/cast_scale_bf16_f32/cast_add_bf16"
-bullet) — verified MANUALLY against `crates/jammi-kernels/src/
-admission.rs`'s own module doc (the authoritative reachability
-classification) each time this constant changes, the documented
-manual-sweep protocol this mechanical test's own doc names as its
-complement, not a substitute for it.
-
-Stdlib-only, no network, no build — reads tracked source text only, same
-footing `test_identity_fields_subset.py`'s own Rust-const extraction takes.
+Not stdlib-only anymore (an intentional, documented departure from an
+earlier revision's own "no build" boast): `probed_ops_registry_keys` and
+`admit_call_sites` both shell out to a real `cargo run --release`, exactly
+as `ci/tools/symbol-index`'s own established callers already do.
 
 Run: `python3 ci/scripts/perf/test_finetune_ab_disable_op_keys.py`
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import subprocess
 import tempfile
 import unittest
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 FINETUNE_AB_SH = os.path.join(REPO_ROOT, "ci", "scripts", "perf", "finetune_ab.sh")
 
-# The three crates this scan covers -- see this module's own "SCOPE"
-# section for why `jammi-kernels` is deliberately excluded.
+PROBED_OPS_INDEX_CRATE = "probed-ops-index"
+SYMBOL_INDEX_CRATE = "symbol-index"
+
+# The three crates a live standalone `admit`/`admit_cascade` call site for
+# `JAMMI_EAGER_DISABLE_OP_KEYS`'s own purpose can appear in — deliberately
+# NOT `crates/jammi-kernels/src` (that crate is `admit`/`admit_cascade`'s
+# own DEFINITION site, and the dtype-branching cast-boundary wrapper that
+# makes `cast_scale_bf16_f32`/`cast_scale_f16_f32`/`cast_add_bf16`/
+# `cast_add_f16` non-standalone lives there too — see
+# `KNOWN_NON_STANDALONE_REGISTRY_KEYS`'s own doc). Paths are REPO-ROOT-
+# RELATIVE (not absolute): `symbol-index`'s own CLI takes root directories
+# resolved against its own `cwd`, and `admit_call_sites` runs it with
+# `cwd=REPO_ROOT` — matching `check_no_consumer_names.py::build_symbol_index`'s
+# own established calling convention exactly.
 _SCAN_ROOTS = (
-    os.path.join(REPO_ROOT, "crates", "jammi-encoders", "src"),
-    os.path.join(REPO_ROOT, "crates", "jammi-lora", "src"),
-    os.path.join(REPO_ROOT, "crates", "jammi-ai", "src", "fine_tune"),
+    "crates/jammi-encoders/src",
+    "crates/jammi-lora/src",
+    "crates/jammi-ai/src/fine_tune",
 )
 
-_CALL_RE = re.compile(r"\b(admit|admit_cascade|op_disabled)\s*\(")
-_CFG_TEST_RE = re.compile(r"#\[cfg\(test\)\]")
-_COMMENT_LINE_RE = re.compile(r"^[ \t]*//")
-_LITERAL_ARG_RE = re.compile(r'^"([a-z0-9_]+)"$')
-
-# A `fn <name>(` DEFINITION -- any whitespace, with `pub`, `pub(crate)`,
-# `async`, `unsafe`, `const` (any order, any subset) preceding `fn` itself;
-# none of those qualifiers are checked directly because they sit BEFORE
-# `fn`, never adjacent to `<name>(`, so matching `fn\s*$` immediately
-# before the matched name already admits every qualified form.
-_DEFINITION_PREFIX_RE = re.compile(r"\bfn\s*$")
-# A `.<name>(` METHOD CALL -- the matched name immediately preceded
-# (ignoring whitespace) by `.`. See this module's own METHOD doc for why
-# this can never be a call to the scanned free functions.
-_METHOD_CALL_PREFIX_RE = re.compile(r"\.\s*$")
-
-
-def _is_definition_site(text, start):
-    """True if the `_CALL_RE` match starting at `start` is a `fn <name>(`
-    definition rather than a call -- see this module's own METHOD doc."""
-    return bool(_DEFINITION_PREFIX_RE.search(text[:start]))
-
-
-def _is_method_call_site(text, start):
-    """True if the `_CALL_RE` match starting at `start` is `.<name>(`
-    method-call syntax -- see this module's own METHOD doc for why this
-    can never invoke a free function."""
-    return bool(_METHOD_CALL_PREFIX_RE.search(text[:start]))
-
-# The op-key argument's own FIXED position in each call's argument list --
-# read directly off `admission.rs`'s own `pub fn` signatures
-# (`op_disabled(op: &'static str)`, `admit(mode, op, predicate_name,
-# predicate_holds, counters)`, `admit_cascade(mode, op, predicate_name,
-# outcome, next_arm_can_run, counters)`), never inferred from "the first
-# quoted string in the call" -- see this module's own doc for why that
-# weaker rule mis-reads a literal PREDICATE as an op key the moment the op
-# argument itself is a variable.
-_OP_ARG_INDEX = {"admit": 1, "admit_cascade": 1, "op_disabled": 0}
-
-# Registered-but-non-standalone op keys: NEVER expected to appear in this
-# scan's own discovered set (they live behind a wrapper in
-# `crates/jammi-kernels/src/`, out of scope by design — see module doc),
-# and NEVER legitimate members of `JAMMI_EAGER_DISABLE_OP_KEYS` either
-# (naming any of them aborts a real run — see that constant's own doc).
-# Verified against `crates/jammi-kernels/src/admission.rs`'s own module
-# doc, not derived mechanically — the manual half of this sweep.
-KNOWN_NON_STANDALONE_KEYS = frozenset(
-    {"lora_epilogue", "lora_dropout", "cast_scale_bf16_f32", "cast_add_bf16"}
+# Registered `PROBED_OPS` registry keys that are real rows (checked
+# mechanically below, never assumed) but never reached by a STANDALONE
+# `admit`/`admit_cascade` call site any `finetune_ab.sh` sweep config could
+# disable directly: the dtype-branching `cast_scale`/`cast_add` rows are
+# only ever reached through `crates/jammi-kernels/src/ops/
+# low_rank_residual_linear.rs`'s own `admit_cast_boundary` wrapper (inside
+# `crates/jammi-kernels/src`, outside `_SCAN_ROOTS` by design), whose OWN
+# internal `admit(mode, op, ...)` call passes a *variable* `op`, never a
+# literal — verified against `crates/jammi-kernels/src/admission.rs`'s own
+# module doc (the authoritative reachability classification for every
+# `PROBED_OPS` row) each time this constant changes, the manual half of
+# this sweep its own module doc calls its complement, never a substitute.
+KNOWN_NON_STANDALONE_REGISTRY_KEYS = frozenset(
+    {"cast_scale_bf16_f32", "cast_scale_f16_f32", "cast_add_bf16", "cast_add_f16"}
 )
 
+# Registered-but-DEAD registry keys from an earlier `lora_linear.rs`
+# registry generation that were never promoted to a `PROBED_OPS` row at
+# all — no `admit()`/`admit_cascade()` call site anywhere in the workspace
+# ever passed either, in ANY crate, past or present. Named here purely so
+# `JAMMI_EAGER_DISABLE_OP_KEYS` never accidentally re-adds either; checked
+# mechanically (`test_known_dead_registry_keys_are_not_probed_ops_entries`)
+# in the OPPOSITE direction from `KNOWN_NON_STANDALONE_REGISTRY_KEYS` above
+# (these must be ABSENT from `PROBED_OPS`'s own registry set, not merely
+# present-but-unreachable) — a real row appearing for either would be
+# exactly as much a drift as a stale entry in the non-standalone set.
+KNOWN_DEAD_REGISTRY_KEYS = frozenset({"lora_epilogue", "lora_dropout"})
 
-def _strip_comment_lines(text):
-    """Blanks (never deletes -- LINE NUMBERS must stay stable for
-    `path:line` reporting) every line whose trimmed content starts with
-    `//` — plain line comments, `///` doc comments, and `//!` inner doc
-    comments uniformly (Rust's `//` is a strict prefix of both doc-comment
-    spellings, so one check covers all three). Applied BEFORE both the
-    call-site scan and the `#[cfg(test)]` span scan below, so a comment
-    that merely MENTIONS either "admit(...)" or "#[cfg(test)]" as prose
-    can never be mistaken for the real thing by either pass — see this
-    module's own doc for concrete examples of both failure modes this
-    fixes.
+
+def _run_cargo_tool(crate, extra_args=()):
+    """Runs `cargo run --release -p <crate> [-- extra_args]` from
+    `REPO_ROOT` and returns its parsed stdout JSON. Shared by
+    `probed_ops_registry_keys` and `admit_call_sites` below — one
+    "run the real compiled tool, never a regex" invocation, not two
+    independently-drifting copies.
     """
-    return "\n".join("" if _COMMENT_LINE_RE.match(line) else line for line in text.split("\n"))
+    cmd = ["cargo", "run", "--release", "-p", crate]
+    if extra_args:
+        cmd += ["--", *extra_args]
+    proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"{crate} failed (rc={proc.returncode}) with args {list(extra_args)}:\n"
+            f"{proc.stderr.strip()[-4000:]}"
+        )
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"{crate} did not emit valid JSON on stdout ({exc}); stderr tail:\n"
+            f"{proc.stderr.strip()[-2000:]}"
+        ) from exc
 
 
-def _balanced_span(text, open_idx, open_char, close_char):
-    """The end index (EXCLUSIVE) of the balanced-bracket span opened by
-    `text[open_idx] == open_char` — shared brace/paren-balancing core for
-    both the call-body extractor and the `#[cfg(test)]` span finder below,
-    so the two never independently drift on the SAME "count opens, count
-    closes" logic.
+def probed_ops_registry_keys():
+    """The real, live `PROBED_OPS` registry-key set — `ci/tools/
+    probed-ops-index`'s own dump of `jammi_kernels::admission::PROBED_OPS`,
+    never a text scan. See this module's own doc for why a text scan can
+    no longer read this set at all (#546's typed-op migration).
     """
-    depth = 1
-    i = open_idx + 1
-    n = len(text)
-    while i < n and depth > 0:
-        if text[i] == open_char:
-            depth += 1
-        elif text[i] == close_char:
-            depth -= 1
-        i += 1
-    return i
+    data = _run_cargo_tool(PROBED_OPS_INDEX_CRATE)
+    return set(data["registry_keys"])
 
 
-def _find_call_body(text, open_paren_idx):
-    """Text strictly between a call's own opening `(` (at `open_paren_idx`)
-    and its MATCHING closing `)` -- a balanced-paren scan, not a fixed
-    lookahead window, so a call whose own body has no string literal never
-    accidentally absorbs an unrelated literal from LATER, unrelated code
-    (the exact false positive an earlier "next 400 chars" heuristic hit
-    against `admit_cast_boundary`'s own wrapper body).
+def admit_call_sites(roots):
+    """Every non-test `admit`/`admit_cascade` call site `ci/tools/
+    symbol-index`'s real `syn` parse finds under `roots` — `(path, line)`
+    pairs, sorted. A NON-VACUITY check only (see this module's own doc):
+    WHICH `PROBED_OPS` const each site passes needs no verification here,
+    because `admit`/`admit_cascade`'s own `pub fn` signature already
+    forces it, compiler-side, on every `cargo build`.
     """
-    end = _balanced_span(text, open_paren_idx, "(", ")")
-    return text[open_paren_idx + 1 : end - 1]
-
-
-def _split_top_level_args(body):
-    """Splits a call's own argument-list text on TOP-LEVEL commas only --
-    a comma inside a nested call's own parens (`counters_for(op)`), a
-    nested `[...]`/`{...}`, or inside a string literal, must never split
-    an argument in two. Returns a list of TRIMMED argument strings, in
-    order -- `_OP_ARG_INDEX` then indexes directly into this list.
-    """
-    args = []
-    depth = 0
-    current = []
-    i = 0
-    n = len(body)
-    while i < n:
-        c = body[i]
-        if c == '"':
-            current.append(c)
-            i += 1
-            while i < n and body[i] != '"':
-                if body[i] == "\\" and i + 1 < n:
-                    current.append(body[i])
-                    i += 1
-                current.append(body[i])
-                i += 1
-            if i < n:
-                current.append(body[i])
-                i += 1
-            continue
-        if c in "([{":
-            depth += 1
-            current.append(c)
-            i += 1
-            continue
-        if c in ")]}":
-            depth -= 1
-            current.append(c)
-            i += 1
-            continue
-        if c == "," and depth == 0:
-            args.append("".join(current))
-            current = []
-            i += 1
-            continue
-        current.append(c)
-        i += 1
-    tail = "".join(current)
-    # A trailing comma before the closing paren (this codebase's own
-    # rustfmt multi-line-call convention, e.g. `admit_cascade(...,
-    # cascade_counters_for(...),\n)`) leaves `tail` empty/whitespace-only
-    # here — dropped, never appended as a spurious final "argument".
-    if tail.strip():
-        args.append(tail)
-    return [a.strip() for a in args]
-
-
-def _cfg_test_module_spans(text):
-    """`(start, end)` spans (character offsets into `text`, `end`
-    EXCLUSIVE) of every `#[cfg(test)]`-attributed item — `text` MUST
-    already be comment-stripped (see `_strip_comment_lines`) or a doc
-    comment merely naming "#[cfg(test)]" as prose will be mistaken for a
-    real attribute, whose "next `{`" then belongs to some ARBITRARY later
-    item, silently swallowing real production code into a bogus "test"
-    span (the exact failure this ordering — comment-strip, THEN span-scan
-    — exists to prevent; reproduced during this fix's own development
-    against `crates/jammi-encoders/src/modernbert.rs`'s own doc-comment
-    mentions of `#[cfg(test)]` at lines 2571/2582/2748, which — un-fixed —
-    swallowed the REAL production `op_disabled("mem_efficient_attention")`
-    call at that file's line 2872 into a phantom "test" span).
-
-    A CHEAP brace/attr heuristic, documented rather than hardened further
-    (round-2 audit fix (a)): finds the FIRST `{` after each `#[cfg(test)]`
-    attribute (the attributed item's own opening brace — correct for this
-    codebase's own `#[cfg(test)] mod tests { ... }` / `#[cfg(test)] fn ...
-    { ... }` conventions, both of which have exactly one such brace
-    immediately reachable) and balances FROM THERE to that item's own
-    close via `_balanced_span`.
-    """
-    spans = []
-    for match in _CFG_TEST_RE.finditer(text):
-        brace_idx = text.find("{", match.end())
-        if brace_idx == -1:
-            continue
-        end = _balanced_span(text, brace_idx, "{", "}")
-        spans.append((match.start(), end))
-    return spans
-
-
-def _in_any_span(pos, spans):
-    return any(start <= pos < end for start, end in spans)
-
-
-def discover_live_standalone_op_keys(roots):
-    """The mechanical sweep itself. Returns `(keys, unresolved_sites)`:
-
-      * `keys` — a `set[str]`, every op-key LITERAL successfully resolved
-        from the OP-KEY ARGUMENT'S OWN POSITION (see this module's own
-        METHOD doc) of a real `admit(`/`admit_cascade(`/`op_disabled(`
-        call, outside any `#[cfg(test)]` span, anywhere under `roots`.
-        A `fn <name>(` definition and a `.<name>(` method call are excluded
-        before this position-reading step runs at all (see this module's
-        own METHOD doc) — neither can be a call to `admission.rs`'s free
-        functions of those names. Multiplicity is not itself meaningful
-        (the SAME op key named at several sites collapses to one set
-        member), so this is never a list.
-      * `unresolved_sites` — a `list[str]`, one `"path:line: <call
-        text>"` entry per call whose OWN op-key-position argument is NOT
-        a bare double-quoted literal (a variable, a `const` reference, an
-        expression) — B2's own fix: NEVER silently dropped, NEVER
-        mis-attributed to some OTHER literal elsewhere in the call. Sorted
-        for deterministic output. A NON-EMPTY list here means this scan
-        found something it could not classify — `RealSourceParityTests`
-        REDs on that, loudly, rather than silently under-counting
-        `keys`.
-    """
-    keys = set()
-    unresolved = []
-    for root in roots:
-        for dirpath, _dirnames, filenames in os.walk(root):
-            for filename in filenames:
-                if not filename.endswith(".rs"):
-                    continue
-                path = os.path.join(dirpath, filename)
-                with open(path, encoding="utf-8") as fh:
-                    raw_text = fh.read()
-                text = _strip_comment_lines(raw_text)
-                test_spans = _cfg_test_module_spans(text)
-                for match in _CALL_RE.finditer(text):
-                    if _in_any_span(match.start(), test_spans):
-                        continue
-                    if _is_definition_site(text, match.start()) or _is_method_call_site(
-                        text, match.start()
-                    ):
-                        continue
-                    call_kind = match.group(1)
-                    open_idx = text.index("(", match.start())
-                    body = _find_call_body(text, open_idx)
-                    args = _split_top_level_args(body)
-                    op_index = _OP_ARG_INDEX[call_kind]
-                    literal_match = None
-                    if op_index < len(args):
-                        literal_match = _LITERAL_ARG_RE.match(args[op_index])
-                    if literal_match:
-                        keys.add(literal_match.group(1))
-                    else:
-                        lineno = text[: match.start()].count("\n") + 1
-                        call_text = text[match.start() : open_idx + 1] + body[:60]
-                        unresolved.append(f"{os.path.relpath(path, REPO_ROOT)}:{lineno}: {call_text}")
-    return keys, sorted(unresolved)
+    index = _run_cargo_tool(SYMBOL_INDEX_CRATE, roots)
+    return sorted(
+        (call["path"], call["line"])
+        for call in index["calls"]
+        if call["callee"] in ("admit", "admit_cascade") and not call.get("in_test", False)
+    )
 
 
 def parse_jammi_eager_disable_op_keys(finetune_ab_sh_path):
     """Extracts the CURRENT `JAMMI_EAGER_DISABLE_OP_KEYS="..."` literal
     from `finetune_ab.sh` — the real source, never a hand-copied literal
-    this test could itself drift from.
+    this test could itself drift from. Unaffected by #546's typed-op
+    migration (this is a bash constant, not a Rust call site) — kept
+    exactly as it was.
     """
     with open(finetune_ab_sh_path, encoding="utf-8") as fh:
         text = fh.read()
@@ -427,370 +216,91 @@ def parse_jammi_eager_disable_op_keys(finetune_ab_sh_path):
     return [key for key in match.group(1).split(",") if key]
 
 
-class DiscoverLiveStandaloneOpKeysTests(unittest.TestCase):
-    """Unit coverage of the scanner itself, against SYNTHETIC throwaway
-    fixtures — the same "prove the checker actually bites" posture
-    `check_producer_provenance_gates.py --self-test` already takes for its
-    own gates, applied here to prove a TENTH addition, a wrapper-passed
-    variable, a mis-positioned literal, a doc-comment mention, and a
-    `#[cfg(test)]` site are ALL handled correctly BEFORE trusting this
-    scanner against the real crates.
+class ParseJammiEagerDisableOpKeysTests(unittest.TestCase):
+    """Unit coverage of the one text-extraction this script still performs
+    (a bash literal, not a Rust call site — #546's typed-op migration does
+    not touch this).
     """
 
-    def test_finds_a_direct_literal_admit_call(self):
+    def test_extracts_the_literal_from_a_synthetic_fixture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "finetune_ab.sh")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('JAMMI_EAGER_DISABLE_OP_KEYS="a_key,b_key,c_key"\n')
+            self.assertEqual(
+                parse_jammi_eager_disable_op_keys(path), ["a_key", "b_key", "c_key"]
+            )
+
+    def test_a_missing_assignment_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "finetune_ab.sh")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("# no assignment here at all\n")
+            with self.assertRaises(SystemExit):
+                parse_jammi_eager_disable_op_keys(path)
+
+
+class AdmitCallSitesTests(unittest.TestCase):
+    """Proves `admit_call_sites` genuinely finds a real, non-test call site
+    and genuinely excludes a `#[cfg(test)]`-scoped one — against the REAL,
+    compiled `symbol-index` tool over a synthetic fixture tree (the same
+    "RED->GREEN shape against the real compiled tool" posture
+    `check_plan_citations.py`'s own symbol-index self-tests take), never a
+    mock of its output.
+    """
+
+    def test_a_real_admit_call_is_found_and_a_test_only_one_is_excluded(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "fake.rs")
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(
-                    'let outcome = admit(admission_mode(), "brand_new_fused_op", predicate, holds, counters)?;\n'
-                )
-            keys, unresolved = discover_live_standalone_op_keys([tmp])
-            self.assertEqual(keys, {"brand_new_fused_op"})
-            self.assertEqual(unresolved, [])
-
-    def test_finds_an_admit_cascade_call(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "fake.rs")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(
-                    'let d = admit_cascade(admission_mode(), "a_tenth_cascade_op", reason, outcome, true, counters)?;\n'
-                )
-            keys, unresolved = discover_live_standalone_op_keys([tmp])
-            self.assertEqual(keys, {"a_tenth_cascade_op"})
-            self.assertEqual(unresolved, [])
-
-    def test_finds_an_op_disabled_call(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "fake.rs")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write('let will_fire = !op_disabled("an_eleventh_gate");\n')
-            keys, unresolved = discover_live_standalone_op_keys([tmp])
-            self.assertEqual(keys, {"an_eleventh_gate"})
-            self.assertEqual(unresolved, [])
-
-    def test_a_wrapper_call_passing_a_variable_op_argument_is_unresolved_not_silently_dropped(self):
-        """B2's own reproduction: the `admit_cast_boundary`-shaped case —
-        the wrapper's OWN `admit(mode, op, ...)` call passes a *variable*
-        `op` at the op-key POSITION. An earlier version of this scanner
-        silently resolved this to NOTHING (an empty set, no report at
-        all) — indistinguishable from "no call exists here". This must
-        now be a REPORTED unresolved site, never silently blessed as
-        "nothing found here".
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "fake.rs")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(
-                    "fn admit_cast_boundary(op: &'static str, predicate_name: &'static str) -> Result<DispatchOutcome> {\n"
-                    "    admit(admission_mode(), op, predicate_name, true, counters_for(op))\n"
+                    "fn real_call_site(mode: AdmissionMode, op: &'static ProbedOp) {\n"
+                    "    let _ = admit(mode, op, \"a_predicate\", true, counters);\n"
                     "}\n"
-                    "\n"
-                    'const UNRELATED_LATER_STRING: &str = "cast_scale_bf16_f32";\n'
-                )
-            keys, unresolved = discover_live_standalone_op_keys([tmp])
-            # The later, unrelated `"cast_scale_bf16_f32"` string must
-            # never be absorbed into this call, in EITHER direction.
-            self.assertEqual(keys, set())
-            self.assertEqual(len(unresolved), 1)
-            self.assertIn("fake.rs:2", unresolved[0])
-
-    def test_a_literal_predicate_with_a_variable_op_argument_is_unresolved_not_misread(self):
-        """B2 fix (b): the `admission.rs:1881` shape — `admit(mode, op,
-        "a_literal_predicate_name", holds, counters)` with a *variable*
-        `op`. The call's OWN first quoted string sits at the PREDICATE
-        position, not the op-key position — reading it off as if it were
-        the op key would manufacture a bogus discovered key from
-        unrelated text. This must resolve to UNRESOLVED, and
-        "a_literal_predicate_name" must NEVER appear in `keys`.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "fake.rs")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(
-                    "let op = \"lattice_cell_03_real_admit_warn_op\";\n"
-                    "let outcome = admit(\n"
-                    "    AdmissionMode::Fallback,\n"
-                    "    op,\n"
-                    '    "a_literal_predicate_name",\n'
-                    "    false,\n"
-                    "    &counters,\n"
-                    ").expect(\"Fallback mode never errors\");\n"
-                )
-            keys, unresolved = discover_live_standalone_op_keys([tmp])
-            self.assertNotIn("a_literal_predicate_name", keys)
-            self.assertNotIn("lattice_cell_03_real_admit_warn_op", keys)
-            self.assertEqual(keys, set())
-            self.assertEqual(len(unresolved), 1)
-
-    def test_a_named_const_at_the_op_position_is_unresolved(self):
-        """The audit's own const-OP fixture, verbatim: a named constant
-        reference (not a bare literal) at the op-key position is exactly
-        as unresolvable to this scanner as a plain local variable — a
-        `const` name is an IDENTIFIER at the call site, not a literal
-        this scan can read without constant-folding, which is
-        deliberately out of scope for a cheap mechanical sweep.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "fake.rs")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(
-                    'const OP: &str = "a_synthetic_fused_op";\n'
-                    "let outcome = admit(admission_mode(), OP, \"some_predicate\", holds, counters)?;\n"
-                )
-            keys, unresolved = discover_live_standalone_op_keys([tmp])
-            self.assertEqual(keys, set())
-            self.assertEqual(len(unresolved), 1)
-            self.assertIn("fake.rs:2", unresolved[0])
-
-    def test_a_call_site_named_twice_in_the_same_file_deduplicates(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "fake.rs")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(
-                    'let a = admit(mode, "same_op", pred, holds, c1)?;\n'
-                    'let b = admit(mode, "same_op", pred2, holds2, c2);\n'
-                )
-            keys, unresolved = discover_live_standalone_op_keys([tmp])
-            self.assertEqual(keys, {"same_op"})
-            self.assertEqual(unresolved, [])
-
-    def test_cfg_test_module_is_excluded_entirely(self):
-        """B2 fix (a): a REAL, syntactically-valid call inside a
-        `#[cfg(test)] mod tests { ... }` block is excluded from the scan
-        entirely — neither counted toward `keys` (even a NEW key named
-        only in a test cell must not silently satisfy this constant) nor
-        reported as `unresolved` (it is not a site this constant's own
-        sweep cares about at all, not a site this scan failed to
-        classify).
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "fake.rs")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(
-                    'let a = admit(mode, "real_prod_op", pred, holds, c1)?;\n'
                     "\n"
                     "#[cfg(test)]\n"
                     "mod tests {\n"
                     "    #[test]\n"
                     "    fn some_test() {\n"
-                    '        let b = admit(mode, "test_only_op_never_a_real_key", pred2, holds2, c2);\n'
-                    "        let op_var = compute_op();\n"
-                    '        let c = admit(mode, op_var, "another_predicate", holds3, c3);\n'
+                    "        let _ = admit_cascade(mode, op, \"pred\", outcome, true, counters);\n"
                     "    }\n"
                     "}\n"
                 )
-            keys, unresolved = discover_live_standalone_op_keys([tmp])
-            self.assertEqual(keys, {"real_prod_op"})
-            self.assertNotIn("test_only_op_never_a_real_key", keys)
-            self.assertEqual(unresolved, [])
+            sites = admit_call_sites([tmp])
+            self.assertEqual(len(sites), 1, sites)
+            self.assertTrue(sites[0][0].endswith("fake.rs"), sites[0])
+            self.assertEqual(sites[0][1], 2)
 
-    def test_a_doc_comment_mentioning_admit_as_prose_is_never_a_call_site(self):
-        """B2 fix (c): the `modernbert.rs:1460` shape — a `///` doc
-        comment mentioning `op_disabled("some_op")` as PROSE describing
-        what a DIFFERENT real call site does, never a call itself.
-        """
+    def test_an_empty_root_finds_nothing_not_an_error(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "fake.rs")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(
-                    "/// This function consults `op_disabled(\"phantom_op_from_prose\")`\n"
-                    "/// before doing anything real.\n"
-                    "//! Another mention: admit(\"also_phantom\") never runs here either.\n"
-                    "// A plain comment mentioning admit() too -- never a real call.\n"
-                    "fn real_function() -> bool { true }\n"
-                )
-            keys, unresolved = discover_live_standalone_op_keys([tmp])
-            self.assertEqual(keys, set())
-            self.assertEqual(unresolved, [])
-
-    def test_a_doc_comment_mentioning_cfg_test_as_prose_never_swallows_real_code(self):
-        """The companion to the previous test, for the `#[cfg(test)]` span
-        finder specifically — a doc comment merely NAMING "#[cfg(test)]"
-        (describing where some OTHER real test lives) must never be
-        mistaken for a real attribute, which would otherwise swallow
-        whatever REAL code follows into a bogus "test" span (reproduced
-        during this fix's own development against
-        `crates/jammi-encoders/src/modernbert.rs`'s own doc comments at
-        lines 2571/2582/2748, which — before comment-stripping ran BEFORE
-        span-scanning — silently excluded the real production
-        `op_disabled("mem_efficient_attention")` call at that file's line
-        2872).
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "fake.rs")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(
-                    "/// See this module's own `#[cfg(test)]` harness for the full proof.\n"
-                    "fn unrelated_helper() {}\n"
-                    "\n"
-                    "fn real_production_site() {\n"
-                    '    let outcome = op_disabled("real_prod_op_after_the_doc_mention");\n'
-                    "}\n"
-                )
-            keys, unresolved = discover_live_standalone_op_keys([tmp])
-            self.assertEqual(keys, {"real_prod_op_after_the_doc_mention"})
-            self.assertEqual(unresolved, [])
-
-    def test_a_fn_definition_shaped_like_a_call_is_never_a_call_site(self):
-        """The shape `crates/jammi-ai/src/fine_tune/spec.rs`'s own `TrainingSpec::admit`
-        method carries: `pub fn admit(&self, spec: &TrainingSpec) -> Result<()> {` is a
-        METHOD DEFINITION on `TrainingSpec` (or any other type), not a call to
-        `admission.rs`'s free `admit` — `_CALL_RE` matches its signature
-        textually, but a definition is never a call site. The real, later
-        free-function call in the same file must still resolve normally."""
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "fake.rs")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(
-                    "impl TrainingSpec {\n"
-                    "    pub fn admit(&self, spec: &TrainingSpec) -> Result<()> {\n"
-                    "        Ok(())\n"
-                    "    }\n"
-                    "}\n"
-                    "\n"
-                    'let outcome = admit(mode, "def_shape_real_op", pred, holds, counters)?;\n'
-                )
-            keys, unresolved = discover_live_standalone_op_keys([tmp])
-            self.assertEqual(keys, {"def_shape_real_op"})
-            self.assertEqual(unresolved, [])
-
-    def test_a_qualified_fn_definition_is_also_never_a_call_site(self):
-        """The same exclusion for every qualifier order `fn` can carry in
-        this codebase (`pub`, `pub(crate)`, `async`, `unsafe`, `const`) --
-        none of them sit adjacent to `<name>(`, so the bare `fn\\s*$`
-        lookbehind already covers all of them; this fixture pins that for
-        the two most common shapes."""
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "fake.rs")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(
-                    "pub(crate) async fn admit_cascade(op: &'static str) -> bool {\n"
-                    "    false\n"
-                    "}\n"
-                )
-            keys, unresolved = discover_live_standalone_op_keys([tmp])
-            self.assertEqual(keys, set())
-            self.assertEqual(unresolved, [])
-
-    def test_a_method_call_syntax_is_never_a_call_to_the_free_function(self):
-        """`admit`/`admit_cascade`/`op_disabled` are FREE functions in
-        `crates/jammi-kernels/src/admission.rs`
-        (`AdmissionRsFreeFunctionPremiseTests` below grounds this
-        mechanically, scoped to that one file). A free function can never
-        be invoked with receiver-dot syntax, and that stays true regardless
-        of whether some OTHER type defines its own method sharing one of
-        these names (`TrainingSpec::admit`, this fixture's own premise,
-        does -- with live call sites of its own outside these scan roots),
-        so `.admit(`/`.admit_cascade(`/`.op_disabled(` is provably not a
-        call to `admission.rs`'s free functions specifically -- excluded
-        entirely here, not reported unresolved even though its own
-        argument (`spec`) is a variable."""
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "fake.rs")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write("let r = RankAdmission::from_config(config).admit(spec);\n")
-            keys, unresolved = discover_live_standalone_op_keys([tmp])
-            self.assertEqual(keys, set())
-            self.assertEqual(unresolved, [])
-
-    def test_a_bare_free_call_with_a_variable_op_argument_is_still_unresolved(self):
-        """The honest-universe boundary the previous test must not widen:
-        an UNDOTTED, bare `admit(spec)` -- textually indistinguishable from
-        a real free-function call with too few arguments to resolve its
-        op-key position -- is still reported unresolved. Only the `.`-
-        prefixed method-call SHAPE is excluded, never a free call that
-        merely happens to take a variable argument."""
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "fake.rs")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write("let r = admit(spec);\n")
-            keys, unresolved = discover_live_standalone_op_keys([tmp])
-            self.assertEqual(keys, set())
-            self.assertEqual(len(unresolved), 1)
-            self.assertIn("fake.rs:1", unresolved[0])
-
-
-class AdmissionRsFreeFunctionPremiseTests(unittest.TestCase):
-    """Grounds the premise `DiscoverLiveStandaloneOpKeysTests`'s method-call
-    exclusion (and this module's own METHOD doc) depends on: `admit`,
-    `admit_cascade` and `op_disabled` are each defined EXACTLY ONCE in
-    `crates/jammi-kernels/src/admission.rs`, and each as a TOP-LEVEL
-    (column-0) `pub fn` -- never a method on some `impl` block, anywhere in
-    that file. If a future commit adds a method named one of these three on
-    some `jammi-kernels` type, this test goes RED, because the method-call
-    exclusion above would then silently start skipping a real, in-scope
-    call site rather than a structurally-impossible one."""
-
-    ADMISSION_RS = os.path.join(REPO_ROOT, "crates", "jammi-kernels", "src", "admission.rs")
-
-    #: A top-level (no leading whitespace) `pub fn <name>(` definition line,
-    #: for exactly the three names this scan's exclusion trusts to be free
-    #: functions.
-    _TOP_LEVEL_PUB_FN_RE = {
-        name: re.compile(r"^pub fn " + re.escape(name) + r"\s*\(", re.MULTILINE)
-        for name in ("admit", "admit_cascade", "op_disabled")
-    }
-
-    def setUp(self):
-        with open(self.ADMISSION_RS, encoding="utf-8") as fh:
-            self.text = _strip_comment_lines(fh.read())
-
-    def test_each_scanned_name_is_defined_exactly_once_as_a_top_level_pub_fn(self):
-        for name, pattern in self._TOP_LEVEL_PUB_FN_RE.items():
-            with self.subTest(name=name):
-                matches = pattern.findall(self.text)
-                self.assertEqual(
-                    len(matches),
-                    1,
-                    f"expected exactly one top-level `pub fn {name}(` in {self.ADMISSION_RS}, "
-                    f"found {len(matches)} -- the method-call exclusion in "
-                    "discover_live_standalone_op_keys assumes this name is a free function "
-                    "defined nowhere else",
-                )
-
-    def test_no_method_of_any_scanned_name_exists_in_admission_rs(self):
-        # A method definition of the same name would read `fn <name>(` with
-        # LEADING WHITESPACE (indented inside an `impl` block), never at
-        # column 0. Any such occurrence besides the three top-level
-        # definitions above falsifies the "these are free functions only"
-        # premise.
-        for name in ("admit", "admit_cascade", "op_disabled"):
-            with self.subTest(name=name):
-                indented = re.findall(r"^[ \t]+fn " + re.escape(name) + r"\s*\(", self.text, re.MULTILINE)
-                self.assertEqual(
-                    indented,
-                    [],
-                    f"found an indented (method-shaped) `fn {name}(` in {self.ADMISSION_RS}: "
-                    f"{indented} -- this falsifies the free-function premise the method-call "
-                    "exclusion in discover_live_standalone_op_keys depends on",
-                )
+            self.assertEqual(admit_call_sites([tmp]), [])
 
 
 class RealSourceParityTests(unittest.TestCase):
-    """Drives the REAL sweep against the REAL tracked source — the
+    """Drives the REAL sweep against the REAL, compiled tools — the
     mechanical half of F4's "sweep method" the constant's own comment
-    names. This is the test that catches a TENTH addition (or a stale
-    entry) in CI, and (B2) the test that REDs loudly on any call site this
-    scan could not classify at all.
+    names. This is the test that catches an ELEVENTH addition (or a stale
+    entry) in CI.
     """
 
     def setUp(self):
-        self.discovered, self.unresolved = discover_live_standalone_op_keys(_SCAN_ROOTS)
+        self.registry_keys = probed_ops_registry_keys()
         self.declared = parse_jammi_eager_disable_op_keys(FINETUNE_AB_SH)
+        self.admit_call_sites = admit_call_sites(_SCAN_ROOTS)
 
-    def test_no_unresolved_call_sites(self):
-        # B2's own top-level assertion: every real admit/admit_cascade/
-        # op_disabled call this scan finds (outside a #[cfg(test)] span)
-        # in the three scanned crates must resolve its own op-key
-        # argument to a literal. A non-empty list here is a genuine
-        # finding this test surfaces LOUDLY (the file:line of every
-        # unresolved site), never a silent gap in `self.discovered`.
-        self.assertEqual(
-            self.unresolved,
-            [],
-            "unresolved admit()/admit_cascade()/op_disabled() call site(s) -- this scan could "
-            "not read a literal op key from the op-argument position at:\n  "
-            + "\n  ".join(self.unresolved),
+    def test_every_admit_admit_cascade_call_site_is_type_resolved(self):
+        # Non-vacuity: real, syn-derived (never regex-derived) admit()/
+        # admit_cascade() call sites genuinely exist under the scan roots.
+        # WHICH PROBED_OPS const each one passes needs no further check
+        # here — see this module's own doc for why that half is already a
+        # compiler-enforced fact, not a Python-testable one.
+        self.assertGreater(
+            len(self.admit_call_sites),
+            0,
+            "found zero admit()/admit_cascade() call sites under the scan roots via "
+            "symbol-index -- either every fused-op call site was genuinely removed "
+            "(update _SCAN_ROOTS' own doc) or the scan-root paths/symbol-index "
+            "integration broke; investigate before trusting the rest of this suite",
         )
 
     def test_jammi_eager_disable_op_keys_has_exactly_ten_entries(self):
@@ -800,49 +310,61 @@ class RealSourceParityTests(unittest.TestCase):
             f"JAMMI_EAGER_DISABLE_OP_KEYS ({FINETUNE_AB_SH}) must have EXACTLY 10 entries "
             f"(F4 fold-in: the original 8 plus mem_efficient_attention; issue #463 fold-in: "
             f"plus gelu_erf_fused) — a count other than 10 means the constant drifted; "
-            f"re-derive from the real call graph, never bump this number to make the test "
-            f"pass: {sorted(self.declared)}",
+            f"re-derive from PROBED_OPS's own registry, never bump this number to make the "
+            f"test pass: {sorted(self.declared)}",
         )
         self.assertEqual(len(set(self.declared)), 10, "JAMMI_EAGER_DISABLE_OP_KEYS contains a duplicate entry")
 
-    def test_declared_set_equals_the_discovered_live_standalone_set(self):
-        # SET EQUALITY, never a subset check either direction: a key
-        # present in the source but missing from the constant is exactly
-        # the F4 bug this test exists to catch; a key present in the
-        # constant but no longer reachable anywhere in the source is
-        # equally a drift (a call site removed/renamed without updating
-        # this constant).
+    def test_declared_set_equals_the_live_standalone_registry_key_set(self):
+        # SET EQUALITY, never a subset check either direction: a registry
+        # key present in PROBED_OPS but missing from the constant is
+        # exactly the F4 bug this test exists to catch; a key present in
+        # the constant but no longer a PROBED_OPS registry entry at all is
+        # equally a drift.
+        live_standalone = self.registry_keys - KNOWN_NON_STANDALONE_REGISTRY_KEYS
         self.assertEqual(
             set(self.declared),
-            self.discovered,
+            live_standalone,
             "JAMMI_EAGER_DISABLE_OP_KEYS "
-            f"({sorted(self.declared)}) must equal the mechanically-discovered live standalone "
-            f"admit()/admit_cascade()/op_disabled() call-site set ({sorted(self.discovered)}) "
-            "EXACTLY -- see this module's own doc for the sweep method and its "
-            "jammi-kernels/src exclusion",
+            f"({sorted(self.declared)}) must equal PROBED_OPS's own registry-key set minus "
+            f"KNOWN_NON_STANDALONE_REGISTRY_KEYS ({sorted(live_standalone)}) EXACTLY -- see "
+            "this module's own doc for the sweep method",
         )
 
-    def test_known_non_standalone_keys_never_appear_in_the_discovered_set(self):
-        # Non-vacuity anchor: proves the scanner's own `jammi-kernels/src`
-        # exclusion is doing real work, not merely "these four keys happen
-        # to never be grepped for any reason".
-        overlap = self.discovered & KNOWN_NON_STANDALONE_KEYS
+    def test_known_non_standalone_registry_keys_are_real_probed_ops_entries(self):
+        # Non-vacuity anchor: proves KNOWN_NON_STANDALONE_REGISTRY_KEYS
+        # names REAL PROBED_OPS rows this set-equality check is correctly
+        # excluding, not four typo'd strings that happen to never collide
+        # with anything for an unrelated reason.
+        missing = KNOWN_NON_STANDALONE_REGISTRY_KEYS - self.registry_keys
         self.assertFalse(
-            overlap,
-            f"the discovered set unexpectedly contains registered-but-non-standalone "
-            f"key(s) {sorted(overlap)} -- either the scan scope grew to include "
-            "jammi-kernels/src (update this test's own scope reasoning) or one of these "
-            "keys gained a real standalone call site (update admission.rs's own "
-            "classification doc AND this KNOWN_NON_STANDALONE_KEYS set)",
+            missing,
+            f"KNOWN_NON_STANDALONE_REGISTRY_KEYS names key(s) {sorted(missing)} that are NOT "
+            "real PROBED_OPS registry entries -- either a row was renamed/removed (update "
+            "this set) or one of these was never real to begin with",
         )
 
-    def test_known_non_standalone_keys_never_appear_in_the_declared_constant(self):
-        overlap = set(self.declared) & KNOWN_NON_STANDALONE_KEYS
+    def test_known_dead_registry_keys_are_not_probed_ops_entries(self):
+        # The opposite-direction non-vacuity anchor: these two must stay
+        # ABSENT from PROBED_OPS's own registry set. A real row appearing
+        # for either would itself be a drift this test catches.
+        present = KNOWN_DEAD_REGISTRY_KEYS & self.registry_keys
+        self.assertFalse(
+            present,
+            f"KNOWN_DEAD_REGISTRY_KEYS names key(s) {sorted(present)} that ARE now real "
+            "PROBED_OPS registry entries -- one of these gained a real row; update "
+            "JAMMI_EAGER_DISABLE_OP_KEYS and move it out of this set",
+        )
+
+    def test_declared_never_names_a_non_standalone_or_dead_key(self):
+        overlap = set(self.declared) & (
+            KNOWN_NON_STANDALONE_REGISTRY_KEYS | KNOWN_DEAD_REGISTRY_KEYS
+        )
         self.assertFalse(
             overlap,
-            f"JAMMI_EAGER_DISABLE_OP_KEYS names registered-but-non-standalone key(s) "
-            f"{sorted(overlap)} directly -- naming any of these aborts a real run (see the "
-            "constant's own 'NOT lora_epilogue/...' bullet)",
+            f"JAMMI_EAGER_DISABLE_OP_KEYS names registered-but-non-standalone-or-dead "
+            f"key(s) {sorted(overlap)} directly -- naming any of these aborts a real run "
+            "(see JAMMI_EAGER_DISABLE_OP_KEYS's own 'NOT lora_epilogue/...' bullet)",
         )
 
 

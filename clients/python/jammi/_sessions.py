@@ -64,6 +64,24 @@ _session_handles: "weakref.WeakKeyDictionary[object, int]" = (
 # whether the session object itself is still reachable. Removed on
 # `unregister`; NOT removed by garbage collection — that is the whole point
 # (a dropped-without-close session stays visible here).
+#
+# Bounded to `_LEDGER_CAP` entries: a leak DETECTOR must not itself retain an
+# unbounded copy of what it detects (issue #552 item 3 — 5000 sessions
+# dropped without `close()` used to mean 5000 retained entries, forever, for
+# the life of the process). Registering past the cap evicts the OLDEST
+# still-open entry (FIFO by registration order — a plain `dict` already
+# preserves insertion order since 3.7, so no separate ordering structure is
+# needed) rather than growing further. This bounds `open_session_labels()`'s
+# own retrospective view; it does NOT weaken detection for anything that
+# actually uses this module's leak-catching property today: `observe()` (the
+# cookbook leak rail's mechanism — `cookbook/book/tests/conftest.py`) sees
+# every register/unregister EVENT synchronously, as it fires, independent of
+# the ledger's size or the cap — a subscriber watching a bounded window (one
+# test, one pytest session) never needs more than that window holds. Only a
+# caller asking `open_session_labels()` for a running total across a process
+# that has abandoned more than `_LEDGER_CAP` sessions loses visibility into
+# the oldest ones past the cap — a stated, bounded limit, not a silent one.
+_LEDGER_CAP = 4096
 _open_ledger: Dict[int, str] = {}
 
 # Subscribed (on_register, on_unregister) pairs. A plain list under `_lock`;
@@ -84,12 +102,29 @@ def register(session: object, label: str) -> int:
     embedded catalog location, or a remote endpoint) — never derived from
     `session` itself here, so it survives collection in the ledger and in a
     delivered event even after the session object is gone.
+
+    A falsy `label` (issue #552 item 4: `EmbeddedBackend.__init__`'s
+    direct-construction route defaults to `label=""`) is never stored or
+    delivered as `""` — that collapses "unlabeled" (this construction route
+    passed nothing) with "labeled the empty string" (a caller explicitly
+    named an empty target), and a downstream leak report naming `''` reads
+    as a blank rather than as "this session was never given a label". `""`
+    is replaced here, the ONE seam every construction route already passes
+    through, with a non-empty placeholder carrying the session's own type
+    and handle, so `open_session_labels()` and every `observe()` listener
+    always see a printable, non-empty label regardless of which route
+    constructed the session or whether it passed a label at all.
     """
     with _lock:
         handle = next(_handle_counter)
+        if not label:
+            label = f"<unlabeled {type(session).__name__} #{handle}>"
         _live.add(session)
         _session_handles[session] = handle
         _open_ledger[handle] = label
+        if len(_open_ledger) > _LEDGER_CAP:
+            oldest_handle = next(iter(_open_ledger))
+            del _open_ledger[oldest_handle]
         listeners = list(_listeners)
     # Fired OUTSIDE the lock: a listener that itself calls back into this
     # module (e.g. `open_session_labels()`) must not deadlock on `_lock`, and

@@ -91,6 +91,24 @@ fn run_suffix() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
 }
 
+/// Every `file:///artifacts/...` literal this file's tests register funnels
+/// through here so it carries a per-run suffix, exactly as the job id
+/// already does via [`run_suffix`]. `reset_queue`'s own doc explains why:
+/// the Postgres lane shares ONE catalog database across the whole test run
+/// and clears `jobs`/`workers`/`instances` before a test but never
+/// `models` — so a fixed, un-suffixed artifact path lets a LATER run's
+/// freshly-registered model row share an EARLIER run's path even though the
+/// model rows themselves have distinct (suffixed) primary keys.
+/// `count_models_naming_prefix_all_tenants` counts every `models` row
+/// (across every tenant) naming a prefix, so a count asserted against such a
+/// shared path grows every re-run against a reused database instead of
+/// staying pinned to the rows THIS run seeded. Funneling every call site
+/// through one helper — never 16 hand-suffixed literals — means a new
+/// artifact-path literal added later cannot forget the suffix.
+fn artifact_path(run: &str, tail: &str) -> String {
+    format!("file:///artifacts/{run}/{tail}")
+}
+
 /// Register the FK target model `q-base` once per test catalog.
 async fn register_base_model(catalog: &Catalog) {
     catalog
@@ -180,7 +198,7 @@ async fn set_claim_policy(catalog: &Catalog, job_id: &str, priority: i64, claima
 /// dead process leaves behind (nothing heartbeats it any more).
 async fn force_stale_instance(catalog: &Catalog, instance_id: &str, days_ago: i64) {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(days_ago))
-        .format("%Y-%m-%dT%H:%M:%S%.9fZ")
+        .format("%Y-%m-%dT%H:%M:%S%.6fZ")
         .to_string();
     let instance_id = instance_id.to_string();
     catalog
@@ -1304,7 +1322,7 @@ async fn submit_job_deduped_accepts_a_key_exactly_at_the_bound(backend: BackendK
 
 async fn force_job_status_and_age(catalog: &Catalog, job_id: &str, status: &str, days_ago: i64) {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(days_ago))
-        .format("%Y-%m-%dT%H:%M:%S%.9fZ")
+        .format("%Y-%m-%dT%H:%M:%S%.6fZ")
         .to_string();
     let job_id = job_id.to_string();
     let status = status.to_string();
@@ -1363,10 +1381,15 @@ fn job_params_with_output<'a>(job_id: &'a str, output_model_id: &'a str) -> Subm
 async fn finish_job_with_model_is_an_attempt_guarded_compare_and_set(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let (_session, catalog) = queue_catalog!(backend, dir.path());
-    let job_id = format!("fz-{}", run_suffix());
+    let run = run_suffix();
+    let job_id = format!("fz-{run}");
     let model = format!("jammi:fine-tuned:{job_id}");
     let epoch_0 = format!("{model}:epoch_0");
     let epoch_1 = format!("{model}:epoch_1");
+    let a_epoch0_path = artifact_path(&run, "fz/worker-a/1/checkpoints/epoch_0");
+    let a_epoch1_path = artifact_path(&run, "fz/worker-a/1/checkpoints/epoch_1");
+    let a_served_path = artifact_path(&run, "fz/worker-a/1");
+    let b_served_path = artifact_path(&run, "fz/worker-b/2");
 
     catalog
         .submit_job(job_params_with_output(&job_id, &model))
@@ -1421,14 +1444,14 @@ async fn finish_job_with_model_is_an_attempt_guarded_compare_and_set(backend: Ba
             model_type: "fine-tuned",
             task: ModelTask::TextEmbedding,
             base_model_id: Some("q-base"),
-            artifact_path: "file:///artifacts/fz/worker-a/1/checkpoints/epoch_0",
+            artifact_path: &a_epoch0_path,
         },
         EpochCheckpointRow {
             model_id: &epoch_1,
             model_type: "fine-tuned",
             task: ModelTask::TextEmbedding,
             base_model_id: Some("q-base"),
-            artifact_path: "file:///artifacts/fz/worker-a/1/checkpoints/epoch_1",
+            artifact_path: &a_epoch1_path,
         },
     ];
     let a_finished = catalog
@@ -1439,7 +1462,7 @@ async fn finish_job_with_model_is_an_attempt_guarded_compare_and_set(backend: Ba
             result: r#"{"k":1}"#,
             output_model_id: &model,
             output_model_version: 1,
-            artifact_path: "file:///artifacts/fz/worker-a/1",
+            artifact_path: &a_served_path,
             epoch_checkpoints: &loser_epoch_rows,
         })
         .await
@@ -1482,7 +1505,7 @@ async fn finish_job_with_model_is_an_attempt_guarded_compare_and_set(backend: Ba
             result: r#"{"completed_at":"2026-01-01T00:00:00Z"}"#,
             output_model_id: &model,
             output_model_version: 1,
-            artifact_path: "file:///artifacts/fz/worker-b/2",
+            artifact_path: &b_served_path,
             epoch_checkpoints: &[],
         })
         .await
@@ -1497,7 +1520,7 @@ async fn finish_job_with_model_is_an_attempt_guarded_compare_and_set(backend: Ba
         .expect("the output model row exists");
     assert_eq!(
         model_after_b.artifact_path.as_deref(),
-        Some("file:///artifacts/fz/worker-b/2"),
+        Some(b_served_path.as_str()),
         "the winning finish CAS commits the live owner's prefix as the served path — \
          the sole writer of the committed pointer"
     );
@@ -1513,7 +1536,7 @@ async fn finish_job_with_model_is_an_attempt_guarded_compare_and_set(backend: Ba
             result: "{}",
             output_model_id: &model,
             output_model_version: 1,
-            artifact_path: "file:///artifacts/fz/worker-b/2",
+            artifact_path: &b_served_path,
             epoch_checkpoints: &[],
         })
         .await
@@ -1546,12 +1569,13 @@ async fn a_retained_epoch_checkpoints_own_row_makes_its_exact_prefix_referenced(
 ) {
     let dir = tempdir().unwrap();
     let (_session, catalog) = queue_catalog!(backend, dir.path());
-    let job_id = format!("epoch-ref-{}", run_suffix());
+    let run = run_suffix();
+    let job_id = format!("epoch-ref-{run}");
     let model = format!("jammi:fine-tuned:{job_id}");
     let epoch_0 = format!("{model}:epoch_0");
-    let served_prefix = "file:///artifacts/epoch-ref/worker-1/0";
-    let retained_prefix = "file:///artifacts/epoch-ref/worker-1/0/checkpoints/epoch_0";
-    let unretained_prefix = "file:///artifacts/epoch-ref/worker-1/0/checkpoints/epoch_1";
+    let served_prefix = artifact_path(&run, "epoch-ref/worker-1/0");
+    let retained_prefix = artifact_path(&run, "epoch-ref/worker-1/0/checkpoints/epoch_0");
+    let unretained_prefix = artifact_path(&run, "epoch-ref/worker-1/0/checkpoints/epoch_1");
 
     catalog
         .submit_job(job_params_with_output(&job_id, &model))
@@ -1581,7 +1605,7 @@ async fn a_retained_epoch_checkpoints_own_row_makes_its_exact_prefix_referenced(
         model_type: "fine-tuned",
         task: ModelTask::TextEmbedding,
         base_model_id: Some("q-base"),
-        artifact_path: retained_prefix,
+        artifact_path: &retained_prefix,
     }];
     let finished = catalog
         .finish_job_with_model(FinishJobWithModelParams {
@@ -1591,7 +1615,7 @@ async fn a_retained_epoch_checkpoints_own_row_makes_its_exact_prefix_referenced(
             result: r#"{"k":1}"#,
             output_model_id: &model,
             output_model_version: 1,
-            artifact_path: served_prefix,
+            artifact_path: &served_prefix,
             epoch_checkpoints: &retained_rows,
         })
         .await
@@ -1605,7 +1629,7 @@ async fn a_retained_epoch_checkpoints_own_row_makes_its_exact_prefix_referenced(
     // does NOT also count here — the predicate is deliberately ONE level.
     assert_eq!(
         catalog
-            .count_models_naming_prefix_all_tenants(retained_prefix)
+            .count_models_naming_prefix_all_tenants(&retained_prefix)
             .await
             .unwrap(),
         1,
@@ -1615,7 +1639,7 @@ async fn a_retained_epoch_checkpoints_own_row_makes_its_exact_prefix_referenced(
     // stays unreferenced and reclaimable.
     assert_eq!(
         catalog
-            .count_models_naming_prefix_all_tenants(unretained_prefix)
+            .count_models_naming_prefix_all_tenants(&unretained_prefix)
             .await
             .unwrap(),
         0,
@@ -1624,7 +1648,7 @@ async fn a_retained_epoch_checkpoints_own_row_makes_its_exact_prefix_referenced(
     // The served bundle's own top-level prefix is also referenced.
     assert_eq!(
         catalog
-            .count_models_naming_prefix_all_tenants(served_prefix)
+            .count_models_naming_prefix_all_tenants(&served_prefix)
             .await
             .unwrap(),
         1
@@ -1662,6 +1686,7 @@ async fn finish_job_with_model_update_is_scoped_by_version_and_tenant(backend: B
     let session = skip_if_no_backend!(backend, dir.path());
     let base = Arc::clone(session.catalog());
     reset_queue(&base).await;
+    let run = run_suffix();
 
     let tenant_a = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
     let tenant_b = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b").unwrap();
@@ -1735,6 +1760,7 @@ async fn finish_job_with_model_update_is_scoped_by_version_and_tenant(backend: B
         .unwrap()
         .expect("the queued job is claimable");
 
+    let served_path = artifact_path(&run, "vt-1/worker-a/0");
     let finished = cat_a
         .finish_job_with_model(FinishJobWithModelParams {
             job_id: "vt-1",
@@ -1743,7 +1769,7 @@ async fn finish_job_with_model_update_is_scoped_by_version_and_tenant(backend: B
             result: "{}",
             output_model_id: "acme/tuned",
             output_model_version: 1,
-            artifact_path: "file:///artifacts/vt-1/worker-a/0",
+            artifact_path: &served_path,
             epoch_checkpoints: &[],
         })
         .await
@@ -1757,7 +1783,7 @@ async fn finish_job_with_model_update_is_scoped_by_version_and_tenant(backend: B
         .expect("tenant-a v1 exists");
     assert_eq!(
         a_v1.artifact_path.as_deref(),
-        Some("file:///artifacts/vt-1/worker-a/0"),
+        Some(served_path.as_str()),
         "the finish's OWN (tenant, version) row is the one touched"
     );
 
@@ -1796,12 +1822,23 @@ async fn finish_job_with_model_update_is_scoped_by_version_and_tenant(backend: B
 async fn finish_job_with_model_skips_a_name_occupied_epoch_checkpoint(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let run = run_suffix();
+    let job_id = format!("oc-{run}");
+    let model = format!("jammi:fine-tuned:oc-{run}");
+    let epoch_0 = format!("{model}:epoch_0");
+    let epoch_1 = format!("{model}:epoch_1");
+    let oc_epoch0_path = artifact_path(&run, "oc/worker-a/0/checkpoints/epoch_0");
+    let oc_epoch1_path = artifact_path(&run, "oc/worker-a/0/checkpoints/epoch_1");
+    let oc_served_path = artifact_path(&run, "oc/worker-a/0");
 
     // A pre-existing, unrelated row occupies the name the epoch_0 checkpoint
-    // would otherwise claim.
+    // would otherwise claim. Its own model id carries the run suffix too —
+    // this row lives in `models`, which `reset_queue` never clears on the
+    // Postgres lane's reused database, so a fixed id would collide with a
+    // PRIOR run's occupying row and skip re-registering this run's own.
     catalog
         .register_model(RegisterModelParams {
-            model_id: "jammi:fine-tuned:oc:epoch_0",
+            model_id: &epoch_0,
             version: 1,
             model_type: "embedding",
             backend: "candle",
@@ -1814,7 +1851,7 @@ async fn finish_job_with_model_skips_a_name_occupied_epoch_checkpoint(backend: B
         .unwrap();
     catalog
         .register_model(RegisterModelParams {
-            model_id: "jammi:fine-tuned:oc",
+            model_id: &model,
             version: 1,
             model_type: "fine-tuned",
             backend: "candle",
@@ -1826,7 +1863,7 @@ async fn finish_job_with_model_skips_a_name_occupied_epoch_checkpoint(backend: B
         .await
         .unwrap();
     catalog
-        .submit_job(job_params_with_output("oc", "jammi:fine-tuned:oc"))
+        .submit_job(job_params_with_output(&job_id, &model))
         .await
         .unwrap();
     catalog
@@ -1837,29 +1874,29 @@ async fn finish_job_with_model_skips_a_name_occupied_epoch_checkpoint(backend: B
 
     let epoch_rows = [
         EpochCheckpointRow {
-            model_id: "jammi:fine-tuned:oc:epoch_0",
+            model_id: &epoch_0,
             model_type: "fine-tuned",
             task: ModelTask::TextEmbedding,
             base_model_id: Some("q-base"),
-            artifact_path: "file:///artifacts/oc/worker-a/0/checkpoints/epoch_0",
+            artifact_path: &oc_epoch0_path,
         },
         EpochCheckpointRow {
-            model_id: "jammi:fine-tuned:oc:epoch_1",
+            model_id: &epoch_1,
             model_type: "fine-tuned",
             task: ModelTask::TextEmbedding,
             base_model_id: Some("q-base"),
-            artifact_path: "file:///artifacts/oc/worker-a/0/checkpoints/epoch_1",
+            artifact_path: &oc_epoch1_path,
         },
     ];
     let finished = catalog
         .finish_job_with_model(FinishJobWithModelParams {
-            job_id: "oc",
+            job_id: &job_id,
             instance_id: "worker-a",
             attempts: 1,
             result: "{}",
-            output_model_id: "jammi:fine-tuned:oc",
+            output_model_id: &model,
             output_model_version: 1,
-            artifact_path: "file:///artifacts/oc/worker-a/0",
+            artifact_path: &oc_served_path,
             epoch_checkpoints: &epoch_rows,
         })
         .await
@@ -1867,7 +1904,7 @@ async fn finish_job_with_model_skips_a_name_occupied_epoch_checkpoint(backend: B
     assert!(finished, "an occupied checkpoint name never fails the job");
 
     let occupied = catalog
-        .get_model("jammi:fine-tuned:oc:epoch_0")
+        .get_model(&epoch_0)
         .await
         .unwrap()
         .expect("the occupying row still exists");
@@ -1877,13 +1914,13 @@ async fn finish_job_with_model_skips_a_name_occupied_epoch_checkpoint(backend: B
         "the occupying row must not be clobbered by the skipped checkpoint"
     );
     let sibling = catalog
-        .get_model("jammi:fine-tuned:oc:epoch_1")
+        .get_model(&epoch_1)
         .await
         .unwrap()
         .expect("the non-colliding sibling checkpoint registers normally");
     assert_eq!(
         sibling.artifact_path.as_deref(),
-        Some("file:///artifacts/oc/worker-a/0/checkpoints/epoch_1")
+        Some(oc_epoch1_path.as_str())
     );
 }
 
@@ -2503,7 +2540,7 @@ fn result_table_params<'a>(
         text_columns: None,
         storage_precision: StoragePrecision::F32,
         oversample: 4,
-        created_at: jammi_db::catalog::backend::now_sortable(),
+        created_at: jammi_db::catalog::lease::canonical_stamp_now(),
         writer_id: None,
         lease: None,
         job_attempt: Some(job_attempt),
@@ -2962,6 +2999,170 @@ async fn release_jobs_claimed_by_write_is_exactly_lease_null_releases_plus_one_a
     assert_eq!(catalog.release_jobs_claimed_by("me").await.unwrap(), 0);
 }
 
+/// #516: the release-write delta oracles above compare through `JobRecord`
+/// (`SELECT_COLS`), so a column outside that projection — `idempotency_key`
+/// (`schema.rs:1066`, sitting outside `SELECT_COLS`) is the one that
+/// surfaced the gap — is invisible to them by construction; a future
+/// release statement that touched it would pass both oracles above
+/// unnoticed. This one asserts the SAME delta over a LIVE all-columns
+/// snapshot instead: the column list is read from `PRAGMA table_info('jobs')`
+/// / `information_schema.columns` at test time (never a hardcoded list, so
+/// a column added after this test is written is covered the day it lands,
+/// never invisible the way `SELECT_COLS` was) and every column is projected
+/// `CAST(col AS TEXT)` — the `Row` seam has no column-enumeration API, so
+/// this is the explicit workaround, not a permanent second reader.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_job_lease_write_delta_is_visible_over_every_live_column(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let lease = Duration::from_secs(3600);
+
+    // `idempotency_key` set to a non-NULL value: the column #516 names,
+    // proving the snapshot is not vacuously passing on a NULL == NULL
+    // comparison.
+    catalog
+        .submit_job_deduped(job_params("delta-all-cols"), Some("dedupe-key-delta"))
+        .await
+        .unwrap();
+    catalog
+        .submit_job(job_params("other-untouched"))
+        .await
+        .unwrap();
+    catalog
+        .claim_next("me", KINDS, lease)
+        .await
+        .unwrap()
+        .expect("the first job claimed by `me`");
+    catalog
+        .claim_next("someone-else", KINDS, lease)
+        .await
+        .unwrap()
+        .expect("the second job claimed by a DIFFERENT instance");
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    let columns = live_jobs_columns(&catalog, backend).await;
+    let other_before = snapshot_all_jobs_columns(&catalog, "other-untouched", &columns).await;
+    let before = snapshot_all_jobs_columns(&catalog, "delta-all-cols", &columns).await;
+    let released = catalog
+        .release_job_lease("delta-all-cols", "me", 1)
+        .await
+        .unwrap();
+    assert!(released, "the owner releases its own live lease");
+    let after = snapshot_all_jobs_columns(&catalog, "delta-all-cols", &columns).await;
+
+    let changed: std::collections::BTreeSet<&str> = columns
+        .iter()
+        .filter(|c| before[c.as_str()] != after[c.as_str()])
+        .map(String::as_str)
+        .collect();
+    let expected: std::collections::BTreeSet<&str> = ["lease_expires_at", "releases", "updated_at"]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        changed, expected,
+        "the release write must change EXACTLY these columns, on the live \
+         column set, before {before:?} after {after:?}"
+    );
+    assert_eq!(
+        before["idempotency_key"], after["idempotency_key"],
+        "the column #516 named must round-trip byte-identical across the release"
+    );
+
+    // A row claimed by a different instance stays completely untouched on
+    // the live snapshot too.
+    let other_after = snapshot_all_jobs_columns(&catalog, "other-untouched", &columns).await;
+    assert_eq!(
+        other_before, other_after,
+        "a release for a DIFFERENT job must not touch this row on any column"
+    );
+}
+
+/// The live `jobs` column list, backend-appropriate: `PRAGMA
+/// table_info('jobs')` on SQLite, `information_schema.columns` on Postgres.
+/// Never hardcoded — a future migration's new column is picked up here
+/// automatically, which is the whole point of #516's fix.
+async fn live_jobs_columns(catalog: &Catalog, backend: BackendKind) -> Vec<String> {
+    catalog
+        .backend_arc()
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    match backend {
+                        BackendKind::Sqlite => {
+                            tx.query("SELECT name FROM pragma_table_info('jobs')", &[], |row| {
+                                row.get::<String>("name")
+                            })
+                            .await
+                        }
+                        BackendKind::Postgres => {
+                            tx.query(
+                                "SELECT column_name FROM information_schema.columns \
+                                 WHERE table_name = 'jobs' ORDER BY ordinal_position",
+                                &[],
+                                |row| row.get::<String>("column_name"),
+                            )
+                            .await
+                        }
+                    }
+                })
+            },
+        )
+        .await
+        .unwrap()
+}
+
+/// A `job_id`-keyed row snapshot over EVERY named column, each cast to
+/// `TEXT` so one decode path serves every SQL type the table declares.
+async fn snapshot_all_jobs_columns(
+    catalog: &Catalog,
+    job_id: &str,
+    columns: &[String],
+) -> std::collections::BTreeMap<String, Option<String>> {
+    let projection = columns
+        .iter()
+        .map(|c| format!("CAST({c} AS TEXT) AS {c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("SELECT {projection} FROM jobs WHERE job_id = $1");
+    let job_id = job_id.to_string();
+    let columns = columns.to_vec();
+    catalog
+        .backend_arc()
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                let sql = sql.clone();
+                let columns = columns.clone();
+                Box::pin(async move {
+                    tx.query_opt(&sql, &[SqlValue::TextOwned(job_id)], move |row| {
+                        let mut map = std::collections::BTreeMap::new();
+                        for c in &columns {
+                            map.insert(c.clone(), row.try_get::<String>(c)?);
+                        }
+                        Ok(map)
+                    })
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap()
+        .expect("row present")
+}
+
 /// The reclaim cap compares `attempts - releases` against `MAX_ATTEMPTS`
 /// (3): a deploy storm of three releases leaves the job claimable at
 /// `attempts 4, releases 3`; three genuine expiries fail it; 3 claims / 2
@@ -3316,7 +3517,9 @@ async fn finalize_cas_still_matches_a_released_lease(backend: BackendKind) {
     assert_eq!(done.releases, 1);
 
     // `finish_job_with_model` (the training finalize).
-    let model = format!("jammi:fine-tuned:fin-{}", run_suffix());
+    let run = run_suffix();
+    let model = format!("jammi:fine-tuned:fin-{run}");
+    let fin_t_path = artifact_path(&run, "fin-t/me/1");
     catalog
         .register_model(RegisterModelParams {
             model_id: &model,
@@ -3355,7 +3558,7 @@ async fn finalize_cas_still_matches_a_released_lease(backend: BackendKind) {
                 result: "{}",
                 output_model_id: &model,
                 output_model_version: 1,
-                artifact_path: "file:///artifacts/fin-t/me/1",
+                artifact_path: &fin_t_path,
                 epoch_checkpoints: &[],
             })
             .await
@@ -3939,4 +4142,49 @@ async fn transfer_claim_new_holder_can_heartbeat_old_holder_cannot(backend: Back
         .await
         .unwrap();
     assert!(new_holder, "the new holder owns the claim and can renew it");
+}
+
+/// Every catalog test that asserts a count over rows it seeded must own
+/// those rows: a `"file:///artifacts/..."` string literal in THIS source
+/// file must never bypass [`artifact_path`]'s run suffix, because
+/// `reset_queue` (this file's own shared fixture) clears `jobs`/`workers`/
+/// `instances` before a test but never `models`, and the Postgres lane
+/// reuses ONE catalog database across the whole test run —
+/// `count_models_naming_prefix_all_tenants` counts every `models` row
+/// naming a prefix, across every tenant, so a fixed literal shared across
+/// runs makes that count grow on every re-run. A textual scan (rather than
+/// a runtime property) is the right oracle here: this asserts something
+/// about THIS FILE'S OWN SOURCE TEXT, not about catalog behavior, and
+/// `include_str!` reads the file as the compiler sees it, so the check
+/// cannot itself drift from what actually got compiled.
+#[test]
+fn every_artifact_path_literal_in_this_file_goes_through_the_run_suffix_helper() {
+    let src = include_str!("jobs_queue.rs");
+    // This self-test's OWN source (its doc comment and body) necessarily
+    // names the literal substring it is scanning for, so it must exclude
+    // its own text from the scan — slice at its own marker (this function's
+    // doc comment's first line), which is the last item in the file.
+    const SELF_MARKER: &str = "Every catalog test that asserts a count over rows it seeded";
+    let scanned = &src[..src
+        .find(SELF_MARKER)
+        .expect("this test's own marker is in the file")];
+    let literal_lines: Vec<&str> = scanned
+        .lines()
+        .filter(|line| line.contains("\"file:///artifacts/"))
+        .collect();
+    assert_eq!(
+        literal_lines.len(),
+        1,
+        "every \"file:///artifacts/...\" literal in this file (outside this self-test) must \
+         funnel through `artifact_path(run, tail)` rather than being hand-typed at the call \
+         site — found {} occurrence(s) of the raw literal, expected exactly 1 (the helper's \
+         own `format!` body): {literal_lines:?}",
+        literal_lines.len()
+    );
+    assert!(
+        literal_lines[0].contains("format!(\"file:///artifacts/{run}/{tail}\")"),
+        "the sole \"file:///artifacts/\" literal in this file must be `artifact_path`'s \
+         own body, got: {}",
+        literal_lines[0]
+    );
 }

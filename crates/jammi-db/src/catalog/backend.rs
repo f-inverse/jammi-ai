@@ -398,29 +398,6 @@ pub enum SqlNullType {
     Bytes,
 }
 
-/// A full-resolution, lexicographically-sortable creation-timestamp string,
-/// identical byte-for-byte whichever backend a catalog row lands on.
-///
-/// Exists because a SQL-side `CURRENT_TIMESTAMP` default is not a portable
-/// ordering key: SQLite renders it at second resolution with no offset,
-/// Postgres at microsecond resolution with one, so two backends fed the same
-/// migration DDL populate a `created_at` column with values of different
-/// resolution and shape. Nanosecond precision here means two rows an
-/// application creates in the same call, or even the same second, still
-/// resolve by plain string order — an `ORDER BY created_at DESC` query never
-/// needs a backend-specific tiebreak column (SQLite's `rowid` has no
-/// Postgres analog, and even Postgres's own `ctid` is not creation-ordered
-/// after a `VACUUM`).
-///
-/// Callers stamp this once at row-creation time and bind it as an ordinary
-/// `TEXT` value — the column stays a plain string on both backends, so
-/// nothing downstream needs to parse it as a timestamp to sort on it.
-pub fn now_sortable() -> String {
-    chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.9fZ")
-        .to_string()
-}
-
 /// Engine-owned parameter value. Backend impls translate to driver-native
 /// types in `bind_sqlite` / `bind_postgres`.
 #[derive(Debug, Clone)]
@@ -753,6 +730,25 @@ pub enum BackendError {
     /// `?`/`.into()` to the transaction's result.
     #[error("busy: {0}")]
     Busy(String),
+    /// A write refused the schema-edge stamp domain (`catalog::lease`'s S3):
+    /// Postgres's `CHECK … canonical` constraint (SQLSTATE `23514`), a
+    /// SQLite `BEFORE INSERT`/`BEFORE UPDATE` trigger's `RAISE(ABORT, …)`, or
+    /// a Postgres cast fault during migration `039_canonical_stamps`'s own
+    /// rewrite (`invalid input syntax for type timestamp with time zone`,
+    /// `22007`, or `date/time field value out of range`, `22008`). `column`
+    /// is `Some` whenever the backend's own error names one — the CHECK and
+    /// trigger arms encode it into the constraint name / `RAISE` message
+    /// this crate authors, but a raw Postgres CAST fault carries neither a
+    /// table nor a column in its own error object (SQLSTATE `22007`/`22008`
+    /// are function/cast errors, not constraint violations — Postgres has
+    /// nothing to attribute them to), so both are `<unknown>`/`None` there;
+    /// this is the backend asymmetry `catalog::lease`'s S3/S4 docs name.
+    #[error("stamp domain violation on {table} (column {column:?}): {detail}")]
+    DomainViolation {
+        table: String,
+        column: Option<String>,
+        detail: String,
+    },
     #[error("sqlx backend error: {0}")]
     Sqlx(#[from] sqlx::Error),
 }
@@ -863,6 +859,60 @@ fn warn_close_ceiling<DB: sqlx::Database>(pool: &sqlx::Pool<DB>, kind: BackendKi
     );
 }
 
+/// SQLite's extended result code for a `RAISE(ABORT, …)` fired from a
+/// trigger (`SQLITE_CONSTRAINT_TRIGGER`, `19 | (7 << 8)`). `sqlx-sqlite`'s
+/// `is_check_violation()` does NOT recognize this code (only
+/// `SQLITE_CONSTRAINT_CHECK`, a literal `CHECK` clause, which this crate's
+/// stamp-domain triggers never use — SQLite has no calendar-validating
+/// `CHECK` expression), so a trigger ABORT needs its own match arm.
+const SQLITE_CONSTRAINT_TRIGGER_CODE: &str = "1811";
+
+/// Postgres SQLSTATEs a `::timestamptz` cast can raise on text this crate's
+/// own writers never produce but migration `039_canonical_stamps`'s rewrite
+/// may still encounter in a pre-existing row: `22007` (`invalid input syntax
+/// for type timestamp with time zone` — issue #585's original symptom) and
+/// `22008` (`date/time field value out of range` — a shape-valid,
+/// calendar-invalid value, e.g. a month of `13`). Neither is a constraint
+/// violation, so neither carries a `table`/`column` in Postgres's own error
+/// object.
+const PG_CAST_ERROR_CODES: [&str; 2] = ["22007", "22008"];
+
+/// Split this crate's own `"<table>.<column>: not a canonical stamp"`
+/// `RAISE(ABORT, …)` / `CHECK` violation message shape into `(table,
+/// column)`. `None` for either half when the text is not in that shape (a
+/// defensive fallback, never expected in practice: every domain-violation
+/// message this crate's own DDL raises is authored in exactly this shape).
+fn parse_domain_violation_message(detail: &str) -> (Option<String>, Option<String>) {
+    let Some(prefix) = detail.split(':').next() else {
+        return (None, None);
+    };
+    match prefix.split_once('.') {
+        Some((table, column)) if !table.is_empty() && !column.is_empty() => {
+            (Some(table.to_string()), Some(column.to_string()))
+        }
+        _ => (None, None),
+    }
+}
+
+/// Postgres names a CHECK violation's constraint but not (reliably) a
+/// column at the protocol level, so this crate's own stamp-domain CHECK
+/// constraints are named `sdchk__<table>__<column>` — double-underscore
+/// separated, since a table or column name may itself contain a single
+/// underscore (`result_table_versions`, `lease_expires_at`), which a
+/// single-underscore split could not place unambiguously. `None` for a
+/// constraint name that is not in this shape (any OTHER check constraint —
+/// `execution IN (...)`, `training_set_ref`/`training_set_location`'s
+/// paired-nullability CHECK, `workers.state`'s vocabulary CHECK — is a
+/// different, pre-existing class this function never claims to parse).
+fn parse_domain_violation_constraint_name(name: &str) -> Option<(String, String)> {
+    let rest = name.strip_prefix("sdchk__")?;
+    let (table, column) = rest.split_once("__")?;
+    if table.is_empty() || column.is_empty() {
+        return None;
+    }
+    Some((table.to_string(), column.to_string()))
+}
+
 /// Classify a raw `sqlx::Error` into the engine-owned [`BackendError`]
 /// taxonomy. Constraint and retry detection rely on backend-specific
 /// `DatabaseError` flags exposed by sqlx.
@@ -875,6 +925,54 @@ pub fn classify(err: sqlx::Error) -> BackendError {
         },
         Database(db_err) if db_err.code().as_deref() == Some("40001") => {
             BackendError::Retry(db_err.message().to_string())
+        }
+        // A `CHECK` violation (SQLSTATE 23514 on Postgres; SQLite never
+        // raises this class for the stamp domain — see the trigger arm
+        // below). Only this crate's OWN `sdchk__<table>__<column>` stamp-
+        // domain constraints parse a column (`parse_domain_violation_
+        // constraint_name`); any other CHECK constraint on the schema
+        // still classifies as `DomainViolation` (it IS a domain violation
+        // in the general sense) but with `column: None` — `table()` is
+        // Postgres's own protocol field, populated regardless.
+        Database(db_err) if db_err.is_check_violation() => {
+            let table = db_err.table().map(str::to_string);
+            let parsed = db_err
+                .constraint()
+                .and_then(parse_domain_violation_constraint_name);
+            BackendError::DomainViolation {
+                table: table
+                    .or_else(|| parsed.as_ref().map(|(t, _)| t.clone()))
+                    .unwrap_or_else(|| "<unknown>".to_string()),
+                column: parsed.map(|(_, c)| c),
+                detail: db_err.message().to_string(),
+            }
+        }
+        // SQLite `RAISE(ABORT, '<table>.<column>: not a canonical stamp')`
+        // fired from a stamp-domain trigger.
+        Database(db_err) if db_err.code().as_deref() == Some(SQLITE_CONSTRAINT_TRIGGER_CODE) => {
+            let message = db_err.message();
+            let (table, column) = parse_domain_violation_message(message);
+            BackendError::DomainViolation {
+                table: table.unwrap_or_else(|| "<unknown>".to_string()),
+                column,
+                detail: message.to_string(),
+            }
+        }
+        // Postgres `::timestamptz` cast fault (migration 039's own rewrite,
+        // never a live write path — every live writer composes through
+        // `catalog::lease::pg_canonical_stamp`, which never casts arbitrary
+        // pre-existing text). Names neither table nor column: see this
+        // variant's docs.
+        Database(db_err)
+            if db_err
+                .code()
+                .is_some_and(|c| PG_CAST_ERROR_CODES.contains(&c.as_ref())) =>
+        {
+            BackendError::DomainViolation {
+                table: "<unknown>".to_string(),
+                column: None,
+                detail: db_err.message().to_string(),
+            }
         }
         PoolTimedOut | PoolClosed => BackendError::Unavailable(err.to_string()),
         _ => BackendError::Sqlx(err),
@@ -924,6 +1022,66 @@ fn bind_postgres<'q>(
         SqlValue::Uuid(u) => q.bind(*u),
         SqlValue::Json(j) => q.bind(j.clone()),
         SqlValue::Timestamp(t) => q.bind(*t),
+    }
+}
+
+#[cfg(test)]
+mod domain_violation_parsing_tests {
+    use super::{parse_domain_violation_constraint_name, parse_domain_violation_message};
+
+    #[test]
+    fn message_shape_parses_table_and_column() {
+        assert_eq!(
+            parse_domain_violation_message("jobs.lease_expires_at: not a canonical stamp"),
+            (
+                Some("jobs".to_string()),
+                Some("lease_expires_at".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn message_shape_is_none_for_text_outside_the_shape() {
+        assert_eq!(
+            parse_domain_violation_message("some other trigger's ordinary message"),
+            (None, None)
+        );
+        assert_eq!(
+            parse_domain_violation_message("no-colon-at-all"),
+            (None, None)
+        );
+        assert_eq!(
+            parse_domain_violation_message(": leading colon"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn constraint_name_shape_parses_table_and_column_despite_internal_underscores() {
+        // Both the table and the column name carry an underscore of their
+        // own — a single-underscore split could not place the boundary
+        // unambiguously; the double-underscore separator can.
+        assert_eq!(
+            parse_domain_violation_constraint_name(
+                "sdchk__result_table_versions__lease_expires_at"
+            ),
+            Some((
+                "result_table_versions".to_string(),
+                "lease_expires_at".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn constraint_name_shape_is_none_for_an_unrelated_constraint() {
+        assert_eq!(
+            parse_domain_violation_constraint_name("workers_state_check"),
+            None
+        );
+        assert_eq!(
+            parse_domain_violation_constraint_name("sdchk__no_column"),
+            None
+        );
     }
 }
 

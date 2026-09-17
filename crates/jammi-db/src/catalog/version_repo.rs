@@ -211,10 +211,13 @@ enum VersionCasOutcome {
 const MISS_TABLE: &str = "table";
 const MISS_VERSION: &str = "version";
 
+/// `result_table_versions.completed_at`'s stamp — no reader compares this
+/// column (it is informational, never a sweep/lease predicate input), so it
+/// is out of `catalog::lease`'s enforced-domain class, but it still goes
+/// through the crate's one canonical formatter rather than a hand-rolled
+/// picture, so the catalog never grows a second timestamp shape by accident.
 fn completed_now() -> String {
-    chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string()
+    crate::catalog::lease::canonical_stamp_now()
 }
 
 impl Catalog {
@@ -326,7 +329,7 @@ impl Catalog {
     ) -> Result<AllocatedVersion> {
         let table_name = table.to_string();
         let writer = writer_id.to_string();
-        let created_at = crate::catalog::backend::now_sortable();
+        let created_at = crate::catalog::lease::canonical_stamp_now();
         let tenant = self.current_tenant();
         let arm = TenantArm::in_force(tenant);
         let arm_in_tx = arm.clone();
@@ -468,7 +471,7 @@ impl Catalog {
         let table_name = table.to_string();
         let manifest_path = manifest_path.to_string();
         let identity = identity.to_string();
-        let now = crate::catalog::backend::now_sortable();
+        let now = crate::catalog::lease::canonical_stamp_now();
         let tenant = self.current_tenant();
         let arm = TenantArm::in_force(tenant);
         let arm_in_tx = arm.clone();

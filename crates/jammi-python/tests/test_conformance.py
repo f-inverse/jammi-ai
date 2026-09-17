@@ -23,6 +23,7 @@ until a verb runs. No server is contacted.
 from __future__ import annotations
 
 import inspect
+from datetime import datetime, timezone
 from pathlib import Path
 
 import grpc
@@ -674,11 +675,17 @@ def test_embed_reconcile_referenced_list_is_populated_and_matches_the_remote_key
     catalog_db = tmp_path / "catalog.db"
     conn = sqlite3.connect(str(catalog_db))
     try:
+        # `models.{created_at, updated_at}` are canonical-stamp columns
+        # (migration 039): the schema edge refuses any other shape, including
+        # the legacy `CURRENT_TIMESTAMP` DEFAULT a raw INSERT would otherwise
+        # fall back on — so this fixture stamps explicitly, exactly as every
+        # catalog writer does (`%Y-%m-%dT%H:%M:%S%.6fZ`).
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         conn.execute(
             "INSERT INTO models "
             "(model_id, name, model_type, task, backend, version, status, "
-            " metadata, artifact_path, tenant_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'registered', ?, ?, NULL)",
+            " metadata, artifact_path, tenant_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'registered', ?, ?, NULL, ?, ?)",
             (
                 "attempt-level-model::1",  # untenanted `model_pk(None, name, version)`
                 "attempt-level-model",
@@ -688,6 +695,8 @@ def test_embed_reconcile_referenced_list_is_populated_and_matches_the_remote_key
                 1,
                 json.dumps({"base_model_id": None, "config_json": None}),
                 artifact_path,
+                stamp,
+                stamp,
             ),
         )
         conn.commit()

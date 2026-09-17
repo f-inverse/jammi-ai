@@ -193,7 +193,8 @@ pub async fn load_vectors(
 ) -> Result<Vec<(String, Vec<f32>)>, Box<dyn std::error::Error>> {
     let df = ctx
         .sql(&format!(
-            "SELECT _row_id, vector FROM \"jammi.{table_name}\""
+            "SELECT _row_id, vector FROM {}",
+            jammi_db::store::result_table_relation(table_name)
         ))
         .await?;
     let mut stream = df.execute_stream().await?;

@@ -31,19 +31,30 @@ use crate::pipeline::context_predictor::ContextPredictorTrainConfig;
 /// on a fresh process. Persisted as JSON on the job's `training_spec` column;
 /// the variant's [`TrainingSpec::kind`] tag is mirrored into `training_jobs.kind`.
 ///
-/// No `#[serde(deny_unknown_fields)]`, by this repo's persisted-row
-/// convention: a `jobs.spec` row is always engine-written from a decoded
-/// spec, so an unknown key can only arrive via a hand edit, and this type
-/// is wrapped in `crate::jobs::JobSpec`'s `#[serde(untagged)]` (deny would
-/// collapse the outer wrapper's own "try each inner deserializer in turn"
-/// dispatch — see that type's own doc). The consequence is stated honestly
-/// rather than assumed: a stray `cache` key hand-edited under a
-/// `graph_fine_tune` row is silently DROPPED at deserialize, never refused
-/// — `TrainingSpec::GraphFineTune::cache` does not exist to receive it. See
-/// <https://github.com/f-inverse/jammi-ai/issues/548> for the `JobSpec`
-/// reshape that would let a genuinely malformed row be refused instead.
+/// `#[serde(deny_unknown_fields)]`: a `jobs.spec`/`training_spec` row is
+/// always engine-written from a decoded spec, so an unknown key can only
+/// arrive via a hand edit or corruption — a stray key hand-edited under a
+/// `graph_fine_tune` row (for example) is a typed error naming the field,
+/// never a silent drop. Neither production training-claim decode site
+/// (`crate::fine_tune::worker`'s loop-claimer or its Peer-rank path)
+/// decodes THIS type directly from a `jobs.spec` row at all — both decode
+/// [`crate::jobs::JobSpec`] (that type's own tag/`deny_unknown_fields`
+/// pair is what those two reads actually run under) and project to this
+/// type with `crate::jobs::JobSpec::as_training_spec`. This type's own
+/// `#[serde(deny_unknown_fields)]` still matters: `JobSpec` is
+/// field-for-field identical to this type by construction (see that
+/// type's own doc and its byte-pin tests), so decoding one and rejecting
+/// an unknown field is exactly equivalent to decoding the other and
+/// rejecting it — the guarantee holds under either type's own tag, it is
+/// simply `JobSpec`'s that actually runs in production. `JobSpec` is a
+/// SEPARATE, independently-tagged flat enum (its own doc) that a
+/// training-kind row round-trips through byte-for-byte — never a wrapper
+/// around this type — because internally-tagging one `kind`-tagged
+/// enum's variant AROUND another produces two competing `kind` keys on
+/// serialize (`kind` is written twice), not a nested shape; see
+/// `JobSpec`'s own doc for the executed refutation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TrainingSpec {
     /// Column-source contrastive / classification / regression fine-tune. The
     /// worker re-runs `SELECT columns FROM source` and rebuilds the data loader
@@ -67,7 +78,7 @@ pub enum TrainingSpec {
         /// cache dial, the same shape [`crate::jobs::ComputeSpec`]'s own
         /// `cache` field already carries for every compute kind — except
         /// that model-level cache reuse is not yet supported for this kind:
-        /// `Use` is refused, typed, by `admit_training_spec` — the ONE
+        /// `Use` is refused, typed, by [`admit_training_spec`] — the ONE
         /// admission every durable submit edge for a `TrainingSpec` applies,
         /// so no edge can enqueue this value; see
         /// <https://github.com/f-inverse/jammi-ai/issues/562>. `Bypass` (the
@@ -129,6 +140,7 @@ pub enum TrainingSpec {
 /// [`TrainingSpec::GraphFineTune`] is unrepresentable rather than merely
 /// unused.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrainingCommon {
     /// Base model id the adapter / head is trained over.
     pub base_model: String,
@@ -312,6 +324,46 @@ impl RankAdmission {
     }
 }
 
+/// A [`TrainingSpec`] that has passed [`admit_training_spec`] -- its field is
+/// private to this module (never `pub`, even though the TYPE itself is —
+/// see [`admit_training_spec`]'s own doc on why the type must be nameable
+/// outside this crate), so the ONLY way ANY caller, in this crate or across
+/// the `jammi-bench` boundary, can construct one is by calling
+/// [`admit_training_spec`] and getting one back; a value of this type is
+/// proof admission ran.
+///
+/// What this closes: within EACH of the three edges below, `spec`/
+/// `training_spec` is CONSUMED by [`admit_training_spec`] and the edge reads
+/// the admitted value back only through `AdmittedTrainingSpec::spec`, so
+/// that one function body has no path left that could serialize/submit the
+/// pre-admission value alongside (or instead of) the admitted one -- the
+/// double-value footgun a `&spec` borrow would leave open.
+///
+/// What the witness alone does NOT close (#573): three durable-write call
+/// sites each building their own `SubmitJobParams` inline would let a
+/// fourth edge skip this type entirely and hand a raw JSON string straight
+/// to `jammi_db::Catalog::submit_job`/`submit_job_deduped`.
+/// [`submit_admitted_training`] closes that: it is the ONLY function in the
+/// workspace that builds a
+/// [`jammi_db::catalog::jobs_repo::SubmitJobParams`] for a training kind, so
+/// a hand-rolled bypass has to duplicate this function's body verbatim
+/// rather than merely skip a witness read -- `
+/// every_durable_training_submit_edge_calls_the_one_admission_function`'s
+/// source-level oracle is still what catches that duplication (Rust's
+/// privacy model cannot forbid a caller from writing the same match/insert
+/// logic again under a different name), stated as the ORACLE being the
+/// enforcement, not the type.
+pub struct AdmittedTrainingSpec(TrainingSpec);
+
+impl AdmittedTrainingSpec {
+    /// The admitted spec, by reference -- for serializing to `jobs.spec` and
+    /// for [`crate::session::InferenceSession::training_job_links`], which
+    /// both only need to read it.
+    pub(crate) fn spec(&self) -> &TrainingSpec {
+        &self.0
+    }
+}
+
 /// The ONE admission every durable submit edge for a [`TrainingSpec`]
 /// applies before a `jobs` row is ever written: the per-kind validation
 /// (`FineTuneConfig::validate`/`GraphSampleConfig::validate`/
@@ -321,17 +373,36 @@ impl RankAdmission {
 /// the `cache = Use` refusal (model-level cache reuse is not yet
 /// supported; see <https://github.com/f-inverse/jammi-ai/issues/562>).
 ///
+/// Consumes `spec` and, on success, returns it wrapped in
+/// [`AdmittedTrainingSpec`] -- the type-level half of "every durable submit
+/// edge calls this before writing a row" (#573): unlike a `&spec` borrow
+/// a caller cannot hand the
+/// ORIGINAL `spec` value to a durable-write path expecting
+/// [`AdmittedTrainingSpec`] without first passing it through here -- the
+/// witness is the only surviving handle to the spec after this call.
+///
+/// `pub` (not `pub(crate)`): `jammi-bench`'s finetune-run tier
+/// (`crates/jammi-bench/src/finetune_run.rs`) submits a REAL training job
+/// through this same admission + [`submit_admitted_training`] rather than a
+/// hand-built, unadmitted placeholder row — the seam is the control here,
+/// not the visibility, so raising it is not a bypass of anything this type
+/// protects. [`AdmittedTrainingSpec`]'s own field stays private to this
+/// module regardless of which crate calls this function, so a caller across
+/// the crate boundary is bound by exactly the same "only this call can mint
+/// one" rule an in-crate caller is.
+///
 /// Every edge that can turn a `TrainingSpec` into a durable row calls this:
-/// [`crate::session::InferenceSession::submit_fine_tune_spec_deduped`],
+/// `crate::session::InferenceSession::submit_fine_tune_spec_deduped`,
 /// [`crate::session::InferenceSession::enqueue`], and
 /// [`crate::pipeline::context_predictor`]'s
-/// `train_context_predictor_deduped`. A refusal here leaves no row behind,
+/// `train_context_predictor_deduped` (in-crate), plus `jammi-bench`'s
+/// finetune-run tier (cross-crate). A refusal here leaves no row behind,
 /// because no row has been written yet.
-pub(crate) fn admit_training_spec(
+pub fn admit_training_spec(
     config: &jammi_db::config::JammiConfig,
-    spec: &TrainingSpec,
-) -> Result<()> {
-    match spec {
+    spec: TrainingSpec,
+) -> Result<AdmittedTrainingSpec> {
+    match &spec {
         TrainingSpec::FineTune { common, cache, .. } => {
             common.config.validate()?;
             if *cache == CachePolicy::Use {
@@ -354,7 +425,87 @@ pub(crate) fn admit_training_spec(
             predictor_spec.validate()?;
         }
     }
-    RankAdmission::from_config(config).admit(spec)
+    RankAdmission::from_config(config).admit(&spec)?;
+    Ok(AdmittedTrainingSpec(spec))
+}
+
+/// The catalog's durable record of a [`submit_admitted_training`] call --
+/// the caller reads [`Self::recorded_job_id`] to build whatever handle its
+/// own crate returns ([`crate::fine_tune::training_job::TrainingJob`] for
+/// the two `_deduped` edges, [`crate::jobs::JobHandle`] for `enqueue`, a
+/// bench tier's own claim-by-id call for `jammi-bench`), since those handle
+/// types differ by caller and this function stays training-shape-agnostic
+/// about what the caller does with the id.
+#[derive(Debug, Clone)]
+pub struct SubmittedJob {
+    /// The job id OF RECORD: `job_id` (this call's own argument) on a fresh
+    /// insert -- always, for `idempotency_key = None` -- or a still-live
+    /// PRIOR submission's id when `Some(key)` collided (see
+    /// [`jammi_db::catalog::Catalog::submit_job_deduped`]'s own doc). A
+    /// caller that cares about the dedup outcome compares this against the
+    /// `job_id` it passed in; a caller that never dedupes (`enqueue`, the
+    /// bench tier) always gets that same `job_id` back.
+    pub recorded_job_id: String,
+}
+
+/// The ONE function in the workspace that builds a
+/// [`jammi_db::catalog::jobs_repo::SubmitJobParams`] for a training kind and
+/// submits it -- every durable training submit edge calls this rather than
+/// constructing `SubmitJobParams` itself:
+/// `crate::session::InferenceSession::submit_fine_tune_spec_deduped`,
+/// [`crate::session::InferenceSession::enqueue`]'s training arm,
+/// [`crate::pipeline::context_predictor`]'s `train_context_predictor_deduped`,
+/// and (across the
+/// crate boundary) `jammi-bench`'s finetune-run tier. `jammi_db::Catalog::
+/// submit_job`/`submit_job_deduped` themselves stay generic, kind-agnostic
+/// APIs -- `jammi-db` never depends on `jammi-ai` and so cannot know this
+/// crate's `TrainingSpec` shape at all -- this function is `jammi-ai`'s own
+/// only caller of them for a training kind (pinned by
+/// `every_durable_training_submit_edge_calls_the_one_admission_function`'s
+/// enumerating source oracle, which now also asserts this function itself
+/// is the only training-kind `SubmitJobParams` construction site in
+/// `crates/jammi-ai/src`).
+///
+/// `admitted` is taken by reference so the caller keeps its own handle for
+/// whatever else it needs the admitted spec for (`training_job_links`, in
+/// every in-crate caller). `model_ref`/`output_model_id` are the base
+/// model's catalog PK and the output NAME every training kind's row
+/// carries -- derived by `crate::session::InferenceSession::
+/// training_job_links` for the three in-crate edges, or resolved however
+/// the caller needs to for a cross-crate one. `execution` is always
+/// [`jammi_db::catalog::status::JobExecution::Queued`] (a training row is
+/// never submitted `Inline` — see [`crate::session::InferenceSession::
+/// run_now`]'s own doc, which is `ComputeSpec`-only). `idempotency_key`
+/// forwards unchanged to [`jammi_db::catalog::Catalog::submit_job_deduped`]
+/// (`None` reproduces a plain, always-fresh insert -- see that method's own
+/// doc for the dedup semantics `Some(key)` applies).
+pub async fn submit_admitted_training(
+    catalog: &jammi_db::catalog::Catalog,
+    admitted: &AdmittedTrainingSpec,
+    job_id: &str,
+    model_ref: &str,
+    output_model_id: &str,
+    priority: i32,
+    idempotency_key: Option<&str>,
+) -> Result<SubmittedJob> {
+    let spec = admitted.spec();
+    let spec_json = serde_json::to_string(spec)?;
+    let recorded_job_id = catalog
+        .submit_job_deduped(
+            jammi_db::catalog::jobs_repo::SubmitJobParams {
+                job_id,
+                kind: spec.kind(),
+                execution: jammi_db::catalog::status::JobExecution::Queued,
+                spec: &spec_json,
+                model_ref: Some(model_ref),
+                output_model_id: Some(output_model_id),
+                model_source: None,
+                priority,
+            },
+            idempotency_key,
+        )
+        .await?;
+    Ok(SubmittedJob { recorded_job_id })
 }
 
 impl TrainingSpec {
@@ -616,21 +767,19 @@ mod tests {
         assert_eq!(common.world_size, 4);
     }
 
-    /// The persisted-row oracle stated honestly: a
-    /// `graph_fine_tune` row is engine-written from a decoded spec, so a
-    /// stray top-level `cache` key under it can only arrive via a
-    /// hand-edited `jobs.spec` row — never a real submit path, since
-    /// `TrainingSpec::GraphFineTune` has no `cache` field to serialize one
-    /// from. Serde is PERMISSIVE by this repo's persisted-row convention
-    /// (no `deny_unknown_fields` — see [`TrainingSpec`]'s own doc and
-    /// <https://github.com/f-inverse/jammi-ai/issues/548> for the `JobSpec`
-    /// reshape that would let this be refused instead of silently ignored):
-    /// the key is DROPPED at deserialize, not refused and not smuggled
-    /// through to any observable field. Proven by re-serializing the decoded
-    /// spec and asserting the key never comes back, rather than merely
-    /// asserting decode succeeds.
+    /// The persisted-row oracle, closing
+    /// <https://github.com/f-inverse/jammi-ai/issues/548>: a `graph_fine_tune`
+    /// row is engine-written from a decoded spec, so a stray top-level
+    /// `cache` key under it can only arrive via a hand-edited `jobs.spec`
+    /// row — never a real submit path, since `TrainingSpec::GraphFineTune`
+    /// has no `cache` field to serialize one from. `#[serde(deny_unknown_fields)]`
+    /// now makes that hand-edit a typed refusal naming the field, not a
+    /// silent drop: this is the RED case the untagged-collapse shape used to
+    /// swallow (before this unit, `TrainingSpec` carried no
+    /// `deny_unknown_fields` at all and this same fixture decoded clean with
+    /// the key silently gone).
     #[test]
-    fn a_stray_cache_key_under_graph_fine_tune_is_dropped_at_deserialize() {
+    fn a_stray_cache_key_under_graph_fine_tune_is_refused_naming_the_field() {
         let original = TrainingSpec::GraphFineTune {
             sources: GraphFineTuneSources {
                 node_source: "nodes".into(),
@@ -660,23 +809,17 @@ mod tests {
         // GraphFineTune` has no `cache` field to have serialized this key.
         object.insert("cache".to_string(), serde_json::json!("use"));
 
-        let decoded: TrainingSpec =
-            serde_json::from_value(value).expect("the unknown key must not refuse deserialize");
+        let err = serde_json::from_value::<TrainingSpec>(value)
+            .expect_err("a stray field under a recognised variant must be refused");
+        let message = err.to_string();
         assert!(
-            matches!(decoded, TrainingSpec::GraphFineTune { .. }),
-            "expected the graph_fine_tune variant, got {decoded:?}"
+            message.contains("cache"),
+            "the refusal must name the stray field `cache`, got: {message}"
         );
-        // The value is GONE, not merely unread: re-serializing the decoded
-        // spec never reproduces a `cache` key, because the in-memory type
-        // has nowhere to have stored it.
-        let re_encoded = serde_json::to_value(&decoded).expect("re-serialize");
         assert!(
-            !re_encoded
-                .as_object()
-                .expect("still an object")
-                .contains_key("cache"),
-            "a stray `cache` key under graph_fine_tune must be dropped, never carried through: \
-             {re_encoded:?}"
+            !message.contains("did not match any variant"),
+            "the refusal must name the field on the ALREADY-SELECTED graph_fine_tune variant, \
+             never the untagged-collapse's variant-search failure: {message}"
         );
     }
 

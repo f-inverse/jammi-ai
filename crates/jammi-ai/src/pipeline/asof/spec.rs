@@ -18,6 +18,7 @@ use arrow_schema::{DataType, SchemaRef};
 /// rejected — NaN has no total order, so "most recent at or before" would be
 /// undefined.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AsofKey {
     /// Equality ("by") columns that partition the match into independent
     /// groups — e.g. an entity id, an instrument symbol, a subject id.
@@ -92,6 +93,7 @@ pub enum TieBreak {
 /// The frozen descriptor an `asof_join` lowers to. Construct via
 /// [`AsofJoinSpecBuilder`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AsofJoinSpec {
     /// The spine's column roles.
     pub left: AsofKey,

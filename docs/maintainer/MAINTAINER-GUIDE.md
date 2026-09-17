@@ -81,6 +81,8 @@ jammi-python -> jammi-ai, jammi-db
 jammi-server -> jammi-admin, jammi-ai, jammi-ballista, jammi-client, jammi-db, jammi-numerics, jammi-test-utils, jammi-wire
 jammi-test-utils -> jammi-db
 jammi-wire -> jammi-db, jammi-lora, jammi-numerics
+probed-ops-index -> jammi-kernels
+symbol-index
 ```
 <!-- END GENERATED: dep-dag -->
 
@@ -685,6 +687,26 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `adjust_compute_slots`/`bind_compute_slots` (the placement policy's slot
   CAS), `put_compute_job`/`get_compute_job`/`list_compute_jobs`/
   `delete_compute_job`, `list_compute_executor_devices`.
+- **Migration `039_canonical_stamps`** (`schema.rs`; `catalog::lease`'s
+  `CANONICAL_STAMP` — `YYYY-MM-DDTHH:MM:SS.ffffffZ`, UTC, exactly six
+  fraction digits) — the ONE catalog stamp shape, enforced at the schema
+  edge on both backends for `jobs.{lease_expires_at, next_assembly_after,
+  updated_at, created_at}`, `instances.{last_seen_at, started_at}`,
+  `result_tables.{lease_expires_at, created_at}`,
+  `result_table_versions.lease_expires_at`, `compute_executors.heartbeat_at`,
+  `models.{created_at, updated_at}`, `applied_migrations.applied_at`.
+  SQLite: a `BEFORE INSERT`/`BEFORE UPDATE OF <col>` trigger per column
+  (shape only — SQLite has no calendar parser); Postgres: `CHECK` per column
+  (shape AND `::timestamptz` cast validity), named
+  `sdchk__<table>__<column>` so `catalog::backend::classify` can recover
+  which column refused a write. Existing rows are normalised first (a
+  nine-digit ISO fraction truncates to six; Postgres's own pre-039
+  `timestamptz`-cast-to-text/`CAST(CURRENT_TIMESTAMP AS TEXT)` rendering
+  casts directly). `now_sortable()` (nine fraction digits) is deleted;
+  `catalog::lease::canonical_stamp_now`/`pg_canonical_stamp` are the ONE
+  writer on either backend, MigrationSql::PerBackend (this is the first
+  migration whose SQLite/Postgres DDL text cannot be unified — a trigger
+  body has no Postgres equivalent syntax).
 - **Typed status enums** — `crates/jammi-db/src/catalog/status.rs`:
   `ResultTableStatus`, `JobStatus`, `EvalRunStatus`, `ModelStatus`. Each
   impls `Display`+`FromStr`. **Contract: the DB value set is total over the enum**
@@ -703,7 +725,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   table, migration 029) and a `building` `result_tables` row both share —
   `LEASE_TS_FORMAT` (a fixed-width UTC format whose lexicographic
   order matches chronological order, so `lease_expires_at < $now` needs no
-  dialect-specific interval arithmetic), `lease_now()`/`lease_deadline(lease)`,
+  dialect-specific interval arithmetic), `canonical_stamp_now()`/`lease_deadline(lease)`,
   `LeaseIntervals { lease,
   heartbeat }` (only buildable through `config::LeaseConfig::intervals()` or
   `Default`, enforcing `heartbeat * 2 < lease` and both non-zero at
@@ -2879,27 +2901,27 @@ read as passed-by-skipping.
 A tabular fine-tune's rows are a **producer output**, not a run's private scan (§3.5
 narrates the whole submit → claim → train → finalize path; this section is the
 data-plane primitive underneath the "Train" step). `materialize_training_set`
-(`crates/jammi-db/src/store/mod.rs:4111`) commits the projected columns once into an
+(`crates/jammi-db/src/store/mod.rs:4180`) commits the projected columns once into an
 immutable `TrainingSet` result table; every reader re-applies the SAME committed order,
 and a session reads it either eagerly (collected into memory) or through a per-rank,
 residency-bounded stream — which arm a run takes is a single predicate, stated below.
 
 **The committed order: one key list, two renderers, declared at both registration
-paths.** `training_set_sort_keys` (`crates/jammi-db/src/store/mod.rs:346`) is the ONE
+paths.** `training_set_sort_keys` (`crates/jammi-db/src/store/mod.rs:415`) is the ONE
 source — every projected column, ascending, NULLs first, in declared order — that both
-`training_set_order_by` (`crates/jammi-db/src/store/mod.rs:373`, the SQL `ORDER BY` clause
+`training_set_order_by` (`crates/jammi-db/src/store/mod.rs:442`, the SQL `ORDER BY` clause
 a reader re-applies) and `training_set_file_sort_order`
-(`crates/jammi-db/src/store/mod.rs:421`, the DataFusion `ListingOptions::with_file_sort_order`
+(`crates/jammi-db/src/store/mod.rs:490`, the DataFusion `ListingOptions::with_file_sort_order`
 form a provider DECLARES) render from — a reader that hand-wrote either form independently
 could silently disagree with the producer's own commitment. `bind_result_table`
-(`crates/jammi-db/src/store/mod.rs:2865`) passes the declared order to `register_table`
+(`crates/jammi-db/src/store/mod.rs:2934`) passes the declared order to `register_table`
 for every single-fragment `TrainingSet` row, on BOTH registration paths: fresh
 materialization (inside `BuildingTable::finish`) and crash recovery
 (`load_existing_tables`, on a session that never saw the write) — so a read-back query
 plans no `SortExec` regardless of which path bound the table:
 `a_training_sets_registration_declares_its_order_so_the_read_back_plans_no_sort`
 (`crates/jammi-db/tests/it/materialization.rs:872`). `training_set_registration_sort_order`
-(`crates/jammi-db/src/store/mod.rs:2959`) is where that declaration is actually read back
+(`crates/jammi-db/src/store/mod.rs:3028`) is where that declaration is actually read back
 off the table's `.materialization.json` sidecar; it can legitimately fail to declare one —
 no sidecar at all (a pre-migration-021 table), the sidecar present but UNREADABLE (an
 object-store error, or a body that fails to parse as the manifest JSON — #500 U2c closing
@@ -2950,7 +2972,7 @@ edge, `map_engine_error` (`crates/jammi-server/src/grpc/wire.rs:109`) maps it to
 **The writer: one partition, no merge — and the deployment rule.** The training set's
 own write plans its full-tuple sort through `single_partition_context`
 (`crates/jammi-db/src/session.rs:1180`) inside `plan_training_set_rows`
-(`crates/jammi-db/src/store/mod.rs:4280`): a `target_partitions = 1` derivation of the
+(`crates/jammi-db/src/store/mod.rs:4349`): a `target_partitions = 1` derivation of the
 caller's session state, so the write is ONE external sort at ONE output partition, never a
 partitioned local-sort-plus-`SortPreservingMergeExec` merge — there is only ever one
 partition to recombine, so no merge operator (with its own real pool reservation on top of
@@ -2958,7 +2980,7 @@ every partition's already-buffered sorted run) is ever planned. The residency th
 O(one batch) plus DataFusion's own spill reservation for that single sort, never O(the
 whole table) — **the deployment rule**, stated where the write is planned: a single
 `[engine] batch_size` batch larger than `[engine] memory_limit`
-`cannot be sorted` (`crates/jammi-db/src/store/mod.rs:4049`), because no batch-granular
+`cannot be sorted` (`crates/jammi-db/src/store/mod.rs:4118`), because no batch-granular
 operator (a spilling external sort, a decoded chunk) can ever hold one. Sized correctly
 the arithmetic is comfortable — a fixture with ~100 KB rows under a 64 MiB pool needs
 `engine.batch_size = 32` (`32 × ~100,000 B ≈ 3.1 MB` per batch) rather than
@@ -2982,7 +3004,7 @@ construction), and the mutable provider's own `MemTable::try_new`
 one partition). The edge this excludes: a hand-built MULTI-partition `MemTable` under
 `single_partition_context` plans a `SortPreservingMergeExec` over N per-partition
 `SortExec`s that still collapses to ONE output partition — the writer's own
-`partition_count` (`crates/jammi-db/src/store/mod.rs:4314`) guard cannot see that shape,
+`partition_count` (`crates/jammi-db/src/store/mod.rs:4383`) guard cannot see that shape,
 because a `MemTable`'s partition count is fixed at construction and never collapses just
 because `target_partitions` changed (unlike a `ListingTable`'s file groups). No production
 source registers one: `MemTable::try_new` has exactly one call site in the workspace, the
@@ -2993,7 +3015,7 @@ rather than `MemTable`-backed.
 
 **A pinned/versioned result table is NOT this universe (#500 U2c closing round, A3).** A
 VERSIONED result table's provider is `build_masked_provider`
-(`crates/jammi-db/src/store/mod.rs:3026`): one `ListingTable` per manifest fragment,
+(`crates/jammi-db/src/store/mod.rs:3095`): one `ListingTable` per manifest fragment,
 combined by `MaskedTableProvider`'s `scan` (`crates/jammi-db/src/store/masked_provider.rs:104`)
 into a `UnionExec` (`crates/jammi-db/src/store/masked_provider.rs:153`) when there is more
 than one fragment — a shape that follows the manifest's OWN fragment count, never
@@ -3022,7 +3044,7 @@ this stream keeps, `PerRank(PartitionSpec)` for training or `All { batch }` for 
 prefetch depth (typed); production trains at `PRODUCTION_PREFETCH_DEPTH`
 (`crates/jammi-ai/src/fine_tune/stream.rs:121`, `= 2`) — a named constant, the regression
 pin for a `prefetch = 2` deadlock an earlier design hit, never a literal at the call site:
-`StreamConfig::new` (`crates/jammi-ai/src/fine_tune/worker.rs:5548`). `open`
+`StreamConfig::new` (`crates/jammi-ai/src/fine_tune/worker.rs:6026`). `open`
 (`crates/jammi-ai/src/fine_tune/stream.rs:379`) runs ONE bounded-memory pre-pass over its
 whole window BEFORE the first training step — a schema check plus, for a numeric target, a
 null/NaN aggregate — so a column-level refusal fires before step 0, not after thousands of
@@ -3035,13 +3057,13 @@ against the full corpus) and GradCache (treats the whole dataset as one in-batch
 batch) both need every row resident before an epoch begins, so a config taking either arm
 gets `Resident` (`crates/jammi-ai/src/fine_tune/source.rs:100`); every other text arm at
 `W = 1` gets `TrainingSource::Streamed`. `worker.rs`'s source selection calls this same
-`whole_set_arm` (`crates/jammi-ai/src/fine_tune/worker.rs:5492`) that the trainer's own
+`whole_set_arm` (`crates/jammi-ai/src/fine_tune/worker.rs:5970`) that the trainer's own
 dispatch refuses a mismatch against, so the two decisions can never come apart. A
 `Streamed` source never collects a `Vec<RecordBatch>` for the training set at all — the
 worker calls only `training_set::materialize_projection_table`
-(`crates/jammi-ai/src/fine_tune/worker.rs:3332`), never `read_back`/
+(`crates/jammi-ai/src/fine_tune/worker.rs:3629`), never `read_back`/
 `read_back_with_reservation` — while a `Resident` loader's construction reads back through
-`read_back_with_reservation` (`crates/jammi-ai/src/fine_tune/worker.rs:5500`) — defined at
+`read_back_with_reservation` (`crates/jammi-ai/src/fine_tune/worker.rs:5978`) — defined at
 `read_back_with_reservation` (`crates/jammi-ai/src/fine_tune/training_set.rs:238`) — and
 attaches the live
 `MemoryReservation` to the loader via `with_reservation`
@@ -3060,7 +3082,7 @@ is pinned by `p_r_a_resident_loader_holds_its_eager_reservation_while_training_r
 **A task-local tenant scope does not cross `tokio::spawn` or a `block_on` from the
 blocking pool.** `tenant` (`crates/jammi-ai/src/fine_tune/source.rs:60`) on `StreamedSet`
 captures the job's tenant via `tenant` (`crates/jammi-ai/src/session.rs:764`) on
-`InferenceSession` while `run_spec` (`crates/jammi-ai/src/fine_tune/worker.rs:3289`) is still
+`InferenceSession` while `run_spec` (`crates/jammi-ai/src/fine_tune/worker.rs:3586`) is still
 executing inside the caller's `with_tenant_scoped` task-local scope; `open_streamed_source`
 (`crates/jammi-ai/src/fine_tune/trainer.rs:4098`) drives the stream's own `open` through
 `Handle::block_on` from the `spawn_blocking` pool, which starts a FRESH top-level poll on a
@@ -4294,8 +4316,8 @@ two-host fleet could not otherwise assemble a `Peer` gang if its only
 free-looking host were the one awaiting its own placement result.
 `probe_claim` still refuses `Awaiting`, exactly like `JobRun`.
 
-`submit_placed` (`crates/jammi-ai/src/fine_tune/worker.rs:2224`) submits the descriptor and awaits the
-stream; its exit arms are total — `submit_placed` (`crates/jammi-ai/src/fine_tune/worker.rs:2224`) documents them: the stream ends
+`submit_placed` (`crates/jammi-ai/src/fine_tune/worker.rs:2466`) submits the descriptor and awaits the
+stream; its exit arms are total — `submit_placed` (`crates/jammi-ai/src/fine_tune/worker.rs:2466`) documents them: the stream ends
 with at least one batch → `WorkerJobError::HandedOff` (the executor owns
 the attempt now: no terminal write, no release); the stream ends in an
 error or with no batch → re-read the row — `claimed_by` still this
@@ -4303,7 +4325,7 @@ instance → `Abandoned` (left `running` for reclaim, an attempt spent at the
 successor's claim); `claimed_by` moved → `HandedOff` (the executor's own
 lease expiry requeues it, never this instance's).
 
-`transfer_claim` (`crates/jammi-db/src/catalog/jobs_repo.rs:1262`) is the hand-off: an `UPDATE` guarded by FOUR conjuncts —
+`transfer_claim` (`crates/jammi-db/src/catalog/jobs_repo.rs:1279`) is the hand-off: an `UPDATE` guarded by FOUR conjuncts —
 `claimed_by = $from` (a stale runner, or a SECOND launch of the same task
 via Ballista's own reset-on-`ExecutorLost`, cannot transfer a claim it does
 not hold — the re-launch guard's second half, `DevicePlacement`'s bind-time
@@ -4315,7 +4337,7 @@ must FAIL a transfer, the opposite of how a reclaim sweep reads that same
 `NULL`). `attempts`/`releases` are untouched by design: a hand-off is zero
 net attempts, never a re-claim.
 
-`run_placed_gang` (`crates/jammi-ai/src/fine_tune/worker.rs:2388`, called from the
+`run_placed_gang` (`crates/jammi-ai/src/fine_tune/worker.rs:2644`, called from the
 executor role's `PlacedGangRunner`) — (i) takes this host's job slot
 through `HostAdmission::probe_claim` (a host already holding a rank, a
 loop-claimed job, or another placement refuses typed BEFORE any row write,
@@ -4561,7 +4583,7 @@ id and the missing field, never silently resolved as an ordinary model or served
 unadapted base.
 
 `load_context_predictor`'s own id-shape backstop
-(`record.model_type`, `crates/jammi-ai/src/pipeline/context_predictor.rs:1217`)
+(`record.model_type`, `crates/jammi-ai/src/pipeline/context_predictor.rs:1220`)
 mirrors the resolver's `FINE_TUNED_ID_PREFIX` cross-check, but a context-predictor id is
 caller-chosen — it carries no reserved prefix a fresh reload can cross-check by shape the way
 `try_catalog_lookup` does — so this surface asserts its own row-shape invariant directly,
@@ -4577,18 +4599,18 @@ The adapter-fetch error contract both reload surfaces share: `fetch_artifact`
 never folding them together. A manifest that is ABSENT entirely — nothing was ever
 published at that prefix, or a catalog pointer names the wrong one — reclassifies to
 `StorageError::NotPublished` (`reclassify_missing_manifest`,
-`crates/jammi-db/src/store/artifact.rs:684`; covered by
+`crates/jammi-db/src/store/artifact.rs:734`; covered by
 `missing_manifest_is_not_published_not_corruption`,
-`crates/jammi-db/src/store/artifact.rs:887`): no manifest is in hand, so there is nothing
+`crates/jammi-db/src/store/artifact.rs:937`): no manifest is in hand, so there is nothing
 to say is corrupt. A manifest that IS present but malformed, or that names a key which is
 missing or hash-mismatched on an otherwise-published bundle, is the genuine integrity
 failure, `StorageError::Layout` (`reclassify_missing_key`,
-`crates/jammi-db/src/store/artifact.rs:715`; `verify_sha256`,
-`crates/jammi-db/src/store/artifact.rs:730`). Any OTHER storage fault off `fetch_artifact`
+`crates/jammi-db/src/store/artifact.rs:765`; `verify_sha256`,
+`crates/jammi-db/src/store/artifact.rs:780`). Any OTHER storage fault off `fetch_artifact`
 — transport/IO, a disabled scheme, driver-init failure, or a permission-denied open on a
 present key (which stays `StorageError::Io`, never reclassified —
 `permission_fault_on_a_present_key_stays_a_transport_error`,
-`crates/jammi-db/src/store/artifact.rs:961`) — is left unchanged.
+`crates/jammi-db/src/store/artifact.rs:1011`) — is left unchanged.
 
 Both reload surfaces match on these two variants explicitly and re-type BOTH into the SAME
 `JammiError::Model`, naming the model id with a distinct message per variant.
@@ -4596,29 +4618,29 @@ Both reload surfaces match on these two variants explicitly and re-type BOTH int
 fine-tuned reload arm, matches `StorageError::NotPublished`
 (`crates/jammi-ai/src/model/resolver.rs:262`) and `StorageError::Layout`
 (`crates/jammi-ai/src/model/resolver.rs:273`) into `JammiError::Model`, and
-`load_context_predictor` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1198`) matches
+`load_context_predictor` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1201`) matches
 the identical pair — `StorageError::NotPublished`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1405`) and `StorageError::Layout`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1415`) — into `JammiError::Model` as
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1408`) and `StorageError::Layout`
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1418`) — into `JammiError::Model` as
 well, never its own `JammiError::Inference`. A catalog record that never recorded an
 `artifact_path` at all is a separate, earlier refusal on each surface that never reaches
 `fetch_artifact` — the resolver's arm also raises `JammiError::Model`
 (`crates/jammi-ai/src/model/resolver.rs:288`), and so does the predictor's own
-`JammiError::Model` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1362`). Any OTHER
+`JammiError::Model` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1365`). Any OTHER
 storage fault propagates unchanged past both surfaces' own catch-all —
 `Err(e) => return Err(e)` (`crates/jammi-ai/src/model/resolver.rs:283`) and the identical
-`Err(e) => return Err(e)` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1424`).
+`Err(e) => return Err(e)` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1427`).
 
 Every corrupted-catalog-record refusal EARLIER in this reload path — before `fetch_artifact` is
 even reached — is the SAME `JammiError::Model` variant too: an
 absent `config_json`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1239`), an unparseable `config_json`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1243`, a DISTINCT message from "absent",
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1246`), an unparseable `config_json`
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1246`, a DISTINCT message from "absent",
 never collapsed), and a parseable-but-incomplete config (missing `head`/`architecture`/
 `feature_dim`/`context_k`/`hidden_dim`/`num_heads`/`num_layers`/`head_width`/`value_column`/
 `target_scaler`) each name the model id and the specific field. The `varmap.load` arm — a
 manifest-verified bundle missing `model.safetensors`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1426`) — matches `CandleBackend::load`'s
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1429`) — matches `CandleBackend::load`'s
 peer refusal for a fine-tuned model's weights file, `"Failed to load safetensors: {e}"`
 (`crates/jammi-ai/src/model/backend/candle.rs:2767`), instead of its own
 `JammiError::Inference`.

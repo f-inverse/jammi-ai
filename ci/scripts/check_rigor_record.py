@@ -123,6 +123,42 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LEAD_GATE_LIB = REPO_ROOT / ".claude" / "hooks" / "lead-gate-lib.py"
 RIGOR_DIR = REPO_ROOT / "docs" / "rigor"
+
+# --------------------------------------------------------------------------- #
+# rust symbol index (ci/tools/symbol-index -- a real `syn` AST parse). This
+# repo's convention (see check_plan_citations.py / check_no_consumer_names.py,
+# its first two consumers) is a small, independently-maintained COPY of this
+# one function per CI script that needs it, never a cross-script import — the
+# tool's own module doc names this file as its third intended consumer
+# (issue #557 item 2, the AST-derived required call-site set).
+# --------------------------------------------------------------------------- #
+
+SYMBOL_INDEX_CRATE = "symbol-index"
+
+
+def build_symbol_index(roots: list[str], cwd: Path = REPO_ROOT) -> dict:
+    """Runs the REAL `symbol-index` tool over `roots` and returns the parsed
+    JSON index (`{"items": [...], "calls": [...], ...}`). Raises
+    `RuntimeError` on a non-zero exit or unparseable stdout — never returns a
+    partial/guessed index."""
+    proc = subprocess.run(
+        ["cargo", "run", "--release", "-p", SYMBOL_INDEX_CRATE, "--", *roots],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"{SYMBOL_INDEX_CRATE} failed (rc={proc.returncode}) over {roots}:\n"
+            f"{proc.stderr.strip()[-4000:]}"
+        )
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"{SYMBOL_INDEX_CRATE} did not emit valid JSON on stdout ({exc}); "
+            f"stderr tail:\n{proc.stderr.strip()[-2000:]}"
+        ) from exc
 ALLOWLIST_PATH = REPO_ROOT / "ci" / "scripts" / "rigor_record_allowlist.txt"
 # esc-lead-gate-R12 (M3'): in-flight units whose second-round BLOCK predates
 # fix round 1's anticipation mechanism land without a
@@ -364,11 +400,14 @@ def _r12_reject_foreign_anticipation_rows(path: str, rows: list[tuple[int, dict]
     required_gates` selects (hiding a real `gates` object behind "no
     `gates` object"), or simply deny `check_anticipation_witnesses`
     outright ("no non-empty `residual_risk`"). The exporter's own
-    attestation-row half was later reverted entirely (mutations/
-    exclusions are HOOK-ATTESTED ONLY — visible in the relay artifact
-    readers 1 and 2 already read, never exported or committed); a
-    `lead-relay-attestation` row found HERE is therefore always a
-    FOREIGN row — a stale pre-revert export still committed, or a
+    attestation-row half was later reverted entirely; `mutations`/
+    `exclusions` are now exported by a SEPARATE command
+    (`--export-attestation`) into a SEPARATE committed stream
+    (`docs/rigor/<slug>.attestation.jsonl`, read by `check_attestation_
+    witnesses`, never this function) — never folded back into THIS
+    stream. A `lead-relay-attestation` row found HERE is therefore always
+    a FOREIGN row for THIS stream — a stale pre-revert export still
+    committed, a row exported into the wrong file by hand, or a
     hand-edit. This function REFUSES it with a loud, NAMED FAIL — never
     silently ignores it (which would let a tampered/legacy row go
     undetected) and never silently SELECTS it (the earlier bug this
@@ -381,9 +420,9 @@ def _r12_reject_foreign_anticipation_rows(path: str, rows: list[tuple[int, dict]
             result.fail(
                 f"{path}:{lineno}: row carries agent_type={agent_type!r}, not "
                 "`lead-anticipation` -- a foreign row (e.g. a `lead-relay-attestation` row -- "
-                "mutations/exclusions are hook-attested only and never exported) does not "
-                "belong in the anticipation stream; it is REFUSED here, never ignored and "
-                "never selected as governing (esc-lead-gate-R12 fix round 6 Z12)")
+                "mutations/exclusions export into docs/rigor/<slug>.attestation.jsonl instead, "
+                "never here) does not belong in the anticipation stream; it is REFUSED here, "
+                "never ignored and never selected as governing (esc-lead-gate-R12 fix round 6 Z12)")
             continue
         kept.append((lineno, row))
     return kept
@@ -585,6 +624,591 @@ def check_anticipation_witnesses(cwd: Path, unit_slug: str, rows: list[dict], re
                 _git(cwd, "worktree", "remove", "--force", str(tmp_wt))
 
 
+def _r12_reject_foreign_attestation_rows(path: str, rows: list[tuple[int, dict]],
+                                          result: Result) -> list[tuple[int, dict]]:
+    """The attestation stream's own foreign-row refusal, the SAME shape
+    the anticipation stream's own refusal already establishes: every
+    committed row's `kind` must be exactly `"lead-relay-
+    attestation"` (`cmd_export_attestation`'s own stamp) — a row of any
+    other shape (a hand-edit, a row copied from the anticipation stream)
+    is REFUSED here, loudly and by name, never ignored and never selected
+    as evidence."""
+    kept: list[tuple[int, dict]] = []
+    for lineno, row in rows:
+        kind = row.get("kind")
+        if kind != "lead-relay-attestation":
+            result.fail(
+                f"{path}:{lineno}: row carries kind={kind!r}, not `lead-relay-attestation` -- "
+                "a foreign row does not belong in the attestation stream; it is REFUSED here, "
+                "never ignored and never selected as evidence (issue #557 item 1)"
+            )
+            continue
+        kept.append((lineno, row))
+    return kept
+
+
+def check_attestation_witnesses(cwd: Path, unit_slug: str, rows: list[dict],
+                                 range_spec: str, result: Result) -> None:
+    """issue #557 items 1-2, half 1 (the committed record) + half 2 (the
+    CI-derived required set): `mutations`/`exclusions` (item 8b/8c) are
+    LEAD-ATTESTED, visible to the hook at decision time from the
+    (gitignored, ephemeral) relay artifact — never from anything this CI
+    script can read. Reader 3 therefore never tries to see WHAT a relay
+    attested; it RE-DERIVES, from the SAME two committed facts the hook's
+    own arming conditions already key off (an open second-round BLOCK
+    row's `finding_locations`/`class_enumeration`, and the fix's own
+    `base...HEAD` diff), WHETHER an attestation was ever REQUIRED at all —
+    then requires the committed `docs/rigor/<unit_slug>.attestation.jsonl`
+    to carry real evidence for each requirement THAT RE-DERIVATION FINDS,
+    never for a requirement it cannot see (the hook's own attack-budget-
+    bounded per-relay scoping stays hook-side; this is a per-unit, whole-
+    diff derivation, a stated widening, never a narrower re-check).
+
+    Armed the SAME way `check_anticipation_witnesses` is (an open
+    second-round BLOCK row, not on the shrink-only grandfather list).
+    `mutations` required iff the diff's own new-definition surfaces
+    (`mod._parse_new_surfaces`, the SAME AST-derived enumeration item 8b
+    itself uses) include one inside a file the open BLOCK(s)' own
+    `finding_locations`/`class_enumeration` also name. `exclusions`
+    required iff `mod._r12_new_test_surfaces` (the SAME subset item 8c
+    uses) is non-empty. EITHER arming condition requires the committed
+    file to exist and carry, across its rows, real shape-checked evidence
+    for the arming(s) that fired — never a placeholder, never a file that
+    exists but proves nothing (an empty stream, or a stream carrying only
+    the OTHER field)."""
+    mod = _lib_module()
+    block_rows = _r12_second_round_block_rows(mod, rows)
+    if not block_rows:
+        return  # nothing to attest -- no open second-round BLOCK in this record
+
+    by_file: set[str] = set()
+    for row in block_rows:
+        locs = {s for s in (row.get("finding_locations") or []) if isinstance(s, str)}
+        enum = {s for s in (row.get("class_enumeration") or []) if isinstance(s, str)}
+        for key in locs | enum:
+            by_file.add(mod._key_to_file(key))
+
+    ok_diff, diff_out = _git(cwd, "diff", "-U0", "--end-of-options", range_spec)
+    new_surfaces = mod._parse_new_surfaces(diff_out) if ok_diff else {}
+    new_surface_files = {mod._key_to_file(k) for k in new_surfaces}
+    mutations_required = bool(by_file & new_surface_files)
+    new_test_surfaces = mod._r12_new_test_surfaces(new_surfaces)
+    exclusions_required = bool(new_test_surfaces)
+
+    if not (mutations_required or exclusions_required):
+        return  # armed by the BLOCK, but this diff never widens either 8b/8c set
+
+    path = f"docs/rigor/{unit_slug}.attestation.jsonl"
+    ok, text = _git(cwd, "show", f"HEAD:{path}")
+    has_file = ok and bool(text.strip())
+
+    if unit_slug in _r12_grandfathered_slugs():
+        if not has_file:
+            result.warn(f"{unit_slug!r} is on the shrink-only R12 grandfather list "
+                        f"({_display_path(R12_GRANDFATHER_PATH)}) — no {path} carried; not required")
+            return
+    elif not has_file:
+        requirement = "mutations" if mutations_required and not exclusions_required else (
+            "exclusions" if exclusions_required and not mutations_required else "mutations and exclusions")
+        result.fail(
+            f"the fix's own diff ({requirement}) arms item 8b/8c's committed attestation "
+            f"requirement but no {path} — export one with `python3 .claude/hooks/lead-gate-lib.py "
+            f"--export-attestation {unit_slug} > {path}` and commit it (issue #557 items 1-2); an "
+            f"in-flight unit whose BLOCK predates this mechanism is exempted only via "
+            f"{_display_path(R12_GRANDFATHER_PATH)} (shrink-only, human-added)")
+        return
+
+    if not has_file:
+        return
+
+    art_rows: list[tuple[int, dict]] = []
+    for i, line in enumerate(text.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError as exc:
+            result.fail(f"{path}:{i + 1}: not valid JSON ({exc})")
+            continue
+        if not isinstance(parsed, dict):
+            result.fail(f"{path}:{i + 1}: not a JSON object")
+            continue
+        art_rows.append((i + 1, parsed))
+
+    art_rows = _r12_reject_foreign_attestation_rows(path, art_rows, result)
+    if not art_rows:
+        result.fail(f"{path}: carries no parseable lead-relay-attestation row")
+        return
+
+    # Every row's own `mutations`/`exclusions` is judged through the SAME
+    # shared shape functions the hook itself validated it against before
+    # the relay was ever accepted (`mod._r12_mutations_array_rejection`/
+    # `mod._r12_exclusions_shape_rejection`) — never a second,
+    # independently maintained copy of those checks in THIS file (the
+    # exact class the R12sweepast/RR31 detectors exist to catch). A row
+    # that fails the shared check is reported (so a hand-edit-after-export
+    # drift is visible) but does not by itself deny the whole check — only
+    # the ABSENCE of any row that satisfies the requirement does.
+    mutations_ok = False
+    exclusions_ok = False
+    for lineno, row in art_rows:
+        if "mutations" in row:
+            why = mod._r12_mutations_array_rejection(row["mutations"])
+            if why is None:
+                mutations_ok = True
+            else:
+                result.warn(f"{path}:{lineno}: mutations {why}")
+        if "exclusions" in row:
+            why = mod._r12_exclusions_shape_rejection(new_test_surfaces, row["exclusions"])
+            if why is None:
+                exclusions_ok = True
+            else:
+                result.warn(f"{path}:{lineno}: exclusions {why}")
+
+    if mutations_required and not mutations_ok:
+        result.fail(
+            f"{path}: the fix's own diff adds a new definition in a file the open BLOCK's own "
+            "finding_locations/class_enumeration also names (item 8b), but no committed row "
+            "carries a shape-valid, non-empty `mutations` array"
+        )
+    if exclusions_required and not exclusions_ok:
+        result.fail(
+            f"{path}: the fix's own diff adds {len(new_test_surfaces)} new TEST definition(s) "
+            f"(item 8c), e.g. {list(new_test_surfaces)[:3]}, but no committed row carries a "
+            "shape-valid `exclusions` object covering all of them"
+        )
+
+
+_RR_HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def _rust_added_lines_by_file(cwd: Path, range_spec: str) -> dict[str, set[int]]:
+    """`{path: {new_line_no, ...}}` for every ADDED (`+`) line in a `.rs`
+    file under `git diff --unified=0 <range_spec>` — the SAME `+++
+    b/<path>` / `@@ -a,b +c,d @@` tracking `check_no_consumer_names.py`'s
+    `added_crate_lines_with_paths` already established, applied here to ANY
+    `.rs` path (never scoped to `crates/` alone — a `mutations[].site` can
+    legitimately name a file under `ci/tools/**` too) and returning a
+    per-file LINE SET (never text) since `_r12_required_call_site_set`
+    cross-references the symbol-index's OWN line numbers, not the diff's
+    raw text a second time."""
+    ok, diff_out = _git(cwd, "diff", "--unified=0", "--end-of-options", range_spec)
+    if not ok:
+        return {}
+    out: dict[str, set[int]] = {}
+    current_file: str | None = None
+    new_line_no = 0
+    for line in diff_out.splitlines():
+        if line.startswith("+++ "):
+            raw_path = line[len("+++ "):]
+            if raw_path.startswith("b/"):
+                raw_path = raw_path[2:]
+            current_file = None if raw_path == "/dev/null" else raw_path
+            continue
+        if line.startswith("+++"):
+            continue
+        if line.startswith("@@ "):
+            m = _RR_HUNK_HEADER_RE.match(line)
+            if m:
+                new_line_no = int(m.group(1))
+            continue
+        if line.startswith("+") and current_file is not None:
+            if current_file.endswith(".rs"):
+                out.setdefault(current_file, set()).add(new_line_no)
+            new_line_no += 1
+    return out
+
+
+def _r12_required_call_site_set(cwd: Path, added: dict[str, set[int]]) -> tuple[set[str], dict]:
+    """issue #557 item 2: the REQUIRED call-site set, derived from a REAL
+    `syn` AST parse (`ci/tools/symbol-index`), never a regex reader and
+    never a hand list — `{"path:line", ...}` covering:
+
+      (a) every NEW non-test fn/method DEFINITION this diff's own added
+          lines (`added`) introduce, and
+      (b) every NEW call site this diff's own added lines add, whose
+          callee's bare name matches a fn/method whose OWN pre-existing
+          definition span this SAME diff also touches (`changed_fn_names`
+          — a "changed fn", never a "new fn": (a) and (b) are disjoint
+          categories of the ONE property, "this diff makes new or
+          different code run").
+
+    `index` (the raw symbol-index JSON, covering the FULL text of every
+    scanned file, not just added lines) is returned alongside so a caller
+    can also ask "does this path:line resolve to ANY real position at
+    HEAD" (`_r12_site_resolves`, below) without a second `cargo run`.
+    `roots` are the PARENT DIRECTORIES of `added`'s own files, de-
+    duplicated — `symbol-index`'s own `walkdir` then covers every sibling
+    file in the same directory too (a legitimate `mutations[].site` in an
+    UNTOUCHED sibling file inside a touched directory still resolves), a
+    stated, bounded widening, never the whole `crates/` tree."""
+    if not added:
+        return set(), {"items": [], "calls": []}
+    roots = sorted({str((cwd / rel).parent) for rel in added})
+    index = build_symbol_index(roots)
+
+    def _rel(index_path: str) -> str | None:
+        for rel in added:
+            if index_path == rel or index_path.endswith("/" + rel):
+                return rel
+        return None
+
+    fn_items = [it for it in index.get("items", [])
+                if it.get("kind") == "fn" and not it.get("is_test")]
+    new_defs: set[str] = set()
+    changed_fn_names: set[str] = set()
+    for it in fn_items:
+        rel = _rel(it["path"])
+        if rel is None:
+            continue
+        new_lines = added.get(rel, set())
+        line, line_end = it["line"], it.get("line_end", it["line"])
+        if line in new_lines:
+            new_defs.add(f"{rel}:{line}")
+        elif any(l in new_lines for l in range(line, line_end + 1)):
+            changed_fn_names.add(it["name"])
+
+    new_call_sites: set[str] = set()
+    for c in index.get("calls", []):
+        rel = _rel(c["path"])
+        if rel is None or c.get("in_test"):
+            continue
+        new_lines = added.get(rel, set())
+        if c["line"] in new_lines and c["callee"] in changed_fn_names:
+            new_call_sites.add(f"{rel}:{c['line']}")
+
+    return new_defs | new_call_sites, index
+
+
+def _r12_site_resolves(site: str, index: dict) -> bool:
+    """`True` iff `site` (a `mutations[].site` string, `"path:line"` per
+    `_r12_mutations_array_rejection`'s own shape check) names a REAL
+    position in `index` — either inside an item's own `[line, line_end]`
+    span or exactly a call site's own `line` — matched by path SUFFIX
+    (`index`'s own `path` is however `symbol-index` reported it,
+    ABSOLUTE when `roots` were absolute; `site`'s own path is always the
+    diff/repo-relative form `_r12_mutations_array_rejection` never
+    normalizes). Never "the file exists" alone — that would accept ANY
+    line number in a real file as if it named something; a phantom site
+    is exactly a `path:line` this returns `False` for."""
+    if ":" not in site:
+        return False
+    rel_path, _, line_txt = site.rpartition(":")
+    if not line_txt.isdigit():
+        return False
+    line = int(line_txt)
+
+    def _matches(index_path: str) -> bool:
+        return index_path == rel_path or index_path.endswith("/" + rel_path)
+
+    for it in index.get("items", []):
+        if _matches(it["path"]) and it["line"] <= line <= it.get("line_end", it["line"]):
+            return True
+    for c in index.get("calls", []):
+        if _matches(c["path"]) and c["line"] == line:
+            return True
+    return False
+
+
+def check_required_call_site_set(cwd: Path, unit_slug: str, rows: list[dict],
+                                  range_spec: str, result: Result) -> None:
+    """issue #557 item 2 (Reader 3's AST-derived required call-site set):
+    `mutations[].site` is LEAD-ATTESTED text a human cannot mechanically
+    catch FABRICATION in merely by re-validating its JSON SHAPE
+    (`_r12_mutations_array_rejection`, already run by
+    `check_attestation_witnesses`, above — shape alone accepts
+    `"site": "nowhere.rs:99999"` exactly as readily as a real one). This
+    reader independently derives, from a REAL `syn` AST parse of the
+    diff's own touched `.rs` files (`ci/tools/symbol-index`, never a
+    regex reader and never a hand list), whether EACH committed
+    `mutations[].site` resolves to a real definition or call site at
+    HEAD — an unresolvable ("phantom") site is a hard FAIL, named by
+    text, LAYERED ON TOP OF the shape check above, never a re-derivation
+    of it.
+
+    Armed only over rows whose `mutations` array ALREADY passes the
+    shared shape check (never re-derives THAT arming a second time — the
+    exact class RR31 exists to catch) and only over `.rs`-named sites (a
+    Python `mutations[].site` stays covered by the shape check alone —
+    this reader carries a Rust index only, stated, never silently
+    widened to a language it cannot parse). A no-op whenever the diff
+    touches no `.rs` file, or no committed row carries a shape-valid,
+    non-empty `mutations` array at all."""
+    mod = _lib_module()
+    block_rows = _r12_second_round_block_rows(mod, rows)
+    if not block_rows:
+        return
+
+    path = f"docs/rigor/{unit_slug}.attestation.jsonl"
+    ok, text = _git(cwd, "show", f"HEAD:{path}")
+    if not ok or not text.strip():
+        return  # check_attestation_witnesses already reports a missing-when-required file
+
+    art_rows: list[tuple[int, dict]] = []
+    for i, line in enumerate(text.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            art_rows.append((i + 1, parsed))
+    quiet = Result()
+    art_rows = _r12_reject_foreign_attestation_rows(path, art_rows, quiet)
+
+    mutation_sites: list[tuple[int, str]] = []
+    for lineno, row in art_rows:
+        mutations = row.get("mutations")
+        if mod._r12_mutations_array_rejection(mutations) is not None:
+            continue  # not shape-valid -- check_attestation_witnesses already names this
+        for entry in mutations:
+            site = entry.get("site")
+            if isinstance(site, str) and site.strip():
+                mutation_sites.append((lineno, site))
+    if not mutation_sites:
+        return  # no shape-valid `mutations` row to examine -- nothing for this reader to add
+
+    rust_sites = [(lineno, site) for lineno, site in mutation_sites
+                  if site.rpartition(":")[0].endswith(".rs")]
+    if not rust_sites:
+        return  # every committed site names a non-Rust file
+
+    added = _rust_added_lines_by_file(cwd, range_spec)
+    if not added:
+        return  # this diff touches no `.rs` file -- nothing to derive a required set from
+
+    try:
+        required_set, index = _r12_required_call_site_set(cwd, added)
+    except (RuntimeError, OSError) as exc:
+        # `OSError` (its own `FileNotFoundError` subclass included) covers
+        # the ONE environment this reader cannot assume: `check_rigor_
+        # record.py`'s OTHER checks are deliberately toolchain-free (this
+        # script's own module doc), so a run with no `cargo` on `PATH` at
+        # all must degrade to advisory here, never crash the whole script
+        # for every OTHER check this same invocation still owes a verdict.
+        result.warn(f"{path}: could not build the symbol-index required call-site set — {exc} "
+                    "(advisory; the shape check above still applies)")
+        return
+
+    for lineno, site in rust_sites:
+        if _r12_site_resolves(site, index):
+            continue
+        hint = sorted(required_set)[:3] or "(none — this diff adds no new Rust definition or " \
+            "call site of a changed fn)"
+        result.fail(
+            f"{path}:{lineno}: mutations `site` {site!r} does not resolve to a real definition "
+            f"or call site at HEAD (symbol-index, issue #557 item 2) — a phantom site; the "
+            f"diff's own AST-derived required set names, e.g., {hint}"
+        )
+
+
+def _r12_select_governing_anticipation_row(mod, path: str, text: str) -> dict | None:
+    """The SAME governing-row selection `check_required_gates` runs (head
+    match, else the greatest normalized `ts` instant), reused here rather
+    than re-derived a third time. Returns `None` — SILENTLY, never a
+    SECOND `result.fail(...)` — on ANY ambiguity (no parseable rows, an
+    all-foreign stream, unreliable ordering evidence, or a tie):
+    `check_required_gates` already reports that EXACT ambiguity, over the
+    SAME committed data, in the SAME `run_check` pass; a second report of
+    the identical problem from a different reader would be noise, not a
+    second finding."""
+    raw_rows: list[tuple[int, dict]] = []
+    for i, line in enumerate(text.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            raw_rows.append((i + 1, parsed))
+    if not raw_rows:
+        return None
+    quiet = Result()
+    rows_with_lineno = _r12_reject_foreign_anticipation_rows(path, raw_rows, quiet)
+    if not rows_with_lineno:
+        return None
+
+    ok_head, head_now_raw = _git(REPO_ROOT, "rev-parse", "HEAD")
+    head_now = head_now_raw.strip() if ok_head else None
+
+    def _row_head(r: dict) -> str | None:
+        h = r.get("head_sha")
+        return h if isinstance(h, str) and h else None
+
+    def _row_instant(r: dict):
+        return mod._r12_normalize_ts_instant(r.get("ts"))
+
+    matching = [(ln, r) for ln, r in rows_with_lineno if head_now and _row_head(r) == head_now]
+    pool = matching if matching else rows_with_lineno
+    if len(pool) >= 2 and any(_row_instant(r) is None for _, r in pool):
+        return None
+    max_instant = max(_row_instant(r) for _, r in pool)
+    tied = [(ln, r) for ln, r in pool if _row_instant(r) == max_instant]
+    if len(tied) >= 2:
+        return None
+    return tied[0][1]
+
+
+_R12_RESIDUAL_MARKER_RE = re.compile(r"#\s*R12-RESIDUAL:")
+_BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)`")
+
+
+def _residual_marker_enclosing_functions(source: str) -> dict[int, str]:
+    """`{marker_line_no: enclosing_function_name}` for every line in
+    `source` that `_R12_RESIDUAL_MARKER_RE` (above) matches (a real
+    `ast.parse` of `lead-gate-lib.py`'s own text, never a text scan for
+    "def") — the
+    SMALLEST enclosing `FunctionDef`/`AsyncFunctionDef` span, so a marker
+    inside a nested closure attributes to the closure, not its outer
+    function. A marker line outside every function span (module level) is
+    simply absent from the returned map — this repo's own markers are
+    always inside a function body, a checked-against-the-real-file scope,
+    not an unverified assumption."""
+    tree = ast.parse(source)
+    lines = source.splitlines()
+    marker_lines = {i + 1 for i, line in enumerate(lines) if _R12_RESIDUAL_MARKER_RE.search(line)}
+    if not marker_lines:
+        return {}
+    spans: list[tuple[int, int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            end = getattr(node, "end_lineno", node.lineno)
+            spans.append((node.lineno, end, node.name))
+    spans.sort(key=lambda s: s[1] - s[0])  # smallest span first
+    out: dict[int, str] = {}
+    for ml in marker_lines:
+        for start, end, name in spans:
+            if start <= ml <= end:
+                out[ml] = name
+                break
+    return out
+
+
+def _all_function_names(source: str) -> set[str]:
+    tree = ast.parse(source)
+    return {
+        node.name for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _r12_new_residual_marker_lines(cwd: Path, range_spec: str) -> set[int]:
+    """Line numbers, in `.claude/hooks/lead-gate-lib.py`'s OWN file, that
+    BOTH match `_R12_RESIDUAL_MARKER_RE` (above) AND are a line
+    `base...HEAD` itself ADDS — never the whole file's accumulated
+    history of markers (this repo's own `lead-gate-lib.py` carries many
+    pre-existing, already-reviewed residuals no CURRENT unit's own
+    `residual_risk` was ever meant to re-name). The SAME zero-context
+    diff-hunk line-number technique `check_attestation_witnesses` already
+    uses, scoped to this one file."""
+    ok, diff_out = _git(cwd, "diff", "-U0", "--end-of-options", range_spec,
+                         "--", ".claude/hooks/lead-gate-lib.py")
+    if not ok:
+        return set()
+    lines: set[int] = set()
+    new_line_no = 0
+    for line in diff_out.splitlines():
+        if line.startswith("@@ "):
+            m = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            if m:
+                new_line_no = int(m.group(1))
+            continue
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            if _R12_RESIDUAL_MARKER_RE.search(line[1:]):
+                lines.add(new_line_no)
+            new_line_no += 1
+    return lines
+
+
+def check_residual_risk_bidirectional(cwd: Path, unit_slug: str, range_spec: str, result: Result) -> None:
+    """issue #570: an admission that a property is UNCOVERED is a
+    committed, machine-readable record a reader ENFORCES — never prose
+    alone. Bidirectional cross-reference between `lead-gate-lib.py`'s own
+    markers (`_R12_RESIDUAL_MARKER_RE`, above) and the committed
+    anticipation record's GOVERNING row's `residual_risk` field:
+
+      FORWARD — every marked line THIS UNIT'S OWN DIFF ADDS
+      (`_r12_new_residual_marker_lines` — never a pre-existing,
+      already-reviewed marker from before this unit's own fix; the
+      original closing-audit finding this rebuilds was about a NEWLY
+      introduced residual, not the file's whole history) has its own
+      enclosing function name (`_residual_marker_enclosing_functions`, a
+      real `ast.parse`) appear as a literal substring in `residual_risk`.
+
+      BACKWARD — every backtick-quoted identifier in `residual_risk` that
+      is ALSO a real function name in `lead-gate-lib.py` must carry AT
+      LEAST ONE marker somewhere in its own span (checked against the
+      WHOLE file, not diff-scoped — a residual_risk citing a function
+      with NO marker anywhere is over-claimed regardless of when that
+      function was last touched) — an over-claimed residual is refused
+      the same way an under-claimed one is.
+
+    Armed only when THIS UNIT'S OWN DIFF adds at least one new marker AND
+    a governing anticipation row is selectable (silently no-ops on
+    ambiguity — see `_r12_select_governing_anticipation_row`'s own
+    docstring for why that is never a SECOND report of the same
+    ambiguity)."""
+    ok, source = _git(cwd, "show", "HEAD:.claude/hooks/lead-gate-lib.py")
+    if not ok:
+        return  # nothing to check (file missing at HEAD is another reader's concern)
+    new_marker_lines = _r12_new_residual_marker_lines(cwd, range_spec)
+    if not new_marker_lines:
+        return  # this unit's own diff adds no NEW residual marker -- nothing to require
+    try:
+        enclosing = _residual_marker_enclosing_functions(source)
+    except SyntaxError:
+        result.fail(".claude/hooks/lead-gate-lib.py does not parse at HEAD -- cannot verify the "
+                    "# R12-RESIDUAL <-> residual_risk bidirectional property (issue #570)")
+        return
+    marked_functions = {name for line, name in enclosing.items() if line in new_marker_lines}
+    if not marked_functions:
+        return  # every new marker line fell outside every function span (module level) -- nothing to require
+
+    path = f"docs/rigor/{unit_slug}.anticipation.jsonl"
+    ok, text = _git(cwd, "show", f"HEAD:{path}")
+    if not ok or not text.strip():
+        return  # no anticipation record -- check_anticipation_witnesses owns that absence
+
+    mod = _lib_module()
+    governing = _r12_select_governing_anticipation_row(mod, path, text)
+    if governing is None:
+        return  # no unambiguous governing row -- check_required_gates already reports why
+
+    residual_risk = governing.get("residual_risk")
+    if not isinstance(residual_risk, str) or not residual_risk.strip():
+        return  # check_anticipation_witnesses already requires a non-empty residual_risk
+
+    missing_forward = sorted(fn for fn in marked_functions if fn not in residual_risk)
+    if missing_forward:
+        result.fail(
+            f"{path}: the governing row's residual_risk does not name "
+            f"{len(missing_forward)} `# R12-RESIDUAL`-marked function(s) in lead-gate-lib.py, "
+            f"e.g. {missing_forward[:3]} (issue #570)"
+        )
+
+    # BACKWARD is checked against the WHOLE file's marker set (every
+    # function with a `# R12-RESIDUAL` marker ANYWHERE, not just a new
+    # one this unit's own diff adds) — a residual_risk citing an OLDER,
+    # already-marked function is legitimate; only a citation naming a
+    # function with NO marker at all, anywhere, is over-claimed.
+    all_marked_functions = set(enclosing.values())
+    all_function_names = _all_function_names(source)
+    cited = set(_BACKTICK_IDENT_RE.findall(residual_risk))
+    over_claimed = sorted(
+        name for name in cited if name in all_function_names and name not in all_marked_functions
+    )
+    if over_claimed:
+        result.fail(
+            f"{path}: the governing row's residual_risk names {over_claimed[:3]} as a residual, "
+            "but lead-gate-lib.py carries no `# R12-RESIDUAL` marker anywhere inside that "
+            "function's own span (issue #570)"
+        )
+
+
 def _unit_allowlisted(unit_slug: str) -> bool:
     if not ALLOWLIST_PATH.exists():
         return False
@@ -676,12 +1300,33 @@ def run_check(cwd: Path = REPO_ROOT) -> Result:
         # ADVISORY.
         check_anticipation_witnesses(cwd, unit_slug, [r for r in rows if isinstance(r, dict)], result)
 
+        # issue #557 items 1-2: the committed mutations/exclusions
+        # attestation record — armed by the SAME open-BLOCK condition, but
+        # additionally re-derives (never reads) whether item 8b/8c's own
+        # requirement actually fired for THIS diff.
+        check_attestation_witnesses(
+            cwd, unit_slug, [r for r in rows if isinstance(r, dict)], range_spec, result)
+
+        # issue #557 item 2: the CI-derived required call-site set (a real
+        # `syn` AST parse via ci/tools/symbol-index, never a regex reader
+        # or a hand list) — layered on top of check_attestation_witnesses'
+        # own shape check; a phantom `mutations[].site` is a hard FAIL.
+        check_required_call_site_set(
+            cwd, unit_slug, [r for r in rows if isinstance(r, dict)], range_spec, result)
+
         # esc-lead-gate-R12 fix round 3 item 8a READER 3 — armed
         # UNCONDITIONALLY (fix round 5 Z4 made a missing/empty/all-comment
         # `ci/lead-gate-required-commands.txt` a hard FAIL here, never a
         # silent skip when it is absent); shape+value only, never
         # re-executed.
         check_required_gates(cwd, unit_slug, result)
+
+        # issue #570: the bidirectional # R12-RESIDUAL <-> residual_risk
+        # property — armed unconditionally whenever lead-gate-lib.py
+        # carries at least one marker; silently no-ops when there is no
+        # unambiguous governing anticipation row (check_required_gates
+        # already reports that ambiguity).
+        check_residual_risk_bidirectional(cwd, unit_slug, range_spec, result)
 
     contract_paths = [p for p in changed if _matches_contract_glob(p)]
     if not contract_paths:
@@ -713,46 +1358,42 @@ def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
     and value only — never re-executed (these are already CI jobs
     elsewhere in `.github/workflows/`).
 
-    Fix round 4 Z2 / fix round 5 Z5: the governing row is selected ORDER-
-    INDEPENDENTLY, never by `rows[-1]` (append position). `cmd_export_
-    anticipation` dumps every `<slug>.anticipation.*.json` artifact still
-    on disk, `sorted(sdir.iterdir())` — i.e. sorted by FILENAME, a tip
-    sha, which is pseudorandom hex and carries no chronological meaning;
-    an older round's artifact can sort AFTER a newer round's and land on
-    the last line of the committed export. Since fix round 5, the SAME
-    exporter stamps `ts` (the artifact FILE's own mtime) and `head_sha`
-    (the artifact's own `pre_fix_sha`) on every row it emits — so
-    `_row_head`/`_row_ts_text` below select the row whose own `head_sha`
-    matches this checkout's actual `HEAD` when one does (the case where
-    the export was captured at the exact commit reader 3 is validating);
-    when none does — the common case, since a pre-fix witness by
-    construction predates the commit it is validated against — every row
-    is eligible. Within whichever pool applies, the row naming the
-    GREATEST `ts` TEXT governs, never the row nearest the end of the
-    file — and when the pool holds >=2 candidate rows and ANY of them
-    lacks a non-empty string `ts`, OR two or more rows share the
-    IDENTICAL `ts` text, this FAILS LOUDLY, naming the tied rows' own
-    line numbers, rather than silently falling back to `rows[0]`/append
-    order. A missing, empty, or non-string `ts` and an identical `ts`
-    text are refused as AMBIGUOUS; ordering among the surviving rows is
-    by `ts` text alone, unvalidated as to shape (filed at
-    https://github.com/f-inverse/jammi-ai/issues/557).
+    The governing row is selected ORDER-INDEPENDENTLY, never by
+    `rows[-1]` (append position). `cmd_export_anticipation` dumps every
+    `<slug>.anticipation.*.json` artifact still on disk,
+    `sorted(sdir.iterdir())` — i.e. sorted by FILENAME, a tip sha, which
+    is pseudorandom hex and carries no chronological meaning; an older
+    round's artifact can sort AFTER a newer round's and land on the last
+    line of the committed export. The exporter stamps `ts` (the artifact
+    FILE's own mtime) and `head_sha` (the artifact's own `pre_fix_sha`) on
+    every row it emits — so `_row_head`/`_row_instant` below select the
+    row whose own `head_sha` matches this checkout's actual `HEAD` when
+    one does (the case where the export was captured at the exact commit
+    reader 3 is validating); when none does — the common case, since a
+    pre-fix witness by construction predates the commit it is validated
+    against — every row is eligible. Within whichever pool applies, the
+    row naming the GREATEST normalized `ts` INSTANT governs, never the
+    row nearest the end of the file — and when the pool holds >=2
+    candidate rows and ANY of them lacks a reliably-orderable `ts`, OR two
+    or more rows normalize to the IDENTICAL instant, this FAILS LOUDLY,
+    naming the tied rows' own line numbers, rather than silently falling
+    back to `rows[0]`/append order.
 
-    Fix round 7 Z19 (narrowing fix round 6 Z17): the tie compare is `ts`
-    TEXT ONLY — never a parsed `datetime` instant. An executed probe
-    found `_row_instant`'s own mixed-awareness pool (one row's `ts` with
-    no UTC offset at all beside another's `...Z`/`...+00:00`) raised
-    `TypeError: can't compare offset-naive and offset-aware datetimes` at
-    `max()` and ABORTED the whole run — never the promised AMBIGUOUS
-    FAIL. Comparing `ts` as TEXT can never raise that way. The
-    instant-aware tie this narrowing gives up (two rows naming the SAME
-    instant in different text, e.g. `...Z` vs `...+00:00`, which a text
-    compare treats as UNEQUAL and lets whichever sorts later silently
-    govern) is filed at https://github.com/f-inverse/jammi-ai/issues/557
-    together with `_r12_previous_relay_row`'s own identical text-ordering
-    limit in `lead-gate-lib.py`.
+    `ts` is normalized to a single well-defined, always-AWARE comparable
+    form via the shared `_r12_normalize_ts_instant` (`lead-gate-lib.py`,
+    the SAME function `_r12_previous_relay_row`'s own ordering compare
+    there uses) BEFORE any comparison, so a mixed pool — one row's `ts`
+    with no UTC offset at all beside another's `...Z`/`...+00:00` — can
+    never raise `TypeError: can't compare offset-naive and
+    offset-aware datetimes`: a naive value normalizes to `None`, the same
+    bucket a missing/malformed `ts` already occupies, refused as
+    unparseable rather than compared. Because the compare is on the
+    normalized INSTANT rather than the raw TEXT, two rows naming the SAME
+    instant in different spellings (a trailing `Z` vs an explicit
+    `+00:00` offset) correctly TIE, rather than a text-only compare's
+    silent, incorrect ordering of the two.
 
-    Fix round 5 Z7: the gates SHAPE/VALUE check itself is the SAME shared
+    The gates SHAPE/VALUE check itself is the SAME shared
     `_r12_gates_shape_rejection` reader 1 and reader 2 call — never a
     second, independently hand-rolled implementation that can drift from
     theirs (this is exactly the bug three earlier readers of this file
@@ -818,53 +1459,58 @@ def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
         h = r.get("head_sha")
         return h if isinstance(h, str) and h else None
 
-    def _row_ts_text(r: dict) -> str | None:
-        """fix round 7 Z19 (narrowing fix round 6 Z17): `ts` is compared
-        as TEXT ONLY — no `datetime` parse anywhere on this selection
-        path, so no offset-naive/offset-aware comparison can ever raise.
-        `None` for a missing, empty, or non-string `ts`."""
-        ts = r.get("ts")
-        return ts if isinstance(ts, str) and ts else None
+    mod = _lib_module()
+
+    def _row_instant(r: dict):
+        """issue #557 item 3: `ts` normalized through the SAME shared
+        function `_r12_previous_relay_row`'s own `<` compare in
+        `lead-gate-lib.py` uses (`mod._r12_normalize_ts_instant`) — one
+        fix covers both call sites identically. Always AWARE or `None`;
+        never a naive `datetime`, so `max()`/`==` over this pool can never
+        raise `TypeError: can't compare offset-naive and offset-aware
+        datetimes` (the fix-round-6 crash an executed audit probe found).
+        A naive `ts` is refused as unparseable, folded into the same
+        `None` bucket a missing/malformed one already occupies below —
+        never compared."""
+        return mod._r12_normalize_ts_instant(r.get("ts"))
 
     matching = [(ln, r) for ln, r in rows_with_lineno if head_now and _row_head(r) == head_now]
     pool = matching if matching else rows_with_lineno
 
-    if len(pool) >= 2 and any(_row_ts_text(r) is None for _, r in pool):
+    if len(pool) >= 2 and any(_row_instant(r) is None for _, r in pool):
         pool_lines = ", ".join(str(ln) for ln, _ in pool)
         result.fail(
             f"{path}: {len(pool)} candidate anticipation row(s) (lines {pool_lines}) carry no "
-            "reliable ordering evidence (at least one has no non-empty `ts`) -- the GOVERNING "
-            "row is AMBIGUOUS; re-export with `lead-gate-lib.py --export-anticipation` (which "
-            "stamps `ts`/`head_sha` on every row since fix round 5) and commit the result "
-            "(esc-lead-gate-R12 fix round 5 Z5)"
+            "reliable ordering evidence (at least one has no non-empty, parseable, "
+            "timezone-aware `ts`) -- the GOVERNING row is AMBIGUOUS; re-export with "
+            "`lead-gate-lib.py --export-anticipation` (which stamps `ts`/`head_sha` on every "
+            "row it emits) and commit the result (esc-lead-gate-R12)"
         )
         return
 
-    # Fix round 6 Z15, narrowed at fix round 7 Z19: an EQUAL greatest
-    # `ts` TEXT across >=2 pool rows used to resolve by append position
-    # (`max()` returns the FIRST maximal element) — an executed probe
-    # found two rows with identical `ts`, the `rc=0` row first, silently
-    # governed and shadowed a genuinely `rc=1` sibling. A tie is exactly
-    # as AMBIGUOUS as a missing `ts`. (The instant-aware tie — the SAME
-    # instant in different text — is filed at
-    # https://github.com/f-inverse/jammi-ai/issues/557; a `datetime`
-    # parse here once crashed `max()` on a mixed naive/aware pool
-    # instead of failing loudly.)
-    max_ts = max(_row_ts_text(r) for _, r in pool)
-    tied = [(ln, r) for ln, r in pool if _row_ts_text(r) == max_ts]
+    # issue #557 item 3: ties are on the NORMALIZED INSTANT, never the
+    # `ts` TEXT — two rows naming the SAME instant in different text (a
+    # trailing `Z` vs an explicit `+00:00` offset) correctly tie instead
+    # of silently ordering by text. `max()` returning the FIRST maximal
+    # element is still why a tie must be detected explicitly (a two-row
+    # pool with an identical governing value, the `rc=0` row first, would
+    # otherwise silently govern and shadow a genuinely `rc=1` sibling) —
+    # a tie is exactly as AMBIGUOUS as a missing `ts`.
+    max_instant = max(_row_instant(r) for _, r in pool)
+    tied = [(ln, r) for ln, r in pool if _row_instant(r) == max_instant]
     if len(tied) >= 2:
         tied_lines = ", ".join(str(ln) for ln, _ in tied)
+        tied_ts_texts = sorted({r.get("ts") for _, r in tied})
         result.fail(
             f"{path}: {len(tied)} candidate anticipation row(s) (lines {tied_lines}) share the "
-            f"SAME greatest `ts` text ({max_ts!r}) -- the GOVERNING row is AMBIGUOUS on a tie, "
-            "exactly as it is when `ts` is missing entirely; re-export so each round's row "
-            "carries a distinguishing `ts` (esc-lead-gate-R12 fix round 6 Z15, narrowed at fix "
-            "round 7 Z19)"
+            f"SAME greatest `ts` instant ({max_instant.isoformat()!r}, spelled as "
+            f"{tied_ts_texts!r} across the tied rows) -- the GOVERNING row is AMBIGUOUS on a "
+            "tie, exactly as it is when `ts` is missing entirely; re-export so each round's row "
+            "carries a distinguishing `ts` (esc-lead-gate-R12, instant-aware tie-break)"
         )
         return
     governing = tied[0][1]
 
-    mod = _lib_module()
     gates_why = mod._r12_gates_shape_rejection(f"{path}: the governing row", governing.get("gates"),
                                                 required_commands, judge_rc=True)
     if gates_why is not None:
@@ -1909,6 +2555,65 @@ def fixture_rr24_inspector_only_fails() -> None:
         _assert(any("inspector-class" in f for f in r.failures), "RR24", f"{r.failures}")
 
 
+def fixture_rr27_shared_validator_entry_not_object_denies() -> None:
+    """issue #569: the shared validator's OWN "is not an object" arm
+    (`_r12_anticipation_rejection` in `lead-gate-lib.py`) -- reader 3 has
+    no by-file pre-check at all (its own preceding loop explicitly SKIPS a
+    non-dict `entry`, see this file's own `check_anticipation_witnesses`),
+    so a malformed `attacks[key]` reaches the shared validator's own arm
+    DIRECTLY, never `_r12_validate_and_run_entry`'s per-entry runner
+    (reader 1's OWN second implementation of the identical three checks).
+    Binds to the arm's OWN producer text (`anticipation-validator:`),
+    asserting the OTHER producer's text (`anticipation artifact`) is
+    ABSENT -- the two are satisfiable by the same substring `is not an
+    object` alone, which is exactly what let this arm's own coverage go
+    unexercised before."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_anticipation_commit(work, {
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+            "attacks": {"a.py": "not-an-object"},
+            "residual_risk": "fixture residual",
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR27", "a non-object attacks[a.py] entry must FAIL")
+        joined = " | ".join(r.failures)
+        _assert("anticipation-validator: attacks['a.py'] is not an object" in joined, "RR27", joined)
+        _assert("anticipation artifact" not in joined, "RR27", joined)
+
+
+def fixture_rr28_shared_validator_entry_no_command_denies() -> None:
+    """issue #569: the shared validator's OWN "has no `command`" arm."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_anticipation_commit(work, {
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+            "attacks": {"a.py": {"hash": "a" * 64}},
+            "residual_risk": "fixture residual",
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR28", "an attacks[a.py] entry with no command must FAIL")
+        joined = " | ".join(r.failures)
+        _assert("anticipation-validator: attacks['a.py'] has no `command`" in joined, "RR28", joined)
+        _assert("anticipation artifact" not in joined, "RR28", joined)
+
+
+def fixture_rr29_shared_validator_entry_no_valid_hash_denies() -> None:
+    """issue #569: the shared validator's OWN "has no valid `hash`" arm."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_anticipation_commit(work, {
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+            "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "not-hex"}},
+            "residual_risk": "fixture residual",
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR29", "an attacks[a.py] entry with an invalid hash must FAIL")
+        joined = " | ".join(r.failures)
+        _assert("anticipation-validator: attacks['a.py'] has no valid `hash`" in joined, "RR29", joined)
+        _assert("anticipation artifact" not in joined, "RR29", joined)
+
+
 def fixture_rr25_mixed_stream_via_real_export_selects_anticipation_only() -> None:
     """esc-lead-gate-R12 fix round 6 Z12, round-6 stop rule Z18: the
     production-shaped case — ONE real anticipation artifact AND ONE real
@@ -2005,21 +2710,12 @@ def fixture_rr26_foreign_row_in_anticipation_stream_fails_loudly() -> None:
 
 
 def fixture_rr30_tied_ts_governing_row_fails_loudly() -> None:
-    """fix round 6 Z15, narrowed at fix round 7 Z19: TWO candidate rows
-    share the SAME greatest `ts` TEXT — an executed probe found
-    `max(pool, key=_row_ts)` resolves a tie by APPEND POSITION (the FIRST
-    maximal element), so an `rc=0` row listed first silently governed and
-    shadowed a genuinely `rc=1` sibling recorded at the identical `ts`. A
-    tie is exactly as AMBIGUOUS as a missing `ts` and must FAIL the same
-    way, in BOTH orders. (Fix round 6 Z17 once compared `ts` as a parsed
-    `datetime` INSTANT instead of text, to also catch the SAME instant
-    named in different text — but an executed probe found a mixed naive/
-    aware pool crashes `max()` with `TypeError: can't compare offset-naive
-    and offset-aware datetimes`, aborting the run instead of failing
-    loudly; fix round 7 Z19 narrowed the compare back to TEXT and filed
-    the instant-aware case at
-    https://github.com/f-inverse/jammi-ai/issues/557 — this fixture no
-    longer asserts that case.)"""
+    """TWO candidate rows normalize to the SAME greatest `ts` instant —
+    `max(pool, key=_row_instant)` resolves a tie by APPEND POSITION (the
+    FIRST maximal element), so an `rc=0` row listed first would silently
+    govern and shadow a genuinely `rc=1` sibling recorded at the identical
+    instant. A tie is exactly as AMBIGUOUS as a missing `ts` and must FAIL
+    the same way, in BOTH orders."""
     pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
     block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
                              "verdict": "BLOCK", "finding_locations": ["a.py:1"],
@@ -2047,6 +2743,88 @@ def fixture_rr30_tied_ts_governing_row_fails_loudly() -> None:
             r = _run_check_in(work)
             _assert(not r.ok(), "RR30", f"a tied greatest-ts pool ({order_name}) must FAIL loudly")
             _assert(any("AMBIGUOUS" in f and "tie" in f for f in r.failures), "RR30", f"{order_name}: {r.failures}")
+
+
+def fixture_rr32_mixed_naive_aware_ts_pool_fails_loudly_not_a_crash() -> None:
+    """issue #557 item 3: reproduces the EXACT mixed naive/aware pool an
+    executed audit probe found in an earlier normalization attempt — one
+    candidate row's `ts` carries NO UTC offset at all
+    (`2026-01-01T00:03:00`), the other's carries an explicit one
+    (`2026-01-01T00:03:00Z`). Comparing those two as parsed `datetime`
+    objects without normalizing them to one comparable form first raises
+    `TypeError: can't compare offset-naive and offset-aware datetimes`
+    inside `max()`, aborting the whole self-test run rather than the
+    promised loud AMBIGUOUS FAIL. This fixture asserts the LOUD FAIL: it
+    calls `_run_check_in` with NO surrounding `try`/`except` of its own,
+    so a regression that reintroduces the crash surfaces to `self_test()`'s
+    own harness as `FAIL (unexpected exception)` — DISTINCT from a normal
+    `_assert`-driven `FAIL`, and the property this fixture actually pins.
+    The naive `ts` normalizes to `None` (refused as unparseable, the same
+    bucket a missing `ts` already occupies) and is never fed into a
+    `datetime` comparison against its aware sibling at all."""
+    pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+    block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                             "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                             "class_enumeration": ["a.py:1"]})
+    row_naive = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40, "agent_type": "lead-anticipation",
+                 "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+                 "residual_risk": "fixture residual", "ts": "2026-01-01T00:03:00", "head_sha": "0" * 40,
+                 "gates": {"python3 ci/scripts/probe.py": {"rc": 0}}}
+    row_aware = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": "f" * 40, "agent_type": "lead-anticipation",
+                 "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+                 "residual_risk": "fixture residual", "ts": "2026-01-01T00:03:00Z", "head_sha": "f" * 40,
+                 "gates": {"python3 ci/scripts/probe.py": {"rc": 1}}}
+    for order_name, ordered in (("naive-first", [row_naive, row_aware]), ("aware-first", [row_aware, row_naive])):
+        with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+            _origin, work = _pr_repo(Path(td))
+            _commit(work, f"ci: touch a gate script (mixed naive/aware ts, {order_name})", {
+                "ci/scripts/probe.py": "print('x')\n",
+                "ci/lead-gate-required-commands.txt": "python3 ci/scripts/probe.py  # measured ~0.1s\n",
+                "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+                "docs/rigor/feat_rr-fixture.anticipation.jsonl":
+                    "\n".join(json.dumps(r) for r in ordered) + "\n",
+                "docs/README-fixture.md": "line one\n",
+                "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+            })
+            r = _run_check_in(work)  # no try/except -- a crash here is a DIFFERENT self-test failure shape
+            _assert(not r.ok(), "RR32", f"a mixed naive/aware ts pool ({order_name}) must FAIL loudly")
+            _assert(any("AMBIGUOUS" in f for f in r.failures), "RR32", f"{order_name}: {r.failures}")
+
+
+def fixture_rr33_same_instant_different_text_ts_ties() -> None:
+    """issue #557 item 3: two rows name the SAME instant in DIFFERENT
+    text — a trailing `Z` (`2026-01-01T00:03:00Z`) vs the equivalent
+    explicit offset (`2026-01-01T00:03:00+00:00`). A TEXT-only compare
+    treats these as UNEQUAL and lets whichever sorts later silently
+    govern; the normalized-INSTANT compare correctly recognizes them as
+    the SAME instant and ties, exactly like `RR30`'s identical-text case."""
+    pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+    block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                             "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                             "class_enumeration": ["a.py:1"]})
+    row_z = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40, "agent_type": "lead-anticipation",
+             "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+             "residual_risk": "fixture residual", "ts": "2026-01-01T00:03:00Z", "head_sha": "0" * 40,
+             "gates": {"python3 ci/scripts/probe.py": {"rc": 0}}}
+    row_offset = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": "f" * 40, "agent_type": "lead-anticipation",
+                  "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+                  "residual_risk": "fixture residual", "ts": "2026-01-01T00:03:00+00:00", "head_sha": "f" * 40,
+                  "gates": {"python3 ci/scripts/probe.py": {"rc": 1}}}
+    for order_name, ordered in (("z-first", [row_z, row_offset]), ("offset-first", [row_offset, row_z])):
+        with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+            _origin, work = _pr_repo(Path(td))
+            _commit(work, f"ci: touch a gate script (same instant, different text, {order_name})", {
+                "ci/scripts/probe.py": "print('x')\n",
+                "ci/lead-gate-required-commands.txt": "python3 ci/scripts/probe.py  # measured ~0.1s\n",
+                "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+                "docs/rigor/feat_rr-fixture.anticipation.jsonl":
+                    "\n".join(json.dumps(r) for r in ordered) + "\n",
+                "docs/README-fixture.md": "line one\n",
+                "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+            })
+            r = _run_check_in(work)
+            _assert(not r.ok(), "RR33", f"a same-instant/different-text ts pool ({order_name}) must tie and FAIL")
+            _assert(any("AMBIGUOUS" in f and "tie" in f for f in r.failures), "RR33", f"{order_name}: {r.failures}")
 
 
 # ==========================================================================
@@ -2220,6 +2998,338 @@ def fixture_rr31_no_fail_reporting_entry_shape_duplicate() -> None:
             "restoring fix round 6 Z14's deleted duplicate must make this detector non-empty — it did not")
 
 
+# --------------------------------------------------------------------------- #
+# issue #557 items 1-2: the committed mutations/exclusions attestation
+# record + its required, CI-derived reader (`check_attestation_witnesses`).
+# --------------------------------------------------------------------------- #
+
+
+def _rr_attestation_block_setup(work: Path, attestation_jsonl: str | None) -> None:
+    """Shared setup: one open second-round BLOCK naming `a.py`
+    (`finding_locations`), a real NEW `def compute_thing()` committed
+    INSIDE `a.py` (so the diff's own AST-derived new-definition surfaces,
+    `mod._parse_new_surfaces`, land inside a `finding_locations` file --
+    item 8b's own arming condition), and (when `attestation_jsonl` is not
+    `None`) a committed `docs/rigor/feat_rr-fixture.attestation.jsonl`."""
+    pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+    block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                             "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                             "class_enumeration": ["a.py:1"]})
+    files = {
+        "ci/scripts/probe.py": "print('x')\n",
+        "a.py": "def compute_thing():\n    return 1\n",
+        "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+        "docs/README-fixture.md": "line one\n",
+        "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+    }
+    if attestation_jsonl is not None:
+        files["docs/rigor/feat_rr-fixture.attestation.jsonl"] = attestation_jsonl
+    _commit(work, "ci: touch a gate script (new def in a.py, item 8b armed)", files)
+
+
+def fixture_rr34_missing_attestation_when_armed_fails() -> None:
+    """issue #557 items 1-2: the fix's own diff adds `a.py::compute_thing`,
+    a NEW definition inside `a.py` -- the SAME file the open BLOCK's own
+    `finding_locations` names -- so item 8b is armed by RE-DERIVATION
+    alone (no relay artifact exists or is read here at all). No
+    `docs/rigor/feat_rr-fixture.attestation.jsonl` is committed. Must FAIL
+    naming the export command."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_attestation_block_setup(work, attestation_jsonl=None)
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR34", "a new definition inside a finding_locations file with no "
+                                      "committed attestation must FAIL")
+        _assert(any("attestation.jsonl" in f and "--export-attestation" in f for f in r.failures),
+                "RR34", f"{r.failures}")
+
+
+def fixture_rr35_attestation_file_with_no_valid_row_fails() -> None:
+    """issue #557 items 1-2: a committed attestation file EXISTS, but its
+    one row's `mutations` is an empty array (fails
+    `_r12_mutations_array_rejection`'s own shape check) -- no row
+    satisfies item 8b's requirement, so this must still FAIL, naming that
+    no committed row carries a shape-valid array."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        bad_row = json.dumps({"kind": "lead-relay-attestation", "unit_branch": "feat/rr-fixture",
+                               "agent_type": "adversarial-audit", "mutations": []})
+        _rr_attestation_block_setup(work, attestation_jsonl=bad_row + "\n")
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR35", "an attestation file with no shape-valid row must FAIL")
+        _assert(any("no committed row carries a shape-valid" in f for f in r.failures), "RR35", f"{r.failures}")
+
+
+def fixture_rr36_foreign_attestation_row_refused() -> None:
+    """issue #557 items 1-2: a committed attestation file carries a row
+    whose `kind` is NOT `lead-relay-attestation` (a hand-edit, or a row
+    copied from the anticipation stream) -- REFUSED by name, never
+    silently ignored or selected as evidence."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        foreign_row = json.dumps({"kind": "lead-anticipation", "unit_branch": "feat/rr-fixture",
+                                   "attacks": {}, "residual_risk": "x"})
+        _rr_attestation_block_setup(work, attestation_jsonl=foreign_row + "\n")
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR36", "a foreign-kind row in the attestation stream must FAIL")
+        _assert(any("not `lead-relay-attestation`" in f for f in r.failures), "RR36", f"{r.failures}")
+
+
+def fixture_rr37_valid_attestation_row_satisfies() -> None:
+    """issue #557 items 1-2, positive control: a committed attestation
+    file carries ONE real, shape-valid `lead-relay-attestation` row with a
+    non-empty `mutations` array -- item 8b's own requirement is satisfied;
+    `check_attestation_witnesses` itself reports NO failure (other readers
+    in the same run, e.g. the anticipation record, are not this fixture's
+    concern and are asserted separately elsewhere)."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        good_row = json.dumps({
+            "kind": "lead-relay-attestation", "unit_branch": "feat/rr-fixture",
+            "agent_type": "adversarial-audit", "block_ts": "2026-01-01T00:01:00Z",
+            "mutations": [{"site": "a.py:1", "command": "python3 -c \"print('ok')\"",
+                            "rc_before": 0, "rc_after": 1, "marker_after": "test result: FAILED"}],
+        })
+        _rr_attestation_block_setup(work, attestation_jsonl=good_row + "\n")
+        r = _run_check_in(work)
+        joined_failures = " | ".join(r.failures)
+        _assert("attestation" not in joined_failures, "RR37",
+                f"a shape-valid attestation row must satisfy item 8b, got: {r.failures}")
+
+
+# --------------------------------------------------------------------------- #
+# issue #570: the bidirectional # R12-RESIDUAL <-> residual_risk property.
+# --------------------------------------------------------------------------- #
+
+
+def _rr_residual_setup(work: Path, extra_lib_marker: str | None, residual_risk: str) -> None:
+    """Commits a real anticipation record with `residual_risk` set as
+    given, plus (when `extra_lib_marker` is not `None`) a MUTATED copy of
+    `.claude/hooks/lead-gate-lib.py` that injects `extra_lib_marker` as a
+    NEW statement right inside the real `slugify` function -- a stable,
+    always-present anchor every copy of the file carries -- so THIS
+    unit's own diff (against `origin/main`'s UNMUTATED copy, from
+    `_pr_repo`'s own scaffold commit) adds exactly one NEW line matching
+    `_R12_RESIDUAL_MARKER_RE`, never the file's whole pre-existing
+    history."""
+    if extra_lib_marker is not None:
+        lib_path = work / ".claude" / "hooks" / "lead-gate-lib.py"
+        original = lib_path.read_text()
+        anchor = "def slugify(branch: str) -> str:\n"
+        if anchor not in original:  # pragma: no cover - guards fixture drift, not swarm behavior
+            raise AssertionError("RR38/39/40 anchor drifted from the real lead-gate-lib.py's slugify()")
+        mutated = original.replace(anchor, anchor + f"    pass  {extra_lib_marker}\n", 1)
+        lib_path.write_text(mutated)
+    pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+    block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                             "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                             "class_enumeration": ["a.py:1"]})
+    anticipation_row = json.dumps({
+        "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40, "agent_type": "lead-anticipation",
+        "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+        "residual_risk": residual_risk,
+        "gates": {_RR_BASELINE_REQUIRED_COMMAND: {"rc": 0}},
+    })
+    _commit(work, "fix: touch a gate script + lead-gate-lib.py residual state", {
+        "ci/scripts/probe.py": "print('x')\n",
+        "a.py": "def compute_thing():\n    return 1\n",
+        "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+        "docs/rigor/feat_rr-fixture.anticipation.jsonl": anticipation_row + "\n",
+        "docs/README-fixture.md": "line one\n",
+        "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+    })
+
+
+def fixture_rr38_new_residual_marker_not_named_forward_fails() -> None:
+    """issue #570 FORWARD: the fix's own diff adds a NEW marker (matching
+    `_R12_RESIDUAL_MARKER_RE`) inside `slugify` in lead-gate-lib.py, but
+    the governing row's `residual_risk` never names `slugify`. Must
+    FAIL."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_residual_setup(work, "# R12-RESIDUAL: fixture-injected residual for RR38",
+                            residual_risk="unrelated residual text naming nothing real")
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR38", "a new residual marker not named in residual_risk must FAIL")
+        _assert(any("does not name" in f and "slugify" in f for f in r.failures), "RR38", f"{r.failures}")
+
+
+def fixture_rr39_over_claimed_residual_backward_fails() -> None:
+    """issue #570 BACKWARD: `residual_risk` backtick-cites `state_dir` — a
+    REAL function in lead-gate-lib.py that carries NO marker (matching
+    `_R12_RESIDUAL_MARKER_RE`) anywhere — an over-claimed residual. Must
+    FAIL by name, even
+    though `residual_risk` ALSO correctly names `slugify` (the function
+    the fixture's own new marker actually sits inside), satisfying
+    FORWARD: BACKWARD's own over-claim check is independent of whether
+    FORWARD passed."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        lib_text = (work / ".claude" / "hooks" / "lead-gate-lib.py").read_text()
+        marker_lines = [l for l in lib_text.splitlines() if _R12_RESIDUAL_MARKER_RE.search(l)]
+        _assert("def state_dir(" in lib_text and not any("state_dir" in l for l in marker_lines),
+                "RR39 setup", "`state_dir` must be real and carry no marker in the unmutated file")
+        _rr_residual_setup(
+            work, "# R12-RESIDUAL: fixture-injected residual for RR39",
+            residual_risk="the `slugify` gap is real; see `state_dir` for another untracked one",
+        )
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR39", "an over-claimed residual (citing an unmarked real function) must FAIL")
+        _assert(any("state_dir" in f and "no `# R12-RESIDUAL` marker" in f for f in r.failures),
+                "RR39", f"{r.failures}")
+
+
+def fixture_rr40_correctly_named_residual_satisfies() -> None:
+    """issue #570, positive control: `residual_risk` names `slugify`,
+    exactly the function the new marker sits inside -- both FORWARD and
+    BACKWARD are satisfied; `check_residual_risk_bidirectional` itself
+    reports no failure."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_residual_setup(work, "# R12-RESIDUAL: fixture-injected residual for RR40",
+                            residual_risk="the `slugify` fixture-injected gap for RR40 is untracked")
+        r = _run_check_in(work)
+        joined = " | ".join(r.failures)
+        _assert("issue #570" not in joined, "RR40",
+                f"a correctly-named residual must satisfy #570, got: {r.failures}")
+
+
+# --------------------------------------------------------------------------- #
+# issue #557 item 2: the CI-derived required call-site set
+# (`check_required_call_site_set`), a real `syn` AST parse via
+# `ci/tools/symbol-index` -- never a regex reader, never a hand list.
+# --------------------------------------------------------------------------- #
+
+def _rr_call_site_setup(work: Path, rust_file_content: str, mutations_site: str) -> None:
+    """Shared setup for RR41-43: an open second-round BLOCK naming
+    `src/lib.rs` (`finding_locations`), a real committed `src/lib.rs` (so
+    item 8b's own `mod._parse_new_surfaces` arming ALSO fires -- the SAME
+    arming condition `_rr_attestation_block_setup` uses for `a.py`, a
+    `.rs` file this time so `check_required_call_site_set` arms too), plus
+    a `lead-relay-attestation` row whose ONE `mutations` entry's `site` is
+    `mutations_site` -- the caller's own choice, real for a positive
+    control, fabricated for the phantom-site fixture."""
+    pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+    block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                             "verdict": "BLOCK", "finding_locations": ["src/lib.rs:1"],
+                             "class_enumeration": ["src/lib.rs:1"]})
+    good_row = json.dumps({
+        "kind": "lead-relay-attestation", "unit_branch": "feat/rr-fixture",
+        "agent_type": "adversarial-audit", "block_ts": "2026-01-01T00:01:00Z",
+        "mutations": [{"site": mutations_site, "command": "python3 -c \"print('ok')\"",
+                        "rc_before": 0, "rc_after": 1, "marker_after": "test result: FAILED"}],
+    })
+    files = {
+        "ci/scripts/probe.py": "print('x')\n",
+        "src/lib.rs": rust_file_content,
+        "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+        "docs/rigor/feat_rr-fixture.attestation.jsonl": good_row + "\n",
+        "docs/README-fixture.md": "line one\n",
+        "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+    }
+    _commit(work, "ci: touch a gate script (new .rs def, item 8b + #557 item 2 armed)", files)
+
+
+def fixture_rr41_mutation_site_resolves_to_real_def_satisfies() -> None:
+    """issue #557 item 2, positive control: `mutations[0].site` names the
+    EXACT line of a real, newly-added `pub fn compute_new()` in
+    `src/lib.rs` -- the symbol-index-derived required set's own `new_defs`
+    entry. `check_required_call_site_set` must report no failure."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        rust = "pub fn compute_new() -> i32 {\n    1\n}\n"
+        _rr_call_site_setup(work, rust, mutations_site="src/lib.rs:1")
+        r = _run_check_in(work)
+        joined = " | ".join(r.failures)
+        _assert("phantom site" not in joined, "RR41",
+                f"a mutations site naming a real new definition must resolve, got: {r.failures}")
+
+
+def _symbol_index_unavailable(r) -> bool:
+    """Whether this run's own reader could not build `ci/tools/symbol-index`
+    (no toolchain, or cargo without the mandatory sccache wrapper) and said
+    so by name — the advisory arm RR44 pins. A fixture whose assertion needs
+    the index reads this rather than guessing at the environment."""
+    return any("could not build the symbol-index required call-site set" in w for w in r.warnings)
+
+
+def fixture_rr42_phantom_mutation_site_fails() -> None:
+    """issue #557 item 2: `mutations[0].site` names `src/lib.rs:999` --
+    the real committed file has only 3 lines. Must FAIL by name as a
+    phantom site, never merely accepted because the FILE exists."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        rust = "pub fn compute_new() -> i32 {\n    1\n}\n"
+        _rr_call_site_setup(work, rust, mutations_site="src/lib.rs:999")
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR42", "a mutations site naming a non-existent line must FAIL")
+        if _symbol_index_unavailable(r):
+            # The lane running this self-test cannot build `ci/tools/symbol-index`
+            # (the toolchain-free swarm lane: cargo present, the mandatory sccache
+            # wrapper absent). The phantom-site arm is then unreachable BY
+            # DESIGN and the check must have said so by name (RR44's own arm);
+            # the phantom arm itself is exercised by this same self-test in
+            # ci.yml's container-backed `symbol-index-gates` job.
+            print("check-rigor-record[RR42]: toolchain-less lane -- phantom-site arm exercised in symbol-index-gates",
+                  file=sys.stderr)
+            return
+        _assert(any("phantom site" in f and "src/lib.rs:999" in f for f in r.failures),
+                "RR42", f"{r.failures}")
+
+
+def fixture_rr43_mutation_site_resolves_to_real_call_satisfies() -> None:
+    """issue #557 item 2, positive control (the CALL-SITE half of the
+    required set, not just definitions): `mutations[0].site` names the
+    EXACT line of a real, newly-added call expression (`helper()` inside
+    `compute_new`) -- resolved via the index's own `calls` list, not its
+    `items` list. Must satisfy; proves `_r12_site_resolves` checks BOTH,
+    never definitions alone."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        rust = "pub fn compute_new() -> i32 {\n    helper()\n}\n\npub fn helper() -> i32 {\n    1\n}\n"
+        _rr_call_site_setup(work, rust, mutations_site="src/lib.rs:2")
+        r = _run_check_in(work)
+        if _symbol_index_unavailable(r):
+            print("check-rigor-record[RR43]: toolchain-less lane -- resolution arm exercised in symbol-index-gates",
+                  file=sys.stderr)
+            return
+        joined = " | ".join(r.failures)
+        _assert("phantom site" not in joined, "RR43",
+                f"a mutations site naming a real call expression must resolve, got: {r.failures}")
+
+
+def fixture_rr44_no_cargo_on_path_degrades_to_advisory() -> None:
+    """issue #557 item 2, robustness: `check_rigor_record.py`'s OTHER
+    checks are deliberately toolchain-free (this script's own module
+    doc) -- a run with no `cargo` on `PATH` at all must never CRASH the
+    whole script (an unhandled `FileNotFoundError` would deny every
+    OTHER check this same invocation still owes a verdict); it degrades
+    to a named advisory instead. The no-cargo `PATH` is ONE private
+    directory holding a symlink to the `git` this process resolves --
+    the only tool the check runs by name -- so the fixture never depends
+    on where a host installs git (`/usr/bin` on a bare runner and macOS,
+    `/usr/local/bin` in the CI image) and cannot reach a `cargo` from any
+    host directory. The override applies to this ONE invocation only --
+    never the process-wide environment."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        rust = "pub fn compute_new() -> i32 {\n    1\n}\n"
+        _rr_call_site_setup(work, rust, mutations_site="src/lib.rs:1")
+        import shutil  # used by this fixture alone
+        git = shutil.which("git")
+        _assert(git is not None, "RR44", "this self-test needs a `git` on PATH to build its no-cargo PATH")
+        no_cargo_bin = Path(td) / "no-cargo-bin"
+        no_cargo_bin.mkdir()
+        (no_cargo_bin / "git").symlink_to(git)
+        _assert(shutil.which("cargo", path=str(no_cargo_bin)) is None, "RR44",
+                f"the no-cargo PATH {no_cargo_bin} must not resolve cargo")
+        r = _run_check_in(work, env_overrides={"PATH": str(no_cargo_bin)})
+        _assert(any("could not build the symbol-index required call-site set" in w for w in r.warnings),
+                "RR44", f"a missing cargo must degrade to a named advisory, got warnings: {r.warnings}")
+        _assert(not any("phantom site" in f for f in r.failures), "RR44",
+                f"a missing cargo must never be reported as a phantom site, got: {r.failures}")
+
+
 RR_FIXTURES = [
     ("RR1", fixture_rr1_not_armed_docs_only),
     ("RR2", fixture_rr2_armed_no_record),
@@ -2247,6 +3357,9 @@ RR_FIXTURES = [
     ("RR22", fixture_rr22_no_residual_risk_fails),
     ("RR23", fixture_rr23_identical_pair_reused_fails),
     ("RR24", fixture_rr24_inspector_only_fails),
+    ("RR27", fixture_rr27_shared_validator_entry_not_object_denies),
+    ("RR28", fixture_rr28_shared_validator_entry_no_command_denies),
+    ("RR29", fixture_rr29_shared_validator_entry_no_valid_hash_denies),
     ("RR14", fixture_rr14_missing_gates_fails),
     ("RR15", fixture_rr15_complete_gates_rc_zero_allows),
     ("RR16", fixture_rr16_nonzero_rc_fails),
@@ -2256,6 +3369,19 @@ RR_FIXTURES = [
     ("RR26", fixture_rr26_foreign_row_in_anticipation_stream_fails_loudly),
     ("RR30", fixture_rr30_tied_ts_governing_row_fails_loudly),
     ("RR31", fixture_rr31_no_fail_reporting_entry_shape_duplicate),
+    ("RR32", fixture_rr32_mixed_naive_aware_ts_pool_fails_loudly_not_a_crash),
+    ("RR33", fixture_rr33_same_instant_different_text_ts_ties),
+    ("RR34", fixture_rr34_missing_attestation_when_armed_fails),
+    ("RR35", fixture_rr35_attestation_file_with_no_valid_row_fails),
+    ("RR36", fixture_rr36_foreign_attestation_row_refused),
+    ("RR37", fixture_rr37_valid_attestation_row_satisfies),
+    ("RR38", fixture_rr38_new_residual_marker_not_named_forward_fails),
+    ("RR39", fixture_rr39_over_claimed_residual_backward_fails),
+    ("RR40", fixture_rr40_correctly_named_residual_satisfies),
+    ("RR41", fixture_rr41_mutation_site_resolves_to_real_def_satisfies),
+    ("RR42", fixture_rr42_phantom_mutation_site_fails),
+    ("RR43", fixture_rr43_mutation_site_resolves_to_real_call_satisfies),
+    ("RR44", fixture_rr44_no_cargo_on_path_degrades_to_advisory),
 ]
 
 

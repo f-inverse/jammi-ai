@@ -296,14 +296,14 @@ fn dtype_class(p: ComputePrecision) -> DtypeClass {
 fn two_arm_ops_for(dtype: DtypeClass) -> Vec<(&'static str, &'static str)> {
     PROBED_OPS
         .iter()
-        .filter(|op| op.kind == ProbedOpKind::TwoArm)
-        .filter(|op| op.report_key != "attention_block")
-        .filter(|op| op.report_key != "gelu_erf")
-        .filter(|op| !STRICT_UNREACHABLE_OPS.contains(&op.report_key))
+        .filter(|op| op.kind() == ProbedOpKind::TwoArm)
+        .filter(|op| op.report_key() != "attention_block")
+        .filter(|op| op.report_key() != "gelu_erf")
+        .filter(|op| !STRICT_UNREACHABLE_OPS.contains(&op.report_key()))
         .filter_map(|op| {
             op.registry_keys_for(dtype)
                 .next()
-                .map(|key| (op.report_key, key))
+                .map(|key| (op.report_key(), key))
         })
         .collect()
 }
@@ -322,11 +322,11 @@ fn two_arm_ops_for(dtype: DtypeClass) -> Vec<(&'static str, &'static str)> {
 fn cascade_ops() -> Vec<(&'static str, &'static str)> {
     PROBED_OPS
         .iter()
-        .filter(|op| op.kind == ProbedOpKind::Cascade)
+        .filter(|op| op.kind() == ProbedOpKind::Cascade)
         .filter_map(|op| {
             op.registry_keys_for(DtypeClass::Any)
                 .next()
-                .map(|key| (op.report_key, key))
+                .map(|key| (op.report_key(), key))
         })
         .collect()
 }
@@ -337,8 +337,8 @@ fn cascade_ops() -> Vec<(&'static str, &'static str)> {
 fn internal_subkernel_ops() -> Vec<(&'static str, &'static str)> {
     PROBED_OPS
         .iter()
-        .filter_map(|op| match op.kind {
-            ProbedOpKind::InternalSubkernel { parent } => Some((op.report_key, parent)),
+        .filter_map(|op| match op.kind() {
+            ProbedOpKind::InternalSubkernel { parent } => Some((op.report_key(), parent)),
             _ => None,
         })
         .collect()
@@ -346,7 +346,7 @@ fn internal_subkernel_ops() -> Vec<(&'static str, &'static str)> {
 
 /// Every [`PROBED_OPS`] report key, regardless of kind.
 fn all_probed_report_keys() -> HashSet<&'static str> {
-    PROBED_OPS.iter().map(|op| op.report_key).collect()
+    PROBED_OPS.iter().map(|op| op.report_key()).collect()
 }
 
 /// Manifest-declared ops that are structurally UNREACHABLE in a
@@ -836,6 +836,34 @@ async fn capability_surface() {
 
         probe_dtype(&config, &weights_path, candle_dtype, &device);
 
+        // Captured HERE, immediately after `probe_dtype`'s own call returns
+        // and before ANY other probe in this dtype iteration runs (issue
+        // CAPSURF, root cause: `bert_probe_dtype` below — driven for the
+        // `gelu_erf` check — is a SECOND, independent caller into the same
+        // `attention_block_fused` dispatch-registry key, mirroring
+        // `ModernBertAttention`'s call but with `flash` always `Declined`
+        // (BERT has no flash transport wired at all, any dtype — see
+        // `forward_training`, `crates/jammi-encoders/src/bert.rs:190`,
+        // own doc for why) — landed by issue #462's BERT/DistilBERT cascade
+        // wiring. A snapshot taken AFTER
+        // `bert_probe_dtype` ran (the previous shape: both `_after`
+        // snapshots re-read live counters down in the `attention_block`
+        // block, by which point the `gelu_erf` block's `bert_probe_dtype`
+        // call had already run) folds BERT's own unconditional
+        // `attention_block_fused` dispatch into a window this test's
+        // TIER-PREEMPTION assertion attributes to ModernBERT alone — the
+        // exact contamination the `gelu_erf` check's own comment above
+        // warns against for its OWN counter ("the before/after window
+        // wraps ONLY `bert_probe_dtype`'s own call, so a measured delta is
+        // attributable to that call and nothing else"). Snapshotting here,
+        // tightly around `probe_dtype` and before `bert_probe_dtype` ever
+        // runs, gives `attention_block`/`attention_block_flash` the same
+        // isolation.
+        let attention_block_after_modernbert =
+            jammi_kernels::admission::counters_for("attention_block_fused").snapshot();
+        let flash_cascade_after_modernbert =
+            jammi_kernels::admission::cascade_counters_for("attention_block_flash").snapshot();
+
         for &(report_op, registry_key) in &two_arm_ops {
             if !declared_ops.iter().any(|d| d == report_op) {
                 continue;
@@ -889,11 +917,13 @@ async fn capability_surface() {
 
         // `attention_block`: the TIER-PREEMPTION-AWARE pair of assertions —
         // both arms real, never logging-only (Phase-4 audit finding 1).
+        // Uses the snapshots captured right after `probe_dtype` above (NOT
+        // a fresh read here) — a fresh read at this point would already
+        // include `bert_probe_dtype`'s own `attention_block_fused` dispatch
+        // from the `gelu_erf` block above, see that capture's own comment.
         if declared_ops.iter().any(|d| d == "attention_block") {
-            let attention_block_after =
-                jammi_kernels::admission::counters_for("attention_block_fused").snapshot();
-            let flash_cascade_after =
-                jammi_kernels::admission::cascade_counters_for("attention_block_flash").snapshot();
+            let attention_block_after = attention_block_after_modernbert;
+            let flash_cascade_after = flash_cascade_after_modernbert;
             if flash_should_preempt {
                 assert!(
                     flash_cascade_after.fused > flash_cascade_before.fused,
@@ -1047,8 +1077,8 @@ fn manifest_capability_categories_match_probed_ops_by_kind() {
 
     let mut expected_admission: Vec<&str> = PROBED_OPS
         .iter()
-        .filter(|op| matches!(op.kind, ProbedOpKind::TwoArm | ProbedOpKind::Cascade))
-        .map(|op| op.report_key)
+        .filter(|op| matches!(op.kind(), ProbedOpKind::TwoArm | ProbedOpKind::Cascade))
+        .map(|op| op.report_key())
         .collect();
     expected_admission.sort_unstable();
     let mut declared_admission = manifest_string_list(&manifest, MANIFEST_FUSED_OP_ADMISSION);

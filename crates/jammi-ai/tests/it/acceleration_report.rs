@@ -106,7 +106,7 @@ async fn wait_for_terminal(
     job_id: &str,
 ) -> jammi_db::catalog::jobs_repo::JobRecord {
     let record = wait_for_any_terminal(catalog, job_id).await;
-    if record.status != "completed" {
+    if record.status != jammi_db::catalog::status::JobStatus::Completed.to_string() {
         panic!("job {job_id} failed unexpectedly: {:?}", record.error);
     }
     record
@@ -133,13 +133,16 @@ async fn wait_for_any_terminal(
 ) -> jammi_db::catalog::jobs_repo::JobRecord {
     loop {
         let record = catalog.get_job(job_id).await.unwrap();
-        match record.status.as_str() {
-            "completed" | "failed" => {
-                assert_terminal_report_is_not_pending(&record, job_id);
-                return record;
-            }
-            _ => tokio::time::sleep(Duration::from_millis(50)).await,
+        // Derived from `JobRecord::is_terminal` (the ONE terminality
+        // predicate) rather than an enumerated `"completed" | "failed"`
+        // match arm, so a future terminal status joining the vocabulary
+        // still ends this wait with a one-line edit, not a hunt for every
+        // match arm.
+        if record.is_terminal() {
+            assert_terminal_report_is_not_pending(&record, job_id);
+            return record;
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -156,7 +159,7 @@ async fn terminal_record(
 ) -> jammi_db::catalog::jobs_repo::JobRecord {
     let record = catalog.get_job(job_id).await.unwrap();
     assert!(
-        matches!(record.status.as_str(), "completed" | "failed"),
+        record.is_terminal(),
         "{label}: expected an already-terminal row, got status {:?}",
         record.status
     );
@@ -683,7 +686,7 @@ fn tiny_bert_head64_model() -> String {
 /// `"device_is_cpu_or_metal_not_cuda"` (`cuda` feature compiled, but this
 /// session never resolves a real CUDA device), exactly like every OTHER
 /// architecture on the same build. `admit_cascade`
-/// (`crates/jammi-kernels/src/admission.rs:403-453`) now records every
+/// (`crates/jammi-kernels/src/admission.rs:406-457`) now records every
 /// decline — including BERT's own `"flash_transport_not_wired"` — into the
 /// SAME thread-local probe-capture sink `admit_inner` uses
 /// (`record_probe_miss`, `admission.rs:416,427,437`), and
@@ -777,9 +780,9 @@ fn candidate_report_keys(p: ComputePrecision) -> std::collections::BTreeSet<&'st
     let dtype = dtype_class(p);
     jammi_kernels::admission::PROBED_OPS
         .iter()
-        .filter(|op| op.kind == jammi_kernels::admission::ProbedOpKind::TwoArm)
+        .filter(|op| op.kind() == jammi_kernels::admission::ProbedOpKind::TwoArm)
         .filter(|op| op.registry_keys_for(dtype).next().is_some())
-        .map(|op| op.report_key)
+        .map(|op| op.report_key())
         .collect()
 }
 
@@ -801,12 +804,12 @@ fn ops_keys(report: &serde_json::Value) -> std::collections::BTreeSet<String> {
 /// report carries them `holds: true`, which can only happen if the
 /// before/after delta on `cast_scale_f16_f32` / `cast_add_f16` — the exact
 /// registry keys the table names for `DtypeClass::F16` — actually moved,
-/// i.e. if some workspace call site really does pass those literals to
-/// `admit_cast_boundary`'s own `admit()` call (`"cast_scale_f16_f32"`,
-/// `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1068`, and
-/// `"cast_add_f16"`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1165`,
-/// both reached from `LowRankResidualLinear::bwd` during the probe's
-/// backward pass). Before the fix the shipped table named only
+/// i.e. if some workspace call site really does resolve to those keys
+/// (`"cast_scale_f16_f32"`, `crates/jammi-kernels/src/admission.rs:2056`, and
+/// `"cast_add_f16"`, `crates/jammi-kernels/src/admission.rs:2064`,
+/// both reached from `LowRankResidualLinear::bwd`'s `admit_cast_boundary(&CAST_SCALE, DtypeClass::F16, ..)`/
+/// `admit_cast_boundary(&CAST_ADD, DtypeClass::F16, ..)` calls, during
+/// the probe's backward pass). Before the fix the shipped table named only
 /// `cast_add_bf16`, so an f16 job's report could not contain either key at
 /// any value.
 ///
@@ -1327,7 +1330,7 @@ fn assert_terminal_report_is_not_pending(
     label: &str,
 ) -> serde_json::Value {
     assert!(
-        matches!(record.status.as_str(), "completed" | "failed"),
+        record.is_terminal(),
         "{label}: this oracle only speaks about a TERMINAL row, got status {:?}",
         record.status
     );

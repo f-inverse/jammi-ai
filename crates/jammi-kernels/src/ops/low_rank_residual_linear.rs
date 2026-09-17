@@ -825,15 +825,22 @@ pub(crate) fn materialize_contiguous_if_needed<S: BackendStorage>(
 /// defense in depth, not trusted away, per this crate's usual "an op
 /// trusts no caller for its own domain" doctrine.
 fn admit_cast_boundary(
-    op: &'static str,
+    op: &'static crate::admission::ProbedOp,
+    dtype: crate::admission::DtypeClass,
     predicate_name: &'static str,
 ) -> Result<crate::admission::DispatchOutcome> {
-    crate::admission::admit(
+    let key = op.registry_keys_for(dtype).next().unwrap_or_else(|| {
+        panic!(
+            "admit_cast_boundary: {:?} has no registry key at {dtype:?}",
+            op.report_key
+        )
+    });
+    crate::admission::admit_by_key(
         crate::admission::admission_mode(),
-        op,
+        key,
         predicate_name,
         true,
-        crate::admission::counters_for(op),
+        crate::admission::counters_for(key),
     )
     .map_err(Error::from)
 }
@@ -1051,7 +1058,8 @@ impl CustomOp3 for LowRankResidualLinear {
                 .reshape((m, outf))?,
             DType::BF16 => {
                 let dy_f32 = match admit_cast_boundary(
-                    "cast_scale_bf16_f32",
+                    &crate::admission::CAST_SCALE,
+                    crate::admission::DtypeClass::Bf16,
                     "grad_res_is_bf16_a_fusable_two_kernel_chain",
                 )? {
                     crate::admission::DispatchOutcome::Fused => {
@@ -1065,7 +1073,8 @@ impl CustomOp3 for LowRankResidualLinear {
             }
             DType::F16 => {
                 let dy_f32 = match admit_cast_boundary(
-                    "cast_scale_f16_f32",
+                    &crate::admission::CAST_SCALE,
+                    crate::admission::DtypeClass::F16,
                     "grad_res_is_f16_a_fusable_two_kernel_chain",
                 )? {
                     crate::admission::DispatchOutcome::Fused => {
@@ -1150,7 +1159,8 @@ impl CustomOp3 for LowRankResidualLinear {
         let dx_2d = match base_dtype {
             DType::F32 => (&dx_base_2d + &d_x_lora_f32_2d)?,
             DType::BF16 => match admit_cast_boundary(
-                "cast_add_bf16",
+                &crate::admission::CAST_ADD,
+                crate::admission::DtypeClass::Bf16,
                 "base_dtype_is_bf16_a_fusable_two_kernel_chain",
             )? {
                 crate::admission::DispatchOutcome::Fused => {
@@ -1162,7 +1172,8 @@ impl CustomOp3 for LowRankResidualLinear {
                 }
             },
             DType::F16 => match admit_cast_boundary(
-                "cast_add_f16",
+                &crate::admission::CAST_ADD,
+                crate::admission::DtypeClass::F16,
                 "base_dtype_is_f16_a_fusable_two_kernel_chain",
             )? {
                 crate::admission::DispatchOutcome::Fused => {

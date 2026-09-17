@@ -2689,6 +2689,139 @@ pub fn h(x: Option<u8>) -> Option<String> {
         self.assertIn(("f.rs", "h"), names)
 
 
+class TestResourceBinding(unittest.TestCase):
+    """#513 G7' (contract delta, 2026-09-16): `verify_helper_registry`'s
+    fixed-point delegation pass proves a candidate genuinely reaches SOME
+    registered, panicking require-gate — never WHICH resource that gate
+    governs. `check_resource_binding` closes that: an OPT-IN `resource=
+    <tag>` annotation on a registry line asserts the accessor's OWN
+    direct env-read resolves to the JAMMI_REQUIRE_* variable that tag
+    names. The RED case this closes: a Postgres-shaped skip delegating
+    to (or, here, directly registered as) an accessor actually gated by
+    JAMMI_REQUIRE_GPU was credited by `verify_helper_registry` alone —
+    "reaches a genuine gate" said nothing about which resource."""
+
+    PG_SRC = """
+pub const REQUIRE_PG_ENV: &str = "JAMMI_REQUIRE_PG";
+pub fn pg_url_for_tests() -> Option<String> {
+    let url: Option<String> = None;
+    if url.is_none() && std::env::var_os(REQUIRE_PG_ENV).is_some() {
+        panic!("{REQUIRE_PG_ENV} is set but the url is unset");
+    }
+    url
+}
+"""
+
+    GPU_SRC = """
+pub fn cuda_device() -> Option<u8> {
+    if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
+        panic!("JAMMI_REQUIRE_CUDA is set but no device");
+    }
+    None
+}
+"""
+
+    def test_matching_resource_binding_verifies_clean(self) -> None:
+        bindings = {("f.rs", "pg_url_for_tests"): ("pg", 1)}
+        findings = ko.check_resource_binding(bindings, {"f.rs": self.PG_SRC})
+        self.assertEqual(findings, [])
+
+    def test_matching_gpu_binding_via_the_alias_set_verifies_clean(self) -> None:
+        # `RESOURCE_REQUIRE_VARS["gpu"]` names BOTH JAMMI_REQUIRE_GPU and
+        # JAMMI_REQUIRE_CUDA — the real cuda_device()-shaped accessors in
+        # this tree use the CUDA spelling.
+        bindings = {("f.rs", "cuda_device"): ("gpu", 1)}
+        findings = ko.check_resource_binding(bindings, {"f.rs": self.GPU_SRC})
+        self.assertEqual(findings, [])
+
+    def test_postgres_skip_annotated_but_actually_gpu_gated_is_caught(self) -> None:
+        # The RED fixture this issue names verbatim: a line claims
+        # resource=pg but its OWN body reads JAMMI_REQUIRE_CUDA — the
+        # class of bug where a wrong accessor gets registered/copy-pasted
+        # under a resource-mismatched claim, invisible to `verify_helper_
+        # registry` alone (which only asks "is SOME require-gate here").
+        bindings = {("f.rs", "cuda_device"): ("pg", 1)}
+        findings = ko.check_resource_binding(bindings, {"f.rs": self.GPU_SRC})
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("resource='pg'", findings[0])
+        self.assertIn("JAMMI_REQUIRE_CUDA", findings[0])
+
+    def test_unknown_resource_tag_is_a_named_finding(self) -> None:
+        bindings = {("f.rs", "pg_url_for_tests"): ("not_a_real_tag", 1)}
+        findings = ko.check_resource_binding(bindings, {"f.rs": self.PG_SRC})
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("not a known tag", findings[0])
+
+    def test_annotated_entry_with_no_direct_env_read_fails_closed(self) -> None:
+        # A delegated wrapper (no env-read of its own) carrying a
+        # resource= claim cannot be verified by this pass at all — fails
+        # closed by name, never silently skipped as "nothing to check".
+        src = self.PG_SRC + """
+pub fn make_test_session() -> Option<String> {
+    let url = pg_url_for_tests()?;
+    Some(url)
+}
+"""
+        bindings = {("f.rs", "make_test_session"): ("pg", 1)}
+        findings = ko.check_resource_binding(bindings, {"f.rs": src})
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("no resolvable direct env-read", findings[0])
+
+    def test_missing_fn_is_a_named_finding(self) -> None:
+        bindings = {("f.rs", "does_not_exist"): ("pg", 1)}
+        findings = ko.check_resource_binding(bindings, {"f.rs": self.PG_SRC})
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("does not resolve to exactly one fn", findings[0])
+
+    def test_unannotated_registry_entries_are_untouched(self) -> None:
+        # An entry with no resource= claim at all is absent from
+        # `load_resource_bindings`'s own output and never reaches
+        # check_resource_binding — no claim, no check.
+        findings = ko.check_resource_binding({}, {"f.rs": self.GPU_SRC})
+        self.assertEqual(findings, [])
+
+    def test_load_resource_bindings_parses_the_trailing_annotation(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "helpers.txt"
+            path.write_text(
+                "# comment\n"
+                "f.rs::plain_entry\n"
+                "shared:f.rs::pg_url_for_tests resource=pg\n"
+                "f.rs::cuda_device   resource=gpu\n",
+                encoding="utf-8",
+            )
+            bindings = ko.load_resource_bindings(path)
+        self.assertNotIn(("f.rs", "plain_entry"), bindings)
+        self.assertEqual(bindings[("f.rs", "pg_url_for_tests")][0], "pg")
+        self.assertEqual(bindings[("f.rs", "cuda_device")][0], "gpu")
+
+    def test_load_helper_registry_strips_the_resource_annotation_from_fn_name(self) -> None:
+        # The critical integration point: `load_helper_registry`'s own
+        # `<file>::<fn_name>` split must never include ` resource=<tag>`
+        # as part of `fn_name` — a regression here would corrupt every
+        # annotated line's own registered name.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "helpers.txt"
+            path.write_text("shared:f.rs::pg_url_for_tests resource=pg\n", encoding="utf-8")
+            entries = ko.load_helper_registry(path)
+        self.assertEqual(entries, [("shared:f.rs", "pg_url_for_tests")])
+
+    def test_real_tree_annotations_verify_clean(self) -> None:
+        # The three real registry annotations this unit adds
+        # (pg_url_for_tests, cuda_device, required_backends) against the
+        # REAL checked-out source — the control that proves the synthetic
+        # fixtures above match production, not a toy shape.
+        source_texts = ko.scan_files()
+        bindings = ko.load_resource_bindings()
+        self.assertGreaterEqual(len(bindings), 3, bindings)
+        findings = ko.check_resource_binding(bindings, source_texts)
+        self.assertEqual(findings, [], findings)
+
+
 if __name__ == "__main__":
     if "--regenerate-tokenizer-golden" in sys.argv:
         sys.exit(_regenerate_tokenizer_golden())

@@ -65,7 +65,7 @@ impl std::str::FromStr for FineTuneMethod {
 
 /// Loss function for embedding fine-tuning.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum EmbeddingLoss {
     /// CoSENT: sorts pairs by score, applies cross-entropy on cosine similarity ordering.
     #[default]
@@ -116,7 +116,7 @@ pub enum EmbeddingLoss {
 /// (distribution-free conformal) — pick along that spectrum; do not read this
 /// head's `σ` as epistemic.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RegressionLoss {
     /// Gaussian negative log-likelihood, `½(log σ² + (y−μ)²/σ²)` (+const). The
     /// classic heteroscedastic mean-variance objective ([Nix & Weigend 1994]).
@@ -158,7 +158,7 @@ impl Default for RegressionLoss {
 
 /// Loss function for classification fine-tuning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClassificationLoss {
     /// Standard cross-entropy loss.
     #[default]
@@ -209,6 +209,7 @@ pub enum LrSchedule {
 /// wasteful; `refresh_every` re-mines once per that many epochs (ANCE's
 /// asynchronous-index-refresh trade: fresher negatives cost more index builds).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HardNegativeConfig {
     /// Mine hard negatives from the model's own retrieval index. Default `false`.
     pub mine: bool,
@@ -234,6 +235,7 @@ impl Default for HardNegativeConfig {
 
 /// Configuration for a fine-tuning job.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FineTuneConfig {
     /// LoRA rank (number of low-rank dimensions). Default: 8.
     pub lora_rank: usize,

@@ -19,7 +19,12 @@ It has no proper names of its own. It uses only GENERIC patterns:
      confirm. Scoped to the diff because these stems already have legitimate
      open-core uses in the tree (source/UDF *registration*; benchmark SLO
      *gates*) — the tripwire questions what a change *adds*, and a human confirms
-     it is mechanism, not governance. Advisory.
+     it is mechanism, not governance. Advisory. Resolved against the REAL
+     `symbol-index` `syn` parse (`ci/tools/symbol-index`), cross-referenced
+     against the diff's own added-line-number set — never a regex re-scan of
+     each added line's bare text, which cannot see a `pub fn` whose signature
+     wraps across lines and can be fooled by matching text inside a string or
+     comment a real parser is not.
 
   2. **Philosophy leak-smell tokens (whole-tree).** The engine runtime tree
      (`crates/**` + workspace config) is grepped for the specific identifiers the
@@ -64,19 +69,60 @@ is worse than no waiver at all). Expected result on a clean engine tree with a
 clean allowlist: pass.
 
 Run: `python3 ci/scripts/check_no_consumer_names.py`
-Hermetic: reads the working tree + `git diff` + `git merge-base`; no network, no build.
+Reads the working tree + `git diff` + `git merge-base`; no network. NOT
+build-free in the strict sense: the governance-verb tripwire (1) and the
+allowlist's own rule-1 rot check both resolve against the REAL
+`symbol-index` tool (`cargo run --release -p symbol-index`, a `syn` AST
+parse) rather than a regex reader — a cold build pays once, cached the same
+way every other cargo-invoking gate/agent in this repo caches (sccache /
+CI cache).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+SYMBOL_INDEX_CRATE = "symbol-index"
+
+
+def build_symbol_index(roots: list[str], cwd: Path = REPO_ROOT) -> dict:
+    """Runs the REAL `symbol-index` tool (`ci/tools/symbol-index`, a `syn`
+    AST parse) over `roots` and returns the parsed JSON index. The SAME
+    tool `check_plan_citations.py` resolves construct citations against —
+    one indexer, not two independently-maintained regex readers (the
+    retired `PUB_DECL_RE` this migration removes was the second). See
+    that tool's own module doc for the full item shape and scope.
+    `cargo run --release` so a cold build pays once; this function never
+    overrides `CARGO_TARGET_DIR`/`RUSTC_WRAPPER` — the caller's own
+    environment (if any) is inherited unchanged.
+    """
+    proc = subprocess.run(
+        ["cargo", "run", "--release", "-p", SYMBOL_INDEX_CRATE, "--", *roots],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"{SYMBOL_INDEX_CRATE} failed (rc={proc.returncode}) over {roots}:\n"
+            f"{proc.stderr.strip()[-4000:]}"
+        )
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"{SYMBOL_INDEX_CRATE} did not emit valid JSON on stdout ({exc}); "
+            f"stderr tail:\n{proc.stderr.strip()[-2000:]}"
+        ) from exc
 
 # Engine runtime roots. `crates/**` is the engine's code + fixtures; the workspace
 # manifest and cargo config are its runtime config. Deliberately excludes docs/
@@ -108,12 +154,13 @@ LOCAL_DENYLIST = REPO_ROOT / "ci" / "scripts" / ".consumer_names.local"
 # (4) The waiver allowlist — see that file's own header for the full schema.
 ALLOWLIST_PATH = REPO_ROOT / "ci" / "scripts" / "no_consumer_names_allowlist.txt"
 
-# A `pub` item declaration and its identifier.
-PUB_DECL_RE = re.compile(
-    r"pub(?:\s*\([^)]*\))?\s+(?:async\s+)?"
-    r"(?:unsafe\s+)?(?:fn|struct|enum|trait|type|const|static|mod)\s+"
-    r"([A-Za-z_][A-Za-z0-9_]*)"
-)
+# A `pub` item declaration and its identifier used to be found by a regex
+# (`PUB_DECL_RE`) over each file's/line's own raw text — retired: every
+# caller now cross-references the REAL `symbol-index` `syn` parse
+# (`build_symbol_index`, `_public_idents_in_file`) instead. Regex readers
+# over Rust source are the class this repo's own recorded lesson names
+# ("lost five audits"); this file's own first migrated run found the same
+# class of gap `check_plan_citations.py`'s own construction did.
 
 
 def is_source_file(path: Path) -> bool:
@@ -189,14 +236,23 @@ def resolve_diff_base() -> str | None:
     return None
 
 
-def added_crate_lines_with_paths(base: str) -> list[tuple[str, str]]:
-    """`[(file_path, added_line_text), ...]` for every added (`+`) line under
-    `crates/` in `git diff <base>...HEAD` — file-path-attributed (round for
-    #508: the allowlist matches `(identifier, declaring_path)` PAIRS, so a
-    finding needs to know which file it came from, not just its raw text).
-    Tracked via the diff's own `+++ b/<path>` hunk headers; a deleted file's
-    `+++ /dev/null` clears the current file (no added lines can attribute to
-    it).
+_HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def added_crate_lines_with_paths(base: str) -> list[tuple[str, int, str]]:
+    """`[(file_path, new_file_line_no, added_line_text), ...]` for every
+    added (`+`) line under `crates/` in `git diff <base>...HEAD` —
+    file-path-attributed (round for #508: the allowlist matches
+    `(identifier, declaring_path)` PAIRS, so a finding needs to know which
+    file it came from, not just its raw text) and line-number-attributed
+    (so `check_governance_tripwire` can cross-reference a REAL parsed
+    item's own declared line against this diff's added-line set, rather
+    than re-parsing the line's own bare text). Tracked via the diff's own
+    `+++ b/<path>` hunk headers and each hunk's `@@ -a,b +c,d @@` new-file
+    starting line; a deleted file's `+++ /dev/null` clears the current
+    file (no added lines can attribute to it). `--unified=0` means every
+    non-`+++`/`@@` line in a hunk is an add, so the running new-line
+    counter only needs to seed from `c` and increment on `+`.
     """
     result = subprocess.run(
         ["git", "diff", "--unified=0", f"{base}...HEAD", "--", "crates/"],
@@ -206,8 +262,9 @@ def added_crate_lines_with_paths(base: str) -> list[tuple[str, str]]:
     )
     if result.returncode != 0:
         return []
-    pairs: list[tuple[str, str]] = []
+    triples: list[tuple[str, int, str]] = []
     current_file: str | None = None
+    new_line_no = 0
     for line in result.stdout.splitlines():
         if line.startswith("+++ "):
             raw_path = line[len("+++ ") :]
@@ -217,9 +274,15 @@ def added_crate_lines_with_paths(base: str) -> list[tuple[str, str]]:
             continue
         if line.startswith("+++"):
             continue
+        if line.startswith("@@ "):
+            m = _HUNK_HEADER_RE.match(line)
+            if m:
+                new_line_no = int(m.group(1))
+            continue
         if line.startswith("+") and current_file is not None:
-            pairs.append((current_file, line[1:]))
-    return pairs
+            triples.append((current_file, new_line_no, line[1:]))
+            new_line_no += 1
+    return triples
 
 
 # --------------------------------------------------------------------------- #
@@ -282,12 +345,20 @@ def load_allowlist(path: Path = ALLOWLIST_PATH) -> tuple[list[AllowlistRow], lis
     return rows, failures
 
 
-def _public_idents_in_file(path: Path) -> set[str]:
-    try:
-        text = path.read_text(errors="ignore")
-    except OSError:
-        return set()
-    return set(PUB_DECL_RE.findall(text))
+def _public_idents_in_file(rel_path: str, index: dict) -> set[str]:
+    """Every `pub`(-any-form) item's bare NAME declared in `rel_path`
+    (repo-relative), per the REAL `symbol-index` `syn` parse — never a
+    regex reader over the file's own text (see the module docstring's own
+    "PUB_DECL_RE retired" note). An impl method's own bare method name is
+    included (an `impl` block's `pub fn` is a public declaration the same
+    way a free `pub fn` is), matching what the retired regex also matched
+    textually, now derived from a real AST instead.
+    """
+    return {
+        it["name"]
+        for it in index["items"]
+        if it["path"] == rel_path and it["vis"].startswith("pub")
+    }
 
 
 def _identifier_appears_anywhere(identifier: str) -> bool:
@@ -388,8 +459,14 @@ def check_allowlist_rot(rows: list[AllowlistRow]) -> list[str]:
     """Rules 1-6, re-verified on EVERY run, every one a hard FAIL — a row
     that no longer says what it claims to say is worse than no waiver at
     all (rule 7 is enforced at load time — see `load_allowlist`).
+
+    The symbol index is built ONCE, here, and threaded through every row's
+    own rule-1 check — never rebuilt per row (a real `cargo run` per row
+    would be a needless multiplication of an already-fast, single-build
+    cost).
     """
     findings: list[str] = []
+    index = build_symbol_index(["crates"]) if rows else None
     for row in rows:
         loc = f"{ALLOWLIST_PATH.name}:{row.line_no}"
         decl_path = REPO_ROOT / row.declaring_path
@@ -398,7 +475,7 @@ def check_allowlist_rot(rows: list[AllowlistRow]) -> list[str]:
                 f"{loc}: declaring_path `{row.declaring_path}` does not exist (rule 2) — "
                 "delete or fix the row"
             )
-        elif row.identifier not in _public_idents_in_file(decl_path):
+        elif row.identifier not in _public_idents_in_file(row.declaring_path, index):
             findings.append(
                 f"{loc}: identifier `{row.identifier}` no longer matches a public declaration "
                 f"in `{row.declaring_path}` (rule 1) — a rename must re-earn its ruling"
@@ -435,6 +512,13 @@ def _waiver_line(kind: str, identifier: str, path: str, row: AllowlistRow) -> st
 def check_governance_tripwire(rows: list[AllowlistRow]) -> tuple[list[str], list[str]]:
     """(1) NEW public governance-verb identifiers in the diff (advisory,
     unless waived). Returns `(findings, waived_lines)`.
+
+    Cross-references the REAL symbol index (every `pub` item's own
+    declared line, from a real `syn` parse) against the diff's own
+    added-line-number set — never a regex re-scan of each added line's
+    bare text (the retired `PUB_DECL_RE` approach), which could not see a
+    `pub fn` whose signature wraps across lines, and could be fooled by a
+    string/comment containing the same text a real parser is not.
     """
     base = resolve_diff_base()
     if base is None:
@@ -446,26 +530,40 @@ def check_governance_tripwire(rows: list[AllowlistRow]) -> tuple[list[str], list
         )
         return [], []
 
+    added = added_crate_lines_with_paths(base)
+    added_lines_by_file: dict[str, set[int]] = {}
+    for file_path, line_no, _text in added:
+        added_lines_by_file.setdefault(file_path, set()).add(line_no)
+    if not added_lines_by_file:
+        return [], []
+
+    index = build_symbol_index(["crates"])
     allowlist_by_key = {(r.identifier, r.declaring_path): r for r in rows}
     findings: list[str] = []
     waived: list[str] = []
-    for file_path, line in added_crate_lines_with_paths(base):
-        for ident in PUB_DECL_RE.findall(line):
-            verb = governance_stem(ident)
-            if verb is None:
-                continue
-            row = allowlist_by_key.get((ident, file_path))
-            if row is not None:
-                waived.append(_waiver_line("governance-verb", ident, file_path, row))
-                continue
-            findings.append(
-                f"ADVISORY: new public identifier `{ident}` in `{file_path}` has governance-verb "
-                f"stem `{verb}` — confirm it is open-core MECHANISM "
-                "(list/describe/delete/federation), not platform GOVERNANCE "
-                "(governance is platform-owned; LESSONS L24). If a human has already ruled this "
-                f"mechanism, add a reviewed row to {ALLOWLIST_PATH.name} citing the ruling — "
-                "never rename a correct identifier to dodge this tripwire."
-            )
+    for item in index["items"]:
+        if not item["vis"].startswith("pub"):
+            continue
+        file_path = item["path"]
+        added_set = added_lines_by_file.get(file_path)
+        if not added_set or item["line"] not in added_set:
+            continue
+        ident = item["name"]
+        verb = governance_stem(ident)
+        if verb is None:
+            continue
+        row = allowlist_by_key.get((ident, file_path))
+        if row is not None:
+            waived.append(_waiver_line("governance-verb", ident, file_path, row))
+            continue
+        findings.append(
+            f"ADVISORY: new public identifier `{ident}` in `{file_path}` has governance-verb "
+            f"stem `{verb}` — confirm it is open-core MECHANISM "
+            "(list/describe/delete/federation), not platform GOVERNANCE "
+            "(governance is platform-owned; LESSONS L24). If a human has already ruled this "
+            f"mechanism, add a reviewed row to {ALLOWLIST_PATH.name} citing the ruling — "
+            "never rename a correct identifier to dodge this tripwire."
+        )
     return findings, waived
 
 
@@ -514,7 +612,171 @@ def check_leak_smells(rows: list[AllowlistRow]) -> tuple[list[str], list[str]]:
     return findings, waived
 
 
+# --------------------------------------------------------------------------- #
+# self-test (#508 contract delta: one fixture per rot rule 1-7, plus the
+# duplicate-pair vs. same-identifier-different-path distinction)
+# --------------------------------------------------------------------------- #
+def self_test() -> int:
+    failures: list[str] = []
+
+    def check(label: str, cond: bool, detail: object = "") -> None:
+        if not cond:
+            failures.append(f"{label}: {detail}")
+
+    # The REAL, committed row this repo already ships -- reused as the
+    # baseline for every mutation below, rather than a synthetic tempdir
+    # tree: `register_content_hash_udf` genuinely exists at this exact
+    # path, its ruling_sha is a genuine ancestor of HEAD, and the
+    # identifier genuinely appears elsewhere in the crates tree (its OWN
+    # second row, `pinned_source_gate.rs`) -- so a mutation on ONE field
+    # exercises exactly the rule that field governs, nothing else.
+    good_row = AllowlistRow(
+        identifier="register_content_hash_udf",
+        declaring_path="crates/jammi-ai/src/query/content_hash_udf.rs",
+        ruling_sha="c0e1faec00a3de0d59499801755e705579dbe202",
+        ruling_ref="#508",
+        reason=(
+            "Installs a Datafusion scalar UDF into the query session's function catalog so SQL "
+            "statements can invoke it by name."
+        ),
+        line_no=1,
+    )
+
+    # Positive control: the real, committed row must produce ZERO findings
+    # -- proves this checker can find a genuinely correct row, not merely
+    # reject everything handed to it.
+    got = check_allowlist_rot([good_row])
+    check("positive control (the real committed row)", got == [], got)
+
+    # Rule 1: identifier no longer matches a public declaration at
+    # declaring_path (a rename must re-earn its ruling).
+    renamed = replace(good_row, identifier="register_content_hash_udf_renamed_xyz")
+    got = check_allowlist_rot([renamed])
+    check("rule 1 (renamed identifier)", any("(rule 1)" in g for g in got), got)
+
+    # Rule 2: declaring_path does not exist.
+    missing_path = replace(good_row, declaring_path="crates/jammi-ai/src/does_not_exist_xyz.rs")
+    got = check_allowlist_rot([missing_path])
+    check("rule 2 (missing declaring_path)", any("(rule 2)" in g for g in got), got)
+
+    # Rule 3a: ruling_sha is not a well-formed 40-hex sha at all.
+    bad_shape = replace(good_row, ruling_sha="not-a-real-sha")
+    got = check_allowlist_rot([bad_shape])
+    check("rule 3 (malformed ruling_sha)", any("(rule 3)" in g and "well-formed" in g for g in got), got)
+
+    # Rule 3b: well-formed 40-hex sha that is NOT an ancestor of HEAD.
+    non_ancestor = replace(good_row, ruling_sha="f" * 40)
+    got = check_allowlist_rot([non_ancestor])
+    check(
+        "rule 3 (well-formed but non-ancestor ruling_sha)",
+        any("(rule 3)" in g and "not an ancestor" in g for g in got),
+        got,
+    )
+
+    # Rule 4: ruling_ref does not resolve (neither an issue/PR number nor a
+    # `<doc-path>#<heading>` citation).
+    bad_ref = replace(good_row, ruling_ref="not-a-real-citation")
+    got = check_allowlist_rot([bad_ref])
+    check("rule 4 (unresolvable ruling_ref)", any("(rule 4)" in g for g in got), got)
+
+    # Rule 5: identifier appears NOWHERE in the scanned engine-runtime tree
+    # -- a dead waiver.
+    dead = replace(good_row, identifier="definitely_absent_identifier_98765_xyz")
+    got = check_allowlist_rot([dead])
+    check("rule 5 (dead identifier, appears nowhere)", any("(rule 5)" in g for g in got), got)
+
+    # Rule 6a: reason is trivially short.
+    short_reason = replace(good_row, reason="ok")
+    got = check_allowlist_rot([short_reason])
+    check(
+        "rule 6 (trivially short reason)",
+        any("(rule 6)" in g and "trivially short" in g for g in got),
+        got,
+    )
+
+    # Rule 6b: reason itself leads with a governance-verb stem as its main
+    # verb -- "confirmed, it's fine" phrased as a restatement, refused.
+    verb_reason = replace(
+        good_row,
+        reason="Registers a new content-hash row so downstream code can look it up by name later.",
+    )
+    got = check_allowlist_rot([verb_reason])
+    check(
+        "rule 6 (reason leads with a governance verb)",
+        any("(rule 6)" in g and "leads with governance-verb" in g for g in got),
+        got,
+    )
+
+    # Rule 6c: reason carries a bare line-number citation instead of a
+    # mechanism sentence.
+    line_reason = replace(good_row, reason="Confirmed clean per the ruling discussion at content_hash_udf.rs:42")
+    got = check_allowlist_rot([line_reason])
+    check(
+        "rule 6 (bare line-number citation)",
+        any("(rule 6)" in g and "bare line-number citation" in g for g in got),
+        got,
+    )
+
+    # Rule 7: an EXACT duplicate (identifier, declaring_path) PAIR is a
+    # hard parse failure at load time (never seen by check_allowlist_rot
+    # at all), and only the FIRST occurrence survives into `rows`.
+    with tempfile.TemporaryDirectory() as td:
+        allow_path = Path(td) / "allow.txt"
+        allow_path.write_text(
+            f"{good_row.identifier}\t{good_row.declaring_path}\t{good_row.ruling_sha}\t"
+            f"{good_row.ruling_ref}\t{good_row.reason}\n"
+            f"{good_row.identifier}\t{good_row.declaring_path}\t{good_row.ruling_sha}\t"
+            "#999\tA second, differently-worded ruling for the identical pair.\n",
+            encoding="utf-8",
+        )
+        rows, parse_failures = load_allowlist(allow_path)
+        check(
+            "rule 7 (duplicate pair is a hard parse failure)",
+            any("rule 7" in f for f in parse_failures),
+            parse_failures,
+        )
+        check("rule 7 (only the first occurrence survives into rows)", len(rows) == 1, rows)
+
+    # Negative control: the SAME identifier at a DIFFERENT declaring_path
+    # is NOT rule 7 -- the real committed allowlist carries exactly this
+    # shape (register_content_hash_udf at two distinct paths) and must
+    # load with zero parse failures.
+    with tempfile.TemporaryDirectory() as td:
+        allow_path = Path(td) / "allow.txt"
+        allow_path.write_text(
+            f"{good_row.identifier}\t{good_row.declaring_path}\t{good_row.ruling_sha}\t"
+            f"{good_row.ruling_ref}\t{good_row.reason}\n"
+            f"{good_row.identifier}\tcrates/jammi-ai/tests/it/pinned_source_gate.rs\t"
+            f"{good_row.ruling_sha}\t#554\tA different site, its own row, not a duplicate pair.\n",
+            encoding="utf-8",
+        )
+        rows, parse_failures = load_allowlist(allow_path)
+        check(
+            "same identifier, different declaring_path is NOT rule 7",
+            parse_failures == [] and len(rows) == 2,
+            (parse_failures, rows),
+        )
+
+    if failures:
+        print("no-consumer-names self-test: FAIL", file=sys.stderr)
+        for f in failures:
+            print(f"  - {f}", file=sys.stderr)
+        return 1
+    print(
+        "no-consumer-names self-test: OK — every allowlist rot rule (1-7) bites: a renamed "
+        "identifier, a missing declaring_path, a malformed AND a well-formed-but-non-ancestor "
+        "ruling_sha, an unresolvable ruling_ref, a dead identifier, a trivially-short / "
+        "governance-verb-leading / bare-line-cited reason, and a duplicate (identifier, "
+        "declaring_path) pair (with the SAME identifier at a DIFFERENT path staying clean) -- "
+        "plus a positive control on the real, committed register_content_hash_udf row."
+    )
+    return 0
+
+
 def main() -> int:
+    if "--self-test" in sys.argv[1:]:
+        return self_test()
+
     allowlist_rows, allowlist_parse_failures = load_allowlist()
     rot_findings = check_allowlist_rot(allowlist_rows) if not allowlist_parse_failures else []
     gov_findings, gov_waived = check_governance_tripwire(allowlist_rows)

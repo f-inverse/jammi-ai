@@ -403,7 +403,49 @@ impl ArtifactStore {
     /// caller is paving over already-cleaned or never-completed state. A missing
     /// manifest means the attempt never completed its write; nothing durable to
     /// reclaim, so that is a no-op too.
+    ///
+    /// **I1 (#562(2)).** `pub(crate)`, so no crate outside `jammi-db` can call
+    /// this directly; within `jammi-db` its only two callers are the two
+    /// sanctioned routes named above — `models_delete_call_sites.rs`'s
+    /// enumerating source oracle pins that call-site set (and every OTHER
+    /// production call of the lower-level
+    /// [`crate::storage::JammiObjectStore::delete_if_exists`] this method's
+    /// own body reaches, reviewing each as non-`models/` with its reason).
+    /// The check below is the runtime half — an ALWAYS-ON, RELEASE-BUILD
+    /// typed refusal, never a `debug_assert!` a release build compiles
+    /// away: `self.root` is always `models_root(&root)` by construction
+    /// (`ResultStore::new`, the ONE place an `ArtifactStore` is built), so
+    /// every `prefix` this unguarded primitive ever receives should be
+    /// under it — a THIRD, future call site (source-review drift, not a
+    /// hypothetical: the two-call-site source oracle
+    /// (`models_delete_call_sites.rs`) is a CI-time text scan, not a
+    /// compiler proof) that somehow reaches this method with a foreign
+    /// prefix is refused here, in every build, rather than trusted.
     pub(crate) async fn delete_artifact_prefix(&self, prefix: &StorageUrl) -> Result<()> {
+        // PATH CONTAINMENT, never a bare string-prefix test: `self.root`
+        // (`models_root`, `store/mod.rs`) carries no trailing slash, so a
+        // plain `starts_with` would also accept a SIBLING directory whose
+        // name merely shares `self.root`'s own text as a prefix —
+        // `{root}/models-archive/x` starts with the STRING `{root}/models`
+        // without being under the PATH `{root}/models` at all. The only
+        // two admissible relationships are exact equality (the store's own
+        // root itself) or `self.root` immediately followed by `/` (a real
+        // path segment boundary).
+        let root = self.root.as_str();
+        let candidate = prefix.as_str();
+        let root_with_sep = format!("{root}/");
+        if candidate != root && !candidate.starts_with(&root_with_sep) {
+            return Err(JammiError::Storage(StorageError::layout(
+                prefix.as_str(),
+                format!(
+                    "delete_artifact_prefix: {prefix} is not under this store's own root ({}); \
+                     every call site must route through \
+                     ResultStore::delete_unreferenced_prefix (guarded) or \
+                     Self::delete_resume_checkpoint (the proven-exempt `_resume/` namespace)",
+                    self.root.as_str()
+                ),
+            )));
+        }
         let handle = self.handle(prefix)?;
         let manifest_path = self.child(prefix, MANIFEST_NAME)?;
         let manifest = if handle.exists(&manifest_path).await? {
@@ -623,7 +665,15 @@ impl ArtifactStore {
     /// `{root}/{TenantSegment::of(tenant)}/{segments…}`. Each segment is
     /// sanitized so a `job_id`/`worker_id` carrying a `/` cannot escape the
     /// prefix or collide across attempts.
-    fn prefix_url(&self, tenant: Option<&TenantId>, segments: &[&str]) -> Result<StorageUrl> {
+    ///
+    /// `pub`: this is the ONE place [`Self::put_artifact`] builds the prefix
+    /// a published artifact roots under, so a test asserting on the SHAPE of
+    /// a committed `artifact_path` (never its bytes) calls this instead of
+    /// hand-building the layout string — the shape can never drift out from
+    /// under a hand-built copy again the way `artifact_crash_window.rs`'s
+    /// `winner_prefix` did across commit `5fef1ac8`'s tenant-prefixed
+    /// layout change.
+    pub fn prefix_url(&self, tenant: Option<&TenantId>, segments: &[&str]) -> Result<StorageUrl> {
         let root = self.root.as_str().trim_end_matches('/');
         let mut joined = String::from(root);
         joined.push('/');
@@ -1065,6 +1115,113 @@ mod tests {
         assert!(store.fetch_artifact(&prefix).await.is_err());
         // Deleting again (already-clean) is a no-op, not an error.
         store.delete_artifact_prefix(&prefix).await.unwrap();
+    }
+
+    /// I1's release-build typed refusal: a
+    /// prefix NOT under this store's own root — a THIRD, hypothetical call
+    /// site's mistake, not one of the two sanctioned routes
+    /// (`ResultStore::delete_unreferenced_prefix`,
+    /// `Self::delete_resume_checkpoint`) — is refused, typed, in EVERY
+    /// build (not a `debug_assert!` a release build would compile away).
+    /// Proves the bytes it published under its OWN root are untouched:
+    /// this is a pure input-validation refusal, never a "best-effort
+    /// delete of whatever happened to be there" fallback.
+    #[tokio::test]
+    async fn delete_artifact_prefix_refuses_a_prefix_outside_this_stores_own_root() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = store_with_root(
+            StorageUrl::memory("artifacts-foreign-root"),
+            cache.path().to_path_buf(),
+        );
+        // A well-formed prefix, but under a COMPLETELY DIFFERENT root —
+        // never one this store's own `put_artifact` could have produced.
+        let foreign = StorageUrl::memory("a-totally-different-root/job-x/worker-y/0");
+
+        let err = store
+            .delete_artifact_prefix(&foreign)
+            .await
+            .expect_err("a prefix outside this store's own root must be refused, not deleted");
+        assert!(
+            matches!(
+                &err,
+                crate::error::JammiError::Storage(StorageError::Layout { path, .. })
+                    if path == foreign.as_str()
+            ),
+            "expected a typed Storage(Layout) refusal naming the foreign prefix, got {err:?}"
+        );
+
+        // Own-root bytes are entirely unaffected — this call never touched
+        // anything under `store`'s actual root at all.
+        let own = store
+            .put_artifact(None, &["job-z", "worker-w", "0"], &sample_files())
+            .await
+            .unwrap();
+        assert!(
+            store.fetch_artifact(&own).await.is_ok(),
+            "the refusal above must be a pure input check, with no side effect on this \
+             store's own, unrelated bytes"
+        );
+    }
+
+    /// PATH containment, never a bare STRING-prefix test (adversarial
+    /// audit on `feat/500-wave5`, item 3): `models_root` (`store/mod.rs`)
+    /// yields `{root}/models` with NO trailing slash, so a plain
+    /// `prefix.starts_with(self.root)` would also accept a SIBLING
+    /// directory whose name merely shares `self.root`'s own text as a
+    /// prefix — `{root}/models-archive/x` starts with the STRING
+    /// `{root}/models` without being under the PATH `{root}/models` at
+    /// all. Pins all four boundary shapes the audit named: a
+    /// dash-suffixed sibling and a bare-letter-suffixed sibling (`models`
+    /// immediately followed by `-archive` or `X`, neither a `/`) are
+    /// refused; the root's own bytes AND a real child path both proceed.
+    #[tokio::test]
+    async fn delete_artifact_prefix_refuses_a_string_prefix_that_is_not_a_path_ancestor() {
+        let cache = tempfile::tempdir().unwrap();
+        // A root SHAPED like production's `models_root` output — a
+        // `/models` suffix on some base, so the sibling-directory shapes
+        // below share a real string prefix with it, not just a synthetic
+        // coincidence.
+        let store = store_with_root(
+            StorageUrl::memory("artifacts-boundary/models"),
+            cache.path().to_path_buf(),
+        );
+
+        for sibling in [
+            "artifacts-boundary/models-archive/x",
+            "artifacts-boundary/modelsX/x",
+        ] {
+            let candidate = StorageUrl::memory(sibling);
+            let err = store
+                .delete_artifact_prefix(&candidate)
+                .await
+                .expect_err(&format!(
+                    "{sibling} shares a STRING prefix with the store's own root but is not a \
+                     PATH descendant of it — must be refused"
+                ));
+            assert!(
+                matches!(&err, JammiError::Storage(StorageError::Layout { path, .. }) if path == candidate.as_str()),
+                "expected a typed Storage(Layout) refusal naming {sibling}, got {err:?}"
+            );
+        }
+
+        // A real path descendant (`{root}/x`, never published) is a
+        // no-op delete, not a refusal — `delete_artifact_prefix`'s own
+        // doc: a missing manifest at `prefix` is a no-op, never an error.
+        let real_child = StorageUrl::memory("artifacts-boundary/models/x");
+        assert!(
+            store.delete_artifact_prefix(&real_child).await.is_ok(),
+            "a genuine path descendant of the store's own root must be accepted (a no-op here, \
+             since nothing was ever published at it), never refused as foreign"
+        );
+
+        // The root's own exact prefix (no further path segment at all) is
+        // likewise accepted — the `candidate != root` branch of the
+        // equality-or-separator check.
+        let exact_root = StorageUrl::memory("artifacts-boundary/models");
+        assert!(
+            store.delete_artifact_prefix(&exact_root).await.is_ok(),
+            "the store's own exact root prefix must be accepted, never refused as foreign"
+        );
     }
 
     #[tokio::test]

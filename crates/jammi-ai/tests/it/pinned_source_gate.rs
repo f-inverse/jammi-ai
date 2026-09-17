@@ -99,17 +99,30 @@
 //!    into a bare `current_version` local remains disclosed, not covered —
 //!    see that same doc for why.
 //!
-//! **What this file does NOT claim.** It is source-text pattern matching
-//! over a hand-written (but string/char/comment-literal-aware — see
-//! [`mask_non_code`]) approximation of Rust's grammar, not a real parser and
-//! not a call-graph or dataflow analysis. Stated failure modes, per R-A:
-//! nested (non-doc) block comments are treated as non-nesting (the first
-//! `*/` closes them — Rust allows `/* /* */ */` to nest; this crate's source
-//! was checked and contains no such nesting today, but a future one would
-//! have its interior treated as code); a function-pointer type parameter
-//! written with unconventional spacing (`fn (i32) -> bool`, a space after
-//! `fn`) would be mistaken for a function item — checked: `grep -rn 'fn (\['
-//! crates/jammi-db/src crates/jammi-ai/src` finds none; and detectors 2 and
+//! **What this file does NOT claim.** [`find_fn_regions`] itself is still
+//! source-text pattern matching over an approximation of Rust's grammar (a
+//! function-pointer type parameter written with unconventional spacing
+//! (`fn (i32) -> bool`, a space after `fn`) would be mistaken for a function
+//! item — checked: `grep -rn 'fn (\[' crates/jammi-db/src crates/jammi-ai/src`
+//! finds none), not a real call-graph or dataflow analysis. The masking layer
+//! underneath it ([`mask_non_code`]/[`mask_comments_only`]) is NOT
+//! hand-rolled: both delegate to [`real_tokenizer_mask`], which walks the
+//! REAL token stream `proc-macro2`'s fallback lexer produces (the same lexer
+//! `rustc` itself is built on) and uses each token's own `Span::byte_range()`
+//! to decide what is code, what is a string/char literal, and what is a
+//! comment — never a hand-counted quote or `/*`/`*/` pair. This closes the
+//! R-A limits a prior hand-rolled scanner had here (closing audit #9 of
+//! U2a, 2026-09-14, measured them live on this tree: 22 code lines blanked as
+//! comments and 12 real comments left unblanked around raw strings in
+//! `crates/jammi-db/src/{storage/config.rs,config/tests.rs,config/secret.rs,
+//! sql/ident.rs}`) rather than merely disclosing them: a raw string's
+//! `r#"..."#` delimiter (any hash count, any number of embedded physical
+//! newlines) is a single [`proc_macro2::Literal`] token regardless of what
+//! `"`/`//`/`/*` text it contains, and a (non-doc) block comment nests
+//! correctly because the tokenizer's own trivia-skipping — not this file's
+//! character loop — decides where one ends; see
+//! [`falsification_real_tokenizer_mask_handles_raw_strings_and_nested_comments`]
+//! for the executed proof, both directions. Detectors 2 and
 //! 4 do not follow a value ACROSS function boundaries (a helper that reads
 //! `.current_version` — off a parameter for pattern 2, off a self-fetched
 //! record for pattern 4 — and hands the bare version to a second,
@@ -180,7 +193,21 @@ use std::process::Command;
 
 /// The whole surface this gate's property quantifies over
 /// (`CONTRACT-DELTA-fix7.md`: "every Rust source in `crates/jammi-db/src`
-/// and `crates/jammi-ai/src`"), relative to the repo root.
+/// and `crates/jammi-ai/src`"), relative to the repo root — stated honestly,
+/// not merely by construction: a registration verb or DDL literal living
+/// anywhere OUTSIDE these two trees is outside every check in this file's
+/// "literal-occurrence gate" section (below) entirely, whether that is a
+/// third crate ([`falsification_registration_verb_scan_states_its_universe_honestly`]
+/// exercises `crates/jammi-bench/src/corpus.rs`'s real
+/// `ctx.register_parquet(TableReference::bare(format!("jammi.{table_name}")),
+/// ..)` call, live and unreviewed by this file today, precisely because
+/// `jammi-bench` is not one of these two directories) or `tests/it/` in
+/// either crate named here (five `.register_table(` calls this file's own
+/// review list cites live under `crates/jammi-db/tests/it/materialization.rs`,
+/// outside `crates/jammi-db/src`, and so outside this constant's reach too).
+/// [`fine_tune_reachable_sites`]'s own universe (derived from `cargo
+/// metadata`'s dependency closure, not this constant) is wider on purpose —
+/// see that function's doc.
 const SURFACE_DIRS: &[&str] = &["crates/jammi-db/src", "crates/jammi-ai/src"];
 
 /// The repo root, derived from this crate's manifest dir
@@ -263,238 +290,252 @@ pub(crate) fn scan_surface() -> Vec<(String, String)> {
     out
 }
 
-// ── A comment/string/char-literal-aware mask, so brace/paren counting and
-// pattern search never mistake a `format!("jammi.{}")`'s own braces, or a
-// doc comment's prose, for code. ──────────────────────────────────────────
+/// #554 item 4: [`SURFACE_DIRS`]'s "stated honestly" claim, executed rather
+/// than taken on prose. `crates/jammi-bench/src/corpus.rs` carries a real,
+/// live `ctx.register_parquet(TableReference::bare(format!(
+/// "jammi.{table_name}")), ..)` call today -- checked directly below, not
+/// assumed -- and [`scan_surface`]'s own output is asserted to contain ZERO
+/// `crates/jammi-bench/` files, so that call is provably outside every
+/// check in the "literal-occurrence gate" section, not merely claimed to be.
+#[test]
+fn falsification_registration_verb_scan_states_its_universe_honestly() {
+    let root = repo_root();
+    let corpus_path = root.join("crates/jammi-bench/src/corpus.rs");
+    let corpus_text = std::fs::read_to_string(&corpus_path).unwrap_or_else(|e| {
+        panic!("crates/jammi-bench/src/corpus.rs must exist for this test to be meaningful ({e})")
+    });
+    assert!(
+        corpus_text.contains("register_parquet("),
+        "crates/jammi-bench/src/corpus.rs must still contain the motivating out-of-universe \
+         register_parquet( call this test proves lies outside SURFACE_DIRS -- if this fails, the \
+         call moved or was removed and this test's own premise needs re-checking, not silencing"
+    );
 
-/// Replace every line comment, block comment, string literal (plain and
-/// raw), and char literal in `text` with spaces — same length, same
-/// newlines, so every downstream line/column number still matches the
-/// original file, and brace/paren counting on the result never miscounts a
-/// `{`/`}` that appears inside a string (e.g. `format!("jammi.{}", ..)`) or
-/// treats commented-out code as live.
-///
-/// **Stated limit (R-A):** block comments are treated as non-nesting (the
-/// first `*/` closes one opened by `/*`, even though Rust itself nests
-/// them). Checked rather than assumed: `grep -rn '/\*.*/\*' crates/jammi-db/src
-/// crates/jammi-ai/src` finds no nested block comment in this surface today,
-/// so this limit is inert on the current tree; a future nested block
-/// comment would have its interior treated as code, which could only ever
-/// make a detector below fire MORE often (spurious code seen inside a dead
-/// comment), never mask a real hit.
-fn mask_non_code(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let mut out: Vec<char> = chars.clone();
-    let mut i = 0usize;
-    while i < n {
-        let c = chars[i];
-        // Line comment: `//` to end of line.
-        if c == '/' && i + 1 < n && chars[i + 1] == '/' {
-            let mut j = i;
-            while j < n && chars[j] != '\n' {
-                out[j] = ' ';
-                j += 1;
-            }
-            i = j;
-            continue;
-        }
-        // Block comment: `/* ... */`, non-nesting (see doc above).
-        if c == '/' && i + 1 < n && chars[i + 1] == '*' {
-            let mut j = i + 2;
-            while j + 1 < n && !(chars[j] == '*' && chars[j + 1] == '/') {
-                j += 1;
-            }
-            let end = (j + 2).min(n);
-            for k in i..end {
-                if chars[k] != '\n' {
-                    out[k] = ' ';
-                }
-            }
-            i = end;
-            continue;
-        }
-        // Raw string: `r`/`r#`.../`r###..."`, matched against the same
-        // number of trailing `#` after the closing `"`.
-        if c == 'r' && i + 1 < n && (chars[i + 1] == '"' || chars[i + 1] == '#') {
-            let mut k = i + 1;
-            let mut hashes = 0usize;
-            while k < n && chars[k] == '#' {
-                hashes += 1;
-                k += 1;
-            }
-            if k < n && chars[k] == '"' {
-                let content_start = k + 1;
-                let mut j = content_start;
-                let end = loop {
-                    if j >= n {
-                        break n;
-                    }
-                    if chars[j] == '"'
-                        && chars[j + 1..(j + 1 + hashes).min(n)]
-                            .iter()
-                            .all(|ch| *ch == '#')
-                        && j + 1 + hashes <= n
-                    {
-                        break j + 1 + hashes;
-                    }
-                    j += 1;
-                };
-                for k2 in i..end {
-                    if chars[k2] != '\n' {
-                        out[k2] = ' ';
-                    }
-                }
-                i = end;
-                continue;
-            }
-        }
-        // Plain string literal: `"..."`, with `\`-escapes.
-        if c == '"' {
-            let mut j = i + 1;
-            while j < n {
-                if chars[j] == '\\' {
-                    j += 2;
-                    continue;
-                }
-                if chars[j] == '"' {
-                    j += 1;
-                    break;
-                }
-                j += 1;
-            }
-            let end = j.min(n);
-            for k in i..end {
-                if chars[k] != '\n' {
-                    out[k] = ' ';
-                }
-            }
-            i = end;
-            continue;
-        }
-        // Char literal, distinguished from a lifetime (`'a`, `'static`) by
-        // requiring a closing `'` within an escape's width: `'\''`, `'\n'`,
-        // `'\u{2019}'`, or a plain `'x'`.
-        if c == '\'' {
-            if i + 1 < n && chars[i + 1] == '\\' {
-                let mut j = i + 2;
-                let mut steps = 0;
-                while j < n && chars[j] != '\'' && steps < 10 {
-                    j += 1;
-                    steps += 1;
-                }
-                if j < n && chars[j] == '\'' {
-                    let end = j + 1;
-                    for k in i..end {
-                        if chars[k] != '\n' {
-                            out[k] = ' ';
-                        }
-                    }
-                    i = end;
-                    continue;
-                }
-            } else if i + 2 < n && chars[i + 2] == '\'' {
-                out[i] = ' ';
-                out[i + 1] = ' ';
-                out[i + 2] = ' ';
-                i += 3;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out.into_iter().collect()
+    let surface = scan_surface();
+    let bench_files: Vec<&String> = surface
+        .iter()
+        .map(|(f, _)| f)
+        .filter(|f| f.starts_with("crates/jammi-bench/"))
+        .collect();
+    assert!(
+        bench_files.is_empty(),
+        "SURFACE_DIRS's own doc claims crates/jammi-bench is outside its universe -- \
+         scan_surface() must never return a jammi-bench file, got {bench_files:?}"
+    );
 }
 
-/// Blank every line comment and block comment in `text` (same length and
-/// newlines preserved, so line numbers still match the original), leaving
-/// string and char literal CONTENT untouched — unlike [`mask_non_code`],
-/// which blanks comments AND string/char literals and so cannot be used to
-/// find a DDL keyword that lives inside a string
-/// ([`fine_tune_ddl_relation_binding_hits`]'s exact requirement). String
-/// literals are still recognised (and skipped over without masking) so that
-/// a `//` or `/*` appearing inside one — a URL, say — is never mistaken for
-/// the start of a comment on the next iteration; raw strings and char
-/// literals are not specially recognised here. This function has TWO
-/// callers today, with two different scopes: [`fine_tune_ddl_relation_binding_hits`],
-/// scoped to `crates/jammi-ai/src/fine_tune/**`, and [`ddl_literal_occurrences`],
-/// unscoped over both crates' whole `src` trees ([`SURFACE_DIRS`]). Not
-/// recognising raw strings or char literals is a LIVE desync today, not a
-/// disclosed-but-inert limit: this scanner pairs the FIRST `"` it meets with
-/// the NEXT `"` it meets, with no notion of an `r#`/`r##` delimiter or of
-/// the hash count a raw string's real closing quote must match, so its
-/// "inside a string" bookkeeping can invert and run across lines — this is
-/// not one enumerable mechanism, so no fixed list of triggers is claimed
-/// here. Measured with this exact function, compiled verbatim (not a
-/// transcription), over both `src` trees at this head: 22 code lines get
-/// blanked as if they were comments and 12 real `//` comment lines are left
-/// completely unblanked, across `storage/config.rs:555`/`:619`,
-/// `config/tests.rs`, `config/secret.rs`, and `sql/ident.rs` — the complete
-/// set. The `grep -rn 'r#*".*\(//\|/\*\)'
-/// crates/jammi-db/src crates/jammi-ai/src` command finds exactly the two
-/// SINGLE-LINE raw strings responsible for part of the code-blanking above —
-/// `storage/config.rs:555` and `:619` — and nothing else, but that describes
-/// the one grep, not the tree: a delimiter-aware scan of `config/tests.rs`
-/// alone finds 12 further raw strings that span MULTIPLE physical lines
-/// (URL-carrying TOML fixtures), invisible to a single-line pattern by
-/// construction — the grep is a description of what it matches, not a
-/// completeness instrument over what raw strings exist. The
-/// consequence for this function's callers: a DDL-shaped string literal
-/// sitting on a desynced line is invisible to [`ddl_literal_occurrences`] —
-/// a FIFTH residual alongside the four the "literal-occurrence gate" section
-/// below already names, tracked on the same issue,
-/// <https://github.com/f-inverse/jammi-ai/issues/554> (amended with this
-/// residual; the rebuild that closes it replaces this hand-rolled masking
-/// with a real tokenizer that knows raw-string hash counts).
-fn mask_comments_only(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let mut out: Vec<char> = chars.clone();
-    let mut i = 0usize;
-    while i < n {
-        let c = chars[i];
-        if c == '/' && i + 1 < n && chars[i + 1] == '/' {
-            let mut j = i;
-            while j < n && chars[j] != '\n' {
-                out[j] = ' ';
-                j += 1;
+// ── A comment/string/char-literal-aware mask, so brace/paren counting and
+// pattern search never mistake a `format!("jammi.{}")`'s own braces, or a
+// doc comment's prose, for code. Both masks below are thin wrappers over
+// [`real_tokenizer_mask`] — a REAL tokenizer (proc-macro2's fallback lexer,
+// the same one `rustc` itself is built on), not a hand-counted quote/`/*`
+// scanner. ───────────────────────────────────────────────────────────────
+
+/// Whether a rendered [`proc_macro2::Literal`] token's OWN source spelling
+/// (`Literal::to_string()`, which reproduces the exact original text —
+/// `r##"..."##` hash count included, never a re-escaped copy) is a
+/// string/byte-string/C-string/char/byte literal, as opposed to a numeric or
+/// boolean one — the distinction [`real_tokenizer_mask`] needs to know
+/// whether a literal's CONTENT is ever a masking candidate at all. Delegated
+/// to `syn::Lit`'s own parser rather than a hand-written prefix check (`b`?
+/// `r`? how many `#`? `'` vs `"`?) precisely so the raw-string hash-counting
+/// class of bug this function replaces can never recur here by
+/// reintroducing a hand-rolled parse of the same shape one layer up.
+fn literal_is_string_or_char(rendered: &str) -> bool {
+    matches!(
+        syn::parse_str::<syn::Lit>(rendered),
+        Ok(syn::Lit::Str(_))
+            | Ok(syn::Lit::ByteStr(_))
+            | Ok(syn::Lit::CStr(_))
+            | Ok(syn::Lit::Char(_))
+            | Ok(syn::Lit::Byte(_))
+    )
+}
+
+/// What [`collect_mask_units`] found at one byte range of the source: never
+/// blanked on its own (an identifier, a punctuation character, a group
+/// delimiter, a numeric/bool literal); blanked only when the caller asks for
+/// string/char literal content to be masked too ([`mask_non_code`]'s mode);
+/// or blanked UNCONDITIONALLY, because the tokenizer identified it as a
+/// `///`/`//!`/`/** */`/`/*! */` doc comment synthesized into a
+/// `#[doc = "..."]` attribute — see that function's doc for the detection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MaskKind {
+    Code,
+    Literal,
+    AlwaysBlank,
+}
+
+/// Depth-first flatten of `ts` into `(byte range, MaskKind)` units, in
+/// source order. A [`proc_macro2::Group`]'s own delimiter characters are not
+/// tokens of their own in the stream, so they are emitted explicitly via
+/// [`proc_macro2::Group::span_open`]/`span_close` — otherwise the character
+/// AT that position would fall into an inter-token "gap"
+/// ([`real_tokenizer_mask`]'s own doc) and be blanked as if it were
+/// whitespace-or-comment, corrupting every paren/brace count downstream.
+///
+/// **Doc-comment detection.** `///x`/`//!x`/`/** x */`/`/*! x */` are not
+/// comments to the tokenizer at all — the lexer synthesizes them into a
+/// `#[doc = "x"]` (or `#![doc = "x"]`) attribute, and every token of that
+/// synthesized attribute (the `#`, the `!` when present, the brackets,
+/// `doc`, `=`, and the literal) shares ONE collapsed span: the doc comment's
+/// own original extent, not the narrow span each token would carry if a
+/// human had actually typed `#[doc = "x"]` by hand. A hand-written `#` is
+/// always exactly one byte wide; a synthesized one carries the WHOLE
+/// original comment's byte range instead — that width discrepancy is the
+/// signal checked here, and is the ONLY signal: `Span::byte_range()` never
+/// exposes "this token came from a doc comment" more directly than the span
+/// it silently widens. Detected, the entire synthesized attribute is
+/// emitted as ONE `AlwaysBlank` unit over the `#`'s own (collapsed, whole-
+/// comment) span and its inner tokens are never descended into — walking
+/// them individually would each re-claim that SAME byte range, and
+/// [`real_tokenizer_mask`]'s cursor only ever advances forward.
+/// [`falsification_real_tokenizer_mask_handles_raw_strings_and_nested_comments`]
+/// exercises this directly: a doc comment is blanked in BOTH
+/// [`mask_non_code`] and [`mask_comments_only`], the same as a plain `//`
+/// line comment, matching this file's pre-existing behaviour (the old
+/// hand-rolled scanner treated `///` as an ordinary `//` line comment too,
+/// since it never inspected the third `/`).
+fn collect_mask_units(
+    ts: proc_macro2::TokenStream,
+    out: &mut Vec<(std::ops::Range<usize>, MaskKind)>,
+) {
+    let mut iter = ts.into_iter().peekable();
+    while let Some(tt) = iter.next() {
+        match tt {
+            proc_macro2::TokenTree::Punct(p)
+                if p.as_char() == '#' && p.span().byte_range().len() > 1 =>
+            {
+                let range = p.span().byte_range();
+                if let Some(proc_macro2::TokenTree::Punct(bang)) = iter.peek() {
+                    if bang.as_char() == '!' {
+                        iter.next();
+                    }
+                }
+                if let Some(proc_macro2::TokenTree::Group(_)) = iter.peek() {
+                    iter.next();
+                }
+                out.push((range, MaskKind::AlwaysBlank));
             }
-            i = j;
-            continue;
-        }
-        if c == '/' && i + 1 < n && chars[i + 1] == '*' {
-            let mut j = i + 2;
-            while j + 1 < n && !(chars[j] == '*' && chars[j + 1] == '/') {
-                j += 1;
+            proc_macro2::TokenTree::Punct(p) => out.push((p.span().byte_range(), MaskKind::Code)),
+            proc_macro2::TokenTree::Ident(id) => out.push((id.span().byte_range(), MaskKind::Code)),
+            proc_macro2::TokenTree::Literal(lit) => {
+                let kind = if literal_is_string_or_char(&lit.to_string()) {
+                    MaskKind::Literal
+                } else {
+                    MaskKind::Code
+                };
+                out.push((lit.span().byte_range(), kind));
             }
-            let end = (j + 2).min(n);
-            for k in i..end {
-                if chars[k] != '\n' {
-                    out[k] = ' ';
+            proc_macro2::TokenTree::Group(g) => {
+                if g.delimiter() != proc_macro2::Delimiter::None {
+                    out.push((g.span_open().byte_range(), MaskKind::Code));
+                }
+                collect_mask_units(g.stream(), out);
+                if g.delimiter() != proc_macro2::Delimiter::None {
+                    out.push((g.span_close().byte_range(), MaskKind::Code));
                 }
             }
-            i = end;
-            continue;
         }
-        if c == '"' {
-            let mut j = i + 1;
-            while j < n {
-                if chars[j] == '\\' {
-                    j += 2;
-                    continue;
-                }
-                if chars[j] == '"' {
-                    j += 1;
-                    break;
-                }
-                j += 1;
-            }
-            i = j.min(n);
-            continue;
-        }
-        i += 1;
     }
-    out.into_iter().collect()
+}
+
+/// Blank `original[from..to]` in `out`, byte for byte, leaving `\n` bytes
+/// alone so line numbers never shift. A UTF-8 continuation byte is never
+/// `0x0A` (`\n`'s own byte value only ever occurs as a genuine newline in
+/// valid UTF-8), so operating byte-wise rather than char-wise here is safe:
+/// every blanked byte becomes the single ASCII byte `0x20`, so `out` stays
+/// valid UTF-8 no matter how many bytes a multi-byte character in the
+/// ORIGINAL text occupied (this file's own prose is full of multi-byte `—`
+/// em dashes inside comments, which is exactly the case this must not
+/// corrupt).
+fn blank_byte_range(out: &mut [u8], original: &[u8], from: usize, to: usize) {
+    for k in from..to.min(out.len()) {
+        if original[k] != b'\n' {
+            out[k] = b' ';
+        }
+    }
+}
+
+/// The real-tokenizer mask both [`mask_non_code`] and [`mask_comments_only`]
+/// delegate to. Lexes `text` with `proc-macro2`'s fallback tokenizer (the
+/// same lexer `rustc` itself is built on — never a hand-rolled quote/`/*`
+/// scanner) and walks the resulting `(byte range, MaskKind)` units in source
+/// order, blanking every inter-token GAP unconditionally (nothing but
+/// whitespace and comments — LINE or BLOCK, correctly nested, since the
+/// tokenizer's own trivia-skipping, not a hand-counted `*/`, decided where
+/// each one ends — can appear between two real tokens in syntactically
+/// valid Rust) and additionally blanking a token's own span when its
+/// [`MaskKind`] calls for it (`AlwaysBlank` always; `Literal` only when
+/// `blank_literals` is set). `Span::byte_range()` (`span-locations` feature)
+/// is documented accurate for a process that is not itself running AS a
+/// procedural macro — a `cargo test` binary, exactly like `main.rs`/
+/// `build.rs` in that same doc — which every caller here is.
+///
+/// Fails closed on a lex error (this file's "read a tracked file" discipline
+/// applied to tokenizing, not just reading, a tracked file): source
+/// `git ls-files` reports as tracked that this tokenizer cannot lex is a
+/// hard failure naming the file's own error, never a silent fall-through to
+/// the unmasked original text, which could hide a hit inside whatever bytes
+/// defeated the lexer.
+fn real_tokenizer_mask(text: &str, blank_literals: bool) -> String {
+    let stream =
+        <proc_macro2::TokenStream as std::str::FromStr>::from_str(text).unwrap_or_else(|e| {
+            panic!(
+                "real_tokenizer_mask: proc-macro2 could not lex this source ({e}) -- refusing to \
+             fall back to unmasked text, which could hide a hit inside the unlexed bytes"
+            )
+        });
+    let mut units = Vec::new();
+    collect_mask_units(stream, &mut units);
+    units.sort_by_key(|(r, _)| r.start);
+
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = bytes.to_vec();
+    let mut cursor = 0usize;
+    for (range, kind) in &units {
+        let start = range.start.max(cursor);
+        let end = range.end.max(start);
+        blank_byte_range(&mut out, bytes, cursor, start);
+        let should_blank =
+            *kind == MaskKind::AlwaysBlank || (blank_literals && *kind == MaskKind::Literal);
+        if should_blank {
+            blank_byte_range(&mut out, bytes, start, end);
+        }
+        cursor = end;
+    }
+    blank_byte_range(&mut out, bytes, cursor, bytes.len());
+    String::from_utf8(out).expect(
+        "blanking only ever overwrites a byte with the single ASCII byte 0x20, which stays \
+         valid UTF-8 regardless of what multi-byte character occupied that position before",
+    )
+}
+
+/// Replace every line comment, block comment, doc comment, string literal
+/// (plain and raw, any hash count), and char literal in `text` with spaces —
+/// same length, same newlines, so every downstream line/column number still
+/// matches the original file, and brace/paren counting on the result never
+/// miscounts a `{`/`}` that appears inside a string (e.g.
+/// `format!("jammi.{}", ..)`) or treats commented-out code as live. A thin
+/// wrapper over [`real_tokenizer_mask`]; see that function's doc for the
+/// mechanism.
+fn mask_non_code(text: &str) -> String {
+    real_tokenizer_mask(text, true)
+}
+
+/// Blank every line comment, block comment, and doc comment in `text` (same
+/// length and newlines preserved, so line numbers still match the original),
+/// leaving string and char literal CONTENT untouched — unlike
+/// [`mask_non_code`], which blanks comments AND string/char literals and so
+/// cannot be used to find a DDL keyword that lives inside a string
+/// ([`fine_tune_ddl_relation_binding_hits`]'s exact requirement). A thin
+/// wrapper over [`real_tokenizer_mask`]; see that function's doc for the
+/// mechanism. This function has TWO callers today, with two different
+/// scopes: [`fine_tune_ddl_relation_binding_hits`], scoped to
+/// `crates/jammi-ai/src/fine_tune/**`, and [`ddl_literal_occurrences`],
+/// unscoped over both crates' whole `src` trees ([`SURFACE_DIRS`]).
+fn mask_comments_only(text: &str) -> String {
+    real_tokenizer_mask(text, false)
 }
 
 fn is_ident_char(c: char) -> bool {
@@ -1551,16 +1592,12 @@ const SELF_FETCHED_RECORD_ALLOWED: &[(&str, &str, usize)] = &[
 /// see [`assign_ordinals`]'s doc for why an ORDINAL, not a line number, is
 /// the stable third element).
 const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
-    (
-        "crates/jammi-ai/src/pipeline/graph_propagation.rs",
-        "edge_scan_sql",
-        1, // ordinal 1 — the only `edge_scan_sql` in this file; line 854 today
-        1,
-        // The S9 `neighbor_graph` edge scan — the EDGE relation, never the
-        // pinned embedding table `PinnedSource` covers. See this same file's
-        // `edge_source_anchor` note in `ANCHOR_RETURN_ALLOWED` for the
-        // anchor/content pairing this residual leaves open.
-    ),
+    // `graph_propagation.rs::edge_scan_sql` (the S9 `neighbor_graph` edge
+    // scan) was HERE — round 3 (#551, N2-gate) migrated it onto
+    // `jammi_db::store::result_table_relation`, so its `"jammi.{` literal is
+    // gone from this function's body; the SAME literal now lives at the
+    // minter's own site (`crates/jammi-db/src/store/mod.rs::
+    // result_table_relation`, below), and this list shrank to match.
     (
         "crates/jammi-ai/src/pipeline/graph_neighbourhood.rs",
         "load_neighbor_graph_edges",
@@ -1568,18 +1605,10 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
         1,
         // Same class, the S9 edge relation.
     ),
-    (
-        "crates/jammi-db/src/index/exact.rs",
-        "exact_vector_search",
-        1, // ordinal 1 — the only `exact_vector_search` in this file; line 135 today
-        1,
-        // The exact-match ANN fallback, reading THIS session's own
-        // registration. `pin_current_version`'s own doc names this exact
-        // function as the disclosed "candidate SELECTION is not pinned"
-        // residual (M4): a pinned producer's pooled vectors are single-
-        // version, but the candidate set this function returns may have
-        // been chosen from a different, unpinned view.
-    ),
+    // `jammi-db/src/index/exact.rs::exact_vector_search` was HERE — round 3
+    // (#551, N2-gate) migrated it onto `crate::store::result_table_relation`
+    // too, for the same reason: its `"jammi.{` literal moved to the
+    // minter's site.
     (
         "crates/jammi-db/src/session.rs",
         "read_vectors",
@@ -1713,20 +1742,34 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
         // would not be caught by anything here and would need a fresh
         // review, not a renewed allowlist entry.
     ),
+    // `session.rs::infer_ordered_read_back_sql` was HERE — round 3 (#551,
+    // N2-gate) migrated it onto `jammi_db::store::result_table_relation`
+    // too; its `"jammi.{` literal moved to the minter's site, below.
     (
-        "crates/jammi-ai/src/session.rs",
-        "infer_ordered_read_back_sql",
-        1, // ordinal 1 — the only `infer_ordered_read_back_sql` in this file; line 2094 today
+        "crates/jammi-db/src/store/mod.rs",
+        "result_table_relation",
+        1, // ordinal 1 — the only `result_table_relation` in this file; line 361 today
         1,
-        // An INFERENCE task-result table's own read-back of what
-        // `InferenceSession::infer` just wrote in the same call, immediately
-        // after the write, in-process. This is a different table kind (task
-        // results, never a `current_version`-bearing embedding table
-        // `PinnedSource` covers) and a different hazard shape (read-your-
-        // own-write, not a version straddle across two independent
-        // resolutions) — listed here because the literal check cannot
-        // distinguish table kinds, not because it shares the embedding-
-        // provenance risk this contract is about.
+        // #551 round 3 (N2-gate): the general-purpose minter every OTHER
+        // reader of a session-registered `jammi.{name}` relation across the
+        // workspace now calls (`TrainingSetTable::sql_relation` delegates to
+        // it too) instead of hand-building the quoted string itself. This is
+        // the ONE reviewed construction site the `"jammi.{` literal is
+        // allowed to exist at for the quoted-relation class this round
+        // migrated — every quoted call site this round found
+        // (`session.rs::infer_ordered_read_back_sql`,
+        // `graph_propagation.rs::edge_scan_sql`,
+        // `index/exact.rs::exact_vector_search`, plus
+        // `jammi-bench`'s `propagate.rs`/`search_rss.rs`/`corpus.rs`, which
+        // this gate's `SURFACE_DIRS` does not scan) now calls this function
+        // and carries no literal of its own. The pre-existing UNQUOTED
+        // `TableReference::bare(format!("jammi.{{name}}"))` registration
+        // sites (`registered_name`, `load_neighbor_graph_edges`,
+        // `jammi-db/src/session.rs::read_vectors`/`read_vector_by_key`,
+        // `register_table`, `bind_result_table`) are a DIFFERENT risk class
+        // (what a name registers AS, not what a raw-SQL read quotes) this
+        // round did not migrate — reviewed and left as-is, their own
+        // existing entries unchanged.
     ),
 ];
 
@@ -2377,6 +2420,76 @@ fn mask_non_code_ignores_comments_and_string_braces() {
     );
 }
 
+/// The real-tokenizer masking rebuild's own executed proof, both directions
+/// -- closing audit #9 of U2a's fifth residual (raw strings) plus the R-A
+/// nested-block-comment limit the module doc used to disclose as inert:
+///
+/// 1. A raw string containing an escaped quote and an embedded `//`/`/*`
+///    must have its content (and ONLY its content) blanked by
+///    [`mask_non_code`] -- a hand-counted quote scanner (the deleted
+///    implementation) pairs the FIRST `"` with the NEXT `"`, closing the
+///    raw string early at the escaped `\"` and leaving everything after it
+///    (including a REAL `//comment`) unmasked as if it were code.
+/// 2. That SAME raw string's embedded `"jammi.{table}"`-shaped text must
+///    NOT be seen by [`mask_comments_only`] as a real session-registration
+///    literal candidate outside the string -- it stays untouched, inside
+///    the (still-visible) string, exactly where it belongs.
+/// 3. A `///` doc comment must be blanked the same as a plain `//` comment
+///    by BOTH masks (matching this file's pre-existing behaviour, since the
+///    old scanner never inspected the third `/`).
+/// 4. A NESTED block comment (`/* outer /* inner */ still-outer */`) must
+///    have its ENTIRE extent blanked, not just up to the first `*/` -- the
+///    R-A limit the deleted scanner disclosed as inert is closed here by
+///    construction: the tokenizer's own trivia-skipping decides where the
+///    comment ends, not a hand-counted `*/`.
+#[test]
+fn falsification_real_tokenizer_mask_handles_raw_strings_and_nested_comments() {
+    let src = concat!(
+        "/// a doc comment mentioning CREATE TABLE in prose\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
+        "fn f() {\n",
+        "    let raw = r#\"a \\\" quote, a // comment, and a /* block */ all inside\"#;\n",
+        "    /* outer /* inner */ still-outer */\n",
+        "    let _ = raw;\n",
+        "}\n",
+    );
+
+    let non_code = mask_non_code(src);
+    assert!(
+        !non_code.contains("comment, and a"),
+        "the raw string's CONTENT must be blanked by mask_non_code, got {non_code:?}"
+    );
+    assert!(
+        non_code.contains("let raw =") && non_code.contains("let _ = raw"),
+        "real code surrounding the raw string must survive mask_non_code, got {non_code:?}"
+    );
+    assert!(
+        !non_code.to_ascii_lowercase().contains("create table"),
+        "the doc comment's prose must be blanked by mask_non_code too, got {non_code:?}"
+    );
+    assert!(
+        !non_code.contains("still-outer"),
+        "a nested block comment must be blanked in its ENTIRE extent, including the text after \
+         the FIRST `*/`, got {non_code:?}"
+    );
+
+    let comments_only = mask_comments_only(src);
+    assert!(
+        comments_only.contains("a // comment, and a /* block */ all inside"),
+        "mask_comments_only must leave the raw string's CONTENT untouched (a `//`/`/*` inside a \
+         string is not a real comment), got {comments_only:?}"
+    );
+    assert!(
+        !comments_only.to_ascii_lowercase().contains("create table"),
+        "the doc comment's prose must be blanked by mask_comments_only too, got {comments_only:?}"
+    );
+    assert!(
+        !comments_only.contains("still-outer"),
+        "a nested block comment must be blanked in its ENTIRE extent by mask_comments_only too, \
+         got {comments_only:?}"
+    );
+}
+
 #[test]
 fn allowlists_match_current_hits_exactly() {
     // The inverse control, generalized to all four patterns: an allowance
@@ -2640,7 +2753,7 @@ fn allowlists_match_current_hits_exactly() {
 //     catalog and returned"), the identical silent-overwrite shape
 //     `register_catalog`/`register_udf` already have above;
 //     `deregister_schema` is its inverse. `ResultStore`'s own
-//     `install_result_schema`, `crates/jammi-db/src/store/mod.rs:1182` calls
+//     `install_result_schema`, `crates/jammi-db/src/store/mod.rs:1251` calls
 //     exactly this verb — which is why this literal set had to widen past
 //     `SessionContext`'s own surface rather than staying a pure enumeration
 //     of it.
@@ -3232,7 +3345,16 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
 /// never a declaration LINE, which drifts under an unrelated edit above it
 /// (see [`assign_ordinals`]'s doc) -- carries a `property`, the reviewed,
 /// human-written account of what this site actually does and why a second
-/// call/occurrence at the same site can never silently corrupt state. Every
+/// call/occurrence at the same site can never silently corrupt state, and an
+/// `allowed` COUNT: how many times this exact (file, function, ordinal) site
+/// is reviewed to occur, never merely whether it occurs at all. A `BTreeSet`
+/// key alone cannot see a SECOND `ctx.register_table(...)` planted inside an
+/// already-reviewed function collapse onto the same key — closing audit #8
+/// of U2a (2026-09-14, head d1fee4e7) executed exactly that escape and it
+/// stayed green under the set-only scheme; `registration_verb_occurrences`/
+/// `ddl_literal_occurrences` (below) now return a per-key COUNT, and
+/// [`assert_occurrences_reviewed`] fails a key whose real count exceeds its
+/// `allowed` one, not merely a key that is altogether missing or stale. Every
 /// field is read: `file`/`function`/`ordinal` key the comparison against the
 /// live scan ([`registration_verb_occurrences_are_all_reviewed`],
 /// [`ddl_literal_occurrences_are_all_reviewed`]); `property` is asserted
@@ -3245,6 +3367,7 @@ struct ReviewedRegistrationSite {
     file: &'static str,
     function: &'static str,
     ordinal: usize,
+    allowed: usize,
     property: &'static str,
 }
 
@@ -3283,65 +3406,403 @@ fn attribute_hit_to_enclosing_fn(regions: &[FnRegion], line_no: usize) -> (Strin
 /// Every occurrence, anywhere under [`SURFACE_DIRS`] (both crates, every
 /// directory -- not scoped to `fine_tune/`), of a
 /// [`PAIRED_REGISTRATION_VERBS`]/[`UNPAIRED_REGISTRATION_VERBS`] call-site
-/// PATTERN, attributed to its enclosing function. Deliberately a superset of
-/// "genuine calls": the same substring match `fine_tune_session_registration_hits`
-/// uses also matches the verb's own `fn register_x(`/`fn deregister_x(`
-/// DECLARATION line, which this file's hand-rolled scan cannot distinguish
-/// from a call site without becoming a real parser -- disclosed, not hidden:
-/// [`REGISTRATION_VERB_SITES`]'s entries for `store/mod.rs::register_table`
-/// and `store/result_schema.rs::{register_table,deregister_table}` say so
-/// directly.
+/// PATTERN, attributed to its enclosing function and COUNTED, not merely
+/// noted present -- a `(file, function, ordinal)` key maps to how many times
+/// the pattern occurs there, so a SECOND occurrence planted inside an
+/// already-reviewed function (closing audit #8 of U2a, 2026-09-14, head
+/// d1fee4e7, executed exactly this escape against the earlier `BTreeSet`
+/// version of this function) bumps the count past its `allowed` ceiling
+/// instead of collapsing onto the same, already-present key. Deliberately a
+/// superset of "genuine calls": the same substring match
+/// `fine_tune_session_registration_hits` uses also matches the verb's own
+/// `fn register_x(`/`fn deregister_x(` DECLARATION line, which this file's
+/// hand-rolled scan cannot distinguish from a call site without becoming a
+/// real parser -- disclosed, not hidden: [`REGISTRATION_VERB_SITES`]'s
+/// entries for `store/mod.rs::register_table` and
+/// `store/result_schema.rs::{register_table,deregister_table}` say so
+/// directly. A `deregister_X(` occurrence is never double-counted as a
+/// SEPARATE `register_X(` occurrence even though the former's text contains
+/// the latter as a substring (`"de"` + `"register_X("`): counting only the
+/// `"register_{verb}("` pattern already counts each `deregister_X(`
+/// occurrence once (via its embedded substring) and each standalone
+/// `register_X(` occurrence once, with no double pass needed --
+/// [`falsification_paired_verb_occurrence_count_does_not_double_count_deregister`]
+/// proves the arithmetic directly.
 fn registration_verb_occurrences(
     surface: &[(String, String)],
-) -> BTreeSet<(String, String, usize)> {
-    let mut hits = BTreeSet::new();
+) -> std::collections::BTreeMap<(String, String, usize), usize> {
+    let mut hits: std::collections::BTreeMap<(String, String, usize), usize> =
+        std::collections::BTreeMap::new();
     for (file, text) in surface {
         let masked = mask_non_code(text);
         let regions = find_fn_regions(&masked);
         for (line_idx, line) in masked.lines().enumerate() {
             let line_no = line_idx + 1;
-            let mut hit_here = false;
+            let mut count_here = 0usize;
             for verb in PAIRED_REGISTRATION_VERBS {
-                if line.contains(format!("deregister_{verb}(").as_str())
-                    || line.contains(format!("register_{verb}(").as_str())
-                {
-                    hit_here = true;
-                }
+                count_here += line.matches(format!("register_{verb}(").as_str()).count();
             }
             for verb in UNPAIRED_REGISTRATION_VERBS {
-                if line.contains(format!("register_{verb}(").as_str()) {
-                    hit_here = true;
-                }
+                count_here += line.matches(format!("register_{verb}(").as_str()).count();
             }
-            if hit_here {
+            if count_here > 0 {
                 let (name, ordinal) = attribute_hit_to_enclosing_fn(&regions, line_no);
-                hits.insert((file.clone(), name, ordinal));
+                *hits.entry((file.clone(), name, ordinal)).or_insert(0) += count_here;
             }
         }
     }
     hits
 }
 
-/// Every [`ddl_statement_shape`] occurrence anywhere under [`SURFACE_DIRS`]
-/// (both crates, every directory), on [`mask_comments_only`]'s output (string
-/// content visible, comments blanked -- the same reasoning
-/// [`fine_tune_ddl_relation_binding_hits`] already documents), attributed to
-/// its enclosing function.
-fn ddl_literal_occurrences(surface: &[(String, String)]) -> BTreeSet<(String, String, usize)> {
-    let mut hits = BTreeSet::new();
+/// A [`syn`]-driven scan (never a masked-line substring search) collecting
+/// every 1-based source LINE at which a DDL-shaped string occurs anywhere in
+/// `text`, from three independent sources -- #554's items 2 and 3:
+///
+/// 1. Any single [`syn::LitStr`]'s own DECODED `.value()` (`visit_lit_str`,
+///    syn's normal AST traversal, so it finds a plain `SessionContext::sql(
+///    "CREATE TABLE ..")` call argument the same way the old scan did) --
+///    immune to the raw-string/masking-desync class of bug entirely, by
+///    construction: `syn` decodes the literal's real VALUE, so an `r#"..`
+///    delimiter or an escaped `\"` plays no part in what this sees.
+/// 2. The ARGUMENT-ORDER STRING-LITERAL CONCATENATION of every
+///    `format!`/`concat!`/`write!`/`writeln!` invocation anywhere in `text`
+///    (`visit_macro`'s special case below), so a DDL keyword split across
+///    two literal arguments on separate lines (`concat!("CREATE ",
+///    "TABLE")`) is seen as ONE statement -- invisible to `visit_lit_str`
+///    alone, since neither `"CREATE "` nor `"TABLE"` is independently
+///    DDL-shaped.
+/// 3. Every OTHER macro invocation's raw token stream (`visit_macro`'s
+///    general case), walked for `Literal` tokens that are themselves string
+///    literals -- so a DDL string buried inside `assert!(..)`,
+///    `println!(..)`, or any custom macro (none of which `syn::visit::Visit`
+///    descends into as typed `Expr`/`Lit` nodes on its own, since a macro's
+///    body is opaque `TokenStream` to the AST) is still found, matching what
+///    the deleted line-based scan saw regardless of macro boundaries.
+/// 4. `include_str!(..)`'s own TARGET FILE, resolved the same way `rustc`
+///    resolves it (relative to the INCLUDING file's own directory), read and
+///    scanned as if its content were inlined -- a hard failure naming the
+///    file when the target cannot be read, the same "fails closed" discipline
+///    [`scan_surface`] already applies to a tracked `.rs` file.
+fn ddl_hit_lines(file_dir: &Path, text: &str) -> (Vec<usize>, Vec<(usize, String)>) {
+    let parsed = syn::parse_file(text)
+        .unwrap_or_else(|e| panic!("ddl_hit_lines: syn could not parse this source ({e})"));
+    let mut scanner = DdlLiteralScanner {
+        file_dir: file_dir.to_path_buf(),
+        hits: Vec::new(),
+        unresolved_includes: Vec::new(),
+    };
+    syn::visit::Visit::visit_file(&mut scanner, &parsed);
+    (scanner.hits, scanner.unresolved_includes)
+}
+
+struct DdlLiteralScanner {
+    file_dir: PathBuf,
+    hits: Vec<usize>,
+    /// `include_str!(..)` invocations whose argument is not a single
+    /// top-level string literal (e.g. `include_str!(concat!(env!(
+    /// "CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))`, `fine_tune/trainer.rs`)
+    /// -- resolving that target would mean evaluating `env!`/`concat!`
+    /// ourselves, which this scanner does not attempt; recorded here (by
+    /// line) rather than silently skipped, so
+    /// [`unresolved_include_str_targets_are_reviewed`] can assert the
+    /// UNRESOLVABLE set is itself a fixed, reviewed list, never a silent gap
+    /// a new occurrence could hide inside. Recorded as `(line, argument
+    /// text)`: the line is for the failure message, the ARGUMENT TEXT (the
+    /// macro's own token stream, whitespace-normalised) is the review key --
+    /// a line number drifts under every edit above the site (this entry went
+    /// stale twice inside one wave with nothing about the site changing),
+    /// the argument text changes only when the site itself does.
+    unresolved_includes: Vec<(usize, String)>,
+}
+
+/// Every string-literal `Literal` token anywhere in `ts` (recursing into
+/// every [`proc_macro2::Group`]), decoded via `syn::Lit::new`, in source
+/// order -- the shared walk [`DdlLiteralScanner::visit_macro`]'s general
+/// case uses so a macro this scanner does not otherwise special-case still
+/// has its own literal arguments seen. `syn::Lit::new` (NOT
+/// `syn::parse_str`, which this function used at first and which every
+/// caller's line attribution silently read `1` from ever after) decodes the
+/// token's OWN `proc_macro2::Literal` value directly, preserving its REAL
+/// span in the original file -- `syn::parse_str::<syn::Lit>(&lit.to_string())`
+/// instead RE-LEXES the token's rendered text as a brand-new, one-line
+/// source of its own, so every literal returned carries a PHANTOM span
+/// (line 1, wherever it actually lives) -- exactly why every
+/// `format!`/`concat!`/general-macro DDL hit this scanner found, in the
+/// Postgres and SQLite arms of the "mutable table" backend
+/// (`store/mutable/postgres.rs`, `store/mutable/sqlite.rs`), was reported at
+/// line 1 (that file's own module doc comment line, an innocent coincidence
+/// of line-1 attribution landing on line 1's `<module-scope>` sentinel)
+/// rather than the DDL literal's real line, until this fix; caught directly
+/// by [`falsification_general_macro_ddl_literal_is_attributed_to_its_real_line`].
+fn string_literals_in_tokens(ts: proc_macro2::TokenStream) -> Vec<syn::LitStr> {
+    let mut out = Vec::new();
+    for tt in ts {
+        match tt {
+            proc_macro2::TokenTree::Literal(lit) => {
+                if let syn::Lit::Str(s) = syn::Lit::new(lit) {
+                    out.push(s);
+                }
+            }
+            proc_macro2::TokenTree::Group(g) => out.extend(string_literals_in_tokens(g.stream())),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A macro invocation's argument token stream rendered as one
+/// whitespace-normalised string (`proc_macro2`'s `Display` inserts spaces
+/// between tokens deterministically, so two renderings of the same source
+/// text are equal) -- the line-independent identity of an `include_str!`
+/// site [`UNRESOLVED_INCLUDE_STR_TARGETS`] reviews.
+fn macro_argument_text(tokens: &proc_macro2::TokenStream) -> String {
+    tokens
+        .to_string()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+impl<'ast> syn::visit::Visit<'ast> for DdlLiteralScanner {
+    fn visit_attribute(&mut self, node: &'ast syn::Attribute) {
+        // A `///`/`//!`/`/** */`/`/*! */` doc comment is, to `syn`, an
+        // ordinary `#[doc = "prose"]` attribute -- its literal's decoded
+        // VALUE is human prose (this file's own module doc, two paragraphs
+        // up, literally contains the words "CREATE TABLE" inside backticks),
+        // not a DataFusion statement, so it must never reach
+        // `visit_lit_str` below. Detected the same way
+        // `collect_mask_units` detects it for masking: a hand-written `#` is
+        // always exactly one byte wide; a doc-comment-synthesized one
+        // carries the whole original comment's collapsed span instead.
+        if node.pound_token.span.byte_range().len() > 1 {
+            return;
+        }
+        syn::visit::visit_attribute(self, node);
+    }
+
+    fn visit_lit_str(&mut self, node: &'ast syn::LitStr) {
+        if ddl_statement_shape(&node.value()) {
+            self.hits.push(node.span().start().line);
+        }
+        syn::visit::visit_lit_str(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        let name = node.path.segments.last().map(|s| s.ident.to_string());
+        let macro_line = node
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.span().start().line)
+            .unwrap_or(0);
+
+        match name.as_deref() {
+            // `format!`/`concat!`/`write!`/`writeln!`: the ARGUMENT-ORDER
+            // concatenation of every string-literal argument is the ONLY
+            // check run for these four -- it already subsumes the
+            // single-literal case (concatenating one literal with nothing
+            // else IS that literal), so also running the general
+            // per-literal scan below for these four would double-COUNT the
+            // common one-literal-template shape (the general scan flags the
+            // literal on its own line, the combined check flags the SAME
+            // text again at the macro's line) --
+            // [`falsification_format_macro_ddl_literal_is_not_double_counted`]
+            // proves the arithmetic.
+            Some("format") | Some("concat") | Some("write") | Some("writeln") => {
+                let mut combined = String::new();
+                for lit in string_literals_in_tokens(node.tokens.clone()) {
+                    combined.push_str(&lit.value());
+                }
+                if !combined.is_empty() && ddl_statement_shape(&combined) {
+                    self.hits.push(macro_line);
+                }
+            }
+            Some("include_str") => {
+                let top_level: Vec<proc_macro2::TokenTree> =
+                    node.tokens.clone().into_iter().collect();
+                match top_level.as_slice() {
+                    [proc_macro2::TokenTree::Literal(lit)] => match syn::Lit::new(lit.clone()) {
+                        syn::Lit::Str(s) => {
+                            let target = self.file_dir.join(s.value());
+                            let content = std::fs::read_to_string(&target).unwrap_or_else(|e| {
+                                panic!(
+                                    "ddl_hit_lines: include_str!({:?}) at line {} resolves to \
+                                     {} which could not be read ({e}) -- this gate fails \
+                                     closed rather than silently skipping an unreadable \
+                                     include target",
+                                    s.value(),
+                                    s.span().start().line,
+                                    target.display()
+                                )
+                            });
+                            if ddl_statement_shape(&content) {
+                                self.hits.push(s.span().start().line);
+                            }
+                        }
+                        _ => self
+                            .unresolved_includes
+                            .push((macro_line, macro_argument_text(&node.tokens))),
+                    },
+                    _ => self
+                        .unresolved_includes
+                        .push((macro_line, macro_argument_text(&node.tokens))),
+                }
+            }
+            // Every OTHER macro (`assert!`, `println!`, `tokio::select!`,
+            // any custom `macro_rules!`-defined one): its own literal
+            // arguments, individually -- `visit_lit_str` above never sees
+            // these on its own, since a macro's `tokens` are opaque to
+            // syn's typed AST traversal. Not run for the four formatter
+            // macros above, which already cover their own literals via the
+            // combined-string check (running both would double-count the
+            // common single-literal-template shape).
+            _ => {
+                for lit in string_literals_in_tokens(node.tokens.clone()) {
+                    if ddl_statement_shape(&lit.value()) {
+                        self.hits.push(lit.span().start().line);
+                    }
+                }
+            }
+        }
+        syn::visit::visit_macro(self, node);
+    }
+}
+
+/// Every [`ddl_hit_lines`] occurrence anywhere under [`SURFACE_DIRS`] (both
+/// crates, every directory), attributed to its enclosing function and
+/// COUNTED -- same discipline as [`registration_verb_occurrences`].
+fn ddl_literal_occurrences(
+    surface: &[(String, String)],
+) -> std::collections::BTreeMap<(String, String, usize), usize> {
+    let root = repo_root();
+    let mut hits: std::collections::BTreeMap<(String, String, usize), usize> =
+        std::collections::BTreeMap::new();
     for (file, text) in surface {
         let regions = find_fn_regions(&mask_non_code(text));
-        let masked_comments = mask_comments_only(text);
-        for (line_idx, line) in masked_comments.lines().enumerate() {
-            if !ddl_statement_shape(line) {
-                continue;
-            }
-            let line_no = line_idx + 1;
+        let file_dir = root
+            .join(file)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.clone());
+        let (hit_lines, _unresolved) = ddl_hit_lines(&file_dir, text);
+        for line_no in hit_lines {
             let (name, ordinal) = attribute_hit_to_enclosing_fn(&regions, line_no);
-            hits.insert((file.clone(), name, ordinal));
+            *hits.entry((file.clone(), name, ordinal)).or_insert(0) += 1;
         }
     }
     hits
+}
+
+/// Every `include_str!(..)` invocation anywhere under [`SURFACE_DIRS`] whose
+/// argument [`ddl_hit_lines`] could not resolve to a path (not a single
+/// top-level string literal -- e.g. `include_str!(concat!(env!(
+/// "CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))`), keyed
+/// `(file, argument text) -> occurrence count` with the lines carried for
+/// the failure message, so a NEW unresolvable `include_str!` is a NAMED
+/// finding requiring its own review entry here rather than a
+/// silently-skipped scan gap -- and an edit ABOVE a reviewed site is not.
+fn unresolved_include_str_targets(
+    surface: &[(String, String)],
+) -> std::collections::BTreeMap<(String, String), (usize, Vec<usize>)> {
+    let root = repo_root();
+    let mut out: std::collections::BTreeMap<(String, String), (usize, Vec<usize>)> =
+        std::collections::BTreeMap::new();
+    for (file, text) in surface {
+        let file_dir = root
+            .join(file)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.clone());
+        let (_hits, unresolved) = ddl_hit_lines(&file_dir, text);
+        for (line, argument) in unresolved {
+            let entry = out
+                .entry((file.clone(), argument))
+                .or_insert((0, Vec::new()));
+            entry.0 += 1;
+            entry.1.push(line);
+        }
+    }
+    out
+}
+
+/// The reviewed, exhaustive set [`unresolved_include_str_targets_are_reviewed`]
+/// checks against: every `include_str!(..)` under [`SURFACE_DIRS`] whose
+/// argument this gate cannot statically resolve to a path, keyed by the
+/// file and the macro's own argument text (never a line number: a line
+/// drifts under every edit above the site and this entry went stale twice
+/// inside one wave with nothing about the site changing), with the number
+/// of occurrences and a human account of why its UNKNOWN content cannot be
+/// a DataFusion DDL statement anyway. One entry today.
+const UNRESOLVED_INCLUDE_STR_TARGETS: &[(&str, &str, usize, &str)] = &[(
+    "crates/jammi-ai/src/fine_tune/trainer.rs",
+    "concat ! (env ! (\"CARGO_MANIFEST_DIR\") , \"/../../Cargo.lock\")",
+    1,
+    "include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../../Cargo.lock\")) -- reads the \
+     workspace's own Cargo.lock text into a test assertion (a lockfile-pinning check); Cargo.lock \
+     is TOML, never a DataFusion DDL statement, so leaving its content unresolved here cannot hide \
+     a DDL literal.",
+)];
+
+#[test]
+fn unresolved_include_str_targets_are_reviewed() {
+    let surface = scan_surface();
+    let found = unresolved_include_str_targets(&surface);
+    let allow: std::collections::BTreeMap<(String, String), usize> = UNRESOLVED_INCLUDE_STR_TARGETS
+        .iter()
+        .map(|(f, arg, n, _)| ((f.to_string(), arg.to_string()), *n))
+        .collect();
+    let unreviewed: Vec<_> = found
+        .iter()
+        .filter(|(key, (count, _))| allow.get(key) != Some(count))
+        .map(|((file, arg), (count, lines))| {
+            format!("{file}: include_str!({arg}) x{count} at lines {lines:?}")
+        })
+        .collect();
+    assert!(
+        unreviewed.is_empty(),
+        "unresolved include_str! target(s) with no reviewed entry (or a count that moved): \
+         {unreviewed:?} -- add/update the (file, argument text, count) entry in \
+         UNRESOLVED_INCLUDE_STR_TARGETS naming why its unknown content cannot hide a DDL \
+         literal, or make the argument statically resolvable."
+    );
+    let stale: Vec<_> = allow
+        .keys()
+        .filter(|key| !found.contains_key(*key))
+        .map(|(file, arg)| format!("{file}: include_str!({arg})"))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "reviewed unresolved-include_str! entr(y/ies) {stale:?} are now resolvable (or gone) -- \
+         shrink UNRESOLVED_INCLUDE_STR_TARGETS to match reality."
+    );
+}
+
+/// The review key must survive an edit ABOVE the site (the drift that made
+/// the line-keyed form of this list go stale twice inside one wave) and
+/// must NOT survive a change to the site itself: the same source shifted
+/// down by a blank line yields the identical key; the same site with a
+/// different argument yields a different key.
+#[test]
+fn unresolved_include_str_review_key_is_line_independent_and_argument_sensitive() {
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fed to `ddl_hit_lines` to pin the review key's shape, not real code in this file
+    let src = "fn f() -> &'static str { include_str!(concat!(env!(\"X\"), \"/a.txt\")) }\n";
+    let dir = repo_root();
+    let (_, a) = ddl_hit_lines(&dir, src);
+    let (_, b) = ddl_hit_lines(&dir, &format!("\n\n{src}"));
+    let (_, c) = ddl_hit_lines(&dir, &src.replace("/a.txt", "/b.txt"));
+    assert_eq!(a.len(), 1);
+    assert_eq!(
+        a[0].1, b[0].1,
+        "an edit above the site must not change its review key"
+    );
+    assert_ne!(
+        a[0].0, b[0].0,
+        "the carried line still moves (it is for the message only)"
+    );
+    assert_ne!(
+        a[0].1, c[0].1,
+        "a changed argument must change the review key"
+    );
 }
 
 /// This list IS the gate's own output at this head, never a hand-typed
@@ -3371,6 +3832,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-ai/src/query/content_hash_udf.rs",
         function: "register_content_hash_udf",
         ordinal: 1,
+        allowed: 1,
         property: "register_udf(..) under the UDF's own FIXED `.name()` (`jammi_content_hash`), \
                    called once per session at construction (`InferenceSession`'s own \
                    `with_observer`/`wrap_with` chain) -- a session-wide singleton, never a \
@@ -3382,6 +3844,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-ai/src/query/content_hash_udf.rs",
         function: "udf_hashes_the_runner_rendering",
         ordinal: 1,
+        allowed: 1,
         property: "a unit test's own `SessionContext::new()`, local and discarded at the end of \
                    the test -- never the shared production session, so there is no reclaim-shaped \
                    collision surface here at all.",
@@ -3390,6 +3853,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-ai/src/query/vector_agg_udaf.rs",
         function: "empty_group_is_null_vector",
         ordinal: 1,
+        allowed: 1,
         property: "a unit test's own `SessionContext::new()`, local and discarded at the end of \
                    the test -- same as `content_hash_udf.rs::udf_hashes_the_runner_rendering`.",
     },
@@ -3397,6 +3861,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-ai/src/query/vector_agg_udaf.rs",
         function: "grouped_reduction_per_group",
         ordinal: 1,
+        allowed: 1,
         property: "a unit test's own `SessionContext::new()`, local and discarded at the end of \
                    the test.",
     },
@@ -3404,6 +3869,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-ai/src/query/vector_agg_udaf.rs",
         function: "register_vector_agg_udafs",
         ordinal: 1,
+        allowed: 1,
         property: "register_udaf(..) three times (`vector_mean`/`vector_sum`/`vector_max`), each \
                    under that UDAF's own FIXED `.name()`, called once per session at construction \
                    (`InferenceSession::register_query_functions`'s own call) -- the same \
@@ -3413,6 +3879,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-ai/src/query/vector_agg_udaf.rs",
         function: "run_reduce",
         ordinal: 1,
+        allowed: 1,
         property: "a unit-test helper's own `SessionContext::new()`, local and discarded at the \
                    end of each call.",
     },
@@ -3420,6 +3887,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-ai/src/query/vector_agg_udaf.rs",
         function: "wrong_argument_type_is_planning_error",
         ordinal: 1,
+        allowed: 1,
         property: "a unit test's own `SessionContext::new()`, local and discarded at the end of \
                    the test.",
     },
@@ -3427,6 +3895,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-ai/src/session.rs",
         function: "register_query_functions",
         ordinal: 1,
+        allowed: 1,
         property: "register_udtf(..) under the FIXED `AnnotateTableFunction::NAME` -- this \
                    function's own doc: \"must be called once per session, after the session is \
                    behind an Arc\" -- a session-construction-time singleton, never called from \
@@ -3436,6 +3905,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/session.rs",
         function: "build",
         ordinal: 1,
+        allowed: 1,
         property: "register_catalog(\"mutable\", ..) under the FIXED literal name \"mutable\", \
                    once at session-build time -- a session-construction-time singleton.",
     },
@@ -3443,6 +3913,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/session.rs",
         function: "register_source_tables",
         ordinal: 1,
+        allowed: 1,
         property: "register_catalog(source_id, ..) keyed by the data SOURCE's own stable, \
                    admin-configured identifier, called once per configured source at session \
                    build/reload time -- never per fine_tune call, never per job; two DIFFERENT \
@@ -3453,6 +3924,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/source/file_format.rs",
         function: "register_driver_for_url",
         ordinal: 1,
+        allowed: 1,
         property: "register_object_store(..) keyed by the URL's own scheme+authority, with the \
                    driver resolved through `StorageRegistry::driver_for`'s per-(scheme,root) \
                    cache -- the identical idempotent-rebind shape reviewed for \
@@ -3463,6 +3935,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/mod.rs",
         function: "bind_result_table",
         ordinal: 1,
+        allowed: 1,
         property: "binds by calling `self.register_table(..)` -- jammi's OWN 4-argument method, a \
                    name collision this substring scan cannot itself tell apart from DataFusion's \
                    `SessionContext::register_table`, but the resolution IS the real one here: \
@@ -3475,6 +3948,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/mod.rs",
         function: "build_result_table_provider",
         ordinal: 1,
+        allowed: 1,
         property: "for a non-file/-memory URL, calls `ctx.runtime_env().register_object_store(&parsed, driver)` \
                    keyed by the URL's own scheme+authority, where `driver` is \
                    `StorageRegistry::driver_for`'s CACHED value for that key -- two calls for one \
@@ -3490,6 +3964,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/mod.rs",
         function: "install_result_schema",
         ordinal: 1,
+        allowed: 1,
         property: "calls `catalog.register_schema(&catalog_opts.default_schema, ..)` under the \
                    session's FIXED default-schema name -- this function's own doc: \"Idempotent: \
                    re-installing the same provider preserves the tables it already holds\" -- \
@@ -3501,6 +3976,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/mod.rs",
         function: "register_table",
         ordinal: 1,
+        allowed: 1,
         // kernel-oracles: fn-in-literal reviewed: the property string below names the literal shape `fn register_table(` in prose, describing a real declaration elsewhere in this file — not a fn-keyword desync in this line
         property: "this hit is the `fn register_table(` DECLARATION line, not a call site (see \
                    `registration_verb_occurrences`'s own doc on this scan's inability to tell the \
@@ -3517,6 +3993,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/result_schema.rs",
         function: "register_table",
         ordinal: 1,
+        allowed: 1,
         property: "this hit is the `SchemaProvider::register_table` trait-method DECLARATION for \
                    `ResultTableSchemaProvider`, not a call site written in this crate: the only \
                    in-tree paths that dispatch to it are DataFusion's own `SessionContext::register_table` \
@@ -3555,6 +4032,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/result_schema.rs",
         function: "deregister_table",
         ordinal: 1,
+        allowed: 1,
         property: "the `SchemaProvider::deregister_table` trait-method DECLARATION, the inverse of \
                    `register_table` immediately above -- same disclosure, both commands stated \
                    exactly: `grep -rn '\\.deregister_table(' crates/jammi-db/src crates/jammi-ai/src` \
@@ -3568,6 +4046,7 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/mod.rs",
         function: "register_object_store_twice_for_one_url_rebinds_the_same_driver_and_errors_on_neither",
         ordinal: 1,
+        allowed: 2,
         property: "the unit test that is `build_result_table_provider`'s own \
                    EXECUTED oracle above -- it calls `ctx.runtime_env().register_object_store(..)` \
                    directly, twice, against an in-memory driver and a raw `url::Url`, on a session \
@@ -3585,6 +4064,7 @@ const DDL_LITERAL_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/catalog/migrations.rs",
         function: "<module-scope>",
         ordinal: 0,
+        allowed: 1,
         property: "the ordered `MIGRATIONS` table naming each migration's SQL constant -- the DDL \
                    text itself lives in `catalog/schema.rs` (reviewed below); this file only lists \
                    the constants. Every migration executes through `CatalogBackend`'s own SQL \
@@ -3598,6 +4078,12 @@ const DDL_LITERAL_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/catalog/schema.rs",
         function: "<module-scope>",
         ordinal: 0,
+        // 13 -- transcribed from the gate's own output (the real-tokenizer
+        // rebuild's `ddl_hit_lines`, #554), never hand-counted: this module
+        // holds MANY migration-SQL constants (`CREATE TABLE sources`,
+        // `result_tables`, and every other table this catalog's migrations
+        // create), each its own `ddl_statement_shape` hit at module scope.
+        allowed: 13,
         property: "the migration SQL constants themselves (`CREATE TABLE sources`, \
                    `result_tables`, etc.) -- same disclosure as `catalog/migrations.rs`: executed \
                    only through `CatalogBackend`'s own connection, never a DataFusion \
@@ -3608,6 +4094,7 @@ const DDL_LITERAL_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/mutable/postgres.rs",
         function: "create_table_ddl",
         ordinal: 1,
+        allowed: 1,
         property: "builds a `CREATE TABLE ..` STRING for the companion \"mutable table\" Postgres \
                    backend, executed through that backend's own direct SQL connection -- never a \
                    DataFusion `SessionContext::sql` call, and never reachable from `fine_tune/` by \
@@ -3618,6 +4105,7 @@ const DDL_LITERAL_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/mutable/sqlite.rs",
         function: "create_table_ddl",
         ordinal: 1,
+        allowed: 1,
         property: "the SQLite arm of the same \"mutable table\" backend -- same disclosure as the \
                    Postgres arm above.",
     },
@@ -3625,34 +4113,71 @@ const DDL_LITERAL_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/store/mutable/sqlite.rs",
         function: "create_table_ddl_emits_implicit_tenant_id",
         ordinal: 1,
+        allowed: 1,
         property: "a unit test asserting on the built DDL STRING's own content \
                    (`ddl.starts_with(\"CREATE TABLE \\\"widgets\\\"\")`) -- the DDL text lives in a \
                    test assertion, never executed as SQL by this test at all.",
     },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/catalog/migrations.rs",
+        function: "a_create_trigger_body_is_one_statement_despite_its_internal_semicolons",
+        ordinal: 1,
+        // 3 -- the one `sql` fixture string literal contains three DDL-shaped
+        // statements (`CREATE TABLE`, `CREATE TRIGGER`, `CREATE INDEX`), each
+        // its own `ddl_statement_shape` hit inside this one function.
+        allowed: 3,
+        property: "a unit test's synthetic `sql` fixture (`CREATE TABLE t (c TEXT); CREATE TRIGGER \
+                   trg .. END; CREATE INDEX idx_t_c ON t(c)`) fed through `split_statements` to \
+                   prove a `BEGIN..END` trigger body's internal `;` survives as ONE statement -- the \
+                   DDL text lives in a local `let sql = ..` binding never executed as SQL by this \
+                   test at all, same disclosure as `sqlite.rs::create_table_ddl_emits_implicit_tenant_id` \
+                   above.",
+    },
 ];
 
-/// Both directions of the comparison every allowlist in this file already
-/// checks (`allowlists_match_current_hits_exactly`'s own discipline, applied
-/// here to the two whole-surface scans): an occurrence with no reviewed entry
-/// is UNREVIEWED (fails naming the site); a reviewed entry whose site no
-/// longer produces a hit is STALE (also fails -- an allowance is never
-/// permanent slack a later, different site can spend).
+/// Three-way comparison every allowlist in this file already checks
+/// (`allowlists_match_current_hits_exactly`'s own discipline, applied here to
+/// the two whole-surface, COUNTED scans): an occurrence with no reviewed
+/// entry is UNREVIEWED (fails naming the site); a reviewed entry whose site
+/// no longer produces a hit is STALE (also fails -- an allowance is never
+/// permanent slack a later, different site can spend); and a reviewed entry
+/// whose site's REAL count exceeds its `allowed` one is OVER-COUNT -- the
+/// check closing audit #8 of U2a's escape needed and the set-only version of
+/// this file never had: a second `ctx.register_table(...)` planted inside an
+/// already-reviewed function does not create a NEW key, it bumps an
+/// EXISTING one's count past what was reviewed.
 fn assert_occurrences_reviewed(
-    found: &BTreeSet<(String, String, usize)>,
-    allow: &BTreeSet<(String, String, usize)>,
+    found: &std::collections::BTreeMap<(String, String, usize), usize>,
+    allow: &[&ReviewedRegistrationSite],
     what: &str,
 ) {
-    let unreviewed: Vec<_> = found.difference(allow).collect();
+    let allow_keys: BTreeSet<(String, String, usize)> = allow.iter().map(|e| e.key()).collect();
+    let found_keys: BTreeSet<(String, String, usize)> = found.keys().cloned().collect();
+
+    let unreviewed: Vec<_> = found_keys.difference(&allow_keys).collect();
     assert!(
         unreviewed.is_empty(),
         "{what}: unreviewed occurrence(s) {unreviewed:?} -- add a reviewed entry naming the \
          (file, function, ordinal) and its property, or remove the offending call/literal."
     );
-    let stale: Vec<_> = allow.difference(found).collect();
+    let stale: Vec<_> = allow_keys.difference(&found_keys).collect();
     assert!(
         stale.is_empty(),
         "{what}: reviewed entr(y/ies) {stale:?} no longer produce a hit -- shrink the allowlist \
          to match reality."
+    );
+    let over_count: Vec<_> = allow
+        .iter()
+        .filter_map(|e| {
+            let real = *found.get(&e.key()).unwrap_or(&0);
+            (real > e.allowed).then_some((e.key(), real, e.allowed))
+        })
+        .collect();
+    assert!(
+        over_count.is_empty(),
+        "{what}: site(s) occur MORE often than their reviewed `allowed` count \
+         (key, real count, allowed count) = {over_count:?} -- a new, unreviewed occurrence was \
+         planted at an already-reviewed site; add its own review or remove it."
     );
 }
 
@@ -3660,10 +4185,7 @@ fn assert_occurrences_reviewed(
 fn registration_verb_occurrences_are_all_reviewed() {
     let surface = scan_surface();
     let found = registration_verb_occurrences(&surface);
-    let allow: BTreeSet<_> = REGISTRATION_VERB_SITES
-        .iter()
-        .map(ReviewedRegistrationSite::key)
-        .collect();
+    let allow: Vec<&ReviewedRegistrationSite> = REGISTRATION_VERB_SITES.iter().collect();
     assert_occurrences_reviewed(&found, &allow, "registration verb");
 }
 
@@ -3671,11 +4193,139 @@ fn registration_verb_occurrences_are_all_reviewed() {
 fn ddl_literal_occurrences_are_all_reviewed() {
     let surface = scan_surface();
     let found = ddl_literal_occurrences(&surface);
-    let allow: BTreeSet<_> = DDL_LITERAL_SITES
-        .iter()
-        .map(ReviewedRegistrationSite::key)
-        .collect();
+    let allow: Vec<&ReviewedRegistrationSite> = DDL_LITERAL_SITES.iter().collect();
     assert_occurrences_reviewed(&found, &allow, "DDL literal");
+}
+
+/// #549's own DDL-position list: a module-level `const SQL: &str = "CREATE
+/// TABLE .."` -- exactly the real shape `crates/jammi-db/src/catalog/
+/// schema.rs`'s 13 reviewed module-scope hits already are, reproduced here
+/// as a clean, minimal fixture (a bare per-literal `visit_lit_str` hit, not
+/// buried inside a macro or a fn body).
+#[test]
+fn falsification_module_level_const_ddl_is_detected() {
+    let dir = repo_root();
+    let source = concat!(
+        "const PROBE_TABLE_DDL: &str = \"CREATE TABLE probe (id INT)\";\n",
+        "\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
+        "fn unrelated() {}\n",
+    );
+    let (hits, _unresolved) = ddl_hit_lines(&dir, source);
+    assert_eq!(
+        hits,
+        vec![1],
+        "a module-level const string literal containing a DDL statement must be detected at its \
+         own real line, got {hits:?}"
+    );
+}
+
+/// #554 item 2: a DDL keyword split across two `concat!` string-literal
+/// arguments on separate lines is invisible to a per-literal check (neither
+/// `"CREATE "` nor `"TABLE probe"` is independently DDL-shaped) but visible
+/// to the ARGUMENT-ORDER CONCATENATION `ddl_hit_lines` builds for
+/// `concat!`/`format!`/`write!`/`writeln!` -- RED under the deleted
+/// line-based scan (each half sits on its own line, neither DDL-shaped
+/// alone), GREEN here.
+#[test]
+fn falsification_ddl_keyword_split_across_concat_arguments_is_detected() {
+    let dir = repo_root();
+    let source = concat!(
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the concat!-split DDL shape -- synthetic producer text, not real code in this file
+        "fn build_ddl() -> &'static str {\n",
+        "    concat!(\n",
+        "        \"CREATE \",\n",
+        "        \"TABLE probe (id INT)\"\n",
+        "    )\n",
+        "}\n",
+    );
+    let (hits, _unresolved) = ddl_hit_lines(&dir, source);
+    assert!(
+        !hits.is_empty(),
+        "a DDL keyword split across two concat! string-literal arguments must be detected as one \
+         statement, got no hits"
+    );
+}
+
+/// #554 item 3: `include_str!(..)`'s own target file content is scanned as
+/// if inlined -- a fixture file containing `CREATE TABLE` is included by a
+/// synthetic source and must be detected.
+#[test]
+fn falsification_include_str_target_ddl_is_detected() {
+    let scratch_dir = std::env::temp_dir().join(format!(
+        "pinned_source_gate_include_str_probe_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&scratch_dir).expect("create scratch dir for the include_str! probe");
+    let included_path = scratch_dir.join("probe_included.sql");
+    std::fs::write(&included_path, "CREATE TABLE probe_included (id INT);\n")
+        .expect("write the include_str! probe's target file");
+    let source = concat!(
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the include_str! DDL shape -- synthetic producer text, not real code in this file
+        "fn embedded_ddl() -> &'static str {\n",
+        "    include_str!(\"probe_included.sql\")\n",
+        "}\n",
+    );
+    let (hits, unresolved) = ddl_hit_lines(&scratch_dir, source);
+    std::fs::remove_dir_all(&scratch_dir).ok();
+    assert!(
+        !hits.is_empty(),
+        "an include_str! target containing a DDL statement must be scanned and flagged, got no \
+         hits (unresolved: {unresolved:?})"
+    );
+}
+
+/// The general per-literal macro scan and the format!/concat!-combined
+/// check must never BOTH fire for the common single-literal-template shape
+/// (`format!("CREATE TABLE ..", ..)`) -- exactly the double count this file
+/// measured live in `store/mutable/{postgres,sqlite}.rs::create_table_ddl`
+/// before the fix (real count 2 against a reviewed `allowed: 1`).
+#[test]
+fn falsification_format_macro_ddl_literal_is_not_double_counted() {
+    let dir = repo_root();
+    let source = concat!(
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture proving the format!-template DDL count is 1, not 2 -- synthetic producer text, not real code in this file
+        "fn build_ddl(name: &str) -> String {\n",
+        "    format!(\"CREATE TABLE {} (id INT)\", name)\n",
+        "}\n",
+    );
+    let (hits, _unresolved) = ddl_hit_lines(&dir, source);
+    assert_eq!(
+        hits.len(),
+        1,
+        "a single-literal format! DDL template must be counted once, not once per detection path, \
+         got {hits:?}"
+    );
+}
+
+/// [`string_literals_in_tokens`]'s span-preservation fix, executed directly:
+/// a literal buried two macro-groups deep must be reported on ITS OWN real
+/// source line, never line 1 (`syn::parse_str::<syn::Lit>(&lit.to_string())`
+/// -- the bug this replaces -- re-lexes the token's rendered text as a
+/// brand-new one-line source, so every literal it returned carried a
+/// PHANTOM `line 1` span regardless of where it actually lived; this is
+/// exactly how the real `postgres.rs`/`sqlite.rs` hits were misattributed
+/// to `<module-scope>` at line 1 before the fix).
+#[test]
+fn falsification_general_macro_ddl_literal_is_attributed_to_its_real_line() {
+    let dir = repo_root();
+    let source = concat!(
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture proving real-span attribution for a macro-nested literal -- synthetic producer text, not real code in this file
+        "fn f() {\n",
+        "    // five filler lines push the DDL literal well past line 1\n",
+        "    let _ = 1;\n",
+        "    let _ = 2;\n",
+        "    let _ = 3;\n",
+        "    assert!(some_call(\"CREATE TABLE probe (id INT)\").is_ok());\n",
+        "}\n",
+    );
+    let (hits, _unresolved) = ddl_hit_lines(&dir, source);
+    assert_eq!(
+        hits,
+        vec![6],
+        "a DDL literal inside an assert!(..) argument must be attributed to its REAL source line \
+         (6), not a phantom line 1, got {hits:?}"
+    );
 }
 
 /// No field on [`ReviewedRegistrationSite`] is decorative: `property` is read
@@ -3725,13 +4375,94 @@ fn falsification_new_verb_occurrence_in_a_new_file_is_flagged() {
         1usize,
     );
     assert!(
-        found.contains(&key),
+        found.contains_key(&key),
         "a register_table( call in a new file must be found by the scan, got {found:?}"
     );
     assert!(
         !allow.contains(&key),
         "the planted site must not already be on the reviewed list -- this control is vacuous \
          otherwise"
+    );
+}
+
+/// Non-vacuousness for the OVER-COUNT arm [`assert_occurrences_reviewed`]
+/// added (#554 item 1): a site already reviewed at `allowed: 1` that the
+/// real scan now finds TWICE (a second `ctx.register_table(...)` planted
+/// inside the same, already-reviewed function -- exactly closing audit #8 of
+/// U2a's own escape, reproduced here as a fixture rather than against the
+/// live 600+-file surface) is reported OVER-COUNT, never silently absorbed
+/// the way a `BTreeSet`-keyed version of this gate absorbed it.
+#[test]
+fn falsification_a_second_occurrence_inside_an_already_reviewed_function_is_over_count() {
+    let surface = vec![(
+        "crates/jammi-db/src/store/__probe_double_registration__.rs".to_string(),
+        concat!(
+            // kernel-oracles: fn-in-literal reviewed: falsification fixture for the count-keyed over-count arm -- synthetic producer text, not real code in this file
+            "fn bind_result_table(ctx: &SessionContext, provider: Arc<dyn TableProvider>) {\n",
+            "    ctx.register_table(\"a\", provider.clone()).unwrap();\n",
+            "    ctx.register_table(\"b\", provider).unwrap();\n",
+            "}\n",
+        )
+        .to_string(),
+    )];
+    let found = registration_verb_occurrences(&surface);
+    let key = (
+        "crates/jammi-db/src/store/__probe_double_registration__.rs".to_string(),
+        "bind_result_table".to_string(),
+        1usize,
+    );
+    assert_eq!(
+        found.get(&key).copied(),
+        Some(2),
+        "two `.register_table(` calls in one reviewed function must be counted as 2, got {found:?}"
+    );
+    let reviewed = ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/__probe_double_registration__.rs",
+        function: "bind_result_table",
+        ordinal: 1,
+        allowed: 1,
+        property: "a stand-in reviewed entry allowing exactly one occurrence, for this test only.",
+    };
+    let allow = vec![&reviewed];
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_occurrences_reviewed(&found, &allow, "probe");
+    }));
+    assert!(
+        result.is_err(),
+        "a site reviewed at allowed: 1 whose real count is 2 must fail assert_occurrences_reviewed, \
+         not pass silently"
+    );
+}
+
+/// Paired-verb occurrence counting does not double-count a `deregister_X(`
+/// call as a separate `register_X(` one, even though `"deregister_table("`
+/// contains `"register_table("` as a literal substring -- see
+/// [`registration_verb_occurrences`]'s doc for the arithmetic this proves.
+#[test]
+fn falsification_paired_verb_occurrence_count_does_not_double_count_deregister() {
+    let surface = vec![(
+        "crates/jammi-db/src/store/__probe_paired_verb_count__.rs".to_string(),
+        concat!(
+            // kernel-oracles: fn-in-literal reviewed: falsification fixture proving paired-verb occurrence counting arithmetic -- synthetic producer text, not real code in this file
+            "fn both_forms(ctx: &SessionContext, provider: Arc<dyn TableProvider>) {\n",
+            "    ctx.register_table(\"a\", provider).unwrap();\n",
+            "    ctx.deregister_table(\"a\").unwrap();\n",
+            "}\n",
+        )
+        .to_string(),
+    )];
+    let found = registration_verb_occurrences(&surface);
+    let key = (
+        "crates/jammi-db/src/store/__probe_paired_verb_count__.rs".to_string(),
+        "both_forms".to_string(),
+        1usize,
+    );
+    assert_eq!(
+        found.get(&key).copied(),
+        Some(2),
+        "one register_table( and one deregister_table( call must count as 2 occurrences, not 3 \
+         (the embedded `register_table(` substring inside `deregister_table(` double-counted), \
+         got {found:?}"
     );
 }
 
@@ -3756,11 +4487,1124 @@ fn falsification_removing_a_reviewed_entry_leaves_its_site_unreviewed() {
         .to_string(),
     )];
     let found = registration_verb_occurrences(&surface);
-    let empty_allow: BTreeSet<(String, String, usize)> = BTreeSet::new();
-    let unreviewed: Vec<_> = found.difference(&empty_allow).collect();
+    let empty_allow: Vec<&ReviewedRegistrationSite> = Vec::new();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_occurrences_reviewed(&found, &empty_allow, "probe");
+    }));
     assert!(
-        !unreviewed.is_empty(),
+        result.is_err(),
         "an allowlist missing a real hit's entry must report it unreviewed, not silently pass -- \
          found {found:?} against an empty allowlist"
+    );
+}
+
+// ── #549 -- fine_tune/ reachability over the binding surface ───────────────
+//
+// The literal-occurrence gate above reviews every registration-verb/DDL
+// occurrence under SURFACE_DIRS UNCONDITIONALLY -- reachable from
+// `fine_tune/` or not. This section answers the narrower, harder question:
+// which of those reviewed sites can `fine_tune/` actually REACH, tracing
+// through every indirection shape a hand-rolled reachability sweep can miss
+// (a fn-pointer argument, a `Self::method` path handed to `.map(..)`, a call
+// buried inside `assert!`/`tokio::select!`, a fn-pointer struct field, a
+// `macro_rules!`-generated fn item)? A prior attempt at this (U2a fix round
+// 7, `call_graph_gate.rs`) was excised at fix round 8 after its own closing
+// audit #7 found it unsound on exactly these five call shapes and four DDL
+// positions -- this section's own fixtures are that same list, executed.
+//
+// **The universe is NOT jammi-ai's own (forward) dependency closure.**
+// `cargo metadata`'s FULL package graph (no `--no-deps`) is 697 packages,
+// 10.4M lines -- clearly the wrong universe -- and jammi-ai's forward
+// closure (the crates jammi-ai itself depends on) EXCLUDES the motivating
+// case entirely: `crates/jammi-bench/src/corpus.rs` depends ON jammi-ai (the
+// reverse direction), so its live `ctx.register_parquet(TableReference::bare(
+// format!("jammi.{table_name}")), ..)` call (also see this file's own
+// `falsification_registration_verb_scan_states_its_universe_honestly`,
+// above) is never IN jammi-ai's forward closure no matter how it is
+// computed. The universe this section actually needs is THE BINDING
+// SURFACE: every WORKSPACE member whose source can bind a table on a
+// session `fine_tune/` (or anything downstream of it) could also touch --
+// derived as the REVERSE-dependency closure of `jammi-db`/`jammi-ai` within
+// the workspace (a workspace member is in scope the moment ITS OWN forward
+// closure contains `jammi-db` or `jammi-ai`), from `cargo metadata
+// --no-deps`'s own `dependencies[].path` edges (a workspace-LOCAL dependency
+// always carries a `path`; an external registry/git dependency never does,
+// so third-party crates are excluded by construction -- no name-based filter
+// needed). Measured at this head via [`binding_surface_crates`]: 11 of the
+// workspace's 15 members (`jammi-admin`, `jammi-ai`, `jammi-ballista`,
+// `jammi-bench`, `jammi-cli`, `jammi-client`, `jammi-db`, `jammi-python`,
+// `jammi-server`, `jammi-test-utils`, `jammi-wire`), 337 tracked `.rs` files
+// under their `src/` trees.
+//
+// **Soundness posture: safe-direction over-approximation, name-keyed.**
+// Every edge below is keyed by NAME, never by a resolved type -- two
+// unrelated functions sharing a name are treated as ONE reachability target,
+// so a call this graph cannot actually prove distinct is still followed (a
+// FALSE reachable is the safe direction; a false NOT-reachable is the
+// failure mode this whole rebuild exists to close). Two shapes this section
+// cannot resolve BY NAME are handled by FAILING CLOSED instead, per G2:  a
+// fn-pointer struct field call `(s.f)(ctx)` is resolved by finding every
+// site anywhere in the binding surface that assigns a value into a field of
+// that SAME name (also name-keyed) -- if NONE exists, the call is reported
+// UNRESOLVED and the gate refuses to pass rather than silently treating it
+// as a dead end; a `macro_rules!` definition whose OWN template body
+// contains a registration-verb call shape or a DDL-shaped literal is a
+// NAMED, unconditional finding (never traced through expansion, since the
+// generated function's NAME is a macro metavariable resolved only per
+// invocation site) that the gate also refuses to pass silently.
+
+/// Every workspace member (name only) whose OWN forward path-dependency
+/// closure contains `jammi-ai` or `jammi-db` -- see the module comment
+/// above for why this is the reverse-, not forward-, dependency closure, and
+/// why it is derived from `cargo metadata --no-deps` rather than the full
+/// (`--no-deps`-less) package graph.
+fn binding_surface_crates() -> Vec<String> {
+    let root = repo_root();
+    let manifest = root.join("Cargo.toml");
+    let output = Command::new("cargo")
+        .args([
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--manifest-path",
+        ])
+        .arg(&manifest)
+        .output()
+        .expect("spawn cargo metadata --no-deps");
+    assert!(
+        output.status.success(),
+        "cargo metadata --no-deps failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("cargo metadata --no-deps must produce valid JSON");
+    let packages = parsed["packages"]
+        .as_array()
+        .expect("cargo metadata output has a top-level `packages` array");
+
+    // name -> its own DIRECT workspace-local (a `path`-carrying dependency
+    // entry always denotes a workspace-local crate; an external registry/git
+    // dependency never carries a `path`) dependency names.
+    let mut direct: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut all_names: Vec<String> = Vec::new();
+    for pkg in packages {
+        let name = pkg["name"]
+            .as_str()
+            .expect("package name is a string")
+            .to_string();
+        all_names.push(name.clone());
+        let deps = pkg["dependencies"]
+            .as_array()
+            .expect("package dependencies is an array")
+            .iter()
+            .filter(|d| !d["path"].is_null())
+            .map(|d| {
+                d["name"]
+                    .as_str()
+                    .expect("dependency name is a string")
+                    .to_string()
+            })
+            .filter(|d| d != &name)
+            .collect();
+        direct.insert(name, deps);
+    }
+
+    let forward_closure = |start: &str| -> HashSet<String> {
+        let mut seen = HashSet::new();
+        let mut stack = vec![start.to_string()];
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n.clone()) {
+                continue;
+            }
+            for d in direct.get(&n).into_iter().flatten() {
+                if !seen.contains(d) {
+                    stack.push(d.clone());
+                }
+            }
+        }
+        seen
+    };
+
+    let mut reverse: Vec<String> = all_names
+        .into_iter()
+        .filter(|n| {
+            let closure = forward_closure(n);
+            closure.contains("jammi-ai") || closure.contains("jammi-db")
+        })
+        .collect();
+    reverse.sort();
+    reverse
+}
+
+/// The `(repo-relative path, source text)` surface [`build_call_graph`] and
+/// [`fine_tune_reachable_sites_are_all_reviewed`] scan: every tracked `.rs`
+/// file under `src/` of every [`binding_surface_crates`] entry -- the WHOLE
+/// binding surface, not just [`SURFACE_DIRS`] (the narrower pair
+/// [`registration_verb_occurrences_are_all_reviewed`]/
+/// [`ddl_literal_occurrences_are_all_reviewed`] review).
+fn binding_surface() -> Vec<(String, String)> {
+    let root = repo_root();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for krate in binding_surface_crates() {
+        let dir = format!("crates/{krate}/src");
+        let files = tracked_rs_files(&root, &dir);
+        assert!(
+            !files.is_empty(),
+            "git ls-files -- {dir} returned no tracked .rs files"
+        );
+        for rel in files {
+            assert!(
+                seen.insert(rel.clone()),
+                "{rel} tracked twice across the binding surface"
+            );
+            let text = std::fs::read_to_string(root.join(&rel))
+                .unwrap_or_else(|e| panic!("{rel} is git-tracked but could not be read ({e})"));
+            out.push((rel, text));
+        }
+    }
+    out
+}
+
+/// One `fn`-like item (free fn, inherent/trait `impl` method, or a trait's
+/// own declaration) found anywhere in [`binding_surface`] by a REAL parse
+/// (`syn::parse_file`, never text/regex) -- a call-graph NODE.
+struct GraphFn {
+    file: String,
+    name: String,
+    ordinal: usize,
+    line: usize,
+}
+
+/// A name-keyed call graph over [`binding_surface`] (see the module comment
+/// above for the soundness posture) plus the two residual, fail-closed
+/// findings sets [`build_call_graph`] could not resolve into edges at all.
+struct CallGraph {
+    nodes: Vec<GraphFn>,
+    by_name: std::collections::HashMap<String, Vec<usize>>,
+    /// node index -> the set of NAMES its body calls, in the edge-shape
+    /// sense the module comment lists (direct/method/UFCS call, a bare path
+    /// handed to a call as an argument, a name found inside any macro
+    /// invocation's token stream in call position).
+    calls: std::collections::HashMap<usize, BTreeSet<String>>,
+    /// `(file, line, field name)` for every `(EXPR.field)(..)` call site this
+    /// graph COULD resolve (every RHS ever assigned to a field of that name
+    /// anywhere in the binding surface) -- human-readable, always populated
+    /// (even when resolved), so a reader can audit every one, not merely the
+    /// failures.
+    field_ptr_findings: Vec<String>,
+    /// `(file, line, field name)` for every `(EXPR.field)(..)` call site this
+    /// graph could NOT resolve (no assignment to that field name found
+    /// anywhere) -- [`fine_tune_reachable_sites_are_all_reviewed`] fails
+    /// closed whenever this is non-empty.
+    unresolved_field_ptr_sites: Vec<String>,
+    /// `(file, line, macro name)` for every `macro_rules!` DEFINITION whose
+    /// own template body contains a registration-verb call shape or a
+    /// DDL-shaped literal -- [`fine_tune_reachable_sites_are_all_reviewed`]
+    /// fails closed whenever this is non-empty (see the module comment for
+    /// why this can never be resolved into an ordinary edge).
+    macro_rules_findings: Vec<String>,
+}
+
+/// Strip `Paren`/`Reference`/`Group` wrappers to reach the expression a
+/// caller actually cares about -- `(b)`, `&b`, and `b` must all be seen as
+/// the same bare path `b` when it is handed to a call as an argument.
+fn unwrap_trivial(e: &syn::Expr) -> &syn::Expr {
+    match e {
+        syn::Expr::Paren(p) => unwrap_trivial(&p.expr),
+        syn::Expr::Reference(r) => unwrap_trivial(&r.expr),
+        syn::Expr::Group(g) => unwrap_trivial(&g.expr),
+        _ => e,
+    }
+}
+
+/// Every NAME this graph treats as "called" inside a macro invocation's raw
+/// token stream (recursing into every [`proc_macro2::Group`]): an `Ident`
+/// token immediately followed by a `(`-delimited [`proc_macro2::Group`]
+/// (`b(ctx)`, the `assert!(b(ctx).is_ok())`/`tokio::select!` arm shape) or
+/// immediately preceded by a `.` or `:` [`proc_macro2::Punct`] (`.b(`/`::b(`
+/// -- also catches a qualified path used as a bare value, `Self::b`, the
+/// same shape [`FileGraphBuilder::visit_expr_call`]'s argument scan handles
+/// for a NON-macro call site). A macro's `tokens` are opaque to `syn`'s
+/// typed AST, so this is the only way any of these three shapes inside a
+/// macro invocation are ever seen at all.
+fn call_shaped_idents_in_tokens(ts: proc_macro2::TokenStream) -> Vec<String> {
+    let mut out = Vec::new();
+    let toks: Vec<proc_macro2::TokenTree> = ts.into_iter().collect();
+    for (i, tt) in toks.iter().enumerate() {
+        match tt {
+            proc_macro2::TokenTree::Ident(id) => {
+                let followed_by_paren = matches!(
+                    toks.get(i + 1),
+                    Some(proc_macro2::TokenTree::Group(g))
+                        if g.delimiter() == proc_macro2::Delimiter::Parenthesis
+                );
+                let preceded_by_dot_or_colon = i > 0
+                    && matches!(
+                        &toks[i - 1],
+                        proc_macro2::TokenTree::Punct(p) if p.as_char() == '.' || p.as_char() == ':'
+                    );
+                if followed_by_paren || preceded_by_dot_or_colon {
+                    out.push(id.to_string());
+                }
+            }
+            proc_macro2::TokenTree::Group(g) => {
+                out.extend(call_shaped_idents_in_tokens(g.stream()))
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether `tokens` (a `macro_rules!` DEFINITION's own body -- every match
+/// arm and its expansion template, not one specific invocation) contains a
+/// registration-verb call shape or a DDL-shaped literal ANYWHERE -- see the
+/// module comment for why this can never be traced through to a specific
+/// generated function without expanding the macro, and so is reported as an
+/// unconditional, named finding instead.
+fn macro_rules_template_is_a_binding_site(tokens: proc_macro2::TokenStream) -> bool {
+    let idents = call_shaped_idents_in_tokens(tokens.clone());
+    let verb_hit = PAIRED_REGISTRATION_VERBS
+        .iter()
+        .chain(UNPAIRED_REGISTRATION_VERBS)
+        .any(|verb| idents.iter().any(|id| id == &format!("register_{verb}")));
+    if verb_hit {
+        return true;
+    }
+    string_literals_in_tokens(tokens)
+        .into_iter()
+        .any(|lit| ddl_statement_shape(&lit.value()))
+}
+
+/// Per-file accumulator [`build_call_graph`] drives with `syn::visit::Visit`
+/// over ONE file's parsed AST; every field is relative to THIS file only
+/// (`build_call_graph` offsets `fn_names_in_order`'s indices by the running
+/// node count once the walk finishes, and reassigns ordinals the same way
+/// [`assign_ordinals`] does -- per file, by declaration order -- so the
+/// resulting `(file, name, ordinal)` triples key into the SAME space
+/// [`registration_verb_occurrences`]/[`ddl_literal_occurrences`] already
+/// use).
+#[derive(Default)]
+struct FileGraphBuilder {
+    fn_names_in_order: Vec<String>,
+    fn_lines: Vec<usize>,
+    calls: Vec<BTreeSet<String>>,
+    /// `(fn index into fn_names_in_order, field name, line)` for every
+    /// `(EXPR.field)(..)` call site found in this file.
+    field_ptr_sites: Vec<(usize, String, usize)>,
+    /// `(field name, target name)` for every place in this file that
+    /// assigns a bare path value into a field of that name (a struct-literal
+    /// field-init or a plain `x.field = path;` assignment).
+    field_assignments: Vec<(String, String)>,
+    /// `(line, macro name)` for every `macro_rules!` definition in this file
+    /// whose template body is itself a registration/DDL binding site.
+    macro_rules_findings: Vec<(usize, String)>,
+    /// Stack of `fn_names_in_order` indices; the top is the innermost
+    /// enclosing NAMED function a visited expression attributes to (a
+    /// closure has no name of its own, so its calls attribute to whichever
+    /// named `fn` encloses it).
+    current: Vec<usize>,
+}
+
+impl FileGraphBuilder {
+    fn enter_fn(&mut self, name: String, line: usize) {
+        let idx = self.fn_names_in_order.len();
+        self.fn_names_in_order.push(name);
+        self.fn_lines.push(line);
+        self.calls.push(BTreeSet::new());
+        self.current.push(idx);
+    }
+
+    fn exit_fn(&mut self) {
+        self.current.pop();
+    }
+
+    fn add_call_edge(&mut self, name: String) {
+        if let Some(&idx) = self.current.last() {
+            self.calls[idx].insert(name);
+        }
+    }
+
+    fn record_field_ptr_site(&mut self, field: String, line: usize) {
+        if let Some(&idx) = self.current.last() {
+            self.field_ptr_sites.push((idx, field, line));
+        }
+    }
+
+    /// Every direct ARGUMENT of a call/method-call that is (after unwrapping
+    /// `Paren`/`Reference`/`Group`) a bare `Expr::Path` -- the `for_each(b)`
+    /// and `.map(Self::b)` edge shapes G8 requires, handled uniformly since
+    /// neither is anything more than "a path expression sitting directly in
+    /// argument position", regardless of how many segments the path has.
+    fn record_path_arguments(
+        &mut self,
+        args: &syn::punctuated::Punctuated<syn::Expr, syn::token::Comma>,
+    ) {
+        for arg in args {
+            if let syn::Expr::Path(p) = unwrap_trivial(arg) {
+                if let Some(last) = p.path.segments.last() {
+                    self.add_call_edge(last.ident.to_string());
+                }
+            }
+        }
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for FileGraphBuilder {
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        self.enter_fn(
+            node.sig.ident.to_string(),
+            node.sig.ident.span().start().line,
+        );
+        syn::visit::visit_item_fn(self, node);
+        self.exit_fn();
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        self.enter_fn(
+            node.sig.ident.to_string(),
+            node.sig.ident.span().start().line,
+        );
+        syn::visit::visit_impl_item_fn(self, node);
+        self.exit_fn();
+    }
+
+    fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+        self.enter_fn(
+            node.sig.ident.to_string(),
+            node.sig.ident.span().start().line,
+        );
+        syn::visit::visit_trait_item_fn(self, node);
+        self.exit_fn();
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        match unwrap_trivial(&node.func) {
+            syn::Expr::Path(p) => {
+                if let Some(last) = p.path.segments.last() {
+                    self.add_call_edge(last.ident.to_string());
+                }
+            }
+            syn::Expr::Field(f) => {
+                // `(s.f)(ctx)` -- a fn-pointer/closure stored in a struct
+                // field, called through it. This scanner cannot know WHICH
+                // function was ever assigned there without a second,
+                // whole-surface pass (`build_call_graph`'s field-pointer
+                // resolution, below); recorded here, resolved there.
+                if let syn::Member::Named(ident) = &f.member {
+                    self.record_field_ptr_site(ident.to_string(), f.dot_token.span.start().line);
+                }
+            }
+            _ => {}
+        }
+        self.record_path_arguments(&node.args);
+        syn::visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        self.add_call_edge(node.method.to_string());
+        self.record_path_arguments(&node.args);
+        syn::visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+        for fv in &node.fields {
+            if let syn::Member::Named(ident) = &fv.member {
+                if let syn::Expr::Path(p) = unwrap_trivial(&fv.expr) {
+                    if let Some(last) = p.path.segments.last() {
+                        self.field_assignments
+                            .push((ident.to_string(), last.ident.to_string()));
+                    }
+                }
+            }
+        }
+        syn::visit::visit_expr_struct(self, node);
+    }
+
+    fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
+        if let syn::Expr::Field(f) = unwrap_trivial(&node.left) {
+            if let syn::Member::Named(ident) = &f.member {
+                if let syn::Expr::Path(p) = unwrap_trivial(&node.right) {
+                    if let Some(last) = p.path.segments.last() {
+                        self.field_assignments
+                            .push((ident.to_string(), last.ident.to_string()));
+                    }
+                }
+            }
+        }
+        syn::visit::visit_expr_assign(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        if node.path.is_ident("macro_rules") {
+            // The definition's own template body, checked directly -- see
+            // the module comment for why this is an unconditional finding,
+            // never an edge.
+            if macro_rules_template_is_a_binding_site(node.tokens.clone()) {
+                let name = node
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                let line = node
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.span().start().line)
+                    .unwrap_or(0);
+                self.macro_rules_findings.push((line, name));
+            }
+        } else {
+            for name in call_shaped_idents_in_tokens(node.tokens.clone()) {
+                self.add_call_edge(name);
+            }
+        }
+        syn::visit::visit_macro(self, node);
+    }
+}
+
+/// Builds the whole-surface [`CallGraph`] over `surface`: one
+/// [`FileGraphBuilder`] walk per file, ordinals reassigned per file
+/// (matching [`assign_ordinals`]'s own discipline exactly -- checked
+/// directly by [`syn_fn_ordinals_match_hand_rolled_regions`], below), then a
+/// SECOND pass resolving every fn-pointer field-call site now that
+/// `field_assignments` is complete across the WHOLE surface (a field can be
+/// assigned in one file and called through in another).
+fn build_call_graph(surface: &[(String, String)]) -> CallGraph {
+    let mut nodes: Vec<GraphFn> = Vec::new();
+    let mut calls: std::collections::HashMap<usize, BTreeSet<String>> =
+        std::collections::HashMap::new();
+    let mut field_assignments: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut field_ptr_sites: Vec<(usize, String, String)> = Vec::new();
+    let mut macro_rules_findings = Vec::new();
+
+    for (file, text) in surface {
+        let parsed = syn::parse_file(text).unwrap_or_else(|e| {
+            panic!(
+                "build_call_graph: syn could not parse {file} ({e}) -- refusing to build an \
+                 unsound graph over unparsed source"
+            )
+        });
+        let mut builder = FileGraphBuilder::default();
+        syn::visit::Visit::visit_file(&mut builder, &parsed);
+
+        let base = nodes.len();
+        let mut per_name_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for (i, name) in builder.fn_names_in_order.iter().enumerate() {
+            let counter = per_name_counts.entry(name.clone()).or_insert(0);
+            *counter += 1;
+            nodes.push(GraphFn {
+                file: file.clone(),
+                name: name.clone(),
+                ordinal: *counter,
+                line: builder.fn_lines[i],
+            });
+        }
+        for (i, edges) in builder.calls.into_iter().enumerate() {
+            calls.insert(base + i, edges);
+        }
+        for (fn_idx, field, line) in builder.field_ptr_sites {
+            field_ptr_sites.push((base + fn_idx, field, format!("{file}:{line}")));
+        }
+        for (field, target) in builder.field_assignments {
+            field_assignments.entry(field).or_default().push(target);
+        }
+        macro_rules_findings.extend(
+            builder
+                .macro_rules_findings
+                .into_iter()
+                .map(|(line, name)| format!("{file}:{line}: macro_rules! {name}")),
+        );
+    }
+
+    let mut field_ptr_findings = Vec::new();
+    let mut unresolved_field_ptr_sites = Vec::new();
+    for (idx, field, loc) in &field_ptr_sites {
+        match field_assignments.get(field) {
+            Some(targets) if !targets.is_empty() => {
+                for t in targets {
+                    calls.entry(*idx).or_default().insert(t.clone());
+                }
+                field_ptr_findings.push(format!(
+                    "{loc}: fn-pointer call via `.{field}` -- resolved to {targets:?} (every RHS \
+                     ever assigned to a `.{field}` field anywhere in the binding surface)"
+                ));
+            }
+            _ => {
+                unresolved_field_ptr_sites.push(format!(
+                    "{loc}: fn-pointer call via `.{field}` -- UNRESOLVED, no assignment to a \
+                     `.{field}` field found anywhere in the binding surface"
+                ));
+            }
+        }
+    }
+
+    let mut by_name: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, node) in nodes.iter().enumerate() {
+        by_name.entry(node.name.clone()).or_default().push(i);
+    }
+
+    CallGraph {
+        nodes,
+        by_name,
+        calls,
+        field_ptr_findings,
+        unresolved_field_ptr_sites,
+        macro_rules_findings,
+    }
+}
+
+/// Breadth-first NAME-keyed reachability from `entries` (node indices) over
+/// `graph.calls`: an edge to a name expands to EVERY node sharing that name
+/// (the safe-direction over-approximation the module comment describes), so
+/// two functions in different files/types that merely share a name are
+/// still both marked reachable the moment either is.
+fn reachable_node_indices(graph: &CallGraph, entries: &[usize]) -> HashSet<usize> {
+    let mut visited_nodes: HashSet<usize> = entries.iter().copied().collect();
+    let mut visited_names: HashSet<String> = HashSet::new();
+    let mut queue: std::collections::VecDeque<usize> = entries.iter().copied().collect();
+    while let Some(idx) = queue.pop_front() {
+        let Some(targets) = graph.calls.get(&idx) else {
+            continue;
+        };
+        for name in targets {
+            if !visited_names.insert(name.clone()) {
+                continue;
+            }
+            for &tid in graph.by_name.get(name).into_iter().flatten() {
+                if visited_nodes.insert(tid) {
+                    queue.push_back(tid);
+                }
+            }
+        }
+    }
+    visited_nodes
+}
+
+/// This list IS the gate's own output at this head, transcribed the same
+/// way [`REGISTRATION_VERB_SITES`] was: every `registration_verb_occurrences`/
+/// `ddl_literal_occurrences` site over the WHOLE binding surface (not just
+/// [`SURFACE_DIRS`]) that this section's call graph marks reachable from a
+/// `fn` under `crates/jammi-ai/src/fine_tune/`, kept in sync by
+/// [`fine_tune_reachable_sites_are_all_reviewed`].
+const FINE_TUNE_REACHABLE_SITES: &[ReviewedRegistrationSite] = &[
+    ReviewedRegistrationSite {
+        file: "crates/jammi-ai/src/query/content_hash_udf.rs",
+        function: "register_content_hash_udf",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry for this site (a \
+                   session-wide singleton, called once at construction, never per-call): this \
+                   graph marks it reachable because the embedded-engine session-construction path \
+                   (InferenceSession's own `with_observer`/`wrap_with` chain) shares a caller with \
+                   fine_tune/'s worker construction, name-keyed the same way every other verb-name \
+                   collision here is -- the SAME clearance already carries the safety argument.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-ai/src/query/vector_agg_udaf.rs",
+        function: "register_vector_agg_udafs",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: register_udaf(..) \
+                   three times under each UDAF's own FIXED name, called once per session at \
+                   construction -- the same session-construction-time singleton shape as \
+                   register_content_hash_udf, reachable for the same reason.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-ai/src/session.rs",
+        function: "register_query_functions",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: register_udtf(..) \
+                   under the FIXED AnnotateTableFunction::NAME, \"must be called once per session, \
+                   after the session is behind an Arc\" per its own doc -- a session-construction \
+                   singleton, reachable for the same reason as the two UDF/UDAF registrars above.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-bench/src/corpus.rs",
+        function: "register",
+        ordinal: 1,
+        allowed: 1,
+        property: "a SAFE-DIRECTION OVER-APPROXIMATION false positive, not a real reachability \
+                   path: `crates/jammi-bench` depends ON `crates/jammi-ai` (verified directly by \
+                   `binding_surface_crates`'s own reverse-dependency computation, which is exactly \
+                   why jammi-bench is IN this section's binding surface in the first place), so no \
+                   fn under `crates/jammi-ai/src/fine_tune/` can call FORWARD into it -- this \
+                   graph is NAME-keyed, not crate-direction-aware, and jammi-bench's own `register` \
+                   (a benchmark harness helper that calls `ctx.register_parquet(TableReference::bare( \
+                   format!(\"jammi.{table_name}\")), ..)` on a session it builds itself, \
+                   `SessionContext::new()`) happens to share its name with something fine_tune/ \
+                   calls elsewhere in this same graph. Reviewed and accepted as the cost of a \
+                   sound (never a false NOT-reachable), name-keyed over-approximation -- see the \
+                   module comment's own soundness-posture paragraph, and \
+                   `falsification_name_keyed_over_approximation_reports_a_new_same_named_binder` \
+                   for the same shape proven directly.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/session.rs",
+        function: "build",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: register_catalog( \
+                   \"mutable\", ..) under the FIXED literal name \"mutable\", once at session-build \
+                   time -- a session-construction-time singleton, reachable because every job's \
+                   session (including fine_tune/'s) is built through this same path.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/session.rs",
+        function: "register_source_tables",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: register_catalog( \
+                   source_id, ..) keyed by the data source's own stable identifier, called once \
+                   per configured source at session build/reload time -- never per fine_tune call, \
+                   reachable via the same session-construction path as `build` above.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/source/file_format.rs",
+        function: "register_driver_for_url",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: register_object_store( \
+                   ..) keyed by the URL's own scheme+authority, idempotent-rebind shape, executed \
+                   by `register_object_store_twice_for_one_url_rebinds_the_same_driver_and_errors_on_neither`.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mod.rs",
+        function: "bind_result_table",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: binds by calling \
+                   self.register_table(..), rebinding an EARLIER call's own already-written, \
+                   immutable Parquet bytes -- the training-set materialization path fine_tune/ \
+                   calls into directly, so this one is a GENUINE reachable path, not merely a name \
+                   collision. EXECUTED oracle: \
+                   materialization.rs::two_runs_over_one_pinned_definition_share_one_training_set.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mod.rs",
+        function: "build_result_table_provider",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: idempotent-rebind of \
+                   the cached driver for a URL's scheme+authority -- reachable via the same \
+                   materialization path as bind_result_table, a genuine reachable site.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mod.rs",
+        function: "install_result_schema",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: idempotent \
+                   re-installation of the same provider under the session's FIXED default-schema \
+                   name -- reachable via the same materialization path, a genuine reachable site.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mod.rs",
+        function: "register_table",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: this hit is the `fn \
+                   register_table(` DECLARATION line -- the function ITSELF is the one \
+                   bind_result_table/build_result_table_provider/install_result_schema chain \
+                   above, so it is reachable as the same materialization entry point.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mutable/postgres.rs",
+        function: "create_table_ddl",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at DDL_LITERAL_SITES's own entry: builds a CREATE TABLE STRING \
+                   for the companion \"mutable table\" Postgres backend, executed only through \
+                   that backend's own direct SQL connection, never a DataFusion \
+                   SessionContext::sql call -- reachable here as a NAME-keyed call-graph node (the \
+                   trait method dispatch chain), not because fine_tune/ ever executes this SQL \
+                   through DataFusion; the DDL text itself never reaches a DataFusion catalog \
+                   bind, per that entry's own disclosure.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mutable/sqlite.rs",
+        function: "create_table_ddl",
+        ordinal: 1,
+        allowed: 1,
+        property: "the SQLite arm of the same \"mutable table\" backend -- same disclosure as the \
+                   Postgres arm above.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/result_schema.rs",
+        function: "register_table",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: the \
+                   SchemaProvider::register_table trait-method DECLARATION for \
+                   ResultTableSchemaProvider -- reachable as the trait-dispatch target of the \
+                   store/mod.rs::register_table chain above (the same name-keyed method-dispatch \
+                   edge DataFusion's own SessionContext::register_table/CREATE TABLE DDL execution \
+                   use in production).",
+    },
+];
+
+#[test]
+fn fine_tune_reachable_sites_are_all_reviewed() {
+    let surface = binding_surface();
+    let graph = build_call_graph(&surface);
+
+    assert!(
+        graph.macro_rules_findings.is_empty(),
+        "macro_rules! definition(s) whose OWN template is a registration/DDL binding site \
+         require review (cannot be traced through expansion without expanding it): {:?}",
+        graph.macro_rules_findings
+    );
+    assert!(
+        graph.unresolved_field_ptr_sites.is_empty(),
+        "fn-pointer field call site(s) with no discoverable assignment anywhere in the binding \
+         surface require review: {:?}",
+        graph.unresolved_field_ptr_sites
+    );
+
+    let entries: Vec<usize> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.file.starts_with("crates/jammi-ai/src/fine_tune/"))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "crates/jammi-ai/src/fine_tune/ must contain at least one fn, or this test is vacuous"
+    );
+    let reachable = reachable_node_indices(&graph, &entries);
+    let reachable_keys: BTreeSet<(String, String, usize)> = reachable
+        .iter()
+        .map(|&i| {
+            let n = &graph.nodes[i];
+            (n.file.clone(), n.name.clone(), n.ordinal)
+        })
+        .collect();
+
+    let verb_hits = registration_verb_occurrences(&surface);
+    let ddl_hits = ddl_literal_occurrences(&surface);
+
+    // Every REAL occurrence site must have a MATCHING node in this section's
+    // own (syn-derived) call graph -- if the syn-derived and hand-rolled
+    // fn-identification schemes ever disagreed on a site the occurrence
+    // scan actually found, reachability for it could never be soundly
+    // determined (a silent, structural under-approximation this assertion
+    // exists to catch before it ever reaches the reviewed-list comparison).
+    let all_node_keys: BTreeSet<(String, String, usize)> = graph
+        .nodes
+        .iter()
+        .map(|n| (n.file.clone(), n.name.clone(), n.ordinal))
+        .collect();
+    // `<module-scope>` (ordinal 0) sites are never call-graph NODES at all
+    // by construction (nothing "calls" a module-level const) -- excluded
+    // from this check the same way `DDL_LITERAL_SITES`'s own module-scope
+    // entries are reviewed as "unreachable from any DataFusion
+    // SessionContext, and so from fine_tune/, regardless": they can never
+    // appear in `reachable_keys` either, so the effect is identical to
+    // treating them as structurally not-reachable, never a silent gap.
+    let missing_nodes: Vec<_> = verb_hits
+        .keys()
+        .chain(ddl_hits.keys())
+        .filter(|k| k.1 != "<module-scope>")
+        .filter(|k| !all_node_keys.contains(*k))
+        .collect();
+    assert!(
+        missing_nodes.is_empty(),
+        "occurrence site(s) with no matching call-graph node -- the syn-derived and hand-rolled \
+         fn-identification schemes disagree on these, so reachability cannot be soundly \
+         determined for them: {missing_nodes:?}"
+    );
+
+    let found: std::collections::BTreeMap<(String, String, usize), usize> = verb_hits
+        .keys()
+        .chain(ddl_hits.keys())
+        .filter(|k| reachable_keys.contains(*k))
+        .map(|k| (k.clone(), 1))
+        .collect();
+
+    let allow: Vec<&ReviewedRegistrationSite> = FINE_TUNE_REACHABLE_SITES.iter().collect();
+    assert_occurrences_reviewed(&found, &allow, "fine_tune/-reachable registration/DDL site");
+}
+
+/// G8's own wall-time bound, measured and stated (not merely claimed): the
+/// reachability computation over the REAL binding surface (337 tracked
+/// `.rs` files at this head) must complete in under 10 seconds.
+#[test]
+fn fine_tune_reachability_wall_time_is_under_ten_seconds() {
+    let start = std::time::Instant::now();
+    let surface = binding_surface();
+    let graph = build_call_graph(&surface);
+    let entries: Vec<usize> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.file.starts_with("crates/jammi-ai/src/fine_tune/"))
+        .map(|(i, _)| i)
+        .collect();
+    let _reachable = reachable_node_indices(&graph, &entries);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_secs_f64() < 10.0,
+        "the reachability gate's wall time over the real binding surface (cargo metadata + \
+         syn-parsing 337 files + BFS) must stay under 10s, got {elapsed:?}"
+    );
+}
+
+/// [`GraphFn::line`] is never decorative: a node whose line is `0` (this
+/// crate's own sentinel for "no real line found", used nowhere in
+/// [`FileGraphBuilder::enter_fn`]) would mean a node's own source position
+/// was silently lost -- checked directly over the real binding surface.
+#[test]
+fn graph_fn_lines_are_never_zero() {
+    let surface = binding_surface();
+    let graph = build_call_graph(&surface);
+    let zero_line: Vec<_> = graph
+        .nodes
+        .iter()
+        .filter(|n| n.line == 0)
+        .map(|n| (&n.file, &n.name, n.ordinal))
+        .collect();
+    assert!(
+        zero_line.is_empty(),
+        "every call-graph node must carry a real, 1-based source line, got zero for: {zero_line:?}"
+    );
+}
+
+/// Test-only harness for the falsification fixtures below: parses `source`
+/// as a single synthetic file under `crates/jammi-ai/src/fine_tune/` (so
+/// every `fn` in it is, by construction, an ENTRY the real gate's own file
+/// prefix would also pick up) and returns the resulting graph plus the set
+/// of node indices reachable from every fn in that one file.
+fn probe_reachability(source: &str) -> (CallGraph, HashSet<usize>) {
+    let surface = vec![(
+        "crates/jammi-ai/src/fine_tune/__probe__.rs".to_string(),
+        source.to_string(),
+    )];
+    let graph = build_call_graph(&surface);
+    let entries: Vec<usize> = (0..graph.nodes.len()).collect();
+    let reachable = reachable_node_indices(&graph, &entries);
+    (graph, reachable)
+}
+
+fn reachable_contains_fn(graph: &CallGraph, reachable: &HashSet<usize>, name: &str) -> bool {
+    reachable.iter().any(|&i| graph.nodes[i].name == name)
+}
+
+/// G8 edge shape 1: a bare function NAME handed directly to a call as an
+/// argument (`for_each(callee)`) -- the callee is invoked THROUGH the
+/// fn-pointer `for_each` receives, never spelled as a call site of its own.
+#[test]
+fn falsification_fn_pointer_argument_edge_is_found() {
+    let (graph, reachable) = probe_reachability(concat!(
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
+        "fn caller(items: &[i32]) {\n",
+        "    items.iter().for_each(|_| callee());\n",
+        "    items.iter().for_each(direct_callee);\n",
+        "}\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
+        "fn direct_callee() {}\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
+        "fn callee() {}\n",
+    ));
+    assert!(
+        reachable_contains_fn(&graph, &reachable, "direct_callee"),
+        "a bare fn NAME handed directly to for_each(..) as an argument must be a reachability edge"
+    );
+}
+
+/// G8 edge shape 2: a qualified path (`Self::b`) handed directly to
+/// `.map(..)` as an argument -- the same argument-position shape as
+/// `for_each(b)`, with a multi-segment path instead of a bare identifier.
+#[test]
+fn falsification_map_self_method_argument_edge_is_found() {
+    let (graph, reachable) = probe_reachability(concat!(
+        "struct S;\n",
+        "impl S {\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
+        "    fn caller(items: Vec<i32>) -> Vec<i32> {\n",
+        "        items.into_iter().map(Self::b).collect()\n",
+        "    }\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
+        "    fn b(x: i32) -> i32 { x }\n",
+        "}\n",
+    ));
+    assert!(
+        reachable_contains_fn(&graph, &reachable, "b"),
+        "a qualified path (Self::b) handed to .map(..) as an argument must be a reachability edge"
+    );
+}
+
+/// G8 edge shape 3a: a call inside an `assert!(..)` macro invocation's
+/// token stream -- opaque to `syn`'s typed AST, so only the raw token walk
+/// ([`call_shaped_idents_in_tokens`]) can see it at all.
+#[test]
+fn falsification_call_inside_assert_macro_edge_is_found() {
+    let (graph, reachable) = probe_reachability(concat!(
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
+        "fn caller() {\n",
+        "    assert!(callee().is_ok());\n",
+        "}\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
+        "fn callee() -> Result<(), ()> { Ok(()) }\n",
+    ));
+    assert!(
+        reachable_contains_fn(&graph, &reachable, "callee"),
+        "a call inside an assert!(..) argument must be a reachability edge"
+    );
+}
+
+/// G8 edge shape 3b: a call inside a `tokio::select!` arm -- a macro DSL
+/// `syn` cannot parse as ordinary expressions at all, so this shape can only
+/// be found by the same raw token walk as the `assert!` case.
+#[test]
+fn falsification_call_inside_tokio_select_arm_edge_is_found() {
+    let (graph, reachable) = probe_reachability(concat!(
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
+        "async fn caller() {\n",
+        "    tokio::select! {\n",
+        "        _ = callee() => {}\n",
+        "    }\n",
+        "}\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
+        "async fn callee() {}\n",
+    ));
+    assert!(
+        reachable_contains_fn(&graph, &reachable, "callee"),
+        "a call inside a tokio::select! arm must be a reachability edge"
+    );
+}
+
+/// G8 edge shape 4: a fn-pointer struct field `(s.f)(ctx)` -- resolved by
+/// finding every RHS ever assigned to a field of that SAME name anywhere in
+/// the (synthetic, here single-file) binding surface.
+#[test]
+fn falsification_fn_pointer_struct_field_edge_is_found() {
+    let (graph, reachable) = probe_reachability(concat!(
+        "struct Handlers {\n",
+        "    f: fn(),\n",
+        "}\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
+        "fn make() -> Handlers {\n",
+        "    Handlers { f: callee }\n",
+        "}\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
+        "fn caller(s: &Handlers) {\n",
+        "    (s.f)();\n",
+        "}\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
+        "fn callee() {}\n",
+    ));
+    assert!(
+        reachable_contains_fn(&graph, &reachable, "callee"),
+        "a fn-pointer struct field call (s.f)(..) must be resolved into a reachability edge \
+         once a matching field assignment exists anywhere in the binding surface"
+    );
+    assert!(
+        graph
+            .field_ptr_findings
+            .iter()
+            .any(|f| f.contains("callee")),
+        "a RESOLVED fn-pointer field call must be recorded in field_ptr_findings (human-auditable \
+         even on success, not merely on failure), got {:?}",
+        graph.field_ptr_findings
+    );
+}
+
+/// G2, applied to G8's fn-pointer-field shape: when NO assignment to the
+/// field exists anywhere, the gate refuses to pass silently -- it is a
+/// NAMED, unresolved finding, never a silent dead end.
+#[test]
+fn falsification_unresolved_fn_pointer_field_call_fails_closed() {
+    let surface = vec![(
+        "crates/jammi-ai/src/fine_tune/__probe_unresolved_field__.rs".to_string(),
+        concat!(
+            "struct Handlers {\n",
+            "    f: fn(),\n",
+            "}\n",
+            // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
+            "fn caller(s: &Handlers) {\n",
+            "    (s.f)();\n",
+            "}\n",
+        )
+        .to_string(),
+    )];
+    let graph = build_call_graph(&surface);
+    assert!(
+        !graph.unresolved_field_ptr_sites.is_empty(),
+        "a fn-pointer field call with NO discoverable assignment anywhere must be reported \
+         UNRESOLVED, got {:?}",
+        graph.unresolved_field_ptr_sites
+    );
+}
+
+/// G8 edge shape 5: a `macro_rules!`-generated fn item -- the generated
+/// function's NAME is a macro metavariable resolved only per invocation
+/// site, so it can never be traced through to a specific call-graph node;
+/// instead, the DEFINITION's own template body is checked directly for a
+/// registration-verb call shape or DDL literal, unconditionally.
+#[test]
+fn falsification_macro_rules_template_binding_site_is_flagged() {
+    let surface = vec![(
+        "crates/jammi-ai/src/fine_tune/__probe_macro_rules__.rs".to_string(),
+        concat!(
+            "macro_rules! register_probe_table {\n",
+            "    ($ctx:expr, $name:expr, $provider:expr) => {\n",
+            "        $ctx.register_table($name, $provider).unwrap();\n",
+            "    };\n",
+            "}\n",
+        )
+        .to_string(),
+    )];
+    let graph = build_call_graph(&surface);
+    assert!(
+        !graph.macro_rules_findings.is_empty(),
+        "a macro_rules! template containing a registration-verb call shape must be flagged, got \
+         {:?}",
+        graph.macro_rules_findings
+    );
+}
+
+/// G8's own soundness posture, executed directly: "name-keyed
+/// over-approximation is safe-direction (a new same-named binder is
+/// REPORTED)". A call to `helper()` must mark EVERY node named `helper`
+/// reachable, including one this graph cannot prove is a DIFFERENT
+/// function -- the safe direction is over-inclusion, never silently
+/// resolving to "the one true `helper`" by guesswork.
+#[test]
+fn falsification_name_keyed_over_approximation_reports_a_new_same_named_binder() {
+    let (graph, reachable) = probe_reachability(concat!(
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for name-keyed safe-direction over-approximation -- synthetic producer text fed to build_call_graph, not real code in this file
+        "fn caller() { helper(); }\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
+        "fn helper() {}\n",
+        "mod other {\n",
+        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
+        "    pub fn helper() {}\n",
+        "}\n",
+    ));
+    let helper_nodes: Vec<usize> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.name == "helper")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        helper_nodes.len(),
+        2,
+        "the fixture must define two distinct `helper` fns for this control to be non-vacuous"
+    );
+    assert!(
+        helper_nodes.iter().all(|i| reachable.contains(i)),
+        "a call to helper() must mark EVERY node named `helper` reachable (name-keyed, \
+         safe-direction over-approximation), got reachable={reachable:?} helper_nodes={helper_nodes:?}"
     );
 }

@@ -245,11 +245,14 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ancestry  # noqa: E402 — #530: the ONE ancestry rule, shared with check_pod_build_timings.py
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CUDA_RUNS_DIR = REPO_ROOT / "crates" / "jammi-kernels" / "artifacts" / "cuda-runs"
 README_PATH = CUDA_RUNS_DIR / "README.md"
 
-GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+GIT_SHA_RE = ancestry.GIT_SHA_RE
 PRODUCER_KINDS = {"cargo-test", "script", "none"}
 GATING_STATIC = {"#[ignore]", "required-features", "none"}
 GATING_ENV_RE = re.compile(r"^env:[A-Za-z_][A-Za-z0-9_]*$")
@@ -330,21 +333,13 @@ class ArtifactError(Exception):
     """Uncomputable input (parse failure, missing dir) — fails closed."""
 
 
-# Same class as the CI incident that hit `check_arch_validation_freshness.py`
-# (run 33230050451, main, "Guard (arch validation freshness self-test)"):
-# `shutil.rmtree` during a `tempfile.TemporaryDirectory`'s teardown can hit
-# `OSError: [Errno 39] Directory not empty: '.git'` — a race between tempdir
-# cleanup and a background `git maintenance`/`gc --auto` process this file's
-# own scratch-repo `git init`/`add`/`commit`/`clone` calls below can spawn.
-# `-c gc.auto=0 -c gc.autoDetach=false -c maintenance.auto=false` kills the
-# background writer AT THE SOURCE for every git invocation this file makes.
-_GIT_NO_BACKGROUND_MAINTENANCE = ("-c", "gc.auto=0", "-c", "gc.autoDetach=false", "-c", "maintenance.auto=false")
-
-
-def _run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    if cmd and cmd[0] == "git":
-        cmd = ["git", *_GIT_NO_BACKGROUND_MAINTENANCE, *cmd[1:]]
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+# #530: the git-plumbing this file's own ancestry rule needs no longer has
+# a private copy here -- `_run` IS `ancestry.run` (the identical gc/
+# maintenance suppression, for the identical reason: a `shutil.rmtree`
+# during a `tempfile.TemporaryDirectory`'s teardown racing a background
+# `git maintenance`/`gc --auto` this file's own scratch-repo `git init`/
+# `add`/`commit`/`clone` calls can spawn), imported rather than redefined.
+_run = ancestry.run
 
 
 def git_ls_files(repo_root: Path) -> set[str]:
@@ -368,10 +363,12 @@ def is_shallow_repository(repo_root: Path) -> bool:
     tells the two apart; a non-zero exit (e.g. run outside a git repo at
     all) is treated as "not shallow" here — `git_ls_files`/`_is_ancestor`
     will raise their own, more specific errors moments later if the
-    checkout is unusable for some other reason.
+    checkout is unusable for some other reason. Delegates to `ancestry.
+    is_shallow_repository` (#530) -- the identical check `check_pod_
+    build_timings.py` uses, kept as its own named function here for the
+    docstring's own file-specific incident history.
     """
-    proc = _run(["git", "rev-parse", "--is-shallow-repository"], repo_root)
-    return proc.returncode == 0 and proc.stdout.strip() == "true"
+    return ancestry.is_shallow_repository(repo_root)
 
 
 # --------------------------------------------------------------------------- #
@@ -796,41 +793,27 @@ def check_cargo_test_gating(data: dict, producer: dict, repo_root: Path) -> list
 
 
 # --------------------------------------------------------------------------- #
-# rule (d) — ancestry
+# rule (d) — ancestry (#530: delegates entirely to the ONE shared rule in
+# ancestry.py, imported by this gate AND check_pod_build_timings.py)
 # --------------------------------------------------------------------------- #
-def _is_ancestor(sha: str, repo_root: Path, target: str = "HEAD") -> bool:
-    proc = _run(["git", "merge-base", "--is-ancestor", sha, target], repo_root)
-    return proc.returncode == 0
+_is_ancestor = ancestry.is_ancestor
 
 
 def check_ancestry(data: dict, repo_root: Path) -> list[str]:
     """PASS if `git_sha` is an ancestor of HEAD, OR — for a branch tip that
-    was squash-merged, so `git_sha` itself can never be an ancestor of
-    anything again — if `merged_as` is an ancestor of HEAD and the artifact
-    also carries `git_sha` (the measured tip, kept verbatim) plus
-    `merged_via_pr`. `merged_as`'s own well-typedness (40-hex, paired with
-    `merged_via_pr`, only valid alongside a resolved `git_sha`) is rule (a)'s
-    job (`check_schema_types`); this function only re-checks GIT_SHA_RE here
-    so a malformed `merged_as` cannot be handed to `git merge-base` as a
-    literal ref expression.
-    """
+    was rewritten (rebased or squash-merged) before its own landing, so
+    `git_sha` itself can never be an ancestor of anything again — if
+    `merged_as` is an ancestor of HEAD and the artifact also carries
+    `git_sha` (the measured tip, kept verbatim) plus `merged_via_pr`.
+    `merged_as`'s own well-typedness (40-hex, paired with `merged_via_pr`,
+    only valid alongside a resolved `git_sha`) is rule (a)'s job
+    (`check_schema_types`); `ancestry.check_ancestry` only re-checks
+    GIT_SHA_RE on `merged_as` itself, so a malformed one cannot be handed
+    to `git merge-base` as a literal ref expression."""
     sha = data.get("git_sha")
     if not sha:
         return []  # git_sha_unresolved artifacts have nothing resolvable to check
-    if _is_ancestor(sha, repo_root):
-        return []
-
-    merged_as = data.get("merged_as")
-    merged_via_pr = data.get("merged_via_pr")
-    if isinstance(merged_as, str) and GIT_SHA_RE.match(merged_as) and merged_via_pr is not None:
-        if _is_ancestor(merged_as, repo_root):
-            return []
-        return [
-            f"git_sha {sha} {ANCESTOR_MESSAGE} merged_as {merged_as} (PR #{merged_via_pr}) is "
-            "ALSO not an ancestor of HEAD — the squash-landing claim does not hold either."
-        ]
-
-    return [f"git_sha {sha} {ANCESTOR_MESSAGE}"]
+    return ancestry.check_ancestry(data, repo_root, ANCESTOR_MESSAGE)
 
 
 # --------------------------------------------------------------------------- #
@@ -1571,6 +1554,30 @@ def _gang_check_ttl_hours(gang: dict, _data: dict, _repo_root: Path) -> list[str
     return []
 
 
+# M7 (plan #500 U7b's `pods` transport): the two-HOST bootstrap can be
+# rented over TWO independent RunPod object types -- an INSTANT CLUSTER
+# (`POST /v2/clusters`, near-zero capacity) or two ORDINARY pods joined by
+# Global Networking (`POST /v2/pods` x2, the default -- ordinary pods
+# provision reliably where clusters do not). `gang.leg` stays `"cluster"`
+# either way (the two-HOST leg is the fact that matters to every OTHER
+# reader of this registry); `gang.transport` is the sub-fact naming WHICH
+# mechanism actually carried it, closed-set, required, so a reader can
+# never mistake a Global-Networking run for an Instant-Cluster one.
+GANG_TRANSPORT_INSTANT_CLUSTER = "instant-cluster"
+GANG_TRANSPORT_GLOBAL_NETWORKING = "global-networking"
+GANG_TRANSPORTS = (GANG_TRANSPORT_INSTANT_CLUSTER, GANG_TRANSPORT_GLOBAL_NETWORKING)
+
+
+def _gang_check_transport(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
+    v = gang.get("transport")
+    if v not in GANG_TRANSPORTS:
+        return [
+            f"`gang.transport` must be exactly one of {list(GANG_TRANSPORTS)} -- which RENTAL MECHANISM "
+            f"actually carried this two-host run, got {v!r}"
+        ]
+    return []
+
+
 # The POD-leg registry -- unchanged from before M6 (this rule's original
 # shape). Renamed from `GANG_FIELD_REGISTRY` to `GANG_POD_FIELD_REGISTRY`;
 # nothing outside this module referenced the old name.
@@ -1686,6 +1693,12 @@ GANG_CLUSTER_FIELD_REGISTRY: tuple[tuple[str, object, str], ...] = (
         "ttl_hours",
         _gang_check_ttl_hours,
         "the cluster's own deadline, baked into its entrypoint at create time",
+    ),
+    (
+        "transport",
+        _gang_check_transport,
+        f"which RENTAL MECHANISM carried this two-host run -- exactly one of {list(GANG_TRANSPORTS)} -- so "
+        "a reader never mistakes a Global-Networking run for an Instant-Cluster one",
     ),
 )
 
@@ -3243,6 +3256,7 @@ def self_test() -> int:
                 "pod_count": 2,
                 "gpu_count_per_pod": 1,
                 "ttl_hours": 1,
+                "transport": "instant-cluster",
             }
             return d
 
@@ -3292,12 +3306,31 @@ def self_test() -> int:
             "pod_count",
             "gpu_count_per_pod",
             "ttl_hours",
+            "transport",
         ):
             bad = gang_cluster_baseline()
             del bad["gang"][field]
             expect_hit(
                 bad, "x.json", f"`gang.{field}` is missing", f"rule (k): cluster leg missing gang.{field}"
             )
+
+        # M7: `transport` -- closed set, both spellings accepted, anything
+        # else refused.
+        for good_transport in ("instant-cluster", "global-networking"):
+            ok = gang_cluster_baseline()
+            ok["gang"]["transport"] = good_transport
+            expect_clean(ok, "x.json", f"rule (k): transport={good_transport!r} is accepted")
+        bad = gang_cluster_baseline()
+        bad["gang"]["transport"] = "carrier-pigeon"
+        expect_hit(bad, "x.json", "`gang.transport` must be exactly one of", "rule (k): transport outside the closed set")
+        bad = gang_cluster_baseline()
+        bad["gang"]["transport"] = "cluster"
+        expect_hit(
+            bad,
+            "x.json",
+            "`gang.transport` must be exactly one of",
+            "rule (k): transport must not be confused with `gang.leg`'s own value",
+        )
 
         bad = gang_cluster_baseline()
         bad["gang"]["hosts"] = 3

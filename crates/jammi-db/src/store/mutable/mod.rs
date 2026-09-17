@@ -29,7 +29,9 @@ use crate::catalog::backend::BackendImpl;
 /// associated [`BackendImpl`] returned by [`MutableBackend::catalog_backend`].
 pub trait MutableBackend: Send + Sync {
     /// `CREATE TABLE` statement for `def`. The implicit `tenant_id TEXT`
-    /// column is always emitted (per ADR-00).
+    /// column is always emitted, per the engine's tenant-identifier
+    /// discipline (see
+    /// `docs/guide/src/philosophy.md#the-one-rule-everything-else-follows-from`).
     fn create_table_ddl(&self, def: &MutableTableDefinition) -> String;
 
     /// `CREATE INDEX` statement for one secondary index.

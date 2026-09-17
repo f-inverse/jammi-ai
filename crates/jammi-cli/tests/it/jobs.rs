@@ -122,7 +122,7 @@ async fn seed_completed_job(catalog: &Catalog, fixture: &JobFixture<'_>, base_mo
         .to_string()
     });
     let acceleration_report = fixture.acceleration_report.map(str::to_string);
-    let now = jammi_db::catalog::backend::now_sortable();
+    let now = jammi_db::catalog::lease::canonical_stamp_now();
 
     catalog
         .backend_arc()

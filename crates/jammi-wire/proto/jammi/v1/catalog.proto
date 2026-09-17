@@ -251,7 +251,9 @@ message ServerInfo {
   string broker = 5;
 }
 
-// A tenant identifier carried over the wire. UUID v4 / v7 string per ADR-00;
+// A tenant identifier carried over the wire. UUID v4 / v7 string, per the
+// engine's tenant-identifier discipline (see
+// docs/guide/src/philosophy.md#the-one-rule-everything-else-follows-from);
 // the nil UUID is invalid and the engine rejects it at the TenantId newtype
 // boundary.
 message Tenant {

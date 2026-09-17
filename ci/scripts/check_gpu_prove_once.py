@@ -1001,7 +1001,7 @@ RUNPOD_LIB_REL = "ci/scripts/runpod_lib.sh"
 # root's transitive callers PLUS the roots themselves; a root name that
 # stops existing in runpod_lib.sh is caught the same way an empty closure
 # always was (see `derive_deploy_closure` below).
-RENTING_ROOTS: tuple[str, ...] = ("_rp_deploy_payload", "rp_cluster_create")
+RENTING_ROOTS: tuple[str, ...] = ("_rp_deploy_payload", "rp_cluster_create", "rp_two_host_pod_create")
 # Retained as an alias: several comments/messages below still read most
 # naturally naming the ORIGINAL (and still first) root; nothing outside
 # this module depends on the name.
@@ -1542,22 +1542,32 @@ def find_step_if_by_name(
     reconstitutes ITS OWN `if:` at that step's own key column -- never a
     job-level `if:` or a different step's. `found` is `False` when no step
     with that name exists in this job at all (its own P3 finding, distinct
-    from an unreadable `if:`). Identification is by DISPLAY NAME ONLY --
-    two steps in the same job may share an identical `name:` (GitHub
-    Actions does not require uniqueness); this returns the FIRST match,
-    which can silently pick the wrong one of two same-named steps. See
-    https://github.com/f-inverse/jammi-ai/issues/564."""
-    for s, e in _find_step_ranges(lines, job_start, job_end):
-        keys = _parse_step_keys(lines, s, e)
-        name = _step_display_name(keys)
-        if name != step_name:
-            continue
-        key_col = _step_key_column(lines, s, e)
-        if key_col is None:
-            return None, f"step `{step_name}`: could not determine its key column", True
-        expr, err = reconstruct_if_expr(lines, s, e, indent=key_col)
-        return expr, err, True
-    return None, None, False
+    from an unreadable `if:`). GitHub Actions does not require a step's
+    `name:` to be unique within a job; a display name matching MORE THAN
+    ONE step in this job is itself a named, fail-closed finding (`error`
+    set, `found=True`) rather than silently trusting the FIRST match --
+    the same ambiguity discipline P3's other rules already hold to (never
+    guess). See https://github.com/f-inverse/jammi-ai/issues/564."""
+    matches = [
+        (s, e)
+        for s, e in _find_step_ranges(lines, job_start, job_end)
+        if _step_display_name(_parse_step_keys(lines, s, e)) == step_name
+    ]
+    if not matches:
+        return None, None, False
+    if len(matches) > 1:
+        return (
+            None,
+            f"step `{step_name}` is not unique in this job -- {len(matches)} steps share that "
+            "display name, cannot determine which one is gated",
+            True,
+        )
+    s, e = matches[0]
+    key_col = _step_key_column(lines, s, e)
+    if key_col is None:
+        return None, f"step `{step_name}`: could not determine its key column", True
+    expr, err = reconstruct_if_expr(lines, s, e, indent=key_col)
+    return expr, err, True
 
 
 def _step_display_name(keys: dict[str, str]) -> str:
@@ -1568,34 +1578,57 @@ def _step_display_name(keys: dict[str, str]) -> str:
 
 
 def _other_publishing_steps(
-    job_node: dict, gated_step_name: str
+    job_node: dict, gated_step_name: str, composed_job_node: "exec_mod.yaml.Node | None" = None
 ) -> tuple[list[tuple[str, str]], str | None]:
     """(`[(step_name, matched_primitive), ...]`, error) for every step in
-    this job OTHER than `gated_step_name` -- a step-gated row (P3) only
-    ever pins the NAMED step's `if:`; a second, ungated publishing step in
-    the SAME job used to sail through unseen. Reads `steps:` from the
-    PARSED document via `_step_invokes_publish_primitive`, the SAME
-    reader `job_invokes_publish_primitive` uses -- never a hand-rolled
-    step-range text scan, which a quoted `uses:` or a flow-style
-    `steps: [...]` both escaped. `error` is set (matches always `[]`)
-    when this job's own `steps:` cannot be examined at all (missing, not
-    a list, or an entry that is not itself a mapping). `gated_step_name`
-    exclusion is by DISPLAY NAME ONLY -- a second, ungated step sharing
-    the SAME `name:` as the genuinely gated one is excluded here too and
-    stays invisible, the same identification gap `find_step_if_by_name`
-    carries. See https://github.com/f-inverse/jammi-ai/issues/564."""
+    this job OTHER than `gated_step_name`, PLUS this job's own job-level
+    `env:`/`strategy.matrix:` carrier if it itself matches a primitive
+    (`_job_level_primitive_match`, #565 -- a job-level carrier is by
+    definition ungated, since only a STEP carries its own `if:`) -- a
+    step-gated row (P3) only ever pins the NAMED step's `if:`; a second,
+    ungated publishing step (or job-level carrier) in the SAME job used
+    to sail through unseen. Reads `steps:` from the PARSED document via
+    `_step_invokes_publish_primitive`, the SAME reader `job_invokes_
+    publish_primitive` uses -- never a hand-rolled step-range text scan,
+    which a quoted `uses:` or a flow-style `steps: [...]` both escaped.
+    `composed_job_node`, when provided, threads this SAME job's composed
+    (pre-construction) MappingNode down to each OTHER step by index so
+    `push:` is decided by GitHub's own boolean-false spelling set (#563).
+    `error` is set (matches always `[]`) when this job's own `steps:`
+    cannot be examined at all (missing, not a list, or an entry that is
+    not itself a mapping) -- OR when `gated_step_name` itself is not
+    unique among this job's own steps (the same ambiguity `find_step_
+    if_by_name` now refuses; see
+    https://github.com/f-inverse/jammi-ai/issues/564): silently
+    excluding every step sharing the gated display name (the old
+    behaviour) could exclude the wrong one of two, so an ambiguous
+    exclusion is a named, fail-closed error instead of a guess."""
     steps = job_node.get("steps")
     if not isinstance(steps, list):
         return [], "steps: is missing or is not a list -- cannot examine"
-    out: list[tuple[str, str]] = []
+    names: list[str] = []
     for step in steps:
         if not isinstance(step, dict):
             return [], "a steps: entry is not a mapping -- cannot examine"
         name = step.get("name")
-        name = name.strip() if isinstance(name, str) else ""
+        names.append(name.strip() if isinstance(name, str) else "")
+    if names.count(gated_step_name) > 1:
+        return [], (
+            f"step `{gated_step_name}` is not unique in this job -- {names.count(gated_step_name)} "
+            "steps share that display name, cannot determine which one is gated"
+        )
+    out: list[tuple[str, str]] = []
+    job_level = _job_level_primitive_match(job_node)
+    if job_level is not None:
+        out.append(("<job-level env:/strategy.matrix:>", job_level))
+    for index, (step, name) in enumerate(zip(steps, names)):
         if name == gated_step_name:
             continue
-        primitive = _step_invokes_publish_primitive(step)
+        push_node = _composed_step_push_node(composed_job_node, index)
+        try:
+            primitive = _step_invokes_publish_primitive(step, push_node)
+        except WorkflowLoadError as exc:
+            return [], f"step `{name or '<unnamed step>'}`: {exc}"
         if primitive is not None:
             out.append((name or "<unnamed step>", primitive))
     return out, None
@@ -1637,8 +1670,11 @@ def check_promotion_table(workflow_texts: dict[str, str], manifest: dict) -> lis
         lines = text.splitlines()
         # Parsed-document twin, needed only by the step-gated (`step_name`)
         # branch below -- the second-ungated-publishing-step check reads
-        # `steps:` from here, never from a text-range scan.
+        # `steps:` from here, never from a text-range scan. `composed_
+        # jobs` is its RAW-node sibling (#563), needed so a second step's
+        # own `push:` is decided by GitHub's own boolean-false spelling.
         parsed_jobs, parsed_jobs_err = _parsed_jobs_or_fail(text)
+        composed_jobs, _ = _composed_jobs_or_fail(text)
 
         promo_range = jobs.get(row.promoting_job)
         if promo_range is None:
@@ -1764,7 +1800,9 @@ def check_promotion_table(workflow_texts: dict[str, str], manifest: dict) -> lis
                         "missing from the parsed document -- cannot examine its steps"
                     )
                 else:
-                    other_matches, other_err = _other_publishing_steps(promo_node, row.step_name)
+                    other_matches, other_err = _other_publishing_steps(
+                        promo_node, row.step_name, composed_jobs.get(row.promoting_job)
+                    )
                     if other_err is not None:
                         findings.append(
                             f"P3: row `{key}`: {row.workflow}'s promoting job `{row.promoting_job}`'s "
@@ -1823,32 +1861,255 @@ _SIMPLE_PRIMITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 # hold the literal `push: false`/`push: "false"` (see `_step_push_is_
 # promoting`, below -- read from the parsed document, never a text regex).
 _DOCKER_BUILD_PUSH_ACTION_RE = re.compile(r"docker/build-push-action(?:@|\b)")
-_LOCAL_DOCKER_PUBLISH_VALUE_RE = re.compile(r"^\./\.github/actions/docker-publish\b")
-_CROSS_REPO_DOCKER_PUBLISH_VALUE_RE = re.compile(r"^[\w.-]+/[\w.-]+/\.github/actions/docker-publish@")
 
-# `release-upload`: unconditional (unlike docker-publish, this action has no
-# `push: false`-shaped build-only mode -- every call is a real upload).
-_LOCAL_RELEASE_UPLOAD_VALUE_RE = re.compile(r"^\./\.github/actions/release-upload\b")
-_CROSS_REPO_RELEASE_UPLOAD_VALUE_RE = re.compile(r"^[\w.-]+/[\w.-]+/\.github/actions/release-upload@")
+# A LOCAL composite action (this repo's own `.github/actions/<name>/`) or a
+# CROSS-REPO action reference SHAPED like one (`owner/repo/.github/actions/
+# <name>@ref` -- the same subpath convention `_local_reusable_workflow_
+# target`/`_cross_repo_reusable_workflow_target` already read for REUSABLE
+# WORKFLOWS, restated for ACTIONS). #F4 audit fix: a step calling a LOCAL
+# action used to be recognised ONLY by two hand-named literal path strings
+# (`./.github/actions/docker-publish`, `./.github/actions/release-upload`)
+# -- ANY other local composite action, including one an author adds later
+# that itself invokes a publishing primitive, was entirely invisible. The
+# name-keyed constants are deleted; `_composite_action_structure` (below)
+# RESOLVES and EXAMINES the target's own `action.yml` instead, through the
+# SAME readers every other rule in this module uses (`load_workflow_text`,
+# `_step_scalar_values`/`_SIMPLE_PRIMITIVE_PATTERNS`). A cross-repo action
+# reference in this SAME shape is refused as unexaminable by construction,
+# exactly like a cross-repo reusable WORKFLOW -- never opened, never
+# silently passed.
+_LOCAL_ACTION_USES_PREFIX = "./.github/actions/"
+_CROSS_REPO_ACTION_USES_RE = re.compile(r"^[\w.-]+/[\w.-]+/\.github/actions/(.+)@")
 
 
-def _step_push_is_promoting(step_node: dict) -> bool:
+def _local_action_target(uses: str) -> str | None:
+    """The `<name>` in a LOCAL composite-action reference `uses: ./.github/
+    actions/<name>` (optionally with a trailing `@ref`, or a nested
+    subpath under `<name>` -- the directory's own top segment is what this
+    module resolves `action.yml` under). `None` when `uses` does not name
+    a local action this way."""
+    if not uses.startswith(_LOCAL_ACTION_USES_PREFIX):
+        return None
+    rest = uses[len(_LOCAL_ACTION_USES_PREFIX) :].split("@", 1)[0]
+    name = rest.split("/", 1)[0]
+    return name or None
+
+
+def _cross_repo_action_target(uses: str) -> str | None:
+    """The `<name>` in a CROSS-REPO action reference `uses: <owner>/<repo>/
+    .github/actions/<name>@<ref>` -- `None` for an ordinary marketplace
+    action (`actions/checkout@v4`, which carries no `.github/actions/`
+    path segment at all) or a local reference (`_local_action_target`'s
+    own concern)."""
+    m = _CROSS_REPO_ACTION_USES_RE.match(uses)
+    return m.group(1) if m else None
+
+
+# Patchable in a test via `mock.patch.object(cgo, "_ACTIONS_DIR", ...)` so
+# a synthetic action tree never has to touch this repo's real
+# `.github/actions/` -- mirrors `WORKFLOWS_DIR`'s own role for workflows.
+_ACTIONS_DIR = REPO_ROOT / ".github" / "actions"
+
+
+def _local_action_yml_text(action_name: str) -> tuple[str | None, str | None]:
+    """(text, error) for `.github/actions/<action_name>/action.yml` (or
+    the `.yaml` spelling) -- the ONE place this module reads a composite
+    action's own definition from disk, behind a patchable module-level
+    function rather than an inline `Path.read_text` at every call site.
+    `error` names why when neither extension exists or the file cannot be
+    read; `text` is `None` in that case."""
+    for ext in ("action.yml", "action.yaml"):
+        path = _ACTIONS_DIR / action_name / ext
+        if path.is_file():
+            try:
+                return path.read_text(encoding="utf-8"), None
+            except OSError as exc:
+                return None, f"cannot read {path}: {exc}"
+    return None, f"no action.yml/action.yaml found under .github/actions/{action_name}/"
+
+
+def _composite_action_steps_or_fail(text: str) -> tuple[list[dict], str | None]:
+    """The `runs.steps:` list of a composite action document (`runs.
+    using: "composite"`), read from the SAME fail-loud PyYAML loader
+    every workflow document goes through (`load_workflow_text` -- an
+    action.yml's own top level is a mapping just like a workflow's).
+    `[]`, error when `runs:`/`runs.steps:` is absent, this is NOT a
+    composite action (a Docker or JavaScript action carries no `steps:`
+    this module can examine -- a NAMED refusal, never silently "no
+    primitive found"), or a step entry is not itself a mapping."""
+    try:
+        doc = load_workflow_text(text)
+    except WorkflowLoadError as exc:
+        return [], str(exc)
+    runs = doc.get("runs")
+    if not isinstance(runs, dict):
+        return [], "action.yml has no runs: mapping -- cannot examine"
+    using = runs.get("using")
+    if using != "composite":
+        return [], f"action.yml's runs.using is {using!r}, not 'composite' -- cannot examine its own steps"
+    steps = runs.get("steps")
+    if not isinstance(steps, list):
+        return [], "action.yml's runs.steps is missing or not a list -- cannot examine"
+    for step in steps:
+        if not isinstance(step, dict):
+            return [], "an action.yml runs.steps entry is not a mapping -- cannot examine"
+    return steps, None
+
+
+@dataclass(frozen=True)
+class _ActionStructure:
+    """The result of examining ONE local composite action's own
+    `runs.steps:`. `unconditional_primitive`: the display name of an
+    `_SIMPLE_PRIMITIVE_PATTERNS` match found anywhere in this action's
+    OWN steps (or a nested local action it itself calls) -- unconditional
+    because these markers carry no `push:`-shaped build-only mode.
+    `wraps_docker_build_push`: `True` when one of this action's OWN steps
+    itself `uses: docker/build-push-action` -- the CALLER of THIS action
+    decides promotion via ITS OWN `with.push` (this module cannot resolve
+    an inner `${{ inputs.push }}` expression against the outer caller's
+    value any other way; `release-upload`'s real shape needs no such
+    resolution -- its own `gh release create`/`upload` commands are
+    unconditional `run:` text, caught directly as `unconditional_
+    primitive` with no special-casing by name)."""
+
+    unconditional_primitive: str | None
+    wraps_docker_build_push: bool
+
+
+_MAX_LOCAL_ACTION_DEPTH = 10
+
+
+def _composite_action_structure(
+    action_name: str,
+    memo: dict[str, tuple["_ActionStructure | None", WorkflowLoadError | None]],
+    depth: int,
+) -> "_ActionStructure":
+    """Examine the LOCAL composite action `action_name`'s own `runs.
+    steps:`, recursing into any FURTHER local action `uses:` those steps
+    themselves carry -- memoized by `action_name`, depth-bounded by
+    `_MAX_LOCAL_ACTION_DEPTH`, the SAME diamond/cycle discipline
+    `_traverse_local_reusable` holds job-level `uses:` to (#561),
+    restated for step-level composite actions (#F4). A CROSS-REPO
+    `uses:` reached from one of this action's own steps is refused BY
+    NAME (`_cross_repo_action_target`), never opened. Raises
+    `WorkflowLoadError` -- naming what could not be examined and why --
+    on a missing/unreadable action.yml, a non-composite action, a
+    cycle, or an unexaminable nested step; `memo` mirrors `_traverse_
+    local_reusable`'s own precedence (an already-memoized refusal is
+    RE-raised, never silently `None`)."""
+    if action_name in memo:
+        structure, refusal = memo[action_name]
+        if refusal is not None:
+            raise refusal
+        assert structure is not None
+        return structure
+    if depth > _MAX_LOCAL_ACTION_DEPTH:
+        refusal = WorkflowLoadError(
+            f"local action uses: chain exceeds the max examined depth ({_MAX_LOCAL_ACTION_DEPTH}) "
+            f"reaching {action_name!r} -- refusing to keep recursing (a uses: cycle, or a "
+            "pathologically deep local-action chain)"
+        )
+        memo[action_name] = (None, refusal)
+        raise refusal
+    text, read_err = _local_action_yml_text(action_name)
+    if read_err is not None:
+        refusal = WorkflowLoadError(f"local action {action_name!r}: {read_err}")
+        memo[action_name] = (None, refusal)
+        raise refusal
+    steps, steps_err = _composite_action_steps_or_fail(text)
+    if steps_err is not None:
+        refusal = WorkflowLoadError(f"local action {action_name!r}: {steps_err}")
+        memo[action_name] = (None, refusal)
+        raise refusal
+    unconditional: str | None = None
+    wraps = False
+    refusal_messages: list[str] = []
+    for step in steps:
+        if unconditional is None:
+            step_text = "\n".join(_step_scalar_values(step))
+            for label, pattern in _SIMPLE_PRIMITIVE_PATTERNS:
+                if pattern.search(step_text):
+                    unconditional = label
+                    break
+        uses = step.get("uses")
+        if not isinstance(uses, str):
+            continue
+        if _DOCKER_BUILD_PUSH_ACTION_RE.search(uses):
+            wraps = True
+        cross_target = _cross_repo_action_target(uses)
+        if cross_target is not None:
+            refusal_messages.append(
+                f"step {step.get('name')!r} uses a CROSS-REPO action ({uses!r}) -- unexaminable by "
+                "construction (this gate cannot open another repo's file)"
+            )
+            continue
+        nested_name = _local_action_target(uses)
+        if nested_name is not None:
+            try:
+                nested = _composite_action_structure(nested_name, memo, depth + 1)
+            except WorkflowLoadError as exc:
+                refusal_messages.append(str(exc))
+                continue
+            if unconditional is None and nested.unconditional_primitive is not None:
+                unconditional = f"{nested.unconditional_primitive} (via action {nested_name})"
+    if refusal_messages:
+        if len(refusal_messages) == 1:
+            detail = f"an unexaminable step: {refusal_messages[0]}"
+        else:
+            detail = f"{len(refusal_messages)} unexaminable steps: " + " | ".join(refusal_messages)
+        combined = WorkflowLoadError(f"local action {action_name!r} reaches {detail}")
+        memo[action_name] = (None, combined)
+        raise combined
+    structure = _ActionStructure(unconditional, wraps)
+    memo[action_name] = (structure, None)
+    return structure
+
+
+def _step_push_is_promoting(step_node: dict, push_node: "exec_mod.yaml.Node | None" = None) -> bool:
     """Fail-closed: a step's own `with:` mapping decides `push:` -- absent
-    entirely, unparseable (`with:` not a mapping, or no `push:` key), or
-    ANY value other than the exact literal `False` / `"false"` is
-    PROMOTING. Read entirely from the parsed step mapping; no text regex
-    on `push:` remains anywhere in this module. Known gap: `False` here
-    is whatever PyYAML's own SafeLoader already constructed a bare
-    scalar into, and PyYAML's YAML-1.1 boolean set (`off`/`no`/`n`, ...)
-    is WIDER than GitHub Actions' own (`false`/`False`/`FALSE` only) --
-    a bare `push: off` reads as Python `False` here but is a STRING to
-    GitHub's own resolver, not a boolean. See
+    entirely, or unparseable (`with:` not a mapping, or no `push:` key),
+    is PROMOTING. Otherwise decided from `push_node`, the COMPOSED
+    (pre-construction) scalar node for this SAME step's own `with.push`
+    (`_composed_step_push_node`) -- restricted to EXACTLY GitHub Actions'
+    own two-spelling boolean-false set: bare `false`/`False`/`FALSE`, or
+    the quoted string `"false"`/`'false'` (`_step_push_raw_is_false_
+    spelling`). Never the already-constructed Python value `with_value
+    ["push"]`: PyYAML's SafeLoader resolves a WIDER YAML-1.1 boolean set
+    (`off`/`no`/`n`, and case variants) into the SAME Python `False` a
+    bare `false` resolves into, so a bare `push: off` used to read as
+    Python `False` here and was called not-promoting even though GitHub
+    Actions' own resolver treats `off` as a STRING, never a boolean.
+    `push_node=None` (no composed twin offered) is ALSO fail-closed to
+    PROMOTING for any non-empty `push:` key -- it never falls back to
+    the constructed value's own wider notion of false. See
     https://github.com/f-inverse/jammi-ai/issues/563."""
     with_value = step_node.get("with")
     if not isinstance(with_value, dict) or "push" not in with_value:
         return True
-    push = with_value["push"]
-    return not (push is False or push == "false")
+    return not _step_push_raw_is_false_spelling(push_node)
+
+
+def _flatten_string_scalars(value: object) -> list[str]:
+    """Every STRING scalar reachable from `value`, recursively through
+    lists and mappings -- a YAML SEQUENCE or nested mapping under
+    `with:`/`env:`/`strategy.matrix:` carries an author's publish command
+    just as readily as a bare top-level scalar does (`with: {args: [-c,
+    "cargo publish"]}`, `strategy.matrix.cmd: ["cargo publish"]`). A
+    bool/number/`None` contributes nothing (cannot itself match a
+    substring pattern). See https://github.com/f-inverse/jammi-ai/issues/565."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            out.extend(_flatten_string_scalars(item))
+        return out
+    if isinstance(value, dict):
+        out = []
+        for item in value.values():
+            out.extend(_flatten_string_scalars(item))
+        return out
+    return []
 
 
 def _step_scalar_values(step_node: dict) -> list[str]:
@@ -1858,9 +2119,12 @@ def _step_scalar_values(step_node: dict) -> list[str]:
     including `with.command`/`with.script`/`with.args`/`with.entrypoint`/
     `env`-carried markers, never `run`/`uses` alone.
     `name`/`id`/`if` are deliberately EXCLUDED: identifiers and
-    conditions, never invocation content. A non-string `with:`/`env:`
-    value (a bool, a number) cannot itself match a substring pattern and
-    contributes nothing here."""
+    conditions, never invocation content. A non-string, non-list,
+    non-mapping `with:`/`env:` value (a bool, a number) cannot itself
+    match a substring pattern and contributes nothing here; a LIST or
+    MAPPING of strings (a YAML sequence, e.g. `with: {args: [...]}`) CAN
+    (`_flatten_string_scalars`) -- see
+    https://github.com/f-inverse/jammi-ai/issues/565."""
     values: list[str] = []
     for key in ("run", "uses"):
         v = step_node.get(key)
@@ -1869,22 +2133,76 @@ def _step_scalar_values(step_node: dict) -> list[str]:
     for key in ("with", "env"):
         mapping = step_node.get(key)
         if isinstance(mapping, dict):
-            values.extend(v for v in mapping.values() if isinstance(v, str))
+            values.extend(_flatten_string_scalars(mapping))
     return values
 
 
-def _step_invokes_publish_primitive(step_node: dict) -> str | None:
+def _job_level_scalar_values(job_node: dict) -> list[str]:
+    """Every STRING scalar reachable from this job's OWN `env:` mapping
+    and `strategy.matrix:` mapping (flattened through lists/mappings via
+    `_flatten_string_scalars`) -- a `run:` step that only ever
+    REFERENCES one of these by name (`$CMD`, `${{ matrix.cmd }}`) never
+    itself spells the primitive; the marker lives at the JOB level
+    instead. Shared by `job_invokes_publish_primitive` and `_other_
+    publishing_steps`, neither of which previously searched a job-level
+    carrier at all. See https://github.com/f-inverse/jammi-ai/issues/565."""
+    values: list[str] = []
+    env = job_node.get("env")
+    if isinstance(env, dict):
+        values.extend(_flatten_string_scalars(env))
+    strategy = job_node.get("strategy")
+    if isinstance(strategy, dict) and "matrix" in strategy:
+        values.extend(_flatten_string_scalars(strategy["matrix"]))
+    return values
+
+
+def _job_level_primitive_match(job_node: dict) -> str | None:
+    """The matched primitive's display name if this job's OWN job-level
+    `env:`/`strategy.matrix:` values (`_job_level_scalar_values`) carry
+    one of `_SIMPLE_PRIMITIVE_PATTERNS` -- searched ONCE per job over the
+    SAME substring patterns every step's own scalars are searched
+    against, so a job-level carrier is never a separate, independently-
+    drifting rule. This is an OVER-approximation on purpose (a job-level
+    marker with no step that could ever reference it still produces one
+    finding) -- the safe direction, never a missed one."""
+    text = "\n".join(_job_level_scalar_values(job_node))
+    for label, pattern in _SIMPLE_PRIMITIVE_PATTERNS:
+        if pattern.search(text):
+            return f"{label} (job-level env:/strategy.matrix:)"
+    return None
+
+
+def _step_invokes_publish_primitive(
+    step_node: dict,
+    push_node: "exec_mod.yaml.Node | None" = None,
+    _action_memo: dict[str, tuple["_ActionStructure | None", WorkflowLoadError | None]] | None = None,
+) -> str | None:
     """The matched primitive's display name for ONE step, read entirely
     from the parsed document, or `None`. `_SIMPLE_PRIMITIVE_PATTERNS` are
     searched over EVERY scalar `_step_scalar_values` returns (a shell
     command, an action reference, or an input/env value all have no
     YAML-quoting escape once read from the parsed value). `docker/build-
-    push-action` and the docker-publish/release-upload actions (local and
-    cross-repo) match on the parsed `uses:` scalar specifically, with
-    `push:` decided by this SAME step's own `with:` mapping
-    (`_step_push_is_promoting`). This is the ONE reader both
-    `job_invokes_publish_primitive` (every step in a job) and
-    `_other_publishing_steps` (every step but a job's gated one) use."""
+    push-action`, invoked DIRECTLY, matches on the parsed `uses:` scalar,
+    with `push:` decided by this SAME step's own `with:` mapping
+    (`_step_push_is_promoting`, given `push_node` -- this step's own
+    COMPOSED `with.push` node, or `None` when the caller has none to
+    offer, which is fail-closed to promoting).
+
+    A LOCAL composite action (`uses: ./.github/actions/<name>`) is
+    RESOLVED and EXAMINED (#F4 -- `_composite_action_structure`, never a
+    name-keyed literal-path match): its own unconditional primitive (if
+    any) is reported directly; if it wraps `docker/build-push-action`
+    instead, THIS step's own `push_node` still decides promotion, since
+    the action's own inner `${{ inputs.push }}` expression cannot be
+    resolved any other way. A CROSS-REPO action in the SAME
+    `owner/repo/.github/actions/<name>@ref` shape is refused as
+    UNEXAMINABLE by construction, exactly like a cross-repo reusable
+    WORKFLOW. Raises `WorkflowLoadError` when a LOCAL action's own
+    examination cannot be completed (missing/unreadable action.yml, not
+    composite, a cycle, or an unexaminable nested step) -- never silently
+    `None`; callers (`job_invokes_publish_primitive`, `_other_publishing_
+    steps`) turn this into a named finding. This is the ONE reader both
+    of those use."""
     text = "\n".join(_step_scalar_values(step_node))
     for label, pattern in _SIMPLE_PRIMITIVE_PATTERNS:
         if pattern.search(text):
@@ -1893,31 +2211,66 @@ def _step_invokes_publish_primitive(step_node: dict) -> str | None:
     if not isinstance(uses, str):
         return None
     if _DOCKER_BUILD_PUSH_ACTION_RE.search(uses):
-        return "docker/build-push-action (push != false)" if _step_push_is_promoting(step_node) else None
-    if _LOCAL_DOCKER_PUBLISH_VALUE_RE.match(uses) or _CROSS_REPO_DOCKER_PUBLISH_VALUE_RE.match(uses):
-        return "./.github/actions/docker-publish (push != false)" if _step_push_is_promoting(step_node) else None
-    if _LOCAL_RELEASE_UPLOAD_VALUE_RE.match(uses) or _CROSS_REPO_RELEASE_UPLOAD_VALUE_RE.match(uses):
-        return "./.github/actions/release-upload"
+        return "docker/build-push-action (push != false)" if _step_push_is_promoting(step_node, push_node) else None
+    local_action = _local_action_target(uses)
+    if local_action is not None:
+        if _action_memo is None:
+            _action_memo = {}
+        structure = _composite_action_structure(local_action, _action_memo, 1)
+        if structure.unconditional_primitive is not None:
+            return f"{structure.unconditional_primitive} (via action {local_action})"
+        if structure.wraps_docker_build_push:
+            return (
+                f"./.github/actions/{local_action} (push != false)"
+                if _step_push_is_promoting(step_node, push_node)
+                else None
+            )
+        return None
+    cross_action = _cross_repo_action_target(uses)
+    if cross_action is not None:
+        return f"cross-repo action {uses!r} -- unexaminable by construction (this gate cannot open another repo's file)"
     return None
 
 
-def job_invokes_publish_primitive(job_node: dict) -> tuple[str | None, str | None]:
-    """(primitive, error). `primitive` is the matched display name for the
-    first (in order) step that invokes one -- a job whose steps invoke ANY
-    listed primitive is a "promotion job" for P6's purposes: it must be
-    listed in `PROMOTION_TABLE` (any row, any gate_kind) or this gate
-    fails by name. Reads every step from the PARSED document via
-    `_step_invokes_publish_primitive`. `error` is set (primitive always
-    `None`) the moment any step entry is not itself a mapping (never valid
-    GitHub Actions, but not assumed here) -- a named finding, never a
-    silent skip, consistent with `_other_publishing_steps`'s identical
-    rule. A job-level `uses:` (this job itself delegating to another
-    workflow, carrying no `steps:` of its own) is a SEPARATE, fail-closed
-    rule `check_p6_discovery` applies directly -- see its own docstring."""
-    for step in job_node.get("steps") or []:
+def job_invokes_publish_primitive(
+    job_node: dict, composed_job_node: "exec_mod.yaml.Node | None" = None
+) -> tuple[str | None, str | None]:
+    """(primitive, error). `primitive` is the matched display name for
+    this job's OWN job-level `env:`/`strategy.matrix:` carrier
+    (`_job_level_primitive_match`) if any, else the first (in order)
+    step that invokes one -- a job whose steps (or job-level env/matrix)
+    invoke ANY listed primitive is a "promotion job" for P6's purposes:
+    it must be listed in `PROMOTION_TABLE` (any row, any gate_kind) or
+    this gate fails by name. Reads every step from the PARSED document
+    via `_step_invokes_publish_primitive`, given `composed_job_node` --
+    this SAME job's own composed (pre-construction) MappingNode, or
+    `None` -- threaded down to each step BY INDEX (`_composed_step_
+    push_node`) so `push:` is decided by GitHub's own boolean-false
+    spelling set, never PyYAML's wider one (#563).
+
+    `steps:` ABSENT entirely is NOT an error here (unlike `_other_
+    publishing_steps`, which is only ever called once a step-gated
+    `PROMOTION_TABLE` row already asserts a specific step must exist in
+    THIS job -- there, an absent `steps:` really is a break; here, a job
+    may legitimately carry NO `steps:` at all when it instead carries a
+    job-level `uses:`, examined by a SEPARATE rule in `check_p6_
+    discovery`). `steps:` PRESENT but not a list (`steps: 5`) IS a named
+    finding, never an uncaught `TypeError` from iterating a non-iterable
+    -- see https://github.com/f-inverse/jammi-ai/issues/565."""
+    steps = job_node.get("steps")
+    if steps is not None and not isinstance(steps, list):
+        return None, "steps: is present but is not a list -- cannot examine"
+    job_level = _job_level_primitive_match(job_node)
+    if job_level is not None:
+        return job_level, None
+    for index, step in enumerate(steps or []):
         if not isinstance(step, dict):
             return None, "a steps: entry is not a mapping -- cannot examine"
-        found = _step_invokes_publish_primitive(step)
+        push_node = _composed_step_push_node(composed_job_node, index)
+        try:
+            found = _step_invokes_publish_primitive(step, push_node)
+        except WorkflowLoadError as exc:
+            return None, str(exc)
         if found is not None:
             return found, None
     return None, None
@@ -2056,6 +2409,101 @@ def _parsed_jobs_or_fail(text: str) -> tuple[dict[str, dict], str | None]:
     return result, None
 
 
+def _composed_jobs_or_fail(text: str) -> tuple[dict[str, "exec_mod.yaml.Node"], str | None]:
+    """{job_id: composed job MappingNode} via `yaml.compose` -- the RAW
+    node twin of `_parsed_jobs_or_fail`'s constructed dict, needed
+    wherever a scalar's ORIGINAL YAML spelling (quoted vs bare, and the
+    bare spelling itself) decides the outcome, never PyYAML's already-
+    resolved Python value (`_step_push_raw_is_false_spelling`, #563:
+    PyYAML's SafeLoader constructs a bare `off`/`no`/`n`/... into the
+    SAME Python `False` a bare `false` constructs into, but GitHub
+    Actions' own resolver treats only `false`/`False`/`FALSE` as
+    boolean-false -- the distinction is only visible in the composed
+    node's raw `.value`/`.style`, never in the already-constructed
+    object). Whenever `_parsed_jobs_or_fail` on the SAME text succeeds,
+    this always succeeds too: `yaml.load` composes the identical node
+    tree before constructing it, so a composition failure would already
+    be a construction failure -- callers that already hold a successful
+    `_parsed_jobs_or_fail` result for this SAME text may treat `error`
+    here as unreachable in practice, but it is still returned, never
+    swallowed, for a caller with no such guarantee."""
+    if exec_mod.yaml is None:
+        return {}, exec_mod._MISSING_PYYAML_MESSAGE.format(exec_mod._YAML_IMPORT_ERROR)
+    try:
+        root = exec_mod.yaml.compose(text, Loader=exec_mod.yaml.SafeLoader)
+    except exec_mod.yaml.YAMLError as exc:
+        return {}, f"cannot parse YAML: {exc}"
+    if root is None or not isinstance(root, exec_mod.yaml.MappingNode):
+        return {}, "workflow document's top level is not a mapping"
+    jobs_node = None
+    for key_node, value_node in root.value:
+        if isinstance(key_node, exec_mod.yaml.ScalarNode) and key_node.value == "jobs":
+            jobs_node = value_node
+            break
+    if jobs_node is None or not isinstance(jobs_node, exec_mod.yaml.MappingNode):
+        return {}, "no top-level jobs: mapping"
+    result: dict[str, "exec_mod.yaml.Node"] = {}
+    for key_node, value_node in jobs_node.value:
+        result[str(key_node.value)] = value_node
+    return result, None
+
+
+def _composed_step_push_node(job_composed: "exec_mod.yaml.Node | None", step_index: int) -> "exec_mod.yaml.Node | None":
+    """The composed (pre-construction) ScalarNode for `with.push` on the
+    step at `step_index` under `job_composed`'s own `steps:` sequence --
+    `None` when `job_composed` is `None` (no composed twin offered), or
+    the shape is anything but exactly that (missing `steps:`, index out
+    of range, `with:` absent/not a mapping, no `push:` key). Index-
+    aligned with the CONSTRUCTED `steps:` list every caller already
+    iterates -- PyYAML preserves sequence order identically between
+    `compose` and `load`, since `load` composes then constructs the same
+    node tree."""
+    if job_composed is None or not isinstance(job_composed, exec_mod.yaml.MappingNode):
+        return None
+    steps_node = None
+    for key_node, value_node in job_composed.value:
+        if isinstance(key_node, exec_mod.yaml.ScalarNode) and key_node.value == "steps":
+            steps_node = value_node
+            break
+    if not isinstance(steps_node, exec_mod.yaml.SequenceNode):
+        return None
+    if step_index >= len(steps_node.value):
+        return None
+    step_node = steps_node.value[step_index]
+    if not isinstance(step_node, exec_mod.yaml.MappingNode):
+        return None
+    with_node = None
+    for key_node, value_node in step_node.value:
+        if isinstance(key_node, exec_mod.yaml.ScalarNode) and key_node.value == "with":
+            with_node = value_node
+            break
+    if not isinstance(with_node, exec_mod.yaml.MappingNode):
+        return None
+    for key_node, value_node in with_node.value:
+        if isinstance(key_node, exec_mod.yaml.ScalarNode) and key_node.value == "push":
+            return value_node
+    return None
+
+
+_GITHUB_FALSE_BARE_SPELLINGS = frozenset({"false", "False", "FALSE"})
+
+
+def _step_push_raw_is_false_spelling(push_node: "exec_mod.yaml.Node | None") -> bool:
+    """`True` exactly when `push_node` (a COMPOSED, pre-construction YAML
+    scalar node) spells one of GitHub Actions' own two boolean-false
+    forms: bare (unquoted) `false`/`False`/`FALSE`, or the quoted string
+    `"false"`/`'false'`. `push_node` absent, not a scalar node, or
+    spelled ANY other way PyYAML's own WIDER YAML-1.1 boolean set would
+    also fold to Python `False` (`off`/`Off`/`OFF`/`no`/`No`/`NO`/`n`/
+    `N`, and case variants) returns `False` here too (fail-closed --
+    promoting). See https://github.com/f-inverse/jammi-ai/issues/563."""
+    if push_node is None or not isinstance(push_node, exec_mod.yaml.ScalarNode):
+        return False
+    if push_node.style in ("'", '"'):
+        return push_node.value == "false"
+    return push_node.value in _GITHUB_FALSE_BARE_SPELLINGS
+
+
 def _resolved_exempt_step_scan_names(workflow_texts: dict[str, str]) -> set[str]:
     """The discovered-on-disk spellings (either extension) of every
     workflow this module scans directly by NAME instead of resolving via
@@ -2069,43 +2517,195 @@ def _resolved_exempt_step_scan_names(workflow_texts: dict[str, str]) -> set[str]
     return names
 
 
+# #561 audit fix: bounds the `uses:` traversal with a NAMED refusal
+# rather than trusting a memo/cycle-guard alone (or, worse, an uncaught
+# `RecursionError`) -- comfortably above GitHub Actions' own reusable-
+# workflow nesting limit (4), far below Python's default recursion limit.
+_MAX_LOCAL_USES_DEPTH = 10
+
+
+def _traverse_local_reusable(
+    resolved: str,
+    workflow_texts: dict[str, str],
+    memo: dict[str, tuple[str | None, WorkflowLoadError | None]],
+    depth: int,
+) -> str | None:
+    """Examine EVERY job inside the LOCAL reusable workflow named by
+    `resolved` (already a key in `workflow_texts`) for a publishing
+    primitive, recursing into any FURTHER local job-level `uses:` each of
+    those jobs itself carries. `None` (fully examined, transitively
+    clean) or the matched primitive's display name; raises
+    `WorkflowLoadError` -- naming what could not be examined and why --
+    on anything this cannot resolve. See
+    https://github.com/f-inverse/jammi-ai/issues/561.
+
+    DIAMOND: memoized by `resolved` -- the same reusable reached from two
+    different callers, or two different sibling jobs, is walked exactly
+    once per top-level `check_p6_discovery` scan (`memo` is created once
+    there and threaded through); every subsequent lookup reuses the
+    memoized (found, refusal) pair, RE-RAISING an already-memoized
+    refusal so a caller reached second sees the identical named refusal
+    a caller reached first already surfaced, never a silent `None`.
+
+    CYCLE: `depth` bounds the walk (`_MAX_LOCAL_USES_DEPTH`) -- a genuine
+    `uses:` cycle (A -> B -> A) terminates in a NAMED refusal, never an
+    uncaught `RecursionError`.
+
+    SELF-MASK: for every sub-job, this OWN direct-match result never
+    short-circuits examining that SAME sub-job's own further job-level
+    `uses:` -- both are always computed, unconditionally (GitHub Actions
+    itself makes `uses:` and `steps:` mutually exclusive at the job
+    level, so a REAL job never carries both, but a synthetic/malformed
+    document is not assumed impossible here).
+
+    DANGLING: a sub-job's job-level `uses:` naming a workflow that does
+    not exist anywhere in the discovered tree is its own named refusal,
+    distinct from "exists but its own jobs are unexaminable".
+
+    CROSS-REPO (the a895b148 gap this issue closes): a sub-job's
+    job-level `uses:` to a CROSS-REPO workflow, reached ANYWHERE in this
+    reachable set, is its OWN named, UNEXAMINABLE refusal -- this repo's
+    own gate can never open another repo's file, so it can never be
+    silently treated as "no delegation" the way the pre-a895b148
+    traversal did (`_local_reusable_workflow_target` alone returned
+    `None` for it, so the old recursive reader never even looked at it).
+
+    EVERY refusing reusable reached from `resolved`'s own jobs is named
+    in the raised message, never only the first; a multi-hop refusal
+    folds the resolved target onto the FRONT of the message, so the
+    finding reads as the true edge sequence (caller -> mid -> bad),
+    never a flattened or missing hop -- the caller of this function
+    prepends its own hop when it re-raises."""
+    if resolved in memo:
+        found, refusal = memo[resolved]
+        if refusal is not None:
+            raise refusal
+        return found
+    if depth > _MAX_LOCAL_USES_DEPTH:
+        refusal = WorkflowLoadError(
+            f"uses: chain exceeds the max examined depth ({_MAX_LOCAL_USES_DEPTH}) reaching "
+            f"{resolved!r} -- refusing to keep recursing (a uses: cycle, or a pathologically deep "
+            "reusable chain)"
+        )
+        memo[resolved] = (None, refusal)
+        raise refusal
+    target_text = workflow_texts[resolved]
+    sub_jobs, jobs_err = _parsed_jobs_or_fail(target_text)
+    if jobs_err is not None:
+        refusal = WorkflowLoadError(
+            f"uses local reusable workflow {resolved!r}, whose jobs: cannot be examined: {jobs_err}"
+        )
+        memo[resolved] = (None, refusal)
+        raise refusal
+    composed_sub_jobs, _ = _composed_jobs_or_fail(target_text)
+    found_result: str | None = None
+    refusal_messages: list[str] = []
+    for sub_job_id in sorted(sub_jobs):
+        sub_node = sub_jobs[sub_job_id]
+        composed_sub_node = composed_sub_jobs.get(sub_job_id)
+        direct, direct_err = job_invokes_publish_primitive(sub_node, composed_sub_node)
+        if direct_err is not None:
+            refusal_messages.append(f"job {sub_job_id!r}: {direct_err}")
+            continue
+        sub_found = direct
+        # SELF-MASK: `direct` above (or lack of it) never gates whether
+        # this sub-job's OWN job-level `uses:` is examined too.
+        cross_target = _cross_repo_reusable_workflow_target(sub_node)
+        if cross_target is not None:
+            refusal_messages.append(
+                f"job {sub_job_id!r} has a job-level uses: to a CROSS-REPO workflow "
+                f"({cross_target!r}) -- unexaminable by construction (this gate cannot open "
+                "another repo's file)"
+            )
+            continue
+        local_target = _local_reusable_workflow_target(sub_node)
+        if local_target is not None:
+            resolved_sub = resolve_workflow(workflow_texts, local_target)
+            if resolved_sub is None:
+                refusal_messages.append(
+                    f"job {sub_job_id!r} uses local reusable workflow {local_target!r}, which does "
+                    "not exist anywhere in the discovered workflow tree (dangling target) -- cannot "
+                    "examine"
+                )
+                continue
+            try:
+                nested_found = _traverse_local_reusable(resolved_sub, workflow_texts, memo, depth + 1)
+            except WorkflowLoadError as exc:
+                refusal_messages.append(str(exc))
+                continue
+            if nested_found is not None and sub_found is None:
+                sub_found = f"{nested_found} (via {resolved_sub})"
+        if sub_found is not None and found_result is None:
+            found_result = sub_found
+    if refusal_messages:
+        # Every refusing reusable reached from `resolved`'s own jobs is
+        # named, never only the first.
+        if len(refusal_messages) == 1:
+            detail = f"an unexaminable reusable: {refusal_messages[0]}"
+        else:
+            detail = f"{len(refusal_messages)} unexaminable reusables: " + " | ".join(refusal_messages)
+        combined = WorkflowLoadError(f"uses local reusable workflow {resolved!r}, which reaches {detail}")
+        memo[resolved] = (None, combined)
+        raise combined
+    memo[resolved] = (found_result, None)
+    return found_result
+
+
 def check_p6_discovery(workflow_texts: dict[str, str]) -> list[str]:
-    """PROPERTY (fail-closed, no traversal into a delegate's own jobs): a
-    merge-path job is a "promotion job" for P6's purposes when EITHER (a)
-    one of its own steps invokes a listed primitive directly
+    """PROPERTY: a merge-path job is a "promotion job" for P6's purposes
+    when EITHER (a) one of its own steps (or its own job-level `env:`/
+    `strategy.matrix:`) invokes a listed primitive directly
     (`job_invokes_publish_primitive`), OR (b) it carries a job-level
-    `uses:` delegating to ANY other workflow at all -- local, cross-repo,
-    a dangling target, quoted, a `+`-bearing filename, all alike, since
-    the raw parsed scalar's mere PRESENCE is what this rule reads, never
-    its resolved identity; a job-level `uses:` value that is PRESENT but
-    NOT a string is its own named finding (cannot examine at all). Either
-    way, the job must be listed in `PROMOTION_TABLE` (any row's
-    `promoting_job`) or this gate fails by name. A job-level delegation is
-    judged WITHOUT ever opening the delegate's own text: this rule does
-    not know or care whether the delegate itself promotes anything, is
-    examinable, or even exists -- ANY delegation is presumed promoting
-    until a human reviews it, with TWO narrow, hand-reviewed exceptions,
-    NEITHER of which is a traversal: (1) a `PROMOTION_TABLE` row's own
+    `uses:` reaching a primitive -- either DIRECTLY (a cross-repo target,
+    always presumed promoting -- see below) or TRANSITIVELY, through a
+    real per-LOCAL-delegate traversal (`_traverse_local_reusable`,
+    #561): for every local job-level `uses:` reachable from a merge-path
+    job, either the reusable AND EVERY reusable reachable from it
+    (transitively) is fully examinable and examined for a publishing
+    primitive, or this job is reported as a finding naming the
+    unexaminable reusable and why. Either way, the job must be listed in
+    `PROMOTION_TABLE` (any row's `promoting_job`) or this gate fails by
+    name; a job-level `uses:` value that is PRESENT but NOT a string is
+    its own named finding (cannot examine at all).
+
+    A CROSS-REPO job-level `uses:` (`owner/repo/.github/workflows/<f>
+    @<ref>`, bare, quoted, or pinned to a sha alike) is refused as
+    UNEXAMINABLE BY CONSTRUCTION, stated explicitly -- this repo's own
+    gate can never open another repo's file, so it can never be
+    "examined and clean," only presumed promoting (this rule's own
+    finding) or explicitly reviewed into `PROMOTION_TABLE` by a human.
+    This is the SAME verdict the fail-closed interim shape (a895b148)
+    already reached for a TOP-LEVEL cross-repo target; what #561 adds is
+    that a cross-repo target reached MID-CHAIN, through a local
+    delegate's own further delegation, is now ALSO a named refusal --
+    the interim shape's traversal-free design had no chain to reach it
+    through at all, and its own predecessor (deleted in a895b148) walked
+    only `./`-prefixed local targets, so a cross-repo delegate reached
+    that way was silently invisible, never even a refusal.
+
+    A LOCAL job-level delegation is examined WITHOUT trusting the
+    delegate's mere presence: `_traverse_local_reusable` opens it,
+    recursing into any further local delegation it itself carries, with
+    TWO narrow, hand-reviewed shortcuts that skip the traversal entirely
+    (neither is itself a traversal): (1) a `PROMOTION_TABLE` row's own
     `gate_job` is exempt ONLY when its OWN parsed job-level `uses:`
     scalar resolves EXACTLY to `PROOF_REQUIRED_WORKFLOW` (either
     extension spelling) -- any other value on that same job, including a
     non-string one, is still a finding; (2) a LOCAL target in
     `REVIEWED_NONPUBLISHING_LOCAL_REUSABLES` is exempt by NAME. Both
-    exempted-by-name classes (`REVIEWED_NONPUBLISHING_LOCAL_REUSABLES`
-    and `PROOF_REQUIRED_WORKFLOW` itself) get a compensating, NON-
-    recursive top-level examination below: every job INSIDE the exempted
-    file is scanned by the step-level publish-primitive rule directly (a
-    match is a finding naming that file and job) -- the exemption is a
-    reviewed NAME plus that direct scan, never an examination of what the
-    exempted file's OWN jobs might themselves delegate to (rebuilding a
-    real per-delegate traversal is tracked as
-    https://github.com/f-inverse/jammi-ai/issues/561). A workflow whose
-    OWN `on:` block is `workflow_call`-only is otherwise skipped here
-    entirely -- it is inert without a caller, and (outside the two named
-    exemptions just above) is never itself examined; a caller reaching it
+    exempted-by-name classes get a compensating, NON-recursive top-level
+    examination below: every job INSIDE the exempted file is scanned by
+    the step-level publish-primitive rule directly (a match is a finding
+    naming that file and job) -- the exemption is a reviewed NAME plus
+    that direct scan, never an examination of what the exempted file's
+    OWN jobs might themselves delegate to. A workflow whose OWN `on:`
+    block is `workflow_call`-only is otherwise skipped here entirely --
+    it is inert without a caller, and (outside the two named exemptions
+    just above) is never itself examined directly; a caller reaching it
     via a job-level `uses:` is what rule (b) holds accountable, not the
     reusable it names."""
     findings: list[str] = []
+    memo: dict[str, tuple[str | None, WorkflowLoadError | None]] = {}
     listed = {(row.workflow, row.promoting_job) for row in PROMOTION_TABLE.values()}
     gate_jobs = {(row.workflow, row.gate_job) for row in PROMOTION_TABLE.values() if row.gate_job is not None}
     # Every table row's workflow may be discovered under either the `.yml`
@@ -2143,8 +2743,11 @@ def check_p6_discovery(workflow_texts: dict[str, str]) -> list[str]:
                 if exempt_err is not None:
                     findings.append(f"P6: {name}: cannot examine (exempted-by-name file): {exempt_err}")
                     continue
+                exempt_composed, _ = _composed_jobs_or_fail(text)
                 for exempt_job_name, exempt_job_node in sorted(exempt_jobs.items()):
-                    exempt_primitive, exempt_primitive_err = job_invokes_publish_primitive(exempt_job_node)
+                    exempt_primitive, exempt_primitive_err = job_invokes_publish_primitive(
+                        exempt_job_node, exempt_composed.get(exempt_job_name)
+                    )
                     if exempt_primitive_err is not None:
                         findings.append(f"P6: {name}'s job `{exempt_job_name}`: {exempt_primitive_err}")
                     elif exempt_primitive is not None:
@@ -2159,10 +2762,11 @@ def check_p6_discovery(workflow_texts: dict[str, str]) -> list[str]:
         if jobs_err is not None:
             findings.append(f"P6: {name}: {jobs_err}")
             continue
+        composed_jobs, _ = _composed_jobs_or_fail(text)
         for job_name, job_node in sorted(jobs.items()):
             if (name, job_name) in listed_resolved:
                 continue
-            primitive, primitive_err = job_invokes_publish_primitive(job_node)
+            primitive, primitive_err = job_invokes_publish_primitive(job_node, composed_jobs.get(job_name))
             if primitive_err is not None:
                 findings.append(f"P6: {name}'s job `{job_name}`: {primitive_err}")
                 continue
@@ -2172,7 +2776,14 @@ def check_p6_discovery(workflow_texts: dict[str, str]) -> list[str]:
                     "not listed in PROMOTION_TABLE -- an unlisted promoting job is invisible to the "
                     "gpu-prove-once guarantee; add a reviewed row for it"
                 )
-                continue
+                # SELF-MASK (#561): a direct match on THIS job never
+                # short-circuits examining this SAME job's own job-level
+                # `uses:` too -- GitHub Actions makes `uses:` and
+                # `steps:` mutually exclusive at the job level, so a REAL
+                # job never carries both, but a synthetic document is
+                # not assumed impossible here; fall through rather than
+                # `continue`.
+
             uses = job_node.get("uses")
             if uses is None:
                 continue
@@ -2188,12 +2799,49 @@ def check_p6_discovery(workflow_texts: dict[str, str]) -> list[str]:
                     continue
             if _job_level_uses_is_reviewed_nonpublishing(job_node):
                 continue
-            findings.append(
-                f"P6: {name}'s job `{job_name}` has a job-level `uses:` ({uses!r}) and is not listed "
-                "in PROMOTION_TABLE -- every job-level delegation to another workflow is presumed "
-                "promoting until reviewed (fail-closed: this rule never opens the delegate itself); "
-                "add a row, or see the filed issue if the delegate genuinely needs its own examination"
-            )
+            cross_target = _cross_repo_reusable_workflow_target(job_node)
+            if cross_target is not None:
+                # #561: a cross-repo delegate is refused as UNEXAMINABLE
+                # by construction -- see this function's own docstring.
+                findings.append(
+                    f"P6: {name}'s job `{job_name}` has a job-level `uses:` to a CROSS-REPO workflow "
+                    f"({uses!r}) -- unexaminable by construction (this gate cannot open another "
+                    "repo's file); presumed promoting until reviewed into PROMOTION_TABLE"
+                )
+                continue
+            local_target = _local_reusable_workflow_target(job_node)
+            if local_target is None:
+                # Neither local nor cross-repo nor a reviewed exemption:
+                # an unrecognised `uses:` shape -- stay fail-closed.
+                findings.append(
+                    f"P6: {name}'s job `{job_name}` has a job-level `uses:` ({uses!r}) of an "
+                    "unrecognised shape -- cannot examine, presumed promoting"
+                )
+                continue
+            resolved_target = resolve_workflow(workflow_texts, local_target)
+            if resolved_target is None:
+                findings.append(
+                    f"P6: {name}'s job `{job_name}` uses local reusable workflow {local_target!r}, "
+                    "which does not exist anywhere in the discovered workflow tree (dangling target) "
+                    "-- cannot examine"
+                )
+                continue
+            try:
+                delegate_found = _traverse_local_reusable(resolved_target, workflow_texts, memo, 1)
+            except WorkflowLoadError as exc:
+                findings.append(
+                    f"P6: {name}'s job `{job_name}` {exc} -- cannot fully examine, presumed promoting"
+                )
+                continue
+            if delegate_found is not None:
+                findings.append(
+                    f"P6: {name}'s job `{job_name}` invokes a publishing primitive "
+                    f"({delegate_found} (via {resolved_target})) but is not listed in PROMOTION_TABLE "
+                    "-- an unlisted promoting job is invisible to the gpu-prove-once guarantee; add a "
+                    "reviewed row for it"
+                )
+            # else: `resolved_target` and everything it reaches was fully
+            # examined and is transitively clean -- no finding.
 
     return findings
 

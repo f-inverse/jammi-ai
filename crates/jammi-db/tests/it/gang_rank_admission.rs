@@ -7,17 +7,19 @@
 //! private tempdir per test); `world_size` decoding (a targeted JSON field
 //! read with no backend-specific SQL of its own, but still worth the same
 //! `test_case`-parameterized sqlite/postgres shape `migrations.rs` uses) and
-//! `lease` (`jammi_db::catalog::lease::decode_lease_expires_at` parses a
-//! DIFFERENT text shape per backend — Postgres's own default
-//! `timestamptz`-cast-to-`text` rendering versus SQLite's app-clock
-//! `LEASE_TS_FORMAT` — so these have no oracle at all on Postgres without a
-//! live one) also run a `::postgres` arm gated by `live-postgres-tests`,
-//! skipping (never failing) when `JAMMI_TEST_PG_URL` is unset. Issue #574's
-//! parity oracle (`get_job_for_rank_undecodable_lease_is_a_row_fact_on_both_backends`)
-//! is the one test in this file that MUST run identically on both backends
-//! whenever Postgres is available — it is the property this whole file split
-//! exists to pin: a malformed `lease_expires_at` is `Ok(Some(row))` with
-//! `LeaseFact::Undecodable`, never a backend-dependent `Err`.
+//! `lease` also run a `::postgres` arm gated by `live-postgres-tests`,
+//! skipping (never failing) when `JAMMI_TEST_PG_URL` is unset. Since
+//! migration `039_canonical_stamps`, `jammi_db::catalog::lease::
+//! decode_lease_expires_at` parses the IDENTICAL text shape on either
+//! backend (the schema-edge domain makes it the only representable one) --
+//! issue #574's parity oracle
+//! (`get_job_for_rank_undecodable_lease_is_a_row_fact_on_sqlite_and_a_write_refusal_on_postgres`)
+//! is the one test in this file that MUST run on both backends whenever
+//! Postgres is available; it now pins a stated ASYMMETRY rather than an
+//! identity -- a shape-valid/calendar-invalid `lease_expires_at` is a row
+//! FACT (`Ok(Some(row))` with `LeaseFact::Undecodable`) on SQLite (whose
+//! trigger checks shape only) and a typed WRITE REFUSAL on Postgres (whose
+//! `CHECK` also validates the cast) -- see that test's own docs for why.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -135,11 +137,9 @@ async fn get_job_for_rank_returns_none_for_an_absent_job() {
 
 /// The row's `status`/`claimed_by`/`attempts`/`lease` mirror a genuine
 /// claim exactly, and `lease` is `LeaseFact::Live` for a freshly-claimed
-/// lease. Parameterized (sqlite/postgres, the `migrations.rs` shape):
-/// `decode_lease_expires_at` parses a DIFFERENT text shape per backend
-/// (`lease.rs`), so `lease` has no oracle at all on the Postgres arm without
-/// this; the postgres arm skips (never fails) when `JAMMI_TEST_PG_URL` is
-/// unset.
+/// lease. Parameterized (sqlite/postgres, the `migrations.rs` shape) so the
+/// property is pinned against a real Postgres write, not just SQLite's; the
+/// postgres arm skips (never fails) when `JAMMI_TEST_PG_URL` is unset.
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -284,26 +284,40 @@ async fn get_job_for_rank_treats_an_expired_lease_as_not_live(kind: BackendKind)
     );
 }
 
-/// #574's own parity oracle: a `lease_expires_at` that is neither `NULL` nor
-/// a parseable timestamp for THIS backend (planted by raw SQL — nothing in
-/// this crate writes such a value) is `Ok(Some(row))` with
-/// `LeaseFact::Undecodable` on BOTH backends, identically — never a fault on
-/// either. Before the fix (`get_job_for_rank` computing `remaining_secs` via
-/// a SQL-side `col::timestamptz` cast / `EXTRACT(...)`), this same planted
-/// value read as `Ok(Some(row))` with `lease_live = false` on SQLite
+/// #574's own parity oracle — REWRITTEN by `catalog::lease`'s S4/migration
+/// `039_canonical_stamps`: before 039, a `lease_expires_at` that failed to
+/// parse read as `Ok(Some(row))` with `lease_live = false` on SQLite
 /// (`julianday(...)` silently returns `NULL` for unparseable text) but `Err`
-/// on Postgres (the cast raises a genuine SQL error) — the exact
-/// backend-dependent classification issue #574 reports. Parameterized
+/// on Postgres (`col::timestamptz` raised a genuine SQL error) — the
+/// backend-dependent classification #574 reported. That specific asymmetry
+/// is CLOSED: the schema-edge domain (`catalog::lease`'s S3) makes every
+/// value a live Postgres write can ever leave in `lease_expires_at`
+/// cast-valid, so the read side can no longer fault on row content there.
+///
+/// What remains, stated rather than papered over: SQLite's trigger checks
+/// SHAPE only (a `GLOB` over a digit-class pattern — SQLite has no calendar
+/// parser), so a shape-valid, CALENDAR-invalid value (a month of `13`) is
+/// still representable on SQLite and still decodes as
+/// [`LeaseFact::Undecodable`] there (nothing in this crate's own write path
+/// ever produces one; this plants it with raw SQL). On Postgres the SAME
+/// literal text is REFUSED at the write itself — the CHECK requires BOTH
+/// shape AND `c::timestamptz IS NOT NULL`, and Postgres's own calendar
+/// validation rejects a month of `13` outright (SQLSTATE `22008`) — so the
+/// value this test plants on SQLite can never reach a Postgres row at all;
+/// `get_job_for_rank` never gets the chance to disagree about it. Every
+/// OTHER column stays populated on the SQLite arm, proving the malformed
+/// lease is isolated to `RankAdmissionRow::lease` alone. Parameterized
 /// (sqlite/postgres): the postgres arm skips (never fails) when
-/// `JAMMI_TEST_PG_URL` is unset; every OTHER column stays populated, proving
-/// the malformed lease is isolated to `RankAdmissionRow::lease` alone.
+/// `JAMMI_TEST_PG_URL` is unset.
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
     test_case::test_case(BackendKind::Postgres ; "postgres")
 )]
 #[tokio::test]
-async fn get_job_for_rank_undecodable_lease_is_a_row_fact_on_both_backends(kind: BackendKind) {
+async fn get_job_for_rank_undecodable_lease_is_a_row_fact_on_sqlite_and_a_write_refusal_on_postgres(
+    kind: BackendKind,
+) {
     // The require-gate itself: a direct, crate-qualified call to the
     // registered `shared:` helper (`ci/kernel-oracle-helpers.txt`), textually
     // in THIS test fn's own body — `base_catalog_kind`'s internal `?` on
@@ -329,30 +343,54 @@ async fn get_job_for_rank_undecodable_lease_is_a_row_fact_on_both_backends(kind:
         .unwrap()
         .unwrap();
 
-    let sql =
-        format!("UPDATE jobs SET lease_expires_at = 'not-a-timestamp' WHERE job_id = '{job_id}'");
-    catalog
+    // Shape-valid (matches the schema-edge CHECK/trigger's digit-class
+    // regex/GLOB), calendar-invalid (no month `13`) — see this test's docs
+    // for why a leap second does NOT serve this role (chrono accepts it).
+    let sql = format!(
+        "UPDATE jobs SET lease_expires_at = '2026-13-01T00:00:00.000000Z' WHERE job_id = '{job_id}'"
+    );
+    let write_result = catalog
         .backend_arc()
         .transaction(TxOptions::default(), |tx| {
             let sql = sql.clone();
             Box::pin(async move { tx.execute(&sql, &[]).await })
         })
-        .await
-        .unwrap();
+        .await;
 
-    let row = catalog
-        .get_job_for_rank(&job_id)
-        .await
-        .expect("a malformed lease_expires_at must be a row fact, never a read fault, on EITHER backend")
-        .expect("row present");
-    assert_eq!(
-        row.lease,
-        LeaseFact::Undecodable,
-        "a lease that does not parse as a timestamp on this backend must be Undecodable"
-    );
-    assert_eq!(row.status, "running", "every other column stays populated");
-    assert_eq!(row.claimed_by.as_deref(), Some("coord-1"));
-    assert_eq!(row.attempts, 1);
+    match kind {
+        BackendKind::Sqlite => {
+            write_result.expect(
+                "SQLite's trigger checks shape only; a calendar-invalid but \
+                 shape-valid value is admitted",
+            );
+            let row = catalog
+                .get_job_for_rank(&job_id)
+                .await
+                .expect("a malformed lease_expires_at must be a row fact, never a read fault")
+                .expect("row present");
+            assert_eq!(
+                row.lease,
+                LeaseFact::Undecodable,
+                "a lease that does not parse as a timestamp must be Undecodable"
+            );
+            assert_eq!(row.status, "running", "every other column stays populated");
+            assert_eq!(row.claimed_by.as_deref(), Some("coord-1"));
+            assert_eq!(row.attempts, 1);
+        }
+        BackendKind::Postgres => {
+            let err = write_result.expect_err(
+                "Postgres's CHECK requires calendar validity too; a month of 13 must be \
+                 refused at the write, never silently stored for a later Undecodable read",
+            );
+            assert!(
+                matches!(
+                    err,
+                    jammi_db::catalog::backend::BackendError::DomainViolation { .. }
+                ),
+                "the refusal must be the typed domain-violation class, got {err:?}"
+            );
+        }
+    }
 }
 
 /// The row's OWN `world_size`, decoded from `spec`
@@ -390,6 +428,74 @@ async fn get_job_for_rank_reflects_the_row_world_size() {
         WorldSizeFact::Decoded(2),
         "the row's own world_size must round-trip"
     );
+}
+
+/// N4 oracle (iv) (#548): `world_size_from_spec_json` (this module,
+/// module-private) reads `jammi_ai::jobs::JobSpec`'s new flat-derive shape
+/// unchanged, for every training kind and for a compute kind — `jammi-db`
+/// cannot import `jammi-ai` (the dependency runs the other way), so these
+/// fixtures are hand-written JSON matching that type's own byte-pin tests
+/// (`crates/jammi-ai/src/jobs.rs`'s `job_spec_byte_pins_every_compiled_kind_
+/// against_its_own_type`/`job_spec_fine_tune_literal_byte_pin`) rather than
+/// constructed through it. `fine_tune`/`graph_fine_tune` carry `common.
+/// world_size` and decode it explicitly; `context_predictor` has no
+/// `common` field at all (`TrainingSpec::ContextPredictor` never did, tag
+/// merge or not) and `neighbor_graph` (a compute kind) has no `world_size`
+/// field either — both default to `1` through the SAME absent-field path,
+/// which is the property this test pins: a row's kind never changes how
+/// `world_size` is read, only whether the field exists. Not parameterized
+/// (sqlite only): the read is a plain JSON field lookup with no
+/// backend-specific SQL, already covered on both backends by the
+/// `world_size`-decoding tests around it.
+#[tokio::test]
+async fn get_job_for_rank_reads_world_size_the_same_way_for_every_compiled_job_spec_kind_shape() {
+    let (_dir, catalog) = base_catalog().await;
+    let fixtures: &[(&str, &str, WorldSizeFact)] = &[
+        (
+            "job-shape-fine-tune",
+            r#"{"kind":"fine_tune","source":"s","columns":["text"],"method":"lora","task":"text_embedding","common":{"base_model":"b","world_size":2},"cache":"bypass"}"#,
+            WorldSizeFact::Decoded(2),
+        ),
+        (
+            "job-shape-graph-fine-tune",
+            r#"{"kind":"graph_fine_tune","sources":{},"sample_config":{},"common":{"base_model":"b","world_size":3}}"#,
+            WorldSizeFact::Decoded(3),
+        ),
+        (
+            "job-shape-context-predictor",
+            r#"{"kind":"context_predictor","source":"s","predictor_spec":{}}"#,
+            WorldSizeFact::Decoded(1),
+        ),
+        (
+            "job-shape-neighbor-graph",
+            r#"{"kind":"neighbor_graph","source_id":"s","embedding_table":null,"params":{},"cache":"bypass"}"#,
+            WorldSizeFact::Decoded(1),
+        ),
+    ];
+    for (job_id, spec, expected) in fixtures {
+        catalog
+            .submit_job(SubmitJobParams {
+                job_id,
+                kind: KIND,
+                execution: JobExecution::Queued,
+                spec,
+                model_ref: Some("q-base::1"),
+                output_model_id: None,
+                model_source: None,
+                priority: 0,
+            })
+            .await
+            .unwrap();
+        let row = catalog
+            .get_job_for_rank(job_id)
+            .await
+            .unwrap()
+            .expect("the row was just submitted");
+        assert_eq!(
+            row.world_size, *expected,
+            "job {job_id} (spec {spec}) must read world_size as {expected:?}"
+        );
+    }
 }
 
 /// A spec naming no `world_size` at all (`job_params`'s `"{}"`, every

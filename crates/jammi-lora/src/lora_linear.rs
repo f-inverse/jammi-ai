@@ -4,7 +4,7 @@ use candle_core::{DType, Tensor};
 use candle_nn::{Init, Linear, Module, VarBuilder, VarMap};
 use jammi_kernels::admission::{
     admission_mode, admit, counters_for, device_is_supported, DispatchCounters, DispatchOutcome,
-    DispatchSnapshot,
+    DispatchSnapshot, LOW_RANK_RESIDUAL_LINEAR,
 };
 use jammi_kernels::ops::{apply1, apply3, DropoutFused, DropoutKey, LowRankResidualLinear};
 
@@ -1076,7 +1076,7 @@ impl LoraLinear {
         );
         let outcome = admit(
             admission_mode(),
-            "lora_linear_fused",
+            &LOW_RANK_RESIDUAL_LINEAR,
             predicate,
             holds,
             lora_linear_fused_counters(),

@@ -626,3 +626,119 @@ def test_rail_inactive_without_the_registry_warns_once_and_runs_clean(
     full = "\n".join(result.outlines)
     assert full.count("session-leak rail inactive") == 1
     assert "0.1.0-fake-pre-registry" in full
+
+
+# --------------------------------------------------------------------------- #
+# issue #552 item 1: a session constructed OUTSIDE any single test's own
+# fixture window (a module-scoped fixture's own setup) is invisible to the
+# per-test guard and must still fail the RUN, via the session-wide sweep.
+# --------------------------------------------------------------------------- #
+
+_MODULE_SCOPED_LEAK_SUITE = '''
+import jammi
+import pytest
+
+
+@pytest.fixture(scope="module")
+def _leaked_module_fixture():
+    """Opens a (lazy -- no server needed) remote session in a MODULE-scoped
+    fixture's own setup -- which pytest sets up before any function-scoped
+    autouse fixture for the first test that needs it, so `_no_leaked_sessions`
+    never sees the register event at all (it subscribes only once ITS OWN
+    setup runs, which is after this one). Deliberately never closed."""
+    db = jammi.connect("grpc://127.0.0.1:8081")
+    yield db
+    # no db.close() -- the leak under test
+
+
+def test_uses_the_module_scoped_fixture(_leaked_module_fixture):
+    assert _leaked_module_fixture is not None
+'''
+
+
+def test_a_session_opened_by_a_module_scoped_fixture_fails_the_run_not_the_test(
+    pytester: pytest.Pytester,
+):
+    """The per-test guard cannot see this leak (the register event fired
+    before `_no_leaked_sessions` subscribed), so the test itself passes
+    clean -- but the process-wide sweep (`pytest_sessionstart` /
+    `pytest_sessionfinish` in `conftest.py`) saw the same register event
+    from before collection even started, and fails the WHOLE RUN at
+    `pytest_sessionfinish`, by label, once every test has finished.
+    """
+    pytester.makeconftest(_CONFTEST)
+    pytester.makepyfile(test_the_module_scoped_leak=_MODULE_SCOPED_LEAK_SUITE)
+
+    result = pytester.runpytest_subprocess("-p", "no:cacheprovider")
+
+    # The test's own CALL and per-test-guard teardown are both clean: this
+    # leak is invisible to `_no_leaked_sessions` by construction.
+    result.assert_outcomes(passed=1, errors=0, failed=0)
+    assert result.ret != 0, (
+        "a session opened by a module-scoped fixture and never closed must "
+        "still fail the run, via the session-wide sweep"
+    )
+    full = "\n".join(result.outlines)
+    assert "SESSION-WIDE LEAK" in full
+    assert "1 jammi session(s)" in full
+
+
+# --------------------------------------------------------------------------- #
+# issue #552 item 2: "a test-opened session is closed by that SAME test" --
+# a session opened in test A and closed in test B is reported against A (the
+# opener), never against B (the closer).
+# --------------------------------------------------------------------------- #
+
+_OPENED_IN_A_CLOSED_IN_B_SUITE = '''
+import jammi
+
+_HANDOFF = []
+
+
+def test_a_opens_a_session_and_hands_it_off():
+    db = jammi.connect("grpc://127.0.0.1:8081")
+    _HANDOFF.append(db)
+
+
+def test_b_closes_the_session_test_a_opened():
+    db = _HANDOFF.pop()
+    db.close()
+'''
+
+
+def test_a_session_opened_in_one_test_and_closed_in_a_later_test_is_reported_against_the_opener(
+    pytester: pytest.Pytester,
+):
+    """Pins the suite rule stated in `conftest.py`'s own module docstring:
+    the per-test guard's soundness rests on "a test-opened session is
+    closed by that SAME test" -- so when that rule is broken by hand (A
+    opens, B closes), the guard reports it against A, the opener, which
+    ends its own window with the session still registered; B's window
+    never saw a `register` event for it at all (only, harmlessly, the
+    `unregister` B itself caused), so B is not reported.
+    """
+    pytester.makeconftest(_CONFTEST)
+    pytester.makepyfile(
+        test_the_handoff_suite=_OPENED_IN_A_CLOSED_IN_B_SUITE
+    )
+
+    result = pytester.runpytest_subprocess("-p", "no:cacheprovider")
+
+    # A's CALL passes (opening a session is not itself wrong) but its
+    # teardown errors on the still-open session; B's CALL closes it and B's
+    # own teardown is clean -- the session-wide sweep also sees the pair
+    # close out before the run ends, so it does not ALSO fail the run.
+    result.assert_outcomes(passed=2, errors=1, failed=0)
+    assert result.ret != 0
+
+    sections = _teardown_error_sections(result.outlines)
+    names = [name for name, _ in sections]
+    assert names == [
+        "test_a_opens_a_session_and_hands_it_off"
+    ], f"expected the leak reported against the OPENER only, got {names!r}"
+    assert "left 1 jammi session(s) open" in "\n".join(sections[0][1])
+    full = "\n".join(result.outlines)
+    assert "SESSION-WIDE LEAK" not in full, (
+        "the session was closed (by B) before the run ended -- the "
+        "session-wide sweep must not also report it"
+    )

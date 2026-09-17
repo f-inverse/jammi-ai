@@ -354,7 +354,7 @@ fn result_params<'a>(
         text_columns: None,
         storage_precision: jammi_db::config::StoragePrecision::F32,
         oversample: 4,
-        created_at: jammi_db::catalog::backend::now_sortable(),
+        created_at: jammi_db::catalog::lease::canonical_stamp_now(),
         job_attempt: None,
     }
 }
@@ -2234,7 +2234,7 @@ async fn tenant_scoped_reconcile_never_touches_a_global_expired_building_row() {
             text_columns: None,
             storage_precision: StoragePrecision::F32,
             oversample: 4,
-            created_at: jammi_db::catalog::backend::now_sortable(),
+            created_at: jammi_db::catalog::lease::canonical_stamp_now(),
             writer_id: Some("writer-global-dead"),
             lease: Some(std::time::Duration::from_secs(600)),
             job_attempt: None,

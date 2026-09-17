@@ -4560,6 +4560,7 @@ dependencies = [
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "parquet",
+ "proc-macro2",
  "prost",
  "rand 0.8.6",
  "rand_distr 0.4.3",
@@ -4571,6 +4572,7 @@ dependencies = [
  "sha2 0.10.9",
  "statrs",
  "symphonia",
+ "syn 2.0.117",
  "tantivy",
  "tempfile",
  "thiserror 2.0.18",
@@ -4714,6 +4716,7 @@ dependencies = [
  "object_store",
  "parking_lot",
  "parquet",
+ "proc-macro2",
  "seahash",
  "secrecy",
  "serde",
@@ -4721,6 +4724,8 @@ dependencies = [
  "serde_path_to_error",
  "sha2 0.10.9",
  "sqlx",
+ "strum",
+ "syn 2.0.117",
  "tempfile",
  "test-case",
  "thiserror 2.0.18",
@@ -4792,6 +4797,7 @@ dependencies = [
  "serde",
  "serde_json",
  "statrs",
+ "strum",
  "thiserror 2.0.18",
 ]
 
@@ -6595,6 +6601,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "probed-ops-index"
+version = "0.1.0"
+dependencies = [
+ "jammi-kernels",
+ "serde_json",
+]
+
+[[package]]
 name = "proc-macro-crate"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8362,6 +8376,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
+name = "strum"
+version = "0.26.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fec0f0aef304996cf250b31b5a10dee7980c85da9d759361292b8bca5a18f06"
+dependencies = [
+ "strum_macros",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.26.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c6bee85a5a24955dc440386795aa378cd9cf82acd5f764469152d2270e581be"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "rustversion",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "substrait"
 version = "0.63.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8392,6 +8428,17 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "symbol-index"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "serde",
+ "serde_json",
+ "syn 2.0.117",
+ "walkdir",
+]
 
 [[package]]
 name = "symphonia"

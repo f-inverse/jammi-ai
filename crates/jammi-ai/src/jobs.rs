@@ -86,8 +86,14 @@ use crate::session::InferenceSession;
 /// cache policy has to survive the trip through `jobs.spec` and back, not be
 /// silently forced to [`CachePolicy::Bypass`] the way the pre-item-3
 /// `execute_compute` did for every compute kind.
+///
+/// `#[serde(deny_unknown_fields)]`: a `jobs.spec` row is always
+/// engine-written from a decoded spec, so an unknown key can only arrive
+/// via a hand edit or corruption, and [`JobSpec`]'s own `Deserialize`
+/// already dispatches to this type ONLY when the row's `kind` names one of
+/// this enum's own variants — see that type's doc.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ComputeSpec {
     /// [`InferenceSession::build_neighbor_graph`]'s inputs.
     NeighborGraph {
@@ -179,44 +185,364 @@ impl ComputeSpec {
 
 /// The union of every durable job specification this crate submits: the
 /// three [`TrainingSpec`](crate::fine_tune::spec::TrainingSpec) training
-/// kinds, unchanged, and the compute kinds in [`ComputeSpec`].
-/// `#[serde(untagged)]`: each inner enum already carries its own flat `kind`
-/// tag (mirroring `jobs.kind`), so the outer wrapper tries each inner
-/// deserializer in turn (training first) rather than adding a second tag
-/// layer that would shadow it — a spec whose `kind` is not one of the three
-/// training variants simply fails `TrainingSpec`'s deserializer and falls
-/// through to `ComputeSpec`.
+/// kinds and the five compute kinds in [`ComputeSpec`], flattened into ONE
+/// directly-tagged enum — not a wrapper around either of those two types.
+///
+/// Derived `#[serde(tag = "kind", deny_unknown_fields)]`, over all eight
+/// variants at once, field-for-field identical (same names, same order) to
+/// [`crate::fine_tune::spec::TrainingSpec`]'s three variants and
+/// [`ComputeSpec`]'s five: a row written through `JobSpec` is byte-identical
+/// to one written directly through whichever of those two types the kind
+/// belongs to (see the byte-pin tests below), so it round-trips through
+/// EITHER type's decode unchanged. `JobSpec` is, in fact, the type every
+/// production claim site decodes: `crate::fine_tune::worker`'s loop-claimer
+/// and its Peer-rank path both decode a `jobs.spec` row as `JobSpec` and
+/// project to [`TrainingSpec`](crate::fine_tune::spec::TrainingSpec) with
+/// `JobSpec::as_training_spec`; its compute-claim path decodes `JobSpec`
+/// the same way and projects to [`ComputeSpec`] with
+/// `JobSpec::as_compute_spec` — `TrainingSpec`/`ComputeSpec` are never
+/// deserialized directly from a `jobs.spec` row on any of those three
+/// paths (see `JobSpec::as_training_spec`'s own doc for the full
+/// caller list and why: a decode under `JobSpec`'s tag/
+/// `deny_unknown_fields` pair catches a stray field the SAME way
+/// regardless of which kind the row holds, rather than running two
+/// independently-tagged decodes that could drift). Only this type's own
+/// byte-pin tests below still construct a bare `TrainingSpec`/`ComputeSpec`
+/// value directly, to prove the two shapes stay byte-identical.
+///
+/// This is a flat merge, not a wrapper, because a wrapper does not work:
+/// an outer `#[serde(tag = "kind")]` enum whose variant is a newtype around
+/// an ALREADY internally-tagged type (`Training(Box<TrainingSpec>)`) tries
+/// to write `kind` twice on serialize — once for the outer variant, once
+/// for the inner type's own tag — which `serde_json` refuses with a
+/// "duplicate field `kind`" error; nesting the payload under an `Adjacent`
+/// tag/content pair (`{"kind": ..., "content": {...}}`) round-trips but
+/// pushes every training kind's `common` field to depth 2, breaking
+/// [`crate::fine_tune::spec::TrainingCommon`]'s depth-1 contract with
+/// `jammi-db`'s [`jammi_db::catalog::jobs_repo`] (see this crate and that
+/// one's respective `world_size_from_spec_json` fixtures). Only the fully
+/// flat merge below keeps `common` at depth 1 while giving `JobSpec` its
+/// own single tag layer, so this enum's variants restate
+/// `TrainingSpec`'s/`ComputeSpec`'s field lists rather than embedding
+/// either type as a value.
+///
+/// No migration for existing rows: the wire bytes are unchanged (a row
+/// written before this reshape already carries `kind` and no unknown
+/// fields, since every write path is engine-written from a decoded spec),
+/// so every row that decoded before still decodes identically now. A row
+/// that CANNOT decode — no `kind` field, an unrecognised `kind`, or a
+/// stray field under a recognised one — fails with a typed
+/// [`serde_json::Error`] naming the offending field or kind; both
+/// production readers of a `jobs.spec` row
+/// (`crate::fine_tune::worker::JobWorker::run_claimed_compute_job` and
+/// the training claim paths cited above) already fold that error into a
+/// failure record keyed by the job's own id (`jobs.job_id` is the row's
+/// primary key), so the typed error is never anonymous in practice — see
+/// <https://github.com/f-inverse/jammi-ai/issues/548>.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum JobSpec {
-    /// A training kind: `fine_tune` / `graph_fine_tune` / `context_predictor`.
-    /// Boxed — `TrainingSpec` is far larger than `ComputeSpec`, and boxing
-    /// keeps `JobSpec` itself small to pass/return by value.
-    Training(Box<crate::fine_tune::spec::TrainingSpec>),
-    /// A compute kind: `neighbor_graph` / `propagate` / `asof_join`. Boxed
-    /// to match `Training`'s indirection, keeping both variants small.
-    Compute(Box<ComputeSpec>),
+    /// Field-for-field identical to
+    /// [`TrainingSpec::FineTune`](crate::fine_tune::spec::TrainingSpec::FineTune).
+    FineTune {
+        source: String,
+        columns: Vec<String>,
+        method: crate::fine_tune::FineTuneMethod,
+        task: ModelTask,
+        common: crate::fine_tune::spec::TrainingCommon,
+        #[serde(default)]
+        cache: CachePolicy,
+    },
+    /// Field-for-field identical to
+    /// [`TrainingSpec::GraphFineTune`](crate::fine_tune::spec::TrainingSpec::GraphFineTune).
+    GraphFineTune {
+        sources: crate::fine_tune::graph_sampler::GraphFineTuneSources,
+        sample_config: crate::fine_tune::graph_sampler::GraphSampleConfig,
+        common: crate::fine_tune::spec::TrainingCommon,
+    },
+    /// Field-for-field identical to
+    /// [`TrainingSpec::ContextPredictor`](crate::fine_tune::spec::TrainingSpec::ContextPredictor).
+    ContextPredictor {
+        source: String,
+        predictor_spec: crate::pipeline::context_predictor::ContextPredictorTrainConfig,
+    },
+    /// Field-for-field identical to [`ComputeSpec::NeighborGraph`].
+    NeighborGraph {
+        source_id: String,
+        embedding_table: Option<String>,
+        params: BuildNeighborGraph,
+        cache: CachePolicy,
+    },
+    /// Field-for-field identical to [`ComputeSpec::Propagate`].
+    Propagate {
+        request: PropagateRequest,
+        cache: CachePolicy,
+    },
+    /// Field-for-field identical to [`ComputeSpec::AsofJoin`].
+    AsofJoin {
+        spine: String,
+        facts: String,
+        spec: AsofJoinSpec,
+    },
+    /// Field-for-field identical to [`ComputeSpec::Embedding`].
+    Embedding {
+        source_id: String,
+        model_id: String,
+        columns: Vec<String>,
+        key_column: String,
+        modality: jammi_wire::request::Modality,
+        cache: CachePolicy,
+    },
+    /// Field-for-field identical to [`ComputeSpec::Infer`].
+    Infer {
+        source_id: String,
+        model_id: String,
+        task: ModelTask,
+        content_columns: Vec<String>,
+        key_column: String,
+        cache: CachePolicy,
+    },
 }
 
 impl JobSpec {
     /// The `jobs.kind` tag this spec submits under.
     pub fn kind(&self) -> &'static str {
         match self {
-            JobSpec::Training(t) => t.kind(),
-            JobSpec::Compute(c) => c.kind(),
+            JobSpec::FineTune { .. } => "fine_tune",
+            JobSpec::GraphFineTune { .. } => "graph_fine_tune",
+            JobSpec::ContextPredictor { .. } => "context_predictor",
+            JobSpec::NeighborGraph { .. } => "neighbor_graph",
+            JobSpec::Propagate { .. } => "propagate",
+            JobSpec::AsofJoin { .. } => "asof_join",
+            JobSpec::Embedding { .. } => "embedding",
+            JobSpec::Infer { .. } => "infer",
+        }
+    }
+
+    /// Reconstructs the equivalent
+    /// [`TrainingSpec`](crate::fine_tune::spec::TrainingSpec) when `self` is
+    /// one of the three training kinds, `None` for a compute kind. This is
+    /// the PROJECTION every `jobs.spec`/`training_spec` production reader
+    /// uses: `JobSpec` is the one type every persisted row decodes as (see
+    /// the type doc), and a caller that needs the narrower standalone type
+    /// — [`crate::fine_tune::spec::admit_training_spec`],
+    /// [`InferenceSession::training_job_links`] (both take `&TrainingSpec`),
+    /// the loop-claimer and Peer-rank training-claim paths
+    /// (`crate::fine_tune::worker`), and [`crate::fine_tune::training_job::
+    /// resolve_model_id`] — decodes `JobSpec` first, then projects with
+    /// this method, never decoding `TrainingSpec` directly from a `jobs.spec`
+    /// row again (only `JobSpec`'s OWN byte-pin tests still construct a bare
+    /// `TrainingSpec` value, to prove the two shapes stay byte-identical).
+    pub(crate) fn as_training_spec(&self) -> Option<crate::fine_tune::spec::TrainingSpec> {
+        use crate::fine_tune::spec::TrainingSpec;
+        Some(match self {
+            JobSpec::FineTune {
+                source,
+                columns,
+                method,
+                task,
+                common,
+                cache,
+            } => TrainingSpec::FineTune {
+                source: source.clone(),
+                columns: columns.clone(),
+                method: *method,
+                task: *task,
+                common: common.clone(),
+                cache: *cache,
+            },
+            JobSpec::GraphFineTune {
+                sources,
+                sample_config,
+                common,
+            } => TrainingSpec::GraphFineTune {
+                sources: sources.clone(),
+                sample_config: *sample_config,
+                common: common.clone(),
+            },
+            JobSpec::ContextPredictor {
+                source,
+                predictor_spec,
+            } => TrainingSpec::ContextPredictor {
+                source: source.clone(),
+                predictor_spec: predictor_spec.clone(),
+            },
+            JobSpec::NeighborGraph { .. }
+            | JobSpec::Propagate { .. }
+            | JobSpec::AsofJoin { .. }
+            | JobSpec::Embedding { .. }
+            | JobSpec::Infer { .. } => return None,
+        })
+    }
+
+    /// [`Self::as_training_spec`]'s counterpart: reconstructs the equivalent
+    /// [`ComputeSpec`] when `self` is one of the five compute kinds, `None`
+    /// for a training kind. The one production reader of a compute-kind
+    /// `jobs.spec` row ([`crate::fine_tune::worker::JobWorker::
+    /// run_claimed_compute_job`]) decodes `JobSpec` first, then projects
+    /// with this method.
+    pub(crate) fn as_compute_spec(&self) -> Option<ComputeSpec> {
+        Some(match self {
+            JobSpec::NeighborGraph {
+                source_id,
+                embedding_table,
+                params,
+                cache,
+            } => ComputeSpec::NeighborGraph {
+                source_id: source_id.clone(),
+                embedding_table: embedding_table.clone(),
+                params: params.clone(),
+                cache: *cache,
+            },
+            JobSpec::Propagate { request, cache } => ComputeSpec::Propagate {
+                request: request.clone(),
+                cache: *cache,
+            },
+            JobSpec::AsofJoin { spine, facts, spec } => ComputeSpec::AsofJoin {
+                spine: spine.clone(),
+                facts: facts.clone(),
+                spec: spec.clone(),
+            },
+            JobSpec::Embedding {
+                source_id,
+                model_id,
+                columns,
+                key_column,
+                modality,
+                cache,
+            } => ComputeSpec::Embedding {
+                source_id: source_id.clone(),
+                model_id: model_id.clone(),
+                columns: columns.clone(),
+                key_column: key_column.clone(),
+                modality: *modality,
+                cache: *cache,
+            },
+            JobSpec::Infer {
+                source_id,
+                model_id,
+                task,
+                content_columns,
+                key_column,
+                cache,
+            } => ComputeSpec::Infer {
+                source_id: source_id.clone(),
+                model_id: model_id.clone(),
+                task: *task,
+                content_columns: content_columns.clone(),
+                key_column: key_column.clone(),
+                cache: *cache,
+            },
+            JobSpec::FineTune { .. }
+            | JobSpec::GraphFineTune { .. }
+            | JobSpec::ContextPredictor { .. } => return None,
+        })
+    }
+
+    /// [`ComputeSpec::model_source`]'s equivalent for the two compute
+    /// kinds that carry a model input; `None` for every other kind
+    /// (including every training kind — a training job's model links come
+    /// from [`Self::as_training_spec`] + [`InferenceSession::
+    /// training_job_links`] instead, which resolves a different `jobs`
+    /// column pair).
+    fn model_source(&self) -> Option<String> {
+        match self {
+            JobSpec::Embedding { model_id, .. } | JobSpec::Infer { model_id, .. } => {
+                Some(crate::model::ModelSource::parse(model_id).to_string())
+            }
+            _ => None,
         }
     }
 }
 
 impl From<ComputeSpec> for JobSpec {
     fn from(c: ComputeSpec) -> Self {
-        JobSpec::Compute(Box::new(c))
+        match c {
+            ComputeSpec::NeighborGraph {
+                source_id,
+                embedding_table,
+                params,
+                cache,
+            } => JobSpec::NeighborGraph {
+                source_id,
+                embedding_table,
+                params,
+                cache,
+            },
+            ComputeSpec::Propagate { request, cache } => JobSpec::Propagate { request, cache },
+            ComputeSpec::AsofJoin { spine, facts, spec } => {
+                JobSpec::AsofJoin { spine, facts, spec }
+            }
+            ComputeSpec::Embedding {
+                source_id,
+                model_id,
+                columns,
+                key_column,
+                modality,
+                cache,
+            } => JobSpec::Embedding {
+                source_id,
+                model_id,
+                columns,
+                key_column,
+                modality,
+                cache,
+            },
+            ComputeSpec::Infer {
+                source_id,
+                model_id,
+                task,
+                content_columns,
+                key_column,
+                cache,
+            } => JobSpec::Infer {
+                source_id,
+                model_id,
+                task,
+                content_columns,
+                key_column,
+                cache,
+            },
+        }
     }
 }
 
 impl From<crate::fine_tune::spec::TrainingSpec> for JobSpec {
     fn from(t: crate::fine_tune::spec::TrainingSpec) -> Self {
-        JobSpec::Training(Box::new(t))
+        use crate::fine_tune::spec::TrainingSpec;
+        match t {
+            TrainingSpec::FineTune {
+                source,
+                columns,
+                method,
+                task,
+                common,
+                cache,
+            } => JobSpec::FineTune {
+                source,
+                columns,
+                method,
+                task,
+                common,
+                cache,
+            },
+            TrainingSpec::GraphFineTune {
+                sources,
+                sample_config,
+                common,
+            } => JobSpec::GraphFineTune {
+                sources,
+                sample_config,
+                common,
+            },
+            TrainingSpec::ContextPredictor {
+                source,
+                predictor_spec,
+            } => JobSpec::ContextPredictor {
+                source,
+                predictor_spec,
+            },
+        }
     }
 }
 
@@ -601,27 +927,29 @@ impl JobHandle {
                 .status
                 .parse()
                 .map_err(|e| JammiError::Catalog(format!("{e}")))?;
-            match status {
-                JobStatus::Completed => {
-                    let result_json = record.result.ok_or_else(|| {
-                        JammiError::Catalog(format!(
-                            "job '{}' completed with no recorded result",
-                            self.job_id
-                        ))
-                    })?;
-                    return serde_json::from_str(&result_json).map_err(|e| {
-                        JammiError::Catalog(format!(
-                            "job '{}' recorded an unparseable result: {e}",
-                            self.job_id
-                        ))
-                    });
-                }
-                JobStatus::Failed => {
-                    let msg = record.error.unwrap_or_else(|| "job failed".into());
-                    return Err(JammiError::FineTune(msg));
-                }
-                _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            // Derived from `JobStatus::is_terminal_unsuccessful`/`Completed`
+            // (the ONE terminality predicate) rather than a per-variant
+            // match arm, so a future terminal-unsuccessful status joining
+            // the vocabulary ends this wait with a one-line edit, not a
+            // hunt for every per-variant match arm.
+            if status == JobStatus::Completed {
+                let result_json = record.result.ok_or_else(|| {
+                    JammiError::Catalog(format!(
+                        "job '{}' completed with no recorded result",
+                        self.job_id
+                    ))
+                })?;
+                return serde_json::from_str(&result_json).map_err(|e| {
+                    JammiError::Catalog(format!(
+                        "job '{}' recorded an unparseable result: {e}",
+                        self.job_id
+                    ))
+                });
+            } else if status.is_terminal_unsuccessful() {
+                let msg = record.error.unwrap_or_else(|| "job failed".into());
+                return Err(JammiError::FineTune(msg));
             }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
 
@@ -661,31 +989,59 @@ impl InferenceSession {
         // through it without passing the per-verb entry points. Same
         // admission — [`crate::fine_tune::spec::admit_training_spec`] — same
         // typed refusals, nothing enqueued on any of them.
-        if let JobSpec::Training(training) = &spec {
-            crate::fine_tune::spec::admit_training_spec(self.jammi_config(), training)?;
-        }
+        //
+        // For a training kind this function builds no `SubmitJobParams` of
+        // its own (#573 round 3, N3-seam):
+        // [`crate::fine_tune::spec::submit_admitted_training`] is the ONE
+        // place that construction happens, so this arm submits through it
+        // rather than the `submit_job` call below. It writes the
+        // RECONSTRUCTED, admitted `TrainingSpec`'s own serialization — not
+        // `spec` (the `JobSpec`) — which is a byte-identical but SEPARATE
+        // value (see `JobSpec`'s own doc on the two independent shapes; the
+        // byte-pin tests are what makes this substitution sound). A compute
+        // kind is untouched by N3 (scoped to training kinds only) and keeps
+        // building `SubmitJobParams` from `spec`'s own `JobSpec::Serialize`
+        // exactly as before.
         let job_id = uuid::Uuid::new_v4().to_string();
         let kind = spec.kind();
-        let spec_json = serde_json::to_string(&spec)?;
-        let (model_ref, output_model_id, model_source) = match &spec {
-            JobSpec::Training(training) => {
-                let links = self.training_job_links(training, &job_id).await?;
-                (Some(links.model_ref), Some(links.output_model_id), None)
+        match spec.as_training_spec() {
+            Some(training) => {
+                let admitted =
+                    crate::fine_tune::spec::admit_training_spec(self.jammi_config(), training)?;
+                let links = self.training_job_links(admitted.spec(), &job_id).await?;
+                let submitted = crate::fine_tune::spec::submit_admitted_training(
+                    self.catalog(),
+                    &admitted,
+                    &job_id,
+                    &links.model_ref,
+                    &links.output_model_id,
+                    priority,
+                    None,
+                )
+                .await?;
+                debug_assert_eq!(
+                    submitted.recorded_job_id, job_id,
+                    "enqueue never dedupes (idempotency_key = None), so the recorded id is \
+                     always the one this call minted"
+                );
             }
-            JobSpec::Compute(compute) => (None, None, compute.model_source()),
-        };
-        self.catalog()
-            .submit_job(SubmitJobParams {
-                job_id: &job_id,
-                kind,
-                execution: JobExecution::Queued,
-                spec: &spec_json,
-                model_ref: model_ref.as_deref(),
-                output_model_id: output_model_id.as_deref(),
-                model_source: model_source.as_deref(),
-                priority,
-            })
-            .await?;
+            None => {
+                let spec_json = serde_json::to_string(&spec)?;
+                let model_source = spec.model_source();
+                self.catalog()
+                    .submit_job(SubmitJobParams {
+                        job_id: &job_id,
+                        kind,
+                        execution: JobExecution::Queued,
+                        spec: &spec_json,
+                        model_ref: None,
+                        output_model_id: None,
+                        model_source: model_source.as_deref(),
+                        priority,
+                    })
+                    .await?;
+            }
+        }
         Ok(JobHandle::new(
             job_id,
             kind.to_string(),
@@ -973,11 +1329,12 @@ mod tests {
     }
 
     /// A training-kind `JobSpec` round-trips through the SAME `#[serde(tag =
-    /// "kind")]` vocabulary `TrainingSpec` itself uses — the untagged wrapper
-    /// adds no second tag layer.
+    /// "kind")]` vocabulary `TrainingSpec` itself uses — `JobSpec`'s own
+    /// derive is one flat tag layer over both types' variants, not a
+    /// wrapper that would add a second one.
     #[test]
     fn training_job_spec_round_trips_and_keeps_the_flat_kind_tag() {
-        let spec = JobSpec::Training(Box::new(crate::fine_tune::spec::TrainingSpec::FineTune {
+        let spec: JobSpec = crate::fine_tune::spec::TrainingSpec::FineTune {
             source: "src".into(),
             columns: vec!["text".into()],
             method: crate::fine_tune::FineTuneMethod::Lora,
@@ -988,7 +1345,8 @@ mod tests {
                 world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
             },
             cache: jammi_db::store::CachePolicy::Bypass,
-        }));
+        }
+        .into();
         let json = serde_json::to_string(&spec).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
@@ -996,8 +1354,355 @@ mod tests {
             Some("fine_tune"),
             "the flat `kind` tag must be reachable at the top level of the JSON, got: {json}"
         );
+        assert_eq!(
+            value.get("common").and_then(|c| c.get("world_size")),
+            Some(&serde_json::json!(
+                crate::fine_tune::spec::DEFAULT_WORLD_SIZE
+            )),
+            "`common` must be reachable at JSON depth 1, never nested under a tag/content \
+             wrapper, got: {json}"
+        );
         let back: JobSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back.kind(), "fine_tune");
+    }
+
+    /// The untagged-collapse case (#548), through `JobSpec` this time (not
+    /// `TrainingSpec` directly): a stray `cache` key hand-edited under a
+    /// `graph_fine_tune` row is refused with a typed error naming the
+    /// field, never `"data did not match any variant of untagged enum"` —
+    /// the message a `#[serde(untagged)]` `JobSpec` (this type's form
+    /// before #548) produces when every inner deserializer it tries in turn
+    /// fails. RED: dropping `deny_unknown_fields` from `JobSpec`'s own
+    /// `#[serde(tag = "kind", ...)]` attribute turns this red — the stray
+    /// `cache` key decodes silently instead of refusing, and
+    /// `expect_err` panics.
+    #[test]
+    fn a_stray_field_under_a_declared_kind_is_refused_through_job_spec_naming_the_field() {
+        let original: JobSpec = crate::fine_tune::spec::TrainingSpec::GraphFineTune {
+            sources: crate::fine_tune::graph_sampler::GraphFineTuneSources {
+                node_source: "nodes".into(),
+                id_column: "id".into(),
+                text_column: "text".into(),
+                edge_source: "edges".into(),
+                src_column: "src".into(),
+                dst_column: "dst".into(),
+                provenance: crate::fine_tune::graph_sampler::EdgeProvenance::Declared,
+            },
+            sample_config: crate::fine_tune::graph_sampler::GraphSampleConfig::default(),
+            common: crate::fine_tune::spec::TrainingCommon {
+                base_model: "local:tiny".into(),
+                config: crate::fine_tune::FineTuneConfig::default(),
+                world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
+            },
+        }
+        .into();
+        let mut value = serde_json::to_value(&original).expect("serialize to a JSON value");
+        let object = value
+            .as_object_mut()
+            .expect("a graph_fine_tune spec is a JSON object");
+        assert_eq!(
+            object.get("kind").and_then(|k| k.as_str()),
+            Some("graph_fine_tune")
+        );
+        // The hand-edit a real submit path can never produce: `JobSpec::
+        // GraphFineTune` has no `cache` field to have serialized this key.
+        object.insert("cache".to_string(), serde_json::json!("use"));
+
+        let err = serde_json::from_value::<JobSpec>(value)
+            .expect_err("a stray field under the declared kind must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("cache"),
+            "the refusal must name the stray field `cache`, got: {message}"
+        );
+        assert!(
+            !message.contains("did not match any variant"),
+            "the refusal must come from the ONE flat tag `kind` named, never a trial-and-error \
+             fallthrough across variants: {message}"
+        );
+    }
+
+    /// The same stray-field refusal on a COMPUTE kind (not just a training
+    /// one, above): `deny_unknown_fields` covers every one of `JobSpec`'s
+    /// eight variants at once, since it is ONE derive over the whole flat
+    /// enum, not per-variant. RED: dropping `deny_unknown_fields` from
+    /// `JobSpec`'s attribute turns this red the same way.
+    #[test]
+    fn a_stray_field_under_a_compute_kind_is_refused_naming_the_field() {
+        let mut value = serde_json::to_value(JobSpec::NeighborGraph {
+            source_id: "s".into(),
+            embedding_table: None,
+            params: BuildNeighborGraph::default(),
+            cache: CachePolicy::Bypass,
+        })
+        .expect("serialize to a JSON value");
+        value
+            .as_object_mut()
+            .expect("a neighbor_graph spec is a JSON object")
+            .insert("unexpected_extra".to_string(), serde_json::json!(1));
+
+        let err = serde_json::from_value::<JobSpec>(value)
+            .expect_err("a stray field under a compute kind must be refused");
+        assert!(
+            err.to_string().contains("unexpected_extra"),
+            "the refusal must name the stray field, got: {err}"
+        );
+    }
+
+    /// Depth-complete refusal: `deny_unknown_fields` on `JobSpec` itself only
+    /// refuses a stray field at depth 1 (directly under `kind`) — a stray
+    /// field nested inside `common` (depth 2, `TrainingCommon`'s own shape)
+    /// is a SEPARATE struct with its own `deny_unknown_fields` requirement.
+    /// Before this unit's `TrainingCommon` gained the attribute, a fixture
+    /// exactly like this one decoded clean with the nested key silently
+    /// dropped — the round-2 finding this test pins. RED: removing
+    /// `#[serde(deny_unknown_fields)]` from `TrainingCommon`
+    /// (`crate::fine_tune::spec::TrainingCommon`) turns this red — the
+    /// `expect_err` panics because the nested stray key decodes silently.
+    #[test]
+    fn a_stray_field_nested_inside_common_is_refused_not_silently_dropped() {
+        let mut value = serde_json::to_value(JobSpec::FineTune {
+            source: "src".into(),
+            columns: vec!["text".into()],
+            method: crate::fine_tune::FineTuneMethod::Lora,
+            task: jammi_db::ModelTask::TextEmbedding,
+            common: crate::fine_tune::spec::TrainingCommon {
+                base_model: "base".into(),
+                config: crate::fine_tune::FineTuneConfig::default(),
+                world_size: 1,
+            },
+            cache: CachePolicy::Bypass,
+        })
+        .expect("serialize to a JSON value");
+        value
+            .as_object_mut()
+            .expect("a fine_tune spec is a JSON object")
+            .get_mut("common")
+            .expect("common is present")
+            .as_object_mut()
+            .expect("common is a JSON object")
+            .insert("unexpected_nested_extra".to_string(), serde_json::json!(1));
+
+        let err = serde_json::from_value::<JobSpec>(value)
+            .expect_err("a stray field nested inside `common` must be refused, not dropped");
+        assert!(
+            err.to_string().contains("unexpected_nested_extra"),
+            "the refusal must name the nested stray field, got: {err}"
+        );
+    }
+
+    /// N4 oracle (i) — BYTE PIN: `JobSpec`'s serialization of a value is
+    /// byte-identical to the corresponding `TrainingSpec`/`ComputeSpec`
+    /// variant's own serialization of the same logical value, for every
+    /// one of the eight compiled kinds — the property the type's own doc
+    /// claims ("a row written through `JobSpec` is byte-identical to one
+    /// written directly through whichever of those two types the kind
+    /// belongs to"), which is what lets the two production training-claim
+    /// sites and the one compute-claim site keep reading `TrainingSpec`/
+    /// `ComputeSpec` directly with no awareness `JobSpec` exists. RED:
+    /// nesting `JobSpec` under `#[serde(tag = "kind", content = "content")]`
+    /// (serde's "adjacent" enum representation) turns every training-kind
+    /// row of this test red — `common` moves to `.content.common`,
+    /// desynchronising the two serializations this test compares byte for
+    /// byte.
+    #[test]
+    fn job_spec_byte_pins_every_compiled_kind_against_its_own_type() {
+        use crate::fine_tune::spec::TrainingSpec;
+
+        let common = |world_size: u32| crate::fine_tune::spec::TrainingCommon {
+            base_model: "base".into(),
+            config: crate::fine_tune::FineTuneConfig::default(),
+            world_size,
+        };
+        let training_cases: Vec<TrainingSpec> = vec![
+            TrainingSpec::FineTune {
+                source: "src".into(),
+                columns: vec!["text".into()],
+                method: crate::fine_tune::FineTuneMethod::Lora,
+                task: jammi_db::ModelTask::TextEmbedding,
+                common: common(1),
+                cache: CachePolicy::Bypass,
+            },
+            TrainingSpec::GraphFineTune {
+                sources: crate::fine_tune::graph_sampler::GraphFineTuneSources {
+                    node_source: "nodes".into(),
+                    id_column: "id".into(),
+                    text_column: "text".into(),
+                    edge_source: "edges".into(),
+                    src_column: "src".into(),
+                    dst_column: "dst".into(),
+                    provenance: crate::fine_tune::graph_sampler::EdgeProvenance::Declared,
+                },
+                sample_config: crate::fine_tune::graph_sampler::GraphSampleConfig::default(),
+                common: common(2),
+            },
+            TrainingSpec::ContextPredictor {
+                source: "src".into(),
+                predictor_spec: crate::pipeline::context_predictor::ContextPredictorTrainConfig {
+                    model_id: "predictor".into(),
+                    architecture: crate::pipeline::context_predictor::ContextArchitecture::Cnp,
+                    key_column: "id".into(),
+                    task_column: "task".into(),
+                    value_column: "y".into(),
+                    context_k: 4,
+                    hidden_dim: 8,
+                    num_heads: 1,
+                    num_layers: 1,
+                    head: crate::pipeline::context_predictor::PredictiveHead::Gaussian {
+                        objective: crate::pipeline::context_predictor::GaussianObjective::Crps,
+                    },
+                    epochs: 1,
+                    learning_rate: 0.01,
+                    grad_clip: 1.0,
+                    test_task_fraction: 0.2,
+                    min_task_count: 2,
+                    seed: 1,
+                },
+            },
+        ];
+        for training in training_cases {
+            let direct = serde_json::to_string(&training).unwrap();
+            let via_job_spec = serde_json::to_string(&JobSpec::from(training.clone())).unwrap();
+            assert_eq!(
+                direct,
+                via_job_spec,
+                "JobSpec's bytes for kind {:?} must byte-match TrainingSpec's own",
+                training.kind()
+            );
+        }
+
+        let compute_cases: Vec<ComputeSpec> = vec![
+            ComputeSpec::NeighborGraph {
+                source_id: "s".into(),
+                embedding_table: None,
+                params: BuildNeighborGraph::default(),
+                cache: CachePolicy::Bypass,
+            },
+            ComputeSpec::Propagate {
+                request: PropagateRequest::new(
+                    "src",
+                    crate::pipeline::graph_neighbourhood::EdgeSourceRef::NeighborGraph {
+                        table_name: "edges".into(),
+                    },
+                ),
+                cache: CachePolicy::Bypass,
+            },
+            ComputeSpec::AsofJoin {
+                spine: "spine".into(),
+                facts: "facts".into(),
+                spec: crate::pipeline::asof::AsofJoinSpecBuilder::new(
+                    crate::pipeline::asof::AsofKey {
+                        by: vec!["id".into()],
+                        time: "t".into(),
+                    },
+                    crate::pipeline::asof::AsofKey {
+                        by: vec!["id".into()],
+                        time: "t".into(),
+                    },
+                )
+                .build(),
+            },
+            ComputeSpec::Embedding {
+                source_id: "s".into(),
+                model_id: "m".into(),
+                columns: vec!["text".into()],
+                key_column: "id".into(),
+                modality: jammi_wire::request::Modality::Text,
+                cache: CachePolicy::Bypass,
+            },
+            ComputeSpec::Infer {
+                source_id: "s".into(),
+                model_id: "m".into(),
+                task: jammi_db::ModelTask::TextEmbedding,
+                content_columns: vec!["text".into()],
+                key_column: "id".into(),
+                cache: CachePolicy::Bypass,
+            },
+        ];
+        for compute in compute_cases {
+            let direct = serde_json::to_string(&compute).unwrap();
+            let via_job_spec = serde_json::to_string(&JobSpec::from(compute.clone())).unwrap();
+            assert_eq!(
+                direct,
+                via_job_spec,
+                "JobSpec's bytes for kind {:?} must byte-match ComputeSpec's own",
+                compute.kind()
+            );
+        }
+    }
+
+    /// A concrete literal pin (not just the cross-type comparison above) for
+    /// one representative training kind, so the exact key set/order is
+    /// nailed down, not merely "equal to whatever TrainingSpec produces
+    /// today": `kind` first (the tag), then `common`/`world_size` reachable
+    /// at depth 1.
+    #[test]
+    fn job_spec_fine_tune_literal_byte_pin() {
+        let spec: JobSpec = crate::fine_tune::spec::TrainingSpec::FineTune {
+            source: "src".into(),
+            columns: vec!["text".into()],
+            method: crate::fine_tune::FineTuneMethod::Lora,
+            task: jammi_db::ModelTask::TextEmbedding,
+            common: crate::fine_tune::spec::TrainingCommon {
+                base_model: "base".into(),
+                config: crate::fine_tune::FineTuneConfig::default(),
+                world_size: 1,
+            },
+            cache: CachePolicy::Bypass,
+        }
+        .into();
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(
+            json.starts_with(r#"{"kind":"fine_tune","source":"src","columns":["text"]"#),
+            "the tag must lead, in variant-declaration field order, got: {json}"
+        );
+        assert!(
+            json.contains(r#""common":{"base_model":"base""#),
+            "`common` must be an object reachable directly (depth 1), got: {json}"
+        );
+        assert!(
+            json.contains(r#""world_size":1"#),
+            "world_size must be nested one level under common, got: {json}"
+        );
+    }
+
+    /// A row whose fields happen to satisfy a DIFFERENT kind's shape is
+    /// still refused under its own declared `kind`, never silently
+    /// reinterpreted as that other kind. `neighbor_graph`'s shape
+    /// (`source_id`, `embedding_table`, `params`, `cache`) cannot satisfy
+    /// `context_predictor`'s (`source`, `predictor_spec`), so a
+    /// `context_predictor` row is refused as `context_predictor` (missing
+    /// its own fields) rather than silently decoding as some other variant.
+    #[test]
+    fn an_unrecognised_kind_is_refused_naming_the_kind_not_silently_mapped_to_a_different_variant()
+    {
+        let value = serde_json::json!({
+            "kind": "not_a_real_kind",
+            "source_id": "s",
+            "embedding_table": null,
+            "params": {},
+            "cache": "bypass",
+        });
+        let err = serde_json::from_value::<JobSpec>(value)
+            .expect_err("an unrecognised kind must be refused, never guessed at");
+        let message = err.to_string();
+        assert!(
+            message.contains("not_a_real_kind"),
+            "the refusal must name the unrecognised kind, got: {message}"
+        );
+    }
+
+    /// A row with no `kind` field at all is refused as a missing field,
+    /// never silently treated as one variant or another.
+    #[test]
+    fn a_job_spec_row_missing_kind_is_refused() {
+        let value = serde_json::json!({ "source_id": "s" });
+        let err = serde_json::from_value::<JobSpec>(value)
+            .expect_err("a row with no `kind` field must be refused");
+        assert!(
+            err.to_string().contains("kind"),
+            "the refusal must name the missing `kind` field, got: {err}"
+        );
     }
 
     /// A `NeighborGraph`/`AsofJoin` compute spec's param structs

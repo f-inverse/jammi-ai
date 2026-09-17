@@ -387,8 +387,18 @@ and Ray are placement options only (#482; owned by U9b after 68 K and OPS merge)
 
 Sharded model or optimizer state (FSDP-like); elastic gangs; SGD or gradient exchange as
 DataFusion operators or aggregates; `ContextPredictor` on a gang; hard-negative mining and
-GradCache at `world_size > 1` (typed refusal in this plan); a sixth pluggable backend; a GPU
-byte-equality claim before S5.
+GradCache at `world_size > 1` (typed refusal in this plan); a sixth pluggable backend (Metal/f16
+acceleration, issue #445, deferred indefinitely for Mac hardware); a GPU byte-equality claim
+before S5.
+
+**The v1 graph-gang limit.** A `graph_fine_tune` job samples its rows in memory and has no
+training-set table for a member to be admitted against, so a `Peer` gang cannot serve it: the
+coordinator refuses it, typed, at the coordinator's own edge (K2) before dispatch — never a
+silent single-rank run of a wider job (`crates/jammi-ai/src/fine_tune/worker.rs:3707`, the
+`TopologyDecision::Peer` match arm). Run it entirely on one host (`[worker] local_ranks >=
+world_size`, a `Local` gang) or resubmit with `world_size = 1`. Issue #538 carries the executed
+refutation of the materialised-graph-arm shape that would lift this limit and is the rebuild
+pointer for the next attempt.
 
 ## 9. The Ballista extension (U8a, U8b)
 

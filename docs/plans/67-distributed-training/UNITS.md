@@ -410,9 +410,50 @@ runs per authorization; label-only until a flake-free streak) is the LEAD's, aft
 standing authorization — this unit ships no live RunPod call. The pre-flight gap U7b's contract §1
 recorded as never executed (whether REST v2's `args` field reaches `bash -c` on `RP_IMAGE`) is
 CLOSED, executed 2026-09-16 against a real single-pod REST v2 create (pod `rln5hfmn4viu06`,
-`docs/maintainer/dev-gpu.md`'s cluster-leg section carries the full record); `ens1` as a cluster
-member's own overlay iface, member sshd reachability on a real cluster, and member self-removal
-remain unmeasured until the one real cluster run above executes.
+`docs/maintainer/dev-gpu.md`'s cluster-leg section carries the full record). The one real
+two-host run above executed under the `pods` transport (below): row C9's artifact
+(`2026-09-17-500-u7b-gang-cluster-6207a918-rtx-4090-two-host-pods.json`, GPU cluster run
+`35171132263`) measures member sshd reachability by an executed connect (never RunPod's own
+RUNNING status), both members' concurrent builds, the NCCL-id crossing bounded by the work, rank
+logs on every exit arm, and mutual termination of both pods via `rp_terminate` on every exit arm.
+`ens1` as the INSTANT CLUSTER product's own overlay iface remains unmeasured — the real run used
+the `pods` transport, not `cluster` (near-zero capacity, below), so that path stays row C9's own
+open determinant if `cluster` is ever exercised for real.
+
+Dated correction, 2026-09-16 (a second transport): the INSTANT CLUSTER product this unit's driver
+originally targeted measured near-zero capacity in practice (eight of nine creates in one session
+refused `Insufficient resources`), while ordinary RunPod pods provision reliably and RunPod's
+Global Networking gives two pods a private network between them — the same proof
+(`gang_nccl_two_hosts_reduce_a_known_vector`) does not care which fabric carries the bytes. The
+driver now selects `RP_TWO_HOST_TRANSPORT=pods|cluster` (env; `gpu-cluster.yml`'s own `transport`
+workflow_dispatch input; default `pods`) — `cluster` is UNCHANGED, byte-for-byte, from the shape
+this unit shipped above. Under `pods` the driver reads pod availability
+(`GET /v2/catalog/gpus?include=AVAILABILITY&product=POD&count=1&cloud=SECURE`, the same read
+`_rpc_pick_data_centers` already performs) and Global-Networking data centers
+(`GET /v2/datacenters`, `globalNetwork: true`, read live — never a hard-coded list), intersects
+the two, and picks ONE data center for BOTH pods (`_rpc_intersect_data_centers`); creates two
+ordinary pods (`rp_two_host_pod_create`, the RENTING ROOT `check_gpu_prove_once.py`'s P7 now
+tracks alongside `_rp_deploy_payload`/`rp_cluster_create`) with `cloud: SECURE`,
+`globalNetworking: true`, one GPU each; rank is assigned by creation order (first pod = rank 0,
+second = rank 1); waits for both RUNNING with Global Networking enabled, the SAME `dataCenterId`,
+and a direct ssh endpoint on each (`_rpc_wait_for_two_host_pods_ready`, refusing 97 before any
+build otherwise — the pods transport never uses the cluster path's overlay-ip proxy fallback,
+since `scp`/`rsync` cannot ride through it); each member DERIVES its own `NCCL_SOCKET_IFNAME`
+from its Global-Networking ip at run time (`ip -o -4 addr show`, never a literal), refusing 97 by
+name when no local interface carries it; and terminates BOTH pods on every exit arm via the SAME
+`rp_terminate`/`rp_pod_gone` primitives every other pod lane uses (no new termination primitive).
+`gang.leg` stays `"cluster"` either way (the two-HOST leg is the fact that matters downstream);
+`gang.transport` (`instant-cluster` | `global-networking`, closed set, required) is the sub-fact,
+bound into `check_cuda_run_artifacts.py` rule (k)'s `GANG_CLUSTER_FIELD_REGISTRY`. Cost bound at
+the catalog's own SECURE POD rate ($1.59/GPU/h for the default A100 SXM4 part):
+`2 x $1.59/GPU/h = $3.18/h`; `1 h x $3.18/h = $3.18` terminate-succeeds,
+`(1 + 6) h x $3.18/h = $22.26` sweep-only (both pods fall under the ordinary pod sweep's own
+name-shape match, so `gpu-reap.yml`'s SAME 6-hourly cadence is the backstop — no separate sweep
+primitive for this transport). Spec: `ci/scripts/test_gpu_cluster_lane.sh`'s own TWOPODS section
+(P1–P10, each with an executed oracle and a revert-RED against the real driver); prose updated in
+this driver's own header, `gpu-cluster.yml`, and `docs/maintainer/dev-gpu.md`'s cluster-leg
+section. The lead's own one real run (standing authorization) is unaffected: this unit still
+ships no live RunPod call.
 
 ## U5a — `GangService` on `peer_bind`; I-GANG authorization; admit-and-hold (PR-C commit 2)
 
@@ -803,9 +844,21 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   coordinator/rank role (RED at base: no runner-role parameter exists — a missed site is silent,
   not a compile error); `RankEvent::Outcome` end-to-end reaches the same terminal state as
   today's loop-claimed run, byte-for-byte, via a hermetic two-member `Local` gang (`W == 1`
-  itself never traverses the coordinator — a pinned row); `W > 1` resume is refused at assembly
-  with a typed reason (resume-state broadcast across ranks is its own follow-up, issue #543,
-  never built here).
+  itself never traverses the coordinator — a pinned row); resume at `W > 1` follows the shared
+  artifact root: every rank calls `discover_resume` (`fine_tune/worker.rs::discover_resume`,
+  per-rank call site `worker.rs:8455`) against the SAME tenant-scoped checkpoint prefix, and the
+  coordinator (rank 0, `RunnerRole::Holder`) is the sole writer of the resume checkpoint
+  (`fine_tune/trainer.rs::save_resume_checkpoint`); a fleet with no shared artifact root cannot
+  form a `Peer` gang at all — refused at the membership listing by the root-identity predicate
+  (`Catalog::list_gang_members`, `jammi-db/src/catalog/jobs_repo.rs:2761-2786`), proven by
+  `jammi-db/tests/it/gang_membership.rs:544`
+  (`file_and_s3_rooted_members_are_not_gang_members_of_each_other`) and `:740`
+  (`a_row_with_a_root_but_no_identity_is_never_a_member`). #543's own "REFUSED at assembly" text
+  is WITHDRAWN: the resume half is closed by
+  `jammi-server/tests/it/gang_resume_parity.rs::peer_and_local_w2_gangs_resume_from_epoch_1s_checkpoint_and_publish_byte_identical_adapters`
+  (`:347`) and `::a_corrupted_epoch_1_checkpoint_fails_attempt_2_loudly_never_a_silent_restart`
+  (`:368`) — Peer W=2 and Local W=2 publish byte-identical adapters from the same checkpoint, and
+  a corrupted checkpoint fails loudly rather than silently restarting from scratch.
 - **lane**: hermetic. **depends_on**: U5b-1b-ii (`Outcome`'s only consumer is that unit's
   terminal write on receipt; they land together, never `Outcome` shipped alone). **size**: L
   (the largest unit in the split — eleven `record_failed` sites × two runner roles × the K4

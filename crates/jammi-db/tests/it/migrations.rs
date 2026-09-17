@@ -59,6 +59,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "036_instances_result_root_identity",
     "037_jobs_assembly_failures_next_after",
     "038_compute_cluster_state",
+    "039_canonical_stamps",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -242,8 +243,8 @@ async fn migration_019_normalizes_available_status_to_registered() {
             Box::pin(async move {
                 for (id, status) in [("legacy::1", "available"), ("modern::1", "registered")] {
                     tx.execute(
-                        "INSERT INTO models (model_id, name, model_type, task, version, status) \
-                         VALUES ($1, $2, 'embedding', 'text-embedding', 1, $3)",
+                        "INSERT INTO models (model_id, name, model_type, task, version, status, created_at, updated_at) \
+                         VALUES ($1, $2, 'embedding', 'text-embedding', 1, $3, '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')",
                         &[
                             SqlValue::TextOwned(id.into()),
                             SqlValue::TextOwned(id.into()),
@@ -856,14 +857,27 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                 // drops, and those are non-idempotent — replaying 038 would
                 // fail on "table already exists". The reopened `workers`
                 // table below is missing `devices` as a result, which this
-                // test's `jobs`-only assertions never observe.
+                // test's `jobs`-only assertions never observe. `039` DOES
+                // join this list (replay-idempotence, R5): its `jobs`/
+                // `instances` triggers were dropped along with the tables
+                // above (`DROP TABLE` drops a table's own triggers in
+                // SQLite), so it must replay to reinstall them, or the
+                // reopened `jobs`/`instances` would carry NO schema-edge
+                // stamp domain at all. Replaying it is safe for the tables
+                // this test does NOT drop (`result_tables`, `models`,
+                // `compute_executors`, `applied_migrations`): their triggers
+                // survive intact, `CREATE TRIGGER IF NOT EXISTS` makes
+                // reinstalling them a no-op, and the data-rewrite `UPDATE`s
+                // are naturally idempotent (their `WHERE` excludes
+                // already-canonical rows).
                 tx.execute(
                     "DELETE FROM applied_migrations WHERE name IN ( \
                        '029_jobs_instances_workers', '030_jobs_idempotency_key', \
                        '031_jobs_releases_workers_state', '034_jobs_training_set_identity', \
                        '035_instances_peer_addr_result_root', \
                        '036_instances_result_root_identity', \
-                       '037_jobs_assembly_failures_next_after')",
+                       '037_jobs_assembly_failures_next_after', \
+                       '039_canonical_stamps')",
                     &[],
                 )
                 .await?;
@@ -871,8 +885,9 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                 // requires — the copy's `base_model_id -> model_ref` value
                 // must resolve.
                 tx.execute(
-                    "INSERT INTO models (model_id, name, model_type, task) \
-                     VALUES ('base::1', 'base', 'embedding', 'text-embedding')",
+                    "INSERT INTO models (model_id, name, model_type, task, created_at, updated_at) \
+                     VALUES ('base::1', 'base', 'embedding', 'text-embedding', \
+                             '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')",
                     &[],
                 )
                 .await?;
@@ -1606,7 +1621,7 @@ async fn migration_032_creates_result_table_versions(
                 let name = format!("mig032_{}", jammi_test_utils::unique_suffix());
                 tx.execute(
                     "INSERT INTO result_tables (table_name, source_id, model_id, task, \
-                     parquet_path, created_at) VALUES ($1, 's', 'm', 'text_embedding', 'p', 'now')",
+                     parquet_path, created_at) VALUES ($1, 's', 'm', 'text_embedding', 'p', '2026-01-01T00:00:00.000000Z')",
                     &[jammi_db::catalog::backend::SqlValue::TextOwned(
                         name.clone(),
                     )],
@@ -1818,8 +1833,9 @@ async fn migration_033_is_ordered_after_032_and_adds_model_materialization_colum
             let pk = pk.clone();
             Box::pin(async move {
                 tx.execute(
-                    "INSERT INTO models (model_id, name, model_type, task, version) \
-                     VALUES ($1, $1, 'lora', 'text_embedding', 1)",
+                    "INSERT INTO models (model_id, name, model_type, task, version, created_at, updated_at) \
+                     VALUES ($1, $1, 'lora', 'text_embedding', 1, \
+                             '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')",
                     &[jammi_db::catalog::backend::SqlValue::TextOwned(pk)],
                 )
                 .await
@@ -1963,7 +1979,7 @@ async fn migration_034_is_ordered_after_033_and_pins_the_pair_at_the_schema_edge
     let job_id = format!("mig033_{}", jammi_test_utils::unique_suffix());
     let insert_bare = format!(
         "INSERT INTO jobs (job_id, kind, execution, spec, created_at, updated_at) \
-         VALUES ('{job_id}', 'k', 'queued', '{{}}', 'now', 'now')"
+         VALUES ('{job_id}', 'k', 'queued', '{{}}', '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')"
     );
 
     // Both NULL succeeds — the default, every existing and every `world_size
@@ -1985,7 +2001,7 @@ async fn migration_034_is_ordered_after_033_and_pins_the_pair_at_the_schema_edge
                 tx.execute(
                     "INSERT INTO jobs (job_id, kind, execution, spec, created_at, updated_at, \
                          training_set_ref, training_set_location) \
-                     VALUES ($1, 'k', 'queued', '{}', 'now', 'now', 'digest-x', 'table-y')",
+                     VALUES ($1, 'k', 'queued', '{}', '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z', 'digest-x', 'table-y')",
                     &[SqlValue::TextOwned(job_id2)],
                 )
                 .await
@@ -2161,7 +2177,7 @@ async fn migration_035_is_ordered_after_034_and_adds_instances_peer_addr_result_
             Box::pin(async move {
                 tx.execute(
                     "INSERT INTO instances (instance_id, started_at, last_seen_at) \
-                     VALUES ($1, 'now', 'now')",
+                     VALUES ($1, '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')",
                     &[SqlValue::TextOwned(id_null)],
                 )
                 .await
@@ -2176,7 +2192,7 @@ async fn migration_035_is_ordered_after_034_and_adds_instances_peer_addr_result_
                 tx.execute(
                     "INSERT INTO instances \
                          (instance_id, started_at, last_seen_at, peer_addr, result_root) \
-                     VALUES ($1, 'now', 'now', '10.0.0.1:9000', 'file:///data/jammi_db')",
+                     VALUES ($1, '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z', '10.0.0.1:9000', 'file:///data/jammi_db')",
                     &[SqlValue::TextOwned(id_set)],
                 )
                 .await
@@ -2396,7 +2412,7 @@ async fn migration_037_is_ordered_after_036_and_adds_assembly_failures_next_afte
                 tx.execute(
                     "INSERT INTO jobs \
                      (job_id, kind, status, execution, spec, created_at, updated_at) \
-                     VALUES ($1, 'fine_tune', 'queued', 'queued', '{}', 'now', 'now')",
+                     VALUES ($1, 'fine_tune', 'queued', 'queued', '{}', '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')",
                     &[jammi_db::catalog::backend::SqlValue::TextOwned(job_id)],
                 )
                 .await
@@ -2594,7 +2610,7 @@ async fn migration_038_is_ordered_after_035_and_037_and_creates_compute_tables(
                     "INSERT INTO compute_executors \
                      (executor_id, instance_id, host, port, grpc_port, task_slots, \
                       available_slots, status, heartbeat_at, metadata) \
-                     VALUES ($1, 'inst-1', 'localhost', 50051, 50052, 1, 1, 'live', 'now', '{}')",
+                     VALUES ($1, 'inst-1', 'localhost', 50051, 50052, 1, 1, 'live', '2026-01-01T00:00:00.000000Z', '{}')",
                     &[SqlValue::TextOwned(executor_id.clone())],
                 )
                 .await
@@ -2687,7 +2703,7 @@ async fn migration_038_is_ordered_after_035_and_037_and_creates_compute_tables(
             Box::pin(async move {
                 tx.execute(
                     "INSERT INTO instances (instance_id, started_at, last_seen_at) \
-                     VALUES ($1, 'now', 'now')",
+                     VALUES ($1, '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')",
                     &[SqlValue::TextOwned(instance_id.clone())],
                 )
                 .await?;
@@ -2725,4 +2741,541 @@ async fn migration_038_is_ordered_after_035_and_037_and_creates_compute_tables(
         devices, "[]",
         "workers.devices defaults to the empty JSON array"
     );
+}
+
+/// The 13 `(table, column)` pairs `catalog::lease`'s schema-edge domain
+/// (migration `039_canonical_stamps`) enforces — the universe gate this
+/// oracle enumerates against (R5: "a future rebuild-dance migration cannot
+/// silently drop enforcement").
+const CANONICAL_STAMP_COLUMNS: &[(&str, &str)] = &[
+    ("jobs", "lease_expires_at"),
+    ("jobs", "next_assembly_after"),
+    ("jobs", "updated_at"),
+    ("jobs", "created_at"),
+    ("instances", "last_seen_at"),
+    ("instances", "started_at"),
+    ("result_tables", "lease_expires_at"),
+    ("result_tables", "created_at"),
+    ("result_table_versions", "lease_expires_at"),
+    ("compute_executors", "heartbeat_at"),
+    ("models", "created_at"),
+    ("models", "updated_at"),
+    ("applied_migrations", "applied_at"),
+];
+
+/// Migration `039_canonical_stamps` (R5, `catalog::lease`'s pin sites) is
+/// ordered after `038_compute_cluster_state` (K5: relative position, never
+/// `.last()` — it names `compute_executors`, which `038` creates), and the
+/// enforcement set it installs — on SQLite, a `BEFORE INSERT` AND a
+/// `BEFORE UPDATE OF <col>` trigger per [`CANONICAL_STAMP_COLUMNS`] entry
+/// (26 triggers); on Postgres, one `sdchk__<table>__<column>` `CHECK`
+/// constraint per entry (13 constraints) — equals exactly that set on a
+/// freshly migrated catalog. A future migration that rebuilds one of these
+/// tables (SQLite's create-new/copy/drop/rename dance, migration 012's own
+/// shape) without reinstalling its two triggers would silently drop
+/// enforcement for that column; this oracle catches it by enumerating
+/// `sqlite_master`/`pg_constraint` directly rather than trusting that the
+/// DDL which installed them once still applies.
+#[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn migration_039_is_ordered_after_038_and_the_enforcement_set_is_exact(
+    kind: jammi_db::catalog::backend::BackendKind,
+) {
+    use jammi_db::catalog::backend::{BackendKind, SqlValue};
+
+    let position = |name: &str| {
+        EXPECTED_MIGRATION_NAMES
+            .iter()
+            .position(|m| *m == name)
+            .unwrap_or_else(|| panic!("{name} missing from EXPECTED_MIGRATION_NAMES"))
+    };
+    assert!(
+        position("039_canonical_stamps") > position("038_compute_cluster_state"),
+        "039_canonical_stamps must follow 038 (it enforces compute_executors.heartbeat_at, \
+         which 038 creates)"
+    );
+
+    let dir = tempdir().unwrap();
+    let backend = match kind {
+        BackendKind::Sqlite => {
+            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
+        }
+        BackendKind::Postgres => {
+            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+                return;
+            };
+            BackendImpl::Postgres(
+                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
+                    &url, 4, None,
+                )
+                .await
+                .unwrap(),
+            )
+        }
+    };
+    backend.migrate().await.unwrap();
+
+    match kind {
+        BackendKind::Sqlite => {
+            let expected: std::collections::BTreeSet<String> = CANONICAL_STAMP_COLUMNS
+                .iter()
+                .flat_map(|(t, c)| {
+                    [
+                        format!("trg_{t}_{c}_canonical_ins"),
+                        format!("trg_{t}_{c}_canonical_upd"),
+                    ]
+                })
+                .collect();
+            assert_eq!(expected.len(), CANONICAL_STAMP_COLUMNS.len() * 2);
+            let actual: std::collections::BTreeSet<String> = backend
+                .transaction(
+                    TxOptions {
+                        read_only: true,
+                        ..Default::default()
+                    },
+                    |tx| {
+                        Box::pin(async move {
+                            tx.query(
+                                "SELECT name FROM sqlite_master WHERE type = 'trigger' \
+                                 AND name LIKE 'trg_%_canonical_%'",
+                                &[],
+                                |row| row.get::<String>("name"),
+                            )
+                            .await
+                        })
+                    },
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "the SQLite trigger set must equal CANONICAL_STAMP_COLUMNS exactly"
+            );
+        }
+        BackendKind::Postgres => {
+            let expected: std::collections::BTreeSet<String> = CANONICAL_STAMP_COLUMNS
+                .iter()
+                .map(|(t, c)| format!("sdchk__{t}__{c}"))
+                .collect();
+            let actual: std::collections::BTreeSet<String> = backend
+                .transaction(
+                    TxOptions {
+                        read_only: true,
+                        ..Default::default()
+                    },
+                    |tx| {
+                        Box::pin(async move {
+                            tx.query(
+                                "SELECT conname FROM pg_constraint \
+                                 WHERE contype = 'c' AND conname LIKE $1",
+                                &[SqlValue::TextOwned("sdchk\\_\\_%".to_string())],
+                                |row| row.get::<String>("conname"),
+                            )
+                            .await
+                        })
+                    },
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "the Postgres sdchk__ constraint set must equal CANONICAL_STAMP_COLUMNS exactly"
+            );
+        }
+    }
+}
+
+/// R2 (round-2 REFINE): S2's fail-closed migration is an OUTCOME property,
+/// not a mechanism — a refused re-application of `039_canonical_stamps`
+/// must leave the ledger at 038, the offending row's own value untouched,
+/// AND install NEITHER the trigger nor the `CHECK` for the column it could
+/// not normalise (a `RAISE(ABORT)`/cast fault rolls back only its own
+/// statement; fail-closed holds because the migration RUNNER's one
+/// transaction is never committed once an `Err` propagates — the state
+/// this oracle asserts, not the rollback mechanism itself).
+///
+/// SQLite only, deliberately: 039 is ONE migration entry, tracked by ONE
+/// ledger name, so re-applying it (clearing its ledger row) re-runs its
+/// FULL 26-trigger/13-rewrite statement list, not just the one column this
+/// test manufactures an offending value for. On a private tempdir catalog
+/// (this test's own, touched by nothing else) that is harmless — every
+/// other column's trigger/rewrite is a no-op against already-canonical
+/// data. The Postgres arm was tried first and DROPPED after it corrupted
+/// the shared `jammi_test` database's migration ledger twice in a row
+/// (this file's own PR history): re-applying 039 there re-attempted
+/// `ADD CONSTRAINT` for the 12 OTHER columns this test never touched,
+/// which already existed from the real, once-only migration every other
+/// test in this suite depends on, and failed with `already exists` —
+/// requiring a manual `pg_dump`/`psql` repair of shared infrastructure. A
+/// migration that is monolithic across many columns cannot safely be
+/// partially rewound against a database other concurrent test runs share;
+/// SQLite's per-test isolation is the only backend this specific fixture
+/// shape is safe on. The property itself — a failed migration's
+/// transaction never commits — is backend-symmetric (verified once by
+/// hand against a live Postgres scratch table during development) and is
+/// exercised by EVERY OTHER migration's own tests on both backends
+/// already (the runner's transaction wrapping is not 039-specific code).
+#[tokio::test]
+async fn migration_039_on_an_unclassifiable_value_fails_closed() {
+    use jammi_db::catalog::backend::SqlValue;
+
+    let dir = tempdir().unwrap();
+    let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
+    // A real, fully-migrated catalog first (039 included) -- the baseline
+    // every assertion below diffs against.
+    backend.migrate().await.unwrap();
+
+    let job_id = "mig039-fail-closed".to_string();
+    let offending = "unclassifiable-garbage-value";
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                // A minimal, valid `jobs` row so the UPDATE below has
+                // something to hit.
+                tx.execute(
+                    "INSERT INTO jobs (job_id, kind, execution, spec, created_at, updated_at) \
+                     VALUES ($1, 'k', 'queued', '{}', '2026-01-01T00:00:00.000000Z', \
+                             '2026-01-01T00:00:00.000000Z')",
+                    &[SqlValue::TextOwned(job_id.clone())],
+                )
+                .await?;
+                tx.execute("DROP TRIGGER trg_jobs_lease_expires_at_canonical_ins", &[])
+                    .await?;
+                tx.execute("DROP TRIGGER trg_jobs_lease_expires_at_canonical_upd", &[])
+                    .await?;
+                tx.execute(
+                    "UPDATE jobs SET lease_expires_at = $1 WHERE job_id = $2",
+                    &[
+                        SqlValue::Text(offending),
+                        SqlValue::TextOwned(job_id.clone()),
+                    ],
+                )
+                .await?;
+                tx.execute(
+                    "DELETE FROM applied_migrations WHERE name = '039_canonical_stamps'",
+                    &[],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+
+    // The re-application must fail.
+    let err = backend.migrate().await.expect_err(
+        "039 must refuse to normalise a value none of its three recognised shapes match",
+    );
+    assert!(
+        matches!(
+            err,
+            jammi_db::catalog::backend::BackendError::DomainViolation { .. }
+        ),
+        "the refusal must be the typed domain-violation class, got {err:?}"
+    );
+
+    // Outcome, not mechanism: the ledger stays at 038 for this migration,
+    let ledger: Vec<String> = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query(
+                        "SELECT name FROM applied_migrations WHERE name = '039_canonical_stamps'",
+                        &[],
+                        |row| row.get::<String>("name"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        ledger.is_empty(),
+        "039_canonical_stamps must NOT be recorded as applied after a failed re-application"
+    );
+
+    // the row's own value is untouched (never rewritten, never nulled),
+    let stored: String = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                let job_id = job_id.clone();
+                Box::pin(async move {
+                    tx.query_opt(
+                        "SELECT lease_expires_at FROM jobs WHERE job_id = $1",
+                        &[SqlValue::TextOwned(job_id)],
+                        |row| row.get::<String>("lease_expires_at"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the row must still exist");
+    assert_eq!(
+        stored, offending,
+        "the offending row's value must be intact after the refused migration"
+    );
+
+    // and the enforcement this exact failed attempt would have installed
+    // does NOT exist (the dropped trigger for THIS column stays dropped --
+    // a refused migration installs nothing, not even partially).
+    let enforcement_exists: bool = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    let rows: Vec<i64> = tx
+                        .query(
+                            "SELECT 1 AS one FROM sqlite_master WHERE type = 'trigger' \
+                             AND name = 'trg_jobs_lease_expires_at_canonical_upd'",
+                            &[],
+                            |row| row.get::<i64>("one"),
+                        )
+                        .await?;
+                    Ok(!rows.is_empty())
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !enforcement_exists,
+        "a refused migration must install neither the trigger nor the CHECK it was attempting"
+    );
+}
+
+/// `catalog::lease::pg_canonical_stamp`'s GUC-independence (S1's own oracle
+/// requirement): `to_char` with an explicit picture must render the SAME
+/// text regardless of the session's `DateStyle`/`TimeZone`, unlike a bare
+/// `::text` cast. `SET LOCAL` (transaction-scoped, reverted automatically
+/// at commit or rollback) rather than `SET`, since this runs on a POOLED
+/// connection another test could reuse afterward. Self-contained: no
+/// table at all, a plain `SELECT` of a literal expression, never touching
+/// the shared schema.
+#[cfg(feature = "live-postgres-tests")]
+#[tokio::test]
+async fn pg_canonical_stamp_is_independent_of_session_datestyle_and_timezone() {
+    use jammi_db::catalog::lease::pg_canonical_stamp;
+
+    let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+        eprintln!("skipping: JAMMI_TEST_PG_URL unset");
+        return;
+    };
+    let backend = BackendImpl::Postgres(
+        jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(&url, 2, None)
+            .await
+            .unwrap(),
+    );
+
+    let default_render: String = backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                let sql = format!(
+                    "SELECT {} AS s",
+                    pg_canonical_stamp("'2026-01-01T00:00:00.123456Z'::timestamptz")
+                );
+                tx.query_opt(&sql, &[], |row| row.get::<String>("s")).await
+            })
+        })
+        .await
+        .unwrap()
+        .expect("one row");
+
+    let altered_render: String = backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute("SET LOCAL datestyle = 'SQL, MDY'", &[]).await?;
+                tx.execute("SET LOCAL timezone = 'Asia/Kolkata'", &[])
+                    .await?;
+                let sql = format!(
+                    "SELECT {} AS s",
+                    pg_canonical_stamp("'2026-01-01T00:00:00.123456Z'::timestamptz")
+                );
+                tx.query_opt(&sql, &[], |row| row.get::<String>("s")).await
+            })
+        })
+        .await
+        .unwrap()
+        .expect("one row");
+
+    assert_eq!(
+        default_render, "2026-01-01T00:00:00.123456Z",
+        "the default-session rendering must already be canonical"
+    );
+    assert_eq!(
+        default_render, altered_render,
+        "pg_canonical_stamp's rendering must not depend on DateStyle/TimeZone"
+    );
+
+    // Control: a bare `::text` cast (what the pre-039 writer used) DOES
+    // depend on these GUCs -- proving the oracle's altered-session arm
+    // actually changed something observable, not merely a no-op SET.
+    let bare_cast_default: String = backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.query_opt(
+                    "SELECT ('2026-01-01T00:00:00.123456Z'::timestamptz)::text AS s",
+                    &[],
+                    |row| row.get::<String>("s"),
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap()
+        .expect("one row");
+    let bare_cast_altered: String = backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute("SET LOCAL datestyle = 'SQL, MDY'", &[]).await?;
+                tx.query_opt(
+                    "SELECT ('2026-01-01T00:00:00.123456Z'::timestamptz)::text AS s",
+                    &[],
+                    |row| row.get::<String>("s"),
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap()
+        .expect("one row");
+    assert_ne!(
+        bare_cast_default, bare_cast_altered,
+        "control: a bare ::text cast DOES vary with DateStyle -- confirms the SET actually took \
+         effect, so pg_canonical_stamp's invariance above is not a vacuous pass"
+    );
+}
+
+/// GRAPH (#515) contracts/graph.md §4.6/§5 G8: a ledger-level source oracle.
+/// `jobs` is (or, once the still-held migration lands, will be) the FIRST FK
+/// PARENT in this schema, and `PRAGMA foreign_keys` is ON for the pool
+/// migrations run on (`backend_sqlite.rs`'s `.foreign_keys(true)`) — so a
+/// FUTURE migration that rebuilds `jobs` with this codebase's own canonical
+/// SQLite create-new/copy/DROP-old/RENAME idiom (schema.rs already uses it
+/// for `topics`, `eval_runs`, `evidence_channels`, `training_jobs`) would
+/// silently CASCADE-delete every row of any table that FK-references
+/// `jobs(job_id) ON DELETE CASCADE` the moment the old `jobs` table is
+/// dropped, unless that migration explicitly disables FK enforcement (or
+/// otherwise preserves the referencing rows) for the swap. No migration in
+/// `MIGRATIONS` does this today (verified by this test — 040's future
+/// `job_dependencies`/`job_ancestors` tables have not landed yet, and every
+/// EXISTING rebuild targets a different table); this oracle pins that state
+/// so a future migration cannot introduce the hazard unnoticed. Scoped by
+/// TABLE NAME, not substring: `training_jobs` (migration 029's own DROP) is
+/// a DIFFERENT table and must not false-positive.
+#[test]
+fn no_migration_text_rebuilds_the_jobs_table_without_a_stated_preserving_idiom() {
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/catalog/schema.rs"
+    ))
+    .expect("read schema.rs");
+
+    let forbidden = jobs_table_rebuild_hits(&source);
+    assert!(
+        forbidden.is_empty(),
+        "a migration text rebuilds (or renames away) the `jobs` table without a stated \
+         preserving idiom -- this can silently drop every FK-referencing row \
+         (job_dependencies/job_ancestors) once `jobs` is a FK parent under \
+         PRAGMA foreign_keys = ON: {forbidden:?}. Either this migration explicitly disables \
+         FK enforcement for the swap (documented in its own rustdoc, matching \
+         schema.rs:1438-1444's rule for 039) or the change belongs elsewhere."
+    );
+}
+
+/// Every line in `source` matching a `jobs`-table rebuild/rename shape,
+/// scoped to the EXACT table name (never a substring like `training_jobs`).
+fn jobs_table_rebuild_hits(source: &str) -> Vec<(usize, String)> {
+    let mut hits = Vec::new();
+    for (idx, line) in source.lines().enumerate() {
+        let has_drop_jobs = contains_word_pair(line, "DROP TABLE", "jobs");
+        let has_rename_to_jobs = contains_word_pair(line, "RENAME TO", "jobs");
+        let has_alter_jobs_rename = line.contains("ALTER TABLE jobs") && line.contains("RENAME");
+        if has_drop_jobs || has_rename_to_jobs || has_alter_jobs_rename {
+            hits.push((idx + 1, line.trim().to_string()));
+        }
+    }
+    hits
+}
+
+/// True when `line` contains `prefix` immediately followed by whitespace and
+/// EXACTLY the identifier `word` (not a longer identifier it is a suffix of
+/// — `training_jobs` must not match `word = "jobs"`).
+fn contains_word_pair(line: &str, prefix: &str, word: &str) -> bool {
+    let Some(pos) = line.find(prefix) else {
+        return false;
+    };
+    let rest = line[pos + prefix.len()..].trim_start();
+    let ident_end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    &rest[..ident_end] == word
+}
+
+#[cfg(test)]
+mod jobs_table_rebuild_hits_self_tests {
+    use super::{contains_word_pair, jobs_table_rebuild_hits};
+
+    #[test]
+    fn a_bare_drop_table_jobs_is_a_hit() {
+        assert_eq!(
+            jobs_table_rebuild_hits("DROP TABLE jobs;\n"),
+            vec![(1, "DROP TABLE jobs;".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_rename_to_jobs_is_a_hit() {
+        assert_eq!(
+            jobs_table_rebuild_hits("ALTER TABLE jobs_new RENAME TO jobs;\n"),
+            vec![(1, "ALTER TABLE jobs_new RENAME TO jobs;".to_string())]
+        );
+    }
+
+    /// The negative control naming the exact false-positive this scoping
+    /// exists to avoid: `training_jobs` is a DIFFERENT table.
+    #[test]
+    fn drop_table_training_jobs_is_not_a_hit() {
+        assert!(jobs_table_rebuild_hits("DROP TABLE training_jobs;\n").is_empty());
+    }
+
+    #[test]
+    fn rename_to_training_jobs_is_not_a_hit() {
+        assert!(
+            jobs_table_rebuild_hits("ALTER TABLE fine_tune_jobs RENAME TO training_jobs;\n")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn contains_word_pair_rejects_a_longer_identifier() {
+        assert!(!contains_word_pair(
+            "DROP TABLE training_jobs;",
+            "DROP TABLE",
+            "jobs"
+        ));
+        assert!(contains_word_pair("DROP TABLE jobs;", "DROP TABLE", "jobs"));
+    }
 }

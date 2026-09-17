@@ -60,9 +60,28 @@
 # never as a false green), so it is a documented limitation, not a bug to
 # route around — the remedy is to call the registered name directly
 # (`cuda_device()`), never assign it to a local first.
-# Format: one `<file-relative-to-repo-root>::<fn_name>` per line.
+#
+# #513 G7' — resource binding (OPT-IN): a line may carry a trailing
+# ` resource=<tag>` annotation (a single space, then `resource=`, then a
+# tag from check_kernel_oracles.py's own `RESOURCE_REQUIRE_VARS`). The
+# fixed-point delegation pass above proves a candidate genuinely reaches
+# SOME registered, panicking require-gate — never WHICH resource that
+# gate governs. A caller whose skip is nominally about one resource
+# (Postgres) could delegate to an accessor actually gated on an
+# unrelated resource's variable (JAMMI_REQUIRE_GPU) and still be
+# credited, since "reaches a genuine gate" is true regardless of which
+# JAMMI_REQUIRE_* name that gate reads. An annotated line's OWN direct
+# env-read (never a delegated one — see check_resource_binding's own
+# scope note) must resolve to the JAMMI_REQUIRE_* variable the tag
+# names, checked on every run. Un-annotated lines (the default, and
+# every pre-existing line below) make no resource claim and are
+# untouched by this check — annotating one is a reviewed act, exactly
+# like adding a row.
+#
+# Format: one `<file-relative-to-repo-root>::<fn_name>` per line, with an
+# optional trailing ` resource=<tag>`.
 
-crates/jammi-kernels/tests/cuda_parity.rs::cuda_device
+crates/jammi-kernels/tests/cuda_parity.rs::cuda_device resource=gpu
 crates/jammi-kernels/tests/flash_smoke.rs::cuda_device
 crates/jammi-kernels/tests/flash_op_oracles.rs::cuda_device
 crates/jammi-kernels/tests/flash_torch_parity.rs::cuda_device
@@ -124,7 +143,7 @@ crates/jammi-encoders/tests/bits_snapshot.rs::k4_snapshot_require_gate
 # because every one of those twelve (and future) callers must be gated
 # for free, with nothing to remember — reintroducing a per-file wrapper
 # here is exactly the failure mode this registration replaces.
-shared:crates/jammi-test-utils/src/lib.rs::pg_url_for_tests
+shared:crates/jammi-test-utils/src/lib.rs::pg_url_for_tests resource=pg
 # `make_test_session` is a same-file convenience wrapper that FORWARDS to
 # `pg_url_for_tests` (`let url = pg_url_for_tests()?;`) rather than reading
 # the env itself — verified by DELEGATION (one hop to the entry directly
@@ -145,4 +164,4 @@ crates/jammi-db/tests/it/segment.rs::open_backend
 crates/jammi-db/tests/it/sources.rs::build_backend
 crates/jammi-db/tests/it/trigger.rs::build_harness_with_broker
 crates/jammi-db/tests/it/trigger.rs::build_harness_with_in_memory_broker
-shared:crates/jammi-ballista/tests/distributed/harness.rs::required_backends
+shared:crates/jammi-ballista/tests/distributed/harness.rs::required_backends resource=distributed

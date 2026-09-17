@@ -983,7 +983,7 @@ async fn live_writer_survives_peer_recover_w2(kind: BackendKind) {
     // predicate, not a Rust-side string compare against `row.lease_expires_at`
     // — that stored value is a Postgres-clock expression's text rendering on
     // Postgres (`(now() + make_interval(...))::text`), not the
-    // `lease_now()`-shaped string a naive `>` compare here would assume.
+    // `canonical_stamp_now()`-shaped string a naive `>` compare here would assume.
     assert!(
         cat_a
             .list_live_building_tables()

@@ -67,6 +67,11 @@ export RP_TIMEOUT="${RP_TIMEOUT:-6000}"
 
 GIT_REPO="${GIT_REPO:-https://github.com/${GITHUB_REPOSITORY:-f-inverse/jammi-ai}.git}"
 GIT_REF="${GIT_REF:-${GITHUB_SHA:-main}}"
+# The remote checkout text, computed at source time (beside NATIVE_COMPUTE_CAP)
+# so a fixture that sources this file and renders the heredoc sees it: the
+# exact commit when PROVE_EXPECT_SHA is set, else the ref (runpod_lib.sh's
+# rp_remote_checkout_lines — one helper for every leg).
+REMOTE_CHECKOUT_LINES="$(rp_remote_checkout_lines "${GIT_REF}" "${GIT_REPO}")"
 
 # sm_XX (the GENCODE_ARCHES / check_gpu_parity_matrix.py silicon-axis naming)
 # -> the `rp_deploy_arch` candidate-list key (runpod_lib.sh), and -> the bare
@@ -240,9 +245,7 @@ if [ "\${compute_cap_norm}" != "\${CUDA_COMPUTE_CAP:-}" ]; then
   echo "::error::compute_cap mismatch: nvidia-smi reports compute_cap=\${compute_cap_raw} (normalized \${compute_cap_norm}) but CUDA_COMPUTE_CAP=\${CUDA_COMPUTE_CAP:-<unset>} -- rented device does not match this leg's requested arch, refusing to build"
   exit 97
 fi
-cd /root && rm -rf jammi-ai
-git clone --depth 1 -b "${GIT_REF}" "${GIT_REPO}" jammi-ai 2>&1 | tail -1
-cd jammi-ai
+${REMOTE_CHECKOUT_LINES}
 echo "PROVE_SHA=\$(git rev-parse HEAD)"
 rc=0
 # The vendored FlashAttention-2 build (\`flash-attn\`, now in the manifest's

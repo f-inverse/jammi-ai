@@ -83,6 +83,10 @@ serde_json.workspace = true
 toml.workspace = true
 serde_path_to_error.workspace = true
 
+# Enum-inventory-by-construction (#550): see the workspace manifest's comment
+# on this dependency.
+strum.workspace = true
+
 # Caching
 moka.workspace = true
 seahash.workspace = true
@@ -126,3 +130,20 @@ test-case = { workspace = true }
 # `libc` moved to `[dependencies]` above (now a real, non-dev dependency);
 # still available to every test in this crate through that promotion.
 parquet = { workspace = true }
+# I1's `models_delete_call_sites.rs` source oracle (#562(2), wave-5 pressure
+# round F2): re-keys the reviewed raw-byte-delete-call-site table by (file,
+# enclosing fn, ordinal-within-that-fn) rather than a bare source line, which
+# only a REAL AST walk — never a text-line scan — can determine correctly (a
+# hand-rolled brace-counter cannot tell a doc comment's rendered text from a
+# real call, or find the enclosing `fn` across a multi-line signature). Same
+# rationale, and the SAME pinned versions already resolved transitively in
+# `Cargo.lock`, as `jammi-ai/Cargo.toml`'s own `syn`/`proc-macro2` dev-deps
+# (`cargo tree -p proc-macro2 -p syn` confirms 2.0.117 / 1.0.106 already
+# resolve here) — adding this dev-only edge only appends `jammi-db` to those
+# two `[[package]]` entries' existing `dependencies` lists in `Cargo.lock`
+# (verified via `git diff Cargo.lock`: a 2-line addition, no new
+# `[[package]]` block and no version change), so `cargo deny`'s advisory
+# scan sees no new dependency or version. Test-only: no production code
+# parses Rust source.
+proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
+syn = { version = "2.0.117", features = ["full", "visit", "extra-traits"] }

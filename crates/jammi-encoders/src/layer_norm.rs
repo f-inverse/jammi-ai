@@ -100,6 +100,7 @@ use candle_core::{DType, Tensor, D};
 use candle_nn::{Init, VarBuilder};
 use jammi_kernels::admission::{
     admission_mode, admit, counters_for, device_is_supported, DispatchCounters, DispatchOutcome,
+    LAYER_NORM,
 };
 use jammi_kernels::ops::{apply2, apply3, LayerNormBiasedFused, LayerNormFused, MAX_HIDDEN};
 
@@ -582,7 +583,7 @@ impl LayerNorm {
         crate::seam_gate("layer_norm::forward_fused_or_fallback");
         let outcome = admit(
             admission_mode(),
-            "layer_norm_fused",
+            &LAYER_NORM,
             predicate,
             holds,
             *LN_DISPATCH_COUNTERS,
@@ -2435,11 +2436,11 @@ mod tests {
         // directly with an explicit `Strict` mode, exercising the exact
         // same code `forward_fused_or_fallback` runs without depending on
         // the env-var memoization's timing.
-        use jammi_kernels::admission::{admit, AdmissionMode};
+        use jammi_kernels::admission::{admit, AdmissionMode, LAYER_NORM};
         let counters = jammi_kernels::admission::DispatchCounters::new();
         let err = admit(
             AdmissionMode::Strict,
-            "layer_norm_fused",
+            &LAYER_NORM,
             "x_contiguous",
             false,
             &counters,

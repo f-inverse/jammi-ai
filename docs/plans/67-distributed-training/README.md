@@ -1,10 +1,24 @@
 # 67 — Multi-GPU and multi-node training as engine mechanism, on DataFusion (#500)
 
-**Status:** PLANNED, v4 — rebased on the jobs fleet, which is now on `main` (PR #501, merge
-`4ecc0230`, 2026-09-10: `jobs` table, migrations 029/030, `[worker]`, `JobService`; the #485/#486
-work), reconciled with `docs/plans/68-compute-tier-substrate/` (its PR-K is in CI), U8 reshaped as
-a Ballista **extension** unit. Scoped twice (gap-analyzer 2026-09-10, v1 and v4
-briefs), pressure-tested in four rounds (`PRESSURE.md`), NOT implemented. Hand-off order: this
+**Status:** SHIPPED, waves 1–5. The jobs fleet merged as PR #501 (`4ecc0230`, 2026-09-10: `jobs`
+table, migrations 029/030, `[worker]`, `JobService`; the #485/#486 work); every unit merged across
+PRs #521, #568, #575, #571, #579, #580, #584, #586, culminating in PR-D **merged as #586**
+(U8a: `crates/jammi-ballista/src/{codec,engine,cluster,placement}.rs`; U8b:
+`crates/jammi-db/src/catalog/migrations.rs`'s `038_compute_cluster_state`, `compute_executors.
+devices` in `schema.rs`; U9a/U9b: `deploy/kubernetes/overlays/shape-d/{deployment-scheduler,
+statefulset-compute,service-compute-headless,service-scheduler}.yaml`) — `Cargo.toml` pins
+`datafusion 54.1`, `arrow 58.3`, `ballista-core/-scheduler/-executor 54.1`, all confirmed on this
+tree. The wave-5 close-out (this PR, `feat/500-wave5`) lands the cluster-leg artifact (row C9,
+below), `#543`'s closure, and the v1 limits recorded in `DESIGN.md` §8. What is NOT in v1: the
+`graph_fine_tune` `Peer` gang (issue #538, DESIGN.md §8), the partition-aware `InferenceExec`
+range split (issue #540, out of scope — de-scoped from a withdrawn U6), and Ballista's
+accelerator-dimension seam (the one upstream PR 67 owes, README r43). 68's `DIST-2`
+(`RendezvousPlacement`) and `DIST-3` (`datafusion-distributed`) are unscheduled "later" work on
+top of this plan's substrate, not a precondition of anything here. Two unrelated backlog items
+are deferred indefinitely (user, 2026-09-16), not pending: #445 (Metal/f16 acceleration, parked
+for Mac hardware) and #478 (a Kafka driver for the trigger-stream broker); upstream contribution
+of `jammi-ballista` stays out of scope until jammi is proved by real users, beyond the one
+upstream PR already owed (r43). Hand-off order: this
 file, `DESIGN.md`, `UNITS.md`, `SIZING.md`, `PRESSURE.md`; then `68-compute-tier-substrate/README.md`
 for the sibling units 67 depends on.
 
@@ -212,13 +226,13 @@ those still in force are restated here in their v4 form. Principle in parenthese
     frees the lost task's slot and `SuccessfulStage::reset_tasks` re-fails its COMPLETED tasks as
     `ResultLost` (`retryable: true, count_to_failures: false`), which `update_task_status` resets
     **without consulting `task_max_failures`**. The `ExecutorLost` arm itself
-    (`scheduler_server/query_stage_scheduler.rs::QueryStageScheduler::on_receive`, the
+    (Ballista's `scheduler_server/query_stage_scheduler.rs::QueryStageScheduler::on_receive`, the
     `QueryStageSchedulerEvent::ExecutorLost` match arm) only resets the freed/re-failed tasks; it posts no
     `ReviveOffers` and no failure. **Re-launch on a surviving executor is conditional**, not
     automatic: `ReviveOffers` fires only from a later, independent event — a new executor
-    registering under push-staged scheduling (`do_register_executor`, `scheduler_server/mod.rs:
+    registering under push-staged scheduling (Ballista's `do_register_executor`, `scheduler_server/mod.rs:
     419`) or a subsequent `TaskUpdating` success under push-staged scheduling
-    (`scheduler_server/query_stage_scheduler.rs::QueryStageScheduler::on_receive`, the
+    (Ballista's `scheduler_server/query_stage_scheduler.rs::QueryStageScheduler::on_receive`, the
     `QueryStageSchedulerEvent::TaskUpdating` match arm's `ReviveOffers` post) — so with both retry knobs at 0, a `GangExec` on a killed
     executor is picked up only if one of those triggers fires afterward; with no other executor
     registering and no other in-flight task reporting status, the freed task can sit unscheduled
@@ -298,16 +312,16 @@ in r46); committed-artifact convention (r20); StatefulSet consequence, now owned
 | B | 6 | U2c | Streaming training-set loader with a residency bound (issue #544) | hermetic + cookbook | U2a, U2b, U4a |
 | B | 7 | U4b | Rank context; gather rule; lockstep; single-node gang — SHIPPED on `feat/500-wave3c` (dated correction 2026-09-16: contract `feat_500-wave3c` §2/§2a/§2b; the `run_spec` local-rank fan-out landed with U5b-1b-ii (§6); rung pinning not wired (the gather is dim 0 over pooled rows); mining/GradCache/precomputed refused at `world > 1`) | hermetic + pod leg | U2b, U2c, U3, U4a, S1 |
 | B | 8 | — | pod-leg artifact — DONE: `crates/jammi-kernels/artifacts/cuda-runs/2026-09-16-500-u4b-gang-pod-02eb3943-a100-sxm4.json` (dated correction 2026-09-16, contract §2c) | gpu-gang | U4b |
-| C | 1 | U7b | cluster-leg primitives, reap, two-host test body, schedule visibility (driver U7b-A2b BUILT on `feat/500-wave3c`, contract §8c; dated correction 2026-09-16) | gate scripts + ai-core test body | U7a, S4 |
+| C | 1 | U7b | cluster-leg primitives, reap, two-host test body, schedule visibility (driver U7b-A2b BUILT on `feat/500-wave3c`, contract §8c; dated correction 2026-09-16: a SECOND transport, `pods` — two ordinary Global-Networking pods, the default, kept alongside the near-zero-capacity `cluster` transport unchanged — see UNITS.md §U7b-A2b's own dated correction) | gate scripts + ai-core test body | U7a, S4 |
 | C | 2 | U5a | `GangService` on `peer_bind`; I-GANG authorization; allowlist + freeze lines — SHIPPED on `feat/500-wave3c` (dated correction 2026-09-16: U5a-1 shipped in #575; U5a-2 — `HostAdmission`, the hold loop, the world>1 conjunct (#566) with the row's own tenant as carrier — §4) | hermetic + server it-suite | U4a, 68 DIST unit 1 |
 | C | 3 | U5b-1a | Membership substrate: `peer_advertise`, `instances.peer_addr`/`result_root`, `list_gang_members` | hermetic + distributed | U5a-1, PR-B1 |
 | C | 3a | U5b-1a-A2 | Result-root identity across spellings (scheme aliasing, symlinks, case/slash folding) AND the membership predicate built on that identity — SHIPPED (`RootIdentity::of`, `instances.result_root_identity` by migration 036, `list_gang_members` compares identities) — `list_gang_members` itself consults no root at all (U5b-1a's round-5 stop rule fired, excising the column from the predicate entirely); filed by U5b-1a's round-3 stop rule, widened by round-5's; spec = rounds 1–5 of `docs/rigor/feat_500-C-U5b-1a.jsonl` + contract §9/§10/§12; a precondition of U5b-1b-ii (gang formation needs an actual root-identity predicate, not merely the verbatim string) | unscheduled | U5b-1a |
 | C | 4 | U5b-0 | Partitioned attestation inventory (per-row-group leaf digests, `MaterializationManifest`) — SHIPPED (`leaves` keyed inventory additive to `artifact`, `verify_partitions`; see UNITS.md's dated correction) | hermetic | none (base: PR-B2) |
 | C | 5 | U5b-1b-i | The `Peer` collective + round protocol — SHIPPED on `feat/500-wave3c` (dated correction 2026-09-16: §3; the round index is a descriptor determinant and a commit-phase fault is fatal on every rank; the hermetic loopback target replaces the `tests/distributed` rows the spec named) | hermetic + distributed | U5a-1, U5b-0 |
 | C | 6 | U5b-1b-ii | Coordinator: membership → assignment → dispatch → assembly — SHIPPED on `feat/500-wave3c` (dated correction 2026-09-16: §5 db slice + §6 body; the lease is settled by the outcome's counting class (an uncounted outcome hands it back at once); `AllRootDivergent` is unreachable from the body (root identity is inside the listing)) | hermetic + server it-suite | U5b-1a, U5b-1a-A2, U5b-1b-i, U4b, U5a-1, U5a-2 |
-| C | 7 | U5b-1b-iii | `world_size == 1` rank body; runner-role writer split; `Outcome`; resume pin — SHIPPED on `feat/500-wave3c` (dated correction 2026-09-16: contract §7; `LeaseHolder`/`RunnerRole` as types; the resume pin is WITHDRAWN — a retired attempt's successor gang resumes from the shared root (U5b-2's executed chaos rows), #543 re-scoped to fleets without a shared root) | hermetic | U5b-1b-ii |
+| C | 7 | U5b-1b-iii | `world_size == 1` rank body; runner-role writer split; `Outcome`; resume pin — SHIPPED on `feat/500-wave3c` (dated correction 2026-09-16: contract §7; `LeaseHolder`/`RunnerRole` as types; the resume pin is WITHDRAWN — a retired attempt's successor gang resumes from the shared root (U5b-2's executed chaos rows); #543 is CLOSED by two executed oracles, `UNITS.md`'s U5b-1b-iii row: the listing half (`gang_membership.rs:544`/`:740`) and the resume half (`gang_resume_parity.rs`'s N5 row)) | hermetic | U5b-1b-ii |
 | C | 8 | U5b-2 | Watchdog; abort with no terminal write; released-vs-failed; chaos; cluster leg — SHIPPED on `feat/500-wave3c` (dated correction 2026-09-16: contract §8; no flag flip (the run has already returned through `Abandoned`), no `BackOff` disposition (a live same-named `building` row is unreachable: table names carry nanos + a uuid — executed refutation); the cluster leg is row C9) | distributed + cluster leg | U5b-1b-ii, U5b-1b-iii, 68 OPS |
-| C | 9 | — | cluster-leg artifact | gpu-gang | U5b-2 |
+| C | 9 | — | cluster-leg artifact — DONE: `crates/jammi-kernels/artifacts/cuda-runs/2026-09-17-500-u7b-gang-cluster-6207a918-rtx-4090-two-host-pods.json` (GPU cluster run `35171132263`, transport `global-networking`, two Global-Networking pods — A100 SXM4 per the artifact's own `box`/`producer` fields — status GREEN; the leg's wave-5 fixes — sshd readiness by executed connect, concurrent per-rank builds, the NCCL-id crossing bounded by the work rather than a clock, rank logs shipped on every exit arm, the route-table-derived interface, the exact-sha checkout, PID 1's environment, the remote root as a parameter — are this driver's current shape, `UNITS.md` §U7b-A2b) | gpu-gang | U5b-2 |
 | — | — | C1 (cookbook) | AST session-lifecycle gate (issue #539), after PR-B2 | pytest + ruff | none |
 | D | 1 | U8a | `jammi-ballista`: crate (+ card globs, publish list, dep-DAG), codecs, `JammiExecutionEngine`, role knobs; in-memory cluster (dated correction 2026-09-16: SHIPPED on `feat/500-wave4` — contract §9: the codec magic is `0x07`/field-0-wire-type-7, never a legal prost tag (§9 A1); the six-address collision rule is a `&JammiConfig` cross-section validator, never a second parse (§9 A2); `advertise_host` required whenever `bind` is unspecified (§9 A3); `InferenceExec` carries an explicit `device_kind` the codec never invents (§9 B3); placement excludes a task's own submitter by construction, decided BEFORE topology (§9 B1)) | hermetic + distributed three-process arm | U1, U5b-1b-ii, U5b-1b-iii, S6 |
 | D | 2 | U8b | `CatalogClusterState`/`CatalogJobState`, `DevicePlacement`, `compute_cluster_state` migration (+ `workers.devices`), gang as one placed task (dated correction 2026-09-16: SHIPPED on `feat/500-wave4` — contract §9: `compute_executors.devices`, not `workers.devices`, is the placement join's sole authority (§9 B5); DRAIN stops task admission and waits for an in-flight placed gang, only RELEASE tears an executor down at once (§9 B6); the scheduler's slot CAS runs before the graph's task info is stamped, and `ballista-scheduler`'s `default-features = false` is load-bearing for the restart property (§9 A10)) | distributed | U8a, S6 |
@@ -336,7 +350,11 @@ byte-identical across processes and across two A100s with no env pins; `CUBLAS_W
 is a kernel-selection input that must merely be *consistent* across ranks (`:4096:8` reproduces
 the unset default, `:16:8` differs), so it belongs in the `MaterializationEnv` kernel profile,
 not a default setting; the `NCCL_ALGO`/`PROTO`/`NCHANNELS` pin set is untested — at world size 2
-the reduction is commutative, so it needs world size ≥ 3 on the cluster leg. **S6** (→ U8a/U8b;
+the reduction is commutative, so it needs world size ≥ 3 on the cluster leg. The shared
+`capability_surface.rs` TIER-PREEMPTION oracle every nightly `gpu-prove.yml` run exercises (the
+window this plan's byte-equality claims stand on) is fixed at `0179471e` (`capsurf`: the
+`attention_block_fused` before/after window no longer leaks `bert_probe_dtype`'s own dispatch);
+run `35171308424` is green on sm_80/86/89/90 with that fix on the branch. **S6** (→ U8a/U8b;
 supersedes S2) a scratch crate on Ballista 54.1 with `override_execution_engine`, a custom
 `ClusterState`/`JobState` passed to `start_server`, and the codec, running a custom
 `ExecutionPlan` on one scheduler + two executors. **Result:** retries are off for jammi operators

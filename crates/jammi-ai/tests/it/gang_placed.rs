@@ -21,7 +21,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::error::DataFusionError;
 use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream};
-use jammi_ai::fine_tune::worker::{training_test_hooks, JobWorker, PlacedGangSubmitter};
+use jammi_ai::fine_tune::worker::{
+    loop_test_hooks, training_test_hooks, JobWorker, PlacedGangSubmitter,
+};
 use jammi_ai::operator::gang_exec::{GangDescriptor, PlacedOutcome};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::Catalog;
@@ -587,5 +589,190 @@ async fn the_submitters_heartbeat_after_hand_off_never_resurrects_the_executors_
     assert_eq!(
         before.lease_expires_at, after.lease_expires_at,
         "the lease is untouched by the stale holder's heartbeat"
+    );
+}
+
+/// #500 wave 5 group E1, P7 pressure-round fix (adversarial-audit finding on
+/// `register_job_hold_or_release`): `run_placed_gang` takes its claim
+/// (`probe_claim`), snapshots its `WorkerShared` birth release-epoch in the
+/// SAME synchronous step, then makes two catalog round trips
+/// (`Catalog::transfer_claim`, `Catalog::get_job`) before the hold is
+/// registered. A RELEASE landing anywhere in that window — parked here
+/// immediately after the birth snapshot, before `transfer_claim` even runs —
+/// must still be caught by `register_job_hold_or_release`'s
+/// `released_since_birth` check and self-release the claim: never dispatch,
+/// never register a lease hold, `coordinate` never reached. The sweeps run
+/// before the transfer lands (the row is still the SUBMITTER's at that
+/// instant) and find nothing of this job's; the epoch comparison alone is
+/// what catches it.
+///
+/// Mutation (executed): in `JobWorker::run_placed_gang`, changing the final
+/// `WorkerShared::for_single_run(admission, worker.worker_id.clone(),
+/// claim_epoch)` call to ignore `claim_epoch` and read
+/// `admission.release_epoch()` live at that call site instead (the pre-fix
+/// shape, which reads the epoch only after both catalog round trips) reds
+/// this test: `run_placed_gang` returns `Ok(PlacedOutcome::Trained { .. })`
+/// instead of the expected `Err`, because by the time of that live read the
+/// RELEASE has already landed and is folded into the very value compared
+/// against itself, so `released_since_birth` reads `false` and the claim
+/// dispatches straight through the RELEASE. First line of the red output:
+/// `a claim that raced RELEASE must self-release, never dispatch: called
+/// \`Result::expect_err\` on an \`Ok\` value: Trained { artifact_digest: ...
+/// }`.
+#[tokio::test(flavor = "multi_thread")]
+async fn release_landing_between_probe_claim_and_transfer_self_releases_a_placed_gang() {
+    let (submitter, executor, _dir) = fleet().await;
+    let worker = JobWorker::new(&submitter).unwrap();
+    let record = submit_and_claim(&submitter, &worker, two_rank_graph_spec()).await;
+    let job_id = record.job_id.clone();
+    let submitter_id = submitter.instance_id().to_string();
+    let executor_id = executor.instance_id().to_string();
+
+    let descriptor = GangDescriptor {
+        job_id: job_id.clone(),
+        attempt: 1,
+        world: 2,
+        submitter: submitter_id.clone(),
+        device_kind: ComputeDeviceKind::Cpu,
+    };
+
+    let park = loop_test_hooks::arm(
+        &job_id,
+        loop_test_hooks::ParkPoint::PlacedGangBeforeTransfer,
+    );
+    let running = {
+        let executor = Arc::clone(&executor);
+        tokio::spawn(async move { JobWorker::run_placed_gang(&executor, descriptor).await })
+    };
+    park.wait_parked().await;
+
+    // The claim's own `WorkerShared` birth epoch is already snapshotted;
+    // land a RELEASE on the SAME session's admission now, before
+    // `transfer_claim` has even run — exactly the window a live
+    // `EmbeddedWorker` sharing this process's `HostAdmission` could deliver
+    // one in.
+    let (_holds, sweep) = executor.release_job_leases().await.unwrap();
+    assert_eq!(
+        sweep.jobs,
+        Some(0),
+        "the row is still the submitter's at this instant (no transfer yet); \
+         the sweep must not be what releases it here"
+    );
+    park.release();
+
+    let err = tokio::time::timeout(Duration::from_secs(30), running)
+        .await
+        .expect("run_placed_gang must return once the prologue self-releases")
+        .unwrap()
+        .expect_err("a claim that raced RELEASE must self-release, never dispatch");
+    assert!(
+        err.to_string().contains("left running for reclaim"),
+        "{err}"
+    );
+    assert!(
+        training_test_hooks::coordinator_ends_for(&job_id).is_empty(),
+        "coordinate must never run: the claim self-released before dispatch"
+    );
+
+    let after = row(submitter.catalog(), &job_id).await;
+    assert_eq!(after.status, "running", "{after:?}");
+    assert_eq!(
+        after.claimed_by.as_deref(),
+        Some(executor_id.as_str()),
+        "transfer_claim still lands (it runs after the park release); the \
+         self-release hands the lease back under the EXECUTOR's own \
+         claimed_by, never the submitter's"
+    );
+    assert!(after.lease_expires_at.is_none(), "{after:?}");
+    assert_eq!(after.releases, 1, "{after:?}");
+}
+
+/// #500 wave 5 group E1, P7 pressure-round fix, round 2 (adversarial-audit
+/// finding on round 1's own fix above): round 1 read
+/// `HostAdmission::release_epoch` immediately AFTER `probe_claim()`
+/// returned — two separate, non-atomic operations, so a RELEASE landing
+/// between `probe_claim`'s own internal phase read (which commits the
+/// claim while the phase is still `Running`) and the epoch read
+/// afterwards is caught by neither: `probe_claim` already admitted, and
+/// the epoch read already carries the RELEASE's bump, so
+/// `released_since_birth` compares the post-release epoch against itself
+/// and reads `false` — the placed gang would dispatch on a releasing
+/// host. The fix reads the epoch BEFORE `probe_claim()` runs at all, so
+/// any RELEASE landing in the (now benign) gap between the read and
+/// `probe_claim()` is instead refused by `probe_claim`'s own phase check:
+/// a release visible enough to have bumped the epoch has, a fortiori,
+/// already flipped the phase (`HostAdmission::begin_release` orders the
+/// phase flip strictly before the epoch bump). Parked here, immediately
+/// after the epoch read and before `probe_claim` itself runs.
+///
+/// Mutation (executed): swapped `run_placed_gang`'s epoch read and its
+/// `probe_claim()` call back to their pre-fix order — `probe_claim()`
+/// first, this same park point second, the epoch read last, exactly the
+/// shape the finding names — and reran this test: it reds because the
+/// epoch read now captures the ALREADY-bumped value (the claim committed
+/// while `Running`, then the park lets the RELEASE land, then the epoch
+/// is read only after), so `released_since_birth` never sees a
+/// difference and the claim dispatches straight through the RELEASE.
+/// First line of the red output (the test's own `expect_err` message,
+/// executed): `a claim raced by RELEASE before probe_claim must never
+/// dispatch: Trained { artifact_digest:
+/// "1a24c580af994b80e26d0ce0df69fedefbac297b95338844070d0a6c9d046887" }`.
+#[tokio::test(flavor = "multi_thread")]
+async fn release_landing_between_the_epoch_read_and_probe_claim_is_still_refused() {
+    let (submitter, executor, _dir) = fleet().await;
+    let worker = JobWorker::new(&submitter).unwrap();
+    let record = submit_and_claim(&submitter, &worker, two_rank_graph_spec()).await;
+    let job_id = record.job_id.clone();
+    let submitter_id = submitter.instance_id().to_string();
+
+    let descriptor = GangDescriptor {
+        job_id: job_id.clone(),
+        attempt: 1,
+        world: 2,
+        submitter: submitter_id.clone(),
+        device_kind: ComputeDeviceKind::Cpu,
+    };
+
+    let park = loop_test_hooks::arm(
+        &job_id,
+        loop_test_hooks::ParkPoint::PlacedGangBeforeProbeClaim,
+    );
+    let running = {
+        let executor = Arc::clone(&executor);
+        tokio::spawn(async move { JobWorker::run_placed_gang(&executor, descriptor).await })
+    };
+    park.wait_parked().await;
+
+    // The epoch snapshot is already taken; land a RELEASE now, before
+    // `probe_claim()` itself has even run.
+    let (_holds, sweep) = executor.release_job_leases().await.unwrap();
+    assert_eq!(
+        sweep.jobs,
+        Some(0),
+        "the row is still the submitter's at this instant (no claim taken, \
+         no transfer); the sweep must not be what refuses it here"
+    );
+    park.release();
+
+    let err = tokio::time::timeout(Duration::from_secs(30), running)
+        .await
+        .expect("run_placed_gang must return once probe_claim refuses")
+        .unwrap()
+        .expect_err("a claim raced by RELEASE before probe_claim must never dispatch");
+    assert!(
+        err.to_string().contains("has begun a Releasing"),
+        "probe_claim itself refuses on the phase read: {err}"
+    );
+    assert!(
+        training_test_hooks::coordinator_ends_for(&job_id).is_empty(),
+        "coordinate must never run: probe_claim refused before any claim was taken"
+    );
+
+    let unchanged = row(submitter.catalog(), &job_id).await;
+    assert_eq!(unchanged.status, "running");
+    assert_eq!(
+        unchanged.claimed_by.as_deref(),
+        Some(submitter_id.as_str()),
+        "no transfer happened: probe_claim refused before transfer_claim ever ran"
     );
 }

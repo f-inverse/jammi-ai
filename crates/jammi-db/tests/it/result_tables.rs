@@ -107,7 +107,7 @@ fn building_row<'a>(
         text_columns: None,
         storage_precision: StoragePrecision::F32,
         oversample: 4,
-        created_at: jammi_db::catalog::backend::now_sortable(),
+        created_at: jammi_db::catalog::lease::canonical_stamp_now(),
         writer_id: Some(writer_id),
         lease: Some(Duration::from_secs(3600)),
         job_attempt,

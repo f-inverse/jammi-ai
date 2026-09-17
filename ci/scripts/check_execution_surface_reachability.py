@@ -712,7 +712,6 @@ GPU_PROVE_PROMOTED_TO_REQUIRED = False
 
 GATED_FEATURE_TOKENS = {"cuda", "flash-attn"}
 CARGO_SUBCOMMANDS = ("build", "test", "clippy", "check", "run")
-DEFAULT_PR_LIFECYCLE_TYPES = {"opened", "synchronize", "reopened"}
 
 # Boundary is a lookahead (whitespace or end-of-string), NOT `\b`: `\b` only
 # checks word-vs-non-word, so `cargo build/run ...` (a real PROSE sentence
@@ -1356,8 +1355,18 @@ def _push_admits_main(push: dict[str, list[str] | None]) -> bool:
 
 
 def _pr_admits_main(pr: dict[str, list[str] | None]) -> bool:
+    """... #533 audit fix: `types:` credits a host only when `synchronize`
+    is present (or `types:` is ABSENT entirely, which GitHub defaults to
+    `[opened, synchronize, reopened]`) -- a `types: [opened]`-only host
+    re-runs once, on the PR's initial creation, but NEVER AGAIN on a later
+    push to that PR's branch (the `synchronize` event); crediting it as
+    reachable promises per-commit coverage this trigger shape cannot
+    deliver. Merge-blocking rescues most real cases (a required check
+    missing on the NEW head still blocks the merge button), but that is a
+    DIFFERENT mechanism than this rule's own promise, and is not assumed
+    here. See https://github.com/f-inverse/jammi-ai/issues/533."""
     types = pr.get("types")
-    types_ok = types is None or bool(set(types) & DEFAULT_PR_LIFECYCLE_TYPES)
+    types_ok = types is None or "synchronize" in types
     if not types_ok:
         return False
     branches = pr.get("branches")
@@ -1485,6 +1494,21 @@ def _lane_admits_any_origin(lane: PathLane, origins: list[str]) -> bool:
 _MATRIX_CMD_INTERP_RE = re.compile(r"^\$\{\{\s*matrix\.cmd\s*\}\}$")
 _MATRIX_CONTINUE_ON_ERROR_EXPR = "${{ matrix.continue_on_error == 'true' }}"
 
+# #533 (round-2 audit, discovered independently of this unit but inherited
+# by it): Rule 1c's own YAML-level honesty (`_job_is_blocked`/`_step_is_
+# blocked` already exclude a job/step carrying an `if:`) says nothing
+# about SHELL-level control flow INSIDE a `run:` body's own text -- a line
+# extracted from `if [ "${{ github.event_name }}" = "push" ]; then ... fi`
+# is still credited even though the shell `if` may never take that branch
+# on a PR run. `&&`-guarded compound heads already fail closed
+# (`_looks_like_real_invocation` rejects the compound head outright); this
+# closes the SAME class for `if`/`case` block-shaped control flow: a `run:`
+# body containing either keyword, as its own token (never a substring
+# inside an identifier), is excluded WHOLESALE from tuple extraction --
+# fail-closed, the same "exclude rather than guess" doctrine `_job_is_
+# blocked` already holds a YAML-level `if:` to.
+_SHELL_CONTROL_FLOW_KEYWORD_RE = re.compile(r"(?<![\w.-])(?:if|case)(?![\w.-])")
+
 
 def _job_is_blocked(job: dict) -> bool:
     """Fail-closed: a job carrying ANY `if:` (this gate cannot evaluate
@@ -1535,6 +1559,8 @@ def _job_tuples(job: object) -> set[str]:
             if _MATRIX_CMD_INTERP_RE.match(body_text.strip()):
                 has_unblocked_matrix_cmd_step = True
                 continue  # handled via the matrix include: legs below
+            if _SHELL_CONTROL_FLOW_KEYWORD_RE.search(body_text):
+                continue  # #533: an if:/case-wrapped run: body may never execute the tuple on this trigger
             found |= _extract_tuples_from_text(body_text)
 
     if has_unblocked_matrix_cmd_step:
@@ -1548,7 +1574,7 @@ def _job_tuples(job: object) -> set[str]:
             if leg_coe is True or (isinstance(leg_coe, str) and leg_coe.strip("\"'") == "true"):
                 continue
             cmd_body = leg.get("cmd")
-            if isinstance(cmd_body, str):
+            if isinstance(cmd_body, str) and not _SHELL_CONTROL_FLOW_KEYWORD_RE.search(cmd_body):
                 found |= _extract_tuples_from_text(cmd_body)
 
     return found
@@ -2057,6 +2083,72 @@ jobs:
         run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
 """
 
+# #533 fixture 1: the clippy line lives inside a SHELL `if` block (never a
+# YAML-level `if:`, which `_job_is_blocked`/`_step_is_blocked` already
+# exclude) -- on a `pull_request` run, `github.event_name` is `pull_
+# request`, never `push`, so this shell `if` never takes the clippy
+# branch at all; crediting it as reachable is false.
+SHELL_IF_WRAPPED_WORKFLOW = """name: fixture-shell-if
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            cargo clippy -p demo --all-targets --features cuda -- -D warnings
+          fi
+"""
+
+# #533 fixture 2: `types: [opened]` alone re-runs on the PR's initial
+# creation but never again on a later push to that PR's branch
+# (`synchronize`) -- crediting per-commit coverage from this shape is
+# false.
+PR_TYPES_OPENED_ONLY_WORKFLOW = """name: fixture-pr-types-opened-only
+on:
+  pull_request:
+    types: [opened]
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+"""
+
+# Positive control: `types: [synchronize]` (explicit, not the implicit
+# default) still credits -- the rule requires `synchronize` present, not
+# `types:` absent specifically.
+PR_TYPES_SYNCHRONIZE_WORKFLOW = """name: fixture-pr-types-synchronize
+on:
+  pull_request:
+    types: [synchronize]
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p demo --all-targets --features cuda -- -D warnings
+"""
+
+# #533 negative control: a `case` shell keyword must be blocked the same
+# way `if` is.
+SHELL_CASE_WRAPPED_WORKFLOW = """name: fixture-shell-case
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          case "${{ github.event_name }}" in
+            push) cargo clippy -p demo --all-targets --features cuda -- -D warnings ;;
+          esac
+"""
+
 MATRIX_CMD_WORKFLOW = """name: fixture-matrix-cmd
 on:
   pull_request:
@@ -2461,6 +2553,18 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
 
     # --- Rule 1c: step-level continue-on-error: true -> FAIL ---------------
     check("step-level continue-on-error excludes", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-sc.yml": STEP_CONTINUE_ON_ERROR_WORKFLOW}, None, "UNREACHABLE gated tuple")
+
+    # --- #533 leg 1: a shell `if`/`case` block wrapping the clippy line is
+    # excluded WHOLESALE from tuple extraction, never credited on mere
+    # YAML-level presence. ---------------------------------------------------
+    check("shell if-wrapped run: body excludes", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-shell-if.yml": SHELL_IF_WRAPPED_WORKFLOW}, None, "UNREACHABLE gated tuple")
+    check("shell case-wrapped run: body excludes", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-shell-case.yml": SHELL_CASE_WRAPPED_WORKFLOW}, None, "UNREACHABLE gated tuple")
+
+    # --- #533 leg 2: `pull_request: types: [opened]` alone never re-runs on
+    # a later push to the PR (synchronize) -- must not be credited; an
+    # EXPLICIT `types: [synchronize]` still credits (positive control). ----
+    check("pull_request types: [opened] alone excludes", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-pr-types-opened.yml": PR_TYPES_OPENED_ONLY_WORKFLOW}, None, "UNREACHABLE gated tuple")
+    check("pull_request types: [synchronize] explicit still credits", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-pr-types-sync.yml": PR_TYPES_SYNCHRONIZE_WORKFLOW}, None, None)
 
     # --- Rule 1c: matrix cmd: indirection is honored (positive control) ----
     check("matrix cmd indirection credits a real leg", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-mc.yml": MATRIX_CMD_WORKFLOW}, None, None)
@@ -2978,8 +3082,10 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
         "row (Rule 3), env-prefixed/wrapper-prefixed/semicolon-chained/continuation-spanning discovery, "
         "multi-feature/-F/namespaced-flash-attn gating (incl. quoted --features=\"cuda\"), prose "
         "exclusion (both a comment/assignment-wrapped and a bare cargo-subcommand-shaped sentence, the "
-        "latter also pinned via discover_suspicious_lines — A1), workflow_call-only exclusion, and a "
-        "paths: list surviving a nested comment line."
+        "latter also pinned via discover_suspicious_lines — A1), workflow_call-only exclusion, a "
+        "paths: list surviving a nested comment line, a shell if:/case-wrapped run: body excluded "
+        "wholesale (#533), and pull_request types: [opened] alone excluded while an explicit "
+        "types: [synchronize] still credits (#533)."
     )
     return 0
 

@@ -26,6 +26,11 @@ Every `*.json` directly under `ci/artifacts/pod-build-timings/` must carry:
   - `schema_version` (int) — must be one of `KNOWN_SCHEMA_VERSIONS`.
   - `box` (non-empty string).
   - `git_sha` (40-hex, lowercase).
+  - `merged_as` (40-hex, OPTIONAL) + `merged_via_pr` (int, OPTIONAL, required
+    together with `merged_as`) — for a measured tip rewritten (rebased or
+    squash-merged) before its own landing, so `git_sha` is legitimately
+    never an ancestor of anything again (#530, the same pairing
+    `check_cuda_run_artifacts.py`'s own schema already enforces).
   - `ts` (ISO-8601 UTC, `YYYY-MM-DDTHH:MM:SSZ`, and must actually parse as a
     real calendar date/time — not merely shaped right).
   - `lock_held` — must be the boolean `true` (not merely truthy): the
@@ -54,15 +59,20 @@ Every `*.json` directly under `ci/artifacts/pod-build-timings/` must carry:
   (a) Every required field above is present and well-typed; findings are
       NAMED (which field, which file), never a bare non-zero exit.
   (b) `git_sha` must be an ancestor of `HEAD` (`git merge-base
-      --is-ancestor`) — the same #406-merge-commit discipline
-      `check_cuda_run_artifacts.py` rule (d) already enforces for cuda-run
-      artifacts, and for the identical reason: a green artifact whose sha is
-      not reachable from this branch is evidence about a tree that no longer
-      exists. Checked BEFORE any ancestry work: a shallow checkout
-      (`actions/checkout`'s default `fetch-depth: 1`) makes every single
-      `git_sha` read back as a false non-ancestor, indistinguishable from a
-      genuine one without this guard — one explicit failure naming the
-      shallow checkout, never N misleading per-file findings.
+      --is-ancestor`), OR — for a branch tip rewritten (rebased or
+      squash-merged) before its own landing, so `git_sha` can never be an
+      ancestor of anything again — `merged_as` (well-typed, paired with
+      `merged_via_pr`) is itself an ancestor of HEAD. ONE shared function,
+      `ancestry.check_ancestry`, imported by this gate AND by
+      `check_cuda_run_artifacts.py` rule (d) — the identical rule for the
+      identical reason (a green artifact whose sha is not reachable from
+      this branch is evidence about a tree that no longer exists), never
+      two independently-typed copies that can drift (#530). Checked
+      BEFORE any ancestry work: a shallow checkout (`actions/checkout`'s
+      default `fetch-depth: 1`) makes every single `git_sha` read back as
+      a false non-ancestor, indistinguishable from a genuine one without
+      this guard — one explicit failure naming the shallow checkout,
+      never N misleading per-file findings.
 
 Run: `python3 ci/scripts/check_pod_build_timings.py`
 Self-test (RED cases for every rule above — every required field's own
@@ -86,10 +96,13 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ancestry  # noqa: E402 — #530: the ONE ancestry rule, shared with check_cuda_run_artifacts.py
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TIMINGS_DIR = REPO_ROOT / "ci" / "artifacts" / "pod-build-timings"
 
-GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+GIT_SHA_RE = ancestry.GIT_SHA_RE
 TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 KNOWN_SCHEMA_VERSIONS = {1}
 BYTE_EQUAL_STATES = {"invalid", "set_mismatch", "true", "false"}
@@ -111,31 +124,14 @@ class ArtifactError(Exception):
     """Uncomputable input (parse failure, missing dir) — fails closed."""
 
 
-# Same class as the CI incident that hit `check_arch_validation_freshness.py`
-# (run 33230050451, main, "Guard (arch validation freshness self-test)"):
-# `shutil.rmtree` during a `tempfile.TemporaryDirectory`'s teardown can hit
-# `OSError: [Errno 39] Directory not empty: '.git'` — a race between tempdir
-# cleanup and a background `git maintenance`/`gc --auto` process this file's
-# own scratch-repo `git init`/`add`/`commit`/`clone` calls below can spawn.
-# `-c gc.auto=0 -c gc.autoDetach=false -c maintenance.auto=false` kills the
-# background writer AT THE SOURCE for every git invocation this file makes.
-_GIT_NO_BACKGROUND_MAINTENANCE = ("-c", "gc.auto=0", "-c", "gc.autoDetach=false", "-c", "maintenance.auto=false")
-
-
-def _run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    if cmd and cmd[0] == "git":
-        cmd = ["git", *_GIT_NO_BACKGROUND_MAINTENANCE, *cmd[1:]]
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-
-
-def is_shallow_repository(repo_root: Path) -> bool:
-    proc = _run(["git", "rev-parse", "--is-shallow-repository"], repo_root)
-    return proc.returncode == 0 and proc.stdout.strip() == "true"
-
-
-def _is_ancestor(sha: str, repo_root: Path, target: str = "HEAD") -> bool:
-    proc = _run(["git", "merge-base", "--is-ancestor", sha, target], repo_root)
-    return proc.returncode == 0
+# #530: `_run`/`is_shallow_repository`/`_is_ancestor` are no longer defined
+# here at all -- every internal call site keeps its own name via these
+# aliases, but the ACTUAL implementation lives in `ancestry.py`, imported
+# by this gate AND by `check_cuda_run_artifacts.py`, so there is no second
+# copy left to independently drift.
+_run = ancestry.run
+is_shallow_repository = ancestry.is_shallow_repository
+_is_ancestor = ancestry.is_ancestor
 
 
 def _valid_ts(ts: str) -> bool:
@@ -170,6 +166,30 @@ def check_schema_types(data: dict) -> list[str]:
     sha = data.get("git_sha")
     if not isinstance(sha, str) or not GIT_SHA_RE.match(sha):
         failures.append(f"git_sha must be 40 lowercase hex chars, got {sha!r}")
+
+    # `merged_as` / `merged_via_pr` — the OPTIONAL squash/rebase-landing
+    # pair (#530): a branch tip a timing run measured can be rewritten
+    # before its own landing, so `git_sha` itself is legitimately never an
+    # ancestor of anything again; `merged_as` names the commit the SAME
+    # content landed on `main` as, kept alongside (never instead of) the
+    # measured `git_sha`. The SAME pairing rule `check_cuda_run_
+    # artifacts.py` already enforces, restated here rather than imported,
+    # since it decides TYPING (this gate's own schema concern), never the
+    # ancestry DECISION itself (which is imported, from `ancestry.py`).
+    has_merged_as = "merged_as" in data
+    has_merged_via_pr = "merged_via_pr" in data
+    if has_merged_as:
+        merged_as = data["merged_as"]
+        if not isinstance(merged_as, str) or not GIT_SHA_RE.match(merged_as):
+            failures.append(f"merged_as must be 40 lowercase hex chars, got {merged_as!r}")
+        if not has_merged_via_pr:
+            failures.append("merged_as is present but merged_via_pr is missing")
+    if has_merged_via_pr:
+        merged_via_pr = data["merged_via_pr"]
+        if not isinstance(merged_via_pr, int) or isinstance(merged_via_pr, bool):
+            failures.append(f"merged_via_pr must be an int, got {merged_via_pr!r}")
+        if not has_merged_as:
+            failures.append("merged_via_pr is present but merged_as is missing")
 
     ts = data.get("ts")
     if not isinstance(ts, str) or not _valid_ts(ts):
@@ -236,15 +256,10 @@ def check_measurements(measurements: dict) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# ancestry
+# ancestry (#530: delegates entirely to the ONE shared rule in ancestry.py)
 # --------------------------------------------------------------------------- #
 def check_ancestry(data: dict, repo_root: Path) -> list[str]:
-    sha = data.get("git_sha")
-    if not isinstance(sha, str) or not GIT_SHA_RE.match(sha):
-        return []  # rule (a) already reported the malformed-sha failure
-    if _is_ancestor(sha, repo_root):
-        return []
-    return [f"git_sha {sha} {ANCESTOR_MESSAGE}"]
+    return ancestry.check_ancestry(data, repo_root, ANCESTOR_MESSAGE)
 
 
 # --------------------------------------------------------------------------- #
@@ -494,6 +509,58 @@ def self_test() -> int:
             )
         (timings_dir / "merge-reachable-control.json").unlink()
 
+        # --- #530: the merged_as rescue -- a REWRITTEN branch tip's git_sha
+        # (a real, valid commit that will never be an ancestor of anything
+        # again) is rescued by a merged_as that IS an ancestor of HEAD. ---
+        d = good()
+        d["git_sha"] = shas["non_ancestor"]
+        d["merged_as"] = shas["head"]
+        d["merged_via_pr"] = 1
+        write("rescued-by-merged-as.json", d)
+        got = run_gate(timings_dir, repo_root)
+        if got:
+            failures.append(
+                f"self-test FAILED: a git_sha rescued by an ancestor merged_as was still flagged: {got}"
+            )
+        (timings_dir / "rescued-by-merged-as.json").unlink()
+
+        # --- #530: the rescue itself can fail -- BOTH git_sha and merged_as
+        # are real non-ancestors; the finding must name BOTH. -------------
+        d = good()
+        d["git_sha"] = shas["non_ancestor"]
+        d["merged_as"] = shas["non_ancestor"]
+        d["merged_via_pr"] = 1
+        write("rescue-also-fails.json", d)
+        got = run_gate(timings_dir, repo_root)
+        if not any(
+            "not an ancestor of HEAD" in g and "merged_as" in g and "ALSO not an ancestor" in g for g in got
+        ):
+            failures.append(
+                f"self-test FAILED: a merged_as that is ALSO not an ancestor did not name both "
+                f"verdicts: {got}"
+            )
+        (timings_dir / "rescue-also-fails.json").unlink()
+
+        # --- #530: merged_as must be well-typed (40-hex) -- rule (a)'s own
+        # schema concern, never handed to `git merge-base` as a literal. ---
+        d = good()
+        d["merged_as"] = "not-a-real-sha"
+        d["merged_via_pr"] = 1
+        write("bad-merged-as-shape.json", d)
+        got = run_gate(timings_dir, repo_root)
+        if not any("merged_as" in g and "40 lowercase hex" in g for g in got):
+            failures.append(f"self-test FAILED: malformed merged_as not caught: {got}")
+        (timings_dir / "bad-merged-as-shape.json").unlink()
+
+        # --- #530: merged_as without merged_via_pr is malformed -----------
+        d = good()
+        d["merged_as"] = shas["head"]
+        write("merged-as-without-pr.json", d)
+        got = run_gate(timings_dir, repo_root)
+        if not any("merged_via_pr is missing" in g for g in got):
+            failures.append(f"self-test FAILED: merged_as without merged_via_pr not caught: {got}")
+        (timings_dir / "merged-as-without-pr.json").unlink()
+
         # --- unknown schema_version (well-typed int, not in KNOWN_SCHEMA_VERSIONS) --
         d = good()
         d["schema_version"] = 999
@@ -640,8 +707,10 @@ def self_test() -> int:
         "measurements-not-an-object, fa2_ran/fa2_reason typing, a bool on a wall field, "
         "documented/undocumented null, byte_equal_state vocabulary, top-level-not-an-object, a JSON "
         "parse error, an unreadable/non-UTF-8 file (a named finding, never a traceback), ancestry "
-        "against a REAL non-ancestor commit plus a merge-reachable-only positive control, and the "
-        "shallow-checkout guard."
+        "against a REAL non-ancestor commit plus a merge-reachable-only positive control, the "
+        "shallow-checkout guard, and #530's merged_as rescue (a rewritten tip rescued by an ancestor "
+        "merged_as, the rescue itself failing and naming both verdicts, a malformed merged_as, and "
+        "merged_as without merged_via_pr)."
     )
     return 0
 

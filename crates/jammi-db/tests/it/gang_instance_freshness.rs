@@ -11,8 +11,10 @@
 //! `live-postgres-tests`, skipping (never failing) when `JAMMI_TEST_PG_URL`
 //! is unset — kept parameterized even though the decode itself is now
 //! backend-independent, so the parity oracle
-//! (`fresh_instance_malformed_last_seen_at_is_not_fresh_on_both_backends`)
-//! actually proves the two backends agree, not merely that each compiles.
+//! (`fresh_instance_malformed_last_seen_at_is_not_fresh_on_sqlite_and_a_write_refusal_on_postgres`)
+//! actually pins the stated asymmetry between the two backends (a row fact
+//! on SQLite, a write refusal on Postgres — see that test's own docs), not
+//! merely that each compiles.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,7 +57,7 @@ async fn base_catalog_kind(kind: BackendKind) -> Option<(tempfile::TempDir, Arc<
 /// dead process leaves behind (nothing heartbeats it any more).
 async fn force_stale_instance(catalog: &Catalog, instance_id: &str, ago: Duration) {
     let cutoff = (chrono::Utc::now() - chrono::Duration::from_std(ago).unwrap())
-        .format("%Y-%m-%dT%H:%M:%S%.9fZ")
+        .format("%Y-%m-%dT%H:%M:%S%.6fZ")
         .to_string();
     let instance_id = instance_id.to_string();
     catalog
@@ -283,22 +285,31 @@ async fn fresh_instance_false_just_outside_the_liveness_margin(kind: BackendKind
     );
 }
 
-/// #574's own parity oracle: a `last_seen_at` that does not parse as a
-/// timestamp at all (planted by raw SQL — nothing in this crate writes such
-/// a value) reads `fresh_instance() == Ok(false)` on BOTH backends,
-/// identically — never a fault on either. Before the fix
-/// (`fresh_instance` comparing via a SQL-side `stale_before_clause` cast),
-/// this same planted value read as `Ok(false)` on SQLite (a plain string
-/// compare, never erroring) but `Err` on Postgres (`last_seen_at::timestamptz`
-/// raises a genuine SQL error) — the exact backend-dependent classification
-/// issue #574 reports for this column too.
+/// #574's own parity oracle — REWRITTEN by `catalog::lease`'s S4/migration
+/// `039_canonical_stamps`, the same shape as `gang_rank_admission.rs`'s
+/// sibling test for `jobs.lease_expires_at`. Before the fix (`fresh_instance`
+/// comparing via a SQL-side `stale_before_clause` cast), a `last_seen_at`
+/// that did not parse at all read as `Ok(false)` on SQLite (a plain string
+/// compare, never erroring) but `Err` on Postgres
+/// (`last_seen_at::timestamptz` raised a genuine SQL error) — the
+/// backend-dependent classification issue #574 reported for this column
+/// too. That asymmetry is CLOSED (every value a live Postgres write can
+/// leave in this column is now cast-valid). What remains: SQLite's trigger
+/// checks SHAPE only, so a shape-valid, CALENDAR-invalid value (a month of
+/// `13` — a leap second does NOT serve this role, `lease.rs`'s own docs
+/// state why) is still representable there and still reads `false` (chrono
+/// refuses to parse it, `last_seen_at_is_fresh`'s `None` arm); on Postgres
+/// the SAME text is refused at the WRITE itself (the CHECK also validates
+/// the cast), so `fresh_instance` never gets the chance to read it.
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
     test_case::test_case(BackendKind::Postgres ; "postgres")
 )]
 #[tokio::test]
-async fn fresh_instance_malformed_last_seen_at_is_not_fresh_on_both_backends(kind: BackendKind) {
+async fn fresh_instance_malformed_last_seen_at_is_not_fresh_on_sqlite_and_a_write_refusal_on_postgres(
+    kind: BackendKind,
+) {
     // The require-gate itself: a direct, crate-qualified call to the
     // registered `shared:` helper (`ci/kernel-oracle-helpers.txt`), textually
     // in THIS test fn's own body — `base_catalog_kind`'s internal `?` on
@@ -327,47 +338,83 @@ async fn fresh_instance_malformed_last_seen_at_is_not_fresh_on_both_backends(kin
         ))
         .await
         .unwrap();
-    catalog
+    let write_result = catalog
         .backend_arc()
         .transaction(TxOptions::default(), |tx| {
             let instance_id = instance_id.clone();
             Box::pin(async move {
                 tx.execute(
-                    "UPDATE instances SET last_seen_at = 'not-a-timestamp' \
+                    "UPDATE instances SET last_seen_at = '2026-13-01T00:00:00.000000Z' \
                      WHERE instance_id = $1",
                     &[SqlValue::TextOwned(instance_id)],
                 )
                 .await
             })
         })
-        .await
-        .unwrap();
+        .await;
 
-    let fresh = catalog
-        .fresh_instance(&instance_id, Duration::from_secs(30))
-        .await
-        .expect(
-            "a malformed last_seen_at must be a row fact, never a read fault, on EITHER backend",
-        );
-    assert!(
-        !fresh,
-        "a last_seen_at that does not parse as a timestamp must never read as fresh"
-    );
-    // Tests own their rows: on the shared Postgres database a malformed
-    // `last_seen_at` left behind would fault every sibling's SQL-side sweep
-    // (`prune_instances` casts the column) — the row is removed here.
-    catalog
-        .backend_arc()
-        .transaction(TxOptions::default(), |tx| {
-            let instance_id = instance_id.clone();
-            Box::pin(async move {
-                tx.execute(
-                    "DELETE FROM instances WHERE instance_id = $1",
-                    &[SqlValue::TextOwned(instance_id)],
-                )
+    match kind {
+        BackendKind::Sqlite => {
+            write_result.expect(
+                "SQLite's trigger checks shape only; a calendar-invalid but shape-valid \
+                 value is admitted",
+            );
+            let fresh = catalog
+                .fresh_instance(&instance_id, Duration::from_secs(30))
                 .await
-            })
-        })
-        .await
-        .unwrap();
+                .expect(
+                    "a calendar-invalid last_seen_at must be a row fact, never a read fault, \
+                     on SQLite",
+                );
+            assert!(
+                !fresh,
+                "a last_seen_at that does not parse as a timestamp must never read as fresh"
+            );
+            catalog
+                .backend_arc()
+                .transaction(TxOptions::default(), |tx| {
+                    let instance_id = instance_id.clone();
+                    Box::pin(async move {
+                        tx.execute(
+                            "DELETE FROM instances WHERE instance_id = $1",
+                            &[SqlValue::TextOwned(instance_id)],
+                        )
+                        .await
+                    })
+                })
+                .await
+                .unwrap();
+        }
+        BackendKind::Postgres => {
+            let err = write_result.expect_err(
+                "Postgres's CHECK requires calendar validity too; a month of 13 must be \
+                 refused at the write",
+            );
+            assert!(
+                matches!(
+                    err,
+                    jammi_db::catalog::backend::BackendError::DomainViolation { .. }
+                ),
+                "the refusal must be the typed domain-violation class, got {err:?}"
+            );
+            // Postgres never took the write; nothing to clean up or assert
+            // through `fresh_instance` on this backend.
+            catalog
+                .backend_arc()
+                .transaction(TxOptions::default(), |tx| {
+                    let instance_id = instance_id.clone();
+                    Box::pin(async move {
+                        tx.execute(
+                            "DELETE FROM instances WHERE instance_id = $1",
+                            &[SqlValue::TextOwned(instance_id)],
+                        )
+                        .await
+                    })
+                })
+                .await
+                .unwrap();
+        }
+    }
+    // Both arms above are terminal assertions of their backend's own
+    // behaviour; no arm returns early, so nothing here is a runtime skip.
 }

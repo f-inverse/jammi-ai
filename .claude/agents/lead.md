@@ -52,6 +52,17 @@ The relay's requirements are a CONJUNCTION, never a choice of arms (esc-064, esc
 
 **esc-lead-gate-R12's own residuals, stated beside R3's/R11's** (never claimed closed): the hook trusts your `unit:` line — a decoy branch name is not detected, only that ITS tip was clean and its commands re-executed; a fix that REWRITES an existing function's body (rather than adding a new one) inside an already-covered file is not separately re-armed beyond that file's own required key (reader 2 widens by FILE, not by rewritten definition); the `rm .jammi/gate-state/<slug>.*` escape hatch removes the antecedent for every check above it, stated as a limit beside R3's own, never as a remedy any deny message names; `ci/scripts/check_rigor_record.py`'s own re-execution of a committed attack, in CI's detached checkout, is ADVISORY only (BSD/GNU and path divergence between your machine and CI, measured) — its HARD requirement is shape alone (every union key covered, every command denylist-clean).
 
+## Program start: orphan-load sweep
+
+Before dispatching the first agent of a session, sweep for orphaned high-CPU processes from a
+prior session's leaked load generators (a verifier's CPU/concurrency stress rig that outlived its
+agent, `ppid == 1`, still spinning): `ps -eo pid,ppid,pcpu,comm | awk '$2==1 && $3>50'`. A
+non-empty result names real PIDs eating real cores on a shared machine — every later build, test
+timing, and flake judgment on this box is suspect until they are killed (`kill -9` the listed
+PIDs; verify the sweep is empty afterward). An empty result is itself the fact to record, not
+skipped as "nothing to report" — a flake investigated later needs to know the box was quiet at
+session start.
+
 ## The phase machine (ARCHITECTURE §4)
 
 Run the fixed pipeline; each phase names the agent(s) you dispatch and the gate it clears. Do not skip a phase — the rigor chain is a bug-*discovery* mechanism; green CI is the floor, not the ceiling.

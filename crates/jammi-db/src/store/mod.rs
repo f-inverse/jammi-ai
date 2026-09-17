@@ -306,7 +306,11 @@ impl TrainingSetTable {
     /// The key the table is registered under on the session it was bound to:
     /// the single bare identifier `jammi.{table_name}` — what
     /// `TableReference::bare` takes. NOT safe to interpolate into SQL as-is;
-    /// use [`Self::sql_relation`] for that.
+    /// use [`Self::sql_relation`] for that. Returns a plain `String` (not
+    /// [`RelationKey`]): the UNQUOTED registration name is a different risk
+    /// class from a raw-SQL relation string, already covered by
+    /// `pinned_source_gate.rs`'s session-registration-literal pattern (a
+    /// `TableReference::bare(...)`-shaped call site), not this newtype.
     pub fn registered_name(&self) -> String {
         format!("jammi.{}", self.record.table_name)
     }
@@ -318,8 +322,73 @@ impl TrainingSetTable {
     /// nanosecond timestamp), so the unquoted form re-parses as arithmetic and
     /// as a multi-part relation reference — never the table. Quoting the WHOLE
     /// key (not each dot-separated part) is what matches the provider's key.
-    pub fn sql_relation(&self) -> String {
-        crate::sql::quote_ident(&self.registered_name())
+    ///
+    /// Returns [`RelationKey`], not a plain `String` (#551): the only way
+    /// ANY code in this crate can mint one of these values is through this
+    /// method or [`result_table_relation`] (the type's field is private to
+    /// this module — both live here), so a function that requires a
+    /// `RelationKey` parameter cannot be handed a hand-built
+    /// `format!("SELECT * FROM \"jammi.{{}}\"", name)` string instead — that
+    /// value is a plain `String`, not this type.
+    pub fn sql_relation(&self) -> RelationKey {
+        result_table_relation(&self.record.table_name)
+    }
+}
+
+/// Quote `table_name` (any session-registered result table's bare name —
+/// `TrainingSetTable::table_name()`, a [`crate::catalog::result_repo::ResultTableRecord::table_name`],
+/// or any other value known to be a table this session registered under
+/// the bare `jammi.{name}` identifier) into a [`RelationKey`] safe for SQL
+/// interpolation.
+///
+/// The general-purpose sibling of [`TrainingSetTable::sql_relation`] (#551):
+/// a training-set caller that already holds a
+/// [`TrainingSetTable`] handle uses that method directly, but every OTHER
+/// reader of a registered relation across the workspace — an inference
+/// result table, a neighbor-graph table, an embedding index, a bench
+/// corpus — has only the bare table NAME, never a `TrainingSetTable`. Both
+/// functions construct the SAME private-field [`RelationKey`] from the
+/// SAME module, so "no code outside `store/mod.rs` can construct a
+/// `RelationKey`" still holds with two minters instead of one; every
+/// production call site that used to hand-build
+/// `format!("SELECT .. FROM \"jammi.{{name}}\"")` now calls this instead —
+/// `crates/jammi-ai/tests/it/pinned_source_gate.rs`'s quoted-relation
+/// pattern is the enumerating oracle over that migration (see its own doc
+/// for the two exclusions: a source-side federation relation
+/// `"{source_id}".public."{table}"`, and a `FROM "{backing}"` read of a
+/// caller-named backing table, neither of which is a session-registered
+/// `jammi.{name}` relation this minter's contract covers).
+pub fn result_table_relation(table_name: &str) -> RelationKey {
+    RelationKey(crate::sql::quote_ident(&format!("jammi.{table_name}")))
+}
+
+/// A session-registered `jammi.{table}` relation, quoted for SQL
+/// interpolation — [`TrainingSetTable::sql_relation`]'s and
+/// [`result_table_relation`]'s shared return type, and the only public
+/// constructors: the field is private to this module, so no other module in
+/// this crate (or a downstream crate) can construct one from a hand-built
+/// string, only read one back (#551). Does not itself prevent a SQL-building
+/// function from accepting a bare `&str` instead and being handed an
+/// independently hand-built string there — every SQL sink in this codebase
+/// still takes `&str` (`Display`, below, is what lets a `RelationKey`
+/// interpolate into a `format!` string unchanged) — but it does mean a NEW
+/// call site that wants a value ALREADY KNOWN to be a correctly quoted
+/// session-registered relation must go through one of the two minters above
+/// to get one, rather than being able to forge an equally-typed value by
+/// hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationKey(String);
+
+impl RelationKey {
+    /// The quoted relation string, e.g. `"jammi.my-table"`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RelationKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -1309,7 +1378,7 @@ impl ResultStore {
                 // shared default, while still honoring an explicit override.
                 storage_precision,
                 oversample: self.ann.effective_oversample_for(storage_precision),
-                created_at: crate::catalog::backend::now_sortable(),
+                created_at: crate::catalog::lease::canonical_stamp_now(),
                 writer_id: Some(&self.writer_id),
                 lease: Some(self.lease.lease()),
                 job_attempt,
@@ -4234,7 +4303,7 @@ impl ResultStore {
     /// The catalog's own `ORDER BY` is not trusted as the tie-break of record
     /// (r32): the candidates are re-sorted in Rust on the total key
     /// `(created_at DESC, table_name DESC)`, so two rows created in the same
-    /// nanosecond still resolve to one deterministic winner. A reaped artifact
+    /// microsecond still resolve to one deterministic winner. A reaped artifact
     /// falls through to the next candidate rather than failing the whole probe
     /// — the same soundness rule [`Self::probe_cache_record`] applies.
     async fn probe_ready_training_set(

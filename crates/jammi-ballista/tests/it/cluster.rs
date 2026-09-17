@@ -363,7 +363,7 @@ async fn cuda_stamped_stage_never_binds_to_a_device_less_executor() {
                     task_slots: cpu_spec.total_task_slots,
                     available_slots: cpu_spec.available_task_slots,
                     status: "Active".to_string(),
-                    heartbeat_at: jammi_db::catalog::backend::now_sortable(),
+                    heartbeat_at: jammi_db::catalog::lease::canonical_stamp_now(),
                     metadata: String::new(),
                     devices: vec![],
                 })
@@ -379,7 +379,7 @@ async fn cuda_stamped_stage_never_binds_to_a_device_less_executor() {
                     task_slots: 1,
                     available_slots: 1,
                     status: "Active".to_string(),
-                    heartbeat_at: jammi_db::catalog::backend::now_sortable(),
+                    heartbeat_at: jammi_db::catalog::lease::canonical_stamp_now(),
                     metadata: String::new(),
                     devices: vec![DeviceFact {
                         kind: "cuda".to_string(),
@@ -461,7 +461,7 @@ async fn cuda_stamped_stage_never_binds_to_a_cpu_only_executor() {
                     task_slots: cpu_spec.total_task_slots,
                     available_slots: cpu_spec.available_task_slots,
                     status: "Active".to_string(),
-                    heartbeat_at: jammi_db::catalog::backend::now_sortable(),
+                    heartbeat_at: jammi_db::catalog::lease::canonical_stamp_now(),
                     metadata: String::new(),
                     devices: vec![DeviceFact {
                         kind: "cpu".to_string(),
@@ -480,7 +480,7 @@ async fn cuda_stamped_stage_never_binds_to_a_cpu_only_executor() {
                     task_slots: 1,
                     available_slots: 1,
                     status: "Active".to_string(),
-                    heartbeat_at: jammi_db::catalog::backend::now_sortable(),
+                    heartbeat_at: jammi_db::catalog::lease::canonical_stamp_now(),
                     metadata: String::new(),
                     devices: vec![DeviceFact {
                         kind: "cuda".to_string(),
@@ -558,7 +558,7 @@ async fn cpu_stamped_stage_binds_to_a_cpu_only_executor() {
                     task_slots: cpu_spec.total_task_slots,
                     available_slots: cpu_spec.available_task_slots,
                     status: "Active".to_string(),
-                    heartbeat_at: jammi_db::catalog::backend::now_sortable(),
+                    heartbeat_at: jammi_db::catalog::lease::canonical_stamp_now(),
                     metadata: String::new(),
                     devices: vec![DeviceFact {
                         kind: "cpu".to_string(),
@@ -633,7 +633,7 @@ async fn already_transferred_gang_is_never_bound() {
                     task_slots: spec.total_task_slots,
                     available_slots: spec.available_task_slots,
                     status: "Active".to_string(),
-                    heartbeat_at: jammi_db::catalog::backend::now_sortable(),
+                    heartbeat_at: jammi_db::catalog::lease::canonical_stamp_now(),
                     metadata: String::new(),
                     // The descriptor below is stamped `Cuda` — this executor
                     // must list a matching device so the ONLY reason binding
@@ -724,7 +724,7 @@ async fn a_slot_less_executor_never_gets_a_task_stamped() {
                     task_slots: 1,
                     available_slots: 0, // fully booked in the catalog
                     status: "Active".to_string(),
-                    heartbeat_at: jammi_db::catalog::backend::now_sortable(),
+                    heartbeat_at: jammi_db::catalog::lease::canonical_stamp_now(),
                     metadata: String::new(),
                     devices: vec![],
                 })
@@ -781,7 +781,7 @@ fn record(id: &str, status: &str, heartbeat_at: String) -> ComputeExecutorRecord
 #[test]
 fn executor_is_live_table() {
     let now = chrono::Utc::now();
-    let stamp = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string();
+    let stamp = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
     let fresh = stamp(now);
     assert!(executor_is_live(&record("e", "Active", fresh.clone()), now));
     assert!(!executor_is_live(
@@ -794,7 +794,7 @@ fn executor_is_live_table() {
     let outside = stamp(now - executor_liveness_window() - chrono::Duration::seconds(1));
     assert!(!executor_is_live(&record("e", "Active", outside), now));
     assert!(!executor_is_live(
-        &record("e", "Active", "2026-01-01T00:00:00.000000000Z".into()),
+        &record("e", "Active", "2026-01-01T00:00:00.000000Z".into()),
         now
     ));
     assert!(!executor_is_live(
@@ -848,7 +848,7 @@ async fn terminating_and_stale_executors_are_never_bound() {
                 .upsert_compute_executor(&record(
                     &stale_id,
                     "Active",
-                    "2026-01-01T00:00:00.000000000Z".to_string(),
+                    "2026-01-01T00:00:00.000000Z".to_string(),
                 ))
                 .await
                 .unwrap();
@@ -910,7 +910,7 @@ async fn a_stale_cuda_row_never_admits_a_cuda_plan_at_the_submit_edge() {
         let mut stale = record(
             &stale_id,
             "Active",
-            "2026-01-01T00:00:00.000000000Z".to_string(),
+            "2026-01-01T00:00:00.000000Z".to_string(),
         );
         stale.devices = cuda.clone();
         catalog.upsert_compute_executor(&stale).await.unwrap();
@@ -948,7 +948,7 @@ async fn a_stale_cuda_row_never_admits_a_cuda_plan_at_the_submit_edge() {
         let mut fresh = record(
             &fresh_id,
             "Active",
-            jammi_db::catalog::backend::now_sortable(),
+            jammi_db::catalog::lease::canonical_stamp_now(),
         );
         fresh.devices = cuda;
         catalog.upsert_compute_executor(&fresh).await.unwrap();

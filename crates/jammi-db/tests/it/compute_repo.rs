@@ -74,7 +74,7 @@ fn executor(id: &str, devices: Vec<DeviceFact>) -> ComputeExecutorRecord {
         task_slots: 4,
         available_slots: 4,
         status: "live".to_string(),
-        heartbeat_at: "2026-01-01T00:00:00.000000000Z".to_string(),
+        heartbeat_at: "2026-01-01T00:00:00.000000Z".to_string(),
         metadata: "{}".to_string(),
         devices,
     }
@@ -85,8 +85,8 @@ fn job(id: &str, owner: &str) -> ComputeJobRecord {
         job_id: id.to_string(),
         owner: owner.to_string(),
         status: "queued".to_string(),
-        queued_at: "2026-01-01T00:00:00.000000000Z".to_string(),
-        updated_at: "2026-01-01T00:00:00.000000000Z".to_string(),
+        queued_at: "2026-01-01T00:00:00.000000Z".to_string(),
+        updated_at: "2026-01-01T00:00:00.000000Z".to_string(),
     }
 }
 
@@ -171,7 +171,7 @@ async fn heartbeat_updates_only_status_and_heartbeat_at(kind: BackendKind) {
             .unwrap();
 
         let updated = catalog
-            .record_compute_heartbeat(&target, "draining", "2026-06-01T00:00:00.000000000Z")
+            .record_compute_heartbeat(&target, "draining", "2026-06-01T00:00:00.000000Z")
             .await
             .unwrap();
         assert!(updated);
@@ -182,7 +182,7 @@ async fn heartbeat_updates_only_status_and_heartbeat_at(kind: BackendKind) {
             .unwrap()
             .unwrap();
         assert_eq!(target_row.status, "draining");
-        assert_eq!(target_row.heartbeat_at, "2026-06-01T00:00:00.000000000Z");
+        assert_eq!(target_row.heartbeat_at, "2026-06-01T00:00:00.000000Z");
         // Every other field on the target row is untouched.
         assert_eq!(target_row.task_slots, 4);
         assert_eq!(target_row.available_slots, 4);
@@ -196,7 +196,7 @@ async fn heartbeat_updates_only_status_and_heartbeat_at(kind: BackendKind) {
         let missing = format!("exec-hb-missing-{}", jammi_test_utils::unique_suffix());
         owned.borrow_mut().push(missing.clone());
         let updated = catalog
-            .record_compute_heartbeat(&missing, "live", "2026-06-01T00:00:00.000000000Z")
+            .record_compute_heartbeat(&missing, "live", "2026-06-01T00:00:00.000000Z")
             .await
             .unwrap();
         assert!(!updated);
@@ -394,7 +394,7 @@ async fn compute_jobs_put_get_list_delete(kind: BackendKind) {
 
     let mut updated = rec.clone();
     updated.status = "running".to_string();
-    updated.updated_at = "2026-06-01T00:00:00.000000000Z".to_string();
+    updated.updated_at = "2026-06-01T00:00:00.000000Z".to_string();
     catalog.put_compute_job(&updated).await.unwrap();
     assert_eq!(catalog.get_compute_job(&id).await.unwrap(), Some(updated));
 

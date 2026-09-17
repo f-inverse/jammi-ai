@@ -598,8 +598,19 @@ def _calibration_report_to_dict(
 # accepts, matching the embed binding's `ChannelColumnType::as_str`.
 _CHANNEL_COLUMN_TYPE_NAME = {v: k for k, v in _CHANNEL_COLUMN_TYPE.items()}
 
-# Terminal job states, matching the engine's `JobStatus`.
+# Terminal job states, matching the engine's `JobStatus::ALL` filtered by
+# `JobStatus::is_terminal` (`crates/jammi-db/src/catalog/status.rs:70-78`) —
+# the ONE Rust-side terminality predicate; this set must stay equal to it.
 _TERMINAL_STATES = {"completed", "failed"}
+# The terminal-unsuccessful subset (mirrors `JobStatus::is_terminal_unsuccessful`
+# — today exactly `{"failed"}`, kept as its own named set rather than a bare
+# literal so a future terminal-unsuccessful status joining the vocabulary is
+# one edit here, not a hunt for every `== "failed"` call site).
+_TERMINAL_UNSUCCESSFUL_STATES = {"failed"}
+# `JobStatus::Queued`'s rendered spelling — the ONE place a caller (this
+# module or a test) that needs the exact "freshly submitted, unclaimed"
+# literal reads it from, instead of hand-typing `"queued"` again.
+_QUEUED_STATE = "queued"
 
 
 def _verify_verdict_to_dict(
@@ -854,15 +865,21 @@ class RemoteJob:
         """Block until the job reaches a terminal state; raise on failure.
         Returns the tagged terminal result dict (see `_job_result_to_dict`).
 
-        Polls `JobStatus` until ``completed`` (returns the result) or
-        ``failed`` (raises :class:`jammi.TrainingError` with the wire error
-        message) — the remote peer of the embedded `Job.wait`.
+        Polls `JobStatus` until ``completed`` (returns the result) or a
+        terminal-unsuccessful status — today exactly ``failed`` — raising
+        :class:`jammi.TrainingError` with the wire error message — the
+        remote peer of the embedded `Job.wait`. Derived from
+        `_TERMINAL_UNSUCCESSFUL_STATES` (matching the engine's
+        `JobStatus::is_terminal_unsuccessful`) rather than a bare literal, so
+        a future terminal-unsuccessful status joining the vocabulary still
+        ends this loop with a one-line edit, not a hunt for every literal
+        compare.
         """
         while True:
             resp = self._status_response()
             if resp.status == "completed":
                 return _job_result_to_dict(resp)
-            if resp.status == "failed":
+            if resp.status in _TERMINAL_UNSUCCESSFUL_STATES:
                 raise TrainingError(resp.error or "job failed")
             time.sleep(self._POLL_INTERVAL_SECONDS)
 

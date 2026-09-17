@@ -176,7 +176,7 @@
 # expectation, checked via the SAME exact-SET-equality
 # `params.expect_kernels_disabled` (`finetune_step.rs:746-758`) machinery
 # the eager leg's own nonempty list uses —
-# `parse_disable_list` (`crates/jammi-kernels/src/admission.rs:1037-1046`)
+# `parse_disable_list` (`crates/jammi-kernels/src/admission.rs:1041-1046`)
 # is the empty set for `Some("")`, so
 # this hard-fails the run if `JAMMI_KERNELS_DISABLE` carries ANYTHING at
 # all when this process starts, catching an AMBIENT/leaked env var (a
@@ -326,23 +326,23 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # ten LIVE, STANDALONE `admit()`/`admit_cascade()`/`op_disabled()` op keys
 # this crate's fused finetune-step call graph actually reaches on a real
 # training step (confirmed at this contract's tip: `layer_norm_fused`
-# `crates/jammi-encoders/src/layer_norm.rs:585`, `geglu_fused`
-# `crates/jammi-encoders/src/modernbert.rs:1433`, `gelu_erf_fused`
-# `crates/jammi-encoders/src/activations.rs:173`, `attention_block_flash`
-# `crates/jammi-encoders/src/modernbert.rs:2002` (`op_disabled`, the
+# `crates/jammi-encoders/src/layer_norm.rs:130`, `geglu_fused`
+# `crates/jammi-encoders/src/modernbert.rs:1389`, `gelu_erf_fused`
+# `crates/jammi-encoders/src/activations.rs:32`, `attention_block_flash`
+# `crates/jammi-encoders/src/modernbert.rs:2000` (`op_disabled`, the
 # cascade's own capability gate), `attention_block_fused`
-# `crates/jammi-encoders/src/attention_cascade.rs:905` (moved out of
+# `crates/jammi-encoders/src/attention_cascade.rs:400` (moved out of
 # `crate::modernbert`, issue #462), `rope_fused`
-# `crates/jammi-encoders/src/modernbert.rs:485`, `softmax_last_dim_fused`
-# `crates/jammi-encoders/src/attention_cascade.rs:636` (moved out of
+# `crates/jammi-encoders/src/modernbert.rs:182`, `softmax_last_dim_fused`
+# `crates/jammi-encoders/src/attention_cascade.rs:405` (moved out of
 # `crate::modernbert`, issue #462), `lora_linear_fused`
-# `crates/jammi-lora/src/lora_linear.rs:1079`, `adamw_step_fused`
-# `crates/jammi-ai/src/fine_tune/adamw.rs:259`, `mem_efficient_attention`
-# `crates/jammi-encoders/src/attention_cascade.rs:859` (`admit_cascade`, the
+# `crates/jammi-lora/src/lora_linear.rs:227`, `adamw_step_fused`
+# `crates/jammi-ai/src/fine_tune/adamw.rs:34`, `mem_efficient_attention`
+# `crates/jammi-encoders/src/attention_cascade.rs:864` (`admit_cascade`, the
 # per-layer memeff cascade — consulted on EVERY training-mode attention
 # layer once the flash cascade has declined, BEFORE the block arm's own
 # `admit()`) and `op_disabled`
-# (`crates/jammi-encoders/src/modernbert.rs:2359`) is the once-per-forward
+# (`crates/jammi-encoders/src/modernbert.rs:2360`) is the once-per-forward
 # gate that suppresses the block/eager mask bundle when memeff is going to
 # fire.
 # `mem_efficient_attention` is the NINTH key, added by adversarial-audit
@@ -362,26 +362,29 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # absence mechanically the moment the op landed: the all-eager leg would
 # otherwise silently leave this site fused.
 #
-# SWEEP METHOD (so an ELEVENTH addition gets caught, not merely this tenth):
-# every entry above was found by grepping `crates/jammi-encoders/src/`,
-# `crates/jammi-lora/src/`, and `crates/jammi-ai/src/fine_tune/` for a
-# direct `admit(`/`admit_cascade(`/`op_disabled(` call and reading off its
-# literal `op`/`&'static str` argument — `ci/scripts/perf/
-# test_finetune_ab_disable_op_keys.py` runs EXACTLY this sweep
-# mechanically (a balanced-paren scan over those three crates, never a
-# hand-kept list) and asserts the discovered set equals this constant
-# byte-for-byte; run it after touching any of those crates' attention/
-# LoRA/optimizer call graphs, and it REDs on both a missing and a stale
-# entry. That test's own scope is deliberately NOT `crates/jammi-kernels/
-# src/` (the SUBSUMED `cast_scale_bf16_f32`/`cast_add_bf16` keys live
-# there behind `ops/low_rank_residual_linear.rs`'s `admit_cast_boundary`
-# wrapper, called with a *variable* `op` argument, not a literal — a
-# grep-based scan cannot resolve it, and it must not be named directly
-# here regardless, see the `NOT lora_epilogue/...` bullet below) — that
-# one exclusion is verified MANUALLY against `admission.rs`'s own module
-# doc (the authoritative classification of every op key's reachability)
-# each time this constant changes, the documented manual-sweep protocol
-# the mechanical test's own doc names as its complement.
+# SWEEP METHOD (so an ELEVENTH addition gets caught, not merely this
+# tenth), REBUILT for wave-5 identity's #546 typed-op migration: every
+# `admit`/`admit_cascade` call site now passes a typed
+# `&'static jammi_kernels::admission::ProbedOp` const (`admission.rs`'s
+# own `PROBED_OPS` table), never a bare string literal — there is no
+# literal left at a call site for a text scan to read the op key from at
+# all. The live standalone op-key set is `PROBED_OPS` itself:
+# `ci/scripts/perf/test_finetune_ab_disable_op_keys.py` reads it from
+# `ci/tools/probed-ops-index` (`cargo run --release -p probed-ops-index`,
+# a tiny CI-only binary that dumps `PROBED_OPS`'s own registry keys as
+# JSON) and asserts this constant equals that set, MINUS the
+# `KNOWN_NON_STANDALONE_REGISTRY_KEYS` that script's own module doc names
+# (the dtype-branching cast-boundary rows, reached only through
+# `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs`'s
+# `admit_cast_boundary` wrapper, called with a *variable* `op` argument,
+# never a literal, and never a standalone call site any sweep config here
+# could disable directly), byte-for-byte; run it after touching
+# `admission.rs`'s `PROBED_OPS` table and it REDs on both a missing and a
+# stale entry. That exclusion is verified MANUALLY against `admission.rs`'s
+# own module doc (the authoritative classification of every op key's
+# reachability) each time this constant changes, the documented
+# manual-sweep protocol the mechanical test's own doc names as its
+# complement.
 #
 #   * NOT `all` (`crates/jammi-kernels/src/admission.rs:169-177`)
 #     disclaims it as whole-registry evidence: `unmatched_disables()`
@@ -403,18 +406,20 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 #     `--expect-kernels-disabled`'s own hard check) refuses the run rather
 #     than accepting a name that never fired.
 #   * NOT `lora_epilogue`/`lora_dropout`/`cast_scale_bf16_f32`/
-#     `cast_add_bf16` — subsumed by `lora_linear_fused`
-#     (`crates/jammi-kernels/src/admission.rs:101-115`):
-#     `lora_epilogue`/`lora_dropout` are REGISTERED but PERMANENTLY DEAD
-#     (their stand-alone call sites were superseded by the fused LoRA
-#     site's single `CustomOp3`, which never calls `admit` for either name
-#     — always reads `{fused: 0, eager: 0}`); `cast_scale_bf16_f32`/
-#     `cast_add_bf16` are reachable ONLY as a SUBSUMED op inside
-#     `lora_linear_fused`'s own admitted branch, never named directly by a
-#     caller that wants the whole LoRA site eager. Naming any of the four
-#     directly ABORTS the run — a real, present-in-the-registry op name
-#     that nonetheless never reaches `admit`/`op_disabled` is exactly as
-#     unmatched as a typo —
+#     `cast_scale_f16_f32`/`cast_add_bf16`/`cast_add_f16` — subsumed by
+#     `lora_linear_fused` (`crates/jammi-kernels/src/admission.rs`'s own
+#     `PROBED_OPS` table): `lora_epilogue`/`lora_dropout` are REGISTERED
+#     but PERMANENTLY DEAD (their stand-alone call sites were superseded
+#     by the fused LoRA site's single `CustomOp3`, which never calls
+#     `admit` for either name — always reads `{fused: 0, eager: 0}`, and
+#     neither is even a `PROBED_OPS` row); the four `cast_scale`/`cast_add`
+#     dtype-branching keys (bf16 AND f16) are reachable ONLY as a SUBSUMED
+#     op inside `lora_linear_fused`'s own admitted branch, through
+#     `ops/low_rank_residual_linear.rs`'s `admit_cast_boundary` wrapper,
+#     never named directly by a caller that wants the whole LoRA site
+#     eager. Naming any of the six directly ABORTS the run — a real,
+#     present-in-the-registry op name that nonetheless never reaches
+#     `admit`/`op_disabled` is exactly as unmatched as a typo —
 #     `kernel_disable_of_a_registered_but_dead_op_name_invalidates_the_run`
 #     (`crates/jammi-bench/tests/finetune_step_kernel_disable.rs:112`)
 #     proves this against the real CLI.

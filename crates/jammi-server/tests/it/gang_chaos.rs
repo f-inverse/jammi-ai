@@ -101,12 +101,12 @@ const MAX_ATTEMPTS: u32 = 3;
 const CHAOS_AT_REDUCE: usize = 5;
 
 /// The deployment: one catalog, one result root, the training source.
-struct Fleet {
+pub(crate) struct Fleet {
     dir: TempDir,
 }
 
 impl Fleet {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let dir = TempDir::new().expect("fleet dir");
         std::fs::create_dir_all(dir.path().join("jammi_db")).expect("result root");
         Self { dir }
@@ -120,10 +120,18 @@ impl Fleet {
         self.dir.path().join("jammi_db").display().to_string()
     }
 
+    /// The fleet's own temp dir — a host's private subdirectory (its
+    /// `artifact_dir`) is created under this, and the shared training
+    /// source's CSV file lives here too (`gang_resume_parity.rs` reuses
+    /// this to register the source once, before any host claims).
+    pub(crate) fn dir(&self) -> &Path {
+        self.dir.path()
+    }
+
     /// A host's config over the shared catalog and result root: its own
     /// `artifact_dir`, `[worker] enabled = false` (every claim below is the
     /// test's own), a serveable world of two, the fleet timing.
-    fn host_config(
+    pub(crate) fn host_config(
         &self,
         own: &Path,
         lease: Duration,
@@ -236,15 +244,15 @@ impl Coordinator {
 /// is that runtime dropped (its listener, every accepted connection, every
 /// spawned hold loop and every rank body's task go with it; a body's
 /// blocking thread runs on to its next collective, which fails).
-struct Member {
-    session: Arc<InferenceSession>,
+pub(crate) struct Member {
+    pub(crate) session: Arc<InferenceSession>,
     addr: SocketAddr,
     runtime: Option<tokio::runtime::Runtime>,
     _dir: TempDir,
 }
 
 impl Member {
-    async fn start(fleet: &Fleet) -> Self {
+    pub(crate) async fn start(fleet: &Fleet) -> Self {
         // The port is reserved BEFORE the session exists so the
         // registration can advertise it; the listener moves onto the gang
         // runtime below.
@@ -362,11 +370,11 @@ impl Member {
         assert!(self.session.host_admission().begin_drain());
     }
 
-    fn holder(&self) -> Holder {
+    pub(crate) fn holder(&self) -> Holder {
         self.session.host_admission().holder()
     }
 
-    async fn wait_slot_free(&self, within: Duration) {
+    pub(crate) async fn wait_slot_free(&self, within: Duration) {
         let deadline = tokio::time::Instant::now() + within;
         while self.holder() != Holder::Free {
             assert!(

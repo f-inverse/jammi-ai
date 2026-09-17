@@ -1,11 +1,15 @@
 name: Swarm gates
 
-# No `paths:` filter — every gate here is a trivial, hermetic pure-Python (or
-# git-diff) check with no Rust build and no toolchain, so it always runs on every
-# PR and push to main. A path-filtered workflow that is later set as a required
-# status check would hang unrelated PRs (the check never reports) — this is the
-# #245 trap. The TOUCHED guards below therefore detect their own touched set
-# *inside* the job (via `git diff`), never via a workflow `paths:` filter.
+# No `paths:` filter on the job below — every gate here always runs on
+# every PR and push to main, as a toolchain-free pure-Python (or git-diff)
+# check. The gates that resolve against a real `syn` parse via
+# `ci/tools/symbol-index` run in ci.yml's `symbol-index-gates` job (a
+# toolchain job aggregated by the required `ci-summary`), so a Rust build
+# never taxes this fast lane. A
+# path-filtered workflow that is later set as a required status check would
+# hang unrelated PRs (the check never reports) — this is the #245 trap. The
+# TOUCHED guards below therefore detect their own touched set *inside* the
+# job (via `git diff`), never via a workflow `paths:` filter.
 on:
   push:
     branches: [main]
@@ -49,13 +53,32 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 ci/scripts/check_constitution_anchors.py
 
-      # The mechanical half of the discipline test: no governance-verb leak in the
-      # diff, no philosophy leak-smell token in the engine tree. Advisory-labelled.
-      - name: Assert no consumer-name / governance leak in the engine tree
+      # The mechanical half of the discipline test (no governance-verb leak in
+      # the diff, no philosophy leak-smell token in the engine tree) resolves
+      # its `pub`-declaration scan against the real `symbol-index` tool since
+      # the migration off `PUB_DECL_RE` — it runs in ci.yml's `symbol-index-gates`
+      # (below), the Rust-toolchain job, not here.
+
+      # Issue #555: diff-scoped journey-marker gate (unit ids, round numbers,
+      # ruling ids, "at this commit" hedges) — blocks on a published surface
+      # (rustdoc on a `pub` item, a `.proto` comment, a python docstring),
+      # advisory on a private comment/test.
+      - name: Assert the journey-marker self-test fixtures fire correctly
+        if: ${{ !cancelled() }}
+        run: python3 ci/scripts/check_journey_markers.py --self-test
+
+      - name: Assert no journey marker on a published surface in the diff
         if: ${{ !cancelled() }}
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
-        run: python3 ci/scripts/check_no_consumer_names.py
+        run: python3 ci/scripts/check_journey_markers.py
+
+      # Issue #556: plan docs under docs/plans/** cite CONSTRUCTS
+      # (path::symbol / path#heading / TOML key / proto member). TOML/
+      # heading/proto resolution is toolchain-free and stays here; Rust
+      # construct resolution (against the real symbol-index tool) runs in
+      # ci.yml's `symbol-index-gates` job — `check_plan_citations.py` itself is
+      # ONE script either way, this is only where its invocation lives.
 
       # The lead-proactivity gate's own CI leg: runs the REAL hook scripts
       # (lead-gate-{start,stop,pre}.sh) against fixture payloads in a temp
@@ -106,15 +129,21 @@ jobs:
         run: |
           git fetch --quiet origin "${{ github.base_ref }}"
           base="origin/${{ github.base_ref }}"
-          changed="$(git diff --name-only "$base"...HEAD -- docs/swarm/CONSTITUTION.md)"
+          changed="$(git diff --name-only "$base"...HEAD -- \
+            docs/swarm/CONSTITUTION.md \
+            docs/swarm/RULES.md \
+            docs/guide/src/philosophy.md)"
           if [ -n "$changed" ]; then
-            echo "::error::CONSTITUTION_TOUCHED: docs/swarm/CONSTITUTION.md changed in this PR."
-            echo "The engine constitution is human-amend-only (anti-Goodhart, ARCHITECTURE §2.7/§7):"
-            echo "every edit — tightening included — must be human-reviewed and admin-merged."
+            echo "::error::CONSTITUTION_TOUCHED: a canonical invariant-index source changed in this PR:"
+            echo "$changed" | sed 's/^/    /'
+            echo "The engine constitution and its two canonical sources (docs/swarm/RULES.md, the"
+            echo "swarm-facing rules; docs/guide/src/philosophy.md, the engine's design philosophy)"
+            echo "are human-amend-only (anti-Goodhart, ARCHITECTURE §2.7/§7): every edit —"
+            echo "tightening included — must be human-reviewed and admin-merged."
             echo "This PR must be human-reviewed and admin-merged."
             exit 1
           fi
-          echo "CONSTITUTION_TOUCHED: clean — constitution untouched."
+          echo "CONSTITUTION_TOUCHED: clean — constitution and its canonical sources untouched."
 
       - name: Guard — swarm gate definitions are human-amend-only (SWARM_GATE_TOUCHED)
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
@@ -125,6 +154,7 @@ jobs:
             ':(glob).claude/agents/*.md' \
             ':(glob)ci/scripts/**/check_*.py' \
             ':(glob)ci/scripts/**/check_*.sh' \
+            ':(glob)ci/tools/**' \
             'ci/scripts/no_consumer_names_allowlist.txt' \
             'ci/lead-gate-required-commands.txt' \
             '.claude/settings.json' \
@@ -134,8 +164,8 @@ jobs:
           if [ -n "$changed" ]; then
             echo "::error::SWARM_GATE_TOUCHED: a swarm gate definition changed in this PR:"
             echo "$changed" | sed 's/^/    /'
-            echo "Gate definitions (agent cards, check_*.py gates, the no-consumer-names waiver"
-            echo "allowlist, swarm.yml) are human-amend-only."
+            echo "Gate definitions (agent cards, check_*.py gates, ci/tools/** shared indexers, the"
+            echo "no-consumer-names waiver allowlist, swarm.yml) are human-amend-only."
             echo "Autonomously adding/altering a gate touches a gate definition and is blocked by design."
             echo "This PR must be human-reviewed and admin-merged."
             exit 1

@@ -9,6 +9,7 @@ mod gang_admission_catalog_fault_oracle;
 mod gang_chaos;
 mod gang_coordinator;
 mod gang_rank_admission_oracle;
+mod gang_resume_parity;
 mod gang_rounds;
 mod gang_service;
 mod gang_terminal_write_oracle;

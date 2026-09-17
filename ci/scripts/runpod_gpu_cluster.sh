@@ -916,9 +916,15 @@ _rpc_run_two_ranks_inner() {
   _rpc_phase "build (both ranks, concurrently) + two-host proof"
   rank0_log="$(mktemp)"; rank1_log="$(mktemp)"
   STAGING_ID_FILE="$RP_WORK/nccl.id"
-  _rpc_remote_script 0 | ssh "${RP_SSHO[@]}" -p "$primary_port" "root@${primary_host}" "timeout ${RP_TIMEOUT:-3000} bash -s" > "$rank0_log" 2>&1 &
+  # Every remote job imports PID 1's environment FIRST (RP_ENV_PREAMBLE, the
+  # library's one definition, prepended exactly as rp_run_remote /
+  # rp_run_remote_watched do): an sshd session does not inherit the
+  # container's Dockerfile ENV, so without it the member builds with the
+  # system gcc, which does not know the mold link flag the workspace's cargo
+  # config asks for (run 35169035056: rank 0's build died at the linker).
+  { printf '%s\n' "$RP_ENV_PREAMBLE"; _rpc_remote_script 0; } | ssh "${RP_SSHO[@]}" -p "$primary_port" "root@${primary_host}" "timeout ${RP_TIMEOUT:-3000} bash -s" > "$rank0_log" 2>&1 &
   rank0_pid=$!
-  _rpc_remote_script 1 | ssh "${RP_SSHO[@]}" "${member_extra_sshopts[@]}" -p "$member_port" "root@${member_host}" "timeout ${RP_TIMEOUT:-3000} bash -s" > "$rank1_log" 2>&1 &
+  { printf '%s\n' "$RP_ENV_PREAMBLE"; _rpc_remote_script 1; } | ssh "${RP_SSHO[@]}" "${member_extra_sshopts[@]}" -p "$member_port" "root@${member_host}" "timeout ${RP_TIMEOUT:-3000} bash -s" > "$rank1_log" 2>&1 &
   rank1_pid=$!
   _rpc_phase "watching both ranks (id crossing + inactivity + wrong-tree + budget)"
   local last_growth=$SECONDS last_size0=0 last_size1=0 sz0 sz1 remote_size wrong_tree candidate_log line

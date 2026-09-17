@@ -1757,8 +1757,8 @@ if grep -qF 'rp_two_host_pod_create "$RP_CLUSTER_GPU_TYPE" "$chosen_dc" 0' "$CLU
 else
   bad "P3: expected each create call to name its own rank literal"
 fi
-if grep -qF '_rpc_remote_script 0 | ssh "${RP_SSHO[@]}" -p "$primary_port" "root@${primary_host}"' "$CLUSTER_SH" \
-  && grep -qF '_rpc_remote_script 1 | ssh "${RP_SSHO[@]}" "${member_extra_sshopts[@]}" -p "$member_port" "root@${member_host}"' "$CLUSTER_SH"; then
+if grep -qF '_rpc_remote_script 0; } | ssh "${RP_SSHO[@]}" -p "$primary_port" "root@${primary_host}"' "$CLUSTER_SH" \
+  && grep -qF '_rpc_remote_script 1; } | ssh "${RP_SSHO[@]}" "${member_extra_sshopts[@]}" -p "$member_port" "root@${member_host}"' "$CLUSTER_SH"; then
   ok "P3: rank 0's remote script runs on the primary (rank 0's own pod), rank 1's on the member (rank 1's own pod)"
 else
   bad "P3: expected rank 0/1's remote script to run on the primary/member host respectively"
@@ -2081,7 +2081,8 @@ run_two_ranks_fixture() { # $1=rank0 script body $2=rank1 script body $3=RP_INAC
     CLUSTER_REMOTE_ID_FILE=/remote/nccl.id; RP_TIMEOUT=30
     RP_INACTIVITY="$P12_INACT"; DEADLINE=$(( SECONDS + P12_DL )); id_landed=0; unset PROVE_EXPECT_SHA
     _rpc_remote_script() { [ "$1" = "0" ] && printf "%s\n" "$P12_R0" || printf "%s\n" "$P12_R1"; }
-    ssh() { echo "ssh $*" >> "'"$P12_DIR"'/calls"; bash -s; }
+    RP_ENV_PREAMBLE=": env-preamble-sentinel"
+    ssh() { echo "ssh $*" >> "'"$P12_DIR"'/calls"; f="$(mktemp "'"$P12_DIR"'/stdin-XXXXXX")"; cat > "$f"; bash "$f"; }
     scp() { echo "scp $*" >> "'"$P12_DIR"'/calls"; case "$*" in *"root@"*":"*" "*) : ;; esac
             last="${@: -1}"; case "$last" in "'"$P12_DIR"'"/*) head -c 128 /dev/zero > "$last" ;; esac; }
     _rpc_remote_id_size() { cat "'"$P12_DIR"'/idsize" 2>/dev/null; }
@@ -2103,6 +2104,12 @@ if printf '%s' "$out" | grep -q "RC=0 id_landed=1 rank0_rc=0 rank1_rc=0" \
    && grep '^scp ' "$P12_DIR/calls" | tail -1 | grep -q -- "-o ProxyJump=root@jump:1 -P 2202 .* root@10.0.0.2:/remote/nccl.id" \
    && grep '^ssh ' "$P12_DIR/calls" | tail -1 | grep -q -- "-o ProxyJump=root@jump:1 -p 2202 root@10.0.0.2"; then
   ok "P12: happy path -- both ranks launched up front (2 ssh, rank 1 with its own options), the id scp'd down from the primary then up to the member exactly once each, both ranks rc 0, id_landed=1"
+  p14_r0="$(grep -l '^echo start0' "$P12_DIR"/stdin-* | head -1)"; p14_r1="$(grep -l '^echo start1' "$P12_DIR"/stdin-* | head -1)"
+  if [ -n "$p14_r0" ] && [ -n "$p14_r1" ] && [ "$(head -1 "$p14_r0")" = ": env-preamble-sentinel" ] && [ "$(head -1 "$p14_r1")" = ": env-preamble-sentinel" ]; then
+    ok "P14: the FIRST line each rank receives is RP_ENV_PREAMBLE (PID 1's environment import, the library's one definition), before its own script"
+  else
+    bad "P14: expected RP_ENV_PREAMBLE as the first line of both ranks' stdin; got: $(head -1 "$p14_r0" 2>/dev/null) / $(head -1 "$p14_r1" 2>/dev/null)"
+  fi
 else
   bad "P12: happy path off; out=$out calls=$(cat "$P12_DIR/calls" 2>/dev/null)"
 fi

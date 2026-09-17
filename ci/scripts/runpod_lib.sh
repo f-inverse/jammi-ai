@@ -2485,7 +2485,13 @@ rp_parse_prove_marker() {
 # and the wrong-tree guard below fired). Without an expected sha (a hand
 # run) the ref is cloned. Emits shell lines for the remote script's
 # heredoc: `cd /root`, a fresh `jammi-ai` dir, and leaves the caller INSIDE
-# it. `$1` = the ref (used only without PROVE_EXPECT_SHA), `$2` = the repo.
+# it. Every leg then deepens the history WITHOUT blobs (commits and trees
+# only, seconds): the artifact registry's ancestry rule (`git merge-base
+# --is-ancestor`, check_cuda_run_artifacts.py rule (d)/(k)) answers "not an
+# ancestor" for every commit but HEAD on a depth-1 history — the pod-leg
+# synthetic tests failed on the prove leg for exactly that (GPU prove
+# 35162725943). `$1` = the ref (used only without PROVE_EXPECT_SHA), `$2` =
+# the repo.
 rp_remote_checkout_lines() {
   local ref="${1:?rp_remote_checkout_lines needs a ref}" repo="${2:?rp_remote_checkout_lines needs a repo url}"
   if [ -n "${PROVE_EXPECT_SHA:-}" ]; then
@@ -2495,12 +2501,16 @@ git init -q && git remote add origin "${repo}"
 git fetch -q --depth 1 origin "${PROVE_EXPECT_SHA}" \\
   || { echo "::error::could not fetch the exact commit ${PROVE_EXPECT_SHA} from ${repo}" >&2; exit 1; }
 git checkout -q --detach FETCH_HEAD
+git fetch -q --filter=blob:none --unshallow origin \\
+  || { echo "::error::could not deepen the checkout (blobless --unshallow failed) -- the artifact registry's ancestry rule cannot run on a depth-1 history" >&2; exit 1; }
 LINES
   else
     cat <<LINES
 cd /root && rm -rf jammi-ai
 git clone --depth 1 -b "${ref}" "${repo}" jammi-ai 2>&1 | tail -1
 cd jammi-ai
+git fetch -q --filter=blob:none --unshallow origin \\
+  || { echo "::error::could not deepen the checkout (blobless --unshallow failed) -- the artifact registry's ancestry rule cannot run on a depth-1 history" >&2; exit 1; }
 LINES
   fi
 }

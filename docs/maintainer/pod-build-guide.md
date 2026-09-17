@@ -67,7 +67,7 @@ exactly one place).
    own acceptance measurement — pod_build_timings.sh)
 ```
 
-Each box's own entry point: bootstrap is `rp_bootstrap` (`ci/scripts/runpod_lib.sh:3160`);
+Each box's own entry point: bootstrap is `rp_bootstrap` (`ci/scripts/runpod_lib.sh:3170`);
 the detached seed is `start_seed_build` (`ci/scripts/gpu-dev.sh:776`), called
 from `[ -n "$RP_REF" ] && start_seed_build` (`ci/scripts/gpu-dev.sh:799`) for
 `shell` and again at `[ -n "$RP_REF" ] && start_seed_build` (`ci/scripts/gpu-dev.sh:883`)
@@ -90,7 +90,7 @@ lead or the user runs the verbs that rent or terminate hardware:
 `down`/`reap` are destructive: `down` runs its own verify-before-terminate
 machinery at `rp_pod_verify "$RP_POD_ID"` (`ci/scripts/gpu-dev.sh:1272`), and
 `reap`'s own doc states `Every ambiguity resolves toward terminating`
-(`ci/scripts/runpod_lib.sh:2899`). A session or pod belonging to a process
+(`ci/scripts/runpod_lib.sh:2909`). A session or pod belonging to a process
 you did not start is never yours to `down` — the session-name containment
 check `rp_session_name_check` (`ci/scripts/runpod_lib.sh:281`) and the
 `up --replace` refusal path, `refusing to silently replace it`
@@ -121,7 +121,7 @@ terminated an unrelated pod.
    `RP_TTL_HOURS` is not set explicitly — a dev session someone is actively
    using is meant to survive a workday, not die at the throwaway-pod
    default. This is independent of the **account-level sweep**: `rp_sweep`
-   (`ci/scripts/runpod_lib.sh:2902`) judges each `jammi-gpu*` pod against the
+   (`ci/scripts/runpod_lib.sh:2912`) judges each `jammi-gpu*` pod against the
    deadline carried in its own name, `"name": "%s-ttl%s" % (prefix, ttl_h),`
    (`ci/scripts/runpod_lib.sh:1464`), read back by
    `if tail.startswith('-ttl') and tail[4:].isdigit() and tail[4:] != '':`
@@ -225,12 +225,12 @@ terminates the old pod —
 
 **A branch that exists only on your laptop cannot be `--ref`'d.** `up`
 resolves a branch or tag against the remote *before* renting anything —
-`rp_ref_precheck` (`ci/scripts/runpod_lib.sh:3114`) — and a name the remote
+`rp_ref_precheck` (`ci/scripts/runpod_lib.sh:3124`) — and a name the remote
 does not carry fails closed with
-`is not a branch or tag in` (`ci/scripts/runpod_lib.sh:3124`), naming that
+`is not a branch or tag in` (`ci/scripts/runpod_lib.sh:3134`), naming that
 `nothing was rented`; an unreachable remote is equally refused
 (`refusing to rent a pod for a ref that cannot be verified`,
-`ci/scripts/runpod_lib.sh:3126`). Only a 40-hex commit id skips the remote
+`ci/scripts/runpod_lib.sh:3136`). Only a 40-hex commit id skips the remote
 check, and it is then verified on the pod instead. So an unpushed campaign
 branch reaches the pod the other way: boot on `main` (or any pushed ref) and
 `push --tree <name>` the working tree, which sends uncommitted work too. §5
@@ -1092,23 +1092,23 @@ ci/scripts/gpu-dev.sh reap 2                  # force-reap everything older than
 
 `reap` is account-wide (never a per-session verb) and judges age from
 `Age comes from createdAt, never from runtime.uptimeInSeconds`
-(`ci/scripts/runpod_lib.sh:2977`) — uptime is null for the first minutes of
+(`ci/scripts/runpod_lib.sh:2987`) — uptime is null for the first minutes of
 a healthy pod and can reset on a container restart, either of which would
 misjudge age. `Every ambiguity resolves toward terminating.`
-(`ci/scripts/runpod_lib.sh:2899`): a stopped pod
+(`ci/scripts/runpod_lib.sh:2909`): a stopped pod
 (`print(p['id'], age if age is not None else -1, 'not-running'); continue`,
-`ci/scripts/runpod_lib.sh:2990`) is swept. A pod this sweep cannot JUDGE is
+`ci/scripts/runpod_lib.sh:3000`) is swept. A pod this sweep cannot JUDGE is
 never terminated on a guess: a prefixed name with no parseable `-ttl<H>`
 (`print('UNPARSEABLE', p['id'], name); continue`,
-`ci/scripts/runpod_lib.sh:3002`) and a pod with no usable `createdAt` at all
+`ci/scripts/runpod_lib.sh:3012`) and a pod with no usable `createdAt` at all
 (`print('UNAGEABLE', p['id'], name); continue`,
-`ci/scripts/runpod_lib.sh:2994`) are both NAMED with their by-id remedy
-(`no usable createdAt` / `no parseable -ttl<H>`, `ci/scripts/runpod_lib.sh:3022`)
+`ci/scripts/runpod_lib.sh:3004`) are both NAMED with their by-id remedy
+(`no usable createdAt` / `no parseable -ttl<H>`, `ci/scripts/runpod_lib.sh:3032`)
 while the rest of the list is still swept, and the sweep exits 1 — selected by
 `print('UNAGEABLE', p['id'], name); continue`
-(`ci/scripts/runpod_lib.sh:2994`). A query that cannot reach RunPod at all
+(`ci/scripts/runpod_lib.sh:3004`). A query that cannot reach RunPod at all
 fails loudly rather than reporting "nothing to clean up":
-`sweep could NOT enumerate pods` (`ci/scripts/runpod_lib.sh:2949`).
+`sweep could NOT enumerate pods` (`ci/scripts/runpod_lib.sh:2959`).
 
 **Reconciling account state when boot output was empty.** If `up`/`shell`
 returned with no coordinates (a dropped connection mid-deploy, a killed
@@ -1158,8 +1158,8 @@ exists) a `test_pod_substrate.sh` leg.
 
 | Script | Synopsis | Key env vars | Exit codes |
 |---|---|---|---|
-| `ci/scripts/gpu-dev.sh` | The CLI: `shell`/`up`/`target`/`attach`/`run`/`logs`/`push`/`pull`/`wait-seed`/`wait-job`/`down`/`ls`/`reap` — `# Usage:` (`ci/scripts/gpu-dev.sh:33`), restated for `--help` by `usage()` (`ci/scripts/gpu-dev.sh:119`) | `RUNPOD_API_KEY`, `RP_IMAGE`, `RP_TTL_HOURS`, `RP_DEV_TTL_HOURS`, `RP_DISK_GB`, `RP_VOLUME_GB`, `RP_WAIT_TIMEOUT_SECS`, `RP_WAIT_INTERVAL_SECS`, `RP_WAIT_MAX_TRANSPORT_FAILS` — `# Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,` (`ci/scripts/gpu-dev.sh:95`), restated in `usage()`'s own `Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,` (`ci/scripts/gpu-dev.sh:233`) | `0` ok; `2` usage/argument error; `1` a real failure (bootstrap, verify, named wait-seed/wait-job failure); `75` no-capacity neutral skip (propagated from `rp_deploy_live`); `wait-seed`/`wait-job` additionally: `2` transport failure, `3` timed out with no verdict — `A timeout with no verdict either way exits 3.` (`ci/scripts/gpu-dev.sh:232`), implemented by `rp_wait_poll` (`ci/scripts/runpod_lib.sh:2812`) |
-| `ci/scripts/runpod_lib.sh` | Shared RunPod primitive — deploy/verify/terminate/sweep/wait-poll; sourced, not run directly — `Shared RunPod GPU primitive — one seam for every caller.` (`ci/scripts/runpod_lib.sh:2`) | `RUNPOD_API_KEY`, `RP_SESSION`, `RP_KEEP`, `RP_TTL_HOURS` (default 8 — `RP_TTL_HOURS="${RP_TTL_HOURS:-8}"`, `ci/scripts/runpod_lib.sh:111`), `RP_DISK_GB` (default 60 — `RP_DISK_GB="${RP_DISK_GB:-60}"`, `ci/scripts/runpod_lib.sh:142`), `RP_SSH_WAIT_SECS` (default 600 — `RP_SSH_WAIT_SECS="${RP_SSH_WAIT_SECS:-600}"`, `ci/scripts/runpod_lib.sh:193`), `RP_WAIT_SSH_BOUND_SECS`, the local kill bound `_rp_bounded_capture` (`ci/scripts/runpod_lib.sh:2757`) applies | `rp_pod_verify`: `0` match, `1` present-wrong-shape, `2` query failed, `3` absent — `Returns 1 (present, but` (`ci/scripts/runpod_lib.sh:480`), implemented at `rp_pod_verify` (`ci/scripts/runpod_lib.sh:514`); `rp_deploy_live`: `0` ok, `1` real deploy fault, `75` no reachable capacity — `(neutral skip) when no candidate yields a reachable pod` (`ci/scripts/runpod_lib.sh:2183`), implemented at `rp_deploy_live` (`ci/scripts/runpod_lib.sh:2185`); `rp_wait_poll`: `0` success, `1` named failure, `2` transport failure, `3` timed out — `Returns 0 (success), 1 (named failure` (`ci/scripts/runpod_lib.sh:2809`) |
+| `ci/scripts/gpu-dev.sh` | The CLI: `shell`/`up`/`target`/`attach`/`run`/`logs`/`push`/`pull`/`wait-seed`/`wait-job`/`down`/`ls`/`reap` — `# Usage:` (`ci/scripts/gpu-dev.sh:33`), restated for `--help` by `usage()` (`ci/scripts/gpu-dev.sh:119`) | `RUNPOD_API_KEY`, `RP_IMAGE`, `RP_TTL_HOURS`, `RP_DEV_TTL_HOURS`, `RP_DISK_GB`, `RP_VOLUME_GB`, `RP_WAIT_TIMEOUT_SECS`, `RP_WAIT_INTERVAL_SECS`, `RP_WAIT_MAX_TRANSPORT_FAILS` — `# Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,` (`ci/scripts/gpu-dev.sh:95`), restated in `usage()`'s own `Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,` (`ci/scripts/gpu-dev.sh:233`) | `0` ok; `2` usage/argument error; `1` a real failure (bootstrap, verify, named wait-seed/wait-job failure); `75` no-capacity neutral skip (propagated from `rp_deploy_live`); `wait-seed`/`wait-job` additionally: `2` transport failure, `3` timed out with no verdict — `A timeout with no verdict either way exits 3.` (`ci/scripts/gpu-dev.sh:232`), implemented by `rp_wait_poll` (`ci/scripts/runpod_lib.sh:2822`) |
+| `ci/scripts/runpod_lib.sh` | Shared RunPod primitive — deploy/verify/terminate/sweep/wait-poll; sourced, not run directly — `Shared RunPod GPU primitive — one seam for every caller.` (`ci/scripts/runpod_lib.sh:2`) | `RUNPOD_API_KEY`, `RP_SESSION`, `RP_KEEP`, `RP_TTL_HOURS` (default 8 — `RP_TTL_HOURS="${RP_TTL_HOURS:-8}"`, `ci/scripts/runpod_lib.sh:111`), `RP_DISK_GB` (default 60 — `RP_DISK_GB="${RP_DISK_GB:-60}"`, `ci/scripts/runpod_lib.sh:142`), `RP_SSH_WAIT_SECS` (default 600 — `RP_SSH_WAIT_SECS="${RP_SSH_WAIT_SECS:-600}"`, `ci/scripts/runpod_lib.sh:193`), `RP_WAIT_SSH_BOUND_SECS`, the local kill bound `_rp_bounded_capture` (`ci/scripts/runpod_lib.sh:2767`) applies | `rp_pod_verify`: `0` match, `1` present-wrong-shape, `2` query failed, `3` absent — `Returns 1 (present, but` (`ci/scripts/runpod_lib.sh:480`), implemented at `rp_pod_verify` (`ci/scripts/runpod_lib.sh:514`); `rp_deploy_live`: `0` ok, `1` real deploy fault, `75` no reachable capacity — `(neutral skip) when no candidate yields a reachable pod` (`ci/scripts/runpod_lib.sh:2183`), implemented at `rp_deploy_live` (`ci/scripts/runpod_lib.sh:2185`); `rp_wait_poll`: `0` success, `1` named failure, `2` transport failure, `3` timed out — `Returns 0 (success), 1 (named failure` (`ci/scripts/runpod_lib.sh:2819`) |
 | `ci/scripts/pod_seed_target.sh` | Builds/cleans the member-free seed — `Builds and cleans a MEMBER-FREE pod build-substrate seed` (`ci/scripts/pod_seed_target.sh:2`) | `JAMMI_SEED_DIR` (default `/root/.jammi-seed`), `JAMMI_TREE_DIR` (default `/root/jammi-ai`), `JAMMI_SEED_LOCK_WAIT_SECS` (default 1800), `--reseed`, `--no-lock`, `JAMMI_SEED_DRY_RUN` | `0` ok/no-op; non-zero on any build/check failure, writes `.jammi-seed-failed` |
 | `ci/scripts/pod_target_clone.sh` | Clones the seed into a fresh `CARGO_TARGET_DIR`; `--verify` checks a piped `cargo build -v` log — `Usage: pod_target_clone.sh <seed-dir> <dest-dir> [tree-dir] [--verify|--adopt]` (`ci/scripts/pod_target_clone.sh:12`) | positional `<seed-dir> <dest-dir> [tree-dir]`, `--verify` | `0` ok; `1` member-free check failed post-clone (clone removed) or verify found a `Fresh jammi-*` unit; `2` destination already exists; `3` no seed at `<seed-dir>` |
 | `ci/scripts/pod_provision_cutlass.sh` | The one cutlass provisioning surface into an existing tree — `Provisions cutlass INTO an already-pushed tree` (`ci/scripts/pod_provision_cutlass.sh:2`) | positional `<source-tree-dir> [super-dir]` (default `/root/jammi-ai`) | `0` ok/no-op (self-target); `1` any validation, network, or mismatch failure |

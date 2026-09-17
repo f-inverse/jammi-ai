@@ -843,15 +843,14 @@ def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
         )
         return
 
-    # Fix round 8 (closing issue #557 item 3): ties are now on the
-    # NORMALIZED INSTANT, not the `ts` TEXT — two rows naming the SAME
-    # instant in different text (a trailing `Z` vs an explicit `+00:00`
-    # offset) now correctly tie instead of silently ordering by text.
-    # `max()` returning the FIRST maximal element is still why a tie must
-    # be detected explicitly (an executed probe at fix round 6 found two
-    # rows with an identical governing value, the `rc=0` row first,
-    # silently governing and shadowing a genuinely `rc=1` sibling) — a tie
-    # is exactly as AMBIGUOUS as a missing `ts`.
+    # issue #557 item 3: ties are on the NORMALIZED INSTANT, never the
+    # `ts` TEXT — two rows naming the SAME instant in different text (a
+    # trailing `Z` vs an explicit `+00:00` offset) correctly tie instead
+    # of silently ordering by text. `max()` returning the FIRST maximal
+    # element is still why a tie must be detected explicitly (a two-row
+    # pool with an identical governing value, the `rc=0` row first, would
+    # otherwise silently govern and shadow a genuinely `rc=1` sibling) —
+    # a tie is exactly as AMBIGUOUS as a missing `ts`.
     max_instant = max(_row_instant(r) for _, r in pool)
     tied = [(ln, r) for ln, r in pool if _row_instant(r) == max_instant]
     if len(tied) >= 2:
@@ -862,8 +861,7 @@ def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
             f"SAME greatest `ts` instant ({max_instant.isoformat()!r}, spelled as "
             f"{tied_ts_texts!r} across the tied rows) -- the GOVERNING row is AMBIGUOUS on a "
             "tie, exactly as it is when `ts` is missing entirely; re-export so each round's row "
-            "carries a distinguishing `ts` (esc-lead-gate-R12 fix round 6 Z15, instant-aware "
-            "since fix round 8)"
+            "carries a distinguishing `ts` (esc-lead-gate-R12, instant-aware tie-break)"
         )
         return
     governing = tied[0][1]

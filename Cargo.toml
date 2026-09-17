@@ -24,7 +24,8 @@ members = [
 # swarm's own Rust-source-facing gates share — see its own Cargo.toml) — a
 # workspace member so `cargo run -p symbol-index` resolves against the SAME
 # lockfile every other crate does, but never in default-members: it is not
-# part of the product and must not slow down a bare `cargo build --workspace`.
+# part of the product and must not slow down a bare `cargo build` (which honours
+# default-members; `--workspace` builds every member regardless).
 # ci/tools/probed-ops-index is the same CI-only shape, one dump of
 # jammi-kernels' own PROBED_OPS constant for
 # ci/scripts/perf/test_finetune_ab_disable_op_keys.py (wave-5 identity's

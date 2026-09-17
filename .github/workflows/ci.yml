@@ -1695,6 +1695,7 @@ jobs:
           # ci/scripts/test_pod_substrate.sh's own module doc.
           - name: pod build substrate
             cmd: JAMMI_REQUIRE_LOCK_TEST=1 bash ci/scripts/test_pod_substrate.sh
+            toolchain: true
           # Pod-build-timings artifact schema + provenance guard (the
           # accepted-debt item the pod-substrate-followups audit named):
           # every ci/artifacts/pod-build-timings/*.json must carry a
@@ -1973,13 +1974,17 @@ jobs:
           # zero-execution gap as `compare_grad_oracle`'s suite above.
           - name: perf ab_merge suite
             cmd: python3 ci/scripts/perf/test_ab_merge.py
-          # `finetune_ab.sh`'s forced-eager disable-key enumeration
-          # (`ci/scripts/perf/test_finetune_ab_disable_op_keys.py`) is NOT in
-          # this matrix: it derives the key set from a real `cargo run
-          # --release -p probed-ops-index` (and the call-site census from
-          # `ci/tools/symbol-index`), so it needs the Rust toolchain this
-          # runner deliberately lacks. It runs in swarm.yml's
-          # `symbol-index-gates` job beside the other syn-backed gates.
+          # `finetune_ab.sh`'s forced-eager disable-key enumeration: derives
+          # the key set from the real `PROBED_OPS` table through a `cargo run
+          # --release -p probed-ops-index` and the admit/admit_cascade call-
+          # site census through `ci/tools/symbol-index` — real `syn` parses,
+          # never a regex. Every cargo call on this runner goes through the
+          # `sccache` wrapper `.cargo/config.toml` mandates, which only
+          # `setup-rust-ci` installs, so this leg declares `toolchain: true`
+          # (the same shape as `pod build substrate` below).
+          - name: perf finetune_ab disable-op-keys suite
+            cmd: python3 ci/scripts/perf/test_finetune_ab_disable_op_keys.py
+            toolchain: true
           # `finetune_ab.sh` ITSELF (the redesigned single-binary A/B
           # producer, #352): dry-run smoke over the whole pipeline, the
           # same hermetic discipline `gpu_inference_ab.sh`'s own dry-run
@@ -2484,14 +2489,19 @@ jobs:
       # every guard here instant. The "pod build substrate" leg is the one
       # exception: its RED tests (i)/(ii) enumerate every build-script
       # package from a REAL `cargo metadata` and read real vendored
-      # build.rs sources under $CARGO_HOME/registry (round-2 audit finding
-      # 6), which needs an actual toolchain + a fetched registry — gated
-      # behind `if:` so no OTHER leg pays this cost.
-      - name: Rust toolchain (pod build substrate only)
-        if: matrix.name == 'pod build substrate'
+      # build.rs sources under $CARGO_HOME/registry, which needs an actual
+      # toolchain + a fetched registry. This runner image carries cargo and
+      # rustc but NOT `sccache`, and `.cargo/config.toml` makes sccache the
+      # mandatory rustc wrapper for every cargo call — so a matrix leg that
+      # shells out to cargo declares `toolchain: true` and gets
+      # `setup-rust-ci` (which installs sccache) plus a fetched registry;
+      # every other leg pays nothing. `ci/scripts/merge_path.sh`'s guards
+      # stage mirrors exactly this split (sccache hidden for the other legs).
+      - name: Rust toolchain (toolchain legs only)
+        if: matrix.toolchain == true
         uses: ./.github/actions/setup-rust-ci
-      - name: Fetch the registry (pod build substrate only)
-        if: matrix.name == 'pod build substrate'
+      - name: Fetch the registry (toolchain legs only)
+        if: matrix.toolchain == true
         run: cargo fetch --locked
       # `convert_legacy_bert_checkpoint.py`'s file-level suite needs the
       # real `safetensors` package (see that matrix entry's own comment,
@@ -2740,6 +2750,72 @@ jobs:
   # as a pass. `if: always()` makes it emit on every run, so the required check
   # never hangs "waiting for status". `test-live` is deliberately excluded — it
   # is `continue-on-error` (a live-network lane allowed to fail).
+  # A SEPARATE job (not a step folded into swarm.yml's `swarm-gates`) because these
+  # two gates resolve Rust construct citations / public-declaration scans
+  # against a REAL `syn` AST parse (`ci/tools/symbol-index`, `cargo run
+  # --release -p symbol-index`) rather than a regex reader — this repo's own
+  # recorded lesson ("regex readers over YAML/Rust lost five audits") is why
+  # `check_plan_citations.py`'s Rust resolution and `check_no_consumer_
+  # names.py`'s PUB_DECL_RE scan were both migrated onto that ONE shared
+  # tool rather than each carrying (or re-carrying) its own text scanner.
+  # That real parse needs the repo's pinned Rust toolchain, which the
+  # toolchain-free `swarm-gates` job (swarm.yml) deliberately does not carry —
+  # hence this job lives here, with its own `container:` (the repo-provided CI
+  # image, `./.github/actions/setup-rust-ci` for the sccache GHA-cache
+  # backend), and is aggregated by the required `ci-summary` below so a red
+  # gate blocks a merge without any branch-protection wiring. No `paths:`
+  # filter (the #245 trap) — this job always runs, on every PR and push.
+  symbol-index-gates:
+    name: Guard (symbol-index gates)
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-rust-ci
+
+      - name: Assert symbol-index's own unit tests + fmt + clippy pass
+        if: ${{ !cancelled() }}
+        run: |
+          cargo fmt -p symbol-index -- --check
+          cargo clippy -p symbol-index --all-targets -- -D warnings
+          cargo test -p symbol-index
+
+      # Issue #555 is journey-markers (toolchain-free, `swarm-gates`); this
+      # is issue #556's Rust construct resolution — a bare `path::symbol`
+      # citation under docs/plans/** resolved against the real syn index.
+      - name: Assert the plan-citations self-test fixtures fire correctly
+        if: ${{ !cancelled() }}
+        run: python3 ci/scripts/check_plan_citations.py --self-test
+
+      - name: Assert every construct citation under docs/plans/** resolves
+        if: ${{ !cancelled() }}
+        run: python3 ci/scripts/check_plan_citations.py
+
+      # The mechanical half of the discipline test: no governance-verb leak in
+      # the diff, no philosophy leak-smell token in the engine tree. Advisory-
+      # labelled. Migrated off `PUB_DECL_RE` onto the real symbol-index tool.
+      - name: Assert the no-consumer-names self-test fixtures fire correctly
+        if: ${{ !cancelled() }}
+        run: python3 ci/scripts/check_no_consumer_names.py --self-test
+
+      - name: Assert no consumer-name / governance leak in the engine tree
+        if: ${{ !cancelled() }}
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: python3 ci/scripts/check_no_consumer_names.py
+
+      # `ci/tools/probed-ops-index` is the other CI-only syn tool (the
+      # eager-disable key sweep's source of truth; that sweep is a `toolchain`
+      # leg of the guard matrix above).
+      - name: Assert probed-ops-index's own fmt + clippy pass
+        if: ${{ !cancelled() }}
+        run: |
+          cargo fmt -p probed-ops-index -- --check
+          cargo clippy -p probed-ops-index --all-targets -- -D warnings
+
   ci-summary:
     needs:
       - check
@@ -2761,6 +2837,7 @@ jobs:
       - test-broker
       - test-python
       - test-pg
+      - symbol-index-gates
     if: always()
     uses: ./.github/workflows/_summary.yml
     with:

@@ -135,12 +135,13 @@ run_sh() {
   run "$stage" "$label" bash -e -c "$cmd"
 }
 
-# Same as run_sh, with the Rust toolchain hidden from PATH — the ci.yml guard
-# matrix's runner shape (see the guards stage below).
-run_sh_nocargo() {
+# Same as run_sh, with the rustc wrapper pointed at a path that does not
+# exist — the ci.yml guard runner's shape for a non-toolchain leg (sccache
+# absent while config.toml mandates it; see the guards stage below).
+run_sh_nosccache() {
   local stage="$1" label="$2" cmd
   cmd="$(expand "$3")" || exit 2
-  run "$stage" "$label" env PATH="$NOCARGO_PATH" bash -e -c "$cmd"
+  run "$stage" "$label" env RUSTC_WRAPPER="$NOSCCACHE_WRAPPER" bash -e -c "$cmd"
 }
 
 export GITHUB_EVENT_NAME=pull_request GITHUB_BASE_REF="$BASE_REF" GITHUB_HEAD_REF="$HEAD_REF" \
@@ -192,22 +193,36 @@ ci = yaml.safe_load(open('.github/workflows/ci.yml'))
 entries = ci['jobs']['guard']['strategy']['matrix']['include']
 with open(sys.argv[1], 'w') as out:
     for e in entries:
-        out.write(e['name'] + '\t' + ' '.join(e['cmd'].split()) + '\n')
+        tc = 'true' if e.get('toolchain') is True else 'false'
+        out.write(e['name'] + '\t' + tc + '\t' + ' '.join(e['cmd'].split()) + '\n')
 print(f"merge_path: {len(entries)} guard-matrix commands read from ci.yml")
 PY
-  # ci.yml's `guard` job runs on a bare ubuntu runner with NO Rust toolchain
-  # (the swarm.yml `symbol-index-gates` job carries the syn-backed gates for
-  # exactly that reason). A developer machine has cargo on PATH, so a guard
-  # that quietly grew a `cargo run` passes here and fails only in CI. Mirror
-  # the runner: every guard-matrix command runs with cargo/rustup hidden from
-  # PATH, and the stage refuses to start if cargo is still reachable.
-  NOCARGO_PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -v -e '/\.cargo/bin' -e '/\.rustup/' | paste -sd: -)"
-  if PATH="$NOCARGO_PATH" command -v cargo >/dev/null 2>&1; then
-    printf 'FAIL  [guards] cargo is still on PATH after hiding ~/.cargo/bin and ~/.rustup (%s) — the guard matrix must run toolchain-free\n' "$(PATH="$NOCARGO_PATH" command -v cargo)"
+  # ci.yml's `guard` runner carries cargo and rustc but NOT `sccache`, and
+  # `.cargo/config.toml` makes sccache the mandatory rustc wrapper for every
+  # cargo call — so a guard that shells out to cargo fails there ("could not
+  # execute process `sccache ... rustc -vV`") unless its matrix entry declares
+  # `toolchain: true` (then `setup-rust-ci` installs sccache). A developer
+  # machine has sccache, so the same guard passes here. Mirror the runner:
+  # every NON-toolchain leg runs with RUSTC_WRAPPER pointed at a path that
+  # does not exist (the env var overrides config.toml, so cargo fails exactly
+  # as on the runner; sccache shares ~/.cargo/bin with cargo, so hiding it by
+  # PATH would hide cargo too, which is NOT the runner's shape); toolchain
+  # legs run as-is. The stage refuses to start if that path exists.
+  NOSCCACHE_WRAPPER="/nonexistent/sccache-absent-on-the-guard-runner"
+  if [ -e "$NOSCCACHE_WRAPPER" ]; then
+    printf 'FAIL  [guards] %s exists — the non-toolchain mirror needs an unexecutable wrapper path\n' "$NOSCCACHE_WRAPPER"
     exit 2
   fi
-  while IFS=$'\t' read -r name cmd; do
-    run_sh_nocargo guards "$name" "$cmd"
+  if ! command -v sccache >/dev/null 2>&1; then
+    printf 'FAIL  [guards] sccache is not on PATH here — the toolchain legs (and every cargo stage) need it\n'
+    exit 2
+  fi
+  while IFS=$'\t' read -r name toolchain cmd; do
+    if [ "$toolchain" = "true" ]; then
+      run_sh guards "$name" "$cmd"
+    else
+      run_sh_nosccache guards "$name" "$cmd"
+    fi
   done < "$GUARD_LIST"
 fi
 
@@ -218,8 +233,12 @@ if stage_wanted swarm; then
   python3 - "$SWARM_DIR" <<'PY'
 import os, sys, yaml
 wf = yaml.safe_load(open('.github/workflows/swarm.yml'))
+ci = yaml.safe_load(open('.github/workflows/ci.yml'))
+# the syn-backed gates live in ci.yml's `symbol-index-gates` job (aggregated by
+# the required ci-summary); run them here beside the swarm-gates steps
+jobs = list(wf['jobs'].values()) + [ci['jobs']['symbol-index-gates']]
 n = 0
-for job in wf['jobs'].values():
+for job in jobs:
     for st in job.get('steps', []):
         run = st.get('run')
         if not run:
@@ -233,7 +252,7 @@ for job in wf['jobs'].values():
         with open(os.path.join(sys.argv[1], f"{n:02d}.step"), 'w') as out:
             out.write((st.get('name') or stripped.split('\n')[0]) + '\n')
             out.write(run)
-print(f"merge_path: {n} swarm-gate steps read from swarm.yml (each run as one block)")
+print(f"merge_path: {n} swarm-gate steps read from swarm.yml + ci.yml symbol-index-gates (each run as one block)")
 PY
   for step in "$SWARM_DIR"/*.step; do
     name="$(head -n1 "$step")"

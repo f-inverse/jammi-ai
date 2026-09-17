@@ -1,11 +1,11 @@
 name: Swarm gates
 
-# No `paths:` filter on EITHER job below — every gate here always runs on
-# every PR and push to main, whether it is a toolchain-free pure-Python (or
-# git-diff) check (`swarm-gates`) or one that resolves against a real `syn`
-# parse via `ci/tools/symbol-index` (`symbol-index-gates`, its own job so a
-# Rust build never taxes the fast, toolchain-free lane the header comment
-# above `swarm-gates`'s own steps still describes truthfully). A
+# No `paths:` filter on the job below — every gate here always runs on
+# every PR and push to main, as a toolchain-free pure-Python (or git-diff)
+# check. The gates that resolve against a real `syn` parse via
+# `ci/tools/symbol-index` run in ci.yml's `symbol-index-gates` job (a
+# toolchain job aggregated by the required `ci-summary`), so a Rust build
+# never taxes this fast lane. A
 # path-filtered workflow that is later set as a required status check would
 # hang unrelated PRs (the check never reports) — this is the #245 trap. The
 # TOUCHED guards below therefore detect their own touched set *inside* the
@@ -56,7 +56,7 @@ jobs:
       # The mechanical half of the discipline test (no governance-verb leak in
       # the diff, no philosophy leak-smell token in the engine tree) resolves
       # its `pub`-declaration scan against the real `symbol-index` tool since
-      # the migration off `PUB_DECL_RE` — it runs in `symbol-index-gates`
+      # the migration off `PUB_DECL_RE` — it runs in ci.yml's `symbol-index-gates`
       # (below), the Rust-toolchain job, not here.
 
       # Issue #555: diff-scoped journey-marker gate (unit ids, round numbers,
@@ -77,7 +77,7 @@ jobs:
       # (path::symbol / path#heading / TOML key / proto member). TOML/
       # heading/proto resolution is toolchain-free and stays here; Rust
       # construct resolution (against the real symbol-index tool) runs in
-      # `symbol-index-gates` (below) — `check_plan_citations.py` itself is
+      # ci.yml's `symbol-index-gates` job — `check_plan_citations.py` itself is
       # ONE script either way, this is only where its invocation lives.
 
       # The lead-proactivity gate's own CI leg: runs the REAL hook scripts
@@ -231,83 +231,3 @@ jobs:
       - name: Guard — the oracle-gate exemption allowlist only shrinks
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         run: python3 ci/scripts/check_oracle_gate.py --check-allowlist-only-shrinks
-
-  # A SEPARATE job (not a step folded into `swarm-gates` above) because these
-  # two gates resolve Rust construct citations / public-declaration scans
-  # against a REAL `syn` AST parse (`ci/tools/symbol-index`, `cargo run
-  # --release -p symbol-index`) rather than a regex reader — this repo's own
-  # recorded lesson ("regex readers over YAML/Rust lost five audits") is why
-  # `check_plan_citations.py`'s Rust resolution and `check_no_consumer_
-  # names.py`'s PUB_DECL_RE scan were both migrated onto that ONE shared
-  # tool rather than each carrying (or re-carrying) its own text scanner.
-  # That real parse needs the repo's pinned Rust toolchain, which the
-  # toolchain-free `swarm-gates` job above deliberately does not carry (its
-  # own header comment states this) — hence its own `container:`, mirroring
-  # `ci.yml`'s `check`/`dep-audit` jobs' own pattern (the repo-provided CI
-  # image with the toolchain baked in, `./.github/actions/setup-rust-ci` for
-  # the sccache GHA-cache backend) rather than reinventing toolchain setup
-  # here. No `paths:` filter, same rationale as `swarm-gates` (the #245
-  # trap) — this job always runs, on every PR and push to main.
-  #
-  # NOTE for the human who wires branch protection: this is a NEW job name
-  # (`Guard (symbol-index gates)`), distinct from `swarm-gates`'s own
-  # `Guard (swarm constitution + boundary)` — it needs adding to the
-  # required-status-checks list in repo settings alongside that one; this
-  # workflow file cannot do that itself.
-  symbol-index-gates:
-    name: Guard (symbol-index gates)
-    runs-on: ubuntu-latest
-    container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: ./.github/actions/setup-rust-ci
-
-      - name: Assert symbol-index's own unit tests + fmt + clippy pass
-        if: ${{ !cancelled() }}
-        run: |
-          cargo fmt -p symbol-index -- --check
-          cargo clippy -p symbol-index --all-targets -- -D warnings
-          cargo test -p symbol-index
-
-      # Issue #555 is journey-markers (toolchain-free, `swarm-gates`); this
-      # is issue #556's Rust construct resolution — a bare `path::symbol`
-      # citation under docs/plans/** resolved against the real syn index.
-      - name: Assert the plan-citations self-test fixtures fire correctly
-        if: ${{ !cancelled() }}
-        run: python3 ci/scripts/check_plan_citations.py --self-test
-
-      - name: Assert every construct citation under docs/plans/** resolves
-        if: ${{ !cancelled() }}
-        run: python3 ci/scripts/check_plan_citations.py
-
-      # The mechanical half of the discipline test: no governance-verb leak in
-      # the diff, no philosophy leak-smell token in the engine tree. Advisory-
-      # labelled. Migrated off `PUB_DECL_RE` onto the real symbol-index tool.
-      - name: Assert the no-consumer-names self-test fixtures fire correctly
-        if: ${{ !cancelled() }}
-        run: python3 ci/scripts/check_no_consumer_names.py --self-test
-
-      - name: Assert no consumer-name / governance leak in the engine tree
-        if: ${{ !cancelled() }}
-        env:
-          GITHUB_BASE_REF: ${{ github.base_ref }}
-        run: python3 ci/scripts/check_no_consumer_names.py
-
-      # `finetune_ab.sh`'s forced-eager disable-key enumeration: the key set
-      # is derived from the real `PROBED_OPS` table through
-      # `ci/tools/probed-ops-index` (a `cargo run`), and the admit/
-      # admit_cascade call-site census through `ci/tools/symbol-index` —
-      # both real `syn` parses, so this suite lives here with the toolchain,
-      # never in ci.yml's toolchain-free guard matrix.
-      - name: Assert probed-ops-index's own fmt + clippy pass
-        if: ${{ !cancelled() }}
-        run: |
-          cargo fmt -p probed-ops-index -- --check
-          cargo clippy -p probed-ops-index --all-targets -- -D warnings
-
-      - name: Assert the eager-disable key sweep derives from the real PROBED_OPS table
-        if: ${{ !cancelled() }}
-        run: python3 ci/scripts/perf/test_finetune_ab_disable_op_keys.py

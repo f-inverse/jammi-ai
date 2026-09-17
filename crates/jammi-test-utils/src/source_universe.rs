@@ -48,12 +48,26 @@ pub fn tracked_rs_files(root: &Path, dir: &str) -> Vec<String> {
 /// target: every workspace member's `src/` (the crates and the `ci/tools/*`
 /// members), every `build.rs`, and every `examples/` and `benches/` target
 /// (`cargo clippy --workspace --all-targets` builds them, so a hand-built
-/// call placed in one compiles). Excluded: `tests/` directories (integration
-/// test targets — `#[cfg(test)]` items inside compiled files are the
-/// scanner's own concern) and the `ci/fixtures/` tokenizer inputs, which
-/// are parsed by a checker's fixtures and never compiled.
+/// call placed in one compiles). Excluded: a crate's top-level `tests/`
+/// directory (its integration-test targets — `#[cfg(test)]` items inside
+/// compiled files are the scanner's own concern) and the `ci/fixtures/`
+/// tokenizer inputs, which are parsed by a checker's fixtures and never
+/// compiled.
 pub fn is_compiled_non_test_source(rel: &str) -> bool {
-    !rel.split('/').any(|p| p == "tests") && !rel.starts_with("ci/fixtures/")
+    if rel.starts_with("ci/fixtures/") {
+        return false;
+    }
+    // A crate's integration-test targets live in ITS top-level `tests/`
+    // (`crates/<c>/tests/**`, `ci/tools/<t>/tests/**`). A `tests` component
+    // deeper down (`examples/tests/main.rs`, `src/x/tests/mod.rs`) is a
+    // compiled target or module and stays in the universe.
+    let parts: Vec<&str> = rel.split('/').collect();
+    let crate_tests_dir = match parts.as_slice() {
+        ["crates", _, "tests", ..] => true,
+        ["ci", "tools", _, "tests", ..] => true,
+        _ => false,
+    };
+    !crate_tests_dir
 }
 
 /// Every tracked `.rs` file under `root` that [`is_compiled_non_test_source`]
@@ -84,6 +98,8 @@ mod tests {
             "crates/jammi-bench/examples/frontend_serial_tail.rs",
             "crates/jammi-bench/benches/anything.rs",
             "ci/tools/symbol-index/src/main.rs",
+            "crates/jammi-bench/examples/tests/main.rs",
+            "crates/jammi-db/src/store/tests/helpers.rs",
         ] {
             assert!(
                 is_compiled_non_test_source(admitted),
@@ -94,6 +110,7 @@ mod tests {
             "crates/jammi-ai/tests/it/rank_admission.rs",
             "crates/jammi-db/tests/it/models_delete_call_sites.rs",
             "ci/fixtures/kernel-oracle-tokenizer/chars.rs",
+            "ci/tools/symbol-index/tests/smoke.rs",
         ] {
             assert!(
                 !is_compiled_non_test_source(refused),

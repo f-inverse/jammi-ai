@@ -20,6 +20,8 @@ on:
       - "Cargo.lock"
       - "crates/*/Cargo.toml"
       - "crates/*/src/**"
+      - "ci/tools/*/Cargo.toml"
+      - "ci/tools/*/src/**"
       - "docs/maintainer/**"
       - "ci/scripts/gen_dep_dag.py"
   pull_request:
@@ -29,6 +31,8 @@ on:
       - "Cargo.lock"
       - "crates/*/Cargo.toml"
       - "crates/*/src/**"
+      - "ci/tools/*/Cargo.toml"
+      - "ci/tools/*/src/**"
       - "docs/maintainer/**"
       - "ci/scripts/gen_dep_dag.py"
   workflow_dispatch:

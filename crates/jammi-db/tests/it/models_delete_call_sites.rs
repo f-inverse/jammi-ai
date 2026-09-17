@@ -2,14 +2,24 @@
 //! (twice): the `models/` byte-delete guard is not a compile-time proof
 //! (the models root is a RUNTIME value, `models_root(&root)`, not a type),
 //! so completeness is instead an ENUMERATING source oracle over every
-//! reference to the three ways this crate's code can delete bytes under a
-//! store — the two raw byte-deleters,
-//! [`jammi_db::storage::JammiObjectStore::delete_if_exists`] and
-//! [`jammi_db::store::ArtifactStore::delete_artifact_prefix`] (`pub(crate)`,
-//! confirmed by reading its definition), and the raw driver accessor
-//! `JammiObjectStore::driver` (`pub(crate)`; the `Arc<dyn ObjectStore>` it
-//! returns deletes any key with no guard, so every reference to it is a
-//! reviewed row, today the parquet reader and writer only) — across every
+//! reference to the deleters this crate's HANDLE exposes — the two raw
+//! byte-deleters, [`jammi_db::storage::JammiObjectStore::delete_if_exists`]
+//! and [`jammi_db::store::ArtifactStore::delete_artifact_prefix`]
+//! (`pub(crate)`, confirmed by reading its definition), and the handle's own
+//! raw driver, as the `pub(crate)` accessor `JammiObjectStore::driver` and as
+//! the private field `self.driver` inside the handle's file (every reference
+//! to either is a reviewed row) — across every
+//!
+//! **The residual this oracle does NOT close, stated rather than claimed:**
+//! the raw `Arc<dyn ObjectStore>` is also obtainable WITHOUT the handle,
+//! through `StorageRegistry::driver_for` and `storage::build_object_store`
+//! (both `pub`; the non-test acquisition sites in the workspace are
+//! enumerated in the wave-5 contract, `docs/rigor/contracts/feat_500-wave5.md`
+//! §2.12), and `ObjectStoreExt::delete` on such a value is unguarded. Closing
+//! that door is a jammi-db capability-sealing unit (the registry hands out
+//! guarded handles only, the raw builders become crate-private), filed from
+//! that contract; until it lands, a raw driver obtained that way is outside
+//! this review.
 //! `.rs` file cargo compiles outside a test target (the universe
 //! `jammi_test_utils::source_universe` defines: every workspace member's
 //! `src/`, every `build.rs`, every `examples/` and `benches/` target; not
@@ -52,10 +62,12 @@
 //!   `result_tables`/index-segment/sidecar key that can never be `models/`-
 //!   namespaced, with the reason stated per entry.
 //!
-//! **Why this, not a type.** `ArtifactStore::with_root` is called exactly
-//! once, from `ResultStore::new`, always with `models_root(&root)` — so
-//! EVERY `ArtifactStore` instance that exists is models-rooted BY
-//! CONSTRUCTION, and `delete_artifact_prefix` refuses, typed, a `prefix`
+//! **Why this, not a type.** `ArtifactStore::with_root` is `pub`; today its
+//! one production caller is `ResultStore::new` with `models_root(&root)`
+//! (its other callers are `#[cfg(test)]`), which is a review of the present
+//! tree, not a control — the control is that `delete_artifact_prefix`
+//! refuses, typed, a `prefix` that is not under the store's OWN root
+//! whatever that root is, and `delete_artifact_prefix` refuses, typed, a `prefix`
 //! that fails that check IN EVERY BUILD (`store/artifact.rs` — an
 //! always-on check, not a `debug_assert!` a release build compiles away;
 //! see `delete_artifact_prefix_refuses_a_prefix_outside_this_stores_own_root`
@@ -111,6 +123,66 @@ struct ReviewedSite {
 /// the point of this test.
 const REVIEWED: &[ReviewedSite] = &[
     // ── `JammiObjectStore::driver` (the raw `Arc<dyn ObjectStore>`) ─────
+    // Inside the handle's own file the private FIELD is the raw store; every
+    // use of it is a row (shape 5). `delete_if_exists` is the ONE deleter.
+    ReviewedSite {
+        file: "crates/jammi-db/src/storage/object_store_handle.rs",
+        function: "driver",
+        ordinal: 1,
+        count: 1,
+        class: SiteClass::NonModels,
+        reason: "the `pub(crate)` accessor clones the raw driver for the parquet reader/writer \
+                 (their references are the two rows below); it deletes nothing itself.",
+    },
+    ReviewedSite {
+        file: "crates/jammi-db/src/storage/object_store_handle.rs",
+        function: "put_bytes",
+        ordinal: 1,
+        count: 1,
+        class: SiteClass::NonModels,
+        reason: "a `put` on the handle's own path; no delete.",
+    },
+    ReviewedSite {
+        file: "crates/jammi-db/src/storage/object_store_handle.rs",
+        function: "get_range",
+        ordinal: 1,
+        count: 1,
+        class: SiteClass::NonModels,
+        reason: "a ranged `get` on the handle's own path; no delete.",
+    },
+    ReviewedSite {
+        file: "crates/jammi-db/src/storage/object_store_handle.rs",
+        function: "delete_if_exists",
+        ordinal: 1,
+        count: 1,
+        class: SiteClass::NonModels,
+        reason: "THE raw deleter's own body — the one place the field's `delete` is called; \
+                 every caller of `delete_if_exists` is itself a reviewed row of this table.",
+    },
+    ReviewedSite {
+        file: "crates/jammi-db/src/storage/object_store_handle.rs",
+        function: "get_bytes",
+        ordinal: 1,
+        count: 1,
+        class: SiteClass::NonModels,
+        reason: "a whole-object `get` on the handle's own path; no delete.",
+    },
+    ReviewedSite {
+        file: "crates/jammi-db/src/storage/object_store_handle.rs",
+        function: "list",
+        ordinal: 1,
+        count: 1,
+        class: SiteClass::NonModels,
+        reason: "a `list` under the handle's own prefix; no delete.",
+    },
+    ReviewedSite {
+        file: "crates/jammi-db/src/storage/object_store_handle.rs",
+        function: "exists",
+        ordinal: 1,
+        count: 1,
+        class: SiteClass::NonModels,
+        reason: "a `head` on the handle's own path; no delete.",
+    },
     ReviewedSite {
         file: "crates/jammi-db/src/storage/reader.rs",
         function: "read_all_record_batches",
@@ -440,6 +512,20 @@ impl<'ast> syn::visit::Visit<'ast> for DeleteCallScanner {
         syn::visit::visit_expr_method_call(self, node);
     }
 
+    /// Shape 5: the raw driver as a FIELD (`self.driver`), which only the
+    /// handle's own file can spell (the field is private) — every use of it
+    /// there is a site, so a new deleter written as `self.driver.delete(..)`
+    /// is reviewed like any other.
+    fn visit_expr_field(&mut self, node: &'ast syn::ExprField) {
+        if let syn::Member::Named(name) = &node.member {
+            if name == "driver" && self.file == "crates/jammi-db/src/storage/object_store_handle.rs"
+            {
+                self.record_if_match("driver");
+            }
+        }
+        syn::visit::visit_expr_field(self, node);
+    }
+
     /// Shape 2: a path expression in ANY position (a call's callee, a
     /// captured value, an argument, a field). Only the path's LAST segment
     /// is the function name; everything before it (`Type::`,
@@ -756,6 +842,29 @@ fn shape_5_a_raw_driver_reference_is_a_site_inside_this_crate_only() {
         scan_source("crates/jammi-db/src/store/fixture.rs", local).len(),
         0,
         "a bare local named `driver` is not a reference to the inherent method"
+    );
+}
+
+#[test]
+fn shape_5b_the_raw_driver_field_inside_the_handle_is_a_site() {
+    let src =
+        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_5b (raw driver field) — not real code in this file
+        "impl H { pub async fn purge(&self, p: &P) { let _ = self.driver.delete(p).await; } }";
+    let rows = |file: &str| -> Vec<String> {
+        scan_source(file, src)
+            .into_iter()
+            .map(|s| format!("{} #{}", s.function, s.ordinal))
+            .collect()
+    };
+    assert_eq!(
+        rows("crates/jammi-db/src/storage/object_store_handle.rs"),
+        vec!["purge #1"],
+        "a use of the private `driver` field inside the handle's file must be a reviewed site"
+    );
+    assert_eq!(
+        rows("crates/jammi-db/src/store/mod.rs"),
+        Vec::<String>::new(),
+        "a field named `driver` in any other file is some other type's field (the handle's is private)"
     );
 }
 

@@ -92,10 +92,13 @@ impl JammiObjectStore {
 
     /// Underlying `Arc<dyn ObjectStore>`, for this crate's own writer and
     /// reader helpers only. `pub(crate)`, not `pub`: the raw driver can
-    /// delete any key with no `models/` guard, so no other crate can reach
-    /// it (a compiler refusal), and inside this crate every reference to
-    /// `driver` is a reviewed row of the raw byte-delete oracle
-    /// (`tests/it/models_delete_call_sites.rs`).
+    /// delete any key with no `models/` guard, so this HANDLE never hands
+    /// it to another crate (a compiler refusal), and inside this crate every
+    /// reference to `driver` — this accessor and the private field — is a
+    /// reviewed row of the raw byte-delete oracle
+    /// (`tests/it/models_delete_call_sites.rs`). The raw store is still
+    /// obtainable without a handle through `StorageRegistry::driver_for`
+    /// and `build_object_store`; that door is the oracle's stated residual.
     pub(crate) fn driver(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.driver)
     }

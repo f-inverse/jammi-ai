@@ -99,7 +99,8 @@ impl JammiObjectStore {
     /// (`tests/it/models_delete_call_sites.rs`). The raw store is still
     /// obtainable without a handle — through `StorageRegistry::driver_for`
     /// and `build_object_store`, through `JammiSession::context()`'s
-    /// DataFusion runtime registry, or by constructing an `object_store`
+    /// DataFusion runtime registry (re-exposed by `jammi-ai`'s
+    /// `InferenceSession::context()`), or by constructing an `object_store`
     /// client directly with the same credentials; that is the oracle's
     /// stated residual, not something this accessor's visibility closes.
     pub(crate) fn driver(&self) -> Arc<dyn ObjectStore> {

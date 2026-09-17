@@ -20,7 +20,8 @@
 //! a raw `Arc<dyn ObjectStore>` — on which `ObjectStoreExt::delete` is
 //! unguarded — is obtainable WITHOUT the handle by three routes, all outside
 //! this review: `StorageRegistry::driver_for` and `storage::build_object_store`
-//! (both `pub`); `JammiSession::context()` (`pub`), whose DataFusion
+//! (both `pub`); `JammiSession::context()` (`pub`, re-exposed by `jammi-ai`'s
+//! `InferenceSession::context()`), whose DataFusion
 //! `runtime_env().object_store(url)` returns the registered store (the
 //! session's default registry pre-registers `file://`, and this crate registers
 //! its cloud drivers there); and direct construction with the `object_store`

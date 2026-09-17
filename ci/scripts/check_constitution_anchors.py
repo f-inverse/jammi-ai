@@ -14,9 +14,10 @@ not a symbol). Each anchor names its resolver kind:
     same "does the documented name still exist in the code" check `doc-parity`
     runs for the `ProducingDescriptor` enum).
   - `gate_script:<path>`           — the gate script `<path>` exists AND is
-    referenced in `.github/workflows/swarm.yml` (a gate that is not wired into
-    the swarm workflow does not enforce anything, so an unwired gate is a
-    finding). The sentinel `gate_script:UNENFORCED` marks a boundary invariant
+    referenced in `.github/workflows/swarm.yml` or `.github/workflows/ci.yml`
+    (the two workflows that gate every PR — ci.yml's jobs through the required
+    `ci-summary`; a gate wired into neither does not enforce anything, so an
+    unwired gate is a finding). The sentinel `gate_script:UNENFORCED` marks a boundary invariant
     that has NO wired mechanical gate — an honest hole in the enforcement
     surface, which this gate flags rather than hides.
   - `doc_heading:<path>#<heading>` — `<heading>` appears in `<path>`.
@@ -58,6 +59,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONSTITUTION = REPO_ROOT / "docs" / "swarm" / "CONSTITUTION.md"
 SWARM_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "swarm.yml"
+# A gate is WIRED when a workflow that gates every PR references it: swarm.yml
+# (the toolchain-free swarm lane) or ci.yml (whose jobs `ci-summary` aggregates
+# into the required context — the syn-backed gates live in its
+# `symbol-index-gates` job because that lane carries the toolchain).
+WIRING_WORKFLOWS = (SWARM_WORKFLOW, REPO_ROOT / ".github" / "workflows" / "ci.yml")
 
 # A typed anchor token: `<kind>:<value>`, where <value> runs to the next
 # whitespace, `;`, `|` (table cell wall) or backtick. Paths and rust symbols keep
@@ -144,7 +150,7 @@ def resolve_gate_script(value: str, swarm_text: str) -> str | None:
     if value not in swarm_text:
         return (
             f"gate_script `{value}` exists but is NOT referenced in "
-            f"{SWARM_WORKFLOW.name} — an unwired gate enforces nothing"
+            f"{' or '.join(w.name for w in WIRING_WORKFLOWS)} — an unwired gate enforces nothing"
         )
     return None
 
@@ -229,11 +235,11 @@ def main() -> int:
         return 1
 
     try:
-        swarm_text = _read(SWARM_WORKFLOW)
+        swarm_text = "\n".join(_read(w) for w in WIRING_WORKFLOWS)
     except OSError as exc:
         print(
             f"constitution-anchors: FAIL (uncomputable) — cannot read "
-            f"{SWARM_WORKFLOW}: {exc}",
+            f"{[str(w) for w in WIRING_WORKFLOWS]}: {exc}",
             file=sys.stderr,
         )
         return 1

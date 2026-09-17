@@ -270,12 +270,12 @@ CLUSTER_TEST_FILTER="${CLUSTER_TEST_FILTER:-gang_nccl_two_hosts}"
 # Where the two-host test writes its per-rank report on EACH member, and
 # where this driver pulls both back to locally. The NCCL id rides NO path
 # under this directory — see the module doc's "THE ID CROSSING".
-CLUSTER_REMOTE_ARTIFACT_DIR="/root/jammi-ai/.gang-artifact"
+CLUSTER_REMOTE_ARTIFACT_DIR="${RP_REMOTE_ROOT}/jammi-ai/.gang-artifact"
 CLUSTER_ARTIFACT_DIR="${CLUSTER_ARTIFACT_DIR:-.gpu-pull/gpu-cluster}"
 # The remote path rank 0 mints the id to and rank 1 reads it from — on
 # EACH host's own filesystem (never shared storage; this driver is what
 # ships it between the two).
-CLUSTER_REMOTE_ID_FILE="/root/nccl.id"
+CLUSTER_REMOTE_ID_FILE="${RP_REMOTE_ROOT}/nccl.id"
 
 # The gating groups this driver's own verdict rule reads `PROVE_GROUP_RC`
 # markers for, per rank — `::group::` names in `_rpc_remote_script`,

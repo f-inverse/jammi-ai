@@ -2163,14 +2163,15 @@ fi
 p13_sha_text="$(PROVE_EXPECT_SHA=0123456789abcdef0123456789abcdef01234567 bash -c 'source "'"$DIR"'/runpod_lib.sh" >/dev/null 2>&1; rp_remote_checkout_lines "some-branch" "https://example.invalid/r.git"')"
 p13_ref_text="$(bash -c 'unset PROVE_EXPECT_SHA; source "'"$DIR"'/runpod_lib.sh" >/dev/null 2>&1; rp_remote_checkout_lines "some-branch" "https://example.invalid/r.git"')"
 if printf '%s' "$p13_sha_text" | grep -qF 'git fetch -q --depth 1 origin "0123456789abcdef0123456789abcdef01234567"' \
-   && printf '%s' "$p13_sha_text" | grep -qF 'git checkout -q --detach FETCH_HEAD' \
+   && printf '%s' "$p13_sha_text" | grep -qF 'git checkout -q --detach FETCH_HEAD || { echo "::error::could not check out' \
    && ! printf '%s' "$p13_sha_text" | grep -qF 'some-branch' \
    && printf '%s' "$p13_sha_text" | grep -qF 'could not fetch the exact commit'; then
   ok "P13: with PROVE_EXPECT_SHA the remote checkout fetches that exact sha and never names the ref; a failed fetch is a named error"
 else
   bad "P13: expected a by-sha fetch with no ref; got: ${p13_sha_text}"
 fi
-if printf '%s' "$p13_ref_text" | grep -qF 'git clone --depth 1 -b "some-branch" "https://example.invalid/r.git" jammi-ai' \
+if printf '%s' "$p13_ref_text" | grep -qF 'git clone --depth 1 -b "some-branch" "https://example.invalid/r.git" jammi-ai || { echo "::error::could not clone' \
+   && ! printf '%s' "$p13_ref_text" | grep -qF '| tail -1' \
    && ! printf '%s' "$p13_ref_text" | grep -qF 'FETCH_HEAD'; then
   ok "P13: without PROVE_EXPECT_SHA (a hand run) the ref is cloned"
 else
@@ -2184,6 +2185,42 @@ if [ "$p13_legs" -eq 3 ]; then
   ok "P13: all three GPU legs (cluster, gang, prove) check out through the ONE library helper; no leg clones the ref itself"
 else
   bad "P13: expected all three legs on rp_remote_checkout_lines with no own clone line; got $p13_legs/3"
+fi
+# ----------------------------------------------------------------------------
+# P15: the remote root is a PARAMETER of every leg and the checkout chain
+# fails closed. RP_REMOTE_ROOT roots the checkout, the id file and the
+# artifact dir; rendered under a sandbox root no `/root` literal survives
+# in the remote text; a checkout step that fails STOPS the script by name
+# (nothing ever runs in an unknown working directory — the lane suite once
+# executed this text where /root did not exist and a stubbed clone wrote a
+# tree mirror into the caller's own checkout).
+# ----------------------------------------------------------------------------
+p15_text="$(RP_TWO_HOST_TRANSPORT=pods RP_REMOTE_ROOT=/sandbox/x RP_TWO_HOST_GN_IP_0=10.0.0.1 RP_TWO_HOST_GN_IP_1=10.0.0.2 PROVE_EXPECT_SHA=0123456789abcdef0123456789abcdef01234567 bash -c 'source "'"$CLUSTER_SH"'" >/dev/null 2>&1; export RP_TWO_HOST_GN_IP_0 RP_TWO_HOST_GN_IP_1; _rpc_remote_script 1' 2>&1)"
+if [ "$(printf '%s' "$p15_text" | grep -c '/root')" -eq 0 ] \
+   && printf '%s' "$p15_text" | grep -qF 'cd "/sandbox/x" || { echo "::error::remote root /sandbox/x is not enterable" >&2; exit 1; }' \
+   && printf '%s' "$p15_text" | grep -qF 'export JAMMI_GANG_TWO_HOSTS_ID_FILE=/sandbox/x/nccl.id' \
+   && printf '%s' "$p15_text" | grep -qF 'export JAMMI_GANG_ARTIFACT_DIR=/sandbox/x/jammi-ai/.gang-artifact'; then
+  ok "P15: under RP_REMOTE_ROOT=/sandbox/x the whole remote text (checkout, id file, artifact dir) is rooted there and carries no /root literal"
+else
+  bad "P15: expected a fully re-rooted remote text with no /root literal; got: $(printf '%s' "$p15_text" | grep -n '/root\|sandbox' | head -5)"
+fi
+p15_default="$(RP_TWO_HOST_TRANSPORT=pods RP_TWO_HOST_GN_IP_0=10.0.0.1 RP_TWO_HOST_GN_IP_1=10.0.0.2 bash -c 'unset RP_REMOTE_ROOT; source "'"$CLUSTER_SH"'" >/dev/null 2>&1; export RP_TWO_HOST_GN_IP_0 RP_TWO_HOST_GN_IP_1; _rpc_remote_script 0' 2>&1)"
+if printf '%s' "$p15_default" | grep -qF 'cd "/root" || {' && printf '%s' "$p15_default" | grep -qF 'export JAMMI_GANG_TWO_HOSTS_ID_FILE=/root/nccl.id'; then
+  ok "P15: with RP_REMOTE_ROOT unset the root is /root (a real pod)"
+else
+  bad "P15: expected the /root default; got: $(printf '%s' "$p15_default" | grep -n 'cd \"' | head -2)"
+fi
+p15_fc="$(mktemp -d "$SANDBOX/p15-XXXXXX")"
+p15_out="$(RP_REMOTE_ROOT="$p15_fc/does-not-exist" bash -c 'source "'"$DIR"'/runpod_lib.sh" >/dev/null 2>&1; rp_remote_checkout_lines "b" "https://example.invalid/r.git"' | bash 2>&1; echo "RC=$?")"
+if printf '%s' "$p15_out" | grep -q "RC=1" && printf '%s' "$p15_out" | grep -q "::error::remote root .*/does-not-exist is not enterable" && ! printf '%s' "$p15_out" | grep -qi "clon"; then
+  ok "P15: executed — an un-enterable root stops the checkout by name before any git command (rc 1, never a clone into the caller's cwd)"
+else
+  bad "P15: expected the fail-closed root arm; got: ${p15_out}"
+fi
+if ! grep -nE '"/root/|=/root' "$DIR/runpod_gpu_cluster.sh" "$DIR/runpod_gpu_gang.sh" "$DIR/runpod_gpu_prove.sh" | grep -v '^\S*:[0-9]*:\s*#' | grep -q .; then
+  ok "P15: no GPU leg carries a /root literal outside a comment (the root is RP_REMOTE_ROOT everywhere)"
+else
+  bad "P15: a /root literal survives in a leg: $(grep -nE '"/root/|=/root' "$DIR/runpod_gpu_cluster.sh" "$DIR/runpod_gpu_gang.sh" "$DIR/runpod_gpu_prove.sh" | grep -v '^\S*:[0-9]*:\s*#' | head -3)"
 fi
 # ----------------------------------------------------------------------------
 # P10: prose == code.

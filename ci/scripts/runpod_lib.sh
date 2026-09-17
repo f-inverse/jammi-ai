@@ -349,6 +349,11 @@ RP_REF=""
 # PATH with cuda+mold+rust). Every remote job imports PID 1's real environment.
 RP_ENV_PREAMBLE='while IFS= read -r -d "" __e; do export "$__e"; done < /proc/1/environ'
 
+# The directory a rented host's remote job works under. /root on a real pod;
+# a lane suite that executes a leg's remote text points it at a sandbox and
+# runs the text UNMODIFIED — never a string patch of the script under test.
+RP_REMOTE_ROOT="${RP_REMOTE_ROOT:-/root}"
+
 rp_gql() { curl -s "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" -H 'Content-Type: application/json' --data-binary "$1"; }
 
 # The REST v2 primitive (`https://api.runpod.io/v2/...`, Bearer auth) every
@@ -2485,7 +2490,9 @@ rp_parse_prove_marker() {
 # and the wrong-tree guard below fired). Without an expected sha (a hand
 # run) the ref is cloned. Emits shell lines for the remote script's
 # heredoc: `cd /root`, a fresh `jammi-ai` dir, and leaves the caller INSIDE
-# it. Every leg then deepens the history WITHOUT blobs (commits and trees
+# it. The root is RP_REMOTE_ROOT (default /root) — a parameter, never a
+# literal, so a fixture executes this text unmodified in a sandbox.
+# Every leg then deepens the history WITHOUT blobs (commits and trees
 # only, seconds): the artifact registry's ancestry rule (`git merge-base
 # --is-ancestor`, check_cuda_run_artifacts.py rule (d)/(k)) answers "not an
 # ancestor" for every commit but HEAD on a depth-1 history — the pod-leg
@@ -2494,21 +2501,29 @@ rp_parse_prove_marker() {
 # the repo.
 rp_remote_checkout_lines() {
   local ref="${1:?rp_remote_checkout_lines needs a ref}" repo="${2:?rp_remote_checkout_lines needs a repo url}"
+  local root="${RP_REMOTE_ROOT:-/root}"
+  # Every step is chained fail-closed: a checkout that cannot enter its root,
+  # clone, fetch or check out STOPS the remote script by name. Nothing may run
+  # in an unknown working directory (the lane suite once executed this text
+  # on a host with no /root, and the stubbed clone wrote a tree mirror into
+  # the caller's own checkout).
   if [ -n "${PROVE_EXPECT_SHA:-}" ]; then
     cat <<LINES
-cd /root && rm -rf jammi-ai && mkdir jammi-ai && cd jammi-ai
-git init -q && git remote add origin "${repo}"
+cd "${root}" || { echo "::error::remote root ${root} is not enterable" >&2; exit 1; }
+rm -rf jammi-ai && mkdir jammi-ai && cd jammi-ai || { echo "::error::could not create ${root}/jammi-ai" >&2; exit 1; }
+git init -q && git remote add origin "${repo}" || { echo "::error::could not initialise the checkout" >&2; exit 1; }
 git fetch -q --depth 1 origin "${PROVE_EXPECT_SHA}" \\
   || { echo "::error::could not fetch the exact commit ${PROVE_EXPECT_SHA} from ${repo}" >&2; exit 1; }
-git checkout -q --detach FETCH_HEAD
+git checkout -q --detach FETCH_HEAD || { echo "::error::could not check out ${PROVE_EXPECT_SHA}" >&2; exit 1; }
 git fetch -q --filter=blob:none --unshallow origin \\
   || { echo "::error::could not deepen the checkout (blobless --unshallow failed) -- the artifact registry's ancestry rule cannot run on a depth-1 history" >&2; exit 1; }
 LINES
   else
     cat <<LINES
-cd /root && rm -rf jammi-ai
-git clone --depth 1 -b "${ref}" "${repo}" jammi-ai 2>&1 | tail -1
-cd jammi-ai
+cd "${root}" || { echo "::error::remote root ${root} is not enterable" >&2; exit 1; }
+rm -rf jammi-ai || exit 1
+git clone --depth 1 -b "${ref}" "${repo}" jammi-ai || { echo "::error::could not clone ${ref} from ${repo}" >&2; exit 1; }
+cd jammi-ai || exit 1
 git fetch -q --filter=blob:none --unshallow origin \\
   || { echo "::error::could not deepen the checkout (blobless --unshallow failed) -- the artifact registry's ancestry rule cannot run on a depth-1 history" >&2; exit 1; }
 LINES

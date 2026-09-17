@@ -155,7 +155,7 @@ GANG_TEST_FILTER="${GANG_TEST_FILTER:-gang_}"
 # that backstops that contract ships with the cluster leg
 # (docs/plans/67-distributed-training/UNITS.md § U7b acceptance (id-secrecy)), beside the crossing
 # it protects; this driver mints/ships no id today.
-GANG_REMOTE_ARTIFACT_DIR="/root/jammi-ai/.gang-artifact"
+GANG_REMOTE_ARTIFACT_DIR="${RP_REMOTE_ROOT}/jammi-ai/.gang-artifact"
 GANG_ARTIFACT_DIR="${GANG_ARTIFACT_DIR:-.gpu-pull/gpu-gang}"
 
 # The gating groups this driver's own pass/fail rule reads `PROVE_GROUP_RC`

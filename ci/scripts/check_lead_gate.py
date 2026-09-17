@@ -2652,7 +2652,7 @@ def fixture_r12r2f_partial_attacks_post_coverage_denies() -> None:
 
 def fixture_r12r2g_attacks_post_entry_not_object_denies() -> None:
     """issue #569 fold-in: `_post_fix_attacks_rejection`'s OWN inline
-    `isinstance(entry, dict)` pre-check (`relay \`attacks_post[{f!r}]\` is
+    `isinstance(entry, dict)` pre-check (`relay attacks_post[{f!r}] is
     not an object`) — a THIRD producer of the unmarked substring `is not
     an object`, distinct from BOTH `_r12_validate_and_run_entry`'s own
     text (`anticipation artifact ...`) and the shared validator's marked

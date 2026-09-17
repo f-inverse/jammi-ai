@@ -55,6 +55,38 @@ the `#`, so an issue reference on its own never collides with it in the
 first place). (3) `docs/plans/**` and `docs/rigor/**` — the program's OWN
 record; skipped by path, entirely, before any pattern runs.
 
+**Definition exemption (a `ruling_id`- or `paren_ruling`-shaped token the
+SAME FILE itself DEFINES, never a citation of the swarm's own ledger).**
+The `ruling_id` pattern's own broad net (module docstring, above) catches
+not only a reference to THIS program's bookkeeping but a `check_*.py`
+gate's OWN rule- or test-case-id vocabulary about the tool it checks (a
+single letter followed by digits, a `T`-letter id with a parenthesized
+sub-index, or a `#`-prefixed `F`-letter id — deliberately not reproduced
+as a literal instance here, same discipline as the module docstring's own
+ruling-id family, above). A stable identifier a FILE DEFINES is current-
+state vocabulary, exactly like K1–K7; a journey marker is an id the text
+only REFERENCES from the swarm's own ledger, never one the file under
+scan declares for itself. `_defined_ids_in_file` computes, per file, the
+set of bare ids exempted via either of two independent mechanisms:
+
+  1. The file's OWN module docstring (`.py` only) names it in the shape a
+     tool declares its OWN rule/test vocabulary — captured once per file,
+     REGARDLESS of where else in the file the id is later referenced.
+  2. ANYWHERE in the file's own comments/docstrings, a DEFINITION-SHAPED
+     line — a markdown table row, a markdown heading, or a line whose own
+     text starts with the id immediately followed by `--`/`—`/`:` — names
+     it; every `ruling_id`-shaped token that SAME line carries is exempted
+     (a table row or heading names its subject anywhere on the line, not
+     only at column 0).
+
+Applies ONLY to the `ruling_id`/`paren_ruling` categories — `round_n`,
+`unit_id`, `at_this_commit`, `fix_round`, `campaign_audit`,
+`readme_ruling`, `block_hash`, and `finding_f` are NEVER exempted by this
+mechanism and stay BLOCK unconditionally regardless of what a file
+defines: a wave/group/unit id, a round number, and an "as of this commit"
+hedge are journey shape by construction, never a tool's own current-state
+rule name.
+
 Run: `python3 ci/scripts/check_journey_markers.py`
 Self-test: `python3 ci/scripts/check_journey_markers.py --self-test`
 Hermetic: reads `git diff <base>...HEAD` + the tree at HEAD; no network, no build.
@@ -240,6 +272,130 @@ SURFACE_SEVERITY = {
 
 
 # --------------------------------------------------------------------------- #
+# definition exemption — see module docstring's own "Definition exemption"
+# section for the full statement; this is the mechanical half.
+# --------------------------------------------------------------------------- #
+
+_RULING_ID_CORE_RE = re.compile(r"[A-Z]\d{1,3}'?")
+_HEADING_LINE_RE = re.compile(r"^#{1,6}\s")
+_DEFINITION_LEAD_RE = re.compile(r"^([A-Z]\d{1,3}'?)\s*(--|—|:)")
+# A `check_*.py` gate's own rule/test-case-id vocabulary shapes, as such a
+# module doc actually declares them (see e.g. `check_gpu_prove_once.py`'s
+# `P1`-`P6` and its own "F4 audit fix" cross-references, later CITED with a
+# leading `#` at its own call sites; `check_bundle_fixture.py`'s own
+# citation of `test_bundle_cuda_libs.sh`'s `T4(3)`): `T<n>(<m>)` (a test
+# case), `P<n>`/`R<n>` (a rule id), an `F<n>` audit-fix id (its own module
+# doc never prefixes the DEFINING mention with `#`, only later citations
+# do — the `#` is therefore OPTIONAL here, never required) — never
+# reproduced as a literal instance in THIS file's own docstring (see
+# module doc).
+_TOOL_VOCAB_RE = re.compile(r"\bT\d+\(\d+\)|\b[PR]\d{1,3}\b|#?\bF\d{1,3}\b")
+_WHOLE_PROSE_EXTS = {".md", ".mdx", ".rst", ".txt"}
+_LINE_COMMENT_MARKERS = ("///", "//!", "//", "/*", "*", "#")
+
+
+def _comment_or_docstring_line_numbers(rel_path: str, file_lines: list[str]) -> set[int]:
+    """1-indexed line numbers, over the WHOLE file, a definition can live
+    in — a real Python docstring range (`_python_docstring_ranges`, never a
+    second docstring detector) plus every `#`-comment line for `.py`; every
+    line, for a whole-prose extension; a `//`/`///`/`//!`/`/*`/`*`/`#`
+    -prefixed line otherwise (this repo's own established comment-marker
+    convention, see `lead-gate-lib.py`'s `_LINE_COMMENT_MARKERS`)."""
+    ext = Path(rel_path).suffix.lower()
+    if ext == ".py":
+        out: set[int] = set()
+        for start, end in _python_docstring_ranges("\n".join(file_lines)):
+            out.update(range(start, end + 1))
+        for i, line in enumerate(file_lines, start=1):
+            if line.strip().startswith("#"):
+                out.add(i)
+        return out
+    if ext in _WHOLE_PROSE_EXTS:
+        return set(range(1, len(file_lines) + 1))
+    return {
+        i for i, line in enumerate(file_lines, start=1)
+        if line.strip().startswith(_LINE_COMMENT_MARKERS)
+    }
+
+
+def _module_docstring_text(rel_path: str, file_lines: list[str]) -> str:
+    """The file's OWN module docstring text (`.py` only — the one place a
+    `check_*.py` gate already states its rules, by this repo's own
+    convention). `""` for a non-`.py` file or a file with no module
+    docstring."""
+    if Path(rel_path).suffix.lower() != ".py":
+        return ""
+    ranges = _python_docstring_ranges("\n".join(file_lines))
+    if not ranges:
+        return ""
+    start, end = ranges[0]
+    return "\n".join(file_lines[start - 1:end])
+
+
+def _defined_ids_in_file(rel_path: str, file_lines: list[str]) -> set[str]:
+    """The set of bare `[A-Z]\\d{1,3}` ids (trailing apostrophe ALWAYS
+    stripped — see `_match_core_id`'s own docstring for why a comparison
+    against this set must never depend on whether a matched CITATION
+    happened to be possessive) this FILE ITSELF defines — see module
+    docstring's "Definition exemption" section for the full statement of
+    the two mechanisms this computes."""
+    defined: set[str] = set()
+
+    module_doc = _module_docstring_text(rel_path, file_lines)
+    for m in _TOOL_VOCAB_RE.finditer(module_doc):
+        core = _RULING_ID_CORE_RE.search(m.group(0))
+        if core:
+            defined.add(core.group(0).rstrip("'"))
+
+    ext = Path(rel_path).suffix.lower()
+    for i in _comment_or_docstring_line_numbers(rel_path, file_lines):
+        raw = file_lines[i - 1]
+        # Strip ONE leading comment marker (if any) BEFORE testing any of
+        # the three definition shapes below — a table row / heading inside
+        # a `#`/`//`-marked comment line is preceded by the marker, not at
+        # the raw line's own column 0 (only true for a whole-prose file,
+        # where `content` below is already unchanged from `stripped_raw`).
+        content = raw.strip()
+        for marker in _LINE_COMMENT_MARKERS:
+            if content.startswith(marker):
+                content = content[len(marker):].strip()
+                break
+        if content.startswith("|"):
+            defined.update(m.group(0).rstrip("'") for m in _RULING_ID_CORE_RE.finditer(content))
+            continue
+        if ext in _WHOLE_PROSE_EXTS and _HEADING_LINE_RE.match(content):
+            defined.update(m.group(0).rstrip("'") for m in _RULING_ID_CORE_RE.finditer(content))
+            continue
+        m2 = _DEFINITION_LEAD_RE.match(content)
+        if m2:
+            defined.add(m2.group(1).rstrip("'"))
+    return defined
+
+
+def _match_core_id(vm: VocabMatch) -> str | None:
+    """The bare `[A-Z]\\d{1,3}` core (the trailing `'?` NEVER kept — a
+    POSSESSIVE reference captures `ruling_id`'s own OPTIONAL apostrophe as
+    part of the match, which would otherwise silently mismatch
+    `_defined_ids_in_file`'s own apostrophe-free definitions and defeat the
+    exemption on exactly the possessive-citation shape this program's own
+    prose most commonly uses) a `ruling_id` or `paren_ruling`
+    match carries — `ruling_id`'s own matched text already IS that core
+    (modulo the trailing apostrophe); `paren_ruling`'s matched text wraps
+    it in the `(`/`[,)]` punctuation its own pattern requires. `None` for
+    every OTHER vocabulary category — `round_n`/`unit_id`/
+    `at_this_commit`/`fix_round`/`campaign_audit`/`readme_ruling`/
+    `block_hash`/`finding_f` are never eligible for the definition
+    exemption (see module docstring), and this function is the ONE gate
+    that enforces that scope."""
+    if vm.pattern_name == "ruling_id":
+        return vm.text.rstrip("'")
+    if vm.pattern_name == "paren_ruling":
+        m = _RULING_ID_CORE_RE.search(vm.text)
+        return m.group(0).rstrip("'") if m else None
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # diff scoping
 # --------------------------------------------------------------------------- #
 
@@ -340,6 +496,7 @@ class Finding:
 def scan_added_lines(added: list[tuple[str, int, str]]) -> list[Finding]:
     findings: list[Finding] = []
     file_cache: dict[str, list[str]] = {}
+    defined_ids_cache: dict[str, set[str]] = {}
     for rel_path, line_no, text in added:
         if is_exempt_path(rel_path):
             continue
@@ -348,6 +505,19 @@ def scan_added_lines(added: list[tuple[str, int, str]]) -> list[Finding]:
             continue
         if rel_path not in file_cache:
             file_cache[rel_path] = read_file_lines(rel_path)
+        if rel_path not in defined_ids_cache:
+            defined_ids_cache[rel_path] = _defined_ids_in_file(rel_path, file_cache[rel_path])
+        defined_ids = defined_ids_cache[rel_path]
+        # Definition exemption (module docstring's own section) — scoped to
+        # ruling_id/paren_ruling ONLY (`_match_core_id` returns `None` for
+        # every other category, which then never matches `in defined_ids`
+        # regardless of that set's own contents).
+        vocab_matches = [
+            vm for vm in vocab_matches
+            if not (_match_core_id(vm) is not None and _match_core_id(vm) in defined_ids)
+        ]
+        if not vocab_matches:
+            continue
         surface = classify_surface(rel_path, file_cache[rel_path], line_no)
         severity = SURFACE_SEVERITY[surface]
         findings.append(
@@ -512,6 +682,87 @@ def self_test() -> int:
         z_matches = find_vocabulary_matches(z_line)
         check("Z17 (non-allowlisted) matches ruling_id", any(m.text == "Z17" for m in z_matches))
 
+        # --- definition exemption: a `check_*.py` gate's OWN rule/test-id
+        # vocabulary, declared in its module doc, is current-state text, not
+        # a journey reference (coordinator's own binding correction) -------
+        gate_src = (
+            '"""Some gate. Six rules:\n\n'
+            "  P3 (PROMOTION_TABLE, every row reconciled): every reviewed row.\n"
+            '"""\n'
+            "\n"
+            "def check_p3():\n"
+            '    """the same ambiguity discipline P3\'s other rules already hold to,\n'
+            "    and this step-gated row (P3) only ever pins the NAMED step's own\n"
+            '    if:, never an UNDEFINED Z17-style id or a round 3 hedge."""\n'
+            "    return True\n"
+        )
+        gate_lines = gate_src.splitlines()
+        defined = _defined_ids_in_file("ci/scripts/fake_gate.py", gate_lines)
+        check("module-doc-declared P3 is captured as defined", "P3" in defined)
+
+        def _survives(vocab_matches):
+            return [
+                vm for vm in vocab_matches
+                if not (_match_core_id(vm) is not None and _match_core_id(vm) in defined)
+            ]
+
+        possessive_line = gate_lines[6]  # "the same ambiguity discipline P3's other rules..."
+        check(
+            "a possessive citation of a module-doc-declared id (P3's) produces NO finding",
+            not _survives(find_vocabulary_matches(possessive_line)),
+        )
+        paren_line = gate_lines[7]  # "and this step-gated row (P3) only ever pins..."
+        check(
+            "a parenthetical citation of the SAME declared id ((P3), BOTH paren_ruling "
+            "and ruling_id) produces NO finding",
+            not _survives(find_vocabulary_matches(paren_line)),
+        )
+        undefined_line = "See Z17 for the invariant, never declared by this file."
+        check(
+            "an UNDEFINED id of the identical shape (Z17) still produces a finding",
+            bool(_survives(find_vocabulary_matches(undefined_line))),
+        )
+        round_line = gate_lines[8]  # "if:, never an UNDEFINED Z17-style id or a round 3 hedge."
+        check(
+            "round_n stays BLOCK unconditionally, even inside a file with declared vocabulary",
+            any(vm.pattern_name == "round_n" for vm in _survives(find_vocabulary_matches(round_line))),
+        )
+
+        # --- definition exemption, mechanism 2: a table-row/heading/`<ID>
+        # --`-shaped line ANYWHERE in the file's own prose, never restricted
+        # to the module docstring ------------------------------------------
+        table_src = (
+            '"""No module-doc vocabulary declared here."""\n'
+            "\n"
+            "def f():\n"
+            "    # | rule | outcome |\n"
+            "    # | R2 | denies |\n"
+            '    """R2 governs this branch."""\n'
+            "    return True\n"
+        )
+        table_lines = table_src.splitlines()
+        table_defined = _defined_ids_in_file("ci/scripts/fake_table.py", table_lines)
+        check("a table-row-cited id (R2) is captured as defined", "R2" in table_defined)
+        check(
+            "an in-prose reference to the table-defined id produces NO finding",
+            not [
+                vm for vm in find_vocabulary_matches("R2 governs this branch.")
+                if not (_match_core_id(vm) is not None and _match_core_id(vm) in table_defined)
+            ],
+        )
+
+        lead_src = (
+            '"""No module-doc vocabulary declared here either."""\n'
+            "\n"
+            "def f():\n"
+            "    # R9 -- this branch's own denial text.\n"
+            '    """cross-referenced again: R9 denies for the same reason."""\n'
+            "    return True\n"
+        )
+        lead_lines = lead_src.splitlines()
+        lead_defined = _defined_ids_in_file("ci/scripts/fake_lead.py", lead_lines)
+        check("an `<ID> --`-at-line-start definition (R9) is captured as defined", "R9" in lead_defined)
+
         # --- public issue links never collide (sanctioned by construction) ---
         issue_line = "Fixes a bug (see #557); closes issue #558; ref PR #559."
         check("bare issue/PR links produce no finding", not find_vocabulary_matches(issue_line))
@@ -546,8 +797,11 @@ def self_test() -> int:
         "check_journey_markers self-test: OK -- every vocabulary form fires on every "
         "surface kind with the right severity, K1-K7 is allowlisted (and shown to be "
         "load-bearing against the raw pattern), public issue links never collide, "
-        "docs/plans and docs/rigor are exempt by path, and hunk-header line-number "
-        "seeding is correct."
+        "docs/plans and docs/rigor are exempt by path, hunk-header line-number "
+        "seeding is correct, and the definition exemption (a module-doc-declared or "
+        "definition-line-declared id) suppresses ONLY the matching citation while an "
+        "undefined id of the identical shape, and round_n regardless of any declared "
+        "vocabulary, both still fire."
     )
     return 0
 

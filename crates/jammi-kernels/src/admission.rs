@@ -1076,6 +1076,19 @@ fn fired_disables() -> &'static RwLock<HashSet<String>> {
     FIRED.get_or_init(|| RwLock::new(HashSet::new()))
 }
 
+/// The PURE, side-effect-free "is `op` disabled" decision — exact match
+/// OR the `"all"` wildcard, matching every predicate the live and dry
+/// paths below consult before either one ever touches mutable state.
+///
+/// This is the ONE implementation of that decision in the crate:
+/// `op_is_disabled` (the live admission path) and
+/// `DryRunCtx::op_is_disabled_here` (the dry, pre-training path) both
+/// call it directly, with no second copy of the `"all"`/exact-match
+/// logic to drift out of sync.
+fn disable_decision(requested: &HashSet<String>, op: &str) -> bool {
+    !requested.is_empty() && (requested.contains("all") || requested.contains(op))
+}
+
 /// Whether `op` is disabled by `requested` (an exact-name entry, or the
 /// `"all"` wildcard), recording which of `requested`'s entries actually
 /// matched into `fired`.
@@ -1111,23 +1124,6 @@ fn fired_disables() -> &'static RwLock<HashSet<String>> {
 /// an unconditional write lock plus a `String` allocation on every one of
 /// those later calls would bias exactly the timing measurement a
 /// `JAMMI_KERNELS_DISABLE` forced-eager leg exists to produce.
-/// The PURE, side-effect-free "is `op` disabled" decision — exact match
-/// OR the `"all"` wildcard, matching every predicate the live path (below)
-/// consults before it ever touches `fired`'s bookkeeping. This is the ONE
-/// implementation of that decision in the crate: `op_is_disabled` (the
-/// live admission path — `admit`/`admit_cascade`) calls it to decide
-/// whether to fire at all, and `DryRunCtx::op_is_disabled_here` (the
-/// dry, pre-training path — `dry_run_all`) calls it directly, over the
-/// caller's own `disabled_registry_keys` set, with NO second copy of the
-/// "all"/exact-match logic to drift out of sync — a prior revision of
-/// the dry path re-implemented only the exact-match arm, so
-/// `JAMMI_KERNELS_DISABLE=all` rendered a byte-identical profile to an
-/// unset run; that class of bug is now structurally impossible; there is
-/// nothing left to reimplement.
-fn disable_decision(requested: &HashSet<String>, op: &str) -> bool {
-    !requested.is_empty() && (requested.contains("all") || requested.contains(op))
-}
-
 fn op_is_disabled(
     requested: &HashSet<String>,
     fired: &RwLock<HashSet<String>>,
@@ -2130,14 +2126,27 @@ struct Sealed;
 /// instead by `every_probed_op_construction_site_is_reviewed`
 /// (`crates/jammi-kernels/tests/probed_op_construction_sites.rs`), a
 /// `syn` source oracle over this crate's own `src/`/`tests/` trees that
-/// reviews every `ProbedOp::new(...)` call (count-keyed against
-/// [`PROBED_OPS`]), every `ProbedOp { ... }` struct literal, and every
-/// fn whose own return type names `ProbedOp` (both name-keyed against
-/// the one reviewed constructor, `ProbedOp::new` — that file's own
-/// module doc has the full three-direction argument and why a fourth
-/// (mutation from a same-crate `&mut` reference into an existing row)
-/// is not a real vector: every [`PROBED_OPS`] entry is a `const`, never
-/// a `static mut` or interior-mutable cell).
+/// reviews every `ProbedOp::new(...)`-equivalent call (matched by its
+/// LAST TWO path segments under any qualifying prefix, qualified-self
+/// syntax, `Self::new` inside `impl ProbedOp`, or a same-crate type
+/// alias — never a fixed, exact segment count — and name-keyed against
+/// each real [`PROBED_OPS`] row's own `report_key`, never a bare count),
+/// every `ProbedOp { ... }`-equivalent struct literal, every fn whose own
+/// return type names `ProbedOp`-equivalent, every macro INVOCATION whose
+/// own token stream names `ProbedOp`/an alias at all (the shape a call or
+/// literal wrapped inside `vec![...]` takes — opaque to the typed
+/// traversal the other directions use), and every `transmute` whose
+/// target type is named explicitly (a turbofish, or a `let`-binding's own
+/// annotation) — that file's own module doc has the full seven-direction
+/// argument, including the one HONESTLY NAMED residual neither this
+/// struct's own two mechanisms nor that oracle closes: a `transmute` (or
+/// raw-pointer cast) whose target type is established some OTHER way a
+/// syntax-only, type-checker-free scan cannot resolve — this crate does
+/// NOT carry `#![forbid(unsafe_code)]`, so that residual is not claimed
+/// closed. A fifth vector this doc names but neither mechanism nor the
+/// oracle needs to close (mutation from a same-crate `&mut` reference
+/// into an existing row) is not a real vector at all: every [`PROBED_OPS`]
+/// entry is a `const`, never a `static mut` or interior-mutable cell.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ProbedOp {

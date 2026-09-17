@@ -71,13 +71,26 @@ INSIDE the crate that defines the type, though — a same-crate forgery
 inside `jammi-kernels` itself is a residual the compiler alone does not
 close, closed instead by a real `syn` source oracle,
 `crates/jammi-kernels/tests/probed_op_construction_sites.rs`, which proves
-every `ProbedOp::new(...)` call (count-keyed against the real, linked-in
-`PROBED_OPS` constant), every `ProbedOp { ... }` struct literal, and every
-fn whose own return type names `ProbedOp`, anywhere under that crate's
-`src/`/`tests/` trees, is either the one reviewed constructor
-(`ProbedOp::new`'s own body) or one of two named, reviewed `#[cfg(test)]`
-fixture macros. Together, the compiler's two proofs and the oracle's three
-directions cover every crate; no one of them alone does. Separately, this
+every `ProbedOp::new(...)`-equivalent call (matched by its own last two
+path segments under any qualifying prefix, qualified-self syntax,
+`Self::new` inside `impl ProbedOp`, or a same-crate type alias — never a
+fixed, exact segment count — and name-keyed against the real, linked-in
+`PROBED_OPS` constant's own `report_key`s, never a bare count), every
+`ProbedOp { ... }`-equivalent struct literal, every fn whose own return
+type names `ProbedOp`-equivalent, every macro INVOCATION whose own token
+stream names `ProbedOp`/a resolved alias at all (`vec![ProbedOp::new(...)]`
+and `vec![ProbedOp { ... }]` are both opaque to the other directions'
+typed traversal), and every `transmute` whose target type is named
+explicitly (a turbofish, or a `let`-binding's own annotation), anywhere
+under that crate's `src/`/`tests/` trees, is either the one reviewed
+constructor (`ProbedOp::new`'s own body) or one of two named, reviewed
+`#[cfg(test)]` fixture macros. The one HONESTLY NAMED residual neither the
+compiler's two mechanisms nor the oracle closes: a `transmute` (or
+raw-pointer cast) whose target `ProbedOp` type is established some OTHER
+way a syntax-only, type-checker-free scan cannot resolve — `jammi-kernels`
+does not carry `#![forbid(unsafe_code)]`, so this is not claimed closed.
+Together, the compiler's two proofs and the oracle's seven directions
+cover every crate; no one of them alone does. Separately, this
 script still checks NON-VACUITY: that real
 `admit`/`admit_cascade` call sites genuinely exist under the scan roots at
 all (`admit_call_sites`, via

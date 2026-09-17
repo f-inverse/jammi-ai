@@ -1117,7 +1117,7 @@ mod tests {
         store.delete_artifact_prefix(&prefix).await.unwrap();
     }
 
-    /// I1's release-build typed refusal (wave-5 pressure round F2): a
+    /// I1's release-build typed refusal: a
     /// prefix NOT under this store's own root — a THIRD, hypothetical call
     /// site's mistake, not one of the two sanctioned routes
     /// (`ResultStore::delete_unreferenced_prefix`,

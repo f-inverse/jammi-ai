@@ -266,7 +266,7 @@ pub struct MaterializationEnv {
     /// `rope`, `softmax`, `geglu`, `gelu_erf`, `attention_block`,
     /// `lora_linear_fused`'s two report keys, `cast_scale`, `cast_add`,
     /// `adamw_step`, `mem_efficient_attention` — rather than leaving them
-    /// entirely unconsulted, AND (wave-5 third adversarial audit) covers
+    /// entirely unconsulted, AND covers
     /// `JAMMI_KERNELS_DISABLE`: `jammi_kernels::admission::admit`/
     /// `admit_cascade` both honor that env var over every predicate, in
     /// every build, so `dry_run_all` checks each row's own registry

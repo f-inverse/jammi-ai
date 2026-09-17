@@ -1778,7 +1778,7 @@ impl JobWorker {
                 break;
             }
             // The slot: `Free → ClaimProbe` before `claim_next` (a peer never
-            // claims while it holds a rank — OPS D6); the guard resets the
+            // claims while it holds a rank); the guard resets the
             // holder to `Free` on every exit of this iteration. A held slot
             // (an admitted rank, or a job already running) skips the claim
             // and sleeps the idle poll exactly like a claim that found
@@ -2571,11 +2571,11 @@ impl JobWorker {
     /// (i) takes this host's job slot through [`HostAdmission::probe_claim`]
     /// — exactly as the claim loop does (`Free → ClaimProbe`; a host
     /// already holding a rank, a loop-claimed job, or another placement's
-    /// probe/await refuses typed BEFORE any row write — OPS D6) and, in the
+    /// probe/await refuses typed BEFORE any row write) and, in the
     /// SAME synchronous step (no `.await` between them), snapshots
     /// `HostAdmission::release_epoch` as this run's `WorkerShared` birth —
     /// the claim's true commit instant, not the moment `WorkerShared` is
-    /// later constructed (#500 wave 5 group E1, P7 pressure-round fix: a
+    /// later constructed (a
     /// RELEASE landing during (ii)/(iii) below must still be caught, and
     /// only a birth snapshot taken THIS early, before either `.await`,
     /// guarantees that — see `WorkerShared::for_single_run`'s own doc);
@@ -4020,7 +4020,7 @@ impl JobWorker {
             // where this unit's "seq is the only residual" framing does
             // NOT hold for the real predicates.
             //
-            // `disabled_registry_keys` (wave-5 third adversarial audit):
+            // `disabled_registry_keys`:
             // `JAMMI_KERNELS_DISABLE` wins over every predicate, in every
             // build (`jammi_kernels::admission::admit`/`admit_cascade`'s
             // own doc) — omitting it from this profile let two attempts of
@@ -10629,7 +10629,7 @@ mod tests {
         );
     }
 
-    /// #546's completeness proof (wave-5 second pressure round):
+    /// #546's completeness proof:
     /// `dry_run_admission_profile`'s `ops` key set must equal EXACTLY the
     /// `TwoArm`/`Cascade` report keys the REAL, linked-in `PROBED_OPS`
     /// names — read live off the constant, never a hand-copied list. Since

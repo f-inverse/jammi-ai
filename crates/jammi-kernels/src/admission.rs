@@ -1769,12 +1769,12 @@ pub enum DeviceKind {
     Metal,
 }
 
-/// #546's DETERMINISTIC, PRE-TRAINING inputs (wave-5 second pressure
+/// #546's DETERMINISTIC, PRE-TRAINING inputs (
 /// round): build features, this attempt's resolved device kind, its
 /// backbone dtype class, whether the ENCODER arm is even reachable at all
 /// (a `target_modules`-empty `ProjectionHead` run never builds an encoder,
 /// so every encoder op is [`DryRunVerdict::NotReached`] for such a run,
-/// never merely undetermined), and — wave-5 third adversarial audit —
+/// never merely undetermined), and —
 /// which registry keys `JAMMI_KERNELS_DISABLE` names for THIS process.
 /// Everything a [`ProbedOp::dry_run`] fn needs and nothing else — no
 /// tensor, no catalog handle, no I/O.
@@ -1845,8 +1845,8 @@ impl DryRunCtx {
     }
 }
 
-/// One [`ProbedOp`]'s deterministic, pre-training admission verdict (#546,
-/// wave-5 second pressure round) — a pure function of [`DryRunCtx`], never a
+/// One [`ProbedOp`]'s deterministic, pre-training admission verdict (#546)
+/// — a pure function of [`DryRunCtx`], never a
 /// real tensor, never a dispatch counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DryRunVerdict {
@@ -2087,9 +2087,8 @@ struct Sealed;
 /// `admit_cascade()` call site passes per dtype class, and this row's OWN
 /// deterministic, pre-training dry-run verdict function.
 ///
-/// **Sealed (wave-5 third adversarial audit).** Before this fix, every
-/// field here was `pub`, and this struct carried no `#[non_exhaustive]` —
-/// so ANY crate (`jammi-encoders`, `jammi-lora`, `jammi-ai`, or a future
+/// **Sealed.** Were every field here `pub` with no `#[non_exhaustive]`,
+/// ANY crate (`jammi-encoders`, `jammi-lora`, `jammi-ai`, or a future
 /// one) could construct its OWN `ProbedOp` value with a struct literal and
 /// pass `&that_value` to [`admit`]/[`admit_cascade`], which would honor it
 /// exactly as if it were a real [`PROBED_OPS`] row — invisible to
@@ -2126,7 +2125,7 @@ pub struct ProbedOp {
     /// [`ProbedOpKind::InternalSubkernel`], which has no key at all.
     pub registry: &'static [(DtypeClass, &'static str)],
     /// This row's own deterministic, pre-training dry-run verdict function
-    /// (#546, wave-5 second pressure round) — moved onto the row itself so
+    /// (#546) — moved onto the row itself so
     /// a new [`PROBED_OPS`] row cannot exist without a `dry_run` fn (a
     /// missing field in a struct literal does not compile), replacing a
     /// SECOND, string-keyed enumeration of these same ops that used to live
@@ -2482,8 +2481,8 @@ pub fn probed_op(report_key: &str) -> Option<&'static ProbedOp> {
 /// reachability oracle cannot resolve.
 ///
 /// **The `JAMMI_KERNELS_DISABLE` check runs HERE, once, uniformly — never
-/// duplicated into each row's own `dry_run` fn** (wave-5 third adversarial
-/// audit): `admit`/`admit_cascade` both consult the disable list BEFORE
+/// duplicated into each row's own `dry_run` fn**
+/// : `admit`/`admit_cascade` both consult the disable list BEFORE
 /// the predicate, for every op, identically — a
 /// `DryRunCtx::op_is_disabled_here`-shaped check ahead of
 /// `(op.dry_run)(ctx)` mirrors that ordering exactly, without asking nine
@@ -2534,7 +2533,7 @@ mod tests {
         DryRunVerdict::Holds
     }
 
-    /// Wave-5 third adversarial audit: `dry_run_all` must differ, at a
+    /// `dry_run_all` must differ, at a
     /// REAL `PROBED_OPS` row, between a ctx naming nothing in
     /// `disabled_registry_keys` and an otherwise-IDENTICAL ctx naming a
     /// real standalone registry key — hermetically, through the ctx field

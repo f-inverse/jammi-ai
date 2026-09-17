@@ -31,7 +31,7 @@ fn main() {
         .iter()
         .flat_map(|op| op.all_registry_keys())
         .collect();
-    let report_keys: BTreeSet<&str> = PROBED_OPS.iter().map(|op| op.report_key).collect();
+    let report_keys: BTreeSet<&str> = PROBED_OPS.iter().map(|op| op.report_key()).collect();
     let out = serde_json::json!({
         "registry_keys": registry_keys,
         "report_keys": report_keys,

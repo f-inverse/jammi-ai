@@ -296,14 +296,14 @@ fn dtype_class(p: ComputePrecision) -> DtypeClass {
 fn two_arm_ops_for(dtype: DtypeClass) -> Vec<(&'static str, &'static str)> {
     PROBED_OPS
         .iter()
-        .filter(|op| op.kind == ProbedOpKind::TwoArm)
-        .filter(|op| op.report_key != "attention_block")
-        .filter(|op| op.report_key != "gelu_erf")
-        .filter(|op| !STRICT_UNREACHABLE_OPS.contains(&op.report_key))
+        .filter(|op| op.kind() == ProbedOpKind::TwoArm)
+        .filter(|op| op.report_key() != "attention_block")
+        .filter(|op| op.report_key() != "gelu_erf")
+        .filter(|op| !STRICT_UNREACHABLE_OPS.contains(&op.report_key()))
         .filter_map(|op| {
             op.registry_keys_for(dtype)
                 .next()
-                .map(|key| (op.report_key, key))
+                .map(|key| (op.report_key(), key))
         })
         .collect()
 }
@@ -322,11 +322,11 @@ fn two_arm_ops_for(dtype: DtypeClass) -> Vec<(&'static str, &'static str)> {
 fn cascade_ops() -> Vec<(&'static str, &'static str)> {
     PROBED_OPS
         .iter()
-        .filter(|op| op.kind == ProbedOpKind::Cascade)
+        .filter(|op| op.kind() == ProbedOpKind::Cascade)
         .filter_map(|op| {
             op.registry_keys_for(DtypeClass::Any)
                 .next()
-                .map(|key| (op.report_key, key))
+                .map(|key| (op.report_key(), key))
         })
         .collect()
 }
@@ -337,8 +337,8 @@ fn cascade_ops() -> Vec<(&'static str, &'static str)> {
 fn internal_subkernel_ops() -> Vec<(&'static str, &'static str)> {
     PROBED_OPS
         .iter()
-        .filter_map(|op| match op.kind {
-            ProbedOpKind::InternalSubkernel { parent } => Some((op.report_key, parent)),
+        .filter_map(|op| match op.kind() {
+            ProbedOpKind::InternalSubkernel { parent } => Some((op.report_key(), parent)),
             _ => None,
         })
         .collect()
@@ -346,7 +346,7 @@ fn internal_subkernel_ops() -> Vec<(&'static str, &'static str)> {
 
 /// Every [`PROBED_OPS`] report key, regardless of kind.
 fn all_probed_report_keys() -> HashSet<&'static str> {
-    PROBED_OPS.iter().map(|op| op.report_key).collect()
+    PROBED_OPS.iter().map(|op| op.report_key()).collect()
 }
 
 /// Manifest-declared ops that are structurally UNREACHABLE in a
@@ -1077,8 +1077,8 @@ fn manifest_capability_categories_match_probed_ops_by_kind() {
 
     let mut expected_admission: Vec<&str> = PROBED_OPS
         .iter()
-        .filter(|op| matches!(op.kind, ProbedOpKind::TwoArm | ProbedOpKind::Cascade))
-        .map(|op| op.report_key)
+        .filter(|op| matches!(op.kind(), ProbedOpKind::TwoArm | ProbedOpKind::Cascade))
+        .map(|op| op.report_key())
         .collect();
     expected_admission.sort_unstable();
     let mut declared_admission = manifest_string_list(&manifest, MANIFEST_FUSED_OP_ADMISSION);

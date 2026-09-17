@@ -49,26 +49,36 @@ check either direction, in `test_declared_set_equals_the_live_standalone_registr
 B2's own concern — "an unresolved call site must never read identically to
 'no call exists here'" — is answered differently now than it was by the
 retired text scan, but not abandoned. Precisely what the compiler proves
-and what a source oracle proves, stated separately (wave-5 third
-adversarial audit's own correction — an earlier revision of this
-paragraph overclaimed the compiler's own share): `admit`/`admit_cascade`'s
+and what a source oracle proves, stated separately: `admit`/`admit_cascade`'s
 own `pub fn` signature (`crates/jammi-kernels/src/admission.rs`) requires
 a `&'static jammi_kernels::admission::ProbedOp` argument, and that type is
-now SEALED (`#[non_exhaustive]` plus a private field) — the Rust compiler
-proves, on every `cargo build`, that a call site OUTSIDE `jammi-kernels`
-cannot pass anything but one of `PROBED_OPS`'s own named consts (a forged
-value built with a struct literal in another crate is `error[E0639]:
-cannot create non-exhaustive struct using struct expression`, not a
-runtime property). `#[non_exhaustive]`/private-field sealing has no effect
+now sealed by TWO separate mechanisms, proved separately, neither alone
+sufficient: `#[non_exhaustive]` refuses struct-literal CONSTRUCTION from
+outside the crate (a forged value built with a struct literal in another
+crate is `error[E0639]: cannot create non-exhaustive struct using struct
+expression`); every field being `pub(crate)`, not `pub`, refuses field
+ASSIGNMENT on a value already held from outside the crate, including one
+obtained by copying a real `PROBED_OPS` row (`Copy`, no struct expression
+at all, so `#[non_exhaustive]` alone never engages there — a probe against
+an earlier revision that sealed only `#[non_exhaustive]` copied a real
+row, assigned a field on the copy directly, and `admit` honoured the
+forged value; the same probe against field-private `ProbedOp` is
+`error[E0616]: field \`report_key\` of struct \`ProbedOp\` is private`).
+Together, on every `cargo build`, the Rust compiler proves that a call
+site OUTSIDE `jammi-kernels` cannot pass anything but one of `PROBED_OPS`'s
+own named consts, by either route. Neither mechanism has any effect
 INSIDE the crate that defines the type, though — a same-crate forgery
 inside `jammi-kernels` itself is a residual the compiler alone does not
 close, closed instead by a real `syn` source oracle,
 `crates/jammi-kernels/tests/probed_op_construction_sites.rs`, which proves
-every `ProbedOp::new(...)` call site anywhere in that crate's own `src/`
-tree is either one of `PROBED_OPS`'s own rows (count-keyed against the
-real, linked-in constant) or one of two named, reviewed `#[cfg(test)]`
-fixture macros. Together, the two claims cover every crate; neither alone
-does. Separately, this script still checks NON-VACUITY: that real
+every `ProbedOp::new(...)` call (count-keyed against the real, linked-in
+`PROBED_OPS` constant), every `ProbedOp { ... }` struct literal, and every
+fn whose own return type names `ProbedOp`, anywhere under that crate's
+`src/`/`tests/` trees, is either the one reviewed constructor
+(`ProbedOp::new`'s own body) or one of two named, reviewed `#[cfg(test)]`
+fixture macros. Together, the compiler's two proofs and the oracle's three
+directions cover every crate; no one of them alone does. Separately, this
+script still checks NON-VACUITY: that real
 `admit`/`admit_cascade` call sites genuinely exist under the scan roots at
 all (`admit_call_sites`, via
 `ci/tools/symbol-index`'s real `syn` parse — never a regex — filtered to

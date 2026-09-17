@@ -1111,19 +1111,33 @@ fn fired_disables() -> &'static RwLock<HashSet<String>> {
 /// an unconditional write lock plus a `String` allocation on every one of
 /// those later calls would bias exactly the timing measurement a
 /// `JAMMI_KERNELS_DISABLE` forced-eager leg exists to produce.
+/// The PURE, side-effect-free "is `op` disabled" decision — exact match
+/// OR the `"all"` wildcard, matching every predicate the live path (below)
+/// consults before it ever touches `fired`'s bookkeeping. This is the ONE
+/// implementation of that decision in the crate: `op_is_disabled` (the
+/// live admission path — `admit`/`admit_cascade`) calls it to decide
+/// whether to fire at all, and `DryRunCtx::op_is_disabled_here` (the
+/// dry, pre-training path — `dry_run_all`) calls it directly, over the
+/// caller's own `disabled_registry_keys` set, with NO second copy of the
+/// "all"/exact-match logic to drift out of sync — a prior revision of
+/// the dry path re-implemented only the exact-match arm, so
+/// `JAMMI_KERNELS_DISABLE=all` rendered a byte-identical profile to an
+/// unset run; that class of bug is now structurally impossible; there is
+/// nothing left to reimplement.
+fn disable_decision(requested: &HashSet<String>, op: &str) -> bool {
+    !requested.is_empty() && (requested.contains("all") || requested.contains(op))
+}
+
 fn op_is_disabled(
     requested: &HashSet<String>,
     fired: &RwLock<HashSet<String>>,
     op: &'static str,
 ) -> bool {
-    if requested.is_empty() {
+    if !disable_decision(requested, op) {
         return false;
     }
     let via_all = requested.contains("all");
     let via_exact = requested.contains(op);
-    if !via_all && !via_exact {
-        return false;
-    }
     {
         let fired_read = fired
             .read()
@@ -1783,7 +1797,10 @@ pub enum DeviceKind {
 /// theoretical one.** [`admit`]/[`admit_cascade`] both consult
 /// `op_is_disabled` (via `disabled_ops`) BEFORE the predicate, in
 /// every build, unconditionally — a disabled op is `Eager`/`Declined`
-/// regardless of what its predicate would have said. Before this field
+/// regardless of what its predicate would have said, whether the entry
+/// disabling it is an EXACT registry-key match or the documented `"all"`
+/// wildcard (`disable_decision`, the ONE decision both this path and
+/// `op_is_disabled` share — see that fn's own doc). Before this field
 /// existed, [`DryRunCtx`] carried none of that: two attempts of the SAME
 /// spec, one with `JAMMI_KERNELS_DISABLE` unset and one forcing every
 /// fused op eager, produced the IDENTICAL `kernel_admission_profile`
@@ -1797,11 +1814,10 @@ pub enum DeviceKind {
 /// `dry_run` fn (via [`dry_run_all`]'s own disabled-check, applied
 /// uniformly before any row's own fn runs) stays a PURE function of this
 /// ctx, never a second, independent read of the live process env
-/// mid-computation. `BTreeSet`, not `HashSet`: iteration order is never
-/// read here (membership only), but a `BTreeSet`'s `Debug`/hash-derived
-/// paths (this type derives neither, but a caller building a durable
-/// record from it might) stay deterministic without a caller needing to
-/// sort first.
+/// mid-computation. `HashSet<String>`, matching `disable_decision`'s own
+/// parameter type exactly — the SAME type `disabled_ops` itself returns,
+/// so a caller can thread [`disabled_ops_requested`]'s output straight
+/// through with no collection-type conversion at the boundary.
 #[derive(Debug, Clone)]
 pub struct DryRunCtx {
     pub device_kind: DeviceKind,
@@ -1813,7 +1829,7 @@ pub struct DryRunCtx {
     /// [`disabled_ops_requested`]'s own output, read ONCE at ctx
     /// construction — see this struct's own doc for why this field exists
     /// at all.
-    pub disabled_registry_keys: std::collections::BTreeSet<String>,
+    pub disabled_registry_keys: std::collections::HashSet<String>,
 }
 
 impl DryRunCtx {
@@ -1837,11 +1853,13 @@ impl DryRunCtx {
     /// own `dtype`, is named in `disabled_registry_keys` — the SAME
     /// dtype-narrowing [`ProbedOp::registry_keys_for`] already applies for
     /// resolving the concrete key `admit`/`admit_cascade` would actually
-    /// pass, so this check asks exactly the question a live run's own
-    /// `op_is_disabled` call answers for that op, hermetically.
+    /// pass, and the SAME `disable_decision` predicate `op_is_disabled`
+    /// (the live path) calls, so this asks EXACTLY the question a live
+    /// run answers for that op — including the `"all"` wildcard — never
+    /// a second, narrower re-implementation.
     fn op_is_disabled_here(&self, op: &ProbedOp) -> bool {
         op.registry_keys_for(self.dtype)
-            .any(|key| self.disabled_registry_keys.contains(key))
+            .any(|key| disable_decision(&self.disabled_registry_keys, key))
     }
 }
 
@@ -2066,19 +2084,14 @@ fn dry_run_internal_subkernel(_ctx: &DryRunCtx) -> DryRunVerdict {
     )
 }
 
-/// A private, un-nameable marker type — [`ProbedOp`]'s own sealing field
-/// (see that struct's doc for why). No crate outside `jammi-kernels` can
-/// even WRITE the name `Sealed`, so no OTHER crate can supply a value for
-/// the field it seals, regardless of `#[non_exhaustive]` (which, on its
-/// own, seals struct-literal construction only from OUTSIDE the DEFINING
-/// CRATE — irrelevant here, since a `pub(crate)` field visibility bound
-/// already does that; this type exists for the belt-and-suspenders case
-/// of a caller that copies this struct's OWN field names byte-for-byte
-/// into a look-alike type in another crate and tries to coerce it — Rust
-/// has no structural typing, so that can never actually type-check either,
-/// but the field's PRIVATE type means even naming it in an attempted
-/// literal is a compile error on its own, before visibility is even
-/// checked).
+/// A private, un-nameable marker type — [`ProbedOp`]'s own `_sealed`
+/// field. Belt-and-suspenders alongside that struct's OWN field privacy
+/// (see its doc): a caller that copies `ProbedOp`'s field NAMES
+/// byte-for-byte into a look-alike type in another crate and tries to
+/// coerce it can never actually type-check (Rust has no structural
+/// typing), but this field's PRIVATE type means even naming it in an
+/// attempted literal is a compile error on its own, before visibility of
+/// the OTHER fields is even checked.
 #[derive(Debug, Clone, Copy)]
 struct Sealed;
 
@@ -2087,43 +2100,61 @@ struct Sealed;
 /// `admit_cascade()` call site passes per dtype class, and this row's OWN
 /// deterministic, pre-training dry-run verdict function.
 ///
-/// **Sealed.** Were every field here `pub` with no `#[non_exhaustive]`,
-/// ANY crate (`jammi-encoders`, `jammi-lora`, `jammi-ai`, or a future
-/// one) could construct its OWN `ProbedOp` value with a struct literal and
-/// pass `&that_value` to [`admit`]/[`admit_cascade`], which would honor it
-/// exactly as if it were a real [`PROBED_OPS`] row — invisible to
-/// [`PROBED_OPS`] itself, to [`dry_run_all`], and to
-/// `ci/scripts/perf/test_finetune_ab_disable_op_keys.py`'s eager-disable
-/// sweep, which reads [`PROBED_OPS`] as its own source of truth. That
-/// sweep's own earlier revision deleted its source-text scan on the claim
-/// "the compiler already proves every call site passes a real row" — true
-/// for WHICH CONST a call site names, false for whether a hostile crate
-/// could hand-roll a look-alike value never named in this table at all;
-/// `#[non_exhaustive]` plus `Sealed` (a private field of a private type)
-/// jointly make that impossible from any OTHER crate: `#[non_exhaustive]`
-/// refuses struct-literal syntax and exhaustive matching from outside this
-/// crate; the un-nameable `Sealed` field means even a `..Default::default()`-
-/// style partial-literal attempt (if this type ever derived `Default`,
-/// which it does not, on purpose) could not supply a value for a field it
-/// cannot name. Construction is `pub(crate)` `ProbedOp::new` only — a
-/// same-crate forgery inside `jammi-kernels` itself remains POSSIBLE
-/// (`#[non_exhaustive]`/private-field sealing has no effect within the
-/// defining crate; Rust has no "seal from myself" mechanism), closed
-/// instead by `every_probed_op_construction_is_a_reviewed_probed_ops_row`
-/// (`crates/jammi-kernels/tests/probed_op_construction_sites.rs`), a `syn`
-/// source oracle over this crate's own tree.
+/// **Sealed — two properties, two DIFFERENT mechanisms, proved
+/// separately.** (1) No OTHER crate can CONSTRUCT a fresh `ProbedOp`
+/// value: `#[non_exhaustive]` refuses struct-literal syntax and
+/// exhaustive matching from outside this crate — reproduced directly (a
+/// forged literal in `jammi-encoders` fails with `error[E0639]: cannot
+/// create non-exhaustive struct using struct expression`). (2) No OTHER
+/// crate can MUTATE a field on a `ProbedOp` value it already holds,
+/// including one obtained by copying a real [`PROBED_OPS`] row (`Copy`,
+/// no struct expression involved at all, so `#[non_exhaustive]` alone
+/// never engages): every field is `pub(crate)`, not `pub`, so
+/// `let mut copied = LAYER_NORM; copied.report_key = "forged";` from
+/// another crate is refused with `error[E0616]` naming `report_key` as a
+/// private field of `ProbedOp` — reproduced directly the same way. An
+/// earlier revision sealed ONLY (1) (every field stayed `pub`, relying on
+/// `#[non_exhaustive]` alone) — a probe copied a real row, assigned
+/// `report_key`/`registry`/`dry_run` on the copy, and `admit` honoured
+/// the forged value with no struct expression anywhere for
+/// `#[non_exhaustive]` to refuse. Together, (1) and (2) cover every
+/// OTHER crate: there is no third way to obtain a `ProbedOp` value
+/// without either a struct expression or field access, and both are
+/// blocked. Outside this crate, every field is read through its own
+/// accessor ([`Self::report_key`], [`Self::kind`], [`Self::registry`],
+/// [`Self::dry_run`]) instead.
+///
+/// A same-crate forgery inside `jammi-kernels` itself remains POSSIBLE —
+/// `#[non_exhaustive]`/field-privacy sealing has no effect within the
+/// defining crate; Rust has no "seal from myself" mechanism — closed
+/// instead by `every_probed_op_construction_site_is_reviewed`
+/// (`crates/jammi-kernels/tests/probed_op_construction_sites.rs`), a
+/// `syn` source oracle over this crate's own `src/`/`tests/` trees that
+/// reviews every `ProbedOp::new(...)` call (count-keyed against
+/// [`PROBED_OPS`]), every `ProbedOp { ... }` struct literal, and every
+/// fn whose own return type names `ProbedOp` (both name-keyed against
+/// the one reviewed constructor, `ProbedOp::new` — that file's own
+/// module doc has the full three-direction argument and why a fourth
+/// (mutation from a same-crate `&mut` reference into an existing row)
+/// is not a real vector: every [`PROBED_OPS`] entry is a `const`, never
+/// a `static mut` or interior-mutable cell).
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ProbedOp {
     /// The dtype-NEUTRAL key this op appears under in a durable acceleration
     /// report and in `ci/release-feature-manifest.json`'s capability lists.
-    pub report_key: &'static str,
-    /// How (or whether) this op's dispatch decision can be observed.
-    pub kind: ProbedOpKind,
+    /// `pub(crate)`, not `pub` — read it through [`Self::report_key`]
+    /// outside this crate; see this struct's own "Sealed" doc for why a
+    /// `pub` field is not merely a stylistic choice here.
+    pub(crate) report_key: &'static str,
+    /// How (or whether) this op's dispatch decision can be observed. Read
+    /// it through [`Self::kind`] outside this crate.
+    pub(crate) kind: ProbedOpKind,
     /// `(dtype class, registry key)` — the key the kernel's own call site
     /// passes to [`admit`]/[`admit_cascade`], reused VERBATIM. Empty for a
-    /// [`ProbedOpKind::InternalSubkernel`], which has no key at all.
-    pub registry: &'static [(DtypeClass, &'static str)],
+    /// [`ProbedOpKind::InternalSubkernel`], which has no key at all. Read
+    /// it through [`Self::registry`] outside this crate.
+    pub(crate) registry: &'static [(DtypeClass, &'static str)],
     /// This row's own deterministic, pre-training dry-run verdict function
     /// (#546) — moved onto the row itself so
     /// a new [`PROBED_OPS`] row cannot exist without a `dry_run` fn (a
@@ -2132,22 +2163,26 @@ pub struct ProbedOp {
     /// in `jammi-ai` as a `match report_key { "layer_norm" => ..., ... }` —
     /// a rival enumeration a test could only check was complete at runtime.
     /// `jammi-ai`'s `dry_run_admission_profile`-shaped caller is now
-    /// `PROBED_OPS.iter().map(|op| (op.report_key, (op.dry_run)(ctx)))` —
-    /// no match over `report_key` anywhere in that crate.
-    pub dry_run: fn(&DryRunCtx) -> DryRunVerdict,
+    /// `PROBED_OPS.iter().map(|op| (op.report_key(), (op.dry_run())(ctx)))`
+    /// — no match over `report_key` anywhere in that crate. Read it
+    /// through [`Self::dry_run`] outside this crate.
+    pub(crate) dry_run: fn(&DryRunCtx) -> DryRunVerdict,
     /// [`Sealed`]'s own doc — this struct's doc has the full argument for
     /// why this field exists at all.
     _sealed: Sealed,
 }
 
 impl ProbedOp {
-    /// The ONLY way to build a [`ProbedOp`] — `pub(crate)`, so every
-    /// [`PROBED_OPS`] row (and every `#[cfg(test)]` fixture row in this
-    /// crate's own test modules) constructs through this one function,
-    /// never a struct literal naming [`Sealed`] directly (which would
-    /// still compile, being same-crate, but this keeps ONE construction
-    /// path this crate's own `syn` oracle can name exhaustively, rather
-    /// than two shapes it would have to recognize).
+    /// The ONE reviewed way to build a [`ProbedOp`] — `pub(crate)`, so
+    /// every [`PROBED_OPS`] row (and every `#[cfg(test)]` fixture row in
+    /// this crate's own test modules) constructs through this one
+    /// function. A struct literal naming [`Sealed`] directly still
+    /// compiles, being same-crate (`#[non_exhaustive]`/field-privacy
+    /// sealing has no effect within the defining crate) — the ONE literal
+    /// this fn's own body contains, and the only one this crate's `syn`
+    /// oracle (`crates/jammi-kernels/tests/probed_op_construction_sites.rs`)
+    /// reviews as legitimate; any OTHER struct literal, or any OTHER fn
+    /// whose return type names `ProbedOp`, REDs it.
     const fn new(
         report_key: &'static str,
         kind: ProbedOpKind,
@@ -2161,6 +2196,41 @@ impl ProbedOp {
             dry_run,
             _sealed: Sealed,
         }
+    }
+
+    /// The dtype-NEUTRAL key this op appears under — see the field's own
+    /// doc. Read-only: there is no setter, by design (see this struct's
+    /// own "Sealed" doc — every field is `pub(crate)`, so an OUTSIDE
+    /// crate can neither construct a fresh `ProbedOp` NOR mutate a field
+    /// on one it already holds, including a `Copy`-obtained one; a
+    /// `pub(crate)` field is exactly as invisible to another crate's own
+    /// `foo.report_key = ...` assignment as a fully private one, the
+    /// same compile error either way).
+    pub fn report_key(&self) -> &'static str {
+        self.report_key
+    }
+
+    /// How (or whether) this op's dispatch decision is observable — see
+    /// the field's own doc. Read-only, same rationale as
+    /// [`Self::report_key`].
+    pub fn kind(&self) -> ProbedOpKind {
+        self.kind
+    }
+
+    /// `(dtype class, registry key)` pairs — see the field's own doc.
+    /// Read-only, same rationale as [`Self::report_key`]. Prefer
+    /// [`Self::registry_keys_for`]/[`Self::all_registry_keys`] for the
+    /// common dtype-filtered/every-key reads; this accessor exists for a
+    /// caller that genuinely needs the raw pairs (e.g. an exhaustive
+    /// source oracle proving a row's own shape).
+    pub fn registry(&self) -> &'static [(DtypeClass, &'static str)] {
+        self.registry
+    }
+
+    /// This row's own dry-run verdict function — see the field's own
+    /// doc. Read-only, same rationale as [`Self::report_key`].
+    pub fn dry_run(&self) -> fn(&DryRunCtx) -> DryRunVerdict {
+        self.dry_run
     }
 }
 
@@ -2549,10 +2619,10 @@ mod tests {
             device_kind: DeviceKind::Cpu,
             dtype: DtypeClass::F32,
             encoder_reachable: true,
-            disabled_registry_keys: std::collections::BTreeSet::new(),
+            disabled_registry_keys: std::collections::HashSet::new(),
         };
         let disabled = DryRunCtx {
-            disabled_registry_keys: std::collections::BTreeSet::from([
+            disabled_registry_keys: std::collections::HashSet::from([
                 "layer_norm_fused".to_string()
             ]),
             ..base.clone()
@@ -2600,15 +2670,128 @@ mod tests {
             device_kind: DeviceKind::Cpu,
             dtype: DtypeClass::F32,
             encoder_reachable: true,
-            disabled_registry_keys: std::collections::BTreeSet::new(),
+            disabled_registry_keys: std::collections::HashSet::new(),
         };
         let disabled = DryRunCtx {
-            disabled_registry_keys: std::collections::BTreeSet::from([
+            disabled_registry_keys: std::collections::HashSet::from([
                 "layer_norm_fused".to_string()
             ]),
             ..base.clone()
         };
         assert_ne!(render(&base), render(&disabled));
+    }
+
+    /// The `"all"` wildcard, not just an exact key, must ALSO move the
+    /// profile — closing exactly the bug a bisected earlier revision of
+    /// `DryRunCtx::op_is_disabled_here` reintroduced: it reimplemented
+    /// only the exact-key arm of `op_is_disabled`, so
+    /// `JAMMI_KERNELS_DISABLE=all` rendered a BYTE-IDENTICAL profile to
+    /// an unset run (a `{}` vs `{"all"}` ctx would have hashed the SAME,
+    /// even though a live run under `all` forces every op eager). RED
+    /// (executed, reverted): removing `disable_decision`'s
+    /// `requested.contains("all")` arm — or, equivalently, resurrecting
+    /// the field-level `self.disabled_registry_keys.contains(key)` check
+    /// `op_is_disabled_here` used before this fix — makes this assertion
+    /// fail identically to the exact-key test above.
+    #[test]
+    fn dry_run_all_moves_when_only_the_all_wildcard_is_requested() {
+        let base = DryRunCtx {
+            device_kind: DeviceKind::Cpu,
+            dtype: DtypeClass::F32,
+            encoder_reachable: true,
+            disabled_registry_keys: std::collections::HashSet::new(),
+        };
+        let all_disabled = DryRunCtx {
+            disabled_registry_keys: std::collections::HashSet::from(["all".to_string()]),
+            ..base.clone()
+        };
+        let before = dry_run_all(&base);
+        let after = dry_run_all(&all_disabled);
+        assert_eq!(before["layer_norm"], DryRunVerdict::Holds);
+        assert_eq!(
+            after["layer_norm"],
+            DryRunVerdict::Declines("disabled_by_jammi_kernels_disable"),
+            "the \"all\" wildcard must decline layer_norm exactly as an exact-key request does"
+        );
+        assert_ne!(before, after);
+    }
+
+    /// The enumerating equivalence proof `disable_decision`'s own doc
+    /// claims: the LIVE admission path (`op_is_disabled`) and the DRY
+    /// pre-training path (`DryRunCtx::op_is_disabled_here`, via
+    /// `disable_decision` directly) agree on EVERY `PROBED_OPS` row's own
+    /// registry key(s), under EACH of the three request shapes a real
+    /// `JAMMI_KERNELS_DISABLE` value can take (empty/unset, an exact
+    /// key, and the `"all"` wildcard) — not two hand-picked examples.
+    /// `op_is_disabled`'s own `fired` bookkeeping is irrelevant to its
+    /// RETURN value here (a fresh, empty `fired` lock every call; the
+    /// function's own doc: repeated calls with the SAME `requested`/`op`
+    /// always return the SAME boolean regardless of prior firing), so
+    /// this is a pure equivalence check, not order-dependent.
+    #[test]
+    fn live_op_is_disabled_and_the_dry_predicate_agree_over_every_row_key_and_request_shape() {
+        // Every REAL PROBED_OPS row, every registry key it dispatches
+        // under — never a synthetic fixture op — so this exercises the
+        // ACTUAL production entry point (`DryRunCtx::op_is_disabled_here`
+        // called on a real row), not merely `disable_decision` standalone
+        // (which a regression in `op_is_disabled_here`'s own wiring could
+        // silently stop calling while this test kept passing — the exact
+        // gap a bisection against this fix's own development found: the
+        // wildcard-specific test below caught a reverted
+        // `op_is_disabled_here` that this equivalence check alone did
+        // not, because it called `disable_decision` directly rather than
+        // through the real dry entry point).
+        let mut checked_rows = 0usize;
+        for op in PROBED_OPS {
+            if matches!(op.kind, ProbedOpKind::InternalSubkernel { .. }) {
+                continue;
+            }
+            for &(class, key) in op.registry {
+                let dtype = if class == DtypeClass::Any {
+                    DtypeClass::F32
+                } else {
+                    class
+                };
+                let resolved: Vec<&str> = op.registry_keys_for(dtype).collect();
+                assert_eq!(
+                    resolved,
+                    vec![key],
+                    "fixture assumption: registry_keys_for({dtype:?}) on {} must resolve to \
+                     exactly this entry's own key {key:?}, got {resolved:?}",
+                    op.report_key
+                );
+                checked_rows += 1;
+
+                let shapes: [(&str, HashSet<String>); 3] = [
+                    ("empty", HashSet::new()),
+                    ("exact", HashSet::from([key.to_string()])),
+                    ("all", HashSet::from(["all".to_string()])),
+                ];
+                for (shape_name, requested) in shapes {
+                    let fired = RwLock::new(HashSet::new());
+                    let live = op_is_disabled(&requested, &fired, key);
+                    let ctx = DryRunCtx {
+                        device_kind: DeviceKind::Cpu,
+                        dtype,
+                        encoder_reachable: true,
+                        disabled_registry_keys: requested,
+                    };
+                    let dry = ctx.op_is_disabled_here(op);
+                    assert_eq!(
+                        live, dry,
+                        "op_is_disabled (live) and DryRunCtx::op_is_disabled_here (dry) \
+                         disagree for {}'s key={key:?} under the {shape_name:?} request shape: \
+                         live={live}, dry={dry}",
+                        op.report_key
+                    );
+                }
+            }
+        }
+        assert!(
+            checked_rows > 0,
+            "fixture assumption: PROBED_OPS has at least one non-InternalSubkernel row with a \
+             registry key to check"
+        );
     }
 
     macro_rules! test_two_arm {

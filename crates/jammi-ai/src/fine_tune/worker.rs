@@ -9009,11 +9009,11 @@ fn probed_report_keys(
 ) -> Vec<(&'static str, &'static str)> {
     jammi_kernels::admission::PROBED_OPS
         .iter()
-        .filter(|op| op.kind == jammi_kernels::admission::ProbedOpKind::TwoArm)
+        .filter(|op| op.kind() == jammi_kernels::admission::ProbedOpKind::TwoArm)
         .filter_map(|op| {
             op.registry_keys_for(dtype)
                 .next()
-                .map(|key| (op.report_key, key))
+                .map(|key| (op.report_key(), key))
         })
         .collect()
 }
@@ -10709,11 +10709,11 @@ mod tests {
             .iter()
             .filter(|op| {
                 !matches!(
-                    op.kind,
+                    op.kind(),
                     jammi_kernels::admission::ProbedOpKind::InternalSubkernel { .. }
                 )
             })
-            .map(|op| op.report_key)
+            .map(|op| op.report_key())
             .collect();
         want.sort_unstable();
         assert_eq!(
@@ -10792,8 +10792,8 @@ mod tests {
     /// #546's own literally-named defect, closed: two contexts differing
     /// ONLY in a build feature (`CUDA_COMPILED` here, standing in for
     /// `--features cuda`/`flash-attn`, driven hermetically by feeding
-    /// `ATTENTION_BLOCK_FLASH.dry_run` the feature constant directly rather
-    /// than an actual two-build CI matrix) move `attention_block_flash`'s
+    /// `ATTENTION_BLOCK_FLASH.dry_run()` the feature constant directly
+    /// rather than an actual two-build CI matrix) move `attention_block_flash`'s
     /// verdict, and therefore the whole profile string.
     #[test]
     fn attention_block_flash_verdict_moves_with_cuda_compiled() {
@@ -10805,12 +10805,12 @@ mod tests {
         };
         // On THIS build (no `cuda` feature), a `Cuda`-kind context still
         // resolves `device_supported() == false` inside
-        // `ATTENTION_BLOCK_FLASH.dry_run`'s FIRST gate
+        // `ATTENTION_BLOCK_FLASH.dry_run()`'s FIRST gate
         // (`!jammi_kernels::admission::CUDA_COMPILED`), so the verdict names
         // that gate — never silently falls through to the flash-specific
         // gates below it.
         assert_eq!(
-            (jammi_kernels::admission::ATTENTION_BLOCK_FLASH.dry_run)(&ctx_no_cuda),
+            (jammi_kernels::admission::ATTENTION_BLOCK_FLASH.dry_run())(&ctx_no_cuda),
             jammi_kernels::admission::DryRunVerdict::Declines("cuda_not_compiled")
         );
     }

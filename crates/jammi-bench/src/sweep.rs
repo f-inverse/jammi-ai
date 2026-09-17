@@ -234,7 +234,10 @@ pub async fn run(
             if precision.needs_rescore() {
                 retrieve_then_rescore(&loaded, q, k, oversample.max(1))
             } else {
-                loaded.search(&validate_query(q.to_vec(), None, QuerySource::Caller)?, k)
+                loaded.search(
+                    &validate_query(q.to_vec(), Some(loaded.dimensions()), QuerySource::Caller)?,
+                    k,
+                )
             }
         })?;
         precision_sweep.push(PrecisionSweepPoint {
@@ -272,7 +275,10 @@ fn recall_and_qps(
     exact: &[Vec<(String, f32)>],
 ) -> Result<(BTreeMap<usize, Measurement>, f64), Box<dyn std::error::Error>> {
     recall_and_qps_with(queries, exact, |q, k| {
-        index.search(&validate_query(q.to_vec(), None, QuerySource::Caller)?, k)
+        index.search(
+            &validate_query(q.to_vec(), Some(index.dimensions()), QuerySource::Caller)?,
+            k,
+        )
     })
 }
 

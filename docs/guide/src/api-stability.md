@@ -258,15 +258,20 @@ against the crate list above, not assumed.
   which carries no `QuerySource` at all — a mismatch it finds is always
   attributed to the named artifact, never the caller, because by the time a
   query reaches any consumer an entry has already checked it once against an
-  authority it had in hand. THREE call sites still attribute by the query's
-  own provenance (the placement entry's all-remote shape, the placement
-  entry's all-local shape against the set's own first segment, and
-  `exact_vector_search`'s no-catalog-width fallback — round 8 closed the
-  all-local gap, where the same deferral the other two already performed
-  had never run), each checking a query with no width in hand against the
-  only authority available to that call; all three use the new
+  authority it had in hand. FOUR call sites still attribute by the query's
+  own provenance (the placement entry's Mixed shape — one call site
+  covering both the all-remote branch and the branch with at least one
+  resident local segment — the placement entry's all-local shape,
+  `exact_vector_search`'s no-catalog-width fallback, and
+  `ResultStore::search_vectors_local`'s `Some(index)` branch, the
+  FORCE-LOCAL twin of the all-local shape), each checking a query with no
+  width in hand against the only authority available to that call; all
+  four use the new
   `ValidatedQuery::require_authority_width` instead, which keeps the OLD
   `require_width` behaviour under a name that says why it is different.
+  (Re-derive this count with
+  `grep -rn 'require_authority_width(' crates/*/src | grep -v query.rs`
+  rather than trusting this sentence.)
   `QuerySource::source()` on `QueryValidationError` now returns
   `Option<&QuerySource>` (`None` for `ArtifactMismatch`) rather than
   `&QuerySource` unconditionally. (DIST round 6/7 shipped a third

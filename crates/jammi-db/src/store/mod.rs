@@ -2558,6 +2558,24 @@ impl ResultStore {
         match self.resolve_search_mode_local(table).await? {
             Some(index) => {
                 let oversample = self.ann.resolve_oversample(None, table.oversample);
+                // The authority this call checks against is a catalog width
+                // when the table has one, and this loaded index's own width
+                // otherwise — exactly `search_final_placed`'s AllLocal arm's
+                // resolution (`placed.rs`), one layer up: this is that arm's
+                // FORCE-LOCAL twin, going straight to `SegmentedIndex::
+                // search_final` rather than through `PlacedIndex`, checked
+                // unconditionally the same way regardless of which authority
+                // it resolves to. With a catalog width on record this
+                // re-checks what the caller's own construction-time check
+                // (`QueryBuilder::new`'s Caller arm, the eval runner's
+                // per-query entry) already verified — redundant for a
+                // Caller-provenance query but not for a Stored-provenance one
+                // (the documented construction-time exception,
+                // `jammi_numerics::query`'s module doc), which defers even
+                // with an authority in hand; without a catalog width, nothing
+                // upstream ever had an authority to check against at all.
+                let authority = catalog_width(table).unwrap_or_else(|| index.dimensions());
+                query.require_authority_width(authority)?;
                 index.search_final(query, k, oversample)
             }
             None => {

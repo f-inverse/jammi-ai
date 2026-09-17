@@ -4767,6 +4767,15 @@ impl TrainingLoop {
             &self.job_id,
             &bundle,
         ))?;
+        // #527/#567/#578: the earliest instant a test may observe
+        // `fetch_resume_checkpoint` return `Some` for this job — fired only
+        // AFTER the durable write above has actually landed, never on a
+        // wall-clock guess at when one epoch's write might have completed.
+        #[cfg(feature = "test-hooks")]
+        crate::fine_tune::worker::loop_test_hooks::fire_observed(
+            &self.job_id,
+            crate::fine_tune::worker::loop_test_hooks::Event::ResumeCheckpointWritten,
+        );
         Ok(())
     }
 

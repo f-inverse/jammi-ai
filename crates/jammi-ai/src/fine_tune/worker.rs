@@ -5165,6 +5165,95 @@ pub mod loop_test_hooks {
             armed.notify.notify_one();
         }
     }
+
+    /// A discrete, test-observable moment on ONE job's attempt — never a
+    /// poll tick, never a wall-clock guess at when one MIGHT have happened.
+    /// Generalises [`Rendezvous`]'s notify-only shape (never blocks the
+    /// producer, unlike [`ParkPoint`]/[`arm`]) over an ENUM keyed by
+    /// `job_id` instead of `instance_id`, so a new observable site extends
+    /// this ONE `arm_observed`/`fire_observed` pair rather than growing a
+    /// bespoke pair of its own (#527/#567/#578: a `timeout`/deadline-loop
+    /// bound that races a training-progress event's real cadence, rather
+    /// than observing the event itself, is the flake class this closes).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Event {
+        /// [`spawn_cancel_request_watcher`] has just read
+        /// `cancel_requested = true` off the row and flipped
+        /// `cancel_requested_seen` — never merely "a poll tick happened" (a
+        /// tick that reads `false` does not fire this).
+        CancelObserved,
+        /// The training loop has just written a durable resume checkpoint
+        /// (`TrainingLoop::save_resume_checkpoint`'s `put_resume_checkpoint`
+        /// call returned `Ok`) for `job_id` — the earliest instant a test
+        /// may observe `fetch_resume_checkpoint` return `Some` for it.
+        ResumeCheckpointWritten,
+    }
+
+    struct ArmedEvent {
+        job_id: String,
+        which: Event,
+        fired: Arc<AtomicBool>,
+        notify: Arc<Notify>,
+    }
+
+    fn events() -> &'static Mutex<Vec<ArmedEvent>> {
+        static ARMED: OnceLock<Mutex<Vec<ArmedEvent>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// The test's side of an armed job event.
+    pub struct Observed {
+        fired: Arc<AtomicBool>,
+        notify: Arc<Notify>,
+    }
+
+    impl Observed {
+        /// Resolve once the event has fired. A test bounds this call with
+        /// its OWN generous backstop — this method itself never times out.
+        pub async fn wait_fired(&self) {
+            while !self.fired.load(Ordering::SeqCst) {
+                self.notify.notified().await;
+            }
+        }
+    }
+
+    /// Arm `which` for the next occurrence on `job_id`. One-shot; keyed so
+    /// sibling tests in one binary never fire each other's.
+    pub fn arm_observed(job_id: &str, which: Event) -> Observed {
+        let fired = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(Notify::new());
+        events()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(ArmedEvent {
+                job_id: job_id.to_string(),
+                which,
+                fired: Arc::clone(&fired),
+                notify: Arc::clone(&notify),
+            });
+        Observed { fired, notify }
+    }
+
+    /// Fire every handle armed for (`job_id`, `which`). Never parks, never
+    /// blocks the caller — the opposite contract from [`maybe_park`]:
+    /// firing is a notification, not a rendezvous the producer waits on.
+    /// `pub(crate)` (not `pub(super)`): [`crate::fine_tune::trainer`] is a
+    /// SIBLING module of `worker`, not a descendant, and is the only other
+    /// caller ([`Event::ResumeCheckpointWritten`]'s fire point).
+    pub(crate) fn fire_observed(job_id: &str, which: Event) {
+        let taken: Vec<ArmedEvent> = {
+            let mut list = events().lock().unwrap_or_else(PoisonError::into_inner);
+            let (hit, rest): (Vec<_>, Vec<_>) = list
+                .drain(..)
+                .partition(|a| a.which == which && a.job_id == job_id);
+            *list = rest;
+            hit
+        };
+        for armed in taken {
+            armed.fired.store(true, Ordering::SeqCst);
+            armed.notify.notify_one();
+        }
+    }
 }
 
 /// The reconstructed inputs for a LoRA fine-tune run — the per-kind data
@@ -7108,6 +7197,8 @@ fn spawn_cancel_request_watcher(
                 Ok(record) if record.cancel_requested => {
                     cancel_requested_seen.store(true, Ordering::SeqCst);
                     cancel.store(true, Ordering::SeqCst);
+                    #[cfg(feature = "test-hooks")]
+                    loop_test_hooks::fire_observed(&job_id, loop_test_hooks::Event::CancelObserved);
                     return;
                 }
                 Ok(_) => {}

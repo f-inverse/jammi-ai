@@ -369,9 +369,17 @@ cat > "$ESC082_BIN/git" <<'GITSTUB'
 case "$1" in
   clone)
     dest="${@: -1}"
-    mkdir -p "$dest"
-    cp -r "${ESC082_REAL_ROOT:?unset}/ci" "$dest/ci"
-    cp -r "$ESC082_REAL_ROOT/crates" "$dest/crates"
+    # The stub writes ONLY inside the sandbox: resolve the clone target and
+    # refuse anything else by name (a clone target relative to an unknown
+    # working directory once wrote a tree mirror into the real checkout).
+    dest_abs="$(cd "$(dirname "$dest")" 2>/dev/null && pwd)/$(basename "$dest")"
+    case "$dest_abs" in
+      "${ESC082_WORKDIR:?unset}"/*) ;;
+      *) echo "esc-082 git stub: refusing to clone outside the sandbox: ${dest_abs}" >&2; exit 97 ;;
+    esac
+    mkdir -p "$dest_abs"
+    cp -r "${ESC082_REAL_ROOT:?unset}/ci" "$dest_abs/ci"
+    cp -r "$ESC082_REAL_ROOT/crates" "$dest_abs/crates"
     ;;
   rev-parse) echo "0000000000000000000000000000000000000000" ;;
   *) : ;;
@@ -381,17 +389,19 @@ GITSTUB
 chmod +x "$ESC082_BIN/git"
 
 # Extracts the heredoc's literal body (between `<<REMOTE` and the closing
-# `REMOTE`), substitutes the ONE sandbox-workdir adaptation, and writes it
-# as a runnable script -- never a hand-copied re-transcription of the
-# script's own logic.
+# `REMOTE`) and writes it as a runnable script UNMODIFIED -- never a
+# hand-copied re-transcription of the script's own logic and never a text
+# patch of it. The sandbox comes in through the driver's own parameter:
+# RP_REMOTE_ROOT (runpod_lib.sh) roots the remote checkout, and the
+# fixture re-renders REMOTE_CHECKOUT_LINES through the real helper with
+# that root before the heredoc is expanded.
 esc082_extract_heredoc() {
   local out="$1"
   local start end
   start="$(grep -n '<<REMOTE' "$PROVE_SH" | head -1 | cut -d: -f1)"
   end="$(grep -n '^REMOTE$' "$PROVE_SH" | head -1 | cut -d: -f1)"
   local raw_text
-  raw_text="$(sed -n "$((start + 1)),$((end - 1))p" "$PROVE_SH" \
-    | sed 's#^cd /root && rm -rf jammi-ai#cd "$ESC082_WORKDIR" \&\& rm -rf jammi-ai#')"
+  raw_text="$(sed -n "$((start + 1)),$((end - 1))p" "$PROVE_SH")"
   # Two-phase expansion, mirroring what actually happens on the wire: phase
   # 1 (this `eval`) reproduces the LOCAL/CI-runner's own UNQUOTED-heredoc
   # construction -- `\$`/`` \` ``/`\\` de-escaped, `${NATIVE_COMPUTE_CAP}`/
@@ -429,6 +439,8 @@ esc082_run() {
   # run time below, so exporting them only on that later line would be too
   # late for the `${...}` references the extraction step must resolve.
   export NATIVE_COMPUTE_CAP=80 GIT_REF=test-ref GIT_REPO=unused ESC082_WORKDIR="$workdir"
+  export RP_REMOTE_ROOT="$workdir"
+  REMOTE_CHECKOUT_LINES="$(rp_remote_checkout_lines "$GIT_REF" "$GIT_REPO")"
   esc082_extract_heredoc "$script"
   env PATH="$ESC082_BIN:$PATH" \
     ESC082_FAIL_MATCH="$fail_match" \

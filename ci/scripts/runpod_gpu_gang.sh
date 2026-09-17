@@ -127,6 +127,11 @@ source "$DIR/runpod_lib.sh"
 
 GIT_REPO="${GIT_REPO:-https://github.com/${GITHUB_REPOSITORY:-f-inverse/jammi-ai}.git}"
 GIT_REF="${GIT_REF:-${GITHUB_SHA:-main}}"
+# The remote checkout text, computed at source time (beside NATIVE_COMPUTE_CAP)
+# so a fixture that sources this file and renders the heredoc sees it: the
+# exact commit when PROVE_EXPECT_SHA is set, else the ref (runpod_lib.sh's
+# rp_remote_checkout_lines — one helper for every leg).
+REMOTE_CHECKOUT_LINES="$(rp_remote_checkout_lines "${GIT_REF}" "${GIT_REPO}")"
 
 # sm_80 is the gang leg's device: the plan's own 2xA100 pod-leg oracles, and
 # the only arch S4 measured multi-GPU capacity for. NATIVE_COMPUTE_CAP
@@ -150,7 +155,7 @@ GANG_TEST_FILTER="${GANG_TEST_FILTER:-gang_}"
 # that backstops that contract ships with the cluster leg
 # (docs/plans/67-distributed-training/UNITS.md § U7b acceptance (id-secrecy)), beside the crossing
 # it protects; this driver mints/ships no id today.
-GANG_REMOTE_ARTIFACT_DIR="/root/jammi-ai/.gang-artifact"
+GANG_REMOTE_ARTIFACT_DIR="${RP_REMOTE_ROOT}/jammi-ai/.gang-artifact"
 GANG_ARTIFACT_DIR="${GANG_ARTIFACT_DIR:-.gpu-pull/gpu-gang}"
 
 # The gating groups this driver's own pass/fail rule reads `PROVE_GROUP_RC`
@@ -291,9 +296,7 @@ if [ "\${compute_cap_norm}" != "\${CUDA_COMPUTE_CAP:-}" ]; then
   exit 97
 fi
 echo "::endgroup::"
-cd /root && rm -rf jammi-ai
-git clone --depth 1 -b "${GIT_REF}" "${GIT_REPO}" jammi-ai 2>&1 | tail -1
-cd jammi-ai
+${REMOTE_CHECKOUT_LINES}
 # The artifact registry's rule (k) checks ANCESTRY on the pod: the pod-leg
 # producer's own shape oracles (gang_pod_leg::synthetic_artifact_tests) run the
 # checker against a written artifact, and the checker asks git whether the

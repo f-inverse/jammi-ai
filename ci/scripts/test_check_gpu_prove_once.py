@@ -801,6 +801,13 @@ rp_sweep() { echo sweeping; }
 rp_cluster_create() { # $1=gpuTypeId $2=optional dataCenterIds
   echo "{}"
 }
+# F9 (plan #500 twopods): the THIRD renting root -- the pods transport's own
+# REST v2 `POST /v2/pods` entrypoint, with no internal caller of its own
+# (real runpod_lib.sh shape, same as rp_cluster_create above). Deliberately
+# payload-free.
+rp_two_host_pod_create() { # $1=gpuTypeId $2=dataCenterId $3=rank
+  echo "{}"
+}
 """
 
 # A one-line wrapper added to the library: the RED case for "the closure is
@@ -830,10 +837,15 @@ def fixture_scripts() -> dict[str, str]:
         "ci/scripts/runpod_gpu_howwell.sh": _driver("rp_deploy_live_a100"),
         "ci/scripts/gpu-dev.sh": _driver("rp_deploy_arch \"$ARCH\""),
         "ci/scripts/test_pod_substrate.sh": _driver("rp_deploy_live \"SECURE|X\""),
-        # The cluster leg's own row -- calls the SECOND root, `rp_cluster_
-        # create`, directly (there is no wrapper the way `_rp_deploy_payload`
-        # has `rp_deploy_arch`/`rp_deploy_live`).
-        "ci/scripts/runpod_gpu_cluster.sh": _driver('rp_cluster_create "NVIDIA A100-SXM4-80GB"'),
+        # The cluster leg's own row -- calls BOTH the second root
+        # (`rp_cluster_create`, the `cluster` transport) and the third
+        # (`rp_two_host_pod_create`, the `pods` transport) directly (there
+        # is no wrapper the way `_rp_deploy_payload` has
+        # `rp_deploy_arch`/`rp_deploy_live`).
+        "ci/scripts/runpod_gpu_cluster.sh": _driver(
+            'rp_cluster_create "NVIDIA A100-SXM4-80GB"\n'
+            'rp_two_host_pod_create "NVIDIA A100-SXM4-80GB" "dc-a" 0'
+        ),
         # A tracked script that calls NOTHING in the closure: the derivation
         # must not sweep the whole directory in.
         "ci/scripts/check_something.py": "print('no deploy here')\n",
@@ -893,14 +905,15 @@ class DerivedRentingDriverTest(unittest.TestCase):
         closure, findings = cgo.derive_deploy_closure(FIXTURE_LIB)
         self.assertEqual(findings, [])
         # F9: the closure is each RENTING_ROOTS entry's transitive callers
-        # PLUS the roots themselves -- `rp_cluster_create` has no caller of
-        # its own in this fixture (matching the real library), so it
-        # contributes only itself.
+        # PLUS the roots themselves -- `rp_cluster_create`/`rp_two_host_
+        # pod_create` have no caller of their own in this fixture (matching
+        # the real library), so each contributes only itself.
         self.assertEqual(
             set(closure),
             {
                 "_rp_deploy_payload",
                 "rp_cluster_create",
+                "rp_two_host_pod_create",
                 "rp_deploy_live",
                 "rp_deploy_arch",
                 "rp_deploy_live_a100",
@@ -938,7 +951,8 @@ class DerivedRentingDriverTest(unittest.TestCase):
     def test_a_library_nothing_calls_the_payload_builder_from_fails_closed(self):
         _closure, findings = cgo.derive_deploy_closure(
             "#!/usr/bin/env bash\n_rp_deploy_payload() { echo '{}'; }\n"
-            "rp_cluster_create() { echo '{}'; }\nrp_init() { :; }\n"
+            "rp_cluster_create() { echo '{}'; }\n"
+            "rp_two_host_pod_create() { echo '{}'; }\nrp_init() { :; }\n"
         )
         self.assertTrue(any("carries no CALLERS" in f for f in findings), findings)
 
@@ -1296,7 +1310,7 @@ class DerivedRentingDriverTest(unittest.TestCase):
         scripts = cgo.load_script_texts()
         closure, findings = cgo.derive_deploy_closure(scripts[cgo.RUNPOD_LIB_REL])
         self.assertEqual(findings, [])
-        # F9: both RENTING_ROOTS are now members of the closure (a root is
+        # F9: all three RENTING_ROOTS are members of the closure (a root is
         # a member of its own matched set), alongside `_rp_deploy_payload`'s
         # own real transitive callers.
         self.assertEqual(
@@ -1304,6 +1318,7 @@ class DerivedRentingDriverTest(unittest.TestCase):
             {
                 "_rp_deploy_payload",
                 "rp_cluster_create",
+                "rp_two_host_pod_create",
                 "rp_deploy_live",
                 "rp_deploy_arch",
                 "rp_deploy_live_a100",

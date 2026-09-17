@@ -61,6 +61,13 @@ trap 'rm -rf "$SANDBOX"' EXIT
 # own env at source time, hence the dummy key.
 # --------------------------------------------------------------------------
 export RUNPOD_API_KEY="test-dummy-key"
+# P1: every EXISTING case below (unmodified) exercises the `cluster`
+# transport exactly as it always did -- the pods transport's own default
+# (RP_TWO_HOST_TRANSPORT unset -> "pods") never reaches any assertion
+# above this line. Exported so every `bash -c 'source ...'` subshell below
+# inherits it identically. The pods-transport's OWN fixtures (bottom of
+# this file) override it locally, per-invocation.
+export RP_TWO_HOST_TRANSPORT="cluster"
 
 NETPROBE_BIN="$SANDBOX/netprobe-bin"
 mkdir -p "$NETPROBE_BIN"
@@ -83,6 +90,32 @@ if [ "${netprobe_calls:-0}" -eq 0 ]; then
   ok "G0: sourcing runpod_gpu_cluster.sh invoked NO curl/ssh/scp/rsync/runpodctl (counted through a PATH shim, not assumed) — the sourced-execution guard really does cover the create/wait/pull path"
 else
   bad "G0: sourcing runpod_gpu_cluster.sh invoked ${netprobe_calls} external call(s): $(tr '\n' '; ' <"$NETPROBE_LOG") — the sourced-execution guard no longer covers the rent path, and this suite would spend money"
+fi
+
+if declare -f rp_cluster_rank_verdict >/dev/null \
+  && declare -f rp_cluster_verdict >/dev/null \
+  && declare -f _rpc_remote_script >/dev/null \
+  && declare -f _rpc_check_readback >/dev/null \
+  && declare -f _rpc_wait_for_members_ready >/dev/null \
+  && declare -f _rpc_id_file_ready >/dev/null \
+  && declare -f _rpc_ens1_seen >/dev/null \
+  && declare -f _rpc_run_id_secrecy_scan >/dev/null \
+  && declare -f _rpc_assemble_gang_artifact >/dev/null \
+  && declare -f _rpc_self_remove_status >/dev/null \
+  && declare -f _rpc_scan_or_destroy >/dev/null \
+  && declare -f _rpc_cleanup_cluster >/dev/null \
+  && declare -f _rpc_parse_global_network_datacenters >/dev/null \
+  && declare -f _rpc_intersect_data_centers >/dev/null \
+  && declare -f _rpc_check_pods_readback >/dev/null \
+  && declare -f _rpc_wait_for_two_host_pods_ready >/dev/null \
+  && declare -f _rpc_two_host_iface_lines >/dev/null \
+  && declare -f _rpc_parse_derived_iface >/dev/null \
+  && declare -f _rpc_net_iface_seen >/dev/null \
+  && declare -f rp_two_host_pod_create >/dev/null \
+  && declare -f rp_pod_get >/dev/null; then
+  ok "P9: sourcing runpod_gpu_cluster.sh (no network) defines every pods-transport _rpc_* helper too (rp_two_host_pod_create/rp_pod_get come from runpod_lib.sh)"
+else
+  bad "P9: one or more pods-transport helpers are not defined after sourcing"
 fi
 
 if declare -f rp_cluster_rank_verdict >/dev/null \
@@ -477,10 +510,15 @@ for sig in TERM HUP; do
 done
 
 f1_sig_lines="$(grep -nE "^trap _rpc_cleanup_cluster EXIT\$|^trap '_rpc_cleanup_cluster 129' HUP\$|^trap '_rpc_cleanup_cluster 130' INT\$|^trap '_rpc_cleanup_cluster 143' TERM\$" "$CLUSTER_SH")"
-if [ "$(printf '%s\n' "$f1_sig_lines" | wc -l | tr -d ' ')" = "4" ]; then
-  ok "F1: all four trap registrations (EXIT, HUP, INT, TERM) are present verbatim in the committed driver — INT's own dynamic delivery is unreliable across environments without a real controlling terminal (above), so this property is checked statically, over the committed TEXT, never dynamically for this one signal"
+# P1: the pods transport (added by this unit) registers the SAME 4-line
+# trap pattern for its OWN create/wait/build flow, before the FIRST create
+# call, exactly as the cluster branch already does -- 8 lines total (4 per
+# branch), never 4 (the cluster path's own count is UNCHANGED; this is an
+# addition, not a mutation of it).
+if [ "$(printf '%s\n' "$f1_sig_lines" | wc -l | tr -d ' ')" = "8" ]; then
+  ok "F1: all four trap registrations (EXIT, HUP, INT, TERM) are present verbatim TWICE (once per transport branch, 8 lines total) in the committed driver — INT's own dynamic delivery is unreliable across environments without a real controlling terminal (above), so this property is checked statically, over the committed TEXT, never dynamically for this one signal"
 else
-  bad "F1: expected exactly 4 trap registration lines (EXIT/HUP/INT/TERM); got: $f1_sig_lines"
+  bad "F1: expected exactly 8 trap registration lines (4 per transport branch); got: $f1_sig_lines"
 fi
 
 # ============================================================================
@@ -1194,8 +1232,8 @@ else
 fi
 if grep -q 'if \[ -z "\$NATIVE_COMPUTE_CAP" \]; then' "$CLUSTER_SH" \
   && awk '/-z "\$NATIVE_COMPUTE_CAP"/{f=1} f && /exit 2/{print "refuses"; exit}' "$CLUSTER_SH" | grep -q refuses \
-  && [ "$(grep -n 'if \[ -z "\$NATIVE_COMPUTE_CAP" \]; then' "$CLUSTER_SH" | cut -d: -f1)" -lt "$(grep -n '_rpc_phase "availability read' "$CLUSTER_SH" | cut -d: -f1)" ]; then
-  ok "A3: the empty-cap refusal (exit 2) sits BEFORE phase 0's availability read -- nothing is rented on an out-of-domain id"
+  && [ "$(grep -n 'if \[ -z "\$NATIVE_COMPUTE_CAP" \]; then' "$CLUSTER_SH" | cut -d: -f1)" -lt "$(grep -n '_rpc_phase "availability read' "$CLUSTER_SH" | head -1 | cut -d: -f1)" ]; then
+  ok "A3: the empty-cap refusal (exit 2) sits BEFORE phase 0's availability read -- nothing is rented on an out-of-domain id (either transport)"
 else
   bad "A3: the empty-cap refusal is missing or sits after phase 0"
 fi
@@ -1363,7 +1401,7 @@ sys.exit(1 if failures else 0)
 write_rank_report "$assemble_dir/r0.json" 0 "host-a" "ens1" pass "$DIGEST_A" 0
 write_rank_report "$assemble_dir/r1.json" 1 "host-b" "ens1" pass "$DIGEST_A" 0
 out_happy="$assemble_dir/gang-happy.json"
-_rpc_assemble_gang_artifact "$assemble_dir/r0.json" "$assemble_dir/r1.json" deadbeef "a100-sxm4-cluster" "$out_happy" 2 1 1
+_rpc_assemble_gang_artifact "$assemble_dir/r0.json" "$assemble_dir/r1.json" deadbeef "a100-sxm4-cluster" "$out_happy" 2 1 1 "instant-cluster"
 rc=$?
 if [ "$rc" -eq 0 ] && [ -f "$out_happy" ]; then
   ok "P-D: happy-path assembly succeeds with the measured pod_count=2/gpu_count_per_pod=1 threaded in"
@@ -1381,7 +1419,7 @@ fi
 # literals are gone, and the checker then refuses it against the SAME
 # 2-rank reports (the cross-field check is falsifiable, not a tautology).
 out_38="$assemble_dir/gang-3x8.json"
-_rpc_assemble_gang_artifact "$assemble_dir/r0.json" "$assemble_dir/r1.json" deadbeef "a100-sxm4-cluster" "$out_38" 3 8 1
+_rpc_assemble_gang_artifact "$assemble_dir/r0.json" "$assemble_dir/r1.json" deadbeef "a100-sxm4-cluster" "$out_38" 3 8 1 "instant-cluster"
 rc=$?
 if [ "$rc" -eq 0 ]; then
   ok "P-C: the assembler accepts a driver-supplied 3x8 shape without hardcoding pod_count/gpu_count_per_pod"
@@ -1413,7 +1451,7 @@ fi
 write_rank_report "$assemble_dir/ruh0.json" 0 "unknown" "ens1" pass "$DIGEST_A" 0
 write_rank_report "$assemble_dir/ruh1.json" 1 "host-b" "ens1" pass "$DIGEST_A" 0
 out_uh="$assemble_dir/gang-unknown-host.json"
-_rpc_assemble_gang_artifact "$assemble_dir/ruh0.json" "$assemble_dir/ruh1.json" deadbeef box "$out_uh" 2 1 1
+_rpc_assemble_gang_artifact "$assemble_dir/ruh0.json" "$assemble_dir/ruh1.json" deadbeef box "$out_uh" 2 1 1 "instant-cluster"
 rc=$?
 if [ "$rc" -ne 0 ] && [ ! -f "$out_uh" ]; then
   ok "P-D: an unresolved (\"unknown\") rank hostname REFUSES assembly, no artifact written"
@@ -1425,7 +1463,7 @@ fi
 write_rank_report "$assemble_dir/rui0.json" 0 "host-a" "unknown" pass "$DIGEST_A" 0
 write_rank_report "$assemble_dir/rui1.json" 1 "host-b" "ens1" pass "$DIGEST_A" 0
 out_ui="$assemble_dir/gang-unknown-iface.json"
-_rpc_assemble_gang_artifact "$assemble_dir/rui0.json" "$assemble_dir/rui1.json" deadbeef box "$out_ui" 2 1 1
+_rpc_assemble_gang_artifact "$assemble_dir/rui0.json" "$assemble_dir/rui1.json" deadbeef box "$out_ui" 2 1 1 "instant-cluster"
 rc=$?
 if [ "$rc" -ne 0 ] && [ ! -f "$out_ui" ]; then
   ok "P-D: an unresolved (\"unknown\") rank iface REFUSES assembly, no artifact written"
@@ -1438,7 +1476,7 @@ fi
 write_rank_report "$assemble_dir/rrh0.json" 0 "Host-A" "ens1" pass "$DIGEST_A" 0
 write_rank_report "$assemble_dir/rrh1.json" 1 "host-a" "ens1" pass "$DIGEST_A" 0
 out_rh="$assemble_dir/gang-repeated-host.json"
-_rpc_assemble_gang_artifact "$assemble_dir/rrh0.json" "$assemble_dir/rrh1.json" deadbeef box "$out_rh" 2 1 1
+_rpc_assemble_gang_artifact "$assemble_dir/rrh0.json" "$assemble_dir/rrh1.json" deadbeef box "$out_rh" 2 1 1 "instant-cluster"
 rc=$?
 if [ "$rc" -ne 0 ] && [ ! -f "$out_rh" ]; then
   ok "P-D: two ranks reporting the SAME host case-insensitively (Host-A vs host-a) REFUSES assembly"
@@ -1452,7 +1490,7 @@ fi
 write_rank_report "$assemble_dir/rd0.json" 0 "host-a" "ens1" pass "$DIGEST_A" 0
 write_rank_report "$assemble_dir/rd1.json" 1 "host-b" "ens1" pass "$DIGEST_B" 0
 out_dm="$assemble_dir/gang-digest-mismatch.json"
-_rpc_assemble_gang_artifact "$assemble_dir/rd0.json" "$assemble_dir/rd1.json" deadbeef box "$out_dm" 2 1 1
+_rpc_assemble_gang_artifact "$assemble_dir/rd0.json" "$assemble_dir/rd1.json" deadbeef box "$out_dm" 2 1 1 "instant-cluster"
 rc=$?
 verdict_f="$(python3 -c "import json; print(json.load(open('$out_dm'))['gang']['verdict'])" 2>/dev/null)"
 if [ "$rc" -eq 0 ] && [ "$verdict_f" = "fail" ]; then
@@ -1551,6 +1589,47 @@ else
 fi
 
 # ============================================================================
+# P6: the pods-transport cost bound is what the MECHANISM produces too --
+# S4's measured SECURE POD rate ($1.59/GPU/h, the catalog's own figure,
+# never the cluster's separate $1.908/GPU/h), re-derived the SAME way G4
+# already re-derives the cluster figures: (i) terminate-succeeds, (ii)
+# sweep-only (the ordinary pod sweep's own 6-hourly gpu-reap.yml schedule
+# -- the SAME cadence the cluster sweep uses, re-read from the committed
+# workflow rather than assumed).
+# ============================================================================
+POD_RATE_USD_PER_GPU_HOUR=1.59
+GPU_REAP_YML="$REPO_ROOT/.github/workflows/gpu-reap.yml"
+reap_cron_hours="$(grep -oE 'cron: "[0-9]+ \*/([0-9]+) \* \* \*"' "$GPU_REAP_YML" | head -1 | grep -oE '/[0-9]+' | tr -d '/')"
+if [ -z "$reap_cron_hours" ]; then
+  bad "P6: could not read gpu-reap.yml's own sweep cadence (cron */Nh) -- the sweep-only bound cannot be re-derived from the mechanism"
+  reap_cron_hours=6
+else
+  ok "P6: read gpu-reap.yml's own sweep cadence as every ${reap_cron_hours}h (re-derived, not assumed)"
+fi
+read -r pod_cost_rate pod_cost_i pod_cost_ii < <(python3 - "$RP_TTL_HOURS" "$POD_RATE_USD_PER_GPU_HOUR" "$reap_cron_hours" <<'PY'
+import sys
+ttl_h, per_gpu, reap_h = int(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3])
+rate = 2 * per_gpu
+bound_i = ttl_h * rate
+bound_ii = (ttl_h + reap_h) * rate
+print(f"{rate:.3f} {bound_i:.2f} {bound_ii:.2f}")
+PY
+)
+for site in "$CLUSTER_YML" "$CLUSTER_SH" "$DEV_GPU_MD"; do
+  rel="${site#"$REPO_ROOT"/}"
+  if grep -qF "\$${pod_cost_i}" "$site"; then
+    ok "P6: ${rel} states the pods-transport bound (i) as \$${pod_cost_i} — the figure the mechanism produces"
+  else
+    bad "P6: ${rel} does not state the pods-transport bound (i) (\$${pod_cost_i}) — its prose and the mechanism disagree"
+  fi
+  if grep -qF "\$${pod_cost_ii}" "$site"; then
+    ok "P6: ${rel} states the pods-transport bound (ii) as \$${pod_cost_ii} (the sweep-only path)"
+  else
+    bad "P6: ${rel} does not state the pods-transport bound (ii) (\$${pod_cost_ii})"
+  fi
+done
+
+# ============================================================================
 # G7: NO schedule: key anywhere in the committed gpu-cluster.yml.
 # ============================================================================
 g7_out="$(python3 "$PROVE_ONCE_PY" --read-on-block "$CLUSTER_YML" 2>&1)"
@@ -1560,6 +1639,690 @@ if [ "$g7_rc" -eq 0 ] && ! printf '%s\n' "$g7_out" | grep -qx "schedule"; then
 else
   bad "G7: expected gpu-cluster.yml to carry no schedule: key; got rc=${g7_rc} out=${g7_out}"
 fi
+
+# ============================================================================
+# TWOPODS: the pods transport (RP_TWO_HOST_TRANSPORT=pods, the default).
+# Every property below drives the REAL function, mocking only _rp_rest/
+# rp_pod_get/rp_terminate exactly as the cluster fixtures above mock
+# _rp_rest/rp_cluster_delete.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# P1: transport is explicit; the cluster path is UNCHANGED -- a byte-for-
+# byte diff of every function that is genuinely cluster-transport-specific,
+# between this worktree and the base commit this unit branched from.
+# ----------------------------------------------------------------------------
+extract_fn() { # $1=file $2=function name -> stdout: the function's own text (name() { ... }), or empty
+  awk -v fn="$2" '
+    $0 ~ "^" fn "\\(\\) \\{" { grabbing=1 }
+    grabbing { print }
+    grabbing && /^}/ { exit }
+  ' "$1"
+}
+
+CLUSTER_ONLY_FNS=(
+  rp_cluster_rank_verdict rp_cluster_verdict _rpc_check_readback
+  _rpc_wait_for_members_ready _rpc_id_file_ready _rpc_ens1_seen
+  _rpc_parse_cluster_shape _rpc_pick_data_centers _rpc_availability_at_least
+)
+p1_all_clean=1
+for fn in "${CLUSTER_ONLY_FNS[@]}"; do
+  before="$(git -C "$REPO_ROOT" show "HEAD:ci/scripts/runpod_gpu_cluster.sh" 2>/dev/null | extract_fn /dev/stdin "$fn")"
+  after="$(extract_fn "$CLUSTER_SH" "$fn")"
+  if [ -z "$before" ] || [ -z "$after" ]; then
+    bad "P1: could not extract ${fn} from HEAD and/or the working tree -- the diff-empty claim cannot be checked"
+    p1_all_clean=0
+    continue
+  fi
+  if [ "$before" != "$after" ]; then
+    bad "P1: ${fn}'s own text differs from HEAD -- the cluster path is no longer byte-for-byte unchanged"
+    p1_all_clean=0
+  fi
+done
+[ "$p1_all_clean" -eq 1 ] && ok "P1: every cluster-transport-specific function (${CLUSTER_ONLY_FNS[*]}) is byte-for-byte identical to HEAD"
+
+if [ "$RP_TWO_HOST_TRANSPORT" = "cluster" ]; then
+  ok "P1: this suite's own export pins RP_TWO_HOST_TRANSPORT=cluster, so every case above this section already re-exercised the (unchanged) cluster path end to end"
+else
+  bad "P1: expected this suite's own RP_TWO_HOST_TRANSPORT export to be 'cluster'; got '${RP_TWO_HOST_TRANSPORT}'"
+fi
+
+default_transport="$(bash -c 'unset RP_TWO_HOST_TRANSPORT; source "'"$CLUSTER_SH"'" >/dev/null 2>&1; printf "%s" "$RP_TWO_HOST_TRANSPORT"')"
+if [ "$default_transport" = "pods" ]; then
+  ok "P1: with RP_TWO_HOST_TRANSPORT unset, the driver defaults to 'pods'"
+else
+  bad "P1: expected the default transport to be 'pods'; got '${default_transport}'"
+fi
+
+invalid_marker="$(RP_TWO_HOST_TRANSPORT="bogus" bash -c 'source "'"$CLUSTER_SH"'" >/dev/null 2>&1; printf "%s" "${RP_TWO_HOST_TRANSPORT_INVALID:-}"')"
+if [ "$invalid_marker" = "1" ]; then
+  ok "P1: an out-of-set RP_TWO_HOST_TRANSPORT sets RP_TWO_HOST_TRANSPORT_INVALID at source time (never exits while merely sourced)"
+else
+  bad "P1: expected RP_TWO_HOST_TRANSPORT_INVALID=1 for an out-of-set transport; got '${invalid_marker}'"
+fi
+
+# ----------------------------------------------------------------------------
+# P2: co-placement -- ONE data center, both GN-enabled, MEASURED from the
+# get responses; refused (97) before any build otherwise.
+# ----------------------------------------------------------------------------
+pod_json() { # $1=id $2=status $3=dataCenterId $4=gn_enabled(true|false) $5=gn_ip(or null) $6=ssh_host(or null) $7=ssh_port
+  python3 -c '
+import json, sys
+pid, status, dc, gn_en, gn_ip, host, port = sys.argv[1:8]
+d = {
+    "id": pid, "desiredStatus": status, "dataCenterId": dc,
+    "globalNetworking": {"enabled": gn_en == "true", "ip": (None if gn_ip == "null" else gn_ip)},
+    "ssh": {"direct": (None if host == "null" else {"host": host, "port": int(port)})},
+}
+print(json.dumps(d))
+' "$@"
+}
+
+run_wait_two_host_pods() { # $1=body0 $2=body1 $3=wait_secs $4=driver path (default CLUSTER_SH) -> "<rc>\t<out>"
+  local b0="$1" b1="$2" wait_secs="$3" driver="${4:-$CLUSTER_SH}" out rc
+  out="$(TWOPODS_BODY0="$b0" TWOPODS_BODY1="$b1" bash -c '
+    source "'"$driver"'"
+    rp_pod_get() { [ "$1" = "pod-0" ] && printf "%s" "$TWOPODS_BODY0" || printf "%s" "$TWOPODS_BODY1"; }
+    _rpc_wait_for_two_host_pods_ready "pod-0" "pod-1" "$1"
+  ' _ "$wait_secs" 2>&1)"
+  rc=$?
+  printf '%s\t%s\n' "$rc" "$out"
+}
+
+ok_body0="$(pod_json pod-0 RUNNING dc-a true 10.0.0.2 1.2.3.4 22)"
+ok_body1="$(pod_json pod-1 RUNNING dc-a true 10.0.0.3 5.6.7.8 22)"
+IFS=$'\t' read -r rc out <<< "$(run_wait_two_host_pods "$ok_body0" "$ok_body1" 10)"
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "^1.2.3.4 22 5.6.7.8 22 dc-a 10.0.0.2 10.0.0.3$"; then
+  ok "P2: both pods RUNNING, GN-enabled, co-located in dc-a -> ready (0), both endpoints + GN ips carried"
+else
+  bad "P2: expected rc=0 with both endpoints and GN ips; got rc=$rc out=$out"
+fi
+
+diff_dc_body1="$(pod_json pod-1 RUNNING dc-b true 10.0.0.3 5.6.7.8 22)"
+IFS=$'\t' read -r rc out <<< "$(run_wait_two_host_pods "$ok_body0" "$diff_dc_body1" 6)"
+if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "DIFFERENT data centers"; then
+  ok "P2: the two pods landing in DIFFERENT data centers -> refused (97), named, before any build"
+else
+  bad "P2: expected rc=97 naming DIFFERENT data centers; got rc=$rc out=$out"
+fi
+
+no_gn_body1="$(pod_json pod-1 RUNNING dc-a false null 5.6.7.8 22)"
+IFS=$'\t' read -r rc out <<< "$(run_wait_two_host_pods "$ok_body0" "$no_gn_body1" 1)"
+if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "rank 1 ready: 0"; then
+  ok "P2: rank 1 never reporting Global Networking enabled -> refused (97) at the deadline, never a silent pass"
+else
+  bad "P2: expected rc=97 naming rank 1 unready; got rc=$rc out=$out"
+fi
+
+no_ssh_body1="$(pod_json pod-1 RUNNING dc-a true 10.0.0.3 null 22)"
+IFS=$'\t' read -r rc out <<< "$(run_wait_two_host_pods "$ok_body0" "$no_ssh_body1" 1)"
+if [ "$rc" -eq 97 ]; then
+  ok "P2: rank 1 with no ssh.direct (the pods transport never proxies) -> refused (97)"
+else
+  bad "P2: expected rc=97 for a missing ssh.direct; got rc=$rc out=$out"
+fi
+
+# P2 revert-RED: on a scratch copy, weaken the co-placement check to compare
+# nothing at all (accept any two dataCenterIds) -- confirm the SAME
+# different-dc fixture above now reads "ready" instead of refusing, proving
+# the real check above is load-bearing.
+P2_SCRATCH_DIR="$SANDBOX/p2-revert-red"
+mkdir -p "$P2_SCRATCH_DIR"
+cp "$DIR/runpod_lib.sh" "$P2_SCRATCH_DIR/runpod_lib.sh"
+P2_SCRATCH="$P2_SCRATCH_DIR/runpod_gpu_cluster.sh"
+python3 - "$CLUSTER_SH" "$P2_SCRATCH" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+old = '''  if [ "$dc0" != "$dc1" ]; then
+    echo "::error::the two pods landed in DIFFERENT data centers (rank 0: ${dc0}, rank 1: ${dc1}) -- co-placement failed; refusing before any build starts" >&2
+    return 97
+  fi'''
+new = '''  :  # revert-RED: co-placement check removed'''
+assert old in text, "P2 revert-RED fixture: co-placement check not found verbatim"
+open(dst, "w").write(text.replace(old, new, 1))
+PY
+IFS=$'\t' read -r rc out <<< "$(run_wait_two_host_pods "$ok_body0" "$diff_dc_body1" 6 "$P2_SCRATCH")"
+if [ "$rc" -eq 0 ]; then
+  ok "P2 revert-RED: removing the co-placement check reads the different-dc fixture as ready (rc=0) -- the real check above is load-bearing"
+else
+  bad "P2 revert-RED: expected the reverted shape to accept the different-dc fixture as ready (rc=0); got rc=$rc out=$out -- the revert-RED fixture itself may be stale"
+fi
+rm -rf "$P2_SCRATCH_DIR"
+
+# ----------------------------------------------------------------------------
+# P2b: the create body speaks REST v2's field names (`cloud`, `image`,
+# `disk`, `gpu{id,count}`, `globalNetworking`, `dataCenterIds`, `ports`,
+# `startSsh`, `args`, `env`) -- never the v1 GraphQL `cloudType`/`imageName`
+# the pod leg's `_rp_deploy_payload` speaks (lead's review: the first cut
+# carried both v1 names onto `POST /v2/pods`).
+# ----------------------------------------------------------------------------
+p2b_json="$(RP_DISK_GB=60 RP_TTL_HOURS=1 bash -c '
+  source "'"$CLUSTER_SH"'" >/dev/null 2>&1
+  RP_PUBKEY="ssh-ed25519 AAAAtest"
+  _rp_two_host_pod_payload "NVIDIA A40" "US-IL-1" 0
+' 2>&1)"
+p2b_verdict="$(printf '%s' "$p2b_json" | python3 -c '
+import json, sys
+try:
+    b = json.loads(sys.stdin.read())
+except Exception as e:
+    print("PARSE_ERROR %s" % e); sys.exit(0)
+want = {"name", "cloud", "globalNetworking", "dataCenterIds", "gpu", "image", "disk", "ports", "startSsh", "args", "env"}
+got = set(b)
+bad = []
+if got != want: bad.append("keys=%s" % sorted(got ^ want))
+if b.get("cloud") != "SECURE": bad.append("cloud")
+if b.get("globalNetworking") is not True: bad.append("globalNetworking")
+if b.get("dataCenterIds") != ["US-IL-1"]: bad.append("dataCenterIds")
+if b.get("gpu") != {"id": "NVIDIA A40", "count": 1}: bad.append("gpu")
+if not isinstance(b.get("disk"), int) or b["disk"] != 60: bad.append("disk")
+if b.get("ports") != ["22/tcp"]: bad.append("ports")
+if b.get("startSsh") is not True: bad.append("startSsh")
+if not str(b.get("args", "")).startswith("bash -c "): bad.append("args")
+if b.get("env", {}).get("PUBLIC_KEY") != "ssh-ed25519 AAAAtest": bad.append("env")
+print("OK" if not bad else "BAD " + ",".join(bad))
+')"
+if [ "$p2b_verdict" = "OK" ]; then
+  ok "P2b: the two-host pod create body carries exactly REST v2's field names (cloud/image/disk/gpu{id,count}/globalNetworking/dataCenterIds/ports/startSsh/args/env) -- no v1 cloudType/imageName"
+else
+  bad "P2b: the create body is off: ${p2b_verdict}; body=${p2b_json}"
+fi
+
+# ----------------------------------------------------------------------------
+# P3: rank assignment is deterministic and RECORDED -- rank 0 is created
+# FIRST, rank 1 SECOND (static ordering over the committed text, the same
+# "F10" precedent this file already uses for rp_init/rp_cluster_create).
+# ----------------------------------------------------------------------------
+rank0_create_line="$(grep -n '^two_host_pod_id_0="\$(rp_two_host_pod_create ' "$CLUSTER_SH" | head -1 | cut -d: -f1)"
+rank1_create_line="$(grep -n '^two_host_pod_id_1="\$(rp_two_host_pod_create ' "$CLUSTER_SH" | head -1 | cut -d: -f1)"
+if [ -n "$rank0_create_line" ] && [ -n "$rank1_create_line" ] && [ "$rank0_create_line" -lt "$rank1_create_line" ]; then
+  ok "P3: rank 0's own pod create (line ${rank0_create_line}) precedes rank 1's (line ${rank1_create_line}) -- deterministic, never inferred from the RunPod response"
+else
+  bad "P3: expected rank 0's create call before rank 1's; rank0=${rank0_create_line:-<none>} rank1=${rank1_create_line:-<none>}"
+fi
+if grep -qF 'rp_two_host_pod_create "$RP_CLUSTER_GPU_TYPE" "$chosen_dc" 0' "$CLUSTER_SH" \
+  && grep -qF 'rp_two_host_pod_create "$RP_CLUSTER_GPU_TYPE" "$chosen_dc" 1' "$CLUSTER_SH"; then
+  ok "P3: each create call names its OWN rank literal (0, then 1) -- recorded, not derived"
+else
+  bad "P3: expected each create call to name its own rank literal"
+fi
+if grep -qF '_rpc_remote_script 0; } | ssh "${RP_SSHO[@]}" -p "$primary_port" "root@${primary_host}"' "$CLUSTER_SH" \
+  && grep -qF '_rpc_remote_script 1; } | ssh "${RP_SSHO[@]}" "${member_extra_sshopts[@]}" -p "$member_port" "root@${member_host}"' "$CLUSTER_SH"; then
+  ok "P3: rank 0's remote script runs on the primary (rank 0's own pod), rank 1's on the member (rank 1's own pod)"
+else
+  bad "P3: expected rank 0/1's remote script to run on the primary/member host respectively"
+fi
+
+# ----------------------------------------------------------------------------
+# P4: the NCCL interface is DERIVED at run time, never a literal; a missing
+# interface is a NAMED refusal on that member.
+# ----------------------------------------------------------------------------
+cluster_iface_text="$(RP_TWO_HOST_TRANSPORT=cluster bash -c 'source "'"$CLUSTER_SH"'"; _rpc_two_host_iface_lines 0')"
+if [ "$cluster_iface_text" = "export NCCL_SOCKET_IFNAME=ens1" ]; then
+  ok "P1/P4: under RP_TWO_HOST_TRANSPORT=cluster, _rpc_two_host_iface_lines emits EXACTLY the pre-existing literal line"
+else
+  bad "P1/P4: expected the cluster transport's iface line to be exactly 'export NCCL_SOCKET_IFNAME=ens1'; got: ${cluster_iface_text}"
+fi
+
+pods_iface_text="$(RP_TWO_HOST_TRANSPORT=pods RP_TWO_HOST_GN_IP_0=10.0.0.9 bash -c 'source "'"$CLUSTER_SH"'"; _rpc_two_host_iface_lines 0')"
+if printf '%s' "$pods_iface_text" | grep -q 'gn_ip="10.0.0.9"' \
+  && printf '%s' "$pods_iface_text" | grep -qF '/proc/net/route' \
+  && ! printf '%s' "$pods_iface_text" | grep -qF 'ip -o -4 addr show' \
+  && printf '%s' "$pods_iface_text" | grep -qF 'DERIVED_NCCL_IFACE=' \
+  && ! printf '%s' "$pods_iface_text" | grep -qF 'NCCL_SOCKET_IFNAME=ens1'; then
+  ok "P4: under RP_TWO_HOST_TRANSPORT=pods, _rpc_two_host_iface_lines derives the interface from the rank's own GN ip -- never the ens1 literal"
+else
+  bad "P4: expected the pods transport's iface text to derive from RP_TWO_HOST_GN_IP_0 with no ens1 literal; got: ${pods_iface_text}"
+fi
+
+# Execute the REAL derivation text end to end (a real subshell, a route
+# table in /proc/net/route's format fed through RP_ROUTE_TABLE) -- both the
+# match and the no-match (refusal) arms. No `ip` binary anywhere: the CI
+# image ships none (run 35166917277).
+# A route table in /proc/net/route's own format (little-endian hex): a
+# default route on eth0 (mask 0, never a match), a /16 on eth0 that also
+# covers 10.0.0.9, and the /24 on ens7 that must win by longest prefix.
+IFACE_ROUTES="$SANDBOX/iface-route"
+printf 'Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n' > "$IFACE_ROUTES"
+printf 'eth0\t00000000\t0100A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n' >> "$IFACE_ROUTES"
+printf 'eth0\t0000000A\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n' >> "$IFACE_ROUTES"
+printf 'ens7\t0000000A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n' >> "$IFACE_ROUTES"
+match_out="$(RP_ROUTE_TABLE="$IFACE_ROUTES" bash -c "$pods_iface_text"; echo "RC=$?")"
+if printf '%s' "$match_out" | grep -q 'DERIVED_NCCL_IFACE=ens7' && printf '%s' "$match_out" | grep -q 'RC=0'; then
+  ok "P4: executed end to end, the derivation picks 'ens7' (the interface actually carrying the GN ip) and exits 0"
+else
+  bad "P4: expected the executed derivation to pick ens7 and exit 0; got: ${match_out}"
+fi
+
+nomatch_iface_text="$(RP_TWO_HOST_TRANSPORT=pods RP_TWO_HOST_GN_IP_0=10.9.9.9 bash -c 'source "'"$CLUSTER_SH"'"; _rpc_two_host_iface_lines 0')"
+nomatch_out="$(RP_ROUTE_TABLE="$IFACE_ROUTES" bash -c "$nomatch_iface_text" 2>&1; echo "RC=$?")"
+if printf '%s' "$nomatch_out" | grep -q 'covers the Global-Networking ip 10.9.9.9' && printf '%s' "$nomatch_out" | grep -q 'RC=97'; then
+  ok "P4: executed end to end, an ip with NO matching interface is a NAMED refusal (97), never a silent pass"
+else
+  bad "P4: expected the executed derivation to refuse (97) naming the ip; got: ${nomatch_out}"
+fi
+
+# P4 revert-RED: hardcode the interface (ignore the derivation) on a
+# scratch copy -- the SAME no-match fixture now "succeeds" with the wrong
+# interface instead of refusing, proving the real derivation is load-bearing.
+P4_SCRATCH_DIR="$SANDBOX/p4-revert-red"
+mkdir -p "$P4_SCRATCH_DIR"
+cp "$DIR/runpod_lib.sh" "$P4_SCRATCH_DIR/runpod_lib.sh"
+P4_SCRATCH="$P4_SCRATCH_DIR/runpod_gpu_cluster.sh"
+if ! python3 - "$CLUSTER_SH" "$P4_SCRATCH" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+# The derivation's refusal arm: replace it with a hardcoded interface so the
+# no-match fixture "succeeds" -- the shape the real derivation must NOT have.
+old = '''if [ -z "\\$iface" ]; then
+  echo "::error::no route in \\$route_table covers the Global-Networking ip \\$gn_ip -- refusing to derive NCCL_SOCKET_IFNAME" >&2
+  exit 97
+fi'''
+new = '''iface="ens1"  # revert-RED: hardcoded, ignoring gn_ip and the route table entirely'''
+assert old in text, "P4 revert-RED fixture: the refusal arm was not found verbatim -- the fixture is stale, not the driver"
+open(dst, "w").write(text.replace(old, new, 1))
+PY
+then
+  bad "P4 revert-RED: the scratch patch did not apply (fixture stale) -- refusing to read a vacuous RC=0 as evidence"
+fi
+nomatch_iface_text_red="$(RP_TWO_HOST_TRANSPORT=pods RP_TWO_HOST_GN_IP_0=10.9.9.9 bash -c 'source "'"$P4_SCRATCH"'"; _rpc_two_host_iface_lines 0')"
+nomatch_out_red="$(RP_ROUTE_TABLE="$IFACE_ROUTES" bash -c "$nomatch_iface_text_red"; echo "RC=$?")"
+if printf '%s' "$nomatch_out_red" | grep -q 'RC=0'; then
+  ok "P4 revert-RED: the hardcoded (pre-fix) shape reads the no-match fixture as a SUCCESS (RC=0) -- confirms the real derivation above is load-bearing"
+else
+  bad "P4 revert-RED: expected the reverted (hardcoded) shape to succeed on the no-match fixture; got: ${nomatch_out_red} -- the revert-RED fixture itself may be stale"
+fi
+rm -rf "$P4_SCRATCH_DIR"
+
+iface_log_good="$SANDBOX/iface-good.log"
+printf 'noise\nNCCL INFO NET/Socket : Using [0]ens7:10.0.0.9<0>\nmore\n' > "$iface_log_good"
+if _rpc_net_iface_seen "$iface_log_good" "ens7"; then
+  ok "P4: _rpc_net_iface_seen recognizes the derived interface's own NET/Socket line"
+else
+  bad "P4: expected _rpc_net_iface_seen to recognize ens7's NET/Socket line"
+fi
+if _rpc_net_iface_seen "$iface_log_good" "eth0"; then
+  bad "P4: _rpc_net_iface_seen must not match a DIFFERENT interface's name"
+else
+  ok "P4: _rpc_net_iface_seen refuses when the log names a different interface"
+fi
+iface_log_marker="$SANDBOX/iface-marker.log"
+printf 'DERIVED_NCCL_IFACE=ens7\nother noise\n' > "$iface_log_marker"
+parsed_iface="$(_rpc_parse_derived_iface "$iface_log_marker")"
+if [ "$parsed_iface" = "ens7" ]; then
+  ok "P4: _rpc_parse_derived_iface reads the DERIVED_NCCL_IFACE= marker back"
+else
+  bad "P4: expected _rpc_parse_derived_iface to read 'ens7'; got '${parsed_iface}'"
+fi
+if [ -z "$(_rpc_parse_derived_iface "$SANDBOX/does-not-exist")" ]; then
+  ok "P4: _rpc_parse_derived_iface on a missing log prints nothing (never a stale guess)"
+else
+  bad "P4: expected empty output for a missing log"
+fi
+
+# ----------------------------------------------------------------------------
+# P5: both pods terminated on EVERY exit arm (the trap's own terminate
+# calls appear for both ids on the wrong-shape arm too).
+# ----------------------------------------------------------------------------
+run_two_host_cleanup() { # $1=pod0_id(or "") $2=pod1_id(or "") $3=pending_rc $4=terminate_ok(1|0, applies to BOTH ids)
+  TWOPODS_TERMINATE_OK="$4" bash -c '
+    source "'"$CLUSTER_SH"'"
+    two_host_pod_id_0="$1"
+    two_host_pod_id_1="$2"
+    rp_terminate() { [ "$TWOPODS_TERMINATE_OK" = "1" ]; }
+    rp_cleanup() { : > "'"$SANDBOX"'/two-host-cleanup-called"; }
+    ( exit "$3" )
+    _rpc_cleanup_cluster
+  ' _ "$1" "$2" "$3"
+}
+
+rm -f "$SANDBOX/two-host-cleanup-called"
+run_two_host_cleanup "pod-0" "pod-1" 0 1 >/dev/null 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] && [ -f "$SANDBOX/two-host-cleanup-called" ]; then
+  ok "P5: happy path (rc=0), both terminate calls succeed -> pending rc preserved, rp_cleanup still chained"
+else
+  bad "P5: expected rc=0 and rp_cleanup chained on the happy path; got rc=$rc"
+fi
+
+rm -f "$SANDBOX/two-host-cleanup-called"
+out="$(run_two_host_cleanup "pod-0" "pod-1" 97 1 2>&1)"
+rc=$?
+if [ "$rc" -eq 97 ] && [ -f "$SANDBOX/two-host-cleanup-called" ]; then
+  ok "P5: a wrong-shape refusal (97) still terminates BOTH pods and preserves the named exit code"
+else
+  bad "P5: expected rc=97 preserved with rp_cleanup chained; got rc=$rc out=$out"
+fi
+
+rm -f "$SANDBOX/two-host-cleanup-called"
+out="$(run_two_host_cleanup "pod-0" "pod-1" 0 0 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "LEAKED two-host pod pod-0" && printf '%s' "$out" | grep -q "LEAKED two-host pod pod-1"; then
+  ok "P5: BOTH termination calls failing names BOTH pod ids LEAKED and joins the exit status non-zero"
+else
+  bad "P5: expected both pod ids named LEAKED with a non-zero exit; got rc=$rc out=$out"
+fi
+
+rm -f "$SANDBOX/two-host-cleanup-called"
+run_two_host_cleanup "" "" 75 1 >/dev/null 2>&1
+rc=$?
+if [ "$rc" -eq 75 ] && [ -f "$SANDBOX/two-host-cleanup-called" ]; then
+  ok "P5: no pod ids at all (cleanup fires before either create ran) -> no terminate attempted, rc=75 preserved"
+else
+  bad "P5: expected rc=75 preserved with no ids set; got rc=$rc"
+fi
+
+# P5 -- confirms the cluster branch is UNAFFECTED by this new block (the
+# existing F2/F3(c) cluster-cleanup cases above, all of which run with
+# two_host_pod_id_0/1 unset, already prove this by continuing to pass; this
+# is the converse: a pods-transport cleanup with cluster_id unset never
+# touches the cluster branch's own self-remove/delete calls).
+rm -f "$SANDBOX/two-host-cleanup-called"
+out="$(bash -c '
+  source "'"$CLUSTER_SH"'"
+  two_host_pod_id_0="pod-0"; two_host_pod_id_1="pod-1"
+  rp_terminate() { return 0; }
+  _rpc_self_remove_status() { echo "SHOULD_NOT_BE_CALLED"; }
+  rp_cluster_delete() { echo "SHOULD_NOT_BE_CALLED"; return 0; }
+  rp_cleanup() { : ; }
+  ( exit 0 )
+  _rpc_cleanup_cluster
+' 2>&1)"
+if ! printf '%s' "$out" | grep -q "SHOULD_NOT_BE_CALLED"; then
+  ok "P5: a pods-transport cleanup (cluster_id unset) never invokes the cluster branch's self-remove/delete calls"
+else
+  bad "P5: the pods-transport cleanup unexpectedly touched the cluster branch: $out"
+fi
+
+# ----------------------------------------------------------------------------
+# P7: the artifact carries `transport`; the bash-side assembler itself
+# refuses a value outside the closed set BEFORE any python assembly runs
+# (check_cuda_run_artifacts.py's own self-test, run as one of this suite's
+# gates below, is the authoritative schema-level oracle for the checker
+# side of this property).
+# ----------------------------------------------------------------------------
+out_pods="$assemble_dir/gang-pods-happy.json"
+_rpc_assemble_gang_artifact "$assemble_dir/r0.json" "$assemble_dir/r1.json" deadbeef "a100-sxm4-two-host-pods" "$out_pods" 2 1 1 "global-networking"
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$(python3 -c "import json; print(json.load(open('$out_pods'))['gang']['transport'])")" = "global-networking" ]; then
+  ok "P7: the assembler records transport='global-networking' for the pods leg"
+else
+  bad "P7: expected transport='global-networking' recorded; rc=$rc"
+fi
+if check_gang_via_checker "$out_pods" >/dev/null 2>&1; then
+  ok "P7: the real check_cuda_run_artifacts.py accepts a complete pods-transport (global-networking) artifact"
+else
+  bad "P7: the real checker unexpectedly refused a complete pods-transport artifact: $(check_gang_via_checker "$out_pods" 2>&1)"
+fi
+
+out_bogus="$assemble_dir/gang-bogus-transport.json"
+_rpc_assemble_gang_artifact "$assemble_dir/r0.json" "$assemble_dir/r1.json" deadbeef box "$out_bogus" 2 1 1 "carrier-pigeon"
+rc=$?
+if [ "$rc" -ne 0 ] && [ ! -f "$out_bogus" ]; then
+  ok "P7: an out-of-set transport is refused by the bash-side assembler itself (rc!=0), no artifact written"
+else
+  bad "P7: expected an out-of-set transport to refuse assembly; rc=$rc, artifact exists=$([ -f "$out_bogus" ] && echo yes || echo no)"
+fi
+
+missing_transport_out="$(_rpc_assemble_gang_artifact "$assemble_dir/r0.json" "$assemble_dir/r1.json" deadbeef box "$assemble_dir/gang-missing-transport.json" 2 1 1 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  ok "P7: an OMITTED transport argument is refused (the bash \${9:?...} required-parameter guard)"
+else
+  bad "P7: expected an omitted transport to refuse assembly; rc=$rc"
+fi
+
+# ----------------------------------------------------------------------------
+# P8: exit codes are UNCHANGED across transports -- the same combining
+# functions (rp_cluster_rank_verdict/rp_cluster_verdict, already exercised
+# by G1 above over every rc arm) are reused verbatim by the pods branch;
+# the module doc's own EXIT CONTRACT documents the SAME closed set for
+# both transports.
+# ----------------------------------------------------------------------------
+if grep -qE '(exit|return) 75' "$CLUSTER_SH" && grep -qE '(exit|return) 76' "$CLUSTER_SH" \
+  && grep -qE '(exit|return) 77' "$CLUSTER_SH" && grep -qE '(exit|return) 97' "$CLUSTER_SH" && grep -qE '(exit|return) 124' "$CLUSTER_SH" \
+  && [ "$(grep -c '_rpc_run_two_ranks "\$primary_host" "\$primary_port" "\$member_host" "\$member_port" || exit \$?' "$CLUSTER_SH")" -eq 2 ]; then
+  ok "P8: every named exit code (75/76/77/97/124) appears in the driver (the shared rank runner returns 76/77/124 and BOTH arms exit with its status verbatim)"
+else
+  bad "P8: one or more named exit codes is missing from the driver text"
+fi
+pods_branch_codes="$(awk '/The `pods` transport \(two ORDINARY/{f=1} f{print} /^echo "=== GPU cluster leg exit/{exit}' "$CLUSTER_SH" | grep -oE 'exit (75|76|77|97|124)' | sort -u | tr '\n' ' ')"
+if [ -n "$pods_branch_codes" ]; then
+  ok "P8: the pods branch itself names exit codes: ${pods_branch_codes}(shared closed set, never a new one)"
+else
+  bad "P8: the pods branch names no exit code at all -- the awk delimiter used to isolate it may be stale"
+fi
+
+# ----------------------------------------------------------------------------
+# P11: no remote command before an EXECUTED connect to that member succeeded
+# once (run 35163325352: both pods RUNNING + GN-enabled, the first ssh to
+# rank 0 refused 0.1 s later -- sshd is installed by the entrypoint AFTER
+# boot). The library probes `ssh ... true` under a bound; both
+# transports call `rp_wait_sshd` (runpod_lib.sh: ONE predicate, `rp_sshd_answers`,
+# shared with `rp_session_alive` and `_rp_deploy`) for BOTH members before
+# their first `_rpc_remote_script`.
+# ----------------------------------------------------------------------------
+run_ssh_ready() { # $1=refusals before success (-1 = never) $2=bound(s)
+  P11_REFUSALS="$1" bash -c '
+    source "'"$CLUSTER_SH"'" >/dev/null 2>&1
+    RP_SSHO=(-o Fixture=yes)
+    n=0
+    ssh() { echo "ssh $*" >> "'"$SANDBOX"'/p11-ssh-calls"; n=$((n+1)); [ "$P11_REFUSALS" -ge 0 ] && [ "$n" -gt "$P11_REFUSALS" ]; }
+    sleep() { :; }
+    rp_wait_sshd "10.0.0.1" "2222" "'"$2"'" "rank 0" -o "ProxyJump=root@jump:1"
+  '
+}
+rm -f "$SANDBOX/p11-ssh-calls"
+out="$(run_ssh_ready 2 300 2>&1)"; rc=$?
+calls="$(grep -c '^ssh ' "$SANDBOX/p11-ssh-calls" 2>/dev/null || echo 0)"
+if [ "$rc" -eq 0 ] && [ "$calls" -eq 3 ] && printf '%s' "$out" | grep -q "sshd up on rank 0 (10.0.0.1:2222)" && grep -q -- "-o Fixture=yes -o ProxyJump=root@jump:1 -p 2222 root@10.0.0.1 true" "$SANDBOX/p11-ssh-calls"; then
+  ok "P11: two refused connects then success -> rc 0 after exactly 3 probes, RP_SSHO + the member's extra options + the port on every probe"
+else
+  bad "P11: expected rc 0 after 3 probes with the options threaded; got rc=$rc calls=$calls out=$out"
+fi
+rm -f "$SANDBOX/p11-ssh-calls"
+out="$(run_ssh_ready -1 1 2>&1)"; rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "::error::sshd on rank 0 (10.0.0.1:2222) answered no connect within 1s"; then
+  ok "P11: a member whose sshd never answers -> rc 1 within the bound, named ::error:: (never a remote command)"
+else
+  bad "P11: expected rc 1 with the named ::error:: on the bound; got rc=$rc out=$out"
+fi
+# Static ordering, both arms (the F10/P3 precedent): each arm's TWO wait calls
+# precede that arm's first `_rpc_remote_script 0 | ssh` launch.
+p11_waits="$(grep -n '^rp_wait_sshd "\$primary_host"' "$CLUSTER_SH" | cut -d: -f1 | tr '\n' ' ')"
+p11_launch="$(grep -n '^_rpc_run_two_ranks "\$primary_host"' "$CLUSTER_SH" | cut -d: -f1 | tr '\n' ' ')"
+p11_ok=1
+set -- $p11_launch
+for launch in "$@"; do
+  seen=0
+  for w in $p11_waits; do
+    [ "$w" -lt "$launch" ] && [ $(( launch - w )) -lt 40 ] && seen=1
+  done
+  [ "$seen" -eq 1 ] || p11_ok=0
+done
+if [ "$p11_ok" -eq 1 ] && [ "$(printf '%s' "$p11_waits" | wc -w)" -eq 2 ] && [ "$(printf '%s' "$p11_launch" | wc -w)" -eq 2 ]; then
+  ok "P11: both arms (cluster, pods) wait for sshd on rank 0 within 40 lines before their own _rpc_run_two_ranks call (waits at ${p11_waits}; launches at ${p11_launch})"
+else
+  bad "P11: expected a rank-0 sshd wait shortly before EACH arm's _rpc_run_two_ranks call; waits=${p11_waits} launches=${p11_launch}"
+fi
+if [ "$(grep -c '^rp_wait_sshd "\$member_host"' "$CLUSTER_SH")" -eq 2 ]; then
+  ok "P11: both arms wait for sshd on rank 1 too"
+else
+  bad "P11: expected two rank-1 sshd waits (one per arm)"
+fi
+# ----------------------------------------------------------------------------
+# P12: the two ranks run through ONE shared function on both transports;
+# both build concurrently; the id crossing is a phase of the watch loop
+# bounded by rank 0's liveness, log growth and the budget -- never a wall
+# clock of its own (run 35164486335: the crossing was bounded by
+# RP_SSH_WAIT_SECS=300 s while a cold build takes far longer). Every exit
+# arm of `_rpc_run_two_ranks` is driven here with stubbed ssh/scp/remote
+# scripts (the REAL function, the REAL `_rpc_id_file_ready`).
+# ----------------------------------------------------------------------------
+P12_DIR="$SANDBOX/p12"
+run_two_ranks_fixture() { # $1=rank0 script body $2=rank1 script body $3=RP_INACTIVITY $4=deadline offset (s)
+  rm -rf "$P12_DIR"; mkdir -p "$P12_DIR"
+  P12_R0="$1" P12_R1="$2" P12_INACT="$3" P12_DL="$4" bash -c '
+    source "'"$CLUSTER_SH"'" >/dev/null 2>&1
+    RP_SSHO=(-o Fixture=yes); member_extra_sshopts=(-o "ProxyJump=root@jump:1")
+    RP_WORK="'"$P12_DIR"'/work"; mkdir -p "$RP_WORK"  # the driver'"'"'s own EXIT cleanup removes RP_WORK -- never the fixture dir itself
+    CLUSTER_REMOTE_ID_FILE=/remote/nccl.id; RP_TIMEOUT=30
+    RP_INACTIVITY="$P12_INACT"; DEADLINE=$(( SECONDS + P12_DL )); id_landed=0; unset PROVE_EXPECT_SHA
+    _rpc_remote_script() { [ "$1" = "0" ] && printf "%s\n" "$P12_R0" || printf "%s\n" "$P12_R1"; }
+    RP_ENV_PREAMBLE=": env-preamble-sentinel"
+    ssh() { echo "ssh $*" >> "'"$P12_DIR"'/calls"; f="$(mktemp "'"$P12_DIR"'/stdin-XXXXXX")"; cat > "$f"; bash "$f"; }
+    scp() { echo "scp $*" >> "'"$P12_DIR"'/calls"; case "$*" in *"root@"*":"*" "*) : ;; esac
+            last="${@: -1}"; case "$last" in "'"$P12_DIR"'"/*) head -c 128 /dev/zero > "$last" ;; esac; }
+    _rpc_remote_id_size() { cat "'"$P12_DIR"'/idsize" 2>/dev/null; }
+    _rpc_phase() { echo "=== PHASE ($SECONDS)s: $* ==="; }
+    CLUSTER_ARTIFACT_DIR="'"$P12_DIR"'/artifact"
+    sleep() { command sleep 0.1; }
+    _rpc_run_two_ranks "10.0.0.1" "2201" "10.0.0.2" "2202"; rc=$?
+    echo "RC=$rc id_landed=${id_landed} rank0_rc=${rank0_rc:-?} rank1_rc=${rank1_rc:-?}"
+  ' 2>&1
+}
+r0_happy='echo start0; command sleep 0.4; echo 128 > "'"$P12_DIR"'/idsize"; command sleep 0.4; echo done0'
+r1_happy='echo start1; command sleep 0.6; echo done1'
+out="$(run_two_ranks_fixture "$r0_happy" "$r1_happy" 30 600)"
+if printf '%s' "$out" | grep -q "RC=0 id_landed=1 rank0_rc=0 rank1_rc=0" \
+   && printf '%s' "$out" | grep -q "the id crossed to the member" \
+   && [ "$(grep -c '^ssh ' "$P12_DIR/calls")" -eq 2 ] \
+   && [ "$(grep -n '^scp ' "$P12_DIR/calls" | wc -l | tr -d ' ')" -eq 2 ] \
+   && grep -m1 '^scp ' "$P12_DIR/calls" | grep -q "root@10.0.0.1:/remote/nccl.id" \
+   && grep '^scp ' "$P12_DIR/calls" | tail -1 | grep -q -- "-o ProxyJump=root@jump:1 -P 2202 .* root@10.0.0.2:/remote/nccl.id" \
+   && grep '^ssh ' "$P12_DIR/calls" | tail -1 | grep -q -- "-o ProxyJump=root@jump:1 -p 2202 root@10.0.0.2"; then
+  ok "P12: happy path -- both ranks launched up front (2 ssh, rank 1 with its own options), the id scp'd down from the primary then up to the member exactly once each, both ranks rc 0, id_landed=1"
+  p14_r0="$(grep -l '^echo start0' "$P12_DIR"/stdin-* | head -1)"; p14_r1="$(grep -l '^echo start1' "$P12_DIR"/stdin-* | head -1)"
+  if [ -n "$p14_r0" ] && [ -n "$p14_r1" ] && [ "$(head -1 "$p14_r0")" = ": env-preamble-sentinel" ] && [ "$(head -1 "$p14_r1")" = ": env-preamble-sentinel" ]; then
+    ok "P14: the FIRST line each rank receives is RP_ENV_PREAMBLE (PID 1's environment import, the library's one definition), before its own script"
+  else
+    bad "P14: expected RP_ENV_PREAMBLE as the first line of both ranks' stdin; got: $(head -1 "$p14_r0" 2>/dev/null) / $(head -1 "$p14_r1" 2>/dev/null)"
+  fi
+else
+  bad "P12: happy path off; out=$out calls=$(cat "$P12_DIR/calls" 2>/dev/null)"
+fi
+r0_dies='echo start0; command sleep 0.2; exit 3'
+out="$(run_two_ranks_fixture "$r0_dies" "$r1_happy" 30 600)"
+if printf '%s' "$out" | grep -q "RC=76" && printf '%s' "$out" | grep -q "::error::rank 0 ended (rc=3) before minting the 128-byte id file" \
+   && grep -q "start0" "$P12_DIR/artifact/rank0.log" && grep -q "start1" "$P12_DIR/artifact/rank1.log"; then
+  ok "P12: rank 0 exiting before the id is minted -> 76 with rank 0's own rc named; no scp ever attempted; BOTH rank logs shipped into the artifact dir on this refusal arm"
+else
+  bad "P12: expected 76 naming rank 0's rc; out=$out"
+fi
+r0_silent='command sleep 5'
+r1_silent='command sleep 5'
+out="$(run_two_ranks_fixture "$r0_silent" "$r1_silent" 1 600)"
+if printf '%s' "$out" | grep -q "RC=76" && printf '%s' "$out" | grep -q "::error::inactivity: no new output on either rank's log for 1s"; then
+  ok "P12: no log growth on either rank within RP_INACTIVITY -> 76, named inactivity (the crossing wait has no clock of its own)"
+else
+  bad "P12: expected the inactivity arm; out=$out"
+fi
+out="$(run_two_ranks_fixture "$r0_happy" "$r1_happy" 30 0)"
+if printf '%s' "$out" | grep -q "RC=124" && printf '%s' "$out" | grep -q "budget cut at T-10m"; then
+  ok "P12: the T-10m budget cuts the leg at 124 during the crossing wait"
+else
+  bad "P12: expected the budget arm (124); out=$out"
+fi
+p12_calls="$(grep -c '^_rpc_run_two_ranks "\$primary_host" "\$primary_port" "\$member_host" "\$member_port" || exit \$?' "$CLUSTER_SH")"
+if [ "$p12_calls" -eq 2 ] && ! grep -q 'id_deadline=' "$CLUSTER_SH" && ! grep -q 'never produced a 128-byte id file within' "$CLUSTER_SH"; then
+  ok "P12: both transport arms run the ranks through the ONE shared function; the wall-clock id poll is gone from the tree"
+else
+  bad "P12: expected exactly two shared-function calls and no wall-clock id poll; calls=$p12_calls"
+fi
+p12_scripts="$(RP_TWO_HOST_GN_IP_0=10.0.0.1 RP_TWO_HOST_GN_IP_1=10.0.0.2 bash -c '
+  source "'"$CLUSTER_SH"'" >/dev/null 2>&1
+  export RP_TWO_HOST_GN_IP_0 RP_TWO_HOST_GN_IP_1
+  echo "r1=$(_rpc_remote_script 1 | grep -c "=== id-wait: rank 1 built") r0=$(_rpc_remote_script 0 | grep -c "id-wait")"
+  _rpc_remote_script 1 | awk "/::group::cluster-build/{b=NR} /=== id-wait: rank 1 built/{w=NR} /::group::cluster-proof/{p=NR} END{print (b<w && w<p) ? \"order-ok\" : \"order-bad\"}" | head -1
+' 2>&1 | tr '\n' ' ')"
+if printf '%s' "$p12_scripts" | grep -q "r1=1 r0=0" && printf '%s' "$p12_scripts" | grep -q "order-ok"; then
+  ok "P12: rank 1's remote script waits for the 128-byte id BETWEEN its build and its proof; rank 0's never waits"
+else
+  bad "P12: expected the id wait only in rank 1's script, between build and proof; got: $p12_scripts"
+fi
+# ----------------------------------------------------------------------------
+# P13: a member proves the EXACT commit the run was dispatched on. With
+# PROVE_EXPECT_SHA set the remote checkout fetches that sha by hash and
+# never names the ref (run 35167650156: a `-b unit/e0` clone landed on a
+# tip that had moved after dispatch and the wrong-tree guard fired); without
+# it (a hand run) the ref is cloned. ONE library helper, used by all three
+# GPU legs.
+# ----------------------------------------------------------------------------
+p13_sha_text="$(PROVE_EXPECT_SHA=0123456789abcdef0123456789abcdef01234567 bash -c 'source "'"$DIR"'/runpod_lib.sh" >/dev/null 2>&1; rp_remote_checkout_lines "some-branch" "https://example.invalid/r.git"')"
+p13_ref_text="$(bash -c 'unset PROVE_EXPECT_SHA; source "'"$DIR"'/runpod_lib.sh" >/dev/null 2>&1; rp_remote_checkout_lines "some-branch" "https://example.invalid/r.git"')"
+if printf '%s' "$p13_sha_text" | grep -qF 'git fetch -q --depth 1 origin "0123456789abcdef0123456789abcdef01234567"' \
+   && printf '%s' "$p13_sha_text" | grep -qF 'git checkout -q --detach FETCH_HEAD || { echo "::error::could not check out' \
+   && ! printf '%s' "$p13_sha_text" | grep -qF 'some-branch' \
+   && printf '%s' "$p13_sha_text" | grep -qF 'could not fetch the exact commit'; then
+  ok "P13: with PROVE_EXPECT_SHA the remote checkout fetches that exact sha and never names the ref; a failed fetch is a named error"
+else
+  bad "P13: expected a by-sha fetch with no ref; got: ${p13_sha_text}"
+fi
+if printf '%s' "$p13_ref_text" | grep -qF 'git clone --depth 1 -b "some-branch" "https://example.invalid/r.git" jammi-ai || { echo "::error::could not clone' \
+   && ! printf '%s' "$p13_ref_text" | grep -qF '| tail -1' \
+   && ! printf '%s' "$p13_ref_text" | grep -qF 'FETCH_HEAD'; then
+  ok "P13: without PROVE_EXPECT_SHA (a hand run) the ref is cloned"
+else
+  bad "P13: expected the ref clone without PROVE_EXPECT_SHA; got: ${p13_ref_text}"
+fi
+p13_legs=0
+for leg in runpod_gpu_cluster.sh runpod_gpu_gang.sh runpod_gpu_prove.sh; do
+  grep -qF '$(rp_remote_checkout_lines "${GIT_REF}" "${GIT_REPO}")' "$DIR/$leg" && ! grep -qF 'git clone --depth 1 -b "${GIT_REF}"' "$DIR/$leg" && p13_legs=$((p13_legs + 1))
+done
+if [ "$p13_legs" -eq 3 ]; then
+  ok "P13: all three GPU legs (cluster, gang, prove) check out through the ONE library helper; no leg clones the ref itself"
+else
+  bad "P13: expected all three legs on rp_remote_checkout_lines with no own clone line; got $p13_legs/3"
+fi
+# ----------------------------------------------------------------------------
+# P15: the remote root is a PARAMETER of every leg and the checkout chain
+# fails closed. RP_REMOTE_ROOT roots the checkout, the id file and the
+# artifact dir; rendered under a sandbox root no `/root` literal survives
+# in the remote text; a checkout step that fails STOPS the script by name
+# (nothing ever runs in an unknown working directory — the lane suite once
+# executed this text where /root did not exist and a stubbed clone wrote a
+# tree mirror into the caller's own checkout).
+# ----------------------------------------------------------------------------
+p15_text="$(RP_TWO_HOST_TRANSPORT=pods RP_REMOTE_ROOT=/sandbox/x RP_TWO_HOST_GN_IP_0=10.0.0.1 RP_TWO_HOST_GN_IP_1=10.0.0.2 PROVE_EXPECT_SHA=0123456789abcdef0123456789abcdef01234567 bash -c 'source "'"$CLUSTER_SH"'" >/dev/null 2>&1; export RP_TWO_HOST_GN_IP_0 RP_TWO_HOST_GN_IP_1; _rpc_remote_script 1' 2>&1)"
+if [ "$(printf '%s' "$p15_text" | grep -c '/root')" -eq 0 ] \
+   && printf '%s' "$p15_text" | grep -qF 'cd "/sandbox/x" || { echo "::error::remote root /sandbox/x is not enterable" >&2; exit 1; }' \
+   && printf '%s' "$p15_text" | grep -qF 'export JAMMI_GANG_TWO_HOSTS_ID_FILE=/sandbox/x/nccl.id' \
+   && printf '%s' "$p15_text" | grep -qF 'export JAMMI_GANG_ARTIFACT_DIR=/sandbox/x/jammi-ai/.gang-artifact'; then
+  ok "P15: under RP_REMOTE_ROOT=/sandbox/x the whole remote text (checkout, id file, artifact dir) is rooted there and carries no /root literal"
+else
+  bad "P15: expected a fully re-rooted remote text with no /root literal; got: $(printf '%s' "$p15_text" | grep -n '/root\|sandbox' | head -5)"
+fi
+p15_default="$(RP_TWO_HOST_TRANSPORT=pods RP_TWO_HOST_GN_IP_0=10.0.0.1 RP_TWO_HOST_GN_IP_1=10.0.0.2 bash -c 'unset RP_REMOTE_ROOT; source "'"$CLUSTER_SH"'" >/dev/null 2>&1; export RP_TWO_HOST_GN_IP_0 RP_TWO_HOST_GN_IP_1; _rpc_remote_script 0' 2>&1)"
+if printf '%s' "$p15_default" | grep -qF 'cd "/root" || {' && printf '%s' "$p15_default" | grep -qF 'export JAMMI_GANG_TWO_HOSTS_ID_FILE=/root/nccl.id'; then
+  ok "P15: with RP_REMOTE_ROOT unset the root is /root (a real pod)"
+else
+  bad "P15: expected the /root default; got: $(printf '%s' "$p15_default" | grep -n 'cd \"' | head -2)"
+fi
+p15_fc="$(mktemp -d "$SANDBOX/p15-XXXXXX")"
+p15_out="$(RP_REMOTE_ROOT="$p15_fc/does-not-exist" bash -c 'source "'"$DIR"'/runpod_lib.sh" >/dev/null 2>&1; rp_remote_checkout_lines "b" "https://example.invalid/r.git"' | bash 2>&1; echo "RC=$?")"
+if printf '%s' "$p15_out" | grep -q "RC=1" && printf '%s' "$p15_out" | grep -q "::error::remote root .*/does-not-exist is not enterable" && ! printf '%s' "$p15_out" | grep -qi "clon"; then
+  ok "P15: executed — an un-enterable root stops the checkout by name before any git command (rc 1, never a clone into the caller's cwd)"
+else
+  bad "P15: expected the fail-closed root arm; got: ${p15_out}"
+fi
+if ! grep -nE '"/root/|=/root' "$DIR/runpod_gpu_cluster.sh" "$DIR/runpod_gpu_gang.sh" "$DIR/runpod_gpu_prove.sh" | grep -v '^\S*:[0-9]*:\s*#' | grep -q .; then
+  ok "P15: no GPU leg carries a /root literal outside a comment (the root is RP_REMOTE_ROOT everywhere)"
+else
+  bad "P15: a /root literal survives in a leg: $(grep -nE '"/root/|=/root' "$DIR/runpod_gpu_cluster.sh" "$DIR/runpod_gpu_gang.sh" "$DIR/runpod_gpu_prove.sh" | grep -v '^\S*:[0-9]*:\s*#' | head -3)"
+fi
+# ----------------------------------------------------------------------------
+# P10: prose == code.
+# ----------------------------------------------------------------------------
+for site in "$CLUSTER_SH" "$CLUSTER_YML" "$DEV_GPU_MD"; do
+  rel="${site#"$REPO_ROOT"/}"
+  if grep -qi "pods" "$site" && grep -qi "global.networking\|global network" "$site"; then
+    ok "P10: ${rel} describes the pods transport / Global Networking in prose"
+  else
+    bad "P10: ${rel} does not mention the pods transport or Global Networking -- prose and code have diverged"
+  fi
+done
 
 # ============================================================================
 # check_gpu_prove_once.py's own P7/P8 gates stay green over this lane

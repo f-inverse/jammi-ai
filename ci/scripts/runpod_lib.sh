@@ -349,6 +349,11 @@ RP_REF=""
 # PATH with cuda+mold+rust). Every remote job imports PID 1's real environment.
 RP_ENV_PREAMBLE='while IFS= read -r -d "" __e; do export "$__e"; done < /proc/1/environ'
 
+# The directory a rented host's remote job works under. /root on a real pod;
+# a lane suite that executes a leg's remote text points it at a sandbox and
+# runs the text UNMODIFIED — never a string patch of the script under test.
+RP_REMOTE_ROOT="${RP_REMOTE_ROOT:-/root}"
+
 rp_gql() { curl -s "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" -H 'Content-Type: application/json' --data-binary "$1"; }
 
 # The REST v2 primitive (`https://api.runpod.io/v2/...`, Bearer auth) every
@@ -685,11 +690,47 @@ rp_session_load() {
   rp_init
 }
 
+# THE readiness predicate for a rented host: its sshd answers an executed
+# connect. RunPod's `RUNNING` status and a mapped port say the CONTAINER is
+# up; the image's entrypoint installs openssh-server after boot
+# (`_rp_entrypoint_setup`), so the mapped port refuses connections for tens
+# of seconds first (gpu-cluster run 35163325352: both pods RUNNING and
+# GN-enabled at 224 s, the first ssh to rank 0 refused 0.1 s later). Every
+# leg decides "usable" with this ONE probe -- never with the API status.
+#   rp_sshd_answers <host> <port> [extra ssh options...]
+rp_sshd_answers() {
+  local host="${1:?rp_sshd_answers needs a host}" port="${2:?rp_sshd_answers needs a port}"
+  shift 2
+  ssh "${RP_SSHO[@]}" "$@" -p "$port" "root@${host}" true 2>/dev/null
+}
+
+# The bounded wait on that predicate, for a host whose endpoint is already
+# known: probe every 5 s until sshd answers or `bound` seconds elapse.
+# Prints one line on success; on the bound a named `::error::` and rc 1 --
+# the caller never issues a remote command after rc 1.
+#   rp_wait_sshd <host> <port> <bound-seconds> <label> [extra ssh options...]
+rp_wait_sshd() {
+  local host="${1:?rp_wait_sshd needs a host}" port="${2:?rp_wait_sshd needs a port}" \
+        bound="${3:?rp_wait_sshd needs a bound in seconds}" label="${4:?rp_wait_sshd needs a label}"
+  shift 4
+  local deadline=$(( SECONDS + bound )) started=$SECONDS attempts=0
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    attempts=$(( attempts + 1 ))
+    if rp_sshd_answers "$host" "$port" "$@"; then
+      echo "sshd up on ${label} (${host}:${port}) after $(( SECONDS - started ))s, ${attempts} probe(s)"
+      return 0
+    fi
+    sleep 5
+  done
+  echo "::error::sshd on ${label} (${host}:${port}) answered no connect within ${bound}s (${attempts} probes) -- the pod is RUNNING but its entrypoint has not started sshd; refusing to issue a remote command" >&2
+  return 1
+}
+
 # A recorded pod is not a live pod — the reaper may have collected it, or the
 # host may have died. Callers must confirm before treating a session as usable.
 rp_session_alive() {
   [ -n "$RP_POD_ID" ] && [ -n "$RP_HOST" ] && [ -n "$RP_PORT" ] || return 1
-  ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" true 2>/dev/null
+  rp_sshd_answers "$RP_HOST" "$RP_PORT"
 }
 
 # The whole session table — header included, so the row format exists once. The
@@ -1767,6 +1808,131 @@ rp_cluster_delete() {
   esac
 }
 
+# ═════════════════════════════════════════════════════════════════════════
+# Two-host POD-transport primitives (REST v2, `POST/GET /v2/pods`). A THIRD
+# renting shape, distinct from BOTH the single-pod GraphQL payload
+# (`_rp_deploy_payload`, `podFindAndDeployOnDemand`) and the cluster's own
+# REST payload (`_rp_cluster_payload`, `POST /v2/clusters`): two ORDINARY
+# pods, rented individually, joined by RunPod's Global Networking rather
+# than a CLUSTER object — `runpod_gpu_cluster.sh`'s own `RP_TWO_HOST_
+# TRANSPORT=pods` path. Named identically to an ordinary single pod
+# ("<RP_POD_PREFIX>-ttl<H>", no rank suffix — the shape `rp_sweep`'s own
+# TTL-name parser already recognizes, so BOTH two-host pods fall under the
+# ordinary pod sweep's existing backstop with no separate sweep primitive;
+# rank is tracked by this tooling's own local id-to-rank mapping, never by
+# name) — the caller supplies WHICH data center (co-placement is decided by
+# the driver, not this primitive).
+# ═════════════════════════════════════════════════════════════════════════
+
+# $1=gpuTypeId $2=dataCenterId $3=rank (0 or 1 — name-shape validation only;
+# the created pod's own id, not its name, is what the caller tracks per
+# rank). Prints the REST v2 `POST /v2/pods` request body. Shares
+# `_rp_entrypoint_setup` with both other payload builders (the SAME
+# watchdog+sshd text on every leg).
+_rp_two_host_pod_payload() {
+  local gpu="${1:?_rp_two_host_pod_payload needs a gpuTypeId}" dc="${2:?_rp_two_host_pod_payload needs a dataCenterId}" \
+        rank="${3:?_rp_two_host_pod_payload needs a rank}" setup name
+  setup="$(_rp_entrypoint_setup "$RP_TTL_HOURS")" || return 1
+  name="${RP_POD_PREFIX}-ttl${RP_TTL_HOURS}"
+  rp_name_allowlist_check "two-host pod name (rank ${rank})" "$name" || return 2
+  # REST v2 `POST /v2/pods` field names (docs.runpod.io/api-reference-v2/pods/
+  # create-a-pod): `cloud` and `image` -- NOT the v1 GraphQL `cloudType`/
+  # `imageName` the pod leg's `_rp_deploy_payload` speaks; `disk` is the
+  # container disk in GB (the same RP_DISK_GB the cluster payload sends).
+  python3 - "$gpu" "$dc" "$RP_IMAGE" "$RP_PUBKEY" "$name" "$setup" "$RP_DISK_GB" <<'PY'
+import json, sys
+gpu, dc, image, pub, name, setup, disk_gb = sys.argv[1:8]
+body = {
+    "name": name,
+    "cloud": "SECURE",
+    "globalNetworking": True,
+    "dataCenterIds": [dc],
+    "gpu": {"id": gpu, "count": 1},
+    "image": image,
+    "disk": int(disk_gb),
+    "ports": ["22/tcp"],
+    "startSsh": True,
+    "args": "bash -c '%s'" % setup,
+    "env": {"PUBLIC_KEY": pub},
+}
+print(json.dumps(body))
+PY
+}
+
+# POST /v2/pods — the RENTING ROOT for the two-host pods transport
+# (`RENTING_ROOTS` in `check_gpu_prove_once.py`; P7's closure/derivation
+# scan is seeded from this name). $1=gpuTypeId $2=dataCenterId $3=rank.
+# Prints the new pod's id on success — the SAME three-way judged 201 body
+# (yes-id / no-id / unparseable) as `rp_cluster_create`'s own doc.
+rp_two_host_pod_create() {
+  local gpu="${1:?rp_two_host_pod_create needs a gpuTypeId}" dc="${2:?rp_two_host_pod_create needs a dataCenterId}" \
+        rank="${3:?rp_two_host_pod_create needs a rank}" payload resp status body id prc
+  payload="$(_rp_two_host_pod_payload "$gpu" "$dc" "$rank")" \
+    || { echo "::error::two-host pod create (rank ${rank}): could not build the request body" >&2; return 1; }
+  resp="$(_rp_rest POST /v2/pods "$payload")" \
+    || { echo "::error::two-host pod create (rank ${rank}): REST request failed (transport)" >&2; return 1; }
+  status="$(printf '%s\n' "$resp" | head -n1)"
+  body="$(printf '%s\n' "$resp" | tail -n +2)"
+  case "$status" in
+    201)
+      id="$(printf '%s' "$body" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+if not isinstance(d, dict):
+    sys.exit(2)
+i = d.get("id")
+if not i:
+    sys.exit(1)
+print(i)
+' 2>/dev/null)"
+      prc=$?
+      case "$prc" in
+        0) printf '%s\n' "$id"; return 0 ;;
+        1) echo "::error::two-host pod create (rank ${rank}): 201 but the response body carried no id: ${body}" >&2; return 1 ;;
+        *) echo "::error::two-host pod create (rank ${rank}): 201 but the response body is unparseable: $(printf '%s' "$body" | head -c 300)" >&2; return 1 ;;
+      esac ;;
+    *)
+      echo "::error::two-host pod create (rank ${rank}) refused (status ${status}): $(printf '%s' "$body" | head -c 300)" >&2
+      return 1 ;;
+  esac
+}
+
+# GET /v2/pods/{id}. Prints the raw Pod body on success (200 with the
+# required `id` key present) — the SAME three-way judged shape as
+# `rp_cluster_get`'s own doc. $1=podId.
+rp_pod_get() {
+  local id="${1:?rp_pod_get needs a pod id}" resp status body prc
+  resp="$(_rp_rest GET "/v2/pods/${id}")" \
+    || { echo "::error::pod get ${id}: REST request failed (transport)" >&2; return 1; }
+  status="$(printf '%s\n' "$resp" | head -n1)"
+  body="$(printf '%s\n' "$resp" | tail -n +2)"
+  case "$status" in
+    200)
+      printf '%s' "$body" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+if not isinstance(d, dict):
+    sys.exit(2)
+sys.exit(0 if d.get("id") else 1)
+' 2>/dev/null
+      prc=$?
+      case "$prc" in
+        0) printf '%s' "$body"; return 0 ;;
+        1) echo "::error::pod get ${id}: 200 but the body is missing the required 'id' key: ${body}" >&2; return 1 ;;
+        *) echo "::error::pod get ${id}: 200 but the body is unparseable: $(printf '%s' "$body" | head -c 300)" >&2; return 1 ;;
+      esac ;;
+    *)
+      echo "::error::pod get ${id} refused (status ${status}): $(printf '%s' "$body" | head -c 300)" >&2
+      return 1 ;;
+  esac
+}
+
 # The ONE `-ttl<H>` deadline-NAME parser shared by rp_sweep (pods) and
 # rp_cluster_sweep (clusters) — a `python3` SOURCE FRAGMENT, not a bash
 # function, because both sweeps already do their age/deadline math in ONE
@@ -2107,7 +2273,7 @@ else:
       read -r RP_HOST RP_PORT < <(printf '%s' "$R" | python3 -c 'import sys,json
 p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
 [print(x["ip"], x["publicPort"]) for x in (p.get("ports") or []) if x.get("privatePort")==22 and x.get("isIpPublic")]' | head -1)
-      if [ -n "${RP_HOST:-}" ] && ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" true 2>/dev/null; then
+      if [ -n "${RP_HOST:-}" ] && rp_sshd_answers "$RP_HOST" "$RP_PORT"; then
         # Reachable — now gate on the driver floor. A pod below r560 cannot JIT
         # the image's CUDA 12.6 PTX, so it is unusable for this build; fail over
         # to the next candidate rather than run every test into the #304 floor.
@@ -2315,6 +2481,53 @@ rp_parse_prove_marker() {
     return 0
   fi
   return 1
+}
+
+# The REMOTE checkout text every GPU leg ships to its host: the tree it
+# proves is the exact commit the workflow ran at (`PROVE_EXPECT_SHA`,
+# fetched by sha, depth 1 — a branch name is a moving target: gpu-cluster
+# run 35167650156 cloned `-b unit/e0` after a push had moved that branch,
+# and the wrong-tree guard below fired). Without an expected sha (a hand
+# run) the ref is cloned. Emits shell lines for the remote script's
+# heredoc: `cd /root`, a fresh `jammi-ai` dir, and leaves the caller INSIDE
+# it. The root is RP_REMOTE_ROOT (default /root) — a parameter, never a
+# literal, so a fixture executes this text unmodified in a sandbox.
+# Every leg then deepens the history WITHOUT blobs (commits and trees
+# only, seconds): the artifact registry's ancestry rule (`git merge-base
+# --is-ancestor`, check_cuda_run_artifacts.py rule (d)/(k)) answers "not an
+# ancestor" for every commit but HEAD on a depth-1 history — the pod-leg
+# synthetic tests failed on the prove leg for exactly that (GPU prove
+# 35162725943). `$1` = the ref (used only without PROVE_EXPECT_SHA), `$2` =
+# the repo.
+rp_remote_checkout_lines() {
+  local ref="${1:?rp_remote_checkout_lines needs a ref}" repo="${2:?rp_remote_checkout_lines needs a repo url}"
+  local root="${RP_REMOTE_ROOT:-/root}"
+  # Every step is chained fail-closed: a checkout that cannot enter its root,
+  # clone, fetch or check out STOPS the remote script by name. Nothing may run
+  # in an unknown working directory (the lane suite once executed this text
+  # on a host with no /root, and the stubbed clone wrote a tree mirror into
+  # the caller's own checkout).
+  if [ -n "${PROVE_EXPECT_SHA:-}" ]; then
+    cat <<LINES
+cd "${root}" || { echo "::error::remote root ${root} is not enterable" >&2; exit 1; }
+rm -rf jammi-ai && mkdir jammi-ai && cd jammi-ai || { echo "::error::could not create ${root}/jammi-ai" >&2; exit 1; }
+git init -q && git remote add origin "${repo}" || { echo "::error::could not initialise the checkout" >&2; exit 1; }
+git fetch -q --depth 1 origin "${PROVE_EXPECT_SHA}" \\
+  || { echo "::error::could not fetch the exact commit ${PROVE_EXPECT_SHA} from ${repo}" >&2; exit 1; }
+git checkout -q --detach FETCH_HEAD || { echo "::error::could not check out ${PROVE_EXPECT_SHA}" >&2; exit 1; }
+git fetch -q --filter=blob:none --unshallow origin \\
+  || { echo "::error::could not deepen the checkout (blobless --unshallow failed) -- the artifact registry's ancestry rule cannot run on a depth-1 history" >&2; exit 1; }
+LINES
+  else
+    cat <<LINES
+cd "${root}" || { echo "::error::remote root ${root} is not enterable" >&2; exit 1; }
+rm -rf jammi-ai || exit 1
+git clone --depth 1 -b "${ref}" "${repo}" jammi-ai || { echo "::error::could not clone ${ref} from ${repo}" >&2; exit 1; }
+cd jammi-ai || exit 1
+git fetch -q --filter=blob:none --unshallow origin \\
+  || { echo "::error::could not deepen the checkout (blobless --unshallow failed) -- the artifact registry's ancestry rule cannot run on a depth-1 history" >&2; exit 1; }
+LINES
+  fi
 }
 
 # ONE grammar, hand-mirrored across languages (esc-084/#454) -- bash cannot

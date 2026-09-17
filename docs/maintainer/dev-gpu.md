@@ -768,6 +768,42 @@ land it, or re-measure.
 
 ## The cluster leg — two hosts, one GPU each
 
+**Two transports, one proof.** `RP_TWO_HOST_TRANSPORT` selects which RunPod
+object type carries the two-HOST NCCL bootstrap: `pods` (default) or
+`cluster`. `pods` rents TWO ORDINARY pods (`POST /v2/pods`,
+`rp_two_host_pod_create` — `cloud: SECURE`, `globalNetworking: true`, one
+GPU each), co-located in ONE data center chosen by intersecting the pod
+catalog's own per-data-center availability (`GET /v2/catalog/gpus?
+include=AVAILABILITY&product=POD&count=1&cloud=SECURE`) with the data
+centers RunPod's own `GET /v2/catalog/datacenters` reports `globalNetwork: true`
+for — read LIVE at run time, never a hard-coded list (a snapshot verified
+2026-09-16: CA-MTL-1, CA-MTL-3, EU-CZ-1, EU-FR-1, EU-NL-1, EU-RO-1, EU-SE-1,
+EUR-IS-2, EUR-IS-4, OC-AU-1, US-CA-2, US-GA-2, US-IL-1, US-KS-2, US-NC-1,
+US-TX-3, US-TX-4, US-WA-1). Rank is assigned by CREATION ORDER (the first
+pod created is rank 0, the second rank 1), and each member DERIVES its own
+`NCCL_SOCKET_IFNAME` from its Global-Networking ip at run time
+(the kernel route table, `/proc/net/route`: the interface whose route
+covers that ip by longest prefix — the image ships no `ip` binary) rather
+than the cluster path's `ens1` literal — a member whose route table covers
+no such ip refuses (97) by name, echoing `DERIVED_NCCL_IFACE=` so
+the driver's own post-run proof reads which interface it actually used.
+`cluster` is kept, byte-for-byte what it always was (below) — the SAME
+proof over a different, near-zero-capacity rental mechanism (measured: 8 of
+9 cluster creates refused `Insufficient resources` in one session). Both
+transports assemble the SAME `gang` artifact (`gang.leg` stays `"cluster"`
+either way — the two-HOST leg is the fact that matters downstream);
+`gang.transport` (`instant-cluster` | `global-networking`) is the sub-fact
+naming which mechanism actually carried the run, closed-set and required by
+`check_cuda_run_artifacts.py` rule (k). Cost bound (both parts at S4/the
+catalog's own measured rates, `RP_TTL_HOURS=1`): `cluster` bills
+`2 x $1.908/GPU/h = $3.816/h` (`1 h x $3.816/h = $3.82` terminate-succeeds;
+`(1 + 6) h x $3.816/h = $26.71` sweep-only); `pods` bills
+`2 x $1.59/GPU/h = $3.18/h` (`1 h x $3.18/h = $3.18` terminate-succeeds;
+`(1 + 6) h x $3.18/h = $22.26` sweep-only — both pods fall under the
+ORDINARY pod sweep's own name-shape match, so `gpu-reap.yml`'s SAME
+6-hourly cadence is the backstop, no separate sweep primitive for this
+transport).
+
 A CLUSTER is a SEPARATE RunPod object type from a pod: member pods on one
 private overlay network, created and destroyed as a unit — it is retired by
 deleting the CLUSTER, never by terminating one of its member pods. This
@@ -829,9 +865,17 @@ may still drive the two-host test BY HAND with the primitives above:
    center at `MEDIUM` or better — co-placement needs exactly one.
 2. `rp_cluster_create <gpuTypeId> [dataCenterIds]`; poll `rp_cluster_get`/
    `rp_cluster_pods` until both members are `RUNNING` with a reachable
-   `ssh.direct` (or the overlay-ip fallback through the primary).
-3. On BOTH members: clone this tree at the commit under test and build the
-   `gpu_capability` test target.
+   `ssh.direct` (or the overlay-ip fallback through the primary), then
+   probe each member with `ssh … true` until it answers
+   (`rp_wait_sshd`, bounded by `RP_SSH_WAIT_SECS`): a `RUNNING`
+   pod's entrypoint installs sshd after boot, so the endpoint RunPod
+   reports refuses connections for a while first. Both transports run
+   this probe for both members before any remote command.
+3. On BOTH members, concurrently: fetch this tree at the EXACT commit under
+   test (`PROVE_EXPECT_SHA`, by hash — never a branch name, which can move
+   between dispatch and clone) and build the `gpu_capability` test target (only the proof needs the id,
+   so neither build waits on the other; the driver's one watch loop bounds
+   both by log growth within `RP_INACTIVITY` and the T-10m budget).
 4. On the member running rank 0: export `JAMMI_GANG_TWO_HOSTS_RANK=0`,
    `JAMMI_GANG_TWO_HOSTS_WORLD=2`, `JAMMI_GANG_TWO_HOSTS_ID_FILE=<path>`,
    `JAMMI_GANG_ARTIFACT_DIR=<path>`, `NCCL_SOCKET_IFNAME=ens1`,
@@ -844,8 +888,10 @@ may still drive the two-host test BY HAND with the primitives above:
    --test-threads=1`.
 5. Once rank 0's id file holds exactly 128 bytes, `scp` it to the member
    running rank 1 (mode 0600; delete the local copy once the id has
-   crossed) and start rank 1 with the SAME env (including
-   `JAMMI_REQUIRE_CUDA_TWO_HOSTS=1`), `JAMMI_GANG_TWO_HOSTS_RANK=1`.
+   crossed). Rank 1 runs with the SAME env (including
+   `JAMMI_REQUIRE_CUDA_TWO_HOSTS=1`), `JAMMI_GANG_TWO_HOSTS_RANK=1`, and its
+   script blocks between its build and its proof until that file holds
+   128 bytes — the proof, never the build, waits for the id.
 6. Read both `rank-<r>.json` reports back; `rp_cluster_delete` the cluster
    when done — do not rely on member self-removal alone (below).
 7. Treat the id as a secret throughout: it must never appear in a

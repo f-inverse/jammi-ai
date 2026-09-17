@@ -1,15 +1,39 @@
 #!/usr/bin/env bash
-# GPU cluster leg: two RunPod PODS on one RunPod CLUSTER (REST v2), one A100
-# each, joined over the cluster's own private overlay network — the only
-# place a real cross-HOST NCCL gang is exercised before release. The pod leg
-# (`runpod_gpu_gang.sh`) proves a two-DEVICE gang inside one pod; this driver
-# proves the two-HOST bootstrap (`ncclCommInitRank`, an out-of-band id file)
-# that pod leg cannot reach at all. Never `runpod_gpu_gang.sh` itself — a
-# SEPARATE driver, a SEPARATE workflow, a SEPARATE RunPod object type (a
-# cluster is retired by deleting the CLUSTER, never a member pod — see
-# runpod_lib.sh's own `rp_cluster_delete`/`rp_cluster_sweep`).
+# GPU cluster leg: the two-HOST NCCL bootstrap, rented over ONE of TWO
+# transports selected by `RP_TWO_HOST_TRANSPORT` (`pods` default, `cluster`)
+# — the only place a real cross-HOST NCCL gang is exercised before release.
+# The pod leg (`runpod_gpu_gang.sh`) proves a two-DEVICE gang inside one
+# pod; this driver proves the two-HOST bootstrap (`ncclCommInitRank`, an
+# out-of-band id file) that pod leg cannot reach at all. Never
+# `runpod_gpu_gang.sh` itself — a SEPARATE driver, a SEPARATE workflow, and
+# (under `cluster`) a SEPARATE RunPod object type (a cluster is retired by
+# deleting the CLUSTER, never a member pod — see runpod_lib.sh's own
+# `rp_cluster_delete`/`rp_cluster_sweep`).
 #
-# WHAT IT RENTS: one RunPod CLUSTER, `podCount: 2`, `gpuCountPerPod: 1`, the
+# WHAT IT RENTS, per transport:
+#
+#   `pods` (default — ordinary pods provision reliably where INSTANT
+#   CLUSTERs do not; measured: 8 of 9 cluster creates refused `Insufficient
+#   resources` in one session). TWO ORDINARY pods (`POST /v2/pods`,
+#   `rp_two_host_pod_create`), each `gpu: {id: RP_CLUSTER_GPU_TYPE,
+#   count: 1}`, `cloud: SECURE`, `globalNetworking: true`, co-located in the
+#   SAME data center — chosen by intersecting "offers this GPU type at
+#   RP_CLUSTER_MIN_AVAILABILITY or better" (`GET /v2/catalog/gpus?
+#   include=AVAILABILITY&product=POD&count=1&cloud=SECURE`, the SAME read
+#   `runpod_gpu_prove.sh`/`runpod_gpu_gang.sh` already make) with "carries
+#   Global Networking" (`GET /v2/catalog/datacenters`, `globalNetwork: true` — READ
+#   LIVE at run time, never a hard-coded list; snapshot verified 2026-09-16:
+#   CA-MTL-1, CA-MTL-3, EU-CZ-1, EU-FR-1, EU-NL-1, EU-RO-1, EU-SE-1,
+#   EUR-IS-2, EUR-IS-4, OC-AU-1, US-CA-2, US-GA-2, US-IL-1, US-KS-2,
+#   US-NC-1, US-TX-3, US-TX-4, US-WA-1). Rank is OURS to assign: the first
+#   pod created is rank 0, the second rank 1. Each member derives its OWN
+#   NCCL_SOCKET_IFNAME from its Global-Networking ip at run time (the
+#   kernel route table, /proc/net/route, longest matching prefix — the image
+#   ships no `ip` binary) — never a literal interface name; a member whose
+#   route table covers no such ip refuses (97) by name.
+#
+#   `cluster` (kept, never removed — the SAME proof over a different rental
+#   mechanism). One RunPod CLUSTER, `podCount: 2`, `gpuCountPerPod: 1`, the
 # `RP_CLUSTER_GPU_TYPE` SECURE candidate (default `NVIDIA A100-SXM4-80GB`,
 # the one shape S4 measured co-placed on ONE data center; the workflow's
 # `gpu_type` input may name another part in the sm_80/86/89/90 domain
@@ -20,35 +44,57 @@
 # product=CLUSTER&count=1&cloud=SECURE`) and passes only the data
 # center(s) at `RP_CLUSTER_MIN_AVAILABILITY` (MEDIUM) or better — co-
 # placement needs ONE data center, and the overall (account-wide) figure
-# alone does not establish that any single one actually has it (A1).
+# alone does not establish that any single one actually has it (A1). Both
+# transports assemble the SAME `gang` artifact (`gang.leg == "cluster"` —
+# the two-HOST leg is the fact that matters downstream — `gang.transport`
+# is the sub-fact naming WHICH mechanism carried it: `instant-cluster` or
+# `global-networking`, closed set, checked by `check_cuda_run_artifacts.py`
+# rule (k)).
 #
-# COST BOUND (human-approved, S4's measured $1.908/GPU/h for a SECURE
-# cluster GPU — the catalog's own $1.59 is the POD price, a different rate).
-# The figures below are for the DEFAULT part; an operator-chosen
-# `gpu_type` bills at RunPod's cluster rate for that part, which this header
-# and `test_gpu_cluster_lane.sh`'s G4 re-derivation do not bound — choosing
-# it is the cost decision (an H100 SXM cluster ran at ~$6.6/h in run
-# 35127869122):
+# COST BOUND (human-approved), per transport:
 #
-#   2 GPUs x $1.908/GPU/h = $3.816/h.
+#   `cluster` (S4's measured $1.908/GPU/h for a SECURE cluster GPU — the
+#   catalog's own $1.59 is the POD price, a different rate). The figures
+#   below are for the DEFAULT part; an operator-chosen `gpu_type` bills at
+#   RunPod's cluster rate for that part, which this header and
+#   `test_gpu_cluster_lane.sh`'s G4 re-derivation do not bound — choosing
+#   it is the cost decision (an H100 SXM cluster ran at ~$6.6/h in run
+#   35127869122):
 #
-#   (i) terminate-succeeds (the ordinary path): ONE create (no candidate
-#       walk — a cluster create names its data center directly, unlike a
-#       pod's failover search), billing to RP_TTL_HOURS=1:
-#         1 h x $3.816/h = $3.82 per run.
-#   (ii) sweep-only (the worst path — the EXIT trap's own `rp_cluster_delete`
-#       call fails, AND member self-removal is UNMEASURED — see
-#       runpod_lib.sh's own cluster-primitives header): the cluster bills to
-#       its own TTL, then `gpu-reap.yml`'s 6-hourly `rp_cluster_sweep` is the
-#       backstop:
-#         (1 + 6) h x $3.816/h = $26.71.
+#     2 GPUs x $1.908/GPU/h = $3.816/h.
 #
-# `ci/scripts/test_gpu_cluster_lane.sh` re-derives both figures from this
-# script's own RP_TTL_HOURS/the $1.908 rate/the 2-GPU shape and fails if the
-# printed figure and the mechanism disagree. `≤ 1 h billed, ≤ 2 runs` is the
-# standing spend authorization (2026-09-13) this lane holds to; `MAX_ATTEMPTS`
-# lives in `.github/workflows/gpu-cluster.yml`, exactly the gang lane's own
-# shape (this driver attempts ONE create per invocation; the workflow's own
+#     (i) terminate-succeeds (the ordinary path): ONE create (no candidate
+#         walk — a cluster create names its data center directly, unlike a
+#         pod's failover search), billing to RP_TTL_HOURS=1:
+#           1 h x $3.816/h = $3.82 per run.
+#     (ii) sweep-only (the worst path — the EXIT trap's own
+#         `rp_cluster_delete` call fails, AND member self-removal is
+#         UNMEASURED — see runpod_lib.sh's own cluster-primitives header):
+#         the cluster bills to its own TTL, then `gpu-reap.yml`'s 6-hourly
+#         `rp_cluster_sweep` is the backstop:
+#           (1 + 6) h x $3.816/h = $26.71.
+#
+#   `pods` (the catalog's own SECURE POD rate, $1.59/GPU/h for the same
+#   default A100 SXM4 part):
+#
+#     2 GPUs x $1.59/GPU/h = $3.18/h.
+#
+#     (i) terminate-succeeds: two ordinary creates (no candidate walk — the
+#         co-located data center is chosen up front), billing to
+#         RP_TTL_HOURS=1:
+#           1 h x $3.18/h = $3.18 per run.
+#     (ii) sweep-only (both pods carry the ORDINARY pod-name shape, so
+#         `gpu-reap.yml`'s SAME 6-hourly `rp_sweep` is the backstop — no
+#         separate sweep primitive for this transport):
+#           (1 + 6) h x $3.18/h = $22.26.
+#
+# `ci/scripts/test_gpu_cluster_lane.sh` re-derives every one of these four
+# figures from this script's own RP_TTL_HOURS/each transport's own rate/the
+# 2-GPU shape and fails if the printed figure and the mechanism disagree.
+# `≤ 1 h billed, ≤ 2 runs` is the standing spend authorization
+# (2026-09-13) this lane holds to; `MAX_ATTEMPTS` lives in `.github/
+# workflows/gpu-cluster.yml`, exactly the gang lane's own shape (this
+# driver attempts ONE create sequence per invocation; the workflow's own
 # retry loop is capacity-only, bounded, and never doubles the billed TTL).
 #
 # WHAT IT PROVES: `gang_nccl_two_hosts_reduce_a_known_vector`
@@ -67,7 +113,12 @@
 # atomically, to its own host's id file; this driver polls that file (via
 # `stat` over ssh) until it reports EXACTLY 128 bytes, `scp`s it down to a
 # LOCAL staging copy (`$RP_WORK/nccl.id`, mode 0600), then `scp`s that
-# staging copy up to the member host — ONLY THEN does rank 1 start. The id
+# staging copy up to the member host — ONLY THEN does rank 1's PROOF start
+# (both ranks clone and build concurrently; rank 1's script blocks between
+# its build and its proof until that file holds 128 bytes). The crossing is
+# a phase of the one watch loop, bounded by rank 0's liveness, log growth
+# within RP_INACTIVITY and the T-10m budget — never a separate wall clock
+# (`_rpc_run_two_ranks`). The id
 # never rides inside `JAMMI_GANG_ARTIFACT_DIR` and never reaches this
 # driver's own stdout/log in the clear. The moment the download from the
 # primary is ATTEMPTED, this driver's own cleanup trap starts scanning: on
@@ -173,6 +224,19 @@ RP_CLUSTER_MIN_AVAILABILITY="${RP_CLUSTER_MIN_AVAILABILITY:-MEDIUM}"
 RP_CLUSTER_POD_COUNT=2
 RP_CLUSTER_GPU_COUNT_PER_POD=1
 
+# Which RunPod object type carries the two-HOST NCCL bootstrap: `cluster`
+# (`POST /v2/clusters`, an INSTANT CLUSTER — near-zero capacity, see the
+# module header) or `pods` (`POST /v2/pods` x2, joined by RunPod's Global
+# Networking — the default, since ordinary pods provision reliably where
+# clusters do not). Validated in the executed-only block below (never here
+# — a sourced fixture must never `exit`); `RP_TWO_HOST_TRANSPORT_INVALID`
+# is set instead so the refusal fires at the one place it is checked.
+RP_TWO_HOST_TRANSPORT="${RP_TWO_HOST_TRANSPORT:-pods}"
+case "$RP_TWO_HOST_TRANSPORT" in
+  pods|cluster) : ;;
+  *) RP_TWO_HOST_TRANSPORT_INVALID=1 ;;
+esac
+
 # The rented part's compute capability, DERIVED from the gpuTypeId (never a
 # second literal): each member exports it as `CUDA_COMPUTE_CAP` and refuses
 # to build when `nvidia-smi`'s own `compute_cap` disagrees (the tripwire in
@@ -206,12 +270,12 @@ CLUSTER_TEST_FILTER="${CLUSTER_TEST_FILTER:-gang_nccl_two_hosts}"
 # Where the two-host test writes its per-rank report on EACH member, and
 # where this driver pulls both back to locally. The NCCL id rides NO path
 # under this directory — see the module doc's "THE ID CROSSING".
-CLUSTER_REMOTE_ARTIFACT_DIR="/root/jammi-ai/.gang-artifact"
+CLUSTER_REMOTE_ARTIFACT_DIR="${RP_REMOTE_ROOT}/jammi-ai/.gang-artifact"
 CLUSTER_ARTIFACT_DIR="${CLUSTER_ARTIFACT_DIR:-.gpu-pull/gpu-cluster}"
 # The remote path rank 0 mints the id to and rank 1 reads it from — on
 # EACH host's own filesystem (never shared storage; this driver is what
 # ships it between the two).
-CLUSTER_REMOTE_ID_FILE="/root/nccl.id"
+CLUSTER_REMOTE_ID_FILE="${RP_REMOTE_ROOT}/nccl.id"
 
 # The gating groups this driver's own verdict rule reads `PROVE_GROUP_RC`
 # markers for, per rank — `::group::` names in `_rpc_remote_script`,
@@ -484,6 +548,193 @@ _rpc_ens1_seen() {
   grep -q 'NCCL INFO NET/Socket.*ens1' "$log" 2>/dev/null
 }
 
+# ─────────────────────────────────────────────────────────────────────────
+# The `pods` transport's own pure helpers (RP_TWO_HOST_TRANSPORT=pods): two
+# ORDINARY RunPod pods joined by Global Networking rather than an INSTANT
+# CLUSTER. Every read below reuses `_rp_rest`/`_rpc_pick_data_centers` —
+# never a second literal for the availability read the cluster path already
+# performs.
+# ─────────────────────────────────────────────────────────────────────────
+
+# $1(stdin)=the raw `GET /v2/catalog/datacenters` response BODY. Prints a
+# SPACE-SEPARATED, SORTED list of every data center id carrying
+# `globalNetwork: true` — read LIVE at run time (never a hard-coded list;
+# see the module doc for the snapshot this was verified against on
+# 2026-09-16). Accepts either a bare list or an object carrying a
+# `dataCenters` key (RunPod's documented REST v2 shape has varied across
+# endpoints elsewhere in this file — `rp_cluster_pods` vs `rp_cluster_list`
+# — so both shapes are read rather than assumed). Returns 0 on any
+# successful parse (including zero GN data centers — "no capacity", read by
+# the caller as SUPPLY_CONSTRAINT); 2 when the body could not be read as
+# either documented shape at all.
+_rpc_parse_global_network_datacenters() {
+  python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception as e:
+    print("PARSE_ERROR: could not parse the datacenters response: %s" % e)
+    sys.exit(2)
+if isinstance(d, list):
+    items = d
+elif isinstance(d, dict) and isinstance(d.get("dataCenters"), list):
+    items = d["dataCenters"]
+else:
+    print("PARSE_ERROR: datacenters response is neither a list nor an object carrying a dataCenters list")
+    sys.exit(2)
+out = []
+for dc in items:
+    if isinstance(dc, dict) and dc.get("globalNetwork") is True:
+        did = dc.get("id")
+        if did:
+            out.append(did)
+print(" ".join(sorted(out)))
+'
+}
+
+# The co-placement intersection (P2): $1=space-separated candidate list A
+# $2=space-separated candidate list B. Prints the SORTED intersection,
+# space-separated (possibly empty). Pure set arithmetic — no parsing, no
+# network — so the two upstream reads (pod availability, Global-Networking
+# data centers) stay independently testable and this join is tested on its
+# own.
+_rpc_intersect_data_centers() {
+  local a="${1:-}" b="${2:-}"
+  python3 -c '
+import sys
+a = set(sys.argv[1].split())
+b = set(sys.argv[2].split())
+print(" ".join(sorted(a & b)))
+' "$a" "$b"
+}
+
+# The pods-transport readback parser (P2), mirroring `_rpc_check_readback`'s
+# own three-way judged shape for the cluster path's `Pod` list, but reading
+# TWO independent `GET /v2/pods/{id}` bodies (one per rank — pods rented
+# individually carry no shared `cluster.rank`/`cluster.ip` block at all,
+# unlike a cluster member). $1=rank 0's raw Pod body $2=rank 1's raw Pod
+# body. Prints ONE line per rank: `<podId> <rank> <status> <dataCenterId>
+# <gn_enabled 0|1> <gn_ip_or_dash> <ssh_host_or_dash> <ssh_port_or_dash>`.
+# Returns 0 when BOTH bodies parse (even when a pod is not yet RUNNING or
+# not yet GN-enabled — the caller's own poll loop reads the per-rank
+# fields); 2 when EITHER body could not be read as the documented `Pod`
+# object shape at all.
+_rpc_check_pods_readback() {
+  local body0="${1:?_rpc_check_pods_readback needs rank 0 own Pod body}" \
+        body1="${2:?_rpc_check_pods_readback needs rank 1 own Pod body}"
+  python3 -c '
+import json, sys
+
+def parse(body, rank):
+    try:
+        d = json.loads(body)
+    except Exception as e:
+        return None, "PARSE_ERROR: could not parse rank %d Pod body: %s" % (rank, e)
+    if not isinstance(d, dict):
+        return None, "PARSE_ERROR: rank %d Pod body is not an object" % rank
+    return d, None
+
+for rank, body in ((0, sys.argv[1]), (1, sys.argv[2])):
+    d, err = parse(body, rank)
+    if err:
+        print(err)
+        sys.exit(2)
+    pid = d.get("id") or "?"
+    status = d.get("desiredStatus") or d.get("status") or "?"
+    dc = d.get("dataCenterId") or "-"
+    gn = d.get("globalNetworking") if isinstance(d.get("globalNetworking"), dict) else {}
+    gn_enabled = "1" if gn.get("enabled") is True else "0"
+    gn_ip = gn.get("ip") or "-"
+    ssh = d.get("ssh") if isinstance(d.get("ssh"), dict) else {}
+    ssh_direct = ssh.get("direct") if isinstance(ssh.get("direct"), dict) else {}
+    shost = ssh_direct.get("host") or "-"
+    sport = ssh_direct.get("port")
+    sport = str(sport) if sport is not None else "-"
+    print("%s %d %s %s %s %s %s %s" % (pid, rank, status, dc, gn_enabled, gn_ip, shost, sport))
+' "$body0" "$body1"
+}
+
+# The pods-transport reachability wait loop (P2), mirroring
+# `_rpc_wait_for_members_ready`'s own shape but over TWO independently
+# polled pods rather than one cluster's member listing. Refuses (97) BEFORE
+# any build starts when: either pod never reaches RUNNING within the
+# window, either pod never reports `globalNetworking.enabled` with a GN ip,
+# the two pods' OWN `dataCenterId` disagree (co-placement did not actually
+# happen — measured, never trusted from the create-time request alone), or
+# either pod carries no `ssh.direct` (the pods transport does not use the
+# cluster path's overlay-ip proxy fallback: `scp`/`rsync` cannot ride
+# through it either way, so a direct endpoint is required for BOTH pods,
+# not merely the primary). $1=rank 0 pod id $2=rank 1 pod id
+# $3=RP_SSH_WAIT_SECS. On success prints ONE line: `<host0> <port0> <host1>
+# <port1> <dataCenterId> <gn_ip0> <gn_ip1>` and returns 0. On any refusal,
+# prints nothing to stdout, names the reason on stderr, returns 97.
+_rpc_wait_for_two_host_pods_ready() {
+  local pod0_id="${1:?_rpc_wait_for_two_host_pods_ready needs rank 0 pod id}" \
+        pod1_id="${2:?_rpc_wait_for_two_host_pods_ready needs rank 1 pod id}" \
+        wait_secs="${3:?_rpc_wait_for_two_host_pods_ready needs RP_SSH_WAIT_SECS}"
+  local deadline=$(( SECONDS + wait_secs ))
+  local body0 body1 readback readback_rc
+  local host0="" port0="" host1="" port1="" dc0="" dc1="" gn_ip0="" gn_ip1=""
+  local ready0=0 ready1=0
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    body0="$(rp_pod_get "$pod0_id" 2>/dev/null)"
+    body1="$(rp_pod_get "$pod1_id" 2>/dev/null)"
+    if [ -n "$body0" ] && [ -n "$body1" ]; then
+      readback="$(_rpc_check_pods_readback "$body0" "$body1")"
+      readback_rc=$?
+      if [ "$readback_rc" -eq 0 ]; then
+        ready0=0; ready1=0
+        while IFS=' ' read -r _pid rank status dc gn_en gn_ip shost sport; do
+          [ -n "$rank" ] || continue
+          if [ "$status" = "RUNNING" ] && [ "$gn_en" = "1" ] && [ "$gn_ip" != "-" ] && [ "$shost" != "-" ]; then
+            if [ "$rank" = "0" ]; then
+              ready0=1; host0="$shost"; port0="$sport"; dc0="$dc"; gn_ip0="$gn_ip"
+            else
+              ready1=1; host1="$shost"; port1="$sport"; dc1="$dc"; gn_ip1="$gn_ip"
+            fi
+          fi
+        done <<< "$readback"
+        [ "$ready0" -eq 1 ] && [ "$ready1" -eq 1 ] && break
+      fi
+    fi
+    sleep 5
+  done
+  if [ "$ready0" -ne 1 ] || [ "$ready1" -ne 1 ]; then
+    echo "::error::not every two-host pod reached RUNNING with Global Networking enabled and a direct ssh endpoint within ${wait_secs}s (rank 0 ready: ${ready0}, rank 1 ready: ${ready1})" >&2
+    return 97
+  fi
+  if [ "$dc0" != "$dc1" ]; then
+    echo "::error::the two pods landed in DIFFERENT data centers (rank 0: ${dc0}, rank 1: ${dc1}) -- co-placement failed; refusing before any build starts" >&2
+    return 97
+  fi
+  printf '%s %s %s %s %s %s %s\n' "$host0" "$port0" "$host1" "$port1" "$dc0" "$gn_ip0" "$gn_ip1"
+  return 0
+}
+
+# P4: reads a rank's own log for the `DERIVED_NCCL_IFACE=<iface>` marker the
+# pods-transport remote script echoes right after deriving its interface
+# from the Global-Networking ip (never before — a marker line the remote
+# script never reaches is exactly "the derivation was never attempted or
+# refused", read by the caller as an empty string, never a stale guess).
+# $1=log path. Prints the interface name, or nothing when the marker is
+# absent.
+_rpc_parse_derived_iface() {
+  local log="${1:?_rpc_parse_derived_iface needs a log path}"
+  grep -oE '^DERIVED_NCCL_IFACE=.*$' "$log" 2>/dev/null | tail -1 | cut -d= -f2-
+}
+
+# P4's log-side proof, generalizing `_rpc_ens1_seen` to an ARBITRARY
+# interface name (the pods transport's own derived one, never the cluster
+# path's `ens1` literal). $1=a rank's own log file $2=the interface name to
+# look for. Returns 0 when the log names that interface for NCCL's own
+# NET/socket transport line; 1 when it does not (a missing line, or an
+# empty $2, is this driver's own refusal, by name, never a silent pass).
+_rpc_net_iface_seen() {
+  local log="${1:?_rpc_net_iface_seen needs a log path}" iface="${2:-}"
+  [ -n "$iface" ] || return 1
+  grep -qF "NCCL INFO NET/Socket" "$log" 2>/dev/null && grep -q "NCCL INFO NET/Socket.*${iface}" "$log" 2>/dev/null
+}
+
 # P-C: the MEASURED cluster shape, read from the SAME `Cluster` object
 # `rp_cluster_get` already returns (`GET /v2/clusters/{id}`, which echoes
 # the create request's own `compute` block back) -- never the request-side
@@ -577,13 +828,211 @@ rp_cluster_verdict() {
   return "$r1"
 }
 
+# Point 4 of the pods-transport design: the ONE place the two transports'
+# remote text actually differs. $1=rank. Under `RP_TWO_HOST_TRANSPORT=
+# cluster` prints EXACTLY the pre-existing literal (`export
+# NCCL_SOCKET_IFNAME=ens1`) — byte-for-byte, so the cluster path's own text
+# (and every fixture asserting it) is unchanged. Under `pods`, prints shell
+# TEXT that DERIVES the interface ON THE REMOTE HOST, at run time, from that
+# rank's own Global-Networking ip (`RP_TWO_HOST_GN_IP_<rank>`, set by the
+# executed block once the readback wait resolves it — never a literal
+# interface name): /proc/net/route lists every route as little-endian hex
+# Destination/Mask per Iface; the interface whose route covers the GN ip by
+# LONGEST prefix wins (the default route, mask 0, never matches); no match
+# is a NAMED refusal (97), never a silent fall-through to some other
+# interface. No iproute2 anywhere — the image ships none. Echoes `DERIVED_NCCL_IFACE=<iface>` right after a successful
+# derivation so the LOCAL driver's own post-run proof
+# (`_rpc_parse_derived_iface`/`_rpc_net_iface_seen`) reads which interface
+# this rank actually used, never re-guessing it.
+_rpc_two_host_iface_lines() {
+  local rank="${1:?_rpc_two_host_iface_lines needs a rank}"
+  if [ "${RP_TWO_HOST_TRANSPORT:-pods}" = "cluster" ]; then
+    printf 'export NCCL_SOCKET_IFNAME=ens1\n'
+    return 0
+  fi
+  local gn_ip_var="RP_TWO_HOST_GN_IP_${rank}"
+  # The interface is read from the kernel's own route table (/proc/net/route:
+  # little-endian hex Destination/Mask per Iface), never from iproute2 — the
+  # CI image ships no `ip` binary (run 35166917277: both ranks refused with
+  # "ip: command not found"). Longest matching prefix wins; the default
+  # route (mask 0) never matches. RP_ROUTE_TABLE lets the lane suite feed a
+  # fixture table; a member always reads the real one.
+  cat <<IFACE
+gn_ip="${!gn_ip_var}"
+route_table="\${RP_ROUTE_TABLE:-/proc/net/route}"
+IFS=. read -r _a _b _c _d <<< "\$gn_ip"
+gn_le=\$(( (_d << 24) | (_c << 16) | (_b << 8) | _a ))
+iface=""; best_mask=-1
+while read -r _ifn _dest _gw _flags _ref _use _metric _mask _rest; do
+  [ "\$_ifn" = "Iface" ] && continue
+  [ -n "\$_mask" ] || continue
+  _m=\$(( 16#\$_mask )); _dst=\$(( 16#\$_dest ))
+  [ "\$_m" -eq 0 ] && continue
+  if [ \$(( gn_le & _m )) -eq "\$_dst" ] && [ "\$_m" -gt "\$best_mask" ]; then
+    best_mask=\$_m; iface="\$_ifn"
+  fi
+done < "\$route_table"
+if [ -z "\$iface" ]; then
+  echo "::error::no route in \$route_table covers the Global-Networking ip \$gn_ip -- refusing to derive NCCL_SOCKET_IFNAME" >&2
+  exit 97
+fi
+echo "DERIVED_NCCL_IFACE=\$iface"
+export NCCL_SOCKET_IFNAME="\$iface"
+IFACE
+}
+
+# Every rank log the run produced ships in the artifact on EVERY exit arm —
+# a refusal that leaves only "rank 0 ended (rc=97)" in run.log and the
+# reason on a terminated pod is not a diagnosis (run 35166195386). The
+# id-secrecy scan already covers `$CLUSTER_ARTIFACT_DIR`, so the logs are
+# scanned like every other carrier before upload.
+_rpc_ship_rank_logs() {
+  mkdir -p "$CLUSTER_ARTIFACT_DIR"
+  [ -n "${rank0_log:-}" ] && cp -f "$rank0_log" "${CLUSTER_ARTIFACT_DIR}/rank0.log" 2>/dev/null || echo "::warning::could not copy rank 0's own log into ${CLUSTER_ARTIFACT_DIR}"
+  [ -n "${rank1_log:-}" ] && cp -f "$rank1_log" "${CLUSTER_ARTIFACT_DIR}/rank1.log" 2>/dev/null || echo "::warning::could not copy rank 1's own log into ${CLUSTER_ARTIFACT_DIR}"
+}
+
+_rpc_run_two_ranks() {
+  local rc=0
+  _rpc_run_two_ranks_inner "$@" || rc=$?
+  _rpc_ship_rank_logs
+  return "$rc"
+}
+
+# The size of rank 0's id file, read over ssh: the ONE probe the id crossing
+# polls. A helper so the lane suite can drive `_rpc_run_two_ranks` with a
+# fixture that mints the id after N polls.
+_rpc_remote_id_size() { # $1=host $2=port
+  ssh "${RP_SSHO[@]}" -p "$2" "root@${1}" "stat -c%s '${CLUSTER_REMOTE_ID_FILE}' 2>/dev/null"
+}
+
+# Run the two ranks, shared by BOTH transports (the same defect lived in two
+# copies of this text). Both members clone and build CONCURRENTLY — only the
+# PROOF needs the id — and the id crossing is a phase of the watch loop,
+# bounded by the SAME three rules as everything else (rank 0's liveness and
+# log growth within RP_INACTIVITY, the wrong-tree check, the T-10m budget),
+# never by a wall clock unrelated to the work it waits on (run 35164486335:
+# the crossing was bounded by RP_SSH_WAIT_SECS=300 s while rank 0's cold
+# build alone takes far longer, so no cold run could ever pass). Rank 1's
+# own remote script blocks between its build and its proof until the id file
+# it was shipped holds exactly 128 bytes; the id still travels ONLY through
+# the staging copy, after rank 0 minted it (`_rpc_remote_script`'s doc).
+#   $1=primary host $2=primary port $3=member host $4=member port;
+#   `member_extra_sshopts[@]` (global; empty under `pods`) rides on every
+#   member call. Sets the globals the assembly step reads: rank0_log,
+#   rank1_log, rank0_rc, rank1_rc, STAGING_ID_FILE, id_landed.
+_rpc_run_two_ranks_inner() {
+  local primary_host="${1:?_rpc_run_two_ranks needs the primary host}" \
+        primary_port="${2:?_rpc_run_two_ranks needs the primary port}" \
+        member_host="${3:?_rpc_run_two_ranks needs the member host}" \
+        member_port="${4:?_rpc_run_two_ranks needs the member port}"
+  _rpc_phase "build (both ranks, concurrently) + two-host proof"
+  rank0_log="$(mktemp)"; rank1_log="$(mktemp)"
+  STAGING_ID_FILE="$RP_WORK/nccl.id"
+  # Every remote job imports PID 1's environment FIRST (RP_ENV_PREAMBLE, the
+  # library's one definition, prepended exactly as rp_run_remote /
+  # rp_run_remote_watched do): an sshd session does not inherit the
+  # container's Dockerfile ENV, so without it the member builds with the
+  # system gcc, which does not know the mold link flag the workspace's cargo
+  # config asks for (run 35169035056: rank 0's build died at the linker).
+  { printf '%s\n' "$RP_ENV_PREAMBLE"; _rpc_remote_script 0; } | ssh "${RP_SSHO[@]}" -p "$primary_port" "root@${primary_host}" "timeout ${RP_TIMEOUT:-3000} bash -s" > "$rank0_log" 2>&1 &
+  rank0_pid=$!
+  { printf '%s\n' "$RP_ENV_PREAMBLE"; _rpc_remote_script 1; } | ssh "${RP_SSHO[@]}" "${member_extra_sshopts[@]}" -p "$member_port" "root@${member_host}" "timeout ${RP_TIMEOUT:-3000} bash -s" > "$rank1_log" 2>&1 &
+  rank1_pid=$!
+  _rpc_phase "watching both ranks (id crossing + inactivity + wrong-tree + budget)"
+  local last_growth=$SECONDS last_size0=0 last_size1=0 sz0 sz1 remote_size wrong_tree candidate_log line
+  while kill -0 "$rank0_pid" 2>/dev/null || kill -0 "$rank1_pid" 2>/dev/null; do
+    sleep 5
+    if [ "${id_landed:-0}" -ne 1 ]; then
+      if ! kill -0 "$rank0_pid" 2>/dev/null; then
+        wait "$rank0_pid" 2>/dev/null; rank0_rc=$?
+        echo "::error::rank 0 ended (rc=${rank0_rc}) before minting the 128-byte id file -- the proof never started (its log is in the artifact)"
+        kill -TERM "$rank1_pid" 2>/dev/null; wait "$rank1_pid" 2>/dev/null
+        return 76
+      fi
+      remote_size="$(_rpc_remote_id_size "$primary_host" "$primary_port")"
+      if [ "$remote_size" = "128" ]; then
+        id_landed=1
+        scp "${RP_SSHO[@]}" -P "$primary_port" "root@${primary_host}:${CLUSTER_REMOTE_ID_FILE}" "$STAGING_ID_FILE" \
+          || { echo "::error::could not scp the id down from the primary"; kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null; return 76; }
+        chmod 600 "$STAGING_ID_FILE"
+        _rpc_id_file_ready "$STAGING_ID_FILE" \
+          || { echo "::error::the staged id copy is not exactly 128 bytes -- refusing to ship it"; kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null; return 76; }
+        scp "${RP_SSHO[@]}" "${member_extra_sshopts[@]}" -P "$member_port" "$STAGING_ID_FILE" "root@${member_host}:${CLUSTER_REMOTE_ID_FILE}" \
+          || { echo "::error::could not scp the id up to the member"; kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null; return 76; }
+        echo "the id crossed to the member at $(( SECONDS ))s"
+      fi
+    fi
+    sz0=$(wc -c < "$rank0_log" 2>/dev/null || echo 0)
+    sz1=$(wc -c < "$rank1_log" 2>/dev/null || echo 0)
+    if [ "$sz0" -gt "$last_size0" ] || [ "$sz1" -gt "$last_size1" ]; then
+      last_growth=$SECONDS
+      last_size0=$sz0; last_size1=$sz1
+    fi
+    if [ -n "${PROVE_EXPECT_SHA:-}" ]; then
+      wrong_tree=0
+      for candidate_log in "$rank0_log" "$rank1_log"; do
+        while IFS= read -r line; do
+          if rp_parse_prove_sha "$line" && [ "$RP_PARSED_PROVE_SHA" != "$PROVE_EXPECT_SHA" ]; then
+            wrong_tree=1
+            break
+          fi
+        done < "$candidate_log"
+        [ "$wrong_tree" -eq 1 ] && break
+      done
+      if [ "$wrong_tree" -eq 1 ]; then
+        echo "::error::wrong tree: a rank's own PROVE_SHA disagreed with PROVE_EXPECT_SHA=${PROVE_EXPECT_SHA}"
+        kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null
+        return 77
+      fi
+    fi
+    if [ $(( SECONDS - last_growth )) -ge "${RP_INACTIVITY}" ]; then
+      echo "::error::inactivity: no new output on either rank's log for ${RP_INACTIVITY}s"
+      kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null
+      return 76
+    fi
+    if [ "$SECONDS" -ge "$DEADLINE" ]; then
+      echo "::error::budget cut at T-10m (per-phase breakdown above)"
+      kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null
+      return 124
+    fi
+  done
+  wait "$rank0_pid"; rank0_rc=$?
+  wait "$rank1_pid"; rank1_rc=$?
+  if [ "${id_landed:-0}" -ne 1 ]; then
+    echo "::error::both ranks ended (rank 0 rc=${rank0_rc}, rank 1 rc=${rank1_rc}) and the id never crossed"
+    return 76
+  fi
+  return 0
+}
+
 # The shared per-rank remote script text (F13: the zero-test tripwire lives
 # HERE, spliced via the pre-computed `${cluster_zero_test_tripwire}`
 # variable — never a bare `$(...)` inside this heredoc). $1=rank (0|1).
 # `world`/`pod_count`/`gpu_count_per_pod` derive from
 # RP_CLUSTER_POD_COUNT/RP_CLUSTER_GPU_COUNT_PER_POD, never a second literal.
+# The NCCL interface line itself is transport-specific
+# (`_rpc_two_host_iface_lines`, spliced via the pre-computed
+# `${two_host_iface_lines}` variable — same "never a bare `$(...)` inside
+# this heredoc" rule F13 already states) — everything else is ONE script,
+# shared, transport-agnostic.
 _rpc_remote_script() {
   local rank="${1:?_rpc_remote_script needs a rank}"
+  local two_host_iface_lines id_wait_lines="" remote_checkout_lines
+  two_host_iface_lines="$(_rpc_two_host_iface_lines "$rank")"
+  remote_checkout_lines="$(rp_remote_checkout_lines "${GIT_REF}" "${GIT_REPO}")"
+  # Every rank but 0 blocks between its build and its proof until the id
+  # rank 0 minted has been shipped to it (128 bytes exactly); the heartbeat
+  # line keeps the driver's inactivity watchdog fed while it waits. Rank 0
+  # mints the id inside its own proof and never waits.
+  if [ "$rank" != "0" ]; then
+    id_wait_lines='echo "=== id-wait: rank 1 built; waiting for the 128-byte id file rank 0 mints ==="
+while [ "$(stat -c%s "${JAMMI_GANG_TWO_HOSTS_ID_FILE}" 2>/dev/null)" != "128" ]; do
+  echo "id-wait: not yet (${SECONDS}s)"
+  sleep 10
+done
+echo "=== id-wait: the id landed ==="'
+  fi
   cat <<EOF
 export CARGO_TERM_COLOR=never
 export CARGO_BUILD_RUSTC_WRAPPER=  # wrapper-off (ledger row 17: no cross-target-dir reuse on this image)
@@ -593,7 +1042,7 @@ export JAMMI_REQUIRE_CUDA_TWO_HOSTS=1
 export JAMMI_GANG_TWO_HOSTS_RANK=${rank}
 export JAMMI_GANG_TWO_HOSTS_WORLD=${RP_CLUSTER_POD_COUNT}
 export JAMMI_GANG_TWO_HOSTS_ID_FILE=${CLUSTER_REMOTE_ID_FILE}
-export NCCL_SOCKET_IFNAME=ens1
+${two_host_iface_lines}
 export NCCL_DEBUG=INFO
 echo "::group::device"
 nvidia-smi --query-gpu=index,name,compute_cap,driver_version --format=csv
@@ -609,9 +1058,7 @@ if [ "\${compute_cap_norm}" != "\${CUDA_COMPUTE_CAP:-}" ]; then
   exit 97
 fi
 echo "::endgroup::"
-cd /root && rm -rf jammi-ai
-git clone --depth 1 -b "${GIT_REF}" "${GIT_REPO}" jammi-ai 2>&1 | tail -1
-cd jammi-ai
+${remote_checkout_lines}
 echo "PROVE_SHA=\$(git rev-parse HEAD)"
 rc=0
 git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass \\
@@ -624,6 +1071,7 @@ cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capa
 echo "PROVE_GROUP_RC name=cluster-build rc=\${grc}"
 echo "::endgroup::"
 
+${id_wait_lines}
 echo "::group::cluster-proof"
 grc=0
 mkdir -p "\${JAMMI_GANG_ARTIFACT_DIR}"
@@ -647,19 +1095,30 @@ EOF
 # `rank-<r>.json` reports (this driver is the SOLE writer of the assembled
 # artifact; the ranks only report). $1=rank0 json path $2=rank1 json path
 # $3=git_sha $4=box label $5=out path $6=pod_count (MEASURED, from
-# `_rpc_parse_cluster_shape`) $7=gpu_count_per_pod (MEASURED) $8=ttl_hours
-# (optional, default 1). Prints nothing; returns 0 on a successful write
-# (regardless of the recorded verdict — a `fail` is representable, never
-# refused at assembly time), 1 when EITHER rank report is missing or
-# malformed (an artifact with no evidence to assemble from is refused
-# outright, never synthesized), 2 on the named per-rank refusals below.
+# `_rpc_parse_cluster_shape` under `cluster`, or the literal 2 under `pods`
+# — both transports rent exactly 2 pods, 1 GPU each) $7=gpu_count_per_pod
+# (MEASURED) $8=ttl_hours (optional, default 1) $9=transport — REQUIRED,
+# exactly `instant-cluster` or `global-networking` (P7: a reader must never
+# mistake one rental mechanism's run for the other's). Prints nothing;
+# returns 0 on a successful write (regardless of the recorded verdict — a
+# `fail` is representable, never refused at assembly time), 1 when EITHER
+# rank report is missing or malformed, or `transport` is outside the closed
+# set (an artifact with no evidence to assemble from, or an unrecorded
+# rental mechanism, is refused outright, never synthesized), 2 on the named
+# per-rank refusals below.
 _rpc_assemble_gang_artifact() {
   local r0="${1:?needs rank-0.json}" r1="${2:?needs rank-1.json}" git_sha="${3:?needs git_sha}" \
         box="${4:?needs a box label}" out="${5:?needs an output path}" \
-        pod_count="${6:?needs the MEASURED pod_count}" gpu_count_per_pod="${7:?needs the MEASURED gpu_count_per_pod}"
+        pod_count="${6:?needs the MEASURED pod_count}" gpu_count_per_pod="${7:?needs the MEASURED gpu_count_per_pod}" \
+        transport="${9:?needs the transport (instant-cluster|global-networking)}"
+  case "$transport" in
+    instant-cluster|global-networking) : ;;
+    *) echo "::error::_rpc_assemble_gang_artifact: transport must be 'instant-cluster' or 'global-networking', got '${transport}'" >&2; return 1 ;;
+  esac
   python3 -c '
 import json, sys
 r0_path, r1_path, git_sha, box, out_path, pod_count_s, gpu_count_per_pod_s = sys.argv[1:8]
+transport = sys.argv[9] if len(sys.argv) > 9 else ""
 try:
     r0 = json.load(open(r0_path))
     r1 = json.load(open(r1_path))
@@ -764,6 +1223,13 @@ artifact = {
         "pod_count": pod_count,
         "gpu_count_per_pod": gpu_count_per_pod,
         "ttl_hours": int((sys.argv[8] if len(sys.argv) > 8 else "1")),
+        # P7: which RENTAL MECHANISM produced this run -- a reader must
+        # never mistake a Global-Networking run for an Instant-Cluster one.
+        # Bash-side already refused a value outside the closed set before
+        # this python process ever started; asserted again here is
+        # deliberately redundant (belt), the checker (rule (k)) is the
+        # authoritative gate (suspenders).
+        "transport": transport,
     },
 }
 if verdict == "fail":
@@ -771,7 +1237,7 @@ if verdict == "fail":
 with open(out_path, "w") as f:
     json.dump(artifact, f, indent=2)
     f.write("\n")
-' "$r0" "$r1" "$git_sha" "$box" "$out" "$pod_count" "$gpu_count_per_pod" "${RP_TTL_HOURS}"
+' "$r0" "$r1" "$git_sha" "$box" "$out" "$pod_count" "$gpu_count_per_pod" "${RP_TTL_HOURS}" "$transport"
 }
 
 # Wraps the id-secrecy scan (F5, `gang_id_secrecy_scan.py`) invocation in
@@ -951,6 +1417,28 @@ _rpc_cleanup_cluster() {
     fi
   fi
 
+  # P5 (pods transport): terminates BOTH pods on every exit arm, exactly
+  # like the cluster branch above does for its one cluster -- a SIBLING
+  # block, gated on the pods-transport's OWN globals
+  # (`two_host_pod_id_<rank>`, set the moment each create call returns an
+  # id, never only on the happy path) rather than on `RP_TWO_HOST_
+  # TRANSPORT` itself, so the cluster branch above is untouched byte-for-
+  # byte and this block is simply INERT (both variables unset) on the
+  # cluster path. `rp_terminate` (runpod_lib.sh) is the SAME GraphQL
+  # `podTerminate` mutation every other pod lane in this tree already uses
+  # -- no new termination primitive for this transport.
+  local two_host_pid two_host_leaked=0
+  for two_host_pid in "${two_host_pod_id_0:-}" "${two_host_pod_id_1:-}"; do
+    [ -n "$two_host_pid" ] || continue
+    if rp_terminate "$two_host_pid" >/dev/null 2>&1; then
+      echo "two-host pod ${two_host_pid} terminated by the driver's own EXIT trap"
+    else
+      echo "::error::LEAKED two-host pod ${two_host_pid}: could not terminate on exit -- gpu-reap.yml's own pod sweep is the backstop"
+      two_host_leaked=1
+    fi
+  done
+  [ "$two_host_leaked" -eq 1 ] && [ "$rc" -eq 0 ] && rc=1
+
   # F5 advisory: the staging id file is deleted on EVERY exit AFTER the
   # scan above, regardless of RP_SESSION/RP_WORK_IS_TEMP -- never left to
   # rp_cleanup's own conditional `rm -rf "$RP_WORK"` (which only fires when
@@ -1027,6 +1515,21 @@ if [ -z "$NATIVE_COMPUTE_CAP" ]; then
   echo "::error::RP_CLUSTER_GPU_TYPE '${RP_CLUSTER_GPU_TYPE}' is outside this leg's domain (no compute capability mapping in _rpc_compute_cap_for_gpu_type: sm_80/86/89/90 parts only) -- refused before any rent"
   exit 2
 fi
+# P1: RP_TWO_HOST_TRANSPORT is validated at source time (above, before the
+# sourced-execution guard) into RP_TWO_HOST_TRANSPORT_INVALID rather than
+# exiting there directly (a sourced fixture must never exit) -- refused
+# HERE, before any rent, on the one path that actually executes.
+if [ -n "${RP_TWO_HOST_TRANSPORT_INVALID:-}" ]; then
+  echo "::error::RP_TWO_HOST_TRANSPORT must be 'pods' or 'cluster', got '${RP_TWO_HOST_TRANSPORT}'"
+  exit 2
+fi
+echo "two-host transport: ${RP_TWO_HOST_TRANSPORT}"
+
+if [ "$RP_TWO_HOST_TRANSPORT" = "cluster" ]; then
+# --------------------------------------------------------------------------- #
+# The `cluster` transport (RunPod INSTANT CLUSTER, POST /v2/clusters) --
+# UNCHANGED from before this transport existed (P1: byte-for-byte).
+# --------------------------------------------------------------------------- #
 _rpc_phase "availability read (product=CLUSTER, cloud=SECURE)"
 avail_resp="$(_rp_rest GET "/v2/catalog/gpus?include=AVAILABILITY&product=CLUSTER&count=1&cloud=SECURE")"
 avail_status="$(printf '%s\n' "$avail_resp" | head -n1)"
@@ -1106,105 +1609,17 @@ member_extra_sshopts=()
 # explicitly instead of one shared array with an embedded, flag-specific
 # `-p`/`-P`).
 [ "$proxy_flag" = "1" ] && member_extra_sshopts=(-o "ProxyJump=root@${primary_host}:${primary_port}")
+_rpc_phase "waiting for sshd on both members (an executed connect per member)"
+rp_wait_sshd "$primary_host" "$primary_port" "$RP_SSH_WAIT_SECS" "rank 0" || exit 76
+rp_wait_sshd "$member_host" "$member_port" "$RP_SSH_WAIT_SECS" "rank 1" "${member_extra_sshopts[@]}" || exit 76
 
-_rpc_phase "build + two-host proof"
-rank0_log="$(mktemp)"; rank1_log="$(mktemp)"
-STAGING_ID_FILE="$RP_WORK/nccl.id"
-
-_rpc_remote_script 0 | ssh "${RP_SSHO[@]}" -p "$primary_port" "root@${primary_host}" "timeout ${RP_TIMEOUT:-3000} bash -s" > "$rank0_log" 2>&1 &
-rank0_pid=$!
-
-_rpc_phase "polling the primary for the 128-byte id file"
-id_deadline=$(( SECONDS + RP_SSH_WAIT_SECS ))
-id_ready=0
-while [ "$SECONDS" -lt "$id_deadline" ]; do
-  if ! kill -0 "$rank0_pid" 2>/dev/null; then
-    break  # rank 0 already exited -- stop polling; `wait` below reads its rc.
-  fi
-  remote_size="$(ssh "${RP_SSHO[@]}" -p "$primary_port" "root@${primary_host}" "stat -c%s '${CLUSTER_REMOTE_ID_FILE}' 2>/dev/null")"
-  if [ "$remote_size" = "128" ]; then
-    id_ready=1
-    break
-  fi
-  sleep 3
-done
-if [ "$id_ready" -ne 1 ]; then
-  echo "::error::rank 0 never produced a 128-byte id file within ${RP_SSH_WAIT_SECS}s"
-  kill -TERM "$rank0_pid" 2>/dev/null; wait "$rank0_pid" 2>/dev/null
-  exit 76
-fi
-
-# P-A: from THIS line on, the id is about to exist locally on this runner
-# -- every exit arm from here onward (a failed download, a bad staging
-# size, a failed upload to the member, the watch loop's own inactivity/
-# wrong-tree/budget exits, a failed pull, a refused assembly) is scanned by
-# the EXIT trap before anything can be uploaded. Set BEFORE the download is
-# attempted, not after it succeeds, so a partially-written staging file
-# from a failed transfer is scanned (and refused as UNEXAMINABLE by its
-# own wrong byte-length, never silently skipped) rather than ignored.
-id_landed=1
-
-scp "${RP_SSHO[@]}" -P "$primary_port" "root@${primary_host}:${CLUSTER_REMOTE_ID_FILE}" "$STAGING_ID_FILE" \
-  || { echo "::error::could not scp the id down from the primary"; kill -TERM "$rank0_pid" 2>/dev/null; wait "$rank0_pid" 2>/dev/null; exit 76; }
-chmod 600 "$STAGING_ID_FILE"
-_rpc_id_file_ready "$STAGING_ID_FILE" \
-  || { echo "::error::the staged id copy is not exactly 128 bytes -- refusing to ship it"; kill -TERM "$rank0_pid" 2>/dev/null; wait "$rank0_pid" 2>/dev/null; exit 76; }
-
-scp "${RP_SSHO[@]}" "${member_extra_sshopts[@]}" -P "$member_port" "$STAGING_ID_FILE" "root@${member_host}:${CLUSTER_REMOTE_ID_FILE}" \
-  || { echo "::error::could not scp the id up to the member"; kill -TERM "$rank0_pid" 2>/dev/null; wait "$rank0_pid" 2>/dev/null; exit 76; }
-
-_rpc_remote_script 1 | ssh "${RP_SSHO[@]}" "${member_extra_sshopts[@]}" -p "$member_port" "root@${member_host}" "timeout ${RP_TIMEOUT:-3000} bash -s" > "$rank1_log" 2>&1 &
-rank1_pid=$!
-
-_rpc_phase "watching both ranks (inactivity + wrong-tree + budget)"
-last_growth=$SECONDS
-last_size0=0; last_size1=0
-while kill -0 "$rank0_pid" 2>/dev/null || kill -0 "$rank1_pid" 2>/dev/null; do
-  sleep 5
-  sz0=$(wc -c < "$rank0_log" 2>/dev/null || echo 0)
-  sz1=$(wc -c < "$rank1_log" 2>/dev/null || echo 0)
-  if [ "$sz0" -gt "$last_size0" ] || [ "$sz1" -gt "$last_size1" ]; then
-    last_growth=$SECONDS
-    last_size0=$sz0; last_size1=$sz1
-  fi
-  if [ -n "${PROVE_EXPECT_SHA:-}" ]; then
-    wrong_tree=0
-    for candidate_log in "$rank0_log" "$rank1_log"; do
-      while IFS= read -r line; do
-        if rp_parse_prove_sha "$line" && [ "$RP_PARSED_PROVE_SHA" != "$PROVE_EXPECT_SHA" ]; then
-          wrong_tree=1
-          break
-        fi
-      done < "$candidate_log"
-      [ "$wrong_tree" -eq 1 ] && break
-    done
-    if [ "$wrong_tree" -eq 1 ]; then
-      echo "::error::wrong tree: a rank's own PROVE_SHA disagreed with PROVE_EXPECT_SHA=${PROVE_EXPECT_SHA}"
-      kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null
-      exit 77
-    fi
-  fi
-  if [ $(( SECONDS - last_growth )) -ge "${RP_INACTIVITY}" ]; then
-    echo "::error::inactivity: no new output on either rank's log for ${RP_INACTIVITY}s"
-    kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null
-    exit 76
-  fi
-  if [ "$SECONDS" -ge "$DEADLINE" ]; then
-    echo "::error::budget cut at T-10m (per-phase breakdown above)"
-    kill -TERM "$rank0_pid" "$rank1_pid" 2>/dev/null; wait "$rank0_pid" "$rank1_pid" 2>/dev/null
-    exit 124
-  fi
-done
-wait "$rank0_pid"; rank0_rc=$?
-wait "$rank1_pid"; rank1_rc=$?
+_rpc_run_two_ranks "$primary_host" "$primary_port" "$member_host" "$member_port" || exit $?
 
 # F6 advisory: both ranks' own logs land in the uploaded/scanned directory
 # too, pass or fail alike -- copied here, unconditionally, before any
 # pass/fail branching below, rather than only on a path that might exit
 # early.
-mkdir -p "$CLUSTER_ARTIFACT_DIR"
-cp -f "$rank0_log" "${CLUSTER_ARTIFACT_DIR}/rank0.log" 2>/dev/null || echo "::warning::could not copy rank 0's own log into ${CLUSTER_ARTIFACT_DIR}"
-cp -f "$rank1_log" "${CLUSTER_ARTIFACT_DIR}/rank1.log" 2>/dev/null || echo "::warning::could not copy rank 1's own log into ${CLUSTER_ARTIFACT_DIR}"
+mkdir -p "$CLUSTER_ARTIFACT_DIR"  # rank logs already shipped by _rpc_run_two_ranks, on every arm
 
 rp_cluster_rank_verdict "$rank0_rc" "$rank0_log"; rank0_final=$?
 rp_cluster_rank_verdict "$rank1_rc" "$rank1_log"; rank1_final=$?
@@ -1240,7 +1655,7 @@ if [ -f "${CLUSTER_ARTIFACT_DIR}/rank-0.json" ] && [ -f "${CLUSTER_ARTIFACT_DIR}
   measured_sha="${PROVE_EXPECT_SHA:-$(git -C . rev-parse HEAD 2>/dev/null || echo unknown)}"
   if _rpc_assemble_gang_artifact "${CLUSTER_ARTIFACT_DIR}/rank-0.json" "${CLUSTER_ARTIFACT_DIR}/rank-1.json" \
     "$measured_sha" "a100-sxm4-cluster" "$ASSEMBLED" \
-    "$MEASURED_POD_COUNT" "$MEASURED_GPU_COUNT_PER_POD"; then
+    "$MEASURED_POD_COUNT" "$MEASURED_GPU_COUNT_PER_POD" "" "instant-cluster"; then
     assembly_ok=1
   else
     echo "::error::could not assemble the gang artifact" >&2
@@ -1261,6 +1676,149 @@ fi
 _rpc_phase "billing read (F16)"
 billing_resp="$(_rp_rest GET /v2/billing/clusters)"
 echo "billing read status for this run window: $(printf '%s\n' "$billing_resp" | head -n1)"
+
+else
+# --------------------------------------------------------------------------- #
+# The `pods` transport (two ORDINARY RunPod pods, joined by Global
+# Networking) -- the default. Same phase shape as the cluster branch above,
+# reusing every shared primitive it uses (`_rpc_pick_data_centers`,
+# `rp_init`, `_rpc_remote_script`, `rp_cluster_rank_verdict`/`rp_cluster_
+# verdict`, `_rpc_run_id_secrecy_scan`, `_rpc_assemble_gang_artifact`) --
+# only the rent/readback/interface/cleanup primitives differ (point 4 of
+# the design: "one script, transport-specific lines only").
+# --------------------------------------------------------------------------- #
+_rpc_phase "availability read (product=POD, cloud=SECURE)"
+pod_avail_resp="$(_rp_rest GET "/v2/catalog/gpus?include=AVAILABILITY&product=POD&count=1&cloud=SECURE")"
+pod_avail_status="$(printf '%s\n' "$pod_avail_resp" | head -n1)"
+pod_avail_body="$(printf '%s\n' "$pod_avail_resp" | tail -n +2)"
+if [ "$pod_avail_status" != "200" ]; then
+  echo "::error::pod catalog availability read failed (status ${pod_avail_status}) -- treating as no capacity"
+  exit 75
+fi
+pod_dcs="$(printf '%s' "$pod_avail_body" | _rpc_pick_data_centers "$RP_CLUSTER_GPU_TYPE" "$RP_CLUSTER_MIN_AVAILABILITY")"
+case "$pod_dcs" in
+  PARSE_ERROR*) echo "::error::${pod_dcs}"; exit 75 ;;
+esac
+
+_rpc_phase "global-networking data center read"
+gn_resp="$(_rp_rest GET /v2/catalog/datacenters)"
+gn_status="$(printf '%s\n' "$gn_resp" | head -n1)"
+gn_body="$(printf '%s\n' "$gn_resp" | tail -n +2)"
+if [ "$gn_status" != "200" ]; then
+  echo "::error::datacenters read failed (status ${gn_status}) -- treating as no capacity"
+  exit 75
+fi
+gn_dcs="$(printf '%s' "$gn_body" | _rpc_parse_global_network_datacenters)"
+case "$gn_dcs" in
+  PARSE_ERROR*) echo "::error::${gn_dcs}"; exit 75 ;;
+esac
+
+# P2: co-placement is a PROPERTY, not a hope -- ONE data center for BOTH
+# pods, picked from the intersection of "offers this GPU type at the
+# floor" and "carries Global Networking", never left to two independent
+# per-pod choices.
+co_dcs="$(_rpc_intersect_data_centers "$pod_dcs" "$gn_dcs")"
+if [ -z "$co_dcs" ]; then
+  echo "::error::no data center offers both ${RP_CLUSTER_GPU_TYPE} at ${RP_CLUSTER_MIN_AVAILABILITY} or better AND Global Networking (SUPPLY_CONSTRAINT)"
+  exit 75
+fi
+chosen_dc="$(printf '%s\n' "$co_dcs" | tr ' ' '\n' | sort | head -n1)"
+echo "candidate co-located data center(s): ${co_dcs} -- chosen: ${chosen_dc}"
+
+rp_init
+
+# P5/P9: initialized BEFORE either create call and BEFORE the trap is
+# registered, so the trap's own pods-transport cleanup block (in
+# _rpc_cleanup_cluster, above) never reads an unset variable regardless of
+# which phase this process exits from.
+two_host_pod_id_0=""
+two_host_pod_id_1=""
+trap _rpc_cleanup_cluster EXIT
+trap '_rpc_cleanup_cluster 129' HUP
+trap '_rpc_cleanup_cluster 130' INT
+trap '_rpc_cleanup_cluster 143' TERM
+
+# P3: rank assignment is DETERMINISTIC and RECORDED -- the FIRST pod
+# created is rank 0, the SECOND is rank 1, never the reverse and never
+# inferred from anything RunPod returns.
+_rpc_phase "pod create (rank 0)"
+two_host_pod_id_0="$(rp_two_host_pod_create "$RP_CLUSTER_GPU_TYPE" "$chosen_dc" 0)" \
+  || { echo "::error::two-host pod create (rank 0) failed"; exit 75; }
+echo "pod ${two_host_pod_id_0} (rank 0) created in ${chosen_dc}"
+
+_rpc_phase "pod create (rank 1)"
+two_host_pod_id_1="$(rp_two_host_pod_create "$RP_CLUSTER_GPU_TYPE" "$chosen_dc" 1)" \
+  || { echo "::error::two-host pod create (rank 1) failed"; exit 75; }
+echo "pod ${two_host_pod_id_1} (rank 1) created in ${chosen_dc}"
+
+_rpc_phase "waiting for both pods RUNNING with Global Networking + a direct ssh endpoint"
+two_host_ready_line="$(_rpc_wait_for_two_host_pods_ready "$two_host_pod_id_0" "$two_host_pod_id_1" "$RP_SSH_WAIT_SECS")"
+wait_rc=$?
+[ "$wait_rc" -eq 0 ] || exit "$wait_rc"
+IFS=' ' read -r primary_host primary_port member_host member_port measured_dc RP_TWO_HOST_GN_IP_0 RP_TWO_HOST_GN_IP_1 <<< "$two_host_ready_line"
+echo "both pods RUNNING, GN-enabled, co-located in ${measured_dc} (rank 0 GN ip: ${RP_TWO_HOST_GN_IP_0}, rank 1 GN ip: ${RP_TWO_HOST_GN_IP_1})"
+# P4: threaded through global variables `_rpc_remote_script`/`_rpc_two_host_
+# iface_lines` already read (declared, not local, so they are visible to
+# those functions defined earlier in this file) -- never a literal
+# interface name.
+export RP_TWO_HOST_GN_IP_0 RP_TWO_HOST_GN_IP_1
+member_extra_sshopts=()  # the pods transport never proxies -- both pods carry their own direct endpoint (P2's own refusal above).
+_rpc_phase "waiting for sshd on both pods (an executed connect per member)"
+rp_wait_sshd "$primary_host" "$primary_port" "$RP_SSH_WAIT_SECS" "rank 0" || exit 76
+rp_wait_sshd "$member_host" "$member_port" "$RP_SSH_WAIT_SECS" "rank 1" || exit 76
+
+_rpc_run_two_ranks "$primary_host" "$primary_port" "$member_host" "$member_port" || exit $?
+
+mkdir -p "$CLUSTER_ARTIFACT_DIR"  # rank logs already shipped by _rpc_run_two_ranks, on every arm
+
+rp_cluster_rank_verdict "$rank0_rc" "$rank0_log"; rank0_final=$?
+rp_cluster_rank_verdict "$rank1_rc" "$rank1_log"; rank1_final=$?
+rp_cluster_verdict "$rank0_final" "$rank1_final"; rc=$?
+
+# P4: "the derived interface's line" is this transport's own version of the
+# cluster path's ens1 proof -- each rank's OWN derived interface (read from
+# the `DERIVED_NCCL_IFACE=` marker it echoed), never a shared literal.
+if [ "$rc" -eq 0 ]; then
+  for two_host_check_rank in 0 1; do
+    if [ "$two_host_check_rank" = "0" ]; then two_host_check_log="$rank0_log"; else two_host_check_log="$rank1_log"; fi
+    two_host_iface="$(_rpc_parse_derived_iface "$two_host_check_log")"
+    if [ -z "$two_host_iface" ] || ! _rpc_net_iface_seen "$two_host_check_log" "$two_host_iface"; then
+      echo "::error::rank ${two_host_check_rank}'s log never named its own derived interface ('${two_host_iface:-<none>}') for the NCCL NET transport -- refusing to read this as a proof"
+      rc=1
+    fi
+  done
+fi
+
+_rpc_phase "pulling both ranks' artifacts"
+pull_rc=0
+rsync -az -e "ssh ${RP_SSHO[*]} -p ${primary_port}" "root@${primary_host}:${CLUSTER_REMOTE_ARTIFACT_DIR}/" "${CLUSTER_ARTIFACT_DIR}/" || pull_rc=$?
+rsync -az -e "ssh ${RP_SSHO[*]} -p ${member_port}" "root@${member_host}:${CLUSTER_REMOTE_ARTIFACT_DIR}/" "${CLUSTER_ARTIFACT_DIR}/" || pull_rc=$?
+if [ "$pull_rc" -ne 0 ]; then
+  echo "::error::artifact pull failed (rsync rc=${pull_rc}) -- a leg with no retrievable evidence proves nothing reviewable" >&2
+  [ "$rc" -eq 0 ] && rc="$pull_rc"
+fi
+
+_rpc_phase "assembling the gang artifact"
+if [ -f "${CLUSTER_ARTIFACT_DIR}/rank-0.json" ] && [ -f "${CLUSTER_ARTIFACT_DIR}/rank-1.json" ]; then
+  measured_sha="${PROVE_EXPECT_SHA:-$(git -C . rev-parse HEAD 2>/dev/null || echo unknown)}"
+  if _rpc_assemble_gang_artifact "${CLUSTER_ARTIFACT_DIR}/rank-0.json" "${CLUSTER_ARTIFACT_DIR}/rank-1.json" \
+    "$measured_sha" "a100-sxm4-two-host-pods" "$ASSEMBLED" \
+    "$RP_CLUSTER_POD_COUNT" "$RP_CLUSTER_GPU_COUNT_PER_POD" "" "global-networking"; then
+    assembly_ok=1
+  else
+    echo "::error::could not assemble the gang artifact" >&2
+    [ "$rc" -eq 0 ] && rc=1
+  fi
+else
+  echo "::error::one or both rank reports were not pulled -- cannot assemble the gang artifact" >&2
+  [ "$rc" -eq 0 ] && rc=1
+fi
+
+_rpc_phase "billing read"
+billing_resp="$(_rp_rest GET /v2/billing/pods 2>/dev/null || true)"
+echo "billing read status for this run window: $(printf '%s\n' "$billing_resp" | head -n1)"
+
+fi
 
 echo "=== GPU cluster leg exit=${rc} ==="
 exit "$rc"

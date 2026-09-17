@@ -4175,6 +4175,108 @@ mod tests {
         );
     }
 
+    /// CAPSURF (wave 5): the CPU-hermetic counterpart of `GPU prove
+    /// (RunPod)`'s `capability_surface.rs` TIER-PREEMPTION assertion,
+    /// exercised through [`forward_hidden_forcing_flash_decision`] (the
+    /// admission seam's own test hook — no CUDA device or `flash-attn`
+    /// feature needed to force a `Holds`/`Fused` decision, see
+    /// [`fused_flash_for_test`]'s doc) instead of a rented GPU. Proves the
+    /// property `training_attention_cascade` claims by construction — flash
+    /// consulted FIRST, `attention_block_fused`'s own `admit()` unreachable
+    /// once flash dispatches `Fused` — genuinely holds for a LoRA-wrapped
+    /// attention module (`Wqkv` LoRA-wrapped, `Wo` left frozen — BOTH
+    /// module shapes `forward_training_attention` can reach in one call,
+    /// mirroring `flash_oracle_build_model`'s own `target_modules =
+    /// ["Wqkv"]` shape), catching in the ordinary `cargo test -p
+    /// jammi-encoders` lane a regression `capability_surface.rs`'s own GPU
+    /// assertion only ever catches on a nightly rented pod.
+    #[test]
+    fn lora_wrapped_attention_never_reaches_attention_block_fused_when_flash_dispatches() {
+        let _lock = crate::test_support::seam_counter_lock();
+        let _d2h_guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny_modernbert_head64");
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let weights = dir.join("model.safetensors");
+        let varmap = VarMap::new();
+        let target_modules = ["Wqkv".to_string()];
+        let rank_pattern: HashMap<String, usize> = HashMap::new();
+        let lora = LoraBuildConfig {
+            target_modules: &target_modules,
+            layers_to_transform: &None,
+            lora_rank: 4,
+            lora_alpha: 8.0,
+            use_rslora: false,
+            lora_dropout: None,
+            rank_pattern: &rank_pattern,
+            init_mode: jammi_lora::LoraInitMode::Gaussian,
+            seed: 1,
+            dropout_seed: 1,
+        };
+        let mut model = ModernBert::builder()
+            .lora(lora)
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .unwrap_or_else(|e| panic!("build LoRA-wrapped ModernBert: {e}"));
+        model.set_training(true);
+        assert!(
+            matches!(model.layers[0].attention.wqkv, MaybeLoraLinear::Lora(_)),
+            "sanity: Wqkv must actually be LoRA-wrapped, or this test proves nothing about the \
+             LoRA-wrapped case"
+        );
+        assert!(
+            matches!(model.layers[0].attention.wo, MaybeLoraLinear::Frozen(_)),
+            "sanity: Wo must stay frozen (unwrapped), so this one call also covers the \
+             unwrapped-module case"
+        );
+
+        let input_ids =
+            Tensor::new(&[[2u32, 5, 10, 3, 7, 9], [4u32, 8, 1, 6, 9, 2]], &device).unwrap();
+        let mask = Tensor::new(&[[1u32, 1, 1, 1, 1, 1], [1u32, 1, 1, 1, 1, 1]], &device).unwrap();
+        // DENSE (`is_dense == true`): `ModernBertAttention::forward` takes
+        // the UNCHANGED `dims3()` branch (never the padded-transport early
+        // return), so `wqkv`/`wo` (the LoRA-wrapped module) genuinely run
+        // before `training_attention_cascade` ever sees `flash`.
+        let dense_decision = fused_flash_for_test(vec![6, 6], 6, &device);
+
+        let block_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let flash_before = cascade_counters_for("attention_block_flash").snapshot();
+        let err = forward_hidden_forcing_flash_decision(&model, &input_ids, &mask, dense_decision)
+            .unwrap_err()
+            .to_string();
+        let block_after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let flash_after = cascade_counters_for("attention_block_flash").snapshot();
+
+        assert!(
+            !err.contains("padded/ragged arm") && !err.contains("flash_attention_varlen"),
+            "sanity: a DENSE decision must reach forward_flash_dense_attention's own stub, not \
+             the ragged one -- got: {err}"
+        );
+        assert_eq!(
+            flash_after.fused - flash_before.fused,
+            1,
+            "layer 0's admit_cascade call must dispatch Fused on the LoRA-wrapped attention \
+             module before the CPU-only flash-transport stub errors -- got before={flash_before:?} \
+             after={flash_after:?}"
+        );
+        assert_eq!(
+            block_after.fused, block_before.fused,
+            "attention_block_fused must NEVER have dispatched on the LoRA-wrapped path -- the \
+             flash cascade preempts it by construction (training_attention_cascade returns on \
+             CascadeOutcome::Fused before attention_block_fused's own admit() call) -- \
+             before={block_before:?} after={block_after:?}"
+        );
+        assert_eq!(
+            block_after.eager, block_before.eager,
+            "attention_block_fused must not have been reached AT ALL (fused or eager) once \
+             flash dispatches Fused -- before={block_before:?} after={block_after:?}"
+        );
+    }
+
     /// Contract v4 §3.1 item 3's own pin: `JAMMI_KERNELS_DISABLE` naming
     /// `attention_block_flash` must decide the WHOLE forward's transport
     /// at the ONE place (`decide_flash_admission`), never let a per-layer

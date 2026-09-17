@@ -144,7 +144,8 @@
           "dropout",
           "cast_scale",
           "cast_add",
-          "adamw_step"
+          "adamw_step",
+          "attention_block_flash"
         ],
         "internal_subkernels": {
           "rope_positions": {
@@ -187,7 +188,8 @@
           "dropout",
           "cast_scale",
           "cast_add",
-          "adamw_step"
+          "adamw_step",
+          "attention_block_flash"
         ],
         "internal_subkernels": {
           "rope_positions": {
@@ -230,7 +232,8 @@
           "dropout",
           "cast_scale",
           "cast_add",
-          "adamw_step"
+          "adamw_step",
+          "attention_block_flash"
         ],
         "internal_subkernels": {
           "rope_positions": {

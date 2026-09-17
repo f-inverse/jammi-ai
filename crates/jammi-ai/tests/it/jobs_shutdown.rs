@@ -22,7 +22,7 @@ use std::time::Duration;
 use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use jammi_ai::fine_tune::worker::{
     loop_test_hooks, training_test_hooks, EmbeddedWorker, HoldReleaseOutcome, Holder, JobWorker,
-    LoopState, StopOutcome, WorkerPhase, WorkerShared,
+    LoopState, ReleaseSweep, StopOutcome, WorkerPhase, WorkerShared,
 };
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::jobs::{compute_test_hooks, ComputeSpec, JobResult, JobSpec};
@@ -769,6 +769,250 @@ async fn release_with_the_loop_paused_in_the_claim_to_hold_prologue_self_release
     }
 }
 
+// ---------------------------------------------------------------------------
+// P7 (#525, #500 wave 5 group E1) — the release barrier's blast radius
+// equals the release's, not the releasing entry point's own worker.
+// ---------------------------------------------------------------------------
+
+/// P7(b): the loop's OWN `EmbeddedWorker` never calls `release_and_stop` at
+/// all here — `InferenceSession::release_job_leases` (the "no loop to stop"
+/// sibling, `session.rs:439`, the shape `runtime.rs`/`database.rs` use on
+/// their `worker.is_none()` arm) is called directly while a REAL, live loop
+/// on the SAME session is parked in the claim→hold prologue
+/// (`register_job_hold_or_release`, before the hold is registered, phase
+/// still `Running`). `release_job_leases` flips the session-owned
+/// `HostAdmission` phase to `Releasing` (2a-equivalent) BEFORE its 2b/2c —
+/// no `WorkerShared::stop` is ever touched, since `release_job_leases` does
+/// not know the worker exists — so this proves the barrier the prologue
+/// observes is the SHARED phase cell, not anything paired with a stop
+/// signal on the specific `WorkerShared` that owns the parked loop: the
+/// blast radius of a release equals the release's, regardless of which of
+/// the two entry points (`EmbeddedWorker::release_and_stop` or
+/// `InferenceSession::release_job_leases`) initiated it.
+///
+/// At the park, the claim has already committed (`execution = 'queued'`,
+/// lease live) but the hold is not yet on the keeper, so 2b's per-hold pass
+/// finds nothing of this job's (`attempted: 0`) and 2c's sweep is the
+/// actual releaser (`sweep.jobs == Some(1)`). Once the park is released,
+/// the prologue registers a (now-doomed) hold, reads the shared phase as
+/// `Releasing`, and self-releases: the row is left `running`/lease
+/// NULL/`releases 1`, and the producer never runs.
+///
+/// Mutation (executed): commenting out the
+/// `if shared.phase() == WorkerPhase::Releasing` arm in
+/// `register_job_hold_or_release` (`crates/jammi-ai/src/fine_tune/
+/// worker.rs`) so the prologue always dispatches reds this test — the
+/// `dispatch_park` wait that must time out instead resolves inside the
+/// 200 ms bound, failing `"the self-released claim must never reach the
+/// producer"`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_job_leases_reaches_a_live_foreign_loops_prologue_and_self_releases() {
+    let (session, _dir) = session(DEFAULT_TIMING).await;
+    let source = unique_patents(&session).await;
+    let handle = session
+        .enqueue(never_dispatched_infer(&source).into(), 0)
+        .await
+        .unwrap();
+    let park = loop_test_hooks::arm(&handle.job_id, loop_test_hooks::ParkPoint::BeforeHold);
+    let dispatch_park =
+        compute_test_hooks::arm(&source, compute_test_hooks::ParkPoint::BeforeDispatch);
+    let worker = spawn_worker(&session);
+    let shared = shared_of(&worker);
+    park.wait_parked().await;
+    assert_eq!(in_flight(&shared), 0, "the hold is not registered yet");
+    assert!(
+        !shared.stop_requested(),
+        "release_job_leases must never touch this worker's own WorkerShared::stop"
+    );
+
+    let (holds, sweep) =
+        tokio::time::timeout(Duration::from_secs(10), session.release_job_leases())
+            .await
+            .expect("release_job_leases does not wait on any loop")
+            .unwrap();
+    assert_eq!(
+        holds,
+        HoldReleaseOutcome::Observed(HoldRelease {
+            released: 0,
+            not_required: 0,
+            failed: 0,
+            attempted: 0,
+        }),
+        "the keeper never held this job's lease at the time of the park: {holds:?}"
+    );
+    assert_eq!(
+        sweep,
+        ReleaseSweep {
+            jobs: Some(1),
+            building: Some(0),
+        },
+        "the sweep is the actual releaser: {sweep:?}"
+    );
+    assert_eq!(shared.admission().phase(), WorkerPhase::Releasing);
+
+    park.release();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), dispatch_park.wait_parked())
+            .await
+            .is_err(),
+        "the self-released claim must never reach the producer"
+    );
+    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
+    assert_eq!(row.status, JobStatus::Running.to_string());
+    assert_eq!(row.claimed_by.as_deref(), Some(session.instance_id()));
+    assert!(row.lease_expires_at.is_none(), "{row:?}");
+    assert_eq!((row.attempts, row.releases), (1, 1));
+
+    worker.stop_and_join().await.unwrap();
+    session.close().await;
+}
+
+/// P7(a): the session's single claim-loop slot is STRUCTURAL — a second
+/// `EmbeddedWorker::spawn_worker` on a session that already has one live is
+/// refused with a typed [`JammiError::FineTune`], never a second claim
+/// loop. The first worker's row/loop are entirely untouched by the refused
+/// attempt. The slot is released by the FIRST guard's own `Drop`, not by
+/// `stop_and_join` (which takes `&self` and leaves the guard itself alive)
+/// — `stop_and_join` alone still refuses a successor spawn; only dropping
+/// the guard admits one, on the SAME session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_spawn_on_the_same_session_is_refused_structurally() {
+    let (session, _dir) = session(DEFAULT_TIMING).await;
+    let worker_a = spawn_worker(&session);
+    let shared_a = shared_of(&worker_a);
+    // The loop's own first statement upserts its `workers` row
+    // asynchronously; wait for it so the row-count assertion below is not
+    // racing that first write.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while session.catalog().list_workers().await.unwrap().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first worker's `workers` row never appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let err = match EmbeddedWorker::spawn_worker(
+        &session,
+        JobWorker::with_intervals(&session, session.worker_intervals().unwrap()),
+    ) {
+        Ok(_) => panic!("a second spawn on a session with a live loop must be refused"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, jammi_db::error::JammiError::FineTune(_)),
+        "{err:?}"
+    );
+    // The refused attempt never touched the live worker's own state.
+    assert_eq!(shared_a.loop_state(), LoopState::Running);
+    assert_eq!(
+        session.catalog().list_workers().await.unwrap().len(),
+        1,
+        "the refused spawn upserted no second `workers` row"
+    );
+
+    worker_a.stop_and_join().await.unwrap();
+    assert_eq!(shared_a.loop_state(), LoopState::Stopped);
+    // The loop task is joined, but the GUARD itself is still alive — the
+    // slot is still held, so a spawn attempt here is still refused.
+    assert!(
+        matches!(
+            EmbeddedWorker::spawn_worker(
+                &session,
+                JobWorker::with_intervals(&session, session.worker_intervals().unwrap()),
+            ),
+            Err(jammi_db::error::JammiError::FineTune(_))
+        ),
+        "stop_and_join alone (guard still alive) must not free the slot"
+    );
+
+    // Dropping the guard is the ONE release point: a successor spawn on the
+    // SAME session, after the first guard is gone, is admitted — the slot
+    // is a compare-and-set, not a once-per-session latch.
+    drop(worker_a);
+    let worker_b = spawn_worker(&session);
+    worker_b.stop_and_join().await.unwrap();
+    session.close().await;
+}
+
+/// P7 delta (pressure round): the slot is held until `release_and_stop`
+/// COMPLETES, not until the guard is dropped — a successor spawn is
+/// admitted the instant `release_and_stop` returns, with the FIRST guard's
+/// value still alive (not yet dropped). The successor belongs to a NEW
+/// generation and is NOT stopped by the old RELEASE: its own `admits_claim`
+/// reads `Running` (its epoch snapshot is taken AFTER the bump), so it
+/// actually claims and runs a fresh job to completion — proving the reset
+/// is not merely a phase flip nobody re-checks. The first guard's own later
+/// `Drop` is a no-op (compare-and-set against a generation the successor
+/// has already superseded) — it does not steal the successor's slot, and
+/// the successor's row/loop are untouched afterward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_and_stop_completing_frees_the_slot_for_a_successor_not_stopped_by_the_old_release()
+{
+    let (session, _dir) = session(DEFAULT_TIMING).await;
+    let worker_a = spawn_worker(&session);
+    let shared_a = shared_of(&worker_a);
+    let report = worker_a.release_and_stop().await.unwrap();
+    assert_eq!(report.loop_state, LoopState::Stopped, "{report:?}");
+
+    // The FIRST guard (`worker_a`) is still alive here — never dropped —
+    // yet a successor spawn is admitted.
+    let worker_b = spawn_worker(&session);
+    let shared_b = shared_of(&worker_b);
+    assert_ne!(
+        shared_a.instance_id(),
+        "",
+        "sanity: the old guard's shared state is still reachable"
+    );
+
+    // The successor is NOT stopped by the OLD release: it claims and runs a
+    // fresh job to completion, exactly like a freshly-spawned worker on a
+    // never-released session would.
+    let handle = session.enqueue(fine_tune(1), 0).await.unwrap();
+    wait_status(
+        &session,
+        &handle.job_id,
+        &JobStatus::Completed.to_string(),
+        Duration::from_secs(60),
+    )
+    .await;
+    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
+    assert_eq!(row.claimed_by.as_deref(), Some(session.instance_id()));
+    assert_eq!(row.attempts, 1, "{row:?}");
+    assert_eq!(
+        row.releases, 0,
+        "the successor's own claim was never released: {row:?}"
+    );
+
+    // The first guard's `Drop` — its OWN release already ran inside
+    // `release_and_stop`, so this must be a no-op: the successor's slot
+    // (and its still-`Running` loop) is untouched.
+    drop(worker_a);
+    assert_eq!(
+        shared_b.loop_state(),
+        LoopState::Running,
+        "the first guard's belated Drop must not touch the successor's loop"
+    );
+    // The slot is still HELD (by the successor's generation) — the first
+    // guard's belated Drop must not have freed it: a third spawn attempt is
+    // still refused. This is the compare-and-set half of the property: an
+    // unconditional release in `Drop` would free the successor's slot out
+    // from under it right here.
+    assert!(
+        matches!(
+            EmbeddedWorker::spawn_worker(
+                &session,
+                JobWorker::with_intervals(&session, session.worker_intervals().unwrap()),
+            ),
+            Err(jammi_db::error::JammiError::FineTune(_))
+        ),
+        "the first guard's belated Drop must not free the successor's slot"
+    );
+
+    worker_b.stop_and_join().await.unwrap();
+    session.close().await;
+}
+
 /// Fix round (`CONTRACT-RELEASE-SPIN.md`, design-pass fold, P1 — safety):
 /// the loop's top-of-iteration gate refuses a new `claim_next` on the phase
 /// read ALONE (`phase() != Running`), independent of `stop_requested()`.
@@ -793,9 +1037,15 @@ async fn release_gate_refuses_every_claim_when_phase_flips_without_a_stop() {
     let handle_b = session.enqueue(fine_tune(1), 0).await.unwrap();
 
     let job_worker = JobWorker::with_intervals(&session, session.worker_intervals().unwrap());
+    // A fresh session's `HostAdmission` has seen no `begin_release` call
+    // yet, so its release epoch is 0 — the gate-direct construction below
+    // deliberately bypasses `try_claim_loop` entirely (no generation, no
+    // slot), so there is no live epoch to read; this test is about the
+    // PHASE read alone (P1), never the epoch.
     let shared = WorkerShared::new(
         Arc::clone(session.host_admission()),
         session.instance_id().to_string(),
+        0,
     );
     // The gate-direct construction: phase flipped, stop deliberately left
     // unset, BEFORE the loop ever takes its first iteration -- no race with

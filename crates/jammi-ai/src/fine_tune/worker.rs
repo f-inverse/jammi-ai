@@ -393,6 +393,45 @@ pub struct HostAdmission {
     /// reaches this process's coordinator body (see [`placed_gang_runner`]'s
     /// doc for the process-global seam this backs).
     placed_gang_runner: OnceLock<Arc<dyn PlacedGangRunner>>,
+    /// The single claim-loop slot (#500 wave 5 group E1, P7): `0` (free) or
+    /// a nonzero GENERATION id — the id [`HostAdmission::try_claim_loop`]
+    /// handed out to whichever [`EmbeddedWorker`] currently owns the slot.
+    /// A second `spawn`/`spawn_worker` while a generation is live finds this
+    /// nonzero and is refused with a typed error before it builds any task
+    /// — "one claim loop per session" is therefore a compare-and-set on
+    /// this cell, not a premise the RELEASE mechanism merely assumes (issue
+    /// #525: the phase/hold barrier alone is necessary but was never, on
+    /// its own, sufficient — nothing stopped a second loop from existing in
+    /// the first place).
+    ///
+    /// The slot is held from a successful claim until [`EmbeddedWorker::
+    /// release_and_stop`] completes OR the [`EmbeddedWorker`] value is
+    /// dropped, whichever comes first — both release through
+    /// [`HostAdmission::release_loop_claim`], a compare-and-set against the
+    /// CALLER's OWN generation id, so a release that lands after a
+    /// successor has already claimed a NEW generation is a harmless no-op
+    /// rather than stealing the successor's slot.
+    loop_owner: AtomicU64,
+    /// The next generation id [`HostAdmission::try_claim_loop`] hands out —
+    /// monotonic, never reused, never zero (zero is reserved for "free").
+    next_generation: AtomicU64,
+    /// How many times [`HostAdmission::begin_release`] has run, on this
+    /// session, ever — bumped on EVERY call, whether or not the phase
+    /// actually changed. The session-scoped release barrier is EPOCH-based,
+    /// not phase-based, because [`HostAdmission::try_claim_loop`] resets
+    /// `phase` to `Running` for each new generation (a fresh loop must not
+    /// be born already refusing every claim), so `phase() == Releasing`
+    /// alone cannot distinguish "this generation was released" from "a
+    /// LATER generation reset the phase after an earlier release": a claim
+    /// loop's own [`WorkerShared`] instead snapshots this counter at spawn
+    /// (`WorkerShared::spawn_release_epoch`) and treats ANY later value as
+    /// "I have been released", however far its own task's execution lags
+    /// behind an `abort()` request (`register_job_hold_or_release`'s
+    /// self-release check and [`WorkerShared::admits_claim`] both read it).
+    /// A generation born AFTER a release therefore snapshots the
+    /// already-bumped counter and is never stopped by that release — only a
+    /// LATER one.
+    release_epoch: AtomicU64,
 }
 
 /// The process-global weak link to whichever session's [`HostAdmission`]
@@ -487,7 +526,46 @@ impl HostAdmission {
             dialer: OnceLock::new(),
             placed_gang_submitter: OnceLock::new(),
             placed_gang_runner: OnceLock::new(),
+            loop_owner: AtomicU64::new(0),
+            next_generation: AtomicU64::new(1),
+            release_epoch: AtomicU64::new(0),
         })
+    }
+
+    /// Claim the session's single claim-loop slot. `Some((generation,
+    /// release_epoch))` means this call won the slot (no loop was live):
+    /// `generation` is this claim's unique, nonzero id — the caller's own
+    /// key for [`Self::release_loop_claim`] — and `release_epoch` is the
+    /// count of [`Self::begin_release`] calls THIS SESSION HAS EVER SEEN,
+    /// snapshotted at birth (`WorkerShared::spawn_release_epoch`'s source):
+    /// a fresh generation is never stopped by a release that predates it.
+    /// `None` means a loop already owns the slot and the caller must not
+    /// spawn a second one. Resets `phase` to `Running` on a win — a new
+    /// generation must not be born already refusing every claim because a
+    /// PRIOR generation's `Draining`/`Releasing` phase was left in the
+    /// cell.
+    pub(crate) fn try_claim_loop(&self) -> Option<(u64, u64)> {
+        let candidate = self.next_generation.fetch_add(1, Ordering::SeqCst);
+        self.loop_owner
+            .compare_exchange(0, candidate, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        self.phase.send_replace(WorkerPhase::Running);
+        Some((candidate, self.release_epoch.load(Ordering::SeqCst)))
+    }
+
+    /// Release the claim-loop slot ONLY if it is still held by `generation`
+    /// — a compare-and-set, not an unconditional write, so a release that
+    /// lands after a successor has already claimed a NEW generation (e.g.
+    /// `release_and_stop` freeing it, a caller immediately spawning a
+    /// successor, and only THEN this same guard's own `Drop` running) is a
+    /// harmless no-op instead of stealing the successor's slot. Called from
+    /// both [`EmbeddedWorker::release_and_stop`] (on success) and
+    /// [`EmbeddedWorker`]'s `Drop` (unconditionally attempted, idempotent
+    /// either way it lands).
+    pub(crate) fn release_loop_claim(&self, generation: u64) {
+        let _ = self
+            .loop_owner
+            .compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
 
     /// Install the process's [`MemberDialer`] — once. `false` when one is
@@ -608,7 +686,17 @@ impl HostAdmission {
     }
 
     /// Begin a RELEASE: the phase is `Releasing` from this instant, whatever
-    /// it was (a RELEASE wins over a DRAIN in progress).
+    /// it was (a RELEASE wins over a DRAIN in progress), AND the session's
+    /// release epoch is bumped — UNCONDITIONALLY, even when the phase was
+    /// already `Releasing`, since a distinct RELEASE call (e.g.
+    /// `InferenceSession::release_job_leases` racing an in-flight
+    /// `EmbeddedWorker::release_and_stop`) is still a distinct release event
+    /// any generation born before it must be sensitive to (see the
+    /// `release_epoch` field's own doc). This is the ONE session-scoped
+    /// signal `WorkerShared::admits_claim` and `register_job_hold_or_
+    /// release`'s self-release check both read — `phase()` alone cannot
+    /// serve that role because `try_claim_loop` resets it for every new
+    /// generation.
     pub fn begin_release(&self) {
         self.phase.send_if_modified(|p| {
             if *p == WorkerPhase::Releasing {
@@ -618,6 +706,13 @@ impl HostAdmission {
                 true
             }
         });
+        self.release_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// How many times [`Self::begin_release`] has run on this session, ever
+    /// — see the `release_epoch` field's own doc.
+    pub(crate) fn release_epoch(&self) -> u64 {
+        self.release_epoch.load(Ordering::SeqCst)
     }
 
     /// Test-only: set the phase WITHOUT any stop request or row write —
@@ -933,6 +1028,13 @@ pub struct WorkerShared {
     /// How many catalog samples the sampler has taken — the oracle that a
     /// scrape issues no catalog statement of its own.
     samples_taken: AtomicU64,
+    /// [`HostAdmission::release_epoch`], snapshotted at construction (#500
+    /// wave 5 group E1, P7): any LATER value observed on `admission` means
+    /// a RELEASE has happened since this shared state was born, and is
+    /// treated as "I have been released" regardless of what `phase()`
+    /// currently reads (a later generation may have reset it to `Running`)
+    /// — see [`Self::released_since_birth`].
+    spawn_release_epoch: u64,
 }
 
 /// The queue-depth snapshot the gauge sampler last read from the catalog:
@@ -948,8 +1050,20 @@ pub struct WorkerSample {
 
 impl WorkerShared {
     /// Fresh shared state for one loop task over the session's
-    /// `admission`: stop unset, state `Running`.
-    pub fn new(admission: Arc<HostAdmission>, instance_id: String) -> Arc<Self> {
+    /// `admission`: stop unset, state `Running`. `spawn_release_epoch` is
+    /// this state's birth snapshot of `HostAdmission::release_epoch` —
+    /// callers that go through `HostAdmission::try_claim_loop`
+    /// ([`EmbeddedWorker::spawn_worker`]) pass the epoch that call
+    /// returned; a fresh, un-looped single-job run (`JobWorker::
+    /// run_claimed_job`, `run_placed_gang`, `JobWorker::run`'s own
+    /// never-claimed loop) passes `admission.release_epoch()` read live,
+    /// the same value `phase()` would have read before this snapshot
+    /// existed.
+    pub fn new(
+        admission: Arc<HostAdmission>,
+        instance_id: String,
+        spawn_release_epoch: u64,
+    ) -> Arc<Self> {
         let (stop, _) = watch::channel(false);
         let (state_tx, _) = watch::channel(LoopState::Running);
         Arc::new(Self {
@@ -959,6 +1073,7 @@ impl WorkerShared {
             instance_id,
             sample: std::sync::RwLock::new(WorkerSample::default()),
             samples_taken: AtomicU64::new(0),
+            spawn_release_epoch,
         })
     }
 
@@ -1035,17 +1150,33 @@ impl WorkerShared {
         *self.stop.borrow()
     }
 
+    /// Whether a RELEASE has landed on `admission` since this state was
+    /// born (#500 wave 5 group E1, P7) — see the `spawn_release_epoch`
+    /// field's doc for why this, rather than a bare `phase()` read, is the
+    /// authoritative "have I been released" signal: `phase()` is reset to
+    /// `Running` for every new generation
+    /// ([`HostAdmission::try_claim_loop`]), so a STALE task whose own
+    /// execution lags behind an `abort()` request could otherwise read a
+    /// LATER generation's fresh `Running` phase and wrongly conclude it was
+    /// never released.
+    fn released_since_birth(&self) -> bool {
+        self.admission.release_epoch() != self.spawn_release_epoch
+    }
+
     /// Whether the loop may initiate a new `claim_next`: no stop has been
-    /// requested AND the phase is still `Running`. `EmbeddedWorker::run_until`
-    /// reads this ONE predicate at two sites — the loop's top-of-iteration
-    /// gate and again, with no `.await` between that second read and the
-    /// `claim_next` call itself, immediately after `reclaim_expired_jobs`
-    /// returns — so the two reads can never drift apart (P1',
-    /// `CONTRACT-RELEASE-SPIN.md`): a RELEASE landing anywhere in the
-    /// reclaim round trip is caught by the second read even when the first,
-    /// now-stale read had already admitted the iteration.
+    /// requested, the phase is still `Running`, AND no RELEASE has landed
+    /// since this state was born. `EmbeddedWorker::run_until` reads this ONE
+    /// predicate at two sites — the loop's top-of-iteration gate and again,
+    /// with no `.await` between that second read and the `claim_next` call
+    /// itself, immediately after `reclaim_expired_jobs` returns — so the two
+    /// reads can never drift apart (P1', `CONTRACT-RELEASE-SPIN.md`): a
+    /// RELEASE landing anywhere in the reclaim round trip is caught by the
+    /// second read even when the first, now-stale read had already admitted
+    /// the iteration.
     fn admits_claim(&self) -> bool {
-        !self.stop_requested() && self.phase() == WorkerPhase::Running
+        !self.stop_requested()
+            && self.phase() == WorkerPhase::Running
+            && !self.released_since_birth()
     }
 
     fn request_stop(&self) {
@@ -1108,9 +1239,14 @@ impl Drop for LoopExitGuard {
 /// both sites ([`JobWorker::run_claimed_job`]'s fine-tune arm and its
 /// compute arm) call, so the RELEASE check exists in exactly one place.
 ///
-/// Registers the hold with the session's keeper, then reads the phase
-/// (`SeqCst`): under [`WorkerPhase::Releasing`] the claim raced a RELEASE
-/// (it committed after the keeper's per-hold pass snapshotted, or after the
+/// Registers the hold with the session's keeper, then reads whether a
+/// RELEASE has landed on `shared`'s session since `shared` was born
+/// ([`WorkerShared::released_since_birth`], #500 wave 5 group E1 P7 — an
+/// epoch comparison, never a bare `phase() == Releasing` read: a STALE call
+/// from a task an `abort()` has not yet actually torn down could otherwise
+/// observe a LATER generation's freshly-reset `Running` phase and wrongly
+/// conclude it was never released): if so, the claim raced a RELEASE (it
+/// committed after the keeper's per-hold pass snapshotted, or after the
 /// first sweep), so this releases its OWN row through
 /// `Catalog::release_job_lease` (idempotent — 0 rows if a sweep already
 /// took it), drops the hold and returns `None`: the caller returns without
@@ -1143,7 +1279,7 @@ async fn register_job_hold_or_release(
         instance_id: shared.instance_id.clone(),
         attempts,
     });
-    if shared.phase() == WorkerPhase::Releasing {
+    if shared.released_since_birth() {
         match catalog
             .release_job_lease(job_id, &shared.instance_id, attempts)
             .await
@@ -1474,9 +1610,11 @@ impl JobWorker {
     /// state — for callers that rely solely on the session dropping (the
     /// `Weak` upgrade failing) to stop the worker.
     pub async fn run(&self) {
+        let epoch = self.admission.release_epoch();
         self.run_until(WorkerShared::new(
             Arc::clone(&self.admission),
             self.worker_id.clone(),
+            epoch,
         ))
         .await
     }
@@ -1781,7 +1919,14 @@ impl JobWorker {
         // sites read the session's phase, and — holding no claim probe —
         // leave the session's holder exactly as they found it (a direct run
         // sits beside the loop's slot the way an inline `run_now` does).
-        let shared = WorkerShared::new(Arc::clone(&self.admission), self.worker_id.clone());
+        // The release-epoch snapshot is read live, right before use — the
+        // same value `phase()` would have read before `WorkerShared` gained
+        // that snapshot (`released_since_birth`'s doc).
+        let shared = WorkerShared::new(
+            Arc::clone(&self.admission),
+            self.worker_id.clone(),
+            self.admission.release_epoch(),
+        );
         self.run_claimed_job_under(session, record, &shared, false)
             .await;
     }
@@ -2446,7 +2591,11 @@ impl JobWorker {
                 return Err(e);
             }
         };
-        let shared = WorkerShared::new(Arc::clone(admission), worker.worker_id.clone());
+        let shared = WorkerShared::new(
+            Arc::clone(admission),
+            worker.worker_id.clone(),
+            admission.release_epoch(),
+        );
         let end = worker
             .run_claimed_job_under(session, record, &shared, true)
             .await;
@@ -4256,6 +4405,11 @@ pub struct EmbeddedWorker {
     heartbeat: Duration,
     /// The gauge sampler task; aborted with the loop on every stop path.
     sampler: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// This guard's own generation id — the key
+    /// [`HostAdmission::release_loop_claim`] releases (#500 wave 5 group E1
+    /// P7), a compare-and-set so this guard can never free a SUCCESSOR's
+    /// slot.
+    loop_generation: u64,
 }
 
 impl EmbeddedWorker {
@@ -4267,7 +4421,14 @@ impl EmbeddedWorker {
     /// session's `[worker]` configuration. Returns [`JammiError::Config`] if
     /// that timing (or `kinds`) violates the worker invariants — in the
     /// normal flow `JammiConfig::load` already validated the timing, so that
-    /// half only surfaces for a hand-built config.
+    /// half only surfaces for a hand-built config. Returns
+    /// [`JammiError::FineTune`] when a loop already owns this session's
+    /// single claim-loop slot (`HostAdmission::try_claim_loop`, #500 wave 5
+    /// group E1 P7): "one claim loop per session" is structural — a second
+    /// spawn is refused before any task exists, never a second loop whose
+    /// hold-release blast radius the phase barrier alone would have to
+    /// cover. Spawn a successor only after the prior guard has fully
+    /// dropped.
     ///
     /// The loop task's own first statement upserts this process's `workers`
     /// row (`warming`, then `claiming` once the session's worker gate is
@@ -4279,10 +4440,23 @@ impl EmbeddedWorker {
 
     /// Spawn an already-built worker (used by [`Self::spawn`] and any test
     /// harness that needs explicit timing/kinds via
-    /// [`JobWorker::with_intervals_and_kinds`]).
+    /// [`JobWorker::with_intervals_and_kinds`]). See [`Self::spawn`]'s doc
+    /// for the single-claim-loop-slot refusal.
     pub fn spawn_worker(session: &Arc<InferenceSession>, worker: JobWorker) -> Result<Self> {
         let admission = Arc::clone(session.host_admission());
-        let shared = WorkerShared::new(Arc::clone(&admission), session.instance_id().to_string());
+        let Some((loop_generation, spawn_release_epoch)) = admission.try_claim_loop() else {
+            return Err(JammiError::FineTune(format!(
+                "a claim loop is already spawned on session instance {}; only one claim loop \
+                 per session may run at once (spawn a successor only after the prior \
+                 EmbeddedWorker's release_and_stop completes or its guard is dropped)",
+                session.instance_id()
+            )));
+        };
+        let shared = WorkerShared::new(
+            Arc::clone(&admission),
+            session.instance_id().to_string(),
+            spawn_release_epoch,
+        );
         let heartbeat = worker.intervals.heartbeat;
         let task_shared = Arc::clone(&shared);
         let handle = tokio::spawn(async move { worker.run_until(task_shared).await });
@@ -4303,6 +4477,7 @@ impl EmbeddedWorker {
             writer_id: session.result_store().writer_id().to_string(),
             heartbeat,
             sampler: std::sync::Mutex::new(Some(sampler)),
+            loop_generation,
         })
     }
 
@@ -4605,6 +4780,16 @@ impl EmbeddedWorker {
         // Cell before delete (§8 B1) — same as `stop_and_join`.
         self.registration.set_worker(None);
         self.catalog.delete_worker(&self.instance_id).await?;
+        // 2i (#500 wave 5 group E1, P7): the loop task is joined or aborted
+        // by 2e above — this call is what it means for RELEASE to
+        // "complete" the guard's slot-holding lifetime — so a successor
+        // `spawn`/`spawn_worker` on this SAME session is admitted from this
+        // instant, without waiting for THIS guard to be dropped. `Drop`'s
+        // own release later is a compare-and-set against `loop_generation`
+        // and finds the slot already free (or already reclaimed by a
+        // successor), so it never double-releases or steals a successor's
+        // slot.
+        self.admission.release_loop_claim(self.loop_generation);
         Ok(ReleaseReport {
             loop_state,
             holds,
@@ -4630,9 +4815,20 @@ impl Drop for EmbeddedWorker {
     /// process's own caller cancelled before it could join or abort it (F1)
     /// — is aborted here too: total match, nothing is ever silently lost to
     /// a bare `JoinHandle` drop (which would DETACH rather than abort).
+    ///
+    /// Also releases the session's single claim-loop slot
+    /// (`HostAdmission::release_loop_claim`, #500 wave 5 group E1 P7),
+    /// compare-and-set against this guard's OWN `loop_generation` — a
+    /// no-op when `release_and_stop` already released it (2i), or when a
+    /// successor has since claimed a NEW generation, so this can never
+    /// steal a successor's slot. `Drop` runs exactly once per guard
+    /// regardless of whether `stop_and_join`, `release_and_stop`, both (one
+    /// cancelled), or neither ran first, so this is the backstop for every
+    /// stop path OTHER than a completed `release_and_stop`.
     fn drop(&mut self) {
         self.shared.request_stop();
         self.stop_sampler();
+        self.admission.release_loop_claim(self.loop_generation);
         let task = std::mem::replace(
             &mut *self
                 .handle

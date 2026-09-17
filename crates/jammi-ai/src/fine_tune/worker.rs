@@ -5444,6 +5444,19 @@ pub mod loop_test_hooks {
         /// call returned `Ok`) for `job_id` — the earliest instant a test
         /// may observe `fetch_resume_checkpoint` return `Some` for it.
         ResumeCheckpointWritten,
+        /// The rank body identified by the carried rank number is ABOUT TO
+        /// call `discover_resume` for `job_id` — fired unconditionally,
+        /// immediately before that call, so it still fires even when
+        /// `discover_resume` goes on to return `Err` (a corrupted resume
+        /// bundle, `artifact.rs`'s hard-error contract) or the function
+        /// returns early via `?`. The rank-attributed positive proof that
+        /// THIS rank's body reached the resume seam — needed because the
+        /// `_resume/` bundle is job-scoped, read independently by every
+        /// rank, so a job's terminal `failed` row with a resume-related
+        /// error cannot by itself attribute which rank's read produced it
+        /// (a `Peer` gang's rank-0 coordinator and its member's rank 1 both
+        /// read the identical bundle and would fail identically).
+        ResumeAttempted(u32),
     }
 
     struct ArmedEvent {
@@ -8682,6 +8695,17 @@ fn run_fine_tune_blocking(
     // initial weights through the real `run_spec`.
     #[cfg(feature = "test-hooks")]
     training_test_hooks::note_rank_target(&job_id, role.rank(), dropout_seed, &target)?;
+
+    // Fired UNCONDITIONALLY, before the call: the rank-attributed proof
+    // that THIS rank's body reached the resume seam, regardless of what
+    // `discover_resume` goes on to return (`Ok(None)`, `Ok(Some(_))`, or an
+    // `Err` this `?` propagates on a corrupted bundle) — see
+    // `Event::ResumeAttempted`'s own doc.
+    #[cfg(feature = "test-hooks")]
+    loop_test_hooks::fire_observed(
+        &job_id,
+        loop_test_hooks::Event::ResumeAttempted(role.rank()),
+    );
 
     let tenant = catalog.current_tenant();
     let resume = discover_resume(&artifact_store, tenant, &job_id, &device)?;

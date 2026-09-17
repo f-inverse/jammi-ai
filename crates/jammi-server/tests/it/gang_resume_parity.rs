@@ -43,15 +43,26 @@
 //!   fetch_resume_checkpoint`'s own contract (`artifact.rs`) makes a
 //!   present-but-corrupt bundle a HARD ERROR, never a silent from-scratch
 //!   restart — so attempt 2 failing here, naming the digest mismatch, is the
-//!   executed proof that the rank body genuinely calls back into
+//!   executed proof that SOME rank's body genuinely called back into
 //!   `discover_resume` rather than skipping it. Run once under `Local`
 //!   (`..._under_local`, `[worker] local_ranks = 2`, no fleet dial) and once
 //!   under `Peer` (`..._under_peer`, a real loopback member over the same
 //!   `GangServiceServer` `gang_chaos.rs` uses, unmodified, serving both
-//!   attempts): the Peer arm is the executed proof that a member-hosted
-//!   rank's resume path is exercised too, not only the in-process one — the
-//!   two rows share one driver (`run_corrupted_epoch_1_checkpoint`), never
-//!   duplicated per topology.
+//!   attempts) — the two rows share one driver
+//!   (`run_corrupted_epoch_1_checkpoint`), never duplicated per topology.
+//!
+//!   The job-terminal `failed`/`sha256` assertion alone cannot attribute
+//!   WHICH rank's read produced it: the `_resume/` bundle is job-scoped, so
+//!   on `Peer` the in-process rank-0 coordinator and the dialed member's
+//!   rank 1 read the identical corrupted bundle and fail identically — a
+//!   member that never even attempted resume would leave this assertion
+//!   passing vacuously off rank 0's own failure alone. The `Peer` row
+//!   closes that gap with a SECOND, rank-attributed assertion: it arms
+//!   `loop_test_hooks::Event::ResumeAttempted(1)` (fired unconditionally,
+//!   immediately before a rank body's own `discover_resume` call, by rank
+//!   number) for attempt 2 and asserts it fired before the row went
+//!   terminal — the executed proof that the MEMBER's own body, specifically,
+//!   reached the resume seam.
 
 #![cfg(feature = "test-hooks")]
 
@@ -375,12 +386,30 @@ async fn peer_and_local_w2_gangs_resume_from_epoch_1s_checkpoint_and_publish_byt
 /// loopback fleet member (unmodified, serving both attempts, exactly
 /// `run_peer_w2_resumed`'s own shape) — its slot is awaited free between
 /// the kill and the second host's claim, the same wait that row performs.
+///
+/// `member_rank`, when `Some(rank)`, arms
+/// [`loop_test_hooks::Event::ResumeAttempted`] for `rank` immediately BEFORE
+/// attempt 2 runs (never before attempt 1 — that attempt legitimately calls
+/// `discover_resume` too, and the event is one-shot per (job, rank), so
+/// arming any earlier would let attempt 1's own occurrence consume it) and,
+/// once attempt 2 is terminal, asserts that rank's body reached the resume
+/// seam. This is the ONLY rank-attributed evidence in this driver: the
+/// job-terminal `failed`/`sha256` assertion below is job-scoped, not
+/// rank-scoped — the `_resume/` bundle is shared and read independently by
+/// EVERY rank, so on a `Peer` gang a rank-0 (coordinator) failure and a rank
+/// 1 (member) failure produce an IDENTICAL terminal row; only the armed
+/// event distinguishes "rank `member_rank`'s own body reached
+/// `discover_resume`" from "some other rank's read failed the job first".
+/// `None` on `Local` (there is no separate member to attribute to — the one
+/// host runs every rank in-process).
+///
 /// Shared by both topology tests below so the corrupted-bundle assertion is
 /// written once, never duplicated per topology.
 async fn run_corrupted_epoch_1_checkpoint(
     fleet: &Fleet,
     install_dialer: bool,
     member: Option<&Member>,
+    member_rank: Option<u32>,
     configure: impl Fn(&mut JammiConfig) + Copy,
 ) -> Row {
     let mut host = KillableHost::start(fleet, install_dialer, configure).await;
@@ -426,7 +455,24 @@ async fn run_corrupted_epoch_1_checkpoint(
     let host2 = KillableHost::start(fleet, install_dialer, configure).await;
     let record2 = host2.claim(LEASE + Duration::from_secs(20)).await;
     assert_eq!(record2.attempts, 2);
+
+    // Armed BEFORE attempt 2 runs (see this fn's own doc on why not earlier).
+    let resume_attempted = member_rank.map(|rank| {
+        loop_test_hooks::arm_observed(&job_id, loop_test_hooks::Event::ResumeAttempted(rank))
+    });
+
     host2.run(record2).await;
+
+    if let Some(observed) = resume_attempted {
+        tokio::time::timeout(Duration::from_secs(10), observed.wait_fired())
+            .await
+            .expect(
+                "rank-attributed proof: the member's own rank body must have reached \
+                 discover_resume for this job during attempt 2 -- a job-terminal failure \
+                 alone does not attribute which rank's read produced it, since every rank \
+                 reads the identical job-scoped resume bundle",
+            );
+    }
 
     row(&host2.session, &job_id).await
 }
@@ -446,7 +492,9 @@ fn assert_corrupted_resume_failed_loudly(after: &Row) {
 }
 
 /// The `Local` arm: a `local_ranks = 2` host runs both ranks in-process, no
-/// fleet dial — `run_local_w2_resumed`'s own topology.
+/// fleet dial — `run_local_w2_resumed`'s own topology. No separate member to
+/// attribute to (`member_rank: None`): the job-terminal
+/// `failed`/`sha256` assertion is the whole proof here, same as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_corrupted_epoch_1_checkpoint_fails_attempt_2_loudly_never_a_silent_restart_under_local()
 {
@@ -456,15 +504,25 @@ async fn a_corrupted_epoch_1_checkpoint_fails_attempt_2_loudly_never_a_silent_re
         cfg.gpu.devices = Some(vec![0, 1]);
         cfg.worker.local_ranks = 2;
     };
-    let after = run_corrupted_epoch_1_checkpoint(&fleet, false, None, configure).await;
+    let after = run_corrupted_epoch_1_checkpoint(&fleet, false, None, None, configure).await;
     assert_corrupted_resume_failed_loudly(&after);
 }
 
 /// The `Peer` arm: a coordinator plus one real fleet member dialed over the
 /// loopback `GangServiceServer` (`gang_chaos::Member`, unmodified — the SAME
-/// member serves both attempts, `run_peer_w2_resumed`'s own topology) — the
-/// executed proof that a member-hosted rank's resume path is exercised too,
-/// not only the in-process one this row's `Local` sibling covers.
+/// member serves both attempts, `run_peer_w2_resumed`'s own topology).
+///
+/// The job-terminal `failed`/`sha256` assertion this row shares with `Local`
+/// does NOT, by itself, prove the MEMBER's rank body reached
+/// `discover_resume`: the `_resume/` bundle is job-scoped, and rank 0 (the
+/// in-process coordinator) reads the identical corrupted bundle and would
+/// fail the SAME way even if the member's own rank-1 body never ran its
+/// resume path at all. `member_rank: Some(1)` (the member always runs rank
+/// 1 — `gang_coordinator.rs`'s own doc) closes that gap: it arms
+/// [`loop_test_hooks::Event::ResumeAttempted(1)`] for attempt 2 and asserts
+/// it fired — the executed, rank-attributed proof that the member's own
+/// body called back into `discover_resume`, not merely that the job (via
+/// SOME rank) ended `failed`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_corrupted_epoch_1_checkpoint_fails_attempt_2_loudly_never_a_silent_restart_under_peer() {
     let fleet = Fleet::new();
@@ -473,6 +531,7 @@ async fn a_corrupted_epoch_1_checkpoint_fails_attempt_2_loudly_never_a_silent_re
         cfg.distributed.max_world_size = 2;
     };
     let member = Member::start(&fleet).await;
-    let after = run_corrupted_epoch_1_checkpoint(&fleet, true, Some(&member), configure).await;
+    let after =
+        run_corrupted_epoch_1_checkpoint(&fleet, true, Some(&member), Some(1), configure).await;
     assert_corrupted_resume_failed_loudly(&after);
 }

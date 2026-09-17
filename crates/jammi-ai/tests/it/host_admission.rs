@@ -269,7 +269,7 @@ async fn the_phase_cell_drains_once_and_release_wins() {
     assert!(!cell.begin_drain(), "a second drain changes nothing");
     assert_eq!(cell.phase(), WorkerPhase::Draining);
     rx.wait_for(|p| *p != WorkerPhase::Running).await.unwrap();
-    cell.begin_release();
+    cell.begin_release().await;
     assert_eq!(cell.phase(), WorkerPhase::Releasing);
     assert!(
         !cell.begin_drain(),

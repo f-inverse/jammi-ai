@@ -442,7 +442,7 @@ impl InferenceSession {
         crate::fine_tune::worker::HoldReleaseOutcome,
         crate::fine_tune::worker::ReleaseSweep,
     )> {
-        self.host_admission.begin_release();
+        self.host_admission.begin_release().await;
         let heartbeat = self.worker_intervals()?.heartbeat;
         let holds = match self.lease_keeper.release_job_holds(heartbeat).await {
             Ok(hr) => crate::fine_tune::worker::HoldReleaseOutcome::Observed(hr),

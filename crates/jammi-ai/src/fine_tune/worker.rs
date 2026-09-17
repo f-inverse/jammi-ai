@@ -701,7 +701,24 @@ impl HostAdmission {
     /// release`'s self-release check both read — `phase()` alone cannot
     /// serve that role because `try_claim_loop` resets it for every new
     /// generation.
-    pub fn begin_release(&self) {
+    ///
+    /// The phase flip runs strictly BEFORE the epoch bump — LOAD-BEARING,
+    /// not incidental: `run_placed_gang`'s own doc and `WorkerShared::
+    /// for_single_run`'s (the two-catch lattice over a birth-epoch snapshot
+    /// taken before `probe_claim()`) both depend on "the bump is visible ⇒
+    /// the flip already happened", which only holds in THIS order. Swapping
+    /// the two statements admits a gang on a releasing host: a birth-epoch
+    /// snapshot taken inside the (now relocated) window between the bump
+    /// and the flip already contains the bump, so `released_since_birth`
+    /// reads `false` downstream, while `probe_claim`'s phase check — racing
+    /// the same window from the other side — still reads `Running` and
+    /// admits. Pinned by `begin_release_bumps_the_epoch_strictly_after_the_
+    /// phase_flip_is_already_visible` (`fine_tune::worker::tests`), which
+    /// parks a live `begin_release` call between the two statements
+    /// (`loop_test_hooks::ParkPoint::BeginReleaseBetweenFlipAndBump`) and
+    /// asserts `probe_claim` already refuses while the epoch is still
+    /// unbumped.
+    pub async fn begin_release(&self) {
         self.phase.send_if_modified(|p| {
             if *p == WorkerPhase::Releasing {
                 false
@@ -710,6 +727,12 @@ impl HostAdmission {
                 true
             }
         });
+        #[cfg(feature = "test-hooks")]
+        loop_test_hooks::maybe_park(
+            &self.registry.instance_id,
+            loop_test_hooks::ParkPoint::BeginReleaseBetweenFlipAndBump,
+        )
+        .await;
         self.release_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -1098,24 +1121,28 @@ impl WorkerShared {
     /// call and carries that value all the way here — every byte of work
     /// after the snapshot (`probe_claim()` itself, `Catalog::transfer_claim`,
     /// `Catalog::get_job`) must be covered by the SAME birth snapshot any
-    /// RELEASE landing during them has to race: a RELEASE whose epoch bump
-    /// is not yet visible when the snapshot is read cannot have flipped the
-    /// phase yet either (`HostAdmission::begin_release` orders the phase
-    /// flip strictly before the epoch bump), so `probe_claim()`'s own phase
-    /// check refuses it typed; a RELEASE whose epoch bump IS already
-    /// visible when the snapshot is read is instead caught by
-    /// `released_since_birth` downstream. No RELEASE lands in the gap
-    /// between the two catches (#500 wave 5 group E1, P7 pressure-round
-    /// fix, round 2 — round 1 read the epoch synchronously right AFTER
-    /// `probe_claim()` returned rather than before it: that closed the
-    /// window across the two catalog round trips but left the read itself
-    /// racing a RELEASE landing between `probe_claim()`'s own phase check
-    /// and the read, since `probe_claim` commits on the phase read alone
-    /// and `begin_release` bumps the epoch after flipping the phase; such a
-    /// RELEASE bumped the epoch before this constructor's read snapshotted
-    /// it, so `released_since_birth` compared the post-release epoch
-    /// against itself and read `false`, and the gang dispatched on a
-    /// releasing host).
+    /// RELEASE landing during them has to race: because `HostAdmission::
+    /// begin_release` flips the phase strictly BEFORE it bumps the epoch, a
+    /// snapshot whose epoch bump is already visible implies the flip already
+    /// happened too, so `probe_claim()`'s own phase check — run immediately
+    /// after the snapshot — refuses it typed directly; a snapshot whose
+    /// epoch bump is NOT yet visible carries no such guarantee about the
+    /// phase (the flip may land at any point after the snapshot, including
+    /// inside `probe_claim()`'s own check), so that case relies instead on
+    /// `released_since_birth` downstream once the bump does become visible.
+    /// No RELEASE lands in the gap between the two catches (#500 wave 5
+    /// group E1, P7 pressure-round fix, round 2 — round 1 read the epoch
+    /// synchronously right AFTER `probe_claim()` returned rather than
+    /// before it: that closed the window across the two catalog round
+    /// trips but left the read itself racing a RELEASE landing between
+    /// `probe_claim()`'s own phase check and the read, since `probe_claim`
+    /// commits on the phase read alone and `begin_release` bumps the epoch
+    /// after flipping the phase; such a RELEASE bumped the epoch before
+    /// this constructor's read snapshotted it, so `released_since_birth`
+    /// compared the post-release epoch against itself and read `false`,
+    /// and the gang dispatched on a releasing host; round 3 pins the flip-
+    /// before-bump ORDER itself, load-bearing but previously unpinned —
+    /// see `HostAdmission::begin_release`'s own doc).
     fn for_single_run(
         admission: &Arc<HostAdmission>,
         worker_id: String,
@@ -2583,17 +2610,19 @@ impl JobWorker {
     /// [`HostAdmission::probe_claim`] (`Free → ClaimProbe`; a host already
     /// holding a rank, a loop-claimed job, or another placement's
     /// probe/await refuses typed BEFORE any row write) — a two-catch
-    /// lattice with no gap between the catches: a RELEASE whose epoch bump
-    /// is not yet visible when the snapshot is read has, a fortiori, not
-    /// yet flipped the phase either (`HostAdmission::begin_release` orders
-    /// the phase flip strictly BEFORE the epoch bump), so `probe_claim`'s
-    /// own phase check refuses it typed; a RELEASE whose epoch bump IS
-    /// already visible when the snapshot is read is instead caught
-    /// downstream by the epoch compare (`WorkerShared::released_since_birth`),
-    /// since the snapshot this run carries is then already stale for it —
-    /// covering `probe_claim()` itself and every byte of (ii)/(iii) below —
-    /// see `WorkerShared::for_single_run`'s own doc for the prior (windowed)
-    /// shape this replaced;
+    /// lattice with no gap between the catches: because `HostAdmission::
+    /// begin_release` orders the phase flip strictly BEFORE the epoch
+    /// bump, a snapshot whose epoch bump IS already visible implies the
+    /// flip already happened too, so `probe_claim`'s own phase check —
+    /// run immediately after the snapshot — refuses it typed directly; a
+    /// snapshot whose epoch bump is NOT yet visible carries no such
+    /// guarantee (the flip can still land at any point up to and including
+    /// inside `probe_claim`'s own check), so that case is instead caught
+    /// downstream by the epoch compare (`WorkerShared::released_since_birth`)
+    /// once the bump does become visible — covering `probe_claim()` itself
+    /// and every byte of (ii)/(iii) below — see `WorkerShared::
+    /// for_single_run`'s own doc for the prior (windowed) shape this
+    /// replaced;
     /// (ii) [`Catalog::transfer_claim`] moves `claimed_by` from
     /// `descriptor.submitter` to this instance at the SAME `attempts`,
     /// arming a fresh lease (`false` — the transfer never happened, a
@@ -4941,13 +4970,17 @@ impl EmbeddedWorker {
     /// catalog error inside any statement is logged and the arm continues
     /// (the affected lease falls to the expiry path).
     pub async fn release_and_stop(&self) -> Result<ReleaseReport> {
-        // 2a — phase and stop together, in the same synchronous statement
-        // pair (no `.await` between them), mirroring `begin_drain`'s own
-        // shape (P2, `CONTRACT-RELEASE-SPIN.md`'s design-pass fold): a
-        // poll-once test proves both setters resolve this pair before their
-        // first yield, so exit latency after either flip is bounded by the
-        // in-flight job, never by `idle_poll`.
-        self.admission.begin_release();
+        // 2a — phase and stop together, in the same statement pair,
+        // mirroring `begin_drain`'s own shape (P2, `CONTRACT-RELEASE-
+        // SPIN.md`'s design-pass fold): `begin_release` carries a syntactic
+        // `.await` (its own doc: the test-only park pinning the phase-
+        // flip/epoch-bump order), but that inner future resolves within
+        // this SAME poll — no genuine yield — unless a test has armed
+        // `ParkPoint::BeginReleaseBetweenFlipAndBump` for THIS instance, so
+        // a poll-once test proves both setters resolve this pair before
+        // their first genuine yield, and exit latency after either flip is
+        // bounded by the in-flight job, never by `idle_poll`.
+        self.admission.begin_release().await;
         self.shared.request_stop();
         // 2b
         let holds = match self.keeper.release_job_holds(self.heartbeat).await {
@@ -5170,6 +5203,19 @@ pub mod loop_test_hooks {
         /// round trips a RELEASE landing during them must still be caught
         /// across (#500 wave 5 group E1, P7 pressure-round fix).
         PlacedGangBeforeTransfer,
+        /// Inside `HostAdmission::begin_release`, between the phase flip
+        /// (→ `Releasing`) and the release-epoch bump — pins the load-
+        /// bearing order the two-catch lattice in `run_placed_gang`'s own
+        /// doc and `WorkerShared::for_single_run`'s depends on: while
+        /// parked here the phase is already `Releasing` (a concurrent
+        /// `probe_claim` refuses) but the epoch is not yet bumped (a
+        /// concurrent birth-epoch snapshot would not yet contain it).
+        /// Keyed by the owning `HostAdmission`'s `registry().instance_id`
+        /// (`arm`'s key doubles as either a job id or an instance id — no
+        /// job is claimed yet at this point) (#500 wave 5 group E1, P7
+        /// pressure-round fix, round 3: pins the ORDER of the two
+        /// statements, which round 2's fix only ever assumed).
+        BeginReleaseBetweenFlipAndBump,
     }
 
     struct Armed {
@@ -12642,17 +12688,98 @@ mod tests {
     /// admission are this one predicate. Mutation: drop the phase check at
     /// the top of `probe_claim` and the `Draining` assertion reds (the
     /// holder cell is `Free`, so the CAS alone would admit).
-    #[test]
-    fn probe_claim_refuses_once_a_drain_or_release_has_begun() {
+    #[tokio::test]
+    async fn probe_claim_refuses_once_a_drain_or_release_has_begun() {
         let cell = cell();
         assert!(cell.probe_claim().is_some(), "Running admits");
         assert!(cell.begin_drain());
         assert!(cell.probe_claim().is_none(), "Draining refuses a new claim");
         assert_eq!(cell.holder(), Holder::Free, "the refusal moved nothing");
-        cell.begin_release();
+        cell.begin_release().await;
         assert!(
             cell.probe_claim().is_none(),
             "Releasing refuses a new claim"
+        );
+    }
+
+    /// Adversarial-audit finding on `begin_release`'s own two statements:
+    /// nothing PINNED the phase flip landing strictly before the epoch
+    /// bump — the two-catch lattice `run_placed_gang`'s own doc and
+    /// `WorkerShared::for_single_run`'s depend on ("a snapshot whose epoch
+    /// bump is already visible implies the flip already happened too")
+    /// only holds in that order, and the sole existing regression test for
+    /// the lattice (`gang_placed::
+    /// release_landing_between_the_epoch_read_and_probe_claim_is_still_
+    /// refused`) cannot falsify the ORDER because its own RELEASE runs to
+    /// full completion (both statements) inside one park, never observing
+    /// the gap between them.
+    ///
+    /// This test parks a live `begin_release` call between its two
+    /// statements and reads BOTH sides of the window directly: while
+    /// parked, the phase must already read `Releasing` (so a concurrent
+    /// `probe_claim` refuses) while the epoch must NOT yet be bumped.
+    ///
+    /// Mutation (executed): swapped `begin_release`'s two statements (bump
+    /// then flip) and moved the park between the (now-reordered) bump and
+    /// flip. RED, first line: `assertion `left == right` failed: phase must
+    /// already be Releasing while parked between the flip and the bump` /
+    /// `left: Running` / `right: Releasing` — under the swap, the epoch is
+    /// already bumped but the phase has not yet flipped at the park, so
+    /// this assertion catches it before the `probe_claim` assertion below
+    /// even runs. Reverted after capturing the line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn begin_release_bumps_the_epoch_strictly_after_the_phase_flip_is_already_visible() {
+        let admission = HostAdmission::new(Arc::new(InstanceRegistration::new(
+            "release-window-cell",
+            None,
+            None,
+            None,
+            None,
+        )));
+        let birth_epoch = admission.release_epoch();
+        assert_eq!(birth_epoch, 0, "a fresh admission starts at epoch 0");
+
+        let park = loop_test_hooks::arm(
+            &admission.registry().instance_id,
+            loop_test_hooks::ParkPoint::BeginReleaseBetweenFlipAndBump,
+        );
+        let releasing = {
+            let admission = Arc::clone(&admission);
+            tokio::spawn(async move { admission.begin_release().await })
+        };
+        park.wait_parked().await;
+
+        // Parked strictly between the flip and the bump: the flip must
+        // already be visible ...
+        assert_eq!(
+            admission.phase(),
+            WorkerPhase::Releasing,
+            "phase must already be Releasing while parked between the flip and the bump"
+        );
+        // ... while the bump must NOT be visible yet.
+        assert_eq!(
+            admission.release_epoch(),
+            birth_epoch,
+            "the epoch must not be bumped yet while parked between the flip and the bump"
+        );
+        // A concurrent `probe_claim` — exactly `run_placed_gang`'s own
+        // check, racing this window — must refuse on the phase alone, with
+        // no epoch compare available to it at all.
+        assert!(
+            admission.probe_claim().is_none(),
+            "probe_claim must refuse on the phase read alone while the epoch is still unbumped"
+        );
+
+        park.release();
+        tokio::time::timeout(Duration::from_secs(10), releasing)
+            .await
+            .expect("begin_release must resume and return once released")
+            .unwrap();
+
+        assert_eq!(
+            admission.release_epoch(),
+            birth_epoch + 1,
+            "the bump lands once begin_release resumes"
         );
     }
 

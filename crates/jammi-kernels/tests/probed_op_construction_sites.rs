@@ -1,4 +1,4 @@
-//! I2 adversarial-audit fix: [`jammi_kernels::admission::ProbedOp`] is
+//! [`jammi_kernels::admission::ProbedOp`] is
 //! sealed against every crate but `jammi-kernels` itself — `#[non_exhaustive]`
 //! plus every field `pub(crate)` with public read accessors
 //! (`admission.rs`'s own doc on `ProbedOp`/`Sealed` has the full argument).
@@ -850,7 +850,7 @@ fn falsification_an_extra_direct_call_site_moves_the_discovered_count() {
     );
 }
 
-/// Mutation oracle for direction 2 — the exact gap the audit named: a
+/// Mutation oracle for direction 2: a
 /// same-crate `pub const X: ProbedOp = ProbedOp {{ ..., _sealed: Sealed }}`
 /// struct literal, never routed through `ProbedOp::new` at all, was
 /// invisible to the earlier, `ProbedOp::new`-only scan (`direct_call_sites`
@@ -914,7 +914,7 @@ fn falsification_a_same_crate_struct_literal_outside_new_is_found_and_unreviewed
     );
 }
 
-/// Auditor bypass 1/5 — a fully qualified path
+/// Construction shape 1/5 — a fully qualified path
 /// (`crate::admission::ProbedOp::new`, here shortened to a two-module
 /// prefix over the SAME shape since the fixture is single-file): the
 /// exact shape an exact-segment-vector-equality check (`segments ==
@@ -937,7 +937,7 @@ fn falsification_qualified_path_call_is_found() {
     );
 }
 
-/// Auditor bypass 2/5 — qualified-self syntax (`<ProbedOp>::new(...)`): a
+/// Construction shape 2/5 — qualified-self syntax (`<ProbedOp>::new(...)`): a
 /// DIFFERENT `syn::Expr::Path` shape entirely (the type lives in the
 /// expression's own `qself` field, and `path` carries only `new`), so a
 /// check that only ever reads `path`'s own segments — never `qself` —
@@ -960,7 +960,7 @@ fn falsification_qualified_self_type_call_is_found() {
     );
 }
 
-/// Auditor bypass 3/5 — a same-crate type alias (`type PO = ProbedOp; PO
+/// Construction shape 3/5 — a same-crate type alias (`type PO = ProbedOp; PO
 /// ::new(...)`): the exact shape [`AliasCollector`]'s own first pass
 /// exists to resolve.
 #[test]
@@ -989,7 +989,7 @@ fn falsification_type_alias_call_is_found() {
     );
 }
 
-/// Auditor bypass 4/5 — a `ProbedOp::new(...)` call wrapped inside a
+/// Construction shape 4/5 — a `ProbedOp::new(...)` call wrapped inside a
 /// macro INVOCATION (`vec![ProbedOp::new(...)]`): opaque to direction 1's
 /// typed `ExprCall` traversal (a macro's own arguments are an unparsed
 /// token stream, never an `Expr` node syn descends into), found only by
@@ -1011,7 +1011,7 @@ fn falsification_macro_invocation_wrapped_new_call_is_found() {
     );
 }
 
-/// Auditor bypass 5/5 — a raw `ProbedOp { .. }` struct literal wrapped
+/// Construction shape 5/5 — a raw `ProbedOp { .. }` struct literal wrapped
 /// inside a macro invocation (`vec![ProbedOp { .., _sealed: Sealed }]`):
 /// opaque to BOTH direction 1 (no call at all) and direction 2 (no typed
 /// `ExprStruct` node — the whole literal is inside an unparsed macro

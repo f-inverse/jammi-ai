@@ -306,12 +306,34 @@ fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
 }
 
 /// Walks a parsed file, tracking the innermost enclosing named function and
-/// recording every `.delete_if_exists(...)` / `.delete_artifact_prefix(...)`
-/// METHOD call it finds (both raw deleters are always reached as `self.foo(..)`
-/// or `handle.foo(..)` in this codebase — never a bare associated-function
-/// call — confirmed by reading every production call site during this
-/// scan's construction; `visit_expr_method_call` alone is therefore a
-/// complete walk, not a partial one).
+/// recording every call of `delete_if_exists` / `delete_artifact_prefix` it
+/// finds, in EVERY shape a same-tree caller can spell one — never only the
+/// shape today's call sites happen to use ("confirmed by reading every
+/// production call site" is a review of the present tree, not a control
+/// over the next commit's, and an enumerating gate that enumerates one
+/// shape fails open on the others):
+///
+/// 1. a method call, `handle.delete_if_exists(..)` (`visit_expr_method_call`);
+/// 2. a path call under ANY qualifying prefix or qualified-self syntax —
+///    `JammiObjectStore::delete_if_exists(&h, ..)`,
+///    `crate::storage::JammiObjectStore::delete_if_exists(..)`,
+///    `<JammiObjectStore>::delete_if_exists(..)` — matched by the path's own
+///    LAST segment, never by a fixed-length segment-vector equality
+///    (`visit_expr_call`);
+/// 3. a call inside a macro INVOCATION's argument stream —
+///    `tokio::try_join!(h.delete_if_exists(&a), ..)`, `assert!(..)`, a
+///    `macro_rules!` body — which `syn` parses as an opaque token stream
+///    no `visit_expr_*` ever descends into: `visit_macro` walks the tokens
+///    (through every nested group) and records each exact `Ident` spelled
+///    as one of the two deleters, so a call that hides inside any macro is
+///    surfaced as a site to review, attributed to the enclosing named fn.
+///
+/// Matching is by exact identifier, never substring (`delete_if_existing`
+/// or a string literal that merely mentions the name is not a call), and a
+/// found site outside any named function panics loudly rather than being
+/// dropped. Executed falsifications for every shape live below
+/// (`shape_*` tests); the same seven-direction argument for the sibling
+/// construction oracle is `crates/jammi-kernels/tests/probed_op_construction_sites.rs`.
 struct DeleteCallScanner {
     /// The stack of enclosing named-function names — only `visit_item_fn`
     /// (free functions) and `visit_impl_item_fn` (methods) push; a closure
@@ -395,6 +417,52 @@ impl<'ast> syn::visit::Visit<'ast> for DeleteCallScanner {
         self.record_if_match(&node.method.to_string());
         syn::visit::visit_expr_method_call(self, node);
     }
+
+    /// Shape 2: a path call. Only the path's LAST segment is the function
+    /// name; everything before it (`Type::`, `crate::m::Type::`, or a
+    /// `<Type>` qualified self, which `syn` keeps in `qself` and out of the
+    /// segments entirely) is a prefix this scan must be indifferent to.
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(p) = &*node.func {
+            if let Some(last) = p.path.segments.last() {
+                self.record_if_match(&last.ident.to_string());
+            }
+        }
+        syn::visit::visit_expr_call(self, node);
+    }
+
+    /// Shape 3: a macro invocation (expression, statement or item position
+    /// — `syn` routes all three here). Its arguments are an opaque token
+    /// stream, so the tokens are walked directly; every exact `Ident`
+    /// spelled as a deleter is one site.
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        for ident in deleter_idents_in_tokens(node.tokens.clone()) {
+            self.record_if_match(&ident);
+        }
+        syn::visit::visit_macro(self, node);
+    }
+}
+
+/// Every `Ident` token in `ts` (descending through every nested
+/// delimited group) whose spelling is one of the two raw deleters, in
+/// source order. A string literal mentioning the name is a `Literal`
+/// token, never an `Ident`, so prose inside `format!`/`panic!` cannot
+/// match.
+fn deleter_idents_in_tokens(ts: proc_macro2::TokenStream) -> Vec<String> {
+    let mut out = Vec::new();
+    for tt in ts {
+        match tt {
+            proc_macro2::TokenTree::Ident(i) => {
+                let s = i.to_string();
+                if s == "delete_if_exists" || s == "delete_artifact_prefix" {
+                    out.push(s);
+                }
+            }
+            proc_macro2::TokenTree::Group(g) => out.extend(deleter_idents_in_tokens(g.stream())),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Parse `file` and return every raw-delete call site found, in the shape
@@ -402,7 +470,15 @@ impl<'ast> syn::visit::Visit<'ast> for DeleteCallScanner {
 fn scan_file(repo_root: &Path, file: &str) -> Vec<FoundSite> {
     let text = std::fs::read_to_string(repo_root.join(file))
         .unwrap_or_else(|e| panic!("reading {file}: {e}"));
-    let parsed = syn::parse_file(&text)
+    scan_source(file, &text)
+}
+
+/// The scan over one file's SOURCE TEXT — what `scan_file` runs on a real
+/// tracked file, and what the `shape_*` falsifications below run on a
+/// synthetic fixture, so a fixture exercises exactly the visitor the real
+/// gate uses (never a copy of it).
+fn scan_source(file: &str, text: &str) -> Vec<FoundSite> {
+    let parsed = syn::parse_file(text)
         .unwrap_or_else(|e| panic!("models_delete_call_sites: syn could not parse {file}: {e}"));
     let mut scanner = DeleteCallScanner::new();
     syn::visit::Visit::visit_file(&mut scanner, &parsed);
@@ -555,6 +631,81 @@ fn every_raw_models_byte_delete_call_site_is_reviewed() {
 /// (never touching the real tree) so the assertion logic itself is proven,
 /// independent of today's real call-site count drifting the primary test
 /// above.
+/// Run the real scanner over a synthetic fixture and return `function #ordinal`
+/// rows — the shape every `shape_*` falsification below asserts on.
+fn shape_sites(src: &str) -> Vec<String> {
+    scan_source("fixture.rs", src)
+        .into_iter()
+        .map(|s| format!("{} #{}", s.function, s.ordinal))
+        .collect()
+}
+
+#[test]
+fn shape_1_a_method_call_is_found() {
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_1_a_method_call_is_found — not real code in this file
+    let src = "async fn f(h: H, p: P) { h.delete_if_exists(&p).await.unwrap(); }";
+    assert_eq!(shape_sites(src), vec!["f #1"]);
+}
+
+#[test]
+fn shape_2_a_path_call_is_found_under_any_prefix_and_qualified_self() {
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_2 (bare type path) — not real code in this file
+    let bare = "async fn f(h: H, p: P) { JammiObjectStore::delete_if_exists(&h, &p).await; }";
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_2 (crate-qualified path) — not real code in this file
+    let qualified = "async fn f(h: H, p: P) { crate::storage::JammiObjectStore::delete_if_exists(&h, &p).await; }";
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_2 (qualified self) — not real code in this file
+    let qself = "async fn f(h: H, p: P) { <JammiObjectStore>::delete_if_exists(&h, &p).await; }";
+    let other =
+        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_2 (the other deleter, Self-prefixed) — not real code in this file
+        "impl S { async fn g(&self, p: P) { Self::delete_artifact_prefix(self, &p).await; } }";
+    for (name, src) in [
+        ("bare", bare),
+        ("qualified", qualified),
+        ("qself", qself),
+        ("other", other),
+    ] {
+        let want = if name == "other" { "g #1" } else { "f #1" };
+        assert_eq!(
+            shape_sites(src),
+            vec![want],
+            "shape 2 ({name}): a path-call spelling of a raw deleter must be found"
+        );
+    }
+}
+
+#[test]
+fn shape_3_a_call_inside_a_macro_invocation_is_found_per_occurrence() {
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_3 (try_join!) — not real code in this file
+    let joined = "async fn f(h: H, a: P, b: P) { tokio::try_join!(h.delete_if_exists(&a), h.delete_if_exists(&b)).unwrap(); }";
+    assert_eq!(shape_sites(joined), vec!["f #1", "f #2"]);
+    let nested =
+        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_3 (assert!, nested group) — not real code in this file
+        "async fn f(h: H, p: P) { assert!(matches!(h.delete_if_exists(&p).await, Ok(_))); }";
+    assert_eq!(shape_sites(nested), vec!["f #1"]);
+    let body =
+        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_3 (macro_rules body) — not real code in this file
+        "fn f() { macro_rules! reap { ($h:expr, $p:expr) => { $h.delete_if_exists($p).await } } }";
+    assert_eq!(shape_sites(body), vec!["f #1"]);
+}
+
+#[test]
+fn shape_controls_a_near_miss_identifier_or_a_string_literal_is_not_a_call() {
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for shape_controls — not real code in this file
+    let src = "async fn f(h: H, p: P) { h.delete_if_existing(&p).await; let _ = delete_if_exists_count(); \
+               tracing::warn!(\"delete_if_exists refused {p}\"); format!(\"delete_artifact_prefix\"); }";
+    assert_eq!(shape_sites(src), Vec::<String>::new());
+}
+
+#[test]
+fn shape_a_call_outside_any_named_function_is_surfaced_not_dropped() {
+    let src = "static _X: () = { let _ = macro_with_deleter!(delete_if_exists); };";
+    let r = std::panic::catch_unwind(|| shape_sites(src));
+    assert!(
+        r.is_err(),
+        "a deleter reached at module scope must panic the scan loudly, never be silently dropped"
+    );
+}
+
 #[test]
 fn an_unreviewed_call_site_reds_the_direction_one_check() {
     let found = [FoundSite {

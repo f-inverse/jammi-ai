@@ -2551,6 +2551,73 @@ class PrimitivePatternShapesTest(unittest.TestCase):
         self.assertEqual(findings, [], findings)
 
 
+class JobLevelAndSequenceCarrierTest(unittest.TestCase):
+    """#565: the publish-primitive matcher's domain widens to job-level
+    `env:`/`strategy.matrix:` and a YAML SEQUENCE under `with:`/`env:` --
+    carriers a `run:` step's own scalar never spells the primitive in at
+    all (only a variable REFERENCE), and a step's own `with:` value that
+    is a list, not a bare string."""
+
+    def test_job_level_env_with_an_indirect_run_command_is_caught(self):
+        rogue = (
+            "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  sneak:\n    runs-on: ubuntu-latest\n    env:\n      CMD: cargo publish\n"
+            "    steps:\n"
+            '      - run: bash -c "$CMD"\n'
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        self.assertTrue(any("sneak" in f for f in findings), findings)
+
+    def test_strategy_matrix_with_an_indirect_run_command_is_caught(self):
+        rogue = (
+            "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  sneak:\n    runs-on: ubuntu-latest\n"
+            '    strategy:\n      matrix:\n        cmd: ["cargo publish"]\n'
+            "    steps:\n"
+            "      - run: ${{ matrix.cmd }}\n"
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        self.assertTrue(any("sneak" in f for f in findings), findings)
+
+    def test_with_args_sequence_carrier_is_caught(self):
+        rogue = (
+            "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - uses: docker://alpine\n"
+            "        with:\n          args:\n            - -c\n            - cargo publish\n"
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        self.assertTrue(any("sneak" in f for f in findings), findings)
+
+    def test_job_level_env_carrier_on_a_step_gated_rows_second_step_is_caught(self):
+        texts = _positive_texts()
+        texts["npm.yml"] = _wf(
+            "v*",
+            _gate_job("gpu-proof")
+            + "  publish:\n    needs: [gpu-proof]\n    if: always()\n    runs-on: ubuntu-latest\n"
+            "    env:\n      SNEAK_CMD: npm publish --tag sneak\n"
+            "    steps:\n      - uses: actions/checkout@v4\n"
+            "      - name: Publish\n"
+            "        if: always() && startsWith(github.ref, 'refs/tags/v') && needs.gpu-proof.result == 'success'\n"
+            "        run: npm publish --provenance --access public\n",
+        )
+        findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
+        self.assertTrue(
+            any("SECOND" in f and "job-level" in f and "not the gated step" in f for f in findings),
+            findings,
+        )
+
+    def test_steps_present_but_not_a_list_is_a_named_finding_never_a_typeerror(self):
+        # #565: `steps: 5` used to raise an uncaught TypeError from
+        # `for step in job_node.get("steps") or []` (a non-empty int is
+        # truthy, so `or []` never substitutes) -- now a named finding.
+        rogue = "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n  sneak:\n    runs-on: ubuntu-latest\n    steps: 5\n"
+        findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        mine = [f for f in findings if "rogue.yml" in f and "sneak" in f]
+        self.assertEqual(len(mine), 1, findings)
+        self.assertIn("not a list", mine[0])
+
+
 class RecursiveLocalReusableDiscoveryTest(unittest.TestCase):
     """F1 audit fix: a job that merely `uses:` a LOCAL reusable workflow
     whose own jobs match a primitive is itself a promoting job too --
@@ -2587,6 +2654,394 @@ class RecursiveLocalReusableDiscoveryTest(unittest.TestCase):
         self.assertFalse(
             any("_ci-base-image.yml" in f and "merge-manifest" in f for f in findings), findings
         )
+
+
+class DifferentialOracleAgainstA895b148Test(unittest.TestCase):
+    """F5 (contract delta, 2026-09-16): the rebuilt traversal (#561, plus
+    #563/#565/#564's per-hop corrections and #F4's composite-action
+    resolution) is a STRICT REFINEMENT of a895b148's fail-closed shape.
+    a895b148 (the commit `#561` rebuilds from) flags EVERY unlisted job's
+    job-level `uses:` unconditionally -- mere PRESENCE, never opened,
+    never examined -- once the SAME two named exemptions
+    (`REVIEWED_NONPUBLISHING_LOCAL_REUSABLES`, the `gate_job`/`PROOF_
+    REQUIRED_WORKFLOW` pair) are applied. The rebuild only ever CLEARS a
+    finding by actually opening the delegate and finding the WHOLE
+    reachable set clean; it never SILENCES a delegation a895b148's own
+    blanket rule would have flagged. This oracle reconstructs a895b148's
+    own rule directly (never imports it -- that shape no longer exists in
+    this module) and asserts, over the real tree AND every synthetic
+    fixture already defined in this file, that the rebuild's own
+    (workflow, job) finding pairs are a SUBSET of a895b148's."""
+
+    @staticmethod
+    def _a895b148_shape_flagged_pairs(workflow_texts: dict[str, str]) -> set[tuple[str, str]]:
+        listed = {(row.workflow, row.promoting_job) for row in cgo.PROMOTION_TABLE.values()}
+        gate_jobs = {
+            (row.workflow, row.gate_job) for row in cgo.PROMOTION_TABLE.values() if row.gate_job is not None
+        }
+        listed_resolved: set[tuple[str, str]] = set()
+        for workflow, job in listed:
+            resolved = cgo.resolve_workflow(workflow_texts, workflow)
+            listed_resolved.add((resolved if resolved is not None else workflow, job))
+        gate_jobs_resolved: set[tuple[str, str]] = set()
+        for workflow, job in gate_jobs:
+            resolved = cgo.resolve_workflow(workflow_texts, workflow)
+            gate_jobs_resolved.add((resolved if resolved is not None else workflow, job))
+        proof_required_variants = set(cgo._workflow_name_variants(cgo.PROOF_REQUIRED_WORKFLOW))
+        out: set[tuple[str, str]] = set()
+        for name, text in workflow_texts.items():
+            on_keys, on_err = cgo.read_top_level_on_block(text)
+            if on_err is not None or on_keys == ["workflow_call"]:
+                continue
+            jobs, jobs_err = cgo._parsed_jobs_or_fail(text)
+            if jobs_err is not None:
+                continue
+            for job_name, job_node in jobs.items():
+                if (name, job_name) in listed_resolved:
+                    continue
+                # a895b148's OWN direct-primitive check (unchanged in
+                # spirit by #563/#565 -- those only narrow/widen WHAT
+                # counts as a match, in the safe direction for this
+                # oracle: #565 widens the old shape's own coverage too,
+                # via the SAME `job_invokes_publish_primitive` this
+                # helper calls, so the subset property still holds).
+                primitive, primitive_err = cgo.job_invokes_publish_primitive(job_node)
+                if primitive_err is not None or primitive is not None:
+                    out.add((name, job_name))
+                    continue
+                uses = job_node.get("uses")
+                if not isinstance(uses, str):
+                    continue
+                if (name, job_name) in gate_jobs_resolved:
+                    gate_target = cgo._local_reusable_workflow_target(job_node)
+                    if gate_target is not None and gate_target in proof_required_variants:
+                        continue
+                if cgo._job_level_uses_is_reviewed_nonpublishing(job_node):
+                    continue
+                # a895b148's own rule: PRESENCE alone, unconditionally.
+                out.add((name, job_name))
+        return out
+
+    @staticmethod
+    def _rebuild_flagged_pairs(findings: list[str]) -> set[tuple[str, str]]:
+        out: set[tuple[str, str]] = set()
+        for f in findings:
+            m = re.match(r"P6: (\S+)'s job `([^`]+)`", f)
+            if m:
+                out.add((m.group(1), m.group(2)))
+        return out
+
+    def _assert_strict_refinement(self, workflow_texts: dict[str, str]) -> None:
+        old_shape = self._a895b148_shape_flagged_pairs(workflow_texts)
+        rebuild_findings = cgo.check_p6_discovery(workflow_texts)
+        rebuild_pairs = self._rebuild_flagged_pairs(rebuild_findings)
+        self.assertTrue(rebuild_pairs <= old_shape, rebuild_pairs - old_shape)
+
+    def test_real_tree_is_a_strict_refinement(self):
+        self._assert_strict_refinement(cgo.load_workflow_texts(cgo.WORKFLOWS_DIR))
+
+    def test_positive_fixture_is_a_strict_refinement(self):
+        self._assert_strict_refinement(_positive_texts())
+
+    def test_diamond_fixture_is_a_strict_refinement(self):
+        shared = LocalReusableTraversalTest._clean_reusable()
+        texts = {
+            **_positive_texts(),
+            "_shared.yml": shared,
+            "caller-a.yml": (
+                "name: caller-a\n\non:\n  push:\n    branches: [main]\n\n"
+                "jobs:\n  a:\n    uses: ./.github/workflows/_shared.yml\n"
+            ),
+            "caller-b.yml": (
+                "name: caller-b\n\non:\n  push:\n    branches: [main]\n\n"
+                "jobs:\n  b:\n    uses: ./.github/workflows/_shared.yml\n"
+            ),
+        }
+        self._assert_strict_refinement(texts)
+
+    def test_untabled_local_reusable_caller_fixture_is_a_strict_refinement(self):
+        texts = {
+            **_positive_texts(),
+            "rogue-caller.yml": _local_reusable_caller_yml(caller_job_name="sneak-build", target="_ci-base-image.yml"),
+        }
+        self._assert_strict_refinement(texts)
+
+
+class LocalCompositeActionResolutionTest(unittest.TestCase):
+    """#F4 (contract delta, 2026-09-16): a step-level `uses: ./.github/
+    actions/<x>` is RESOLVED and its `action.yml`'s own steps EXAMINED
+    through the same readers, replacing the deleted name-keyed
+    `_LOCAL_DOCKER_PUBLISH_VALUE_RE` -- ANY local composite action whose
+    own body invokes a primitive is caught, not only the two hand-named
+    ones. Uses a synthetic `_ACTIONS_DIR` (never the real
+    `.github/actions/`, which `docker-publish`/`release-upload` fixtures
+    elsewhere in this file already exercise for real)."""
+
+    def _with_synthetic_actions_dir(self, actions: dict[str, str]):
+        """`actions`: {name: action.yml text}. Returns a context manager
+        that patches `cgo._ACTIONS_DIR` at a fresh temp directory holding
+        exactly those actions, so no test here ever touches this repo's
+        real `.github/actions/`."""
+        tmp = tempfile.TemporaryDirectory()
+        root = Path(tmp.name)
+        for name, text in actions.items():
+            action_dir = root / name
+            action_dir.mkdir(parents=True, exist_ok=True)
+            (action_dir / "action.yml").write_text(text, encoding="utf-8")
+        return tmp, mock.patch.object(cgo, "_ACTIONS_DIR", root)
+
+    def test_local_composite_action_running_docker_push_unlisted_fails(self):
+        # The RED fixture: a local composite action whose body runs
+        # `docker push` via a plain `run:` command (never docker/build-
+        # push-action, never a hand-named path) -- invisible to the
+        # deleted name-keyed regex, which only ever recognised the two
+        # literal paths `docker-publish`/`release-upload`.
+        action_yml = (
+            "name: sneaky-pusher\nruns:\n  using: composite\n  steps:\n"
+            "    - name: Push it\n      shell: bash\n"
+            "      run: docker push ghcr.io/f-inverse/rogue:latest\n"
+        )
+        tmp, patcher = self._with_synthetic_actions_dir({"sneaky-pusher": action_yml})
+        with tmp, patcher:
+            rogue = (
+                "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+                "  check:\n    runs-on: ubuntu-latest\n    steps:\n"
+                "      - uses: actions/checkout@v4\n"
+                "      - uses: ./.github/actions/sneaky-pusher\n"
+            )
+            findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        self.assertTrue(any("check" in f and "docker push" in f for f in findings), findings)
+
+    def test_local_composite_action_running_docker_push_is_red_at_the_deleted_name_keyed_shape(self):
+        # Executed mutation, inline: the OLD name-keyed matcher (deleted
+        # by this unit) only ever recognised the literal path strings
+        # `./.github/actions/docker-publish`/`./.github/actions/release-
+        # upload` -- reproduce that shape directly and confirm it misses
+        # this exact fixture (the escape this rebuild closes).
+        action_yml = (
+            "name: sneaky-pusher\nruns:\n  using: composite\n  steps:\n"
+            "    - name: Push it\n      shell: bash\n"
+            "      run: docker push ghcr.io/f-inverse/rogue:latest\n"
+        )
+        import re as _re
+
+        old_local_re = _re.compile(r"^\./\.github/actions/docker-publish\b")
+        uses_value = "./.github/actions/sneaky-pusher"
+        self.assertIsNone(old_local_re.match(uses_value))
+        # ... and the OLD shape's own SIMPLE_PRIMITIVE_PATTERNS scan never
+        # looked inside a called action's `action.yml` at all -- the step
+        # calling it carries no `docker push` text of its own.
+        step_own_text = "./.github/actions/sneaky-pusher"
+        self.assertNotRegex(step_own_text, r"docker\s+push")
+
+    def test_local_composite_action_clean_body_is_not_flagged(self):
+        action_yml = (
+            "name: clean-noop\nruns:\n  using: composite\n  steps:\n"
+            "    - name: Say hi\n      shell: bash\n      run: echo hi\n"
+        )
+        tmp, patcher = self._with_synthetic_actions_dir({"clean-noop": action_yml})
+        with tmp, patcher:
+            clean = (
+                "name: clean\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+                "  build-only:\n    runs-on: ubuntu-latest\n    steps:\n"
+                "      - uses: ./.github/actions/clean-noop\n"
+            )
+            findings = cgo.check_p6_discovery({**_positive_texts(), "clean.yml": clean})
+        self.assertEqual(findings, [], findings)
+
+    def test_missing_local_action_yml_is_a_named_refusal_never_a_silent_pass(self):
+        tmp, patcher = self._with_synthetic_actions_dir({})
+        with tmp, patcher:
+            rogue = (
+                "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+                "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
+                "      - uses: ./.github/actions/does-not-exist\n"
+            )
+            findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        mine = [f for f in findings if "rogue.yml" in f and "sneak" in f]
+        self.assertEqual(len(mine), 1, findings)
+        self.assertIn("no action.yml", mine[0])
+
+    def test_nested_local_action_running_docker_push_is_caught_via_the_action_it_calls(self):
+        outer = (
+            "name: outer\nruns:\n  using: composite\n  steps:\n"
+            "    - name: delegate\n      uses: ./.github/actions/inner-pusher\n"
+        )
+        inner = (
+            "name: inner-pusher\nruns:\n  using: composite\n  steps:\n"
+            "    - name: Push it\n      shell: bash\n"
+            "      run: docker push ghcr.io/f-inverse/rogue:latest\n"
+        )
+        tmp, patcher = self._with_synthetic_actions_dir({"outer-wrapper": outer, "inner-pusher": inner})
+        with tmp, patcher:
+            rogue = (
+                "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+                "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
+                "      - uses: ./.github/actions/outer-wrapper\n"
+            )
+            findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        self.assertTrue(any("sneak" in f and "docker push" in f for f in findings), findings)
+
+    def test_cross_repo_local_shaped_action_is_refused_not_silently_passed(self):
+        rogue = (
+            "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - uses: f-inverse/other-repo/.github/actions/some-action@main\n"
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        mine = [f for f in findings if "rogue.yml" in f and "sneak" in f]
+        self.assertEqual(len(mine), 1, findings)
+        self.assertIn("CROSS-REPO", mine[0].upper())
+
+
+class LocalReusableTraversalTest(unittest.TestCase):
+    """#561: the rebuilt per-delegate traversal. Fixtures moved here from
+    the deleted traversal test suite (a895b148) plus the cross-repo gap
+    that deletion's own predecessor was found to have: diamond
+    memoization, a cycle's named depth-bound refusal, self-mask (a
+    sub-job's own direct match never masks examining its own further
+    `uses:`), a dangling/cross-repo target reached MID-CHAIN (not only at
+    the top-level caller) is its own named refusal, and memoized refusal
+    precedence (every caller reaching the same unexaminable reusable
+    sees the identical named refusal)."""
+
+    @staticmethod
+    def _clean_reusable() -> str:
+        return (
+            "name: clean-reusable\n\non:\n  workflow_call:\n\n"
+            "jobs:\n  noop:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - run: echo hi\n"
+        )
+
+    def test_diamond_reusable_is_walked_once_not_once_per_caller(self):
+        shared = self._clean_reusable()
+        caller_a = (
+            "name: caller-a\n\non:\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  a:\n    uses: ./.github/workflows/_shared.yml\n"
+        )
+        caller_b = (
+            "name: caller-b\n\non:\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  b:\n    uses: ./.github/workflows/_shared.yml\n"
+        )
+        texts = {
+            **_positive_texts(),
+            "_shared.yml": shared,
+            "caller-a.yml": caller_a,
+            "caller-b.yml": caller_b,
+        }
+        original = cgo._parsed_jobs_or_fail
+        calls: list[str] = []
+
+        def counting(text):
+            calls.append(text)
+            return original(text)
+
+        with mock.patch.object(cgo, "_parsed_jobs_or_fail", side_effect=counting):
+            findings = cgo.check_p6_discovery(texts)
+        self.assertEqual(findings, [], findings)
+        self.assertEqual(calls.count(shared), 1, calls)
+
+    def test_uses_cycle_terminates_in_a_named_depth_refusal_never_a_recursionerror(self):
+        a = "name: a\n\non:\n  workflow_call:\n\njobs:\n  j:\n    uses: ./.github/workflows/_b.yml\n"
+        b = "name: b\n\non:\n  workflow_call:\n\njobs:\n  k:\n    uses: ./.github/workflows/_a.yml\n"
+        caller = (
+            "name: caller\n\non:\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  top:\n    uses: ./.github/workflows/_a.yml\n"
+        )
+        texts = {**_positive_texts(), "_a.yml": a, "_b.yml": b, "caller.yml": caller}
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "caller.yml" in f]
+        self.assertEqual(len(mine), 1, mine)
+        self.assertIn("max examined depth", mine[0])
+
+    def test_self_mask_direct_match_never_skips_examining_the_same_jobs_own_uses(self):
+        # A single job carrying BOTH direct-match step content AND its
+        # own job-level `uses:` is not valid GitHub Actions (`uses:` and
+        # `steps:` are mutually exclusive there), but is not assumed
+        # impossible here -- examining the job-level `uses:` must never
+        # be skipped just because a direct match was already found.
+        mid = (
+            "name: mid\n\non:\n  workflow_call:\n\njobs:\n  j:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    uses: ./.github/workflows/_does_not_exist_nested.yml\n"
+            "    steps:\n      - run: npm publish\n"
+        )
+        caller = (
+            "name: caller\n\non:\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  top:\n    uses: ./.github/workflows/_mid.yml\n"
+        )
+        texts = {**_positive_texts(), "_mid.yml": mid, "caller.yml": caller}
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "caller.yml" in f]
+        self.assertEqual(len(mine), 1, mine)
+        self.assertIn("_does_not_exist_nested.yml", mine[0])
+
+    def test_nested_cross_repo_delegate_is_a_named_refusal_not_a_silent_pass(self):
+        # The a895b148 lineage's own headline gap: the traversal deleted
+        # there resolved only a `./`-prefixed LOCAL target, so a
+        # cross-repo delegate reached MID-CHAIN (not at the top-level
+        # caller) was silently invisible, never even a refusal.
+        mid = (
+            "name: mid\n\non:\n  workflow_call:\n\njobs:\n  j:\n"
+            "    uses: f-inverse/other-repo/.github/workflows/_reuse.yml@main\n"
+        )
+        caller = (
+            "name: caller\n\non:\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  top:\n    uses: ./.github/workflows/_mid.yml\n"
+        )
+        texts = {**_positive_texts(), "_mid.yml": mid, "caller.yml": caller}
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "caller.yml" in f]
+        self.assertEqual(len(mine), 1, mine)
+        self.assertIn("CROSS-REPO", mine[0])
+        self.assertIn("_reuse.yml", mine[0])
+
+    def test_dangling_nested_target_is_a_named_refusal(self):
+        mid = (
+            "name: mid\n\non:\n  workflow_call:\n\njobs:\n  j:\n"
+            "    uses: ./.github/workflows/_does_not_exist_nested2.yml\n"
+        )
+        caller = (
+            "name: caller\n\non:\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  top:\n    uses: ./.github/workflows/_mid2.yml\n"
+        )
+        texts = {**_positive_texts(), "_mid2.yml": mid, "caller.yml": caller}
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "caller.yml" in f]
+        self.assertEqual(len(mine), 1, mine)
+        self.assertIn("_does_not_exist_nested2.yml", mine[0])
+        self.assertIn("dangling target", mine[0])
+
+    def test_memoized_refusal_precedence_both_callers_see_the_identical_refusal(self):
+        bad_mid = (
+            "name: bad-mid\n\non:\n  workflow_call:\n\njobs:\n  j:\n"
+            "    uses: ./.github/workflows/_does_not_exist_shared.yml\n"
+        )
+        caller_a = (
+            "name: caller-a\n\non:\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  a:\n    uses: ./.github/workflows/_bad_mid.yml\n"
+        )
+        caller_b = (
+            "name: caller-b\n\non:\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  b:\n    uses: ./.github/workflows/_bad_mid.yml\n"
+        )
+        texts = {
+            **_positive_texts(),
+            "_bad_mid.yml": bad_mid,
+            "caller-a.yml": caller_a,
+            "caller-b.yml": caller_b,
+        }
+        findings = cgo.check_p6_discovery(texts)
+        mine_a = [f for f in findings if "caller-a.yml" in f]
+        mine_b = [f for f in findings if "caller-b.yml" in f]
+        self.assertEqual(len(mine_a), 1, findings)
+        self.assertEqual(len(mine_b), 1, findings)
+
+        def normalize(f: str) -> str:
+            f = re.sub(r"^P6: caller-[ab]\.yml's", "P6: caller-X.yml's", f)
+            return re.sub(r"job `[^`]+`", "job `X`", f, count=1)
+
+        self.assertEqual(normalize(mine_a[0]), normalize(mine_b[0]))
 
 
 def _quoted_job_level_caller(target: str, quote: str, job_name: str = "call-it") -> str:
@@ -2808,6 +3263,57 @@ class UsesReadFromTheParsedDocumentTest(unittest.TestCase):
         )
         findings = cgo.check_p6_discovery({**_positive_texts(), "clean.yml": clean})
         self.assertEqual(findings, [], findings)
+
+    def test_quoted_false_control_is_not_promoting(self):
+        clean = (
+            "name: clean\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  build-only:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - uses: docker/build-push-action@v6\n"
+            '        with:\n          push: "false"\n'
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "clean.yml": clean})
+        self.assertEqual(findings, [], findings)
+
+    def test_bare_push_off_is_promoting_never_read_as_pyyaml_false(self):
+        # #563: PyYAML's SafeLoader constructs a bare `off` into the SAME
+        # Python `False` a bare `false` constructs into -- but GitHub
+        # Actions' own YAML-1.1 CORE-schema resolver treats only
+        # `false`/`False`/`FALSE` as boolean-false; `off` resolves to the
+        # STRING `"off"` there, which is not `false: it must stay
+        # PROMOTING here (fail-closed), never silently cleared the way
+        # PyYAML's own wider boolean set would read it.
+        rogue = (
+            "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - uses: docker/build-push-action@v6\n"
+            "        with:\n          push: off\n"
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        self.assertTrue(any("sneak" in f for f in findings), findings)
+
+    def test_bare_push_no_is_promoting_never_read_as_pyyaml_false(self):
+        rogue = (
+            "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - uses: docker/build-push-action@v6\n"
+            "        with:\n          push: no\n"
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        self.assertTrue(any("sneak" in f for f in findings), findings)
+
+    def test_quoted_false_capitalized_is_promoting_only_exact_lowercase_quoted_clears(self):
+        # The quoted-string exemption is EXACTLY "false"/'false' (GitHub's
+        # own two-form bare set has case variants; the quoted string form
+        # does not) -- a quoted "False" is a plain string GitHub's own
+        # resolver never treats as boolean-false either.
+        rogue = (
+            "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - uses: docker/build-push-action@v6\n"
+            '        with:\n          push: "False"\n'
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        self.assertTrue(any("sneak" in f for f in findings), findings)
 
 
 class GateJobExemptionAndNameExemptedFilesAreScannedTest(unittest.TestCase):

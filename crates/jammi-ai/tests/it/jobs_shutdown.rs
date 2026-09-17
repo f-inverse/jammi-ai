@@ -258,7 +258,7 @@ async fn stop_and_join_lets_the_epoch_bundle_land() {
 
     let outcome = tokio::time::timeout(Duration::from_secs(300), worker.stop_and_join())
         .await
-        .expect("a drain is bounded by the in-flight job's own duration")
+        .expect("a generous backstop against a wedged or starved machine: DRAIN never returned")
         .unwrap();
     assert_eq!(outcome, StopOutcome::Joined);
     assert_eq!(shared.loop_state(), LoopState::Stopped);
@@ -409,19 +409,31 @@ async fn dropping_the_guard_after_a_cancelled_stop_and_join_aborts_the_task() {
 async fn release_and_stop_leaves_running_with_null_lease_and_no_new_bundle() {
     let (session, _dir) = session(FAST_TIMING).await;
     let handle = session.enqueue(fine_tune(20_000), 0).await.unwrap();
+    // #527: armed BEFORE `spawn_worker` claims and starts the run, so the
+    // trainer's fire (inside `save_resume_checkpoint`, the instant its
+    // `put_resume_checkpoint` write lands) can never race ahead of the arm.
+    let bundle_landed = loop_test_hooks::arm_observed(
+        &handle.job_id,
+        loop_test_hooks::Event::ResumeCheckpointWritten,
+    );
     let worker = spawn_worker(&session);
     let shared = shared_of(&worker);
     wait_in_flight(&shared, 1).await;
     // At least one epoch boundary has landed a bundle, so there is an epoch
-    // to compare.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    while resume_epoch(&session, &handle.job_id).await.is_none() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "no resume bundle landed"
+    // to compare. Waits on the REAL event -- the trainer's durable
+    // `put_resume_checkpoint` write actually landing -- never on a
+    // wall-clock guess at when one epoch's write might complete. A
+    // generous 60s backstop against a wedged or starved machine.
+    tokio::time::timeout(Duration::from_secs(60), bundle_landed.wait_fired())
+        .await
+        .expect(
+            "a generous backstop against a wedged or starved machine: no resume bundle write \
+             was ever observed",
         );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    assert!(
+        resume_epoch(&session, &handle.job_id).await.is_some(),
+        "the observed write must have left a readable bundle behind"
+    );
     let threads_before = training_test_hooks::training_threads_finished();
     let claim_next_before_release = loop_test_hooks::claim_next_calls(session.instance_id());
 
@@ -458,12 +470,16 @@ async fn release_and_stop_leaves_running_with_null_lease_and_no_new_bundle() {
         "the released loop's workers row is deleted"
     );
 
-    // The abandoned thread finishes (bails at its next boundary) …
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    // The abandoned thread finishes (bails at its next boundary) … derived
+    // from `FAST_TIMING.heartbeat`, mirroring this file's own sibling wait
+    // above (`training_threads_finished` is a counter, not awaitable, so
+    // this stays a derived poll rather than an event rendezvous).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(FAST_TIMING.heartbeat + 120);
     while training_test_hooks::training_threads_finished() <= threads_before {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the abandoned training thread never returned"
+            "derived from FAST_TIMING.heartbeat + 120: the abandoned training thread never \
+             returned"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

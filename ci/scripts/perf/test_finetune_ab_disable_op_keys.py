@@ -63,7 +63,7 @@ at all, so `#[non_exhaustive]` alone never engages there — a probe against
 an earlier revision that sealed only `#[non_exhaustive]` copied a real
 row, assigned a field on the copy directly, and `admit` honoured the
 forged value; the same probe against field-private `ProbedOp` is
-`error[E0616]: field \`report_key\` of struct \`ProbedOp\` is private`).
+`error[E0616]: field `report_key` of struct `ProbedOp` is private`).
 Together, on every `cargo build`, the Rust compiler proves that a call
 site OUTSIDE `jammi-kernels` cannot pass anything but one of `PROBED_OPS`'s
 own named consts, by either route. Neither mechanism has any effect

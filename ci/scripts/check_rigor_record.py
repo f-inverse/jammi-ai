@@ -1757,6 +1757,19 @@ def _commit(work: Path, message: str, files: dict[str, str], swarm: bool = True)
 
 
 def _run_check_in(work: Path, env_overrides: dict | None = None) -> Result:
+    """The ONE universal entry point every RR
+    self-test fixture calls (grepped, not guessed — every `fixture_rr*`
+    in this file reaches `run_check` through here, never directly), which
+    is exactly why the `--require-symbol-index` property is enforced HERE
+    rather than per-fixture: under `REQUIRE_SYMBOL_INDEX`, ANY result
+    whose warnings carry `_SYMBOL_INDEX_UNAVAILABLE_TEXT` is a `Failure`
+    naming the CURRENTLY RUNNING fixture (`_CURRENT_FIXTURE_NAME`, set by
+    `self_test`'s own loop) — covering RR42/RR43 and every FUTURE index-
+    backed fixture by construction, not by an enumerated list that could
+    drift. RR44 (`_SYMBOL_INDEX_FLAG_EXEMPT`) is the one exception: its
+    own purpose is to MANUFACTURE this exact warning via a no-cargo PATH
+    override and assert it degrades to advisory, which must keep
+    happening regardless of this flag."""
     env = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_BASE_REF": "main", "GITHUB_HEAD_REF": "feat/rr-fixture"}
     if env_overrides:
         env.update(env_overrides)
@@ -1772,7 +1785,7 @@ def _run_check_in(work: Path, env_overrides: dict | None = None) -> Result:
         real_lib = LEAD_GATE_LIB
         LEAD_GATE_LIB = work / ".claude" / "hooks" / "lead-gate-lib.py"
         try:
-            return run_check(work)
+            r = run_check(work)
         finally:
             LEAD_GATE_LIB = real_lib
     finally:
@@ -1781,6 +1794,14 @@ def _run_check_in(work: Path, env_overrides: dict | None = None) -> Result:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+    if REQUIRE_SYMBOL_INDEX and _CURRENT_FIXTURE_NAME not in _SYMBOL_INDEX_FLAG_EXEMPT:
+        for w in r.warnings:
+            if _SYMBOL_INDEX_UNAVAILABLE_TEXT in w:
+                name = _CURRENT_FIXTURE_NAME or "<unknown fixture>"
+                _assert(False, name,
+                        f"the symbol index could not be built under --require-symbol-index "
+                        f"(the toolchain is expected to be present in this lane) — {w}")
+    return r
 
 
 _VALID_CONTRACT = "# A mechanism contract\n\nCites `docs/README-fixture.md:1` which exists.\n"
@@ -3245,12 +3266,49 @@ def fixture_rr41_mutation_site_resolves_to_real_def_satisfies() -> None:
                 f"a mutations site naming a real new definition must resolve, got: {r.failures}")
 
 
+REQUIRE_SYMBOL_INDEX = False
+
+# A SECOND, independent recursion guard for RR45 — `--only=
+# RR42,RR43` already keeps a nested `--self-test` subprocess from
+# re-selecting RR45, but that guard lives in the ARGUMENTS RR45 itself
+# constructs; a future edit to RR45 that widens or drops `--only` would
+# reintroduce the recursion silently. This env var, set ONLY in RR45's own
+# two subprocess environments, makes RR45 refuse to run a second time no
+# matter what selected it — the same idiom `check_execution_surface_
+# reachability.py`'s own `_SELFTEST_SUBPROCESS_GUARD_ENV` already uses.
+RR45_SUBPROCESS_GUARD_ENV = "JAMMI_RR45_SELFTEST_SUBPROCESS_GUARD"
+
+_SYMBOL_INDEX_UNAVAILABLE_TEXT = "could not build the symbol-index required call-site set"
+
+# The property is of the RESULT, never an
+# enumeration of "index-backed fixtures" — `_run_check_in` (below) raises
+# for ANY result whose warnings carry `_SYMBOL_INDEX_UNAVAILABLE_TEXT`
+# under `REQUIRE_SYMBOL_INDEX`, covering every fixture that goes through
+# it (all of them) BY CONSTRUCTION — including RR41, an index-backed
+# POSITIVE assertion that used to pass VACUOUSLY when the index could not
+# be built (no failures are ever produced in that case, so its own
+# `"phantom site" not in joined` read as trivially true for the wrong
+# reason). RR44's own PURPOSE is to
+# MANUFACTURE this exact warning (a no-cargo PATH) and assert it degrades
+# to advisory — the one fixture exempt by name, checked against
+# `_CURRENT_FIXTURE_NAME` (set by `self_test`'s own fixture loop) rather
+# than re-deriving "is this index-backed" from scratch.
+_SYMBOL_INDEX_FLAG_EXEMPT = {"RR44"}
+
+_CURRENT_FIXTURE_NAME: str | None = None
+
+
 def _symbol_index_unavailable(r) -> bool:
     """Whether this run's own reader could not build `ci/tools/symbol-index`
     (no toolchain, or cargo without the mandatory sccache wrapper) and said
     so by name — the advisory arm RR44 pins. A fixture whose assertion needs
-    the index reads this rather than guessing at the environment."""
-    return any("could not build the symbol-index required call-site set" in w for w in r.warnings)
+    the index (to decide whether to take its own named "toolchain-less
+    lane" skip when `REQUIRE_SYMBOL_INDEX` is NOT armed) reads this rather
+    than guessing at the environment. Pure detection only — the
+    `--require-symbol-index` ENFORCEMENT itself lives in `_run_check_in`
+    (a property of the RESULT, checked once, universally), never
+    re-implemented per caller."""
+    return any(_SYMBOL_INDEX_UNAVAILABLE_TEXT in w for w in r.warnings)
 
 
 def fixture_rr42_phantom_mutation_site_fails() -> None:
@@ -3269,7 +3327,9 @@ def fixture_rr42_phantom_mutation_site_fails() -> None:
             # wrapper absent). The phantom-site arm is then unreachable BY
             # DESIGN and the check must have said so by name (RR44's own arm);
             # the phantom arm itself is exercised by this same self-test in
-            # ci.yml's container-backed `symbol-index-gates` job.
+            # ci.yml's container-backed `symbol-index-gates` job. (Reached only
+            # when `REQUIRE_SYMBOL_INDEX` is OFF — `_run_check_in` itself
+            # already raised, naming this fixture, when the flag is ON.)
             print("check-rigor-record[RR42]: toolchain-less lane -- phantom-site arm exercised in symbol-index-gates",
                   file=sys.stderr)
             return
@@ -3330,6 +3390,76 @@ def fixture_rr44_no_cargo_on_path_degrades_to_advisory() -> None:
                 f"a missing cargo must never be reported as a phantom site, got: {r.failures}")
 
 
+def fixture_rr45_require_symbol_index_flag_fails_by_name_when_unbuildable() -> None:
+    """#590: `--require-symbol-index` turns RR42/RR43's toolchain-less arm
+    into a named FAIL, never a self-skip. Drives the REAL
+    `check_rigor_record.py --self-test` entry point as a SUBPROCESS (not
+    `self_test()` called in-process, so this exercises the exact command
+    line `ci.yml`'s container-backed `symbol-index-gates` job runs) with
+    the SAME no-cargo PATH RR44 builds (a private directory holding only
+    a `git` symlink — the one tool this self-test's other fixtures need
+    by name — so `cargo` cannot resolve from any host directory and the
+    symbol index is genuinely unbuildable for this ONE invocation, applied
+    only to these two subprocesses' own environment):
+      - WITH the flag: must exit non-zero, naming RR42 or RR43 in stderr.
+      - WITHOUT the flag (same broken PATH): must still exit 0, taking
+        the named toolchain-less skip line instead.
+    Both subprocesses pass `--only=RR42,RR43` — RR45 IS one of `RR_
+    FIXTURES` (nothing exempts it from the ordinary self-test run), so an
+    unrestricted `--self-test` here would spawn RR45 again inside each
+    subprocess, recursively, forever; `--only` scopes each nested run to
+    exactly the two fixtures this property is about.
+    Proves the flag's failure mode is real (a subprocess that actually
+    cannot build the index actually fails loudly), not merely that the
+    module-level `REQUIRE_SYMBOL_INDEX` global exists.
+
+    `RR45_SUBPROCESS_GUARD_ENV` is a SECOND, independent
+    recursion guard (see its own module-level doc) — this fixture refuses
+    to run at all if it finds that env var already set (meaning IT is
+    already running inside one of its own nested subprocesses), and sets
+    it for both subprocesses it spawns below. The refusal PRINTS a named
+    skip line rather than a bare `return` — a silent, uncredited-but-
+    unlabeled "pass" here would read exactly like the self-skip shape
+    this whole flag exists to eliminate elsewhere."""
+    if os.environ.get(RR45_SUBPROCESS_GUARD_ENV):
+        print("check-rigor-record[RR45]: recursion guard active -- already running inside an "
+              "RR45-spawned subprocess, skipping this nested invocation", file=sys.stderr)
+        return
+    import shutil  # used by this fixture alone, like RR44
+    git = shutil.which("git")
+    _assert(git is not None, "RR45", "this fixture needs a `git` on PATH to build its no-cargo PATH")
+    with tempfile.TemporaryDirectory(prefix="rr45-no-cargo-") as d:
+        no_cargo_bin = Path(d) / "no-cargo-bin"
+        no_cargo_bin.mkdir()
+        (no_cargo_bin / "git").symlink_to(git)
+        _assert(shutil.which("cargo", path=str(no_cargo_bin)) is None, "RR45",
+                f"the no-cargo PATH {no_cargo_bin} must not resolve cargo")
+        env = dict(os.environ)
+        env["PATH"] = str(no_cargo_bin)
+        env[RR45_SUBPROCESS_GUARD_ENV] = "1"
+        script = REPO_ROOT / "ci" / "scripts" / "check_rigor_record.py"
+
+        proc_flag = subprocess.run(
+            [sys.executable, str(script), "--self-test", "--require-symbol-index", "--only=RR42,RR43"],
+            capture_output=True, text=True, env=env, timeout=150,
+        )
+        _assert(proc_flag.returncode != 0, "RR45",
+                f"--require-symbol-index with an unbuildable index must exit non-zero, got "
+                f"{proc_flag.returncode}: stdout={proc_flag.stdout}\nstderr={proc_flag.stderr}")
+        _assert("RR42" in proc_flag.stderr or "RR43" in proc_flag.stderr, "RR45",
+                f"the failure must name the fixture (RR42/RR43): {proc_flag.stderr}")
+
+        proc_no_flag = subprocess.run(
+            [sys.executable, str(script), "--self-test", "--only=RR42,RR43"],
+            capture_output=True, text=True, env=env, timeout=150,
+        )
+        _assert(proc_no_flag.returncode == 0, "RR45",
+                f"without the flag the SAME unbuildable index must still exit 0 (named skip), got "
+                f"{proc_no_flag.returncode}: stdout={proc_no_flag.stdout}\nstderr={proc_no_flag.stderr}")
+        _assert("toolchain-less lane" in proc_no_flag.stderr, "RR45",
+                f"without the flag, the named toolchain-less skip line must appear: {proc_no_flag.stderr}")
+
+
 RR_FIXTURES = [
     ("RR1", fixture_rr1_not_armed_docs_only),
     ("RR2", fixture_rr2_armed_no_record),
@@ -3382,33 +3512,92 @@ RR_FIXTURES = [
     ("RR42", fixture_rr42_phantom_mutation_site_fails),
     ("RR43", fixture_rr43_mutation_site_resolves_to_real_call_satisfies),
     ("RR44", fixture_rr44_no_cargo_on_path_degrades_to_advisory),
+    ("RR45", fixture_rr45_require_symbol_index_flag_fails_by_name_when_unbuildable),
 ]
 
 
-def self_test() -> int:
-    failures: list[str] = []
-    for name, fn in RR_FIXTURES:
-        try:
-            fn()
-            print(f"check-rigor-record[{name}]: OK")
-        except Failure as e:
-            failures.append(f"{name}: {e}")
-            print(f"check-rigor-record[{name}]: FAIL — {e}", file=sys.stderr)
-        except Exception as e:  # noqa: BLE001
-            failures.append(f"{name}: unexpected exception: {e!r}")
-            print(f"check-rigor-record[{name}]: FAIL (unexpected exception) — {e!r}", file=sys.stderr)
-    if failures:
-        print("check-rigor-record: FAIL", file=sys.stderr)
-        for f in failures:
-            print(f"  - {f}", file=sys.stderr)
+def self_test(require_symbol_index: bool = False, only: set[str] | None = None) -> int:
+    """#590: `require_symbol_index` (the `--require-symbol-index` flag)
+    arms `REQUIRE_SYMBOL_INDEX` for the DURATION of this call only (reset
+    in `finally`, never leaked to a later in-process call) — `_run_check_
+    in`'s own universal check (a property of the RESULT, not an
+    enumeration — see its doc) then FAILS a fixture by name instead of
+    letting it self-skip if the symbol index cannot be built.
+    `_CURRENT_FIXTURE_NAME` is set to each fixture's own registered name
+    for the duration of ITS call, so that universal check can name it.
+
+    `only` (the `--only=NAME[,NAME...]` flag) restricts the run to the
+    named fixtures — RR45 uses it so its own two nested subprocesses run
+    only RR42/RR43 rather than the WHOLE suite (which would otherwise
+    spawn RR45 again, recursively, inside each).
+
+    An UNKNOWN name in `only`, or an `only` that selects nothing
+    at all, is a hard FAIL here — never a silent "all 0 passed" (which a
+    typo'd `--only=RR9999` would otherwise report as success)."""
+    global REQUIRE_SYMBOL_INDEX, _CURRENT_FIXTURE_NAME
+    REQUIRE_SYMBOL_INDEX = require_symbol_index
+    if only is not None:
+        known_names = {n for n, _ in RR_FIXTURES}
+        unknown = sorted(only - known_names)
+        if unknown:
+            print(f"check-rigor-record: --only names unknown fixture(s): {unknown}", file=sys.stderr)
+            return 1
+        if not only:
+            print("check-rigor-record: --only selects zero fixtures — refusing to report "
+                  "\"all 0 passed\" as success", file=sys.stderr)
+            return 1
+    # `_SYMBOL_INDEX_FLAG_EXEMPT` is a ONE-entry closed set by
+    # design (RR44's own purpose IS to manufacture the unavailable-index
+    # warning; every OTHER fixture must be enforced, never quietly grow
+    # this set) — asserted on every self-test run, rather than trusted to stay
+    # correct by convention alone.
+    if _SYMBOL_INDEX_FLAG_EXEMPT != {"RR44"}:
+        print(
+            f"check-rigor-record: _SYMBOL_INDEX_FLAG_EXEMPT must stay exactly {{'RR44'}} "
+            f"(RR44 alone manufactures the unavailable-index warning on purpose; every other "
+            f"fixture must be enforced by --require-symbol-index) — got {_SYMBOL_INDEX_FLAG_EXEMPT}",
+            file=sys.stderr,
+        )
         return 1
-    print(f"check-rigor-record: all {len(RR_FIXTURES)} self-test fixture(s) passed.")
-    return 0
+    fixtures = RR_FIXTURES if only is None else [(n, f) for n, f in RR_FIXTURES if n in only]
+    try:
+        failures: list[str] = []
+        for name, fn in fixtures:
+            _CURRENT_FIXTURE_NAME = name
+            try:
+                fn()
+                print(f"check-rigor-record[{name}]: OK")
+            except Failure as e:
+                failures.append(f"{name}: {e}")
+                print(f"check-rigor-record[{name}]: FAIL — {e}", file=sys.stderr)
+            except Exception as e:  # noqa: BLE001
+                failures.append(f"{name}: unexpected exception: {e!r}")
+                print(f"check-rigor-record[{name}]: FAIL (unexpected exception) — {e!r}", file=sys.stderr)
+        if failures:
+            print("check-rigor-record: FAIL", file=sys.stderr)
+            for f in failures:
+                print(f"  - {f}", file=sys.stderr)
+            return 1
+        print(f"check-rigor-record: all {len(fixtures)} self-test fixture(s) passed.")
+        return 0
+    finally:
+        REQUIRE_SYMBOL_INDEX = False
+        _CURRENT_FIXTURE_NAME = None
 
 
 def main(argv: list[str]) -> int:
     if "--self-test" in argv:
-        return self_test()
+        only = None
+        for a in argv:
+            if a.startswith("--only="):
+                raw = a.split("=", 1)[1]
+                # `--only=` (empty value) is an empty SELECTION
+                # (`set()`), never `{""}` — `"".split(",")` would otherwise
+                # produce a one-element set holding the empty string,
+                # which is neither a real fixture name nor an honest
+                # "nothing selected".
+                only = {n for n in raw.split(",") if n} if raw else set()
+        return self_test(require_symbol_index="--require-symbol-index" in argv, only=only)
     if "--check-allowlist-only-shrinks" in argv:
         return check_allowlist_only_shrinks()
     if "--check-r12-grandfather-only-shrinks" in argv:

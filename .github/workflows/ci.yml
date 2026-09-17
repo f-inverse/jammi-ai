@@ -2833,10 +2833,16 @@ jobs:
       # site, RR43 real-call resolution) need `ci/tools/symbol-index` built;
       # the toolchain-free swarm lane runs the same self-test and takes its
       # named toolchain-less arm there, so THIS job is where those two arms
-      # are exercised.
+      # are exercised. `--require-symbol-index` (#590) turns that toolchain-
+      # less arm into a hard FAIL here: this job HAS the toolchain, so a
+      # build failure (a broken `ci/tools/symbol-index` build, a cargo/
+      # sccache misconfiguration surfacing only under this self-test's own
+      # `cargo run --release -p symbol-index` invocation, not the plain
+      # build+test+clippy step above) must be visible by name, never a
+      # silent exit 0.
       - name: Assert the rigor-record self-test's index-backed fixtures fire with the toolchain
         if: ${{ !cancelled() }}
-        run: python3 ci/scripts/check_rigor_record.py --self-test
+        run: python3 ci/scripts/check_rigor_record.py --self-test --require-symbol-index
 
   ci-summary:
     needs:

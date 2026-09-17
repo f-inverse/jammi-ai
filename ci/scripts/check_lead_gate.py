@@ -254,8 +254,10 @@ Run: `python3 ci/scripts/check_lead_gate.py --self-test`
 from __future__ import annotations
 
 import atexit
+import concurrent.futures
 import hashlib
 import json
+import multiprocessing
 import os
 import re
 import subprocess
@@ -278,8 +280,41 @@ class Failure(Exception):
     pass
 
 
+class ArmTimeout(RuntimeError):
+    """A fixture's own hook invocation
+    TIMED OUT (`subprocess.TimeoutExpired`) while running under
+    `run_r12_deny_coverage_sweep`. The generic `except Exception: pass` in
+    `_r12_run_fixture_subset_against` used to swallow this SILENTLY (a
+    timeout is a plain `Exception` subclass) and report the arm as an
+    ordinary, uncredited SURVIVOR — indistinguishable from a genuinely
+    uncovered arm; under concurrency, contention from OTHER arms' own
+    processes can manufacture a timeout that has nothing to do with
+    coverage. This is raised instead (never caught by that generic arm),
+    naming the fixture and propagating all the way out of
+    `run_r12_deny_coverage_sweep` — a LOUD, unambiguous failure of the
+    sweep step, never folded into the report-only survivor list."""
+
+
+_R12_TIMEOUT_SCALE = 1
+# The divisor between "a hung command" and "a command that is merely slow
+# because N sibling arms are contending for the same CPUs".
+# `run_r12_deny_coverage_sweep`'s concurrent path raises this to `max(1,
+# min(concurrency, 4))` at the top of EVERY `_r12_sweep_worker` call — a
+# `ProcessPoolExecutor` worker is NOT single-use (`max_tasks_per_child` is
+# unset, so one forked process judges many arms in sequence over the life
+# of a sweep); every one of those calls passes the SAME `timeout_scale`,
+# so re-setting it per call is harmless, never a correctness dependency on
+# "this process only ever sets it once". The serial path (and every
+# non-sweep caller: the plain `--self-test` run, this module imported
+# directly) never touches it, so it stays at its default of 1 — identical
+# to today's un-scaled behaviour. `_run`'s and `_git`'s own hardcoded
+# subprocess timeouts, and one existing fixture's own timing bound, read
+# this multiplier rather than a bare constant.
+
+
 def _run(script: str, payload: dict | bytes, project_dir: Path,
-         env_overrides: dict | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess:
+         env_overrides: dict | None = None, cwd: Path | None = None,
+         hooks_dir: Path | None = None) -> subprocess.CompletedProcess:
     """esc-097 (HARD_BLOCK fix): `cwd` is NOT `project_dir` by default — a
     mutant that reduces `repo_root()` to `Path.cwd()` (dropping the
     `CLAUDE_PROJECT_DIR` env read entirely) under the 8b4e4b9d harness
@@ -290,7 +325,17 @@ def _run(script: str, payload: dict | bytes, project_dir: Path,
     minted once at import time) that carries no `.jammi/gate-state` at all —
     a fixture that needs the cwd FALLBACK exercised on purpose (only G26:
     `CLAUDE_PROJECT_DIR` unset, relying on `repo_root()`'s OTHER, unrelated
-    cwd fallback for the non-R3 arms) passes `cwd=project_dir` explicitly."""
+    cwd fallback for the non-R3 arms) passes `cwd=project_dir` explicitly.
+
+    `hooks_dir`: an explicit override for which directory's
+    `script` is invoked — every one of the ~600 existing call sites omits
+    it and gets the module-global `HOOKS_DIR` exactly as before (the
+    default arm). `run_r12_deny_coverage_sweep`'s own worker still
+    monkey-patches that module global per arm (the worker
+    PROCESS is reused across many arms — see `_r12_sweep_worker`'s doc — the real
+    guarantee across arm reuse is `_r12_run_fixture_subset_against`'s own
+    `finally` restore, not process lifetime), but a caller that wants the
+    value threaded explicitly, rather than through that global, now can."""
     env = dict(os.environ)
     env["CLAUDE_PROJECT_DIR"] = str(project_dir)
     if env_overrides:
@@ -304,7 +349,7 @@ def _run(script: str, payload: dict | bytes, project_dir: Path,
                 env.pop(k, None)
             else:
                 env[k] = v
-    script_path = HOOKS_DIR / script
+    script_path = (hooks_dir if hooks_dir is not None else HOOKS_DIR) / script
     data = payload if isinstance(payload, (bytes, bytearray)) else json.dumps(payload).encode("utf-8")
     start = time.monotonic()
     proc = subprocess.run(
@@ -313,7 +358,7 @@ def _run(script: str, payload: dict | bytes, project_dir: Path,
         capture_output=True,
         env=env,
         cwd=str(cwd if cwd is not None else _DECOY_CWD),
-        timeout=10,
+        timeout=10 * _R12_TIMEOUT_SCALE,
     )
     _WALL_TIMES.append(time.monotonic() - start)
     proc.stdout = proc.stdout.decode("utf-8", errors="replace") if isinstance(proc.stdout, bytes) else proc.stdout
@@ -350,6 +395,24 @@ def _fresh_root() -> Path:
     d = tempfile.TemporaryDirectory(prefix="lead-gate-selftest-")
     _TEMP_DIRS.append(d)
     return Path(d.name)
+
+
+def _fresh_marker_path(name: str) -> Path:
+    """A per-invocation-UNIQUE path for a
+    fixture's own "this command must never have run" marker — never a
+    FIXED `/tmp/<name>` path. A fixed path is invisible to every OTHER
+    caller of THIS SAME process (fine), but under `run_r12_deny_coverage_
+    sweep`'s concurrent path, `should-never-run-r12p9` runs once per arm
+    across MULTIPLE, genuinely simultaneous OS processes sharing the same
+    host `/tmp` — a fixed path is exactly the shared-filesystem-state
+    hazard the sweep's own process-per-arm isolation does NOT protect
+    against (process isolation covers Python memory, never the
+    filesystem). The returned path lives inside a fresh, tracked
+    `tempfile.TemporaryDirectory` (kept alive via `_TEMP_DIRS`, cleaned up
+    at process exit like every other tempdir this harness makes)."""
+    d = tempfile.TemporaryDirectory(prefix=f"lead-gate-marker-{name}-")
+    _TEMP_DIRS.append(d)
+    return Path(d.name) / name
 
 
 # esc-097 (HARD_BLOCK fix): a single, shared, empty directory — never a
@@ -395,7 +458,7 @@ def _git_fixture_env() -> dict:
 
 def _git(root: Path, *args: str) -> str:
     proc = subprocess.run(["git", "-C", str(root)] + list(args), env=_git_fixture_env(),
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, timeout=10 * _R12_TIMEOUT_SCALE)
     _assert(proc.returncode == 0, "git fixture setup",
             f"git {' '.join(args)} (in {root}) failed: {proc.stderr}")
     return proc.stdout.strip()
@@ -1757,8 +1820,9 @@ def fixture_uc4_write_verb_denied() -> None:
     is denied WITHOUT ever executing it — never reaches the hash-compare
     step at all."""
     root, row, fix_head = _uc_setup("feat/uc4")
+    marker = _fresh_marker_path("should-never-run-uc4")
     _write_relay_exact(root, row, sites=_UC_SITES, probe=_UC_PROBE, fix_head=fix_head, claims={
-        "bar.py:2": {"status": "tested", "command": "rm -rf /tmp/should-never-run-uc4",
+        "bar.py:2": {"status": "tested", "command": f"rm -rf {marker}",
                      "output_hash": "a" * 64},
         "bar.py:3": {"status": "uncovered", "reason": "no fault-injecting backend in this fixture"},
     })
@@ -1767,7 +1831,7 @@ def fixture_uc4_write_verb_denied() -> None:
     _assert(p.returncode == 2, "UC4", f"a write-verb command must deny, got {p.returncode}: {p.stderr}")
     _assert("denied program" in p.stderr or "write-verb" in p.stderr, "UC4",
             f"the deny reason must name the write-verb denylist: {p.stderr!r}")
-    _assert(not Path("/tmp/should-never-run-uc4").exists(), "UC4",
+    _assert(not marker.exists(), "UC4",
             "the denied command must never have been executed")
 
 
@@ -2017,15 +2081,16 @@ def fixture_r12p9_denylisted_command_denies() -> None:
     make this fixture pass vacuously without ever exercising the denylist)."""
     unit = "feat/r12p9"
     root = _temp_repo(unit)
+    marker = _fresh_marker_path("should-never-run-r12p9")
     row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
     _write_anticipation_exact(root, unit, row["head_sha"], {
-        "a.py": {"command": "rm -rf /tmp/should-never-run-r12p9", "hash": "b" * 64},
+        "a.py": {"command": f"rm -rf {marker}", "hash": "b" * 64},
     })
     p = _r12_dispatch(root, unit)
     _assert(p.returncode == 2, "R12P9", f"a denylisted command must deny, got {p.returncode}")
     _assert("command is denied:" in p.stderr, "R12P9",
             f"the SPECIFIC denylist arm must fire, not merely the wrapper's own text: {p.stderr!r}")
-    _assert(not Path("/tmp/should-never-run-r12p9").exists(), "R12P9", "the denied command must never have run")
+    _assert(not marker.exists(), "R12P9", "the denied command must never have run")
 
 
 def fixture_r12p10_complete_artifact_allows() -> None:
@@ -4172,7 +4237,17 @@ def _r12_run_fixture_subset_against(hooks_dir: Path, fixtures: list[tuple[str, o
          fixture setup") — this fixture's OWN terminal assertion about
          the arm never even ran; crediting the kill to environment/setup
          breakage would be crediting the arm for a fixture that never
-         actually reached it."""
+         actually reached it.
+
+    A `subprocess.TimeoutExpired` (from `_run`/`_git`'s own
+    hardcoded, scale-aware timeout) is NEITHER of the above — it is not
+    credited as a kill, but it is also never silently absorbed into the
+    generic `except Exception: pass` catch-all below (which would
+    otherwise make an overloaded/timed-out fixture indistinguishable
+    from a genuinely-surviving mutant). It is re-raised as `ArmTimeout`,
+    named by fixture, propagating all the way out of a caller like
+    `run_r12_deny_coverage_sweep` — a loud step failure, never a report-
+    only survivor."""
     global HOOKS_DIR
     real_hooks_dir = HOOKS_DIR
     HOOKS_DIR = hooks_dir
@@ -4184,6 +4259,8 @@ def _r12_run_fixture_subset_against(hooks_dir: Path, fixtures: list[tuple[str, o
             except Failure as exc:
                 if str(exc).startswith(f"{name}: "):
                     died.append(name)
+            except subprocess.TimeoutExpired as exc:
+                raise ArmTimeout(f"{name}: hook invocation timed out under load ({exc})") from exc
             except Exception:
                 pass
     finally:
@@ -4191,13 +4268,118 @@ def _r12_run_fixture_subset_against(hooks_dir: Path, fixtures: list[tuple[str, o
     return died
 
 
+def _r12_sweep_worker(task: tuple[tuple[int, int], str, tuple[str, ...], int]) -> tuple[tuple[int, int], list[str]]:
+    """The unit of work for ONE deny arm, dispatched by
+    `run_r12_deny_coverage_sweep`'s concurrent path into a
+    `ProcessPoolExecutor` (fork context) — validated: every arm gets its
+    own, unshared memory, including its own private copy of the
+    `HOOKS_DIR` module global, so `_r12_run_fixture_subset_against`'s
+    monkey-patch of that global for ONE arm can never be observed by, or
+    race with, another arm running CONCURRENTLY in a sibling process.
+    `fixture_names` (never the fixture objects themselves) crosses the
+    fork so the child resolves them against ITS OWN already-populated
+    `FIXTURES` list — `fork` duplicates the parent's full memory at call
+    time, so `FIXTURES` (built once at import) is already there.
+    Byte-identical mechanism to the historical serial loop: mutate, build
+    a mutant hooks dir, run the fixture subset against it.
+
+    This function is called MANY TIMES per OS process over
+    the life of one sweep — `max_workers` workers are NOT `max_tasks_per_
+    child=1` (unset), so a single forked process runs on the order of
+    `positions / concurrency` arms, one after another, in sequence: this
+    process is REUSED across arms, never single-use. The property that
+    holds under that reuse —
+    arm N+1, judged in a process that already judged arm N, is judged
+    against ITS OWN mutant, never leftover state from arm N — is
+    `_r12_run_fixture_subset_against`'s own `finally: HOOKS_DIR = real_
+    hooks_dir` restore, which runs after EVERY call regardless of process
+    reuse (proved directly by `R12sweepworker`, run from `--r12-sweep`:
+    two sequential calls to this function, in one process, where the
+    second's result is checked against its OWN mutant).
+
+    A `ProcessPoolExecutor` worker can be torn down via
+    `os._exit()` by multiprocessing's own internals (pool shutdown,
+    `BrokenProcessPool` handling, ...), which skips this process's
+    `@atexit` handlers ENTIRELY — every tempdir `_r12_mutate_at`/`_r12_
+    mutant_hooks_dir`/a fixture's own `_temp_repo`/`_fresh_marker_path`
+    created for THIS arm would otherwise leak permanently. Cleaned up
+    explicitly in the `finally` below — every entry
+    `_TEMP_DIRS` gained during this ONE call, regardless of how the arm's
+    own work finishes, never relying on `@atexit` inside a pool worker at
+    all. Safe under reuse: nothing an arm creates is needed after this
+    function returns, so truncating `_TEMP_DIRS` back to its pre-call
+    length is correct whether this process goes on to judge another arm
+    or exits immediately after.
+
+    `timeout_scale` is set into `_R12_TIMEOUT_SCALE` for the
+    remainder of THIS process's lifetime (harmless if the process judges
+    another arm afterward — the SAME sweep call passes the SAME
+    `timeout_scale` to every task), before any fixture executes, so
+    contention from sibling arms' own concurrently-running processes
+    cannot manufacture a spurious `TimeoutExpired` in `_run`/`_git`'s
+    hardcoded per-call timeout.
+
+    A timed-out fixture raises `ArmTimeout` (see its own doc), which
+    propagates out of this function labeled with the ARM (never just the
+    fixture) so a crash names both."""
+    global _R12_TIMEOUT_SCALE
+    pos, source, fixture_names, timeout_scale = task
+    _R12_TIMEOUT_SCALE = timeout_scale
+    names = set(fixture_names)
+    r12_fixtures = [(n, f) for n, f in FIXTURES if n in names]
+    _temp_dirs_start = len(_TEMP_DIRS)
+    try:
+        mutated = _r12_mutate_at(source, pos)
+        hooks_dir = _r12_mutant_hooks_dir(mutated)
+        try:
+            died = _r12_run_fixture_subset_against(hooks_dir, r12_fixtures)
+        except ArmTimeout as exc:
+            raise ArmTimeout(f"arm@line{pos[0]}: {exc}") from exc
+        return pos, died
+    finally:
+        for d in _TEMP_DIRS[_temp_dirs_start:]:
+            d.cleanup()
+        del _TEMP_DIRS[_temp_dirs_start:]
+
+
 def run_r12_deny_coverage_sweep(fixtures: list[tuple[str, object]],
-                                 source: str | None = None) -> tuple[list[tuple[int, int]], dict[tuple[int, int], list[str]]]:
+                                 source: str | None = None,
+                                 concurrency: int | None = None,
+                                 ) -> tuple[list[tuple[int, int]], dict[tuple[int, int], list[str]]]:
     """`source` defaults to the REAL `lead-gate-lib.py` — overridable so the
     sweep meta-fixture (`R12sweepmeta`) can run this exact mechanism
     against a deliberately mutated COPY carrying one genuinely silent arm,
     proving the sweep's OWN detection logic fires, never merely that every
-    arm CURRENTLY has a fixture."""
+    arm CURRENTLY has a fixture.
+
+    Arms run CONCURRENTLY, each in its own
+    forked PROCESS (measured directly: 4 arms in 4 processes finish in
+    35.7s wall against the un-mutated tree, no cross-arm mis-attribution —
+    a THREAD pool, by contrast, DOES mis-attribute, since two threads
+    sharing one process race on `_r12_run_fixture_subset_against`'s
+    `HOOKS_DIR` monkey-patch; a separate OS process per arm has no such
+    shared memory to race on). The "own process group" phrase describes
+    the ATTACK subprocess a fixture launches
+    (`start_new_session=True` deep in `_run_attack_command`), never the
+    arm's own isolation mechanism. The result is independent
+    of arm order and of how many workers ran them; `positions`/`per_arm`
+    are the SAME byte-identical values the historical serial loop would
+    produce. `concurrency` (default `max(2, min(os.cpu_count() or 2, 4))`
+    — a floor of 2 and a ceiling of 4, so the shipped default is the SAME
+    degree `R12sweepconc` exercises at both ends: `concurrency=2` and
+    `concurrency=4`) is the number of OS processes;
+    `concurrency <= 1` (or fewer than 2 positions)
+    runs the historical serial loop verbatim — same per-arm call sequence
+    as every worker task (`timeout_scale=1`, matching today's un-scaled
+    behaviour exactly), so the two paths are provably the same
+    computation, only parallelized — kept reachable so a fixture can
+    assert the two paths agree (`R12sweepconc`). The concurrent path's
+    per-arm timeout multiplier is `max(1, min(concurrency, 4))` (see
+    `_R12_TIMEOUT_SCALE`'s own doc): bounded so a genuinely hung command
+    is still caught, but wide enough that CPU contention from sibling
+    arms cannot manufacture a spurious timeout. A `TimeoutExpired`
+    anywhere in an arm propagates as `ArmTimeout` out of this function —
+    a loud step failure, never silently absorbed into `per_arm`."""
     if source is None:
         source = LEAD_GATE_LIB.read_text()
     begin, end = _r12_sentinel_line_range(source)
@@ -4212,12 +4394,28 @@ def run_r12_deny_coverage_sweep(fixtures: list[tuple[str, object]],
     # mutant hooks dir that the rest of the subset never actually
     # exercised.
     _R12_MUTATION_BLIND = {"R12D1", "R12alarm", "R12timeout", "R12alarmkill", "R12sweepast"}
-    r12_fixtures = [(n, f) for n, f in fixtures if n.startswith("R12") and n not in _R12_MUTATION_BLIND]
+    fixture_names = tuple(n for n, f in fixtures if n.startswith("R12") and n not in _R12_MUTATION_BLIND)
     per_arm: dict[tuple[int, int], list[str]] = {}
-    for pos in positions:
-        mutated = _r12_mutate_at(source, pos)
-        hooks_dir = _r12_mutant_hooks_dir(mutated)
-        per_arm[pos] = _r12_run_fixture_subset_against(hooks_dir, r12_fixtures)
+    if concurrency is None:
+        # Floored at 2, ceilinged at 4 (never the full `os.cpu_count()`)
+        # so the SHIPPED default is one of the SAME two degrees
+        # `R12sweepconc` exercises — and `_R12_TIMEOUT_SCALE`'s identical
+        # `min(concurrency, 4)` cap — rather than a fixture proving
+        # order/timing independence at degrees production never actually
+        # runs at.
+        concurrency = max(2, min(os.cpu_count() or 2, 4))
+    if concurrency <= 1 or len(positions) <= 1:
+        for pos in positions:
+            _, died = _r12_sweep_worker((pos, source, fixture_names, 1))
+            per_arm[pos] = died
+        return positions, per_arm
+    timeout_scale = max(1, min(concurrency, 4))
+    ctx = multiprocessing.get_context("fork")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=min(concurrency, len(positions)), mp_context=ctx) as ex:
+        futures = [ex.submit(_r12_sweep_worker, (pos, source, fixture_names, timeout_scale)) for pos in positions]
+        for fut in concurrent.futures.as_completed(futures):
+            pos, died = fut.result()
+            per_arm[pos] = died
     return positions, per_arm
 
 
@@ -4535,6 +4733,155 @@ def fixture_r12sweepmeta_sweep_flags_a_genuinely_silent_arm() -> None:
     _assert(non_canary_deaths, "R12sweepmeta",
             "no non-canary arm died under this subset -- the mutation/re-run pipeline itself "
             "may be broken (everything would look like a survivor for the wrong reason)")
+
+
+def fixture_r12sweepconc_serial_and_concurrent_agree() -> None:
+    """The sweep's result is independent of arm execution order
+    and concurrency. Reuses the R12sweepmeta canary-insertion technique so
+    the mutated source carries both a genuinely UNREACHABLE arm (a
+    survivor under any execution strategy) and every real, killable R12
+    deny arm across the WHOLE sentinel region — running the sweep on this
+    one mutated copy SERIALLY (`concurrency=1`) and CONCURRENTLY at BOTH
+    degrees the shipped default can resolve to (`concurrency=2`, the
+    floor, and `concurrency=4`, the ceiling — fixed rather than host-
+    derived so this fixture is deterministic on a 1-2 core runner too)
+    must produce byte-identical `positions` and `per_arm` across all
+    three runs. Excluded from `--self-test` (like
+    R12sweepmeta) — drives the real mutation/re-run pipeline three times
+    and belongs only in `--r12-sweep`."""
+    source = LEAD_GATE_LIB.read_text()
+    _assert(source.count(_R12_SWEEP_META_ANCHOR) == 1, "R12sweepconc",
+            "the sweep meta-fixture's anchor text no longer appears exactly once in the real "
+            "lib — update the anchor to match the current source")
+    mutated = source.replace(_R12_SWEEP_META_ANCHOR, _R12_SWEEP_META_ANCHOR + _R12_SWEEP_META_CANARY, 1)
+    _assert(mutated != source, "R12sweepconc", "the canary insertion did not change the source")
+    # Same cheap, representative subset as R12sweepmeta -- this fixture is
+    # about ORDER/CONCURRENCY independence, not re-proving every real arm.
+    subset = [(n, f) for n, f in FIXTURES if n in ("R12P9", "R12P13")]
+    _assert(len(subset) == 2, "R12sweepconc setup", f"expected 2 fixtures in the subset, got {len(subset)}")
+    pos_serial, per_serial = run_r12_deny_coverage_sweep(subset, source=mutated, concurrency=1)
+    pos_conc2, per_conc2 = run_r12_deny_coverage_sweep(subset, source=mutated, concurrency=2)
+    pos_conc4, per_conc4 = run_r12_deny_coverage_sweep(subset, source=mutated, concurrency=4)
+    _assert(pos_serial == pos_conc2 == pos_conc4, "R12sweepconc",
+            f"positions differ across the serial/degree-2/degree-4 runs of the SAME mutated "
+            f"source: {pos_serial} vs {pos_conc2} vs {pos_conc4}")
+    _assert(per_serial == per_conc2 == per_conc4, "R12sweepconc",
+            f"per_arm differs across the serial/degree-2/degree-4 runs of the SAME mutated "
+            f"source: {per_serial} vs {per_conc2} vs {per_conc4}")
+
+
+def fixture_r12sweepworker_sequential_reuse_judges_independently() -> None:
+    """A `ProcessPoolExecutor` worker (fork context, no `max_
+    tasks_per_child`) is reused — one forked process judges MANY
+    arms in sequence over the life of a sweep. The actual guarantee that arm N+1, judged
+    in a process that already judged arm N, is judged against ITS OWN
+    mutant (never leftover state from arm N) is `_r12_run_fixture_subset_
+    against`'s own `finally: HOOKS_DIR = real_hooks_dir` restore, which
+    runs after EVERY call regardless of process reuse. Proved directly:
+    calls `_r12_sweep_worker` THREE times, SEQUENTIALLY, in ONE process
+    (the exact shape a recycled pool worker exercises) — first against
+    the REAL, unmutated source (an ordinary arm simulating whatever ran
+    immediately before), then against a DIFFERENT, deliberately-mutated
+    copy (the R12sweepmeta canary technique) at the injected CANARY
+    position, then a REAL (non-canary) arm in that SAME mutated copy.
+    Decisive: if arm 1's `HOOKS_DIR` state (or its already-cleaned-up
+    mutant hooks dir) leaked into arm 2, the canary fixture
+    subset would either crash (a missing hooks dir) or misjudge; if it
+    leaked into arm 3, the real arm would fail to die. Excluded from
+    `--self-test` (like `R12sweepmeta`/`R12sweepconc`) — drives the real
+    mutation/re-run pipeline three times and belongs only in
+    `--r12-sweep`."""
+    real_source = LEAD_GATE_LIB.read_text()
+    begin, end = _r12_sentinel_line_range(real_source)
+    real_positions = _r12_deny_if_positions(real_source, begin, end)
+    _assert(len(real_positions) >= 1, "R12sweepworker setup", "need >=1 real deny-arm position")
+    subset_names = ("R12P9", "R12P13")
+
+    # Arm 1: an ORDINARY arm against the REAL source, in this process.
+    _r12_sweep_worker((real_positions[0], real_source, subset_names, 1))
+
+    # Arm 2 and 3: the SAME canary-insertion technique R12sweepmeta/
+    # R12sweepconc use, run in the SAME process right after arm 1.
+    _assert(real_source.count(_R12_SWEEP_META_ANCHOR) == 1, "R12sweepworker",
+            "the sweep meta-fixture's anchor text no longer appears exactly once in the real "
+            "lib — update the anchor to match the current source")
+    mutated = real_source.replace(_R12_SWEEP_META_ANCHOR, _R12_SWEEP_META_ANCHOR + _R12_SWEEP_META_CANARY, 1)
+    canary_line = None
+    for i, line in enumerate(mutated.splitlines(), start=1):
+        if '"__r12_sweep_meta_canary__"' in line:
+            canary_line = i
+            break
+    _assert(canary_line is not None, "R12sweepworker", "could not locate the injected canary line")
+    mb, me = _r12_sentinel_line_range(mutated)
+    mutated_positions = _r12_deny_if_positions(mutated, mb, me)
+    canary_positions = [p for p in mutated_positions if p[0] == canary_line]
+    _assert(len(canary_positions) == 1, "R12sweepworker",
+            f"the injected canary arm was not detected as a distinct position: {mutated_positions}")
+
+    _, died2 = _r12_sweep_worker((canary_positions[0], mutated, subset_names, 1))
+    _assert(died2 == [], "R12sweepworker",
+            f"the canary arm, run as the SECOND arm in a reused process, must be judged a "
+            f"SURVIVOR (no dying fixture) — leftover arm-1 state would misjudge it: {died2}")
+
+    # Not every non-canary position is killed by this cheap 2-fixture
+    # subset (R12sweepmeta's own doc: "at least one" real arm dies under
+    # it) — search for one that actually does, rather than assuming the
+    # first non-canary position is it.
+    other_real_positions = [p for p in mutated_positions if p[0] != canary_line]
+    _assert(other_real_positions, "R12sweepworker setup", "no non-canary arm to cross-check")
+    died3: list[str] = []
+    for candidate in other_real_positions:
+        _, died3 = _r12_sweep_worker((candidate, mutated, subset_names, 1))
+        if died3:
+            break
+    _assert(died3, "R12sweepworker",
+            f"no non-canary arm, run as the THIRD arm in the same reused process, died under "
+            f"this subset — process reuse may have contaminated every arm's judgment "
+            f"(R12sweepmeta's own mechanism check already proves >=1 SHOULD die under this "
+            f"subset when run in isolation)")
+
+
+def fixture_r12sweepresidue_concurrent_sweep_leaves_no_temp_residue() -> None:
+    """A `ProcessPoolExecutor` worker (fork context) can be
+    torn down via `os._exit()` by multiprocessing's own internals, which
+    skips this process's `@atexit` handlers entirely — every tempdir an
+    arm creates (its mutant hooks dir, any fixture's own `_temp_repo`/
+    `_fresh_marker_path`) would otherwise leak permanently. Proved directly: points the
+    process-wide `tempfile.tempdir` at a fresh, EMPTY, isolated directory
+    (restored in `finally`, so this never contaminates any other fixture
+    or leaves stray state on a real `/tmp`), runs a REAL 2-arm concurrent
+    sweep (`concurrency=2`) — the forked children inherit the same
+    `tempfile.tempdir` value — and asserts that isolated directory is
+    EMPTY afterward. Decisive: without `_r12_sweep_worker`'s per-arm
+    `finally` cleanup, the mutant hooks dirs and every fixture-scaffolded
+    git repo those two arms create would still be sitting there. Excluded
+    from `--self-test` (like its siblings above) — drives the real
+    mutation/re-run pipeline concurrently and belongs only in
+    `--r12-sweep`."""
+    source = LEAD_GATE_LIB.read_text()
+    _assert(source.count(_R12_SWEEP_META_ANCHOR) == 1, "R12sweepresidue",
+            "the sweep meta-fixture's anchor text no longer appears exactly once in the real lib")
+    mutated = source.replace(_R12_SWEEP_META_ANCHOR, _R12_SWEEP_META_ANCHOR + _R12_SWEEP_META_CANARY, 1)
+    subset = [(n, f) for n, f in FIXTURES if n in ("R12P9", "R12P13")]
+    _assert(len(subset) == 2, "R12sweepresidue setup", f"expected 2 fixtures in the subset, got {len(subset)}")
+
+    import shutil  # used by this fixture alone
+
+    real_tempdir = tempfile.tempdir
+    isolated = tempfile.mkdtemp(prefix="r12-residue-isolation-")
+    tempfile.tempdir = isolated
+    try:
+        positions, per_arm = run_r12_deny_coverage_sweep(subset, source=mutated, concurrency=2)
+        _assert(len(positions) >= 2, "R12sweepresidue setup",
+                "need >=2 positions to exercise a real 2-arm concurrent sweep")
+        remaining = list(Path(isolated).iterdir())
+        _assert(remaining == [], "R12sweepresidue",
+                f"the isolated TMPDIR still contains {len(remaining)} entr(y/ies) after a "
+                f"2-arm concurrent sweep completed — per-arm tempdir cleanup is not happening: "
+                f"{remaining[:5]}")
+    finally:
+        tempfile.tempdir = real_tempdir
+        shutil.rmtree(isolated, ignore_errors=True)
 
 
 # ==========================================================================
@@ -5304,10 +5651,12 @@ FIXTURES = [
     ("R12sweepast", fixture_r12sweepast_sweep_funcs_equals_the_sentinel_region),
     ("R12norm2", fixture_r12norm2_cargo_timing_normalized),
     ("R12alarmkill", fixture_r12alarmkill_self_alarm_kills_inflight_attack_process_group),
-    # R12sweepmeta is deliberately NOT here — like the sweep itself (see
-    # `r12_sweep_main`'s own docstring), it re-runs the mutation/re-run
-    # pipeline (measured ~60s) and belongs in `--r12-sweep`, never in the
-    # per-invocation `--self-test` every unit's pressure-tester/oracle
+    # R12sweepmeta, R12sweepconc, R12sweepworker and R12sweepresidue are
+    # deliberately NOT here — like the sweep itself (see `r12_sweep_main`'s
+    # own docstring), they re-run the mutation/re-run pipeline (measured
+    # ~60s per run; R12sweepconc runs it twice, R12sweepworker three times,
+    # R12sweepresidue concurrently) and belong in `--r12-sweep`, never in
+    # the per-invocation `--self-test` every unit's pressure-tester/oracle
     # round already re-runs.
     ("T1", fixture_t1_card_schema_line_substituted_binds),
     ("T2", fixture_t2_annotated_legacy_unit_branch_binds),
@@ -5491,7 +5840,28 @@ def r12_sweep_main() -> int:
         print(f"check-lead-gate[R12-SWEEP]: FAIL — R12sweepmeta itself failed: {e}", file=sys.stderr)
         return 1
     print("check-lead-gate[R12-SWEEP]: R12sweepmeta OK — the mechanism correctly flags a "
-          "genuinely silent arm; proceeding to the real sweep.")
+          "genuinely silent arm; proceeding to R12sweepconc (order/concurrency independence).")
+    try:
+        fixture_r12sweepconc_serial_and_concurrent_agree()
+    except Failure as e:
+        print(f"check-lead-gate[R12-SWEEP]: FAIL — R12sweepconc itself failed: {e}", file=sys.stderr)
+        return 1
+    print("check-lead-gate[R12-SWEEP]: R12sweepconc OK — serial and concurrent runs agree; "
+          "proceeding to R12sweepworker (sequential worker-reuse independence).")
+    try:
+        fixture_r12sweepworker_sequential_reuse_judges_independently()
+    except Failure as e:
+        print(f"check-lead-gate[R12-SWEEP]: FAIL — R12sweepworker itself failed: {e}", file=sys.stderr)
+        return 1
+    print("check-lead-gate[R12-SWEEP]: R12sweepworker OK — a reused process judges each arm "
+          "independently; proceeding to R12sweepresidue (no leaked tempdirs).")
+    try:
+        fixture_r12sweepresidue_concurrent_sweep_leaves_no_temp_residue()
+    except Failure as e:
+        print(f"check-lead-gate[R12-SWEEP]: FAIL — R12sweepresidue itself failed: {e}", file=sys.stderr)
+        return 1
+    print("check-lead-gate[R12-SWEEP]: R12sweepresidue OK — a concurrent sweep leaves no "
+          "tempdir residue; proceeding to the real sweep.")
 
     source = LEAD_GATE_LIB.read_text()
     source_lines = source.splitlines()

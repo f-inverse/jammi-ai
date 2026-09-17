@@ -16,16 +16,22 @@ Method (hermetic: `cargo metadata --no-deps`, no network, no build):
   2. Read `ci/release-feature-manifest.json`'s `lanes` object — the single
      source of truth for every CUDA release lane's exact cargo feature list
      (cu12 tarball, cu12 wheel, cu12 image today; any future lane the
-     manifest gains is picked up automatically). For EVERY lane, assert its
-     declared `capabilities.flash_compiled` matches whether its
-     `cargo_features` selection actually reaches
-     `jammi-kernels/flash-attn` — a `true` lane that fails to reach it (a
-     broken or renamed forwarding chain) and a `false` lane that DOES reach
-     it (an undeclared leak) both FAIL. FAILS on a missing/unreadable
-     manifest, a missing/renamed `lanes` key, or an empty lane list — this is
-     the PR-time drift enforcement for every release lane (this gate runs on
-     every PR via ci.yml), covering `release-binaries.yml`'s own missing
-     `pull_request` trigger.
+     manifest gains is picked up automatically). For EVERY lane that carries
+     a `capabilities` block, assert its declared `capabilities.
+     flash_compiled` matches whether its `cargo_features` selection
+     actually reaches `jammi-kernels/flash-attn` — a `true` lane that fails
+     to reach it (a broken or renamed forwarding chain) and a `false` lane
+     that DOES reach it (an undeclared leak) both FAIL. A lane with NO
+     `capabilities` block at all (#507: a CPU family — `check_release_
+     manifest.py` enforces this is exactly the lanes whose `cargo_features`
+     names neither `cuda` nor `flash-attn`) is SKIPPED by rule, never a
+     hard error — there is no `flash_compiled` claim to check reachability
+     against. FAILS on a missing/unreadable manifest, a missing/renamed
+     `lanes` key, an empty lane list, or a lane missing `package`/
+     `cargo_features` (or carrying a malformed `capabilities` block) — this
+     is the PR-time drift enforcement for every release lane (this gate
+     runs on every PR via ci.yml), covering `release-binaries.yml`'s own
+     missing `pull_request` trigger.
   3. Lane-independent invariants on `jammi-server` (`ROOT`) directly, held
      regardless of what the manifest says: a plain `cuda` selection and the
      bare `default` selection never reach `jammi-kernels/flash-attn`.
@@ -200,10 +206,24 @@ def load_metadata() -> dict:
 
 def load_manifest_lanes() -> dict[str, dict]:
     """Read and validate `ci/release-feature-manifest.json`'s `lanes`
-    object. FAILS (exit 2) on a missing/unreadable file, a missing/renamed
-    `lanes` key, an empty lane list, or a lane missing a required field —
-    the manifest-read closure assertion for esc-074 must be unable to pass
-    vacuously on a broken or absent manifest."""
+    object, returning only the lanes this gate can guard. FAILS (exit 2) on
+    a missing/unreadable file, a missing/renamed `lanes` key, an empty lane
+    list, a lane missing `package`/`cargo_features`, or a lane that DOES
+    carry a `capabilities` block but is missing `capabilities.
+    flash_compiled` inside it (malformed, never silently tolerated) — the
+    manifest-read closure assertion for esc-074 must be unable to pass
+    vacuously on a broken or absent manifest.
+
+    #507: a lane with NO `capabilities` block AT ALL ships no capability
+    surface — `check_release_manifest.py` enforces this is EXACTLY the
+    lanes whose `cargo_features` names neither `cuda` nor `flash-attn` (a
+    CPU family). Such a lane is SKIPPED here BY RULE (there is no
+    `flash_compiled` claim to check reachability against, and no leak is
+    even possible: `cargo_features` that names neither trigger feature
+    cannot reach `jammi-kernels/flash-attn` transitively either), never a
+    hard `sys.exit(2)` — that would turn every future CPU-family manifest
+    addition into a closure-gate outage for a lane this gate has nothing to
+    assert about."""
     try:
         raw = MANIFEST_PATH.read_text()
     except OSError as e:
@@ -222,8 +242,9 @@ def load_manifest_lanes() -> dict[str, dict]:
             file=sys.stderr,
         )
         sys.exit(2)
+    guarded: dict[str, dict] = {}
     for lane_name, lane in lanes.items():
-        for key in ("package", "cargo_features", "capabilities"):
+        for key in ("package", "cargo_features"):
             if key not in lane:
                 print(
                     f"ERROR: lane `{lane_name}` in {MANIFEST_PATH} is missing "
@@ -231,6 +252,8 @@ def load_manifest_lanes() -> dict[str, dict]:
                     file=sys.stderr,
                 )
                 sys.exit(2)
+        if "capabilities" not in lane:
+            continue  # #507: no capability surface to guard — skip by rule
         if "flash_compiled" not in lane["capabilities"]:
             print(
                 f"ERROR: lane `{lane_name}` in {MANIFEST_PATH} is missing "
@@ -238,7 +261,33 @@ def load_manifest_lanes() -> dict[str, dict]:
                 file=sys.stderr,
             )
             sys.exit(2)
-    return lanes
+        guarded[lane_name] = lane
+    if not guarded:
+        print(
+            f"ERROR: {MANIFEST_PATH}'s `lanes` has no lane WITH a `capabilities` "
+            f"block — nothing to guard",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return guarded
+
+
+def load_all_lanes_raw() -> dict[str, dict]:
+    """Every lane in `ci/release-feature-manifest.json`, WITHOUT
+    `load_manifest_lanes`'s skip-by-rule filtering — used only by
+    `_check_capability_syntactic_matches_derived`, which must see every
+    lane's `package`/`cargo_features` regardless of whether it carries a
+    `capabilities` block, to check the block's PRESENCE against the
+    derived closure. Never used for anything `load_manifest_lanes`
+    already guards (shape validation, `flash_compiled` presence): by the
+    time this is called, `load_manifest_lanes` has already run and would
+    have exited 2 on a malformed manifest, so this can read permissively."""
+    try:
+        manifest = json.loads(MANIFEST_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    lanes = manifest.get("lanes")
+    return lanes if isinstance(lanes, dict) else {}
 
 
 class Graph:
@@ -416,6 +465,72 @@ def _check_manifest_lanes(graph: Graph, lanes: dict[str, dict], verbose: bool) -
     return rc
 
 
+def _check_capability_syntactic_matches_derived(
+    graph: Graph, all_lanes: dict[str, dict], verbose: bool
+) -> int:
+    """`check_release_manifest.py`'s SYNTACTIC capabilities rule (a
+    `capabilities` block is present iff a lane's own `cargo_features`
+    literally names `cuda` or `flash-attn`) is a literal-text check with
+    no toolchain; `load_manifest_lanes`'s own skip-by-rule then never
+    closure-checks a lane with no `capabilities` block AT ALL. Composed,
+    those two facts leave a gap: a lane that reaches
+    `jammi-kernels/{cuda,flash-attn}` through some OTHER feature name
+    (never literally naming `cuda`/`flash-attn` in its OWN cargo_features)
+    would be BOTH forbidden a capabilities block (the syntactic rule) AND
+    silently skipped here — latent today (measured: every lane's closure
+    reaches `cuda`/`flash-attn` only via those literal names), but not
+    fail-closed by construction. This closes it here, in the ONE
+    toolchain-bearing gate that can actually walk the real feature graph:
+    for EVERY lane in the manifest (`all_lanes`, unfiltered by whether it
+    carries `capabilities` — never the `load_manifest_lanes`-guarded
+    subset), the DERIVED reachability (this lane's `cargo_features`
+    closure reaching `jammi-kernels/cuda` or `jammi-kernels/flash-attn`)
+    must agree with whether the lane carries a `capabilities` block at
+    all: a capability-less lane whose closure DOES reach either is a
+    FINDING (an undeclared capability surface); a capabilities-bearing
+    lane whose closure reaches NEITHER is also a FINDING (a capabilities
+    block asserting a surface the build does not actually have)."""
+    rc = 0
+    for lane_name, lane in all_lanes.items():
+        if not isinstance(lane, dict):
+            continue
+        pkg = lane.get("package")
+        feats = lane.get("cargo_features")
+        if not isinstance(pkg, str) or pkg not in graph.pkgs or not isinstance(feats, list):
+            continue  # malformed-lane shape is `load_manifest_lanes`'s own finding, not this one's
+        _, kernels = _reaches_flash(graph, pkg, feats)
+        derived_needs_capabilities = FORBIDDEN_FEATURE in kernels or CONTROL_FEATURE in kernels
+        syntactic_has_capabilities = "capabilities" in lane
+        if verbose:
+            print(
+                f"lane `{lane_name}` capability-derivation: capabilities block "
+                f"{'present' if syntactic_has_capabilities else 'ABSENT'}, closure reaches "
+                f"{TARGET_PKG} features {kernels} (derived needs capabilities="
+                f"{derived_needs_capabilities})"
+            )
+        if syntactic_has_capabilities and not derived_needs_capabilities:
+            if verbose:
+                print(
+                    f"FAIL: lane `{lane_name}` carries a `capabilities` block but its "
+                    f"cargo_features closure reaches NEITHER {TARGET_PKG}/{CONTROL_FEATURE} "
+                    f"NOR {TARGET_PKG}/{FORBIDDEN_FEATURE} ({kernels}) — a capabilities block "
+                    f"asserting a surface this build does not have",
+                    file=sys.stderr,
+                )
+            rc = 1
+        elif not syntactic_has_capabilities and derived_needs_capabilities:
+            if verbose:
+                print(
+                    f"FAIL: lane `{lane_name}` carries NO `capabilities` block but its "
+                    f"cargo_features closure DOES reach {TARGET_PKG} features {kernels} — an "
+                    f"undeclared capability surface reached through a feature name other than "
+                    f"a literal `cuda`/`flash-attn`",
+                    file=sys.stderr,
+                )
+            rc = 1
+    return rc
+
+
 def _check_exempt_member_real_lanes(graph: Graph, pkg: str, verbose: bool) -> int:
     """The real property an `--all-features` exemption above must not
     weaken: an exempted member's OWN `default` and `cuda` selections (the
@@ -439,12 +554,27 @@ def _check_exempt_member_real_lanes(graph: Graph, pkg: str, verbose: bool) -> in
     return rc
 
 
-def verdict(graph: Graph, lanes: dict[str, dict], verbose: bool = True) -> int:
+def verdict(
+    graph: Graph,
+    lanes: dict[str, dict],
+    verbose: bool = True,
+    all_lanes: dict[str, dict] | None = None,
+) -> int:
     rc = 0
 
     # (2) Per-lane, manifest-derived assertions — the PR-time drift
     # enforcement for every declared CUDA release lane.
     rc |= _check_manifest_lanes(graph, lanes, verbose)
+
+    # (2b) syntactic capabilities-presence must match the DERIVED
+    # closure for EVERY lane, not merely the capability-bearing subset
+    # `lanes` already is — `all_lanes` defaults to `lanes` so an existing
+    # caller that only ever had the guarded subset in hand keeps its exact
+    # prior behavior (every lane it can see already carries capabilities,
+    # so this reduces to a no-op check on that subset).
+    rc |= _check_capability_syntactic_matches_derived(
+        graph, all_lanes if all_lanes is not None else lanes, verbose
+    )
 
     # (3) Lane-independent invariants: `cuda` alone and bare `default` never
     # reach jammi-kernels/flash-attn, regardless of what any lane declares.
@@ -889,6 +1019,59 @@ def self_test() -> int:
     # itself just iterates whatever dict it's given, so this is asserted at
     # the load_manifest_lanes() level below instead.
     assert load_manifest_lanes_rejects_empty(), "empty `lanes` must be rejected"
+    assert load_manifest_lanes_skips_capability_less_lane(), (
+        "#507: a lane with no `capabilities` block must be SKIPPED (excluded from the "
+        "returned lanes), never sys.exit(2) -- a sibling lane WITH capabilities must "
+        "still be returned and guarded"
+    )
+    assert load_manifest_lanes_all_capability_less_still_errors(), (
+        "if EVERY lane lacks `capabilities`, load_manifest_lanes must still exit 2 -- "
+        "the skip-by-rule is per-lane, never a silent whole-file pass"
+    )
+
+    # Syntactic capabilities-presence must match the DERIVED closure for
+    # EVERY lane in `all_lanes`, independent of whether the manifest
+    # already marks it capability-bearing. Every assertion below reuses
+    # the SAME clean graph (`g`) and the SAME `lanes=_default_lanes()`
+    # (both already proven rc==0 together at the top of this self-test)
+    # so the ONLY variable is `all_lanes` -- an rc==1 can only come from
+    # this check itself, never noise from the lane-independent
+    # invariants or `_check_manifest_lanes`.
+    g = Graph(_synthetic(["jammi-kernels/cuda"]))
+    # A lane with NO `capabilities` block whose cargo_features closure
+    # DOES reach jammi-kernels/cuda (a real, undeclared capability surface
+    # reached through a feature the manifest never marks) must FAIL.
+    capability_less_but_leaks = {
+        "cpu-tarball": {"package": "jammi-server", "cargo_features": ["cuda"]},
+    }
+    assert verdict(g, _default_lanes(), verbose=False, all_lanes=capability_less_but_leaks) == 1, (
+        "a capability-less lane whose derived closure reaches jammi-kernels/cuda must FAIL"
+    )
+    # Positive control: a genuinely CPU-only lane (its OWN cargo_features,
+    # `jetstream-broker`, maps to an empty feature spec on jammi-server --
+    # reaches jammi-kernels at all) with no `capabilities` block must stay
+    # clean.
+    capability_less_and_clean = {
+        "cpu-tarball": {"package": "jammi-server", "cargo_features": ["jetstream-broker"]},
+    }
+    assert verdict(g, _default_lanes(), verbose=False, all_lanes=capability_less_and_clean) == 0, (
+        "a genuinely CPU-only lane (no capabilities block, closure reaches neither cuda nor "
+        "flash-attn) must stay clean"
+    )
+    # A lane that DOES carry a `capabilities` block but whose
+    # cargo_features closure reaches NEITHER cuda nor flash-attn (a stale
+    # or wrong capabilities claim) must FAIL.
+    capabilities_but_no_reach = {
+        "cpu-tarball": {
+            "package": "jammi-server",
+            "cargo_features": ["jetstream-broker"],
+            "capabilities": {"flash_compiled": False},
+        },
+    }
+    assert verdict(g, _default_lanes(), verbose=False, all_lanes=capabilities_but_no_reach) == 1, (
+        "a lane carrying a `capabilities` block whose closure reaches neither cuda nor "
+        "flash-attn must FAIL"
+    )
 
     # The ALL_FEATURES_FLASH_EXEMPT mechanism (P6 Stage B): a member that
     # declares its OWN by-name `flash-attn` passthrough must pass under
@@ -1287,6 +1470,65 @@ def load_manifest_lanes_rejects_empty() -> bool:
             MANIFEST_PATH = saved
 
 
+def load_manifest_lanes_skips_capability_less_lane() -> bool:
+    """A lane with NO `capabilities` block (a CPU
+    family) is SKIPPED by `load_manifest_lanes` -- returned lanes exclude
+    it entirely -- never a hard `sys.exit(2)`. A SIBLING lane that DOES
+    carry `capabilities` is still returned and still guarded, proving the
+    skip is scoped to the one capability-less lane, never the whole file."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        manifest = Path(td) / "release-feature-manifest.json"
+        manifest.write_text(json.dumps({
+            "lanes": {
+                "cpu-tarball": {
+                    "package": "jammi-ai",
+                    "cargo_features": ["jetstream-broker"],
+                },
+                "cu12-tarball": {
+                    "package": "jammi-ai",
+                    "cargo_features": ["flash-attn"],
+                    "capabilities": {"flash_compiled": True},
+                },
+            }
+        }))
+        global MANIFEST_PATH
+        saved = MANIFEST_PATH
+        MANIFEST_PATH = manifest
+        try:
+            lanes = load_manifest_lanes()
+        finally:
+            MANIFEST_PATH = saved
+        return "cpu-tarball" not in lanes and "cu12-tarball" in lanes
+
+
+def load_manifest_lanes_all_capability_less_still_errors() -> bool:
+    """The `not guarded` fail-closed arm: if EVERY lane lacks `capabilities`
+    (a manifest gone entirely CPU-only, or a genuine authoring mistake),
+    `load_manifest_lanes` still exits 2 -- the skip-by-rule is scoped to
+    individual lanes, never a silent "nothing left to guard, so pass"."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        manifest = Path(td) / "release-feature-manifest.json"
+        manifest.write_text(json.dumps({
+            "lanes": {
+                "cpu-tarball": {"package": "jammi-ai", "cargo_features": ["jetstream-broker"]},
+            }
+        }))
+        global MANIFEST_PATH
+        saved = MANIFEST_PATH
+        MANIFEST_PATH = manifest
+        try:
+            load_manifest_lanes()
+            return False  # should have exited
+        except SystemExit as e:
+            return e.code == 2
+        finally:
+            MANIFEST_PATH = saved
+
+
 def main(argv: list[str]) -> int:
     if "--self-test" in argv:
         return self_test()
@@ -1303,7 +1545,7 @@ def main(argv: list[str]) -> int:
         )
         return 2
     lanes = load_manifest_lanes()
-    rc = verdict(graph, lanes)
+    rc = verdict(graph, lanes, all_lanes=load_all_lanes_raw())
     full_manifest = prove_surface.load_manifest(MANIFEST_PATH)
     rc |= check_prove_surface(full_manifest, REPO_ROOT)
     print("check_flash_attn_closure: " + ("PASS" if rc == 0 else "FAIL"))

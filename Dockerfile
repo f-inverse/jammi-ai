@@ -50,6 +50,18 @@ ARG BASE_IMAGE_CUDA=ghcr.io/f-inverse/jammi-ai-ci-cuda:latest
 # container runtime selects the manifest matching its own host arch.
 FROM ${BASE_IMAGE} AS builder
 
+# Redeclared HERE (post-FROM), same rule the CUDA stage's own
+# `CARGO_FEATURES` follows below: a pre-FROM global ARG does not cross a
+# `FROM` boundary. NO DEFAULT (#507): a bare `docker build` with this
+# build-arg omitted must fail LOUDLY at the RUN step's own `:?` guard
+# below, never silently build a plausible-but-wrong feature list — the
+# fail-OPEN behavior an empty/absent build-arg had before (a mistyped or
+# missing `--build-arg CARGO_FEATURES=...` still built successfully) is
+# exactly the #507 defect this closes. `server-image.yml`'s three CPU
+# image jobs pass this from `ci/release-feature-manifest.json`'s
+# `cpu-image` lane via `jq`.
+ARG CARGO_FEATURES
+
 WORKDIR /workspace
 COPY . .
 
@@ -64,11 +76,18 @@ COPY . .
 # image). One `cargo build` compiles the workspace once for both.
 # `--features` applies to the server (which owns the broker + cloud-driver
 # flags); the strict-client CLI carries no such features, so it builds plain.
+# `jammi-server/` prefixes every feature name, same `awk` transform the CUDA
+# builder stage below uses, so `CARGO_FEATURES` is a plain comma-separated
+# feature-name list (matching the manifest's own `cargo_features` array)
+# rather than a second, pre-prefixed copy this Dockerfile would have to keep
+# in sync by hand.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/workspace/target,sharing=locked \
-    cargo build --release \
+    : "${CARGO_FEATURES:?CARGO_FEATURES build-arg is required (see ci/release-feature-manifest.json's cpu-* lanes) -- pass --build-arg CARGO_FEATURES=<comma-separated cargo feature list>}" \
+    && features="$(printf '%s' "${CARGO_FEATURES}" | awk -F',' '{out=""; for(i=1;i<=NF;i++){out = out (i>1?",":"") "jammi-server/" $i} print out}')" \
+    && cargo build --release \
         --package jammi-server --bin jammi-server \
-        --features jammi-server/jetstream-broker,jammi-server/storage-cloud \
+        --features "${features}" \
     && cargo build --release --package jammi-cli --bin jammi \
     && cp target/release/jammi-server /tmp/jammi-server \
     && cp target/release/jammi /tmp/jammi \
@@ -91,15 +110,15 @@ FROM --platform=linux/amd64 ${BASE_IMAGE_CUDA} AS builder-cuda
 
 # Redeclared HERE (post-FROM) rather than only as a global arg above: a
 # pre-FROM global ARG does not cross a `FROM` boundary, so this stage needs
-# its own declaration to see a `--build-arg CARGO_FEATURES=...` value. The
-# default matches today's published CUDA image lane exactly (no `flash-attn`)
-# so a bare `docker build` — no `--build-arg` at all — stays CUTLASS-free,
-# matching `server-image.yml`'s CPU-variant no-CUDA-features behavior in
-# spirit: nobody gets the vendored FlashAttention-2 build without asking for
-# it. `server-image.yml`'s CUDA jobs pass the manifest-derived
-# (`ci/release-feature-manifest.json`, lane `cu12-image`) feature list
-# explicitly via this build-arg.
-ARG CARGO_FEATURES=cuda,jetstream-broker,storage-cloud
+# its own declaration to see a `--build-arg CARGO_FEATURES=...` value. NO
+# DEFAULT (#507, same fix as the CPU builder stage above): a bare `docker
+# build` — no `--build-arg` at all — must fail LOUDLY at the RUN step's own
+# `:?` guard below rather than silently building a plausible-but-wrong
+# feature list (the old default masked exactly a missing/mistyped
+# `--build-arg`, which built successfully anyway). `server-image.yml`'s CUDA
+# jobs pass the manifest-derived (`ci/release-feature-manifest.json`, lane
+# `cu12-image`) feature list explicitly via this build-arg.
+ARG CARGO_FEATURES
 
 WORKDIR /workspace
 COPY . .
@@ -115,7 +134,8 @@ COPY . .
 # `jammi-cli`'s own build (no `--features`) is unaffected by the arg's value.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/workspace/target,sharing=locked \
-    features="$(printf '%s' "${CARGO_FEATURES}" | awk -F',' '{out=""; for(i=1;i<=NF;i++){out = out (i>1?",":"") "jammi-server/" $i} print out}')" \
+    : "${CARGO_FEATURES:?CARGO_FEATURES build-arg is required (see ci/release-feature-manifest.json's cu12-image lane) -- pass --build-arg CARGO_FEATURES=<comma-separated cargo feature list>}" \
+    && features="$(printf '%s' "${CARGO_FEATURES}" | awk -F',' '{out=""; for(i=1;i<=NF;i++){out = out (i>1?",":"") "jammi-server/" $i} print out}')" \
     && cargo build --release \
         --package jammi-server --bin jammi-server \
         --features "${features}" \

@@ -3,7 +3,9 @@
 
 **Guarded property**: the manifest's three CUDA release lanes describe ONE
 shipped capability surface, and every op it names is classified by exactly
-ONE proof mechanism.
+ONE proof mechanism. The three CPU release lanes (#507) ship no capability
+surface at all — `capabilities` is required iff a lane's own
+`cargo_features` reaches `cuda`/`flash-attn`, forbidden otherwise.
 
 The manifest is duplicated three ways on purpose (one block per lane, so a
 lane that genuinely diverges can say so), which makes silent divergence the
@@ -28,15 +30,22 @@ either name ops under a mechanism or not carry the mechanism at all.
 Checks (hermetic: reads the manifest and the tracked Rust sources, no
 network, no build, no toolchain):
 
-  1. The file parses; `lanes` exists and is non-empty; every lane carries a
-     `capabilities` object with both category keys present, each non-empty,
-     and NO capability key outside the closed set (the two categories plus
-     the non-op build facts `cuda_compiled`/`flash_compiled`/`flash_dtypes`).
+  1. The file parses; `lanes` exists and is non-empty. `capabilities` is
+     REQUIRED, with both category keys present (each non-empty, no
+     capability key outside the closed set — the two categories plus the
+     non-op build facts `cuda_compiled`/`flash_compiled`/`flash_dtypes`), on
+     every lane whose `cargo_features` names `cuda` or `flash-attn`
+     (SYNTACTIC here — a literal feature-name match; the toolchain-bearing
+     `check_flash_attn_closure.py` re-derives the same fact from the real
+     feature graph) — and `capabilities` is FORBIDDEN (a FINDING if present)
+     on every OTHER lane (#507: a CPU family ships no capability surface).
      Fail-closed: a missing/renamed/extra key is a FINDING, never a silently
      skipped check.
-  2. Every lane's `capabilities` block is IDENTICAL to every other lane's,
-     compared as canonical JSON (key order included, so the file stays
-     reviewable as three literally-equal blocks).
+  2. Every lane's `capabilities` block, among the lanes that carry one, is
+     IDENTICAL to every other such lane's, compared as canonical JSON (key
+     order included, so the file stays reviewable as N literally-equal
+     blocks) — the CUDA families today; a lane with no `capabilities` block
+     (a CPU family) is never compared.
   3. Every op named across the two categories appears in EXACTLY ONE of
      them, and at most once within its own category.
   4. Every `internal_subkernels` entry carries a `parent` and a
@@ -118,6 +127,24 @@ NON_CATEGORY_CAPABILITY_KEYS = frozenset(
 # `counters_for("<key>")` / `cascade_counters_for("<key>")` — the only two
 # ways a dispatch-registry key is named in this workspace.
 _REGISTRY_KEY_RE = re.compile(r"(?:cascade_)?counters_for\(\s*\"([a-z0-9_]+)\"")
+
+# #507: `capabilities` is REQUIRED on a lane iff its `cargo_features` names
+# either of these — SYNTACTIC here (this gate has no toolchain, no cargo
+# metadata): a literal feature-name match, never a derived closure over the
+# workspace feature graph. `check_flash_attn_closure.py` (toolchain-bearing)
+# re-derives the SAME fact from the real graph and is the DERIVED half of
+# this rule; this file only enforces that the manifest's OWN two halves
+# (which lanes carry a block, and whether siblings agree) are internally
+# consistent with the literal `cargo_features` list sitting right next to
+# them.
+_CAPABILITY_TRIGGER_FEATURES = frozenset({"cuda", "flash-attn"})
+
+
+def _lane_needs_capabilities(lane: dict) -> bool:
+    feats = lane.get("cargo_features")
+    if not isinstance(feats, list):
+        return False
+    return any(f in _CAPABILITY_TRIGGER_FEATURES for f in feats)
 
 
 def registry_key_literals(repo_root: Path) -> set[str]:
@@ -250,21 +277,40 @@ def check_manifest(manifest: dict, repo_root: Path = REPO_ROOT) -> list[str]:
     if not isinstance(lanes, dict) or not lanes:
         return ["manifest has no (or an empty) `lanes` object — nothing to check"]
 
-    # (2) every lane's capability block is identical.
+    # (1b)/(2) #507: `capabilities` is REQUIRED iff the lane's own
+    # `cargo_features` names `cuda`/`flash-attn` (SYNTACTIC — see
+    # `_lane_needs_capabilities`'s own doc), FORBIDDEN otherwise; among the
+    # lanes that DO carry one, every block must be IDENTICAL (compared as
+    # canonical JSON) — a CPU family (no capabilities) is never compared
+    # against, or mistaken for a divergence from, the CUDA lanes' block.
     canonical: dict[str, str] = {}
     for lane_name, lane in lanes.items():
-        caps = lane.get("capabilities") if isinstance(lane, dict) else None
-        if not isinstance(caps, dict):
-            problems.append(f"lane `{lane_name}`: no `capabilities` object")
+        if not isinstance(lane, dict):
+            problems.append(f"lane `{lane_name}`: must be an object")
             continue
-        canonical[lane_name] = json.dumps(caps, indent=2, sort_keys=False)
+        needs_caps = _lane_needs_capabilities(lane)
+        caps = lane.get("capabilities")
+        if needs_caps:
+            if not isinstance(caps, dict):
+                problems.append(
+                    f"lane `{lane_name}`: `cargo_features` names `cuda` or `flash-attn` but "
+                    f"has no `capabilities` object (#507: capabilities is REQUIRED here)"
+                )
+                continue
+            canonical[lane_name] = json.dumps(caps, indent=2, sort_keys=False)
+        elif caps is not None:
+            problems.append(
+                f"lane `{lane_name}`: `cargo_features` names neither `cuda` nor "
+                f"`flash-attn` — `capabilities` must be ABSENT (#507: forbidden on a "
+                f"non-CUDA family), found a {type(caps).__name__}"
+            )
     if len(set(canonical.values())) > 1:
         reference = next(iter(canonical))
         for lane_name, blob in canonical.items():
             if blob != canonical[reference]:
                 problems.append(
                     f"lane `{lane_name}`'s capabilities block differs from lane "
-                    f"`{reference}`'s — the three lanes build one feature list and "
+                    f"`{reference}`'s — the CUDA lanes build one feature list and "
                     f"must declare one capability surface (edit all lanes in one unit)"
                 )
 
@@ -360,8 +406,8 @@ def _fixture_manifest() -> dict:
     }
     return {
         "lanes": {
-            "a": {"capabilities": json.loads(json.dumps(caps))},
-            "b": {"capabilities": json.loads(json.dumps(caps))},
+            "a": {"cargo_features": ["cuda", "flash-attn"], "capabilities": json.loads(json.dumps(caps))},
+            "b": {"cargo_features": ["cuda", "flash-attn"], "capabilities": json.loads(json.dumps(caps))},
         },
         "prove_lane": {
             "crates": {
@@ -399,6 +445,39 @@ def _self_test() -> int:
     ]
     probs = check_manifest(m, REPO_ROOT)
     check("divergent-lane-capability-block-caught", any("differs from lane" in p for p in probs), f"{probs}")
+
+    # 1b. (#507) A CPU family carrying `capabilities` is a FINDING — the
+    # syntactic rule reads `cargo_features`, never the presence of the
+    # block alone.
+    m = _fixture_manifest()
+    m["lanes"]["c"] = {
+        "cargo_features": ["jetstream-broker", "storage-cloud"],
+        "capabilities": json.loads(json.dumps(m["lanes"]["a"]["capabilities"])),
+    }
+    probs = check_manifest(m, REPO_ROOT)
+    check(
+        "capabilities-on-cpu-family-caught",
+        any("must be ABSENT" in p and "lane `c`" in p for p in probs),
+        f"{probs}",
+    )
+
+    # 1c. (#507) A CUDA family (cargo_features names `cuda`) with NO
+    # `capabilities` block is a FINDING — capabilities is REQUIRED there.
+    m = _fixture_manifest()
+    del m["lanes"]["b"]["capabilities"]
+    probs = check_manifest(m, REPO_ROOT)
+    check(
+        "capabilities-missing-on-cuda-family-caught",
+        any("capabilities is REQUIRED here" in p and "lane `b`" in p for p in probs),
+        f"{probs}",
+    )
+
+    # 1d. (#507) A CPU family with NO `capabilities` block (the real,
+    # correct shape) is accepted.
+    m = _fixture_manifest()
+    m["lanes"]["c"] = {"cargo_features": ["jetstream-broker", "storage-cloud"]}
+    probs = check_manifest(m, REPO_ROOT)
+    check("cpu-family-without-capabilities-accepted", probs == [], f"{probs}")
 
     # 2. An op in two categories at once — the two mechanisms contradict.
     #    Here an ADMITTED op is also claimed as a parentless sub-kernel.

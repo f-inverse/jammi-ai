@@ -112,7 +112,32 @@
     "real `admit()`/`admit_cascade()` call site (and its `PROBED_OPS` row)",
     "promotes an op into `fused_op_admission`; giving it an admitted parent",
     "that launches it directly moves it into `internal_subkernels`. Never a",
-    "manifest-only move."
+    "manifest-only move.",
+    "",
+    "#507: the three CPU families (`cpu-tarball`, `cpu-wheel`, `cpu-image`)",
+    "live under `lanes` too, alongside the three CUDA families above — ONE",
+    "closed set, ONE key (`lanes`), never a second top-level section split by",
+    "GPU-vs-CPU. A CPU family carries NO `capabilities` block: it reaches",
+    "neither `cuda` nor `flash-attn`, so it has no capability surface to",
+    "declare (`check_release_manifest.py` enforces `capabilities` present iff",
+    "`cargo_features` names `cuda` or `flash-attn`, forbidden otherwise —",
+    "SYNTACTIC there; `check_flash_attn_closure.py` re-derives the same fact",
+    "from the real feature graph and skips a lane with no `capabilities`",
+    "block by rule). Every build site for a CPU family reads its",
+    "`cargo_features` via `jq`, exactly like a CUDA family: nine call sites",
+    "across six lanes (`.github/workflows/pypi-server.yml:75`,",
+    "`pypi-server-cuda.yml:83`, `release-binaries.yml:310`/`:465`, and",
+    "`server-image.yml:149`/`:415`/`:660`/`:770`/`:850`). No gate examines",
+    "whether a workflow scalar (a `build-args:` value, a `--features=`/`-F`",
+    "invocation, a `workflow_call`/composite-action input default, or any",
+    "other shape) reads one of these sites rather than a literal — that is a",
+    "stated residual, tracked on #507.",
+    "`crates/jammi-db/tests/it/shipped_feature_exposure.rs` covers the",
+    "manifest half (all six families present under `lanes`, the generated",
+    "`deny.toml` exposure line) plus the Dockerfile arm (both",
+    "`ARG CARGO_FEATURES` declarations carry no default, and each builder",
+    "stage's own `RUN` carries the `${CARGO_FEATURES:?...}` required-",
+    "argument guard)."
   ],
   "lanes": {
     "cu12-tarball": {
@@ -246,6 +271,33 @@
           }
         }
       }
+    },
+    "cpu-tarball": {
+      "_doc": "The CPU `jammi-server` tarball, two-arch matrix (x86_64-linux, aarch64-linux). No `capabilities` block: reaches neither cuda nor flash-attn (#507).",
+      "workflow": ".github/workflows/release-binaries.yml:server-cpu-promote",
+      "package": "jammi-server",
+      "cargo_features": [
+        "jetstream-broker",
+        "storage-cloud"
+      ]
+    },
+    "cpu-wheel": {
+      "_doc": "The `jammi-server` PyPI wheel (CPU), two-arch matrix (x86_64, aarch64), built through `_pypi-server.yml` (reusable) by `.github/workflows/pypi-server.yml`. No `capabilities` block (#507).",
+      "workflow": ".github/workflows/pypi-server.yml:publish",
+      "package": "jammi-server",
+      "cargo_features": [
+        "jetstream-broker",
+        "storage-cloud"
+      ]
+    },
+    "cpu-image": {
+      "_doc": "The `jammi-ai-server` container image's `runtime-generic`/`runtime-selfcontained` stages (CPU `builder` Dockerfile stage), published by `.github/workflows/server-image.yml`. No `capabilities` block (#507).",
+      "workflow": ".github/workflows/server-image.yml:build-and-push-main / build-and-push / build-and-push-selfcontained (Dockerfile builder stage)",
+      "package": "jammi-server",
+      "cargo_features": [
+        "jetstream-broker",
+        "storage-cloud"
+      ]
     }
   },
   "prove_lane": {

@@ -137,6 +137,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `ci/release-feature-manifest.json`'s `cpu-image` lane is the single
+      # source of truth for this build's cargo feature list (fed into the
+      # Dockerfile's `CARGO_FEATURES` build-arg, required — no default —
+      # since #507) — read here rather than hardcoding it a second time,
+      # same idiom as the CUDA jobs' own `manifest` step below.
+      - name: Read release feature list (ci/release-feature-manifest.json)
+        id: manifest
+        run: |
+          set -euo pipefail
+          features="$(jq -r '.lanes["cpu-image"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          if [ -z "$features" ]; then
+            echo "::error::ci/release-feature-manifest.json produced an empty cpu-image cargo_features list" >&2
+            exit 1
+          fi
+          echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
+
       - uses: ./.github/actions/docker-publish
         id: publish
         with:
@@ -150,6 +166,7 @@ jobs:
           tag-suffix: ${{ matrix.arch }}
           build-args: |
             BASE_IMAGE=${{ needs.resolve-base.outputs.image }}
+            CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
           platforms: linux/${{ matrix.arch }}
           cache-scope: cpu-${{ matrix.arch }}
           push: "true"
@@ -388,6 +405,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # See build-and-push-main's identical step: `ci/release-feature-
+      # manifest.json`'s `cpu-image` lane is the single source of truth
+      # for this build's cargo feature list.
+      - name: Read release feature list (ci/release-feature-manifest.json)
+        id: manifest
+        run: |
+          set -euo pipefail
+          features="$(jq -r '.lanes["cpu-image"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          if [ -z "$features" ]; then
+            echo "::error::ci/release-feature-manifest.json produced an empty cpu-image cargo_features list" >&2
+            exit 1
+          fi
+          echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
+
       - uses: ./.github/actions/docker-publish
         id: publish
         with:
@@ -397,6 +428,7 @@ jobs:
           tag-suffix: ${{ matrix.arch }}
           build-args: |
             BASE_IMAGE=${{ needs.resolve-base.outputs.image }}
+            CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
           platforms: linux/${{ matrix.arch }}
           cache-scope: cpu-${{ matrix.arch }}
           push: "true"
@@ -591,11 +623,12 @@ jobs:
   # Self-contained variant: opt-in, dispatch-only. Builds the
   # `runtime-selfcontained` stage (baked config + encoder) from the
   # dispatched ref and pushes `:selfcontained` + a `:sha-<sha>` tag.
-  # Independent of the tag-triggered generic publish above. Deliberately
-  # manifest-free (no `ci/release-feature-manifest.json` read, no
-  # `CARGO_FEATURES` build-arg) like the generic CPU image above: this
-  # variant builds from the CPU `builder` stage, not `builder-cuda`, so it
-  # never carries a CUDA feature to source from the manifest.
+  # Independent of the tag-triggered generic publish above. Reads the SAME
+  # `cpu-image` manifest lane the generic CPU image does (#507: the
+  # Dockerfile's CPU builder stage requires `CARGO_FEATURES` — no default —
+  # so every job that reaches it, including this one, must pass it); it
+  # builds from the CPU `builder` stage, not `builder-cuda`, so it never
+  # carries a CUDA feature.
   build-and-push-selfcontained:
     # `&& github.ref_type != 'tag'` (F3 audit fix, #454 follow-up round 2):
     # closes a real leak an adversarial audit found here -- without a ref-
@@ -617,6 +650,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # See build-and-push-main's identical step: `ci/release-feature-
+      # manifest.json`'s `cpu-image` lane is the single source of truth
+      # for this build's cargo feature list.
+      - name: Read release feature list (ci/release-feature-manifest.json)
+        id: manifest
+        run: |
+          set -euo pipefail
+          features="$(jq -r '.lanes["cpu-image"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          if [ -z "$features" ]; then
+            echo "::error::ci/release-feature-manifest.json produced an empty cpu-image cargo_features list" >&2
+            exit 1
+          fi
+          echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
+
       - uses: ./.github/actions/docker-publish
         id: publish
         with:
@@ -627,6 +674,7 @@ jobs:
           build-args: |
             RUNTIME_VARIANT=runtime-selfcontained
             BASE_IMAGE=${{ needs.resolve-base.outputs.image }}
+            CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
           # S5: Cloudflare Containers (this variant's runtime) is amd64-only
           # -- no arm leg, no merge job, no row. Explicit, never implicit
           # native-runner behavior, so a future runner-arch change fails

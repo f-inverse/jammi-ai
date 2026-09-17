@@ -145,6 +145,28 @@ GOVERNANCE_VERBS = (
     "promote", "retire", "register", "approve", "gate", "stage", "transition",
 )
 
+# The CamelCase NOUN form of a governance verb is ALSO
+# governance-shaped (`Retirement`, `RetirementPolicy`, `retirement_policy`)
+# even though a plain participle/agentive/plural form of the SAME verb
+# (`Retired`, `Retiring`, `Retires`, `Registered`) is legitimate engine
+# vocabulary — measured directly against the real tree: a
+# naive participle rule would newly flag Registered(54) Gated(29)
+# Registering(3) Registers(4) Gates(2) Promoting/Promotes(1), all real,
+# non-governance engine identifiers. A closed, per-verb table — never a
+# generic "-tion/-ment" suffix rule, which would re-introduce exactly that
+# false-positive class. `gate`→"Gating" is deliberately NOT a row here
+# (ambiguous with the engine's own `Gated`/`Gates` vocabulary — `gate`
+# keeps only its verb-head rule below); `stage`→"Staging" is likewise
+# excluded (same reason); `transition` needs no row — it is already
+# noun-shaped, so the plain verb-head rule below already matches the bare
+# identifier `Transition`/`transition`.
+GOVERNANCE_NOUNS = {
+    "promote": "Promotion",
+    "retire": "Retirement",
+    "register": "Registration",
+    "approve": "Approval",
+}
+
 # (2) Philosophy leak-smell tokens — specific boundary-break identifiers.
 LEAK_SMELL_TOKENS = ("get_vector", "LifecycleTable", "record_actor", "sign_with")
 
@@ -201,6 +223,27 @@ def governance_stem(ident: str) -> str | None:
     NOT `retirement`, and `register` matches `register_query` but not
     `registration`. (A naive case-insensitive char class would treat a lowercase
     continuation as a boundary and mis-flag `retirement`.)
+
+    A verb WITH a row in `GOVERNANCE_NOUNS` also matches its own
+    CamelCase NOUN form, and that noun's PLURAL, as a whole head token —
+    the exact identifier, a snake_case head (`retirement_…`), or a
+    CamelCase head (`Retirement` + an uppercase hump). The noun's
+    SPELLING (not merely its prefix) is what excludes a participle/
+    agentive/plural of the bare VERB: `Retired`/`Retiring`/`Retires`/
+    `Registered` all diverge from `Retirement`/`Registration` within the
+    shared verb root, so they never match this rule OR the plain
+    verb-head rule above (which requires an uppercase/digit boundary
+    immediately after the verb itself, absent here). Measured directly
+    against the real tree (symbol-index parse of `crates`): the noun and
+    plural widening together introduce 0 new findings over the bare
+    verb-head rule, so neither reproduces the participle/agentive false-
+    positive class the noun table itself was built to avoid.
+
+    `transition` carries no `GOVERNANCE_NOUNS` row (it is already noun-
+    shaped, so the verb-head rule above already matches the bare
+    identifier `Transition`/`transition`) but its PLURAL, `Transitions`,
+    still needs the same whole-head-token check the other verbs' nouns
+    get — also measured at 0 new findings.
     """
     low = ident.lower()
     for verb in GOVERNANCE_VERBS:
@@ -211,7 +254,43 @@ def governance_stem(ident: str) -> str | None:
             return verb
         if low.startswith(verb) and len(ident) > len(verb) and ident[len(verb)].isdigit():
             return verb
+        noun = GOVERNANCE_NOUNS.get(verb)
+        forms: tuple[str, ...] = ()
+        if noun is not None:
+            forms = (noun, noun + "s")
+        elif verb == "transition":
+            forms = (cap + "s",)  # "Transitions" -- the singular is already covered above
+        for form in forms:
+            form_low = form.lower()
+            if low == form_low or low.startswith(form_low + "_"):
+                return verb
+            if ident.startswith(form) and len(ident) > len(form) and ident[len(form)].isupper():
+                return verb
     return None
+
+
+def _census_governance_findings(index: dict, nouns: dict[str, str] | None) -> set[tuple[str, str]]:
+    """Every (identifier, path) `pub` item, TREE-WIDE (never diff-scoped —
+    `check_governance_tripwire` stays diff-scoped; this is
+    the self-test's own tree-wide oracle only), whose stem matches `governance_stem` under the
+    given noun table: `nouns={}` reproduces the PRE-#517 verb-only rule
+    (temporarily empties `GOVERNANCE_NOUNS`, restored in `finally`, so this
+    calls the REAL `governance_stem` rather than duplicating its logic —
+    the two paths cannot drift apart by construction); `nouns=None` uses
+    the real, committed table."""
+    global GOVERNANCE_NOUNS
+    real_nouns = GOVERNANCE_NOUNS
+    GOVERNANCE_NOUNS = real_nouns if nouns is None else nouns
+    try:
+        found: set[tuple[str, str]] = set()
+        for item in index["items"]:
+            if not item["vis"].startswith("pub"):
+                continue
+            if governance_stem(item["name"]) is not None:
+                found.add((item["name"], item["path"]))
+        return found
+    finally:
+        GOVERNANCE_NOUNS = real_nouns
 
 
 def resolve_diff_base() -> str | None:
@@ -519,6 +598,13 @@ def check_governance_tripwire(rows: list[AllowlistRow]) -> tuple[list[str], list
     bare text (the retired `PUB_DECL_RE` approach), which could not see a
     `pub fn` whose signature wraps across lines, and could be fooled by a
     string/comment containing the same text a real parser is not.
+
+    An un-waived finding here is what makes `main()` return 1 (fail the
+    step) — `governance_stem`'s own oracle for whether a finding is
+    CORRECT (a real governance-shaped identifier, never a false positive)
+    is the self-test's tree-wide census (`_census_governance_findings`),
+    never this diff-scoped function, which only ever sees whatever the
+    CURRENT diff happens to add.
     """
     base = resolve_diff_base()
     if base is None:
@@ -756,6 +842,57 @@ def self_test() -> int:
             parse_failures == [] and len(rows) == 2,
             (parse_failures, rows),
         )
+
+    # governance_stem's per-verb noun morphology. A CamelCase
+    # NOUN form of a governance verb is a match; a participle/agentive/
+    # plural form of the SAME verb is not.
+    check("noun pair: Retirement -> retire", governance_stem("Retirement") == "retire",
+          governance_stem("Retirement"))
+    check("noun pair: Registered -> None", governance_stem("Registered") is None,
+          governance_stem("Registered"))
+    check("noun pair: RegistrationTable -> register", governance_stem("RegistrationTable") == "register",
+          governance_stem("RegistrationTable"))
+    check("noun pair: Registers -> None", governance_stem("Registers") is None,
+          governance_stem("Registers"))
+    # The PLURAL noun forms are governance-shaped too.
+    check("plural noun pair: Registrations -> register", governance_stem("Registrations") == "register",
+          governance_stem("Registrations"))
+    check("plural noun pair: Approvals -> approve", governance_stem("Approvals") == "approve",
+          governance_stem("Approvals"))
+    check("plural noun pair: Promotions -> promote", governance_stem("Promotions") == "promote",
+          governance_stem("Promotions"))
+    check("plural noun pair: RetirementsTable -> retire", governance_stem("RetirementsTable") == "retire",
+          governance_stem("RetirementsTable"))
+    check("plural noun pair: Transitions -> transition", governance_stem("Transitions") == "transition",
+          governance_stem("Transitions"))
+
+    # Tree-wide census — the oracle is the REAL symbol-index
+    # parse of `crates`, never the diff-scoped tripwire (`check_
+    # governance_tripwire` examines only pub items on the diff's OWN added
+    # lines, so it cannot see whether the noun table would newly flag
+    # something ALREADY in the tree). This self-test runs ONLY in ci.yml's
+    # container-backed `symbol-index-gates` job (a toolchain is always
+    # present there — never the toolchain-less swarm lane), so an index
+    # build failure here is a genuine environment problem, not a
+    # graceful-skip arm like this file's own missing-cargo advisory arm
+    # elsewhere.
+    census_index = build_symbol_index(["crates"])
+    pub_items = [it for it in census_index["items"] if it["vis"].startswith("pub")]
+    check(
+        "census: pub item floor (committed literal)",
+        len(pub_items) >= 6838,
+        f"only {len(pub_items)} pub item(s) indexed tree-wide, expected >= 6838 "
+        "(a shrink this large means the index itself is broken, not that the tree got smaller)",
+    )
+    verb_only = _census_governance_findings(census_index, nouns={})
+    with_nouns = _census_governance_findings(census_index, nouns=None)
+    new_from_nouns = with_nouns - verb_only
+    check(
+        "census: the noun table introduces 0 NEW tree-wide findings (committed literal)",
+        len(new_from_nouns) == 0,
+        f"the noun table newly flags {sorted(new_from_nouns)} tree-wide — either a genuine leak "
+        "(fix it, with its own commit) or the noun table needs narrowing, never loosened silently",
+    )
 
     if failures:
         print("no-consumer-names self-test: FAIL", file=sys.stderr)

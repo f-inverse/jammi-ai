@@ -296,8 +296,26 @@ jobs:
           # never wanted -D warnings.
           deny-warnings: false
 
+      # `ci/release-feature-manifest.json`'s `cpu-tarball` lane is the single
+      # source of truth for this lane's cargo feature list (#507) — read
+      # here rather than restating it, same idiom as `server-cpu-cuda`
+      # below. `jq` is not guaranteed present in the CI base image (not a
+      # `dnf install` its own Dockerfile carries), so this step installs it
+      # on demand.
+      - name: Read release feature list (ci/release-feature-manifest.json)
+        id: manifest
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null 2>&1 || dnf install -y jq >/dev/null
+          features="$(jq -r '.lanes["cpu-tarball"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          if [ -z "$features" ]; then
+            echo "::error::ci/release-feature-manifest.json produced an empty cpu-tarball cargo_features list" >&2
+            exit 1
+          fi
+          echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
+
       - name: Build jammi-server (CPU, release)
-        run: cargo build --release -p jammi-server --bin jammi-server --features jetstream-broker,storage-cloud
+        run: cargo build --release -p jammi-server --bin jammi-server --features ${{ steps.manifest.outputs.cargo_features }}
 
       - name: Package
         id: package

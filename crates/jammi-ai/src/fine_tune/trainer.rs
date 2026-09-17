@@ -13056,10 +13056,6 @@ mod epoch_checkpoint_retention_failure {
         let root_dir = tempfile::tempdir().unwrap().keep();
         let cache_dir = tempfile::tempdir().unwrap().keep();
         let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
-        let store = Arc::new(
-            ArtifactStore::with_root(root.clone(), StorageRegistry::new(), cache_dir.clone())
-                .unwrap(),
-        );
         let artifact_dir = tempfile::tempdir().unwrap().keep();
         let checkpoint_dir = tempfile::tempdir().unwrap().keep();
         // The only async step — done here, before the blocking closure.
@@ -13068,11 +13064,15 @@ mod epoch_checkpoint_retention_failure {
                 .await
                 .unwrap(),
         );
-        // Rooted at the SAME `root`/registry/cache_dir as `store` above, so
-        // the guard consult and the delete it may perform act on the exact
-        // same physical bytes — no `models` row ever names this test's
-        // prefix, so every consult below answers "not referenced" and the
-        // real (chmod-gated) delete is what actually fails.
+        // `store` is `result_store.artifact_store()` — the SAME instance
+        // production aliases the two through (`InferenceSession::artifact_store`
+        // is literally `result_store.artifact_store()`, `session.rs:281`), never
+        // an independently-rooted `ArtifactStore`. `ResultStore::with_root`
+        // roots its own artifact store at `{root}/models`
+        // (`models_root`, `store/mod.rs`); a SEPARATE, raw-rooted `store` here
+        // would make `delete_artifact_prefix`'s own-root refusal fire on every
+        // legitimate epoch-checkpoint prefix (I1, wave-5 pressure round F2) —
+        // an alias mismatch this test does not intend to exercise.
         let result_store = Arc::new(
             ResultStore::with_root(
                 root,
@@ -13083,6 +13083,7 @@ mod epoch_checkpoint_retention_failure {
             )
             .unwrap(),
         );
+        let store = result_store.artifact_store();
 
         let root_dir_for_blocking = root_dir.clone();
         tokio::task::spawn_blocking(move || {
@@ -13186,10 +13187,13 @@ mod epoch_checkpoint_retention_failure {
     }
 
     fn epoch0_local_dir(root_dir: &std::path::Path) -> std::path::PathBuf {
-        // `minimal_loop_with_store` never sets `.tenant(...)`, so every
-        // checkpoint this loop writes lands under the `_global` tenant
-        // segment (`TenantSegment::of(None)`).
+        // `store` is `result_store.artifact_store()`, rooted at
+        // `{root_dir}/models` (`models_root`, `store/mod.rs`) — not
+        // `root_dir` itself. `minimal_loop_with_store` never sets
+        // `.tenant(...)`, so every checkpoint this loop writes lands under
+        // the `_global` tenant segment (`TenantSegment::of(None)`).
         root_dir
+            .join("models")
             .join("_global")
             .join("f2-retry-job")
             .join("f2-retry-worker")
@@ -13278,10 +13282,6 @@ mod epoch_checkpoint_retention_isolation {
         let root_dir = tempfile::tempdir().unwrap().keep();
         let cache_dir = tempfile::tempdir().unwrap().keep();
         let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
-        let store = Arc::new(
-            ArtifactStore::with_root(root.clone(), StorageRegistry::new(), cache_dir.clone())
-                .unwrap(),
-        );
         let artifact_dir = tempfile::tempdir().unwrap().keep();
         let checkpoint_dir = tempfile::tempdir().unwrap().keep();
         let catalog_dir = tempfile::tempdir().unwrap().keep();
@@ -13290,9 +13290,10 @@ mod epoch_checkpoint_retention_isolation {
                 .await
                 .unwrap(),
         );
-        // Rooted at the SAME `root`/registry/cache_dir as `store` above —
-        // see `epoch_checkpoint_retention_failure`'s own `result_store` for
-        // why this is safe to build as a second handle onto the same bytes.
+        // `store` is `result_store.artifact_store()` — see
+        // `epoch_checkpoint_retention_failure`'s own `result_store` for why
+        // an independently-rooted `ArtifactStore` would alias-mismatch I1's
+        // own-root refusal instead.
         let result_store = Arc::new(
             ResultStore::with_root(
                 root,
@@ -13303,6 +13304,7 @@ mod epoch_checkpoint_retention_isolation {
             )
             .unwrap(),
         );
+        let store = result_store.artifact_store();
 
         // The PREVIOUS attempt ("0"): writes epoch 0, which this test
         // registers as a RETAINED checkpoint row — the exact shape a real
@@ -13449,10 +13451,6 @@ mod epoch_checkpoint_retention_guard {
         let root_dir = tempfile::tempdir().unwrap().keep();
         let cache_dir = tempfile::tempdir().unwrap().keep();
         let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
-        let store = Arc::new(
-            ArtifactStore::with_root(root.clone(), StorageRegistry::new(), cache_dir.clone())
-                .unwrap(),
-        );
         let artifact_dir = tempfile::tempdir().unwrap().keep();
         let checkpoint_dir = tempfile::tempdir().unwrap().keep();
         let catalog = Arc::new(
@@ -13460,6 +13458,10 @@ mod epoch_checkpoint_retention_guard {
                 .await
                 .unwrap(),
         );
+        // `store` is `result_store.artifact_store()` — see
+        // `epoch_checkpoint_retention_failure`'s own `result_store` for why
+        // an independently-rooted `ArtifactStore` would alias-mismatch I1's
+        // own-root refusal instead.
         let result_store = Arc::new(
             ResultStore::with_root(
                 root,
@@ -13470,6 +13472,7 @@ mod epoch_checkpoint_retention_guard {
             )
             .unwrap(),
         );
+        let store = result_store.artifact_store();
 
         // One continuous loop drives all three epoch boundaries, exactly
         // like a real run — the catalog register/delete calls in between

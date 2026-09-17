@@ -46,6 +46,8 @@ mod member_root_constructor;
 mod memory_pool;
 mod migrations;
 mod model_lifecycle;
+mod model_prefix_ownership;
+mod models_delete_call_sites;
 #[cfg(feature = "test-hooks")]
 mod mutable_crash_recovery;
 mod mutable_federation;

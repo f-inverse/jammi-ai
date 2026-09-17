@@ -403,7 +403,29 @@ impl ArtifactStore {
     /// caller is paving over already-cleaned or never-completed state. A missing
     /// manifest means the attempt never completed its write; nothing durable to
     /// reclaim, so that is a no-op too.
+    ///
+    /// **I1 (#562(2)).** `pub(crate)`, so no crate outside `jammi-db` can call
+    /// this directly; within `jammi-db` its only two callers are the two
+    /// sanctioned routes named above — `models_delete_call_sites.rs`'s
+    /// enumerating source oracle pins that call-site set (and every OTHER
+    /// production call of the lower-level
+    /// [`crate::storage::JammiObjectStore::delete_if_exists`] this method's
+    /// own body reaches, reviewing each as non-`models/` with its reason).
+    /// The `debug_assert!` below is the runtime half: `self.root` is always
+    /// `models_root(&root)` by construction (`ResultStore::new`, the ONE
+    /// place an `ArtifactStore` is built), so every `prefix` this unguarded
+    /// primitive ever receives is a sanity-checked fact, not merely a doc
+    /// claim — compiled out in release, where the two-call-site source oracle
+    /// (checked in CI on every commit) is the enforcement that actually
+    /// matters.
     pub(crate) async fn delete_artifact_prefix(&self, prefix: &StorageUrl) -> Result<()> {
+        debug_assert!(
+            prefix.as_str().starts_with(self.root.as_str()),
+            "delete_artifact_prefix: {prefix} is not under this store's own root ({}); every \
+             call site must route through ResultStore::delete_unreferenced_prefix (guarded) or \
+             Self::delete_resume_checkpoint (the proven-exempt `_resume/` namespace)",
+            self.root.as_str()
+        );
         let handle = self.handle(prefix)?;
         let manifest_path = self.child(prefix, MANIFEST_NAME)?;
         let manifest = if handle.exists(&manifest_path).await? {

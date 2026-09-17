@@ -3921,8 +3921,8 @@ _R12_SWEEP_FUNCS = {
     "_post_fix_attacks_rejection", "_r12_find_pre_fix_artifact",
     "_r12_required_commands_path", "_r12_required_commands_or_deny",
     "_r12_gates_shape_rejection", "_r12_anticipation_rejection",
-    "_mutations_rejection", "_r12_new_test_surfaces", "_r12_previous_relay_row",
-    "_exclusions_rejection",
+    "_mutations_rejection", "_r12_new_test_surfaces", "_r12_normalize_ts_instant",
+    "_r12_previous_relay_row", "_exclusions_rejection",
 }
 
 

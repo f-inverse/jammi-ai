@@ -2657,20 +2657,77 @@ def _r12_new_test_surfaces(new_surfaces: dict[str, str] | None) -> dict[str, str
     return out
 
 
+def _r12_normalize_ts_instant(ts: object) -> datetime | None:
+    """issue #557 item 3: normalize a `ts` field to ONE well-defined,
+    always-AWARE comparable form before ANY comparison — the shared
+    seam both `_r12_previous_relay_row`'s own `<` compare (below) and
+    `check_rigor_record.py`'s governing-row selection call through (via
+    `_lib_module()`), so a fix here fixes both identically, the same
+    discipline `_r12_gates_shape_rejection`/`_r12_anticipation_rejection`
+    already hold for their own shared checks.
+
+    `None` for: not a non-empty string; a string that does not parse via
+    `datetime.fromisoformat` (a trailing `Z` is rewritten to `+00:00`
+    first, the one substitution `fromisoformat` itself does not accept);
+    and — the case fix round 6's own `_row_instant` got wrong — a value
+    that PARSES but is NAIVE (no UTC offset at all). A naive value is
+    refused as unparseable, exactly like a missing one, rather than fed
+    into a `datetime` comparison against an aware sibling: mixing a naive
+    and an aware `datetime` in the same `<`/`==`/`max()` raises `TypeError:
+    can't compare offset-naive and offset-aware datetimes` — the exact
+    crash an executed audit probe found in the fix-round-6 attempt,
+    aborting the whole run instead of the promised loud AMBIGUOUS FAIL.
+    Every value this function returns (never `None`) is timezone-AWARE,
+    so any comparison a caller builds ONLY from this function's own output
+    can never raise that way — and two rows naming the SAME instant in
+    different text (a trailing `Z` vs an explicit `+00:00` offset) now
+    compare EQUAL, closing the narrower gap the fix-round-7 text-only
+    compare (still used by callers that have not adopted this function)
+    left open.
+    """
+    if not isinstance(ts, str) or not ts:
+        return None
+    text = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
 def _r12_previous_relay_row(sdir: Path, unit_slug: str, row: dict) -> dict | None:
     """item 8c: the unit's own PREVIOUS row of the SAME `agent_type` (an
     earlier `ts`) — used only to compare `exclusions` text across rounds,
-    never to gate anything else. `None` when there is no earlier row."""
+    never to gate anything else. `None` when there is no earlier row.
+
+    issue #557 item 3: ordering is by `_r12_normalize_ts_instant`, never a
+    bare string `<` — a plain text compare orders `...Z` and the identical
+    instant spelled `...+00:00` incorrectly (they are not text-equal, so
+    whichever sorts later wins, regardless of which one is REALLY later).
+    A row whose `ts` fails to normalize (missing, malformed, or naive) is
+    excluded from the candidate pool entirely — it carries no reliable
+    ordering evidence, so it can neither be `cur_ts`'s comparison partner
+    nor win `max()`; this is a narrowing, never a loosening, of the
+    previous behavior (a row that never NORMALIZED could not have safely
+    ordered `<` in the first place).
+    """
     agent_type = row.get("agent_type") or ""
-    cur_ts = row.get("ts") or ""
-    if not agent_type or not cur_ts:
+    cur_instant = _r12_normalize_ts_instant(row.get("ts"))
+    if not agent_type or cur_instant is None:
         return None
     path = sdir / f"{unit_slug}.jsonl"
-    candidates = [r for r in read_rows(path)
-                  if r.get("agent_type") == agent_type and isinstance(r.get("ts"), str) and r["ts"] < cur_ts]
+    candidates: list[tuple[datetime, dict]] = []
+    for r in read_rows(path):
+        if r.get("agent_type") != agent_type:
+            continue
+        r_instant = _r12_normalize_ts_instant(r.get("ts"))
+        if r_instant is not None and r_instant < cur_instant:
+            candidates.append((r_instant, r))
     if not candidates:
         return None
-    return max(candidates, key=lambda r: r["ts"])
+    return max(candidates, key=lambda pair: pair[0])[1]
 
 
 def _exclusions_rejection(new_test_surfaces: dict[str, str], data: dict, unit_slug: str,

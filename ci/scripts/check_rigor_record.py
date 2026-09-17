@@ -713,46 +713,42 @@ def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
     and value only — never re-executed (these are already CI jobs
     elsewhere in `.github/workflows/`).
 
-    Fix round 4 Z2 / fix round 5 Z5: the governing row is selected ORDER-
-    INDEPENDENTLY, never by `rows[-1]` (append position). `cmd_export_
-    anticipation` dumps every `<slug>.anticipation.*.json` artifact still
-    on disk, `sorted(sdir.iterdir())` — i.e. sorted by FILENAME, a tip
-    sha, which is pseudorandom hex and carries no chronological meaning;
-    an older round's artifact can sort AFTER a newer round's and land on
-    the last line of the committed export. Since fix round 5, the SAME
-    exporter stamps `ts` (the artifact FILE's own mtime) and `head_sha`
-    (the artifact's own `pre_fix_sha`) on every row it emits — so
-    `_row_head`/`_row_ts_text` below select the row whose own `head_sha`
-    matches this checkout's actual `HEAD` when one does (the case where
-    the export was captured at the exact commit reader 3 is validating);
-    when none does — the common case, since a pre-fix witness by
-    construction predates the commit it is validated against — every row
-    is eligible. Within whichever pool applies, the row naming the
-    GREATEST `ts` TEXT governs, never the row nearest the end of the
-    file — and when the pool holds >=2 candidate rows and ANY of them
-    lacks a non-empty string `ts`, OR two or more rows share the
-    IDENTICAL `ts` text, this FAILS LOUDLY, naming the tied rows' own
-    line numbers, rather than silently falling back to `rows[0]`/append
-    order. A missing, empty, or non-string `ts` and an identical `ts`
-    text are refused as AMBIGUOUS; ordering among the surviving rows is
-    by `ts` text alone, unvalidated as to shape (filed at
-    https://github.com/f-inverse/jammi-ai/issues/557).
+    The governing row is selected ORDER-INDEPENDENTLY, never by
+    `rows[-1]` (append position). `cmd_export_anticipation` dumps every
+    `<slug>.anticipation.*.json` artifact still on disk,
+    `sorted(sdir.iterdir())` — i.e. sorted by FILENAME, a tip sha, which
+    is pseudorandom hex and carries no chronological meaning; an older
+    round's artifact can sort AFTER a newer round's and land on the last
+    line of the committed export. The exporter stamps `ts` (the artifact
+    FILE's own mtime) and `head_sha` (the artifact's own `pre_fix_sha`) on
+    every row it emits — so `_row_head`/`_row_instant` below select the
+    row whose own `head_sha` matches this checkout's actual `HEAD` when
+    one does (the case where the export was captured at the exact commit
+    reader 3 is validating); when none does — the common case, since a
+    pre-fix witness by construction predates the commit it is validated
+    against — every row is eligible. Within whichever pool applies, the
+    row naming the GREATEST normalized `ts` INSTANT governs, never the
+    row nearest the end of the file — and when the pool holds >=2
+    candidate rows and ANY of them lacks a reliably-orderable `ts`, OR two
+    or more rows normalize to the IDENTICAL instant, this FAILS LOUDLY,
+    naming the tied rows' own line numbers, rather than silently falling
+    back to `rows[0]`/append order.
 
-    Fix round 7 Z19 (narrowing fix round 6 Z17): the tie compare is `ts`
-    TEXT ONLY — never a parsed `datetime` instant. An executed probe
-    found `_row_instant`'s own mixed-awareness pool (one row's `ts` with
-    no UTC offset at all beside another's `...Z`/`...+00:00`) raised
-    `TypeError: can't compare offset-naive and offset-aware datetimes` at
-    `max()` and ABORTED the whole run — never the promised AMBIGUOUS
-    FAIL. Comparing `ts` as TEXT can never raise that way. The
-    instant-aware tie this narrowing gives up (two rows naming the SAME
-    instant in different text, e.g. `...Z` vs `...+00:00`, which a text
-    compare treats as UNEQUAL and lets whichever sorts later silently
-    govern) is filed at https://github.com/f-inverse/jammi-ai/issues/557
-    together with `_r12_previous_relay_row`'s own identical text-ordering
-    limit in `lead-gate-lib.py`.
+    `ts` is normalized to a single well-defined, always-AWARE comparable
+    form via the shared `_r12_normalize_ts_instant` (`lead-gate-lib.py`,
+    the SAME function `_r12_previous_relay_row`'s own ordering compare
+    there uses) BEFORE any comparison, so a mixed pool — one row's `ts`
+    with no UTC offset at all beside another's `...Z`/`...+00:00` — can
+    never raise `TypeError: can't compare offset-naive and
+    offset-aware datetimes`: a naive value normalizes to `None`, the same
+    bucket a missing/malformed `ts` already occupies, refused as
+    unparseable rather than compared. Because the compare is on the
+    normalized INSTANT rather than the raw TEXT, two rows naming the SAME
+    instant in different spellings (a trailing `Z` vs an explicit
+    `+00:00` offset) correctly TIE, rather than a text-only compare's
+    silent, incorrect ordering of the two.
 
-    Fix round 5 Z7: the gates SHAPE/VALUE check itself is the SAME shared
+    The gates SHAPE/VALUE check itself is the SAME shared
     `_r12_gates_shape_rejection` reader 1 and reader 2 call — never a
     second, independently hand-rolled implementation that can drift from
     theirs (this is exactly the bug three earlier readers of this file
@@ -818,53 +814,60 @@ def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
         h = r.get("head_sha")
         return h if isinstance(h, str) and h else None
 
-    def _row_ts_text(r: dict) -> str | None:
-        """fix round 7 Z19 (narrowing fix round 6 Z17): `ts` is compared
-        as TEXT ONLY — no `datetime` parse anywhere on this selection
-        path, so no offset-naive/offset-aware comparison can ever raise.
-        `None` for a missing, empty, or non-string `ts`."""
-        ts = r.get("ts")
-        return ts if isinstance(ts, str) and ts else None
+    mod = _lib_module()
+
+    def _row_instant(r: dict):
+        """issue #557 item 3: `ts` normalized through the SAME shared
+        function `_r12_previous_relay_row`'s own `<` compare in
+        `lead-gate-lib.py` uses (`mod._r12_normalize_ts_instant`) — one
+        fix covers both call sites identically. Always AWARE or `None`;
+        never a naive `datetime`, so `max()`/`==` over this pool can never
+        raise `TypeError: can't compare offset-naive and offset-aware
+        datetimes` (the fix-round-6 crash an executed audit probe found).
+        A naive `ts` is refused as unparseable, folded into the same
+        `None` bucket a missing/malformed one already occupies below —
+        never compared."""
+        return mod._r12_normalize_ts_instant(r.get("ts"))
 
     matching = [(ln, r) for ln, r in rows_with_lineno if head_now and _row_head(r) == head_now]
     pool = matching if matching else rows_with_lineno
 
-    if len(pool) >= 2 and any(_row_ts_text(r) is None for _, r in pool):
+    if len(pool) >= 2 and any(_row_instant(r) is None for _, r in pool):
         pool_lines = ", ".join(str(ln) for ln, _ in pool)
         result.fail(
             f"{path}: {len(pool)} candidate anticipation row(s) (lines {pool_lines}) carry no "
-            "reliable ordering evidence (at least one has no non-empty `ts`) -- the GOVERNING "
-            "row is AMBIGUOUS; re-export with `lead-gate-lib.py --export-anticipation` (which "
-            "stamps `ts`/`head_sha` on every row since fix round 5) and commit the result "
-            "(esc-lead-gate-R12 fix round 5 Z5)"
+            "reliable ordering evidence (at least one has no non-empty, parseable, "
+            "timezone-aware `ts`) -- the GOVERNING row is AMBIGUOUS; re-export with "
+            "`lead-gate-lib.py --export-anticipation` (which stamps `ts`/`head_sha` on every "
+            "row since fix round 5) and commit the result (esc-lead-gate-R12 fix round 5 Z5)"
         )
         return
 
-    # Fix round 6 Z15, narrowed at fix round 7 Z19: an EQUAL greatest
-    # `ts` TEXT across >=2 pool rows used to resolve by append position
-    # (`max()` returns the FIRST maximal element) — an executed probe
-    # found two rows with identical `ts`, the `rc=0` row first, silently
-    # governed and shadowed a genuinely `rc=1` sibling. A tie is exactly
-    # as AMBIGUOUS as a missing `ts`. (The instant-aware tie — the SAME
-    # instant in different text — is filed at
-    # https://github.com/f-inverse/jammi-ai/issues/557; a `datetime`
-    # parse here once crashed `max()` on a mixed naive/aware pool
-    # instead of failing loudly.)
-    max_ts = max(_row_ts_text(r) for _, r in pool)
-    tied = [(ln, r) for ln, r in pool if _row_ts_text(r) == max_ts]
+    # Fix round 8 (closing issue #557 item 3): ties are now on the
+    # NORMALIZED INSTANT, not the `ts` TEXT — two rows naming the SAME
+    # instant in different text (a trailing `Z` vs an explicit `+00:00`
+    # offset) now correctly tie instead of silently ordering by text.
+    # `max()` returning the FIRST maximal element is still why a tie must
+    # be detected explicitly (an executed probe at fix round 6 found two
+    # rows with an identical governing value, the `rc=0` row first,
+    # silently governing and shadowing a genuinely `rc=1` sibling) — a tie
+    # is exactly as AMBIGUOUS as a missing `ts`.
+    max_instant = max(_row_instant(r) for _, r in pool)
+    tied = [(ln, r) for ln, r in pool if _row_instant(r) == max_instant]
     if len(tied) >= 2:
         tied_lines = ", ".join(str(ln) for ln, _ in tied)
+        tied_ts_texts = sorted({r.get("ts") for _, r in tied})
         result.fail(
             f"{path}: {len(tied)} candidate anticipation row(s) (lines {tied_lines}) share the "
-            f"SAME greatest `ts` text ({max_ts!r}) -- the GOVERNING row is AMBIGUOUS on a tie, "
-            "exactly as it is when `ts` is missing entirely; re-export so each round's row "
-            "carries a distinguishing `ts` (esc-lead-gate-R12 fix round 6 Z15, narrowed at fix "
-            "round 7 Z19)"
+            f"SAME greatest `ts` instant ({max_instant.isoformat()!r}, spelled as "
+            f"{tied_ts_texts!r} across the tied rows) -- the GOVERNING row is AMBIGUOUS on a "
+            "tie, exactly as it is when `ts` is missing entirely; re-export so each round's row "
+            "carries a distinguishing `ts` (esc-lead-gate-R12 fix round 6 Z15, instant-aware "
+            "since fix round 8)"
         )
         return
     governing = tied[0][1]
 
-    mod = _lib_module()
     gates_why = mod._r12_gates_shape_rejection(f"{path}: the governing row", governing.get("gates"),
                                                 required_commands, judge_rc=True)
     if gates_why is not None:
@@ -2005,21 +2008,12 @@ def fixture_rr26_foreign_row_in_anticipation_stream_fails_loudly() -> None:
 
 
 def fixture_rr30_tied_ts_governing_row_fails_loudly() -> None:
-    """fix round 6 Z15, narrowed at fix round 7 Z19: TWO candidate rows
-    share the SAME greatest `ts` TEXT — an executed probe found
-    `max(pool, key=_row_ts)` resolves a tie by APPEND POSITION (the FIRST
-    maximal element), so an `rc=0` row listed first silently governed and
-    shadowed a genuinely `rc=1` sibling recorded at the identical `ts`. A
-    tie is exactly as AMBIGUOUS as a missing `ts` and must FAIL the same
-    way, in BOTH orders. (Fix round 6 Z17 once compared `ts` as a parsed
-    `datetime` INSTANT instead of text, to also catch the SAME instant
-    named in different text — but an executed probe found a mixed naive/
-    aware pool crashes `max()` with `TypeError: can't compare offset-naive
-    and offset-aware datetimes`, aborting the run instead of failing
-    loudly; fix round 7 Z19 narrowed the compare back to TEXT and filed
-    the instant-aware case at
-    https://github.com/f-inverse/jammi-ai/issues/557 — this fixture no
-    longer asserts that case.)"""
+    """TWO candidate rows normalize to the SAME greatest `ts` instant —
+    `max(pool, key=_row_instant)` resolves a tie by APPEND POSITION (the
+    FIRST maximal element), so an `rc=0` row listed first would silently
+    govern and shadow a genuinely `rc=1` sibling recorded at the identical
+    instant. A tie is exactly as AMBIGUOUS as a missing `ts` and must FAIL
+    the same way, in BOTH orders."""
     pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
     block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
                              "verdict": "BLOCK", "finding_locations": ["a.py:1"],
@@ -2047,6 +2041,88 @@ def fixture_rr30_tied_ts_governing_row_fails_loudly() -> None:
             r = _run_check_in(work)
             _assert(not r.ok(), "RR30", f"a tied greatest-ts pool ({order_name}) must FAIL loudly")
             _assert(any("AMBIGUOUS" in f and "tie" in f for f in r.failures), "RR30", f"{order_name}: {r.failures}")
+
+
+def fixture_rr32_mixed_naive_aware_ts_pool_fails_loudly_not_a_crash() -> None:
+    """issue #557 item 3: reproduces the EXACT mixed naive/aware pool an
+    executed audit probe found in an earlier normalization attempt — one
+    candidate row's `ts` carries NO UTC offset at all
+    (`2026-01-01T00:03:00`), the other's carries an explicit one
+    (`2026-01-01T00:03:00Z`). Comparing those two as parsed `datetime`
+    objects without normalizing them to one comparable form first raises
+    `TypeError: can't compare offset-naive and offset-aware datetimes`
+    inside `max()`, aborting the whole self-test run rather than the
+    promised loud AMBIGUOUS FAIL. This fixture asserts the LOUD FAIL: it
+    calls `_run_check_in` with NO surrounding `try`/`except` of its own,
+    so a regression that reintroduces the crash surfaces to `self_test()`'s
+    own harness as `FAIL (unexpected exception)` — DISTINCT from a normal
+    `_assert`-driven `FAIL`, and the property this fixture actually pins.
+    The naive `ts` normalizes to `None` (refused as unparseable, the same
+    bucket a missing `ts` already occupies) and is never fed into a
+    `datetime` comparison against its aware sibling at all."""
+    pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+    block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                             "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                             "class_enumeration": ["a.py:1"]})
+    row_naive = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40, "agent_type": "lead-anticipation",
+                 "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+                 "residual_risk": "fixture residual", "ts": "2026-01-01T00:03:00", "head_sha": "0" * 40,
+                 "gates": {"python3 ci/scripts/probe.py": {"rc": 0}}}
+    row_aware = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": "f" * 40, "agent_type": "lead-anticipation",
+                 "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+                 "residual_risk": "fixture residual", "ts": "2026-01-01T00:03:00Z", "head_sha": "f" * 40,
+                 "gates": {"python3 ci/scripts/probe.py": {"rc": 1}}}
+    for order_name, ordered in (("naive-first", [row_naive, row_aware]), ("aware-first", [row_aware, row_naive])):
+        with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+            _origin, work = _pr_repo(Path(td))
+            _commit(work, f"ci: touch a gate script (mixed naive/aware ts, {order_name})", {
+                "ci/scripts/probe.py": "print('x')\n",
+                "ci/lead-gate-required-commands.txt": "python3 ci/scripts/probe.py  # measured ~0.1s\n",
+                "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+                "docs/rigor/feat_rr-fixture.anticipation.jsonl":
+                    "\n".join(json.dumps(r) for r in ordered) + "\n",
+                "docs/README-fixture.md": "line one\n",
+                "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+            })
+            r = _run_check_in(work)  # no try/except -- a crash here is a DIFFERENT self-test failure shape
+            _assert(not r.ok(), "RR32", f"a mixed naive/aware ts pool ({order_name}) must FAIL loudly")
+            _assert(any("AMBIGUOUS" in f for f in r.failures), "RR32", f"{order_name}: {r.failures}")
+
+
+def fixture_rr33_same_instant_different_text_ts_ties() -> None:
+    """issue #557 item 3: two rows name the SAME instant in DIFFERENT
+    text — a trailing `Z` (`2026-01-01T00:03:00Z`) vs the equivalent
+    explicit offset (`2026-01-01T00:03:00+00:00`). A TEXT-only compare
+    treats these as UNEQUAL and lets whichever sorts later silently
+    govern; the normalized-INSTANT compare correctly recognizes them as
+    the SAME instant and ties, exactly like `RR30`'s identical-text case."""
+    pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+    block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                             "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                             "class_enumeration": ["a.py:1"]})
+    row_z = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40, "agent_type": "lead-anticipation",
+             "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+             "residual_risk": "fixture residual", "ts": "2026-01-01T00:03:00Z", "head_sha": "0" * 40,
+             "gates": {"python3 ci/scripts/probe.py": {"rc": 0}}}
+    row_offset = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": "f" * 40, "agent_type": "lead-anticipation",
+                  "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+                  "residual_risk": "fixture residual", "ts": "2026-01-01T00:03:00+00:00", "head_sha": "f" * 40,
+                  "gates": {"python3 ci/scripts/probe.py": {"rc": 1}}}
+    for order_name, ordered in (("z-first", [row_z, row_offset]), ("offset-first", [row_offset, row_z])):
+        with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+            _origin, work = _pr_repo(Path(td))
+            _commit(work, f"ci: touch a gate script (same instant, different text, {order_name})", {
+                "ci/scripts/probe.py": "print('x')\n",
+                "ci/lead-gate-required-commands.txt": "python3 ci/scripts/probe.py  # measured ~0.1s\n",
+                "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+                "docs/rigor/feat_rr-fixture.anticipation.jsonl":
+                    "\n".join(json.dumps(r) for r in ordered) + "\n",
+                "docs/README-fixture.md": "line one\n",
+                "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+            })
+            r = _run_check_in(work)
+            _assert(not r.ok(), "RR33", f"a same-instant/different-text ts pool ({order_name}) must tie and FAIL")
+            _assert(any("AMBIGUOUS" in f and "tie" in f for f in r.failures), "RR33", f"{order_name}: {r.failures}")
 
 
 # ==========================================================================
@@ -2256,6 +2332,8 @@ RR_FIXTURES = [
     ("RR26", fixture_rr26_foreign_row_in_anticipation_stream_fails_loudly),
     ("RR30", fixture_rr30_tied_ts_governing_row_fails_loudly),
     ("RR31", fixture_rr31_no_fail_reporting_entry_shape_duplicate),
+    ("RR32", fixture_rr32_mixed_naive_aware_ts_pool_fails_loudly_not_a_crash),
+    ("RR33", fixture_rr33_same_instant_different_text_ts_ties),
 ]
 
 

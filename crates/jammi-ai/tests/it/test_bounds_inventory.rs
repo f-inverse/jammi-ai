@@ -36,9 +36,16 @@
 //!
 //! A new literal bound anywhere in the four targets is either missing from
 //! [`REVIEWED_SITES`] (the [`every_literal_wall_clock_bound_is_reviewed`]
-//! assertion fails, naming the file:line) or a REMOVED/MOVED site makes a
-//! stale entry fail to match (the same assertion's other arm) — so this
-//! file must be updated in the SAME commit as any new/moved/removed bound.
+//! assertion fails, naming the site) or a REMOVED site makes a stale entry
+//! fail to match (the same assertion's other arm) — so this file must be
+//! updated in the SAME commit as any new/removed bound. A site is keyed by
+//! ITS OWN IDENTITY — `(file, enclosing item, ordinal within that item)`,
+//! the enclosing item found by `syn` — never by a line number: an edit
+//! anywhere above a site (a doc comment, an unrelated helper) moves its
+//! line and must not move the review; the line is carried only for the
+//! failure message. The marker window for classes A/B/C is the enclosing
+//! item's own span (attributes and doc comments included), so a backstop's
+//! justification lives next to the code it justifies.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -105,11 +112,74 @@ const FORMS: &[&str] = &[
     ": Duration = Duration::from_secs(",
 ];
 
-/// One found (file, 1-based line) pair, scanning every [`TARGET_ROOTS`]
-/// file for every [`FORMS`] substring.
-fn scan_universe() -> BTreeSet<(String, u32)> {
+/// One found literal bound: `(file, enclosing item, ordinal within that
+/// item)` with the 1-based line carried for messages, and the enclosing
+/// item's own inclusive line span (the marker window for classes A/B/C).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Hit {
+    file: String,
+    item: String,
+    ordinal: u32,
+    line: u32,
+    span: (u32, u32),
+}
+
+/// Every `fn`/`const`/`static` item in `text` (top-level, in `impl`s, in
+/// nested `mod`s, in trait impls), as `(name, start line, end line)` with
+/// the span covering the item's attributes and doc comments -- `syn` over
+/// the real AST, never a text scan for `fn `.
+fn item_regions(file: &str, text: &str) -> Vec<(String, u32, u32)> {
+    struct V(Vec<(String, u32, u32)>);
+    fn span_of<T: syn::spanned::Spanned>(node: &T) -> (u32, u32) {
+        let s = node.span();
+        (s.start().line as u32, s.end().line as u32)
+    }
+    impl<'ast> syn::visit::Visit<'ast> for V {
+        fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
+            let (a, b) = span_of(i);
+            self.0.push((i.sig.ident.to_string(), a, b));
+            syn::visit::visit_item_fn(self, i);
+        }
+        fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
+            let (a, b) = span_of(i);
+            self.0.push((i.sig.ident.to_string(), a, b));
+            syn::visit::visit_impl_item_fn(self, i);
+        }
+        fn visit_item_const(&mut self, i: &'ast syn::ItemConst) {
+            let (a, b) = span_of(i);
+            self.0.push((i.ident.to_string(), a, b));
+            syn::visit::visit_item_const(self, i);
+        }
+        fn visit_item_static(&mut self, i: &'ast syn::ItemStatic) {
+            let (a, b) = span_of(i);
+            self.0.push((i.ident.to_string(), a, b));
+            syn::visit::visit_item_static(self, i);
+        }
+    }
+    let parsed = syn::parse_file(text)
+        .unwrap_or_else(|e| panic!("{file}: syn could not parse this source ({e})"));
+    let mut v = V(Vec::new());
+    syn::visit::Visit::visit_file(&mut v, &parsed);
+    v.0
+}
+
+/// The innermost item whose span contains `line` (smallest span wins), or
+/// `<module-scope>` when no item contains it.
+fn enclosing_item(regions: &[(String, u32, u32)], line: u32) -> (String, (u32, u32)) {
+    regions
+        .iter()
+        .filter(|(_, a, b)| *a <= line && line <= *b)
+        .min_by_key(|(_, a, b)| b - a)
+        .map(|(n, a, b)| (n.clone(), (*a, *b)))
+        .unwrap_or_else(|| ("<module-scope>".to_string(), (line, line)))
+}
+
+/// Every literal bound in every [`TARGET_ROOTS`] file, scanning each tracked
+/// line for every [`FORMS`] substring and attributing each hit to its
+/// enclosing item; ordinals count hits within one item in source order.
+fn scan_universe() -> Vec<Hit> {
     let root = repo_root();
-    let mut found = BTreeSet::new();
+    let mut found = Vec::new();
     for target in TARGET_ROOTS {
         let files = tracked_rs_files(&root, target);
         assert!(
@@ -120,13 +190,27 @@ fn scan_universe() -> BTreeSet<(String, u32)> {
         for rel in files {
             let text = std::fs::read_to_string(root.join(&rel))
                 .unwrap_or_else(|e| panic!("{rel} is git-tracked but could not be read ({e})"));
-            for (idx, line) in text.lines().enumerate() {
-                if FORMS.iter().any(|form| line.contains(form)) {
-                    found.insert((rel.clone(), (idx + 1) as u32));
+            let regions = item_regions(&rel, &text);
+            let mut per_item: std::collections::BTreeMap<String, u32> =
+                std::collections::BTreeMap::new();
+            for (idx, line_text) in text.lines().enumerate() {
+                if FORMS.iter().any(|form| line_text.contains(form)) {
+                    let line = (idx + 1) as u32;
+                    let (item, span) = enclosing_item(&regions, line);
+                    let ordinal = per_item.entry(item.clone()).or_insert(0);
+                    *ordinal += 1;
+                    found.push(Hit {
+                        file: rel.clone(),
+                        item,
+                        ordinal: *ordinal,
+                        line,
+                        span,
+                    });
                 }
             }
         }
     }
+    found.sort();
     found
 }
 
@@ -142,15 +226,16 @@ enum Class {
     D,
 }
 
-/// One reviewed site. `window` is the INCLUSIVE 1-based line range (within
-/// the same file) this entry's `marker` must be found in (concatenated,
-/// newline-joined) for classes A/B/C; ignored (kept `(line, line)`) for
-/// class D, which is checked only for a non-empty `reason`.
+/// One reviewed site, keyed by identity: the file, the enclosing `fn`/
+/// `const`/`static` item (`<module-scope>` if none) and the ordinal of this
+/// bound within that item in source order. For classes A/B/C the `marker`
+/// must appear inside the enclosing item's span (doc comments included);
+/// class D is checked only for a non-empty `reason`.
 struct Site {
     file: &'static str,
-    line: u32,
+    item: &'static str,
+    ordinal: u32,
     class: Class,
-    window: (u32, u32),
     marker: &'static str,
     reason: &'static str,
 }
@@ -161,72 +246,79 @@ const WEDGED: &str = "wedged or starved machine";
 /// B3 table for the prose version of this same list.
 const REVIEWED_SITES: &[Site] = &[
     // ---- timeout(Duration::from_secs( ------------------------------------
-    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", line: 2648, class: Class::C, window: (2644, 2654), marker: WEDGED, reason: "" },
-    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", line: 2901, class: Class::C, window: (2901, 2903), marker: WEDGED, reason: "" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", line: 190, class: Class::D, window: (190, 190), marker: "", reason: "a queued INFERENCE job's cancel-then-claim dispatch (never_dispatched_infer); no training compute involved" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", line: 501, class: Class::A, window: (501, 501), marker: "cancel_observed", reason: "" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", line: 511, class: Class::A, window: (511, 518), marker: "poll cadence", reason: "" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", line: 649, class: Class::A, window: (636, 652), marker: "arm_pause_before_spawn_blocking", reason: "" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", line: 855, class: Class::B, window: (855, 855), marker: "heartbeat_secs", reason: "" },
-    Site { file: "crates/jammi-ai/tests/it/scheduling.rs", line: 98, class: Class::D, window: (98, 98), marker: "", reason: "GPU memory scheduler admission queueing, not training compute" },
-    Site { file: "crates/jammi-ai/tests/it/scheduling.rs", line: 264, class: Class::D, window: (264, 264), marker: "", reason: "GPU memory scheduler admission queueing, not training compute" },
-    Site { file: "crates/jammi-ai/tests/it/training_set_stream.rs", line: 305, class: Class::D, window: (305, 305), marker: "", reason: "a prefetch/streaming deadlock backstop over data loading, not training compute progress" },
-    Site { file: "crates/jammi-ai/tests/it/training_set_stream.rs", line: 790, class: Class::D, window: (790, 790), marker: "", reason: "a prefetch/streaming deadlock backstop over data loading, not training compute progress" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 259, class: Class::C, window: (259, 261), marker: WEDGED, reason: "" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 290, class: Class::D, window: (290, 290), marker: "", reason: "an IDLE worker's DRAIN (no job in flight), not training progress" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 391, class: Class::D, window: (391, 391), marker: "", reason: "session.close() shutdown, not training progress" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 427, class: Class::A, window: (415, 429), marker: "bundle_landed", reason: "" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 440, class: Class::B, window: (440, 443), marker: "heartbeats", reason: "" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 542, class: Class::D, window: (542, 542), marker: "", reason: "a compute/materialization RELEASE, not training compute" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 656, class: Class::D, window: (656, 656), marker: "", reason: "claim->hold prologue RELEASE mechanics, gated by this file's own loop_test_hooks parks" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 749, class: Class::D, window: (749, 749), marker: "", reason: "claim->hold prologue RELEASE mechanics, gated by this file's own loop_test_hooks parks" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 845, class: Class::D, window: (845, 845), marker: "", reason: "release_job_leases's own doc/message: it does not wait on any loop at all" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 1260, class: Class::D, window: (1260, 1260), marker: "", reason: "parked-iteration RELEASE mechanics, gated by this file's own loop_test_hooks parks" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 1474, class: Class::B, window: (1474, 1477), marker: "heartbeats", reason: "" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 1656, class: Class::D, window: (1656, 1656), marker: "", reason: "a RELEASE-vs-DRAIN handle-race over a compute materialization, not training compute" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 1751, class: Class::D, window: (1751, 1751), marker: "", reason: "a schema-fault RELEASE test on fine_tune(1) (near-instant), not a training-progress wait" },
-    Site { file: "crates/jammi-ai/tests/it/cache_staleness.rs", line: 781, class: Class::D, window: (781, 781), marker: "", reason: "a GPU-budget cache reload wait, not training" },
+    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", item: "cancelled_run_reclaims_epoch_checkpoints_that_actually_existed", ordinal: 2, class: Class::C, marker: WEDGED, reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", item: "finalize_reclaims_a_persistently_failed_prune_and_warns", ordinal: 2, class: Class::C, marker: WEDGED, reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", item: "a_cancel_requested_while_queued_is_honoured_right_after_the_claim", ordinal: 1, class: Class::D, marker: "", reason: "a queued INFERENCE job's cancel-then-claim dispatch (never_dispatched_infer); no training compute involved" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", item: "a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_boundary", ordinal: 1, class: Class::A, marker: "cancel_observed", reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", item: "a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_boundary", ordinal: 2, class: Class::A, marker: "poll cadence", reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", item: "a_dropped_run_claimed_jobs_future_leaves_no_leaked_cancel_watcher_or_catalog_handle", ordinal: 1, class: Class::A, marker: "arm_pause_before_spawn_blocking", reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", item: "a_lease_loss_on_the_owning_worker_lands_the_lease_lost_outcome_never_the_cancel_message", ordinal: 1, class: Class::B, marker: "heartbeat_secs", reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/scheduling.rs", item: "blocking_acquire_and_panic_safety", ordinal: 1, class: Class::D, marker: "", reason: "GPU memory scheduler admission queueing, not training compute" },
+    Site { file: "crates/jammi-ai/tests/it/scheduling.rs", item: "concurrent_acquire_stress_and_liveness", ordinal: 1, class: Class::D, marker: "", reason: "GPU memory scheduler admission queueing, not training compute" },
+    Site { file: "crates/jammi-ai/tests/it/training_set_stream.rs", item: "p4_liveness_over_every_held_chunk_at_every_accepted_prefetch", ordinal: 1, class: Class::D, marker: "", reason: "a prefetch/streaming deadlock backstop over data loading, not training compute progress" },
+    Site { file: "crates/jammi-ai/tests/it/training_set_stream.rs", item: "p3_streamed_read_completes_under_a_small_pool_while_eager_fails", ordinal: 1, class: Class::D, marker: "", reason: "a prefetch/streaming deadlock backstop over data loading, not training compute progress" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "stop_and_join_lets_the_epoch_bundle_land", ordinal: 1, class: Class::C, marker: WEDGED, reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "stop_and_join_returns_within_idle_poll_when_idle", ordinal: 1, class: Class::D, marker: "", reason: "an IDLE worker's DRAIN (no job in flight), not training progress" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "dropping_the_guard_after_a_cancelled_stop_and_join_aborts_the_task", ordinal: 3, class: Class::D, marker: "", reason: "session.close() shutdown, not training progress" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "release_and_stop_leaves_running_with_null_lease_and_no_new_bundle", ordinal: 1, class: Class::A, marker: "bundle_landed", reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "release_and_stop_leaves_running_with_null_lease_and_no_new_bundle", ordinal: 2, class: Class::B, marker: "heartbeats", reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "release_mid_materialization_resumes_on_the_successor_without_backoff", ordinal: 1, class: Class::D, marker: "", reason: "a compute/materialization RELEASE, not training compute" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "release_with_the_loop_paused_inside_claim_next_does_not_abort", ordinal: 1, class: Class::D, marker: "", reason: "claim->hold prologue RELEASE mechanics, gated by this file's own loop_test_hooks parks" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "release_with_the_loop_paused_in_the_claim_to_hold_prologue_self_releases", ordinal: 1, class: Class::D, marker: "", reason: "claim->hold prologue RELEASE mechanics, gated by this file's own loop_test_hooks parks" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "release_job_leases_reaches_a_live_foreign_loops_prologue_and_self_releases", ordinal: 1, class: Class::D, marker: "", reason: "release_job_leases's own doc/message: it does not wait on any loop at all" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "release_landing_during_the_reclaim_window_is_caught_by_the_second_gate_read", ordinal: 1, class: Class::D, marker: "", reason: "parked-iteration RELEASE mechanics, gated by this file's own loop_test_hooks parks" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "release_and_stop_report_matches_release_job_leases_on_the_pair_that_actually_differs", ordinal: 1, class: Class::B, marker: "heartbeats", reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "a_release_racing_an_in_flight_drain_reads_stop_unwitnessed", ordinal: 1, class: Class::D, marker: "", reason: "a RELEASE-vs-DRAIN handle-race over a compute materialization, not training compute" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "release_and_stops_second_sweep_reports_jobs_none_building_some_from_a_real_fault", ordinal: 1, class: Class::D, marker: "", reason: "a schema-fault RELEASE test on fine_tune(1) (near-instant), not a training-progress wait" },
+    Site { file: "crates/jammi-ai/tests/it/cache_staleness.rs", item: "stale_reload_while_guard_live_waits_for_release_under_a_realistic_budget", ordinal: 1, class: Class::D, marker: "", reason: "a GPU-budget cache reload wait, not training" },
     // ---- sleep(Duration::from_secs( ---------------------------------------
-    Site { file: "crates/jammi-ai/tests/it/instance_identity.rs", line: 473, class: Class::D, window: (473, 473), marker: "", reason: "worker-registry (list_workers) timing, not training compute" },
-    Site { file: "crates/jammi-ai/tests/it/instance_identity.rs", line: 515, class: Class::D, window: (515, 515), marker: "", reason: "worker-registry (list_workers) timing, not training compute" },
-    Site { file: "crates/jammi-ai/tests/it/instance_identity.rs", line: 564, class: Class::D, window: (564, 564), marker: "", reason: "worker-registry (list_workers) timing, not training compute" },
-    Site { file: "crates/jammi-ai/tests/it/instance_identity.rs", line: 606, class: Class::D, window: (606, 606), marker: "", reason: "worker-registry (list_workers) timing, not training compute" },
-    Site { file: "crates/jammi-ai/tests/it/peer_gang.rs", line: 381, class: Class::D, window: (381, 381), marker: "", reason: "a peer wire round-trip silence simulation, not training compute" },
-    Site { file: "crates/jammi-ai/tests/distributed/gang_chaos.rs", line: 149, class: Class::D, window: (149, 149), marker: "", reason: "a fault-injection delay before kill9, not an assertion bound -- the pass/fail wait is harness::await_job's TERMINAL_TIMEOUT, reviewed separately" },
-    Site { file: "crates/jammi-ai/tests/distributed/gang_chaos.rs", line: 193, class: Class::D, window: (193, 193), marker: "", reason: "a fault-injection delay before kill9, not an assertion bound -- the pass/fail wait is harness::await_job's TERMINAL_TIMEOUT, reviewed separately" },
+    Site { file: "crates/jammi-ai/tests/it/instance_identity.rs", item: "a_failed_first_upsert_worker_leaves_the_cell_none_so_the_keeper_writes_no_workers_row", ordinal: 1, class: Class::D, marker: "", reason: "worker-registry (list_workers) timing, not training compute" },
+    Site { file: "crates/jammi-ai/tests/it/instance_identity.rs", item: "a_failed_first_upsert_worker_leaves_the_cell_none_so_the_keeper_writes_no_workers_row", ordinal: 2, class: Class::D, marker: "", reason: "worker-registry (list_workers) timing, not training compute" },
+    Site { file: "crates/jammi-ai/tests/it/instance_identity.rs", item: "a_gang_member_survives_a_forced_instance_delete_after_one_keeper_pass", ordinal: 1, class: Class::D, marker: "", reason: "worker-registry (list_workers) timing, not training compute" },
+    Site { file: "crates/jammi-ai/tests/it/instance_identity.rs", item: "a_drained_worker_is_not_resurrected_as_a_member_after_a_forced_delete", ordinal: 1, class: Class::D, marker: "", reason: "worker-registry (list_workers) timing, not training compute" },
+    Site { file: "crates/jammi-ai/tests/it/peer_gang.rs", item: "a_silent_member_over_the_wire_expires_the_coordinators_wait_at_the_deadline_naming_the_round", ordinal: 1, class: Class::D, marker: "", reason: "a peer wire round-trip silence simulation, not training compute" },
+    Site { file: "crates/jammi-ai/tests/distributed/gang_chaos.rs", item: "killed_peer_job_is_reclaimed_and_completed_by_a_new_gang", ordinal: 1, class: Class::D, marker: "", reason: "a fault-injection delay before kill9, not an assertion bound -- the pass/fail wait is harness::await_job's TERMINAL_TIMEOUT, reviewed separately" },
+    Site { file: "crates/jammi-ai/tests/distributed/gang_chaos.rs", item: "killed_coordinator_job_is_reclaimed_and_completed_by_a_new_gang", ordinal: 1, class: Class::D, marker: "", reason: "a fault-injection delay before kill9, not an assertion bound -- the pass/fail wait is harness::await_job's TERMINAL_TIMEOUT, reviewed separately" },
     // ---- Instant::now() + Duration::from_secs( (the deadline-loop form) --
-    Site { file: "crates/jammi-ai/tests/it/host_admission.rs", line: 95, class: Class::D, window: (95, 95), marker: "", reason: "host admission/slot holder state, not training compute" },
-    Site { file: "crates/jammi-ai/tests/it/host_admission.rs", line: 345, class: Class::D, window: (345, 345), marker: "", reason: "claim-loop idle-poll count, not training compute" },
-    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", line: 2573, class: Class::C, window: (2573, 2581), marker: WEDGED, reason: "" },
-    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", line: 2866, class: Class::C, window: (2866, 2873), marker: WEDGED, reason: "" },
-    Site { file: "crates/jammi-ai/tests/it/instance_identity.rs", line: 38, class: Class::D, window: (38, 38), marker: "", reason: "catalog worker-listing poll, not training compute" },
-    Site { file: "crates/jammi-ai/tests/it/instance_identity.rs", line: 286, class: Class::D, window: (286, 286), marker: "", reason: "catalog worker-listing poll, not training compute" },
-    Site { file: "crates/jammi-ai/tests/it/instance_identity.rs", line: 382, class: Class::D, window: (382, 382), marker: "", reason: "catalog worker-listing poll, not training compute" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", line: 676, class: Class::D, window: (676, 676), marker: "", reason: "watcher-task cleanup after an abort, not training progress" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", line: 693, class: Class::D, window: (693, 693), marker: "", reason: "catalog handle refcount cleanup after an abort, not training progress" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 178, class: Class::D, window: (178, 178), marker: "", reason: "the claim->hold admission transition (in_flight), not training compute; every call site awaits want=1, near-instant" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 347, class: Class::B, window: (347, 347), marker: "FAST_TIMING.heartbeat", reason: "" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 373, class: Class::B, window: (373, 373), marker: "FAST_TIMING.heartbeat", reason: "" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 477, class: Class::B, window: (477, 477), marker: "FAST_TIMING.heartbeat", reason: "" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 902, class: Class::D, window: (902, 902), marker: "", reason: "a workers-row upsert-on-spawn poll, not training compute" },
-    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", line: 1694, class: Class::D, window: (1694, 1694), marker: "", reason: "a lease-keeper thread death poll, not training compute" },
+    Site { file: "crates/jammi-ai/tests/it/host_admission.rs", item: "wait_holder", ordinal: 1, class: Class::D, marker: "", reason: "host admission/slot holder state, not training compute" },
+    Site { file: "crates/jammi-ai/tests/it/host_admission.rs", item: "an_idle_loop_never_claims_while_a_rank_is_held", ordinal: 1, class: Class::D, marker: "", reason: "claim-loop idle-poll count, not training compute" },
+    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", item: "cancelled_run_reclaims_epoch_checkpoints_that_actually_existed", ordinal: 1, class: Class::C, marker: WEDGED, reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", item: "finalize_reclaims_a_persistently_failed_prune_and_warns", ordinal: 1, class: Class::C, marker: WEDGED, reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/instance_identity.rs", item: "await_workers", ordinal: 1, class: Class::D, marker: "", reason: "catalog worker-listing poll, not training compute" },
+    Site { file: "crates/jammi-ai/tests/it/instance_identity.rs", item: "wait_until_gang_member", ordinal: 1, class: Class::D, marker: "", reason: "catalog worker-listing poll, not training compute" },
+    Site { file: "crates/jammi-ai/tests/it/instance_identity.rs", item: "peer_advertise_without_peer_bind_fails_open_naming_both_keys", ordinal: 1, class: Class::D, marker: "", reason: "catalog worker-listing poll, not training compute" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", item: "a_dropped_run_claimed_jobs_future_leaves_no_leaked_cancel_watcher_or_catalog_handle", ordinal: 2, class: Class::D, marker: "", reason: "watcher-task cleanup after an abort, not training progress" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_cancel.rs", item: "a_dropped_run_claimed_jobs_future_leaves_no_leaked_cancel_watcher_or_catalog_handle", ordinal: 3, class: Class::D, marker: "", reason: "catalog handle refcount cleanup after an abort, not training progress" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "wait_in_flight", ordinal: 1, class: Class::D, marker: "", reason: "the claim->hold admission transition (in_flight), not training compute; every call site awaits want=1, near-instant" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "dropping_the_guard_after_a_cancelled_stop_and_join_aborts_the_task", ordinal: 1, class: Class::B, marker: "FAST_TIMING.heartbeat", reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "dropping_the_guard_after_a_cancelled_stop_and_join_aborts_the_task", ordinal: 2, class: Class::B, marker: "FAST_TIMING.heartbeat", reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "release_and_stop_leaves_running_with_null_lease_and_no_new_bundle", ordinal: 3, class: Class::B, marker: "FAST_TIMING.heartbeat", reason: "" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "a_second_spawn_on_the_same_session_is_refused_structurally", ordinal: 1, class: Class::D, marker: "", reason: "a workers-row upsert-on-spawn poll, not training compute" },
+    Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "release_job_leases_is_unobserved_when_the_keeper_thread_is_dead", ordinal: 1, class: Class::D, marker: "", reason: "a lease-keeper thread death poll, not training compute" },
     // ---- named const `: Duration = Duration::from_secs(` -------------------
-    Site { file: "crates/jammi-ai/tests/distributed/harness.rs", line: 531, class: Class::C, window: (531, 596), marker: WEDGED, reason: "" },
+    Site { file: "crates/jammi-ai/tests/distributed/harness.rs", item: "TERMINAL_TIMEOUT", ordinal: 1, class: Class::C, marker: WEDGED, reason: "" },
 ];
 
-fn site_text(root: &Path, site: &Site) -> String {
-    let full = std::fs::read_to_string(root.join(site.file))
-        .unwrap_or_else(|e| panic!("{}: {e}", site.file));
+fn span_text(root: &Path, file: &str, span: (u32, u32)) -> String {
+    let full = std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
     let lines: Vec<&str> = full.lines().collect();
-    let (start, end) = site.window;
-    let start = (start as usize).saturating_sub(1);
-    let end = (end as usize).min(lines.len());
+    let start = (span.0 as usize).saturating_sub(1);
+    let end = (span.1 as usize).min(lines.len());
     lines[start..end].join("\n")
+}
+
+fn key(file: &str, item: &str, ordinal: u32) -> (String, String, u32) {
+    (file.to_string(), item.to_string(), ordinal)
 }
 
 #[test]
 fn every_literal_wall_clock_bound_is_reviewed() {
     let scanned = scan_universe();
+    if std::env::var_os("JAMMI_TEST_BOUNDS_PRINT").is_some() {
+        for h in &scanned {
+            eprintln!("HIT\t{}\t{}\t{}\t{}", h.file, h.item, h.ordinal, h.line);
+        }
+    }
     assert!(
         scanned.len() >= 30,
         "the scan found only {} sites across {TARGET_ROOTS:?} -- expected at least 30; a git \
@@ -234,66 +326,120 @@ fn every_literal_wall_clock_bound_is_reviewed() {
          universe is a hard failure rather than a silent pass",
         scanned.len()
     );
-
-    let reviewed: BTreeSet<(String, u32)> = REVIEWED_SITES
+    let scanned_keys: BTreeSet<(String, String, u32)> = scanned
         .iter()
-        .map(|s| (s.file.to_string(), s.line))
+        .map(|h| key(&h.file, &h.item, h.ordinal))
+        .collect();
+    assert_eq!(
+        scanned_keys.len(),
+        scanned.len(),
+        "two hits share one (file, item, ordinal) key"
+    );
+
+    let reviewed: BTreeSet<(String, String, u32)> = REVIEWED_SITES
+        .iter()
+        .map(|s| key(s.file, s.item, s.ordinal))
         .collect();
     assert_eq!(
         reviewed.len(),
         REVIEWED_SITES.len(),
-        "REVIEWED_SITES has a duplicate (file, line) entry"
+        "REVIEWED_SITES has a duplicate (file, item, ordinal) entry"
     );
 
-    let missing: Vec<&(String, u32)> = scanned.difference(&reviewed).collect();
+    let missing: Vec<String> = scanned
+        .iter()
+        .filter(|h| !reviewed.contains(&key(&h.file, &h.item, h.ordinal)))
+        .map(|h| format!("{}::{} #{} (line {})", h.file, h.item, h.ordinal, h.line))
+        .collect();
     assert!(
         missing.is_empty(),
         "new, UNREVIEWED literal wall-clock bound(s) (add each to REVIEWED_SITES with its \
          class): {missing:?}"
     );
 
-    let stale: Vec<&(String, u32)> = reviewed.difference(&scanned).collect();
+    let stale: Vec<&(String, String, u32)> = reviewed.difference(&scanned_keys).collect();
     assert!(
         stale.is_empty(),
-        "REVIEWED_SITES entries no longer found at their recorded line (moved, edited, or \
-         removed -- re-locate and update the entry): {stale:?}"
+        "REVIEWED_SITES entries no longer found (the bound was removed, or its enclosing item \
+         was renamed or split -- re-locate and update the entry): {stale:?}"
     );
 }
 
 #[test]
 fn every_class_a_b_c_site_carries_its_class_marker() {
     let root = repo_root();
+    let scanned = scan_universe();
     for site in REVIEWED_SITES {
+        let hit = scanned
+            .iter()
+            .find(|h| key(&h.file, &h.item, h.ordinal) == key(site.file, site.item, site.ordinal));
         match site.class {
             Class::A | Class::B | Class::C => {
                 assert!(
                     !site.marker.is_empty(),
-                    "{}:{} is class {:?} but carries no marker to check",
+                    "{}::{} #{} is class {:?} but carries no marker to check",
                     site.file,
-                    site.line,
+                    site.item,
+                    site.ordinal,
                     site.class
                 );
-                let text = site_text(&root, site);
+                let Some(hit) = hit else {
+                    // The other test names the stale entry; nothing to check here.
+                    continue;
+                };
+                let text = span_text(&root, &hit.file, hit.span);
                 assert!(
                     text.contains(site.marker),
-                    "{}:{} is reviewed as class {:?} but its window ({}..={}) does not contain \
-                     the required marker {:?}:\n{text}",
+                    "{}::{} #{} (line {}) is reviewed as class {:?} but its enclosing item's span \
+                     ({}..={}) does not contain the required marker {:?}:\n{text}",
                     site.file,
-                    site.line,
+                    site.item,
+                    site.ordinal,
+                    hit.line,
                     site.class,
-                    site.window.0,
-                    site.window.1,
+                    hit.span.0,
+                    hit.span.1,
                     site.marker
                 );
             }
             Class::D => {
                 assert!(
                     !site.reason.is_empty(),
-                    "{}:{} is class D (not a training-progress wait) but carries no reason",
+                    "{}::{} #{} is class D (not a training-progress wait) but carries no reason",
                     site.file,
-                    site.line
+                    site.item,
+                    site.ordinal
                 );
             }
         }
     }
+}
+
+/// The review key survives an edit ABOVE the site and does not survive the
+/// site moving to a different item: the same source with two blank lines
+/// prepended yields identical keys; a bound inside a different fn is a
+/// different key.
+#[test]
+fn review_key_is_line_independent_and_item_sensitive() {
+    // kernel-oracles: fn-in-literal reviewed: synthetic source fed to `item_regions` to pin the review key's shape, not real code in this file
+    let src = "fn a() { let _ = timeout(Duration::from_secs(5)); }\nfn b() { let _ = timeout(Duration::from_secs(5)); }\n";
+    let regions = item_regions("<synthetic>", src);
+    let shifted = format!("\n\n{src}");
+    let regions2 = item_regions("<synthetic>", &shifted);
+    assert_eq!(enclosing_item(&regions, 1).0, "a");
+    assert_eq!(
+        enclosing_item(&regions2, 3).0,
+        "a",
+        "an edit above the site must not change its key"
+    );
+    assert_eq!(
+        enclosing_item(&regions, 2).0,
+        "b",
+        "a bound in another fn is another key"
+    );
+    assert_ne!(
+        enclosing_item(&regions, 1).1,
+        enclosing_item(&regions2, 3).1,
+        "the span still moves"
+    );
 }

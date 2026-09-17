@@ -528,6 +528,10 @@ fn jammi_server_binary() -> PathBuf {
 /// CPU LoRA fine-tune, publish to MinIO, and finalize — all under a 3 s lease
 /// with reclaim on a crash. 120 s comfortably covers a cold CI runner while
 /// still failing fast on a genuinely stuck fleet.
+/// The bound is a generous backstop against a wedged or starved machine,
+/// never the pace of the work: every wait on it is gated by the row's own
+/// observed state ([`await_job`] fails the instant a terminal row rejects
+/// `want`).
 pub const TERMINAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Tight poll interval for [`await_job`] — 250 ms keeps the harness responsive

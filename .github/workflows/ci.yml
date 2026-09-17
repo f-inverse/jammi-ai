@@ -2829,6 +2829,15 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 ci/scripts/perf/test_finetune_ab_disable_op_keys.py
 
+      # The rigor-record self-test's two index-backed fixtures (RR42 phantom
+      # site, RR43 real-call resolution) need `ci/tools/symbol-index` built;
+      # the toolchain-free swarm lane runs the same self-test and takes its
+      # named toolchain-less arm there, so THIS job is where those two arms
+      # are exercised.
+      - name: Assert the rigor-record self-test's index-backed fixtures fire with the toolchain
+        if: ${{ !cancelled() }}
+        run: python3 ci/scripts/check_rigor_record.py --self-test
+
   ci-summary:
     needs:
       - check

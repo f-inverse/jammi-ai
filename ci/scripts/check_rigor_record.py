@@ -3245,6 +3245,14 @@ def fixture_rr41_mutation_site_resolves_to_real_def_satisfies() -> None:
                 f"a mutations site naming a real new definition must resolve, got: {r.failures}")
 
 
+def _symbol_index_unavailable(r) -> bool:
+    """Whether this run's own reader could not build `ci/tools/symbol-index`
+    (no toolchain, or cargo without the mandatory sccache wrapper) and said
+    so by name — the advisory arm RR44 pins. A fixture whose assertion needs
+    the index reads this rather than guessing at the environment."""
+    return any("could not build the symbol-index required call-site set" in w for w in r.warnings)
+
+
 def fixture_rr42_phantom_mutation_site_fails() -> None:
     """issue #557 item 2: `mutations[0].site` names `src/lib.rs:999` --
     the real committed file has only 3 lines. Must FAIL by name as a
@@ -3255,6 +3263,16 @@ def fixture_rr42_phantom_mutation_site_fails() -> None:
         _rr_call_site_setup(work, rust, mutations_site="src/lib.rs:999")
         r = _run_check_in(work)
         _assert(not r.ok(), "RR42", "a mutations site naming a non-existent line must FAIL")
+        if _symbol_index_unavailable(r):
+            # The lane running this self-test cannot build `ci/tools/symbol-index`
+            # (the toolchain-free swarm lane: cargo present, the mandatory sccache
+            # wrapper absent). The phantom-site arm is then unreachable BY
+            # DESIGN and the check must have said so by name (RR44's own arm);
+            # the phantom arm itself is exercised by this same self-test in
+            # ci.yml's container-backed `symbol-index-gates` job.
+            print("check-rigor-record[RR42]: toolchain-less lane -- phantom-site arm exercised in symbol-index-gates",
+                  file=sys.stderr)
+            return
         _assert(any("phantom site" in f and "src/lib.rs:999" in f for f in r.failures),
                 "RR42", f"{r.failures}")
 
@@ -3271,6 +3289,10 @@ def fixture_rr43_mutation_site_resolves_to_real_call_satisfies() -> None:
         rust = "pub fn compute_new() -> i32 {\n    helper()\n}\n\npub fn helper() -> i32 {\n    1\n}\n"
         _rr_call_site_setup(work, rust, mutations_site="src/lib.rs:2")
         r = _run_check_in(work)
+        if _symbol_index_unavailable(r):
+            print("check-rigor-record[RR43]: toolchain-less lane -- resolution arm exercised in symbol-index-gates",
+                  file=sys.stderr)
+            return
         joined = " | ".join(r.failures)
         _assert("phantom site" not in joined, "RR43",
                 f"a mutations site naming a real call expression must resolve, got: {r.failures}")

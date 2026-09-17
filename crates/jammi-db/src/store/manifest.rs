@@ -256,34 +256,53 @@ pub struct MaterializationEnv {
     /// PRE-TRAINING value covering EVERY `jammi_kernels::admission::PROBED_OPS`
     /// row of kind `TwoArm`/`Cascade` — `jammi-ai`'s
     /// `fine_tune::worker::dry_run_admission_profile`'s own doc has the
-    /// per-op derivation, each arm citing the real predicate function it is
-    /// read from (`fine_tune::worker::dry_run_verdict`), never a fresh
-    /// re-derivation. This closes the issue's own named defect (two CUDA
-    /// builds differing only in `--features flash-attn` no longer hash
-    /// identically) AND folds a per-op admission decision for every OTHER
-    /// row — `layer_norm`, `rope`, `softmax`, `geglu`, `gelu_erf`,
-    /// `attention_block`, `lora_linear_fused`'s two report keys,
-    /// `cast_scale`, `cast_add`, `adamw_step`, `mem_efficient_attention` —
-    /// rather than leaving them entirely unconsulted.
+    /// per-op derivation, each row's verdict coming from
+    /// `jammi_kernels::admission::dry_run_all`, which runs each
+    /// `jammi_kernels::admission::ProbedOp::dry_run` fn — the real
+    /// predicate function each arm cites — never a fresh re-derivation.
+    /// This closes the issue's own named defect (two CUDA builds differing
+    /// only in `--features flash-attn` no longer hash identically), folds
+    /// a per-op admission decision for every OTHER row — `layer_norm`,
+    /// `rope`, `softmax`, `geglu`, `gelu_erf`, `attention_block`,
+    /// `lora_linear_fused`'s two report keys, `cast_scale`, `cast_add`,
+    /// `adamw_step`, `mem_efficient_attention` — rather than leaving them
+    /// entirely unconsulted, AND (wave-5 third adversarial audit) covers
+    /// `JAMMI_KERNELS_DISABLE`: `jammi_kernels::admission::admit`/
+    /// `admit_cascade` both honor that env var over every predicate, in
+    /// every build, so `dry_run_all` checks each row's own registry
+    /// key(s) against `jammi_kernels::admission::DryRunCtx::disabled_registry_keys`
+    /// (populated ONCE, hermetically, from
+    /// `jammi_kernels::admission::disabled_ops_requested()` at the ctx's
+    /// own construction site in `fine_tune::worker::train_fine_tune`) and
+    /// declines a disabled row before its own `dry_run` fn ever runs — two
+    /// attempts of the same spec differing ONLY in that env var now hash
+    /// differently, closing the hole where `CachePolicy::Use` would
+    /// otherwise serve a disable-requesting attempt the bytes of an
+    /// earlier attempt that never disabled anything.
     ///
-    /// **What this does NOT claim.** Several rows resolve only their
-    /// device/build-feature/dtype gate fully; a further, genuinely
-    /// data-dependent condition (a real batch's sequence length for
-    /// `attention_block`/`mem_efficient_attention`/`attention_block_flash`,
-    /// a real base checkpoint's own bias shape for `lora_linear_fused`) is
+    /// **What this does NOT claim — the residual list, named completely.**
+    /// Several rows resolve only their device/build-feature/dtype/disable
+    /// gate fully; a further, genuinely data-dependent condition — a real
+    /// batch's sequence length for `attention_block`/
+    /// `mem_efficient_attention`/`attention_block_flash`, or a real base
+    /// checkpoint's own bias shape for `lora_linear_fused`/`dropout` — is
     /// recorded as its OWN explicit `data_dependent:{reason}` value, never
-    /// silently rounded to "holds" — see `DryRunVerdict`'s own doc for why
-    /// this is MORE than the single `seq` residual #546's own restatement
-    /// named, read directly from each real predicate rather than assumed.
-    /// A `data_dependent` value is itself part of the hashed string (a run
-    /// whose config makes an op data-dependent hashes differently from one
-    /// where that op is `not_reached` or `holds`), but it cannot
-    /// distinguish two runs that are BOTH data-dependent on the same op —
-    /// that residual is real, stated, and left open at
-    /// <https://github.com/f-inverse/jammi-ai/issues/546> only for the
-    /// `admit`/`admit_cascade` predicate functions themselves to close by
-    /// being called with the real batch, which this pre-training fold
-    /// structurally cannot do.
+    /// silently rounded to "holds" (`jammi_kernels::admission::DryRunVerdict`'s
+    /// own doc has why this is MORE than the single `seq` residual #546's
+    /// own restatement named, read directly from each real predicate
+    /// rather than assumed). A `data_dependent` value is itself part of
+    /// the hashed string (a run whose config makes an op data-dependent
+    /// hashes differently from one where that op is `not_reached` or
+    /// `holds`), but it cannot distinguish two runs that are BOTH
+    /// data-dependent on the SAME op — that residual is real, stated, and
+    /// left open at <https://github.com/f-inverse/jammi-ai/issues/546>
+    /// only for the `admit`/`admit_cascade` predicate functions
+    /// themselves to close by being called with the real batch, which
+    /// this pre-training fold structurally cannot do. This is now the
+    /// COMPLETE residual: every OTHER determinant `admit`/`admit_cascade`
+    /// consult before a predicate — build features, device, dtype, and
+    /// (as of this fix) `JAMMI_KERNELS_DISABLE` — is folded into this
+    /// string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_admission_profile: Option<String>,
 }

@@ -80,6 +80,21 @@ bindgen_cuda = { version = "0.1.6", optional = true }
 
 [dev-dependencies]
 approx.workspace = true
+# `probed_op_construction_sites.rs`'s source oracle (wave-5 third
+# adversarial audit, I2): a real `syn` AST walk over this crate's own
+# `src/` tree, proving every `ProbedOp::new(...)` call is one of
+# `PROBED_OPS`'s own reviewed rows or a reviewed `#[cfg(test)]` fixture —
+# `ProbedOp` is sealed against every OTHER crate by the type system
+# (`#[non_exhaustive]` + a private field), but same-crate construction is
+# not something Rust's own visibility rules can seal, so this test closes
+# it mechanically instead. Same rationale, and the SAME pinned versions
+# already resolved transitively in `Cargo.lock`, as `jammi-ai`/`jammi-db`'s
+# own `syn`/`proc-macro2` dev-deps (`cargo tree -p proc-macro2 -p syn`
+# confirms 2.0.117 / 1.0.106 already resolve here) — this dev-only edge
+# moves nothing new into the lock. Test-only: no production code parses
+# Rust source.
+proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
+syn = { version = "2.0.117", features = ["full", "visit", "extra-traits"] }
 
 [features]
 default = []

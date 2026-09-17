@@ -194,12 +194,21 @@ impl ComputeSpec {
 /// [`ComputeSpec`]'s five: a row written through `JobSpec` is byte-identical
 /// to one written directly through whichever of those two types the kind
 /// belongs to (see the byte-pin tests below), so it round-trips through
-/// their OWN independent decodes unchanged — the two production
-/// training-claim sites (`crate::fine_tune::worker`'s loop-claimer,
-/// `worker.rs:1975`, and its Peer-rank path, `:6410`) read `TrainingSpec`
-/// directly, and the one compute-claim site (`:3250`) reads `ComputeSpec`
-/// directly; `JobSpec` itself is never deserialized on either of those
-/// paths.
+/// EITHER type's decode unchanged. `JobSpec` is, in fact, the type every
+/// production claim site decodes: `crate::fine_tune::worker`'s loop-claimer
+/// and its Peer-rank path both decode a `jobs.spec` row as `JobSpec` and
+/// project to [`TrainingSpec`](crate::fine_tune::spec::TrainingSpec) with
+/// `JobSpec::as_training_spec`; its compute-claim path decodes `JobSpec`
+/// the same way and projects to [`ComputeSpec`] with
+/// `JobSpec::as_compute_spec` — `TrainingSpec`/`ComputeSpec` are never
+/// deserialized directly from a `jobs.spec` row on any of those three
+/// paths (see `JobSpec::as_training_spec`'s own doc for the full
+/// caller list and why: a decode under `JobSpec`'s tag/
+/// `deny_unknown_fields` pair catches a stray field the SAME way
+/// regardless of which kind the row holds, rather than running two
+/// independently-tagged decodes that could drift). Only this type's own
+/// byte-pin tests below still construct a bare `TrainingSpec`/`ComputeSpec`
+/// value directly, to prove the two shapes stay byte-identical.
 ///
 /// This is a flat merge, not a wrapper, because a wrapper does not work:
 /// an outer `#[serde(tag = "kind")]` enum whose variant is a newtype around

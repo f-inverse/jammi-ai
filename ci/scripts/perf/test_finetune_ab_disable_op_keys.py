@@ -48,15 +48,29 @@ check either direction, in `test_declared_set_equals_the_live_standalone_registr
 
 B2's own concern — "an unresolved call site must never read identically to
 'no call exists here'" — is answered differently now than it was by the
-retired text scan, but not abandoned: `admit`/`admit_cascade`'s own `pub
-fn` signature (`crates/jammi-kernels/src/admission.rs`) requires a
-`&'static ProbedOp` argument, so EVERY real call site passes one of
-`PROBED_OPS`'s own named consts by construction — a fact the Rust compiler
-already proves on every `cargo build` (a call site that could not resolve
-its op key literally would not compile), never a fact this script needs to
-re-derive from source text. What this script still checks, honestly, is
-NON-VACUITY: that real `admit`/`admit_cascade` call sites genuinely exist
-under the scan roots at all (`admit_call_sites`, via
+retired text scan, but not abandoned. Precisely what the compiler proves
+and what a source oracle proves, stated separately (wave-5 third
+adversarial audit's own correction — an earlier revision of this
+paragraph overclaimed the compiler's own share): `admit`/`admit_cascade`'s
+own `pub fn` signature (`crates/jammi-kernels/src/admission.rs`) requires
+a `&'static jammi_kernels::admission::ProbedOp` argument, and that type is
+now SEALED (`#[non_exhaustive]` plus a private field) — the Rust compiler
+proves, on every `cargo build`, that a call site OUTSIDE `jammi-kernels`
+cannot pass anything but one of `PROBED_OPS`'s own named consts (a forged
+value built with a struct literal in another crate is `error[E0639]:
+cannot create non-exhaustive struct using struct expression`, not a
+runtime property). `#[non_exhaustive]`/private-field sealing has no effect
+INSIDE the crate that defines the type, though — a same-crate forgery
+inside `jammi-kernels` itself is a residual the compiler alone does not
+close, closed instead by a real `syn` source oracle,
+`crates/jammi-kernels/tests/probed_op_construction_sites.rs`, which proves
+every `ProbedOp::new(...)` call site anywhere in that crate's own `src/`
+tree is either one of `PROBED_OPS`'s own rows (count-keyed against the
+real, linked-in constant) or one of two named, reviewed `#[cfg(test)]`
+fixture macros. Together, the two claims cover every crate; neither alone
+does. Separately, this script still checks NON-VACUITY: that real
+`admit`/`admit_cascade` call sites genuinely exist under the scan roots at
+all (`admit_call_sites`, via
 `ci/tools/symbol-index`'s real `syn` parse — never a regex — filtered to
 non-test call sites by callee name) — a scan root silently returning zero
 hits (a typo'd path, a directory that stopped existing) is the failure mode

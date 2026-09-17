@@ -4019,11 +4019,27 @@ impl JobWorker {
             // own doc has the full per-op derivation and states precisely
             // where this unit's "seq is the only residual" framing does
             // NOT hold for the real predicates.
+            //
+            // `disabled_registry_keys` (wave-5 third adversarial audit):
+            // `JAMMI_KERNELS_DISABLE` wins over every predicate, in every
+            // build (`jammi_kernels::admission::admit`/`admit_cascade`'s
+            // own doc) — omitting it from this profile let two attempts of
+            // the SAME spec, one with the env var unset and one forcing
+            // every fused op eager, hash identically, so `CachePolicy::Use`
+            // would serve the second attempt the FIRST attempt's already-
+            // published (fused) bytes despite explicitly requesting eager.
+            // Read ONCE here, from `disabled_ops_requested()` (this
+            // process's own live env, at THIS exact call), never re-read
+            // inside any `dry_run` fn — the ctx is what stays hermetic and
+            // deterministic from this point on, not the process env.
             let dtype = dtype_class_of(common.config.backbone_dtype);
             let ctx = jammi_kernels::admission::DryRunCtx {
                 device_kind: kernels_device_kind(device.kind()),
                 dtype,
                 encoder_reachable: !common.config.target_modules.is_empty(),
+                disabled_registry_keys: jammi_kernels::admission::disabled_ops_requested()
+                    .into_iter()
+                    .collect(),
             };
             let kernel_admission_profile = dry_run_admission_profile(&ctx);
             let env = jammi_db::store::manifest::MaterializationEnv::new(
@@ -10627,6 +10643,7 @@ mod tests {
             device_kind: jammi_kernels::admission::DeviceKind::Cuda,
             dtype: jammi_kernels::admission::DtypeClass::Bf16,
             encoder_reachable: true,
+            disabled_registry_keys: Default::default(),
         };
         let profile: serde_json::Value =
             serde_json::from_str(&dry_run_admission_profile(&ctx)).unwrap();
@@ -10663,6 +10680,7 @@ mod tests {
             device_kind: jammi_kernels::admission::DeviceKind::Cpu,
             dtype: jammi_kernels::admission::DtypeClass::F32,
             encoder_reachable: false,
+            disabled_registry_keys: Default::default(),
         };
         let profile: serde_json::Value =
             serde_json::from_str(&dry_run_admission_profile(&ctx)).unwrap();
@@ -10690,6 +10708,7 @@ mod tests {
             device_kind: jammi_kernels::admission::DeviceKind::Cpu,
             dtype: jammi_kernels::admission::DtypeClass::F32,
             encoder_reachable: false,
+            disabled_registry_keys: Default::default(),
         };
         let profile: serde_json::Value =
             serde_json::from_str(&dry_run_admission_profile(&ctx)).unwrap();
@@ -10727,6 +10746,7 @@ mod tests {
             device_kind: jammi_kernels::admission::DeviceKind::Cuda,
             dtype: jammi_kernels::admission::DtypeClass::Bf16,
             encoder_reachable: true,
+            disabled_registry_keys: Default::default(),
         };
         // On THIS build (no `cuda` feature), a `Cuda`-kind context still
         // resolves `device_supported() == false` inside

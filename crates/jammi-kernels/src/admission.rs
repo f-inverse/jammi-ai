@@ -1771,12 +1771,38 @@ pub enum DeviceKind {
 
 /// #546's DETERMINISTIC, PRE-TRAINING inputs (wave-5 second pressure
 /// round): build features, this attempt's resolved device kind, its
-/// backbone dtype class, and whether the ENCODER arm is even reachable at
-/// all (a `target_modules`-empty `ProjectionHead` run never builds an
-/// encoder, so every encoder op is [`DryRunVerdict::NotReached`] for such a
-/// run, never merely undetermined). Everything a [`ProbedOp::dry_run`] fn
-/// needs and nothing else — no tensor, no catalog handle, no I/O.
-#[derive(Debug, Clone, Copy)]
+/// backbone dtype class, whether the ENCODER arm is even reachable at all
+/// (a `target_modules`-empty `ProjectionHead` run never builds an encoder,
+/// so every encoder op is [`DryRunVerdict::NotReached`] for such a run,
+/// never merely undetermined), and — wave-5 third adversarial audit —
+/// which registry keys `JAMMI_KERNELS_DISABLE` names for THIS process.
+/// Everything a [`ProbedOp::dry_run`] fn needs and nothing else — no
+/// tensor, no catalog handle, no I/O.
+///
+/// **`disabled_registry_keys` closes a real hash collision, not a
+/// theoretical one.** [`admit`]/[`admit_cascade`] both consult
+/// `op_is_disabled` (via `disabled_ops`) BEFORE the predicate, in
+/// every build, unconditionally — a disabled op is `Eager`/`Declined`
+/// regardless of what its predicate would have said. Before this field
+/// existed, [`DryRunCtx`] carried none of that: two attempts of the SAME
+/// spec, one with `JAMMI_KERNELS_DISABLE` unset and one forcing every
+/// fused op eager, produced the IDENTICAL `kernel_admission_profile`
+/// string (nothing in the ctx read the env var at all) and therefore the
+/// IDENTICAL `MaterializationEnv`/definition hash — with `CachePolicy::Use`
+/// admitted (#562), the second attempt would be served the FIRST
+/// attempt's already-published (fused) bytes, silently defeating the
+/// disable it explicitly requested. The caller (`jammi-ai`'s
+/// `train_fine_tune`) reads [`disabled_ops_requested`] ONCE, at
+/// [`DryRunCtx`] construction, and threads the result in here — every
+/// `dry_run` fn (via [`dry_run_all`]'s own disabled-check, applied
+/// uniformly before any row's own fn runs) stays a PURE function of this
+/// ctx, never a second, independent read of the live process env
+/// mid-computation. `BTreeSet`, not `HashSet`: iteration order is never
+/// read here (membership only), but a `BTreeSet`'s `Debug`/hash-derived
+/// paths (this type derives neither, but a caller building a durable
+/// record from it might) stay deterministic without a caller needing to
+/// sort first.
+#[derive(Debug, Clone)]
 pub struct DryRunCtx {
     pub device_kind: DeviceKind,
     pub dtype: DtypeClass,
@@ -1784,6 +1810,10 @@ pub struct DryRunCtx {
     /// `jammi-ai`'s `train_fine_tune` itself branches on to decide
     /// `ProjectionHead` vs `EncoderAdapters`.
     pub encoder_reachable: bool,
+    /// [`disabled_ops_requested`]'s own output, read ONCE at ctx
+    /// construction — see this struct's own doc for why this field exists
+    /// at all.
+    pub disabled_registry_keys: std::collections::BTreeSet<String>,
 }
 
 impl DryRunCtx {
@@ -1791,7 +1821,7 @@ impl DryRunCtx {
     /// "cuda") && d.is_cuda())`), restated over [`DeviceKind`] rather than a
     /// real `candle_core::Device` — the SAME two build/device facts, read
     /// without ever constructing one.
-    pub fn device_supported(self) -> bool {
+    pub fn device_supported(&self) -> bool {
         match self.device_kind {
             DeviceKind::Cpu => true,
             DeviceKind::Cuda => CUDA_COMPILED,
@@ -1799,8 +1829,19 @@ impl DryRunCtx {
         }
     }
 
-    pub fn is_cuda(self) -> bool {
+    pub fn is_cuda(&self) -> bool {
         self.device_kind == DeviceKind::Cuda && CUDA_COMPILED
+    }
+
+    /// Whether ANY registry key `op` could dispatch under, for THIS ctx's
+    /// own `dtype`, is named in `disabled_registry_keys` — the SAME
+    /// dtype-narrowing [`ProbedOp::registry_keys_for`] already applies for
+    /// resolving the concrete key `admit`/`admit_cascade` would actually
+    /// pass, so this check asks exactly the question a live run's own
+    /// `op_is_disabled` call answers for that op, hermetically.
+    fn op_is_disabled_here(&self, op: &ProbedOp) -> bool {
+        op.registry_keys_for(self.dtype)
+            .any(|key| self.disabled_registry_keys.contains(key))
     }
 }
 
@@ -2025,11 +2066,55 @@ fn dry_run_internal_subkernel(_ctx: &DryRunCtx) -> DryRunVerdict {
     )
 }
 
+/// A private, un-nameable marker type — [`ProbedOp`]'s own sealing field
+/// (see that struct's doc for why). No crate outside `jammi-kernels` can
+/// even WRITE the name `Sealed`, so no OTHER crate can supply a value for
+/// the field it seals, regardless of `#[non_exhaustive]` (which, on its
+/// own, seals struct-literal construction only from OUTSIDE the DEFINING
+/// CRATE — irrelevant here, since a `pub(crate)` field visibility bound
+/// already does that; this type exists for the belt-and-suspenders case
+/// of a caller that copies this struct's OWN field names byte-for-byte
+/// into a look-alike type in another crate and tries to coerce it — Rust
+/// has no structural typing, so that can never actually type-check either,
+/// but the field's PRIVATE type means even naming it in an attempted
+/// literal is a compile error on its own, before visibility is even
+/// checked).
+#[derive(Debug, Clone, Copy)]
+struct Sealed;
+
 /// One row of [`PROBED_OPS`]: a dtype-neutral report key, how its dispatch
 /// is observable, the registry key(s) its kernel's own `admit()` /
 /// `admit_cascade()` call site passes per dtype class, and this row's OWN
 /// deterministic, pre-training dry-run verdict function.
+///
+/// **Sealed (wave-5 third adversarial audit).** Before this fix, every
+/// field here was `pub`, and this struct carried no `#[non_exhaustive]` —
+/// so ANY crate (`jammi-encoders`, `jammi-lora`, `jammi-ai`, or a future
+/// one) could construct its OWN `ProbedOp` value with a struct literal and
+/// pass `&that_value` to [`admit`]/[`admit_cascade`], which would honor it
+/// exactly as if it were a real [`PROBED_OPS`] row — invisible to
+/// [`PROBED_OPS`] itself, to [`dry_run_all`], and to
+/// `ci/scripts/perf/test_finetune_ab_disable_op_keys.py`'s eager-disable
+/// sweep, which reads [`PROBED_OPS`] as its own source of truth. That
+/// sweep's own earlier revision deleted its source-text scan on the claim
+/// "the compiler already proves every call site passes a real row" — true
+/// for WHICH CONST a call site names, false for whether a hostile crate
+/// could hand-roll a look-alike value never named in this table at all;
+/// `#[non_exhaustive]` plus `Sealed` (a private field of a private type)
+/// jointly make that impossible from any OTHER crate: `#[non_exhaustive]`
+/// refuses struct-literal syntax and exhaustive matching from outside this
+/// crate; the un-nameable `Sealed` field means even a `..Default::default()`-
+/// style partial-literal attempt (if this type ever derived `Default`,
+/// which it does not, on purpose) could not supply a value for a field it
+/// cannot name. Construction is `pub(crate)` `ProbedOp::new` only — a
+/// same-crate forgery inside `jammi-kernels` itself remains POSSIBLE
+/// (`#[non_exhaustive]`/private-field sealing has no effect within the
+/// defining crate; Rust has no "seal from myself" mechanism), closed
+/// instead by `every_probed_op_construction_is_a_reviewed_probed_ops_row`
+/// (`crates/jammi-kernels/tests/probed_op_construction_sites.rs`), a `syn`
+/// source oracle over this crate's own tree.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct ProbedOp {
     /// The dtype-NEUTRAL key this op appears under in a durable acceleration
     /// report and in `ci/release-feature-manifest.json`'s capability lists.
@@ -2051,6 +2136,33 @@ pub struct ProbedOp {
     /// `PROBED_OPS.iter().map(|op| (op.report_key, (op.dry_run)(ctx)))` —
     /// no match over `report_key` anywhere in that crate.
     pub dry_run: fn(&DryRunCtx) -> DryRunVerdict,
+    /// [`Sealed`]'s own doc — this struct's doc has the full argument for
+    /// why this field exists at all.
+    _sealed: Sealed,
+}
+
+impl ProbedOp {
+    /// The ONLY way to build a [`ProbedOp`] — `pub(crate)`, so every
+    /// [`PROBED_OPS`] row (and every `#[cfg(test)]` fixture row in this
+    /// crate's own test modules) constructs through this one function,
+    /// never a struct literal naming [`Sealed`] directly (which would
+    /// still compile, being same-crate, but this keeps ONE construction
+    /// path this crate's own `syn` oracle can name exhaustively, rather
+    /// than two shapes it would have to recognize).
+    const fn new(
+        report_key: &'static str,
+        kind: ProbedOpKind,
+        registry: &'static [(DtypeClass, &'static str)],
+        dry_run: fn(&DryRunCtx) -> DryRunVerdict,
+    ) -> Self {
+        ProbedOp {
+            report_key,
+            kind,
+            registry,
+            dry_run,
+            _sealed: Sealed,
+        }
+    }
 }
 
 impl ProbedOp {
@@ -2212,119 +2324,119 @@ impl ProbedOp {
 /// added here. That is the completeness proof `PROBED_OPS`'s own doc used to
 /// call merely "hand-populated": the table and the call sites are now the
 /// SAME memory, not two things a reviewer keeps in sync by re-reading source.
-pub const LAYER_NORM: ProbedOp = ProbedOp {
-    report_key: "layer_norm",
-    kind: ProbedOpKind::TwoArm,
-    registry: &[(DtypeClass::Any, "layer_norm_fused")],
-    dry_run: dry_run_uniform_device_gate,
-};
-pub const ROPE: ProbedOp = ProbedOp {
-    report_key: "rope",
-    kind: ProbedOpKind::TwoArm,
-    registry: &[(DtypeClass::Any, "rope_fused")],
-    dry_run: dry_run_uniform_device_gate,
-};
-pub const SOFTMAX: ProbedOp = ProbedOp {
-    report_key: "softmax",
-    kind: ProbedOpKind::TwoArm,
-    registry: &[(DtypeClass::Any, "softmax_last_dim_fused")],
-    dry_run: dry_run_uniform_device_gate,
-};
-pub const GEGLU: ProbedOp = ProbedOp {
-    report_key: "geglu",
-    kind: ProbedOpKind::TwoArm,
-    registry: &[(DtypeClass::Any, "geglu_fused")],
-    dry_run: dry_run_uniform_device_gate,
-};
-pub const GELU_ERF: ProbedOp = ProbedOp {
-    report_key: "gelu_erf",
-    kind: ProbedOpKind::TwoArm,
-    registry: &[(DtypeClass::Any, "gelu_erf_fused")],
-    dry_run: dry_run_gelu_erf,
-};
-pub const ATTENTION_BLOCK: ProbedOp = ProbedOp {
-    report_key: "attention_block",
-    kind: ProbedOpKind::TwoArm,
-    registry: &[(DtypeClass::Any, "attention_block_fused")],
-    dry_run: dry_run_attention_block,
-};
+pub const LAYER_NORM: ProbedOp = ProbedOp::new(
+    "layer_norm",
+    ProbedOpKind::TwoArm,
+    &[(DtypeClass::Any, "layer_norm_fused")],
+    dry_run_uniform_device_gate,
+);
+pub const ROPE: ProbedOp = ProbedOp::new(
+    "rope",
+    ProbedOpKind::TwoArm,
+    &[(DtypeClass::Any, "rope_fused")],
+    dry_run_uniform_device_gate,
+);
+pub const SOFTMAX: ProbedOp = ProbedOp::new(
+    "softmax",
+    ProbedOpKind::TwoArm,
+    &[(DtypeClass::Any, "softmax_last_dim_fused")],
+    dry_run_uniform_device_gate,
+);
+pub const GEGLU: ProbedOp = ProbedOp::new(
+    "geglu",
+    ProbedOpKind::TwoArm,
+    &[(DtypeClass::Any, "geglu_fused")],
+    dry_run_uniform_device_gate,
+);
+pub const GELU_ERF: ProbedOp = ProbedOp::new(
+    "gelu_erf",
+    ProbedOpKind::TwoArm,
+    &[(DtypeClass::Any, "gelu_erf_fused")],
+    dry_run_gelu_erf,
+);
+pub const ATTENTION_BLOCK: ProbedOp = ProbedOp::new(
+    "attention_block",
+    ProbedOpKind::TwoArm,
+    &[(DtypeClass::Any, "attention_block_fused")],
+    dry_run_attention_block,
+);
 /// The `dropout` REPORT row — same dispatch decision as
 /// [`LOW_RANK_RESIDUAL_LINEAR`] (both are `lora_linear_fused`, one dispatch,
 /// two report keys per this table's own row-provenance doc). No call site
 /// admits under this const directly; it exists for the esc-075 report's
 /// `ops.dropout` key.
-pub const DROPOUT: ProbedOp = ProbedOp {
-    report_key: "dropout",
-    kind: ProbedOpKind::TwoArm,
-    registry: &[(DtypeClass::Any, "lora_linear_fused")],
-    dry_run: dry_run_low_rank_residual_linear,
-};
+pub const DROPOUT: ProbedOp = ProbedOp::new(
+    "dropout",
+    ProbedOpKind::TwoArm,
+    &[(DtypeClass::Any, "lora_linear_fused")],
+    dry_run_low_rank_residual_linear,
+);
 /// The call-site-facing const for `lora_linear_fused` — `jammi-lora`'s
 /// `lora_linear.rs` admits under this one.
-pub const LOW_RANK_RESIDUAL_LINEAR: ProbedOp = ProbedOp {
-    report_key: "low_rank_residual_linear",
-    kind: ProbedOpKind::TwoArm,
-    registry: &[(DtypeClass::Any, "lora_linear_fused")],
-    dry_run: dry_run_low_rank_residual_linear,
-};
-pub const CAST_SCALE: ProbedOp = ProbedOp {
-    report_key: "cast_scale",
-    kind: ProbedOpKind::TwoArm,
-    registry: &[
+pub const LOW_RANK_RESIDUAL_LINEAR: ProbedOp = ProbedOp::new(
+    "low_rank_residual_linear",
+    ProbedOpKind::TwoArm,
+    &[(DtypeClass::Any, "lora_linear_fused")],
+    dry_run_low_rank_residual_linear,
+);
+pub const CAST_SCALE: ProbedOp = ProbedOp::new(
+    "cast_scale",
+    ProbedOpKind::TwoArm,
+    &[
         (DtypeClass::Bf16, "cast_scale_bf16_f32"),
         (DtypeClass::F16, "cast_scale_f16_f32"),
     ],
-    dry_run: dry_run_cast_boundary,
-};
-pub const CAST_ADD: ProbedOp = ProbedOp {
-    report_key: "cast_add",
-    kind: ProbedOpKind::TwoArm,
-    registry: &[
+    dry_run_cast_boundary,
+);
+pub const CAST_ADD: ProbedOp = ProbedOp::new(
+    "cast_add",
+    ProbedOpKind::TwoArm,
+    &[
         (DtypeClass::Bf16, "cast_add_bf16"),
         (DtypeClass::F16, "cast_add_f16"),
     ],
-    dry_run: dry_run_cast_boundary,
-};
-pub const ADAMW_STEP: ProbedOp = ProbedOp {
-    report_key: "adamw_step",
-    kind: ProbedOpKind::TwoArm,
-    // `DtypeClass::Any`, NOT `F32` — see this table's "the optimizer's
-    // dtype domain is not a dtype CLASS" note. The op's own tensors are
-    // F32-only; the JOB's backbone dtype is a different axis, and it is
-    // the job's that `DtypeClass` selects on.
-    registry: &[(DtypeClass::Any, "adamw_step_fused")],
-    dry_run: dry_run_adamw_step,
-};
-pub const MEM_EFFICIENT_ATTENTION: ProbedOp = ProbedOp {
-    report_key: "mem_efficient_attention",
-    kind: ProbedOpKind::Cascade,
-    registry: &[(DtypeClass::Any, "mem_efficient_attention")],
-    dry_run: dry_run_mem_efficient_attention,
-};
+    dry_run_cast_boundary,
+);
+// `DtypeClass::Any`, NOT `F32` — see this table's "the optimizer's dtype
+// domain is not a dtype CLASS" note. The op's own tensors are F32-only;
+// the JOB's backbone dtype is a different axis, and it is the job's that
+// `DtypeClass` selects on.
+pub const ADAMW_STEP: ProbedOp = ProbedOp::new(
+    "adamw_step",
+    ProbedOpKind::TwoArm,
+    &[(DtypeClass::Any, "adamw_step_fused")],
+    dry_run_adamw_step,
+);
+pub const MEM_EFFICIENT_ATTENTION: ProbedOp = ProbedOp::new(
+    "mem_efficient_attention",
+    ProbedOpKind::Cascade,
+    &[(DtypeClass::Any, "mem_efficient_attention")],
+    dry_run_mem_efficient_attention,
+);
 /// See this constant's sibling doc paragraph above ("`attention_block_flash`
 /// IS a row") for why this row exists at all (#546).
-pub const ATTENTION_BLOCK_FLASH: ProbedOp = ProbedOp {
-    report_key: "attention_block_flash",
-    kind: ProbedOpKind::Cascade,
-    registry: &[(DtypeClass::Any, "attention_block_flash")],
-    dry_run: dry_run_attention_block_flash,
-};
-pub const ROPE_POSITIONS: ProbedOp = ProbedOp {
-    report_key: "rope_positions",
-    kind: ProbedOpKind::InternalSubkernel {
+pub const ATTENTION_BLOCK_FLASH: ProbedOp = ProbedOp::new(
+    "attention_block_flash",
+    ProbedOpKind::Cascade,
+    &[(DtypeClass::Any, "attention_block_flash")],
+    dry_run_attention_block_flash,
+);
+pub const ROPE_POSITIONS: ProbedOp = ProbedOp::new(
+    "rope_positions",
+    ProbedOpKind::InternalSubkernel {
         parent: "attention_block_flash",
     },
-    registry: &[],
-    dry_run: dry_run_internal_subkernel,
-};
-pub const SCALED_CAST_ADD: ProbedOp = ProbedOp {
-    report_key: "scaled_cast_add",
-    kind: ProbedOpKind::InternalSubkernel {
+    &[],
+    dry_run_internal_subkernel,
+);
+pub const SCALED_CAST_ADD: ProbedOp = ProbedOp::new(
+    "scaled_cast_add",
+    ProbedOpKind::InternalSubkernel {
         parent: "low_rank_residual_linear",
     },
-    registry: &[],
-    dry_run: dry_run_internal_subkernel,
-};
+    &[],
+    dry_run_internal_subkernel,
+);
 
 pub const PROBED_OPS: &[ProbedOp] = &[
     LAYER_NORM,
@@ -2368,11 +2480,29 @@ pub fn probed_op(report_key: &str) -> Option<&'static ProbedOp> {
 /// asking that gate to special-case a crate outside its own documented
 /// universe, or asking `jammi-ai` to carry a call shape that crate's own
 /// reachability oracle cannot resolve.
+///
+/// **The `JAMMI_KERNELS_DISABLE` check runs HERE, once, uniformly — never
+/// duplicated into each row's own `dry_run` fn** (wave-5 third adversarial
+/// audit): `admit`/`admit_cascade` both consult the disable list BEFORE
+/// the predicate, for every op, identically — a
+/// `DryRunCtx::op_is_disabled_here`-shaped check ahead of
+/// `(op.dry_run)(ctx)` mirrors that ordering exactly, without asking nine
+/// different `dry_run` fn bodies to each re-implement the same
+/// disable-precedence rule. A disabled row never reaches its own
+/// `dry_run` fn at all — the SAME short-circuit `admit_cascade` gives a
+/// disabled op over its own predicate.
 pub fn dry_run_all(ctx: &DryRunCtx) -> std::collections::BTreeMap<&'static str, DryRunVerdict> {
     PROBED_OPS
         .iter()
         .filter(|op| !matches!(op.kind, ProbedOpKind::InternalSubkernel { .. }))
-        .map(|op| (op.report_key, (op.dry_run)(ctx)))
+        .map(|op| {
+            let verdict = if ctx.op_is_disabled_here(op) {
+                DryRunVerdict::Declines("disabled_by_jammi_kernels_disable")
+            } else {
+                (op.dry_run)(ctx)
+            };
+            (op.report_key, verdict)
+        })
         .collect()
 }
 
@@ -2404,14 +2534,92 @@ mod tests {
         DryRunVerdict::Holds
     }
 
+    /// Wave-5 third adversarial audit: `dry_run_all` must differ, at a
+    /// REAL `PROBED_OPS` row, between a ctx naming nothing in
+    /// `disabled_registry_keys` and an otherwise-IDENTICAL ctx naming a
+    /// real standalone registry key — hermetically, through the ctx field
+    /// alone, never by setting the process env var (`disabled_ops_requested`
+    /// is not called here at all). `LAYER_NORM`'s own registry key
+    /// (`layer_norm_fused`) is real and standalone, and `Holds` on this
+    /// fixture's own encoder-reachable, device-supported, dtype-neutral
+    /// ctx, so disabling it is a genuine, observable move — not a
+    /// coincidence of an already-`Declines`/`NotReached` row.
+    #[test]
+    fn dry_run_all_moves_when_only_the_disabled_registry_keys_differ() {
+        let base = DryRunCtx {
+            device_kind: DeviceKind::Cpu,
+            dtype: DtypeClass::F32,
+            encoder_reachable: true,
+            disabled_registry_keys: std::collections::BTreeSet::new(),
+        };
+        let disabled = DryRunCtx {
+            disabled_registry_keys: std::collections::BTreeSet::from([
+                "layer_norm_fused".to_string()
+            ]),
+            ..base.clone()
+        };
+        let before = dry_run_all(&base);
+        let after = dry_run_all(&disabled);
+        assert_eq!(
+            before["layer_norm"],
+            DryRunVerdict::Holds,
+            "fixture assumption: layer_norm holds on this ctx before disabling it"
+        );
+        assert_eq!(
+            after["layer_norm"],
+            DryRunVerdict::Declines("disabled_by_jammi_kernels_disable"),
+            "a disabled registry key must decline the WHOLE row, before its own dry_run fn ever \
+             runs — mirrors admit's own disabled-wins-over-the-predicate precedence"
+        );
+        assert_ne!(
+            before, after,
+            "the whole dry_run_all map must move between the two ctxs, not just the one entry \
+             checked above"
+        );
+    }
+
+    /// The SAME property one level up: `jammi-ai`'s own
+    /// `MaterializationEnv::kernel_admission_profile` (folded from
+    /// `dry_run_all`'s own render) must differ between the two ctxs above —
+    /// checked here at the STRING level (the exact shape `jammi-ai`
+    /// hashes), since `dry_run_all`'s own map is this crate's boundary and
+    /// the definition-hash movement itself is `jammi-db`'s own property
+    /// (`MaterializationEnv::kernel_admission_profile_none_serialises_to_no_key`'s
+    /// sibling test `fine_tune_hash_moves_with_the_kernel_admission_profile`
+    /// pins that generically for ANY string change — this test is the
+    /// concrete witness that a disable-only diff IS such a change).
+    #[test]
+    fn rendered_profile_moves_when_only_the_disabled_registry_keys_differ() {
+        fn render(ctx: &DryRunCtx) -> String {
+            let ops: std::collections::BTreeMap<&str, String> = dry_run_all(ctx)
+                .into_iter()
+                .map(|(k, v)| (k, v.render()))
+                .collect();
+            format!("{ops:?}")
+        }
+        let base = DryRunCtx {
+            device_kind: DeviceKind::Cpu,
+            dtype: DtypeClass::F32,
+            encoder_reachable: true,
+            disabled_registry_keys: std::collections::BTreeSet::new(),
+        };
+        let disabled = DryRunCtx {
+            disabled_registry_keys: std::collections::BTreeSet::from([
+                "layer_norm_fused".to_string()
+            ]),
+            ..base.clone()
+        };
+        assert_ne!(render(&base), render(&disabled));
+    }
+
     macro_rules! test_two_arm {
         ($key:expr) => {
-            ProbedOp {
-                report_key: $key,
-                kind: ProbedOpKind::TwoArm,
-                registry: &[(DtypeClass::Any, $key)],
-                dry_run: dry_run_test_fixture,
-            }
+            ProbedOp::new(
+                $key,
+                ProbedOpKind::TwoArm,
+                &[(DtypeClass::Any, $key)],
+                dry_run_test_fixture,
+            )
         };
     }
 
@@ -2419,12 +2627,12 @@ mod tests {
     /// reason).
     macro_rules! test_cascade {
         ($key:expr) => {
-            ProbedOp {
-                report_key: $key,
-                kind: ProbedOpKind::Cascade,
-                registry: &[(DtypeClass::Any, $key)],
-                dry_run: dry_run_test_fixture,
-            }
+            ProbedOp::new(
+                $key,
+                ProbedOpKind::Cascade,
+                &[(DtypeClass::Any, $key)],
+                dry_run_test_fixture,
+            )
         };
     }
 

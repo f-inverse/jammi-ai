@@ -4768,6 +4768,8 @@ dependencies = [
  "candle-nn",
  "half",
  "libm",
+ "proc-macro2",
+ "syn 2.0.117",
  "thiserror 2.0.18",
  "tracing",
 ]

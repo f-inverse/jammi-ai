@@ -35,13 +35,21 @@ use crate::pipeline::context_predictor::ContextPredictorTrainConfig;
 /// always engine-written from a decoded spec, so an unknown key can only
 /// arrive via a hand edit or corruption — a stray key hand-edited under a
 /// `graph_fine_tune` row (for example) is a typed error naming the field,
-/// never a silent drop. This type is read directly (not through
-/// `crate::jobs::JobSpec`) at both training-claim decode sites
-/// (`crate::fine_tune::worker`'s loop-claimer and Peer-rank paths), so its
-/// own tag/`deny_unknown_fields` pair is what those two reads actually run
-/// under. `JobSpec` is a SEPARATE, independently-tagged flat enum (its own
-/// doc) that a training-kind row round-trips through byte-for-byte — never
-/// a wrapper around this type — because internally-tagging one `kind`-tagged
+/// never a silent drop. Neither production training-claim decode site
+/// (`crate::fine_tune::worker`'s loop-claimer or its Peer-rank path)
+/// decodes THIS type directly from a `jobs.spec` row at all — both decode
+/// [`crate::jobs::JobSpec`] (that type's own tag/`deny_unknown_fields`
+/// pair is what those two reads actually run under) and project to this
+/// type with `crate::jobs::JobSpec::as_training_spec`. This type's own
+/// `#[serde(deny_unknown_fields)]` still matters: `JobSpec` is
+/// field-for-field identical to this type by construction (see that
+/// type's own doc and its byte-pin tests), so decoding one and rejecting
+/// an unknown field is exactly equivalent to decoding the other and
+/// rejecting it — the guarantee holds under either type's own tag, it is
+/// simply `JobSpec`'s that actually runs in production. `JobSpec` is a
+/// SEPARATE, independently-tagged flat enum (its own doc) that a
+/// training-kind row round-trips through byte-for-byte — never a wrapper
+/// around this type — because internally-tagging one `kind`-tagged
 /// enum's variant AROUND another produces two competing `kind` keys on
 /// serialize (`kind` is written twice), not a nested shape; see
 /// `JobSpec`'s own doc for the executed refutation.

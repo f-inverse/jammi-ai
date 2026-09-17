@@ -422,7 +422,19 @@ impl ArtifactStore {
     /// compiler proof) that somehow reaches this method with a foreign
     /// prefix is refused here, in every build, rather than trusted.
     pub(crate) async fn delete_artifact_prefix(&self, prefix: &StorageUrl) -> Result<()> {
-        if !prefix.as_str().starts_with(self.root.as_str()) {
+        // PATH CONTAINMENT, never a bare string-prefix test: `self.root`
+        // (`models_root`, `store/mod.rs`) carries no trailing slash, so a
+        // plain `starts_with` would also accept a SIBLING directory whose
+        // name merely shares `self.root`'s own text as a prefix —
+        // `{root}/models-archive/x` starts with the STRING `{root}/models`
+        // without being under the PATH `{root}/models` at all. The only
+        // two admissible relationships are exact equality (the store's own
+        // root itself) or `self.root` immediately followed by `/` (a real
+        // path segment boundary).
+        let root = self.root.as_str();
+        let candidate = prefix.as_str();
+        let root_with_sep = format!("{root}/");
+        if candidate != root && !candidate.starts_with(&root_with_sep) {
             return Err(JammiError::Storage(StorageError::layout(
                 prefix.as_str(),
                 format!(
@@ -1148,6 +1160,67 @@ mod tests {
             store.fetch_artifact(&own).await.is_ok(),
             "the refusal above must be a pure input check, with no side effect on this \
              store's own, unrelated bytes"
+        );
+    }
+
+    /// PATH containment, never a bare STRING-prefix test (adversarial
+    /// audit on `feat/500-wave5`, item 3): `models_root` (`store/mod.rs`)
+    /// yields `{root}/models` with NO trailing slash, so a plain
+    /// `prefix.starts_with(self.root)` would also accept a SIBLING
+    /// directory whose name merely shares `self.root`'s own text as a
+    /// prefix — `{root}/models-archive/x` starts with the STRING
+    /// `{root}/models` without being under the PATH `{root}/models` at
+    /// all. Pins all four boundary shapes the audit named: a
+    /// dash-suffixed sibling and a bare-letter-suffixed sibling (`models`
+    /// immediately followed by `-archive` or `X`, neither a `/`) are
+    /// refused; the root's own bytes AND a real child path both proceed.
+    #[tokio::test]
+    async fn delete_artifact_prefix_refuses_a_string_prefix_that_is_not_a_path_ancestor() {
+        let cache = tempfile::tempdir().unwrap();
+        // A root SHAPED like production's `models_root` output — a
+        // `/models` suffix on some base, so the sibling-directory shapes
+        // below share a real string prefix with it, not just a synthetic
+        // coincidence.
+        let store = store_with_root(
+            StorageUrl::memory("artifacts-boundary/models"),
+            cache.path().to_path_buf(),
+        );
+
+        for sibling in [
+            "artifacts-boundary/models-archive/x",
+            "artifacts-boundary/modelsX/x",
+        ] {
+            let candidate = StorageUrl::memory(sibling);
+            let err = store
+                .delete_artifact_prefix(&candidate)
+                .await
+                .expect_err(&format!(
+                    "{sibling} shares a STRING prefix with the store's own root but is not a \
+                     PATH descendant of it — must be refused"
+                ));
+            assert!(
+                matches!(&err, JammiError::Storage(StorageError::Layout { path, .. }) if path == candidate.as_str()),
+                "expected a typed Storage(Layout) refusal naming {sibling}, got {err:?}"
+            );
+        }
+
+        // A real path descendant (`{root}/x`, never published) is a
+        // no-op delete, not a refusal — `delete_artifact_prefix`'s own
+        // doc: a missing manifest at `prefix` is a no-op, never an error.
+        let real_child = StorageUrl::memory("artifacts-boundary/models/x");
+        assert!(
+            store.delete_artifact_prefix(&real_child).await.is_ok(),
+            "a genuine path descendant of the store's own root must be accepted (a no-op here, \
+             since nothing was ever published at it), never refused as foreign"
+        );
+
+        // The root's own exact prefix (no further path segment at all) is
+        // likewise accepted — the `candidate != root` branch of the
+        // equality-or-separator check.
+        let exact_root = StorageUrl::memory("artifacts-boundary/models");
+        assert!(
+            store.delete_artifact_prefix(&exact_root).await.is_ok(),
+            "the store's own exact root prefix must be accepted, never refused as foreign"
         );
     }
 

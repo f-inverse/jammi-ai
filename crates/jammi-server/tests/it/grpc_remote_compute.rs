@@ -1150,24 +1150,22 @@ async fn an_unset_count_persists_the_identical_single_rank_spec_on_both_paths() 
 // surfaces.
 // ---------------------------------------------------------------------------
 
-/// PARITY (K4), plus the `Bypass` control. Model-level cache reuse IS
-/// admitted for `TrainingSpec::FineTune` (#562):
+/// REFUSAL, over both surfaces, plus the persistence control. Model-level
+/// cache reuse is not supported for `TrainingSpec::FineTune`:
 /// `jammi_ai::fine_tune::spec::admit_training_spec` — the one admission
 /// every durable submit edge for a training spec applies before a `jobs`
-/// row is written — no longer refuses `cache = Use`; the remote path
-/// reaches it via `JobService.SubmitJob` -> `run_training_spec_deduped` ->
+/// row is written — refuses `cache = Use`; the remote path reaches it via
+/// `JobService.SubmitJob` -> `run_training_spec_deduped` ->
 /// `submit_fine_tune_spec_deduped`, and the embedded path reaches the same
-/// edge. Both paths admit the identical submission and persist a
-/// BYTE-IDENTICAL `jobs.spec` carrying `cache = Use` — never silently
-/// downgraded to `Bypass` — mirroring
-/// `remote_and_embedded_submits_persist_the_identical_multi_rank_spec`'s
+/// edge. Three assertions for the refusal (the SAME typed
+/// error, the SAME message, and NOTHING enqueued on either path), mirroring
+/// `a_count_beyond_the_devices_is_refused_from_the_wire_and_enqueues_nothing`'s
 /// shape for the rank count; then the control: the identical spec with
-/// `cache = Bypass` also persists a BYTE-IDENTICAL `jobs.spec` on both
-/// paths, so this test still proves the wire carries `cache` at all (a
-/// remote path that dropped the field on both requests would otherwise
-/// pass the `Use` half vacuously).
+/// `cache = Bypass` still persists a BYTE-IDENTICAL `jobs.spec` on both
+/// paths, so the refusal above is specific to `Use`, never "the wire drops
+/// `cache` entirely".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_fine_tune_cache_use_is_admitted_identically_on_both_paths() {
+async fn a_fine_tune_cache_use_is_refused_identically_on_both_paths() {
     let server = start_engine_server_with_devices(2).await;
     let remote = remote(&server).await;
     let local = local(&server);
@@ -1179,14 +1177,61 @@ async fn a_fine_tune_cache_use_is_admitted_identically_on_both_paths() {
         ..two_rank_request(&model)
     };
 
+    let before = server
+        .engine
+        .catalog()
+        .list_jobs()
+        .await
+        .expect("list_jobs")
+        .len();
+
+    let remote_err = remote
+        .submit_fine_tune(use_request())
+        .await
+        .expect_err("remote submit with cache = use must be refused");
+    let local_err = local
+        .submit_fine_tune(use_request())
+        .await
+        .expect_err("embedded submit with cache = use must be refused the same way");
+
+    assert_eq!(
+        std::mem::discriminant(&remote_err),
+        std::mem::discriminant(&local_err),
+        "the remote caller must reconstruct the SAME typed refusal the embedded \
+         caller sees: {remote_err:?} vs {local_err:?}"
+    );
+    assert_eq!(
+        remote_err.to_string(),
+        local_err.to_string(),
+        "the remote caller must carry the refusal message the engine produced"
+    );
+
+    let after = server
+        .engine
+        .catalog()
+        .list_jobs()
+        .await
+        .expect("list_jobs")
+        .len();
+    assert_eq!(
+        before, after,
+        "a refused submission must enqueue nothing -- on either path"
+    );
+
+    // The control: the identical spec with `cache = Bypass` is unaffected —
+    // the refusal above is `Use`-specific.
+    let bypass_request = || jammi_wire::request::FineTuneRequest {
+        cache: jammi_db::store::CachePolicy::Bypass,
+        ..two_rank_request(&model)
+    };
     let remote_job = remote
-        .submit_fine_tune(use_request())
+        .submit_fine_tune(bypass_request())
         .await
-        .expect("remote submit with cache = use must be admitted");
+        .expect("remote submit with cache = bypass returns a handle");
     let local_job = local
-        .submit_fine_tune(use_request())
+        .submit_fine_tune(bypass_request())
         .await
-        .expect("embedded submit with cache = use must be admitted the same way");
+        .expect("embedded submit with cache = bypass returns a handle");
 
     let catalog = server.engine.catalog();
     let remote_spec = catalog
@@ -1201,49 +1246,11 @@ async fn a_fine_tune_cache_use_is_admitted_identically_on_both_paths() {
         .spec;
 
     assert!(
-        remote_spec.contains("\"cache\":\"use\""),
-        "the persisted spec must carry the policy the caller chose, not the \
-         Bypass default: {remote_spec}"
+        remote_spec.contains("\"cache\":\"bypass\""),
+        "the persisted spec must carry the policy the caller chose: {remote_spec}"
     );
     assert_eq!(
         remote_spec, local_spec,
-        "a job submitted over the wire and the same job submitted in-process \
-         must persist byte-identical specs"
-    );
-
-    // The control: the identical spec with `cache = Bypass` persists too —
-    // this test proves the wire carries `cache` at all, not only the `Use`
-    // arm.
-    let bypass_request = || jammi_wire::request::FineTuneRequest {
-        cache: jammi_db::store::CachePolicy::Bypass,
-        ..two_rank_request(&model)
-    };
-    let remote_bypass_job = remote
-        .submit_fine_tune(bypass_request())
-        .await
-        .expect("remote submit with cache = bypass returns a handle");
-    let local_bypass_job = local
-        .submit_fine_tune(bypass_request())
-        .await
-        .expect("embedded submit with cache = bypass returns a handle");
-
-    let remote_bypass_spec = catalog
-        .get_job(&remote_bypass_job.0)
-        .await
-        .expect("remote get_job")
-        .spec;
-    let local_bypass_spec = catalog
-        .get_job(&local_bypass_job.0)
-        .await
-        .expect("local get_job")
-        .spec;
-
-    assert!(
-        remote_bypass_spec.contains("\"cache\":\"bypass\""),
-        "the persisted spec must carry the policy the caller chose: {remote_bypass_spec}"
-    );
-    assert_eq!(
-        remote_bypass_spec, local_bypass_spec,
         "a job submitted over the wire and the same job submitted in-process \
          must persist byte-identical specs"
     );

@@ -2809,91 +2809,42 @@ impl JobWorker {
         // loser's (or zombie's) register can never set the served pointer.
         //
         // Every attempt publishes its OWN bytes under its OWN attempt-unique
-        // prefix — EXCEPT a `FineTuneMaterializationOutcome::Reused` run
-        // (#562 item 3, wave-5 F5): it names an ALREADY-published prefix
-        // some earlier attempt (possibly another tenant's) owns, producing
-        // the N:1 shape `PublishedPrefix::existing`'s own doc names.
+        // prefix — no FineTune run ever shares a `models/` prefix with
+        // another run (model-level cache reuse is not yet supported; see
+        // <https://github.com/f-inverse/jammi-ai/issues/562>).
         let attempt_str = attempt.to_string();
         let prefix =
-            if let Some(FineTuneMaterializationOutcome::Reused { existing }) = &materialization {
-                // `Catalog::probe_model_by_definition`'s own candidate set is
-                // `artifact_path IS NOT NULL` (`find_models_by_definition`'s
-                // predicate) — a `None` here would mean that invariant broke
-                // between the probe and this finalize, which is a bug in the
-                // catalog layer this worker cannot repair; refused, typed,
-                // rather than silently substituted.
-                let raw = match existing.artifact_path.as_deref() {
-                    Some(p) => p,
-                    None => {
-                        let reason = format!(
-                            "cache-hit reuse: probed row {:?} carries no artifact_path — \
-                         probe_model_by_definition's own servable-candidate invariant broke",
-                            existing.catalog_pk
-                        );
-                        record_failed(
-                            holder,
-                            catalog,
-                            job_id,
-                            &self.worker_id,
-                            attempt,
-                            reason.clone(),
-                        )
-                        .await;
-                        return PublishOutcome::Failed(reason);
-                    }
-                };
-                match jammi_db::storage::StorageUrl::parse(raw) {
-                    Ok(url) => PublishedPrefix::existing(url),
-                    Err(e) => {
-                        let reason = format!(
-                            "cache-hit reuse: the reused row's artifact_path did not parse as a \
-                         StorageUrl: {e}"
-                        );
-                        record_failed(
-                            holder,
-                            catalog,
-                            job_id,
-                            &self.worker_id,
-                            attempt,
-                            reason.clone(),
-                        )
-                        .await;
-                        return PublishOutcome::Failed(reason);
-                    }
-                }
-            } else {
-                match publish_artifact(&store, tenant, job_id, &self.worker_id, &attempt_str, &dir)
-                    .await
-                {
-                    Ok(p) => PublishedPrefix(p),
-                    Err(e) => {
-                        record_failed(
-                            holder,
-                            catalog,
-                            job_id,
-                            &self.worker_id,
-                            attempt,
-                            e.to_string(),
-                        )
-                        .await;
-                        // The training loop DID complete and DID write epoch
-                        // checkpoints (we have a `TrainedArtifact`) — but the
-                        // FINAL artifact publish failed, so this attempt never
-                        // reaches finalize at all. Reclaim its epoch-checkpoint
-                        // bytes via the derived sweep (never the vec — one
-                        // reclaim path for every terminating arm, unit 348 F1/F2).
-                        Self::gc_epoch_checkpoints(
-                            &store,
-                            refs,
-                            tenant,
-                            job_id,
-                            &self.worker_id,
-                            attempt,
-                            epoch_checkpoint_bound,
-                        )
-                        .await;
-                        return PublishOutcome::Failed(e.to_string());
-                    }
+            match publish_artifact(&store, tenant, job_id, &self.worker_id, &attempt_str, &dir)
+                .await
+            {
+                Ok(p) => PublishedPrefix(p),
+                Err(e) => {
+                    record_failed(
+                        holder,
+                        catalog,
+                        job_id,
+                        &self.worker_id,
+                        attempt,
+                        e.to_string(),
+                    )
+                    .await;
+                    // The training loop DID complete and DID write epoch
+                    // checkpoints (we have a `TrainedArtifact`) — but the
+                    // FINAL artifact publish failed, so this attempt never
+                    // reaches finalize at all. Reclaim its epoch-checkpoint
+                    // bytes via the derived sweep (never the vec — one
+                    // reclaim path for every terminating arm, unit 348 F1/F2).
+                    Self::gc_epoch_checkpoints(
+                        &store,
+                        refs,
+                        tenant,
+                        job_id,
+                        &self.worker_id,
+                        attempt,
+                        epoch_checkpoint_bound,
+                    )
+                    .await;
+                    return PublishOutcome::Failed(e.to_string());
                 }
             };
 
@@ -3024,16 +2975,6 @@ impl JobWorker {
                 pending_record =
                     Some((manifest.definition_hash.as_str().to_string(), anchors_json));
             }
-            // #562 item 3 (wave-5 F5): a cache-hit reuse row. Its
-            // `materialization.json` sidecar already exists at `prefix` —
-            // written by the ORIGINAL attempt that first published these
-            // bytes — so there is nothing to write here, and no
-            // `pending_record` to set: the reuse row's own
-            // `definition_hash`/`input_anchors_json` columns stay `NULL`
-            // (the original row is the one `Catalog::probe_model_by_definition`
-            // matches against; the reuse row itself never needs to be a
-            // probe candidate).
-            Some(FineTuneMaterializationOutcome::Reused { .. }) => {}
             // `GraphFineTune` / a context predictor: no materialization to
             // record. `ProducingDescriptor::FineTune` covers only the
             // column-source `FineTune` kind — `GraphFineTune` has no `cache`
@@ -3098,22 +3039,11 @@ impl JobWorker {
         // `Table` arm's `"computed"`/`"reused:{name}"` vocabulary, but every
         // FineTune run always records `"computed"` today — model-level
         // cache reuse is not yet supported (see that field's own doc).
-        // #562 item 3 (wave-5 F5): `"reused:{model}"` for a cache hit —
-        // `{model}` names the REUSED row's own `model_id` (never this NEW
-        // row's, which the wire response's `model_id` field already
-        // carries), matching `CacheOutcome::Reused { table }`'s
-        // `"reused:{table}"` vocabulary for the `Table` kind.
-        let cache_outcome = match &materialization {
-            Some(FineTuneMaterializationOutcome::Reused { existing }) => {
-                format!("reused:{}", existing.model_id)
-            }
-            Some(FineTuneMaterializationOutcome::Fresh { .. }) | None => "computed".to_string(),
-        };
         let job_result = crate::jobs::JobResult::Model {
             model_id: model_id.clone(),
             artifact_path: prefix.url().to_string(),
             metrics: metrics.clone(),
-            cache_outcome,
+            cache_outcome: "computed".to_string(),
         };
         let result_json = match serde_json::to_string(&job_result) {
             Ok(j) => j,
@@ -3671,10 +3601,13 @@ impl JobWorker {
                 method,
                 task,
                 common,
-                // #562 item 3 (wave-5 F5): `Use` is admitted now that I1,
-                // I2, and I4 all hold — `train_fine_tune` reads this to
-                // decide whether to probe for a cache hit before training.
-                cache,
+                // `cache = USE` is refused, typed, by
+                // `fine_tune::spec::admit_training_spec` — the ONE admission
+                // every durable submit edge for a training spec applies
+                // before a row is ever written: a queued `fine_tune` row can
+                // therefore only ever carry `Bypass` here, and the worker
+                // has nothing left to branch on.
+                cache: _cache,
             } => {
                 // Materialise the projected rows into an immutable
                 // `TrainingSet` result table (or reuse the one that already
@@ -3769,7 +3702,6 @@ impl JobWorker {
                     training_set_definition_hash: table.definition_hash.as_str().to_string(),
                     training_set_artifact_digest,
                     training_set_row_count: table.record.row_count as u64,
-                    cache,
                 });
                 let topology = TopologyDecision::decide(
                     common.world_size,
@@ -4062,38 +3994,13 @@ impl JobWorker {
         if let Some(src) = &materialization_source {
             let canonical_model_id = model_source.to_string();
             let device = session.compute_device();
-            // #546, restated by the wave-5 pressure round (F3): a
-            // DETERMINISTIC, PRE-TRAINING fold over EVERY
-            // `jammi_kernels::admission::PROBED_OPS` row — never a
-            // dispatch-counter delta, never routed through a forward pass
-            // — computed here, before `guard` (below) is dropped and
-            // before the training loop exists at all. `dry_run_admission_profile`'s
-            // own doc has the full per-op derivation and states precisely
-            // where this unit's "seq is the only residual" framing does
-            // NOT hold for the real predicates.
-            //
-            // `disabled_registry_keys`:
-            // `JAMMI_KERNELS_DISABLE` wins over every predicate, in every
-            // build (`jammi_kernels::admission::admit`/`admit_cascade`'s
-            // own doc) — omitting it from this profile let two attempts of
-            // the SAME spec, one with the env var unset and one forcing
-            // every fused op eager, hash identically, so `CachePolicy::Use`
-            // would serve the second attempt the FIRST attempt's already-
-            // published (fused) bytes despite explicitly requesting eager.
-            // Read ONCE here, from `disabled_ops_requested()` (this
-            // process's own live env, at THIS exact call), never re-read
-            // inside any `dry_run` fn — the ctx is what stays hermetic and
-            // deterministic from this point on, not the process env.
-            let dtype = dtype_class_of(common.config.backbone_dtype);
-            let ctx = jammi_kernels::admission::DryRunCtx {
-                device_kind: kernels_device_kind(device.kind()),
-                dtype,
-                encoder_reachable: !common.config.target_modules.is_empty(),
-                disabled_registry_keys: jammi_kernels::admission::disabled_ops_requested()
-                    .into_iter()
-                    .collect(),
-            };
-            let kernel_admission_profile = dry_run_admission_profile(&ctx);
+            // The fused-kernel admission profile is UNCOVERED here
+            // (#546): `MaterializationEnv::kernel_admission_profile` stays
+            // declared and hash-affecting the moment a real value is
+            // written, but nothing here writes one — a re-derived
+            // prediction is not the training loop's actual per-op admission
+            // outcome, and shipping one would be a false sense of coverage
+            // (see that field's own doc).
             let env = jammi_db::store::manifest::MaterializationEnv::new(
                 device.clone(),
                 vec![jammi_db::store::manifest::ModelIdentity {
@@ -4103,8 +4010,7 @@ impl JobWorker {
                     content_digest: guard.model.content_digest().map_err(WorkerJobError::from)?,
                     quantization: guard.model.quantization(),
                 }],
-            )
-            .with_kernel_admission_profile(kernel_admission_profile);
+            );
             let spec_canonical = crate::fine_tune::spec::fine_tune_spec_canonical(
                 &src.source,
                 &src.columns,
@@ -4164,59 +4070,6 @@ impl JobWorker {
             // TrainingSet-table replay arm, over THAT table's own
             // separately-recorded anchors, never these.
             let inputs: Vec<jammi_db::store::manifest::InputAnchor> = Vec::new();
-
-            // #562 item 3 (wave-5 F5): the cache probe, keyed on the SAME
-            // `(descriptor, env)` pair this attempt would otherwise record
-            // — `MaterializationManifest::definition_of` is the documented
-            // pre-training half of `MaterializationManifest::compute`
-            // itself (`jammi_db::store::manifest`'s own doc: "exposed so a
-            // cache probe can build the lookup key before the expensive
-            // compute"), so a HIT here is byte-identical to what a FRESH
-            // run of the identical spec would have recorded. `src.cache`
-            // is the ONE dial that reaches this branch at all: `Bypass`
-            // (every run before this unit, and every run today unless the
-            // submitter asked for reuse) always falls through to the
-            // `Fresh` arm below, unchanged.
-            if src.cache == jammi_db::store::CachePolicy::Use {
-                let definition_hash =
-                    jammi_db::store::manifest::MaterializationManifest::definition_of(
-                        &descriptor,
-                        &env,
-                    )
-                    .map_err(|e| WorkerJobError::Failed(e.to_string()))?;
-                if let Some(existing) = catalog
-                    .probe_model_by_definition(definition_hash.as_str(), &inputs)
-                    .await
-                    .map_err(WorkerJobError::from)?
-                {
-                    drop(guard);
-                    let empty_dir = tempfile::tempdir().map_err(|e| {
-                        WorkerJobError::Failed(format!(
-                            "cache-hit reuse: failed to allocate a placeholder tempdir: {e}"
-                        ))
-                    })?;
-                    return Ok(TrainedArtifact {
-                        dir: empty_dir,
-                        register: ModelRegistration {
-                            model_id: output_model_id,
-                            version: 1,
-                            model_type: "fine-tuned",
-                            task,
-                            base_model_id: Some(common.base_model.clone()),
-                            config_json: None,
-                        },
-                        metrics: None,
-                        epoch_checkpoints: Vec::new(),
-                        materialization: Some(FineTuneMaterializationOutcome::Reused {
-                            existing: Box::new(existing),
-                        }),
-                    });
-                }
-                // A miss: falls through to the `Fresh` arm exactly like a
-                // `Bypass` run — this attempt trains, and its own materialization
-                // becomes the NEXT probe's potential hit.
-            }
-
             pending_materialization = Some(FineTuneMaterializationOutcome::Fresh {
                 descriptor: Box::new(descriptor),
                 env,
@@ -5645,13 +5498,6 @@ struct FineTuneMaterializationSource {
     training_set_artifact_digest: String,
     /// The materialised `TrainingSet` table's committed row count.
     training_set_row_count: u64,
-    /// The submitting caller's [`jammi_db::store::CachePolicy`] dial for
-    /// THIS run — `Use` (now admitted, #562/wave-5 F5) tells
-    /// [`JobWorker::train_fine_tune`] to probe for an exact-definition
-    /// cache hit before ever building the training target or running the
-    /// blocking trainer; `Bypass` always trains, byte-identical to every
-    /// run before this field existed.
-    cache: jammi_db::store::CachePolicy,
 }
 
 /// What [`JobWorker::publish_and_finalize`] does with a `TrainingSpec::FineTune`
@@ -5666,23 +5512,6 @@ pub(crate) enum FineTuneMaterializationOutcome {
         descriptor: Box<jammi_db::store::manifest::ProducingDescriptor>,
         env: jammi_db::store::manifest::MaterializationEnv,
         inputs: Vec<jammi_db::store::manifest::InputAnchor>,
-    },
-    /// #562 item 3 (wave-5 F5): an EXACT-DEFINITION cache hit —
-    /// `Catalog::probe_model_by_definition` found an already-`ready` model
-    /// row whose `definition_hash` (and, when any are pinned, input
-    /// anchors) match this submission's own. No training ran and no new
-    /// bytes are published: [`JobWorker::publish_and_finalize`] registers a
-    /// SECOND `models` row for THIS job's own `output_model_id`, pointing
-    /// at the SAME `artifact_path` the reused row already serves —
-    /// `ResultStore::prefix_is_referenced` (I1/I2) is what keeps that
-    /// prefix reachable for as long as EITHER row exists, and what makes a
-    /// same-tenant or cross-tenant N:1 shape byte-safe by construction, not
-    /// by a special case this variant has to reason about itself.
-    Reused {
-        /// The row being reused — its `artifact_path` is what the NEW row
-        /// is registered against; its `model_id` is what
-        /// `cache_outcome: "reused:{model}"` names on the wire.
-        existing: Box<jammi_db::catalog::model_repo::ModelRecord>,
     },
 }
 
@@ -7197,30 +7026,19 @@ impl PrefixReferences for ResultStore {
 }
 
 /// The prefix [`JobWorker::publish_and_finalize`] is about to finalize
-/// against — either bytes this attempt published itself, OR (#562 item 3,
-/// wave-5 F5, [`Self::existing`]) an ALREADY-published prefix a cache-hit
-/// reuse row is about to name a SECOND time, an N:1 shape I1/I2 make
-/// byte-safe. A newtype rather than a bare [`jammi_db::storage::StorageUrl`]
-/// so [`Self::delete`] is the ONLY way to delete a prefix reached through
-/// this type, and it never trusts its own ownership claim unconditionally:
-/// it deletes only through [`PrefixReferences`], which itself refuses if
-/// some OTHER live `models` row has, in the meantime, come to name the
-/// exact same prefix (the pre-existing `:1334`-style guard this restates so
-/// it cannot be forgotten again) — the SAME guard that makes the `existing`
-/// arm's abandon path safe: an attempt whose reuse-registration fails after
-/// this point can call [`Self::delete`] exactly like a fresh-publish
-/// failure would, and the guard refuses because the ORIGINAL row (never
-/// touched by this attempt) still names it.
+/// against — always bytes this attempt published itself (no FineTune run
+/// ever shares a `models/` prefix with another run; see
+/// [`FineTuneMaterializationOutcome`]'s own doc). A newtype rather than a
+/// bare [`jammi_db::storage::StorageUrl`] so [`Self::delete`] is the ONLY
+/// way to delete a prefix reached through this type, and it never trusts
+/// its own ownership claim unconditionally: it deletes only through
+/// [`PrefixReferences`], which itself refuses if some OTHER live `models`
+/// row has, in the meantime, come to name the exact same prefix (the
+/// pre-existing `:1334`-style guard this restates so it cannot be forgotten
+/// again).
 struct PublishedPrefix(jammi_db::storage::StorageUrl);
 
 impl PublishedPrefix {
-    /// #562 item 3 (wave-5 F5): the prefix a cache-hit reuse names — never
-    /// published by THIS attempt. See this type's own doc for the byte-safety
-    /// argument.
-    fn existing(url: jammi_db::storage::StorageUrl) -> Self {
-        Self(url)
-    }
-
     /// The underlying [`jammi_db::storage::StorageUrl`] — every READ (the
     /// manifest write target, the finalize CAS's `artifact_path`, the
     /// terminal `jobs.result`) needs the bytes; only a DELETE goes through
@@ -9169,58 +8987,6 @@ fn reason_from_probe_window(
         .to_string()
 }
 
-/// Converts a `jammi_db::store::manifest::ComputeDeviceKind` to the
-/// dependency-free `jammi_kernels::admission::DeviceKind` a
-/// [`jammi_kernels::admission::DryRunCtx`] needs — `jammi-kernels` has no
-/// `jammi-*` dependency of its own (a leaf crate), so this conversion lives
-/// here, in the one crate that has both types in scope, rather than in
-/// either of them.
-fn kernels_device_kind(
-    kind: jammi_db::store::manifest::ComputeDeviceKind,
-) -> jammi_kernels::admission::DeviceKind {
-    use jammi_db::store::manifest::ComputeDeviceKind;
-    match kind {
-        ComputeDeviceKind::Cpu => jammi_kernels::admission::DeviceKind::Cpu,
-        ComputeDeviceKind::Cuda => jammi_kernels::admission::DeviceKind::Cuda,
-        ComputeDeviceKind::Metal => jammi_kernels::admission::DeviceKind::Metal,
-    }
-}
-
-/// #546's canonical, sorted-key `kernel_admission_profile` string (wave-5
-/// second pressure round) folded into
-/// [`jammi_db::store::manifest::MaterializationEnv::kernel_admission_profile`]:
-/// one entry per [`jammi_kernels::admission::PROBED_OPS`] row whose
-/// [`jammi_kernels::admission::ProbedOpKind`] is `TwoArm` or `Cascade` (an
-/// `InternalSubkernel` row carries no registry key of its own and no
-/// independent admission — filtered by `kind`, never by `report_key`),
-/// valued by that row's OWN `dry_run` fn
-/// ([`jammi_kernels::admission::DryRunVerdict::render`]). Plus the two
-/// build-feature booleans explicitly (never left implicit in a verdict's
-/// reason string alone), so a build differing only in a feature moves this
-/// string even in an edge case where every verdict's rendered text happened
-/// to coincide.
-///
-/// **By construction, not by a match this crate maintains**: this function
-/// renders [`jammi_kernels::admission::dry_run_all`]'s own map — no `match
-/// report_key { "layer_norm" => ..., ... }` anywhere in this crate, and no
-/// `(op.dry_run)(ctx)` fn-pointer call in this crate's own source either
-/// (`dry_run_all`'s own doc has why that call lives in `jammi-kernels`,
-/// not here). A new `PROBED_OPS` row with no `dry_run` fn does not compile
-/// (a required struct field), so this profile cannot silently omit a row
-/// the way a second, string-keyed enumeration could.
-fn dry_run_admission_profile(ctx: &jammi_kernels::admission::DryRunCtx) -> String {
-    let ops: std::collections::BTreeMap<&str, String> = jammi_kernels::admission::dry_run_all(ctx)
-        .into_iter()
-        .map(|(key, verdict)| (key, verdict.render()))
-        .collect();
-    serde_json::json!({
-        "cuda_compiled": jammi_kernels::admission::CUDA_COMPILED,
-        "flash_compiled": jammi_kernels::admission::FLASH_COMPILED,
-        "ops": ops,
-    })
-    .to_string()
-}
-
 /// The compiled/device-level short-circuit reasons for `"flash"`, checked
 /// BEFORE any probe result is consulted: `Some(..)` when flash is not even
 /// reachable on this build/device — no probe was, or could have been,
@@ -10727,137 +10493,6 @@ mod tests {
         assert_eq!(
             flash_cascade_decline_reason(&[]),
             "capability_or_domain_miss"
-        );
-    }
-
-    /// #546's completeness proof:
-    /// `dry_run_admission_profile`'s `ops` key set must equal EXACTLY the
-    /// `TwoArm`/`Cascade` report keys the REAL, linked-in `PROBED_OPS`
-    /// names — read live off the constant, never a hand-copied list. Since
-    /// `dry_run` is now a REQUIRED field of `ProbedOp`, a new row with no
-    /// verdict fn does not compile at all (the stronger, by-construction
-    /// version of what this test used to have to catch at runtime); this
-    /// test still pins the SET, at a fixed `DryRunCtx` it controls.
-    #[test]
-    fn dry_run_admission_profile_enumerates_every_probed_ops_key() {
-        let ctx = jammi_kernels::admission::DryRunCtx {
-            device_kind: jammi_kernels::admission::DeviceKind::Cuda,
-            dtype: jammi_kernels::admission::DtypeClass::Bf16,
-            encoder_reachable: true,
-            disabled_registry_keys: Default::default(),
-        };
-        let profile: serde_json::Value =
-            serde_json::from_str(&dry_run_admission_profile(&ctx)).unwrap();
-        let ops = profile["ops"].as_object().expect("ops is an object");
-        let mut got: Vec<&str> = ops.keys().map(String::as_str).collect();
-        got.sort_unstable();
-        let mut want: Vec<&str> = jammi_kernels::admission::PROBED_OPS
-            .iter()
-            .filter(|op| {
-                !matches!(
-                    op.kind(),
-                    jammi_kernels::admission::ProbedOpKind::InternalSubkernel { .. }
-                )
-            })
-            .map(|op| op.report_key())
-            .collect();
-        want.sort_unstable();
-        assert_eq!(
-            got, want,
-            "the profile's key set must equal PROBED_OPS's TwoArm/Cascade report keys exactly — \
-             a mismatch means a stale key survives a row's removal (a NEW row with no dry_run \
-             fn cannot compile at all, so that half of this drift is no longer reachable)"
-        );
-    }
-
-    /// Every rendered verdict is a KNOWN tag (`holds`/`declines:.../
-    /// not_reached:.../data_dependent:...`) — catches a `render()` arm that
-    /// silently produces something else (a `Debug`-formatted enum name, an
-    /// empty string) that would still "enumerate every key" (the test
-    /// above) while carrying no honest information.
-    #[test]
-    fn dry_run_admission_profile_every_value_is_a_known_tag() {
-        let ctx = jammi_kernels::admission::DryRunCtx {
-            device_kind: jammi_kernels::admission::DeviceKind::Cpu,
-            dtype: jammi_kernels::admission::DtypeClass::F32,
-            encoder_reachable: false,
-            disabled_registry_keys: Default::default(),
-        };
-        let profile: serde_json::Value =
-            serde_json::from_str(&dry_run_admission_profile(&ctx)).unwrap();
-        for (key, value) in profile["ops"].as_object().unwrap() {
-            let v = value.as_str().unwrap();
-            assert!(
-                v == "holds"
-                    || v.starts_with("declines:")
-                    || v.starts_with("not_reached:")
-                    || v.starts_with("data_dependent:"),
-                "{key}'s rendered verdict {v:?} is not one of the four known tags"
-            );
-        }
-    }
-
-    /// `encoder_reachable = false` (a `ProjectionHead` target) must put
-    /// EVERY encoder-only op at `not_reached`, while `adamw_step` — reached
-    /// on every target — still resolves normally. This is the property a
-    /// `target_modules`-empty vs. non-empty submission MUST differ on: two
-    /// configs that build a genuinely different admission surface must not
-    /// collide on one profile string.
-    #[test]
-    fn projection_head_target_marks_every_encoder_op_not_reached() {
-        let ctx = jammi_kernels::admission::DryRunCtx {
-            device_kind: jammi_kernels::admission::DeviceKind::Cpu,
-            dtype: jammi_kernels::admission::DtypeClass::F32,
-            encoder_reachable: false,
-            disabled_registry_keys: Default::default(),
-        };
-        let profile: serde_json::Value =
-            serde_json::from_str(&dry_run_admission_profile(&ctx)).unwrap();
-        let ops = profile["ops"].as_object().unwrap();
-        for key in [
-            "layer_norm",
-            "rope",
-            "softmax",
-            "geglu",
-            "gelu_erf",
-            "attention_block",
-            "dropout",
-            "low_rank_residual_linear",
-            "mem_efficient_attention",
-            "attention_block_flash",
-        ] {
-            assert_eq!(
-                ops[key].as_str().unwrap(),
-                "not_reached:projection_head_target_builds_no_encoder",
-                "{key} must be not_reached under a ProjectionHead target"
-            );
-        }
-        assert_eq!(ops["adamw_step"].as_str().unwrap(), "holds");
-    }
-
-    /// #546's own literally-named defect, closed: two contexts differing
-    /// ONLY in a build feature (`CUDA_COMPILED` here, standing in for
-    /// `--features cuda`/`flash-attn`, driven hermetically by feeding
-    /// `ATTENTION_BLOCK_FLASH.dry_run()` the feature constant directly
-    /// rather than an actual two-build CI matrix) move `attention_block_flash`'s
-    /// verdict, and therefore the whole profile string.
-    #[test]
-    fn attention_block_flash_verdict_moves_with_cuda_compiled() {
-        let ctx_no_cuda = jammi_kernels::admission::DryRunCtx {
-            device_kind: jammi_kernels::admission::DeviceKind::Cuda,
-            dtype: jammi_kernels::admission::DtypeClass::Bf16,
-            encoder_reachable: true,
-            disabled_registry_keys: Default::default(),
-        };
-        // On THIS build (no `cuda` feature), a `Cuda`-kind context still
-        // resolves `device_supported() == false` inside
-        // `ATTENTION_BLOCK_FLASH.dry_run()`'s FIRST gate
-        // (`!jammi_kernels::admission::CUDA_COMPILED`), so the verdict names
-        // that gate — never silently falls through to the flash-specific
-        // gates below it.
-        assert_eq!(
-            (jammi_kernels::admission::ATTENTION_BLOCK_FLASH.dry_run())(&ctx_no_cuda),
-            jammi_kernels::admission::DryRunVerdict::Declines("cuda_not_compiled")
         );
     }
 

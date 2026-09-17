@@ -48,49 +48,26 @@ check either direction, in `test_declared_set_equals_the_live_standalone_registr
 
 B2's own concern — "an unresolved call site must never read identically to
 'no call exists here'" — is answered differently now than it was by the
-retired text scan, but not abandoned. Precisely what the compiler proves
-and what a source oracle proves, stated separately: `admit`/`admit_cascade`'s
+retired text scan, but not abandoned. Precisely what the compiler proves, stated on its own: `admit`/`admit_cascade`'s
 own `pub fn` signature (`crates/jammi-kernels/src/admission.rs`) requires
 a `&'static jammi_kernels::admission::ProbedOp` argument, and that type is
-now sealed by TWO separate mechanisms, proved separately, neither alone
-sufficient: `#[non_exhaustive]` refuses struct-literal CONSTRUCTION from
-outside the crate (a forged value built with a struct literal in another
-crate is `error[E0639]: cannot create non-exhaustive struct using struct
-expression`); every field being `pub(crate)`, not `pub`, refuses field
-ASSIGNMENT on a value already held from outside the crate, including one
-obtained by copying a real `PROBED_OPS` row (`Copy`, no struct expression
-at all, so `#[non_exhaustive]` alone never engages there — a probe against
-an earlier revision that sealed only `#[non_exhaustive]` copied a real
-row, assigned a field on the copy directly, and `admit` honoured the
-forged value; the same probe against field-private `ProbedOp` is
-`error[E0616]: field `report_key` of struct `ProbedOp` is private`).
-Together, on every `cargo build`, the Rust compiler proves that a call
-site OUTSIDE `jammi-kernels` cannot pass anything but one of `PROBED_OPS`'s
-own named consts, by either route. Neither mechanism has any effect
-INSIDE the crate that defines the type, though — a same-crate forgery
-inside `jammi-kernels` itself is a residual the compiler alone does not
-close, closed instead by a real `syn` source oracle,
-`crates/jammi-kernels/tests/probed_op_construction_sites.rs`, which proves
-every `ProbedOp::new(...)`-equivalent call (matched by its own last two
-path segments under any qualifying prefix, qualified-self syntax,
-`Self::new` inside `impl ProbedOp`, or a same-crate type alias — never a
-fixed, exact segment count — and name-keyed against the real, linked-in
-`PROBED_OPS` constant's own `report_key`s, never a bare count), every
-`ProbedOp { ... }`-equivalent struct literal, every fn whose own return
-type names `ProbedOp`-equivalent, every macro INVOCATION whose own token
-stream names `ProbedOp`/a resolved alias at all (`vec![ProbedOp::new(...)]`
-and `vec![ProbedOp { ... }]` are both opaque to the other directions'
-typed traversal), and every `transmute` whose target type is named
-explicitly (a turbofish, or a `let`-binding's own annotation), anywhere
-under that crate's `src/`/`tests/` trees, is either the one reviewed
-constructor (`ProbedOp::new`'s own body) or one of two named, reviewed
-`#[cfg(test)]` fixture macros. The one HONESTLY NAMED residual neither the
-compiler's two mechanisms nor the oracle closes: a `transmute` (or
-raw-pointer cast) whose target `ProbedOp` type is established some OTHER
-way a syntax-only, type-checker-free scan cannot resolve — `jammi-kernels`
-does not carry `#![forbid(unsafe_code)]`, so this is not claimed closed.
-Together, the compiler's two proofs and the oracle's seven directions
-cover every crate; no one of them alone does. Separately, this
+sealed against every OTHER crate by two separate compiler mechanisms:
+`#[non_exhaustive]` refuses struct-literal CONSTRUCTION from outside the
+crate (`error[E0639]: cannot create non-exhaustive struct using struct
+expression`), and every field being `pub(crate)`, not `pub`, refuses field
+ASSIGNMENT on a value already held from outside the crate, including a
+`Copy` of a real `PROBED_OPS` row (`error[E0616]: field `report_key` of
+struct `ProbedOp` is private`). So on every `cargo build` a call site
+OUTSIDE `jammi-kernels` cannot pass anything but one of `PROBED_OPS`'s own
+named consts. Neither mechanism has any effect INSIDE the defining crate:
+a same-crate forgery in `jammi-kernels` itself is syntactically possible
+and is NOT sealed — and nothing needs it to be, because no durable
+artifact (no `DefinitionHash`, see
+`jammi_db::store::manifest::MaterializationEnv::kernel_admission_profile`'s
+own doc) folds a `ProbedOp` row's admission outcome in; a same-crate
+forgery has no downstream property to violate. This script and
+`ci/tools/probed-ops-index` enumerate the TABLE's rows, which is exactly
+what they claim. Separately, this
 script still checks NON-VACUITY: that real
 `admit`/`admit_cascade` call sites genuinely exist under the scan roots at
 all (`admit_call_sites`, via

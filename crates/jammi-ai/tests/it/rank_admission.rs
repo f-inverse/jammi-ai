@@ -237,14 +237,12 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
     );
 }
 
-/// `cache = Use` on `TrainingSpec::FineTune` is ADMITTED on BOTH embedded
-/// submit entrances (#562, wave-5 F5 — `Use` is no longer refused):
-/// `InferenceSession::enqueue` takes an already-built spec, bypassing every
-/// per-verb entry point, and admits it the SAME way the per-verb funnel
-/// does — `admit_training_spec` is the ONE admission both entrances share,
-/// so neither can enqueue a `cache = Use` job the other refuses.
+/// `cache = Use` on `TrainingSpec::FineTune` is refused on BOTH embedded
+/// submit entrances, not just the per-verb one: `InferenceSession::enqueue`
+/// takes an already-built spec, bypassing every per-verb entry point, and
+/// must still refuse it before writing a row.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_fine_tune_cache_use_is_admitted_through_enqueue_too() {
+async fn a_fine_tune_cache_use_is_refused_through_enqueue_too() {
     let (session, _dir) = session_with_serveable_world(1).await;
     let before = job_count(&session).await;
 
@@ -261,24 +259,35 @@ async fn a_fine_tune_cache_use_is_admitted_through_enqueue_too() {
         cache: jammi_db::store::CachePolicy::Use,
     };
 
-    session
+    let per_verb = session
         .run_training_spec(spec.clone())
         .await
-        .expect("cache = Use must be admitted through the per-verb funnel");
-    assert_eq!(
-        job_count(&session).await,
-        before + 1,
-        "the per-verb entrance must enqueue exactly one row"
+        .expect_err("cache = Use must be refused through the per-verb funnel");
+    assert!(
+        matches!(per_verb, JammiError::Config(_)),
+        "the refusal must be typed, got {per_verb:?}"
     );
 
-    session
-        .enqueue(JobSpec::from(spec), 0)
-        .await
-        .expect("cache = Use must be admitted through the generic enqueue entrance too");
+    let generic = match session.enqueue(JobSpec::from(spec), 0).await {
+        Ok(handle) => panic!(
+            "the generic enqueue entrance admitted a cache=Use job {}",
+            handle.job_id
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(generic, JammiError::Config(_)),
+        "the generic entrance must refuse the same way, got {generic:?}"
+    );
+    assert_eq!(
+        generic.to_string(),
+        per_verb.to_string(),
+        "one rule, one message, whichever entrance the spec came through"
+    );
     assert_eq!(
         job_count(&session).await,
-        before + 2,
-        "the generic entrance must admit the same way, enqueueing a second row"
+        before,
+        "a refused submission must enqueue nothing, through either entrance"
     );
 }
 

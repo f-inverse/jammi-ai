@@ -80,35 +80,6 @@ bindgen_cuda = { version = "0.1.6", optional = true }
 
 [dev-dependencies]
 approx.workspace = true
-# `probed_op_construction_sites.rs`'s source oracle: a real `syn` AST
-# walk over this crate's own `src/` AND `tests/` trees, proving every
-# `ProbedOp::new(...)`-equivalent call (matched by its last two path
-# segments under any qualifying prefix, qualified-self syntax, `Self::new`,
-# or a same-crate type alias — name-keyed against `PROBED_OPS`'s own real
-# `report_key`s, never a bare count), every `ProbedOp { ... }`-equivalent
-# struct literal, every fn whose own return type names `ProbedOp`-
-# equivalent, every macro INVOCATION whose own token stream names
-# `ProbedOp`/an alias, and every `transmute` whose target type is named
-# explicitly, is either the one reviewed constructor (`ProbedOp::new`'s
-# own body) or a reviewed `#[cfg(test)]` fixture macro (that file's own
-# module doc has the full seven-direction argument, including the one
-# honestly-named residual: a `transmute` whose target type is inferred
-# some other way a syntax-only scan cannot resolve) — `ProbedOp` is
-# sealed against every OTHER crate by TWO type-system mechanisms
-# (`#[non_exhaustive]` refuses construction; every field `pub(crate)`,
-# not `pub`, refuses field assignment on an already-held `Copy`, which
-# `#[non_exhaustive]` alone does not touch), but same-crate construction
-# is not something either mechanism, or Rust's own visibility rules
-# generally, can seal — Rust has no "seal from myself" — so this test
-# closes that residual mechanically instead.
-# Same rationale, and the SAME pinned versions
-# already resolved transitively in `Cargo.lock`, as `jammi-ai`/`jammi-db`'s
-# own `syn`/`proc-macro2` dev-deps (`cargo tree -p proc-macro2 -p syn`
-# confirms 2.0.117 / 1.0.106 already resolve here) — this dev-only edge
-# moves nothing new into the lock. Test-only: no production code parses
-# Rust source.
-proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
-syn = { version = "2.0.117", features = ["full", "visit", "extra-traits"] }
 
 [features]
 default = []

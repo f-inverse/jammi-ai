@@ -200,33 +200,23 @@ async fn start_training_runs_to_completion_over_the_wire() {
     let _ = server.handle.await;
 }
 
-/// End to end: `cache = USE` on a `FineTuneSpec` is ADMITTED over the wire —
-/// `admit_training_spec` (the one admission every durable training submit
-/// edge applies) no longer refuses model-level cache reuse for
-/// `TrainingSpec::FineTune`: `train_fine_tune` probes the catalog by
-/// `DefinitionHash` before training and reports the outcome
-/// (`cache_outcome = "reused:{model_id}"` on an exact hit, `"computed"`
-/// otherwise) — see <https://github.com/f-inverse/jammi-ai/issues/562>. This
-/// pins the SERVER's own gRPC decode path: `SubmitJob` returns a
-/// well-formed handle (non-empty `job_id` and `output_model_id`, no
-/// status), and the row it left behind persists the policy the caller
-/// chose — `jobs.spec` carries `cache = Use`, never silently downgraded to
-/// the `Bypass` default. The embedded⇄remote parity on this same property
-/// is pinned separately, in `grpc_remote_compute.rs`'s
-/// `a_fine_tune_cache_use_is_admitted_identically_on_both_paths`.
+/// End to end: `cache = USE` on a `FineTuneSpec` is refused over the wire —
+/// model-level cache reuse is not yet supported (the engine refuses it,
+/// typed, before any `jobs` row is written; see
+/// <https://github.com/f-inverse/jammi-ai/issues/562>). Pins the SERVER's own
+/// gRPC status mapping (`InvalidArgument`, naming the refusal), not merely
+/// the engine's own `JammiError` ai-core's own suite already covers.
 ///
 /// Chosen over `grpc_remote_session.rs` (that file's fixtures own the
 /// embedded/remote session-parity concern, not `JobService`'s own wire
 /// shape): this file already hosts the `JobService` FineTune-over-the-wire
 /// submit harness (`start_request`) this test only needs to parameterise on
-/// `cache`. The worker-quiesced fixture keeps this a pure decode/persist
-/// read (no worker can have claimed, run, or overwritten the row's `spec`
-/// column between the submit and the read below).
+/// `cache`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_fine_tune_cache_use_submission_is_admitted_over_the_wire() {
+async fn a_fine_tune_cache_use_submission_is_refused_over_the_wire() {
     use jammi_server::grpc::proto::inference::CachePolicy;
 
-    let server = start_engine_server_worker_quiesced().await;
+    let server = start_engine_server().await;
     add_training_source(
         channel(server.addr).await,
         None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
@@ -238,42 +228,29 @@ async fn a_fine_tune_cache_use_submission_is_admitted_over_the_wire() {
     let mut request = start_request();
     request.cache = CachePolicy::Use as i32;
 
-    let start = client
+    let status = client
         .submit_job(request)
         .await
-        .expect("cache = USE must be admitted over the wire")
-        .into_inner();
-    assert!(!start.job_id.is_empty(), "SubmitJob returns a job id");
+        .expect_err("cache = USE must be refused before any row is written");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert!(
-        !start.output_model_id.is_empty(),
-        "SubmitJob returns the deterministic output model id"
+        status
+            .message()
+            .contains("model-level cache reuse is not yet supported"),
+        "the refusal must name why: {}",
+        status.message()
     );
 
-    // The persisted row carries the policy the caller chose, not the
-    // `Bypass` default a silent downgrade would leave behind.
-    let embedded = server
-        .engine
-        .catalog()
-        .get_job(&start.job_id)
-        .await
-        .expect("get_job");
-    assert!(
-        embedded.spec.contains("\"cache\":\"use\""),
-        "the persisted spec must carry cache = Use, not the Bypass default: {}",
-        embedded.spec
-    );
-
-    // The admitted submission leaves exactly the one queued row.
+    // The refusal leaves no `fine_tune` row queued.
     let listed = client
         .list_jobs(ListJobsRequest {})
         .await
         .expect("list_jobs")
         .into_inner()
         .jobs;
-    assert_eq!(
-        listed.len(),
-        1,
-        "an admitted submit must write exactly the one jobs row: {listed:?}"
+    assert!(
+        listed.is_empty(),
+        "a refused submit must never write a jobs row: {listed:?}"
     );
 
     let _ = server.shutdown.send(());

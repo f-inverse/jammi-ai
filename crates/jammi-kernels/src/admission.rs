@@ -1077,14 +1077,8 @@ fn fired_disables() -> &'static RwLock<HashSet<String>> {
 }
 
 /// The PURE, side-effect-free "is `op` disabled" decision — exact match
-/// OR the `"all"` wildcard, matching every predicate the live and dry
-/// paths below consult before either one ever touches mutable state.
-///
-/// This is the ONE implementation of that decision in the crate:
-/// `op_is_disabled` (the live admission path) and
-/// `DryRunCtx::op_is_disabled_here` (the dry, pre-training path) both
-/// call it directly, with no second copy of the `"all"`/exact-match
-/// logic to drift out of sync.
+/// OR the `"all"` wildcard, computed before [`op_is_disabled`] (its one
+/// caller) ever touches mutable state.
 fn disable_decision(requested: &HashSet<String>, op: &str) -> bool {
     !requested.is_empty() && (requested.contains("all") || requested.contains(op))
 }
@@ -1762,399 +1756,36 @@ pub enum ProbedOpKind {
     },
 }
 
-/// The device KIND [`DryRunCtx`] needs — the same three-variant shape as
-/// `jammi_db::store::manifest::ComputeDeviceKind`, restated here because
-/// this crate has NO `jammi-*` dependency at all (a leaf crate every other
-/// `jammi-*` crate builds on): `jammi-ai`, the one caller that has both
-/// types in scope, converts a `ComputeDeviceKind` to this type with a
-/// trivial, lossless three-arm match at the [`DryRunCtx`] construction
-/// site, rather than this crate depending "up" into `jammi-db` for one enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeviceKind {
-    /// CPU.
-    Cpu,
-    /// A CUDA device, any ordinal.
-    Cuda,
-    /// An Apple Metal device, any ordinal.
-    Metal,
-}
-
-/// #546's DETERMINISTIC, PRE-TRAINING inputs (
-/// round): build features, this attempt's resolved device kind, its
-/// backbone dtype class, whether the ENCODER arm is even reachable at all
-/// (a `target_modules`-empty `ProjectionHead` run never builds an encoder,
-/// so every encoder op is [`DryRunVerdict::NotReached`] for such a run,
-/// never merely undetermined), and —
-/// which registry keys `JAMMI_KERNELS_DISABLE` names for THIS process.
-/// Everything a [`ProbedOp::dry_run`] fn needs and nothing else — no
-/// tensor, no catalog handle, no I/O.
-///
-/// **`disabled_registry_keys` closes a real hash collision, not a
-/// theoretical one.** [`admit`]/[`admit_cascade`] both consult
-/// `op_is_disabled` (via `disabled_ops`) BEFORE the predicate, in
-/// every build, unconditionally — a disabled op is `Eager`/`Declined`
-/// regardless of what its predicate would have said, whether the entry
-/// disabling it is an EXACT registry-key match or the documented `"all"`
-/// wildcard (`disable_decision`, the ONE decision both this path and
-/// `op_is_disabled` share — see that fn's own doc). Before this field
-/// existed, [`DryRunCtx`] carried none of that: two attempts of the SAME
-/// spec, one with `JAMMI_KERNELS_DISABLE` unset and one forcing every
-/// fused op eager, produced the IDENTICAL `kernel_admission_profile`
-/// string (nothing in the ctx read the env var at all) and therefore the
-/// IDENTICAL `MaterializationEnv`/definition hash — with `CachePolicy::Use`
-/// admitted (#562), the second attempt would be served the FIRST
-/// attempt's already-published (fused) bytes, silently defeating the
-/// disable it explicitly requested. The caller (`jammi-ai`'s
-/// `train_fine_tune`) reads [`disabled_ops_requested`] ONCE, at
-/// [`DryRunCtx`] construction, and threads the result in here — every
-/// `dry_run` fn (via [`dry_run_all`]'s own disabled-check, applied
-/// uniformly before any row's own fn runs) stays a PURE function of this
-/// ctx, never a second, independent read of the live process env
-/// mid-computation. `HashSet<String>`, matching `disable_decision`'s own
-/// parameter type exactly — the SAME type `disabled_ops` itself returns,
-/// so a caller can thread [`disabled_ops_requested`]'s output straight
-/// through with no collection-type conversion at the boundary.
-#[derive(Debug, Clone)]
-pub struct DryRunCtx {
-    pub device_kind: DeviceKind,
-    pub dtype: DtypeClass,
-    /// `!config.target_modules.is_empty()` — the SAME predicate
-    /// `jammi-ai`'s `train_fine_tune` itself branches on to decide
-    /// `ProjectionHead` vs `EncoderAdapters`.
-    pub encoder_reachable: bool,
-    /// [`disabled_ops_requested`]'s own output, read ONCE at ctx
-    /// construction — see this struct's own doc for why this field exists
-    /// at all.
-    pub disabled_registry_keys: std::collections::HashSet<String>,
-}
-
-impl DryRunCtx {
-    /// [`device_is_supported`]'s own rule (`d.is_cpu() || (cfg!(feature =
-    /// "cuda") && d.is_cuda())`), restated over [`DeviceKind`] rather than a
-    /// real `candle_core::Device` — the SAME two build/device facts, read
-    /// without ever constructing one.
-    pub fn device_supported(&self) -> bool {
-        match self.device_kind {
-            DeviceKind::Cpu => true,
-            DeviceKind::Cuda => CUDA_COMPILED,
-            DeviceKind::Metal => false,
-        }
-    }
-
-    pub fn is_cuda(&self) -> bool {
-        self.device_kind == DeviceKind::Cuda && CUDA_COMPILED
-    }
-
-    /// Whether ANY registry key `op` could dispatch under, for THIS ctx's
-    /// own `dtype`, is named in `disabled_registry_keys` — the SAME
-    /// dtype-narrowing [`ProbedOp::registry_keys_for`] already applies for
-    /// resolving the concrete key `admit`/`admit_cascade` would actually
-    /// pass, and the SAME `disable_decision` predicate `op_is_disabled`
-    /// (the live path) calls, so this asks EXACTLY the question a live
-    /// run answers for that op — including the `"all"` wildcard — never
-    /// a second, narrower re-implementation.
-    fn op_is_disabled_here(&self, op: &ProbedOp) -> bool {
-        op.registry_keys_for(self.dtype)
-            .any(|key| disable_decision(&self.disabled_registry_keys, key))
-    }
-}
-
-/// One [`ProbedOp`]'s deterministic, pre-training admission verdict (#546)
-/// — a pure function of [`DryRunCtx`], never a
-/// real tensor, never a dispatch counter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DryRunVerdict {
-    /// Every gate this dry-run can resolve holds; no further domain
-    /// condition this dry-run lacks the data to resolve exists FOR THIS OP
-    /// (contrast [`Self::DataDependent`]).
-    Holds,
-    /// A gate this dry-run CAN resolve fully (device support, a build
-    /// feature, a dtype domain) refuses — names which one.
-    Declines(&'static str),
-    /// This op's real call site is never reached for this job's config at
-    /// all: an encoder op under a `ProjectionHead` target, or
-    /// `cast_scale`/`cast_add` for an `F32` backbone (their own call sites
-    /// only ever reach the cast-boundary admission on the `BF16`/`F16` arms
-    /// of a `match base_dtype`), or an [`ProbedOpKind::InternalSubkernel`]
-    /// row, which carries no independent admission at all.
-    NotReached(&'static str),
-    /// Every gate this dry-run CAN resolve holds, but the REAL predicate
-    /// also checks a condition this dry-run has no data for (a real batch's
-    /// sequence length, a real base checkpoint's own bias shape) — named
-    /// explicitly, never silently rounded up to [`Self::Holds`].
-    ///
-    /// **This variant is why the claim "the data-dependent `seq` arm is the
-    /// ONLY residual" does not hold for the real predicates, read directly
-    /// rather than taken on trust:** `attention_block`'s predicate ALSO
-    /// refuses on `seq_within_attention_block_max_seq`;
-    /// `mem_efficient_attention`'s ENTIRE admission is gated on `seq <=
-    /// ATTENTION_BLOCK_MAX_SEQ` — it exists specifically as the large-`seq`
-    /// arm `attention_block` cannot serve; and `lora_linear`'s predicate
-    /// refuses `bias_is_frozen_leaf` for a base checkpoint whose bias is a
-    /// trainable `Var` rather than frozen — a per-CHECKPOINT fact this
-    /// dry-run has no principled way to resolve without loading and
-    /// inspecting the base model's own bias tensor (out of scope for a
-    /// "no I/O" pre-training fold). Each is stated here, not silently
-    /// folded into [`Self::Holds`].
-    DataDependent(&'static str),
-}
-
-impl DryRunVerdict {
-    /// The profile string's per-op value — `"holds"`, `"declines:{reason}"`,
-    /// `"not_reached:{reason}"`, or `"data_dependent:{reason}"`. A plain,
-    /// grep-able tag rather than nested JSON, so two profiles differing in
-    /// exactly one op's verdict differ in exactly one substring.
-    pub fn render(self) -> String {
-        match self {
-            DryRunVerdict::Holds => "holds".to_string(),
-            DryRunVerdict::Declines(r) => format!("declines:{r}"),
-            DryRunVerdict::NotReached(r) => format!("not_reached:{r}"),
-            DryRunVerdict::DataDependent(r) => format!("data_dependent:{r}"),
-        }
-    }
-}
-
-/// The uniform "device-supported, dtype in {F32,BF16,F16} on either device"
-/// shape [`LAYER_NORM`]/[`ROPE`]/[`SOFTMAX`]/[`GEGLU`] all share
-/// (`fused_admission_predicate` layer_norm.rs, `rope_admission_predicate`
-/// modernbert.rs, `softmax_admission_predicate` attention_cascade.rs,
-/// `geglu_admission_predicate` modernbert.rs) — [`DtypeClass`] only ever
-/// names F32/Bf16/F16 (`jammi_numerics::ComputePrecision`'s own three
-/// variants), so the dtype half of this gate is trivially always satisfied;
-/// only the device half can refuse. The remaining contiguity/rank/
-/// `MAX_HIDDEN` checks each predicate also makes are assumed satisfied by
-/// this trainer's own tower construction for every shape it produces,
-/// never independently re-verified per shape here.
-fn dry_run_uniform_device_gate(ctx: &DryRunCtx) -> DryRunVerdict {
-    if !ctx.encoder_reachable {
-        return DryRunVerdict::NotReached("projection_head_target_builds_no_encoder");
-    }
-    if ctx.device_supported() {
-        DryRunVerdict::Holds
-    } else {
-        DryRunVerdict::Declines("device_is_cpu_or_cuda")
-    }
-}
-
-/// `gelu_admission_predicate`, `crates/jammi-encoders/src/activations.rs`:
-/// the ONE two-arm op whose dtype domain genuinely differs BY DEVICE —
-/// `F32`-only on CPU, `F32`/`BF16`/`F16` on CUDA. Resolved fully here: no
-/// residual.
-fn dry_run_gelu_erf(ctx: &DryRunCtx) -> DryRunVerdict {
-    if !ctx.encoder_reachable {
-        return DryRunVerdict::NotReached("projection_head_target_builds_no_encoder");
-    }
-    if !ctx.device_supported() {
-        return DryRunVerdict::Declines("device_is_cpu_or_cuda");
-    }
-    if ctx.is_cuda() || ctx.dtype == DtypeClass::F32 {
-        DryRunVerdict::Holds
-    } else {
-        DryRunVerdict::Declines("dtype_f32_only_on_cpu")
-    }
-}
-
-/// `attention_block_admission_predicate`,
-/// `crates/jammi-encoders/src/attention_cascade.rs`: device/dtype resolved
-/// here (CPU: F32-only; CUDA: all three, mirroring [`dry_run_gelu_erf`]'s
-/// split) — but the predicate ALSO refuses
-/// `seq_within_attention_block_max_seq` and requires a fixed
-/// `ATTENTION_BLOCK_HEAD_DIM`, both real-batch/architecture facts this
-/// dry-run does not have. See [`DryRunVerdict::DataDependent`]'s own doc
-/// for why this is stated, not rounded to `Holds`.
-fn dry_run_attention_block(ctx: &DryRunCtx) -> DryRunVerdict {
-    if !ctx.encoder_reachable {
-        return DryRunVerdict::NotReached("projection_head_target_builds_no_encoder");
-    }
-    if !ctx.device_supported() {
-        return DryRunVerdict::Declines("device_is_cpu_or_cuda");
-    }
-    let dtype_ok = ctx.is_cuda() || ctx.dtype == DtypeClass::F32;
-    if !dtype_ok {
-        return DryRunVerdict::Declines("dtype_f32_matching_between_qkv_and_mask_on_cpu");
-    }
-    DryRunVerdict::DataDependent("seq_within_attention_block_max_seq_and_fixed_head_dim")
-}
-
-/// `lora_linear_admission_predicate`,
-/// `crates/jammi-lora/src/lora_linear.rs`: device resolved here;
-/// `lora_dtype != F32` is assumed always false per that predicate's own doc
-/// ("today's workspace fact is that lora_a/lora_b are always built F32");
-/// `bias_is_frozen_leaf` is a per-BASE-CHECKPOINT fact (whether the frozen
-/// base's bias is a trainable `Var`) this dry-run cannot resolve without
-/// loading and inspecting the base model. Shared by [`DROPOUT`] and
-/// [`LOW_RANK_RESIDUAL_LINEAR`] — same dispatch decision, two report keys.
-fn dry_run_low_rank_residual_linear(ctx: &DryRunCtx) -> DryRunVerdict {
-    if !ctx.encoder_reachable {
-        return DryRunVerdict::NotReached("projection_head_target_builds_no_encoder");
-    }
-    if !ctx.device_supported() {
-        return DryRunVerdict::Declines("device_is_cpu_or_cuda");
-    }
-    DryRunVerdict::DataDependent("bias_is_frozen_leaf_depends_on_the_base_checkpoint")
-}
-
-/// `admit_cast_boundary`'s own callers (`low_rank_residual_linear.rs`'s
-/// `bwd`) only ever reach it on the `BF16`/`F16` arms of a `match
-/// base_dtype` — never `F32` — and `admit_cast_boundary` passes
-/// `predicate_holds = true` unconditionally once reached. So this op is
-/// either not reached at all (`F32` backbone) or deterministically holds
-/// (`BF16`/`F16`) — no residual either way. Shared by [`CAST_SCALE`] and
-/// [`CAST_ADD`].
-fn dry_run_cast_boundary(ctx: &DryRunCtx) -> DryRunVerdict {
-    if !ctx.encoder_reachable {
-        DryRunVerdict::NotReached("projection_head_target_builds_no_encoder")
-    } else if ctx.dtype == DtypeClass::F32 {
-        DryRunVerdict::NotReached("f32_backbone_never_reaches_the_cast_boundary")
-    } else {
-        DryRunVerdict::Holds
-    }
-}
-
-/// `fused_admission_predicate`, `crates/jammi-ai/src/fine_tune/adamw.rs`:
-/// device only — the optimizer's own tensors are F32 regardless of
-/// backbone dtype (`PROBED_OPS`'s own "the optimizer's dtype domain is not
-/// a dtype class" doc), and the trainer always reaches the optimizer step,
-/// `ProjectionHead` target included (unlike every encoder op, no
-/// `encoder_reachable` gate here).
-fn dry_run_adamw_step(ctx: &DryRunCtx) -> DryRunVerdict {
-    if ctx.device_supported() {
-        DryRunVerdict::Holds
-    } else {
-        DryRunVerdict::Declines("device_is_cpu_or_cuda")
-    }
-}
-
-/// `mem_efficient_attention_predicate`, `attention_cascade.rs`: device/dtype
-/// resolved here (identical CPU/CUDA split to [`dry_run_attention_block`]);
-/// its admission is EXCLUSIVELY seq-dependent beyond that (`seq <=
-/// ATTENTION_BLOCK_MAX_SEQ` declines — this op exists as the large-`seq`
-/// arm `attention_block` cannot serve — and it also declines whenever the
-/// flash cascade already fused).
-fn dry_run_mem_efficient_attention(ctx: &DryRunCtx) -> DryRunVerdict {
-    if !ctx.encoder_reachable {
-        return DryRunVerdict::NotReached("projection_head_target_builds_no_encoder");
-    }
-    if !ctx.device_supported() {
-        return DryRunVerdict::Declines("device_is_cpu_or_cuda");
-    }
-    let dtype_ok = ctx.is_cuda() || ctx.dtype == DtypeClass::F32;
-    if !dtype_ok {
-        return DryRunVerdict::Declines("dtype_f32_only_on_cpu");
-    }
-    DryRunVerdict::DataDependent("seq_within_attention_block_max_seq_and_flash_outcome")
-}
-
-/// The cascade's own compiled/device short-circuit ([`CUDA_COMPILED`]/
-/// [`FLASH_COMPILED`], this run's device kind) is fully resolved here —
-/// #546's own literally-named defect (two CUDA builds differing only in
-/// `--features flash-attn`) is closed by THIS fn alone. Beyond that gate,
-/// the real cascade decision is real-batch shape/seq dependent — genuinely
-/// singular for THIS op.
-fn dry_run_attention_block_flash(ctx: &DryRunCtx) -> DryRunVerdict {
-    if !ctx.encoder_reachable {
-        return DryRunVerdict::NotReached("projection_head_target_builds_no_encoder");
-    }
-    if !CUDA_COMPILED {
-        return DryRunVerdict::Declines("cuda_not_compiled");
-    }
-    if !FLASH_COMPILED {
-        return DryRunVerdict::Declines("flash_not_compiled");
-    }
-    if !ctx.is_cuda() {
-        return DryRunVerdict::Declines("device_is_cpu_or_metal_not_cuda");
-    }
-    DryRunVerdict::DataDependent("real_batch_shape_and_sequence_length")
-}
-
-/// [`ProbedOpKind::InternalSubkernel`] rows ([`ROPE_POSITIONS`],
-/// [`SCALED_CAST_ADD`]) carry no registry key and no independent
-/// admission — their execution is proven only by their `parent`'s fused
-/// arm dispatching. Every [`ProbedOp`] instance needs a `dry_run` fn (a
-/// required struct field), so these two get one that states that plainly;
-/// callers filter `InternalSubkernel` rows out of any rendered profile by
-/// `kind`, never by re-checking this verdict.
-fn dry_run_internal_subkernel(_ctx: &DryRunCtx) -> DryRunVerdict {
-    DryRunVerdict::NotReached(
-        "internal_subkernel_carries_no_independent_admission_the_parents_fused_dispatch_proves_it",
-    )
-}
-
-/// A private, un-nameable marker type — [`ProbedOp`]'s own `_sealed`
-/// field. Belt-and-suspenders alongside that struct's OWN field privacy
-/// (see its doc): a caller that copies `ProbedOp`'s field NAMES
-/// byte-for-byte into a look-alike type in another crate and tries to
-/// coerce it can never actually type-check (Rust has no structural
-/// typing), but this field's PRIVATE type means even naming it in an
-/// attempted literal is a compile error on its own, before visibility of
-/// the OTHER fields is even checked.
-#[derive(Debug, Clone, Copy)]
-struct Sealed;
-
 /// One row of [`PROBED_OPS`]: a dtype-neutral report key, how its dispatch
-/// is observable, the registry key(s) its kernel's own `admit()` /
-/// `admit_cascade()` call site passes per dtype class, and this row's OWN
-/// deterministic, pre-training dry-run verdict function.
+/// is observable, and the registry key(s) its kernel's own `admit()` /
+/// `admit_cascade()` call site passes, per dtype class.
 ///
-/// **Sealed — two properties, two DIFFERENT mechanisms, proved
-/// separately.** (1) No OTHER crate can CONSTRUCT a fresh `ProbedOp`
-/// value: `#[non_exhaustive]` refuses struct-literal syntax and
-/// exhaustive matching from outside this crate — reproduced directly (a
-/// forged literal in `jammi-encoders` fails with `error[E0639]: cannot
-/// create non-exhaustive struct using struct expression`). (2) No OTHER
-/// crate can MUTATE a field on a `ProbedOp` value it already holds,
-/// including one obtained by copying a real [`PROBED_OPS`] row (`Copy`,
-/// no struct expression involved at all, so `#[non_exhaustive]` alone
-/// never engages): every field is `pub(crate)`, not `pub`, so
-/// `let mut copied = LAYER_NORM; copied.report_key = "forged";` from
-/// another crate is refused with `error[E0616]` naming `report_key` as a
-/// private field of `ProbedOp` — reproduced directly the same way. An
-/// earlier revision sealed ONLY (1) (every field stayed `pub`, relying on
-/// `#[non_exhaustive]` alone) — a probe copied a real row, assigned
-/// `report_key`/`registry`/`dry_run` on the copy, and `admit` honoured
-/// the forged value with no struct expression anywhere for
-/// `#[non_exhaustive]` to refuse. Together, (1) and (2) cover every
-/// OTHER crate: there is no third way to obtain a `ProbedOp` value
-/// without either a struct expression or field access, and both are
-/// blocked. Outside this crate, every field is read through its own
-/// accessor ([`Self::report_key`], [`Self::kind`], [`Self::registry`],
-/// [`Self::dry_run`]) instead.
-///
-/// A same-crate forgery inside `jammi-kernels` itself remains POSSIBLE —
-/// `#[non_exhaustive]`/field-privacy sealing has no effect within the
-/// defining crate; Rust has no "seal from myself" mechanism — closed
-/// instead by `every_probed_op_construction_site_is_reviewed`
-/// (`crates/jammi-kernels/tests/probed_op_construction_sites.rs`), a
-/// `syn` source oracle over this crate's own `src/`/`tests/` trees that
-/// reviews every `ProbedOp::new(...)`-equivalent call (matched by its
-/// LAST TWO path segments under any qualifying prefix, qualified-self
-/// syntax, `Self::new` inside `impl ProbedOp`, or a same-crate type
-/// alias — never a fixed, exact segment count — and name-keyed against
-/// each real [`PROBED_OPS`] row's own `report_key`, never a bare count),
-/// every `ProbedOp { ... }`-equivalent struct literal, every fn whose own
-/// return type names `ProbedOp`-equivalent, every macro INVOCATION whose
-/// own token stream names `ProbedOp`/an alias at all (the shape a call or
-/// literal wrapped inside `vec![...]` takes — opaque to the typed
-/// traversal the other directions use), and every `transmute` whose
-/// target type is named explicitly (a turbofish, or a `let`-binding's own
-/// annotation) — that file's own module doc has the full seven-direction
-/// argument, including the one HONESTLY NAMED residual neither this
-/// struct's own two mechanisms nor that oracle closes: a `transmute` (or
-/// raw-pointer cast) whose target type is established some OTHER way a
-/// syntax-only, type-checker-free scan cannot resolve — this crate does
-/// NOT carry `#![forbid(unsafe_code)]`, so that residual is not claimed
-/// closed. A fifth vector this doc names but neither mechanism nor the
-/// oracle needs to close (mutation from a same-crate `&mut` reference
-/// into an existing row) is not a real vector at all: every [`PROBED_OPS`]
-/// entry is a `const`, never a `static mut` or interior-mutable cell.
+/// **Cross-crate callers are compiler-bound to this table, same-crate
+/// construction is not sealed, and no property rests on that.**
+/// `#[non_exhaustive]` refuses a struct-literal/exhaustive match from
+/// outside this crate, and every field is `pub(crate)` rather than `pub`
+/// (read through [`Self::report_key`]/[`Self::kind`]/[`Self::registry`]
+/// outside this crate), so another crate can neither construct a fresh
+/// `ProbedOp` value nor mutate a field on one it already holds — both are
+/// plain compiler refusals (`error[E0639]`, `error[E0616]`), not something
+/// this crate has to police at review time. A same-crate forgery inside
+/// `jammi-kernels` itself remains syntactically POSSIBLE (`#[non_exhaustive]`/
+/// field-privacy sealing has no effect within the defining crate), and
+/// nothing here closes it — because nothing needs to: no `DefinitionHash`
+/// or other durable artifact folds a `ProbedOp` row's admission outcome in
+/// (see `jammi_db::store::manifest::MaterializationEnv::kernel_admission_profile`'s
+/// own doc), so a same-crate forgery has no downstream property to violate.
+/// `ci/tools/probed-ops-index` and the eager-disable sweep
+/// (`ci/scripts/perf/test_finetune_ab_disable_op_keys.py`) both enumerate
+/// [`PROBED_OPS`] itself — the TABLE's rows — which is exactly what they
+/// claim to do; neither depends on same-crate construction being sealed.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ProbedOp {
     /// The dtype-NEUTRAL key this op appears under in a durable acceleration
     /// report and in `ci/release-feature-manifest.json`'s capability lists.
     /// `pub(crate)`, not `pub` — read it through [`Self::report_key`]
-    /// outside this crate; see this struct's own "Sealed" doc for why a
-    /// `pub` field is not merely a stylistic choice here.
+    /// outside this crate.
     pub(crate) report_key: &'static str,
     /// How (or whether) this op's dispatch decision can be observed. Read
     /// it through [`Self::kind`] outside this crate.
@@ -2164,57 +1795,31 @@ pub struct ProbedOp {
     /// [`ProbedOpKind::InternalSubkernel`], which has no key at all. Read
     /// it through [`Self::registry`] outside this crate.
     pub(crate) registry: &'static [(DtypeClass, &'static str)],
-    /// This row's own deterministic, pre-training dry-run verdict function
-    /// (#546) — moved onto the row itself so
-    /// a new [`PROBED_OPS`] row cannot exist without a `dry_run` fn (a
-    /// missing field in a struct literal does not compile), replacing a
-    /// SECOND, string-keyed enumeration of these same ops that used to live
-    /// in `jammi-ai` as a `match report_key { "layer_norm" => ..., ... }` —
-    /// a rival enumeration a test could only check was complete at runtime.
-    /// `jammi-ai`'s `dry_run_admission_profile`-shaped caller is now
-    /// `PROBED_OPS.iter().map(|op| (op.report_key(), (op.dry_run())(ctx)))`
-    /// — no match over `report_key` anywhere in that crate. Read it
-    /// through [`Self::dry_run`] outside this crate.
-    pub(crate) dry_run: fn(&DryRunCtx) -> DryRunVerdict,
-    /// [`Sealed`]'s own doc — this struct's doc has the full argument for
-    /// why this field exists at all.
-    _sealed: Sealed,
 }
 
 impl ProbedOp {
-    /// The ONE reviewed way to build a [`ProbedOp`] — `pub(crate)`, so
-    /// every [`PROBED_OPS`] row (and every `#[cfg(test)]` fixture row in
-    /// this crate's own test modules) constructs through this one
-    /// function. A struct literal naming [`Sealed`] directly still
-    /// compiles, being same-crate (`#[non_exhaustive]`/field-privacy
-    /// sealing has no effect within the defining crate) — the ONE literal
-    /// this fn's own body contains, and the only one this crate's `syn`
-    /// oracle (`crates/jammi-kernels/tests/probed_op_construction_sites.rs`)
-    /// reviews as legitimate; any OTHER struct literal, or any OTHER fn
-    /// whose return type names `ProbedOp`, REDs it.
+    /// The ONE way to build a [`ProbedOp`] — `pub(crate)`, so every
+    /// [`PROBED_OPS`] row (and every `#[cfg(test)]` fixture row in this
+    /// crate's own test modules) constructs through this one function.
     const fn new(
         report_key: &'static str,
         kind: ProbedOpKind,
         registry: &'static [(DtypeClass, &'static str)],
-        dry_run: fn(&DryRunCtx) -> DryRunVerdict,
     ) -> Self {
         ProbedOp {
             report_key,
             kind,
             registry,
-            dry_run,
-            _sealed: Sealed,
         }
     }
 
     /// The dtype-NEUTRAL key this op appears under — see the field's own
-    /// doc. Read-only: there is no setter, by design (see this struct's
-    /// own "Sealed" doc — every field is `pub(crate)`, so an OUTSIDE
-    /// crate can neither construct a fresh `ProbedOp` NOR mutate a field
-    /// on one it already holds, including a `Copy`-obtained one; a
-    /// `pub(crate)` field is exactly as invisible to another crate's own
-    /// `foo.report_key = ...` assignment as a fully private one, the
-    /// same compile error either way).
+    /// doc. Read-only: there is no setter, by design (every field is
+    /// `pub(crate)`, so an OUTSIDE crate can neither construct a fresh
+    /// `ProbedOp` NOR mutate a field on one it already holds, including a
+    /// `Copy`-obtained one; a `pub(crate)` field is exactly as invisible to
+    /// another crate's own `foo.report_key = ...` assignment as a fully
+    /// private one, the same compile error either way).
     pub fn report_key(&self) -> &'static str {
         self.report_key
     }
@@ -2234,12 +1839,6 @@ impl ProbedOp {
     /// source oracle proving a row's own shape).
     pub fn registry(&self) -> &'static [(DtypeClass, &'static str)] {
         self.registry
-    }
-
-    /// This row's own dry-run verdict function — see the field's own
-    /// doc. Read-only, same rationale as [`Self::report_key`].
-    pub fn dry_run(&self) -> fn(&DryRunCtx) -> DryRunVerdict {
-        self.dry_run
     }
 }
 
@@ -2406,37 +2005,31 @@ pub const LAYER_NORM: ProbedOp = ProbedOp::new(
     "layer_norm",
     ProbedOpKind::TwoArm,
     &[(DtypeClass::Any, "layer_norm_fused")],
-    dry_run_uniform_device_gate,
 );
 pub const ROPE: ProbedOp = ProbedOp::new(
     "rope",
     ProbedOpKind::TwoArm,
     &[(DtypeClass::Any, "rope_fused")],
-    dry_run_uniform_device_gate,
 );
 pub const SOFTMAX: ProbedOp = ProbedOp::new(
     "softmax",
     ProbedOpKind::TwoArm,
     &[(DtypeClass::Any, "softmax_last_dim_fused")],
-    dry_run_uniform_device_gate,
 );
 pub const GEGLU: ProbedOp = ProbedOp::new(
     "geglu",
     ProbedOpKind::TwoArm,
     &[(DtypeClass::Any, "geglu_fused")],
-    dry_run_uniform_device_gate,
 );
 pub const GELU_ERF: ProbedOp = ProbedOp::new(
     "gelu_erf",
     ProbedOpKind::TwoArm,
     &[(DtypeClass::Any, "gelu_erf_fused")],
-    dry_run_gelu_erf,
 );
 pub const ATTENTION_BLOCK: ProbedOp = ProbedOp::new(
     "attention_block",
     ProbedOpKind::TwoArm,
     &[(DtypeClass::Any, "attention_block_fused")],
-    dry_run_attention_block,
 );
 /// The `dropout` REPORT row — same dispatch decision as
 /// [`LOW_RANK_RESIDUAL_LINEAR`] (both are `lora_linear_fused`, one dispatch,
@@ -2447,7 +2040,6 @@ pub const DROPOUT: ProbedOp = ProbedOp::new(
     "dropout",
     ProbedOpKind::TwoArm,
     &[(DtypeClass::Any, "lora_linear_fused")],
-    dry_run_low_rank_residual_linear,
 );
 /// The call-site-facing const for `lora_linear_fused` — `jammi-lora`'s
 /// `lora_linear.rs` admits under this one.
@@ -2455,7 +2047,6 @@ pub const LOW_RANK_RESIDUAL_LINEAR: ProbedOp = ProbedOp::new(
     "low_rank_residual_linear",
     ProbedOpKind::TwoArm,
     &[(DtypeClass::Any, "lora_linear_fused")],
-    dry_run_low_rank_residual_linear,
 );
 pub const CAST_SCALE: ProbedOp = ProbedOp::new(
     "cast_scale",
@@ -2464,7 +2055,6 @@ pub const CAST_SCALE: ProbedOp = ProbedOp::new(
         (DtypeClass::Bf16, "cast_scale_bf16_f32"),
         (DtypeClass::F16, "cast_scale_f16_f32"),
     ],
-    dry_run_cast_boundary,
 );
 pub const CAST_ADD: ProbedOp = ProbedOp::new(
     "cast_add",
@@ -2473,7 +2063,6 @@ pub const CAST_ADD: ProbedOp = ProbedOp::new(
         (DtypeClass::Bf16, "cast_add_bf16"),
         (DtypeClass::F16, "cast_add_f16"),
     ],
-    dry_run_cast_boundary,
 );
 // `DtypeClass::Any`, NOT `F32` — see this table's "the optimizer's dtype
 // domain is not a dtype CLASS" note. The op's own tensors are F32-only;
@@ -2483,13 +2072,11 @@ pub const ADAMW_STEP: ProbedOp = ProbedOp::new(
     "adamw_step",
     ProbedOpKind::TwoArm,
     &[(DtypeClass::Any, "adamw_step_fused")],
-    dry_run_adamw_step,
 );
 pub const MEM_EFFICIENT_ATTENTION: ProbedOp = ProbedOp::new(
     "mem_efficient_attention",
     ProbedOpKind::Cascade,
     &[(DtypeClass::Any, "mem_efficient_attention")],
-    dry_run_mem_efficient_attention,
 );
 /// See this constant's sibling doc paragraph above ("`attention_block_flash`
 /// IS a row") for why this row exists at all (#546).
@@ -2497,7 +2084,6 @@ pub const ATTENTION_BLOCK_FLASH: ProbedOp = ProbedOp::new(
     "attention_block_flash",
     ProbedOpKind::Cascade,
     &[(DtypeClass::Any, "attention_block_flash")],
-    dry_run_attention_block_flash,
 );
 pub const ROPE_POSITIONS: ProbedOp = ProbedOp::new(
     "rope_positions",
@@ -2505,7 +2091,6 @@ pub const ROPE_POSITIONS: ProbedOp = ProbedOp::new(
         parent: "attention_block_flash",
     },
     &[],
-    dry_run_internal_subkernel,
 );
 pub const SCALED_CAST_ADD: ProbedOp = ProbedOp::new(
     "scaled_cast_add",
@@ -2513,7 +2098,6 @@ pub const SCALED_CAST_ADD: ProbedOp = ProbedOp::new(
         parent: "low_rank_residual_linear",
     },
     &[],
-    dry_run_internal_subkernel,
 );
 
 pub const PROBED_OPS: &[ProbedOp] = &[
@@ -2539,51 +2123,6 @@ pub fn probed_op(report_key: &str) -> Option<&'static ProbedOp> {
     PROBED_OPS.iter().find(|op| op.report_key == report_key)
 }
 
-/// Every non-[`ProbedOpKind::InternalSubkernel`] [`PROBED_OPS`] row's OWN
-/// dry-run verdict, keyed by `report_key` — the exact enumeration
-/// `jammi-ai`'s `dry_run_admission_profile` renders into a profile string.
-///
-/// **Lives here, not in `jammi-ai`, on purpose.** The `(op.dry_run)(ctx)`
-/// fn-pointer struct-field call this loop makes is EXACTLY the shape
-/// `jammi-ai/tests/it/pinned_source_gate.rs`'s
-/// `fine_tune_reachable_sites_are_all_reviewed` call-graph oracle traces
-/// and fails closed on when it cannot find a `dry_run: ...` assignment
-/// anywhere in ITS OWN traced universe (`jammi-db`/`jammi-ai`'s
-/// reverse-dependency closure within the workspace, that gate's own
-/// documented "binding surface" — `jammi-kernels` is a FORWARD dependency
-/// of both, correctly outside it). Every `dry_run: ...` assignment IS
-/// here, in [`PROBED_OPS`]'s own const declarations — so keeping the
-/// dispatch loop here too means the fn-pointer call and its every
-/// assignment live in the SAME file the gate never scans, rather than
-/// asking that gate to special-case a crate outside its own documented
-/// universe, or asking `jammi-ai` to carry a call shape that crate's own
-/// reachability oracle cannot resolve.
-///
-/// **The `JAMMI_KERNELS_DISABLE` check runs HERE, once, uniformly — never
-/// duplicated into each row's own `dry_run` fn**
-/// : `admit`/`admit_cascade` both consult the disable list BEFORE
-/// the predicate, for every op, identically — a
-/// `DryRunCtx::op_is_disabled_here`-shaped check ahead of
-/// `(op.dry_run)(ctx)` mirrors that ordering exactly, without asking nine
-/// different `dry_run` fn bodies to each re-implement the same
-/// disable-precedence rule. A disabled row never reaches its own
-/// `dry_run` fn at all — the SAME short-circuit `admit_cascade` gives a
-/// disabled op over its own predicate.
-pub fn dry_run_all(ctx: &DryRunCtx) -> std::collections::BTreeMap<&'static str, DryRunVerdict> {
-    PROBED_OPS
-        .iter()
-        .filter(|op| !matches!(op.kind, ProbedOpKind::InternalSubkernel { .. }))
-        .map(|op| {
-            let verdict = if ctx.op_is_disabled_here(op) {
-                DryRunVerdict::Declines("disabled_by_jammi_kernels_disable")
-            } else {
-                (op.dry_run)(ctx)
-            };
-            (op.report_key, verdict)
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2602,215 +2141,9 @@ mod tests {
     /// expands the literal INLINE at each `const OP: ProbedOp =
     /// test_two_arm!("...")`  call, so promotion sees the same shape as a
     /// hand-written literal.
-    /// A `dry_run` fn for a fixture [`ProbedOp`] whose admission-mechanism
-    /// test never exercises the dry-run system at all — every `test_two_arm`/
-    /// `test_cascade` row needs SOME value for the field (it is required),
-    /// and `Holds` is the least surprising placeholder for a row that
-    /// exists purely to drive `admit`/`admit_cascade`'s own gate-order and
-    /// counter tests.
-    fn dry_run_test_fixture(_ctx: &DryRunCtx) -> DryRunVerdict {
-        DryRunVerdict::Holds
-    }
-
-    /// `dry_run_all` must differ, at a
-    /// REAL `PROBED_OPS` row, between a ctx naming nothing in
-    /// `disabled_registry_keys` and an otherwise-IDENTICAL ctx naming a
-    /// real standalone registry key — hermetically, through the ctx field
-    /// alone, never by setting the process env var (`disabled_ops_requested`
-    /// is not called here at all). `LAYER_NORM`'s own registry key
-    /// (`layer_norm_fused`) is real and standalone, and `Holds` on this
-    /// fixture's own encoder-reachable, device-supported, dtype-neutral
-    /// ctx, so disabling it is a genuine, observable move — not a
-    /// coincidence of an already-`Declines`/`NotReached` row.
-    #[test]
-    fn dry_run_all_moves_when_only_the_disabled_registry_keys_differ() {
-        let base = DryRunCtx {
-            device_kind: DeviceKind::Cpu,
-            dtype: DtypeClass::F32,
-            encoder_reachable: true,
-            disabled_registry_keys: std::collections::HashSet::new(),
-        };
-        let disabled = DryRunCtx {
-            disabled_registry_keys: std::collections::HashSet::from([
-                "layer_norm_fused".to_string()
-            ]),
-            ..base.clone()
-        };
-        let before = dry_run_all(&base);
-        let after = dry_run_all(&disabled);
-        assert_eq!(
-            before["layer_norm"],
-            DryRunVerdict::Holds,
-            "fixture assumption: layer_norm holds on this ctx before disabling it"
-        );
-        assert_eq!(
-            after["layer_norm"],
-            DryRunVerdict::Declines("disabled_by_jammi_kernels_disable"),
-            "a disabled registry key must decline the WHOLE row, before its own dry_run fn ever \
-             runs — mirrors admit's own disabled-wins-over-the-predicate precedence"
-        );
-        assert_ne!(
-            before, after,
-            "the whole dry_run_all map must move between the two ctxs, not just the one entry \
-             checked above"
-        );
-    }
-
-    /// The SAME property one level up: `jammi-ai`'s own
-    /// `MaterializationEnv::kernel_admission_profile` (folded from
-    /// `dry_run_all`'s own render) must differ between the two ctxs above —
-    /// checked here at the STRING level (the exact shape `jammi-ai`
-    /// hashes), since `dry_run_all`'s own map is this crate's boundary and
-    /// the definition-hash movement itself is `jammi-db`'s own property
-    /// (`MaterializationEnv::kernel_admission_profile_none_serialises_to_no_key`'s
-    /// sibling test `fine_tune_hash_moves_with_the_kernel_admission_profile`
-    /// pins that generically for ANY string change — this test is the
-    /// concrete witness that a disable-only diff IS such a change).
-    #[test]
-    fn rendered_profile_moves_when_only_the_disabled_registry_keys_differ() {
-        fn render(ctx: &DryRunCtx) -> String {
-            let ops: std::collections::BTreeMap<&str, String> = dry_run_all(ctx)
-                .into_iter()
-                .map(|(k, v)| (k, v.render()))
-                .collect();
-            format!("{ops:?}")
-        }
-        let base = DryRunCtx {
-            device_kind: DeviceKind::Cpu,
-            dtype: DtypeClass::F32,
-            encoder_reachable: true,
-            disabled_registry_keys: std::collections::HashSet::new(),
-        };
-        let disabled = DryRunCtx {
-            disabled_registry_keys: std::collections::HashSet::from([
-                "layer_norm_fused".to_string()
-            ]),
-            ..base.clone()
-        };
-        assert_ne!(render(&base), render(&disabled));
-    }
-
-    /// The `"all"` wildcard, not just an exact key, must ALSO move the
-    /// profile — closing exactly the bug a bisected earlier revision of
-    /// `DryRunCtx::op_is_disabled_here` reintroduced: it reimplemented
-    /// only the exact-key arm of `op_is_disabled`, so
-    /// `JAMMI_KERNELS_DISABLE=all` rendered a BYTE-IDENTICAL profile to
-    /// an unset run (a `{}` vs `{"all"}` ctx would have hashed the SAME,
-    /// even though a live run under `all` forces every op eager). RED
-    /// (executed, reverted): removing `disable_decision`'s
-    /// `requested.contains("all")` arm — or, equivalently, resurrecting
-    /// the field-level `self.disabled_registry_keys.contains(key)` check
-    /// `op_is_disabled_here` used before this fix — makes this assertion
-    /// fail identically to the exact-key test above.
-    #[test]
-    fn dry_run_all_moves_when_only_the_all_wildcard_is_requested() {
-        let base = DryRunCtx {
-            device_kind: DeviceKind::Cpu,
-            dtype: DtypeClass::F32,
-            encoder_reachable: true,
-            disabled_registry_keys: std::collections::HashSet::new(),
-        };
-        let all_disabled = DryRunCtx {
-            disabled_registry_keys: std::collections::HashSet::from(["all".to_string()]),
-            ..base.clone()
-        };
-        let before = dry_run_all(&base);
-        let after = dry_run_all(&all_disabled);
-        assert_eq!(before["layer_norm"], DryRunVerdict::Holds);
-        assert_eq!(
-            after["layer_norm"],
-            DryRunVerdict::Declines("disabled_by_jammi_kernels_disable"),
-            "the \"all\" wildcard must decline layer_norm exactly as an exact-key request does"
-        );
-        assert_ne!(before, after);
-    }
-
-    /// The enumerating equivalence proof `disable_decision`'s own doc
-    /// claims: the LIVE admission path (`op_is_disabled`) and the DRY
-    /// pre-training path (`DryRunCtx::op_is_disabled_here`, via
-    /// `disable_decision` directly) agree on EVERY `PROBED_OPS` row's own
-    /// registry key(s), under EACH of the three request shapes a real
-    /// `JAMMI_KERNELS_DISABLE` value can take (empty/unset, an exact
-    /// key, and the `"all"` wildcard) — not two hand-picked examples.
-    /// `op_is_disabled`'s own `fired` bookkeeping is irrelevant to its
-    /// RETURN value here (a fresh, empty `fired` lock every call; the
-    /// function's own doc: repeated calls with the SAME `requested`/`op`
-    /// always return the SAME boolean regardless of prior firing), so
-    /// this is a pure equivalence check, not order-dependent.
-    #[test]
-    fn live_op_is_disabled_and_the_dry_predicate_agree_over_every_row_key_and_request_shape() {
-        // Every REAL PROBED_OPS row, every registry key it dispatches
-        // under — never a synthetic fixture op — so this exercises the
-        // ACTUAL production entry point (`DryRunCtx::op_is_disabled_here`
-        // called on a real row), not merely `disable_decision` standalone
-        // (which a regression in `op_is_disabled_here`'s own wiring could
-        // silently stop calling while this test kept passing — the exact
-        // gap a bisection against this fix's own development found: the
-        // wildcard-specific test below caught a reverted
-        // `op_is_disabled_here` that this equivalence check alone did
-        // not, because it called `disable_decision` directly rather than
-        // through the real dry entry point).
-        let mut checked_rows = 0usize;
-        for op in PROBED_OPS {
-            if matches!(op.kind, ProbedOpKind::InternalSubkernel { .. }) {
-                continue;
-            }
-            for &(class, key) in op.registry {
-                let dtype = if class == DtypeClass::Any {
-                    DtypeClass::F32
-                } else {
-                    class
-                };
-                let resolved: Vec<&str> = op.registry_keys_for(dtype).collect();
-                assert_eq!(
-                    resolved,
-                    vec![key],
-                    "fixture assumption: registry_keys_for({dtype:?}) on {} must resolve to \
-                     exactly this entry's own key {key:?}, got {resolved:?}",
-                    op.report_key
-                );
-                checked_rows += 1;
-
-                let shapes: [(&str, HashSet<String>); 3] = [
-                    ("empty", HashSet::new()),
-                    ("exact", HashSet::from([key.to_string()])),
-                    ("all", HashSet::from(["all".to_string()])),
-                ];
-                for (shape_name, requested) in shapes {
-                    let fired = RwLock::new(HashSet::new());
-                    let live = op_is_disabled(&requested, &fired, key);
-                    let ctx = DryRunCtx {
-                        device_kind: DeviceKind::Cpu,
-                        dtype,
-                        encoder_reachable: true,
-                        disabled_registry_keys: requested,
-                    };
-                    let dry = ctx.op_is_disabled_here(op);
-                    assert_eq!(
-                        live, dry,
-                        "op_is_disabled (live) and DryRunCtx::op_is_disabled_here (dry) \
-                         disagree for {}'s key={key:?} under the {shape_name:?} request shape: \
-                         live={live}, dry={dry}",
-                        op.report_key
-                    );
-                }
-            }
-        }
-        assert!(
-            checked_rows > 0,
-            "fixture assumption: PROBED_OPS has at least one non-InternalSubkernel row with a \
-             registry key to check"
-        );
-    }
-
     macro_rules! test_two_arm {
         ($key:expr) => {
-            ProbedOp::new(
-                $key,
-                ProbedOpKind::TwoArm,
-                &[(DtypeClass::Any, $key)],
-                dry_run_test_fixture,
-            )
+            ProbedOp::new($key, ProbedOpKind::TwoArm, &[(DtypeClass::Any, $key)])
         };
     }
 
@@ -2818,12 +2151,7 @@ mod tests {
     /// reason).
     macro_rules! test_cascade {
         ($key:expr) => {
-            ProbedOp::new(
-                $key,
-                ProbedOpKind::Cascade,
-                &[(DtypeClass::Any, $key)],
-                dry_run_test_fixture,
-            )
+            ProbedOp::new($key, ProbedOpKind::Cascade, &[(DtypeClass::Any, $key)])
         };
     }
 

@@ -76,13 +76,14 @@ pub enum TrainingSpec {
         common: TrainingCommon,
         /// [`ProducingDescriptor::FineTune`](jammi_db::store::manifest::ProducingDescriptor::FineTune)'s
         /// cache dial, the same shape [`crate::jobs::ComputeSpec`]'s own
-        /// `cache` field already carries for every compute kind. `Use`
-        /// (#562, wave-5 F5) is admitted: `JobWorker::train_fine_tune`
-        /// probes `Catalog::probe_model_by_definition` for an exact
-        /// `(descriptor, env)` match before ever running the trainer, and
-        /// finalizes a SECOND `models` row against the already-published
-        /// prefix on a hit (`FineTuneMaterializationOutcome::Reused`'s own
-        /// doc). `Bypass` always trains.
+        /// `cache` field already carries for every compute kind — except
+        /// that model-level cache reuse is not yet supported for this kind:
+        /// `Use` is refused, typed, by [`admit_training_spec`] — the ONE
+        /// admission every durable submit edge for a `TrainingSpec` applies,
+        /// so no edge can enqueue this value; see
+        /// <https://github.com/f-inverse/jammi-ai/issues/562>. `Bypass` (the
+        /// only value a submitted job can carry past that refusal) always
+        /// trains.
         ///
         /// Lives HERE — on the `FineTune` variant, not on [`TrainingCommon`]
         /// — because only this kind has a materialization to probe:
@@ -402,11 +403,15 @@ pub fn admit_training_spec(
     spec: TrainingSpec,
 ) -> Result<AdmittedTrainingSpec> {
     match &spec {
-        TrainingSpec::FineTune { common, .. } => {
+        TrainingSpec::FineTune { common, cache, .. } => {
             common.config.validate()?;
-            // `cache = USE` is admitted (#562, wave-5 F5): `train_fine_tune`
-            // probes for an exact-definition cache hit before training —
-            // see `FineTuneMaterializationOutcome::Reused`'s own doc.
+            if *cache == CachePolicy::Use {
+                return Err(JammiError::Config(
+                    "model-level cache reuse is not yet supported: submit this fine_tune job \
+                     without `cache` or with `cache = BYPASS`"
+                        .into(),
+                ));
+            }
         }
         TrainingSpec::GraphFineTune {
             common,

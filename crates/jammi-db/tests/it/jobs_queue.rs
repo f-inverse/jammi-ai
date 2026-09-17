@@ -2962,6 +2962,170 @@ async fn release_jobs_claimed_by_write_is_exactly_lease_null_releases_plus_one_a
     assert_eq!(catalog.release_jobs_claimed_by("me").await.unwrap(), 0);
 }
 
+/// #516: the release-write delta oracles above compare through `JobRecord`
+/// (`SELECT_COLS`), so a column outside that projection — `idempotency_key`
+/// (`schema.rs:1066`, sitting outside `SELECT_COLS`) is the one that
+/// surfaced the gap — is invisible to them by construction; a future
+/// release statement that touched it would pass both oracles above
+/// unnoticed. This one asserts the SAME delta over a LIVE all-columns
+/// snapshot instead: the column list is read from `PRAGMA table_info('jobs')`
+/// / `information_schema.columns` at test time (never a hardcoded list, so
+/// a column added after this test is written is covered the day it lands,
+/// never invisible the way `SELECT_COLS` was) and every column is projected
+/// `CAST(col AS TEXT)` — the `Row` seam has no column-enumeration API, so
+/// this is the explicit workaround, not a permanent second reader.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_job_lease_write_delta_is_visible_over_every_live_column(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let lease = Duration::from_secs(3600);
+
+    // `idempotency_key` set to a non-NULL value: the column #516 names,
+    // proving the snapshot is not vacuously passing on a NULL == NULL
+    // comparison.
+    catalog
+        .submit_job_deduped(job_params("delta-all-cols"), Some("dedupe-key-delta"))
+        .await
+        .unwrap();
+    catalog
+        .submit_job(job_params("other-untouched"))
+        .await
+        .unwrap();
+    catalog
+        .claim_next("me", KINDS, lease)
+        .await
+        .unwrap()
+        .expect("the first job claimed by `me`");
+    catalog
+        .claim_next("someone-else", KINDS, lease)
+        .await
+        .unwrap()
+        .expect("the second job claimed by a DIFFERENT instance");
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    let columns = live_jobs_columns(&catalog, backend).await;
+    let other_before = snapshot_all_jobs_columns(&catalog, "other-untouched", &columns).await;
+    let before = snapshot_all_jobs_columns(&catalog, "delta-all-cols", &columns).await;
+    let released = catalog
+        .release_job_lease("delta-all-cols", "me", 1)
+        .await
+        .unwrap();
+    assert!(released, "the owner releases its own live lease");
+    let after = snapshot_all_jobs_columns(&catalog, "delta-all-cols", &columns).await;
+
+    let changed: std::collections::BTreeSet<&str> = columns
+        .iter()
+        .filter(|c| before[c.as_str()] != after[c.as_str()])
+        .map(String::as_str)
+        .collect();
+    let expected: std::collections::BTreeSet<&str> = ["lease_expires_at", "releases", "updated_at"]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        changed, expected,
+        "the release write must change EXACTLY these columns, on the live \
+         column set, before {before:?} after {after:?}"
+    );
+    assert_eq!(
+        before["idempotency_key"], after["idempotency_key"],
+        "the column #516 named must round-trip byte-identical across the release"
+    );
+
+    // A row claimed by a different instance stays completely untouched on
+    // the live snapshot too.
+    let other_after = snapshot_all_jobs_columns(&catalog, "other-untouched", &columns).await;
+    assert_eq!(
+        other_before, other_after,
+        "a release for a DIFFERENT job must not touch this row on any column"
+    );
+}
+
+/// The live `jobs` column list, backend-appropriate: `PRAGMA
+/// table_info('jobs')` on SQLite, `information_schema.columns` on Postgres.
+/// Never hardcoded — a future migration's new column is picked up here
+/// automatically, which is the whole point of #516's fix.
+async fn live_jobs_columns(catalog: &Catalog, backend: BackendKind) -> Vec<String> {
+    catalog
+        .backend_arc()
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    match backend {
+                        BackendKind::Sqlite => {
+                            tx.query("SELECT name FROM pragma_table_info('jobs')", &[], |row| {
+                                row.get::<String>("name")
+                            })
+                            .await
+                        }
+                        BackendKind::Postgres => {
+                            tx.query(
+                                "SELECT column_name FROM information_schema.columns \
+                                 WHERE table_name = 'jobs' ORDER BY ordinal_position",
+                                &[],
+                                |row| row.get::<String>("column_name"),
+                            )
+                            .await
+                        }
+                    }
+                })
+            },
+        )
+        .await
+        .unwrap()
+}
+
+/// A `job_id`-keyed row snapshot over EVERY named column, each cast to
+/// `TEXT` so one decode path serves every SQL type the table declares.
+async fn snapshot_all_jobs_columns(
+    catalog: &Catalog,
+    job_id: &str,
+    columns: &[String],
+) -> std::collections::BTreeMap<String, Option<String>> {
+    let projection = columns
+        .iter()
+        .map(|c| format!("CAST({c} AS TEXT) AS {c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("SELECT {projection} FROM jobs WHERE job_id = $1");
+    let job_id = job_id.to_string();
+    let columns = columns.to_vec();
+    catalog
+        .backend_arc()
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                let sql = sql.clone();
+                let columns = columns.clone();
+                Box::pin(async move {
+                    tx.query_opt(&sql, &[SqlValue::TextOwned(job_id)], move |row| {
+                        let mut map = std::collections::BTreeMap::new();
+                        for c in &columns {
+                            map.insert(c.clone(), row.try_get::<String>(c)?);
+                        }
+                        Ok(map)
+                    })
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap()
+        .expect("row present")
+}
+
 /// The reclaim cap compares `attempts - releases` against `MAX_ATTEMPTS`
 /// (3): a deploy storm of three releases leaves the job claimable at
 /// `attempts 4, releases 3`; three genuine expiries fail it; 3 claims / 2

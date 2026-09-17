@@ -611,6 +611,20 @@ jobs:
       - name: Self-test the flash-attn closure guard
         run: python3 ci/scripts/check_flash_attn_closure.py --self-test
 
+      # #511: jammi-db's postgres/mysql features link a native TLS stack
+      # (OpenSSL) this repo's release/CI images deliberately omit, and the
+      # runtime image cannot load it if a shipped build enabled either —
+      # nothing ships broken TODAY only because no release lane enables
+      # them. This walks the SAME workspace feature graph
+      # check_flash_attn_closure.py's own Graph walker builds (reused, not
+      # re-implemented) and fails the moment any manifest lane's
+      # cargo_features selection reaches jammi-db/postgres or jammi-db/mysql.
+      - name: Assert no release lane's feature closure reaches jammi-db/postgres|mysql
+        run: python3 ci/scripts/check_release_manifest_pg_mysql_closure.py
+
+      - name: Self-test the release-manifest postgres/mysql closure guard
+        run: python3 ci/scripts/check_release_manifest_pg_mysql_closure.py --self-test
+
   lint-surface-closure:
     name: Guard (lint-surface closure)
     runs-on: ubuntu-latest
@@ -1109,9 +1123,14 @@ jobs:
       # direction in the lockfile. cargo-deny fetches/updates the RustSec DB
       # itself, so the advisory check reads the current database, not a stale
       # snapshot — and knowingly-carried advisories live as documented exceptions
-      # in `deny.toml`, never a blanket silence.
+      # in `deny.toml`, never a blanket silence. The TOOL's own version is
+      # pinned (#511) — deny.toml's own config shape asserts this major
+      # version's schema behavior; an unpinned `cargo install` could silently
+      # pick up a newer cargo-deny release that reads the SAME file
+      # differently, which is a different risk from the advisory DB's own
+      # deliberate freshness above and is not relaxed by pinning this.
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: cargo install cargo-deny --version 0.20.2 --locked
       - name: cargo deny (advisories + licenses + bans + sources)
         run: cargo deny check advisories licenses bans sources
 

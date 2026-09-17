@@ -23,6 +23,18 @@ session.add_source("data", SourceType::File, SourceConnection {
 let results = session.sql("SELECT * FROM data.public.data LIMIT 10").await?;
 ```
 
+## Build requirements
+
+The `postgres` and `mysql` features pull `datafusion-table-providers`'s
+federation drivers, which link a native TLS stack (`native-tls` ->
+OpenSSL) rather than `rustls`, unconditionally at every published
+version. Building either feature requires OpenSSL's development headers
+on the build host (e.g. `libssl-dev`/`openssl-devel`, or the `openssl`
+Homebrew formula plus `OPENSSL_DIR`/`PKG_CONFIG_PATH`). Neither feature
+is enabled by default, and no release lane in this repo enables them
+today (`ci/release-feature-manifest.json` carries no row that reaches
+either — enforced by `ci/scripts/check_release_manifest_pg_mysql_closure.py`).
+
 ## Documentation
 
 See the [Jammi AI Guide](https://f-inverse.github.io/jammi-ai/) for the full guide.

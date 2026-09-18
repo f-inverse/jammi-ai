@@ -686,7 +686,7 @@ fn tiny_bert_head64_model() -> String {
 /// `"device_is_cpu_or_metal_not_cuda"` (`cuda` feature compiled, but this
 /// session never resolves a real CUDA device), exactly like every OTHER
 /// architecture on the same build. `admit_cascade`
-/// (`crates/jammi-kernels/src/admission.rs:406-457`) now records every
+/// (`crates/jammi-kernels/src/admission.rs:407-457`) now records every
 /// decline — including BERT's own `"flash_transport_not_wired"` — into the
 /// SAME thread-local probe-capture sink `admit_inner` uses
 /// (`record_probe_miss`, `admission.rs:416,427,437`), and
@@ -805,8 +805,8 @@ fn ops_keys(report: &serde_json::Value) -> std::collections::BTreeSet<String> {
 /// before/after delta on `cast_scale_f16_f32` / `cast_add_f16` — the exact
 /// registry keys the table names for `DtypeClass::F16` — actually moved,
 /// i.e. if some workspace call site really does resolve to those keys
-/// (`"cast_scale_f16_f32"`, `crates/jammi-kernels/src/admission.rs:2056`, and
-/// `"cast_add_f16"`, `crates/jammi-kernels/src/admission.rs:2064`,
+/// (`"cast_scale_f16_f32"`, `crates/jammi-kernels/src/admission.rs:2077`, and
+/// `"cast_add_f16"`, `crates/jammi-kernels/src/admission.rs:2085`,
 /// both reached from `LowRankResidualLinear::bwd`'s `admit_cast_boundary(&CAST_SCALE, DtypeClass::F16, ..)`/
 /// `admit_cast_boundary(&CAST_ADD, DtypeClass::F16, ..)` calls, during
 /// the probe's backward pass). Before the fix the shipped table named only

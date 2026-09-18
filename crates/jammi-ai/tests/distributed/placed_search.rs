@@ -255,9 +255,28 @@ async fn scrape_counter(health_url: &str, metric: &str, label_substr: &str) -> u
         .sum()
 }
 
+/// The lane's shared backends, or a skip that CI can never take silently:
+/// with `JAMMI_REQUIRE_DISTRIBUTED` set, unconfigured backends are a hard
+/// failure rather than a hollow green (the same per-file require-gate idiom
+/// `artifact_crash_window.rs`/`exactly_one_claim.rs` carry). The nested,
+/// un-collapsed `if`s are the registry verifier's canonical shape.
+#[allow(clippy::collapsible_if)]
+fn required_backends(test: &str) -> Option<Backends> {
+    let backends = Backends::from_env_or_skip(test);
+    if backends.is_none() {
+        if std::env::var_os("JAMMI_REQUIRE_DISTRIBUTED").is_some() {
+            panic!(
+                "{test}: JAMMI_REQUIRE_DISTRIBUTED is set but the distributed lane's shared \
+                 backends are unconfigured — a silent skip is not acceptable here"
+            );
+        }
+    }
+    backends
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rendezvous_placed_search_over_real_worker_processes() {
-    let Some(backends) = Backends::from_env_or_skip("rendezvous_placed_search") else {
+    let Some(backends) = required_backends("rendezvous_placed_search") else {
         return;
     };
     let result_root = backends.unique_result_root("rendezvous-placed-search");

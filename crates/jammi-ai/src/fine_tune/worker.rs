@@ -9378,11 +9378,11 @@ fn validate_backbone_precision(
 // carries, because neither wires the encoder-boundary flash transport
 // protocol — see `BERT never wires the encoder-boundary flash transport` (`crates/jammi-encoders/src/bert.rs:428-430`)
 // and the sibling `FlashDecision::Declined` (`crates/jammi-encoders/src/distilbert.rs:331-334`). `admit_cascade`
-// (`crates/jammi-kernels/src/admission.rs:406-457`) now records every decline
+// (`crates/jammi-kernels/src/admission.rs:407-457`) now records every decline
 // — disabled, `DomainMiss`, and `CapabilityMiss` alike — into the SAME
 // thread-local probe-capture sink `admit_inner` uses
 // (`record_probe_miss(op, predicate_name)`,
-// `crates/jammi-kernels/src/admission.rs:431,441`), not just an atomic
+// `crates/jammi-kernels/src/admission.rs:432,441`), not just an atomic
 // increment on `CascadeDispatchCounters`. [`flash_report`] reads that entry
 // back through `jammi_kernels::admission::probe_capture_reason_for(window,
 // "attention_block_flash")` on a decline, exactly the way
@@ -11068,7 +11068,7 @@ mod tests {
 
     /// Issue #462/#463 follow-up: `admit_cascade`'s decline path now records
     /// `(op, predicate)` into the SAME probe-capture window `admit_inner`
-    /// uses — `record_probe_miss(op, predicate_name)` (`crates/jammi-kernels/src/admission.rs:431,441`), which is what
+    /// uses — `record_probe_miss(op, predicate_name)` (`crates/jammi-kernels/src/admission.rs:432,441`), which is what
     /// lets [`flash_cascade_decline_reason`] — the function [`flash_report`]
     /// itself calls on a decline — read a verbatim reason back for the
     /// `"attention_block_flash"` cascade key instead of the coarse

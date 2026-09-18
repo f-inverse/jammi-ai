@@ -120,6 +120,8 @@ crates/jammi-ai/src/fine_tune/trainer.rs::chmod_bypassed
 crates/jammi-db/tests/it/reconcile.rs::chmod_bypassed
 crates/jammi-server/src/runtime.rs::chmod_bypassed
 crates/jammi-ai/tests/distributed/artifact_crash_window.rs::required_backends
+crates/jammi-ai/tests/distributed/placed_search.rs::required_backends
+crates/jammi-ai/tests/it/fine_tune_materialization.rs::child_process_mode
 crates/jammi-ai/tests/distributed/cross_tenant_isolation.rs::required_backends
 crates/jammi-ai/tests/distributed/exactly_one_claim.rs::required_backends
 crates/jammi-ai/tests/distributed/gang_chaos.rs::required_backends

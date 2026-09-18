@@ -519,6 +519,56 @@ impl TrainingSpec {
             TrainingSpec::ContextPredictor { .. } => "context_predictor",
         }
     }
+
+    /// How a rank reads this job's training-set table — `None` for a kind that
+    /// trains from no training-set table. Everything downstream of "the table
+    /// exists" (binding a source, a gang member's rank body) consumes this and
+    /// never the spec's variant, so how the table was produced stays the
+    /// producer's business.
+    pub fn training_set_view(&self) -> Option<TrainingSetView<'_>> {
+        match self {
+            TrainingSpec::FineTune {
+                columns,
+                task,
+                common,
+                ..
+            } => Some(TrainingSetView {
+                columns: columns.clone(),
+                task: *task,
+                common,
+            }),
+            TrainingSpec::GraphFineTune {
+                sample_config,
+                common,
+                ..
+            } => Some(TrainingSetView {
+                columns: graph_training_columns(sample_config.hard_negatives > 0),
+                task: ModelTask::TextEmbedding,
+                common,
+            }),
+            TrainingSpec::ContextPredictor { .. } => None,
+        }
+    }
+}
+
+/// The reader's view of a training job: which columns of its training-set
+/// table it decodes, as which task, under which common config.
+#[derive(Debug, Clone)]
+pub struct TrainingSetView<'a> {
+    pub columns: Vec<String>,
+    pub task: ModelTask,
+    pub common: &'a TrainingCommon,
+}
+
+/// The columns a graph-sampled training set is decoded by: text pairs, or
+/// triplets when the sampler drew hard negatives. The sampler is one more
+/// producer of the pairs/triplet shape every text-embedding fine-tune reads.
+pub fn graph_training_columns(has_negatives: bool) -> Vec<String> {
+    let mut columns = vec!["anchor".to_string(), "positive".to_string()];
+    if has_negatives {
+        columns.push("negative".to_string());
+    }
+    columns
 }
 
 // ─── The `ProducingDescriptor::FineTune::spec_canonical` producer ──────────

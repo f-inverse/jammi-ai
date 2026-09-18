@@ -866,16 +866,13 @@ fn two_rank_graph_spec() -> TrainingSpec {
     }
 }
 
-/// GA8's exit oracle: a `graph_fine_tune` at `world_size = 2` still decides
-/// `Peer` (unchanged), but `run_spec` refuses it BY NAME before any
-/// coordinator dial — never a silent single-rank run of a wider job, never
-/// a generic/opaque failure. RED under the mutation named in this commit
-/// (restoring GA8's `self.coordinate(...)` call in place of the refusal
-/// turns this GREEN-for-the-wrong-reason into a hang/dial against a member
-/// with no ordered-read counterpart — this test's error-message assertion
-/// is what catches a silent re-introduction, not just job status).
+/// A `graph_fine_tune` at `world_size = 2` runs as a real `Peer` gang: the
+/// member binds the graph-sampled training set by the identity on the job
+/// row, reads it in its committed order through the same rank body a
+/// column-source job uses, and ends `Trained` with the digest the
+/// coordinator's terminal write on receipt requires to equal rank 0's own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn graph_fine_tune_peer_gang_is_refused_by_name() {
+async fn graph_fine_tune_runs_as_a_peer_gang() {
     let server = coordinating_graph_server().await;
     let engine = Arc::clone(&server.engine);
     register_graph_member(&engine, "member-1", server.peer_addr).await;
@@ -883,9 +880,7 @@ async fn graph_fine_tune_peer_gang_is_refused_by_name() {
     let job = engine
         .run_training_spec(two_rank_graph_spec())
         .await
-        .expect(
-            "submission itself is not refused; the typed refusal fires when the worker runs it",
-        );
+        .unwrap();
     let job_id = job.job_id.clone();
     let worker = JobWorker::new(&engine).unwrap();
 
@@ -894,25 +889,30 @@ async fn graph_fine_tune_peer_gang_is_refused_by_name() {
 
     assert_eq!(
         training_test_hooks::topology_for(&job_id),
-        Some(TopologyDecision::Peer { world: 2 }),
-        "the topology decision is unchanged by the exit — Peer is still decided, then refused"
+        Some(TopologyDecision::Peer { world: 2 })
     );
     let after = row(&engine, &job_id).await;
-    assert_eq!(after.status, "failed", "{after:?}");
-    let error = after.error.clone().unwrap_or_default();
+    assert_eq!(after.status, "completed", "{after:?}");
+    assert_eq!(after.error, None);
+
+    let roles = training_test_hooks::runner_roles_for(&job_id);
     assert!(
-        error.contains("graph fine-tune gangs are local-only in v1")
-            && error.contains("tracked on #538")
-            && error.contains("world_size = 2"),
-        "the refusal must name the reason and the width, not a generic failure: {error}"
+        roles.contains(&RunnerRole::Holder(LeaseHolder::Coordinator))
+            && roles.contains(&RunnerRole::Rank { rank: 1 }),
+        "rank 0 ran as the coordinator and rank 1 as the member's body: {roles:?}"
+    );
+    let member_ends = training_test_hooks::member_ends_for(&job_id);
+    assert_eq!(member_ends.len(), 1, "{member_ends:?}");
+    assert!(
+        member_ends[0]
+            .1
+            .starts_with("Trained { artifact_digest: \""),
+        "the member ended Trained: {}",
+        member_ends[0].1
     );
     assert!(
-        training_test_hooks::coordinator_ends_for(&job_id).is_empty(),
-        "the refusal fires BEFORE any coordinator body/dial — no attempt is recorded"
-    );
-    assert!(
-        fine_tuned_model(&engine, &job_id).await.is_none(),
-        "nothing is published over a refused width"
+        fine_tuned_model(&engine, &job_id).await.is_some(),
+        "the gang's model is published"
     );
     expect_slot_free(&engine).await;
 }

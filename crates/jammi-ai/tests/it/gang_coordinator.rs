@@ -179,7 +179,7 @@ fn graph_sources() -> GraphFineTuneSources {
     }
 }
 
-/// The loader the worker's `reconstruct_graph_loader` builds — the same
+/// The loader the worker's `materialize_graph_training_set` builds — the same
 /// nodes and edges the real job's two ordered scans read
 /// (`sort_into_graph_read_order`, `GRAPH_READ_ORDER_RULE_V1`), through the
 /// same seeded sampler. `graph_nodes`/`graph_edges` are declared in a

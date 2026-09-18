@@ -4501,10 +4501,13 @@ through `ResultStore::materialize_training_set` as an immutable `TrainingSet` re
 them; a registered source is anchored unpinned, so the tabular path materialises its own
 table) — and read back on the SAME `SessionContext` through `read_back_sql`,
 `SELECT * FROM <TrainingSetTable::sql_relation> <training_set_order_by(columns)>`, the
-reader's half of the full-tuple order contract. The `GraphFineTune` arm does not reach this
-producer: `reconstruct_graph_loader` re-samples the seeded pairs and builds the loader
-straight from them in memory (`TrainingDataLoader::from_graph`); a graph training set's own
-result table is https://github.com/f-inverse/jammi-ai/issues/538.
+reader's half of the order contract. The `GraphFineTune` kind differs in the producer only:
+`materialize_graph_training_set` samples the graph and commits the pairs as a training-set
+table ordered by a leading `_ordinal`. From the table on the two kinds share one path — the
+reader asks the table's descriptor for its committed order
+(`ProducingDescriptor::training_set_order_columns`) and the spec for what to decode
+(`TrainingSpec::training_set_view`), never which producer wrote the table — so every
+topology, a multi-host `Peer` gang included, serves both.
 Then the source binding (`bind_training_source`: `Resident` through
 `build_training_data_loader` for the whole-set arms, `Streamed` otherwise — the
 SAME binding a `Peer` member's rank body performs over the same table, §2.8e) →

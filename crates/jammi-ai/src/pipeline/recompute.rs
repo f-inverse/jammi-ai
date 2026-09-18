@@ -622,8 +622,7 @@ impl InferenceSession {
     /// [`ProducingDescriptor::GraphTrainingSet`] replay (GA9, issue #538):
     /// re-read the CURRENT node/edge sources and re-sample, through the SAME
     /// shared core ([`crate::fine_tune::worker::materialize_graph_training_set`])
-    /// [`crate::fine_tune::worker::JobWorker::reconstruct_graph_loader`] uses
-    /// for a fresh run — never a second, independent re-implementation of
+    /// a fresh run uses — never a second, independent re-implementation of
     /// the sample-then-materialise path.
     ///
     /// Anchors both `node_source` and `edge_source` from the table's OWN

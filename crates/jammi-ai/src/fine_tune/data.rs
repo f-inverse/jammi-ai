@@ -524,8 +524,8 @@ impl TrainingDataLoader {
     /// supervision largely re-learns the base metric; genuine gain comes from
     /// declared / external edges (see [`super::graph_sampler`]).
     ///
-    /// Has no production caller (the real worker path is
-    /// `reconstruct_graph_loader` → [`Self::from_graph_table_rows`], never a
+    /// Has no production caller (a job trains from the materialised table,
+    /// decoded like any pairs/triplet training set, never a
     /// re-sample-in-place); kept as a direct, table-free constructor over an
     /// ALREADY-BUILT `GraphSampler` for other callers (tests, and any future
     /// caller with no table to materialise). A caller comparing the result
@@ -577,59 +577,6 @@ impl TrainingDataLoader {
         Ok(Self {
             format: TrainingFormat::Graph { has_negatives },
             data: LoaderData::TextRows(rows),
-            reservation: None,
-        })
-    }
-
-    /// The table-backed counterpart of [`Self::from_graph`] (issue #538):
-    /// build a graph-format loader from rows already read back from a
-    /// materialised `GraphTrainingSet` table, in COMMITTED order (GA4) —
-    /// `reconstruct_graph_loader`'s worker path, once it materialises
-    /// through the seam, calls this instead of re-deriving the format from
-    /// the rows.
-    ///
-    /// `has_negatives` is the CONFIG's own decision (GA3), supplied by the
-    /// caller (the worker already knows `sample_config.hard_negatives`) —
-    /// never re-derived from row 0 or from column presence, which cannot
-    /// distinguish this table from an ordinary triplet/pairs one at all
-    /// (identical column names).
-    ///
-    /// A `None` negative while `has_negatives` is true is a typed error: the
-    /// sampler's own empty-negative-pool refusal (GA3, `GraphSampler::
-    /// sample`) guarantees every row written under `graph_triplet` carries
-    /// one, so reaching a `None` here is an engine-invariant breach (a
-    /// hand-built table, a producer that bypassed the sampler), never a
-    /// silently-dropped negative.
-    pub fn from_graph_table_rows(
-        rows: Vec<(String, String, Option<String>)>,
-        has_negatives: bool,
-    ) -> Result<Self> {
-        let data = if has_negatives {
-            rows.into_iter()
-                .map(|(anchor, positive, negative)| {
-                    let negative = negative.ok_or_else(|| {
-                        JammiError::FineTune(
-                            "graph_triplet row has no negative: the sampler's own \
-                             empty-negative-pool refusal (GA3, issue #538) should have caught \
-                             this before the table was ever written"
-                                .into(),
-                        )
-                    })?;
-                    Ok(TrainingRow::Triplet {
-                        anchor,
-                        positive,
-                        negative,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            rows.into_iter()
-                .map(|(anchor, positive, _)| TrainingRow::Pairs { anchor, positive })
-                .collect()
-        };
-        Ok(Self {
-            format: TrainingFormat::Graph { has_negatives },
-            data: LoaderData::TextRows(data),
             reservation: None,
         })
     }

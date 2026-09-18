@@ -108,6 +108,10 @@ workspace ships every publishable crate at the same
   behaviour).
 
 ### Added
+- **A graph fine-tune runs on a multi-host gang (#591).** `graph_fine_tune` at a `world_size`
+  above `[worker] local_ranks` trains as a `Peer` gang like `fine_tune` does; it was refused by
+  name. A graph sample is one more producer of a pairs/triplet training set: members bind it by
+  the identity on the job row and read it in its committed `_ordinal` order.
 - **`[inference] partitions = N` (#540).** Splits the model forward `N` ways in-process
   below every `InferenceExec` (default `1`, refused outside `1..=1024`): each partition
   pulls the next batch on demand and stamps a global `_ordinal`, and a

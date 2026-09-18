@@ -320,12 +320,12 @@ fn dangling_endpoint_is_a_typed_error() {
 /// order (`GRAPH_READ_ORDER_RULE_V1`), so two physical layouts of the
 /// IDENTICAL node/edge set sample byte-identical pairs — never a function of
 /// scan order. The model is deliberately bogus so the job fails fast right
-/// after `reconstruct_graph_loader` runs (sampling happens before model
+/// after `materialize_graph_training_set` runs (sampling happens before model
 /// load); the fingerprint hook has already fired by the time `job.wait()`
 /// returns either way.
 ///
 /// Mutation executed (not committed): removing the `ORDER BY` clauses from
-/// `reconstruct_graph_loader`'s node/edge queries makes this assertion fail
+/// `materialize_graph_training_set`'s node/edge queries makes this assertion fail
 /// (the two fingerprints differ) — confirmed by hand before this test was
 /// added, restoring the fix afterward.
 #[cfg(feature = "test-hooks")]
@@ -393,7 +393,7 @@ async fn graph_sample_is_a_function_of_the_set_not_the_scan_order() {
             ..GraphSampleConfig::default()
         };
         // Deliberately unresolvable: the job fails at model load, well after
-        // `reconstruct_graph_loader` has already run and the hook fired.
+        // `materialize_graph_training_set` has already run and the hook fired.
         let job = session
             .fine_tune_graph(
                 &sources,
@@ -405,7 +405,7 @@ async fn graph_sample_is_a_function_of_the_set_not_the_scan_order() {
             .unwrap();
         let _ = job.wait().await;
         graph_sample_fingerprint_for(&job.job_id)
-            .expect("reconstruct_graph_loader must have sampled and recorded a fingerprint")
+            .expect("materialize_graph_training_set must have sampled and recorded a fingerprint")
     }
 
     let ids = ["n0000", "n0001", "n0002", "n0003", "n0004"];
@@ -525,7 +525,7 @@ async fn fine_tune_graph_duplicate_node_id_fails() {
 /// sized against a REAL measurement — never zero, never a placeholder.
 /// Asserted via the `test-hooks` recorder rather than by forcing a real
 /// `ResourcesExhausted` (which would need the graph large enough to also
-/// perturb `reconstruct_graph_loader`'s own node/edge `ORDER BY` scans —
+/// perturb `materialize_graph_training_set`'s own node/edge `ORDER BY` scans —
 /// GA1 — a separate, comparably-sized DataFusion-side sort competing for
 /// the same bounded pool during the READ, before this reservation is even
 /// attempted; entangling the two would make this test's failure ambiguous
@@ -624,7 +624,7 @@ async fn fine_tune_graph_reservation_is_sized_against_a_real_measurement() {
     let _ = job.wait().await;
 
     let reserved = graph_sample_reservation_bytes_for(&job.job_id)
-        .expect("reconstruct_graph_loader must have reserved and recorded its bytes");
+        .expect("materialize_graph_training_set must have reserved and recorded its bytes");
     assert!(
         reserved >= node_text_bytes,
         "the reservation ({reserved} B) must be at least the node id+text bytes alone \
@@ -868,7 +868,7 @@ async fn fine_tune_graph_materialises_a_graph_training_set_table() {
 /// GA6 (issue #538): two attempts of ONE `graph_fine_tune` job id (a stale
 /// lease reclaimed to a second worker) never displace or clobber each
 /// other's materialised `GraphTrainingSet` table — each attempt's own call
-/// to `reconstruct_graph_loader` re-samples and re-materialises
+/// to `materialize_graph_training_set` re-samples and re-materialises
 /// independently (the source anchors are `UnpinnedAtInstant`, so the second
 /// attempt's `materialize_training_set` call never reuses the first's row —
 /// `probe_ready_training_set` never matches an unpinned anchor), and the
@@ -1349,7 +1349,7 @@ async fn fine_tune_graph_end_to_end_completes() {
     );
 
     // This fixture's edge rows are NOT already in `(src, dst)` order, and
-    // `reconstruct_graph_loader` scans nodes/edges with an explicit
+    // `materialize_graph_training_set` scans nodes/edges with an explicit
     // `ORDER BY` (see that method's doc), so the exact physical row the
     // sampler's first draw sees — and therefore the trained adapter's bytes
     // — depends on that scan order, never on the source file's own row

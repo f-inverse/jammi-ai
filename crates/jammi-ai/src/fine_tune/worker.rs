@@ -141,7 +141,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
-use arrow::array::{Array, ArrayRef, RecordBatch, StringArray, UInt64Array};
+use arrow::array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use datafusion::error::DataFusionError;
@@ -170,7 +170,6 @@ use tokio::sync::watch;
 use crate::fine_tune::collective::{
     BlockingCall, Collective, CoordinatorLink, LocalGang, MemberEnd, MemberLink, Peer,
 };
-use crate::fine_tune::data::TrainingDataLoader;
 use crate::fine_tune::decode::{
     build_training_data_loader, detect_training_format, extract_string_column,
 };
@@ -1632,7 +1631,7 @@ pub struct JobWorker {
 /// Re-read the node/edge sources (`GRAPH_READ_ORDER_RULE_V1`, GA1), sample
 /// the graph, and materialise the pairs as a `GraphTrainingSet`-kind
 /// `TrainingSet` table through the `Batches` seam (GA5/GA9, issue #538) —
-/// the SHARED core [`JobWorker::reconstruct_graph_loader`] (a fresh run) and
+/// the SHARED core `run_spec` (a fresh run) and
 /// [`crate::pipeline::recompute`]'s `recompute_graph_training_set` (a
 /// replay) both call, differing only in `inputs`: a fresh run anchors both
 /// sources `UnpinnedAtInstant`, never reused; a replay re-resolves the
@@ -2270,7 +2269,7 @@ impl JobWorker {
     /// |---|---|---|
     /// | 1 | no `training_spec` at all | `mark_acceleration_undetermined` (a MORE specific `failed_before_device_resolution` reason, which the catalog edge preserves) then `record_failed` |
     /// | 2 | undeserialisable `training_spec` | same as 1 |
-    /// | 3 | training-set materialization / loader reconstruction error (`training_set::materialize_projection`, `build_training_data_loader`, `reconstruct_graph_loader`) | `Err(Failed)` → `record_failed` |
+    /// | 3 | training-set materialization / loader reconstruction error (`training_set::materialize_projection`, `build_training_data_loader`, `materialize_graph_training_set`) | `Err(Failed)` → `record_failed` |
     /// | 4 | base-model load error, incl. a missing artifact (`model_cache().get_or_load`) | `Err(Failed)` → `record_failed` |
     /// | 5 | base model exposes no embedding dim | `Err(Failed)` → `record_failed` |
     /// | 6 | device-select error (`select_device`, inside `run_fine_tune_blocking` — BEFORE the probe) | `Err(Failed)` → `record_failed` |
@@ -3966,46 +3965,70 @@ impl JobWorker {
         holder: LeaseHolder,
     ) -> std::result::Result<TrainedArtifact, WorkerJobError> {
         match spec {
-            TrainingSpec::FineTune {
-                source,
-                columns,
-                method,
-                task,
-                common,
-                // `cache = USE` is refused, typed, by
-                // `fine_tune::spec::admit_training_spec` — the ONE admission
-                // every durable submit edge for a training spec applies
-                // before a row is ever written: a queued `fine_tune` row can
-                // therefore only ever carry `Bypass` here, and the worker
-                // has nothing left to branch on.
-                cache: _cache,
-            } => {
-                // Materialise the projected rows into an immutable
-                // `TrainingSet` result table (or reuse the one that already
-                // carries this definition). The rows a run trains on are a
-                // durable, attested artifact, not this worker's private scan.
+            // Every kind that trains from a training-set table. The kinds
+            // differ in ONE step — how the table is produced (a projection of
+            // a source, or a sample of a graph); from the table on there is one
+            // path, so every topology serves every such kind. (`FineTune`'s
+            // `cache = USE` is refused at `admit_training_spec`, so nothing
+            // here branches on it.)
+            spec @ (TrainingSpec::FineTune { .. } | TrainingSpec::GraphFineTune { .. }) => {
+                let kind = spec.kind();
+                let view = spec
+                    .training_set_view()
+                    .expect("both kinds in this arm train from a training-set table");
+                let (columns, task, common) = (view.columns, view.task, view.common.clone());
                 let detected =
                     detect_training_format(&columns, task).map_err(WorkerJobError::from)?;
 
                 // The table: a retry binds the one the row already names
                 // (the job's identity, write-once); a first attempt
-                // materialises (or reuses on the engine's own key).
-                let table = match &recorded_pair {
-                    Some(pair) => {
+                // materialises (or reuses on the engine's own key). The rows a
+                // run trains on are a durable, attested artifact, not this
+                // worker's private scan.
+                let table = match (&recorded_pair, &spec) {
+                    (Some(pair), _) => {
                         bind_recorded_training_set(session, catalog, pair)
                             .await
                             .map_err(WorkerJobError::from)?
                             .0
                     }
-                    None => training_set::materialize_projection_table(
-                        session,
-                        &source,
-                        &columns,
-                        task,
-                        detected.format_tag(),
-                    )
-                    .await
-                    .map_err(WorkerJobError::from)?,
+                    (None, TrainingSpec::FineTune { source, .. }) => {
+                        training_set::materialize_projection_table(
+                            session,
+                            source,
+                            &columns,
+                            task,
+                            detected.format_tag(),
+                        )
+                        .await
+                        .map_err(WorkerJobError::from)?
+                    }
+                    (
+                        None,
+                        TrainingSpec::GraphFineTune {
+                            sources,
+                            sample_config,
+                            ..
+                        },
+                    ) => {
+                        let now = chrono::Utc::now().to_rfc3339();
+                        let inputs = vec![
+                            InputAnchor::unpinned_at_instant(&sources.node_source, now.clone()),
+                            InputAnchor::unpinned_at_instant(&sources.edge_source, now),
+                        ];
+                        materialize_graph_training_set(
+                            session,
+                            job_id,
+                            sources,
+                            *sample_config,
+                            inputs,
+                        )
+                        .await
+                        .map_err(WorkerJobError::from)?
+                    }
+                    (None, TrainingSpec::ContextPredictor { .. }) => {
+                        unreachable!("the arm's pattern admits no context predictor")
+                    }
                 };
 
                 // The ONE source binding every rank of this job performs
@@ -4034,9 +4057,10 @@ impl JobWorker {
                 // identity — the training-set table's own definition hash,
                 // artifact digest and row count, binding this fine-tune to
                 // the EXACT materialised `TrainingSet` it trained from (see
-                // that descriptor variant's own doc). Only the column-source
-                // `FineTune` kind carries this; `GraphFineTune` does not (see
-                // `FineTuneMaterializationSource`'s doc).
+                // that descriptor variant's own doc). Recorded for the
+                // column-source `FineTune` kind only: the descriptor's fields
+                // name a projection's `source` and `method`, which a graph
+                // sample has no value for.
                 let training_set_artifact_digest = {
                     let parquet_url = jammi_db::storage::StorageUrl::parse(table.parquet_path())
                         .map_err(JammiError::from)
@@ -4065,14 +4089,22 @@ impl JobWorker {
                     training_set_ref: training_set_artifact_digest.clone(),
                     training_set_location: table.table_name().to_string(),
                 };
-                let materialization_source = Some(FineTuneMaterializationSource {
-                    source: source.clone(),
-                    columns: columns.clone(),
-                    method,
-                    training_set_definition_hash: table.definition_hash.as_str().to_string(),
-                    training_set_artifact_digest,
-                    training_set_row_count: table.row_count() as u64,
-                });
+                let materialization_source = match &spec {
+                    TrainingSpec::FineTune { source, method, .. } => {
+                        Some(FineTuneMaterializationSource {
+                            source: source.clone(),
+                            columns: columns.clone(),
+                            method: *method,
+                            training_set_definition_hash: table
+                                .definition_hash
+                                .as_str()
+                                .to_string(),
+                            training_set_artifact_digest,
+                            training_set_row_count: table.row_count() as u64,
+                        })
+                    }
+                    _ => None,
+                };
                 let topology = TopologyDecision::decide(
                     common.world_size,
                     session.inner_config().worker.local_ranks,
@@ -4114,94 +4146,11 @@ impl JobWorker {
                     }
                     TopologyDecision::Peer { world } => {
                         self.coordinate(
-                            session,
-                            catalog,
-                            job_id,
-                            "fine_tune",
-                            run,
-                            cancel,
-                            attempt,
-                            world,
-                            pair,
+                            session, catalog, job_id, kind, run, cancel, attempt, world, pair,
                         )
                         .await
                     }
                 }
-            }
-            TrainingSpec::GraphFineTune {
-                sources,
-                sample_config,
-                common,
-            } => {
-                // Re-read node/edge sources, re-sample the graph (seeded →
-                // deterministic), and materialise the pairs as a
-                // `GraphTrainingSet`-kind table through the SAME `Batches`
-                // producer seam the tabular arm's `TrainingSet` uses
-                // (`reconstruct_graph_loader`, GA1-GA7/GA9, issue #538) —
-                // then train on the text-embedding head. This arm is always
-                // `Resident` regardless: rank 0 reads the freshly
-                // materialised table back eagerly here (never a streamed
-                // read of it), so `train_fine_tune` never sees a
-                // graph-specific `TrainingSource` variant.
-                let loader = self
-                    .reconstruct_graph_loader(session, job_id, &sources, sample_config)
-                    .await
-                    .map_err(WorkerJobError::from)?;
-                let topology = TopologyDecision::decide(
-                    common.world_size,
-                    session.inner_config().worker.local_ranks,
-                );
-                #[cfg(feature = "test-hooks")]
-                training_test_hooks::note_topology(job_id, topology);
-                let run = FineTuneRun {
-                    task: ModelTask::TextEmbedding,
-                    common,
-                    source: crate::fine_tune::source::TrainingSource::Resident(loader),
-                    // `ProducingDescriptor::FineTune` covers only the
-                    // column-source `FineTune` kind (its own doc); a graph
-                    // fine-tune's model row carries no materialization.
-                    materialization_source: None,
-                };
-                let topology = match topology {
-                    TopologyDecision::Single => RankTopology::Single,
-                    TopologyDecision::Local { world } => RankTopology::Local { world },
-                    // Refused, typed, at the coordinator's edge (K2) — never
-                    // a silent single-rank run of a wider job. The graph arm
-                    // DOES materialise a real `GraphTrainingSet` table now
-                    // (GA1-GA7, GA9), but a member's bind path
-                    // (`bind_recorded_training_set` →
-                    // `TrainingSetTable::from_record`) refuses a
-                    // `GraphTrainingSet` descriptor, typed, so a member
-                    // cannot bind this table at all yet — and even once it
-                    // could, (1) and (2) below remain unbuilt.
-                    // Attempted and blocked twice by execution, not by
-                    // inspection: (1) a member's own rank body currently
-                    // has no path that reads the table in the SAME
-                    // `_ordinal`-committed order rank 0's own read uses — a
-                    // member reading by a column-derived `ORDER BY` (the
-                    // generic `bind_training_source` path the tabular arm's
-                    // member takes) partitions a DIFFERENT row order than
-                    // rank 0's `_ordinal` read, so the two ranks would slice
-                    // the SAME rows into DIFFERENT shards; (2) there is no
-                    // executed oracle proving a gang's per-rank shards
-                    // combine into the correct all-reduced gradient over the
-                    // graph arm's own loss (the tabular arm's own such proof
-                    // does not transfer — its shards are cut over its own
-                    // committed order, not this one). Issue #538 tracks
-                    // building both: the ordered member read and the
-                    // gradient-propagation oracle.
-                    TopologyDecision::Peer { world } => {
-                        return Err(WorkerJobError::Failed(format!(
-                            "graph fine-tune gangs are local-only in v1; W>1 Peer tracked on \
-                             #538 (world_size = {world}): run it entirely on one host ([worker] \
-                             local_ranks >= {world}) or resubmit with world_size = 1"
-                        )));
-                    }
-                };
-                self.train_fine_tune(
-                    session, catalog, job_id, run, cancel, attempt, holder, topology,
-                )
-                .await
             }
             TrainingSpec::ContextPredictor {
                 source,
@@ -4237,91 +4186,6 @@ impl JobWorker {
                     .map_err(|e| classify(cancel, e))
             }
         }
-    }
-
-    /// Re-read the node/edge sources and rebuild the deterministic graph sampler,
-    /// then derive the contrastive-pair training loader from it.
-    ///
-    /// # `GRAPH_READ_ORDER_RULE_V1` (GA1, issue #538)
-    ///
-    /// Both scans below carry an explicit `ORDER BY` over the FULL projected
-    /// tuple, ascending, NULLS FIRST — the same shape
-    /// [`jammi_db::store::training_set_order_by`] renders for the tabular
-    /// arm's own committed order. Without it the rows arrive in whatever
-    /// order the source's physical layout happens to hold (row-group order
-    /// for Parquet, file order for CSV), and `GraphSampler::sample` walks
-    /// `node_ids` in insertion order and each node's `out_adj` in
-    /// edge-arrival order over ONE seeded RNG stream — so two layouts of the
-    /// identical node/edge SET sampled different bytes. Ordering both scans
-    /// restores "the sample is a function of the input SET, not its scan
-    /// order"; [`GraphSampler::build`]'s duplicate-node-id refusal is the
-    /// other half (a key-only order is not total under a duplicate id).
-    // `job_id` feeds only the `test-hooks`-gated fingerprint recorder below;
-    // without that feature it is a genuinely unused parameter, not a bug.
-    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
-    async fn reconstruct_graph_loader(
-        &self,
-        session: &Arc<InferenceSession>,
-        job_id: &str,
-        sources: &GraphFineTuneSources,
-        sample_config: GraphSampleConfig,
-    ) -> Result<TrainingDataLoader> {
-        // Issue #538: a fresh materialization anchors both sources at the
-        // read instant — the same honest, never-reused anchor
-        // `training_set::materialize_projection_table` records for the
-        // tabular arm's single source. `recompute_graph_training_set`
-        // (`pipeline/recompute.rs`) calls the SAME shared function below
-        // with RE-RESOLVED anchors instead.
-        let now = chrono::Utc::now().to_rfc3339();
-        let inputs = vec![
-            InputAnchor::unpinned_at_instant(&sources.node_source, now.clone()),
-            InputAnchor::unpinned_at_instant(&sources.edge_source, now),
-        ];
-        let has_negatives = sample_config.hard_negatives > 0;
-        let table =
-            materialize_graph_training_set(session, job_id, sources, sample_config, inputs).await?;
-
-        // Read back in committed (`_ordinal`) order (GA4) and decode
-        // directly into the graph-format loader — never
-        // `detect_training_format`'s column-name classifier, which cannot
-        // distinguish this table from an ordinary triplet/pairs one (the
-        // column names are identical); the worker already knows this is a
-        // graph job.
-        // The relation carries its own committed order (`_ordinal`, the
-        // `columns` the graph producer's `TrainingSetSpec` recorded — #551):
-        // the loader never builds an `ORDER BY` of its own.
-        let read_query = table.relation()?.select_ordered();
-        let read_batches = session.sql(&read_query).await?;
-        let mut rows: Vec<(String, String, Option<String>)> = Vec::new();
-        for batch in &read_batches {
-            let anchors = batch
-                .column_by_name("anchor")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune("graph training set: 'anchor' is not text".into())
-                })?;
-            let positives = batch
-                .column_by_name("positive")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune("graph training set: 'positive' is not text".into())
-                })?;
-            let negative_col = batch.column_by_name("negative").ok_or_else(|| {
-                JammiError::FineTune("graph training set: missing 'negative' column".into())
-            })?;
-            let negatives = extract_string_column(negative_col.as_ref()).ok_or_else(|| {
-                JammiError::FineTune("graph training set: 'negative' is not text".into())
-            })?;
-            for i in 0..batch.num_rows() {
-                let negative = if negative_col.is_null(i) {
-                    None
-                } else {
-                    Some(negatives[i].clone())
-                };
-                rows.push((anchors[i].clone(), positives[i].clone(), negative));
-            }
-        }
-        TrainingDataLoader::from_graph_table_rows(rows, has_negatives)
     }
 
     /// Load the base model, build the training target, and drive the blocking
@@ -6344,28 +6208,21 @@ pub(crate) fn assign_ranks(
 }
 
 /// Who one attempt of `spec` runs as on this host (the module doc's writer
-/// table): the `Coordinator` exactly when a column-source `fine_tune`
-/// decides [`TopologyDecision::Peer`] over this host's `[worker]
-/// local_ranks` — the one shape `run_spec` hands to the coordinator body —
-/// and the `LoopClaimer` for every other shape: a single rank, an
-/// in-process `Local` gang, a `graph_fine_tune` (a `Peer` one is refused at
-/// the coordinator's edge before any assembly) and a context predictor
+/// table): the `Coordinator` exactly when a job that trains from a
+/// training-set table decides [`TopologyDecision::Peer`] over this host's
+/// `[worker] local_ranks` — the one shape `run_spec` hands to the coordinator
+/// body — and the `LoopClaimer` for every other shape: a single rank, an
+/// in-process `Local` gang, and a context predictor
 /// (single-rank by admission). Decided from the SAME `TopologyDecision::
 /// decide` call `run_spec` makes, over the same inputs, so the two cannot
 /// diverge. `W == 1` is the loop claimer on every arm (K4).
 pub fn lease_holder_for(spec: &TrainingSpec, local_ranks: u32) -> LeaseHolder {
-    match spec {
-        TrainingSpec::FineTune { common, .. } => {
-            match TopologyDecision::decide(common.world_size, local_ranks) {
-                TopologyDecision::Peer { .. } => LeaseHolder::Coordinator,
-                TopologyDecision::Single | TopologyDecision::Local { .. } => {
-                    LeaseHolder::LoopClaimer
-                }
-            }
-        }
-        TrainingSpec::GraphFineTune { .. } | TrainingSpec::ContextPredictor { .. } => {
-            LeaseHolder::LoopClaimer
-        }
+    let Some(view) = spec.training_set_view() else {
+        return LeaseHolder::LoopClaimer;
+    };
+    match TopologyDecision::decide(view.common.world_size, local_ranks) {
+        TopologyDecision::Peer { .. } => LeaseHolder::Coordinator,
+        TopologyDecision::Single | TopologyDecision::Local { .. } => LeaseHolder::LoopClaimer,
     }
 }
 
@@ -7138,23 +6995,17 @@ async fn member_rank_body(
     };
     let Some(spec) = job_spec.as_training_spec() else {
         return failed(format!(
-            "a Peer gang serves a column-source fine_tune only; the row's spec is a compute \
-             kind {}",
+            "a gang trains from a training-set table; the row's spec is a compute kind {}",
             job_spec.kind()
         ));
     };
-    let TrainingSpec::FineTune {
-        columns,
-        task,
-        common,
-        ..
-    } = spec
-    else {
+    let Some(view) = spec.training_set_view() else {
         return failed(format!(
-            "a Peer gang serves a column-source fine_tune only; the row's spec is a {}",
+            "a gang trains from a training-set table; a {} has none",
             spec.kind()
         ));
     };
+    let (columns, task, common) = (view.columns, view.task, view.common.clone());
     if common.world_size != world {
         return failed(format!(
             "the row's spec names world_size {} where the assignment names {world}",
@@ -8070,7 +7921,7 @@ pub mod training_test_hooks {
     }
 
     /// The most recently recorded graph-sample fingerprint for `job_id` —
-    /// `None` if this job never reached `reconstruct_graph_loader`.
+    /// `None` if this job never sampled a graph.
     pub fn graph_sample_fingerprint_for(job_id: &str) -> Option<String> {
         graph_samples()
             .lock()
@@ -8082,7 +7933,7 @@ pub mod training_test_hooks {
     }
 
     /// One recorded `training_set_graph_sample` reservation size, keyed by
-    /// job — GA7's oracle (issue #538): the bytes `reconstruct_graph_loader`
+    /// job — GA7's oracle (issue #538): the bytes `materialize_graph_training_set`
     /// actually reserved against the NAMED `MemoryConsumer`, so a test can
     /// assert it against an independently computed lower bound rather than
     /// trust the reservation call succeeded silently.
@@ -10809,13 +10660,13 @@ mod tests {
     }
 
     /// The holder derivation (the module doc's writer table): the
-    /// `Coordinator` exactly when a column-source `fine_tune` decides
-    /// `Peer` over this host's `local_ranks`; the `LoopClaimer` for every
-    /// other `(kind, world_size, local_ranks)` — `W == 1` on every kind and
-    /// every host (K4), an in-process `Local` gang, a `graph_fine_tune` of
-    /// any width, a context predictor.
+    /// `Coordinator` exactly when a kind that trains from a training-set
+    /// table — `fine_tune` and `graph_fine_tune` alike — decides `Peer` over
+    /// this host's `local_ranks`; the `LoopClaimer` for every other
+    /// `(kind, world_size, local_ranks)` — `W == 1` on every kind and every
+    /// host, and an in-process `Local` gang.
     #[test]
-    fn the_lease_holder_is_the_coordinator_exactly_when_a_fine_tune_decides_peer() {
+    fn the_lease_holder_is_the_coordinator_exactly_when_a_training_set_kind_decides_peer() {
         use crate::fine_tune::spec::TrainingCommon;
         use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
         use jammi_db::store::CachePolicy;
@@ -10866,8 +10717,8 @@ mod tests {
                 };
                 assert_eq!(
                     lease_holder_for(&graph, local_ranks),
-                    LeaseHolder::LoopClaimer,
-                    "graph_fine_tune W={world_size} L={local_ranks}: never the coordinator"
+                    expected,
+                    "graph_fine_tune W={world_size} L={local_ranks}: the same rule as fine_tune"
                 );
             }
         }

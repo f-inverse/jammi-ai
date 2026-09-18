@@ -164,6 +164,16 @@ if stage_wanted static; then
     cargo clippy -p jammi-ai --tests --features live-gpu-tests,live-distributed-tests -- -D warnings
   run static "clippy gated test surfaces (jammi-server)" \
     cargo clippy -p jammi-server --tests --features test-hooks -- -D warnings
+  # The `postgres`/`mysql` source providers pull `openssl-sys`, whose build
+  # script needs OpenSSL headers the CI image deliberately omits; ci.yml
+  # installs them for this one lint (its "OpenSSL headers" step, which says
+  # why). Mirror that step where it applies: inside the image, as root, with
+  # the headers absent. A developer host that already has OpenSSL is left
+  # alone.
+  if command -v yum >/dev/null 2>&1 && [ "$(id -u)" = 0 ] \
+    && ! pkg-config --exists openssl 2>/dev/null; then
+    run static "OpenSSL headers (for the source-provider lint)" yum install -y -q openssl-devel
+  fi
   run static "clippy jammi-db postgres,mysql" \
     cargo clippy -p jammi-db --features postgres,mysql --all-targets -- -D warnings
   run static "rustdoc -D warnings" \

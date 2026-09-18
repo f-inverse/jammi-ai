@@ -505,12 +505,13 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
 /// one shared value. The macOS constant below is pinned from two repeated
 /// local runs (confirmed byte-stable, the same discipline
 /// [`gradcache_completes_at_w1_with_a_pinned_adapter_digest`]'s own doc
-/// states). The Linux constant is pinned from ONE observation — the hermetic
-/// `Test` job's own stdout (ci.yml run 35334270497, x86_64 `ubuntu-latest`),
-/// read from the `println!` below, printed BEFORE the assert on every run —
-/// so its byte-stability across runners is asserted by every CI run since,
-/// not yet established by two agreeing captures the way the macOS pair's is;
-/// a divergence fails BY NAME here (never `#[ignore]`d).
+/// states). The Linux constant is pinned from two agreeing captures on
+/// x86_64 Linux: the hermetic `Test` job's own stdout (ci.yml run
+/// 35334270497, `ubuntu-latest`), read from the `println!` below, printed
+/// BEFORE the assert on every run, and a second run of this test inside the
+/// same CI image (`ghcr.io/f-inverse/jammi-ai-ci`, `linux/amd64`) on another
+/// host; every CI run re-measures it and a divergence fails BY NAME here
+/// (never `#[ignore]`d).
 /// This run's live mining-on-vs-off inequality (below) is the non-vacuity control this
 /// module's doc names: #551's own oracle gap (an earlier attempted digest
 /// test set `hard_negatives.mine = true` with no `embedding_loss` at all, so
@@ -521,10 +522,10 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
     use jammi_ai::fine_tune::{EmbeddingLoss, HardNegativeConfig};
 
     // Platform-specific, like `PARITY_ADAPTER_PRINTS` above: the Linux pair
-    // is captured from one hermetic CI job's stdout (this test's own
-    // `println!`, below; run 35334270497) and every later CI run re-measures
-    // it; the macOS pair is pinned from two repeated local runs on this
-    // implementer's host.
+    // is captured from the hermetic CI job's stdout (this test's own
+    // `println!`, below; run 35334270497) and confirmed by a second run in
+    // the CI image on another x86_64 host; the macOS pair is pinned from two
+    // repeated local runs on this implementer's host.
     #[cfg(target_os = "linux")]
     const MINING_ADAPTER_PRINTS: &[(&str, &str)] = &[
         ("adapter.safetensors", "1184:18ce9f6cfea22f83"),

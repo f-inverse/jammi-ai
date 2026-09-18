@@ -1346,17 +1346,11 @@ async fn fine_tune_graph_end_to_end_completes() {
     // order (issue #538). This assertion pins the resulting bytes, so a
     // regression of the ordering fix (or an unrelated change to the
     // sampler/trainer) shows up here as a moved fingerprint.
-    // The bytes are platform-specific (x86_64 Linux vs Apple Silicon float
-    // paths), so the pin carries one value per platform: Linux measured
-    // inside the CI image (`ghcr.io/f-inverse/jammi-ai-ci`, `docker run
-    // --platform linux/amd64`, QEMU-emulated on the Apple Silicon
-    // implementer host — not native x86_64 hardware); the other measured
-    // natively on the Apple Silicon host GA1 was implemented on. A native
-    // x86_64 measurement disagreeing with the QEMU-measured value is NOT
-    // self-authorizing: re-pin it only via an explicit commit that states
-    // the old and new values and which run (native, real hardware) produced
-    // the new one — never a silent move on a CI run's say-so.
-    let expected = if cfg!(target_os = "linux") {
+    // The bytes are a function of the CPU architecture, not the operating
+    // system (aarch64 Linux reproduces aarch64 macOS byte for byte), so the
+    // pin carries one value per `target_arch`. A re-pin states the old and
+    // new values and the run that produced the new one.
+    let expected = if cfg!(target_arch = "x86_64") {
         "1184:d923987b7592d7bd"
     } else {
         "1184:7a8781df1cd80172"

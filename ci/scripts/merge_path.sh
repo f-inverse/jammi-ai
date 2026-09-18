@@ -142,6 +142,19 @@ run_sh_nosccache() {
 export GITHUB_EVENT_NAME=pull_request GITHUB_BASE_REF="$BASE_REF" GITHUB_HEAD_REF="$HEAD_REF" \
   GITHUB_ACTOR="${GITHUB_ACTOR:-local}" GITHUB_WORKSPACE="$ROOT"
 
+# provide_in_image STAGE PACKAGE PROBE... — inside the CI image (root, yum),
+# install PACKAGE when PROBE fails. The hosted runners a ci.yml job uses carry
+# tools the image deliberately leaves out, and some jobs install one for a
+# single step; this supplies the same thing to a run inside the image. On a
+# developer host it does nothing: PROBE passes, or there is no yum to call.
+provide_in_image() {
+  local stage="$1" package="$2"; shift 2
+  if "$@" >/dev/null 2>&1; then return 0; fi
+  if command -v yum >/dev/null 2>&1 && [ "$(id -u)" = 0 ]; then
+    run "$stage" "provide $package (absent from the CI image)" yum install -y -q "$package"
+  fi
+}
+
 # ---------------------------------------------------------------- coverage
 # Which ci.yml jobs this runner covers, printed up front so "green" is never
 # read as "every job".
@@ -166,14 +179,8 @@ if stage_wanted static; then
     cargo clippy -p jammi-server --tests --features test-hooks -- -D warnings
   # The `postgres`/`mysql` source providers pull `openssl-sys`, whose build
   # script needs OpenSSL headers the CI image deliberately omits; ci.yml
-  # installs them for this one lint (its "OpenSSL headers" step, which says
-  # why). Mirror that step where it applies: inside the image, as root, with
-  # the headers absent. A developer host that already has OpenSSL is left
-  # alone.
-  if command -v yum >/dev/null 2>&1 && [ "$(id -u)" = 0 ] \
-    && ! pkg-config --exists openssl 2>/dev/null; then
-    run static "OpenSSL headers (for the source-provider lint)" yum install -y -q openssl-devel
-  fi
+  # installs them for this one lint (its "OpenSSL headers" step says why).
+  provide_in_image static openssl-devel pkg-config --exists openssl
   run static "clippy jammi-db postgres,mysql" \
     cargo clippy -p jammi-db --features postgres,mysql --all-targets -- -D warnings
   run static "rustdoc -D warnings" \
@@ -231,6 +238,10 @@ PY
   # placement — a guard that builds a workspace crate lives in ci.yml's
   # container-backed `symbol-index-gates` job — and the draft PR's CI is the
   # check. Toolchain legs run as-is here.
+  # The guard runner has an ssh client and, on a toolchain leg, a fetched
+  # registry (`cargo metadata --frozen` reads it); the image has neither.
+  provide_in_image guards openssh-clients command -v ssh-keygen
+  run guards "cargo fetch (a toolchain leg's registry)" cargo fetch --locked
   while IFS=$'\t' read -r name toolchain cmd; do
     if [ "$toolchain" = "true" ]; then
       run_sh guards "$name" "$cmd"

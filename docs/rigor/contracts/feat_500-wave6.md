@@ -297,7 +297,7 @@ Wave 6: seven contracts pressure-tested (KILL ×4 → TYPESTATE excised after a 
 rebuilt as v2 and re-pressured; REFINE ×3 folded: LOADER, PROFILE, GATES). Wave 7: two design rounds each for GRAPH
 (KILL, KILL → excised), GRAPHARM, RANGESPLIT, RENDEZVOUS (promoted to implementation contracts). The first
 RENDEZVOUS design verdict carried no JSON fence and is recorded UNBOUND; its second round is the pressure row.
-Phase-5 oracle: PASS on 714cfb41, re-run PASS on 305822b6 (two prose advisories on the lead's own mining-pin commit, folded as 73335961) and PASS on 73335961 (`docs/rigor/feat_500-wave6.oracle.jsonl`, the committed row), mechanical gates all 0, four advisories folded above (A1 §2.1 wording, A2 the lead's own brief named a migration this wave does not carry — §3 was already right, A3/A4 as §5 residuals).
+Phase-5 oracle: PASS on 714cfb41, re-run PASS on 305822b6 (two prose advisories on the lead's own mining-pin commit, folded as 73335961) PASS on 73335961 and PASS on 92de9197 (`docs/rigor/feat_500-wave6.oracle.jsonl`, every row committed; the last two rounds were gate-driven doc reflows, not oracle findings), mechanical gates all 0, four advisories folded above (A1 §2.1 wording, A2 the lead's own brief named a migration this wave does not carry — §3 was already right, A3/A4 as §5 residuals).
 
 ## 8. Stop rules honored
 Second-block excisions: TYPESTATE (pressure), COOKGATE, LOADER, PROFILE (closing audits), SEAL S2 (F7), GRAPH
@@ -339,6 +339,7 @@ reviewed in the wall-clock-bound inventory.
 | 1845253c | static, guards, swarm, tests, records | — | — | the doc-claims lens fold (20 prose claims re-anchored, two mechanisms aligned to their stated property; three read-only auditors, 145 files, 408 claims); the closing run on the final tip, result on the PR |
 | 97fcbd6f | (CI, PR #592 on d0c8f414) | — | 3 — Kubernetes smoke (the load-only image build passed no `CARGO_FEATURES`, refused by the Dockerfile's own guard), hermetic Test (the mining pin's Linux constant was `None` by design and failed by name), oracle gate (the record's head_sha was orphaned by a records amend) | 97fcbd6f: both smoke workflows read the `cpu-image` lane (eleven sites); the Linux pair pinned from the run's stdout; the oracle re-run on this tip and its record added as a new commit, never an amend |
 | 73335961 | static, guards, swarm, tests, records | — | — | the mining pin as a plain per-platform constant (oracle A5/A6); the closing run on the final tip, result on the PR |
+| 92de9197 | static, guards, swarm, records | — | — | the two smoke-build citations one per line (the resolver's shape); the closing run on the final tip, result on the PR |
 
 Lanes dispatched from the branch: release-binaries 35300438931 (success, the jail report captured — GATES P4 §4(iii) precondition), server-image 35300440387 (success), gpu-prove 35304096937 (four legs, result recorded on the PR).
 

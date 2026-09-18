@@ -7,6 +7,19 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### BREAKING
+- **`jammi_db::storage::build_object_store` and `StorageRegistry::driver_for` are no
+  longer public (#588).** No crate outside `jammi-db` can obtain a raw
+  `Arc<dyn ObjectStore>` from the registry or the builder; `JammiObjectStore::{new, open,
+  handle_for}` are the only doors and none yields the driver. A caller that built its own
+  driver through the builder migrates to `JammiObjectStore::open`, or constructs an
+  `object_store` driver itself. The DataFusion session context still resolves a writable
+  `file://` store (a registry-level seal was built and excised; recorded on #588).
+- **`jammi_ai::fine_tune::training_set::read_back_sql(table)` takes no projection, and
+  `TrainingSetTable::from_record(record, manifest, outcome)` reads the order key from the
+  manifest (#551).** A training set's read-back order is a property of the relation
+  (`TrainingSetTable::relation()`), never a caller-supplied column list; a manifest whose
+  `definition_hash` disagrees with the catalog row's, or whose descriptor has no columns,
+  is refused typed.
 - **`[server] preload_models` is now honoured (#482).** It was documented and
   dormant; a config that already lists it flips from starting to exiting
   non-zero if a listed model cannot load, a bare id has no `models` row (its
@@ -95,6 +108,13 @@ workspace ships every publishable crate at the same
   behaviour).
 
 ### Added
+- **`[inference] partitions = N` (#540).** Splits the model forward `N` ways in-process
+  below every `InferenceExec` (default `1`, refused outside `1..=1024`): each partition
+  pulls the next batch on demand and stamps a global `_ordinal`, and a
+  `SortPreservingMergeExec` on `_ordinal` restores the single-partition row sequence
+  exactly. Forwards are admitted by a per-exec permit (CPU: available parallelism; GPU:
+  one). A plan carrying the split is refused, typed, for distributed submission (the
+  split has no wire form in v1; #540).
 - **`[server] placement = "local" | "rendezvous"` and
   `jammi_db::index::RendezvousPlacement` (#500).** Beyond-one-node retrieval
   over the LIVE `instances` ring, derived at query time (never declared):
@@ -385,6 +405,11 @@ workspace ships every publishable crate at the same
   now accepts either the value inline or `{ file = "…" }` naming a file to read
   at load (env spelling: `JAMMI_<PATH>__FILE=/path`); a resolved secret renders
   as `Secret(***)` everywhere, including `Debug` — see `### Changed` for the
+- **A fine-tune's `definition_hash` folds the kernel-admission profile (#546).** The
+  profile renders, per probed op, whether the job's build features, admission mode and
+  `JAMMI_KERNELS_DISABLE` set (resolved at the job's `backbone_dtype` class) admit the
+  fused kernel; two runs whose admission genuinely differs now hash differently. Existing
+  fine-tune outputs re-materialize once under `cache = Use` after upgrading.
   `storage.cloud.{s3,r2,gcs,azure}` credential fields' retype.
   `signing_key.file` reads the
   audit master key from a file (re-read on every signing request, so a rotated
@@ -1235,6 +1260,12 @@ workspace ships every publishable crate at the same
   immune to a stray `PGSSLMODE=disable` left in the environment.
 
 ### Fixed
+- **Width-mismatch refusals name the right party (#519).** The placement entry's Mixed
+  and all-local shapes, `exact_vector_search`'s no-catalog-width fallback and the
+  force-local `search_vectors_local` check a query against the authority they hold
+  (catalog width, else the loaded index's own width), so a caller's wrong-width query is
+  refused in the caller class and a Stored-provenance mismatch names the query's own
+  source table, never a segment.
 - **`JobService.PruneJobs` swept every tenant's terminal rows, not just the
   caller's (#485).** The RPC handler bypassed
   `scoped(...)` (the tenant-binding path every other `JobService` RPC uses)

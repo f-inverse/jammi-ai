@@ -145,6 +145,41 @@ pub fn cookbook_fixture(name: &str) -> PathBuf {
     cookbook_fixtures_dir().join(name)
 }
 
+/// A text the `tiny_bert` fixture model can tell apart from every other
+/// `(role, index)`: `role`, then `index` in base 36, each character its own
+/// whitespace-separated word.
+///
+/// That model's vocabulary is 256 WordPiece tokens — the single characters
+/// `0-9a-z`, punctuation and a few suffixes — so an ordinary English fixture
+/// (`"anchor text 3"`, `"graph_node_text_3"`) tokenizes almost entirely to
+/// `[UNK]`: rows that differ on the page are one row to the model, and a test
+/// over them cannot see a wrong order, a wrong shard, or an anchor that equals
+/// its positive. Every word this emits is a single in-vocabulary token, so
+/// distinct arguments give distinct token sequences, for any number of rows.
+///
+/// # Panics
+/// If `role` is not an ASCII lowercase letter or digit.
+pub fn tiny_vocab_text(role: char, index: usize) -> String {
+    assert!(
+        role.is_ascii_digit() || role.is_ascii_lowercase(),
+        "tiny_vocab_text: role {role:?} is not a single in-vocabulary character (0-9, a-z)"
+    );
+    let mut digits = Vec::new();
+    let mut rest = index;
+    loop {
+        digits.push(char::from_digit((rest % 36) as u32, 36).expect("a base-36 digit"));
+        rest /= 36;
+        if rest == 0 {
+            break;
+        }
+    }
+    std::iter::once(role)
+        .chain(digits.into_iter().rev())
+        .map(String::from)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// URL for a `tests/fixtures/` fixture suitable for DataFusion's ListingTable.
 pub fn fixture_url(name: &str) -> String {
     format!("file://{}", fixture(name).display())

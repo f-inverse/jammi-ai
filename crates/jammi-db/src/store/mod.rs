@@ -25,10 +25,10 @@ pub use freshness::{
 pub use layout::TenantSegment;
 pub use manifest::{
     AnchorKind, AnchorValue, ArtifactDigest, ComputeDevice, DefinitionHash, DeletePolicy,
-    InputAnchor, LeafDigest, LeafKey, ManifestError, MatchVerdict, Materialization,
-    MaterializationEnv, MaterializationManifest, ModelContentDigest,
+    GraphSampleFields, InputAnchor, LeafDigest, LeafKey, ManifestError, MatchVerdict,
+    Materialization, MaterializationEnv, MaterializationManifest, ModelContentDigest,
     ModelContentDigestUnavailableReason, ModelIdentity, PartitionVerdict, ProducingDescriptor,
-    TRAINING_SET_ORDER_RULE_V1,
+    GRAPH_READ_ORDER_RULE_V1, TRAINING_SET_ORDER_RULE_V1,
 };
 pub use reconcile::{ReconcileOptions, ReconcileReport};
 pub use result_schema::ResultTableSchemaProvider;
@@ -37,15 +37,19 @@ pub use version::VersionManifest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
-use arrow::array::Array;
+use arrow::array::{Array, UInt64Array};
+use arrow::datatypes::SchemaRef;
+use datafusion::catalog::streaming::StreamingTable;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::options::ReadOptions;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::SortExpr;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
@@ -162,41 +166,176 @@ pub struct ComputedEmbeddingProvenance {
 /// use.
 pub const TRAINING_SET_MODEL_ID: &str = "training-set";
 
+/// [`ResultStore::materialize_training_set`]'s producer input (GA5, issue
+/// #538): SQL run through the caller's session (the tabular arm, unchanged
+/// since before GA5), or a one-shot [`RecordBatch`](arrow::array::RecordBatch)
+/// stream the caller already computed and put in its own final, committed row
+/// order (the graph arm — its rows are the output of an in-memory biased
+/// walk, not a query the engine can express as durable SQL).
+///
+/// Both arms plan and write through the IDENTICAL machinery in
+/// [`ResultStore::materialize_training_set`]; only
+/// `ResultStore::plan_training_set_rows` branches on which this is. The
+/// `Batches` provider is NAMELESS — read via `ctx.read_table(provider)`,
+/// never `ctx.register_table(..)` — the same unregistered-provider shape
+/// [`ResultStore::pinned_provider`]/`ResultStore::current_version_provider`
+/// already use elsewhere in this module, so a name that is not unique per
+/// materialization call never collides on the shared session (the shape a
+/// `MemTable` binding under a per-spec or per-job name was tried and refuted
+/// for — see issue #538's own history).
+pub enum TrainingSetInput<'a> {
+    /// The query the rows are projected from, as the producer will run it.
+    /// This is the identity of the *source* in the definition hash: two
+    /// different projections, filters, or joins over one registered source are
+    /// two different training sets and must not share a table.
+    Sql(&'a str),
+    /// A one-shot stream of already-final rows, in the producer's OWN
+    /// committed order (e.g. a leading `_ordinal` column, ascending) —
+    /// [`ResultStore::materialize_training_set`] does NOT re-sort this arm
+    /// (GA4): re-imposing a full-tuple sort here would permute rows the
+    /// caller already committed in a meaningful order (the graph sampler's
+    /// per-anchor walk-emission order) into an unrelated alphabetic one.
+    /// Instead every batch is checked, as it drains, against `columns`
+    /// (`TrainingSetSpec::columns`, read here as the order-key column to
+    /// assert rather than a projection to apply) — see
+    /// `ResultStore::plan_training_set_rows`'s `Batches` arm.
+    Batches {
+        /// The exact schema every batch below conforms to.
+        schema: SchemaRef,
+        /// The one-shot row stream — taken exactly once; this producer is its
+        /// sole consumer.
+        stream: SendableRecordBatchStream,
+    },
+}
+
+impl std::fmt::Debug for TrainingSetInput<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sql(sql) => f.debug_tuple("Sql").field(sql).finish(),
+            Self::Batches { schema, .. } => f
+                .debug_struct("Batches")
+                .field("schema", schema)
+                .field("stream", &"<SendableRecordBatchStream>")
+                .finish(),
+        }
+    }
+}
+
+/// A one-shot [`PartitionStream`] wrapping a [`TrainingSetInput::Batches`]
+/// caller's stream — the nameless provider `ResultStore::plan_training_set_rows`
+/// hands to `ctx.read_table(..)`. `execute` takes the stream out on the
+/// first (and only) call the engine's single-partition derivation ever makes;
+/// a hypothetical second call yields an empty stream rather than panicking.
+struct OneShotBatches {
+    schema: SchemaRef,
+    inner: Mutex<Option<SendableRecordBatchStream>>,
+}
+
+impl std::fmt::Debug for OneShotBatches {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OneShotBatches(training-set Batches input)")
+    }
+}
+
+impl PartitionStream for OneShotBatches {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+        let taken = self
+            .inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        match taken {
+            Some(s) => s,
+            None => Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&self.schema),
+                futures::stream::empty(),
+            )),
+        }
+    }
+}
+
+/// Wrap `stream` so every batch's `order_columns[0]` (when present — the
+/// [`TrainingSetInput::Batches`] arm's order key, e.g. `_ordinal`) is checked
+/// non-decreasing WITHIN that batch as it drains, and any violation surfaces
+/// as a typed error instead of silently committing an out-of-order batch —
+/// GA4's "assert, don't impose" replacement for the `Sql` arm's `SortExec`.
+/// Scoped to a [`UInt64Array`] column (`_ordinal`'s own type); a
+/// differently-typed or absent named column is not checked here (nothing in
+/// this crate names anything else as a `Batches` order key today).
+fn assert_batches_are_ordinal_sorted(
+    stream: SendableRecordBatchStream,
+    order_columns: &[String],
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    let order_column = order_columns.first().cloned();
+    let checked = stream.map(move |item| {
+        let batch = item?;
+        if let Some(name) = &order_column {
+            if let Some(array) = batch
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+            {
+                for pair in array.values().windows(2) {
+                    if pair[1] < pair[0] {
+                        return Err(datafusion::error::DataFusionError::Execution(format!(
+                            "training set Batches input: column '{name}' is not sorted \
+                             ascending within a batch ({} then {}) — GRAPH_READ_ORDER_RULE_V1 \
+                             (GA1) / GA4 requires the caller's stream to already be in its own \
+                             committed order; this producer never re-sorts a Batches input",
+                            pair[0], pair[1]
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(batch)
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, checked))
+}
+
 /// Everything [`ResultStore::materialize_training_set`] needs to identify and
 /// build one training set.
 ///
 /// Every field here except `device` and `inputs` is a **determinant of the
-/// table's identity** and folds into [`ProducingDescriptor::TrainingSet`];
-/// `device` folds into the [`MaterializationEnv`] the hash also covers.
-/// `inputs` is not part of the hash — the definition is *how* a table is
-/// produced, the anchors are *over what* — but it IS the other half of the
+/// table's identity**; `descriptor` IS that identity (folded into the
+/// [`DefinitionHash`] directly) and `device` folds
+/// into the [`MaterializationEnv`] the hash also covers. `inputs` is not part
+/// of the hash — the definition is *how* a table is produced, the anchors are
+/// *over what* — but it IS the other half of the
 /// reuse key: [`ResultStore::materialize_training_set`] reuses a table only
 /// when its recorded anchors equal these and every one of them is pinned.
 ///
 /// Deliberately absent: world size, per-rank batch, validation fraction,
 /// topology. They slice a table that is already fixed, so a spec that carried
 /// them would fragment one shareable artifact into a per-run copy.
-#[derive(Debug)]
 pub struct TrainingSetSpec<'a> {
     /// The registered source the rows belong to — the catalog row's
     /// `source_id` lineage column, and the name a refusal reports against.
+    /// For a [`TrainingSetInput::Batches`] caller (no single registered
+    /// relation), a descriptive stand-in naming its real sources (e.g. `graph
+    /// node=NODE_SOURCE edge=EDGE_SOURCE`) — never a fabricated SQL string
+    /// (issue #538).
     pub source_id: &'a str,
-    /// The query the rows are projected from, as the producer will run it.
-    /// This is the identity of the *source* in the definition hash: two
-    /// different projections, filters, or joins over one registered source are
-    /// two different training sets and must not share a table.
-    pub source_sql: &'a str,
-    /// The columns to project, in declared order. Also the full-tuple order
-    /// key ([`TRAINING_SET_ORDER_RULE_V1`]), so the declared order is
-    /// output-affecting.
+    /// The producer's row source — SQL, or a one-shot batch stream.
+    pub input: TrainingSetInput<'a>,
+    /// The `Sql` arm's projected columns, in declared order (also the
+    /// full-tuple order key, [`TRAINING_SET_ORDER_RULE_V1`] — the declared
+    /// order is output-affecting); the `Batches` arm's order-key column(s) to
+    /// ASSERT (never impose) sortedness over as the stream drains — see
+    /// `assert_batches_are_ordinal_sorted`.
     pub columns: &'a [String],
     /// The model task the projected columns are read as.
     pub task: ModelTask,
-    /// The training format the consumer parses the rows under, as its
-    /// canonical string tag. The consuming crate owns the enum and the mapping
-    /// (`jammi-db` depends on no jammi crate but `jammi-numerics`); the
-    /// mapping's completeness is what keeps two formats off one hash.
-    pub format: &'a str,
+    /// The typed identity this table names — the caller builds it (e.g.
+    /// [`ProducingDescriptor::training_set`] for the tabular arm,
+    /// [`ProducingDescriptor::graph_training_set`] for the graph arm) rather
+    /// than this spec deriving one internally: two different producer verbs
+    /// share this one spec/materialization funnel but must NOT share one
+    /// descriptor shape (GA2, issue #538).
+    pub descriptor: ProducingDescriptor,
     /// The as-of anchors of every input the source query reads, in the
     /// caller's order. Recorded in the manifest and matched exactly by the
     /// reuse probe: an [`AnchorKind::UnpinnedAtInstant`] anchor here means
@@ -209,16 +348,26 @@ pub struct TrainingSetSpec<'a> {
     pub device: ComputeDevice,
 }
 
+impl std::fmt::Debug for TrainingSetSpec<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrainingSetSpec")
+            .field("source_id", &self.source_id)
+            .field("input", &self.input)
+            .field("columns", &self.columns)
+            .field("task", &self.task)
+            .field("descriptor", &self.descriptor)
+            .field("inputs", &self.inputs)
+            .field("device", &self.device)
+            .finish()
+    }
+}
+
 impl TrainingSetSpec<'_> {
-    /// The typed [`ProducingDescriptor::TrainingSet`] this spec names.
+    /// The typed identity this spec names — exactly what the caller supplied
+    /// in the `descriptor` field (see that field's own doc for why this is
+    /// no longer derived here).
     pub fn descriptor(&self) -> ProducingDescriptor {
-        ProducingDescriptor::TrainingSet {
-            source: self.source_sql.to_string(),
-            columns: self.columns.to_vec(),
-            task: self.task,
-            format: self.format.to_string(),
-            order_rule: manifest::TRAINING_SET_ORDER_RULE_V1.to_string(),
-        }
+        self.descriptor.clone()
     }
 
     /// The output-affecting environment this spec's materialization runs under
@@ -3702,6 +3851,14 @@ impl ResultStore {
             ProducingDescriptor::TrainingSet { columns, .. } => {
                 Ok(Some(training_set_file_sort_order(&columns)))
             }
+            // Issue #538: every graph training-set table is written with a
+            // leading `_ordinal` column, no full-tuple sort — declare it the
+            // same way, so a read-back plans no `SortExec` here either.
+            ProducingDescriptor::GraphTrainingSet { .. } => {
+                Ok(Some(training_set_file_sort_order(&[
+                    manifest::GRAPH_TRAINING_SET_ORDINAL_COLUMN.to_string(),
+                ])))
+            }
             other => {
                 warn!(
                     table = record.table_name,
@@ -4855,7 +5012,17 @@ impl ResultStore {
             });
         }
 
-        let (plan, mut stream) = self.plan_training_set_rows(ctx, &spec).await?;
+        // The empty-projection refusal below must name what the caller
+        // actually gave it — the SQL text for `Sql`, `source_id` for
+        // `Batches` (which has no query to quote) — captured before
+        // `spec.input` is moved into `plan_training_set_rows`.
+        let empty_refusal_subject = match &spec.input {
+            TrainingSetInput::Sql(sql) => sql.to_string(),
+            TrainingSetInput::Batches { .. } => spec.source_id.to_string(),
+        };
+        let (plan, mut stream) = self
+            .plan_training_set_rows(ctx, spec.source_id, spec.columns, spec.input)
+            .await?;
 
         // K2: the refusal has to land BEFORE the catalog row exists, so the
         // stream is pulled until it yields a row (or ends). Only the leading
@@ -4874,7 +5041,7 @@ impl ResultStore {
         }
         if rows_seen == 0 {
             return Err(JammiError::EmptyTrainingSet {
-                source_query: spec.source_sql.to_string(),
+                source_query: empty_refusal_subject,
             });
         }
 
@@ -4979,68 +5146,106 @@ impl ResultStore {
         Ok(None)
     }
 
-    /// Plan the projection + full-tuple sort over `spec.source_sql` and start
-    /// it, returning the plan (for its output schema) and a single-partition
-    /// stream of its rows in committed order.
+    /// Plan `input`'s rows and start them, returning the plan (for its output
+    /// schema) and a single-partition stream of its rows in committed order.
     ///
-    /// Planned through [`single_partition_context`] (`ctx`'s own state,
-    /// `target_partitions` forced to `1`) rather than `ctx` directly: a
-    /// global sort at one output partition is ONE external sort with no
-    /// merge to plan, so the physical plan this returns is never a
-    /// partitioned local-sort-plus-[`SortPreservingMergeExec`] whose merge
-    /// operator would need its own real reservation on top of every
-    /// partition's already-buffered sorted run (#500 U2c c3c — see
+    /// `Sql`: projection + full-tuple sort over the SQL text, unchanged since
+    /// before GA5 (issue #538). `Batches`: the caller's one-shot stream, read
+    /// through a NAMELESS [`StreamingTable`]/[`OneShotBatches`] provider via
+    /// `ctx.read_table(..)` (never `ctx.register_table(..)` — the shared
+    /// session is not a per-call namespace) — no `.sort(..)` is planned
+    /// (GA4): the caller already committed its own final order (e.g. a
+    /// leading `_ordinal` column), and `columns` here is instead the order
+    /// key [`assert_batches_are_ordinal_sorted`] checks each batch against as
+    /// it drains, never a projection this function applies.
+    ///
+    /// Both arms plan through [`single_partition_context`] (`ctx`'s own
+    /// state, `target_partitions` forced to `1`) rather than `ctx` directly:
+    /// a plan at one output partition is ONE external sort (or one
+    /// unpartitioned stream) with no merge to plan, so the physical plan this
+    /// returns is never a partitioned local-sort-plus-[`SortPreservingMergeExec`]
+    /// whose merge operator would need its own real reservation on top of
+    /// every partition's already-buffered sorted run (see
     /// [`Self::materialize_training_set`]'s "The order it commits"). The
-    /// single-partition guarantee is asserted, not assumed: reaching
-    /// [`ExecutionPlan::execute`] at more than one output partition would
-    /// silently commit only partition 0's rows, never every row in order —
-    /// an engine-invariant breach, surfaced as a typed error rather than a
-    /// panic in a producer.
+    /// single-partition guarantee is asserted, not assumed, for BOTH arms:
+    /// reaching [`ExecutionPlan::execute`] at more than one output partition
+    /// would silently commit only partition 0's rows, never every row in
+    /// order — an engine-invariant breach, surfaced as a typed error rather
+    /// than a panic in a producer.
     async fn plan_training_set_rows(
         &self,
         ctx: &SessionContext,
-        spec: &TrainingSetSpec<'_>,
+        source_id: &str,
+        columns: &[String],
+        input: TrainingSetInput<'_>,
     ) -> Result<(Arc<dyn ExecutionPlan>, SendableRecordBatchStream)> {
         use datafusion::common::Column;
         use datafusion::logical_expr::Expr;
 
-        let projection: Vec<Expr> = spec
-            .columns
-            .iter()
-            // `Column::new_unqualified` rather than the `col(..)` helper: the
-            // helper PARSES its argument as a possibly-qualified identifier, so
-            // a column whose name contains a dot would resolve as
-            // `table.column` and miss. A projected column name is data, never
-            // a fragment of SQL to re-parse.
-            .map(|c| Expr::Column(Column::new_unqualified(c.clone())))
-            .collect();
         let single_partition_ctx = single_partition_context(ctx);
-        let sorted = single_partition_ctx
-            .sql(spec.source_sql)
-            .await?
-            .select(projection.clone())?
-            // `full_tuple_v1`: every projected column, declared order,
-            // ascending, NULLs first — the same key
-            // [`training_set_order_by`] renders for the reader.
-            .sort(
-                projection
-                    .into_iter()
-                    .map(|e| e.sort(true, true))
-                    .collect::<Vec<_>>(),
-            )?;
 
-        let plan = sorted.create_physical_plan().await?;
+        let plan = match input {
+            TrainingSetInput::Sql(sql) => {
+                let projection: Vec<Expr> = columns
+                    .iter()
+                    // `Column::new_unqualified` rather than the `col(..)`
+                    // helper: the helper PARSES its argument as a
+                    // possibly-qualified identifier, so a column whose name
+                    // contains a dot would resolve as `table.column` and
+                    // miss. A projected column name is data, never a
+                    // fragment of SQL to re-parse.
+                    .map(|c| Expr::Column(Column::new_unqualified(c.clone())))
+                    .collect();
+                let sorted = single_partition_ctx
+                    .sql(sql)
+                    .await?
+                    .select(projection.clone())?
+                    // `full_tuple_v1`: every projected column, declared
+                    // order, ascending, NULLs first — the same key
+                    // [`training_set_order_by`] renders for the reader.
+                    .sort(
+                        projection
+                            .into_iter()
+                            .map(|e| e.sort(true, true))
+                            .collect::<Vec<_>>(),
+                    )?;
+                sorted.create_physical_plan().await?
+            }
+            TrainingSetInput::Batches { schema, stream } => {
+                let provider: Arc<dyn TableProvider> = Arc::new(StreamingTable::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(OneShotBatches {
+                        schema: Arc::clone(&schema),
+                        inner: Mutex::new(Some(stream)),
+                    })],
+                )?);
+                // UNREGISTERED (GA5): read via `ctx.read_table(provider)`,
+                // never `ctx.register_table(..)` — the same nameless-provider
+                // shape `Self::pinned_provider`/`Self::current_version_provider`
+                // already use elsewhere in this module.
+                single_partition_ctx
+                    .read_table(provider)?
+                    .create_physical_plan()
+                    .await?
+            }
+        };
+
         let partition_count = plan.output_partitioning().partition_count();
         if partition_count != 1 {
             return Err(JammiError::Other(format!(
-                "training set over '{}': the single-partition derivation left the write plan at \
-                 {partition_count} output partition(s); expected exactly one — an engine \
-                 invariant broke between the derivation and the physical plan",
-                spec.source_id
+                "training set over '{source_id}': the single-partition derivation left the \
+                 write plan at {partition_count} output partition(s); expected exactly one — \
+                 an engine invariant broke between the derivation and the physical plan"
             )));
         }
 
         let stream = plan.execute(0, single_partition_ctx.task_ctx())?;
+        // GA4: the `Batches` arm asserts its committed order rather than
+        // having one imposed; the `Sql` arm's `SortExec` already guarantees
+        // it, so the assertion is a cheap no-op pass-through there (its
+        // `_ordinal`-shaped column, if any, is by construction already
+        // sorted by the `SortExec` above).
+        let stream = assert_batches_are_ordinal_sorted(stream, columns);
         Ok((plan, stream))
     }
 }
@@ -5219,12 +5424,18 @@ mod tests {
     }
 
     fn spec<'a>(source_id: &'a str, columns: &'a [String]) -> TrainingSetSpec<'a> {
+        const SQL: &str = "SELECT \"q\", \"a\" FROM t";
         TrainingSetSpec {
             source_id,
-            source_sql: "SELECT \"q\", \"a\" FROM t",
+            input: TrainingSetInput::Sql(SQL),
             columns,
             task: ModelTask::TextEmbedding,
-            format: "pairs",
+            descriptor: ProducingDescriptor::training_set(
+                SQL,
+                columns.to_vec(),
+                ModelTask::TextEmbedding,
+                "pairs",
+            ),
             inputs: Vec::new(),
             device: ComputeDevice::Cpu,
         }
@@ -5484,6 +5695,20 @@ mod tests {
     /// The definition hash a caller can name a training set by, before any
     /// table exists, is the same value for the same spec — and moves with the
     /// spec's determinants.
+    ///
+    /// GA5 (issue #538) moved descriptor construction OUT of this method
+    /// (see [`TrainingSetSpec`]'s `descriptor` field doc): the spec now
+    /// carries exactly the [`ProducingDescriptor`] its caller built (via
+    /// [`ProducingDescriptor::training_set`] for this arm), rather than
+    /// re-deriving one from spec fields internally — a `Batches` caller's
+    /// descriptor ([`ProducingDescriptor::GraphTrainingSet`]) cannot be
+    /// derived from generic spec fields at all, so `format` was removed from
+    /// this struct entirely rather than left as a field nothing reads (the
+    /// double-bookkeeping GA5's refactor exists to rule out). This test's
+    /// mutation therefore moves `other.descriptor`, the sole source of the
+    /// hash now; the underlying "format changes the hash" property is still
+    /// covered, at the layer that now owns it —
+    /// `store::manifest::tests::training_set_every_field_moves_the_hash`.
     #[test]
     fn the_spec_names_a_stable_definition_hash() {
         let columns = cols(&["q", "a"]);
@@ -5492,7 +5717,12 @@ mod tests {
         assert_eq!(a, b);
 
         let mut other = spec("docs", &columns);
-        other.format = "triplets";
+        other.descriptor = ProducingDescriptor::training_set(
+            "SELECT \"q\", \"a\" FROM t",
+            columns.clone(),
+            ModelTask::TextEmbedding,
+            "triplets",
+        );
         assert_ne!(a, other.definition_hash().unwrap());
     }
 

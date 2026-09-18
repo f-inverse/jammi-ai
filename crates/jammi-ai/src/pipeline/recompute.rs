@@ -60,11 +60,12 @@ use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::manifest::{
     AsofBoundary, AsofDirection, AsofTolerance, ContextAggregator, ContextCandidateSource,
-    ContextEdgeGather, InputAnchor, ProducingDescriptor, PropagationDirection, PropagationOutput,
-    PropagationWeighting, TRAINING_SET_ORDER_RULE_V1,
+    ContextEdgeGather, GraphSampleFields, InputAnchor, ProducingDescriptor, PropagationDirection,
+    PropagationOutput, PropagationWeighting, GRAPH_READ_ORDER_RULE_V1, TRAINING_SET_ORDER_RULE_V1,
 };
 use jammi_db::store::{CacheOutcome, CachePolicy};
 
+use crate::fine_tune::graph_sampler::{EdgeProvenance, GraphFineTuneSources, GraphSampleConfig};
 use crate::model::ModelSource;
 use crate::pipeline::asof::{
     AsofJoinSpecBuilder, AsofKey, Boundary, MatchDirection, TieBreak, Tolerance,
@@ -433,6 +434,33 @@ impl InferenceSession {
             ProducingDescriptor::External { .. } => Err(JammiError::NotRecomputable {
                 table: table.table_name.clone(),
             }),
+            ProducingDescriptor::GraphTrainingSet {
+                node_source,
+                edge_source,
+                id_column,
+                text_column,
+                src_column,
+                dst_column,
+                task,
+                format,
+                sample,
+                read_order_rule,
+            } => {
+                self.recompute_graph_training_set(
+                    table,
+                    node_source,
+                    edge_source,
+                    id_column,
+                    text_column,
+                    src_column,
+                    dst_column,
+                    task,
+                    format,
+                    sample,
+                    read_order_rule,
+                )
+                .await
+            }
         }
     }
 
@@ -585,6 +613,141 @@ impl InferenceSession {
                 ),
             )
             .await?;
+        Ok((
+            materialized.table_name().to_string(),
+            materialized.outcome.clone(),
+        ))
+    }
+
+    /// [`ProducingDescriptor::GraphTrainingSet`] replay (GA9, issue #538):
+    /// re-read the CURRENT node/edge sources and re-sample, through the SAME
+    /// shared core ([`crate::fine_tune::worker::materialize_graph_training_set`])
+    /// [`crate::fine_tune::worker::JobWorker::reconstruct_graph_loader`] uses
+    /// for a fresh run — never a second, independent re-implementation of
+    /// the sample-then-materialise path.
+    ///
+    /// Anchors both `node_source` and `edge_source` from the table's OWN
+    /// recorded anchor set (`Self::recompute_training_set`'s own doc section
+    /// explains why: `table.source_id` names only one relation, and this
+    /// variant's original materialization anchored two) — the same
+    /// re-resolution policy, dispatching on each recorded anchor's OWN kind
+    /// via [`Self::reresolve_recorded_anchor`].
+    ///
+    /// `min_negatives` and `provenance` are not recorded on the descriptor
+    /// (neither is output-affecting for a successful sample — see
+    /// [`ProducingDescriptor::GraphTrainingSet`]'s own doc); the replay uses
+    /// `min_negatives: 1` (the most permissive floor, which can only make a
+    /// replay of an already-successful sample MORE likely to succeed, never
+    /// less) and `EdgeProvenance::Declared` (never read by `GraphSampler::
+    /// sample`, only by the informational `has_declared_supervision`, which
+    /// this replay never calls).
+    ///
+    /// `task` and `format` ARE recorded (K1: `replay_descriptor`'s match
+    /// names every field, never `task: _, format: _` discarding two that
+    /// exist precisely so a replay can check itself) and are asserted equal
+    /// to what THIS replay independently derives — `task` is always
+    /// `TextEmbedding` (the graph arm's own hardcoded choice, no per-run
+    /// variation), `format` is GA3's own function of `sample.hard_negatives`
+    /// alone — BEFORE any read or write, refusing loudly on a mismatch
+    /// rather than silently trusting today's re-derivation to still agree
+    /// with what the original run recorded (the root-cause class GA3 exists
+    /// to close finding its second home here: a future change to either
+    /// derivation could otherwise silently diverge a replay from its
+    /// original recorded meaning with no signal at all).
+    #[allow(clippy::too_many_arguments)]
+    async fn recompute_graph_training_set(
+        self: &Arc<Self>,
+        table: &ResultTableRecord,
+        node_source: String,
+        edge_source: String,
+        id_column: String,
+        text_column: String,
+        src_column: String,
+        dst_column: String,
+        task: jammi_db::model_task::ModelTask,
+        format: String,
+        sample: GraphSampleFields,
+        read_order_rule: String,
+    ) -> Result<(String, CacheOutcome)> {
+        if read_order_rule != GRAPH_READ_ORDER_RULE_V1 {
+            return Err(JammiError::NotRecomputable {
+                table: table.table_name.clone(),
+            });
+        }
+        let expected_format = crate::fine_tune::data::TrainingFormat::Graph {
+            has_negatives: sample.hard_negatives > 0,
+        }
+        .format_tag();
+        if task != jammi_db::model_task::ModelTask::TextEmbedding || format != expected_format {
+            return Err(JammiError::FineTune(format!(
+                "table '{}': recorded task/format ({task:?}/{format}) do not match what this \
+                 replay derives fresh (TextEmbedding/{expected_format}) — the graph arm's task \
+                 or format derivation has changed since this table was materialised; refusing \
+                 rather than silently replaying under a different meaning",
+                table.table_name
+            )));
+        }
+        let parquet_url = jammi_db::storage::StorageUrl::parse(&table.parquet_path)?;
+        let manifest = self
+            .result_store()
+            .read_materialization_manifest(&parquet_url)
+            .await?
+            .ok_or_else(|| JammiError::NotRecomputable {
+                table: table.table_name.clone(),
+            })?;
+        let recorded_anchors = manifest.input_anchors;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut inputs: Vec<InputAnchor> = Vec::with_capacity(recorded_anchors.len());
+        for anchor in &recorded_anchors {
+            inputs.push(self.reresolve_recorded_anchor(table, anchor, &now).await?);
+        }
+
+        let sources = GraphFineTuneSources {
+            node_source,
+            id_column,
+            text_column,
+            edge_source,
+            src_column,
+            dst_column,
+            provenance: EdgeProvenance::Declared,
+        };
+        // Domain-validity at the decode edge (family D): `f64::from_bits`
+        // reconstructs ANY bit pattern the persisted sidecar happens to
+        // hold, including NaN/Infinity, and `GraphSampleConfig::validate`'s
+        // `<= 0.0` checks do not catch that (`NaN <= 0.0` is `false`, so a
+        // NaN return_p/in_out_q would silently pass validation and reach
+        // `biased_choice`'s `1.0 / return_p` weight computation as a
+        // confidently-wrong, not a refused, number). Refused here, typed,
+        // by name, before `GraphSampleConfig` is even constructed.
+        let return_p = f64::from_bits(sample.return_p_bits);
+        let in_out_q = f64::from_bits(sample.in_out_q_bits);
+        if !return_p.is_finite() || !in_out_q.is_finite() {
+            return Err(JammiError::FineTune(format!(
+                "table '{}': recorded return_p/in_out_q decode to a non-finite value \
+                 ({return_p}/{in_out_q}) — the sidecar's sample fields are corrupt or the bits \
+                 were never a valid f64 to begin with; refusing rather than sampling under an \
+                 undefined node2vec bias",
+                table.table_name
+            )));
+        }
+        let sample_config = GraphSampleConfig {
+            walk_length: sample.walk_length as usize,
+            walks_per_node: sample.walks_per_node as usize,
+            return_p,
+            in_out_q,
+            hard_negatives: sample.hard_negatives as usize,
+            exclude_hops: sample.exclude_hops as usize,
+            min_negatives: 1,
+            seed: sample.seed,
+        };
+        let materialized = crate::fine_tune::worker::materialize_graph_training_set(
+            self,
+            "recompute",
+            &sources,
+            sample_config,
+            inputs,
+        )
+        .await?;
         Ok((
             materialized.table_name().to_string(),
             materialized.outcome.clone(),

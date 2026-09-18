@@ -53,22 +53,40 @@
 //! see `training_set::a_result_table_cannot_be_a_fine_tune_source` in the
 //! integration suite for the executed probe.
 //!
-//! # The graph arm does not go through this module
+//! # The graph arm goes through the SAME funnel, over a DIFFERENT input seam
 //!
 //! A graph fine-tune's sampled pairs are the output of a deterministic biased
-//! walk, not of a query the engine can express as durable SQL, and re-running
-//! that walk from the recorded spec is exactly `reconstruct_graph_loader`'s
-//! job (`worker.rs`). They are sampled in memory and trained on directly, the
-//! way `origin/main` always did it; no `TrainingSet` table is written, and
-//! nothing here registers or deregisters a relation on the shared session for
-//! them. Giving the graph arm a table of its own is
-//! <https://github.com/f-inverse/jammi-ai/issues/538>.
+//! walk, not of a query the engine can express as durable SQL, so this
+//! module's `training_set_spec`/`materialize_projection*` helpers (SQL-only)
+//! are not it. Instead `worker.rs::reconstruct_graph_loader` re-reads the
+//! node/edge sources (ordered — `GRAPH_READ_ORDER_RULE_V1`, GA1), samples
+//! them, and hands the sampled pairs to
+//! [`ResultStore::materialize_training_set`](jammi_db::store::ResultStore::materialize_training_set)
+//! as a [`TrainingSetInput::Batches`] stream (a leading `_ordinal` column,
+//! GA4: never re-sorted — the producer's own committed order IS the
+//! sampler's emission order) under a
+//! [`jammi_db::store::manifest::ProducingDescriptor::GraphTrainingSet`]
+//! descriptor (GA2), never this module's `ProducingDescriptor::TrainingSet`.
+//! The written table is still `ResultTableKind::TrainingSet` — the SAME
+//! catalog kind, registration, and reuse-probe machinery this module's arm
+//! uses — and `pipeline/recompute.rs`'s `recompute_graph_training_set`
+//! replays it through the identical shared sample-then-materialise
+//! function a fresh run calls (GA9). A `Peer` gang does NOT admit a member
+//! against this table: `run_spec` refuses a graph fine-tune's
+//! `TopologyDecision::Peer` by name (`world_size` above `[worker]
+//! local_ranks`) — a member's own rank body has no read path over this
+//! table in the SAME `_ordinal`-committed order rank 0 reads, and no
+//! executed oracle proves the resulting per-rank shards combine into a
+//! correct gradient; `Single` and in-process `Local` gangs are unaffected.
+//! The empty-negative-pool refusal (GA3) and the named
+//! `training_set_graph_sample` residency reservation (GA7) are the graph
+//! arm's own, with no tabular-arm counterpart.
 
 use arrow::array::RecordBatch;
 use jammi_db::error::Result;
 use jammi_db::sql::{quote_ident, source_relation};
-use jammi_db::store::manifest::InputAnchor;
-use jammi_db::store::{TrainingSetSpec, TrainingSetTable};
+use jammi_db::store::manifest::{InputAnchor, ProducingDescriptor};
+use jammi_db::store::{TrainingSetInput, TrainingSetSpec, TrainingSetTable};
 
 use crate::model::ModelTask;
 use crate::session::InferenceSession;
@@ -93,11 +111,15 @@ pub fn read_back_sql(table: &TrainingSetTable) -> Result<String> {
     Ok(table.relation()?.select_ordered())
 }
 
-/// The single constructor every production call site in this crate builds a
-/// [`TrainingSetSpec`] through: a future field added to the spec is added in
-/// exactly ONE place, rather than re-derived independently at each of
-/// [`materialize_projection`] and `pipeline/recompute.rs`'s
-/// `recompute_training_set`.
+/// The single constructor every SQL-sourced production call site in this
+/// crate builds a [`TrainingSetSpec`] through: a future field added to the
+/// spec is added in exactly ONE place, rather than re-derived independently
+/// at each of [`materialize_projection`] and `pipeline/recompute.rs`'s
+/// `recompute_training_set`. The graph arm's `Batches`-sourced spec
+/// (`fine_tune::worker::materialize_graph_training_set`) builds
+/// `TrainingSetSpec` directly rather than through this function — its
+/// `input` is a `RecordBatch` stream, not a `source_sql` string, so the two
+/// arms' constructors do not share a signature to begin with.
 ///
 /// A thin pass-through by design — it changes nothing about what a caller
 /// supplies, only WHERE the seven fields are named — so it cannot move a
@@ -114,10 +136,10 @@ pub(crate) fn training_set_spec<'a>(
 ) -> TrainingSetSpec<'a> {
     TrainingSetSpec {
         source_id,
-        source_sql,
+        input: TrainingSetInput::Sql(source_sql),
         columns,
         task,
-        format,
+        descriptor: ProducingDescriptor::training_set(source_sql, columns.to_vec(), task, format),
         inputs,
         device,
     }
@@ -526,6 +548,15 @@ mod reader_class_allow_list {
             1,
         ),
         ("crates/jammi-bench/src/corpus.rs", "load_vectors", 1),
+        // `recompute_graph_training_set` (#538) returns the freshly
+        // materialised graph table's bare name to its caller alongside the
+        // cache outcome — a value handed UP, never a relation string built
+        // here; the table's own read goes through `TrainingSetTable::relation`.
+        (
+            "crates/jammi-ai/src/pipeline/recompute.rs",
+            "recompute_graph_training_set",
+            1,
+        ),
     ];
 
     /// The accessors' own implementations (`crates/jammi-db/src/store/mod.rs`)
@@ -848,10 +879,15 @@ mod tests {
         );
         let hand_built = TrainingSetSpec {
             source_id: "training",
-            source_sql: "SELECT anchor, positive FROM training",
+            input: TrainingSetInput::Sql("SELECT anchor, positive FROM training"),
             columns: &columns,
             task: ModelTask::TextEmbedding,
-            format: "pairs",
+            descriptor: ProducingDescriptor::training_set(
+                "SELECT anchor, positive FROM training",
+                columns.clone(),
+                ModelTask::TextEmbedding,
+                "pairs",
+            ),
             inputs,
             device,
         };

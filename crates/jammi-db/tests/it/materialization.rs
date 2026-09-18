@@ -34,7 +34,8 @@ use jammi_db::store::manifest::{
 };
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{
-    BuildingTable, CacheOutcome, PinnedSource, ResultStore, StaleReason, Staleness, TrainingSetSpec,
+    BuildingTable, CacheOutcome, PinnedSource, ResultStore, StaleReason, Staleness,
+    TrainingSetInput, TrainingSetSpec,
 };
 use jammi_db::TenantId;
 use tempfile::tempdir;
@@ -569,13 +570,20 @@ fn ts_session(partitions: usize, batches: Vec<RecordBatch>) -> SessionContext {
     ctx
 }
 
+const TS_SOURCE_SQL: &str = "SELECT * FROM rows";
+
 fn ts_spec<'a>(source_id: &'a str, columns: &'a [String], format: &'a str) -> TrainingSetSpec<'a> {
     TrainingSetSpec {
         source_id,
-        source_sql: "SELECT * FROM rows",
+        input: TrainingSetInput::Sql(TS_SOURCE_SQL),
         columns,
         task: ModelTask::TextEmbedding,
-        format,
+        descriptor: ProducingDescriptor::training_set(
+            TS_SOURCE_SQL,
+            columns.to_vec(),
+            ModelTask::TextEmbedding,
+            format,
+        ),
         // A registered relation exposes no version surface, so the honest
         // anchor is the read instant — the shape a real caller passes over an
         // unpinned source, and the one the reuse probe never matches on.
@@ -652,10 +660,15 @@ fn pinned_spec_multi<'a>(
 ) -> TrainingSetSpec<'a> {
     TrainingSetSpec {
         source_id,
-        source_sql: PINNED_SOURCE_SQL,
+        input: TrainingSetInput::Sql(PINNED_SOURCE_SQL),
         columns,
         task: ModelTask::TextEmbedding,
-        format,
+        descriptor: ProducingDescriptor::training_set(
+            PINNED_SOURCE_SQL,
+            columns.to_vec(),
+            ModelTask::TextEmbedding,
+            format,
+        ),
         inputs,
         device: ComputeDevice::Cpu,
     }
@@ -693,10 +706,15 @@ fn pinned_spec_two<'a>(
 ) -> TrainingSetSpec<'a> {
     TrainingSetSpec {
         source_id,
-        source_sql: PINNED_SOURCE_SQL_TWO,
+        input: TrainingSetInput::Sql(PINNED_SOURCE_SQL_TWO),
         columns,
         task: ModelTask::TextEmbedding,
-        format,
+        descriptor: ProducingDescriptor::training_set(
+            PINNED_SOURCE_SQL_TWO,
+            columns.to_vec(),
+            ModelTask::TextEmbedding,
+            format,
+        ),
         inputs,
         device: ComputeDevice::Cpu,
     }
@@ -1301,12 +1319,18 @@ async fn the_file_sort_order_declares_a_dotted_column_verbatim_not_as_a_qualifie
 
     let columns = vec!["meta.id".to_string(), "id".to_string()];
     let source = unique_source(&dir, "dotted");
+    const DOTTED_SQL: &str = "SELECT \"meta.id\", \"id\" FROM rows";
     let spec = TrainingSetSpec {
         source_id: &source,
-        source_sql: "SELECT \"meta.id\", \"id\" FROM rows",
+        input: TrainingSetInput::Sql(DOTTED_SQL),
         columns: &columns,
         task: ModelTask::TextEmbedding,
-        format: "pairs",
+        descriptor: ProducingDescriptor::training_set(
+            DOTTED_SQL,
+            columns.clone(),
+            ModelTask::TextEmbedding,
+            "pairs",
+        ),
         inputs: vec![InputAnchor::unpinned_at_instant(
             &source,
             "2026-09-15T00:00:00Z",
@@ -3108,4 +3132,276 @@ async fn a_pre_leaves_sidecar_reads_as_absent_on_both_verbs(backend: BackendKind
         .await
         .err()
         .is_some());
+}
+
+// ─── GA4/GA5 (issue #538): the `Batches` producer input ────────────────────
+
+fn ordinal_schema() -> arrow_schema::SchemaRef {
+    Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("_ordinal", arrow_schema::DataType::UInt64, false),
+        arrow_schema::Field::new("anchor", arrow_schema::DataType::Utf8, false),
+        arrow_schema::Field::new("positive", arrow_schema::DataType::Utf8, false),
+    ]))
+}
+
+fn ordinal_batch(rows: &[(u64, &str, &str)]) -> RecordBatch {
+    let ord = arrow::array::UInt64Array::from(rows.iter().map(|r| r.0).collect::<Vec<_>>());
+    let anchor: StringArray = rows.iter().map(|r| Some(r.1)).collect();
+    let positive: StringArray = rows.iter().map(|r| Some(r.2)).collect();
+    RecordBatch::try_new(
+        ordinal_schema(),
+        vec![Arc::new(ord), Arc::new(anchor), Arc::new(positive)],
+    )
+    .unwrap()
+}
+
+/// A one-shot [`jammi_db::store::TrainingSetInput::Batches`] stream over
+/// `batches`, deliberately NOT sorted alphabetically by `(anchor, positive)`
+/// — the sampler's own per-anchor emission order, exactly the shape
+/// `plan_training_set_rows` must commit without re-imposing a full-tuple
+/// sort (GA4).
+fn ordinal_stream(batches: Vec<RecordBatch>) -> datafusion::execution::SendableRecordBatchStream {
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    Box::pin(RecordBatchStreamAdapter::new(
+        ordinal_schema(),
+        futures::stream::iter(batches.into_iter().map(Ok)),
+    ))
+}
+
+fn graph_descriptor_fixture() -> ProducingDescriptor {
+    ProducingDescriptor::graph_training_set(
+        "kb_nodes",
+        "kb_edges",
+        "id",
+        "text",
+        "src",
+        "dst",
+        ModelTask::TextEmbedding,
+        "graph_pairs",
+        jammi_db::store::manifest::GraphSampleFields {
+            seed: 1,
+            walk_length: 3,
+            walks_per_node: 2,
+            return_p_bits: 1.0_f64.to_bits(),
+            in_out_q_bits: 1.0_f64.to_bits(),
+            hard_negatives: 0,
+            exclude_hops: 1,
+        },
+    )
+}
+
+/// A `Batches` input's rows commit and read back in EXACTLY the caller's
+/// emission order — never the tabular arm's full-tuple alphabetic sort. Two
+/// batches, each internally NOT alphabetic (`z`, `m`, `a`), so a full-tuple
+/// `SortExec` (if one ran) would visibly permute them; the oracle is
+/// `training_set_order_by` over just `["_ordinal"]`.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn batches_input_commits_and_reads_back_in_emission_order(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = SessionContext::new();
+
+    let rows: Vec<(u64, &str, &str)> = vec![
+        (0, "n3", "z"),
+        (1, "n3", "m"),
+        (2, "n3", "a"),
+        (3, "n1", "z"),
+        (4, "n1", "m"),
+        (5, "n1", "a"),
+    ];
+    let batches = vec![ordinal_batch(&rows[..3]), ordinal_batch(&rows[3..])];
+    let source = unique_source(&dir, "graph-batches");
+    let order_columns = vec!["_ordinal".to_string()];
+    let now = "2026-09-17T00:00:00Z";
+    let spec = TrainingSetSpec {
+        source_id: &source,
+        input: TrainingSetInput::Batches {
+            schema: ordinal_schema(),
+            stream: ordinal_stream(batches),
+        },
+        columns: &order_columns,
+        task: ModelTask::TextEmbedding,
+        descriptor: graph_descriptor_fixture(),
+        inputs: vec![
+            InputAnchor::unpinned_at_instant("kb_nodes", now),
+            InputAnchor::unpinned_at_instant("kb_edges", now),
+        ],
+        device: ComputeDevice::Cpu,
+    };
+
+    let materialized = store.materialize_training_set(&ctx, spec).await.unwrap();
+    assert_eq!(materialized.record.row_count, 6);
+    assert_eq!(materialized.record.kind, ResultTableKind::TrainingSet);
+
+    let expected: Vec<(u64, String, String)> = rows
+        .iter()
+        .map(|(o, a, p)| (*o, a.to_string(), p.to_string()))
+        .collect();
+
+    async fn read_rows(ctx: &SessionContext, query: &str) -> Vec<(u64, String, String)> {
+        let got = ctx.sql(query).await.unwrap().collect().await.unwrap();
+        let mut out = Vec::new();
+        for batch in &got {
+            let ord = batch
+                .column_by_name("_ordinal")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .unwrap();
+            let anchor = string_column(batch, "anchor");
+            let positive = string_column(batch, "positive");
+            for i in 0..batch.num_rows() {
+                out.push((
+                    ord.value(i),
+                    anchor[i].clone().unwrap(),
+                    positive[i].clone().unwrap(),
+                ));
+            }
+        }
+        out
+    }
+
+    // (a) The reader's half of the contract: an EXPLICIT `ORDER BY` over the
+    // order key reproduces emission order (works regardless of physical
+    // write order, since this is a real sort).
+    let ordered_query = format!(
+        "SELECT * FROM {} {}",
+        materialized.sql_relation(),
+        jammi_db::store::training_set_order_by(&order_columns)
+    );
+    assert_eq!(
+        read_rows(&ctx, &ordered_query).await,
+        expected,
+        "GA4: an explicit ORDER BY over the order key must reproduce emission order"
+    );
+
+    // (b) The producer's half: a PLAIN scan with NO `ORDER BY` at all
+    // already comes back in emission order, because the write path never
+    // re-sorted the rows in the first place (GA4's actual claim — a
+    // `Batches` input commits EXACTLY the caller's order, so even an
+    // unordered read of this single-file, single-row-group table matches
+    // it). Mutation executed (not committed): adding a `.sort()` to
+    // `plan_training_set_rows`'s `Batches` arm made this specific assertion
+    // fail (rows came back alphabetised) while assertion (a) above still
+    // passed — confirmed by hand, then reverted.
+    let plain_query = format!("SELECT * FROM {}", materialized.sql_relation());
+    assert_eq!(
+        read_rows(&ctx, &plain_query).await,
+        expected,
+        "GA4: the Batches arm must not re-impose a sort — even an unordered read of the freshly \
+         written table must already be in emission order"
+    );
+
+    // A gang member binds the SAME table on its OWN, independent session —
+    // never the coordinator's `ctx`. A fresh session's `bind_result_table`
+    // must declare the SAME `_ordinal` file sort order
+    // (`ResultStore::training_set_registration_sort_order`'s
+    // `GraphTrainingSet` arm) so a member's plain scan agrees with the
+    // coordinator's own read, with no explicit `ORDER BY` needed on either
+    // side. This is infrastructure a `Batches`-sourced table's cross-session
+    // rebinding must hold regardless of which caller re-binds it.
+    let member_ctx = SessionContext::new();
+    store
+        .bind_result_table(&member_ctx, &materialized.record)
+        .await
+        .unwrap();
+    let member_query = format!("SELECT * FROM {}", materialized.sql_relation());
+    assert_eq!(
+        read_rows(&member_ctx, &member_query).await,
+        expected,
+        "a table re-bound on an INDEPENDENT session must still read back in emission order"
+    );
+}
+
+/// An EMPTY `Batches` stream's refusal names `source_id`, never a
+/// fabricated SQL string (there is none to quote).
+#[tokio::test]
+async fn batches_input_empty_stream_names_source_id_not_sql() {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog(BackendKind::Sqlite, dir.path())
+        .await
+        .unwrap();
+    let store = store(dir.path(), catalog);
+    let ctx = SessionContext::new();
+
+    let source = unique_source(&dir, "graph-batches-empty");
+    let order_columns = vec!["_ordinal".to_string()];
+    let now = "2026-09-17T00:00:00Z";
+    let spec = TrainingSetSpec {
+        source_id: &source,
+        input: TrainingSetInput::Batches {
+            schema: ordinal_schema(),
+            stream: ordinal_stream(Vec::new()),
+        },
+        columns: &order_columns,
+        task: ModelTask::TextEmbedding,
+        descriptor: graph_descriptor_fixture(),
+        inputs: vec![
+            InputAnchor::unpinned_at_instant("kb_nodes", now),
+            InputAnchor::unpinned_at_instant("kb_edges", now),
+        ],
+        device: ComputeDevice::Cpu,
+    };
+
+    let err = store
+        .materialize_training_set(&ctx, spec)
+        .await
+        .expect_err("an empty Batches stream must be refused, never a 0-row table");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains(&source),
+        "the refusal must name source_id ('{source}'), got: {msg}"
+    );
+    assert!(
+        !msg.to_uppercase().contains("SELECT"),
+        "the refusal must never fabricate a SQL string for a Batches input, got: {msg}"
+    );
+}
+
+/// GA4's mutation half: skipping the ordinal-sortedness assertion (a
+/// deliberately UN-ordered `_ordinal` column within one batch) must be
+/// caught, typed, rather than silently committed out of order — the
+/// production analogue of the harness's "drop the ORDER BY" mutation.
+#[tokio::test]
+async fn batches_input_out_of_order_ordinal_within_a_batch_is_refused() {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog(BackendKind::Sqlite, dir.path())
+        .await
+        .unwrap();
+    let store = store(dir.path(), catalog);
+    let ctx = SessionContext::new();
+
+    // `_ordinal` goes 0, 2, 1 WITHIN one batch — not non-decreasing.
+    let bad_rows: Vec<(u64, &str, &str)> = vec![(0, "n0", "x"), (2, "n1", "y"), (1, "n2", "z")];
+    let batches = vec![ordinal_batch(&bad_rows)];
+    let source = unique_source(&dir, "graph-batches-unsorted");
+    let order_columns = vec!["_ordinal".to_string()];
+    let now = "2026-09-17T00:00:00Z";
+    let spec = TrainingSetSpec {
+        source_id: &source,
+        input: TrainingSetInput::Batches {
+            schema: ordinal_schema(),
+            stream: ordinal_stream(batches),
+        },
+        columns: &order_columns,
+        task: ModelTask::TextEmbedding,
+        descriptor: graph_descriptor_fixture(),
+        inputs: vec![
+            InputAnchor::unpinned_at_instant("kb_nodes", now),
+            InputAnchor::unpinned_at_instant("kb_edges", now),
+        ],
+        device: ComputeDevice::Cpu,
+    };
+
+    let err = store
+        .materialize_training_set(&ctx, spec)
+        .await
+        .expect_err("an out-of-order `_ordinal` batch must be refused, never silently committed");
+    assert!(
+        format!("{err}").contains("not sorted"),
+        "the refusal should name the sortedness violation: {err}"
+    );
 }

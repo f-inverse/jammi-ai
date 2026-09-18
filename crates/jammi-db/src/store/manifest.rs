@@ -107,6 +107,26 @@ pub const MANIFEST_VERSION: u32 = 3;
 /// silently read as if it carried the newer order.
 pub const TRAINING_SET_ORDER_RULE_V1: &str = "full_tuple_v1";
 
+/// The graph fine-tune arm's read-order rule (GA1, issue #538):
+/// [`ProducingDescriptor::GraphTrainingSet::read_order_rule`]'s versioned
+/// tag — the node scan ordered by `(id, text)` and the edge scan ordered by
+/// `(src, dst)`, both ascending NULLS FIRST, so the sampler's input is a
+/// function of the node/edge SET rather than of scan order. A versioned tag
+/// for the same reason [`TRAINING_SET_ORDER_RULE_V1`] is: a later rule is a
+/// *different* definition and must take a new tag.
+pub const GRAPH_READ_ORDER_RULE_V1: &str = "graph_read_order_v1";
+
+/// The leading column every [`ProducingDescriptor::GraphTrainingSet`] table
+/// is written with (GA4, issue #538): the sampler's own emission order,
+/// ascending, assigned once per row at write time. Unlike
+/// [`ProducingDescriptor::TrainingSet`], this variant carries no generic
+/// `columns` list to derive a declared file sort order from (its fields are
+/// the four named column bindings, not a projection) — every graph
+/// training-set writer commits this ONE column name by convention, so a
+/// reader (or a ListingTable registration declaring the file's order) names
+/// it directly rather than re-deriving it from the descriptor.
+pub const GRAPH_TRAINING_SET_ORDINAL_COLUMN: &str = "_ordinal";
+
 /// Content hash of *how* a table was produced: a canonical encoding of the
 /// [`ProducingDescriptor`] plus the [`MaterializationEnv`] that affects its
 /// output. SHA-256, hex-encoded.
@@ -398,6 +418,32 @@ pub enum ModelContentDigestUnavailableReason {
     ExternalImport,
 }
 
+/// [`ProducingDescriptor::GraphTrainingSet::sample`]'s fields — a db-local
+/// mirror of `jammi-ai`'s `GraphSampleConfig` minus `min_negatives` (not
+/// output-affecting; see the variant's own doc). `walk_length`,
+/// `walks_per_node`, `hard_negatives` and `exclude_hops` widen from
+/// `GraphSampleConfig`'s `usize` to `u64` for a hash fold whose width does
+/// not depend on the compiling target; `return_p`/`in_out_q` fold as
+/// `f64::to_bits()`, never the `f64` itself (family J).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphSampleFields {
+    /// Seed for the walk/negative RNG.
+    pub seed: u64,
+    /// node2vec walk length `L`.
+    pub walk_length: u64,
+    /// Walks started per node.
+    pub walks_per_node: u64,
+    /// node2vec return parameter `p`, as `f64::to_bits()`.
+    pub return_p_bits: u64,
+    /// node2vec in-out parameter `q`, as `f64::to_bits()`.
+    pub in_out_q_bits: u64,
+    /// Structure-aware hard negatives mined per pair (`0` = `graph_pairs`
+    /// format; `>= 1` = `graph_triplet`, GA3).
+    pub hard_negatives: u64,
+    /// Hops of the anchor's neighbourhood excluded from its negative pool.
+    pub exclude_hops: u64,
+}
+
 /// A canonical, deterministically-serialisable description of the verb that
 /// produced a result table and its typed parameters — the input to the
 /// definition hash in place of a logical plan.
@@ -685,6 +731,64 @@ pub enum ProducingDescriptor {
         /// of the definition and takes a NEW tag rather than silently
         /// re-ordering the rows an existing hash already names.
         order_rule: String,
+    },
+    /// A graph fine-tune's training set (GA2, issue #538): the contrastive
+    /// pairs a biased-walk sampler drew from a node-text source and an
+    /// edge-table source, committed as a [`Self::TrainingSet`]-kind result
+    /// table through the SAME materialisation funnel — but this variant, not
+    /// [`Self::TrainingSet`], because the graph arm's row source is not a
+    /// single SQL projection: it is TWO relations (nodes, edges) plus a
+    /// sampling procedure, and `Self::TrainingSet::source` has no field wide
+    /// enough to carry a walk configuration honestly.
+    ///
+    /// The determinant set is exactly what changes the committed BYTES: the
+    /// two source relations and the four column bindings that resolve which
+    /// of their columns feed the sampler, the model task, the format tag, the
+    /// walk/negative-sampling knobs (`sample`), and the read-order rule the
+    /// node/edge scans committed. `min_negatives` (a
+    /// `GraphSampleConfig` field) is deliberately ABSENT from `sample`: it
+    /// changes only how many rows a *successful* sample is allowed to have
+    /// been willing to produce (a config-time validation ceiling on the
+    /// negative pool), never which rows a successful sample actually emits:
+    /// two runs differing ONLY in `min_negatives` emit byte-identical output
+    /// over the same graph. `provenance`
+    /// (`GraphFineTuneSources::provenance`) is likewise ABSENT: `GraphSampler
+    /// ::sample` never reads it (only `has_declared_supervision`, an
+    /// informational report, does), so it cannot change the sampled bytes
+    /// either.
+    ///
+    /// `sample` mirrors `jammi-ai`'s `GraphSampleConfig` as a db-local
+    /// primitive standing in for a foreign type — `jammi-db` depends on no
+    /// jammi crate but `jammi-numerics` (DESIGN §3), the same constraint
+    /// [`Self::TrainingSet::format`]'s canonical string tag and
+    /// [`Self::FineTune::spec_canonical`]'s opaque JSON already accommodate.
+    /// `return_p`/`in_out_q` fold as their IEEE-754 bit patterns
+    /// (`f64::to_bits`) rather than the `f64` itself — a fixed, exact,
+    /// byte-stable fold (family J), never a float compared/hashed directly.
+    GraphTrainingSet {
+        /// Catalog source holding the node text.
+        node_source: String,
+        /// Catalog source holding the edges.
+        edge_source: String,
+        /// Column in `node_source` holding the node id.
+        id_column: String,
+        /// Column in `node_source` holding the node text.
+        text_column: String,
+        /// Column in `edge_source` holding the edge source endpoint.
+        src_column: String,
+        /// Column in `edge_source` holding the edge destination endpoint.
+        dst_column: String,
+        /// The model task the sampled rows are read as.
+        task: ModelTask,
+        /// The training format the consumer parses the rows under
+        /// (`graph_pairs` / `graph_triplet`), as its canonical string tag —
+        /// decided from `sample.hard_negatives` (GA3).
+        format: String,
+        /// The node2vec walk and structure-aware negative-sampling knobs.
+        sample: GraphSampleFields,
+        /// The read-order rule the node/edge scans committed —
+        /// [`GRAPH_READ_ORDER_RULE_V1`] today.
+        read_order_rule: String,
     },
     /// A trained model's output: a base model fine-tuned over a materialised
     /// [`Self::TrainingSet`], keyed under the catalog name
@@ -1092,6 +1196,58 @@ impl ProducingDescriptor {
         let canonical = canonicalize_json(&value);
         serde_json::to_vec(&canonical)
             .map_err(|e| ManifestError::UncanonicalDescriptor(e.to_string()))
+    }
+
+    /// Build a [`Self::TrainingSet`] descriptor — the tabular fine-tune arm's
+    /// identity, at [`TRAINING_SET_ORDER_RULE_V1`]. A named constructor
+    /// (GA5, issue #538) rather than deriving this inline at each call site:
+    /// `crate::store::TrainingSetSpec::descriptor` used to build this exact
+    /// value internally from its own `source_sql`/`columns`/`task`/`format`
+    /// fields; now that `TrainingSetSpec` takes ANY [`Self`] (a `Batches`
+    /// caller needs [`Self::graph_training_set`] instead), every production
+    /// caller building the tabular identity goes through this one function
+    /// so the two verbs' shapes cannot silently drift from each other.
+    pub fn training_set(
+        source: impl Into<String>,
+        columns: Vec<String>,
+        task: ModelTask,
+        format: impl Into<String>,
+    ) -> Self {
+        Self::TrainingSet {
+            source: source.into(),
+            columns,
+            task,
+            format: format.into(),
+            order_rule: TRAINING_SET_ORDER_RULE_V1.to_string(),
+        }
+    }
+
+    /// Build a [`Self::GraphTrainingSet`] descriptor — the graph fine-tune
+    /// arm's identity, at [`GRAPH_READ_ORDER_RULE_V1`] (GA2, issue #538).
+    #[allow(clippy::too_many_arguments)]
+    pub fn graph_training_set(
+        node_source: impl Into<String>,
+        edge_source: impl Into<String>,
+        id_column: impl Into<String>,
+        text_column: impl Into<String>,
+        src_column: impl Into<String>,
+        dst_column: impl Into<String>,
+        task: ModelTask,
+        format: impl Into<String>,
+        sample: GraphSampleFields,
+    ) -> Self {
+        Self::GraphTrainingSet {
+            node_source: node_source.into(),
+            edge_source: edge_source.into(),
+            id_column: id_column.into(),
+            text_column: text_column.into(),
+            src_column: src_column.into(),
+            dst_column: dst_column.into(),
+            task,
+            format: format.into(),
+            sample,
+            read_order_rule: GRAPH_READ_ORDER_RULE_V1.to_string(),
+        }
     }
 }
 
@@ -2706,6 +2862,178 @@ mod tests {
     #[test]
     fn training_set_hash_moves_with_the_device() {
         let d = training_set_descriptor(&training_set_fields());
+        assert_ne!(
+            definition_hash(&d, &MaterializationEnv::new(ComputeDevice::Cpu, Vec::new())).unwrap(),
+            definition_hash(
+                &d,
+                &MaterializationEnv::new(ComputeDevice::Cuda { ordinal: 0 }, Vec::new())
+            )
+            .unwrap(),
+        );
+    }
+
+    /// Every field of [`ProducingDescriptor::GraphTrainingSet`] (GA2, issue
+    /// #538), carried as a fixture whose shape the completeness test below
+    /// destructures WITHOUT `..`, so a field added to the variant fails to
+    /// compile here instead of silently escaping the definition hash (K7).
+    #[derive(Clone)]
+    struct GraphTrainingSetFields {
+        node_source: String,
+        edge_source: String,
+        id_column: String,
+        text_column: String,
+        src_column: String,
+        dst_column: String,
+        task: ModelTask,
+        format: String,
+        sample: GraphSampleFields,
+        read_order_rule: String,
+    }
+
+    fn graph_training_set_descriptor(f: &GraphTrainingSetFields) -> ProducingDescriptor {
+        // Exhaustive construction: no `..`, so the fixture and the variant
+        // stay in lock-step.
+        let GraphTrainingSetFields {
+            node_source,
+            edge_source,
+            id_column,
+            text_column,
+            src_column,
+            dst_column,
+            task,
+            format,
+            sample,
+            read_order_rule,
+        } = f.clone();
+        ProducingDescriptor::GraphTrainingSet {
+            node_source,
+            edge_source,
+            id_column,
+            text_column,
+            src_column,
+            dst_column,
+            task,
+            format,
+            sample,
+            read_order_rule,
+        }
+    }
+
+    /// A base fixture whose every field is a NON-default, distinguishable
+    /// value: a mutation test over a fixture of defaults passes vacuously
+    /// exactly where the identity is lossy.
+    fn graph_training_set_fields() -> GraphTrainingSetFields {
+        GraphTrainingSetFields {
+            node_source: "kb_nodes".into(),
+            edge_source: "kb_edges".into(),
+            id_column: "id".into(),
+            text_column: "text".into(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+            task: ModelTask::TextEmbedding,
+            format: "graph_triplet".into(),
+            sample: GraphSampleFields {
+                seed: 42,
+                walk_length: 4,
+                walks_per_node: 2,
+                return_p_bits: 1.0_f64.to_bits(),
+                in_out_q_bits: 1.0_f64.to_bits(),
+                hard_negatives: 2,
+                exclude_hops: 1,
+            },
+            read_order_rule: GRAPH_READ_ORDER_RULE_V1.to_string(),
+        }
+    }
+
+    #[test]
+    fn graph_training_set_hash_is_deterministic() {
+        let env = no_model_env();
+        let f = graph_training_set_fields();
+        assert_eq!(
+            definition_hash(&graph_training_set_descriptor(&f), &env).unwrap(),
+            definition_hash(&graph_training_set_descriptor(&f), &env).unwrap(),
+            "the same graph training-set definition must hash identically"
+        );
+    }
+
+    /// K7 completeness: the field set the assertions below range over is the
+    /// variant's own, taken by exhaustive destructuring (no `..`) — a new
+    /// field breaks this test's compilation, which is the point. Every
+    /// mutation here is GA2's "change one sample knob -> different hash"
+    /// oracle, over the whole field table, executed per field.
+    #[test]
+    fn graph_training_set_every_field_moves_the_hash() {
+        // The `let` below is the enumeration of record: adding a field to the
+        // variant fails to compile here until it is bound and mutated.
+        let GraphTrainingSetFields {
+            node_source: _,
+            edge_source: _,
+            id_column: _,
+            text_column: _,
+            src_column: _,
+            dst_column: _,
+            task: _,
+            format: _,
+            sample: _,
+            read_order_rule: _,
+        } = graph_training_set_fields();
+
+        assert_each_change_moves_hash(
+            &graph_training_set_fields(),
+            &no_model_env(),
+            graph_training_set_descriptor,
+            &[
+                ("node_source", |f| f.node_source = "kb_nodes_v2".into()),
+                ("edge_source", |f| f.edge_source = "kb_edges_v2".into()),
+                ("id_column", |f| f.id_column = "node_id".into()),
+                ("text_column", |f| f.text_column = "body".into()),
+                ("src_column", |f| f.src_column = "from".into()),
+                ("dst_column", |f| f.dst_column = "to".into()),
+                ("task", |f| f.task = ModelTask::Classification),
+                ("format", |f| f.format = "graph_pairs".into()),
+                ("sample.seed", |f| f.sample.seed = 7),
+                ("sample.walk_length", |f| f.sample.walk_length = 8),
+                ("sample.walks_per_node", |f| f.sample.walks_per_node = 6),
+                ("sample.return_p_bits", |f| {
+                    f.sample.return_p_bits = 2.0_f64.to_bits()
+                }),
+                ("sample.in_out_q_bits", |f| {
+                    f.sample.in_out_q_bits = 0.5_f64.to_bits()
+                }),
+                ("sample.hard_negatives", |f| f.sample.hard_negatives = 5),
+                ("sample.exclude_hops", |f| f.sample.exclude_hops = 2),
+                ("read_order_rule", |f| {
+                    f.read_order_rule = "graph_read_order_v2".into()
+                }),
+            ],
+        );
+    }
+
+    /// `min_negatives` (a `GraphSampleConfig` field) has no home in
+    /// [`GraphSampleFields`]: two runs differing ONLY in `min_negatives`
+    /// emit byte-identical sampled output over the same graph, so it is not
+    /// output-affecting and folding it in would collide two identical
+    /// tables' definitions apart for no reason.
+    /// Pinned here as the negative space `graph_training_set_every_field_
+    /// moves_the_hash` cannot show (there is no `min_negatives` field to
+    /// mutate): two descriptors built from otherwise-identical `sample`
+    /// fields hash identically, full stop — the type simply carries no knob
+    /// that could vary it.
+    #[test]
+    fn graph_training_set_hash_has_no_min_negatives_field() {
+        let a = graph_training_set_descriptor(&graph_training_set_fields());
+        let b = graph_training_set_descriptor(&graph_training_set_fields());
+        assert_eq!(
+            definition_hash(&a, &no_model_env()).unwrap(),
+            definition_hash(&b, &no_model_env()).unwrap()
+        );
+    }
+
+    /// The device is part of the environment the hash folds — the
+    /// environment leg of K7 for this variant.
+    #[test]
+    fn graph_training_set_hash_moves_with_the_device() {
+        let d = graph_training_set_descriptor(&graph_training_set_fields());
         assert_ne!(
             definition_hash(&d, &MaterializationEnv::new(ComputeDevice::Cpu, Vec::new())).unwrap(),
             definition_hash(

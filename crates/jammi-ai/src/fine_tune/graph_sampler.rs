@@ -128,6 +128,29 @@ impl GraphEdge {
     }
 }
 
+/// Reorder an in-memory node/edge set into `GRAPH_READ_ORDER_RULE_V1`'s
+/// order (nodes ascending by `(id, text)`, edges ascending by `(src, dst)`)
+/// — the SAME full-tuple ascending order the real worker's two `ORDER BY`
+/// scans (`fine_tune::worker::materialize_graph_training_set`) produce for
+/// free from the source's own row order.
+///
+/// A reference sampler that builds a [`GraphSampler`] directly from an
+/// in-memory fixture (to compare bytes against a real job over the SAME
+/// node/edge SET) must call this FIRST — [`GraphSampler::build`] samples in
+/// exactly the order it is handed, so a fixture in its own raw declaration
+/// order (not already `(id, text)`/`(src, dst)`-sorted) samples different
+/// bytes than the real job even though the SET is identical. Every
+/// in-crate and `jammi-server` reference sampler calls this ONE function
+/// rather than re-deriving the sort inline — a comparison against a
+/// reference that skips it, or sorts differently, is silently vacuous
+/// (GA1's own oracle: two physical layouts of the identical set must
+/// sample identically, which this function is what makes a fixture's
+/// layout agree with a real scan's in the first place).
+pub fn sort_into_graph_read_order(nodes: &mut [TextNode], edges: &mut [GraphEdge]) {
+    nodes.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.text.cmp(&b.text)));
+    edges.sort_by(|a, b| a.src.cmp(&b.src).then_with(|| a.dst.cmp(&b.dst)));
+}
+
 /// The two sources and their column bindings a graph fine-tune reads from: a
 /// node-text source (id + text) and an edge source (src + dst), plus the
 /// provenance every edge in the edge source carries. Bundled so the
@@ -221,11 +244,25 @@ impl GraphSampleConfig {
                 "graph walks_per_node must be >= 1".into(),
             ));
         }
-        if self.return_p <= 0.0 {
-            return Err(JammiError::FineTune("graph return_p must be > 0".into()));
+        // `is_finite` checked FIRST, short-circuiting `<= 0.0` (family
+        // D/F): `NaN <= 0.0` is `false`, so a bare `self.return_p <= 0.0`
+        // would silently PASS a NaN return_p/in_out_q through validation —
+        // a confidently-wrong number, not a refused one — and
+        // `biased_choice`'s `1.0 / return_p` weight computation would then
+        // divide by NaN. Checking `!is_finite()` FIRST means a NaN or
+        // Infinity is refused there, before `<= 0.0` (a comparison NaN
+        // would make silently vacuous) ever runs.
+        if !self.return_p.is_finite() || self.return_p <= 0.0 {
+            return Err(JammiError::FineTune(format!(
+                "graph return_p must be > 0 and finite (was {})",
+                self.return_p
+            )));
         }
-        if self.in_out_q <= 0.0 {
-            return Err(JammiError::FineTune("graph in_out_q must be > 0".into()));
+        if !self.in_out_q.is_finite() || self.in_out_q <= 0.0 {
+            return Err(JammiError::FineTune(format!(
+                "graph in_out_q must be > 0 and finite (was {})",
+                self.in_out_q
+            )));
         }
         if self.exclude_hops == 0 {
             return Err(JammiError::FineTune(
@@ -297,12 +334,26 @@ impl GraphSampler {
             ));
         }
 
+        // (issue #538): the node id is the sole ordering key a caller's
+        // "ORDER BY id" scan can offer, so a duplicate id makes that key-only
+        // order non-total — which of the two rows' text a tie-broken scan
+        // would keep is undefined, and a silent "last write wins" would make
+        // the sampled text a function of SCAN ORDER, not of the node SET.
+        // Refused here, at build, naming the id — never a silent overwrite.
         let mut node_map = HashMap::with_capacity(nodes.len());
         let mut node_ids = Vec::with_capacity(nodes.len());
         for node in nodes {
-            if node_map.insert(node.id.clone(), node.text).is_none() {
-                node_ids.push(node.id);
+            if node_map.contains_key(&node.id) {
+                return Err(JammiError::FineTune(format!(
+                    "duplicate node id '{}': every node id must appear exactly once in the \
+                     node source; a duplicate id makes the read-order rule non-total (which \
+                     row's text survives a tie-broken scan is undefined) — de-duplicate the \
+                     source or make the ids unique",
+                    node.id
+                )));
             }
+            node_ids.push(node.id.clone());
+            node_map.insert(node.id, node.text);
         }
 
         // The negative pool for an anchor is "every node except the anchor's
@@ -364,17 +415,82 @@ impl GraphSampler {
         self.has_declared
     }
 
-    /// Sample the graph into `(anchor, positive, [hard_negative])` text rows.
+    /// The sample config this sampler was built with (issue #538): the
+    /// authority `TrainingDataLoader::from_graph` reads `hard_negatives`
+    /// from to decide `graph_pairs` vs `graph_triplet` — a CONFIG decision,
+    /// never re-derived from which negatives the first sampled pair happens
+    /// to carry (the first pair alone can be a misleading representative of
+    /// the whole set).
+    pub fn config(&self) -> &GraphSampleConfig {
+        &self.config
+    }
+
+    /// A byte estimate for what this sampler holds RESIDENT for random
+    /// access over its whole lifetime (GA7, issue #538): every node id +
+    /// text, the forward adjacency (`out_adj`, `biased_walk`'s own table),
+    /// and the undirected adjacency (`k_hop_neighbourhood`'s bounded BFS,
+    /// `biased_choice`'s p/q lookup). This is the shape `reconstruct_graph_
+    /// loader`'s `training_set_graph_sample`-named `MemoryConsumer`
+    /// reservation is sized against — the resident set node2vec's random
+    /// access needs is O(|V|+|E|), unlike a training-set stream's
+    /// per-chunk residency.
+    ///
+    /// Every string's own bytes PLUS the real, measured per-`String` and
+    /// per-`HashMap`/`Vec`-slot struct overhead
+    /// (`std::mem::size_of::<String>()`/`size_of::<usize>()`) the allocator
+    /// actually pays beyond the text — a text-only floor (bytes alone, no
+    /// overhead) silently under-reserves by roughly 2-3x the `Vec<String>`/
+    /// `HashMap<String, _>` shapes this type holds; `size_of` is a
+    /// compiler-verified platform constant, not a made-up multiplier. Still
+    /// rounds UP, not an exact allocator accounting (no load-factor/
+    /// capacity-growth headroom).
+    pub fn resident_bytes(&self) -> usize {
+        const STRING_OVERHEAD: usize = std::mem::size_of::<String>();
+        const SLOT_OVERHEAD: usize = std::mem::size_of::<usize>();
+        let nodes_bytes: usize = self
+            .nodes
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 2 * STRING_OVERHEAD + SLOT_OVERHEAD)
+            .sum();
+        let node_ids_bytes: usize = self
+            .node_ids
+            .iter()
+            .map(|s| s.len() + STRING_OVERHEAD)
+            .sum();
+        let out_adj_bytes: usize = self
+            .out_adj
+            .iter()
+            .map(|(k, v)| {
+                k.len()
+                    + STRING_OVERHEAD
+                    + SLOT_OVERHEAD
+                    + v.iter()
+                        .map(|s| s.len() + STRING_OVERHEAD + SLOT_OVERHEAD)
+                        .sum::<usize>()
+            })
+            .sum();
+        nodes_bytes + node_ids_bytes + out_adj_bytes + self.undirected.resident_bytes()
+    }
+
+    /// Sample the graph into `(anchor, positive, [hard_negative])` text rows,
+    /// calling `emit` once per row AS IT IS PRODUCED — never building a
+    /// `Vec<SampledPair>` of the whole output (GA7, issue #538): a caller
+    /// materialising the output (`fine_tune::worker::
+    /// materialize_graph_training_set`) streams straight into its own
+    /// bounded batch buffer, so peak residency is the sampler's own O(|V|+
+    /// |E|) resident set (covered by [`Self::resident_bytes`]'s named
+    /// reservation) plus ONE bounded chunk, never a second full-output copy.
     ///
     /// For each node, run `walks_per_node` biased walks of length `walk_length`;
     /// each distinct node visited after the start becomes one positive for that
     /// anchor. Per pair, mine `hard_negatives` structure-aware negatives drawn
     /// from outside the anchor's `exclude_hops`-hop neighbourhood (the
     /// false-negative guard). A node with no out-edges contributes no pairs (it
-    /// has no graph structure to learn from).
-    pub fn sample(&self) -> Result<Vec<SampledPair>> {
+    /// has no graph structure to learn from). `emit` returning `Err` stops
+    /// sampling immediately and propagates that error.
+    pub fn sample_into(&self, mut emit: impl FnMut(SampledPair) -> Result<()>) -> Result<()> {
         let mut rng = SplitMix64::new(self.config.seed);
-        let mut pairs = Vec::new();
+        let mut any = false;
 
         for start in &self.node_ids {
             // The anchor's protected neighbourhood: excluded from its negatives.
@@ -391,19 +507,37 @@ impl GraphSampler {
                         continue;
                     }
                     let negatives = self.sample_negatives(start, visited, &excluded, &mut rng);
-                    pairs.push(SampledPair {
+                    // (issue #538): an empty negative pool under a config
+                    // that DEMANDS hard negatives is refused HERE, at sample
+                    // time, naming the anchor — never emitted as a row with
+                    // no negatives for `from_graph`'s later, generic
+                    // `ok_or_else` to reject with no anchor context (a star
+                    // graph's hub anchor can have its whole candidate pool
+                    // excluded).
+                    if self.config.hard_negatives > 0 && negatives.is_empty() {
+                        return Err(JammiError::FineTune(format!(
+                            "graph node '{start}' has an empty negative pool under \
+                             exclude_hops={}: every candidate is within the anchor's excluded \
+                             neighbourhood, so no structure-aware hard negative could be mined \
+                             for this (anchor, positive) pair — lower hard_negatives, widen the \
+                             graph, or reduce exclude_hops",
+                            self.config.exclude_hops
+                        )));
+                    }
+                    any = true;
+                    emit(SampledPair {
                         anchor: self.text_of(start)?,
                         positive: self.text_of(visited)?,
                         hard_negatives: negatives
                             .iter()
                             .map(|id| self.text_of(id))
                             .collect::<Result<Vec<_>>>()?,
-                    });
+                    })?;
                 }
             }
         }
 
-        if pairs.is_empty() {
+        if !any {
             return Err(JammiError::FineTune(
                 "graph sampling produced no pairs: every node is isolated (no \
                  out-edges). A graph with no edges carries no structure to learn."
@@ -411,6 +545,23 @@ impl GraphSampler {
             ));
         }
 
+        Ok(())
+    }
+
+    /// The whole-output convenience wrapper over [`Self::sample_into`] — for
+    /// a caller with no reason to stream (tests; any future caller with a
+    /// small enough graph that a `Vec<SampledPair>` is a non-issue). The
+    /// production materialisation path
+    /// (`fine_tune::worker::materialize_graph_training_set`) calls
+    /// [`Self::sample_into`] directly and never this method, so its own
+    /// residency is never charged the whole-output copy this convenience
+    /// wrapper makes.
+    pub fn sample(&self) -> Result<Vec<SampledPair>> {
+        let mut pairs = Vec::new();
+        self.sample_into(|pair| {
+            pairs.push(pair);
+            Ok(())
+        })?;
         Ok(pairs)
     }
 
@@ -635,6 +786,43 @@ mod tests {
     }
 
     #[test]
+    fn build_rejects_duplicate_node_id() {
+        // GA1: a duplicate node id is refused, typed, naming the id — never
+        // the silent "last text wins" that made the sampled text a function
+        // of scan order rather than of the node SET (mutation: reverting this
+        // check to the old `HashMap::insert`-and-overwrite shape makes this
+        // assert `is_ok()` again — RED under that mutation).
+        let nodes = vec![
+            TextNode::new("n0005", "FIRST text of node 5"),
+            TextNode::new("n0006", "text of node 6"),
+            TextNode::new("n0005", "SECOND text of node 5"),
+        ];
+        let edges = vec![GraphEdge::declared("n0005", "n0006")];
+        let Err(err) = GraphSampler::build(nodes, edges, GraphSampleConfig::default()) else {
+            panic!("duplicate node id must be rejected");
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("duplicate node id") && msg.contains("n0005"),
+            "error should name the duplicated id: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_keeps_duplicate_edges_asymmetry_with_duplicate_nodes() {
+        // GA1's stated asymmetry: a duplicate EDGE is benign (the projected
+        // edge tuple carries no third field that can differ, so keeping both
+        // copies is well-defined and output-affecting only in count, never in
+        // content) while a duplicate NODE id is not (rejected above). Two
+        // identical declared edges must both be accepted and both counted in
+        // the adjacency the walk draws from.
+        let nodes = vec![TextNode::new("a", "alpha"), TextNode::new("b", "beta")];
+        let edges = vec![GraphEdge::declared("a", "b"), GraphEdge::declared("a", "b")];
+        let sampler = GraphSampler::build(nodes, edges, GraphSampleConfig::default()).unwrap();
+        assert_eq!(sampler.out_adj.get("a").map(|v| v.len()), Some(2));
+    }
+
+    #[test]
     fn build_rejects_too_few_nodes_for_min_negatives() {
         // 2 nodes → negative pool ceiling is 1; min_negatives 3 is unreachable.
         let nodes = vec![TextNode::new("a", "alpha"), TextNode::new("b", "beta")];
@@ -647,6 +835,37 @@ mod tests {
             panic!("too-few-nodes must be rejected");
         };
         assert!(format!("{err}").contains("min_negatives"));
+    }
+
+    /// Family D/F (advisory 7, issue #538): `NaN <= 0.0` is `false`, so a
+    /// naive `<= 0.0` bound would silently let a NaN `return_p`/`in_out_q`
+    /// pass validation. `validate` must refuse it, named, same as any other
+    /// invalid value — never a confidently-wrong bias reaching
+    /// `biased_choice`'s `1.0 / return_p`.
+    #[test]
+    fn validate_refuses_non_finite_return_p_and_in_out_q() {
+        let nan_return_p = GraphSampleConfig {
+            return_p: f64::NAN,
+            ..GraphSampleConfig::default()
+        };
+        let err = nan_return_p.validate().unwrap_err();
+        assert!(format!("{err}").contains("return_p"), "{err}");
+
+        let inf_in_out_q = GraphSampleConfig {
+            in_out_q: f64::INFINITY,
+            ..GraphSampleConfig::default()
+        };
+        let err = inf_in_out_q.validate().unwrap_err();
+        assert!(format!("{err}").contains("in_out_q"), "{err}");
+
+        let neg_in_out_q = GraphSampleConfig {
+            in_out_q: -1.0,
+            ..GraphSampleConfig::default()
+        };
+        assert!(neg_in_out_q.validate().is_err());
+
+        // The positive, finite default must still validate.
+        assert!(GraphSampleConfig::default().validate().is_ok());
     }
 
     #[test]
@@ -860,5 +1079,104 @@ mod tests {
         ];
         let sampler = GraphSampler::build(nodes, Vec::new(), GraphSampleConfig::default()).unwrap();
         assert!(sampler.sample().is_err());
+    }
+
+    /// A star graph: hub `c0` reaches every spoke directly, so
+    /// `exclude_hops=1` excludes c0's WHOLE candidate pool — its negative
+    /// pool is empty. Issue #538: requesting `hard_negatives > 0` over this
+    /// graph must refuse AT SAMPLE TIME, naming the hub, never silently emit
+    /// a pair with no negatives for a later, generic caller to reject with
+    /// no anchor context.
+    fn star_graph() -> (Vec<TextNode>, Vec<GraphEdge>) {
+        let n = 5;
+        let nodes = (0..n)
+            .map(|i| TextNode::new(format!("c{i}"), format!("t{i}")))
+            .collect();
+        let mut edges = Vec::new();
+        for i in 1..n {
+            edges.push(GraphEdge::declared("c0", format!("c{i}")));
+            edges.push(GraphEdge::declared(format!("c{i}"), "c0"));
+        }
+        (nodes, edges)
+    }
+
+    #[test]
+    fn sample_refuses_an_empty_negative_pool_when_hard_negatives_are_requested() {
+        let (nodes, edges) = star_graph();
+        let cfg = GraphSampleConfig {
+            hard_negatives: 2,
+            exclude_hops: 1,
+            min_negatives: 1,
+            seed: 1,
+            ..GraphSampleConfig::default()
+        };
+        let sampler = GraphSampler::build(nodes, edges, cfg).unwrap();
+        let Err(err) = sampler.sample() else {
+            panic!("an empty negative pool under hard_negatives > 0 must be refused");
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("c0") && msg.contains("empty negative pool"),
+            "the refusal should name the exhausted anchor: {msg}"
+        );
+    }
+
+    /// GA3: the SAME star graph with `hard_negatives = 0` never mines a
+    /// pool at all, so it succeeds — the format decision (`graph_pairs`) is
+    /// a config fact, not a property this graph's structure could violate.
+    #[test]
+    fn sample_succeeds_on_the_same_star_when_hard_negatives_is_zero() {
+        let (nodes, edges) = star_graph();
+        let cfg = GraphSampleConfig {
+            hard_negatives: 0,
+            exclude_hops: 1,
+            min_negatives: 1,
+            seed: 1,
+            ..GraphSampleConfig::default()
+        };
+        let sampler = GraphSampler::build(nodes, edges, cfg).unwrap();
+        let pairs = sampler.sample().unwrap();
+        assert!(pairs.iter().all(|p| p.hard_negatives.is_empty()));
+    }
+
+    /// GA7 (issue #538): `resident_bytes` is a REAL measurement, not a
+    /// placeholder — it moves when the resident text does, and a graph with
+    /// more edges (a wider `out_adj`/`undirected`) reports MORE resident
+    /// bytes than an isolated-looking one with identical node text alone.
+    #[test]
+    fn resident_bytes_reflects_node_text_and_adjacency_width() {
+        let nodes = vec![
+            TextNode::new("a", "alpha text"),
+            TextNode::new("b", "beta text"),
+            TextNode::new("c", "gamma text"),
+        ];
+        let cfg = GraphSampleConfig::default();
+        let few_edges =
+            GraphSampler::build(nodes.clone(), vec![GraphEdge::declared("a", "b")], cfg).unwrap();
+        let more_edges = GraphSampler::build(
+            nodes,
+            vec![
+                GraphEdge::declared("a", "b"),
+                GraphEdge::declared("b", "c"),
+                GraphEdge::declared("c", "a"),
+            ],
+            cfg,
+        )
+        .unwrap();
+
+        let node_text_bytes = "a".len()
+            + "alpha text".len()
+            + "b".len()
+            + "beta text".len()
+            + "c".len()
+            + "gamma text".len();
+        assert!(
+            few_edges.resident_bytes() >= node_text_bytes,
+            "resident_bytes must be at least the node id+text bytes alone"
+        );
+        assert!(
+            more_edges.resident_bytes() > few_edges.resident_bytes(),
+            "a wider adjacency must report MORE resident bytes over the identical node text"
+        );
     }
 }

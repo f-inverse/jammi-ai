@@ -2153,6 +2153,7 @@ CI if the guide and the code diverge:
 - `ContextSet` — per-target pooled context vectors materialised as an embedding table.
 - `AsofJoin` — a point-in-time temporal join, each spine row matched as-of within its group.
 - `TrainingSet` — the rows a training run reads, projected from a source relation and committed in one canonical full-tuple order; replayed by re-materializing.
+- `GraphTrainingSet` — a graph fine-tune's sampled `(anchor, positive, [hard_negative])` pairs, materialized through the SAME producer funnel as `TrainingSet` via a `Batches` (`RecordBatch`-stream) input rather than SQL, committed in the sampler's own emission order (a leading `_ordinal` column, never re-sorted); the format tag (`graph_pairs`/`graph_triplet`) is decided from the recorded `sample.hard_negatives`, never from row content (<https://github.com/f-inverse/jammi-ai/issues/538>); replayed by re-reading the node/edge sources and re-sampling.
 - `External` — a consumer-materialized table for a verb the engine does not own; no replay arm (returns `NotRecomputable` by design).
 - `EmbeddingDelta` — an incremental refresh of an embedding table (only the changed rows re-embedded, deletion-mask horizons raised); replayed as a full embed into a new table.
 - `EmbeddingCompaction` — a versioned embedding table's live rows rewritten as one fragment + one segment; replayed as a full embed into a new table.

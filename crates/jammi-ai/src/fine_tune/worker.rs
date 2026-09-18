@@ -141,9 +141,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
-use arrow::array::RecordBatch;
+use arrow::array::{Array, ArrayRef, RecordBatch, StringArray, UInt64Array};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use datafusion::error::DataFusionError;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use jammi_db::catalog::instance::{
@@ -157,8 +160,10 @@ use jammi_db::error::{JammiError, Result};
 use jammi_db::model_task::ModelTask;
 use jammi_db::sql::{quote_ident, source_relation};
 use jammi_db::storage::StorageError;
-use jammi_db::store::manifest::ComputeDevice;
-use jammi_db::store::{ArtifactStore, ResultStore};
+use jammi_db::store::manifest::{
+    ComputeDevice, GraphSampleFields, InputAnchor, ProducingDescriptor,
+};
+use jammi_db::store::{ArtifactStore, ResultStore, TrainingSetInput, TrainingSetSpec};
 use jammi_db::tenant::TenantId;
 use tokio::sync::watch;
 
@@ -170,7 +175,7 @@ use crate::fine_tune::decode::{
     build_training_data_loader, detect_training_format, extract_string_column,
 };
 use crate::fine_tune::graph_sampler::{
-    GraphEdge, GraphFineTuneSources, GraphSampleConfig, GraphSampler, TextNode,
+    GraphEdge, GraphFineTuneSources, GraphSampleConfig, GraphSampler, SampledPair, TextNode,
 };
 use crate::fine_tune::partition::{PartitionRule, PartitionSpec};
 use crate::fine_tune::role::{LeaseHolder, RunnerRole};
@@ -1622,6 +1627,372 @@ pub struct JobWorker {
     /// no session alive): the phase and holder every loop this worker
     /// drives runs under.
     admission: Arc<HostAdmission>,
+}
+
+/// Re-read the node/edge sources (`GRAPH_READ_ORDER_RULE_V1`, GA1), sample
+/// the graph, and materialise the pairs as a `GraphTrainingSet`-kind
+/// `TrainingSet` table through the `Batches` seam (GA5/GA9, issue #538) —
+/// the SHARED core [`JobWorker::reconstruct_graph_loader`] (a fresh run) and
+/// [`crate::pipeline::recompute`]'s `recompute_graph_training_set` (a
+/// replay) both call, differing only in `inputs`: a fresh run anchors both
+/// sources `UnpinnedAtInstant`, never reused; a replay re-resolves the
+/// TABLE's own recorded anchor set (mirroring `recompute_training_set`'s own
+/// shape). `job_id_for_hooks` labels the `test-hooks` recorders only (a
+/// replay has no real job id; it passes a descriptive label instead).
+///
+/// # `GRAPH_READ_ORDER_RULE_V1` (GA1)
+///
+/// Both scans below carry an explicit `ORDER BY` over the FULL projected
+/// tuple, ascending, NULLS FIRST — the same shape
+/// [`jammi_db::store::training_set_order_by`] renders for the tabular arm's
+/// own committed order. Without it the rows arrive in whatever order the
+/// source's physical layout happens to hold (row-group order for Parquet,
+/// file order for CSV), and `GraphSampler::sample` walks `node_ids` in
+/// insertion order and each node's `out_adj` in edge-arrival order over ONE
+/// seeded RNG stream — so two layouts of the identical node/edge SET sampled
+/// different bytes. Ordering both scans restores "the sample is a function
+/// of the input SET, not its scan order"; [`GraphSampler::build`]'s
+/// duplicate-node-id refusal is the other half (a key-only order is not
+/// total under a duplicate id).
+#[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+pub(crate) async fn materialize_graph_training_set(
+    session: &Arc<InferenceSession>,
+    job_id_for_hooks: &str,
+    sources: &GraphFineTuneSources,
+    sample_config: GraphSampleConfig,
+    inputs: Vec<InputAnchor>,
+) -> Result<jammi_db::store::TrainingSetTable> {
+    let node_table = session.find_table_name(&sources.node_source)?;
+    let id_col = quote_ident(&sources.id_column);
+    let text_col = quote_ident(&sources.text_column);
+    let node_query = format!(
+        "SELECT {id_col}, {text_col} FROM {} ORDER BY {id_col} ASC NULLS FIRST, {text_col} ASC NULLS FIRST",
+        source_relation(&sources.node_source, &node_table)
+    );
+    let node_batches = session.sql(&node_query).await?;
+    let mut nodes = Vec::new();
+    for batch in &node_batches {
+        let ids = batch
+            .column_by_name(&sources.id_column)
+            .and_then(|c| extract_string_column(c.as_ref()))
+            .ok_or_else(|| {
+                JammiError::FineTune(format!(
+                    "node id column '{}' is not text",
+                    sources.id_column
+                ))
+            })?;
+        let texts = batch
+            .column_by_name(&sources.text_column)
+            .and_then(|c| extract_string_column(c.as_ref()))
+            .ok_or_else(|| {
+                JammiError::FineTune(format!(
+                    "node text column '{}' is not text",
+                    sources.text_column
+                ))
+            })?;
+        for (id, text) in ids.into_iter().zip(texts) {
+            nodes.push(TextNode::new(id, text));
+        }
+    }
+
+    let edge_table = session.find_table_name(&sources.edge_source)?;
+    let src_col = quote_ident(&sources.src_column);
+    let dst_col = quote_ident(&sources.dst_column);
+    let edge_query = format!(
+        "SELECT {src_col}, {dst_col} FROM {} ORDER BY {src_col} ASC NULLS FIRST, {dst_col} ASC NULLS FIRST",
+        source_relation(&sources.edge_source, &edge_table)
+    );
+    let edge_batches = session.sql(&edge_query).await?;
+    let mut edges = Vec::new();
+    for batch in &edge_batches {
+        let srcs = batch
+            .column_by_name(&sources.src_column)
+            .and_then(|c| extract_string_column(c.as_ref()))
+            .ok_or_else(|| {
+                JammiError::FineTune(format!(
+                    "edge src column '{}' is not text",
+                    sources.src_column
+                ))
+            })?;
+        let dsts = batch
+            .column_by_name(&sources.dst_column)
+            .and_then(|c| extract_string_column(c.as_ref()))
+            .ok_or_else(|| {
+                JammiError::FineTune(format!(
+                    "edge dst column '{}' is not text",
+                    sources.dst_column
+                ))
+            })?;
+        for (src, dst) in srcs.into_iter().zip(dsts) {
+            edges.push(GraphEdge {
+                src,
+                dst,
+                provenance: sources.provenance,
+            });
+        }
+    }
+
+    let sampler = GraphSampler::build(nodes, edges, sample_config)?;
+    // GA7 (issue #538): a NAMED `MemoryConsumer` reserves the sampler's
+    // resident adjacency + node-text bytes, held for THIS WHOLE FUNCTION —
+    // through the write at the end, not just through sampling — via
+    // `ReservationGuard`'s `Drop`. A closing audit found the previous
+    // `drop(reservation)` right after `sample()` released the pool's
+    // accounting while the sampler's own allocation (and the batches then
+    // being built from it) were still live for the rest of the function:
+    // the memory pool would have reported this job's peak bytes as free
+    // while they were not. `resident_bytes` itself now rounds up from a
+    // text-only floor by the real, measured `size_of::<String>()`/
+    // `size_of::<usize>()` per-`String`/bucket overhead (that method's own
+    // doc) rather than reporting text bytes alone.
+    let reservation =
+        datafusion::execution::memory_pool::MemoryConsumer::new("training_set_graph_sample")
+            .register(&session.memory_pool());
+    let resident_bytes = sampler.resident_bytes();
+    reservation
+        .try_grow(resident_bytes)
+        .map_err(JammiError::from)?;
+    #[cfg(feature = "test-hooks")]
+    training_test_hooks::note_graph_sample_reservation_bytes(job_id_for_hooks, resident_bytes);
+    let _reservation_guard = ReservationGuard::new(reservation, job_id_for_hooks);
+
+    // GA5/GA9 (issue #538): materialise the sampled pairs through the SAME
+    // `ResultStore::materialize_training_set` funnel the tabular arm uses,
+    // via the `Batches` input seam — never a re-sample-in-place
+    // `TrainingDataLoader::from_graph` (still available as a direct,
+    // table-free constructor for other callers). GA3: the format tag is the
+    // CONFIG's own decision (`hard_negatives > 0`), not re-derived from any
+    // particular row.
+    let has_negatives = sample_config.hard_negatives > 0;
+    let format_tag = crate::fine_tune::data::TrainingFormat::Graph { has_negatives }.format_tag();
+
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("_ordinal", DataType::UInt64, false),
+        Field::new("anchor", DataType::Utf8, false),
+        Field::new("positive", DataType::Utf8, false),
+        // Nullable: NULL for every row when `!has_negatives` (the
+        // `graph_pairs` format never carries one); GA3's sample-time
+        // refusal guarantees every row carries `Some` when `has_negatives`
+        // is true, so a `None` reaching here under that config would itself
+        // be an engine-invariant breach — never silently written as an
+        // empty string.
+        Field::new("negative", DataType::Utf8, true),
+    ]));
+    // 4096 rows/batch: an arbitrary, generous chunk size — no per-row
+    // significance, just bounding one Arrow batch's build cost. GA7: the
+    // sampler's `sample_into` streams pairs directly into THIS bounded
+    // chunk buffer — no `Vec` of the whole sampled output is ever built on
+    // this path (`tests::materialize_graph_training_set_streams_through_
+    // sample_into_never_sample`, a source-level oracle).
+    const GRAPH_BATCH_ROWS: usize = 4096;
+    let mut record_batches: Vec<RecordBatch> = Vec::new();
+    let mut chunk = Vec::with_capacity(GRAPH_BATCH_ROWS);
+    let mut ordinal_base: u64 = 0;
+    #[cfg(feature = "test-hooks")]
+    let mut fingerprint_hasher = {
+        use sha2::Digest;
+        sha2::Sha256::new()
+    };
+    sampler.sample_into(|pair| {
+        #[cfg(feature = "test-hooks")]
+        {
+            use sha2::Digest;
+            fingerprint_hasher.update(pair.anchor.as_bytes());
+            fingerprint_hasher.update([0u8]);
+            fingerprint_hasher.update(pair.positive.as_bytes());
+            fingerprint_hasher.update([0u8]);
+            for negative in &pair.hard_negatives {
+                fingerprint_hasher.update(negative.as_bytes());
+                fingerprint_hasher.update([0u8]);
+            }
+            fingerprint_hasher.update([0xffu8]);
+        }
+        chunk.push(pair);
+        if chunk.len() >= GRAPH_BATCH_ROWS {
+            let batch = build_graph_training_set_batch(
+                std::mem::take(&mut chunk),
+                ordinal_base,
+                has_negatives,
+                &schema,
+            )?;
+            ordinal_base += batch.num_rows() as u64;
+            record_batches.push(batch);
+        }
+        Ok(())
+    })?;
+    if !chunk.is_empty() {
+        record_batches.push(build_graph_training_set_batch(
+            chunk,
+            ordinal_base,
+            has_negatives,
+            &schema,
+        )?);
+    }
+    #[cfg(feature = "test-hooks")]
+    {
+        use sha2::Digest;
+        training_test_hooks::note_graph_sample_fingerprint(
+            job_id_for_hooks,
+            format!("{:x}", fingerprint_hasher.finalize()),
+        );
+    }
+    let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        Arc::clone(&schema),
+        futures::stream::iter(record_batches.into_iter().map(Ok)),
+    ));
+
+    // (advisory 4, issue #538): exhaustive destructure, no `..` — a field
+    // ADDED to `GraphSampleConfig` fails to compile HERE until it is
+    // explicitly threaded into `GraphSampleFields` (moving the hash) or
+    // named `_` with a reason (like `min_negatives` below), rather than
+    // silently escaping the definition hash by continued dot-access on
+    // only the fields this literal already named.
+    let GraphSampleConfig {
+        walk_length,
+        walks_per_node,
+        return_p,
+        in_out_q,
+        hard_negatives,
+        exclude_hops,
+        // Not output-affecting for a successful sample (`GraphTrainingSet`'s
+        // own doc): the floor only gates whether sampling REFUSES, never
+        // what a SUCCESSFUL sample's rows contain.
+        min_negatives: _,
+        seed,
+    } = sample_config;
+    let sample_fields = GraphSampleFields {
+        seed,
+        walk_length: walk_length as u64,
+        walks_per_node: walks_per_node as u64,
+        return_p_bits: return_p.to_bits(),
+        in_out_q_bits: in_out_q.to_bits(),
+        hard_negatives: hard_negatives as u64,
+        exclude_hops: exclude_hops as u64,
+    };
+    let descriptor = ProducingDescriptor::graph_training_set(
+        sources.node_source.clone(),
+        sources.edge_source.clone(),
+        sources.id_column.clone(),
+        sources.text_column.clone(),
+        sources.src_column.clone(),
+        sources.dst_column.clone(),
+        ModelTask::TextEmbedding,
+        format_tag,
+        sample_fields,
+    );
+    // Issue #538 (advisory 8): `TrainingSetSpec::source_id` becomes part of
+    // `ResultStore::create_table`'s literal table name/Parquet path
+    // (`create_table`'s own doc: `"{source_id}__{task}__{model}__
+    // {timestamp}_{suffix}"`, never sanitized like `model_id` is) — a
+    // proper opaque lineage identifier, NOT a display sentence a human
+    // reads. A space/`=`-bearing sentence ("graph node=X edge=Y") would
+    // land verbatim in a file path and a SQL-registered relation name; a
+    // stable `graph__node-X__edge-Y` shape names the SAME two real
+    // sources (never a fabricated query string — there is none; the graph
+    // arm's row source is a biased walk, not a projection) with no
+    // structural character a caller reading the resulting table name would
+    // have to escape.
+    let source_display = format!(
+        "graph__node-{}__edge-{}",
+        sources.node_source, sources.edge_source
+    );
+    let order_columns = vec!["_ordinal".to_string()];
+    let spec = TrainingSetSpec {
+        source_id: &source_display,
+        input: TrainingSetInput::Batches {
+            schema: Arc::clone(&schema),
+            stream,
+        },
+        columns: &order_columns,
+        task: ModelTask::TextEmbedding,
+        descriptor,
+        inputs,
+        device: session.compute_device(),
+    };
+    let table = session
+        .result_store()
+        .materialize_training_set(session.context(), spec)
+        .await?;
+    #[cfg(feature = "test-hooks")]
+    training_test_hooks::note_graph_sample_write_committed(job_id_for_hooks);
+    // `_reservation_guard` drops HERE, at the end of this function's own
+    // scope — strictly after the write above committed, never before.
+    Ok(table)
+}
+
+/// Build one `_ordinal`/`anchor`/`positive`/`negative` `RecordBatch` from a
+/// BOUNDED chunk of sampled pairs (GA7, issue #538) — moves each `String`
+/// out of `chunk` (`into_iter`, never `.clone()`), so building a batch never
+/// doubles the chunk's own residency. `ordinal_base` is the running row
+/// count already written by prior chunks (the leading `_ordinal` column is
+/// GLOBAL across the whole output, not chunk-local).
+fn build_graph_training_set_batch(
+    chunk: Vec<SampledPair>,
+    ordinal_base: u64,
+    has_negatives: bool,
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    let ordinals: ArrayRef = Arc::new(UInt64Array::from(
+        (0..chunk.len() as u64)
+            .map(|i| ordinal_base + i)
+            .collect::<Vec<_>>(),
+    ));
+    let mut anchors = Vec::with_capacity(chunk.len());
+    let mut positives = Vec::with_capacity(chunk.len());
+    let mut negatives: Vec<Option<String>> = Vec::with_capacity(chunk.len());
+    for pair in chunk {
+        anchors.push(pair.anchor);
+        positives.push(pair.positive);
+        negatives.push(if has_negatives {
+            pair.hard_negatives.into_iter().next()
+        } else {
+            None
+        });
+    }
+    let anchors: ArrayRef = Arc::new(StringArray::from(anchors));
+    let positives: ArrayRef = Arc::new(StringArray::from(positives));
+    let negatives: ArrayRef = Arc::new(StringArray::from(negatives));
+    RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![ordinals, anchors, positives, negatives],
+    )
+    .map_err(|e| JammiError::FineTune(format!("failed to build graph training-set batch: {e}")))
+}
+
+/// Holds a [`datafusion::execution::memory_pool::MemoryReservation`] and
+/// releases it on `Drop` — the reservation's release always happens at ITS
+/// OWN scope's natural end, never an explicit early `drop(reservation)`
+/// call whose placement a reviewer has to trust matches the write's real
+/// completion (GA7, issue #538: a closing audit found exactly that drift).
+/// Under `test-hooks`, dropping also records a release event so the
+/// release-timing oracle can assert, from execution, that release happened
+/// AFTER the write committed — not by reading the source and trusting the
+/// ordering by eye.
+struct ReservationGuard {
+    reservation: Option<datafusion::execution::memory_pool::MemoryReservation>,
+    #[cfg(feature = "test-hooks")]
+    job_id: String,
+}
+
+impl ReservationGuard {
+    fn new(
+        reservation: datafusion::execution::memory_pool::MemoryReservation,
+        #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))] job_id: &str,
+    ) -> Self {
+        Self {
+            reservation: Some(reservation),
+            #[cfg(feature = "test-hooks")]
+            job_id: job_id.to_string(),
+        }
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        self.reservation.take();
+        #[cfg(feature = "test-hooks")]
+        training_test_hooks::note_graph_sample_reservation_released(&self.job_id);
+    }
 }
 
 impl JobWorker {
@@ -3762,15 +4133,18 @@ impl JobWorker {
                 sample_config,
                 common,
             } => {
-                // Re-read node/edge sources and re-sample the graph (seeded →
-                // deterministic), then train on the text-embedding head. A
-                // graph fine-tune's rows are sampled in memory, not read
-                // from a `TrainingSet` result table — there is no table to
-                // stream, so this arm is ALWAYS `Resident` (`training_set.
-                // rs`'s module doc, "The graph arm does not go through this
-                // module").
+                // Re-read node/edge sources, re-sample the graph (seeded →
+                // deterministic), and materialise the pairs as a
+                // `GraphTrainingSet`-kind table through the SAME `Batches`
+                // producer seam the tabular arm's `TrainingSet` uses
+                // (`reconstruct_graph_loader`, GA1-GA7/GA9, issue #538) —
+                // then train on the text-embedding head. This arm is always
+                // `Resident` regardless: rank 0 reads the freshly
+                // materialised table back eagerly here (never a streamed
+                // read of it), so `train_fine_tune` never sees a
+                // graph-specific `TrainingSource` variant.
                 let loader = self
-                    .reconstruct_graph_loader(session, &sources, sample_config)
+                    .reconstruct_graph_loader(session, job_id, &sources, sample_config)
                     .await
                     .map_err(WorkerJobError::from)?;
                 let topology = TopologyDecision::decide(
@@ -3791,18 +4165,32 @@ impl JobWorker {
                 let topology = match topology {
                     TopologyDecision::Single => RankTopology::Single,
                     TopologyDecision::Local { world } => RankTopology::Local { world },
-                    // A member is admitted against the job's training-set
-                    // identity pair (`GangService::run_rank`, the world>1
-                    // conjunct) and reads the table by name; a graph
-                    // fine-tune samples its rows in memory and has no such
-                    // table (issue #538), so a `Peer` gang cannot serve it:
-                    // refused, typed, at the coordinator's edge (K2) —
-                    // never a silent single-rank run of a wider job.
+                    // Refused, typed, at the coordinator's edge (K2) — never
+                    // a silent single-rank run of a wider job. The graph arm
+                    // DOES materialise a real `GraphTrainingSet` table now
+                    // (GA1-GA7, GA9), so a Peer member CAN bind it exactly
+                    // like the tabular arm's `TrainingSet`; what is missing
+                    // is a proof that binding is sound at world > 1.
+                    // Attempted and blocked twice by execution, not by
+                    // inspection: (1) a member's own rank body currently
+                    // has no path that reads the table in the SAME
+                    // `_ordinal`-committed order rank 0's own read uses — a
+                    // member reading by a column-derived `ORDER BY` (the
+                    // generic `bind_training_source` path the tabular arm's
+                    // member takes) partitions a DIFFERENT row order than
+                    // rank 0's `_ordinal` read, so the two ranks would slice
+                    // the SAME rows into DIFFERENT shards; (2) there is no
+                    // executed oracle proving a gang's per-rank shards
+                    // combine into the correct all-reduced gradient over the
+                    // graph arm's own loss (the tabular arm's own such proof
+                    // does not transfer — its shards are cut over its own
+                    // committed order, not this one). Issue #538 tracks
+                    // building both: the ordered member read and the
+                    // gradient-propagation oracle.
                     TopologyDecision::Peer { world } => {
                         return Err(WorkerJobError::Failed(format!(
-                            "graph_fine_tune at world_size = {world} needs a Peer gang, but a \
-                             graph fine-tune has no training-set table for a member to be \
-                             admitted against: run it entirely on one host ([worker] \
+                            "graph fine-tune gangs are local-only in v1; W>1 Peer tracked on \
+                             #538 (world_size = {world}): run it entirely on one host ([worker] \
                              local_ranks >= {world}) or resubmit with world_size = 1"
                         )));
                     }
@@ -3850,84 +4238,87 @@ impl JobWorker {
 
     /// Re-read the node/edge sources and rebuild the deterministic graph sampler,
     /// then derive the contrastive-pair training loader from it.
+    ///
+    /// # `GRAPH_READ_ORDER_RULE_V1` (GA1, issue #538)
+    ///
+    /// Both scans below carry an explicit `ORDER BY` over the FULL projected
+    /// tuple, ascending, NULLS FIRST — the same shape
+    /// [`jammi_db::store::training_set_order_by`] renders for the tabular
+    /// arm's own committed order. Without it the rows arrive in whatever
+    /// order the source's physical layout happens to hold (row-group order
+    /// for Parquet, file order for CSV), and `GraphSampler::sample` walks
+    /// `node_ids` in insertion order and each node's `out_adj` in
+    /// edge-arrival order over ONE seeded RNG stream — so two layouts of the
+    /// identical node/edge SET sampled different bytes. Ordering both scans
+    /// restores "the sample is a function of the input SET, not its scan
+    /// order"; [`GraphSampler::build`]'s duplicate-node-id refusal is the
+    /// other half (a key-only order is not total under a duplicate id).
+    // `job_id` feeds only the `test-hooks`-gated fingerprint recorder below;
+    // without that feature it is a genuinely unused parameter, not a bug.
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
     async fn reconstruct_graph_loader(
         &self,
         session: &Arc<InferenceSession>,
+        job_id: &str,
         sources: &GraphFineTuneSources,
         sample_config: GraphSampleConfig,
     ) -> Result<TrainingDataLoader> {
-        let node_table = session.find_table_name(&sources.node_source)?;
-        let node_query = format!(
-            "SELECT {}, {} FROM {}",
-            quote_ident(&sources.id_column),
-            quote_ident(&sources.text_column),
-            source_relation(&sources.node_source, &node_table)
-        );
-        let node_batches = session.sql(&node_query).await?;
-        let mut nodes = Vec::new();
-        for batch in &node_batches {
-            let ids = batch
-                .column_by_name(&sources.id_column)
+        // Issue #538: a fresh materialization anchors both sources at the
+        // read instant — the same honest, never-reused anchor
+        // `training_set::materialize_projection_table` records for the
+        // tabular arm's single source. `recompute_graph_training_set`
+        // (`pipeline/recompute.rs`) calls the SAME shared function below
+        // with RE-RESOLVED anchors instead.
+        let now = chrono::Utc::now().to_rfc3339();
+        let inputs = vec![
+            InputAnchor::unpinned_at_instant(&sources.node_source, now.clone()),
+            InputAnchor::unpinned_at_instant(&sources.edge_source, now),
+        ];
+        let has_negatives = sample_config.hard_negatives > 0;
+        let table =
+            materialize_graph_training_set(session, job_id, sources, sample_config, inputs).await?;
+
+        // Read back in committed (`_ordinal`) order (GA4) and decode
+        // directly into the graph-format loader — never
+        // `detect_training_format`'s column-name classifier, which cannot
+        // distinguish this table from an ordinary triplet/pairs one (the
+        // column names are identical); the worker already knows this is a
+        // graph job.
+        // The relation carries its own committed order (`_ordinal`, the
+        // `columns` the graph producer's `TrainingSetSpec` recorded — #551):
+        // the loader never builds an `ORDER BY` of its own.
+        let read_query = table.relation()?.select_ordered();
+        let read_batches = session.sql(&read_query).await?;
+        let mut rows: Vec<(String, String, Option<String>)> = Vec::new();
+        for batch in &read_batches {
+            let anchors = batch
+                .column_by_name("anchor")
                 .and_then(|c| extract_string_column(c.as_ref()))
                 .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "node id column '{}' is not text",
-                        sources.id_column
-                    ))
+                    JammiError::FineTune("graph training set: 'anchor' is not text".into())
                 })?;
-            let texts = batch
-                .column_by_name(&sources.text_column)
+            let positives = batch
+                .column_by_name("positive")
                 .and_then(|c| extract_string_column(c.as_ref()))
                 .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "node text column '{}' is not text",
-                        sources.text_column
-                    ))
+                    JammiError::FineTune("graph training set: 'positive' is not text".into())
                 })?;
-            for (id, text) in ids.into_iter().zip(texts) {
-                nodes.push(TextNode::new(id, text));
+            let negative_col = batch.column_by_name("negative").ok_or_else(|| {
+                JammiError::FineTune("graph training set: missing 'negative' column".into())
+            })?;
+            let negatives = extract_string_column(negative_col.as_ref()).ok_or_else(|| {
+                JammiError::FineTune("graph training set: 'negative' is not text".into())
+            })?;
+            for i in 0..batch.num_rows() {
+                let negative = if negative_col.is_null(i) {
+                    None
+                } else {
+                    Some(negatives[i].clone())
+                };
+                rows.push((anchors[i].clone(), positives[i].clone(), negative));
             }
         }
-
-        let edge_table = session.find_table_name(&sources.edge_source)?;
-        let edge_query = format!(
-            "SELECT {}, {} FROM {}",
-            quote_ident(&sources.src_column),
-            quote_ident(&sources.dst_column),
-            source_relation(&sources.edge_source, &edge_table)
-        );
-        let edge_batches = session.sql(&edge_query).await?;
-        let mut edges = Vec::new();
-        for batch in &edge_batches {
-            let srcs = batch
-                .column_by_name(&sources.src_column)
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "edge src column '{}' is not text",
-                        sources.src_column
-                    ))
-                })?;
-            let dsts = batch
-                .column_by_name(&sources.dst_column)
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "edge dst column '{}' is not text",
-                        sources.dst_column
-                    ))
-                })?;
-            for (src, dst) in srcs.into_iter().zip(dsts) {
-                edges.push(GraphEdge {
-                    src,
-                    dst,
-                    provenance: sources.provenance,
-                });
-            }
-        }
-
-        let sampler = GraphSampler::build(nodes, edges, sample_config)?;
-        TrainingDataLoader::from_graph(&sampler)
+        TrainingDataLoader::from_graph_table_rows(rows, has_negatives)
     }
 
     /// Load the base model, build the training target, and drive the blocking
@@ -7616,6 +8007,150 @@ pub mod training_test_hooks {
             .push((job_id.to_string(), topology));
     }
 
+    /// One recorded graph-sample fingerprint, keyed by job — the most recent
+    /// entry wins, the same "retried job re-selects" shape as
+    /// [`SourceKindProbe`]. GA1's oracle (issue #538): two `GraphFineTune`
+    /// runs whose node/edge sources hold the SAME set of rows in DIFFERENT
+    /// physical layouts must record the SAME fingerprint here — the
+    /// read-order rule making the sample a function of the input SET, not of
+    /// scan order.
+    struct GraphSampleProbe {
+        job_id: String,
+        fingerprint: String,
+    }
+
+    fn graph_samples() -> &'static Mutex<Vec<GraphSampleProbe>> {
+        static PROBES: OnceLock<Mutex<Vec<GraphSampleProbe>>> = OnceLock::new();
+        PROBES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub(super) fn note_graph_sample_fingerprint(job_id: &str, fingerprint: String) {
+        graph_samples()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(GraphSampleProbe {
+                job_id: job_id.to_string(),
+                fingerprint,
+            });
+    }
+
+    /// The most recently recorded graph-sample fingerprint for `job_id` —
+    /// `None` if this job never reached `reconstruct_graph_loader`.
+    pub fn graph_sample_fingerprint_for(job_id: &str) -> Option<String> {
+        graph_samples()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|p| p.job_id == job_id)
+            .map(|p| p.fingerprint.clone())
+    }
+
+    /// One recorded `training_set_graph_sample` reservation size, keyed by
+    /// job — GA7's oracle (issue #538): the bytes `reconstruct_graph_loader`
+    /// actually reserved against the NAMED `MemoryConsumer`, so a test can
+    /// assert it against an independently computed lower bound rather than
+    /// trust the reservation call succeeded silently.
+    struct GraphReservationProbe {
+        job_id: String,
+        bytes: usize,
+    }
+
+    fn graph_reservations() -> &'static Mutex<Vec<GraphReservationProbe>> {
+        static PROBES: OnceLock<Mutex<Vec<GraphReservationProbe>>> = OnceLock::new();
+        PROBES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub(super) fn note_graph_sample_reservation_bytes(job_id: &str, bytes: usize) {
+        graph_reservations()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(GraphReservationProbe {
+                job_id: job_id.to_string(),
+                bytes,
+            });
+    }
+
+    /// The most recently recorded `training_set_graph_sample` reservation
+    /// size for `job_id` — `None` if this job's reservation was never
+    /// attempted (or failed before this hook fires).
+    pub fn graph_sample_reservation_bytes_for(job_id: &str) -> Option<usize> {
+        graph_reservations()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|p| p.job_id == job_id)
+            .map(|p| p.bytes)
+    }
+
+    /// One recorded event in a graph sample's reservation lifecycle (GA7,
+    /// issue #538): `"write_committed"` right after `materialize_training_
+    /// set` returns, `"released"` when `ReservationGuard::drop` runs. `seq`
+    /// is a single, global, monotonically increasing counter shared by
+    /// every event of both kinds — so two events for the SAME job compare
+    /// by real happens-before order, not by wall-clock time (which two
+    /// events in the same async task can share to the clock's resolution).
+    struct GraphReservationLifecycleEvent {
+        job_id: String,
+        seq: u64,
+        released: bool,
+    }
+
+    fn graph_reservation_lifecycle() -> &'static Mutex<Vec<GraphReservationLifecycleEvent>> {
+        static EVENTS: OnceLock<Mutex<Vec<GraphReservationLifecycleEvent>>> = OnceLock::new();
+        EVENTS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    fn next_graph_reservation_lifecycle_seq() -> u64 {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(super) fn note_graph_sample_write_committed(job_id: &str) {
+        graph_reservation_lifecycle()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(GraphReservationLifecycleEvent {
+                job_id: job_id.to_string(),
+                seq: next_graph_reservation_lifecycle_seq(),
+                released: false,
+            });
+    }
+
+    pub(super) fn note_graph_sample_reservation_released(job_id: &str) {
+        graph_reservation_lifecycle()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(GraphReservationLifecycleEvent {
+                job_id: job_id.to_string(),
+                seq: next_graph_reservation_lifecycle_seq(),
+                released: true,
+            });
+    }
+
+    /// GA7's release-timing oracle (issue #538): `Some(true)` iff `job_id`'s
+    /// graph-sample reservation was released STRICTLY AFTER its write
+    /// committed (by `seq`, not wall-clock); `Some(false)` if release
+    /// preceded the write (the bug this oracle catches); `None` if either
+    /// event was never recorded for this job.
+    pub fn graph_sample_reservation_released_after_write_for(job_id: &str) -> Option<bool> {
+        let events = graph_reservation_lifecycle()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let write_seq = events
+            .iter()
+            .rev()
+            .find(|e| e.job_id == job_id && !e.released)
+            .map(|e| e.seq)?;
+        let release_seq = events
+            .iter()
+            .rev()
+            .find(|e| e.job_id == job_id && e.released)
+            .map(|e| e.seq)?;
+        Some(release_seq > write_seq)
+    }
+
     /// The most recent [`super::TopologyDecision`] `run_spec` made for
     /// `job_id` — the oracle that a claimed job really fanned out into the
     /// layout its `world_size` and `[worker] local_ranks` imply.
@@ -9895,6 +10430,73 @@ mod tests {
     use candle_core::Tensor;
 
     use super::*;
+
+    /// A source-level oracle (GA7, issue #538): `materialize_graph_training_
+    /// set`'s own function body — read from disk at test time, not
+    /// transcribed — calls `GraphSampler::sample_into` (the streaming,
+    /// no-whole-Vec emit path) and never `GraphSampler::sample` (the
+    /// whole-`Vec<SampledPair>`-collecting convenience wrapper). A grep/syn
+    /// class oracle over compiled behaviour cannot see WHICH method was
+    /// called if both compile fine and both satisfy the same trait-free
+    /// signature elsewhere, so this reads the actual source text: a static
+    /// property no unit test that only exercises inputs/outputs can prove.
+    ///
+    /// Mutation executed (and reverted before committing): replacing the
+    /// production `sampler.sample_into(|pair| { ... })?;` call with
+    /// `for pair in sampler.sample()? { ... }` — functionally equivalent
+    /// output, but reintroducing the whole-output `Vec<SampledPair>` this
+    /// property forbids — turns this test RED (confirmed: the scan found
+    /// `.sample()` present and `.sample_into(` absent from the reduced
+    /// body).
+    #[test]
+    fn materialize_graph_training_set_streams_through_sample_into_never_sample() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fine_tune/worker.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let start_marker = "pub(crate) async fn materialize_graph_training_set(";
+        let start = source
+            .find(start_marker)
+            .expect("materialize_graph_training_set must still exist under this exact name");
+        // The function ends at the first top-level `\n}\n` after its own
+        // opening brace, tracked by a simple brace depth counter over the
+        // text from the signature onward — good enough to isolate ONE
+        // function's body from its neighbours without a full parser.
+        let body_start = source[start..]
+            .find('{')
+            .map(|i| start + i)
+            .expect("the function must have a body");
+        let mut depth = 0i32;
+        let mut body_end = None;
+        for (offset, ch) in source[body_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = Some(body_start + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body_end = body_end.expect("a balanced function body must close its own brace");
+        let body = &source[body_start..body_end];
+
+        assert!(
+            body.contains(".sample_into("),
+            "materialize_graph_training_set must call GraphSampler::sample_into (the \
+             streaming emit path) — the function body has changed shape; update this \
+             oracle only if the streaming property itself is being deliberately re-verified \
+             under a new name"
+        );
+        assert!(
+            !body.contains(".sample()"),
+            "materialize_graph_training_set must NEVER call GraphSampler::sample (the \
+             whole-Vec<SampledPair>-collecting convenience wrapper) — that reintroduces a \
+             second full-output copy this property forbids"
+        );
+    }
 
     /// The manifest's topology determinants name what the run EXECUTED at,
     /// as a total function of the decided `RankTopology` — never the

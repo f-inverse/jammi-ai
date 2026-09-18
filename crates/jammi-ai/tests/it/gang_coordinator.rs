@@ -33,7 +33,8 @@ use candle_nn::{VarBuilder, VarMap};
 use jammi_ai::fine_tune::collective::{BlockingCall, LocalGang};
 use jammi_ai::fine_tune::data::TrainingDataLoader;
 use jammi_ai::fine_tune::graph_sampler::{
-    EdgeProvenance, GraphEdge, GraphFineTuneSources, GraphSampleConfig, GraphSampler, TextNode,
+    sort_into_graph_read_order, EdgeProvenance, GraphEdge, GraphFineTuneSources, GraphSampleConfig,
+    GraphSampler, TextNode,
 };
 use jammi_ai::fine_tune::lora::build_projection_head_for_rank;
 use jammi_ai::fine_tune::partition::{PartitionRule, PartitionSpec};
@@ -179,13 +180,18 @@ fn graph_sources() -> GraphFineTuneSources {
 }
 
 /// The loader the worker's `reconstruct_graph_loader` builds — the same
-/// nodes and edges in source order through the same seeded sampler.
+/// nodes and edges the real job's two ordered scans read
+/// (`sort_into_graph_read_order`, `GRAPH_READ_ORDER_RULE_V1`), through the
+/// same seeded sampler. `graph_nodes`/`graph_edges` are declared in a
+/// bidirected shape (two triangles + a bridge), NOT already `(id,
+/// text)`/`(src, dst)`-sorted — sorting here is required, not cosmetic; a
+/// closing audit caught this omission by the byte mismatch it caused.
 pub(crate) fn graph_loader() -> TrainingDataLoader {
-    let nodes = graph_nodes()
+    let mut nodes: Vec<TextNode> = graph_nodes()
         .into_iter()
         .map(|(id, text)| TextNode::new(id, text))
         .collect();
-    let edges = graph_edges()
+    let mut edges: Vec<GraphEdge> = graph_edges()
         .into_iter()
         .map(|(src, dst)| GraphEdge {
             src,
@@ -193,6 +199,7 @@ pub(crate) fn graph_loader() -> TrainingDataLoader {
             provenance: EdgeProvenance::Declared,
         })
         .collect();
+    sort_into_graph_read_order(&mut nodes, &mut edges);
     let sampler = GraphSampler::build(nodes, edges, graph_sample_config()).unwrap();
     TrainingDataLoader::from_graph(&sampler).unwrap()
 }

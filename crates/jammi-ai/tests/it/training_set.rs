@@ -1168,8 +1168,8 @@ async fn a_training_set_replays_from_its_recorded_descriptor() {
 #[tokio::test(flavor = "multi_thread")]
 async fn recompute_re_anchors_every_recorded_relation() {
     use jammi_ai::pipeline::recompute::Cascade;
-    use jammi_db::store::manifest::{AnchorKind, InputAnchor};
-    use jammi_db::store::TrainingSetSpec;
+    use jammi_db::store::manifest::{AnchorKind, InputAnchor, ProducingDescriptor};
+    use jammi_db::store::{TrainingSetInput, TrainingSetSpec};
 
     let dir = TempDir::new().unwrap();
     let session = session_over(&dir, &common::fixture_url("training_pairs.csv")).await;
@@ -1194,10 +1194,15 @@ async fn recompute_re_anchors_every_recorded_relation() {
     let now = chrono::Utc::now().to_rfc3339();
     let spec = TrainingSetSpec {
         source_id: "training",
-        source_sql: &source_sql,
+        input: TrainingSetInput::Sql(&source_sql),
         columns: &columns,
         task: ModelTask::TextEmbedding,
-        format: "contrastive",
+        descriptor: ProducingDescriptor::training_set(
+            source_sql.clone(),
+            columns.clone(),
+            ModelTask::TextEmbedding,
+            "contrastive",
+        ),
         inputs: vec![
             InputAnchor::unpinned_at_instant("training", now.clone()),
             InputAnchor::unpinned_at_instant("training_secondary", now),

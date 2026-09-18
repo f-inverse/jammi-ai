@@ -316,6 +316,885 @@ fn dangling_endpoint_is_a_typed_error() {
     assert!(format!("{err}").contains("text-bearing"));
 }
 
+/// GA1 (issue #538): the graph sampler's input is read with an explicit
+/// order (`GRAPH_READ_ORDER_RULE_V1`), so two physical layouts of the
+/// IDENTICAL node/edge set sample byte-identical pairs — never a function of
+/// scan order. The model is deliberately bogus so the job fails fast right
+/// after `reconstruct_graph_loader` runs (sampling happens before model
+/// load); the fingerprint hook has already fired by the time `job.wait()`
+/// returns either way.
+///
+/// Mutation executed (not committed): removing the `ORDER BY` clauses from
+/// `reconstruct_graph_loader`'s node/edge queries makes this assertion fail
+/// (the two fingerprints differ) — confirmed by hand before this test was
+/// added, restoring the fix afterward.
+#[cfg(feature = "test-hooks")]
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_sample_is_a_function_of_the_set_not_the_scan_order() {
+    use jammi_ai::fine_tune::worker::training_test_hooks::graph_sample_fingerprint_for;
+
+    async fn sample_fingerprint(
+        node_rows: &[(String, String)],
+        edge_rows: &[(String, String)],
+    ) -> String {
+        let dir = TempDir::new().unwrap();
+        let config = common::test_config(dir.path());
+        let session = Arc::new(InferenceSession::new(config).await.unwrap());
+        let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+            .expect("default worker intervals are valid");
+
+        let node_url = write_csv(dir.path(), "nodes.csv", "id,text", node_rows);
+        let edge_url = write_csv(dir.path(), "edges.csv", "src,dst", edge_rows);
+        session
+            .add_source(
+                "nodes",
+                SourceType::File,
+                SourceConnection {
+                    url: Some(node_url),
+                    format: Some(FileFormat::Csv),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        session
+            .add_source(
+                "edges",
+                SourceType::File,
+                SourceConnection {
+                    url: Some(edge_url),
+                    format: Some(FileFormat::Csv),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let sources = GraphFineTuneSources {
+            node_source: "nodes".into(),
+            id_column: "id".into(),
+            text_column: "text".into(),
+            edge_source: "edges".into(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+            provenance: EdgeProvenance::Declared,
+        };
+        let sample = GraphSampleConfig {
+            walk_length: 3,
+            walks_per_node: 4,
+            // GA1 tests read-order independence, not negative mining; 0
+            // side-steps GA3's empty-negative-pool refusal on this small
+            // fixture (a 5-node ring can legitimately exhaust an anchor's
+            // candidate pool under exclude_hops=1).
+            hard_negatives: 0,
+            exclude_hops: 1,
+            min_negatives: 1,
+            seed: 4242,
+            ..GraphSampleConfig::default()
+        };
+        // Deliberately unresolvable: the job fails at model load, well after
+        // `reconstruct_graph_loader` has already run and the hook fired.
+        let job = session
+            .fine_tune_graph(
+                &sources,
+                "local:/nonexistent/definitely-not-a-model",
+                sample,
+                Some(jammi_ai::fine_tune::FineTuneConfig::default()),
+            )
+            .await
+            .unwrap();
+        let _ = job.wait().await;
+        graph_sample_fingerprint_for(&job.job_id)
+            .expect("reconstruct_graph_loader must have sampled and recorded a fingerprint")
+    }
+
+    let ids = ["n0000", "n0001", "n0002", "n0003", "n0004"];
+    let node_rows_a: Vec<(String, String)> = ids
+        .iter()
+        .map(|id| (id.to_string(), format!("text of {id}")))
+        .collect();
+    // A different physical layout of the SAME node rows.
+    let mut node_rows_b = node_rows_a.clone();
+    node_rows_b.rotate_left(2);
+    node_rows_b.swap(0, 3);
+
+    let edge_pairs = [
+        ("n0000", "n0001"),
+        ("n0001", "n0002"),
+        ("n0002", "n0003"),
+        ("n0003", "n0004"),
+        ("n0004", "n0000"),
+        ("n0001", "n0004"),
+        ("n0002", "n0000"),
+    ];
+    let edge_rows_a: Vec<(String, String)> = edge_pairs
+        .iter()
+        .map(|(s, d)| (s.to_string(), d.to_string()))
+        .collect();
+    // A different physical layout of the SAME edge rows (rotated, not sorted).
+    let mut edge_rows_b = edge_rows_a.clone();
+    edge_rows_b.rotate_left(3);
+
+    let fp_a = sample_fingerprint(&node_rows_a, &edge_rows_a).await;
+    let fp_b = sample_fingerprint(&node_rows_b, &edge_rows_b).await;
+    assert_eq!(
+        fp_a, fp_b,
+        "two physical layouts of the identical node/edge set must sample \
+         byte-identical pairs under GRAPH_READ_ORDER_RULE_V1"
+    );
+}
+
+/// GA1: a node source with a duplicate id fails the job end to end with a
+/// typed error naming the duplicate — never a silent last-write-wins sample.
+#[tokio::test(flavor = "multi_thread")]
+async fn fine_tune_graph_duplicate_node_id_fails() {
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+
+    let node_rows: Vec<(String, String)> = vec![
+        ("n0".to_string(), "text of n0".to_string()),
+        ("n1".to_string(), "text of n1".to_string()),
+        ("n0".to_string(), "DUPLICATE text of n0".to_string()),
+    ];
+    let node_url = write_csv(dir.path(), "nodes.csv", "id,text", &node_rows);
+    let edge_rows: Vec<(String, String)> = vec![
+        ("n0".to_string(), "n1".to_string()),
+        ("n1".to_string(), "n0".to_string()),
+    ];
+    let edge_url = write_csv(dir.path(), "edges.csv", "src,dst", &edge_rows);
+
+    session
+        .add_source(
+            "nodes",
+            SourceType::File,
+            SourceConnection {
+                url: Some(node_url),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    session
+        .add_source(
+            "edges",
+            SourceType::File,
+            SourceConnection {
+                url: Some(edge_url),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let model = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
+    let sources = GraphFineTuneSources {
+        node_source: "nodes".into(),
+        id_column: "id".into(),
+        text_column: "text".into(),
+        edge_source: "edges".into(),
+        src_column: "src".into(),
+        dst_column: "dst".into(),
+        provenance: EdgeProvenance::Declared,
+    };
+    let job = session
+        .fine_tune_graph(
+            &sources,
+            &model,
+            GraphSampleConfig::default(),
+            Some(jammi_ai::fine_tune::FineTuneConfig::default()),
+        )
+        .await
+        .expect("submit persists the spec and returns a handle");
+
+    let result = job.wait().await;
+    assert!(
+        result.is_err(),
+        "a duplicate node id must drive the job to a typed failure"
+    );
+    let record = session.catalog().get_job(&job.job_id).await.unwrap();
+    assert_eq!(record.status, "failed");
+}
+
+/// GA7 (issue #538): the sampler's resident adjacency + node-text bytes are
+/// reserved against a NAMED `training_set_graph_sample` `MemoryConsumer`,
+/// sized against a REAL measurement — never zero, never a placeholder.
+/// Asserted via the `test-hooks` recorder rather than by forcing a real
+/// `ResourcesExhausted` (which would need the graph large enough to also
+/// perturb `reconstruct_graph_loader`'s own node/edge `ORDER BY` scans —
+/// GA1 — a separate, comparably-sized DataFusion-side sort competing for
+/// the same bounded pool during the READ, before this reservation is even
+/// attempted; entangling the two would make this test's failure ambiguous
+/// about which mechanism actually tripped).
+#[tokio::test(flavor = "multi_thread")]
+async fn fine_tune_graph_reservation_is_sized_against_a_real_measurement() {
+    use jammi_ai::fine_tune::worker::training_test_hooks::graph_sample_reservation_bytes_for;
+
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+
+    let ids = ["n0", "n1", "n2", "n3"];
+    let texts = [
+        "text of node zero somewhat long",
+        "text of node one",
+        "text of node two also fairly long indeed",
+        "text of node three",
+    ];
+    let node_rows: Vec<(String, String)> = ids
+        .iter()
+        .zip(texts.iter())
+        .map(|(id, text)| (id.to_string(), text.to_string()))
+        .collect();
+    // An independent lower bound computed HERE, from the same fixture, via
+    // arithmetic that does not call `GraphSampler::resident_bytes` — id +
+    // text bytes for every node, never the tautological "call the same
+    // method and compare to itself".
+    let node_text_bytes: usize =
+        ids.iter().map(|s| s.len()).sum::<usize>() + texts.iter().map(|s| s.len()).sum::<usize>();
+    let node_url = write_csv(dir.path(), "nodes.csv", "id,text", &node_rows);
+    let edge_rows: Vec<(String, String)> = vec![
+        ("n0".to_string(), "n1".to_string()),
+        ("n1".to_string(), "n2".to_string()),
+        ("n2".to_string(), "n3".to_string()),
+        ("n3".to_string(), "n0".to_string()),
+    ];
+    let edge_url = write_csv(dir.path(), "edges.csv", "src,dst", &edge_rows);
+
+    session
+        .add_source(
+            "nodes",
+            SourceType::File,
+            SourceConnection {
+                url: Some(node_url),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    session
+        .add_source(
+            "edges",
+            SourceType::File,
+            SourceConnection {
+                url: Some(edge_url),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let sources = GraphFineTuneSources {
+        node_source: "nodes".into(),
+        id_column: "id".into(),
+        text_column: "text".into(),
+        edge_source: "edges".into(),
+        src_column: "src".into(),
+        dst_column: "dst".into(),
+        provenance: EdgeProvenance::Declared,
+    };
+    let sample = GraphSampleConfig {
+        walk_length: 2,
+        walks_per_node: 1,
+        hard_negatives: 0,
+        exclude_hops: 1,
+        min_negatives: 1,
+        seed: 1,
+        ..GraphSampleConfig::default()
+    };
+    // Deliberately unresolvable model: the reservation and the fingerprint
+    // hook both fire well before any model load would matter.
+    let job = session
+        .fine_tune_graph(
+            &sources,
+            "local:/nonexistent/definitely-not-a-model",
+            sample,
+            Some(jammi_ai::fine_tune::FineTuneConfig::default()),
+        )
+        .await
+        .unwrap();
+    let _ = job.wait().await;
+
+    let reserved = graph_sample_reservation_bytes_for(&job.job_id)
+        .expect("reconstruct_graph_loader must have reserved and recorded its bytes");
+    assert!(
+        reserved >= node_text_bytes,
+        "the reservation ({reserved} B) must be at least the node id+text bytes alone \
+         ({node_text_bytes} B) — it also covers the (small, here) out_adj/undirected \
+         adjacency on top"
+    );
+}
+
+/// GA7's release-timing oracle (issue #538): the named
+/// `training_set_graph_sample` reservation is released STRICTLY AFTER the
+/// materialised table's write commits, never right after sampling and
+/// before the write — a closing audit found the reservation dropped before
+/// the batches it had reserved for were even built. A mutation that
+/// restores the early `drop(reservation)` right after `sample_into`
+/// returns (before the batch-build loop) turns this RED (`Some(false)`,
+/// executed and confirmed, then reverted before committing).
+#[tokio::test(flavor = "multi_thread")]
+async fn fine_tune_graph_reservation_is_released_after_the_write_commits() {
+    use jammi_ai::fine_tune::worker::training_test_hooks::graph_sample_reservation_released_after_write_for;
+
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+
+    let node_rows: Vec<(String, String)> = ["n0", "n1", "n2", "n3"]
+        .iter()
+        .map(|id| (id.to_string(), format!("text of node {id}")))
+        .collect();
+    let node_url = write_csv(dir.path(), "nodes.csv", "id,text", &node_rows);
+    let edge_rows: Vec<(String, String)> = vec![
+        ("n0".to_string(), "n1".to_string()),
+        ("n1".to_string(), "n2".to_string()),
+        ("n2".to_string(), "n3".to_string()),
+        ("n3".to_string(), "n0".to_string()),
+    ];
+    let edge_url = write_csv(dir.path(), "edges.csv", "src,dst", &edge_rows);
+
+    session
+        .add_source(
+            "nodes",
+            SourceType::File,
+            SourceConnection {
+                url: Some(node_url),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    session
+        .add_source(
+            "edges",
+            SourceType::File,
+            SourceConnection {
+                url: Some(edge_url),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let sources = GraphFineTuneSources {
+        node_source: "nodes".into(),
+        id_column: "id".into(),
+        text_column: "text".into(),
+        edge_source: "edges".into(),
+        src_column: "src".into(),
+        dst_column: "dst".into(),
+        provenance: EdgeProvenance::Declared,
+    };
+    let sample = GraphSampleConfig {
+        walk_length: 2,
+        walks_per_node: 1,
+        hard_negatives: 0,
+        exclude_hops: 1,
+        min_negatives: 1,
+        seed: 1,
+        ..GraphSampleConfig::default()
+    };
+    let job = session
+        .fine_tune_graph(
+            &sources,
+            "local:/nonexistent/definitely-not-a-model",
+            sample,
+            Some(jammi_ai::fine_tune::FineTuneConfig::default()),
+        )
+        .await
+        .unwrap();
+    let _ = job.wait().await;
+
+    assert_eq!(
+        graph_sample_reservation_released_after_write_for(&job.job_id),
+        Some(true),
+        "the reservation must release AFTER the table's write commits, not before"
+    );
+}
+
+/// GA5/GA2/GA9 (issue #538): a graph fine-tune's worker path actually
+/// materialises a `TrainingSet`-kind table through the seam, carrying a
+/// `GraphTrainingSet` descriptor with the sources/columns/format/sample
+/// config the job ran with — never silently still sampling in memory with
+/// no table at all (`origin/main`'s pre-#538 shape).
+#[tokio::test(flavor = "multi_thread")]
+async fn fine_tune_graph_materialises_a_graph_training_set_table() {
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+
+    let node_rows: Vec<(String, String)> = ["a0", "a1", "a2", "b0", "b1", "b2"]
+        .iter()
+        .map(|id| (id.to_string(), format!("document about topic {id}")))
+        .collect();
+    let node_url = write_csv(dir.path(), "nodes.csv", "id,text", &node_rows);
+    let edge_pairs = [
+        ("a0", "a1"),
+        ("a1", "a0"),
+        ("a1", "a2"),
+        ("a2", "a1"),
+        ("a0", "a2"),
+        ("a2", "a0"),
+        ("b0", "b1"),
+        ("b1", "b0"),
+        ("b1", "b2"),
+        ("b2", "b1"),
+        ("b0", "b2"),
+        ("b2", "b0"),
+        ("a0", "b0"),
+    ];
+    let edge_rows: Vec<(String, String)> = edge_pairs
+        .iter()
+        .map(|(s, d)| (s.to_string(), d.to_string()))
+        .collect();
+    let edge_url = write_csv(dir.path(), "edges.csv", "src,dst", &edge_rows);
+
+    session
+        .add_source(
+            "nodes",
+            SourceType::File,
+            SourceConnection {
+                url: Some(node_url),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    session
+        .add_source(
+            "edges",
+            SourceType::File,
+            SourceConnection {
+                url: Some(edge_url),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let sources = GraphFineTuneSources {
+        node_source: "nodes".into(),
+        id_column: "id".into(),
+        text_column: "text".into(),
+        edge_source: "edges".into(),
+        src_column: "src".into(),
+        dst_column: "dst".into(),
+        provenance: EdgeProvenance::Declared,
+    };
+    let sample = GraphSampleConfig {
+        walk_length: 3,
+        walks_per_node: 2,
+        hard_negatives: 1,
+        exclude_hops: 1,
+        min_negatives: 1,
+        seed: 11,
+        ..GraphSampleConfig::default()
+    };
+    let job = session
+        .fine_tune_graph(
+            &sources,
+            "local:/nonexistent/definitely-not-a-model",
+            sample,
+            Some(jammi_ai::fine_tune::FineTuneConfig::default()),
+        )
+        .await
+        .unwrap();
+    let _ = job.wait().await;
+
+    let ready = session
+        .catalog()
+        .list_result_tables_by_status(jammi_db::catalog::status::ResultTableStatus::Ready)
+        .await
+        .unwrap();
+    let training_set = ready
+        .iter()
+        .find(|t| t.kind == jammi_db::catalog::result_repo::ResultTableKind::TrainingSet)
+        .expect("the graph arm must materialise a TrainingSet-kind table");
+
+    let descriptor = session
+        .result_store()
+        .producing_descriptor(training_set)
+        .await
+        .unwrap();
+    match descriptor {
+        jammi_db::store::manifest::ProducingDescriptor::GraphTrainingSet {
+            node_source,
+            edge_source,
+            id_column,
+            text_column,
+            src_column,
+            dst_column,
+            format,
+            sample,
+            read_order_rule,
+            ..
+        } => {
+            assert_eq!(node_source, "nodes");
+            assert_eq!(edge_source, "edges");
+            assert_eq!(id_column, "id");
+            assert_eq!(text_column, "text");
+            assert_eq!(src_column, "src");
+            assert_eq!(dst_column, "dst");
+            assert_eq!(
+                format, "graph_triplet",
+                "hard_negatives=1 must record graph_triplet"
+            );
+            assert_eq!(sample.hard_negatives, 1);
+            assert_eq!(sample.seed, 11);
+            assert_eq!(read_order_rule, jammi_db::store::GRAPH_READ_ORDER_RULE_V1);
+        }
+        other => panic!("expected a GraphTrainingSet descriptor, got {other:?}"),
+    }
+    assert!(training_set.row_count > 0);
+}
+
+/// GA6 (issue #538): two attempts of ONE `graph_fine_tune` job id (a stale
+/// lease reclaimed to a second worker) never displace or clobber each
+/// other's materialised `GraphTrainingSet` table — each attempt's own call
+/// to `reconstruct_graph_loader` re-samples and re-materialises
+/// independently (the source anchors are `UnpinnedAtInstant`, so the second
+/// attempt's `materialize_training_set` call never reuses the first's row —
+/// `probe_ready_training_set` never matches an unpinned anchor), and the
+/// per-attempt table name (`materialization.rs:1613`'s timestamp+random
+/// suffix, unchanged since before #538) keeps the two tables distinct. The
+/// same shape `fine_tune.rs::loser_prefix_is_never_the_committed_artifact`
+/// proves for the tabular arm, generic over `JobWorker::run_claimed_job`'s
+/// kind dispatch — this is that oracle's graph-arm instance.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_attempts_of_one_graph_job_never_displace_each_others_table() {
+    use jammi_ai::fine_tune::worker::JobWorker;
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+
+    let node_rows: Vec<(String, String)> = ["a0", "a1", "a2", "b0", "b1", "b2"]
+        .iter()
+        .map(|id| (id.to_string(), format!("document about topic {id}")))
+        .collect();
+    let node_url = write_csv(dir.path(), "nodes.csv", "id,text", &node_rows);
+    let edge_pairs = [
+        ("a0", "a1"),
+        ("a1", "a0"),
+        ("a1", "a2"),
+        ("a2", "a1"),
+        ("a0", "a2"),
+        ("a2", "a0"),
+        ("b0", "b1"),
+        ("b1", "b0"),
+        ("b1", "b2"),
+        ("b2", "b1"),
+        ("b0", "b2"),
+        ("b2", "b0"),
+        ("a0", "b0"),
+    ];
+    let edge_rows: Vec<(String, String)> = edge_pairs
+        .iter()
+        .map(|(s, d)| (s.to_string(), d.to_string()))
+        .collect();
+    let edge_url = write_csv(dir.path(), "edges.csv", "src,dst", &edge_rows);
+
+    session
+        .add_source(
+            "nodes",
+            SourceType::File,
+            SourceConnection {
+                url: Some(node_url),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    session
+        .add_source(
+            "edges",
+            SourceType::File,
+            SourceConnection {
+                url: Some(edge_url),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let model = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
+    let sources = GraphFineTuneSources {
+        node_source: "nodes".into(),
+        id_column: "id".into(),
+        text_column: "text".into(),
+        edge_source: "edges".into(),
+        src_column: "src".into(),
+        dst_column: "dst".into(),
+        provenance: EdgeProvenance::Declared,
+    };
+    let sample = GraphSampleConfig {
+        walk_length: 3,
+        walks_per_node: 2,
+        hard_negatives: 1,
+        exclude_hops: 1,
+        min_negatives: 1,
+        seed: 11,
+        ..GraphSampleConfig::default()
+    };
+    let train = jammi_ai::fine_tune::FineTuneConfig {
+        epochs: 1,
+        batch_size: 4,
+        lora_rank: 4,
+        warmup_steps: 0,
+        validation_fraction: 0.0,
+        early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
+        ..Default::default()
+    };
+
+    let job = session
+        .fine_tune_graph(&sources, &model, sample, Some(train))
+        .await
+        .unwrap();
+
+    let worker_a = JobWorker::new(&session).expect("default worker intervals are valid");
+    let worker_b = JobWorker::new(&session).expect("default worker intervals are valid");
+
+    // worker-a claims with an already-expired lease; worker-b reclaims and
+    // re-claims under a long lease, so worker-b owns the job.
+    let stale_claim = session
+        .catalog()
+        .claim_next(worker_a.worker_id(), &["graph_fine_tune"], Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("worker-a claims the queued job");
+    let actioned = session
+        .catalog()
+        .reclaim_expired_jobs(Duration::from_secs(60), 5)
+        .await
+        .unwrap();
+    assert_eq!(actioned, 1, "the expired lease is re-queued");
+    let owned = session
+        .catalog()
+        .claim_next(
+            worker_b.worker_id(),
+            &["graph_fine_tune"],
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap()
+        .expect("worker-b re-claims the requeued job");
+
+    // Both attempts run to completion; each independently samples and
+    // materialises its OWN GraphTrainingSet table (no shared, name-collided
+    // artifact) before either trains.
+    worker_a.run_claimed_job(&session, stale_claim).await;
+    let after_loser = session.catalog().get_job(&job.job_id).await.unwrap();
+    assert_ne!(
+        after_loser.status, "completed",
+        "the loser's finalize CAS fails; the job is not completed by it"
+    );
+
+    worker_b.run_claimed_job(&session, owned).await;
+    job.wait().await.unwrap();
+    let done = session.catalog().get_job(&job.job_id).await.unwrap();
+    assert_eq!(done.status, "completed", "the winner finalizes the job");
+
+    // Both attempts' TrainingSet tables exist, `ready`, and are DISTINCT —
+    // the loser's is an orphan (never referenced by any model row), never a
+    // silently-clobbered or reused-by-name artifact.
+    let ready = session
+        .catalog()
+        .list_result_tables_by_status(jammi_db::catalog::status::ResultTableStatus::Ready)
+        .await
+        .unwrap();
+    let training_sets: Vec<_> = ready
+        .iter()
+        .filter(|t| t.kind == jammi_db::catalog::result_repo::ResultTableKind::TrainingSet)
+        .collect();
+    assert_eq!(
+        training_sets.len(),
+        2,
+        "both attempts must have materialised their OWN table: {:?}",
+        training_sets
+            .iter()
+            .map(|t| &t.table_name)
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(
+        training_sets[0].table_name, training_sets[1].table_name,
+        "the two attempts' tables must never share one name"
+    );
+}
+
+/// GA9 (issue #538): recomputing a `GraphTrainingSet` table over UNMOVED
+/// node/edge sources re-samples through the SAME shared core a fresh run
+/// uses and writes a byte-identical artifact — the descriptor records every
+/// sample determinant, so nothing about the replay can drift from the
+/// original.
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_training_set_recompute_is_byte_identical_over_unmoved_sources() {
+    use jammi_ai::pipeline::recompute::Cascade;
+
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+
+    let node_rows: Vec<(String, String)> = ["a0", "a1", "a2", "b0", "b1", "b2"]
+        .iter()
+        .map(|id| (id.to_string(), format!("document about topic {id}")))
+        .collect();
+    let node_url = write_csv(dir.path(), "nodes.csv", "id,text", &node_rows);
+    let edge_pairs = [
+        ("a0", "a1"),
+        ("a1", "a0"),
+        ("a1", "a2"),
+        ("a2", "a1"),
+        ("a0", "a2"),
+        ("a2", "a0"),
+        ("b0", "b1"),
+        ("b1", "b0"),
+        ("b1", "b2"),
+        ("b2", "b1"),
+        ("b0", "b2"),
+        ("b2", "b0"),
+        ("a0", "b0"),
+    ];
+    let edge_rows: Vec<(String, String)> = edge_pairs
+        .iter()
+        .map(|(s, d)| (s.to_string(), d.to_string()))
+        .collect();
+    let edge_url = write_csv(dir.path(), "edges.csv", "src,dst", &edge_rows);
+
+    session
+        .add_source(
+            "nodes",
+            SourceType::File,
+            SourceConnection {
+                url: Some(node_url),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    session
+        .add_source(
+            "edges",
+            SourceType::File,
+            SourceConnection {
+                url: Some(edge_url),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let sources = GraphFineTuneSources {
+        node_source: "nodes".into(),
+        id_column: "id".into(),
+        text_column: "text".into(),
+        edge_source: "edges".into(),
+        src_column: "src".into(),
+        dst_column: "dst".into(),
+        provenance: EdgeProvenance::Declared,
+    };
+    let sample = GraphSampleConfig {
+        walk_length: 3,
+        walks_per_node: 2,
+        hard_negatives: 1,
+        exclude_hops: 1,
+        min_negatives: 1,
+        seed: 11,
+        ..GraphSampleConfig::default()
+    };
+    let job = session
+        .fine_tune_graph(
+            &sources,
+            "local:/nonexistent/definitely-not-a-model",
+            sample,
+            Some(jammi_ai::fine_tune::FineTuneConfig::default()),
+        )
+        .await
+        .unwrap();
+    let _ = job.wait().await;
+
+    let ready = session
+        .catalog()
+        .list_result_tables_by_status(jammi_db::catalog::status::ResultTableStatus::Ready)
+        .await
+        .unwrap();
+    let training_set = ready
+        .iter()
+        .find(|t| t.kind == jammi_db::catalog::result_repo::ResultTableKind::TrainingSet)
+        .expect("the graph arm must materialise a TrainingSet-kind table");
+
+    let before_url = jammi_db::storage::StorageUrl::parse(&training_set.parquet_path).unwrap();
+    let before_digest = session
+        .result_store()
+        .read_materialization_manifest(&before_url)
+        .await
+        .unwrap()
+        .expect("manifest sidecar present")
+        .artifact
+        .0;
+
+    let report = jammi_ai::Session::new(Arc::clone(&session))
+        .recompute(&training_set.table_name, Cascade::ReportOnly)
+        .await
+        .unwrap();
+    assert_eq!(report.recomputed.len(), 1);
+    let replay = &report.recomputed[0];
+    assert_eq!(replay.original, training_set.table_name);
+    assert_ne!(
+        replay.recomputed, training_set.table_name,
+        "the replay must write a NEW table, not hand back the one it replayed"
+    );
+    assert_eq!(
+        replay.outcome,
+        jammi_db::store::CacheOutcome::Computed,
+        "an unpinned source anchor never matches the verb's reuse probe, so a replay always \
+         recomputes"
+    );
+
+    let after_record = session
+        .catalog()
+        .get_result_table(&replay.recomputed)
+        .await
+        .unwrap()
+        .expect("the replayed table exists");
+    let after_url = jammi_db::storage::StorageUrl::parse(&after_record.parquet_path).unwrap();
+    let after_digest = session
+        .result_store()
+        .read_materialization_manifest(&after_url)
+        .await
+        .unwrap()
+        .expect("manifest sidecar present")
+        .artifact
+        .0;
+    assert_eq!(
+        before_digest, after_digest,
+        "GA9: a replay over UNMOVED node/edge sources must be byte-identical to the original"
+    );
+}
+
 // ─── End-to-end: fine_tune_graph drives the real trainer ────────────────────
 
 /// Write a 2-column CSV to `dir/name` and return its `file://` URL.
@@ -469,35 +1348,35 @@ async fn fine_tune_graph_end_to_end_completes() {
         "graph fine-tune should publish an adapter, missing at {adapter:?}"
     );
 
-    // P3 (the graph-arm excision): this fixture's `reconstruct_graph_loader`
-    // is `origin/main` (fe5ac560)'s text, restored rather than re-derived, so
-    // it must produce `origin/main`'s BYTES too — not just its source.
-    // Measured, not assumed: this fixture's OWN body is byte-identical to
-    // `origin/main`'s (the `fingerprint()` helper and this `assert_eq!` are
-    // this pin's own additions, grafted onto that body to read the value
-    // out), and the value below is derived from code identity over the whole
-    // producing path — `reconstruct_graph_loader`, `run_spec`'s
-    // `GraphFineTune` arm, `graph_sampler.rs`, `trainer.rs`, `model/**`,
-    // `session.rs`, and `fine_tune/data.rs::TrainingFormat::from_graph` (the
-    // graph arm's sole entry point into that file; the rest of the file
-    // carries the tabular arm's own, unrelated additions) are byte-identical
-    // to `fe5ac560` — not by re-running an unmodified test on a separate
-    // checkout.
+    // This fixture's edge rows are NOT already in `(src, dst)` order, and
+    // `reconstruct_graph_loader` scans nodes/edges with an explicit
+    // `ORDER BY` (see that method's doc), so the exact physical row the
+    // sampler's first draw sees — and therefore the trained adapter's bytes
+    // — depends on that scan order, never on the source file's own row
+    // order (issue #538). This assertion pins the resulting bytes, so a
+    // regression of the ordering fix (or an unrelated change to the
+    // sampler/trainer) shows up here as a moved fingerprint.
     // The bytes are platform-specific (x86_64 Linux vs Apple Silicon float
-    // paths), so the pin carries one value per platform: Linux from the CI
-    // hermetic lane (identical across three runs), the other from the Apple
-    // Silicon host the fixture was first pinned on.
+    // paths), so the pin carries one value per platform: Linux measured
+    // inside the CI image (`ghcr.io/f-inverse/jammi-ai-ci`, `docker run
+    // --platform linux/amd64`, QEMU-emulated on the Apple Silicon
+    // implementer host — not native x86_64 hardware); the other measured
+    // natively on the Apple Silicon host GA1 was implemented on. A native
+    // x86_64 measurement disagreeing with the QEMU-measured value is NOT
+    // self-authorizing: re-pin it only via an explicit commit that states
+    // the old and new values and which run (native, real hardware) produced
+    // the new one — never a silent move on a CI run's say-so.
     let expected = if cfg!(target_os = "linux") {
-        "1184:a5ada07e134f0b21"
+        "1184:d923987b7592d7bd"
     } else {
-        "1184:8f34fc6e6f33abea"
+        "1184:7a8781df1cd80172"
     };
     assert_eq!(
         fingerprint(&std::fs::read(&adapter).unwrap()),
         expected,
-        "the graph fine-tune adapter's bytes moved off origin/main's (fe5ac560) value for this \
-         exact fixture — the excised graph arm is restored main's code producing main's bytes; a \
-         mismatch here means either this fixture or the sampler/trainer changed"
+        "the graph fine-tune adapter's bytes moved off the GA1 (issue #538) pinned value for \
+         this exact fixture; a mismatch here means the read-order rule, the sampler, or the \
+         trainer changed since GA1 was pinned"
     );
 }
 

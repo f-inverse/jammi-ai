@@ -107,6 +107,25 @@ workspace ships every publishable crate at the same
   ring read that comes back empty, or does not contain this process's own
   row, falls back to all-local and is counted
   (`jammi_placement_ring_empty_total`), never silent.
+- **`graph_fine_tune` materialises its sampled pairs as a training-set table
+  (#538).** The graph arm now reads its node/edge sources with an explicit
+  order (a duplicate node id is refused, typed, naming it) and materialises
+  the sampled `(anchor, positive, [hard_negative])` pairs through the same
+  producer funnel a tabular fine-tune's source projection uses — an
+  immutable, content-addressed `TrainingSet`-kind Parquet table
+  (`jammi_db::store::manifest::ProducingDescriptor::GraphTrainingSet`)
+  rather than an ephemeral in-memory sample, so `recompute` can replay it
+  and the sampler's resident adjacency/text is reserved against a named
+  memory consumer for its whole lifetime. The training format
+  (`graph_pairs`/`graph_triplet`) is decided from `graph_hard_negatives`
+  alone; an anchor whose entire candidate pool falls inside its own
+  `exclude_hops`-hop neighbourhood is refused, typed, naming the anchor,
+  rather than silently trained with no negative. A `Peer` (multi-host)
+  gang still does **not** admit a member against this table —
+  `world_size > 1` above `[worker] local_ranks` is refused, typed, naming
+  the reason (a member's committed-order read and the gang's
+  gradient-propagation proof are both unbuilt); `world_size == 1` and an
+  in-process `Local` gang (`world_size <= local_ranks`) are unaffected.
 - **Two-mode shutdown — SIGTERM = DRAIN, SIGINT = RELEASE — on the server,
   the Rust library and Python (#482).** A DRAIN finishes the in-flight job
   (every epoch bundle lands, `completed` under the same attempt), ends idle

@@ -52,10 +52,15 @@ task and format ONLY when the input anchors are equal AND pinned — the engine'
 source anchors as `UnpinnedAtInstant` and the cache probe short-circuits any unpinned anchor, so it
 is honestly always a miss. Whatever their world size, batch or validation fraction, two jobs over
 the same PLAIN source still each materialize their own table; reuse needs a pinned source.
-Input anchors are the source anchors. `GraphFineTune` does not go through this table: its seeded,
-deterministic sampled pairs (`crates/jammi-ai/src/fine_tune/graph_sampler.rs::GraphSampler::sample`)
-are sampled in memory and trained on directly; a graph training set's own table is
-https://github.com/f-inverse/jammi-ai/issues/538. Media blob columns are stored as today.
+Input anchors are the source anchors. `GraphFineTune` goes through the SAME funnel via a
+different `ProducingDescriptor::GraphTrainingSet` variant (issue #538, GRAPHARM): the worker
+re-reads the node/edge sources (ordered, `GRAPH_READ_ORDER_RULE_V1`), samples them
+(`crates/jammi-ai/src/fine_tune/graph_sampler.rs::GraphSampler::sample`), and materialises the
+sampled pairs as a `TrainingSet`-kind table through a `Batches` (`RecordBatch`-stream) producer
+input — the seam a query-shaped `source_sql` cannot serve, since the graph arm's rows are the
+output of a biased walk, not a query. The node/edge sources anchor `UnpinnedAtInstant`, exactly
+like the tabular arm's plain-source case, so a graph training set is never reused across runs
+either. Media blob columns are stored as today.
 
 **Split.** The job's `validation_fraction` defines the train prefix exactly as today
 (`crates/jammi-ai/src/fine_tune/data.rs::TrainingDataLoader::split`, the `TextRows` arm):
@@ -391,14 +396,24 @@ GradCache at `world_size > 1` (typed refusal in this plan); a sixth pluggable ba
 acceleration, issue #445, deferred indefinitely for Mac hardware); a GPU byte-equality claim
 before S5.
 
-**The v1 graph-gang limit.** A `graph_fine_tune` job samples its rows in memory and has no
-training-set table for a member to be admitted against, so a `Peer` gang cannot serve it: the
-coordinator refuses it, typed, at the coordinator's own edge (K2) before dispatch — never a
-silent single-rank run of a wider job (`crates/jammi-ai/src/fine_tune/worker.rs:3707`, the
-`TopologyDecision::Peer` match arm). Run it entirely on one host (`[worker] local_ranks >=
-world_size`, a `Local` gang) or resubmit with `world_size = 1`. Issue #538 carries the executed
-refutation of the materialised-graph-arm shape that would lift this limit and is the rebuild
-pointer for the next attempt.
+**The graph gang (issue #538, GRAPHARM, GA1–GA7, GA9).** A `graph_fine_tune` job now materialises
+its sampled pairs as a `GraphTrainingSet`-kind `TrainingSet` table through the `Batches` producer
+seam (§2), read-ordered and duplicate-id-refused like a real scan (GA1), format-decided from
+config rather than row content (GA3), reserved against a named `MemoryConsumer` for its sampler's
+resident lifetime (GA7), and replayable by `recompute` through the same shared
+sample-then-materialise function a fresh run calls (GA9). A `Peer` gang does **not** admit a
+member against this table (`world_size > 1` is still `Single`/`Local`-only for this kind):
+`run_spec`'s `TopologyDecision::Peer` arm refuses a `GraphFineTune` by name
+(`crates/jammi-ai/src/fine_tune/worker.rs::run_spec`) rather than dial a member, because a
+member's own rank body has no read path over the table in the SAME `_ordinal`-committed order
+rank 0 reads (a column-derived `ORDER BY`, the generic path the tabular arm's member takes, would
+partition a DIFFERENT row order of the identical rows), and no executed oracle proves the
+resulting per-rank shards combine into a correct all-reduced gradient over the graph arm's own
+loss. `Single` (`world_size == 1`) and in-process `Local` (`world_size <= [worker] local_ranks`)
+both work today and are pinned byte-for-byte against a reference
+(`crates/jammi-ai/tests/it/gang_coordinator.rs::a_local_ranks_two_host_fans_a_two_rank_job_out_through_run_spec_and_publishes_the_gangs_bytes`);
+`crates/jammi-server/tests/it/gang_coordinator.rs::graph_fine_tune_peer_gang_is_refused_by_name`
+proves the `Peer` refusal by its exact error text, not just by job status.
 
 ## 9. The Ballista extension (U8a, U8b)
 

@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 
 use super::backend::{BackendKind, SqlValue};
 use super::jobs_repo::WorkerState;
-use super::lease::stale_before_clause;
+use super::lease::{stale_before_clause, CanonicalStampColumn};
 use crate::error::{JammiError, Result};
 use crate::storage::{BuilderSeeds, Scheme, StorageUrl};
 
@@ -637,7 +637,13 @@ pub(crate) fn live_with_root_clause(
     root_identity_expr: &str,
     params: &mut Vec<SqlValue<'static>>,
 ) -> String {
-    let stale = stale_before_clause(&format!("{alias}.last_seen_at"), kind, margin, params);
+    let stale = stale_before_clause(
+        CanonicalStampColumn::InstancesLastSeenAt,
+        Some(alias),
+        kind,
+        margin,
+        params,
+    );
     format!(
         "{alias}.peer_addr IS NOT NULL AND {alias}.result_root_identity = ({root_identity_expr}) \
          AND NOT ({stale})"

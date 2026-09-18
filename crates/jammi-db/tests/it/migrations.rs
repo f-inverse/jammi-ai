@@ -2763,6 +2763,24 @@ const CANONICAL_STAMP_COLUMNS: &[(&str, &str)] = &[
     ("applied_migrations", "applied_at"),
 ];
 
+/// `stale_before_clause` compares a stamp column lexically, which is
+/// chronological only for a column the schema holds to the canonical shape.
+/// Every column it can be asked about is therefore one this migration
+/// enforces — the set the test below proves is installed exactly.
+#[test]
+fn every_column_stale_before_clause_accepts_is_schema_enforced() {
+    use jammi_db::catalog::lease::CanonicalStampColumn;
+    use strum::VariantArray;
+    for column in CanonicalStampColumn::VARIANTS {
+        assert!(
+            CANONICAL_STAMP_COLUMNS.contains(&column.table_and_column()),
+            "{column:?} is compared lexically by stale_before_clause but \
+             {:?} is not in the canonical-stamps enforcement set",
+            column.table_and_column()
+        );
+    }
+}
+
 /// Migration `039_canonical_stamps` (R5, `catalog::lease`'s pin sites) is
 /// ordered after `038_compute_cluster_state` (K5: relative position, never
 /// `.last()` — it names `compute_executors`, which `038` creates), and the

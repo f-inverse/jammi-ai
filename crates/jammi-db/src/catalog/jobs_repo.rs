@@ -41,7 +41,7 @@ use super::instance::{
 };
 use super::lease::{
     canonical_stamp_now, instance_liveness_margin, lease_deadline_expr, lease_expired_clause,
-    lease_live_clause, stale_before_clause,
+    lease_live_clause, stale_before_clause, CanonicalStampColumn,
 };
 use super::status::{JobExecution, JobStatus};
 use super::Catalog;
@@ -2221,8 +2221,13 @@ impl Catalog {
                         params.push(SqlValue::Text(ACCELERATION_REPORT_INLINE_EXECUTOR_DIED));
                         let terminal_bind = params.len();
                         let retire = retire_pending_report_clause(pending_bind, terminal_bind);
-                        let stale =
-                            stale_before_clause("i.last_seen_at", kind, margin, &mut params);
+                        let stale = stale_before_clause(
+                            CanonicalStampColumn::InstancesLastSeenAt,
+                            Some("i"),
+                            kind,
+                            margin,
+                            &mut params,
+                        );
                         params.push(SqlValue::TextOwned(running.clone()));
                         let running_bind = params.len();
                         params.push(SqlValue::TextOwned(inline_execution.clone()));
@@ -2798,7 +2803,13 @@ impl Catalog {
                 |tx| {
                     Box::pin(async move {
                         let mut params: Vec<SqlValue<'static>> = Vec::new();
-                        let stale = stale_before_clause("last_seen_at", kind, margin, &mut params);
+                        let stale = stale_before_clause(
+                            CanonicalStampColumn::InstancesLastSeenAt,
+                            None,
+                            kind,
+                            margin,
+                            &mut params,
+                        );
                         params.push(SqlValue::TextOwned(instance_id_owned));
                         let id_bind = params.len();
                         let sql = format!(
@@ -3193,7 +3204,13 @@ impl Catalog {
     pub async fn prune_instances(&self, stale_after: Duration) -> Result<usize> {
         let kind = self.backend().backend_kind();
         let mut params: Vec<SqlValue<'static>> = Vec::new();
-        let stale = stale_before_clause("last_seen_at", kind, stale_after, &mut params);
+        let stale = stale_before_clause(
+            CanonicalStampColumn::InstancesLastSeenAt,
+            None,
+            kind,
+            stale_after,
+            &mut params,
+        );
         let sql = format!("DELETE FROM instances WHERE {stale}");
         let deleted = self
             .backend()
@@ -3223,7 +3240,13 @@ impl Catalog {
         let admin = TenantBinding::is_admin_scope();
         let kind = self.backend().backend_kind();
         let mut params: Vec<SqlValue<'static>> = Vec::new();
-        let stale = stale_before_clause("updated_at", kind, retention, &mut params);
+        let stale = stale_before_clause(
+            CanonicalStampColumn::JobsUpdatedAt,
+            None,
+            kind,
+            retention,
+            &mut params,
+        );
         let terminal = JobStatus::terminal_sql_list();
         let tenant = self.current_tenant();
         let sql = if admin {

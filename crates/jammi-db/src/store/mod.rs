@@ -570,17 +570,12 @@ impl TrainingSetTable {
                 record.table_name, record.definition_hash, manifest.definition_hash
             )));
         }
-        let order_columns = match &manifest.descriptor {
-            ProducingDescriptor::TrainingSet { columns, .. } => columns.clone(),
-            other => {
-                return Err(JammiError::FineTune(format!(
-                    "TrainingSetTable::from_record: table '{}' carries a manifest descriptor \
-                     that is not TrainingSet (got {other:?}) — the row's recorded identity \
-                     does not match what this constructor expects, so its order columns \
-                     cannot be trusted",
-                    record.table_name
-                )));
-            }
+        let Some(order_columns) = manifest.descriptor.training_set_order_columns() else {
+            return Err(JammiError::FineTune(format!(
+                "TrainingSetTable::from_record: table '{}' carries a manifest descriptor that \
+                 is not a training set (got {:?}), so it records no committed order",
+                record.table_name, manifest.descriptor
+            )));
         };
         // Refuse an empty column list HERE, typed (#551), rather than
         // minting a `TrainingSetTable` whose later `relation()` call would
@@ -800,6 +795,46 @@ mod from_record_tests {
     /// never exercises the `other` arm and the `TrainingSet` arm's own
     /// columns were untouched — recorded here since the two tests do not
     /// both redden under every shape of this mutation. Reverted.
+    /// A graph-produced training set binds through the same constructor and
+    /// reads in its committed `_ordinal` order: the reader asks the descriptor
+    /// for the order, never which producer wrote the table.
+    #[test]
+    fn from_record_with_a_graph_training_set_descriptor_orders_by_its_ordinal() {
+        let descriptor = ProducingDescriptor::graph_training_set(
+            "nodes",
+            "edges",
+            "id",
+            "text",
+            "src",
+            "dst",
+            ModelTask::TextEmbedding,
+            "graph_pairs",
+            manifest::GraphSampleFields {
+                seed: 7,
+                walk_length: 4,
+                walks_per_node: 2,
+                return_p_bits: 1.0_f64.to_bits(),
+                in_out_q_bits: 1.0_f64.to_bits(),
+                hard_negatives: 0,
+                exclude_hops: 1,
+            },
+        );
+        let manifest = manifest_for(&descriptor);
+        let record = record_for("from-record-graph", manifest.definition_hash.as_str());
+
+        let table =
+            TrainingSetTable::from_record(record, &manifest, CacheOutcome::Computed).unwrap();
+
+        let sql = table.relation().unwrap().select_ordered();
+        assert!(
+            sql.ends_with(&format!(
+                "ORDER BY \"{}\" ASC NULLS FIRST",
+                manifest::GRAPH_TRAINING_SET_ORDINAL_COLUMN
+            )),
+            "a graph training set reads in its committed ordinal order: {sql}"
+        );
+    }
+
     #[test]
     fn from_record_with_a_non_training_set_descriptor_refuses_typed() {
         let descriptor = ProducingDescriptor::Inference {
@@ -3848,19 +3883,12 @@ impl ResultStore {
             );
             return Ok(None);
         };
-        match manifest.descriptor {
-            ProducingDescriptor::TrainingSet { columns, .. } => {
-                Ok(Some(training_set_file_sort_order(&columns)))
-            }
-            // Issue #538: every graph training-set table is written with a
-            // leading `_ordinal` column, no full-tuple sort — declare it the
-            // same way, so a read-back plans no `SortExec` here either.
-            ProducingDescriptor::GraphTrainingSet { .. } => {
-                Ok(Some(training_set_file_sort_order(&[
-                    manifest::GRAPH_TRAINING_SET_ORDINAL_COLUMN.to_string(),
-                ])))
-            }
-            other => {
+        match manifest.descriptor.training_set_order_columns() {
+            // Declared as the file's own sort order, so a read-back in
+            // committed order plans no `SortExec`.
+            Some(columns) => Ok(Some(training_set_file_sort_order(&columns))),
+            None => {
+                let other = &manifest.descriptor;
                 warn!(
                     table = record.table_name,
                     descriptor = ?other,

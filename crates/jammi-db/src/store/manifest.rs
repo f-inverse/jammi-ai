@@ -1209,6 +1209,20 @@ impl ProducingDescriptor {
         }
     }
 
+    /// The columns a training-set table was committed in order of, or `None`
+    /// for a descriptor that is not a training set. Producers are plural; the
+    /// reader is one: everything that reads a training set asks this, never
+    /// which producer wrote it.
+    pub fn training_set_order_columns(&self) -> Option<Vec<String>> {
+        match self {
+            Self::TrainingSet { columns, .. } => Some(columns.clone()),
+            Self::GraphTrainingSet { .. } => {
+                Some(vec![GRAPH_TRAINING_SET_ORDINAL_COLUMN.to_string()])
+            }
+            _ => None,
+        }
+    }
+
     /// Canonical bytes for hashing: a JSON encoding with object keys sorted, so
     /// the byte stream is independent of struct field declaration order and
     /// stable across serde versions. Pure; no I/O.

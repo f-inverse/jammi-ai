@@ -2,6 +2,7 @@
 
 [Introduction](./introduction.md)
 [Design Philosophy](./philosophy.md)
+[Engineering Principles](./engineering.md)
 
 # Getting Started
 

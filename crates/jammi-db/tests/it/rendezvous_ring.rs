@@ -352,19 +352,34 @@ async fn plan_arms_local_when_self_is_the_only_ring_member(kind: BackendKind) {
 /// measured cost at each scale). Live only (requires `JAMMI_TEST_PG_URL`;
 /// skips, never fails, otherwise) — this is a COST measurement, not a
 /// correctness oracle (those are the tests above), so it prints the
-/// measured milliseconds and asserts a 20 ms budget. Over 5 repeated runs
+/// measured milliseconds and asserts a HOST-RELATIVE bound: at each scale
+/// the ring read may cost at most four times a plain transfer of the same
+/// number of `(instance_id, peer_addr)` rows through this test's own pool
+/// (plus a 2 ms floor for sub-millisecond noise), measured in the same
+/// process seconds apart. That isolates what this measurement is about —
+/// the predicate and plan cost RV3/RV6 changed — from wire transfer and
+/// per-row decode, which scale with the ring size AND the host (an absolute
+/// budget calibrated on one host tripped on a shared CI runner at 24.9 ms
+/// for a read this host does in ~10 ms). Measured here over 3 repeated runs
 /// (a warmed connection, isolating the query's own cost from a process's
-/// first-connection handshake): ~3.9-5.0 ms at 101 rows, ~10.2-10.9 ms at
-/// 10,101 rows (`EXPLAIN` shows a Seq Scan — see `RendezvousPlacement`'s
+/// first-connection handshake): 2.1-2.8 ms at 101 rows against a 0.40-0.59 ms
+/// transfer of the same 51 rows — the ring read is ~5x the transfer at that
+/// size because the fixed per-statement cost (planning plus the root
+/// InitPlan) dominates, which is what the 2 ms floor is for; 8.6-8.9 ms at
+/// 10,101 rows against a 6.8-7.1 ms transfer of the same 5,051 rows (1.2-1.3x:
+/// past the fixed cost, the read IS the transfer). Earlier captures on this
+/// host measured ~10.2-10.9 ms at 10,101 rows (`EXPLAIN` shows a Seq Scan — see `RendezvousPlacement`'s
 /// doc for why, and why the remaining cost past the scan itself is the
 /// 5,051-row result transfer, not the scan or the transaction wrapper this
 /// read no longer pays at all). The 50 %-root-sharing 10k-row shape is a
 /// deliberately ADVERSARIAL stress fixture (a fleet that let `instances`
 /// bloat with thousands of unpruned rows sharing one root), never the
-/// realistic ring size this placement is sized for, so the budget is a
-/// bound on that pathological shape (under 2x headroom there), not a
-/// headroom multiple over the realistic one (which the 101-row number
-/// already covers with room to spare).
+/// realistic ring size this placement is sized for, so the bound is stated
+/// on that pathological shape, not on the realistic one (which the 101-row
+/// number already covers with room to spare). A regression that made the
+/// predicate expensive per row (a correlated subplan, a non-sargable
+/// rewrite that forces a function call per row) moves the ring read but
+/// not the baseline transfer, and fails here by name.
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn ring_read_cost_is_measured_at_100_and_10k_instance_rows() {
@@ -469,10 +484,30 @@ async fn ring_read_cost_is_measured_at_100_and_10k_instance_rows() {
             ring.iter().any(|m| m.instance_id == self_id),
             "self must still be in the ring at {cumulative_instances} cumulative rows"
         );
+        // Host-relative bound: a plain transfer of the same number of rows,
+        // same two columns, through this test's own (warm) pool. Everything
+        // the ring read pays beyond this is the predicate and the plan.
+        let baseline_start = std::time::Instant::now();
+        let baseline: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT instance_id, peer_addr FROM instances WHERE peer_addr IS NOT NULL LIMIT $1",
+        )
+        .bind(ring.len() as i64)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let baseline_elapsed = baseline_start.elapsed();
+        assert_eq!(baseline.len(), ring.len(), "the baseline transfers exactly the ring's row count");
+        let bound = baseline_elapsed * 4 + Duration::from_millis(2);
+        eprintln!(
+            "RENDEZVOUS RV6: plain transfer of {} rows took {baseline_elapsed:?}; bound {bound:?}",
+            baseline.len()
+        );
         assert!(
-            elapsed < Duration::from_millis(20),
-            "RV6 budget: the ring read at {cumulative_instances} cumulative instances rows took \
-             {elapsed:?}, over the stated 20 ms budget on the scratch host"
+            elapsed <= bound,
+            "RV6 bound: the ring read at {cumulative_instances} cumulative instances rows took \
+             {elapsed:?}, more than four times (+2 ms) a plain transfer of the same {} rows on this \
+             host ({baseline_elapsed:?}) — the predicate or the plan regressed, not the host",
+            baseline.len()
         );
     }
 

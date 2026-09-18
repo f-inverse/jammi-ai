@@ -574,16 +574,19 @@ impl RendezvousMetrics {
 /// ring: a real ring is bounded by one deployment's own live replica count
 /// (single- to low-double-digit in practice), which the 101-row/51-candidate
 /// measurement (~4-5 ms, dominated by the one-round-trip floor, not by row
-/// count) already over-covers. The stated 20 ms budget is therefore not
-/// "an order of magnitude of headroom" over the measured number — at 10k
-/// adversarial rows it is under 2x — but it is a deliberate bound on a
-/// fleet that has accumulated thousands of long-dead, unpruned `instances`
-/// rows still sharing one root (a real but pathological shape
-/// `Catalog::prune_instances` exists to prevent), not on the realistic
-/// operating point this ring is sized for. Exceeding the budget at a
-/// REALISTIC ring size is a regression; exceeding it only in the
-/// adversarial 10k-row shape means `Catalog::prune_instances` has not run —
-/// an operational fact, not this predicate's own cost.
+/// count) already over-covers. The cost test's bound is therefore stated
+/// relative to the host, not as an absolute budget: at each scale the ring
+/// read may cost at most four times a plain transfer of the same number of
+/// `(instance_id, peer_addr)` rows through the same process's pool, plus a
+/// 2 ms floor — an absolute budget calibrated on one host (20 ms, under 2x
+/// over this host's ~10.5 ms) tripped on a shared CI runner at 24.9 ms with
+/// no change to the predicate at all. A regression that makes the predicate
+/// or the plan expensive per row moves the ring read and not the baseline
+/// transfer, and fails the bound by name; a fleet that has accumulated
+/// thousands of long-dead, unpruned `instances` rows still sharing one root
+/// (a real but pathological shape `Catalog::prune_instances` exists to
+/// prevent) moves both, and is an operational fact, not this predicate's
+/// own cost.
 #[derive(Clone)]
 pub struct RendezvousPlacement {
     catalog: Arc<Catalog>,

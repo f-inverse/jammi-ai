@@ -8,6 +8,9 @@ CI scripts, docs — and a change that satisfies a test while breaking one of th
 
 Nothing that exists is a constraint. When a design turns out not to generalise, the existing
 code is broken down and rebuilt the way it should have been — it is never worked around.
+There is no backwards compatibility to keep: no shims, no deprecated paths, no `#[deprecated]`,
+no `_unused` renames, no compatibility re-exports, no "keep the old way around". If something
+needs to change, it changes everywhere, in one change.
 
 The shape to watch for is a second path beside the first. If a capability works on one route
 and needs a special case, a flag, or a refusal on another, the first route was the wrong
@@ -27,22 +30,56 @@ Derive the answer; do not pick by taste or by what is least work.
 
 A design that needs many rounds to defend is usually answering the wrong question.
 
-## Functional by default
+## Code principles
 
+These apply to every line. No exceptions, and no "we'll clean it up later."
+
+### Clean, functional style
+
+- Favor composition over inheritance.
+- Iterators, combinators and pattern matching over imperative loops.
+- Prefer pure functions — inputs in, outputs out, no side effects where avoidable.
 - **Separate deciding from doing.** A decision — a plan, a topology, an order, a view of a
   spec — is a pure function of data, testable without I/O. The code that acts on it is a thin
   shell. A function that both decides and acts gets split.
-- **One concept, one home (DRY).** Before adding a second match, helper, or arm, find the first
-  and generalise it. Producers may be plural; the reader is singular. This holds for tests:
-  a shared fixture lives once, never pasted per crate.
-- **Boundaries are types, not comments.** If a caller must not reach something, make it
-  unreachable or unrepresentable. A rule stated in a doc comment and kept by review is a rule
-  that will be broken. Callers consume a small value that says what they need, rather than
-  matching on the variants of a large enum they do not own.
-- **Separation of concerns is measured in files too.** A source file that needs a table of
-  contents is several modules. Split along the seam a change exposes rather than adding to it.
-- **Comments describe the code**, for the next reader — not the review, incident, or
-  discussion that produced it. That history belongs in the commit message.
+- `Result` propagation (`?`) over panics. `unwrap()` only in tests.
+
+### Clear boundaries and separation of concerns
+
+- Every module has one responsibility. If you can't state it in one sentence, split it. A
+  source file that needs a table of contents is several modules.
+- Traits define boundaries. Concrete types live behind traits at module edges.
+- No module reaches into another module's internals. Public API only.
+- Lifecycle (load / cache / evict) and execution (infer / batch / adapt) are separate
+  concerns — never mixed.
+- Callers consume a small value that says what they need, rather than matching on the
+  variants of a large enum they do not own.
+
+### DRY
+
+- If logic appears twice, extract it. No copy-paste code — in tests and fixtures too: a
+  shared fixture lives once, never pasted per crate.
+- Shared behaviour goes into traits or functions, not duplicated match arms. Before adding a
+  second arm or helper, find the first and generalise it. Producers may be plural; the reader
+  is singular.
+- Configuration constants live in one place.
+
+### Type-driven design
+
+- Newtypes (`ModelId`, `GpuPermit`) make invalid states unrepresentable. If a caller must not
+  reach something, make it unreachable — a rule kept by a doc comment and review is a rule
+  that will be broken.
+- Enums over stringly-typed parameters.
+- RAII for resources: permits, guards, connections.
+- A builder where construction takes more than three parameters.
+
+### Tests, comments and docs
+
+- Default `cargo test` is fully hermetic: no live network calls. Live tests sit behind a
+  feature (`live-hub-tests` and its siblings).
+- Comments describe the code, for the next reader — not the review, incident or discussion
+  that produced it. That history belongs in the commit message.
+- Docs describe the system as it is, not the journey: no "added in PR #N", no "since v0.2".
 
 ## Invariants every change keeps
 
@@ -71,6 +108,18 @@ In order of strength. Reach for the highest one that fits.
    polices how the work was done does not belong in CI.
 4. **Review**, for what nothing above can hold. Say so plainly where that is the case, so the
    gap is visible rather than assumed covered.
+
+## Before calling a change done
+
+- [ ] No duplicated logic introduced
+- [ ] Every new public type or trait has one clear responsibility
+- [ ] No module reaches into another module's internals
+- [ ] No temporary APIs, compatibility shims, or refusals standing in for a capability
+- [ ] New interfaces are downstream-driven — only what callers need
+- [ ] Each test is in the right category (unit / contract / integration / live), and each new
+      one has been seen to fail
+- [ ] `cargo fmt` and `cargo clippy -- -D warnings` pass — `ci/dev.sh` runs them as CI does
+- [ ] The code reads as idiomatic Rust, not translated Java or Python
 
 More checks are not more enforcement. Every check is code someone must maintain and every
 contributor must pass; add one when it protects something, and delete it when it no longer does.

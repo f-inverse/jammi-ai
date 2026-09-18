@@ -36,7 +36,7 @@
 //! **Cancellation.** `Catalog::cancel_request` ends a job no worker has
 //! claimed at once (`queued -> cancelled`) and flags a running one
 //! (`jobs.cancel_requested`), which its executor ends `cancelled` through the
-//! lease-guarded `Catalog::cancel_job`. [`UnsuccessfulEnd`] decides `failed`
+//! lease-guarded `Catalog::cancel_job`. `UnsuccessfulEnd` decides `failed`
 //! versus `cancelled` from the executor's typed error.
 //! The COMPUTE executor observes the flag at three checkpoint boundaries — after
 //! the claim ([`crate::session::InferenceSession::run_now`],

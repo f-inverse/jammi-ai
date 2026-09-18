@@ -577,12 +577,16 @@ impl RendezvousMetrics {
 /// count) already over-covers. The cost test's bound is therefore stated
 /// relative to the host, not as an absolute budget: at each scale the ring
 /// read may cost at most four times a plain transfer of the same number of
-/// `(instance_id, peer_addr)` rows through the same process's pool, plus a
+/// `(instance_id, peer_addr)` rows through the test's own pool in the same
+/// process, plus a
 /// 2 ms floor — an absolute budget calibrated on one host (20 ms, under 2x
 /// over this host's ~10.5 ms) tripped on a shared CI runner at 24.9 ms with
 /// no change to the predicate at all. A regression that makes the predicate
-/// or the plan expensive per row moves the ring read and not the baseline
-/// transfer, and fails the bound by name; a fleet that has accumulated
+/// or the plan expensive per candidate row (an index probe per row or worse)
+/// moves the ring read and not the baseline transfer, and fails the bound by
+/// name; sargability of the liveness conjunct is guarded separately by the
+/// `EXPLAIN` oracle in `catalog/lease.rs`, not by this bound; a fleet that
+/// has accumulated
 /// thousands of long-dead, unpruned `instances` rows still sharing one root
 /// (a real but pathological shape `Catalog::prune_instances` exists to
 /// prevent) moves both, and is an operational fact, not this predicate's

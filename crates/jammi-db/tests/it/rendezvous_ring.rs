@@ -376,10 +376,16 @@ async fn plan_arms_local_when_self_is_the_only_ring_member(kind: BackendKind) {
 /// bloat with thousands of unpruned rows sharing one root), never the
 /// realistic ring size this placement is sized for, so the bound is stated
 /// on that pathological shape, not on the realistic one (which the 101-row
-/// number already covers with room to spare). A regression that made the
-/// predicate expensive per row (a correlated subplan, a non-sargable
-/// rewrite that forces a function call per row) moves the ring read but
-/// not the baseline transfer, and fails here by name.
+/// number already covers with room to spare). What this bound catches is a
+/// regression that makes the predicate expensive per candidate row on the
+/// order of an index probe per row (a correlated subplan, ~1-10 µs/row
+/// against a detection threshold of ~2 µs/row here and ~3.5 µs/row on the
+/// CI image): it moves the ring read but not the baseline transfer, and
+/// fails here by name. It does NOT catch a lost sargable rewrite — the cast
+/// form costs ~0.4 µs/row (measured in `lease.rs`'s own oracle), ~4 ms at
+/// this scale, inside the headroom; sargability is guarded by
+/// `stale_before_clause_postgres_is_sargable_and_agrees_with_the_cast_form`
+/// (`crates/jammi-db/src/catalog/lease.rs`), which asserts the plan shape.
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn ring_read_cost_is_measured_at_100_and_10k_instance_rows() {

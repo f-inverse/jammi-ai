@@ -7,6 +7,14 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### BREAKING
+- **A cancelled job ends `cancelled`, not `failed` (#515).** `cancelled` is a terminal job
+  status. A cancel on a job no worker has claimed ends it at once, with no attempt spent; a
+  running job is flagged and its executor ends it `cancelled` at its next checkpoint. `wait()`
+  returns the typed `JammiError::JobCancelled` (gRPC `CANCELLED`) where it returned a generic
+  failure; the Python clients raise the new `jammi.JobCancelled` on both transports (it refines
+  `RuntimeError`, as `TrainingError` does). Code that treated `failed` as the only unsuccessful
+  terminal status must also handle `cancelled`. New: `Catalog::cancel_job`,
+  `JobRecord::unsuccessful_error`.
 - **`jammi_db::storage::build_object_store` and `StorageRegistry::driver_for` are no
   longer public (#588).** No crate outside `jammi-db` can obtain a raw
   `Arc<dyn ObjectStore>` from the registry or the builder; `JammiObjectStore::{new, open,

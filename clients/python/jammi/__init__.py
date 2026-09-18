@@ -41,6 +41,7 @@ from .errors import (
     NoEmbeddedEngineError,
     NotSupportedOnBackend,
     PlatformNotInstalledError,
+    JobCancelled,
     TrainingError,
 )
 
@@ -70,6 +71,7 @@ __all__ = [
     "NotSupportedOnBackend",
     "NoEmbeddedEngineError",
     "PlatformNotInstalledError",
+    "JobCancelled",
     "TrainingError",
     "BackendError",
     # Credentials + targets.

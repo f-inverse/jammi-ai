@@ -2110,7 +2110,7 @@ async fn wait_job_streams_to_exactly_one_terminal_frame() {
 /// keeper renews at — fires well inside this test's own time budget, with no
 /// park-point hook needed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn training_job_cancel_reports_failed_with_the_cancel_message_over_the_wire() {
+async fn training_job_cancel_reports_cancelled_with_the_cancel_message_over_the_wire() {
     use jammi_server::grpc::proto::job::{job_event::Event, CancelJobRequest, JobHandle};
     use jammi_server::grpc::proto::training::FineTuneConfig;
 
@@ -2181,15 +2181,15 @@ async fn training_job_cancel_reports_failed_with_the_cancel_message_over_the_wir
     }
     let terminal = terminal.expect("wait_job must reach a terminal Done frame");
     assert_eq!(
-        terminal.status, "failed",
-        "a cancelled training job must land `failed`, got '{}' (error: {})",
+        terminal.status, "cancelled",
+        "a cancelled training job must land `cancelled`, got '{}' (error: {})",
         terminal.status, terminal.error
     );
     assert!(
         terminal
             .error
             .contains("cancelled at the executor's request checkpoint"),
-        "the failure message must be JammiError::JobCancelled's faithful text, got: {}",
+        "the row's error must be JammiError::JobCancelled's faithful text, got: {}",
         terminal.error
     );
 

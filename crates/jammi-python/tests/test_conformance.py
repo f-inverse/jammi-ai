@@ -1240,6 +1240,40 @@ def test_failed_job_wait_raises_training_error_on_both_raise_sites():
     assert client_errors.TrainingError is jammi.TrainingError
 
 
+def test_cancelled_job_wait_raises_job_cancelled_not_training_error():
+    """Tier B (converter-level) — a cancelled job's `wait()` raises
+    `jammi.errors.JobCancelled` on both transports, distinct from a failure.
+
+    Converter-level for the reason the failed-job test above gives. The REMOTE
+    raise-site is driven through a stubbed `JobStatus` of `cancelled`; the
+    EMBEDDED raise-site (`JobRecord::unsuccessful_error` →
+    `JammiError::JobCancelled` → `to_pyerr`) raises the same class object,
+    imported from `jammi.errors`."""
+    from jammi._generated.jammi.v1 import job_pb2
+
+    class _CancelledJobStub:
+        def JobStatus(self, *_args, **_kwargs):
+            return job_pb2.JobStatusResponse(status="cancelled", error="job 'job-1' cancelled")
+
+    job = jammi.RemoteJob(
+        _CancelledJobStub(), (), job_id="job-1", kind="fine_tune", output_model_id="model-1"
+    )
+    with pytest.raises(jammi.JobCancelled) as info:
+        job.wait()
+    assert type(info.value) is jammi.JobCancelled
+    assert "job-1" in str(info.value)
+
+    # The end a caller asked for is not a fault: `except TrainingError` must not
+    # swallow it, while `except JammiError` / `except RuntimeError` still catch
+    # any unsuccessful job.
+    assert not issubclass(jammi.JobCancelled, jammi.TrainingError)
+    assert issubclass(jammi.JobCancelled, jammi.JammiError)
+    assert issubclass(jammi.JobCancelled, RuntimeError)
+    from jammi import errors as client_errors
+
+    assert client_errors.JobCancelled is jammi.JobCancelled
+
+
 def test_empty_training_set_refusal_over_recompute_is_invalid_argument_on_both_transports():
     """Tier B (converter-level) — the K2 refusal of an EMPTY training set, WHEN
     IT SURFACES OVER THE `Recompute` RPC (`grpc/pipeline.rs:139`,

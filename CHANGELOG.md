@@ -405,11 +405,6 @@ workspace ships every publishable crate at the same
   now accepts either the value inline or `{ file = "…" }` naming a file to read
   at load (env spelling: `JAMMI_<PATH>__FILE=/path`); a resolved secret renders
   as `Secret(***)` everywhere, including `Debug` — see `### Changed` for the
-- **A fine-tune's `definition_hash` folds the kernel-admission profile (#546).** The
-  profile renders, per probed op, whether the job's build features, admission mode and
-  `JAMMI_KERNELS_DISABLE` set (resolved at the job's `backbone_dtype` class) admit the
-  fused kernel; two runs whose admission genuinely differs now hash differently. Existing
-  fine-tune outputs re-materialize once under `cache = Use` after upgrading.
   `storage.cloud.{s3,r2,gcs,azure}` credential fields' retype.
   `signing_key.file` reads the
   audit master key from a file (re-read on every signing request, so a rotated
@@ -421,6 +416,11 @@ workspace ships every publishable crate at the same
   workspace — and the new `docs_toml_fences_parse_under_the_real_loader`
   guide-fence test — is hermetic and process-env-free. `ci.yml`'s `HF_TOKEN`
   is live (previously set but unused by any Hub call site).
+- **A fine-tune's `definition_hash` folds the kernel-admission profile (#546).** The
+  profile renders, per probed op, whether the job's build features, admission mode and
+  `JAMMI_KERNELS_DISABLE` set (resolved at the job's `backbone_dtype` class) admit the
+  fused kernel; two runs whose admission genuinely differs now hash differently. Existing
+  fine-tune outputs re-materialize once under `cache = Use` after upgrading.
 - **Lead-gate relay proposal: probe the fix, not just the class (esc-097, `docs/plans/63-how-well/proposals/esc-097-probe-the-fix.md`).** A relay's `probe` array could satisfy the existing coverage/proactivity conjunction (esc-064) entirely within the ORIGINAL finding's neighbourhood, never once looking at what a re-dispatched fix actually changed — six consecutive adversarial-audit BLOCKs landed on one evolving mechanism, each on the previous fix's own new surface. The proposal (human-applies; `.claude/hooks/**` stays agent-write-denied) adds R3: a lead-written `fix_head`, a hook-computed `fix_changed` window (`git diff --name-only -z <block> <fix_head>`, one of the module's four narrowly-scoped git subprocesses per decision, each bounded by a real timeout with no pipe to drain, all four sharing ONE per-decision monotonic budget (`_GIT_BUDGET_S = 5.0`), armed ONLY on a repeat dispatch — never a first dispatch, for exactly one targeted unit per decision, a prompt naming more than one open BLOCK of the same type denying outright instead), and a requirement that at least one probed path be a real member of that window. Reachability binds TWO things: the relay's own `unit_branch` must `slugify()` to this BLOCK's own `unit_slug` (the NAME, git-free — an `UNBOUND`-bucket row is never satisfiable this way), and `fix_head` must be an ancestor of that same branch's resolved tip (`git merge-base --is-ancestor`, the POSITION — closing a round-3 gap where a relay naming the right unit's branch could still cite an amended-away or unrelated-branch `fix_head`). An adversarial-audit BLOCK closes only via a same-type PASS after a relay that passed R3, or the documented `rm` — there is no cross-type clearing arm. `ci/scripts/check_lead_gate.py` ships the fixtures (G20-G38) RED against the current hook, self-test-guarded to report that arm SKIPPED until the patch files land.
 - **LoRA fine-tuning for the CLIP-text, OpenCLIP-vision and HTSAT-CLAP audio towers (#421).** All
   three carry LoRA sites on the same `jammi_lora::MaybeLoraLinear` seam the BERT family uses,

@@ -4168,9 +4168,12 @@ impl JobWorker {
                     // Refused, typed, at the coordinator's edge (K2) — never
                     // a silent single-rank run of a wider job. The graph arm
                     // DOES materialise a real `GraphTrainingSet` table now
-                    // (GA1-GA7, GA9), so a Peer member CAN bind it exactly
-                    // like the tabular arm's `TrainingSet`; what is missing
-                    // is a proof that binding is sound at world > 1.
+                    // (GA1-GA7, GA9), but a member's bind path
+                    // (`bind_recorded_training_set` →
+                    // `TrainingSetTable::from_record`) refuses a
+                    // `GraphTrainingSet` descriptor, typed, so a member
+                    // cannot bind this table at all yet — and even once it
+                    // could, (1) and (2) below remain unbuilt.
                     // Attempted and blocked twice by execution, not by
                     // inspection: (1) a member's own rank body currently
                     // has no path that reads the table in the SAME
@@ -9382,7 +9385,7 @@ fn validate_backbone_precision(
 // — disabled, `DomainMiss`, and `CapabilityMiss` alike — into the SAME
 // thread-local probe-capture sink `admit_inner` uses
 // (`record_probe_miss(op, predicate_name)`,
-// `crates/jammi-kernels/src/admission.rs:432,441`), not just an atomic
+// `crates/jammi-kernels/src/admission.rs:432,442`), not just an atomic
 // increment on `CascadeDispatchCounters`. [`flash_report`] reads that entry
 // back through `jammi_kernels::admission::probe_capture_reason_for(window,
 // "attention_block_flash")` on a decline, exactly the way
@@ -11068,7 +11071,7 @@ mod tests {
 
     /// Issue #462/#463 follow-up: `admit_cascade`'s decline path now records
     /// `(op, predicate)` into the SAME probe-capture window `admit_inner`
-    /// uses — `record_probe_miss(op, predicate_name)` (`crates/jammi-kernels/src/admission.rs:432,441`), which is what
+    /// uses — `record_probe_miss(op, predicate_name)` (`crates/jammi-kernels/src/admission.rs:432,442`), which is what
     /// lets [`flash_cascade_decline_reason`] — the function [`flash_report`]
     /// itself calls on a decline — read a verbatim reason back for the
     /// `"attention_block_flash"` cascade key instead of the coarse

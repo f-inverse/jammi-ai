@@ -1385,7 +1385,8 @@ mod rs5_source_oracle {
 /// `persisted_checkpoint == merged_batches.len()` would hold at a
 /// trivial `1 == 1`, proving nothing about cross-partition merging. This
 /// fixture measures `persisted_checkpoint = 3, merged_batches.len() = 3`
-/// (asserted below alongside the property, not silently assumed).
+/// (the assertions below pin `merged_batches.len() > 1` and the equality,
+/// not the literal 3).
 #[tokio::test]
 async fn rs8_checkpoint_counts_the_merged_batches_under_partitions_two() {
     let dir = TempDir::new().unwrap();

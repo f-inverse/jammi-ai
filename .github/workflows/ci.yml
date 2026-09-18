@@ -1864,7 +1864,8 @@ jobs:
           # arm 1b): the argument-validation arm and the real, unmocked
           # `os.chroot` exit-code contract (EPERM as non-root; a genuine
           # chroot success as root, from THIS gate's own privilege level —
-          # never hardcoded), no jail, no CUDA binary, no network.
+          # never hardcoded), no cu12 jail and no CUDA binary (the root arm
+          # builds a trivial loader-only jail), no network.
           - name: cu12 jail-trace driver suite
             cmd: python3 ci/scripts/test_jail_trace.py
           # Completeness tripwire for this very guard class: every

@@ -1049,7 +1049,7 @@ def self_test() -> int:
     )
     # Positive control: a genuinely CPU-only lane (its OWN cargo_features,
     # `jetstream-broker`, maps to an empty feature spec on jammi-server --
-    # reaches jammi-kernels at all) with no `capabilities` block must stay
+    # never reaches jammi-kernels at all) with no `capabilities` block must stay
     # clean.
     capability_less_and_clean = {
         "cpu-tarball": {"package": "jammi-server", "cargo_features": ["jetstream-broker"]},

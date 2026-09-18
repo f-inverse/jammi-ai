@@ -299,10 +299,11 @@ fn assert_batches_are_ordinal_sorted(
 /// Everything [`ResultStore::materialize_training_set`] needs to identify and
 /// build one training set.
 ///
-/// Every field here except `device` and `inputs` is a **determinant of the
-/// table's identity**; `descriptor` IS that identity (folded into the
+/// `descriptor` IS the **table's identity** (folded into the
 /// [`DefinitionHash`] directly) and `device` folds
-/// into the [`MaterializationEnv`] the hash also covers. `inputs` is not part
+/// into the [`MaterializationEnv`] the hash also covers; `source_id`,
+/// `input`, `columns` and `task` drive production and validation and reach
+/// the hash only insofar as the caller mirrors them into `descriptor`. `inputs` is not part
 /// of the hash — the definition is *how* a table is produced, the anchors are
 /// *over what* — but it IS the other half of the
 /// reuse key: [`ResultStore::materialize_training_set`] reuses a table only

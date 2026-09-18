@@ -851,7 +851,7 @@ pub enum ProducingDescriptor {
     /// see [`MaterializationEnv::kernel_admission_profile`]'s own doc for
     /// what is and is not folded. **Residual, not fixed here:** every OTHER
     /// model-invoking producer (`Self::Embedding`/`Self::Inference` —
-    /// e.g. `jammi-ai`'s `pipeline::embedding::EmbeddingPipeline::run`,
+    /// e.g. `jammi-ai`'s `pipeline::embedding::embedding_definition`,
     /// `pipeline/embedding.rs:47`) still builds its `MaterializationEnv`
     /// with `kernel_admission_profile: None`; this field is populated ONLY
     /// for `FineTune` today, so any admission-gated dispatch those other

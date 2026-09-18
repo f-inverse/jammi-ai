@@ -36,7 +36,7 @@
 //! **Residual, stated rather than covered**: no gate in this tree examines a feature literal
 //! placed in an arbitrary workflow SCALAR — a `build-args:` value, a `--features=<list>` or
 //! `-F <list>` invocation, a `workflow_call`/composite-action `inputs.*.default`, or any
-//! non-canonical key shape. The eight places `jammi-server`'s feature list is actually read
+//! non-canonical key shape. The nine places `jammi-server`'s feature list is actually read
 //! from the manifest today are:
 //! `cpu-wheel`, .github/workflows/pypi-server.yml:75;
 //! `cu12-wheel`, .github/workflows/pypi-server-cuda.yml:83;

@@ -3240,7 +3240,7 @@ def fixture_r12phase_slow_attack_does_not_exhaust_next_git_phase() -> None:
     # attack plus ordinary git-call overhead, comfortably below any
     # budget that would indicate the NEXT phase inherited the attack's
     # own exhausted clock.
-    _assert(elapsed < 10.0, "R12phase",
+    _assert(elapsed < 10.0 * _R12_TIMEOUT_SCALE, "R12phase",
             f"the dispatch took {elapsed:.2f}s — the attack phase must not exhaust the "
             "following git-call phase's own freshly-minted budget")
 
@@ -4294,8 +4294,8 @@ def _r12_sweep_worker(task: tuple[tuple[int, int], str, tuple[str, ...], int]) -
     `_r12_run_fixture_subset_against`'s own `finally: HOOKS_DIR = real_
     hooks_dir` restore, which runs after EVERY call regardless of process
     reuse (proved directly by `R12sweepworker`, run from `--r12-sweep`:
-    two sequential calls to this function, in one process, where the
-    second's result is checked against its OWN mutant).
+    three sequential calls to this function, in one process, where the
+    second's and third's results are each checked against their OWN mutant).
 
     A `ProcessPoolExecutor` worker can be torn down via
     `os._exit()` by multiprocessing's own internals (pool shutdown,

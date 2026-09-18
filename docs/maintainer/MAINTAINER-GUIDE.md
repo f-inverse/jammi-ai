@@ -2902,27 +2902,27 @@ read as passed-by-skipping.
 A tabular fine-tune's rows are a **producer output**, not a run's private scan (§3.5
 narrates the whole submit → claim → train → finalize path; this section is the
 data-plane primitive underneath the "Train" step). `materialize_training_set`
-(`crates/jammi-db/src/store/mod.rs:4985`) commits the projected columns once into an
+(`crates/jammi-db/src/store/mod.rs:4986`) commits the projected columns once into an
 immutable `TrainingSet` result table; every reader re-applies the SAME committed order,
 and a session reads it either eagerly (collected into memory) or through a per-rank,
 residency-bounded stream — which arm a run takes is a single predicate, stated below.
 
 **The committed order: one key list, two renderers, declared at both registration
-paths.** `training_set_sort_keys` (`crates/jammi-db/src/store/mod.rs:1163`) is the ONE
+paths.** `training_set_sort_keys` (`crates/jammi-db/src/store/mod.rs:1164`) is the ONE
 source — every projected column, ascending, NULLs first, in declared order — that both
-`training_set_order_by` (`crates/jammi-db/src/store/mod.rs:1190`, the SQL `ORDER BY` clause
+`training_set_order_by` (`crates/jammi-db/src/store/mod.rs:1191`, the SQL `ORDER BY` clause
 a reader re-applies) and `training_set_file_sort_order`
-(`crates/jammi-db/src/store/mod.rs:1238`, the DataFusion `ListingOptions::with_file_sort_order`
+(`crates/jammi-db/src/store/mod.rs:1239`, the DataFusion `ListingOptions::with_file_sort_order`
 form a provider DECLARES) render from — a reader that hand-wrote either form independently
 could silently disagree with the producer's own commitment. `bind_result_table`
-(`crates/jammi-db/src/store/mod.rs:3731`) passes the declared order to `register_table`
+(`crates/jammi-db/src/store/mod.rs:3732`) passes the declared order to `register_table`
 for every single-fragment `TrainingSet` row, on BOTH registration paths: fresh
 materialization (inside `BuildingTable::finish`) and crash recovery
 (`load_existing_tables`, on a session that never saw the write) — so a read-back query
 plans no `SortExec` regardless of which path bound the table:
 `a_training_sets_registration_declares_its_order_so_the_read_back_plans_no_sort`
 (`crates/jammi-db/tests/it/materialization.rs:907`). `training_set_registration_sort_order`
-(`crates/jammi-db/src/store/mod.rs:3825`) is where that declaration is actually read back
+(`crates/jammi-db/src/store/mod.rs:3826`) is where that declaration is actually read back
 off the table's `.materialization.json` sidecar; it can legitimately fail to declare one —
 no sidecar at all (a pre-migration-021 table), the sidecar present but UNREADABLE (an
 object-store error, or a body that fails to parse as the manifest JSON — #500 U2c closing
@@ -2973,7 +2973,7 @@ edge, `map_engine_error` (`crates/jammi-server/src/grpc/wire.rs:109`) maps it to
 **The writer: one partition, no merge — and the deployment rule.** The training set's
 own write plans its full-tuple sort through `single_partition_context`
 (`crates/jammi-db/src/session.rs:1180`) inside `plan_training_set_rows`
-(`crates/jammi-db/src/store/mod.rs:5175`): a `target_partitions = 1` derivation of the
+(`crates/jammi-db/src/store/mod.rs:5176`): a `target_partitions = 1` derivation of the
 caller's session state, so the write is ONE external sort at ONE output partition, never a
 partitioned local-sort-plus-`SortPreservingMergeExec` merge — there is only ever one
 partition to recombine, so no merge operator (with its own real pool reservation on top of
@@ -2981,7 +2981,7 @@ every partition's already-buffered sorted run) is ever planned. The residency th
 O(one batch) plus DataFusion's own spill reservation for that single sort, never O(the
 whole table) — **the deployment rule**, stated where the write is planned: a single
 `[engine] batch_size` batch larger than `[engine] memory_limit`
-`cannot be sorted` (`crates/jammi-db/src/store/mod.rs:4923`), because no batch-granular
+`cannot be sorted` (`crates/jammi-db/src/store/mod.rs:4924`), because no batch-granular
 operator (a spilling external sort, a decoded chunk) can ever hold one. Sized correctly
 the arithmetic is comfortable — a fixture with ~100 KB rows under a 64 MiB pool needs
 `engine.batch_size = 32` (`32 × ~100,000 B ≈ 3.1 MB` per batch) rather than
@@ -3005,7 +3005,7 @@ construction), and the mutable provider's own `MemTable::try_new`
 one partition). The edge this excludes: a hand-built MULTI-partition `MemTable` under
 `single_partition_context` plans a `SortPreservingMergeExec` over N per-partition
 `SortExec`s that still collapses to ONE output partition — the writer's own
-`partition_count` (`crates/jammi-db/src/store/mod.rs:5233`) guard cannot see that shape,
+`partition_count` (`crates/jammi-db/src/store/mod.rs:5234`) guard cannot see that shape,
 because a `MemTable`'s partition count is fixed at construction and never collapses just
 because `target_partitions` changed (unlike a `ListingTable`'s file groups). No production
 source registers one: `MemTable::try_new` has exactly one call site in the workspace, the
@@ -3016,7 +3016,7 @@ rather than `MemTable`-backed.
 
 **A pinned/versioned result table is NOT this universe (#500 U2c closing round, A3).** A
 VERSIONED result table's provider is `build_masked_provider`
-(`crates/jammi-db/src/store/mod.rs:3900`): one `ListingTable` per manifest fragment,
+(`crates/jammi-db/src/store/mod.rs:3901`): one `ListingTable` per manifest fragment,
 combined by `MaskedTableProvider`'s `scan` (`crates/jammi-db/src/store/masked_provider.rs:104`)
 into a `UnionExec` (`crates/jammi-db/src/store/masked_provider.rs:153`) when there is more
 than one fragment — a shape that follows the manifest's OWN fragment count, never
@@ -3045,7 +3045,7 @@ this stream keeps, `PerRank(PartitionSpec)` for training or `All { batch }` for 
 prefetch depth (typed); production trains at `PRODUCTION_PREFETCH_DEPTH`
 (`crates/jammi-ai/src/fine_tune/stream.rs:121`, `= 2`) — a named constant, the regression
 pin for a `prefetch = 2` deadlock an earlier design hit, never a literal at the call site:
-`StreamConfig::new` (`crates/jammi-ai/src/fine_tune/worker.rs:6447`). `open`
+`StreamConfig::new` (`crates/jammi-ai/src/fine_tune/worker.rs:6450`). `open`
 (`crates/jammi-ai/src/fine_tune/stream.rs:379`) runs ONE bounded-memory pre-pass over its
 whole window BEFORE the first training step — a schema check plus, for a numeric target, a
 null/NaN aggregate — so a column-level refusal fires before step 0, not after thousands of
@@ -3058,13 +3058,13 @@ against the full corpus) and GradCache (treats the whole dataset as one in-batch
 batch) both need every row resident before an epoch begins, so a config taking either arm
 gets `Resident` (`crates/jammi-ai/src/fine_tune/source.rs:100`); every other text arm at
 `W = 1` gets `TrainingSource::Streamed`. `worker.rs`'s source selection calls this same
-`whole_set_arm` (`crates/jammi-ai/src/fine_tune/worker.rs:6371`) that the trainer's own
+`whole_set_arm` (`crates/jammi-ai/src/fine_tune/worker.rs:6374`) that the trainer's own
 dispatch refuses a mismatch against, so the two decisions can never come apart. A
 `Streamed` source never collects a `Vec<RecordBatch>` for the training set at all — the
 worker calls only `training_set::materialize_projection_table`
 (`crates/jammi-ai/src/fine_tune/worker.rs:4000`), never `read_back`/
 `read_back_with_reservation` — while a `Resident` loader's construction reads back through
-`read_back_with_reservation` (`crates/jammi-ai/src/fine_tune/worker.rs:6400`) — defined at
+`read_back_with_reservation` (`crates/jammi-ai/src/fine_tune/worker.rs:6403`) — defined at
 `read_back_with_reservation` (`crates/jammi-ai/src/fine_tune/training_set.rs:273`) — and
 attaches the live
 `MemoryReservation` to the loader via `with_reservation`

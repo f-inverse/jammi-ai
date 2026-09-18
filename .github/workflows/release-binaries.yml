@@ -298,7 +298,7 @@ jobs:
 
       # `ci/release-feature-manifest.json`'s `cpu-tarball` lane is the single
       # source of truth for this lane's cargo feature list (#507) — read
-      # here rather than restating it, same idiom as `server-cpu-cuda`
+      # here rather than restating it, same idiom as `server-cu12-build`
       # below. `jq` is not guaranteed present in the CI base image (not a
       # `dnf install` its own Dockerfile carries), so this step installs it
       # on demand.
@@ -566,16 +566,17 @@ jobs:
           # a failure here (`set -euo pipefail`) stops the step before arm
           # 1b, the launcher, or the tarball are ever built.
           loader_report="$(LD_LIBRARY_PATH="${stage}/lib" ldd target/release/jammi-server 2>&1 || true)"
-          # shellcheck disable=SC2046
-          bundle_verify_loader_resolution "${stage}/lib" "$loader_report" $(bundle_needed_sonames target/release/jammi-server)
-
           # Captured verbatim for `ci/scripts/fixtures/cu12_loader_report_real.txt`
           # (T4(3)'s own real-report fixture; see that file's own header) —
           # uploaded as a workflow artifact below so the lead can commit it
           # in place of the provisional placeholder without renting a pod:
           # this container already has the toolkit and no driver, which is
-          # exactly the shape the shipped arm sees on a release.
+          # exactly the shape the shipped arm sees on a release. Written
+          # BEFORE the verify call so a failing verify still leaves the
+          # report on disk for the `if: always()` upload below.
           printf '%s\n' "$loader_report" > cu12_loader_report_real.txt
+          # shellcheck disable=SC2046
+          bundle_verify_loader_resolution "${stage}/lib" "$loader_report" $(bundle_needed_sonames target/release/jammi-server)
 
           # Loader verification, arm 1b — THE JAIL (#534's chroot half —
           # see `ci/scripts/jail_trace.py`'s own module doc for the

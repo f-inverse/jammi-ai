@@ -255,8 +255,9 @@ impl PlacedIndex {
     ///
     /// All-local: literally [`SegmentedIndex::search_final`] — the same
     /// kernels, the same bytes, today's exact-read count — after the same
-    /// deferred-authority check the all-remote branch of [`Self::
-    /// search_mixed`] applies (below). Mixed: the per-precision protocol
+    /// deferred-authority check `Self::search_mixed` applies
+    /// unconditionally (below), resolved against this set's own authority.
+    /// Mixed: the per-precision protocol
     /// over the transport plus the failure ladder.
     pub async fn search_final_placed(
         &self,

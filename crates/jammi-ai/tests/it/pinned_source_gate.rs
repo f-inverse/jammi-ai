@@ -2709,7 +2709,7 @@ fn allowlists_match_current_hits_exactly() {
 //     catalog and returned"), the identical silent-overwrite shape
 //     `register_catalog`/`register_udf` already have above;
 //     `deregister_schema` is its inverse. `ResultStore`'s own
-//     `install_result_schema`, `crates/jammi-db/src/store/mod.rs:2021` calls
+//     `install_result_schema`, `crates/jammi-db/src/store/mod.rs:2022` calls
 //     exactly this verb — which is why this literal set had to widen past
 //     `SessionContext`'s own surface rather than staying a pure enumeration
 //     of it.
@@ -3269,9 +3269,9 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
 // carried over rather than closed by this replacement. And it is scoped to
 // exactly [`SURFACE_DIRS`]: a registration verb or DDL literal living
 // anywhere outside those two `src` trees is outside its universe entirely --
-// under `tests/it/` in either crate (e.g. the five `.register_table(`
+// under `tests/it/` in either crate (e.g. the six `.register_table(`
 // calls this file's own review list keys to, `.register_table(`,
-// `crates/jammi-db/tests/it/materialization.rs:569/:616/:669/:671/:1024`,
+// `crates/jammi-db/tests/it/materialization.rs:569/:636/:694/:696/:1318/:1569`,
 // none of them under `crates/jammi-db/src`), or in a third crate, both
 // count the same way. A fifth gap sits inside the scan itself, not at its
 // boundary: [`mask_comments_only`]'s masking step desyncs on a raw string
@@ -3957,24 +3957,31 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
                    to this provider (i.e. after `install_result_schema` runs). Checked, not assumed, \
                    and the command run is stated exactly because an earlier draft of this entry got \
                    it wrong: `grep -rn '\\.register_table(' crates/jammi-db/src crates/jammi-ai/src` \
-                   -- the two `src` trees [`SURFACE_DIRS`] scans -- returns exactly ONE hit, the \
-                   4-argument `.register_table(ctx, &record.table_name, &url, owner)` call at \
-                   `store/mod.rs:2724`; it does NOT find the five 2-argument \
-                   `.register_table(name, provider)` calls, because all five live under \
-                   `crates/jammi-db/tests/it/materialization.rs`, outside both `src` trees entirely. \
-                   The command that actually produces the five is repo-wide: \
+                   -- the two `src` trees [`SURFACE_DIRS`] scans -- returns exactly ONE call site, the \
+                   5-argument `.register_table(ctx, &record.table_name, &url, owner, file_sort_order)` \
+                   call at `store/mod.rs:3748` (its other three hits, `store/mod.rs:180/:5156/:5224`, \
+                   are prose naming the verb); it does NOT find the ten 2-argument \
+                   `.register_table(name, provider)` calls, because all ten live under `tests/` \
+                   trees, outside both `src` trees entirely. \
+                   The command that actually produces the ten is repo-wide: \
                    `grep -rn '\\.register_table(' --include='*.rs' crates/` returns \
-                   `materialization.rs:565/:616/:669/:671/:1024` (plus that same `store/mod.rs:2724` \
+                   `crates/jammi-db/tests/it/materialization.rs:569/:636/:694/:696/:1318/:1569`, \
+                   `crates/jammi-ai/tests/it/rangesplit.rs:219/:359/:416` and \
+                   `crates/jammi-ballista/tests/it/roles.rs:70` (plus that same `store/mod.rs:3748` \
                    line, and several prose mentions of the verb inside this very file that are text, \
-                   not call sites). Of those five 2-argument calls, only the one at `:1024`, inside \
+                   not call sites). Of those ten 2-argument calls, only the one at \
+                   `materialization.rs:1569`, inside \
                    `install_result_schema_twice_on_one_session_binds_the_same_schema_and_errors_on_neither`, \
-                   actually dispatches to THIS implementation: it is the only one of the five whose \
+                   actually dispatches to THIS implementation: it is the only one of the ten whose \
                    `ctx` already had `install_result_schema` called on it earlier in the same \
                    function, which is what makes the target schema resolve here (traced, not \
-                   assumed: `install_result_schema`'s call at that test's line 1018 precedes its \
-                   `:1024` `register_table` call; the other four calls' enclosing functions --\
-                   `ts_session` (`:565`), `pinned_session` (`:616`), and `pinned_session_two` \
-                   (`:669`, `:671`) -- never call `install_result_schema` on their `ctx` at all, \
+                   assumed: `install_result_schema`'s call at that test's line 1563 precedes its \
+                   `:1569` `register_table` call; the other nine calls' enclosing functions --\
+                   `ts_session` (`:569`), `pinned_session` (`:636`), `pinned_session_two` \
+                   (`:694`, `:696`), \
+                   `the_file_sort_order_declares_a_dotted_column_verbatim_not_as_a_qualified_reference` \
+                   (`:1318`), and the rangesplit and ballista fixtures -- never call \
+                   `install_result_schema` on their `ctx` at all, \
                    so they resolve to DataFusion's \
                    own default `MemorySchemaProvider` instead). That one call is deliberate, to \
                    prove the \"preserves the tables it already holds\" property survives a second \

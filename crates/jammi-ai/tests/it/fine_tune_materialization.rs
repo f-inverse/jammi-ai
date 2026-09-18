@@ -503,6 +503,26 @@ fn spawn_and_capture_profile(
     (profile, hash)
 }
 
+/// Whether this process is a spawned child (`KERNEL_ADMISSION_PROFILE_CHILD`
+/// set by `spawn_and_capture_profile`). In the parent the child-body test
+/// returns without running BY DESIGN — that is not a resource skip — and a
+/// lane that sets `JAMMI_REQUIRE_KERNEL_ADMISSION_PROFILE_CHILD` while not
+/// being a child gets a hard failure, never a hollow green (the registry's
+/// canonical require-gate shape: nested, un-collapsed `if`s).
+#[allow(clippy::collapsible_if)]
+fn child_process_mode(test: &str) -> bool {
+    let child = std::env::var_os("KERNEL_ADMISSION_PROFILE_CHILD").is_some();
+    if !child {
+        if std::env::var_os("JAMMI_REQUIRE_KERNEL_ADMISSION_PROFILE_CHILD").is_some() {
+            panic!(
+                "{test}: JAMMI_REQUIRE_KERNEL_ADMISSION_PROFILE_CHILD is set but this process is \
+                 not a spawned child — the child body would be skipped silently"
+            );
+        }
+    }
+    child
+}
+
 /// Only meaningful inside the child process [`spawn_and_capture_profile`]
 /// spawns (guarded on `KERNEL_ADMISSION_PROFILE_CHILD`) — a no-op under the
 /// ordinary `cargo test` harness that also runs every other test in this
@@ -525,26 +545,6 @@ fn spawn_and_capture_profile(
 /// fact about the SAME `backbone_dtype` this process's own spec declared —
 /// so calling them again AFTER training completes reads the identical
 /// values the worker's own call site read before training started.
-/// Whether this process is a spawned child (`KERNEL_ADMISSION_PROFILE_CHILD`
-/// set by `spawn_and_capture_profile`). In the parent the child-body test
-/// returns without running BY DESIGN — that is not a resource skip — and a
-/// lane that sets `JAMMI_REQUIRE_KERNEL_ADMISSION_PROFILE_CHILD` while not
-/// being a child gets a hard failure, never a hollow green (the registry's
-/// canonical require-gate shape: nested, un-collapsed `if`s).
-#[allow(clippy::collapsible_if)]
-fn child_process_mode(test: &str) -> bool {
-    let child = std::env::var_os("KERNEL_ADMISSION_PROFILE_CHILD").is_some();
-    if !child {
-        if std::env::var_os("JAMMI_REQUIRE_KERNEL_ADMISSION_PROFILE_CHILD").is_some() {
-            panic!(
-                "{test}: JAMMI_REQUIRE_KERNEL_ADMISSION_PROFILE_CHILD is set but this process is \
-                 not a spawned child — the child body would be skipped silently"
-            );
-        }
-    }
-    child
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn kernel_admission_profile_child_process_body() {
     if !child_process_mode("kernel_admission_profile_child_process_body") {

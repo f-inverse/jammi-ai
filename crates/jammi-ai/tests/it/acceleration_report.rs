@@ -689,7 +689,7 @@ fn tiny_bert_head64_model() -> String {
 /// (`crates/jammi-kernels/src/admission.rs:407-457`) now records every
 /// decline — including BERT's own `"flash_transport_not_wired"` — into the
 /// SAME thread-local probe-capture sink `admit_inner` uses
-/// (`record_probe_miss`, `admission.rs:416,427,437`), and
+/// (`record_probe_miss`, `admission.rs:421,432,442`), and
 /// `flash_cascade_decline_reason` reads it back verbatim on a real
 /// CUDA+flash-compiled build; that mechanism is proven directly, without
 /// needing a CUDA device, by

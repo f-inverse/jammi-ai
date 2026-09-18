@@ -41,7 +41,7 @@ pub struct InferenceRunner {
     /// Input columns copied verbatim to the end of every emitted sub-batch
     /// (see `schema::build_output_schema`'s `passthrough`).
     passthrough: Vec<String>,
-    /// RS7: the per-device admission bounding how many `forward()` calls run
+    /// RS7: the per-`InferenceExec`-instance admission bounding how many `forward()` calls run
     /// concurrently across every partition of the SAME `InferenceExec`
     /// (shared via one `Arc` across the `N` `InferenceRunner`s
     /// `InferenceExec::execute` builds — one per partition). `None` is the
@@ -96,7 +96,7 @@ pub mod test_hooks {
 
     /// RS7's oracle: the peak number of `forward()` calls observed IN FLIGHT
     /// SIMULTANEOUSLY over `source_id` since the last reset, so a test can
-    /// prove the per-device forward permit (`InferenceRunner::
+    /// prove the per-`InferenceExec`-instance forward permit (`InferenceRunner::
     /// with_forward_permits`) actually bounds concurrency rather than merely
     /// existing. Keyed by `source_id` for the same reason as
     /// [`forward_calls_for`] — parallel sibling tests in one binary.
@@ -340,7 +340,7 @@ impl InferenceRunner {
             let chunk_ordinals = ordinals.slice(chunk_start, chunk_len);
 
             let start = Instant::now();
-            // RS7: acquire this device's forward admission BEFORE the model
+            // RS7: acquire this exec's forward admission BEFORE the model
             // is ever invoked, and hold it for the whole forward call — an
             // OOM-halving retry below re-acquires on its next loop iteration,
             // never holding the permit across the halving decision itself.
@@ -784,7 +784,7 @@ mod tests {
     }
 
     /// RS7: `forward()` concurrency across partitions is bounded by the
-    /// shared per-device permit, never by accident of scheduling. Four
+    /// shared per-`InferenceExec`-instance permit, never by accident of scheduling. Four
     /// concurrent `run_chunks` callers (simulating `N=4` partitions of one
     /// `InferenceExec` sharing one `Arc<Semaphore>`, as
     /// `InferenceExec::execute` wires it) each sleep on a REAL OS thread

@@ -77,7 +77,7 @@ impl StorageRegistry {
     ///
     /// `pub(crate)`, not `pub`: this hands back the raw `Arc<dyn
     /// ObjectStore>`, on which `ObjectStoreExt::delete` carries no
-    /// `models/` guard. Outside this crate, call [`Self::open`], which
+    /// `models/` guard. Outside this crate, call [`Self::handle_for`], which
     /// wraps the SAME cached driver in the guarded
     /// [`super::object_store_handle::JammiObjectStore`] handle (#588).
     pub(crate) fn driver_for(

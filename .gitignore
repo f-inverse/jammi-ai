@@ -59,6 +59,9 @@ packaging/*/build/
 .target/
 .tmp/
 
+# OS and editor debris.
+.DS_Store
+
 # A contributor's own assistant/agent tooling and its state stay local.
 .claude/
 .jammi/

@@ -299,6 +299,7 @@ const REVIEWED_SITES: &[Site] = &[
     Site { file: "crates/jammi-ai/tests/it/jobs_shutdown.rs", item: "release_job_leases_is_unobserved_when_the_keeper_thread_is_dead", ordinal: 1, class: Class::D, marker: "", reason: "a lease-keeper thread death poll, not training compute" },
     // ---- named const `: Duration = Duration::from_secs(` -------------------
     Site { file: "crates/jammi-ai/tests/distributed/harness.rs", item: "TERMINAL_TIMEOUT", ordinal: 1, class: Class::C, marker: WEDGED, reason: "" },
+    Site { file: "crates/jammi-ai/tests/distributed/placed_search.rs", item: "wait_ready", ordinal: 1, class: Class::D, marker: "", reason: "a worker /readyz readiness poll deadline in the placed-search leg's own harness (catalog connect + migrate + tier mount on a cold runner), not training compute" },
 ];
 
 fn span_text(root: &Path, file: &str, span: (u32, u32)) -> String {

@@ -31,9 +31,32 @@
 //! `Weak` is a typed refusal naming the missing session, not a panic): the
 //! model cache, result store, and DataFusion context are the decoding
 //! session's, never serialized.
+//!
+//! `jammi_ai::operator::ordinal_split_exec::OrdinalSplitExec` (#540
+//! RANGESPLIT) has NO wire form here — no `NodeTag`, no `plan.proto`
+//! message, no encode/decode arm — the same v1 cut as `MaskExec` below.
+//! WHY: in Ballista 54.1, `SortPreservingMergeExec` is a STAGE BOUNDARY
+//! (`ballista-scheduler-54.1.0/src/planner.rs:219-232` inserts a shuffle
+//! write below it and starts a new stage above), so the `N`-partition
+//! `InferenceExec(OrdinalSplitExec(..))` this split would sit under
+//! becomes its own stage of `N` TASKS — each task executing exactly ONE
+//! partition, in general on a DIFFERENT executor process
+//! (`ballista-scheduler-54.1.0/src/state/execution_stage.rs:1043-1053,530`;
+//! `ballista-executor-54.1.0/src/execution_engine.rs:359-369`). This
+//! node's mechanism is a single IN-PROCESS `tokio::sync::Mutex`-guarded
+//! pull shared across its `N` partitions (`OrdinalSplitExec`'s own module
+//! doc) — it has no meaning, and no way to share its state, across a
+//! process boundary, so putting it on the wire at all would silently
+//! produce `N` independent, uncoordinated splits (each executor's task
+//! would open its OWN copy of `input`, reassign ITS OWN ordinal sequence
+//! from 0, and see none of the other tasks' rows) rather than one
+//! N-way fan-out. `InferenceConfig::partitions` defaults to `1`, which
+//! never inserts this node at all, so this cut affects nothing this
+//! codec's other callers already exercise.
 
 use std::sync::{Arc, Weak};
 
+use datafusion::error::DataFusionError;
 use datafusion::error::Result as DfResult;
 use datafusion::execution::{FunctionRegistry, TaskContext};
 use datafusion::logical_expr::ScalarUDF;
@@ -52,6 +75,7 @@ use jammi_ai::operator::key_check_exec::KeyCheckExec;
 use jammi_ai::pipeline::asof::exec::AsofJoinExec;
 use jammi_ai::pipeline::asof::spec::AsofJoinSpec;
 use jammi_ai::session::InferenceSession;
+use jammi_db::error::JammiError;
 use jammi_db::index::{validate_query, QuerySource};
 use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_db::TenantId;
@@ -179,7 +203,8 @@ impl PhysicalExtensionCodec for JammiCodec {
         }
         // Not one of ours — delegate to Ballista's own codec (shuffle
         // reader/writer, unresolved shuffle, ...). A node NEITHER codec
-        // knows (e.g. `MaskExec`, the named v1 cut) surfaces as the
+        // knows (e.g. `MaskExec`, or `OrdinalSplitExec` — the module doc's
+        // stage-boundary reason — both named v1 cuts) surfaces as the
         // delegate's own typed "Unsupported plan node" error naming it —
         // this codec adds no catch-all of its own.
         self.inner.try_encode(node, buf)
@@ -342,22 +367,66 @@ fn decode_ann_search(
 ) -> DfResult<Arc<dyn ExecutionPlan>> {
     let msg = pb::AnnSearchExecNode::decode(body)
         .map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
+    // Every typed refusal below boxes the `JammiError` payload directly as
+    // `DataFusionError::External`'s inner value (never this crate's own
+    // `Error`, which `Error::into_df_error` would box instead, hiding the
+    // `JammiError` a downcast needs) — so a caller inspecting the returned
+    // `DataFusionError` IN THIS PROCESS (a same-process test, or a future
+    // in-process consumer of this codec) recovers the typed variant via
+    // `jammi_db::error`'s structural `DataFusionError` -> `JammiError`
+    // classifier ("owned passthrough" shape) rather than the lossy
+    // catch-all `JammiError::DataFusion(e)`.
+    //
+    // This does NOT reach a client across a real distributed Ballista job.
+    // `ballista-executor`'s task loop stringifies a failed task's error
+    // (`e.to_string()`, `ballista-executor-54.1.0/src/lib.rs:138`) into
+    // `TaskStatus`, and `ballista-core`'s job-status waiter does the same
+    // for the job as a whole, rebuilding it as a bare
+    // `DataFusionError::Execution(String)`
+    // (`ballista-core-54.1.0/src/execution_plans/distributed_query.rs:519,685`)
+    // — no boxed value survives that hop, so `unwrap_jammi` finds nothing to
+    // destructure and falls to `JammiError::DataFusion(e)`, which
+    // `jammi-server/src/grpc/wire.rs`'s classifier's catch-all
+    // (`other => (Code::Internal, ..)`, `wire.rs:311`) maps to `Internal`,
+    // never `InvalidArgument`, regardless of which typed variant was boxed
+    // here. The caller-class path for a REMOTE client is the coordinator's
+    // own `QueryBuilder::new` check, which runs before any plan is ever
+    // shipped; every check in this function is decode-time defense in depth
+    // for a peer that skipped it, recoverable in-process but not over the
+    // wire (tracked as a residual on #519 — reshaping that boundary is its
+    // own unit, not a fold of this one).
     let tenant: Option<TenantId> = msg
         .tenant_id
         .map(TenantId::try_from)
         .transpose()
-        .map_err(|e| Error::Catalog(e).into_df_error())?;
+        .map_err(|e: JammiError| DataFusionError::External(Box::new(e)))?;
     let table = block_on_catalog(
         session
             .catalog()
             .get_result_table_for_tenant(&msg.table_name, tenant),
     )
-    .map_err(Error::into_df_error)?
+    .map_err(|e| match e {
+        Error::Catalog(j) => DataFusionError::External(Box::new(j)),
+        other => other.into_df_error(),
+    })?
     .ok_or_else(|| {
-        Error::Decode(format!("result table '{}' not found", msg.table_name)).into_df_error()
+        DataFusionError::External(Box::new(JammiError::Other(format!(
+            "result table '{}' not found",
+            msg.table_name
+        ))))
     })?;
-    let query = validate_query(msg.query_vector, None, QuerySource::Caller)
-        .map_err(|e| Error::Decode(format!("{e:?}")).into_df_error())?;
+    // The catalog width is already in hand (`table` above) — pass it as the
+    // authority, exactly the pattern `QueryBuilder::new`'s Caller arm and
+    // every other production entry uses. A mismatch is boxed as the
+    // `JammiError` the width-validation `From` impl classifies it into
+    // (`Schema` for a Caller-provenance width fault) — recoverable
+    // in-process exactly as described above.
+    let query = validate_query(
+        msg.query_vector,
+        table.dimensions().map(std::num::NonZeroUsize::get),
+        QuerySource::Caller,
+    )
+    .map_err(|e| DataFusionError::External(Box::new(JammiError::from(e))))?;
     let node = AnnSearchExec::new(
         table,
         query,
@@ -366,7 +435,7 @@ fn decode_ann_search(
         session.result_store(),
         session.context().clone(),
     )
-    .map_err(|e| Error::Catalog(e).into_df_error())?;
+    .map_err(|e: JammiError| DataFusionError::External(Box::new(e)))?;
     Ok(Arc::new(node))
 }
 

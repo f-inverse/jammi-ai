@@ -126,7 +126,7 @@ async fn p1_the_loader_derived_state_plans_with_no_sort_and_no_merge() {
     // the same function `stream.rs` calls.
     let derived_ctx = jammi_db::session::single_partition_context(session.context());
 
-    let query = read_back_sql(&fixture.table, &fixture.columns);
+    let query = read_back_sql(&fixture.table).unwrap();
     let batches = derived_ctx
         .sql(&format!("EXPLAIN {query}"))
         .await
@@ -165,7 +165,7 @@ async fn p6i_w1_stream_concatenation_matches_read_back_sql_at_various_partition_
         let columns = fixture.columns.clone();
         let total = fixture.written.len();
 
-        let expected = rows_of(&session.sql(&read_back_sql(&table, &columns)).await.unwrap());
+        let expected = rows_of(&session.sql(&read_back_sql(&table).unwrap()).await.unwrap());
 
         let spec =
             partition::PartitionSpec::single_rank(13, partition::PartitionRule::BlockByGlobalBatch);
@@ -332,7 +332,7 @@ async fn p5_two_rank_world_slices_match_eager_text_chunk_for_rank_exactly() {
     let columns = fixture.columns.clone();
     let total = fixture.written.len();
 
-    let eager_rows = rows_of(&session.sql(&read_back_sql(&table, &columns)).await.unwrap());
+    let eager_rows = rows_of(&session.sql(&read_back_sql(&table).unwrap()).await.unwrap());
     let eager_loader =
         jammi_ai::fine_tune::data::TrainingDataLoader::from_pairs(eager_rows.clone());
 
@@ -616,7 +616,7 @@ async fn classification_fixture() -> (
 async fn f3_classification_streams_given_a_vocabulary_and_matches_the_eager_class_indices() {
     let (session, table, columns, _dir) = classification_fixture().await;
 
-    let vocab = stream::build_label_vocabulary(&session, &table, &columns)
+    let vocab = stream::build_label_vocabulary(&session, &table)
         .await
         .unwrap();
     assert_eq!(vocab.num_classes(), 2, "labels are exactly {{a, b}}");
@@ -707,7 +707,7 @@ async fn f3_a_label_seen_only_in_the_validation_suffix_is_still_counted() {
     .await
     .unwrap();
 
-    let vocab = stream::build_label_vocabulary(&session, &table, &columns)
+    let vocab = stream::build_label_vocabulary(&session, &table)
         .await
         .unwrap();
     assert_eq!(
@@ -718,7 +718,7 @@ async fn f3_a_label_seen_only_in_the_validation_suffix_is_still_counted() {
 
     // The eager `BTreeSet` count over the SAME whole table agrees — the
     // property this oracle actually pins: the two routes never disagree.
-    let batches = jammi_ai::fine_tune::training_set::read_back(&session, &table, &columns)
+    let batches = jammi_ai::fine_tune::training_set::read_back(&session, &table)
         .await
         .unwrap();
     let eager = jammi_ai::fine_tune::decode::build_training_data_loader(
@@ -800,7 +800,7 @@ async fn p3_streamed_read_completes_under_a_small_pool_while_eager_fails() {
     // SAME typed reservation check, which must now fail under the small
     // pool.
     let batches = session_b
-        .sql(&read_back_sql(&table, &columns))
+        .sql(&read_back_sql(&table).unwrap())
         .await
         .expect("the plain collected read itself must succeed (no operator needs the pool)");
     let total_bytes: usize = batches

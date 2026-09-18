@@ -512,3 +512,13 @@ impl CatalogBackend for SqliteBackend {
         8
     }
 }
+
+impl SqliteBackend {
+    /// The raw connection pool, for [`super::backend::BackendImpl::
+    /// query_untransacted`] — see the Postgres twin's doc for why a
+    /// single-statement read never goes through [`CatalogBackend::
+    /// transaction`]'s `BEGIN`/`COMMIT` pair.
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+}

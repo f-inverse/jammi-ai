@@ -3,10 +3,11 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::expressions::col;
+use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::{
-    stream::RecordBatchReceiverStreamBuilder, DisplayAs, DisplayFormatType, ExecutionPlan,
-    Partitioning, PlanProperties,
+    stream::RecordBatchReceiverStreamBuilder, DisplayAs, DisplayFormatType, Distribution,
+    ExecutionPlan, ExecutionPlanProperties, Partitioning, PlanProperties,
 };
 
 use crate::inference::adapter::DistributionForm;
@@ -15,7 +16,26 @@ use crate::inference::runner::InferenceRunner;
 use crate::inference::schema::build_output_schema;
 use crate::model::cache::ModelCache;
 use crate::model::{BackendType, ModelSource, ModelTask};
+use crate::operator::ordinal_split_exec::ORDINAL_COLUMN;
 use jammi_db::store::manifest::ComputeDeviceKind;
+
+/// RS7's default forward admission, scoped to ONE `InferenceExec` INSTANCE
+/// (never a whole device — see `forward_permits`' field doc for what that
+/// means for two concurrent instances sharing a GPU): `available_
+/// parallelism()` concurrent forwards on the CPU (bounded parallel CPU
+/// inference actually helps — RS7's CPU speedup measurement), 1 on a CUDA
+/// or Metal device (the conservative default until a future unit wires
+/// this to `concurrency::GpuScheduler`'s own admission, which is the named
+/// seam for DEVICE-WIDE admission across every concurrent instance — e.g.
+/// multiple small models, or a scheduler-approved batch split).
+fn default_forward_permits(device_kind: ComputeDeviceKind) -> usize {
+    match device_kind {
+        ComputeDeviceKind::Cpu => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+        ComputeDeviceKind::Cuda | ComputeDeviceKind::Metal => 1,
+    }
+}
 
 /// InferenceExec — the core intelligence operator.
 /// Reads input RecordBatches, runs model inference, and outputs
@@ -46,6 +66,16 @@ pub struct InferenceExec {
     /// ballista`'s codec, `codec.rs`).
     device_kind: ComputeDeviceKind,
     properties: Arc<PlanProperties>,
+    /// RS7: the forward admission shared by every partition of THIS
+    /// `InferenceExec` instance (cloned into each partition's
+    /// `InferenceRunner` at `execute()` time). This is per-INSTANCE, never
+    /// per-device: two concurrent `InferenceExec` instances targeting the
+    /// SAME GPU each get their own `forward_permits` and will each run one
+    /// forward concurrently (up to two total on that device) — bounding a
+    /// whole device's admission across every instance is the named,
+    /// unbuilt seam (`concurrency::GpuScheduler`; `default_forward_
+    /// permits`'s doc). Sized from `device_kind` at build time.
+    forward_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for InferenceExec {
@@ -157,7 +187,10 @@ impl InferenceExecBuilder {
             self.regression_form.as_ref(),
             &self.passthrough,
         )?;
-        let properties = InferenceExec::compute_properties(output_schema);
+        let properties = InferenceExec::compute_properties(output_schema, &self.input);
+        let forward_permits = Arc::new(tokio::sync::Semaphore::new(
+            default_forward_permits(self.device_kind).max(1),
+        ));
         Ok(InferenceExec {
             input: self.input,
             source: self.source,
@@ -174,6 +207,7 @@ impl InferenceExecBuilder {
             passthrough: self.passthrough,
             device_kind: self.device_kind,
             properties: Arc::new(properties),
+            forward_permits,
         })
     }
 }
@@ -241,10 +275,31 @@ impl InferenceExec {
         self.device_kind
     }
 
-    fn compute_properties(schema: SchemaRef) -> PlanProperties {
+    /// RS1/RS2: `output_partitioning` propagates the CHILD's own partition
+    /// count (never a hardcoded 1) — the fix for the pre-RANGESPLIT bug where
+    /// a multi-partition child (the UDTF/`annotate` scan) had its extra
+    /// partitions silently unreachable, since every call site here always
+    /// calls `.execute(0, ..)` and a declared `UnknownPartitioning(1)` gave
+    /// the optimizer no reason to ever coalesce first. The equivalence
+    /// properties publish `[_ordinal ASC]` — true BY CONSTRUCTION regardless
+    /// of whether an `OrdinalSplitExec` sits below (see
+    /// `inference::schema::extract_or_generate_ordinals`'s doc: either arm
+    /// hands this operator, and this operator alone emits, a strictly
+    /// increasing per-partition `_ordinal` subsequence).
+    fn compute_properties(schema: SchemaRef, input: &Arc<dyn ExecutionPlan>) -> PlanProperties {
+        let mut eq = EquivalenceProperties::new(Arc::clone(&schema));
+        if let Ok(ordinal) = col(ORDINAL_COLUMN, schema.as_ref()) {
+            let sort_opts = arrow::compute::SortOptions {
+                descending: false,
+                nulls_first: false,
+            };
+            if let Some(ordering) = LexOrdering::new([PhysicalSortExpr::new(ordinal, sort_opts)]) {
+                eq.add_ordering(ordering);
+            }
+        }
         PlanProperties::new(
-            EquivalenceProperties::new(schema),
-            Partitioning::UnknownPartitioning(1),
+            eq,
+            Partitioning::UnknownPartitioning(input.output_partitioning().partition_count()),
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
         )
@@ -272,6 +327,40 @@ impl ExecutionPlan for InferenceExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    /// RS1: `UnspecifiedDistribution` (never `SinglePartition`) — this node
+    /// does not require its child to be coalesced; `OrdinalSplitExec`'s own
+    /// `SinglePartition` requirement (or a multi-partition scan directly
+    /// below, on the `n == 1` no-split shape) is what `EnforceDistribution`
+    /// actually satisfies.
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::UnspecifiedDistribution]
+    }
+
+    /// RS1: `false`, not the DataFusion default (`true` for a node whose
+    /// `required_input_distribution` is `Unspecified`). The default would let
+    /// `EnforceDistribution` insert a round-robin `RepartitionExec` between
+    /// `OrdinalSplitExec` and this node whenever it judges that repartitioning
+    /// "benefits" — defeating the point of the split. Dropping this override
+    /// (setting it to `vec![true]`) sends 60 of the 120-cell grid's cells RED
+    /// (`tests/it/rangesplit.rs`'s `rs1_nothing_between_split_and_
+    /// inference_across_the_grid`, re-measured directly against this tree by
+    /// applying that exact one-line mutation and reading the test's own
+    /// failure count) — re-measure the same way after any change to this
+    /// file or to `OrdinalSplitExec`, since which optimizer passes fire (and
+    /// so how many cells fail) can shift; never assume this number without
+    /// re-running the mutation.
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    /// RS2: each partition forwards its input rows in arrival order and
+    /// stamps `_ordinal` (or reads the split's own) without ever reordering
+    /// them — the per-partition ordering this node's own `[_ordinal ASC]`
+    /// equivalence claims is genuinely maintained, never merely declared.
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
     }
 
     fn with_new_children(
@@ -324,10 +413,78 @@ impl ExecutionPlan for InferenceExec {
             self.batch_size,
             self.observer.clone(),
         )
-        .with_passthrough(self.passthrough.clone());
+        .with_passthrough(self.passthrough.clone())
+        .with_forward_permits(Arc::clone(&self.forward_permits));
 
         builder.spawn(async move { runner.run(input_stream, tx, output_schema).await });
 
         Ok(builder.build())
     }
+}
+
+/// Wire `InferenceConfig::partitions` (#540 RANGESPLIT) into one of this
+/// crate's four `InferenceExec`-building call sites: `partitions <= 1`
+/// coalesces `input` to a single partition when it is not already one
+/// (`build_inference` always sees exactly ONE partition — see the
+/// implementation below for why this coalesce is load-bearing, not
+/// cosmetic) and builds `build_inference` on it with no split and no
+/// merge. `partitions > 1` inserts
+/// [`OrdinalSplitExec`](crate::operator::ordinal_split_exec::OrdinalSplitExec)
+/// below `input` (which coalesces a multi-partition `input` itself, the
+/// same way) and wraps the built `InferenceExec` in a
+/// `SortPreservingMergeExec([_ordinal ASC])` (RS2's merge key — see that
+/// module's doc for why `_ordinal` alone, never `[_row_id, _ordinal]`).
+///
+/// `session::annotate_plan`, `session::infer_materialize` (`infer`'s actual
+/// materializer), `pipeline::embedding::build_embedding_plan`, and
+/// `pipeline::embedding_refresh::infer_delta` all call this rather than
+/// each repeating the wrap/merge logic — RS5's "the four roots" invariant
+/// holds because all four share this one function, and is checked live by
+/// `tests/it/rangesplit.rs`'s `rs5_source_oracle` (a `syn`-based scan of
+/// every `InferenceExecBuilder::new` call site in this crate).
+pub fn wrap_with_split_and_merge(
+    input: Arc<dyn ExecutionPlan>,
+    partitions: usize,
+    build_inference: impl FnOnce(Arc<dyn ExecutionPlan>) -> jammi_db::error::Result<InferenceExec>,
+) -> jammi_db::error::Result<Arc<dyn ExecutionPlan>> {
+    if partitions <= 1 {
+        // `InferenceExec::compute_properties` (below) propagates the
+        // CHILD's own partition count rather than a hardcoded 1, so an
+        // uncoalesced multi-partition `input` here would make it declare
+        // more than one partition while every one of those partitions'
+        // `InferenceRunner`s independently self-generates `_ordinal`
+        // starting at 0 (no split providing a shared global sequence), and
+        // a caller that always calls `.execute(0, ..)` (every one in this
+        // crate) would see only a fraction of the rows. Coalesce
+        // defensively, exactly as `OrdinalSplitExec::new` does at
+        // `partitions > 1` for the identical reason.
+        let input: Arc<dyn ExecutionPlan> = if input.output_partitioning().partition_count() > 1 {
+            Arc::new(
+                datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(input),
+            )
+        } else {
+            input
+        };
+        return Ok(Arc::new(build_inference(input)?));
+    }
+    let split = Arc::new(
+        crate::operator::ordinal_split_exec::OrdinalSplitExec::new(input, partitions).map_err(
+            |e| jammi_db::error::JammiError::Inference(format!("OrdinalSplitExec: {e}")),
+        )?,
+    );
+    let inference: Arc<dyn ExecutionPlan> = Arc::new(build_inference(split)?);
+    let schema = inference.schema();
+    let sort_opts = arrow::compute::SortOptions {
+        descending: false,
+        nulls_first: false,
+    };
+    let ordinal_expr = col(ORDINAL_COLUMN, schema.as_ref())
+        .map_err(|e| jammi_db::error::JammiError::Inference(format!("merge ordering: {e}")))?;
+    let ordering = LexOrdering::new([PhysicalSortExpr::new(ordinal_expr, sort_opts)])
+        .ok_or_else(|| jammi_db::error::JammiError::Inference("merge ordering: empty".into()))?;
+    Ok(Arc::new(
+        datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec::new(
+            ordering, inference,
+        ),
+    ))
 }

@@ -1,3 +1,4 @@
+mod arity_guard;
 mod assembly_outcome;
 mod audit;
 mod backup_recipe;
@@ -12,6 +13,7 @@ mod compute_repo;
 mod concurrent_writers;
 mod datafusion_version;
 mod docs_config_fences;
+mod domain_hash_prefix_free_gate;
 mod ephemeral;
 mod esc_071_cross_session_visibility;
 mod esc_072_two_pool_writers;
@@ -56,6 +58,8 @@ mod read_vectors;
 mod reconcile;
 mod recovery;
 mod register_computed_embedding;
+#[cfg(feature = "test-hooks")]
+mod rendezvous_ring;
 mod result_tables;
 mod segment;
 mod serde_json_preserve_order;

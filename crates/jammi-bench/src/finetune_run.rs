@@ -3583,53 +3583,78 @@ mod tests {
     /// construction's cost LARGE and DETERMINISTIC instead of relying on the
     /// fixture's real size: `LOADER_BUILD_SLEEP_MS_FOR_TEST` injects a
     /// fixed sleep into every `RowSet::loader` call for the duration of this
-    /// test's `run_impl` invocation. `non_perturbation_test_params` runs 2
-    /// epochs with `probe_at_init = true`, so the hook fires 3 times total
-    /// (the train-probe's `loader()` call, which sits BEFORE `train_run_t0`
-    /// in every revision of this function, plus one `train_rows.loader(..)`
-    /// call per epoch leg) — only the per-epoch calls are candidates for
-    /// re-entering the timed span.
+    /// test's `run_impl` invocation: the held-out loader, each train-probe
+    /// loader (all of which sit BEFORE or AFTER `train_run_t0` in every
+    /// revision of this function), and one `train_rows.loader(..)` call per
+    /// epoch leg — only the per-epoch train calls are candidates for
+    /// re-entering the timed span. On this fixture (2 epochs, probes on)
+    /// six `loader` calls fire; the injected run's outer wall clock grows by
+    /// their sleeps' sum less the process cold-start the plain run pays first
+    /// (measured: ~1.5 s natively, ~1.0 s in the CI image as `linux/amd64`).
+    ///
+    /// The property is DIFFERENTIAL, never an absolute bound on the real
+    /// training span: the same fixture runs twice in this process, once with
+    /// the injected sleep at 0 and once at 250 ms, and `train_run_wall_s` may
+    /// grow between the two by less than one injected leg. A re-contaminated
+    /// field grows by both epoch legs' sleeps (2 × 250 ms); an honest one
+    /// grows only by run-to-run noise. An earlier revision asserted the
+    /// field is strictly less than one injected leg (`INJECTED_MS`)
+    /// outright, which is a claim about how fast the host trains this
+    /// fixture, not about the field's composition — it held on developer
+    /// hosts and on two CI rounds, then read nearly twice the injected leg
+    /// on a loaded shared runner (ci.yml run 35360837371) with the
+    /// composition unchanged; the exact readings are in the wave's rigor
+    /// record. This test prints its own two measurements on every run.
     ///
     /// RED evidence (executed by hand, reverted immediately after): moving
     /// `let train_run_t0 = Instant::now();` back above
-    /// `train_rows.loader(..)` (F1's exact regression) made this test fail
-    /// with `train_run_wall_s (0.5...) must be STRICTLY LESS than the
-    /// injected per-epoch-leg sleep (0.25s)` — `train_run_wall_s` picked up
-    /// both epoch legs' injected sleeps (2 × 250ms), proving this test does
-    /// detect the F1 shape.
+    /// `train_rows.loader(..)` (F1's exact regression) makes this test fail
+    /// by name — `train_run_wall_s` grows by ~0.5 s between the two runs
+    /// against a 0.25 s allowance — proving it detects the F1 shape.
     #[tokio::test]
     async fn train_run_wall_s_excludes_the_loader_build() {
-        let work_dir = tempfile::tempdir().expect("tempdir");
-        let params = non_perturbation_test_params(work_dir.path().to_path_buf());
         const INJECTED_MS: u64 = 250;
-        let (run_result, outer_wall_s) = BlockingCall::spawn_blocking(move |call| {
-            LOADER_BUILD_SLEEP_MS_FOR_TEST.with(|c| c.set(INJECTED_MS));
-            let outer_t0 = Instant::now();
-            let result = run_impl(&call, &params, true);
-            let outer_wall_s = outer_t0.elapsed().as_secs_f64();
-            // Reset before this blocking-pool thread is returned to the pool
-            // and might serve a different, unrelated test.
-            LOADER_BUILD_SLEEP_MS_FOR_TEST.with(|c| c.set(0));
-            (result, outer_wall_s)
-        })
-        .await
-        .expect("join run_impl task");
-        let (tier, _varmap) = run_result.expect("finetune-run");
+        // One run of the fixture with the loader-build sleep set to
+        // `sleep_ms` on its own blocking thread: `(train_run_wall_s, outer
+        // wall-clock of run_impl)`.
+        async fn run_with(sleep_ms: u64) -> (f64, f64) {
+            let work_dir = tempfile::tempdir().expect("tempdir");
+            let params = non_perturbation_test_params(work_dir.path().to_path_buf());
+            let (run_result, outer_wall_s) = BlockingCall::spawn_blocking(move |call| {
+                LOADER_BUILD_SLEEP_MS_FOR_TEST.with(|c| c.set(sleep_ms));
+                let outer_t0 = Instant::now();
+                let result = run_impl(&call, &params, true);
+                let outer_wall_s = outer_t0.elapsed().as_secs_f64();
+                // Reset before this blocking-pool thread is returned to the
+                // pool and might serve a different, unrelated test.
+                LOADER_BUILD_SLEEP_MS_FOR_TEST.with(|c| c.set(0));
+                (result, outer_wall_s)
+            })
+            .await
+            .expect("join run_impl task");
+            let (tier, _varmap) = run_result.expect("finetune-run");
+            (tier.train_run_wall_s, outer_wall_s)
+        }
 
+        let (train_plain, outer_plain) = run_with(0).await;
+        let (train_injected, outer_injected) = run_with(INJECTED_MS).await;
         let injected_s = INJECTED_MS as f64 / 1000.0;
-        assert!(
-            outer_wall_s >= injected_s,
-            "the injected loader-build sleep ({injected_s}s) must show up somewhere in \
-             run_impl's own wall clock ({outer_wall_s}s) -- otherwise the hook never fired"
+        eprintln!(
+            "train_run_wall_s: plain {train_plain:.3}s, injected {train_injected:.3}s; \
+             outer: plain {outer_plain:.3}s, injected {outer_injected:.3}s"
         );
         assert!(
-            tier.train_run_wall_s < injected_s,
-            "train_run_wall_s ({}) must be STRICTLY LESS than the injected per-epoch-leg sleep \
-             ({injected_s}s) -- if RowSet::loader()'s cost re-entered the \
-             train_run_t0..elapsed() span, this field would carry at least one epoch leg's worth \
-             of the injected sleep (and this fixture runs 2 epoch legs, so a re-contaminated \
-             field would read at least {}s)",
-            tier.train_run_wall_s,
+            outer_injected >= injected_s,
+            "the injected loader-build sleep ({injected_s}s) must show up somewhere in \
+             run_impl's own wall clock ({outer_injected}s) -- otherwise the hook never fired"
+        );
+        assert!(
+            train_injected < train_plain + injected_s,
+            "train_run_wall_s grew from {train_plain}s to {train_injected}s when {injected_s}s \
+             was injected into every RowSet::loader() call -- if the loader build re-entered the \
+             train_run_t0..elapsed() span, the field would carry both epoch legs' sleeps \
+             ({}s) on top of the plain run; an honest field grows only by run-to-run noise, \
+             which must stay under one injected leg",
             injected_s * 2.0,
         );
     }

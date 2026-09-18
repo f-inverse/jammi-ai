@@ -518,7 +518,7 @@ pub async fn multi_row_group_pairs(
     .await
     .unwrap();
 
-    let url = jammi_db::storage::StorageUrl::parse(&table.record.parquet_path).unwrap();
+    let url = jammi_db::storage::StorageUrl::parse(table.parquet_path()).unwrap();
     let handle = session.result_store().open_parquet(&url).unwrap();
     let bytes = handle
         .get_bytes(&handle.data_path().unwrap())

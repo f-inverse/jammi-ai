@@ -439,10 +439,7 @@ async fn a_corrupted_leaf_is_caught_on_the_member_before_any_collective_and_ends
     std::fs::write(&path, &tampered).expect("write");
     let url =
         jammi_db::storage::StorageUrl::parse(&format!("file://{}", path.display())).expect("url");
-    let handle = jammi_db::storage::JammiObjectStore::new(
-        jammi_db::storage::build_object_store(&url, None).expect("driver"),
-        url,
-    );
+    let handle = jammi_db::storage::JammiObjectStore::open(&url, None).expect("driver");
 
     let cap = 1 << 20;
     let timeout = Duration::from_secs(10);

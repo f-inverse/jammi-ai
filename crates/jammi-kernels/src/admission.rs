@@ -187,6 +187,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
 
 use candle_core::Device;
+use strum::VariantArray;
 
 use crate::error::{KernelError, Result};
 
@@ -1768,17 +1769,37 @@ pub enum ProbedOpKind {
 /// outside this crate), so another crate can neither construct a fresh
 /// `ProbedOp` value nor mutate a field on one it already holds — both are
 /// plain compiler refusals (`error[E0639]`, `error[E0616]`), not something
-/// this crate has to police at review time. A same-crate forgery inside
-/// `jammi-kernels` itself remains syntactically POSSIBLE (`#[non_exhaustive]`/
-/// field-privacy sealing has no effect within the defining crate), and
-/// nothing here closes it — because nothing needs to: no `DefinitionHash`
-/// or other durable artifact folds a `ProbedOp` row's admission outcome in
-/// (see `jammi_db::store::manifest::MaterializationEnv::kernel_admission_profile`'s
-/// own doc), so a same-crate forgery has no downstream property to violate.
-/// `ci/tools/probed-ops-index` and the eager-disable sweep
-/// (`ci/scripts/perf/test_finetune_ab_disable_op_keys.py`) both enumerate
-/// [`PROBED_OPS`] itself — the TABLE's rows — which is exactly what they
-/// claim to do; neither depends on same-crate construction being sealed.
+/// this crate has to police at review time:
+///
+/// ```compile_fail
+/// // Outside `jammi_kernels`, every field is invisible, so a struct
+/// // literal cannot even name its fields — the compiler proves this,
+/// // not a runtime check or a syn oracle over construction shapes.
+/// let _ = jammi_kernels::admission::ProbedOp {
+///     report_key: "forged",
+///     kind: jammi_kernels::admission::ProbedOpKind::TwoArm,
+///     registry: &[],
+/// };
+/// ```
+///
+/// A same-crate forgery inside `jammi-kernels` itself remains syntactically
+/// POSSIBLE (`#[non_exhaustive]`/field-privacy sealing has no effect within
+/// the defining crate), and nothing here closes it — because nothing needs
+/// to. **#546 K1 update:** a real, hash-affecting fold now exists
+/// (`jammi_db::store::manifest::MaterializationEnv::kernel_admission_profile`,
+/// written by `jammi-ai`'s fine-tune worker from
+/// [`render_kernel_admission_profile`]'s return value), but it is BY
+/// CONSTRUCTION immune to a same-crate `ProbedOp` forgery: the fold
+/// enumerates [`ProbedOpId::ALL`] (a fixed, compiler-checked 15-variant
+/// list) and reads each variant's row through [`ProbedOpId::row`]'s total
+/// `match` — [`render_kernel_admission_profile`]'s own signature never
+/// accepts a `ProbedOp` value as an argument or iterates any
+/// externally-extensible collection of them, so a local `ProbedOp::new(..)`
+/// forged elsewhere in this crate has no expression that ever hands it to
+/// the profile renderer. `ci/tools/probed-ops-index` and the eager-disable
+/// sweep (`ci/scripts/perf/test_finetune_ab_disable_op_keys.py`) enumerate
+/// [`ProbedOpId::ALL`]/[`PROBED_OPS`] the same way — never a same-crate
+/// `ProbedOp` value a caller happens to be holding.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ProbedOp {
@@ -2121,6 +2142,264 @@ pub const PROBED_OPS: &[ProbedOp] = &[
 /// The [`PROBED_OPS`] row with this `report_key`, or `None`.
 pub fn probed_op(report_key: &str) -> Option<&'static ProbedOp> {
     PROBED_OPS.iter().find(|op| op.report_key == report_key)
+}
+
+// =============================================================================
+// #546 K1: the CLOSED enum identity (third attempt, by construction)
+// =============================================================================
+//
+// The first two attempts (`scratchpad/issue-546.md`'s 2026-09-17 comment;
+// this crate's own git history) tried to prove "no forged `ProbedOp` folds
+// into a durable hash" with an ENUMERATING oracle over an OPEN type: a `syn`
+// scan of every construction shape in this crate. That oracle was blocked
+// three times with executed bypasses (UFCS, macro invocations, `use ... as`
+// aliases, a mutated copy behind a non-`Type::Path` return type, and the
+// honest residual — a `transmute`/raw-pointer cast a syntax-only scan cannot
+// resolve). [`ProbedOpId`] answers the closing question instead: make the
+// determinant BY CONSTRUCTION, so the fold never takes a [`ProbedOp`] value
+// at all — there is nothing for a forged row to enter.
+
+/// The CLOSED set of admission-relevant ops — one variant per [`PROBED_OPS`]
+/// row. This is the identity a durable, hash-affecting fold reads (K1/K2),
+/// replacing the open `PROBED_OPS` table/string-keyed enumeration as the
+/// enumeration boundary for anything that must be provably COMPLETE over
+/// every admission-gated op this crate knows about.
+///
+/// `#[non_exhaustive]` is FORBIDDEN on this enum, on purpose: the property
+/// this type exists to prove is TOTALITY — every variant has exactly one
+/// row, enforced by [`Self::row`]'s exhaustive `match` — and
+/// `#[non_exhaustive]` would let a downstream crate (or a future commit in
+/// this one) add a variant without the compiler ever re-checking that every
+/// existing exhaustive match still covers it.
+///
+/// **The mutation this compiler-anchoring defeats:** add a sixteenth variant
+/// here without adding its arm to [`Self::row`] — `cargo build` refuses with
+/// `error[E0004]: non-exhaustive patterns` (a `match` with no wildcard arm),
+/// not a runtime gap an oracle has to notice. `probed_op_id_variants_cover_every_probed_ops_row`
+/// (this module's own tests) is the executed proof that today's 15 variants
+/// and [`PROBED_OPS`]'s 15 rows name the exact same set — not merely that
+/// `row()` compiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, strum::VariantArray)]
+pub enum ProbedOpId {
+    LayerNorm,
+    Rope,
+    Softmax,
+    Geglu,
+    GeluErf,
+    AttentionBlock,
+    Dropout,
+    LowRankResidualLinear,
+    CastScale,
+    CastAdd,
+    AdamwStep,
+    MemEfficientAttention,
+    AttentionBlockFlash,
+    RopePositions,
+    ScaledCastAdd,
+}
+
+impl ProbedOpId {
+    /// Every variant, in declaration order — this crate's own inherent
+    /// forwarder for `#[derive(VariantArray)]`'s [`strum::VariantArray::VARIANTS`],
+    /// so a consumer crate (`jammi-ai`, `ci/tools/probed-ops-index`) reads
+    /// the closed enumeration through `ProbedOpId::ALL` without adding its
+    /// own `strum` dependency — the same forwarding shape
+    /// `jammi_numerics::WeightQuantization::ALL` and
+    /// `jammi_db::catalog::status::JobStatus::ALL` already use. Declaration
+    /// order matches [`Ord`]'s derived order (both come from the same
+    /// variant list), so folding [`Self::ALL`] in order is the "sorted by
+    /// variant order" the profile string (K2) needs — never a `HashMap`/
+    /// `HashSet` iteration order (family J).
+    pub const ALL: &'static [Self] = <Self as VariantArray>::VARIANTS;
+
+    /// This variant's [`PROBED_OPS`] row.
+    ///
+    /// A TOTAL `match` — no wildcard arm — so the compiler itself is the
+    /// enforcement mechanism: [`ProbedOpId`] gaining a variant without a
+    /// corresponding arm here fails to compile (`error[E0004]`) rather than
+    /// shipping a silently-incomplete profile. `const fn` so this is usable
+    /// in a `const` context exactly like the named row consts
+    /// ([`LAYER_NORM`], [`ROPE`], …) it returns references to.
+    pub const fn row(self) -> &'static ProbedOp {
+        match self {
+            ProbedOpId::LayerNorm => &LAYER_NORM,
+            ProbedOpId::Rope => &ROPE,
+            ProbedOpId::Softmax => &SOFTMAX,
+            ProbedOpId::Geglu => &GEGLU,
+            ProbedOpId::GeluErf => &GELU_ERF,
+            ProbedOpId::AttentionBlock => &ATTENTION_BLOCK,
+            ProbedOpId::Dropout => &DROPOUT,
+            ProbedOpId::LowRankResidualLinear => &LOW_RANK_RESIDUAL_LINEAR,
+            ProbedOpId::CastScale => &CAST_SCALE,
+            ProbedOpId::CastAdd => &CAST_ADD,
+            ProbedOpId::AdamwStep => &ADAMW_STEP,
+            ProbedOpId::MemEfficientAttention => &MEM_EFFICIENT_ATTENTION,
+            ProbedOpId::AttentionBlockFlash => &ATTENTION_BLOCK_FLASH,
+            ProbedOpId::RopePositions => &ROPE_POSITIONS,
+            ProbedOpId::ScaledCastAdd => &SCALED_CAST_ADD,
+        }
+    }
+}
+
+// =============================================================================
+// #546 K2' (pressure-round fold, 2026-09-17: the observed-outcome K2 above
+// was DELETED, not demoted — see `ProbedOpId`'s own doc for the executed
+// reasons: `Catalog::probe_model_by_definition` computes a `DefinitionHash`
+// BEFORE the work to look up whether it already exists, so a profile
+// knowable only AFTER training makes that lookup impossible for the very
+// run it would describe; the counter registry is also process-global and
+// `counters_for(..).record(..)` is `pub`, so an observed-outcome fold was
+// never sealed the way K1's row identity is).
+// =============================================================================
+//
+// K2' folds only EX ANTE facts — known before training runs, and every one
+// BY CONSTRUCTION: [`BUILD_FACTS`] (this crate's own compiled feature set),
+// [`admission_mode`], the caller's disabled-op set, and the job's
+// [`DtypeClass`]. None of these require observing a single `admit` call.
+
+/// The closed set of BUILD-TIME facts that gate admission for this crate —
+/// every cargo feature `jammi-kernels` itself exposes that a [`ProbedOp`]
+/// row's admission predicate can depend on. `(name, this build's value)`
+/// pairs, in this FIXED declaration order.
+///
+/// **Never re-derive this via `cfg!` at a fold site outside this crate.**
+/// `jammi-ai` (or any other consumer) reading its OWN `cuda`/`metal`
+/// Cargo features would be WRONG under workspace feature unification:
+/// `cargo tree -p jammi-ai -e features` can show `jammi-kernels` built
+/// with `cuda` ON while `jammi-ai`'s OWN `cuda` feature is OFF (a sibling
+/// crate in the same build graph turned it on). Only THIS crate's own
+/// `cfg!` is truthful about what THIS crate compiled — the same reasoning
+/// [`CUDA_COMPILED`]/[`FLASH_COMPILED`]'s own docs already give for why
+/// they are plain, unconditionally-compiled consts rather than something a
+/// caller infers from its own feature flags.
+pub const BUILD_FACTS: &[(&str, bool)] = &[
+    ("cuda", CUDA_COMPILED),
+    ("flash-attn", FLASH_COMPILED),
+    ("metal", cfg!(feature = "metal")),
+];
+
+/// Renders the #546 K2' canonical kernel-admission profile string — the
+/// value `jammi_db::store::manifest::MaterializationEnv::with_kernel_admission_profile`
+/// receives (`jammi-db` cannot depend on this crate, so the caller —
+/// `jammi-ai`'s fine-tune worker — calls this and hands the resulting
+/// `String` across, the same "db-local primitive standing in for a
+/// foreign type" shape that field's own doc describes).
+///
+/// **`dtype` must be the job's OWN declared training dtype**
+/// (`jammi_wire::fine_tune::FineTuneConfig::backbone_dtype`) — the SAME
+/// value `ops::low_rank_residual_linear::admit_cast_boundary`'s
+/// `registry_keys_for(dtype)` resolves a real dispatch against, and the
+/// SAME value `jammi-ai`'s own `probe_acceleration`/`dtype_class_of`
+/// resolves the esc-075 report's dtype class from. It is NEVER a loaded
+/// model's own `compute_precision()` (the base model's ON-DISK weight
+/// dtype) — a DIFFERENT axis entirely: `jammi-lora` trains its adapters at
+/// single precision (f32) regardless of `backbone_dtype`, and the base model
+/// can be loaded at f32 while `backbone_dtype` casts the FORWARD activations
+/// to bf16/f16 — passing the loaded model's own precision here instead
+/// makes an f16-backbone CPU job render the f32 dtype class: every
+/// `cast_scale`/`cast_add` line then reads `n/a`, and
+/// `JAMMI_KERNELS_DISABLE=cast_scale_f16_f32` never moved that job's
+/// `DefinitionHash` at all).
+///
+/// # Panics
+/// If `dtype` is [`DtypeClass::Any`] — that variant is a TABLE-ENTRY class
+/// (a dtype-neutral row's SOLE registry key is filed under it), never a
+/// JOB's own dtype: no real job ever declares `backbone_dtype: Any`, and a
+/// caller with no concrete dtype in hand must not silently render a
+/// profile at all (every `n/a`/`enabled` line would be a confident-wrong
+/// guess, family D) — it must resolve a real dtype first.
+///
+/// One line per [`ProbedOpId`] variant, in [`ProbedOpId::ALL`]'s
+/// declaration order: `report_key=<disabled|enabled|n/a>`. The predicate
+/// this renders is EXACTLY the one production admission applies for a job
+/// at `dtype`, never a dtype-blind approximation: `op.registry_keys_for(dtype).next()`
+/// — the SAME resolution `ops::low_rank_residual_linear::admit_cast_boundary`
+/// uses to pick the one real registry key `admit_by_key`/`op_is_disabled`
+/// then check `disabled` against (closing round audit finding: an earlier
+/// revision checked [`ProbedOp::all_registry_keys`] — EVERY dtype's key —
+/// which collapsed a real determinant, since `disabled=[cast_scale_bf16_f32]`
+/// and `disabled=[cast_scale_f16_f32]` rendered byte-identically at
+/// `dtype=Bf16` despite disabling DIFFERENT real dispatches, and a build
+/// with `cast_scale_bf16_f32` disabled moved the rendered string — and
+/// therefore the published `DefinitionHash` — even for an f32 job that
+/// can never dispatch that key at all):
+///
+/// - **`n/a`**: this row has NO registry key for `dtype`
+///   (`registry_keys_for(dtype).next()` is `None`) — [`CAST_SCALE`]/
+///   [`CAST_ADD`] under the f32 [`DtypeClass`] (their two dtype-branching
+///   entries are the bf16/f16 classes only, never `Any`), or a
+///   [`ProbedOpKind::InternalSubkernel`] row (an always-empty registry —
+///   `admit`/`admit_cascade` are never called for it under ANY dtype).
+///   `n/a` is never conflated with `enabled` OR `disabled` — including
+///   under the `"all"` wildcard (see `disabled`'s own bullet below): a row
+///   that cannot dispatch under this job's dtype at all is a DIFFERENT
+///   fact from one that can and simply isn't disabled, and `admit`/
+///   `admit_cascade`/`op_is_disabled` are never even CALLED for it
+///   regardless of the disabled set, so there is no real admission
+///   decision the wildcard could be said to have overridden.
+/// - **`disabled`**: this row HAS a resolved key for `dtype`, and either
+///   that key is named in `disabled` (typically
+///   [`disabled_ops_requested`]'s return) or `disabled` contains the
+///   `"all"` wildcard. `"all"` and an EXPLICIT list naming every row's own
+///   resolved key at THIS `dtype` therefore render IDENTICALLY — the same
+///   real admission decision (every reachable op forced eager) reads the
+///   same profile line either way, never two different strings for one
+///   underlying policy.
+/// - **`enabled`**: this row has a resolved key for `dtype` and it is not
+///   named in `disabled` (and `"all"` is absent).
+///
+/// Followed by [`BUILD_FACTS`] (`name=bool`, declaration order),
+/// `admission_mode=<AdmissionMode Debug>`, and `dtype_class=<DtypeClass
+/// Debug>`.
+///
+/// **This function's signature takes no [`ProbedOp`] value** — only
+/// `dtype`, `mode`, and `disabled` (plain data). The profile is a total
+/// function of [`ProbedOpId::ALL`]'s closed enumeration, never of a
+/// `ProbedOp` a caller happens to be holding (K1): there is no expression
+/// in this fold that could ever be handed a same-crate-forged row, even if
+/// one existed.
+///
+/// Deterministic for fixed inputs (family J): variant order and
+/// [`BUILD_FACTS`] order are compile-time fixed, and `dtype`/`mode`/
+/// `disabled` are plain, caller-supplied data — the same three arguments
+/// always render the same string, regardless of process history or any
+/// `admit`/`admit_cascade` call this process has made.
+pub fn render_kernel_admission_profile(
+    dtype: DtypeClass,
+    mode: AdmissionMode,
+    disabled: &[String],
+) -> String {
+    assert_ne!(
+        dtype,
+        DtypeClass::Any,
+        "render_kernel_admission_profile: DtypeClass::Any is a table-entry class (a \
+         dtype-neutral row's registry key), never a job's own backbone dtype — resolve the \
+         job's real FineTuneConfig::backbone_dtype before rendering a profile"
+    );
+    let disabled_set: HashSet<&str> = disabled.iter().map(String::as_str).collect();
+    let wildcard = disabled_set.contains("all");
+    let mut lines: Vec<String> = ProbedOpId::ALL
+        .iter()
+        .map(|id| {
+            let row = id.row();
+            let state = match row.registry_keys_for(dtype).next() {
+                // No key at this dtype at all: `admit`/`admit_cascade`/
+                // `op_is_disabled` are never reached for this row under ANY
+                // disabled set, so the wildcard has nothing real to
+                // override — `n/a` stays `n/a` even under `"all"`.
+                None => "n/a",
+                Some(key) if wildcard || disabled_set.contains(key) => "disabled",
+                Some(_) => "enabled",
+            };
+            format!("{}={state}", row.report_key())
+        })
+        .collect();
+    for (name, value) in BUILD_FACTS {
+        lines.push(format!("{name}={value}"));
+    }
+    lines.push(format!("admission_mode={mode:?}"));
+    lines.push(format!("dtype_class={dtype:?}"));
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -4145,5 +4424,325 @@ mod tests {
             cast_scale.all_registry_keys().collect::<Vec<_>>(),
             vec!["cast_scale_bf16_f32", "cast_scale_f16_f32"]
         );
+    }
+
+    // =========================================================================
+    // #546 K1/K2': `ProbedOpId`, `ProbedOpId::row`, `render_kernel_admission_profile`
+    // =========================================================================
+
+    /// K1's completeness oracle: [`ProbedOpId::ALL`] and [`PROBED_OPS`] name
+    /// the EXACT same set of rows — not merely that [`ProbedOpId::row`]
+    /// compiles for every variant (the compiler already forces that; this
+    /// is the OTHER direction, that no [`PROBED_OPS`] row is missing a
+    /// variant).
+    ///
+    /// Mutation executed for this contract (K1's stop-rule mutation,
+    /// reverted before commit): adding a sixteenth `ProbedOpId` variant
+    /// (`Bogus`) without a matching arm in [`ProbedOpId::row`] fails
+    /// `cargo build -p jammi-kernels` with `error[E0004]: non-exhaustive
+    /// patterns: \`ProbedOpId::Bogus\` not covered` — the totality property
+    /// is therefore enforced by the compiler, not by this test (this test
+    /// instead pins the SEPARATE property that today's 15 variants and 15
+    /// rows already agree).
+    #[test]
+    fn probed_op_id_variants_cover_every_probed_ops_row() {
+        assert_eq!(
+            ProbedOpId::ALL.len(),
+            PROBED_OPS.len(),
+            "ProbedOpId::ALL and PROBED_OPS must name the same number of rows"
+        );
+        let from_ids: std::collections::BTreeMap<&str, ()> = ProbedOpId::ALL
+            .iter()
+            .map(|id| (id.row().report_key(), ()))
+            .collect();
+        let from_table: std::collections::BTreeMap<&str, ()> =
+            PROBED_OPS.iter().map(|op| (op.report_key(), ())).collect();
+        assert_eq!(
+            from_ids.keys().collect::<Vec<_>>(),
+            from_table.keys().collect::<Vec<_>>(),
+            "ProbedOpId::ALL's row set and PROBED_OPS's row set must be identical"
+        );
+    }
+
+    /// Every [`ProbedOpId`] variant's `report_key` is unique (K1's other
+    /// named oracle) — a duplicate would let two variants silently collapse
+    /// onto the same profile-string line.
+    #[test]
+    fn probed_op_id_report_keys_are_unique() {
+        let mut seen = HashSet::new();
+        for id in ProbedOpId::ALL {
+            assert!(
+                seen.insert(id.row().report_key()),
+                "duplicate report_key {:?} across ProbedOpId variants",
+                id.row().report_key()
+            );
+        }
+    }
+
+    /// [`ProbedOpId::ALL`] is in DECLARATION order (K2's "sorted by variant
+    /// order" requirement) — pinned against the literal expected sequence,
+    /// not merely "some order", since a profile string's byte content is a
+    /// determinism property (family J).
+    #[test]
+    fn probed_op_id_all_is_in_declaration_order() {
+        let keys: Vec<&str> = ProbedOpId::ALL
+            .iter()
+            .map(|id| id.row().report_key())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "layer_norm",
+                "rope",
+                "softmax",
+                "geglu",
+                "gelu_erf",
+                "attention_block",
+                "dropout",
+                "low_rank_residual_linear",
+                "cast_scale",
+                "cast_add",
+                "adamw_step",
+                "mem_efficient_attention",
+                "attention_block_flash",
+                "rope_positions",
+                "scaled_cast_add",
+            ]
+        );
+    }
+
+    /// K2'(a)'s dtype-neutral facts: [`BUILD_FACTS`] and `admission_mode`/
+    /// `dtype_class` all appear, and toggling the disabled set changes
+    /// exactly the named variant's own line (never another's).
+    #[test]
+    fn render_kernel_admission_profile_names_a_disabled_variant_and_nothing_else() {
+        let none_disabled =
+            render_kernel_admission_profile(DtypeClass::F32, AdmissionMode::Fallback, &[]);
+        let layer_norm_disabled = render_kernel_admission_profile(
+            DtypeClass::F32,
+            AdmissionMode::Fallback,
+            &["layer_norm_fused".to_string()],
+        );
+        assert_ne!(
+            none_disabled, layer_norm_disabled,
+            "disabling a registry key must change the rendered profile"
+        );
+        assert!(none_disabled.contains("layer_norm=enabled"));
+        assert!(layer_norm_disabled.contains("layer_norm=disabled"));
+        // Nothing else moved: every OTHER row's line is byte-identical
+        // between the two renders.
+        let other_lines_none: Vec<&str> = none_disabled
+            .lines()
+            .filter(|l| !l.starts_with("layer_norm="))
+            .collect();
+        let other_lines_disabled: Vec<&str> = layer_norm_disabled
+            .lines()
+            .filter(|l| !l.starts_with("layer_norm="))
+            .collect();
+        assert_eq!(
+            other_lines_none, other_lines_disabled,
+            "disabling layer_norm_fused must not change any other row's line"
+        );
+    }
+
+    /// The `"all"` wildcard disables every row that HAS a resolved key at
+    /// this dtype — but never an `n/a` row: `admit`/`admit_cascade`/
+    /// `op_is_disabled` are never even called for an `n/a` row under ANY
+    /// disabled set, so there is no real admission decision `"all"` could
+    /// be said to override.
+    /// At `dtype=F32`, `cast_scale`/`cast_add` (dtype-branching, no `Any`
+    /// entry) and the two `InternalSubkernel` rows all stay `n/a`; every
+    /// OTHER row (dtype-neutral, always has a key) reads `disabled`.
+    #[test]
+    fn render_kernel_admission_profile_all_wildcard_disables_every_applicable_row_only() {
+        let profile = render_kernel_admission_profile(
+            DtypeClass::F32,
+            AdmissionMode::Fallback,
+            &["all".to_string()],
+        );
+        let n_a_rows = [
+            "cast_scale",
+            "cast_add",
+            "rope_positions",
+            "scaled_cast_add",
+        ];
+        for id in ProbedOpId::ALL {
+            let report_key = id.row().report_key();
+            let expected_state = if n_a_rows.contains(&report_key) {
+                "n/a"
+            } else {
+                "disabled"
+            };
+            let expected = format!("{report_key}={expected_state}");
+            assert!(
+                profile.contains(&expected),
+                "profile missing {expected:?} under JAMMI_KERNELS_DISABLE=all at F32:\n{profile}"
+            );
+        }
+    }
+
+    /// The `"all"` wildcard and an EXPLICIT list naming every row's OWN
+    /// resolved key at a given dtype must render IDENTICALLY: the same
+    /// real admission decision — every reachable op forced eager — reads
+    /// the same profile line either way, never two different strings for
+    /// one underlying policy.
+    #[test]
+    fn render_kernel_admission_profile_all_equals_the_explicit_full_key_list_at_a_dtype() {
+        for dtype in [DtypeClass::F32, DtypeClass::Bf16, DtypeClass::F16] {
+            let via_wildcard = render_kernel_admission_profile(
+                dtype,
+                AdmissionMode::Fallback,
+                &["all".to_string()],
+            );
+            let every_real_key: Vec<String> = ProbedOpId::ALL
+                .iter()
+                .filter_map(|id| id.row().registry_keys_for(dtype).next())
+                .map(str::to_string)
+                .collect();
+            let via_explicit_list =
+                render_kernel_admission_profile(dtype, AdmissionMode::Fallback, &every_real_key);
+            assert_eq!(
+                via_wildcard, via_explicit_list,
+                "at {dtype:?}: \"all\" and the explicit list of every row's own resolved key \
+                 must render the identical profile"
+            );
+        }
+    }
+
+    /// `DtypeClass::Any` is a table-ENTRY class, never a job's own dtype —
+    /// the renderer refuses it outright rather than silently emitting a
+    /// confident-wrong `n/a`/`enabled` guess.
+    #[test]
+    #[should_panic(expected = "DtypeClass::Any is a table-entry class")]
+    fn render_kernel_admission_profile_refuses_dtype_class_any() {
+        render_kernel_admission_profile(DtypeClass::Any, AdmissionMode::Fallback, &[]);
+    }
+
+    /// A dtype-branching row ([`CAST_SCALE`]) gets exactly ONE line, keyed
+    /// by `report_key` — never [`ProbedOp::dtype_neutral_key`] (which would
+    /// panic for this row; K1's totality is stated over the row, not over a
+    /// dtype-neutral key).
+    #[test]
+    fn render_kernel_admission_profile_never_panics_on_a_dtype_branching_row() {
+        let profile = render_kernel_admission_profile(DtypeClass::Bf16, AdmissionMode::Strict, &[]);
+        assert_eq!(
+            profile
+                .lines()
+                .filter(|l| l.starts_with("cast_scale="))
+                .count(),
+            1
+        );
+        assert!(profile.contains("cast_scale=enabled"));
+    }
+
+    /// CLOSING-AUDIT BLOCK, FIXED: the predicate resolves the row's key for
+    /// THIS job's dtype exactly as production admission does
+    /// (`admit_cast_boundary`'s `registry_keys_for(dtype).next()`), never
+    /// [`ProbedOp::all_registry_keys`] (every dtype's key at once, which
+    /// collapses a real determinant). `cast_scale_bf16_f32` disabled at
+    /// `dtype=Bf16` renders `cast_scale=disabled`; the SAME disabled list at
+    /// `dtype=F16` renders `cast_scale=enabled` (F16's OWN key,
+    /// `cast_scale_f16_f32`, was never named) — the two strings differ.
+    ///
+    /// Mutation EXECUTED (reverted before commit): reverting the predicate
+    /// to `row.all_registry_keys().any(|k| disabled_set.contains(k))` makes
+    /// this test red — both dtypes then render `cast_scale=disabled`
+    /// regardless of which dtype-specific key was actually named.
+    #[test]
+    fn render_kernel_admission_profile_resolves_the_disabled_check_per_dtype_not_across_all_dtypes()
+    {
+        let disabled = vec!["cast_scale_bf16_f32".to_string()];
+        let bf16 =
+            render_kernel_admission_profile(DtypeClass::Bf16, AdmissionMode::Fallback, &disabled);
+        let f16 =
+            render_kernel_admission_profile(DtypeClass::F16, AdmissionMode::Fallback, &disabled);
+        assert!(
+            bf16.contains("cast_scale=disabled"),
+            "cast_scale_bf16_f32 disabled at dtype=Bf16 must read disabled: {bf16}"
+        );
+        assert!(
+            f16.contains("cast_scale=enabled"),
+            "cast_scale_bf16_f32 disabled at dtype=F16 must NOT disable cast_scale's F16 key \
+             (cast_scale_f16_f32 was never named): {f16}"
+        );
+        assert_ne!(
+            bf16, f16,
+            "the same disabled list must render DIFFERENT strings at Bf16 vs F16 — a \
+             dtype-blind check would collapse this to the same line"
+        );
+    }
+
+    /// A row whose dtype-branching entries are `Bf16`/`F16` only (never
+    /// `Any`) has NO key under [`DtypeClass::F32`] — its line reads `n/a`,
+    /// never `enabled` (which would falsely claim this row COULD dispatch
+    /// on an F32 job) and never `disabled` (nothing was actually named).
+    /// Also proves an F32 job's `JAMMI_KERNELS_DISABLE=cast_scale_bf16_f32`
+    /// does NOT move `cast_scale`'s own line (it is `n/a` either way) —
+    /// the over-discrimination half of the closing-audit finding.
+    #[test]
+    fn render_kernel_admission_profile_f32_renders_n_a_for_cast_rows() {
+        let bare = render_kernel_admission_profile(DtypeClass::F32, AdmissionMode::Fallback, &[]);
+        assert!(bare.contains("cast_scale=n/a"), "{bare}");
+        assert!(bare.contains("cast_add=n/a"), "{bare}");
+
+        let disabled = render_kernel_admission_profile(
+            DtypeClass::F32,
+            AdmissionMode::Fallback,
+            &["cast_scale_bf16_f32".to_string()],
+        );
+        assert_eq!(
+            bare, disabled,
+            "an F32 job's rendered profile must not move when a key F32 can never resolve is \
+             named in JAMMI_KERNELS_DISABLE"
+        );
+    }
+
+    /// The two [`ProbedOpKind::InternalSubkernel`] rows (empty registry
+    /// under every dtype) render `n/a` under a NON-wildcard disabled set —
+    /// and, per `render_kernel_admission_profile_all_wildcard_disables_every_applicable_row_only`,
+    /// UNDER the wildcard too: an empty-registry row has no
+    /// real admission decision for `"all"` to override either way.
+    #[test]
+    fn render_kernel_admission_profile_internal_subkernel_rows_are_n_a_without_the_wildcard() {
+        let profile = render_kernel_admission_profile(
+            DtypeClass::F32,
+            AdmissionMode::Fallback,
+            &["layer_norm_fused".to_string()],
+        );
+        assert!(profile.contains("rope_positions=n/a"), "{profile}");
+        assert!(profile.contains("scaled_cast_add=n/a"), "{profile}");
+    }
+
+    /// [`BUILD_FACTS`], `admission_mode`, and `dtype_class` all render —
+    /// dropping any one of them from the fold is the mutation this pins
+    /// against (each must appear literally).
+    #[test]
+    fn render_kernel_admission_profile_includes_every_ex_ante_fact() {
+        let profile = render_kernel_admission_profile(
+            DtypeClass::F16,
+            AdmissionMode::Strict,
+            &["rope_fused".to_string()],
+        );
+        for (name, value) in BUILD_FACTS {
+            assert!(
+                profile.contains(&format!("{name}={value}")),
+                "missing build fact {name}={value} in:\n{profile}"
+            );
+        }
+        assert!(profile.contains("admission_mode=Strict"));
+        assert!(profile.contains("dtype_class=F16"));
+    }
+
+    /// Determinism (K2'(c)): the same three arguments always render the
+    /// same string — no `HashMap`/`HashSet` iteration order anywhere in the
+    /// fold (family J).
+    #[test]
+    fn render_kernel_admission_profile_is_deterministic() {
+        let disabled = vec!["geglu_fused".to_string(), "adamw_step_fused".to_string()];
+        let a =
+            render_kernel_admission_profile(DtypeClass::Bf16, AdmissionMode::Fallback, &disabled);
+        let b =
+            render_kernel_admission_profile(DtypeClass::Bf16, AdmissionMode::Fallback, &disabled);
+        assert_eq!(a, b);
     }
 }

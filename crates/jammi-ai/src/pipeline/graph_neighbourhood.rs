@@ -142,6 +142,30 @@ impl Adjacency {
         self.edges.get(node).map_or(&[], Vec::as_slice)
     }
 
+    /// A byte estimate for this adjacency's resident set (GA7, issue #538):
+    /// every key id plus every neighbour id's own bytes, PLUS each
+    /// `String`'s and each `HashMap`/`Vec` slot's real struct overhead
+    /// (`std::mem::size_of::<String>()`/`size_of::<usize>()` — a MEASURED
+    /// platform constant, not an arbitrary multiplier). Rounds UP from a
+    /// text-only floor toward the allocator's real footprint rather than
+    /// ignoring the container overhead entirely; still not an exact
+    /// allocator accounting (no load-factor/capacity-growth headroom).
+    pub(crate) fn resident_bytes(&self) -> usize {
+        const STRING_OVERHEAD: usize = std::mem::size_of::<String>();
+        const SLOT_OVERHEAD: usize = std::mem::size_of::<usize>();
+        self.edges
+            .iter()
+            .map(|(k, v)| {
+                k.len()
+                    + STRING_OVERHEAD
+                    + SLOT_OVERHEAD
+                    + v.iter()
+                        .map(|s| s.len() + STRING_OVERHEAD + SLOT_OVERHEAD)
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+
     /// Bounded breadth-first gather from `start`, capped at `hops` frontiers.
     ///
     /// At each node, if `fanout` is set and the node has more neighbours than

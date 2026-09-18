@@ -73,7 +73,7 @@ use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::config::{GpuConfig, JammiConfig};
 use jammi_db::model_task::ModelTask;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_db::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
+use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 
 use crate::report::{ContextPredictorTier, DeterminismGate, Measurement, RateVerdict};
 
@@ -287,8 +287,7 @@ async fn dataset_session(
     let path = dir.path().join("source.parquet");
     let url = StorageUrl::parse(path.to_str().ok_or("source path is not valid UTF-8")?)?;
     let registry = StorageRegistry::new();
-    let driver = registry.driver_for(&url, None)?;
-    let handle = JammiObjectStore::new(driver, url.clone());
+    let handle = registry.handle_for(&url, None)?;
     let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema)).await?;
     writer.write_batch(&batch).await?;
     writer.close().await?;

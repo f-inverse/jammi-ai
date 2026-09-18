@@ -36,7 +36,8 @@ use serde::{Deserialize, Serialize};
 
 use super::backend::{BackendError, BackendKind, Row, SqlValue, TxOptions};
 use super::instance::{
-    decode_devices_json, DeviceFact, GangListing, GangMember, InstanceRegistration, PeerAddr,
+    decode_devices_json, live_with_root_clause, DeviceFact, GangListing, GangMember,
+    InstanceRegistration, PeerAddr,
 };
 use super::lease::{
     canonical_stamp_now, instance_liveness_margin, lease_deadline_expr, lease_expired_clause,
@@ -765,6 +766,13 @@ struct GangCandidateRow {
     peer_addr: String,
     kinds: String,
     state: String,
+}
+
+/// One `instances` ring candidate row for [`Catalog::list_ring_members`] —
+/// no `workers` join, so no `kinds`/`state` columns exist to carry.
+struct RingCandidateRow {
+    instance_id: String,
+    peer_addr: String,
 }
 
 /// The `workers.state` vocabulary (migration 031, CHECK-constrained at the
@@ -2786,17 +2794,15 @@ impl Catalog {
                 |tx| {
                     Box::pin(async move {
                         let mut params: Vec<SqlValue<'static>> = Vec::new();
-                        let stale =
-                            stale_before_clause("i.last_seen_at", kind, margin, &mut params);
                         params.push(SqlValue::TextOwned(root_identity));
-                        let identity_bind = params.len();
+                        let identity_bind = format!("${}", params.len());
+                        let live_with_root =
+                            live_with_root_clause("i", kind, margin, &identity_bind, &mut params);
                         let sql = format!(
                             "SELECT i.instance_id AS instance_id, i.peer_addr AS peer_addr, \
                                     w.kinds AS kinds, w.state AS state \
                              FROM instances i JOIN workers w ON w.instance_id = i.instance_id \
-                             WHERE i.peer_addr IS NOT NULL \
-                               AND i.result_root_identity = ${identity_bind} \
-                               AND NOT ({stale})"
+                             WHERE {live_with_root}"
                         );
                         tx.query(&sql, &params, |row| {
                             Ok(GangCandidateRow {
@@ -2841,6 +2847,81 @@ impl Catalog {
             });
         }
         members.sort_by(|a, b| a.instance_id.as_bytes().cmp(b.instance_id.as_bytes()));
+        Ok(members)
+    }
+
+    /// The RENDEZVOUS ring: every LIVE `instances` row sharing
+    /// `self_instance_id`'s OWN result root, `peer_addr` set — SELF INCLUDED
+    /// (unlike [`Self::list_gang_members`]). No `workers` join, no kind
+    /// vocabulary: placement is generic over what a segment owner does with
+    /// a request, never coupled to the gang/job vocabulary.
+    ///
+    /// ONE statement: `self_instance_id`'s own `result_root_identity` is
+    /// named by a self-referencing subquery on `instances` rather than
+    /// resolved in a first round trip and re-bound in a second — this
+    /// process's root identity has exactly one source of truth (its own
+    /// catalog row), never a second Rust-side copy that could drift from it.
+    /// Liveness + root-sharing is `live_with_root_clause`, the SAME
+    /// fragment [`Self::list_gang_members`] evaluates (`docs/plans/
+    /// 68-compute-tier-substrate/units/DIST-DATA-PLANE.md`'s "one definition
+    /// of live with my root").
+    ///
+    /// A caller whose own row is absent (never yet registered, or pruned)
+    /// gets an empty ring, never a fault: [`crate::index::peer::
+    /// RendezvousPlacement`] treats that identically to a genuinely empty
+    /// ring (all-local, counted).
+    ///
+    /// # Errors
+    ///
+    /// A stored `peer_addr` that fails [`PeerAddr::parse`] is a typed
+    /// [`JammiError::Catalog`] naming the corrupted instance — the SAME
+    /// refusal [`Self::list_gang_members`] gives for the identical row fault.
+    pub async fn list_ring_members(
+        &self,
+        self_instance_id: &str,
+        margin: Duration,
+    ) -> Result<Vec<super::instance::RingMember>> {
+        let kind = self.backend().backend_kind();
+        let self_instance_id = self_instance_id.to_string();
+        let mut params: Vec<SqlValue<'static>> = Vec::new();
+        params.push(SqlValue::TextOwned(self_instance_id));
+        let self_bind = params.len();
+        let root_identity_expr =
+            format!("SELECT result_root_identity FROM instances WHERE instance_id = ${self_bind}");
+        let live_with_root =
+            live_with_root_clause("instances", kind, margin, &root_identity_expr, &mut params);
+        let sql = format!(
+            "SELECT instance_id AS instance_id, peer_addr AS peer_addr \
+             FROM instances WHERE {live_with_root}"
+        );
+        // RV6: ONE statement, no transaction wrapper — `query_untransacted`
+        // issues this `SELECT` directly against the pool (no `BEGIN`/`SET
+        // TRANSACTION ...`/`COMMIT`), which is what the ring read's own
+        // budget assumes (see that function's doc for the measured cost of
+        // the wrapper this skips).
+        let rows: Vec<RingCandidateRow> = self
+            .backend()
+            .query_untransacted(&sql, &params, |row| {
+                Ok(RingCandidateRow {
+                    instance_id: row.get::<String>("instance_id")?,
+                    peer_addr: row.get::<String>("peer_addr")?,
+                })
+            })
+            .await?;
+
+        let mut members = Vec::with_capacity(rows.len());
+        for row in rows {
+            let peer_addr = PeerAddr::parse(&row.peer_addr).map_err(|e| {
+                JammiError::Catalog(format!(
+                    "instance '{}' has a corrupted peer_addr row: {e}",
+                    row.instance_id
+                ))
+            })?;
+            members.push(super::instance::RingMember {
+                instance_id: row.instance_id,
+                peer_addr,
+            });
+        }
         Ok(members)
     }
 

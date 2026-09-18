@@ -23,6 +23,7 @@ on:
       - ".github/workflows/pypi-server.yml"
       - ".github/workflows/_pypi-server.yml"
       - "crates/jammi-server/**"
+      - "ci/release-feature-manifest.json"
 
 # Serialize per ref, never cancel: a publish in flight must finish (PyPI
 # uploads are not resumable), matching the other release lanes.
@@ -47,6 +48,7 @@ jobs:
       contents: read
     outputs:
       image: ${{ steps.resolve.outputs.image }}
+      cargo_features: ${{ steps.manifest.outputs.cargo_features }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
@@ -60,6 +62,23 @@ jobs:
         with:
           ref: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
 
+      # `ci/release-feature-manifest.json`'s `cpu-wheel` lane is the single
+      # source of truth for the CPU wheel's cargo feature list (#507) — read
+      # here, once, and fed to both arch legs below via `needs.resolve-
+      # base.outputs.cargo_features` (a reusable `uses:` workflow's `with:`
+      # inputs cannot run their own shell, so the read happens in THIS
+      # calling job, same idiom as server-image.yml's CPU/CUDA jobs).
+      - name: Read release feature list (ci/release-feature-manifest.json)
+        id: manifest
+        run: |
+          set -euo pipefail
+          features="$(jq -r '.lanes["cpu-wheel"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          if [ -z "$features" ]; then
+            echo "::error::ci/release-feature-manifest.json produced an empty cpu-wheel cargo_features list" >&2
+            exit 1
+          fi
+          echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
+
   server-cpu-x86_64:
     name: jammi-server (CPU, x86_64)
     needs: [resolve-base]
@@ -68,7 +87,7 @@ jobs:
     uses: ./.github/workflows/_pypi-server.yml
     with:
       container_image: ${{ needs.resolve-base.outputs.image }}
-      cargo_features: jetstream-broker,storage-cloud
+      cargo_features: ${{ needs.resolve-base.outputs.cargo_features }}
       package_dir: packaging/server-cpu
       artifact_prefix: server-cpu-x86_64
       platform_tag: manylinux_2_28_x86_64
@@ -83,7 +102,7 @@ jobs:
     with:
       container_image: ${{ needs.resolve-base.outputs.image }}
       runs_on: ubuntu-24.04-arm
-      cargo_features: jetstream-broker,storage-cloud
+      cargo_features: ${{ needs.resolve-base.outputs.cargo_features }}
       package_dir: packaging/server-cpu
       artifact_prefix: server-cpu-aarch64
       platform_tag: manylinux_2_28_aarch64

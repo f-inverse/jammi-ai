@@ -519,6 +519,13 @@ impl OssServer {
         // `jammi_peer_search_failures_total{reason}`. Registered here, once,
         // additively — `MetricsRegistry::new` keeps its arity.
         metrics.install_peer_failures(session.result_store().peer_failures())?;
+        // `RendezvousPlacement`'s ring-empty fallback counter, when this
+        // session's placement is `RendezvousPlacement` (`[server] placement =
+        // "rendezvous"`) -- `AllLocal`/`StaticPlacement` return `None` here,
+        // so the default single-node deployment registers nothing new.
+        if let Some(ring_empty) = session.result_store().placement_ring_empty_metrics() {
+            metrics.install_ring_empty(ring_empty)?;
+        }
         let readiness = Arc::new(ReadinessProbe::new(Arc::new(CatalogPingProbe::new(
             Arc::clone(&session),
         ))));

@@ -1412,7 +1412,7 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str, usize)] = &[
            // (see `session_registration_literal_sites`'s allowlist entry for
            // this same file) rather than through `pinned_provider` — an
            // unpinned, version-branched content read, re-exported publicly at
-           // `read_vectors`, `jammi-ai/src/session.rs:1160` and
+           // `read_vectors`, `jammi-ai/src/session.rs:1229` and
            // `read_vectors`, `jammi-ai/src/local_session.rs:365`.
            // `READ_VECTORS_CALLERS` above is the machine-checked claim: its
            // only two in-tree callers are those two forwarding wrappers, each
@@ -1628,67 +1628,19 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
         // file — kept as its own site so the two allowances cannot be
         // spent interchangeably.
     ),
-    (
-        "crates/jammi-db/src/store/mod.rs",
-        "registered_name",
-        1, // ordinal 1 — the only `registered_name` in this file
-        1,
-        // `TrainingSetTable::registered_name` — the key a materialised
-        // training set is bound under, the accessor `sql_relation` (and
-        // through it `jammi_ai::fine_tune::training_set::read_back_sql`)
-        // quotes for the read-back. There is no version to straddle here.
-        //
-        // Two independent reasons, the second of which is the operative one:
-        //
-        // (1) KIND-INDEPENDENT: neither `registered_name` nor `sql_relation`
-        // resolves a version at ALL. They format `jammi.{table_name}` off the
-        // record the caller already holds; no `current_version` is read on
-        // this path, so there is no anchor/content pair here to mismatch —
-        // only a bare registration key. What the straddle question turns on
-        // is whether the RELATION that key names can change under a reader,
-        // which is (2).
-        //
-        // (2) The relation is versionless because every verb that could
-        // publish a version over a result table REFUSES this kind, in
-        // `jammi-ai`, before it writes: `InferenceSession::refreshable_record`
-        // (`crates/jammi-ai/src/pipeline/embedding_refresh.rs`) returns
-        // `NotRefreshable { reason: NotEmbeddingTable }` for any record whose
-        // `kind` is not `ResultTableKind::Model`, and it dominates the
-        // enumerated writer set: `refresh_embeddings` and `compact_embeddings`
-        // both call it before `ensure_base_version` (→
-        // `version_repo.rs::publish_base_version`) and before
-        // `allocate_version` (→ `building_version.rs`), and `expire_versions`
-        // — the deleting third verb through that gate — calls it too. Pinned
-        // by `training_set::refresh_and_compaction_refuse_a_training_set_leaving_it_versionless`,
-        // which materialises a real `ready` `TrainingSet` row, drives all
-        // three verbs at it, and asserts the typed refusal plus
-        // `current_version == None`, `next_version` unmoved and zero version
-        // rows afterwards.
-        //
-        // R-A — this is CALLER DISCIPLINE, not a storage-layer
-        // impossibility, and the earlier version of this entry got that
-        // wrong. The db owner's executed probe publishes a base version on a
-        // `TrainingSet` row through `Catalog::publish_base_version`
-        // (`current_version` None → `Some(0)`) and allocates a second through
-        // `ResultStore::allocate_version` (`Ok(1)`): jammi-db accepts both.
-        // The `kind = 'model'` predicate in `resolve_embedding_table`
-        // (`result_repo.rs`, pinned by the db-side oracle
-        // `a_training_set_never_resolves_as_a_sources_embedding_table`) is
-        // still true and still reviewed, but it covers only the
-        // source_id-ADDRESSED half — how a source resolves to ITS embedding
-        // table — and `refresh_embeddings` / `compact_embeddings` never call
-        // it. So the claim held by this entry is exactly: no caller in this
-        // workspace publishes a version on a training set, because the one
-        // choke point they all pass through refuses the kind. A future verb
-        // that reaches `publish_base_version` WITHOUT going through
-        // `refreshable_record` would break it and nothing here would catch
-        // that; the writer set above is a hand enumeration (`grep -rn
-        // 'publish_base_version\|allocate_version' crates/jammi-ai/src`),
-        // re-derived when a version-writing path is added.
-        //
-        // The table is also immutable by construction: it is written once
-        // through the single `building -> ready` funnel and never rewritten.
-    ),
+    // `registered_name` was HERE — #551 deleted the function itself
+    // (zero production callers; `TrainingSetTable::table_name`/`sql_relation`
+    // cover its two legitimate uses), so this entry is removed by rule
+    // rather than left pointing at a site that no longer exists. The
+    // versionlessness argument this entry made (a `TrainingSet` row is
+    // immutable and can never straddle a version boundary because every
+    // version-publishing verb refuses this kind — see
+    // `refreshable_record`/`NotEmbeddingTable`, pinned by
+    // `training_set::refresh_and_compaction_refuse_a_training_set_leaving_it_versionless`)
+    // still holds for `TrainingSetTable::sql_relation`/`table_name`, neither
+    // of which resolves a version either — it just no longer needs an entry
+    // of ITS OWN here, since the `"jammi.{` literal both used to share now
+    // lives only at `result_table_relation`'s site, below.
     (
         "crates/jammi-db/src/store/mod.rs",
         "register_table",
@@ -1748,7 +1700,7 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "result_table_relation",
-        1, // ordinal 1 — the only `result_table_relation` in this file; line 361 today
+        1, // ordinal 1 — the only `result_table_relation` in this file; line 427 today (#551 re-key)
         1,
         // #551 round 3 (N2-gate): the general-purpose minter every OTHER
         // reader of a session-registered `jammi.{name}` relation across the
@@ -1764,12 +1716,16 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
         // this gate's `SURFACE_DIRS` does not scan) now calls this function
         // and carries no literal of its own. The pre-existing UNQUOTED
         // `TableReference::bare(format!("jammi.{{name}}"))` registration
-        // sites (`registered_name`, `load_neighbor_graph_edges`,
+        // sites (`load_neighbor_graph_edges`,
         // `jammi-db/src/session.rs::read_vectors`/`read_vector_by_key`,
         // `register_table`, `bind_result_table`) are a DIFFERENT risk class
         // (what a name registers AS, not what a raw-SQL read quotes) this
         // round did not migrate — reviewed and left as-is, their own
-        // existing entries unchanged.
+        // existing entries unchanged. `registered_name` itself, which USED
+        // to be listed alongside them here, was deleted in #551
+        // (zero production callers) — its own allow-list entry is removed by
+        // rule, above, rather than kept pointing at a site that no longer
+        // exists.
     ),
 ];
 
@@ -2753,7 +2709,7 @@ fn allowlists_match_current_hits_exactly() {
 //     catalog and returned"), the identical silent-overwrite shape
 //     `register_catalog`/`register_udf` already have above;
 //     `deregister_schema` is its inverse. `ResultStore`'s own
-//     `install_result_schema`, `crates/jammi-db/src/store/mod.rs:1251` calls
+//     `install_result_schema`, `crates/jammi-db/src/store/mod.rs:2022` calls
 //     exactly this verb — which is why this literal set had to widen past
 //     `SessionContext`'s own surface rather than staying a pure enumeration
 //     of it.
@@ -3313,9 +3269,9 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
 // carried over rather than closed by this replacement. And it is scoped to
 // exactly [`SURFACE_DIRS`]: a registration verb or DDL literal living
 // anywhere outside those two `src` trees is outside its universe entirely --
-// under `tests/it/` in either crate (e.g. the five `.register_table(`
+// under `tests/it/` in either crate (e.g. the six `.register_table(`
 // calls this file's own review list keys to, `.register_table(`,
-// `crates/jammi-db/tests/it/materialization.rs:568/:616/:669/:671/:1024`,
+// `crates/jammi-db/tests/it/materialization.rs:569/:636/:694/:696/:1318/:1569`,
 // none of them under `crates/jammi-db/src`), or in a third crate, both
 // count the same way. A fifth gap sits inside the scan itself, not at its
 // boundary: [`mask_comments_only`]'s masking step desyncs on a raw string
@@ -4001,24 +3957,31 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
                    to this provider (i.e. after `install_result_schema` runs). Checked, not assumed, \
                    and the command run is stated exactly because an earlier draft of this entry got \
                    it wrong: `grep -rn '\\.register_table(' crates/jammi-db/src crates/jammi-ai/src` \
-                   -- the two `src` trees [`SURFACE_DIRS`] scans -- returns exactly ONE hit, the \
-                   4-argument `.register_table(ctx, &record.table_name, &url, owner)` call at \
-                   `store/mod.rs:2724`; it does NOT find the five 2-argument \
-                   `.register_table(name, provider)` calls, because all five live under \
-                   `crates/jammi-db/tests/it/materialization.rs`, outside both `src` trees entirely. \
-                   The command that actually produces the five is repo-wide: \
+                   -- the two `src` trees [`SURFACE_DIRS`] scans -- returns exactly ONE call site, the \
+                   5-argument `.register_table(ctx, &record.table_name, &url, owner, file_sort_order)` \
+                   call at `store/mod.rs:3748` (its other three hits, `store/mod.rs:180/:5156/:5224`, \
+                   are prose naming the verb); it does NOT find the ten 2-argument \
+                   `.register_table(name, provider)` calls, because all ten live under `tests/` \
+                   trees, outside both `src` trees entirely. \
+                   The command that actually produces the ten is repo-wide: \
                    `grep -rn '\\.register_table(' --include='*.rs' crates/` returns \
-                   `materialization.rs:565/:616/:669/:671/:1024` (plus that same `store/mod.rs:2724` \
+                   `crates/jammi-db/tests/it/materialization.rs:569/:636/:694/:696/:1318/:1569`, \
+                   `crates/jammi-ai/tests/it/rangesplit.rs:219/:359/:416` and \
+                   `crates/jammi-ballista/tests/it/roles.rs:70` (plus that same `store/mod.rs:3748` \
                    line, and several prose mentions of the verb inside this very file that are text, \
-                   not call sites). Of those five 2-argument calls, only the one at `:1024`, inside \
+                   not call sites). Of those ten 2-argument calls, only the one at \
+                   `materialization.rs:1569`, inside \
                    `install_result_schema_twice_on_one_session_binds_the_same_schema_and_errors_on_neither`, \
-                   actually dispatches to THIS implementation: it is the only one of the five whose \
+                   actually dispatches to THIS implementation: it is the only one of the ten whose \
                    `ctx` already had `install_result_schema` called on it earlier in the same \
                    function, which is what makes the target schema resolve here (traced, not \
-                   assumed: `install_result_schema`'s call at that test's line 1018 precedes its \
-                   `:1024` `register_table` call; the other four calls' enclosing functions --\
-                   `ts_session` (`:565`), `pinned_session` (`:616`), and `pinned_session_two` \
-                   (`:669`, `:671`) -- never call `install_result_schema` on their `ctx` at all, \
+                   assumed: `install_result_schema`'s call at that test's line 1563 precedes its \
+                   `:1569` `register_table` call; the other nine calls' enclosing functions --\
+                   `ts_session` (`:569`), `pinned_session` (`:636`), `pinned_session_two` \
+                   (`:694`, `:696`), \
+                   `the_file_sort_order_declares_a_dotted_column_verbatim_not_as_a_qualified_reference` \
+                   (`:1318`), and the rangesplit and ballista fixtures -- never call \
+                   `install_result_schema` on their `ctx` at all, \
                    so they resolve to DataFusion's \
                    own default `MemorySchemaProvider` instead). That one call is deliberate, to \
                    prove the \"preserves the tables it already holds\" property survives a second \

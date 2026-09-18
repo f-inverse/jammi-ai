@@ -6,7 +6,8 @@ pub mod sidecar;
 
 pub use peer::{
     AllLocal, NoPeers, PeerAddr, PeerError, PeerFailureCounters, PeerFailureReason, PeerTransport,
-    SegmentPlacement, SegmentSearchPhase, StaticPlacement, PEER_FAILURE_LABELS, PEER_RPC_DEADLINE,
+    RendezvousMetrics, RendezvousPlacement, SegmentPlacement, SegmentSearchPhase, StaticPlacement,
+    PEER_FAILURE_LABELS, PEER_RPC_DEADLINE, PLACEMENT_HASH_DOMAIN,
 };
 pub use placed::{PlacedIndex, SegmentSource};
 

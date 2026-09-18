@@ -1860,6 +1860,14 @@ jobs:
             cmd: python3 ci/scripts/check_bundle_fixture.py
           - name: cu12 tarball fixture provisional refusal self-test
             cmd: python3 ci/scripts/check_bundle_fixture.py --self-test
+          # `ci/scripts/jail_trace.py`'s own suite (#534's chroot half, jail
+          # arm 1b): the argument-validation arm and the real, unmocked
+          # `os.chroot` exit-code contract (EPERM as non-root; a genuine
+          # chroot success as root, from THIS gate's own privilege level —
+          # never hardcoded), no cu12 jail and no CUDA binary (the root arm
+          # builds a trivial loader-only jail), no network.
+          - name: cu12 jail-trace driver suite
+            cmd: python3 ci/scripts/test_jail_trace.py
           # Completeness tripwire for this very guard class: every
           # ci/scripts/check_*.py|.sh gate script must be referenced by at
           # least one workflow (this file included), so a new check script
@@ -2833,10 +2841,16 @@ jobs:
       # site, RR43 real-call resolution) need `ci/tools/symbol-index` built;
       # the toolchain-free swarm lane runs the same self-test and takes its
       # named toolchain-less arm there, so THIS job is where those two arms
-      # are exercised.
+      # are exercised. `--require-symbol-index` (#590) turns that toolchain-
+      # less arm into a hard FAIL here: this job HAS the toolchain, so a
+      # build failure (a broken `ci/tools/symbol-index` build, a cargo/
+      # sccache misconfiguration surfacing only under this self-test's own
+      # `cargo run --release -p symbol-index` invocation, not the plain
+      # build+test+clippy step above) must be visible by name, never a
+      # silent exit 0.
       - name: Assert the rigor-record self-test's index-backed fixtures fire with the toolchain
         if: ${{ !cancelled() }}
-        run: python3 ci/scripts/check_rigor_record.py --self-test
+        run: python3 ci/scripts/check_rigor_record.py --self-test --require-symbol-index
 
   ci-summary:
     needs:

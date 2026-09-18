@@ -454,7 +454,7 @@ impl Fleet {
     /// process's listener is released). Used by (b1). The replacement is a
     /// freshly-minted instance (a new `instances` row): `instance_id` is
     /// minted at session construction, never externally supplied
-    /// (`instance_id`, crates/jammi-ai/src/session.rs:468), so a
+    /// (`instance_id`, crates/jammi-ai/src/session.rs:509), so a
     /// killed-then-respawned
     /// process cannot literally keep the OLD instance id — (b1)'s own
     /// assertion (contract acceptance list) only needs the OTHER executors'

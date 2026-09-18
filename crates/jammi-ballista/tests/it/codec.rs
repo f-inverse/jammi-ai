@@ -368,6 +368,37 @@ async fn mask_exec_is_refused_typed() {
     );
 }
 
+/// RS6 (#540 RANGESPLIT), the contract's stop-rule exit: `OrdinalSplitExec`
+/// gets the SAME v1-cut treatment as `MaskExec` above — no `NodeTag`, no
+/// `plan.proto` message, no encode/decode arm — so a plan containing it
+/// (only ever built when `InferenceConfig::partitions > 1`; the default `1`
+/// never inserts this node) is refused typed rather than silently
+/// mis-encoded or handed to Ballista's own delegate (which does not know it
+/// either). See `jammi_ballista::codec`'s module doc for WHY: in Ballista
+/// 54.1 a `SortPreservingMergeExec` is a stage boundary, so the N-partition
+/// `InferenceExec(OrdinalSplitExec)` this node feeds would become its own
+/// stage of N tasks each executing ONE partition, in general in a separate
+/// process — this node's in-process shared-mutex mechanism has no meaning
+/// across that split.
+#[tokio::test]
+async fn ordinal_split_exec_is_refused_typed() {
+    let input = string_scan("id", &["a"]);
+    let node = jammi_ai::operator::ordinal_split_exec::OrdinalSplitExec::new(input, 2)
+        .expect("OrdinalSplitExec builds over a plain scan");
+    let session = session().await;
+    let codec = JammiCodec::new(&session);
+    let mut buf = Vec::new();
+    let err = codec
+        .try_encode(Arc::new(node), &mut buf)
+        .expect_err("OrdinalSplitExec must be refused, never silently encoded");
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("unsupported")
+            || msg.to_lowercase().contains("ordinalsplitexec"),
+        "refusal must name the node: {msg}"
+    );
+}
+
 /// A plain in-memory scan is unknown to jammi's codec (not one of the four
 /// jammi node types) AND unknown to Ballista's delegate (not one of its
 /// shuffle/coalesce/chaos node types) — the delegation-then-typed-refusal
@@ -536,4 +567,95 @@ async fn ann_search_decode_refuses_another_tenants_table_and_a_tenant_free_read_
         .downcast_ref::<jammi_ai::operator::ann_search_exec::AnnSearchExec>()
         .unwrap();
     assert_eq!(decoded.table().table_name, table_name);
+}
+
+/// `decode_ann_search` checks a decoded query's width against the catalog
+/// authority it already has in hand (`table`, resolved a few lines before
+/// the check) rather than unconditionally passing `None` and skipping the
+/// authority the decode function just looked up. This decode-time check is
+/// defense in depth (a conforming coordinator's own `QueryBuilder::new`
+/// checks the width before ever building the plan node), so this is a
+/// hand-built malformed-in-transit descriptor, not the shape any real
+/// encoder would produce.
+///
+/// **What this proves, precisely — IN-PROCESS recovery, not the wire
+/// class.** Calling `codec.try_decode` directly (as this test does) and
+/// inspecting the returned `DataFusionError` recovers the caller-fault
+/// class: boxing the classified `JammiError` directly (rather than routing
+/// through this crate's own `Error::Decode`/`Error::Catalog`, which
+/// `crates/jammi-ballista/src/error.rs`'s `into_df_error` would box as THIS
+/// crate's `Error`, defeating the downstream downcast) is what makes
+/// `jammi_db::error`'s structural `DataFusionError` -> `JammiError`
+/// classifier ("owned passthrough" shape) recover
+/// `JammiError::Schema { .. }` here. This does NOT hold across a real
+/// distributed Ballista job: `ballista-executor` stringifies a failed
+/// task's error (`e.to_string()`) into `TaskStatus`, and the job-status
+/// waiter rebuilds job failure as a bare `DataFusionError::Execution(String)`
+/// — no boxed value survives that hop, so a REMOTE client sees
+/// `Code::Internal` (`jammi-server/src/grpc/wire.rs`'s catch-all), never
+/// `InvalidArgument`, regardless of which typed variant this decode boxes.
+/// The caller-class path for a remote client is the coordinator's own
+/// `QueryBuilder::new` check, which runs before any plan is shipped —
+/// tracked as a residual on #519, its own unit, not a fold of this test.
+///
+/// Mutation executed: revert the fix (pass `None` instead of
+/// `table.dimensions()`) — this test reds (the malformed query decodes
+/// instead of being refused).
+#[tokio::test(flavor = "multi_thread")]
+async fn ann_search_decode_checks_width_against_the_catalog_authority_it_holds() {
+    use jammi_ballista::codec::{pb, NodeTag, MAGIC};
+    use jammi_db::error::JammiError;
+    use prost::Message;
+
+    let session = session().await;
+    let table_name = format!("bal_width_authority_{}", uuid::Uuid::new_v4().simple());
+    session
+        .catalog()
+        .create_result_table(CreateResultTableParams {
+            table_name: &table_name,
+            source_id: "src-1",
+            model_id: "model-1",
+            task: ModelTask::TextEmbedding,
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            parquet_path: "",
+            dimensions: Some(4),
+            key_column: Some("id"),
+            text_columns: None,
+            storage_precision: StoragePrecision::F32,
+            oversample: 4,
+            created_at: jammi_db::catalog::lease::canonical_stamp_now(),
+            writer_id: None,
+            lease: None,
+            job_attempt: None,
+        })
+        .await
+        .expect("seed a result table row");
+
+    // A 3-wide query against a table whose catalog width is 4 — no real
+    // encoder would ever build this; it stands in for a peer that skipped
+    // its own `QueryBuilder::new` check.
+    let msg = pb::AnnSearchExecNode {
+        table_name: table_name.clone(),
+        tenant_id: None,
+        query_vector: vec![0.1, 0.2, 0.3],
+        k: 5,
+        oversample_override: None,
+    };
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&MAGIC);
+    buf.push(NodeTag::AnnSearch as u8);
+    msg.encode(&mut buf).unwrap();
+
+    let codec = JammiCodec::new(&session);
+    let ctx = session.context().task_ctx();
+    let err = codec
+        .try_decode(&buf, &[], &ctx)
+        .expect_err("a 3-wide query against a catalog width of 4 must be refused at decode");
+
+    let classified = JammiError::from(err);
+    assert!(
+        matches!(classified, JammiError::Schema { .. }),
+        "expected the caller-fault Schema class (gRPC InvalidArgument), got {classified:?}"
+    );
 }

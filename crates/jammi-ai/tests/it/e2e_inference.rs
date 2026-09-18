@@ -424,7 +424,7 @@ async fn e2e_all_input_invalid_fails_loud_not_empty_ready_table() {
     // forward failures the runner now propagates).
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use jammi_db::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
+    use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
@@ -452,7 +452,7 @@ async fn e2e_all_input_invalid_fails_loud_not_empty_ready_table() {
     let path = dir.path().join("all_empty.parquet");
     let url = StorageUrl::parse(path.to_str().unwrap()).unwrap();
     let registry = StorageRegistry::new();
-    let handle = JammiObjectStore::new(registry.driver_for(&url, None).unwrap(), url.clone());
+    let handle = registry.handle_for(&url, None).unwrap();
     let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema))
         .await
         .unwrap();

@@ -42,7 +42,7 @@ use jammi_ai::pipeline::neighbor_graph::BuildNeighborGraph;
 use jammi_ai::session::InferenceSession;
 use jammi_db::config::{GpuConfig, JammiConfig};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_db::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
+use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 use jammi_db::store::{CacheOutcome, CachePolicy};
 
 use crate::report::{CacheSloTier, Measurement, SpeedupGate};
@@ -129,8 +129,7 @@ async fn write_parquet(
     let path = dir.join(name);
     let url = StorageUrl::parse(path.to_str().ok_or("fixture path is not valid UTF-8")?)?;
     let registry = StorageRegistry::new();
-    let driver = registry.driver_for(&url, None)?;
-    let handle = JammiObjectStore::new(driver, url.clone());
+    let handle = registry.handle_for(&url, None)?;
     let mut writer = ObjectParquetWriter::open(&handle, schema).await?;
     writer.write_batch(&batch).await?;
     writer.close().await?;

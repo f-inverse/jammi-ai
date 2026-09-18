@@ -261,6 +261,23 @@ pub fn lease_deadline_expr(
 /// job-retention sweep/predicate (a `retention_days` margin against
 /// `jobs.updated_at`) — one shared clock-arithmetic primitive for every
 /// "how long ago" comparison outside the lease-deadline family above.
+/// **Sargability.** The Postgres arm renders the cutoff DB-side, in
+/// [`LEASE_TS_FORMAT`] TEXT, via [`pg_canonical_stamp`], and compares it
+/// against `col` as TEXT — no cast on `col` at all. Every writer of an
+/// in-class `*_at` column renders the SAME fixed-width UTC shape (this
+/// module's docs; the schema-edge CHECK constraint enforces it), so
+/// lexicographic TEXT order equals chronological order and the comparison is
+/// exact. Measured at 200k `instances`-shaped rows on the scratch Postgres
+/// host (`idx_instances_seen`, a plain btree on the TEXT column): the
+/// PRIOR form — `col::timestamptz < (now() - make_interval(...))`, casting
+/// `col` — forces a Seq Scan (no btree supports an index condition on a
+/// CAST of the indexed column) at ~80 ms for a low-selectivity ("who is
+/// still live") predicate; this form is an Index (Only) Scan under 0.1 ms,
+/// same row set. [`crate::catalog::Catalog::list_gang_members`] and
+/// `super::instance::live_with_root_clause` (the ring predicate this
+/// module's docs describe) both wrap this in `NOT (...)` for their
+/// low-selectivity "who is live" read, which is exactly the case the cast
+/// form scanned the whole table for.
 pub fn stale_before_clause(
     col: &str,
     kind: BackendKind,
@@ -271,8 +288,8 @@ pub fn stale_before_clause(
         BackendKind::Postgres => {
             params.push(SqlValue::Float(margin.as_secs_f64()));
             format!(
-                "{col}::timestamptz < (now() - make_interval(secs => ${}))",
-                params.len()
+                "{col} < {}",
+                pg_canonical_stamp(&format!("now() - make_interval(secs => ${})", params.len()))
             )
         }
         BackendKind::Sqlite => {
@@ -492,11 +509,27 @@ pub fn decode_lease_expires_at(
 /// — NOT fresh, a ROW FACT (`Catalog::fresh_instance`'s own docs: "`false`
 /// for an absent OR a stale row alike... disclosing nothing about which" —
 /// undecodable joins that same class) — never a read fault (the resolution
-/// of <https://github.com/f-inverse/jammi-ai/issues/574> for this column:
-/// [`stale_before_clause`]'s Postgres arm casts `last_seen_at::timestamptz`
-/// in SQL and would otherwise fault the whole statement on the same
-/// malformed text SQLite's `julianday(...)`-based comparison merely
-/// evaluates to a stale answer for).
+/// of <https://github.com/f-inverse/jammi-ai/issues/574>, still honoured
+/// here even though [`stale_before_clause`]'s Postgres arm no longer casts
+/// this column at all: the SQL-side predicate is now a lexical TEXT
+/// comparison against a DB-side-rendered canonical cutoff, sargable and
+/// cast-free — see that function's own doc for the measured Seq-Scan-to-
+/// Index-Scan fix. The column's domain is guarded by the schema-edge CHECK
+/// `sdchk__instances__last_seen_at` (`schema.rs`), which validates shape AND
+/// calendar-validity (via its own internal cast) at WRITE time on Postgres,
+/// so a non-`NULL` `last_seen_at` the SQL predicate reads is already
+/// guaranteed well-formed there — this function's own INFALLIBLE, no-fault
+/// decode exists for the read path regardless, since the CHECK is a
+/// Postgres-only, write-time guarantee: SQLite's own write-time guard
+/// (`trg_instances_last_seen_at_canonical_ins`/`_upd`, `schema.rs`) enforces
+/// only the canonical SHAPE (a `GLOB` pattern; a mismatch raises
+/// `BackendError::DomainViolation` — `backend.rs`'s
+/// `SQLITE_CONSTRAINT_TRIGGER_CODE` arm), never calendar validity: it has no
+/// cast, so a shape-valid, calendar-invalid stamp such as
+/// `0000-00-00T00:00:00.000000Z` still passes it. Neither guard is
+/// retroactive, and a value that predates either one (or a column this crate
+/// does not itself write) can still reach this decoder malformed on either
+/// backend.
 pub fn last_seen_at_is_fresh(
     last_seen_at: &str,
     margin: Duration,
@@ -825,8 +858,20 @@ mod tests {
         assert_eq!(d.heartbeat(), Duration::from_secs(10));
     }
 
+    /// The PROPERTY (rewritten from a pinned clause string, RENDEZVOUS RV3):
+    /// exactly one bind, carrying the margin in seconds untouched by the
+    /// rewrite; the rendered clause casts NEITHER side of the comparison —
+    /// `col` appears bare (never `col::timestamptz`), so a btree on `col`
+    /// (TEXT) can serve it — and the cutoff is expressed through
+    /// [`pg_canonical_stamp`], the SAME renderer [`lease_deadline_expr`]
+    /// uses, so every DB-side stamp in this crate is produced by exactly two
+    /// functions (this one, and the app-side [`canonical_stamp_now`]). The
+    /// live sargability + row-set oracle (`EXPLAIN`, and a differential
+    /// against the old cast form) is
+    /// `stale_before_clause_postgres_is_sargable_and_agrees_with_the_cast_form`
+    /// below.
     #[test]
-    fn stale_before_clause_postgres_binds_only_the_margin_seconds() {
+    fn stale_before_clause_postgres_binds_only_the_margin_seconds_and_casts_neither_side() {
         let mut params = Vec::new();
         let clause = stale_before_clause(
             "last_seen_at",
@@ -834,12 +879,185 @@ mod tests {
             Duration::from_secs(60),
             &mut params,
         );
-        assert_eq!(
-            clause,
-            "last_seen_at::timestamptz < (now() - make_interval(secs => $1))"
+        assert!(
+            !clause.contains("::timestamptz") && !clause.contains("::text"),
+            "the rendered clause must cast neither operand: {clause}"
         );
-        assert_eq!(params.len(), 1);
+        assert!(
+            clause.starts_with("last_seen_at < "),
+            "col must appear bare, never wrapped, so a btree on col serves it: {clause}"
+        );
+        assert!(
+            clause.contains("to_char("),
+            "the cutoff must be rendered through pg_canonical_stamp: {clause}"
+        );
+        assert_eq!(params.len(), 1, "one bind: the margin in seconds");
         assert!(matches!(params[0], SqlValue::Float(secs) if secs == 60.0));
+    }
+
+    /// Live (requires `JAMMI_TEST_PG_URL`; skips, never fails, otherwise):
+    /// (1) `EXPLAIN` over an `instances`-shaped fixture (the real
+    /// `idx_instances_seen` btree on a TEXT `last_seen_at`) shows an Index
+    /// (Only) Scan for the rewritten clause and a Seq Scan for the old cast
+    /// form, for the SAME low-selectivity "who is still live" read every
+    /// caller (`list_gang_members`, the RENDEZVOUS ring,
+    /// `reclaim_expired_jobs`'s instance-liveness arm, `prune_instances`,
+    /// `prune_jobs`'s retention arm) makes; (2) the two forms return the
+    /// IDENTICAL row set at one frozen instant, including a row planted
+    /// EXACTLY at the margin boundary (the boundary a lexical `<` and a
+    /// `timestamptz <` must agree on bit-for-bit, since both compare the same
+    /// canonical stamp text).
+    #[tokio::test]
+    async fn stale_before_clause_postgres_is_sargable_and_agrees_with_the_cast_form() {
+        let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+            eprintln!(
+                "skipping stale_before_clause_postgres_is_sargable_and_agrees_with_the_cast_form: \
+                 JAMMI_TEST_PG_URL unset"
+            );
+            return;
+        };
+        // `max_connections(1)` PLUS one explicit transaction for the WHOLE
+        // test: a `CREATE TEMP TABLE` is visible only on the connection that
+        // created it, and Postgres's `now()` is stable for the lifetime of a
+        // transaction — so the boundary stamp this test plants (captured via
+        // one `now()` read) and every later `now()` the two clause forms
+        // themselves evaluate resolve to the IDENTICAL instant, making the
+        // exact-microsecond boundary assertion deterministic rather than a
+        // race against wall-clock drift between statements.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("connect to the scratch Postgres");
+        let mut tx = pool.begin().await.unwrap();
+        let table = format!("lease_rs_stale_before_clause_{}", std::process::id());
+        sqlx::query(&format!(
+            "CREATE TEMP TABLE {table} (last_seen_at TEXT NOT NULL)"
+        ))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(&format!("CREATE INDEX ON {table} (last_seen_at)"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let margin = Duration::from_secs(60);
+        let margin_secs = margin.as_secs_f64();
+        // The exact-microsecond boundary, computed by THIS transaction's own
+        // stable `now()` via the SAME renderer `stale_before_clause` uses
+        // (`pg_canonical_stamp`) — never Rust's app clock, which would race
+        // the DB's `now()` by however long the round trip takes.
+        let boundary: String = sqlx::query_scalar(&format!(
+            "SELECT {}",
+            pg_canonical_stamp("now() - make_interval(secs => $1)")
+        ))
+        .bind(margin_secs)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        // One row per second over ~14 hours (relative to the SAME stable
+        // `now()`), so a 60 s liveness margin selects a small, realistic
+        // fraction — the exact shape a fleet's `instances` table has (mostly
+        // stale rows from processes long gone, a handful still live).
+        let now_text: String = sqlx::query_scalar(
+            "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339(&now_text)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(&now_text, "%Y-%m-%dT%H:%M:%S%.fZ")
+                    .map(|naive| chrono::DateTime::from_naive_utc_and_offset(naive, chrono::Utc))
+                    .expect("the DB's own canonical-stamp rendering must parse back")
+            });
+        let mut stamps: Vec<String> = (0i64..50_000)
+            .map(|s| {
+                (now - chrono::Duration::seconds(s))
+                    .format(LEASE_TS_FORMAT)
+                    .to_string()
+            })
+            .collect();
+        // The exact-microsecond boundary: a row stamped precisely at the
+        // cutoff is LIVE (`stale_before_clause` is strict `<`; live is `>=`).
+        stamps.push(boundary.clone());
+        sqlx::query(&format!(
+            "INSERT INTO {table} (last_seen_at) SELECT * FROM UNNEST($1::text[])"
+        ))
+        .bind(&stamps)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(&format!("ANALYZE {table}"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+
+        let mut new_params = Vec::new();
+        let new_clause = stale_before_clause(
+            "last_seen_at",
+            BackendKind::Postgres,
+            margin,
+            &mut new_params,
+        );
+        // The OLD (pre-rewrite) form, reconstructed verbatim here (never
+        // reachable from production code any more) purely as this oracle's
+        // baseline.
+        let old_clause = "last_seen_at::timestamptz < (now() - make_interval(secs => $1))";
+
+        let plan_new: Vec<String> = sqlx::query_scalar(&format!(
+            "EXPLAIN SELECT last_seen_at FROM {table} WHERE NOT ({new_clause})"
+        ))
+        .bind(margin_secs)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        let plan_old: Vec<String> = sqlx::query_scalar(&format!(
+            "EXPLAIN SELECT last_seen_at FROM {table} WHERE NOT ({old_clause})"
+        ))
+        .bind(margin_secs)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        let plan_new_text = plan_new.join("\n");
+        let plan_old_text = plan_old.join("\n");
+        assert!(
+            plan_new_text.contains("Index"),
+            "the rewritten clause must be an Index (Only) Scan: {plan_new_text}"
+        );
+        assert!(
+            plan_old_text.contains("Seq Scan"),
+            "the OLD cast form must still force a Seq Scan (else this fixture no longer \
+             demonstrates the fix): {plan_old_text}"
+        );
+
+        let mut live_new: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT last_seen_at FROM {table} WHERE NOT ({new_clause}) ORDER BY last_seen_at"
+        ))
+        .bind(margin_secs)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        let mut live_old: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT last_seen_at FROM {table} WHERE NOT ({old_clause}) ORDER BY last_seen_at"
+        ))
+        .bind(margin_secs)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        live_new.sort();
+        live_old.sort();
+        assert_eq!(
+            live_new, live_old,
+            "the rewritten clause must return the IDENTICAL row set as the cast form, \
+             including the row planted exactly at the margin boundary"
+        );
+        assert!(
+            live_new.iter().any(|s| s == &stamps[stamps.len() - 1]),
+            "the exact-boundary row must be counted as live (not stale) on both forms"
+        );
+        tx.commit().await.unwrap();
     }
 
     #[test]

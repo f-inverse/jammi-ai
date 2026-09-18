@@ -12,7 +12,7 @@ use jammi_db::model_task::ModelTask;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::{
     reader::{count_parquet_rows, is_valid_parquet},
-    JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl,
+    ObjectParquetWriter, StorageRegistry, StorageUrl,
 };
 use jammi_db::store::ResultStore;
 use jammi_test_utils::{make_test_session, unique_suffix};
@@ -33,8 +33,7 @@ async fn parquet_write_read_roundtrip() {
 
     let url = StorageUrl::parse(path.to_str().unwrap()).unwrap();
     let registry = StorageRegistry::new();
-    let driver = registry.driver_for(&url, None).unwrap();
-    let handle = JammiObjectStore::new(driver, url.clone());
+    let handle = registry.handle_for(&url, None).unwrap();
 
     let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema))
         .await
@@ -453,8 +452,7 @@ async fn recovery_skips_index_rebuild_for_non_embedding_task() {
 
     let url = StorageUrl::parse(parquet_path.to_str().unwrap()).unwrap();
     let registry = StorageRegistry::new();
-    let driver = registry.driver_for(&url, None).unwrap();
-    let handle = JammiObjectStore::new(driver, url.clone());
+    let handle = registry.handle_for(&url, None).unwrap();
     let mut writer = ObjectParquetWriter::open(&handle, schema).await.unwrap();
     writer.write_batch(&batch).await.unwrap();
     writer.close().await.unwrap();
@@ -923,8 +921,7 @@ async fn recovery_promotes_valid_parquet_to_ready() {
 
     let url = StorageUrl::parse(parquet_path.to_str().unwrap()).unwrap();
     let registry = StorageRegistry::new();
-    let driver = registry.driver_for(&url, None).unwrap();
-    let handle = JammiObjectStore::new(driver, url.clone());
+    let handle = registry.handle_for(&url, None).unwrap();
     let mut writer = ObjectParquetWriter::open(&handle, schema).await.unwrap();
     writer.write_batch(&batch).await.unwrap();
     writer.close().await.unwrap();

@@ -10,17 +10,26 @@ use crate::model::ModelTask;
 
 /// Common prefix columns on every inference output.
 ///
-/// `_ordinal` is a stream-scoped monotonic row counter (0-based, assigned by
-/// [`build_prefix_columns`] in emission order across the WHOLE
-/// [`InferenceExec`](crate::operator::inference_exec::InferenceExec)
-/// invocation, never reset per sub-batch) — `InferenceExec` is
-/// `Partitioning::UnknownPartitioning(1)`, so exactly one ordinal sequence
-/// exists per inference run. It exists so a caller can read the result table
-/// back in the SAME order the model actually produced it
-/// (`ORDER BY _row_id, _ordinal`) even when `_row_id` carries duplicate or
-/// non-monotonic keys, and even when the underlying Parquet scan reorders
-/// row groups on read. Embedding tables carry no `_ordinal` — their
-/// read-backs are keyed by `_row_id` alone, per
+/// `_ordinal` is a monotonic row-emission counter (0-based). When
+/// `InferenceExec`'s input is an
+/// [`OrdinalSplitExec`](crate::operator::ordinal_split_exec::OrdinalSplitExec)
+/// (every production plan with `InferenceConfig::partitions > 1` — #540
+/// RANGESPLIT), that split assigns ONE global sequence, before fan-out, over
+/// its whole single-partition input, and `InferenceExec` reads it back as a
+/// named INPUT column (never a `passthrough`) at each of its `N` partitions —
+/// see [`extract_or_generate_ordinals`]. When there is no split below it
+/// (`partitions == 1`, or a caller that builds `InferenceExec` directly, e.g.
+/// this crate's own unit tests), `InferenceExec`'s single partition
+/// self-generates the sequence exactly as every release before RANGESPLIT
+/// did. Either way there is exactly one sequence per partition's share of the
+/// rows it is responsible for, and (per-partition) it is gap-free and
+/// contiguous within that partition's own subsequence.
+///
+/// It exists so a caller can read the result table back in the SAME order
+/// the model actually produced it (`ORDER BY _row_id, _ordinal`) even when
+/// `_row_id` carries duplicate or non-monotonic keys, and even when the
+/// underlying Parquet scan reorders row groups on read. Embedding tables
+/// carry no `_ordinal` — their read-backs are keyed by `_row_id` alone, per
 /// [`crate::pipeline::embedding::EmbeddingPipeline`]'s schema.
 pub fn common_prefix_fields() -> Vec<Field> {
     vec![
@@ -92,21 +101,21 @@ pub fn build_output_schema(
 /// runner building the prefix columns before calling the task adapter is
 /// call ordering, not a safety dependency.
 ///
-/// `ordinal_start` is the first `_ordinal` value this batch assigns; the
-/// caller (`InferenceRunner`) advances its own running counter by
-/// `row_count` after this call so the sequence stays monotonic and
-/// contiguous across every sub-batch of one stream — see
-/// [`common_prefix_fields`] for why this exists.
+/// `ordinals` is this batch's `_ordinal` column (one `UInt64` entry per row,
+/// non-null) — see [`common_prefix_fields`] and [`extract_or_generate_ordinals`]
+/// for where it comes from; this function only places it and checks its
+/// length agrees with every other prefix column.
 #[allow(clippy::too_many_arguments)]
 pub fn build_prefix_columns(
     keys: &ArrayRef,
+    key_column: &str,
     source_id: &str,
     model_id: &str,
     row_status: &[bool],
     row_errors: &[String],
     latency_ms: f32,
     row_count: usize,
-    ordinal_start: u64,
+    ordinals: &ArrayRef,
 ) -> Result<Vec<ArrayRef>> {
     if row_status.len() != row_count {
         return Err(JammiError::Inference(format!(
@@ -118,6 +127,12 @@ pub fn build_prefix_columns(
         return Err(JammiError::Inference(format!(
             "build_prefix_columns: row_errors has {} entries, expected one per row ({row_count})",
             row_errors.len()
+        )));
+    }
+    if ordinals.len() != row_count {
+        return Err(JammiError::Inference(format!(
+            "build_prefix_columns: ordinals has {} entries, expected one per row ({row_count})",
+            ordinals.len()
         )));
     }
 
@@ -141,24 +156,62 @@ pub fn build_prefix_columns(
         })
         .collect();
 
-    // Cast keys to Utf8 if needed (key column may be Int64, etc.)
+    // Cast keys to Utf8 if needed (key column may be Int64, etc.). RS4: a
+    // key type the engine cannot render as Utf8 (a Struct/Map, whose Arrow
+    // cast kernel has no Utf8 arm) is a typed, named refusal — never the
+    // silent `unwrap_or_else(|_| Arc::clone(keys))` fallback this replaced,
+    // which passed the RAW non-Utf8 array through as `_row_id` and let a
+    // downstream schema-shape mismatch misattribute the failure to whatever
+    // column happened to trip over the wrong type first (see the unit
+    // oracle `build_prefix_columns_refuses_a_key_that_cannot_cast_to_utf8`
+    // below, and the end-to-end oracle
+    // `crates/jammi-ai/tests/it/rangesplit.rs`'s
+    // `rs4_struct_key_through_annotate_is_a_typed_refusal_naming_the_key`).
     let row_ids: ArrayRef = if keys.data_type() == &DataType::Utf8 {
         Arc::clone(keys)
     } else {
-        compute::cast(keys, &DataType::Utf8).unwrap_or_else(|_| Arc::clone(keys))
+        compute::cast(keys, &DataType::Utf8).map_err(|e| {
+            JammiError::Inference(format!(
+                "key column '{key_column}' (type {:?}) cannot be cast to Utf8: {e}",
+                keys.data_type()
+            ))
+        })?
     };
-
-    let ordinals: UInt64Array = (ordinal_start..ordinal_start + row_count as u64).collect();
 
     Ok(vec![
         row_ids,                                                               // _row_id
-        Arc::new(ordinals) as ArrayRef,                                        // _ordinal
+        Arc::clone(ordinals),                                                  // _ordinal
         Arc::new(StringArray::from(vec![source_id; row_count])) as ArrayRef,   // _source
         Arc::new(StringArray::from(vec![model_id; row_count])) as ArrayRef,    // _model
         Arc::new(status) as ArrayRef,                                          // _status
         Arc::new(errors) as ArrayRef,                                          // _error
         Arc::new(Float32Array::from(vec![latency_ms; row_count])) as ArrayRef, // _latency_ms
     ])
+}
+
+/// This batch's `_ordinal` column: the input's own `_ordinal` column when
+/// present (an [`OrdinalSplitExec`](crate::operator::ordinal_split_exec::OrdinalSplitExec)
+/// child assigned it before fan-out — RS2), or a freshly self-generated
+/// contiguous run starting at `*next_ordinal` otherwise (no split below —
+/// `partitions == 1`, or a caller that built `InferenceExec` directly).
+/// `*next_ordinal` advances by `batch.num_rows()` only on the self-generate
+/// arm, so the fallback sequence stays contiguous across every input batch of
+/// one partition's stream; the split-supplied arm never touches it (the
+/// split already assigned every value, spanning batches on ITS OWN
+/// single-writer counter, before this partition ever saw the row).
+pub fn extract_or_generate_ordinals(
+    batch: &arrow::record_batch::RecordBatch,
+    next_ordinal: &mut u64,
+) -> ArrayRef {
+    match batch.column_by_name(crate::operator::ordinal_split_exec::ORDINAL_COLUMN) {
+        Some(col) => Arc::clone(col),
+        None => {
+            let row_count = batch.num_rows() as u64;
+            let start = *next_ordinal;
+            *next_ordinal += row_count;
+            Arc::new((start..start + row_count).collect::<UInt64Array>()) as ArrayRef
+        }
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +231,10 @@ mod tests {
     /// `_status` column of length 1 sitting next to `_error`/`_row_id`
     /// columns of length 3, a mutually-inconsistent batch, instead of the
     /// `Err` asserted below).
+    fn ordinals_for(row_count: usize, start: u64) -> ArrayRef {
+        Arc::new((start..start + row_count as u64).collect::<UInt64Array>())
+    }
+
     #[test]
     fn build_prefix_columns_refuses_a_row_status_shorter_than_row_count() {
         let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
@@ -187,8 +244,19 @@ mod tests {
             "row 1 failed".to_string(),
             "row 2 failed".to_string(),
         ];
-        let err = build_prefix_columns(&keys, "src", "model", &row_status, &row_errors, 1.0, 3, 0)
-            .expect_err("a row_status shorter than row_count must be a typed refusal");
+        let ords = ordinals_for(3, 0);
+        let err = build_prefix_columns(
+            &keys,
+            "id",
+            "src",
+            "model",
+            &row_status,
+            &row_errors,
+            1.0,
+            3,
+            &ords,
+        )
+        .expect_err("a row_status shorter than row_count must be a typed refusal");
         let msg = err.to_string();
         assert!(msg.contains("row_status"), "must name the field: {msg}");
         assert!(
@@ -208,8 +276,19 @@ mod tests {
         let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
         let row_status = vec![true, false, true];
         let row_errors = vec!["row 1 failed".to_string()]; // one entry; row_count is 3
-        let err = build_prefix_columns(&keys, "src", "model", &row_status, &row_errors, 1.0, 3, 0)
-            .expect_err("a row_errors shorter than row_count must be a typed refusal");
+        let ords = ordinals_for(3, 0);
+        let err = build_prefix_columns(
+            &keys,
+            "id",
+            "src",
+            "model",
+            &row_status,
+            &row_errors,
+            1.0,
+            3,
+            &ords,
+        )
+        .expect_err("a row_errors shorter than row_count must be a typed refusal");
         let msg = err.to_string();
         assert!(msg.contains("row_errors"), "must name the field: {msg}");
         assert!(
@@ -227,8 +306,19 @@ mod tests {
         let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
         let row_status = vec![true, false, true];
         let row_errors = vec![String::new(), "row 1 failed".to_string(), String::new()];
-        let cols = build_prefix_columns(&keys, "src", "model", &row_status, &row_errors, 1.0, 3, 0)
-            .expect("mutually consistent lengths must not be refused");
+        let ords = ordinals_for(3, 0);
+        let cols = build_prefix_columns(
+            &keys,
+            "id",
+            "src",
+            "model",
+            &row_status,
+            &row_errors,
+            1.0,
+            3,
+            &ords,
+        )
+        .expect("mutually consistent lengths must not be refused");
         for (i, col) in cols.iter().enumerate() {
             assert_eq!(col.len(), 3, "column {i} must have one entry per row");
         }
@@ -239,19 +329,159 @@ mod tests {
         assert!(errors.is_null(2), "row 2's own recorded status was ok");
     }
 
-    /// `_ordinal` is a contiguous, 0-based sequence starting at whatever
-    /// `ordinal_start` the caller passes — the value
-    /// [`InferenceRunner`](crate::inference::runner::InferenceRunner)
-    /// advances by `row_count` across every sub-batch of one stream, per
-    /// [`common_prefix_fields`]'s doc.
+    /// `build_prefix_columns` places the CALLER'S `ordinals` array verbatim
+    /// at `_ordinal` — it never recomputes it. See
+    /// [`extract_or_generate_ordinals`] for where that array comes from.
     #[test]
-    fn build_prefix_columns_ordinal_is_contiguous_from_the_given_start() {
+    fn build_prefix_columns_places_the_given_ordinals_verbatim() {
         let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
         let row_status = vec![true, true, true];
         let row_errors = vec![String::new(), String::new(), String::new()];
-        let cols = build_prefix_columns(&keys, "src", "model", &row_status, &row_errors, 1.0, 3, 7)
-            .expect("mutually consistent lengths must not be refused");
+        let ords = ordinals_for(3, 7);
+        let cols = build_prefix_columns(
+            &keys,
+            "id",
+            "src",
+            "model",
+            &row_status,
+            &row_errors,
+            1.0,
+            3,
+            &ords,
+        )
+        .expect("mutually consistent lengths must not be refused");
         let ordinals = cols[1].as_any().downcast_ref::<UInt64Array>().unwrap();
         assert_eq!(ordinals.values(), &[7u64, 8, 9]);
+    }
+
+    /// RS4: a key type the Arrow cast kernel cannot render as Utf8 (a Struct,
+    /// verbatim `inference/schema.rs`'s former fallback fixture) is a typed
+    /// `JammiError::Inference` naming the key COLUMN, its TYPE, and "cannot
+    /// be cast to Utf8" — never the silent `unwrap_or_else(|_|
+    /// Arc::clone(keys))` this replaced, which passed the raw Struct array
+    /// through as `_row_id` and let `RecordBatch::try_new` fail later with a
+    /// schema-shape error that named the wrong column. Verified by reverting
+    /// to the `unwrap_or_else` fallback: this test goes RED (`Ok` with a
+    /// Struct-typed `_row_id` column instead of the `Err` asserted below).
+    #[test]
+    fn build_prefix_columns_refuses_a_key_that_cannot_cast_to_utf8() {
+        use arrow::array::{Int32Array, StructArray};
+        use arrow::datatypes::Fields;
+
+        let fields: Fields = vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, false),
+        ]
+        .into();
+        let keys: ArrayRef = Arc::new(StructArray::new(
+            fields,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["x", "y"])) as ArrayRef,
+            ],
+            None,
+        ));
+        let row_status = vec![true, true];
+        let row_errors = vec![String::new(), String::new()];
+        let ords = ordinals_for(2, 0);
+        let err = build_prefix_columns(
+            &keys,
+            "struct_key",
+            "src",
+            "model",
+            &row_status,
+            &row_errors,
+            1.0,
+            2,
+            &ords,
+        )
+        .expect_err("a key type with no Utf8 cast kernel must be a typed refusal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("struct_key"),
+            "must name the key column: {msg}"
+        );
+        assert!(
+            msg.contains("cannot be cast to Utf8"),
+            "must state the failure: {msg}"
+        );
+    }
+
+    /// An `ordinals` array shorter than `row_count` must be refused the same
+    /// way as `row_status`/`row_errors` — the same class of shape bug.
+    #[test]
+    fn build_prefix_columns_refuses_ordinals_shorter_than_row_count() {
+        let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        let row_status = vec![true, true, true];
+        let row_errors = vec![String::new(), String::new(), String::new()];
+        let ords = ordinals_for(1, 0); // one entry; row_count is 3
+        let err = build_prefix_columns(
+            &keys,
+            "id",
+            "src",
+            "model",
+            &row_status,
+            &row_errors,
+            1.0,
+            3,
+            &ords,
+        )
+        .expect_err("ordinals shorter than row_count must be a typed refusal");
+        let msg = err.to_string();
+        assert!(msg.contains("ordinals"), "must name the field: {msg}");
+    }
+
+    /// [`extract_or_generate_ordinals`] reads the `_ordinal` column when the
+    /// input carries one (the `OrdinalSplitExec` shape) rather than
+    /// generating a fresh sequence — it must not touch `next_ordinal` on
+    /// this arm.
+    #[test]
+    fn extract_or_generate_ordinals_prefers_the_input_column() {
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(
+                crate::operator::ordinal_split_exec::ORDINAL_COLUMN,
+                DataType::UInt64,
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![100u64, 101])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut next_ordinal = 5u64;
+        let ords = extract_or_generate_ordinals(&batch, &mut next_ordinal);
+        let ords = ords.as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert_eq!(ords.values(), &[100u64, 101]);
+        assert_eq!(
+            next_ordinal, 5,
+            "the split-supplied arm must not advance the fallback counter"
+        );
+    }
+
+    /// The fallback arm (no `_ordinal` input column) self-generates a
+    /// contiguous run and DOES advance `next_ordinal` — the pre-RANGESPLIT
+    /// behaviour, preserved for a caller with no `OrdinalSplitExec` below it.
+    #[test]
+    fn extract_or_generate_ordinals_falls_back_and_advances() {
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef],
+        )
+        .unwrap();
+        let mut next_ordinal = 5u64;
+        let ords = extract_or_generate_ordinals(&batch, &mut next_ordinal);
+        let ords = ords.as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert_eq!(ords.values(), &[5u64, 6, 7]);
+        assert_eq!(next_ordinal, 8, "the fallback arm advances by row_count");
     }
 }

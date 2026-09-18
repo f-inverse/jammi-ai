@@ -38,7 +38,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::backend::{BackendKind, SqlValue};
 use super::jobs_repo::WorkerState;
+use super::lease::stale_before_clause;
 use crate::error::{JammiError, Result};
 use crate::storage::{BuilderSeeds, Scheme, StorageUrl};
 
@@ -578,6 +580,17 @@ impl MembershipConfig {
     /// `artifact_dir` on its own.
     pub fn validate(config: &crate::config::JammiConfig) -> Result<Option<Self>> {
         let Some(advertise) = &config.server.peer_advertise else {
+            // RENDEZVOUS RV4: `[server] placement = "rendezvous"` needs a
+            // member row to have any ring to read — refused by NAME, at this
+            // ONE choke point, so neither `load_from` nor a struct-literal
+            // config reaching `from_config` directly can skip it.
+            if config.server.placement == crate::config::PlacementMode::Rendezvous {
+                return Err(JammiError::Config(
+                    "server.placement = \"rendezvous\" requires server.peer_advertise \
+                     (and server.peer_bind) to be set too"
+                        .into(),
+                ));
+            }
             return Ok(None);
         };
         if config.server.peer_bind.is_none() {
@@ -588,6 +601,47 @@ impl MembershipConfig {
         let peer_addr = PeerAddr::parse(advertise)?;
         Ok(Some(Self { peer_addr }))
     }
+}
+
+/// The ONE shared SQL fragment for "a row in `instances` (aliased `alias`)
+/// that is LIVE and shares MY result root": `{alias}.peer_addr IS NOT NULL
+/// AND {alias}.result_root_identity = ({root_identity_expr}) AND NOT
+/// ({stale})`, `{stale}` being [`stale_before_clause`] over
+/// `{alias}.last_seen_at` at [`super::lease::instance_liveness_margin`]'s
+/// margin. Two callers evaluate exactly this predicate —
+/// [`super::Catalog::list_gang_members`] (which joins `workers` and filters
+/// `kinds`/`state` in Rust on top; its caller already resolved its own
+/// [`MemberRoot`] in Rust, so it passes a BOUND parameter placeholder it
+/// pushed itself, e.g. `"$1"`) and [`super::Catalog::list_ring_members`] (the
+/// RENDEZVOUS ring, which adds no join, includes the caller's OWN row, and
+/// passes a `(SELECT result_root_identity FROM instances WHERE instance_id =
+/// …)` self-referencing subquery — never a second, separately-cached copy of
+/// its own root identity) — so "live with my root" has one definition, never
+/// two independently-drifting `WHERE` clauses. `root_identity_expr` is
+/// SPLICED VERBATIM into the returned SQL text (never bound): it is the
+/// caller's job to make it a value expression, either a placeholder the
+/// caller already bound or a subquery, both of which are `${n}`. Appends only
+/// the margin bind, from [`stale_before_clause`], to `params`.
+///
+/// A row this predicate excludes for staleness, for a missing `peer_addr`,
+/// or for a foreign root is excluded exactly the same way — one `WHERE`,
+/// no per-reason tag. Neither caller counts WHY a row was excluded (only
+/// `RendezvousPlacement` counts a behaviour-changing OUTCOME — the whole
+/// ring reading empty — never a per-row exclusion reason); doing so would
+/// cost a second statement per caller for a distinction only human
+/// debugging, never correctness, would use.
+pub(crate) fn live_with_root_clause(
+    alias: &str,
+    kind: BackendKind,
+    margin: Duration,
+    root_identity_expr: &str,
+    params: &mut Vec<SqlValue<'static>>,
+) -> String {
+    let stale = stale_before_clause(&format!("{alias}.last_seen_at"), kind, margin, params);
+    format!(
+        "{alias}.peer_addr IS NOT NULL AND {alias}.result_root_identity = ({root_identity_expr}) \
+         AND NOT ({stale})"
+    )
 }
 
 /// [`super::Catalog::list_gang_members`]'s request: the predicate admits on
@@ -622,6 +676,17 @@ pub struct GangListing<'a> {
 /// with `w` peers gets them all in one call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GangMember {
+    pub instance_id: String,
+    pub peer_addr: PeerAddr,
+}
+
+/// One member of the RENDEZVOUS ring
+/// ([`super::Catalog::list_ring_members`]): live, sharing the caller's own
+/// result root, `peer_addr` set. Unlike [`GangMember`] the caller's OWN row
+/// is a valid member (self-inclusion is the ring's whole point — a segment
+/// this process itself wins placement for needs no remote call at all).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RingMember {
     pub instance_id: String,
     pub peer_addr: PeerAddr,
 }

@@ -13,7 +13,7 @@ use jammi_db::catalog::result_repo::CreateResultTableParams;
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::error::JammiError;
 use jammi_db::model_task::ModelTask;
-use jammi_db::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
+use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_test_utils::{make_test_session, unique_suffix};
 use tempfile::tempdir;
@@ -82,8 +82,7 @@ async fn read_vectors_returns_input_rows_byte_for_byte(backend: BackendKind) {
     let parquet_path = dir.path().join("embeddings.parquet");
     let url = StorageUrl::parse(parquet_path.to_str().unwrap()).unwrap();
     let registry = StorageRegistry::new();
-    let driver = registry.driver_for(&url, None).unwrap();
-    let handle = JammiObjectStore::new(driver, url.clone());
+    let handle = registry.handle_for(&url, None).unwrap();
     let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema))
         .await
         .unwrap();
@@ -165,8 +164,7 @@ async fn read_vectors_surfaces_typed_engine_fault_on_wrong_column_shape(backend:
     let parquet_path = dir.path().join("wrong_shape.parquet");
     let url = StorageUrl::parse(parquet_path.to_str().unwrap()).unwrap();
     let registry = StorageRegistry::new();
-    let driver = registry.driver_for(&url, None).unwrap();
-    let handle = JammiObjectStore::new(driver, url.clone());
+    let handle = registry.handle_for(&url, None).unwrap();
     let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&wrong_schema))
         .await
         .unwrap();

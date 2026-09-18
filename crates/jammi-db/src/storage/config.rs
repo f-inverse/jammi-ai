@@ -21,7 +21,7 @@ use crate::config::Secret;
 
 /// AWS S3 (or any S3-compatible) connection details.
 ///
-/// Used to build the S3 driver via [`crate::storage::builder::build_object_store`].
+/// Used to build the object-store driver via `crate::storage::builder::build_object_store`.
 /// Field names mirror the canonical AWS SDK env var conventions so a
 /// caller can populate from `std::env::var` 1:1.
 ///

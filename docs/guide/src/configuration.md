@@ -92,6 +92,19 @@ batch_size = 32
 batch_timeout_secs = 300
 # Maximum models kept loaded simultaneously. 0 = unlimited. Default: 0.
 max_loaded_models = 0
+# Number of ordinal-keyed partitions an inference/embedding plan fans a
+# model's forward pass out to below one merge. 1 is the default (and the
+# minimum accepted value: 0 is refused at load, never silently treated as
+# 1). A value greater than 1 fans the model forward out N ways IN-PROCESS
+# on the executor that runs it, each partition's forward call admitted by a
+# permit scoped to that ONE InferenceExec instance (not a whole device):
+# two concurrent InferenceExec instances targeting the same GPU each get
+# their own permit and run their own forward concurrently — a real,
+# device-wide admission scheduler is a named future seam
+# (jammi_ai::concurrency::GpuScheduler), not built by this permit. Not yet
+# distributable: a value greater than 1 has no wire form and is refused if
+# submitted to a Ballista cluster. Default: 1.
+partitions = 1
 
 [inference.http]
 # HTTP request timeout (seconds). Default: 60.
@@ -292,6 +305,19 @@ preload_models = [
 # willing to give one query's fallback loads. 0 is refused. Read by the
 # result store; a library embedder sets it through the same config.
 # peer_local_load_bytes = 268435456
+# Which segment placement this session builds: "local" (the default -- every
+# segment is this process's own, a single node regardless of what else is
+# configured) or "rendezvous" (beyond-one-node retrieval over the LIVE
+# `instances` ring: every segment is scored per live, root-sharing member --
+# self included -- by a rendezvous hash, so membership changes move a near-
+# minimal share of segments and every replica agrees on the owner with no
+# coordination round). "rendezvous" REQUIRES peer_advertise to be set too --
+# refused by name at the same membership choke point peer_advertise's own
+# requirement is (InstanceRegistration::from_config / JammiConfig::load_from);
+# unset peer_bind/peer_advertise is unaffected -- this knob changes nothing
+# about an existing single-node deployment. See "Beyond one node" in
+# reference-topologies.md.
+# placement = "rendezvous"
 
 [server.limits]
 # Request-bounds and refusal policy for the combined gRPC + Flight SQL

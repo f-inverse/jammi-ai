@@ -369,7 +369,11 @@ async fn recall_samples_at_k_rescored(
 
     let mut samples = Vec::with_capacity(queries.len());
     for query in queries {
-        let query = &validate_query(query.to_vec(), None, QuerySource::Caller)?;
+        let query = &validate_query(
+            query.to_vec(),
+            Some(index.dimensions()),
+            QuerySource::Caller,
+        )?;
         let exact = exact_vector_search(ctx, table_name, query, k, None).await?;
         let ann = if precision.needs_rescore() {
             crate::operator_mirror::retrieve_then_rescore(&index, query, k, oversample.max(1))?
@@ -417,11 +421,16 @@ async fn recall_samples_at_k_segmented(
             Ok::<_, Box<dyn std::error::Error>>((SegmentId(i as i64), index))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    // `SegmentedIndex` does not expose its width outside `jammi-db` — the
+    // first segment's own width is the authority (the same one
+    // `SegmentedIndex::dimensions()` itself reads), captured before
+    // `segments` is moved into it.
+    let dim = segments.first().map(|(_, index)| index.dimensions());
     let merged = SegmentedIndex::new(segments)?;
 
     let mut samples = Vec::with_capacity(queries.len());
     for query in queries {
-        let query = &validate_query(query.to_vec(), None, QuerySource::Caller)?;
+        let query = &validate_query(query.to_vec(), dim, QuerySource::Caller)?;
         let exact = exact_vector_search(ctx, table_name, query, k, None).await?;
         let ann = merged.search_final(query, k, oversample.max(1))?;
         samples.push(recall_at_k_for_query(&ann, &exact, k));

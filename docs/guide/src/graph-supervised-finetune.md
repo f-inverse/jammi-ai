@@ -143,6 +143,39 @@ The output is a fine-tuned model; regenerate embeddings with it and they encode
 the graph's structure ([`build_neighbor_graph`](./build-neighbor-graph.md),
 search, and [propagation](./graph-propagation.md) all benefit).
 
+## How it's materialised (and why the sample is reproducible)
+
+Re-claiming the job (a lost lease, a retry) re-samples from the same seeded
+config and re-reads the node/edge sources — the sample must be a function of
+the node/edge *set*, not of whatever order the source happens to be scanned
+in. Both scans carry an explicit order (ascending, by every projected
+column), so two different physical layouts of the identical node/edge set
+always sample byte-identical pairs; a node id that appears twice is refused,
+typed, naming the id, rather than silently keeping "whichever row the scan
+happened to see last."
+
+The sampled pairs are materialised as an immutable, content-addressed
+`TrainingSet`-kind table — the same producer funnel a tabular fine-tune's
+source projection uses — so a `graph_fine_tune` job trains from a durable,
+attested artifact rather than an ephemeral in-memory sample, and `recompute`
+can replay it later over the current state of the node/edge sources. The
+format (`graph_pairs` / `graph_triplet`) is
+decided from `graph_hard_negatives` alone, never from what the first sampled
+row happens to contain. If `graph_hard_negatives > 0` and some anchor's
+entire candidate pool falls inside its own `exclude_hops`-hop neighbourhood
+(nothing left outside the false-negative guard to mine a negative from), the
+job fails with a typed error naming that anchor — never a row silently
+trained with no negative.
+
+`graph_fine_tune` supports an in-process multi-rank gang on ONE host: at
+`world_size > 1` within `[worker] local_ranks`, the claiming worker itself
+runs every rank, each over the SAME materialised table. It does **not**
+yet support a multi-host (`Peer`) gang — `world_size` above `local_ranks`
+is refused, typed, naming the reason (issue #538): a `Peer` member's own
+read path over the table does not yet agree with rank 0's committed row
+order, and there is no proof yet that the ranks' shards combine into a
+correct gradient. Keep `world_size <= [worker] local_ranks` for now.
+
 ## Tuning knobs
 
 | Knob | Effect |

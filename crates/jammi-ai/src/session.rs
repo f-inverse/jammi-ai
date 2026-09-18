@@ -137,20 +137,25 @@ impl InferenceSession {
 
     /// [`Self::open`] with an explicit segment placement — which process owns
     /// which ANN index segment, read by the result store at every online
-    /// search resolve. `open` passes [`jammi_db::index::AllLocal`] (every
-    /// segment is this process's — a single node); a library process that
-    /// knows its topology passes a [`jammi_db::index::StaticPlacement`] and
-    /// becomes a full coordinator over the gRPC peer transport
-    /// (`jammi_wire::peer::GrpcPeerTransport`, wired by the store builder).
-    /// Precondition for any non-local placement: `storage.result_root` (or a
-    /// shared local `artifact_dir`) is a root every replica can read,
-    /// spelled IDENTICALLY on every replica. When `[server] peer_advertise`
-    /// is set, this shared-root topology is exactly what
+    /// search resolve. `open` builds a placement from `[server] placement`
+    /// itself ([`jammi_db::index::AllLocal`] by default, or
+    /// [`jammi_db::index::RendezvousPlacement`] when the config names
+    /// `"rendezvous"`); THIS constructor is the explicit override a library
+    /// process that knows its own topology uses instead — a
+    /// [`jammi_db::index::StaticPlacement`], or any other
+    /// `SegmentPlacement` — becoming a full coordinator over the gRPC peer
+    /// transport (`jammi_wire::peer::GrpcPeerTransport`, wired by the store
+    /// builder) regardless of `[server] placement`. Precondition for any
+    /// non-local placement: `storage.result_root` (or a shared local
+    /// `artifact_dir`) is a root every replica can read, spelled IDENTICALLY
+    /// on every replica. When `[server] peer_advertise` is set, this
+    /// shared-root topology is exactly what
     /// [`jammi_db::config::JammiConfig::resolved_result_root`] yields
-    /// verbatim into `instances.result_root` — carried, not consulted:
+    /// verbatim into `instances.result_root` — carried AND consulted:
     /// [`jammi_db::catalog::Catalog::list_gang_members`] admits on address,
-    /// kinds, state and freshness only; root identity and any predicate on
-    /// it are U5b-1a-A2. Identical spelling stays necessary, never
+    /// kinds, state, freshness AND root-identity equality, and
+    /// [`jammi_db::index::RendezvousPlacement`]'s ring evaluates the SAME
+    /// root-identity predicate. Identical spelling stays necessary, never
     /// sufficient, for shared storage (see
     /// [`jammi_db::catalog::instance::InstanceRegistration::from_config`]).
     pub async fn open_with_placement(
@@ -158,7 +163,7 @@ impl InferenceSession {
         placement: Arc<dyn jammi_db::index::SegmentPlacement>,
     ) -> Result<Arc<Self>> {
         let inner = JammiSession::new(config).await?;
-        let session = Arc::new(Self::wrap_with(inner, None, placement).await?);
+        let session = Arc::new(Self::wrap_with(inner, None, Some(placement)).await?);
         session.register_query_functions();
         Ok(session)
     }
@@ -208,13 +213,18 @@ impl InferenceSession {
         inner: JammiSession,
         observer: Option<Arc<dyn InferenceObserver>>,
     ) -> Result<Self> {
-        Self::wrap_with(inner, observer, Arc::new(jammi_db::index::AllLocal)).await
+        Self::wrap_with(inner, observer, None).await
     }
 
+    /// `placement_override: None` means "derive the placement from `[server]
+    /// placement`" (the DEFAULT path, [`Self::open`]/[`Self::new`]/every
+    /// other constructor); `Some(p)` is [`Self::open_with_placement`]'s
+    /// explicit override, which wins regardless of what `[server] placement`
+    /// says.
     async fn wrap_with(
         inner: JammiSession,
         observer: Option<Arc<dyn InferenceObserver>>,
-        placement: Arc<dyn jammi_db::index::SegmentPlacement>,
+        placement_override: Option<Arc<dyn jammi_db::index::SegmentPlacement>>,
     ) -> Result<Self> {
         let inner = Arc::new(inner);
         let catalog = Arc::clone(inner.catalog());
@@ -231,6 +241,17 @@ impl InferenceSession {
         // funnel every `InferenceSession` constructor reaches, so a
         // hand-built config (never routed through `JammiConfig::load_from`)
         // is still covered here.
+        // #540 RANGESPLIT advisory: `JammiConfig::load_from` calls
+        // `InferenceConfig::validate` (rejects `partitions == 0` and above
+        // `MAX_PARTITIONS`), but a hand-built `JammiConfig` handed straight
+        // to an `InferenceSession` constructor — the way every test in this
+        // crate, and any embedding caller, builds one — never runs
+        // `load_from` at all. `wrap_with` is the same universal funnel that
+        // already covers `MembershipConfig::validate` for the identical
+        // reason (see the comment above), so validating here closes the
+        // same gap for `inference.partitions`.
+        inner.config().inference.validate()?;
+
         let instance_id = crate::fine_tune::worker::mint_instance_id();
         let label = crate::fine_tune::worker::worker_label();
         let registration = Arc::new(
@@ -264,6 +285,26 @@ impl InferenceSession {
             lease_intervals,
         )
         .await?;
+
+        // `[server] placement` resolved AFTER `instance_id` is minted (a
+        // `RendezvousPlacement` names itself by it) and AFTER `lease_intervals`
+        // is known (its ring-liveness margin derives from the SAME lease
+        // window every other leased row family uses) — an explicit override
+        // from `Self::open_with_placement` wins outright, regardless of what
+        // `[server] placement` says.
+        let placement: Arc<dyn jammi_db::index::SegmentPlacement> = match placement_override {
+            Some(placement) => placement,
+            None => match inner.config().server.placement {
+                jammi_db::config::PlacementMode::Local => Arc::new(jammi_db::index::AllLocal),
+                jammi_db::config::PlacementMode::Rendezvous => {
+                    Arc::new(jammi_db::index::RendezvousPlacement::new(
+                        Arc::clone(&catalog),
+                        instance_id.clone(),
+                        jammi_db::catalog::lease::instance_liveness_margin(lease_intervals.lease()),
+                    ))
+                }
+            },
+        };
 
         // The result store is built first: it owns the session's
         // `ArtifactStore` internally (rooted at `{result_store_root}/models`,
@@ -1028,23 +1069,51 @@ impl InferenceSession {
         let regression_form = guard.model.regression_form().cloned();
         drop(guard);
 
-        let inference = InferenceExecBuilder::new(
+        // #540 RANGESPLIT: see `operator::inference_exec::
+        // wrap_with_split_and_merge`'s doc. `input` here is CALLER-supplied
+        // (`query::QueryBuilder::annotate`'s fluent chain, or the Flight-SQL
+        // `annotate` table function's scan) and may already have more than
+        // one partition with nothing coalescing it — at the default
+        // `InferenceConfig::partitions == 1`, `wrap_with_split_and_merge`
+        // coalesces such an `input` to one partition before building
+        // InferenceExec: an uncoalesced multi-partition `input` would make
+        // InferenceExec declare N partitions while every partition's own
+        // runner independently restarts `_ordinal` at 0, and every in-crate
+        // `.execute(0, ..)` caller would see only a fraction of the rows —
+        // this is a REAL, load-bearing plan-shape change on this specific
+        // path, not a no-op, whenever `input` was not already a single
+        // partition.
+        let partitions = self.inner.config().inference.partitions;
+        let batch_size = self.inner.config().inference.batch_size;
+        let observer = self.observer.clone();
+        let model_cache = Arc::clone(&self.model_cache);
+        let device_kind = self.compute_device().kind();
+        let model = model.clone();
+        let columns = columns.to_vec();
+        let key_column = key_column.to_string();
+        let plan = crate::operator::inference_exec::wrap_with_split_and_merge(
             input,
-            model.clone(),
-            task,
-            columns.to_vec(),
-            key_column.to_string(),
-            String::new(),
-            Arc::clone(&self.model_cache),
-            self.compute_device().kind(),
-        )
-        .batch_size(self.inner.config().inference.batch_size)
-        .observer(self.observer.clone())
-        .embedding_dim(embedding_dim)
-        .regression_form(regression_form)
-        .build()?;
+            partitions,
+            move |input| {
+                InferenceExecBuilder::new(
+                    input,
+                    model,
+                    task,
+                    columns,
+                    key_column,
+                    String::new(),
+                    model_cache,
+                    device_kind,
+                )
+                .batch_size(batch_size)
+                .observer(observer)
+                .embedding_dim(embedding_dim)
+                .regression_form(regression_form)
+                .build()
+            },
+        )?;
 
-        Ok(Arc::new(inference))
+        Ok(plan)
     }
 
     /// Encode a single text query into a vector using the given model.
@@ -1540,22 +1609,42 @@ impl InferenceSession {
             }
         }
 
-        // Wrap with InferenceExec
-        let inference_exec = InferenceExecBuilder::new(
+        // Wrap with InferenceExec. #540 RANGESPLIT: see
+        // `operator::inference_exec::wrap_with_split_and_merge`'s doc. At
+        // the default `InferenceConfig::partitions == 1` it coalesces
+        // `input_plan` to one partition if it is not already one — a no-op
+        // here, since `ordered_input` just above already produced exactly
+        // one partition.
+        let partitions = self.inner.config().inference.partitions;
+        let batch_size = self.inner.config().inference.batch_size;
+        let observer = self.observer.clone();
+        let model_cache = Arc::clone(&self.model_cache);
+        let device_kind = self.compute_device().kind();
+        let source_clone = source.clone();
+        let content_columns_owned = content_columns.to_vec();
+        let key_column_owned = key_column.to_string();
+        let source_id_owned = source_id.to_string();
+        let inference_exec = crate::operator::inference_exec::wrap_with_split_and_merge(
             input_plan,
-            source.clone(),
-            task,
-            content_columns.to_vec(),
-            key_column.to_string(),
-            source_id.to_string(),
-            Arc::clone(&self.model_cache),
-            self.compute_device().kind(),
-        )
-        .batch_size(self.inner.config().inference.batch_size)
-        .observer(self.observer.clone())
-        .embedding_dim(embedding_dim)
-        .regression_form(regression_form)
-        .build()?;
+            partitions,
+            move |input| {
+                InferenceExecBuilder::new(
+                    input,
+                    source_clone,
+                    task,
+                    content_columns_owned,
+                    key_column_owned,
+                    source_id_owned,
+                    model_cache,
+                    device_kind,
+                )
+                .batch_size(batch_size)
+                .observer(observer)
+                .embedding_dim(embedding_dim)
+                .regression_form(regression_form)
+                .build()
+            },
+        )?;
 
         // Execute and collect results — both through the structural
         // classifier so a typed refusal raised inside the plan reaches the

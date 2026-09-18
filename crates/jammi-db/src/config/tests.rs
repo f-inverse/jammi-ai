@@ -3498,6 +3498,61 @@ fn from_config_peer_advertise_without_peer_bind_is_refused_naming_both_keys() {
     );
 }
 
+/// RENDEZVOUS RV4: `[server] placement = "rendezvous"` with no
+/// `peer_advertise` is refused BY NAME from `load_from` — the same choke
+/// point `peer_advertise`-without-`peer_bind` is refused at.
+#[test]
+fn load_from_rendezvous_placement_without_peer_advertise_is_refused_naming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = format!(
+        "artifact_dir = {:?}\n[server]\nplacement = \"rendezvous\"\n",
+        dir.path().to_str().unwrap()
+    );
+    let err = load_src(&src).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("placement") && msg.contains("rendezvous") && msg.contains("peer_advertise"),
+        "{msg}"
+    );
+}
+
+/// The same arm, over `InstanceRegistration::from_config` directly — the
+/// struct-literal-config / embedded-process path `load_from` never reaches.
+#[test]
+fn from_config_rendezvous_placement_without_peer_advertise_is_refused_naming_it() {
+    let cfg = JammiConfig {
+        server: ServerConfig {
+            placement: crate::config::PlacementMode::Rendezvous,
+            ..ServerConfig::default()
+        },
+        ..JammiConfig::default()
+    };
+    let err = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("placement") && msg.contains("rendezvous") && msg.contains("peer_advertise"),
+        "{msg}"
+    );
+}
+
+/// `[server] placement` defaults to `Local` and parses `"rendezvous"`;
+/// `"local"` and unset are both accepted with NO `peer_advertise`.
+#[test]
+fn server_placement_defaults_local_and_parses_rendezvous() {
+    assert_eq!(
+        ServerConfig::default().placement,
+        crate::config::PlacementMode::Local
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let src = format!(
+        "artifact_dir = {:?}\n[server]\nplacement = \"local\"\n",
+        dir.path().to_str().unwrap()
+    );
+    let cfg = load_src(&src).unwrap();
+    assert_eq!(cfg.server.placement, crate::config::PlacementMode::Local);
+}
+
 /// P-X1 (contract §10): `InstanceRegistration::from_config`'s `member_root`
 /// is the byte-for-byte output of `resolved_result_root()` — VERBATIM —
 /// over the whole arm list: unset, `file://`, `memory://`, `s3://`, both
@@ -4048,4 +4103,52 @@ fn ballista_executor_advertise_host_is_required_iff_the_bind_host_is_unspecified
     )
     .unwrap();
     assert!(BallistaConfig::validate(&cfg).is_ok());
+}
+
+/// `[inference] partitions = 0` is refused at load, naming the key —
+/// `OrdinalSplitExec`/`wrap_with_split_and_merge` floor it to `1`
+/// defensively, but that silent flooring must never be the FIRST thing a
+/// `0` a config author wrote actually does.
+#[test]
+fn inference_partitions_zero_is_rejected_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jammi.toml");
+    std::fs::write(&path, "[inference]\npartitions = 0\n").unwrap();
+    let err = JammiConfig::load_from(Some(&path), std::iter::empty())
+        .expect_err("partitions = 0 must be refused, never silently treated as 1");
+    assert!(err.to_string().contains("partitions"));
+}
+
+/// The peer of the above: a `partitions` value past the documented maximum
+/// is refused too, naming both the value and the bound.
+#[test]
+fn inference_partitions_above_the_maximum_is_rejected_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jammi.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[inference]\npartitions = {}\n",
+            InferenceConfig::MAX_PARTITIONS + 1
+        ),
+    )
+    .unwrap();
+    let err = JammiConfig::load_from(Some(&path), std::iter::empty())
+        .expect_err("partitions past the maximum must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("partitions"));
+    assert!(msg.contains(&InferenceConfig::MAX_PARTITIONS.to_string()));
+}
+
+/// A `partitions` value inside `[1, MAX_PARTITIONS]` — including both
+/// endpoints — is accepted.
+#[test]
+fn inference_partitions_in_range_is_accepted() {
+    for p in [1usize, 2, InferenceConfig::MAX_PARTITIONS] {
+        let cfg = InferenceConfig {
+            partitions: p,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok(), "partitions = {p} must be accepted");
+    }
 }

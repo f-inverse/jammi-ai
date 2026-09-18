@@ -662,3 +662,257 @@ async fn a_member_whose_body_fails_ends_the_attempt_failed_under_the_coordinator
     );
     expect_slot_free(&engine).await;
 }
+
+// ─── GA8 exit (issue #538): a Peer graph gang is refused by name ──────────
+//
+// GA8 built the graph-arm Peer path (a member binding the materialised
+// `GraphTrainingSet` table via the generic `bind_training_source` path),
+// but a closing audit found it unsound by execution, not by inspection:
+// reverting only GA1's two `ORDER BY`s made the SAME reference-vs-job byte
+// comparison this file's other tests use go green, meaning the Peer
+// member's own rank body has no path that reads the table in the SAME
+// `_ordinal`-committed order rank 0's read uses — a member reading by a
+// column-derived `ORDER BY` (the generic path the tabular arm's member
+// takes) partitions a DIFFERENT row order of the SAME rows, so the two
+// ranks would shard identically-named rows differently; and there is no
+// executed oracle that the resulting per-rank shards combine into a
+// correct all-reduced gradient over the graph arm's own loss (rank 0's
+// bytes were unchanged when the member's rows were replaced with garbage
+// or read reversed). Exited: a `graph_fine_tune` at `world_size > 1` still
+// decides `Peer` (the topology decision itself is unchanged — this is a
+// refusal downstream of it, not a different decision), but `run_spec`
+// refuses it by name before any coordinator dial. The `Single` (`world ==
+// 1`) and `Local` (in-process, `world <= local_ranks`) paths are
+// unaffected and keep their own byte pins:
+// `crates/jammi-ai/tests/it/gang_coordinator.rs`'s
+// `a_local_ranks_two_host_fans_a_two_rank_job_out_through_run_spec_and_publishes_the_gangs_bytes`,
+// `gang_placed.rs`'s `p2_the_stub_submitter_drives_a_real_run_placed_gang_to_the_same_bytes`,
+// and `graph_finetune.rs`'s `fine_tune_graph_end_to_end_completes` (W=1).
+
+/// A small, well-connected graph — a directed 8-cycle plus chords.
+fn graph_nodes_edges() -> (
+    Vec<jammi_ai::fine_tune::graph_sampler::TextNode>,
+    Vec<jammi_ai::fine_tune::graph_sampler::GraphEdge>,
+) {
+    use jammi_ai::fine_tune::graph_sampler::{GraphEdge, TextNode};
+    let n = 8;
+    let nodes = (0..n)
+        .map(|i| TextNode::new(format!("g{i}"), format!("graph_node_text_{i}")))
+        .collect();
+    let mut edges = Vec::new();
+    for i in 0..n {
+        edges.push(GraphEdge::declared(
+            format!("g{i}"),
+            format!("g{}", (i + 1) % n),
+        ));
+        edges.push(GraphEdge::declared(
+            format!("g{}", (i + 1) % n),
+            format!("g{i}"),
+        ));
+    }
+    (nodes, edges)
+}
+
+fn graph_sample_config() -> jammi_ai::fine_tune::graph_sampler::GraphSampleConfig {
+    jammi_ai::fine_tune::graph_sampler::GraphSampleConfig {
+        walk_length: 2,
+        walks_per_node: 1,
+        hard_negatives: 0,
+        exclude_hops: 1,
+        min_negatives: 1,
+        seed: 7,
+        ..Default::default()
+    }
+}
+
+fn write_graph_csvs(dir: &std::path::Path) -> (String, String) {
+    let (nodes, edges) = graph_nodes_edges();
+    let node_path = dir.join("graph_nodes.csv");
+    let mut node_body = String::from("id,text\n");
+    for n in &nodes {
+        node_body.push_str(&format!("{},{}\n", n.id, n.text));
+    }
+    std::fs::write(&node_path, node_body).unwrap();
+
+    let edge_path = dir.join("graph_edges.csv");
+    let mut edge_body = String::from("src,dst\n");
+    for e in &edges {
+        edge_body.push_str(&format!("{},{}\n", e.src, e.dst));
+    }
+    std::fs::write(&edge_path, edge_body).unwrap();
+
+    (
+        format!("file://{}", node_path.display()),
+        format!("file://{}", edge_path.display()),
+    )
+}
+
+/// [`register_member`]'s graph-arm counterpart: a member claiming the
+/// `graph_fine_tune` kind, not `fine_tune` — present and available, so the
+/// refusal test below proves a DELIBERATE typed width block, never merely
+/// "no member was found".
+async fn register_graph_member(
+    engine: &Arc<InferenceSession>,
+    id: &str,
+    addr: std::net::SocketAddr,
+) {
+    let root = MemberRoot::resolved(engine.inner_config()).expect("the engine's own root");
+    engine
+        .catalog()
+        .upsert_instance(&InstanceRegistration::new(
+            id,
+            Some("member"),
+            Some("host"),
+            Some(PeerAddr::parse(&addr.to_string()).unwrap()),
+            Some(root),
+        ))
+        .await
+        .unwrap();
+    engine
+        .catalog()
+        .upsert_worker(id, "graph_fine_tune", WorkerState::Claiming, &[])
+        .await
+        .unwrap();
+}
+
+/// [`claim`]'s graph-arm counterpart: claims `graph_fine_tune`, not
+/// `fine_tune`.
+async fn claim_graph(
+    engine: &Arc<InferenceSession>,
+    worker: &JobWorker,
+    within: Duration,
+) -> JobRecord {
+    const MAX_ATTEMPTS: u32 = 3;
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        engine
+            .catalog()
+            .reclaim_expired_jobs(LEASE, MAX_ATTEMPTS)
+            .await
+            .unwrap();
+        if let Some(record) = engine
+            .catalog()
+            .claim_next(worker.worker_id(), &["graph_fine_tune"], LEASE)
+            .await
+            .unwrap()
+        {
+            return record;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the graph job was not claimable within {within:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn coordinating_graph_server() -> crate::common::grpc::PeerEngineServer {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cfg = crate::common::grpc::peer_bind_config(dir.path());
+    cfg.worker.enabled = false;
+    cfg.lease.duration_secs = LEASE.as_secs();
+    cfg.lease.heartbeat_secs = HEARTBEAT.as_secs();
+    cfg.distributed.max_world_size = 2;
+    cfg.server.peer_advertise = Some("127.0.0.1:1".into());
+    let (node_url, edge_url) = write_graph_csvs(dir.path());
+    let server = crate::common::grpc::start_engine_server_from_config(cfg, Some(dir)).await;
+    server
+        .engine
+        .add_source(
+            "graph_nodes",
+            SourceType::File,
+            SourceConnection {
+                url: Some(node_url),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    server
+        .engine
+        .add_source(
+            "graph_edges",
+            SourceType::File,
+            SourceConnection {
+                url: Some(edge_url),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    server
+}
+
+fn two_rank_graph_spec() -> TrainingSpec {
+    use jammi_ai::fine_tune::graph_sampler::{EdgeProvenance, GraphFineTuneSources};
+    TrainingSpec::GraphFineTune {
+        sources: GraphFineTuneSources {
+            node_source: "graph_nodes".into(),
+            id_column: "id".into(),
+            text_column: "text".into(),
+            edge_source: "graph_edges".into(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+            provenance: EdgeProvenance::Declared,
+        },
+        sample_config: graph_sample_config(),
+        common: TrainingCommon {
+            base_model: tiny_bert_model(),
+            config: gang_config(2),
+            world_size: 2,
+        },
+    }
+}
+
+/// GA8's exit oracle: a `graph_fine_tune` at `world_size = 2` still decides
+/// `Peer` (unchanged), but `run_spec` refuses it BY NAME before any
+/// coordinator dial — never a silent single-rank run of a wider job, never
+/// a generic/opaque failure. RED under the mutation named in this commit
+/// (restoring GA8's `self.coordinate(...)` call in place of the refusal
+/// turns this GREEN-for-the-wrong-reason into a hang/dial against a member
+/// with no ordered-read counterpart — this test's error-message assertion
+/// is what catches a silent re-introduction, not just job status).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graph_fine_tune_peer_gang_is_refused_by_name() {
+    let server = coordinating_graph_server().await;
+    let engine = Arc::clone(&server.engine);
+    register_graph_member(&engine, "member-1", server.peer_addr).await;
+
+    let job = engine
+        .run_training_spec(two_rank_graph_spec())
+        .await
+        .expect(
+            "submission itself is not refused; the typed refusal fires when the worker runs it",
+        );
+    let job_id = job.job_id.clone();
+    let worker = JobWorker::new(&engine).unwrap();
+
+    let record = claim_graph(&engine, &worker, Duration::from_secs(20)).await;
+    worker.run_claimed_job(&engine, record).await;
+
+    assert_eq!(
+        training_test_hooks::topology_for(&job_id),
+        Some(TopologyDecision::Peer { world: 2 }),
+        "the topology decision is unchanged by the exit — Peer is still decided, then refused"
+    );
+    let after = row(&engine, &job_id).await;
+    assert_eq!(after.status, "failed", "{after:?}");
+    let error = after.error.clone().unwrap_or_default();
+    assert!(
+        error.contains("graph fine-tune gangs are local-only in v1")
+            && error.contains("tracked on #538")
+            && error.contains("world_size = 2"),
+        "the refusal must name the reason and the width, not a generic failure: {error}"
+    );
+    assert!(
+        training_test_hooks::coordinator_ends_for(&job_id).is_empty(),
+        "the refusal fires BEFORE any coordinator body/dial — no attempt is recorded"
+    );
+    assert!(
+        fine_tuned_model(&engine, &job_id).await.is_none(),
+        "nothing is published over a refused width"
+    );
+    expect_slot_free(&engine).await;
+}

@@ -93,6 +93,30 @@ pub(crate) fn extract_string_column(col: &dyn arrow::array::Array) -> Option<Vec
     string_cells(col).map(|cells| cells.to_vec())
 }
 
+/// GA3 (issue #538): refuse a NULL cell in `column` rather than let
+/// [`StringCells::value`]'s historical "a null slot reads `\"\"`" contract
+/// silently apply to it. Scoped to the ONE column a caller opts into (the
+/// Triplet arms' `negative` column below) — [`extract_string_column`]'s
+/// existing null-tolerant contract is unchanged for every other text column,
+/// so this does not widen the historical policy, only carve out one honest
+/// exception where a null is never a legitimate reading of the caller's data.
+///
+/// The graph sampler's own empty-negative-pool refusal fires at SAMPLE time,
+/// before a table is ever written (`GraphSampler::sample`) — a NULL reaching
+/// this decode means that refusal was somehow bypassed (a hand-built table,
+/// a future producer that forgets to call it), so this is the last, honest
+/// line of defense, not the primary one.
+fn refuse_null_cell(col: &dyn arrow::array::Array, column: &str) -> Result<()> {
+    if let Some(i) = (0..col.len()).find(|&i| col.is_null(i)) {
+        return Err(JammiError::FineTune(format!(
+            "'{column}' has a NULL cell at row {i}: a declared triplet format must carry an \
+             explicit value for every row, never silently read as whatever an unchecked \
+             null-slot read on this column type happens to return (issue #538 GA3)"
+        )));
+    }
+    Ok(())
+}
+
 /// A string column read as CELLS: the same type acceptance and the same two
 /// refusals as [`extract_string_column`] (which IS `string_cells(col)` turned
 /// into a `Vec`, so there is exactly one policy), held as a typed view over
@@ -508,17 +532,23 @@ pub fn build_training_data_loader(
                         schema_info()
                     ))
                     })?;
-                let neg_vals = batch
-                    .column_by_name("negative")
-                    .and_then(|c| extract_string_column(c.as_ref()))
-                    .ok_or_else(|| {
-                        JammiError::FineTune(format!(
+                let negative_col = batch.column_by_name("negative").ok_or_else(|| {
+                    JammiError::FineTune(format!(
                         "Missing/invalid 'negative' column: task {task} expects text columns; for \
                          image/audio triplets submit task=image_embedding/audio_embedding. \
                          Batch schema: [{}]",
                         schema_info()
                     ))
-                    })?;
+                })?;
+                refuse_null_cell(negative_col.as_ref(), "negative")?;
+                let neg_vals = extract_string_column(negative_col.as_ref()).ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "Missing/invalid 'negative' column: task {task} expects text columns; for \
+                         image/audio triplets submit task=image_embedding/audio_embedding. \
+                         Batch schema: [{}]",
+                        schema_info()
+                    ))
+                })?;
 
                 for i in 0..batch.num_rows() {
                     rows.push((
@@ -683,16 +713,27 @@ fn build_media_triplet_loader(
                     schema_info()
                 ))
             })?;
-        let neg_vals = batch
-            .column_by_name("negative")
-            .and_then(|c| extract_binary_column(c.as_ref()))
-            .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "Missing/invalid binary 'negative' column for media triplets (task \
-                     {task}). Batch schema: [{}]",
-                    schema_info()
-                ))
-            })?;
+        let negative_col = batch.column_by_name("negative").ok_or_else(|| {
+            JammiError::FineTune(format!(
+                "Missing/invalid binary 'negative' column for media triplets (task {task}). \
+                 Batch schema: [{}]",
+                schema_info()
+            ))
+        })?;
+        // (advisory 9, issue #538): a NULL negative cell must be refused,
+        // never silently read via an unchecked `.value(i)` on this
+        // binary column — the SAME refusal the text Triplet arm's
+        // `negative` column already carries; a media triplet has no
+        // legitimate reason to carry a NULL negative any more than a text
+        // one does.
+        refuse_null_cell(negative_col.as_ref(), "negative")?;
+        let neg_vals = extract_binary_column(negative_col.as_ref()).ok_or_else(|| {
+            JammiError::FineTune(format!(
+                "Missing/invalid binary 'negative' column for media triplets (task {task}). \
+                 Batch schema: [{}]",
+                schema_info()
+            ))
+        })?;
 
         for i in 0..batch.num_rows() {
             rows.push((
@@ -1029,11 +1070,19 @@ impl<'a> DecodedBatch<'a> {
                 anchors: text_column("anchor")?,
                 positives: text_column("positive")?,
             },
-            DetectedFormat::Triplet => DecodedBatch::Triplet {
-                anchors: text_column("anchor")?,
-                positives: text_column("positive")?,
-                negatives: text_column("negative")?,
-            },
+            DetectedFormat::Triplet => {
+                // GA3 (issue #538): a missing column is `text_column`'s own
+                // refusal below; a PRESENT-but-null `negative` cell is this
+                // one, before `StringCells`'s null-tolerant read applies.
+                if let Some(negative_col) = batch.column_by_name("negative") {
+                    refuse_null_cell(negative_col.as_ref(), "negative")?;
+                }
+                DecodedBatch::Triplet {
+                    anchors: text_column("anchor")?,
+                    positives: text_column("positive")?,
+                    negatives: text_column("negative")?,
+                }
+            }
             DetectedFormat::MediaTriplet => DecodedBatch::MediaTriplet {
                 anchors: media_column("anchor")?,
                 positives: media_column("positive")?,
@@ -1390,6 +1439,109 @@ mod decoded_batch_tests {
         assert_eq!(
             extract_binary_column(bytes.as_ref()).unwrap(),
             cells.to_vec()
+        );
+    }
+
+    /// (issue #538): a triplet batch whose `negative` column carries a NULL
+    /// cell — `StringCells`'s historical null-reads-as-`""` contract must
+    /// NOT apply to this column; row 1's negative is null, everything else
+    /// is present.
+    fn triplet_batch_with_a_null_negative() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("anchor", DataType::Utf8, true),
+            Field::new("positive", DataType::Utf8, true),
+            Field::new("negative", DataType::Utf8, true),
+        ]));
+        let anchors: ArrayRef =
+            Arc::new(StringArray::from(vec![Some("a0"), Some("a1"), Some("a2")]));
+        let positives: ArrayRef =
+            Arc::new(StringArray::from(vec![Some("p0"), Some("p1"), Some("p2")]));
+        let negatives: ArrayRef = Arc::new(StringArray::from(vec![Some("n0"), None, Some("n2")]));
+        RecordBatch::try_new(schema, vec![anchors, positives, negatives]).unwrap()
+    }
+
+    #[test]
+    fn decoded_batch_refuses_a_null_negative_cell_rather_than_read_it_as_empty() {
+        let batch = triplet_batch_with_a_null_negative();
+        let Err(err) =
+            DecodedBatch::decode(DetectedFormat::Triplet, ModelTask::TextEmbedding, &batch)
+        else {
+            panic!("a NULL negative cell must be refused, never read as \"\"");
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("negative") && msg.contains("NULL") && msg.contains('1'),
+            "the refusal should name the column and the offending row: {msg}"
+        );
+    }
+
+    /// (advisory 9, issue #538): the SAME NULL-negative refusal, over a
+    /// media triplet's BINARY `negative` column (`ImageEmbedding`/
+    /// `AudioEmbedding` task, not a text one) — a media triplet has no
+    /// legitimate reason to carry a NULL negative any more than a text one
+    /// does, and `BinaryCells::value`'s unchecked `.value(i)` read has no
+    /// "historical null-reads-as-empty" contract to fall back on at all
+    /// (unlike `StringCells`'s), so reading it unchecked is undefined, not
+    /// merely lenient.
+    fn media_triplet_batch_with_a_null_negative() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("anchor", DataType::Binary, true),
+            Field::new("positive", DataType::Binary, true),
+            Field::new("negative", DataType::Binary, true),
+        ]));
+        let anchors: ArrayRef = Arc::new(arrow::array::BinaryArray::from(vec![
+            Some(&b"a0"[..]),
+            Some(&b"a1"[..]),
+            Some(&b"a2"[..]),
+        ]));
+        let positives: ArrayRef = Arc::new(arrow::array::BinaryArray::from(vec![
+            Some(&b"p0"[..]),
+            Some(&b"p1"[..]),
+            Some(&b"p2"[..]),
+        ]));
+        let negatives: ArrayRef = Arc::new(arrow::array::BinaryArray::from(vec![
+            Some(&b"n0"[..]),
+            None,
+            Some(&b"n2"[..]),
+        ]));
+        RecordBatch::try_new(schema, vec![anchors, positives, negatives]).unwrap()
+    }
+
+    #[test]
+    fn build_training_data_loader_refuses_a_null_negative_cell_in_a_media_triplet() {
+        let batch = media_triplet_batch_with_a_null_negative();
+        let columns = vec![
+            "anchor".to_string(),
+            "positive".to_string(),
+            "negative".to_string(),
+        ];
+        let Err(err) = build_training_data_loader(&[batch], &columns, ModelTask::ImageEmbedding)
+        else {
+            panic!("a NULL negative cell in a media triplet must be refused, never read unchecked");
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("negative") && msg.contains("NULL") && msg.contains('1'),
+            "the refusal should name the column and the offending row: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_training_data_loader_refuses_a_null_negative_cell() {
+        let batch = triplet_batch_with_a_null_negative();
+        let columns = vec![
+            "anchor".to_string(),
+            "positive".to_string(),
+            "negative".to_string(),
+        ];
+        let Err(err) = build_training_data_loader(&[batch], &columns, ModelTask::TextEmbedding)
+        else {
+            panic!("a NULL negative cell must be refused, never read as \"\"");
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("negative") && msg.contains("NULL"),
+            "the refusal should name the column: {msg}"
         );
     }
 }

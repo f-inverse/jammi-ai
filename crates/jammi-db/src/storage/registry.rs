@@ -74,7 +74,13 @@ impl StorageRegistry {
     /// used instead. Subsequent calls for the same key return the cached
     /// driver and ignore `config`. Callers needing distinct credentials per
     /// call should use distinct buckets.
-    pub fn driver_for(
+    ///
+    /// `pub(crate)`, not `pub`: this hands back the raw `Arc<dyn
+    /// ObjectStore>`, on which `ObjectStoreExt::delete` carries no
+    /// `models/` guard. Outside this crate, call [`Self::handle_for`], which
+    /// wraps the SAME cached driver in the guarded
+    /// [`super::object_store_handle::JammiObjectStore`] handle (#588).
+    pub(crate) fn driver_for(
         &self,
         url: &StorageUrl,
         config: Option<&CloudConfig>,
@@ -88,6 +94,25 @@ impl StorageRegistry {
         let driver = build_object_store(url, effective)?;
         guard.insert(key, Arc::clone(&driver));
         Ok(driver)
+    }
+
+    /// Resolve (or construct and cache) the driver for `url` and hand it
+    /// back wrapped in the guarded [`super::object_store_handle::JammiObjectStore`]
+    /// handle — the public replacement for a raw `Self::driver_for` call:
+    /// every byte-delete this handle can issue goes through
+    /// `JammiObjectStore::delete_if_exists`, the crate's one reviewed
+    /// deleter (`tests/it/models_delete_call_sites.rs`), never a raw
+    /// `ObjectStoreExt::delete` on the underlying driver.
+    pub fn handle_for(
+        &self,
+        url: &StorageUrl,
+        config: Option<&CloudConfig>,
+    ) -> Result<super::object_store_handle::JammiObjectStore, StorageError> {
+        let driver = self.driver_for(url, config)?;
+        Ok(super::object_store_handle::JammiObjectStore::new(
+            driver,
+            url.clone(),
+        ))
     }
 
     /// Drop the cached driver for `url`. The next `driver_for` call

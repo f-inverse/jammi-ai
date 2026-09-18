@@ -9,9 +9,16 @@ devices` in `schema.rs`; U9a/U9b: `deploy/kubernetes/overlays/shape-d/{deploymen
 statefulset-compute,service-compute-headless,service-scheduler}.yaml`) — `Cargo.toml` pins
 `datafusion 54.1`, `arrow 58.3`, `ballista-core/-scheduler/-executor 54.1`, all confirmed on this
 tree. The wave-5 close-out (this PR, `feat/500-wave5`) lands the cluster-leg artifact (row C9,
-below), `#543`'s closure, and the v1 limits recorded in `DESIGN.md` §8. What is NOT in v1: the
-`graph_fine_tune` `Peer` gang (issue #538, DESIGN.md §8), the partition-aware `InferenceExec`
-range split (issue #540, out of scope — de-scoped from a withdrawn U6), and Ballista's
+below), `#543`'s closure, and the v1 limits recorded in `DESIGN.md` §8. Issue #538's graph
+fine-tune work landed after wave 5 (GRAPHARM, GA1–GA7, GA9): a `graph_fine_tune` job now
+materialises its sampled pairs as a `GraphTrainingSet`-kind `TrainingSet` table through the same
+`Batches` producer seam the tabular arm's SQL arm uses, replayable by `recompute`, reserved
+against a named memory consumer, and read-order-independent. A `Peer` gang at `world_size > 1`
+still does **not** admit a member against it — a closing audit found the member's read path
+diverges from rank 0's committed order with no gradient-propagation proof, so `run_spec` refuses
+it by name (`DESIGN.md` §8); `Single` and in-process `Local` gangs are unaffected. What is NOT
+in v1: the partition-aware
+`InferenceExec` range split (issue #540, out of scope — de-scoped from a withdrawn U6), and Ballista's
 accelerator-dimension seam (the one upstream PR 67 owes, README r43). 68's `DIST-2`
 (`RendezvousPlacement`) and `DIST-3` (`datafusion-distributed`) are unscheduled "later" work on
 top of this plan's substrate, not a precondition of anything here. Two unrelated backlog items
@@ -69,8 +76,11 @@ those still in force are restated here in their v4 form. Principle in parenthese
 
 26. **The claimant is the coordinator.** A training-kind job is claimed by a `JobWorker` through
     `claim_next` (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::claim_next`); that process is rank 0 and holds the only lease
-    (`heartbeat_job`, `Catalog::heartbeat_job`). Kinds eligible for `world_size > 1`: `fine_tune` and
-    `graph_fine_tune`; `context_predictor` is refused at `world_size > 1` (K2, typed, at submit).
+    (`heartbeat_job`, `Catalog::heartbeat_job`). Kinds eligible for a `Peer` gang (`world_size` above
+    `[worker] local_ranks`): `fine_tune` only — `graph_fine_tune` decides `Peer` at the same
+    threshold but is refused there by name (issue #538, `DESIGN.md` §8; it still runs `Single` and
+    in-process `Local` at any `world_size <= local_ranks`); `context_predictor` is refused at
+    `world_size > 1` outright (K2, typed, at submit).
 27. **A peer is a fleet worker with a spare admission holder.** A peer is a `JobWorker` process
     whose `[worker] kinds` include the job's kind and whose `peer_bind` is set. `RunRank`
     contends for `HostAdmission`'s single per-process holder cell — `Free` / `ClaimProbe` /

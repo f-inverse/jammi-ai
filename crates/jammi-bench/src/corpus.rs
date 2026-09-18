@@ -29,7 +29,7 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use futures::TryStreamExt;
 
-use jammi_db::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
+use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 use jammi_db::store::schema::{embedding_batch_with_null_hash, embedding_table_schema};
 use jammi_db::store::vectors::extend_with_fixed_size_list_f32;
 
@@ -102,8 +102,7 @@ pub async fn materialize(
     let schema = embedding_table_schema(dim);
     let url = StorageUrl::parse(path.to_str().ok_or("corpus path is not valid UTF-8")?)?;
     let registry = StorageRegistry::new();
-    let driver = registry.driver_for(&url, None)?;
-    let handle = JammiObjectStore::new(driver, url.clone());
+    let handle = registry.handle_for(&url, None)?;
     let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema)).await?;
 
     let mut lcg = Lcg::new(seed);
@@ -138,8 +137,7 @@ pub async fn write_vectors(
     let schema = embedding_table_schema(dim);
     let url = StorageUrl::parse(path.to_str().ok_or("corpus path is not valid UTF-8")?)?;
     let registry = StorageRegistry::new();
-    let driver = registry.driver_for(&url, None)?;
-    let handle = JammiObjectStore::new(driver, url.clone());
+    let handle = registry.handle_for(&url, None)?;
     let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema)).await?;
 
     let batch = embedding_batch_with_null_hash(&schema, "src", "model", rows, dim)?;

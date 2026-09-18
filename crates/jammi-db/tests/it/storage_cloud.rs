@@ -106,8 +106,7 @@ fn three_col_batch() -> RecordBatch {
 ))]
 async fn round_trip_under(url: StorageUrl) {
     let registry = StorageRegistry::new();
-    let driver = registry.driver_for(&url, None).unwrap();
-    let handle = JammiObjectStore::new(driver, url.clone());
+    let handle = registry.handle_for(&url, None).unwrap();
     let batch = three_col_batch();
     let schema = batch.schema();
     let mut w = ObjectParquetWriter::open(&handle, schema).await.unwrap();

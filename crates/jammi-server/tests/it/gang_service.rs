@@ -426,7 +426,7 @@ async fn materialize_training_set_for_tenant(
     let record = server
         .engine
         .with_tenant_scoped(tenant, move |_scope| async move {
-            jammi_ai::fine_tune::training_set::materialize_projection_table(
+            let table = jammi_ai::fine_tune::training_set::materialize_projection_table(
                 &engine_for_scope,
                 "pairs",
                 &columns,
@@ -434,8 +434,16 @@ async fn materialize_training_set_for_tenant(
                 &format,
             )
             .await
-            .unwrap()
-            .record
+            .unwrap();
+            // The whole catalog row, fetched through the catalog under the
+            // SAME tenant scope this closure already runs in (#551)
+            // — `TrainingSetTable` carries no whole-row accessor.
+            engine_for_scope
+                .catalog()
+                .get_result_table(table.table_name())
+                .await
+                .unwrap()
+                .expect("the producer promoted a catalog row")
         })
         .await;
     let store = server.engine.result_store();

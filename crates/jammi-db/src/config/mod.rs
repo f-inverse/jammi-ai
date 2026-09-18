@@ -977,6 +977,22 @@ pub struct InferenceConfig {
     pub batch_timeout_secs: u64,
     /// Maximum number of models held in memory simultaneously. 0 means unlimited. Default: 0.
     pub max_loaded_models: usize,
+    /// The number of `OrdinalSplitExec` fan-out partitions `InferenceExec` runs
+    /// concurrently below its merge (#540 RANGESPLIT). At `1` (the default)
+    /// no `OrdinalSplitExec`/`SortPreservingMergeExec` node is inserted at
+    /// all; `InferenceExec`'s single caller-supplied input is coalesced to
+    /// one partition first if it is not already one (needed on at least one
+    /// call site — `InferenceSession::annotate_plan` — whose input may
+    /// already have more than one partition with nothing coalescing it), so
+    /// this is a genuine no-op ONLY when the input was already a single
+    /// partition. A value `> 1` inserts the split (see `jammi_ai::operator::
+    /// ordinal_split_exec` for the mechanism). This node is NOT distributable
+    /// in v1: it has no wire form at all (`jammi_ballista::codec`'s module
+    /// doc states why — a Ballista `SortPreservingMergeExec` is a stage
+    /// boundary, so this node's in-process shared-mutex mechanism has no
+    /// meaning across the resulting per-task process split), so a value
+    /// `> 1` is an in-process-only capability. Default: 1.
+    pub partitions: usize,
     /// HTTP backend configuration (for remote inference endpoints).
     pub http: HttpConfig,
 }
@@ -1747,6 +1763,30 @@ pub struct CacheConfig {
     pub embedding_cache_size: String,
 }
 
+/// Which [`crate::index::SegmentPlacement`] a session builds:
+/// [`Self::Local`] ([`crate::index::AllLocal`], the default — every segment
+/// is this process's own, a single node regardless of what else is
+/// configured) or [`Self::Rendezvous`] ([`crate::index::RendezvousPlacement`]
+/// over the live `instances` ring — beyond-one-node retrieval). `rendezvous`
+/// with no `[server] peer_advertise` is refused, by name, at the ONE
+/// membership choke point
+/// ([`crate::catalog::instance::MembershipConfig::validate`]) both
+/// [`crate::config::JammiConfig::load_from`] and
+/// [`crate::catalog::instance::InstanceRegistration::from_config`] call —
+/// never here, and never in [`ServerConfig::validate`], which cannot see
+/// whether a segment placement even wants a member row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementMode {
+    /// Every segment is this process's own — [`crate::index::AllLocal`].
+    #[default]
+    Local,
+    /// Beyond-one-node retrieval over the live `instances` ring —
+    /// [`crate::index::RendezvousPlacement`]. Requires `[server]
+    /// peer_advertise`.
+    Rendezvous,
+}
+
 /// Arrow Flight SQL and health-probe server bind addresses.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1812,6 +1852,20 @@ pub struct ServerConfig {
     /// concurrency × budget. Read by the result store; a library embedder sets
     /// it through the same config. `Some(0)` is refused.
     pub peer_local_load_bytes: Option<u64>,
+    /// Which [`crate::index::SegmentPlacement`] this session builds. Default
+    /// [`PlacementMode::Local`] — every existing deployment's behaviour is
+    /// unchanged. `"rendezvous"` requires `peer_advertise` to be set too
+    /// (refused at the membership choke point — see [`PlacementMode`]'s doc).
+    ///
+    /// # TOML
+    ///
+    /// ```toml
+    /// [server]
+    /// placement = "rendezvous"
+    /// peer_bind = "0.0.0.0:9000"
+    /// peer_advertise = "10.0.4.7:9000"
+    /// ```
+    pub placement: PlacementMode,
 }
 
 /// The optional service-tier selection for a server deployment. `All` (the
@@ -2701,8 +2755,58 @@ impl Default for InferenceConfig {
             batch_size: 32,
             batch_timeout_secs: 300,
             max_loaded_models: 0,
+            partitions: 1,
             http: HttpConfig::default(),
         }
+    }
+}
+
+impl InferenceConfig {
+    /// `partitions` above this is refused — not a compute limit (the model
+    /// forward itself is bounded elsewhere, by `RS7`'s per-instance
+    /// semaphore), but a RESIDENCY one: `partitions` is the count of
+    /// resident copies one query holds open at once — one `InferenceRunner`
+    /// and one upstream-adjacent stream slot PER partition (a STRUCTURAL
+    /// bound — `OrdinalSplitExec`'s own module doc — never an instrumented
+    /// one; there is no per-partition in-flight-batch buffer to count) — so
+    /// an unbounded value is an unbounded number of resident
+    /// runners/streams, never a compute cost that merely runs slower.
+    /// `1024` is generous relative to any real deployment's device or core
+    /// count while still refusing an obviously-mistyped value (a raw row
+    /// count, a byte size) before it ever reaches `OrdinalSplitExec`.
+    pub const MAX_PARTITIONS: usize = 1024;
+
+    /// Reject `partitions == 0` (silently flooring it to `1` at
+    /// `OrdinalSplitExec`/`wrap_with_split_and_merge` would let a config
+    /// author's `0` mean something other than what they wrote) and
+    /// `partitions > MAX_PARTITIONS` (see that constant's doc for the
+    /// growing term it bounds), naming the offending value either way.
+    ///
+    /// Called by [`JammiConfig::load_from`]. A `JammiConfig` built by
+    /// struct literal (or by `parse_from` alone) and handed straight to an
+    /// `InferenceSession` constructor — the way every test in
+    /// `crates/jammi-ai` builds one — never runs `load_from`, so it would
+    /// never run this check either; the second call site is
+    /// `jammi_ai::session::InferenceSession::wrap_with`, the same
+    /// universal constructor funnel that already covers
+    /// [`crate::catalog::instance::MembershipConfig::validate`] for the
+    /// identical "struct-literal config skips `load_from`" reason.
+    pub fn validate(&self) -> Result<()> {
+        if self.partitions == 0 {
+            return Err(JammiError::Config(
+                "[inference] partitions must be >= 1 (0 is refused, never silently treated as 1)"
+                    .into(),
+            ));
+        }
+        if self.partitions > Self::MAX_PARTITIONS {
+            return Err(JammiError::Config(format!(
+                "[inference] partitions = {} exceeds the maximum {} — partitions is a count of \
+                 RESIDENT runners/streams/batches held open by one query, not a compute knob",
+                self.partitions,
+                Self::MAX_PARTITIONS
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -2760,6 +2864,7 @@ impl Default for ServerConfig {
             peer_bind: None,
             peer_advertise: None,
             peer_local_load_bytes: None,
+            placement: PlacementMode::default(),
         }
     }
 }
@@ -2995,6 +3100,20 @@ impl JammiConfig {
         // `load_from` entirely is still covered there. The `Option` is
         // discarded; this call is for its early-failure side effect only.
         let _ = crate::catalog::instance::MembershipConfig::validate(&config)?;
+        // Reject `[inference] partitions = 0` at load time, naming the key —
+        // `OrdinalSplitExec`/`wrap_with_split_and_merge` floor it to 1
+        // defensively, but a config author who wrote `0` meant something
+        // and silently getting `1` back is a confident-wrong-number, not a
+        // degrade. Also caps it: the growing term this knob multiplies is
+        // resident copies — N `InferenceRunner`s, N open upstream-adjacent
+        // streams per query (a structural bound over `OrdinalSplitExec`'s
+        // own field list, never an instrumented one — see
+        // `InferenceConfig::MAX_PARTITIONS`'s own doc) — never compute
+        // alone, so an unbounded `partitions` is an unbounded number of
+        // resident runners/streams per query. The second call site (a
+        // struct-literal `JammiConfig` that skips this function entirely)
+        // is named on `InferenceConfig::validate`'s own doc.
+        config.inference.validate()?;
         Ok(config)
     }
 

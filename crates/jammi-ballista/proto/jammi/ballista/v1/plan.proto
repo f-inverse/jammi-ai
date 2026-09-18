@@ -81,6 +81,13 @@ message KeyCheckExecNode {
   string key_column = 1;
 }
 
+// `OrdinalSplitExec` (`jammi_ai::operator::ordinal_split_exec`, #540
+// RANGESPLIT) has NO message here — it is not distributable in v1. See
+// `jammi_ballista::codec`'s module doc for why (a Ballista
+// SortPreservingMergeExec is a stage boundary, so this node's in-process
+// shared-mutex mechanism has no meaning across the resulting per-task
+// process split).
+
 // `GangExec`'s construction inputs (README r41).
 message GangExecNode {
   string job_id = 1;

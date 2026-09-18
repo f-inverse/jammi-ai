@@ -176,7 +176,7 @@
 # expectation, checked via the SAME exact-SET-equality
 # `params.expect_kernels_disabled` (`finetune_step.rs:746-758`) machinery
 # the eager leg's own nonempty list uses —
-# `parse_disable_list` (`crates/jammi-kernels/src/admission.rs:1041-1046`)
+# `parse_disable_list` (`crates/jammi-kernels/src/admission.rs:1042-1046`)
 # is the empty set for `Some("")`, so
 # this hard-fails the run if `JAMMI_KERNELS_DISABLE` carries ANYTHING at
 # all when this process starts, catching an AMBIENT/leaked env var (a

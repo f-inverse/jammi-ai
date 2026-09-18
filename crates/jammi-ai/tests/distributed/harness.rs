@@ -116,8 +116,10 @@ impl Backends {
 /// lease` margin (`2 < 3`), so a live worker renews well inside the lease while
 /// reclaim of a *dead* worker's job happens within roughly one poll + lease (a
 /// few seconds) — fast enough for the kill-9 reclaim assertion, slow enough that
-/// a live short run never spuriously loses its lease.
-const LEASE_SECS: u64 = 3;
+/// a live short run never spuriously loses its lease. `pub(crate)`: read by
+/// `placed_search.rs` to bound the wall-clock window its retry_ok arm must
+/// finish inside (see that file's "Stated limits" doc).
+pub(crate) const LEASE_SECS: u64 = 3;
 const HEARTBEAT_SECS: u64 = 1;
 const IDLE_POLL_SECS: u64 = 1;
 /// The round deadline every spawned worker runs its gangs under: a rank
@@ -205,11 +207,31 @@ pub async fn label_of(session: &InferenceSession, instance_id: &str) -> String {
         })
 }
 
+/// Which [`jammi_db::config::PlacementMode`] a spawned worker's `jammi.toml`
+/// carries: [`Self::Local`] (`[server] placement` unset, `AllLocal` — every
+/// existing job-shaped test's own shape) or [`Self::Rendezvous`]
+/// (`placement = "rendezvous"`, requiring `peer_bind`/`peer_advertise`,
+/// which every spawned worker already carries for gang admission). A
+/// per-FLEET knob (RV7: "the shared `worker_toml` stays local for the
+/// existing job-shaped tests") — every worker in one [`Fleet::spawn_with_placement`]
+/// call gets the SAME value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementKnob {
+    /// `[server] placement` unset.
+    Local,
+    /// `[server] placement = "rendezvous"`.
+    Rendezvous,
+}
+
 /// One spawned `jammi-server` worker process and the scratch dir backing its
 /// config + log. Killed on drop via the owning [`Fleet`].
 struct WorkerProc {
     worker_id: String,
     child: Child,
+    /// This worker's three listeners — read back by [`Fleet::worker_ports`]
+    /// so a test can build a gRPC client to its flight port, dial its
+    /// `/metrics` on its health port, or name its `peer_advertise` address.
+    ports: WorkerPorts,
     /// The effective `jammi.toml` this worker was launched with. Held verbatim
     /// so a failure dump shows exactly the catalog / storage / tier / timing the
     /// worker was configured with — no re-deriving it from the scratch dir.
@@ -238,10 +260,36 @@ impl Fleet {
     /// (Shape D's compute node: `services = []`, the worker on). The MinIO
     /// credentials are passed through the child env so the
     /// worker's S3 driver authenticates exactly as the harness session does.
+    /// Every job-shaped test's own placement stays [`PlacementKnob::Local`]
+    /// (`[server] placement` unset — today's byte-for-byte behaviour); see
+    /// [`Self::spawn_with_placement`] for the RENDEZVOUS leg's own spawn.
     pub fn spawn(backends: &Backends, result_root: &str, n: usize) -> Self {
+        Self::spawn_with_placement(backends, result_root, n, PlacementKnob::Local)
+    }
+
+    /// [`Self::spawn`] with an explicit per-fleet [`PlacementKnob`] — the
+    /// RENDEZVOUS placed-search leg's own entry (`placed_search.rs`): every
+    /// spawned worker is a full `RendezvousPlacement` ring member (a
+    /// coordinator AND a segment owner), over the SAME shared catalog +
+    /// `result_root` every other worker in the fleet shares.
+    pub fn spawn_with_placement(
+        backends: &Backends,
+        result_root: &str,
+        n: usize,
+        placement: PlacementKnob,
+    ) -> Self {
         let exe = jammi_server_binary();
         let workers = (1..=n)
-            .map(|i| spawn_worker(&exe, backends, result_root, &format!("worker-{i}"), i))
+            .map(|i| {
+                spawn_worker(
+                    &exe,
+                    backends,
+                    result_root,
+                    &format!("worker-{i}"),
+                    i,
+                    placement,
+                )
+            })
             .collect();
         Self { workers }
     }
@@ -252,6 +300,16 @@ impl Fleet {
     /// `claimed_by` to its label through [`label_of`] before matching here.
     pub fn worker_labels(&self) -> Vec<&str> {
         self.workers.iter().map(|w| w.worker_id.as_str()).collect()
+    }
+
+    /// The listeners of the worker seeded LABEL `worker_id` — the RENDEZVOUS
+    /// leg's own accessor, for building a `Search` client fixture to one
+    /// worker's flight port or scraping another's `/metrics`.
+    pub fn worker_ports(&self, worker_id: &str) -> Option<WorkerPorts> {
+        self.workers
+            .iter()
+            .find(|w| w.worker_id == worker_id)
+            .map(|w| w.ports)
     }
 
     /// SIGKILL exactly one worker by its seeded LABEL, returning whether it
@@ -361,6 +419,7 @@ fn spawn_worker(
     result_root: &str,
     worker_id: &str,
     index: usize,
+    placement: PlacementKnob,
 ) -> WorkerProc {
     let scratch = TempDir::new().expect("worker scratch dir");
     let artifact_dir = scratch.path().join("artifacts");
@@ -383,6 +442,7 @@ fn spawn_worker(
         &backends.region,
         artifact_dir.to_str().expect("utf8 artifact_dir"),
         ports,
+        placement,
     );
     std::fs::write(&config_path, &config_toml).expect("write worker config");
 
@@ -414,6 +474,7 @@ fn spawn_worker(
     WorkerProc {
         worker_id: worker_id.to_string(),
         child,
+        ports,
         config_toml,
         log_path,
         _scratch: scratch,
@@ -421,13 +482,28 @@ fn spawn_worker(
 }
 
 /// One spawned worker's three listeners, distinct per process: the flight
-/// (gRPC) port is its wire surface, the health port serves `/readyz`, the
-/// peer port is the gang listener other workers dial (`peer_advertise`).
-#[derive(Clone, Copy)]
-struct WorkerPorts {
-    flight: usize,
-    health: usize,
-    peer: usize,
+/// (gRPC) port is its wire surface, the health port serves `/readyz` and
+/// `/metrics`, the peer port is the gang/peer listener other workers dial
+/// (`peer_advertise`). All on `127.0.0.1`.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkerPorts {
+    pub flight: usize,
+    pub health: usize,
+    pub peer: usize,
+}
+
+impl WorkerPorts {
+    /// `host:port` this worker's public gRPC (flight) listener answers on —
+    /// what a `Search` client fixture dials.
+    pub fn flight_addr(&self) -> String {
+        format!("127.0.0.1:{}", self.flight)
+    }
+
+    /// `http://host:port` this worker's health listener answers on — the
+    /// base URL for `/readyz` and `/metrics`.
+    pub fn health_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.health)
+    }
 }
 
 /// Render a worker's `jammi.toml`. The S3 secrets are deliberately absent — they
@@ -440,6 +516,7 @@ fn worker_toml(
     region: &str,
     artifact_dir: &str,
     ports: WorkerPorts,
+    placement: PlacementKnob,
 ) -> String {
     let allow_http = s3_endpoint.starts_with("http://");
     let WorkerPorts {
@@ -447,6 +524,18 @@ fn worker_toml(
         health: health_port,
         peer: peer_port,
     } = ports;
+    // `[server] placement` (and `peer_local_load_bytes`, the failure
+    // ladder's local-load-rung budget the RENDEZVOUS leg needs refused so a
+    // both-owners-dead segment surfaces `Unavailable` rather than silently
+    // loading locally) stay UNSET for `PlacementKnob::Local` — every
+    // job-shaped test's existing worker_toml, byte-for-byte (RV7's own
+    // requirement) — and are rendered only for the RENDEZVOUS leg.
+    let placement_line = match placement {
+        PlacementKnob::Local => String::new(),
+        PlacementKnob::Rendezvous => {
+            "placement = \"rendezvous\"\npeer_local_load_bytes = 1\n".to_string()
+        }
+    };
     format!(
         r#"
 artifact_dir = "{artifact_dir}"
@@ -486,11 +575,12 @@ max_world_size = {MAX_WORLD_SIZE}
 # Distinct per-worker ports so N servers coexist on one host.
 flight_listen = "127.0.0.1:{flight_port}"
 health_listen = "127.0.0.1:{health_port}"
-# The gang listener (`GangService::RunRank`) and the address other workers
-# dial this process at: a fleet member.
+# The gang listener (`GangService::RunRank`) / peer listener
+# (`PeerService::SegmentSearch`) and the address other workers dial this
+# process at: a fleet member.
 peer_bind = "127.0.0.1:{peer_port}"
 peer_advertise = "127.0.0.1:{peer_port}"
-# Core only — the worker, not a tier, is what makes this process a compute node.
+{placement_line}# Core only — the worker, not a tier, is what makes this process a compute node.
 services = []
 "#
     )

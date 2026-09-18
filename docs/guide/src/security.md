@@ -112,6 +112,21 @@ is stated as one invariant, **I-PEER**:
   listener speaks plaintext gRPC like every other engine port; encryption and
   peer authentication are the runtime's (a mesh, a network policy, mTLS at a
   sidecar), exactly as for the public listener. Default unset = no listener.
+- **`[server] placement = "rendezvous"` widens WHO the coordinator dials,
+  never WHAT the owner trusts.** The owner set for a segment is no longer a
+  library-supplied `StaticPlacement`; it is SELF-ASSERTED through the catalog
+  — any process that upserts an `instances` row with `peer_addr` set and a
+  `result_root_identity` equal to the coordinator's own becomes a candidate
+  owner the coordinator will dial and defer segment reads to. This is the
+  SAME trust boundary I-PEER already states (every client AND every advertised
+  owner of `peer_bind` is a jammi coordinator on the operator's own network) —
+  it does not add a new one — but it means a compromised or misconfigured
+  process that can reach the shared catalog and the shared result root can
+  advertise itself into the ring and receive segment-search fan-out for a
+  table it has no independent authorization to read. The mitigation is the
+  same as I-PEER's: `peer_bind` on a private interface, network policy / mTLS
+  between replicas, and a catalog credential scoped to the deployment's own
+  replicas.
 
 ## The gang listener (I-GANG)
 

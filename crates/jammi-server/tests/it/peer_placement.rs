@@ -98,13 +98,20 @@ impl TestPlacement {
 
 #[tonic::async_trait]
 impl SegmentPlacement for TestPlacement {
-    async fn owners(&self, table: &str, segment: SegmentId) -> Vec<PeerAddr> {
-        self.0
-            .read()
-            .unwrap()
-            .get(&(table.to_string(), segment))
-            .cloned()
-            .unwrap_or_default()
+    async fn plan(
+        &self,
+        table: &str,
+        segments: &[SegmentId],
+    ) -> jammi_db::error::Result<Vec<Vec<PeerAddr>>> {
+        let map = self.0.read().unwrap();
+        Ok(segments
+            .iter()
+            .map(|segment| {
+                map.get(&(table.to_string(), *segment))
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect())
     }
 }
 

@@ -34,12 +34,20 @@
 //! see below); an entry with no authority in hand defers by passing `None`
 //! and calling [`ValidatedQuery::require_authority_width`] itself, once, as
 //! soon as an authority becomes available (today, the placement entry's
-//! all-remote shape, the placement entry's ALL-LOCAL shape against the set's
-//! own first segment, and
+//! Mixed shape — one call site covering both the all-remote branch and the
+//! branch with at least one resident local segment — the placement
+//! entry's ALL-LOCAL shape,
 //! `jammi_db::index::exact::exact_vector_search`'s no-catalog-width
-//! fallback, in the downstream crate that has all three; do not let this
-//! comment or any published surface drift back to claiming fewer). Every
-//! OTHER width check a query meets afterwards — an index's declared
+//! fallback, and `jammi_db::store::ResultStore::search_vectors_local`'s
+//! `Some(index)` branch, the FORCE-LOCAL batch lane's twin of the
+//! placement entry's ALL-LOCAL shape
+//! — FOUR sites, all in the downstream crate; do not let this comment or
+//! any published surface (`docs/guide/src/api-stability.md`'s "Whose-fault
+//! a downstream width check assigns" entry) drift back to claiming fewer —
+//! re-derive the count with
+//! `grep -rn 'require_authority_width(' crates/*/src | grep -v query.rs`
+//! rather than trusting this sentence). Every OTHER width check a query
+//! meets afterwards — an index's declared
 //! dimensions, a scan's `FixedSizeList` length, a stored vector's own length
 //! — is downstream of that authority check by construction, so a mismatch
 //! there is the ARTIFACT's drift, never the query's, regardless of whether
@@ -295,12 +303,16 @@ impl ValidatedQuery {
     /// against (the catalog's recorded width) — reserved for an entry that
     /// has no other opportunity to check a query built with
     /// `expected_width = None` before it would otherwise reach a downstream
-    /// artifact unguarded. THREE production call sites use this today (the
-    /// placement entry's all-remote shape, the placement entry's all-local
-    /// shape against the set's own first segment, and
-    /// `exact_vector_search`'s no-catalog-width fallback in `jammi-db`) — do
-    /// not let this doc drift back to claiming fewer; recheck the call count
-    /// in the same commit that adds or removes one. Attributes by
+    /// artifact unguarded. FOUR production call sites use this today (the
+    /// placement entry's Mixed shape — one call site covering both the
+    /// all-remote branch and the branch with at least one resident local
+    /// segment — the placement entry's all-local shape,
+    /// `exact_vector_search`'s no-catalog-width fallback, and
+    /// `ResultStore::search_vectors_local`'s `Some(index)` branch, all in
+    /// `jammi-db`) — re-derive this count with
+    /// `grep -rn 'require_authority_width(' crates/*/src | grep -v
+    /// query.rs` rather than trusting this sentence; recheck it in the same
+    /// commit that adds or removes a call site. Attributes by
     /// `self.source()`, exactly like
     /// `validate_query`'s own construction-time check: a genuine caller
     /// mistake caught HERE is still the caller's fault, because nothing

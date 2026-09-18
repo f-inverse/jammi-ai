@@ -98,26 +98,46 @@ pub async fn build_embedding_plan(
     let input_plan = crate::operator::ordered_input::ordered_input(input_plan, key_column)?;
 
     // Create InferenceExec — the source scan's `_content_hash` projection
-    // rides through to the sink as the table's fifth column.
-    let inference_exec = InferenceExecBuilder::new(
+    // rides through to the sink as the table's fifth column. #540
+    // RANGESPLIT: `wrap_with_split_and_merge` inserts `OrdinalSplitExec` +
+    // the `[_ordinal ASC]` merge below/above it when `InferenceConfig::
+    // partitions > 1`; at the default `1` it coalesces `input_plan` to one
+    // partition if it is not already one (a no-op here — `ordered_input`
+    // just above already produced exactly one partition) and builds
+    // InferenceExec directly on it, no split, no merge.
+    let partitions = session.inner_config().inference.partitions;
+    let batch_size = session.inner_config().inference.batch_size;
+    let observer = session.observer().clone();
+    let model_cache = Arc::clone(session.model_cache());
+    let device_kind = session.compute_device().kind();
+    let columns_owned = columns.to_vec();
+    let key_column_owned = key_column.to_string();
+    let source_id_owned = source_id.to_string();
+    let plan = crate::operator::inference_exec::wrap_with_split_and_merge(
         input_plan,
-        model_source,
-        task,
-        columns.to_vec(),
-        key_column.to_string(),
-        source_id.to_string(),
-        Arc::clone(session.model_cache()),
-        session.compute_device().kind(),
-    )
-    .batch_size(session.inner_config().inference.batch_size)
-    .observer(session.observer().clone())
-    .embedding_dim(Some(embedding_dim))
-    .passthrough(vec![
-        jammi_db::store::schema::CONTENT_HASH_COLUMN.to_string()
-    ])
-    .build()?;
+        partitions,
+        move |input| {
+            InferenceExecBuilder::new(
+                input,
+                model_source,
+                task,
+                columns_owned,
+                key_column_owned,
+                source_id_owned,
+                model_cache,
+                device_kind,
+            )
+            .batch_size(batch_size)
+            .observer(observer)
+            .embedding_dim(Some(embedding_dim))
+            .passthrough(vec![
+                jammi_db::store::schema::CONTENT_HASH_COLUMN.to_string()
+            ])
+            .build()
+        },
+    )?;
 
-    Ok(Arc::new(inference_exec))
+    Ok(plan)
 }
 
 /// Orchestrates embedding generation: source scan → InferenceExec → ResultSink → index.

@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
-"""Refuses a PROVISIONAL cu12 loader-report fixture on the merge path, with
-NO environment-variable escape.
+"""Refuses a PROVISIONAL cu12 loader/jail-report fixture on the merge path,
+with NO environment-variable escape.
 
-`ci/scripts/fixtures/cu12_loader_report_real.txt` must hold the VERBATIM
-`ldd` report `release-binaries.yml`'s `server-cu12-build` job captures from
-the real cu12 `jammi-server` binary and its real staged `lib/` (the build
-container: CUDA toolkit present, NVIDIA driver absent — see that job's
-`cu12-loader-report` artifact and this fixture's own header). Until the lead
-downloads that artifact and commits it over the placeholder, the fixture
-carries a CLEARLY-LABELLED `# captured: pending` header instead — and T4(3)'s
-own property ("the loader's self-named line is parsed as a resolved platform
-entry, so a CORRECT [real] stage passes") is UNPROVEN, not merely untested,
-while that header stands.
+`ci/scripts/fixtures/cu12_loader_report_real.txt` (arm 1a, DETECTION) must
+hold the VERBATIM `ldd` report `release-binaries.yml`'s `server-cu12-build`
+job captures from the real cu12 `jammi-server` binary and its real staged
+`lib/` (the build container: CUDA toolkit present, NVIDIA driver absent —
+see that job's `cu12-loader-report` artifact and this fixture's own header).
+`ci/scripts/fixtures/cu12_jail_report_real.txt` (arm 1b, THE JAIL — #534's
+chroot half) must likewise hold the VERBATIM tolerant `LD_TRACE_LOADED_
+OBJECTS` trace `ci/scripts/jail_trace.py` runs inside the real jail — the
+loader invoked AT its own `PT_INTERP` path, never `ld.so --list` (fatal on
+the first missing library, see that script's own module doc) — captured by
+the same job, uploaded as its `cu12-jail-report` workflow artifact. Until
+the lead downloads each artifact
+and commits it over its placeholder, that fixture carries a
+CLEARLY-LABELLED `# captured: pending` header instead — and that arm's own
+"a CORRECT real stage passes" property is UNPROVEN, not merely untested,
+while its header stands.
 
-`ci/scripts/test_bundle_cuda_libs.sh` also refuses to run its own T4(3)
-integration check against a provisional fixture, but ONLY when the caller
-sets `BUNDLE_FIXTURE_PROVISIONAL=1` does it skip that refusal and run the
-REST of the suite anyway — a knob meant for a developer iterating on the
-other 100+ checks in that file locally, before the real report exists. This
-gate is that knob's floor: it is wired into `ci.yml`'s Guard matrix with NO
-environment variable, no flag, and no allowlist entry that could suppress
-it — the merge path stays red on this file until the real report replaces
-the placeholder, full stop.
+`ci/scripts/test_bundle_cuda_libs.sh` also refuses to run its own
+real-report integration checks against a provisional fixture, but ONLY when
+the caller sets `BUNDLE_FIXTURE_PROVISIONAL=1` does it skip that refusal and
+run the REST of the suite anyway — a knob meant for a developer iterating on
+the other 100+ checks in that file locally, before the real reports exist.
+This gate is that knob's floor, over BOTH fixtures: it is wired into
+`ci.yml`'s Guard matrix with NO environment variable, no flag, and no
+allowlist entry that could suppress it — the merge path stays red on either
+file until its real report replaces the placeholder, full stop.
 
 Run: `python3 ci/scripts/check_bundle_fixture.py`
 Self-test: `python3 ci/scripts/check_bundle_fixture.py --self-test`
@@ -33,7 +39,10 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-FIXTURE = REPO_ROOT / "ci" / "scripts" / "fixtures" / "cu12_loader_report_real.txt"
+FIXTURES = (
+    REPO_ROOT / "ci" / "scripts" / "fixtures" / "cu12_loader_report_real.txt",
+    REPO_ROOT / "ci" / "scripts" / "fixtures" / "cu12_jail_report_real.txt",
+)
 MARKER = "# captured: pending"
 
 
@@ -63,13 +72,15 @@ def check(fixture: Path) -> int:
     # exact-equality check would leave open (trailing text appended to the
     # same marker line would otherwise read as "already real").
     if first_line.startswith(MARKER):
+        artifact = "cu12-jail-report" if fixture.name.startswith("cu12_jail_") else "cu12-loader-report"
+        arm = "jail (#534's chroot half)" if fixture.name.startswith("cu12_jail_") else "detection"
         print(
             "check_bundle_fixture.py: FAILED -- "
             f"{fixture} is still the provisional '{MARKER}' placeholder. "
-            "The loader-verification arm's T4(3) property (a correct REAL stage "
-            "passes) is unproven until the real ldd report -- captured by "
-            "release-binaries.yml's server-cu12-build job and uploaded as its "
-            "'cu12-loader-report' workflow artifact -- replaces this placeholder "
+            f"The {arm} arm's own \"a correct REAL stage passes\" property is "
+            "unproven until the real report -- captured by "
+            f"release-binaries.yml's server-cu12-build job and uploaded as its "
+            f"'{artifact}' workflow artifact -- replaces this placeholder "
             "as its own commit. No environment variable escapes this check.",
             file=sys.stderr,
         )
@@ -115,11 +126,30 @@ def self_test() -> int:
         near_marker.write_text(f"{MARKER} -- actually already replaced below\nlibcudart.so.12 => /x (0x1)\n")
         assert check(near_marker) == 1, "expected FAILED -- the marker is a prefix of the first line"
 
+        # `check_all` (the actual entry point over both fixtures): FAILED if
+        # EITHER is provisional, and never short-circuits — a caller reading
+        # stderr sees both fixtures' status, not just the first checked.
+        assert check_all((real, real)) == 0, "expected OK when every fixture is real"
+        assert check_all((provisional, real)) == 1, "expected FAILED when the first fixture is provisional"
+        assert check_all((real, provisional)) == 1, "expected FAILED when the second fixture is provisional"
+        assert check_all((provisional, provisional)) == 1, "expected FAILED when every fixture is provisional"
+
     print("check_bundle_fixture.py --self-test: all self-test cases passed.")
     return 0
+
+
+def check_all(fixtures: tuple[Path, ...]) -> int:
+    # Every fixture is checked, never short-circuited on the first failure —
+    # a run that stops at the loader fixture would print nothing at all
+    # about the jail fixture, which is exactly the kind of partial coverage
+    # a "no escape" floor gate must not have.
+    rc = 0
+    for fixture in fixtures:
+        rc = check(fixture) or rc
+    return rc
 
 
 if __name__ == "__main__":
     if "--self-test" in sys.argv[1:]:
         sys.exit(self_test())
-    sys.exit(check(FIXTURE))
+    sys.exit(check_all(FIXTURES))

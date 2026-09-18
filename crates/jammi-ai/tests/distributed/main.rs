@@ -34,3 +34,4 @@ mod cross_tenant_isolation;
 mod exactly_one_claim;
 mod gang_chaos;
 mod kill9_reclaim;
+mod placed_search;

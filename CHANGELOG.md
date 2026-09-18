@@ -7,6 +7,19 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### BREAKING
+- **`jammi_db::storage::build_object_store` and `StorageRegistry::driver_for` are no
+  longer public (#588).** No crate outside `jammi-db` can obtain a raw
+  `Arc<dyn ObjectStore>` from the registry or the builder; `JammiObjectStore::{new, open,
+  handle_for}` are the only doors and none yields the driver. A caller that built its own
+  driver through the builder migrates to `JammiObjectStore::open`, or constructs an
+  `object_store` driver itself. The DataFusion session context still resolves a writable
+  `file://` store (a registry-level seal was built and excised; recorded on #588).
+- **`jammi_ai::fine_tune::training_set::read_back_sql(table)` takes no projection, and
+  `TrainingSetTable::from_record(record, manifest, outcome)` reads the order key from the
+  manifest (#551).** A training set's read-back order is a property of the relation
+  (`TrainingSetTable::relation()`), never a caller-supplied column list; a manifest whose
+  `definition_hash` disagrees with the catalog row's, or whose descriptor has no columns,
+  is refused typed.
 - **`[server] preload_models` is now honoured (#482).** It was documented and
   dormant; a config that already lists it flips from starting to exiting
   non-zero if a listed model cannot load, a bare id has no `models` row (its
@@ -84,8 +97,55 @@ workspace ships every publishable crate at the same
   out-of-tree caller adds the argument (`&[]` reproduces the previous
   behaviour — an empty device list, and every existing row's `devices`
   column already defaults to `[]`).
+- **`jammi_db::index::SegmentPlacement::owners(table, segment) ->
+  Vec<PeerAddr>` is replaced by `plan(table, segments: &[SegmentId]) ->
+  Result<Vec<Vec<PeerAddr>>>` (#500).** One ring read now serves a whole
+  query's segment set instead of one read per segment, and a catalog read
+  failure is a typed `Err` rather than a silent per-segment fallback to
+  local. A caller that implemented `owners` for `AllLocal`/`StaticPlacement`-
+  shaped placements returns one `Vec<PeerAddr>` per input segment, in order
+  (`Ok(vec![Vec::new(); segments.len()])` reproduces `AllLocal`'s old
+  behaviour).
 
 ### Added
+- **`[inference] partitions = N` (#540).** Splits the model forward `N` ways in-process
+  below every `InferenceExec` (default `1`, refused outside `1..=1024`): each partition
+  pulls the next batch on demand and stamps a global `_ordinal`, and a
+  `SortPreservingMergeExec` on `_ordinal` restores the single-partition row sequence
+  exactly. Forwards are admitted by a per-exec permit (CPU: available parallelism; GPU:
+  one). A plan carrying the split is refused, typed, for distributed submission (the
+  split has no wire form in v1; #540).
+- **`[server] placement = "local" | "rendezvous"` and
+  `jammi_db::index::RendezvousPlacement` (#500).** Beyond-one-node retrieval
+  over the LIVE `instances` ring, derived at query time (never declared):
+  every live, root-sharing replica — self included — is scored by a
+  domain-separated hash of `(instance_id, table, segment_id)`, and the
+  highest-scoring member owns the segment (the second-highest is the one
+  retry candidate). Default `"local"` (`AllLocal`) — no existing deployment's
+  behaviour changes. `"rendezvous"` requires `[server] peer_advertise` too
+  (refused by name at the membership choke point otherwise). A
+  ring read that comes back empty, or does not contain this process's own
+  row, falls back to all-local and is counted
+  (`jammi_placement_ring_empty_total`), never silent.
+- **`graph_fine_tune` materialises its sampled pairs as a training-set table
+  (#538).** The graph arm now reads its node/edge sources with an explicit
+  order (a duplicate node id is refused, typed, naming it) and materialises
+  the sampled `(anchor, positive, [hard_negative])` pairs through the same
+  producer funnel a tabular fine-tune's source projection uses — an
+  immutable, content-addressed `TrainingSet`-kind Parquet table
+  (`jammi_db::store::manifest::ProducingDescriptor::GraphTrainingSet`)
+  rather than an ephemeral in-memory sample, so `recompute` can replay it
+  and the sampler's resident adjacency/text is reserved against a named
+  memory consumer for its whole lifetime. The training format
+  (`graph_pairs`/`graph_triplet`) is decided from `graph_hard_negatives`
+  alone; an anchor whose entire candidate pool falls inside its own
+  `exclude_hops`-hop neighbourhood is refused, typed, naming the anchor,
+  rather than silently trained with no negative. A `Peer` (multi-host)
+  gang still does **not** admit a member against this table —
+  `world_size > 1` above `[worker] local_ranks` is refused, typed, naming
+  the reason (a member's committed-order read and the gang's
+  gradient-propagation proof are both unbuilt); `world_size == 1` and an
+  in-process `Local` gang (`world_size <= local_ranks`) are unaffected.
 - **Two-mode shutdown — SIGTERM = DRAIN, SIGINT = RELEASE — on the server,
   the Rust library and Python (#482).** A DRAIN finishes the in-flight job
   (every epoch bundle lands, `completed` under the same attempt), ends idle
@@ -356,6 +416,11 @@ workspace ships every publishable crate at the same
   workspace — and the new `docs_toml_fences_parse_under_the_real_loader`
   guide-fence test — is hermetic and process-env-free. `ci.yml`'s `HF_TOKEN`
   is live (previously set but unused by any Hub call site).
+- **A fine-tune's `definition_hash` folds the kernel-admission profile (#546).** The
+  profile renders, per probed op, whether the job's build features, admission mode and
+  `JAMMI_KERNELS_DISABLE` set (resolved at the job's `backbone_dtype` class) admit the
+  fused kernel; two runs whose admission genuinely differs now hash differently. Existing
+  fine-tune outputs re-materialize once under `cache = Use` after upgrading.
 - **Lead-gate relay proposal: probe the fix, not just the class (esc-097, `docs/plans/63-how-well/proposals/esc-097-probe-the-fix.md`).** A relay's `probe` array could satisfy the existing coverage/proactivity conjunction (esc-064) entirely within the ORIGINAL finding's neighbourhood, never once looking at what a re-dispatched fix actually changed — six consecutive adversarial-audit BLOCKs landed on one evolving mechanism, each on the previous fix's own new surface. The proposal (human-applies; `.claude/hooks/**` stays agent-write-denied) adds R3: a lead-written `fix_head`, a hook-computed `fix_changed` window (`git diff --name-only -z <block> <fix_head>`, one of the module's four narrowly-scoped git subprocesses per decision, each bounded by a real timeout with no pipe to drain, all four sharing ONE per-decision monotonic budget (`_GIT_BUDGET_S = 5.0`), armed ONLY on a repeat dispatch — never a first dispatch, for exactly one targeted unit per decision, a prompt naming more than one open BLOCK of the same type denying outright instead), and a requirement that at least one probed path be a real member of that window. Reachability binds TWO things: the relay's own `unit_branch` must `slugify()` to this BLOCK's own `unit_slug` (the NAME, git-free — an `UNBOUND`-bucket row is never satisfiable this way), and `fix_head` must be an ancestor of that same branch's resolved tip (`git merge-base --is-ancestor`, the POSITION — closing a round-3 gap where a relay naming the right unit's branch could still cite an amended-away or unrelated-branch `fix_head`). An adversarial-audit BLOCK closes only via a same-type PASS after a relay that passed R3, or the documented `rm` — there is no cross-type clearing arm. `ci/scripts/check_lead_gate.py` ships the fixtures (G20-G38) RED against the current hook, self-test-guarded to report that arm SKIPPED until the patch files land.
 - **LoRA fine-tuning for the CLIP-text, OpenCLIP-vision and HTSAT-CLAP audio towers (#421).** All
   three carry LoRA sites on the same `jammi_lora::MaybeLoraLinear` seam the BERT family uses,
@@ -1195,6 +1260,12 @@ workspace ships every publishable crate at the same
   immune to a stray `PGSSLMODE=disable` left in the environment.
 
 ### Fixed
+- **Width-mismatch refusals name the right party (#519).** The placement entry's Mixed
+  and all-local shapes, `exact_vector_search`'s no-catalog-width fallback and the
+  force-local `search_vectors_local` check a query against the authority they hold
+  (catalog width, else the loaded index's own width), so a caller's wrong-width query is
+  refused in the caller class and a Stored-provenance mismatch names the query's own
+  source table, never a segment.
 - **`JobService.PruneJobs` swept every tenant's terminal rows, not just the
   caller's (#485).** The RPC handler bypassed
   `scoped(...)` (the tenant-binding path every other `JobService` RPC uses)

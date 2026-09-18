@@ -3233,8 +3233,8 @@ async fn batches_input_commits_and_reads_back_in_emission_order(backend: Backend
     };
 
     let materialized = store.materialize_training_set(&ctx, spec).await.unwrap();
-    assert_eq!(materialized.record.row_count, 6);
-    assert_eq!(materialized.record.kind, ResultTableKind::TrainingSet);
+    assert_eq!(materialized.row_count(), 6);
+    assert_eq!(materialized.kind(), ResultTableKind::TrainingSet);
 
     let expected: Vec<(u64, String, String)> = rows
         .iter()
@@ -3304,8 +3304,16 @@ async fn batches_input_commits_and_reads_back_in_emission_order(backend: Backend
     // side. This is infrastructure a `Batches`-sourced table's cross-session
     // rebinding must hold regardless of which caller re-binds it.
     let member_ctx = SessionContext::new();
+    // The handle has no whole-row accessor (#551): a fresh session binds the
+    // catalog's own row, fetched by name.
+    let materialized_record = store
+        .catalog()
+        .get_result_table(materialized.table_name())
+        .await
+        .unwrap()
+        .unwrap();
     store
-        .bind_result_table(&member_ctx, &materialized.record)
+        .bind_result_table(&member_ctx, &materialized_record)
         .await
         .unwrap();
     let member_query = format!("SELECT * FROM {}", materialized.sql_relation());

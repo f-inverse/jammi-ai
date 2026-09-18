@@ -10453,6 +10453,7 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fine_tune/worker.rs");
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        // kernel-oracles: fn-in-literal reviewed: this source oracle locates the function it audits by its own signature text
         let start_marker = "pub(crate) async fn materialize_graph_training_set(";
         let start = source
             .find(start_marker)

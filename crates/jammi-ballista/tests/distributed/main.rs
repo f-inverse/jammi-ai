@@ -741,7 +741,7 @@ async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
 
     // SIGKILL and respawn the scheduler process (lane-1) at the SAME
     // `scheduler_bind` port. `instance_id` (`instance_id`,
-    // crates/jammi-ai/src/session.rs:468) is minted at session
+    // crates/jammi-ai/src/session.rs:509) is minted at session
     // construction, never externally supplied, so the replacement is a fresh
     // instance — this oracle's own assertions below need only the OTHER
     // executors' registrations and a NEW job's completion, which the

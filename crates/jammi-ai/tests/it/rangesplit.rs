@@ -1264,10 +1264,13 @@ mod rs5_source_oracle {
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("real.rs"),
-            "pub struct InferenceExecBuilder;\n\
-             impl InferenceExecBuilder {\n    \
-             pub fn new() -> Self { InferenceExecBuilder }\n\
-             }\n",
+            concat!(
+                "pub struct InferenceExecBuilder;\n",
+                "impl InferenceExecBuilder {\n",
+                // kernel-oracles: fn-in-literal reviewed: a synthetic source fixture the alias-resolution oracle parses
+                "    pub fn new() -> Self { InferenceExecBuilder }\n",
+                "}\n"
+            ),
         )
         .unwrap();
         std::fs::write(
@@ -1277,10 +1280,13 @@ mod rs5_source_oracle {
         .unwrap();
         std::fs::write(
             tmp.path().join("bypass.rs"),
-            "use crate::reexport::Aliased;\n\
-             fn bad() {\n    \
-             let _ = Aliased::new();\n\
-             }\n",
+            concat!(
+                "use crate::reexport::Aliased;\n",
+                // kernel-oracles: fn-in-literal reviewed: a synthetic source fixture the alias-resolution oracle parses
+                "fn bad() {\n",
+                "    let _ = Aliased::new();\n",
+                "}\n"
+            ),
         )
         .unwrap();
 
@@ -1308,10 +1314,13 @@ mod rs5_source_oracle {
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("real.rs"),
-            "pub struct InferenceExecBuilder;\n\
-             impl InferenceExecBuilder {\n    \
-             pub fn new() -> Self { InferenceExecBuilder }\n\
-             }\n",
+            concat!(
+                "pub struct InferenceExecBuilder;\n",
+                "impl InferenceExecBuilder {\n",
+                // kernel-oracles: fn-in-literal reviewed: a synthetic source fixture the alias-resolution oracle parses
+                "    pub fn new() -> Self { InferenceExecBuilder }\n",
+                "}\n"
+            ),
         )
         .unwrap();
         std::fs::write(
@@ -1321,10 +1330,13 @@ mod rs5_source_oracle {
         .unwrap();
         std::fs::write(
             tmp.path().join("bypass.rs"),
-            "use crate::alias::Aliased;\n\
-             fn bad() {\n    \
-             let _ = Aliased::new();\n\
-             }\n",
+            concat!(
+                "use crate::alias::Aliased;\n",
+                // kernel-oracles: fn-in-literal reviewed: a synthetic source fixture the alias-resolution oracle parses
+                "fn bad() {\n",
+                "    let _ = Aliased::new();\n",
+                "}\n"
+            ),
         )
         .unwrap();
 

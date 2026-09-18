@@ -37,12 +37,19 @@
 //! placed in an arbitrary workflow SCALAR — a `build-args:` value, a `--features=<list>` or
 //! `-F <list>` invocation, a `workflow_call`/composite-action `inputs.*.default`, or any
 //! non-canonical key shape. The eight places `jammi-server`'s feature list is actually read
-//! from the manifest today are: `.github/workflows/pypi-server.yml:75`,
-//! `.github/workflows/pypi-server-cuda.yml:83`, `.github/workflows/release-binaries.yml:310`
-//! and `:465`, and `.github/workflows/server-image.yml:149`, `:415`, `:660`, `:770` (`:850`
-//! reads the same `cu12-image` lane a second time, in `build-cuda-pr`) — nine call sites over
-//! six manifest lanes, each a `jq -r '.lanes["<key>"].cargo_features | ...'` invocation this
-//! test does not itself verify. `ci/scripts/runpod_gpu_prove.sh:287` carries a literal cargo
+//! from the manifest today are:
+//! `cpu-wheel`, .github/workflows/pypi-server.yml:75;
+//! `cu12-wheel`, .github/workflows/pypi-server-cuda.yml:83;
+//! `cpu-tarball`, .github/workflows/release-binaries.yml:310;
+//! `cu12-tarball`, .github/workflows/release-binaries.yml:465;
+//! `cpu-image`, .github/workflows/server-image.yml:149;
+//! `cpu-image`, .github/workflows/server-image.yml:415;
+//! `cpu-image`, .github/workflows/server-image.yml:660;
+//! `cu12-image`, .github/workflows/server-image.yml:770;
+//! `cu12-image`, .github/workflows/server-image.yml:850 (the last reads the same lane a second
+//! time, in `build-cuda-pr`) — nine call sites over six manifest lanes, each a
+//! `jq -r '.lanes["<key>"].cargo_features | ...'` invocation this test does not itself verify.
+//! `cu12_features`, ci/scripts/runpod_gpu_prove.sh:287 carries a literal cargo
 //! feature tuple OUTSIDE this universe on purpose (esc-081): it is compared against the
 //! manifest-derived value with its own loud `PROVE_SURFACE_DRIFT` error rather than reading the
 //! manifest directly. The lead names this residual on the tracking issue for this class.

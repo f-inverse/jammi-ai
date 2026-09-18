@@ -54,21 +54,24 @@
 # the suite's own assertions below prove `libnvrtc-builtins` still ends up
 # staged — through the floor, never through the closure.
 #
-# `BUNDLE_FIXTURE_PROVISIONAL=1` is required to run this suite at all today:
-# T4(3)'s "a correct real stage passes" assertion is driven off a REAL `ldd`
-# report captured from the actual cu12 binary on a driver-only-style host —
-# not yet captured (see `ci/scripts/capture_loader_report.sh` and
-# `ci/scripts/fixtures/cu12_loader_report_real.txt`, which carries a
-# CLEARLY-LABELLED `captured: pending` provisional report instead). Without
-# `BUNDLE_FIXTURE_PROVISIONAL=1` this suite refuses to run at all on that
-# provisional fixture — the intended effect: the merge path stays red on this
-# file until the real report lands as its own commit.
+# `ci/scripts/fixtures/cu12_loader_report_real.txt` (arm 1a, DETECTION) is a
+# REAL `ldd` report captured from the actual cu12 binary in the release
+# lane's own CUDA container, and check 14 below verifies it against the
+# measured `DT_NEEDED` set with no `BUNDLE_FIXTURE_PROVISIONAL` needed.
+# `ci/scripts/fixtures/cu12_jail_report_real.txt` (arm 1b, THE JAIL — #534's
+# chroot half) is still the CLEARLY-LABELLED `captured: pending` placeholder
+# (see check 20 below): `BUNDLE_FIXTURE_PROVISIONAL=1` is required to run
+# this suite at all until the lead dispatches `release-binaries.yml`,
+# downloads the `cu12-jail-report` workflow artifact, and commits its
+# content in place of the placeholder — the intended effect: the merge path
+# stays red on this file until that real report lands as its own commit.
 #
-# Run: `BUNDLE_FIXTURE_PROVISIONAL=1 bash ci/scripts/test_bundle_cuda_libs.sh`
+# Run today: `BUNDLE_FIXTURE_PROVISIONAL=1 bash ci/scripts/test_bundle_cuda_libs.sh`
+# Run once the jail fixture is real: `bash ci/scripts/test_bundle_cuda_libs.sh`
 #
-# shellcheck disable=SC2329,SC2034,SC2012,SC2086
+# shellcheck disable=SC2329,SC2034,SC2012,SC2086,SC2016
 # File-level, not per-site, because every instance across this file is the
-# SAME four deliberate shapes: SC2086 ("double quote to prevent word
+# SAME five deliberate shapes: SC2086 ("double quote to prevent word
 # splitting") fires on every `bundle_verify_loader_resolution ... $NEEDED`
 # call below — deliberately unquoted for the identical reason `bundle_cuda_
 # libs.sh`'s own `bundle_main` disables it inline: a space-separated soname
@@ -86,11 +89,17 @@
 # `find`) fires on two `ls | wc -l`/`ls | sort` pipelines over a `mktemp -d`
 # fixture tree this same file creates with only alphanumeric names -- the
 # non-alphanumeric-filename hazard `find` would close does not exist here.
+# SC2016 ("expressions don't expand in single quotes") fires on every
+# single-quoted `$ORIGIN`/`${ORIGIN}` literal in the
+# RPATH/RUNPATH fixtures below -- deliberately literal, the same reason
+# `bundle_cuda_libs.sh`'s own `bundle_is_origin_only_rpath` disables it
+# inline: `$ORIGIN` is glibc's dynamic string token, never a shell variable.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="${HERE}/bundle_cuda_libs.sh"
 REAL_REPORT_FIXTURE="${HERE}/fixtures/cu12_loader_report_real.txt"
+REAL_JAIL_REPORT_FIXTURE="${HERE}/fixtures/cu12_jail_report_real.txt"
 WORKFLOW="${HERE}/../../.github/workflows/release-binaries.yml"
 
 failures=0
@@ -846,15 +855,68 @@ bundle_dynamic_section() {
         " 0x0000000000000001 (NEEDED)             Shared library: [libcudart.so.12]" \
         " 0x000000000000001d (RUNPATH)             Library runpath: [/opt/build-host/cuda/lib64]"
       ;;
+    # The REAL `readelf -d` line, verbatim, measured
+    # against the CUDA 12.6 toolkit's own libcublas.so/libcublasLt.so/
+    # libcurand.so (`readelf -d` inside `nvidia/cuda:12.6.3-devel-ubi8`) —
+    # committed as a fixture so this exact shape is pinned, not re-typed.
+    libcublasLt.so.12-origin-runpath)
+      printf '%s\n' \
+        " 0x0000000000000001 (NEEDED)             Shared library: [libcudart.so.12]" \
+        " 0x000000000000001d (RUNPATH)             Library runpath: [\$ORIGIN]"
+      ;;
+    fake-jammi-server-origin-rpath)
+      printf '%s\n' \
+        " 0x0000000000000001 (NEEDED)             Shared library: [libcudart.so.12]" \
+        " 0x000000000000000f (RPATH)               Library rpath: [\$ORIGIN]"
+      ;;
+    fake-jammi-server-origin-braced)
+      printf '%s\n' \
+        " 0x0000000000000001 (NEEDED)             Shared library: [libcudart.so.12]" \
+        " 0x000000000000001d (RUNPATH)             Library runpath: [\${ORIGIN}]"
+      ;;
+    fake-jammi-server-origin-dotdot)
+      printf '%s\n' \
+        " 0x0000000000000001 (NEEDED)             Shared library: [libcudart.so.12]" \
+        " 0x000000000000001d (RUNPATH)             Library runpath: [\$ORIGIN/..]"
+      ;;
+    fake-jammi-server-origin-dotdot-lib)
+      printf '%s\n' \
+        " 0x0000000000000001 (NEEDED)             Shared library: [libcudart.so.12]" \
+        " 0x000000000000001d (RUNPATH)             Library runpath: [\$ORIGIN/../lib]"
+      ;;
+    fake-jammi-server-usrlib64)
+      printf '%s\n' \
+        " 0x0000000000000001 (NEEDED)             Shared library: [libcudart.so.12]" \
+        " 0x000000000000001d (RUNPATH)             Library runpath: [/usr/lib64]"
+      ;;
+    fake-jammi-server-mixed-origin)
+      printf '%s\n' \
+        " 0x0000000000000001 (NEEDED)             Shared library: [libcudart.so.12]" \
+        " 0x000000000000001d (RUNPATH)             Library runpath: [\$ORIGIN:/usr/lib]"
+      ;;
     *) printf '%s\n' "" ;;
   esac
 }
 CLEAN_BINARY="${ROOT}/fake-jammi-server-clean"
 RPATH_BINARY="${ROOT}/fake-jammi-server-rpath"
 RUNPATH_BINARY="${ROOT}/fake-jammi-server-runpath"
+ORIGIN_RUNPATH_BINARY="${ROOT}/libcublasLt.so.12-origin-runpath"
+ORIGIN_RPATH_BINARY="${ROOT}/fake-jammi-server-origin-rpath"
+ORIGIN_BRACED_BINARY="${ROOT}/fake-jammi-server-origin-braced"
+ORIGIN_DOTDOT_BINARY="${ROOT}/fake-jammi-server-origin-dotdot"
+ORIGIN_DOTDOT_LIB_BINARY="${ROOT}/fake-jammi-server-origin-dotdot-lib"
+USRLIB64_BINARY="${ROOT}/fake-jammi-server-usrlib64"
+MIXED_ORIGIN_BINARY="${ROOT}/fake-jammi-server-mixed-origin"
 : >"$CLEAN_BINARY"
 : >"$RPATH_BINARY"
 : >"$RUNPATH_BINARY"
+: >"$ORIGIN_RUNPATH_BINARY"
+: >"$ORIGIN_RPATH_BINARY"
+: >"$ORIGIN_BRACED_BINARY"
+: >"$ORIGIN_DOTDOT_BINARY"
+: >"$ORIGIN_DOTDOT_LIB_BINARY"
+: >"$USRLIB64_BINARY"
+: >"$MIXED_ORIGIN_BINARY"
 
 clean_runpath_out="$(bundle_assert_no_runpath "$CLEAN_BINARY" 2>&1)"
 clean_runpath_rc=$?
@@ -869,6 +931,63 @@ runpath_out="$(bundle_assert_no_runpath "$RUNPATH_BINARY" 2>&1)"
 runpath_rc=$?
 assert_eq "F4: a binary with DT_RUNPATH fails" "$runpath_rc" "1"
 assert_contains "F4: the RUNPATH failure names the RUNPATH line" "$runpath_out" "RUNPATH"
+
+# ---------------------------------------------------------------------------
+# 15b2. `$ORIGIN`-only RPATH/RUNPATH is ACCEPTED, by
+#       component — the real shape NVIDIA ships (measured `readelf -d`
+#       against the CUDA 12.6 toolkit's libcublasLt.so.12/libcublas.so.12/
+#       libcurand.so.10), never refused by presence alone.
+# ---------------------------------------------------------------------------
+origin_only_rc=0
+bundle_is_origin_only_rpath '$ORIGIN' || origin_only_rc=$?
+assert_eq "origin: bundle_is_origin_only_rpath('\$ORIGIN') succeeds" "$origin_only_rc" "0"
+origin_braced_rc=0
+bundle_is_origin_only_rpath '${ORIGIN}' || origin_braced_rc=$?
+assert_eq "origin: bundle_is_origin_only_rpath('\${ORIGIN}') succeeds" "$origin_braced_rc" "0"
+origin_dotdot_rc=0
+bundle_is_origin_only_rpath '$ORIGIN/..' || origin_dotdot_rc=$?
+assert_eq "origin: bundle_is_origin_only_rpath('\$ORIGIN/..') fails (escapes the object's own directory)" "$origin_dotdot_rc" "1"
+origin_dotdot_lib_rc=0
+bundle_is_origin_only_rpath '$ORIGIN/../lib' || origin_dotdot_lib_rc=$?
+assert_eq "origin: bundle_is_origin_only_rpath('\$ORIGIN/../lib') fails" "$origin_dotdot_lib_rc" "1"
+usrlib64_rc=0
+bundle_is_origin_only_rpath '/usr/lib64' || usrlib64_rc=$?
+assert_eq "origin: bundle_is_origin_only_rpath('/usr/lib64') fails" "$usrlib64_rc" "1"
+mixed_origin_rc=0
+bundle_is_origin_only_rpath '$ORIGIN:/usr/lib' || mixed_origin_rc=$?
+assert_eq "origin: bundle_is_origin_only_rpath('\$ORIGIN:/usr/lib') fails (mixed component)" "$mixed_origin_rc" "1"
+
+# The same rule, end to end through `bundle_assert_no_runpath`, over a
+# committed real-shape fixture and each mutation named above.
+origin_runpath_out="$(bundle_assert_no_runpath "$ORIGIN_RUNPATH_BINARY" 2>&1)"
+origin_runpath_rc=$?
+assert_eq "origin: a real-shape \$ORIGIN RUNPATH (libcublasLt.so.12) passes" "$origin_runpath_rc" "0"
+
+origin_rpath_out="$(bundle_assert_no_runpath "$ORIGIN_RPATH_BINARY" 2>&1)"
+origin_rpath_rc=$?
+assert_eq "origin: a \$ORIGIN RPATH (0x0f, same rule as RUNPATH) passes" "$origin_rpath_rc" "0"
+
+origin_braced_out="$(bundle_assert_no_runpath "$ORIGIN_BRACED_BINARY" 2>&1)"
+origin_braced_rc=$?
+assert_eq "origin: a \${ORIGIN} (braced) RUNPATH passes" "$origin_braced_rc" "0"
+
+origin_dotdot_out="$(bundle_assert_no_runpath "$ORIGIN_DOTDOT_BINARY" 2>&1)"
+origin_dotdot_bin_rc=$?
+assert_eq "origin: \$ORIGIN/.. fails (escapes the object's own directory)" "$origin_dotdot_bin_rc" "1"
+assert_contains "origin: the \$ORIGIN/.. failure names the value" "$origin_dotdot_out" '$ORIGIN/..'
+
+origin_dotdot_lib_out="$(bundle_assert_no_runpath "$ORIGIN_DOTDOT_LIB_BINARY" 2>&1)"
+origin_dotdot_lib_bin_rc=$?
+assert_eq "origin: \$ORIGIN/../lib fails" "$origin_dotdot_lib_bin_rc" "1"
+
+usrlib64_out="$(bundle_assert_no_runpath "$USRLIB64_BINARY" 2>&1)"
+usrlib64_bin_rc=$?
+assert_eq "origin: /usr/lib64 (a bare absolute path, no \$ORIGIN at all) fails" "$usrlib64_bin_rc" "1"
+
+mixed_origin_out="$(bundle_assert_no_runpath "$MIXED_ORIGIN_BINARY" 2>&1)"
+mixed_origin_bin_rc=$?
+assert_eq "origin: \$ORIGIN:/usr/lib (mixed components) fails" "$mixed_origin_bin_rc" "1"
+assert_contains "origin: the mixed-component failure names the value" "$mixed_origin_out" '$ORIGIN:/usr/lib'
 
 # `bundle_main` itself refuses a RUNPATH'd binary before staging anything —
 # no stage directory is even created.
@@ -886,6 +1005,26 @@ assert_eq "bundle_main refuses a RUNPATH'd binary before staging anything" "$mai
 assert_eq "bundle_main creates no stage directory for a RUNPATH'd binary (refused before mkdir)" \
   "$([ -d "$RUNPATH_STAGE" ] && echo exists || echo absent)" "absent"
 
+# 15c. `bundle_assert_no_runpath_dir` extends
+#      the SAME check over every regular file in a directory — reuses the
+#      `bundle_dynamic_section` fixture above (still installed).
+RUNPATH_DIR_CLEAN="${ROOT}/runpath-dir-clean"
+mkdir -p "$RUNPATH_DIR_CLEAN"
+cp "$CLEAN_BINARY" "${RUNPATH_DIR_CLEAN}/fake-jammi-server-clean"
+runpath_dir_clean_rc=0
+bundle_assert_no_runpath_dir "$RUNPATH_DIR_CLEAN" >/dev/null 2>&1 || runpath_dir_clean_rc=$?
+assert_eq "runpath-dir: bundle_assert_no_runpath_dir passes over a directory with no RPATH/RUNPATH file" "$runpath_dir_clean_rc" "0"
+
+RUNPATH_DIR_DIRTY="${ROOT}/runpath-dir-dirty"
+mkdir -p "$RUNPATH_DIR_DIRTY"
+cp "$CLEAN_BINARY" "${RUNPATH_DIR_DIRTY}/fake-jammi-server-clean"
+cp "$RUNPATH_BINARY" "${RUNPATH_DIR_DIRTY}/fake-jammi-server-runpath"
+runpath_dir_dirty_out="$(bundle_assert_no_runpath_dir "$RUNPATH_DIR_DIRTY" 2>&1)"
+runpath_dir_dirty_rc=$?
+assert_eq "runpath-dir: bundle_assert_no_runpath_dir fails when ANY file in the directory carries RUNPATH" \
+  "$runpath_dir_dirty_rc" "1"
+assert_contains "runpath-dir: the directory-level failure names the offending file's own error" "$runpath_dir_dirty_out" "fake-jammi-server-runpath"
+
 # Restore the real ELF reader for anything below (nothing does, today, but
 # leaving a fixture installed past its own section is exactly the kind of
 # state leak this suite's `install_fixture_needed` idiom exists to avoid).
@@ -894,7 +1033,637 @@ bundle_dynamic_section() {
 }
 
 # ---------------------------------------------------------------------------
-# 15. T5: the release lane wires this script in, and the retired hand list
+# 16. `bundle_jail_platform_basenames` (see #534), driven
+#     directly: pure — the platform SUBSET of a `DT_NEEDED` list, nothing
+#     bundle-able and nothing driver.
+# ---------------------------------------------------------------------------
+# shellcheck disable=SC2086
+jail_platform_out="$(bundle_jail_platform_basenames $BINARY_NEEDED)"
+assert_contains "jail platform basenames includes a glibc member (libc)" "$jail_platform_out" "libc.so.6"
+assert_contains "jail platform basenames includes the loader itself" "$jail_platform_out" "ld-linux-x86-64.so.2"
+assert_not_contains "jail platform basenames excludes a bundle-able member (cudart)" "$jail_platform_out" "libcudart.so.12"
+assert_not_contains "jail platform basenames excludes the driver (libcuda)" "$jail_platform_out" "libcuda.so.1"
+
+# ---------------------------------------------------------------------------
+# 17a. `bundle_jail_platform_closure` (the platform closure of the
+#      binary AND every staged object), driven directly over the REAL
+#      fixture tree section 7 above already built ($BINARY, the already-
+#      populated $STAGE — `bundle_needed_sonames` is still the fixture
+#      `install_fixture_needed` installed). Proof this reads EVERY staged
+#      object's own needed-sonames, not only the binary's: libnvrtc.so.12
+#      and libnccl.so.2 both (fixture-)report `libc.so.6` as their own
+#      dependency, on top of the binary naming it directly — the closure
+#      must still emit it exactly ONCE.
+# ---------------------------------------------------------------------------
+jail_closure_out="$(bundle_jail_platform_closure "$BINARY" "$STAGE")"
+assert_contains "jail platform closure includes a glibc member (libc)" "$jail_closure_out" "libc.so.6"
+assert_contains "jail platform closure includes the loader itself" "$jail_closure_out" "ld-linux-x86-64.so.2"
+assert_not_contains "jail platform closure excludes a bundle-able member (cudart)" "$jail_closure_out" "libcudart.so.12"
+assert_not_contains "jail platform closure excludes the driver (libcuda)" "$jail_closure_out" "libcuda.so.1"
+jail_closure_libc_count="$(printf '%s\n' "$jail_closure_out" | grep -c '^libc\.so\.6$')"
+assert_eq "jail platform closure deduplicates a member named by multiple objects" "$jail_closure_libc_count" "1"
+
+# ---------------------------------------------------------------------------
+# 17b. `bundle_jail_expected_relpaths`, driven directly over fixture LISTINGS
+#     (text, no filesystem read) — the jail builder's file-set rule as a
+#     PURE function. `interp_relpath` is a measured-shape example: the
+#     loader's OWN `PT_INTERP` path, without its leading `/`.
+# ---------------------------------------------------------------------------
+JAIL_LIB_LISTING="libcudart.so.12
+libcudart.so.12.6.77
+libnccl.so.2"
+JAIL_PLATFORM_BASENAMES="libc.so.6
+ld-linux-x86-64.so.2"
+jail_expected_out="$(bundle_jail_expected_relpaths "$JAIL_LIB_LISTING" "$JAIL_PLATFORM_BASENAMES" "lib64/ld-linux-x86-64.so.2")"
+assert_contains "jail expected paths: the binary at the jail root" "$jail_expected_out" "jammi-server"
+assert_contains "jail expected paths: the loader at its own PT_INTERP path" "$jail_expected_out" "lib64/ld-linux-x86-64.so.2"
+assert_contains "jail expected paths: a staged lib_dir entry under lib/" "$jail_expected_out" "lib/libcudart.so.12"
+assert_contains "jail expected paths: a staged lib_dir entry's versioned sibling under lib/" "$jail_expected_out" "lib/libcudart.so.12.6.77"
+# Platform copies land under the SEPARATE platform/ directory, never lib/
+# (the isolation property — no shared namespace with the hardlinked stage).
+assert_contains "jail expected paths: a platform member under platform/" "$jail_expected_out" "platform/libc.so.6"
+assert_not_contains "jail expected paths: a platform member is NEVER also placed under lib/" "$jail_expected_out" "lib/libc.so.6"
+assert_not_contains "jail expected paths exclude the driver" "$jail_expected_out" "libcuda.so.1"
+assert_not_contains "jail expected paths never carry the old fixed 'ld.so' name" "$jail_expected_out" "ld.so"
+
+# ---------------------------------------------------------------------------
+# 18. `bundle_assert_jail_file_set` (see #534, the builder's own
+#     file-set rule checked over a REAL fixture tree — no ELF, pure
+#     filesystem, same idiom as `bundle_assert_staged`). Mutation: a file
+#     at a path the builder never wrote
+#     (`usr/lib/libnccl.so.2`, standing in for a host copy leaking into the
+#     jail at a path outside `lib/`) must FAIL, named.
+# ---------------------------------------------------------------------------
+JAIL_FIXTURE="${ROOT}/jail-fixture"
+mkdir -p "${JAIL_FIXTURE}/lib" "${JAIL_FIXTURE}/lib64"
+: >"${JAIL_FIXTURE}/jammi-server"
+: >"${JAIL_FIXTURE}/lib64/ld-linux-x86-64.so.2"
+: >"${JAIL_FIXTURE}/lib/libcudart.so.12"
+: >"${JAIL_FIXTURE}/lib/libc.so.6"
+JAIL_EXPECTED_LIST="jammi-server
+lib64/ld-linux-x86-64.so.2
+lib/libcudart.so.12
+lib/libc.so.6"
+# shellcheck disable=SC2086
+jail_fileset_out="$(bundle_assert_jail_file_set "$JAIL_FIXTURE" $JAIL_EXPECTED_LIST 2>&1)"
+jail_fileset_rc=$?
+assert_eq "the jail file-set check passes on an exactly-matching tree" "$jail_fileset_rc" "0"
+
+mkdir -p "${JAIL_FIXTURE}/usr/lib"
+: >"${JAIL_FIXTURE}/usr/lib/libnccl.so.2"
+# shellcheck disable=SC2086
+jail_fileset_mut_out="$(bundle_assert_jail_file_set "$JAIL_FIXTURE" $JAIL_EXPECTED_LIST 2>&1)"
+jail_fileset_mut_rc=$?
+assert_eq "the jail file-set check fails when an unexpected host-shaped file leaks in (/usr/lib/libnccl.so.2)" \
+  "$jail_fileset_mut_rc" "1"
+assert_contains "the jail file-set failure names the leaked file" "$jail_fileset_mut_out" "usr/lib/libnccl.so.2"
+rm -rf "${JAIL_FIXTURE:?}/usr"
+
+rm -f "${JAIL_FIXTURE}/lib/libc.so.6"
+# shellcheck disable=SC2086
+jail_fileset_missing_out="$(bundle_assert_jail_file_set "$JAIL_FIXTURE" $JAIL_EXPECTED_LIST 2>&1)"
+jail_fileset_missing_rc=$?
+assert_eq "the jail file-set check fails when an expected file is missing" "$jail_fileset_missing_rc" "1"
+assert_contains "the jail file-set failure names the missing file" "$jail_fileset_missing_out" "lib/libc.so.6"
+
+# ---------------------------------------------------------------------------
+# 18a. `bundle_build_jail` hardlinks the shipped stage into the jail's own
+#      BUNDLE_JAIL_LIB_DIR with `cp -al`, sharing INODES. First, directly:
+#      the sharing is proven REAL (a write through either path is a write
+#      to the SAME file), which is exactly why `bundle_build_jail`'s own
+#      code must never write there again after the copy. Second, end to
+#      end, over `bundle_build_jail`'s own real code (`bundle_binary_
+#      interp` stubbed the same way the other two ELF-reading functions
+#      already are in this suite): the shipped stage's file is BYTE-
+#      IDENTICAL, same inode, after the call as before — proof the
+#      platform-copy step that follows writes only into
+#      BUNDLE_JAIL_PLATFORM_DIR, never back into BUNDLE_JAIL_LIB_DIR.
+# ---------------------------------------------------------------------------
+bundle_inode() {
+  python3 -c 'import os, sys; print(os.stat(sys.argv[1]).st_ino)' "$1"
+}
+
+CPAL_STAGE="${ROOT}/cpal-isolation/stage"
+mkdir -p "$CPAL_STAGE"
+printf 'original content\n' > "${CPAL_STAGE}/libfoo.so.1"
+CPAL_JAIL="${ROOT}/cpal-isolation/jail"
+mkdir -p "$CPAL_JAIL"
+cp -al "$CPAL_STAGE" "${CPAL_JAIL}${BUNDLE_JAIL_LIB_DIR}"
+
+cpal_stage_inode_before="$(bundle_inode "${CPAL_STAGE}/libfoo.so.1")"
+cpal_jail_inode="$(bundle_inode "${CPAL_JAIL}${BUNDLE_JAIL_LIB_DIR}/libfoo.so.1")"
+assert_eq "cp -al: the jail's lib/ file shares the SAME inode as the shipped stage's file" \
+  "$cpal_jail_inode" "$cpal_stage_inode_before"
+
+printf 'a write through the jail side\n' > "${CPAL_JAIL}${BUNDLE_JAIL_LIB_DIR}/libfoo.so.1"
+cpal_stage_content_after="$(cat "${CPAL_STAGE}/libfoo.so.1")"
+assert_eq "cp -al: a write through the jail's lib/ file DOES alter the shipped stage's own file — the sharing is real, not incidental" \
+  "$cpal_stage_content_after" "a write through the jail side"
+
+# `bundle_build_jail`'s own real code, run end to end.
+REAL_JAIL_HOST_LOADER="${ROOT}/real-jail-isolation/host-lib64/fake-ld.so"
+mkdir -p "$(dirname "$REAL_JAIL_HOST_LOADER")"
+: >"$REAL_JAIL_HOST_LOADER"
+bundle_binary_interp() {
+  printf '%s\n' "$REAL_JAIL_HOST_LOADER"
+}
+REAL_JAIL_STAGE="${ROOT}/real-jail-isolation/stage/lib"
+mkdir -p "$REAL_JAIL_STAGE"
+printf 'bundle-able content\n' > "${REAL_JAIL_STAGE}/libbundleable.so.1"
+REAL_JAIL_BINARY="${ROOT}/real-jail-isolation/fake-jammi-server"
+: >"$REAL_JAIL_BINARY"
+HOST_PLATFORM_DIR="${ROOT}/real-jail-isolation/host-platform"
+mkdir -p "$HOST_PLATFORM_DIR"
+: >"${HOST_PLATFORM_DIR}/libc.so.6"
+real_jail_report="libc.so.6 => ${HOST_PLATFORM_DIR}/libc.so.6 (0x1)"
+bundle_needed_sonames() {
+  case "$(basename "$1")" in
+    fake-jammi-server) printf '%s\n' "libbundleable.so.1" "libc.so.6" ;;
+    *) : ;;
+  esac
+}
+REAL_JAIL_DIR="${ROOT}/real-jail-isolation/jail"
+real_jail_stage_inode_before="$(bundle_inode "${REAL_JAIL_STAGE}/libbundleable.so.1")"
+bundle_build_jail "$REAL_JAIL_BINARY" "$REAL_JAIL_STAGE" "$REAL_JAIL_DIR" "$real_jail_report" >/dev/null
+real_jail_build_rc=$?
+install_fixture_needed
+bundle_binary_interp() {
+  readelf -l "$1" | sed -n 's/.*Requesting program interpreter: \(.*\)\]$/\1/p'
+}
+assert_eq "bundle_build_jail succeeds over the isolation fixture" "$real_jail_build_rc" "0"
+real_jail_stage_inode_after="$(bundle_inode "${REAL_JAIL_STAGE}/libbundleable.so.1")"
+real_jail_stage_content_after="$(cat "${REAL_JAIL_STAGE}/libbundleable.so.1")"
+assert_eq "bundle_build_jail's own code never rewrites the shipped stage's file (same inode after the call)" \
+  "$real_jail_stage_inode_after" "$real_jail_stage_inode_before"
+assert_eq "bundle_build_jail's own code never rewrites the shipped stage's file (same content after the call)" \
+  "$real_jail_stage_content_after" "bundle-able content"
+# The platform member DID land, via the copy step, purely under
+# BUNDLE_JAIL_PLATFORM_DIR, never touching BUNDLE_JAIL_LIB_DIR again.
+assert_eq "bundle_build_jail stages the platform member under BUNDLE_JAIL_PLATFORM_DIR" \
+  "$([ -f "${REAL_JAIL_DIR}${BUNDLE_JAIL_PLATFORM_DIR}/libc.so.6" ] && echo yes || echo no)" "yes"
+
+# `bundle_assert_jail_class_provenance`, driven directly, over the SAME
+# already-built (correct) jail: passes on its own real output.
+provenance_ok_out="$(bundle_assert_jail_class_provenance "$REAL_JAIL_STAGE" "$REAL_JAIL_DIR" 2>&1)"
+provenance_ok_rc=$?
+assert_eq "bundle_assert_jail_class_provenance passes over a correctly-built jail" "$provenance_ok_rc" "0"
+
+# Mutation: a PLATFORM member found under BUNDLE_JAIL_LIB_DIR (the
+# bundle-able directory) is a named failure, by soname alone, regardless
+# of its actual inode.
+: >"${REAL_JAIL_DIR}${BUNDLE_JAIL_LIB_DIR}/libc.so.6"
+provenance_platform_under_lib_out="$(bundle_assert_jail_class_provenance "$REAL_JAIL_STAGE" "$REAL_JAIL_DIR" 2>&1)"
+provenance_platform_under_lib_rc=$?
+assert_eq "bundle_assert_jail_class_provenance fails when a platform member is found under BUNDLE_JAIL_LIB_DIR" \
+  "$provenance_platform_under_lib_rc" "1"
+assert_contains "bundle_assert_jail_class_provenance names the platform-under-lib failure" \
+  "$provenance_platform_under_lib_out" "a PLATFORM member found under"
+rm -f "${REAL_JAIL_DIR}${BUNDLE_JAIL_LIB_DIR}/libc.so.6"
+
+# Mutation: a BUNDLE-ABLE member found under BUNDLE_JAIL_PLATFORM_DIR (the
+# platform directory) is a named failure, by soname alone.
+: >"${REAL_JAIL_DIR}${BUNDLE_JAIL_PLATFORM_DIR}/libbundleable.so.1"
+provenance_bundleable_under_platform_out="$(bundle_assert_jail_class_provenance "$REAL_JAIL_STAGE" "$REAL_JAIL_DIR" 2>&1)"
+provenance_bundleable_under_platform_rc=$?
+assert_eq "bundle_assert_jail_class_provenance fails when a bundle-able member is found under BUNDLE_JAIL_PLATFORM_DIR" \
+  "$provenance_bundleable_under_platform_rc" "1"
+assert_contains "bundle_assert_jail_class_provenance names the bundle-able-under-platform failure" \
+  "$provenance_bundleable_under_platform_out" "a BUNDLE-ABLE (non-platform) member found under"
+rm -f "${REAL_JAIL_DIR}${BUNDLE_JAIL_PLATFORM_DIR}/libbundleable.so.1"
+
+# Mutation: a platform-named file under BUNDLE_JAIL_PLATFORM_DIR whose
+# inode happens to MATCH the staged tarball (accidentally hardlinked in
+# bulk instead of copied individually from the host) is refused by
+# PROVENANCE even though its name and directory otherwise agree.
+rm -f "${REAL_JAIL_DIR}${BUNDLE_JAIL_PLATFORM_DIR}/libc.so.6"
+ln "${REAL_JAIL_STAGE}/libbundleable.so.1" "${REAL_JAIL_DIR}${BUNDLE_JAIL_PLATFORM_DIR}/libc.so.6"
+provenance_wrong_inode_out="$(bundle_assert_jail_class_provenance "$REAL_JAIL_STAGE" "$REAL_JAIL_DIR" 2>&1)"
+provenance_wrong_inode_rc=$?
+assert_eq "bundle_assert_jail_class_provenance fails when a 'platform' file under BUNDLE_JAIL_PLATFORM_DIR is actually hardlinked from the stage" \
+  "$provenance_wrong_inode_rc" "1"
+assert_contains "bundle_assert_jail_class_provenance names the wrong-provenance failure" \
+  "$provenance_wrong_inode_out" "accidentally hardlinked from the stage"
+rm -f "${REAL_JAIL_DIR}${BUNDLE_JAIL_PLATFORM_DIR}/libc.so.6"
+cp -L "${HOST_PLATFORM_DIR}/libc.so.6" "${REAL_JAIL_DIR}${BUNDLE_JAIL_PLATFORM_DIR}/libc.so.6"
+
+# ---------------------------------------------------------------------------
+# 18b. `bundle_normalize_path`, driven
+#      directly: LEXICAL `.`/`..` collapse, filesystem-free.
+# ---------------------------------------------------------------------------
+assert_eq "normalize: a '..'-composed path collapses to where it really points" \
+  "$(bundle_normalize_path "/lib/../usr/lib/x.so")" "/usr/lib/x.so"
+assert_eq "normalize: an already-clean path is unchanged" \
+  "$(bundle_normalize_path "/lib/libc.so.6")" "/lib/libc.so.6"
+assert_eq "normalize: a trailing slash is stripped" \
+  "$(bundle_normalize_path "/lib/")" "/lib"
+assert_eq "normalize: a relative (non-absolute) path stays relative" \
+  "$(bundle_normalize_path "linux-vdso.so.1")" "linux-vdso.so.1"
+
+# ---------------------------------------------------------------------------
+# 19. `bundle_verify_jail_report` (see #534), driven directly
+#     against literal captured-report TEXT — no `chroot`, no real loader,
+#     anywhere in this suite. `JAIL_NEEDED` carries one bundle-able member,
+#     one platform member, the driver, and the loader itself, so every
+#     branch of the rule has a fixture. `JAIL_LOADER_PATH` is the
+#     loader's own measured-shape `PT_INTERP` path, passed as this
+#     function's first argument.
+# ---------------------------------------------------------------------------
+JAIL_LOADER_PATH="/lib64/ld-linux-x86-64.so.2"
+JAIL_NEEDED="libcudart.so.12 libnccl.so.2 libc.so.6 libcuda.so.1 ld-linux-x86-64.so.2"
+
+# 19a. A correct jail report: bundle-able members resolve under /lib,
+#      PLATFORM members resolve under /platform (a
+#      class-keyed expected directory, not a single literal), the driver is
+#      not found, and the loader's own self-named (no `=>`) line resolves
+#      to EXACTLY its PT_INTERP path (measured — at that path the self
+#      line is the no-`=>` fixture shape and this rule passes).
+jail_correct_report="libcudart.so.12 => /lib/libcudart.so.12 (0x1)
+libnccl.so.2 => /lib/libnccl.so.2 (0x2)
+libc.so.6 => /platform/libc.so.6 (0x3)
+libcuda.so.1 => not found
+	${JAIL_LOADER_PATH} (0x00007ffff7fc0000)"
+# shellcheck disable=SC2086
+jail_correct_out="$(bundle_verify_jail_report "$JAIL_LOADER_PATH" "$jail_correct_report" $JAIL_NEEDED 2>&1)"
+jail_correct_rc=$?
+assert_eq "jail verify: a correct report (driver absent, loader at its own PT_INTERP path) passes" "$jail_correct_rc" "0"
+
+# 19a2. The loader resolved from the
+#       WRONG path (e.g. copied to an arbitrary name/location instead of
+#       its own PT_INTERP path) is a NAMED failure, never tolerated.
+#       Measured shape: when the loader is INVOKED somewhere other
+#       than its own PT_INTERP path, its self line carries a `=>` (its true
+#       soname mapped to wherever it was actually invoked from) — it is
+#       ONLY at its own PT_INTERP path that the self line degenerates to
+#       the bare, no-`=>` shape (19a above).
+jail_wrong_loader_report="libcudart.so.12 => /lib/libcudart.so.12 (0x1)
+libnccl.so.2 => /lib/libnccl.so.2 (0x2)
+libc.so.6 => /platform/libc.so.6 (0x3)
+libcuda.so.1 => not found
+ld-linux-x86-64.so.2 => /ld.so (0x00007ffff7fc0000)"
+# shellcheck disable=SC2086
+jail_wrong_loader_out="$(bundle_verify_jail_report "$JAIL_LOADER_PATH" "$jail_wrong_loader_report" $JAIL_NEEDED 2>&1)"
+jail_wrong_loader_rc=$?
+assert_eq "jail verify: the loader resolved from the WRONG path fails" "$jail_wrong_loader_rc" "1"
+assert_contains "jail verify: the wrong-loader-path failure names the actual resolved path" "$jail_wrong_loader_out" "/ld.so"
+
+# 19a3. The loader's own entry ABSENT from the report entirely is now a
+#       named failure too — no exemption: a real trace always
+#       carries the self line, so its absence is itself a defect signal.
+jail_no_loader_line_report="libcudart.so.12 => /lib/libcudart.so.12 (0x1)
+libnccl.so.2 => /lib/libnccl.so.2 (0x2)
+libc.so.6 => /platform/libc.so.6 (0x3)
+libcuda.so.1 => not found"
+# shellcheck disable=SC2086
+jail_no_loader_line_out="$(bundle_verify_jail_report "$JAIL_LOADER_PATH" "$jail_no_loader_line_report" $JAIL_NEEDED 2>&1)"
+jail_no_loader_line_rc=$?
+assert_eq "jail verify: fails when the loader's own soname has no line at all" "$jail_no_loader_line_rc" "1"
+assert_contains "jail verify: names the loader's own soname as absent" "$jail_no_loader_line_out" "ld-linux-x86-64.so.2"
+
+# 19b. Bundle-able member `not found` inside the jail.
+jail_bundleable_missing_report="libcudart.so.12 => /lib/libcudart.so.12 (0x1)
+libnccl.so.2 => not found
+libc.so.6 => /platform/libc.so.6 (0x3)
+libcuda.so.1 => not found
+	${JAIL_LOADER_PATH} (0x00007ffff7fc0000)"
+# shellcheck disable=SC2086
+jail_bundleable_missing_out="$(bundle_verify_jail_report "$JAIL_LOADER_PATH" "$jail_bundleable_missing_report" $JAIL_NEEDED 2>&1)"
+jail_bundleable_missing_rc=$?
+assert_eq "jail verify: a bundle-able member 'not found' fails" "$jail_bundleable_missing_rc" "1"
+assert_contains "jail verify: the bundle-able-not-found failure names it" "$jail_bundleable_missing_out" "libnccl.so.2"
+
+# 19c. Driver member RESOLVED inside the jail — proof the jail failed to
+#      exclude it.
+jail_driver_resolved_report="libcudart.so.12 => /lib/libcudart.so.12 (0x1)
+libnccl.so.2 => /lib/libnccl.so.2 (0x2)
+libc.so.6 => /platform/libc.so.6 (0x3)
+libcuda.so.1 => /lib/libcuda.so.1 (0x4)
+	${JAIL_LOADER_PATH} (0x00007ffff7fc0000)"
+# shellcheck disable=SC2086
+jail_driver_resolved_out="$(bundle_verify_jail_report "$JAIL_LOADER_PATH" "$jail_driver_resolved_report" $JAIL_NEEDED 2>&1)"
+jail_driver_resolved_rc=$?
+assert_eq "jail verify: a driver member RESOLVED fails" "$jail_driver_resolved_rc" "1"
+assert_contains "jail verify: the driver-resolved failure names it" "$jail_driver_resolved_out" "libcuda.so.1"
+
+# 19d. A member resolved from OUTSIDE /lib (e.g. /usr/lib) — impossible in a
+#      real bare jail, but the rule still refuses it rather than assuming
+#      the impossibility.
+jail_outside_report="libcudart.so.12 => /lib/libcudart.so.12 (0x1)
+libnccl.so.2 => /usr/lib/libnccl.so.2 (0x2)
+libc.so.6 => /platform/libc.so.6 (0x3)
+libcuda.so.1 => not found
+	${JAIL_LOADER_PATH} (0x00007ffff7fc0000)"
+# shellcheck disable=SC2086
+jail_outside_out="$(bundle_verify_jail_report "$JAIL_LOADER_PATH" "$jail_outside_report" $JAIL_NEEDED 2>&1)"
+jail_outside_rc=$?
+assert_eq "jail verify: a member resolved from outside /lib fails" "$jail_outside_rc" "1"
+assert_contains "jail verify: the outside-/lib failure names the wrong path" "$jail_outside_out" "/usr/lib/libnccl.so.2"
+
+# 19d2. A PLATFORM member resolved from `/lib` — where `bundle_build_jail`
+#       never stages a platform member, only `/platform` — must FAIL: the
+#       rule is class-keyed in BOTH directions (a platform member accepted
+#       under `/platform`, rejected under `/lib`), never merely widened to
+#       accept a platform member from wherever it happens to resolve.
+jail_platform_old_layout_report="libcudart.so.12 => /lib/libcudart.so.12 (0x1)
+libnccl.so.2 => /lib/libnccl.so.2 (0x2)
+libc.so.6 => /lib/libc.so.6 (0x3)
+libcuda.so.1 => not found
+	${JAIL_LOADER_PATH} (0x00007ffff7fc0000)"
+# shellcheck disable=SC2086
+jail_platform_old_layout_out="$(bundle_verify_jail_report "$JAIL_LOADER_PATH" "$jail_platform_old_layout_report" $JAIL_NEEDED 2>&1)"
+jail_platform_old_layout_rc=$?
+assert_eq "jail verify: a platform member resolved from /lib (the bundle-able directory) fails" \
+  "$jail_platform_old_layout_rc" "1"
+assert_contains "jail verify: the wrong-directory failure names the platform member" "$jail_platform_old_layout_out" "libc.so.6"
+assert_contains "jail verify: the wrong-directory failure names the expected /platform directory" "$jail_platform_old_layout_out" "not /platform"
+
+# 19e. Vacuous pass closed — an empty report contains no resolved entry for
+#      any required name and must fail, never pass silently.
+jail_empty_report=""
+# shellcheck disable=SC2086
+jail_empty_out="$(bundle_verify_jail_report "$JAIL_LOADER_PATH" "$jail_empty_report" $JAIL_NEEDED 2>&1)"
+jail_empty_rc=$?
+assert_eq "jail verify: an empty report fails (vacuous pass closed)" "$jail_empty_rc" "1"
+
+# ---------------------------------------------------------------------------
+# 19f-h. The quantifier is EVERY LINE the report
+#        carries, never only the names in `needed` — each fixture below
+#        names a soname NOT present in `JAIL_NEEDED` at all (a transitive
+#        member of a STAGED object the binary itself never names directly).
+# ---------------------------------------------------------------------------
+JAIL_NEEDED_NARROW="libcudart.so.12 libc.so.6 ld-linux-x86-64.so.2"
+
+# 19f. A transitive platform member `not found` — a jail
+#      missing libm.so.6 traces `libm.so.6 => not found`, and the binary
+#      genuinely cannot run even though libm.so.6 is
+#      never in the narrow `needed` list passed here.
+jail_transitive_notfound_report="libcudart.so.12 => /lib/libcudart.so.12 (0x1)
+libc.so.6 => /platform/libc.so.6 (0x3)
+libm.so.6 => not found
+	${JAIL_LOADER_PATH} (0x00007ffff7fc0000)"
+# shellcheck disable=SC2086
+jail_transitive_notfound_out="$(bundle_verify_jail_report "$JAIL_LOADER_PATH" "$jail_transitive_notfound_report" $JAIL_NEEDED_NARROW 2>&1)"
+jail_transitive_notfound_rc=$?
+assert_eq "jail verify: a transitive member 'not found' fails even though it is absent from 'needed'" \
+  "$jail_transitive_notfound_rc" "1"
+assert_contains "jail verify: the transitive-not-found failure names it" "$jail_transitive_notfound_out" "libm.so.6"
+
+# 19g. A transitive PLATFORM member resolved from OUTSIDE /platform.
+#      libm.so.6 is itself a
+#      platform member (glibc's math library), so its correct location is
+#      `/platform`, never `/lib` — /usr/lib is wrong under EITHER layout.
+jail_transitive_outside_report="libcudart.so.12 => /lib/libcudart.so.12 (0x1)
+libc.so.6 => /platform/libc.so.6 (0x3)
+libm.so.6 => /usr/lib/libm.so.6 (0x2)
+	${JAIL_LOADER_PATH} (0x00007ffff7fc0000)"
+# shellcheck disable=SC2086
+jail_transitive_outside_out="$(bundle_verify_jail_report "$JAIL_LOADER_PATH" "$jail_transitive_outside_report" $JAIL_NEEDED_NARROW 2>&1)"
+jail_transitive_outside_rc=$?
+assert_eq "jail verify: a transitive platform member resolved outside /platform fails even though it is absent from 'needed'" \
+  "$jail_transitive_outside_rc" "1"
+assert_contains "jail verify: the transitive-outside-/platform failure names the wrong path" "$jail_transitive_outside_out" "/usr/lib/libm.so.6"
+
+# 19h. A DRIVER member resolved from OUTSIDE the jail, transitively, never a
+#      direct DT_NEEDED entry.
+jail_transitive_driver_report="libcudart.so.12 => /lib/libcudart.so.12 (0x1)
+libc.so.6 => /platform/libc.so.6 (0x3)
+libnvidia-ptxjitcompiler.so.1 => /usr/lib64/libnvidia-ptxjitcompiler.so.1 (0x5)
+	${JAIL_LOADER_PATH} (0x00007ffff7fc0000)"
+# shellcheck disable=SC2086
+jail_transitive_driver_out="$(bundle_verify_jail_report "$JAIL_LOADER_PATH" "$jail_transitive_driver_report" $JAIL_NEEDED_NARROW 2>&1)"
+jail_transitive_driver_rc=$?
+assert_eq "jail verify: a transitive DRIVER member resolved fails even though it is absent from 'needed'" \
+  "$jail_transitive_driver_rc" "1"
+assert_contains "jail verify: the transitive-driver-resolved failure names it" "$jail_transitive_driver_out" "libnvidia-ptxjitcompiler.so.1"
+
+# 19i. A `..`-composed path that textually
+#      starts with "/lib/" but NORMALIZES to somewhere else must still fail
+#      — a bare prefix match (`case "$p" in "/lib"/*)`) would have passed
+#      this, since the string literally begins with "/lib/". Mutates a
+#      BUNDLE-ABLE member (libcudart.so.12, expected under /lib) so this
+#      fixture stays about path normalization alone, independent of the
+#      class-keyed directory logic.
+jail_dotdot_report="libcudart.so.12 => /lib/../usr/lib/libcudart.so.12 (0x1)
+libc.so.6 => /platform/libc.so.6 (0x3)
+	${JAIL_LOADER_PATH} (0x00007ffff7fc0000)"
+# shellcheck disable=SC2086
+jail_dotdot_out="$(bundle_verify_jail_report "$JAIL_LOADER_PATH" "$jail_dotdot_report" $JAIL_NEEDED_NARROW 2>&1)"
+jail_dotdot_rc=$?
+assert_eq "jail verify: a '..'-composed path that normalizes outside /lib fails" "$jail_dotdot_rc" "1"
+assert_contains "jail verify: the normalized-path failure names the raw resolved path" "$jail_dotdot_out" "/lib/../usr/lib/libcudart.so.12"
+
+# 19j. The `linux-vdso.so.1` carve-out: a no-`=>` line with a
+#      RELATIVE, synthetic "path" must be tolerated, never judged as
+#      "resolved outside /lib" (which a naive normalize-then-prefix-check
+#      would otherwise flag, since a relative path never starts with "/").
+jail_vdso_report="libcudart.so.12 => /lib/libcudart.so.12 (0x1)
+libc.so.6 => /platform/libc.so.6 (0x3)
+linux-vdso.so.1 (0x00007ffff7fc0000)
+	${JAIL_LOADER_PATH} (0x00007ffff7fc0000)"
+# shellcheck disable=SC2086
+jail_vdso_out="$(bundle_verify_jail_report "$JAIL_LOADER_PATH" "$jail_vdso_report" $JAIL_NEEDED_NARROW 2>&1)"
+jail_vdso_rc=$?
+assert_eq "jail verify: the linux-vdso.so.1 carve-out tolerates its synthetic relative path" "$jail_vdso_rc" "0"
+
+# 19k-m. The vDSO carve-out must be
+#        CONDITIONED, never matched on the soname alone — three
+#        spoof shapes, each otherwise a report that would pass cleanly.
+JAIL_NEEDED_VDSO="libcudart.so.12 libc.so.6 ld-linux-x86-64.so.2"
+
+# 19k. Spoofed vdso RESOLVED from a real host-shaped path.
+jail_vdso_spoof_evil_report="libcudart.so.12 => /lib/libcudart.so.12 (0x1)
+libc.so.6 => /platform/libc.so.6 (0x3)
+linux-vdso.so.1 => /usr/lib/evil.so (0x4)
+	${JAIL_LOADER_PATH} (0x00007ffff7fc0000)"
+# shellcheck disable=SC2086
+jail_vdso_spoof_evil_out="$(bundle_verify_jail_report "$JAIL_LOADER_PATH" "$jail_vdso_spoof_evil_report" $JAIL_NEEDED_VDSO 2>&1)"
+jail_vdso_spoof_evil_rc=$?
+assert_eq "jail verify: a spoofed 'linux-vdso.so.1 => /usr/lib/evil.so' fails" "$jail_vdso_spoof_evil_rc" "1"
+assert_contains "jail verify: the spoofed-vdso-evil failure names the wrong path" "$jail_vdso_spoof_evil_out" "/usr/lib/evil.so"
+
+# 19l. Spoofed vdso reported as `not found`.
+jail_vdso_spoof_notfound_report="libcudart.so.12 => /lib/libcudart.so.12 (0x1)
+libc.so.6 => /platform/libc.so.6 (0x3)
+linux-vdso.so.1 => not found
+	${JAIL_LOADER_PATH} (0x00007ffff7fc0000)"
+# shellcheck disable=SC2086
+jail_vdso_spoof_notfound_out="$(bundle_verify_jail_report "$JAIL_LOADER_PATH" "$jail_vdso_spoof_notfound_report" $JAIL_NEEDED_VDSO 2>&1)"
+jail_vdso_spoof_notfound_rc=$?
+assert_eq "jail verify: a spoofed 'linux-vdso.so.1 => not found' fails" "$jail_vdso_spoof_notfound_rc" "1"
+assert_contains "jail verify: the spoofed-vdso-not-found failure names it" "$jail_vdso_spoof_notfound_out" "linux-vdso.so.1"
+
+# 19m. Spoofed vdso: a `=>`-shaped line whose path TEXT equals the bare
+#      soname -- parses to the SAME (RESOLVED, "linux-vdso.so.1") pair the
+#      genuine no-`=>` self-line produces; a real trace never emits this
+#      shape (a real `=>` resolution always carries an absolute path).
+jail_vdso_spoof_selfarrow_report="libcudart.so.12 => /lib/libcudart.so.12 (0x1)
+libc.so.6 => /platform/libc.so.6 (0x3)
+linux-vdso.so.1 => linux-vdso.so.1 (0x1)
+	${JAIL_LOADER_PATH} (0x00007ffff7fc0000)"
+# shellcheck disable=SC2086
+jail_vdso_spoof_selfarrow_out="$(bundle_verify_jail_report "$JAIL_LOADER_PATH" "$jail_vdso_spoof_selfarrow_report" $JAIL_NEEDED_VDSO 2>&1)"
+jail_vdso_spoof_selfarrow_rc=$?
+assert_eq "jail verify: a spoofed 'linux-vdso.so.1 => linux-vdso.so.1' (self-text via a REAL arrow) fails" \
+  "$jail_vdso_spoof_selfarrow_rc" "1"
+assert_contains "jail verify: the spoofed-vdso-self-arrow failure names it" "$jail_vdso_spoof_selfarrow_out" "linux-vdso.so.1"
+
+# ---------------------------------------------------------------------------
+# 20. The real captured JAIL report (see this
+#     file's module doc and `cu12_jail_report_real.txt`'s own header):
+#     the fixture carries BOTH the report AND the SAME lane run's measured
+#     `DT_NEEDED` set, delimited by a `# --- BINARY_NEEDED ---` line, so the
+#     two halves of this oracle can never desync. Refuses to run at all
+#     unless `BUNDLE_FIXTURE_PROVISIONAL=1` while the fixture is still the
+#     CLEARLY-LABELLED `captured: pending` placeholder — the intended
+#     effect: this suite, and therefore the merge path, stays red on this
+#     file until the lead commits the real report (captured by
+#     `release-binaries.yml`'s `server-cu12-build` job, uploaded as the
+#     `cu12-jail-report` workflow artifact) as its own commit.
+# ---------------------------------------------------------------------------
+checks=$((checks + 1))
+if [ ! -f "$REAL_JAIL_REPORT_FIXTURE" ]; then
+  fail "the real jail-report fixture exists" "expected a file at ${REAL_JAIL_REPORT_FIXTURE}"
+else
+  ok "the real jail-report fixture exists"
+  real_jail_head="$(head -n1 "$REAL_JAIL_REPORT_FIXTURE")"
+  checks=$((checks + 1))
+  case "$real_jail_head" in
+    "# captured: pending"*)
+      if [ "${BUNDLE_FIXTURE_PROVISIONAL:-0}" != "1" ]; then
+        fail "the real jail-report fixture is not provisional" \
+          "fixture is still 'captured: pending' -- set BUNDLE_FIXTURE_PROVISIONAL=1 to run this suite anyway (the merge path itself must NOT set it), or land the real captured report"
+      else
+        ok "the real jail-report fixture is provisional, and BUNDLE_FIXTURE_PROVISIONAL=1 is set"
+      fi
+      ;;
+    *)
+      ok "the real jail-report fixture is a real capture (no 'captured: pending' header)"
+      real_jail_report_part="$(sed -n '1,/^# --- BINARY_NEEDED ---$/p' "$REAL_JAIL_REPORT_FIXTURE" | sed '$d')"
+      real_jail_needed_part="$(sed -n '/^# --- BINARY_NEEDED ---$/,$p' "$REAL_JAIL_REPORT_FIXTURE" | tail -n +2)"
+      checks=$((checks + 1))
+      if [ -z "$real_jail_needed_part" ]; then
+        fail "the real jail-report fixture carries its own committed DT_NEEDED section" \
+          "expected a '# --- BINARY_NEEDED ---'-delimited section (the report and its DT_NEEDED set are captured together, same lane run)"
+      else
+        ok "the real jail-report fixture carries its own committed DT_NEEDED section"
+        real_jail_parsed="$(printf '%s\n' "$real_jail_report_part" | bundle_parse_loader_report)"
+        real_jail_loader_path=""
+        while IFS=' ' read -r rj_soname rj_state rj_path; do
+          [ -n "$rj_soname" ] || continue
+          if [ "$rj_state" = "RESOLVED" ] && bundle_is_loader_soname "$rj_soname"; then
+            real_jail_loader_path="$rj_path"
+            break
+          fi
+        done <<EOF
+$real_jail_parsed
+EOF
+        checks=$((checks + 1))
+        if [ -z "$real_jail_loader_path" ]; then
+          fail "the real jail report names a resolved loader (ld-linux-*) entry" \
+            "no RESOLVED ld-linux-* line found in ${REAL_JAIL_REPORT_FIXTURE} -- cannot infer the loader's own PT_INTERP path"
+        else
+          ok "the real jail report names a resolved loader (ld-linux-*) entry"
+          # shellcheck disable=SC2086
+          real_jail_out="$(bundle_verify_jail_report "$real_jail_loader_path" "$real_jail_report_part" $real_jail_needed_part 2>&1)"
+          real_jail_rc=$?
+          assert_eq "the real captured jail report verifies against its own committed DT_NEEDED set" "$real_jail_rc" "0"
+        fi
+      fi
+      ;;
+  esac
+fi
+
+
+# ---------------------------------------------------------------------------
+# 20b. `strip_inline_comment`'s own
+#      correctness, self-tested directly in Python before it is ever
+#      trusted against the real workflow file below — including a code
+#      line that "unwires" a call by moving its name into a TRAILING
+#      comment (`: skip   # bundle_assert_jail_file_set`), which must NOT
+#      satisfy a presence check for that name.
+# ---------------------------------------------------------------------------
+checks=$((checks + 1))
+b3_selftest_out="$(python3 - <<'PYEOF' 2>&1
+def strip_inline_comment(line):
+    in_single = False
+    in_double = False
+    for i, ch in enumerate(line):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            return line[:i]
+    return line
+
+
+def strip_comment_lines(text):
+    return "\n".join(strip_inline_comment(line) for line in text.splitlines())
+
+
+cases = [
+    ("a whole-line comment disappears", "# bundle_assert_jail_file_set", ""),
+    ("a bare code line is untouched", "bundle_assert_jail_file_set foo bar", "bundle_assert_jail_file_set foo bar"),
+    (
+        "an inline trailing comment is stripped, code kept",
+        "bundle_build_jail a b  # calls bundle_assert_jail_file_set too",
+        "bundle_build_jail a b  ",
+    ),
+    (
+        "a name moved into a trailing comment "
+        "on an unrelated code line reads as ABSENT",
+        ": skip   # bundle_assert_jail_file_set",
+        ": skip   ",
+    ),
+    (
+        "a '#' inside single quotes is not a comment starter",
+        "echo 'a # b' # real comment",
+        "echo 'a # b' ",
+    ),
+    (
+        "a '#' inside double quotes is not a comment starter",
+        'echo "a # b" # real comment',
+        'echo "a # b" ',
+    ),
+]
+failures = []
+for name, given, expected in cases:
+    got = strip_inline_comment(given)
+    if got != expected:
+        failures.append(f"{name}: strip_inline_comment({given!r}) = {got!r}, expected {expected!r}")
+
+# The mutation itself, end to end: a synthetic run_text where
+# bundle_build_jail is called for real,
+# bundle_assert_jail_file_set's call is REPLACED by a no-op with its name
+# surviving only in a trailing comment, then jail_trace.py is called for real.
+mutated_run_text = strip_comment_lines(
+    "bundle_build_jail x y z w\n"
+    ": skip   # bundle_assert_jail_file_set x y\n"
+    "python3 ci/scripts/jail_trace.py a b c d\n"
+)
+if "bundle_assert_jail_file_set" in mutated_run_text:
+    failures.append(
+        "a name moved into a trailing comment still satisfies "
+        "'bundle_assert_jail_file_set' in run_text"
+    )
+
+if failures:
+    print("FAILED:")
+    for f in failures:
+        print(f"  - {f}")
+    raise SystemExit(1)
+print("ok")
+PYEOF
+)"
+b3_selftest_rc=$?
+if [ "$b3_selftest_rc" -eq 0 ]; then
+  ok "strip_inline_comment strips shell-aware, keeps quoted '#', and a trailing-comment mutation reads as absent"
+else
+  fail "strip_inline_comment strips shell-aware, keeps quoted '#', and a trailing-comment mutation reads as absent" \
+    "$b3_selftest_out"
+fi
+
+# ---------------------------------------------------------------------------
+# 21. The release lane wires this script in, and the retired hand list
 #     is gone from it. Parsed YAML (PyYAML), never a regex over the file
 #     text: the property under test is "the Package step's shell script
 #     calls bundle_cuda_libs.sh and never re-declares the seven-name list",
@@ -917,7 +1686,54 @@ if job is None:
     sys.exit(1)
 
 steps = job.get("steps", [])
-package_runs = [s.get("run", "") for s in steps if s.get("id") == "package"]
+
+
+def strip_inline_comment(line):
+    # A WHOLE-LINE-ONLY comment strip
+    # (dropping a line only when its stripped content starts with `#`)
+    # leaves an INLINE trailing comment on a real code line untouched — a
+    # code line reading `: skip   # bundle_assert_jail_file_set` still
+    # contains the literal substring `bundle_assert_jail_file_set`, so
+    # every presence/ordering check below would read it as "the call is
+    # here" even though the real call was DELETED and only its name
+    # survives in a comment. Dropping from
+    # the first UNQUOTED `#` to end of line, character by character,
+    # tracking single/double-quote state — a `#` inside `'...'` or `"..."`
+    # (e.g. a `#`-containing string literal some future step might pass to
+    # a script) is never treated as a comment starter, matching what the
+    # shell itself does. Deliberately NOT a full shell parser (no
+    # backslash-escape handling, no `$'...'` ANSI-C quoting, no here-doc
+    # awareness) — this is a presence/ordering CHECK over generated
+    # workflow YAML, not a shell interpreter, and every `run:` block in
+    # this repo's workflows sticks to plain `'...'`/`"..."` quoting.
+    in_single = False
+    in_double = False
+    for i, ch in enumerate(line):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            return line[:i]
+    return line
+
+
+def strip_comment_lines(text):
+    # The ORDERING assertions below (`bundle_
+    # build_jail` before `bundle_assert_jail_file_set` before `jail_trace.
+    # py`, `jail_idx < detect_idx`) are meaningless if a `#`-prefixed
+    # COMMENT mentioning one of these names earlier in the script text
+    # shifts its `str.find()` position ahead of the real call site — exactly
+    # what this file's own module doc above already warns a presence-only
+    # check ("not a grep that would pass just as well on a comment
+    # mentioning the same words") must avoid; dropping every comment
+    # (whole-line OR inline) before ANY check below makes both the
+    # presence AND the ordering checks read the real code, never prose
+    # describing it.
+    return "\n".join(strip_inline_comment(line) for line in text.splitlines())
+
+
+package_runs = [strip_comment_lines(s.get("run", "")) for s in steps if s.get("id") == "package"]
 if not package_runs:
     print("no step with id: package under server-cu12-build")
     sys.exit(1)
@@ -932,15 +1748,55 @@ if hand_list in run_text:
     print("the retired seven-name hand list is still literally present in the package step")
     sys.exit(1)
 
+# See #534: both arms present, arm 1a (detection) ordered
+# strictly before arm 1b (the jail) — a future edit that drops the jail call
+# or reorders it behind the tarball assembly (a silent fallback to
+# detection-only) fails this check rather than only the hermetic function
+# tests above, which never read the workflow at all.
+detect_idx = run_text.find("bundle_verify_loader_resolution")
+if detect_idx == -1:
+    print("the package step never calls bundle_verify_loader_resolution (arm 1a, detection)")
+    sys.exit(1)
+
+jail_idx = run_text.find("jail_trace.py")
+if jail_idx == -1:
+    print("the package step never invokes ci/scripts/jail_trace.py (arm 1b, the jail)")
+    sys.exit(1)
+build_idx = run_text.find("bundle_build_jail")
+if build_idx == -1:
+    print("the package step never calls bundle_build_jail (arm 1b, the jail)")
+    sys.exit(1)
+if "bundle_verify_jail_report" not in run_text:
+    print("the package step never calls bundle_verify_jail_report (arm 1b, the jail)")
+    sys.exit(1)
+if jail_idx < detect_idx:
+    print("the jail arm (jail_trace.py) appears before arm 1a's detection call — arm 1a must run FIRST")
+    sys.exit(1)
+
+# The jail builder's own file-set assert must be
+# WIRED into the lane, between the build call and the trace call — an
+# assertion that exists in bundle_cuda_libs.sh but is never called from the
+# workflow enforces nothing on a real release.
+assert_idx = run_text.find("bundle_assert_jail_file_set")
+if assert_idx == -1:
+    print("the package step never calls bundle_assert_jail_file_set (the jail builder's own file-set rule)")
+    sys.exit(1)
+if not (build_idx < assert_idx < jail_idx):
+    print(
+        "bundle_assert_jail_file_set must run strictly between bundle_build_jail and the "
+        "jail_trace.py call, not before the jail exists or after it has already been traced"
+    )
+    sys.exit(1)
+
 print("ok")
 sys.exit(0)
 PYEOF
 )"
 workflow_check_rc=$?
 if [ "$workflow_check_rc" -eq 0 ]; then
-  ok "release-binaries.yml's server-cu12-build package step calls bundle_cuda_libs.sh and drops the hand list"
+  ok "release-binaries.yml's server-cu12-build package step calls bundle_cuda_libs.sh, drops the hand list, and runs arm 1a (detection) before arm 1b (the jail)"
 else
-  fail "release-binaries.yml's server-cu12-build package step calls bundle_cuda_libs.sh and drops the hand list" \
+  fail "release-binaries.yml's server-cu12-build package step calls bundle_cuda_libs.sh, drops the hand list, and runs arm 1a (detection) before arm 1b (the jail)" \
     "$workflow_check_out"
 fi
 

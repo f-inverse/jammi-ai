@@ -522,7 +522,15 @@ jobs:
           # directly.
           bash ci/scripts/assert_elf_machine.sh target/release/jammi-server "$arch"
 
-          stage="jammi-server-cu12"
+          # Container-native path, deliberately OUTSIDE $GITHUB_WORKSPACE:
+          # a `container:` job's workspace is bind-mounted in from the
+          # runner HOST (a different filesystem/device than the container's
+          # own writable layer), and the jail arm below (F6, #534's chroot
+          # half) needs to `cp -al` (hardlink) this multi-GB stage into the
+          # jail — a hardlink cannot cross that boundary. `/root` is this
+          # container's own filesystem and this job already runs as root
+          # (the `dnf install` above needs no `sudo`).
+          stage="/root/jammi-server-cu12"
           mkdir -p "${stage}/lib"
           strip target/release/jammi-server
           cp target/release/jammi-server "${stage}/bin-jammi-server"
@@ -545,14 +553,18 @@ jobs:
           . ci/scripts/bundle_cuda_libs.sh
           bundle_main target/release/jammi-server "${stage}/lib"
 
-          # Loader verification (#534, arm 1a — the release lane's own real
-          # execution; `ci/scripts/test_bundle_cuda_libs.sh` is arm 1b, the
-          # hermetic fixture-parse half; see `bundle_cuda_libs.sh`'s module
-          # doc). Runs the REAL loader against the REAL stage, in this
+          # Loader verification, arm 1a — DETECTION, the release lane's own
+          # real execution; arm 1b right below is the jail (#534's chroot
+          # half), and `ci/scripts/test_bundle_cuda_libs.sh` is arm 1c, the
+          # hermetic fixture-parse half for both; see `bundle_cuda_libs.sh`'s
+          # module doc. Runs the REAL loader against the REAL stage, in this
           # container (toolkit present, no NVIDIA driver — the `not found`
           # driver lines this arm tolerates by name are expected here), and
           # pipes the report through the SAME parser the hermetic suite
-          # drives over committed fixture text.
+          # drives over committed fixture text. Runs FIRST, unconditionally —
+          # arm 1b below never runs instead of this, only in addition to it;
+          # a failure here (`set -euo pipefail`) stops the step before arm
+          # 1b, the launcher, or the tarball are ever built.
           loader_report="$(LD_LIBRARY_PATH="${stage}/lib" ldd target/release/jammi-server 2>&1 || true)"
           # shellcheck disable=SC2046
           bundle_verify_loader_resolution "${stage}/lib" "$loader_report" $(bundle_needed_sonames target/release/jammi-server)
@@ -564,6 +576,99 @@ jobs:
           # this container already has the toolkit and no driver, which is
           # exactly the shape the shipped arm sees on a release.
           printf '%s\n' "$loader_report" > cu12_loader_report_real.txt
+
+          # Loader verification, arm 1b — THE JAIL (#534's chroot half —
+          # see `ci/scripts/jail_trace.py`'s own module doc for the
+          # measured reasons). Arm
+          # 1a above can only DETECT a host copy that would have satisfied a
+          # bundled member; this arm HIDES every host copy so none CAN, by
+          # running a TOLERANT `LD_TRACE_LOADED_OBJECTS` trace inside a real
+          # `chroot` jail — never `ld.so --list`, which is FATAL (exit
+          # 127, no report at all) on the FIRST missing library, and this
+          # jail deliberately ships with the driver libraries absent. The
+          # jail (`bundle_build_jail`) contains nothing but: the real
+          # binary; the staged `lib/` HARDLINKED in wholesale (`cp -al`
+          # — why `stage` above is a container-native path — and NEVER
+          # written to again afterward); same-named copies of the
+          # platform closure of the binary AND every staged object (a
+          # bundled CUDA library can itself need a platform member the
+          # binary never names directly), sourced from arm 1a's own report
+          # above (`bundle_platform_sources_from_report`) and copied
+          # byte-for-byte into the SEPARATE `/platform` directory (never
+          # hardlinked, never written into the `lib/` directory the shipped
+          # stage's own inodes live under, so a destination-name collision
+          # with the shipped stage is structurally impossible rather than
+          # merely unlikely); and the loader ITSELF at its real `PT_INTERP`
+          # path (anywhere else, its own self-reported trace line gains
+          # a `=>` the shipped parser misreads as a defect on an otherwise
+          # correct jail). Driver members are deliberately absent.
+          # `bundle_assert_jail_file_set` checks the
+          # real jail's file set against exactly this plan before the trace
+          # ever runs. Docker's default capability set includes
+          # `CAP_SYS_CHROOT` (probed against `docker run --rm ubuntu:24.04`,
+          # no `--privileged`/`--cap-add` needed), so this container needs no
+          # extra privilege for `os.chroot` itself to succeed — if it is
+          # nonetheless denied (EPERM), `jail_trace.py` exits 2 and this step
+          # FAILS naming the missing capability rather than silently falling
+          # back to arm 1a's already-passed result above.
+          interp="$(bundle_binary_interp target/release/jammi-server)"
+          interp_rel="${interp#/}"
+          jail="/root/jammi-server-cu12-jail"
+          rm -rf "$jail"
+          bundle_build_jail target/release/jammi-server "${stage}/lib" "$jail" "$loader_report"
+
+          # The jail BUILDER's own file-set rule,
+          # wired into the lane between the build and the trace, so a
+          # regression that stages an extra host-shaped path (or drops an
+          # expected one) is caught here — before the trace ever runs, not
+          # only in the hermetic suite over a fixture tree.
+          lib_listing="$(cd "${stage}/lib" && ls)"
+          # shellcheck disable=SC2046
+          platform_basenames="$(bundle_jail_platform_closure target/release/jammi-server "${stage}/lib")"
+          expected_relpaths="$(bundle_jail_expected_relpaths "$lib_listing" "$platform_basenames" "$interp_rel")"
+          # shellcheck disable=SC2086
+          bundle_assert_jail_file_set "$jail" $expected_relpaths
+
+          # `python3` itself is a dynamically-
+          # linked executable — if THIS shell already carries
+          # LD_TRACE_LOADED_OBJECTS, the loader that starts `python3`
+          # traces `python3`'s OWN dependency list and exits 0 WITHOUT ever
+          # running jail_trace.py's code at all (measured:
+          # `LD_TRACE_LOADED_OBJECTS=1 python3 -c 'print(2)'` prints
+          # python3's own trace, never "2", exit 0) — a check inside
+          # jail_trace.py cannot defend against this specific case, since
+          # its own code never runs; refused HERE, before python3 is ever
+          # exec'd, is the only place this hazard can actually be caught.
+          if [ -n "${LD_TRACE_LOADED_OBJECTS+x}" ]; then
+            echo "::error::LD_TRACE_LOADED_OBJECTS is already set in this shell — invoking python3 in this state would trace python3 ITSELF (jail_trace.py's own code would never run), not the jail. Refusing before python3 is exec'd." >&2
+            exit 1
+          fi
+          jail_report="$(python3 ci/scripts/jail_trace.py "$jail" "$interp" /jammi-server "${BUNDLE_JAIL_LIB_DIR}:${BUNDLE_JAIL_PLATFORM_DIR}")" && jail_rc=0 || jail_rc=$?
+          if [ "$jail_rc" -eq 2 ]; then
+            echo "::error::jail_trace.py: os.chroot(${jail}) was denied (EPERM) — CAP_SYS_CHROOT is likely missing from this job's container; the jail arm cannot run here." >&2
+            exit 1
+          fi
+          if [ "$jail_rc" -eq 3 ]; then
+            echo "::error::jail_trace.py: the trace failed before producing a report (bad path, missing loader, or exec failure) — see the step log above for the child's own diagnostic." >&2
+            exit 1
+          fi
+          if [ "$jail_rc" -ne 0 ]; then
+            echo "::error::jail_trace.py exited ${jail_rc}, neither the success (0) nor either named failure (2, 3) code — treating as a defect." >&2
+            exit 1
+          fi
+          # F6: the report and the measured DT_NEEDED set it must be judged
+          # against are captured TOGETHER, from the SAME lane run, as one
+          # fixture — a later drift between a hand-kept BINARY_NEEDED and
+          # what this run actually measured can never desync the two halves
+          # of the oracle.
+          {
+            printf '%s\n' "$jail_report"
+            printf '%s\n' "# --- BINARY_NEEDED ---"
+            bundle_needed_sonames target/release/jammi-server
+          } > cu12_jail_report_real.txt
+          # shellcheck disable=SC2046
+          bundle_verify_jail_report "$interp" "$jail_report" $(bundle_needed_sonames target/release/jammi-server)
+          rm -rf "$jail"
 
           # The launcher: a host with only an NVIDIA driver has no system CUDA,
           # so put the bundled libs on the loader path before exec. `exec`
@@ -577,7 +682,12 @@ jobs:
           LAUNCH
           chmod +x "${stage}/jammi-server"
 
-          tar -czf "$asset" "$stage"
+          # `-C`, not a bare `tar -czf "$asset" "$stage"`: `$stage` is now an
+          # absolute, container-native path (`/root/...`), and taring it
+          # directly would embed that absolute path in the archive rather
+          # than the relative `jammi-server-cu12/...` layout the launcher
+          # and every consumer of this tarball expect.
+          tar -czf "$asset" -C "$(dirname "$stage")" "$(basename "$stage")"
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
       # A workflow artifact, never `release-upload` directly: this job runs
@@ -600,10 +710,35 @@ jobs:
       # lead dispatches on a branch, downloads this artifact, and commits its
       # content over `ci/scripts/fixtures/cu12_loader_report_real.txt`'s
       # `captured: pending` placeholder. No pod rental for this fixture.
+      #
+      # `if: always()` — the file is written to
+      # disk BEFORE arm 1a's verify call, so a FAILING verify (or a failing
+      # arm 1b below it) must not prevent this artifact from uploading; a
+      # capture-without-enforcing fallback arm would otherwise be
+      # unreachable, since GitHub Actions skips every later step in a job
+      # once one step fails.
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: cu12-loader-report
           path: cu12_loader_report_real.txt
+
+      # The jail's own real report (arm 1b, #534's chroot half), same
+      # rationale as the artifact above: the lead dispatches on a
+      # branch, downloads this artifact, and commits its content over
+      # `ci/scripts/fixtures/cu12_jail_report_real.txt`'s `captured: pending`
+      # placeholder. No pod rental for this fixture either. `if: always()`
+      # for the identical reason — the file is written before `bundle_
+      # verify_jail_report` runs, so a failing verify still uploads it for
+      # diagnosis; if the trace itself never produced a report at all (a
+      # `jail_trace.py` exit 2/3, no file ever written), the upload step
+      # correctly has nothing to attach and that failure is diagnosed from
+      # the step log instead.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cu12-jail-report
+          path: cu12_jail_report_real.txt
 
   server-cu12-promote:
     name: Promote jammi-server (CUDA) to the release

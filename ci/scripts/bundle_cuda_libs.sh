@@ -135,6 +135,23 @@ bundle_is_platform_soname() {
     libc.so.* | libm.so.* | libmvec.so.* | libdl.so.* | librt.so.* | libpthread.so.* | libgcc_s.so.* | libstdc++.so.*)
       return 0
       ;;
+    *)
+      bundle_is_loader_soname "$1"
+      ;;
+  esac
+}
+
+# The dynamic loader itself, named as a `DT_NEEDED` entry (`ld-linux-*`) — a
+# subset of "platform", broken out on its own because the jail arm
+# (`bundle_verify_jail_report`) treats it differently from every other
+# platform member: it is the process `ci/scripts/jail_trace.py` execve's to
+# RUN the tolerant `LD_TRACE_LOADED_OBJECTS` trace, placed at and invoked
+# from its own `PT_INTERP` path (`bundle_binary_interp`) rather than staged
+# alongside the other platform copies under `/platform` — so its self-
+# reported entry is PINNED to that exact path (checked for EQUALITY, never
+# merely "under some directory" the way every other member's is).
+bundle_is_loader_soname() {
+  case "$1" in
     ld-linux-*)
       return 0
       ;;
@@ -169,6 +186,28 @@ bundle_realpath() {
   python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
 }
 
+# LEXICAL normalization of an absolute path
+# string — collapses `.`/`..` components (`posixpath.normpath`, never
+# touches the filesystem, never resolves a symlink) so a value like
+# `/lib/../usr/lib/x.so` is judged by where it actually points, never by a
+# bare textual prefix match (`case "$p" in "/lib"/*)` matches that literal
+# string even though it normalizes to `/usr/lib/x.so`, OUTSIDE the jail's
+# `/lib`). Used only by `bundle_verify_jail_report`'s resolved-path checks —
+# the jail-report TEXT is judged as fed, so this must stay filesystem-free
+# to keep that function hermetically testable off paths that do not exist
+# on the host running the suite.
+bundle_normalize_path() {
+  python3 -c 'import posixpath, sys; print(posixpath.normpath(sys.argv[1]))' "$1"
+}
+
+# The device+inode pair for a real file, portable across GNU/BSD `stat`
+# flag differences (macOS's shipped `stat` and Linux's disagree on `-f`).
+# Used only to compare ON-DISK PROVENANCE (a real hardlink, not merely a
+# same-looking name) between two files — never a soname classification.
+bundle_stat_ino() {
+  python3 -c 'import os, sys; st = os.stat(sys.argv[1]); print(f"{st.st_dev}:{st.st_ino}")' "$1"
+}
+
 # The one function that reads an ELF file, and therefore the one the hermetic
 # suite replaces. Prints the file's `DT_NEEDED` sonames, one per line, in link
 # order; prints nothing for a file with none.
@@ -184,6 +223,59 @@ bundle_dynamic_section() {
   readelf -d "$1" 2>&1
 }
 
+# The third and last ELF-reading function, used only by the jail arm
+# (`bundle_build_jail`): the binary's `PT_INTERP` path (`readelf -l`'s
+# "Requesting program interpreter" line) — `bundle_build_jail` copies the
+# loader into the jail AT this exact path (e.g. `/lib64/ld-linux-x86-64.so.2`,
+# never an arbitrary name like `/ld.so`) and `ci/scripts/jail_trace.py`
+# `os.execve`s it there directly (invoked from any OTHER path,
+# the loader's own self-reported trace line gains a `=>` — `<true-soname> =>
+# <invoked-path>` — that `bundle_verify_jail_report` correctly reads as "not
+# at its own PT_INTERP path" and refuses; only invoked from its real
+# `PT_INTERP` path does the self line degenerate to the bare, no-`=>` shape).
+# The binary itself is never exec'd directly inside the jail — its own
+# baked-in `PT_INTERP` reference is resolved by the KERNEL at exec time via
+# the normal `/lib64/...` lookup, which is exactly why the loader must
+# actually BE there rather than merely present under some other name.
+bundle_binary_interp() {
+  readelf -l "$1" | sed -n 's/.*Requesting program interpreter: \(.*\)\]$/\1/p'
+}
+
+# The dynamic string token `$ORIGIN` (glibc
+# `ld.so(8)`, "Dynamic string tokens") resolves, AT RUNTIME, to the
+# directory the ACTUAL LOADED OBJECT itself lives in — never a build-host
+# path baked in at link time. An RPATH/RUNPATH VALUE composed of one or
+# more colon-separated components that are EACH exactly `$ORIGIN` (or the
+# brace-quoted `${ORIGIN}`) therefore always resolves INSIDE whatever
+# directory currently holds the object — the stage's own `<lib>/` today,
+# the jail's own `/lib` after `bundle_build_jail` copies it there — which
+# REINFORCES this arm's "resolved from lib_dir" argument rather than
+# defeating it. NVIDIA ships `libcublas`, `libcublasLt`, and `libcurand`
+# (at least) in the CUDA 12.6 toolkit with exactly `RUNPATH: [$ORIGIN]` —
+# refusing every RPATH/RUNPATH by presence alone would fail every real
+# cu12 release, not only a genuine build-time-path leak; the domain this
+# function checks is the RPATH/RUNPATH's OWN component shape, never its
+# mere presence. A COMPONENT other than the bare `$ORIGIN`/`${ORIGIN}`
+# token — an absolute
+# path, `$ORIGIN` with any suffix (`$ORIGIN/..`, `$ORIGIN/../lib` — these
+# escape the object's own directory, which `$ORIGIN` ALONE never does), or
+# any component mixed into the same colon-separated value — is refused,
+# by component, never by shape-guessing the whole string.
+bundle_is_origin_only_rpath() {
+  local value="$1"
+  local comp
+  local IFS=':'
+  for comp in $value; do
+    # shellcheck disable=SC2016  # deliberately literal -- $ORIGIN is glibc's
+    # own dynamic string token, never a shell variable to expand.
+    case "$comp" in
+      '$ORIGIN' | '${ORIGIN}') : ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+
 # `LD_LIBRARY_PATH` is the loader's LAST search step (after `DT_RPATH`,
 # `LD_PRELOAD`, the cache, and `DT_RUNPATH` sits between the cache and the
 # default path — https://man7.org/linux/man-pages/man8/ld.so.8.html "Search
@@ -195,17 +287,59 @@ bundle_dynamic_section() {
 # from `lib_dir`", assumes no such entry exists. Checked once, up front, so
 # a build that somehow acquires one fails loudly here instead of silently
 # defeating the launcher on a host whose directory layout happens to differ
-# from the build host's.
+# from the build host's. A PURELY `$ORIGIN`-relative entry
+# (`bundle_is_origin_only_rpath`) is the one exception — see that
+# function's own doc.
 bundle_assert_no_runpath() {
   local binary="$1"
   local out
   out="$(bundle_dynamic_section "$binary")"
-  if printf '%s\n' "$out" | grep -Eq '\((RPATH|RUNPATH)\)'; then
-    echo "::error::bundle_cuda_libs.sh: ${binary} carries an RPATH/RUNPATH dynamic-section entry — the loader would consult it ahead of (RPATH) or interleaved with (RUNPATH) LD_LIBRARY_PATH, which defeats this arm's whole 'resolved from lib_dir' argument:" >&2
-    printf '%s\n' "$out" | grep -E '\((RPATH|RUNPATH)\)' >&2
+  local line kind value violations=""
+  while IFS= read -r line; do
+    case "$line" in
+      *'(RPATH)'*) kind="RPATH" ;;
+      *'(RUNPATH)'*) kind="RUNPATH" ;;
+      *) continue ;;
+    esac
+    value="$(printf '%s\n' "$line" | sed -n 's/.*\[\(.*\)\]$/\1/p')"
+    if ! bundle_is_origin_only_rpath "$value"; then
+      violations="${violations}
+  (${kind}) [${value}]"
+    fi
+  done <<EOF
+$out
+EOF
+  if [ -n "$violations" ]; then
+    echo "::error::bundle_cuda_libs.sh: ${binary} carries an RPATH/RUNPATH dynamic-section entry with a component other than \$ORIGIN — the loader would consult it ahead of (RPATH) or interleaved with (RUNPATH) LD_LIBRARY_PATH, and a component that is not PURELY \$ORIGIN-relative can point outside the directory the object actually lives in, which defeats this arm's whole 'resolved from lib_dir' argument:${violations}" >&2
     return 1
   fi
   return 0
+}
+
+# Extends `bundle_assert_no_runpath`'s guarantee
+# from the binary ALONE to every regular file directly under `dir` — a
+# STAGED CUDA `.so` (not the binary) carrying its own `DT_RPATH`/`DT_RUNPATH`
+# could resolve ITS OWN transitive dependencies from a build-time toolkit
+# path regardless of `--library-path`, which is exactly the same hazard
+# `bundle_assert_no_runpath` already refuses for the binary, just on a
+# different object — including the `$ORIGIN`-only carve-out
+# (`bundle_is_origin_only_rpath`), since real CUDA toolkit `.so`s
+# (`libcublas`, `libcublasLt`, `libcurand`) carry exactly that RUNPATH and a
+# rule refusing it here too would fail every real cu12 release. Checked
+# over the jail's OWN `lib_dir` before anything is hardlinked into a jail —
+# a toolkit library with a component OTHER than `$ORIGIN` fails loudly here
+# rather than silently defeating the "every bundle-able member resolves
+# from `/lib`" argument the jail arm exists to prove.
+bundle_assert_no_runpath_dir() {
+  local dir="$1"
+  local f rc=0
+  for f in "$dir"/*; do
+    [ -f "$f" ] || continue
+    if ! bundle_assert_no_runpath "$f"; then
+      rc=1
+    fi
+  done
+  return "$rc"
 }
 
 # The directory of the first entry in `search_path` that holds `soname`, or a
@@ -521,32 +655,129 @@ bundle_assert_staged() {
 #   (1) LD_LIBRARY_PATH PREPENDS, it does not restrict — a soname the tarball
 #       never staged can still resolve `Ok` if the host happens to carry a
 #       copy too. The property this arm asserts is "no host copy outside
-#       `<lib>` satisfies a bundle-able member" — a chroot/`unshare`d mount
-#       that hides host copies from the loader entirely is ONE mechanism for
-#       that property, not the property itself, so this arm ships in TWO
-#       homes rather than picking one:
-#         (1a) THE RELEASE LANE (`release-binaries.yml`'s `server-cu12-build`
-#              job, in the CUDA container, as root) runs the REAL loader
-#              (`LD_LIBRARY_PATH=<lib> ldd <binary>`) against the REAL staged
-#              binary and pipes that real report through THIS SAME parser —
-#              `bundle_verify_loader_resolution`, the `case "$resolved_path"
-#              in "$lib_dir"/*)` branch, refuses any non-platform, non-driver
-#              member resolved from outside `<lib>`. An `unshare --mount`
-#              chroot around that real `ldd` call would tighten this further
-#              (hiding host copies rather than merely detecting one that
-#              WOULD have been used) but is not available today —
-#              `server-cu12-build` runs in `resolve-base.image_cuda` with no
-#              `--privileged`/`--cap-add` (confirmed by reading the job) —
-#              and remains OPEN as the chroot half of #534 until a runner
-#              grants that privilege; STOP RULE INVOKED for that mechanism
-#              only, never for the refuse-outside-`<lib>` property.
-#         (1b) THE HERMETIC SUITE (`ci/scripts/test_bundle_cuda_libs.sh`, on
+#       `<lib>` satisfies a bundle-able member" — TWO independent mechanisms
+#       run in the release lane for it, because DETECTING a host copy that
+#       WOULD have been used and HIDING every host copy so none CAN be used
+#       are different strengths of the same argument, and neither stands in
+#       for the other:
+#         (1a) DETECTION, THE RELEASE LANE (`release-binaries.yml`'s
+#              `server-cu12-build` job, in the CUDA container, as root) runs
+#              the REAL loader (`LD_LIBRARY_PATH=<lib> ldd <binary>`) against
+#              the REAL staged binary and pipes that real report through THIS
+#              SAME parser — `bundle_verify_loader_resolution`, the
+#              `case "$resolved_path" in "$lib_dir"/*)` branch, refuses any
+#              non-platform, non-driver member resolved from outside `<lib>`.
+#              Runs FIRST, unconditionally, before the jail arm below —
+#              nothing here ever falls back to it silently if the jail arm
+#              fails; both are required and neither result substitutes for
+#              the other's.
+#         (1b) THE JAIL, THE RELEASE LANE, arm (1a)'s tightening (#534's
+#              chroot half): rather than merely detecting a host copy that
+#              WOULD satisfy a bundled member, this arm HIDES every host
+#              copy so none CAN — a `chroot` jail (`bundle_build_jail`)
+#              containing NOTHING but the real binary; the staged `<lib>/`
+#              HARDLINKED in wholesale (`cp -al` — the stage can be multi-GB,
+#              and this REQUIRES the jail and the stage to already sit on
+#              the same, container-native filesystem, never the bind-mounted
+#              checkout a `container:` job's own workspace actually is);
+#              same-named copies of the PLATFORM CLOSURE of the binary AND
+#              every staged object (`bundle_jail_platform_closure` — a
+#              bundled CUDA library can itself need a platform member the
+#              binary never names directly), sourced from arm (1a)'s own
+#              already-captured report via `bundle_platform_sources_from_
+#              report` — one real loader run is the one fact this script
+#              trusts about where the host's own glibc lives, never a second
+#              `ldconfig`/`ldd` lookup, copied byte-for-byte into a SEPARATE
+#              `/platform` directory — never
+#              hardlinked, never written into the `lib/` directory the
+#              shipped stage's own inodes live under, so a destination-name
+#              collision with the shipped stage's own files is structurally
+#              impossible rather than merely unlikely); and the loader
+#              itself, copied to and invoked AT its own `PT_INTERP` path
+#              (`bundle_binary_interp`) rather than any other name — copied
+#              elsewhere, its own self-reported trace line gains a `=>` the
+#              shipped parser misreads as "resolved from outside the jail"
+#              on an otherwise CORRECT jail. Driver members (`libcuda.so.1`,
+#              `libnvidia-*`) are DELIBERATELY ABSENT from the jail.
+#              `bundle_assert_jail_file_set` checks
+#              the real jail's file set against exactly this plan, wired
+#              into the release lane between the build and the trace.
+#
+#              The report is produced by `ci/scripts/jail_trace.py`, never
+#              `ld.so --list`: `--list` is FATAL (exit 127, one error line,
+#              no report at all) on the FIRST missing library, and this jail
+#              deliberately ships with the driver libraries missing — a
+#              mechanism that refuses to produce a report the moment one
+#              name is absent cannot ever prove "every driver name is `not
+#              found`". `jail_trace.py` instead forks, `os.chroot`s the
+#              CHILD into the jail, sets `LD_TRACE_LOADED_OBJECTS=1` in the
+#              child's OWN environment strictly AFTER the chroot syscall,
+#              then `os.execve`s the loader at its `PT_INTERP` path with
+#              `--library-path /lib <binary>` — a TOLERANT trace, `not
+#              found` lines and all, exit 0. Setting that environment
+#              variable on a `chroot <jail> ...` COMMAND LINE instead (a
+#              shell one-liner) would trace `chroot`'s OWN loader ON THE
+#              HOST before the `chroot()` syscall ever runs — a silent
+#              VACUOUS PASS `jail_trace.py`'s own module doc names as the
+#              reason it is a separate Python process rather than a shell
+#              invocation. Docker's default capability set includes
+#              `CAP_SYS_CHROOT` (probed against `docker run --rm
+#              ubuntu:24.04` — no `--privileged`/`--cap-add` needed), so this
+#              container needs no extra privilege for `os.chroot` itself to
+#              succeed — if it is nonetheless denied (EPERM), `jail_trace.py`
+#              exits 2 and the step FAILS naming the missing capability
+#              rather than falling back to (1a)'s already-passed result.
+#
+#              The report is verified by `bundle_verify_jail_report`: a
+#              STRICTER rule than (1a)'s in TWO ways. First, inside the jail
+#              there is no host copy left to distinguish from a bundled
+#              one — EVERY driver name resolving AT ALL is refused (proof
+#              the jail failed to exclude it), every OTHER non-loader name
+#              must resolve to a NORMALIZED path (`bundle_normalize_path`
+#              collapses `..`/`.` components lexically, so a value like
+#              `/lib/../usr/lib/x` is judged by where it really points, not
+#              by a bare textual prefix) under `/lib`, and the loader's own
+#              self-reported entry must resolve to EXACTLY its `PT_INTERP`
+#              path — never merely tolerated, since placing/invoking it
+#              correctly is itself part of what this arm proves; the
+#              `linux-vdso.so.1` kernel-injected entry is an explicit,
+#              named carve-out (never a real file, never checked). Second,
+#              the quantifier is EVERY LINE the
+#              report carries, never only the binary's own direct
+#              `DT_NEEDED` names — a member that is only a TRANSITIVE
+#              dependency of a STAGED object still appears
+#              in a real trace, and judging only the binary's own named set
+#              would let a missing or host-leaked TRANSITIVE member
+#              (`libm.so.6 => not found`; a driver resolving from
+#              `/usr/lib64` when it is not itself a direct `DT_NEEDED`
+#              entry) pass silently. This arm's own "bundle-able" quantifier
+#              is the binary's `DT_NEEDED` set intersected with the non-host
+#              set; `libnvrtc-builtins` (the floor's own dlopen-only member
+#              — see the module doc above) is never a `DT_NEEDED` entry,
+#              never traced by any loader run, and stays UNPROVEN by this
+#              arm, documented rather than silently assumed. The jail
+#              report, alongside the SAME lane run's measured `DT_NEEDED`
+#              set, is captured and uploaded as a workflow artifact on
+#              every run — see `ci/scripts/fixtures/cu12_jail_report_real.txt`.
+#         (1c) THE HERMETIC SUITE (`ci/scripts/test_bundle_cuda_libs.sh`, on
 #              the bare-runner Guard matrix and the lead's macOS merge path)
-#              parses COMMITTED fixture report TEXT — including the real
-#              report (1a) itself captures and uploads as a workflow
-#              artifact, see `ci/scripts/fixtures/cu12_loader_report_real.txt`
-#              — through this exact same parser, with no `ldd`, no ELF, no
-#              network, anywhere in this file's test.
+#              parses COMMITTED fixture report TEXT for BOTH (1a)'s and
+#              (1b)'s rules — including the real reports each arm captures
+#              and uploads as a workflow artifact, see
+#              `ci/scripts/fixtures/cu12_loader_report_real.txt` and
+#              `ci/scripts/fixtures/cu12_jail_report_real.txt` — through the
+#              exact same parsers, with no `ldd`, no `chroot`, no ELF, no
+#              network, anywhere in this file's test. The jail BUILDER's own
+#              file-set rule (`bundle_jail_expected_relpaths` /
+#              `bundle_assert_jail_file_set`: the jail contains exactly the
+#              staged `<lib>/` UNION the platform copies under the SEPARATE
+#              `/platform` directory UNION the loader (at its own
+#              `PT_INTERP` path) and the binary, nothing else — no path a
+#              host copy could have leaked in at) is likewise exercised as a
+#              pure function over a fixture listing, never a real `chroot`,
+#              and is WIRED into the release
+#              lane itself, between the build and the trace, not merely
+#              defined and left uncalled.
 #   (2) VACUOUS PASS on a crashed/empty/vdso-only report — closed by requiring
 #       the report to carry a RESOLVED line for every one of the binary's own
 #       `DT_NEEDED` names (platform members included): an empty, "not a
@@ -667,6 +898,555 @@ EOF
   fi
   if [ -n "$violations" ]; then
     echo "::error::bundle_cuda_libs.sh: the loader resolved a bundled library from OUTSIDE the stage directory — this proves a build-host copy satisfied it, not the tarball's own:${violations}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# The jail arm (#534's chroot half, arm 1b — see the section doc above).
+# `BUNDLE_JAIL_LIB_DIR`/`BUNDLE_JAIL_PLATFORM_DIR` are fixed, never
+# parameters, and are TWO SEPARATE directories on purpose: `bundle_build_
+# jail` hardlinks the tarball's own `lib_dir` into `BUNDLE_JAIL_LIB_DIR`
+# with `cp -al` — sharing INODES with the shipped stage — and NEVER writes
+# into that directory again afterward. Every platform member the jail ALSO
+# carries (the loader itself excepted — see `bundle_verify_jail_report`'s
+# own doc) is copied byte-for-byte (`cp -L`, not hardlinked) into the
+# SEPARATE `BUNDLE_JAIL_PLATFORM_DIR`. This is the ISOLATION PROPERTY this
+# split states: a write aimed at a platform member's destination path can
+# NEVER land on an inode the shipped stage still owns, because the two
+# directories never share a namespace to collide in — this does NOT depend
+# on the derivation's closure never staging a platform-named file (a fact
+# that happens to hold but is never itself enforced): `cp` overwriting an
+# existing hardlinked destination IN PLACE would silently corrupt the
+# shipped stage's own copy if that fact ever slipped, and keeping platform
+# copies in a namespace the hardlinked directory never shares makes that
+# corruption structurally impossible regardless. `ci/scripts/jail_trace.py`
+# is invoked with `--library-path BUNDLE_JAIL_LIB_DIR:BUNDLE_JAIL_
+# PLATFORM_DIR` (glibc's loader searches a colon-separated list in order),
+# so both directories are visible to the real trace.
+# ---------------------------------------------------------------------------
+BUNDLE_JAIL_LIB_DIR="/lib"
+BUNDLE_JAIL_PLATFORM_DIR="/platform"
+
+# Pure: given the binary's full `DT_NEEDED` list (platform members
+# included), the SUBSET that are platform members (`bundle_is_platform_
+# soname`) — a building block `bundle_jail_platform_closure` folds over
+# multiple ELF objects; kept as its own pure function so the FILTER itself
+# (as opposed to which files it is applied to) stays hermetically testable
+# off a plain fixture list.
+bundle_jail_platform_basenames() {
+  local needed=("$@")
+  local n
+  for n in "${needed[@]}"; do
+    if bundle_is_platform_soname "$n"; then
+      printf '%s\n' "$n"
+    fi
+  done
+}
+
+# NOT pure — reads ELF (`bundle_needed_sonames`) over the binary AND every
+# already-staged object under `lib_dir`: a
+# bundled CUDA library can itself need a platform member the BINARY never
+# names directly (e.g. a toolkit `.so` naming `libdl`/`libm`
+# entries the binary's own direct `DT_NEEDED` does not) — a jail built only
+# from the binary's own platform set can come up short a copy the loader's
+# transitive trace legitimately needs. One level over the UNION of (binary,
+# every staged file), not a further recursive walk: `bundle_verify_jail_
+# report`'s own runtime trace (`LD_TRACE_LOADED_OBJECTS`, which resolves the
+# REAL, full transitive graph) is what actually proves the result is
+# complete — this function is a generous, cheap over-approximation of what
+# to STAGE, never itself the proof. Emits deduplicated platform basenames.
+bundle_jail_platform_closure() {
+  local binary="$1"
+  local lib_dir="$2"
+  local all_needed=() n f
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    all_needed[${#all_needed[@]}]="$n"
+  done <<EOF
+$(bundle_needed_sonames "$binary")
+EOF
+  for f in "$lib_dir"/*; do
+    [ -e "$f" ] || continue
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      all_needed[${#all_needed[@]}]="$n"
+    done <<EOF
+$(bundle_needed_sonames "$f")
+EOF
+  done
+  bundle_jail_platform_basenames "${all_needed[@]}" | LC_ALL=C sort -u
+}
+
+# Pure text function: given arm (1a)'s already-captured loader report (real
+# HOST paths, captured before any jail exists) and a list of wanted sonames,
+# emits `<soname> <path>` for every one the report RESOLVED. This is the one
+# place the jail arm learns where the host's own glibc lives — reusing arm
+# (1a)'s real run rather than a second host lookup (`ldconfig -p`, a fresh
+# `ldd`) keeps there being exactly one real loader invocation this script
+# trusts for host paths (arm 1a's trace, being a REAL `ldd`, already
+# resolves the full transitive graph, so every platform member `bundle_
+# jail_platform_closure` names is expected to appear here too).
+bundle_platform_sources_from_report() {
+  local report="$1"
+  shift
+  local wanted=("$@")
+  local parsed name soname state path
+  parsed="$(printf '%s\n' "$report" | bundle_parse_loader_report)"
+  for name in "${wanted[@]}"; do
+    while IFS=' ' read -r soname state path; do
+      [ -n "$soname" ] || continue
+      if [ "$soname" = "$name" ] && [ "$state" = "RESOLVED" ]; then
+        printf '%s %s\n' "$soname" "$path"
+      fi
+    done <<EOF
+$parsed
+EOF
+  done
+}
+
+# Pure: the exact set of paths, relative to the jail root, the jail must
+# carry for `bundle_verify_jail_report` to have any chance of passing — the
+# SAME set `bundle_assert_jail_file_set` checks the real jail tree against
+# after `bundle_build_jail` runs. Arguments, all plain TEXT (this function
+# reads no filesystem, no ELF, which is what keeps it hermetic):
+#   - `lib_listing`: newline-separated basenames already staged under the
+#     tarball's OWN `$lib_dir` (`bundle_main`'s output — `ls`, or a fixture
+#     listing in the hermetic suite). Every one is hardlinked into the jail
+#     under `BUNDLE_JAIL_LIB_DIR` (`lib/`) wholesale.
+#   - `platform_basenames`: newline-separated PLATFORM basenames the jail
+#     must ALSO carry a same-named copy of under `BUNDLE_JAIL_PLATFORM_DIR`
+#     (`platform/`, a SEPARATE directory from `lib/` — the isolation
+#     property the section doc above states) — `bundle_jail_platform_
+#     closure`'s output, passed in as plain text so THIS function stays
+#     pure.
+#   - `interp_relpath`: the loader's own `PT_INTERP` path, WITHOUT the
+#     leading `/` (e.g. `lib64/ld-linux-x86-64.so.2`) — the loader must
+#     sit at this exact path inside the jail and be invoked there, never an
+#     arbitrary name, or its own self-reported trace line gains a `=>` the
+#     shipped parser misreads as "resolved from outside" on an otherwise
+#     correct jail.
+bundle_jail_expected_relpaths() {
+  local lib_listing="$1" platform_basenames="$2" interp_relpath="$3"
+  local f
+  printf '%s\n' "jammi-server" "$interp_relpath"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    printf 'lib/%s\n' "$f"
+  done <<EOF
+$lib_listing
+EOF
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    printf 'platform/%s\n' "$f"
+  done <<EOF
+$platform_basenames
+EOF
+}
+
+# The real builder — filesystem writes only, not hermetically exercised
+# directly (it needs a real ELF binary for `bundle_binary_interp` and real
+# `cp -al` hardlink semantics); the hermetic suite instead exercises the
+# PURE functions above it draws from, plus `bundle_assert_jail_file_set`
+# over a fixture tree built by hand.
+#
+# Arguments: `binary` (the real, already-staged `jammi-server`), `lib_dir`
+# (the tarball's OWN stage directory — `bundle_main`'s output, already the
+# `DT_NEEDED` closure union the floor), `jail_dir` (created fresh), `report`
+# (arm 1a's captured loader report, for the platform members' real host
+# paths).
+#
+# `lib_dir` is hardlinked into the jail with `cp -al` (GNU coreutils;
+# this function runs only inside the Linux CUDA container, never the
+# hermetic macOS suite) rather than copied byte-for-byte — the stage is
+# multi-GB — which REQUIRES `jail_dir` and `lib_dir` to already sit on the
+# SAME, container-native filesystem (a hardlink cannot cross a filesystem
+# boundary): see this function's caller in `release-binaries.yml` for why
+# the stage itself is built under a container-native path (`/root/...`),
+# never the bind-mounted checkout a `container:` job's `$GITHUB_WORKSPACE`
+# actually is.
+bundle_build_jail() {
+  local binary="$1" lib_dir="$2" jail_dir="$3" report="$4"
+
+  # A staged CUDA `.so` carrying its own
+  # RPATH/RUNPATH would let it resolve ITS OWN dependencies from a
+  # build-time toolkit path regardless of `--library-path` — checked BEFORE
+  # anything is hardlinked into the jail, so a toolkit library that somehow
+  # acquired one fails loudly here rather than silently defeating the
+  # "every bundle-able member resolves from `/lib`" argument.
+  bundle_assert_no_runpath_dir "$lib_dir" || return 1
+
+  mkdir -p "$jail_dir" "${jail_dir}${BUNDLE_JAIL_PLATFORM_DIR}"
+  cp -L "$binary" "${jail_dir}/jammi-server"
+  # Hardlinked, sharing inodes with the shipped stage — nothing below
+  # this line ever writes into `${jail_dir}${BUNDLE_JAIL_LIB_DIR}` again.
+  cp -al "$lib_dir" "${jail_dir}${BUNDLE_JAIL_LIB_DIR}"
+
+  local platform_basenames
+  platform_basenames="$(bundle_jail_platform_closure "$binary" "$lib_dir")"
+
+  local platform_sources
+  # shellcheck disable=SC2086
+  platform_sources="$(bundle_platform_sources_from_report "$report" $platform_basenames)"
+
+  # Platform copies land in the SEPARATE `BUNDLE_JAIL_PLATFORM_DIR`,
+  # copied byte-for-byte (`cp -L`, never hardlinked) — this directory shares
+  # no inode, and no destination-name collision is even possible, with the
+  # hardlinked `BUNDLE_JAIL_LIB_DIR` above.
+  local name found src missing_platform=""
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    found=0
+    while IFS=' ' read -r n src; do
+      [ -n "$n" ] || continue
+      if [ "$n" = "$name" ]; then
+        cp -L "$src" "${jail_dir}${BUNDLE_JAIL_PLATFORM_DIR}/${name}"
+        found=1
+      fi
+    done <<EOF
+$platform_sources
+EOF
+    if [ "$found" -eq 0 ]; then
+      missing_platform="${missing_platform} ${name}"
+    fi
+  done <<EOF
+$platform_basenames
+EOF
+  if [ -n "$missing_platform" ]; then
+    echo "::error::bundle_cuda_libs.sh: arm 1a's loader report has no resolved host path for platform member(s):${missing_platform} — the jail cannot be built without a real copy of each." >&2
+    return 1
+  fi
+
+  local interp interp_rel
+  interp="$(bundle_binary_interp "$binary")"
+  if [ -z "$interp" ]; then
+    echo "::error::bundle_cuda_libs.sh: ${binary} carries no PT_INTERP — cannot place the loader in the jail at its own path." >&2
+    return 1
+  fi
+  interp_rel="${interp#/}"
+  mkdir -p "${jail_dir}/$(dirname "$interp_rel")"
+  cp -L "$interp" "${jail_dir}/${interp_rel}"
+
+  bundle_assert_jail_class_provenance "$lib_dir" "$jail_dir" || return 1
+}
+
+# The expected-directory-per-CLASS rule everywhere else in this file
+# (`bundle_jail_expected_relpaths`, `bundle_verify_jail_report`) is a NAME
+# classification (`bundle_is_platform_soname` on the SONAME) — it never
+# looks at where a file on disk actually CAME FROM. Two independent
+# mechanisms that both encode "platform -> /platform, bundle-able -> /lib"
+# could in principle both agree on the same wrong belief. This function
+# checks the REAL jail tree against TWO independent facts neither of those
+# functions inspects: first, by NAME — a PLATFORM-classified soname found
+# under `BUNDLE_JAIL_LIB_DIR` (the bundle-able directory), or a
+# non-platform soname found under `BUNDLE_JAIL_PLATFORM_DIR`, is refused
+# regardless of anything else; second, by ON-DISK PROVENANCE — `lib_dir` is
+# the tarball's own staged directory (the SAME inodes `bundle_build_jail`
+# hardlinks into `BUNDLE_JAIL_LIB_DIR`), so a file under the jail's
+# `BUNDLE_JAIL_LIB_DIR` must share an inode with some file in `lib_dir`
+# (genuinely staged from the tarball, not a host copy that happened to
+# land there), and a file under `BUNDLE_JAIL_PLATFORM_DIR` must NOT
+# (genuinely copied from the host — `cp -L` — never a hardlink from the
+# stage). A platform member's copy found sharing an inode with the stage
+# under `BUNDLE_JAIL_LIB_DIR` would mean it was accidentally hardlinked in
+# bulk with the tarball's own closure rather than copied individually from
+# the host; a bundle-able object's copy found under
+# `BUNDLE_JAIL_PLATFORM_DIR` sharing no stage inode would mean the
+# platform-copy step wrote something that was never actually resolved
+# from the host report at all.
+bundle_assert_jail_class_provenance() {
+  local lib_dir="$1"
+  local jail_dir="$2"
+  local f stage_inodes=""
+  for f in "$lib_dir"/*; do
+    [ -e "$f" ] || continue
+    stage_inodes="${stage_inodes}$(bundle_stat_ino "$f")
+"
+  done
+
+  local base ino violations=""
+  for f in "${jail_dir}${BUNDLE_JAIL_LIB_DIR}"/*; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f")"
+    if bundle_is_platform_soname "$base"; then
+      violations="${violations}
+  ${base}: a PLATFORM member found under ${BUNDLE_JAIL_LIB_DIR} (the bundle-able directory)"
+      continue
+    fi
+    ino="$(bundle_stat_ino "$f")"
+    case "$stage_inodes" in
+      *"$ino"$'\n'*) : ;;
+      *)
+        violations="${violations}
+  ${base}: under ${BUNDLE_JAIL_LIB_DIR} but its inode matches no file in the staged tarball directory — not actually hardlinked from the stage" ;;
+    esac
+  done
+  for f in "${jail_dir}${BUNDLE_JAIL_PLATFORM_DIR}"/*; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f")"
+    if ! bundle_is_platform_soname "$base"; then
+      violations="${violations}
+  ${base}: a BUNDLE-ABLE (non-platform) member found under ${BUNDLE_JAIL_PLATFORM_DIR} (the platform directory)"
+      continue
+    fi
+    ino="$(bundle_stat_ino "$f")"
+    case "$stage_inodes" in
+      *"$ino"$'\n'*)
+        violations="${violations}
+  ${base}: under ${BUNDLE_JAIL_PLATFORM_DIR} but its inode MATCHES a staged tarball file — accidentally hardlinked from the stage instead of copied from the host" ;;
+      *) : ;;
+    esac
+  done
+
+  if [ -n "$violations" ]; then
+    echo "::error::bundle_cuda_libs.sh: a jail file's on-disk provenance does not match its class directory:${violations}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Real filesystem walk of `jail_dir`, compared for EXACT set equality against
+# `expected` (paths relative to `jail_dir`, one per remaining argument) — the
+# jail BUILDER's own file-set rule (see the section doc above). Anything the
+# jail carries that is not on the expected list is refused BY NAME (a host
+# file leaking in at a path `bundle_build_jail` never wrote — e.g. an
+# absolute-looking `usr/lib/libnccl.so.2` sitting outside `lib/` — is exactly
+# the shape a future regression in this builder would take), and anything
+# expected but absent is refused the same way `bundle_assert_staged` already
+# refuses a missing derivation file.
+bundle_assert_jail_file_set() {
+  local jail_dir="$1"
+  shift
+  local expected_nl
+  expected_nl="$(printf '%s\n' "$@")"
+  local actual_nl
+  actual_nl="$(cd "$jail_dir" && find . \( -type f -o -type l \) | sed 's#^\./##')"
+
+  local rel extra="" missing=""
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    if ! printf '%s\n' "$expected_nl" | grep -Fxq -- "$rel"; then
+      extra="${extra} ${rel}"
+    fi
+  done <<EOF
+$actual_nl
+EOF
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    if [ ! -e "${jail_dir}/${rel}" ]; then
+      missing="${missing} ${rel}"
+    fi
+  done <<EOF
+$expected_nl
+EOF
+
+  if [ -n "$extra" ]; then
+    echo "::error::bundle_cuda_libs.sh: the jail carries a file the builder never staged, outside the allowed set:${extra} — a host copy or stray path leaking into the jail defeats the whole 'nothing but what we staged' argument this arm exists to prove." >&2
+    return 1
+  fi
+  if [ -n "$missing" ]; then
+    echo "::error::bundle_cuda_libs.sh: the jail is missing a file the plan requires:${missing}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Verifies a captured JAIL report (`ci/scripts/jail_trace.py`'s tolerant
+# `LD_TRACE_LOADED_OBJECTS` trace, run inside the jail via `os.chroot` —
+# never `ld.so --list`, see that script's own doc for why — parsed by the
+# SAME `bundle_parse_loader_report` every other arm uses) against the
+# binary's own full `DT_NEEDED` names. STRICTER than `bundle_verify_loader_
+# resolution`'s rule: inside the jail there is no host copy left standing
+# to distinguish a bundled member from — every name resolves from a
+# jail-internal path this function pins down exactly, or it is a defect.
+# `loader_path` is the loader's OWN `PT_INTERP` path — it must sit there,
+# never an arbitrary name, and its self-reported RESOLVED path is checked
+# against exactly this value rather than exempted.
+#
+# The quantifier is EVERY LINE the report carries, not only the names in
+# the binary's OWN `DT_NEEDED` list — a member that is only a TRANSITIVE
+# dependency of a STAGED object (never the binary's own direct
+# `DT_NEEDED`) still appears in a real trace, and an unjudged line is
+# exactly how a jail missing that member (`libm.so.6 => not found`, the
+# binary genuinely cannot run) or leaking a host path for it (a driver
+# resolving from `/usr/lib64` when it is not itself a direct `DT_NEEDED`
+# entry) could slip through unjudged. Two passes over the SAME parsed
+# report:
+#
+#   PASS 1 (presence, closes a vacuous pass): every name in the
+#   binary's own `DT_NEEDED` set (`needed`, driver members exempted — a
+#   driver-less jail may not even print a line for one) must appear
+#   SOMEWHERE in the report, in ANY state. An empty, crashed, or
+#   `linux-vdso.so.1`-only report names none of them and fails here alone.
+#
+#   PASS 2 (the positive rule, over EVERY parsed line, not just
+#   `needed`): for each entry the report actually carries —
+#     - `linux-vdso.so.1` is an explicit, named CARVE-OUT, CONDITIONED
+#       exactly like the loader's own carve-out just below, never matched
+#       on the soname alone — matching on the name alone would let three
+#       spoofed shapes through unexamined: `linux-vdso.so.1 =>
+#       /usr/lib/evil.so`, `linux-vdso.so.1 => not found`, and
+#       `linux-vdso.so.1 => linux-vdso.so.1 (0x1)` — the third parses to
+#       the SAME (RESOLVED, "linux-vdso.so.1") pair the genuine no-`=>`
+#       self-line produces, so it is detected separately, off the RAW
+#       report text, never through the already-parsed triple alone.
+#       Exempt ONLY for the EXACT synthetic shape a real trace produces —
+#       a RESOLVED, no-`=>` self-line whose "path" IS the bare soname
+#       itself. Any OTHER state/path/shape for this name is NOT exempt and
+#       falls through to the SAME classification every other line gets,
+#       which refuses it.
+#     - the LOADER's own entry (`bundle_is_loader_soname`) is the other
+#       explicit carve-out: it must resolve, and its resolved path must
+#       equal `loader_path` EXACTLY (normalized — `bundle_normalize_path`)
+#       — a jail-construction bug that places or invokes it anywhere else
+#       is refused by name, never merely tolerated.
+#     - a DRIVER member (`bundle_is_driver_soname`) resolving AT ALL, from
+#       ANY line, is a FAIL — the jail deliberately staged none, so any
+#       resolution (whether or not the binary itself names it directly)
+#       proves the jail failed to exclude the host's copy.
+#     - EVERY OTHER line — bundle-able or platform, named directly by the
+#       binary or reached only transitively through a staged object — must
+#       resolve (`not found` is a FAIL by name, exactly as much a failure
+#       as a resolution from the wrong place) to a NORMALIZED path under
+#       the directory `bundle_build_jail` actually staged that CLASS of
+#       member into — `BUNDLE_JAIL_PLATFORM_DIR` for a platform member
+#       (`bundle_is_platform_soname`, the loader itself already consumed by
+#       the carve-out above), `BUNDLE_JAIL_LIB_DIR` for everything else
+#       (bundle-able) — read from the SAME two constants `bundle_build_jail`
+#       uses, never a literal restated here, so the two can never drift
+#       apart (a real jail built with platform copies under `/platform`
+#       correctly traces `libc.so.6 => /platform/libc.so.6`, and a
+#       verifier that only ever accepted `BUNDLE_JAIL_LIB_DIR` would fail
+#       that CORRECT jail). Normalized via `bundle_normalize_path` before
+#       the prefix check, so a value like `/lib/../usr/lib/x.so` (which a
+#       composed `DT_RUNPATH` could in principle produce) is judged by
+#       where it actually points, never by a bare textual prefix match
+#       that a `..` component defeats.
+#
+# `needed` (pass 1's presence set) is the binary's own full `DT_NEEDED`
+# set — this arm proves self-sufficiency for that set (plus whatever pass 2
+# additionally judges from the real trace). `libnvrtc-builtins` (floor-only,
+# `dlopen`'d, never a `DT_NEEDED` entry, never traced by any loader run — see
+# the module doc) is NOT in this set and stays UNPROVEN by this arm,
+# documented rather than silently assumed.
+bundle_verify_jail_report() {
+  local loader_path="$1"
+  local report="$2"
+  shift 2
+  local needed=("$@")
+  local parsed
+  parsed="$(printf '%s\n' "$report" | bundle_parse_loader_report)"
+
+  # The vDSO carve-out below must also
+  # reject a THIRD spoof shape — a `=>`-line whose reported PATH TEXT
+  # happens to equal the bare soname itself (`linux-vdso.so.1 =>
+  # linux-vdso.so.1 (0x1)`), which parses to the SAME (RESOLVED,
+  # "linux-vdso.so.1") pair the genuine no-`=>` self-line produces. A real
+  # trace never emits this shape (a REAL `=>` resolution always carries an
+  # ABSOLUTE path); detected directly off the RAW report text, since
+  # `bundle_parse_loader_report`'s output alone cannot distinguish "no `=>`
+  # at all" from "a `=>` whose path happens to read the same as the name".
+  local vdso_has_arrow=0
+  case "$report" in
+    *"linux-vdso.so.1 => "*) vdso_has_arrow=1 ;;
+  esac
+
+  # PASS 1 — presence over the binary's own DT_NEEDED set only.
+  local name found entry_soname entry_state entry_path
+  local absent=""
+  for name in "${needed[@]}"; do
+    if bundle_is_driver_soname "$name"; then
+      continue
+    fi
+    found=0
+    while IFS=' ' read -r entry_soname entry_state entry_path; do
+      [ -n "$entry_soname" ] || continue
+      if [ "$entry_soname" = "$name" ]; then
+        found=1
+      fi
+    done <<EOF
+$parsed
+EOF
+    if [ "$found" -eq 0 ]; then
+      absent="${absent} ${name}"
+    fi
+  done
+  if [ -n "$absent" ]; then
+    echo "::error::bundle_cuda_libs.sh: the jail report names no line at all for:${absent} — an empty, crashed, or vacuous report must fail this arm, never pass it." >&2
+    return 1
+  fi
+
+  # PASS 2 — the positive rule, over EVERY line the report actually carries.
+  local normalized_loader_path
+  normalized_loader_path="$(bundle_normalize_path "$loader_path")"
+  local unexpected_driver="" violations="" expected_dir
+  while IFS=' ' read -r entry_soname entry_state entry_path; do
+    [ -n "$entry_soname" ] || continue
+    # The vDSO carve-out is exempt ONLY for
+    # the EXACT synthetic shape a real trace produces — a RESOLVED, no-`=>`
+    # self-line whose "path" is the bare soname itself (`bundle_parse_
+    # loader_report`'s shape when there is no directory component at all:
+    # `linux-vdso.so.1 (0x...)` parses to soname==path==`linux-vdso.so.1`).
+    # Matching on the SONAME ALONE would let a SPOOFED line carrying
+    # that name in any other shape — `linux-vdso.so.1 => /usr/lib/evil.so`,
+    # `linux-vdso.so.1 => not found` — through unexamined. Conditioned
+    # exactly like the loader
+    # arm's own carve-out just below: any OTHER state/path for this name
+    # falls through to the SAME classification every other line gets
+    # (never a special vdso-only violation), which is enough to refuse it
+    # (an unresolvable/wrongly-placed bundle-able-shaped name).
+    if [ "$entry_soname" = "linux-vdso.so.1" ] && [ "$entry_state" = "RESOLVED" ] && [ "$entry_path" = "linux-vdso.so.1" ] && [ "$vdso_has_arrow" -eq 0 ]; then
+      continue
+    fi
+    if bundle_is_loader_soname "$entry_soname"; then
+      if [ "$entry_state" != "RESOLVED" ]; then
+        violations="${violations}
+  ${entry_soname} (the loader itself) has no resolved entry at all"
+      elif [ "$(bundle_normalize_path "$entry_path")" != "$normalized_loader_path" ]; then
+        violations="${violations}
+  ${entry_soname} (the loader itself) resolved from ${entry_path}, not its own PT_INTERP path ${loader_path}"
+      fi
+      continue
+    fi
+    if bundle_is_driver_soname "$entry_soname"; then
+      if [ "$entry_state" = "RESOLVED" ]; then
+        unexpected_driver="${unexpected_driver} ${entry_soname} (resolved ${entry_path})"
+      fi
+      continue
+    fi
+    if [ "$entry_state" != "RESOLVED" ]; then
+      violations="${violations}
+  ${entry_soname} not found (every non-driver, non-loader, non-vdso line must resolve)"
+      continue
+    fi
+    # Lead-probed fix: the expected directory is keyed by CLASS — a
+    # platform member (the loader already excluded above) is staged into
+    # `BUNDLE_JAIL_PLATFORM_DIR` by `bundle_build_jail`, never
+    # `BUNDLE_JAIL_LIB_DIR`; a bundle-able member is the reverse. Read from
+    # the same two constants `bundle_build_jail` itself uses (never a
+    # literal), so the builder and the verifier cannot drift apart again.
+    if bundle_is_platform_soname "$entry_soname"; then
+      expected_dir="$BUNDLE_JAIL_PLATFORM_DIR"
+    else
+      expected_dir="$BUNDLE_JAIL_LIB_DIR"
+    fi
+    case "$(bundle_normalize_path "$entry_path")" in
+      "${expected_dir}"/*) : ;;
+      *)
+        violations="${violations}
+  ${entry_soname} resolved from ${entry_path}, not ${expected_dir}" ;;
+    esac
+  done <<EOF
+$parsed
+EOF
+
+  if [ -n "$unexpected_driver" ]; then
+    echo "::error::bundle_cuda_libs.sh: a driver member resolved INSIDE the jail, where none was ever staged:${unexpected_driver} — this proves the jail did not actually exclude host driver copies, defeating the whole point of running under chroot." >&2
+    return 1
+  fi
+  if [ -n "$violations" ]; then
+    echo "::error::bundle_cuda_libs.sh: the jail resolved a member from the wrong place, or not found at all:${violations}" >&2
     return 1
   fi
   return 0

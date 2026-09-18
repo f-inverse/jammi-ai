@@ -1,0 +1,44 @@
+# captured: pending
+#
+# This file is a placeholder. The real jail report (`ci/scripts/
+# jail_trace.py`'s tolerant `LD_TRACE_LOADED_OBJECTS` trace, run inside a
+# real `chroot` jail by `.github/workflows/release-binaries.yml`'s
+# `server-cu12-build` job's `Package` step, uploaded as the
+# `cu12-jail-report` workflow artifact on EVERY dispatch/tag push — see that
+# step's own comment) has not yet been committed here.
+#
+# Once real, this file carries TWO sections, captured together from the
+# SAME lane run so they can never desync — the raw trace report, then a
+# line reading exactly
+#   # --- BINARY_NEEDED ---
+# then the binary's own measured `DT_NEEDED` list (`readelf -d`), one soname
+# per line, in link order — the exact set `bundle_verify_jail_report` judges
+# the report against.
+#
+# The report's RESOLVED lines are expected in TWO directories, never one —
+# every PLATFORM member (libc, libm, libpthread, ... —
+# bundle_is_platform_soname) resolves from BUNDLE_JAIL_PLATFORM_DIR
+# (`/platform`), and every BUNDLE-ABLE member (the CUDA runtime libraries
+# the derivation staged) resolves from BUNDLE_JAIL_LIB_DIR (`/lib`) — e.g.
+# `libc.so.6 => /platform/libc.so.6`, `libcudart.so.12 =>
+# /lib/libcudart.so.12`. A real capture showing a platform member resolved
+# from `/lib` reflects the wrong layout and must NOT be committed here
+# as-is.
+#
+# Two more line shapes the parser accepts, and the real capture should show:
+#   - the loader's own self line, no `=>` at all, its "path" the loader's
+#     real `PT_INTERP` path exactly (e.g.
+#     `/lib64/ld-linux-x86-64.so.2 (0x...)`), never a `=>` shape naming that
+#     path.
+#   - a driver member (`libcuda.so.1`, `libnvidia-*`) reported as
+#     `not found` (e.g. `libcuda.so.1 => not found`) — the jail deliberately
+#     ships with no driver copy, so every driver line in a correct capture
+#     reads this way; a driver line RESOLVED to any path is a defect, not a
+#     capture artifact to explain away.
+#
+# `ci/scripts/test_bundle_cuda_libs.sh` refuses to run at all against this
+# placeholder unless `BUNDLE_FIXTURE_PROVISIONAL=1` is set (the merge path
+# itself must NOT set it) — the intended effect: this suite stays red on
+# this file until the lead dispatches `release-binaries.yml` on a branch,
+# downloads the `cu12-jail-report` artifact, and commits its content in
+# place of this header.

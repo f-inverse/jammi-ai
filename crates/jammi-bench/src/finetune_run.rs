@@ -3595,22 +3595,13 @@ mod tests {
     /// The property is DIFFERENTIAL, never an absolute bound on the real
     /// training span: the same fixture runs twice in this process, once with
     /// the injected sleep at 0 and once at 250 ms, and `train_run_wall_s` may
-    /// grow between the two by less than one injected leg. A re-contaminated
-    /// field grows by both epoch legs' sleeps (2 × 250 ms); an honest one
-    /// grows only by run-to-run noise. An earlier revision asserted the
-    /// field is strictly less than one injected leg (`INJECTED_MS`)
-    /// outright, which is a claim about how fast the host trains this
-    /// fixture, not about the field's composition — it held on developer
-    /// hosts and on two CI rounds, then read nearly twice the injected leg
-    /// on a loaded shared runner (ci.yml run 35360837371) with the
-    /// composition unchanged; the exact readings are in the wave's rigor
-    /// record. This test prints its own two measurements on every run.
-    ///
-    /// RED evidence (executed by hand, reverted immediately after): moving
-    /// `let train_run_t0 = Instant::now();` back above
-    /// `train_rows.loader(..)` (F1's exact regression) makes this test fail
-    /// by name — `train_run_wall_s` grows by ~0.5 s between the two runs
-    /// against a 0.25 s allowance — proving it detects the F1 shape.
+    /// grow between the two by less than one injected leg. A field that
+    /// re-includes the loader build grows by both epoch legs' sleeps
+    /// (2 × 250 ms); an honest one grows only by run-to-run noise. An
+    /// absolute bound on the field would instead be a claim about how fast
+    /// the host trains this fixture, which a loaded shared runner breaks with
+    /// the field's composition unchanged. Both measurements are printed by
+    /// [`train_run_wall_s_excludes_the_loader_build`] on every run.
     #[tokio::test]
     async fn train_run_wall_s_excludes_the_loader_build() {
         const INJECTED_MS: u64 = 250;

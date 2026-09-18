@@ -7,6 +7,11 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### BREAKING
+- **A graph-sampled training set is a `pairs` / `triplet` training set (#591).** The
+  `graph_pairs` / `graph_triplet` format tags and `TrainingFormat::Graph` are removed: a graph
+  sample is one more producer of the pairs/triplet shape, and that the rows came from a graph
+  is recorded by the table's `GraphTrainingSet` descriptor. A graph training set's definition
+  hash changes with its format tag, so one materialised before this change is not reused.
 - **`jammi_db::storage::build_object_store` and `StorageRegistry::driver_for` are no
   longer public (#588).** No crate outside `jammi-db` can obtain a raw
   `Arc<dyn ObjectStore>` from the registry or the builder; `JammiObjectStore::{new, open,
@@ -141,7 +146,7 @@ workspace ships every publishable crate at the same
   rather than an ephemeral in-memory sample, so `recompute` can replay it
   and the sampler's resident adjacency/text is reserved against a named
   memory consumer for its whole lifetime. The training format
-  (`graph_pairs`/`graph_triplet`) is decided from `graph_hard_negatives`
+  (`pairs`/`triplet`) is decided from `graph_hard_negatives`
   alone; an anchor whose entire candidate pool falls inside its own
   `exclude_hops`-hop neighbourhood is refused, typed, naming the anchor,
   rather than silently trained with no negative. A `Peer` (multi-host)

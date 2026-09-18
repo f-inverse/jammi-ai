@@ -1763,14 +1763,14 @@ pub(crate) async fn materialize_graph_training_set(
     // CONFIG's own decision (`hard_negatives > 0`), not re-derived from any
     // particular row.
     let has_negatives = sample_config.hard_negatives > 0;
-    let format_tag = crate::fine_tune::data::TrainingFormat::Graph { has_negatives }.format_tag();
+    let format_tag = crate::fine_tune::data::TrainingFormat::in_batch(has_negatives).format_tag();
 
     let schema: SchemaRef = Arc::new(Schema::new(vec![
         Field::new("_ordinal", DataType::UInt64, false),
         Field::new("anchor", DataType::Utf8, false),
         Field::new("positive", DataType::Utf8, false),
         // Nullable: NULL for every row when `!has_negatives` (the
-        // `graph_pairs` format never carries one); GA3's sample-time
+        // `pairs` format never carries one); the sampler's sample-time
         // refusal guarantees every row carries `Some` when `has_negatives`
         // is true, so a `None` reaching here under that config would itself
         // be an engine-invariant breach — never silently written as an

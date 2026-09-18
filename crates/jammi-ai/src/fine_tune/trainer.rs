@@ -22,7 +22,7 @@ use crate::fine_tune::adamw::{AdamW, ParamsAdamW};
 use jammi_db::error::{JammiError, Result};
 
 use super::collective::{BlockingCall, Collective, Noop};
-use super::data::{TextChunk, TrainingDataLoader, TrainingFormat};
+use super::data::{TextChunk, TrainingDataLoader};
 use super::optimizer::{
     accumulate_grads, canonical_reduce, clip_and_step, DEFAULT_NORM_CHECK_INTERVAL,
 };
@@ -2266,49 +2266,34 @@ impl TrainingLoop {
                 job_id = %self.job_id,
                 "hard-negative mining produced no rows; training on original data this epoch"
             );
-            return Self::clone_text_loader(loader);
+            return Ok(Self::clone_text_loader(loader));
         }
         Ok(TrainingDataLoader::from_triplets(rows))
     }
 
     /// Re-materialise a text loader's in-batch-negative rows as a fresh loader,
     /// used as the mining fall-back. Pairs become a `Pairs` loader; triplets
-    /// keep their explicit negatives.
-    ///
-    /// Guarantees shape routing before any I/O: a loader with no
-    /// in-batch-negative SHAPE at all (`is_precomputed()`, or a format other
-    /// than `Pairs`/`Triplet`/`Graph`) takes the empty-triplets fallback
-    /// directly, without ever calling `in_batch_negative_texts`. Every format
-    /// admitted past that guard (`Pairs`, `Triplet`, and `Graph` — whose
-    /// `underlying()` is always `Pairs` or `Triplet`) is one
-    /// `in_batch_negative_texts` accepts, so its `Err` arm is unreachable here.
+    /// keep their explicit negatives; a loader with no in-batch-negative shape
+    /// (precomputed batches, or any other format) becomes the empty loader.
+    /// [`TrainingDataLoader::in_batch_negative_texts`] is the one authority on
+    /// which loaders have that shape, so this asks it rather than re-deriving
+    /// its answer.
     ///
     /// Not `&self` — this never reads trainer state.
-    fn clone_text_loader(loader: &TrainingDataLoader) -> Result<TrainingDataLoader> {
-        if loader.is_precomputed()
-            || !matches!(
-                loader.format(),
-                TrainingFormat::Pairs | TrainingFormat::Triplet | TrainingFormat::Graph { .. }
-            )
-        {
-            return Ok(TrainingDataLoader::from_triplets(Vec::new()));
-        }
-        match loader.in_batch_negative_texts().expect(
-            "the guard above admits only Pairs/Triplet/Graph, and Graph's underlying() is \
-             always Pairs or Triplet, so in_batch_negative_texts cannot return Err here",
-        ) {
-            (anchors, positives, Some(negatives)) => {
-                let rows = anchors
+    fn clone_text_loader(loader: &TrainingDataLoader) -> TrainingDataLoader {
+        match loader.in_batch_negative_texts() {
+            Ok((anchors, positives, Some(negatives))) => TrainingDataLoader::from_triplets(
+                anchors
                     .into_iter()
                     .zip(positives)
                     .zip(negatives)
                     .map(|((a, p), n)| (a, p, n))
-                    .collect();
-                Ok(TrainingDataLoader::from_triplets(rows))
+                    .collect(),
+            ),
+            Ok((anchors, positives, None)) => {
+                TrainingDataLoader::from_pairs(anchors.into_iter().zip(positives).collect())
             }
-            (anchors, positives, None) => Ok(TrainingDataLoader::from_pairs(
-                anchors.into_iter().zip(positives).collect(),
-            )),
+            Err(_no_in_batch_shape) => TrainingDataLoader::from_triplets(Vec::new()),
         }
     }
 
@@ -5807,7 +5792,7 @@ mod clone_text_loader_tests {
             ("a1".into(), "p1".into()),
             ("a2".into(), "p2".into()),
         ]);
-        let cloned = TrainingLoop::clone_text_loader(&loader).unwrap();
+        let cloned = TrainingLoop::clone_text_loader(&loader);
         assert_eq!(cloned.len(), 3, "the clone must carry every source row");
     }
 
@@ -5815,7 +5800,7 @@ mod clone_text_loader_tests {
     fn a_triplet_loader_keeps_its_explicit_negatives() {
         let loader =
             TrainingDataLoader::from_triplets(vec![("a0".into(), "p0".into(), "n0".into())]);
-        let cloned = TrainingLoop::clone_text_loader(&loader).unwrap();
+        let cloned = TrainingLoop::clone_text_loader(&loader);
         assert_eq!(cloned.len(), 1);
     }
 
@@ -5825,7 +5810,7 @@ mod clone_text_loader_tests {
     #[test]
     fn a_contrastive_loader_takes_the_empty_fallback_without_erroring() {
         let loader = TrainingDataLoader::from_contrastive(vec![("a".into(), "b".into(), 0.5)]);
-        let cloned = TrainingLoop::clone_text_loader(&loader).unwrap();
+        let cloned = TrainingLoop::clone_text_loader(&loader);
         assert_eq!(cloned.len(), 0);
     }
 
@@ -5833,7 +5818,7 @@ mod clone_text_loader_tests {
     #[test]
     fn a_precomputed_loader_takes_the_empty_fallback_without_erroring() {
         let loader = TrainingDataLoader::from_precomputed(Vec::<TrainingBatch>::new());
-        let cloned = TrainingLoop::clone_text_loader(&loader).unwrap();
+        let cloned = TrainingLoop::clone_text_loader(&loader);
         assert_eq!(cloned.len(), 0);
     }
 }

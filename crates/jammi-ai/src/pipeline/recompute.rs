@@ -673,10 +673,9 @@ impl InferenceSession {
                 table: table.table_name.clone(),
             });
         }
-        let expected_format = crate::fine_tune::data::TrainingFormat::Graph {
-            has_negatives: sample.hard_negatives > 0,
-        }
-        .format_tag();
+        let expected_format =
+            crate::fine_tune::data::TrainingFormat::in_batch(sample.hard_negatives > 0)
+                .format_tag();
         if task != jammi_db::model_task::ModelTask::TextEmbedding || format != expected_format {
             return Err(JammiError::FineTune(format!(
                 "table '{}': recorded task/format ({task:?}/{format}) do not match what this \

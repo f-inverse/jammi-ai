@@ -7,7 +7,7 @@
 //!    edge supervision. These run in milliseconds on tiny synthetic graphs.
 //! 2. **End-to-end session path** (`tiny_bert`): `fine_tune_graph` threads a
 //!    real graph (node CSV + edge CSV) through the existing trainer to a
-//!    completed job + saved adapter — proving `TrainingFormat::Graph` drives the
+//!    completed job + saved adapter — proving a graph sample drives the
 //!    MNRL/Triplet path with no new loss.
 //!
 //! ## Circularity — what is demonstrated vs documented
@@ -195,12 +195,7 @@ fn from_graph_loader_threads_pairs_and_triplet_shapes() {
     };
     let sampler = GraphSampler::build(nodes, edges, cfg).unwrap();
     let loader = TrainingDataLoader::from_graph(&sampler).unwrap();
-    assert!(matches!(
-        loader.format(),
-        TrainingFormat::Graph {
-            has_negatives: true
-        }
-    ));
+    assert!(matches!(loader.format(), TrainingFormat::Triplet));
     let (anchors, positives, negatives) = loader.in_batch_negative_texts().unwrap();
     assert_eq!(anchors.len(), positives.len());
     assert!(
@@ -217,12 +212,7 @@ fn from_graph_loader_threads_pairs_and_triplet_shapes() {
     };
     let sampler = GraphSampler::build(nodes, edges, cfg).unwrap();
     let loader = TrainingDataLoader::from_graph(&sampler).unwrap();
-    assert!(matches!(
-        loader.format(),
-        TrainingFormat::Graph {
-            has_negatives: false
-        }
-    ));
+    assert!(matches!(loader.format(), TrainingFormat::Pairs));
     let (_, _, negatives) = loader.in_batch_negative_texts().unwrap();
     assert!(
         negatives.is_none(),
@@ -853,8 +843,8 @@ async fn fine_tune_graph_materialises_a_graph_training_set_table() {
             assert_eq!(src_column, "src");
             assert_eq!(dst_column, "dst");
             assert_eq!(
-                format, "graph_triplet",
-                "hard_negatives=1 must record graph_triplet"
+                format, "triplet",
+                "hard_negatives=1 must record the triplet format"
             );
             assert_eq!(sample.hard_negatives, 1);
             assert_eq!(sample.seed, 11);
@@ -1214,7 +1204,7 @@ fn write_csv(dir: &std::path::Path, name: &str, header: &str, rows: &[(String, S
 
 /// `fine_tune_graph` reads a node source + a declared-edge source, samples the
 /// graph, and trains a real (tiny_bert) model to a completed job with a saved
-/// adapter — the integration proof that `TrainingFormat::Graph` threads through
+/// adapter — the integration proof that a graph sample threads through
 /// the existing trainer with no new loss.
 #[tokio::test(flavor = "multi_thread")]
 async fn fine_tune_graph_end_to_end_completes() {

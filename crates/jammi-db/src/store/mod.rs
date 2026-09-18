@@ -808,7 +808,7 @@ mod from_record_tests {
             "src",
             "dst",
             ModelTask::TextEmbedding,
-            "graph_pairs",
+            "pairs",
             manifest::GraphSampleFields {
                 seed: 7,
                 walk_length: 4,

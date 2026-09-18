@@ -451,8 +451,8 @@ pub struct GraphSampleFields {
     pub return_p_bits: u64,
     /// node2vec in-out parameter `q`, as `f64::to_bits()`.
     pub in_out_q_bits: u64,
-    /// Structure-aware hard negatives mined per pair (`0` = `graph_pairs`
-    /// format; `>= 1` = `graph_triplet`, GA3).
+    /// Structure-aware hard negatives mined per pair (`0` = the `pairs`
+    /// format; `>= 1` = `triplet`).
     pub hard_negatives: u64,
     /// Hops of the anchor's neighbourhood excluded from its negative pool.
     pub exclude_hops: u64,
@@ -795,8 +795,8 @@ pub enum ProducingDescriptor {
         /// The model task the sampled rows are read as.
         task: ModelTask,
         /// The training format the consumer parses the rows under
-        /// (`graph_pairs` / `graph_triplet`), as its canonical string tag —
-        /// decided from `sample.hard_negatives` (GA3).
+        /// (`pairs` / `triplet`), as its canonical string tag — decided from
+        /// `sample.hard_negatives`.
         format: String,
         /// The node2vec walk and structure-aware negative-sampling knobs.
         sample: GraphSampleFields,
@@ -2967,7 +2967,7 @@ mod tests {
             src_column: "src".into(),
             dst_column: "dst".into(),
             task: ModelTask::TextEmbedding,
-            format: "graph_triplet".into(),
+            format: "triplet".into(),
             sample: GraphSampleFields {
                 seed: 42,
                 walk_length: 4,
@@ -3026,7 +3026,7 @@ mod tests {
                 ("src_column", |f| f.src_column = "from".into()),
                 ("dst_column", |f| f.dst_column = "to".into()),
                 ("task", |f| f.task = ModelTask::Classification),
-                ("format", |f| f.format = "graph_pairs".into()),
+                ("format", |f| f.format = "pairs".into()),
                 ("sample.seed", |f| f.sample.seed = 7),
                 ("sample.walk_length", |f| f.sample.walk_length = 8),
                 ("sample.walks_per_node", |f| f.sample.walks_per_node = 6),

@@ -58,17 +58,15 @@ pub(crate) use crate::gang_fixtures::{
 pub(crate) fn graph_nodes() -> Vec<(String, String)> {
     ["a0", "a1", "a2", "b0", "b1", "b2"]
         .iter()
-        // Every node's text is distinct in-vocabulary tokens for the tiny test
-        // model: a text it tokenizes to `[UNK]` makes every sampled row the
-        // same row, and no order or shard fault could then change the bytes.
-        .map(|id| {
-            let (group, n) = (id.as_bytes()[0], id.as_bytes()[1] - b'0');
-            let text = format!(
-                "{} {n} {}",
-                group as char,
-                (group as u32 + n as u32 * 3) % 10
-            );
-            (id.to_string(), text)
+        .enumerate()
+        // Text the tiny model can tell apart, node from node: were two nodes
+        // one token sequence, every sampled row would be the same row, and no
+        // order or shard fault could change the bytes.
+        .map(|(index, id)| {
+            (
+                id.to_string(),
+                jammi_test_utils::tiny_vocab_text('g', index),
+            )
         })
         .collect()
 }

@@ -24,14 +24,16 @@ use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
 use jammi_db::storage::{StorageRegistry, StorageUrl};
 use jammi_db::store::{ArtifactStore, CachePolicy};
+use jammi_test_utils::tiny_vocab_text;
 use tempfile::TempDir;
 
-/// The U4b gang oracle's fixture (`trainer.rs`, `gang_determinism_oracle`):
-/// eight `(anchor, positive)` rows. Single-digit indices, so the file order
-/// and the training set's full-tuple order (`training_set_order_by`) agree.
+/// Eight `(anchor, positive)` rows the tiny model can tell apart — row from
+/// row, and anchor from positive (`tiny_vocab_text`). Single-digit indices, so
+/// the file order and the training set's full-tuple order
+/// (`training_set_order_by`) agree.
 pub(crate) fn pairs() -> Vec<(String, String)> {
     (0..8)
-        .map(|i| (format!("anchor text {i}"), format!("positive text {i}")))
+        .map(|i| (tiny_vocab_text('a', i), tiny_vocab_text('p', i)))
         .collect()
 }
 

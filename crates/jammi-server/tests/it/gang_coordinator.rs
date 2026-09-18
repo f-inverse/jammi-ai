@@ -505,15 +505,10 @@ fn graph_nodes_edges() -> (
     use jammi_ai::fine_tune::graph_sampler::{GraphEdge, TextNode};
     let n = 8;
     let nodes = (0..n)
-        // Every node's text is distinct in-vocabulary tokens for the tiny test
-        // model: a text it tokenizes to `[UNK]` makes every sampled row the
-        // same row, and no order or shard fault could then change the bytes.
-        .map(|i| {
-            TextNode::new(
-                format!("g{i}"),
-                format!("{i} {} {}", (i * 3 + 1) % 8, (i * 5 + 2) % 8),
-            )
-        })
+        // Text the tiny model can tell apart, node from node: were two nodes
+        // one token sequence, every sampled row would be the same row, and no
+        // order or shard fault could change the bytes.
+        .map(|i| TextNode::new(format!("g{i}"), jammi_test_utils::tiny_vocab_text('g', i)))
         .collect();
     let mut edges = Vec::new();
     for i in 0..n {

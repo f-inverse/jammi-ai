@@ -606,8 +606,8 @@ fn pod_leg_pairs() -> jammi_ai::fine_tune::data::TrainingDataLoader {
         (0..POD_LEG_TRAIN_ROWS)
             .map(|i| {
                 (
-                    format!("pod leg anchor text {i}"),
-                    format!("pod leg positive text {i}"),
+                    jammi_test_utils::tiny_vocab_text('a', i),
+                    jammi_test_utils::tiny_vocab_text('p', i),
                 )
             })
             .collect(),

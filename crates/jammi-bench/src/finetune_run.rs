@@ -3597,11 +3597,14 @@ mod tests {
     /// the injected sleep at 0 and once at 250 ms, and `train_run_wall_s` may
     /// grow between the two by less than one injected leg. A re-contaminated
     /// field grows by both epoch legs' sleeps (2 × 250 ms); an honest one
-    /// grows only by run-to-run noise. An earlier revision asserted
-    /// `train_run_wall_s < 0.25 s` outright, which is a claim about how fast
-    /// the host trains this fixture, not about the field's composition — it
-    /// held on developer hosts (~0.1-0.2 s) and on two CI rounds, then read
-    /// 0.44 s on a loaded shared runner with the composition unchanged.
+    /// grows only by run-to-run noise. An earlier revision asserted the
+    /// field is strictly less than one injected leg (`INJECTED_MS`)
+    /// outright, which is a claim about how fast the host trains this
+    /// fixture, not about the field's composition — it held on developer
+    /// hosts and on two CI rounds, then read nearly twice the injected leg
+    /// on a loaded shared runner (ci.yml run 35360837371) with the
+    /// composition unchanged; the exact readings are in the wave's rigor
+    /// record. This test prints its own two measurements on every run.
     ///
     /// RED evidence (executed by hand, reverted immediately after): moving
     /// `let train_run_t0 = Instant::now();` back above

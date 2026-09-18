@@ -505,12 +505,12 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
 /// one shared value. The macOS constant below is pinned from two repeated
 /// local runs (confirmed byte-stable, the same discipline
 /// [`gradcache_completes_at_w1_with_a_pinned_adapter_digest`]'s own doc
-/// states). The Linux constant has never been measured by this implementer —
-/// `MINING_ADAPTER_PRINTS` is `None` under `target_os = "linux"`, and the
-/// test FAILS BY NAME there (never `#[ignore]`d) until a CI run's own
-/// stdout — the `println!` below, printed BEFORE the assert on every run —
-/// is read and committed as the Linux constant. Until then this run's live
-/// mining-on-vs-off inequality (below) is the non-vacuity control this
+/// states). The Linux constant is pinned from the hermetic `Test` job's own
+/// stdout (ci.yml run 35334270497, x86_64 `ubuntu-latest`) — the `println!`
+/// below, printed BEFORE the assert on every run, is what it was read from;
+/// a divergence on a later runner fails BY NAME here (never `#[ignore]`d)
+/// and is the signal that the (arch, os) pair is not byte-stable after all.
+/// This run's live mining-on-vs-off inequality (below) is the non-vacuity control this
 /// module's doc names: #551's own oracle gap (an earlier attempted digest
 /// test set `hard_negatives.mine = true` with no `embedding_loss` at all, so
 /// `mining_eligible()` never admitted mining and flipping `mine` left the
@@ -519,14 +519,23 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
 async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it_unreached() {
     use jammi_ai::fine_tune::{EmbeddingLoss, HardNegativeConfig};
 
-    // Platform-specific, like `GRADCACHE_ADAPTER_PRINTS` above: `None` on
-    // Linux until the LEAD captures it from a CI run's stdout (this test's
-    // own `println!`, below) agreeing across TWO runs (this crate's CPU
-    // backprop is measured, not assumed, byte-identical within one
-    // (arch, os) pair — see ci.yml's K4 heterogeneity note); the macOS pair
-    // is pinned from two repeated local runs on this implementer's host.
+    // Platform-specific, like `GRADCACHE_ADAPTER_PRINTS` above: the Linux
+    // pair is captured from the hermetic CI job's stdout (this test's own
+    // `println!`, below; run 35334270497) and every later CI run re-measures
+    // it (this crate's CPU backprop is measured, not assumed, byte-identical
+    // within one (arch, os) pair); the macOS pair is pinned from two repeated
+    // local runs on this implementer's host.
     #[cfg(target_os = "linux")]
-    const MINING_ADAPTER_PRINTS: Option<&[(&str, &str)]> = None;
+    const MINING_ADAPTER_PRINTS: Option<&[(&str, &str)]> = Some(&[
+        ("adapter.safetensors", "1184:18ce9f6cfea22f83"),
+        ("adapter_config.json", "143:1feeeb6239c3fd30"),
+        ("checkpoint_1.safetensors", "1184:86dc3390a3a33369"),
+        ("checkpoint_2.safetensors", "1184:69b1749cb8a27123"),
+        ("checkpoint_3.safetensors", "1184:b35bf467ede2a8f5"),
+        ("checkpoint_4.safetensors", "1184:18ce9f6cfea22f83"),
+        ("checkpoint_best.safetensors", "1184:18ce9f6cfea22f83"),
+        ("manifest.json", "788:bb64db20eacab44a"),
+    ]);
     #[cfg(not(target_os = "linux"))]
     const MINING_ADAPTER_PRINTS: Option<&[(&str, &str)]> = Some(&[
         ("adapter.safetensors", "1184:94281422a73e9e84"),

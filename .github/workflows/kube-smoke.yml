@@ -103,6 +103,21 @@ jobs:
           echo "JAMMI_AUDIT_MASTER_KEY=${key}" >> "$GITHUB_ENV"
           echo "JAMMI_IMAGE=jammi-ai-server:pr" >> "$GITHUB_ENV"
 
+      # `ci/release-feature-manifest.json`'s `cpu-image` lane is the single
+      # source of truth for this build's cargo feature list (fed into the
+      # Dockerfile's `CARGO_FEATURES` build-arg, required — no default —
+      # since #507) — read here, same idiom as server-image.yml.
+      - name: Read release feature list (ci/release-feature-manifest.json)
+        id: manifest
+        run: |
+          set -euo pipefail
+          features="$(jq -r '.lanes["cpu-image"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          if [ -z "$features" ]; then
+            echo "::error::ci/release-feature-manifest.json produced an empty cpu-image cargo_features list" >&2
+            exit 1
+          fi
+          echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
+
       - name: Build the CPU image (load, no push)
         uses: ./.github/actions/docker-publish
         with:
@@ -111,6 +126,7 @@ jobs:
           local-tag: jammi-ai-server:pr
           build-args: |
             BASE_IMAGE=${{ needs.resolve-base.outputs.image }}
+            CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
           # No `platforms` input -- native (amd64, this job's own runner).
           # The docker exporter (what `load: true` uses) cannot carry
           # attestations on a stock daemon -- `sbom: false` is the one that

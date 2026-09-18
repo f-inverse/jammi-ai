@@ -124,10 +124,11 @@
     "SYNTACTIC there; `check_flash_attn_closure.py` re-derives the same fact",
     "from the real feature graph and skips a lane with no `capabilities`",
     "block by rule). Every build site for a CPU family reads its",
-    "`cargo_features` via `jq`, exactly like a CUDA family: nine call sites",
+    "`cargo_features` via `jq`, exactly like a CUDA family: eleven call sites",
     "across six lanes (`.github/workflows/pypi-server.yml:75`,",
-    "`pypi-server-cuda.yml:83`, `release-binaries.yml:310`/`:465`, and",
-    "`server-image.yml:149`/`:415`/`:660`/`:770`/`:850`). No gate examines",
+    "`pypi-server-cuda.yml:83`, `release-binaries.yml:310`/`:465`,",
+    "`server-image.yml:149`/`:415`/`:660`/`:770`/`:850`, and the two load-only",
+    "smoke builds `kube-smoke.yml:114`/`compose-smoke.yml:107`). No gate examines",
     "whether a workflow scalar (a `build-args:` value, a `--features=`/`-F`",
     "invocation, a `workflow_call`/composite-action input default, or any",
     "other shape) reads one of these sites rather than a literal — that is a",
@@ -292,7 +293,7 @@
     },
     "cpu-image": {
       "_doc": "The `jammi-ai-server` container image's `runtime-generic`/`runtime-selfcontained` stages (CPU `builder` Dockerfile stage), published by `.github/workflows/server-image.yml`. No `capabilities` block (#507).",
-      "workflow": ".github/workflows/server-image.yml:build-and-push-main / build-and-push / build-and-push-selfcontained (Dockerfile builder stage)",
+      "workflow": ".github/workflows/server-image.yml:build-and-push-main / build-and-push / build-and-push-selfcontained (Dockerfile builder stage); .github/workflows/kube-smoke.yml and compose-smoke.yml (load-only smoke builds of the same builder stage)",
       "package": "jammi-server",
       "cargo_features": [
         "jetstream-broker",

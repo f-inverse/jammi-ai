@@ -49,14 +49,13 @@ impl FromStr for ResultTableStatus {
 /// Status of a job (`jobs.status`) — every kind-agnostic unit of work the
 /// catalog's claim/lease/reclaim machinery drives
 /// ([`crate::catalog::jobs_repo`]), training and compute alike. `Queued` and
-/// `Running` are non-terminal; `Completed` and `Failed` are terminal — the
-/// two states [`crate::catalog::jobs_repo::JobRecord::is_terminal`] and the
-/// retention age-predicate ([`crate::catalog::model_repo`]'s `REFERENCE_EDGES`)
-/// both key on. `Failed` is additionally TERMINAL-UNSUCCESSFUL
-/// ([`Self::is_terminal_unsuccessful`]). A `Cancelled` variant is NOT
-/// declared here: a status with no writer is dead vocabulary — it belongs
-/// with whatever unit actually retires a row to it (the deferred #515 job-
-/// dependency graph), not ahead of that writer landing.
+/// `Running` are non-terminal; `Completed`, `Failed` and `Cancelled` are
+/// terminal — the states [`crate::catalog::jobs_repo::JobRecord::is_terminal`]
+/// and the retention age-predicate ([`crate::catalog::model_repo`]'s
+/// `REFERENCE_EDGES`) both key on. `Failed` and `Cancelled` are additionally
+/// TERMINAL-UNSUCCESSFUL ([`Self::is_terminal_unsuccessful`]): the job did not
+/// produce its result, because it could not (`Failed`) or because it was asked
+/// not to (`Cancelled`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, VariantArray)]
 pub enum JobStatus {
     /// Job created, waiting to be claimed.
@@ -65,16 +64,20 @@ pub enum JobStatus {
     Running,
     /// Finished successfully.
     Completed,
-    /// Finished unsuccessfully (error, divergence, lease exhaustion, cancel).
+    /// Finished unsuccessfully (error, divergence, lease exhaustion).
     Failed,
+    /// Stopped because a cancel was requested: a queued job retired before
+    /// any worker claimed it, or a running one that honoured the request at a
+    /// checkpoint.
+    Cancelled,
 }
 
 impl JobStatus {
-    /// Whether this status is terminal (`Completed` or `Failed`) — a row in
-    /// either state accepts no further lease-guarded write and is eligible
+    /// Whether this status is terminal (`Completed`, `Failed` or `Cancelled`)
+    /// — a row in any of them accepts no further lease-guarded write and is eligible
     /// for retention once past `[jobs] retention_days`.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Failed)
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
 
     /// Whether this status is terminal AND unsuccessful (`Failed`) — DERIVED
@@ -131,22 +134,21 @@ impl fmt::Display for JobStatus {
             Self::Running => write!(f, "running"),
             Self::Completed => write!(f, "completed"),
             Self::Failed => write!(f, "failed"),
+            Self::Cancelled => write!(f, "cancelled"),
         }
     }
 }
 
 impl FromStr for JobStatus {
     type Err = JammiError;
+    /// The inverse of [`Display`](fmt::Display) over [`Self::ALL`], so the
+    /// vocabulary is spelled once.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "queued" => Ok(Self::Queued),
-            "running" => Ok(Self::Running),
-            "completed" => Ok(Self::Completed),
-            "failed" => Ok(Self::Failed),
-            other => Err(JammiError::Catalog(format!(
-                "Unknown job status: '{other}'"
-            ))),
-        }
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|status| status.to_string() == s)
+            .ok_or_else(|| JammiError::Catalog(format!("Unknown job status: '{s}'")))
     }
 }
 
@@ -262,11 +264,12 @@ mod tests {
         }
         assert_eq!(
             JobStatus::ALL.len(),
-            4,
+            5,
             "every declared JobStatus variant is in ALL"
         );
         assert_eq!(JobStatus::Failed.to_string(), "failed");
-        assert!(JobStatus::from_str("cancelled").is_err());
+        assert_eq!(JobStatus::Cancelled.to_string(), "cancelled");
+        assert!(JobStatus::from_str("canceled").is_err());
     }
 
     #[test]
@@ -275,6 +278,10 @@ mod tests {
         assert!(!JobStatus::Running.is_terminal());
         assert!(JobStatus::Completed.is_terminal());
         assert!(JobStatus::Failed.is_terminal());
+        assert!(JobStatus::Cancelled.is_terminal());
+        assert!(JobStatus::Failed.is_terminal_unsuccessful());
+        assert!(JobStatus::Cancelled.is_terminal_unsuccessful());
+        assert!(!JobStatus::Completed.is_terminal_unsuccessful());
     }
 
     #[test]

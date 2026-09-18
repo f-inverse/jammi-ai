@@ -502,7 +502,11 @@ async fn ring_read_cost_is_measured_at_100_and_10k_instance_rows() {
         .await
         .unwrap();
         let baseline_elapsed = baseline_start.elapsed();
-        assert_eq!(baseline.len(), ring.len(), "the baseline transfers exactly the ring's row count");
+        assert_eq!(
+            baseline.len(),
+            ring.len(),
+            "the baseline transfers exactly the ring's row count"
+        );
         let bound = baseline_elapsed * 4 + Duration::from_millis(2);
         eprintln!(
             "RENDEZVOUS RV6: plain transfer of {} rows took {baseline_elapsed:?}; bound {bound:?}",

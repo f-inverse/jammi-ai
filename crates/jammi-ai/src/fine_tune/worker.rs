@@ -178,7 +178,7 @@ use crate::fine_tune::graph_sampler::{
 };
 use crate::fine_tune::partition::{PartitionRule, PartitionSpec};
 use crate::fine_tune::role::{LeaseHolder, RunnerRole};
-use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
+use crate::fine_tune::spec::{TrainingCommon, TrainingPlan, TrainingSetProducer, TrainingSpec};
 use crate::fine_tune::trainer::RankContext;
 use crate::fine_tune::training_set;
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
@@ -3964,18 +3964,14 @@ impl JobWorker {
         recorded_pair: Option<TrainingSetIdentityPair>,
         holder: LeaseHolder,
     ) -> std::result::Result<TrainedArtifact, WorkerJobError> {
-        match spec {
+        let kind = spec.kind();
+        match spec.plan() {
             // Every kind that trains from a training-set table. The kinds
-            // differ in ONE step — how the table is produced (a projection of
-            // a source, or a sample of a graph); from the table on there is one
-            // path, so every topology serves every such kind. (`FineTune`'s
-            // `cache = USE` is refused at `admit_training_spec`, so nothing
-            // here branches on it.)
-            spec @ (TrainingSpec::FineTune { .. } | TrainingSpec::GraphFineTune { .. }) => {
-                let kind = spec.kind();
-                let view = spec
-                    .training_set_view()
-                    .expect("both kinds in this arm train from a training-set table");
+            // differ in ONE step — how the table is produced
+            // (`view.producer`); from the table on there is one path, so every
+            // topology serves every such kind. (`FineTune`'s `cache = USE` is
+            // refused at `admit_training_spec`, so nothing here branches on it.)
+            TrainingPlan::FromTrainingSet(view) => {
                 let (columns, task, common) = (view.columns, view.task, view.common.clone());
                 let detected =
                     detect_training_format(&columns, task).map_err(WorkerJobError::from)?;
@@ -3985,14 +3981,14 @@ impl JobWorker {
                 // materialises (or reuses on the engine's own key). The rows a
                 // run trains on are a durable, attested artifact, not this
                 // worker's private scan.
-                let table = match (&recorded_pair, &spec) {
+                let table = match (&recorded_pair, &view.producer) {
                     (Some(pair), _) => {
                         bind_recorded_training_set(session, catalog, pair)
                             .await
                             .map_err(WorkerJobError::from)?
                             .0
                     }
-                    (None, TrainingSpec::FineTune { source, .. }) => {
+                    (None, TrainingSetProducer::Projection { source, .. }) => {
                         training_set::materialize_projection_table(
                             session,
                             source,
@@ -4005,10 +4001,9 @@ impl JobWorker {
                     }
                     (
                         None,
-                        TrainingSpec::GraphFineTune {
+                        TrainingSetProducer::GraphSample {
                             sources,
                             sample_config,
-                            ..
                         },
                     ) => {
                         let now = chrono::Utc::now().to_rfc3339();
@@ -4025,9 +4020,6 @@ impl JobWorker {
                         )
                         .await
                         .map_err(WorkerJobError::from)?
-                    }
-                    (None, TrainingSpec::ContextPredictor { .. }) => {
-                        unreachable!("the arm's pattern admits no context predictor")
                     }
                 };
 
@@ -4089,10 +4081,10 @@ impl JobWorker {
                     training_set_ref: training_set_artifact_digest.clone(),
                     training_set_location: table.table_name().to_string(),
                 };
-                let materialization_source = match &spec {
-                    TrainingSpec::FineTune { source, method, .. } => {
+                let materialization_source = match &view.producer {
+                    TrainingSetProducer::Projection { source, method } => {
                         Some(FineTuneMaterializationSource {
-                            source: source.clone(),
+                            source: source.to_string(),
                             columns: columns.clone(),
                             method: *method,
                             training_set_definition_hash: table
@@ -4103,7 +4095,9 @@ impl JobWorker {
                             training_set_row_count: table.row_count() as u64,
                         })
                     }
-                    _ => None,
+                    // A graph sample has no `source`/`method` for the descriptor's
+                    // fields to name.
+                    TrainingSetProducer::GraphSample { .. } => None,
                 };
                 let topology = TopologyDecision::decide(
                     common.world_size,
@@ -4152,7 +4146,7 @@ impl JobWorker {
                     }
                 }
             }
-            TrainingSpec::ContextPredictor {
+            TrainingPlan::ContextPredictor {
                 source,
                 predictor_spec,
             } => {
@@ -4181,7 +4175,7 @@ impl JobWorker {
                 // tenant-pinned catalog (the same path the fine-tune kinds take),
                 // so the model lands under the job's tenant.
                 session
-                    .run_context_predictor_training(&source, &predictor_spec, cancel)
+                    .run_context_predictor_training(source, predictor_spec, cancel)
                     .await
                     .map_err(|e| classify(cancel, e))
             }
@@ -7933,8 +7927,7 @@ pub mod training_test_hooks {
     }
 
     /// One recorded `training_set_graph_sample` reservation size, keyed by
-    /// job — GA7's oracle (issue #538): the bytes `materialize_graph_training_set`
-    /// actually reserved against the NAMED `MemoryConsumer`, so a test can
+    /// job: the bytes `materialize_graph_training_set` actually reserved against the NAMED `MemoryConsumer`, so a test can
     /// assert it against an independently computed lower bound rather than
     /// trust the reservation call succeeded silently.
     struct GraphReservationProbe {

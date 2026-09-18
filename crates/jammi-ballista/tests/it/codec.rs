@@ -368,6 +368,37 @@ async fn mask_exec_is_refused_typed() {
     );
 }
 
+/// RS6 (#540 RANGESPLIT), the contract's stop-rule exit: `OrdinalSplitExec`
+/// gets the SAME v1-cut treatment as `MaskExec` above — no `NodeTag`, no
+/// `plan.proto` message, no encode/decode arm — so a plan containing it
+/// (only ever built when `InferenceConfig::partitions > 1`; the default `1`
+/// never inserts this node) is refused typed rather than silently
+/// mis-encoded or handed to Ballista's own delegate (which does not know it
+/// either). See `jammi_ballista::codec`'s module doc for WHY: in Ballista
+/// 54.1 a `SortPreservingMergeExec` is a stage boundary, so the N-partition
+/// `InferenceExec(OrdinalSplitExec)` this node feeds would become its own
+/// stage of N tasks each executing ONE partition, in general in a separate
+/// process — this node's in-process shared-mutex mechanism has no meaning
+/// across that split.
+#[tokio::test]
+async fn ordinal_split_exec_is_refused_typed() {
+    let input = string_scan("id", &["a"]);
+    let node = jammi_ai::operator::ordinal_split_exec::OrdinalSplitExec::new(input, 2)
+        .expect("OrdinalSplitExec builds over a plain scan");
+    let session = session().await;
+    let codec = JammiCodec::new(&session);
+    let mut buf = Vec::new();
+    let err = codec
+        .try_encode(Arc::new(node), &mut buf)
+        .expect_err("OrdinalSplitExec must be refused, never silently encoded");
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("unsupported")
+            || msg.to_lowercase().contains("ordinalsplitexec"),
+        "refusal must name the node: {msg}"
+    );
+}
+
 /// A plain in-memory scan is unknown to jammi's codec (not one of the four
 /// jammi node types) AND unknown to Ballista's delegate (not one of its
 /// shuffle/coalesce/chaos node types) — the delegation-then-typed-refusal

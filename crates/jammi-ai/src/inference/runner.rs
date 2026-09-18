@@ -10,7 +10,7 @@ use tokio::sync::mpsc::Sender;
 
 use super::adapter::{create_adapter, BackendOutput, OutputAdapter};
 use super::observer::InferenceObserver;
-use super::schema::build_prefix_columns;
+use super::schema::{build_prefix_columns, extract_or_generate_ordinals};
 use super::{extract_column, extract_columns, slice_columns};
 use crate::model::cache::ModelCache;
 use crate::model::oom::is_oom_message;
@@ -41,6 +41,14 @@ pub struct InferenceRunner {
     /// Input columns copied verbatim to the end of every emitted sub-batch
     /// (see `schema::build_output_schema`'s `passthrough`).
     passthrough: Vec<String>,
+    /// RS7: the per-device admission bounding how many `forward()` calls run
+    /// concurrently across every partition of the SAME `InferenceExec`
+    /// (shared via one `Arc` across the `N` `InferenceRunner`s
+    /// `InferenceExec::execute` builds — one per partition). `None` is the
+    /// unrestricted default for a caller that never opts in (this runner's
+    /// own unit tests below): forward calls proceed with no admission gate,
+    /// exactly as every release before this bound existed.
+    forward_permits: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// Test-only observability: a process-global count of `forward()` calls,
@@ -85,6 +93,59 @@ pub mod test_hooks {
             .expect("forward-call table poisoned")
             .insert(source_id.to_string(), 0);
     }
+
+    /// RS7's oracle: the peak number of `forward()` calls observed IN FLIGHT
+    /// SIMULTANEOUSLY over `source_id` since the last reset, so a test can
+    /// prove the per-device forward permit (`InferenceRunner::
+    /// with_forward_permits`) actually bounds concurrency rather than merely
+    /// existing. Keyed by `source_id` for the same reason as
+    /// [`forward_calls_for`] — parallel sibling tests in one binary.
+    static CONCURRENT_FORWARDS: OnceLock<Mutex<HashMap<String, (u64, u64)>>> = OnceLock::new();
+
+    fn concurrency_table() -> &'static Mutex<HashMap<String, (u64, u64)>> {
+        CONCURRENT_FORWARDS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Record one more forward call entering `source_id`'s critical section
+    /// (AFTER its permit, if any, is acquired), updating the running peak.
+    pub(super) fn enter_forward(source_id: &str) {
+        let mut t = concurrency_table()
+            .lock()
+            .expect("forward-concurrency table poisoned");
+        let entry = t.entry(source_id.to_string()).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 = entry.1.max(entry.0);
+    }
+
+    /// The peer of [`enter_forward`]: one forward call over `source_id` has
+    /// returned (its permit, if any, is about to release).
+    pub(super) fn exit_forward(source_id: &str) {
+        let mut t = concurrency_table()
+            .lock()
+            .expect("forward-concurrency table poisoned");
+        if let Some(entry) = t.get_mut(source_id) {
+            entry.0 = entry.0.saturating_sub(1);
+        }
+    }
+
+    /// The maximum number of `forward()` calls observed in flight
+    /// simultaneously over `source_id` since the last reset.
+    pub fn peak_concurrent_forwards_for(source_id: &str) -> u64 {
+        concurrency_table()
+            .lock()
+            .expect("forward-concurrency table poisoned")
+            .get(source_id)
+            .map(|&(_, peak)| peak)
+            .unwrap_or(0)
+    }
+
+    /// Reset `source_id`'s concurrency counter and peak to zero.
+    pub fn reset_forward_concurrency_for(source_id: &str) {
+        concurrency_table()
+            .lock()
+            .expect("forward-concurrency table poisoned")
+            .insert(source_id.to_string(), (0, 0));
+    }
 }
 
 /// Everything needed to shape a successful forward's raw output into a
@@ -127,6 +188,7 @@ impl InferenceRunner {
             batch_size,
             observer,
             passthrough: Vec::new(),
+            forward_permits: None,
         }
     }
 
@@ -134,6 +196,13 @@ impl InferenceRunner {
     /// sub-batch, in this order (after the task columns).
     pub fn with_passthrough(mut self, passthrough: Vec<String>) -> Self {
         self.passthrough = passthrough;
+        self
+    }
+
+    /// Bound `forward()` concurrency across every partition sharing this
+    /// semaphore (RS7). See `forward_permits`'s field doc.
+    pub fn with_forward_permits(mut self, permits: Arc<tokio::sync::Semaphore>) -> Self {
+        self.forward_permits = Some(permits);
         self
     }
 
@@ -181,10 +250,10 @@ impl InferenceRunner {
         // (the cursor loop replaced the old `step_by`, which panicked on 0) — a
         // silent hang is worse than a loud error, so treat 0 as 1.
         let mut current_batch_size = self.batch_size.max(1);
-        // `_ordinal`'s running counter: one sequence for this WHOLE `run`
-        // invocation (this operator is `Partitioning::UnknownPartitioning(1)`
-        // — exactly one stream, never reset per input batch or per
-        // OOM-halved sub-batch). See `schema::common_prefix_fields`'s doc.
+        // `_ordinal`'s fallback running counter: only advanced by
+        // `extract_or_generate_ordinals` on the arm where THIS partition's
+        // input carries no `_ordinal` column of its own (no `OrdinalSplitExec`
+        // below — see that function's doc and `schema::common_prefix_fields`).
         let mut next_ordinal: u64 = 0;
         let model_label = self.source.to_string();
         let task = self.task;
@@ -200,6 +269,7 @@ impl InferenceRunner {
             let content = extract_columns(&input_batch, &self.content_columns)?;
             let keys = extract_column(&input_batch, &self.key_column)?;
             let passthrough = extract_columns(&input_batch, &self.passthrough)?;
+            let ordinals = extract_or_generate_ordinals(&input_batch, &mut next_ordinal);
 
             let ctx = OutputContext {
                 output_schema,
@@ -214,10 +284,11 @@ impl InferenceRunner {
                 &content,
                 &keys,
                 &passthrough,
+                &ordinals,
                 &mut current_batch_size,
-                &mut next_ordinal,
                 &ctx,
                 tx,
+                self.forward_permits.as_ref(),
                 |chunk_content| model.forward(chunk_content, task),
             )
             .await?;
@@ -248,10 +319,11 @@ impl InferenceRunner {
         content: &[ArrayRef],
         keys: &ArrayRef,
         passthrough: &[ArrayRef],
+        ordinals: &ArrayRef,
         current_batch_size: &mut usize,
-        next_ordinal: &mut u64,
         ctx: &OutputContext<'_>,
         tx: &Sender<datafusion::error::Result<RecordBatch>>,
+        permits: Option<&Arc<tokio::sync::Semaphore>>,
         mut forward: F,
     ) -> Result<()>
     where
@@ -265,11 +337,29 @@ impl InferenceRunner {
             let chunk_content = slice_columns(content, chunk_start, chunk_len);
             let chunk_keys = keys.slice(chunk_start, chunk_len);
             let chunk_passthrough = slice_columns(passthrough, chunk_start, chunk_len);
+            let chunk_ordinals = ordinals.slice(chunk_start, chunk_len);
 
             let start = Instant::now();
+            // RS7: acquire this device's forward admission BEFORE the model
+            // is ever invoked, and hold it for the whole forward call — an
+            // OOM-halving retry below re-acquires on its next loop iteration,
+            // never holding the permit across the halving decision itself.
+            let _permit = match permits {
+                Some(sem) => Some(sem.clone().acquire_owned().await.map_err(|_| {
+                    JammiError::Inference("forward permit semaphore closed".into())
+                })?),
+                None => None,
+            };
             #[cfg(feature = "test-hooks")]
-            test_hooks::record_forward(ctx.source_id);
-            match forward(&chunk_content) {
+            {
+                test_hooks::record_forward(ctx.source_id);
+                test_hooks::enter_forward(ctx.source_id);
+            }
+            let forward_result = forward(&chunk_content);
+            #[cfg(feature = "test-hooks")]
+            test_hooks::exit_forward(ctx.source_id);
+            drop(_permit);
+            match forward_result {
                 Ok(raw_output) => {
                     let latency_ms = start.elapsed().as_secs_f32() * 1000.0;
                     let output_batch = Self::build_output_batch(
@@ -279,7 +369,7 @@ impl InferenceRunner {
                         &raw_output,
                         chunk_len,
                         latency_ms,
-                        *next_ordinal,
+                        &chunk_ordinals,
                     )?;
 
                     if let Some(obs) = ctx.observer {
@@ -290,12 +380,6 @@ impl InferenceRunner {
                         // Receiver dropped (query cancelled).
                         return Ok(());
                     }
-                    // Advance the SAME counter `build_output_batch` just read
-                    // — only on a batch that was actually sent (never on the
-                    // OOM-retry arm below, which resends this identical
-                    // slice at a smaller size: retried rows must reuse the
-                    // ordinals their failed attempt never emitted).
-                    *next_ordinal += chunk_len as u64;
                     chunk_start += chunk_len;
                 }
                 Err(e) if Self::is_oom_error(&e) && *current_batch_size > 1 => {
@@ -343,17 +427,18 @@ impl InferenceRunner {
         raw_output: &BackendOutput,
         row_count: usize,
         latency_ms: f32,
-        ordinal_start: u64,
+        ordinals: &ArrayRef,
     ) -> Result<RecordBatch> {
         let prefix = build_prefix_columns(
             keys,
+            ctx.key_column,
             ctx.source_id,
             ctx.model_label,
             &raw_output.row_status,
             &raw_output.row_errors,
             latency_ms,
             row_count,
-            ordinal_start,
+            ordinals,
         )?;
         // Defensive only: `KeyCheckExec` below the blocking sort refuses a
         // null key before any row reaches this runner, so this is unreachable
@@ -506,7 +591,8 @@ mod tests {
             key_column: "id",
         };
         let mut current_batch_size = 100;
-        let mut next_ordinal = 0u64;
+        let batch_ordinals: ArrayRef =
+            Arc::new((0..row_count as u64).collect::<arrow::array::UInt64Array>());
         let oom_threshold = 64;
 
         let (tx, rx) = tokio::sync::mpsc::channel(row_count);
@@ -514,10 +600,11 @@ mod tests {
             &content,
             &keys,
             &[],
+            &batch_ordinals,
             &mut current_batch_size,
-            &mut next_ordinal,
             &ctx,
             &tx,
+            None,
             |chunk| {
                 let len = chunk[0].len();
                 if len > oom_threshold {
@@ -563,7 +650,8 @@ mod tests {
             key_column: "id",
         };
         let mut current_batch_size = 100;
-        let mut next_ordinal = 0u64;
+        let batch_ordinals: ArrayRef =
+            Arc::new((0..row_count as u64).collect::<arrow::array::UInt64Array>());
         let oom_threshold = 64;
 
         let (tx, rx) = tokio::sync::mpsc::channel(row_count);
@@ -571,10 +659,11 @@ mod tests {
             &content,
             &keys,
             &[],
+            &batch_ordinals,
             &mut current_batch_size,
-            &mut next_ordinal,
             &ctx,
             &tx,
+            None,
             |chunk| {
                 let len = chunk[0].len();
                 if len > oom_threshold {
@@ -619,17 +708,19 @@ mod tests {
             key_column: "id",
         };
         let mut current_batch_size = 4;
-        let mut next_ordinal = 0u64;
+        let batch_ordinals: ArrayRef =
+            Arc::new((0..row_count as u64).collect::<arrow::array::UInt64Array>());
 
         let (tx, _rx) = tokio::sync::mpsc::channel(row_count);
         let result = InferenceRunner::run_chunks(
             &content,
             &keys,
             &[],
+            &batch_ordinals,
             &mut current_batch_size,
-            &mut next_ordinal,
             &ctx,
             &tx,
+            None,
             |_chunk| Err(JammiError::Inference("out of memory".into())),
         )
         .await;
@@ -663,17 +754,19 @@ mod tests {
             key_column: "id",
         };
         let mut current_batch_size = 4;
-        let mut next_ordinal = 0u64;
+        let batch_ordinals: ArrayRef =
+            Arc::new((0..row_count as u64).collect::<arrow::array::UInt64Array>());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(row_count);
         let result = InferenceRunner::run_chunks(
             &content,
             &keys,
             &[],
+            &batch_ordinals,
             &mut current_batch_size,
-            &mut next_ordinal,
             &ctx,
             &tx,
+            None,
             |_chunk| Err(JammiError::Inference("shape mismatch".into())),
         )
         .await;
@@ -687,6 +780,172 @@ mod tests {
         assert!(
             rx.recv().await.is_none(),
             "a systemic failure must not emit any output batch"
+        );
+    }
+
+    /// RS7: `forward()` concurrency across partitions is bounded by the
+    /// shared per-device permit, never by accident of scheduling. Four
+    /// concurrent `run_chunks` callers (simulating `N=4` partitions of one
+    /// `InferenceExec` sharing one `Arc<Semaphore>`, as
+    /// `InferenceExec::execute` wires it) each sleep on a REAL OS thread
+    /// while "forwarding", so overlapping calls are actually observable —
+    /// a synchronous sleep, not `tokio::time::sleep`, because the injected
+    /// `forward` closure is sync and must genuinely occupy a worker thread
+    /// for overlap to be possible at all. Verified by passing `None` instead
+    /// of `Some(&permits)`: this test goes RED (`peak_concurrent_forwards_for`
+    /// observes 4 concurrent forwards, exceeding the 2-permit bound the
+    /// assertion checks).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn run_chunks_bounds_concurrent_forwards_to_the_shared_permit() {
+        let source_id = "rs7-concurrency-test-source";
+        #[cfg(feature = "test-hooks")]
+        test_hooks::reset_forward_concurrency_for(source_id);
+
+        let permits = Arc::new(tokio::sync::Semaphore::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let permits = Arc::clone(&permits);
+            handles.push(tokio::spawn(async move {
+                let row_count = 2;
+                let keys = test_keys(row_count);
+                let content = test_content(row_count);
+                let adapter = EmbeddingAdapter::new(1);
+                let output_schema = test_output_schema();
+                let ctx = OutputContext {
+                    output_schema: &output_schema,
+                    adapter: &adapter,
+                    source_id: "rs7-concurrency-test-source",
+                    model_label: "test-model",
+                    observer: None,
+                    key_column: "id",
+                };
+                let ordinals: ArrayRef =
+                    Arc::new((0..row_count as u64).collect::<arrow::array::UInt64Array>());
+                let mut current_batch_size = row_count;
+                let (tx, mut rx) = tokio::sync::mpsc::channel(row_count);
+                InferenceRunner::run_chunks(
+                    &content,
+                    &keys,
+                    &[],
+                    &ordinals,
+                    &mut current_batch_size,
+                    &ctx,
+                    &tx,
+                    Some(&permits),
+                    |chunk| {
+                        std::thread::sleep(std::time::Duration::from_millis(40));
+                        Ok(fake_backend_output(chunk[0].len()))
+                    },
+                )
+                .await
+                .unwrap();
+                drop(tx);
+                while rx.recv().await.is_some() {}
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        #[cfg(feature = "test-hooks")]
+        {
+            let peak = test_hooks::peak_concurrent_forwards_for(source_id);
+            assert!(
+                peak <= 2,
+                "peak concurrent forwards {peak} must never exceed the 2-permit bound"
+            );
+            assert!(
+                peak >= 1,
+                "the oracle must have observed at least one forward"
+            );
+        }
+    }
+
+    /// RS7's CPU speedup measurement: `N=1` sequential vs `N=4` concurrent
+    /// CPU-bound "forward" calls on a `std::thread::available_parallelism()`
+    /// machine, sharing a `default_forward_permits(Cpu)`-sized semaphore
+    /// (unbounded here in intent — the permit count is `available_parallelism`,
+    /// so `N=4` is never actually gated below full concurrency on any CI
+    /// runner with >= 4 cores). `#[ignore]`d: wall-clock ratios are a
+    /// reported measurement, never a CI assertion (a loaded/undersized CI
+    /// runner would make a fixed speedup threshold flaky) — run explicitly
+    /// with `cargo test --lib -p jammi-ai -- --ignored --nocapture
+    /// run_chunks_reports_cpu_speedup_at_n4`.
+    #[ignore = "manual measurement, not a CI assertion — see the doc comment"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn run_chunks_reports_cpu_speedup_at_n4() {
+        fn spin(ms: u64) -> BackendOutput {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            let mut x: u64 = 0;
+            while std::time::Instant::now() < deadline {
+                x = x.wrapping_add(1).wrapping_mul(2654435761);
+            }
+            std::hint::black_box(x);
+            fake_backend_output(1)
+        }
+
+        async fn run_one_partition(permits: Option<Arc<tokio::sync::Semaphore>>, work_ms: u64) {
+            let row_count = 1;
+            let keys = test_keys(row_count);
+            let content = test_content(row_count);
+            let adapter = EmbeddingAdapter::new(1);
+            let output_schema = test_output_schema();
+            let ctx = OutputContext {
+                output_schema: &output_schema,
+                adapter: &adapter,
+                source_id: "rs7-speedup-test-source",
+                model_label: "test-model",
+                observer: None,
+                key_column: "id",
+            };
+            let ordinals: ArrayRef =
+                Arc::new((0..row_count as u64).collect::<arrow::array::UInt64Array>());
+            let mut current_batch_size = row_count;
+            let (tx, mut rx) = tokio::sync::mpsc::channel(row_count);
+            InferenceRunner::run_chunks(
+                &content,
+                &keys,
+                &[],
+                &ordinals,
+                &mut current_batch_size,
+                &ctx,
+                &tx,
+                permits.as_ref(),
+                |_chunk| Ok(spin(work_ms)),
+            )
+            .await
+            .unwrap();
+            drop(tx);
+            while rx.recv().await.is_some() {}
+        }
+
+        let n = 4usize;
+        let work_ms = 50u64;
+
+        let seq_start = std::time::Instant::now();
+        for _ in 0..n {
+            run_one_partition(None, work_ms).await;
+        }
+        let seq_elapsed = seq_start.elapsed();
+
+        let permits = Arc::new(tokio::sync::Semaphore::new(n));
+        let par_start = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..n {
+            handles.push(tokio::spawn(run_one_partition(
+                Some(Arc::clone(&permits)),
+                work_ms,
+            )));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let par_elapsed = par_start.elapsed();
+
+        let speedup = seq_elapsed.as_secs_f64() / par_elapsed.as_secs_f64();
+        eprintln!(
+            "RS7 CPU speedup at N={n} on this machine: sequential={:.1}ms concurrent={:.1}ms speedup={speedup:.2}x",
+            seq_elapsed.as_secs_f64() * 1000.0,
+            par_elapsed.as_secs_f64() * 1000.0,
         );
     }
 }

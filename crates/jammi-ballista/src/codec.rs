@@ -31,6 +31,28 @@
 //! `Weak` is a typed refusal naming the missing session, not a panic): the
 //! model cache, result store, and DataFusion context are the decoding
 //! session's, never serialized.
+//!
+//! `jammi_ai::operator::ordinal_split_exec::OrdinalSplitExec` (#540
+//! RANGESPLIT) has NO wire form here — no `NodeTag`, no `plan.proto`
+//! message, no encode/decode arm — the same v1 cut as `MaskExec` below.
+//! WHY: in Ballista 54.1, `SortPreservingMergeExec` is a STAGE BOUNDARY
+//! (`ballista-scheduler-54.1.0/src/planner.rs:219-232` inserts a shuffle
+//! write below it and starts a new stage above), so the `N`-partition
+//! `InferenceExec(OrdinalSplitExec(..))` this split would sit under
+//! becomes its own stage of `N` TASKS — each task executing exactly ONE
+//! partition, in general on a DIFFERENT executor process
+//! (`ballista-scheduler-54.1.0/src/state/execution_stage.rs:1043-1053,530`;
+//! `ballista-executor-54.1.0/src/execution_engine.rs:359-369`). This
+//! node's mechanism is a single IN-PROCESS `tokio::sync::Mutex`-guarded
+//! pull shared across its `N` partitions (`OrdinalSplitExec`'s own module
+//! doc) — it has no meaning, and no way to share its state, across a
+//! process boundary, so putting it on the wire at all would silently
+//! produce `N` independent, uncoordinated splits (each executor's task
+//! would open its OWN copy of `input`, reassign ITS OWN ordinal sequence
+//! from 0, and see none of the other tasks' rows) rather than one
+//! N-way fan-out. `InferenceConfig::partitions` defaults to `1`, which
+//! never inserts this node at all, so this cut affects nothing this
+//! codec's other callers already exercise.
 
 use std::sync::{Arc, Weak};
 
@@ -181,7 +203,8 @@ impl PhysicalExtensionCodec for JammiCodec {
         }
         // Not one of ours — delegate to Ballista's own codec (shuffle
         // reader/writer, unresolved shuffle, ...). A node NEITHER codec
-        // knows (e.g. `MaskExec`, the named v1 cut) surfaces as the
+        // knows (e.g. `MaskExec`, or `OrdinalSplitExec` — the module doc's
+        // stage-boundary reason — both named v1 cuts) surfaces as the
         // delegate's own typed "Unsupported plan node" error naming it —
         // this codec adds no catch-all of its own.
         self.inner.try_encode(node, buf)

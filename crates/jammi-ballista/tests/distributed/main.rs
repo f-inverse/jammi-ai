@@ -51,7 +51,23 @@ use harness::{Backends, BallistaRole, Fleet, JobSize, ProcSpec, WorkerRole};
 /// The deepest (leaf) plan node's own partition count — the scan stage's,
 /// regardless of how many `CoalescePartitionsExec`/operator nodes wrap it
 /// (contract §2.5: `InferenceExec(SortExec(KeyCheckExec(
-/// CoalescePartitionsExec(scan))))`).
+/// CoalescePartitionsExec(scan))))`). Re-anchored for #540 RANGESPLIT: at
+/// the default `InferenceConfig::partitions == 1` (this lane's own
+/// session default, never configured otherwise), `wrap_with_split_and_merge`
+/// (`jammi_ai::operator::inference_exec`) inserts no `OrdinalSplitExec`/
+/// `SortPreservingMergeExec` and coalesces `InferenceExec`'s input to one
+/// partition ONLY IF it was not already one — for `build_embedding_plan`
+/// specifically, its input already went through `operator::ordered_input`
+/// (coalesce + sort), so that coalesce is a no-op and this test's own shape
+/// assertion stands as written, unchanged.
+///
+/// `OrdinalSplitExec` (`partitions > 1`, which this lane never configures)
+/// has NO wire form at all — not distributable in v1. See `jammi_ballista::
+/// codec`'s module doc for why (a Ballista `SortPreservingMergeExec` is a
+/// stage boundary, so the N-partition `InferenceExec(OrdinalSplitExec(..))`
+/// that split feeds would become its own stage of N tasks each executing
+/// ONE partition, in general in a separate process — this node's
+/// in-process shared-mutex mechanism has no meaning across that split).
 fn leaf_partition_count(plan: &Arc<dyn ExecutionPlan>) -> usize {
     let children = plan.children();
     match children.first() {

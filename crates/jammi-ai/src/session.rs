@@ -241,6 +241,17 @@ impl InferenceSession {
         // funnel every `InferenceSession` constructor reaches, so a
         // hand-built config (never routed through `JammiConfig::load_from`)
         // is still covered here.
+        // #540 RANGESPLIT advisory: `JammiConfig::load_from` calls
+        // `InferenceConfig::validate` (rejects `partitions == 0` and above
+        // `MAX_PARTITIONS`), but a hand-built `JammiConfig` handed straight
+        // to an `InferenceSession` constructor — the way every test in this
+        // crate, and any embedding caller, builds one — never runs
+        // `load_from` at all. `wrap_with` is the same universal funnel that
+        // already covers `MembershipConfig::validate` for the identical
+        // reason (see the comment above), so validating here closes the
+        // same gap for `inference.partitions`.
+        inner.config().inference.validate()?;
+
         let instance_id = crate::fine_tune::worker::mint_instance_id();
         let label = crate::fine_tune::worker::worker_label();
         let registration = Arc::new(
@@ -1058,23 +1069,51 @@ impl InferenceSession {
         let regression_form = guard.model.regression_form().cloned();
         drop(guard);
 
-        let inference = InferenceExecBuilder::new(
+        // #540 RANGESPLIT: see `operator::inference_exec::
+        // wrap_with_split_and_merge`'s doc. `input` here is CALLER-supplied
+        // (`query::QueryBuilder::annotate`'s fluent chain, or the Flight-SQL
+        // `annotate` table function's scan) and may already have more than
+        // one partition with nothing coalescing it — at the default
+        // `InferenceConfig::partitions == 1`, `wrap_with_split_and_merge`
+        // coalesces such an `input` to one partition before building
+        // InferenceExec: an uncoalesced multi-partition `input` would make
+        // InferenceExec declare N partitions while every partition's own
+        // runner independently restarts `_ordinal` at 0, and every in-crate
+        // `.execute(0, ..)` caller would see only a fraction of the rows —
+        // this is a REAL, load-bearing plan-shape change on this specific
+        // path, not a no-op, whenever `input` was not already a single
+        // partition.
+        let partitions = self.inner.config().inference.partitions;
+        let batch_size = self.inner.config().inference.batch_size;
+        let observer = self.observer.clone();
+        let model_cache = Arc::clone(&self.model_cache);
+        let device_kind = self.compute_device().kind();
+        let model = model.clone();
+        let columns = columns.to_vec();
+        let key_column = key_column.to_string();
+        let plan = crate::operator::inference_exec::wrap_with_split_and_merge(
             input,
-            model.clone(),
-            task,
-            columns.to_vec(),
-            key_column.to_string(),
-            String::new(),
-            Arc::clone(&self.model_cache),
-            self.compute_device().kind(),
-        )
-        .batch_size(self.inner.config().inference.batch_size)
-        .observer(self.observer.clone())
-        .embedding_dim(embedding_dim)
-        .regression_form(regression_form)
-        .build()?;
+            partitions,
+            move |input| {
+                InferenceExecBuilder::new(
+                    input,
+                    model,
+                    task,
+                    columns,
+                    key_column,
+                    String::new(),
+                    model_cache,
+                    device_kind,
+                )
+                .batch_size(batch_size)
+                .observer(observer)
+                .embedding_dim(embedding_dim)
+                .regression_form(regression_form)
+                .build()
+            },
+        )?;
 
-        Ok(Arc::new(inference))
+        Ok(plan)
     }
 
     /// Encode a single text query into a vector using the given model.
@@ -1570,22 +1609,42 @@ impl InferenceSession {
             }
         }
 
-        // Wrap with InferenceExec
-        let inference_exec = InferenceExecBuilder::new(
+        // Wrap with InferenceExec. #540 RANGESPLIT: see
+        // `operator::inference_exec::wrap_with_split_and_merge`'s doc. At
+        // the default `InferenceConfig::partitions == 1` it coalesces
+        // `input_plan` to one partition if it is not already one — a no-op
+        // here, since `ordered_input` just above already produced exactly
+        // one partition.
+        let partitions = self.inner.config().inference.partitions;
+        let batch_size = self.inner.config().inference.batch_size;
+        let observer = self.observer.clone();
+        let model_cache = Arc::clone(&self.model_cache);
+        let device_kind = self.compute_device().kind();
+        let source_clone = source.clone();
+        let content_columns_owned = content_columns.to_vec();
+        let key_column_owned = key_column.to_string();
+        let source_id_owned = source_id.to_string();
+        let inference_exec = crate::operator::inference_exec::wrap_with_split_and_merge(
             input_plan,
-            source.clone(),
-            task,
-            content_columns.to_vec(),
-            key_column.to_string(),
-            source_id.to_string(),
-            Arc::clone(&self.model_cache),
-            self.compute_device().kind(),
-        )
-        .batch_size(self.inner.config().inference.batch_size)
-        .observer(self.observer.clone())
-        .embedding_dim(embedding_dim)
-        .regression_form(regression_form)
-        .build()?;
+            partitions,
+            move |input| {
+                InferenceExecBuilder::new(
+                    input,
+                    source_clone,
+                    task,
+                    content_columns_owned,
+                    key_column_owned,
+                    source_id_owned,
+                    model_cache,
+                    device_kind,
+                )
+                .batch_size(batch_size)
+                .observer(observer)
+                .embedding_dim(embedding_dim)
+                .regression_form(regression_form)
+                .build()
+            },
+        )?;
 
         // Execute and collect results — both through the structural
         // classifier so a typed refusal raised inside the plan reaches the

@@ -46,6 +46,7 @@ mod peer_gang;
 mod pinned_source_gate;
 mod pipeline;
 mod pooling_config;
+mod rangesplit;
 mod rank_admission;
 mod read_vectors;
 mod recompute;

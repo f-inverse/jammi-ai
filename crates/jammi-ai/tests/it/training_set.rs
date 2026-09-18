@@ -505,11 +505,12 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
 /// one shared value. The macOS constant below is pinned from two repeated
 /// local runs (confirmed byte-stable, the same discipline
 /// [`gradcache_completes_at_w1_with_a_pinned_adapter_digest`]'s own doc
-/// states). The Linux constant is pinned from the hermetic `Test` job's own
-/// stdout (ci.yml run 35334270497, x86_64 `ubuntu-latest`) — the `println!`
-/// below, printed BEFORE the assert on every run, is what it was read from;
-/// a divergence on a later runner fails BY NAME here (never `#[ignore]`d)
-/// and is the signal that the (arch, os) pair is not byte-stable after all.
+/// states). The Linux constant is pinned from ONE observation — the hermetic
+/// `Test` job's own stdout (ci.yml run 35334270497, x86_64 `ubuntu-latest`),
+/// read from the `println!` below, printed BEFORE the assert on every run —
+/// so its byte-stability across runners is asserted by every CI run since,
+/// not yet established by two agreeing captures the way the macOS pair's is;
+/// a divergence fails BY NAME here (never `#[ignore]`d).
 /// This run's live mining-on-vs-off inequality (below) is the non-vacuity control this
 /// module's doc names: #551's own oracle gap (an earlier attempted digest
 /// test set `hard_negatives.mine = true` with no `embedding_loss` at all, so
@@ -519,14 +520,13 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
 async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it_unreached() {
     use jammi_ai::fine_tune::{EmbeddingLoss, HardNegativeConfig};
 
-    // Platform-specific, like `GRADCACHE_ADAPTER_PRINTS` above: the Linux
-    // pair is captured from the hermetic CI job's stdout (this test's own
+    // Platform-specific, like `PARITY_ADAPTER_PRINTS` above: the Linux pair
+    // is captured from one hermetic CI job's stdout (this test's own
     // `println!`, below; run 35334270497) and every later CI run re-measures
-    // it (this crate's CPU backprop is measured, not assumed, byte-identical
-    // within one (arch, os) pair); the macOS pair is pinned from two repeated
-    // local runs on this implementer's host.
+    // it; the macOS pair is pinned from two repeated local runs on this
+    // implementer's host.
     #[cfg(target_os = "linux")]
-    const MINING_ADAPTER_PRINTS: Option<&[(&str, &str)]> = Some(&[
+    const MINING_ADAPTER_PRINTS: &[(&str, &str)] = &[
         ("adapter.safetensors", "1184:18ce9f6cfea22f83"),
         ("adapter_config.json", "143:1feeeb6239c3fd30"),
         ("checkpoint_1.safetensors", "1184:86dc3390a3a33369"),
@@ -535,9 +535,9 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
         ("checkpoint_4.safetensors", "1184:18ce9f6cfea22f83"),
         ("checkpoint_best.safetensors", "1184:18ce9f6cfea22f83"),
         ("manifest.json", "788:bb64db20eacab44a"),
-    ]);
+    ];
     #[cfg(not(target_os = "linux"))]
-    const MINING_ADAPTER_PRINTS: Option<&[(&str, &str)]> = Some(&[
+    const MINING_ADAPTER_PRINTS: &[(&str, &str)] = &[
         ("adapter.safetensors", "1184:94281422a73e9e84"),
         ("adapter_config.json", "143:1feeeb6239c3fd30"),
         ("checkpoint_1.safetensors", "1184:335fa1132eb87409"),
@@ -546,7 +546,7 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
         ("checkpoint_4.safetensors", "1184:94281422a73e9e84"),
         ("checkpoint_best.safetensors", "1184:94281422a73e9e84"),
         ("manifest.json", "788:b456e1175219e213"),
-    ]);
+    ];
 
     async fn run(dir: &TempDir, mine: bool) -> (Option<&'static str>, BTreeMap<String, String>) {
         let session = session_over(dir, &common::fixture_url("training_triplets.csv")).await;
@@ -643,18 +643,9 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
          result and this assertion catches it."
     );
 
-    // The byte-for-byte pin: `None` on Linux is the honest state of
-    // this branch, and fails BY NAME rather than silently skipping.
-    let expected_pairs = MINING_ADAPTER_PRINTS.unwrap_or_else(|| {
-        panic!(
-            "unimplemented pin: MINING_ADAPTER_PRINTS has no captured constant for \
-             target_os=\"linux\" (#551) — this run's own stdout above \
-             (`MINING_ADAPTER_PRINTS = ...`) is the value to commit, once it agrees across TWO \
-             CI runs (ci.yml's K4 heterogeneity note); never `#[ignore]` this test to route \
-             around the gap"
-        )
-    });
-    let expected: BTreeMap<String, String> = expected_pairs
+    // The byte-for-byte pin, asserted on both platforms; a divergence fails
+    // BY NAME below (the `println!` above is the value to compare against).
+    let expected: BTreeMap<String, String> = MINING_ADAPTER_PRINTS
         .iter()
         .map(|(n, p)| ((*n).to_string(), (*p).to_string()))
         .collect();

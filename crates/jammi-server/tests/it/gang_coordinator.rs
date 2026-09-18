@@ -79,7 +79,7 @@ pub(crate) fn pairs() -> Vec<(String, String)> {
         .collect()
 }
 
-fn pairs_loader() -> TrainingDataLoader {
+pub(crate) fn pairs_loader() -> TrainingDataLoader {
     TrainingDataLoader::from_pairs(pairs())
 }
 
@@ -362,6 +362,7 @@ pub(crate) fn file_store() -> Arc<ArtifactStore> {
 pub(crate) async fn reference_rank0_adapter_bytes(
     engine: &Arc<InferenceSession>,
     tag: &str,
+    loader: fn() -> TrainingDataLoader,
 ) -> Vec<u8> {
     let guard = engine
         .model_cache()
@@ -417,7 +418,7 @@ pub(crate) async fn reference_rank0_adapter_bytes(
                     .build()
                     .unwrap();
             let result = training_loop
-                .run(&call, TrainingSource::Resident(pairs_loader()))
+                .run(&call, TrainingSource::Resident(loader()))
                 .unwrap_or_else(|e| panic!("reference rank {rank} must complete: {e}"));
             let bytes =
                 std::fs::read(result.artifact_dir.path().join("adapter.safetensors")).unwrap();
@@ -585,7 +586,7 @@ async fn a_member_answering_unavailable_ends_the_attempt_cooled_and_the_next_att
     // fixture: the loopback rounds through the real hold loop and the real
     // rank body folded exactly as Local does.
     let published = published_adapter_bytes(&engine, &job_id).await;
-    let reference = reference_rank0_adapter_bytes(&engine, "peer-e2e").await;
+    let reference = reference_rank0_adapter_bytes(&engine, "peer-e2e", pairs_loader).await;
     assert_eq!(
         published, reference,
         "rank 0's published adapter over Peer must be byte-identical to Local's rank 0"
@@ -697,7 +698,15 @@ fn graph_nodes_edges() -> (
     use jammi_ai::fine_tune::graph_sampler::{GraphEdge, TextNode};
     let n = 8;
     let nodes = (0..n)
-        .map(|i| TextNode::new(format!("g{i}"), format!("graph_node_text_{i}")))
+        // Every node's text is distinct in-vocabulary tokens for the tiny test
+        // model: a text it tokenizes to `[UNK]` makes every sampled row the
+        // same row, and no order or shard fault could then change the bytes.
+        .map(|i| {
+            TextNode::new(
+                format!("g{i}"),
+                format!("{i} {} {}", (i * 3 + 1) % 8, (i * 5 + 2) % 8),
+            )
+        })
         .collect();
     let mut edges = Vec::new();
     for i in 0..n {
@@ -711,6 +720,17 @@ fn graph_nodes_edges() -> (
         ));
     }
     (nodes, edges)
+}
+
+/// The in-memory reference for the graph fixture: the same nodes and edges,
+/// in the read order the job's own scans commit, through the same seeded
+/// sampler — never the job's table.
+fn graph_loader() -> TrainingDataLoader {
+    use jammi_ai::fine_tune::graph_sampler::{sort_into_graph_read_order, GraphSampler};
+    let (mut nodes, mut edges) = graph_nodes_edges();
+    sort_into_graph_read_order(&mut nodes, &mut edges);
+    let sampler = GraphSampler::build(nodes, edges, graph_sample_config()).unwrap();
+    TrainingDataLoader::from_graph(&sampler).unwrap()
 }
 
 fn graph_sample_config() -> jammi_ai::fine_tune::graph_sampler::GraphSampleConfig {
@@ -871,6 +891,9 @@ fn two_rank_graph_spec() -> TrainingSpec {
 /// row, reads it in its committed order through the same rank body a
 /// column-source job uses, and ends `Trained` with the digest the
 /// coordinator's terminal write on receipt requires to equal rank 0's own.
+/// That digest equality shows the ranks agree with each other; the byte
+/// equality against an in-process gang over the in-memory sample shows they
+/// cut and read the right shards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn graph_fine_tune_runs_as_a_peer_gang() {
     let server = coordinating_graph_server().await;
@@ -910,9 +933,13 @@ async fn graph_fine_tune_runs_as_a_peer_gang() {
         "the member ended Trained: {}",
         member_ends[0].1
     );
-    assert!(
-        fine_tuned_model(&engine, &job_id).await.is_some(),
-        "the gang's model is published"
+    let published = published_adapter_bytes(&engine, &job_id).await;
+    let reference = reference_rank0_adapter_bytes(&engine, "graph-peer", graph_loader).await;
+    assert!(!published.is_empty());
+    assert_eq!(
+        published, reference,
+        "rank 0's published adapter over Peer must be byte-identical to an in-process gang \
+         over the in-memory graph sample"
     );
     expect_slot_free(&engine).await;
 }

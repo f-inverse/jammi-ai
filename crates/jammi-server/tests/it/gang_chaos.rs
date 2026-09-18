@@ -65,8 +65,8 @@ use tokio::sync::oneshot;
 use tonic::transport::server::TcpIncoming;
 
 use crate::gang_coordinator::{
-    published_adapter_bytes, reference_rank0_adapter_bytes, row, two_rank_spec, write_pairs_csv,
-    Row,
+    pairs_loader, published_adapter_bytes, reference_rank0_adapter_bytes, row, two_rank_spec,
+    write_pairs_csv, Row,
 };
 
 /// The coordinator hosts' lease: a retired attempt whose lease is left to
@@ -631,7 +631,7 @@ async fn assert_completed_like_the_reference(coordinator: &Coordinator, job_id: 
         "Success resets the cooldown"
     );
     let published = published_adapter_bytes(&coordinator.session, job_id).await;
-    let reference = reference_rank0_adapter_bytes(&coordinator.session, tag).await;
+    let reference = reference_rank0_adapter_bytes(&coordinator.session, tag, pairs_loader).await;
     assert!(!published.is_empty());
     assert_eq!(
         published, reference,

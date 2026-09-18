@@ -112,7 +112,18 @@ pub(crate) fn write_pairs_csv(dir: &std::path::Path) -> String {
 pub(crate) fn graph_nodes() -> Vec<(String, String)> {
     ["a0", "a1", "a2", "b0", "b1", "b2"]
         .iter()
-        .map(|id| (id.to_string(), format!("document about topic {id}")))
+        // Every node's text is distinct in-vocabulary tokens for the tiny test
+        // model: a text it tokenizes to `[UNK]` makes every sampled row the
+        // same row, and no order or shard fault could then change the bytes.
+        .map(|id| {
+            let (group, n) = (id.as_bytes()[0], id.as_bytes()[1] - b'0');
+            let text = format!(
+                "{} {n} {}",
+                group as char,
+                (group as u32 + n as u32 * 3) % 10
+            );
+            (id.to_string(), text)
+        })
         .collect()
 }
 

@@ -4384,13 +4384,44 @@ impl JobWorker {
         if let Some(src) = &materialization_source {
             let canonical_model_id = model_source.to_string();
             let device = session.compute_device();
-            // The fused-kernel admission profile is UNCOVERED here
-            // (#546): `MaterializationEnv::kernel_admission_profile` stays
-            // declared and hash-affecting the moment a real value is
-            // written, but nothing here writes one — a re-derived
-            // prediction is not the training loop's actual per-op admission
-            // outcome, and shipping one would be a false sense of coverage
-            // (see that field's own doc).
+            // The fused-kernel admission profile (#546 K2') is folded HERE,
+            // ex ante — before training runs, alongside every other
+            // materialization fact. K2's original design (an OBSERVED
+            // per-op dispatch outcome, read after training via a
+            // before/after counter window) was DELETED, not demoted: a
+            // `DefinitionHash` is computed BEFORE the work
+            // (`Catalog::probe_model_by_definition`) to look up whether it
+            // already exists, so a value knowable only after training would
+            // make that lookup impossible for the very run it describes —
+            // see `jammi_kernels::admission::render_kernel_admission_profile`'s
+            // own doc for the full executed record. Every fact folded below
+            // is EX ANTE and by construction: this crate's own compiled
+            // features (`jammi_kernels::admission::BUILD_FACTS`), the
+            // process's `admission_mode()`, the `JAMMI_KERNELS_DISABLE` set
+            // (`disabled_ops_requested()`), and this job's backbone dtype
+            // class.
+            //
+            // The dtype passed below must be `common.config.backbone_dtype`
+            // — the SAME value `probe_acceleration`'s own
+            // `dtype_class_of(backbone_dtype)` call resolves the esc-075
+            // report's dtype class from — never
+            // `guard.model.compute_precision()` (the loaded model's own
+            // ON-DISK weight dtype, a DIFFERENT axis: the trainer's
+            // `VarBuilder` and LoRA adapters are always `F32` regardless of
+            // `backbone_dtype`, and `guard.model` can be loaded at `F32`
+            // while `backbone_dtype` casts the forward activations to
+            // `Bf16`/`F16`). Passing the loaded model's own precision here
+            // instead renders an f16-backbone CPU job's profile at
+            // `dtype_class=F32` (tiny_bert's own fixture loads at F32 on
+            // disk), so `cast_scale`/`cast_add` read `n/a` and
+            // `JAMMI_KERNELS_DISABLE=cast_scale_f16_f32` never moves that
+            // job's `DefinitionHash` at all.
+            let kernel_admission_profile =
+                jammi_kernels::admission::render_kernel_admission_profile(
+                    dtype_class_of(common.config.backbone_dtype),
+                    jammi_kernels::admission::admission_mode(),
+                    &jammi_kernels::admission::disabled_ops_requested(),
+                );
             let env = jammi_db::store::manifest::MaterializationEnv::new(
                 device.clone(),
                 vec![jammi_db::store::manifest::ModelIdentity {
@@ -4400,7 +4431,8 @@ impl JobWorker {
                     content_digest: guard.model.content_digest().map_err(WorkerJobError::from)?,
                     quantization: guard.model.quantization(),
                 }],
-            );
+            )
+            .with_kernel_admission_profile(kernel_admission_profile);
             let spec_canonical = crate::fine_tune::spec::fine_tune_spec_canonical(
                 &src.source,
                 &src.columns,

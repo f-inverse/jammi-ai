@@ -33,8 +33,11 @@ not a fix.
 
 The live standalone op-key set is `PROBED_OPS` itself. This script reads it
 from `ci/tools/probed-ops-index` (`cargo run --release -p probed-ops-index`),
-a tiny CI-only Rust binary that imports `jammi_kernels::admission::PROBED_OPS`
-directly and prints its own `registry_keys`/`report_keys` as JSON — the
+a tiny CI-only Rust binary that imports `jammi_kernels::admission::ProbedOpId`
+(#546 K4: the closed enum, not the open table, is the enumeration source —
+`ProbedOpId::ALL` and `PROBED_OPS` are pinned identical by admission.rs's own
+`probed_op_id_variants_cover_every_probed_ops_row` test) and prints its own
+`registry_keys`/`report_keys` as JSON — the
 SAME "run the real, compiled tool, never a regex over source" posture
 `ci/tools/symbol-index` already established for `check_plan_citations.py`/
 `check_no_consumer_names.py` (this repo's own recorded lesson: "regex
@@ -61,13 +64,21 @@ struct `ProbedOp` is private`). So on every `cargo build` a call site
 OUTSIDE `jammi-kernels` cannot pass anything but one of `PROBED_OPS`'s own
 named consts. Neither mechanism has any effect INSIDE the defining crate:
 a same-crate forgery in `jammi-kernels` itself is syntactically possible
-and is NOT sealed — and nothing needs it to be, because no durable
-artifact (no `DefinitionHash`, see
-`jammi_db::store::manifest::MaterializationEnv::kernel_admission_profile`'s
-own doc) folds a `ProbedOp` row's admission outcome in; a same-crate
-forgery has no downstream property to violate. This script and
-`ci/tools/probed-ops-index` enumerate the TABLE's rows, which is exactly
-what they claim. Separately, this
+and is NOT sealed — and nothing needs it to be. `#546` K2' now DOES fold a
+real, hash-affecting fact set into
+`jammi_db::store::manifest::MaterializationEnv::kernel_admission_profile`
+(build features, `admission_mode`, the disabled-op set, and the job's
+dtype class — all EX ANTE facts, never a per-run observation), but that
+fold is BY CONSTRUCTION immune to a same-crate `ProbedOp` forgery too: it
+is `jammi_kernels::admission::render_kernel_admission_profile`, which
+enumerates `ProbedOpId::ALL` and reads each variant through
+`ProbedOpId::row`'s total `match` — it never accepts a `ProbedOp` value as
+an argument or iterates any externally-extensible collection of them, so a
+same-crate forgery still has no expression that ever reaches the fold.
+This script and `ci/tools/probed-ops-index` enumerate the TABLE's rows
+(equivalently, `ProbedOpId::ALL`'s rows — pinned identical by
+`probed_op_id_variants_cover_every_probed_ops_row` in `admission.rs`),
+which is exactly what they claim. Separately, this
 script still checks NON-VACUITY: that real
 `admit`/`admit_cascade` call sites genuinely exist under the scan roots at
 all (`admit_call_sites`, via

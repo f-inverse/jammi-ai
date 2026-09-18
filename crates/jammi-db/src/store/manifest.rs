@@ -260,6 +260,16 @@ pub struct MaterializationEnv {
     /// precision, so it is a determinant of the output like the compute
     /// device and every invoked model's identity.
     ///
+    /// **Residual, not fixed here:** [`Self::device`] folds only
+    /// `ComputeDevice::Cuda { ordinal }` (an ordinal, never the GPU's
+    /// actual compute capability), while
+    /// `jammi_kernels::admission::flash_validated_arches`'s pod-parity gate
+    /// admits or refuses an arch based on that REAL capability — two CUDA
+    /// runs on different-architecture GPUs (differing compute capability,
+    /// same ordinal convention) can therefore hash identically despite a
+    /// genuine hardware-driven admission difference neither `device` nor
+    /// this field folds.
+    ///
     /// `None` for every producer that records no kernel-admission decision
     /// (every variant before [`ProducingDescriptor::FineTune`]).
     /// `#[serde(skip_serializing_if = "Option::is_none")]` means a `None`
@@ -268,21 +278,25 @@ pub struct MaterializationEnv {
     /// addition changes not one byte of any [`DefinitionHash`] computed
     /// before it existed.
     ///
-    /// **No production caller writes this field.** `jammi-db` cannot itself
-    /// observe a training loop's per-op fused/eager admission outcomes (it
-    /// depends on no `jammi-kernels` type), so populating it is entirely the
-    /// producing caller's responsibility, and the `FineTune` producer in
-    /// `jammi-ai` does not call [`Self::with_kernel_admission_profile`]. The
-    /// kernel-admission determinant of a fine-tuned model's produced bytes is
-    /// therefore UNCOVERED by [`DefinitionHash`] at this base: two runs whose
-    /// fused/eager admission genuinely differs (e.g. a build-feature or
-    /// hardware difference that changes which ops fuse) can hash identically.
-    /// Folding a real, per-op admission outcome into this field is tracked at
-    /// <https://github.com/f-inverse/jammi-ai/issues/546>. The field stays
-    /// declared, `serde`-default and skip-if-`None`, and its builder
-    /// (below) is exercised by this crate's own hash-completeness tests —
-    /// setting it DOES move [`DefinitionHash`] — so the seam is ready the
-    /// moment #546 lands a real write.
+    /// **Populated by the `FineTune` producer (#546 K2').** `jammi-db`
+    /// cannot itself compute this value (it depends on no `jammi-kernels`
+    /// type), so `jammi-ai`'s fine-tune worker builds the string via
+    /// `jammi_kernels::admission::render_kernel_admission_profile` and hands
+    /// it across through [`Self::with_kernel_admission_profile`] — the same
+    /// "db-local primitive standing in for a foreign type" shape this
+    /// field's own doc already describes. Every fact the rendered string
+    /// carries is EX ANTE (known before training runs: this crate's own
+    /// compiled build features, `admission_mode`, the disabled-op set, and
+    /// the job's OWN declared training dtype — `FineTuneConfig::backbone_dtype`,
+    /// never the base model's loaded `compute_precision()` (a different
+    /// axis — see `render_kernel_admission_profile`'s own doc) — never a
+    /// per-run OBSERVATION of
+    /// which ops actually dispatched fused, which would make the value
+    /// unknowable at the point a [`DefinitionHash`] is computed to look up
+    /// whether the work already exists (`Catalog::probe_model_by_definition`
+    /// runs BEFORE training). The full executed record — including why an
+    /// observed-outcome design was tried and deleted — is on
+    /// <https://github.com/f-inverse/jammi-ai/issues/546>.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_admission_profile: Option<String>,
 }
@@ -827,13 +841,21 @@ pub enum ProducingDescriptor {
     /// use for the model they invoke — so `base_model_id` (below) is the
     /// db-local mirror of `env.models[0].model_id`, not a second identity.
     /// The fused-kernel admission profile is an environment fact, not a
-    /// spec knob, when it IS folded — but for this variant it is not: the
-    /// `FineTune` producer never calls
-    /// [`MaterializationEnv::with_kernel_admission_profile`], so
-    /// [`MaterializationEnv::kernel_admission_profile`] stays `None` here
-    /// and the real per-op fused/eager admission outcome is UNCOVERED by
-    /// this variant's [`DefinitionHash`] (that field's own doc carries the
-    /// tracking issue).
+    /// spec knob (#546 K2'): the `FineTune` producer calls
+    /// [`MaterializationEnv::with_kernel_admission_profile`] with the
+    /// EX ANTE string `jammi_kernels::admission::render_kernel_admission_profile`
+    /// renders (build features, `admission_mode`, the disabled-op set, the
+    /// job's OWN declared training dtype — `FineTuneConfig::backbone_dtype`,
+    /// never the base model's loaded `compute_precision()`), so a build/policy difference that changes which
+    /// ops CAN fuse is a determinant of this variant's [`DefinitionHash`] —
+    /// see [`MaterializationEnv::kernel_admission_profile`]'s own doc for
+    /// what is and is not folded. **Residual, not fixed here:** every OTHER
+    /// model-invoking producer (`Self::Embedding`/`Self::Inference` —
+    /// e.g. `jammi-ai`'s `pipeline::embedding::EmbeddingPipeline::run`,
+    /// `pipeline/embedding.rs:47`) still builds its `MaterializationEnv`
+    /// with `kernel_admission_profile: None`; this field is populated ONLY
+    /// for `FineTune` today, so any admission-gated dispatch those other
+    /// producers make is not yet a `DefinitionHash` determinant for them.
     ///
     /// `world_size` (`TrainingCommon`'s own topology field) and `collective`/
     /// `local_ranks` (below, #500 U4b) are this variant's topology fields
@@ -3222,6 +3244,42 @@ mod tests {
         );
     }
 
+    /// K5 (#546): a manifest written before `kernel_admission_profile`
+    /// existed — no key at all in the JSON, modelling what is actually on
+    /// disk from before this field existed — deserialises to `None` via
+    /// `#[serde(default)]`, the same pre-feature-row contract
+    /// `quantization_serde_round_trips_and_pre_feature_rows_default_to_none`
+    /// pins for `ModelIdentity`.
+    #[test]
+    fn kernel_admission_profile_pre_feature_manifest_deserialises_to_none() {
+        let pre_feature_json = serde_json::json!({
+            "engine_version": "0.0.0",
+            "device": "cpu",
+            "models": [],
+        });
+        let env: MaterializationEnv = serde_json::from_value(pre_feature_json).unwrap();
+        assert_eq!(env.kernel_admission_profile, None);
+    }
+
+    /// K5 (#546): a row recorded WITHOUT a profile never matches (hashes
+    /// identically to) a row recorded WITH one over an otherwise-identical
+    /// environment — the mirror direction of
+    /// `fine_tune_hash_moves_with_the_kernel_admission_profile`, stated
+    /// explicitly as the "prior manifests stay readable but distinguishable"
+    /// property K5 asks for.
+    #[test]
+    fn kernel_admission_profile_absent_never_hashes_equal_to_present() {
+        let d = fine_tune_descriptor(&fine_tune_fields());
+        let absent = env_with_model(base_model_identity());
+        let present = MaterializationEnv::new(ComputeDevice::Cpu, vec![base_model_identity()])
+            .with_kernel_admission_profile("layer_norm=enabled");
+        assert_ne!(
+            definition_hash(&d, &absent).unwrap(),
+            definition_hash(&d, &present).unwrap(),
+            "a manifest with no recorded profile must never hash equal to one that recorded one"
+        );
+    }
+
     /// DISTINCTNESS: a `Some` kernel-admission profile must hash differently
     /// from `None` over an otherwise-identical environment — a fused-kernel
     /// run is output-affecting relative to an eager run of the same spec.
@@ -3236,6 +3294,99 @@ mod tests {
             definition_hash(&d, &fused).unwrap(),
             "a fused-kernel admission profile must change the hash relative to none recorded"
         );
+    }
+
+    /// #546 K2'(a): a hash-completeness test over the `kernel_admission_profile`
+    /// FIELD itself — this proves `MaterializationEnv`'s hash folds every
+    /// LINE of an arbitrary, line-shaped `String` value, not that this
+    /// specific literal matches `jammi_kernels::admission::render_kernel_admission_profile`'s
+    /// real output (`jammi-db` cannot depend on `jammi-kernels` — leaf-crate
+    /// rule — so this uses hand-written literals; the renderer's OWN fact
+    /// set and its per-dtype-correctness are asserted directly against the
+    /// real function in `jammi-kernels/src/admission.rs`'s own test suite,
+    /// e.g. `render_kernel_admission_profile_includes_every_ex_ante_fact`
+    /// and `render_kernel_admission_profile_resolves_the_disabled_check_per_dtype_not_across_all_dtypes`,
+    /// and end to end — a real published `DefinitionHash` moving under a
+    /// real `JAMMI_KERNELS_DISABLE` — by `jammi-ai`'s
+    /// `kernel_admission_profile_names_a_real_disabled_op_and_moves_the_definition_hash`).
+    /// The literals below are kept in the renderer's CURRENT shape
+    /// (`report_key=<disabled|enabled|n/a>`, `name=bool`) for plausibility,
+    /// but this test's OWN claim is narrower: two envs differing in exactly
+    /// one line hash differently, and reverting that line restores equality
+    /// (the control half — proves the OTHER lines are not secretly what
+    /// moved the hash) — a property of `MaterializationEnv`'s own fold,
+    /// true for ANY such string, real renderer or not.
+    #[test]
+    fn kernel_admission_profile_field_is_hash_complete_over_any_line_shaped_content() {
+        let baseline = "layer_norm=enabled\n\
+                         rope=enabled\n\
+                         cast_scale=n/a\n\
+                         cuda=false\n\
+                         flash-attn=false\n\
+                         metal=false\n\
+                         admission_mode=Fallback\n\
+                         dtype_class=F32";
+        let d = fine_tune_descriptor(&fine_tune_fields());
+        let base_hash = definition_hash(
+            &d,
+            &env_with_model(base_model_identity()).with_kernel_admission_profile(baseline),
+        )
+        .unwrap();
+
+        // One perturbation per line this literal names — each must move the
+        // hash relative to `baseline`, and reverting it must restore
+        // equality (ruling out "always different" as a vacuous pass).
+        let perturbations: &[(&str, &str)] = &[
+            ("a disabled-op row line", "layer_norm=disabled"),
+            ("a different row's line", "rope=disabled"),
+            ("an n/a row line", "cast_scale=disabled"),
+            ("the cuda build fact", "cuda=true"),
+            ("the flash-attn build fact", "flash-attn=true"),
+            ("the metal build fact", "metal=true"),
+            ("admission_mode", "admission_mode=Strict"),
+            ("dtype_class", "dtype_class=Bf16"),
+        ];
+        for (name, replacement) in perturbations {
+            let target = replacement.split('=').next().unwrap();
+            let mutated: String = baseline
+                .lines()
+                .map(|line| {
+                    if line.starts_with(&format!("{target}=")) {
+                        (*replacement).to_string()
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_ne!(
+                mutated, baseline,
+                "test bug: perturbation {name:?} did not change the literal string"
+            );
+            let mutated_hash = definition_hash(
+                &d,
+                &env_with_model(base_model_identity())
+                    .with_kernel_admission_profile(mutated.as_str()),
+            )
+            .unwrap();
+            assert_ne!(
+                base_hash, mutated_hash,
+                "changing {name} alone must change DefinitionHash"
+            );
+
+            // Control: reverting the SAME line restores hash equality —
+            // the hash difference above is attributable to this one line,
+            // not some other channel this test forgot to hold constant.
+            let reverted_hash = definition_hash(
+                &d,
+                &env_with_model(base_model_identity()).with_kernel_admission_profile(baseline),
+            )
+            .unwrap();
+            assert_eq!(
+                base_hash, reverted_hash,
+                "control: re-using the baseline string must reproduce the baseline hash"
+            );
+        }
     }
 
     #[test]

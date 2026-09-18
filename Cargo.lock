@@ -4768,6 +4768,7 @@ dependencies = [
  "candle-nn",
  "half",
  "libm",
+ "strum",
  "thiserror 2.0.18",
  "tracing",
 ]

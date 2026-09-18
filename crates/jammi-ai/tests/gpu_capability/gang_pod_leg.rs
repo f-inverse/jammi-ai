@@ -182,7 +182,6 @@ const TINY_BERT_HIDDEN: usize = 32;
 
 /// Per-rank micro-batch (`B`) for the W=2 gang; the W=1 reference trains at
 /// double this (the SAME global batch, one rank instead of two).
-#[cfg(feature = "cuda")]
 const POD_LEG_PER_RANK_BATCH: usize = 2;
 
 /// Training rows — divisible by both the W=2 gang's global batch
@@ -732,6 +731,7 @@ fn run_pod_gang(
     run_tag: &str,
     dev0: &candle_core::Device,
     dev1: &candle_core::Device,
+    loader: fn() -> jammi_ai::fine_tune::data::TrainingDataLoader,
 ) -> (String, Vec<(u64, f64)>) {
     crate::harness::loss_capture::reset();
     let devices = [dev0.clone(), dev1.clone()];
@@ -754,7 +754,7 @@ fn run_pod_gang(
             let tag = format!("{run_tag}-r{idx}");
             let job_id = job_id.clone();
             let config = gang_pod_config();
-            let loader = pod_leg_pairs();
+            let loader = loader();
             let ordinal = idx as i32;
             BlockingCall::spawn_thread(move |call| {
                 run_pod_rank(call, tag, job_id, config, loader, rank_ctx, device, ordinal)
@@ -781,10 +781,11 @@ fn run_pod_reference(
     run_tag: &str,
     device: &candle_core::Device,
     device_ordinal: i32,
+    loader: fn() -> jammi_ai::fine_tune::data::TrainingDataLoader,
 ) -> Vec<(u64, f64)> {
     crate::harness::loss_capture::reset();
     let config = gang_pod_reference_config();
-    let loader = pod_leg_pairs();
+    let loader = loader();
     let job_id = format!("{run_tag}-job");
     let tag = run_tag.to_string();
     let device_clone = device.clone();
@@ -816,6 +817,116 @@ fn run_pod_reference(
 /// `JAMMI_GANG_ARTIFACT_DIR` unset: the assertions below still execute in
 /// full (this test still proves the property on this run), but nothing is
 /// written — stated via a loud `tracing::warn`, never silently skipped.
+/// A graph-sampled training set for the pod leg: an 8-node ring sampled by
+/// seeded walks into `(anchor, positive)` pairs — the loader a `graph_fine_tune`
+/// job trains from. Its rows are a whole number of global batches (see the
+/// test below), so the gang and the double-batch reference step in lockstep.
+fn pod_leg_graph_sample() -> jammi_ai::fine_tune::data::TrainingDataLoader {
+    use jammi_ai::fine_tune::graph_sampler::{
+        sort_into_graph_read_order, GraphEdge, GraphSampleConfig, GraphSampler, TextNode,
+    };
+    const NODES: usize = 8;
+    let mut nodes: Vec<TextNode> = (0..NODES)
+        .map(|i| TextNode::new(format!("g{i}"), jammi_test_utils::tiny_vocab_text('g', i)))
+        .collect();
+    let mut edges: Vec<GraphEdge> = (0..NODES)
+        .flat_map(|i| {
+            let next = (i + 1) % NODES;
+            [
+                GraphEdge::declared(format!("g{i}"), format!("g{next}")),
+                GraphEdge::declared(format!("g{next}"), format!("g{i}")),
+            ]
+        })
+        .collect();
+    sort_into_graph_read_order(&mut nodes, &mut edges);
+    let config = GraphSampleConfig {
+        walk_length: 2,
+        walks_per_node: 1,
+        hard_negatives: 0,
+        exclude_hops: 1,
+        min_negatives: 1,
+        seed: 7,
+        ..GraphSampleConfig::default()
+    };
+    let sampler = GraphSampler::build(nodes, edges, config).expect("the ring is a valid graph");
+    jammi_ai::fine_tune::data::TrainingDataLoader::from_graph(&sampler)
+        .expect("the ring samples at least one pair")
+}
+
+/// Runs on any host: the graph fixture must divide into whole global batches
+/// (`W = 2` ranks x [`POD_LEG_PER_RANK_BATCH`]), or the gang and its W=1
+/// reference would not see the same steps — found here, not on a rented pod.
+#[test]
+fn pod_leg_graph_sample_is_a_whole_number_of_global_batches() {
+    let rows = pod_leg_graph_sample().len();
+    let global_batch = 2 * POD_LEG_PER_RANK_BATCH;
+    assert!(
+        rows >= 2 * global_batch,
+        "{rows} rows is under two global batches"
+    );
+    assert_eq!(
+        rows % global_batch,
+        0,
+        "{rows} sampled rows do not divide into global batches of {global_batch}"
+    );
+}
+
+/// The pod leg's property for a GRAPH-SAMPLED training set: on two real GPUs
+/// over NCCL, a two-rank gang reproduces itself byte for byte, and its loss
+/// curve matches a single rank at double the batch — the reduced gradient is
+/// the single-rank gradient over the union batch. The pairs test below owns
+/// this leg's committed artifact; this one asserts the same three properties
+/// for the loader a `graph_fine_tune` job trains from.
+#[test]
+fn gang_pod_leg_graph_sample_two_ranks_reproduce_and_match_w1() {
+    skip_without_gpu!();
+
+    #[cfg(feature = "cuda")]
+    {
+        const TEST: &str = "gang_pod_leg_graph_sample_two_ranks_reproduce_and_match_w1";
+        crate::harness::loss_capture::install();
+
+        let Some(slot) = serial_cuda_device_or_require(TEST) else {
+            tracing::warn!("SKIP: no usable CUDA device");
+            return;
+        };
+        let dev0 = slot.device().clone();
+        let Some(dev1) = second_cuda_device_or_require(TEST) else {
+            tracing::warn!("SKIP: a two-rank NCCL gang needs two CUDA devices; this host has one");
+            return;
+        };
+
+        let (digest_a, curve_a) =
+            run_pod_gang("podleg-graph-a", &dev0, &dev1, pod_leg_graph_sample);
+        let (digest_b, _) = run_pod_gang("podleg-graph-b", &dev0, &dev1, pod_leg_graph_sample);
+        let curve_ref = run_pod_reference("podleg-graph-ref", &dev0, 0, pod_leg_graph_sample);
+
+        assert!(
+            !curve_a.is_empty() && !curve_ref.is_empty(),
+            "{TEST}: no per-epoch loss was captured (gang {curve_a:?}, reference {curve_ref:?})"
+        );
+        assert_eq!(
+            digest_a, digest_b,
+            "{TEST}: two same-seed gangs published different adapters"
+        );
+        assert_eq!(
+            curve_a.len(),
+            curve_ref.len(),
+            "{TEST}: the gang and the W=1 reference ran a different number of epochs"
+        );
+        let worst = curve_a
+            .iter()
+            .zip(&curve_ref)
+            .map(|((_, gang), (_, reference))| (gang - reference).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            worst <= GANG_POD_LEG_EPSILON as f64,
+            "{TEST}: the gang's loss curve leaves the W=1 double-batch reference by {worst:e} \
+             (allowed {GANG_POD_LEG_EPSILON:e}): gang {curve_a:?}, reference {curve_ref:?}"
+        );
+    }
+}
+
 #[test]
 fn gang_pod_leg_two_ranks_over_nccl_reproduce_and_match_w1() {
     skip_without_gpu!();
@@ -844,11 +955,11 @@ fn gang_pod_leg_two_ranks_over_nccl_reproduce_and_match_w1() {
         };
 
         // (a) two independent same-seed W=2 gangs -> a reproducible digest pair.
-        let (digest_a, curve_a) = run_pod_gang("podleg-a", &dev0, &dev1);
-        let (digest_b, _curve_b) = run_pod_gang("podleg-b", &dev0, &dev1);
+        let (digest_a, curve_a) = run_pod_gang("podleg-a", &dev0, &dev1, pod_leg_pairs);
+        let (digest_b, _curve_b) = run_pod_gang("podleg-b", &dev0, &dev1, pod_leg_pairs);
 
         // (c) the W=1 x 2B reference, same seed, same data.
-        let curve_ref = run_pod_reference("podleg-ref", &dev0, 0);
+        let curve_ref = run_pod_reference("podleg-ref", &dev0, 0, pod_leg_pairs);
 
         assert!(
             !curve_a.is_empty() && !curve_ref.is_empty(),

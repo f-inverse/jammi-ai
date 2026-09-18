@@ -48,9 +48,9 @@
 //! `cu12-image`, .github/workflows/server-image.yml:770;
 //! `cu12-image`, .github/workflows/server-image.yml:850 (the last reads the same lane a second
 //! time, in `build-cuda-pr`);
-//! `cpu-image`, .github/workflows/kube-smoke.yml:114 and .github/workflows/compose-smoke.yml:107
-//! (the two smoke workflows build the same CPU image, load-only) — eleven call sites over six
-//! manifest lanes, each a
+//! `cpu-image`, .github/workflows/kube-smoke.yml:114;
+//! `cpu-image`, .github/workflows/compose-smoke.yml:107 (the two smoke workflows build the same
+//! CPU image, load-only) — eleven call sites over six manifest lanes, each a
 //! `jq -r '.lanes["<key>"].cargo_features | ...'` invocation this test does not itself verify.
 //! `cu12_features`, ci/scripts/runpod_gpu_prove.sh:287 carries a literal cargo
 //! feature tuple OUTSIDE this universe on purpose (esc-081): it is compared against the

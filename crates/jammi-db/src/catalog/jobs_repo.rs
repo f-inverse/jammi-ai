@@ -1584,8 +1584,8 @@ impl Catalog {
     ///
     /// This is a TERMINAL write, so the same attempt-guarded UPDATE also
     /// retires a still-`pending` `acceleration_report` to
-    /// `{"state":"undetermined","reason":"failed_before_probe"}` (esc-075) —
-    /// see [`JobRecord::acceleration_report`]'s lifecycle section.
+    /// `{"state":"undetermined","reason":"failed_before_probe"}` — see
+    /// [`JobRecord::acceleration_report`]'s lifecycle section.
     pub async fn fail_job(
         &self,
         job_id: &str,
@@ -1593,7 +1593,34 @@ impl Catalog {
         attempts: u32,
         error: &str,
     ) -> Result<bool> {
-        let failed = JobStatus::Failed.to_string();
+        self.end_unsuccessfully(job_id, instance_id, attempts, JobStatus::Failed, error)
+            .await
+    }
+
+    /// End a job the caller still owns because its cancel was requested:
+    /// `running -> cancelled`. The executor calls this when it honours
+    /// `cancel_requested` at a checkpoint. `false` when the attempt guard
+    /// misses. The same terminal write as [`Self::fail_job`], under the status
+    /// that says the job was asked to stop rather than that it could not run.
+    pub async fn cancel_job(&self, job_id: &str, instance_id: &str, attempts: u32) -> Result<bool> {
+        let reason = JammiError::JobCancelled {
+            job_id: job_id.to_string(),
+        }
+        .to_string();
+        self.end_unsuccessfully(job_id, instance_id, attempts, JobStatus::Cancelled, &reason)
+            .await
+    }
+
+    /// The one attempt-guarded `running -> <terminal, unsuccessful>` write.
+    async fn end_unsuccessfully(
+        &self,
+        job_id: &str,
+        instance_id: &str,
+        attempts: u32,
+        status: JobStatus,
+        error: &str,
+    ) -> Result<bool> {
+        let status = status.to_string();
         let running = JobStatus::Running.to_string();
         let job_id = job_id.to_string();
         let instance_id = instance_id.to_string();
@@ -1613,7 +1640,7 @@ impl Catalog {
                     tx.execute(
                         &sql,
                         &[
-                            SqlValue::TextOwned(failed),
+                            SqlValue::TextOwned(status),
                             SqlValue::TextOwned(error),
                             SqlValue::Text(ACCELERATION_REPORT_PENDING),
                             SqlValue::Text(ACCELERATION_REPORT_FAILED_BEFORE_PROBE),
@@ -1927,39 +1954,72 @@ impl Catalog {
         Ok(updated == 1)
     }
 
-    /// Request cancellation of a non-terminal job. Sets `cancel_requested`;
-    /// the executor observes it at a checkpoint boundary. Tenant-scoped with
-    /// the STRICT predicate [`Self::delete_model`] uses; inside
-    /// [`crate::session::JammiSession::with_admin_scope`] the predicate is
-    /// dropped. `false` when the row is absent, out of scope, or already
-    /// terminal (a terminal job cannot be cancelled retroactively).
+    /// Request cancellation of a non-terminal job. `false` when the row is
+    /// absent, out of scope, or already terminal (a terminal job cannot be
+    /// cancelled retroactively).
+    ///
+    /// A job no worker has claimed has nothing to stop, so it is retired here,
+    /// in the request's own transaction: `queued -> cancelled`. A `running`
+    /// job is only flagged (`cancel_requested`); its executor observes the flag
+    /// at a checkpoint boundary and ends the row through [`Self::cancel_job`].
+    /// An `inline` row is never retired here even while `queued`: its submitter
+    /// claims it synchronously in the same call, and owns its outcome.
+    ///
+    /// Tenant-scoped with the STRICT predicate [`Self::delete_model`] uses;
+    /// inside [`crate::session::JammiSession::with_admin_scope`] the predicate
+    /// is dropped.
     pub async fn cancel_request(&self, job_id: &str) -> Result<bool> {
         let admin = TenantBinding::is_admin_scope();
-        let job_id_s = job_id.to_string();
         let tenant = self.current_tenant();
-        let now = canonical_stamp_now();
-        let non_terminal = JobStatus::non_terminal_sql_list();
-        let sql = if admin {
-            format!(
-                "UPDATE jobs SET cancel_requested = TRUE, updated_at = $1 \
-                 WHERE job_id = $2 AND status IN ({non_terminal})"
-            )
+        let scope = if admin {
+            ""
         } else {
-            format!(
-                "UPDATE jobs SET cancel_requested = TRUE, updated_at = $1 \
-                 WHERE job_id = $2 AND status IN ({non_terminal}) \
-                   AND (tenant_id = $3 OR (tenant_id IS NULL AND $3 IS NULL))"
-            )
+            " AND (tenant_id = $3 OR (tenant_id IS NULL AND $3 IS NULL))"
         };
+        let mut params = vec![
+            SqlValue::TextOwned(canonical_stamp_now()),
+            SqlValue::TextOwned(job_id.to_string()),
+        ];
+        if !admin {
+            params.push(SqlValue::from(tenant.map(|t| t.to_string())));
+        }
+        let next = params.len() + 1;
+
+        let retire_report = retire_pending_report_clause(next + 1, next + 2);
+        let retire_sql = format!(
+            "UPDATE jobs SET status = '{cancelled}', cancel_requested = TRUE, error = ${next}, \
+             {retire_report}, updated_at = $1 \
+             WHERE job_id = $2 AND status = '{queued}' AND execution = '{queued_execution}'{scope}",
+            cancelled = JobStatus::Cancelled,
+            queued = JobStatus::Queued,
+            queued_execution = JobExecution::Queued,
+        );
+        let mut retire_params = params.clone();
+        retire_params.extend([
+            SqlValue::TextOwned(
+                JammiError::JobCancelled {
+                    job_id: job_id.to_string(),
+                }
+                .to_string(),
+            ),
+            SqlValue::Text(ACCELERATION_REPORT_PENDING),
+            SqlValue::Text(ACCELERATION_REPORT_FAILED_BEFORE_PROBE),
+        ]);
+
+        let flag_sql = format!(
+            "UPDATE jobs SET cancel_requested = TRUE, updated_at = $1 \
+             WHERE job_id = $2 AND status IN ({non_terminal}){scope}",
+            non_terminal = JobStatus::non_terminal_sql_list(),
+        );
+
         let updated = self
             .backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
-                    let mut params = vec![SqlValue::TextOwned(now), SqlValue::TextOwned(job_id_s)];
-                    if !admin {
-                        params.push(SqlValue::from(tenant.map(|t| t.to_string())));
+                    match tx.execute(&retire_sql, &retire_params).await? {
+                        0 => tx.execute(&flag_sql, &params).await,
+                        retired => Ok(retired),
                     }
-                    tx.execute(&sql, &params).await
                 })
             })
             .await?;

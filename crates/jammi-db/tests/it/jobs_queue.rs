@@ -764,6 +764,112 @@ async fn fail_is_a_lease_guarded_compare_and_set(backend: BackendKind) {
     assert_eq!(after_b.error.as_deref(), Some("real failure"));
 }
 
+/// A cancel requested on a job no worker has claimed retires it at once:
+/// there is nothing running to stop, so it must not wait to be claimed just
+/// to be ended. The row is terminal, names why, and is never handed to a
+/// claimer.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_queued_job_retires_it_without_a_claim(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    catalog.submit_job(job_params("cq")).await.unwrap();
+
+    assert!(catalog.cancel_request("cq").await.unwrap());
+
+    let after = catalog.get_job("cq").await.unwrap();
+    assert_eq!(after.status, JobStatus::Cancelled.to_string());
+    assert!(after.is_terminal());
+    assert!(after.cancel_requested);
+    assert_eq!(after.attempts, 0, "no attempt was ever spent on it");
+    assert!(
+        after.error.as_deref().is_some_and(|e| e.contains("cq")),
+        "the row names why it ended: {:?}",
+        after.error
+    );
+    assert!(
+        catalog
+            .claim_next("worker-a", KINDS, Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_none(),
+        "a cancelled job is never claimed"
+    );
+    assert!(
+        !catalog.cancel_request("cq").await.unwrap(),
+        "a terminal job cannot be cancelled again"
+    );
+}
+
+/// A cancel requested on a running job only flags it — its executor owns the
+/// row until it reaches a checkpoint — and the executor's own lease-guarded
+/// `cancel_job` is what ends it, as `cancelled` rather than `failed`. A worker
+/// that lost the lease cannot end it.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_running_job_flags_it_and_its_owner_ends_it_cancelled(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    catalog.submit_job(job_params("cr")).await.unwrap();
+    let claimed = catalog
+        .claim_next("worker-a", KINDS, Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("worker-a claims");
+
+    assert!(catalog.cancel_request("cr").await.unwrap());
+    let flagged = catalog.get_job("cr").await.unwrap();
+    assert_eq!(
+        flagged.status,
+        JobStatus::Running.to_string(),
+        "a running job is its executor's to end"
+    );
+    assert!(flagged.cancel_requested);
+
+    assert!(
+        !catalog
+            .cancel_job("cr", "worker-b", claimed.attempts)
+            .await
+            .unwrap(),
+        "a worker that does not hold the lease cannot end the job"
+    );
+    assert!(catalog
+        .cancel_job("cr", "worker-a", claimed.attempts)
+        .await
+        .unwrap());
+    let ended = catalog.get_job("cr").await.unwrap();
+    assert_eq!(ended.status, JobStatus::Cancelled.to_string());
+    assert!(ended.error.as_deref().is_some_and(|e| e.contains("cr")));
+}
+
+/// An `inline` row is its submitter's: it claims the row synchronously in the
+/// same call, so a cancel request never retires it out from under that claim.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_queued_inline_job_only_flags_it(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    catalog.submit_job(inline_job_params("ci")).await.unwrap();
+
+    assert!(catalog.cancel_request("ci").await.unwrap());
+
+    let after = catalog.get_job("ci").await.unwrap();
+    assert_eq!(after.status, JobStatus::Queued.to_string());
+    assert!(after.cancel_requested);
+}
+
 /// A live (unexpired) lease is left untouched by reclaim.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(

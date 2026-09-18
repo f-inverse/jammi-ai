@@ -3587,8 +3587,10 @@ mod tests {
     /// loader (all of which sit BEFORE or AFTER `train_run_t0` in every
     /// revision of this function), and one `train_rows.loader(..)` call per
     /// epoch leg — only the per-epoch train calls are candidates for
-    /// re-entering the timed span. On this fixture (2 epochs, probes on) the
-    /// injected run's outer wall clock grows by ~1.5 s, six sleeps.
+    /// re-entering the timed span. On this fixture (2 epochs, probes on)
+    /// six `loader` calls fire; the injected run's outer wall clock grows by
+    /// their sleeps' sum less the process cold-start the plain run pays first
+    /// (measured: ~1.5 s natively, ~1.0 s in the CI image as `linux/amd64`).
     ///
     /// The property is DIFFERENTIAL, never an absolute bound on the real
     /// training span: the same fixture runs twice in this process, once with

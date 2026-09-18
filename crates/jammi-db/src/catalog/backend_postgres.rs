@@ -151,3 +151,17 @@ impl CatalogBackend for PostgresBackend {
         self.pool_size
     }
 }
+
+impl PostgresBackend {
+    /// The raw connection pool, for [`super::backend::BackendImpl::
+    /// query_untransacted`] — a read issued directly against the pool
+    /// (sqlx picks an idle connection, runs the statement standalone, and
+    /// returns it), never wrapped in an explicit `BEGIN`/`SET
+    /// TRANSACTION ...`/`COMMIT` the way [`CatalogBackend::transaction`]
+    /// always pays for (measured: 4 extra round trips for a single
+    /// read-only `SELECT`). `pub(crate)`: only the backend-agnostic
+    /// dispatcher in `backend.rs` calls this.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+}

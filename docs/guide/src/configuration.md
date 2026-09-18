@@ -292,6 +292,19 @@ preload_models = [
 # willing to give one query's fallback loads. 0 is refused. Read by the
 # result store; a library embedder sets it through the same config.
 # peer_local_load_bytes = 268435456
+# Which segment placement this session builds: "local" (the default -- every
+# segment is this process's own, a single node regardless of what else is
+# configured) or "rendezvous" (beyond-one-node retrieval over the LIVE
+# `instances` ring: every segment is scored per live, root-sharing member --
+# self included -- by a rendezvous hash, so membership changes move a near-
+# minimal share of segments and every replica agrees on the owner with no
+# coordination round). "rendezvous" REQUIRES peer_advertise to be set too --
+# refused by name at the same membership choke point peer_advertise's own
+# requirement is (InstanceRegistration::from_config / JammiConfig::load_from);
+# unset peer_bind/peer_advertise is unaffected -- this knob changes nothing
+# about an existing single-node deployment. See "Beyond one node" in
+# reference-topologies.md.
+# placement = "rendezvous"
 
 [server.limits]
 # Request-bounds and refusal policy for the combined gRPC + Flight SQL

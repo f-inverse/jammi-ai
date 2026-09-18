@@ -1795,6 +1795,20 @@ impl ResultStore {
         self
     }
 
+    /// The ring-empty fallback counter this store's placement exposes, if
+    /// any (`RendezvousPlacement`'s own; `AllLocal`/`StaticPlacement` have
+    /// nothing to observe). The server registers this into its metrics
+    /// registry when `Some`, so `jammi_placement_ring_empty_total` is
+    /// actually exported at `/metrics` rather than only kept in-process —
+    /// see [`SegmentPlacement::ring_empty_metrics`]'s doc for why this is a
+    /// trait hook rather than a downcast on the stored `Arc<dyn
+    /// SegmentPlacement>`.
+    pub fn placement_ring_empty_metrics(
+        &self,
+    ) -> Option<Arc<crate::index::peer::RendezvousMetrics>> {
+        self.placement.ring_empty_metrics()
+    }
+
     /// Set the transport a placed search fans remote segments out through.
     /// Defaults to [`NoPeers`].
     pub fn with_peer_transport(mut self, transport: Arc<dyn PeerTransport>) -> Self {
@@ -3222,13 +3236,22 @@ impl ResultStore {
         if segments.is_empty() {
             return Ok(None);
         }
-        let mut owners = Vec::with_capacity(segments.len());
-        for seg in &segments {
-            owners.push(
-                self.placement
-                    .owners(&table.table_name, SegmentId(seg.segment_id))
-                    .await,
-            );
+        // ONE ring read for the whole segment set (RENDEZVOUS RV1): every
+        // segment of this query sees the SAME snapshot of the placement ring,
+        // never a per-segment read that could see the ring move mid-query.
+        let segment_ids: Vec<SegmentId> = segments
+            .iter()
+            .map(|seg| SegmentId(seg.segment_id))
+            .collect();
+        let owners = self.placement.plan(&table.table_name, &segment_ids).await?;
+        if owners.len() != segments.len() {
+            return Err(JammiError::Catalog(format!(
+                "placement returned {} owner lists for {} segments of table '{}' \
+                 (SegmentPlacement::plan must return exactly one entry per requested segment)",
+                owners.len(),
+                segments.len(),
+                table.table_name
+            )));
         }
         let precision = table.storage_precision.unwrap_or_default();
         if owners.iter().all(Vec::is_empty) {

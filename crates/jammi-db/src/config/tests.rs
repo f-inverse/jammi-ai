@@ -3498,6 +3498,61 @@ fn from_config_peer_advertise_without_peer_bind_is_refused_naming_both_keys() {
     );
 }
 
+/// RENDEZVOUS RV4: `[server] placement = "rendezvous"` with no
+/// `peer_advertise` is refused BY NAME from `load_from` — the same choke
+/// point `peer_advertise`-without-`peer_bind` is refused at.
+#[test]
+fn load_from_rendezvous_placement_without_peer_advertise_is_refused_naming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = format!(
+        "artifact_dir = {:?}\n[server]\nplacement = \"rendezvous\"\n",
+        dir.path().to_str().unwrap()
+    );
+    let err = load_src(&src).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("placement") && msg.contains("rendezvous") && msg.contains("peer_advertise"),
+        "{msg}"
+    );
+}
+
+/// The same arm, over `InstanceRegistration::from_config` directly — the
+/// struct-literal-config / embedded-process path `load_from` never reaches.
+#[test]
+fn from_config_rendezvous_placement_without_peer_advertise_is_refused_naming_it() {
+    let cfg = JammiConfig {
+        server: ServerConfig {
+            placement: crate::config::PlacementMode::Rendezvous,
+            ..ServerConfig::default()
+        },
+        ..JammiConfig::default()
+    };
+    let err = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("placement") && msg.contains("rendezvous") && msg.contains("peer_advertise"),
+        "{msg}"
+    );
+}
+
+/// `[server] placement` defaults to `Local` and parses `"rendezvous"`;
+/// `"local"` and unset are both accepted with NO `peer_advertise`.
+#[test]
+fn server_placement_defaults_local_and_parses_rendezvous() {
+    assert_eq!(
+        ServerConfig::default().placement,
+        crate::config::PlacementMode::Local
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let src = format!(
+        "artifact_dir = {:?}\n[server]\nplacement = \"local\"\n",
+        dir.path().to_str().unwrap()
+    );
+    let cfg = load_src(&src).unwrap();
+    assert_eq!(cfg.server.placement, crate::config::PlacementMode::Local);
+}
+
 /// P-X1 (contract §10): `InstanceRegistration::from_config`'s `member_root`
 /// is the byte-for-byte output of `resolved_result_root()` — VERBATIM —
 /// over the whole arm list: unset, `file://`, `memory://`, `s3://`, both

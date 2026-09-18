@@ -137,20 +137,25 @@ impl InferenceSession {
 
     /// [`Self::open`] with an explicit segment placement — which process owns
     /// which ANN index segment, read by the result store at every online
-    /// search resolve. `open` passes [`jammi_db::index::AllLocal`] (every
-    /// segment is this process's — a single node); a library process that
-    /// knows its topology passes a [`jammi_db::index::StaticPlacement`] and
-    /// becomes a full coordinator over the gRPC peer transport
-    /// (`jammi_wire::peer::GrpcPeerTransport`, wired by the store builder).
-    /// Precondition for any non-local placement: `storage.result_root` (or a
-    /// shared local `artifact_dir`) is a root every replica can read,
-    /// spelled IDENTICALLY on every replica. When `[server] peer_advertise`
-    /// is set, this shared-root topology is exactly what
+    /// search resolve. `open` builds a placement from `[server] placement`
+    /// itself ([`jammi_db::index::AllLocal`] by default, or
+    /// [`jammi_db::index::RendezvousPlacement`] when the config names
+    /// `"rendezvous"`); THIS constructor is the explicit override a library
+    /// process that knows its own topology uses instead — a
+    /// [`jammi_db::index::StaticPlacement`], or any other
+    /// `SegmentPlacement` — becoming a full coordinator over the gRPC peer
+    /// transport (`jammi_wire::peer::GrpcPeerTransport`, wired by the store
+    /// builder) regardless of `[server] placement`. Precondition for any
+    /// non-local placement: `storage.result_root` (or a shared local
+    /// `artifact_dir`) is a root every replica can read, spelled IDENTICALLY
+    /// on every replica. When `[server] peer_advertise` is set, this
+    /// shared-root topology is exactly what
     /// [`jammi_db::config::JammiConfig::resolved_result_root`] yields
-    /// verbatim into `instances.result_root` — carried, not consulted:
+    /// verbatim into `instances.result_root` — carried AND consulted:
     /// [`jammi_db::catalog::Catalog::list_gang_members`] admits on address,
-    /// kinds, state and freshness only; root identity and any predicate on
-    /// it are U5b-1a-A2. Identical spelling stays necessary, never
+    /// kinds, state, freshness AND root-identity equality, and
+    /// [`jammi_db::index::RendezvousPlacement`]'s ring evaluates the SAME
+    /// root-identity predicate. Identical spelling stays necessary, never
     /// sufficient, for shared storage (see
     /// [`jammi_db::catalog::instance::InstanceRegistration::from_config`]).
     pub async fn open_with_placement(
@@ -158,7 +163,7 @@ impl InferenceSession {
         placement: Arc<dyn jammi_db::index::SegmentPlacement>,
     ) -> Result<Arc<Self>> {
         let inner = JammiSession::new(config).await?;
-        let session = Arc::new(Self::wrap_with(inner, None, placement).await?);
+        let session = Arc::new(Self::wrap_with(inner, None, Some(placement)).await?);
         session.register_query_functions();
         Ok(session)
     }
@@ -208,13 +213,18 @@ impl InferenceSession {
         inner: JammiSession,
         observer: Option<Arc<dyn InferenceObserver>>,
     ) -> Result<Self> {
-        Self::wrap_with(inner, observer, Arc::new(jammi_db::index::AllLocal)).await
+        Self::wrap_with(inner, observer, None).await
     }
 
+    /// `placement_override: None` means "derive the placement from `[server]
+    /// placement`" (the DEFAULT path, [`Self::open`]/[`Self::new`]/every
+    /// other constructor); `Some(p)` is [`Self::open_with_placement`]'s
+    /// explicit override, which wins regardless of what `[server] placement`
+    /// says.
     async fn wrap_with(
         inner: JammiSession,
         observer: Option<Arc<dyn InferenceObserver>>,
-        placement: Arc<dyn jammi_db::index::SegmentPlacement>,
+        placement_override: Option<Arc<dyn jammi_db::index::SegmentPlacement>>,
     ) -> Result<Self> {
         let inner = Arc::new(inner);
         let catalog = Arc::clone(inner.catalog());
@@ -264,6 +274,26 @@ impl InferenceSession {
             lease_intervals,
         )
         .await?;
+
+        // `[server] placement` resolved AFTER `instance_id` is minted (a
+        // `RendezvousPlacement` names itself by it) and AFTER `lease_intervals`
+        // is known (its ring-liveness margin derives from the SAME lease
+        // window every other leased row family uses) — an explicit override
+        // from `Self::open_with_placement` wins outright, regardless of what
+        // `[server] placement` says.
+        let placement: Arc<dyn jammi_db::index::SegmentPlacement> = match placement_override {
+            Some(placement) => placement,
+            None => match inner.config().server.placement {
+                jammi_db::config::PlacementMode::Local => Arc::new(jammi_db::index::AllLocal),
+                jammi_db::config::PlacementMode::Rendezvous => {
+                    Arc::new(jammi_db::index::RendezvousPlacement::new(
+                        Arc::clone(&catalog),
+                        instance_id.clone(),
+                        jammi_db::catalog::lease::instance_liveness_margin(lease_intervals.lease()),
+                    ))
+                }
+            },
+        };
 
         // The result store is built first: it owns the session's
         // `ArtifactStore` internally (rooted at `{result_store_root}/models`,

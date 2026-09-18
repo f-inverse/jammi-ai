@@ -502,19 +502,30 @@ the port.
 replicas dial, and setting it writes this process's `instances.peer_addr`/
 `result_root` columns (requires `peer_bind` to be set too, refused naming
 both keys otherwise). The row records the configured root SPELLING
-verbatim, but the gang-membership predicate does NOT consult it in this
-unit — root identity across spellings, and any membership predicate built
-on it, is a separate, not-yet-built unit. Root-string equality was never
-more than NECESSARY, never SUFFICIENT, for shared storage: two
-byte-identical roots on two filesystems are indistinguishable to a string
-comparison; the attestation VERIFY (a later unit) is what establishes
-sufficiency. The prune window a stale member's row survives before deletion
-is strictly
+verbatim AND its IDENTITY across spellings (scheme aliases, bucket/key
+normalisation, the location determinants the store's own driver would dial,
+symlink/`.`/`..` resolution for a local root) in `instances.result_root_identity`
+— both the gang-membership predicate (`Catalog::list_gang_members`) and the
+RENDEZVOUS placement ring (`[server] placement = "rendezvous"`, below) admit
+only members whose identity equals the caller's own. Root-identity equality
+is still NECESSARY, never SUFFICIENT, for shared storage: two identical
+identities on two filesystems are indistinguishable to this comparison; the
+attestation VERIFY (a later unit) is what establishes sufficiency. The prune
+window a stale member's row survives before deletion is strictly
 beyond the liveness margin used to judge freshness (`3 × lease` vs. `2 ×
 lease`), so a pruned-but-still-live process rejoins its gang on its very
 next heartbeat with no restart — the lease keeper's reregister re-upserts
 the whole membership tuple (`instances` + its `workers` row, if any) in one
 transaction.
+
+**`[server] placement = "rendezvous"`** turns this SAME membership into a
+segment placement: `Search` on a query-tier replica reads the live ring of
+members sharing its own result root (self included) and rendezvous-hashes
+each segment onto a member — no library-supplied `StaticPlacement`, no
+declared topology. Requires `peer_advertise` too, refused by name at the
+same choke point. See [Beyond one node](./reference-topologies.md#beyond-one-node-retrieval)
+for the mechanism and [Security Posture](./security.md#the-peer-listener-i-peer)
+for what this widens in the peer listener's own trust boundary.
 
 ## Deploying as a container
 

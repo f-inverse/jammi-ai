@@ -1747,6 +1747,30 @@ pub struct CacheConfig {
     pub embedding_cache_size: String,
 }
 
+/// Which [`crate::index::SegmentPlacement`] a session builds:
+/// [`Self::Local`] ([`crate::index::AllLocal`], the default — every segment
+/// is this process's own, a single node regardless of what else is
+/// configured) or [`Self::Rendezvous`] ([`crate::index::RendezvousPlacement`]
+/// over the live `instances` ring — beyond-one-node retrieval). `rendezvous`
+/// with no `[server] peer_advertise` is refused, by name, at the ONE
+/// membership choke point
+/// ([`crate::catalog::instance::MembershipConfig::validate`]) both
+/// [`crate::config::JammiConfig::load_from`] and
+/// [`crate::catalog::instance::InstanceRegistration::from_config`] call —
+/// never here, and never in [`ServerConfig::validate`], which cannot see
+/// whether a segment placement even wants a member row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementMode {
+    /// Every segment is this process's own — [`crate::index::AllLocal`].
+    #[default]
+    Local,
+    /// Beyond-one-node retrieval over the live `instances` ring —
+    /// [`crate::index::RendezvousPlacement`]. Requires `[server]
+    /// peer_advertise`.
+    Rendezvous,
+}
+
 /// Arrow Flight SQL and health-probe server bind addresses.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1812,6 +1836,20 @@ pub struct ServerConfig {
     /// concurrency × budget. Read by the result store; a library embedder sets
     /// it through the same config. `Some(0)` is refused.
     pub peer_local_load_bytes: Option<u64>,
+    /// Which [`crate::index::SegmentPlacement`] this session builds. Default
+    /// [`PlacementMode::Local`] — every existing deployment's behaviour is
+    /// unchanged. `"rendezvous"` requires `peer_advertise` to be set too
+    /// (refused at the membership choke point — see [`PlacementMode`]'s doc).
+    ///
+    /// # TOML
+    ///
+    /// ```toml
+    /// [server]
+    /// placement = "rendezvous"
+    /// peer_bind = "0.0.0.0:9000"
+    /// peer_advertise = "10.0.4.7:9000"
+    /// ```
+    pub placement: PlacementMode,
 }
 
 /// The optional service-tier selection for a server deployment. `All` (the
@@ -2760,6 +2798,7 @@ impl Default for ServerConfig {
             peer_bind: None,
             peer_advertise: None,
             peer_local_load_bytes: None,
+            placement: PlacementMode::default(),
         }
     }
 }

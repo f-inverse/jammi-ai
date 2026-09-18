@@ -23,7 +23,7 @@ use std::sync::{OnceLock, Weak};
 
 use jammi_ai::fine_tune::worker::{LoopState, WorkerShared};
 use jammi_db::catalog::lease_keeper::LeaseKeeper;
-use jammi_db::index::{PeerFailureCounters, PEER_FAILURE_LABELS};
+use jammi_db::index::{PeerFailureCounters, RendezvousMetrics, PEER_FAILURE_LABELS};
 use prometheus::core::{Collector, Desc};
 use prometheus::proto::{Counter, LabelPair, Metric, MetricFamily, MetricType};
 use prometheus::{
@@ -385,6 +385,22 @@ impl MetricsRegistry {
             .register(Box::new(PeerFailureCollector::new(counters)?))
     }
 
+    /// Install a `RendezvousPlacement`'s ring-empty fallback counter (see
+    /// [`jammi_db::index::SegmentPlacement::ring_empty_metrics`]) into this
+    /// registry as `jammi_placement_ring_empty_total`, read at scrape.
+    /// ADDITIVE, same contract as [`Self::install_peer_failures`]. The
+    /// caller (`OssServer::new`) only calls this when
+    /// `ResultStore::placement_ring_empty_metrics` returns `Some` — a
+    /// deployment running the default `AllLocal` placement registers
+    /// nothing, so its `/metrics` output is unchanged.
+    pub fn install_ring_empty(
+        &self,
+        metrics: Arc<RendezvousMetrics>,
+    ) -> Result<(), prometheus::Error> {
+        self.inner
+            .register(Box::new(RingEmptyCollector::new(metrics)?))
+    }
+
     /// Borrow the underlying `prometheus::Registry`. Tests that want to
     /// scrape metrics directly use this to call `.gather()`.
     pub fn inner(&self) -> &Registry {
@@ -452,6 +468,52 @@ impl Collector for PeerFailureCollector {
         family.set_help(Self::HELP.to_string());
         family.set_field_type(MetricType::COUNTER);
         family.set_metric(metrics);
+        vec![family]
+    }
+}
+
+/// The scrape-time adapter over `RendezvousPlacement`'s
+/// [`RendezvousMetrics`]: one bare (unlabelled) `jammi_placement_ring_empty_
+/// total` sample, read from the atomic at every `gather()` — same shape as
+/// [`PeerFailureCollector`], minus the label set (this counter has exactly
+/// one thing to say: how many `plan()` calls fell back to all-local).
+struct RingEmptyCollector {
+    desc: Desc,
+    metrics: Arc<RendezvousMetrics>,
+}
+
+impl RingEmptyCollector {
+    const NAME: &'static str = "jammi_placement_ring_empty_total";
+    const HELP: &'static str = "Total number of RendezvousPlacement::plan calls that fell back \
+        to all-local because the live-ring read came back empty or did not contain this \
+        replica's own row.";
+
+    fn new(metrics: Arc<RendezvousMetrics>) -> Result<Self, prometheus::Error> {
+        let desc = Desc::new(
+            Self::NAME.to_string(),
+            Self::HELP.to_string(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+        )?;
+        Ok(Self { desc, metrics })
+    }
+}
+
+impl Collector for RingEmptyCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        vec![&self.desc]
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let mut counter = Counter::default();
+        counter.set_value(self.metrics.ring_empty_total() as f64);
+        let mut metric = Metric::default();
+        metric.set_counter(counter);
+        let mut family = MetricFamily::default();
+        family.set_name(Self::NAME.to_string());
+        family.set_help(Self::HELP.to_string());
+        family.set_field_type(MetricType::COUNTER);
+        family.set_metric(vec![metric]);
         vec![family]
     }
 }

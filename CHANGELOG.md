@@ -84,8 +84,29 @@ workspace ships every publishable crate at the same
   out-of-tree caller adds the argument (`&[]` reproduces the previous
   behaviour — an empty device list, and every existing row's `devices`
   column already defaults to `[]`).
+- **`jammi_db::index::SegmentPlacement::owners(table, segment) ->
+  Vec<PeerAddr>` is replaced by `plan(table, segments: &[SegmentId]) ->
+  Result<Vec<Vec<PeerAddr>>>` (#500).** One ring read now serves a whole
+  query's segment set instead of one read per segment, and a catalog read
+  failure is a typed `Err` rather than a silent per-segment fallback to
+  local. A caller that implemented `owners` for `AllLocal`/`StaticPlacement`-
+  shaped placements returns one `Vec<PeerAddr>` per input segment, in order
+  (`Ok(vec![Vec::new(); segments.len()])` reproduces `AllLocal`'s old
+  behaviour).
 
 ### Added
+- **`[server] placement = "local" | "rendezvous"` and
+  `jammi_db::index::RendezvousPlacement` (#500).** Beyond-one-node retrieval
+  over the LIVE `instances` ring, derived at query time (never declared):
+  every live, root-sharing replica — self included — is scored by a
+  domain-separated hash of `(instance_id, table, segment_id)`, and the
+  highest-scoring member owns the segment (the second-highest is the one
+  retry candidate). Default `"local"` (`AllLocal`) — no existing deployment's
+  behaviour changes. `"rendezvous"` requires `[server] peer_advertise` too
+  (refused by name at the membership choke point otherwise). A
+  ring read that comes back empty, or does not contain this process's own
+  row, falls back to all-local and is counted
+  (`jammi_placement_ring_empty_total`), never silent.
 - **Two-mode shutdown — SIGTERM = DRAIN, SIGINT = RELEASE — on the server,
   the Rust library and Python (#482).** A DRAIN finishes the in-flight job
   (every epoch bundle lands, `completed` under the same attempt), ends idle

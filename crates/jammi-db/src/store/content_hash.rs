@@ -79,21 +79,91 @@ impl ContentHash {
     }
 }
 
-/// The pure fold: hash one row's rendered cells in column order.
-pub fn content_hash_row(values: &[ContentValue<'_>]) -> ContentHash {
+/// A domain-separated SHA-256 fold: `SHA256(domain ++ parts[0] ++ parts[1]
+/// ++ … )`. `domain_hash` adds NO framing of its own beyond concatenating
+/// `domain` and `parts` in order — making two distinct ordered part
+/// sequences unable to collide by a shifted boundary (`"ab"+"c"` vs
+/// `"a"+"bc"`) is the CALLER's responsibility: this crate's one convention
+/// is that every PART is already self-delimiting (a fixed-width type tag,
+/// or an 8-byte little-endian length immediately followed by its payload —
+/// see [`content_hash_row`]'s per-cell encoding below and
+/// [`crate::index::peer::RendezvousPlacement`]'s per-field encoding). This
+/// is NOT the one primitive every domain-separated hash in this crate folds
+/// through — `crate::store::manifest`'s `definition_hash` and
+/// `crate::store::version::Version::compute_identity` hand-roll the
+/// identical length-prefixed-parts shape under their own domains
+/// (`b"jammi.materialization.definition.v1"`, `b"jammi.version.identity.v1"`)
+/// without calling this function; only [`content_hash_row`] and
+/// [`crate::index::peer::RendezvousPlacement`]'s `rendezvous_score` route
+/// through `domain_hash` itself.
+///
+/// **The domain itself is NOT length-prefixed or otherwise delimited from
+/// `parts`.** Two DIFFERENT domain tags are guaranteed never to collide
+/// (for ANY choice of parts on either side) if and only if NEITHER is a
+/// byte-for-byte PREFIX of the other — when one is, `domain_hash(long,
+/// [payload])` is byte-identical to `domain_hash(short, [long[short.len()..],
+/// payload])`, since both fold the identical concatenated byte stream.
+/// Executed, not asserted: `tests::domain_prefix_is_not_free_by_construction`
+/// (below) constructs exactly this collision. Prefix-freedom of the SET of
+/// domain tags this crate actually folds a hash under (`domain_hash`'s own
+/// two callers above, plus the two hand-rolled folds this doc names) is
+/// therefore the real, load-bearing invariant, and it is GATED —
+/// `crates/jammi-db/tests/it/domain_hash_prefix_free_gate.rs` walks a real
+/// `syn` parse of every tracked `.rs` file under `crates/` (this function is
+/// `pub`, so a caller outside this crate is in scope, not just this crate's
+/// own `src/`), finds every CALL to `domain_hash` (bare, path-qualified, or
+/// reached through a `use ... as` alias), and resolves each call's first
+/// argument — a byte-string literal, a string literal's `.as_bytes()`, or a
+/// `const`/`static` reference resolved against every such item the same
+/// scan finds — into the domain value it folds a hash under. The resolved
+/// set's count is asserted so a new tag cannot silently join unreviewed; an
+/// argument the scan cannot resolve at all (a local variable, a computed
+/// slice) is its own tracked, reviewed finding rather than a silent miss;
+/// and every pair of resolved domains is checked for prefix-freedom — never
+/// reviewed by eye, never a text/regex scan over one spelling of the
+/// literal, and never assumed from the current set's absence of a
+/// counterexample.
+///
+/// Two callers: [`content_hash_row`] (domain [`CONTENT_HASH_DOMAIN`], one
+/// already tag+length+payload-framed part per rendered cell — passed
+/// VERBATIM as this crate's existing per-cell encoding, so extracting this
+/// primitive changes no hash value: `domain_hash(CONTENT_HASH_DOMAIN, parts)`
+/// folds the identical bytes `content_hash_row` folded before this
+/// extraction, in the identical order) and [`crate::index::peer::
+/// RendezvousPlacement`] (domain `b"jammi.placement.v1"`, one length-prefixed
+/// part each for `instance_id`, `table` and the segment id).
+pub fn domain_hash(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(CONTENT_HASH_DOMAIN);
-    for v in values {
-        let (tag, bytes): (u8, &[u8]) = match v {
-            ContentValue::Str(s) => (b's', s.as_bytes()),
-            ContentValue::Bytes(b) => (b'b', b),
-            ContentValue::Null => (b'n', &[]),
-        };
-        hasher.update([tag]);
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
+    hasher.update(domain);
+    for part in parts {
+        hasher.update(part);
     }
-    ContentHash(hasher.finalize().into())
+    hasher.finalize().into()
+}
+
+/// The pure fold: hash one row's rendered cells in column order. Builds one
+/// self-delimiting part per cell — `[tag: 1 byte][len(bytes): 8 bytes
+/// little-endian][bytes]` — and folds them through [`domain_hash`] under
+/// [`CONTENT_HASH_DOMAIN`]; byte-for-byte the same computation this function
+/// ran before `domain_hash` was extracted from it (see that function's docs).
+pub fn content_hash_row(values: &[ContentValue<'_>]) -> ContentHash {
+    let framed: Vec<Vec<u8>> = values
+        .iter()
+        .map(|v| {
+            let (tag, bytes): (u8, &[u8]) = match v {
+                ContentValue::Str(s) => (b's', s.as_bytes()),
+                ContentValue::Bytes(b) => (b'b', b),
+                ContentValue::Null => (b'n', &[]),
+            };
+            let mut part = Vec::with_capacity(1 + 8 + bytes.len());
+            part.push(tag);
+            part.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            part.extend_from_slice(bytes);
+            part
+        })
+        .collect();
+    let parts: Vec<&[u8]> = framed.iter().map(Vec::as_slice).collect();
+    ContentHash(domain_hash(CONTENT_HASH_DOMAIN, &parts))
 }
 
 /// Read cell `i` of an already-rendered column as a [`ContentValue`].
@@ -235,6 +305,107 @@ mod tests {
         assert_eq!(
             hashes.value(2),
             content_hash_row(&[ContentValue::Str("c"), ContentValue::Null]).to_hex()
+        );
+    }
+
+    /// RENDEZVOUS RV5: `content_hash_row` calling the extracted
+    /// [`domain_hash`] primitive must be byte-identical to the fold it ran
+    /// before the extraction — reimplemented here, independently, exactly as
+    /// the pre-refactor function read (SHA-256 over the domain tag, then
+    /// `[tag][len(bytes) as u64 LE][bytes]` per value, with NO call to
+    /// `domain_hash`), over cases spanning every tag and several
+    /// boundary-shift pairs.
+    #[test]
+    fn content_hash_row_is_byte_identical_to_the_pre_extraction_fold() {
+        fn pre_extraction_fold(values: &[ContentValue<'_>]) -> ContentHash {
+            let mut hasher = Sha256::new();
+            hasher.update(CONTENT_HASH_DOMAIN);
+            for v in values {
+                let (tag, bytes): (u8, &[u8]) = match v {
+                    ContentValue::Str(s) => (b's', s.as_bytes()),
+                    ContentValue::Bytes(b) => (b'b', b),
+                    ContentValue::Null => (b'n', &[]),
+                };
+                hasher.update([tag]);
+                hasher.update((bytes.len() as u64).to_le_bytes());
+                hasher.update(bytes);
+            }
+            ContentHash(hasher.finalize().into())
+        }
+
+        let cases: Vec<Vec<ContentValue<'_>>> = vec![
+            vec![ContentValue::Str("hello")],
+            vec![ContentValue::Bytes(b"hello")],
+            vec![ContentValue::Null],
+            vec![ContentValue::Str("ab"), ContentValue::Str("c")],
+            vec![ContentValue::Str("a"), ContentValue::Str("bc")],
+            vec![
+                ContentValue::Str("x"),
+                ContentValue::Null,
+                ContentValue::Bytes(b"y"),
+            ],
+            vec![],
+        ];
+        for case in &cases {
+            assert_eq!(
+                content_hash_row(case),
+                pre_extraction_fold(case),
+                "case {case:?} diverged after extracting domain_hash"
+            );
+        }
+    }
+
+    /// A third domain tag never collides with [`CONTENT_HASH_DOMAIN`] or
+    /// RENDEZVOUS's `b"jammi.placement.v1"`, over the SAME parts, for these
+    /// THREE CONCRETE domains — this is NOT a general "any two domains never
+    /// collide" claim (see `domain_prefix_is_not_free_by_construction`
+    /// immediately below for the general counterexample: two domains where
+    /// one is a byte-prefix of the other DO collide, for a suitable choice
+    /// of parts). What this test excludes is exactly the shape
+    /// `crates/jammi-db/tests/it/domain_hash_prefix_free_gate.rs` verifies
+    /// holds over every domain this crate actually folds a hash under: none
+    /// of `CONTENT_HASH_DOMAIN`, `b"jammi.placement.v1"`, and an unrelated
+    /// third literal is a prefix of another, so they cannot collide this way
+    /// — pairwise prefix-freedom is the real, narrower, gated invariant.
+    #[test]
+    fn domain_hash_separates_by_domain_over_identical_parts() {
+        let parts: &[&[u8]] = &[b"same", b"parts"];
+        let a = domain_hash(CONTENT_HASH_DOMAIN, parts);
+        let b = domain_hash(b"jammi.placement.v1", parts);
+        let c = domain_hash(b"a.third.domain", parts);
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+    }
+
+    /// The GENERAL counterexample `domain_hash`'s own doc now names: when
+    /// one domain is a byte-for-byte PREFIX of another, the two DO collide
+    /// for a suitable choice of parts, because `domain_hash` adds no framing
+    /// around the domain itself — `domain_hash(long, [rest, ...])` and
+    /// `domain_hash(short, [rest_of_long, ...])` fold the identical byte
+    /// stream when `long == short ++ rest_of_long`. `short_domain` is
+    /// SLICED from `long_domain` at runtime (never a second `b"jammi...."`
+    /// literal) so this fixture cannot itself be mistaken for a real domain
+    /// by `domain_hash_prefix_free_gate.rs`'s source scan — it demonstrates
+    /// the vulnerability without adding a new literal to the reviewed set.
+    /// Executed, not asserted: this is exactly why prefix-freedom of the
+    /// domain SET this crate actually uses is the real precondition, gated
+    /// rather than reviewed by eye.
+    #[test]
+    fn domain_prefix_is_not_free_by_construction() {
+        let long_domain: &[u8] = b"jammi.placement.v1";
+        let short_domain: &[u8] = &long_domain[..long_domain.len() - 1]; // "jammi.placement.v"
+        let extra = &long_domain[long_domain.len() - 1..]; // "1"
+        let payload: &[u8] = b"\x31PAYLOAD";
+
+        let via_long_domain = domain_hash(long_domain, &[payload]);
+        // `short_domain ++ extra ++ payload == long_domain ++ payload` exactly,
+        // since `long_domain == short_domain ++ extra`.
+        let via_short_domain_and_extra_part = domain_hash(short_domain, &[extra, payload]);
+        assert_eq!(
+            via_long_domain, via_short_domain_and_extra_part,
+            "a prefix-related domain pair must collide by construction — this is the \
+             counterexample that refutes 'a third domain tag can never collide'"
         );
     }
 

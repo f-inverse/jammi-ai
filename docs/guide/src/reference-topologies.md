@@ -378,15 +378,27 @@ for the failure ladder). Three facts fix the shape:
   owner serves must be a bundle every replica can reach: `[storage]
   result_root` on an object store every replica reads (a local
   `artifact_dir` is one node's). Placement — which replica owns which
-  segment — is derived at query time from the live replica ring
-  (`[server] peer_advertise` + the catalog's `instances` rows, rendezvous-
-  hashed over `(table, segment)`), never declared; the membership half of
-  that ring is the compute-tier substrate's (`peer_advertise`,
-  `instances.peer_addr`), and until it lands a library process supplies an
-  explicit `StaticPlacement` through
-  `InferenceSession::open_with_placement`. Batch builders (the neighbor
-  graph, eval) never fan out: they load the whole table's segment set on the
-  building replica.
+  segment — is derived at query time, never declared. `[server] placement =
+  "rendezvous"` (default `"local"`, i.e. `AllLocal`) builds a
+  `RendezvousPlacement`: for each segment, every LIVE replica sharing this
+  process's own result root — self included — is scored by a domain-separated
+  hash of `(instance_id, table, segment_id)`, and the highest-scoring member
+  owns it (the second-highest is the one retry candidate). Requires `[server]
+  peer_advertise` too (refused by name otherwise, at the same membership choke
+  point `peer_advertise` itself is refused at); the ring is read fresh on
+  every resolve — one query, one snapshot, no coordination round and no
+  background membership loop — from the catalog's `instances` rows
+  (`peer_advertise`, `instances.peer_addr`/`result_root_identity`). A
+  membership change (a replica joining, leaving, or going stale) moves close
+  to the minimal `1/N` share of segments, and a replica whose own row is
+  missing from a healthy ring (or a genuinely empty ring) falls back to
+  all-local rather than serving a stale placement, counted
+  (`jammi_placement_ring_empty_total`) rather than silent. A library process
+  that wants an explicit topology instead — never reading the live ring —
+  passes a `StaticPlacement` through
+  `InferenceSession::open_with_placement`, which overrides `[server]
+  placement` outright. Batch builders (the neighbor graph, eval) never fan
+  out: they load the whole table's segment set on the building replica.
 - **Membership is judged fresh under a margin, pruned only well beyond it.**
   A row missing its heartbeat for `2 × lease` (`instance_liveness_margin`) is
   no longer a fresh member; it is not actually deleted until `3 × lease`

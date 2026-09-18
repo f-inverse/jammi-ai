@@ -47,6 +47,7 @@ mod peer_placement;
 mod peer_service;
 mod probe;
 mod readiness_preload;
+mod rendezvous_metrics;
 mod serve_bind_race;
 mod serve_e2e;
 mod serve_shutdown_modes;

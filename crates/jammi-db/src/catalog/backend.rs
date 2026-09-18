@@ -131,6 +131,75 @@ impl BackendImpl {
         }
     }
 
+    /// Run one read-only `SELECT` directly against the pool — no `BEGIN`, no
+    /// `SET TRANSACTION ISOLATION LEVEL ...`, no `SET TRANSACTION READ
+    /// ONLY`, no `COMMIT`. [`Self::transaction`] pays for all four of those
+    /// on Postgres even for a single statement (`TxOptions { read_only:
+    /// true, .. }` issues `BEGIN` + two `SET TRANSACTION ...` statements +
+    /// `COMMIT` around the caller's own query — four extra round trips for
+    /// what is, by itself, already exactly one). Use this ONLY for a read
+    /// that needs no cross-statement consistency (a single self-contained
+    /// `SELECT`, correct however many rows land in it, evaluated against
+    /// whatever the backend's own snapshot is at that instant) — anything
+    /// that reads-then-writes, or reads two statements that must agree with
+    /// each other, still needs [`Self::transaction`].
+    /// [`crate::catalog::Catalog::list_ring_members`] (the RENDEZVOUS ring
+    /// read) is the first, and as of this writing the only, caller.
+    /// `pub(crate)`, never `pub`: a raw, wrapper-free pool door is exactly
+    /// the shape a FUTURE in-tree caller could reach for the wrong reason
+    /// (a read that actually needs cross-statement consistency, reached for
+    /// this because it looked cheaper) — the one real caller today is
+    /// in-crate, so nothing outside `jammi-db` can construct that risk, and
+    /// widening this back to `pub` is a decision for whoever adds the
+    /// second real caller, not a default this constructor should invite.
+    pub(crate) fn query_untransacted<'a, F, R>(
+        &'a self,
+        stmt: &'a str,
+        params: &'a [SqlValue<'a>],
+        mut row_mapper: F,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<R>, BackendError>> + Send + 'a>>
+    where
+        F: FnMut(&Row<'_>) -> Result<R, BackendError> + Send + 'a,
+        R: Send + 'a,
+    {
+        match self {
+            BackendImpl::Sqlite(b) => {
+                let pool = b.pool();
+                Box::pin(async move {
+                    let mut q = sqlx::query(stmt);
+                    for p in params {
+                        q = bind_sqlite(q, p);
+                    }
+                    let rows = q.fetch_all(pool).await.map_err(classify)?;
+                    rows.iter()
+                        .map(|r| {
+                            row_mapper(&Row {
+                                inner: RowInner::Sqlite(r),
+                            })
+                        })
+                        .collect()
+                })
+            }
+            BackendImpl::Postgres(b) => {
+                let pool = b.pool();
+                Box::pin(async move {
+                    let mut q = sqlx::query(stmt);
+                    for v in params {
+                        q = bind_postgres(q, v);
+                    }
+                    let rows = q.fetch_all(pool).await.map_err(classify)?;
+                    rows.iter()
+                        .map(|r| {
+                            row_mapper(&Row {
+                                inner: RowInner::Postgres(r),
+                            })
+                        })
+                        .collect()
+                })
+            }
+        }
+    }
+
     pub fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + '_>> {
         match self {
             BackendImpl::Sqlite(b) => b.migrate(),

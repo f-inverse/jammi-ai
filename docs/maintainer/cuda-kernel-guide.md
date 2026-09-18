@@ -1,9 +1,6 @@
 # Writing a fused CUDA kernel for jammi
 
-*Single source of truth for kernel work in `crates/jammi-kernels`.* The local agent skill
-`.claude/skills/jammi-cuda-kernels/` is a thin pointer at this file — `.claude/*` is gitignored
-(`.gitignore:64-69` allowlists only `agents/`, `hooks/`, `evals/`, `settings.json`, `AGENTS.md`),
-so the knowledge lives here and the skill indexes it, never copies it.
+*Single source of truth for kernel work in `crates/jammi-kernels`.*
 
 Adapted in spirit from HuggingFace's `cuda-kernels` agent skill, but the substrate is different and
 most of their scaffolding does not transfer. **What transfers:** architecture-aware optimisation
@@ -330,8 +327,7 @@ because it was a small share of runtime. An isolated number alone is not a resul
 
 ## 6. Process
 
-Mutating work goes through the rigor chain (`AGENTS.md`); a kernel change is not exempt.
-The two steps that catch kernel bugs specifically: **pressure-test the design before code**
-(a wrong kernel design compiles and passes its own tests), and **fix-verifier / red-green** — revert
+The two habits that catch kernel bugs specifically: **pressure-test the design before code**
+(a wrong kernel design compiles and passes its own tests), and **red-green** — revert
 the fix, keep the test, require RED. If the test is green on the broken build, it is not an oracle,
 whatever else it asserts.

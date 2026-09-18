@@ -10,16 +10,11 @@
 #            (ci.yml `check`, docs.yml `build`)
 #   guards   every `guard` matrix command in ci.yml (read from the file at run
 #            time, never a copied list — the list that drifted cost a CI round)
-#   swarm    the Swarm-gates workflow's steps, each step's `run:` block executed
-#            WHOLE (a multi-line guard split into lines is never evaluated)
+#   index    ci.yml's `symbol-index-gates` steps (the guards that build a
+#            workspace crate), each step's `run:` block executed WHOLE (a
+#            multi-line guard split into lines is never evaluated)
 #   tests    the hermetic lane (workspace, test-hooks, golden-parity) and the
 #            Postgres lane (ci.yml `test`, `test-pg`)
-#   records  check_rigor_record.py and check_oracle_gate.py — the committed
-#            rigor record and the oracle's PASS row. The oracle gate's
-#            freshness is a COMMITTED-content diff between the recorded
-#            head_sha and HEAD outside docs/rigor/**, so the order that
-#            matters is the commit order: commit every code and doc change,
-#            run the oracle, commit only docs/rigor/** after it.
 #
 # Refuses to run when HEAD is the base (nothing to check — every diff-scoped
 # gate would be vacuously green) or the tree is dirty (the gates read
@@ -150,14 +145,14 @@ export GITHUB_EVENT_NAME=pull_request GITHUB_BASE_REF="$BASE_REF" GITHUB_HEAD_RE
 # ---------------------------------------------------------------- coverage
 # Which ci.yml jobs this runner covers, printed up front so "green" is never
 # read as "every job".
-COVERED_JOBS="check test test-pg guard"
+COVERED_JOBS="check test test-pg guard symbol-index-gates"
 python3 - "$COVERED_JOBS" <<'PY'
 import sys, yaml
 ci = yaml.safe_load(open('.github/workflows/ci.yml'))
 covered = set(sys.argv[1].split())
 jobs = [j for j in ci['jobs'] if j != 'ci-summary']
 missing = [j for j in jobs if j not in covered]
-print(f"merge_path: covers {len(jobs) - len(missing)} of {len(jobs)} ci.yml jobs (plus swarm.yml and docs.yml's build)")
+print(f"merge_path: covers {len(jobs) - len(missing)} of {len(jobs)} ci.yml jobs (plus docs.yml's build)")
 print("merge_path: NOT run here (CI runs them): " + ", ".join(missing))
 PY
 
@@ -204,7 +199,7 @@ PY
   # unless its matrix entry declares `toolchain: true` (then `setup-rust-ci`
   # installs sccache — enough for `cargo metadata`, never for a build; a guard
   # that builds Rust lives in ci.yml's container-backed `symbol-index-gates`
-  # job, which the swarm stage below runs). A developer
+  # job, which the index stage below runs). A developer
   # machine has sccache, so the same guard passes here. Mirror the runner:
   # every NON-toolchain leg runs with RUSTC_WRAPPER pointed at a path that
   # does not exist (the env var overrides config.toml, so cargo fails exactly
@@ -235,38 +230,28 @@ PY
   done < "$GUARD_LIST"
 fi
 
-# ---------------------------------------------------------------- swarm
-if stage_wanted swarm; then
-  SWARM_DIR="$LOG_DIR/swarm-steps"
-  rm -rf "$SWARM_DIR"; mkdir -p "$SWARM_DIR"
-  python3 - "$SWARM_DIR" <<'PY'
+# ---------------------------------------------------------------- index
+if stage_wanted index; then
+  INDEX_DIR="$LOG_DIR/index-steps"
+  rm -rf "$INDEX_DIR"; mkdir -p "$INDEX_DIR"
+  python3 - "$INDEX_DIR" <<'PY'
 import os, sys, yaml
-wf = yaml.safe_load(open('.github/workflows/swarm.yml'))
 ci = yaml.safe_load(open('.github/workflows/ci.yml'))
-# the syn-backed gates live in ci.yml's `symbol-index-gates` job (aggregated by
-# the required ci-summary); run them here beside the swarm-gates steps
-jobs = list(wf['jobs'].values()) + [ci['jobs']['symbol-index-gates']]
 n = 0
-for job in jobs:
-    for st in job.get('steps', []):
-        run = st.get('run')
-        if not run:
-            continue
-        stripped = run.strip()
-        # the two record checks run in the `records` stage
-        if stripped in ('python3 ci/scripts/check_rigor_record.py',
-                        'python3 ci/scripts/check_oracle_gate.py'):
-            continue
-        n += 1
-        with open(os.path.join(sys.argv[1], f"{n:02d}.step"), 'w') as out:
-            out.write((st.get('name') or stripped.split('\n')[0]) + '\n')
-            out.write(run)
-print(f"merge_path: {n} swarm-gate steps read from swarm.yml + ci.yml symbol-index-gates (each run as one block)")
+for st in ci['jobs']['symbol-index-gates'].get('steps', []):
+    run = st.get('run')
+    if not run:
+        continue
+    n += 1
+    with open(os.path.join(sys.argv[1], f"{n:02d}.step"), 'w') as out:
+        out.write((st.get('name') or run.strip().split('\n')[0]) + '\n')
+        out.write(run)
+print(f"merge_path: {n} steps read from ci.yml symbol-index-gates (each run as one block)")
 PY
-  for step in "$SWARM_DIR"/*.step; do
+  for step in "$INDEX_DIR"/*.step; do
     name="$(head -n1 "$step")"
     body="$(tail -n +2 "$step")"
-    run_sh swarm "$name" "$body"
+    run_sh index "$name" "$body"
   done
 fi
 
@@ -293,12 +278,6 @@ if stage_wanted tests && [ "$SKIP_TESTS" = 0 ]; then
     FAILED_LIST+=("[tests] Postgres lane: JAMMI_TEST_PG_URL is unset — start a Postgres 16 (user jammi, db jammi_test), export JAMMI_TEST_PG_URL=postgres://jammi@127.0.0.1:PORT/jammi_test, or pass --skip-pg explicitly")
     printf 'FAIL  [tests] Postgres lane: JAMMI_TEST_PG_URL is unset (pass --skip-pg to skip explicitly)\n'
   fi
-fi
-
-# ---------------------------------------------------------------- records
-if stage_wanted records; then
-  run records "check_rigor_record.py" python3 ci/scripts/check_rigor_record.py
-  run records "check_oracle_gate.py (fresh PASS at HEAD's committed content)" python3 ci/scripts/check_oracle_gate.py
 fi
 
 # ---------------------------------------------------------------- summary

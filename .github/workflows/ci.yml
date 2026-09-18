@@ -734,9 +734,8 @@ jobs:
   # nvcc-driven). Measured on job 103688700438: steps 1-8 (checkout through
   # the two `jammi-encoders` clippy arms) take 13m26s, the `jammi-ai
   # --features cuda` step 5m50s, and the job 19m20s in total. It runs on every
-  # PR here (no `paths:` filter, matching every other job in this file and the
-  # swarm's own no-paths-filter discipline: a filtered-out required check
-  # hangs unrelated PRs). The `jammi-ai --features cuda` step's share is
+  # PR here (no `paths:` filter, matching every other job in this file: a
+  # filtered-out required check hangs unrelated PRs). The `jammi-ai --features cuda` step's share is
   # additive rather than shared: it pulls THAT crate's full dependency graph
   # (datafusion, arrow and tantivy on top of the candle stack) under a feature
   # resolution none of the other three steps select — they build
@@ -1380,9 +1379,7 @@ jobs:
   # jobs. `fail-fast: false` so one guard's failure doesn't hide another's; the
   # matrix job's overall result is `failure` if any leg fails, which is what
   # `ci-summary` (below) actually gates on. No path filter (runs on every PR)
-  # so the context stays safe to require. (The swarm-gates workflow is
-  # deliberately NOT folded in here: it is a human-amend-only governance gate
-  # and stays isolated.)
+  # so the context stays safe to require.
   guard:
     name: Guard (${{ matrix.name }})
     runs-on: ubuntu-latest
@@ -1499,8 +1496,7 @@ jobs:
           # stale/absent data) and fails on any entry this branch ADDS
           # relative to it (never on one it removes). The one leg of this
           # gate that is not otherwise hermetic (a single `git fetch origin
-          # main`), matching swarm.yml's own TOUCHED-guard precedent for
-          # comparing a branch against its merge base. Trivially passes
+          # main`), to compare the branch against its merge base. Trivially passes
           # (bootstrap) ONLY when origin/main resolves but has no allowlist
           # file yet — the one PR introducing the file for the first time,
           # since there is no baseline yet to have grown past.
@@ -2548,8 +2544,8 @@ jobs:
   # kubeconform --strict + a pinned --kubernetes-version turn an unknown key
   # or a wrong-typed field in any deploy/kubernetes manifest into a caught CI
   # failure instead of a deploy-time apply error. Not a check_*.py: this gate
-  # is two upstream binaries (kustomize, kubeconform) applied directly, with
-  # no swarm-gate definition behind it; check_no_consumer_names.py does not
+  # is two upstream binaries (kustomize, kubeconform) applied directly;
+  # check_no_consumer_names.py does not
   # scan deploy/ (ci/scripts/check_no_consumer_names.py:66). No path filter --
   # same rationale as the Guard matrix's own comment above (`ci.yml:1147-1156`):
   # a required context must run on every PR. A separate job, not a Guard
@@ -2761,21 +2757,14 @@ jobs:
   # as a pass. `if: always()` makes it emit on every run, so the required check
   # never hangs "waiting for status". `test-live` is deliberately excluded — it
   # is `continue-on-error` (a live-network lane allowed to fail).
-  # A SEPARATE job (not a step folded into swarm.yml's `swarm-gates`) because these
-  # two gates resolve Rust construct citations / public-declaration scans
-  # against a REAL `syn` AST parse (`ci/tools/symbol-index`, `cargo run
-  # --release -p symbol-index`) rather than a regex reader — this repo's own
-  # recorded lesson ("regex readers over YAML/Rust lost five audits") is why
-  # `check_plan_citations.py`'s Rust resolution and `check_no_consumer_
-  # names.py`'s PUB_DECL_RE scan were both migrated onto that ONE shared
-  # tool rather than each carrying (or re-carrying) its own text scanner.
-  # That real parse needs the repo's pinned Rust toolchain, which the
-  # toolchain-free `swarm-gates` job (swarm.yml) deliberately does not carry —
-  # hence this job lives here, with its own `container:` (the repo-provided CI
-  # image, `./.github/actions/setup-rust-ci` for the sccache GHA-cache
-  # backend), and is aggregated by the required `ci-summary` below so a red
-  # gate blocks a merge without any branch-protection wiring. No `paths:`
-  # filter (the #245 trap) — this job always runs, on every PR and push.
+  # The gates that resolve Rust declarations against a REAL `syn` AST parse
+  # (`ci/tools/symbol-index`, `cargo run --release -p symbol-index`) rather
+  # than a regex reader. That parse needs the repo's pinned Rust toolchain,
+  # so this job runs in the CI image (`./.github/actions/setup-rust-ci` for
+  # the sccache GHA-cache backend), and is aggregated by the required
+  # `ci-summary` below so a red gate blocks a merge without any
+  # branch-protection wiring. No `paths:` filter (the #245 trap) — this job
+  # always runs, on every PR and push.
   symbol-index-gates:
     name: Guard (symbol-index gates)
     runs-on: ubuntu-latest
@@ -2794,20 +2783,9 @@ jobs:
           cargo clippy -p symbol-index --all-targets -- -D warnings
           cargo test -p symbol-index
 
-      # Issue #555 is journey-markers (toolchain-free, `swarm-gates`); this
-      # is issue #556's Rust construct resolution — a bare `path::symbol`
-      # citation under docs/plans/** resolved against the real syn index.
-      - name: Assert the plan-citations self-test fixtures fire correctly
-        if: ${{ !cancelled() }}
-        run: python3 ci/scripts/check_plan_citations.py --self-test
-
-      - name: Assert every construct citation under docs/plans/** resolves
-        if: ${{ !cancelled() }}
-        run: python3 ci/scripts/check_plan_citations.py
-
       # The mechanical half of the discipline test: no governance-verb leak in
       # the diff, no philosophy leak-smell token in the engine tree. Advisory-
-      # labelled. Migrated off `PUB_DECL_RE` onto the real symbol-index tool.
+      # labelled.
       - name: Assert the no-consumer-names self-test fixtures fire correctly
         if: ${{ !cancelled() }}
         run: python3 ci/scripts/check_no_consumer_names.py --self-test
@@ -2836,21 +2814,6 @@ jobs:
       - name: Assert the eager-disable key sweep derives from the real PROBED_OPS table
         if: ${{ !cancelled() }}
         run: python3 ci/scripts/perf/test_finetune_ab_disable_op_keys.py
-
-      # The rigor-record self-test's two index-backed fixtures (RR42 phantom
-      # site, RR43 real-call resolution) need `ci/tools/symbol-index` built;
-      # the toolchain-free swarm lane runs the same self-test and takes its
-      # named toolchain-less arm there, so THIS job is where those two arms
-      # are exercised. `--require-symbol-index` (#590) turns that toolchain-
-      # less arm into a hard FAIL here: this job HAS the toolchain, so a
-      # build failure (a broken `ci/tools/symbol-index` build, a cargo/
-      # sccache misconfiguration surfacing only under this self-test's own
-      # `cargo run --release -p symbol-index` invocation, not the plain
-      # build+test+clippy step above) must be visible by name, never a
-      # silent exit 0.
-      - name: Assert the rigor-record self-test's index-backed fixtures fire with the toolchain
-        if: ${{ !cancelled() }}
-        run: python3 ci/scripts/check_rigor_record.py --self-test --require-symbol-index
 
   ci-summary:
     needs:

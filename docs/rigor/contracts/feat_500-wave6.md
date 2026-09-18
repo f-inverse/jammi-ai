@@ -81,7 +81,7 @@ S2 (the read-only DataFusion registry, `keep/seal-s2-built` = a13ad1cb), GRAPH (
   cross-checks the derived closure for every lane (both directions red under mutation, executed by audit #2); the
   Dockerfile's `ARG CARGO_FEATURES` carries no default in either stage and each builder RUN is guarded by
   `${CARGO_FEATURES:?}`, asserted by `shipped_feature_exposure.rs` (the lead executed the added-default mutation at
-  Dockerfile:63 → red by name); every workflow build site reads the manifest (nine sites over six lanes, listed in
+  Dockerfile:63 → red by name); every workflow build site reads the manifest (eleven sites over six lanes, listed in
   that test's doc). The PyYAML gate over workflow scalars was built and excised by the pre-committed fallback after
   blocking twice (§5).
 
@@ -337,6 +337,7 @@ reviewed in the wall-clock-bound inventory.
 | 5a066041 | tests | 6 | 0 | hermetic workspace, jammi-db test-hooks, encoders golden-parity, three Postgres lanes |
 | f813aee5 | static, records | 9 | 1 — oracle gate (no oracle record yet) | static all green (fmt, clippy workspace + gated surfaces + postgres, rustdoc, mdbook); `check_rigor_record.py` OK |
 | 1845253c | static, guards, swarm, tests, records | — | — | the doc-claims lens fold (20 prose claims re-anchored, two mechanisms aligned to their stated property; three read-only auditors, 145 files, 408 claims); the closing run on the final tip, result on the PR |
+| 97fcbd6f | (CI, PR #592 on d0c8f414) | — | 3 — Kubernetes smoke (the load-only image build passed no `CARGO_FEATURES`, refused by the Dockerfile's own guard), hermetic Test (the mining pin's Linux constant was `None` by design and failed by name), oracle gate (the record's head_sha was orphaned by a records amend) | 97fcbd6f: both smoke workflows read the `cpu-image` lane (eleven sites); the Linux pair pinned from the run's stdout; the oracle re-run on this tip and its record added as a new commit, never an amend |
 
 Lanes dispatched from the branch: release-binaries 35300438931 (success, the jail report captured — GATES P4 §4(iii) precondition), server-image 35300440387 (success), gpu-prove 35304096937 (four legs, result recorded on the PR).
 

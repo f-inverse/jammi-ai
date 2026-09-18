@@ -164,7 +164,10 @@ S2 (the read-only DataFusion registry, `keep/seal-s2-built` = a13ad1cb), GRAPH (
 - RV6: one untransacted statement per placed search (`BackendImpl::query_untransacted`, `pub(crate)`, one caller);
   measured 3.9–5.0 ms at 101 rows and 10.2–10.9 ms at 10,101 rows on the scratch host, reproduced independently by
   audit #2 (2.07 / 8.43 ms), with the EXPLAIN reason (Seq Scan; `idx_instances_seen` is on `last_seen_at` alone and
-  `result_root_identity` is unindexed) stated in the doc.
+  `result_root_identity` is unindexed) stated in the doc. The cost test's bound is host-relative (0ddf189e): the ring
+  read ≤ 4× a plain transfer of the same rows through the same process's pool + 2 ms — CI's shared runner measured
+  24.9 ms against the earlier absolute 20 ms budget with the predicate unchanged; measured locally 1.2–1.3× at 10k
+  rows, ~5× at 101 rows within the floor.
 - RV7: the distributed lane's placed-search leg (per-fleet placement knob, shared-MinIO embedded table, owner-side
   `/metrics` read, K4 byte parity, D8 retry_ok + UNAVAILABLE with real kills) run live 4/4 by the implementer on
   native darwin MinIO + the scratch Postgres; the timing coupling (worker-2's row must still be live while the
@@ -341,6 +344,7 @@ reviewed in the wall-clock-bound inventory.
 | 73335961 | static, guards, swarm, tests, records | — | — | the mining pin as a plain per-platform constant (oracle A5/A6); the closing run on the final tip, result on the PR |
 | 92de9197 | static, guards, swarm, records | — | — | the two smoke-build citations one per line (the resolver's shape); the closing run on the final tip, result on the PR |
 | f3b64bcb | CI-image reproduction (not a merge-path stage) | 2 | 0 | `ghcr.io/f-inverse/jammi-ai-ci:latest` run as `linux/amd64` on the lead's host (x86_64 via Rosetta, `fma`+`avx2`, rustc 1.94.0), clean clone of the tip, the hermetic job's env: `cargo test -p jammi-ai --test it training_set::hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it_unreached -- --exact --nocapture` → `test result: ok. 1 passed` with all eight `MINING_ADAPTER_PRINTS` digests identical to CI run 35334270497 (the second Linux capture); `docker build --build-arg CARGO_FEATURES=jetstream-broker,storage-cloud .` of the root Dockerfile → exit 0 (the smoke workflows' build-arg path on the Dockerfile side). Logs: `ci-image-amd64-mining.log`, `smoke-image-build.log` in the session scratchpad |
+| 0ddf189e | (CI, PR #592 on 88f3be5e) | — | 1 — Test (Postgres): `ring_read_cost_is_measured_at_100_and_10k_instance_rows`, 24.9 ms vs an absolute 20 ms budget calibrated on this host | the bound made host-relative (0ddf189e); 3/3 green on the scratch Postgres; CI-image `linux/amd64` run recorded below; the `from_millis` bounds gap filed as #600 |
 
 Lanes dispatched from the branch: release-binaries 35300438931 (success, the jail report captured — GATES P4 §4(iii) precondition), server-image 35300440387 (success), gpu-prove 35304096937 (four legs, result recorded on the PR).
 

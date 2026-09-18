@@ -169,6 +169,17 @@ class TrainingError(JammiError, RuntimeError):
     """
 
 
+class JobCancelled(JammiError, RuntimeError):
+    """A job reached the ``cancelled`` terminal state.
+
+    Raised by a job's ``wait()`` when its cancel was requested: a job no worker
+    had claimed is cancelled at once, a running one at its executor's next
+    checkpoint. Distinct from :class:`TrainingError` so a caller can tell the
+    end it asked for from a fault. Refines :class:`RuntimeError`, as
+    :class:`TrainingError` does.
+    """
+
+
 class BackendError(JammiError, RuntimeError):
     """A transport or engine runtime failure that is not a caller error.
 

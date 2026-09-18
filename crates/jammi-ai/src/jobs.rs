@@ -33,12 +33,16 @@
 //! payload shapes the compiled kinds produce: a `Model` (every training
 //! kind) and a `Table` (every compute kind).
 //!
-//! **Cancellation.** `Catalog::cancel_request` sets `jobs.cancel_requested`;
-//! the COMPUTE executor observes it at three checkpoint boundaries — after
+//! **Cancellation.** `Catalog::cancel_request` ends a job no worker has
+//! claimed at once (`queued -> cancelled`) and flags a running one
+//! (`jobs.cancel_requested`), which its executor ends `cancelled` through the
+//! lease-guarded `Catalog::cancel_job`. [`UnsuccessfulEnd`] decides `failed`
+//! versus `cancelled` from the executor's typed error.
+//! The COMPUTE executor observes the flag at three checkpoint boundaries — after
 //! the claim ([`crate::session::InferenceSession::run_now`],
 //! `JobWorker::run_claimed_compute_job`) and before dispatch
 //! ([`crate::jobs::execute_compute`]) — through [`crate::jobs::check_cancel`],
-//! failing the row with [`jammi_db::error::JammiError::JobCancelled`]'s message. Every compute producer is a
+//! which returns [`jammi_db::error::JammiError::JobCancelled`]. Every compute producer is a
 //! single-shot write with no mid-table checkpoint, so a request that lands
 //! after the producer has started is honoured only in the sense that it
 //! stays recorded on the row: the run completes and the row finishes
@@ -52,8 +56,7 @@
 //! cancel flag the trainer's own epoch-boundary check already reads for a
 //! lost lease, so the SAME [`crate::fine_tune::worker::JobWorker::
 //! run_claimed_job`] that already stops training on a lost lease also stops
-//! it — and fails the row with [`jammi_db::error::JammiError::JobCancelled`]'s
-//! message — on a genuine cancel request. See that module's
+//! it — and ends the row `cancelled` — on a genuine cancel request. See that module's
 //! cooperative-cancellation doc.
 
 use std::sync::Arc;
@@ -878,6 +881,41 @@ pub async fn check_cancel(catalog: &Catalog, job_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// How a claimed job ends without its result: it could not run, or it was
+/// asked not to. Decided from the executor's typed error, so a
+/// [`JammiError::JobCancelled`] is never recorded as a failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnsuccessfulEnd {
+    Failed(String),
+    Cancelled,
+}
+
+impl From<&JammiError> for UnsuccessfulEnd {
+    fn from(error: &JammiError) -> Self {
+        match error {
+            JammiError::JobCancelled { .. } => Self::Cancelled,
+            other => Self::Failed(other.to_string()),
+        }
+    }
+}
+
+impl UnsuccessfulEnd {
+    /// The lease-guarded terminal write for this end. `false` when the
+    /// attempt guard misses (the caller no longer owns the job).
+    pub(crate) async fn record(
+        &self,
+        catalog: &Catalog,
+        job_id: &str,
+        instance_id: &str,
+        attempts: u32,
+    ) -> Result<bool> {
+        match self {
+            Self::Failed(error) => catalog.fail_job(job_id, instance_id, attempts, error).await,
+            Self::Cancelled => catalog.cancel_job(job_id, instance_id, attempts).await,
+        }
+    }
+}
+
 fn table_result(record: ResultTableRecord, outcome: CacheOutcome) -> JobResult {
     let cache_outcome = match outcome {
         CacheOutcome::Computed => "computed".to_string(),
@@ -916,10 +954,10 @@ impl JobHandle {
     }
 
     /// Block until the job reaches a terminal state, returning the parsed
-    /// [`JobResult`] on success. A `failed` job surfaces its recorded error
-    /// as a typed [`JammiError::FineTune`] (matching
-    /// [`crate::fine_tune::training_job::TrainingJob::wait`]'s error shape,
-    /// which this generalises).
+    /// [`JobResult`] on success. A job that ended without its result surfaces
+    /// [`JobRecord::unsuccessful_error`](jammi_db::catalog::jobs_repo::JobRecord::unsuccessful_error):
+    /// its recorded error for a `failed` job, [`JammiError::JobCancelled`] for
+    /// a `cancelled` one.
     pub async fn wait(&self) -> Result<JobResult> {
         loop {
             let record = self.catalog.get_job(&self.job_id).await?;
@@ -945,20 +983,19 @@ impl JobHandle {
                         self.job_id
                     ))
                 });
-            } else if status.is_terminal_unsuccessful() {
-                let msg = record.error.unwrap_or_else(|| "job failed".into());
-                return Err(JammiError::FineTune(msg));
+            } else if let Some(error) = record.unsuccessful_error() {
+                return Err(error);
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
 
-    /// Request cancellation. `true` means the request is recorded on a
-    /// still non-terminal row and the executor will honour it at its next
-    /// checkpoint boundary (see the module docs' cancellation section):
-    /// the job then lands `failed` with [`JammiError::JobCancelled`]'s
-    /// message, and [`Self::wait`] surfaces that message. `false` when the
-    /// job is already terminal or absent.
+    /// Request cancellation. `true` means the request took effect: a job no
+    /// worker had claimed is `cancelled` already; a running one is flagged and
+    /// its executor ends it `cancelled` at its next checkpoint boundary (see
+    /// the module docs' cancellation section). [`Self::wait`] then returns
+    /// [`JammiError::JobCancelled`]. `false` when the job is already terminal
+    /// or absent.
     pub async fn cancel(&self) -> Result<bool> {
         self.catalog.cancel_request(&self.job_id).await
     }
@@ -1157,9 +1194,8 @@ impl InferenceSession {
                 // the benign race (a peer somehow holds this attempt's
                 // lease already) and stays a debug log; a genuine catalog
                 // `Err` is surfaced at error level so it is never silent.
-                match self
-                    .catalog()
-                    .fail_job(&job_id, &instance_id, claimed.attempts, &e.to_string())
+                match UnsuccessfulEnd::from(&e)
+                    .record(self.catalog(), &job_id, &instance_id, claimed.attempts)
                     .await
                 {
                     Ok(true) => {}

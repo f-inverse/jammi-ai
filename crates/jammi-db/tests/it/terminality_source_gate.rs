@@ -164,15 +164,14 @@ fn leading_ident(s: &str) -> &str {
 
 /// A literal job-status terminality compare, in either direction: `<expr
 /// ending in "status"> (==|!=) "<vocab>"` or the reverse `"<vocab>"
-/// (==|!=) <expr ending in "status">`. The vocabulary scanned is exactly
-/// [`jammi_db::catalog::status::JobStatus::ALL`]'s rendered set
-/// (`"queued"`, `"running"`, `"completed"`, `"failed"`) —
-/// literal-string-derived here (this file cannot depend on the library
-/// crate's enum from a plain text scan) but checked for completeness by
-/// [`the_scanned_vocabulary_matches_job_status_all`] below, which DOES
-/// import the enum.
+/// (==|!=) <expr ending in "status">`. The vocabulary scanned is
+/// [`jammi_db::catalog::status::JobStatus::ALL`]'s rendered set, read from the
+/// enum, so a status joining it is scanned for with no edit here.
 fn find_literal_status_compares(text: &str) -> Vec<(usize, String)> {
-    const VOCAB: &[&str] = &["queued", "running", "completed", "failed"];
+    let vocabulary: Vec<String> = jammi_db::catalog::status::JobStatus::ALL
+        .iter()
+        .map(|status| status.to_string())
+        .collect();
     let mut out = Vec::new();
     for (idx, line) in text.lines().enumerate() {
         let trimmed = line.trim_start();
@@ -180,7 +179,7 @@ fn find_literal_status_compares(text: &str) -> Vec<(usize, String)> {
         if trimmed.starts_with("//") || trimmed.starts_with('#') {
             continue;
         }
-        for vocab in VOCAB {
+        for vocab in &vocabulary {
             let forward = format!("\"{vocab}\"");
             if let Some(pos) = line.find(&forward) {
                 let before = line[..pos].trim_end();
@@ -297,33 +296,6 @@ fn no_literal_job_status_terminality_compare_outside_the_one_predicate_python() 
         "literal job-status terminality compare(s) found outside \
          clients/python/jammi/_database.py's _TERMINAL_STATES/_TERMINAL_UNSUCCESSFUL_STATES \
          (derive from those sets instead): {hits:#?}"
-    );
-}
-
-/// Completeness check on the scanner's own hard-coded vocabulary (family M:
-/// this scan and `JobStatus::ALL` must be set-equal, or a status added to
-/// the enum without a matching scanner entry would let a NEW literal compare
-/// against it slip past both tests above silently).
-#[test]
-fn the_scanned_vocabulary_matches_job_status_all() {
-    use jammi_db::catalog::status::JobStatus;
-    let from_enum: HashSet<String> = JobStatus::ALL.iter().map(|s| s.to_string()).collect();
-    let scanned: HashSet<String> = ["queued", "running", "completed", "failed"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    assert_eq!(
-        from_enum,
-        scanned,
-        "find_literal_status_compares' hard-coded vocabulary has drifted from JobStatus::ALL \
-         (now {} members) — update it in the SAME change that grows the enum",
-        JobStatus::ALL.len()
-    );
-    assert_eq!(
-        JobStatus::ALL.len(),
-        4,
-        "JobStatus::ALL must have exactly 4 members (queued/running/completed/failed) — \
-         #515's Cancelled status returns only once its own writer lands"
     );
 }
 

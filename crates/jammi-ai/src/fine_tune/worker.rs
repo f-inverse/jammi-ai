@@ -182,6 +182,7 @@ use crate::fine_tune::spec::{TrainingCommon, TrainingPlan, TrainingSetProducer, 
 use crate::fine_tune::trainer::RankContext;
 use crate::fine_tune::training_set;
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
+use crate::jobs::UnsuccessfulEnd;
 use crate::model::backend::DeviceConfig;
 use crate::model::hub::HubSource;
 use crate::model::ModelSource;
@@ -2715,23 +2716,22 @@ impl JobWorker {
                     // #485: the flag tripped because `spawn_cancel_request_
                     // watcher` observed `jobs.cancel_requested`, not because
                     // the lease was lost — this run is not going to be
-                    // reclaimed and retried, so it must land a terminal
-                    // `failed` here, with the SAME message the compute path
-                    // and `run_now` already record for a request honoured at
-                    // their own checkpoints (`JammiError::JobCancelled`),
-                    // never the lease-lost log line below.
-                    tracing::warn!(job_id = %job_id, worker = %self.worker_id, "training cancelled (cancel requested); recording failed");
+                    // reclaimed and retried, so it must land terminal here,
+                    // as `cancelled` — the same end the compute path and
+                    // `run_now` record for a request honoured at their own
+                    // checkpoints — never the lease-lost log line below.
+                    tracing::warn!(job_id = %job_id, worker = %self.worker_id, "training cancelled (cancel requested); recording cancelled");
                     let reason = JammiError::JobCancelled {
                         job_id: job_id.clone(),
                     }
                     .to_string();
-                    record_failed(
+                    record_unsuccessful_end(
                         holder,
                         &catalog,
                         &job_id,
                         &self.worker_id,
                         attempt,
-                        reason.clone(),
+                        UnsuccessfulEnd::Cancelled,
                     )
                     .await;
                     AttemptEnd::Failed { reason }
@@ -3792,13 +3792,13 @@ impl JobWorker {
         // `queued` is honoured before any prior-attempt dispatch or
         // producer runs (`execute_compute` re-checks before dispatch).
         if let Err(e) = crate::jobs::check_cancel(catalog, job_id).await {
-            record_failed(
+            record_unsuccessful_end(
                 LeaseHolder::LoopClaimer,
                 catalog,
                 job_id,
                 &self.worker_id,
                 attempt,
-                e.to_string(),
+                UnsuccessfulEnd::from(&e),
             )
             .await;
             return;
@@ -3918,13 +3918,13 @@ impl JobWorker {
                 }
             },
             Err(e) => {
-                record_failed(
+                record_unsuccessful_end(
                     LeaseHolder::LoopClaimer,
                     catalog,
                     job_id,
                     &self.worker_id,
                     attempt,
-                    e.to_string(),
+                    UnsuccessfulEnd::from(&e),
                 )
                 .await;
             }
@@ -7417,7 +7417,8 @@ enum AttemptEnd {
     /// (`adapter_files_digest`, computed over the SAME directory
     /// `publish_and_finalize` just uploaded from — K4).
     Published { artifact_digest: String },
-    /// A terminal `failed` was recorded, with this reason.
+    /// A terminal unsuccessful status (`failed`, or `cancelled` for an
+    /// honoured cancel) was recorded, with this reason.
     Failed { reason: String },
     /// No terminal write: left `running` for reclaim (a lease loss, a
     /// finalize race lost, a mid-run gang abandon, or a hand-off to a
@@ -8615,7 +8616,30 @@ async fn record_failed(
     attempt: u32,
     msg: String,
 ) {
-    match catalog.fail_job(job_id, worker_id, attempt, &msg).await {
+    record_unsuccessful_end(
+        holder,
+        catalog,
+        job_id,
+        worker_id,
+        attempt,
+        UnsuccessfulEnd::Failed(msg),
+    )
+    .await;
+}
+
+/// [`record_failed`]'s general form: the lease-guarded terminal write for a
+/// job that ended without its result, as `failed` or as `cancelled`. A call
+/// site whose error can be a [`JammiError::JobCancelled`] passes
+/// `UnsuccessfulEnd::from(&error)`, so the typed error decides the status.
+async fn record_unsuccessful_end(
+    holder: LeaseHolder,
+    catalog: &Arc<Catalog>,
+    job_id: &str,
+    worker_id: &str,
+    attempt: u32,
+    end: UnsuccessfulEnd,
+) {
+    match end.record(catalog, job_id, worker_id, attempt).await {
         Ok(true) => {}
         Ok(false) => {
             tracing::debug!(

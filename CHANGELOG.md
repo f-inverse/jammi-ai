@@ -7,6 +7,14 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### BREAKING
+- **A cancelled job ends `cancelled`, not `failed` (#515).** `cancelled` is a terminal job
+  status. A cancel on a job no worker has claimed ends it at once, with no attempt spent; a
+  running job is flagged and its executor ends it `cancelled` at its next checkpoint. `wait()`
+  returns the typed `JammiError::JobCancelled` (gRPC `CANCELLED`) where it returned a generic
+  failure; the Python clients raise the new `jammi.JobCancelled` on both transports (it refines
+  `RuntimeError`, as `TrainingError` does). Code that treated `failed` as the only unsuccessful
+  terminal status must also handle `cancelled`. New: `Catalog::cancel_job`,
+  `JobRecord::unsuccessful_error`.
 - **A graph-sampled training set is a `pairs` / `triplet` training set (#591).** The
   `graph_pairs` / `graph_triplet` format tags and `TrainingFormat::Graph` are removed: a graph
   sample is one more producer of the pairs/triplet shape, and that the rows came from a graph

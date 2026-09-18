@@ -389,9 +389,8 @@ async fn wait_for_result(
                     "job '{job_id}' recorded an unparseable result: {e}"
                 ))
             });
-        } else if status.is_terminal_unsuccessful() {
-            let msg = record.error.unwrap_or_else(|| "job failed".into());
-            return Err(JammiError::FineTune(msg));
+        } else if let Some(error) = record.unsuccessful_error() {
+            return Err(error);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

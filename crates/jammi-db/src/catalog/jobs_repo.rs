@@ -191,13 +191,30 @@ impl JobRecord {
             .unwrap_or(false)
     }
 
-    /// Whether this row is terminal AND unsuccessful (`failed`). See
-    /// [`JobStatus::is_terminal_unsuccessful`].
+    /// Whether this row is terminal AND unsuccessful (`failed` or
+    /// `cancelled`). See [`JobStatus::is_terminal_unsuccessful`].
     pub fn is_terminal_unsuccessful(&self) -> bool {
         self.status
             .parse::<JobStatus>()
             .map(|s| s.is_terminal_unsuccessful())
             .unwrap_or(false)
+    }
+
+    /// The typed error a caller waiting on this job sees once it has ended
+    /// without its result — the one mapping every `wait` shares. `None` while
+    /// the row is non-terminal or `completed`. A `cancelled` job is
+    /// [`JammiError::JobCancelled`], never the generic failure: the caller
+    /// asked for that end and must be able to tell it from a fault.
+    pub fn unsuccessful_error(&self) -> Option<JammiError> {
+        match self.status.parse::<JobStatus>().ok()? {
+            JobStatus::Cancelled => Some(JammiError::JobCancelled {
+                job_id: self.job_id.clone(),
+            }),
+            JobStatus::Failed => Some(JammiError::FineTune(
+                self.error.clone().unwrap_or_else(|| "job failed".into()),
+            )),
+            JobStatus::Queued | JobStatus::Running | JobStatus::Completed => None,
+        }
     }
 }
 

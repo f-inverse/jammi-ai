@@ -25,8 +25,6 @@
 //! server's rank body (U5b-1b-iii) for a cross-process gang to complete at
 //! all.
 
-use std::time::Duration;
-
 use jammi_db::catalog::jobs_repo::WorkerState;
 
 use crate::harness::{self, Backends, Fleet, JobSize};
@@ -146,10 +144,10 @@ async fn killed_peer_job_is_reclaimed_and_completed_by_a_new_gang() {
     .claimed_by
     .expect("a running job records its claimer");
 
-    // Rank 1 is the coordinator's first listed member; give the gang a
-    // moment to assemble and run before the crash lands mid-run.
+    // Rank 1 is the coordinator's first listed member; the crash lands once
+    // the gang is observed mid-run.
     let member = rank_1_of(&session, &coordinator).await;
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    harness::await_mid_run(&mut fleet, &session, &job_id).await;
     let member_label = harness::label_of(&session, &member).await;
     assert!(
         fleet.kill9(&member_label),
@@ -196,7 +194,7 @@ async fn killed_coordinator_job_is_reclaimed_and_completed_by_a_new_gang() {
     .await
     .claimed_by
     .expect("a running job records its claimer");
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    harness::await_mid_run(&mut fleet, &session, &job_id).await;
     let coordinator_label = harness::label_of(&session, &coordinator).await;
     assert!(
         fleet.kill9(&coordinator_label),

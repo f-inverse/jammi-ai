@@ -394,11 +394,11 @@ impl TrainingSetStream {
         // run the check.
         drop(ChunkAccumulator::new_for(detected, label_vocab.as_ref())?);
 
-        validate_window(session, table, columns, detected, task, window).await?;
+        validate_window(session, table, detected, task, window).await?;
 
         let derived_ctx = single_partition_context(session.context());
 
-        let query = read_back_sql(table, columns);
+        let query = read_back_sql(table)?;
         let df = derived_ctx.sql(&query).await?;
         let df_stream = df.execute_stream().await?;
 
@@ -771,12 +771,11 @@ async fn run_pump(
 pub(crate) async fn validate_window(
     session: &InferenceSession,
     table: &TrainingSetTable,
-    columns: &[String],
     detected: DetectedFormat,
     task: ModelTask,
     window: RowWindow,
 ) -> Result<()> {
-    let ordered_sql = read_back_sql(table, columns);
+    let ordered_sql = read_back_sql(table)?;
 
     // A `DataFrame`'s logical schema is known from planning alone — no rows
     // need to execute.
@@ -909,9 +908,8 @@ pub(crate) async fn validate_window(
 pub async fn build_label_vocabulary(
     session: &InferenceSession,
     table: &TrainingSetTable,
-    columns: &[String],
 ) -> Result<LabelVocabulary> {
-    let query = read_back_sql(table, columns);
+    let query = read_back_sql(table)?;
     let mut df_stream = session.sql_stream(&query).await?;
     let mut labels: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     while let Some(batch) = df_stream.next().await {

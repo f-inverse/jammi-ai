@@ -501,7 +501,7 @@ async fn recovery_reaps_a_post_contract_ready_table_whose_sidecar_vanished(backe
     // Corrupt: delete the sidecar of a post-contract `ready` row (its summary
     // column is set, so it is NOT a pre-contract table).
     let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
-    delete_sidecar(&store, &record).await;
+    delete_sidecar(&store, &record.parquet_path).await;
     assert!(store
         .read_materialization_manifest(&url)
         .await
@@ -608,7 +608,16 @@ async fn pinned_training_source(
         .materialize_training_set(&ts_session(1, rows), ts_spec(&source, &columns, "parent"))
         .await
         .unwrap();
-    store.pin_current_version(parent.record).await.unwrap()
+    // `pin_current_version` takes an owned `ResultTableRecord`, fetched
+    // through the catalog (#551) — `TrainingSetTable` carries no
+    // whole-row accessor.
+    let record = store
+        .catalog()
+        .get_result_table(parent.table_name())
+        .await
+        .unwrap()
+        .expect("the producer promoted a catalog row");
+    store.pin_current_version(record).await.unwrap()
 }
 
 /// A fresh session reading `pin` under the bare name `parent`, through the
@@ -729,11 +738,11 @@ async fn reattest_with_new_digest(
 /// row-group count.
 async fn committed_rows(
     store: &ResultStore,
-    record: &ResultTableRecord,
+    parquet_path: &str,
 ) -> (Vec<(Option<String>, Option<String>)>, usize) {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-    let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
+    let url = jammi_db::storage::StorageUrl::parse(parquet_path).unwrap();
     let handle = store.open_parquet(&url).unwrap();
     let path = handle.data_path().unwrap();
     let bytes = handle.get_bytes(&path).await.unwrap();
@@ -793,27 +802,35 @@ async fn a_training_set_lands_as_a_ready_kinded_table_with_its_attestation(backe
         .await
         .unwrap();
 
-    assert_eq!(materialized.record.kind, ResultTableKind::TrainingSet);
-    assert_eq!(
-        materialized.record.status,
-        ResultTableStatus::Ready.to_string()
-    );
-    assert_eq!(materialized.record.row_count, 2);
+    // The whole catalog row, fetched through the catalog (#551) —
+    // `TrainingSetTable` carries no whole-row accessor; `kind`/`row_count`/
+    // `parquet_path` each have their own narrow accessor, used directly
+    // below, but `status`/`derived_from`/the catalog's own indexed
+    // `definition_hash` summary do not.
+    let record = store
+        .catalog()
+        .get_result_table(materialized.table_name())
+        .await
+        .unwrap()
+        .expect("the producer promoted a catalog row");
+    assert_eq!(materialized.kind(), ResultTableKind::TrainingSet);
+    assert_eq!(record.status, ResultTableStatus::Ready.to_string());
+    assert_eq!(materialized.row_count(), 2);
     assert!(matches!(materialized.outcome, CacheOutcome::Computed));
     // The catalog's summary column is the hash the verb reports.
     assert_eq!(
-        materialized.record.definition_hash.as_deref(),
+        record.definition_hash.as_deref(),
         Some(materialized.definition_hash.as_str())
     );
     // The row is nobody's partial result (r31): it was created with no job
     // attempt, so no job row was ever touched.
-    assert!(materialized.record.derived_from.is_none());
+    assert!(record.derived_from.is_none());
 
     // The attestation is on disk and names this producer with these exact
     // determinants.
     let manifest = store
         .read_materialization_manifest(
-            &jammi_db::storage::StorageUrl::parse(&materialized.record.parquet_path).unwrap(),
+            &jammi_db::storage::StorageUrl::parse(materialized.parquet_path()).unwrap(),
         )
         .await
         .unwrap()
@@ -1002,13 +1019,13 @@ async fn registration_warns_when_a_training_sets_sidecar_is_absent(backend: Back
         .materialize_training_set(&ctx, ts_spec(&source, &columns, "pairs"))
         .await
         .unwrap();
-    assert_eq!(materialized.record.kind, ResultTableKind::TrainingSet);
+    assert_eq!(materialized.kind(), ResultTableKind::TrainingSet);
 
     // Simulate a pre-migration-021 row: bytes + a `ready` catalog row, but no
     // manifest sidecar — the SAME corruption
     // `recovery_reaps_a_post_contract_ready_table_whose_sidecar_vanished`
     // applies to the verify path, applied here to the registration path.
-    delete_sidecar(&store, &materialized.record).await;
+    delete_sidecar(&store, materialized.parquet_path()).await;
 
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()
@@ -1036,7 +1053,7 @@ async fn registration_warns_when_a_training_sets_sidecar_is_absent(backend: Back
 
     let log = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
     assert!(
-        log.contains(materialized.record.table_name.as_str()),
+        log.contains(materialized.table_name()),
         "the missing-sidecar warning must name the table, got: {log}"
     );
     assert!(
@@ -1098,9 +1115,9 @@ async fn registration_warns_when_a_training_sets_sidecar_is_unreadable(backend: 
         .materialize_training_set(&ctx, ts_spec(&source, &columns, "pairs"))
         .await
         .unwrap();
-    assert_eq!(materialized.record.kind, ResultTableKind::TrainingSet);
+    assert_eq!(materialized.kind(), ResultTableKind::TrainingSet);
 
-    corrupt_sidecar(&store, &materialized.record).await;
+    corrupt_sidecar(&store, materialized.parquet_path()).await;
 
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()
@@ -1133,7 +1150,7 @@ async fn registration_warns_when_a_training_sets_sidecar_is_unreadable(backend: 
 
     let log = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
     assert!(
-        log.contains(materialized.record.table_name.as_str()),
+        log.contains(materialized.table_name()),
         "the unreadable-sidecar warning must name the table, got: {log}"
     );
     assert!(
@@ -2010,9 +2027,18 @@ async fn staleness_over_a_two_anchor_manifest_reports_on_both_relations(backend:
         )
         .await
         .unwrap();
+    // `staleness` takes a whole `ResultTableRecord`, fetched through the
+    // catalog (#551) — `TrainingSetTable` carries no whole-row
+    // accessor.
+    let ts_record = store
+        .catalog()
+        .get_result_table(training_set.table_name())
+        .await
+        .unwrap()
+        .expect("the producer promoted a catalog row");
     assert_eq!(
         store
-            .staleness(&training_set.record, &training_set.definition_hash)
+            .staleness(&ts_record, &training_set.definition_hash)
             .await
             .unwrap(),
         Staleness::Fresh,
@@ -2035,7 +2061,7 @@ async fn staleness_over_a_two_anchor_manifest_reports_on_both_relations(backend:
     .await;
 
     match store
-        .staleness(&training_set.record, &training_set.definition_hash)
+        .staleness(&ts_record, &training_set.definition_hash)
         .await
         .unwrap()
     {
@@ -2142,7 +2168,7 @@ async fn the_committed_order_is_the_full_projected_tuple(backend: BackendKind) {
         .await
         .unwrap();
 
-    let (rows, row_groups) = committed_rows(&store, &materialized.record).await;
+    let (rows, row_groups) = committed_rows(&store, materialized.parquet_path()).await;
     assert!(
         row_groups > 1,
         "the order oracle is vacuous on a single row group; the fixture produced {row_groups}"
@@ -2189,7 +2215,13 @@ async fn a_training_set_never_resolves_as_a_sources_embedding_table(backend: Bac
     let mut spec = ts_spec(&source, &columns, "pairs");
     spec.task = ModelTask::TextEmbedding;
     let training_set = store.materialize_training_set(&ctx, spec).await.unwrap();
-    assert_eq!(training_set.record.task, ModelTask::TextEmbedding);
+    let ts_record = store
+        .catalog()
+        .get_result_table(training_set.table_name())
+        .await
+        .unwrap()
+        .expect("the producer promoted a catalog row");
+    assert_eq!(ts_record.task, ModelTask::TextEmbedding);
 
     // With ONLY the training set present, the source has no embedding table.
     let err = catalog
@@ -2313,8 +2345,8 @@ async fn write_sidecar(
         .unwrap();
 }
 
-async fn delete_sidecar(store: &ResultStore, record: &ResultTableRecord) {
-    let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
+async fn delete_sidecar(store: &ResultStore, parquet_path: &str) {
+    let url = jammi_db::storage::StorageUrl::parse(parquet_path).unwrap();
     let handle = store.open_parquet(&url).unwrap();
     let sidecar = handle.sibling_path("materialization.json").unwrap();
     handle.delete_if_exists(&sidecar).await.unwrap();
@@ -2326,8 +2358,8 @@ async fn delete_sidecar(store: &ResultStore, record: &ResultTableRecord) {
 /// finds the object present (`handle.exists` is `true`) but
 /// `MaterializationManifest::from_json_bytes` fails to parse it, so the call
 /// returns `Err`, never `Ok(None)`.
-async fn corrupt_sidecar(store: &ResultStore, record: &ResultTableRecord) {
-    let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
+async fn corrupt_sidecar(store: &ResultStore, parquet_path: &str) {
+    let url = jammi_db::storage::StorageUrl::parse(parquet_path).unwrap();
     let handle = store.open_parquet(&url).unwrap();
     let sidecar = handle.sibling_path("materialization.json").unwrap();
     handle

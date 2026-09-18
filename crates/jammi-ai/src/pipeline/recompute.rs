@@ -586,7 +586,7 @@ impl InferenceSession {
             )
             .await?;
         Ok((
-            materialized.record.table_name.clone(),
+            materialized.table_name().to_string(),
             materialized.outcome.clone(),
         ))
     }
@@ -1203,7 +1203,7 @@ mod tests {
         // The window: the sidecar vanishes strictly between the descriptor
         // read (elided above — see the doc comment) and the anchor read
         // `recompute_training_set` is about to make.
-        let url = jammi_db::storage::StorageUrl::parse(&table.record.parquet_path).unwrap();
+        let url = jammi_db::storage::StorageUrl::parse(table.parquet_path()).unwrap();
         let handle = session.result_store().open_parquet(&url).unwrap();
         let sidecar = handle.sibling_path("materialization.json").unwrap();
         assert_eq!(
@@ -1212,9 +1212,18 @@ mod tests {
             "the sidecar must actually be removed for the window to be real"
         );
 
+        // The whole `ResultTableRecord` `recompute_training_set` takes is
+        // fetched through the catalog (#551) — never through
+        // `TrainingSetTable`, which carries no whole-row accessor.
+        let record = session
+            .catalog()
+            .get_result_table(table.table_name())
+            .await
+            .unwrap()
+            .expect("the producer promoted a catalog row");
         let err = session
             .recompute_training_set(
-                &table.record,
+                &record,
                 source,
                 columns,
                 ModelTask::TextEmbedding,
@@ -1228,7 +1237,7 @@ mod tests {
             );
         match err {
             JammiError::NotRecomputable { table: named } => {
-                assert_eq!(named, table.record.table_name);
+                assert_eq!(named, table.table_name());
             }
             other => panic!("expected NotRecomputable, got {other:?}"),
         }

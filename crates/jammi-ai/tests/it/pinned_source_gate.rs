@@ -1628,67 +1628,19 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
         // file — kept as its own site so the two allowances cannot be
         // spent interchangeably.
     ),
-    (
-        "crates/jammi-db/src/store/mod.rs",
-        "registered_name",
-        1, // ordinal 1 — the only `registered_name` in this file
-        1,
-        // `TrainingSetTable::registered_name` — the key a materialised
-        // training set is bound under, the accessor `sql_relation` (and
-        // through it `jammi_ai::fine_tune::training_set::read_back_sql`)
-        // quotes for the read-back. There is no version to straddle here.
-        //
-        // Two independent reasons, the second of which is the operative one:
-        //
-        // (1) KIND-INDEPENDENT: neither `registered_name` nor `sql_relation`
-        // resolves a version at ALL. They format `jammi.{table_name}` off the
-        // record the caller already holds; no `current_version` is read on
-        // this path, so there is no anchor/content pair here to mismatch —
-        // only a bare registration key. What the straddle question turns on
-        // is whether the RELATION that key names can change under a reader,
-        // which is (2).
-        //
-        // (2) The relation is versionless because every verb that could
-        // publish a version over a result table REFUSES this kind, in
-        // `jammi-ai`, before it writes: `InferenceSession::refreshable_record`
-        // (`crates/jammi-ai/src/pipeline/embedding_refresh.rs`) returns
-        // `NotRefreshable { reason: NotEmbeddingTable }` for any record whose
-        // `kind` is not `ResultTableKind::Model`, and it dominates the
-        // enumerated writer set: `refresh_embeddings` and `compact_embeddings`
-        // both call it before `ensure_base_version` (→
-        // `version_repo.rs::publish_base_version`) and before
-        // `allocate_version` (→ `building_version.rs`), and `expire_versions`
-        // — the deleting third verb through that gate — calls it too. Pinned
-        // by `training_set::refresh_and_compaction_refuse_a_training_set_leaving_it_versionless`,
-        // which materialises a real `ready` `TrainingSet` row, drives all
-        // three verbs at it, and asserts the typed refusal plus
-        // `current_version == None`, `next_version` unmoved and zero version
-        // rows afterwards.
-        //
-        // R-A — this is CALLER DISCIPLINE, not a storage-layer
-        // impossibility, and the earlier version of this entry got that
-        // wrong. The db owner's executed probe publishes a base version on a
-        // `TrainingSet` row through `Catalog::publish_base_version`
-        // (`current_version` None → `Some(0)`) and allocates a second through
-        // `ResultStore::allocate_version` (`Ok(1)`): jammi-db accepts both.
-        // The `kind = 'model'` predicate in `resolve_embedding_table`
-        // (`result_repo.rs`, pinned by the db-side oracle
-        // `a_training_set_never_resolves_as_a_sources_embedding_table`) is
-        // still true and still reviewed, but it covers only the
-        // source_id-ADDRESSED half — how a source resolves to ITS embedding
-        // table — and `refresh_embeddings` / `compact_embeddings` never call
-        // it. So the claim held by this entry is exactly: no caller in this
-        // workspace publishes a version on a training set, because the one
-        // choke point they all pass through refuses the kind. A future verb
-        // that reaches `publish_base_version` WITHOUT going through
-        // `refreshable_record` would break it and nothing here would catch
-        // that; the writer set above is a hand enumeration (`grep -rn
-        // 'publish_base_version\|allocate_version' crates/jammi-ai/src`),
-        // re-derived when a version-writing path is added.
-        //
-        // The table is also immutable by construction: it is written once
-        // through the single `building -> ready` funnel and never rewritten.
-    ),
+    // `registered_name` was HERE — #551 deleted the function itself
+    // (zero production callers; `TrainingSetTable::table_name`/`sql_relation`
+    // cover its two legitimate uses), so this entry is removed by rule
+    // rather than left pointing at a site that no longer exists. The
+    // versionlessness argument this entry made (a `TrainingSet` row is
+    // immutable and can never straddle a version boundary because every
+    // version-publishing verb refuses this kind — see
+    // `refreshable_record`/`NotEmbeddingTable`, pinned by
+    // `training_set::refresh_and_compaction_refuse_a_training_set_leaving_it_versionless`)
+    // still holds for `TrainingSetTable::sql_relation`/`table_name`, neither
+    // of which resolves a version either — it just no longer needs an entry
+    // of ITS OWN here, since the `"jammi.{` literal both used to share now
+    // lives only at `result_table_relation`'s site, below.
     (
         "crates/jammi-db/src/store/mod.rs",
         "register_table",
@@ -1748,7 +1700,7 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "result_table_relation",
-        1, // ordinal 1 — the only `result_table_relation` in this file; line 361 today
+        1, // ordinal 1 — the only `result_table_relation` in this file; line 427 today (#551 re-key)
         1,
         // #551 round 3 (N2-gate): the general-purpose minter every OTHER
         // reader of a session-registered `jammi.{name}` relation across the
@@ -1764,12 +1716,16 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
         // this gate's `SURFACE_DIRS` does not scan) now calls this function
         // and carries no literal of its own. The pre-existing UNQUOTED
         // `TableReference::bare(format!("jammi.{{name}}"))` registration
-        // sites (`registered_name`, `load_neighbor_graph_edges`,
+        // sites (`load_neighbor_graph_edges`,
         // `jammi-db/src/session.rs::read_vectors`/`read_vector_by_key`,
         // `register_table`, `bind_result_table`) are a DIFFERENT risk class
         // (what a name registers AS, not what a raw-SQL read quotes) this
         // round did not migrate — reviewed and left as-is, their own
-        // existing entries unchanged.
+        // existing entries unchanged. `registered_name` itself, which USED
+        // to be listed alongside them here, was deleted in #551
+        // (zero production callers) — its own allow-list entry is removed by
+        // rule, above, rather than kept pointing at a site that no longer
+        // exists.
     ),
 ];
 

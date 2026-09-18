@@ -3667,10 +3667,9 @@ impl JobWorker {
                 // `FineTune` kind carries this; `GraphFineTune` does not (see
                 // `FineTuneMaterializationSource`'s doc).
                 let training_set_artifact_digest = {
-                    let parquet_url =
-                        jammi_db::storage::StorageUrl::parse(&table.record.parquet_path)
-                            .map_err(JammiError::from)
-                            .map_err(WorkerJobError::from)?;
+                    let parquet_url = jammi_db::storage::StorageUrl::parse(table.parquet_path())
+                        .map_err(JammiError::from)
+                        .map_err(WorkerJobError::from)?;
                     session
                         .result_store()
                         .read_materialization_manifest(&parquet_url)
@@ -3680,7 +3679,7 @@ impl JobWorker {
                         .ok_or_else(|| {
                             WorkerJobError::from(JammiError::FineTune(format!(
                                 "training set '{}' has no materialization manifest",
-                                table.record.table_name
+                                table.table_name()
                             )))
                         })?
                 };
@@ -3693,7 +3692,7 @@ impl JobWorker {
                 // is dialed.
                 let pair = TrainingSetIdentityPair {
                     training_set_ref: training_set_artifact_digest.clone(),
-                    training_set_location: table.record.table_name.clone(),
+                    training_set_location: table.table_name().to_string(),
                 };
                 let materialization_source = Some(FineTuneMaterializationSource {
                     source: source.clone(),
@@ -3701,7 +3700,7 @@ impl JobWorker {
                     method,
                     training_set_definition_hash: table.definition_hash.as_str().to_string(),
                     training_set_artifact_digest,
-                    training_set_row_count: table.record.row_count as u64,
+                    training_set_row_count: table.row_count() as u64,
                 });
                 let topology = TopologyDecision::decide(
                     common.world_size,
@@ -5975,7 +5974,7 @@ async fn bind_training_source(
         // it (`training_set::read_back`'s own contract, which every OTHER
         // caller still gets).
         let (batches, reservation) =
-            training_set::read_back_with_reservation(session, table, columns).await?;
+            training_set::read_back_with_reservation(session, table).await?;
         let loader =
             build_training_data_loader(&batches, columns, task)?.with_reservation(reservation);
         // The tag the table was WRITTEN under and the shape its loader
@@ -5994,7 +5993,7 @@ async fn bind_training_source(
     }
     // Streamed (#500 U2c §10/§11): table only — no row is ever collected
     // into memory for this arm (F1).
-    let total_rows = table.record.row_count;
+    let total_rows = table.row_count();
     let train_count =
         crate::fine_tune::data::split_index(total_rows, common.config.validation_fraction);
 
@@ -6003,7 +6002,6 @@ async fn bind_training_source(
     crate::fine_tune::stream::validate_window(
         session,
         table,
-        columns,
         detected,
         task,
         crate::fine_tune::stream::RowWindow::new(0, total_rows),
@@ -6016,7 +6014,7 @@ async fn bind_training_source(
         detected,
         crate::fine_tune::decode::DetectedFormat::Classification
     ) {
-        Some(crate::fine_tune::stream::build_label_vocabulary(session, table, columns).await?)
+        Some(crate::fine_tune::stream::build_label_vocabulary(session, table).await?)
     } else {
         None
     };
@@ -6115,16 +6113,25 @@ async fn bind_recorded_training_set(
         )));
     }
     store.bind_result_table(session.context(), &record).await?;
-    Ok((
-        jammi_db::store::TrainingSetTable {
-            record,
-            definition_hash: manifest.definition_hash.clone(),
-            outcome: jammi_db::store::CacheOutcome::Reused {
-                table: pair.training_set_location.clone(),
-            },
+    // `TrainingSetTable::from_record` reads its own order columns and
+    // definition hash off `manifest` (#551) — never derives them
+    // here and hands them in, so a manifest whose descriptor is not
+    // `TrainingSet` refuses inside that constructor, typed, rather than
+    // trusting this call site's own match to have gotten the refusal right.
+    let table = jammi_db::store::TrainingSetTable::from_record(
+        record,
+        &manifest,
+        jammi_db::store::CacheOutcome::Reused {
+            table: pair.training_set_location.clone(),
         },
-        manifest,
-    ))
+    )
+    .map_err(|e| {
+        JammiError::FineTune(format!(
+            "the job row names training set '{}' but {e}",
+            pair.training_set_location
+        ))
+    })?;
+    Ok((table, manifest))
 }
 
 /// End every admitted member session in `links` cooperatively (one
@@ -6753,7 +6760,7 @@ async fn member_rank_body(
     };
 
     // The per-partition leaf verify (U5b-1b-i), before the first collective.
-    let parquet_url = match jammi_db::storage::StorageUrl::parse(&table.record.parquet_path) {
+    let parquet_url = match jammi_db::storage::StorageUrl::parse(table.parquet_path()) {
         Ok(url) => url,
         Err(e) => return failed(format!("the training set's parquet path: {e}")),
     };

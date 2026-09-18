@@ -497,24 +497,49 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
 /// GradCache ineligible on this config, `Resident` cannot be explained by
 /// anything other than `WholeSetArm::Mining`.
 ///
-/// **No committed byte-for-byte pin, unlike [`gradcache_completes_at_w1_with_a_pinned_adapter_digest`]
-/// right above** — stated honestly, not silently narrowed: that oracle pins
-/// TWO separate constants precisely because this crate's CPU backprop is
-/// demonstrably not byte-identical across `target_os` (a measured
-/// divergence on this very fixture, not a hypothetical one). Producing that
-/// same pair for a mining run needs a measurement on a Linux host, which
-/// was not available to this implementer this round — UNCOVERED, not
-/// attempted at low confidence (see this unit's contract). This oracle
-/// instead compares two digests captured LIVE in the SAME test run (mining
-/// on vs. off): exactly as sensitive to a mining regression (an identical
-/// adapter print with mining flipped on is exactly the failure mode a
-/// missing pin would also have caught), and needs no per-platform constant
-/// at all.
+/// **The byte-for-byte pin, GradCache-shaped, honestly incomplete (#551).**
+/// Like [`gradcache_completes_at_w1_with_a_pinned_adapter_digest`],
+/// this crate's CPU backprop is demonstrably not byte-identical across
+/// `target_os` (a measured divergence on this very fixture, not a
+/// hypothetical one), so the pin is a per-`target_os` constant pair, never
+/// one shared value. The macOS constant below is pinned from two repeated
+/// local runs (confirmed byte-stable, the same discipline
+/// [`gradcache_completes_at_w1_with_a_pinned_adapter_digest`]'s own doc
+/// states). The Linux constant has never been measured by this implementer —
+/// `MINING_ADAPTER_PRINTS` is `None` under `target_os = "linux"`, and the
+/// test FAILS BY NAME there (never `#[ignore]`d) until a CI run's own
+/// stdout — the `println!` below, printed BEFORE the assert on every run —
+/// is read and committed as the Linux constant. Until then this run's live
+/// mining-on-vs-off inequality (below) is the non-vacuity control this
+/// module's doc names: #551's own oracle gap (an earlier attempted digest
+/// test set `hard_negatives.mine = true` with no `embedding_loss` at all, so
+/// `mining_eligible()` never admitted mining and flipping `mine` left the
+/// pinned bytes identical because the miner never ran either way).
 #[tokio::test(flavor = "multi_thread")]
 async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it_unreached() {
     use jammi_ai::fine_tune::{EmbeddingLoss, HardNegativeConfig};
 
-    async fn run(dir: &TempDir, mine: bool) -> (Option<&'static str>, String) {
+    // Platform-specific, like `GRADCACHE_ADAPTER_PRINTS` above: `None` on
+    // Linux until the LEAD captures it from a CI run's stdout (this test's
+    // own `println!`, below) agreeing across TWO runs (this crate's CPU
+    // backprop is measured, not assumed, byte-identical within one
+    // (arch, os) pair — see ci.yml's K4 heterogeneity note); the macOS pair
+    // is pinned from two repeated local runs on this implementer's host.
+    #[cfg(target_os = "linux")]
+    const MINING_ADAPTER_PRINTS: Option<&[(&str, &str)]> = None;
+    #[cfg(not(target_os = "linux"))]
+    const MINING_ADAPTER_PRINTS: Option<&[(&str, &str)]> = Some(&[
+        ("adapter.safetensors", "1184:94281422a73e9e84"),
+        ("adapter_config.json", "143:1feeeb6239c3fd30"),
+        ("checkpoint_1.safetensors", "1184:335fa1132eb87409"),
+        ("checkpoint_2.safetensors", "1184:7c95380a54e0fb96"),
+        ("checkpoint_3.safetensors", "1184:6bb5d6d94b3c46e0"),
+        ("checkpoint_4.safetensors", "1184:94281422a73e9e84"),
+        ("checkpoint_best.safetensors", "1184:94281422a73e9e84"),
+        ("manifest.json", "788:b456e1175219e213"),
+    ]);
+
+    async fn run(dir: &TempDir, mine: bool) -> (Option<&'static str>, BTreeMap<String, String>) {
         let session = session_over(dir, &common::fixture_url("training_triplets.csv")).await;
         let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
             .expect("default worker intervals are valid");
@@ -564,15 +589,11 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
             .await
             .expect("the published adapter fetches and verifies");
         let prints = pinned_prints(local.dir());
-        let adapter_print = prints
-            .get("adapter.safetensors")
-            .expect("every run publishes adapter.safetensors")
-            .clone();
-        (source_kind, adapter_print)
+        (source_kind, prints)
     }
 
     let mining_dir = TempDir::new().unwrap();
-    let (mining_kind, mining_print) = run(&mining_dir, true).await;
+    let (mining_kind, mining_prints) = run(&mining_dir, true).await;
     assert_eq!(
         mining_kind,
         Some("resident"),
@@ -581,8 +602,13 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
          alternative explanation, so Resident here is proof the Mining arm, specifically, ran"
     );
 
+    // Printed BEFORE the byte-for-byte assert below, unconditionally on every
+    // run (Linux included) — a failing test's captured stdout is the lead's
+    // only read for the Linux constant this pin is missing.
+    println!("MINING_ADAPTER_PRINTS = {mining_prints:#?}");
+
     let off_dir = TempDir::new().unwrap();
-    let (off_kind, off_print) = run(&off_dir, false).await;
+    let (off_kind, off_prints) = run(&off_dir, false).await;
     assert_eq!(
         off_kind,
         Some("streamed"),
@@ -591,6 +617,12 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
          two runs is whether the miner ran"
     );
 
+    let mining_print = mining_prints
+        .get("adapter.safetensors")
+        .expect("every run publishes adapter.safetensors");
+    let off_print = off_prints
+        .get("adapter.safetensors")
+        .expect("every run publishes adapter.safetensors");
     assert_ne!(
         mining_print, off_print,
         "hard-negative mining must change the trained adapter bytes — an identical adapter print \
@@ -600,6 +632,26 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
          `embedding_loss` set at all; this run sets one, so a regression that silently dropped the \
          mined loader (falling back to the original triplets) reproduces exactly U2b's vacuous \
          result and this assertion catches it."
+    );
+
+    // The byte-for-byte pin: `None` on Linux is the honest state of
+    // this branch, and fails BY NAME rather than silently skipping.
+    let expected_pairs = MINING_ADAPTER_PRINTS.unwrap_or_else(|| {
+        panic!(
+            "unimplemented pin: MINING_ADAPTER_PRINTS has no captured constant for \
+             target_os=\"linux\" (#551) — this run's own stdout above \
+             (`MINING_ADAPTER_PRINTS = ...`) is the value to commit, once it agrees across TWO \
+             CI runs (ci.yml's K4 heterogeneity note); never `#[ignore]` this test to route \
+             around the gap"
+        )
+    });
+    let expected: BTreeMap<String, String> = expected_pairs
+        .iter()
+        .map(|(n, p)| ((*n).to_string(), (*p).to_string()))
+        .collect();
+    assert_eq!(
+        mining_prints, expected,
+        "the mining-on adapter bytes moved from the pinned fixture"
     );
 }
 
@@ -933,14 +985,14 @@ async fn read_back_re_applies_the_committed_order_across_row_groups() {
     assert_eq!(committed.len(), fixture.written.len());
 
     // The read-back the worker performs, through the production reader.
-    let batches = session.sql(&read_back_sql(&table, &columns)).await.unwrap();
+    let batches = session.sql(&read_back_sql(&table).unwrap()).await.unwrap();
     assert_eq!(
         rows_of(&batches),
         committed,
         "the read-back must reproduce the committed order exactly"
     );
 
-    let ordered_sql = read_back_sql(&table, &columns);
+    let ordered_sql = read_back_sql(&table).unwrap();
     // The clause names the WHOLE committed key, rendered by the producer's own
     // single source of truth. A prefix of the key re-sorts an already-sorted
     // file into (almost always) the same order, so the row comparison above
@@ -1026,7 +1078,13 @@ async fn a_result_table_cannot_be_a_fine_tune_source() {
 
     // ... and yet neither its catalog name nor its registered name resolves as
     // a fine-tune SOURCE, on either the submit or the materialize path.
-    for name in [table.table_name().to_string(), table.registered_name()] {
+    // `registered_name` itself was deleted (#551: zero production
+    // callers) — the registered form is spelled out here instead, the same
+    // `jammi.{table_name}` shape it used to return.
+    for name in [
+        table.table_name().to_string(),
+        format!("jammi.{}", table.table_name()),
+    ] {
         let err = jammi_ai::fine_tune::training_set::materialize_projection(
             &session,
             &name,
@@ -1224,7 +1282,7 @@ async fn recompute_refuses_a_training_set_with_an_unknown_order_rule() {
     .await
     .unwrap();
 
-    let url = jammi_db::storage::StorageUrl::parse(&table.record.parquet_path).unwrap();
+    let url = jammi_db::storage::StorageUrl::parse(table.parquet_path()).unwrap();
     let mut manifest: MaterializationManifest = session
         .result_store()
         .read_materialization_manifest(&url)
@@ -1301,7 +1359,7 @@ async fn recompute_refuses_a_training_set_with_a_missing_sidecar() {
     .await
     .unwrap();
 
-    let url = jammi_db::storage::StorageUrl::parse(&table.record.parquet_path).unwrap();
+    let url = jammi_db::storage::StorageUrl::parse(table.parquet_path()).unwrap();
     let handle = session.result_store().open_parquet(&url).unwrap();
     let sidecar = handle.sibling_path("materialization.json").unwrap();
     assert!(
@@ -1360,9 +1418,10 @@ async fn artifact_digest(session: &InferenceSession, table: &str) -> String {
 /// keeps it that way is a caller-side kind refusal in this crate — pinned here.
 ///
 /// `crates/jammi-ai/tests/it/pinned_source_gate.rs`'s `SESSION_LITERAL_ALLOWED`
-/// entry for `TrainingSetTable::registered_name` rests on that versionlessness:
-/// a read through the session registration cannot straddle a version boundary
-/// on a relation that never gets a second version. Every verb that could
+/// entry for `crates/jammi-db/src/store/mod.rs::result_table_relation` rests
+/// on that versionlessness: a read through the session registration cannot
+/// straddle a version boundary on a relation that never gets a second
+/// version. Every verb that could
 /// publish one over a result table — `refresh_embeddings` and
 /// `compact_embeddings`, plus `expire_versions`, which deletes versions rather
 /// than publishing them — enters through
@@ -1460,8 +1519,8 @@ async fn refresh_and_compaction_refuse_a_training_set_leaving_it_versionless() {
 
     // ... and the refusals left the relation versionless: no `current_version`,
     // no allocation consumed, no version row at all. The last is what the
-    // allowlist entry actually needs — a read through `registered_name` has one
-    // and only one state to see.
+    // allowlist entry actually needs — a read through the relation this row
+    // registers has one and only one state to see.
     let after = session
         .catalog()
         .get_result_table(&name)

@@ -17,10 +17,21 @@
 //! guarantee: the table is written with 64K row groups and the session plans at
 //! `[engine] execution_threads` partitions, so a table larger than one row group
 //! comes back interleaved unless the reader asks for the order. [`read_back_sql`]
-//! is the one place that asks, and it renders the key through
-//! [`training_set_order_by`] rather than hand-writing it — a reader that spelled
-//! the direction or the NULL placement differently would read rows in an order
-//! the table's own descriptor does not claim, and nothing would report it.
+//! is the one place that asks, through
+//! [`TrainingSetTable::relation`](jammi_db::store::TrainingSetTable::relation)'s
+//! `TrainingSetRelation::select_ordered` — which renders
+//! [`training_set_order_by`](jammi_db::store::training_set_order_by) from the
+//! table's OWN recorded order columns, never a caller-supplied key — rather
+//! than hand-writing the clause; a reader that spelled the direction or the
+//! NULL placement differently would read rows in an order the table's own
+//! descriptor does not claim, and nothing would report it. The spelling
+//! scan below (`reader_class_allow_list`) is the disclosed residual this
+//! type does not close: the BARE catalog name is reachable off any
+//! `ResultTableRecord` (`Catalog::get_result_table`, or
+//! `ResultTableRecord::table_name` directly), independently of
+//! `TrainingSetTable`, so a hand-built `format!("SELECT * FROM \"jammi.{{}}\"",
+//! record.table_name)` remains representable — the scan is what still catches
+//! that route.
 //!
 //! # Anchors
 //!
@@ -57,7 +68,7 @@ use arrow::array::RecordBatch;
 use jammi_db::error::Result;
 use jammi_db::sql::{quote_ident, source_relation};
 use jammi_db::store::manifest::InputAnchor;
-use jammi_db::store::{training_set_order_by, TrainingSetSpec, TrainingSetTable};
+use jammi_db::store::{TrainingSetSpec, TrainingSetTable};
 
 use crate::model::ModelTask;
 use crate::session::InferenceSession;
@@ -65,18 +76,21 @@ use crate::session::InferenceSession;
 /// The SQL that reads a materialised training set back in its **committed
 /// order** — the reader's half of the order contract, in one place.
 ///
-/// `SELECT *` over the registered table (its schema is exactly the projection,
-/// in declared order) with [`training_set_order_by`] re-applied. The relation is
-/// spelled with [`TrainingSetTable::sql_relation`]: a result-table name carries
-/// hyphens (a sanitized model id) and dots (a nanosecond timestamp), so the
-/// unquoted form re-parses as arithmetic and as a multi-part reference — never
-/// the table.
-pub fn read_back_sql(table: &TrainingSetTable, columns: &[String]) -> String {
-    format!(
-        "SELECT * FROM {} {}",
-        table.sql_relation(),
-        training_set_order_by(columns)
-    )
+/// A thin call into [`TrainingSetTable::relation`]'s
+/// `TrainingSetRelation::select_ordered` (#551): the relation and its
+/// order clause are minted together, from the table's OWN recorded order
+/// columns, by that one method, which takes no projection argument at all
+/// — there is no caller-supplied value left to trust or
+/// distrust for the `ORDER BY`, so this function takes none either:
+/// a parameter this function never read would be exactly the
+/// band-aid shape a caller could mistake for still influencing the SQL.
+///
+/// `Result`, not a bare `String` (#551): [`TrainingSetTable::relation`]
+/// refuses an empty order-column list, typed — a `TrainingSetTable` this
+/// crate ever hands out never actually has one, but this function does not
+/// swallow that refusal into a panic or an assumption; it propagates.
+pub fn read_back_sql(table: &TrainingSetTable) -> Result<String> {
+    Ok(table.relation()?.select_ordered())
 }
 
 /// The single constructor every production call site in this crate builds a
@@ -128,7 +142,7 @@ pub async fn materialize_projection(
     format: &str,
 ) -> Result<(TrainingSetTable, Vec<RecordBatch>)> {
     let table = materialize_projection_table(session, source_id, columns, task, format).await?;
-    let batches = read_back(session, &table, columns).await?;
+    let batches = read_back(session, &table).await?;
     Ok((table, batches))
 }
 
@@ -217,9 +231,8 @@ pub async fn materialize(
 pub async fn read_back(
     session: &InferenceSession,
     table: &TrainingSetTable,
-    columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
-    let batches = session.sql(&read_back_sql(table, columns)).await?;
+    let batches = session.sql(&read_back_sql(table)?).await?;
     // Checked, then released immediately — this function's own contract
     // (its doc above), unlike `read_back_with_reservation`'s.
     reserve_eager_batches(session, &batches)?.free();
@@ -238,12 +251,11 @@ pub async fn read_back(
 pub async fn read_back_with_reservation(
     session: &InferenceSession,
     table: &TrainingSetTable,
-    columns: &[String],
 ) -> Result<(
     Vec<RecordBatch>,
     datafusion::execution::memory_pool::MemoryReservation,
 )> {
-    let batches = session.sql(&read_back_sql(table, columns)).await?;
+    let batches = session.sql(&read_back_sql(table)?).await?;
     let reservation = reserve_eager_batches(session, &batches)?;
     Ok((batches, reservation))
 }
@@ -272,59 +284,114 @@ fn reserve_eager_batches(
 }
 
 /// The reader-class allow-list: every call site in the workspace, outside test
-/// code, that reaches a training-set table's relation KEY through one of the
-/// three named routes below, keyed by `path:function` rather than
-/// `path:line` — a line number drifts under an unrelated edit, a function
-/// name does not — with the ONE property each entry must hold: it applies
-/// [`training_set_order_by`] itself. A caller that reads a relation by name
-/// without doing so loses the committed order silently on a multi-row-group
-/// table scanned by more than one partition.
+/// code, that reaches a training-set table's relation by NAME through one of
+/// the routes below, keyed by `path:function` rather than `path:line` — a
+/// line number drifts under an unrelated edit, a function name does not —
+/// with the ONE property each entry must hold: it applies
+/// [`training_set_order_by`](jammi_db::store::training_set_order_by) itself
+/// (or is reviewed as not reading a training-set relation at all — see the
+/// widened needles below). A caller that reads a relation by name without
+/// applying the order loses it silently on a multi-row-group table scanned by
+/// more than one partition.
 ///
-/// # The three named routes this scan covers
+/// # #551 — the honest guarantee, widened, never claimed closed
 ///
-/// [`TrainingSetTable::sql_relation`] is not the only way to reach the
-/// registered name — the scan matches three named routes:
-/// - `.sql_relation(` — the dot-call form.
-/// - `sql_relation(&` — the UFCS form (`TrainingSetTable::sql_relation(&t)`).
-/// - `registered_name(` — [`TrainingSetTable::registered_name`], the
-///   UNQUOTED key `sql_relation` itself quotes. Its own doc says it is "NOT
-///   safe to interpolate into SQL as-is", but a caller that reaches for it
-///   directly (skipping the quoting) is still on the identical route to the
-///   same relation, and the order hazard is the same.
+/// [`TrainingSetTable::relation`](jammi_db::store::TrainingSetTable::relation)
+/// makes the SAFE route the only one with no order key to supply — every
+/// production reader in this crate that names a training-set relation now
+/// goes through it (`read_back_sql`, below), and that route cannot render an
+/// unordered read. It does NOT make the UNSAFE routes unreachable: the bare
+/// catalog name is reachable off any `ResultTableRecord` — a fresh
+/// `Catalog::get_result_table(name)` call, or `ResultTableRecord::table_name`
+/// directly on a value obtained some other way — entirely independently of
+/// `TrainingSetTable`, so a hand-built
+/// `format!("SELECT * FROM \"jammi.{{}}\"", record.table_name)` remains
+/// representable. This scan is what still catches that: it is the DISCLOSED
+/// RESIDUAL on #551, not a closed set over meaning. Its needle set widened
+/// this round to name the catalog-record route explicitly rather than only
+/// the accessor-spelling routes:
+/// - `.sql_relation(` — the dot-call form of
+///   [`TrainingSetTable::sql_relation`](jammi_db::store::TrainingSetTable::sql_relation).
+/// - `sql_relation(&` — its UFCS form.
+/// - `registered_name(` — the now-deleted `TrainingSetTable::registered_name`'s
+///   spelling; kept as a needle in case a future symbol reuses the name.
+/// - `result_table_relation(` —
+///   [`jammi_db::store::result_table_relation`], `sql_relation`'s
+///   general-purpose sibling minter every other registered-relation reader in
+///   the workspace calls.
+/// - `.record.table_name` / `.table_name()` — the catalog-record route: a
+///   caller that reaches a `ResultTableRecord`'s bare name through EITHER
+///   spelling. Neither the field-access nor the method-call form is specific
+///   to training sets — `PinnedSource::table_name`, `BuildingTable::table_name`,
+///   `BuildingVersion::table_name` are catalog-identity accessors on
+///   DIFFERENT types entirely — so this needle catches many reviewed,
+///   unrelated call sites too; each is reviewed once and allow-listed below
+///   with a note of which type it belongs to and why it never reaches a
+///   training-set relation.
 ///
-/// # This scan's universe is exactly these three named routes — nothing wider
+/// # This scan's universe is exactly these named routes — nothing wider
 ///
-/// The scan matches literal invocation syntax for `sql_relation`/
-/// `registered_name`, so it covers a caller **only** if the caller spells one
-/// of those two names. [`TrainingSetTable::table_name`] returns the bare
-/// catalog name with no `jammi.` schema prefix and is NOT one of the three
-/// needles, so a caller that hand-builds the relation string from it — e.g.
-/// `format!("SELECT * FROM \"jammi.{}\"", table.table_name())`, reproducing
-/// [`TrainingSetTable::sql_relation`]'s own formatting by hand instead of
-/// calling it — is invisible to this scan: it reaches the identical
-/// relation, carries the identical order hazard, and is counted nowhere in
-/// the table above.
-/// [`TrainingSetTable::record`] is a public field, so nothing in the type
-/// system stops this: the allow-list is a scan over spelling, not a closed
-/// set over meaning, and a hand-built key never triggers it no matter how
-/// many such callers exist. Making the hand-built form unrepresentable — a
-/// `RelationKey` newtype that owns quoting and is the only value
-/// [`TrainingSetTable::sql_relation`]-shaped code can hold — is tracked as
-/// <https://github.com/f-inverse/jammi-ai/issues/551>; until it lands, this
-/// scan's guarantee is "every caller that reaches for the relation by NAME
-/// applies the order", not "every caller that reaches the relation at all".
+/// The scan matches literal invocation/field-access syntax, so it covers a
+/// caller only if the caller spells one of the needles above. A caller that
+/// re-derives the bare name some OTHER way (string concatenation from parts,
+/// a value threaded through several functions before reaching a `format!`)
+/// is invisible to it — the residual this module's doc states, not a claim
+/// this scan closes.
 ///
-/// One exclusion, by construction rather than by allow-listing: `sql_relation`'s
-/// OWN body (`crates/jammi-db/src/store/mod.rs`) calls `registered_name()` on
-/// itself to build the string it then quotes — that call constructs an
-/// identifier, not a query, so there is no order to lose. The scan skips
-/// matches whose enclosing function IS `table_name`/`registered_name`/
-/// `sql_relation` in that one file (the accessors' own implementations),
-/// never a caller elsewhere.
+/// A further disclosed residual (#551): every needle match is a
+/// single-LINE `contains` check, so a rustfmt-split expression whose needle
+/// text spans two lines — `.record`/`.table_name` on separate lines, e.g. a
+/// method-chain break rustfmt inserts for a long line — is invisible to it
+/// the same way, even though the compiled code reaches the identical
+/// field. `.sql_relation(`, `registered_name(`, and `result_table_relation(`
+/// are single tokens rustfmt never splits mid-call, so they do not carry
+/// this gap. `sql_relation(&` is NOT a single token — it is a call's `(`
+/// followed by a separate `&` token, and rustfmt CAN break a call's argument
+/// list onto its own line after `(` for a long enough invocation — so this
+/// needle belongs with the split-prone ones on the same footing as
+/// `.record.table_name`/`.table_name()`; it is listed here rather than left
+/// unstated because today, workspace-wide, there are ZERO call sites that
+/// spell `TrainingSetTable::sql_relation(&..)` in its UFCS form at all
+/// (every real call is the dot-call `self.sql_relation()`/`table.sql_relation()`
+/// form) — so this gap is currently vacuous, not closed.
 ///
-/// | `path:function`                                  | mechanism                          | behavioural order assertion |
-/// |---------------------------------------------------|-------------------------------------|------------------------------|
-/// | `fine_tune/training_set.rs:read_back_sql`          | `ORDER BY` via `training_set_order_by` | `training_set::read_back_re_applies_the_committed_order_across_row_groups` (`tests/it/training_set.rs`) |
+/// A SECOND disclosed residual of the same line-granularity check (#551):
+/// the accessor-impl exclusion below (`accessor_impl_line_ranges`) treats its
+/// `(start, end)` span as INCLUSIVE of `end`, the impl block's closing-brace
+/// LINE — so a needle appearing on that SAME line, after the `}` (e.g.
+/// `} let _ = record.table_name;`), would be excluded as if it were still
+/// inside the impl block, even though it lexically is not. This shape is not
+/// reachable through this repository's own required gates: `cargo fmt
+/// --check` (a required CI step) rejects it — rustfmt always places an
+/// item's closing brace alone on its own line, never followed by another
+/// statement on the same line — so no rustfmt-clean commit can produce it.
+///
+/// One exclusion, by construction rather than by allow-listing: the
+/// accessors' OWN implementations
+/// (`crates/jammi-db/src/store/mod.rs::{table_name,sql_relation,relation}`)
+/// read `self.record.table_name` (or call `self.sql_relation()`) to build
+/// their OWN return value — that is the method constructing its result, never
+/// a caller reaching for the relation key, so the scan skips matches whose
+/// LINE falls inside `TrainingSetTable`'s or `TrainingSetRelation`'s own
+/// `impl` block SPAN (see `accessor_impl_line_ranges`, which parses the file
+/// with `syn` rather than a text heuristic — #551) — never a
+/// function-NAME match file-wide, which would (and, before this fix, did)
+/// also silently swallow `PinnedSource::table_name`'s identically-named but
+/// unrelated method in the SAME file; that hit is reviewed and allow-listed
+/// below instead.
+///
+/// [`read_back_sql`] itself carries NO entry in [`ALLOWED`] — it spells none
+/// of this scan's needles any more (`TrainingSetTable::relation` is not one),
+/// which is the point: the safe route dropped OFF this allow-list rather
+/// than earning a permanent place on it, because there is no longer a
+/// spelling to review. Its own order guarantee is pinned separately, by
+/// `training_set::read_back_re_applies_the_committed_order_across_row_groups`
+/// (`tests/it/training_set.rs`).
+///
+/// Every entry in [`ALLOWED`] is therefore the catalog-record-route
+/// residual: a reviewed call that reaches a bare table name for a purpose
+/// OTHER than building a training-set SQL read (index bookkeeping, an error
+/// message, a non-training-set relation) — see each entry's own comment.
 ///
 /// This test finds every call site itself (never hand-transcribes the count)
 /// by walking every `crates/*/src/**/*.rs` file from the workspace root and
@@ -339,17 +406,214 @@ fn reserve_eager_batches(
 mod reader_class_allow_list {
     /// `(workspace-relative path, enclosing function name)` for every
     /// production call site this fold has audited and accepted.
-    const ALLOWED: &[(&str, &str)] = &[(
-        "crates/jammi-ai/src/fine_tune/training_set.rs",
-        "read_back_sql",
-    )];
+    const ALLOWED: &[(&str, &str, usize)] = &[
+        // --- `.table_name()` needle, the catalog-record route (#551):
+        // none of the sites below reach a TRAINING-SET relation.
+        // `run_spec` reads `TrainingSetTable::table_name` TWICE — the
+        // identity pair a `Peer` gang admits against, and a materialization-
+        // manifest error message — both catalog-key STRINGs, never
+        // interpolated into SQL.
+        ("crates/jammi-ai/src/fine_tune/worker.rs", "run_spec", 2),
+        // `PinnedSource::table_name`, twice — a context-pool error message
+        // AND a vector-extraction key, not a training-set relation.
+        (
+            "crates/jammi-ai/src/pipeline/context_set.rs",
+            "pool_context_vectors",
+            2,
+        ),
+        // `TrainingSetTable::table_name`, the freshly-materialised REPLAY's
+        // own identity, returned as the recomputed table's name — never
+        // interpolated into SQL.
+        (
+            "crates/jammi-ai/src/pipeline/recompute.rs",
+            "recompute_training_set",
+            1,
+        ),
+        // The SAME accessor, in this module's own unit-style fixture
+        // (`#[cfg(test)]` inside `src/`, so this scan still walks it), TWICE
+        // — a catalog-row fetch and the refusal assertion, both naming the
+        // table for the test's own bookkeeping, never building SQL.
+        (
+            "crates/jammi-ai/src/pipeline/recompute.rs",
+            "recompute_training_set_refuses_when_its_own_manifest_read_finds_no_sidecar",
+            2,
+        ),
+        // `PinnedSource::table_name`, an embedding-delta refusal's table
+        // label.
+        (
+            "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
+            "infer_delta",
+            1,
+        ),
+        // `BuildingTable::table_name` — the freshly-built embedding table's
+        // own identity string, not a training-set relation.
+        ("crates/jammi-ai/src/pipeline/embedding.rs", "run", 1),
+        // `PinnedSource::table_name`, three call sites across
+        // `context_predictor.rs` — a gang-episode/provenance table label and
+        // a peer-vector read's catalog key, never a training-set relation.
+        (
+            "crates/jammi-ai/src/pipeline/context_predictor.rs",
+            "episode_for_task",
+            1,
+        ),
+        (
+            "crates/jammi-ai/src/pipeline/context_predictor.rs",
+            "read_member_vectors",
+            1,
+        ),
+        (
+            "crates/jammi-ai/src/pipeline/context_predictor.rs",
+            "predict_with_context_predictor_provenanced",
+            1,
+        ),
+        // `BuildingTable::table_name`, twice — `jammi-db`'s OWN ANN-index
+        // segment bookkeeping (a precision-mismatch error message AND the
+        // `max_index_segment_id` key), no relation SQL anywhere on this path.
+        ("crates/jammi-db/src/store/mod.rs", "append_segment", 2),
+        // `BuildingVersion::table_name`, twice — same shape, the version-row
+        // sibling of `append_segment`.
+        (
+            "crates/jammi-db/src/store/mod.rs",
+            "append_segment_for_version",
+            2,
+        ),
+        // `PinnedSource::table_name`'s OWN body (`&self.record.table_name`) —
+        // NOT excluded by the accessor-impl-span mechanism above, since
+        // `PinnedSource`'s impl block is a DIFFERENT, unrelated span this
+        // round does not touch (#551: `PinnedSource::record`/
+        // `table_name` are the SAME residual-route class as
+        // `TrainingSetTable`'s own former `record()`, left unreviewed and
+        // unchanged, per that method's own doc). Reviewed here instead: the
+        // method builds its OWN return value, the identical shape the
+        // construction-exclusion covers for `TrainingSetTable`/
+        // `TrainingSetRelation`, just not folded into that exclusion's span.
+        ("crates/jammi-db/src/store/mod.rs", "table_name", 1),
+        // `BuildingTable::table_name` — a test-utility helper's own table
+        // label for its refusal path.
+        ("crates/jammi-test-utils/src/lib.rs", "abandon_building", 1),
+        // --- `result_table_relation(` needle: every reviewed migration site
+        // (#551 — `crates/jammi-ai/tests/it/
+        // pinned_source_gate.rs`'s SESSION_LITERAL_ALLOWED entry for this
+        // same minter is the sibling review of the SAME call sites, for a
+        // different risk class) plus this crate's own quoted-relation reads.
+        // Each already applies its OWN order (a primary-key equality scan,
+        // an ANN-ordered nearest-neighbour read, or an unordered full scan
+        // with no committed order to lose) — none is a training-set relation.
+        (
+            "crates/jammi-ai/src/session.rs",
+            "infer_ordered_read_back_sql",
+            1,
+        ),
+        (
+            "crates/jammi-ai/src/pipeline/graph_propagation.rs",
+            "edge_scan_sql",
+            1,
+        ),
+        (
+            "crates/jammi-db/src/index/exact.rs",
+            "exact_vector_search",
+            1,
+        ),
+        ("crates/jammi-bench/src/search_rss.rs", "scan_only_drain", 1),
+        (
+            "crates/jammi-bench/src/search_rss.rs",
+            "naive_collect_all_search",
+            1,
+        ),
+        (
+            "crates/jammi-bench/src/propagate.rs",
+            "read_sorted_vectors",
+            1,
+        ),
+        ("crates/jammi-bench/src/corpus.rs", "load_vectors", 1),
+    ];
 
     /// The accessors' own implementations (`crates/jammi-db/src/store/mod.rs`)
     /// — excluded by construction, not by allow-listing, since a match there
     /// is the method building its own return value, never a caller reaching
     /// for the relation key. See the module doc's "One exclusion" note.
     const ACCESSOR_IMPL_FILE: &str = "crates/jammi-db/src/store/mod.rs";
-    const ACCESSOR_IMPL_FNS: &[&str] = &["table_name", "registered_name", "sql_relation"];
+
+    /// The `Self` type names whose top-level `impl` blocks are excluded —
+    /// NEVER a function-name match file-wide (#551): `PinnedSource`
+    /// has its own `table_name`/`record` methods in the SAME file, and a
+    /// name-only exclusion silently swallowed its body as if it were
+    /// `TrainingSetTable::table_name`'s.
+    const ACCESSOR_IMPL_TYPES: &[&str] = &["TrainingSetTable", "TrainingSetRelation"];
+
+    /// `(start, end)` 0-based line indices (inclusive) for every top-level
+    /// `impl` block in `text` whose `Self` type is one of
+    /// [`ACCESSOR_IMPL_TYPES`] — via the REAL parser (`syn::parse_file`), not
+    /// a line-text heuristic (#551): a line-based "the next line
+    /// that is exactly `}` at zero indentation closes the block" heuristic
+    /// silently EXTENDS the excluded span past a rustfmt-clean trailing
+    /// comment on that same closing brace (`} // end impl TrainingSetRelation`
+    /// still reads as exactly the brace text on ITS line, but a heuristic
+    /// scanning for the LITERAL line `"}"` would miss it and keep walking
+    /// past the true end) — an auditor's planted hand-built read placed
+    /// right after such a brace was silently swallowed by the widened span,
+    /// invisible to the scan. `syn`'s span for a parsed `ItemImpl` ends at
+    /// the closing brace TOKEN itself, regardless of what shares its line or
+    /// how any doc comment inside the block spells `{`/`}` in prose (a
+    /// tokenizer never confuses a comment's or a string literal's braces
+    /// with real block structure, unlike a naive text scan).
+    fn accessor_impl_line_ranges(text: &str) -> Vec<(usize, usize)> {
+        use syn::spanned::Spanned;
+
+        let file = syn::parse_file(text).unwrap_or_else(|e| {
+            panic!(
+                "crates/jammi-db/src/store/mod.rs failed to parse as Rust via `syn` — this \
+                 scan's accessor-impl exclusion cannot run: {e}"
+            )
+        });
+        // Named, not just spanned (#551): a PER-NAME count is asserted
+        // below, not merely a total across all of `ACCESSOR_IMPL_TYPES` — a
+        // total-length check alone cannot tell "two `impl TrainingSetRelation`
+        // blocks and zero `impl TrainingSetTable` blocks" (2 total, matching
+        // `ACCESSOR_IMPL_TYPES.len() == 2` by coincidence) from the intended
+        // "exactly one of each", which would silently leave `TrainingSetTable`
+        // entirely unexcluded while reporting no staleness at all.
+        let named_spans: Vec<(&'static str, (usize, usize))> = file
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                syn::Item::Impl(item_impl) => Some(item_impl),
+                _ => None,
+            })
+            .filter_map(|item_impl| {
+                let syn::Type::Path(type_path) = item_impl.self_ty.as_ref() else {
+                    return None;
+                };
+                let name = type_path.path.segments.last()?.ident.to_string();
+                let matched = *ACCESSOR_IMPL_TYPES.iter().find(|t| **t == name)?;
+                let span = item_impl.span();
+                // `proc_macro2::LineColumn::line` is 1-based; this scan's own
+                // line index (`lines.iter().enumerate()`) is 0-based.
+                Some((
+                    matched,
+                    (
+                        span.start().line.saturating_sub(1),
+                        span.end().line.saturating_sub(1),
+                    ),
+                ))
+            })
+            .collect();
+        for type_name in ACCESSOR_IMPL_TYPES {
+            let count = named_spans.iter().filter(|(n, _)| n == type_name).count();
+            assert_eq!(
+                count, 1,
+                "expected exactly one top-level `impl {type_name}` block, found {count} — this \
+                 scan's exclusion set is stale (the type was renamed, removed, or gained/lost an \
+                 impl block); a total-count check across all of ACCESSOR_IMPL_TYPES would not \
+                 catch this NAME's count going to 0 as long as some OTHER name's count rose to \
+                 compensate, so each name is asserted separately"
+            );
+        }
+        let mut spans: Vec<(usize, usize)> =
+            named_spans.into_iter().map(|(_, span)| span).collect();
+        spans.sort_unstable();
+        spans
+    }
 
     /// Every route this scan matches, each assembled from separate literal
     /// parts so the exact contiguous text never appears once in this file
@@ -360,16 +624,24 @@ mod reader_class_allow_list {
             format!(".{}(", "sql_relation"),
             format!("{}(&", "sql_relation"),
             format!("{}(", "registered_name"),
+            format!("{}(", "result_table_relation"),
+            format!(".{}.{}", "record", "table_name"),
+            format!(".{}()", "table_name"),
         ]
     }
 
-    /// A route's own definition line (`fn sql_relation(` / `fn registered_name(`)
-    /// is not a call site — the return-type accessor being DEFINED, never
-    /// invoked. Distinct from [`ACCESSOR_IMPL_FNS`]'s exclusion, which covers
-    /// calls made FROM inside those functions' bodies.
+    /// A route's own definition line (`fn sql_relation(` /
+    /// `fn registered_name(` / `fn result_table_relation(`) is not a call
+    /// site — the return-type accessor/minter being DEFINED, never invoked.
+    /// Distinct from `accessor_impl_line_ranges`'s exclusion, which covers calls
+    /// made FROM inside those functions' bodies. `.table_name()`'s leading
+    /// dot already excludes every `fn table_name(` definition line across
+    /// the workspace (a definition never starts with a dot), so it needs no
+    /// entry here.
     fn is_definition_line(line: &str) -> bool {
         line.contains(&format!("fn {}(", "sql_relation"))
             || line.contains(&format!("fn {}(", "registered_name"))
+            || line.contains(&format!("fn {}(", "result_table_relation"))
     }
 
     fn workspace_root() -> std::path::PathBuf {
@@ -450,6 +722,11 @@ mod reader_class_allow_list {
     fn every_production_sql_relation_call_site_is_on_the_allow_list() {
         let root = workspace_root();
         let needles = needles();
+        // One entry PER OCCURRENCE, never deduped (#551): a
+        // (path, fn) key alone let a SECOND hand-built read inside an
+        // already-allow-listed function pass silently, since `found.dedup()`
+        // collapsed both occurrences into the one entry `ALLOWED` already
+        // covered. Counting fixes it — see the assertion below.
         let mut found: Vec<(String, String)> = Vec::new();
         for path in all_workspace_src_files(&root) {
             let text = std::fs::read_to_string(&path)
@@ -460,6 +737,11 @@ mod reader_class_allow_list {
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
+            let accessor_spans = if rel == ACCESSOR_IMPL_FILE {
+                accessor_impl_line_ranges(&text)
+            } else {
+                Vec::new()
+            };
             for (i, line) in lines.iter().enumerate() {
                 // Skip comment/doc lines outright — a mention of a route in
                 // prose is not an invocation of it.
@@ -473,6 +755,17 @@ mod reader_class_allow_list {
                 if !needles.iter().any(|n| line.contains(n)) {
                     continue;
                 }
+                // The accessors' own bodies (`sql_relation` calling
+                // `result_table_relation` on itself, `relation` calling
+                // `sql_relation`) are excluded by construction, scoped to
+                // the exact `impl TrainingSetTable`/`impl TrainingSetRelation`
+                // spans — NEVER by function name file-wide, which would also
+                // (wrongly) swallow `PinnedSource::table_name`'s identically-
+                // named but unrelated method in the SAME file. See the
+                // module doc's "One exclusion" note.
+                if accessor_spans.iter().any(|(s, e)| i >= *s && i <= *e) {
+                    continue;
+                }
                 let func = enclosing_fn_name(&lines, i).unwrap_or_else(|| {
                     panic!(
                         "{rel}:{}: reader-method call with no enclosing `fn` found by this \
@@ -480,38 +773,48 @@ mod reader_class_allow_list {
                         i + 1
                     )
                 });
-                // The accessors' own bodies (`sql_relation` calling
-                // `registered_name` on itself) are excluded by construction —
-                // see the module doc's "One exclusion" note.
-                if rel == ACCESSOR_IMPL_FILE && ACCESSOR_IMPL_FNS.contains(&func.as_str()) {
-                    continue;
-                }
                 found.push((rel.clone(), func));
             }
         }
-        found.sort();
-        found.dedup();
-        let mut allowed: Vec<(String, String)> = ALLOWED
-            .iter()
-            .map(|(p, f)| (p.to_string(), f.to_string()))
-            .collect();
-        allowed.sort();
 
-        let extra: Vec<_> = found.iter().filter(|e| !allowed.contains(e)).collect();
-        assert!(
-            extra.is_empty(),
-            "new caller(s) reaching a training-set table's relation key (via `sql_relation`, \
-             its UFCS form, or `registered_name`) not on the reader-class allow-list — each \
-             one must either apply `training_set_order_by` or pin `target_partitions = 1` on \
-             an `ORDER BY`-free scan, then be added here with its own behavioural order \
-             assertion: {extra:?}"
-        );
-        let missing: Vec<_> = allowed.iter().filter(|e| !found.contains(e)).collect();
-        assert!(
-            missing.is_empty(),
-            "allow-listed call site(s) no longer found — the allow-list is stale, narrow it: \
-             {missing:?}"
-        );
+        // Count occurrences per (path, fn) — the key `ALLOWED` now carries a
+        // third field for.
+        let mut found_counts: std::collections::BTreeMap<(String, String), usize> =
+            std::collections::BTreeMap::new();
+        for site in found {
+            *found_counts.entry(site).or_insert(0) += 1;
+        }
+        for ((path, func), count) in &found_counts {
+            let allowed_count = ALLOWED
+                .iter()
+                .find(|(p, f, _)| *p == path.as_str() && *f == func.as_str())
+                .map(|(_, _, c)| *c)
+                .unwrap_or(0);
+            assert!(
+                *count <= allowed_count,
+                "{path}:{func} reaches a relation's registered/catalog name (via `sql_relation`, \
+                 its UFCS form, `registered_name`, `result_table_relation`, a bare `record` \
+                 field's `table_name`, or a bare `table_name` call) {count} time(s), only \
+                 {allowed_count} reviewed/allowed at this site — review the NEW occurrence: \
+                 either it reaches a training-set relation and must apply \
+                 `training_set_order_by` (or pin `target_partitions = 1` on an `ORDER BY`-free \
+                 scan), or it is unrelated (a different type's catalog identity, an already-\
+                 ordered read) and the count in ALLOWED belongs raised, with a note of which."
+            );
+        }
+        for (path, func, allowed_count) in ALLOWED {
+            let actual = found_counts
+                .get(&((*path).to_string(), (*func).to_string()))
+                .copied()
+                .unwrap_or(0);
+            assert_eq!(
+                actual, *allowed_count,
+                "{path}:{func}: ALLOWED claims {allowed_count} occurrence(s), the scan finds \
+                 {actual} — the allow-list is stale (a site moved, was refactored away, or this \
+                 entry's count was never accurate); narrow or correct it rather than leaving a \
+                 count that does not describe reality."
+            );
+        }
     }
 }
 

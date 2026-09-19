@@ -44,13 +44,11 @@ Hermetic: three file reads, stdlib only, no network, no wheel, no binary.
 `ci/scripts/bundle_cuda_libs.sh` answers the identical classification
 question — "is this SONAME the tarball's to carry, the host's, or the
 driver's" — for the cu12 TARBALL rather than the WHEEL. Two artifacts, one
-partition, and the pressure round on wave 5's TARBALL unit (F2) named the
-failure mode directly: a SECOND, independent enumeration in the shell script
-(a `BUNDLE_FLOOR_STEMS`/platform/driver list restated by hand) is exactly the
-kind of copy this whole unit exists to remove — the tarball's now-fixed
-seven-name HAND LIST (#535) was one; a second one here, never checked against
-`verify_link_set.py`, would just be a fifth statement of the same fact.
-`BundleScriptContract` below is that binding, added in the same idiom as
+partition. The failure mode is a SECOND, independent enumeration in the shell
+script (a `BUNDLE_FLOOR_STEMS`/platform/driver list restated by hand): never
+checked against `verify_link_set.py`, it would be a fifth statement of the
+same fact, free to drift. `BundleScriptContract` below is that binding, in the
+same idiom as
 `ComponentContract` above: read each side's OWN enumeration (here, by
 sourcing the real shell script in a subprocess and asking its real
 functions/constants — no re-parsing of shell text by regex) and assert
@@ -220,8 +218,8 @@ class ComponentContract(unittest.TestCase):
 class BundleScriptContract(unittest.TestCase):
     """`ci/scripts/bundle_cuda_libs.sh` (the cu12 TARBALL's derivation +
     loader-verification arm) restates the SAME COVERED/PLATFORM/
-    DRIVER_PROVIDED partition `verify_link_set.py` states for the cu12 WHEEL
-    (F2, wave-5 pressure round). This is the cross-file agreement for that
+    DRIVER_PROVIDED partition `verify_link_set.py` states for the cu12
+    WHEEL. This is the cross-file agreement for that
     second statement: neither script's classification can drift from the
     other without going red here."""
 

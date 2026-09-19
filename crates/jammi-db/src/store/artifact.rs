@@ -50,9 +50,11 @@ use object_store::path::Path as ObjectPath;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::catalog::artifact_repo::{ArtifactRef, ReclaimLicence, StagedArtifact, StagingScope};
+use crate::catalog::Catalog;
 use crate::error::{JammiError, Result};
 use crate::storage::{
-    sha256_hex, JammiObjectStore, Scheme, StorageError, StorageRegistry, StorageUrl,
+    sha256_hex, DeleteOutcome, JammiObjectStore, Scheme, StorageError, StorageRegistry, StorageUrl,
 };
 use crate::store::layout::TenantSegment;
 use crate::store::manifest::{
@@ -462,6 +464,169 @@ impl ArtifactStore {
         Ok(())
     }
 
+    /// Stage and write the bundle one attempt of a job serves, under the
+    /// attempt-unique prefix `{job_id}/{worker_id}/{attempt}`.
+    ///
+    /// The `staged` catalog row is written FIRST, through `catalog` (whose
+    /// bound tenant owns both the row and the prefix's tenant segment), so no
+    /// byte exists under `models/` that a row does not name. The returned
+    /// [`StagedArtifact`] is the writer's claim on the bundle: a finalize
+    /// publishes it, and an attempt that gives up reclaims it.
+    pub async fn stage_attempt_artifact(
+        &self,
+        catalog: &Catalog,
+        job_id: &str,
+        worker_id: &str,
+        attempt: u32,
+        files: &[(String, Bytes)],
+    ) -> Result<StagedArtifact> {
+        let attempt_segment = attempt.to_string();
+        self.stage_bundle(
+            catalog,
+            StagingScope::Attempt {
+                job_id: job_id.to_string(),
+                attempt,
+            },
+            &[job_id, worker_id, &attempt_segment],
+            files,
+        )
+        .await
+    }
+
+    /// Stage and write one epoch's full loadable adapter checkpoint under
+    /// `{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{epoch}` — its own
+    /// artifact, with its own row, nested beneath the attempt's served prefix
+    /// only in the physical layout. `epoch` is the 0-based loop epoch index.
+    pub async fn stage_epoch_checkpoint(
+        &self,
+        catalog: &Catalog,
+        job_id: &str,
+        worker_id: &str,
+        attempt: u32,
+        epoch: usize,
+        files: &[(String, Bytes)],
+    ) -> Result<StagedArtifact> {
+        let attempt_segment = attempt.to_string();
+        let epoch_segment = epoch_segment(epoch);
+        self.stage_bundle(
+            catalog,
+            StagingScope::Attempt {
+                job_id: job_id.to_string(),
+                attempt,
+            },
+            &[
+                job_id,
+                worker_id,
+                &attempt_segment,
+                CHECKPOINTS_SEGMENT,
+                &epoch_segment,
+            ],
+            files,
+        )
+        .await
+    }
+
+    /// Stage and write a job's durable resume checkpoint under the
+    /// job-scoped prefix `{job_id}/_resume`, overwriting the prior epoch's
+    /// bundle in place. Resume state belongs to the JOB — attempt N+1 reads
+    /// attempt N's progress — so the artifact is staged job-scoped and is
+    /// never published: it stays protected while the job is non-terminal and
+    /// is reclaimed once the job ends.
+    pub async fn stage_resume_checkpoint(
+        &self,
+        catalog: &Catalog,
+        job_id: &str,
+        files: &[(String, Bytes)],
+    ) -> Result<StagedArtifact> {
+        self.stage_bundle(
+            catalog,
+            StagingScope::Job {
+                job_id: job_id.to_string(),
+            },
+            &[job_id, RESUME_SEGMENT],
+            files,
+        )
+        .await
+    }
+
+    /// Row first, bytes second: the one ordering every staged bundle shares.
+    async fn stage_bundle(
+        &self,
+        catalog: &Catalog,
+        scope: StagingScope,
+        prefix_segments: &[&str],
+        files: &[(String, Bytes)],
+    ) -> Result<StagedArtifact> {
+        let tenant = catalog.current_tenant();
+        let prefix = self.prefix_url(tenant.as_ref(), prefix_segments)?;
+        let staged = catalog.stage_model_artifact(&prefix, scope).await?;
+        self.put_artifact(tenant.as_ref(), prefix_segments, files)
+            .await?;
+        Ok(staged)
+    }
+
+    /// The artifact a job's resume checkpoint is staged as.
+    pub fn resume_checkpoint_ref(
+        &self,
+        tenant: Option<&TenantId>,
+        job_id: &str,
+    ) -> Result<ArtifactRef> {
+        Ok(ArtifactRef::from_url(
+            self.prefix_url(tenant, &[job_id, RESUME_SEGMENT])?,
+        ))
+    }
+
+    /// Delete a reclaimed artifact's bytes and retire its row — the one
+    /// primitive that removes bytes under `models/`, reachable only with the
+    /// [`ReclaimLicence`] the catalog's reclaim compare-and-set minted.
+    ///
+    /// Deletes the files the bundle's `manifest.json` lists, any `listed` key
+    /// the caller found under the prefix (a reconcile pass's own listing —
+    /// how a bundle torn before its manifest, or one whose manifest no longer
+    /// parses, still converges), the `materialization.json` attestation, and
+    /// the manifest itself LAST, so an interrupted reclaim still knows what it
+    /// had left to delete. Every key passes the licence's always-on
+    /// [`ReclaimLicence::covers`] check at the raw delete. Only when every
+    /// delete has succeeded is the row retired; any failure leaves the
+    /// artifact `reclaiming`, which the next reclaim of it resumes.
+    pub async fn reclaim(
+        &self,
+        catalog: &Catalog,
+        licence: ReclaimLicence,
+        listed: &[ObjectPath],
+    ) -> Result<Vec<ObjectPath>> {
+        let prefix = licence.artifact().url().clone();
+        let handle = self.handle(&prefix)?;
+        let manifest_path = self.child(&prefix, MANIFEST_NAME)?;
+        let mut keys: Vec<ObjectPath> = match self.read_manifest(&handle, &prefix).await {
+            Ok(manifest) => manifest
+                .files
+                .iter()
+                .map(|entry| self.child(&prefix, &entry.name))
+                .collect::<Result<_>>()?,
+            // Nothing published, or a manifest that no longer parses: the
+            // caller's listing is then the only inventory there is.
+            Err(JammiError::Storage(
+                StorageError::NotPublished { .. } | StorageError::Layout { .. },
+            )) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        keys.extend(listed.iter().filter(|key| **key != manifest_path).cloned());
+        keys.push(self.child(&prefix, MATERIALIZATION_NAME)?);
+        keys.sort();
+        keys.dedup();
+        keys.push(manifest_path);
+
+        let mut deleted = Vec::new();
+        for key in keys {
+            if handle.delete_licensed(&licence, &key).await? == DeleteOutcome::Deleted {
+                deleted.push(key);
+            }
+        }
+        catalog.retire_reclaimed_artifact(licence).await?;
+        Ok(deleted)
+    }
+
     /// Write a job's durable **resume checkpoint** under the attempt-shared prefix
     /// `{job_id}/_resume/`, overwriting the prior epoch's bundle in place.
     ///
@@ -647,16 +812,7 @@ impl ArtifactStore {
     /// cloud-bucket leading segment stripped (mirroring
     /// [`JammiObjectStore`]'s path parsing).
     fn child(&self, prefix: &StorageUrl, name: &str) -> Result<ObjectPath> {
-        let key = format!("{}/{}", prefix.path(), name);
-        let stripped = match prefix.scheme() {
-            Scheme::File | Scheme::Memory => key.trim_start_matches('/').to_string(),
-            _ => key
-                .split_once('/')
-                .map(|(_, rest)| rest.to_string())
-                .unwrap_or_default(),
-        };
-        ObjectPath::parse(&stripped)
-            .map_err(|e| JammiError::Storage(StorageError::layout(&key, e.to_string())))
+        Ok(prefix.object_key(&format!("{}/{}", prefix.path(), name))?)
     }
 
     /// Join the tenant segment plus attempt-unique segments under the store

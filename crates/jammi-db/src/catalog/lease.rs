@@ -259,6 +259,7 @@ pub fn lease_deadline_expr(
 pub enum CanonicalStampColumn {
     InstancesLastSeenAt,
     JobsUpdatedAt,
+    ModelArtifactsCreatedAt,
 }
 
 impl CanonicalStampColumn {
@@ -267,6 +268,7 @@ impl CanonicalStampColumn {
         match self {
             Self::InstancesLastSeenAt => ("instances", "last_seen_at"),
             Self::JobsUpdatedAt => ("jobs", "updated_at"),
+            Self::ModelArtifactsCreatedAt => ("model_artifacts", "created_at"),
         }
     }
 

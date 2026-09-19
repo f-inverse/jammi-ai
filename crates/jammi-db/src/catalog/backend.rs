@@ -131,6 +131,41 @@ impl BackendImpl {
         }
     }
 
+    /// Run `f` in a `Serializable` read-write transaction, re-running it when
+    /// the backend reports a serialization failure
+    /// ([`BackendError::Retry`]) — the outcome a `Serializable` transaction
+    /// that lost a genuine conflict is REQUIRED to retry from, not an error
+    /// of the operation itself. `f` runs once per try, so it must be
+    /// re-runnable: it owns (or clones) everything it binds.
+    ///
+    /// Bounded: a transaction that still conflicts after
+    /// [`SERIALIZABLE_TRIES`] tries surfaces the `Retry` to the caller.
+    pub(crate) async fn serializable<F, R>(&self, f: F) -> Result<R, BackendError>
+    where
+        F: for<'tx> Fn(
+                &'tx mut Transaction<'tx>,
+            )
+                -> Pin<Box<dyn Future<Output = Result<R, BackendError>> + Send + 'tx>>
+            + Send
+            + Sync,
+        R: Send,
+    {
+        let opts = TxOptions {
+            isolation: IsolationLevel::Serializable,
+            read_only: false,
+        };
+        let mut tries = 1;
+        loop {
+            match self.transaction(opts, &f).await {
+                Err(BackendError::Retry(_)) if tries < SERIALIZABLE_TRIES => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5 * tries as u64)).await;
+                    tries += 1;
+                }
+                settled => return settled,
+            }
+        }
+    }
+
     /// Run one read-only `SELECT` directly against the pool — no `BEGIN`, no
     /// `SET TRANSACTION ISOLATION LEVEL ...`, no `SET TRANSACTION READ
     /// ONLY`, no `COMMIT`. [`Self::transaction`] pays for all four of those
@@ -310,6 +345,10 @@ pub enum BackendKind {
     Sqlite,
     Postgres,
 }
+
+/// How many times [`BackendImpl::serializable`] runs a transaction that keeps
+/// losing serialization conflicts before surfacing the failure.
+const SERIALIZABLE_TRIES: usize = 8;
 
 /// Lifetime-scoped transactional handle handed to a [`CatalogBackend::transaction`]
 /// closure. Holds a borrowed reference to the backend's connection (the

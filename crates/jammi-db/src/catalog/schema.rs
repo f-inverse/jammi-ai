@@ -1899,3 +1899,83 @@ ALTER TABLE applied_migrations ADD CONSTRAINT sdchk__applied_migrations__applied
     applied_at IS NULL OR (CASE WHEN applied_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$' THEN applied_at::timestamptz IS NOT NULL ELSE false END)
 );
 "#;
+
+/// Migration 040 — the model artifact as a catalog entity.
+///
+/// `model_artifacts` is the peer of `result_tables` for bytes under
+/// `models/`: one row per bundle, keyed by the bundle's prefix (a full
+/// [`crate::storage::StorageUrl`] string). The row is written `staged`
+/// BEFORE the bundle's first byte, flips to `published` inside the finalize
+/// transaction that attaches the first `models` row to it, and flips to
+/// `reclaiming` only through the compare-and-set that licenses the byte
+/// delete ([`crate::catalog::artifact_repo`]). `definition_hash` and
+/// `input_anchors_json` are properties of the BYTES, so they live here, not
+/// on a `models` row that merely names them. `staging_job_id` /
+/// `staging_attempt` identify the writer while the row is `staged`: an
+/// attempt-scoped bundle carries both, a job-scoped one (the durable resume
+/// checkpoint, shared across a job's attempts) carries a `NULL` attempt.
+/// Neither is a foreign key — a `jobs` row is retention-swept on its own
+/// clock, and the identity is read only while the artifact is `staged`.
+///
+/// `models.artifact_prefix` is the ONE reference edge to an artifact: a
+/// FOREIGN KEY to `model_artifacts(prefix)` with `ON DELETE RESTRICT`, so "is
+/// this artifact referenced" is `EXISTS (SELECT 1 FROM models WHERE
+/// artifact_prefix = $1)` and nothing else, and an artifact row cannot be
+/// retired while any `models` row, in any tenant, still names it.
+///
+/// `created_at` joins the canonical-stamp domain (it is the grace clock a
+/// reconcile pass ages an unreferenced artifact against), enforced at the
+/// schema edge exactly like every other compared `*_at` column — a trigger
+/// pair on SQLite, a `CHECK` on Postgres — which is the only reason this
+/// migration's text differs per backend.
+pub(super) const MIGRATION_040_MODEL_ARTIFACTS_SQLITE: &str = r#"
+CREATE TABLE model_artifacts (
+    prefix              TEXT PRIMARY KEY,
+    tenant_id           TEXT,
+    state               TEXT NOT NULL,
+    definition_hash     TEXT,
+    input_anchors_json  TEXT,
+    staging_job_id      TEXT,
+    staging_attempt     BIGINT,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX idx_model_artifacts_definition ON model_artifacts(definition_hash);
+CREATE INDEX idx_model_artifacts_staging ON model_artifacts(staging_job_id, staging_attempt);
+ALTER TABLE models ADD COLUMN artifact_prefix TEXT
+    REFERENCES model_artifacts(prefix) ON DELETE RESTRICT;
+CREATE INDEX idx_models_artifact_prefix ON models(artifact_prefix);
+CREATE TRIGGER IF NOT EXISTS trg_model_artifacts_created_at_canonical_ins
+BEFORE INSERT ON model_artifacts
+WHEN NEW.created_at IS NOT NULL AND NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'model_artifacts.created_at: not a canonical stamp');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_model_artifacts_created_at_canonical_upd
+BEFORE UPDATE OF created_at ON model_artifacts
+WHEN NEW.created_at IS NOT NULL AND NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'model_artifacts.created_at: not a canonical stamp');
+END;
+"#;
+
+/// The Postgres text of [`MIGRATION_040_MODEL_ARTIFACTS_SQLITE`].
+pub(super) const MIGRATION_040_MODEL_ARTIFACTS_POSTGRES: &str = r#"
+CREATE TABLE model_artifacts (
+    prefix              TEXT PRIMARY KEY,
+    tenant_id           TEXT,
+    state               TEXT NOT NULL,
+    definition_hash     TEXT,
+    input_anchors_json  TEXT,
+    staging_job_id      TEXT,
+    staging_attempt     BIGINT,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX idx_model_artifacts_definition ON model_artifacts(definition_hash);
+CREATE INDEX idx_model_artifacts_staging ON model_artifacts(staging_job_id, staging_attempt);
+ALTER TABLE models ADD COLUMN artifact_prefix TEXT
+    REFERENCES model_artifacts(prefix) ON DELETE RESTRICT;
+CREATE INDEX idx_models_artifact_prefix ON models(artifact_prefix);
+ALTER TABLE model_artifacts ADD CONSTRAINT sdchk__model_artifacts__created_at CHECK (
+    created_at IS NULL OR (CASE WHEN created_at ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$' THEN created_at::timestamptz IS NOT NULL ELSE false END)
+);
+"#;

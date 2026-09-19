@@ -46,6 +46,53 @@ impl FromStr for ResultTableStatus {
     }
 }
 
+/// Lifecycle state of a model artifact (`model_artifacts.state`) — the bytes
+/// of one published bundle under `models/`.
+///
+/// `Staged` is written before the bundle's first byte and names the writer;
+/// `Published` is committed by the finalize transaction that attaches the
+/// first `models` row; `Reclaiming` is committed only by the compare-and-set
+/// that licenses the byte delete ([`crate::catalog::artifact_repo`]). A
+/// `models` row can attach to a `Published` artifact and to no other state,
+/// so a `Reclaiming` artifact is never a reuse candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, VariantArray)]
+pub enum ArtifactState {
+    /// The row exists; the bundle's bytes are being written by its stager.
+    Staged,
+    /// The bundle is complete and at least one finalize has committed it.
+    Published,
+    /// The byte delete is licensed and in progress.
+    Reclaiming,
+}
+
+impl ArtifactState {
+    /// The spelling stored in `model_artifacts.state`.
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Staged => "staged",
+            Self::Published => "published",
+            Self::Reclaiming => "reclaiming",
+        }
+    }
+}
+
+impl fmt::Display for ArtifactState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_db_str())
+    }
+}
+
+impl FromStr for ArtifactState {
+    type Err = JammiError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::VARIANTS
+            .iter()
+            .copied()
+            .find(|state| state.as_db_str() == s)
+            .ok_or_else(|| JammiError::Catalog(format!("Unknown model artifact state: '{s}'")))
+    }
+}
+
 /// Status of a job (`jobs.status`) — every kind-agnostic unit of work the
 /// catalog's claim/lease/reclaim machinery drives
 /// ([`crate::catalog::jobs_repo`]), training and compute alike. `Queued` and

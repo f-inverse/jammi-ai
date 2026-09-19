@@ -91,6 +91,14 @@ pub enum StorageError {
         path: String,
     },
 
+    /// A delete presented a licence that does not cover the key: the key is
+    /// not one of the licensed artifact's own objects.
+    #[error("cannot delete '{path}': the presented licence does not cover it")]
+    NotLicensed {
+        /// The driver-relative key the delete named.
+        path: String,
+    },
+
     /// A live `models` row — in some tenant scope, not necessarily the
     /// caller's own — still names this prefix as its `artifact_path`,
     /// either exactly or as its immediate containing directory, so the

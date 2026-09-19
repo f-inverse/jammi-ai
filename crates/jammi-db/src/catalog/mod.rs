@@ -1,3 +1,4 @@
+pub mod artifact_repo;
 pub mod backend;
 pub mod backend_postgres;
 pub mod backend_sqlite;

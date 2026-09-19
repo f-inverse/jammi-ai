@@ -14,6 +14,7 @@ use super::builder::DynObjectStore;
 use super::config::CloudConfig;
 use super::error::StorageError;
 use super::url::{Scheme, StorageUrl};
+use crate::catalog::artifact_repo::ReclaimLicence;
 
 /// The two states a [`JammiObjectStore::delete_if_exists`] call can end in —
 /// deliberately NOT collapsed into a bare `Result<(), StorageError>`, because
@@ -245,6 +246,29 @@ impl JammiObjectStore {
     /// distinction is only as good as the driver underneath (unreachable
     /// `Absent` on `s3://`/`r2://`).
     pub async fn delete_if_exists(&self, path: &ObjectPath) -> Result<DeleteOutcome, StorageError> {
+        self.delete_raw(path).await
+    }
+
+    /// Delete one object of a model artifact under its reclaim licence. The
+    /// licence's own [`ReclaimLicence::covers`] check runs on every call, in
+    /// every build: a key the licence does not cover is refused
+    /// ([`StorageError::NotLicensed`]) before the driver is reached.
+    pub(crate) async fn delete_licensed(
+        &self,
+        licence: &ReclaimLicence,
+        path: &ObjectPath,
+    ) -> Result<DeleteOutcome, StorageError> {
+        if !licence.covers(path) {
+            return Err(StorageError::NotLicensed {
+                path: path.to_string(),
+            });
+        }
+        self.delete_raw(path).await
+    }
+
+    /// The one call of the driver's `delete`. A 404 is not an error; which of
+    /// the two the driver reported is returned ([`DeleteOutcome`]).
+    async fn delete_raw(&self, path: &ObjectPath) -> Result<DeleteOutcome, StorageError> {
         match self.driver.delete(path).await {
             Ok(()) => Ok(DeleteOutcome::Deleted),
             Err(object_store::Error::NotFound { .. }) => Ok(DeleteOutcome::Absent),
@@ -294,17 +318,7 @@ impl JammiObjectStore {
     }
 
     fn parse_path(url: &StorageUrl, raw: &str) -> Result<ObjectPath, StorageError> {
-        // For cloud schemes the first path segment is the bucket — the
-        // driver was bound to that bucket at build time so we strip it
-        // before handing the key to `object_store::Path::parse`.
-        let key = match url.scheme() {
-            Scheme::File | Scheme::Memory => raw.trim_start_matches('/').to_string(),
-            _ => raw
-                .split_once('/')
-                .map(|(_, rest)| rest.to_string())
-                .unwrap_or_default(),
-        };
-        ObjectPath::parse(&key).map_err(|e| StorageError::layout(raw, e.to_string()))
+        url.object_key(raw)
     }
 }
 

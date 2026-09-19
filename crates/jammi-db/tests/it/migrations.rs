@@ -58,6 +58,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "037_jobs_assembly_failures_next_after",
     "038_compute_cluster_state",
     "039_canonical_stamps",
+    "040_model_artifacts",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -2712,10 +2713,11 @@ async fn migration_038_is_ordered_after_035_and_037_and_creates_compute_tables(
     );
 }
 
-/// The 13 `(table, column)` pairs `catalog::lease`'s schema-edge domain
-/// (migration `039_canonical_stamps`) enforces — the universe gate this
-/// oracle enumerates against (a later rebuild-dance migration cannot
-/// silently drop enforcement).
+/// The 14 `(table, column)` pairs `catalog::lease`'s schema-edge domain
+/// enforces — 13 installed by migration `039_canonical_stamps`, and
+/// `model_artifacts.created_at` by `040_model_artifacts`, which creates that
+/// table — the universe gate this oracle enumerates against (a later
+/// rebuild-dance migration cannot silently drop enforcement).
 const CANONICAL_STAMP_COLUMNS: &[(&str, &str)] = &[
     ("jobs", "lease_expires_at"),
     ("jobs", "next_assembly_after"),
@@ -2730,6 +2732,7 @@ const CANONICAL_STAMP_COLUMNS: &[(&str, &str)] = &[
     ("models", "created_at"),
     ("models", "updated_at"),
     ("applied_migrations", "applied_at"),
+    ("model_artifacts", "created_at"),
 ];
 
 /// `stale_before_clause` compares a stamp column lexically, which is
@@ -2753,11 +2756,11 @@ fn every_column_stale_before_clause_accepts_is_schema_enforced() {
 /// Migration `039_canonical_stamps` is
 /// ordered after `038_compute_cluster_state` (relative position, never
 /// `.last()` — it names `compute_executors`, which `038` creates), and the
-/// enforcement set it installs — on SQLite, a `BEFORE INSERT` AND a
-/// `BEFORE UPDATE OF <col>` trigger per [`CANONICAL_STAMP_COLUMNS`] entry
-/// (26 triggers); on Postgres, one `sdchk__<table>__<column>` `CHECK`
-/// constraint per entry (13 constraints) — equals exactly that set on a
-/// freshly migrated catalog. A future migration that rebuilds one of these
+/// enforcement set a freshly migrated catalog carries — on SQLite, a
+/// `BEFORE INSERT` AND a `BEFORE UPDATE OF <col>` trigger per
+/// [`CANONICAL_STAMP_COLUMNS`] entry (28 triggers); on Postgres, one
+/// `sdchk__<table>__<column>` `CHECK` constraint per entry (14 constraints)
+/// — equals exactly that set. A future migration that rebuilds one of these
 /// tables (SQLite's create-new/copy/drop/rename dance, migration 012's own
 /// shape) without reinstalling its two triggers would silently drop
 /// enforcement for that column; this oracle catches it by enumerating

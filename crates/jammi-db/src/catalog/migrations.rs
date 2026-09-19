@@ -207,6 +207,13 @@ const MIGRATIONS: &[(&str, MigrationSql)] = &[
             postgres: schema::MIGRATION_039_CANONICAL_STAMPS_POSTGRES,
         },
     ),
+    (
+        "040_model_artifacts",
+        MigrationSql::PerBackend {
+            sqlite: schema::MIGRATION_040_MODEL_ARTIFACTS_SQLITE,
+            postgres: schema::MIGRATION_040_MODEL_ARTIFACTS_POSTGRES,
+        },
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

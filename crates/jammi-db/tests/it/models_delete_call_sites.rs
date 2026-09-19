@@ -161,12 +161,14 @@ const REVIEWED: &[ReviewedSite] = &[
     },
     ReviewedSite {
         file: "crates/jammi-db/src/storage/object_store_handle.rs",
-        function: "delete_if_exists",
+        function: "delete_raw",
         ordinal: 1,
         count: 1,
         class: SiteClass::NonModels,
-        reason: "THE raw deleter's own body — the one place the field's `delete` is called; \
-                 every caller of `delete_if_exists` is itself a reviewed row of this table.",
+        reason: "THE raw deleter's own body — the one place the field's `delete` is called. It \
+                 is private: `delete_licensed` reaches it only past the reclaim licence's own \
+                 `covers` check, and every caller of `delete_if_exists` is itself a reviewed \
+                 row of this table.",
     },
     ReviewedSite {
         file: "crates/jammi-db/src/storage/object_store_handle.rs",

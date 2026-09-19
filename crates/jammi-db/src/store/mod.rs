@@ -3216,24 +3216,18 @@ impl ResultStore {
                     continue;
                 }
             };
-            // The row's own `tenant_id` is the table's owner — captured here so
-            // an admin-scoped bulk load registers each table under the tenant
-            // that owns it, never flattened to the loading scope.
-            let owner = match table.tenant_id.as_deref() {
-                Some(s) => match TenantId::from_str(s) {
-                    Ok(t) => Some(t),
-                    Err(e) => {
-                        warn!(
-                            table = table.table_name,
-                            error = %e,
-                            "Result-table tenant_id is not a valid tenant id; skipping"
-                        );
-                        continue;
-                    }
-                },
-                None => None,
-            };
-            let _ = owner;
+            // `bind_result_table` registers the table under the tenant its row
+            // names; a row whose `tenant_id` does not parse has no owner to
+            // register it under, so it is left out rather than flattened to
+            // the loading scope.
+            if let Some(Err(e)) = table.tenant_id.as_deref().map(TenantId::from_str) {
+                warn!(
+                    table = table.table_name,
+                    error = %e,
+                    "Result-table tenant_id is not a valid tenant id; skipping"
+                );
+                continue;
+            }
             let handle = self.open_parquet(&url)?;
             let path = handle.data_path()?;
             if handle.exists(&path).await? {

@@ -607,49 +607,43 @@ fn source_chain<'a>(
 impl From<jammi_numerics::query::QueryValidationError> for JammiError {
     fn from(e: jammi_numerics::query::QueryValidationError) -> Self {
         use jammi_numerics::query::{QuerySource, QueryValidationError};
+
+        /// A query that disagreed with `expected`, blamed by its provenance.
+        fn refused_query(source: QuerySource, expected: String, actual: String) -> JammiError {
+            match source {
+                QuerySource::Caller => JammiError::Schema {
+                    table: "query".into(),
+                    column: "query".into(),
+                    expected,
+                    actual,
+                },
+                QuerySource::Stored { table } => JammiError::IncompatibleFormat {
+                    artifact: format!("{table}.vector"),
+                    found: actual,
+                    supported: expected,
+                },
+            }
+        }
+
         match e {
             QueryValidationError::NonFinite {
                 index,
                 value,
                 source,
-            } => {
-                let expected = "finite f32 components".to_string();
-                let actual = format!("component {index} is {value:?}");
-                match source {
-                    QuerySource::Caller => JammiError::Schema {
-                        table: "query".into(),
-                        column: "query".into(),
-                        expected,
-                        actual,
-                    },
-                    QuerySource::Stored { table } => JammiError::IncompatibleFormat {
-                        artifact: format!("{table}.vector"),
-                        found: actual,
-                        supported: expected,
-                    },
-                }
-            }
+            } => refused_query(
+                source,
+                "finite f32 components".to_string(),
+                format!("component {index} is {value:?}"),
+            ),
             QueryValidationError::Width {
                 expected,
                 actual,
                 source,
-            } => {
-                let expected_s = format!("{expected} dimensions");
-                let actual_s = format!("{actual} dimensions");
-                match source {
-                    QuerySource::Caller => JammiError::Schema {
-                        table: "query".into(),
-                        column: "query".into(),
-                        expected: expected_s,
-                        actual: actual_s,
-                    },
-                    QuerySource::Stored { table } => JammiError::IncompatibleFormat {
-                        artifact: format!("{table}.vector"),
-                        found: actual_s,
-                        supported: expected_s,
-                    },
-                }
-            }
+            } => refused_query(
+                source,
+                format!("{expected} dimensions"),
+                format!("{actual} dimensions"),
+            ),
             // Carries no `QuerySource` at all — engine-fault by construction,
             // never the query's own provenance, regardless of it.
             QueryValidationError::ArtifactMismatch {

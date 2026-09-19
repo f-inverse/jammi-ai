@@ -349,6 +349,14 @@ conformal is not an OSS Python lever — the weighting here is the consumer's
 client-side construction, exactly where the conformal doctrine places the cohort
 choice.
 
+The session's work is done, so it is closed. An embedded engine holds its catalog until
+`close()` returns, which is why `close()` comes before anything removes the directory the
+catalog lives in.
+
+```{python}
+db.close()
+```
+
 ## The two halves of one thesis
 
 > **Weighted conformal repairs a covariate shift if and only if the shift moves the

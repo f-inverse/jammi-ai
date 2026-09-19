@@ -633,6 +633,15 @@ for cell, observed in (
     rails.measure(f"tenancy_h3.byo_auth.{cell}", 1.0 if observed else 0.0)
 ```
 
+Both sessions' work is done, so they are closed. An embedded engine holds its catalog until
+`close()` returns, which is why `close()` comes before anything removes the directory the
+catalog lives in.
+
+```{python}
+rts_db.close()
+db.close()
+```
+
 ## What this chapter establishes
 
 The engine isolates **per verb**: every tenant-scoped catalog read, describe, and

@@ -194,9 +194,8 @@ class LiveServer:
             if self.proc.poll() is not None:
                 raise RuntimeError(f"jammi-server exited early:\n{''.join(self._log)}")
             try:
-                handshake = jammi.connect(f"grpc://127.0.0.1:{self.port}")
-                handshake.get_server_info()
-                handshake.close()
+                with jammi.connect(f"grpc://127.0.0.1:{self.port}") as handshake:
+                    handshake.get_server_info()
                 return self
             except Exception:
                 time.sleep(0.25)

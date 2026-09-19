@@ -234,6 +234,14 @@ higher than the global recall because restricting to a tenant's subject subset s
 candidate pool — but the point is the **parity**: one recipe, the engine scoping the data
 per tenant, each tenant getting its own measured answer over rows it alone can see.
 
+The session's work is done, so it is closed. An embedded engine holds its catalog until
+`close()` returns, which is why `close()` comes before anything removes the directory the
+catalog lives in.
+
+```{python}
+db.close()
+```
+
 ## What this chapter does not claim
 
 The engine isolates at the catalog listing and at a discriminator-column scan rewrite.

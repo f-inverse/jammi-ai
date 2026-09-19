@@ -327,6 +327,14 @@ assert tenancy["listing_leak"] == 0 and tenancy["discriminator_leak"] == 0
 assert tenancy["global_source_visible"] == len(eu)
 ```
 
+The session's work is done, so it is closed. An embedded engine holds its catalog until
+`close()` returns, which is why `close()` comes before anything removes the directory the
+catalog lives in.
+
+```{python}
+db.close()
+```
+
 > **Neptune-contrast.** Multi-tenant isolation on a property graph is a
 > deployment-and-governance concern Neptune leaves to IAM/VPC around the
 > database. Here, two layers are *substrate* properties: `set_tenant` scopes

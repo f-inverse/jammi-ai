@@ -316,6 +316,14 @@ assert mm["expected"] != mm["found"]
 > verdict mechanics are pinned; the per-run content digest is not. The
 > `definition_hash` recorded for this run was `{python} matrix['definition_hash'][:16]`….
 
+The session's work is done, so it is closed. An embedded engine holds its catalog until
+`close()` returns, which is why `close()` comes before anything removes the directory the
+catalog lives in.
+
+```{python}
+db.close()
+```
+
 ## The honest limit
 
 This chapter proves the primitive composes into a **leakage-free, skew-free training

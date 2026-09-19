@@ -426,6 +426,15 @@ assert got.nbytes == edge["embedded_returned_bytes"]
 assert got.nbytes > edge["demo_cap_bytes"]
 ```
 
+Both sessions' work is done, so they are closed. A remote session's `close()` releases its
+channels; an embedded engine holds its catalog until `close()` returns, which is why `close()`
+comes before anything removes the directory the catalog lives in.
+
+```{python}
+embedded.close()
+remote.close()
+```
+
 ## The verdict
 
 ```{python}
@@ -440,8 +449,6 @@ print(f"  one except JammiError catches both transports:          {tax['one_exce
 print(f"  remote receive cap finite (64 MiB) + loud on exceed:    "
       f"{edge['capped_channel_mapped'] == 'BackendError'}")
 print(f"  embedded returns the same-scale payload unbounded:      {edge['embedded_exceeds_demo_cap']}")
-
-remote.close()
 ```
 
 The substitution the whole book leans on — write once against `Session`, run in-process or

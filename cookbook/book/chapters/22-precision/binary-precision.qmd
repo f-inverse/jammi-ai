@@ -133,9 +133,12 @@ source and promoted to a ready embedding table via `import_embeddings` (precompu
 encoder, GPU-free). Unlike the sibling chapter, `build_table` here treats `oversample=None` as a
 real, meaningful input — an **untouched** deployment default — rather than always stamping a
 value, because the claim this chapter measures first is what a table gets when the deployment
-*never sets the knob at all*.
+*never sets the knob at all*. Each build is a `with` block: an embedded engine holds its
+catalog until `close()` returns, so a session is closed as soon as its measurements are
+taken, while the artifact directory and the sidecars in it stay on disk.
 
 ```{python}
+import contextlib
 import glob
 import os
 import tempfile
@@ -155,10 +158,12 @@ pq.write_table(
 )
 
 
+@contextlib.contextmanager
 def build_table(storage_precision: str, oversample: int | None):
     """Open a fresh session through the public `jammi.connect(config=...)` front
     door at (storage_precision, oversample), import the corpus slice as a ready
-    embedding table, and return the session + table name + its artifact dir.
+    embedding table, and yield the session + table name + its artifact dir. The
+    session closes when the caller's `with` block ends.
     `oversample=None` leaves the TOML's `oversample` key OUT ENTIRELY — the real
     "deployment never configured this knob" case, not a stand-in for any
     particular value."""
@@ -171,16 +176,16 @@ def build_table(storage_precision: str, oversample: int | None):
         f.write(body)
 
     art_dir = tempfile.mkdtemp(prefix="binary_art_")
-    db = jammi.connect(f"file://{art_dir}", config=cfg_path)
-    db.add_source(SOURCE_ID, url=f"file://{corpus_url}", format="parquet")
-    table_name = db.import_embeddings(
-        source=SOURCE_ID,
-        model="modernbert-base",
-        vectors_url=f"file://{corpus_url}",
-        key="_row_id",
-        dimensions=corpus_vecs.shape[1],
-    )
-    return db, table_name, art_dir
+    with jammi.connect(f"file://{art_dir}", config=cfg_path) as db:
+        db.add_source(SOURCE_ID, url=f"file://{corpus_url}", format="parquet")
+        table_name = db.import_embeddings(
+            source=SOURCE_ID,
+            model="modernbert-base",
+            vectors_url=f"file://{corpus_url}",
+            key="_row_id",
+            dimensions=corpus_vecs.shape[1],
+        )
+        yield db, table_name, art_dir
 
 
 def recall_at_1(db, oversample_override=None):
@@ -217,10 +222,10 @@ print("helpers ready")
 ```{python}
 from jammi_cookbook import rails
 
-db_f32, table_f32, art_f32 = build_table("f32", oversample=4)  # oversample is irrelevant at f32
-recall1_f32 = recall_at_1(db_f32)
-recall10_f32 = recall_at_10(db_f32)
-f32_usearch = sidecar_bytes(art_f32, "usearch")
+with build_table("f32", oversample=4) as (db_f32, table_f32, art_f32):  # oversample is irrelevant at f32
+    recall1_f32 = recall_at_1(db_f32)
+    recall10_f32 = recall_at_10(db_f32)
+    f32_usearch = sidecar_bytes(art_f32, "usearch")
 
 print(f"f32 recall@1:  {recall1_f32:.4f}")
 print(f"f32 recall@{K}: {recall10_f32:.4f}")
@@ -242,18 +247,20 @@ untouched deployment silently fell back to the shared default of `4` instead, th
 would fail (the next section shows `4` is a materially worse operating point for `binary`).
 
 ```{python}
-db_default, _, art_default = build_table("binary", oversample=None)   # untouched — no oversample key at all
-
-# The SAME table, no rebuild: the "no override" call resolves through whatever
-# oversample the table's own catalog row was stamped with; the explicit-32 call
-# pins the request-level override to exactly 32. Comparing these two on ONE
-# already-built graph (rather than two independently-built tables) is what makes
-# this an honest proof of the catalog-row's stamped value, immune to any
-# build-to-build HNSW construction variance.
-recall1_default_noarg = recall_at_1(db_default)
-recall1_default_explicit32 = recall_at_1(db_default, oversample_override=32)
-recall10_default_noarg = recall_at_10(db_default)
-recall10_default_explicit32 = recall_at_10(db_default, oversample_override=32)
+# untouched — no oversample key at all
+with build_table("binary", oversample=None) as (db_default, _, art_default):
+    # The SAME table, no rebuild: the "no override" call resolves through whatever
+    # oversample the table's own catalog row was stamped with; the explicit-32 call
+    # pins the request-level override to exactly 32. Comparing these two on ONE
+    # already-built graph (rather than two independently-built tables) is what makes
+    # this an honest proof of the catalog-row's stamped value, immune to any
+    # build-to-build HNSW construction variance.
+    recall1_default_noarg = recall_at_1(db_default)
+    recall1_default_explicit32 = recall_at_1(db_default, oversample_override=32)
+    recall10_default_noarg = recall_at_10(db_default)
+    recall10_default_explicit32 = recall_at_10(db_default, oversample_override=32)
+    binary_usearch = sidecar_bytes(art_default, "usearch")
+    binary_rawf32 = sidecar_bytes(art_default, "rawf32")
 
 print(f"binary, oversample UNSET, no override:        recall@1 = {recall1_default_noarg:.4f}   "
       f"recall@{K} = {recall10_default_noarg:.4f}")
@@ -269,8 +276,6 @@ assert recall10_default_noarg == recall10_default_explicit32, (
     "recall@10 must match too — both calls resolve to the same effective oversample"
 )
 
-binary_usearch = sidecar_bytes(art_default, "usearch")
-binary_rawf32 = sidecar_bytes(art_default, "rawf32")
 graph_ratio = binary_usearch / f32_usearch
 
 print(f"\nbinary sidecar (.usearch), default oversample: {binary_usearch:,} bytes  "
@@ -479,9 +484,9 @@ oversample_grid = [1, 4, 8, 16, 32]
 sweep1 = {}
 sweep10 = {}
 for ov in oversample_grid:
-    db_ov, _, _ = build_table("binary", oversample=ov)
-    sweep1[ov] = recall_at_1(db_ov)
-    sweep10[ov] = recall_at_10(db_ov)
+    with build_table("binary", oversample=ov) as (db_ov, _, _):
+        sweep1[ov] = recall_at_1(db_ov)
+        sweep10[ov] = recall_at_10(db_ov)
 
 print(f"{'oversample':>10}{'candidates':>12}{'recall@1':>11}{'recall@10':>11}")
 for ov in oversample_grid:
@@ -531,10 +536,9 @@ default > deployment default*. We reuse the narrowest table from the sweep above
 same held-out queries with an explicit per-request `oversample=32`.
 
 ```{python}
-db_narrow, table_narrow, _ = build_table("binary", oversample=1)
-
-recall1_no_override = recall_at_1(db_narrow)
-recall1_override32 = recall_at_1(db_narrow, oversample_override=32)
+with build_table("binary", oversample=1) as (db_narrow, table_narrow, _):
+    recall1_no_override = recall_at_1(db_narrow)
+    recall1_override32 = recall_at_1(db_narrow, oversample_override=32)
 
 print(f"table stamped at oversample=1, no per-request override:  recall@1 = {recall1_no_override:.4f}")
 print(f"same table, per-request override oversample=32:          recall@1 = {recall1_override32:.4f}")

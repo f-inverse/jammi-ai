@@ -383,6 +383,14 @@ consumer owns and registers. The OSS Python surface exposes the **marginal**
 doctrine puts it. The point stands: honest coverage on a shifting graph requires
 *someone* to own the cohort, and a reweight alone is not that someone.
 
+The session's work is done, so it is closed. An embedded engine holds its catalog until
+`close()` returns, which is why `close()` comes before anything removes the directory the
+catalog lives in.
+
+```{python}
+db.close()
+```
+
 ## Bridge note (a signature chapter — deepened in the bridge chapters)
 
 > **A prediction is a context-conditioned posterior; honest coverage needs the

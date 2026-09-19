@@ -202,6 +202,14 @@ assert abs(report_record["pit_ks"] - pit_ks) < 1e-2
 assert ece > 0.05, "the adaptive ECE registers the miscalibration"
 ```
 
+The session's work is done, so it is closed. An embedded engine holds its catalog until
+`close()` returns, which is why `close()` comes before anything removes the directory the
+catalog lives in.
+
+```{python}
+db.close()
+```
+
 ## Bridge note
 
 > **Uncertainty is a first-class output, and its honesty is measurable.** A predictive

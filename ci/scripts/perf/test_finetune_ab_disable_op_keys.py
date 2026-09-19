@@ -1,47 +1,35 @@
 #!/usr/bin/env python3
-"""F4 (adversarial audit fold-in — "the ninth key"), B2 (round-2 adversarial
-audit — "the scanner silently drops unresolvable sites"), wave-5 identity
-(#546's typed-op migration retired the text scan entirely): the MECHANICAL
-sweep `finetune_ab.sh`'s own `JAMMI_EAGER_DISABLE_OP_KEYS` constant names as
-its own enumeration method — run this after touching
-`crates/jammi-kernels/src/admission.rs`'s `PROBED_OPS` table to catch an
-ELEVENTH addition (or a stale entry) mechanically, never by re-reading the
-whole call graph by eye.
+"""The MECHANICAL sweep `finetune_ab.sh`'s own `JAMMI_EAGER_DISABLE_OP_KEYS`
+constant names as its own enumeration method — run this after touching
+`crates/jammi-kernels/src/admission.rs`'s `PROBED_OPS` table to catch a new
+op key (or a stale entry) mechanically, never by re-reading the whole call
+graph by eye.
 
-WHY THIS EXISTS: an eight-key version of `JAMMI_EAGER_DISABLE_OP_KEYS`
-shipped with a real gap (`mem_efficient_attention`) that went undetected
-because every `finetune_ab.sh` sweep config has `seq <= 512`, and that op's
-own domain predicate declines unconditionally for `seq <= ATTENTION_BLOCK_MAX_SEQ`
-(4096) — a coincidence of the SWEEP's own shape, not proof the key was
-unneeded. A hand-re-read of the call graph missed it once; this script
-performs the identical sweep mechanically, every run.
+WHY THIS EXISTS: a hand-read of the call graph can miss a key like
+`mem_efficient_attention`, which never dispatches on any `finetune_ab.sh`
+sweep config (every one has `seq <= 512`, and that op's own domain
+predicate declines unconditionally for `seq <= ATTENTION_BLOCK_MAX_SEQ`
+(4096)) — a coincidence of the SWEEP's own shape, not proof the key is
+unneeded. This script performs the sweep mechanically, every run.
 
-METHOD, REBUILT (wave-5 identity, #546): every `admit`/`admit_cascade` call
-site across the workspace now passes a typed `&'static
-jammi_kernels::admission::ProbedOp` const (`crates/jammi-kernels/src/
-admission.rs`'s own `PROBED_OPS` table), never a bare string literal — the
-PRIOR version of this script read the op key off a text scan of each call
-site's own quoted-string argument (a balanced-paren extraction over
-`crates/jammi-encoders/src`, `crates/jammi-lora/src`,
-`crates/jammi-ai/src/fine_tune`), which the typed migration makes
-structurally impossible: there is no literal left at an `admit`/
-`admit_cascade` call site for a regex to read at all. Fixing this by
-teaching the old regex the const names would be exactly the "second,
-string-keyed enumeration" wave-5 identity's own I4 fix eliminated at the
-Rust layer — re-introducing the identical shape here, one layer down, is
-not a fix.
+METHOD: every `admit`/`admit_cascade` call site across the workspace passes
+a typed `&'static jammi_kernels::admission::ProbedOp` const
+(`crates/jammi-kernels/src/admission.rs`'s own `PROBED_OPS` table), never a
+bare string literal — there is no literal at an `admit`/`admit_cascade`
+call site for a regex to read at all. Teaching a regex the const names
+would re-introduce a second, string-keyed enumeration alongside the typed
+one.
 
 The live standalone op-key set is `PROBED_OPS` itself. This script reads it
 from `ci/tools/probed-ops-index` (`cargo run --release -p probed-ops-index`),
 a tiny CI-only Rust binary that imports `jammi_kernels::admission::ProbedOpId`
-(#546 K4: the closed enum, not the open table, is the enumeration source —
+(the closed enum, not the open table, is the enumeration source —
 `ProbedOpId::ALL` and `PROBED_OPS` are pinned identical by admission.rs's own
 `probed_op_id_variants_cover_every_probed_ops_row` test) and prints its own
 `registry_keys`/`report_keys` as JSON — the
 SAME "run the real, compiled tool, never a regex over source" posture
-`ci/tools/symbol-index` already established for
-`check_no_consumer_names.py` (this repo's own recorded lesson: "regex
-readers over YAML/Rust lost five audits"). `JAMMI_EAGER_DISABLE_OP_KEYS`'s
+`ci/tools/symbol-index` uses for `check_no_consumer_names.py` (regex
+readers over YAML/Rust miss real sites). `JAMMI_EAGER_DISABLE_OP_KEYS`'s
 own live set is `PROBED_OPS`'s registry keys MINUS
 `KNOWN_NON_STANDALONE_REGISTRY_KEYS` (the dtype-branching cast-boundary
 rows, reached only through `jammi-kernels`'s own internal
@@ -49,9 +37,8 @@ rows, reached only through `jammi-kernels`'s own internal
 config could disable directly) — a set-equality assertion, never a subset
 check either direction, in `test_declared_set_equals_the_live_standalone_registry_key_set`.
 
-B2's own concern — "an unresolved call site must never read identically to
-'no call exists here'" — is answered differently now than it was by the
-retired text scan, but not abandoned. Precisely what the compiler proves, stated on its own: `admit`/`admit_cascade`'s
+An unresolved call site must never read identically to "no call exists
+here". Precisely what the compiler proves, stated on its own: `admit`/`admit_cascade`'s
 own `pub fn` signature (`crates/jammi-kernels/src/admission.rs`) requires
 a `&'static jammi_kernels::admission::ProbedOp` argument, and that type is
 sealed against every OTHER crate by two separate compiler mechanisms:
@@ -64,11 +51,11 @@ struct `ProbedOp` is private`). So on every `cargo build` a call site
 OUTSIDE `jammi-kernels` cannot pass anything but one of `PROBED_OPS`'s own
 named consts. Neither mechanism has any effect INSIDE the defining crate:
 a same-crate forgery in `jammi-kernels` itself is syntactically possible
-and is NOT sealed — and nothing needs it to be. `#546` K2' now DOES fold a
+and is NOT sealed — and nothing needs it to be. A
 real, hash-affecting fact set into
 `jammi_db::store::manifest::MaterializationEnv::kernel_admission_profile`
-(build features, `admission_mode`, the disabled-op set, and the job's
-dtype class — all EX ANTE facts, never a per-run observation), but that
+folds a real, hash-affecting fact set (build features, `admission_mode`, the disabled-op set, and the job's
+dtype class — all EX ANTE facts, never a per-run observation), and that
 fold is BY CONSTRUCTION immune to a same-crate `ProbedOp` forgery too: it
 is `jammi_kernels::admission::render_kernel_admission_profile`, which
 enumerates `ProbedOpId::ALL` and reads each variant through
@@ -88,10 +75,9 @@ hits (a typo'd path, a directory that stopped existing) is the failure mode
 this residual check still catches; WHICH op each site passes needs no
 further verification, because the type system already did it.
 
-Not stdlib-only anymore (an intentional, documented departure from an
-earlier revision's own "no build" boast): `probed_ops_registry_keys` and
+Not stdlib-only: `probed_ops_registry_keys` and
 `admit_call_sites` both shell out to a real `cargo run --release`, exactly
-as `ci/tools/symbol-index`'s own established callers already do.
+as `ci/tools/symbol-index`'s own callers do.
 
 Run: `python3 ci/scripts/perf/test_finetune_ab_disable_op_keys.py`
 """
@@ -144,10 +130,9 @@ KNOWN_NON_STANDALONE_REGISTRY_KEYS = frozenset(
     {"cast_scale_bf16_f32", "cast_scale_f16_f32", "cast_add_bf16", "cast_add_f16"}
 )
 
-# Registered-but-DEAD registry keys from an earlier `lora_linear.rs`
-# registry generation that were never promoted to a `PROBED_OPS` row at
-# all — no `admit()`/`admit_cascade()` call site anywhere in the workspace
-# ever passed either, in ANY crate, past or present. Named here purely so
+# Registered-but-DEAD registry keys that are not `PROBED_OPS` rows at all —
+# no `admit()`/`admit_cascade()` call site anywhere in the workspace passes
+# either, in ANY crate. Named here purely so
 # `JAMMI_EAGER_DISABLE_OP_KEYS` never accidentally re-adds either; checked
 # mechanically (`test_known_dead_registry_keys_are_not_probed_ops_entries`)
 # in the OPPOSITE direction from `KNOWN_NON_STANDALONE_REGISTRY_KEYS` above
@@ -185,8 +170,8 @@ def _run_cargo_tool(crate, extra_args=()):
 def probed_ops_registry_keys():
     """The real, live `PROBED_OPS` registry-key set — `ci/tools/
     probed-ops-index`'s own dump of `jammi_kernels::admission::PROBED_OPS`,
-    never a text scan. See this module's own doc for why a text scan can
-    no longer read this set at all (#546's typed-op migration).
+    never a text scan. See this module's own doc for why a text scan
+    cannot read this set at all (typed `ProbedOp` call-site arguments).
     """
     data = _run_cargo_tool(PROBED_OPS_INDEX_CRATE)
     return set(data["registry_keys"])
@@ -211,9 +196,8 @@ def admit_call_sites(roots):
 def parse_jammi_eager_disable_op_keys(finetune_ab_sh_path):
     """Extracts the CURRENT `JAMMI_EAGER_DISABLE_OP_KEYS="..."` literal
     from `finetune_ab.sh` — the real source, never a hand-copied literal
-    this test could itself drift from. Unaffected by #546's typed-op
-    migration (this is a bash constant, not a Rust call site) — kept
-    exactly as it was.
+    this test could itself drift from (a bash constant, not a Rust call
+    site).
     """
     with open(finetune_ab_sh_path, encoding="utf-8") as fh:
         text = fh.read()
@@ -229,8 +213,7 @@ def parse_jammi_eager_disable_op_keys(finetune_ab_sh_path):
 
 class ParseJammiEagerDisableOpKeysTests(unittest.TestCase):
     """Unit coverage of the one text-extraction this script still performs
-    (a bash literal, not a Rust call site — #546's typed-op migration does
-    not touch this).
+    (a bash literal, not a Rust call site).
     """
 
     def test_extracts_the_literal_from_a_synthetic_fixture(self):
@@ -287,8 +270,8 @@ class AdmitCallSitesTests(unittest.TestCase):
 
 class RealSourceParityTests(unittest.TestCase):
     """Drives the REAL sweep against the REAL, compiled tools — the
-    mechanical half of F4's "sweep method" the constant's own comment
-    names. This is the test that catches an ELEVENTH addition (or a stale
+    mechanical half of the "sweep method" the constant's own comment
+    names. This is the test that catches a newly added op key (or a stale
     entry) in CI.
     """
 
@@ -317,8 +300,7 @@ class RealSourceParityTests(unittest.TestCase):
             len(self.declared),
             10,
             f"JAMMI_EAGER_DISABLE_OP_KEYS ({FINETUNE_AB_SH}) must have EXACTLY 10 entries "
-            f"(F4 fold-in: the original 8 plus mem_efficient_attention; issue #463 fold-in: "
-            f"plus gelu_erf_fused) — a count other than 10 means the constant drifted; "
+            f"— a count other than 10 means the constant drifted; "
             f"re-derive from PROBED_OPS's own registry, never bump this number to make the "
             f"test pass: {sorted(self.declared)}",
         )
@@ -327,9 +309,9 @@ class RealSourceParityTests(unittest.TestCase):
     def test_declared_set_equals_the_live_standalone_registry_key_set(self):
         # SET EQUALITY, never a subset check either direction: a registry
         # key present in PROBED_OPS but missing from the constant is
-        # exactly the F4 bug this test exists to catch; a key present in
-        # the constant but no longer a PROBED_OPS registry entry at all is
-        # equally a drift.
+        # exactly the gap this test exists to catch; a key present in the
+        # constant but not a PROBED_OPS registry entry at all is equally a
+        # drift.
         live_standalone = self.registry_keys - KNOWN_NON_STANDALONE_REGISTRY_KEYS
         self.assertEqual(
             set(self.declared),

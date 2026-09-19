@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The unit-62 encode-step producer (E6, docs-ci domain): runs
+# The encode-step producer: runs
 # `jammi-bench encode-step` TWICE (replicate legs r1/r2) and asserts, via a
 # leg-premise-refusal check, that the two legs agree on every
 # `identity_fields.ENCODE_IDENTITY_FIELDS` entry before their measured
@@ -7,14 +7,12 @@
 # measurement" -- reusing `ci/scripts/perf/ab_merge.py`'s
 # `generic_leg_identity_fields`/`generic_leg_premise_violations` (the SAME
 # shared premise-refusal core `leg_premise_violations`/
-# `compare_grad_oracle.py`'s own identity check already build on), never a
+# `compare_grad_oracle.py`'s own identity check build on), never a
 # second, independently-drifting comparator.
 #
 # WHY TWO REPLICATE LEGS, NOT A JAMMI-VS-TORCH A/B: unlike
 # `finetune_ab.sh`, there is no torch twin for the encode
-# surface today (unit-62 PLAN.md v2 OQ4 ruling: "torch_encode.py NOT now --
-# C16-style front-door record; eval is single-arm") and no forced-attention-
-# arm A/B either (CONTRACT.md's Frame: "NO forced-arm encode A/B" -- the
+# surface (eval is single-arm) and no forced-attention-arm A/B either (the
 # fused arms are training-only by design, `attention_arm` is constant on
 # this surface and FORBIDDEN from identity). So the one meaningful A/B this
 # producer runs is a same-binary, same-premise REPRODUCIBILITY check: two
@@ -100,7 +98,7 @@ if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
   fi
 fi
 
-# --- provenance cross-check (unification contract C5.1), same shape as
+# --- provenance cross-check, same shape as
 # finetune_ab.sh/stacked_sweep.sh/clip_artifact_producer.sh:
 # refuse BEFORE any leg runs if the binary's own baked identity does not
 # match the sha this checkout is actually at.
@@ -163,13 +161,12 @@ run_leg r2
 
 # --- merge: leg-premise refusal (ENCODE_IDENTITY_FIELDS) reusing
 # ab_merge.py's generic core, then record both legs' identity+provenance
-# blocks (EncodeStepTier::IDENTITY_FIELDS + ::PROVENANCE_FIELDS,
-# CONTRACT.md's disjoint E3 shape) into one merged, push-stamp-friendly
+# blocks (EncodeStepTier::IDENTITY_FIELDS + ::PROVENANCE_FIELDS, two
+# disjoint sets) into one merged, push-stamp-friendly
 # JSON -- schema_version/git_sha/box/producer/status, the SAME shape
 # `check_cuda_run_artifacts.py`'s schema expects of a committed cuda-run
-# artifact (this script itself does not commit anything; the pod evidence
-# train, CONTRACT.md Step 5, folds a real run's output into a committed
-# artifact via that gate's own schema).
+# artifact (this script itself does not commit anything; a real run's
+# output is committed as an artifact through that gate's own schema).
 python3 - "$RAW_DIR" "$OUT_DIR" "$SHA" "$DIR" <<'PYEOF'
 import json
 import os

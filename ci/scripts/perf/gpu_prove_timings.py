@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPU-prove-lane timing/outcome artifact producer (esc-080/esc-083).
+"""GPU-prove-lane timing/outcome artifact producer.
 
 Parses a `gpu-prove.yml` job log (the raw, tab-
 separated `<job>\\t<step>\\t<ISO8601 timestamp> <message>` form `gh run view
@@ -13,8 +13,8 @@ same-surface healthy artifact).
 
 Two modes:
 
-  * CURRENT (default) -- the post-esc-081 script shape: `::group::<token>`/
-    `::endgroup::` pairs use the SIX renamed short tokens plus `device`/
+  * CURRENT (default) -- the current script shape: `::group::<token>`/
+    `::endgroup::` pairs use the SIX short tokens plus `device`/
     `bench`, each proof group's own `PROVE_GROUP_RC name=<n> rc=<v>` marker,
     one `PROVE_SHA=<sha>` echo after clone, `PROVE_TUPLE crate=<c> kind=<k>
     features=<literal>` echoes, and a final `PROVE_EXIT=<n>` line (present
@@ -23,7 +23,7 @@ Two modes:
     `ci/scripts/prove_surface.py`'s shared canonicalization -- NOT the
     current tree's manifest, so a committed artifact's claimed surface never
     silently drifts if this script is re-run later against a newer checkout.
-  * LEGACY (`--legacy`) -- a pre-esc-081 job log: descriptive `::group::`
+  * LEGACY (`--legacy`) -- an older job log: descriptive `::group::`
     titles (mapped to the six canonical group names via prefix match, see
     `LEGACY_TITLE_PREFIXES`), no `PROVE_GROUP_RC`/`PROVE_SHA`/`PROVE_TUPLE`
     markers at all. `run_id`/`job_id`/`git_sha`/`outcome` cannot be derived
@@ -79,10 +79,10 @@ CURRENT_GROUP_NAMES = frozenset(
     }
 )
 
-# Legacy (pre-esc-081) descriptive `::group::` titles -> canonical short
-# name, matched by PREFIX (a legacy title carries trailing parenthetical
-# prose the canonical name drops). `jammi-kernels clippy` has NO current
-# equivalent (esc-081 removed it from the prove lane entirely) -- kept under
+# Legacy descriptive `::group::` titles -> canonical short name, matched by
+# PREFIX (a legacy title carries trailing parenthetical prose the canonical
+# name drops). `jammi-kernels clippy` has NO current equivalent (the prove
+# lane does not run it) -- kept under
 # its own informational name so a legacy leg's silence/wall accounting still
 # sees it, but it is never compared against `CURRENT_GROUP_NAMES`.
 LEGACY_TITLE_PREFIXES: list[tuple[str, str]] = [
@@ -100,18 +100,18 @@ LEGACY_TITLE_PREFIXES: list[tuple[str, str]] = [
 _LOG_LINE_RE = re.compile(r"^(?P<job>[^\t]*)\t(?P<step>[^\t]*)\t(?P<ts>\S+)\s(?P<msg>.*)$")
 _GROUP_RE = re.compile(r"##\[group\](?P<title>.*)$")
 _ENDGROUP_RE = re.compile(r"##\[endgroup\]\s*$")
-# The ONE Python-side marker grammar (BLOCK 3 audit fix) -- imported from
+# The ONE Python-side marker grammar -- imported from
 # prove_surface.py rather than compiled here a second time, so this and the
 # bash-side `rp_parse_prove_marker` (runpod_lib.sh) cannot silently drift.
 _GROUP_RC_RE = prove_surface.PROVE_GROUP_RC_RE
 _PROVE_SHA_RE = prove_surface.PROVE_SHA_RE
-# esc-084/#454: the driver's own `WRONG TREE` diagnostic
+# The driver's own `WRONG TREE` diagnostic
 # (`runpod_lib.sh`'s `rp_run_remote_watched`) names the sha it expected and
 # the sha it actually saw (or the literal token `none` when no `PROVE_SHA=`
 # line was ever observed by session end). Checked against the WHOLE log
 # text (like `_DRIVER_EXIT_LINE_RE`'s BUDGET/NO PROGRESS siblings below),
-# never per-line inside the measured window. BLOCK B9 audit fix: the
-# diagnostic does NOT only fire before any proof group opens or after the
+# never per-line inside the measured window. The diagnostic does NOT only
+# fire before any proof group opens or after the
 # window has closed with nothing else in the log -- the driver's final-
 # flush and absence arms can (and do) leave a `PROVE_EXIT=0` line and every
 # gating group green in the SAME log as this diagnostic, when the remote
@@ -162,9 +162,9 @@ def _canon_group_name(title: str, legacy: bool) -> str | None:
     own first group) is not a group this producer has any business timing.
     LEGACY already filtered through `_legacy_group_name`'s prefix map;
     CURRENT gets the same treatment against the exact `CURRENT_GROUP_NAMES`
-    set instead of accepting any title verbatim (the D5 measurement-scope
-    bug: an unfiltered CURRENT-mode title let the runner's own provisioning
-    groups anchor the window)."""
+    set instead of accepting any title verbatim (an unfiltered CURRENT-mode
+    title would let the runner's own provisioning groups anchor the
+    window)."""
     if legacy:
         return _legacy_group_name(title)
     return title if title in CURRENT_GROUP_NAMES else None
@@ -184,10 +184,9 @@ def parse_log(text: str, legacy: bool) -> dict:
     script's first `::group::device` line, and the runner's own post-job
     cleanup step groups AFTER the driver's own exit echo; a naive "first/
     last `##[group]`/`##[endgroup]` in the file" anchor silently absorbs
-    both into `wall_s`/`max_silent_gap_s` (the D5 measurement-scope bug --
-    confirmed live: sm_90's reported `max_silent_gap_s` was the pod-
-    provisioning wait, sm_80's reported `wall_s` was the WHOLE job's
-    duration). Neither runner phase belongs to the prove lane's own wall or
+    both into `wall_s`/`max_silent_gap_s` (`max_silent_gap_s` becomes the
+    pod-provisioning wait, `wall_s` the WHOLE job's duration). Neither
+    runner phase belongs to the prove lane's own wall or
     silence accounting; a non-canonical `##[group]` title occurring OUTSIDE
     this window is ignored entirely, and one occurring INSIDE it (the
     driver holds exactly one canonical group open at a time in this range,
@@ -200,14 +199,14 @@ def parse_log(text: str, legacy: bool) -> dict:
     open_groups: dict[str, datetime] = {}
     closed: list[dict] = []
     current_open_name: str | None = None
-    # BLOCK 1 audit fix: `PROVE_GROUP_RC` markers are emitted BEFORE their
-    # own `::endgroup::` by design (runpod_gpu_prove.sh's own convention),
-    # so at the moment a marker is seen its group is still in `open_groups`,
-    # never yet in `closed` -- searching `closed` for a name match (the
-    # original shape) found nothing for EVERY current-mode marker, silently
-    # leaving `rc: None` on every group and reading a fully healthy log as
-    # `budget-cut`. Attribute by the marker's OWN `name=` field into a plain
-    # dict instead (the marker already states which group it belongs to;
+    # `PROVE_GROUP_RC` markers are emitted BEFORE their own `::endgroup::`
+    # by design (runpod_gpu_prove.sh's own convention), so at the moment a
+    # marker is seen its group is still in `open_groups`, never yet in
+    # `closed` -- searching `closed` for a name match would find nothing for
+    # EVERY current-mode marker, leaving `rc: None` on every group and
+    # reading a fully healthy log as `budget-cut`. Attribute by the marker's
+    # OWN `name=` field into a plain dict instead (the marker states which
+    # group it belongs to;
     # only one group is ever open at a time, so this needs no additional
     # "is it the currently-open one" check) and pull from that dict the
     # moment the SAME-named group closes.
@@ -250,8 +249,8 @@ def parse_log(text: str, legacy: bool) -> dict:
                 # end boundary -- a runner's own post-job cleanup group
                 # (e.g. artifact upload) closing AFTER the driver's last
                 # canonical group has no `current_open_name` to match here,
-                # so it no longer silently drags `last_boundary_ts` (and
-                # therefore `wall_s`) out to the whole job's duration.
+                # so it never drags `last_boundary_ts` (and therefore
+                # `wall_s`) out to the whole job's duration.
                 last_boundary_ts = ts
             continue
         rc_m = _GROUP_RC_RE.search(msg)
@@ -372,12 +371,10 @@ def build_artifact(
         source = "job-log"
         groups = parsed["groups"]
         if outcome is None:
-            # BLOCK B audit fix: the original `else` arm labelled EVERY
-            # "PROVE_EXIT absent" case `budget-cut`, even a genuinely
-            # healthy log whose gating rc's just happened to be 0 with no
-            # PROVE_EXIT line for some other reason, and a log whose
-            # gating groups were simply never populated (a truncated log,
-            # not a cut) -- neither is actually a budget-cut. The real
+            # "PROVE_EXIT absent" is NOT by itself a budget-cut: a
+            # genuinely healthy log whose gating rc's are 0 can lack a
+            # PROVE_EXIT line for some other reason, and a log whose gating
+            # groups were never populated is truncated, not cut. The real
             # discriminators are: did the remote reach its own final
             # `PROVE_EXIT=` line at all, do EVERY gating group's markers
             # exist, do they all read rc=0, and does the log carry the
@@ -394,8 +391,7 @@ def build_artifact(
             has_budget_evidence = "BUDGET" in log_text
             has_no_progress_evidence = "NO PROGRESS" in log_text
 
-            # BLOCK B9 audit fix: the driver's own WRONG TREE diagnostic is
-            # tested FIRST, before `has_prove_exit` -- the bash-side final-
+            # The driver's own WRONG TREE diagnostic is tested FIRST, before `has_prove_exit` -- the bash-side final-
             # flush and absence arms (runpod_lib.sh's `rp_run_remote_watched`)
             # both leave a `PROVE_EXIT=0` line (and every gating marker
             # green) on a leg the driver itself refused as rc 77: the remote
@@ -445,7 +441,7 @@ def build_artifact(
                     "--outcome explicitly"
                 )
 
-    # esc-084/#454: a wrong-tree leg proved nothing -- record
+    # A wrong-tree leg proved nothing -- record
     # the sha it EXPECTED as `git_sha` (the identity check happens outside
     # any proof group, so `parsed["git_sha"]` -- the observed `PROVE_SHA=`
     # line, if the mismatch itself was echoed -- is a `proved_sha`, never
@@ -511,11 +507,11 @@ def build_artifact(
 
 
 # --------------------------------------------------------------------------- #
-# Self-test (BLOCK 1 audit fix): pins the CURRENT-mode marker-attribution
-# path (a marker precedes its own `::endgroup::` by design) against both a
-# fully healthy synthetic log and a genuine budget-cut one -- the exact
-# shape whose bug (matching `closed` instead of the marker's own `name=`
-# field) silently mislabeled every healthy leg as `budget-cut`.
+# Self-test: pins the CURRENT-mode marker-attribution path (a marker
+# precedes its own `::endgroup::` by design) against both a fully healthy
+# synthetic log and a genuine budget-cut one -- matching `closed` instead of
+# the marker's own `name=` field would mislabel every healthy leg as
+# `budget-cut`.
 # --------------------------------------------------------------------------- #
 _JOB = "GPU prove on RunPod (sm_80)"
 _STEP = "UNKNOWN STEP"
@@ -535,9 +531,9 @@ def _synth_log(lines: list[str]) -> str:
 
 # The manifest's own `prove_lane.crates` declared (crate, kind) -> literal
 # feature-text pairs, used to emit the SEVEN real PROVE_TUPLE echoes a
-# healthy leg actually carries (round-2 audit advisory #3: the self-test's
-# healthy log must carry them and assert `expected_id ==
-# prove_surface.current_expected_id()`, never a bare synthetic sha).
+# healthy leg actually carries (the self-test's healthy log must carry them
+# and assert `expected_id == prove_surface.current_expected_id()`, never a
+# bare synthetic sha).
 _SELF_TEST_TUPLES = [
     ("jammi-server", "release"),
     ("jammi-ai", "test"),
@@ -610,11 +606,11 @@ def _synth_log_from_offsets(entries: list[tuple[float, str]]) -> str:
 
 
 def _healthy_synth_log_with_runner_preamble() -> str:
-    """D5 measurement-scope regression fixture (esc-080..083 followup): a
-    REALISTIC GitHub-runner preamble -- provisioning/checkout step groups,
-    then the driver's own `waiting for SSH`/`SSH up` pair separated by a
-    500+s pod-provisioning wait -- BEFORE this script's own first
-    `::group::device`, exactly the shape a real D5 job log carries. The
+    """Measurement-scope regression fixture: a REALISTIC GitHub-runner
+    preamble -- provisioning/checkout step groups, then the driver's own
+    `waiting for SSH`/`SSH up` pair separated by a 500+s pod-provisioning
+    wait -- BEFORE this script's own first `::group::device`, exactly the
+    shape a real gpu-prove job log carries. The
     body after the preamble is byte-identical to `_healthy_lines()`'s own
     output, so `wall_s`/`max_silent_gap_s`/`groups[]` computed from this
     log must come out IDENTICAL to `_healthy_synth_log()`'s -- any
@@ -649,8 +645,8 @@ def _cut_synth_log() -> str:
     lines.append("Compiling jammi-kernels v0.48.0")
     # The driver's own BUDGET diagnostic (rp_run_remote_watched's real
     # output on a genuine ssh-status-124 cut with no PROVE_EXIT reached) --
-    # BLOCK B audit fix: without this evidence in the log, `budget-cut` can
-    # no longer be auto-derived at all (the producer now refuses to guess).
+    # without this evidence in the log, `budget-cut` cannot be auto-derived
+    # at all (the producer refuses to guess).
     lines.append('=== GPU prove: BUDGET (RP_TIMEOUT=6000s) cut group "engine-core-sweep"; groups: [capability-surface-build:0,capability-surface-proof:0,served-client-server-proof:0] ===')
     return _synth_log(lines)
 
@@ -718,8 +714,7 @@ def _wrong_tree_synth_log(observed_prove_sha: str | None) -> str:
 
 
 def _wrong_tree_healthy_synth_log(observed_prove_sha: str | None) -> str:
-    """BLOCK B9 audit fix regression fixture: the WRONG-TREE-in-the-final-
-    flush shape -- the remote script ran ALL THE WAY to a self-reported
+    """Regression fixture for the WRONG-TREE-in-the-final-flush shape -- the remote script ran ALL THE WAY to a self-reported
     healthy finish (every gating group green, `PROVE_EXIT=0`) and the
     driver's own identity check only caught the mismatch (or the absence)
     in its final flush, AFTER the remote had already printed its own
@@ -765,7 +760,7 @@ def _self_test() -> int:
     )
     bench_group = next(g for g in healthy_artifact["groups"] if g["name"] == "bench")
     check("healthy-bench-rc-recorded-non-gating", bench_group["rc"] == 1, f"{bench_group}")
-    # Round-2 audit advisory #3: the healthy self-test log carries the real
+    # The healthy self-test log carries the real
     # PROVE_TUPLE echoes, and the resulting expected_id must equal the
     # CURRENT manifest's own canonicalization -- never a bare synthetic sha
     # standing in for a real surface fingerprint.
@@ -782,7 +777,7 @@ def _self_test() -> int:
     cut_names = {g["name"] for g in cut_artifact["groups"]}
     check("cut-engine-core-sweep-not-closed", "engine-core-sweep" not in cut_names, f"{cut_names}")
 
-    # BLOCK B audit fix -- the three-way `else`-arm split.
+    # The three-way no-PROVE_EXIT/incomplete/suite-fail split.
     suite_fail_artifact = build_artifact(arch="sm_80", run_id="3", job_id="3", log_text=_suite_fail_synth_log(), legacy=False)
     check("suite-fail-outcome", suite_fail_artifact["outcome"] == "suite-fail", f"{suite_fail_artifact['outcome']}")
 
@@ -799,7 +794,7 @@ def _self_test() -> int:
     watchdog_artifact = build_artifact(arch="sm_80", run_id="5", job_id="5", log_text=_watchdog_kill_synth_log(), legacy=False)
     check("watchdog-kill-outcome", watchdog_artifact["outcome"] == "watchdog-kill", f"{watchdog_artifact['outcome']}")
 
-    # esc-084/#454: wrong-tree, both shapes -- a real (wrong)
+    # Wrong-tree, both shapes -- a real (wrong)
     # PROVE_SHA was observed, and the absence case (no PROVE_SHA at all).
     wrong_tree_artifact = build_artifact(
         arch="sm_80", run_id="6", job_id="6", log_text=_wrong_tree_synth_log("a" * 40), legacy=False
@@ -816,7 +811,7 @@ def _self_test() -> int:
     check("wrong-tree-absent-git-sha-is-expected", wrong_tree_absent_artifact["git_sha"] == "f" * 40, wrong_tree_absent_artifact["git_sha"])
     check("wrong-tree-absent-proved-sha-is-none", wrong_tree_absent_artifact["proved_sha"] is None, wrong_tree_absent_artifact.get("proved_sha"))
 
-    # BLOCK B9 audit fix regression: a log that ALSO carries PROVE_EXIT=0
+    # A log that ALSO carries PROVE_EXIT=0
     # and every gating group green (the final-flush shape) must still
     # resolve `wrong-tree`, never `healthy` -- the driver's 77 wins
     # regardless of which other markers landed in the same log.
@@ -861,7 +856,7 @@ def _self_test() -> int:
         wrong_tree_healthy_absent_artifact.get("proved_sha"),
     )
 
-    # D5 measurement-scope fix: a runner preamble (provisioning/checkout
+    # Measurement scope: a runner preamble (provisioning/checkout
     # groups + a 500+s SSH-wait gap) BEFORE `::group::device` must not move
     # `wall_s`/`max_silent_gap_s`, and `groups[]` must carry ONLY canonical
     # names -- never the runner's own step groups.
@@ -891,8 +886,8 @@ def _self_test() -> int:
     )
 
     # A non-canonical `##[group]` INSIDE the measured window is a parse
-    # error, not a silently-dropped group (BLOCK C follow-up: the driver's
-    # own convention never interleaves a foreign group between canonical
+    # error, not a silently-dropped group (the driver's own convention
+    # never interleaves a foreign group between canonical
     # ones, so seeing one there means the log itself is suspect).
     stray_inside_lines = _healthy_lines()
     device_close_idx = stray_inside_lines.index("##[endgroup]")

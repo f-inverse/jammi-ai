@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Byte-verify a re-derived ``train_pairs.jsonl`` against the committed
-``cookbook/fixtures/finetune_heldout/train_ids_sha256.json`` (unit 63,
-CONTRACT amendment 2026-08-28b PRE-RUN provisioning step).
+``cookbook/fixtures/finetune_heldout/train_ids_sha256.json`` (the pre-run
+provisioning step of a fine-tune A/B leg).
 
 ``train_pairs.jsonl`` is never committed (repo-size discipline — see
 ``cookbook/fixtures/finetune_heldout/README.md`` "Why train text isn't
@@ -47,8 +47,8 @@ FIXTURE_DIR = REPO_ROOT / "cookbook" / "fixtures" / "finetune_heldout"
 DEFAULT_PAIRS = FIXTURE_DIR / "train_pairs.jsonl"
 DEFAULT_HASHES = FIXTURE_DIR / "train_ids_sha256.json"
 
-# The committed train-side pair count (CONTRACT H3: N_PAIRS=1500,
-# N_HELDOUT=128, 1500-128=1372 -- cookbook/book/scripts/
+# The committed train-side pair count (N_PAIRS=1500, N_HELDOUT=128,
+# 1500-128=1372 -- cookbook/book/scripts/
 # derive_heldout_fixture.py's own N_PAIRS/N_HELDOUT constants). A self-test
 # fixture overrides this via --expected-count to exercise the same logic on
 # a tiny synthetic pair set without needing 1372 real rows.
@@ -144,7 +144,7 @@ def verify(pairs_path: Path, hashes_path: Path, expected_count: int = EXPECTED_T
             f"{pairs_path.name} has {len(actual_pairs)} pairs, expected exactly "
             f"{expected_count}")
 
-    # Unit-63 audit advisory (b): row ORDER is load-bearing too -- ab_merge.py's
+    # Row ORDER is load-bearing too -- ab_merge.py's
     # own `row_lengths` identity field carries the exact same "per-row order
     # is load-bearing, never canonicalized" doctrine (identity_fields.py's
     # own doc). A re-derivation that silently reordered rows (e.g. a
@@ -254,7 +254,7 @@ def self_test() -> int:
         if not any("expected exactly 1372" in x for x in findings_d):
             failures.append(f"(d) wrong-count case expected an 'expected exactly 1372' finding, got {findings_d}")
 
-        # (e) RED (unit-63 audit advisory (b)): same two pair ids, same
+        # (e) RED: same two pair ids, same
         # per-pair content -- just written in the OPPOSITE order. Every
         # per-pair/structural check above stays clean (no missing/extra/
         # duplicate/mismatched id, exact count) -- only the row-order check

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""`convert_legacy_bert_checkpoint.py`'s own suite (unit #356 census
-execution fix, defect 2): drives the real `renamed_name`/`convert`
+"""`convert_legacy_bert_checkpoint.py`'s own suite: drives the real `renamed_name`/`convert`
 functions.
 
 `renamed_name` (the suffix-anchored `.gamma`->`.weight` / `.beta`->`.bias`
@@ -30,8 +29,7 @@ skips in CI (and runs for real only in an environment without the
 package, e.g. this repo's own base dev checkout) -- the inverse trade-off
 of the file-level tests above.
 
-`CiExecutionAssertionTests` (phase-4 audit round-3 re-audit advisory 3,
-this repo's own zero-execution-is-RED doctrine): NEVER `skipUnless`-gated
+`CiExecutionAssertionTests` (zero execution is a failure, not a pass): NEVER `skipUnless`-gated
 -- it always runs, and only decides whether to assert or
 `self.skipTest()` from INSIDE the method body based on
 `JAMMI_CI_SAFETENSORS_EXPECTED` (set only by `ci.yml`'s own matrix entry
@@ -99,7 +97,7 @@ class RenamedNameSuffixAnchoredTests(unittest.TestCase):
         self.assertEqual(clbc.renamed_name("somegamma"), "somegamma")
 
     def test_literal_bare_gamma_name_is_untouched(self):
-        # Phase-4 audit advisory 4: `renamed_name` is a literal
+        # `renamed_name` is a literal
         # `str.endswith('.gamma')` suffix check, NOT a tokenized "last
         # dot-separated path component" one -- a name that IS just the
         # bare word "gamma", with no leading dot at all, has no
@@ -148,7 +146,7 @@ class ConvertFileLevelTests(unittest.TestCase):
             ln_weight_bytes = bytes(range(16))  # 4 x float32
             ln_bias_bytes = bytes(range(16, 32))
             embed_bytes = bytes(range(32, 40))  # 2 x float32
-            # A non-f32 dtype arm (phase-4 audit advisory 3) -- exercises
+            # A non-f32 dtype arm -- exercises
             # the `_DTYPE_CODE_TO_CTOR` on-disk-code round-trip for a real
             # checkpoint dtype other than the stock bert-base-uncased F32.
             bf16_bytes = bytes(range(40, 44))  # 2 x bfloat16
@@ -211,7 +209,7 @@ class ConvertFileLevelTests(unittest.TestCase):
             self.assertFalse(os.path.exists(out_path))
 
     def test_metadata_block_carried_through_unchanged(self):
-        # Phase-4 audit advisory 4: `safetensors.deserialize()` itself
+        # `safetensors.deserialize()` itself
         # drops `__metadata__` entirely -- `convert()` must still carry it
         # through to the output UNCHANGED via `_read_metadata` reading the
         # input's own header bytes directly.
@@ -340,8 +338,8 @@ class NotImportableRefusalTests(unittest.TestCase):
                 text=True,
                 timeout=30,
             )
-            # Both the exact exit code AND the named `::error::` marker
-            # (phase-4 audit advisory 2): `assertNotEqual(rc, 0)` alone
+            # Both the exact exit code AND the named `::error::` marker:
+            # `assertNotEqual(rc, 0)` alone
             # cannot distinguish this module's own LOUD, declared
             # ImportError refusal (exit 1, a clear stderr message) from an
             # UNHANDLED traceback elsewhere in the script also exiting
@@ -353,8 +351,7 @@ class NotImportableRefusalTests(unittest.TestCase):
 
 
 class CiExecutionAssertionTests(unittest.TestCase):
-    """Phase-4 audit round-3 re-audit advisory 3 -- this repo's own
-    zero-execution-is-RED doctrine, applied to the `skipUnless`-gated
+    """Zero execution is a failure, not a pass -- applied to the `skipUnless`-gated
     arms above: NEVER decorator-gated (no `@unittest.skipUnless`), so
     this test method ALWAYS runs. `ci.yml`'s own matrix entry for this
     suite sets `JAMMI_CI_SAFETENSORS_EXPECTED=1`; when that is present,

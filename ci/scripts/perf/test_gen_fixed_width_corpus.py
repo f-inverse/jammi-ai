@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""`gen_fixed_width_corpus.py`'s own suite (P4, CONTRACT
-`scratchpad/contract-356-profile.md` v3): determinism (same
+"""`gen_fixed_width_corpus.py`'s own suite: determinism (same
 `(rows, min_wordpieces, seed)` -> byte-identical output; different seed ->
 different output), the emitted JSONL schema (exactly the six
 `anchor_id`/`anchor_text`/`positive_id`/`positive_text`/`negative_id`/
@@ -166,7 +165,7 @@ class VerifyTokenizerTests(unittest.TestCase):
 
 
 class HeldOutSplitTests(unittest.TestCase):
-    """`--heldout-rows` (issue #421 P1-b(iv)): `finetune-run` REQUIRES a
+    """`--heldout-rows`: `finetune-run` REQUIRES a
     held-out fixture on every leg (`--heldout-ids` + `--heldout-jsonl` are
     unconditional), so the text producer emits one too rather than leaving
     a CLIP-text leg to reuse its own train rows as its held-out set.

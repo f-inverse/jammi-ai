@@ -1,32 +1,26 @@
 #!/usr/bin/env python3
-"""B1 audit fix on PR #372, round 2: a cross-producer PARITY test that
+"""A cross-producer PARITY test that
 drives the two REAL emitters — `jammi-bench grad-oracle` (a real `cargo`
 build/run, tiny CPU fixture) and `torch_grad_oracle.py --dry-run` (a real
 torch subprocess, tiny random-init 2-layer ModernBERT donor checkpoint) —
 and diffs their emitted `backbone_dtype` SPELLING and top-level key set,
 never two hand-built fixture dicts standing in for what the producers
-actually emit (implementer-acceptance clause: tracked-input fixtures, and
-this crate's own standing clause "every field compared across the two
-producers has a parity test that drives the REAL emitters on both sides").
+actually emit: every field compared across the two producers has a parity
+test that drives the REAL emitters on both sides.
 
-THE B1 REPRODUCTION this closes: jammi's `grad_oracle.rs` has always emitted
-`backbone_dtype: "f32"` (`format!("{:?}", ComputePrecision::F32).to_lowercase()`);
-`torch_grad_oracle.py`, before this fix, emitted the bare `--dtype` CLI
-spelling `"fp32"` straight through. `compare_grad_oracle.py`'s
-`RUN_IDENTITY_FIELDS` premise check compares this field EXACT — so EVERY
-jammi-f32-vs-torch-f32 comparison (including this oracle's own near-perfect
-control, overall cosine 0.9999998 on a real A100 run) was UNRUNNABLE,
-refused on a spurious spelling mismatch despite both sides having run at the
-identical, actual precision. `test_compare_grad_oracle.py`'s fixture-based
-suite could not see this at all: its `make_report` helper put `"f32"` on
-BOTH sides by construction (a fixture dict, not a real emitter), so the bug
-was invisible to fixture-only coverage — exactly why this test exists as a
-SEPARATE file that drives the real producers instead of adding more cases to
-that fixture-based suite.
+WHY REAL EMITTERS: jammi's `grad_oracle.rs` emits `backbone_dtype: "f32"`
+(`format!("{:?}", ComputePrecision::F32).to_lowercase()`), while torch's bare
+`--dtype` CLI spelling is `"fp32"`. `compare_grad_oracle.py`'s
+`RUN_IDENTITY_FIELDS` premise check compares this field after canonicalizing
+it — if the torch producer ever emitted a spelling the canonicalizer does not
+cover, EVERY jammi-f32-vs-torch-f32 comparison (including this oracle's own
+near-perfect control, overall cosine 0.9999998 on a real A100 run) would be
+refused on a spurious spelling mismatch. `test_compare_grad_oracle.py`'s
+fixture-based suite cannot see that: its `make_report` helper puts `"f32"`
+on BOTH sides by construction, which is why this test lives in a SEPARATE
+file that drives the real producers.
 
-REQUIRES (both, or every test method SKIPS, never fails/errors — the
-"anticipate error classes" environment-blocked convention this crate's own
-memory names): a `cargo` toolchain that can build `jammi-bench`, and a torch
+REQUIRES (both, or every test method SKIPS, never fails/errors): a `cargo` toolchain that can build `jammi-bench`, and a torch
 venv (`TORCH_VENV` env var, default `<repo>/.venv-torch-ref`, mirroring
 `finetune_ab.sh`'s OWN default — see that script's module doc) with
 `torch`/`transformers`/`peft`/`safetensors` installed
@@ -34,8 +28,7 @@ venv (`TORCH_VENV` env var, default `<repo>/.venv-torch-ref`, mirroring
 this). Not a guard in `ci/guards.toml`, for the same reason `finetune_ab.sh` itself is not: it needs a real
 cargo build and a real torch install, neither of which the hermetic guard
 lane provisions — this is a manually-run (or pod-dispatched) verification
-script, run once as part of THIS fix round's own RED->GREEN evidence, not a
-per-PR blocking gate.
+script, not a per-PR blocking gate.
 
 Run directly (after `uv venv "$TORCH_VENV" && uv pip install --python
 "$TORCH_VENV/bin/python3" torch transformers peft safetensors`):
@@ -153,7 +146,7 @@ class CrossProducerDtypeSpellingParity(unittest.TestCase):
         cls._tmp.cleanup()
 
     def test_both_real_emitters_write_the_canonical_f32_spelling(self):
-        """THE B1 FIX ITSELF, driven at the real entry points: BOTH dumps'
+        """Driven at the real entry points: BOTH dumps'
         `backbone_dtype` must be the literal string `"f32"` -- not merely
         "equal to each other under some normalization", but the ACTUAL
         canonical jammi spelling on both sides, unnormalized.

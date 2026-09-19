@@ -12,7 +12,7 @@ where every `*_path` is RELATIVE to the emitted JSONL's own directory (the
 loader resolves it against that directory, so the corpus is relocatable as
 one tree).
 
-LENGTH GUARANTEE (issue #421 PR B's pre-registered training-step profile):
+LENGTH GUARANTEE (the pre-registered training-step profile):
 every emitted clip is EXACTLY `round(--seconds * --sample-rate)` frames of
 16-bit signed little-endian PCM, single channel, at `--sample-rate` Hz --
 asserted by this producer against the header the stdlib `wave` module
@@ -36,14 +36,14 @@ distance strictly below mean absolute inter-family distance) rather than
 assuming it. Nothing here is claimed to be semantically meaningful: this is
 a fixed-length COST workload, not an accuracy fixture.
 
-Determinism (family J): one `random.Random(seed)` instance draws every noise
+Determinism: one `random.Random(seed)` instance draws every noise
 sample in a single fixed sequential order -- families first, then instances
 within a family -- so the same `(seconds, sample_rate, families, instances,
 jitter, seed)` tuple always produces byte-identical WAVs AND a
 byte-identical JSONL. The row list consumes no RNG at all, so `--rows` never
 perturbs the audio bytes.
 
-Generic fixture (family L): the content is synthetic additive-harmonic tones
+Generic fixture: the content is synthetic additive-harmonic tones
 plus seeded noise. No consumer's data, no recorded audio, no third-party
 package -- clips are written with the stdlib `wave` module over `array`, so
 this producer has NO dependency beyond the Python standard library.
@@ -52,11 +52,11 @@ FRACTIONAL `--seconds`: `--seconds` is a float and the clip length is
 `round(seconds * sample_rate)` frames ([`frame_count`], one definition used
 by the generator AND re-asserted by the test suite off the written WAV
 header). `--seconds 9.5 --sample-rate 48000` is therefore exactly 456000
-frames -- the #421 profile's declared audio shape, chosen to sit strictly
+frames -- the training-step profile's declared audio shape, chosen to sit strictly
 BELOW the CLAP front end's `nb_max_samples` so the repeat-pad branch is the
 declared branch rather than a boundary case.
 
-HELD-OUT SPLIT (issue #421 P1-b(iv)): `--heldout-rows N` additionally emits
+HELD-OUT SPLIT: `--heldout-rows N` additionally emits
 `heldout_ids.txt` (TAB-separated `anchor_id\tpositive_id\tnegative_id`, one
 row per line, in the order it was generated -- this file's ORDER is the
 scoring identity `jammi-bench finetune-run --heldout-ids` reads) and
@@ -80,9 +80,8 @@ a nonzero multiple of `--batch`, and finding that out here (before any WAV
 is written) is cheaper than finding it out on a GPU pod.
 
 WITHOUT `--heldout-rows` (the default, 0) nothing about this producer's
-output changes: the train rows are drawn from the FULL family pool exactly
-as before, no extra files are written, and the emitted bytes are identical
-to what every existing invocation already gets.
+output changes: the train rows are drawn from the FULL family pool and
+no extra files are written.
 
 Usage:
   gen_fixed_length_audio_corpus.py --rows N --seconds T --sample-rate R
@@ -197,7 +196,7 @@ def encode_wav(samples: array.array, sample_rate: int) -> bytes:
     """Encode int16 mono `samples` as a RIFF/WAVE file via the stdlib `wave`
     module. The bytes are a pure function of the samples and the rate --
     `wave` writes no timestamp, no encoder string, nothing environmental
-    (family J)."""
+   ."""
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(_CHANNELS)
@@ -649,7 +648,7 @@ def generate_split(
             families, heldout_families, heldout_rows, heldout_batch
         )
 
-    # Fixed draw order: family-major, instance-minor (family J).
+    # Fixed draw order: family-major, instance-minor.
     # `_build_pool` is the SAME function whether or not `pool_cache_dir`
     # is given (see `_load_or_build_pool`'s own doc) -- caching can only
     # skip re-running this construction, never change what it would have
@@ -696,7 +695,7 @@ def write_corpus(
     heldout_rows: list[dict] | None = None,
 ) -> Path:
     """Write the WAVs and the JSONL under `out_dir` (created if absent), in
-    SORTED file-name order (family J: the emission order is fixed, never the
+    SORTED file-name order (the emission order is fixed, never the
     dict's insertion order or the filesystem's), plus the held-out pair of
     files when `heldout_rows` is non-empty. Returns the train JSONL path."""
     out_dir.mkdir(parents=True, exist_ok=True)

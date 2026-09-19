@@ -227,7 +227,7 @@ async fn oracle_steps_equal_epochs_times_ceil_batches_over_grad_accum() {
 // The trainer pre-computes `total_steps = (batches_per_epoch * epochs) / grad_accum`
 // (integer division) and feeds it to `compute_lr` as the cosine/linear-decay
 // horizon. But each epoch ALSO flushes a trailing partial accumulation window
-// (trainer.rs:425) which bumps global_step. When batches_per_epoch is NOT a
+// (`TrainingLoop::run`'s end-of-epoch flush) which bumps global_step. When batches_per_epoch is NOT a
 // multiple of grad_accum, the realised step count per epoch is
 // ceil(batches/grad_accum), so the run overshoots `total_steps`.
 //
@@ -290,8 +290,8 @@ async fn oracle_grad_accum_partial_window_step_accounting() {
     .unwrap();
 
     // total_steps reported == realised global_step. Oracle realised = ceil(N/GA)*EPOCHS = 2.
-    // The trailing partial-window flush takes the extra step the old floored
-    // horizon `(N*EPOCHS)/GA = 1` failed to count; the corrected horizon counts it
+    // The trailing partial-window flush takes the extra step a floored
+    // horizon `(N*EPOCHS)/GA = 1` fails to count; the ceiling horizon counts it
     // (`ceil(N/GA)*EPOCHS = 2`), so realised steps and horizon agree.
     let realised_oracle = N.div_ceil(GA) * EPOCHS;
     let horizon = realised_oracle;

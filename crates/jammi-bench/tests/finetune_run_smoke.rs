@@ -513,7 +513,7 @@ fn finetune_run_smoke_mnrl_end_to_end_cpu_hermetic() {
         assert!(!v.is_null(), "identity field {field:?} is null: {v:?}");
     }
 
-    // Identity-value semantics (task item 4): MNRL flips the nullness pair —
+    // Identity-value semantics: MNRL flips the nullness pair —
     // `margin: null`, `temperature` non-null (already checked above),
     // `embedding_loss: "mnrl"`.
     assert!(

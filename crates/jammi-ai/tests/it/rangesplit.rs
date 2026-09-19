@@ -1,12 +1,10 @@
-//! RANGESPLIT (#540): N-way `InferenceExec` below one `_ordinal`-keyed merge.
+//! Range split: N-way `InferenceExec` below one `_ordinal`-keyed merge.
 //!
 //! Every oracle here builds the REAL production types (`OrdinalSplitExec`,
-//! `InferenceExecBuilder`, `SortPreservingMergeExec`, and — for RS5 —
+//! `InferenceExecBuilder`, `SortPreservingMergeExec`, and
 //! `wrap_with_split_and_merge` itself) rather than a stand-in mimicking their
-//! declared `PlanProperties` (the design round's own probes at
-//! `targets/pt-rangesplit` used stubs for `InferenceExec`; this file never
-//! does). See the implementation contract (`rangesplit.md`) §0/§1 for the
-//! executed premises RS1-RS8 rest on.
+//! declared `PlanProperties`: a stubbed `InferenceExec` would assert the
+//! stub's declarations, not the shipped ones.
 
 use std::sync::Arc;
 
@@ -66,8 +64,8 @@ fn out_schema() -> SchemaRef {
 /// (`OrdinalSplitExec` + a real `InferenceExec` + `SortPreservingMergeExec`)
 /// via the SAME `OrdinalSplitExec::new` + `InferenceExecBuilder` +
 /// `SortPreservingMergeExec::new` construction the production call sites use
-/// (never `wrap_with_split_and_merge`'s `n<=1` shortcut — RS1's grid forces
-/// the split present at every `N`, matching the design round's own probes).
+/// (never `wrap_with_split_and_merge`'s `n<=1` shortcut — the grid below
+/// forces the split present at every `N`).
 struct AnnotateStub {
     session: Arc<InferenceSession>,
     n: usize,
@@ -168,31 +166,27 @@ impl TableProvider for AnnotateStub {
     }
 }
 
-/// RS1: for the OPTIMIZED plan, nothing (no `RepartitionExec`/`SortExec`/
+/// For the OPTIMIZED plan, nothing (no `RepartitionExec`/`SortExec`/
 /// `CoalescePartitionsExec`) sits between `OrdinalSplitExec` and
 /// `InferenceExec` — the 120-cell grid over the production declaration set
 /// (`{PIPE, UDTF} x {bare, GROUP BY, ORDER BY, WHERE, LIMIT} x N in {1,2,4} x
-/// target_partitions in {1,2,4,8}`; RANGESPLIT ships the ordinal-only design
-/// the contract's executed record selected, so this is the single-variant
-/// subset of the design round's 240-cell two-variant grid that applies to
-/// the shipped code).
+/// target_partitions in {1,2,4,8}`, over the ordinal-only split design).
 ///
 /// Mutation (dropping `benefits_from_input_partitioning = [false]`) is
 /// executed by the sibling
-/// `rs1_oracle_detects_an_inserted_node_between_split_and_inference` below
+/// `oracle_detects_an_inserted_node_between_split_and_inference` below
 /// (a smaller, targeted repro — 120 real DataFusion optimizer passes per
 /// mutation makes an in-loop mutate-and-rerun too slow for routine CI). This
-/// grid ALSO independently goes RED under RS2's merge-key mutation
-/// (`[_row_id, _ordinal]`, executed and reverted during implementation, and
-/// re-measured on this file's final tree at 64 of 120 cells — a number
-/// that shifts with unrelated changes, re-measure before trusting it
-/// stale) — `SanityCheckPlan` refuses those cells outright ("does not
+/// grid ALSO independently fails under the merge-key mutation of
+/// `row_sequence_is_identical_across_n_on_both_input_shapes`
+/// (`[_row_id, _ordinal]`; the number of failing cells shifts with unrelated
+/// changes) — `SanityCheckPlan` refuses those cells outright ("does not
 /// satisfy order requirements ... Child-0 order: [[_ordinal ASC]]"); see
-/// `rs2_row_sequence_is_identical_across_n_on_both_input_shapes`'s own doc,
+/// `row_sequence_is_identical_across_n_on_both_input_shapes`'s own doc,
 /// which now reds under the identical mutation directly (a real per-row
 /// divergence oracle, not merely a plan-build refusal).
 #[tokio::test]
-async fn rs1_nothing_between_split_and_inference_across_the_grid() {
+async fn nothing_between_split_and_inference_across_the_grid() {
     let (session, _dir) = session().await;
     let mut failures: Vec<String> = Vec::new();
     let mut total = 0usize;
@@ -274,19 +268,19 @@ async fn rs1_nothing_between_split_and_inference_across_the_grid() {
     );
     assert!(
         failures.is_empty(),
-        "{} of {total} cells failed RS1:\n{}",
+        "{} of {total} cells have a node between OrdinalSplitExec and InferenceExec:\n{}",
         failures.len(),
         failures.join("\n\n")
     );
 }
 
-/// RS1's own falsification: dropping `benefits_from_input_partitioning =
+/// The grid oracle's own falsification: dropping `benefits_from_input_partitioning =
 /// [false]` from `InferenceExec` (reproduced here by wrapping a
 /// `RepartitionExec` directly between a real `OrdinalSplitExec` and a real
 /// `InferenceExec` — the shape `EnforceDistribution` would insert without
 /// the override) IS detected by the same structural check the grid uses.
 #[tokio::test]
-async fn rs1_oracle_detects_an_inserted_node_between_split_and_inference() {
+async fn oracle_detects_an_inserted_node_between_split_and_inference() {
     let (session, _dir) = session().await;
     let batch = RecordBatch::try_new(
         in_schema(),
@@ -334,7 +328,7 @@ async fn rs1_oracle_detects_an_inserted_node_between_split_and_inference() {
     );
 }
 
-/// RS2 at FULL strength: an UNSORTED `SELECT * FROM annotated` (no
+/// Row-sequence identity at FULL strength: an UNSORTED `SELECT * FROM annotated` (no
 /// `ORDER BY` to mask a divergence —
 /// the property is about the SPLIT/MERGE's own row sequence, not a sort
 /// downstream fixing it up), compared PER ROW over EVERY column but
@@ -342,15 +336,13 @@ async fn rs1_oracle_detects_an_inserted_node_between_split_and_inference() {
 /// `_ordinal` from the comparison), for N in {1,2,4} on BOTH input shapes
 /// (sorted and unsorted), against N=1's own sequence.
 ///
-/// Mutation executed and reverted (`AnnotateStub`'s merge re-keyed
-/// `[_row_id, _ordinal]`, `InferenceExec`'s own declared child ordering
-/// left at `[_ordinal]` — matching the executed record's exact scenario):
-/// this test itself goes RED under it, refused by `SanityCheckPlan` ("does
+/// Mutation (`AnnotateStub`'s merge re-keyed `[_row_id, _ordinal]`,
+/// `InferenceExec`'s own declared child ordering left at `[_ordinal]`):
+/// this test fails under it, refused by `SanityCheckPlan` ("does
 /// not satisfy order requirements ... Child-0 order: [[_ordinal ASC]]")
-/// before a single row is even compared — the exact mechanism the
-/// implementation contract's executed record names.
+/// before a single row is even compared.
 #[tokio::test]
-async fn rs2_row_sequence_is_identical_across_n_on_both_input_shapes() {
+async fn row_sequence_is_identical_across_n_on_both_input_shapes() {
     let (session, _dir) = session().await;
     for shape in ["PIPE", "UDTF"] {
         let mut base: Option<Vec<String>> = None;
@@ -404,13 +396,13 @@ async fn rs2_row_sequence_is_identical_across_n_on_both_input_shapes() {
     }
 }
 
-/// RS3: a `LIMIT` satisfied over N=4 completes rather than wedging the
+/// A `LIMIT` satisfied over N=4 completes rather than wedging the
 /// driver. Under the demand-driven mechanism (`OrdinalSplitExec`'s module
 /// doc) this is not a special case at all — a partition `LIMIT` stops
 /// polling never blocks anything, since nothing was ever reserved for it —
 /// but it is exercised end to end here through the real query engine.
 #[tokio::test]
-async fn rs3_limit_over_n4_completes_without_wedging() {
+async fn limit_over_n4_completes_without_wedging() {
     let (session, _dir) = session().await;
     let ctx = SessionContext::new();
     ctx.register_table(
@@ -432,14 +424,13 @@ async fn rs3_limit_over_n4_completes_without_wedging() {
     assert_eq!(total_rows, 1, "LIMIT 1 must return exactly one row");
 }
 
-/// RS3's residency claim (this node's module doc: `SharedPull` holds no
+/// The split's residency claim (this node's module doc: `SharedPull` holds no
 /// queue and no `Vec<RecordBatch>`, so no batch is ever retained past the
 /// single poll that produced it) is a STRUCTURAL argument over `SharedPull`'s
-/// own field list, not something a runtime counter measures — an earlier
-/// `outstanding: Vec<bool>` / `peak_outstanding()` instrument asserted its
-/// own popcount never exceeded `n`, which is true of any length-`n`
-/// `Vec<bool>` unconditionally and so proved nothing; it has been removed
-/// along with the flag it counted (see `ordinal_split_exec`'s module doc).
+/// own field list, not something a runtime counter measures (a per-partition
+/// `Vec<bool>` whose popcount never exceeds `n` is true of any length-`n`
+/// vector unconditionally and so proves nothing; see `ordinal_split_exec`'s
+/// module doc).
 /// What IS worth exercising through the query engine's own `SessionContext`
 /// is that `n` partitions polling the real `OrdinalSplitExec` CONCURRENTLY
 /// (each holding its received batch for a short artificial delay, simulating
@@ -447,7 +438,7 @@ async fn rs3_limit_over_n4_completes_without_wedging() {
 /// the mutex-guarded shared pull never double-hands or drops a batch under
 /// concurrent access.
 #[tokio::test]
-async fn rs3_concurrent_polling_conserves_every_row_exactly_once() {
+async fn concurrent_polling_conserves_every_row_exactly_once() {
     fn fixture(nb: usize, rows: usize) -> Arc<dyn ExecutionPlan> {
         let mut batches = Vec::new();
         for b in 0..nb {
@@ -505,12 +496,12 @@ async fn rs3_concurrent_polling_conserves_every_row_exactly_once() {
     );
 }
 
-/// RS5: `wrap_with_split_and_merge` — the ONE function all four
+/// `wrap_with_split_and_merge` — the ONE function all four
 /// `InferenceExec` roots call — returns the identical (no split, no merge)
 /// shape at the default `partitions == 1`, and a `SortPreservingMergeExec`
 /// root over an `OrdinalSplitExec`-fed `InferenceExec` at `partitions > 1`.
 #[tokio::test]
-async fn rs5_wrap_with_split_and_merge_is_a_noop_at_one_and_wraps_above_one() {
+async fn wrap_with_split_and_merge_is_a_noop_at_one_and_wraps_above_one() {
     let (session, _dir) = session().await;
     let batch = RecordBatch::try_new(
         in_schema(),
@@ -567,11 +558,11 @@ async fn rs5_wrap_with_split_and_merge_is_a_noop_at_one_and_wraps_above_one() {
     );
 }
 
-/// RS5's falsification: a `wrap_with_split_and_merge` that always merges
+/// The falsification: a `wrap_with_split_and_merge` that always merges
 /// (never short-circuits at `partitions <= 1`) is caught by the same
 /// no-merge-at-one assertion above.
 #[tokio::test]
-async fn rs5_oracle_detects_a_spurious_merge_at_partitions_one() {
+async fn oracle_detects_a_spurious_merge_at_partitions_one() {
     let batch = RecordBatch::try_new(
         in_schema(),
         vec![
@@ -720,12 +711,11 @@ async fn annotate_plan_at_partitions_one_sees_every_row_of_a_multi_partition_inp
     );
 }
 
-/// RS4: a Struct-typed key through the real `annotate()` path is a typed
-/// refusal naming the key column, its type, and "cannot be cast to Utf8" —
-/// reproduces `inference/schema.rs`'s former fallback fixture end to end
-/// through `InferenceSession::annotate_plan`.
+/// A Struct-typed key through the real `annotate()` path is a typed
+/// refusal naming the key column, its type, and "cannot be cast to Utf8",
+/// end to end through `InferenceSession::annotate_plan`.
 #[tokio::test]
-async fn rs4_struct_key_through_annotate_is_a_typed_refusal_naming_the_key() {
+async fn struct_key_through_annotate_is_a_typed_refusal_naming_the_key() {
     use arrow::array::{Int32Array, StructArray};
     use arrow::datatypes::Fields;
 
@@ -813,7 +803,7 @@ async fn a_struct_literal_config_with_partitions_zero_is_refused_by_session_cons
     );
 }
 
-/// RS5's literal source oracle: an `syn`-based (never regex — a
+/// The literal source oracle for `wrap_with_split_and_merge`: an `syn`-based (never regex — a
 /// `.build()`/`InferenceExecBuilder::new(` text scan cannot distinguish "in
 /// live code" from "in a doc comment" or "inside a different closure", and
 /// cannot see nesting at all) enumeration of EVERY `.rs` file ON DISK
@@ -865,7 +855,7 @@ async fn a_struct_literal_config_with_partitions_zero_is_refused_by_session_cons
 /// with_new_children`'s own self-rebuild (DataFusion's own machinery
 /// reconstructing an ALREADY-PLACED node from itself when it transforms the
 /// plan tree, never a fresh, independently-reachable root).
-mod rs5_source_oracle {
+mod split_merge_source_oracle {
     use std::collections::{BTreeSet, HashMap};
     use std::path::{Path, PathBuf};
 
@@ -1201,7 +1191,7 @@ mod rs5_source_oracle {
         }
         assert!(
             bypasses.is_empty(),
-            "RS5 violated — a construction site bypasses wrap_with_split_and_merge:\n{}",
+            "a construction site bypasses wrap_with_split_and_merge:\n{}",
             bypasses.join("\n")
         );
 
@@ -1351,7 +1341,7 @@ mod rs5_source_oracle {
     }
 }
 
-/// RS8's second arm: under `partitions = 2`, `ResultSink`'s `batch_num`/the
+/// Under `partitions = 2`, `ResultSink`'s `batch_num`/the
 /// persisted `checkpoint` column count the
 /// MERGED batches `EmbeddingPipeline::run` actually wrote — never a
 /// per-partition count — asserted against an INDEPENDENTLY collected count
@@ -1363,14 +1353,11 @@ mod rs5_source_oracle {
 /// &batches { sink.write_batch(batch).await?; }` loop).
 ///
 /// The TRUE cause of this fixture's non-trivial batch count is
-/// `cfg.engine.batch_size = 1` below, NOT the number of source files —
-/// executed and confirmed: a single 3-row parquet file under `batch_size
-/// = 1` measures the identical `persisted_checkpoint = 3, merged_batches.len()
-/// = 3` a multi-file source does (an earlier version of this doc
-/// attributed the 3 separate source batches to "three single-row-group
-/// source files under the default scan batch size", which this
-/// measurement refutes — the default scan batch size plays no role once
-/// `batch_size = 1` is set). With the session's own batch size forced to
+/// `cfg.engine.batch_size = 1` below, NOT the number of source files: a
+/// single 3-row parquet file under `batch_size = 1` measures the identical
+/// `persisted_checkpoint = 3, merged_batches.len() = 3` a multi-file source
+/// does — the default scan batch size plays no role once `batch_size = 1`
+/// is set. With the session's own batch size forced to
 /// 1, each ROW becomes its own batch — both at the scan and, critically,
 /// at `SortPreservingMergeExec`'s own re-batching, which otherwise
 /// combines small batches back up to the session batch size regardless of
@@ -1384,7 +1371,7 @@ mod rs5_source_oracle {
 /// (the assertions below pin `merged_batches.len() > 1` and the equality,
 /// not the literal 3).
 #[tokio::test]
-async fn rs8_checkpoint_counts_the_merged_batches_under_partitions_two() {
+async fn checkpoint_counts_the_merged_batches_under_partitions_two() {
     let dir = TempDir::new().unwrap();
     let src_dir = dir.path().join("src");
     std::fs::create_dir_all(&src_dir).unwrap();
@@ -1491,7 +1478,7 @@ async fn rs8_checkpoint_counts_the_merged_batches_under_partitions_two() {
     );
 }
 
-/// The end-to-end oracle (#540 RANGESPLIT) for a typed refusal raised
+/// The end-to-end range-split oracle for a typed refusal raised
 /// BELOW the split: `KeyCheckExec`'s `InvalidKey`, over a NULL `id`, must
 /// reach `generate_text_embeddings`'s caller classified IDENTICALLY —
 /// same variant, same fields — at `partitions ∈ {1, 2}`. `partitions = 1`

@@ -7,10 +7,9 @@ use tempfile::TempDir;
 
 use crate::common;
 
-/// CP3 smoke test: full pipeline from source registration through vector search.
-/// This is the cross-phase regression gate introduced at CP3.
+/// Smoke test: full pipeline from source registration through vector search.
 #[tokio::test]
-async fn smoke_cp3_full_pipeline() {
+async fn smoke_full_pipeline() {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());

@@ -1,5 +1,5 @@
-//! Shared machinery for the GPU-capability suite: the CUDA-availability skip
-//! guard, the paired CPU / GPU session builders, the fixture paths, and the
+//! Shared machinery for the GPU-capability suite: the serialized CUDA device
+//! slot, the paired CPU / GPU session builders, the fixture paths, and the
 //! parity tolerances + comparison helpers every property reuses.
 
 use std::collections::HashMap;
@@ -54,8 +54,8 @@ static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A CUDA device that cannot be held without also holding [`GPU_SERIAL`].
 ///
-/// The sibling of `crates/jammi-encoders/tests/esc076_comparable_eager_control.rs`'s
-/// own `SerialGpu`. `gguf_quantized_gpu.rs`'s admission-truthfulness oracle
+/// The sibling of the `SerialGpu` in `jammi-encoders`' eager-control memory
+/// test (the fused-vs-eager allocator-growth comparison). `gguf_quantized_gpu.rs`'s admission-truthfulness oracle
 /// reads DEVICE-GLOBAL memory (`nvidia-smi --query-gpu=memory.used`, a
 /// whole-device figure) as a before/after DELTA around a model load. Any
 /// concurrent allocation on the same device inside that window is charged to
@@ -124,9 +124,9 @@ impl SerialGpu {
 /// rather than unwrapping it (see [`SerialGpu`]'s doc for why).
 ///
 /// Split out from [`serial_cuda_device`] so the exclusion property itself is
-/// testable on a GPU-less lane, where no `SerialGpu` can ever be constructed:
-/// `gpu_slot_is_exclusive_while_held` below is the non-vacuous control that
-/// the slot is a real mutex and not a decorative field.
+/// testable without opening a device: `gpu_slot_is_exclusive_while_held`
+/// below is the non-vacuous control that the slot is a real mutex and not a
+/// decorative field.
 fn take_gpu_slot() -> std::sync::MutexGuard<'static, ()> {
     GPU_SERIAL
         .lock()
@@ -148,8 +148,7 @@ pub fn serial_cuda_device() -> SerialGpu {
 
 /// The slot is a real mutual exclusion, and it is released only when the
 /// guard drops — the property every device-global oracle in this binary
-/// leans on, pinned on EVERY lane (this one needs no GPU, so the CPU lane
-/// proves it too, where no [`SerialGpu`] can be constructed at all).
+/// leans on. This test opens no device.
 ///
 /// Non-vacuous in both directions: `try_lock` must FAIL while the slot is
 /// held (a decorative, always-available mutex fails here) and SUCCEED once it

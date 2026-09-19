@@ -8,11 +8,7 @@
 //!
 //! ## Device-side clip
 //!
-//! [`clip_gradients`] used to end every trainable [`Var`]'s contribution to
-//! the global norm with a `to_scalar::<f32>()` — a full-pipeline device→host
-//! sync, once per `Var` (224 of them on a ModernBERT-large r16 `Wqkv`/`Wo`/`Wi`
-//! LoRA config at the default `max_grad_norm = 1.0`). PyTorch's own
-//! `torch.nn.utils.clip_grad._clip_grads_with_norm_` computes `clip_coef =
+//! PyTorch's `torch.nn.utils.clip_grad._clip_grads_with_norm_` computes `clip_coef =
 //! max_norm / (total_norm + 1e-6)`, clamps it to at most `1.0`, and multiplies
 //! every gradient by the clamped coefficient **unconditionally** — its comment
 //! is explicit that this "avoids a `if clip_coef < 1:` conditional which can
@@ -20,11 +16,12 @@
 //! `_clip_grads_with_norm_`, called from `clip_grad_norm_`; pinned to
 //! `torch==2.13.0`, the version this repo's own PyTorch reference harness
 //! targets — see `crates/jammi-bench/reference/README.md`). [`clip_gradients`]
-//! now does the same: the
-//! whole computation — per-`Var` squared sums, the global-norm reduction,
-//! `sqrt`, the `max_norm / (total_norm + eps)` coefficient, its `<= 1.0`
-//! clamp, and every gradient's rescale — stays on the device as one tensor
-//! program with **zero** `to_scalar`/`to_vec` calls. `torch.nn.utils.
+//! does the same: the whole computation — per-`Var` squared sums, the
+//! global-norm reduction, `sqrt`, the `max_norm / (total_norm + eps)`
+//! coefficient, its `<= 1.0` clamp, and every gradient's rescale — stays on the
+//! device as one tensor program with **zero** `to_scalar`/`to_vec` calls (a
+//! per-`Var` host read would be a full-pipeline sync per `Var`: 224 of them on a
+//! ModernBERT-large r16 `Wqkv`/`Wo`/`Wi` LoRA config). `torch.nn.utils.
 //! clip_grad_norm_`'s default is `error_if_nonfinite=False`: a NaN gradient is
 //! silently scaled by a NaN coefficient and training continues. jammi keeps
 //! a stricter contract — a non-finite total norm is a typed refusal — but
@@ -41,57 +38,33 @@
 //! statement is "refused within one cadence interval of steps, and never
 //! checkpointed", not "never silent".
 //!
-//! ## Accumulator precision: an undisclosed change the device rewrite also
-//! made, and why the new value is the correct one to keep
+//! ## Accumulator precision
 //!
-//! The pre-rewrite host implementation read EVERY `Var`'s own `f32` squared
-//! sum back with `to_scalar::<f32>()` and accumulated the cross-`Var` fold
-//! in an `f64` HOST scalar (`let mut total_sq = 0.0f64; … total_sq += sq as
-//! f64;`, then `total_sq.sqrt()` — also `f64`). [`clip_gradients`] now folds
-//! that SAME cross-`Var` sum entirely as `f32` device tensors (`Some(acc) =>
-//! (&acc + &sq)…`, `total_sq.sqrt()` on the `f32` tensor) — a genuine
-//! precision change to the fold's accumulator this doc did not previously
-//! call out. It is not a regression to fix, though: PyTorch's OWN reference
-//! implementation never promotes to `f64` either — `torch.linalg.
-//! vector_norm` computes each per-parameter norm AND the outer fold of the
-//! stacked per-parameter norms (`_get_total_norm`, `torch/nn/utils/
-//! clip_grad.py`) entirely in the gradient's own dtype (`f32`, for
-//! full-precision training) — so the pre-rewrite `f64` host accumulation
-//! was an ACCIDENTAL side effect of syncing every `Var` back individually,
-//! never a deliberate higher-precision design choice, and it was already a
-//! (small) DEPARTURE from torch's own `f32`-throughout behavior, not a
-//! closer match to it (family K: parity target is PyTorch, not a candle
-//! implementation detail some earlier revision of this file happened to
-//! have). The device-side `f32` fold this file now performs is the one that
-//! matches torch's own accumulator precision for `f32` gradients. It is NOT
-//! bit-identical to torch, and this doc does not claim it: (1) the
-//! coefficient is now computed with torch's own rounding COUNT — `denom =
-//! total_norm.affine(1.0, 1e-6)` (one add) then `max_norm_t.div(&denom)`
-//! (one division, candle's `Div` kernel, `v1 / v2` — not `recip()` then a
-//! second `affine`-multiply, an earlier revision of this function used,
-//! which cost a SECOND `f32` rounding torch's own `max_norm / (total_norm +
-//! 1e-6)` never pays; see [`clip_gradients`]'s own doc for the derivation)
-//! — so this fold's ONLY remaining source of drift from torch's coefficient
-//! is the `f32` values `total_norm`/`max_norm` themselves being the result
-//! of a differently-shaped reduction, not an extra rounding in the
-//! coefficient's own arithmetic; (2) the fold shape
-//! differs (`sqrt(Σ_i Σ g_i²)` here vs torch's norm-of-per-parameter-norms,
-//! bounded in [`clip_gradients`]'s doc); and (3) for a NON-`f32` gradient
-//! (bf16 LoRA training) torch keeps the whole computation in the gradient's
-//! own dtype — `torch._foreach_norm` returns bf16 per-parameter norms, the
-//! coefficient is bf16, `foreach_mul_` is a bf16 × bf16 — while this file
-//! upcasts each gradient to `f32`, folds/scales in `f32`, and rounds back to
-//! bf16 once at the end, a genuinely different (fewer-rounding) arithmetic
+//! The cross-`Var` sum of squares is folded entirely as `f32` device tensors,
+//! never promoted to an `f64` host accumulator. That matches PyTorch:
+//! `torch.linalg.vector_norm` computes each per-parameter norm AND the outer
+//! fold of the stacked per-parameter norms (`_get_total_norm`,
+//! `torch/nn/utils/clip_grad.py`) in the gradient's own dtype (`f32` for
+//! full-precision training). The parity target is PyTorch, so an `f64` fold
+//! would be a departure from it, not a closer match. The fold is NOT
+//! bit-identical to torch, for three reasons: (1) the coefficient uses torch's
+//! own rounding COUNT — `denom = total_norm.affine(1.0, 1e-6)` (one add) then
+//! `max_norm_t.div(&denom)` (one division, candle's `Div` kernel, `v1 / v2`;
+//! `recip()` then a multiply would add a second `f32` rounding torch never
+//! pays; see [`clip_gradients`]'s doc) — so the only drift in the coefficient
+//! comes from `total_norm` itself being a differently-shaped reduction; (2) the
+//! fold shape differs (`sqrt(Σ_i Σ g_i²)` here vs torch's
+//! norm-of-per-parameter-norms, bounded in [`clip_gradients`]'s doc); and (3)
+//! for a NON-`f32` gradient (bf16 LoRA training) torch keeps the whole
+//! computation in the gradient's own dtype — `torch._foreach_norm` returns bf16
+//! per-parameter norms, the coefficient is bf16, `foreach_mul_` is a bf16 ×
+//! bf16 — while this file upcasts each gradient to `f32`, folds/scales in
+//! `f32`, and rounds back to bf16 once at the end, a fewer-rounding arithmetic
 //! that is closer to the real-number clip than torch's, not equal to it.
-//! `tests::multi_var_clip_
-//! matches_host_reference_on_cpu` and `tests::clip_gradients_device_and_
-//! host_agree_bit_identically_on_cpu` (below) pin that the fold's own
-//! op-sequence behavior matches an independent host reference at the
-//! per-op level this file's doc derives; this crate does not carry a
-//! dedicated test pinning the f64-host-vs-f32-device magnitude at full
-//! 224-`Var` production width specifically — see this PR's own
-//! description for why that apparatus was dropped in favor of the
-//! narrower, per-op derivation these two tests check directly.
+//! `tests::multi_var_clip_matches_host_reference_on_cpu` and
+//! `tests::clip_gradients_device_and_host_agree_bit_identically_on_cpu` pin the
+//! fold's op-sequence behavior against an independent host reference at the
+//! per-op level this doc derives.
 
 use candle_core::{backprop::GradStore, DType, Tensor, Var};
 use candle_nn::VarMap;
@@ -103,34 +76,26 @@ use crate::fine_tune::adamw::AdamW;
 /// sorted by its `VarBuilder`-path NAME, never `VarMap::all_vars()`'s raw
 /// `HashMap` iteration order.
 ///
-/// Why this matters (esc-182, a sibling audit finding): `VarMap::data()` is a
+/// Why this matters: `VarMap::data()` is a
 /// `std::collections::HashMap<String, Var>` (candle-nn 0.11.0, `var_map.rs`)
 /// — `all_vars()` is `tensor_data.values().collect()`, and `std::HashMap`'s
 /// default hasher is keyed by a PER-PROCESS random seed (`RandomState`), so
-/// its iteration order is stable within one process's lifetime for a given
-/// table (never mutated between reads) but is NOT reproducible across two
-/// separate process invocations of the identical program with the identical
-/// `seed` — a second `cargo test`/training run gets a DIFFERENT `all_vars()`
-/// order from the first, purely from HashMap's own randomized hashing, wholly
-/// independent of the caller's `seed` parameter. [`clip_gradients`]'s own doc
-/// claims a "fixed left-to-right fold order… deterministic run to run" — that
-/// claim is only as true as the ORDER its `trainable_vars: &[Var]` argument
-/// arrives in, which this function's caller (not `clip_gradients` itself,
-/// which cannot see names) is responsible for pinning. `trainer.rs`'s
-/// `TrainingLoop::run` and `parallel_train.rs`'s `run_parallel_training` both
-/// snapshot `trainable_vars` ONCE (`self.varmap.all_vars()`, pre-esc-182) and
-/// reuse that same `Vec` for gradient accumulation, the clip's fold, AND the
-/// `AdamW` optimizer's positional moment vector — self-consistent WITHIN one
-/// run (the snapshot itself never reorders), but the clip's fold order (and
-/// therefore the last bits of `total_norm`, and therefore the last bits of
-/// every clipped gradient) still differs BETWEEN independent process
-/// invocations of the same seed. Sorting by name here removes that
-/// process-level nondeterminism from a parity-critical path (family J: no
-/// unseeded RNG) — the optimizer's OWN moment-restoration path already had to
-/// solve this same problem for a different reason (`trainer.rs`'s
-/// `optim_param_names`, keying `AdamW`'s resume-from-checkpoint moments by
-/// name rather than by this same unstable position) — this closes the
-/// matching gap for the clip's own fold.
+/// its iteration order is stable within one process's lifetime but is NOT
+/// reproducible across two process invocations of the identical program with
+/// the identical `seed`. [`clip_gradients`]'s doc claims a "fixed
+/// left-to-right fold order… deterministic run to run" — that claim is only as
+/// true as the ORDER its `trainable_vars: &[Var]` argument arrives in, which
+/// the caller (not `clip_gradients`, which cannot see names) pins.
+/// `trainer.rs`'s `TrainingLoop::run` and `parallel_train.rs`'s
+/// `run_parallel_training` both snapshot `trainable_vars` ONCE through this
+/// function and reuse that same `Vec` for gradient accumulation, the clip's
+/// fold, AND the `AdamW` optimizer's positional moment vector; an unsorted
+/// snapshot would be self-consistent within one run but would change the
+/// clip's fold order (and so the last bits of `total_norm` and of every
+/// clipped gradient) BETWEEN runs of the same seed. The optimizer's
+/// moment-restoration path solves the same problem for resume
+/// (`trainer.rs`'s `optim_param_names`, keying `AdamW`'s checkpointed moments
+/// by name rather than by position).
 pub fn sorted_trainable_vars(varmap: &VarMap) -> Vec<Var> {
     let data = varmap.data().lock().unwrap_or_else(|e| e.into_inner());
     let mut named: Vec<(&String, &Var)> = data.iter().collect();
@@ -283,9 +248,9 @@ impl ClipOutcome {
 /// CALLER SUPPLIES IT). This function has no way to see `Var` names and
 /// cannot enforce ordering itself — the "deterministic run to run" half of
 /// that claim is only as true as its caller's ordering. Every production
-/// caller in this crate (`trainer.rs`, `parallel_train.rs`) now builds
+/// caller in this crate (`trainer.rs`, `parallel_train.rs`) builds
 /// `trainable_vars` via [`sorted_trainable_vars`], never a raw
-/// `VarMap::all_vars()` — see that function's own doc (esc-182) for why a raw
+/// `VarMap::all_vars()` — see that function's own doc for why a raw
 /// `all_vars()` order is stable WITHIN one process's use of one `VarMap` but
 /// NOT reproducible ACROSS separate process invocations of the identical
 /// `seed`, which would otherwise make this fold's last bits (and therefore
@@ -373,7 +338,7 @@ pub fn clip_gradients(
     #[cfg(test)]
     THREAD_CLIP_CALL_COUNT.with(|c| c.set(c.get() + 1));
 
-    // Domain-validity at the edge (family D): `max_norm.is_nan()` makes
+    // Domain-validity at the edge: `max_norm.is_nan()` makes
     // `max_norm <= 0.0` below `false` (NaN compares false against
     // everything), so a NaN `max_norm` would otherwise fall THROUGH the
     // disable-clipping guard and into the clip computation, where
@@ -404,7 +369,7 @@ pub fn clip_gradients(
 
     // Fold the per-`Var` squared sums into one device scalar, in
     // `trainable_vars` order — fixed fold order, so this is deterministic
-    // (family J: no unseeded/order-dependent reduction).
+    // (no unseeded or order-dependent reduction).
     let mut total_sq: Option<Tensor> = None;
     for var in trainable_vars {
         let t: &Tensor = var;
@@ -448,14 +413,12 @@ pub fn clip_gradients(
     // clip_grad.py`, `_clip_grads_with_norm_`; see the module doc's
     // citation): `clip_coef = max_norm / (total_norm + 1e-6)` is Python
     // `float / Tensor`, ATen's binary `div` kernel — ONE add (the `+ 1e-6`)
-    // then ONE division, never a reciprocal. An earlier revision of this
-    // function computed `(total_norm + 1e-6).recip() * max_norm` — a
-    // reciprocal then a multiply, TWO `f32` roundings where torch performs
-    // one — which could differ from torch's coefficient by ~1 ULP for
-    // `max_norm != 1.0` (at the shipped default `max_norm == 1.0`, `x * 1.0
-    // == x` exactly, so that revision's extra rounding was invisible at the
-    // production default specifically, not fixed by it). This computes the
-    // same op sequence, and the same rounding COUNT, as torch:
+    // then ONE division, never a reciprocal. `(total_norm + 1e-6).recip() *
+    // max_norm` would be TWO `f32` roundings where torch performs one, and
+    // could differ from torch's coefficient by ~1 ULP for `max_norm != 1.0`
+    // (at the default `max_norm == 1.0`, `x * 1.0 == x` exactly, which would
+    // hide that extra rounding). This computes the same op sequence, and the
+    // same rounding COUNT, as torch:
     //  1. `denom = total_norm.affine(1.0, 1e-6)` — `total_norm * 1.0` is
     //     exact (multiplying any finite `f32` by `1.0` introduces no
     //     rounding), so this is ONE rounding, matching torch's `total_norm +
@@ -475,13 +438,13 @@ pub fn clip_gradients(
     //     genuine single-rounding division, NOT `Recip`'s `v.recip()`
     //     (`== 1.0 / v` in Rust's own `f32::recip`, still one rounding on
     //     its own, but paired with the second `affine`-multiply rounding
-    //     the old sequence needed to fold in `max_norm`). ONE rounding here,
-    //     matching torch's ONE division.
+    //     a recip-then-multiply sequence needs to fold in `max_norm`).
+    //     ONE rounding here, matching torch's ONE division.
     // Total: two roundings before the clamp (the add, the division) —
     // identical to torch's rounding count. `minimum`'s own `1.0` is a
     // third small device scalar (materialized the same way, via
     // `binary_op_scalar!`'s own `TensorOrScalar` promotion) — one small
-    // H2D-adjacent op per call, same as before this change; not cached
+    // H2D-adjacent op per call; not cached
     // (nothing in this crate holds candle's `CUDA_GRAPH_HTOD_CACHE` for the
     // run — see [`crate::fine_tune::trainer`]'s doc on why an unbounded,
     // never-evicted, run-lifetime cache is the wrong trade). Below,
@@ -511,7 +474,7 @@ pub fn clip_gradients(
             // upconverted above): a non-F32 gradient must upconvert here too
             // — the SAME class of bug this function's `is_finite` guard
             // exists to catch, just a dtype-domain edge instead of a
-            // value-domain one (family D). Round-trip back to the
+            // value-domain one. Round-trip back to the
             // gradient's OWN dtype afterward rather than leaving it F32:
             // dtype is part of the `GradStore` contract this function did
             // not create and must not silently change.
@@ -546,7 +509,7 @@ pub fn clip_gradients(
 /// silently scales every gradient by a NaN/Inf coefficient and trains on;
 /// jammi diverges from that default deliberately — a NaN gradient must never
 /// train silently — but the read this requires is exactly the kind of
-/// mid-step stall [`clip_gradients`] was rewritten to remove, so callers must
+/// mid-step stall [`clip_gradients`] is built to avoid, so callers must
 /// NOT invoke this every step. Every call site in this crate checks on the
 /// same cadence — every [`DEFAULT_NORM_CHECK_INTERVAL`] *optimizer* steps
 /// (not micro-batches: `step` is `global_step + 1`, the 1-based index of the
@@ -577,51 +540,10 @@ pub fn refuse_nonfinite_norm(total_norm: &Tensor, step: usize) -> Result<()> {
 /// one-batch-per-step loop, which has no epoch). Chosen to surface a diverged
 /// run within a small, bounded number of steps while keeping the sync off all
 /// but a `1 / DEFAULT_NORM_CHECK_INTERVAL` fraction of them — every step is
-/// explicitly not acceptable (that is the sync this file exists to remove).
+/// explicitly not acceptable (that is the sync this file exists to avoid).
 pub const DEFAULT_NORM_CHECK_INTERVAL: usize = 50;
 
-/// Clip an already-computed gradient store, then take one AdamW step.
-///
-/// This is the seam both training loops share: whatever produced `grads` (a
-/// single backward, an accumulation window, or the GradCache two-pass
-/// backward), the clip-then-step that turns them into a parameter update is
-/// identical. `max_grad_norm <= 0.0` skips clipping.
-///
-/// `check_every_n_steps` gates [`refuse_nonfinite_norm`]: the norm is read
-/// back and checked when `step` (the 1-based index of the optimizer step
-/// about to run — pass `global_step + 1`) is `1`, is a multiple of
-/// `check_every_n_steps`, OR `is_last_step` is `true` — and never when
-/// `check_every_n_steps == 0` (an explicit full opt-out every call site in
-/// this crate currently leaves unused). The `step == 1` and `is_last_step`
-/// arms exist because the modulo cadence alone silently skips every run
-/// shorter than `check_every_n_steps` steps end to end: with only the modulo
-/// check, a run of, say, 12 steps against the default interval of 50 would
-/// never call [`refuse_nonfinite_norm`] even once, and a NaN gradient on its
-/// very last step would train silently and get saved into the adapter. `step
-/// == 1` catches a bad start immediately; `is_last_step` (the caller states
-/// whether `step` is the final optimizer step of the whole run — trainer.rs's
-/// callers know this from the LR-schedule horizon they already compute)
-/// catches a bad end even when the run never reaches a full interval.
-///
-/// [`ClipOutcome::NoGradients`] is handled OUTSIDE the cadence gate above —
-/// unconditionally, on every call, off-cadence or not — because it is not a
-/// non-finite-norm finding (there is no norm tensor to even read back).
-/// Whenever `trainable_vars` is non-empty, this is an AMBIGUOUS state this
-/// function cannot resolve on its own (see [`ClipOutcome::NoGradients`]'s
-/// own doc): it could be a genuine bug (a detached graph, an all-frozen
-/// adapter, an unpopulated `GradStore`), or a batch whose loss legitimately
-/// never routes through any of these `Var`s by DESIGN (e.g.
-/// `TrainingBatch::Contrastive`'s `contrastive_loss` scores raw precomputed
-/// embeddings directly, never through a `ProjectionHead`'s LoRA layers — a
-/// real, common shape across this crate's own step-counting/schedule test
-/// oracles, never a bug in those tests). Since a hard refusal here would
-/// break every one of those legitimate call sites, this is a COUNTED FACT
-/// instead — a `tracing::warn!` an operator can grep/alert on — and the
-/// step proceeds (`optimizer.step(grads)` over an empty `GradStore` is a
-/// no-op, unchanged from before `ClipOutcome` existed). An EMPTY
-/// `trainable_vars` is the one UNAMBIGUOUSLY benign reading (nothing was
-/// ever asked to be clipped) and does not warn.
-/// DESIGN.md §4's "canonical-order reduce": lay `grads` out in the CANONICAL
+/// The canonical-order reduce: lay `grads` out in the CANONICAL
 /// `trainable_vars` order (the same name-sorted order [`sorted_trainable_vars`]
 /// produces), `all_reduce_sum` it across the gang, and write the summed
 /// values back — but ONLY for a var PRESENT ON AT LEAST ONE RANK; a var
@@ -663,13 +585,11 @@ pub const DEFAULT_NORM_CHECK_INTERVAL: usize = 50;
 /// exactly `1.0` (`> 0`, so it is written back unchanged) and an absent var's
 /// is exactly `0.0` (so it is never written back) — this function's
 /// observable effect at W=1 is NOTHING, byte-for-byte identical to calling
-/// neither reduce at all, restoring the W=1 trajectory this crate's whole
-/// existing trainer suite already pins. See this module's own
+/// neither reduce at all, preserving the W=1 trajectory this crate's trainer
+/// suite pins. See this module's own
 /// `canonical_reduce_at_world_one_leaves_absence_and_presence_unchanged`
-/// oracle (RED-PROOF: unconditionally inserting the zero-filled tensor for
-/// every var, the shape this function held before the presence-set fix,
-/// reds it — the absent var gains an entry it must not have).
-///
+/// oracle (unconditionally inserting the zero-filled tensor for every var
+/// fails it — the absent var gains an entry it must not have).
 pub fn canonical_reduce(
     call: &super::collective::BlockingCall,
     rank_ctx: &super::trainer::RankContext,
@@ -722,6 +642,47 @@ pub fn canonical_reduce(
     Ok(())
 }
 
+/// Clip an already-computed gradient store, then take one AdamW step.
+///
+/// This is the seam both training loops share: whatever produced `grads` (a
+/// single backward, an accumulation window, or the GradCache two-pass
+/// backward), the clip-then-step that turns them into a parameter update is
+/// identical. `max_grad_norm <= 0.0` skips clipping.
+///
+/// `check_every_n_steps` gates [`refuse_nonfinite_norm`]: the norm is read
+/// back and checked when `step` (the 1-based index of the optimizer step
+/// about to run — pass `global_step + 1`) is `1`, is a multiple of
+/// `check_every_n_steps`, OR `is_last_step` is `true` — and never when
+/// `check_every_n_steps == 0` (an explicit full opt-out every call site in
+/// this crate currently leaves unused). The `step == 1` and `is_last_step`
+/// arms exist because the modulo cadence alone silently skips every run
+/// shorter than `check_every_n_steps` steps end to end: with only the modulo
+/// check, a run of, say, 12 steps against the default interval of 50 would
+/// never call [`refuse_nonfinite_norm`] even once, and a NaN gradient on its
+/// very last step would train silently and get saved into the adapter. `step
+/// == 1` catches a bad start immediately; `is_last_step` (the caller states
+/// whether `step` is the final optimizer step of the whole run — trainer.rs's
+/// callers know this from the LR-schedule horizon they already compute)
+/// catches a bad end even when the run never reaches a full interval.
+///
+/// [`ClipOutcome::NoGradients`] is handled OUTSIDE the cadence gate above —
+/// unconditionally, on every call, off-cadence or not — because it is not a
+/// non-finite-norm finding (there is no norm tensor to even read back).
+/// Whenever `trainable_vars` is non-empty, this is an AMBIGUOUS state this
+/// function cannot resolve on its own (see [`ClipOutcome::NoGradients`]'s
+/// own doc): it could be a genuine bug (a detached graph, an all-frozen
+/// adapter, an unpopulated `GradStore`), or a batch whose loss legitimately
+/// never routes through any of these `Var`s by DESIGN (e.g.
+/// `TrainingBatch::Contrastive`'s `contrastive_loss` scores raw precomputed
+/// embeddings directly, never through a `ProjectionHead`'s LoRA layers — a
+/// real, common shape across this crate's own step-counting/schedule test
+/// oracles, never a bug in those tests). Since a hard refusal here would
+/// break every one of those legitimate call sites, this is a COUNTED FACT
+/// instead — a `tracing::warn!` an operator can grep/alert on — and the
+/// step proceeds (`optimizer.step(grads)` over an empty `GradStore` is a
+/// no-op). An EMPTY
+/// `trainable_vars` is the one UNAMBIGUOUSLY benign reading (nothing was
+/// ever asked to be clipped) and does not warn.
 pub fn clip_and_step(
     optimizer: &mut AdamW,
     trainable_vars: &[Var],
@@ -735,9 +696,8 @@ pub fn clip_and_step(
     if matches!(outcome, ClipOutcome::NoGradients) && !trainable_vars.is_empty() {
         // A COUNTED FACT (`tracing::warn!`, a structured field a log
         // pipeline/dashboard can grep and alert on), never a hard refusal:
-        // an earlier revision of this branch returned `Err` here, which
-        // broke every legitimate loss that does not route through EVERY
-        // trainable `Var` for a given batch — e.g. `TrainingBatch::
+        // an `Err` here would break every legitimate loss that does not
+        // route through EVERY trainable `Var` for a given batch — e.g. `TrainingBatch::
         // Contrastive`'s `contrastive_loss` scores raw precomputed
         // embeddings directly, never through `TrainingTarget::
         // ProjectionHead`'s LoRA layers, so its trainable Vars carry no
@@ -749,9 +709,8 @@ pub fn clip_and_step(
         // graph / an all-frozen adapter / an unpopulated GradStore" — is
         // real, so refusing outright is not the answer to that ambiguity;
         // making it OBSERVABLE (searchable in logs, countable by a
-        // dashboard) is. The step proceeds exactly as it did before
-        // `ClipOutcome` existed: `optimizer.step(grads)` over an empty
-        // `GradStore` is a harmless no-op.
+        // dashboard) is. The step proceeds: `optimizer.step(grads)` over an
+        // empty `GradStore` is a harmless no-op.
         tracing::warn!(
             step,
             trainable_vars = trainable_vars.len(),
@@ -862,7 +821,7 @@ mod tests {
         }
     }
 
-    /// esc-182: [`sorted_trainable_vars`] must return the SAME `Var` sequence
+    /// [`sorted_trainable_vars`] must return the SAME `Var` sequence
     /// regardless of the order names were INSERTED into the `VarMap` — the
     /// property that removes the `HashMap`-iteration-order dependence
     /// `VarMap::all_vars()` has. Two `VarMap`s, built by inserting the SAME
@@ -950,7 +909,7 @@ mod tests {
     /// change no existing W=1 test happens to construct a batch that would
     /// catch by accident.
     ///
-    /// RED-PROOF: reverting to the unconditional-insert shape (`grads.insert`
+    /// Mutation: the unconditional-insert shape (`grads.insert`
     /// for every var regardless of `present_count`) makes `w_absent` gain an
     /// entry it must not have — this test's `assert!(grads.get(..).is_none())`
     /// catches it directly.
@@ -985,10 +944,10 @@ mod tests {
         );
     }
 
-    /// U4b (d)'s low-level oracle: a REAL two-rank `Local` gang exercising
+    /// The low-level presence oracle: a REAL two-rank `Local` gang exercising
     /// all three presence shapes at once — `w_shared` (present on both,
     /// summed), `w_only_rank0` (present on rank 0 alone — "a Var absent from
-    /// one rank's `GradStore`", DESIGN.md §6), and `w_absent_everywhere`
+    /// one rank's `GradStore`"), and `w_absent_everywhere`
     /// (present on NEITHER rank). After `canonical_reduce`, both ranks agree
     /// on `w_shared` (`1.0 + 2.0 = 3.0`) and on `w_only_rank0` (`5.0`, rank
     /// 1's zero contributing nothing) — proving the gang completes and
@@ -997,9 +956,9 @@ mod tests {
     /// entry for a var neither rank's loss touched (the presence-set fix:
     /// AdamW must skip it entirely, not step it with a zero gradient).
     ///
-    /// RED-PROOF: swapping `all_reduce_sum` for a no-op (each rank keeping
+    /// Mutation: swapping `all_reduce_sum` for a no-op (each rank keeping
     /// its own local value) makes `w_shared`'s two ranks disagree (1.0 vs
-    /// 2.0, never 3.0); reverting to the unconditional-insert shape makes
+    /// 2.0, never 3.0); the unconditional-insert shape makes
     /// `w_absent_everywhere` gain a materialized entry on both ranks.
     #[test]
     fn canonical_reduce_sums_a_real_gang_and_restores_absence_where_no_rank_had_it() {
@@ -1194,7 +1153,7 @@ mod tests {
         let expected: Vec<f32> = before.iter().map(|x| x * host_coef).collect();
         let after: Vec<f32> = grads.get(w.as_tensor()).unwrap().to_vec1().unwrap();
 
-        // Tolerance: the device path now computes the coefficient with the
+        // Tolerance: the device path computes the coefficient with the
         // SAME rounding count as this host reference — one `f32` add (the
         // `+ 1e-6`), one `f32` division — but the two are still independent
         // implementations of that sequence (candle's `Affine`/`Div` kernels
@@ -1327,8 +1286,8 @@ mod tests {
     /// against the host reference `max_norm / (sqrt(Σ_i Σ g_i²) + 1e-6)` and
     /// every gradient `g_i * coef`, within the bound derived above.
     ///
-    /// Mutation tried: `+` → `*` in the fold over per-`Var` squared sums
-    /// (`&acc + &sq` → `&acc * &sq`) — RED (`total_sq` becomes `2160`, the
+    /// Mutation: `+` → `*` in the fold over per-`Var` squared sums
+    /// (`&acc + &sq` → `&acc * &sq`) — fails (`total_sq` becomes `2160`, the
     /// coefficient a factor `sqrt(30)` too small). A single-`Var` fixture
     /// cannot see that mutant: the fold is never entered with a `Some(acc)`.
     #[test]
@@ -1378,8 +1337,7 @@ mod tests {
         (total_norm, after)
     }
 
-    /// The "drop-in" acceptance leg (esc-182 finding item 2 / phase-6
-    /// tautology close-out): [`clip_gradients`]'s device-side tensor-op path
+    /// The "drop-in" leg: [`clip_gradients`]'s device-side tensor-op path
     /// against [`host_clip_gradients_f32`]'s independent host-scalar replica
     /// of the IDENTICAL formula, over the SAME four-Var exact-integer
     /// fixture [`assert_multi_var_clip_matches_host`] uses — `total_norm`
@@ -1394,9 +1352,9 @@ mod tests {
     /// would not be at production element counts, where CPU's and CUDA's
     /// reduction orders are mathematically but not bitwise equivalent).
     ///
-    /// Mutation tried: `+` → `*` in the fold over per-`Var` squared sums
+    /// Mutation: `+` → `*` in the fold over per-`Var` squared sums
     /// (the same mutant `multi_var_clip_matches_host_reference_on_cpu`
-    /// guards) — RED: the host replica (never touched by the mutant) still
+    /// guards) — fails: the host replica (never touched by the mutant) still
     /// reports `total_sq == 72.0`, while the mutated device path reports
     /// `2160`, and `sqrt(2160) != sqrt(72)` is very much not bit-identical.
     #[test]
@@ -1445,19 +1403,17 @@ mod tests {
     /// test in this file only ever sees F32 gradients, so neither `else` arm
     /// (the actual conversions) is otherwise entered.
     ///
-    /// This test found a REAL bug, not just a mutant-shaped one: before this
-    /// fix, the rescale loop multiplied the gradient's ORIGINAL dtype
-    /// against `coef` (always `F32`, folded from the upconverted squared
-    /// sums) with no matching upconvert of its own — candle's
-    /// `broadcast_mul` refuses mismatched dtypes, so `clip_gradients` errored
-    /// on every call where any trainable `Var`'s gradient was not already
-    /// `F32`, unconditionally, clipping disabled or not test coverage aside.
+    /// Without the rescale loop's own upconvert, it would multiply the
+    /// gradient's ORIGINAL dtype against `coef` (always `F32`, folded from the
+    /// upconverted squared sums) — candle's `broadcast_mul` refuses mismatched
+    /// dtypes, so `clip_gradients` would error on every call where any
+    /// trainable `Var`'s gradient is not already `F32`.
     ///
-    /// Mutation tried: `replace == with !=` on the squared-sum loop's
+    /// Mutation: `replace == with !=` on the squared-sum loop's
     /// `g.dtype() == DType::F32` — the mutant keeps a non-F32 gradient's
     /// dtype through `.sqr()`/`.sum_all()` (BF16 arithmetic) instead of
     /// upconverting it, and routes an already-F32 gradient through a
-    /// redundant (no-op, invisible) `to_dtype` instead. RED here: the
+    /// redundant (no-op, invisible) `to_dtype` instead. It fails here: the
     /// untouched-dtype BF16 squared-sum and the second `Var`'s F32 squared-sum
     /// land in the SAME `Option<Tensor>` fold, and candle's `+` refuses
     /// mismatched dtypes — the fold itself errors, so this test's `.unwrap()`
@@ -1673,8 +1629,7 @@ mod tests {
         );
     }
 
-    /// The CUDA leg of the same structural-proxy claim (esc-182 finding item
-    /// 3 / phase-6 tautology close-out): `SYNC_READ_COUNT` is the only way a
+    /// The CUDA leg of the same structural-proxy claim: `SYNC_READ_COUNT` is the only way a
     /// test can observe "no device→host read happened" on ANY backend — there
     /// is no CUDA stream a `#[test]` can inspect directly — so this counts
     /// `to_scalar`/`to_vec` calls through the exact SAME structural proxy
@@ -1777,19 +1732,15 @@ mod tests {
 
     /// `clip_and_step` must WARN (a `tracing::warn!` — a COUNTED FACT, not a
     /// hard refusal, see `clip_and_step`'s own doc for why a hard `Err` here
-    /// broke every legitimate loss that does not route through every
-    /// trainable `Var` for a given batch) when `trainable_vars` is
-    /// NON-EMPTY but not one of them has a gradient present — the
-    /// AMBIGUOUS `ClipOutcome::NoGradients` case (phase-6 class-census
-    /// addition #2, ledger row 215; and the round-2 pivot on the SAME
-    /// finding once `ft_correctness_sweep.rs`/`ft_determinism.rs`/
-    /// `encoder_adapters.rs` proved a hard refusal there is not viable).
-    /// Before `ClipOutcome` existed, `clip_gradients` returned the SAME
-    /// `None` for this case as it did for `max_grad_norm <= 0.0`, so
-    /// `clip_and_step` silently skipped BOTH the clip AND the non-finite
-    /// check with NO trace of it anywhere — indistinguishable from an
-    /// intentional "clipping is off" configuration AND unobservable. The
-    /// step must still SUCCEED (an `AdamW` step over an empty `GradStore`
+    /// would break every legitimate loss that does not route through every
+    /// trainable `Var` for a given batch; `ft_correctness_sweep.rs`,
+    /// `ft_determinism.rs` and `encoder_adapters.rs` exercise that shape) when
+    /// `trainable_vars` is NON-EMPTY but not one of them has a gradient
+    /// present — the AMBIGUOUS `ClipOutcome::NoGradients` case. Folding this
+    /// case into `Disabled` would make it indistinguishable from an
+    /// intentional "clipping is off" configuration AND unobservable, with the
+    /// clip and the non-finite check silently skipped. The step must still
+    /// SUCCEED (an `AdamW` step over an empty `GradStore`
     /// is a harmless no-op) — this is a warning, not a failure. Off-cadence
     /// OR on-cadence: the warning is not gated by the norm-check cadence at
     /// all (there is no norm tensor to even read back).
@@ -1844,9 +1795,8 @@ mod tests {
 
     /// The counterpart: an EMPTY `trainable_vars` is the UNAMBIGUOUSLY
     /// benign reading of `NoGradients` (nothing was ever asked to be
-    /// clipped) and `clip_and_step` must not even warn about it — matching
-    /// the pre-esc-182 behavior for this one case (an eval-only /
-    /// all-adapters-frozen-by-design call site).
+    /// clipped) and `clip_and_step` must not even warn about it (an
+    /// eval-only / all-adapters-frozen-by-design call site).
     #[test]
     fn clip_and_step_tolerates_no_gradients_with_empty_trainable_vars() {
         let dev = Device::Cpu;
@@ -1860,7 +1810,7 @@ mod tests {
     /// Why `step == 1` is its own arm: with the modulo cadence alone
     /// (`check_every_n_steps > 0 && step.is_multiple_of(check_every_n_steps)`
     /// as the WHOLE gate), `step == 1` against `check_every_n_steps == 50` is
-    /// never checked. Mutation tried: delete the `step == 1 ||` disjunct from
+    /// never checked. Mutation: delete the `step == 1 ||` disjunct from
     /// `clip_and_step`'s `on_cadence` — this test goes red (an `Ok` where it
     /// expects `Err`).
     #[test]
@@ -1885,7 +1835,7 @@ mod tests {
     /// `check_every_n_steps` steps end to end (e.g. 12 steps against the
     /// default interval of 50) never hits a multiple of the interval and, on
     /// the modulo cadence alone, would train an entire run — including a NaN
-    /// on its very last step — without ever calling `refuse_nonfinite_norm`. Mutation tried: delete the `|| is_last_step`
+    /// on its very last step — without ever calling `refuse_nonfinite_norm`. Mutation: delete the `|| is_last_step`
     /// disjunct — this test goes red.
     #[test]
     #[serial(grad_clip_sync_read_count)]
@@ -1946,12 +1896,11 @@ mod tests {
         assert_eq!(before_vals, after);
     }
 
-    /// The NEW half of the ClipOutcome split (phase-6 class-census addition
-    /// #2, ledger row 215): a NON-EMPTY `trainable_vars` where NOT ONE `Var`
-    /// has a gradient present in `grads` must come back `NoGradients`, never
-    /// silently collapsed into the SAME `None` `Disabled` produces — that
-    /// collapse is exactly what let a detached-graph / all-frozen-adapter
-    /// bug hide behind an "operator turned clipping off" reading.
+    /// The `NoGradients` half of the `ClipOutcome` split: a NON-EMPTY
+    /// `trainable_vars` where NOT ONE `Var` has a gradient present in `grads`
+    /// must come back `NoGradients`, never collapsed into `Disabled` — that
+    /// collapse would hide a detached-graph / all-frozen-adapter bug behind
+    /// an "operator turned clipping off" reading.
     #[test]
     fn no_gradient_present_is_distinct_from_disabled() {
         let dev = Device::Cpu;
@@ -1975,13 +1924,13 @@ mod tests {
     }
 
     /// The non-finite `max_norm` cell, NaN: `max_norm.is_nan()` makes
-    /// `max_norm <= 0.0` `false` (family F: a NaN comparison is always
+    /// `max_norm <= 0.0` `false` (a NaN comparison is always
     /// false, in EITHER direction), so a NaN `max_norm` would fall through
     /// the disable-clipping guard and into the clip computation — silently
     /// scaling every gradient by a NaN coefficient forever, invisible to
     /// [`refuse_nonfinite_norm`] because `total_norm` (what that function
     /// checks) is computed from the GRADIENTS, not from `max_norm`, and stays
-    /// finite throughout. Mutation tried: delete the `!max_norm.is_finite()`
+    /// finite throughout. Mutation: delete the `!max_norm.is_finite()`
     /// guard — this test goes red (`Ok` instead of the expected `Err`, and
     /// the returned gradient is silently all-NaN).
     #[test]
@@ -2002,7 +1951,7 @@ mod tests {
     /// arithmetic happens to clamp back to a merely-wasteful `coef == 1.0`
     /// rather than corrupting every gradient, but it is still a non-finite
     /// tuning parameter this abstraction's contract should never silently
-    /// accept). Mutation tried: same as above — this test goes red.
+    /// accept). Mutation: same as above — this test goes red.
     #[test]
     fn clip_gradients_refuses_infinite_max_norm() {
         let (w, mut grads, _g_before) = one_var_with_grad(2.0, 4);
@@ -2017,23 +1966,22 @@ mod tests {
         assert!(err_neg.contains("finite"), "got: {err_neg}");
     }
 
-    /// The near-zero-`total_norm` formula discriminator (RED control —
-    /// acceptance criterion 3: "the old conditional/no-eps formula fails").
-    /// A small, DETERMINISTIC (no RNG, no production-scale apparatus)
-    /// fixture whose `total_norm` sits at the `~1e-9` scale — deep enough
+    /// The near-zero-`total_norm` formula discriminator: a conditional,
+    /// no-epsilon clip formula must fail here. A small, DETERMINISTIC (no RNG,
+    /// no production-scale apparatus) fixture whose `total_norm` sits at the `~1e-9` scale — deep enough
     /// below torch's `1e-6` epsilon that the epsilon term DOMINATES the
-    /// denominator, the exact regime where the pre-PR conditional,
+    /// denominator, the exact regime where a conditional,
     /// no-epsilon formula (`clip_coef = max_norm / total_norm`, applied only
     /// `if total_norm > max_norm`) and torch's own formula (`clip_coef =
     /// max_norm / (total_norm + 1e-6)`, applied unconditionally) diverge by
     /// ORDERS OF MAGNITUDE rather than a few ulp — no probabilistic bound
     /// needed to see it. `max_norm` is set to a FIXED FRACTION of
-    /// `total_norm` (`0.5 * total_norm`), so the OLD formula's coefficient
-    /// is EXACTLY `0.5` by construction, independent of scale (`max_norm /
-    /// total_norm` cancels the common factor); the NEW formula's
+    /// `total_norm` (`0.5 * total_norm`), so the no-epsilon formula's
+    /// coefficient is EXACTLY `0.5` by construction, independent of scale
+    /// (`max_norm / total_norm` cancels the common factor); torch's
     /// coefficient instead collapses toward `total_norm / 1e-6` as
-    /// `total_norm -> 0` — a scale-DEPENDENT divergence the old formula
-    /// cannot see at all.
+    /// `total_norm -> 0` — a scale-DEPENDENT divergence the no-epsilon
+    /// formula cannot see at all.
     #[test]
     fn old_no_epsilon_formula_diverges_from_device_at_near_zero_norm() {
         let (w, mut grads, _g_before) = one_var_with_grad(1e-9, 4);
@@ -2042,7 +1990,7 @@ mod tests {
         let total_norm_host = 1e-9f64 * 4.0f64.sqrt();
         let max_norm = total_norm_host * 0.5; // deep active regime, not boundary-adjacent
 
-        let old_coef = max_norm / total_norm_host; // pre-PR: no epsilon
+        let old_coef = max_norm / total_norm_host; // conditional, no epsilon
         assert!(
             (old_coef - 0.5).abs() < 1e-9,
             "test setup: old_coef must be exactly 0.5 by this fixture's construction, got \
@@ -2053,15 +2001,15 @@ mod tests {
         let relative_diff = (old_coef - new_coef).abs() / old_coef;
         assert!(
             relative_diff > 0.9,
-            "RED control did not fire: the old no-epsilon formula ({old_coef}) should diverge \
+            "control did not fire: the no-epsilon formula ({old_coef}) should diverge \
              from torch's own formula ({new_coef}) by more than 90% at this near-zero \
              total_norm ({total_norm_host}), got only {relative_diff:.3e} relative difference — \
              the fixture's total_norm needs to be smaller relative to the 1e-6 epsilon"
         );
 
-        // The DEVICE path under test must match the NEW formula, not the
-        // OLD one — assert every clipped element lands closer to the
-        // new-formula prediction than to the old-formula one.
+        // The DEVICE path under test must match torch's formula, not the
+        // no-epsilon one — assert every clipped element lands closer to the
+        // torch-formula prediction than to the no-epsilon one.
         let total_norm = clip_gradients(std::slice::from_ref(&w), &mut grads, max_norm)
             .unwrap()
             .unwrap_clipped();
@@ -2079,16 +2027,17 @@ mod tests {
             let dist_to_old = (*a as f64 - expected_old as f64).abs();
             assert!(
                 dist_to_new < dist_to_old,
-                "device-clipped gradient {a} must land closer to the NEW (torch) formula's \
-                 value {expected_new} than to the OLD (pre-PR, no-epsilon) formula's value \
+                "device-clipped gradient {a} must land closer to the torch formula's \
+                 value {expected_new} than to the conditional no-epsilon formula's value \
                  {expected_old} — the code under test must match torch at this near-zero \
-                 total_norm, not the pre-PR formula it replaced"
+                 total_norm"
             );
         }
     }
 
-    /// The rounding-COUNT fix ([`clip_gradients`]'s doc: `max_norm_t.div(&denom)`
-    /// replacing an earlier `recip().affine(max_norm, 0.0)`) is INVISIBLE at
+    /// The rounding COUNT of the coefficient ([`clip_gradients`]'s doc: one
+    /// `max_norm_t.div(&denom)`, not `recip().affine(max_norm, 0.0)`) is
+    /// INVISIBLE at
     /// `max_norm == 1.0` — the shipped default (`jammi_wire::fine_tune::
     /// FineTuneConfig::default().max_grad_norm`) — because `x * 1.0` is an
     /// exact no-op in `f32`: `recip(d) * 1.0 == recip(d) == 1.0 / d ==
@@ -2098,13 +2047,13 @@ mod tests {
     /// identical_to_no_clip`, `clipping_batch_matches_host_reference_within_
     /// f32_ulps`, `multi_var_clip_matches_host_reference_on_cpu`,
     /// `clip_gradients_device_and_host_agree_bit_identically_on_cpu`) passes
-    /// UNCHANGED before and after the fix — none of them can be cited as
-    /// evidence the rounding-count fix does anything. This fixture picks a
+    /// under EITHER op sequence — none of them can be cited as evidence the
+    /// single division matters. This fixture picks a
     /// `max_norm != 1.0` (`7.5`) and a `total_norm` (found by an offline
     /// search, `1799.50146484375`, chosen so `sqr` + `sum_all` + `sqrt`
     /// round-trips to itself exactly — no per-element rounding to reason
-    /// through) where the OLD `recip`-then-`affine` sequence and the NEW
-    /// single `div` genuinely disagree: the coefficient differs by exactly 1
+    /// through) where the `recip`-then-`affine` sequence and the single
+    /// `div` genuinely disagree: the coefficient differs by exactly 1
     /// ULP (`0x3af8894e` vs `0x3af8894d`), and — unlike most such 1-ULP
     /// coefficient differences, which the final `broadcast_mul`'s own
     /// rounding absorbs — this one SURVIVES into the clipped gradient itself
@@ -2112,9 +2061,9 @@ mod tests {
     /// `0x40efffff`). Pinned to exact bits, not a tolerance: this is
     /// deterministic `f32` arithmetic with no data-dependent rounding.
     ///
-    /// Mutation tried: revert `clip_gradients`'s `div` back to `recip()` +
-    /// `affine(max_norm, 0.0)` — RED (the device path lands on the OLD
-    /// bits, not the NEW ones this test pins).
+    /// Mutation: replace `clip_gradients`'s `div` with `recip()` +
+    /// `affine(max_norm, 0.0)` — this test fails (the device path lands on
+    /// the recip-then-multiply bits, not the single-division ones it pins).
     #[test]
     fn rounding_count_fix_changes_the_result_only_when_max_norm_is_not_one() {
         let grad_value = 1_799.501_5_f32; // == 1799.50146484375 exactly (see doc)
@@ -2140,7 +2089,8 @@ mod tests {
             old_coef.to_bits(),
             new_coef.to_bits(),
             "test setup: at max_norm = 7.5 (!= 1.0) the two op sequences must disagree by \
-             construction — old {old_coef} (bits {:#010x}) vs new {new_coef} (bits {:#010x})",
+             construction — recip-then-multiply {old_coef} (bits {:#010x}) vs single-division \
+             {new_coef} (bits {:#010x})",
             old_coef.to_bits(),
             new_coef.to_bits()
         );
@@ -2155,7 +2105,8 @@ mod tests {
             expected_old.to_bits(),
             expected_new.to_bits(),
             "test setup: the 1-ULP coefficient difference must survive the final multiply \
-             here — old {expected_old} (bits {:#010x}) vs new {expected_new} (bits {:#010x})",
+             here — recip-then-multiply {expected_old} (bits {:#010x}) vs single-division \
+             {expected_new} (bits {:#010x})",
             expected_old.to_bits(),
             expected_new.to_bits()
         );
@@ -2165,9 +2116,9 @@ mod tests {
         assert_eq!(
             after[0].to_bits(),
             expected_new.to_bits(),
-            "clip_gradients must match the NEW (single-division, torch-rounding-count) \
+            "clip_gradients must match the single-division (torch-rounding-count) \
              formula's exact bits {expected_new} (bits {:#010x}), got {} (bits {:#010x}) — the \
-             OLD (recip-then-multiply) formula would have given {expected_old} (bits \
+             recip-then-multiply formula would give {expected_old} (bits \
              {:#010x})",
             expected_new.to_bits(),
             after[0],

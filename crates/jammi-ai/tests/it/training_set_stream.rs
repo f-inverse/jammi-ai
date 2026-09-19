@@ -114,8 +114,8 @@ async fn p1_the_loader_derived_state_plans_with_no_sort_and_no_merge() {
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
     let fixture = common::multi_row_group_pairs(&session, dir.path(), true).await;
 
-    // The SHIPPED derivation: `single_partition_context`
-    // (`crates/jammi-db/src/session.rs:1180`) edits `target_partitions` on a plain
+    // The SHIPPED derivation: `jammi_db::session`'s `single_partition_context`
+    // edits `target_partitions` on a plain
     // `ctx.state()` clone in place — never
     // `SessionStateBuilder::new_from_existing(..).with_config(..)`, whose `build()`
     // re-creates the default catalog whenever the resulting config still carries

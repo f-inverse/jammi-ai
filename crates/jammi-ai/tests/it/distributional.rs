@@ -1,4 +1,4 @@
-//! Distributional inference (S18): the regression decoder verified end to end.
+//! Distributional inference: the regression decoder verified end to end.
 //!
 //! The serving contracts live here against the public surface:
 //! - `ModelTask::Regression` is a real `ModelTask::ALL` participant that
@@ -8,7 +8,7 @@
 //!   crossings even when the raw backend output crosses;
 //! - the `uncertainty` evidence channel registers and merges through the real
 //!   catalog substrate (the conformal-sibling pattern, no migration);
-//! - the **R2 calibration gate**: a calibrated heteroscedastic predictive
+//! - the **calibration gate**: a calibrated heteroscedastic predictive
 //!   Gaussian, served through the adapter's σ_y-scaled serve path
 //!   (`gaussian_scaled`, the post-softplus σ_y de-standardise a z-space-trained
 //!   head needs), has realised coverage ≈ nominal and a strictly lower proper
@@ -170,7 +170,7 @@ async fn uncertainty_channel_registers_and_merges_through_the_catalog() {
     let uncertainty = ChannelId::new("uncertainty").unwrap();
 
     let batch = source_batch(2);
-    // One Gaussian row (with S16 context provenance) and one quantile row.
+    // One Gaussian row (with context-set provenance) and one quantile row.
     let contrib = contribution(&[
         UncertaintyOutput::Gaussian {
             mean: 0.7,
@@ -211,12 +211,12 @@ async fn uncertainty_channel_registers_and_merges_through_the_catalog() {
     }
 }
 
-// ─── R2 calibration gate: calibrated, not merely accurate ─────────────────────
+// ─── Calibration gate: calibrated, not merely accurate ────────────────────────
 
-/// The mandatory R2 calibration gate. A *calibrated* heteroscedastic predictive
+/// The mandatory calibration gate. A *calibrated* heteroscedastic predictive
 /// Gaussian — drawn so each observation comes from the very `Normal(μ, σ)` the
-/// head predicts — is served through the adapter, then scored with R2's P2
-/// calibration primitives. Two contracts:
+/// head predicts — is served through the adapter, then scored with
+/// `jammi_numerics::calibration`'s primitives. Two contracts:
 ///
 /// 1. **Coverage ≈ nominal.** The central 90% interval `μ ± 1.645σ` covers
 ///    ≈90% of observations. A head that is accurate-but-overconfident (σ too
@@ -276,7 +276,7 @@ fn r2_calibration_gate_coverage_and_proper_score() {
     let served_means: Vec<f64> = (0..n).map(|i| served_mean.value(i) as f64).collect();
     let served_stds: Vec<f64> = (0..n).map(|i| served_std.value(i) as f64).collect();
 
-    // ── Contract 1: central-90% coverage ≈ nominal via P2's interval_coverage.
+    // ── Contract 1: central-90% coverage ≈ nominal via interval_coverage.
     let z90 = 1.6448536269514722; // Φ⁻¹(0.95)
     let lower: Vec<f64> = served_means
         .iter()

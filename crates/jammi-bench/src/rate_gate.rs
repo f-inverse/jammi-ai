@@ -124,7 +124,7 @@ mod tests {
     }
 
     /// A rate that fell more than the threshold below the baseline fails — the
-    /// gate has teeth (RC1: an assertion must be able to fail).
+    /// gate has teeth (an assertion must be able to fail).
     #[test]
     fn below_floor_fails() {
         let g = RateGate::evaluate(69.9, 100.0, 0.30);

@@ -984,8 +984,8 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
     // Config slot: the resolver's OWN
     // `config.json` / `open_clip_config.json` preference chain
     // (`try_catalog_lookup`, `resolve_local`, `resolve_hf_hub` — every path
-    // checks `config.json` first, `open_clip_config.json` second;
-    // resolver.rs:135-137/223-225/327). `resolved.config_path` names
+    // checks `config.json` first, `open_clip_config.json` second).
+    // `resolved.config_path` names
     // whichever arm was actually selected for THIS load; the OTHER arm is
     // still a tracked candidate so its appearance is detectable and a cold
     // resolve preferring it is never silently masked. Required unless an
@@ -1035,8 +1035,8 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
     });
 
     // The tokenizer slot: NOT required — every resolver path (`discover_local_tokenizer`
-    // locally, resolver.rs:504-514; the HF Hub `tokenizer.json` /
-    // `bpe_simple_vocab_16e6.txt.gz` fallback chain remotely, resolver.rs:379-387)
+    // locally; `resolve_hf_hub`'s `tokenizer.json` /
+    // `bpe_simple_vocab_16e6.txt.gz` fallback chain remotely)
     // already re-derives `tokenizer: None` when NEITHER file is present
     // instead of erroring, and `CandleBackend::load`'s `.transpose()?` over
     // that `Option` accepts `None`: the reload succeeds with
@@ -1087,10 +1087,9 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
 
     // Weights ALTERNATES slot: the resolver's OWN `model.safetensors` /
     // `open_clip_model.safetensors` / `model.onnx` preference chain
-    // (`try_catalog_lookup`, resolver.rs:160-162; `resolve_local`'s
-    // `has_onnx`/`has_safetensors` backend auto-selection,
-    // resolver.rs:240/251-255/261-263/273-274; `download_safetensors`'s two
-    // single-name tries, resolver.rs:426-431). Every known filename is a
+    // (`try_catalog_lookup`; `resolve_local`'s
+    // `has_onnx`/`has_safetensors` backend auto-selection;
+    // `download_safetensors`'s two single-name tries). Every known filename is a
     // tracked arm regardless of which one THIS load actually selected —
     // `model.onnx` APPEARING next to a currently-loaded `model.safetensors`
     // is exactly the case that flips the backend a cold resolve would choose
@@ -1102,11 +1101,11 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
     // below, for why a shard cannot be an arm here).
     //
     // **Primary-file edge**: `download_safetensors` returns as
-    // soon as EITHER single-name `repo.get` succeeds (resolver.rs:426-431),
+    // soon as EITHER single-name `repo.get` succeeds,
     // WITHOUT ever enumerating shards — so whenever `resolved.weights_paths`
     // has a single entry matching one of the three names below, that is the
     // gated arm of THIS slot. The shard-enumeration
-    // branch (resolver.rs:432-442) is reached only once BOTH single-name
+    // branch is reached only once BOTH single-name
     // tries fail, and HF's sharded convention names shards
     // `model-NNNNN-of-MMMMM.safetensors` — never literally `model.safetensors`
     // — so in that state `resolved.weights_paths` names NO known primary at
@@ -1121,16 +1120,16 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
     // `DigestSlot`/`probe` decide arm (b) "stale, a cold resolve would
     // succeed via the alternate" purely from which named files exist on
     // disk — they never see the `backend_hint` the ORIGINAL `get_or_load`
-    // call was made with. `resolve_local` (resolver.rs:251-270), when
+    // call was made with. `resolve_local`, when
     // `backend_hint == Some(Candle)`, pins `backend` to `Candle`
     // UNCONDITIONALLY and never falls back to `model.onnx` even if it
-    // exists (`resolve_local`'s ORT auto-pick, resolver.rs:251-255, applies
+    // exists (`resolve_local`'s ORT auto-pick applies
     // ONLY when `backend_hint` is `None`) — so `model.safetensors` deleted
     // while an ungated `model.onnx` sits alongside it, under a Candle-pinned
     // load, is a case where THIS slot still reports arm (b) `Ok(false)`
     // stale (an arm — `model.onnx` — is present now), even though a cold
     // `resolve_local` call carrying that SAME `backend_hint` would hit the
-    // typed refusal at resolver.rs:266-270 ("No safetensors weights found
+    // `resolve_local`'s typed refusal ("No safetensors weights found
     // for Candle backend"), not succeed via a different backend. The probe
     // therefore does not itself refuse here, contrary to arm (c)'s contract
     // doc above ("no arm can satisfy a cold resolve" -> `Err`) — this is
@@ -1182,12 +1181,12 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
     });
 
     // Per-shard weights slots: a sharded HF download
-    // (`download_safetensors`'s shard fallback, resolver.rs:432-442) names
+    // (`download_safetensors`'s shard fallback) names
     // files OUTSIDE the fixed three-name set entirely, and — unlike the
     // three named arms above, which are mutually substitutable — every
     // shard is CONJUNCTIVELY required: `VarBuilder::from_mmaped_safetensors`
-    // (candle.rs:2382) needs ALL of them, and a cold resolve always
-    // re-fetches the SAME shard set (resolver.rs:432-442 collects every
+    // (in `CandleBackend::load`) needs ALL of them, and a cold resolve always
+    // re-fetches the SAME shard set (`download_safetensors` collects every
     // `.safetensors` sibling deterministically), so any ONE shard's own
     // loss makes a cold resolve fail regardless of the other shards' — or
     // the three named arms' — state. Folding a shard into the alternates
@@ -1478,8 +1477,8 @@ impl ModelFingerprint {
     /// `backend_hint` would make a cold resolve reject that surviving arm
     /// anyway (e.g. `model.safetensors` deleted while an ungated
     /// `model.onnx` survives, under a Candle-pinned `backend_hint`:
-    /// `resolve_local` never auto-falls-back to ORT when the hint is `Some`,
-    /// resolver.rs:251-270). Such a load reports arm (b) `Ok(false)` here
+    /// `resolve_local` never auto-falls-back to ORT when the hint is `Some`).
+    /// Such a load reports arm (b) `Ok(false)` here
     /// even though a cold resolve carrying that SAME hint would in fact hit
     /// arm (c)'s typed refusal. This is NOT a silent wrong answer:
     /// `ModelCache::get_or_load` evicts on `Ok(false)` and immediately
@@ -1652,7 +1651,7 @@ fn compute_model_fingerprint(resolved: &ResolvedModel) -> Result<ModelFingerprin
 /// Compute BOTH per-load staleness facets — [`ModelFingerprint`] (stat) and
 /// [`ModelContentDigest`] (hash) — in the ONLY safe order: fingerprint
 /// FIRST, digest SECOND. This is the sole caller of either function; every
-/// other call site (the `digest_fingerprint_audit62_tests` / `content_digest`
+/// other call site (the `digest_fingerprint_tests` / `content_digest`
 /// unit tests below) calls the two directly and independently, which is
 /// exactly what makes those tests order-agnostic — production code must
 /// route through here.
@@ -3718,10 +3717,8 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
 /// (`ctor` is a plain constructor call, not a critical section), so
 /// unwinding out of it leaves nothing poisoned to clean up — unlike
 /// catching a panic across a held mutex guard or a half-mutated `static`.
-/// Mirrors the test-side mechanism in
-/// `crates/jammi-kernels/tests/metal_parity.rs`'s `metal_device_or_skip`
-/// (added at 29e8b569), which found this exact panic on a real `macos-14`
-/// runner.
+/// The test-side acquisition, `jammi_test_resources::metal_device`, catches
+/// the same panic the same way.
 ///
 /// `ctor` need not be `UnwindSafe` itself — `Device::new_cuda` /
 /// `Device::new_metal` capture nothing and trivially are, but requiring the
@@ -4137,16 +4134,11 @@ mod device_tests {
     /// same [`acquire_accelerator_device`] seam production uses, instead of
     /// depending on the host actually lacking a GPU.
     ///
-    /// Before this seam existed, `require_gpu_without_device_fails_fast` and
-    /// `default_without_device_falls_back_to_cpu_with_warning` called
-    /// `select_device` directly and skipped on a CUDA-capable host (the
-    /// no-usable-GPU arm is unreachable there — selection correctly serves
-    /// the GPU). That skip only covered CUDA: on a real-Metal host (e.g.
-    /// this crate's own `--features metal,local` CI lane and any macOS dev
-    /// machine with a physical GPU) `select_device` likewise legitimately
-    /// acquires the real Metal device, and the old tests failed outright
-    /// ("expected CPU fallback, got Metal(..)") rather than skipping. Both
-    /// tests now inject `unavailable_ctor` through
+    /// Calling `select_device` directly cannot reach the no-usable-GPU arm on
+    /// a host with a real CUDA or Metal device (selection correctly serves the
+    /// GPU), so `require_gpu_without_device_fails_fast` and
+    /// `default_without_device_falls_back_to_cpu_with_warning` inject
+    /// `unavailable_ctor` through
     /// `acquire_accelerator_device` — the exact function `select_device`'s
     /// `cuda`/`metal` branches call — so they assert the SAME
     /// `None` → [`gpu_unavailable`] fallback logic `select_device` runs,
@@ -4660,7 +4652,7 @@ mod ner_nonfinite_logit_tests {
 /// the mechanism is correct and general rather than forcing an end-to-end
 /// scenario the production wiring does not permit.
 #[cfg(test)]
-mod digest_fingerprint_audit62_tests {
+mod digest_fingerprint_tests {
     use super::*;
     use std::collections::HashMap;
 
@@ -5387,8 +5379,8 @@ mod digest_fingerprint_audit62_tests {
     /// `compute_model_identity_facets` is the sole production call site
     /// (this file's only other callers of the two primitives are tests),
     /// its doc comment calls out the ordering invariant explicitly, and a
-    /// diff touching its two-line body is exactly the size a reviewer can
-    /// actually read and hold to that doc; and (2) BEHAVIORAL —
+    /// diff touching its two-line body is small enough to read and hold to
+    /// that doc; and (2) BEHAVIORAL —
     /// `stat_before_hash_converges_after_a_racing_mutation` (above) proves
     /// WHY stat-first is the safe order, using the two primitives called
     /// manually with a real racing mutation in between, even though it does
@@ -5675,7 +5667,7 @@ mod digest_fingerprint_audit62_tests {
     /// "primary-file edge" from `all_candidate_paths`' weights-alternates
     /// doc) PLUS `extra_shard_count` additional CONJUNCTIVELY-required
     /// shard-named files (`model-NNNNN-of-MMMMM.safetensors`, mirroring HF's
-    /// own sharded naming, resolver.rs:432-442) — every one of them present
+    /// own sharded naming, as `download_safetensors` collects them) — every one of them present
     /// in `weights_paths`, i.e. "all gated". Each shard's bytes are distinct
     /// (`marker` byte written first) so a per-shard mutation test can target
     /// exactly one shard unambiguously. Real `download_safetensors` never

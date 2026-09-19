@@ -41,15 +41,11 @@ fn dtype_tokens() -> Vec<String> {
 /// Set-EQUALITY between `ci/release-feature-manifest.json`'s capability
 /// categories and [`PROBED_OPS`] grouped by [`ProbedOpKind`] — the structural
 /// guard that stops the manifest and the probed-op table from drifting apart
-/// again (campaign #446 finding 2's root cause was five unsynced copies of
-/// this same fact; the manifest was a sixth).
+/// (the manifest is one more copy of the same fact the table states).
 ///
-/// Deliberately NOT gated on a GPU (`skip_without_gpu!` is absent): this is a
-/// pure data cross-check between a JSON file and a `const`, and gating it on
-/// hardware would make the one assertion that catches manifest drift run only
-/// on the pod. It still needs the `live-gpu-tests` feature to compile into
-/// this suite at all, so `cargo test -p jammi-ai --features live-gpu-tests
-/// --test gpu_capability` runs it anywhere.
+/// Deliberately NOT a GPU test: this is a pure data cross-check between a JSON
+/// file and a `const`, so it lives in the hermetic `it` suite and runs on
+/// every `cargo test -p jammi-ai`.
 ///
 /// TWO op categories exist, and they are read in the SHAPE each actually
 /// has — `fused_op_admission` as a string list, `internal_subkernels` as an
@@ -60,14 +56,12 @@ fn dtype_tokens() -> Vec<String> {
 /// `parent` is the only evidence it ran at all.
 ///
 /// The third assertion is a CLOSURE check over the whole `capabilities`
-/// object: no capability OTHER than those two may name an op. The manifest
-/// used to carry a compiled-only bucket — kernels proven by compiling, never
-/// by dispatching — which campaign #446 W2 emptied by DELETING its last
-/// member rather than wiring a site for it (census artifact
-/// `crates/jammi-kernels/artifacts/cuda-runs/2026-09-01-axpy-census-bdeb80c-a100-pcie.json`;
-/// this file's module doc quotes its numbers) and then removed. Checking only the two
-/// categories that remain would let an equivalent bucket reappear under any
-/// new name and go unnoticed here, which is exactly the drift this test
+/// object: no capability OTHER than those two may name an op. A compiled-only
+/// bucket — kernels proven by compiling, never by dispatching — carries no
+/// proof mechanism (census artifact
+/// `crates/jammi-kernels/artifacts/cuda-runs/2026-09-01-axpy-census-bdeb80c-a100-pcie.json`).
+/// Checking only the two named categories would let such a bucket appear
+/// under any new name and go unnoticed here, which is exactly the drift this test
 /// exists to catch — so the check is over the capability object's KEYS, not
 /// over a list of names this file already knows.
 ///
@@ -126,8 +120,7 @@ fn manifest_capability_categories_match_probed_ops_by_kind() {
 
     // NO OTHER OP-BEARING CATEGORY. The two assertions above pin the two
     // categories by NAME; on their own they say nothing about a THIRD one, so
-    // a proof-less bucket could reappear beside them (the manifest carried
-    // exactly such a bucket until campaign #446 W2 — see this test's doc).
+    // a proof-less bucket (see this test's doc) could appear beside them.
     // This check is therefore over the capability object's own keys: a
     // capability that is not one of [`MANIFEST_NAME_BEARING_CAPABILITIES`]
     // may not enumerate anything at all.
@@ -165,8 +158,7 @@ fn manifest_capability_categories_match_probed_ops_by_kind() {
          {MANIFEST_FLASH_DTYPES} may name dtypes. A kernel that compiles but dispatches \
          through nothing is not a capability this release surface may claim: wire a real \
          admit()/admit_cascade() site (plus its PROBED_OPS row), give it an admitted parent \
-         that launches it, or DELETE it — the disposition campaign #446 W2 took for the last \
-         member of the removed compiled-only bucket. If this key genuinely names no op, it \
+         that launches it, or DELETE it. If this key genuinely names no op, it \
          must be a scalar flag, or be added to MANIFEST_NAME_BEARING_CAPABILITIES with its \
          own content assertion the way {MANIFEST_FLASH_DTYPES} has one below."
     );

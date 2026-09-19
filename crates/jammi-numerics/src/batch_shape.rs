@@ -10,34 +10,30 @@
 //! `fine_tune::batch_bucket::pad_rows_to_bucket` — the tensor/row-padding
 //! half, which stays there since it is not candle-free-independent the same
 //! way: it mutates the caller's own `Vec<u32>` rows) and `jammi-encoders`
-//! (this crate's own `tests/esc076_comparable_eager_control.rs` D3 leg,
-//! which needs the IDENTICAL bucket decision to prove the fix bounds memory
-//! at the library seam, never re-deriving its own copy) need the SAME
-//! decision — `jammi-numerics` is the one crate both already depend on
-//! (`jammi-ai`/`jammi-encoders`'s own `Cargo.toml`) that is candle-free, so
-//! this is the natural, dependency-direction-respecting home: campaign #443
-//! W2c's own boundary doctrine forbids `jammi-encoders` depending "upstream"
-//! on `jammi-ai`, and `jammi-numerics` sits below both.
+//! (`crates/jammi-encoders/tests/esc076_comparable_eager_control.rs`'s
+//! bucketed leg, which needs the IDENTICAL bucket decision to prove bucketing bounds memory at the
+//! library seam, never re-deriving its own copy) need the SAME decision —
+//! `jammi-numerics` is the one candle-free crate both already depend on.
+//! `jammi-encoders` must not depend "upstream" on `jammi-ai`, and
+//! `jammi-numerics` sits below both.
 //!
-//! ## The mechanism this closes
+//! ## The mechanism this bounds
 //!
-//! `crates/jammi-encoders/tests/esc076_comparable_eager_control.rs`'s D3
-//! ATTRIBUTION (campaign #443 W2c) pins the root cause precisely: `cudarc`
-//! (and candle-core's own CUDA backend, which allocates through the same
-//! `CudaDevice::alloc`/`alloc_zeros` primitives) has NO caching allocator —
+//! `cudarc` (and candle-core's own CUDA backend, which allocates through the
+//! same `CudaDevice::alloc`/`alloc_zeros` primitives) has NO caching allocator —
 //! every tensor is a raw `cuMemAlloc`/`cuMemFree` pair. A raw, non-pooling
 //! allocator fed a training loop whose per-step tensor shapes are NOT drawn
 //! from a small, fixed set fragments/grows its reserved footprint with the
 //! COUNT of DISTINCT shapes it has ever been asked to satisfy, independent
-//! of dtype — the ledger's own "duplicated-batch legs plateau; variable-shape
-//! legs OOM" finding is exactly this. Neither `jammi-encoders`' own per-op
-//! eager fallbacks nor this crate can fix the allocator itself (extend-
-//! seams-not-upstream: no candle/cudarc patch); the D3 doc names the sound
-//! fix point as "the trainer's own batch-construction step (padding/
-//! bucketing sequence lengths to a small, fixed set of buckets)" — this
-//! function, consumed by `jammi-ai::fine_tune::batch_bucket` at
-//! `TrainingLoop::encode_texts`, and directly by `jammi-encoders`' own D3
-//! GPU oracle to prove the bound holds at the library seam too.
+//! of dtype: training legs with duplicated batches plateau, legs with
+//! variable shapes OOM (see that test file). Neither `jammi-encoders`' own
+//! per-op eager fallbacks nor this crate can fix the allocator itself (extend-
+//! seams-not-upstream: no candle/cudarc patch); the sound fix point is the
+//! trainer's own batch-construction step (padding/bucketing sequence lengths
+//! to a small, fixed set of buckets) — this function, consumed by
+//! `jammi-ai::fine_tune::batch_bucket` at `TrainingLoop::encode_texts`, and
+//! directly by `jammi-encoders`' GPU oracle to prove the bound holds at the
+//! library seam too.
 //!
 //! ## Design: power-of-two buckets, capped at `max_seq_length`
 //!
@@ -48,8 +44,7 @@
 //! `ceil(log2(max_seq_length / MIN_BUCKET_LEN)) + 1` buckets regardless of
 //! how many distinct natural lengths a run's texts produce (for
 //! `max_seq_length = 128`, `MIN_BUCKET_LEN = 8`: `{8, 16, 32, 64, 128}`, 5
-//! buckets total) — matching the ledger's own "duplicated batches (a
-//! SINGLE repeated shape) plateau" finding by generalizing "one shape" to "a
+//! buckets total) — generalizing "a SINGLE repeated shape plateaus" to "a
 //! handful of shapes", which is enough to bound the allocator's distinct-size
 //! count for any run length.
 //!
@@ -129,7 +124,7 @@ mod tests {
 
     #[test]
     fn bucket_seq_len_never_exceeds_max_seq_length() {
-        // esc-076's own reporter shape: max_seq_length = 128.
+        // A common reported shape: max_seq_length = 128.
         for natural in 0..=128 {
             let bucketed = bucket_seq_len(natural, 128);
             assert!(
@@ -147,7 +142,7 @@ mod tests {
     fn bucket_seq_len_the_full_ladder_for_esc076_reporter_max_seq_length() {
         // The exact bucket SET a `max_seq_length = 128` run ever presents to
         // the encoder, over every possible natural width — this is the
-        // "small, fixed set of buckets" the D3 attribution names as the fix:
+        // "small, fixed set of buckets" that bounds the allocator:
         // 5 distinct shapes, never 128.
         let mut seen = std::collections::BTreeSet::new();
         for natural in 1..=128 {

@@ -71,7 +71,7 @@ fn row_cosine_min(got: &Tensor, golden: &Tensor) -> candle_core::Result<f32> {
 /// identically to the variable being unset. The returned value is the
 /// TRIMMED string, not the raw one — a padded `HF_HOME` must not silently
 /// resolve to a current-working-directory-relative cache root the same way
-/// `jammi-ai`'s helper now guards against.
+/// `jammi-ai`'s helper guards against.
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()

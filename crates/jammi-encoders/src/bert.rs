@@ -174,7 +174,7 @@ impl BertSelfAttention {
     }
 
     /// Training's arm: routes through the shared
-    /// [`attention_cascade::training_attention_cascade`] (issue #462) —
+    /// [`attention_cascade::training_attention_cascade`] —
     /// `qkv = Tensor::cat(&[q, k, v], D::Minus1)` (the cat bridge, `[B, S,
     /// 3*hidden]`; see this module's doc for the forward-copy/backward-zero-fill
     /// cost this bridge carries on BOTH the fused and eager arms of the
@@ -184,9 +184,8 @@ impl BertSelfAttention {
     /// an all-padding row exactly, unlike ModernBERT's `Zeros` — see this
     /// module's doc), and `flash` always `Declined { CapabilityMiss,
     /// "flash_transport_not_wired" }` — BERT never wires the encoder-boundary
-    /// flash transport protocol (a separate line of work; the flash cascade
-    /// counter still fires, declined, on every training forward, never
-    /// silently).
+    /// flash transport protocol (the flash cascade counter still fires,
+    /// declined, on every training forward, never silently).
     fn forward_training(
         &self,
         hidden: &Tensor,
@@ -194,10 +193,8 @@ impl BertSelfAttention {
         fused: &FusedAttentionMasks,
         flash: &FlashDecision,
     ) -> Result<Tensor, EncoderError> {
-        // No `self.training` field to assert against (audit round item 6:
-        // a duplicated per-sub-struct training copy was deleted here) —
-        // this method is private and has exactly one call site
-        // (`BertAttention::forward_training`, itself only reachable from
+        // No `self.training` field to assert against — this method is private and has exactly one
+        // call site (`BertAttention::forward_training`, itself only reachable from
         // `Bert::forward_hidden`'s `self.training` branch), so a desync
         // between "this method runs" and "training is true" is
         // unrepresentable by construction rather than checked at runtime.
@@ -282,15 +279,15 @@ struct BertIntermediate {
 }
 
 impl BertIntermediate {
-    /// `training` is a PARAMETER, not a stored copy (audit round item 6):
+    /// `training` is a PARAMETER, not a stored copy:
     /// [`Bert::training`] is the single source of truth, threaded down
     /// through [`BertLayer::forward`]/[`BertLayer::forward_training`] to
     /// this call — a desync between what `Bert::forward_hidden` decided
     /// and what this method's `activations::gelu_erf` call receives is
     /// unrepresentable, since there is no second copy left to drift.
     /// `false` (eval) makes the `activations::gelu_erf` call byte-for-byte
-    /// identical to the plain `hidden.gelu_erf()` this method called before
-    /// the GELU seam existed — see `activations::gelu_erf`'s own doc.
+    /// identical to a plain `hidden.gelu_erf()` — see
+    /// `activations::gelu_erf`'s own doc.
     fn forward(&self, hidden: &Tensor, training: bool) -> Result<Tensor, EncoderError> {
         let hidden = self.dense.forward(hidden)?;
         activations::gelu_erf(&hidden, training)
@@ -323,9 +320,8 @@ impl BertLayer {
     }
 
     /// `training` is threaded down to [`BertIntermediate::forward`] as a
-    /// parameter (audit round item 6) — [`Bert::forward_hidden`] passes
-    /// its own `self.training` here, the single source, rather than each
-    /// sub-struct carrying an independently-set copy that could drift.
+    /// parameter — [`Bert::forward_hidden`] passes its own `self.training` here, the single source,
+    /// rather than each sub-struct carrying an independently-set copy that could drift.
     fn forward_training(
         &self,
         hidden: &Tensor,
@@ -548,11 +544,10 @@ impl Bert {
     }
 
     /// Switch every LoRA-wrapped linear and LayerNorm into / out of training
-    /// mode, and (issue #462) `self` itself — the ONE flag
-    /// [`Self::forward_hidden`] reads to pick its call chain and thread
-    /// `training` down to `BertIntermediate::forward` as a parameter
-    /// (audit round item 6: no sub-struct carries its own copy of this
-    /// flag any more, so there is nothing left to fall out of step with
+    /// mode, and `self` itself — the ONE flag [`Self::forward_hidden`] reads
+    /// to pick its call chain and thread `training` down to
+    /// `BertIntermediate::forward` as a parameter (no sub-struct carries its
+    /// own copy of this flag, so nothing can fall out of step with
     /// `self.training`). LoRA layers gate dropout; LayerNorms switch
     /// between the fused no-bwd eval kernel and the primitive-op
     /// composition whose backward is well-defined.
@@ -706,10 +701,10 @@ pub struct BertBuilder<'a> {
     lora: LoraBuildConfig<'a>,
     backbone_dtype: DType,
     adapter_file: Option<&'a Path>,
-    /// The wave-3 GGUF-quantized-weight construction seam — see
+    /// The GGUF-quantized-weight construction seam — see
     /// [`FrozenWeightLookup`]'s own module doc. `None` by default
-    /// ([`Bert::builder`]); every EXISTING call site that never calls
-    /// [`Self::weight_source`] gets byte-identical Dense-only behavior.
+    /// ([`Bert::builder`]); a builder that never calls
+    /// [`Self::weight_source`] loads dense weights only.
     weight_source: Option<&'a FrozenWeightLookup<'a>>,
 }
 
@@ -743,8 +738,8 @@ impl<'a> BertBuilder<'a> {
 
     /// Supply a per-tensor-name GGUF-quantized-weight override — see
     /// [`FrozenWeightLookup`]'s own module doc. Defaulted: a builder that
-    /// never calls this stays byte-identical to every prior release (Dense
-    /// weights, loaded from `weights_paths`, everywhere).
+    /// never calls this loads Dense weights from `weights_paths`
+    /// everywhere.
     pub fn weight_source(mut self, w: &'a FrozenWeightLookup<'a>) -> Self {
         self.weight_source = Some(w);
         self
@@ -819,7 +814,7 @@ impl<'a> BertBuilder<'a> {
                 layer_vb.pp("output.LayerNorm"),
             )?;
 
-            // The attention cascade's `rope_pack` placeholder (issue #462):
+            // The attention cascade's `rope_pack` placeholder:
             // `[2, 1, 1, 64]`, allocated once here, never read (BERT has no
             // RoPE — see `BertSelfAttention`'s own doc). `64` is
             // `ATTENTION_BLOCK_HEAD_DIM`-shaped by convention only; the
@@ -874,9 +869,9 @@ struct LoraSite<'a, 'b> {
     lora: &'a LoraBuildConfig<'a>,
     /// The trainable `VarMap` the seeded LoRA A/B tensors are registered into.
     varmap: &'a VarMap,
-    /// The wave-3 GGUF-quantized-weight construction seam — see
-    /// [`crate::FrozenWeightLookup`]'s own module doc. `None` at every
-    /// EXISTING call site (byte-identical to every prior release).
+    /// The GGUF-quantized-weight construction seam — see
+    /// [`crate::FrozenWeightLookup`]'s own module doc. `None` unless the
+    /// caller supplies a lookup (dense weights only).
     weight_source: Option<&'a FrozenWeightLookup<'a>>,
 }
 
@@ -986,8 +981,8 @@ mod tests {
         }
     }
 
-    /// The encoder-level tolerance oracle (contract R6'/R2', the crate's own
-    /// precedent — `crate::modernbert::tests::fused_training_attention_block_matches_eager_composition_within_tolerance_global`,
+    /// The encoder-level tolerance oracle (the crate's own precedent —
+    /// `crate::modernbert::tests::fused_training_attention_block_matches_eager_composition_within_tolerance_global`,
     /// tol `1e-4`): at head64, `BertSelfAttention::forward_training`'s fused
     /// arm (`AttentionBlockFused`, `FullyMaskedPolicy::Propagate`) must
     /// match the shared cascade's own eager composition
@@ -1061,7 +1056,7 @@ mod tests {
         );
     }
 
-    /// The all-padding-row case (contract R3'/R6'): one sequence entirely
+    /// The all-padding-row case: one sequence entirely
     /// masked. Under `Propagate`, the fused arm must reproduce the eager
     /// composition's own (finite, `MASKED_LOGIT`-convention) output on that
     /// row exactly like every other row — no `Zeros`-style third numeric
@@ -1071,18 +1066,13 @@ mod tests {
     ///
     /// The mask is built through [`crate::mask::extended_attention_mask`]
     /// (the PRODUCTION builder — `[1, 0]` u32 in, `[0.0, MASKED_LOGIT]`
-    /// f32 out) rather than a hand-rolled `affine`: an audit round found
-    /// this test previously constructed `affine(-10_000.0, 10_000.0)`,
-    /// which is `mask.rs`'s own convention (`affine(-MASKED_LOGIT,
-    /// MASKED_LOGIT)` = `affine(10_000.0, -10_000.0)`) SIGN-INVERTED —
-    /// padding became `+10_000` rather than `MASKED_LOGIT`
-    /// (`-10_000`), so the padding row's raw scores were BOOSTED, not
-    /// suppressed, `jammi_kernels::ops::softmax::row_is_fully_masked`
-    /// never fired, and a uniform positive additive constant is a
-    /// softmax no-op either way — the test asserted a real tolerance
-    /// bound while never actually reaching the fully-masked branch it
-    /// claimed to cover. The negative control below is exactly the proof
-    /// that this version does reach that branch.
+    /// f32 out) rather than a hand-rolled `affine`: a sign-inverted mask
+    /// (`+10_000` for padding) BOOSTS the padding row's scores instead of
+    /// suppressing them, `jammi_kernels::ops::softmax::row_is_fully_masked`
+    /// never fires, and a uniform positive additive constant is a softmax
+    /// no-op — the tolerance bound would pass without reaching the
+    /// fully-masked branch. The negative control below proves this test
+    /// does reach it.
     #[test]
     fn bert_head64_all_padding_row_propagate_fused_matches_eager_within_tolerance() {
         let _lock = crate::test_support::seam_counter_lock();
@@ -1149,8 +1139,8 @@ mod tests {
         // MUST differ from the `Propagate` eager reference computed
         // above on the SAME row. If the two policies produced the same
         // values here, this test would not actually be exercising
-        // `row_is_fully_masked` at all — exactly the failure mode the
-        // sign-inverted mask silently produced before this fix.
+        // `row_is_fully_masked` at all — the failure mode a sign-inverted
+        // mask produces.
         let masks_for_zeros = TrainingMaskInputs {
             extended: &extended,
             local_band: None,
@@ -1191,7 +1181,7 @@ mod tests {
             row_diff > 1e-3,
             "Zeros and Propagate must diverge on the fully-masked row (both computed through \
              the fused arm) -- a max|Δ|={row_diff} this small would mean the fully-masked \
-             branch was never actually reached, the same silent gap the inverted mask sign left"
+             branch was never actually reached (e.g. a sign-inverted mask)"
         );
     }
 
@@ -1199,7 +1189,7 @@ mod tests {
     /// non-zero after a fused-arm training forward+backward at head64 —
     /// the fused whole-attention-block op's own backward reaches every
     /// LoRA `A`/`B` tensor through the SAME `Wqkv`-projection chain the
-    /// eager composition would (contract R6' precedent:
+    /// eager composition would (the crate's precedent:
     /// `crate::modernbert::tests::fused_attention_block_matches_eager_lora_gradients_at_production_seq_on_head64`).
     #[test]
     fn bert_head64_fused_attention_lora_gradients_are_finite_and_nonzero() {
@@ -1290,8 +1280,8 @@ mod tests {
         }
     }
 
-    /// The real fused-vs-eager LoRA-gradient EQUALITY oracle (contract
-    /// fix-round item 2 — the crate's own precedent,
+    /// The real fused-vs-eager LoRA-gradient EQUALITY oracle (the crate's own
+    /// precedent,
     /// `crate::modernbert::tests::fused_attention_block_matches_eager_lora_gradients_at_production_seq_on_head64`,
     /// tol `1e-4`, mirrored exactly in shape here): both `query`'s and
     /// `value`'s LoRA `A`/`B` gradients from a fused-arm training
@@ -1445,7 +1435,7 @@ mod tests {
         }
     }
 
-    /// Strict mode on a refused domain (family K2): a `head_dim != 64`
+    /// Strict mode on a refused domain: a `head_dim != 64`
     /// shape is a `false` outcome from `attention_block_admission_predicate`
     /// — `BertSelfAttention::forward_training` reaches it through `admit()`
     /// (a two-arm dispatch: no `DomainMiss`/`CapabilityMiss` split exists at
@@ -1491,7 +1481,7 @@ mod tests {
     fn strict_mode_child_process_body() {
         // The sole test running in this spawned child process (no real
         // contention), but the assertion at `training_attention_cascade`'s
-        // own `admit()` call site is unconditional (esc-092) — it does not
+        // own `admit()` call site is unconditional — it does not
         // know this process holds no other test, only whether this thread
         // holds the lock.
         let _lock = crate::test_support::seam_counter_lock();
@@ -1526,10 +1516,10 @@ mod tests {
         (config, dir.join("model.safetensors"))
     }
 
-    /// #421 P1-a3: [`Bert::fusible_site_census`] is the EXACT per-forward
+    /// [`Bert::fusible_site_census`] is the EXACT per-forward
     /// call count of each fusible seam, not an estimate of it — the `calls`
     /// witness the tower profile's `fused + eager == calls * batches`
-    /// equation had no source for.
+    /// equation needs.
     ///
     /// Both halves are needed, and the frozen half is the NON-VACUITY
     /// control: it is the only leg that can fail if `lora_sites_wrapped`

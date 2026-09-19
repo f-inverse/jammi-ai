@@ -19,23 +19,22 @@ pub(crate) fn quick_gelu(xs: &Tensor) -> Result<Tensor, EncoderError> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Fused GELU-erf seam (issue #463)
+// Fused GELU-erf seam
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Fused/eager dispatch counters for the `gelu_erf` seam, read from the
 /// registry (`counters_for`) — mirroring `crate::layer_norm::LN_DISPATCH_COUNTERS`
 /// / `crate::attention_cascade::SOFTMAX_DISPATCH_COUNTERS`. `pub(crate)`
 /// (not `pub`) — a durable job record or a bench report reads it through a
-/// `crate::gelu_dispatch_snapshot`-shaped API once one exists (not wired in
-/// this unit — see [`gelu_erf`]'s own doc for what IS wired).
+/// `crate::gelu_dispatch_snapshot`-shaped API; no such API exists yet (see
+/// [`gelu_erf`]'s own doc for what IS wired).
 pub(crate) static GELU_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
     LazyLock::new(|| counters_for("gelu_erf_fused"));
 
 /// Test-only guarded read of [`GELU_DISPATCH_COUNTERS`]: takes
-/// `&SeamCounterGuard` (esc-092 / issue #476, see that type's own doc for
-/// exactly what holding a reference to it proves) — mirrors
-/// `crate::layer_norm::ln_snapshot_locked` exactly, for the tests in this
-/// module and `crate::htsat_audio` that read `GELU_DISPATCH_COUNTERS` alone
+/// `&SeamCounterGuard` (see that type's own doc for exactly what holding a
+/// reference to it proves) — mirrors `crate::layer_norm::ln_snapshot_locked` exactly, for the tests
+/// in this module and `crate::htsat_audio` that read `GELU_DISPATCH_COUNTERS` alone
 /// rather than the summed three-seam tuple
 /// `crate::test_support::seam_dispatch_totals` returns.
 #[cfg(test)]
@@ -45,8 +44,8 @@ pub(crate) fn gelu_snapshot_locked(
     GELU_DISPATCH_COUNTERS.snapshot()
 }
 
-/// The fused GELU-erf kernel's domain, checked at the call site (family D /
-/// K2): `x`'s device is one [`device_is_supported`] accepts, its dtype is
+/// The fused GELU-erf kernel's domain, checked at the call site: `x`'s device is one
+/// [`device_is_supported`] accepts, its dtype is
 /// `F32` on either device or additionally `BF16`/`F16` on CUDA (matching
 /// `jammi_kernels::ops::GeluErfFused`'s own per-device forward domain — F32
 /// only on CPU, F32/BF16/F16 on CUDA — see that op's module doc), `x` is
@@ -84,7 +83,7 @@ fn gelu_admission_predicate(x: &Tensor) -> (bool, &'static str) {
 }
 
 /// Dispatches to the real fused kernel, `jammi_kernels::ops::GeluErfFused`
-/// (issue #463) via [`jammi_kernels::ops::apply1`] — the same `CustomOp1`
+/// via [`jammi_kernels::ops::apply1`] — the same `CustomOp1`
 /// adapter idiom every other fused op in this crate's seams uses (mirroring
 /// `attention_cascade`'s `AttentionBlockFused`/`softmax`'s `SoftmaxFused`
 /// call sites). On CPU F32 this op's forward is bit-identical to
@@ -96,7 +95,7 @@ fn gelu_admission_predicate(x: &Tensor) -> (bool, &'static str) {
 /// condition-aware bound (see that op's module doc's "backward" section and
 /// its own exported `jammi_kernels::ops::gelu_erf::{COND_AWARE_TOL,
 /// COND_AWARE_ABS_FLOOR}` constants, which this crate's own gradcheck
-/// oracle imports rather than hand-copying — audit round item 4).
+/// oracle imports rather than hand-copying).
 fn dispatch_gelu_erf_fused(x: &Tensor) -> Result<Tensor, EncoderError> {
     // `GeluErfFused` is a unit struct — clippy's `default_constructed_unit_structs`
     // prefers the bare value over `GeluErfFused::default()` (both are
@@ -117,8 +116,8 @@ fn dispatch_gelu_erf_fused(x: &Tensor) -> Result<Tensor, EncoderError> {
 /// which happened either way. Wired at `bert.rs:296`
 /// (`BertIntermediate::forward`'s `activations::gelu_erf(&hidden,
 /// training)`), `distilbert.rs:213` (`DistilBertFfn::forward`'s
-/// `activations::gelu_erf(&mid, training)`), and — as of #421 P1-a —
-/// `crate::htsat_audio`'s two sites (`SwinBlock::forward`'s MLP and
+/// `activations::gelu_erf(&mid, training)`), and `crate::htsat_audio`'s two
+/// sites (`SwinBlock::forward`'s MLP and
 /// `ClapAudioProjection::forward_unnormalized_with_training`'s `"gelu"`
 /// arm; see that module's own doc, "Every fusible activation goes through
 /// the house seam", for the flag thread and the exact per-forward
@@ -126,8 +125,7 @@ fn dispatch_gelu_erf_fused(x: &Tensor) -> Result<Tensor, EncoderError> {
 ///
 /// ALL FOUR sites receive `training` as a call-chain PARAMETER, never a
 /// per-sub-struct stored copy, so this seam always sees the SAME value the
-/// model's own forward dispatched on (audit round item 6, the defect that
-/// rule exists to prevent): `Bert::training`/`DistilBert::training` thread
+/// model's own forward dispatched on: `Bert::training`/`DistilBert::training` thread
 /// theirs through `BertLayer`/`DistilBertLayer`, and `HtsatAudio`'s single
 /// stored flag threads through
 /// `htsat_audio::HtsatAudioEncoder::forward_spine_with_training` to each
@@ -142,10 +140,8 @@ fn dispatch_gelu_erf_fused(x: &Tensor) -> Result<Tensor, EncoderError> {
 /// `projection_hidden_act == "gelu"`; that tower's own module doc carries
 /// the arithmetic and the oracles that pin it.
 ///
-/// **Not wired** (recorded here, per plan v2 R5', rather than silently
-/// excluded): `crate::context`'s
-/// GELU site has no train/eval split. The GeGLU eager reference arm
-/// (`crate::modernbert::geglu_apply_training`'s own `gate.gelu_erf()?`
+/// **Not wired**: `crate::context`'s GELU site has no train/eval split. The GeGLU eager reference
+/// arm (`crate::modernbert::geglu_apply_training`'s own `gate.gelu_erf()?`
 /// call) and `quick_gelu` (above) are architecturally different
 /// activations, out of this seam's scope entirely.
 pub(crate) fn gelu_erf(x: &Tensor, training: bool) -> Result<Tensor, EncoderError> {
@@ -222,8 +218,7 @@ mod tests {
         assert_eq!(predicate, "non_empty");
     }
 
-    /// Strict mode on a refused domain (family K2, audit round item 7): a
-    /// CPU `BF16` input fails [`gelu_admission_predicate`]'s
+    /// Strict mode on a refused domain: a CPU `BF16` input fails [`gelu_admission_predicate`]'s
     /// `dtype_f32_only_on_cpu` check, so under `Strict` `gelu_erf`'s own
     /// `admit()` call must return `KernelError::StrictModeFallback`
     /// instead of silently falling back to the eager `gelu_erf()` call —
@@ -265,7 +260,7 @@ mod tests {
     fn strict_mode_child_process_body() {
         // The sole test running in this spawned child process (no real
         // contention), but the assertion at `gelu_erf`'s own `admit()` call
-        // site is unconditional (esc-092) — it does not know this process
+        // site is unconditional — it does not know this process
         // holds no other test, only whether this thread holds the lock.
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
@@ -293,9 +288,8 @@ mod tests {
     /// proof.
     #[test]
     fn gelu_erf_training_admits_fused_on_a_supported_shape_and_matches_eager_value() {
-        // Two-sided under the crate-shared counter lock (audit round item
-        // 8): this test reads the SAME process-wide `gelu_erf_fused`
-        // registry every other GELU/attention counter test in this crate
+        // Two-sided under the crate-shared counter lock: this test reads the SAME process-wide
+        // `gelu_erf_fused` registry every other GELU/attention counter test in this crate
         // reads, so it must serialize against them the same way
         // `bert`/`distilbert`/`modernbert`'s own counter tests do.
         let _lock = crate::test_support::seam_counter_lock();
@@ -316,9 +310,8 @@ mod tests {
         );
     }
 
-    /// The crate's own two-sided GELU counter oracle, now genuinely
-    /// exercising the real fused kernel (fix-round item 1): `gelu_erf(x,
-    /// true)` on a head64-shaped (`h=2, d=64`), sign-mixed
+    /// The crate's own two-sided GELU counter oracle, exercising the real
+    /// fused kernel: `gelu_erf(x, true)` on a head64-shaped (`h=2, d=64`), sign-mixed
     /// production-amplitude fixture must (a) bump `gelu_fused_dispatches`,
     /// and (b) produce hidden states BIT-IDENTICAL to the unchanged eager
     /// `x.gelu_erf()` call — CPU F32 is `GeluErfFused`'s own documented
@@ -331,7 +324,7 @@ mod tests {
     /// bert_head64_fused_attention_matches_eager_composition_within_tolerance`)
     /// isolate the eager arm without touching any process-wide admission
     /// switch (`JAMMI_KERNELS_DISABLE`). Two-sided under the crate-shared
-    /// counter lock (audit round item 8).
+    /// counter lock.
     #[test]
     fn gelu_erf_training_fused_forward_is_bit_identical_to_eager_on_head64_fixture() {
         let _lock = crate::test_support::seam_counter_lock();
@@ -390,13 +383,10 @@ mod tests {
     }
 
     /// This file's own re-derivation of `jammi_kernels::ops::gelu_erf`'s
-    /// documented backward CONDITION-AWARE bound formula, now IMPORTING
-    /// that op's own `COND_AWARE_TOL`/`COND_AWARE_ABS_FLOOR` constants
-    /// (audit round item 4: these used to be hand-copied `f64` literals
-    /// here, a duplication the kernels crate's own audit round closed by
-    /// exporting them as `pub const` — see `gelu_erf.rs`'s own doc for
-    /// both constants' derivation; this file no longer has a second,
-    /// independently-drifting copy of either number). `jammi-encoders` has
+    /// documented backward CONDITION-AWARE bound formula, IMPORTING that
+    /// op's own `COND_AWARE_TOL`/`COND_AWARE_ABS_FLOOR` constants (see
+    /// `gelu_erf.rs`'s own doc for both constants' derivation) rather than
+    /// keeping a second copy of either number. `jammi-encoders` has
     /// no `libm` dependency of its own, so `Phi(x)` is computed via
     /// `candle_core::Tensor::erf` (the same standard-normal-CDF identity
     /// `Phi(x) = 0.5*(1+erf(x/sqrt(2)))`) rather than a direct `libm::erf`
@@ -428,9 +418,8 @@ mod tests {
             .collect()
     }
 
-    /// Backward through a LoRA-targeted `intermediate.dense`/`lin1` site
-    /// (contract fix-round item 1): [`Tensor::backward`] on the fused arm's
-    /// output must reach the LoRA `A`/`B` gradients within
+    /// Backward through a LoRA-targeted `intermediate.dense`/`lin1` site:
+    /// [`Tensor::backward`] on the fused arm's output must reach the LoRA `A`/`B` gradients within
     /// `jammi_kernels::ops::gelu_erf`'s own documented condition-aware
     /// bound, not merely finite/non-zero. Deliberately minimal shape
     /// (`in_features = rank = 1`, one row) so the propagated bound on
@@ -457,8 +446,8 @@ mod tests {
         use candle_nn::{Linear, VarBuilder, VarMap};
         use jammi_lora::{FrozenBase, LoraInitMode, LoraLinear};
 
-        // Two-sided under the crate-shared counter lock (audit round item
-        // 8) — same rationale as the sibling tests above.
+        // Two-sided under the crate-shared counter lock — same rationale as the sibling tests
+        // above.
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let hd = 6usize; // "intermediate.dense"/"lin1" out_features stand-in.

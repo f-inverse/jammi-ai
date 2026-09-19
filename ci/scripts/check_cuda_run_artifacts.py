@@ -98,37 +98,31 @@ must carry:
   (f) `producer.kind == "none"` is allowed ONLY for a path in the reviewed,
       in-script `LEGACY_NONE_ALLOWLIST` — a NEW artifact defaulting to
       `"none"` is a hard FAIL.
-  (g) KO-3 (`docs/maintainer/cuda-kernel-guide.md` §3, an instance of §3.8):
-      an OPTIONAL `oracle_separation: {healthy_max_offsample, bound,
-      min_control}` block, attached to ANY leg anywhere in the artifact
-      (found by recursing the whole document, not a fixed top-level key —
-      see `check_oracle_separation`'s own doc), asserts
-      `healthy_max_offsample < bound < min_control` when present. Absent
-      entirely on every artifact committed before this rule existed, so no
-      existing artifact reddens.
-  (i) leg identity on self-declaring v2 legs (unification contract C6,
-      phase 2): any JSON object anywhere in a `cuda-runs/**` tree carrying
-      `leg_schema_version >= 2` must carry the complete identity tuple for
+  (g) separation in the artifact (`docs/maintainer/cuda-kernel-guide.md`
+      §3, an instance of §3.8): an OPTIONAL `oracle_separation:
+      {healthy_max_offsample, bound, min_control}` block, attached to ANY
+      leg anywhere in the artifact (found by recursing the whole document,
+      not a fixed top-level key — see `check_oracle_separation`'s own doc),
+      asserts `healthy_max_offsample < bound < min_control` when present.
+      An artifact without the block is not checked by this rule.
+  (i) leg identity on self-declaring v2 legs: any JSON object anywhere in a
+      `cuda-runs/**` tree carrying `leg_schema_version >= 2` must carry the complete identity tuple for
       its `(tier, producer_kind)` and a `provenance.build_sha` equal to its
       parent artifact's own `git_sha` — see `check_v2_leg`/`find_v2_legs`
       below.
 
-      Letter assignment: this rule and (g) above each originally called
-      themselves "rule (g)" (an accidental collision, KO-3 first). (h) was
-      a since-removed gate's letter, so the v2 leg-identity rule is
-      deliberately lettered (i). The letter is comment/self-test-label
-      prose only — no gate, allowlist, or error message parses it.
+      There is no rule (h). The letters are comment/self-test-label prose
+      only — no gate, allowlist, or error message parses them.
   (j) `producer.source_sha256`, when present, is re-hashed HERE — every
       named repo-root-relative path is re-read from THIS gate's own HEAD
       (the real working tree, never a historical blob) and its sha256
       compared against the recorded value; a mismatch is a hard FAIL naming
-      the path (`check_producer_source_sha256`). This replaces `tree_sha`
-      (a git commit sha nothing ever validated, and the wrong determinant
-      in the first place — an artifact cannot know, at render time, which
-      future commit will contain it) with the producer's own CONTENT
-      identity: editing the producer (or a file it reads a live constant
-      from) and forgetting to regenerate the committed artifact is now
-      caught here, never silently accepted as still-valid provenance.
+      the path (`check_producer_source_sha256`). The producer's own CONTENT
+      identity is the determinant, never a commit sha (an artifact cannot
+      know, at render time, which future commit will contain it): editing
+      the producer (or a file it reads a live constant from) and forgetting
+      to regenerate the committed artifact is caught here, never silently
+      accepted as still-valid provenance.
       `source_sha256`/`input_sha256` stay OPTIONAL for a producer that never
       opted into this convention — but a producer that DOES (stamped via
       `producer.identity == "source_sha256+input_manifest"`) must carry
@@ -151,15 +145,14 @@ must carry:
       (`check_producer_source_identity_marker`).
 
   (k) the `gang` ARTIFACT KIND (the RunPod POD and CLUSTER legs' own
-      evidence — plan #500 U7b's M6): an artifact declared `gang` by ANY of
+      evidence): an artifact declared `gang` by ANY of
       three independent anchors — `artifact_kind == "gang"`, a top-level
       `gang` block, or a committed filename matching
       `GANG_ARTIFACT_FILENAME_RE` — must FIRST carry `gang.leg`, exactly one
       of `"pod"`/`"cluster"` (checked before either registry below — a
       missing or unrecognized leg leaves nothing else checkable, since the
       two legs owe DIFFERENT payloads). `gang.leg == "pod"` carries every
-      row of `GANG_POD_FIELD_REGISTRY` (this rule's ORIGINAL shape,
-      unchanged): `world` (>= 2), `collective`, one per-rank `device` for
+      row of `GANG_POD_FIELD_REGISTRY`: `world` (>= 2), `collective`, one per-rank `device` for
       each of `world` ranks, the same-seed `digests` PAIR (exactly two), the
       measured `per_step_loss_delta`, the leg's own `verdict` (exactly
       `pass` or `fail`), and `epsilon` with its `value`, its `derivation`,
@@ -202,8 +195,7 @@ must carry:
       the NCCL pin set is untested at world >= 3, and a state defined by
       missing evidence gets no definite consequence. A new required field
       lands as a registry row (the same discipline `_TIER_SOURCE_REGISTRY`
-      follows), never an inline literal in a checker. No artifact committed
-      before this kind existed carries any anchor, so none reddens.
+      follows), never an inline literal in a checker.
 
       WHAT THE ANCHOR RULE ASKS OF A PRODUCER: register ε in its OWN
       commit, BEFORE the commit that measures with it, on the same branch.
@@ -243,7 +235,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import ancestry  # noqa: E402 — #530: the ONE ancestry rule, shared with check_pod_build_timings.py
+import ancestry  # noqa: E402 — the ONE ancestry rule, shared with check_pod_build_timings.py
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CUDA_RUNS_DIR = REPO_ROOT / "crates" / "jammi-kernels" / "artifacts" / "cuda-runs"
@@ -265,12 +257,12 @@ README_PRODUCER_RE = re.compile(r"`([\w./-]*proof_artifact\.py)`")
 LEGACY_NONE_ALLOWLIST: dict[str, str] = {
     "2026-08-25-cast-w1-80f02fb-a100-sxm4.json": (
         "pre-schema artifact: the same-build forced-arm A/B was run by hand via "
-        "jammi-bench finetune-step invocations on the lead's exclusive box, not a "
+        "jammi-bench finetune-step invocations on one exclusive box, not a "
         "single #[test] fn or a tracked producer script."
     ),
     "2026-08-25-p1-5f29e3b-a100-sxm4.json": (
         "pre-schema artifact: produced by an earlier, untracked copy of "
-        "proof_artifact.py, before this gate's PR tracked it at "
+        "proof_artifact.py, before it was tracked at "
         "ci/scripts/perf/proof_artifact.py."
     ),
     "2026-08-25-p2-5932520-a100-sxm4.json": (
@@ -285,13 +277,13 @@ LEGACY_NONE_ALLOWLIST: dict[str, str] = {
         "pre-schema artifact: a flash_smoke execution-provenance dump captured by "
         "hand (16 test names from one binary run, not a single #[test] fn)."
     ),
-    # Unification contract C8.3 (phase 2, B6): the two `crates/jammi-bench/
-    # baselines/*.json` records `git mv`d under this directory. Neither has a
-    # tracked producer script (both were hand-driven `jammi-bench finetune-step`
-    # invocations run on the lead's own box — see each file's own `_comment`),
-    # so `producer.kind == "none"` is the honest reading, same as the five
-    # entries above. Growth of this list is no longer purely a human review
-    # call: `check_none_allowlist_history` (rule (f)'s mechanical companion)
+    # The two `crates/jammi-bench/baselines/*.json` records `git mv`d under
+    # this directory. Neither has a tracked producer script (both were
+    # hand-driven `jammi-bench finetune-step` invocations on one box — see
+    # each file's own `_comment`), so `producer.kind == "none"` is the honest
+    # reading, same as the five entries above. Growth of this list is not a
+    # human review call alone: `check_none_allowlist_history` (rule (f)'s
+    # mechanical companion)
     # requires every entry's FIRST INTRODUCTION commit (`git log --follow
     # --diff-filter=A`) to be an ancestor of this gate's own introduction
     # (`c7fd1df`, GATE_INTRODUCTION_SHA below) — both of these predate it
@@ -300,22 +292,22 @@ LEGACY_NONE_ALLOWLIST: dict[str, str] = {
     # history it does not have.
     "2026-08-24-finetune-step-reference-d361515-a100-pcie.json": (
         "pre-schema baseline, moved from crates/jammi-bench/baselines/"
-        "finetune_step_reference.json (unification contract C8): a same-box "
+        "finetune_step_reference.json: a same-box "
         "A/B reference run by hand via jammi-bench finetune-step invocations, "
         "not a single #[test] fn or a tracked producer script — see this "
         "file's own _comment."
     ),
     "2026-08-24-p1-softmax-fold-bf8e807-a100-sxm4.json": (
         "pre-schema baseline, moved from crates/jammi-bench/baselines/"
-        "p1_softmax_scale_fold_ab.json (unification contract C8): a same-box "
+        "p1_softmax_scale_fold_ab.json: a same-box "
         "A/B run by hand proving the P1 softmax-scale-fold change, not a "
         "single #[test] fn or a tracked producer script — see this file's "
         "own _comment."
     ),
 }
 
-# Unification contract C8.3: the commit that introduced THIS gate (schema +
-# ancestry + producer-provenance for cuda-run artifacts, #379). Every
+# The commit that introduced THIS gate (schema + ancestry +
+# producer-provenance for cuda-run artifacts). Every
 # `LEGACY_NONE_ALLOWLIST` entry's own first-introduction commit must be an
 # ancestor of this one — see `check_none_allowlist_history`.
 GATE_INTRODUCTION_SHA = "c7fd1df58b81761374431597d6de414a863f0f83"
@@ -331,12 +323,10 @@ class ArtifactError(Exception):
     """Uncomputable input (parse failure, missing dir) — fails closed."""
 
 
-# #530: the git-plumbing this file's own ancestry rule needs no longer has
-# a private copy here -- `_run` IS `ancestry.run` (the identical gc/
-# maintenance suppression, for the identical reason: a `shutil.rmtree`
-# during a `tempfile.TemporaryDirectory`'s teardown racing a background
-# `git maintenance`/`gc --auto` this file's own scratch-repo `git init`/
-# `add`/`commit`/`clone` calls can spawn), imported rather than redefined.
+# `_run` IS `ancestry.run`: the shared git-plumbing helper, which suppresses
+# gc/maintenance so a `shutil.rmtree` during a `tempfile.TemporaryDirectory`'s
+# teardown never races a background `git maintenance`/`gc --auto` spawned by
+# this file's own scratch-repo `git init`/`add`/`commit`/`clone` calls.
 _run = ancestry.run
 
 
@@ -354,17 +344,14 @@ def is_shallow_repository(repo_root: Path) -> bool:
     """`actions/checkout`'s default (`fetch-depth: 1`) hands `git merge-base
     --is-ancestor` a truncated object graph — every `git_sha` this gate has
     ever seen reads back as a false non-ancestor in that state, which is
-    indistinguishable from a REAL non-ancestor without this check (the exact
-    failure mode that made even `p1`'s genuinely-ancestor `git_sha` FAIL in
-    CI: `.github/workflows/ci.yml`'s `guard` job checked out at the default
-    depth). `git rev-parse --is-shallow-repository` is the one command that
+    indistinguishable from a REAL non-ancestor without this check.
+    `git rev-parse --is-shallow-repository` is the one command that
     tells the two apart; a non-zero exit (e.g. run outside a git repo at
     all) is treated as "not shallow" here — `git_ls_files`/`_is_ancestor`
     will raise their own, more specific errors moments later if the
     checkout is unusable for some other reason. Delegates to `ancestry.
-    is_shallow_repository` (#530) -- the identical check `check_pod_
-    build_timings.py` uses, kept as its own named function here for the
-    docstring's own file-specific incident history.
+    is_shallow_repository` -- the identical check `check_pod_
+    build_timings.py` uses.
     """
     return ancestry.is_shallow_repository(repo_root)
 
@@ -524,21 +511,15 @@ SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS: frozenset[str] = frozenset(
 # renamed producer. An artifact's own committed FILENAME (never
 # `producer.path`) is not something a producer's own code can rename without
 # also renaming what CI actually sees on disk — every "tower-profile" family
-# artifact (`-profile-<N>-towers-...`, one N per profile UNIT — issue #421's
-# own `2026-09-07-profile-421-towers-...json` is one instance, never the
-# only one this pattern is meant to survive) and every "frontend" follow-on
-# artifact (`-frontend-...`) is matched here by FAMILY TOKEN, deliberately
-# never by this one issue's own number: a future profile unit (#421's
-# eventual successor) that reuses the SAME `-profile-<N>-towers-` naming
-# convention under a DIFFERENT issue number must still be caught by this
-# anchor without an edit here, and a literal `-profile-421-` would silently
-# stop matching the moment that successor's own artifact used a different
-# N. The REQUIRED `-towers-` token (never a bare `-profile-\d+-`) is not
-# optional: `2026-08-31-profile-356-closeout-...json` (issue #356's OWN,
-# already-committed, pre-this-convention closeout artifact) also matches
-# `-profile-\d+-` but is NOT a tower-profile source-identity-declaring
-# artifact at all — a bare `-profile-\d+-` would wrongly retroactively
-# demand the marker on that unrelated, already-closed campaign's own
+# artifact (`-profile-<N>-towers-...`, for any N —
+# `2026-09-07-profile-421-towers-...json` is one instance) and every
+# "frontend" artifact (`-frontend-...`) is matched here by FAMILY TOKEN,
+# never by one particular N: a later profile artifact with a different N
+# must be caught without an edit here. The REQUIRED `-towers-` token (never
+# a bare `-profile-\d+-`) is not optional:
+# `2026-08-31-profile-356-closeout-...json` also matches `-profile-\d+-` but
+# is NOT a tower-profile source-identity-declaring artifact at all — a bare
+# `-profile-\d+-` would wrongly demand the marker on that unrelated
 # artifact. Matched against the artifact's own BASENAME ONLY
 # (`relpath.rsplit("/", 1)[-1]`, never the full `relpath`) — `relpath` can
 # carry directory segments (a `*-raw-runs/` subdirectory name, say) that
@@ -861,7 +842,7 @@ def check_cargo_test_gating(data: dict, producer: dict, repo_root: Path) -> list
 
 
 # --------------------------------------------------------------------------- #
-# rule (d) — ancestry (#530: delegates entirely to the ONE shared rule in
+# rule (d) — ancestry (delegates entirely to the ONE shared rule in
 # ancestry.py, imported by this gate AND check_pod_build_timings.py)
 # --------------------------------------------------------------------------- #
 _is_ancestor = ancestry.is_ancestor
@@ -907,10 +888,10 @@ def check_readme_producer(readme_path: Path, repo_root: Path, tracked: set[str])
 # rule (f) — kind == "none" only for the reviewed allow-list
 # --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
-# rule (g) — KO-3: `oracle_separation` (OPTIONAL per artifact leg)
+# rule (g) — `oracle_separation` (OPTIONAL per artifact leg)
 # --------------------------------------------------------------------------- #
-# `docs/maintainer/cuda-kernel-guide.md` §3's `KO-3` id (an instance of
-# §3.8's "no absolute ULP floor" discipline): a bound is not evidence of
+# `docs/maintainer/cuda-kernel-guide.md` §3's separation-in-the-artifact
+# rule (an instance of §3.8's "no absolute ULP floor" discipline): a bound is not evidence of
 # real separation just because it PASSES today — an artifact MAY attach an
 # `oracle_separation: {healthy_max_offsample, bound, min_control}` block to
 # any leg (any nested object anywhere in the artifact JSON, not a fixed
@@ -921,9 +902,8 @@ def check_readme_producer(readme_path: Path, repo_root: Path, tracked: set[str])
 # DEMONSTRATE, numerically, that the chosen bound sits strictly between the
 # healthiest off-sample measurement and the smallest value a real control/
 # regression would produce: `healthy_max_offsample < bound < min_control`.
-# OPTIONAL in v1 — absent entirely on every artifact committed before this
-# rule existed, so no existing artifact reddens; where present, it is
-# checked.
+# OPTIONAL — absent on artifacts that do not carry the block; where
+# present, it is checked.
 ORACLE_SEPARATION_KEY = "oracle_separation"
 ORACLE_SEPARATION_FIELDS = ("healthy_max_offsample", "bound", "min_control")
 
@@ -993,14 +973,11 @@ def check_oracle_separation(data: dict) -> list[str]:
 # "By the time the measured tree existed" is checked against the artifact's
 # EVIDENCE ANCHOR, not unconditionally against `git_sha`: see
 # `_gang_evidence_anchor`. Guarding the check behind "`git_sha` is an
-# ancestor of HEAD" (this rule's first revision) skipped it entirely for
-# exactly the artifacts whose measured tip was rewritten on landing.
+# ancestor of HEAD" would skip it entirely for exactly the artifacts whose
+# measured tip was rewritten on landing.
 #
-# LETTER: (a)-(j) are taken (see the module doc; (h) was a since-removed
-# gate's letter and the v2 leg-identity rule took (i) after an
-# accidental collision with KO-3's (g)). This one is (k). As with every
-# other letter here, it is comment/self-test-label prose only — no gate,
-# allowlist, or error message parses it.
+# LETTER: (k). As with every other letter here, it is comment/self-test-label
+# prose only — no gate, allowlist, or error message parses it.
 #
 # WHY A REGISTRY, NOT AN INLINE LITERAL: this file's own module doc requires
 # a new kind to land as registry ROWS (the same discipline `_TIER_SOURCE_
@@ -1019,7 +996,7 @@ def check_oracle_separation(data: dict) -> list[str]:
 # they bind hard, because a `pass` is a CLAIM.
 #
 # WHAT THIS RULE ASSERTS ONLY CONDITIONALLY: digest EQUALITY. On a `pass`
-# it is required at `world == 2` — the regime spike S5 measured
+# it is required at `world == 2` — the regime a spike measured
 # byte-identical for candle 0.11's LoRA-shaped forward/backward/SGD across
 # A100s, with no env pins — and merely RECORDED above that, because nothing
 # has established byte-identity for a reduction whose NCCL pin set is
@@ -1027,22 +1004,20 @@ def check_oracle_separation(data: dict) -> list[str]:
 # evidence gets no definite consequence: the gate does not decide the
 # higher-world case in either direction.
 # --------------------------------------------------------------------------- #
-# M6 (plan #500 U7b): a `gang` artifact now names WHICH RENTAL LEG produced
-# it. `gang.leg` is a required, closed-set field, checked FIRST, before
-# either registry below: `pod` keeps today's registry byte-for-byte (a
-# single 2-GPU RunPod POD, the original shape this rule was written for);
-# `cluster` is the two-HOST RunPod CLUSTER leg's own shape (2 separate
+# A `gang` artifact names WHICH RENTAL LEG produced it. `gang.leg` is a
+# required, closed-set field, checked FIRST, before either registry below:
+# `pod` is a single 2-GPU RunPod POD; `cluster` is the two-HOST RunPod CLUSTER leg's own shape (2 separate
 # hosts over NCCL's `ncclCommInitRank`, never `ncclCommInitAll`) and owes a
 # DIFFERENT payload: `hosts`, per-rank `host`/`iface` (never `digests`/
 # `per_step_loss_delta`/`epsilon` -- the cluster leg proves a bit-exact
-# reduced-vector match, not a training-loss reproducibility bound; S5's own
+# reduced-vector match, not a training-loss reproducibility bound; the
 # LoRA-shaped byte-identical regime was never measured across two separate
 # HOSTS) plus the shape it was RENTED at (`pod_count`, `gpu_count_per_pod`,
 # `ttl_hours`). Both legs share `world`/`collective`/`verdict` (the SAME
 # generic `_gang_check_verdict` binds on either leg identically) and the
 # three-anchor kind detection below.
 #
-# The cluster registry (F4, plan #500 U7b fix round 1) ALSO asserts, over
+# The cluster registry ALSO asserts, over
 # `ranks[]`: every `host` is DISTINCT across ranks (two ranks on one host is
 # not the two-host bootstrap this leg proves) and neither `host` nor `iface`
 # is the driver's own `unknown` placeholder (the driver's assembler refuses
@@ -1066,15 +1041,13 @@ GANG_LEG_POD = "pod"
 GANG_LEG_CLUSTER = "cluster"
 GANG_LEGS = (GANG_LEG_POD, GANG_LEG_CLUSTER)
 
-# F4: a self-declared `gang.leg` cannot dodge the OTHER leg's registry by
+# A self-declared `gang.leg` cannot dodge the OTHER leg's registry by
 # pointing `producer.path` at a different driver -- each leg's OWN renting
-# driver is the sole writer of that leg's artifact (M3's own doc: "the
-# driver is the SOLE writer of the assembled artifact"), so the two are
-# bound together here, never left as two independently-editable fields. A
-# leg with NO entry here has no registered producer at all -- see
+# driver is the sole writer of that leg's artifact, so the two are bound
+# together here, never left as two independently-editable fields. A leg
+# with NO entry here has no registered producer at all -- see
 # `_gang_check_leg_producer_binding`'s own refusal for that shape (fail
-# closed, never a silent pass, P-E2): U7b-A2b's cluster driver ships in
-# this same revision, so the cluster leg is registered again below.
+# closed, never a silent pass).
 GANG_LEG_PRODUCER_PATH = {
     GANG_LEG_POD: "ci/scripts/runpod_gpu_gang.sh",
     GANG_LEG_CLUSTER: "ci/scripts/runpod_gpu_cluster.sh",
@@ -1224,7 +1197,7 @@ def _gang_check_digests(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
     ):
         failures.append(
             f"`gang.digests` records a `pass` at `gang.world` {GANG_DIGEST_EQUALITY_WORLD} whose two "
-            f"same-seed runs produced DIFFERENT digests ({values[0]} vs {values[1]}) — spike S5 "
+            f"same-seed runs produced DIFFERENT digests ({values[0]} vs {values[1]}) — a spike "
             "measured this regime byte-identical, so an unequal pair is a failed run: record it as "
             f"`gang.verdict` {GANG_VERDICT_FAIL!r} with its own `gang.reason`, never as a pass"
         )
@@ -1308,11 +1281,11 @@ def _gang_evidence_anchor(data: dict, repo_root: Path) -> tuple[str | None, str 
         history for anything to be ordered against. On this repo's corpus
         that is not a corner case: of the 111 cuda-run artifacts carrying a
         `git_sha`, 7 need this arm.
-      * else neither: a hard FAIL naming both, never a silent skip. The
-        previous revision of this rule guarded BOTH of its ε arms behind
-        `_is_ancestor(git_sha, HEAD)`, so exactly the artifacts that need
-        the `merged_as` rescue had their whole ε pre-registration check
-        skipped — including an ε registered in the landing commit itself.
+      * else neither: a hard FAIL naming both, never a silent skip. Guarding
+        BOTH ε arms behind `_is_ancestor(git_sha, HEAD)` would skip the
+        whole ε pre-registration check for exactly the artifacts that need
+        the `merged_as` rescue — including an ε registered in the landing
+        commit itself.
 
     ANCESTRY, never "resolvable": whether a rewritten sha is READABLE here
     is a property of the clone (4 of those 7 exist only as loose objects in
@@ -1429,7 +1402,7 @@ GANG_UNKNOWN_SENTINELS = ("unknown", "")
 
 
 def _gang_check_cluster_ranks(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
-    """F4: beyond shape (one row per rank, non-empty fields), this asserts
+    """Beyond shape (one row per rank, non-empty fields), this asserts
     the properties that make a cluster artifact TRUST-WORTHY evidence of a
     real two-host run: `host` is DISTINCT across ranks (two ranks on one
     host is not the two-host bootstrap this leg exists to prove), `host`/
@@ -1500,7 +1473,7 @@ def _gang_check_cluster_ranks(gang: dict, _data: dict, _repo_root: Path) -> list
             f"`gang.ranks` covers rank indices {sorted(seen)}, not 0..{world - 1} — every rank of the "
             "cluster gang records its own row"
         )
-    # F4 advisory: compared case-insensitively (and stripped) -- the SAME
+    # Compared case-insensitively (and stripped) -- the SAME
     # normalization the assembler's own `_norm_host` applies before it ever
     # writes the artifact, so "Host-A" and "host-a" are never read as two
     # distinct hosts on either side of the producer/checker boundary.
@@ -1522,7 +1495,7 @@ def _gang_check_cluster_ranks(gang: dict, _data: dict, _repo_root: Path) -> list
 
 
 def _gang_check_cluster_shape(gang: dict) -> list[str]:
-    """CLUSTER LEG ONLY cross-field check (F4): `hosts` must equal
+    """CLUSTER LEG ONLY cross-field check: `hosts` must equal
     `pod_count` (the cluster's own measured member count — the host count
     this leg proves is not an independent literal), and `world` must equal
     `pod_count * gpu_count_per_pod` (the rank count derives from the shape
@@ -1555,13 +1528,11 @@ def _gang_check_cluster_shape(gang: dict) -> list[str]:
 
 
 def _gang_check_leg_producer_binding(gang: dict, data: dict, _repo_root: Path) -> list[str]:
-    """F4: `gang.leg` names which rental driver produced this artifact —
+    """`gang.leg` names which rental driver produced this artifact —
     bound to `producer.path` so a self-declared leg cannot dodge the other
     leg's (stricter- or differently-shaped) registry by pointing at a
     different driver, or at no driver at all. A leg with NO
-    `GANG_LEG_PRODUCER_PATH` entry (P-E2: every registered leg has a
-    shipped driver today, but a THIRD leg added later without a row would
-    land here) has no registered producer to bind against at ALL -- that is
+    `GANG_LEG_PRODUCER_PATH` entry (a THIRD leg added without a row) has no registered producer to bind against at ALL -- that is
     a REFUSAL, never a silent pass just because there is nothing to compare
     `producer.path` to; an artifact cannot claim a leg this tree has no
     producer for."""
@@ -1622,7 +1593,7 @@ def _gang_check_ttl_hours(gang: dict, _data: dict, _repo_root: Path) -> list[str
     return []
 
 
-# M7 (plan #500 U7b's `pods` transport): the two-HOST bootstrap can be
+# The two-HOST bootstrap can be
 # rented over TWO independent RunPod object types -- an INSTANT CLUSTER
 # (`POST /v2/clusters`, near-zero capacity) or two ORDINARY pods joined by
 # Global Networking (`POST /v2/pods` x2, the default -- ordinary pods
@@ -1646,9 +1617,7 @@ def _gang_check_transport(gang: dict, _data: dict, _repo_root: Path) -> list[str
     return []
 
 
-# The POD-leg registry -- unchanged from before M6 (this rule's original
-# shape). Renamed from `GANG_FIELD_REGISTRY` to `GANG_POD_FIELD_REGISTRY`;
-# nothing outside this module referenced the old name.
+# The POD-leg registry.
 GANG_POD_FIELD_REGISTRY: tuple[tuple[str, object, str], ...] = (
     (
         "world",
@@ -1672,7 +1641,7 @@ GANG_POD_FIELD_REGISTRY: tuple[tuple[str, object, str], ...] = (
         _gang_check_digests,
         "the same-seed digest PAIR the equal-topology reproducibility oracle produces. Equality is "
         f"ASSERTED on a {GANG_VERDICT_PASS!r} verdict at `world` {GANG_DIGEST_EQUALITY_WORLD} (the "
-        "regime spike S5 measured byte-identical for candle 0.11's LoRA-shaped forward/backward/SGD "
+        "regime a spike measured byte-identical for candle 0.11's LoRA-shaped forward/backward/SGD "
         "on A100s with no env pins) and merely RECORDED above that world — the NCCL pin set is "
         "untested at world >= 3, and a state defined by missing evidence gets no "
         f"definite consequence. A {GANG_VERDICT_FAIL!r} verdict records its pair as measured",
@@ -1701,7 +1670,7 @@ GANG_POD_FIELD_REGISTRY: tuple[tuple[str, object, str], ...] = (
     ),
 )
 
-# The CLUSTER-leg registry (M6): world/collective/verdict are shared with
+# The CLUSTER-leg registry: world/collective/verdict are shared with
 # the pod leg (the identical `_gang_check_world`/`_gang_check_collective`/
 # `_gang_check_verdict` validators — the SAME property binds on either leg);
 # `hosts`/`ranks`(host+device+iface)/`reduced_vector_digest` are this leg's
@@ -1793,8 +1762,7 @@ def check_gang_artifact(data: dict, relpath: str, repo_root: Path) -> list[str]:
     `GANG_CLUSTER_FIELD_REGISTRY` applies — and a missing or unrecognized
     leg stops the check there (nothing else is checkable without knowing
     which schema applies). An artifact declared by none of the anchors is
-    not a gang artifact and is untouched by this rule (every artifact
-    committed before this kind existed stays green)."""
+    not a gang artifact and is untouched by this rule."""
     anchors = gang_anchors(data, relpath)
     if not anchors:
         return []
@@ -1920,7 +1888,7 @@ def check_gate_introduction_sha_anchor(
     gate_file: Path | None = None,
     gate_introduction_sha: str = GATE_INTRODUCTION_SHA,
 ) -> list[str]:
-    """C8.3's own anchor, otherwise unverified: `GATE_INTRODUCTION_SHA` is a
+    """The anchor for `GATE_INTRODUCTION_SHA`, otherwise unverified: it is a
     hand-typed constant that every `LEGACY_NONE_ALLOWLIST` entry's history
     check (`check_none_allowlist_history`) is pinned to — "this entry's
     first-introduction commit must be an ancestor of GATE_INTRODUCTION_SHA".
@@ -1932,9 +1900,8 @@ def check_gate_introduction_sha_anchor(
     commit (`_first_introduction_sha_for_path`, the same `git log --follow
     --diff-filter=A` machinery `check_none_allowlist_history` already
     trusts) — never a second, independently-drifting source of truth.
-    Editing `GATE_INTRODUCTION_SHA` at all is a `ci/scripts/check_cuda_run_
-    artifacts.py` edit, i.e. SWARM_GATE_TOUCHED by construction, same as
-    every other change to this file's own rules.
+    Editing `GATE_INTRODUCTION_SHA` at all is an edit to this gate file,
+    reviewed like every other change to this file's own rules.
 
     Checked BEFORE any `git log --follow` work, same discipline as
     `run_gate`'s own shallow guard: a shallow checkout (`actions/checkout`'s
@@ -1974,15 +1941,14 @@ def check_none_allowlist_history(
     repo_root: Path,
     gate_introduction_sha: str = GATE_INTRODUCTION_SHA,
 ) -> list[str]:
-    """Unification contract C8.3 — rule (f)'s mechanical companion: an entry
+    """Rule (f)'s mechanical companion: an entry
     in `LEGACY_NONE_ALLOWLIST` is legitimate ONLY if the artifact it names
     was first committed (under this exact path, following renames) BEFORE
     this gate itself existed. A genuinely NEW artifact's first-introduction
     commit can never predate `gate_introduction_sha` (the gate did not exist
     yet when a truly pre-schema artifact was added, but it DOES exist by the
     time any new commit lands), so this list cannot grow again without a
-    gate edit — which is SWARM_GATE_TOUCHED by construction — AND a history
-    it does not have.
+    gate edit AND a history it does not have.
     """
     intro = _first_introduction_sha(relpath, cuda_runs_dir, repo_root)
     if intro is None:
@@ -2001,85 +1967,79 @@ def check_none_allowlist_history(
 
 
 # --------------------------------------------------------------------------- #
-# rule (i) — leg identity on self-declaring v2 legs (unification contract C6,
-# phase 2). NOTE: this is a SEPARATE, unrelated mechanism from rule (g)
-# above (KO-3 `oracle_separation`) — see the module docstring's letter-
-# assignment note ((h) was a since-removed gate's letter, so this one is
-# (i); the letter is read by no gate, allowlist, or error message).
+# rule (i) — leg identity on self-declaring v2 legs. A SEPARATE, unrelated
+# mechanism from rule (g) above (`oracle_separation`).
 #
 # A v2 leg is ANY JSON object, anywhere in a `cuda-runs/**` tree,
-# carrying `leg_schema_version >= 2` — a key with ZERO occurrences anywhere
-# in this repo at the time this rule was written, so no pre-existing (v1)
-# leg can satisfy it by accident. A leg WITHOUT the key is v1 and is
-# validated only by rules (a)-(f) above, exactly as before this rule existed.
+# carrying `leg_schema_version >= 2`; no v1 leg carries that key, so none
+# can satisfy it by accident. A leg WITHOUT the key is v1 and is validated
+# only by rules (a)-(f) above.
 #
 # The required identity TUPLE per (tier, producer_kind) is never hand-typed
 # here: the jammi side is extracted by regex from `FinetuneStepTier::
 # IDENTITY_FIELDS` + `REPORT_IDENTITY_FIELDS` in `crates/jammi-bench/src/
 # report.rs` (the SAME const `ci/scripts/perf/test_identity_fields_subset.py`
-# reads, contract C4.2); the torch side is IMPORTED directly from
+# reads); the torch side is IMPORTED directly from
 # `crates/jammi-bench/reference/torch_finetune_step.py`'s own
-# `TORCH_IDENTITY_FIELDS` / `TORCH_IDENTITY_FIELDS_NULL_MEANS` (contract
-# C3.5) and `ci/scripts/perf/ab_merge.py`'s own `_TORCH_ARGS_LEVEL_FIELDS`
+# `TORCH_IDENTITY_FIELDS` / `TORCH_IDENTITY_FIELDS_NULL_MEANS` and `ci/scripts/perf/ab_merge.py`'s own `_TORCH_ARGS_LEVEL_FIELDS`
 # (the field-placement map the existing jammi-vs-torch comparator already
 # depends on) — never re-typed as a second, independently-drifting copy.
 # --------------------------------------------------------------------------- #
 LEG_SCHEMA_VERSION_KEY = "leg_schema_version"
 RAW_RUNS_DIR_SUFFIX = "-raw-runs"
 
-# CLOSED — exactly the 10 `*.json.raw` files committed by #380 (`6d07b20`)
-# AFTER this gate existed (`c7fd1df`, #379), deliberately renamed to dodge
-# the `*.json` glob rather than fabricate a `git_sha` (contract §1 Part D
-# CV3; §2 A3 quotes the artifact's own `provenance_note`; pressure-v2 NF8/
-# pin B). Every one is a bare `Report` dump ({engine_version, host,
+# CLOSED — exactly the 10 `*.json.raw` files committed (`6d07b20`) AFTER
+# this gate existed (`c7fd1df`), named `.json.raw` rather than fabricate a
+# `git_sha` (the parent artifact's own `provenance_note` records why).
+# Every one is a bare `Report` dump ({engine_version, host,
 # subcommand, tiers}) with no schema/provenance fields at all — they cannot
 # be brought under rules (a)-(f), let alone rule (i), without inventing a
 # sha the run never resolved. `--self-test` (`check_legacy_raw_nonjson_files_
 # exist`) proves every listed relpath still exists; a deletion must shrink
-# this list in the SAME commit, and growth is a gate edit (SWARM_GATE_TOUCHED
-# by construction — the list is closed, not merely long).
+# this list in the SAME commit, and growth is a gate edit (the list is
+# closed, not merely long).
 LEGACY_RAW_NONJSON: dict[str, str] = {
     "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/a100b/b8_s128_disabled.r1.json.raw": (
-        "pre-rule-(g) raw leg (a100b box, s128, disabled arm, replicate 1): bare Report "
-        "dump committed by #380 before rule (i) existed; kept .json.raw per this parent "
+        "pre-rule-(i) raw leg (a100b box, s128, disabled arm, replicate 1): bare Report "
+        "dump committed before rule (i) existed; kept .json.raw per this parent "
         "artifact's own provenance_note (a100b_full_step_ab_reference) rather than "
         "fabricate a git_sha for a tip not resolvable against this worktree's ancestry."
     ),
     "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/a100b/b8_s128_disabled.r2.json.raw": (
-        "pre-rule-(g) raw leg (a100b box, s128, disabled arm, replicate 2): same "
+        "pre-rule-(i) raw leg (a100b box, s128, disabled arm, replicate 2): same "
         "provenance_note as the r1 sibling above."
     ),
     "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/a100b/b8_s128_fused.r1.json.raw": (
-        "pre-rule-(g) raw leg (a100b box, s128, fused arm, replicate 1): same "
+        "pre-rule-(i) raw leg (a100b box, s128, fused arm, replicate 1): same "
         "provenance_note as the disabled-arm siblings above."
     ),
     "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/a100b/b8_s128_fused.r2.json.raw": (
-        "pre-rule-(g) raw leg (a100b box, s128, fused arm, replicate 2): same "
+        "pre-rule-(i) raw leg (a100b box, s128, fused arm, replicate 2): same "
         "provenance_note as the disabled-arm siblings above."
     ),
     "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/a100b/b8_s512_disabled.r1.json.raw": (
-        "pre-rule-(g) raw leg (a100b box, s512, disabled arm, replicate 1): same "
+        "pre-rule-(i) raw leg (a100b box, s512, disabled arm, replicate 1): same "
         "provenance_note as the s128 siblings above."
     ),
     "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/a100b/b8_s512_disabled.r2.json.raw": (
-        "pre-rule-(g) raw leg (a100b box, s512, disabled arm, replicate 2): same "
+        "pre-rule-(i) raw leg (a100b box, s512, disabled arm, replicate 2): same "
         "provenance_note as the s128 siblings above."
     ),
     "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/a100b/b8_s512_fused.r1.json.raw": (
-        "pre-rule-(g) raw leg (a100b box, s512, fused arm, replicate 1): same "
+        "pre-rule-(i) raw leg (a100b box, s512, fused arm, replicate 1): same "
         "provenance_note as the s128 siblings above."
     ),
     "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/a100b/b8_s512_fused.r2.json.raw": (
-        "pre-rule-(g) raw leg (a100b box, s512, fused arm, replicate 2): same "
+        "pre-rule-(i) raw leg (a100b box, s512, fused arm, replicate 2): same "
         "provenance_note as the s128 siblings above."
     ),
     "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/r2/b8_s128_disabled.json.raw": (
-        "pre-rule-(g) raw leg (r2 box, s128, disabled arm, single replicate): a separate "
+        "pre-rule-(i) raw leg (r2 box, s128, disabled arm, single replicate): a separate "
         "confirmation session, same 'kept .json.raw rather than fabricate a git_sha' "
         "reasoning as the a100b/ siblings above — see this dir's own PROVENANCE.md."
     ),
     "2026-08-25-adamw-d959805-a100-sxm4-raw-runs/r2/b8_s128_fused.json.raw": (
-        "pre-rule-(g) raw leg (r2 box, s128, fused arm, single replicate): same "
+        "pre-rule-(i) raw leg (r2 box, s128, fused arm, single replicate): same "
         "PROVENANCE.md reasoning as the r2/ sibling above."
     ),
 }
@@ -2098,7 +2058,7 @@ _REPORT_IDENTITY_FIELDS_BLOCK_RE = re.compile(
     r"pub const REPORT_IDENTITY_FIELDS:\s*&\[\(&str,\s*Nullable\)\]\s*=\s*&\[(.*?)\n\];",
     re.DOTALL,
 )
-# `EncodeStepTier`'s own disjoint provenance const (unit-62 E3/E6) — same
+# `EncodeStepTier`'s own disjoint provenance const — same
 # shape as `_TIER_IDENTITY_FIELDS_BLOCK_RE`, different const name. Unlike
 # `FinetuneStepTier`, `EncodeStepTier` never folds its provenance fields
 # into `IDENTITY_FIELDS`; they live here instead, at the SAME `tiers.
@@ -2124,7 +2084,7 @@ _FIELD_ENTRY_RE = re.compile(
 def _scoped_to_struct_impl(text: str, struct: str | None) -> str:
     """Narrows `text` to everything from a given struct's OWN `impl
     <struct> {` marker onward — REQUIRED the moment more than one struct in
-    the SAME file declares a const of the same name (`report.rs` now
+    the SAME file declares a const of the same name (`report.rs`
     carries both `FinetuneStepTier::IDENTITY_FIELDS` and `EncodeStepTier::
     IDENTITY_FIELDS`): an unscoped `block_re.search(text)` would always
     find whichever struct's block sits FIRST in the file, silently
@@ -2206,7 +2166,7 @@ _TORCH_PROVENANCE_ROOT_FIELDS = frozenset(
 )
 
 # --------------------------------------------------------------------------- #
-# HARD-MAPPED file→tier registry (unit-62 E6 restructure): every jammi tier
+# HARD-MAPPED file→tier registry: every jammi tier
 # rule (i) knows how to derive an identity tuple for is a ROW here, never a
 # hand-typed literal inline inside `build_identity_tuples()` — a NEW tier
 # (the next bench tier after `encode_step`) lands as a new registry row, in
@@ -2226,7 +2186,7 @@ _TIER_SOURCE_REGISTRY: dict[str, dict] = {
     "finetune_step": {
         "path": _JAMMI_REPORT_RS,
         "struct": "FinetuneStepTier",
-        # FinetuneStepTier's own K7-completeness convention (contrast
+        # FinetuneStepTier's own completeness convention (contrast
         # EncodeStepTier below): provenance/dispatch facts are folded in
         # via the SEPARATE, Report-level `REPORT_IDENTITY_FIELDS` const —
         # a strict superset shape, not a disjoint one.
@@ -2237,8 +2197,7 @@ _TIER_SOURCE_REGISTRY: dict[str, dict] = {
     "encode_step": {
         "path": _JAMMI_REPORT_RS,
         "struct": "EncodeStepTier",
-        # unit-62 E3's deliberate design choice (CONTRACT.md §E3): this
-        # tier's provenance is its OWN struct-scoped const, DISJOINT from
+        # By design this tier's provenance is its OWN struct-scoped const, DISJOINT from
         # IDENTITY_FIELDS, at the SAME `tiers.encode_step` root as identity
         # (never the Report-level `provenance` block).
         "provenance_block_re": _PROVENANCE_FIELDS_BLOCK_RE,
@@ -2256,8 +2215,8 @@ def build_identity_tuples() -> dict[tuple[str, str], dict]:
     once (module-level cache). Every `("<tier>", "jammi")` entry is derived
     uniformly from `_TIER_SOURCE_REGISTRY` (first-match `block_re`,
     struct-scoped per row — see `_extract_rust_identity_block`); the torch
-    side (only `finetune_step` has one — `encode_step` has no torch twin,
-    unit-62 PLAN.md v2 OQ4 ruling) is imported directly from
+    side (only `finetune_step` has one — `encode_step` has no torch twin)
+    is imported directly from
     `torch_finetune_step.py`'s own `TORCH_IDENTITY_FIELDS`. Never hand-typed.
     """
     global _IDENTITY_TUPLES_CACHE
@@ -2297,8 +2256,8 @@ def build_identity_tuples() -> dict[tuple[str, str], dict]:
 
 
 def _leg_field_value(leg: dict, field: str, root: str, tier: str):
-    """`root == "tier"` reads `leg["tiers"][tier][field]` — `tier` (unit-62
-    E6 restructure) is the CALLER's own `identity.tier` reading, never a
+    """`root == "tier"` reads `leg["tiers"][tier][field]` — `tier` is the
+    CALLER's own `identity.tier` reading, never a
     hardcoded tier name, so this same helper serves every registry row in
     `_TIER_SOURCE_REGISTRY` (`finetune_step`, `encode_step`, and whatever
     tier lands next) rather than only ever reading `tiers.finetune_step`
@@ -2413,7 +2372,7 @@ def check_v2_leg(
 
 def find_v2_legs(data, path_prefix: str = "") -> list[tuple[str, dict]]:
     """Recursively walks `data` for every dict carrying `leg_schema_version
-    >= 2` — this is the WHOLE discriminator (contract C6.1): a v2 leg can be
+    >= 2` — this is the WHOLE discriminator: a v2 leg can be
     the top-level document itself, or nested anywhere inside it (a folded
     `shapes.<s>.legs.<leg>` record, a `bench_legs[i]` entry, an embedded
     `clip_on_flash_leg.record`, ...). Recursion continues INTO a matched leg
@@ -2453,7 +2412,7 @@ def _find_raw_runs_dirs(cuda_runs_dir: Path) -> list[Path]:
     level down is still found), never by deriving one candidate sibling
     path from a particular artifact's stem. This is the ONE list every rule
     that reasons about raw legs — non-json-payload coverage, the v2-leg-
-    required-under-a-v2-parent rule, the `--census` falsifier — walks; none
+    required-under-a-v2-parent rule, the `--census` check — walks; none
     of them may instead loop over top-level artifacts and guess a sibling
     path per artifact, because that guess has a known committed
     counterexample (see `_raw_runs_dir_for`'s docstring)."""
@@ -2523,13 +2482,13 @@ def _covered_by(path: str, reached_paths: set[str]) -> bool:
 
 
 def census_unreached_measurement_objects(cuda_runs_dir: Path) -> list[str]:
-    """Falsifier F4 (contract §6): for every top-level artifact whose OWN
+    """`--census`'s check: for every top-level artifact whose OWN
     `schema_version >= 2`, every JSON object anywhere in its tree — the
     document itself and every `*.json` payload under its sibling
     `*-raw-runs/` directory — that carries `s_per_step_p50` must be
     REACHABLE as (or nested inside) a v2 leg rule (i) actually validated.
     Trivially empty today (zero `schema_version >= 2` top-level artifacts
-    exist yet) — the falsifier is standing for the day one does. Reaches
+    exist yet) — the check is standing for the day one does. Reaches
     exactly the same raw-runs directories `check_raw_runs_nonjson_coverage`
     does: discovered by `_find_raw_runs_dirs`'s name pattern plus
     `_artifact_for_raw_runs_dir`'s ownership lookup, never a per-artifact
@@ -2569,8 +2528,7 @@ def census_unreached_measurement_objects(cuda_runs_dir: Path) -> list[str]:
 def check_legacy_raw_nonjson_files_exist(cuda_runs_dir: Path) -> list[str]:
     """`--self-test`'s own shrink-only proof for `LEGACY_RAW_NONJSON`: every
     listed relpath must exist on disk. A deletion must shrink this list in
-    the SAME commit — growth (a new entry) is a gate edit, i.e.
-    SWARM_GATE_TOUCHED by construction (contract C6.2)."""
+    the SAME commit — growth (a new entry) is a gate edit."""
     return [
         f"LEGACY_RAW_NONJSON lists `{relpath}` but no such file exists under {cuda_runs_dir}"
         for relpath in LEGACY_RAW_NONJSON
@@ -2581,8 +2539,7 @@ def check_legacy_raw_nonjson_files_exist(cuda_runs_dir: Path) -> list[str]:
 def check_raw_runs_nonjson_coverage(cuda_runs_dir: Path) -> list[str]:
     """Every non-`.json` payload (excluding `.md`/`.log`) under ANY `*-raw-
     runs/` directory, at ANY depth, must be in the closed `LEGACY_RAW_NONJSON`
-    list — the `.json.raw` rename bypass (contract C6.2, pressure-v2 NF8) a
-    NEW leg may never reuse. Walks `_find_raw_runs_dirs`'s full, name-
+    list — the `.json.raw` rename bypass a NEW leg may never reuse. Walks `_find_raw_runs_dirs`'s full, name-
     pattern-based discovery — never a per-artifact `<stem>-raw-runs` guess,
     which has a committed counterexample that does not match any artifact's
     stem (`2026-08-25-p6-b3-dense-raw-runs/`) and would otherwise never be
@@ -2605,7 +2562,7 @@ def check_raw_runs_nonjson_coverage(cuda_runs_dir: Path) -> list[str]:
 def check_raw_runs_require_v2(
     data: dict, f: Path, cuda_runs_dir: Path, schema_v2_raw_runs_dirs: set[Path]
 ) -> list[str]:
-    """Contract C6.2's last sentence: under a parent artifact with
+    """Under a parent artifact with
     `schema_version >= 2`, every `*.json` payload under its `*-raw-runs/`
     sibling MUST carry `leg_schema_version >= 2` (else RED) — a v1-shaped
     raw leg silently coexisting under an already-v2 parent is exactly the
@@ -2679,7 +2636,7 @@ def run_gate(
     # rule (i) precompute: EVERY `*-raw-runs/` directory in the tree
     # (`_find_raw_runs_dirs` — name-pattern discovery, not a per-artifact
     # guess), which top-level artifact owns each one, and which of those
-    # owners is already schema_version >= 2 (C6.2's "MUST carry
+    # owners is already schema_version >= 2 (the "MUST carry
     # leg_schema_version >= 2" mandate is conditional on that).
     raw_runs_dirs = _find_raw_runs_dirs(cuda_runs_dir)
     dir_for_artifact: dict[Path, Path] = {}
@@ -2726,7 +2683,7 @@ def run_gate(
 
     all_failures.extend(check_raw_runs_nonjson_coverage(cuda_runs_dir))
 
-    # rule (f)'s mechanical companion (C8.3): every LEGACY_NONE_ALLOWLIST
+    # rule (f)'s mechanical companion: every LEGACY_NONE_ALLOWLIST
     # entry's own first-introduction commit must predate this gate.
     for relpath in allowlist:
         all_failures.extend(
@@ -2779,7 +2736,7 @@ def main() -> int:
 
 
 def run_census() -> int:
-    """`--census`: falsifier F4 — lists every `s_per_step_p50`-carrying JSON
+    """`--census`: lists every `s_per_step_p50`-carrying JSON
     object under a `schema_version >= 2` top-level artifact that rule (i)
     did NOT reach. Must print 0 today (no such artifact exists yet); the
     check is standing for the day one does."""
@@ -2846,7 +2803,7 @@ def self_test() -> int:
         # be tracked (rule (b)) so its own findings never contaminate the
         # marker-specific `expect_hit` needle below.
         (perf_dir / "profile_421_legs.sh").write_text("# stub source-identity-declaring producer\n")
-        # F4: tracked stand-ins for the two gang-leg renting drivers, so
+        # Tracked stand-ins for the two gang-leg renting drivers, so
         # `_gang_check_leg_producer_binding`'s own path=="the leg's own
         # driver" assertion has a real, `git ls-files`-tracked file to bind
         # against (rule (b) — producer.path exists and is tracked).
@@ -2872,10 +2829,10 @@ def self_test() -> int:
         # `second_sha` names ever existed.
         second_sha = _run(["git", "rev-parse", "HEAD"], repo).stdout.strip()
 
-        # rule (k), M1's anchor arms need two MORE shas:
+        # rule (k)'s evidence-anchor arms need two MORE shas:
         #   `third_sha` (== HEAD) is a commit strictly AFTER `second_sha`, so
         #   an ε "registered" there is an ancestor of HEAD yet NOT an
-        #   ancestor of the anchor — the one arm no mutation used to drive;
+        #   ancestor of the anchor;
         #   `orphan_sha` is a real commit object on an orphan branch, an
         #   ancestor of nothing in HEAD's history — the shape a measured tip
         #   takes once its landing commit rewrote it (the `merged_as` case).
@@ -3148,21 +3105,20 @@ def self_test() -> int:
             bad,
             "2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json",
             "matches a known profile/frontend artifact family",
-            "rule (j): -profile-<N>- filename family anchors the marker-mandatory arm (issue #421's own N), "
+            "rule (j): -profile-<N>- filename family anchors the marker-mandatory arm (N=421), "
             "independent of producer.path",
         )
 
         bad = baseline()
         bad["producer"] = dict(bad["producer"])
-        # A DIFFERENT issue's own N (never 421) proves the anchor is a
-        # FAMILY TOKEN, not a hard-coded issue number this repo would have
-        # to keep editing for every future profile-family unit.
+        # A DIFFERENT N (never 421) proves the anchor is a FAMILY TOKEN, not
+        # a hard-coded number.
         expect_hit(
             bad,
             "2027-01-01-profile-500-towers-deadbeef-a100-sxm4.json",
             "matches a known profile/frontend artifact family",
-            "rule (j): -profile-<N>- filename family anchors the marker-mandatory arm for a DIFFERENT N (#500, "
-            "never hard-coded to #421), independent of producer.path",
+            "rule (j): -profile-<N>- filename family anchors the marker-mandatory arm for a DIFFERENT N (500, "
+            "never hard-coded to 421), independent of producer.path",
         )
 
         bad = baseline()
@@ -3187,17 +3143,15 @@ def self_test() -> int:
 
         # A GENUINE regression control, off the REAL committed
         # `2026-08-31-profile-356-closeout-...json` filename: it matches a
-        # bare `-profile-\d+-` (issue #356's own closeout artifact, a
-        # DIFFERENT, already-closed campaign that never adopted the
-        # source-identity convention this rule enforces) but must NOT match
-        # `SOURCE_IDENTITY_DECLARING_FILENAME_RE`'s own required `-towers-`
-        # token — a bare `-profile-\d+-` regex (this rule's OWN prior
-        # shape) would wrongly retroactively demand the marker on this
-        # unrelated artifact.
+        # bare `-profile-\d+-` (a closeout artifact that does not declare
+        # the source-identity convention this rule enforces) but must NOT
+        # match `SOURCE_IDENTITY_DECLARING_FILENAME_RE`'s own required
+        # `-towers-` token — a bare `-profile-\d+-` regex would wrongly
+        # demand the marker on this unrelated artifact.
         expect_clean(
             baseline(),
             "2026-08-31-profile-356-closeout-7820d697-a100-sxm4.json",
-            "rule (j): a -profile-<N>- filename WITHOUT -towers- (issue #356's own closeout artifact) "
+            "rule (j): a -profile-<N>- filename WITHOUT -towers- (a closeout artifact) "
             "anchors nothing",
         )
 
@@ -3321,7 +3275,7 @@ def self_test() -> int:
             # (root_sha), which is what makes it pre-registered.
             d["git_sha"] = second_sha
             d["artifact_kind"] = "gang"
-            # F4: producer bound to the pod leg's OWN renting driver — a
+            # Producer bound to the pod leg's OWN renting driver — a
             # self-declared `leg` cannot point at a different (or no)
             # driver script.
             d["producer"] = {
@@ -3359,13 +3313,12 @@ def self_test() -> int:
             d = baseline()
             d["git_sha"] = second_sha
             d["artifact_kind"] = "gang"
-            # F4: producer bound to the cluster leg's OWN renting driver
-            # (P-E2: registered again now that U7b-A2b's driver ships).
+            # Producer bound to the cluster leg's OWN renting driver.
             d["producer"] = {
                 "path": "ci/scripts/runpod_gpu_cluster.sh",
                 "kind": "script",
                 "invocation": "bash ci/scripts/runpod_gpu_cluster.sh",
-                "gating": "env:JAMMI_REQUIRE_CUDA_TWO_HOSTS",
+                "gating": "none",
             }
             d["gang"] = {
                 "leg": "cluster",
@@ -3423,16 +3376,15 @@ def self_test() -> int:
             del bad["gang"][field]
             expect_hit(bad, "x.json", f"`gang.{field}` is missing", f"rule (k): pod leg missing gang.{field}")
 
-        # Contract's own named example: a pod artifact lacking epsilon still
-        # fails (covered by the loop above; re-stated standalone so the
-        # exact contract wording has its own citable case).
+        # A pod artifact lacking epsilon fails (covered by the loop above;
+        # re-stated standalone as the canonical example).
         bad = gang_baseline()
         del bad["gang"]["epsilon"]
         expect_hit(bad, "x.json", "`gang.epsilon` is missing", "rule (k): a pod artifact lacking epsilon still fails")
 
-        # Cluster leg: missing rows, one per registry entry -- the contract's
-        # own named example (a cluster artifact lacking `hosts` fails by
-        # name) plus every sibling row.
+        # Cluster leg: missing rows, one per registry entry (a cluster
+        # artifact lacking `hosts` fails by name, and so does every sibling
+        # row).
         for field in (
             "world",
             "collective",
@@ -3451,7 +3403,7 @@ def self_test() -> int:
                 bad, "x.json", f"`gang.{field}` is missing", f"rule (k): cluster leg missing gang.{field}"
             )
 
-        # M7: `transport` -- closed set, both spellings accepted, anything
+        # `transport` -- closed set, both spellings accepted, anything
         # else refused.
         for good_transport in ("instant-cluster", "global-networking"):
             ok = gang_cluster_baseline()
@@ -3531,7 +3483,7 @@ def self_test() -> int:
             "rule (k): cluster leg ignores stray pod-only fields rather than cross-checking them",
         )
 
-        # F4 -- the strengthened cluster registry ------------------------------
+        # the cluster registry's cross-rank properties ------------------------
         # (i) two ranks on one host FAILS (not the two-host bootstrap this
         # leg exists to prove).
         bad = gang_cluster_baseline()
@@ -3540,13 +3492,13 @@ def self_test() -> int:
             bad,
             "x.json",
             "repeats a host across ranks",
-            "rule (k) F4: two ranks on the same host FAILS",
+            "rule (k): two ranks on the same host FAILS",
         )
 
         # (i-b) two ranks on the SAME host differing only in CASE also FAILS
         # -- compared case-insensitively (and stripped), the same
         # normalization the assembler's own `_norm_host` applies before it
-        # ever writes an artifact (F4 advisory).
+        # ever writes an artifact.
         bad = gang_cluster_baseline()
         bad["gang"]["ranks"][0]["host"] = "Host-A"
         bad["gang"]["ranks"][1]["host"] = "host-a"
@@ -3554,7 +3506,7 @@ def self_test() -> int:
             bad,
             "x.json",
             "repeats a host across ranks",
-            "rule (k) F4: two ranks on the same host differing only in case FAILS",
+            "rule (k): two ranks on the same host differing only in case FAILS",
         )
 
         # (ii) an `unknown` host or iface FAILS -- the driver's own
@@ -3566,7 +3518,7 @@ def self_test() -> int:
             bad,
             "x.json",
             "`gang.ranks[0].host` is 'unknown'",
-            "rule (k) F4: an `unknown` host FAILS",
+            "rule (k): an `unknown` host FAILS",
         )
         bad = gang_cluster_baseline()
         bad["gang"]["ranks"][1]["iface"] = "UNKNOWN"
@@ -3574,7 +3526,7 @@ def self_test() -> int:
             bad,
             "x.json",
             "`gang.ranks[1].iface` is 'UNKNOWN'",
-            "rule (k) F4: an `unknown` iface FAILS case-insensitively",
+            "rule (k): an `unknown` iface FAILS case-insensitively",
         )
 
         # (iii) a per-rank digest mismatch on a `pass` FAILS -- kept PER
@@ -3585,7 +3537,7 @@ def self_test() -> int:
             bad,
             "x.json",
             "reduced_vector_digest` disagree across ranks",
-            "rule (k) F4: per-rank digest mismatch on pass FAILS",
+            "rule (k): per-rank digest mismatch on pass FAILS",
         )
         bad = gang_cluster_baseline()
         del bad["gang"]["ranks"][0]["reduced_vector_digest"]
@@ -3593,7 +3545,7 @@ def self_test() -> int:
             bad,
             "x.json",
             "`gang.ranks[0].reduced_vector_digest` must be a 64-lowercase-hex digest",
-            "rule (k) F4: a pass with a missing per-rank digest FAILS",
+            "rule (k): a pass with a missing per-rank digest FAILS",
         )
 
         # (iv) hosts != pod_count, world != pod_count*gpu_count_per_pod.
@@ -3603,7 +3555,7 @@ def self_test() -> int:
             bad,
             "x.json",
             "does not equal `gang.pod_count`",
-            "rule (k) F4: gang.hosts != gang.pod_count FAILS",
+            "rule (k): gang.hosts != gang.pod_count FAILS",
         )
         bad = gang_cluster_baseline()
         bad["gang"]["gpu_count_per_pod"] = 2
@@ -3611,7 +3563,7 @@ def self_test() -> int:
             bad,
             "x.json",
             "does not equal `gang.pod_count` x `gang.gpu_count_per_pod`",
-            "rule (k) F4: gang.world != pod_count x gpu_count_per_pod FAILS",
+            "rule (k): gang.world != pod_count x gpu_count_per_pod FAILS",
         )
 
         # (v) leg/producer mismatch FAILS -- a self-declared leg cannot
@@ -3622,7 +3574,7 @@ def self_test() -> int:
             bad,
             "x.json",
             "requires `producer.path` == 'ci/scripts/runpod_gpu_cluster.sh'",
-            "rule (k) F4: gang.leg == cluster with the pod leg's producer.path FAILS",
+            "rule (k): gang.leg == cluster with the pod leg's producer.path FAILS",
         )
         bad = gang_baseline()
         bad["producer"] = dict(gang_cluster_baseline()["producer"])  # the CLUSTER leg's own driver
@@ -3630,7 +3582,7 @@ def self_test() -> int:
             bad,
             "x.json",
             "requires `producer.path` == 'ci/scripts/runpod_gpu_gang.sh'",
-            "rule (k) F4: gang.leg == pod with the cluster leg's producer.path FAILS",
+            "rule (k): gang.leg == pod with the cluster leg's producer.path FAILS",
         )
 
         bad = gang_baseline()
@@ -3767,12 +3719,10 @@ def self_test() -> int:
         bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha=second_sha)
         expect_hit(bad, "x.json", "equals the artifact's own `git_sha`", "rule (k): ε registered in the measured commit")
 
-        # M1 — the EVIDENCE ANCHOR (`_gang_evidence_anchor`). One mutation
-        # per arm, over both anchor shapes plus the no-anchor case. The
-        # first revision of this rule guarded both ε ordering arms behind
-        # "`git_sha` is an ancestor of HEAD", so every case in the
-        # `merged_as` block below was SILENTLY ADMITTED, and the
-        # not-an-ancestor-of-the-anchor arm was driven by no mutation at all.
+        # The EVIDENCE ANCHOR (`_gang_evidence_anchor`). One mutation per
+        # arm, over both anchor shapes plus the no-anchor case. Guarding the
+        # ε ordering arms behind "`git_sha` is an ancestor of HEAD" would
+        # SILENTLY ADMIT every case in the `merged_as` block below.
 
         # (1) merged_as shape: the measured tip was rewritten on landing, so
         # `git_sha` is an ancestor of nothing and `merged_as` is the anchor.
@@ -3821,10 +3771,9 @@ def self_test() -> int:
         # survived into HEAD's history AND a `merged_as` was stamped beside
         # it. The evidence is the tree `git_sha` names — that is where the
         # measurement happened — so the anchor is `git_sha`, and the later
-        # landing commit must not be allowed to relax the ordering. The
-        # first revision of `_gang_evidence_anchor` tried `merged_as` FIRST,
-        # which retargeted ε's constraint onto the landing commit: an ε
-        # registered in the very commit it measures was then ADMITTED.
+        # landing commit must not be allowed to relax the ordering. Trying
+        # `merged_as` FIRST would retarget ε's constraint onto the landing
+        # commit and ADMIT an ε registered in the very commit it measures.
         def both_anchors_gang() -> dict:
             d = gang_baseline()  # git_sha == second_sha, itself an ancestor of HEAD
             d["merged_as"] = third_sha
@@ -3897,7 +3846,7 @@ def self_test() -> int:
         ok["gang"]["per_step_loss_delta"] = [0.0, 1.0e-6]
         expect_clean(ok, "control-gang-epsilon-boundary.json", "rule (k): worst == epsilon.value is inside the tolerance")
 
-        # M2 — `gang.verdict`. One mutation per DETERMINANT: the value
+        # `gang.verdict`. One mutation per DETERMINANT: the value
         # itself, each thing a `fail` owes, and each consequence that binds
         # on `pass` ONLY (so the same payload that FAILS as a pass must be
         # ADMITTED as a fail — the property is "a failing run is
@@ -3910,8 +3859,8 @@ def self_test() -> int:
         bad["gang"]["verdict"] = "unknown"
         expect_hit(bad, "x.json", "`gang.verdict` must be exactly one of", "rule (k): verdict outside the closed set")
 
-        # A `pass` at world 2 with an unequal same-seed pair: S5's measured
-        # regime, so this is a failed run recorded as a pass.
+        # A `pass` at world 2 with an unequal same-seed pair: the spike's
+        # measured byte-identical regime, so this is a failed run recorded as a pass.
         bad = gang_baseline()
         bad["gang"]["digests"] = [
             {"seed": 7, "digest": "a" * 64},
@@ -4067,8 +4016,8 @@ def self_test() -> int:
         }
         expect_hit(bad, "brand-new-not-allowlisted.json", "not in the reviewed LEGACY_NONE_ALLOWLIST", "rule (f): new file defaulting to none")
 
-        # rule (g) — KO-3 oracle_separation, optional per leg -------------------
-        # GREEN: absent entirely — no existing (pre-rule) artifact reddens.
+        # rule (g) — oracle_separation, optional per leg ------------------------
+        # GREEN: absent entirely is clean.
         expect_clean(baseline(), "control-no-separation-block.json", "rule (g): oracle_separation absent is clean")
 
         # GREEN: present, nested under an arbitrary leg name, with real
@@ -4102,7 +4051,7 @@ def self_test() -> int:
         }
         expect_hit(bad_sep2, "x.json", "missing required field", "rule (g): incomplete oracle_separation block is caught")
 
-    # rule (i) — v2 leg identity (contract C6) -----------------------------
+    # rule (i) — v2 leg identity -------------------------------------------
     # A dedicated, isolated fixture repo per case (never the real checkout),
     # exercised through `run_gate` end-to-end so the discovery walk,
     # raw/folded dispatch, and sha cross-check all fire together, exactly as
@@ -4152,10 +4101,9 @@ def self_test() -> int:
         from `build_sha` (rule (i)'s `provenance.build_sha`/`git_rev`) — a
         case exercising an invalid/mismatched `build_sha` must not also
         break the file's OWN base schema, or the two rules' findings become
-        impossible to tell apart. `tier_name` (unit-62 E6 restructure)
-        defaults to `"finetune_step"`, unchanged from before this
-        generalization — the encode-step self-test rows below pass
-        `tier_name="encode_step"` explicitly.
+        impossible to tell apart. `tier_name` defaults to `"finetune_step"`;
+        the encode-step self-test rows below pass `tier_name="encode_step"`
+        explicitly.
         """
         tuple_spec = build_identity_tuples()[(tier_name, producer_kind)]
         doc: dict = {
@@ -4214,7 +4162,7 @@ def self_test() -> int:
     if any("torch_cuda_version" in g for g in got):
         failures.append(f"self-test FAILED: rule (i) iii: a present-but-null NullMeans field must NOT be a finding: {got}")
 
-    # (iii-encode) unit-62 E6 gate restructure: the `_TIER_SOURCE_REGISTRY`
+    # (iii-encode) the `_TIER_SOURCE_REGISTRY`
     # `encode_step` row is exercised the SAME way the finetune_step rows
     # above are — a struct-scoped extraction (`EncodeStepTier::
     # IDENTITY_FIELDS` + its OWN disjoint `::PROVENANCE_FIELDS`, both folded
@@ -4224,7 +4172,7 @@ def self_test() -> int:
     if ("encode_step", "torch") in build_identity_tuples():
         failures.append(
             "self-test FAILED: build_identity_tuples() carries an (encode_step, torch) entry — "
-            "encode_step has no torch twin (unit-62 PLAN.md v2 OQ4 ruling); a registry mistake "
+            "encode_step has no torch twin; a registry mistake "
             "here would silently accept a torch-shaped encode leg rule (i) should reject"
         )
     encode_field_names = {f[0] for f in encode_tuple["fields"]}
@@ -4247,7 +4195,7 @@ def self_test() -> int:
 
     # `chunk_size` is `EncodeStepTier::PROVENANCE_FIELDS`' one `NullMeans`
     # entry — same missing/present-null pair the torch `torch_cuda_version`
-    # checks above exercise, now proving the disjoint-provenance row's
+    # checks above exercise, proving the disjoint-provenance row's
     # NullMeans field reads correctly too.
     missing_encode_nullmeans_leg = _full_leg_fixture("jammi", "c" * 40, tier_name="encode_step")
     del missing_encode_nullmeans_leg["tiers"]["encode_step"]["chunk_size"]
@@ -4342,9 +4290,8 @@ def self_test() -> int:
     # (ii)/(i) — a non-.json raw payload (e.g. a `.json.raw` rename) under a
     # `*-raw-runs/` dir that is NOT in the closed LEGACY_RAW_NONJSON list ->
     # RED, regardless of the parent's own schema_version or the payload's
-    # own leg_schema_version (both contract acceptance bullets (i) and (ii)
-    # land on this SAME finding under this gate's design: the rename bypass
-    # is caught before content is ever inspected).
+    # own leg_schema_version (both shapes land on this SAME finding: the
+    # rename bypass is caught before content is ever inspected).
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_ii:
         cr, root = _rule_g_fixture(Path(tmp_ii))
         parent = {
@@ -4438,7 +4385,7 @@ def self_test() -> int:
 
     # (vii) a v1 leg (no `leg_schema_version` at all) under a schema_version:
     # 1 parent -> unchanged behaviour: rule (i) finds nothing, only rules
-    # (a)-(f) apply, exactly as before this rule existed.
+    # (a)-(f) apply.
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_vii:
         cr, root = _rule_g_fixture(Path(tmp_vii))
         parent = {
@@ -4464,7 +4411,7 @@ def self_test() -> int:
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_viii:
         cr, gate_sha = _rule_g_fixture(Path(tmp_viii))
         # `git log --follow`'s rename detection is CONTENT-similarity based
-        # (needed for real `git mv`-tracked baselines, contract C8.2/C8.3).
+        # (needed for real `git mv`-tracked baselines).
         # A single-line, LOW-ENTROPY body (shared JSON key/value boilerplate,
         # or even a long run of one repeated padding character) can hash-
         # similar enough for git to treat the second file as a rename of the
@@ -4620,8 +4567,8 @@ def self_test() -> int:
         "merged_as/merged_via_pr pairing), (b) producer.path existence+tracking, (c) cargo-test "
         "static gating verification (#[ignore]/env:VAR/required-features), (d) ancestry (both the "
         "plain git_sha path and the merged_as squash-landing rescue, and its own non-ancestor RED "
-        "case), (e) README producer tracking, (f) the none-allowlist closure (including its C8.3 "
-        "first-introduction-predates-the-gate history check), and the OPTIONAL KO-3 "
+        "case), (e) README producer tracking, (f) the none-allowlist closure (including its "
+        "first-introduction-predates-the-gate history check), and the OPTIONAL "
         "oracle_separation block (absent is clean; a genuinely-separated bound is clean; a bound "
         "that is not strictly between healthy_max_offsample and min_control, or an incomplete "
         "block, is caught) all bite on a throwaway fixture repo; GREEN controls "
@@ -4642,7 +4589,7 @@ def self_test() -> int:
         "artifact that already carries a non-empty producer.source_sha256 block, or an artifact whose own "
         "basename matches a known profile/frontend SOURCE_IDENTITY_DECLARING_FILENAME_RE family, matched "
         "against the basename only, never an ancestor directory's own name) round out rule (j). "
-        "Rule (k)'s `gang` kind bites on every determinant of its own registry — each GANG_FIELD_"
+        "Rule (k)'s `gang` kind bites on every determinant of its own registry — each GANG_POD_FIELD_"
         "REGISTRY field missing, world < 2, a device count that disagrees with world, a repeated rank, "
         "an empty rank list, a rank entry that is not an object, a rank index that is a string or "
         "negative, two well-formed ranks that are not 0..world-1, a digest entry that is not an "
@@ -4666,7 +4613,7 @@ def self_test() -> int:
         "no reason and a `fail` filed GREEN are caught, a `pass` at world 2 whose same-seed pair "
         "disagrees is caught while the same pair above world 2 is recorded rather than asserted, "
         "and the exact delta/digest payloads that FAIL as a pass are ADMITTED as a fail. "
-        "`gang.leg` (M6) discriminates the pod registry above from the CLUSTER leg's own "
+        "`gang.leg` discriminates the pod registry above from the CLUSTER leg's own "
         "(hosts == 2, per-rank host/device/iface, a bit-exact reduced_vector_digest, pod_count/"
         "gpu_count_per_pod/ttl_hours, no ε/delta row at all) -- missing/unrecognized leg, every "
         "missing cluster row, a wrong host count, a malformed rank, and a pass with no digest are "

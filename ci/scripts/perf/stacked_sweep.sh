@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# stacked_sweep.sh -- the committed, parameterised producer for the P6 Stage
-# B "stacked" throughput sweep: jammi-fused STACKED (FA2 dense attention arm
+# stacked_sweep.sh -- the committed, parameterised producer for the
+# "stacked" throughput sweep: jammi-fused STACKED (FA2 dense attention arm
 # + the fused AdamW step, both admitted together under
 # JAMMI_KERNELS_STRICT=1) vs an ALL-OFF eager baseline (the same two ops
 # forced eager) vs the PyTorch/PEFT sdpa reference, across 8 batch/seq

@@ -505,7 +505,7 @@ class CensusFixedCostHybridBoundTests(unittest.TestCase):
     the relative bound, plus the two exact fixture numbers that exhibit
     those modes."""
 
-    def test_round1_fixture_899ns_per_launch_no_longer_flips_to_refusal(self):
+    def test_899ns_per_launch_perturbation_does_not_flip_to_refusal(self):
         # `CensusFixedCostGuardTests`'s "must never refuse" fixture (5
         # launches, 1000ns -> 900ns each) measures rel == 0.100000 EXACTLY
         # -- zero margin against a 0.10 relative-only bound. Perturbing B by

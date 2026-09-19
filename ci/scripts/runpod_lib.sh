@@ -47,9 +47,9 @@
 #   RP_INACTIVITY seconds of silent (no new output byte) remote stdout+stderr
 #                 before `rp_run_remote_watched` kills the ssh
 #                 session as a hang, rather than waiting out the full
-#                 RP_TIMEOUT budget (default 900 -- derived from prove run
-#                 33674156137's largest healthy in-window silence, 285.2s on
-#                 sm_90, x R2's 3x margin, rounded up to the next 300s step;
+#                 RP_TIMEOUT budget (default 900 -- derived from the largest
+#                 healthy in-window silence in the committed prove timings,
+#                 285.2s on sm_90, x R2's 3x margin, rounded up to the next 300s step;
 #                 see the setter's own comment below for the full
 #                 derivation). This is a DIFFERENT axis
 #                 from RP_TIMEOUT: a hung leg (e.g. a genuinely stuck test)
@@ -198,8 +198,8 @@ RP_SSH_WAIT_SECS=$((10#$RP_SSH_WAIT_SECS))
 # silent-output span this long (seconds, no NEW bytes on the remote's
 # stdout+stderr stream) is read as a genuine hang, not merely a slow
 # command, and kills the ssh session rather than waiting out the full
-# RP_TIMEOUT budget. Default 900s -- derived from prove run 33674156137:
-# largest healthy in-window silence 285.2s (sm_90, repository clone --
+# RP_TIMEOUT budget. Default 900s -- derived from the committed prove
+# timings: largest healthy in-window silence 285.2s (sm_90, repository clone --
 # `ci/artifacts/gpu-prove-timings/33674156137-sm_90.json`) x
 # `check_gpu_prove_timings.py`'s own R2 3x margin = 855.6s, rounded up to
 # the next 300s step; re-derive when R2 moves it. Validated here, not at
@@ -675,7 +675,7 @@ rp_session_load() {
 # connect. RunPod's `RUNNING` status and a mapped port say the CONTAINER is
 # up; the image's entrypoint installs openssh-server after boot
 # (`_rp_entrypoint_setup`), so the mapped port refuses connections for tens
-# of seconds first (gpu-cluster run 35163325352: both pods RUNNING and
+# of seconds first (measured on the cluster lane: both pods RUNNING and
 # GN-enabled at 224 s, the first ssh to rank 0 refused 0.1 s later). Every
 # leg decides "usable" with this ONE probe -- never with the API status.
 #   rp_sshd_answers <host> <port> [extra ssh options...]
@@ -1512,7 +1512,7 @@ EOF
 # ═════════════════════════════════════════════════════════════════════════
 
 # The cluster create request body — REST v2's `CreateClusterRequest`, which
-# is `unevaluatedProperties: false` (RunPod's schema, read 2026-09-14): this
+# is `unevaluatedProperties: false` (RunPod's published schema): this
 # function emits EXACTLY the documented keys and no others, or the API
 # rejects the whole request. `compute.gpuCountPerPod`/`compute.podCount`
 # below are a FIXED 2x1 request (2 pods x 1 GPU each) — this tooling's own

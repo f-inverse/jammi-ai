@@ -337,13 +337,13 @@ rp_prove_verdict 0 "$log"
 # substituted for a sandbox-local workdir -- the ONLY adaptation, disclosed
 # here, everything else is the file's own unmodified bytes.
 # ============================================================================
-ESC082_BIN="$SANDBOX/heredoc-exec-bin"
-mkdir -p "$ESC082_BIN"
+HEREDOC_EXEC_BIN="$SANDBOX/heredoc-exec-bin"
+mkdir -p "$HEREDOC_EXEC_BIN"
 
-cat > "$ESC082_BIN/cargo" <<'CARGOSTUB'
+cat > "$HEREDOC_EXEC_BIN/cargo" <<'CARGOSTUB'
 #!/usr/bin/env bash
 args="$*"
-if [ -n "${ESC082_FAIL_MATCH:-}" ] && [[ "$args" == *"$ESC082_FAIL_MATCH"* ]]; then
+if [ -n "${HEREDOC_EXEC_FAIL_MATCH:-}" ] && [[ "$args" == *"$HEREDOC_EXEC_FAIL_MATCH"* ]]; then
   echo "stub cargo: FAILING ($args)" >&2
   exit 1
 fi
@@ -351,9 +351,9 @@ echo "stub cargo: ok ($args)"
 echo "test result: ok. 1 passed; 0 failed; 0 ignored"
 exit 0
 CARGOSTUB
-chmod +x "$ESC082_BIN/cargo"
+chmod +x "$HEREDOC_EXEC_BIN/cargo"
 
-cat > "$ESC082_BIN/nvidia-smi" <<'NVSTUB'
+cat > "$HEREDOC_EXEC_BIN/nvidia-smi" <<'NVSTUB'
 #!/usr/bin/env bash
 case "$*" in
   *"name,compute_cap,driver_version"*)
@@ -364,9 +364,9 @@ case "$*" in
   *) echo "" ;;
 esac
 NVSTUB
-chmod +x "$ESC082_BIN/nvidia-smi"
+chmod +x "$HEREDOC_EXEC_BIN/nvidia-smi"
 
-cat > "$ESC082_BIN/git" <<'GITSTUB'
+cat > "$HEREDOC_EXEC_BIN/git" <<'GITSTUB'
 #!/usr/bin/env bash
 case "$1" in
   clone)
@@ -376,19 +376,19 @@ case "$1" in
     # working directory once wrote a tree mirror into the real checkout).
     dest_abs="$(cd "$(dirname "$dest")" 2>/dev/null && pwd)/$(basename "$dest")"
     case "$dest_abs" in
-      "${ESC082_WORKDIR:?unset}"/*) ;;
+      "${HEREDOC_EXEC_WORKDIR:?unset}"/*) ;;
       *) echo "git stub: refusing to clone outside the sandbox: ${dest_abs}" >&2; exit 97 ;;
     esac
     mkdir -p "$dest_abs"
-    cp -r "${ESC082_REAL_ROOT:?unset}/ci" "$dest_abs/ci"
-    cp -r "$ESC082_REAL_ROOT/crates" "$dest_abs/crates"
+    cp -r "${HEREDOC_EXEC_REAL_ROOT:?unset}/ci" "$dest_abs/ci"
+    cp -r "$HEREDOC_EXEC_REAL_ROOT/crates" "$dest_abs/crates"
     ;;
   rev-parse) echo "0000000000000000000000000000000000000000" ;;
   *) : ;;
 esac
 exit 0
 GITSTUB
-chmod +x "$ESC082_BIN/git"
+chmod +x "$HEREDOC_EXEC_BIN/git"
 
 # Extracts the heredoc's literal body (between `<<REMOTE` and the closing
 # `REMOTE`) and writes it as a runnable script UNMODIFIED -- never a
@@ -397,7 +397,7 @@ chmod +x "$ESC082_BIN/git"
 # RP_REMOTE_ROOT (runpod_lib.sh) roots the remote checkout, and the
 # fixture re-renders REMOTE_CHECKOUT_LINES through the real helper with
 # that root before the heredoc is expanded.
-esc082_extract_heredoc() {
+heredoc_exec_extract_heredoc() {
   local out="$1"
   local start end
   start="$(grep -n '<<REMOTE' "$PROVE_SH" | head -1 | cut -d: -f1)"
@@ -410,7 +410,7 @@ esc082_extract_heredoc() {
   # `${GIT_REF}`/`${GIT_REPO}` expanded using THIS fixture's own env --
   # producing the EXACT text the real driver would send over ssh. Feeding
   # `$raw_text` through a SECOND, genuinely unquoted heredoc via `eval`
-  # (which re-parses its argument as fresh source, so `<<ESC082_RAW...`
+  # (which re-parses its argument as fresh source, so `<<HEREDOC_EXEC_RAW...`
   # below is a REAL heredoc redirect at that point, not inert text) gets
   # this right without hand-reimplementing heredoc-expansion rules; a
   # naive `\$` -> `$` sed substitution produces a bash syntax error
@@ -421,33 +421,33 @@ esc082_extract_heredoc() {
   # otherwise close the OUTER assignment's string early. Phase 2 is just
   # running the resulting (already-expanded) text as an ordinary script.
   echo '#!/usr/bin/env bash' > "$out"
-  eval "cat <<ESC082_RAW_9f8a3c
+  eval "cat <<HEREDOC_EXEC_RAW_9f8a3c
 $raw_text
-ESC082_RAW_9f8a3c" >> "$out"
+HEREDOC_EXEC_RAW_9f8a3c" >> "$out"
 }
 
 # Runs the extracted heredoc script with `$1`=the cargo invocation substring
 # to FAIL (empty = everything succeeds), writing the emitted log to `$2`.
 # Returns the script's own exit code (mirrors `raw_rc` in the real driver,
 # since this IS the remote script the driver's own `wait $pid` would see).
-esc082_run() {
+heredoc_exec_run() {
   local fail_match="$1" outlog="$2"
   local script="$SANDBOX/heredoc-exec-script.sh"
   local workdir="$SANDBOX/heredoc-exec-workdir-$$-$RANDOM"
   rm -rf "$workdir"; mkdir -p "$workdir"
-  # Phase-1 expansion (inside esc082_extract_heredoc's own `eval`) needs
-  # NATIVE_COMPUTE_CAP/GIT_REF/GIT_REPO/ESC082_WORKDIR ALREADY set in THIS
+  # Phase-1 expansion (inside heredoc_exec_extract_heredoc's own `eval`) needs
+  # NATIVE_COMPUTE_CAP/GIT_REF/GIT_REPO/HEREDOC_EXEC_WORKDIR ALREADY set in THIS
   # shell -- it runs at EXTRACTION time, not at the later `env ... bash`
   # run time below, so exporting them only on that later line would be too
   # late for the `${...}` references the extraction step must resolve.
-  export NATIVE_COMPUTE_CAP=80 GIT_REF=test-ref GIT_REPO=unused ESC082_WORKDIR="$workdir"
+  export NATIVE_COMPUTE_CAP=80 GIT_REF=test-ref GIT_REPO=unused HEREDOC_EXEC_WORKDIR="$workdir"
   export RP_REMOTE_ROOT="$workdir"
   REMOTE_CHECKOUT_LINES="$(rp_remote_checkout_lines "$GIT_REF" "$GIT_REPO")"
-  esc082_extract_heredoc "$script"
-  env PATH="$ESC082_BIN:$PATH" \
-    ESC082_FAIL_MATCH="$fail_match" \
-    ESC082_REAL_ROOT="$REPO_ROOT" \
-    ESC082_WORKDIR="$workdir" \
+  heredoc_exec_extract_heredoc "$script"
+  env PATH="$HEREDOC_EXEC_BIN:$PATH" \
+    HEREDOC_EXEC_FAIL_MATCH="$fail_match" \
+    HEREDOC_EXEC_REAL_ROOT="$REPO_ROOT" \
+    HEREDOC_EXEC_WORKDIR="$workdir" \
     bash "$script" > "$outlog" 2>&1
   local rc=$?
   rm -rf "$workdir"
@@ -455,55 +455,55 @@ esc082_run() {
 }
 
 # --- positive case: only the bench invocation (gpu-inference-scale) fails. ---
-esc082_log="$SANDBOX/heredoc-exec-bench-fail.log"
-esc082_run "gpu-inference-scale" "$esc082_log"
-esc082_raw_rc=$?
-esc082_ok=1
-grep -q '^BENCH_EXIT=1$' "$esc082_log" || esc082_ok=0
-grep -q '^PROVE_EXIT=0$' "$esc082_log" || esc082_ok=0
+heredoc_exec_log="$SANDBOX/heredoc-exec-bench-fail.log"
+heredoc_exec_run "gpu-inference-scale" "$heredoc_exec_log"
+heredoc_exec_raw_rc=$?
+heredoc_exec_ok=1
+grep -q '^BENCH_EXIT=1$' "$heredoc_exec_log" || heredoc_exec_ok=0
+grep -q '^PROVE_EXIT=0$' "$heredoc_exec_log" || heredoc_exec_ok=0
 for g in "${PROVE_GROUPS[@]}"; do
-  grep -q "^PROVE_GROUP_RC name=${g} rc=0\$" "$esc082_log" || esc082_ok=0
+  grep -q "^PROVE_GROUP_RC name=${g} rc=0\$" "$heredoc_exec_log" || heredoc_exec_ok=0
 done
-if [ "$esc082_ok" -eq 1 ]; then
+if [ "$heredoc_exec_ok" -eq 1 ]; then
   ok "heredoc execution: a bench-only cargo failure -> BENCH_EXIT=1, PROVE_EXIT=0, every gating group rc=0"
 else
-  bad "heredoc execution: expected BENCH_EXIT=1/PROVE_EXIT=0/all-gating-rc=0; raw_rc=$esc082_raw_rc log=$(cat "$esc082_log")"
+  bad "heredoc execution: expected BENCH_EXIT=1/PROVE_EXIT=0/all-gating-rc=0; raw_rc=$heredoc_exec_raw_rc log=$(cat "$heredoc_exec_log")"
 fi
-esc082_verdict_rc=1
-rp_prove_verdict "$esc082_raw_rc" "$esc082_log"
-esc082_verdict_rc=$?
-if [ "$esc082_verdict_rc" -eq 0 ]; then
+heredoc_exec_verdict_rc=1
+rp_prove_verdict "$heredoc_exec_raw_rc" "$heredoc_exec_log"
+heredoc_exec_verdict_rc=$?
+if [ "$heredoc_exec_verdict_rc" -eq 0 ]; then
   ok "heredoc execution: rp_prove_verdict over the EXECUTED heredoc's own log yields lane rc 0 (bench is genuinely non-gating in production code, not only in hand-authored fixtures)"
 else
-  bad "heredoc execution: expected lane rc 0 from the executed heredoc's own log; got $esc082_verdict_rc"
+  bad "heredoc execution: expected lane rc 0 from the executed heredoc's own log; got $heredoc_exec_verdict_rc"
 fi
 
 # --- negative control: the SAME shim, but the served-proof invocation
 # (grpc_embedding_gpu) fails instead -- this must NOT be swallowed. ---
-esc082_neg_log="$SANDBOX/heredoc-exec-served-fail.log"
-esc082_run "grpc_embedding_gpu" "$esc082_neg_log"
-esc082_neg_raw_rc=$?
-rp_prove_verdict "$esc082_neg_raw_rc" "$esc082_neg_log"
-esc082_neg_verdict_rc=$?
-if [ "$esc082_neg_verdict_rc" -ne 0 ] && grep -q '^PROVE_GROUP_RC name=served-client-server-proof rc=[1-9]' "$esc082_neg_log"; then
+heredoc_exec_neg_log="$SANDBOX/heredoc-exec-served-fail.log"
+heredoc_exec_run "grpc_embedding_gpu" "$heredoc_exec_neg_log"
+heredoc_exec_neg_raw_rc=$?
+rp_prove_verdict "$heredoc_exec_neg_raw_rc" "$heredoc_exec_neg_log"
+heredoc_exec_neg_verdict_rc=$?
+if [ "$heredoc_exec_neg_verdict_rc" -ne 0 ] && grep -q '^PROVE_GROUP_RC name=served-client-server-proof rc=[1-9]' "$heredoc_exec_neg_log"; then
   ok "heredoc execution negative control: a served-proof cargo failure -> lane rc != 0, marker names served-client-server-proof"
 else
-  bad "heredoc execution negative control: expected a nonzero lane rc naming served-client-server-proof; got $esc082_neg_verdict_rc log=$(cat "$esc082_neg_log")"
+  bad "heredoc execution negative control: expected a nonzero lane rc naming served-client-server-proof; got $heredoc_exec_neg_verdict_rc log=$(cat "$heredoc_exec_neg_log")"
 fi
 
 # --- bench opens strictly AFTER every gating group's own marker (the
 # "runs LAST" comment, checked against the EXECUTED log's own line order,
 # not prose). ---
-esc082_bench_open_line="$(grep -n '^::group::bench$' "$esc082_log" | head -1 | cut -d: -f1)"
-esc082_last_gating_marker_line=0
+heredoc_exec_bench_open_line="$(grep -n '^::group::bench$' "$heredoc_exec_log" | head -1 | cut -d: -f1)"
+heredoc_exec_last_gating_marker_line=0
 for g in "${PROVE_GROUPS[@]}"; do
-  l="$(grep -n "^PROVE_GROUP_RC name=${g} rc=" "$esc082_log" | tail -1 | cut -d: -f1)"
-  [ -n "$l" ] && [ "$l" -gt "$esc082_last_gating_marker_line" ] && esc082_last_gating_marker_line="$l"
+  l="$(grep -n "^PROVE_GROUP_RC name=${g} rc=" "$heredoc_exec_log" | tail -1 | cut -d: -f1)"
+  [ -n "$l" ] && [ "$l" -gt "$heredoc_exec_last_gating_marker_line" ] && heredoc_exec_last_gating_marker_line="$l"
 done
-if [ -n "$esc082_bench_open_line" ] && [ "$esc082_bench_open_line" -gt "$esc082_last_gating_marker_line" ]; then
+if [ -n "$heredoc_exec_bench_open_line" ] && [ "$heredoc_exec_bench_open_line" -gt "$heredoc_exec_last_gating_marker_line" ]; then
   ok "heredoc execution: ::group::bench opens AFTER every gating group's own marker in the executed log (runs LAST, not only by comment)"
 else
-  bad "heredoc execution: expected bench's own group-open line ($esc082_bench_open_line) after the last gating marker ($esc082_last_gating_marker_line)"
+  bad "heredoc execution: expected bench's own group-open line ($heredoc_exec_bench_open_line) after the last gating marker ($heredoc_exec_last_gating_marker_line)"
 fi
 
 # ============================================================================
@@ -983,10 +983,10 @@ rc=$?
 # means no marker -- this fails against a scratch copy with that trap
 # commented out.
 # ============================================================================
-F7_STUBBIN="$SANDBOX/f7-bin"
-mkdir -p "$F7_STUBBIN"
+STUB_BIN="$SANDBOX/stub-bin"
+mkdir -p "$STUB_BIN"
 
-cat > "$F7_STUBBIN/curl" <<'CURLSTUB'
+cat > "$STUB_BIN/curl" <<'CURLSTUB'
 #!/usr/bin/env bash
 payload=""
 for a in "$@"; do
@@ -996,16 +996,16 @@ for a in "$@"; do
 done
 case "$payload" in
   *podTerminate*)
-    echo "TERMINATED" >> "${F7_TERMINATE_MARKER:?F7_TERMINATE_MARKER unset}"
+    echo "TERMINATED" >> "${STUB_TERMINATE_MARKER:?STUB_TERMINATE_MARKER unset}"
     echo '{"data":{"podTerminate":true}}'
     ;;
-  *podFindAndDeployOnDemand*) echo '{"data":{"podFindAndDeployOnDemand":{"id":"f7-fake-pod"}}}' ;;
+  *podFindAndDeployOnDemand*) echo '{"data":{"podFindAndDeployOnDemand":{"id":"stub-fake-pod"}}}' ;;
   *'myself{'*) echo '{"data":{"myself":{"pods":[]}}}' ;;
   *'pod(input:'*) echo '{"data":{"pod":{"runtime":{"ports":[{"ip":"127.0.0.1","publicPort":2222,"privatePort":22,"isIpPublic":true,"type":"tcp"}]}}}}' ;;
   *) echo '{}' ;;
 esac
 CURLSTUB
-chmod +x "$F7_STUBBIN/curl"
+chmod +x "$STUB_BIN/curl"
 
 # Distinguishes the THREE real ssh invocation shapes rp_deploy_live/
 # rp_run_remote_watched make, by the LAST argument's own content: a bare
@@ -1013,27 +1013,27 @@ chmod +x "$F7_STUBBIN/curl"
 # or the heredoc's `timeout N bash -s` remote-script form (the ONLY one
 # that reads stdin and needs a scenario-specific reply).
 #
-# When F7_SSHARGV_PROBE / F7_SSHARGV_SESSION are set, the stub records its
+# When STUB_SSHARGV_PROBE / STUB_SSHARGV_SESSION are set, the stub records its
 # OWN REAL "$@" (verbatim, one token per line) to that path -- an
 # ARGV-SCOPED control (never `grep ServerAliveInterval
 # ci/scripts/runpod_lib.sh`, which is vacuously green via rp_wait_poll's own
 # unrelated array). Overwritten (`>`, not `>>`) each call: only the most recent
 # invocation of a given shape is kept, and every real call of that shape
 # carries the identical liveness options, so the last one is representative.
-export F7_PROVE_GROUPS="${PROVE_GROUPS[*]}"
-cat > "$F7_STUBBIN/ssh" <<'SSHSTUB'
+export STUB_PROVE_GROUPS="${PROVE_GROUPS[*]}"
+cat > "$STUB_BIN/ssh" <<'SSHSTUB'
 #!/usr/bin/env bash
 last="${@: -1}"
 case "$last" in
   true)
-    [ -n "${F7_SSHARGV_PROBE:-}" ] && printf '%s\n' "$@" > "${F7_SSHARGV_PROBE}"
+    [ -n "${STUB_SSHARGV_PROBE:-}" ] && printf '%s\n' "$@" > "${STUB_SSHARGV_PROBE}"
     exit 0
     ;;
   *nvidia-smi*) echo "570.195.03"; exit 0 ;;
   *"bash -s"*)
-    [ -n "${F7_SSHARGV_SESSION:-}" ] && printf '%s\n' "$@" > "${F7_SSHARGV_SESSION}"
+    [ -n "${STUB_SSHARGV_SESSION:-}" ] && printf '%s\n' "$@" > "${STUB_SSHARGV_SESSION}"
     cat >/dev/null
-    case "${F7_SCENARIO:-}" in
+    case "${STUB_SCENARIO:-}" in
       watchdog)
         echo "::group::capability-surface-build"
         exec sleep 30
@@ -1046,7 +1046,7 @@ case "$last" in
         exec sleep 30
         ;;
       *)
-        for g in ${F7_PROVE_GROUPS}; do
+        for g in ${STUB_PROVE_GROUPS}; do
           echo "PROVE_GROUP_RC name=${g} rc=0"
         done
         echo "::group::bench"
@@ -1057,7 +1057,7 @@ case "$last" in
   *) exit 0 ;;
 esac
 SSHSTUB
-chmod +x "$F7_STUBBIN/ssh"
+chmod +x "$STUB_BIN/ssh"
 
 # ============================================================================
 # Keepalive argv assertion + its own meta-controls.
@@ -1069,7 +1069,7 @@ chmod +x "$F7_STUBBIN/ssh"
 # `-o` and `ServerAliveInterval=30`, neither of which matches), and NUMERIC
 # (>= 1) -- a substring match alone would accept `-oServerAliveInterval=0`
 # or a non-integer suffix, which is not what "present" means here.
-f7_assert_keepalive_argv() {
+assert_keepalive_argv() {
   local file="$1" label="$2"
   if [ ! -s "$file" ]; then
     bad "keepalive ($label): no argv captured (missing or empty: $file) -- this ssh shape was never invoked, or its capture var was never wired"
@@ -1088,15 +1088,15 @@ f7_assert_keepalive_argv() {
   fi
 }
 
-# Meta-controls: drive `f7_assert_keepalive_argv`
+# Meta-controls: drive `assert_keepalive_argv`
 # itself against synthetic argv files and assert it correctly REJECTS every
 # bad shape -- an inner FAIL here is the CORRECT outcome, so it is
 # converted to an outer PASS (and the inner FAIL's own counter increment is
 # reversed) rather than double-counted or silently swallowed.
-f7_expect_keepalive_reject() {
+expect_keepalive_reject() {
   local file="$1" desc="$2"
   local before_fail=$FAIL
-  f7_assert_keepalive_argv "$file" "$desc"
+  assert_keepalive_argv "$file" "$desc"
   if [ "$FAIL" -gt "$before_fail" ]; then
     FAIL=$before_fail
     ok "keepalive meta-control ($desc): correctly rejected"
@@ -1107,29 +1107,29 @@ f7_expect_keepalive_reject() {
 
 META_DIR="$SANDBOX/keepalive-meta"
 mkdir -p "$META_DIR"
-f7_expect_keepalive_reject "$META_DIR/missing" "missing capture file"
+expect_keepalive_reject "$META_DIR/missing" "missing capture file"
 : > "$META_DIR/empty"
-f7_expect_keepalive_reject "$META_DIR/empty" "empty capture file"
+expect_keepalive_reject "$META_DIR/empty" "empty capture file"
 printf '%s\n' -o ServerAliveInterval=30 -o ServerAliveCountMax=6 > "$META_DIR/detached"
-f7_expect_keepalive_reject "$META_DIR/detached" "detached -o form (not the real RP_SSHO shape)"
+expect_keepalive_reject "$META_DIR/detached" "detached -o form (not the real RP_SSHO shape)"
 printf '%s\n' -oServerAliveInterval=0 -oServerAliveCountMax=6 > "$META_DIR/interval-zero"
-f7_expect_keepalive_reject "$META_DIR/interval-zero" "ServerAliveInterval=0"
+expect_keepalive_reject "$META_DIR/interval-zero" "ServerAliveInterval=0"
 printf '%s\n' -oServerAliveInterval=30 -oServerAliveCountMax=0 > "$META_DIR/countmax-zero"
-f7_expect_keepalive_reject "$META_DIR/countmax-zero" "ServerAliveCountMax=0"
+expect_keepalive_reject "$META_DIR/countmax-zero" "ServerAliveCountMax=0"
 printf '%s\n' -oServerAliveInterval=abc -oServerAliveCountMax=6 > "$META_DIR/non-integer"
-f7_expect_keepalive_reject "$META_DIR/non-integer" "non-integer ServerAliveInterval"
+expect_keepalive_reject "$META_DIR/non-integer" "non-integer ServerAliveInterval"
 printf '%s\n' -oServerAliveInterval=30 -oServerAliveCountMax=6 > "$META_DIR/good"
-f7_assert_keepalive_argv "$META_DIR/good" "meta-control positive (well-formed attached options)"
+assert_keepalive_argv "$META_DIR/good" "meta-control positive (well-formed attached options)"
 
-f7_case() {
+stub_case() {
   # $1 = "watchdog" | "bench-cut"; $2 = expected exit code.
   # $3 (optional) = a DIFFERENT runpod_gpu_prove.sh path to execute (its own
   # $DIR sources ITS OWN sibling runpod_lib.sh) -- the keepalive
   # non-vacuity leg's own hook; defaults to the real $PROVE_SH.
   local mode="$1" want_rc="$2" driver="${3:-$PROVE_SH}"
-  local marker="$SANDBOX/f7-terminate-marker-$mode"
-  local session_argv="$SANDBOX/f7-sshargv-session-$mode"
-  local probe_argv="$SANDBOX/f7-sshargv-probe-$mode"
+  local marker="$SANDBOX/stub-terminate-marker-$mode"
+  local session_argv="$SANDBOX/stub-sshargv-session-$mode"
+  local probe_argv="$SANDBOX/stub-sshargv-probe-$mode"
   rm -f "$marker" "$session_argv" "$probe_argv"
   # A single `env ...` line (never a `VAR=val \`-per-line assignment chain):
   # check_gpu_prove_timings.py's own R1 setter-predicate scan matches
@@ -1142,7 +1142,7 @@ f7_case() {
   # the same >=3x-separated-from-the-stub's-own-timing discipline every
   # other fixture in this file uses (RP_INACTIVITY=3 vs the stub's own
   # `sleep 30` silence is a 10x margin).
-  env RUNPOD_API_KEY=test-dummy-key PATH="$F7_STUBBIN:$PATH" F7_TERMINATE_MARKER="$marker" F7_SCENARIO="$mode" F7_SSHARGV_SESSION="$session_argv" F7_SSHARGV_PROBE="$probe_argv" GPU_PROVE_ARCH=sm_80 RP_INACTIVITY=3 RP_WATCH_POLL_S=0.2 RP_SSH_WAIT_SECS=10 bash "$driver" > "$SANDBOX/f7-$mode.out" 2>&1
+  env RUNPOD_API_KEY=test-dummy-key PATH="$STUB_BIN:$PATH" STUB_TERMINATE_MARKER="$marker" STUB_SCENARIO="$mode" STUB_SSHARGV_SESSION="$session_argv" STUB_SSHARGV_PROBE="$probe_argv" GPU_PROVE_ARCH=sm_80 RP_INACTIVITY=3 RP_WATCH_POLL_S=0.2 RP_SSH_WAIT_SECS=10 bash "$driver" > "$SANDBOX/stub-$mode.out" 2>&1
   local rc=$?
   local heredoc_stderr_ok=1
   # The unescaped-backtick class manifests as a command-substitution error
@@ -1150,28 +1150,28 @@ f7_case() {
   # <<REMOTE heredoc -- this fixture ALREADY captures that
   # exact expansion end to end, so re-check its own output here rather than
   # building a second mechanism.
-  if grep -qE 'command not found|unexpected EOF while looking for matching' "$SANDBOX/f7-$mode.out"; then
+  if grep -qE 'command not found|unexpected EOF while looking for matching' "$SANDBOX/stub-$mode.out"; then
     heredoc_stderr_ok=0
   fi
   if [ "$rc" -eq "$want_rc" ] && [ -f "$marker" ] && [ "$heredoc_stderr_ok" -eq 1 ]; then
     ok "executed driver ($mode): the real executed exit path returns $want_rc, rp_cleanup's own podTerminate call fired (marker recorded), and the <<REMOTE heredoc's own expansion produced no command-substitution stderr"
   else
-    bad "executed driver ($mode): expected rc=$want_rc with a recorded podTerminate call and no heredoc-expansion stderr; got rc=$rc marker-present=$([ -f "$marker" ] && echo yes || echo no) heredoc_stderr_ok=$heredoc_stderr_ok; out=$(cat "$SANDBOX/f7-$mode.out")"
+    bad "executed driver ($mode): expected rc=$want_rc with a recorded podTerminate call and no heredoc-expansion stderr; got rc=$rc marker-present=$([ -f "$marker" ] && echo yes || echo no) heredoc_stderr_ok=$heredoc_stderr_ok; out=$(cat "$SANDBOX/stub-$mode.out")"
   fi
 }
 # Every earlier in-process/cross-parser case above did `export -f ssh` with a
 # succession of bash FUNCTION overrides -- an exported bash function takes
 # PRECEDENCE over a same-named PATH executable in any child process, so
-# without unsetting it here the f7_case subprocess below would inherit the
-# LAST test's own `ssh` function instead of ever reaching $F7_STUBBIN/ssh
+# without unsetting it here the stub_case subprocess below would inherit the
+# LAST test's own `ssh` function instead of ever reaching $STUB_BIN/ssh
 # on PATH.
 unset -f ssh
-f7_case "watchdog" 76
-f7_assert_keepalive_argv "$SANDBOX/f7-sshargv-session-watchdog" "watchdog scenario, bash -s session"
-f7_assert_keepalive_argv "$SANDBOX/f7-sshargv-probe-watchdog" "watchdog scenario, true reachability probe"
-f7_case "bench-cut" 0
-f7_assert_keepalive_argv "$SANDBOX/f7-sshargv-session-bench-cut" "bench-cut scenario, bash -s session"
-f7_assert_keepalive_argv "$SANDBOX/f7-sshargv-probe-bench-cut" "bench-cut scenario, true reachability probe"
+stub_case "watchdog" 76
+assert_keepalive_argv "$SANDBOX/stub-sshargv-session-watchdog" "watchdog scenario, bash -s session"
+assert_keepalive_argv "$SANDBOX/stub-sshargv-probe-watchdog" "watchdog scenario, true reachability probe"
+stub_case "bench-cut" 0
+assert_keepalive_argv "$SANDBOX/stub-sshargv-session-bench-cut" "bench-cut scenario, bash -s session"
+assert_keepalive_argv "$SANDBOX/stub-sshargv-probe-bench-cut" "bench-cut scenario, true reachability probe"
 
 # ============================================================================
 # Wrong-tree, executed-driver subprocess execution:
@@ -1180,14 +1180,14 @@ f7_assert_keepalive_argv "$SANDBOX/f7-sshargv-probe-bench-cut" "bench-cut scenar
 # 76/0 above. PROVE_EXPECT_SHA is set to a DIFFERENT sha than the stub's own
 # "PROVE_SHA=deadbeef..." line, so the mismatch is genuine.
 # ============================================================================
-WT_MARKER="$SANDBOX/f7-terminate-marker-wrong-tree"
+WT_MARKER="$SANDBOX/stub-terminate-marker-wrong-tree"
 rm -f "$WT_MARKER"
-env RUNPOD_API_KEY=test-dummy-key PATH="$F7_STUBBIN:$PATH" F7_TERMINATE_MARKER="$WT_MARKER" F7_SCENARIO="wrong-tree" GPU_PROVE_ARCH=sm_80 RP_INACTIVITY=3 RP_WATCH_POLL_S=0.2 RP_SSH_WAIT_SECS=10 PROVE_EXPECT_SHA="cccccccccccccccccccccccccccccccccccccc" bash "$PROVE_SH" > "$SANDBOX/f7-wrong-tree.out" 2>&1
+env RUNPOD_API_KEY=test-dummy-key PATH="$STUB_BIN:$PATH" STUB_TERMINATE_MARKER="$WT_MARKER" STUB_SCENARIO="wrong-tree" GPU_PROVE_ARCH=sm_80 RP_INACTIVITY=3 RP_WATCH_POLL_S=0.2 RP_SSH_WAIT_SECS=10 PROVE_EXPECT_SHA="cccccccccccccccccccccccccccccccccccccc" bash "$PROVE_SH" > "$SANDBOX/stub-wrong-tree.out" 2>&1
 wt_rc=$?
-if [ "$wt_rc" -eq 77 ] && [ -f "$WT_MARKER" ] && grep -q 'WRONG TREE' "$SANDBOX/f7-wrong-tree.out"; then
+if [ "$wt_rc" -eq 77 ] && [ -f "$WT_MARKER" ] && grep -q 'WRONG TREE' "$SANDBOX/stub-wrong-tree.out"; then
   ok "executed driver (wrong-tree): the real executed exit path returns 77, rp_cleanup's own podTerminate call fired (marker recorded), and the WRONG TREE diagnostic is present"
 else
-  bad "executed driver (wrong-tree): expected rc=77 with a recorded podTerminate call and a WRONG TREE diagnostic; got rc=$wt_rc marker-present=$([ -f "$WT_MARKER" ] && echo yes || echo no); out=$(cat "$SANDBOX/f7-wrong-tree.out")"
+  bad "executed driver (wrong-tree): expected rc=77 with a recorded podTerminate call and a WRONG TREE diagnostic; got rc=$wt_rc marker-present=$([ -f "$WT_MARKER" ] && echo yes || echo no); out=$(cat "$SANDBOX/stub-wrong-tree.out")"
 fi
 
 # ============================================================================
@@ -1214,9 +1214,9 @@ if stripped == text:
 open(path, "w").write(stripped)
 PYEOF
 
-f7_case "watchdog" 76 "$NV_DIR/runpod_gpu_prove.sh"
+stub_case "watchdog" 76 "$NV_DIR/runpod_gpu_prove.sh"
 before_fail=$FAIL
-f7_assert_keepalive_argv "$SANDBOX/f7-sshargv-session-watchdog" "non-vacuity scratch copy (options stripped)"
+assert_keepalive_argv "$SANDBOX/stub-sshargv-session-watchdog" "non-vacuity scratch copy (options stripped)"
 if [ "$FAIL" -gt "$before_fail" ]; then
   FAIL=$before_fail
   ok "keepalive non-vacuity: stripping RP_SSHO's keepalive options in a scratch copy correctly turns the assertion RED"

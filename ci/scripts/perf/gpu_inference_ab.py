@@ -118,13 +118,13 @@ a second, independently checkable copy.
 **Sensitivity** (restated from `ci/artifacts/gpu-perf-aa-null/README.md`'s
 own "(c) Sensitivity: what this band can and cannot catch" section; from
 "On a REAL pod" onward the text is verbatim — `test_gpu_inference_ab.py`
-pins it — so "this campaign" and "finding (a)" refer to that README): With
+pins it — so "finding (a)" refers to that README): With
 the upper edge at `1.33`, the smallest SLOWDOWN this band can catch on an
 idealized (zero build-offset) pod is `> 33%` (`1.33 − 1`), not `≥ 25%` —
 `25%` is the LOWER edge's own distance from 1.0 (`1 − 0.75`), a different,
 asymmetric threshold that does not describe the slowdown-catching side at
 all. On a REAL pod, that nominal 33% figure is itself optimistic: this
-campaign's own two primary SXM4 combined ratios (`0.8706549652288303`,
+two primary SXM4 runs' combined ratios (`0.8706549652288303`,
 `0.8821655548443332`) show the binary-level build offset (finding (a)
 above) already suppresses the observed ratio by ≈12.9% and ≈11.8%
 respectively on that device model, working AGAINST detection of a real slowdown (a slowdown and

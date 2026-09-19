@@ -77,8 +77,7 @@ runs:
     # "fatal: detected dubious ownership" (exit 128). Marked here, ONCE, for
     # every job that runs this composite — it runs right after checkout by
     # this action's own contract — instead of a per-job copy each new gate
-    # had to remember (the live lane forgot, and its pinned-source gate died
-    # on every main run). Harmless on a hosted runner without a container.
+    # would have to remember. Harmless on a hosted runner without a container.
     - shell: bash
       run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 

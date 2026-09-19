@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# The unit-63 how-well producer (H4b, docs-ci domain): drives
-# `jammi-bench finetune-run` (CONTRACT H4) over the committed
-# `cookbook/fixtures/finetune_heldout/` held-out fixture (CONTRACT H3), one
+# The how-well producer: drives `jammi-bench finetune-run` over the
+# committed `cookbook/fixtures/finetune_heldout/` held-out fixture, one
 # leg per (seed, arm, repeat) — `{fused, alloff}` arms, `{r1, r2}` same-seed
 # repeats — against the SAME committed fixture and objective every leg of a
 # run shares.
@@ -11,15 +10,15 @@
 # path (the fixture under `cookbook/fixtures/finetune_heldout/`, a local
 # `--model-dir` checkpoint the operator already has on-box); no leg itself
 # builds the cookbook corpus, starts a `jammi-server`, or touches the
-# network. The ONE exception is the PRE-RUN provisioning step below
-# (CONTRACT amendment 2026-08-28b), which runs strictly BEFORE any measured
+# network. The ONE exception is the PRE-RUN provisioning step below,
+# which runs strictly BEFORE any measured
 # leg and is never counted as one: it may invoke the book-side
 # `cookbook/book/scripts/derive_heldout_fixture.py --emit-train-pairs`
 # (network-backed, checksum-gated) to (re)populate `train_pairs.jsonl`, then
 # ALWAYS byte-verifies it against the committed `train_ids_sha256.json`
 # before letting any leg proceed.
 #
-# HELD-OUT FIXTURE LAYOUT (cookbook/fixtures/finetune_heldout/, CONTRACT H3):
+# HELD-OUT FIXTURE LAYOUT (cookbook/fixtures/finetune_heldout/):
 #   heldout_ids.txt      the committed held-out id list -- what
 #                         `heldout_ids_sha256` hashes.
 #   heldout_pairs.jsonl  the FULL held-out pair text (committed).
@@ -31,7 +30,7 @@
 #                         finetune-run` flag) has no committed source of its
 #                         own text in this checkout.
 #
-# PRE-RUN PROVISIONING (CONTRACT amendment 2026-08-28b): before any measured
+# PRE-RUN PROVISIONING: before any measured
 # leg, if `$TRAIN_JSONL` (default `$REPO_ROOT/cookbook/fixtures/
 # finetune_heldout/train_pairs.jsonl`, gitignored -- never committed) is
 # absent, this script invokes the book-side producer's own
@@ -48,21 +47,19 @@
 # hand-edited file left over from an earlier checkout fails this exactly
 # like a corrupted fresh fetch would.
 #
-# Batch size: 32 (`cookbook/fixtures/finetune_heldout/README.md`'s own
-# "this agent's pick, pending lead confirmation" -- the chapter-config value
-# every real `db.fine_tune(...)` call over this exact pair set already
-# uses; 128 held-out pairs is a multiple of both 32 and the engine's own
+# Batch size: 32 (`cookbook/fixtures/finetune_heldout/README.md` -- the
+# chapter-config value every real `db.fine_tune(...)` call over this exact
+# pair set already uses; 128 held-out pairs is a multiple of both 32 and the engine's own
 # unset-default 8, so this pick does not change the fixture's own held-out
 # count, only which "N held-out = k batches" framing is reported).
 #
-# Objective: MNRL by default (CONTRACT amendment 2026-08-28's own default-
-# on-ties-or-ambiguity rule) -- override with FINETUNE_RUN_AB_OBJECTIVE=
-# triplet. H5's own dynamic-range probe (step 0) is what actually PICKS the
-# objective for the real campaign; this script just runs whichever one it
-# is told, over both arms, at every pre-registered seed.
+# Objective: MNRL by default -- override with FINETUNE_RUN_AB_OBJECTIVE=
+# triplet. The objective is chosen by a dynamic-range probe outside this
+# script; this script just runs whichever one it is told, over both arms, at
+# every pre-registered seed.
 #
-# Seeds: the pre-registered 12-seed gate set (CONTRACT Frame: "N=12 seeds x
-# 2 arms"), 1..12 by default -- override with FINETUNE_RUN_AB_SEEDS (a
+# Seeds: the pre-registered 12-seed gate set (N=12 seeds x 2 arms), 1..12
+# by default -- override with FINETUNE_RUN_AB_SEEDS (a
 # comma-separated list, no spaces).
 #
 # Env vars:
@@ -78,12 +75,10 @@
 #   FINETUNE_RUN_AB_LR         --lr passthrough for the main A/B legs
 #                              (default: unset, so the CLI's own default
 #                              (2e-4, main.rs's `FinetuneRunArgs::lr`) is
-#                              used -- this script previously exposed no
-#                              --lr passthrough at all, unit-63 audit
-#                              advisory (b)).
+#                              used).
 #   FINETUNE_RUN_AB_LR0_SEEDS  comma-separated seed list for the lr=0 RED
-#                              control (CONTRACT Frame: "RED control: lr=0
-#                              arm x2 seeds fails learning-happened"; default
+#                              control (an lr=0 arm over >= 2 seeds must fail
+#                              learning-happened); default
 #                              empty = skipped). Each seed here runs BOTH
 #                              arms at --lr 0, tagged with ab_merge.py's own
 #                              `FINETUNE_RUN_LR0_REPEAT` label -- NEVER
@@ -95,7 +90,7 @@
 #                              collide with the gate/off-sample seed
 #                              namespaces).
 #   FINETUNE_RUN_AB_ALLOW_NO_LR0
-#                              unit-63 round-3 audit block 5. Default "0":
+#                              Default "0":
 #                              when FINETUNE_RUN_AB_LR0_SEEDS is empty,
 #                              ab_merge.py's own merger REFUSES (INVALID) --
 #                              the pre-registered lr=0 RED control is not
@@ -106,7 +101,7 @@
 #                              (lr0_control.allow_missing_lr0_control) rather
 #                              than an unstated default.
 #   FINETUNE_RUN_AB_MUTANT_LEGS
-#                              amendment 2026-08-29b item 3 -- OPTIONAL,
+#                              OPTIONAL,
 #                              ';'-separated list of
 #                              'DOSE_LABEL:PATCH_SHA256:SEED1,SEED2,...'
 #                              specs, forwarded verbatim as one
@@ -124,9 +119,7 @@
 #                              --backbone-dtype passthrough for EVERY leg
 #                              `run_leg` runs -- both A/B arms, every seed,
 #                              AND the lr=0 RED control below (default
-#                              "bf16", byte-identical to this script's
-#                              previous hardcoded `--backbone-dtype bf16`
-#                              when unset). `backbone_dtype` is IDENTITY
+#                              "bf16"). `backbone_dtype` is IDENTITY
 #                              FIELD #10 on `FINETUNE_RUN_IDENTITY_FIELDS`
 #                              (identity_fields.py) -- cross-arm AND
 #                              cross-seed homogeneity requires every leg to
@@ -163,9 +156,9 @@
 #                              this step never actually runs). A pod driver
 #                              (e.g. `ci/scripts/runpod_gpu_howwell.sh`) that
 #                              provisions a dedicated venv for
-#                              `jammi_cookbook`/numpy/pyarrow/requests (unit
-#                              63 audit finding 4 -- a bare pod has no pip on
-#                              PATH and this script's own producer binary
+#                              `jammi_cookbook`/numpy/pyarrow/requests (a
+#                              bare pod has no pip on PATH and this script's
+#                              own producer binary
 #                              build/run never needs any of those packages)
 #                              points this at that venv's own interpreter
 #                              instead; every OTHER step in this script
@@ -200,24 +193,20 @@ case "$FINETUNE_RUN_AB_OBJECTIVE" in
 esac
 FINETUNE_RUN_AB_EPOCHS="${FINETUNE_RUN_AB_EPOCHS:-3}"
 FINETUNE_RUN_AB_BATCH="${FINETUNE_RUN_AB_BATCH:-32}"
-# --lr passthrough (unit-63 audit advisory (b): the CLI has always had this
-# flag, main.rs:145-146 -- this script simply never forwarded it). Unset means
-# "omit --lr entirely", i.e. the CLI's own default (2e-4) -- never fabricate
+# --lr passthrough. Unset means "omit --lr entirely", i.e. the CLI's own default (2e-4) -- never fabricate
 # a value here that main.rs's own `#[arg(long, default_value_t = 2e-4)]`
 # already owns.
 FINETUNE_RUN_AB_LR="${FINETUNE_RUN_AB_LR:-}"
-# lr=0 RED control seeds (CONTRACT Frame; advisory (b)) -- comma-separated,
+# lr=0 RED control seeds -- comma-separated,
 # default empty (skipped). NEVER added to FINETUNE_RUN_AB_SEEDS/the main
 # sweep loop below; run through their own dedicated loop, tagged with
 # ab_merge.py's own FINETUNE_RUN_LR0_REPEAT label.
 FINETUNE_RUN_AB_LR0_SEEDS="${FINETUNE_RUN_AB_LR0_SEEDS:-}"
-# --backbone-dtype passthrough for EVERY leg (see env-var doc above) --
-# default "bf16" is byte-identical to this script's previous hardcoded
-# `--backbone-dtype bf16` when this var is unset.
+# --backbone-dtype passthrough for EVERY leg (see env-var doc above).
 FINETUNE_RUN_AB_BACKBONE_DTYPE="${FINETUNE_RUN_AB_BACKBONE_DTYPE:-bf16}"
 FINETUNE_RUN_AB_CUDA="${FINETUNE_RUN_AB_CUDA:-0}"
 FINETUNE_RUN_AB_CPU="${FINETUNE_RUN_AB_CPU:-0}"
-# unit-63 audit finding 4 -- see this script's own env-var doc above.
+# Interpreter for the one provisioning step -- see the env-var doc above.
 FINETUNE_RUN_AB_PROVISION_PYTHON="${FINETUNE_RUN_AB_PROVISION_PYTHON:-python3}"
 
 FIXTURE_DIR="$REPO_ROOT/cookbook/fixtures/finetune_heldout"
@@ -243,26 +232,25 @@ fi
 if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
   for f in "$HELDOUT_IDS" "$HELDOUT_JSONL"; do
     if [ ! -f "$f" ]; then
-      echo "::error::committed fixture file not found: $f (cookbook/fixtures/finetune_heldout/, CONTRACT H3) — refusing before any leg runs." >&2
+      echo "::error::committed fixture file not found: $f (cookbook/fixtures/finetune_heldout/) — refusing before any leg runs." >&2
       exit 1
     fi
   done
 
-  # --- PRE-RUN provisioning (CONTRACT amendment 2026-08-28b) -- see module
+  # --- PRE-RUN provisioning -- see module
   # doc "PRE-RUN PROVISIONING" above. Outside every measured leg: this runs
   # once, before the sweep loop, never inside run_leg. Emit is SKIPPED
   # whenever `$TRAIN_JSONL` is already present (an operator/pod driver may
   # pre-stage it) -- byte-verification below still ALWAYS runs regardless.
   #
-  # Unit-63 audit finding 4: invoked from `cookbook/book` as cwd, per that
+  # Invoked from `cookbook/book` as cwd, per that
   # directory's own fixture README ("cd cookbook/book && python scripts/
   # derive_heldout_fixture.py ...") -- `derive_heldout_fixture.py` itself
   # resolves every path it reads/writes off `__file__`, never cwd, so this
   # is the DOCUMENTED invocation convention, not a functional requirement of
   # that script; `$FINETUNE_RUN_AB_PROVISION_PYTHON` (default "python3") is
   # this call's own interpreter knob -- a bare checkout's system Python
-  # cannot `import jammi_cookbook`/numpy (no sys.path hack exists any more,
-  # see that script's own move-history), so a pod driver that provisions a
+  # cannot `import jammi_cookbook`/numpy, so a pod driver that provisions a
   # dedicated venv for this ONE step points this env var at that venv's
   # interpreter instead (see the env-var's own doc above).
   if [ ! -f "$TRAIN_JSONL" ]; then
@@ -303,12 +291,11 @@ run_cmd() {
   "$@"
 }
 
-# unit-63 round-3 audit, coordinator correction: CONTRACT 63 Frame
-# pre-registers the arms as "fused cascade vs ALLOFF=attention_block_flash,
-# adamw_step_fused" -- the A/B's own differential IS the flash cascade.
-# Building WITHOUT flash-attn (as this line used to) makes
+# The arms are pre-registered as "fused cascade vs ALLOFF=
+# attention_block_flash,adamw_step_fused" -- the A/B's own differential IS
+# the flash cascade. Building WITHOUT flash-attn makes
 # attention_block_flash unable to dispatch in EITHER arm, nulling the
-# experiment the campaign exists to run -- mirrors
+# experiment -- mirrors
 # stacked_sweep.sh's own flash-A/B build feature list exactly
 # (`--features cuda,jammi-encoders/flash-attn`), never a second,
 # independently-drifting feature-list spelling.
@@ -317,7 +304,7 @@ if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
     || { echo "::error::cargo build -p jammi-bench --features cuda,jammi-encoders/flash-attn failed" >&2; exit 1; }
 fi
 
-# --- provenance cross-check (unification contract C5.1), same shape as
+# --- provenance cross-check, same shape as
 # finetune_ab.sh/encode_ab.sh/stacked_sweep.sh/
 # clip_artifact_producer.sh: refuse BEFORE any leg runs if the binary's own
 # baked identity does not match the sha this checkout is actually at.
@@ -343,7 +330,7 @@ fi
 # seed's row).
 #
 # `arm` selects BOTH the CLI's own `--arm` flag (recorded on the report,
-# CONTRACT H4/report.rs's own PROVENANCE_FIELDS) AND, for the `alloff` arm
+# report.rs's own PROVENANCE_FIELDS) AND, for the `alloff` arm
 # only, the `JAMMI_KERNELS_DISABLE` env var this binary's own CLI doc names
 # as the CALLER's responsibility ("the caller is responsible for setting
 # JAMMI_KERNELS_DISABLE=attention_block_flash,adamw_step_fused itself
@@ -351,7 +338,7 @@ fi
 # `FinetuneRunArgs::arm` doc).
 #
 # `lr_override` (5th, optional): when non-empty, forwarded as `--lr`
-# (main.rs:145-146's own CLI flag) -- the lr=0 RED control loop below passes
+# (main.rs's own CLI flag) -- the lr=0 RED control loop below passes
 # `"0"` explicitly; the main A/B loop passes `$FINETUNE_RUN_AB_LR`, which is
 # empty by default (omit --lr entirely, i.e. the CLI's own 2e-4 default).
 run_leg() {
@@ -371,33 +358,29 @@ run_leg() {
     --epochs "$FINETUNE_RUN_AB_EPOCHS"
     --batch "$FINETUNE_RUN_AB_BATCH"
     --objective "$FINETUNE_RUN_AB_OBJECTIVE"
-    # CONTRACT Frame: early stopping DISABLED both arms -- the "never
+    # Early stopping DISABLED both arms -- the "never
     # stops before the pre-registered epoch budget" idiom, so a seed's
     # trajectory is never truncated by an early-stopping decision the sign
     # test would then have to account for.
     --early-stopping-patience 10000
-    # unit-63 round-4 audit F-1: `main.rs`'s own `--backbone-dtype` default
+    # `main.rs`'s own `--backbone-dtype` default
     # is `f32` (`FinetuneRunArgs::backbone_dtype`'s own `#[arg(long,
     # default_value = "f32")]`), and `flash_capability_gates` DomainMisses
     # the whole flash cascade whenever `dtype` is neither `DType::BF16` nor
-    # `DType::F16` (`jammi-encoders/src/modernbert.rs:2450`'s own
+    # `DType::F16` (`jammi-encoders/src/modernbert.rs`'s
     # `dtype_is_bf16_or_f16` gate — `f32` is outside that admitted set, and
-    # this script's own default, `bf16`, is inside it). CONTRACT
-    # 63 Frame pre-registers the flash cascade as the `fused` arm's own
-    # admitted branch, so an unset `--backbone-dtype` (silently f32) makes
-    # `attention_block_flash` unable to fire on EITHER arm's real leg --
-    # the exact same null-differential class the coordinator correction
-    # above already fixed for the build feature list. `backbone_dtype` is
-    # also IDENTITY FIELD #10 on `FINETUNE_RUN_IDENTITY_FIELDS` (was #9
-    # before issue #356 P1 item 5's `layers_to_transform` addition shifted
-    # every field after `target_modules` by one)
+    # this script's own default, `bf16`, is inside it). The flash cascade
+    # is the `fused` arm's pre-registered admitted branch, so an unset
+    # `--backbone-dtype` (silently f32) makes `attention_block_flash`
+    # unable to fire on EITHER arm's real leg -- the same null differential
+    # the flash-attn build feature above prevents. `backbone_dtype` is
+    # also IDENTITY FIELD #10 on `FINETUNE_RUN_IDENTITY_FIELDS`
     # (`identity_fields.py`) -- cross-arm AND cross-seed homogeneity
     # requires every leg (both arms, every seed, INCLUDING the lr=0
     # control below) to report the SAME value, so this is passed
     # unconditionally here in the one `run_leg` both loops share, never
     # only on the `fused` arm. Value comes from
-    # `$FINETUNE_RUN_AB_BACKBONE_DTYPE` (default "bf16", byte-identical to
-    # this line's previous hardcoded literal when unset -- see that
+    # `$FINETUNE_RUN_AB_BACKBONE_DTYPE` (default "bf16" -- see that
     # env-var's own doc above).
     --backbone-dtype "$FINETUNE_RUN_AB_BACKBONE_DTYPE"
     --work-dir "$work_dir"
@@ -447,13 +430,12 @@ for seed in "${SEEDS[@]}"; do
   done
 done
 
-# --- lr=0 RED control legs (CONTRACT Frame; unit-63 audit advisory (b)):
+# --- lr=0 RED control legs:
 # both arms, at --lr 0, tagged with ab_merge.py's own FINETUNE_RUN_LR0_REPEAT
 # label ("lr0") -- a DISTINCT repeat token from r1/r2, so these legs are
 # never picked up by the main sweep's own r1/r2 loader and never enter the
 # A/B set. Skipped entirely (no legs, no wiring cost) when
-# FINETUNE_RUN_AB_LR0_SEEDS is unset -- an operator opts in explicitly per
-# H5 campaign step 3.
+# FINETUNE_RUN_AB_LR0_SEEDS is unset -- an operator opts in explicitly.
 if [ -n "$FINETUNE_RUN_AB_LR0_SEEDS" ]; then
   IFS=',' read -r -a LR0_SEEDS <<< "$FINETUNE_RUN_AB_LR0_SEEDS"
   for seed in "${LR0_SEEDS[@]}"; do
@@ -467,14 +449,13 @@ fi
 
 # --- merge: sign test + conjunctive leg-premise refusal + determinism-
 # floor reporting + the lr=0 control's own learning-happened check, computed
-# INTO the merged artifact by ab_merge.py's own `finetune-run` mode (unit 63
-# H4b) -- reusing the same generic leg-premise-refusal core `encode_ab.sh`'s
+# INTO the merged artifact by ab_merge.py's own `finetune-run` mode --
+# reusing the same generic leg-premise-refusal core `encode_ab.sh`'s
 # merge step already builds on, never a second, hand-rolled comparator.
 #
-# unit-63 round-3 audit block 5: `ab_merge.py`'s own merger now REFUSES
-# (INVALID) when FINETUNE_RUN_AB_LR0_SEEDS is empty, unless
-# `--allow-missing-lr0-control` is passed -- the pre-registered lr=0 RED
-# control (CONTRACT Frame) is not silently optional. This script forwards
+# `ab_merge.py`'s own merger REFUSES (INVALID) when
+# FINETUNE_RUN_AB_LR0_SEEDS is empty, unless `--allow-missing-lr0-control`
+# is passed -- the pre-registered lr=0 RED control is not silently optional. This script forwards
 # that flag ONLY when the operator sets FINETUNE_RUN_AB_ALLOW_NO_LR0=1
 # (default unset/0) -- a deliberate, visible opt-out recorded in the merged
 # artifact (`lr0_control.allow_missing_lr0_control`), never a silent default.
@@ -483,7 +464,7 @@ MERGE_ARGS=(finetune-run "$RAW_DIR" "$OUT_DIR" "$FINETUNE_RUN_AB_SEEDS" "$FINETU
 if [ "$FINETUNE_RUN_AB_ALLOW_NO_LR0" = "1" ]; then
   MERGE_ARGS+=(--allow-missing-lr0-control)
 fi
-# amendment 2026-08-29b item 3 -- the mutant dose ladder's own legs are
+# The mutant dose ladder's own legs are
 # produced OUTSIDE this script entirely (docs/plans/63-how-well/mutants/
 # README.md's own scratch-worktree on-pod procedure: a patched
 # jammi-kernels build, never this script's own checkout). This is a PURE
@@ -494,7 +475,7 @@ fi
 # 'DOSE_LABEL:PATCH_SHA256:SEED1,SEED2,...' specs folds them into the SAME
 # merge invocation/artifact -- never a second, separately-discoverable
 # merge. Default empty = no dose ladder in this merge (the common case: a
-# dose ladder is a deliberate, lead-run H5 step, not part of every sweep).
+# dose ladder is a deliberate, separately-run step, not part of every sweep).
 FINETUNE_RUN_AB_MUTANT_LEGS="${FINETUNE_RUN_AB_MUTANT_LEGS:-}"
 if [ -n "$FINETUNE_RUN_AB_MUTANT_LEGS" ]; then
   IFS=';' read -r -a MUTANT_LEG_SPECS <<< "$FINETUNE_RUN_AB_MUTANT_LEGS"

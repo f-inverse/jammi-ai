@@ -809,7 +809,7 @@ def _self_test() -> int:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         _write_fixture_repo(root, lib_body=_GOOD_LIB, prove_body=_GOOD_PROVE)
-        fixture_line = 'RP_INACTIVITY="$P12_INACT"; DEADLINE=$(( SECONDS + P12_DL ))\n'
+        fixture_line = 'RP_INACTIVITY="$TWORANKS_INACT"; DEADLINE=$(( SECONDS + TWORANKS_DL ))\n'
         (root / "ci" / "scripts" / "test_gpu_cluster_lane.sh").write_text(fixture_line)
         (root / "ci" / "scripts" / "runpod_gpu_cluster.sh").write_text(fixture_line)
         subprocess.run(["git", "add", "-A"], cwd=root, check=True)

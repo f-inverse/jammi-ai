@@ -49,7 +49,7 @@ def check(fixture: Path) -> int:
     if not fixture.exists():
         print(
             f"check_bundle_fixture.py: FAILED -- no fixture at {fixture}. "
-            "ci/scripts/test_bundle_cuda_libs.sh's T4(3) check has nothing to read.",
+            "ci/scripts/test_bundle_cuda_libs.sh's real-report arms have nothing to read.",
             file=sys.stderr,
         )
         return 1
@@ -58,7 +58,7 @@ def check(fixture: Path) -> int:
     if not text.strip():
         print(
             f"check_bundle_fixture.py: FAILED -- {fixture} is empty. "
-            "ci/scripts/test_bundle_cuda_libs.sh's T4(3) check has nothing to read.",
+            "ci/scripts/test_bundle_cuda_libs.sh's real-report arms have nothing to read.",
             file=sys.stderr,
         )
         return 1

@@ -132,4 +132,4 @@ descriptor** for their output table; these verbs then reason over that descripto
 - Standalone Mondrian / weighted conformal — not in the OSS Python surface. The
   tier-04 graph-aware repair is computed **inline in the notebook** (~10 lines of
   numpy); a productionized, governed cohort surface is out of scope. OSS Python
-  exposes only the **marginal** `conformalize*` surface (K0 §4).
+  exposes only the **marginal** `conformalize*` surface.

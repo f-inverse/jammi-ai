@@ -87,7 +87,7 @@ jobs:
       - name: Build native wheel
         run: maturin build --release --out dist
 
-      # W3: the sufficient ABI floor assert, run against the cdylib INSIDE
+      # The sufficient ABI floor assert, run against the cdylib INSIDE
       # the built wheel (maturin, unlike `_pypi-server.yml`'s staged
       # binary, never leaves a bare .so at a fixed path -- unzip first).
       - name: Assert the GLIBC symbol-version floor (manylinux_2_28)
@@ -105,7 +105,7 @@ jobs:
           bash ../../ci/scripts/assert_glibc_floor.sh "$so" 2.28
           echo "so_path=$so" >> "$GITHUB_OUTPUT"
 
-      # BLOCK 1 (#482): maturin derives the wheel's own platform tag
+      # maturin derives the wheel's own platform tag
       # (manylinux_2_28_${{ matrix.arch }}) from the container it runs in --
       # nothing re-checks that the built `.so`'s actual machine matches
       # `matrix.arch` before it ships under that tag. Same shared script
@@ -166,8 +166,8 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
 
-      # Class closure (#482): the Linux legs above assert their wheel's .so
-      # ELF machine matches matrix.arch (BLOCK 1); this leg stamped a
+      # The Linux legs above assert their wheel's .so ELF machine matches
+      # matrix.arch; this leg stamps a
       # platform tag (`macosx_*_arm64`/`macosx_*_x86_64`, maturin-derived
       # from `matrix.target`) with nothing checking the built `.so`'s
       # actual Mach-O machine before it shipped under that tag. Same shared
@@ -197,9 +197,8 @@ jobs:
     name: GPU proof required
     # Any `py-v*` TAG ref — a tag push, or a recovery dispatch run on the
     # tag — requires the release commit's already-recorded GPU-prove
-    # verdict before the native wheel is published (#454 follow-up,
-    # operator direction: every release publisher gates on the prove
-    # verdict, all-or-nothing, not only the CUDA lanes).
+    # verdict before the native wheel is published (every release publisher
+    # gates on the prove verdict, all-or-nothing, not only the CUDA lanes).
     if: startsWith(github.ref, 'refs/tags/py-v')
     uses: ./.github/workflows/_gpu-proof-required.yml
     permissions:

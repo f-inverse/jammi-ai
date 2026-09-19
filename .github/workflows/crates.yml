@@ -75,7 +75,7 @@ jobs:
     # `*-scale` tier maps its measured-rate-vs-committed-floor verdict (and its
     # determinism-digest check) to the process exit code, so a regression exits
     # non-zero and reds this job — and because `publish` needs it, the crates
-    # never ship. This is the gated half of §4.4; the nightly `perf.yml` lane is
+    # never ship. This is the gated half; the nightly `perf.yml` lane is
     # the non-blocking early-warning half. The documented contract (the verb ×
     # baseline × threshold × reference-box SLO table) is
     # `docs/guide/src/performance-slos.md`.
@@ -96,7 +96,7 @@ jobs:
         # container job: build.rs's compile-time `git rev-parse HEAD` fallback
         # hits git's "dubious ownership" refusal in a container, so without an
         # override it bakes build_sha="unknown" — which run_scale_tiers.sh's
-        # C5.1 provenance cross-check then correctly refuses to run tiers
+        # provenance cross-check then correctly refuses to run tiers
         # against. `github.sha` is exactly 40 lowercase hex, the one shape
         # build.rs's own input-edge validation accepts verbatim (see the doc
         # comment at the top of crates/jammi-bench/build.rs) — never a
@@ -115,9 +115,8 @@ jobs:
     name: GPU proof required
     # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
     # requires the release commit's already-recorded GPU-prove verdict
-    # before ANY crate is published (#454 follow-up, operator direction:
-    # every release publisher gates on the prove verdict, all-or-nothing,
-    # not only the CUDA lanes). The tag guard (not an event guard) is what
+    # before ANY crate is published (every release publisher gates on the
+    # prove verdict, all-or-nothing, not only the CUDA lanes). The tag guard (not an event guard) is what
     # keeps every promotion arm proven: an event-keyed guard would let a
     # dispatch publish unproven.
     if: startsWith(github.ref, 'refs/tags/v')

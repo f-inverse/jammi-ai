@@ -26,7 +26,7 @@ directory:
   a per-pair SHA-256 over their (unmounted) text, so the full 1500-pair
   identity is checkable against committed content without committing every
   train pair's text (keeps the repo artifact text-pairs-sized, not a full
-  corpus dump — CONTRACT H3 item 5).
+  corpus dump).
 * ``arxiv_subset_ids.txt`` — a VENDORED byte-identical copy of the committed
   4000-id subset (``cookbook/book/data/ids/arxiv.txt``) written into the
   fixture directory, so the fixture's own provenance is checkout-self-
@@ -65,8 +65,7 @@ Usage (from ``cookbook/book/``)::
                                                           # discipline, see FIXTURE_DIR/README.md
                                                           # "Why train text isn't committed" and
                                                           # this repo's root .gitignore) -- this is
-                                                          # the CONTRACT amendment 2026-08-28b
-                                                          # PRE-RUN provisioning step
+                                                          # the PRE-RUN provisioning step
                                                           # ``ci/scripts/perf/finetune_run_ab.sh``
                                                           # invokes automatically when
                                                           # train_pairs.jsonl is absent, followed
@@ -105,10 +104,9 @@ SUBSET = 4000
 N_PAIRS = 1500
 TEXT_CLIP = 1500
 
-# Held-out sizing (CONTRACT H3 item 2 / PLAN.md v2 delta 2): the held-out set
-# must be an explicit multiple of the fine-tune protocol's batch_size. TWO
-# candidates exist in the repo (see README.md "Batch-size pre-registration
-# flag" — this is a FLAGGED, not yet lead-confirmed, choice):
+# Held-out sizing: the held-out set must be an explicit multiple of the
+# fine-tune protocol's batch_size. TWO candidates exist in the repo (see
+# README.md "Batch-size pre-registration flag"):
 #   (A) BATCH = 32 — cookbook/book/scripts/build_finetune_cache.py:77 and
 #       build_finetune_regression_cache.py:69, the batch_size explicitly
 #       passed to every db.fine_tune(...) call in the chapter that mines this
@@ -117,9 +115,8 @@ TEXT_CLIP = 1500
 #       FineTuneConfig::default().batch_size (the engine's own unset-default,
 #       the "bench/engine config").
 # 128 is a multiple of BOTH candidates (128 = 4*32 = 16*8), so sizing the
-# held-out set to 128 is correct under either resolution of the flagged
-# question -- no rework needed once the lead confirms which the A/B protocol
-# (PLAN.md (c) / the future finetune_run_ab.sh) pins.
+# held-out set to 128 is correct whichever of the two the A/B protocol
+# (ci/scripts/perf/finetune_run_ab.sh) pins.
 N_HELDOUT = 128
 BATCH_SIZE_CANDIDATES = {"chapter_config_build_finetune_cache_py": 32,
                           "engine_default_FineTuneConfig": 8}
@@ -249,7 +246,7 @@ def _write_train_pairs(train_pairs: list[dict]) -> Path:
     line, in mining order) — so a byte-verifier can hash each line exactly
     the way ``_pair_sha256``/``_write_train_hashes`` already did when
     ``train_ids_sha256.json`` was committed. This is the PRE-RUN
-    provisioning artifact CONTRACT amendment 2026-08-28b names: reproducible
+    provisioning artifact: reproducible
     (same mining/clipping code path as ``generate()``), never committed
     (repo-size discipline — see FIXTURE_DIR/README.md "Why train text isn't
     committed" and the root ``.gitignore``), and always byte-verified against

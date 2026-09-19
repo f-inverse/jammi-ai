@@ -8,9 +8,10 @@ it bites: a test which actually leaves a session open is actually failed, BY
 NAME, at teardown, regardless of transport or binding shape. It runs as a
 real pytest session rather than a unit test of a helper function, because
 the guard's own subject is "how does the outer pytest run report a leak" —
-there is no smaller unit that exercises it honestly. A static gate over the
-rest of `cookbook/**` (the non-pytest lanes: scripts, recipes, quickstart,
-the executed chapter cells) is filed as issue #539.
+there is no smaller unit that exercises it honestly. The rest of `cookbook/**`
+(the non-pytest lanes: scripts, recipes, quickstart, the executed chapter
+cells) is covered by the static AST gate
+`ci/scripts/check_cookbook_session_lifecycle.py`.
 
 The throwaway suites run against the REAL ``conftest.py`` next to this file
 (read from disk, not reimplemented), in an isolated subprocess (`pytester`,
@@ -244,7 +245,7 @@ def test_leaked_embedded_session_is_failed_by_name(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Every import-time binding shape and construction route audit #5 executed.
+# Every import-time binding shape and construction route a leak can take.
 #
 # A guard that tracks leaks by patching the `jammi.connect` MODULE ATTRIBUTE
 # for the duration of a test cannot see any of these: each one binds its own
@@ -401,7 +402,7 @@ def test_shape_closing_control_passes():
 '''
 
 # Every leaking test defined in `_SHAPES_SUITE`, by name -- the 13 import-time
-# binding shapes from audit #5, plus the two direct-construction routes and
+# binding shapes, plus the two direct-construction routes and
 # the local-dropped-at-frame-exit shape (16 total). `test_shape_closing_control_passes`
 # is deliberately excluded: it must NOT appear in the ERROR summary.
 _LEAKING_SHAPE_TESTS = (
@@ -425,7 +426,7 @@ _LEAKING_SHAPE_TESTS = (
 
 
 def test_every_alias_and_construction_shape_leaks_by_name(pytester: pytest.Pytester):
-    """Every shape audit #5 found (13 import-time bindings), plus a local
+    """Every import-time binding shape (13), plus a local
     dropped at frame exit and both backends' direct construction, is FAILED
     BY NAME under the current registry-based guard -- and the one test that
     actually closes its session is not.
@@ -552,7 +553,7 @@ def test_leak_in_a_subdirectory_module():
 
 
 # --------------------------------------------------------------------------- #
-# F1: capability detection -- a jammi client without the session registry.
+# Capability detection -- a jammi client without the session registry.
 # --------------------------------------------------------------------------- #
 
 # A minimal stand-in for a pre-registry `jammi` client: exposes `connect` but
@@ -601,13 +602,12 @@ def test_leaks_but_the_rail_is_inactive():
 def test_rail_inactive_without_the_registry_warns_once_and_runs_clean(
     pytester: pytest.Pytester,
 ):
-    """F1: a `jammi` client that predates the session registry (`.observe`
-    absent) must not error every test at setup -- against the guard before
-    this capability arm existed, this exact fixture (a fake `jammi` package
-    with `connect` but no `observe`) failed every test's setup with
+    """A `jammi` client that predates the session registry (`.observe`
+    absent) must not error every test at setup -- without the capability arm,
+    this exact fixture (a fake `jammi` package with `connect` but no
+    `observe`) fails every test's setup with
     `AttributeError: module 'jammi' has no attribute 'observe'` (the
-    nightly release-recipe leg's own symptom, reproduced by execution while
-    developing this fix). The capability arm detects the missing registry
+    nightly release-recipe leg's symptom). The capability arm detects the missing registry
     at import and yields instead of subscribing, and the session-scoped
     fixture reports the gap exactly once.
     """
@@ -629,7 +629,7 @@ def test_rail_inactive_without_the_registry_warns_once_and_runs_clean(
 
 
 # --------------------------------------------------------------------------- #
-# issue #552 item 1: a session constructed OUTSIDE any single test's own
+# A session constructed OUTSIDE any single test's own
 # fixture window (a module-scoped fixture's own setup) is invisible to the
 # per-test guard and must still fail the RUN, via the session-wide sweep.
 # --------------------------------------------------------------------------- #
@@ -684,7 +684,7 @@ def test_a_session_opened_by_a_module_scoped_fixture_fails_the_run_not_the_test(
 
 
 # --------------------------------------------------------------------------- #
-# issue #552 item 2: "a test-opened session is closed by that SAME test" --
+# "A test-opened session is closed by that SAME test" --
 # a session opened in test A and closed in test B is reported against A (the
 # opener), never against B (the closer).
 # --------------------------------------------------------------------------- #

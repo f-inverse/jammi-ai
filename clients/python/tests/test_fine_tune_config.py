@@ -145,7 +145,7 @@ def _capture_graph_request(**overrides):
 
 
 def test_graph_fine_tune_attaches_config_with_hyperparameters() -> None:
-    """Regression for #167: remote `fine_tune_graph` must attach the assembled
+    """Remote `fine_tune_graph` must attach the assembled
     `FineTuneConfig` to the `SubmitJobRequest`. Without it the server falls
     back to its built-in defaults and silently drops every hyperparameter the
     caller set — loss, epochs, batch size, learning rate, LoRA rank, matryoshka."""
@@ -185,7 +185,7 @@ def test_graph_fine_tune_defaults_still_attach_the_loss() -> None:
 # `quantile_levels` (field 28). The pure client must thread the SAME three kwargs
 # onto the SAME proto fields — a signature-only addition would pass the
 # cross-wheel conformance guard while silently dropping the regression config on
-# the wire (the #167 config-attach class of bug). These pin that they reach the
+# the wire (the config-attach class of bug). These pin that they reach the
 # proto, not just the signature.
 
 
@@ -257,7 +257,7 @@ def _capture_fine_tune_request(**overrides):
 
 
 def test_remote_fine_tune_threads_regression_config_to_the_proto() -> None:
-    """End-to-end #167 guard: a remote `fine_tune(regression_loss=..., quantile_levels=...)`
+    """End-to-end config-attach guard: a remote `fine_tune(regression_loss=..., quantile_levels=...)`
     must carry that regression config into the `FineTuneConfig` on the built
     proto. A signature-only addition (passing the conformance guard) would drop
     it here — this catches that."""

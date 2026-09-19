@@ -38,7 +38,7 @@ Every transport exposes the same three verbs with the same report:
 (embedded and remote alike), and `EmbeddingService.RefreshEmbeddings /
 CompactEmbeddings / ExpireVersions` on gRPC. A refresh run through a local
 session and the same refresh run through the data-plane client produce the
-same version identity, fragment digests and counts (K4).
+same version identity, fragment digests and counts.
 
 ## What a refresh does
 
@@ -151,7 +151,7 @@ A reader — `search`, `search_by_id`, every SQL `SELECT`, `read_vectors`,
   cannot be resolved (the object is gone) is bound as a placeholder: planning
   succeeds, every scan is the typed `VersionUnavailable { table, version }`,
   and `recompute` is the remedy.
-- **A never-refreshed table** is byte-identical to today's: no mask, no
+- **A never-refreshed table** is byte-identical to an unversioned one: no mask, no
   union, `read_vectors` reads the raw file.
 
 Restarting the engine re-binds the current version; search results and

@@ -202,15 +202,15 @@ print(f"tier01 recall@10 (raw embeddings): {recall:.3f}")
 rails.measure("arxiv.tier01.recall_at_10", recall)  # asserts and returns the number
 ```
 
-### Why the keystone's recall is a numpy fold (and the R1 evals, now on the wire)
+### Why the keystone's recall is a numpy fold (and the eval verbs on the wire)
 
 The measurement rail names two eval families:
 
-- **R2 — `eval_calibration` is on `RemoteDatabase`** (the `grpc://` arm). It returns
+- **`eval_calibration` is on `RemoteDatabase`** (the `grpc://` arm). It returns
   CRPS / NLL / adaptive-ECE / sharpness / coverage for a gaussian or sample
   predictor, and is the wire surface for the tier-04 calibration verdict.
-- **R1 — `eval_embeddings` / `eval_compare` / `eval_inference` are now on
-  `RemoteDatabase`** (landed since the keystone — see the dedicated chapter
+- **`eval_embeddings` / `eval_compare` / `eval_inference` are on
+  `RemoteDatabase`** (see the dedicated chapter
   *"Eval on the wire + provenance channels"*, which is the engine↔cookbook
   validator that proves it with an emit-side `remote == embedded` parity check).
   But these verbs evaluate a **source-bound** embedding table the engine
@@ -224,7 +224,7 @@ The measurement rail names two eval families:
 
 The fold is therefore the right tool for the **bare committed matrix**, not a
 workaround for a missing verb: the recall numbers are real, deterministic, and
-asserted via `rails.measure` — never fabricated. The R1 wire surface itself is
+asserted via `rails.measure` — never fabricated. The eval verbs' wire surface itself is
 validated, on the engine's source-bound public fixtures, in chapter 14.
 
 ```{python}
@@ -232,7 +232,7 @@ import numpy as np
 
 
 def recall_at_10(emb_table, labels):
-    """Same-label retrieval recall@10 by an exact cosine-kNN fold (R1 stand-in).
+    """Same-label retrieval recall@10 by an exact cosine-kNN fold.
 
     Reproduces the keystone's measurement exactly: L2-normalise the committed
     vectors, take the full cosine-similarity matrix, and for each row count the
@@ -260,7 +260,7 @@ def recall_at_10(emb_table, labels):
 emb = contracts.load_artifact("arxiv.embeddings")
 observed = recall_at_10(emb, subject)
 print(f"recomputed recall@10 (exact cosine-kNN fold): {observed:.3f}")
-rails.measure("arxiv.tier01.recall_at_10", observed)  # the R1 fold, asserted to the golden
+rails.measure("arxiv.tier01.recall_at_10", observed)  # the fold, asserted to the golden
 ```
 
 ```{python}
@@ -268,7 +268,7 @@ rails.measure("arxiv.tier01.recall_at_10", observed)  # the R1 fold, asserted to
 # The numpy-fold recall reproduces the keystone's frozen recall@10 within
 # tolerance — the exact fold is the right tool for the bare committed arxiv
 # matrix, never faked. (eval_embeddings/eval_compare/eval_inference ARE on
-# RemoteDatabase now, but they score a source-bound engine table, not this bare
+# RemoteDatabase, but they score a source-bound engine table, not this bare
 # matrix; their wire surface is validated on public fixtures in chapter 14.
 # eval_calibration IS on the wire — used where the tier-04 calibration verdict is
 # measured.)

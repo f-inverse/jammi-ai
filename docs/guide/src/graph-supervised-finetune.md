@@ -170,11 +170,11 @@ trained with no negative.
 `graph_fine_tune` supports an in-process multi-rank gang on ONE host: at
 `world_size > 1` within `[worker] local_ranks`, the claiming worker itself
 runs every rank, each over the SAME materialised table. It does **not**
-yet support a multi-host (`Peer`) gang — `world_size` above `local_ranks`
-is refused, typed, naming the reason (issue #538): a `Peer` member's own
-read path over the table does not yet agree with rank 0's committed row
-order, and there is no proof yet that the ranks' shards combine into a
-correct gradient. Keep `world_size <= [worker] local_ranks` for now.
+support a multi-host (`Peer`) gang — `world_size` above `local_ranks`
+is refused, typed, naming the reason: a `Peer` member's own
+read path over the table does not agree with rank 0's committed row
+order, and nothing proves that the ranks' shards combine into a
+correct gradient. Keep `world_size <= [worker] local_ranks`.
 
 ## Tuning knobs
 

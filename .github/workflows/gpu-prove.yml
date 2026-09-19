@@ -4,7 +4,7 @@ name: GPU prove (RunPod)
 # — the only place jammi's CUDA path is exercised on a device before release.
 # Two suites: the served client/server GPU proof (`grpc_embedding_gpu`, the
 # recommended topology over gRPC) and the engine-core GPU correctness suite
-# (`gpu_capability`). It doubles as the #277 regression gate: the pod builds
+# (`gpu_capability`). It doubles as the compute-capability gate: the pod builds
 # candle's kernels at the CI image's baked CUDA_COMPUTE_CAP and runs them on a
 # real device, so a cap that regresses above the Ampere floor fails here.
 #
@@ -17,22 +17,17 @@ name: GPU prove (RunPod)
 # selects the leg's device (see that script's own doc for the sm_XX ->
 # RunPod-GPU-type mapping, which lives in exactly one place).
 #
-# RENAME NOTE FOR HUMANS: this job previously ran ONE leg named "GPU prove on
-# RunPod A100 (sm_80)". It now runs FOUR legs, each named "GPU prove on RunPod
-# (<arch>)" (`sm_80`/`sm_86`/`sm_89`/`sm_90`) via the matrix `name:` below —
-# four distinct required-check names replacing the old single one. This
-# workflow is off the merge path (no branch-protection dependency today), but
-# if anything downstream starts requiring a specific check name from this
-# job, it must be repointed at "GPU prove on RunPod (sm_80)" (the closest
-# equivalent), not the old unmatrixed name.
+# CHECK NAMES: each leg is named "GPU prove on RunPod (<arch>)"
+# (`sm_80`/`sm_86`/`sm_89`/`sm_90`) via the matrix `name:` below. This workflow
+# is off the merge path (no branch-protection dependency), so anything that
+# requires a check name from this job must name one of those four.
 #
-# COST NOTE FOR HUMANS: four pods per prove run instead of one — roughly 4x
-# the GPU-minute spend of the previous single-A100 lane, each independently
-# billed and independently subject to the same $187 cancel-in-progress
-# lesson (see the concurrency comment below) if a run is superseded.
+# COST NOTE: four pods per prove run, each independently billed and each
+# subject to the cancel-in-progress cost (see the concurrency comment below)
+# if a run is superseded.
 #
 # Off the merge path by default, and NEVER in the critical path of an
-# automated workflow (operator direction, 2026-09-03): GPU minutes cost
+# automated workflow: GPU minutes cost
 # money and capacity is intermittent. It fires on: the `run-gpu` PR label
 # (opt-in per PR), manual dispatch, and an allow-listed nightly cron —
 # deliberately NO `push:`/`workflow_call:` trigger (`check_gpu_prove_once.
@@ -56,7 +51,7 @@ name: GPU prove (RunPod)
 # every release workflow immediately, by design: prove first, then tag,
 # because a tag push commits the version number.
 #
-# BUDGET, ref-type-conditional (esc-080/esc-083 derivation, kept in this ONE
+# BUDGET, ref-type-conditional (derivation kept in this ONE
 # place — never copied into a publisher's own comment): a `workflow_dispatch`
 # run ON A TAG REF gets the release budget (a dev proving the exact commit
 # about to ship deserves the full retry margin a release promotion needs):
@@ -66,7 +61,7 @@ name: GPU prove (RunPod)
 # ~5m overhead, and the FINAL attempt additionally pays the full RP_TIMEOUT
 # job budget (100m) if it actually runs: 2 × 85m + 180m = 350m, +5m margin =
 # 355m. Every OTHER ref (a branch dispatch, the `run-gpu` label, the nightly
-# schedule) keeps the original single-attempt budget: `max_attempts` 1,
+# schedule) keeps the single-attempt budget: `max_attempts` 1,
 # `timeout-minutes` 190 (80m worst-case deploy + 100m job cap + 10m margin).
 
 on:
@@ -113,16 +108,16 @@ jobs:
     #
     # cancel-in-progress is false because this job rents hardware and cleans up
     # in an EXIT trap. Cancelling SIGKILLs the runner, the trap never runs, and
-    # the pod it already rented is orphaned — that is exactly how a toggled
-    # `run-gpu` label leaked an A100 for seven days on 2026-07-24. Letting a
-    # superseded run finish costs ~$0.50; cancelling one cost $187.
+    # the pod it already rented is orphaned: a toggled `run-gpu` label can
+    # leak an A100 for days (one such leak cost $187), while letting a
+    # superseded run finish costs ~$0.50.
     concurrency:
       group: gpu-prove-${{ matrix.arch }}-${{ github.ref }}
       cancel-in-progress: false
     # A job-timeout kill is another trap bypass. See this file's own header
     # for the ref-type-conditional budget derivation (one place, not copied
     # into a publisher). A `workflow_dispatch` on a tag ref gets the release
-    # budget (355m); every other ref keeps the original 190m.
+    # budget (355m); every other ref keeps 190m.
     timeout-minutes: ${{ github.ref_type == 'tag' && 355 || 190 }}
     steps:
       - uses: actions/checkout@v4
@@ -137,7 +132,7 @@ jobs:
       # leg with no proof, never a silent green. The `::warning::` step below
       # annotates that red as a provider-capacity condition (not a code
       # regression); operator recovery is a re-run once capacity returns. A
-      # `76` exit (esc-080) means `rp_run_remote_watched`'s own inactivity
+      # `76` exit means `rp_run_remote_watched`'s own inactivity
       # watchdog killed the leg with a `PROVE_GROUPS` member still
       # unresolved — a genuine hang, not a capacity condition; the
       # `::warning::` step below names it separately so the two causes are
@@ -145,7 +140,7 @@ jobs:
       # the non-gating `bench` group with every proof group already at
       # rc=0 does NOT reach either arm here — `runpod_gpu_prove.sh`'s own
       # driver rule already turns that case into exit 0 plus its own
-      # inline `::warning::` (esc-082), so this step's `rc` output is `0`.
+      # inline `::warning::`, so this step's `rc` output is `0`.
       # Bounded retry PER ARCH on capacity (75), ref-type-conditional (see
       # this file's own header): `MAX_ATTEMPTS`/the `sleep` between attempts
       # only ever fire on a tag-ref dispatch; every other ref's loop body
@@ -160,7 +155,7 @@ jobs:
           GIT_REPO: https://github.com/${{ github.repository }}.git
           GIT_REF: ${{ github.head_ref || github.ref_name }}
           GPU_PROVE_ARCH: ${{ matrix.arch }}
-          # esc-084: the pod echoes PROVE_SHA after clone; runpod_lib.sh's
+          # The pod echoes PROVE_SHA after clone; runpod_lib.sh's
           # rp_run_remote_watched compares it against this and fails 77
           # ("wrong tree") rather than letting a moved ref silently prove
           # the wrong commit. Unset on a hand run of the script (never

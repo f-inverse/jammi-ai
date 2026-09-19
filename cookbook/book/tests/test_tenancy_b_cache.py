@@ -1,4 +1,4 @@
-"""Cache-backed checks on the committed tenant-isolation vertical (B2).
+"""Cache-backed checks on the committed tenant-isolation vertical.
 
 These run on CPU against the committed cache (no GPU) and assert the tenancy vertical's
 load-bearing invariants — the engine's TRUE isolation model measured as properties:
@@ -42,7 +42,7 @@ def test_caveat_discriminatorless_source_is_globally_visible():
     """The honest caveat: a discriminator-LESS source is globally readable.
 
     A positive assertion — tenant A sees ALL of B's rows when it names B's
-    discriminator-less source. This is the limit the KV-air audit corrected; it must not
+    discriminator-less source. This is the limit that is easy to overstate; it must not
     be hidden behind a false "separate source isolates" claim.
     """
     visible = contracts.golden("tenancy_b.caveat_visible")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emit the ogbn-arxiv keystone cache (K0 layer 2) — run ONCE on the GPU server.
+"""Emit the ogbn-arxiv keystone cache — run ONCE on the GPU server.
 
 This is the heavy pipeline: embed → neighbor graph → propagate → fine-tune →
 context-predictor → conformal. It runs the real ``jammi`` API end-to-end on
@@ -13,7 +13,7 @@ target and the engine does the embedding / fine-tune / predictor training on the
 device. The committed cache is then read on CPU by the chapters via
 ``connect("file://…")`` — the ``connect(target)`` parity spine.
 
-Determinism contract (K0 §3): committed subset ids, ``exact=True`` neighbor
+Determinism contract: committed subset ids, ``exact=True`` neighbor
 graph, pinned ModernBERT + dtype, single-threaded BLAS (applied by importing
 jammi_cookbook), the tier-04 context predictor + domain classifier seeded, metrics
 asserted to tolerances downstream.
@@ -71,8 +71,8 @@ RUN_LIVE_CONTROLS = False  # see _MEASURED_CONTROLS below
 # engine, the same committed 4000-paper subset, seed=determinism.SEED,
 # CONTROL_EPOCHS=5) run independently of this emission, not fabricated and not
 # recomputed by this script's own live-fine-tune path. Set RUN_LIVE_CONTROLS=True
-# to recompute them live instead (the (now-fixed) code path below still runs
-# end-to-end when invoked).
+# to recompute them live instead (the code path below runs end-to-end when
+# invoked).
 _MEASURED_CONTROLS = {
     "similarity": {"recall_at_10": 0.561, "recall_gain_vs_base": 0.023},
     "random": {"recall_at_10": 0.524, "recall_gain_vs_base": -0.014},
@@ -258,8 +258,8 @@ def emit(db) -> None:
     ft_emb = None
     if cached_ft.get("edge_provenance") == "declared" and cached_ft.get("epochs") == FT_EPOCHS:
         # Reuse the trained checkpoint from a prior emit at this exact epoch
-        # budget (K0 §mandate — a re-emit reads its own prior cache rather than
-        # re-deriving an already-measured upstream result); the epoch loop itself
+        # budget (a re-emit reads its own prior cache rather than re-deriving an
+        # already-measured upstream result); the epoch loop itself
         # is NOT re-run, only the embed pass below. The checkpoint is only valid
         # on the SAME server instance that trained it (a fresh/reset server has
         # no artifact for it) — fall through to a real retrain rather than crash
@@ -361,18 +361,17 @@ def tier04(db, papers: str, cite: str, papers_rows: list[dict], cite_rows: list[
     """Two honest results on the ogbn-arxiv time-split (train ≤2017, valid=2018 as
     the calibration era, test 2019–2020).
 
-    **Part A — the bidirectional win (year-regression conformal).** The
-    gaussian-collapse bug (#43) once made ``train_context_predictor(output=
-    "gaussian", value_column="year")`` unusable (std≈0.001, means ~2163). The fix
-    landed in two parts: 0.26.1 standardized the fine-tune projection head's target,
-    but the amortized context predictor still collapsed; 0.26.2 completed it with
-    z-space standardization of the predictor's target and in-context members' y
-    (de-standardizing the served distribution, persisting the scaler). **The win is
-    that the workflow now RUNS end-to-end at all**: the predictor fits a real mean
-    (≈2018.4, essentially unbiased across eras) with real spread, and the
-    previously-impossible regression-conformal recipe executes. Authoring this
-    keystone surfaced the bug; the engine fix made the workflow work — the
-    cookbook→engine→cookbook loop. What the recipe then *measures* is the same
+    **Part A — the bidirectional win (year-regression conformal).** Without a
+    standardized target, ``train_context_predictor(output="gaussian",
+    value_column="year")`` collapses (std≈0.001, means ~2163). The engine
+    standardizes the fine-tune projection head's target and — in z-space — the
+    amortized context predictor's target and in-context members' y
+    (de-standardizing the served distribution, persisting the scaler); standardizing
+    the head alone still leaves the context predictor collapsed. **The win is that
+    the workflow RUNS end-to-end at all**: the predictor fits a real mean (≈2018.4,
+    essentially unbiased across eras) with real spread, and the regression-conformal
+    recipe executes. Authoring this keystone surfaced the collapse; the engine fix
+    makes the workflow work — the cookbook→engine→cookbook loop. What the recipe then *measures* is the same
     honest lesson as Part B: the ``conformalize_interval`` (|y−ŷ| split conformal)
     **under-covers** under the time-split, and weighting it is a **no-op** — not
     because cal and test residual magnitudes match (they do not: the test era's
@@ -534,14 +533,13 @@ def part_a_regression_conformal(db, papers: str, cite: str, ids: list[str],
     """Train the gaussian year predictor, predict per-row means for cal + test,
     and conformalize the absolute-residual interval with the engine.
 
-    **The bidirectional win is that this WORKFLOW RUNS END-TO-END at all.** The #43
-    gaussian collapse once made ``train_context_predictor(output="gaussian",
-    value_column="year")`` unusable (std≈0.001, means ~2163 for a 2014–2020 target).
-    The fix landed in two parts: 0.26.1 standardized the fine-tune projection head,
-    but the *amortized context predictor* still collapsed; 0.26.2 completed it with
-    z-space standardization of the predictor's target. The predictor now fits a real
-    mean (essentially unbiased across eras) with real spread, and the
-    previously-impossible regression-conformal workflow runs.
+    **The bidirectional win is that this WORKFLOW RUNS END-TO-END at all.** Without
+    a standardized target, ``train_context_predictor(output="gaussian",
+    value_column="year")`` collapses (std≈0.001, means ~2163 for a 2014–2020 target);
+    the engine standardizes both the fine-tune projection head and — in z-space — the
+    *amortized context predictor's* target. The predictor fits a real mean
+    (essentially unbiased across eras) with real spread, and the regression-conformal
+    workflow runs.
 
     **The honest conformal finding (same lesson as Part B, different mechanism).**
     The interval is built by the engine's ``conformalize_interval`` (|y−ŷ| split

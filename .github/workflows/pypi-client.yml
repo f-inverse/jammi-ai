@@ -8,8 +8,8 @@ name: PyPI (jammi-ai)
 #
 # NOTE (release-time, EXTERNAL — do not act in CI): the `jammi-ai` PyPI project's
 # Trusted-Publisher config must authorize THIS workflow (`pypi-client.yml`), which
-# builds the `jammi-ai` dist from `clients/python`. Confirm the re-point before the
-# first `py-v*` publish. CI only BUILDS the wheel; it does not publish on a PR, so
+# builds the `jammi-ai` dist from `clients/python`. Confirm it before a `py-v*`
+# publish. CI only BUILDS the wheel; it does not publish on a PR, so
 # this is not a merge blocker.
 
 on:
@@ -74,9 +74,8 @@ jobs:
     name: GPU proof required
     # Any `py-v*` TAG ref — a tag push, or a recovery dispatch run on the
     # tag — requires the release commit's already-recorded GPU-prove
-    # verdict before `jammi-ai` is published (#454 follow-up, operator
-    # direction: every release publisher gates on the prove verdict,
-    # all-or-nothing, not only the CUDA lanes). This client wheel is pure
+    # verdict before `jammi-ai` is published (every release publisher gates
+    # on the prove verdict, all-or-nothing, not only the CUDA lanes). This client wheel is pure
     # Python and never touches CUDA itself, but the lockstep contract this
     # workflow's header states means it must ship in the SAME all-or-nothing
     # release as `jammi-ai-native`, never ahead of an unproven commit.

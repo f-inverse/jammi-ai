@@ -16,20 +16,12 @@ name: Distributed validation
 #
 #   * `chaos` — the SIGKILL crash-window tests (kill-9 reclaim, the
 #     publish/finalize crash, the cross-host artifact round-trip). These race a
-#     kill against an in-flight publish. Promoted off `advisory` (#500 wave 5
-#     E6): every observed red on this leg was `crash_between_publish_and_
-#     finalize_commits_only_the_winner` failing on a stale hand-built
-#     `winner_prefix` layout string that never accounted for the tenant-
-#     prefixed `_global` segment `5fef1ac8` added to `ArtifactStore::
-#     put_artifact` three months after this test was written — a
-#     deterministic, 100%-reproducible assertion mismatch (reproduced 3/3),
-#     never a genuine race against the SIGKILL timing window. Fixed at the
-#     root: the test now derives its expected prefix through `ArtifactStore::
-#     prefix_url` (the same function `put_artifact` itself lays a bundle out
-#     through), never a hand-built copy, and a mutation that reverts to the
-#     old hand-built string reproducibly reds it (verified 3/3 clean runs
-#     post-fix). This leg now runs WITHOUT `continue-on-error`
-#     (`advisory: false`), like `deterministic`.
+#     kill against an in-flight publish, but their outcome does not depend on
+#     where the kill lands: `crash_between_publish_and_finalize_commits_only_
+#     the_winner` derives its expected prefix through `ArtifactStore::
+#     prefix_url` (the same function `put_artifact` lays a bundle out
+#     through), never a hand-built layout string. This leg runs WITHOUT
+#     `continue-on-error` (`advisory: false`), like `deterministic`.
 #
 #   * `ballista` — the compute-plane tests (three `jammi-server` processes
 #     hosting a Ballista scheduler and executors over the shared catalog: the
@@ -89,8 +81,8 @@ jobs:
             tests: >-
               one_job_n_workers_exactly_one_wins
               mixed_tenant_queue_completes_each_under_its_own_scope
-          # Promoted off `advisory` (#500 wave 5 E6 — see this file's header
-          # comment for the root cause). The two `gang_chaos` rows SIGKILL
+          # Not advisory (see this file's header comment). The two
+          # `gang_chaos` rows SIGKILL
           # one process of a two-rank gang (a peer, then the coordinator)
           # and need the server's rank body for the cross-process gang to
           # complete.
@@ -104,17 +96,15 @@ jobs:
               artifact_written_on_worker_is_readable_by_a_different_client
               killed_peer_job_is_reclaimed_and_completed_by_a_new_gang
               killed_coordinator_job_is_reclaimed_and_completed_by_a_new_gang
-          # The Ballista compute-plane lane (plan 67 PR-D, contract
-          # `feat_500-wave4` §2.5/§7/§9): a real three(+)-process
+          # The Ballista compute-plane lane: a real three(+)-process
           # `jammi-server` fleet with `[ballista]` roles configured, proving
-          # embedding-across-two-executors (a3), placed-gang-completes-
-          # elsewhere (a4/b5), killed-executor-mid-gang reclaim (a5),
-          # scheduler restart (b1), two schedulers over one catalog (b2), the
-          # device-less/KIND-MATCH refusal (b3), and `list_workers`/
-          # `list_compute_executor_devices` device reporting (b4). Not a
-          # SIGKILL-race chaos leg (a5 IS a SIGKILL test, but its own
-          # completion is driven by jammi's lease timer, not a publish-window
-          # race) — `advisory: false`.
+          # embedding-across-two-executors, placed-gang-completes-elsewhere,
+          # killed-executor-mid-gang reclaim, scheduler restart, two
+          # schedulers over one catalog, the device-less/KIND-MATCH refusal,
+          # and `list_workers`/`list_compute_executor_devices` device
+          # reporting. Not a SIGKILL-race chaos leg (the killed-executor test
+          # IS a SIGKILL test, but its completion is driven by jammi's lease
+          # timer, not a publish-window race) — `advisory: false`.
           - name: ballista
             display: Ballista compute plane (three processes)
             crate: jammi-ballista
@@ -232,8 +222,8 @@ jobs:
         # `s3://` MinIO root, which needs the S3 object-store driver compiled in —
         # without it a worker claims the job, trains, then fails the publish with
         # `SchemeNotEnabled`, and the job never reaches `completed`. The driver
-        # lives on the server now that the CLI is a strict wire client, so the
-        # feature moves here.
+        # lives on the server (the CLI is a strict wire client), so the feature
+        # is enabled here.
         run: cargo build -p jammi-server --bin jammi-server --features storage-s3
 
       - name: Compile-check the distributed harness

@@ -53,7 +53,7 @@ listing/read/reach is measured:
   (topic), and A's resource SURVIVES. Measured directly: A's resource is still
   present after B's destructive call. (This is the property the standing oracle
   guards — a regression here would be a cross-tenant data-destruction leak.)
-* **the result-table SCAN, over the `db.sql` lane (esc-024, embedded-only)** —
+* **the result-table SCAN, over the `db.sql` lane (embedded-only)** —
   a result table (`asof_join`, `generate_embeddings`, …) carries no `tenant_id`
   column, so the predicate-injection analyzer above has nothing to rewrite;
   resolution is gated on the catalog row's owner instead
@@ -82,10 +82,10 @@ Verifying a caller is the consumer's job — a gateway placed IN FRONT OF the
 engine. The engine's in-process `grpc_byo_auth.rs` worked example shows that
 seam for the TYPED gRPC verbs; the Flight SQL lane (`db.sql()`) is a separate
 `pyarrow.flight` transport and is the gateway-in-front's responsibility there too
-(engine issue #220, by design).
+(by design).
 
 The `jammi-ai` client carries the channel's bearer on the Flight
-SQL lane as well as the typed gRPC verbs (jammi #96). This script demonstrates
+SQL lane as well as the typed gRPC verbs. This script demonstrates
 the consumer-side seam over that
 **real Flight wire**: a `pyarrow.flight` gateway server reads the inbound bearer
 off a genuine `db.sql()` call (the production token-threading runs — no mock), a
@@ -378,7 +378,7 @@ def run_matrix(db, work: Path, base_model: str, *, tag: str, cross_transport: bo
 
 
 def run_result_table_scan(db, work: Path, *, tag: str) -> dict:
-    """Drive the esc-024 result-table SCAN isolation live over the `db.sql` lane —
+    """Drive the result-table SCAN isolation live over the `db.sql` lane —
     the cache-side mirror of the chapter's live-driven cell and of the Rust oracle
     (``tenant_isolation_oracle.rs::assert_result_table_scan_isolated``).
 
@@ -567,7 +567,7 @@ class _GatewayFlightServer(flight.FlightServerBase):
     re-presenting the bearer, so the gateway verifies in BOTH — rejecting in
     ``get_flight_info`` short-circuits the whole ``sql()`` before any engine read.
     This mirrors the engine's ``grpc_byo_auth.rs`` seam, here for the Flight lane
-    the in-engine interceptor does not cover (engine #220)."""
+    the in-engine interceptor does not cover."""
 
     def __init__(self, location, upstream_endpoint: str, factory: _AuthMiddlewareFactory):
         super().__init__(location, middleware={"auth": factory})
@@ -810,7 +810,7 @@ def emit(fixtures_root: Path, server_bin: str) -> None:
             embedded_matrix = run_matrix(
                 embedded, work, base_model, tag="emb", cross_transport=False
             )
-            print("== embedded engine: esc-024 result-table scan (db.sql lane) ==", flush=True)
+            print("== embedded engine: result-table scan (db.sql lane) ==", flush=True)
             result_table_scan = run_result_table_scan(embedded, work, tag="emb")
 
         # --- remote transport (live grpc:// parity for the wire verbs) ------ #
@@ -903,7 +903,7 @@ def emit(fixtures_root: Path, server_bin: str) -> None:
         "byo_auth.over_flight_eq_embedded": {
             "value": 1.0 if byo["over_flight_eq_embedded"] else 0.0, "tol": 0.0
         },
-        # --- esc-024 result-table SCAN isolation, over the db.sql lane ------ #
+        # --- result-table SCAN isolation, over the db.sql lane -------------- #
         "result_table_scan": {"value": result_table_scan["leak"], "tol": 0.0},
         "result_table_scan.a_own_read_positive": {
             "value": 1.0 if result_table_scan["a_own_read"] > 0 else 0.0, "tol": 0.0

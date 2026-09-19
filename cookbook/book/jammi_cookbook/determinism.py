@@ -1,4 +1,4 @@
-"""The determinism contract (K0 §3), applied on import.
+"""The determinism contract, applied on import.
 
 Importing :mod:`jammi_cookbook` pins the process into the reproducible regime the
 whole book depends on: single-threaded BLAS/OMP, tokenizer parallelism off, a

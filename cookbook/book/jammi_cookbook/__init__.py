@@ -1,7 +1,7 @@
 """The cookbook's shared library: it *composes* jammi and *enforces* the
 contracts and rails — it implements no graph or ML logic of its own.
 
-Importing the package applies the determinism contract (K0 §3) as a side effect,
+Importing the package applies the determinism contract as a side effect,
 so a chapter's first line — ``import jammi_cookbook`` — pins the reproducible
 regime before any heavy native library is touched.
 

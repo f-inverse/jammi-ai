@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emit the retrieval / search vertical cache (B1) — CPU, from the committed cache.
+"""Emit the retrieval / search vertical cache — CPU, from the committed cache.
 
 Unlike the keystone/fine-tune emits, this vertical needs **no GPU**: it reuses the
 already-committed ogbn-arxiv embedding matrices — raw (``arxiv.embeddings``) and
@@ -35,7 +35,7 @@ exactly one matrix); the ambiguity is recorded as an engine-surface finding (a
 candidate for an explicit ``table=`` arg on ``search``). ``rrf_fuse`` IS reachable on
 the embedded CPU handle and is used directly for the fusion arm.
 
-Determinism (K0 §3): committed matrices + committed golden, single-threaded BLAS
+Determinism: committed matrices + committed golden, single-threaded BLAS
 (applied by importing ``jammi_cookbook``), a pure-numpy dense fold, the engine's
 deterministic ``rrf_fuse``; metrics asserted to tolerances downstream.
 

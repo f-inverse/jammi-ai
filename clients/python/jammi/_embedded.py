@@ -41,8 +41,8 @@ Composed over the compiled `jammi_native._NativeDatabase` low-level handle:
   transport primitive (a PyO3 call here, a gRPC call there). The signatures
   mirror `jammi.RemoteDatabase`'s — the conformance contract.
 
-The kwargs→struct assembly the native handle used to carry for these verbs is
-gone from Rust; it lives once in `jammi._assembly`.
+The kwargs→struct assembly for these verbs lives once, in `jammi._assembly`;
+the native handle receives the built request.
 """
 
 from __future__ import annotations
@@ -152,10 +152,9 @@ class EmbeddedBackend:
     # the remote capability surface holds.
     #
     # `close` is NOT a capability: both transports carry it (see
-    # `EmbeddedBackend.close`). It used to be listed as remote-only on the claim
-    # that the embedded engine "releases on drop"; it does not — under the
-    # engine's `unix-excl` catalog seam the release is an awaited event, and
-    # `close()` is the only bounded point at which it happens.
+    # `EmbeddedBackend.close`). The embedded engine does not release on drop:
+    # under the engine's `unix-excl` catalog seam the release is an awaited
+    # event, and `close()` is the only bounded point at which it happens.
 
     _CAPABILITIES = frozenset(
         {Capability.AUDIT, Capability.EPHEMERAL_SESSION, Capability.PRELOAD_MODEL}
@@ -572,9 +571,8 @@ class EmbeddedBackend:
         :class:`jammi.errors.InvalidArgument` rather than submitted. `cache`
         names model-level cache reuse (``"use"``) as opposed to the engine's
         default recompute (``"bypass"``, the default when omitted); reuse is
-        not yet implemented, so ``"use"`` is refused with
-        :class:`jammi.errors.InvalidArgument` and the job is not submitted —
-        see https://github.com/f-inverse/jammi-ai/issues/562.
+        not implemented, so ``"use"`` is refused with
+        :class:`jammi.errors.InvalidArgument` and the job is not submitted.
         """
         request = build_fine_tune_request(
             source=source,
@@ -785,8 +783,8 @@ class EmbeddedBackend:
         ``"ner"``, ``"regression"``); `key` names the column whose value becomes
         each output row's ``_row_id``. `cache` opts into memoization
         (``"use"``) or keeps the default recompute (``None``/``"bypass"``) —
-        inference anchors its source unpinned, so ``"use"`` is honestly always a
-        recompute today. Same handle shape and verb signature as the remote
+        inference anchors its source unpinned, so ``"use"`` always
+        recomputes. Same handle shape and verb signature as the remote
         `RemoteDatabase.infer`. The request is assembled with the shared
         `InferRequest` builder and submitted through the engine's wire seam.
         """
@@ -1101,7 +1099,7 @@ class EmbeddedBackend:
         text); `key` names the column whose value becomes each embedding row's
         key; `cache` opts into memoization (``"use"``) or keeps the default
         recompute (``None``/``"bypass"``) — embeddings anchor their source
-        unpinned, so ``"use"`` is honestly always a recompute today. Returns the
+        unpinned, so ``"use"`` always recomputes. Returns the
         result table name. Same handle shape and verb signature as the remote
         `RemoteDatabase.generate_embeddings`; the request is assembled with the
         shared `GenerateEmbeddingsRequest` builder and submitted through the

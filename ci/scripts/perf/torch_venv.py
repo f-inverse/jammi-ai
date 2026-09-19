@@ -58,6 +58,9 @@ def run(script: Path, *args: str, timeout: int) -> str:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--path"]:
+        print(TORCH_VENV)
+        sys.exit(0)
     if why := missing():
         print(why, file=sys.stderr)
         sys.exit(1)

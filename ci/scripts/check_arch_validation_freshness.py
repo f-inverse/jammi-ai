@@ -95,7 +95,12 @@ The flash surface (`FLASH_SURFACE` below) is:
 EXCLUDING pure documentation: any `*.md` file anywhere under the surface
 (concretely, today, only `third_party/flash-attention/VENDORED.md`) is
 filtered out of the diff BEFORE deciding staleness (`_changed_surface_files`
-below strips any changed path ending in `.md`). A doc edit cannot change the
+below strips any changed path ending in `.md`), and so is a source file whose
+change is confined to its comments — `_changed_surface_files` compares the
+comment-stripped text of each changed source file at the artifact's sha and
+at HEAD (`strip_comments` below: line and block comments removed, string and
+character literals kept, so a `//` inside a string is code), and a file whose
+compiled text is unchanged does not trigger. A doc edit cannot change the
 compiled SASS or the runtime fences — the things a per-arch pod-parity
 artifact actually validated — so demanding a fresh GPU run (or a Rule-3
 waiver) for a prose-only change is a FALSE staleness signal, and a gate that
@@ -287,6 +292,61 @@ def _is_ancestor(sha: str, repo_root: Path, target: str = "HEAD") -> bool:
     return proc.returncode == 0
 
 
+# Source files whose comment-only changes are not a surface change: Rust and
+# the CUDA/C++ sources of the vendored kernels.
+SOURCE_SUFFIXES: tuple[str, ...] = (".rs", ".cu", ".cuh", ".h", ".hpp", ".cpp", ".cc")
+
+
+def strip_comments(text: str, path: str) -> str:
+    """`text` with every comment removed and whitespace collapsed — the text
+    that reaches the compiler. String and character literals are kept whole,
+    so a comment marker inside one is code; Rust block comments nest, C ones
+    do not; a Rust raw string (`r#"…"#`) runs to its matching delimiter."""
+    rust = path.endswith(".rs")
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        two = text[i : i + 2]
+        if two == "//":
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif two == "/*":
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if rust and text.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif text.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        elif rust and c in "rb" and (m := re.match(r'b?r(#*)"', text[i:])):
+            close = '"' + m.group(1)
+            j = text.find(close, i + m.end())
+            j = n if j < 0 else j + len(close)
+            out.append(text[i:j])
+            i = j
+        elif c == '"' or (c == "'" and re.match(r"'(\\.|[^'\\])'", text[i:])):
+            quote, j = c, i + 1
+            while j < n and text[j] != quote:
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i : j + 1])
+            i = j + 1
+        else:
+            out.append(c)
+            i += 1
+    return " ".join("".join(out).split())
+
+
+def _compiled_text_at(rev: str, path: str, repo_root: Path) -> str | None:
+    """The comment-stripped text of `path` at `rev`, or `None` when the file
+    does not exist there."""
+    proc = _run(["git", "show", f"{rev}:{path}"], repo_root)
+    if proc.returncode != 0:
+        return None
+    return strip_comments(proc.stdout, path)
+
+
 def _changed_surface_files(sha: str, repo_root: Path, target: str = "HEAD") -> list[str]:
     """The flash-surface files that changed between `sha` and `target`,
     EXCLUDING pure documentation (`DOC_SUFFIXES`) — see FLASH_SURFACE's own
@@ -300,7 +360,16 @@ def _changed_surface_files(sha: str, repo_root: Path, target: str = "HEAD") -> l
     if proc.returncode != 0:
         raise ArtifactError(f"`git diff --name-only {sha}..{target}` failed: {proc.stderr.strip()}")
     changed = [line for line in proc.stdout.splitlines() if line.strip()]
-    if changed and all(f.endswith(DOC_SUFFIXES) for f in changed):
+
+    def triggers(path: str) -> bool:
+        if path.endswith(DOC_SUFFIXES):
+            return False
+        if not path.endswith(SOURCE_SUFFIXES):
+            return True
+        before, after = _compiled_text_at(sha, path, repo_root), _compiled_text_at(target, path, repo_root)
+        return before is None or after is None or before != after
+
+    if changed and not any(triggers(path) for path in changed):
         return []
     return changed
 
@@ -779,7 +848,7 @@ def self_test() -> int:
         _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
         _commit_all(repo_root, "add good artifact")
         (repo_root / "crates" / "jammi-kernels" / "src" / "flash" / "mod.rs").write_text(
-            "// changed flash kernel surface\n", encoding="utf-8"
+            "pub fn changed_flash_kernel_surface() {}\n", encoding="utf-8"
         )
         _commit_all(repo_root, "touch flash surface after artifact landed")
         build_rs, cuda_runs, allowlist = paths(repo_root)
@@ -798,6 +867,46 @@ def self_test() -> int:
             ),
             f"{got}",
         )
+
+    # --- Rule 2: a change confined to comments in a surface file is not a
+    #     surface change; a change inside a string literal is ----------------
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        repo_root = _init_fixture_repo(Path(td), ["80"])
+        flash = repo_root / "crates" / "jammi-kernels" / "src" / "flash" / "mod.rs"
+        flash.write_text(
+            'pub fn fence() -> &\'static str {\n    // the fence\n    "a // literal, not a comment"\n}\n',
+            encoding="utf-8",
+        )
+        head = _commit_all(repo_root, "code that carries a comment and a literal")
+        _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
+        _commit_all(repo_root, "add good artifact")
+        flash.write_text(
+            'pub fn fence() -> &\'static str {\n    /* the fence, /* nested */ restated */\n'
+            '    "a // literal, not a comment"\n}\n',
+            encoding="utf-8",
+        )
+        _commit_all(repo_root, "comment-only edit to a surface file")
+        build_rs, cuda_runs, allowlist = paths(repo_root)
+        got = run_gate(build_rs, cuda_runs, allowlist, repo_root)
+        check("Rule 2: a comment-only change to a surface .rs file is not stale", not got, f"{got}")
+        flash.write_text(
+            'pub fn fence() -> &\'static str {\n    /* the fence */\n    "a // changed literal"\n}\n',
+            encoding="utf-8",
+        )
+        _commit_all(repo_root, "a change inside a string literal")
+        got = run_gate(build_rs, cuda_runs, allowlist, repo_root)
+        check(
+            "Rule 2: a change inside a string literal IS stale",
+            any("arch 80" in g and "STALE" in g for g in got),
+            f"{got}",
+        )
+    check(
+        "strip_comments keeps literals, drops nested Rust and flat C comments",
+        strip_comments('let s = "x // y"; /* a /* b */ c */ // z\nlet t = r#"q"#;', "k.rs")
+        == 'let s = "x // y"; let t = r#"q"#;'
+        and strip_comments("int a; /* b /* c */ d */ e", "k.cu") == "int a; d */ e",
+        "",
+    )
 
     # --- Rule 2 positive control: a non-surface change does NOT go stale ---
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -861,7 +970,7 @@ def self_test() -> int:
         _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
         _commit_all(repo_root, "add good artifact")
         (repo_root / "crates" / "jammi-kernels" / "src" / "flash" / "mod.rs").write_text(
-            "// changed flash kernel surface\n", encoding="utf-8"
+            "pub fn changed_flash_kernel_surface() {}\n", encoding="utf-8"
         )
         review_head = _commit_all(repo_root, "touch flash surface")
         _write_allowlist(repo_root, [f"80\t{review_head}\treviewed and accepted for a fixture reason"])
@@ -906,13 +1015,13 @@ def self_test() -> int:
         _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
         _commit_all(repo_root, "add good artifact")
         (repo_root / "crates" / "jammi-kernels" / "src" / "flash" / "mod.rs").write_text(
-            "// first surface change\n", encoding="utf-8"
+            "pub fn first_surface_change() {}\n", encoding="utf-8"
         )
         reviewed_sha = _commit_all(repo_root, "first surface change, reviewed here")
         _write_allowlist(repo_root, [f"80\t{reviewed_sha}\treviewed the first change only"])
         _commit_all(repo_root, "commit the waiver naming the first change")
         (repo_root / "crates" / "jammi-kernels" / "src" / "flash" / "mod.rs").write_text(
-            "// second surface change, AFTER the waiver's own review point\n", encoding="utf-8"
+            "pub fn second_surface_change() {}\n", encoding="utf-8"
         )
         _commit_all(repo_root, "second surface change, unreviewed")
         build_rs, cuda_runs, allowlist = paths(repo_root)
@@ -1019,7 +1128,8 @@ def self_test() -> int:
     print(
         "arch-validation-freshness self-test: OK — every rule bites: Rule 1 (zero evidence, "
         "non-GREEN, non-ancestor sha, wrong-arch evidence), Rule 2 (STALE on a real surface change, "
-        "a positive control that an excluded-surface (modernbert.rs) change stays fresh, and the "
+        "a positive control that an excluded-surface (modernbert.rs) change stays fresh, a comment-only "
+        "edit to a surface source file stays fresh while a change inside its string literal is STALE, and the "
         "doc-exclusion mutant pair: a *.md-only change under the surface stays fresh while a real "
         "non-.md change in the SAME directory still trips STALE), Rule 3 (valid waiver suppression, "
         "rot for an unknown arch, a dead waiver, a range that no longer covers HEAD, a malformed "

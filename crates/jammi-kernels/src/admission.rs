@@ -2169,11 +2169,11 @@ impl ProbedOpId {
 // The kernel-admission profile: ex ante facts only
 // =============================================================================
 //
-// The profile never folds OBSERVED dispatch outcomes:
-// `Catalog::probe_model_by_definition` computes a `DefinitionHash` BEFORE the
-// work, to look up whether it already exists, so a profile knowable only
-// AFTER training would make that lookup impossible for the very run it
-// describes; and the counter registry is process-global with a `pub`
+// The profile never folds OBSERVED dispatch outcomes: a fine-tune's
+// definition hash is computed BEFORE the work, to look up whether an equal
+// artifact already exists, so a profile knowable only AFTER training would
+// make that lookup impossible for the very run it describes; and the counter
+// registry is process-global with a `pub`
 // `counters_for(..).record(..)`, so an observed-outcome fold could never be
 // sealed the way [`ProbedOpId`]'s row identity is.
 //

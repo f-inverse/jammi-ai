@@ -298,7 +298,7 @@
 #                         section). Must be "peft" or "jammi".
 #   AB_OUT_DIR            where the merged report + table land (default
 #                         "<repo>/.ab-report/<UTC timestamp>").
-#   TORCH_VENV            torch venv path (default "<repo>/.venv-torch-ref").
+#   TORCH_VENV            torch venv path (default: torch_venv.py's, "<repo>/.venv-torch-ref").
 #   AB_DRY_RUN=1          print every command this script would run (cargo,
 #                         uv, the bench binary, the torch script) instead of
 #                         executing it, and write a `{"tool":"dry-run",...}`
@@ -421,7 +421,8 @@ case "$AB_TORCH_LORA_INIT" in
     exit 2
     ;;
 esac
-TORCH_VENV="${TORCH_VENV:-$REPO_ROOT/.venv-torch-ref}"
+# The torch venv and its default are resolved in one place, torch_venv.py.
+TORCH_VENV="$(python3 "$DIR/torch_venv.py" --path)"
 
 MODEL_DIR="${MODEL_DIR:-}"
 JAMMI_MODEL_DIR="${JAMMI_MODEL_DIR:-$MODEL_DIR}"

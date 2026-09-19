@@ -1,4 +1,4 @@
-//! Integration tests for the ephemeral session-storage primitive (spec J6).
+//! Integration tests for the ephemeral session-storage primitive.
 //!
 //! Exercises the success criteria end-to-end against a real session
 //! (SQLite and Postgres): a working session context, session-scoped table
@@ -54,7 +54,7 @@ macro_rules! session_or_skip {
     }};
 }
 
-/// `(image_id VARCHAR, image_hash VARCHAR)` — the J6 motivating shape.
+/// `(image_id VARCHAR, image_hash VARCHAR)` — the motivating shape.
 fn images_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("image_id", DataType::Utf8, false),

@@ -525,7 +525,7 @@ mod tests {
         assert!(good.validate().is_ok());
     }
 
-    // ── #483: persisted credentials are inline-only on read ──────────────
+    // ── Persisted credentials are inline-only on read ──────────────────────
     //
     // A persisted credential (a `sources.options` row) round-trips through
     // `serde_json` byte-for-byte in BOTH directions, exactly as it did
@@ -653,12 +653,11 @@ mod tests {
     /// seven credential positions across all four cloud variants — an
     /// `invalid_type` error naming the field (via `serde_path_to_error`,
     /// which tracks the struct path correctly for these plain, non-tagged
-    /// structs), never a value/path echo, and — the load-bearing half of
-    /// this fix — NEVER a file read. `/etc/passwd` is a real, readable file
-    /// on every CI runner and dev machine; pre-fix, this exact JSON made
-    /// `Secret`'s `Deserialize` (via `SecretSource`) read it and expose its
-    /// contents as the "credential" (see the RED capture in this commit's
-    /// message).
+    /// structs), never a value/path echo, and — the load-bearing half —
+    /// NEVER a file read. `/etc/passwd` is a real, readable file on every CI
+    /// runner and dev machine; a `Secret` `Deserialize` that followed the
+    /// object form (via `SecretSource`) would read it and expose its contents
+    /// as the "credential".
     #[test]
     fn object_form_is_refused_at_every_credential_position_names_field_no_path_leak() {
         fn assert_refused<T: serde::de::DeserializeOwned>(json: &str, field: &str) {

@@ -298,7 +298,7 @@ const FOUR_ROWS: [(&str, [f32; 4]); 4] = [
     ("opp", [-1.0, 0.0, 0.0, 0.0]),
 ];
 
-// A1 — a wrong-width query on the NO-INDEX exact path is a typed `Schema`
+// A wrong-width query on the NO-INDEX exact path is a typed `Schema`
 // error, never a panic. The width comes from the scan schema's
 // `FixedSizeList` length (the authority on this path), so it holds even with
 // no catalog width in hand (`None`).
@@ -333,20 +333,18 @@ async fn exact_search_refuses_a_wrong_width_query_typed_not_panic() {
     assert_eq!(hits[0].0, "near");
 }
 
-// A1b — a ZERO-width `FixedSizeList` scan column (a corrupt schema, not a
+// A ZERO-width `FixedSizeList` scan column (a corrupt schema, not a
 // user query) is refused with a typed, engine-class error naming the
 // artifact, never silently treated as a width of `0` against the query and
 // never billed to the caller. The query here is deliberately NON-EMPTY: an
-// empty query would trivially match a width-0 column under the old, buggy
+// empty query would trivially match a width-0 column under a lossy
 // conversion too (0 == 0), so it would prove nothing. A non-empty query
-// against a 0-width column is exactly the case the old
-// `usize::try_from(*n).unwrap_or(0)` mishandled — it would refuse the query
-// as "expected 0 dimensions" (blaming the CALLER's width). The corrupt scan
-// schema is THIS table's own stored artifact (round-8 fix: `JammiError::
+// against a 0-width column is exactly the case a
+// `usize::try_from(*n).unwrap_or(0)` conversion mishandles — it would refuse
+// the query as "expected 0 dimensions" (blaming the CALLER's width). The
+// corrupt scan schema is THIS table's own stored artifact (`JammiError::
 // IncompatibleFormat`, gRPC `Internal`), never the caller's fault
-// (`JammiError::Schema`, gRPC `InvalidArgument`) — a standing oracle that
-// used to assert the caller class here while its own comment said "a
-// corrupt schema, not a user query".
+// (`JammiError::Schema`, gRPC `InvalidArgument`).
 #[tokio::test]
 async fn exact_search_refuses_a_zero_width_scan_column_typed_engine_fault() {
     let dir = tempdir().unwrap();
@@ -455,7 +453,7 @@ async fn exact_search_refuses_a_corrupt_stored_row_at_the_sink() {
     }
 }
 
-// A5 (provenance, unit level) — the SAME non-finite vector is a caller fault
+// Provenance, unit level — the SAME non-finite vector is a caller fault
 // when the caller supplied it and a corrupt artifact named by its table when
 // it was read back from storage.
 #[test]

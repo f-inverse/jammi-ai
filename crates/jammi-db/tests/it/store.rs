@@ -312,9 +312,8 @@ async fn resolve_embedding_table_accepts_every_embedding_variant() {
 /// `{source}__{task}__{model}__{timestamp}_{suffix}`, and the model segment
 /// sorts *before* the timestamp, so `zzz_model` (created first, older) sorts
 /// after `aaa_model` (created second, newer) even though `aaa_model` is the
-/// correct answer. This is the exact naive-fix regression a prior
-/// pressure-test killed (`ORDER BY created_at DESC, table_name DESC` alone
-/// is correct; `ORDER BY table_name DESC` alone is not) — it also
+/// correct answer (`ORDER BY created_at DESC, table_name DESC` is correct;
+/// `ORDER BY table_name DESC` alone is not) — it also
 /// regression-guards the Postgres `rowid`-does-not-exist hard error, since
 /// SQLite is the only backend with a `rowid` to (wrongly) fall back on.
 #[test_case(BackendKind::Sqlite ; "sqlite")]

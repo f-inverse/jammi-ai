@@ -1,31 +1,29 @@
-//! esc-072 RED oracle (`closes_escape: esc-072`) — transaction integrity with
-//! TWO live pools on one SQLite catalog file.
+//! Transaction integrity with TWO live pools on one SQLite catalog file.
 //!
-//! Contract under test: two live sessions in one process on one `catalog.db`,
+//! Invariant: two live sessions in one process on one `catalog.db`,
 //! each running concurrent catalog write loops of the training worker's
 //! claim/heartbeat/reclaim shape, complete every transaction cleanly — WAL's
 //! "many readers alongside one writer" with `sqlx`'s `busy_timeout`
-//! (`backend_sqlite.rs:29`) absorbing the contention.
+//! (`backend_sqlite.rs`) absorbing the contention.
 //!
-//! The gate this closes: the leaked-`BEGIN` defense
-//! (`backend_sqlite.rs:96-110`, the detached-task begin) is regression-tested
-//! for a SINGLE pool only (`concurrent_writers.rs:249-259`). Two pools on one
-//! file is a topology `docs/guide/src/multi-tenant.md` permits and nothing
-//! covers, so a recurrence of `InvalidSavePointStatement` there would mean the
-//! defense is unproven, not proven, for the shipped topology.
+//! The leaked-`BEGIN` defense (`backend_sqlite.rs`, the detached-task begin)
+//! is regression-tested for a SINGLE pool in `concurrent_writers.rs`. Two
+//! pools on one file is a topology `docs/guide/src/multi-tenant.md` permits;
+//! this file proves the defense holds there too (no
+//! `InvalidSavePointStatement`).
 //!
-//! Oracle shape (from the row's `symptom_spec.observable`): two `JammiSession`s
+//! Oracle shape: two `JammiSession`s
 //! on ONE tempdir's `catalog.db`, each driving its own embedded
 //! training-worker-shaped write loop (claim → heartbeat → stamp metrics, plus a
 //! reclaim sweeper) concurrently, for both a wall-clock floor and an op-count
 //! floor at least as large as the single-pool workload
 //! `concurrent_writers.rs` drives.
 //!
-//! Failure per the row's `control`: ANY surfaced `sqlx`
+//! Failure: ANY surfaced `sqlx`
 //! `InvalidSavePointStatement` / "non-zero transaction depth", any "disk I/O
 //! error", any unabsorbed "database is locked", and any deadlock/timeout in
 //! either loop. Errors are collected with their exact strings and reported
-//! together rather than swallowed, so a RED run names the failure class instead
+//! together rather than swallowed, so a failing run names the failure class instead
 //! of merely failing.
 //!
 //! Non-vacuity: the SAME workload is also run against a SINGLE pool
@@ -56,13 +54,12 @@ const JOBS: usize = 16;
 /// put the same concurrency on the file and differ only in pool count.
 const WORKERS_PER_SESSION: usize = 4;
 
-/// Wall-clock floor, per the row ("≥10s").
+/// Wall-clock floor (≥10s).
 const MIN_WALL: Duration = Duration::from_secs(10);
 
 /// Op-count floor. `concurrent_writers.rs` drives 8 × 60 = 480 write
 /// transactions; every catalog call below is at least one transaction, so this
-/// floor is comfortably above the single-pool workload the row calls the
-/// baseline.
+/// floor is comfortably above the single-pool baseline workload.
 const MIN_OPS: u64 = 2_000;
 
 /// Lease length. Short enough that the reclaim sweeper actually finds expired
@@ -79,8 +76,8 @@ const MAX_ATTEMPTS: u32 = 1_000_000;
 /// retry — nothing is re-attempted after it fires.
 const RUN_CEILING: Duration = Duration::from_secs(180);
 
-/// One observed error, kept verbatim so a RED run reports the exact string the
-/// row's control enumerates rather than a paraphrase.
+/// One observed error, kept verbatim so a failing run reports the exact
+/// string rather than a paraphrase.
 #[derive(Debug)]
 struct Observed {
     who: String,
@@ -89,7 +86,7 @@ struct Observed {
 }
 
 impl Observed {
-    /// The row's failure classes, matched case-insensitively on the rendered
+    /// The failure classes, matched case-insensitively on the rendered
     /// error. Any error at all is a failure; this only names which class.
     fn class(&self) -> &'static str {
         let m = self.message.to_ascii_lowercase();
@@ -120,7 +117,7 @@ impl Run {
             op,
             message,
         });
-        // Stop early on the first error: the RED evidence is the error, and
+        // Stop early on the first error: the evidence is the error, and
         // continuing only floods the log.
         self.stop.store(true, Ordering::SeqCst);
     }
@@ -242,10 +239,10 @@ async fn drive(catalogs: Vec<Arc<Catalog>>, arm: &str) {
     for (ix, handle) in handles.into_iter().enumerate() {
         match tokio::time::timeout(RUN_CEILING.saturating_sub(started.elapsed()), handle).await {
             Ok(joined) => joined.unwrap_or_else(|join| {
-                panic!("esc-072 [{arm}]: worker task {ix} panicked: {join}");
+                panic!("two-pool [{arm}]: worker task {ix} panicked: {join}");
             }),
             Err(_) => panic!(
-                "esc-072 [{arm}]: worker task {ix} did not finish within {RUN_CEILING:?} — \
+                "two-pool [{arm}]: worker task {ix} did not finish within {RUN_CEILING:?} — \
                  deadlocked or starved on the catalog write lock"
             ),
         }
@@ -257,7 +254,7 @@ async fn drive(catalogs: Vec<Arc<Catalog>>, arm: &str) {
 
     assert!(
         errors.is_empty(),
-        "esc-072 [{arm}]: {} catalog transaction failure(s) across {ops} ops in {wall:?}:\n{}",
+        "two-pool [{arm}]: {} catalog transaction failure(s) across {ops} ops in {wall:?}:\n{}",
         errors.len(),
         errors
             .iter()
@@ -270,12 +267,12 @@ async fn drive(catalogs: Vec<Arc<Catalog>>, arm: &str) {
     // exactly when an error was recorded, and that case already failed above.
     assert!(
         ops >= MIN_OPS,
-        "esc-072 [{arm}]: only {ops} ops completed (floor {MIN_OPS}) — the workload did not \
+        "two-pool [{arm}]: only {ops} ops completed (floor {MIN_OPS}) — the workload did not \
          reach the single-pool baseline's volume"
     );
     assert!(
         wall >= MIN_WALL,
-        "esc-072 [{arm}]: run lasted only {wall:?} (floor {MIN_WALL:?})"
+        "two-pool [{arm}]: run lasted only {wall:?} (floor {MIN_WALL:?})"
     );
 }
 

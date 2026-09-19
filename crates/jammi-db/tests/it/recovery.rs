@@ -18,7 +18,7 @@
 //! test observes the transition recovery performs, never just an end state a
 //! live-lease skip could leave vacuously.
 //!
-//! The lease-ownership half (esc-094, issue #479): a `building` row is owned by
+//! The lease-ownership half: a `building` row is owned by
 //! its writer under a heartbeated lease, recovery touches only rows whose lease
 //! is absent or expired, and every transition on a building row is a
 //! compare-and-set naming the owner. The two-writer oracles
@@ -829,7 +829,7 @@ async fn recover_reconciles_every_tenant(kind: BackendKind) {
 }
 
 // =====================================================================
-//  esc-094 — lease ownership. A `building` row belongs to its writer under
+//  Lease ownership. A `building` row belongs to its writer under
 //  a heartbeated lease; recovery touches only rows whose lease is absent or
 //  expired; every building-row transition is a CAS naming the owner.
 // =====================================================================
@@ -899,7 +899,7 @@ fn global_sibling(catalog: &Catalog) -> Arc<Catalog> {
     Arc::new(catalog.pinned_to_tenant(None))
 }
 
-/// W2 (esc-094): a live writer parked between its lease renew and the manifest
+/// W2 (the materialization window): a live writer parked between its lease renew and the manifest
 /// write — Parquet valid, no manifest, row `building` — survives a peer
 /// session's `recover()`: status, bytes, and segments untouched; released, it
 /// completes with the true row count. ONE arm is cross-tenant: the writer is
@@ -1030,7 +1030,7 @@ async fn live_writer_survives_peer_recover_w2(kind: BackendKind) {
     assert_eq!(select_count(&ctx_a, &table_name).await, N);
 }
 
-/// U2 (esc-094 follow-up): the SAME two-writer shape as W2, but the peer
+/// The SAME two-writer shape as W2, but the peer
 /// runs `reconcile(apply=true)` instead of the startup `recover()` sweep — a
 /// live-lease `building` row's bytes must survive a reconcile pass exactly as
 /// they survive recovery. `own_seg` scoping means the peer must reconcile
@@ -1127,14 +1127,13 @@ async fn live_writer_survives_peer_reconcile_apply_u2(kind: BackendKind) {
     assert_eq!(rec.row_count, N);
 }
 
-/// U2b (esc-094 follow-up, RED first): an EXPIRED-lease `building` row is
-/// reconciled through the RECOVERY arm — claimed (its `writer_id` changes)
-/// BEFORE its bytes go — never through the orphan arm with no claim/CAS at
-/// all. Before this fix, `reconcile`'s orphan loop reaped such a row's
-/// Parquet/sidecar objects directly (no claim, no CAS), so a stalled original
-/// writer's later `renew`/`promote` would have raced a promote over deleted
-/// bytes; this pins that the row is claimed first (fencing the stale writer)
-/// and the stale writer's own subsequent CAS is refused.
+/// An EXPIRED-lease `building` row is reconciled through the RECOVERY arm —
+/// claimed (its `writer_id` changes) BEFORE its bytes go — never through the
+/// orphan arm with no claim/CAS at all. An orphan loop that reaped such a
+/// row's Parquet/sidecar objects directly (no claim, no CAS) would let a
+/// stalled original writer's later `renew`/`promote` race a promote over
+/// deleted bytes; this pins that the row is claimed first (fencing the stale
+/// writer) and the stale writer's own subsequent CAS is refused.
 #[cfg(feature = "test-hooks")]
 #[cfg_attr(test, test_case(BackendKind::Sqlite ; "sqlite"))]
 #[cfg_attr(
@@ -1209,7 +1208,7 @@ async fn expired_lease_building_row_is_claimed_before_reconcile_reaps_it_u2b(kin
     );
 }
 
-/// RED first: `reconcile`'s claim of an expired-lease
+/// `reconcile`'s claim of an expired-lease
 /// row must NEVER re-stamp the SAME `writer_id` a lapsed writer in THIS
 /// SAME session still holds — that would leave the lapsed writer's own
 /// `Owner::Writer(self.writer_id)` CAS still matching post-claim (no fence
@@ -1294,7 +1293,7 @@ async fn reconcile_claim_never_reuses_this_sessions_own_writer_id(kind: BackendK
     );
 }
 
-/// W1 (esc-094): a live writer parked right after `create_table` — row
+/// W1 (the table-created window): a live writer parked right after `create_table` — row
 /// `building`, no bytes yet — survives a peer's `recover()` (which would
 /// otherwise take the missing-bytes arm and fail it); released, it completes.
 #[cfg(feature = "test-hooks")]

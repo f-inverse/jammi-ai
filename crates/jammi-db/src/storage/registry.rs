@@ -79,7 +79,7 @@ impl StorageRegistry {
     /// ObjectStore>`, on which `ObjectStoreExt::delete` carries no
     /// `models/` guard. Outside this crate, call [`Self::handle_for`], which
     /// wraps the SAME cached driver in the guarded
-    /// [`super::object_store_handle::JammiObjectStore`] handle (#588).
+    /// [`super::object_store_handle::JammiObjectStore`] handle.
     pub(crate) fn driver_for(
         &self,
         url: &StorageUrl,

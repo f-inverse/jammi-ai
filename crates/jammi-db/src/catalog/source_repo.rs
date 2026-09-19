@@ -50,7 +50,7 @@ impl Catalog {
     /// Persist a new source to the catalog. The session's bound tenant is
     /// written to `tenant_id` and asserted via
     /// [`crate::catalog::backend::Transaction::assert_tenant_matches`] before
-    /// the INSERT (SPEC-03 §7 defence-in-depth).
+    /// the INSERT, as defence in depth.
     pub async fn register_source(
         &self,
         source_id: &str,

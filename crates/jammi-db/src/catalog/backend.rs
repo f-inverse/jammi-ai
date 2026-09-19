@@ -422,7 +422,7 @@ impl<'tx> Transaction<'tx> {
     }
 
     /// Bind a tenant for this transaction. Read by [`Self::assert_tenant_matches`]
-    /// to enforce the write-side guard described in SPEC-03 §7.
+    /// to enforce the write-side tenant guard.
     pub fn set_tenant(&mut self, tenant: Option<TenantId>) {
         self.tenant = tenant;
     }
@@ -799,7 +799,7 @@ pub enum BackendError {
     /// `?`/`.into()` to the transaction's result.
     #[error("busy: {0}")]
     Busy(String),
-    /// A write refused the schema-edge stamp domain (`catalog::lease`'s S3):
+    /// A write refused the schema-edge canonical-stamp domain:
     /// Postgres's `CHECK … canonical` constraint (SQLSTATE `23514`), a
     /// SQLite `BEFORE INSERT`/`BEFORE UPDATE` trigger's `RAISE(ABORT, …)`, or
     /// a Postgres cast fault during migration `039_canonical_stamps`'s own
@@ -810,8 +810,7 @@ pub enum BackendError {
     /// this crate authors, but a raw Postgres CAST fault carries neither a
     /// table nor a column in its own error object (SQLSTATE `22007`/`22008`
     /// are function/cast errors, not constraint violations — Postgres has
-    /// nothing to attribute them to), so both are `<unknown>`/`None` there;
-    /// this is the backend asymmetry `catalog::lease`'s S3/S4 docs name.
+    /// nothing to attribute them to), so both are `<unknown>`/`None` there.
     #[error("stamp domain violation on {table} (column {column:?}): {detail}")]
     DomainViolation {
         table: String,
@@ -939,7 +938,7 @@ const SQLITE_CONSTRAINT_TRIGGER_CODE: &str = "1811";
 /// Postgres SQLSTATEs a `::timestamptz` cast can raise on text this crate's
 /// own writers never produce but migration `039_canonical_stamps`'s rewrite
 /// may still encounter in a pre-existing row: `22007` (`invalid input syntax
-/// for type timestamp with time zone` — issue #585's original symptom) and
+/// for type timestamp with time zone`) and
 /// `22008` (`date/time field value out of range` — a shape-valid,
 /// calendar-invalid value, e.g. a month of `13`). Neither is a constraint
 /// violation, so neither carries a `table`/`column` in Postgres's own error

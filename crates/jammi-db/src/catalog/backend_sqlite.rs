@@ -22,8 +22,7 @@
 //! connection, checkpoints, then truncates and unlinks `catalog.db-wal` /
 //! `catalog.db-shm`, and the engine instance's next touch of the `-shm` page
 //! it still has **mmapped** faults past EOF with `SIGBUS` — a process-fatal
-//! crash for out-of-contract input, which is never an acceptable failure shape
-//! (esc-073).
+//! crash for out-of-contract input, which is never an acceptable failure shape.
 //!
 //! ## The seam: the `unix-excl` VFS
 //!
@@ -65,7 +64,7 @@
 //! The seam converts that topology's worst outcome from "process-fatal signal"
 //! to "typed error or wrong data", and the topology itself stays excluded at
 //! the call sites that could reach it. Cross-*process* sharing, by contrast,
-//! is now fully refused.
+//! is fully refused.
 //!
 //! ## Releasing the file is an awaited event, not a drop
 //!
@@ -105,12 +104,13 @@ use super::backend::{classify, BackendError, BackendKind, CatalogBackend, Transa
 ///
 /// Unset (the only supported configuration) selects the `unix-excl` VFS on
 /// unix and the platform default elsewhere. Set to `default` it restores the
-/// platform default VFS on every target, which **re-arms the esc-073 `SIGBUS`
-/// and the cross-process WAL corruption the module docs describe**. Any other
+/// platform default VFS on every target, which **re-arms the `SIGBUS` and the
+/// cross-process WAL corruption the module docs describe**. Any other
 /// value is passed to SQLite verbatim as a VFS name.
 ///
-/// It exists so the fix can be falsified: a verifier re-runs the esc-073
-/// oracle with `JAMMI_SQLITE_VFS=default` and must observe the pre-fix RED.
+/// It exists so the seam can be falsified: the foreign-library harness
+/// (`tests/it/esc_073_foreign_sqlite_library.rs`) run with
+/// `JAMMI_SQLITE_VFS=default` must observe the crash the seam prevents.
 /// Engaging it logs a `WARN`. It is a test/diagnostic knob and is never set in
 /// production.
 pub const SQLITE_VFS_ENV: &str = "JAMMI_SQLITE_VFS";
@@ -127,7 +127,7 @@ pub fn catalog_vfs() -> Option<Cow<'static, str>> {
             tracing::warn!(
                 env = SQLITE_VFS_ENV,
                 "SQLite catalog opening with the PLATFORM DEFAULT VFS: the single-process \
-                 contract is no longer mechanically enforced and a foreign SQLite library \
+                 contract is not mechanically enforced and a foreign SQLite library \
                  instance can crash this process. Diagnostic use only."
             );
             None

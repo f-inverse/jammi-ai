@@ -162,7 +162,7 @@ async fn add_columns_then_merged_schema_includes_new_column(backend: BackendKind
     assert_eq!(names, vec!["ranker", "rank_score"]);
 }
 
-/// SPEC-01 §9 — `register` must reject a channel id that's already in the
+/// `register` must reject a channel id that's already in the
 /// catalog with `ChannelCatalog(AlreadyExists(...))`.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
@@ -192,7 +192,7 @@ async fn register_rejects_duplicate_channel_id(backend: BackendKind) {
     }
 }
 
-/// SPEC-01 §9 — `add_columns` must reject a redeclaration of an existing
+/// `add_columns` must reject a redeclaration of an existing
 /// column with a different `ChannelColumnType`. The production message
 /// names both the column and the would-be new type so a Python caller
 /// learning the API can see exactly what failed.

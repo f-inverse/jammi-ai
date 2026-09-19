@@ -20,9 +20,9 @@ use super::url::{Scheme, StorageUrl};
 /// a 404 and an actual removal are different facts a caller may need to act
 /// on differently (most sharply: `store::reconcile`'s byte-accounting, which
 /// must credit `bytes_reclaimed` only for a key THIS call actually removed,
-/// never one that was already gone when the delete ran — see esc-484's
-/// vanish-window defect, where collapsing the two let a race credit bytes
-/// that were never freed by the pass reporting them).
+/// never one that was already gone when the delete ran — collapsing the two
+/// would let a race credit bytes that were never freed by the pass reporting
+/// them).
 ///
 /// Both variants are **driver-reported**, not independently verified: they
 /// reflect only what the underlying `object_store` driver's `delete` call
@@ -36,12 +36,12 @@ pub enum DeleteOutcome {
     /// The driver's `delete` call returned success. On a driver whose
     /// delete is idempotent (`s3://`/`r2://`) this does NOT prove an object
     /// was actually removed — a key that was already absent is reported
-    /// `Deleted` too (esc-103).
+    /// `Deleted` too.
     Deleted,
     /// The driver's `delete` call surfaced a not-found error. Only drivers
     /// that report deletes of missing keys as an error reach this variant
     /// (the local filesystem driver does); the `s3://`/`r2://` AWS driver
-    /// never does, so `Absent` is unreachable there (esc-103).
+    /// never does, so `Absent` is unreachable there.
     Absent,
 }
 
@@ -135,7 +135,7 @@ impl JammiObjectStore {
     /// (`tests/it/models_delete_call_sites.rs`).
     ///
     /// `StorageRegistry::driver_for` and `build_object_store` are
-    /// `pub(crate)` too (#588): the ONLY door THIS HANDLE opens for storage
+    /// `pub(crate)` too: the ONLY door THIS HANDLE opens for storage
     /// access is its own typed operations (or [`Self::open`], which never
     /// leaks the driver it builds). TWO routes to a raw, writable store
     /// remain outside this handle, stated rather than claimed closed:
@@ -153,18 +153,14 @@ impl JammiObjectStore {
     ///   no `object_store` API) and write it back through that lock,
     ///   replacing any registry-level wrapper outright — measured directly:
     ///   a `delete` through this seam returns `Ok`, with the target file
-    ///   gone, once the swap has run; the same `delete` before the swap
-    ///   observably resolved a different (guarded) store. Closing this
-    ///   route needs a mechanism other than a
-    ///   registry wrapper (e.g. a context facade that never exposes
-    ///   `state_ref`/the runtime env at all) — recorded on #588, out of
-    ///   scope for this handle.
+    ///   gone, once the swap has run. Closing this route needs a mechanism
+    ///   other than a registry wrapper (e.g. a context facade that never
+    ///   exposes `state_ref`/the runtime env at all).
     /// - Direct construction with the `object_store` crate by code holding
     ///   the same credentials/paths this process can already reach — no
     ///   crate boundary can seal that either. Stated, not attempted.
     ///
-    /// Both are filed as the residual of #588 on
-    /// `models_delete_call_sites.rs`'s module doc.
+    /// Both are tracked in `models_delete_call_sites.rs`'s module doc.
     pub(crate) fn driver(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.driver)
     }
@@ -247,7 +243,7 @@ impl JammiObjectStore {
     /// able to tell "this call removed the object" from "it was already
     /// gone" — see [`DeleteOutcome`]'s own doc comment for why that
     /// distinction is only as good as the driver underneath (unreachable
-    /// `Absent` on `s3://`/`r2://`, esc-103).
+    /// `Absent` on `s3://`/`r2://`).
     pub async fn delete_if_exists(&self, path: &ObjectPath) -> Result<DeleteOutcome, StorageError> {
         match self.driver.delete(path).await {
             Ok(()) => Ok(DeleteOutcome::Deleted),

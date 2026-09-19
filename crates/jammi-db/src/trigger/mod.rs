@@ -1,7 +1,6 @@
 //! Trigger-stream primitive: pub/sub over Arrow `RecordBatch` with SQL
-//! predicate filters and a Phase-2 mutable backing table for the
-//! authoritative event log. See
-//! `docs/plans/cp9-substrate-primitives/SPEC-04-trigger-stream.md`.
+//! predicate filters and a mutable backing table for the authoritative event
+//! log.
 
 pub mod broker;
 pub mod consumer;

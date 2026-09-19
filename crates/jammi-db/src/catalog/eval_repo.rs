@@ -23,7 +23,7 @@ pub struct EvalRunRecord {
 }
 
 /// A single per-query eval record, persisted in `_jammi_eval_per_query` and
-/// keyed by `(eval_run_id, query_id)` (spec J9).
+/// keyed by `(eval_run_id, query_id)`.
 ///
 /// `metrics_json` carries the per-query metric vector — Recall@{1,3,5,10}, MRR,
 /// nDCG, distance — as a JSON object; `cohorts_json` carries an opaque
@@ -69,7 +69,7 @@ fn parse_eval_row(row: &Row<'_>) -> std::result::Result<EvalRunRecord, BackendEr
 }
 
 impl Catalog {
-    /// Insert a new eval run record. Tenant bound + asserted (SPEC-03 §7).
+    /// Insert a new eval run record. Tenant bound + asserted.
     pub async fn record_eval_run(&self, record: &EvalRunRecord) -> Result<()> {
         let r = record.clone();
         let tenant = self.current_tenant();
@@ -205,10 +205,10 @@ impl Catalog {
     }
 
     /// Bulk-insert the per-query eval records for one run. Tenant bound +
-    /// asserted on every row (SPEC-03 §7), mirroring `record_eval_run`.
+    /// asserted on every row, mirroring `record_eval_run`.
     ///
     /// All rows for a run are written in a single batched, multi-row `INSERT`
-    /// inside one tenant-bound transaction — the same batch-write shape the J2
+    /// inside one tenant-bound transaction — the same batch-write shape the
     /// audit log uses — so a run's per-query array is persisted atomically. The
     /// records are validated against the bound tenant before any row is issued;
     /// an empty input is a no-op.
@@ -225,7 +225,7 @@ impl Catalog {
                     tx.assert_tenant_matches(tenant, "_jammi_eval_per_query")?;
 
                     // Build one multi-row INSERT with positional placeholders so
-                    // every row lands in a single round-trip (J2 batch shape).
+                    // every row lands in a single round-trip.
                     let mut sql = String::from(
                         "INSERT INTO _jammi_eval_per_query \
                          (eval_run_id, query_id, cohorts, metrics, tenant_id) VALUES ",

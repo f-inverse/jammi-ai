@@ -342,7 +342,7 @@ impl TableProvider for PlaceholderProvider {
     }
 }
 
-/// Test-only rendezvous for the "object vanished mid-scan" oracle (§6.19):
+/// Test-only rendezvous for the "object vanished mid-scan" oracle:
 /// while a table is armed, EVERY `MaskExec` of that table parks before it
 /// opens its input stream, and all of them wake on one release — so a test
 /// can delete a fragment object in a window no scan has crossed yet.
@@ -469,7 +469,7 @@ mod tests {
         MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap()
     }
 
-    /// The unit assertion §6.20 pins: a fetch is never pushed into the mask.
+    /// A fetch is never pushed into the mask.
     #[test]
     fn mask_exec_never_accepts_a_pushed_limit() {
         let mask = Arc::new(DeletionMask::from_entries([("a".to_string(), 0)]));

@@ -28,7 +28,7 @@ mod freshness;
 mod gang_instance_freshness;
 // `MemberRoot::new` (the arbitrary-string fixture constructor this file's
 // helpers build every member root through) only exists under
-// `feature = "test-hooks"` (P-X4: the production constructor is
+// `feature = "test-hooks"` (the production constructor is
 // `MemberRoot::resolved`, config-only) — CI's "test-hooks lane"
 // (`.github/workflows/ci.yml`'s `Run tests (test-hooks lane)` step) compiles
 // and runs this whole file on every PR; the plain `cargo test --workspace`

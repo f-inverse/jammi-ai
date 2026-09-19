@@ -1,5 +1,4 @@
-//! Phase 2 SPEC-02 §11 exit criteria #1 and #4 — federation between a
-//! mutable companion table and a Parquet result table.
+//! Federation between a mutable companion table and a Parquet result table.
 //!
 //! Coverage:
 //! - 1000-row `INSERT INTO mutable.public.<id>` via `session.sql(...)` then

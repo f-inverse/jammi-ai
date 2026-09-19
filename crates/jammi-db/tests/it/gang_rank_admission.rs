@@ -11,10 +11,10 @@
 //! migration `039_canonical_stamps`, `jammi_db::catalog::lease::
 //! decode_lease_expires_at` parses the IDENTICAL text shape on either
 //! backend (the schema-edge domain makes it the only representable one) --
-//! issue #574's parity oracle
+//! the parity oracle
 //! (`get_job_for_rank_undecodable_lease_is_a_row_fact_on_sqlite_and_a_write_refusal_on_postgres`)
 //! is the one test in this file that MUST run on both backends whenever
-//! Postgres is available; it now pins a stated ASYMMETRY rather than an
+//! Postgres is available; it pins a stated ASYMMETRY rather than an
 //! identity -- a shape-valid/calendar-invalid `lease_expires_at` is a row
 //! FACT (`Ok(Some(row))` with `LeaseFact::Undecodable`) on SQLite (whose
 //! trigger checks shape only) and a typed WRITE REFUSAL on Postgres (whose
@@ -283,17 +283,16 @@ async fn get_job_for_rank_treats_an_expired_lease_as_not_live(kind: BackendKind)
     );
 }
 
-/// #574's own parity oracle — REWRITTEN by `catalog::lease`'s S4/migration
-/// `039_canonical_stamps`: before 039, a `lease_expires_at` that failed to
-/// parse read as `Ok(Some(row))` with `lease_live = false` on SQLite
-/// (`julianday(...)` silently returns `NULL` for unparseable text) but `Err`
-/// on Postgres (`col::timestamptz` raised a genuine SQL error) — the
-/// backend-dependent classification #574 reported. That specific asymmetry
-/// is CLOSED: the schema-edge domain (`catalog::lease`'s S3) makes every
-/// value a live Postgres write can ever leave in `lease_expires_at`
-/// cast-valid, so the read side can no longer fault on row content there.
+/// The backend-parity oracle for `lease_expires_at`. A SQL-side read of an
+/// unparseable value would be `Ok(Some(row))` with `lease_live = false` on
+/// SQLite (`julianday(...)` silently returns `NULL` for unparseable text) but
+/// `Err` on Postgres (`col::timestamptz` raises a genuine SQL error) — a
+/// backend-dependent classification. The schema-edge domain (migration
+/// `039_canonical_stamps`) makes every value a live Postgres write can ever
+/// leave in `lease_expires_at` cast-valid, so the read side cannot fault on
+/// row content there.
 ///
-/// What remains, stated rather than papered over: SQLite's trigger checks
+/// What remains: SQLite's trigger checks
 /// SHAPE only (a `GLOB` over a digit-class pattern — SQLite has no calendar
 /// parser), so a shape-valid, CALENDAR-invalid value (a month of `13`) is
 /// still representable on SQLite and still decodes as
@@ -429,8 +428,8 @@ async fn get_job_for_rank_reflects_the_row_world_size() {
     );
 }
 
-/// N4 oracle (iv) (#548): `world_size_from_spec_json` (this module,
-/// module-private) reads `jammi_ai::jobs::JobSpec`'s new flat-derive shape
+/// `world_size_from_spec_json` (this module, module-private) reads
+/// `jammi_ai::jobs::JobSpec`'s flat-derive shape
 /// unchanged, for every training kind and for a compute kind — `jammi-db`
 /// cannot import `jammi-ai` (the dependency runs the other way), so these
 /// fixtures are hand-written JSON matching that type's own byte-pin tests
@@ -935,7 +934,7 @@ async fn a_raw_single_column_write_is_refused_by_the_schema_check() {
 
 /// `get_job_for_rank` carries the row's OWN `tenant_id` as raw text and the
 /// filled training-set pair — the three facts the gang handler's
-/// `world_size > 1` conjunct reads (#566 R2) — on both backends. Before the
+/// `world_size > 1` conjunct reads — on both backends. Before the
 /// CAS the pair reads `None`/`None`; after it, exactly the filled values;
 /// and a `tenant_id` value that is not a UUID (manufactured by raw SQL —
 /// nothing in this crate writes one) still comes back `Ok(Some(row))` with

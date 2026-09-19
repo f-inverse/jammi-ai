@@ -273,7 +273,7 @@ impl TriggerBroker for PostgresBroker {
         offset: u64,
         _publish_tenant: Option<TenantId>,
     ) -> Result<Offset, TriggerError> {
-        // This driver carries no bytes and no tenant (B5): the batch and the
+        // This driver carries no bytes and no tenant: the batch and the
         // publish-scoped tenant tag are never inspected — the engine's own
         // replay is what any subscriber actually reads once woken.
         if self.suppress_next_notify.swap(false, Ordering::SeqCst) {

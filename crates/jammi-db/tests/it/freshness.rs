@@ -802,7 +802,7 @@ async fn probe_cache_record_reuses_an_intact_newer_row_when_an_older_same_key_ro
     // When the OLDER of the two has had its Parquet bytes reaped but the NEWER
     // one's are intact, the cache probe must still resolve the sound reuse: a
     // reaped candidate must not shadow another candidate at the exact same key
-    // (esc-023 — the false-miss this test pins down).
+    // (the false-miss this test pins down).
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));

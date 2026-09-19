@@ -1,6 +1,6 @@
-//! P-X4 (contract `feat_500-C-U5b-1a` §10): "the typed root the row carries
-//! is constructible in production ONLY from `resolved_result_root()`; any
-//! other constructor is test-only." `MemberRoot::resolved`
+//! The typed root an `instances` row carries is constructible in production
+//! ONLY from `resolved_result_root()`; any other constructor is test-only.
+//! `MemberRoot::resolved`
 //! (`crates/jammi-db/src/catalog/instance.rs`) is the ONE production
 //! constructor — it calls
 //! [`crate::config::JammiConfig::resolved_result_root`] itself.
@@ -13,22 +13,18 @@
 //! a crate that turns the feature on for a non-test reason) cannot smuggle
 //! an arbitrary string into `instances.result_root` unnoticed.
 //!
-//! **Universe, stated honestly**: every `.rs` file under `crates/<name>/
+//! **Universe**: every `.rs` file under `crates/<name>/
 //! src/` for every crate in the workspace that HAS a `src/` directory
 //! (found by walking `crates/`, not a hand-maintained list — a new crate is
 //! automatically in scope). `tests/`, `benches/`, and `examples/`
 //! directories are excluded — those are the test/fixture surfaces
 //! `feature = "test-hooks"` already exists to cover, the same way
 //! `crates/jammi-db/tests/it/gang_membership.rs` and
-//! `crates/jammi-ai/tests/it/instance_identity.rs` use the constructor
-//! today. Nothing inside `src/` is further excluded on the theory that it
-//! might be an inline `#[cfg(test)] mod tests` — the literal call form
-//! `MemberRoot::new(` occurs nowhere under any crate's `src/` at the time
-//! this test was written (verified: the only construction site was
-//! `InstanceRegistration::from_config`, now rewritten to call
-//! `MemberRoot::resolved`); a future such module belongs in `tests/` under
-//! this same contract, not in `src/`, so this test treats one as a real
-//! finding rather than carving out an exception for it.
+//! `crates/jammi-ai/tests/it/instance_identity.rs` use the constructor.
+//! Nothing inside `src/` is further excluded on the theory that it might be
+//! an inline `#[cfg(test)] mod tests` — such a module belongs in `tests/`,
+//! not in `src/`, so this test treats one as a real finding rather than
+//! carving out an exception for it.
 
 use std::path::{Path, PathBuf};
 
@@ -64,7 +60,7 @@ fn rs_files_under(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The enumerating half of P-X4: no `crates/<name>/src/**/*.rs` file across
+/// The enumerating half: no `crates/<name>/src/**/*.rs` file across
 /// the whole workspace calls `MemberRoot::new(` (the test-only, arbitrary-
 /// string constructor). Runs with no feature requirement — this is a pure
 /// static sweep of the tree, so it exercises on every `cargo test`
@@ -128,7 +124,7 @@ fn member_root_new_has_no_production_caller() {
         offenders.is_empty(),
         "MemberRoot::new (the test-only, arbitrary-string constructor gated behind \
          feature = \"test-hooks\") has a production (crates/*/src, outside tests/) caller -- \
-         P-X4 requires the ONLY production constructor to be MemberRoot::resolved, which calls \
+         the ONLY production constructor must be MemberRoot::resolved, which calls \
          JammiConfig::resolved_result_root itself:\n{}",
         offenders.join("\n")
     );

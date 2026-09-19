@@ -59,6 +59,34 @@ except ModuleNotFoundError as e:  # pragma: no cover - the CI image's python is 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = REPO_ROOT / "ci" / "release-feature-manifest.json"
 LANE_NAME = "cu12-tarball"
+PROVE_SCRIPT = REPO_ROOT / "ci" / "scripts" / "runpod_gpu_prove.sh"
+_PROVE_GROUPS_RE = re.compile(r"^PROVE_GROUPS=\(([^)]*)\)", re.M)
+
+
+def gating_groups(script_text: str | None = None) -> frozenset[str]:
+    """The prove lane's gating groups: its script's own `PROVE_GROUPS` array."""
+    text = PROVE_SCRIPT.read_text() if script_text is None else script_text
+    m = _PROVE_GROUPS_RE.search(text)
+    if m is None:
+        raise ValueError(f"{PROVE_SCRIPT} declares no PROVE_GROUPS array")
+    return frozenset(m.group(1).split())
+
+
+_GROUP_ECHO_RE = re.compile(r'echo "::group::([\w-]+)"')
+_TUPLE_ECHO_RE = re.compile(r'echo "PROVE_TUPLE crate=(\S+) kind=(\S+) features=')
+
+
+def script_layout(script_text: str | None = None) -> list[tuple[str, list[tuple[str, str]]]]:
+    """The prove script's groups in run order, each with the `(crate, kind)` of
+    every PROVE_TUPLE it echoes."""
+    text = PROVE_SCRIPT.read_text() if script_text is None else script_text
+    layout: list[tuple[str, list[tuple[str, str]]]] = []
+    for line in text.splitlines():
+        if g := _GROUP_ECHO_RE.search(line):
+            layout.append((g.group(1), []))
+        elif (t := _TUPLE_ECHO_RE.search(line)) and layout:
+            layout[-1][1].append((t.group(1), t.group(2)))
+    return layout
 
 KIND_RELEASE = "release"
 KIND_TEST = "test"

@@ -94,12 +94,6 @@ import prove_surface  # noqa: E402
 # silent extra key nobody validates.
 TOP_LEVEL_KEYS = frozenset({"_schema_doc", "lanes", "server_only_cargo_features", "prove_lane"})
 
-# The exact crates `ci/scripts/runpod_gpu_prove.sh` invokes today -- an entry
-# here for a crate the prove lane does not run is itself a finding (dead
-# manifest state that `check_flash_attn_closure.py`'s set-equality rule
-# would never be exercised for).
-PROVE_LANE_CRATES = frozenset({"jammi-server", "jammi-ai", "jammi-bench", "jammi-kernels"})
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 assert (REPO_ROOT / "Cargo.toml").is_file(), (
     f"REPO_ROOT resolved to {REPO_ROOT}, which has no Cargo.toml — this file "
@@ -221,15 +215,10 @@ def _check_prove_lane(manifest: dict, repo_root: Path, problems: list[str]) -> N
     if not isinstance(crates, dict) or not crates:
         problems.append("`prove_lane` has no (or an empty) `crates` object")
         return
-    for crate in PROVE_LANE_CRATES:
-        if crate not in crates:
-            problems.append(f"`prove_lane.crates` is missing required crate `{crate}`")
+    # Which crates the prove lane must declare is `check_flash_attn_closure.py`'s
+    # set equality against the script's own PROVE_TUPLE invocations; this checks
+    # each declared entry's shape.
     for crate_name, spec in crates.items():
-        if crate_name not in PROVE_LANE_CRATES:
-            problems.append(
-                f"`prove_lane.crates.{crate_name}`: not one of the prove lane's own "
-                f"crates {sorted(PROVE_LANE_CRATES)} -- an extra, unenforced entry"
-            )
         if not isinstance(spec, dict):
             problems.append(f"`prove_lane.crates.{crate_name}` must be an object")
             continue
@@ -610,16 +599,6 @@ def _self_test() -> int:
     check(
         "undeclared-prove-only-caught",
         any("does not declare" in p and "this-feature-does-not-exist" in p for p in probs),
-        f"{probs}",
-    )
-
-    # 9c. A missing prove_lane crate is caught.
-    m = _fixture_manifest()
-    del m["prove_lane"]["crates"]["jammi-kernels"]
-    probs = check_manifest(m, REPO_ROOT)
-    check(
-        "missing-prove-lane-crate-caught",
-        any("missing required crate `jammi-kernels`" in p for p in probs),
         f"{probs}",
     )
 

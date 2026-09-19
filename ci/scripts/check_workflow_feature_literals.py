@@ -203,9 +203,9 @@ def self_test() -> int:
         jobs:
           b:
             steps:
-              - run: cargo build -F 'cuda jetstream-broker'
+              - run: cargo build -F 'storage-cloud jetstream-broker'
         """,
-        {"cuda", "jetstream-broker"},
+        {"storage-cloud", "jetstream-broker"},
     )
     expect(
         "an input default that is nothing but features is refused",

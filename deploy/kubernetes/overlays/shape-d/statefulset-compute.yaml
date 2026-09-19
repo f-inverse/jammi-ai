@@ -56,7 +56,7 @@ spec:
       containers:
         - name: jammi-server
           # amd64 only. Pin-advice: `:latest` is re-pointed by every `v*`
-          # release tag; pin an exact `:vX.Y.Z` tag for reproducible
+          # release tag; pin an exact `:X.Y.Z` tag for reproducible
           # GPU-node deploys.
           image: ghcr.io/f-inverse/jammi-ai-server-cu12:latest
           resources:

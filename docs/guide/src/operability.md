@@ -112,10 +112,14 @@ starts a fresh, unparented trace, exactly as today.
 ## Graceful shutdown
 
 `run_with_shutdown` drives both the HTTP side-channel and the gRPC surface and
-drains them in parallel: the call returns once both have stopped accepting new
-connections and finished serving in-flight requests. The standalone binary wires
-both `SIGINT` (Ctrl+C) and `SIGTERM`, so `docker stop` — which sends
-`SIGTERM` — triggers the same clean drain as an interactive Ctrl+C.
+stops them in parallel. The standalone binary maps the two signals to two
+modes: `SIGTERM` — what `docker stop` and a Kubernetes pod deletion send — is a
+**DRAIN** (stop accepting, finish in-flight requests and the running job, then
+exit), and `SIGINT` (Ctrl+C), or any signal received while draining, is a
+**RELEASE** (hand every held job lease back to the catalog at once, then exit).
+The engine sets no drain timeout; the runtime's grace period bounds it. See
+[Shutdown: DRAIN and RELEASE](./deploy-server.md#shutdown-drain-and-release)
+for what each mode does to leases, streams and gang ranks.
 
 ## Backpressure and resource limits
 

@@ -35,7 +35,7 @@ spec:
       containers:
         - name: jammi-server
           # Pin-advice: `:latest` is re-pointed by every `v*` release tag.
-          # Pin an exact `:vX.Y.Z` tag for reproducible deploys.
+          # Pin an exact `:X.Y.Z` tag for reproducible deploys.
           image: ghcr.io/f-inverse/jammi-ai-server:latest
           ports:
             - { containerPort: 8081, name: flight }

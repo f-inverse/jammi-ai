@@ -224,7 +224,7 @@ successor.
 
 ## Image pin advice
 
-`:latest` is re-pointed by every `v*` release tag. Pin an exact `:vX.Y.Z`
+`:latest` is re-pointed by every `v*` release tag. Pin an exact `:X.Y.Z`
 tag for reproducible deploys — this applies to both the CPU image
 (`base/deployment.yaml`) and the GPU image
 (`overlays/shape-d/statefulset-compute.yaml`).

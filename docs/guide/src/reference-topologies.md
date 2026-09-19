@@ -344,7 +344,7 @@ Deployment's churning pod names cannot hold. This overlay is validated by
 
 Both `:latest` tags are re-pointed by every `v*` release tag (never by a
 prerelease); the CPU `:latest` can additionally be re-pointed to the current
-`main` by a manual `build-and-push-main` dispatch. Pin an exact `:vX.Y.Z`
+`main` by a manual `build-and-push-main` dispatch. Pin an exact `:X.Y.Z`
 tag for reproducible GPU-node deploys.
 
 Very high scale, specialized GPU pools, and a split compliance posture
@@ -462,7 +462,7 @@ only on a custom build that opts into it explicitly; do not read this
 image's Postgres-catalog support as evidence that source federation is
 available.
 
-**Node architecture.** The CPU image's generic tags (`ghcr.io/f-inverse/jammi-ai-server:latest`/`:vX.Y.Z`/`:vX.Y`
+**Node architecture.** The CPU image's generic tags (`ghcr.io/f-inverse/jammi-ai-server:latest`/`:X.Y.Z`/`:X.Y`
 and their `sha-<sha>` equivalents) are a multi-arch index — `linux/amd64` and
 `linux/arm64` — so Shapes B/C's query tier and Shape D's disaggregated query
 tier can schedule onto either an amd64 or an arm64 node pool without a

@@ -19,7 +19,7 @@ set -euo pipefail
 
 BIN="${JAMMI_BENCH_BIN:-./target/release/jammi-bench}"
 
-# --- provenance cross-check (unification contract C5.1), same shape as
+# --- provenance cross-check, same shape as
 # finetune_ab.sh's/stacked_sweep.sh's/pod_build_timings.sh's own
 # check_bin_provenance(): every tier below reports a throughput/digest
 # verdict that BOTH callers (crates.yml's release-blocking gate,

@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
-# gpu_inference_ab.sh -- issue #335's within-run GPU perf A/B producer:
+# gpu_inference_ab.sh -- the within-run GPU perf A/B producer:
 # builds parent-HEAD and the PR change as two FULL, SIMULTANEOUSLY-RESIDENT
 # clones, runs `jammi-bench gpu-inference-scale` on the SAME rented pod, back
 # to back, in an order-balanced A,B,B,A interleaving, and merges the four
 # legs through `gpu_inference_ab.py` (this directory) -- the SAME
 # `generic_leg_identity_fields`/`generic_leg_premise_violations` refusal core
-# `encode_ab.sh` already builds on.
+# `encode_ab.sh` builds on.
 #
-# TWO MODES (issue #335's final unit): the multi-pod/both-device-model
-# validation this producer's own exit criterion required before any
-# enforcement is now DONE (the `--aa-null` empirical-null campaign committed
-# under `ci/artifacts/gpu-perf-aa-null/`), and `gpu_inference_ab.py`'s own
-# advisory band is now PRE-REGISTERED against that evidence (see that
-# module's own doc). This does NOT make enforcement the default:
+# TWO MODES: `gpu_inference_ab.py`'s own advisory band is PRE-REGISTERED
+# against the `--aa-null` empirical-null evidence committed under
+# `ci/artifacts/gpu-perf-aa-null/` (see that module's own doc). Enforcement
+# is NOT the default:
 #   * non-enforcing (the DEFAULT — `GPU_INFERENCE_AB_ENFORCE` unset or `0`)
-#     — the SAME recording-only posture this producer has always had: the
-#     only hard (nonzero, non-75) refusal is a CORRECTNESS-of-measurement
+#     — recording-only: the only hard (nonzero, non-75) refusal is a CORRECTNESS-of-measurement
 #     problem (an identity/premise mismatch between legs, or a binary whose
 #     own `provenance` does not match the clone it was built from). A
 #     measured ratio, however far outside the pre-registered band, is
@@ -26,7 +23,7 @@
 #     "faster is always fine" one -- a ratio too far below 1.0 is refused
 #     just as loudly as one too far above, with its own distinct,
 #     direction-honest verdict; see `gpu_inference_ab.py`'s own
-#     "Enforcement flip" doc for the full exit-code lattice, including the
+#     "Enforcement" doc for the full exit-code lattice, including the
 #     `ENFORCE_INVALID_MODE` refusal below). Still OPT-IN, never this
 #     script's own default: `gpu-perf-ab.yml`'s label-triggered PR path
 #     never sets it, only an explicit `workflow_dispatch` with
@@ -44,10 +41,10 @@
 # `tokenizer.json` from, joined against a RELATIVE `../../cookbook/
 # fixtures/...` that resolves through whatever is CURRENTLY on disk at that
 # absolute path when the binary actually RUNS, not when it was compiled.
-# `gpu_inference.rs::run` now also HASHES those same files
+# `gpu_inference.rs::run` also HASHES those same files
 # (`GpuInferenceTier::embed_checkpoint_*_sha256`/`infer_checkpoint_*_sha256`,
-# issue #335's own D4 identity contract) at RUN time, off whatever bytes sit
-# at that path at that moment.
+# identity fields) at RUN time, off whatever bytes sit at that path at that
+# moment.
 #
 # A single checkout that builds parent, `git checkout`s the PR ref IN PLACE,
 # then builds the PR binary would therefore be UNSOUND the instant the
@@ -75,13 +72,12 @@
 # ## Order-balanced legs: A, B, B, A (never A, A, B, B)
 #
 # See `gpu_inference_ab.py`'s own module doc ("What actually cancels, and
-# what does not", round-1 adversarial audit B4) for the full, corrected
-# rationale — in short: the ORDER itself (never merely "pairing adjacent
+# what does not") for the full rationale — in short: the ORDER itself (never merely "pairing adjacent
 # legs together") cancels a first-order MULTIPLICATIVE clock/thermal drift
 # trend, by placing the two `b`-role legs symmetrically between the two
 # `a`-role legs.
 #
-# ## `--aa-null`: the D6 empirical-null instrument
+# ## `--aa-null`: the empirical-null instrument
 #
 # `GPU_INFERENCE_AB_AA_NULL=1` builds the PARENT sha TWICE, from the SAME
 # TWO independent clones (`clone-a`, `clone-b`) every invocation of this
@@ -91,17 +87,16 @@
 # against itself, built and run independently, so the resulting ratio
 # distribution is pure build+measurement+pod noise, never a real code
 # difference. This is the instrument
-# `gpu_inference_ab.py::PRE_REGISTERED_ADVISORY_BAND` (D6) was derived from —
+# `gpu_inference_ab.py::PRE_REGISTERED_ADVISORY_BAND` is derived from —
 # five runs, THREE primary (the other two, `pcie-p1`/`pcie-p2`, are
 # committed but AUXILIARY: they ran CONCURRENTLY on one shared PCIe pod, a
 # GPU-contention confound this instrument's own isolation assumption does
 # not cover -- `ci/artifacts/gpu-perf-aa-null/README.md`'s own "Disclosure"
 # section has the full evidence), committed under
 # `ci/artifacts/gpu-perf-aa-null/` (that directory's own README.md has the
-# full campaign protocol, per-run table, and characterization findings). A
-# FUTURE campaign that widens this evidence base (more pods, more device
-# models) re-derives the band from the WIDER committed set, never
-# hand-tunes the two numbers directly -- `ci/scripts/check_aa_null_band.py`
+# full protocol, per-run table, and characterization). Widening this
+# evidence base (more pods, more device models) re-derives the band from
+# the WIDER committed set, never hand-tunes the two numbers directly -- `ci/scripts/check_aa_null_band.py`
 # enforces this mechanically (see that module's own "ADVISORY
 # classification" doc). `--aa-null` is MUTUALLY EXCLUSIVE with
 # `GPU_INFERENCE_AB_ENFORCE=1` (checked below, before renting/building
@@ -115,11 +110,10 @@
 # never under `ci/artifacts/gpu-perf-aa-null/` directly on the pod's own
 # throwaway checkout, which `runpod_gpu_perf_ab.sh`'s own rsync step never
 # reaches); a human still decides which run(s) get promoted to
-# `ci/artifacts/gpu-perf-aa-null/` as the campaign's own committed evidence,
+# `ci/artifacts/gpu-perf-aa-null/` as committed evidence,
 # the same convention `runpod_gpu_howwell.sh`'s own artifact pull follows.
 #
-# ## Exit codes (round-3 adversarial audit B2/B3's reconciled lattice —
-# this table, the code sites below, `gpu_inference_ab.py`'s own exit-code
+# ## Exit codes (this table, the code sites below, `gpu_inference_ab.py`'s own exit-code
 # doc, and gpu-perf-ab.yml's own step annotations must all agree; every
 # exit site in this script cites which arm of this table it lands on)
 #
@@ -131,11 +125,9 @@
 #         band; see arm `1`'s own three enforcement shapes below for the
 #         cases that still exit `1` from this same GREEN status).
 #   1  -- a REAL correctness-of-measurement refusal, ONLY ever raised once
-#         `gpu_inference_ab.py` can CONFIRM the signal is real (round-3
-#         adversarial audit B2/B3 correction: an earlier version of this
-#         table claimed this arm was "always the PR's own problem, never
-#         the parent's" -- that overclaimed a confirmation this script does
-#         not always have): an identity mismatch between two otherwise-
+#         `gpu_inference_ab.py` can CONFIRM the signal is real (it is NOT
+#         "always the PR's own problem" -- this script does not always have
+#         that confirmation): an identity mismatch between two otherwise-
 #         comparable legs (status INVALID), a malformed measurement on an
 #         otherwise identity-clean leg set (status INVALID_MEASUREMENT), the
 #         four legs' RECORDED start order not verifying as A,B,B,A with
@@ -148,10 +140,10 @@
 #         binary whose own `provenance` does not match the clone it was
 #         supposedly built from, or the PR/comparison clone's build FAILING
 #         (outside `--aa-null` mode — see that mode's own exception below,
-#         where the SAME build-failure classification already correctly
-#         attributes it to the parent-shaped bucket instead). A report is
-#         still WRITTEN on every one of these, never an uncaught crash. PLUS
-#         (issue #335's final unit), under `GPU_INFERENCE_AB_ENFORCE=1` ONLY:
+#         where the SAME build-failure classification attributes it to the
+#         parent-shaped bucket instead). A report is still WRITTEN on every
+#         one of these, never an uncaught crash. PLUS, under
+#         `GPU_INFERENCE_AB_ENFORCE=1` ONLY:
 #         THREE further, entirely different shapes — in every one, `status`
 #         stays GREEN (the four legs' premises really did agree; NONE of
 #         these are a correctness refusal), distinguishable from the four
@@ -172,7 +164,7 @@
 #           - enforcement was requested but `mode != "ab"` (`"aa-null"` or
 #             unconfirmed/`None`) -- `enforce_verdict=ENFORCE_INVALID_MODE`,
 #             checked BEFORE the band is even consulted; this script's own
-#             mutual-exclusion guard (below) already refuses the
+#             mutual-exclusion guard (below) refuses the
 #             `--aa-null`-plus-`GPU_INFERENCE_AB_ENFORCE=1` combination at
 #             exit `2` before anything is even rented, so this arm fires
 #             only for an UNCONFIRMED (absent/older-producer) `mode`.
@@ -192,29 +184,26 @@
 #         failed (also parent-sha under that mode, same bucket as the
 #         parent), the `origin/main`-tracking-ref refresh fetch failed
 #         (`gpu_inference_ab_git.sh`'s own doc — ADVISORY, this script logs
-#         it and continues to the real gate, the merge-base call, per
-#         round-2 adversarial audit F2), HEAD already equals origin/main's
-#         merge-base (no PR-side commits at all), both binaries report the
-#         SAME `build_sha` outside `--aa-null` mode, a parent leg is missing
-#         one or more declared identity fields entirely (predates issue
-#         #335's own identity contract — status INCOMPLETE_IDENTITY), one or
-#         more legs' RECORDED start timestamps could not be read or did not
-#         parse (status INCOMPLETE_ORDER, round-3 adversarial audit B3 — a
+#         it and continues to the real gate, the merge-base call), HEAD
+#         already equals origin/main's merge-base (no PR-side commits at
+#         all), both binaries report the SAME `build_sha` outside
+#         `--aa-null` mode, a parent leg is missing one or more declared
+#         identity fields entirely (built by an older tool version — status
+#         INCOMPLETE_IDENTITY), one or more legs' RECORDED start timestamps
+#         could not be read or did not parse (status INCOMPLETE_ORDER — a
 #         missing/unparseable timestamp is NOT itself proof the order was
 #         violated), or fewer than all four legs produced an `OK` report and
 #         the CONFIRMED-real b-role-FAIL-in-`ab`-mode precondition above
 #         does not hold (status INCOMPLETE — a `MISSING`/`DRY_RUN` leg of
 #         EITHER role, a `b`-role FAIL under `--aa-null`, or an unconfirmed
-#         `mode`: round-3 adversarial audit B2).
+#         `mode`).
 #
-# ## RESIDUALS (round-3 adversarial audit freeze rule: this wave is EXACTLY
-# three fixes, B1/B2/B3 above; every OTHER advisory the audit raised is
-# acknowledged here, verbatim by name, and DELIBERATELY left untouched)
+# ## Known limitations
 #
 #   - wall-clock ties: `verify_recorded_order` treats an EQUAL recorded
-#     timestamp between adjacent legs as non-decreasing (not a violation)
-#     -- never investigated whether two legs finishing within the SAME
-#     nanosecond-epoch tick is itself a signal worth its own check.
+#     timestamp between adjacent legs as non-decreasing (not a violation);
+#     two legs starting within the SAME nanosecond-epoch tick is not
+#     treated as a signal of its own.
 #   - df fail-open: the driver's own pre-flight disk-space check
 #     (`runpod_gpu_perf_ab.sh`) logs a warning and CONTINUES when `df -BG /`
 #     produces unparseable output, rather than refusing -- a broken `df`
@@ -226,16 +215,14 @@
 #     footprint.
 #   - sourced-guard latency: the `[[ "${BASH_SOURCE[0]}" == "${0}" ]]`
 #     "am I sourced or executed" idiom (`gpu_inference_ab_git.sh`,
-#     `runpod_clone_checkout.sh`) was verified empirically for the ONE
+#     `runpod_clone_checkout.sh`) is verified empirically for the ONE
 #     invocation shape this repo actually uses (`bash -s` reading from
-#     stdin) -- not exhaustively re-verified against every other way bash
-#     can source vs. execute a file.
+#     stdin) -- not against every other way bash can source vs. execute a
+#     file.
 #   - caller's 75-continue branch: `gpu_inference_ab_ensure_history_for_merge_base`
 #     returning 75 makes THIS script log a warning and continue to the real
-#     gate (the `git merge-base` call, round-2 adversarial audit F2) rather
-#     than exit immediately -- no further hardening of that continuation
-#     path (e.g. re-verifying `origin/main`'s own freshness before the
-#     merge-base call) was attempted beyond the F2 fix itself.
+#     gate (the `git merge-base` call) rather than exit immediately --
+#     `origin/main`'s own freshness is not re-verified before that call.
 #
 # Env vars:
 #   GPU_INFERENCE_AB_WORK_DIR       where clone-a/clone-b + their own
@@ -245,10 +232,9 @@
 #   GPU_INFERENCE_AB_OUT_DIR        where the merged report + raw legs land
 #                                   (default "<repo>/.gpu-inference-ab-report/
 #                                   <UTC timestamp>").
-#   GPU_INFERENCE_AB_AA_NULL=1      the D6 instrument (see above).
-#   GPU_INFERENCE_AB_ENFORCE=1      opt THIS invocation into the enforcement
-#                                   flip (issue #335's final unit, see the
-#                                   "TWO MODES" section above) -- REQUIRES
+#   GPU_INFERENCE_AB_AA_NULL=1      the empirical-null instrument (see above).
+#   GPU_INFERENCE_AB_ENFORCE=1      opt THIS invocation into enforcement
+#                                   (see the "TWO MODES" section above) -- REQUIRES
 #                                   `mode == "ab"` (mutually exclusive with
 #                                   `GPU_INFERENCE_AB_AA_NULL=1`, refused at
 #                                   exit 2 before anything is rented, see
@@ -261,8 +247,7 @@
 #                                   `OUTSIDE_BAND_FAST` below the lower one
 #                                   -- direction-honest, never one name for
 #                                   both). Default unset (0): non-enforcing,
-#                                   recording-only, this producer's
-#                                   longstanding default posture.
+#                                   recording-only.
 #   GPU_INFERENCE_AB_SKIP_GPU_CHECK=1  skip the nvidia-smi idle check
 #                                   (CPU/dry-run smoke test only).
 #   GPU_INFERENCE_AB_DRY_RUN=1      print every command this script would
@@ -280,13 +265,11 @@
 #                                   every leg's own `provenance.pod_id`
 #                                   (falls back to `$(hostname)` when unset,
 #                                   e.g. a by-hand invocation off RunPod).
-#                                   The structural fix for the
-#                                   concurrent-invocations-sharing-one-pod
-#                                   contamination class
+#                                   Makes the concurrent-invocations-
+#                                   sharing-one-pod contamination class
 #                                   `ci/artifacts/gpu-perf-aa-null/README.md`'s
 #                                   own "Disclosure" section reconstructs by
-#                                   hand today -- a future committed artifact
-#                                   carries this directly.
+#                                   hand detectable from the report itself.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -297,8 +280,7 @@ GPU_INFERENCE_AB_AA_NULL="${GPU_INFERENCE_AB_AA_NULL:-0}"
 GPU_INFERENCE_AB_ENFORCE="${GPU_INFERENCE_AB_ENFORCE:-0}"
 GPU_INFERENCE_AB_SKIP_GPU_CHECK="${GPU_INFERENCE_AB_SKIP_GPU_CHECK:-0}"
 
-# round-4 delta-audit F4: --aa-null and enforcement are mutually exclusive
-# -- refused HERE, before anything is rented/cloned/built (strictly cheaper
+# --aa-null and enforcement are mutually exclusive -- refused HERE, before anything is rented/cloned/built (strictly cheaper
 # than discovering this at the comparator, `gpu_inference_ab.py::build_report`'s
 # own ENFORCE_INVALID_MODE arm, which ALSO refuses this combination as a
 # defense in depth, never relied on as the ONLY refusal site). No PR exists
@@ -311,8 +293,7 @@ if [ "$GPU_INFERENCE_AB_AA_NULL" = "1" ] && [ "$GPU_INFERENCE_AB_ENFORCE" = "1" 
 fi
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-# Retention (round-1 adversarial audit advisory, documented rather than
-# auto-cleaned): $WORK_DIR (two full clones + two `cargo build` target
+# Retention (documented rather than auto-cleaned): $WORK_DIR (two full clones + two `cargo build` target
 # dirs, easily multiple GB) is DELIBERATELY left on disk when this script
 # exits, success or failure alike -- a fresh, timestamped directory every
 # invocation (never overwritten), so a failed leg's own binary/clone stays
@@ -326,13 +307,13 @@ TS="$(date -u +%Y%m%dT%H%M%SZ)"
 # this reasoning does not cover -- an operator running it that way is
 # expected to set GPU_INFERENCE_AB_WORK_DIR explicitly and clean up
 # afterward, the same "operator/perf-lane tool" posture stacked_sweep.sh's
-# own $CARGO_TARGET_DIR reuse already takes.
+# own $CARGO_TARGET_DIR reuse takes.
 WORK_DIR="${GPU_INFERENCE_AB_WORK_DIR:-$(dirname "$REPO_ROOT")/gpu-perf-ab-$TS}"
 OUT_DIR="${GPU_INFERENCE_AB_OUT_DIR:-$REPO_ROOT/.gpu-inference-ab-report/$TS}"
 RAW_DIR="$OUT_DIR/raw"
 mkdir -p "$RAW_DIR"
 
-# round-3 adversarial audit B2: the comparator has NO other way to know
+# The comparator has NO other way to know
 # whether this run is the normal parent-vs-PR A/B or the --aa-null
 # empirical-null instrument (both b-role legs are ALSO parent-sha clones
 # under aa-null -- a b-role RUNTIME failure there carries no "the PR's own
@@ -342,7 +323,7 @@ mkdir -p "$RAW_DIR"
 # blaming a nonexistent PR. DRY_RUN takes precedence over AA_NULL in this
 # marker (a dry run's own aa_null flag changes no real measurement; every
 # leg is a DRY_RUN stub either way, so the comparator's MISSING/DRY_RUN
-# routing already handles it regardless of which value is recorded here).
+# routing handles it regardless of which value is recorded here).
 if [ "$GPU_INFERENCE_AB_DRY_RUN" = "1" ]; then
   printf 'dry-run' > "$RAW_DIR/mode"
 elif [ "$GPU_INFERENCE_AB_AA_NULL" = "1" ]; then
@@ -351,8 +332,7 @@ else
   printf 'ab' > "$RAW_DIR/mode"
 fi
 
-# issue #335's final unit (the enforcement flip): the SAME file-based
-# state-passing convention as `mode` above, written ONE time, before any leg
+# Enforcement: the SAME file-based state-passing convention as `mode` above, written ONE time, before any leg
 # runs, so `gpu_inference_ab.py::load_enforce` can read it -- never an env
 # var threaded directly into that module (see this module's own doc).
 if [ "$GPU_INFERENCE_AB_ENFORCE" = "1" ]; then
@@ -361,12 +341,11 @@ else
   printf '0' > "$RAW_DIR/enforce"
 fi
 
-# round-4 delta-audit F3(d): pod identity, the structural fix for the
-# concurrent-invocations-sharing-one-pod contamination class
-# `ci/artifacts/gpu-perf-aa-null/README.md`'s own "Disclosure" section
-# reconstructs by hand today -- written ONE time, before any leg runs, the
-# SAME file-based state-passing convention `mode`/`enforce` above already
-# use, so `gpu_inference_ab.py::load_pod_id` can fold it into every OK
+# Pod identity, which makes the concurrent-invocations-sharing-one-pod
+# contamination class `ci/artifacts/gpu-perf-aa-null/README.md`'s own
+# "Disclosure" section reconstructs by hand detectable from the report --
+# written ONE time, before any leg runs, the SAME file-based state-passing
+# convention `mode`/`enforce` above use, so `gpu_inference_ab.py::load_pod_id` can fold it into every OK
 # leg's own `provenance.pod_id`. `RUNPOD_POD_ID` is the identity RunPod's
 # own environment provides on a rented pod; `$(hostname)` is the fallback
 # for a by-hand invocation off RunPod (still a real, if less specific,
@@ -392,7 +371,7 @@ run_cmd() {
 # precedent) -- a busy GPU makes every timing this script would eventually
 # produce meaningless before a single clone is even made.
 #
-# Exit-lattice split (round-1 adversarial audit B3): `nvidia-smi` itself
+# Exit-lattice split: `nvidia-smi` itself
 # FAILING to run (missing binary, driver problem) is an infra/usage error —
 # exit 2, this box cannot even be asked the question. The query SUCCEEDING
 # and reporting busy compute processes is NEUTRAL — exit 75, "nothing to
@@ -414,12 +393,10 @@ if [ "$GPU_INFERENCE_AB_SKIP_GPU_CHECK" != "1" ] && [ "$GPU_INFERENCE_AB_DRY_RUN
 fi
 
 # --- ensure this checkout carries enough history for a real merge-base
-# (round-1 adversarial audit B2) -- see gpu_inference_ab_git.sh's own doc
-# for the exact bug this closes and this function's own exit-code
-# contract (0 / 2 / 75).
+# -- see gpu_inference_ab_git.sh's own doc for why a shallow checkout breaks
+# it and this function's own exit-code contract (0 / 2 / 75).
 #
-# round-2 adversarial audit F2 (the LIBRARY's own design is correct, the
-# CALLER was wrong): a `75` here is ADVISORY, not a gate -- it means "the
+# A `75` here is ADVISORY, not a gate -- it means "the
 # origin/main REFRESH fetch failed", which is meaningless on its own if a
 # PRIOR clone step already populated a usable origin/main (the normal case
 # after runpod_gpu_perf_ab.sh's own full, non-single-branch initial
@@ -447,7 +424,7 @@ if ! [[ "$PR_SHA" =~ $SHA_RE ]]; then
   exit 2
 fi
 if [ "$GPU_INFERENCE_AB_DRY_RUN" = "1" ]; then
-  # round-1 adversarial audit B2: a well-formed 40-hex PLACEHOLDER -- dry-run
+  # A well-formed 40-hex PLACEHOLDER -- dry-run
   # must walk the SAME validation PR_SHA/PARENT_SHA both go through below,
   # never step over it with a value that would fail the real check.
   PARENT_SHA="a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
@@ -461,7 +438,7 @@ if ! [[ "$PARENT_SHA" =~ $SHA_RE ]]; then
 fi
 
 if [ "$GPU_INFERENCE_AB_AA_NULL" = "1" ]; then
-  # The D6 instrument: clone-b (the SAME second clone every invocation
+  # The empirical-null instrument: clone-b (the SAME second clone every invocation
   # makes, never an additional third one) checks out the SAME parent sha,
   # never the PR sha -- see this script's own header.
   B_SHA="$PARENT_SHA"
@@ -478,25 +455,19 @@ mkdir -p "$WORK_DIR"
 # --- TWO SIMULTANEOUSLY-RESIDENT clones, checked out BEFORE any build ---
 clone_and_checkout() {
   local clone="$1" sha="$2" label="$3"
-  # round-2 adversarial audit F6 (round-3 adversarial audit B1 correction):
-  # `--filter=blob:none` -- the SAME pod-clone idiom runpod_lib.sh:1505
-  # already uses -- skips every HISTORICAL blob this workload never touches
-  # (no git log -p, no diffing against history; only the ONE checked-out
-  # tree's own files are ever read), a real disk-footprint saving for two
-  # full source trees. `file://$REPO_ROOT` is REQUIRED for the filter to
-  # even be ATTEMPTED (a bare local path silently ignores `--filter`
-  # outright, discovered empirically). This clone's SOURCE, `$REPO_ROOT`,
-  # is ITSELF a partial (blobless) clone by the time this runs
-  # (`runpod_gpu_perf_ab.sh`'s own outer clone, made via
-  # `runpod_clone_checkout.sh`) -- an earlier version of this comment
-  # claimed an unsupported filter request "never a hard failure" (silent
-  # fallback to a full clone); that claim was FALSE for exactly this
-  # composition (round-3 adversarial audit B1, the auditor's own
-  # reproduction): a source that is ITSELF partial cannot silently
+  # `--filter=blob:none` -- the SAME pod-clone idiom runpod_lib.sh uses --
+  # skips every HISTORICAL blob this workload never touches (no git log -p,
+  # no diffing against history; only the ONE checked-out tree's own files
+  # are ever read), a real disk-footprint saving for two full source trees.
+  # `file://$REPO_ROOT` is REQUIRED for the filter to even be ATTEMPTED (a
+  # bare local path silently ignores `--filter` outright). This clone's
+  # SOURCE, `$REPO_ROOT`, is ITSELF a partial (blobless) clone by the time
+  # this runs (`runpod_gpu_perf_ab.sh`'s own outer clone, made via
+  # `runpod_clone_checkout.sh`). A source that is ITSELF partial cannot
   # fall back to serving a FULL clone (it does not have every blob to
   # serve), so an inner filtered clone against an unfiltered-serving
   # source FAILS hard (fatal, exit 128) rather than degrading gracefully.
-  # The REAL contract this depends on: the source repo's own
+  # The contract this depends on: the source repo's own
   # `uploadpack.allowFilter` must be `true` so it can actually SERVE a
   # partial-clone request rather than attempt (and fail) a full one --
   # `runpod_clone_checkout.sh`'s own outer clone sets this immediately
@@ -538,7 +509,7 @@ if ! build_clone "$CLONE_B" "$TARGET_B"; then
     echo "::warning::--aa-null comparison clone (a second independent parent-sha build) FAILED -- same bucket as a parent build failure; neutral exit 75." >&2
     exit 75
   fi
-  # round-1 adversarial audit B3: a PR-side build failure is the PR's OWN
+  # A PR-side build failure is the PR's OWN
   # problem -- a real correctness-of-measurement refusal (exit 1), distinct
   # from the parent-broke-the-baseline case above (exit 75). The PR simply
   # not compiling is itself a genuine signal this producer surfaces rather
@@ -551,7 +522,7 @@ fi
 BIN_A="$TARGET_A/release/jammi-bench"
 BIN_B="$TARGET_B/release/jammi-bench"
 
-# --- per-binary provenance cross-check (C5.1 shape, cf. encode_ab.sh) ---
+# --- per-binary provenance cross-check (same shape as encode_ab.sh's) ---
 check_provenance() {
   local bin="$1" clone="$2" label="$3"
   local expect_sha prov_json prov_sha
@@ -580,7 +551,7 @@ fi
 
 # --- one leg. NEVER aborts the sweep -- a leg failure is recorded as this
 # leg's own outcome (its .exit file + stderr), same discipline
-# stacked_sweep.sh/encode_ab.sh's own run_leg already follow. ---
+# stacked_sweep.sh/encode_ab.sh's own run_leg follow. ---
 run_leg() {
   local name="$1" bin="$2"
   local out_file="$RAW_DIR/${name}.json"
@@ -588,7 +559,7 @@ run_leg() {
   local exit_file="$RAW_DIR/${name}.exit"
   local started_at_file="$RAW_DIR/${name}.started_at"
 
-  # round-2 adversarial audit F3 (order binding): record a monotonic-for-
+  # Order binding: record a monotonic-for-
   # practical-purposes start timestamp (nanosecond epoch) BEFORE invoking
   # this leg's binary, in EVERY mode including --dry-run -- the ONE piece
   # of evidence `gpu_inference_ab.py`'s own comparator uses to MACHINE-
@@ -631,11 +602,12 @@ python3 "$DIR/gpu_inference_ab.py" "$RAW_DIR" "$OUT_DIR" "$A_PROV_SHA" "$B_PROV_
 MERGE_RC=$?
 
 # --- --aa-null: stage a second, clearly-named copy of the merged artifact
-# for eventual commit under ci/artifacts/gpu-perf-aa-null/ (D6's own
-# evidence path) -- a human still decides which run(s) get committed, the
-# same convention runpod_gpu_howwell.sh's own artifact pull follows.
+# for eventual commit under ci/artifacts/gpu-perf-aa-null/ (the
+# empirical-null evidence path) -- a human still decides which run(s) get
+# committed, the same convention runpod_gpu_howwell.sh's own artifact pull
+# follows.
 #
-# Staged INSIDE $OUT_DIR (round-1 adversarial audit advisory), never under
+# Staged INSIDE $OUT_DIR, never under
 # $REPO_ROOT/ci/artifacts/ directly: $REPO_ROOT here is the ON-POD checkout
 # (e.g. /root/jammi-ai) that invoked this script, NOT the caller's own
 # local repo -- a file written under $REPO_ROOT/ci/artifacts/ would sit
@@ -645,8 +617,8 @@ MERGE_RC=$?
 # would silently never leave the pod at all. $OUT_DIR is exactly the tree
 # that DOES get pulled, so staging here is what actually makes this
 # artifact retrievable; an operator who wants to commit it under
-# ci/artifacts/gpu-perf-aa-null/ for real (once enough runs exist to derive
-# a real band, D6) copies it there from the pulled artifact directory. ---
+# ci/artifacts/gpu-perf-aa-null/ copies it there from the pulled artifact
+# directory. ---
 if [ "$GPU_INFERENCE_AB_AA_NULL" = "1" ] && [ -f "$OUT_DIR/gpu_inference_ab_report.json" ]; then
   cp "$OUT_DIR/gpu_inference_ab_report.json" "$OUT_DIR/aa_null_report.json"
   echo "=== --aa-null artifact staged inside the pulled report dir: $OUT_DIR/aa_null_report.json (promote to ci/artifacts/gpu-perf-aa-null/ by hand once it is real evidence) ===" >&2

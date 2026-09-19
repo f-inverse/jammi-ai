@@ -12,7 +12,7 @@ where every `*_path` is RELATIVE to the emitted JSONL's own directory (the
 loader resolves it against that directory, so the corpus is relocatable as
 one tree).
 
-SHAPE GUARANTEE (issue #421 PR B's pre-registered training-step profile):
+SHAPE GUARANTEE (the pre-registered training-step profile):
 every emitted PNG is EXACTLY `--size x --size` RGB, 8 bits per channel, no
 interlacing, no alpha. An OpenCLIP vision tower resizes whatever it is given
 to `image_size` before the patch embedding; feeding it images that are
@@ -35,7 +35,7 @@ mean absolute inter-family distance) rather than assuming it. Nothing about
 the content is claimed to be semantically meaningful: this is a fixed-shape
 COST workload, not an accuracy fixture.
 
-Determinism (family J): one `random.Random(seed)` instance draws every
+Determinism: one `random.Random(seed)` instance draws every
 jitter value in a single fixed sequential order -- families first, then
 instances within a family, then rows -- so the same
 `(size, families, instances, rows, jitter, seed)` tuple always produces
@@ -44,13 +44,13 @@ pinned by writing at a FIXED zlib compression level (`_ZLIB_LEVEL`) with a
 fixed filter byte (0, "None") on every scanline, so the encoder itself
 contributes no run-to-run variation.
 
-Generic fixture (family L): the content is synthetic periodic patterns plus
+Generic fixture: the content is synthetic periodic patterns plus
 seeded noise. No consumer's data shape, no scraped imagery, no third-party
 image library -- PNGs are written with a minimal encoder over the stdlib
 `zlib`/`struct`/`binascii`, so this producer has NO dependency beyond the
 Python standard library.
 
-HELD-OUT SPLIT (issue #421 P1-b(iv)): `--heldout-rows N` additionally emits
+HELD-OUT SPLIT: `--heldout-rows N` additionally emits
 `heldout_ids.txt` (TAB-separated `anchor_id\tpositive_id\tnegative_id`, one
 row per line, in the order it was generated -- this file's ORDER is the
 scoring identity `jammi-bench finetune-run --heldout-ids` reads) and
@@ -74,9 +74,8 @@ a nonzero multiple of `--batch`, and finding that out here (before any
 image is written) is cheaper than finding it out on a GPU pod.
 
 WITHOUT `--heldout-rows` (the default, 0) nothing about this producer's
-output changes: the train rows are drawn from the FULL family pool exactly
-as before, no extra files are written, and the emitted bytes are identical
-to what every existing invocation already gets.
+output changes: the train rows are drawn from the FULL family pool and
+no extra files are written.
 
 Usage:
   gen_fixed_shape_image_corpus.py --rows N --size S --seed K --out-dir DIR
@@ -118,7 +117,7 @@ _BIT_DEPTH = 8
 
 # Fixed zlib level so the compressed IDAT bytes are a pure function of the
 # raw scanlines -- determinism is a property of the emitted FILE, not just
-# of the pixel array (family J). Level 6 is zlib's own default; naming it
+# of the pixel array. Level 6 is zlib's own default; naming it
 # explicitly means a future change to that default cannot silently move
 # every committed digest.
 _ZLIB_LEVEL = 6
@@ -162,7 +161,7 @@ def encode_png(width: int, height: int, pixels: bytes) -> bytes:
     Every scanline is prefixed with filter byte 0 ("None"), so the raw
     stream is a pure, adaptive-heuristic-free function of the pixel bytes --
     a filter heuristic would make the output depend on the encoder version
-    rather than on the image (family J).
+    rather than on the image.
     """
     expected = width * height * 3
     if len(pixels) != expected:
@@ -676,7 +675,7 @@ def write_corpus(
     heldout_rows: list[dict] | None = None,
 ) -> Path:
     """Write the PNGs and the JSONL under `out_dir` (created if absent), in
-    SORTED file-name order (family J: the emission order is fixed, never the
+    SORTED file-name order (the emission order is fixed, never the
     dict's insertion order or the filesystem's), plus the held-out pair of
     files when `heldout_rows` is non-empty. Returns the train JSONL path."""
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""`gen_fixed_shape_image_corpus.py`'s own suite (issue #421 W2b): the SHAPE
-guarantee read back off the emitted PNG bytes, determinism (family J), the
+"""`gen_fixed_shape_image_corpus.py`'s own suite: the SHAPE
+guarantee read back off the emitted PNG bytes, determinism, the
 emitted JSONL schema pinned by a literal field-name check against
 `crates/jammi-bench/src/main.rs::MediaTripletRow`, the triplet separation
 asserted MECHANICALLY (intra-family pixel distance strictly below
@@ -284,8 +284,8 @@ class CliTests(unittest.TestCase):
 
 
 class PoolCacheTests(unittest.TestCase):
-    """`--pool-cache-dir` (esc-088 round-4 advisory: hermetic dry-run suite
-    runtime): opt-in, real runs never set it. Every assertion here drives
+    """`--pool-cache-dir` (keeps the hermetic dry-run suite's runtime
+    down): opt-in, real runs never set it. Every assertion here drives
     the REAL CLI (`gfi.main`), never `_build_pool`/`_load_or_build_pool`
     directly, so a cache-path bug in argument plumbing cannot hide behind
     a unit-level call that bypasses it."""
@@ -420,7 +420,7 @@ class PoolCacheTests(unittest.TestCase):
         self.assertEqual(gfi._pool_cache_key(*args), gfi._pool_cache_key(*args))
 
     def test_a_marker_recorded_for_a_different_shape_under_the_same_key_is_refused(self):
-        """Belt-and-braces at the point of use (round-5 audit B1(b)): a
+        """Belt-and-braces at the point of use: a
         `_DONE` marker's OWN recorded shape must agree, BY NAME, with the
         shape this call actually requested -- checked even though `key`
         already claims to identify the requested shape uniquely. Simulates
@@ -727,15 +727,15 @@ class RealSourceEditMovesTheKeyTests(unittest.TestCase):
 
     def test_editing_the_module_docstring_moves_the_key(self):
         key = self._key_after(
-            "SHAPE GUARANTEE (issue #421 PR B's pre-registered training-step profile):",
-            "SHAPE GUARANTEE EDITED (issue #421 PR B's pre-registered training-step profile):",
+            "SHAPE GUARANTEE (the pre-registered training-step profile):",
+            "SHAPE GUARANTEE EDITED (the pre-registered training-step profile):",
             "docstring",
         )
         self.assertNotEqual(self.baseline, key)
 
 
 class HeldOutSplitTests(unittest.TestCase):
-    """`--heldout-rows` (issue #421 P1-b(iv)): the held-out split's ROW
+    """`--heldout-rows`: the held-out split's ROW
     COUNT, its FAMILY-disjointness from the train split, its determinism,
     and every refusal the family pool / batch divisibility can produce.
 

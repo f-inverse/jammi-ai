@@ -5,10 +5,9 @@
 //! A raw `&[f32]` can carry two faults into a kernel: a non-finite component
 //! (which makes every distance it touches `NaN` — and a `NaN` distance is the
 //! merge's sort key and the user-visible similarity), and the wrong width
-//! (which reads past the stored vector or silently scores a prefix). Both
-//! were guarded per producer in earlier rounds, and each round found producers
-//! the previous list had missed. [`ValidatedQuery`] closes that class
-//! structurally: its only constructor is [`validate_query`], which checks
+//! (which reads past the stored vector or silently scores a prefix). A
+//! per-producer guard list always misses a producer. [`ValidatedQuery`]
+//! closes that class structurally: its only constructor is [`validate_query`], which checks
 //! finiteness and (when the width is known) the width, and every consumer
 //! takes `&ValidatedQuery`. A new producer that skips validation does not
 //! compile.
@@ -24,8 +23,8 @@
 //! artifact directly instead of borrowing a third `QuerySource` variant: a
 //! provenance enum that could also mean "the site an error was raised at"
 //! would model two different things in one type, forcing every reader of
-//! `QuerySource` to re-check which meaning applies (see the round this
-//! reshaped, `#482 DIST round 8`, for the rescue-by-panic that shape forced).
+//! `QuerySource` to re-check which meaning applies (and inviting a
+//! rescue-by-panic at the reader).
 //!
 //! **Whose fault a width mismatch is depends on WHERE it is discovered, not
 //! only on `QuerySource`.** A query is checked against the authority exactly
@@ -77,11 +76,10 @@
 //! `expected_width: None` anyway defers to whatever artifact the query
 //! happens to meet downstream — silently converting a caller's width
 //! mistake into a `require_width` artifact-fault. Nothing in the type
-//! system catches this today: `expected_width: Option<usize>` accepts
+//! system catches this: `expected_width: Option<usize>` accepts
 //! `None` from an entry with an authority in scope exactly as readily as
 //! from one with none, so this obligation is enforced by review, not by the
-//! compiler or this constructor — the same shape of gap that has cost this
-//! module multiple rounds. A full fix would give "authority checked" vs.
+//! compiler or this constructor. A full fix would give "authority checked" vs.
 //! "authority deferred" a distinct type threaded through every consumer
 //! (`ValidatedQuery` is accepted uniformly today by every kernel and search
 //! entry precisely so a new producer cannot skip validation, and the
@@ -144,8 +142,8 @@ pub enum QueryValidationError {
     /// no [`QuerySource`] at all: unlike `Width`/`NonFinite`, this is never
     /// about where the query came from, only about what it disagreed with,
     /// so there is no field a caller could misread as the query's own
-    /// provenance — the failure mode a fourth `QuerySource` variant used to
-    /// invite (`#482 DIST round 8`).
+    /// provenance — the failure mode an extra `QuerySource` variant would
+    /// invite.
     ArtifactMismatch {
         /// What disagreed with the query (an index, a segment, a scan) —
         /// never the query's own source table.

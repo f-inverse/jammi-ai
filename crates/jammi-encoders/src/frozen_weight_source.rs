@@ -1,4 +1,4 @@
-//! The candle-boundary seam a caller (jammi-ai's wave-3 GGUF loader) plugs
+//! The candle-boundary seam a caller (jammi-ai's GGUF loader) plugs
 //! into `Bert`/`DistilBert`/`ModernBert`'s construction to supply a
 //! GGUF-quantized weight in place of the default dense safetensors load —
 //! WITHOUT this crate doing any GGUF file I/O itself. `pub mod` (not
@@ -8,28 +8,24 @@
 //!
 //! # Why a seam here, and why it stops at this one type
 //!
-//! Issue #351's wave 3 (GGUF/k-quant inference in `jammi-ai`) needs a way
-//! to hand `Bert`/`DistilBert`/`ModernBert`'s construction a
-//! `jammi_lora::FrozenBase::Quantized(..)` for a given named tensor instead
-//! of the frozen safetensors `VarBuilder` load every EXISTING path uses.
+//! GGUF/k-quant inference in `jammi-ai` needs a way to hand `Bert`/`DistilBert`/`ModernBert`'s
+//! construction a `jammi_lora::FrozenBase::Quantized(..)` for a given named tensor instead
+//! of the default frozen safetensors `VarBuilder` load.
 //! This crate has no GGUF reader, no k-quant block format knowledge, and no
 //! opinion on WHERE a caller's weight map comes from — [`FrozenWeightLookup`]
 //! is the entire seam: one `Fn(&str) -> Result<Option<FrozenBase>,
 //! EncoderError>`, threaded as an OPTIONAL builder parameter through every
-//! construction site that currently loads a base `Linear`. Wave 3
-//! implements the closure over its own GGUF-loaded weight map and never
-//! needs to touch `jammi-lora` or this crate again — the entire "does this
-//! module have a quantized override" decision lives on the wave-3 side of
+//! construction site that loads a base `Linear`. The caller implements the
+//! closure over its own GGUF-loaded weight map — the entire "does this
+//! module have a quantized override" decision lives on the caller's side of
 //! the closure boundary.
 //!
-//! # Byte-identical when unset (K2 / additive-only)
+//! # Byte-identical when unset
 //!
-//! Every EXISTING construction path (every `*Builder::build` call in this
-//! workspace today) never calls the new `.weight_source(..)` builder
-//! method, so `weight_source` stays `None` at every site — the per-name
-//! lookup step becomes a single `match None { .. }` no-op, and the ORIGINAL
-//! `linear(in_features, out_features, module_vb)` call (or
-//! `linear_no_bias` for ModernBERT) runs exactly as it always has. Passing
+//! A builder that never calls `.weight_source(..)` keeps `weight_source`
+//! `None` at every site — the per-name lookup step is a single
+//! `match None { .. }` no-op, and the plain `linear(in_features, out_features, module_vb)` call (or
+//! `linear_no_bias` for ModernBERT) runs. Passing
 //! `Some(lookup)` where `lookup` always returns `Ok(None)` is likewise a
 //! byte-identical no-op — the seam's presence changes nothing about a
 //! caller that does not use it.
@@ -51,20 +47,19 @@ use crate::error::EncoderError;
 ///
 /// Returns:
 /// - `Ok(None)` — no override for this name; the caller falls back to the
-///   existing Dense-from-`VarBuilder` load, BYTE-IDENTICAL to every prior
-///   release (the ONLY behavior when no lookup is supplied at all, module
-///   doc, and the correct fallback when a lookup IS supplied but simply
+///   Dense-from-`VarBuilder` load (the ONLY behavior when no lookup is
+///   supplied at all, module doc, and the correct fallback when a lookup IS supplied but simply
 ///   does not cover this particular tensor — e.g. a partially-quantized
 ///   checkpoint).
 /// - `Ok(Some(base))` — use `base` (Dense or Quantized) directly, skipping
 ///   the `VarBuilder` load entirely.
 /// - `Err(e)` — the lookup itself failed (e.g. a malformed GGUF entry for a
-///   name the caller DOES recognize) — a typed, loud refusal (K2) rather
+///   name the caller DOES recognize) — a typed, loud refusal rather
 ///   than a silent fallback to Dense, which would hide a real load failure
 ///   behind a plausible-looking successful build.
 ///
 /// A plain `Fn` trait object, not a new named trait: every implementor is a
-/// closure over a wave-3-owned weight map, and a trait with exactly one
+/// closure over a caller-owned weight map, and a trait with exactly one
 /// method would add a vtable indirection with no benefit a `dyn Fn` does
 /// not already provide.
 pub type FrozenWeightLookup<'a> = dyn Fn(&str) -> Result<Option<FrozenBase>, EncoderError> + 'a;
@@ -77,8 +72,8 @@ pub type FrozenWeightLookup<'a> = dyn Fn(&str) -> Result<Option<FrozenBase>, Enc
 /// geometry disagrees (e.g. a `k_proj` GGUF spliced into a `v_proj` slot, or
 /// a checkpoint built for a different `hidden_size`/`intermediate_size`/
 /// `dim`) is accepted at construction and only fails once a mismatched
-/// matmul runs at first inference — a confident-wrong-shape load (family D),
-/// not a load-time refusal.
+/// matmul runs at first inference — a confident-wrong-shape load, not a
+/// load-time refusal.
 ///
 /// `site` is the tensor's fully-qualified dotted path (as returned by
 /// `VarBuilder::prefix()`), used verbatim in the error message so a caller
@@ -117,8 +112,8 @@ mod tests {
     use super::*;
 
     /// A lookup that always misses (`Ok(None)`) is a legal, well-typed
-    /// implementor — the shape every EXISTING call site's implicit `None`
-    /// seam is equivalent to (module doc's "byte-identical when unset").
+    /// implementor — equivalent to an unset (`None`) seam (module doc's "byte-identical when
+    /// unset").
     #[test]
     fn an_always_miss_lookup_type_checks_and_returns_none() {
         let lookup: &FrozenWeightLookup = &|_name: &str| Ok(None);

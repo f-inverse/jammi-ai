@@ -106,7 +106,7 @@ fn modernbert_loads_with_target_modules() {
     );
 }
 
-/// The gate test the C3 audit asked for: `ModernBert::set_training`'s
+/// The RoPE training gate, end to end: `ModernBert::set_training`'s
 /// threading of `training` down to `ModernBertAttention` (and from there
 /// to `RotaryEmbedding::apply_training`) is exercised through the REAL
 /// encoder's forward call graph, not just `RotaryEmbedding` in isolation.
@@ -174,9 +174,8 @@ fn set_training_threading_gates_the_fused_rope_dispatch_counters() {
     assert!(
         after_train.fused > before_train.fused,
         "training-mode forward with set_training(true) must dispatch the fused \
-         RoPE kernel at least once — this is the exact regression the C3 audit's \
-         'this is the only test that would catch deletion of the set_training \
-         threading' note names (before={before_train:?}, after={after_train:?})"
+         RoPE kernel at least once — a dropped set_training thread into \
+         ModernBertAttention fails here (before={before_train:?}, after={after_train:?})"
     );
 
     // Back to eval: the fused dispatch path must stop again.
@@ -337,20 +336,15 @@ fn set_training_threading_gates_the_fused_geglu_dispatch_counters() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// The padded training fwd+bwd numeric oracle (P6 Stage B B2, item 6)
+// The padded training fwd+bwd numeric oracle
 // ─────────────────────────────────────────────────────────────────────────
 //
-// Contract v4 §1 F1 / §5 B2: the only padded ModernBERT training fwd+bwd
-// test that existed before this commit
-// (`crates/jammi-ai/tests/it/encoder_adapters.rs`'s
-// `encoder_adapters_modernbert_writes_adapter_marker`) asserts nothing
-// numeric — it only checks the saved adapter config's JSON fields. That
-// file lives in `jammi-ai`, a crate this agent does not own (Shared
-// crate boundary — coordinate through the lead), so the numeric oracle
-// contract v4 asks for is added HERE instead, against the same
-// `ModernBert`/`jammi-lora` machinery `jammi-ai`'s fine-tune path
-// ultimately calls into. This is the RED oracle B3 is expected to run
-// again on the FA2 arm once it exists.
+// `crates/jammi-ai/tests/it/encoder_adapters.rs`'s
+// `encoder_adapters_modernbert_writes_adapter_marker` runs a padded
+// ModernBERT training fwd+bwd but asserts nothing numeric — it only checks
+// the saved adapter config's JSON fields. The numeric oracle lives HERE,
+// against the same `ModernBert`/`jammi-lora` machinery `jammi-ai`'s
+// fine-tune path calls into.
 
 fn head64_fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny_modernbert_head64")
@@ -386,8 +380,8 @@ fn lora_targets_wqkv_wo() -> LoraBuildConfig<'static> {
 
 /// Builds a fresh LoRA-targeted `ModernBert` on the `tiny_modernbert_head64`
 /// fixture (hidden 64, 1 head, `head_dim == 64` — the ONLY fixture in this
-/// crate that reaches `AttentionBlockFused`, contract v4 §1 F1's "block
-/// arm"), seeded identically every call so two builds compare bit-for-bit.
+/// crate that reaches `AttentionBlockFused`, the "block arm"), seeded identically every call so two
+/// builds compare bit-for-bit.
 fn head64_lora_model(varmap: &VarMap) -> ModernBert {
     let config = head64_config();
     let weights = head64_fixture_dir().join("model.safetensors");
@@ -408,8 +402,8 @@ fn head64_lora_model(varmap: &VarMap) -> ModernBert {
 /// every layer) and whose value/gradient a pad row can only affect if
 /// something in the forward pass leaks across rows or across the
 /// pad/real boundary (the exact class of bug this oracle exists to
-/// catch — none exists in today's architecture, but the FA2 unpad/repad
-/// path B3 adds is exactly where one COULD be introduced).
+/// catch — the FA2 unpad/repad path is exactly where one COULD be
+/// introduced).
 fn real_rows_loss(hidden: &Tensor, lengths: &[usize]) -> Tensor {
     let mut terms = Vec::new();
     for (b, &len) in lengths.iter().enumerate() {
@@ -425,9 +419,8 @@ fn real_rows_loss(hidden: &Tensor, lengths: &[usize]) -> Tensor {
         .expect("at least one non-empty row")
 }
 
-/// Relative-ULP multiplier for the fold-order tolerance below. Measured
-/// (a100c pod, `crates/jammi-kernels/src/admission.rs` gate at `86aa9da`):
-/// row1's worst per-element hidden-state ratio was **220.93** `f32::EPSILON`
+/// Relative-ULP multiplier for the fold-order tolerance below. Measured on
+/// an A100 host's CPU: row1's worst per-element hidden-state ratio was **220.93** `f32::EPSILON`
 /// units relative to `max(|padded|,|unpadded|)` (2 layers of LN/Wqkv-GEMM/
 /// attention/Wo-GEMM/GeGLU compound a batch-of-2-vs-batch-of-1 GEMM
 /// blocking difference well past a "couple of ULP" bound). `512` gives
@@ -447,20 +440,14 @@ const FOLD_ORDER_RTOL_ULP: f32 = 512.0;
 /// grad differs from the summed unpadded legs' own (near-zero) value by
 /// **1.91e-6** while every element of both unpadded legs' OWN tensor
 /// stays within `f32::EPSILON` of exactly zero. `64 * f32::EPSILON` ≈
-/// `7.63e-6` gives ~4x headroom over that measured residual — the SAME
-/// `64` this file's original grad tolerance used as its (insufficient
-/// alone) relative multiplier, reused here as the atol term so the two
-/// constants in this file share one convention instead of introducing an
-/// unrelated third number.
+/// `7.63e-6` gives ~4x headroom over that measured residual.
 const FOLD_ORDER_ATOL_ULP: f32 = 64.0;
 
 /// Standard `atol + rtol * scale` combined bound (the numpy/torch
 /// `allclose` form), in `f32::EPSILON` units on both terms — a pure
-/// relative bound (as this file originally used) is not sufficient when
-/// the REFERENCE value is itself near-exactly zero (see
+/// relative bound is not sufficient when the REFERENCE value is itself near-exactly zero (see
 /// `FOLD_ORDER_ATOL_ULP`'s doc); a pure absolute bound would hide real
-/// divergence at large-magnitude elements (the guide's §3.8 "no absolute
-/// ULP floor" clause) — the combined form avoids both failure modes.
+/// divergence at large-magnitude elements — the combined form avoids both failure modes.
 fn fold_order_bound(scale: f32) -> f32 {
     f32::EPSILON * (FOLD_ORDER_ATOL_ULP + FOLD_ORDER_RTOL_ULP * scale)
 }
@@ -528,24 +515,20 @@ fn assert_real_row_matches_and_scale(
 
 /// THE oracle: a batch with real padding (row 0 fully real, row 1 padded)
 /// vs the SAME two rows run UNPADDED one-by-one — f32 on CPU (the block
-/// arm — `AttentionBlockFused` admits on this fixture, contract v4 §1 F1).
+/// arm — `AttentionBlockFused` admits on this fixture).
 ///
-/// **Finding, not the deliverable's original assumption (widened on the
-/// a100c pod, `P6 B3-dense`, `crates/jammi-kernels/src/admission.rs`
-/// commit `86aa9da`'s gate run):** the LOSS is NOT bit-identical between
-/// the two legs on every host. The original assumption ("the forward pass
-/// is row-independent, so `hidden_padded[0, s, :]` for `s < 6` is
-/// literally the same computation as `hidden_row0[s, :]`") is true
+/// The LOSS is NOT bit-identical between the two legs on every host. "The
+/// forward pass is row-independent, so `hidden_padded[0, s, :]` for `s < 6` is
+/// literally the same computation as `hidden_row0[s, :]`" is true
 /// MATHEMATICALLY but not at the FLOAT level: candle's CPU `gemm` picks
 /// its blocking/accumulation order from the operand shape, and a
 /// batch-of-2 GEMM (`M=2` rows total) is not guaranteed to issue the SAME
 /// per-row reduction order as two independent batch-of-1 GEMMs (`M=1`
-/// each) — floating-point addition is non-associative (family J), so a
-/// different fold order over mathematically-identical terms is not
-/// guaranteed bit-identical. This box hits it (macOS's `gemm` blocking
-/// happened not to depend on `M` at this tiny shape; this pod's does);
-/// x86_64/Linux CPU BLAS microkernel selection differing by total-M is
-/// architecture-dependent, not a code defect.
+/// each) — floating-point addition is non-associative, so a different
+/// fold order over mathematically-identical terms is not guaranteed
+/// bit-identical. (macOS's `gemm` blocking does not depend on `M` at this
+/// tiny shape; an x86_64 Linux host's does.) x86_64/Linux CPU BLAS microkernel selection differing
+/// by total-M is architecture-dependent, not a code defect.
 ///
 /// Rather than fudge a single ad hoc constant on the near-zero (post-
 /// LayerNorm, heavily cancelled) final scalar loss, the SAME per-element
@@ -687,14 +670,13 @@ fn padded_training_loss_and_lora_grads_match_unpadded_rows_run_individually_f32_
         for i in 0..g_padded.len() {
             let summed = g_row0[i] + g_row1[i];
             let diff = (g_padded[i] - summed).abs();
-            // NOT exact bit-identity, measured (a finding, not the
-            // deliverable's original assumption): `dL/dW` for a shared
+            // NOT exact bit-identity, measured: `dL/dW` for a shared
             // weight sums each row's contribution, and the PADDED run
             // performs that sum in ONE batched reduction over
             // `batch * seq` rows (row-major order, including the
             // exactly-zero-gradient pad rows) while this comparison sums
             // TWO INDEPENDENTLY-COMPUTED (batch=1) reductions externally in
-            // f32 — floating-point addition is non-associative (family J),
+            // f32 — floating-point addition is non-associative,
             // so a DIFFERENT fold order over the mathematically-identical
             // set of terms is not guaranteed bit-identical. `B` is
             // zero-initialized, so `dL/dA = Bᵀ·upstream = 0` exactly for
@@ -719,7 +701,7 @@ fn padded_training_loss_and_lora_grads_match_unpadded_rows_run_individually_f32_
     }
 }
 
-/// The RED control this oracle exists to catch: if a pad row's garbage
+/// The negative control this oracle exists to catch: if a pad row's garbage
 /// values leaked into the loss (e.g. `real_rows_loss` itself summed the
 /// WHOLE row instead of narrowing to `len`), the padded run's loss would
 /// differ from the sum of the two unpadded runs' — this test asserts that

@@ -29,8 +29,7 @@ impl MaybeLoraLinear {
     /// The `Frozen` arm delegates to [`FrozenBase::forward`] — a dense base
     /// casts the input to the weight's dtype so the underlying matmul sees
     /// matching precisions (this matters when a BF16 backbone is driven by an
-    /// F32 input; behavior PRESERVED byte-for-byte from every prior release,
-    /// see that method's own doc), and a quantized base runs the uniform F32
+    /// F32 input; see that method's own doc), and a quantized base runs the uniform F32
     /// activation rule (see [`crate::QuantizedLinear`]'s own doc).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, LoraError> {
         match self {
@@ -174,7 +173,7 @@ impl MaybeLoraLinear {
 }
 
 /// [`MaybeLoraLinear::takes_lora_linear_admission`]: the Dense-vs-Quantized
-/// split that predicate exists to expose (see #467 F3 — a QLoRA backbone's
+/// split that predicate exists to expose (a QLoRA backbone's
 /// `FusibleSiteCensus::lora_sites_wrapped` must not count a quantized-base
 /// adapted site).
 #[cfg(test)]
@@ -249,7 +248,7 @@ mod tests {
         );
     }
 
-    /// The domain-validity edge #467 F3 closes: a `Lora` site over a
+    /// The domain-validity edge: a `Lora` site over a
     /// `Quantized` base is still adapted (`is_lora` stays `true`, this is a
     /// non-vacuous control) but `LoraLinear::forward` composes it
     /// unconditionally and never reaches `admit()` — so it must NOT be

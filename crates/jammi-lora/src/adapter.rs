@@ -74,17 +74,16 @@ pub struct AdapterConfig {
     #[serde(default)]
     pub backbone_dtype: ComputePrecision,
     /// Which tower of a multi-tower checkpoint this adapter installs on —
-    /// see [`Tower`]. `None` for a single-tower family, and `None` for every
-    /// adapter written before this field existed: `#[serde(default)]` means
-    /// a legacy `adapter_config.json` with no `tower` key deserialises
-    /// unchanged (asserted by
+    /// see [`Tower`]. `None` for a single-tower family, and `None` for an
+    /// adapter written without it: `#[serde(default)]` means an
+    /// `adapter_config.json` with no `tower` key deserialises unchanged (asserted by
     /// `tests::legacy_adapter_json_without_tower_round_trips`).
     ///
     /// `skip_serializing_if = "Option::is_none"` omits the key entirely for
-    /// a single-tower family: without it, every already-shipped BERT-family
-    /// `adapter_config.json` would gain a `"tower":null` key it never had,
-    /// changing the persisted adapter bytes (folded into the content digest,
-    /// see K7) for no semantic reason. A dual/triple-tower adapter still
+    /// a single-tower family: without it, every BERT-family
+    /// `adapter_config.json` would carry a `"tower":null` key, changing the
+    /// persisted adapter bytes (folded into the content digest, see the
+    /// serialisation tests below) for no semantic reason. A dual/triple-tower adapter still
     /// emits `"tower":"text"` / `"vision"` / `"audio"` because the value is
     /// `Some`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,13 +131,12 @@ impl AdapterConfig {
 mod tests {
     use super::*;
 
-    /// Domain edge (family D) for the ONE field this commit adds: an
-    /// `adapter_config.json` written before `tower` existed has no such key,
-    /// and must still deserialise — `#[serde(default)]` makes the absent key
-    /// mean `None` ("single-tower family / unspecified"), not a parse error
-    /// that would strand every already-shipped adapter. The round trip back
-    /// out is asserted too, so a `None` tower is not silently re-materialised
-    /// as some default variant.
+    /// Domain edge for the optional `tower` field: an `adapter_config.json`
+    /// without a `tower` key must still deserialise — `#[serde(default)]`
+    /// makes the absent key mean `None` ("single-tower family / unspecified"),
+    /// not a parse error that would strand every adapter written without it.
+    /// The round trip back out is asserted too, so a `None` tower is not
+    /// silently re-materialised as some default variant.
     #[test]
     fn legacy_adapter_json_without_tower_round_trips() {
         let legacy = r#"{
@@ -211,8 +209,8 @@ mod tests {
         }
     }
 
-    /// K7 (a): a single-tower family's `from_build(..)` output serialises
-    /// WITHOUT a `tower` key at all — byte-equal to the pre-unit JSON shape,
+    /// (a): a single-tower family's `from_build(..)` output serialises
+    /// WITHOUT a `tower` key at all — byte-equal to the tower-less JSON shape,
     /// constructed here explicitly rather than by re-deriving it from the
     /// struct (which would not catch a regression back to emitting the key).
     #[test]
@@ -244,7 +242,7 @@ mod tests {
         );
     }
 
-    /// K7 (b): `with_tower(Tower::Vision)` serialises `"tower":"vision"` —
+    /// (b): `with_tower(Tower::Vision)` serialises `"tower":"vision"` —
     /// the `Some` branch is unaffected by `skip_serializing_if`.
     #[test]
     fn with_tower_vision_serialises_the_tower_key() {
@@ -259,7 +257,7 @@ mod tests {
         );
     }
 
-    /// K7 (c): both shapes round-trip through `AdapterConfig` deserialize —
+    /// (c): both shapes round-trip through `AdapterConfig` deserialize —
     /// the key-absent (single-tower) and key-present (`Some`) forms.
     #[test]
     fn tower_key_absent_and_present_both_round_trip() {

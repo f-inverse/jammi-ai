@@ -7,7 +7,7 @@
 //!   trainable `Var` the tower reports gets a `Some`, finite, non-zero
 //!   gradient from one forward+backward, and the site COUNT is the one the
 //!   config predicts. This is a mechanism assertion, not a loss-decrease
-//!   one (esc-037): a loss that happens to go down proves nothing about
+//!   one: a loss that happens to go down proves nothing about
 //!   which parameters were reachable.
 //! * **A2 eval bit-identity** — `builder().lora(frozen())` equals `load()`
 //!   bit-for-bit, and a `ZerosB` adapter installed on every site equals the
@@ -366,7 +366,7 @@ fn a1_htsat_every_lora_param_is_reachable_at_f32() {
 
 /// A5. F16, on CPU. BF16 is deliberately absent: candle-core 0.11's CPU
 /// matmul supports only F16/F32/F64, so a CPU bf16 forward cannot run at
-/// all — the bf16 claim this unit makes is about MASK CONSTRUCTION only
+/// all — the bf16 claim is about MASK CONSTRUCTION only
 /// (`clip_text`'s own `causal_mask_at_bf16_uses_the_bf16_minimum` unit
 /// test), never about a CPU forward.
 #[test]
@@ -396,10 +396,10 @@ fn a5_htsat_every_lora_param_is_reachable_at_f16() {
 ///
 /// Both halves are load-bearing:
 ///
-/// * that the F32 batch is accepted AT ALL is the fix (before the edge cast,
-///   vision raised `dtype mismatch in conv2d` and audio `dtype mismatch in
-///   sub`, so every production front end was locked out of a reduced-
-///   precision backbone);
+/// * that the F32 batch is accepted AT ALL is the edge cast's job (without
+///   it, vision raises `dtype mismatch in conv2d` and audio `dtype mismatch
+///   in sub`, locking every production front end out of a reduced-precision
+///   backbone);
 /// * that it is accepted with the SAME BITS is what makes the edge a cast
 ///   and not a second numeric path — a tower that, say, ran the front end in
 ///   F32 and only narrowed later would pass an "it runs" test and silently
@@ -987,7 +987,7 @@ where
 ///
 /// The `Var` is chosen by SORTED key, not by `HashMap` iteration order: a
 /// `VarMap`'s map has no stable order, and a run-to-run-varying choice would
-/// make the round-trip oracle non-reproducible (family J). `Var::set` writes
+/// make the round-trip oracle non-reproducible. `Var::set` writes
 /// the storage in place, so the tower's own `lora_a`/`lora_b` tensors — which
 /// share that storage — see the new values without rebuilding anything.
 fn perturb_one_var(varmap: &VarMap) -> String {

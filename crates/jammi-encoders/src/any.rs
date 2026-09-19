@@ -471,9 +471,9 @@ impl AnyEncoder {
     /// The DTYPE is derived too, via [`Self::dtype`], so the probe reaches
     /// the backbone with no conversion in the way — a probe is about which
     /// code path runs, and a cast the production path would not perform is
-    /// one more thing between the caller and that path. (It is no longer
+    /// one more thing between the caller and that path. (It is not
     /// REQUIRED: [`Self::forward_input`] accepts an F32 media batch on any
-    /// backbone dtype. Derived is still the honest default.) The text batch
+    /// backbone dtype. Derived is the honest default.) The text batch
     /// is integer (`U32` ids and mask) and carries no floating dtype at
     /// all.
     pub fn probe_input(&self, device: &Device) -> Result<OwnedEncoderInput, EncoderError> {
@@ -799,7 +799,7 @@ mod tests {
     /// sees a partial, V-slice-only gradient — a materially different
     /// fixture from what `AnyEncoder::forward` actually runs).
     ///
-    /// RED-verified: reverting `Self::ClipText(e) => e.set_training(training)`
+    /// Reverting `Self::ClipText(e) => e.set_training(training)`
     /// to `Self::ClipText(_) => {}` flips the training=true half of this
     /// test (`in_proj_weight` comes back with NO gradient entry at all,
     /// same as the eval half, since the tower never actually leaves eval
@@ -1032,7 +1032,7 @@ mod tests {
         assert_eq!(out.dims(), &[1, cfg.embed_dim]);
     }
 
-    /// #421 P1-a3, the purity control for [`AnyEncoder::fusible_site_census`]:
+    /// The purity control for [`AnyEncoder::fusible_site_census`]:
     /// READING the census is a structural walk and nothing else — it runs no
     /// forward, takes no admission decision, and moves no dispatch counter.
     ///

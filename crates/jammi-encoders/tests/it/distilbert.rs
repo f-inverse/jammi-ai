@@ -34,7 +34,7 @@ pub(crate) fn tiny_config() -> jammi_encoders::distilbert::DistilBertConfig {
 }
 
 /// `head_dim == 64` (`dim / n_heads == 64`) — the ONE shape
-/// `attention_block_admission_predicate` admits (issue #462): `dim=64,
+/// `attention_block_admission_predicate` admits: `dim=64,
 /// n_heads=1, hidden_dim=256`, next to [`tiny_config`] (`head_dim = 32/2 =
 /// 16`, which the predicate always refuses, a counted eager fallback).
 fn head64_config() -> jammi_encoders::distilbert::DistilBertConfig {
@@ -230,8 +230,8 @@ fn build_distilbert_with_lora_on_biased_sites(
     // minimal safetensors archive... containing every key the builder
     // requires") — DistilBERT's `q_lin`/`v_lin` sites carry a bias here
     // exactly like BERT's `query`/`value` (see `bert.rs`'s
-    // `build_bert_with_lora_on_biased_sites`'s identical note): #428
-    // P2b's fused-with-bias pack applies here directly.
+    // `build_bert_with_lora_on_biased_sites`'s identical note): the
+    // fused-with-bias pack applies here directly.
     let targets: Vec<String> = vec!["q_lin".into(), "v_lin".into()];
     let no_layers: Option<Vec<usize>> = None;
     let empty_pattern: HashMap<String, usize> = HashMap::new();
@@ -256,7 +256,7 @@ fn build_distilbert_with_lora_on_biased_sites(
         .expect("build LoRA-targeted DistilBert on the synthetic biased fixture")
 }
 
-/// #428 P2b: mirrors `bert.rs`'s
+/// Mirrors `bert.rs`'s
 /// `bert_lora_bias_site_counter_threading_gates_the_fused_lora_linear_dispatch_counters`
 /// for DistilBERT's biased `q_lin`/`v_lin` sites — same
 /// process-wide dispatch-counter lock
@@ -493,7 +493,7 @@ fn hand_composed_reference_forward(
     hidden
 }
 
-/// K4 pin (#428 P2b), mirrors `bert.rs`'s
+/// Mirrors `bert.rs`'s
 /// `bert_lora_bias_site_eval_matches_a_hand_composed_eager_reference_at_nonzero_ab` —
 /// see that test's own doc for why `LoraInitMode::Gaussian` (non-zero `A`
 /// AND `B`) rather than the tautological `ZerosB` is required for this
@@ -556,11 +556,10 @@ fn distilbert_lora_bias_site_eval_matches_a_hand_composed_eager_reference_at_non
     let raw = candle_core::safetensors::load(&weights_path, &device)
         .expect("load the synthetic fixture's raw weights for the hand-composed reference");
     // Non-vacuity, checked at runtime rather than assumed from
-    // `write_synthetic_weights`'s own `randn_1d` call (round-2 fix: see
-    // `bert.rs`'s sibling test's doc for why this crate does not trust a
-    // fixture's bias to be non-zero without checking — `tiny_bert`'s OWN
-    // real bias values are all exactly zero, which would have made an
-    // analogous check there vacuously pass).
+    // `write_synthetic_weights`'s own `randn_1d` call (see `bert.rs`'s
+    // sibling test for why a fixture's bias is never trusted to be
+    // non-zero without checking — `tiny_bert`'s OWN real bias values are
+    // all exactly zero).
     for n in 0..config.num_hidden_layers {
         for site in ["q_lin", "v_lin"] {
             let key = format!("distilbert.transformer.layer.{n}.attention.{site}.bias");
@@ -598,11 +597,10 @@ fn distilbert_lora_bias_site_eval_matches_a_hand_composed_eager_reference_at_non
     );
 }
 
-/// #460 (C-LN): DistilBERT's twin of
+/// DistilBERT's twin of
 /// `bert::bert_biased_layer_norm_counter_threading_gates_the_ln_dispatch_counters`
-/// — before this unit, every DistilBERT LayerNorm (also all biased) fell
-/// through `slow()` with no `admit()` call at all, so its own `ln`
-/// dispatch-counter pair read `0/0` on a real training run too.
+/// — every DistilBERT LayerNorm is also biased, and its training dispatch
+/// must be counted on the `ln` pair too.
 #[test]
 fn distilbert_biased_layer_norm_counter_threading_gates_the_ln_dispatch_counters() {
     let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
@@ -665,7 +663,7 @@ fn distilbert_biased_layer_norm_counter_threading_gates_the_ln_dispatch_counters
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Attention cascade + GELU seam (issue #462/#463)
+// Attention cascade + GELU seam
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn build_frozen_distilbert_head64(device: &Device) -> DistilBert {
@@ -783,7 +781,7 @@ fn distilbert_head16_training_attention_block_counted_eager() {
     );
 }
 
-/// K4 eval pin, same shape as `bert.rs`'s
+/// Eval pin, same shape as `bert.rs`'s
 /// `bert_head64_eval_output_is_bit_identical_regardless_of_fused_eligibility`
 /// — DistilBERT's synthetic weights are randomised per `write_synthetic_weights`
 /// call, so both legs below load from the SAME saved safetensors file

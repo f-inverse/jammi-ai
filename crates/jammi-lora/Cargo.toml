@@ -65,16 +65,16 @@ cuda = ["jammi-kernels/cuda"]
 # see `jammi_kernels::admission::device_is_supported`'s own doc — so a
 # Metal training forward always takes the eager-fallback arm, which is what
 # dispatches `jammi_kernels::ops::DropoutFused` through its Metal
-# host-fallback `metal_fwd`, issue #433). This feature exists purely so
+# host-fallback `metal_fwd`). This feature exists purely so
 # `tests/metal_dropout_position.rs` has an explicit, named,
 # `required-features` gate to build against, mirroring
 # `jammi-kernels`'s own `metal`/`metal_parity` pattern. Not default; never
 # required by a plain `cargo build`.
 metal = ["jammi-kernels/metal"]
 
-# Real-hardware Metal dropout-position/resume oracle (esc-070 conjunct 5):
+# Real-hardware Metal dropout-position/resume oracle:
 # `tests/fused_epilogue.rs`'s dropout-position/resume oracles hardcode
-# `Device::Cpu`, so nothing in this crate ever proved
+# `Device::Cpu`; this target proves
 # `dropout_position`/`restore_dropout_position` on a real Metal device.
 # `required-features` means this test target is not even built by a plain
 # `cargo test -p jammi-lora`; it exists (and can compile) only when the

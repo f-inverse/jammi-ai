@@ -3054,33 +3054,6 @@ mod tests {
         );
     }
 
-    /// The arch/dtype/head_dim gates after `flash_arch_ok`'s call site, on an
-    /// actual, arch-validated CUDA device: `F16` must clear the dtype gate
-    /// exactly like `BF16` does, and a dtype genuinely outside the compiled
-    /// set (`F32`) must still miss it, under the reason key
-    /// `dtype_is_bf16_or_f16`.
-    #[test]
-    #[cfg(feature = "live-gpu-tests")]
-    fn flash_capability_gates_admits_f16_alongside_bf16_on_real_cuda_arch_and_head_dim() {
-        let device = jammi_test_resources::cuda_device(0);
-        assert_flash_arch(&device);
-        for dtype in [DType::BF16, DType::F16] {
-            let miss = flash_capability_gates(true, &device, dtype, FLASH_HEAD_DIM);
-            assert_eq!(
-                miss, None,
-                "{dtype:?} must clear every capability/domain gate on a real, arch-validated \
-                 CUDA device -- got a miss: {miss:?}"
-            );
-        }
-        let miss = flash_capability_gates(true, &device, DType::F32, FLASH_HEAD_DIM);
-        assert_eq!(
-            miss,
-            Some((PredicateOutcome::DomainMiss, "dtype_is_bf16_or_f16", None)),
-            "a dtype outside the compiled {{BF16, F16}} set must still miss, under the \
-             dtype_is_bf16_or_f16 reason key"
-        );
-    }
-
     /// Path P: trusted host-side lengths that genuinely agree with `mask`'s
     /// real padding structure reach `Holds` with the right `CompactedBatch`
     /// inputs — and pay exactly ONE `flash_d2h_syncs`
@@ -3758,100 +3731,6 @@ mod tests {
         );
     }
 
-    /// THE end-to-end proof for the dense flash arm: on the SAME
-    /// `tests/fixtures/tiny_modernbert_head64` checkpoint, a DENSE
-    /// (all-ones, no padding) mask, CUDA, bf16 — `attention_block_flash`
-    /// actually dispatches `Fused` (count == `num_hidden_layers`), the
-    /// BLOCK arm's own counter does NOT move for those layers (flash took
-    /// over, not a second arm racing it), `attention_block_flash.declined
-    /// == 0`, and the output is finite. On a build WITHOUT the
-    /// `flash-attn` feature (`cuda` alone), `FLASH_COMPILED` is `false`,
-    /// so the SAME assertions invert: the cascade declines and the block
-    /// arm fires instead — this test is meaningful (and green) under
-    /// EITHER feature combination, not just the real one.
-    #[test]
-    #[cfg(feature = "live-gpu-tests")]
-    fn forward_hidden_dispatches_attention_block_flash_fused_on_a_dense_cuda_bf16_checkpoint() {
-        let device = jammi_test_resources::cuda_device(0);
-        let _lock = crate::test_support::seam_counter_lock();
-        let _d2h_guard = FLASH_D2H_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/tiny_modernbert_head64");
-        let config: ModernBertConfig =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
-                .unwrap();
-        let weights = dir.join("model.safetensors");
-        let varmap = candle_nn::VarMap::new();
-        let mut model = ModernBert::builder()
-            .backbone_dtype(DType::BF16)
-            .build(&[weights.as_path()], &config, &device, &varmap)
-            .unwrap();
-        // Dense: every row real, no padding -- `decide_flash_admission`'s
-        // dense split (`build_flash_forward_decision`) keeps the real
-        // `Holds`.
-        let input_ids =
-            Tensor::new(&[[2u32, 5, 10, 3, 7, 9], [4u32, 8, 1, 6, 9, 2]], &device).unwrap();
-        let mask = Tensor::new(&[[1u32, 1, 1, 1, 1, 1], [1u32, 1, 1, 1, 1, 1]], &device).unwrap();
-
-        model.set_training(true);
-        let block_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        let flash_before = cascade_counters_for("attention_block_flash").snapshot();
-        let out = model.forward_hidden(&input_ids, &mask).unwrap();
-        let block_after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-        let flash_after = cascade_counters_for("attention_block_flash").snapshot();
-
-        let out_f32: Vec<f32> = out
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        assert!(
-            out_f32.iter().all(|x| x.is_finite()),
-            "training output must be finite"
-        );
-
-        if jammi_kernels::admission::FLASH_COMPILED {
-            assert_eq!(
-                flash_after.fused - flash_before.fused,
-                config.num_hidden_layers as u64,
-                "attention_block_flash must dispatch Fused on every layer of a dense bf16 \
-                 batch on this build: {flash_before:?} -> {flash_after:?}"
-            );
-            assert_eq!(
-                flash_after.declined, flash_before.declined,
-                "a dense batch must never decline on this build"
-            );
-            assert_eq!(
-                flash_after.eager, flash_before.eager,
-                "always 0 -- see CascadeDispatchCounters's doc"
-            );
-            assert_eq!(
-                block_after.fused, block_before.fused,
-                "the block arm must NOT ALSO fire for layers the flash arm already handled"
-            );
-        } else {
-            assert_eq!(
-                flash_after.declined - flash_before.declined,
-                config.num_hidden_layers as u64,
-                "without the flash-attn feature, FLASH_COMPILED is false and every layer \
-                 declines at the cheap capability gate"
-            );
-            assert_eq!(
-                flash_after.fused, flash_before.fused,
-                "attention_block_flash cannot dispatch Fused without the flash-attn feature"
-            );
-            assert_eq!(
-                block_after.fused - block_before.fused,
-                config.num_hidden_layers as u64,
-                "the block arm must fire for every layer instead"
-            );
-        }
-    }
-
     /// Builds a `FlashDecision::Fused` for a literal `(lengths, seq)`,
     /// exactly what `build_flash_forward_decision` produces for a REAL
     /// `Holds` predicate — the seam CPU-hermetic tests use to drive a
@@ -4316,690 +4195,6 @@ mod tests {
         );
     }
 
-    /// Bound for [`flash_arm_padded_matches_block_arm_on_real_rows_cuda`],
-    /// derived from a real 8-seed GPU measurement of THIS oracle's exact
-    /// (window-binding, seed-swept) form.
-    ///
-    /// **The fixture must bind the window.** A fixture whose longest
-    /// segment (`seq=64`) sits BELOW the window-binding threshold
-    /// [`flash_arm_padded_red_control_window_radius_off_by_one_cuda`]'s own
-    /// "CHECKED PREMISE" doc derives (`L >= half_window + 2 = 66`) has
-    /// `max|q-k| = 63 <= half_window = 64`, so the sliding-window band is
-    /// ALL-ZEROS and every LOCAL layer degenerates to full (unwindowed)
-    /// attention, never exercising the real windowed kernel path this
-    /// oracle exists to parity-check. The oracle (below) runs a
-    /// window-BINDING fixture (`seq=160`, at least one segment `>= 66`),
-    /// with the SAME checked-premise assert the RED controls carry.
-    ///
-    /// **Not the same metric as [`FLASH_ORACLE_K_MEAN_POOLED`].
-    /// [`FLASH_ORACLE_K_MEAN_POOLED`] bounds a RATIO,
-    /// `err(other,f32) / err(block,f32)` -- its OWN noise-free value is
-    /// `1.0` (both arms bit-identical to the f32 reference). THIS constant
-    /// bounds a BARE [`relative_l1_error`], `relative_l1_error(flash_real,
-    /// block_real)` directly -- its noise-free value is `0.0` (flash and
-    /// block bit-identical on real rows). A multiplicative factor
-    /// calibrated against a metric whose floor is `1.0` has no principled
-    /// meaning applied to a metric whose floor is `0.0` -- these are two
-    /// DIFFERENT quantities that happen to both be called "a ratio bound"
-    /// in prose, not "the same thing at a different scale" (`CLAUDE.md`'s
-    /// own test for when one definition should serve two call sites). The
-    /// oracle (below) sweeps [`FLASH_ORACLE_SWEEP_SEEDS`] (8 fixed seeds --
-    /// "a single seed's draw is not a distribution", the SAME discipline
-    /// every dense-arm sweep uses), printing every per-seed ratio
-    /// under `--nocapture` and asserting the MEAN (matching
-    /// [`FLASH_ORACLE_K_MEAN_POOLED`]'s own "mean, never per-seed max"
-    /// convention -- see that constant's own doc for why a max bound was
-    /// deleted as seed-unstable).
-    ///
-    /// DERIVATION: measured by
-    /// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-28-m1b-padded-oracle-8seed-6ef586a-a100-pcie.json`
-    /// (A100 80GB PCIe, driver 570.211.01), on THIS oracle's exact
-    /// window-binding/8-seed form:
-    /// per-seed `relative_l1_error(flash_real, block_real)` = `[0.127088,
-    /// 0.104041, 0.153638, 0.148977, 0.119046, 0.109690, 0.111090,
-    /// 0.288572]` (seeds `201..208` respectively) -- mean `0.145268`, max
-    /// `0.288572` (seed `208`; the OTHER 7 seeds alone average `0.124796`,
-    /// so `208` is a genuine single-seed outlier -- `~1.99`x the 8-seed
-    /// mean -- not the distribution's centre). The asserted quantity is
-    /// the MEAN (never the max, matching the convention above); noise-free
-    /// is `0.0`.
-    /// A bound of `0.34` would give only `0.34 / 0.145268` ≈
-    /// `2.34`x margin over the measured MEAN and `0.34 / 0.288572` ≈
-    /// `1.18`x margin over the single WORST observed seed -- NOT enough:
-    /// seed `208` alone shows one unlucky/box-specific seed can land
-    /// nearly `2`x the mean on THIS SAME box; `1.18`x margin over that one
-    /// data point leaves almost no room for a future run where a
-    /// DIFFERENT seed lands there instead, or where box/driver variation
-    /// (a different A100 SKU, a different driver build) shifts the WHOLE
-    /// distribution up rather than just one seed. `0.5` gives
-    /// `0.5 / 0.145268` ≈ `3.44`x margin over the measured mean (comparable
-    /// to this file's own most generous same-shape precedent,
-    /// [`FLASH_ORACLE_K_MEAN_GRAD`]'s `~3.1`x mean margin) and
-    /// `0.5 / 0.288572` ≈ `1.73`x margin over the single worst OBSERVED
-    /// seed -- i.e. even a future run whose MEAN matched today's single
-    /// worst-case per-seed draw would still clear this bound with real
-    /// room to spare, covering BOTH seed-to-seed variance (the observed
-    /// spread) and box/driver variation (unmeasured here, but a same-class
-    /// unknown this margin is sized to absorb) -- never re-fitted to
-    /// exactly the measured mean or max.
-    #[cfg(all(feature = "live-gpu-tests", feature = "flash-attn"))]
-    const FLASH_ORACLE_PADDED_BOUND: f64 = 0.5;
-
-    /// One seed's real-row `relative_l1_error(flash, block)` measurement
-    /// for [`flash_arm_padded_matches_block_arm_on_real_rows_cuda`] --
-    /// factored out so the test itself sweeps [`FLASH_ORACLE_SWEEP_SEEDS`]
-    /// rather than measuring one seed.
-    /// `lengths` is the SAME window-BINDING fixture at every seed (only
-    /// `ids`/the model's LoRA init vary by seed, [`flash_oracle_synthetic_ids`]'s
-    /// own convention) -- also re-checks the dispatch-proof counters
-    /// (`fused == num_hidden_layers, declined == 0`) and the
-    /// pad-rows-exact-zero premise PER SEED, not just once, since a
-    /// per-seed fresh model/forward is a genuinely independent run.
-    #[cfg(all(feature = "live-gpu-tests", feature = "flash-attn"))]
-    fn flash_padded_real_row_ratio_at_seed(
-        config: &ModernBertConfig,
-        weights: &std::path::Path,
-        cuda: &Device,
-        batch: usize,
-        seq: usize,
-        lengths: &[usize],
-        seed: u64,
-    ) -> f64 {
-        let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, cuda);
-        let mut mask_data = vec![0u32; batch * seq];
-        for (b, &len) in lengths.iter().enumerate() {
-            for s in 0..len {
-                mask_data[b * seq + s] = 1;
-            }
-        }
-        let mask = Tensor::from_vec(mask_data, (batch, seq), cuda).unwrap();
-
-        let model = flash_oracle_build_model(config, weights, DType::BF16, seed, cuda, true);
-
-        let flash_before = cascade_counters_for("attention_block_flash").snapshot();
-        let flash_out = model.forward_hidden(&ids, &mask).unwrap();
-        let flash_after = cascade_counters_for("attention_block_flash").snapshot();
-        assert_eq!(
-            flash_after.fused - flash_before.fused,
-            config.num_hidden_layers as u64,
-            "seed={seed}: every layer must dispatch Fused on a genuinely padded, eligible \
-             batch -- {flash_before:?} -> {flash_after:?}"
-        );
-        assert_eq!(
-            flash_after.declined, flash_before.declined,
-            "seed={seed}: an eligible padded batch must never decline -- padded batches fuse, \
-             they are not downgraded"
-        );
-
-        let block_out = forward_hidden_forcing_flash(&model, &ids, &mask, true).unwrap();
-
-        let flash_v: Vec<f32> = flash_out
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        let block_v: Vec<f32> = block_out
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        let hidden = config.hidden_size;
-
-        let mut flash_real = Vec::new();
-        let mut block_real = Vec::new();
-        for (b, &len) in lengths.iter().enumerate() {
-            for s in 0..len {
-                let flat = (b * seq + s) * hidden;
-                flash_real.extend_from_slice(&flash_v[flat..flat + hidden]);
-                block_real.extend_from_slice(&block_v[flat..flat + hidden]);
-            }
-            for s in len..seq {
-                let flat = (b * seq + s) * hidden;
-                assert!(
-                    flash_v[flat..flat + hidden].iter().all(|&x| x == 0.0),
-                    "seed={seed}: pad row (b={b}, s={s}) of the flash arm's OWN output must be \
-                     EXACTLY zero post-scatter (the bias-free final_norm checked premise)"
-                );
-            }
-        }
-        let ratio = relative_l1_error(&flash_real, &block_real);
-        eprintln!(
-            "flash_arm_padded_matches_block_arm_on_real_rows_cuda[seed={seed}]: real-row \
-             ratio={ratio:.5e}"
-        );
-        ratio
-    }
-
-    /// The padded CUDA parity oracle: compares
-    /// `attention_block_flash`'s PADDED/ragged arm against the pre-existing,
-    /// extensively-validated block arm, on REAL rows only — never on pad
-    /// rows, which the two arms do not even both produce the same way (the
-    /// block arm computes real numbers there too since it runs on the full
-    /// padded grid; the flash arm's own output is the `Tensor::zeros`
-    /// `repad_rows` destination). Sweeps [`FLASH_ORACLE_SWEEP_SEEDS`] via
-    /// [`flash_padded_real_row_ratio_at_seed`] on a window-BINDING fixture,
-    /// asserting the MEAN [`relative_l1_error`] against
-    /// [`FLASH_ORACLE_PADDED_BOUND`] (see that constant's own doc for its
-    /// derivation status).
-    #[test]
-    #[cfg(feature = "live-flash-oracle-tests")]
-    fn flash_arm_padded_matches_block_arm_on_real_rows_cuda() {
-        let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
-        let cuda = jammi_test_resources::cuda_device(0);
-        let _lock = crate::test_support::seam_counter_lock();
-        let _d2h_guard = FLASH_D2H_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert_flash_arch(&cuda);
-
-        let dir = std::path::PathBuf::from(&model_dir);
-        let config: ModernBertConfig =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
-                .unwrap();
-        let weights = dir.join("model.safetensors");
-        // Window-BINDING fixture: 160/96 clear the `half_window + 2`
-        // visibility threshold (see the sibling RED controls' own "CHECKED
-        // PREMISE" doc for the derivation); 40/6 stay below it, pinning
-        // the no-truncation regime too. INCLUDES one full-length row
-        // (proving this is genuinely padded, not degenerate dense).
-        let (batch, seq) = (4usize, 160usize);
-        let lengths = [seq, 96, 40, 6];
-        assert_eq!(lengths.len(), batch);
-        let half_window = config.half_window();
-        assert!(
-            lengths.iter().any(|&len| len >= half_window + 2),
-            "checked premise: at least one segment length must reach half_window ({half_window}) \
-             + 2 for the sliding-window band to be anything but all-zeros -- see \
-             FLASH_ORACLE_PADDED_BOUND's own doc"
-        );
-
-        let ratios: Vec<f64> = FLASH_ORACLE_SWEEP_SEEDS
-            .iter()
-            .map(|&seed| {
-                flash_padded_real_row_ratio_at_seed(
-                    &config, &weights, &cuda, batch, seq, &lengths, seed,
-                )
-            })
-            .collect();
-        let (mean, max) = mean_max(&ratios);
-        eprintln!(
-            "flash_arm_padded_matches_block_arm_on_real_rows_cuda OVER {} SEEDS: per-seed \
-             ratios={ratios:.5?} mean={mean:.5e} max={max:.5e} (bound {FLASH_ORACLE_PADDED_BOUND}, \
-             max UNASSERTED -- diagnostic only, same convention as FLASH_ORACLE_K_MEAN_POOLED)",
-            FLASH_ORACLE_SWEEP_SEEDS.len(),
-        );
-        assert!(
-            mean.is_finite() && mean < FLASH_ORACLE_PADDED_BOUND,
-            "flash-padded vs block-arm MEAN real-row ratio {mean:.5e} over {} seeds exceeds the \
-             bound {FLASH_ORACLE_PADDED_BOUND} -- see that constant's own doc",
-            FLASH_ORACLE_SWEEP_SEEDS.len(),
-        );
-    }
-
-    /// RED control for [`flash_arm_padded_matches_block_arm_on_real_rows_cuda`]
-    /// (a "`cu_seqlens` boundary off-by-one via a `lengths` mutant"): forces the SAME batch through
-    /// [`ModernBert::forward_hidden_inner`] with ONE batch element's
-    /// `lengths` entry shifted by `-1` — the mutated `CompactedBatch` feeds
-    /// a wrong row count into BOTH the encoder-boundary gather (a
-    /// different set of "real" rows is transported) and
-    /// `flash_attention_varlen_with_rope_ragged`'s own `cu_seqlens` (a
-    /// shifted segment boundary) — and asserts the result is NOT
-    /// bit-identical to the correctly-decided forward on the SAME inputs.
-    /// An oracle this mutant cannot fail is vacuous.
-    ///
-    /// The companion `w±1` local-layer window-radius RED control the
-    /// contract also names lives immediately below, as two siblings:
-    /// [`flash_arm_padded_red_control_window_radius_off_by_one_cuda`]
-    /// (forward-visible, uniform fwd+bwd fault) and
-    /// [`flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda`]
-    /// (backward-only, config-split fault — the ragged entry point's own
-    /// [`jammi_kernels::ops::flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override`]
-    /// seam, ported from the dense arm's
-    /// [`jammi_kernels::ops::flash_attention_varlen_with_rope_test_only_bwd_window_override`]).
-    #[test]
-    #[cfg(feature = "live-flash-oracle-tests")]
-    fn flash_arm_padded_red_control_lengths_off_by_one_cuda() {
-        let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
-        let cuda = jammi_test_resources::cuda_device(0);
-        let _lock = crate::test_support::seam_counter_lock();
-        let _d2h_guard = FLASH_D2H_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert_flash_arch(&cuda);
-
-        let dir = std::path::PathBuf::from(&model_dir);
-        let config: ModernBertConfig =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
-                .unwrap();
-        let weights = dir.join("model.safetensors");
-        let seed = 78;
-        let (batch, seq) = (4usize, 64usize);
-        let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
-        let lengths = vec![seq, seq - 8, seq / 2, 6]; // last entry >= 2 so `-1` stays >= 1
-        let mut mask_data = vec![0u32; batch * seq];
-        for (b, &len) in lengths.iter().enumerate() {
-            for s in 0..len {
-                mask_data[b * seq + s] = 1;
-            }
-        }
-        let mask = Tensor::from_vec(mask_data, (batch, seq), &cuda).unwrap();
-        let model = flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
-
-        let healthy = model.forward_hidden(&ids, &mask).unwrap();
-        let healthy_v: Vec<f32> = healthy
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-
-        let mut mutant_lengths = lengths.clone();
-        let last = mutant_lengths.len() - 1;
-        mutant_lengths[last] -= 1;
-        let mutant_decision = fused_flash_for_test(mutant_lengths, seq, &cuda);
-        let mutant =
-            forward_hidden_forcing_flash_decision(&model, &ids, &mask, mutant_decision).unwrap();
-        let mutant_v: Vec<f32> = mutant
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-
-        assert_ne!(
-            healthy_v, mutant_v,
-            "RED control: a lengths off-by-one mutant (shifting a cu_seqlens boundary) must \
-             change the output -- an oracle this cannot fail is vacuous"
-        );
-    }
-
-    /// RED control (forward-visible, uniform fwd+bwd fault): a `w+/-1`
-    /// perturbation of every LOCAL layer's [`ModernBertAttention::half_window`]
-    /// field on the SAME (otherwise correctly-decided) padded batch — the
-    /// same structure as
-    /// [`flash_arm_padded_red_control_lengths_off_by_one_cuda`] immediately
-    /// above, mutating the WINDOW rather than the `CompactedBatch` — must
-    /// change [`ModernBert::forward_hidden`]'s output. An oracle this
-    /// cannot fail is vacuous. Uniform: both the forward and
-    /// backward flash launches read the SAME (mutated) `half_window`, so
-    /// this control alone cannot tell "forward wrong" from "backward
-    /// wrong" apart — see
-    /// [`flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda`]
-    /// below for the config-SPLIT control that isolates the backward-only
-    /// case.
-    ///
-    /// CHECKED PREMISE (this control's own assert's words: "must change ...
-    /// an oracle this cannot fail is vacuous" — at `seq=64` it never
-    /// fires):
-    /// a `w+/-1` radius change is observable ONLY for a row whose segment
-    /// is long enough that widening/narrowing the window by 1 actually
-    /// crosses into (or out of) a real key. Worked from row `0`'s window
-    /// `[0, min(L-1, w)]` (segment length `L`, radius `w`, symmetric for
-    /// row `L-1`): GROWING to `w+1` first differs from `w` (gains position
-    /// `w+1`) at `L = w+2`; SHRINKING to `w-1` first differs (loses
-    /// position `w`) one segment length EARLIER, at `L = w+1` — verified
-    /// numerically (`i in 0..L`, both directions, `w=64`, `L=62..68`). The
-    /// BINDING (stricter) bound covering BOTH
-    /// deltas in the SAME control is therefore `L >= half_window + 2`,
-    /// asserted in-test below — a `seq=64` fixture's longest segment (64)
-    /// sits exactly AT `half_window`, two short of that threshold, so
-    /// NEITHER delta can ever fire no matter what the seam does (this is
-    /// why the assert must be `>=` the GROWING threshold, not the looser
-    /// shrinking one). A fixture shrink vacuates LOUDLY (a failed
-    /// `assert!`), never silently.
-    #[test]
-    #[cfg(feature = "live-flash-oracle-tests")]
-    fn flash_arm_padded_red_control_window_radius_off_by_one_cuda() {
-        let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
-        let cuda = jammi_test_resources::cuda_device(0);
-        let _lock = crate::test_support::seam_counter_lock();
-        let _d2h_guard = FLASH_D2H_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert_flash_arch(&cuda);
-
-        let dir = std::path::PathBuf::from(&model_dir);
-        let config: ModernBertConfig =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
-                .unwrap();
-        let weights = dir.join("model.safetensors");
-        let seed = 84;
-        // `seq`/`lengths` sized so at least one segment CLEARS the
-        // `half_window + 2` visibility threshold (this doc's own "CHECKED
-        // PREMISE" section) -- 160 and 96 both clear it on a
-        // `half_window=64` checkpoint; 40 and 6 stay BELOW it, pinning the
-        // no-truncation regime too (both regimes exercised, not just one).
-        let (batch, seq) = (4usize, 160usize);
-        let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
-        let lengths = [seq, 96, 40, 6];
-        let half_window = config.half_window();
-        assert!(
-            lengths.iter().any(|&len| len >= half_window + 2),
-            "checked premise: at least one segment length must reach half_window ({half_window}) \
-             + 2 for a w+/-1 radius mutation to be visible AT ALL -- see this test's own doc, \
-             \"CHECKED PREMISE\""
-        );
-        let mut mask_data = vec![0u32; batch * seq];
-        for (b, &len) in lengths.iter().enumerate() {
-            for s in 0..len {
-                mask_data[b * seq + s] = 1;
-            }
-        }
-        let mask = Tensor::from_vec(mask_data, (batch, seq), &cuda).unwrap();
-
-        let healthy_model =
-            flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
-        let healthy_v: Vec<f32> = healthy_model
-            .forward_hidden(&ids, &mask)
-            .unwrap()
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-
-        for delta in [1i64, -1i64] {
-            let mut mutant_model =
-                flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
-            let mut mutated_any = false;
-            for layer in mutant_model.layers.iter_mut() {
-                if let Some(half) = layer.attention.half_window {
-                    layer.attention.half_window = Some((half as i64 + delta).max(1) as usize);
-                    mutated_any = true;
-                }
-            }
-            assert!(
-                mutated_any,
-                "this control needs at least one local (windowed) layer to mutate"
-            );
-            let mutant_v: Vec<f32> = mutant_model
-                .forward_hidden(&ids, &mask)
-                .unwrap()
-                .to_dtype(DType::F32)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1()
-                .unwrap();
-            assert_ne!(
-                healthy_v, mutant_v,
-                "RED control: a window radius w{delta:+} mutant (every local layer's \
-                 half_window shifted, both forward AND backward) must change the padded/ragged \
-                 flash arm's output -- an oracle this cannot fail is vacuous"
-            );
-        }
-    }
-
-    /// Test-only mirror of [`ModernBert::forward_hidden_inner`]'s
-    /// PADDED/ragged transport composition — the padded-arm counterpart of
-    /// [`forward_hidden_flash_with_fault`] (which mirrors the DENSE arm's
-    /// per-layer composition instead; see that function's own doc for why
-    /// a hand-synced mirror, not the shared `forward_hidden_inner` seam, is
-    /// needed for an op-level CONFIG fault like this one). Every LOCAL
-    /// layer's ragged flash op launches FORWARD with `attn.half_window`'s
-    /// own (correct) radius and BACKWARD with that radius shifted by
-    /// `window_delta`, via the NEW
-    /// [`jammi_kernels::ops::flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override`]
-    /// seam. GLOBAL layers (`half_window == None`) call the plain
-    /// [`jammi_kernels::ops::flash_attention_varlen_with_rope_ragged`] —
-    /// unaffected either way, mirroring the dense arm's own
-    /// `bwd_only_window_dropped` control's identical local/global scoping.
-    /// `admission` must be a genuinely padded (`!is_dense`) `CompactedBatch`
-    /// — this harness does not implement the dense-arm fallback, since its
-    /// whole point is to characterize the RAGGED arm's own fault surface.
-    #[cfg(all(feature = "live-gpu-tests", feature = "flash-attn"))]
-    fn forward_hidden_padded_with_ragged_bwd_window_fault(
-        model: &ModernBert,
-        input_ids: &Tensor,
-        admission: &CompactedBatch,
-        window_delta: i64,
-    ) -> Result<Tensor, EncoderError> {
-        use jammi_kernels::flash::VarlenConfig;
-        use jammi_kernels::ops::{
-            flash_attention_varlen_with_rope_ragged,
-            flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override,
-        };
-
-        let word_emb = model.word_embeddings.forward(input_ids)?;
-        let mut hidden = model.emb_norm.forward(&word_emb)?;
-        hidden = unpad_rows(&hidden, &admission.gather_indices)?;
-
-        for layer in &model.layers {
-            let attn = &layer.attention;
-            let normed = match &attn.attn_norm {
-                Some(ln) => ln.forward(&hidden)?,
-                None => hidden.clone(),
-            };
-            let h = attn.num_heads;
-            let d = attn.head_dim;
-            let qkv = attn.wqkv.forward(&normed)?;
-            let qkv5 = qkv.reshape((admission.total, 3, h, d))?;
-            let (cos_full, sin_full) = attn.rope.cached_tables(qkv5.dtype())?;
-            let cos = cos_full.narrow(2, 0, admission.seq)?;
-            let sin = sin_full.narrow(2, 0, admission.seq)?;
-            let fwd_cfg = VarlenConfig {
-                softmax_scale: 1.0 / (d as f32).sqrt(),
-                window: attn.half_window.map(|w| w as u32),
-                deterministic: true,
-            };
-            let o = match attn.half_window {
-                Some(half) => {
-                    let bad = (half as i64 + window_delta).max(0) as u32;
-                    let bwd_cfg = VarlenConfig {
-                        window: Some(bad),
-                        ..fwd_cfg
-                    };
-                    flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override(
-                        &qkv5,
-                        &cos,
-                        &sin,
-                        &admission.lengths,
-                        &fwd_cfg,
-                        &bwd_cfg,
-                    )
-                }
-                None => flash_attention_varlen_with_rope_ragged(
-                    &qkv5,
-                    &cos,
-                    &sin,
-                    &admission.lengths,
-                    &fwd_cfg,
-                ),
-            }
-            .map_err(|e| EncoderError::Config(format!("ragged bwd-window fault: {e}")))?;
-            let ctx = o.reshape((admission.total, h * d))?;
-            let out = attn.wo.forward(&ctx)?;
-            hidden = (out + &hidden)?;
-            hidden = layer.mlp.forward(&hidden)?;
-        }
-
-        let batch = admission.lengths.len();
-        hidden = repad_rows(&hidden, &admission.gather_indices, batch, admission.seq)?;
-        model.final_norm.forward(&hidden)
-    }
-
-    /// [`flash_oracle_wqkv_lora_b`]'s general form, indexed by layer — used
-    /// ONLY by
-    /// [`flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda`]
-    /// below, which (unlike [`flash_oracle_pooled_and_grad`]'s own
-    /// LAST-layer probe) deliberately needs an EARLY layer: see that
-    /// control's own doc for why the last (global) layer's gradient cannot
-    /// see a LOCAL-layer-only backward defect at all.
-    #[cfg(all(feature = "live-gpu-tests", feature = "flash-attn"))]
-    fn flash_oracle_wqkv_lora_b_of_layer(model: &ModernBert, idx: usize) -> &Tensor {
-        match &model.layers[idx].attention.wqkv {
-            MaybeLoraLinear::Lora(l) => &l.lora_b,
-            MaybeLoraLinear::Frozen(_) => panic!(
-                "flash oracle: layer {idx}'s Wqkv must be LoRA-wrapped -- \
-                 target_modules=[\"Wqkv\"]"
-            ),
-        }
-    }
-
-    /// `(flattened hidden, dL/d(layer `layer_idx`'s Wqkv LoRA B))` for
-    /// `L = (pool_and_normalize(hidden) * dy).sum()` — the padded-arm
-    /// counterpart of [`flash_oracle_pooled_and_grad`], generalised to an
-    /// arbitrary layer (see [`flash_oracle_wqkv_lora_b_of_layer`]'s own
-    /// doc for why).
-    #[cfg(all(feature = "live-gpu-tests", feature = "flash-attn"))]
-    fn flash_oracle_hidden_and_early_grad(
-        model: &ModernBert,
-        hidden: &Tensor,
-        mask: &Tensor,
-        dy: &Tensor,
-        layer_idx: usize,
-    ) -> (Vec<f32>, Vec<f32>) {
-        let hidden_v: Vec<f32> = hidden
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        let pooled = pool_and_normalize(hidden, mask, Pooling::Mean).unwrap();
-        let pooled_f32 = pooled.to_dtype(DType::F32).unwrap();
-        let loss = (&pooled_f32 * dy).unwrap().sum_all().unwrap();
-        assert!(
-            loss.to_scalar::<f32>().unwrap().is_finite(),
-            "flash oracle: loss must be finite before backward"
-        );
-        let grads = loss.backward().unwrap();
-        let lora_b = flash_oracle_wqkv_lora_b_of_layer(model, layer_idx);
-        let grad_v: Vec<f32> = grads
-            .get(lora_b)
-            .expect("flash oracle: layer's Wqkv lora_b must have a gradient")
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        (hidden_v, grad_v)
-    }
-
-    /// RED control (backward-config-split): the ragged entry point's OWN
-    /// counterpart of `tests/cuda_parity.rs`'s
-    /// `flash_upstream_acceptance_form_red_control_bwd_only_window_dropped_cuda`
-    /// (`jammi-kernels`, which covers only the DENSE entry point) — the
-    /// backward-only case [`flash_arm_padded_red_control_lengths_off_by_one_cuda`]
-    /// cannot isolate.
-    /// [`forward_hidden_padded_with_ragged_bwd_window_fault`] forces every
-    /// LOCAL layer's ragged flash op to launch FORWARD with the CORRECT
-    /// window radius and BACKWARD with `w+/-1`, via the
-    /// [`jammi_kernels::ops::flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override`]
-    /// seam. Proves two things per `delta`: (a) the forward output stays
-    /// BIT-IDENTICAL to production's OWN padded forward — the fault really
-    /// is backward-only, never leaking into the forward launch; (b) an
-    /// EARLY layer's own LoRA `B` gradient is NOT bit-identical to
-    /// production's own gradient — the fault is still caught. Deliberately
-    /// probes layer 0, not the LAST layer [`flash_oracle_wqkv_lora_b`]
-    /// targets: the last layer in this checkpoint is GLOBAL (unwindowed —
-    /// see that fn's own doc), so its gradient's own backward pass never
-    /// chains through any LOCAL layer at all and would be structurally
-    /// blind to this exact fault class, whereas layer 0's gradient
-    /// backpropagates through every later (including every LOCAL) layer's
-    /// own backward first.
-    ///
-    /// CHECKED PREMISE (at `seq=64` this control's own gradient assert
-    /// cannot fail — gradients are bit-identical under the fault): a `w+/-1` radius change
-    /// only touches a row's REAL attended-key set when that row's segment
-    /// is long enough for the extra/missing radius step to cross into (or
-    /// out of) a real key — see
-    /// [`flash_arm_padded_red_control_window_radius_off_by_one_cuda`]'s
-    /// own "CHECKED PREMISE" doc for the exact `L >= half_window + 2`
-    /// (GROWING, the binding direction) / `L >= half_window + 1`
-    /// (SHRINKING) derivation (identical here: this control differs from
-    /// that one only in WHICH launch — forward vs. backward — carries the
-    /// wrong radius, never in what makes the radius change observable at
-    /// all). The `seq=64` fixture's longest segment (64) sat two short of
-    /// the threshold on a `half_window=64` checkpoint. Asserted in-test below
-    /// so a future fixture shrink re-vacuates LOUDLY instead of silently.
-    #[test]
-    #[cfg(feature = "live-flash-oracle-tests")]
-    fn flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda() {
-        let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
-        let cuda = jammi_test_resources::cuda_device(0);
-        let _lock = crate::test_support::seam_counter_lock();
-        let _d2h_guard = FLASH_D2H_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert_flash_arch(&cuda);
-
-        let dir = std::path::PathBuf::from(&model_dir);
-        let config: ModernBertConfig =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
-                .unwrap();
-        let weights = dir.join("model.safetensors");
-        let seed = 85;
-        // Same sizing rationale as `flash_arm_padded_red_control_window_
-        // radius_off_by_one_cuda`'s own doc ("CHECKED PREMISE") -- 160/96
-        // clear the `half_window + 2` visibility threshold, 40/6 stay
-        // below it.
-        let (batch, seq) = (4usize, 160usize);
-        let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
-        let lengths = vec![seq, 96, 40, 6];
-        let half_window = config.half_window();
-        assert!(
-            lengths.iter().any(|&len| len >= half_window + 2),
-            "checked premise: at least one segment length must reach half_window ({half_window}) \
-             + 2 for a w+/-1 radius mutation to be visible AT ALL -- see this test's own doc, \
-             \"CHECKED PREMISE\""
-        );
-        let mut mask_data = vec![0u32; batch * seq];
-        for (b, &len) in lengths.iter().enumerate() {
-            for s in 0..len {
-                mask_data[b * seq + s] = 1;
-            }
-        }
-        let mask = Tensor::from_vec(mask_data, (batch, seq), &cuda).unwrap();
-        let dy = flash_oracle_seeded_dy(batch, config.hidden_size, seed, &cuda);
-
-        let decision = fused_flash_for_test(lengths, seq, &cuda);
-        let admission = match &decision {
-            FlashDecision::Fused(admission) => admission,
-            FlashDecision::Declined { .. } => {
-                panic!("this control needs a genuinely padded Fused decision")
-            }
-        };
-        assert!(
-            !admission.is_dense,
-            "this control needs a genuinely padded (ragged) batch"
-        );
-
-        let model = flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
-
-        let healthy_hidden = model.forward_hidden(&ids, &mask).unwrap();
-        let (healthy_hidden_v, healthy_grad_v) =
-            flash_oracle_hidden_and_early_grad(&model, &healthy_hidden, &mask, &dy, 0);
-
-        for delta in [1i64, -1i64] {
-            let mutant_hidden =
-                forward_hidden_padded_with_ragged_bwd_window_fault(&model, &ids, admission, delta)
-                    .unwrap();
-            let (mutant_hidden_v, mutant_grad_v) =
-                flash_oracle_hidden_and_early_grad(&model, &mutant_hidden, &mask, &dy, 0);
-
-            assert_eq!(
-                healthy_hidden_v, mutant_hidden_v,
-                "window w{delta:+} backward-only fault must NOT change the forward output -- \
-                 the forward launch always reads fwd_cfg (the CORRECT window), never \
-                 bwd_cfg_override; a difference here means the split leaked into forward"
-            );
-            assert_ne!(
-                healthy_grad_v, mutant_grad_v,
-                "window w{delta:+} backward-only fault must change layer 0's LoRA B gradient -- \
-                 an oracle this cannot fail is vacuous"
-            );
-        }
-    }
-
     // =====================================================================
     // The flash arm's encoder-level numeric oracle. Asserting only
     // `is_finite` + dispatch counters survives real wiring mutants (K slot
@@ -5128,178 +4323,6 @@ mod tests {
     //   cannot go unnoticed.
     // =====================================================================
 
-    /// Eight fixed seeds, reused IDENTICALLY across the healthy oracle and
-    /// every RED control below, at every shape (property 2 above) -- a
-    /// single seed's draw is not a distribution.
-    #[cfg(feature = "live-gpu-tests")]
-    const FLASH_ORACLE_SWEEP_SEEDS: [u64; 8] = [201, 202, 203, 204, 205, 206, 207, 208];
-
-    /// Mean-ratio bound, pooled-embedding leg (`err(other,f32) /
-    /// err(block,f32)`, [`relative_l1_error`], averaged over
-    /// [`FLASH_ORACLE_SWEEP_SEEDS`]). Measured healthy (A100, full per-seed
-    /// table measured by
-    /// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-flash-arm-encoder-oracle-2aa1551-a100-sxm4.json`):
-    /// mean ratio = 1.0798 (b8_s512) / 1.0250 (b1_s128), i.e.
-    /// flash is on average ~4-8% FURTHER from the f32 reference than the
-    /// block arm is on THIS leg -- not closer (property 3 above). `1.6`
-    /// gives ~1.5x margin over the worse of those
-    /// two means while sitting more than 3x below the WEAKEST measured
-    /// mutant mean on this same leg (window-dropped, 5.2189; K-unrotated
-    /// 9.9498; bad-softmax-scale 19.4144).
-    #[cfg(feature = "live-gpu-tests")]
-    const FLASH_ORACLE_K_MEAN_POOLED: f64 = 1.6;
-
-    /// Mean-ratio bound, LoRA-gradient leg (last layer `Wqkv` LoRA `B`,
-    /// step-0, fixed-cotangent loss -- property 1 above -- [`cosine_distance`]
-    /// ratio, NOT [`relative_l1_error`] -- see that function's own doc for
-    /// why). Measured healthy mean: 1.4604 (b8_s512) / 1.0412
-    /// (b1_s128) -- see the artifact cited on [`FLASH_ORACLE_K_MEAN_POOLED`].
-    /// `4.5` gives ~3.1x margin over the worse of those two while sitting
-    /// ~3x below the WEAKEST measured mutant mean on this leg
-    /// (window-dropped, 13.6483; K-unrotated 26.6004; bad-softmax-scale
-    /// 125.3883).
-    ///
-    /// NO max-per-seed bound exists alongside this mean bound: a max bound
-    /// fitted only to [`FLASH_ORACLE_SWEEP_SEEDS`] (201-208) is not
-    /// seed-stable in either direction — fresh seeds 301-308 measure a
-    /// healthy grad max of 7.18 and 401-408 measure 16.08 (false-RED on
-    /// UNMODIFIED code against a 7.0 max bound), while the k-unrotated
-    /// mutant's own max (6.62) sits INSIDE that bound on at least one seed
-    /// draw. [`assert_red_control_violates_bound`] asserts only the MEAN
-    /// legs.
-    #[cfg(feature = "live-gpu-tests")]
-    const FLASH_ORACLE_K_MEAN_GRAD: f64 = 4.5;
-
-    /// Asserts `device` can run the flash kernels this build compiled: its
-    /// compute capability is in `flash_validated_arches()`. The GPU lanes pin
-    /// exactly those arches, so any other device is the wrong host.
-    #[cfg(all(feature = "live-gpu-tests", feature = "flash-attn"))]
-    fn assert_flash_arch(device: &Device) {
-        assert!(
-            flash_arch_ok(device),
-            "this test needs a device in flash_validated_arches() {:?}; this one is {:?}",
-            flash_validated_arches(),
-            probe_cuda_compute_capability(device)
-        );
-    }
-
-    /// A deterministic (SplitMix64-derived) token-id batch, `vocab`-bounded
-    /// and `seed`-keyed -- every arm below is driven by the exact SAME
-    /// `input_ids` for a given `(batch, seq, seed)`.
-    #[cfg(feature = "live-gpu-tests")]
-    fn flash_oracle_synthetic_ids(
-        batch: usize,
-        seq: usize,
-        vocab: usize,
-        seed: u64,
-        device: &Device,
-    ) -> Tensor {
-        let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
-        let mut ids = Vec::with_capacity(batch * seq);
-        for _ in 0..batch * seq {
-            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
-            ids.push((z % vocab as u64) as u32);
-        }
-        Tensor::from_vec(ids, (batch, seq), device).expect("build synthetic token-id batch")
-    }
-
-    /// A SplitMix64-derived, `seed`-keyed cotangent for the pooled
-    /// embedding (`(batch, hidden)`, F32) -- deliberately NON-uniform (an
-    /// all-equal `dy` can make a downstream softmax/normalize gradient
-    /// identically zero, exactly the degenerate shape this section's own
-    /// vacuous-loss defect took) and driven by a stream XOR'd with a
-    /// DISTINCT odd constant from [`flash_oracle_synthetic_ids`]'s own, so
-    /// the token-id draw and the cotangent draw never correlate at the
-    /// same seed. Values in `[-1, 1)`.
-    #[cfg(feature = "live-gpu-tests")]
-    fn flash_oracle_seeded_dy(batch: usize, hidden: usize, seed: u64, device: &Device) -> Tensor {
-        let mut state = seed ^ 0xD1B5_4A32_D192_ED03;
-        let mut values = Vec::with_capacity(batch * hidden);
-        for _ in 0..batch * hidden {
-            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
-            let u = ((z >> 40) as u32 as f32) / (1u32 << 24) as f32; // [0, 1)
-            values.push(u * 2.0 - 1.0);
-        }
-        Tensor::from_vec(values, (batch, hidden), device).expect("build seeded cotangent")
-    }
-
-    /// Builds a real ModernBERT-large checkpoint with a Gaussian-initialised
-    /// (non-identity from step 0 -- unlike the default `ZerosB`, whose `dA`
-    /// is trivially zero regardless of any arm's numerics) LoRA adapter on
-    /// `Wqkv` only, at the given backbone `dtype`. `training` selects
-    /// whether `forward_hidden` reaches the admission cascade at all
-    /// (`true`) or takes the always-eager eval composition (`false` -- the
-    /// F32 reference's own arm).
-    #[cfg(feature = "live-gpu-tests")]
-    fn flash_oracle_build_model(
-        config: &ModernBertConfig,
-        weights: &std::path::Path,
-        dtype: DType,
-        seed: u64,
-        device: &Device,
-        training: bool,
-    ) -> ModernBert {
-        let varmap = VarMap::new();
-        let target_modules = ["Wqkv".to_string()];
-        let rank_pattern: HashMap<String, usize> = HashMap::new();
-        let lora = LoraBuildConfig {
-            target_modules: &target_modules,
-            layers_to_transform: &None,
-            lora_rank: 16,
-            lora_alpha: 32.0,
-            use_rslora: false,
-            lora_dropout: None,
-            rank_pattern: &rank_pattern,
-            init_mode: jammi_lora::LoraInitMode::Gaussian,
-            seed,
-            dropout_seed: seed,
-        };
-        let mut model = ModernBert::builder()
-            .pooling(Pooling::Mean)
-            .backbone_dtype(dtype)
-            .lora(lora)
-            .build(&[weights], config, device, &varmap)
-            .unwrap_or_else(|e| panic!("flash oracle: build ModernBert ({dtype:?}) failed: {e}"));
-        model.set_training(training);
-        model
-    }
-
-    /// Test-only seam over [`ModernBert::forward_hidden_inner`] (the
-    /// forced-arm harness IS that shared function, not a hand-mirrored copy
-    /// of `forward_hidden_with_lengths`'s body, which every transport change
-    /// would need to edit twice in sync). `force_decline == true` forces
-    /// [`declined_flash`] for the whole forward (the block-bf16 arm);
-    /// `force_decline == false` forces `Derive` (the REAL
-    /// `decide_flash_admission`, production's exact behaviour — the
-    /// flash-bf16 arm on a CUDA device). For a decision this crate's own
-    /// `decide_flash_admission` can never reach WITHOUT a CUDA device (a
-    /// padded, flash-eligible `Fused`), see
-    /// [`forward_hidden_forcing_flash_decision`] instead. `#[cfg(feature =
-    /// "cuda")]`: every call site is a CUDA-gated test (the block-arm vs.
-    /// flash-arm comparison only means something on a real CUDA device).
-    #[cfg(feature = "live-gpu-tests")]
-    fn forward_hidden_forcing_flash(
-        model: &ModernBert,
-        input_ids: &Tensor,
-        mask: &Tensor,
-        force_decline: bool,
-    ) -> Result<Tensor, EncoderError> {
-        let forced = if force_decline {
-            ForcedFlash::Forced(declined_flash())
-        } else {
-            ForcedFlash::Derive
-        };
-        model.forward_hidden_inner(input_ids, mask, None, forced)
-    }
-
     /// [`forward_hidden_forcing_flash`]'s general form: forces the EXACT
     /// `decision` given, for every layer, over `model.forward_hidden_inner`
     /// — the seam a CPU-hermetic test uses to drive a genuinely-padded
@@ -5313,999 +4336,6 @@ mod tests {
         decision: FlashDecision,
     ) -> Result<Tensor, EncoderError> {
         model.forward_hidden_inner(input_ids, mask, None, ForcedFlash::Forced(decision))
-    }
-
-    /// The two encoder-level flash wiring faults this oracle proves it
-    /// catches (see the block comment above), plus `NoFault` -- the
-    /// bit-identity anchor proving this whole harness has not drifted from
-    /// production (see `flash_arm_fault_harness_nofault_matches_production_bit_identical`
-    /// below).
-    #[cfg(all(feature = "live-gpu-tests", feature = "flash-attn"))]
-    enum FlashFault {
-        /// No injection at all -- exactly production's
-        /// `forward_flash_dense_attention` composition.
-        NoFault,
-        /// K (slot 1) never rotated -- the observable effect of a
-        /// `slot == 2` -> `slot >= 1` kernel mutant, injected without
-        /// touching the kernel (see the block comment above).
-        KUnrotated,
-        /// `VarlenConfig::softmax_scale` replaced with a wrong constant.
-        BadSoftmaxScale(f32),
-    }
-
-    /// Test-only mirror of [`ModernBertAttention::forward_flash_dense_attention`]
-    /// (called per layer, replacing `ModernBertLayer::forward`'s whole body),
-    /// calling the SAME production op
-    /// ([`jammi_kernels::ops::flash_attention_varlen_with_rope`], i.e.
-    /// `FlashVarlenAttentionFusedRope`) that function calls, with one of
-    /// [`FlashFault`] injected at the `qkv`/`cfg` BOUNDARY the op itself is
-    /// handed -- never inside the op. Requires the batch to be genuinely
-    /// flash-`Holds`-eligible (asserted up front) -- this harness does not
-    /// implement the block-arm fallback, since its whole point is to
-    /// characterize the flash arm's OWN fault surface.
-    #[cfg(all(feature = "live-gpu-tests", feature = "flash-attn"))]
-    fn forward_hidden_flash_with_fault(
-        model: &ModernBert,
-        input_ids: &Tensor,
-        mask: &Tensor,
-        fault: &FlashFault,
-    ) -> Result<Tensor, EncoderError> {
-        use jammi_kernels::flash::{CuSeqlens, VarlenConfig};
-        use jammi_kernels::ops::{flash_attention_varlen_with_rope, RopePositionsFused};
-
-        let (batch, seq) = input_ids.dims2()?;
-        let device = input_ids.device();
-        let word_emb = model.word_embeddings.forward(input_ids)?;
-        let mut hidden = model.emb_norm.forward(&word_emb)?;
-
-        let head_dim = model
-            .layers
-            .first()
-            .map(|l| l.attention.head_dim)
-            .unwrap_or(0);
-        let decision = decide_flash_admission(device, hidden.dtype(), head_dim, mask, None)?;
-        let admission = match &decision {
-            FlashDecision::Fused(batch) => batch,
-            FlashDecision::Declined { outcome, reason } => panic!(
-                "flash oracle fault harness requires flash to actually be eligible on this \
-                 batch (outcome={outcome:?}, reason={reason})"
-            ),
-        };
-        let cuda_device = match device {
-            Device::Cuda(dev) => dev,
-            _ => panic!("flash oracle fault harness requires a CUDA device"),
-        };
-
-        for layer in &model.layers {
-            let attn = &layer.attention;
-            let normed = match &attn.attn_norm {
-                Some(ln) => ln.forward(&hidden)?,
-                None => hidden.clone(),
-            };
-            let h = attn.num_heads;
-            let d = attn.head_dim;
-            let qkv = attn.wqkv.forward(&normed)?;
-            let total = batch * seq;
-            let qkv5 = qkv.reshape((total, 3, h, d))?;
-            let (cos_full, sin_full) = attn.rope.cached_tables(qkv5.dtype())?;
-            let cos = cos_full.narrow(2, 0, seq)?;
-            let sin = sin_full.narrow(2, 0, seq)?;
-
-            let mut softmax_scale = 1.0 / (d as f32).sqrt();
-            let qkv_for_op = match fault {
-                FlashFault::NoFault => qkv5.clone(),
-                FlashFault::KUnrotated => {
-                    // The production op rotates Q and K TOGETHER, forward,
-                    // from whatever it is handed (proven correct by
-                    // `fused_rope_matches_two_op_composition`). Pre-apply
-                    // the INVERSE rotation (`negate_sin: true`, the SAME
-                    // mechanism that op's own `bwd` un-rotation uses) to
-                    // K ONLY: the op's own forward rotation then cancels
-                    // it exactly, leaving K exactly as it was BEFORE any
-                    // rotation -- observably identical to a
-                    // `slot == 2` -> `slot >= 1` kernel mutant, without
-                    // editing the op or its kernel.
-                    let q_orig = qkv5.narrow(1, 0, 1)?;
-                    let v_orig = qkv5.narrow(1, 2, 1)?;
-                    let inv = apply3(&qkv5, &cos, &sin, RopePositionsFused::new(seq, true))?;
-                    let k_inv = inv.narrow(1, 1, 1)?;
-                    Tensor::cat(&[&q_orig, &k_inv, &v_orig], 1)?.contiguous()?
-                }
-                FlashFault::BadSoftmaxScale(bad) => {
-                    softmax_scale = *bad;
-                    qkv5.clone()
-                }
-            };
-
-            let cu_seqlens = CuSeqlens::from_lengths(&admission.lengths, cuda_device)
-                .map_err(|e| EncoderError::Config(format!("flash oracle fault: {e}")))?;
-            let cfg = VarlenConfig {
-                softmax_scale,
-                window: attn.half_window.map(|w| w as u32),
-                deterministic: true,
-            };
-            let o =
-                flash_attention_varlen_with_rope(&qkv_for_op, &cos, &sin, seq, &cu_seqlens, &cfg)
-                    .map_err(|e| EncoderError::Config(format!("flash oracle fault: {e}")))?;
-            let ctx = o.reshape((batch, seq, h * d))?;
-            let out = attn.wo.forward(&ctx)?;
-            hidden = (out + &hidden)?;
-            hidden = layer.mlp.forward(&hidden)?;
-        }
-        model.final_norm.forward(&hidden)
-    }
-
-    /// The LAST layer's `attention.wqkv`'s LoRA `B` matrix -- `target_modules
-    /// = ["Wqkv"]` with `layers_to_transform: None` guarantees EVERY layer
-    /// (this one included) is the `Lora` variant. Deliberately the LAST
-    /// layer, not layer 0: measured on an A100, layer 0's gradient is 28 backward matmuls
-    /// removed from the loss, and guide §3.2's own "compounding is
-    /// invisible at one call, grows with depth" phenomenon applies to
-    /// ORDINARY bf16 rounding noise exactly as it does to a real defect --
-    /// by layer 0 the block arm's OWN gradient (known-correct, extensively
-    /// tested elsewhere) already has cosine distance from the f32
-    /// reference ranging 0.23-1.04 across seeds (measured by
-    /// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-flash-arm-encoder-oracle-2aa1551-a100-sxm4.json`;
-    /// i.e. sometimes NEAR
-    /// ORTHOGONAL to truth), a noise floor comparable to or larger than
-    /// the K-unrotated/window-dropped mutants' OWN signal at that same
-    /// depth -- neither `relative_l1_error` nor `cosine_distance` can
-    /// discriminate a real fault from ordinary depth-compounded rounding
-    /// noise at that distance. The LAST layer is one backward matmul
-    /// (plus the final norm) from the loss, so its gradient carries
-    /// minimal ACCUMULATED noise while still proving gradients reach a
-    /// LoRA-wrapped parameter (the property this leg exists to check --
-    /// nothing about that property is specific to layer 0).
-    ///
-    /// Blind spot: the last layer is GLOBAL attention (no sliding window),
-    /// so a BACKWARD-ONLY window defect confined to the 18 LOCAL (windowed)
-    /// layers is invisible to this gradient leg -- that class is instead
-    /// covered at the op level, where the window is a per-call parameter,
-    /// by `jammi-kernels`' own
-    /// `tests/cuda_parity.rs::flash_upstream_acceptance_form_red_control_bwd_only_window_dropped_cuda`.
-    #[cfg(feature = "live-gpu-tests")]
-    fn flash_oracle_wqkv_lora_b(model: &ModernBert) -> &Tensor {
-        let last = model
-            .layers
-            .last()
-            .expect("flash oracle: model must have at least one layer");
-        match &last.attention.wqkv {
-            MaybeLoraLinear::Lora(l) => &l.lora_b,
-            MaybeLoraLinear::Frozen(_) => panic!(
-                "flash oracle: the last layer's Wqkv must be LoRA-wrapped -- \
-                 target_modules=[\"Wqkv\"]"
-            ),
-        }
-    }
-
-    /// `L = (pool_and_normalize(hidden) * dy).sum()` for a FIXED, seed-keyed
-    /// random cotangent `dy` (a generic, consumer-free scalar) --
-    /// this oracle's job is comparing arms' NUMERICS, not reproducing the
-    /// production triplet-hinge objective, and NEVER `sum(pooled^2)`
-    /// (identically `batch`, gradient identically zero -- see this
-    /// section's own block comment, defect 1). Returns `(pooled embedding,
-    /// dL/d(last layer Wqkv LoRA B))`, both `F32`, flattened.
-    #[cfg(feature = "live-gpu-tests")]
-    fn flash_oracle_pooled_and_grad(
-        model: &ModernBert,
-        hidden: &Tensor,
-        mask: &Tensor,
-        dy: &Tensor,
-    ) -> (Vec<f32>, Vec<f32>) {
-        let pooled = pool_and_normalize(hidden, mask, Pooling::Mean).unwrap();
-        let pooled_f32 = pooled.to_dtype(DType::F32).unwrap();
-        let pooled_v: Vec<f32> = pooled_f32.flatten_all().unwrap().to_vec1().unwrap();
-        let loss = (&pooled_f32 * dy).unwrap().sum_all().unwrap();
-        assert!(
-            loss.to_scalar::<f32>().unwrap().is_finite(),
-            "flash oracle: loss must be finite before backward"
-        );
-        let grads = loss.backward().unwrap();
-        let lora_b = flash_oracle_wqkv_lora_b(model);
-        let grad_v: Vec<f32> = grads
-            .get(lora_b)
-            .expect("flash oracle: last layer Wqkv lora_b must have a gradient")
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        (pooled_v, grad_v)
-    }
-
-    /// `Σ|arm - reference| / Σ|reference|` -- guide §3.2's own aggregate
-    /// shape (`r(L) = Σ|fused-eager| / Σ|eager|`), NEVER a per-element
-    /// ratio (a reference element near zero would make a per-element ratio
-    /// blow up on ordinary rounding noise alone). Affirmative non-finite
-    /// check FIRST (guide §3.7: never let a NaN read as a silent pass), no
-    /// absolute floor (guide §3.8), and asserts the denominator carries
-    /// real SIGNAL (`sum|reference| > 0`) before dividing -- the exact
-    /// check that would have caught this section's own vacuous-loss defect
-    /// (defect 1 above) the moment it shipped.
-    #[cfg(feature = "live-gpu-tests")]
-    fn relative_l1_error(arm: &[f32], reference: &[f32]) -> f64 {
-        assert_eq!(
-            arm.len(),
-            reference.len(),
-            "relative_l1_error: length mismatch"
-        );
-        let non_finite = arm
-            .iter()
-            .chain(reference.iter())
-            .filter(|v| !v.is_finite())
-            .count();
-        assert_eq!(
-            non_finite, 0,
-            "relative_l1_error: {non_finite} non-finite value(s)"
-        );
-        let mut num = 0.0f64;
-        let mut den = 0.0f64;
-        for (&a, &r) in arm.iter().zip(reference.iter()) {
-            num += (a as f64 - r as f64).abs();
-            den += (r as f64).abs();
-        }
-        assert!(
-            den > 0.0,
-            "relative_l1_error: reference carries no signal (sum|reference| == 0) -- dividing by \
-             this would silently read as a passing ratio; the caller's loss/objective is \
-             degenerate for this arm"
-        );
-        num / den
-    }
-
-    /// `1 - cosine_similarity(arm, reference)`, bounded `[0, 2]` (`0` =
-    /// same direction, `1` = orthogonal, `2` = opposite) -- guide §3.2's
-    /// "aggregate, never per-element" shape, but SCALE-INVARIANT rather
-    /// than magnitude-relative. Measured on an A100: the grad leg's step-0, random-`dy`-driven
-    /// LoRA-B gradient has a magnitude (`Σ|grad_f32|`) that itself varies
-    /// ~60x across [`FLASH_ORACLE_SWEEP_SEEDS`] (some draws of `dy` are
-    /// nearly orthogonal to the local Jacobian, producing a small true
-    /// gradient at that seed) -- [`relative_l1_error`]'s `Σ|Δ|/Σ|ref|`
-    /// aggregate is exactly proportional to `1/Σ|ref|`, so at those
-    /// low-magnitude seeds ORDINARY bf16 rounding noise alone produces a
-    /// huge ratio, drowning out any real fault signal in the MEAN over
-    /// seeds (the K-unrotated and window-dropped mutants' mean
-    /// `relative_l1_error` ratio measured BELOW the healthy oracle's own
-    /// mean under that metric). Cosine distance does not have this failure
-    /// mode: it normalises by each vector's OWN norm, so a small true
-    /// gradient does not inflate the metric -- it asks "does the fused
-    /// arm's gradient point the same way as truth", which is what actually
-    /// matters for a LoRA training step, and is what the grad leg uses
-    /// below. Same affirmative-finite-first (guide §3.7) and signal-assert
-    /// (both norms `> 0`) discipline as [`relative_l1_error`].
-    #[cfg(feature = "live-gpu-tests")]
-    fn cosine_distance(arm: &[f32], reference: &[f32]) -> f64 {
-        assert_eq!(
-            arm.len(),
-            reference.len(),
-            "cosine_distance: length mismatch"
-        );
-        let non_finite = arm
-            .iter()
-            .chain(reference.iter())
-            .filter(|v| !v.is_finite())
-            .count();
-        assert_eq!(
-            non_finite, 0,
-            "cosine_distance: {non_finite} non-finite value(s)"
-        );
-        let mut dot = 0.0f64;
-        let mut norm_arm = 0.0f64;
-        let mut norm_ref = 0.0f64;
-        for (&a, &r) in arm.iter().zip(reference.iter()) {
-            let a = a as f64;
-            let r = r as f64;
-            dot += a * r;
-            norm_arm += a * a;
-            norm_ref += r * r;
-        }
-        let denom = norm_arm.sqrt() * norm_ref.sqrt();
-        assert!(
-            denom > 0.0,
-            "cosine_distance: arm or reference carries no signal (norm == 0) -- dividing by this \
-             would silently read as a passing distance; the caller's loss/objective is degenerate \
-             for this arm"
-        );
-        let cos = (dot / denom).clamp(-1.0, 1.0);
-        1.0 - cos
-    }
-
-    /// Deterministic mean/max over a non-empty `f64` slice -- affirmative
-    /// finiteness check first (guide §3.7) and a `total_cmp` fold (float
-    /// `max`/`min` combinators are NaN-blind -- `f64::max(NaN, x)
-    /// == x`, silently dropping the NaN rather than failing).
-    #[cfg(feature = "live-gpu-tests")]
-    fn mean_max(values: &[f64]) -> (f64, f64) {
-        assert!(!values.is_empty(), "mean_max: empty slice");
-        let non_finite = values.iter().filter(|v| !v.is_finite()).count();
-        assert_eq!(non_finite, 0, "mean_max: {non_finite} non-finite value(s)");
-        let sum: f64 = values.iter().sum();
-        let mean = sum / values.len() as f64;
-        let max =
-            values.iter().copied().fold(
-                values[0],
-                |a, b| if b.total_cmp(&a).is_gt() { b } else { a },
-            );
-        (mean, max)
-    }
-
-    /// One seed's four leg errors (both arms compared against the SAME f32
-    /// reference at that seed) -- the shared unit the healthy oracle and
-    /// every RED control below reduce over. Pooled uses
-    /// [`relative_l1_error`]; grad uses [`cosine_distance`] (see that
-    /// function's own doc for why the grad leg needs a scale-invariant
-    /// metric).
-    #[cfg(feature = "live-gpu-tests")]
-    #[derive(Clone, Copy, Debug)]
-    struct FlashOracleSeedMeasurement {
-        seed: u64,
-        pooled_other: f64,
-        pooled_block: f64,
-        grad_other: f64,
-        grad_block: f64,
-    }
-
-    #[cfg(feature = "live-gpu-tests")]
-    impl FlashOracleSeedMeasurement {
-        fn pooled_ratio(&self) -> f64 {
-            self.pooled_other / self.pooled_block
-        }
-        fn grad_ratio(&self) -> f64 {
-            self.grad_other / self.grad_block
-        }
-    }
-
-    /// Builds a model, runs `forward`, and reduces to `(pooled, grad)` via
-    /// [`flash_oracle_pooled_and_grad`] -- the ONE per-arm measurement
-    /// primitive every call site below shares (a fresh `VarMap` per call,
-    /// same precedent as this section's own original `run_flash_oracle_shape`:
-    /// production-scale ModernBERT-large (28 layers, hidden=1024) at
-    /// forward+backward is real training-step memory, and holding more
-    /// than one arm's graph alive at once OOM'd on an 80GB A100, confirmed
-    /// live).
-    #[cfg(feature = "live-gpu-tests")]
-    fn flash_oracle_measure_arm<B, F>(
-        build: B,
-        forward: F,
-        mask: &Tensor,
-        dy: &Tensor,
-    ) -> (Vec<f32>, Vec<f32>)
-    where
-        B: FnOnce() -> ModernBert,
-        F: FnOnce(&ModernBert) -> Result<Tensor, EncoderError>,
-    {
-        let model = build();
-        let hidden = forward(&model).unwrap();
-        flash_oracle_pooled_and_grad(&model, &hidden, mask, dy)
-    }
-
-    /// Sweeps `seeds`, measuring the caller-supplied "other" arm
-    /// (`other_build`/`other_forward` -- the flash arm for the healthy
-    /// oracle, or a fault-injected arm for a RED control) against the
-    /// production block-bf16 arm and an f32 reference, ALL from the SAME
-    /// `input_ids`/`dy` at each seed. Returns one
-    /// [`FlashOracleSeedMeasurement`] per seed, printed as it goes
-    /// (`--nocapture`) so the full per-seed table is always visible, not
-    /// just the reduced statistic.
-    #[cfg(feature = "live-gpu-tests")]
-    #[allow(clippy::too_many_arguments)]
-    fn flash_oracle_sweep<BO, FO>(
-        config: &ModernBertConfig,
-        weights: &std::path::Path,
-        cuda: &Device,
-        batch: usize,
-        seq: usize,
-        seeds: &[u64],
-        label: &str,
-        other_build: BO,
-        other_forward: FO,
-    ) -> Vec<FlashOracleSeedMeasurement>
-    where
-        BO: Fn(u64) -> ModernBert,
-        FO: Fn(&ModernBert, &Tensor, &Tensor) -> Result<Tensor, EncoderError>,
-    {
-        let mut out = Vec::with_capacity(seeds.len());
-        for &seed in seeds {
-            let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, cuda);
-            let mask = Tensor::ones((batch, seq), DType::U32, cuda).unwrap();
-            let dy = flash_oracle_seeded_dy(batch, config.hidden_size, seed, cuda);
-
-            let (pooled_other, grad_other) = flash_oracle_measure_arm(
-                || other_build(seed),
-                |m| other_forward(m, &ids, &mask),
-                &mask,
-                &dy,
-            );
-            let (pooled_block, grad_block) = flash_oracle_measure_arm(
-                || flash_oracle_build_model(config, weights, DType::BF16, seed, cuda, true),
-                |m| forward_hidden_forcing_flash(m, &ids, &mask, true),
-                &mask,
-                &dy,
-            );
-            let (pooled_f32, grad_f32) = flash_oracle_measure_arm(
-                || flash_oracle_build_model(config, weights, DType::F32, seed, cuda, false),
-                |m| m.forward_hidden(&ids, &mask),
-                &mask,
-                &dy,
-            );
-
-            let m = FlashOracleSeedMeasurement {
-                seed,
-                pooled_other: relative_l1_error(&pooled_other, &pooled_f32),
-                pooled_block: relative_l1_error(&pooled_block, &pooled_f32),
-                grad_other: cosine_distance(&grad_other, &grad_f32),
-                grad_block: cosine_distance(&grad_block, &grad_f32),
-            };
-            eprintln!(
-                "flash_oracle_sweep[{label} seed={seed}]: pooled other={:.5e} block={:.5e} \
-                 ratio={:.4}; grad other={:.5e} block={:.5e} ratio={:.4}",
-                m.pooled_other,
-                m.pooled_block,
-                m.pooled_ratio(),
-                m.grad_other,
-                m.grad_block,
-                m.grad_ratio(),
-            );
-            out.push(m);
-        }
-        out
-    }
-
-    /// Prints the full per-seed `(pooled_ratio, grad_ratio)` table -- the
-    /// artifact-grade record every `--nocapture` caller below relies on
-    /// (the committed `2026-08-25-flash-arm-encoder-oracle-*.json`
-    /// artifacts are built FROM this output), not just the reduced mean/max
-    /// statistic.
-    #[cfg(feature = "live-gpu-tests")]
-    fn print_seed_ratio_table(label: &str, measurements: &[FlashOracleSeedMeasurement]) {
-        for m in measurements {
-            eprintln!(
-                "  seed={:>3} [{label}]: pooled_ratio={:.4} grad_ratio={:.4}",
-                m.seed,
-                m.pooled_ratio(),
-                m.grad_ratio(),
-            );
-        }
-    }
-
-    /// The main oracle: flash-bf16 vs block-bf16 vs f32, on the pooled
-    /// embedding AND the step-0 `dL/dWqkv-LoRA` gradient, over
-    /// [`FLASH_ORACLE_SWEEP_SEEDS`], for ONE shape. Prints the per-seed
-    /// table (including the per-seed max, for diagnostics) and asserts the
-    /// MEAN ratio against [`FLASH_ORACLE_K_MEAN_POOLED`]/
-    /// [`FLASH_ORACLE_K_MEAN_GRAD`] -- there is no per-seed MAX assertion
-    /// (see [`FLASH_ORACLE_K_MEAN_GRAD`]'s own doc for why one existed
-    /// before and was deleted).
-    #[cfg(feature = "live-gpu-tests")]
-    fn run_flash_oracle_shape_sweep(
-        config: &ModernBertConfig,
-        weights: &std::path::Path,
-        cuda: &Device,
-        batch: usize,
-        seq: usize,
-        label: &str,
-    ) {
-        let measurements = flash_oracle_sweep(
-            config,
-            weights,
-            cuda,
-            batch,
-            seq,
-            &FLASH_ORACLE_SWEEP_SEEDS,
-            label,
-            |seed| flash_oracle_build_model(config, weights, DType::BF16, seed, cuda, true),
-            |m, ids, mask| {
-                let before = cascade_counters_for("attention_block_flash").snapshot();
-                let hidden = forward_hidden_forcing_flash(m, ids, mask, false)?;
-                let after = cascade_counters_for("attention_block_flash").snapshot();
-                assert_eq!(
-                    after.fused - before.fused,
-                    config.num_hidden_layers as u64,
-                    "[{label}] flash arm: zero dispatch is RED (guide §3.5) -- every layer must \
-                     have actually dispatched Fused on this dense batch"
-                );
-                Ok(hidden)
-            },
-        );
-
-        print_seed_ratio_table(label, &measurements);
-        let pooled_ratios: Vec<f64> = measurements.iter().map(|m| m.pooled_ratio()).collect();
-        let grad_ratios: Vec<f64> = measurements.iter().map(|m| m.grad_ratio()).collect();
-        let (pooled_mean, pooled_max) = mean_max(&pooled_ratios);
-        let (grad_mean, grad_max) = mean_max(&grad_ratios);
-
-        eprintln!(
-            "flash_oracle[{label}] OVER {} SEEDS: pooled ratio mean={pooled_mean:.4} \
-             max={pooled_max:.4} (bound mean<={FLASH_ORACLE_K_MEAN_POOLED}, max UNASSERTED -- \
-             diagnostic only); grad ratio mean={grad_mean:.4} max={grad_max:.4} (bound \
-             mean<={FLASH_ORACLE_K_MEAN_GRAD}, max UNASSERTED -- diagnostic only)",
-            FLASH_ORACLE_SWEEP_SEEDS.len(),
-        );
-
-        assert!(
-            pooled_mean.is_finite() && pooled_mean <= FLASH_ORACLE_K_MEAN_POOLED,
-            "[{label}] pooled embedding: mean ratio {pooled_mean:.4} over {} seeds exceeds \
-             FLASH_ORACLE_K_MEAN_POOLED={FLASH_ORACLE_K_MEAN_POOLED}",
-            FLASH_ORACLE_SWEEP_SEEDS.len(),
-        );
-        assert!(
-            grad_mean.is_finite() && grad_mean <= FLASH_ORACLE_K_MEAN_GRAD,
-            "[{label}] LoRA gradient (last layer Wqkv B): mean ratio {grad_mean:.4} over {} seeds \
-             exceeds FLASH_ORACLE_K_MEAN_GRAD={FLASH_ORACLE_K_MEAN_GRAD}",
-            FLASH_ORACLE_SWEEP_SEEDS.len(),
-        );
-    }
-
-    /// `cuMemGetInfo` (via `candle_core::cuda_backend::cudarc::driver::
-    /// result::mem_get_info`) after a device sync -- the SAME driver-level
-    /// "free bytes right now" reading `jammi-bench`'s `peak_vram_bytes`
-    /// sampler polls through `nvidia-smi`, just called in-process so it can
-    /// be interleaved with individual layer forwards rather than only
-    /// sampled on a background thread. Returns free memory in MiB.
-    #[cfg(feature = "live-gpu-tests")]
-    fn cuda_free_mib(device: &Device) -> f64 {
-        device
-            .synchronize()
-            .expect("device sync before mem_get_info");
-        let (free, _total) = candle_core::cuda_backend::cudarc::driver::result::mem_get_info()
-            .expect("cuMemGetInfo_v2 failed");
-        free as f64 / (1024.0 * 1024.0)
-    }
-
-    /// The SAME `cuMemGetInfo` driver call [`cuda_free_mib`] makes, reading
-    /// the OTHER half of its `(free, total)` pair — this device's TOTAL
-    /// installed memory in MiB, a fixed hardware property (not a
-    /// currently-free reading). [`assert_vram_floor`]'s own probe.
-    #[cfg(feature = "live-gpu-tests")]
-    fn cuda_total_mib(device: &Device) -> f64 {
-        device
-            .synchronize()
-            .expect("device sync before mem_get_info");
-        let (_free, total) = candle_core::cuda_backend::cudarc::driver::result::mem_get_info()
-            .expect("cuMemGetInfo_v2 failed");
-        total as f64 / (1024.0 * 1024.0)
-    }
-
-    /// A floor on this device's TOTAL memory below which the four
-    /// 80GB-class encoder-level real-checkpoint oracles
-    /// (`flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16` + its
-    /// three RED controls) are structurally unable to run (one arm of
-    /// production-scale ModernBERT-large at forward+backward is
-    /// 80GB-class; see [`flash_oracle_measure_arm`]'s own doc).
-    ///
-    /// 64 GiB: comfortably above the CONFIRMED-insufficient 48 GiB tier
-    /// (L40S/A40 — both OOM'd at model-load with an otherwise EMPTY
-    /// device, `0` MiB used, no zombie process, even under a SERIALIZED
-    /// `--test-threads=1` solo rerun — a genuine capability ceiling, not a
-    /// concurrency artifact or a leak) and comfortably below the
-    /// CONFIRMED-sufficient 80 GiB tier (A100/H100, fully green on every
-    /// leg including these four). No number tighter than this two-SKU
-    /// bracket has actually been measured (a solo run's own peak VRAM was
-    /// never sampled in isolation — only the pass/fail boundary at these
-    /// two real SKU tiers is known), so this floor is a reasoned midpoint
-    /// between two confirmed data points, not a precisely-derived one; a
-    /// future SKU landing between 48 and 80 GiB would need its own real
-    /// measurement to place this floor more precisely.
-    #[cfg(feature = "live-gpu-tests")]
-    const FLASH_ORACLE_ENCODER_LEVEL_VRAM_FLOOR_MIB: f64 = 64.0 * 1024.0;
-
-    /// Asserts `device` has the memory the encoder-level real-checkpoint
-    /// oracles need: one arm of production-scale ModernBERT-large at
-    /// forward+backward is 80GB-class training-step memory, so a 48 GiB card
-    /// cannot hold it.
-    #[cfg(feature = "live-flash-oracle-tests")]
-    fn assert_vram_floor(device: &Device) {
-        let total_mib = cuda_total_mib(device);
-        assert!(
-            total_mib >= FLASH_ORACLE_ENCODER_LEVEL_VRAM_FLOOR_MIB,
-            "this test needs at least {FLASH_ORACLE_ENCODER_LEVEL_VRAM_FLOOR_MIB:.0} MiB of \
-             device memory; this device has {total_mib:.0} MiB"
-        );
-    }
-
-    /// Per-layer VRAM attribution probe for the flash arm's peak VRAM. It
-    /// does NOT mirror [`forward_hidden_forcing_flash`]'s body -- that
-    /// function is a thin seam over `ModernBert::forward_hidden_inner`,
-    /// which includes the padded/ragged encoder-boundary transport gate
-    /// (`unpad_rows` before layer 0, `repad_rows` after); THIS probe is a
-    /// hand-mirrored per-layer loop without transport, with one addition -- a [`cuda_free_mib`] reading after each layer's
-    /// forward, printed as a delta against the PRIOR reading -- and does
-    /// NOT gather/scatter. Its own ONLY call site
-    /// ([`flash_vs_block_per_layer_vram_attribution_probe_cuda`]) always
-    /// passes an ALL-ONES (dense, unpadded) mask, so the missing transport
-    /// gate is a NO-OP there (a genuinely padded batch would
-    /// take the `!admission.is_dense` branch `forward_hidden_inner` skips
-    /// this probe entirely) -- but a caller that reused this probe with a
-    /// padded mask would silently get the WRONG (untransported) per-layer
-    /// VRAM profile, not a refusal. `label` names the arm in the printed
-    /// table (`"flash"` / `"block"`) purely for a human reading
-    /// `--nocapture` output; this function asserts nothing -- it is a
-    /// diagnostic tool, not an oracle (the calling test's own dispatch
-    /// count assertion is the oracle that the intended arm actually ran).
-    #[cfg(feature = "live-gpu-tests")]
-    fn forward_hidden_forcing_flash_vram_probe(
-        model: &ModernBert,
-        input_ids: &Tensor,
-        mask: &Tensor,
-        force_decline: bool,
-        label: &str,
-    ) -> Tensor {
-        let device = input_ids.device().clone();
-        let mut prev = cuda_free_mib(&device);
-        println!("[vram-probe {label}] start free={prev:.2} MiB");
-        let (_batch, seq) = input_ids.dims2().unwrap();
-        let word_emb = model.word_embeddings.forward(input_ids).unwrap();
-        let mut hidden = model.emb_norm.forward(&word_emb).unwrap();
-        let extended = extended_attention_mask(mask).unwrap();
-        let local_band = model
-            .local_half_window
-            .map(|half| model.sliding_band(seq, half, &device).unwrap());
-        let fused_masks = if model.training {
-            Some(
-                FusedAttentionMasks::build(&extended, local_band.as_ref(), hidden.dtype()).unwrap(),
-            )
-        } else {
-            None
-        };
-        let flash_admission = if model.training {
-            if force_decline {
-                Some(declined_flash())
-            } else {
-                let head_dim = model
-                    .layers
-                    .first()
-                    .map(|l| l.attention.head_dim)
-                    .unwrap_or(0);
-                Some(decide_flash_admission(&device, hidden.dtype(), head_dim, mask, None).unwrap())
-            }
-        } else {
-            None
-        };
-        let now = cuda_free_mib(&device);
-        println!(
-            "[vram-probe {label}] after-setup free={now:.2} MiB delta={:.2} MiB",
-            prev - now
-        );
-        prev = now;
-        for (i, layer) in model.layers.iter().enumerate() {
-            hidden = layer
-                .forward(
-                    &hidden,
-                    &extended,
-                    local_band.as_ref(),
-                    fused_masks.as_ref(),
-                    flash_admission.as_ref(),
-                )
-                .unwrap();
-            let now = cuda_free_mib(&device);
-            println!(
-                "[vram-probe {label}] layer {i:02} free={now:.2} MiB delta={:.2} MiB",
-                prev - now
-            );
-            prev = now;
-        }
-        let out = model.final_norm.forward(&hidden).unwrap();
-        let now = cuda_free_mib(&device);
-        println!(
-            "[vram-probe {label}] after-final-norm free={now:.2} MiB delta={:.2} MiB",
-            prev - now
-        );
-        out
-    }
-
-    /// Drives [`forward_hidden_forcing_flash_vram_probe`] for BOTH arms, in
-    /// ONE process, from the SAME loaded checkpoint: per-layer `Device` memory
-    /// queries after each layer's forward, plus one more after backward,
-    /// for both arms, so the per-layer delta table can be read off
-    /// `--nocapture` output directly rather than reconstructed from two
-    /// separate log files. Compiled under `live-flash-oracle-tests`; reads
-    /// the checkpoint from `JAMMI_FLASH_ORACLE_MODEL_DIR` (panics naming it
-    /// when unset), like every other real-checkpoint test in this file. A
-    /// fresh model (fresh `VarMap`) per arm, exactly
-    /// [`run_flash_oracle_shape_sweep`]'s own precedent, so one arm's
-    /// retained graph cannot skew the other's baseline.
-    #[test]
-    #[cfg(feature = "live-flash-oracle-tests")]
-    fn flash_vs_block_per_layer_vram_attribution_probe_cuda() {
-        let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
-        let cuda = jammi_test_resources::cuda_device(0);
-        // This test builds a REAL ModernBERT-large model at the SAME
-        // (8, 512) shape as the four encoder-level oracles and calls a REAL
-        // `.backward()` (twice — once per `[(false, "flash"), (true,
-        // "block")]` arm, each with its own fresh model) — the identical
-        // 80GB-class fwd+bwd profile, so it needs the same VRAM floor.
-        assert_flash_arch(&cuda);
-        assert_vram_floor(&cuda);
-        let _lock = crate::test_support::seam_counter_lock();
-        let _d2h_guard = FLASH_D2H_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let dir = std::path::PathBuf::from(&model_dir);
-        let config: ModernBertConfig =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
-                .unwrap();
-        let weights = dir.join("model.safetensors");
-        let (batch, seq, seed) = (8usize, 512usize, 42u64);
-        let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
-        let mask = Tensor::ones((batch, seq), DType::U32, &cuda).unwrap();
-
-        for (force_decline, label) in [(false, "flash"), (true, "block")] {
-            let bf16_model =
-                flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
-            let counter_before = cascade_counters_for("attention_block_flash").snapshot();
-            let hidden = forward_hidden_forcing_flash_vram_probe(
-                &bf16_model,
-                &ids,
-                &mask,
-                force_decline,
-                label,
-            );
-            let counter_after = cascade_counters_for("attention_block_flash").snapshot();
-            if force_decline {
-                assert_eq!(
-                    counter_after.fused - counter_before.fused,
-                    0,
-                    "[{label}] the block arm must not have dispatched attention_block_flash"
-                );
-            } else {
-                assert_eq!(
-                    counter_after.fused - counter_before.fused,
-                    config.num_hidden_layers as u64,
-                    "[vram-probe {label}] zero dispatch is RED (guide §3.5) -- every layer must \
-                     have actually dispatched Fused on this dense batch"
-                );
-            }
-            let pooled = pool_and_normalize(&hidden, &mask, Pooling::Mean).unwrap();
-            let loss = pooled
-                .to_dtype(DType::F32)
-                .unwrap()
-                .sqr()
-                .unwrap()
-                .sum_all()
-                .unwrap();
-            let before_bwd = cuda_free_mib(&cuda);
-            let grads = loss.backward().unwrap();
-            let after_bwd = cuda_free_mib(&cuda);
-            println!(
-                "[vram-probe {label}] after-backward free={after_bwd:.2} MiB delta={:.2} MiB",
-                before_bwd - after_bwd
-            );
-            drop(grads);
-            drop(hidden);
-            drop(bf16_model);
-            let after_drop = cuda_free_mib(&cuda);
-            println!("[vram-probe {label}] after-drop free={after_drop:.2} MiB");
-        }
-    }
-
-    /// Compiled under `live-flash-oracle-tests`: no ModernBERT-large
-    /// checkpoint is committed to this repo, so the checkpoint comes from
-    /// `JAMMI_FLASH_ORACLE_MODEL_DIR`, and a missing CUDA device, arch, VRAM
-    /// floor or model dir each panics naming what is missing.
-    #[test]
-    #[cfg(feature = "live-flash-oracle-tests")]
-    fn flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16() {
-        let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
-        let cuda = jammi_test_resources::cuda_device(0);
-        assert_flash_arch(&cuda);
-        assert_vram_floor(&cuda);
-        let _lock = crate::test_support::seam_counter_lock();
-        let _d2h_guard = FLASH_D2H_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let dir = std::path::PathBuf::from(&model_dir);
-        let config: ModernBertConfig =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
-                .unwrap();
-        let weights = dir.join("model.safetensors");
-
-        run_flash_oracle_shape_sweep(&config, &weights, &cuda, 8, 512, "b8_s512");
-        run_flash_oracle_shape_sweep(&config, &weights, &cuda, 1, 128, "b1_s128");
-    }
-
-    /// The `NoFault` arm of [`forward_hidden_flash_with_fault`] must be
-    /// BIT-IDENTICAL to [`forward_hidden_forcing_flash`]'s real
-    /// (`force_decline = false`) arm -- proof that the fault-injection
-    /// mirror has not drifted from what `ModernBertLayer::forward` /
-    /// `ModernBertAttention::forward_flash_dense_attention` actually run
-    /// (see this section's own block comment, "the two hand-synced
-    /// mirrors"). If this test ever goes red, every RED control below
-    /// stops being trustworthy -- they all inject faults into THIS
-    /// harness, not into production directly.
-    #[test]
-    #[cfg(feature = "live-flash-oracle-tests")]
-    fn flash_arm_fault_harness_nofault_matches_production_bit_identical() {
-        let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
-        let cuda = jammi_test_resources::cuda_device(0);
-        let _lock = crate::test_support::seam_counter_lock();
-        let _d2h_guard = FLASH_D2H_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert_flash_arch(&cuda);
-
-        let dir = std::path::PathBuf::from(&model_dir);
-        let config: ModernBertConfig =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
-                .unwrap();
-        let weights = dir.join("model.safetensors");
-        let seed = 99;
-        let (batch, seq) = (2usize, 64usize);
-        let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
-        let mask = Tensor::ones((batch, seq), DType::U32, &cuda).unwrap();
-
-        let bf16_model =
-            flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
-        let production: Vec<f32> = forward_hidden_forcing_flash(&bf16_model, &ids, &mask, false)
-            .unwrap()
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        let mirror: Vec<f32> =
-            forward_hidden_flash_with_fault(&bf16_model, &ids, &mask, &FlashFault::NoFault)
-                .unwrap()
-                .to_dtype(DType::F32)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1()
-                .unwrap();
-        assert_eq!(
-            production, mirror,
-            "the fault harness's NoFault arm must be bit-identical to production's own \
-             forward_hidden_forcing_flash(force_decline=false) -- any difference means this \
-             hand-synced mirror has drifted from ModernBertAttention::forward_flash_dense_attention"
-        );
-    }
-
-    /// RED control: the window-dropped fault (`half_window` forced `None`
-    /// on every layer, see the block comment above) must VIOLATE the same
-    /// bound the real oracle asserts above, on BOTH legs, in MEAN, over
-    /// the SAME [`FLASH_ORACLE_SWEEP_SEEDS`].
-    #[test]
-    #[cfg(feature = "live-flash-oracle-tests")]
-    fn flash_arm_encoder_level_oracle_red_control_window_dropped() {
-        let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
-        let cuda = jammi_test_resources::cuda_device(0);
-        assert_flash_arch(&cuda);
-        assert_vram_floor(&cuda);
-        let _lock = crate::test_support::seam_counter_lock();
-        let _d2h_guard = FLASH_D2H_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let dir = std::path::PathBuf::from(&model_dir);
-        let config: ModernBertConfig =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
-                .unwrap();
-        let weights = dir.join("model.safetensors");
-        let (batch, seq) = (8usize, 512usize);
-        let label = "window_dropped_b8_s512";
-
-        let measurements = flash_oracle_sweep(
-            &config,
-            &weights,
-            &cuda,
-            batch,
-            seq,
-            &FLASH_ORACLE_SWEEP_SEEDS,
-            label,
-            |seed| {
-                // FAULT: force every layer's flash-arm sliding window off --
-                // the window is construction data ONLY the flash arm reads
-                // (see `ModernBertAttention::half_window`'s own doc); the
-                // block arm's sliding band comes from a separate field
-                // (`ModernBert::local_half_window`) and is unaffected.
-                let mut m =
-                    flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
-                for layer in m.layers.iter_mut() {
-                    layer.attention.half_window = None;
-                }
-                m
-            },
-            |m, ids, mask| forward_hidden_forcing_flash(m, ids, mask, false),
-        );
-
-        assert_red_control_violates_bound(label, &measurements);
-    }
-
-    /// RED control: the K-unrotated fault (`FlashFault::KUnrotated`, see
-    /// the block comment above) must VIOLATE the same bound the real
-    /// oracle asserts above, on BOTH legs, in MEAN, over the SAME
-    /// [`FLASH_ORACLE_SWEEP_SEEDS`].
-    #[test]
-    #[cfg(feature = "live-flash-oracle-tests")]
-    fn flash_arm_encoder_level_oracle_red_control_k_unrotated() {
-        run_flash_arm_fault_red_control("k_unrotated_b8_s512", &FlashFault::KUnrotated);
-    }
-
-    /// RED control: a wrong `softmax_scale` (class sweep -- see the block
-    /// comment above) must VIOLATE the same bound too, on BOTH legs, in
-    /// MEAN, over the SAME [`FLASH_ORACLE_SWEEP_SEEDS`].
-    #[test]
-    #[cfg(feature = "live-flash-oracle-tests")]
-    fn flash_arm_encoder_level_oracle_red_control_bad_softmax_scale() {
-        run_flash_arm_fault_red_control(
-            "bad_softmax_scale_b8_s512",
-            &FlashFault::BadSoftmaxScale(1.0),
-        );
-    }
-
-    /// Every RED control above shares this: sweep the SAME 8 seeds, assert
-    /// the fault's MEAN ratio (both legs) exceeds the SAME bound the
-    /// healthy oracle asserts against -- proving the oracle actually
-    /// catches the fault as a DISTRIBUTION-level effect, not merely that
-    /// it "looks wrong" on one lucky draw.
-    #[cfg(feature = "live-flash-oracle-tests")]
-    fn run_flash_arm_fault_red_control(label: &str, fault: &FlashFault) {
-        let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
-        let cuda = jammi_test_resources::cuda_device(0);
-        assert_vram_floor(&cuda);
-        assert_flash_arch(&cuda);
-        let _lock = crate::test_support::seam_counter_lock();
-        let _d2h_guard = FLASH_D2H_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let dir = std::path::PathBuf::from(&model_dir);
-        let config: ModernBertConfig =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
-                .unwrap();
-        let weights = dir.join("model.safetensors");
-        let (batch, seq) = (8usize, 512usize);
-
-        let measurements = flash_oracle_sweep(
-            &config,
-            &weights,
-            &cuda,
-            batch,
-            seq,
-            &FLASH_ORACLE_SWEEP_SEEDS,
-            label,
-            |seed| flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true),
-            |m, ids, mask| forward_hidden_flash_with_fault(m, ids, mask, fault),
-        );
-
-        assert_red_control_violates_bound(label, &measurements);
-    }
-
-    /// Shared assertion every RED control above ends with: the fault's MEAN
-    /// pooled ratio AND MEAN grad ratio, over [`FLASH_ORACLE_SWEEP_SEEDS`],
-    /// must each exceed the healthy bound -- if either does not, the real
-    /// oracle above would NOT have caught this defect on that leg.
-    #[cfg(feature = "live-gpu-tests")]
-    fn assert_red_control_violates_bound(label: &str, measurements: &[FlashOracleSeedMeasurement]) {
-        print_seed_ratio_table(label, measurements);
-        let pooled_ratios: Vec<f64> = measurements.iter().map(|m| m.pooled_ratio()).collect();
-        let grad_ratios: Vec<f64> = measurements.iter().map(|m| m.grad_ratio()).collect();
-        let (pooled_mean, _pooled_max) = mean_max(&pooled_ratios);
-        let (grad_mean, _grad_max) = mean_max(&grad_ratios);
-
-        eprintln!(
-            "RED control [{label}]: pooled mean ratio={pooled_mean:.4} (bound \
-             {FLASH_ORACLE_K_MEAN_POOLED}); grad mean ratio={grad_mean:.4} (bound \
-             {FLASH_ORACLE_K_MEAN_GRAD})"
-        );
-
-        assert!(
-            pooled_mean.is_finite() && pooled_mean > FLASH_ORACLE_K_MEAN_POOLED,
-            "RED control [{label}] must VIOLATE the pooled-leg bound in mean (mean ratio \
-             {pooled_mean:.4} must exceed FLASH_ORACLE_K_MEAN_POOLED={FLASH_ORACLE_K_MEAN_POOLED}) \
-             -- if this assertion fails, the real oracle above would NOT have caught this defect \
-             on the pooled leg"
-        );
-        assert!(
-            grad_mean.is_finite() && grad_mean > FLASH_ORACLE_K_MEAN_GRAD,
-            "RED control [{label}] must VIOLATE the grad-leg bound in mean (mean ratio \
-             {grad_mean:.4} must exceed FLASH_ORACLE_K_MEAN_GRAD={FLASH_ORACLE_K_MEAN_GRAD}) -- \
-             if this assertion fails, the real oracle above would NOT have caught this defect on \
-             the grad leg"
-        );
     }
 
     /// Path P's encoders-side seam (`forward_hidden_with_lengths`, contract
@@ -9677,287 +7707,6 @@ mod tests {
         );
     }
 
-    /// The GEMM-operand-form defect oracle: a `.contiguous()`-restored
-    /// regression is invisible to any SINGLE
-    /// fused-vs-eager `bwd` call — its systematic bias is smaller than
-    /// ordinary bf16 rounding noise at depth 1 (this crate's own
-    /// per-element derived bounds already admit it) — and only separates
-    /// from noise by COMPOUNDING through depth. This drives the REAL
-    /// `forward_training_attention` (fused arm) and
-    /// `forward_eager_training_attention_composition` (production eager
-    /// arm) `L_MAX` times each, chaining each call's own output back into
-    /// the next call's `qkv` input (`qkv_next = cat([out, out, out],
-    /// last)` — a weight-free, shape-correct bridge: the mechanism under
-    /// test lives entirely inside the attention call itself, not in any
-    /// inter-layer projection, so no per-layer `Wqkv` is needed) from a
-    /// SINGLE tracked `qkv` `Var`, then compares the two arms'
-    /// `dqkv` at the END of the chain, not after one call.
-    ///
-    /// Discriminating quantity: `r(L) = Σ|dqkv_fused - dqkv_eager| /
-    /// Σ|dqkv_eager|` per `qkv` slot. Gate: `r(L_MAX) <= C * max(r(1),
-    /// EPS)` — `r(1)`, MEASURED on this same run, is the noise floor, not
-    /// an absolute bf16-ULP constant (floor discipline). Six non-vacuity
-    /// clauses, all required for this leg to count: (1) RED-FIRST
-    /// PROVENANCE — this leg is RED with the three `.contiguous()` calls
-    /// `jammi_kernels::ops::attention_block`'s `bwd_core` omits restored,
-    /// GREEN without. (2) DISPATCH
-    /// PROVENANCE — asserted below. (3) NON-FINITE — every comparison is
-    /// `assert!(x.is_finite() && x <= bound)`, never a negated `>`.
-    /// (4) SIGNAL — `Σ|dqkv_eager| > 0` per slot, asserted before it is
-    /// used as a denominator. (5) INDEPENDENCE — "eager" is
-    /// `forward_eager_training_attention_composition` itself, called
-    /// directly (the SAME method `forward_training_attention`'s own
-    /// fallback calls), never a copy of its logic in this test file.
-    /// (6) FLOOR DISCIPLINE — the gate above uses only measured
-    /// quantities from THIS run.
-    ///
-    /// An `F32` run of the SAME chain (`forward_eager_training_
-    /// attention_composition` at `L_MAX` deep, `F32`) is the
-    /// anti-vacuity anchor: it CANNOT itself redden on this defect (both
-    /// `bf16` arms' GEMM reduction orders are individually legal relative
-    /// to it), so it exists only to catch the two `bf16` arms being wrong
-    /// TOGETHER in some unrelated way — confirmation, never the gate.
-    #[test]
-    #[cfg(feature = "live-gpu-tests")]
-    fn attention_block_fused_vs_eager_dqkv_divergence_grows_with_depth_bf16_cuda() {
-        let device = jammi_test_resources::cuda_device(0);
-        let _lock = crate::test_support::seam_counter_lock();
-
-        const L_MAX: usize = 28; // the real ModernBERT-large depth this defect was found on.
-        let (b, s, h): (usize, usize, usize) = (8, 512, 16);
-        let d = ATTENTION_BLOCK_HEAD_DIM;
-        let hd = h * d;
-        let half_window = 64usize;
-        let attn = attention_block_fixture(true, h, s, &device);
-
-        let n = b * s * 3 * hd;
-        let qkv0_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.0137).sin() * 0.6).collect();
-        let dy_v: Vec<f32> = (0..(b * s * hd))
-            .map(|i| ((i as f32) * 0.0059).cos() * 0.5 + 0.05)
-            .collect();
-        let extended = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
-        let band = crate::mask::sliding_window_mask(s, half_window, &device).unwrap();
-        let fused_masks_bf16 =
-            FusedAttentionMasks::build(&extended, Some(&band), DType::BF16).unwrap();
-
-        // Returns `(dqkv, fused_dispatch_delta, eager_dispatch_delta)`.
-        let run = |force_eager: bool, dtype: DType, l: usize| -> (Vec<f32>, u64, u64) {
-            let before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-            let qkv = Var::from_tensor(
-                &Tensor::from_vec(qkv0_v.clone(), (b, s, 3 * hd), &device)
-                    .unwrap()
-                    .to_dtype(dtype)
-                    .unwrap(),
-            )
-            .unwrap();
-            let dy = Tensor::from_vec(dy_v.clone(), (b, s, hd), &device)
-                .unwrap()
-                .to_dtype(dtype)
-                .unwrap();
-            assert!(l > 0, "run: l must be >= 1");
-            let mut cur = qkv.as_tensor().clone();
-            let mut last_out = None;
-            for _ in 0..l {
-                let out = if force_eager {
-                    attn.forward_eager_training_attention_composition(
-                        &cur,
-                        b,
-                        s,
-                        h,
-                        d,
-                        &extended,
-                        Some(&band),
-                    )
-                    .unwrap()
-                } else {
-                    let masks = TrainingMaskInputs {
-                        extended: &extended,
-                        local_band: Some(&band),
-                        fused: Some(&fused_masks_bf16),
-                    };
-                    attn.forward_training_attention(&cur, b, s, h, d, masks, &declined_flash())
-                        .unwrap()
-                };
-                // Amplitude control between chained calls (no residual/
-                // LayerNorm in this synthetic chain — see this test's own
-                // doc): a plain max-abs rescale keeps `cur` inside this
-                // op's own validated bf16 domain (module doc's "BF16
-                // validated-coverage ceiling" section) across `L_MAX`
-                // layers.
-                let out_max = out
-                    .abs()
-                    .unwrap()
-                    .flatten_all()
-                    .unwrap()
-                    .max(0)
-                    .unwrap()
-                    .to_dtype(DType::F32)
-                    .unwrap()
-                    .to_scalar::<f32>()
-                    .unwrap()
-                    .max(1e-6);
-                let out_n = (&out / f64::from(out_max)).unwrap();
-                cur = Tensor::cat(&[&out_n, &out_n, &out_n], D::Minus1).unwrap();
-                last_out = Some(out);
-            }
-            // `cur` (the last iteration's RE-TILED `[b, s, 3*hd]` bridge
-            // for a NEXT iteration that never runs) is NOT the loss input
-            // — `last_out` (`[b, s, hd]`, the last iteration's own
-            // attention output, matching `dy`'s shape) is.
-            let loss = (last_out.unwrap() * &dy).unwrap().sum_all().unwrap();
-            let grads = loss.backward().unwrap();
-            let dqkv: Vec<f32> = grads
-                .get(&qkv)
-                .unwrap()
-                .to_dtype(DType::F32)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1()
-                .unwrap();
-            let after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
-            (dqkv, after.fused - before.fused, after.eager - before.eager)
-        };
-
-        let (dqkv_fused_1, fused_ctr_1, eager_ctr_1) = run(false, DType::BF16, 1);
-        let (dqkv_eager_1, ef_ctr_1, ee_ctr_1) = run(true, DType::BF16, 1);
-        let (dqkv_fused_l, fused_ctr_l, eager_ctr_l) = run(false, DType::BF16, L_MAX);
-        let (dqkv_eager_l, ef_ctr_l, ee_ctr_l) = run(true, DType::BF16, L_MAX);
-        let (dqkv_ref_l, _, _) = run(true, DType::F32, L_MAX);
-
-        // Clause (2): DISPATCH PROVENANCE — zero dispatch is RED, never
-        // green: a silently-eager-fallen-back fused leg would compare
-        // eager against itself.
-        assert_eq!(
-            fused_ctr_1, 1,
-            "fused leg (L=1) must dispatch fused exactly once"
-        );
-        assert_eq!(
-            eager_ctr_1, 0,
-            "fused leg (L=1) must never fall back to eager"
-        );
-        assert_eq!(
-            fused_ctr_l, L_MAX as u64,
-            "fused leg (L={L_MAX}) must dispatch fused every layer"
-        );
-        assert_eq!(
-            eager_ctr_l, 0,
-            "fused leg (L={L_MAX}) must never fall back to eager"
-        );
-        assert_eq!(ef_ctr_1, 0, "the eager leg calls the eager composition directly — it must never touch the fused dispatch counter");
-        assert_eq!(
-            ee_ctr_1, 0,
-            "the eager leg bypasses `admit` entirely — its own counter stays untouched"
-        );
-        assert_eq!(ef_ctr_l, 0, "the eager leg calls the eager composition directly — it must never touch the fused dispatch counter");
-        assert_eq!(
-            ee_ctr_l, 0,
-            "the eager leg bypasses `admit` entirely — its own counter stays untouched"
-        );
-
-        // Clause (3): NON-FINITE, checked BEFORE any comparison; clause
-        // (4): SIGNAL.
-        let finite_sum = |v: &[f32]| -> (bool, f64) {
-            let mut ok = true;
-            let mut sum = 0f64;
-            for &x in v {
-                ok &= x.is_finite();
-                sum += f64::from(x.abs());
-            }
-            (ok, sum)
-        };
-        let (fused_1_ok, _) = finite_sum(&dqkv_fused_1);
-        let (eager_1_ok, eager_1_sum) = finite_sum(&dqkv_eager_1);
-        let (fused_l_ok, _) = finite_sum(&dqkv_fused_l);
-        let (eager_l_ok, eager_l_sum) = finite_sum(&dqkv_eager_l);
-        let (ref_l_ok, _) = finite_sum(&dqkv_ref_l);
-        assert!(
-            fused_1_ok && eager_1_ok && fused_l_ok && eager_l_ok && ref_l_ok,
-            "non-finite dqkv element(s) present before any comparison"
-        );
-        assert!(
-            eager_1_sum.is_finite() && eager_1_sum > 0.0,
-            "Σ|dqkv_eager| at L=1 must be nonzero"
-        );
-        assert!(
-            eager_l_sum.is_finite() && eager_l_sum > 0.0,
-            "Σ|dqkv_eager| at L={L_MAX} must be nonzero"
-        );
-
-        // r(L) per qkv slot (0=Q,1=K,2=V — `dqkv`'s last axis is
-        // `[q_seg(hd), k_seg(hd), v_seg(hd)]`, `forward_eager_training_
-        // attention_composition`'s own `narrow` layout).
-        let r = |fused: &[f32], eager: &[f32]| -> [f64; 3] {
-            let mut num = [0f64; 3];
-            let mut den = [0f64; 3];
-            for (i, (&fv, &ev)) in fused.iter().zip(eager.iter()).enumerate() {
-                let slot = (i / hd) % 3;
-                num[slot] += f64::from((fv - ev).abs());
-                den[slot] += f64::from(ev.abs());
-            }
-            [
-                num[0] / den[0].max(1e-30),
-                num[1] / den[1].max(1e-30),
-                num[2] / den[2].max(1e-30),
-            ]
-        };
-        let r1 = r(&dqkv_fused_1, &dqkv_eager_1);
-        let rl = r(&dqkv_fused_l, &dqkv_eager_l);
-
-        // The gate: GROWTH, not magnitude. `EPS` guards only against a
-        // pathological exact `r(1) == 0` tie (measured: on the FIXED
-        // build `r(1)` is exactly `0.0` for every slot — this op's own
-        // GEMMs are bit-identical to production's at a single call, at
-        // this shape — and a floor at 0 would divide by zero below); it
-        // is set two orders of magnitude BELOW the smallest genuinely-
-        // measured `r(1)` a GPU run of this test records with the
-        // defect present (`~1.04e-7`, F32-epsilon scale — an ordinary
-        // bf16 arm agrees with production almost exactly at ONE call even
-        // WITH the defect live, which is the whole reason a single-call
-        // comparison cannot see it), so it never competes with a real
-        // measurement — it is not the discriminating bound itself.
-        const C: f64 = 4.0;
-        const EPS: f64 = 1e-9;
-        for slot in 0..3 {
-            let floor = r1[slot].max(EPS);
-            let bound = C * floor;
-            assert!(
-                rl[slot].is_finite() && rl[slot] <= bound,
-                "slot {slot} (0=Q,1=K,2=V): r(L={L_MAX})={:e} exceeds {C}*max(r(1),{EPS:e})={bound:e} \
-                 (r(1)={:e}) — the fused/eager divergence is growing SYSTEMATICALLY with depth, not \
-                 staying at the L=1 bf16-noise scale",
-                rl[slot],
-                r1[slot],
-            );
-        }
-
-        // Anti-vacuity anchor (does NOT gate the defect — see this test's
-        // own doc): both bf16 arms must each stay within a generous,
-        // depth-scaled multiple of ordinary bf16 rounding of the F32
-        // reference, ruling out both arms being wrong TOGETHER.
-        let anchor = |bf16_v: &[f32]| -> f64 {
-            let mut num = 0f64;
-            let mut den = 0f64;
-            for (&x, &rf) in bf16_v.iter().zip(dqkv_ref_l.iter()) {
-                num += f64::from((x - rf).abs());
-                den += f64::from(rf.abs());
-            }
-            num / den.max(1e-30)
-        };
-        let fused_anchor = anchor(&dqkv_fused_l);
-        let eager_anchor = anchor(&dqkv_eager_l);
-        assert!(
-            fused_anchor.is_finite() && fused_anchor <= 0.5,
-            "fused dqkv at L={L_MAX} deviates from the F32 anchor by {fused_anchor:e} — too large \
-             to be ordinary bf16 rounding compounded over {L_MAX} layers"
-        );
-        assert!(
-            eager_anchor.is_finite() && eager_anchor <= 0.5,
-            "eager dqkv at L={L_MAX} deviates from the F32 anchor by {eager_anchor:e} — too large \
-             to be ordinary bf16 rounding compounded over {L_MAX} layers"
-        );
-    }
-
     /// Mirrors `crate::layer_norm::tests::strict_mode_errors_instead_of_
     /// falling_back_on_a_failed_predicate`, for `"attention_block_fused"`:
     /// a domain miss under `AdmissionMode::Strict` must return
@@ -10072,5 +7821,2259 @@ mod tests {
         );
         assert_eq!(frozen_census.layer_norms, census.layer_norms);
         assert_eq!(frozen_census.gelu_seam_calls_per_forward, 0);
+    }
+
+    #[cfg(feature = "live-gpu-tests")]
+    mod gpu {
+        use super::*;
+
+        /// The arch/dtype/head_dim gates after `flash_arch_ok`'s call site, on an
+        /// actual, arch-validated CUDA device: `F16` must clear the dtype gate
+        /// exactly like `BF16` does, and a dtype genuinely outside the compiled
+        /// set (`F32`) must still miss it, under the reason key
+        /// `dtype_is_bf16_or_f16`.
+        #[test]
+        fn flash_capability_gates_admits_f16_alongside_bf16_on_real_cuda_arch_and_head_dim() {
+            let device = jammi_test_resources::cuda_device(0);
+            assert_flash_arch(&device);
+            for dtype in [DType::BF16, DType::F16] {
+                let miss = flash_capability_gates(true, &device, dtype, FLASH_HEAD_DIM);
+                assert_eq!(
+                    miss, None,
+                    "{dtype:?} must clear every capability/domain gate on a real, arch-validated \
+                     CUDA device -- got a miss: {miss:?}"
+                );
+            }
+            let miss = flash_capability_gates(true, &device, DType::F32, FLASH_HEAD_DIM);
+            assert_eq!(
+                miss,
+                Some((PredicateOutcome::DomainMiss, "dtype_is_bf16_or_f16", None)),
+                "a dtype outside the compiled {{BF16, F16}} set must still miss, under the \
+                 dtype_is_bf16_or_f16 reason key"
+            );
+        }
+
+        /// THE end-to-end proof for the dense flash arm: on the SAME
+        /// `tests/fixtures/tiny_modernbert_head64` checkpoint, a DENSE
+        /// (all-ones, no padding) mask, CUDA, bf16 — `attention_block_flash`
+        /// actually dispatches `Fused` (count == `num_hidden_layers`), the
+        /// BLOCK arm's own counter does NOT move for those layers (flash took
+        /// over, not a second arm racing it), `attention_block_flash.declined
+        /// == 0`, and the output is finite. On a build WITHOUT the
+        /// `flash-attn` feature (`cuda` alone), `FLASH_COMPILED` is `false`,
+        /// so the SAME assertions invert: the cascade declines and the block
+        /// arm fires instead — this test is meaningful (and green) under
+        /// EITHER feature combination, not just the real one.
+        #[test]
+        fn forward_hidden_dispatches_attention_block_flash_fused_on_a_dense_cuda_bf16_checkpoint() {
+            let device = jammi_test_resources::cuda_device(0);
+            let _lock = crate::test_support::seam_counter_lock();
+            let _d2h_guard = FLASH_D2H_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/tiny_modernbert_head64");
+            let config: ModernBertConfig =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                    .unwrap();
+            let weights = dir.join("model.safetensors");
+            let varmap = candle_nn::VarMap::new();
+            let mut model = ModernBert::builder()
+                .backbone_dtype(DType::BF16)
+                .build(&[weights.as_path()], &config, &device, &varmap)
+                .unwrap();
+            // Dense: every row real, no padding -- `decide_flash_admission`'s
+            // dense split (`build_flash_forward_decision`) keeps the real
+            // `Holds`.
+            let input_ids =
+                Tensor::new(&[[2u32, 5, 10, 3, 7, 9], [4u32, 8, 1, 6, 9, 2]], &device).unwrap();
+            let mask =
+                Tensor::new(&[[1u32, 1, 1, 1, 1, 1], [1u32, 1, 1, 1, 1, 1]], &device).unwrap();
+
+            model.set_training(true);
+            let block_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+            let flash_before = cascade_counters_for("attention_block_flash").snapshot();
+            let out = model.forward_hidden(&input_ids, &mask).unwrap();
+            let block_after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+            let flash_after = cascade_counters_for("attention_block_flash").snapshot();
+
+            let out_f32: Vec<f32> = out
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert!(
+                out_f32.iter().all(|x| x.is_finite()),
+                "training output must be finite"
+            );
+
+            if jammi_kernels::admission::FLASH_COMPILED {
+                assert_eq!(
+                    flash_after.fused - flash_before.fused,
+                    config.num_hidden_layers as u64,
+                    "attention_block_flash must dispatch Fused on every layer of a dense bf16 \
+                     batch on this build: {flash_before:?} -> {flash_after:?}"
+                );
+                assert_eq!(
+                    flash_after.declined, flash_before.declined,
+                    "a dense batch must never decline on this build"
+                );
+                assert_eq!(
+                    flash_after.eager, flash_before.eager,
+                    "always 0 -- see CascadeDispatchCounters's doc"
+                );
+                assert_eq!(
+                    block_after.fused, block_before.fused,
+                    "the block arm must NOT ALSO fire for layers the flash arm already handled"
+                );
+            } else {
+                assert_eq!(
+                    flash_after.declined - flash_before.declined,
+                    config.num_hidden_layers as u64,
+                    "without the flash-attn feature, FLASH_COMPILED is false and every layer \
+                     declines at the cheap capability gate"
+                );
+                assert_eq!(
+                    flash_after.fused, flash_before.fused,
+                    "attention_block_flash cannot dispatch Fused without the flash-attn feature"
+                );
+                assert_eq!(
+                    block_after.fused - block_before.fused,
+                    config.num_hidden_layers as u64,
+                    "the block arm must fire for every layer instead"
+                );
+            }
+        }
+
+        /// Bound for [`flash_arm_padded_matches_block_arm_on_real_rows_cuda`],
+        /// derived from a real 8-seed GPU measurement of THIS oracle's exact
+        /// (window-binding, seed-swept) form.
+        ///
+        /// **The fixture must bind the window.** A fixture whose longest
+        /// segment (`seq=64`) sits BELOW the window-binding threshold
+        /// [`flash_arm_padded_red_control_window_radius_off_by_one_cuda`]'s own
+        /// "CHECKED PREMISE" doc derives (`L >= half_window + 2 = 66`) has
+        /// `max|q-k| = 63 <= half_window = 64`, so the sliding-window band is
+        /// ALL-ZEROS and every LOCAL layer degenerates to full (unwindowed)
+        /// attention, never exercising the real windowed kernel path this
+        /// oracle exists to parity-check. The oracle (below) runs a
+        /// window-BINDING fixture (`seq=160`, at least one segment `>= 66`),
+        /// with the SAME checked-premise assert the RED controls carry.
+        ///
+        /// **Not the same metric as [`FLASH_ORACLE_K_MEAN_POOLED`].
+        /// [`FLASH_ORACLE_K_MEAN_POOLED`] bounds a RATIO,
+        /// `err(other,f32) / err(block,f32)` -- its OWN noise-free value is
+        /// `1.0` (both arms bit-identical to the f32 reference). THIS constant
+        /// bounds a BARE [`relative_l1_error`], `relative_l1_error(flash_real,
+        /// block_real)` directly -- its noise-free value is `0.0` (flash and
+        /// block bit-identical on real rows). A multiplicative factor
+        /// calibrated against a metric whose floor is `1.0` has no principled
+        /// meaning applied to a metric whose floor is `0.0` -- these are two
+        /// DIFFERENT quantities that happen to both be called "a ratio bound"
+        /// in prose, not "the same thing at a different scale" (`CLAUDE.md`'s
+        /// own test for when one definition should serve two call sites). The
+        /// oracle (below) sweeps [`FLASH_ORACLE_SWEEP_SEEDS`] (8 fixed seeds --
+        /// "a single seed's draw is not a distribution", the SAME discipline
+        /// every dense-arm sweep uses), printing every per-seed ratio
+        /// under `--nocapture` and asserting the MEAN (matching
+        /// [`FLASH_ORACLE_K_MEAN_POOLED`]'s own "mean, never per-seed max"
+        /// convention -- see that constant's own doc for why a max bound was
+        /// deleted as seed-unstable).
+        ///
+        /// DERIVATION: measured by
+        /// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-28-m1b-padded-oracle-8seed-6ef586a-a100-pcie.json`
+        /// (A100 80GB PCIe, driver 570.211.01), on THIS oracle's exact
+        /// window-binding/8-seed form:
+        /// per-seed `relative_l1_error(flash_real, block_real)` = `[0.127088,
+        /// 0.104041, 0.153638, 0.148977, 0.119046, 0.109690, 0.111090,
+        /// 0.288572]` (seeds `201..208` respectively) -- mean `0.145268`, max
+        /// `0.288572` (seed `208`; the OTHER 7 seeds alone average `0.124796`,
+        /// so `208` is a genuine single-seed outlier -- `~1.99`x the 8-seed
+        /// mean -- not the distribution's centre). The asserted quantity is
+        /// the MEAN (never the max, matching the convention above); noise-free
+        /// is `0.0`.
+        /// A bound of `0.34` would give only `0.34 / 0.145268` ≈
+        /// `2.34`x margin over the measured MEAN and `0.34 / 0.288572` ≈
+        /// `1.18`x margin over the single WORST observed seed -- NOT enough:
+        /// seed `208` alone shows one unlucky/box-specific seed can land
+        /// nearly `2`x the mean on THIS SAME box; `1.18`x margin over that one
+        /// data point leaves almost no room for a future run where a
+        /// DIFFERENT seed lands there instead, or where box/driver variation
+        /// (a different A100 SKU, a different driver build) shifts the WHOLE
+        /// distribution up rather than just one seed. `0.5` gives
+        /// `0.5 / 0.145268` ≈ `3.44`x margin over the measured mean (comparable
+        /// to this file's own most generous same-shape precedent,
+        /// [`FLASH_ORACLE_K_MEAN_GRAD`]'s `~3.1`x mean margin) and
+        /// `0.5 / 0.288572` ≈ `1.73`x margin over the single worst OBSERVED
+        /// seed -- i.e. even a future run whose MEAN matched today's single
+        /// worst-case per-seed draw would still clear this bound with real
+        /// room to spare, covering BOTH seed-to-seed variance (the observed
+        /// spread) and box/driver variation (unmeasured here, but a same-class
+        /// unknown this margin is sized to absorb) -- never re-fitted to
+        /// exactly the measured mean or max.
+        #[cfg(feature = "flash-attn")]
+        const FLASH_ORACLE_PADDED_BOUND: f64 = 0.5;
+
+        /// One seed's real-row `relative_l1_error(flash, block)` measurement
+        /// for [`flash_arm_padded_matches_block_arm_on_real_rows_cuda`] --
+        /// factored out so the test itself sweeps [`FLASH_ORACLE_SWEEP_SEEDS`]
+        /// rather than measuring one seed.
+        /// `lengths` is the SAME window-BINDING fixture at every seed (only
+        /// `ids`/the model's LoRA init vary by seed, [`flash_oracle_synthetic_ids`]'s
+        /// own convention) -- also re-checks the dispatch-proof counters
+        /// (`fused == num_hidden_layers, declined == 0`) and the
+        /// pad-rows-exact-zero premise PER SEED, not just once, since a
+        /// per-seed fresh model/forward is a genuinely independent run.
+        #[cfg(feature = "flash-attn")]
+        fn flash_padded_real_row_ratio_at_seed(
+            config: &ModernBertConfig,
+            weights: &std::path::Path,
+            cuda: &Device,
+            batch: usize,
+            seq: usize,
+            lengths: &[usize],
+            seed: u64,
+        ) -> f64 {
+            let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, cuda);
+            let mut mask_data = vec![0u32; batch * seq];
+            for (b, &len) in lengths.iter().enumerate() {
+                for s in 0..len {
+                    mask_data[b * seq + s] = 1;
+                }
+            }
+            let mask = Tensor::from_vec(mask_data, (batch, seq), cuda).unwrap();
+
+            let model = flash_oracle_build_model(config, weights, DType::BF16, seed, cuda, true);
+
+            let flash_before = cascade_counters_for("attention_block_flash").snapshot();
+            let flash_out = model.forward_hidden(&ids, &mask).unwrap();
+            let flash_after = cascade_counters_for("attention_block_flash").snapshot();
+            assert_eq!(
+                flash_after.fused - flash_before.fused,
+                config.num_hidden_layers as u64,
+                "seed={seed}: every layer must dispatch Fused on a genuinely padded, eligible \
+                 batch -- {flash_before:?} -> {flash_after:?}"
+            );
+            assert_eq!(
+                flash_after.declined, flash_before.declined,
+                "seed={seed}: an eligible padded batch must never decline -- padded batches fuse, \
+                 they are not downgraded"
+            );
+
+            let block_out = forward_hidden_forcing_flash(&model, &ids, &mask, true).unwrap();
+
+            let flash_v: Vec<f32> = flash_out
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let block_v: Vec<f32> = block_out
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let hidden = config.hidden_size;
+
+            let mut flash_real = Vec::new();
+            let mut block_real = Vec::new();
+            for (b, &len) in lengths.iter().enumerate() {
+                for s in 0..len {
+                    let flat = (b * seq + s) * hidden;
+                    flash_real.extend_from_slice(&flash_v[flat..flat + hidden]);
+                    block_real.extend_from_slice(&block_v[flat..flat + hidden]);
+                }
+                for s in len..seq {
+                    let flat = (b * seq + s) * hidden;
+                    assert!(
+                        flash_v[flat..flat + hidden].iter().all(|&x| x == 0.0),
+                        "seed={seed}: pad row (b={b}, s={s}) of the flash arm's OWN output must be \
+                         EXACTLY zero post-scatter (the bias-free final_norm checked premise)"
+                    );
+                }
+            }
+            let ratio = relative_l1_error(&flash_real, &block_real);
+            eprintln!(
+                "flash_arm_padded_matches_block_arm_on_real_rows_cuda[seed={seed}]: real-row \
+                 ratio={ratio:.5e}"
+            );
+            ratio
+        }
+
+        /// The padded CUDA parity oracle: compares
+        /// `attention_block_flash`'s PADDED/ragged arm against the pre-existing,
+        /// extensively-validated block arm, on REAL rows only — never on pad
+        /// rows, which the two arms do not even both produce the same way (the
+        /// block arm computes real numbers there too since it runs on the full
+        /// padded grid; the flash arm's own output is the `Tensor::zeros`
+        /// `repad_rows` destination). Sweeps [`FLASH_ORACLE_SWEEP_SEEDS`] via
+        /// [`flash_padded_real_row_ratio_at_seed`] on a window-BINDING fixture,
+        /// asserting the MEAN [`relative_l1_error`] against
+        /// [`FLASH_ORACLE_PADDED_BOUND`] (see that constant's own doc for its
+        /// derivation status).
+        #[test]
+        #[cfg(feature = "live-flash-oracle-tests")]
+        fn flash_arm_padded_matches_block_arm_on_real_rows_cuda() {
+            let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
+            let cuda = jammi_test_resources::cuda_device(0);
+            let _lock = crate::test_support::seam_counter_lock();
+            let _d2h_guard = FLASH_D2H_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_flash_arch(&cuda);
+
+            let dir = std::path::PathBuf::from(&model_dir);
+            let config: ModernBertConfig =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                    .unwrap();
+            let weights = dir.join("model.safetensors");
+            // Window-BINDING fixture: 160/96 clear the `half_window + 2`
+            // visibility threshold (see the sibling RED controls' own "CHECKED
+            // PREMISE" doc for the derivation); 40/6 stay below it, pinning
+            // the no-truncation regime too. INCLUDES one full-length row
+            // (proving this is genuinely padded, not degenerate dense).
+            let (batch, seq) = (4usize, 160usize);
+            let lengths = [seq, 96, 40, 6];
+            assert_eq!(lengths.len(), batch);
+            let half_window = config.half_window();
+            assert!(
+                lengths.iter().any(|&len| len >= half_window + 2),
+                "checked premise: at least one segment length must reach half_window ({half_window}) \
+                 + 2 for the sliding-window band to be anything but all-zeros -- see \
+                 FLASH_ORACLE_PADDED_BOUND's own doc"
+            );
+
+            let ratios: Vec<f64> = FLASH_ORACLE_SWEEP_SEEDS
+                .iter()
+                .map(|&seed| {
+                    flash_padded_real_row_ratio_at_seed(
+                        &config, &weights, &cuda, batch, seq, &lengths, seed,
+                    )
+                })
+                .collect();
+            let (mean, max) = mean_max(&ratios);
+            eprintln!(
+                "flash_arm_padded_matches_block_arm_on_real_rows_cuda OVER {} SEEDS: per-seed \
+                 ratios={ratios:.5?} mean={mean:.5e} max={max:.5e} (bound {FLASH_ORACLE_PADDED_BOUND}, \
+                 max UNASSERTED -- diagnostic only, same convention as FLASH_ORACLE_K_MEAN_POOLED)",
+                FLASH_ORACLE_SWEEP_SEEDS.len(),
+            );
+            assert!(
+                mean.is_finite() && mean < FLASH_ORACLE_PADDED_BOUND,
+                "flash-padded vs block-arm MEAN real-row ratio {mean:.5e} over {} seeds exceeds the \
+                 bound {FLASH_ORACLE_PADDED_BOUND} -- see that constant's own doc",
+                FLASH_ORACLE_SWEEP_SEEDS.len(),
+            );
+        }
+
+        /// RED control for [`flash_arm_padded_matches_block_arm_on_real_rows_cuda`]
+        /// (a "`cu_seqlens` boundary off-by-one via a `lengths` mutant"): forces the SAME batch through
+        /// [`ModernBert::forward_hidden_inner`] with ONE batch element's
+        /// `lengths` entry shifted by `-1` — the mutated `CompactedBatch` feeds
+        /// a wrong row count into BOTH the encoder-boundary gather (a
+        /// different set of "real" rows is transported) and
+        /// `flash_attention_varlen_with_rope_ragged`'s own `cu_seqlens` (a
+        /// shifted segment boundary) — and asserts the result is NOT
+        /// bit-identical to the correctly-decided forward on the SAME inputs.
+        /// An oracle this mutant cannot fail is vacuous.
+        ///
+        /// The companion `w±1` local-layer window-radius RED control the
+        /// contract also names lives immediately below, as two siblings:
+        /// [`flash_arm_padded_red_control_window_radius_off_by_one_cuda`]
+        /// (forward-visible, uniform fwd+bwd fault) and
+        /// [`flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda`]
+        /// (backward-only, config-split fault — the ragged entry point's own
+        /// [`jammi_kernels::ops::flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override`]
+        /// seam, ported from the dense arm's
+        /// [`jammi_kernels::ops::flash_attention_varlen_with_rope_test_only_bwd_window_override`]).
+        #[test]
+        #[cfg(feature = "live-flash-oracle-tests")]
+        fn flash_arm_padded_red_control_lengths_off_by_one_cuda() {
+            let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
+            let cuda = jammi_test_resources::cuda_device(0);
+            let _lock = crate::test_support::seam_counter_lock();
+            let _d2h_guard = FLASH_D2H_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_flash_arch(&cuda);
+
+            let dir = std::path::PathBuf::from(&model_dir);
+            let config: ModernBertConfig =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                    .unwrap();
+            let weights = dir.join("model.safetensors");
+            let seed = 78;
+            let (batch, seq) = (4usize, 64usize);
+            let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
+            let lengths = vec![seq, seq - 8, seq / 2, 6]; // last entry >= 2 so `-1` stays >= 1
+            let mut mask_data = vec![0u32; batch * seq];
+            for (b, &len) in lengths.iter().enumerate() {
+                for s in 0..len {
+                    mask_data[b * seq + s] = 1;
+                }
+            }
+            let mask = Tensor::from_vec(mask_data, (batch, seq), &cuda).unwrap();
+            let model = flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+
+            let healthy = model.forward_hidden(&ids, &mask).unwrap();
+            let healthy_v: Vec<f32> = healthy
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+
+            let mut mutant_lengths = lengths.clone();
+            let last = mutant_lengths.len() - 1;
+            mutant_lengths[last] -= 1;
+            let mutant_decision = fused_flash_for_test(mutant_lengths, seq, &cuda);
+            let mutant =
+                forward_hidden_forcing_flash_decision(&model, &ids, &mask, mutant_decision)
+                    .unwrap();
+            let mutant_v: Vec<f32> = mutant
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+
+            assert_ne!(
+                healthy_v, mutant_v,
+                "RED control: a lengths off-by-one mutant (shifting a cu_seqlens boundary) must \
+                 change the output -- an oracle this cannot fail is vacuous"
+            );
+        }
+
+        /// RED control (forward-visible, uniform fwd+bwd fault): a `w+/-1`
+        /// perturbation of every LOCAL layer's [`ModernBertAttention::half_window`]
+        /// field on the SAME (otherwise correctly-decided) padded batch — the
+        /// same structure as
+        /// [`flash_arm_padded_red_control_lengths_off_by_one_cuda`] immediately
+        /// above, mutating the WINDOW rather than the `CompactedBatch` — must
+        /// change [`ModernBert::forward_hidden`]'s output. An oracle this
+        /// cannot fail is vacuous. Uniform: both the forward and
+        /// backward flash launches read the SAME (mutated) `half_window`, so
+        /// this control alone cannot tell "forward wrong" from "backward
+        /// wrong" apart — see
+        /// [`flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda`]
+        /// below for the config-SPLIT control that isolates the backward-only
+        /// case.
+        ///
+        /// CHECKED PREMISE (this control's own assert's words: "must change ...
+        /// an oracle this cannot fail is vacuous" — at `seq=64` it never
+        /// fires):
+        /// a `w+/-1` radius change is observable ONLY for a row whose segment
+        /// is long enough that widening/narrowing the window by 1 actually
+        /// crosses into (or out of) a real key. Worked from row `0`'s window
+        /// `[0, min(L-1, w)]` (segment length `L`, radius `w`, symmetric for
+        /// row `L-1`): GROWING to `w+1` first differs from `w` (gains position
+        /// `w+1`) at `L = w+2`; SHRINKING to `w-1` first differs (loses
+        /// position `w`) one segment length EARLIER, at `L = w+1` — verified
+        /// numerically (`i in 0..L`, both directions, `w=64`, `L=62..68`). The
+        /// BINDING (stricter) bound covering BOTH
+        /// deltas in the SAME control is therefore `L >= half_window + 2`,
+        /// asserted in-test below — a `seq=64` fixture's longest segment (64)
+        /// sits exactly AT `half_window`, two short of that threshold, so
+        /// NEITHER delta can ever fire no matter what the seam does (this is
+        /// why the assert must be `>=` the GROWING threshold, not the looser
+        /// shrinking one). A fixture shrink vacuates LOUDLY (a failed
+        /// `assert!`), never silently.
+        #[test]
+        #[cfg(feature = "live-flash-oracle-tests")]
+        fn flash_arm_padded_red_control_window_radius_off_by_one_cuda() {
+            let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
+            let cuda = jammi_test_resources::cuda_device(0);
+            let _lock = crate::test_support::seam_counter_lock();
+            let _d2h_guard = FLASH_D2H_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_flash_arch(&cuda);
+
+            let dir = std::path::PathBuf::from(&model_dir);
+            let config: ModernBertConfig =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                    .unwrap();
+            let weights = dir.join("model.safetensors");
+            let seed = 84;
+            // `seq`/`lengths` sized so at least one segment CLEARS the
+            // `half_window + 2` visibility threshold (this doc's own "CHECKED
+            // PREMISE" section) -- 160 and 96 both clear it on a
+            // `half_window=64` checkpoint; 40 and 6 stay BELOW it, pinning the
+            // no-truncation regime too (both regimes exercised, not just one).
+            let (batch, seq) = (4usize, 160usize);
+            let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
+            let lengths = [seq, 96, 40, 6];
+            let half_window = config.half_window();
+            assert!(
+                lengths.iter().any(|&len| len >= half_window + 2),
+                "checked premise: at least one segment length must reach half_window ({half_window}) \
+                 + 2 for a w+/-1 radius mutation to be visible AT ALL -- see this test's own doc, \
+                 \"CHECKED PREMISE\""
+            );
+            let mut mask_data = vec![0u32; batch * seq];
+            for (b, &len) in lengths.iter().enumerate() {
+                for s in 0..len {
+                    mask_data[b * seq + s] = 1;
+                }
+            }
+            let mask = Tensor::from_vec(mask_data, (batch, seq), &cuda).unwrap();
+
+            let healthy_model =
+                flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+            let healthy_v: Vec<f32> = healthy_model
+                .forward_hidden(&ids, &mask)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+
+            for delta in [1i64, -1i64] {
+                let mut mutant_model =
+                    flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+                let mut mutated_any = false;
+                for layer in mutant_model.layers.iter_mut() {
+                    if let Some(half) = layer.attention.half_window {
+                        layer.attention.half_window = Some((half as i64 + delta).max(1) as usize);
+                        mutated_any = true;
+                    }
+                }
+                assert!(
+                    mutated_any,
+                    "this control needs at least one local (windowed) layer to mutate"
+                );
+                let mutant_v: Vec<f32> = mutant_model
+                    .forward_hidden(&ids, &mask)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                assert_ne!(
+                    healthy_v, mutant_v,
+                    "RED control: a window radius w{delta:+} mutant (every local layer's \
+                     half_window shifted, both forward AND backward) must change the padded/ragged \
+                     flash arm's output -- an oracle this cannot fail is vacuous"
+                );
+            }
+        }
+
+        /// Test-only mirror of [`ModernBert::forward_hidden_inner`]'s
+        /// PADDED/ragged transport composition — the padded-arm counterpart of
+        /// [`forward_hidden_flash_with_fault`] (which mirrors the DENSE arm's
+        /// per-layer composition instead; see that function's own doc for why
+        /// a hand-synced mirror, not the shared `forward_hidden_inner` seam, is
+        /// needed for an op-level CONFIG fault like this one). Every LOCAL
+        /// layer's ragged flash op launches FORWARD with `attn.half_window`'s
+        /// own (correct) radius and BACKWARD with that radius shifted by
+        /// `window_delta`, via the NEW
+        /// [`jammi_kernels::ops::flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override`]
+        /// seam. GLOBAL layers (`half_window == None`) call the plain
+        /// [`jammi_kernels::ops::flash_attention_varlen_with_rope_ragged`] —
+        /// unaffected either way, mirroring the dense arm's own
+        /// `bwd_only_window_dropped` control's identical local/global scoping.
+        /// `admission` must be a genuinely padded (`!is_dense`) `CompactedBatch`
+        /// — this harness does not implement the dense-arm fallback, since its
+        /// whole point is to characterize the RAGGED arm's own fault surface.
+        #[cfg(feature = "flash-attn")]
+        fn forward_hidden_padded_with_ragged_bwd_window_fault(
+            model: &ModernBert,
+            input_ids: &Tensor,
+            admission: &CompactedBatch,
+            window_delta: i64,
+        ) -> Result<Tensor, EncoderError> {
+            use jammi_kernels::flash::VarlenConfig;
+            use jammi_kernels::ops::{
+                flash_attention_varlen_with_rope_ragged,
+                flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override,
+            };
+
+            let word_emb = model.word_embeddings.forward(input_ids)?;
+            let mut hidden = model.emb_norm.forward(&word_emb)?;
+            hidden = unpad_rows(&hidden, &admission.gather_indices)?;
+
+            for layer in &model.layers {
+                let attn = &layer.attention;
+                let normed = match &attn.attn_norm {
+                    Some(ln) => ln.forward(&hidden)?,
+                    None => hidden.clone(),
+                };
+                let h = attn.num_heads;
+                let d = attn.head_dim;
+                let qkv = attn.wqkv.forward(&normed)?;
+                let qkv5 = qkv.reshape((admission.total, 3, h, d))?;
+                let (cos_full, sin_full) = attn.rope.cached_tables(qkv5.dtype())?;
+                let cos = cos_full.narrow(2, 0, admission.seq)?;
+                let sin = sin_full.narrow(2, 0, admission.seq)?;
+                let fwd_cfg = VarlenConfig {
+                    softmax_scale: 1.0 / (d as f32).sqrt(),
+                    window: attn.half_window.map(|w| w as u32),
+                    deterministic: true,
+                };
+                let o = match attn.half_window {
+                    Some(half) => {
+                        let bad = (half as i64 + window_delta).max(0) as u32;
+                        let bwd_cfg = VarlenConfig {
+                            window: Some(bad),
+                            ..fwd_cfg
+                        };
+                        flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override(
+                            &qkv5,
+                            &cos,
+                            &sin,
+                            &admission.lengths,
+                            &fwd_cfg,
+                            &bwd_cfg,
+                        )
+                    }
+                    None => flash_attention_varlen_with_rope_ragged(
+                        &qkv5,
+                        &cos,
+                        &sin,
+                        &admission.lengths,
+                        &fwd_cfg,
+                    ),
+                }
+                .map_err(|e| EncoderError::Config(format!("ragged bwd-window fault: {e}")))?;
+                let ctx = o.reshape((admission.total, h * d))?;
+                let out = attn.wo.forward(&ctx)?;
+                hidden = (out + &hidden)?;
+                hidden = layer.mlp.forward(&hidden)?;
+            }
+
+            let batch = admission.lengths.len();
+            hidden = repad_rows(&hidden, &admission.gather_indices, batch, admission.seq)?;
+            model.final_norm.forward(&hidden)
+        }
+
+        /// [`flash_oracle_wqkv_lora_b`]'s general form, indexed by layer — used
+        /// ONLY by
+        /// [`flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda`]
+        /// below, which (unlike [`flash_oracle_pooled_and_grad`]'s own
+        /// LAST-layer probe) deliberately needs an EARLY layer: see that
+        /// control's own doc for why the last (global) layer's gradient cannot
+        /// see a LOCAL-layer-only backward defect at all.
+        #[cfg(feature = "flash-attn")]
+        fn flash_oracle_wqkv_lora_b_of_layer(model: &ModernBert, idx: usize) -> &Tensor {
+            match &model.layers[idx].attention.wqkv {
+                MaybeLoraLinear::Lora(l) => &l.lora_b,
+                MaybeLoraLinear::Frozen(_) => panic!(
+                    "flash oracle: layer {idx}'s Wqkv must be LoRA-wrapped -- \
+                     target_modules=[\"Wqkv\"]"
+                ),
+            }
+        }
+
+        /// `(flattened hidden, dL/d(layer `layer_idx`'s Wqkv LoRA B))` for
+        /// `L = (pool_and_normalize(hidden) * dy).sum()` — the padded-arm
+        /// counterpart of [`flash_oracle_pooled_and_grad`], generalised to an
+        /// arbitrary layer (see [`flash_oracle_wqkv_lora_b_of_layer`]'s own
+        /// doc for why).
+        #[cfg(feature = "flash-attn")]
+        fn flash_oracle_hidden_and_early_grad(
+            model: &ModernBert,
+            hidden: &Tensor,
+            mask: &Tensor,
+            dy: &Tensor,
+            layer_idx: usize,
+        ) -> (Vec<f32>, Vec<f32>) {
+            let hidden_v: Vec<f32> = hidden
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let pooled = pool_and_normalize(hidden, mask, Pooling::Mean).unwrap();
+            let pooled_f32 = pooled.to_dtype(DType::F32).unwrap();
+            let loss = (&pooled_f32 * dy).unwrap().sum_all().unwrap();
+            assert!(
+                loss.to_scalar::<f32>().unwrap().is_finite(),
+                "flash oracle: loss must be finite before backward"
+            );
+            let grads = loss.backward().unwrap();
+            let lora_b = flash_oracle_wqkv_lora_b_of_layer(model, layer_idx);
+            let grad_v: Vec<f32> = grads
+                .get(lora_b)
+                .expect("flash oracle: layer's Wqkv lora_b must have a gradient")
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            (hidden_v, grad_v)
+        }
+
+        /// RED control (backward-config-split): the ragged entry point's OWN
+        /// counterpart of `tests/cuda_parity.rs`'s
+        /// `flash_upstream_acceptance_form_red_control_bwd_only_window_dropped_cuda`
+        /// (`jammi-kernels`, which covers only the DENSE entry point) — the
+        /// backward-only case [`flash_arm_padded_red_control_lengths_off_by_one_cuda`]
+        /// cannot isolate.
+        /// [`forward_hidden_padded_with_ragged_bwd_window_fault`] forces every
+        /// LOCAL layer's ragged flash op to launch FORWARD with the CORRECT
+        /// window radius and BACKWARD with `w+/-1`, via the
+        /// [`jammi_kernels::ops::flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override`]
+        /// seam. Proves two things per `delta`: (a) the forward output stays
+        /// BIT-IDENTICAL to production's OWN padded forward — the fault really
+        /// is backward-only, never leaking into the forward launch; (b) an
+        /// EARLY layer's own LoRA `B` gradient is NOT bit-identical to
+        /// production's own gradient — the fault is still caught. Deliberately
+        /// probes layer 0, not the LAST layer [`flash_oracle_wqkv_lora_b`]
+        /// targets: the last layer in this checkpoint is GLOBAL (unwindowed —
+        /// see that fn's own doc), so its gradient's own backward pass never
+        /// chains through any LOCAL layer at all and would be structurally
+        /// blind to this exact fault class, whereas layer 0's gradient
+        /// backpropagates through every later (including every LOCAL) layer's
+        /// own backward first.
+        ///
+        /// CHECKED PREMISE (at `seq=64` this control's own gradient assert
+        /// cannot fail — gradients are bit-identical under the fault): a `w+/-1` radius change
+        /// only touches a row's REAL attended-key set when that row's segment
+        /// is long enough for the extra/missing radius step to cross into (or
+        /// out of) a real key — see
+        /// [`flash_arm_padded_red_control_window_radius_off_by_one_cuda`]'s
+        /// own "CHECKED PREMISE" doc for the exact `L >= half_window + 2`
+        /// (GROWING, the binding direction) / `L >= half_window + 1`
+        /// (SHRINKING) derivation (identical here: this control differs from
+        /// that one only in WHICH launch — forward vs. backward — carries the
+        /// wrong radius, never in what makes the radius change observable at
+        /// all). The `seq=64` fixture's longest segment (64) sat two short of
+        /// the threshold on a `half_window=64` checkpoint. Asserted in-test below
+        /// so a future fixture shrink re-vacuates LOUDLY instead of silently.
+        #[test]
+        #[cfg(feature = "live-flash-oracle-tests")]
+        fn flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda() {
+            let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
+            let cuda = jammi_test_resources::cuda_device(0);
+            let _lock = crate::test_support::seam_counter_lock();
+            let _d2h_guard = FLASH_D2H_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_flash_arch(&cuda);
+
+            let dir = std::path::PathBuf::from(&model_dir);
+            let config: ModernBertConfig =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                    .unwrap();
+            let weights = dir.join("model.safetensors");
+            let seed = 85;
+            // Same sizing rationale as `flash_arm_padded_red_control_window_
+            // radius_off_by_one_cuda`'s own doc ("CHECKED PREMISE") -- 160/96
+            // clear the `half_window + 2` visibility threshold, 40/6 stay
+            // below it.
+            let (batch, seq) = (4usize, 160usize);
+            let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
+            let lengths = vec![seq, 96, 40, 6];
+            let half_window = config.half_window();
+            assert!(
+                lengths.iter().any(|&len| len >= half_window + 2),
+                "checked premise: at least one segment length must reach half_window ({half_window}) \
+                 + 2 for a w+/-1 radius mutation to be visible AT ALL -- see this test's own doc, \
+                 \"CHECKED PREMISE\""
+            );
+            let mut mask_data = vec![0u32; batch * seq];
+            for (b, &len) in lengths.iter().enumerate() {
+                for s in 0..len {
+                    mask_data[b * seq + s] = 1;
+                }
+            }
+            let mask = Tensor::from_vec(mask_data, (batch, seq), &cuda).unwrap();
+            let dy = flash_oracle_seeded_dy(batch, config.hidden_size, seed, &cuda);
+
+            let decision = fused_flash_for_test(lengths, seq, &cuda);
+            let admission = match &decision {
+                FlashDecision::Fused(admission) => admission,
+                FlashDecision::Declined { .. } => {
+                    panic!("this control needs a genuinely padded Fused decision")
+                }
+            };
+            assert!(
+                !admission.is_dense,
+                "this control needs a genuinely padded (ragged) batch"
+            );
+
+            let model = flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+
+            let healthy_hidden = model.forward_hidden(&ids, &mask).unwrap();
+            let (healthy_hidden_v, healthy_grad_v) =
+                flash_oracle_hidden_and_early_grad(&model, &healthy_hidden, &mask, &dy, 0);
+
+            for delta in [1i64, -1i64] {
+                let mutant_hidden = forward_hidden_padded_with_ragged_bwd_window_fault(
+                    &model, &ids, admission, delta,
+                )
+                .unwrap();
+                let (mutant_hidden_v, mutant_grad_v) =
+                    flash_oracle_hidden_and_early_grad(&model, &mutant_hidden, &mask, &dy, 0);
+
+                assert_eq!(
+                    healthy_hidden_v, mutant_hidden_v,
+                    "window w{delta:+} backward-only fault must NOT change the forward output -- \
+                     the forward launch always reads fwd_cfg (the CORRECT window), never \
+                     bwd_cfg_override; a difference here means the split leaked into forward"
+                );
+                assert_ne!(
+                    healthy_grad_v, mutant_grad_v,
+                    "window w{delta:+} backward-only fault must change layer 0's LoRA B gradient -- \
+                     an oracle this cannot fail is vacuous"
+                );
+            }
+        }
+
+        /// Eight fixed seeds, reused IDENTICALLY across the healthy oracle and
+        /// every RED control below, at every shape (property 2 above) -- a
+        /// single seed's draw is not a distribution.
+        const FLASH_ORACLE_SWEEP_SEEDS: [u64; 8] = [201, 202, 203, 204, 205, 206, 207, 208];
+
+        /// Mean-ratio bound, pooled-embedding leg (`err(other,f32) /
+        /// err(block,f32)`, [`relative_l1_error`], averaged over
+        /// [`FLASH_ORACLE_SWEEP_SEEDS`]). Measured healthy (A100, full per-seed
+        /// table measured by
+        /// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-flash-arm-encoder-oracle-2aa1551-a100-sxm4.json`):
+        /// mean ratio = 1.0798 (b8_s512) / 1.0250 (b1_s128), i.e.
+        /// flash is on average ~4-8% FURTHER from the f32 reference than the
+        /// block arm is on THIS leg -- not closer (property 3 above). `1.6`
+        /// gives ~1.5x margin over the worse of those
+        /// two means while sitting more than 3x below the WEAKEST measured
+        /// mutant mean on this same leg (window-dropped, 5.2189; K-unrotated
+        /// 9.9498; bad-softmax-scale 19.4144).
+        const FLASH_ORACLE_K_MEAN_POOLED: f64 = 1.6;
+
+        /// Mean-ratio bound, LoRA-gradient leg (last layer `Wqkv` LoRA `B`,
+        /// step-0, fixed-cotangent loss -- property 1 above -- [`cosine_distance`]
+        /// ratio, NOT [`relative_l1_error`] -- see that function's own doc for
+        /// why). Measured healthy mean: 1.4604 (b8_s512) / 1.0412
+        /// (b1_s128) -- see the artifact cited on [`FLASH_ORACLE_K_MEAN_POOLED`].
+        /// `4.5` gives ~3.1x margin over the worse of those two while sitting
+        /// ~3x below the WEAKEST measured mutant mean on this leg
+        /// (window-dropped, 13.6483; K-unrotated 26.6004; bad-softmax-scale
+        /// 125.3883).
+        ///
+        /// NO max-per-seed bound exists alongside this mean bound: a max bound
+        /// fitted only to [`FLASH_ORACLE_SWEEP_SEEDS`] (201-208) is not
+        /// seed-stable in either direction — fresh seeds 301-308 measure a
+        /// healthy grad max of 7.18 and 401-408 measure 16.08 (false-RED on
+        /// UNMODIFIED code against a 7.0 max bound), while the k-unrotated
+        /// mutant's own max (6.62) sits INSIDE that bound on at least one seed
+        /// draw. [`assert_red_control_violates_bound`] asserts only the MEAN
+        /// legs.
+        const FLASH_ORACLE_K_MEAN_GRAD: f64 = 4.5;
+
+        /// Asserts `device` can run the flash kernels this build compiled: its
+        /// compute capability is in `flash_validated_arches()`. The GPU lanes pin
+        /// exactly those arches, so any other device is the wrong host.
+        #[cfg(feature = "flash-attn")]
+        fn assert_flash_arch(device: &Device) {
+            assert!(
+                flash_arch_ok(device),
+                "this test needs a device in flash_validated_arches() {:?}; this one is {:?}",
+                flash_validated_arches(),
+                probe_cuda_compute_capability(device)
+            );
+        }
+
+        /// A deterministic (SplitMix64-derived) token-id batch, `vocab`-bounded
+        /// and `seed`-keyed -- every arm below is driven by the exact SAME
+        /// `input_ids` for a given `(batch, seq, seed)`.
+        fn flash_oracle_synthetic_ids(
+            batch: usize,
+            seq: usize,
+            vocab: usize,
+            seed: u64,
+            device: &Device,
+        ) -> Tensor {
+            let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+            let mut ids = Vec::with_capacity(batch * seq);
+            for _ in 0..batch * seq {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                ids.push((z % vocab as u64) as u32);
+            }
+            Tensor::from_vec(ids, (batch, seq), device).expect("build synthetic token-id batch")
+        }
+
+        /// A SplitMix64-derived, `seed`-keyed cotangent for the pooled
+        /// embedding (`(batch, hidden)`, F32) -- deliberately NON-uniform (an
+        /// all-equal `dy` can make a downstream softmax/normalize gradient
+        /// identically zero, exactly the degenerate shape this section's own
+        /// vacuous-loss defect took) and driven by a stream XOR'd with a
+        /// DISTINCT odd constant from [`flash_oracle_synthetic_ids`]'s own, so
+        /// the token-id draw and the cotangent draw never correlate at the
+        /// same seed. Values in `[-1, 1)`.
+        fn flash_oracle_seeded_dy(
+            batch: usize,
+            hidden: usize,
+            seed: u64,
+            device: &Device,
+        ) -> Tensor {
+            let mut state = seed ^ 0xD1B5_4A32_D192_ED03;
+            let mut values = Vec::with_capacity(batch * hidden);
+            for _ in 0..batch * hidden {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                let u = ((z >> 40) as u32 as f32) / (1u32 << 24) as f32; // [0, 1)
+                values.push(u * 2.0 - 1.0);
+            }
+            Tensor::from_vec(values, (batch, hidden), device).expect("build seeded cotangent")
+        }
+
+        /// Builds a real ModernBERT-large checkpoint with a Gaussian-initialised
+        /// (non-identity from step 0 -- unlike the default `ZerosB`, whose `dA`
+        /// is trivially zero regardless of any arm's numerics) LoRA adapter on
+        /// `Wqkv` only, at the given backbone `dtype`. `training` selects
+        /// whether `forward_hidden` reaches the admission cascade at all
+        /// (`true`) or takes the always-eager eval composition (`false` -- the
+        /// F32 reference's own arm).
+        fn flash_oracle_build_model(
+            config: &ModernBertConfig,
+            weights: &std::path::Path,
+            dtype: DType,
+            seed: u64,
+            device: &Device,
+            training: bool,
+        ) -> ModernBert {
+            let varmap = VarMap::new();
+            let target_modules = ["Wqkv".to_string()];
+            let rank_pattern: HashMap<String, usize> = HashMap::new();
+            let lora = LoraBuildConfig {
+                target_modules: &target_modules,
+                layers_to_transform: &None,
+                lora_rank: 16,
+                lora_alpha: 32.0,
+                use_rslora: false,
+                lora_dropout: None,
+                rank_pattern: &rank_pattern,
+                init_mode: jammi_lora::LoraInitMode::Gaussian,
+                seed,
+                dropout_seed: seed,
+            };
+            let mut model = ModernBert::builder()
+                .pooling(Pooling::Mean)
+                .backbone_dtype(dtype)
+                .lora(lora)
+                .build(&[weights], config, device, &varmap)
+                .unwrap_or_else(|e| {
+                    panic!("flash oracle: build ModernBert ({dtype:?}) failed: {e}")
+                });
+            model.set_training(training);
+            model
+        }
+
+        /// Test-only seam over [`ModernBert::forward_hidden_inner`] (the
+        /// forced-arm harness IS that shared function, not a hand-mirrored copy
+        /// of `forward_hidden_with_lengths`'s body, which every transport change
+        /// would need to edit twice in sync). `force_decline == true` forces
+        /// [`declined_flash`] for the whole forward (the block-bf16 arm);
+        /// `force_decline == false` forces `Derive` (the REAL
+        /// `decide_flash_admission`, production's exact behaviour — the
+        /// flash-bf16 arm on a CUDA device). For a decision this crate's own
+        /// `decide_flash_admission` can never reach WITHOUT a CUDA device (a
+        /// padded, flash-eligible `Fused`), see
+        /// [`forward_hidden_forcing_flash_decision`] instead. `#[cfg(feature =
+        /// "cuda")]`: every call site is a CUDA-gated test (the block-arm vs.
+        /// flash-arm comparison only means something on a real CUDA device).
+        fn forward_hidden_forcing_flash(
+            model: &ModernBert,
+            input_ids: &Tensor,
+            mask: &Tensor,
+            force_decline: bool,
+        ) -> Result<Tensor, EncoderError> {
+            let forced = if force_decline {
+                ForcedFlash::Forced(declined_flash())
+            } else {
+                ForcedFlash::Derive
+            };
+            model.forward_hidden_inner(input_ids, mask, None, forced)
+        }
+
+        /// The two encoder-level flash wiring faults this oracle proves it
+        /// catches (see the block comment above), plus `NoFault` -- the
+        /// bit-identity anchor proving this whole harness has not drifted from
+        /// production (see `flash_arm_fault_harness_nofault_matches_production_bit_identical`
+        /// below).
+        #[cfg(feature = "flash-attn")]
+        enum FlashFault {
+            /// No injection at all -- exactly production's
+            /// `forward_flash_dense_attention` composition.
+            NoFault,
+            /// K (slot 1) never rotated -- the observable effect of a
+            /// `slot == 2` -> `slot >= 1` kernel mutant, injected without
+            /// touching the kernel (see the block comment above).
+            KUnrotated,
+            /// `VarlenConfig::softmax_scale` replaced with a wrong constant.
+            BadSoftmaxScale(f32),
+        }
+
+        /// Test-only mirror of [`ModernBertAttention::forward_flash_dense_attention`]
+        /// (called per layer, replacing `ModernBertLayer::forward`'s whole body),
+        /// calling the SAME production op
+        /// ([`jammi_kernels::ops::flash_attention_varlen_with_rope`], i.e.
+        /// `FlashVarlenAttentionFusedRope`) that function calls, with one of
+        /// [`FlashFault`] injected at the `qkv`/`cfg` BOUNDARY the op itself is
+        /// handed -- never inside the op. Requires the batch to be genuinely
+        /// flash-`Holds`-eligible (asserted up front) -- this harness does not
+        /// implement the block-arm fallback, since its whole point is to
+        /// characterize the flash arm's OWN fault surface.
+        #[cfg(feature = "flash-attn")]
+        fn forward_hidden_flash_with_fault(
+            model: &ModernBert,
+            input_ids: &Tensor,
+            mask: &Tensor,
+            fault: &FlashFault,
+        ) -> Result<Tensor, EncoderError> {
+            use jammi_kernels::flash::{CuSeqlens, VarlenConfig};
+            use jammi_kernels::ops::{flash_attention_varlen_with_rope, RopePositionsFused};
+
+            let (batch, seq) = input_ids.dims2()?;
+            let device = input_ids.device();
+            let word_emb = model.word_embeddings.forward(input_ids)?;
+            let mut hidden = model.emb_norm.forward(&word_emb)?;
+
+            let head_dim = model
+                .layers
+                .first()
+                .map(|l| l.attention.head_dim)
+                .unwrap_or(0);
+            let decision = decide_flash_admission(device, hidden.dtype(), head_dim, mask, None)?;
+            let admission = match &decision {
+                FlashDecision::Fused(batch) => batch,
+                FlashDecision::Declined { outcome, reason } => panic!(
+                    "flash oracle fault harness requires flash to actually be eligible on this \
+                     batch (outcome={outcome:?}, reason={reason})"
+                ),
+            };
+            let cuda_device = match device {
+                Device::Cuda(dev) => dev,
+                _ => panic!("flash oracle fault harness requires a CUDA device"),
+            };
+
+            for layer in &model.layers {
+                let attn = &layer.attention;
+                let normed = match &attn.attn_norm {
+                    Some(ln) => ln.forward(&hidden)?,
+                    None => hidden.clone(),
+                };
+                let h = attn.num_heads;
+                let d = attn.head_dim;
+                let qkv = attn.wqkv.forward(&normed)?;
+                let total = batch * seq;
+                let qkv5 = qkv.reshape((total, 3, h, d))?;
+                let (cos_full, sin_full) = attn.rope.cached_tables(qkv5.dtype())?;
+                let cos = cos_full.narrow(2, 0, seq)?;
+                let sin = sin_full.narrow(2, 0, seq)?;
+
+                let mut softmax_scale = 1.0 / (d as f32).sqrt();
+                let qkv_for_op = match fault {
+                    FlashFault::NoFault => qkv5.clone(),
+                    FlashFault::KUnrotated => {
+                        // The production op rotates Q and K TOGETHER, forward,
+                        // from whatever it is handed (proven correct by
+                        // `fused_rope_matches_two_op_composition`). Pre-apply
+                        // the INVERSE rotation (`negate_sin: true`, the SAME
+                        // mechanism that op's own `bwd` un-rotation uses) to
+                        // K ONLY: the op's own forward rotation then cancels
+                        // it exactly, leaving K exactly as it was BEFORE any
+                        // rotation -- observably identical to a
+                        // `slot == 2` -> `slot >= 1` kernel mutant, without
+                        // editing the op or its kernel.
+                        let q_orig = qkv5.narrow(1, 0, 1)?;
+                        let v_orig = qkv5.narrow(1, 2, 1)?;
+                        let inv = apply3(&qkv5, &cos, &sin, RopePositionsFused::new(seq, true))?;
+                        let k_inv = inv.narrow(1, 1, 1)?;
+                        Tensor::cat(&[&q_orig, &k_inv, &v_orig], 1)?.contiguous()?
+                    }
+                    FlashFault::BadSoftmaxScale(bad) => {
+                        softmax_scale = *bad;
+                        qkv5.clone()
+                    }
+                };
+
+                let cu_seqlens = CuSeqlens::from_lengths(&admission.lengths, cuda_device)
+                    .map_err(|e| EncoderError::Config(format!("flash oracle fault: {e}")))?;
+                let cfg = VarlenConfig {
+                    softmax_scale,
+                    window: attn.half_window.map(|w| w as u32),
+                    deterministic: true,
+                };
+                let o = flash_attention_varlen_with_rope(
+                    &qkv_for_op,
+                    &cos,
+                    &sin,
+                    seq,
+                    &cu_seqlens,
+                    &cfg,
+                )
+                .map_err(|e| EncoderError::Config(format!("flash oracle fault: {e}")))?;
+                let ctx = o.reshape((batch, seq, h * d))?;
+                let out = attn.wo.forward(&ctx)?;
+                hidden = (out + &hidden)?;
+                hidden = layer.mlp.forward(&hidden)?;
+            }
+            model.final_norm.forward(&hidden)
+        }
+
+        /// The LAST layer's `attention.wqkv`'s LoRA `B` matrix -- `target_modules
+        /// = ["Wqkv"]` with `layers_to_transform: None` guarantees EVERY layer
+        /// (this one included) is the `Lora` variant. Deliberately the LAST
+        /// layer, not layer 0: measured on an A100, layer 0's gradient is 28 backward matmuls
+        /// removed from the loss, and guide §3.2's own "compounding is
+        /// invisible at one call, grows with depth" phenomenon applies to
+        /// ORDINARY bf16 rounding noise exactly as it does to a real defect --
+        /// by layer 0 the block arm's OWN gradient (known-correct, extensively
+        /// tested elsewhere) already has cosine distance from the f32
+        /// reference ranging 0.23-1.04 across seeds (measured by
+        /// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-flash-arm-encoder-oracle-2aa1551-a100-sxm4.json`;
+        /// i.e. sometimes NEAR
+        /// ORTHOGONAL to truth), a noise floor comparable to or larger than
+        /// the K-unrotated/window-dropped mutants' OWN signal at that same
+        /// depth -- neither `relative_l1_error` nor `cosine_distance` can
+        /// discriminate a real fault from ordinary depth-compounded rounding
+        /// noise at that distance. The LAST layer is one backward matmul
+        /// (plus the final norm) from the loss, so its gradient carries
+        /// minimal ACCUMULATED noise while still proving gradients reach a
+        /// LoRA-wrapped parameter (the property this leg exists to check --
+        /// nothing about that property is specific to layer 0).
+        ///
+        /// Blind spot: the last layer is GLOBAL attention (no sliding window),
+        /// so a BACKWARD-ONLY window defect confined to the 18 LOCAL (windowed)
+        /// layers is invisible to this gradient leg -- that class is instead
+        /// covered at the op level, where the window is a per-call parameter,
+        /// by `jammi-kernels`' own
+        /// `tests/cuda_parity.rs::flash_upstream_acceptance_form_red_control_bwd_only_window_dropped_cuda`.
+        fn flash_oracle_wqkv_lora_b(model: &ModernBert) -> &Tensor {
+            let last = model
+                .layers
+                .last()
+                .expect("flash oracle: model must have at least one layer");
+            match &last.attention.wqkv {
+                MaybeLoraLinear::Lora(l) => &l.lora_b,
+                MaybeLoraLinear::Frozen(_) => panic!(
+                    "flash oracle: the last layer's Wqkv must be LoRA-wrapped -- \
+                     target_modules=[\"Wqkv\"]"
+                ),
+            }
+        }
+
+        /// `L = (pool_and_normalize(hidden) * dy).sum()` for a FIXED, seed-keyed
+        /// random cotangent `dy` (a generic, consumer-free scalar) --
+        /// this oracle's job is comparing arms' NUMERICS, not reproducing the
+        /// production triplet-hinge objective, and NEVER `sum(pooled^2)`
+        /// (identically `batch`, gradient identically zero -- see this
+        /// section's own block comment, defect 1). Returns `(pooled embedding,
+        /// dL/d(last layer Wqkv LoRA B))`, both `F32`, flattened.
+        fn flash_oracle_pooled_and_grad(
+            model: &ModernBert,
+            hidden: &Tensor,
+            mask: &Tensor,
+            dy: &Tensor,
+        ) -> (Vec<f32>, Vec<f32>) {
+            let pooled = pool_and_normalize(hidden, mask, Pooling::Mean).unwrap();
+            let pooled_f32 = pooled.to_dtype(DType::F32).unwrap();
+            let pooled_v: Vec<f32> = pooled_f32.flatten_all().unwrap().to_vec1().unwrap();
+            let loss = (&pooled_f32 * dy).unwrap().sum_all().unwrap();
+            assert!(
+                loss.to_scalar::<f32>().unwrap().is_finite(),
+                "flash oracle: loss must be finite before backward"
+            );
+            let grads = loss.backward().unwrap();
+            let lora_b = flash_oracle_wqkv_lora_b(model);
+            let grad_v: Vec<f32> = grads
+                .get(lora_b)
+                .expect("flash oracle: last layer Wqkv lora_b must have a gradient")
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            (pooled_v, grad_v)
+        }
+
+        /// `Σ|arm - reference| / Σ|reference|` -- guide §3.2's own aggregate
+        /// shape (`r(L) = Σ|fused-eager| / Σ|eager|`), NEVER a per-element
+        /// ratio (a reference element near zero would make a per-element ratio
+        /// blow up on ordinary rounding noise alone). Affirmative non-finite
+        /// check FIRST (guide §3.7: never let a NaN read as a silent pass), no
+        /// absolute floor (guide §3.8), and asserts the denominator carries
+        /// real SIGNAL (`sum|reference| > 0`) before dividing -- the exact
+        /// check that would have caught this section's own vacuous-loss defect
+        /// (defect 1 above) the moment it shipped.
+        fn relative_l1_error(arm: &[f32], reference: &[f32]) -> f64 {
+            assert_eq!(
+                arm.len(),
+                reference.len(),
+                "relative_l1_error: length mismatch"
+            );
+            let non_finite = arm
+                .iter()
+                .chain(reference.iter())
+                .filter(|v| !v.is_finite())
+                .count();
+            assert_eq!(
+                non_finite, 0,
+                "relative_l1_error: {non_finite} non-finite value(s)"
+            );
+            let mut num = 0.0f64;
+            let mut den = 0.0f64;
+            for (&a, &r) in arm.iter().zip(reference.iter()) {
+                num += (a as f64 - r as f64).abs();
+                den += (r as f64).abs();
+            }
+            assert!(
+                den > 0.0,
+                "relative_l1_error: reference carries no signal (sum|reference| == 0) -- dividing by \
+                 this would silently read as a passing ratio; the caller's loss/objective is \
+                 degenerate for this arm"
+            );
+            num / den
+        }
+
+        /// `1 - cosine_similarity(arm, reference)`, bounded `[0, 2]` (`0` =
+        /// same direction, `1` = orthogonal, `2` = opposite) -- guide §3.2's
+        /// "aggregate, never per-element" shape, but SCALE-INVARIANT rather
+        /// than magnitude-relative. Measured on an A100: the grad leg's step-0, random-`dy`-driven
+        /// LoRA-B gradient has a magnitude (`Σ|grad_f32|`) that itself varies
+        /// ~60x across [`FLASH_ORACLE_SWEEP_SEEDS`] (some draws of `dy` are
+        /// nearly orthogonal to the local Jacobian, producing a small true
+        /// gradient at that seed) -- [`relative_l1_error`]'s `Σ|Δ|/Σ|ref|`
+        /// aggregate is exactly proportional to `1/Σ|ref|`, so at those
+        /// low-magnitude seeds ORDINARY bf16 rounding noise alone produces a
+        /// huge ratio, drowning out any real fault signal in the MEAN over
+        /// seeds (the K-unrotated and window-dropped mutants' mean
+        /// `relative_l1_error` ratio measured BELOW the healthy oracle's own
+        /// mean under that metric). Cosine distance does not have this failure
+        /// mode: it normalises by each vector's OWN norm, so a small true
+        /// gradient does not inflate the metric -- it asks "does the fused
+        /// arm's gradient point the same way as truth", which is what actually
+        /// matters for a LoRA training step, and is what the grad leg uses
+        /// below. Same affirmative-finite-first (guide §3.7) and signal-assert
+        /// (both norms `> 0`) discipline as [`relative_l1_error`].
+        fn cosine_distance(arm: &[f32], reference: &[f32]) -> f64 {
+            assert_eq!(
+                arm.len(),
+                reference.len(),
+                "cosine_distance: length mismatch"
+            );
+            let non_finite = arm
+                .iter()
+                .chain(reference.iter())
+                .filter(|v| !v.is_finite())
+                .count();
+            assert_eq!(
+                non_finite, 0,
+                "cosine_distance: {non_finite} non-finite value(s)"
+            );
+            let mut dot = 0.0f64;
+            let mut norm_arm = 0.0f64;
+            let mut norm_ref = 0.0f64;
+            for (&a, &r) in arm.iter().zip(reference.iter()) {
+                let a = a as f64;
+                let r = r as f64;
+                dot += a * r;
+                norm_arm += a * a;
+                norm_ref += r * r;
+            }
+            let denom = norm_arm.sqrt() * norm_ref.sqrt();
+            assert!(
+                denom > 0.0,
+                "cosine_distance: arm or reference carries no signal (norm == 0) -- dividing by this \
+                 would silently read as a passing distance; the caller's loss/objective is degenerate \
+                 for this arm"
+            );
+            let cos = (dot / denom).clamp(-1.0, 1.0);
+            1.0 - cos
+        }
+
+        /// Deterministic mean/max over a non-empty `f64` slice -- affirmative
+        /// finiteness check first (guide §3.7) and a `total_cmp` fold (float
+        /// `max`/`min` combinators are NaN-blind -- `f64::max(NaN, x)
+        /// == x`, silently dropping the NaN rather than failing).
+        fn mean_max(values: &[f64]) -> (f64, f64) {
+            assert!(!values.is_empty(), "mean_max: empty slice");
+            let non_finite = values.iter().filter(|v| !v.is_finite()).count();
+            assert_eq!(non_finite, 0, "mean_max: {non_finite} non-finite value(s)");
+            let sum: f64 = values.iter().sum();
+            let mean = sum / values.len() as f64;
+            let max =
+                values.iter().copied().fold(
+                    values[0],
+                    |a, b| if b.total_cmp(&a).is_gt() { b } else { a },
+                );
+            (mean, max)
+        }
+
+        /// One seed's four leg errors (both arms compared against the SAME f32
+        /// reference at that seed) -- the shared unit the healthy oracle and
+        /// every RED control below reduce over. Pooled uses
+        /// [`relative_l1_error`]; grad uses [`cosine_distance`] (see that
+        /// function's own doc for why the grad leg needs a scale-invariant
+        /// metric).
+        #[derive(Clone, Copy, Debug)]
+        struct FlashOracleSeedMeasurement {
+            seed: u64,
+            pooled_other: f64,
+            pooled_block: f64,
+            grad_other: f64,
+            grad_block: f64,
+        }
+
+        impl FlashOracleSeedMeasurement {
+            fn pooled_ratio(&self) -> f64 {
+                self.pooled_other / self.pooled_block
+            }
+            fn grad_ratio(&self) -> f64 {
+                self.grad_other / self.grad_block
+            }
+        }
+
+        /// Builds a model, runs `forward`, and reduces to `(pooled, grad)` via
+        /// [`flash_oracle_pooled_and_grad`] -- the ONE per-arm measurement
+        /// primitive every call site below shares (a fresh `VarMap` per call,
+        /// same precedent as this section's own original `run_flash_oracle_shape`:
+        /// production-scale ModernBERT-large (28 layers, hidden=1024) at
+        /// forward+backward is real training-step memory, and holding more
+        /// than one arm's graph alive at once OOM'd on an 80GB A100, confirmed
+        /// live).
+        fn flash_oracle_measure_arm<B, F>(
+            build: B,
+            forward: F,
+            mask: &Tensor,
+            dy: &Tensor,
+        ) -> (Vec<f32>, Vec<f32>)
+        where
+            B: FnOnce() -> ModernBert,
+            F: FnOnce(&ModernBert) -> Result<Tensor, EncoderError>,
+        {
+            let model = build();
+            let hidden = forward(&model).unwrap();
+            flash_oracle_pooled_and_grad(&model, &hidden, mask, dy)
+        }
+
+        /// Sweeps `seeds`, measuring the caller-supplied "other" arm
+        /// (`other_build`/`other_forward` -- the flash arm for the healthy
+        /// oracle, or a fault-injected arm for a RED control) against the
+        /// production block-bf16 arm and an f32 reference, ALL from the SAME
+        /// `input_ids`/`dy` at each seed. Returns one
+        /// [`FlashOracleSeedMeasurement`] per seed, printed as it goes
+        /// (`--nocapture`) so the full per-seed table is always visible, not
+        /// just the reduced statistic.
+        #[allow(clippy::too_many_arguments)]
+        fn flash_oracle_sweep<BO, FO>(
+            config: &ModernBertConfig,
+            weights: &std::path::Path,
+            cuda: &Device,
+            batch: usize,
+            seq: usize,
+            seeds: &[u64],
+            label: &str,
+            other_build: BO,
+            other_forward: FO,
+        ) -> Vec<FlashOracleSeedMeasurement>
+        where
+            BO: Fn(u64) -> ModernBert,
+            FO: Fn(&ModernBert, &Tensor, &Tensor) -> Result<Tensor, EncoderError>,
+        {
+            let mut out = Vec::with_capacity(seeds.len());
+            for &seed in seeds {
+                let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, cuda);
+                let mask = Tensor::ones((batch, seq), DType::U32, cuda).unwrap();
+                let dy = flash_oracle_seeded_dy(batch, config.hidden_size, seed, cuda);
+
+                let (pooled_other, grad_other) = flash_oracle_measure_arm(
+                    || other_build(seed),
+                    |m| other_forward(m, &ids, &mask),
+                    &mask,
+                    &dy,
+                );
+                let (pooled_block, grad_block) = flash_oracle_measure_arm(
+                    || flash_oracle_build_model(config, weights, DType::BF16, seed, cuda, true),
+                    |m| forward_hidden_forcing_flash(m, &ids, &mask, true),
+                    &mask,
+                    &dy,
+                );
+                let (pooled_f32, grad_f32) = flash_oracle_measure_arm(
+                    || flash_oracle_build_model(config, weights, DType::F32, seed, cuda, false),
+                    |m| m.forward_hidden(&ids, &mask),
+                    &mask,
+                    &dy,
+                );
+
+                let m = FlashOracleSeedMeasurement {
+                    seed,
+                    pooled_other: relative_l1_error(&pooled_other, &pooled_f32),
+                    pooled_block: relative_l1_error(&pooled_block, &pooled_f32),
+                    grad_other: cosine_distance(&grad_other, &grad_f32),
+                    grad_block: cosine_distance(&grad_block, &grad_f32),
+                };
+                eprintln!(
+                    "flash_oracle_sweep[{label} seed={seed}]: pooled other={:.5e} block={:.5e} \
+                     ratio={:.4}; grad other={:.5e} block={:.5e} ratio={:.4}",
+                    m.pooled_other,
+                    m.pooled_block,
+                    m.pooled_ratio(),
+                    m.grad_other,
+                    m.grad_block,
+                    m.grad_ratio(),
+                );
+                out.push(m);
+            }
+            out
+        }
+
+        /// Prints the full per-seed `(pooled_ratio, grad_ratio)` table -- the
+        /// artifact-grade record every `--nocapture` caller below relies on
+        /// (the committed `2026-08-25-flash-arm-encoder-oracle-*.json`
+        /// artifacts are built FROM this output), not just the reduced mean/max
+        /// statistic.
+        fn print_seed_ratio_table(label: &str, measurements: &[FlashOracleSeedMeasurement]) {
+            for m in measurements {
+                eprintln!(
+                    "  seed={:>3} [{label}]: pooled_ratio={:.4} grad_ratio={:.4}",
+                    m.seed,
+                    m.pooled_ratio(),
+                    m.grad_ratio(),
+                );
+            }
+        }
+
+        /// The main oracle: flash-bf16 vs block-bf16 vs f32, on the pooled
+        /// embedding AND the step-0 `dL/dWqkv-LoRA` gradient, over
+        /// [`FLASH_ORACLE_SWEEP_SEEDS`], for ONE shape. Prints the per-seed
+        /// table (including the per-seed max, for diagnostics) and asserts the
+        /// MEAN ratio against [`FLASH_ORACLE_K_MEAN_POOLED`]/
+        /// [`FLASH_ORACLE_K_MEAN_GRAD`] -- there is no per-seed MAX assertion
+        /// (see [`FLASH_ORACLE_K_MEAN_GRAD`]'s own doc for why one existed
+        /// before and was deleted).
+        fn run_flash_oracle_shape_sweep(
+            config: &ModernBertConfig,
+            weights: &std::path::Path,
+            cuda: &Device,
+            batch: usize,
+            seq: usize,
+            label: &str,
+        ) {
+            let measurements = flash_oracle_sweep(
+                config,
+                weights,
+                cuda,
+                batch,
+                seq,
+                &FLASH_ORACLE_SWEEP_SEEDS,
+                label,
+                |seed| flash_oracle_build_model(config, weights, DType::BF16, seed, cuda, true),
+                |m, ids, mask| {
+                    let before = cascade_counters_for("attention_block_flash").snapshot();
+                    let hidden = forward_hidden_forcing_flash(m, ids, mask, false)?;
+                    let after = cascade_counters_for("attention_block_flash").snapshot();
+                    assert_eq!(
+                        after.fused - before.fused,
+                        config.num_hidden_layers as u64,
+                        "[{label}] flash arm: zero dispatch is RED (guide §3.5) -- every layer must \
+                         have actually dispatched Fused on this dense batch"
+                    );
+                    Ok(hidden)
+                },
+            );
+
+            print_seed_ratio_table(label, &measurements);
+            let pooled_ratios: Vec<f64> = measurements.iter().map(|m| m.pooled_ratio()).collect();
+            let grad_ratios: Vec<f64> = measurements.iter().map(|m| m.grad_ratio()).collect();
+            let (pooled_mean, pooled_max) = mean_max(&pooled_ratios);
+            let (grad_mean, grad_max) = mean_max(&grad_ratios);
+
+            eprintln!(
+                "flash_oracle[{label}] OVER {} SEEDS: pooled ratio mean={pooled_mean:.4} \
+                 max={pooled_max:.4} (bound mean<={FLASH_ORACLE_K_MEAN_POOLED}, max UNASSERTED -- \
+                 diagnostic only); grad ratio mean={grad_mean:.4} max={grad_max:.4} (bound \
+                 mean<={FLASH_ORACLE_K_MEAN_GRAD}, max UNASSERTED -- diagnostic only)",
+                FLASH_ORACLE_SWEEP_SEEDS.len(),
+            );
+
+            assert!(
+                pooled_mean.is_finite() && pooled_mean <= FLASH_ORACLE_K_MEAN_POOLED,
+                "[{label}] pooled embedding: mean ratio {pooled_mean:.4} over {} seeds exceeds \
+                 FLASH_ORACLE_K_MEAN_POOLED={FLASH_ORACLE_K_MEAN_POOLED}",
+                FLASH_ORACLE_SWEEP_SEEDS.len(),
+            );
+            assert!(
+                grad_mean.is_finite() && grad_mean <= FLASH_ORACLE_K_MEAN_GRAD,
+                "[{label}] LoRA gradient (last layer Wqkv B): mean ratio {grad_mean:.4} over {} seeds \
+                 exceeds FLASH_ORACLE_K_MEAN_GRAD={FLASH_ORACLE_K_MEAN_GRAD}",
+                FLASH_ORACLE_SWEEP_SEEDS.len(),
+            );
+        }
+
+        /// `cuMemGetInfo` (via `candle_core::cuda_backend::cudarc::driver::
+        /// result::mem_get_info`) after a device sync -- the SAME driver-level
+        /// "free bytes right now" reading `jammi-bench`'s `peak_vram_bytes`
+        /// sampler polls through `nvidia-smi`, just called in-process so it can
+        /// be interleaved with individual layer forwards rather than only
+        /// sampled on a background thread. Returns free memory in MiB.
+        fn cuda_free_mib(device: &Device) -> f64 {
+            device
+                .synchronize()
+                .expect("device sync before mem_get_info");
+            let (free, _total) = candle_core::cuda_backend::cudarc::driver::result::mem_get_info()
+                .expect("cuMemGetInfo_v2 failed");
+            free as f64 / (1024.0 * 1024.0)
+        }
+
+        /// The SAME `cuMemGetInfo` driver call [`cuda_free_mib`] makes, reading
+        /// the OTHER half of its `(free, total)` pair — this device's TOTAL
+        /// installed memory in MiB, a fixed hardware property (not a
+        /// currently-free reading). [`assert_vram_floor`]'s own probe.
+        fn cuda_total_mib(device: &Device) -> f64 {
+            device
+                .synchronize()
+                .expect("device sync before mem_get_info");
+            let (_free, total) = candle_core::cuda_backend::cudarc::driver::result::mem_get_info()
+                .expect("cuMemGetInfo_v2 failed");
+            total as f64 / (1024.0 * 1024.0)
+        }
+
+        /// A floor on this device's TOTAL memory below which the four
+        /// 80GB-class encoder-level real-checkpoint oracles
+        /// (`flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16` + its
+        /// three RED controls) are structurally unable to run (one arm of
+        /// production-scale ModernBERT-large at forward+backward is
+        /// 80GB-class; see [`flash_oracle_measure_arm`]'s own doc).
+        ///
+        /// 64 GiB: comfortably above the CONFIRMED-insufficient 48 GiB tier
+        /// (L40S/A40 — both OOM'd at model-load with an otherwise EMPTY
+        /// device, `0` MiB used, no zombie process, even under a SERIALIZED
+        /// `--test-threads=1` solo rerun — a genuine capability ceiling, not a
+        /// concurrency artifact or a leak) and comfortably below the
+        /// CONFIRMED-sufficient 80 GiB tier (A100/H100, fully green on every
+        /// leg including these four). No number tighter than this two-SKU
+        /// bracket has actually been measured (a solo run's own peak VRAM was
+        /// never sampled in isolation — only the pass/fail boundary at these
+        /// two real SKU tiers is known), so this floor is a reasoned midpoint
+        /// between two confirmed data points, not a precisely-derived one; a
+        /// future SKU landing between 48 and 80 GiB would need its own real
+        /// measurement to place this floor more precisely.
+        const FLASH_ORACLE_ENCODER_LEVEL_VRAM_FLOOR_MIB: f64 = 64.0 * 1024.0;
+
+        /// Asserts `device` has the memory the encoder-level real-checkpoint
+        /// oracles need: one arm of production-scale ModernBERT-large at
+        /// forward+backward is 80GB-class training-step memory, so a 48 GiB card
+        /// cannot hold it.
+        #[cfg(feature = "live-flash-oracle-tests")]
+        fn assert_vram_floor(device: &Device) {
+            let total_mib = cuda_total_mib(device);
+            assert!(
+                total_mib >= FLASH_ORACLE_ENCODER_LEVEL_VRAM_FLOOR_MIB,
+                "this test needs at least {FLASH_ORACLE_ENCODER_LEVEL_VRAM_FLOOR_MIB:.0} MiB of \
+                 device memory; this device has {total_mib:.0} MiB"
+            );
+        }
+
+        /// Per-layer VRAM attribution probe for the flash arm's peak VRAM. It
+        /// does NOT mirror [`forward_hidden_forcing_flash`]'s body -- that
+        /// function is a thin seam over `ModernBert::forward_hidden_inner`,
+        /// which includes the padded/ragged encoder-boundary transport gate
+        /// (`unpad_rows` before layer 0, `repad_rows` after); THIS probe is a
+        /// hand-mirrored per-layer loop without transport, with one addition -- a [`cuda_free_mib`] reading after each layer's
+        /// forward, printed as a delta against the PRIOR reading -- and does
+        /// NOT gather/scatter. Its own ONLY call site
+        /// ([`flash_vs_block_per_layer_vram_attribution_probe_cuda`]) always
+        /// passes an ALL-ONES (dense, unpadded) mask, so the missing transport
+        /// gate is a NO-OP there (a genuinely padded batch would
+        /// take the `!admission.is_dense` branch `forward_hidden_inner` skips
+        /// this probe entirely) -- but a caller that reused this probe with a
+        /// padded mask would silently get the WRONG (untransported) per-layer
+        /// VRAM profile, not a refusal. `label` names the arm in the printed
+        /// table (`"flash"` / `"block"`) purely for a human reading
+        /// `--nocapture` output; this function asserts nothing -- it is a
+        /// diagnostic tool, not an oracle (the calling test's own dispatch
+        /// count assertion is the oracle that the intended arm actually ran).
+        fn forward_hidden_forcing_flash_vram_probe(
+            model: &ModernBert,
+            input_ids: &Tensor,
+            mask: &Tensor,
+            force_decline: bool,
+            label: &str,
+        ) -> Tensor {
+            let device = input_ids.device().clone();
+            let mut prev = cuda_free_mib(&device);
+            println!("[vram-probe {label}] start free={prev:.2} MiB");
+            let (_batch, seq) = input_ids.dims2().unwrap();
+            let word_emb = model.word_embeddings.forward(input_ids).unwrap();
+            let mut hidden = model.emb_norm.forward(&word_emb).unwrap();
+            let extended = extended_attention_mask(mask).unwrap();
+            let local_band = model
+                .local_half_window
+                .map(|half| model.sliding_band(seq, half, &device).unwrap());
+            let fused_masks = if model.training {
+                Some(
+                    FusedAttentionMasks::build(&extended, local_band.as_ref(), hidden.dtype())
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let flash_admission = if model.training {
+                if force_decline {
+                    Some(declined_flash())
+                } else {
+                    let head_dim = model
+                        .layers
+                        .first()
+                        .map(|l| l.attention.head_dim)
+                        .unwrap_or(0);
+                    Some(
+                        decide_flash_admission(&device, hidden.dtype(), head_dim, mask, None)
+                            .unwrap(),
+                    )
+                }
+            } else {
+                None
+            };
+            let now = cuda_free_mib(&device);
+            println!(
+                "[vram-probe {label}] after-setup free={now:.2} MiB delta={:.2} MiB",
+                prev - now
+            );
+            prev = now;
+            for (i, layer) in model.layers.iter().enumerate() {
+                hidden = layer
+                    .forward(
+                        &hidden,
+                        &extended,
+                        local_band.as_ref(),
+                        fused_masks.as_ref(),
+                        flash_admission.as_ref(),
+                    )
+                    .unwrap();
+                let now = cuda_free_mib(&device);
+                println!(
+                    "[vram-probe {label}] layer {i:02} free={now:.2} MiB delta={:.2} MiB",
+                    prev - now
+                );
+                prev = now;
+            }
+            let out = model.final_norm.forward(&hidden).unwrap();
+            let now = cuda_free_mib(&device);
+            println!(
+                "[vram-probe {label}] after-final-norm free={now:.2} MiB delta={:.2} MiB",
+                prev - now
+            );
+            out
+        }
+
+        /// Drives [`forward_hidden_forcing_flash_vram_probe`] for BOTH arms, in
+        /// ONE process, from the SAME loaded checkpoint: per-layer `Device` memory
+        /// queries after each layer's forward, plus one more after backward,
+        /// for both arms, so the per-layer delta table can be read off
+        /// `--nocapture` output directly rather than reconstructed from two
+        /// separate log files. Compiled under `live-flash-oracle-tests`; reads
+        /// the checkpoint from `JAMMI_FLASH_ORACLE_MODEL_DIR` (panics naming it
+        /// when unset), like every other real-checkpoint test in this file. A
+        /// fresh model (fresh `VarMap`) per arm, exactly
+        /// [`run_flash_oracle_shape_sweep`]'s own precedent, so one arm's
+        /// retained graph cannot skew the other's baseline.
+        #[test]
+        #[cfg(feature = "live-flash-oracle-tests")]
+        fn flash_vs_block_per_layer_vram_attribution_probe_cuda() {
+            let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
+            let cuda = jammi_test_resources::cuda_device(0);
+            // This test builds a REAL ModernBERT-large model at the SAME
+            // (8, 512) shape as the four encoder-level oracles and calls a REAL
+            // `.backward()` (twice — once per `[(false, "flash"), (true,
+            // "block")]` arm, each with its own fresh model) — the identical
+            // 80GB-class fwd+bwd profile, so it needs the same VRAM floor.
+            assert_flash_arch(&cuda);
+            assert_vram_floor(&cuda);
+            let _lock = crate::test_support::seam_counter_lock();
+            let _d2h_guard = FLASH_D2H_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            let dir = std::path::PathBuf::from(&model_dir);
+            let config: ModernBertConfig =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                    .unwrap();
+            let weights = dir.join("model.safetensors");
+            let (batch, seq, seed) = (8usize, 512usize, 42u64);
+            let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
+            let mask = Tensor::ones((batch, seq), DType::U32, &cuda).unwrap();
+
+            for (force_decline, label) in [(false, "flash"), (true, "block")] {
+                let bf16_model =
+                    flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+                let counter_before = cascade_counters_for("attention_block_flash").snapshot();
+                let hidden = forward_hidden_forcing_flash_vram_probe(
+                    &bf16_model,
+                    &ids,
+                    &mask,
+                    force_decline,
+                    label,
+                );
+                let counter_after = cascade_counters_for("attention_block_flash").snapshot();
+                if force_decline {
+                    assert_eq!(
+                        counter_after.fused - counter_before.fused,
+                        0,
+                        "[{label}] the block arm must not have dispatched attention_block_flash"
+                    );
+                } else {
+                    assert_eq!(
+                        counter_after.fused - counter_before.fused,
+                        config.num_hidden_layers as u64,
+                        "[vram-probe {label}] zero dispatch is RED (guide §3.5) -- every layer must \
+                         have actually dispatched Fused on this dense batch"
+                    );
+                }
+                let pooled = pool_and_normalize(&hidden, &mask, Pooling::Mean).unwrap();
+                let loss = pooled
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .sqr()
+                    .unwrap()
+                    .sum_all()
+                    .unwrap();
+                let before_bwd = cuda_free_mib(&cuda);
+                let grads = loss.backward().unwrap();
+                let after_bwd = cuda_free_mib(&cuda);
+                println!(
+                    "[vram-probe {label}] after-backward free={after_bwd:.2} MiB delta={:.2} MiB",
+                    before_bwd - after_bwd
+                );
+                drop(grads);
+                drop(hidden);
+                drop(bf16_model);
+                let after_drop = cuda_free_mib(&cuda);
+                println!("[vram-probe {label}] after-drop free={after_drop:.2} MiB");
+            }
+        }
+
+        /// Compiled under `live-flash-oracle-tests`: no ModernBERT-large
+        /// checkpoint is committed to this repo, so the checkpoint comes from
+        /// `JAMMI_FLASH_ORACLE_MODEL_DIR`, and a missing CUDA device, arch, VRAM
+        /// floor or model dir each panics naming what is missing.
+        #[test]
+        #[cfg(feature = "live-flash-oracle-tests")]
+        fn flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16() {
+            let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
+            let cuda = jammi_test_resources::cuda_device(0);
+            assert_flash_arch(&cuda);
+            assert_vram_floor(&cuda);
+            let _lock = crate::test_support::seam_counter_lock();
+            let _d2h_guard = FLASH_D2H_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            let dir = std::path::PathBuf::from(&model_dir);
+            let config: ModernBertConfig =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                    .unwrap();
+            let weights = dir.join("model.safetensors");
+
+            run_flash_oracle_shape_sweep(&config, &weights, &cuda, 8, 512, "b8_s512");
+            run_flash_oracle_shape_sweep(&config, &weights, &cuda, 1, 128, "b1_s128");
+        }
+
+        /// The `NoFault` arm of [`forward_hidden_flash_with_fault`] must be
+        /// BIT-IDENTICAL to [`forward_hidden_forcing_flash`]'s real
+        /// (`force_decline = false`) arm -- proof that the fault-injection
+        /// mirror has not drifted from what `ModernBertLayer::forward` /
+        /// `ModernBertAttention::forward_flash_dense_attention` actually run
+        /// (see this section's own block comment, "the two hand-synced
+        /// mirrors"). If this test ever goes red, every RED control below
+        /// stops being trustworthy -- they all inject faults into THIS
+        /// harness, not into production directly.
+        #[test]
+        #[cfg(feature = "live-flash-oracle-tests")]
+        fn flash_arm_fault_harness_nofault_matches_production_bit_identical() {
+            let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
+            let cuda = jammi_test_resources::cuda_device(0);
+            let _lock = crate::test_support::seam_counter_lock();
+            let _d2h_guard = FLASH_D2H_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_flash_arch(&cuda);
+
+            let dir = std::path::PathBuf::from(&model_dir);
+            let config: ModernBertConfig =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                    .unwrap();
+            let weights = dir.join("model.safetensors");
+            let seed = 99;
+            let (batch, seq) = (2usize, 64usize);
+            let ids = flash_oracle_synthetic_ids(batch, seq, config.vocab_size, seed, &cuda);
+            let mask = Tensor::ones((batch, seq), DType::U32, &cuda).unwrap();
+
+            let bf16_model =
+                flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+            let production: Vec<f32> =
+                forward_hidden_forcing_flash(&bf16_model, &ids, &mask, false)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+            let mirror: Vec<f32> =
+                forward_hidden_flash_with_fault(&bf16_model, &ids, &mask, &FlashFault::NoFault)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+            assert_eq!(
+                production, mirror,
+                "the fault harness's NoFault arm must be bit-identical to production's own \
+                 forward_hidden_forcing_flash(force_decline=false) -- any difference means this \
+                 hand-synced mirror has drifted from ModernBertAttention::forward_flash_dense_attention"
+            );
+        }
+
+        /// RED control: the window-dropped fault (`half_window` forced `None`
+        /// on every layer, see the block comment above) must VIOLATE the same
+        /// bound the real oracle asserts above, on BOTH legs, in MEAN, over
+        /// the SAME [`FLASH_ORACLE_SWEEP_SEEDS`].
+        #[test]
+        #[cfg(feature = "live-flash-oracle-tests")]
+        fn flash_arm_encoder_level_oracle_red_control_window_dropped() {
+            let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
+            let cuda = jammi_test_resources::cuda_device(0);
+            assert_flash_arch(&cuda);
+            assert_vram_floor(&cuda);
+            let _lock = crate::test_support::seam_counter_lock();
+            let _d2h_guard = FLASH_D2H_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            let dir = std::path::PathBuf::from(&model_dir);
+            let config: ModernBertConfig =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                    .unwrap();
+            let weights = dir.join("model.safetensors");
+            let (batch, seq) = (8usize, 512usize);
+            let label = "window_dropped_b8_s512";
+
+            let measurements = flash_oracle_sweep(
+                &config,
+                &weights,
+                &cuda,
+                batch,
+                seq,
+                &FLASH_ORACLE_SWEEP_SEEDS,
+                label,
+                |seed| {
+                    // FAULT: force every layer's flash-arm sliding window off --
+                    // the window is construction data ONLY the flash arm reads
+                    // (see `ModernBertAttention::half_window`'s own doc); the
+                    // block arm's sliding band comes from a separate field
+                    // (`ModernBert::local_half_window`) and is unaffected.
+                    let mut m =
+                        flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true);
+                    for layer in m.layers.iter_mut() {
+                        layer.attention.half_window = None;
+                    }
+                    m
+                },
+                |m, ids, mask| forward_hidden_forcing_flash(m, ids, mask, false),
+            );
+
+            assert_red_control_violates_bound(label, &measurements);
+        }
+
+        /// RED control: the K-unrotated fault (`FlashFault::KUnrotated`, see
+        /// the block comment above) must VIOLATE the same bound the real
+        /// oracle asserts above, on BOTH legs, in MEAN, over the SAME
+        /// [`FLASH_ORACLE_SWEEP_SEEDS`].
+        #[test]
+        #[cfg(feature = "live-flash-oracle-tests")]
+        fn flash_arm_encoder_level_oracle_red_control_k_unrotated() {
+            run_flash_arm_fault_red_control("k_unrotated_b8_s512", &FlashFault::KUnrotated);
+        }
+
+        /// RED control: a wrong `softmax_scale` (class sweep -- see the block
+        /// comment above) must VIOLATE the same bound too, on BOTH legs, in
+        /// MEAN, over the SAME [`FLASH_ORACLE_SWEEP_SEEDS`].
+        #[test]
+        #[cfg(feature = "live-flash-oracle-tests")]
+        fn flash_arm_encoder_level_oracle_red_control_bad_softmax_scale() {
+            run_flash_arm_fault_red_control(
+                "bad_softmax_scale_b8_s512",
+                &FlashFault::BadSoftmaxScale(1.0),
+            );
+        }
+
+        /// Every RED control above shares this: sweep the SAME 8 seeds, assert
+        /// the fault's MEAN ratio (both legs) exceeds the SAME bound the
+        /// healthy oracle asserts against -- proving the oracle actually
+        /// catches the fault as a DISTRIBUTION-level effect, not merely that
+        /// it "looks wrong" on one lucky draw.
+        #[cfg(feature = "live-flash-oracle-tests")]
+        fn run_flash_arm_fault_red_control(label: &str, fault: &FlashFault) {
+            let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
+            let cuda = jammi_test_resources::cuda_device(0);
+            assert_vram_floor(&cuda);
+            assert_flash_arch(&cuda);
+            let _lock = crate::test_support::seam_counter_lock();
+            let _d2h_guard = FLASH_D2H_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            let dir = std::path::PathBuf::from(&model_dir);
+            let config: ModernBertConfig =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                    .unwrap();
+            let weights = dir.join("model.safetensors");
+            let (batch, seq) = (8usize, 512usize);
+
+            let measurements = flash_oracle_sweep(
+                &config,
+                &weights,
+                &cuda,
+                batch,
+                seq,
+                &FLASH_ORACLE_SWEEP_SEEDS,
+                label,
+                |seed| flash_oracle_build_model(&config, &weights, DType::BF16, seed, &cuda, true),
+                |m, ids, mask| forward_hidden_flash_with_fault(m, ids, mask, fault),
+            );
+
+            assert_red_control_violates_bound(label, &measurements);
+        }
+
+        /// Shared assertion every RED control above ends with: the fault's MEAN
+        /// pooled ratio AND MEAN grad ratio, over [`FLASH_ORACLE_SWEEP_SEEDS`],
+        /// must each exceed the healthy bound -- if either does not, the real
+        /// oracle above would NOT have caught this defect on that leg.
+        fn assert_red_control_violates_bound(
+            label: &str,
+            measurements: &[FlashOracleSeedMeasurement],
+        ) {
+            print_seed_ratio_table(label, measurements);
+            let pooled_ratios: Vec<f64> = measurements.iter().map(|m| m.pooled_ratio()).collect();
+            let grad_ratios: Vec<f64> = measurements.iter().map(|m| m.grad_ratio()).collect();
+            let (pooled_mean, _pooled_max) = mean_max(&pooled_ratios);
+            let (grad_mean, _grad_max) = mean_max(&grad_ratios);
+
+            eprintln!(
+                "RED control [{label}]: pooled mean ratio={pooled_mean:.4} (bound \
+                 {FLASH_ORACLE_K_MEAN_POOLED}); grad mean ratio={grad_mean:.4} (bound \
+                 {FLASH_ORACLE_K_MEAN_GRAD})"
+            );
+
+            assert!(
+                pooled_mean.is_finite() && pooled_mean > FLASH_ORACLE_K_MEAN_POOLED,
+                "RED control [{label}] must VIOLATE the pooled-leg bound in mean (mean ratio \
+                 {pooled_mean:.4} must exceed FLASH_ORACLE_K_MEAN_POOLED={FLASH_ORACLE_K_MEAN_POOLED}) \
+                 -- if this assertion fails, the real oracle above would NOT have caught this defect \
+                 on the pooled leg"
+            );
+            assert!(
+                grad_mean.is_finite() && grad_mean > FLASH_ORACLE_K_MEAN_GRAD,
+                "RED control [{label}] must VIOLATE the grad-leg bound in mean (mean ratio \
+                 {grad_mean:.4} must exceed FLASH_ORACLE_K_MEAN_GRAD={FLASH_ORACLE_K_MEAN_GRAD}) -- \
+                 if this assertion fails, the real oracle above would NOT have caught this defect on \
+                 the grad leg"
+            );
+        }
+
+        /// The GEMM-operand-form defect oracle: a `.contiguous()`-restored
+        /// regression is invisible to any SINGLE
+        /// fused-vs-eager `bwd` call — its systematic bias is smaller than
+        /// ordinary bf16 rounding noise at depth 1 (this crate's own
+        /// per-element derived bounds already admit it) — and only separates
+        /// from noise by COMPOUNDING through depth. This drives the REAL
+        /// `forward_training_attention` (fused arm) and
+        /// `forward_eager_training_attention_composition` (production eager
+        /// arm) `L_MAX` times each, chaining each call's own output back into
+        /// the next call's `qkv` input (`qkv_next = cat([out, out, out],
+        /// last)` — a weight-free, shape-correct bridge: the mechanism under
+        /// test lives entirely inside the attention call itself, not in any
+        /// inter-layer projection, so no per-layer `Wqkv` is needed) from a
+        /// SINGLE tracked `qkv` `Var`, then compares the two arms'
+        /// `dqkv` at the END of the chain, not after one call.
+        ///
+        /// Discriminating quantity: `r(L) = Σ|dqkv_fused - dqkv_eager| /
+        /// Σ|dqkv_eager|` per `qkv` slot. Gate: `r(L_MAX) <= C * max(r(1),
+        /// EPS)` — `r(1)`, MEASURED on this same run, is the noise floor, not
+        /// an absolute bf16-ULP constant (floor discipline). Six non-vacuity
+        /// clauses, all required for this leg to count: (1) RED-FIRST
+        /// PROVENANCE — this leg is RED with the three `.contiguous()` calls
+        /// `jammi_kernels::ops::attention_block`'s `bwd_core` omits restored,
+        /// GREEN without. (2) DISPATCH
+        /// PROVENANCE — asserted below. (3) NON-FINITE — every comparison is
+        /// `assert!(x.is_finite() && x <= bound)`, never a negated `>`.
+        /// (4) SIGNAL — `Σ|dqkv_eager| > 0` per slot, asserted before it is
+        /// used as a denominator. (5) INDEPENDENCE — "eager" is
+        /// `forward_eager_training_attention_composition` itself, called
+        /// directly (the SAME method `forward_training_attention`'s own
+        /// fallback calls), never a copy of its logic in this test file.
+        /// (6) FLOOR DISCIPLINE — the gate above uses only measured
+        /// quantities from THIS run.
+        ///
+        /// An `F32` run of the SAME chain (`forward_eager_training_
+        /// attention_composition` at `L_MAX` deep, `F32`) is the
+        /// anti-vacuity anchor: it CANNOT itself redden on this defect (both
+        /// `bf16` arms' GEMM reduction orders are individually legal relative
+        /// to it), so it exists only to catch the two `bf16` arms being wrong
+        /// TOGETHER in some unrelated way — confirmation, never the gate.
+        #[test]
+        fn attention_block_fused_vs_eager_dqkv_divergence_grows_with_depth_bf16_cuda() {
+            let device = jammi_test_resources::cuda_device(0);
+            let _lock = crate::test_support::seam_counter_lock();
+
+            const L_MAX: usize = 28; // the real ModernBERT-large depth this defect was found on.
+            let (b, s, h): (usize, usize, usize) = (8, 512, 16);
+            let d = ATTENTION_BLOCK_HEAD_DIM;
+            let hd = h * d;
+            let half_window = 64usize;
+            let attn = attention_block_fixture(true, h, s, &device);
+
+            let n = b * s * 3 * hd;
+            let qkv0_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.0137).sin() * 0.6).collect();
+            let dy_v: Vec<f32> = (0..(b * s * hd))
+                .map(|i| ((i as f32) * 0.0059).cos() * 0.5 + 0.05)
+                .collect();
+            let extended = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+            let band = crate::mask::sliding_window_mask(s, half_window, &device).unwrap();
+            let fused_masks_bf16 =
+                FusedAttentionMasks::build(&extended, Some(&band), DType::BF16).unwrap();
+
+            // Returns `(dqkv, fused_dispatch_delta, eager_dispatch_delta)`.
+            let run = |force_eager: bool, dtype: DType, l: usize| -> (Vec<f32>, u64, u64) {
+                let before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+                let qkv = Var::from_tensor(
+                    &Tensor::from_vec(qkv0_v.clone(), (b, s, 3 * hd), &device)
+                        .unwrap()
+                        .to_dtype(dtype)
+                        .unwrap(),
+                )
+                .unwrap();
+                let dy = Tensor::from_vec(dy_v.clone(), (b, s, hd), &device)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                assert!(l > 0, "run: l must be >= 1");
+                let mut cur = qkv.as_tensor().clone();
+                let mut last_out = None;
+                for _ in 0..l {
+                    let out = if force_eager {
+                        attn.forward_eager_training_attention_composition(
+                            &cur,
+                            b,
+                            s,
+                            h,
+                            d,
+                            &extended,
+                            Some(&band),
+                        )
+                        .unwrap()
+                    } else {
+                        let masks = TrainingMaskInputs {
+                            extended: &extended,
+                            local_band: Some(&band),
+                            fused: Some(&fused_masks_bf16),
+                        };
+                        attn.forward_training_attention(&cur, b, s, h, d, masks, &declined_flash())
+                            .unwrap()
+                    };
+                    // Amplitude control between chained calls (no residual/
+                    // LayerNorm in this synthetic chain — see this test's own
+                    // doc): a plain max-abs rescale keeps `cur` inside this
+                    // op's own validated bf16 domain (module doc's "BF16
+                    // validated-coverage ceiling" section) across `L_MAX`
+                    // layers.
+                    let out_max = out
+                        .abs()
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .max(0)
+                        .unwrap()
+                        .to_dtype(DType::F32)
+                        .unwrap()
+                        .to_scalar::<f32>()
+                        .unwrap()
+                        .max(1e-6);
+                    let out_n = (&out / f64::from(out_max)).unwrap();
+                    cur = Tensor::cat(&[&out_n, &out_n, &out_n], D::Minus1).unwrap();
+                    last_out = Some(out);
+                }
+                // `cur` (the last iteration's RE-TILED `[b, s, 3*hd]` bridge
+                // for a NEXT iteration that never runs) is NOT the loss input
+                // — `last_out` (`[b, s, hd]`, the last iteration's own
+                // attention output, matching `dy`'s shape) is.
+                let loss = (last_out.unwrap() * &dy).unwrap().sum_all().unwrap();
+                let grads = loss.backward().unwrap();
+                let dqkv: Vec<f32> = grads
+                    .get(&qkv)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                let after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+                (dqkv, after.fused - before.fused, after.eager - before.eager)
+            };
+
+            let (dqkv_fused_1, fused_ctr_1, eager_ctr_1) = run(false, DType::BF16, 1);
+            let (dqkv_eager_1, ef_ctr_1, ee_ctr_1) = run(true, DType::BF16, 1);
+            let (dqkv_fused_l, fused_ctr_l, eager_ctr_l) = run(false, DType::BF16, L_MAX);
+            let (dqkv_eager_l, ef_ctr_l, ee_ctr_l) = run(true, DType::BF16, L_MAX);
+            let (dqkv_ref_l, _, _) = run(true, DType::F32, L_MAX);
+
+            // Clause (2): DISPATCH PROVENANCE — zero dispatch is RED, never
+            // green: a silently-eager-fallen-back fused leg would compare
+            // eager against itself.
+            assert_eq!(
+                fused_ctr_1, 1,
+                "fused leg (L=1) must dispatch fused exactly once"
+            );
+            assert_eq!(
+                eager_ctr_1, 0,
+                "fused leg (L=1) must never fall back to eager"
+            );
+            assert_eq!(
+                fused_ctr_l, L_MAX as u64,
+                "fused leg (L={L_MAX}) must dispatch fused every layer"
+            );
+            assert_eq!(
+                eager_ctr_l, 0,
+                "fused leg (L={L_MAX}) must never fall back to eager"
+            );
+            assert_eq!(ef_ctr_1, 0, "the eager leg calls the eager composition directly — it must never touch the fused dispatch counter");
+            assert_eq!(
+                ee_ctr_1, 0,
+                "the eager leg bypasses `admit` entirely — its own counter stays untouched"
+            );
+            assert_eq!(ef_ctr_l, 0, "the eager leg calls the eager composition directly — it must never touch the fused dispatch counter");
+            assert_eq!(
+                ee_ctr_l, 0,
+                "the eager leg bypasses `admit` entirely — its own counter stays untouched"
+            );
+
+            // Clause (3): NON-FINITE, checked BEFORE any comparison; clause
+            // (4): SIGNAL.
+            let finite_sum = |v: &[f32]| -> (bool, f64) {
+                let mut ok = true;
+                let mut sum = 0f64;
+                for &x in v {
+                    ok &= x.is_finite();
+                    sum += f64::from(x.abs());
+                }
+                (ok, sum)
+            };
+            let (fused_1_ok, _) = finite_sum(&dqkv_fused_1);
+            let (eager_1_ok, eager_1_sum) = finite_sum(&dqkv_eager_1);
+            let (fused_l_ok, _) = finite_sum(&dqkv_fused_l);
+            let (eager_l_ok, eager_l_sum) = finite_sum(&dqkv_eager_l);
+            let (ref_l_ok, _) = finite_sum(&dqkv_ref_l);
+            assert!(
+                fused_1_ok && eager_1_ok && fused_l_ok && eager_l_ok && ref_l_ok,
+                "non-finite dqkv element(s) present before any comparison"
+            );
+            assert!(
+                eager_1_sum.is_finite() && eager_1_sum > 0.0,
+                "Σ|dqkv_eager| at L=1 must be nonzero"
+            );
+            assert!(
+                eager_l_sum.is_finite() && eager_l_sum > 0.0,
+                "Σ|dqkv_eager| at L={L_MAX} must be nonzero"
+            );
+
+            // r(L) per qkv slot (0=Q,1=K,2=V — `dqkv`'s last axis is
+            // `[q_seg(hd), k_seg(hd), v_seg(hd)]`, `forward_eager_training_
+            // attention_composition`'s own `narrow` layout).
+            let r = |fused: &[f32], eager: &[f32]| -> [f64; 3] {
+                let mut num = [0f64; 3];
+                let mut den = [0f64; 3];
+                for (i, (&fv, &ev)) in fused.iter().zip(eager.iter()).enumerate() {
+                    let slot = (i / hd) % 3;
+                    num[slot] += f64::from((fv - ev).abs());
+                    den[slot] += f64::from(ev.abs());
+                }
+                [
+                    num[0] / den[0].max(1e-30),
+                    num[1] / den[1].max(1e-30),
+                    num[2] / den[2].max(1e-30),
+                ]
+            };
+            let r1 = r(&dqkv_fused_1, &dqkv_eager_1);
+            let rl = r(&dqkv_fused_l, &dqkv_eager_l);
+
+            // The gate: GROWTH, not magnitude. `EPS` guards only against a
+            // pathological exact `r(1) == 0` tie (measured: on the FIXED
+            // build `r(1)` is exactly `0.0` for every slot — this op's own
+            // GEMMs are bit-identical to production's at a single call, at
+            // this shape — and a floor at 0 would divide by zero below); it
+            // is set two orders of magnitude BELOW the smallest genuinely-
+            // measured `r(1)` a GPU run of this test records with the
+            // defect present (`~1.04e-7`, F32-epsilon scale — an ordinary
+            // bf16 arm agrees with production almost exactly at ONE call even
+            // WITH the defect live, which is the whole reason a single-call
+            // comparison cannot see it), so it never competes with a real
+            // measurement — it is not the discriminating bound itself.
+            const C: f64 = 4.0;
+            const EPS: f64 = 1e-9;
+            for slot in 0..3 {
+                let floor = r1[slot].max(EPS);
+                let bound = C * floor;
+                assert!(
+                    rl[slot].is_finite() && rl[slot] <= bound,
+                    "slot {slot} (0=Q,1=K,2=V): r(L={L_MAX})={:e} exceeds {C}*max(r(1),{EPS:e})={bound:e} \
+                     (r(1)={:e}) — the fused/eager divergence is growing SYSTEMATICALLY with depth, not \
+                     staying at the L=1 bf16-noise scale",
+                    rl[slot],
+                    r1[slot],
+                );
+            }
+
+            // Anti-vacuity anchor (does NOT gate the defect — see this test's
+            // own doc): both bf16 arms must each stay within a generous,
+            // depth-scaled multiple of ordinary bf16 rounding of the F32
+            // reference, ruling out both arms being wrong TOGETHER.
+            let anchor = |bf16_v: &[f32]| -> f64 {
+                let mut num = 0f64;
+                let mut den = 0f64;
+                for (&x, &rf) in bf16_v.iter().zip(dqkv_ref_l.iter()) {
+                    num += f64::from((x - rf).abs());
+                    den += f64::from(rf.abs());
+                }
+                num / den.max(1e-30)
+            };
+            let fused_anchor = anchor(&dqkv_fused_l);
+            let eager_anchor = anchor(&dqkv_eager_l);
+            assert!(
+                fused_anchor.is_finite() && fused_anchor <= 0.5,
+                "fused dqkv at L={L_MAX} deviates from the F32 anchor by {fused_anchor:e} — too large \
+                 to be ordinary bf16 rounding compounded over {L_MAX} layers"
+            );
+            assert!(
+                eager_anchor.is_finite() && eager_anchor <= 0.5,
+                "eager dqkv at L={L_MAX} deviates from the F32 anchor by {eager_anchor:e} — too large \
+                 to be ordinary bf16 rounding compounded over {L_MAX} layers"
+            );
+        }
     }
 }

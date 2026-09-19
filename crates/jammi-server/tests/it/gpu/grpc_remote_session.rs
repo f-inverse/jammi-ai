@@ -79,7 +79,7 @@ use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tonic::transport::Endpoint;
 
-use super::common::grpc::ephemeral_addr;
+use crate::common::grpc::ephemeral_addr;
 
 fn head64_model_id() -> String {
     format!("local:{}", cookbook_fixture("tiny_bert_head64").display())
@@ -138,7 +138,7 @@ async fn start_gpu_engine_server() -> GpuEngineServer {
         admin_authorizer: None,
         limits: jammi_db::config::LimitsConfig::default(),
     };
-    let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
+    let (addr, handle) = crate::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
 
     GpuEngineServer {
         addr,

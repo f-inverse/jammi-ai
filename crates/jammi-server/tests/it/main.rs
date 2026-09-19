@@ -17,11 +17,10 @@ mod gang_rounds;
 mod gang_service;
 mod gang_terminal_write_oracle;
 mod gang_training_spec_parity;
+#[cfg(feature = "live-gpu-tests")]
+mod gpu;
 mod grpc_byo_auth;
 mod grpc_embedding;
-// The served GPU proofs: compiled only under `live-gpu-tests` (CUDA device 0).
-#[cfg(feature = "live-gpu-tests")]
-mod grpc_embedding_gpu;
 mod grpc_eval;
 mod grpc_inference;
 mod grpc_introspection;
@@ -32,9 +31,6 @@ mod grpc_pipeline;
 mod grpc_remote_compute;
 mod grpc_remote_list;
 mod grpc_remote_session;
-// The remote-vs-local bitwise read-back, on CUDA device 0.
-#[cfg(feature = "live-gpu-tests")]
-mod grpc_remote_session_gpu;
 mod grpc_session;
 mod grpc_tracing_span;
 mod grpc_trigger;

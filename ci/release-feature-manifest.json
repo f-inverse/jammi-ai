@@ -354,7 +354,6 @@
       },
       "jammi-kernels": {
         "kinds": [
-          "default",
           "test"
         ],
         "prove_only": [

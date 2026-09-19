@@ -7,8 +7,8 @@
 # Runs ON A GPU POD from a clean checkout of the exact commit being proven:
 #   1. the producer test: ModernBERT-large's padded flash arm against the block
 #      arm on real rows (`live-flash-oracle-tests`, 8 seeds);
-#   2. on a device with >= 79 GiB, the whole `live-flash-oracle-tests` suite
-#      (its encoder-level oracles need that much memory).
+#   2. on a device with >= 79 GiB, every GPU test of jammi-encoders' lib with the
+#      flash oracles compiled in (its encoder-level oracles need that much memory).
 # The rest of the arch's proof (kernels, encoders, engine, served suites) is the
 # prove lane's run at the same commit; pass its run URL as PROVE_RUN.
 #
@@ -36,9 +36,9 @@ for f in config.json model.safetensors tokenizer.json tokenizer_config.json spec
 done
 export JAMMI_FLASH_ORACLE_MODEL_DIR="$CKPT" CARGO_TERM_COLOR=never RUST_BACKTRACE=1
 
-PRODUCER_TEST=modernbert::tests::flash_arm_padded_matches_block_arm_on_real_rows_cuda
+PRODUCER_TEST=modernbert::tests::gpu::flash_arm_padded_matches_block_arm_on_real_rows_cuda
 PRODUCER_CMD=(cargo test -p jammi-encoders --lib --features cuda,flash-attn,live-flash-oracle-tests -- --exact "$PRODUCER_TEST" --nocapture)
-SUITE_CMD=(cargo test -p jammi-encoders --lib --features cuda,flash-attn,live-flash-oracle-tests -- --test-threads=1)
+SUITE_CMD=(cargo test -p jammi-encoders --lib --features cuda,flash-attn,live-flash-oracle-tests -- gpu:: --test-threads=1)
 
 leg() {
   local name="$1"; shift

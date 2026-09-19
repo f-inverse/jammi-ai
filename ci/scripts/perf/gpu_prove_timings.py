@@ -14,7 +14,7 @@ same-surface healthy artifact).
 Two modes:
 
   * CURRENT (default) -- the current script shape: `::group::<token>`/
-    `::endgroup::` pairs use the SIX short tokens plus `device`/
+    `::endgroup::` pairs use the `PROVE_GROUPS` tokens plus `device`/
     `bench`, each proof group's own `PROVE_GROUP_RC name=<n> rc=<v>` marker,
     one `PROVE_SHA=<sha>` echo after clone, `PROVE_TUPLE crate=<c> kind=<k>
     features=<literal>` echoes, and a final `PROVE_EXIT=<n>` line (present
@@ -24,7 +24,7 @@ Two modes:
     current tree's manifest, so a committed artifact's claimed surface never
     silently drifts if this script is re-run later against a newer checkout.
   * LEGACY (`--legacy`) -- an older job log: descriptive `::group::`
-    titles (mapped to the six canonical group names via prefix match, see
+    titles (mapped to the canonical group names via prefix match, see
     `LEGACY_TITLE_PREFIXES`), no `PROVE_GROUP_RC`/`PROVE_SHA`/`PROVE_TUPLE`
     markers at all. `run_id`/`job_id`/`git_sha`/`outcome` cannot be derived
     from the log body (GitHub run metadata, external to the log) and MUST be
@@ -64,20 +64,10 @@ import prove_surface  # noqa: E402
 SCHEMA_VERSION = 1
 ARTIFACT_DIR = REPO_ROOT / "ci" / "artifacts" / "gpu-prove-timings"
 
-# The six gating groups (matches `PROVE_GROUPS` in runpod_gpu_prove.sh) plus
-# the two non-gating groups this producer still records timing for.
-CURRENT_GROUP_NAMES = frozenset(
-    {
-        "device",
-        "capability-surface-build",
-        "capability-surface-proof",
-        "served-client-server-proof",
-        "engine-core-sweep",
-        "kernels-default",
-        "kernels-cuda",
-        "bench",
-    }
-)
+# The prove lane's gating groups (its script's `PROVE_GROUPS`) plus the two
+# non-gating groups this producer still records timing for.
+GATING_GROUP_NAMES = prove_surface.gating_groups()
+CURRENT_GROUP_NAMES = GATING_GROUP_NAMES | {"device", "bench"}
 
 # Legacy descriptive `::group::` titles -> canonical short name, matched by
 # PREFIX (a legacy title carries trailing parenthetical prose the canonical
@@ -381,7 +371,7 @@ def build_artifact(
             # driver's own BUDGET diagnostic (`rp_run_remote_watched`'s
             # own 124-cut evidence, printed only on a genuine ssh-status-124
             # cut with no PROVE_EXIT reached).
-            gating_names = CURRENT_GROUP_NAMES - {"device", "bench"}
+            gating_names = GATING_GROUP_NAMES
             group_names = {g["name"] for g in groups}
             all_gating_present = gating_names <= group_names
             all_gating_pass = all_gating_present and all(
@@ -529,59 +519,25 @@ def _synth_log(lines: list[str]) -> str:
     return "\n".join(out) + "\n"
 
 
-# The manifest's own `prove_lane.crates` declared (crate, kind) -> literal
-# feature-text pairs, used to emit the SEVEN real PROVE_TUPLE echoes a
-# healthy leg actually carries (the self-test's healthy log must carry them
-# and assert `expected_id == prove_surface.current_expected_id()`, never a
-# bare synthetic sha).
-_SELF_TEST_TUPLES = [
-    ("jammi-server", "release"),
-    ("jammi-ai", "test"),
-    ("jammi-server", "test"),
-    ("jammi-ai", "test"),  # engine-core-sweep -- same (crate,kind), same literal
-    ("jammi-kernels", "default"),
-    ("jammi-kernels", "test"),
-    ("jammi-bench", "release"),
-]
-_SELF_TEST_GROUP_FOR_TUPLE = [
-    "capability-surface-build",
-    "capability-surface-build",
-    "served-client-server-proof",
-    "engine-core-sweep",
-    "kernels-default",
-    "kernels-cuda",
-    "bench",
-]
+# The prove script's own groups, in run order, with the PROVE_TUPLE echoes
+# each carries: a healthy synthetic leg reproduces them exactly, so its
+# `expected_id` must equal `prove_surface.current_expected_id()`.
+_SCRIPT_LAYOUT = [(g, t) for g, t in prove_surface.script_layout() if g != "device"]
 
 
 def _healthy_lines() -> list[str]:
     manifest = prove_surface.load_manifest()
     lines = ["##[group]device", "name, compute_cap, driver_version", "NVIDIA A100 80GB PCIe, 8.0, 570.195.03", "CUDA_COMPUTE_CAP=80", "##[endgroup]"]
     lines += ["PROVE_SHA=" + "a" * 40]
-    tuple_idx = 0
-    for name in (
-        "capability-surface-build",
-        "capability-surface-proof",
-        "served-client-server-proof",
-        "engine-core-sweep",
-        "kernels-default",
-        "kernels-cuda",
-    ):
+    for name, tuples in _SCRIPT_LAYOUT:
         lines.append(f"##[group]{name}")
-        while tuple_idx < len(_SELF_TEST_GROUP_FOR_TUPLE) and _SELF_TEST_GROUP_FOR_TUPLE[tuple_idx] == name:
-            crate, kind = _SELF_TEST_TUPLES[tuple_idx]
+        for crate, kind in tuples:
             feats = prove_surface.feature_text(prove_surface.expected(crate, kind, manifest))
             lines.append(f"PROVE_TUPLE crate={crate} kind={kind} features={feats}")
-            tuple_idx += 1
-        lines.append(f"PROVE_GROUP_RC name={name} rc=0")
+        if name == "bench":
+            lines.append("BENCH_EXIT=1")
+        lines.append(f"PROVE_GROUP_RC name={name} rc={1 if name == 'bench' else 0}")
         lines.append("##[endgroup]")
-    lines.append("##[group]bench")
-    crate, kind = _SELF_TEST_TUPLES[tuple_idx]
-    feats = prove_surface.feature_text(prove_surface.expected(crate, kind, manifest))
-    lines.append(f"PROVE_TUPLE crate={crate} kind={kind} features={feats}")
-    lines.append("BENCH_EXIT=1")
-    lines.append("PROVE_GROUP_RC name=bench rc=1")
-    lines.append("##[endgroup]")
     lines.append("PROVE_EXIT=0")
     lines.append("=== GPU prove suites exit=0 (raw=0) ===")
     return lines
@@ -654,14 +610,7 @@ def _cut_synth_log() -> str:
 def _suite_fail_synth_log() -> str:
     lines = ["##[group]device", "name, compute_cap, driver_version", "NVIDIA A100 80GB PCIe, 8.0, 570.195.03", "CUDA_COMPUTE_CAP=80", "##[endgroup]"]
     lines += ["PROVE_SHA=" + "c" * 40]
-    for name, rc in (
-        ("capability-surface-build", 0),
-        ("capability-surface-proof", 0),
-        ("served-client-server-proof", 1),
-        ("engine-core-sweep", 0),
-        ("kernels-default", 0),
-        ("kernels-cuda", 0),
-    ):
+    for name, rc in ((g, int(g == "served-client-server-proof")) for g, _ in _SCRIPT_LAYOUT if g != "bench"):
         lines.append(f"##[group]{name}")
         lines.append(f"PROVE_GROUP_RC name={name} rc={rc}")
         lines.append("##[endgroup]")
@@ -752,10 +701,10 @@ def _self_test() -> int:
     check("healthy-outcome", healthy_artifact["outcome"] == "healthy", f"{healthy_artifact['outcome']}")
     check("healthy-has-wall-s", "wall_s" in healthy_artifact and isinstance(healthy_artifact["wall_s"], float), "")
     check("healthy-no-wall-lower-bound", "wall_lower_bound_s" not in healthy_artifact, "")
-    gating = {g["name"]: g["rc"] for g in healthy_artifact["groups"] if g["name"] in CURRENT_GROUP_NAMES - {"device", "bench"}}
+    gating = {g["name"]: g["rc"] for g in healthy_artifact["groups"] if g["name"] in GATING_GROUP_NAMES}
     check(
-        "healthy-all-six-gating-rcs-zero",
-        len(gating) == 6 and all(rc == 0 for rc in gating.values()),
+        "healthy-every-gating-rc-zero",
+        set(gating) == GATING_GROUP_NAMES and all(rc == 0 for rc in gating.values()),
         f"{gating}",
     )
     bench_group = next(g for g in healthy_artifact["groups"] if g["name"] == "bench")

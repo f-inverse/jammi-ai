@@ -1,31 +1,13 @@
 # Provenance — `2026-08-30-full-sweep-acce7b3d-a100-pcie/`
 
-The first full, end-to-end run of the committed `ci/scripts/perf/finetune_ab.sh`
-producer to completion — the real pod run that found three defects in that
-producer, executed AFTER those defects were fixed on this branch
-(`fix/352-finetune-ab-harness`), so this run is the closing evidence for the
-throughput+no-OOM clause the fix set out to discharge, not a defect
-reproduction.
+A full, end-to-end run of the committed `ci/scripts/perf/finetune_ab.sh`
+producer to completion — the evidence for its throughput + no-OOM property.
 
 ## Executed sha
 
-`acce7b3d060d5f7fc7ff5f1f8f0b903a2fcbff71` — "fix(perf): finetune_ab
-round-2 audit fold-in — ratio-level two-run completeness, honest scanner
-unresolved-reporting (#352)". The two commits that landed AFTER this run
-(`eaa7d53f`, the esc-067 ledger row + `closes_escape` citations; `cc826336`,
-the `evidence_ref` correction) carry ZERO functional delta against the
-three files this producer's own control flow and comparator logic live in
-— verifiable directly:
-
-```
-git diff acce7b3d..cc826336 -- ci/scripts/perf/finetune_ab.sh ci/scripts/perf/ab_merge.py ci/scripts/perf/identity_fields.py
-```
-
-The only hunk that diff produces is a `#`-prefixed comment block added to
-`finetune_ab.sh`'s own header (the `closes_escape:` line) — `ab_merge.py`
-and `identity_fields.py` are byte-identical between the two shas. This
-artifact is therefore valid evidence for the producer as it stands on
-`fix/352-finetune-ab-harness` today, not just as it stood at `acce7b3d`.
+`acce7b3d060d5f7fc7ff5f1f8f0b903a2fcbff71`. Every number below is evidence
+for the producer (`ci/scripts/perf/finetune_ab.sh`, `ci/scripts/perf/ab_merge.py`,
+`ci/scripts/perf/identity_fields.py`) as it stood at that sha.
 
 ## Environment
 
@@ -81,7 +63,7 @@ within-run pair spread exceeds the combined estimate's own distance to the
 both printed verbatim in the verdict string itself
 (`finetune_ab_report.json#/configs/b8-s128-d0/verdict` and
 `.../b8-s128-d0p05/verdict`). This matches the repo's own PRIOR `b8·s128`
-spread observation, independently recorded before this branch existed —
+spread observation, recorded independently of this run —
 `docs/maintainer/fine-tune-performance-guide.md`'s stacked-sweep table
 ("`b8·s128 | 0.1307 | 0.1319 (r1/r2 spread 8.3%)`") and its own caveat
 prose ("the `b8·s128` torch leg's own spread exceeds the margin at that
@@ -100,31 +82,17 @@ no config carries an `INVALID` verdict. `leg_premise_violations` and
 every config — the same-run premise checks found no drift. NOTE:
 `leg_premise_violations_cross_run` reads `null` (never `[]`) on every
 config despite every relevant leg (`jammi-fused`, `jammi-fused-2`,
-`torch-sdpa`, `torch-sdpa-2`) being `OK` throughout this run — this is a
-genuine ambiguity in `ab_merge.py`'s own F3 cross-run check (it only ever
-assigns a NON-`None` value on the branch that FINDS a violation, so
-"checked and clean" and "never checked" both currently read `null`); it
-does not affect any verdict above (the override this field feeds is
-`if cross_run_premise_violations_list:`, falsy either way), but this
-README does not claim the cross-run check positively confirmed agreement
-here — only that no violation is recorded. Flagged as a follow-up finding,
-not fixed in this commit (fixing it would break this README's own
-"zero functional delta since `acce7b3d`" claim above).
-
-**Update (post-artifact):** the None-vs-`[]` convention fix landed in a
-LATER commit than the one that produced this artifact (see `CrossRunPremiseTriStateTests`
-in `test_ab_merge.py`), so this run's own `null` above still reads as
-"unchecked" under the OLD convention this artifact predates — it is NOT
-retroactively a `[]` under the new one. What this artifact still proves,
-independent of that convention: every relevant leg (`jammi-fused`,
-`jammi-fused-2`, `torch-sdpa`, `torch-sdpa-2`) is `OK`, and the report
-carries no cross-run VIOLATION anywhere — checked-clean-in-substance is
-established by the report's own absence of a violation entry plus the
-fixed suite's `test_all_ok_two_run_config_reads_checked_clean_not_none`
-(an all-`OK` two-run fixture, the same shape this run's own six configs
-share, now reads `[]` under the current code), not by this artifact's own
-`null` field, which is honestly a relic of the convention it was measured
-under.
+`torch-sdpa`, `torch-sdpa-2`) being `OK` throughout this run. At the executed
+sha, `ab_merge.py`'s cross-run check assigns a NON-`None` value only on the
+branch that FINDS a violation, so in this artifact "checked and clean" and
+"never checked" both read `null`. It does not affect any verdict above (the
+override this field feeds is `if cross_run_premise_violations_list:`, falsy
+either way); this README claims only that no violation is recorded, not that
+the cross-run check positively confirmed agreement. The current `ab_merge.py`
+writes `[]` for a checked-clean all-`OK` two-run config
+(`CrossRunPremiseTriStateTests` in `test_ab_merge.py`,
+`test_all_ok_two_run_config_reads_checked_clean_not_none`); this artifact's
+`null` is not retroactively a `[]`.
 
 ## jammi-eager (context leg) OOM — four configs, not one
 
@@ -159,12 +127,12 @@ never feeds `bar_pair_ratio`/`fused_proof`/the leg-premise checks the six
 verdicts above are computed from, so all six PASS/INDETERMINATE
 classifications stand regardless of `jammi-eager`'s own outcome.
 
-## Clause mapping (`finetune_ab.sh`'s own header)
+## Scope (`finetune_ab.sh`'s own header)
 
-This run discharges #352's FIRST clause only — throughput + no-OOM (the
+This run covers the FIRST property only — throughput + no-OOM (the
 PASS/INDETERMINATE bar above, against a synthetic cost-fixture step). The
-SECOND clause, loss-TRAJECTORY equivalence (jammi-fused vs jammi-eager,
-a real trainer, >= 5 seeds), is discharged separately by the pre-registered
+SECOND property, loss-TRAJECTORY equivalence (jammi-fused vs jammi-eager,
+a real trainer, >= 5 seeds), is measured separately by the pre-registered
 real-trainer instrument at `docs/plans/63-how-well/measurements/
 campaign-v2` — never by this producer, which never runs a real trainer or
 a held-out eval; the `loss_first`/`loss_last`/`loss_final_ratio` columns

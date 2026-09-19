@@ -56,10 +56,8 @@
 # covered by nothing at all: `find_unprotected_lanes` removes each lane in
 # turn from the discovered corpus and re-runs both OTHER closures (`find_
 # gaps` over `cargo metadata`'s own `required-features` targets, and this
-# registry's own `find_missing_required_lanes`) — the identical per-lane
-# sweep this file's own history once did by hand, now automatic and rerun
-# every invocation rather than a one-time snapshot that rots the moment a
-# lane is added, moved, or deleted (#532).
+# registry's own `find_missing_required_lanes`), rerun every invocation so
+# the answer tracks lanes as they are added, moved, or deleted.
 #
 # Five lanes are the only cover for some `required-features` target, so the
 # `cargo metadata` closure REDs on their loss by itself and needs no row.
@@ -105,7 +103,7 @@ jammi-encoders  cuda,flash-attn   tests
 # and their own `cfg(test)` halves) that no other merge-path lane activates
 # at all -- the workspace-wide default lane (`ci.yml`'s `--workspace
 # --all-targets`) never turns either feature on. Lives in `ci.yml`'s own
-# `Clippy jammi-db postgres,mysql` step (#532).
+# `Clippy jammi-db postgres,mysql` step.
 jammi-db        postgres,mysql    all-targets
 
 # `jammi-server`'s `test-hooks` arm: `#[cfg(feature = "test-hooks")]` test
@@ -113,5 +111,5 @@ jammi-db        postgres,mysql    all-targets
 # lane never turns it on, and jammi-server's own `--features live-gpu-
 # tests,live-distributed-tests` lane is a DIFFERENT feature combination that
 # does not imply it). Lives in `ci.yml`'s `Clippy jammi-server test-hooks`
-# step (#532).
+# step.
 jammi-server    test-hooks        tests

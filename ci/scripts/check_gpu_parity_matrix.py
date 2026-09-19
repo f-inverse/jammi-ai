@@ -7,21 +7,19 @@ it-matrix (`crates/jammi-db/tests/it`, tripwired syntactically by
 parity is *tested*, this gate proves the parity *test suite itself has no
 uncovered cell to hide a divergence in*.
 
-## The escape this closes (esc-028)
+## Why
 
-ModernBERT×Classification silently produced empty scores on a real A100:
-candle's CUDA matmul rejected the classifier's CLS row — a `narrow(seq=0)
-.squeeze(1)` 2-D operand whose row stride is `seq·hidden` (not `hidden`) — a
-layout its CPU matmul tolerated. `infer`'s per-row annotate semantics
-swallowed the resulting `Err` into an empty score set instead of surfacing
-it. This was latent because the gated `gpu_capability` suite (`crates/
-jammi-ai/tests/gpu_capability/`) covered a handful of (architecture, verb)
-cells with **no completeness check** — an uncovered cell cannot fail, so the
-absence of a ModernBert×Classification parity test was invisible.
+An uncovered cell cannot fail. A CUDA-only divergence in an (architecture,
+verb) pair the gated `gpu_capability` suite (`crates/jammi-ai/tests/
+gpu_capability/`) does not exercise is invisible: e.g. candle's CUDA matmul
+rejects a `narrow(seq=0).squeeze(1)` 2-D operand whose row stride is
+`seq·hidden` (not `hidden`) — a layout its CPU matmul tolerates — and
+`infer`'s per-row annotate semantics turn that `Err` into an empty score
+set rather than surfacing it.
 
-The fix is not "add that one test" (a grep for one known-bad string is
-exactly the anti-pattern `check_doc_parity.py`'s docstring warns against);
-it is a *property*: every SHIPPED (encoder architecture × GPU-dispatching
+The guard is not "add one test" (a grep for one known-bad string is exactly
+the anti-pattern `check_doc_parity.py`'s docstring warns against); it is a
+*property*: every SHIPPED (encoder architecture × GPU-dispatching
 inference verb) pair is accounted for by name, in one of three REVIEWED,
 in-repo sets — so a new architecture, a new verb, or a newly-discovered
 serveable combination cannot silently ship with no GPU-parity accounting.
@@ -47,17 +45,11 @@ serveable combination cannot silently ship with no GPU-parity accounting.
      at PR time — this is NOT a place to silently wave off a real gap.
   3. **PENDING** — cells that ARE serveable (the code path exists and would
      run today) but have no GPU-parity test yet: tracked debt, each with a
-     reason. This is what makes the gate landable now, with teeth: today
-     only two cells are COVERED, but every one of the other 34 SHIPPED
-     cells is accounted for by name in EXCLUDED or PENDING — none can
-     silently fall through the cracks. Closing a PENDING cell means adding
-     a `gpu-parity-cell` marker to a real parity test AND deleting the
-     PENDING entry in the same PR — the two edits are the closure.
-
-     TODO(follow-up issue): file a "fill the GPU parity matrix" tracking
-     issue and knock out PENDING cells incrementally; each closure is a
-     `gpu-parity-cell` marker + a live-gpu-tests test, landed with the
-     PENDING entry removed in the same diff.
+     reason. Every SHIPPED cell not COVERED is accounted for by name in
+     EXCLUDED or PENDING — none can silently fall through the cracks.
+     Closing a PENDING cell means adding a `gpu-parity-cell` marker to a
+     real live-gpu-tests parity test AND deleting the PENDING entry in the
+     same diff — the two edits are the closure.
 
 ## SHIPPED architectures and verbs
 
@@ -82,7 +74,7 @@ Verbs are parsed from `ModelTask::ALL`'s enum body
 (`TextEmbedding`, `ImageEmbedding`, `AudioEmbedding`, `Classification`,
 `Ner`, `Regression`) dispatch through `CandleModel::forward`'s per-task
 match to a real candle GPU forward — none is a CPU-only fold. The CPU-only
-folds the retrospective calls out (graph propagation/SGC/APPNP, conformal
+folds (graph propagation/SGC/APPNP, conformal
 calibration, RRF fusion) are not `ModelTask` members at all: they live
 entirely in `jammi-ai::pipeline` / `jammi-ai::predict` / `jammi-ai::query`
 and never reach `CandleModel::forward`, so they are outside `ModelTask::ALL`
@@ -111,20 +103,15 @@ under `--self-test`); no network, no build, no GPU.
 
 ## A second, orthogonal completeness axis: SILICON
 
-esc-028's parent principle — an uncovered cell cannot fail — is not specific
-to the (architecture × verb) axis above; it applies to any matrix this repo
-ships without a completeness check. The #351 GPU-validation review found a
-second, independent instance of exactly that shape on the SILICON axis: the
-`jammi-kernels` build compiles four real SASS binaries (`sm_80`/`sm_86`/
-`sm_89`/`sm_90`, [`GENCODE_ARCHES`] in `crates/jammi-kernels/build.rs`) and
-`jammi-ai` ships a `metal` feature, but execution proof (a real GPU run, not
-"it compiled") existed for exactly ONE of those five shipped cells — and
-because nothing enumerated "shipped silicon" against "silicon with a named
-execution lane", that four-out-of-five gap was invisible to every gate in
-this repo, the same way the empty ModernBERT×Classification scores were
-invisible before this file existed.
+The same principle — an uncovered cell cannot fail — applies on the SILICON
+axis: the `jammi-kernels` build compiles four real SASS binaries (`sm_80`/
+`sm_86`/`sm_89`/`sm_90`, [`GENCODE_ARCHES`] in `crates/jammi-kernels/build.rs`)
+and `jammi-ai` ships a `metal` feature, and "it compiled" is not execution
+proof. Without an enumeration of "shipped silicon" against "silicon with a
+named execution lane", a target with no real GPU run is invisible to every
+gate.
 
-The fix is the same shape as above, deliberately: two REVIEWED, in-repo sets
+The guard is the same shape as above, deliberately: two REVIEWED, in-repo sets
 (SHIPPED, parsed from source; SILICON_ACCOUNTING, reviewed by name) that must
 reconcile to sameness — never a grep for "sm_80 is proven", which only ever
 catches the one string a human already thought to check.
@@ -149,8 +136,7 @@ catches the one string a human already thought to check.
 
 Self-test: `python3 ci/scripts/check_gpu_parity_matrix.py --self-test` also
 proves the silicon axis REDs on a synthetic shipped-but-unaccounted target
-and a synthetic stale accounting row (plus a duplicated row) — the axis-1
-self-test above is untouched by this addition.
+and a synthetic stale accounting row (plus a duplicated row).
 """
 
 from __future__ import annotations
@@ -230,8 +216,7 @@ VARIANT_ARCHITECTURE_ALIASES = {"Htsat": "HtsatAudio"}
 
 # --------------------------------------------------------------------------- #
 # SILICON axis — see the module docstring's "A second, orthogonal
-# completeness axis: SILICON" section for the full rationale (esc-028 +
-# the #351 GPU-validation review). Each shipped silicon target reconciles to
+# completeness axis: SILICON" section for the full rationale. Each shipped silicon target reconciles to
 # EXACTLY ONE of ProvenBy / Deferred below, reviewed at PR time exactly like
 # STRUCTURALLY_EXCLUDED / PENDING above.
 # --------------------------------------------------------------------------- #
@@ -268,9 +253,8 @@ SiliconAccountingEntry = ProvenBy | Deferred
 # tag — never auto-started) — drives `ci/scripts/runpod_gpu_prove.sh` with
 # `GPU_PROVE_ARCH=<arch>`, which rents the matching device via
 # `rp_deploy_arch` (runpod_lib.sh) and runs the same gated GPU suites
-# (`grpc_embedding_gpu`, `gpu_capability`) real hardware ran for sm_80 alone
-# before the #351 GPU-validation review widened this to all four shipped
-# SASS targets. Every CUDA artifact promotion (server image, release
+# (`grpc_embedding_gpu`, `gpu_capability`) on each of the four shipped SASS
+# targets. Every CUDA artifact promotion (server image, release
 # binaries, cu12 wheel) gates on that SAME recorded verdict, proven once per
 # commit and shared (`ci/scripts/gpu_prove_verdict.py`, consumed via
 # `_gpu-proof-required.yml`), never a second rental of its own.
@@ -310,9 +294,9 @@ SILICON_ACCOUNTING: list[tuple[str, SiliconAccountingEntry]] = [
             reason=(
                 "GH-hosted macos-14 VMs cannot construct a candle 0.11 Metal "
                 "device (MTLResidencySetDescriptor absent; Device::new_metal "
-                "panics — proven in PR #435 CI); ci.yml test-metal proves the "
+                "panics); ci.yml test-metal proves the "
                 "compile/lint surface only; execution proof exists on local "
-                "Apple-silicon runs (PR #435: metal_parity 8/8 byte-exact, "
+                "Apple-silicon runs (metal_parity 8/8 byte-exact, "
                 "metal_quantized_gpu 4/4 measured); a recurring execution lane "
                 "requires a self-hosted Apple-silicon runner"
             ),
@@ -383,7 +367,7 @@ PENDING: dict[Cell, str] = {
     # generic `forward_embedding` path and are equally serveable.
     Cell("DistilBert", "TextEmbedding"): _PENDING_REASON,
     # Classification: only ModernBert×Classification is proven today
-    # (classification_parity.rs, the esc-028 regression guard); Bert and
+    # (classification_parity.rs, which pins the strided CLS-row matmul case); Bert and
     # DistilBert have their own `*ClassificationForward` wrapper and are
     # equally serveable, and equally capable of hitting the same class of
     # CUDA strided-operand rejection.

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""F5/M4 — the NCCL id-secrecy scan for the RunPod CLUSTER leg
+"""The NCCL id-secrecy scan for the RunPod CLUSTER leg
 (`ci/scripts/runpod_gpu_cluster.sh`).
 
 The 128-byte NCCL id `Nccl::new_id()` mints on rank 0 is a CAPABILITY (the
 right to join this one gang), never evidence — it must never reach a
 committed artifact, a CI log, or any file a human later reviews. The id
-crosses hosts HEX-encoded (`runpod_gpu_gang.sh`'s own PR-B1 contract, applied
-here to the cluster driver's out-of-band `scp` ship), so a leak could show up
+crosses hosts HEX-encoded (as in `runpod_gpu_gang.sh`, applied here to the
+cluster driver's out-of-band `scp` ship), so a leak could show up
 raw, hex (either case), or base64 — every encoding the ship step could ever
 emit.
 
@@ -16,16 +16,16 @@ exactly that), the CARRIER SET the cluster driver's own run produces:
 
   1. the pulled artifact directory, recursively (every file the two ranks'
      `rank-<r>.json` reports, and anything else, landed in);
-  2. the driver's own run log (the ONE `tee`'d stream F6 requires) --
+  2. the driver's own run log (the ONE `tee`'d stream the driver writes) --
      ALWAYS a required carrier: this file is created before anything else
      the driver does, so it exists on every exit arm without exception;
   3. the assembled `gang` artifact JSON, `--assembled-artifact`, but ONLY
-     when the caller passes it (P-A2: absent vs. unexaminable, below);
+     when the caller passes it (absent vs. unexaminable, below);
   4. the staging copy's own directory LISTING (never its content a second
      time — its content is the NEEDLE SOURCE, read once, below) — a leak
      spelled into a FILENAME next to it would otherwise go unseen.
 
-P-A2 (absent vs. unexaminable): `--assembled-artifact` is OPTIONAL. Pass it
+Absent vs. unexaminable: `--assembled-artifact` is OPTIONAL. Pass it
 only when the caller's own run actually CLAIMS to have written that file
 (the assembly step was reached and reported success) -- a missing file at
 that path is then UNEXAMINABLE (2), never clean, because something the run
@@ -40,7 +40,7 @@ usage, so omitting the flag never widens what gets scanned: a stray or
 leaked file at that path is still caught by the directory walk (item 1)
 regardless of whether the flag was passed.
 
-Exit lattice (F5): 0 clean; 1 a carrier carries the id in some encoding
+Exit lattice: 0 clean; 1 a carrier carries the id in some encoding
 (named by carrier and encoding, the bytes themselves are NEVER printed); 2 a
 carrier could not be examined at all (missing, unreadable, a dangling
 symlink, a cyclic directory symlink, a non-regular file (FIFO/socket/device
@@ -59,8 +59,7 @@ for exactly that reason: it detects no cycles at all and would hang on one.
 The whole scan additionally runs under a wall-clock budget
 (`GANG_ID_SCAN_BUDGET_SECS`, default 120s, `--budget-secs` overrides) — an
 expiry is itself UNEXAMINABLE (2), independent of any single carrier's own
-shape, the last line of defense against a carrier class this module's own
-author did not anticipate.
+shape, the last line of defense against an unanticipated carrier class.
 
 Only `S_ISREG` files are ever opened. Any other file type this scan's own
 walk reaches (a FIFO, a UNIX socket, a block/char device) is refused by
@@ -68,7 +67,7 @@ name (2) without a `read_bytes()` ever being attempted against it.
 
 Archive members (`.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, `.tbz2`, `.tar.xz`,
 `.txz`, `.zip`, `.gz` — matched by suffix, not by sniffing magic bytes,
-which would itself be a second unaudited parser) anywhere under the pulled
+which would itself be a second, unreviewed parser) anywhere under the pulled
 artifact directory are refused outright (2) rather than opened: this driver
 never legitimately ships an archive there, so one appearing is itself
 suspicious, and this scanner is not an archive-format parser.
@@ -79,8 +78,7 @@ padded leak is also a substring hit on this needle, by construction — no
 false negative, just a redundant label), URL-safe padded, URL-safe
 un-padded.
 
-Both the base64 needles AND the two hex needles (round 3 A2 — the hex pair
-was excluded from this fallback before this round) are ALSO checked against
+Both the base64 needles AND the two hex needles are ALSO checked against
 a whitespace-stripped copy of the scanned bytes, lazily, only when the raw
 contiguous check misses: a line-wrapped encoding (`base64`'s coreutils
 default wraps at 76 columns, `openssl base64` at 64; a hex dump emitter can
@@ -94,7 +92,7 @@ inspect a dirty run's staging file by hand.
 
 Run: `python3 ci/scripts/gang_id_secrecy_scan.py --staging-file <path> \
   --artifact-dir <dir> --log <path> [--assembled-artifact <path>] \
-  [--delete-staging]` -- `--assembled-artifact` is optional (P-A2, above).
+  [--delete-staging]` -- `--assembled-artifact` is optional (see above).
 Self-test: `python3 ci/scripts/gang_id_secrecy_scan.py --self-test`
 """
 
@@ -117,7 +115,7 @@ ID_BYTES_LEN = 128
 DEFAULT_BUDGET_SECS = int(os.environ.get("GANG_ID_SCAN_BUDGET_SECS", "120"))
 
 # Suffix match only (never a magic-byte sniff, which would be a second,
-# unaudited parser) — matched against the LOWERCASED basename so a
+# unreviewed parser) — matched against the LOWERCASED basename so a
 # `.TAR.GZ` upload cannot slip past this refusal on case alone.
 ARCHIVE_SUFFIXES = (
     ".tar",
@@ -180,11 +178,8 @@ def _scan_bytes(data: bytes, needles: list[tuple[str, bytes]]) -> str | None:
     """A needle occurring contiguously in `data` is a hit. A base64- OR
     hex-labeled needle is ALSO checked against a whitespace-stripped copy of
     `data`, lazily computed only when the raw check misses -- a
-    line-wrapped base64 encoding (F5 advisory) OR a line-wrapped hex dump
-    (round 3 A2: a hex-encoded id split across lines by some emitter, e.g.
-    an `xxd`-shaped log, was previously never checked against the
-    whitespace-stripped copy at all -- only "base64"-prefixed names were)
-    would otherwise never match a single contiguous needle even though the
+    line-wrapped base64 encoding OR a line-wrapped hex dump (e.g. an
+    `xxd`-shaped log) would otherwise never match a single contiguous needle even though the
     id is plainly present. The "raw" needle is deliberately EXCLUDED: it is
     the id's own 128 raw bytes, which no legitimate text-shaped carrier
     line-wraps, and stripping whitespace from arbitrary binary data before
@@ -309,7 +304,7 @@ def scan_dir(root: Path, needles: list[tuple[str, bytes]]) -> list[tuple[int, st
 
 
 class ScanTimeout(Exception):
-    """Raised when the wall-clock budget (F5) expires mid-scan."""
+    """Raised when the wall-clock budget expires mid-scan."""
 
 
 @contextlib.contextmanager
@@ -418,7 +413,7 @@ def _run_scan_body(
 
     # `log` is ALWAYS a required carrier (it exists before anything else this
     # driver does). `assembled_artifact` is required ONLY when the caller
-    # passed one at all (P-A2): `None` means the caller's own run never
+    # passed one at all (absent vs. unexaminable): `None` means the caller's own run never
     # claimed to have produced one, so its absence is not itself a finding
     # -- it is simply not in the required set for this invocation. When it
     # IS passed, the happy-path strictness is unchanged: missing is
@@ -474,7 +469,7 @@ def main(argv: list[str] | None = None) -> int:
         "--assembled-artifact",
         type=Path,
         default=None,
-        help="P-A2: OPTIONAL -- pass this only when the caller's own run claims to have "
+        help="OPTIONAL -- pass this only when the caller's own run claims to have "
         "written this file; omit it entirely on a refusal arm that never reached assembly "
         "(its absence is then not scored, rather than read as UNEXAMINABLE)",
     )
@@ -483,7 +478,7 @@ def main(argv: list[str] | None = None) -> int:
         "--budget-secs",
         type=int,
         default=DEFAULT_BUDGET_SECS,
-        help="wall-clock budget for the whole scan (F5); <=0 disables it (default: GANG_ID_SCAN_BUDGET_SECS or 120)",
+        help="wall-clock budget for the whole scan; <=0 disables it (default: GANG_ID_SCAN_BUDGET_SECS or 120)",
     )
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args(argv)
@@ -491,7 +486,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         return _run_self_test()
 
-    # P-A2: `--assembled-artifact` is intentionally NOT in this required set
+    # `--assembled-artifact` is intentionally NOT in this required set
     # -- it is the one carrier a caller may legitimately omit (see its own
     # --help text and the module doc).
     missing = [
@@ -634,11 +629,11 @@ class GangIdSecrecyScanTest(unittest.TestCase):
         self.assertIn("missing", out)
 
     def test_missing_assembled_artifact_is_unexaminable_never_clean(self) -> None:
-        # P-A2, the "claimed" case: `self._run()` always passes
+        # Absent vs. unexaminable, the "claimed" case: `self._run()` always passes
         # `--assembled-artifact` (see `_run` above), i.e. the caller IS
         # claiming this run produced one -- a missing file at that path
         # stays UNEXAMINABLE even though the id-carrying content itself is
-        # clean everywhere else. This is the happy-path strictness P-A2
+        # clean everywhere else. This is the happy-path strictness the rule
         # keeps; see the two tests below for the OMITTED-flag case.
         self.assembled.unlink()
         rc, out = self._run()
@@ -646,7 +641,7 @@ class GangIdSecrecyScanTest(unittest.TestCase):
         self.assertIn("missing", out)
 
     def test_assembled_artifact_omitted_entirely_is_not_required_and_stays_clean(self) -> None:
-        # P-A2, the "never claimed" case: a refusal arm that never reached
+        # Absent vs. unexaminable, the "never claimed" case: a refusal arm that never reached
         # assembly (or whose assembly step itself refused and never wrote
         # anything) passes NO --assembled-artifact at all. Its absence must
         # not be scored -- an otherwise-clean run stays CLEAN, never
@@ -776,11 +771,9 @@ class GangIdSecrecyScanTest(unittest.TestCase):
         self.assertIn("base64", out)
 
     def test_line_wrapped_hex_lower_is_still_a_hit(self) -> None:
-        # Round 3 A2: before this fix, ONLY "base64"-prefixed needles were
-        # checked against the whitespace-stripped copy -- a hex dump
-        # wrapped across lines (e.g. an `xxd`-shaped emitter) was never
-        # caught even though `_strip_whitespace` already existed and the
-        # base64 arms above already relied on it for their own encoding.
+        # A hex dump wrapped across lines (e.g. an `xxd`-shaped emitter) is
+        # matched through the same whitespace-stripped copy the base64 arms
+        # use.
         hexed = self.id_bytes.hex()
         wrapped = "\n".join(hexed[i : i + 32] for i in range(0, len(hexed), 32))
         self.log.write_text("leaked (32-col wrapped hex):\n" + wrapped + "\n")

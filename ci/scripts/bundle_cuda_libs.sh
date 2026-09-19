@@ -9,13 +9,10 @@
 # The tarball ships a launcher that puts `lib/` on `LD_LIBRARY_PATH` and execs
 # the binary, so the tarball is only self-sufficient if `lib/` holds every
 # SONAME the loader will look for on a host that has an NVIDIA driver and
-# nothing else. `release-binaries.yml`'s CUDA leg used to state that set as a
-# HAND LIST of seven literal names (`libcudart libcublas libcublasLt libcurand
-# libnvrtc libnvrtc-builtins libnccl`) after a first derivation attempt (#535)
-# and its loader-verification arm (#534) were both excised for measured
-# defects — recorded here, fixed here, never re-derived from intent (see
+# nothing else. That set is DERIVED, not a hand list of literal names (see
 # `ci/scripts/test_bundle_cuda_libs.sh`'s module doc for the fixture that
-# reproduces each one). A literal list is a copy of a fact that lives in the
+# reproduces each defect the design below avoids). A literal list is a copy
+# of a fact that lives in the
 # binary, and it drifts the moment a feature adds a link: `jammi-ai`'s `cuda`
 # feature includes `candle-core/nccl`, cudarc's build script emits
 # `cargo:rustc-link-lib=dylib=nccl` for it, and the resulting binary carries a
@@ -35,8 +32,8 @@
 #      binary itself does not name can still be needed by a library the
 #      closure DOES resolve, and the loader needs it too. A soname that
 #      resolves nowhere fails this script, naming it.
-#   2. THE FLOOR (`bundle_stage_floor`): seven stems this tarball has carried
-#      since before this derivation existed — `libcudart libcublas
+#   2. THE FLOOR (`bundle_stage_floor`): seven stems this tarball always
+#      carries — `libcudart libcublas
 #      libcublasLt libcurand libnvrtc libnvrtc-builtins libnccl` — resolved
 #      and staged the same way (first match in the search path wins),
 #      INDEPENDENTLY of whatever the `DT_NEEDED` closure above happens to
@@ -61,7 +58,7 @@
 #      that the REAL loader, at run time, resolves each bundled entry FROM
 #      the stage directory rather than from a copy the runtime host happens
 #      to carry too. See that function's own doc for the four measured
-#      defects (#534) its predecessor had and how this shape avoids each one.
+#      defects a plain `ldd` check has and how this shape avoids each one.
 #
 # Before any of the above: `bundle_assert_no_runpath` checks the binary
 # carries no `DT_RPATH`/`DT_RUNPATH` dynamic-section entry — either would let
@@ -370,8 +367,7 @@ bundle_resolve_soname() {
 # the shared one place both the floor's SEARCH (`bundle_resolve_stem_dir`)
 # and its COPY step draw from, so there is exactly one definition of "this
 # stem's objects in this directory" for the floor to ever disagree with
-# itself about (advisory carried from #535: the floor's resolvers used to
-# lack this fallback entirely).
+# itself about.
 bundle_stem_objects() {
   local dir="$1"
   local stem="$2"
@@ -531,8 +527,8 @@ EOF
 # SAME object reached through two different search-path entries (a symlink
 # bridging directories, or a duplicate listing of one real file) is not a
 # conflict and is simply skipped rather than copied twice; only two
-# DIFFERENT objects racing for the same destination filename refuses. #535's
-# advisory named this hole; every floor candidate is checked against the
+# DIFFERENT objects racing for the same destination filename refuses. Every
+# floor candidate is checked against the
 # derivation's own resolved sources BEFORE any file moves, so a collision
 # refuses instead of racing whichever copy ran last.
 bundle_stage_floor() {
@@ -637,7 +633,7 @@ bundle_assert_staged() {
 }
 
 # ---------------------------------------------------------------------------
-# Loader verification (#534): everything above proves a same-named FILE
+# Loader verification: everything above proves a same-named FILE
 # exists under `$lib_dir`. None of it proves that the REAL dynamic loader, at
 # run time, resolves a bundled entry FROM `$lib_dir` rather than from a copy
 # the build/CI host happens to carry too — a distinction that matters because
@@ -646,11 +642,9 @@ bundle_assert_staged() {
 # carries a system copy of, say, `libnccl` proves nothing about a driver-only
 # host that carries no such copy.
 #
-# A prior revision of this arm (`bundle_verify_stage` /
-# `bundle_unresolved_from_loader_output`, via
-# `LD_LIBRARY_PATH=<lib> ldd <binary>`) was excised (#534) after four measured
-# defects made it UNSOUND rather than merely incomplete — reproduced as
-# fixtures in `ci/scripts/test_bundle_cuda_libs.sh`:
+# A bare `LD_LIBRARY_PATH=<lib> ldd <binary>` check is UNSOUND rather than
+# merely incomplete, for four measured reasons — reproduced as fixtures in
+# `ci/scripts/test_bundle_cuda_libs.sh`:
 #
 #   (1) LD_LIBRARY_PATH PREPENDS, it does not restrict — a soname the tarball
 #       never staged can still resolve `Ok` if the host happens to carry a
@@ -671,7 +665,7 @@ bundle_assert_staged() {
 #              nothing here ever falls back to it silently if the jail arm
 #              fails; both are required and neither result substitutes for
 #              the other's.
-#         (1b) THE JAIL, THE RELEASE LANE, arm (1a)'s tightening (#534's
+#         (1b) THE JAIL, THE RELEASE LANE, arm (1a)'s tightening (the
 #              chroot half): rather than merely detecting a host copy that
 #              WOULD satisfy a bundled member, this arm HIDES every host
 #              copy so none CAN — a `chroot` jail (`bundle_build_jail`)
@@ -783,9 +777,9 @@ bundle_assert_staged() {
 #       `DT_NEEDED` names (platform members included): an empty, "not a
 #       dynamic executable", or `linux-vdso.so.1`-only report contains none
 #       of them and fails on that rule alone, no special-casing needed.
-#   (3) THE LOADER'S OWN NO-`=>` LINE (naming itself) used to be skipped as
-#       "nothing to check", which flipped a CORRECT stage into a false
-#       failure once rule (2) demanded every platform member be present too.
+#   (3) THE LOADER'S OWN NO-`=>` LINE (naming itself) is NOT skipped as
+#       "nothing to check": skipping it flips a CORRECT stage into a false
+#       failure once rule (2) demands every platform member be present too.
 #       `bundle_parse_loader_report` treats any report line with no `=>` as a
 #       RESOLVED entry for the basename of its path.
 #   (4) `lib_dir='/'` — the path-prefix comparison degenerates to "everything
@@ -904,7 +898,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# The jail arm (#534's chroot half, arm 1b — see the section doc above).
+# The jail arm (the chroot half, arm 1b — see the section doc above).
 # `BUNDLE_JAIL_LIB_DIR`/`BUNDLE_JAIL_PLATFORM_DIR` are fixed, never
 # parameters, and are TWO SEPARATE directories on purpose: `bundle_build_
 # jail` hardlinks the tarball's own `lib_dir` into `BUNDLE_JAIL_LIB_DIR`
@@ -1484,11 +1478,10 @@ $sources
 EOF
 
   # Every phase below returns its own status, and `bundle_main` returns
-  # non-zero the moment any of them does (#535's core defect: the retired
-  # revision discarded these three return values and printed the success
-  # sentence unconditionally, so a tree missing `libnccl` and
-  # `libnvrtc-builtins` still reported success under the suite's own
-  # `set +e`). Program mode (this file executed, not sourced) does not rely
+  # non-zero the moment any of them does (discarding these three return
+  # values and printing the success sentence unconditionally would report
+  # success for a tree missing `libnccl` and `libnvrtc-builtins` under the
+  # suite's own `set +e`). Program mode (this file executed, not sourced) does not rely
   # on `errexit` for this either — `errexit` does not survive `source`, which
   # is exactly how the hermetic suite drives this file, so every phase here
   # is checked explicitly regardless of which context calls it.

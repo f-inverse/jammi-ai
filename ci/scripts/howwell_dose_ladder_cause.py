@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""GREEN-but-nonzero cause namer for `runpod_gpu_howwell.sh` (unit-63 round-10
-audit advisory (d) / round-13 audit F1) -- extracted out of that script's own
-inline python heredoc into a real, testable module, mirroring this repo's own
-`check_X.py` + `test_X.py` gate-suite convention (see `test_check_kernel_
-oracles.py`'s own doc for the shape).
+"""GREEN-but-nonzero cause namer for `runpod_gpu_howwell.sh`, a real,
+testable module following this repo's `check_X.py` + `test_X.py` gate-suite
+convention (see `test_check_kernel_oracles.py`'s own doc for the shape).
 
 ## Why this exists
 
 A GREEN primary A/B decision does NOT itself force `ab_merge.py`'s own exit
 code to 0 -- the mutant dose ladder (an INVALID dose column, a negative-eps
-`dose_anomaly`, a `sensitivity_error`, or -- unit-63 round-13 audit F1 -- an
+`dose_anomaly`, a `sensitivity_error`, or an
 undischarged RED-proof column, `red_proof_verdict` starting with
 `"NOT_PROVEN"`, `ab_merge.py`'s own exit fold at its `main()`'s dose-ladder
 branch) can still fail the merge while the primary decision itself reads
@@ -25,13 +23,12 @@ column, `red_proof_verdict` NOT_PROVEN) -- never a subset -- and the fallback
 fallback text can see exactly what was ruled out rather than a bare "unknown"
 that looks like this namer forgot a cause.
 
-## Binding to `ab_merge.py`'s own exit fold (unit-63 round-14 audit F6)
+## Binding to `ab_merge.py`'s own exit fold
 
-`ab_merge.py`'s `main()` no longer hand-maintains four independent `if`
-blocks for its `finetune-run` dose-ladder exit code -- it folds a DATA list
-of `(cause_name, triggered, message)` tuples, checked at runtime (an
-explicit `if`/`raise AssertionError` -- unit-63 round-15 audit advisory 4:
-never a bare `assert`, which `python -O` strips entirely) to name exactly
+`ab_merge.py`'s `main()` folds a DATA list of `(cause_name, triggered,
+message)` tuples for its `finetune-run` dose-ladder exit code, checked at
+runtime (an explicit `if`/`raise AssertionError`, never a bare `assert`,
+which `python -O` strips) to name exactly
 `ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES`. `_ALL_CAUSE_NAMES` below is that
 SAME constant, imported directly (never a hand-duplicated literal) --
 `DoseLadderCauseNamesBoundToAbMergeExitFoldTests`
@@ -47,12 +44,9 @@ added to `ab_merge.py`'s own exit fold without a matching entry in
 check (`main()`'s dose-ladder branch) the first time that code path runs
 (under `-O` or not), AND (since this module imports that same constant)
 this namer's own fallback text grows to match automatically -- there is no
-third, independently-drifting copy of the cause-name set left anywhere in
-this pairing. What it does NOT guarantee: a literal fifth `if`/branch
-written OUTSIDE that data-driven fold (bypassing `dose_ladder_causes`
-entirely) would still need its own review to be caught -- this binding
-covers the one fold both sides already commit to, never arbitrary future
-code shape.
+third, independently-drifting copy of the cause-name set. What it does NOT
+guarantee: a literal fifth `if`/branch written OUTSIDE that data-driven fold
+(bypassing `dose_ladder_causes` entirely) still needs its own review.
 """
 
 from __future__ import annotations
@@ -61,53 +55,34 @@ import json
 import os
 import sys
 
-# Unit-63 round-15 audit advisory 3: this insert+import is itself a crash
-# surface upstream of `_inspect_doses`'s own A4 hardening -- an import-time
-# failure here (a syntax error introduced into `perf/ab_merge.py`, a missing
-# `perf/` directory, or -- the shadowing risk -- some OTHER `ab_merge` module
-# earlier on `sys.path` that this `insert(0, ...)` does NOT protect against
-# if this file is ever copied/executed from a location where `os.path.
-# dirname(__file__)` no longer resolves to `ci/scripts`) must degrade to a
-# NAMED cause here, never an uncaught `ImportError`/`SyntaxError` that
-# propagates out of module load. Left uncaught, `runpod_gpu_howwell.sh`'s own
-# `2>/dev/null || echo "unknown (could not inspect ...)"` wrapper (this
-# module's own doc above) swallows the SPECIFIC failure into the same opaque
-# "unknown" text a truly-no-cause-found run also produces -- the exact
-# unexplained-contradiction shape `_inspect_doses` exists to prevent one
-# layer down, now recurring one layer up. Note on the shadowing risk named
-# above: `sys.path.insert(0, ...)` puts THIS `perf/` directory first, so it
-# always wins over anything a caller's `PYTHONPATH` places earlier in
-# `sys.path` -- the risk is the opposite direction, an `ab_merge` module a
-# caller intended to be picked up from elsewhere on `sys.path` being silently
-# shadowed by this repo's own `perf/ab_merge.py`, never the reverse.
+# This insert+import is itself a crash surface upstream of `_inspect_doses`
+# -- an import-time failure here (a syntax error in `perf/ab_merge.py`, a
+# missing `perf/` directory) must degrade to a NAMED cause, never an uncaught
+# `ImportError`/`SyntaxError` out of module load: `runpod_gpu_howwell.sh`'s
+# `2>/dev/null || echo "unknown (could not inspect ...)"` wrapper would
+# otherwise swallow the SPECIFIC failure into the same opaque "unknown" text
+# a truly-no-cause-found run produces. `sys.path.insert(0, ...)` puts THIS
+# `perf/` directory first, so it always wins over anything a caller's
+# `PYTHONPATH` places earlier -- the shadowing risk is the opposite
+# direction: an `ab_merge` a caller meant to load from elsewhere is silently
+# shadowed by this repo's own `perf/ab_merge.py`.
 #
-# Unit-63 round-17 audit shapes (d)/(e): a module named `ab_merge` that
-# IMPORTS cleanly but is stale/shadowed -- lacking one of the three names
-# this file reads off it (`DOSE_LADDER_EXIT_CAUSE_NAMES`,
-# `MUTANT_DOSE_DETECTED_INVALID`, `RED_PROOF_VERDICT_NOT_PROVEN_PREFIX`) --
-# is the SAME failure class as an outright import failure from this file's
-# own point of view: both mean "the `ab_merge` this process actually loaded
-# does not have the contract this namer depends on". The three attribute
-# reads therefore live INSIDE this same `try`, not as separate module-level
-# statements after it -- an `AttributeError` raised while reading any one of
-# them is caught by the same `except Exception` below and folds into
-# `_AB_MERGE_IMPORT_ERROR`, exactly like a failed `import ab_merge` itself.
-# Pre-fix, each read was a separate top-level statement guarded only by
-# `if ab_merge is not None`, so an `AttributeError` raised while reading one
-# of them propagated straight out of module load, uncaught, regardless of
-# whether `import ab_merge` itself had succeeded.
+# A module named `ab_merge` that IMPORTS cleanly but lacks one of the three
+# names this file reads off it (`DOSE_LADDER_EXIT_CAUSE_NAMES`,
+# `MUTANT_DOSE_DETECTED_INVALID`, `RED_PROOF_VERDICT_NOT_PROVEN_PREFIX`) is
+# the SAME failure class as an outright import failure: the `ab_merge` this
+# process loaded does not have the interface this namer depends on. The
+# three attribute reads therefore live INSIDE this same `try`, so an
+# `AttributeError` folds into `_AB_MERGE_IMPORT_ERROR` exactly like a failed
+# `import ab_merge`.
 _PERF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "perf")
 sys.path.insert(0, _PERF_DIR)
 try:
     import ab_merge  # noqa: E402
 
-    # Unit-63 round-14 audit F6 / round-16 audit (identity-completeness
-    # sibling class): all three read directly off `ab_merge.py`'s own
-    # producer-side constants, never a hand-duplicated literal -- see this
-    # module's own "Binding to ab_merge.py's own exit fold" doc above for
-    # exactly what this import makes impossible (a fifth cause silently
-    # added to one side alone) versus what it does not (an exit-fold branch
-    # written outside the shared data structure).
+    # All three read directly off `ab_merge.py`'s own producer-side
+    # constants, never a hand-duplicated literal -- see this module's own
+    # "Binding to ab_merge.py's own exit fold" doc above.
     _ALL_CAUSE_NAMES = list(ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES)
     _MUTANT_DOSE_DETECTED_INVALID = ab_merge.MUTANT_DOSE_DETECTED_INVALID
     _RED_PROOF_VERDICT_NOT_PROVEN_PREFIX = ab_merge.RED_PROOF_VERDICT_NOT_PROVEN_PREFIX
@@ -125,7 +100,7 @@ except Exception as _exc:  # pragma: no cover - exercised via subprocess in test
 
 
 def _inspect_doses(ladder: dict) -> tuple[list, str | None]:
-    """Unit-63 round-14 audit A4: `ladder["doses"]` is a producer/merger
+    """`ladder["doses"]` is a producer/merger
     artifact field, never assumed well-shaped by this namer -- a corrupted
     or hand-edited `finetune_run_ab_report.json` (`"doses": null`, `"doses"`
     not a list at all, or a list carrying a `null`/non-dict element) must
@@ -175,14 +150,14 @@ def dose_ladder_cause(report: dict) -> str:
     a bare "unknown"), so a truly unexplained GREEN-but-nonzero contradiction
     is still legible as "none of these four" rather than silently opaque.
 
-    Unit-63 round-14 audit A4: `ladder["doses"]` itself is inspected via
+    `ladder["doses"]` itself is inspected via
     `_inspect_doses` before being scanned for `INVALID` entries -- a
     malformed `doses` field (`null`, not a list, or carrying a `null`/
     non-dict element) is named as its own cause rather than crashing this
     function outright (see that helper's own doc for why a crash here is
     strictly worse than a named "unknown").
 
-    Unit-63 round-15 audit advisory 3: if the module-level `import ab_merge`
+    If the module-level `import ab_merge`
     itself failed, `_AB_MERGE_IMPORT_ERROR` is non-`None` and this function
     returns that failure as its own named cause immediately, before touching
     the ALREADY-PARSED `report` dict passed in here at all -- same discipline
@@ -192,19 +167,18 @@ def dose_ladder_cause(report: dict) -> str:
     "unknown (could not inspect ...)" text. This function's own contract
     starts AFTER `report` has already been read and `json.loads`-parsed by
     the caller -- reading/parsing the report FILE is `main()`'s own job (see
-    that function's own doc, unit-63 round-16 audit advisory 3, for the
-    file-read hardening this function does not itself provide).
+    that function's own doc for the file-read hardening this function does not itself provide).
 
-    Unit-63 round-17 audit shapes (a)/(b): `json.loads` succeeding proves
+    `json.loads` succeeding proves
     nothing about the SHAPE of what it returned -- valid JSON can decode to
     `null`, a list, a string, or a number just as easily as an object, and
     a `report["mutant_dose_ladder"]` value can independently be any JSON
     value a hand-edited or corrupted report happens to carry (e.g. a list).
-    Both are now type-checked -- a non-dict `report` returns a
+    Both are type-checked -- a non-dict `report` returns a
     `report_is_not_an_object(type=...)` cause before `.get` is ever called
     on it, and a present-but-non-dict `mutant_dose_ladder` (truthy, since a
     falsy one -- `None`, `{}`, `[]`, ... -- degrades to the empty-ladder
-    case exactly as before) returns a `mutant_dose_ladder_is_not_an_object(
+    case) returns a `mutant_dose_ladder_is_not_an_object(
     type=...)` cause -- same "named cause, never an `AttributeError`" style
     as `_inspect_doses`'s own `doses`-field checks below.
     """
@@ -238,27 +212,19 @@ def dose_ladder_cause(report: dict) -> str:
 
 
 def main(argv=None) -> int:
-    """Unit-63 round-16 audit advisory 3 (correcting `dose_ladder_cause`'s
-    own docstring, which was read as claiming MORE than it does): opening
-    and `json.loads`-parsing `REPORT_JSON_PATH` is THIS function's own job,
-    not `dose_ladder_cause`'s -- and it used to happen entirely OUTSIDE the
-    named-degradation discipline that function provides, an unreadable file
-    (missing, permission-denied, a directory, ...) or malformed JSON crashed
-    straight into `runpod_gpu_howwell.sh`'s own
-    `2>/dev/null || echo "unknown (could not inspect ...)"` wrapper -- the
-    exact opaque-collapse shape `_AB_MERGE_IMPORT_ERROR`/`_inspect_doses`
-    exist to prevent one layer down, recurring one layer up, and reachable
-    even when `ab_merge` itself imported cleanly (a broken `ab_merge` and an
-    unreadable report are independent failure axes; this hardening covers
-    the report-read axis regardless of the other).
+    """Opening and `json.loads`-parsing `REPORT_JSON_PATH` is THIS
+    function's own job, not `dose_ladder_cause`'s, and it applies the same
+    named-degradation discipline: an unreadable file (missing,
+    permission-denied, a directory, ...) or malformed JSON must not crash
+    into `runpod_gpu_howwell.sh`'s `2>/dev/null || echo "unknown (could not
+    inspect ...)"` wrapper, which would collapse it into opaque text. A
+    broken `ab_merge` and an unreadable report are independent failure axes;
+    this covers the report-read axis regardless of the other.
 
-    Unit-63 round-17 audit shape (c): a non-UTF-8 report file raised
-    `UnicodeDecodeError` from INSIDE `fh.read()` -- a `ValueError` subclass,
-    not an `OSError` subclass, so the `except OSError` arm alone did not
-    catch it and it propagated uncaught. A second `except ValueError` arm
-    (which also catches `UnicodeDecodeError`, its subclass) now degrades
-    that shape to its own NAMED `report_undecodable(...)` cause on stdout,
-    exit 0.
+    A non-UTF-8 report file raises `UnicodeDecodeError` from INSIDE
+    `fh.read()` -- a `ValueError` subclass, not an `OSError` subclass -- so a
+    second `except ValueError` arm degrades it to its own NAMED
+    `report_undecodable(...)` cause on stdout, exit 0.
 
     What is proven, by the shapes this file's own test suite drives through
     the real CLI: an unreadable path (`OSError`), a non-UTF-8 file
@@ -281,7 +247,7 @@ def main(argv=None) -> int:
         print(f"report_unreadable({type(exc).__name__}: {exc})")
         return 0
     except ValueError as exc:
-        # `UnicodeDecodeError` (round-17 audit shape (c)) is a `ValueError`
+        # `UnicodeDecodeError` is a `ValueError`
         # subclass, not an `OSError` subclass, so it needs this separate arm.
         print(f"report_undecodable({type(exc).__name__}: {exc})")
         return 0

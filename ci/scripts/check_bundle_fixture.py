@@ -7,14 +7,13 @@ hold the VERBATIM `ldd` report `release-binaries.yml`'s `server-cu12-build`
 job captures from the real cu12 `jammi-server` binary and its real staged
 `lib/` (the build container: CUDA toolkit present, NVIDIA driver absent —
 see that job's `cu12-loader-report` artifact and this fixture's own header).
-`ci/scripts/fixtures/cu12_jail_report_real.txt` (arm 1b, THE JAIL — #534's
+`ci/scripts/fixtures/cu12_jail_report_real.txt` (arm 1b, THE JAIL — the
 chroot half) must likewise hold the VERBATIM tolerant `LD_TRACE_LOADED_
 OBJECTS` trace `ci/scripts/jail_trace.py` runs inside the real jail — the
 loader invoked AT its own `PT_INTERP` path, never `ld.so --list` (fatal on
 the first missing library, see that script's own module doc) — captured by
-the same job, uploaded as its `cu12-jail-report` workflow artifact. Until
-the lead downloads each artifact
-and commits it over its placeholder, that fixture carries a
+the same job, uploaded as its `cu12-jail-report` workflow artifact. Until a
+maintainer downloads each artifact and commits it over its placeholder, that fixture carries a
 CLEARLY-LABELLED `# captured: pending` header instead — and that arm's own
 "a CORRECT real stage passes" property is UNPROVEN, not merely untested,
 while its header stands.
@@ -73,7 +72,7 @@ def check(fixture: Path) -> int:
     # same marker line would otherwise read as "already real").
     if first_line.startswith(MARKER):
         artifact = "cu12-jail-report" if fixture.name.startswith("cu12_jail_") else "cu12-loader-report"
-        arm = "jail (#534's chroot half)" if fixture.name.startswith("cu12_jail_") else "detection"
+        arm = "jail (chroot half)" if fixture.name.startswith("cu12_jail_") else "detection"
         print(
             "check_bundle_fixture.py: FAILED -- "
             f"{fixture} is still the provisional '{MARKER}' placeholder. "

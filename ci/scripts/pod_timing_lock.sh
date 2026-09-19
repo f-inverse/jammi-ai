@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # One flock seam for every pod-side thing that must not race a `run --timing`
 # job, a seed build, or another producer over shared pod resources
-# (CARGO_TARGET_DIR, the seed, nvcc). Replaces an earlier rename-based
-# "steal" scheme that reproduced a double-acquire under a scheduling gap
-# between "observe the incumbent is stale" and "rename it away" — see the
-# module doc in gpu-dev.sh (M6) and ledger row 21. `flock` makes the KERNEL
+# (CARGO_TARGET_DIR, the seed, nvcc). A rename-based "steal" scheme
+# double-acquires under a scheduling gap between "observe the incumbent is
+# stale" and "rename it away"; `flock` makes the KERNEL
 # own liveness instead: the lock is a held file descriptor, so it dies the
 # INSTANT the holding process exits or is killed — crash-safe, reboot-safe,
 # no stale marker to observe, and nothing to steal because there is nothing
@@ -39,16 +38,15 @@
 # The holder file (${LOCK}.holder) is written by tmp-then-rename UNDER the
 # lock (never truncate-then-write in place): a reader racing the write can
 # only ever see the OLD complete file or the NEW complete file, never a
-# truncated/partial one — verified empirically (pt8/holder_race.py-style
-# probe: truncate+write showed torn reads under a scheduling gap between
-# the truncate and the write; tmp+rename showed zero).
+# truncated/partial one (truncate+write shows torn reads under a
+# scheduling gap between the truncate and the write; tmp+rename shows
+# none).
 #
-# The holder file is REMOVED on release (round-4 audit A3): a witness file
-# that is written once and never cleaned up answers "is this held, right
-# now" correctly only until the FIRST release, then reads as "held" forever
-# after — a downstream reader (pod_build_timings.sh's own LOCK_HELD check)
-# reproduced exactly that: the prior run exits, the witness still reads
-# true, and an outsider acquires the lock immediately despite it. Removal
+# The holder file is REMOVED on release: a witness file that is written
+# once and never cleaned up answers "is this held, right now" correctly
+# only until the FIRST release, then reads as "held" forever after — a
+# downstream reader (pod_build_timings.sh's own LOCK_HELD check) would see
+# the witness still read true after the prior run exits. Removal
 # happens via a trap on EXIT/INT/TERM set INSIDE the flock-held child, after
 # the holder file is written and BEFORE the wrapped command runs (so a
 # crash/kill of the wrapped command still triggers cleanup) — the wrapped

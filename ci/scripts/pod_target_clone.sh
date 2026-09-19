@@ -5,9 +5,8 @@
 # workspace-member artifact in the clone comes from the CLONE's own build,
 # never from the seed. `cp -a` (reflink where the filesystem supports it)
 # because a clone is throwaway per-tree state, not a shared object cache — a
-# hardlink clone was reproduced to CORRUPT the seed (round-1 pressure-test:
-# writing through a hardlinked path mutates the seed's own copy), so this
-# never hardlinks.
+# hardlink clone CORRUPTS the seed (writing through a hardlinked path
+# mutates the seed's own copy), so this never hardlinks.
 #
 # Usage: pod_target_clone.sh <seed-dir> <dest-dir> [tree-dir] [--verify|--adopt]
 #   --verify: after the caller's own first build against <dest-dir>, pass a
@@ -15,8 +14,8 @@
 #     unit line — a member-free seed means every member unit must actually
 #     compile (Compiling, not Fresh) on the clone's first build. This is an
 #     ADDITIONAL, OPT-IN form a human runs after a real build — it is not a
-#     substitute for the UNCONDITIONAL filesystem-level check below (round-3
-#     audit N2): --verify only ever runs when a caller remembers to run it
+#     substitute for the UNCONDITIONAL filesystem-level check below:
+#     --verify only ever runs when a caller remembers to run it
 #     and only ever catches member units that were Fresh on ONE specific
 #     build; the filesystem check runs on every single clone regardless and
 #     catches a leftover artifact whether or not anyone ever rebuilds.
@@ -26,8 +25,7 @@
 #     This is the executable remedy for `run`'s UNMARKED_WARM refusal: a
 #     warm dir cannot be re-provisioned by a clone (the clone refuses to
 #     write over an existing destination) and is NOT cold, so refusing it
-#     with "run `target` again" left an operator with no runnable move at
-#     all. Adoption is CHECKED, never a rubber stamp: it applies
+#     with "run `target` again" would leave no runnable move at all. Adoption is CHECKED, never a rubber stamp: it applies
 #     pod_seed_assert_member_free — the SAME content validation every clone
 #     is put through — and demands the OPPOSITE answer. A clone must be
 #     member-FREE (nothing of this workspace built into it yet); a dir worth
@@ -201,7 +199,7 @@ du_default="$(du -sh "$DEST_DIR" 2>/dev/null | awk '{print $1}')" # tripwire-ok:
 du_apparent="$(du -sh --apparent-size "$DEST_DIR" 2>/dev/null | awk '{print $1}')" # tripwire-ok: same as du_default above (also covers hosts whose du lacks --apparent-size)
 echo "clone at ${DEST_DIR}: du=${du_default:-?} du(apparent-size)=${du_apparent:-?}"
 
-# UNCONDITIONAL, round-3 audit N2: every clone is checked, not just the ones
+# UNCONDITIONAL: every clone is checked, not just the ones
 # a human remembers to --verify after a build. A seed that was NOT actually
 # member-free (the failure --verify alone can never catch until someone
 # rebuilds against it) is caught the instant it is cloned.
@@ -211,10 +209,10 @@ if ! pod_seed_assert_member_free "$DEST_DIR" "$TREE_DIR_FOR_METADATA"; then
   exit 1
 fi
 
-# esc-077: stamp a marker INSIDE the destination so `gpu-dev.sh run`'s
+# Stamp a marker INSIDE the destination so `gpu-dev.sh run`'s
 # preflight (and a human) can tell a genuine seed-clone from a raw/cold
 # CARGO_TARGET_DIR at a glance — mirroring this script's own SEED-marker
-# check above (COMPLETE_MARKER, :62) rather than inventing a new marker
+# check above (COMPLETE_MARKER) rather than inventing a new marker
 # shape. Records the seed's completion-marker CONTENT (mtime + sha256, not
 # just its path) so a later re-seed of the SAME seed dir (a new, different
 # completion marker) is distinguishable from the seed this clone was

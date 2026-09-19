@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Assert no release lane's feature selection reaches jammi-db's postgres/
-mysql features (#511).
+mysql features.
 
 **Guarded property**: `jammi-db`'s `postgres`/`mysql` features pull
 `datafusion-table-providers`'s federation drivers, which link a native TLS
@@ -11,10 +11,9 @@ package (the runtime image is distroless Debian 12, which ships only the 3
 series; the CI/build image resolves to the 1.1 series) — a build produced
 under the current images with these features enabled would link successfully
 and then fail to LOAD at runtime, a mismatch no build-time gate can see (see
-`crates/jammi-db/README.md`'s own "Build requirements" section and #511).
-Nothing ships broken TODAY only because no release lane enables these
-features — this gate makes that a mechanically-checked property rather than
-an unstated assumption: it FAILS the moment any `ci/release-feature-
+`crates/jammi-db/README.md`'s own "Build requirements" section).
+No release lane enables these features, and this gate keeps that a
+mechanically-checked property: it FAILS the moment any `ci/release-feature-
 manifest.json` lane's `cargo_features` selection reaches either feature,
 which is exactly the day the OpenSSL/runtime-image mismatch above would
 start mattering for real.
@@ -87,9 +86,9 @@ def verdict(graph: "flash.Graph", lanes: dict[str, dict], verbose: bool = True) 
                     f"FAIL: lane `{lane_name}` reaches {TARGET_PKG}/{sorted(reached)} — this "
                     "lane's build would require OpenSSL development headers this repo's "
                     "release/CI images deliberately omit, and the runtime image cannot load "
-                    "the native TLS stack these features link (see crates/jammi-db/README.md "
-                    "and #511); either this is a deliberate new release surface that needs "
-                    "the OpenSSL-parity work #511 tracks, or the lane's own cargo_features "
+                    "the native TLS stack these features link (see crates/jammi-db/README.md); "
+                    "either this is a deliberate new release surface that needs OpenSSL parity "
+                    "between the build and runtime images, or the lane's own cargo_features "
                     "leaked this feature unintentionally",
                     file=sys.stderr,
                 )
@@ -159,9 +158,7 @@ def self_test() -> int:
 
     # Real-tree control: the REAL manifest, walked through the REAL
     # workspace graph, must currently pass clean — proves the synthetic
-    # fixtures above match production, not a toy shape, and is itself
-    # #511's own executed refutation that "nothing ships broken today"
-    # (this is a fact this gate now checks every run, not an assumption).
+    # fixtures above match production, not a toy shape.
     real_metadata = flash.load_metadata()
     real_graph = flash.Graph(real_metadata)
     real_lanes = flash.load_manifest_lanes()

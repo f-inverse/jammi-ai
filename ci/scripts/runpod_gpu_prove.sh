@@ -75,25 +75,39 @@ GIT_REF="${GIT_REF:-${GITHUB_SHA:-main}}"
 REMOTE_CHECKOUT_LINES="$(rp_remote_checkout_lines "${GIT_REF}" "${GIT_REPO}")"
 
 # sm_XX (the GENCODE_ARCHES / check_gpu_parity_matrix.py silicon-axis naming)
-# -> the `rp_deploy_arch` candidate-list key (runpod_lib.sh), and -> the bare
-# numeric NATIVE_COMPUTE_CAP this leg's device actually is. NATIVE_COMPUTE_CAP
-# overrides the CI image's baked CUDA_COMPUTE_CAP (.docker/ci-cuda.Dockerfile)
-# in the remote build env below: candle-kernels 0.11 builds the quantized
-# fast-path kernels as single-arch SASS (no PTX) from that env var, so every
-# leg building at the image's one baked cap produces kernels that silently
-# cannot launch on the other legs' devices. Comment on each line
-# names the SASS target the leg proves.
+# -> the `rp_deploy_arch` candidate-list key (runpod_lib.sh), -> the bare
+# numeric NATIVE_COMPUTE_CAP this leg's device actually is, and ->
+# LEG_DEVICE_80GB, whether EVERY device on that candidate list is 80GB-class.
+#
+# NATIVE_COMPUTE_CAP overrides the CI image's baked CUDA_COMPUTE_CAP
+# (.docker/ci-cuda.Dockerfile) in the remote build env below: candle-kernels
+# 0.11 builds the quantized fast-path kernels as single-arch SASS (no PTX) from
+# that env var, so every leg building at the image's one baked cap produces
+# kernels that silently cannot launch on the other legs' devices.
+#
+# LEG_DEVICE_80GB selects the suite whose reference shapes are calibrated for
+# an 80GB-class device (the encoders-cuda group's eager training-memory
+# bounds). The memory that suite needs is stated once, in the suite, which
+# refuses a smaller device by name: a leg declared `yes` here that rents a
+# smaller device FAILS naming it, never skips. Ampere workstation (sm_86) and
+# Ada (sm_89) have no 80GB-class device at all.
+#
+# Comment on each line names the SASS target the leg proves. A function, so
+# `test_gpu_prove_lane.sh` renders any leg's remote script from this one table.
+prove_leg_facts() { # $1 = sm_XX
+  case "$1" in
+    sm_80) RP_DEPLOY_ARCH=a100 NATIVE_COMPUTE_CAP=80 LEG_DEVICE_80GB=yes ;; # Ampere floor — proves sm_80.
+    sm_86) RP_DEPLOY_ARCH=a40  NATIVE_COMPUTE_CAP=86 LEG_DEVICE_80GB=no ;; # Ampere workstation class — proves sm_86.
+    sm_89) RP_DEPLOY_ARCH=l4_l40s NATIVE_COMPUTE_CAP=89 LEG_DEVICE_80GB=no ;; # Ada — proves sm_89, fp8. L4 first (canonical commodity inference card, ~half L40S rental); L40S is a capacity-only fallback — same sm_89 SASS, identical correctness proof.
+    sm_90) RP_DEPLOY_ARCH=h100 NATIVE_COMPUTE_CAP=90 LEG_DEVICE_80GB=yes ;; # Hopper — proves sm_90.
+    *)
+      echo "::error::unknown GPU_PROVE_ARCH '$1' (want: sm_80|sm_86|sm_89|sm_90)"
+      return 2
+      ;;
+  esac
+}
 GPU_PROVE_ARCH="${GPU_PROVE_ARCH:-sm_80}"
-case "$GPU_PROVE_ARCH" in
-  sm_80) RP_DEPLOY_ARCH=a100 NATIVE_COMPUTE_CAP=80 ;; # Ampere floor — proves sm_80.
-  sm_86) RP_DEPLOY_ARCH=a40  NATIVE_COMPUTE_CAP=86 ;; # Ampere workstation class — proves sm_86.
-  sm_89) RP_DEPLOY_ARCH=l4_l40s NATIVE_COMPUTE_CAP=89 ;; # Ada — proves sm_89, fp8. L4 first (canonical commodity inference card, ~half L40S rental); L40S is a capacity-only fallback — same sm_89 SASS, identical correctness proof.
-  sm_90) RP_DEPLOY_ARCH=h100 NATIVE_COMPUTE_CAP=90 ;; # Hopper — proves sm_90.
-  *)
-    echo "::error::unknown GPU_PROVE_ARCH '${GPU_PROVE_ARCH}' (want: sm_80|sm_86|sm_89|sm_90)"
-    exit 2
-    ;;
-esac
+prove_leg_facts "$GPU_PROVE_ARCH" || exit 2
 
 # The six PROOF groups this leg's driver rule below gates on --
 # `::group::` names in the heredoc below, verbatim. `device` and `bench` are
@@ -385,7 +399,11 @@ echo "::endgroup::"
 
 # encoders-cuda: the encoder device tests. One asserts exact-arch arithmetic
 # and names sm89 (whose bf16 GEMM reassociates) as a device it cannot run on;
-# the sm89 leg excludes it by name.
+# the sm89 leg excludes it by name. The eager training-memory bounds name the
+# device memory their reference shapes are calibrated for and refuse a smaller
+# device; the legs whose every device is 80GB-class (LEG_DEVICE_80GB, this
+# script's per-leg table) select them. Their PROVE_TUPLE echo sits inside the
+# same condition, so a leg's log claims the invocation only where it ran.
 echo "::group::encoders-cuda"
 grc=0
 encoders_skip=()
@@ -393,9 +411,11 @@ encoders_skip=()
 echo "PROVE_TUPLE crate=jammi-encoders kind=test features=cuda,flash-attn,live-gpu-tests"
 cargo test -p jammi-encoders --features cuda,flash-attn,live-gpu-tests --lib --test it -- gpu:: --test-threads=1 "\${encoders_skip[@]}" 2>&1 | tee /tmp/gpu_tests.log
 ran_tests \${PIPESTATUS[0]} || grc=\$?
-echo "PROVE_TUPLE crate=jammi-encoders kind=test features=cuda,flash-attn,live-gpu-tests"
-cargo test -p jammi-encoders --features cuda,flash-attn,live-gpu-tests --test eager_training_memory -- --test-threads=1 2>&1 | tee /tmp/gpu_tests.log
-ran_tests \${PIPESTATUS[0]} || grc=\$?
+if [ "${LEG_DEVICE_80GB}" = yes ]; then
+  echo "PROVE_TUPLE crate=jammi-encoders kind=test features=cuda,flash-attn,live-gpu-tests"
+  cargo test -p jammi-encoders --features cuda,flash-attn,live-gpu-tests --test eager_training_memory -- --test-threads=1 2>&1 | tee /tmp/gpu_tests.log
+  ran_tests \${PIPESTATUS[0]} || grc=\$?
+fi
 [ "\$grc" -ne 0 ] && rc=\$grc
 echo "PROVE_GROUP_RC name=encoders-cuda rc=\${grc}"
 echo "::endgroup::"

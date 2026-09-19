@@ -52,6 +52,16 @@
 //!    drive the identical pipeline (same weights file, same token ids, same margin loss and
 //!    backward), differing only in `backbone_dtype`.
 //!
+//! ## The device this file needs
+//!
+//! The reference shapes are calibrated against an 80 GB device: a verdict here is about how
+//! eager training memory GROWS across steps, which is only readable where a single
+//! reference-shape step fits with room to spare. On a smaller device every leg runs out of
+//! memory inside its first steps, which says nothing about eager composition.
+//! [`cuda_device`] therefore refuses, by name, a device below
+//! [`REFERENCE_DEVICE_MIN_TOTAL_MIB`]; a lane selects this target only where device 0 is
+//! that large.
+//!
 //! ## One test at a time, structurally
 //!
 //! Every test here measures DEVICE-GLOBAL free memory. Two legs sampling `cuMemGetInfo`
@@ -252,13 +262,46 @@ fn gpu_slot_is_exclusive_while_held() {
     drop(slot);
 }
 
+/// The least total device memory, in MiB, this file's reference shapes are calibrated for.
+///
+/// 64 GiB separates the two device classes the shapes have been measured on: a 48 GB
+/// device cannot hold one reference-shape step (the bucketed variable-shape leg runs out
+/// of memory within its first two steps there), and an 80 GB device holds every leg with
+/// tens of GiB to spare. No device between the two has been measured, so this is the
+/// bracket's midpoint, not a measured peak.
+const REFERENCE_DEVICE_MIN_TOTAL_MIB: f64 = 64.0 * 1024.0;
+
+/// Refuses, by name, a device whose total memory is below
+/// [`REFERENCE_DEVICE_MIN_TOTAL_MIB`] -- instead of the out-of-memory or cuBLAS execution
+/// failure such a device produces deep inside a leg, which reads as a finding or a harness
+/// defect and is neither.
+fn require_reference_device_memory(total_mib: f64) {
+    assert!(
+        total_mib >= REFERENCE_DEVICE_MIN_TOTAL_MIB,
+        "this test's reference shapes are calibrated for a device with at least \
+         {REFERENCE_DEVICE_MIN_TOTAL_MIB:.0} MiB; CUDA device 0 has {total_mib:.0} MiB"
+    );
+}
+
+/// The refusal names both the memory this file needs and the memory the device has. Needs
+/// no DEVICE: the measured total is the function's input.
+#[test]
+#[should_panic(
+    expected = "calibrated for a device with at least 65536 MiB; CUDA device 0 has 46068 MiB"
+)]
+fn a_device_below_the_reference_memory_is_refused_by_name() {
+    require_reference_device_memory(46068.0);
+}
+
 fn cuda_device() -> SerialGpu {
     // Taken BEFORE the device opens, so even device acquisition (which
     // allocates a context on the device) is serialized against a sibling
     // leg's memory trace.
     let slot = take_gpu_slot();
+    let device = jammi_test_resources::cuda_device(0);
+    require_reference_device_memory(cuda_memory_mib(&device).total);
     SerialGpu {
-        device: jammi_test_resources::cuda_device(0),
+        device,
         _slot: slot,
     }
 }
@@ -442,17 +485,32 @@ enum LegOutcome {
 /// this test's own runtime budget is spent.
 const STEPS_PER_LEG: usize = 40;
 
-/// `(free, total)` MiB, the same `cuMemGetInfo` driver call
+/// One `cuMemGetInfo` reading of a device, in MiB: `free` moves with every allocation on
+/// the device, `total` is the installed memory and never moves.
+struct CudaMemoryMib {
+    free: f64,
+    total: f64,
+}
+
+/// `cuMemGetInfo` after a device sync, the same driver call
 /// `jammi_encoders::modernbert`'s own (private) VRAM probes make --
 /// duplicated here since that helper is `#[cfg(test)]`-private to this
 /// crate's OWN test module, not exported.
-fn cuda_free_mib(device: &Device) -> f64 {
+fn cuda_memory_mib(device: &Device) -> CudaMemoryMib {
+    const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
     device
         .synchronize()
         .expect("device sync before mem_get_info");
-    let (free, _total) = candle_core::cuda_backend::cudarc::driver::result::mem_get_info()
+    let (free, total) = candle_core::cuda_backend::cudarc::driver::result::mem_get_info()
         .expect("cuMemGetInfo_v2 failed");
-    free as f64 / (1024.0 * 1024.0)
+    CudaMemoryMib {
+        free: free as f64 / BYTES_PER_MIB,
+        total: total as f64 / BYTES_PER_MIB,
+    }
+}
+
+fn cuda_free_mib(device: &Device) -> f64 {
+    cuda_memory_mib(device).free
 }
 
 /// Runs a MULTI-STEP fully-eager training leg at `(REFERENCE_BATCH,

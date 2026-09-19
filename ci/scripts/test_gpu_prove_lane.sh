@@ -19,6 +19,10 @@
 #       INSIDE a proof group -> FAIL; a cut inside bench with every proof
 #       group already rc=0 -> 0 + `::warning::`; a marker written after the
 #       final poll tick still credits.
+#   per-leg selection: the 80GB-calibrated memory suite is invoked, under
+#       its own PROVE_TUPLE echo, on exactly the legs whose every device is
+#       80GB-class, and gates encoders-cuda there; every other leg invokes
+#       neither and still resolves every gating group.
 #   executed driver: `rp_cleanup` (the `trap ... EXIT` runpod_lib.sh
 #       installs at source time) fires on the 76 path and on the exit-0
 #       bench-cut path.
@@ -328,9 +332,11 @@ rp_prove_verdict 0 "$log"
 # script -- `\$rc`/`\${grc}` (escaped in the source so the LOCAL/CI-runner
 # shell never touches them when building the real heredoc) become literal
 # `$rc`/`${grc}` once run this way, read as ITS OWN locals exactly as the
-# REMOTE bash would; `${NATIVE_COMPUTE_CAP}`/`${GIT_REF}`/`${GIT_REPO}`
-# (unescaped in the source, meant for LOCAL expansion) are supplied by this
-# fixture's own environment instead of the real driver's. `cargo`/
+# REMOTE bash would; `${NATIVE_COMPUTE_CAP}`/`${LEG_DEVICE_80GB}`/`${GIT_REF}`/
+# `${GIT_REPO}` (unescaped in the source, meant for LOCAL expansion) are
+# supplied by this fixture's own environment instead of the real driver's --
+# the two per-leg facts through the driver's own `prove_leg_facts` table,
+# never a hand-copied pair. `cargo`/
 # `nvidia-smi`/`git` are PATH-shimmed (git's own `clone` copies this
 # checkout's real `ci/`+`crates/` into the fake clone target so the
 # heredoc's own manifest read is genuine, not faked); `cd /root` is
@@ -358,9 +364,9 @@ cat > "$HEREDOC_EXEC_BIN/nvidia-smi" <<'NVSTUB'
 case "$*" in
   *"name,compute_cap,driver_version"*)
     echo "name, compute_cap, driver_version"
-    echo "NVIDIA A100 80GB PCIe, 8.0, 570.195.03"
+    echo "stub device, ${HEREDOC_EXEC_COMPUTE_CAP:?unset}, 570.195.03"
     ;;
-  *"compute_cap --format=csv,noheader"*) echo "8.0" ;;
+  *"compute_cap --format=csv,noheader"*) echo "${HEREDOC_EXEC_COMPUTE_CAP:?unset}" ;;
   *) echo "" ;;
 esac
 NVSTUB
@@ -427,20 +433,23 @@ HEREDOC_EXEC_RAW_9f8a3c" >> "$out"
 }
 
 # Runs the extracted heredoc script with `$1`=the cargo invocation substring
-# to FAIL (empty = everything succeeds), writing the emitted log to `$2`.
+# to FAIL (empty = everything succeeds), writing the emitted log to `$2`,
+# rendered for leg `$3` (default sm_80) from the driver's own per-leg table.
 # Returns the script's own exit code (mirrors `raw_rc` in the real driver,
 # since this IS the remote script the driver's own `wait $pid` would see).
 heredoc_exec_run() {
-  local fail_match="$1" outlog="$2"
+  local fail_match="$1" outlog="$2" leg="${3:-sm_80}"
   local script="$SANDBOX/heredoc-exec-script.sh"
   local workdir="$SANDBOX/heredoc-exec-workdir-$$-$RANDOM"
   rm -rf "$workdir"; mkdir -p "$workdir"
   # Phase-1 expansion (inside heredoc_exec_extract_heredoc's own `eval`) needs
-  # NATIVE_COMPUTE_CAP/GIT_REF/GIT_REPO/HEREDOC_EXEC_WORKDIR ALREADY set in THIS
-  # shell -- it runs at EXTRACTION time, not at the later `env ... bash`
-  # run time below, so exporting them only on that later line would be too
-  # late for the `${...}` references the extraction step must resolve.
-  export NATIVE_COMPUTE_CAP=80 GIT_REF=test-ref GIT_REPO=unused HEREDOC_EXEC_WORKDIR="$workdir"
+  # NATIVE_COMPUTE_CAP/LEG_DEVICE_80GB/GIT_REF/GIT_REPO/HEREDOC_EXEC_WORKDIR
+  # ALREADY set in THIS shell -- it runs at EXTRACTION time, not at the later
+  # `env ... bash` run time below, so exporting them only on that later line
+  # would be too late for the `${...}` references the extraction step must
+  # resolve.
+  prove_leg_facts "$leg" || return 2
+  export NATIVE_COMPUTE_CAP LEG_DEVICE_80GB GIT_REF=test-ref GIT_REPO=unused HEREDOC_EXEC_WORKDIR="$workdir"
   export RP_REMOTE_ROOT="$workdir"
   REMOTE_CHECKOUT_LINES="$(rp_remote_checkout_lines "$GIT_REF" "$GIT_REPO")"
   heredoc_exec_extract_heredoc "$script"
@@ -448,6 +457,7 @@ heredoc_exec_run() {
     HEREDOC_EXEC_FAIL_MATCH="$fail_match" \
     HEREDOC_EXEC_REAL_ROOT="$REPO_ROOT" \
     HEREDOC_EXEC_WORKDIR="$workdir" \
+    HEREDOC_EXEC_COMPUTE_CAP="${NATIVE_COMPUTE_CAP:0:1}.${NATIVE_COMPUTE_CAP:1}" \
     bash "$script" > "$outlog" 2>&1
   local rc=$?
   rm -rf "$workdir"
@@ -504,6 +514,64 @@ if [ -n "$heredoc_exec_bench_open_line" ] && [ "$heredoc_exec_bench_open_line" -
   ok "heredoc execution: ::group::bench opens AFTER every gating group's own marker in the executed log (runs LAST, not only by comment)"
 else
   bad "heredoc execution: expected bench's own group-open line ($heredoc_exec_bench_open_line) after the last gating marker ($heredoc_exec_last_gating_marker_line)"
+fi
+
+# --- per-leg selection of the memory suite whose reference shapes are
+# calibrated for an 80GB-class device. The truth table below is this
+# fixture's own, held against the driver's `prove_leg_facts`: a leg whose
+# every device is 80GB-class invokes `--test eager_training_memory` under its
+# own PROVE_TUPLE echo; every other leg invokes neither, so a cargo stub that
+# FAILS that invocation cannot touch it. `heredoc_exec_log` above is the sm_80
+# leg with the suite passing. ---
+memory_suite='--test eager_training_memory'
+memory_suite_invocations() { grep -c -- "^stub cargo: .*${memory_suite}" "$1"; }
+encoders_tuple_echoes() { grep -c '^PROVE_TUPLE crate=jammi-encoders kind=test ' "$1"; }
+encoders_device_tests_ran() { grep -q -- '^stub cargo: ok (test -p jammi-encoders .*--lib --test it ' "$1"; }
+every_gating_group_passed() {
+  local g
+  for g in "${PROVE_GROUPS[@]}"; do
+    grep -q "^PROVE_GROUP_RC name=${g} rc=0\$" "$1" || return 1
+  done
+}
+
+if [ "$(memory_suite_invocations "$heredoc_exec_log")" -eq 1 ] && [ "$(encoders_tuple_echoes "$heredoc_exec_log")" -eq 2 ]; then
+  ok "per-leg selection (sm_80): the memory suite is invoked once, under its own PROVE_TUPLE echo"
+else
+  bad "per-leg selection (sm_80): expected 1 memory-suite invocation and 2 jammi-encoders PROVE_TUPLE echoes; log=$(cat "$heredoc_exec_log")"
+fi
+
+leg_log="$SANDBOX/heredoc-exec-leg-sm_90.log"
+heredoc_exec_run "" "$leg_log" sm_90
+leg_rc=$?
+if [ "$leg_rc" -eq 0 ] && every_gating_group_passed "$leg_log" && [ "$(memory_suite_invocations "$leg_log")" -eq 1 ] && [ "$(encoders_tuple_echoes "$leg_log")" -eq 2 ]; then
+  ok "per-leg selection (sm_90): the memory suite is invoked once, under its own PROVE_TUPLE echo, and the leg passes"
+else
+  bad "per-leg selection (sm_90): expected rc 0 with 1 memory-suite invocation and 2 jammi-encoders PROVE_TUPLE echoes; rc=$leg_rc log=$(cat "$leg_log")"
+fi
+
+for leg in sm_86 sm_89; do
+  leg_log="$SANDBOX/heredoc-exec-leg-${leg}.log"
+  heredoc_exec_run "$memory_suite" "$leg_log" "$leg"
+  leg_rc=$?
+  if [ "$leg_rc" -eq 0 ] && every_gating_group_passed "$leg_log" && encoders_device_tests_ran "$leg_log" \
+    && [ "$(memory_suite_invocations "$leg_log")" -eq 0 ] && [ "$(encoders_tuple_echoes "$leg_log")" -eq 1 ]; then
+    ok "per-leg selection ($leg): the memory suite is neither invoked nor echoed, the encoder device tests still run, and every gating group passes"
+  else
+    bad "per-leg selection ($leg): expected rc 0, the encoder device tests, no memory-suite invocation and 1 jammi-encoders PROVE_TUPLE echo; rc=$leg_rc log=$(cat "$leg_log")"
+  fi
+done
+
+# Negative control: where the suite IS selected it gates -- the same failing
+# stub that the sm_86/sm_89 legs above never reach fails encoders-cuda here.
+leg_log="$SANDBOX/heredoc-exec-leg-sm_80-memory-fail.log"
+heredoc_exec_run "$memory_suite" "$leg_log" sm_80
+leg_rc=$?
+rp_prove_verdict "$leg_rc" "$leg_log"
+leg_verdict_rc=$?
+if [ "$leg_verdict_rc" -ne 0 ] && grep -q '^PROVE_GROUP_RC name=encoders-cuda rc=[1-9]' "$leg_log"; then
+  ok "per-leg selection negative control (sm_80): a failing memory suite -> lane rc != 0, marker names encoders-cuda"
+else
+  bad "per-leg selection negative control (sm_80): expected a nonzero lane rc naming encoders-cuda; got $leg_verdict_rc log=$(cat "$leg_log")"
 fi
 
 # ============================================================================

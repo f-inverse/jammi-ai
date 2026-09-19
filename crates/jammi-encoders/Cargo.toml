@@ -115,7 +115,9 @@ name = "live_real_clap"
 path = "tests/live_real_clap.rs"
 
 # Long-shape training memory on CUDA: sequence-length bucketing keeps a
-# variable-shape run within the fixed-shape run's memory.
+# variable-shape run within the fixed-shape run's memory. Its reference shapes
+# are calibrated for an 80GB-class device 0; it refuses a smaller one by name,
+# so a lane names this target only where device 0 is that large.
 [[test]]
 name = "eager_training_memory"
 path = "tests/eager_training_memory.rs"

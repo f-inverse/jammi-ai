@@ -76,13 +76,12 @@ pub enum TrainingSpec {
         common: TrainingCommon,
         /// [`ProducingDescriptor::FineTune`](jammi_db::store::manifest::ProducingDescriptor::FineTune)'s
         /// cache dial, the same shape [`crate::jobs::ComputeSpec`]'s own
-        /// `cache` field already carries for every compute kind — except
-        /// that model-level cache reuse is not supported for this kind:
-        /// `Use` is refused, typed, by [`admit_training_spec`] — the ONE
-        /// admission every durable submit edge for a `TrainingSpec` applies,
-        /// so no edge can enqueue this value. `Bypass` (the
-        /// only value a submitted job can carry past that refusal) always
-        /// trains.
+        /// `cache` field already carries for every compute kind. Under `Use`
+        /// the worker, once the training set is materialised and the model's
+        /// definition hash is therefore known, finishes the job against an
+        /// already-published artifact of that definition if one exists
+        /// (`Catalog::finish_job_reusing_artifact`) and trains only on a
+        /// miss; `Bypass` always trains.
         ///
         /// Lives HERE — on the `FineTune` variant, not on [`TrainingCommon`]
         /// — because only this kind has a materialization to probe:
@@ -366,10 +365,8 @@ impl AdmittedTrainingSpec {
 /// The ONE admission every durable submit edge for a [`TrainingSpec`]
 /// applies before a `jobs` row is ever written: the per-kind validation
 /// (`FineTuneConfig::validate`/`GraphSampleConfig::validate`/
-/// `ContextPredictorTrainConfig::validate`), the rank admission
-/// [`RankAdmission::admit`] performs, and — for the column-source
-/// `FineTune` kind only, the sole kind `cache` is representable on —
-/// the `cache = Use` refusal (model-level cache reuse is not supported).
+/// `ContextPredictorTrainConfig::validate`) and the rank admission
+/// [`RankAdmission::admit`] performs.
 ///
 /// Consumes `spec` and, on success, returns it wrapped in
 /// [`AdmittedTrainingSpec`] -- the type-level half of "every durable submit
@@ -401,15 +398,8 @@ pub fn admit_training_spec(
     spec: TrainingSpec,
 ) -> Result<AdmittedTrainingSpec> {
     match &spec {
-        TrainingSpec::FineTune { common, cache, .. } => {
+        TrainingSpec::FineTune { common, .. } => {
             common.config.validate()?;
-            if *cache == CachePolicy::Use {
-                return Err(JammiError::Config(
-                    "model-level cache reuse is not yet supported: submit this fine_tune job \
-                     without `cache` or with `cache = BYPASS`"
-                        .into(),
-                ));
-            }
         }
         TrainingSpec::GraphFineTune {
             common,
@@ -528,11 +518,12 @@ impl TrainingSpec {
                 method,
                 task,
                 common,
-                ..
+                cache,
             } => TrainingPlan::FromTrainingSet(TrainingSetView {
                 columns: columns.clone(),
                 task: *task,
                 common,
+                cache: *cache,
                 producer: TrainingSetProducer::Projection {
                     source,
                     method: *method,
@@ -546,6 +537,7 @@ impl TrainingSpec {
                 columns: graph_training_columns(sample_config.hard_negatives > 0),
                 task: ModelTask::TextEmbedding,
                 common,
+                cache: CachePolicy::Bypass,
                 producer: TrainingSetProducer::GraphSample {
                     sources,
                     sample_config: *sample_config,
@@ -596,6 +588,9 @@ pub struct TrainingSetView<'a> {
     pub columns: Vec<String>,
     pub task: ModelTask,
     pub common: &'a TrainingCommon,
+    /// Whether the worker probes for an already-published model of the same
+    /// definition before training ([`CachePolicy::Use`]) or always trains.
+    pub cache: CachePolicy,
     pub producer: TrainingSetProducer<'a>,
 }
 

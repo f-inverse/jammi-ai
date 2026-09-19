@@ -1396,19 +1396,63 @@ pub(crate) trait ReuseCandidate {
     fn name(&self) -> &str;
 }
 
-/// The engine's one reuse predicate: of the candidates `fetch` returns (the
-/// rows sharing the requested definition hash), those whose recorded anchor
-/// set EQUALS `requested`, newest first.
-///
-/// - A requested set holding any [`AnchorKind::UnpinnedAtInstant`] anchor
-///   matches nothing, and `fetch` is never run: an instant is not a
-///   reproducible id, so equal instants do not prove equal inputs.
-/// - Anchors compare as a SET — a producer's declaration order is incidental.
-///   A source appears at most once in a producer's anchor set, so a length
-///   check plus containment in each direction is exact.
-/// - The order is the total key `(created_at DESC, name DESC)`, imposed here
-///   rather than trusted from a catalog `ORDER BY`, so two rows stamped in
-///   the same microsecond still resolve to one deterministic winner.
+/// A requested anchor set that can match a recorded one: every anchor in it
+/// is a reproducible id. The engine's one reuse predicate is this type — its
+/// constructor is the refusal of an unpinned request, [`Self::matches`] the
+/// exact-set comparison and the order — so a probe that runs inside a catalog
+/// transaction and one that fetches its candidates asynchronously
+/// ([`exact_reuse_matches`]) decide identically.
+#[derive(Debug, Clone)]
+pub(crate) struct PinnedAnchors(Vec<InputAnchor>);
+
+impl PinnedAnchors {
+    /// `requested` as a matchable set, or `None` when it holds any
+    /// [`AnchorKind::UnpinnedAtInstant`] anchor: an instant is not a
+    /// reproducible id, so equal instants do not prove equal inputs and such
+    /// a request matches nothing.
+    pub(crate) fn of(requested: &[InputAnchor]) -> Option<Self> {
+        requested
+            .iter()
+            .all(|a| a.kind != AnchorKind::UnpinnedAtInstant)
+            .then(|| Self(requested.to_vec()))
+    }
+
+    /// Of `candidates` (the rows sharing the requested definition hash),
+    /// those whose recorded anchor set EQUALS this one, newest first.
+    ///
+    /// - Anchors compare as a SET — a producer's declaration order is
+    ///   incidental. A source appears at most once in a producer's anchor
+    ///   set, so a length check plus containment in each direction is exact.
+    /// - The order is the total key `(created_at DESC, name DESC)`, imposed
+    ///   here rather than trusted from a catalog `ORDER BY`, so two rows
+    ///   stamped in the same microsecond still resolve to one deterministic
+    ///   winner.
+    pub(crate) fn matches<C: ReuseCandidate>(
+        &self,
+        candidates: Vec<C>,
+    ) -> Result<Vec<C>, serde_json::Error> {
+        let mut exact = Vec::new();
+        for candidate in candidates {
+            let Some(anchors_json) = candidate.recorded_anchors_json() else {
+                continue;
+            };
+            let recorded: Vec<InputAnchor> = serde_json::from_str(anchors_json)?;
+            if anchor_sets_equal(&recorded, &self.0) {
+                exact.push(candidate);
+            }
+        }
+        exact.sort_by(|a, b| {
+            b.created_at()
+                .cmp(a.created_at())
+                .then_with(|| b.name().cmp(a.name()))
+        });
+        Ok(exact)
+    }
+}
+
+/// [`PinnedAnchors`] over candidates fetched on demand: `fetch` (the rows
+/// sharing the requested definition hash) is never run for an unpinned
+/// request.
 pub(crate) async fn exact_reuse_matches<C, F, Fut>(
     requested: &[InputAnchor],
     fetch: F,
@@ -1418,28 +1462,10 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = crate::error::Result<Vec<C>>>,
 {
-    if requested
-        .iter()
-        .any(|a| a.kind == AnchorKind::UnpinnedAtInstant)
-    {
-        return Ok(Vec::new());
+    match PinnedAnchors::of(requested) {
+        Some(pinned) => Ok(pinned.matches(fetch().await?)?),
+        None => Ok(Vec::new()),
     }
-    let mut exact = Vec::new();
-    for candidate in fetch().await? {
-        let Some(anchors_json) = candidate.recorded_anchors_json() else {
-            continue;
-        };
-        let recorded: Vec<InputAnchor> = serde_json::from_str(anchors_json)?;
-        if anchor_sets_equal(&recorded, requested) {
-            exact.push(candidate);
-        }
-    }
-    exact.sort_by(|a, b| {
-        b.created_at()
-            .cmp(a.created_at())
-            .then_with(|| b.name().cmp(a.name()))
-    });
-    Ok(exact)
 }
 
 fn anchor_sets_equal(a: &[InputAnchor], b: &[InputAnchor]) -> bool {

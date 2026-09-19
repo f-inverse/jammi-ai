@@ -125,11 +125,11 @@ pub struct FineTuneRequest {
     /// distinction survives in this struct for the caller that wants to say
     /// "one rank" out loud; it does not reach the wire.
     pub world_size: Option<NonZeroU32>,
-    /// Model-level cache policy for the fine-tune: the engine refuses
-    /// [`CachePolicy::Use`] on every durable submit edge
-    /// (<https://github.com/f-inverse/jammi-ai/issues/562> tracks reuse), so
-    /// only [`CachePolicy::Bypass`] trains. Defaults to [`CachePolicy::Bypass`] (always
-    /// train), matching the engine's own default on `TrainingSpec::FineTune`'s
+    /// Model-level cache policy for the fine-tune: under
+    /// [`CachePolicy::Use`] the worker finishes the job against an
+    /// already-published model of the same definition when one exists and
+    /// trains only on a miss; [`CachePolicy::Bypass`] always trains.
+    /// Defaults to [`CachePolicy::Bypass`], matching the engine's own default on `TrainingSpec::FineTune`'s
     /// `cache` field (it lives on that variant, not `TrainingCommon` — the
     /// graph fine-tune kind has no materialization to probe, so it carries no
     /// `cache` field at all) and every caller that predates this field. On

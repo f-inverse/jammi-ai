@@ -1,13 +1,17 @@
-//! The `FineTune` producer's materialization identity and its publish path.
+//! The `FineTune` producer's materialization identity, its publish path, and
+//! the model-level reuse that identity enables: under `CachePolicy::Use` a
+//! second submission of the same definition completes against the first
+//! run's published artifact instead of training — two model rows, one
+//! artifact — and the bytes outlive either row while the other references
+//! them.
 //!
-//! Model-level cache reuse (`CachePolicy::Use` probing a prior model row by
-//! materialization definition and finalizing a second row against its
-//! already-published prefix) is not yet supported: `Use` is refused, typed,
-//! at submit (`InferenceSession::submit_fine_tune_spec_deduped`), for both
-//! the in-process spec-construction path and a spec decoded off the wire —
-//! see <https://github.com/f-inverse/jammi-ai/issues/562>. Every `FineTune`
-//! run therefore computes and owns its own attempt-unique prefix; no two
-//! model rows this suite produces ever share one.
+//! # "Trains once" is asserted structurally, never by wall-clock
+//!
+//! A worker's own artifact prefix is `{tenant}/{job_id}/{worker_id}/{attempt}`,
+//! unique per submission by construction, so two rows referencing ONE
+//! artifact is possible only through the reusing finalize. A reused run
+//! also records no run-metrics (no training loop ran to produce any) and a
+//! `cache_outcome` naming the artifact it reused.
 
 use std::sync::Arc;
 
@@ -16,8 +20,10 @@ use jammi_ai::fine_tune::worker::JobWorker;
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::jobs::JobResult;
 use jammi_ai::model::ModelTask;
-use jammi_db::error::JammiError;
-use jammi_db::store::CachePolicy;
+use jammi_db::catalog::model_repo::ModelLocation;
+use jammi_db::catalog::status::ArtifactState;
+use jammi_db::store::{CachePolicy, ReconcileOptions};
+use std::time::Duration;
 
 use crate::fine_tune::{session_with_training_data, tiny_bert_model};
 
@@ -129,88 +135,252 @@ async fn submit_and_run(
     (job.model_id.clone(), metrics.is_some(), cache_outcome)
 }
 
-/// `cache = Use` on `TrainingSpec::FineTune` is refused, typed, at the ONE
-/// point every submission path — in-process or decoded off the wire —
-/// passes through before any row is written
-/// (`InferenceSession::submit_fine_tune_spec_deduped`). Exercises the
-/// in-process construction path: [`InferenceSession::submit_fine_tune`]
-/// builds the spec directly from a [`jammi_wire::request::FineTuneRequest`],
-/// never touching the wire decode.
+/// Two submissions of the SAME `TrainingSpec::FineTune` under `Use` train
+/// once: the first has nothing to reuse and trains for real; the second's
+/// definition hash — the same training-set content, spec, base model and
+/// topology — matches the first's published artifact, so it completes with
+/// its OWN model name referencing the FIRST run's artifact, no metrics, and
+/// a `cache_outcome` naming that artifact. Then the bytes' lifetime: with
+/// the producer's row deleted the reuser still loads; with both gone the
+/// artifact is unreferenced and a reconcile pass may reap it once aged.
 #[tokio::test(flavor = "multi_thread")]
-async fn cache_use_is_refused_at_submit_on_the_embedded_path() {
+async fn cache_use_trains_once_and_two_rows_share_one_artifact_until_both_are_gone() {
     let (session, _dir) = session_with_training_data().await;
 
-    let request = jammi_wire::request::FineTuneRequest {
-        source: "training".into(),
-        base_model: tiny_bert_model(),
-        columns: vec![
-            "text_a".to_string(),
-            "text_b".to_string(),
-            "score".to_string(),
-        ],
-        method: FineTuneMethod::Lora,
-        task: ModelTask::TextEmbedding,
-        config: None,
-        world_size: None,
-        cache: CachePolicy::Use,
+    let (first_model_id, first_trained, first_cache_outcome) =
+        submit_and_run(&session, spec_with_cache(CachePolicy::Use)).await;
+    assert!(
+        first_trained,
+        "the first submission has nothing to reuse and must train for real"
+    );
+    assert_eq!(first_cache_outcome, "computed");
+
+    let (second_model_id, second_trained, second_cache_outcome) =
+        submit_and_run(&session, spec_with_cache(CachePolicy::Use)).await;
+    assert!(
+        !second_trained,
+        "the second submission (an exact definition match) must reuse: no training loop runs"
+    );
+    assert_ne!(
+        first_model_id, second_model_id,
+        "each submission completes under its OWN model name"
+    );
+
+    let catalog = session.catalog();
+    let first = catalog.get_model(&first_model_id).await.unwrap().unwrap();
+    let second = catalog.get_model(&second_model_id).await.unwrap().unwrap();
+    let Some(ModelLocation::Artifact(artifact)) = first.location.clone() else {
+        panic!("a trained model references its artifact: {first:?}");
     };
-    let err = session
-        .submit_fine_tune(request)
-        .await
-        .expect_err("cache = Use must be refused before any row is written");
-    assert!(
-        matches!(&err, JammiError::Config(msg) if msg.contains("model-level cache reuse is not yet supported")),
-        "got {err:?}"
+    assert_eq!(
+        second.location,
+        Some(ModelLocation::Artifact(artifact.clone())),
+        "the reuser's row references the SAME artifact the producer's does"
     );
+    assert_eq!(
+        second_cache_outcome,
+        format!("reused:{artifact}"),
+        "a reuse names the artifact it reused on the job's own result"
+    );
+    let published = catalog
+        .get_model_artifact(&artifact)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(published.state, ArtifactState::Published);
+    assert_eq!(
+        published.input_anchors_json.as_deref(),
+        Some("[]"),
+        "a fine-tune records the empty anchor set: its one input is named by content"
+    );
+    // Both rows serve the same bundle.
+    let store = session.artifact_store();
+    for model in [&first, &second] {
+        store
+            .fetch_artifact(&crate::common::served_bundle_url(model))
+            .await
+            .unwrap();
+    }
 
-    // The refusal leaves no row behind.
-    assert!(
-        session.catalog().list_jobs().await.unwrap().is_empty(),
-        "a refused submit must never write a `jobs` row"
+    // The producer's row goes; the reuser's reference keeps the bytes.
+    catalog
+        .delete_model(&first_model_id, None, false, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog
+            .get_model(&second_model_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .location,
+        Some(ModelLocation::Artifact(artifact.clone()))
+    );
+    let reap = ReconcileOptions {
+        apply: true,
+        grace: Duration::from_secs(3600),
+    };
+    let held = session.result_store().reconcile(reap).await.unwrap();
+    assert_eq!(held.bytes_reclaimed, 0, "{held:?}");
+    store.fetch_artifact(artifact.url()).await.unwrap();
+
+    // Both gone: the artifact is unreferenced. A reconcile pass still holds
+    // it while it is younger than the grace (the only clock the pass reads
+    // is the artifact row's own); the reap of an aged, unreferenced artifact
+    // is `jammi-db`'s `model_reuse` suite's, over a backdated row.
+    catalog
+        .delete_model(&second_model_id, None, false, 0)
+        .await
+        .unwrap();
+    assert!(!catalog
+        .model_artifact_is_referenced(&artifact)
+        .await
+        .unwrap());
+    let young = session.result_store().reconcile(reap).await.unwrap();
+    assert_eq!(
+        young.bytes_reclaimed, 0,
+        "an unreferenced artifact younger than the grace is left alone: {young:?}"
+    );
+    assert_eq!(
+        catalog
+            .get_model_artifact(&artifact)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ArtifactState::Published
     );
 }
 
-/// [`cache_use_is_refused_at_submit_on_the_embedded_path`]'s peer for the
-/// WIRE decode path: a spec decoded off the wire
-/// (`jammi_ai::wire::training_spec_from_bytes`, the same seam the gRPC
-/// handler and the Python binding both drive) reaches the SAME refusal
-/// through [`InferenceSession::run_training_spec`], never a separate
-/// wire-only check.
+/// A reuse hit whose attempt lost its lease before the reusing finalize
+/// writes nothing — no reference, no job status — and the reused model's
+/// bytes are intact. Drives the real worker: the second (reusing)
+/// submission's claim is stolen by a re-claiming worker before the stale
+/// claim reaches its finalize, so its attempt guard necessarily misses. The
+/// legitimate owner then reuses the same artifact.
 #[tokio::test(flavor = "multi_thread")]
-async fn cache_use_is_refused_at_submit_on_a_spec_decoded_off_the_wire() {
+async fn a_lost_lease_on_a_cache_hit_leaves_no_reference_and_the_bytes_intact() {
+    use std::time::Duration;
+
     let (session, _dir) = session_with_training_data().await;
 
-    let spec = spec_with_cache(CachePolicy::Use);
-    let proto = jammi_ai::wire::training_spec_to_proto(&spec);
-    let bytes = prost::Message::encode_to_vec(&proto);
-    let decoded = jammi_ai::wire::training_spec_from_bytes(&bytes)
-        .expect("a well-formed request decodes: the refusal is not a decode-time one");
-
-    let err = session
-        .run_training_spec(decoded)
+    let (first_model_id, first_trained, _) =
+        submit_and_run(&session, spec_with_cache(CachePolicy::Use)).await;
+    assert!(first_trained);
+    let first_before = session
+        .catalog()
+        .get_model(&first_model_id)
         .await
-        .expect_err("cache = Use must be refused before any row is written");
-    assert!(
-        matches!(&err, JammiError::Config(msg) if msg.contains("model-level cache reuse is not yet supported")),
-        "got {err:?}"
+        .unwrap()
+        .expect("the first job's model row must exist");
+    let Some(ModelLocation::Artifact(artifact)) = first_before.location.clone() else {
+        panic!("a trained model references its artifact: {first_before:?}");
+    };
+
+    let job = session
+        .run_training_spec(spec_with_cache(CachePolicy::Use))
+        .await
+        .unwrap();
+    let worker_a = JobWorker::new(&session).expect("default worker intervals are valid");
+    let worker_b = JobWorker::new(&session).expect("default worker intervals are valid");
+
+    // worker-a claims with a zero (already-expired) lease; worker-b reclaims
+    // the expired lease and re-claims under a long one.
+    let stale_claim = session
+        .catalog()
+        .claim_next(worker_a.worker_id(), &["fine_tune"], Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("worker-a claims the queued cache=Use job");
+    let actioned = session
+        .catalog()
+        .reclaim_expired_jobs(Duration::from_secs(60), 5)
+        .await
+        .unwrap();
+    assert_eq!(actioned, 1, "the expired lease is re-queued");
+    let owned = session
+        .catalog()
+        .claim_next(
+            worker_b.worker_id(),
+            &["fine_tune"],
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap()
+        .expect("worker-b re-claims the requeued job");
+
+    // worker-a runs its STALE claim: the probe hits, but the attempt guard
+    // inside the reusing finalize misses, so nothing is written.
+    worker_a.run_claimed_job(&session, stale_claim).await;
+    let after_a = session.catalog().get_job(&job.job_id).await.unwrap();
+    assert_eq!(
+        after_a.status, "running",
+        "a worker that lost its lease must not finalize, even on a cache hit"
     );
+    assert_eq!(after_a.claimed_by.as_deref(), Some(worker_b.worker_id()));
+    assert!(
+        session
+            .catalog()
+            .get_model(&job.model_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the lost attempt attached no row"
+    );
+    let first_after = session
+        .catalog()
+        .get_model(&first_model_id)
+        .await
+        .unwrap()
+        .expect("the reused model's row must still exist");
+    assert_eq!(
+        first_after.location,
+        Some(ModelLocation::Artifact(artifact.clone()))
+    );
+    assert_eq!(
+        session
+            .catalog()
+            .get_model_artifact(&artifact)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ArtifactState::Published
+    );
+    session
+        .artifact_store()
+        .fetch_artifact(artifact.url())
+        .await
+        .expect("the reused artifact's bytes are intact after the lost-lease attempt");
+
+    // The legitimate owner reuses the same artifact.
+    worker_b.run_claimed_job(&session, owned).await;
+    job.wait().await.unwrap();
+    let second = session
+        .catalog()
+        .get_model(&job.model_id)
+        .await
+        .unwrap()
+        .expect("the legitimate owner's model row must exist");
+    assert_eq!(second.location, Some(ModelLocation::Artifact(artifact)));
 }
 
-/// `CachePolicy::Bypass` (the default) never probes: two submissions of the
-/// identical spec both train for real, each under its own name, and (being
-/// real, independent trainer runs) do NOT share a prefix.
+/// `CachePolicy::Bypass` (the default) never probes: with a published
+/// artifact of the identical definition already in the catalog (the first
+/// run, under `Use`), a `Bypass` submission still trains for real, under
+/// its own name, and does NOT share the artifact.
 #[tokio::test(flavor = "multi_thread")]
 async fn cache_bypass_never_reuses() {
     let (session, _dir) = session_with_training_data().await;
 
     let (first_model_id, first_trained, first_cache_outcome) =
-        submit_and_run(&session, spec_with_cache(CachePolicy::Bypass)).await;
+        submit_and_run(&session, spec_with_cache(CachePolicy::Use)).await;
     let (second_model_id, second_trained, second_cache_outcome) =
         submit_and_run(&session, spec_with_cache(CachePolicy::Bypass)).await;
 
     assert!(
         first_trained,
-        "Bypass never probes: the first run must train"
+        "the first run has nothing to reuse and must train"
     );
     assert!(
         second_trained,
@@ -225,7 +395,7 @@ async fn cache_bypass_never_reuses() {
     assert_ne!(
         crate::common::served_bundle_url(&first),
         crate::common::served_bundle_url(&second),
-        "two independent Bypass runs must never share a prefix"
+        "a Bypass run never shares an artifact with an earlier run"
     );
 }
 

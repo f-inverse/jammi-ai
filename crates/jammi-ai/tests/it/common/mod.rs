@@ -607,7 +607,9 @@ pub async fn finalize_fine_tuned_model(
     base_id: &str,
     files: &[(String, bytes::Bytes)],
 ) -> StorageUrl {
-    use jammi_db::catalog::jobs_repo::{FinishJobWithModelParams, ProducedModel, SubmitJobParams};
+    use jammi_db::catalog::jobs_repo::{
+        FinishJobWithModelParams, ModelRow, ProducedModel, SubmitJobParams,
+    };
     use jammi_db::catalog::model_repo::RegisterModelParams;
     use jammi_db::catalog::status::JobExecution;
 
@@ -665,13 +667,15 @@ pub async fn finalize_fine_tuned_model(
             attempts: attempt,
             result: "{}",
             output: ProducedModel {
-                model_id,
-                version: 1,
-                model_type: "fine-tuned",
-                backend: "candle",
-                task: jammi_ai::model::ModelTask::TextEmbedding,
-                base_model_id: Some(base_id),
-                config_json: None,
+                row: ModelRow {
+                    model_id,
+                    version: 1,
+                    model_type: "fine-tuned",
+                    backend: "candle",
+                    task: jammi_ai::model::ModelTask::TextEmbedding,
+                    base_model_id: Some(base_id),
+                    config_json: None,
+                },
                 artifact: staged,
                 materialization: None,
             },

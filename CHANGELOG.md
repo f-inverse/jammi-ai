@@ -6,6 +6,17 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Added
+- **A fine-tune under `cache = Use` reuses an already-published model of the same
+  definition.** Once the training set is materialised, the worker probes for a `published`
+  artifact of the job's definition hash and anchor set — the engine's one reuse predicate
+  (`store::manifest::PinnedAnchors`), own tenant or global — and
+  `Catalog::finish_job_reusing_artifact` completes the job against it in one `Serializable`
+  transaction with the attempt guard and the output row's attach; a miss trains. The job
+  result's `cache_outcome` is `"reused:{artifact}"`; `PlacedOutcome::Reused` reports a placed
+  gang that reused. `ProducedModel` is a `ModelRow` plus its staged artifact. A replay is
+  still always a retrain, and `graph_fine_tune` still refuses `Use`.
+
 ### BREAKING
 - **`InferenceExec` is built by `plan_inference` from an `InferenceSpec` (#540).**
   `InferenceExecBuilder`, `InferenceExec`'s per-field getters, `wrap_with_split_and_merge`,

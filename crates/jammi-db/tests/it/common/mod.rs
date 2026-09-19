@@ -7,7 +7,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use jammi_db::catalog::artifact_repo::{ArtifactRef, StagedArtifact};
 use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
-use jammi_db::catalog::jobs_repo::{ProducedModel, SubmitJobParams};
+use jammi_db::catalog::jobs_repo::{ModelRow, ProducedModel, SubmitJobParams};
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
@@ -153,13 +153,15 @@ pub async fn running_fine_tune_job(
 /// `artifact`.
 pub fn fine_tuned_model(name: &str, artifact: StagedArtifact) -> ProducedModel<'_> {
     ProducedModel {
-        model_id: name,
-        version: 1,
-        model_type: "fine-tuned",
-        backend: "candle",
-        task: ModelTask::TextEmbedding,
-        base_model_id: Some(BASE_MODEL_ID),
-        config_json: None,
+        row: ModelRow {
+            model_id: name,
+            version: 1,
+            model_type: "fine-tuned",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some(BASE_MODEL_ID),
+            config_json: None,
+        },
         artifact,
         materialization: None,
     }

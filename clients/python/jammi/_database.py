@@ -750,11 +750,10 @@ def _job_result_to_dict(resp: job_pb2.JobStatusResponse) -> Dict[str, Any]:
     "model_id", "artifact_path", "metrics", "cache_outcome"}` (`metrics` the
     raw JSON text of the run-summary blob, or `None` when the run recorded
     none — read `RemoteJob.metrics()` for the parsed form; `cache_outcome`
-    is always `"computed"` — model-level cache reuse for a `FineTune` job is
-    refused on every durable submit edge
-    (`jammi_ai::fine_tune::spec::admit_training_spec`), so the
-    `"reused:{model_id}"` form this field's vocabulary reserves is not
-    reachable — the same vocabulary the `table` variant carries). A compute kind's
+    is `"computed"` for a run that trained, or `"reused:{artifact_path}"`
+    for a `cache="use"` job that completed against an already-published
+    model of the same definition — the same vocabulary the `table` variant
+    carries). A compute kind's
     `table` variant projects to `{"kind": "table", "table", "cache_outcome"}`.
     """
     which = resp.WhichOneof("result")
@@ -1740,10 +1739,10 @@ class RemoteDatabase:
         train this job cooperatively; `1` (the default) is a single process, and
         a value below `1` is refused here with
         :class:`jammi.errors.InvalidArgument` rather than submitted. `cache`
-        names model-level cache reuse (``"use"``) as opposed to the engine's
-        default recompute (``"bypass"``, the default when omitted); reuse is
-        not implemented, so ``"use"`` is refused with
-        :class:`jammi.errors.InvalidArgument` and the job is not submitted.
+        names model-level reuse (``"use"``: the worker completes the job
+        against an already-published model of the same definition when one
+        exists, and trains only on a miss) as opposed to the engine's default
+        (``"bypass"``, the default when omitted: always train).
         """
         request = build_fine_tune_request(
             source=source,

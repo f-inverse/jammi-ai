@@ -569,10 +569,10 @@ class EmbeddedBackend:
         number of ranks that train this job cooperatively; `1` (the default) is
         a single process, and a value below `1` is refused here with
         :class:`jammi.errors.InvalidArgument` rather than submitted. `cache`
-        names model-level cache reuse (``"use"``) as opposed to the engine's
-        default recompute (``"bypass"``, the default when omitted); reuse is
-        not implemented, so ``"use"`` is refused with
-        :class:`jammi.errors.InvalidArgument` and the job is not submitted.
+        names model-level reuse (``"use"``: the worker completes the job
+        against an already-published model of the same definition when one
+        exists, and trains only on a miss) as opposed to the engine's default
+        (``"bypass"``, the default when omitted: always train).
         """
         request = build_fine_tune_request(
             source=source,

@@ -200,11 +200,11 @@ async fn start_training_runs_to_completion_over_the_wire() {
     let _ = server.handle.await;
 }
 
-/// End to end: `cache = USE` on a `FineTuneSpec` is refused over the wire —
-/// model-level cache reuse is not supported (the engine refuses it,
-/// typed, before any `jobs` row is written). Pins the SERVER's own
-/// gRPC status mapping (`InvalidArgument`, naming the refusal), not merely
-/// the engine's own `JammiError` ai-core's own suite already covers.
+/// End to end: two `cache = USE` submissions of the same `FineTuneSpec` over
+/// the wire train once. The first completes `computed` with run metrics;
+/// the second completes against the first's published artifact — the SAME
+/// `artifact_path`, no metrics, and a `cache_outcome` naming that artifact —
+/// on the `JobStatusResponse` the server maps the terminal result onto.
 ///
 /// Chosen over `grpc_remote_session.rs` (that file's fixtures own the
 /// embedded/remote session-parity concern, not `JobService`'s own wire
@@ -212,8 +212,9 @@ async fn start_training_runs_to_completion_over_the_wire() {
 /// submit harness (`start_request`) this test only needs to parameterise on
 /// `cache`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_fine_tune_cache_use_submission_is_refused_over_the_wire() {
+async fn a_repeated_fine_tune_cache_use_submission_reuses_over_the_wire() {
     use jammi_server::grpc::proto::inference::CachePolicy;
+    use jammi_server::grpc::proto::job::job_status_response::Result as WireResult;
 
     let server = start_engine_server().await;
     add_training_source(
@@ -223,34 +224,51 @@ async fn a_fine_tune_cache_use_submission_is_refused_over_the_wire() {
     .await;
 
     let mut client = JobServiceClient::new(channel(server.addr).await);
+    let request = || {
+        let mut request = start_request();
+        request.cache = CachePolicy::Use as i32;
+        request
+    };
 
-    let mut request = start_request();
-    request.cache = CachePolicy::Use as i32;
+    let mut completed = Vec::new();
+    for _ in 0..2 {
+        let start = client
+            .submit_job(request())
+            .await
+            .expect("cache = USE is admitted over the wire")
+            .into_inner();
+        let resp = poll_until_terminal(&mut client, &start.job_id).await;
+        assert_eq!(
+            resp.status, "completed",
+            "got '{}' (error: {})",
+            resp.status, resp.error
+        );
+        let Some(WireResult::Model(model)) = resp.result else {
+            panic!("a training kind's terminal result is a model result: {resp:?}");
+        };
+        completed.push(model);
+    }
+    let (first, second) = (&completed[0], &completed[1]);
 
-    let status = client
-        .submit_job(request)
-        .await
-        .expect_err("cache = USE must be refused before any row is written");
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert_eq!(first.cache_outcome, "computed");
     assert!(
-        status
-            .message()
-            .contains("model-level cache reuse is not yet supported"),
-        "the refusal must name why: {}",
-        status.message()
+        first.metrics_json.is_some(),
+        "the first submission trains for real and records metrics"
     );
-
-    // The refusal leaves no `fine_tune` row queued.
-    let listed = client
-        .list_jobs(ListJobsRequest {})
-        .await
-        .expect("list_jobs")
-        .into_inner()
-        .jobs;
+    assert_eq!(
+        second.artifact_path, first.artifact_path,
+        "the second submission reuses the first's published artifact"
+    );
+    assert_eq!(
+        second.cache_outcome,
+        format!("reused:{}", first.artifact_path),
+        "a reuse names the artifact it reused on the wire"
+    );
     assert!(
-        listed.is_empty(),
-        "a refused submit must never write a jobs row: {listed:?}"
+        second.metrics_json.is_none(),
+        "a reused run has no training loop to record metrics"
     );
+    assert_ne!(first.model_id, second.model_id);
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;

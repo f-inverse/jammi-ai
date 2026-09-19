@@ -160,7 +160,7 @@ use jammi_db::sql::{quote_ident, source_relation};
 use jammi_db::store::manifest::{
     ComputeDevice, GraphSampleFields, InputAnchor, ProducingDescriptor,
 };
-use jammi_db::store::{ArtifactStore, TrainingSetInput, TrainingSetSpec};
+use jammi_db::store::{ArtifactStore, CachePolicy, TrainingSetInput, TrainingSetSpec};
 use jammi_db::tenant::TenantId;
 use tokio::sync::watch;
 
@@ -2586,7 +2586,24 @@ impl JobWorker {
         drop(cancel_watcher);
 
         match outcome {
-            Ok(artifact) => {
+            Ok(AttemptOutput::Reused(reused)) => {
+                // The job is already `completed` (the reuse probe's own
+                // transaction wrote the terminal row and the output model's
+                // reference). This attempt staged nothing of its own, but
+                // the job's durable resume checkpoint from an earlier
+                // attempt has no live stager left, exactly as after a won
+                // finalize: the same sweep and the same reclaim.
+                tracing::info!(
+                    job_id = %job_id, worker = %self.worker_id, model_id = %reused.model_id,
+                    artifact = %reused.artifact, "training job completed by reuse"
+                );
+                let store = session.artifact_store();
+                reclaim_unpublished_artifacts(&store, &catalog, &job_id, &self.worker_id, attempt)
+                    .await;
+                reclaim_resume_checkpoint(&store, &catalog, &job_id).await;
+                AttemptEnd::Reused
+            }
+            Ok(AttemptOutput::Trained(artifact)) => {
                 // Computed BEFORE the artifact's directory is handed to
                 // `publish_and_finalize` (which consumes it) — the SAME
                 // bytes a member/an in-process `Peer` rank digests, so
@@ -2594,7 +2611,7 @@ impl JobWorker {
                 // identical digest without a second row read.
                 let digest = adapter_files_digest(artifact.dir.path());
                 match self
-                    .publish_and_finalize(holder, session, &catalog, &job_id, attempt, artifact)
+                    .publish_and_finalize(holder, session, &catalog, &job_id, attempt, *artifact)
                     .await
                 {
                     PublishOutcome::Completed => match digest {
@@ -2762,7 +2779,7 @@ impl JobWorker {
         attempt: u32,
         world: u32,
         submitter: Arc<dyn PlacedGangSubmitter>,
-    ) -> std::result::Result<TrainedArtifact, WorkerJobError> {
+    ) -> std::result::Result<AttemptOutput, WorkerJobError> {
         #[cfg(feature = "test-hooks")]
         training_test_hooks::note_placed(job_id, attempt);
         let descriptor = GangDescriptor {
@@ -2922,12 +2939,13 @@ impl JobWorker {
     /// `ClaimProbe → JobRun` (`HostAdmission::job_running`) itself, so
     /// nothing here duplicates that registration; (iv) maps the body's
     /// `AttemptEnd` to [`PlacedOutcome`] (`Published` → `Trained`;
-    /// `Failed` → `Failed`; `LeftForReclaim` → a typed `Err`, so the
-    /// Ballista task itself ends in error and Ballista's own zero-retry
-    /// policy — `task_max_failures = 0`, README r40 — never re-runs THIS
-    /// task; jammi's own reclaim, from a FUTURE claim, is the only path
-    /// back); (v) releases the slot on every exit arm (the claim guard's
-    /// own `Drop`).
+    /// `Reused` → `Reused`; `Failed` → `Failed`; `LeftForReclaim` → a typed
+    /// `Err`, so the Ballista task itself ends in error and Ballista never
+    /// re-runs it: the scheduler is configured with `task_max_failures = 0`,
+    /// because a re-run would be a second attempt of the same claim, whose
+    /// lease identity the first attempt still holds; jammi's own reclaim,
+    /// from a FUTURE claim, is the only path back); (v) releases the slot on
+    /// every exit arm (the claim guard's own `Drop`).
     pub async fn run_placed_gang(
         session: &Arc<InferenceSession>,
         descriptor: GangDescriptor,
@@ -3017,6 +3035,7 @@ impl JobWorker {
             AttemptEnd::Published { artifact_digest } => {
                 Ok(PlacedOutcome::Trained { artifact_digest })
             }
+            AttemptEnd::Reused => Ok(PlacedOutcome::Reused),
             AttemptEnd::Failed { reason } => Ok(PlacedOutcome::Failed { reason }),
             AttemptEnd::LeftForReclaim => Err(JammiError::FineTune(format!(
                 "run_placed_gang: job '{}' attempt {} left running for reclaim (no terminal \
@@ -3087,7 +3106,7 @@ impl JobWorker {
         // into the bundle, before the finalize; its indexable summary rides
         // the finalize transaction onto the artifact row.
         let summary = match &materialization {
-            Some(FineTuneMaterializationOutcome::Fresh {
+            Some(FineTuneMaterialization {
                 descriptor,
                 env,
                 inputs,
@@ -3148,14 +3167,22 @@ impl JobWorker {
                 instance_id: &self.worker_id,
                 attempts: attempt,
                 result: &result_json,
-                output: register.produced(&register.model_id, staged, summary),
+                output: jammi_db::catalog::jobs_repo::ProducedModel {
+                    row: register.row(&register.model_id),
+                    artifact: staged,
+                    materialization: summary,
+                },
                 epoch_checkpoints: epoch_checkpoints
                     .into_iter()
                     .zip(&epoch_model_ids)
                     .map(|((_epoch, checkpoint), name)| {
                         jammi_db::catalog::jobs_repo::ProducedModel {
-                            config_json: None,
-                            ..register.produced(name, checkpoint, None)
+                            row: jammi_db::catalog::jobs_repo::ModelRow {
+                                config_json: None,
+                                ..register.row(name)
+                            },
+                            artifact: checkpoint,
+                            materialization: None,
                         }
                     })
                     .collect(),
@@ -3164,25 +3191,7 @@ impl JobWorker {
         reclaim_unpublished_artifacts(&store, catalog, job_id, &self.worker_id, attempt).await;
         match finished {
             Ok(true) => {
-                // The job is `completed`, so its durable resume checkpoint
-                // has no live stager left: the winner reclaims it.
-                match store.resume_checkpoint_ref(catalog.current_tenant().as_ref(), job_id) {
-                    Ok(resume) => {
-                        let decision = catalog.begin_artifact_reclaim(&resume).await;
-                        if !settle_reclaim(&store, catalog, &resume, decision).await {
-                            tracing::warn!(
-                                job_id = %job_id,
-                                "the completed job's resume checkpoint was not reclaimed; a \
-                                 reconcile pass reclaims it"
-                            );
-                        }
-                    }
-                    Err(e) => tracing::warn!(
-                        job_id = %job_id,
-                        error = %e,
-                        "could not name the completed job's resume checkpoint"
-                    ),
-                }
+                reclaim_resume_checkpoint(&store, catalog, job_id).await;
                 PublishOutcome::Completed
             }
             Ok(false) => {
@@ -3463,14 +3472,13 @@ impl JobWorker {
         attempt: u32,
         recorded_pair: Option<TrainingSetIdentityPair>,
         holder: LeaseHolder,
-    ) -> std::result::Result<TrainedArtifact, WorkerJobError> {
+    ) -> std::result::Result<AttemptOutput, WorkerJobError> {
         let kind = spec.kind();
         match spec.plan() {
             // Every kind that trains from a training-set table. The kinds
             // differ in ONE step — how the table is produced
             // (`view.producer`); from the table on there is one path, so every
-            // topology serves every such kind. (`FineTune`'s `cache = USE` is
-            // refused at `admit_training_spec`, so nothing here branches on it.)
+            // topology serves every such kind.
             TrainingPlan::FromTrainingSet(view) => {
                 let (columns, task, common) = (view.columns, view.task, view.common.clone());
                 let detected =
@@ -3605,13 +3613,40 @@ impl JobWorker {
                 );
                 #[cfg(feature = "test-hooks")]
                 training_test_hooks::note_topology(job_id, topology);
+                // The model's identity is known BEFORE any rank trains — it
+                // is a function of the training-set table, the spec, the base
+                // model and the topology, all decided above — so a
+                // `CachePolicy::Use` attempt probes for an already-published
+                // model of that identity here, before the gang is assembled
+                // and the trainer spawned. `Bypass` never probes.
+                let materialization = match &materialization_source {
+                    Some(src) => Some(
+                        fine_tune_materialization(session, src, task, &common, topology).await?,
+                    ),
+                    None => None,
+                };
+                if let (CachePolicy::Use, Some(materialization)) = (view.cache, &materialization) {
+                    if let Some(reused) = self
+                        .reuse_published_model(
+                            catalog,
+                            job_id,
+                            attempt,
+                            task,
+                            &common,
+                            materialization,
+                        )
+                        .await?
+                    {
+                        return Ok(AttemptOutput::Reused(reused));
+                    }
+                }
                 let run = FineTuneRun {
                     task,
                     common,
                     source: training_source,
-                    materialization_source,
+                    materialization,
                 };
-                match topology {
+                let trained = match topology {
                     TopologyDecision::Single => {
                         self.train_fine_tune(
                             session,
@@ -3644,7 +3679,8 @@ impl JobWorker {
                         )
                         .await
                     }
-                }
+                };
+                trained.map(|trained| AttemptOutput::Trained(Box::new(trained)))
             }
             TrainingPlan::ContextPredictor {
                 source,
@@ -3677,8 +3713,74 @@ impl JobWorker {
                 session
                     .run_context_predictor_training(source, predictor_spec, cancel)
                     .await
+                    .map(|trained| AttemptOutput::Trained(Box::new(trained)))
                     .map_err(|e| classify(cancel, e))
             }
+        }
+    }
+
+    /// The `CachePolicy::Use` probe: finish this attempt against an
+    /// already-published artifact of `materialization`'s definition, if one
+    /// exists ([`Catalog::finish_job_reusing_artifact`] — the probe, the
+    /// attempt-guarded job CAS and the output row's attach are one
+    /// transaction). `None` is a miss: nothing was written and the attempt
+    /// trains. A hit whose attempt guard did not match wrote nothing either;
+    /// that is a lost lease, so the attempt ends exactly as a training run
+    /// whose lease was lost does.
+    async fn reuse_published_model(
+        &self,
+        catalog: &Arc<Catalog>,
+        job_id: &str,
+        attempt: u32,
+        task: ModelTask,
+        common: &TrainingCommon,
+        materialization: &FineTuneMaterialization,
+    ) -> std::result::Result<Option<ReusedModel>, WorkerJobError> {
+        use jammi_db::catalog::jobs_repo::{FinishJobReusingArtifactParams, ReuseFinish};
+        let model_id = crate::fine_tune::training_job::fine_tuned_model_id(job_id);
+        let definition_hash = materialization
+            .definition_hash()
+            .map_err(WorkerJobError::from)?;
+        let register = ModelRegistration {
+            model_id: model_id.clone(),
+            version: 1,
+            model_type: "fine-tuned",
+            task,
+            base_model_id: Some(common.base_model.clone()),
+            config_json: None,
+        };
+        let result_model_id = model_id.clone();
+        let finish = catalog
+            .finish_job_reusing_artifact(FinishJobReusingArtifactParams {
+                job_id,
+                instance_id: &self.worker_id,
+                attempts: attempt,
+                definition_hash: &definition_hash,
+                inputs: &materialization.inputs,
+                output: register.row(&register.model_id),
+                result: Arc::new(move |artifact| {
+                    Ok(serde_json::to_string(&crate::jobs::JobResult::Model {
+                        model_id: result_model_id.clone(),
+                        artifact_path: artifact.to_string(),
+                        metrics: None,
+                        cache_outcome: format!("reused:{artifact}"),
+                    })?)
+                }),
+            })
+            .await
+            .map_err(WorkerJobError::from)?;
+        match finish {
+            ReuseFinish::Reused(artifact) => {
+                tracing::info!(
+                    job_id = %job_id,
+                    worker = %self.worker_id,
+                    %artifact,
+                    "fine-tune completed by reusing a published artifact of the same definition"
+                );
+                Ok(Some(ReusedModel { model_id, artifact }))
+            }
+            ReuseFinish::Miss => Ok(None),
+            ReuseFinish::LostLease => Err(WorkerJobError::Cancelled),
         }
     }
 
@@ -3718,7 +3820,7 @@ impl JobWorker {
             task,
             common,
             source: training_source,
-            materialization_source,
+            materialization,
         } = run;
         let output_model_id = crate::fine_tune::training_job::fine_tuned_model_id(job_id);
         let model_source = ModelSource::parse(&common.base_model);
@@ -3735,126 +3837,6 @@ impl JobWorker {
         let hidden_size = guard.model.embedding_dim().ok_or_else(|| {
             WorkerJobError::Failed("Base model does not support embeddings".into())
         })?;
-
-        // The `ProducingDescriptor::FineTune` materialization identity is
-        // built HERE, while the model guard is still held (the identity needs
-        // the loaded model's backend/precision/digest/quantization — the SAME
-        // uniform path `pipeline::embedding`'s `embedding_definition` already
-        // uses for the model it invokes).
-        let mut pending_materialization: Option<FineTuneMaterializationOutcome> = None;
-        if let Some(src) = &materialization_source {
-            let canonical_model_id = model_source.to_string();
-            let device = session.compute_device();
-            // The fused-kernel admission profile is folded HERE,
-            // ex ante — before training runs, alongside every other
-            // materialization fact. It is never an OBSERVED per-op dispatch
-            // outcome read after training: a `DefinitionHash` is what a lookup
-            // for already-existing work is keyed on, BEFORE the work runs, so
-            // a value knowable only after training would make that lookup
-            // impossible for the very run it describes — see
-            // `jammi_kernels::admission::render_kernel_admission_profile`'s
-            // own doc. Every fact folded below
-            // is EX ANTE and by construction: this crate's own compiled
-            // features (`jammi_kernels::admission::BUILD_FACTS`), the
-            // process's `admission_mode()`, the `JAMMI_KERNELS_DISABLE` set
-            // (`disabled_ops_requested()`), and this job's backbone dtype
-            // class.
-            //
-            // The dtype passed below must be `common.config.backbone_dtype`
-            // — the SAME value `probe_acceleration`'s own
-            // `dtype_class_of(backbone_dtype)` call resolves the acceleration
-            // report's dtype class from — never
-            // `guard.model.compute_precision()` (the loaded model's own
-            // ON-DISK weight dtype, a DIFFERENT axis: the trainer's
-            // `VarBuilder` and LoRA adapters are always `F32` regardless of
-            // `backbone_dtype`, and `guard.model` can be loaded at `F32`
-            // while `backbone_dtype` casts the forward activations to
-            // `Bf16`/`F16`). Passing the loaded model's own precision here
-            // instead renders an f16-backbone CPU job's profile at
-            // `dtype_class=F32` (tiny_bert's own fixture loads at F32 on
-            // disk), so `cast_scale`/`cast_add` read `n/a` and
-            // `JAMMI_KERNELS_DISABLE=cast_scale_f16_f32` never moves that
-            // job's `DefinitionHash` at all.
-            let kernel_admission_profile =
-                jammi_kernels::admission::render_kernel_admission_profile(
-                    dtype_class_of(common.config.backbone_dtype),
-                    jammi_kernels::admission::admission_mode(),
-                    &jammi_kernels::admission::disabled_ops_requested(),
-                );
-            let env = jammi_db::store::manifest::MaterializationEnv::new(
-                device.clone(),
-                vec![jammi_db::store::manifest::ModelIdentity {
-                    model_id: canonical_model_id.clone(),
-                    backend: guard.model.backend_kind().to_string(),
-                    compute_precision: guard.model.compute_precision(),
-                    content_digest: guard.model.content_digest().map_err(WorkerJobError::from)?,
-                    quantization: guard.model.quantization(),
-                }],
-            )
-            .with_kernel_admission_profile(kernel_admission_profile);
-            let spec_canonical = crate::fine_tune::spec::fine_tune_spec_canonical(
-                &src.source,
-                &src.columns,
-                src.method,
-                task,
-                &common.base_model,
-                &common.config,
-                common.world_size,
-            )
-            .map_err(WorkerJobError::from)?;
-            let descriptor = jammi_db::store::manifest::ProducingDescriptor::FineTune {
-                training_set_definition_hash: src.training_set_definition_hash.clone(),
-                training_set_artifact_digest: src.training_set_artifact_digest.clone(),
-                training_set_row_count: src.training_set_row_count,
-                spec_canonical,
-                spec_schema_version: crate::fine_tune::spec::FINE_TUNE_SPEC_SCHEMA_VERSION,
-                base_model_id: canonical_model_id,
-                world_size: common.world_size,
-                // The topology THIS run executes at —
-                // the collective it reduces over and the ranks this host
-                // runs — read off the decided `topology`, never off the
-                // `[worker]` selection (`auto` resolves differently on
-                // different hosts, and `[worker] local_ranks` is a capacity,
-                // not what the run used); recorded alongside (never instead
-                // of) the job's own declared `world_size` above.
-                collective: topology.collective_token().to_string(),
-                local_ranks: topology.host_ranks(),
-            };
-            // NO input anchor is recorded for the `FineTune` materialization:
-            // one would be both a FALSE ATTESTATION and REDUNDANT.
-            //
-            // False attestation: an anchor would pair the fine-tune's own
-            // registered SOURCE name (`src.source`, e.g. `"training"` — a
-            // long-lived, mutable relation) with the training-set TABLE's
-            // digest (an ephemeral, single-use materialization
-            // `materialize_projection` never reuses across calls; anchoring
-            // on the table's own fresh, never-repeating name would defeat
-            // reuse). `AnchorKind::ResultDigest`'s semantics
-            // (`crate::pipeline::recompute::reresolve_recorded_anchor`) are
-            // "resolve `source` as a `result_tables` row and pin its
-            // CURRENT digest" — `src.source` is not that table, so a
-            // resolver that read this anchor would pin the wrong
-            // relation's current state under the training-set table's old
-            // digest.
-            //
-            // Redundant: nothing above needs the anchor to DISCRIMINATE.
-            // `ProducingDescriptor::FineTune::training_set_artifact_digest`
-            // (already folded into `descriptor`) is the SAME digest such an
-            // anchor would carry — two fine-tunes over different
-            // training-set content already hash differently without an
-            // anchor's help. And no CONSUMER ever reads a FineTune-recorded
-            // anchor: the model-kind's OWN replay policy is retrain
-            // (`recompute_fine_tune`), which never reads a recorded anchor at
-            // all — `reresolve_recorded_anchor` is reached only from the
-            // TrainingSet-table replay arm, over THAT table's own
-            // separately-recorded anchors, never these.
-            let inputs: Vec<jammi_db::store::manifest::InputAnchor> = Vec::new();
-            pending_materialization = Some(FineTuneMaterializationOutcome::Fresh {
-                descriptor: Box::new(descriptor),
-                env,
-                inputs,
-            });
-        }
         drop(guard);
 
         // Test hook: a no-op in production (the whole call
@@ -4125,7 +4107,7 @@ impl JobWorker {
             },
             metrics: Some(training.metrics_json),
             epoch_checkpoints: training.epoch_checkpoints,
-            materialization: pending_materialization,
+            materialization,
         })
     }
 }
@@ -5242,10 +5224,10 @@ struct FineTuneRun {
     /// [`crate::fine_tune::source::TrainingSource::Resident`] loader or a
     /// [`crate::fine_tune::source::TrainingSource::Streamed`] source.
     source: crate::fine_tune::source::TrainingSource,
-    /// Set ONLY for the column-source `TrainingSpec::FineTune` kind — see
-    /// [`FineTuneMaterializationSource`]'s own doc for why `GraphFineTune`
-    /// carries `None` here.
-    materialization_source: Option<FineTuneMaterializationSource>,
+    /// The identity of the model this run produces, for the kind with a
+    /// materialization contract — see [`FineTuneMaterializationSource`]'s
+    /// own doc for why `GraphFineTune` carries `None` here.
+    materialization: Option<FineTuneMaterialization>,
 }
 
 /// The `ProducingDescriptor::FineTune`-specific inputs a `TrainingSpec::FineTune`
@@ -5274,19 +5256,171 @@ struct FineTuneMaterializationSource {
     training_set_row_count: u64,
 }
 
-/// What [`JobWorker::publish_and_finalize`] does with a `TrainingSpec::FineTune`
-/// run's materialization identity, built by [`JobWorker::train_fine_tune`]
-/// before the trainer runs.
-pub(crate) enum FineTuneMaterializationOutcome {
-    /// A FRESH training run: after the worker publishes this attempt's new
-    /// prefix, `materialization.json` is written LAST (before the finalize
-    /// CAS) from this descriptor + environment + input anchors, and recorded
-    /// on the model row.
-    Fresh {
-        descriptor: Box<jammi_db::store::manifest::ProducingDescriptor>,
-        env: jammi_db::store::manifest::MaterializationEnv,
-        inputs: Vec<jammi_db::store::manifest::InputAnchor>,
-    },
+/// A `TrainingSpec::FineTune` run's materialization identity — the
+/// `ProducingDescriptor::FineTune` descriptor, the environment and the input
+/// anchors — built by [`fine_tune_materialization`] BEFORE the trainer runs.
+/// Under `CachePolicy::Use` its definition hash is what the reuse probe
+/// ([`JobWorker::reuse_published_model`]) looks up; on a fresh run the
+/// worker writes `materialization.json` from it LAST into the published
+/// bundle (before the finalize CAS) and records its summary on the artifact
+/// row.
+pub(crate) struct FineTuneMaterialization {
+    descriptor: Box<jammi_db::store::manifest::ProducingDescriptor>,
+    env: jammi_db::store::manifest::MaterializationEnv,
+    inputs: Vec<jammi_db::store::manifest::InputAnchor>,
+}
+
+impl FineTuneMaterialization {
+    /// The definition hash a run of this identity records — the same fold
+    /// the published manifest carries, so a probe keyed on it matches
+    /// exactly the bundles a fresh run would have produced.
+    fn definition_hash(&self) -> Result<jammi_db::store::manifest::DefinitionHash> {
+        jammi_db::store::manifest::MaterializationManifest::definition_of(
+            &self.descriptor,
+            &self.env,
+        )
+        .map_err(jammi_db::store::manifest_to_jammi)
+    }
+}
+
+/// Build a `TrainingSpec::FineTune` run's materialization identity from the
+/// materialised training set (`src`), the spec's task and common knobs, and
+/// the topology the run will execute at — while holding the base model's
+/// cache guard, because the identity folds the loaded model's
+/// backend/precision/digest/quantization (the SAME uniform path
+/// `pipeline::embedding`'s `embedding_definition` uses for the model it
+/// invokes).
+///
+/// The fused-kernel admission profile is folded HERE, ex ante — before
+/// training runs, alongside every other materialization fact. It is never an
+/// OBSERVED per-op dispatch outcome read after training: a `DefinitionHash`
+/// is what a lookup for already-existing work is keyed on, BEFORE the work
+/// runs, so a value knowable only after training would make that lookup
+/// impossible for the very run it describes — see
+/// `jammi_kernels::admission::render_kernel_admission_profile`'s own doc.
+/// Every fact folded is EX ANTE and by construction: this crate's own
+/// compiled features (`jammi_kernels::admission::BUILD_FACTS`), the process's
+/// `admission_mode()`, the `JAMMI_KERNELS_DISABLE` set
+/// (`disabled_ops_requested()`), and this job's backbone dtype class.
+///
+/// The dtype folded is `common.config.backbone_dtype` — the SAME value
+/// `probe_acceleration`'s own `dtype_class_of(backbone_dtype)` call resolves
+/// the acceleration report's dtype class from — never
+/// `guard.model.compute_precision()` (the loaded model's own ON-DISK weight
+/// dtype, a DIFFERENT axis: the trainer's `VarBuilder` and LoRA adapters are
+/// always `F32` regardless of `backbone_dtype`, and `guard.model` can be
+/// loaded at `F32` while `backbone_dtype` casts the forward activations to
+/// `Bf16`/`F16`). Passing the loaded model's own precision instead renders an
+/// f16-backbone CPU job's profile at `dtype_class=F32` (tiny_bert's own
+/// fixture loads at F32 on disk), so `cast_scale`/`cast_add` read `n/a` and
+/// `JAMMI_KERNELS_DISABLE=cast_scale_f16_f32` never moves that job's
+/// `DefinitionHash` at all.
+///
+/// NO input anchor is recorded for the `FineTune` materialization: one would
+/// be both a FALSE ATTESTATION and REDUNDANT.
+///
+/// False attestation: an anchor would pair the fine-tune's own registered
+/// SOURCE name (`src.source`, e.g. `"training"` — a long-lived, mutable
+/// relation) with the training-set TABLE's digest (an ephemeral, single-use
+/// materialization `materialize_projection` never reuses across calls;
+/// anchoring on the table's own fresh, never-repeating name would defeat
+/// reuse). `AnchorKind::ResultDigest`'s semantics
+/// (`crate::pipeline::recompute::reresolve_recorded_anchor`) are "resolve
+/// `source` as a `result_tables` row and pin its CURRENT digest" —
+/// `src.source` is not that table, so a resolver that read this anchor would
+/// pin the wrong relation's current state under the training-set table's old
+/// digest.
+///
+/// Redundant: nothing needs the anchor to DISCRIMINATE.
+/// `ProducingDescriptor::FineTune::training_set_artifact_digest` (folded into
+/// the descriptor) is the SAME digest such an anchor would carry — two
+/// fine-tunes over different training-set content already hash differently
+/// without an anchor's help — and it is what makes the empty anchor set an
+/// honest, PINNED request: the model's one input is named by content, so an
+/// equal definition hash proves equal inputs. No CONSUMER ever reads a
+/// FineTune-recorded anchor either: the model-kind's OWN replay policy is
+/// retrain (`recompute_fine_tune`), which never reads a recorded anchor at
+/// all — `reresolve_recorded_anchor` is reached only from the TrainingSet-
+/// table replay arm, over THAT table's own separately-recorded anchors.
+async fn fine_tune_materialization(
+    session: &Arc<InferenceSession>,
+    src: &FineTuneMaterializationSource,
+    task: ModelTask,
+    common: &TrainingCommon,
+    topology: TopologyDecision,
+) -> std::result::Result<FineTuneMaterialization, WorkerJobError> {
+    let model_source = ModelSource::parse(&common.base_model);
+    let guard = session
+        .model_cache()
+        .get_or_load(&model_source, task, None)
+        .await
+        .map_err(WorkerJobError::from)?;
+    let canonical_model_id = model_source.to_string();
+    let kernel_admission_profile = jammi_kernels::admission::render_kernel_admission_profile(
+        dtype_class_of(common.config.backbone_dtype),
+        jammi_kernels::admission::admission_mode(),
+        &jammi_kernels::admission::disabled_ops_requested(),
+    );
+    let env = jammi_db::store::manifest::MaterializationEnv::new(
+        session.compute_device(),
+        vec![jammi_db::store::manifest::ModelIdentity {
+            model_id: canonical_model_id.clone(),
+            backend: guard.model.backend_kind().to_string(),
+            compute_precision: guard.model.compute_precision(),
+            content_digest: guard.model.content_digest().map_err(WorkerJobError::from)?,
+            quantization: guard.model.quantization(),
+        }],
+    )
+    .with_kernel_admission_profile(kernel_admission_profile);
+    let spec_canonical = crate::fine_tune::spec::fine_tune_spec_canonical(
+        &src.source,
+        &src.columns,
+        src.method,
+        task,
+        &common.base_model,
+        &common.config,
+        common.world_size,
+    )
+    .map_err(WorkerJobError::from)?;
+    let descriptor = jammi_db::store::manifest::ProducingDescriptor::FineTune {
+        training_set_definition_hash: src.training_set_definition_hash.clone(),
+        training_set_artifact_digest: src.training_set_artifact_digest.clone(),
+        training_set_row_count: src.training_set_row_count,
+        spec_canonical,
+        spec_schema_version: crate::fine_tune::spec::FINE_TUNE_SPEC_SCHEMA_VERSION,
+        base_model_id: canonical_model_id,
+        world_size: common.world_size,
+        // The topology THIS run executes at — the collective it reduces
+        // over and the ranks this host runs — read off the decided
+        // `topology`, never off the `[worker]` selection (`auto` resolves
+        // differently on different hosts, and `[worker] local_ranks` is a
+        // capacity, not what the run used); recorded alongside (never
+        // instead of) the job's own declared `world_size` above.
+        collective: topology.collective_token().to_string(),
+        local_ranks: topology.host_ranks(),
+    };
+    Ok(FineTuneMaterialization {
+        descriptor: Box::new(descriptor),
+        env,
+        inputs: Vec::new(),
+    })
+}
+
+/// A completed attempt that trained nothing: its output model row references
+/// an artifact another job published under the same definition. It holds the
+/// artifact's reference only — never a claim on its bytes.
+struct ReusedModel {
+    model_id: String,
+    artifact: jammi_db::catalog::artifact_repo::ArtifactRef,
+}
+
+/// What one attempt of [`JobWorker::run_spec`] produced.
+enum AttemptOutput {
+    /// A trained bundle awaiting the worker's publish-and-finalize.
+    Trained(Box<TrainedArtifact>),
+    /// The attempt is already `completed`: the reuse probe hit and the same
+    /// transaction attached the output model to the published artifact.
+    Reused(ReusedModel),
 }
 
 /// A successful training run's output, awaiting the worker's unified
@@ -5322,7 +5456,7 @@ pub struct TrainedArtifact {
     /// `Some` for a `TrainingSpec::FineTune` run only (never `GraphFineTune`
     /// or a context predictor) — the model-level materialization
     /// [`JobWorker::publish_and_finalize`] writes/records.
-    pub(crate) materialization: Option<FineTuneMaterializationOutcome>,
+    pub(crate) materialization: Option<FineTuneMaterialization>,
 }
 
 // ── The gang's topology and the coordinator body ───────────────────────────
@@ -5363,18 +5497,7 @@ impl TopologyDecision {
             Self::Peer { world: world_size }
         }
     }
-}
 
-/// [`TopologyDecision`] with what `train_fine_tune` needs to spawn it: for
-/// a `Peer` gang, the coordinator's collective — built by the coordinator
-/// body over the members it dialed, BEFORE the blocking trainer starts.
-enum RankTopology {
-    Single,
-    Local { world: u32 },
-    Peer { world: u32, coordinator: Arc<Peer> },
-}
-
-impl RankTopology {
     /// The canonical token `ProducingDescriptor::FineTune::collective`
     /// records: the collective THIS run reduces over (`Single` runs the
     /// gang-of-one `Noop`, `Local` the in-process `LocalGang`, `Peer` the
@@ -5382,7 +5505,7 @@ impl RankTopology {
     /// a total function of the decided topology, so the manifest names what
     /// the run used rather than the `[worker] collective` selection it was
     /// configured with.
-    fn collective_token(&self) -> &'static str {
+    fn collective_token(self) -> &'static str {
         match self {
             Self::Single => "noop",
             Self::Local { .. } => "local",
@@ -5394,12 +5517,21 @@ impl RankTopology {
     /// `ProducingDescriptor::FineTune::local_ranks`: one for `Single`, the
     /// whole gang for an in-process `Local` gang, and one (rank 0, the
     /// coordinator) for a `Peer` gang whose other ranks live on other hosts.
-    fn host_ranks(&self) -> u32 {
+    fn host_ranks(self) -> u32 {
         match self {
             Self::Single | Self::Peer { .. } => 1,
-            Self::Local { world } => *world,
+            Self::Local { world } => world,
         }
     }
+}
+
+/// [`TopologyDecision`] with what `train_fine_tune` needs to spawn it: for
+/// a `Peer` gang, the coordinator's collective — built by the coordinator
+/// body over the members it dialed, BEFORE the blocking trainer starts.
+enum RankTopology {
+    Single,
+    Local { world: u32 },
+    Peer { world: u32, coordinator: Arc<Peer> },
 }
 
 /// The training-set identity pair the coordinator writes onto the job row
@@ -6663,15 +6795,10 @@ pub struct ModelRegistration {
 }
 
 impl ModelRegistration {
-    /// The `models` row the finalize writes for this registration under
-    /// `name`, attached to `artifact`.
-    fn produced<'a>(
-        &'a self,
-        name: &'a str,
-        artifact: StagedArtifact,
-        materialization: Option<MaterializationSummary>,
-    ) -> jammi_db::catalog::jobs_repo::ProducedModel<'a> {
-        jammi_db::catalog::jobs_repo::ProducedModel {
+    /// The `models` row a finalize writes for this registration under
+    /// `name`.
+    fn row<'a>(&'a self, name: &'a str) -> jammi_db::catalog::jobs_repo::ModelRow<'a> {
+        jammi_db::catalog::jobs_repo::ModelRow {
             model_id: name,
             version: self.version,
             model_type: self.model_type,
@@ -6679,8 +6806,6 @@ impl ModelRegistration {
             task: self.task,
             base_model_id: self.base_model_id.as_deref(),
             config_json: self.config_json.as_deref(),
-            artifact,
-            materialization,
         }
     }
 }
@@ -6783,6 +6908,29 @@ async fn reclaim_unpublished_artifacts(
     }
 }
 
+/// The job is `completed`, so its durable resume checkpoint has no live
+/// stager left: the finisher reclaims it. Best-effort like the sweep — a
+/// refusal or failure leaves it for a reconcile pass.
+async fn reclaim_resume_checkpoint(store: &ArtifactStore, catalog: &Catalog, job_id: &str) {
+    match store.resume_checkpoint_ref(catalog.current_tenant().as_ref(), job_id) {
+        Ok(resume) => {
+            let decision = catalog.begin_artifact_reclaim(&resume).await;
+            if !settle_reclaim(store, catalog, &resume, decision).await {
+                tracing::warn!(
+                    job_id = %job_id,
+                    "the completed job's resume checkpoint was not reclaimed; a reconcile \
+                     pass reclaims it"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            job_id = %job_id,
+            error = %e,
+            "could not name the completed job's resume checkpoint"
+        ),
+    }
+}
+
 /// Act on a reclaim compare-and-set's `decision` for `artifact`: delete its
 /// bytes under the licence. Returns whether the artifact is settled — its
 /// bytes reclaimed, or nothing of it left to reclaim. A refusal (a `models`
@@ -6839,6 +6987,9 @@ enum AttemptEnd {
     /// (`adapter_files_digest`, computed over the SAME directory
     /// `publish_and_finalize` just uploaded from).
     Published { artifact_digest: String },
+    /// The attempt completed by reusing a published artifact: no bytes of
+    /// its own, so no digest of its own.
+    Reused,
     /// A terminal unsuccessful status (`failed`, or `cancelled` for an
     /// honoured cancel) was recorded, with this reason.
     Failed { reason: String },
@@ -9795,39 +9946,20 @@ mod tests {
         );
     }
 
-    /// The manifest's topology determinants name what the run EXECUTED at,
-    /// as a total function of the decided `RankTopology` — never the
-    /// `[worker]` selection: `Single` is the gang-of-one `Noop` on one
-    /// rank, `Local { world }` is the in-process gang with every rank on
-    /// this host, and `Peer { world }` is rank 0 alone on this host over
-    /// the coordinator's collective. Every arm is sampled; the match in
-    /// each method is exhaustive, so a new variant fails to compile before
-    /// it can record the wrong token. (A tokio test: a `CoordinatorLink`
-    /// binds the runtime its stream lives on at construction.)
-    #[tokio::test]
-    async fn rank_topology_records_the_executed_collective_and_host_ranks() {
-        let (_c_out_tx, c_out_rx) = tokio::sync::mpsc::channel(4);
-        let (c_in_tx, _c_in_rx) = tokio::sync::mpsc::channel(4);
-        let link = CoordinatorLink::from_channels(1, c_out_rx, c_in_tx).expect("link");
-        let coordinator = Arc::new(
-            Peer::coordinator(vec![link], candle_core::Device::Cpu, 1 << 20)
-                .expect("a one-member coordinator"),
-        );
+    /// The materialization descriptor's `collective`/`local_ranks` name the
+    /// topology the run EXECUTES at, and the table is total: each method is
+    /// exhaustive, so a new variant fails to compile before it can record
+    /// the wrong token.
+    #[test]
+    fn topology_records_the_executed_collective_and_host_ranks() {
         let samples = [
-            (RankTopology::Single, "noop", 1),
-            (RankTopology::Local { world: 3 }, "local", 3),
-            (
-                RankTopology::Peer {
-                    world: 2,
-                    coordinator,
-                },
-                "peer",
-                1,
-            ),
+            (TopologyDecision::Single, "noop", 1),
+            (TopologyDecision::Local { world: 3 }, "local", 3),
+            (TopologyDecision::Peer { world: 2 }, "peer", 1),
         ];
-        for (topology, token, ranks) in &samples {
-            assert_eq!(topology.collective_token(), *token);
-            assert_eq!(topology.host_ranks(), *ranks);
+        for (topology, token, ranks) in samples {
+            assert_eq!(topology.collective_token(), token);
+            assert_eq!(topology.host_ranks(), ranks);
         }
         // Non-degeneracy: the three arms are pairwise distinct on the
         // token, so a collapsed match could not pass.
@@ -12021,8 +12153,16 @@ mod tests {
                 instance_id: worker,
                 attempts: attempt,
                 result: "{}",
-                output: registration.produced(&name, output, None),
-                epoch_checkpoints: vec![registration.produced(&retained_name, retained, None)],
+                output: jammi_db::catalog::jobs_repo::ProducedModel {
+                    row: registration.row(&name),
+                    artifact: output,
+                    materialization: None,
+                },
+                epoch_checkpoints: vec![jammi_db::catalog::jobs_repo::ProducedModel {
+                    row: registration.row(&retained_name),
+                    artifact: retained,
+                    materialization: None,
+                }],
             })
             .await
             .unwrap());

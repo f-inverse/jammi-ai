@@ -525,7 +525,7 @@ async fn remote_reconcile_reports_like_local() {
         .engine
         .with_tenant_scoped(tenant_a(), |_scope| async {
             use jammi_db::catalog::jobs_repo::{
-                FinishJobWithModelParams, ProducedModel, SubmitJobParams,
+                FinishJobWithModelParams, ModelRow, ProducedModel, SubmitJobParams,
             };
             // Claimed as the engine's own live instance: an inline job whose
             // claimant has no live `instances` row is failed by the reclaim
@@ -596,13 +596,15 @@ async fn remote_reconcile_reports_like_local() {
                     attempts: attempt,
                     result: "{}",
                     output: ProducedModel {
-                        model_id: "damaged-wire-model",
-                        version: 1,
-                        model_type: "fine-tuned",
-                        backend: "candle",
-                        task: ModelTask::TextEmbedding,
-                        base_model_id: Some("wire-base-model"),
-                        config_json: None,
+                        row: ModelRow {
+                            model_id: "damaged-wire-model",
+                            version: 1,
+                            model_type: "fine-tuned",
+                            backend: "candle",
+                            task: ModelTask::TextEmbedding,
+                            base_model_id: Some("wire-base-model"),
+                            config_json: None,
+                        },
                         artifact: staged,
                         materialization: None,
                     },

@@ -2034,8 +2034,8 @@ impl InferenceSession {
         spec: TrainingSpec,
         idempotency_key: Option<&str>,
     ) -> Result<TrainingJob> {
-        // The ONE admission (per-kind validation, rank admission, the
-        // `cache = Use` refusal) is applied HERE, before anything durable
+        // The ONE admission (per-kind validation, rank admission) is
+        // applied HERE, before anything durable
         // exists: this method is one of the durable submit edges for a
         // training spec, so every entry path that reaches it —
         // [`Self::fine_tune`], [`Self::fine_tune_graph`],

@@ -931,7 +931,7 @@ mod tests {
         }
     }
 
-    /// r26: a context-predictor job is refused above one rank at the LAST
+    /// A context-predictor job is refused above one rank at the LAST
     /// edge that can still see the count — the engine's
     /// `TrainingSpec::ContextPredictor` has no `TrainingCommon` and therefore
     /// no field to carry it, so a count that got past this decode would be

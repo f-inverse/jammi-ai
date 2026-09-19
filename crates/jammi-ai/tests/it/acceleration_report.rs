@@ -34,7 +34,9 @@ use jammi_ai::fine_tune::worker::EmbeddedWorker;
 use jammi_ai::fine_tune::{ComputePrecision, FineTuneConfig, FineTuneMethod, LrSchedule};
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
-use jammi_db::catalog::jobs_repo::{FinishJobWithModelParams, ProducedModel, SubmitJobParams};
+use jammi_db::catalog::jobs_repo::{
+    FinishJobWithModelParams, ModelRow, ProducedModel, SubmitJobParams,
+};
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
@@ -1700,13 +1702,15 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
                     attempts,
                     result: &result,
                     output: ProducedModel {
-                        model_id: &output_name,
-                        version: 1,
-                        model_type: "fine-tuned",
-                        backend: "candle",
-                        task: ModelTask::TextEmbedding,
-                        base_model_id: None,
-                        config_json: None,
+                        row: ModelRow {
+                            model_id: &output_name,
+                            version: 1,
+                            model_type: "fine-tuned",
+                            backend: "candle",
+                            task: ModelTask::TextEmbedding,
+                            base_model_id: None,
+                            config_json: None,
+                        },
                         artifact: staged,
                         materialization: None,
                     },

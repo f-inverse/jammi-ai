@@ -12739,7 +12739,9 @@ mod epoch_checkpoint_retention_isolation {
         catalog_and_store, checkpointing_loop, epoch_indices,
     };
     use jammi_db::catalog::artifact_repo::{ArtifactRef, StagedArtifact};
-    use jammi_db::catalog::jobs_repo::{FinishJobWithModelParams, ProducedModel, SubmitJobParams};
+    use jammi_db::catalog::jobs_repo::{
+        FinishJobWithModelParams, ModelRow, ProducedModel, SubmitJobParams,
+    };
     use jammi_db::catalog::model_repo::{ModelLocation, RegisterModelParams};
     use jammi_db::catalog::status::{ArtifactState, JobExecution};
     use jammi_db::catalog::Catalog;
@@ -12786,13 +12788,15 @@ mod epoch_checkpoint_retention_isolation {
 
     fn produced(name: &str, artifact: StagedArtifact) -> ProducedModel<'_> {
         ProducedModel {
-            model_id: name,
-            version: 1,
-            model_type: "fine-tuned",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: Some("retention-base"),
-            config_json: None,
+            row: ModelRow {
+                model_id: name,
+                version: 1,
+                model_type: "fine-tuned",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: Some("retention-base"),
+                config_json: None,
+            },
             artifact,
             materialization: None,
         }

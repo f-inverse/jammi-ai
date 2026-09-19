@@ -78,6 +78,10 @@ pub enum PlacedOutcome {
     /// The attempt published `completed`; this is the SAME digest a member
     /// or an in-process `Peer` run would report (`adapter_files_digest`).
     Trained { artifact_digest: String },
+    /// The attempt completed by reusing an already-published artifact of the
+    /// same definition: no rank trained and no bytes were written, so there
+    /// is no digest of this attempt's own.
+    Reused,
     /// The attempt recorded a terminal `failed`, with this reason — a
     /// SUCCESSFUL run of the coordinator body that decided the job itself
     /// did not train, never a Ballista task fault.
@@ -204,6 +208,11 @@ impl ExecutionPlan for GangExec {
             match runner.run(descriptor).await {
                 Ok(super::gang_exec::PlacedOutcome::Trained { artifact_digest }) => {
                     let batch = outcome_batch(&schema, "trained", Some(&artifact_digest))?;
+                    tx.send(Ok(batch)).await.ok();
+                    Ok(())
+                }
+                Ok(super::gang_exec::PlacedOutcome::Reused) => {
+                    let batch = outcome_batch(&schema, "reused", None)?;
                     tx.send(Ok(batch)).await.ok();
                     Ok(())
                 }

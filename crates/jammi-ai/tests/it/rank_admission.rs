@@ -235,12 +235,13 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
     );
 }
 
-/// `cache = Use` on `TrainingSpec::FineTune` is refused on BOTH embedded
-/// submit entrances, not just the per-verb one: `InferenceSession::enqueue`
-/// takes an already-built spec, bypassing every per-verb entry point, and
-/// must still refuse it before writing a row.
+/// `cache = Use` on `TrainingSpec::FineTune` is admitted on BOTH embedded
+/// submit entrances — the per-verb funnel and the generic
+/// `InferenceSession::enqueue`, which takes an already-built spec — and the
+/// persisted row carries the policy the caller chose: the probe it names
+/// runs on the worker, never at submit.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_fine_tune_cache_use_is_refused_through_enqueue_too() {
+async fn a_fine_tune_cache_use_is_admitted_through_both_entrances() {
     let (session, _dir) = session_with_serveable_world(1).await;
     let before = job_count(&session).await;
 
@@ -260,33 +261,23 @@ async fn a_fine_tune_cache_use_is_refused_through_enqueue_too() {
     let per_verb = session
         .run_training_spec(spec.clone())
         .await
-        .expect_err("cache = Use must be refused through the per-verb funnel");
-    assert!(
-        matches!(per_verb, JammiError::Config(_)),
-        "the refusal must be typed, got {per_verb:?}"
-    );
-
-    let generic = match session.enqueue(JobSpec::from(spec), 0).await {
-        Ok(handle) => panic!(
-            "the generic enqueue entrance admitted a cache=Use job {}",
-            handle.job_id
-        ),
-        Err(e) => e,
-    };
-    assert!(
-        matches!(generic, JammiError::Config(_)),
-        "the generic entrance must refuse the same way, got {generic:?}"
-    );
-    assert_eq!(
-        generic.to_string(),
-        per_verb.to_string(),
-        "one rule, one message, whichever entrance the spec came through"
-    );
+        .expect("cache = Use is admitted through the per-verb funnel");
+    let generic = session
+        .enqueue(JobSpec::from(spec), 0)
+        .await
+        .expect("cache = Use is admitted through the generic enqueue entrance");
     assert_eq!(
         job_count(&session).await,
-        before,
-        "a refused submission must enqueue nothing, through either entrance"
+        before + 2,
+        "each entrance enqueues exactly one row"
     );
+    for job_id in [per_verb.job_id.as_str(), generic.job_id.as_str()] {
+        let persisted = session.catalog().get_job(job_id).await.unwrap().spec;
+        assert!(
+            persisted.contains(r#""cache":"use""#),
+            "the persisted spec carries the policy the caller chose: {persisted}"
+        );
+    }
 }
 
 /// The single-rank job every caller that names no count submits is still

@@ -2029,30 +2029,32 @@ field (e.g. `crates/jammi-wire/proto/jammi/v1/pipeline.proto`). `SubmitJobReques
 declaring a second wire vocabulary for the identical concept;
 `crates/jammi-ai/src/wire/training.rs`'s `lora_common_from_proto` decodes it and returns it
 alongside `TrainingCommon` (never folded into that type — only the `FineTune` decode arm
-threads it onto `TrainingSpec::FineTune.cache`). Model-level cache reuse is not
-supported for `TrainingSpec::FineTune`: `Use` is refused, typed, by `admit_training_spec`
-— the one admission every durable submit edge for a training spec applies before a `jobs`
-row is written (`InferenceSession::submit_fine_tune_spec_deduped`, `InferenceSession::enqueue`,
-and `train_context_predictor_deduped`)
-rather than probed against a recorded materialization, a different mechanism from the
-*result-table* `probe_cache_record` path the producers above use.
+threads it onto `TrainingSpec::FineTune.cache`). Model-level reuse for
+`TrainingSpec::FineTune` is decided on the worker, once the training set is materialised
+and the model's definition hash is therefore known: `Catalog::finish_job_reusing_artifact`
+(`crates/jammi-db/src/catalog/jobs_repo.rs`) is one `Serializable` transaction that probes
+the newest `published` `model_artifacts` row of that definition hash and anchor set (the
+engine's one reuse predicate, `store::manifest::PinnedAnchors`; own tenant or global; a
+`staged` or `reclaiming` artifact is never a hit), runs the attempt-guarded job CAS, and
+upserts the output `models` row referencing the artifact — a miss or a lost lease writes
+nothing, and a miss trains. The probe reads the artifact row the attach then references, so
+it and the reclaim compare-and-set genuinely conflict under `Serializable`: a reference
+never attaches to licensed bytes. A replay (`fine_tune_spec_from_canonical`) is always
+`Bypass` — a replay is a retrain.
 
-**`cache = Use` is refused on both fine-tune kinds.** `cache` lives on
+**`cache = Use` is refused on the graph kind.** `cache` lives on
 `TrainingSpec::FineTune` itself; `TrainingSpec::GraphFineTune` carries no `cache` field at
-all, so a `GraphFineTune` job's `FineTuneRun::materialization_source` is unconditionally
+all, so a `GraphFineTune` job's `FineTuneRun::materialization` is unconditionally
 `None` (`crates/jammi-ai/src/fine_tune/worker.rs`: the graph arm carries no materialization
 to probe or record) and `lora_common_from_proto` refuses `cache = USE` for `GraphFineTune`
 with a typed `InvalidArgument` at decode — the one place that can still see both the kind
 and the requested value, mirroring the `ContextPredictor` `world_size` refusal in the same
-module. On the column-source kind, `cache = Use` is refused later, at submit, for the
-reason above. `Bypass`/unset is
-unaffected on either kind: every fine-tune
-job always trains. A stray `cache` key found
+module. `Bypass`/unset is unaffected on either kind: the job trains. A stray `cache` key found
 under `graph_fine_tune` in a persisted `jobs.spec` row is silently dropped at deserialize
 rather than refused, since the type has nowhere to decode it onto.
-The Python client still carries `cache=` as a kwarg on both `fine_tune` and
-`fine_tune_graph` (beside `world_size`, on both transports); both are refused, not
-silently dropped.
+The Python client carries `cache=` as a kwarg on both `fine_tune` and
+`fine_tune_graph` (beside `world_size`, on both transports); the graph kind's `"use"` is
+refused, not silently dropped.
 
 **A catalog row may be deleted at any time; bytes are reclaimed only when
 unreferenced.** Every bundle under `models/` is a `model_artifacts` row
@@ -2156,7 +2158,7 @@ CI if the guide and the code diverge:
 - `External` — a consumer-materialized table for a verb the engine does not own; no replay arm (returns `NotRecomputable` by design).
 - `EmbeddingDelta` — an incremental refresh of an embedding table (only the changed rows re-embedded, deletion-mask horizons raised); replayed as a full embed into a new table.
 - `EmbeddingCompaction` — a versioned embedding table's live rows rewritten as one fragment + one segment; replayed as a full embed into a new table.
-- `FineTune` — a LoRA fine-tune run, keyed by the training-set table's definition hash + artifact digest + row count, the base model identity, and the whole `TrainingSpec::FineTune` canonical spec (`spec_canonical` + `spec_schema_version`); model-level cache reuse is not yet supported for this kind — `TrainingSpec::FineTune.cache = Use` is refused, typed, by `admit_training_spec`, the one admission every durable submit edge for a training spec applies (<https://github.com/f-inverse/jammi-ai/issues/562>), and `Bypass` (the only value a submitted job can carry past that refusal) always trains; `TrainingSpec::GraphFineTune` carries no `cache` field at all; replayed by retraining.
+- `FineTune` — a LoRA fine-tune run, keyed by the training-set table's definition hash + artifact digest + row count, the base model identity, and the whole `TrainingSpec::FineTune` canonical spec (`spec_canonical` + `spec_schema_version`); under `TrainingSpec::FineTune.cache = Use` the worker completes the job against an already-published artifact of the same definition (`Catalog::finish_job_reusing_artifact`) and trains only on a miss, `Bypass` always trains; `TrainingSpec::GraphFineTune` carries no `cache` field at all; replayed by retraining.
 <!-- END PRODUCING-DESCRIPTOR-VARIANTS -->
 
 #### The recompute verb — descriptor replay + bounded cascade (`pipeline/recompute.rs`)

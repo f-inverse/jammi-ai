@@ -610,10 +610,10 @@ def build_fine_tune_request(
     durable per-tenant contract (migration 030). `world_size` is the number of
     ranks that train this job cooperatively; `1` (the default) is a single
     process and leaves the wire field unset — see :func:`_wire_world_size`.
-    `cache="use"` is refused, typed (:class:`jammi.errors.InvalidArgument`):
-    model-level cache reuse is not supported; `cache=None` or
-    ``"bypass"`` (the default) always trains — see
-    :func:`_wire_cache_policy_for_submit_job`.
+    `cache="use"` opts into model-level reuse: the worker completes the job
+    against an already-published model of the same definition when one
+    exists and trains only on a miss; `cache=None` or ``"bypass"`` (the
+    default) always trains — see :func:`_wire_cache_policy_for_submit_job`.
     """
     wire_world_size = _wire_world_size(world_size)
     wire_cache = _wire_cache_policy_for_submit_job(cache)

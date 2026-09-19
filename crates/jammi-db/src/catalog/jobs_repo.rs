@@ -35,7 +35,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::artifact_repo::{
-    publish_staged_artifact, MaterializationSummary, PublishingArtifact, StagedArtifact,
+    probe_published_artifact, publish_staged_artifact, ArtifactRef, MaterializationSummary,
+    PublishingArtifact, StagedArtifact,
 };
 use super::backend::{BackendError, BackendKind, Row, SqlValue, Transaction, TxOptions};
 use super::instance::{
@@ -49,6 +50,7 @@ use super::lease::{
 use super::status::{JobExecution, JobStatus};
 use super::Catalog;
 use crate::error::{JammiError, Result};
+use crate::store::manifest::{DefinitionHash, InputAnchor, PinnedAnchors};
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
 
@@ -660,13 +662,12 @@ pub struct FinishJobParams<'a> {
     pub result: &'a str,
 }
 
-/// One `models` row a finalize attaches to an artifact it publishes: the
-/// output model, or a retained epoch checkpoint. The row and the artifact's
-/// `staged → published` flip are written by the same attempt-guarded
-/// transaction ([`Catalog::finish_job_with_model`]) or not at all, so a
-/// `models` row never references bytes that are not a published artifact.
-#[derive(Debug)]
-pub struct ProducedModel<'a> {
+/// The columns of a `models` row a finalize writes — everything but where the
+/// model's bytes live, which the finalize itself decides: the artifact it
+/// publishes ([`Catalog::finish_job_with_model`]) or the published artifact it
+/// reuses ([`Catalog::finish_job_reusing_artifact`]).
+#[derive(Debug, Clone, Copy)]
+pub struct ModelRow<'a> {
     /// The catalog NAME. An epoch checkpoint registers under its own name
     /// (`{output}:epoch_{N}`), never as another VERSION of the output model's
     /// — a version would shadow the output through `ORDER BY version DESC`
@@ -684,6 +685,17 @@ pub struct ProducedModel<'a> {
     pub base_model_id: Option<&'a str>,
     /// Backend-specific configuration the reload path reads, if any.
     pub config_json: Option<&'a str>,
+}
+
+/// One `models` row a finalize attaches to an artifact it publishes: the
+/// output model, or a retained epoch checkpoint. The row and the artifact's
+/// `staged → published` flip are written by the same attempt-guarded
+/// transaction ([`Catalog::finish_job_with_model`]) or not at all, so a
+/// `models` row never references bytes that are not a published artifact.
+#[derive(Debug)]
+pub struct ProducedModel<'a> {
+    /// The row's columns.
+    pub row: ModelRow<'a>,
     /// The writer's claim on the bundle holding the model's bytes. Consumed:
     /// publishing is the one thing a finalize does with it.
     pub artifact: StagedArtifact,
@@ -714,17 +726,119 @@ pub struct FinishJobWithModelParams<'a> {
     pub epoch_checkpoints: Vec<ProducedModel<'a>>,
 }
 
+/// Renders a reusing job's terminal JSON payload once the transaction knows
+/// which artifact it reuses — the payload names that artifact, and only the
+/// probe inside the transaction decides it.
+pub type ReusedResult = std::sync::Arc<dyn Fn(&ArtifactRef) -> Result<String> + Send + Sync>;
+
+/// Input parameters for [`Catalog::finish_job_reusing_artifact`].
+pub struct FinishJobReusingArtifactParams<'a> {
+    /// The job id to finish.
+    pub job_id: &'a str,
+    /// The instance the attempt-guarded CAS matches against `claimed_by`.
+    pub instance_id: &'a str,
+    /// The attempt the attempt-guarded CAS matches against `attempts`.
+    pub attempts: u32,
+    /// The definition hash the attempt would produce its model under.
+    pub definition_hash: &'a DefinitionHash,
+    /// The input anchors it would produce it over.
+    pub inputs: &'a [InputAnchor],
+    /// The job's output model row, attached to the artifact a hit reuses.
+    pub output: ModelRow<'a>,
+    /// The terminal payload, given the reused artifact.
+    pub result: ReusedResult,
+}
+
+/// What [`Catalog::finish_job_reusing_artifact`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReuseFinish {
+    /// The job is `completed` and its output model references this already
+    /// `published` artifact. The reference is all the caller gains: it names
+    /// bytes another writer produced, and nothing here can reclaim them.
+    Reused(ArtifactRef),
+    /// No `published` artifact matches; nothing was written.
+    Miss,
+    /// An artifact matched but the attempt guard did not; nothing was
+    /// written.
+    LostLease,
+}
+
+/// The attempt-guarded terminal `running -> completed` compare-and-set every
+/// finalize shares: it lands only while the row is still `running`,
+/// `claimed_by` the instance, at exactly this attempt. Being a TERMINAL
+/// write, it also retires a still-`pending` `acceleration_report` — see
+/// [`JobRecord::acceleration_report`]'s lifecycle section. Owned, so a
+/// `Serializable` retry can re-run it.
+struct CompleteJob {
+    job_id: String,
+    instance_id: String,
+    attempts: i64,
+}
+
+impl CompleteJob {
+    fn new(job_id: &str, instance_id: &str, attempts: u32) -> Self {
+        Self {
+            job_id: job_id.to_string(),
+            instance_id: instance_id.to_string(),
+            attempts: i64::from(attempts),
+        }
+    }
+
+    /// Run the compare-and-set recording `result`; `true` when this attempt
+    /// still held the job.
+    async fn run(
+        &self,
+        tx: &mut Transaction<'_>,
+        result: &str,
+    ) -> std::result::Result<bool, BackendError> {
+        let retire = retire_pending_report_clause(3, 4);
+        let sql = format!(
+            "UPDATE jobs SET status = $1, result = $2, {retire}, lease_expires_at = NULL, \
+             updated_at = $5 \
+             WHERE job_id = $6 AND claimed_by = $7 AND status = $8 AND attempts = $9"
+        );
+        let updated = tx
+            .execute(
+                &sql,
+                &[
+                    SqlValue::TextOwned(JobStatus::Completed.to_string()),
+                    SqlValue::TextOwned(result.to_string()),
+                    SqlValue::Text(ACCELERATION_REPORT_PENDING),
+                    SqlValue::Text(ACCELERATION_REPORT_FINALIZED_WITHOUT_DETERMINATION),
+                    SqlValue::TextOwned(canonical_stamp_now()),
+                    SqlValue::TextOwned(self.job_id.clone()),
+                    SqlValue::TextOwned(self.instance_id.clone()),
+                    SqlValue::TextOwned(JobStatus::Running.to_string()),
+                    SqlValue::Int(self.attempts),
+                ],
+            )
+            .await?;
+        Ok(updated == 1)
+    }
+}
+
 /// Everything [`Catalog::finish_job_with_model`]'s transaction binds, owned,
 /// so the `Serializable` retry can re-run it.
 struct FinalizePlan {
-    job_params: Vec<SqlValue<'static>>,
+    job: CompleteJob,
+    result: String,
     output: AttachedModel,
     epoch_checkpoints: Vec<AttachedModel>,
 }
 
-/// A [`ProducedModel`] in the shape the finalize transaction writes: the
-/// `models` row's columns and the artifact it will reference.
-struct AttachedModel {
+/// Everything [`Catalog::finish_job_reusing_artifact`]'s transaction binds,
+/// owned, so the `Serializable` retry can re-run it.
+struct ReusePlan {
+    job: CompleteJob,
+    definition_hash: String,
+    inputs: PinnedAnchors,
+    output: ModelRowWrite,
+    result: ReusedResult,
+}
+
+/// A [`ModelRow`] in the shape a finalize transaction writes, owned so a
+/// `Serializable` retry can re-run it.
+struct ModelRowWrite {
     pk: String,
     name: String,
     version: i64,
@@ -733,36 +847,34 @@ struct AttachedModel {
     backend: String,
     status: &'static str,
     metadata: String,
-    artifact: PublishingArtifact,
 }
 
-impl AttachedModel {
-    fn new(tenant: Option<TenantId>, model: ProducedModel<'_>, status: &'static str) -> Self {
+impl ModelRowWrite {
+    fn new(tenant: Option<TenantId>, row: ModelRow<'_>, status: &'static str) -> Self {
         Self {
-            pk: super::model_repo::model_pk(tenant, model.model_id, i64::from(model.version)),
-            name: model.model_id.to_string(),
-            version: i64::from(model.version),
-            model_type: model.model_type.to_string(),
-            task: model.task.as_db_str(),
-            backend: model.backend.to_string(),
+            pk: super::model_repo::model_pk(tenant, row.model_id, i64::from(row.version)),
+            name: row.model_id.to_string(),
+            version: i64::from(row.version),
+            model_type: row.model_type.to_string(),
+            task: row.task.as_db_str(),
+            backend: row.backend.to_string(),
             status,
-            metadata: super::model_repo::model_metadata(model.base_model_id, model.config_json),
-            artifact: PublishingArtifact::new(model.artifact, model.materialization),
+            metadata: super::model_repo::model_metadata(row.base_model_id, row.config_json),
         }
     }
 
-    /// Publish the artifact, then upsert the `models` row referencing it —
-    /// the one operator the output model and every retained checkpoint go
+    /// Upsert the `models` row referencing the `published` artifact at
+    /// `artifact_prefix` — the one statement every finalize attaches a model
     /// through. A re-trained model name replaces the row's reference (the
     /// artifact the replaced reference named becomes unreferenced, hence
-    /// reclaimable); a
-    /// row never keeps an external location beside an artifact.
-    async fn publish_and_attach(
+    /// reclaimable); a row never keeps an external location beside an
+    /// artifact.
+    async fn attach(
         &self,
         tx: &mut Transaction<'_>,
         tenant_val: &SqlValue<'static>,
+        artifact_prefix: &str,
     ) -> std::result::Result<(), BackendError> {
-        publish_staged_artifact(tx, &self.artifact).await?;
         let now = canonical_stamp_now();
         let written = tx
             .execute(
@@ -788,7 +900,7 @@ impl AttachedModel {
                     SqlValue::Int(self.version),
                     SqlValue::Text(self.status),
                     SqlValue::TextOwned(self.metadata.clone()),
-                    SqlValue::TextOwned(self.artifact.prefix().to_string()),
+                    SqlValue::TextOwned(artifact_prefix.to_string()),
                     tenant_val.clone(),
                     SqlValue::TextOwned(now),
                 ],
@@ -802,6 +914,35 @@ impl AttachedModel {
                 self.name
             )))
         }
+    }
+}
+
+/// A [`ProducedModel`] in the shape the finalize transaction writes: the
+/// `models` row and the artifact it will reference.
+struct AttachedModel {
+    row: ModelRowWrite,
+    artifact: PublishingArtifact,
+}
+
+impl AttachedModel {
+    fn new(tenant: Option<TenantId>, model: ProducedModel<'_>, status: &'static str) -> Self {
+        Self {
+            row: ModelRowWrite::new(tenant, model.row, status),
+            artifact: PublishingArtifact::new(model.artifact, model.materialization),
+        }
+    }
+
+    /// Publish the artifact, then attach the `models` row to it — the one
+    /// operator the output model and every retained checkpoint go through.
+    async fn publish_and_attach(
+        &self,
+        tx: &mut Transaction<'_>,
+        tenant_val: &SqlValue<'static>,
+    ) -> std::result::Result<(), BackendError> {
+        publish_staged_artifact(tx, &self.artifact).await?;
+        self.row
+            .attach(tx, tenant_val, self.artifact.prefix())
+            .await
     }
 }
 
@@ -1438,42 +1579,14 @@ impl Catalog {
     /// transition should call [`Catalog::finish_job_with_model`] instead,
     /// never this method followed by a second write.
     pub async fn finish_job(&self, p: FinishJobParams<'_>) -> Result<bool> {
-        let completed = JobStatus::Completed.to_string();
-        let running = JobStatus::Running.to_string();
-        let job_id = p.job_id.to_string();
-        let instance_id = p.instance_id.to_string();
-        let attempts = p.attempts as i64;
+        let job = CompleteJob::new(p.job_id, p.instance_id, p.attempts);
         let result = p.result.to_string();
-        let now = canonical_stamp_now();
-        let retire = retire_pending_report_clause(3, 4);
-        let sql = format!(
-            "UPDATE jobs SET status = $1, result = $2, {retire}, lease_expires_at = NULL, \
-             updated_at = $5 \
-             WHERE job_id = $6 AND claimed_by = $7 AND status = $8 AND attempts = $9"
-        );
-        let updated = self
+        Ok(self
             .backend()
             .transaction(TxOptions::default(), |tx| {
-                Box::pin(async move {
-                    tx.execute(
-                        &sql,
-                        &[
-                            SqlValue::TextOwned(completed),
-                            SqlValue::TextOwned(result),
-                            SqlValue::Text(ACCELERATION_REPORT_PENDING),
-                            SqlValue::Text(ACCELERATION_REPORT_FINALIZED_WITHOUT_DETERMINATION),
-                            SqlValue::TextOwned(now),
-                            SqlValue::TextOwned(job_id),
-                            SqlValue::TextOwned(instance_id),
-                            SqlValue::TextOwned(running),
-                            SqlValue::Int(attempts),
-                        ],
-                    )
-                    .await
-                })
+                Box::pin(async move { job.run(tx, &result).await })
             })
-            .await?;
-        Ok(updated == 1)
+            .await?)
     }
 
     /// Finish a job the caller still owns and, in the SAME transaction,
@@ -1527,17 +1640,8 @@ impl Catalog {
         let tenant = self.current_tenant();
         let job_id_for_error = p.job_id.to_string();
         let plan = std::sync::Arc::new(FinalizePlan {
-            job_params: vec![
-                SqlValue::TextOwned(JobStatus::Completed.to_string()),
-                SqlValue::TextOwned(p.result.to_string()),
-                SqlValue::Text(ACCELERATION_REPORT_PENDING),
-                SqlValue::Text(ACCELERATION_REPORT_FINALIZED_WITHOUT_DETERMINATION),
-                SqlValue::TextOwned(canonical_stamp_now()),
-                SqlValue::TextOwned(p.job_id.to_string()),
-                SqlValue::TextOwned(p.instance_id.to_string()),
-                SqlValue::TextOwned(JobStatus::Running.to_string()),
-                SqlValue::Int(p.attempts as i64),
-            ],
+            job: CompleteJob::new(p.job_id, p.instance_id, p.attempts),
+            result: p.result.to_string(),
             output: AttachedModel::new(tenant, p.output, "registered"),
             epoch_checkpoints: p
                 .epoch_checkpoints
@@ -1545,24 +1649,17 @@ impl Catalog {
                 .map(|checkpoint| AttachedModel::new(tenant, checkpoint, "checkpoint"))
                 .collect(),
         });
-        let retire = retire_pending_report_clause(3, 4);
-        let job_sql = format!(
-            "UPDATE jobs SET status = $1, result = $2, {retire}, lease_expires_at = NULL, \
-             updated_at = $5 \
-             WHERE job_id = $6 AND claimed_by = $7 AND status = $8 AND attempts = $9"
-        );
 
         let finished = self
             .backend()
             .serializable(|tx| {
                 let plan = std::sync::Arc::clone(&plan);
-                let job_sql = job_sql.clone();
                 Box::pin(async move {
                     tx.set_tenant(tenant);
                     // The gate every model-side write below hangs off: only
                     // the attempt that wins the job-row CAS publishes or
                     // attaches anything.
-                    if tx.execute(&job_sql, &plan.job_params).await? != 1 {
+                    if !plan.job.run(tx, &plan.result).await? {
                         return Ok(false);
                     }
                     tx.assert_tenant_matches(tenant, "models")?;
@@ -1576,7 +1673,7 @@ impl Catalog {
                                    AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL)) \
                                  LIMIT 1",
                                 &[
-                                    SqlValue::TextOwned(checkpoint.name.clone()),
+                                    SqlValue::TextOwned(checkpoint.row.name.clone()),
                                     tenant_val.clone(),
                                 ],
                                 |row| row.get::<i32>("one"),
@@ -1585,7 +1682,7 @@ impl Catalog {
                             .is_some();
                         if occupied {
                             tracing::warn!(
-                                occupied_name = %checkpoint.name,
+                                occupied_name = %checkpoint.row.name,
                                 skipped_artifact = %checkpoint.artifact.prefix(),
                                 "epoch-checkpoint catalog name already occupied by another \
                                  row; skipping registration — the checkpoint stays staged for \
@@ -1602,6 +1699,80 @@ impl Catalog {
         match finished {
             Err(BackendError::Busy(refusal)) => Err(JammiError::Catalog(format!(
                 "finalize of job '{job_id_for_error}' rolled back: {refusal}"
+            ))),
+            settled => Ok(settled?),
+        }
+    }
+
+    /// Finish a job the caller still owns by REUSING an already-`published`
+    /// artifact instead of producing one — the reuse peer of
+    /// [`Self::finish_job_with_model`], under the same attempt guard.
+    ///
+    /// One `Serializable` transaction:
+    ///
+    /// 1. the reuse probe: the newest `published` artifact whose recorded
+    ///    definition hash is `definition_hash` and whose recorded anchor set
+    ///    equals `inputs` (the engine's one reuse predicate — an unpinned
+    ///    request matches nothing), owned by this catalog's bound tenant or
+    ///    global. No match is [`ReuseFinish::Miss`], and nothing is written:
+    ///    the caller produces the model itself;
+    /// 2. the attempt-guarded job CAS (`running -> completed`), recording
+    ///    the payload `result` renders for the matched artifact. A guard
+    ///    miss is [`ReuseFinish::LostLease`], and nothing is written;
+    /// 3. the output `models` row upserted referencing the matched artifact.
+    ///
+    /// The probe reads the artifact row the attach then references, so under
+    /// `Serializable` this transaction and the reclaim compare-and-set
+    /// ([`Self::begin_artifact_reclaim`]) genuinely conflict: whichever
+    /// commits second is re-run against the other's outcome, and a reference
+    /// never attaches to an artifact whose delete is licensed. The reference
+    /// is all the caller gains — never a claim on the bytes.
+    pub async fn finish_job_reusing_artifact(
+        &self,
+        p: FinishJobReusingArtifactParams<'_>,
+    ) -> Result<ReuseFinish> {
+        let Some(inputs) = PinnedAnchors::of(p.inputs) else {
+            return Ok(ReuseFinish::Miss);
+        };
+        let tenant = self.current_tenant();
+        let plan = std::sync::Arc::new(ReusePlan {
+            job: CompleteJob::new(p.job_id, p.instance_id, p.attempts),
+            definition_hash: p.definition_hash.as_str().to_string(),
+            inputs,
+            output: ModelRowWrite::new(tenant, p.output, "registered"),
+            result: p.result,
+        });
+        let job_id_for_error = p.job_id.to_string();
+
+        let finished = self
+            .backend()
+            .serializable(|tx| {
+                let plan = std::sync::Arc::clone(&plan);
+                Box::pin(async move {
+                    tx.set_tenant(tenant);
+                    let Some(artifact) =
+                        probe_published_artifact(tx, tenant, &plan.definition_hash, &plan.inputs)
+                            .await?
+                    else {
+                        return Ok(ReuseFinish::Miss);
+                    };
+                    let result = (plan.result)(&artifact)
+                        .map_err(|e| BackendError::Execution(e.to_string()))?;
+                    if !plan.job.run(tx, &result).await? {
+                        return Ok(ReuseFinish::LostLease);
+                    }
+                    tx.assert_tenant_matches(tenant, "models")?;
+                    let tenant_val = SqlValue::from(tenant.map(|t| t.to_string()));
+                    plan.output
+                        .attach(tx, &tenant_val, artifact.url().as_str())
+                        .await?;
+                    Ok(ReuseFinish::Reused(artifact))
+                })
+            })
+            .await;
+        match finished {
+            Err(BackendError::Busy(refusal)) => Err(JammiError::Catalog(format!(
+                "reusing finalize of job '{job_id_for_error}' rolled back: {refusal}"
             ))),
             settled => Ok(settled?),
         }

@@ -559,11 +559,10 @@ pub enum JobResult {
         artifact_path: String,
         /// Run-metrics JSON, or `None` when the run recorded none.
         metrics: Option<String>,
-        /// Shares [`Self::Table::cache_outcome`]'s
-        /// `"computed"`/`"reused:{name}"` vocabulary, but every training
-        /// kind always records `"computed"`: there is no model-level cache
-        /// reuse (`TrainingSpec::FineTune`'s own `cache` field refuses `Use`
-        /// at submit).
+        /// Shares [`Self::Table::cache_outcome`]'s vocabulary:
+        /// `"computed"` for a run that trained, `"reused:{artifact}"` for a
+        /// `CachePolicy::Use` job that completed against an already-published
+        /// artifact of the same definition (`artifact_path` names it).
         cache_outcome: String,
     },
     /// A compute kind's result table.

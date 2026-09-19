@@ -37,6 +37,7 @@ use crate::catalog::lease::{canonical_stamp_now, stale_before_clause, CanonicalS
 use crate::catalog::status::{ArtifactState, JobStatus};
 use crate::error::{JammiError, Result};
 use crate::storage::StorageUrl;
+use crate::store::manifest::{PinnedAnchors, ReuseCandidate};
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
 
@@ -319,6 +320,80 @@ pub(super) async fn publish_staged_artifact(
             staged.prefix
         )))
     }
+}
+
+/// A `published` artifact as the reuse probe sees it.
+struct PublishedCandidate {
+    prefix: String,
+    input_anchors_json: Option<String>,
+    created_at: String,
+}
+
+impl ReuseCandidate for PublishedCandidate {
+    fn recorded_anchors_json(&self) -> Option<&str> {
+        self.input_anchors_json.as_deref()
+    }
+
+    fn created_at(&self) -> &str {
+        &self.created_at
+    }
+
+    fn name(&self) -> &str {
+        &self.prefix
+    }
+}
+
+/// The reuse probe, inside the caller's transaction: the newest `published`
+/// artifact produced under `definition_hash` over exactly `inputs`, owned by
+/// `tenant` or global. A `staged` artifact has no complete bytes and a
+/// `reclaiming` one is committed to deletion, so neither is ever a hit; an
+/// artifact published with no materialization summary records no anchors and
+/// matches nothing.
+///
+/// Reading the artifact row here and attaching a `models` row to it in the
+/// same `Serializable` transaction is what makes the attach and the reclaim
+/// compare-and-set conflict: each reads what the other writes, so one of the
+/// two is re-run against the other's committed outcome.
+pub(super) async fn probe_published_artifact(
+    tx: &mut Transaction<'_>,
+    tenant: Option<TenantId>,
+    definition_hash: &str,
+    inputs: &PinnedAnchors,
+) -> std::result::Result<Option<ArtifactRef>, BackendError> {
+    let candidates = tx
+        .query(
+            "SELECT prefix, input_anchors_json, created_at FROM model_artifacts \
+             WHERE definition_hash = $1 AND state = $2 \
+               AND (tenant_id = $3 OR tenant_id IS NULL)",
+            &[
+                SqlValue::TextOwned(definition_hash.to_string()),
+                SqlValue::Text(ArtifactState::Published.as_db_str()),
+                SqlValue::from(tenant.map(|t| t.to_string())),
+            ],
+            |row| {
+                Ok(PublishedCandidate {
+                    prefix: row.get("prefix")?,
+                    input_anchors_json: row.try_get("input_anchors_json")?,
+                    created_at: row.get("created_at")?,
+                })
+            },
+        )
+        .await?;
+    let conversion = |column: &str, detail: String| BackendError::TypeConversion {
+        column: column.to_string(),
+        detail,
+    };
+    inputs
+        .matches(candidates)
+        .map_err(|e| conversion("input_anchors_json", e.to_string()))?
+        .into_iter()
+        .next()
+        .map(|hit| {
+            StorageUrl::parse(&hit.prefix)
+                .map(ArtifactRef::from_url)
+                .map_err(|e| conversion("prefix", e.to_string()))
+        })
+        .transpose()
 }
 
 /// A [`StagedArtifact`] on its way into a publishing transaction: the claim,

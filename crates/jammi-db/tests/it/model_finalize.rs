@@ -14,7 +14,7 @@ use jammi_db::catalog::artifact_repo::{
     ArtifactRef, MaterializationSummary, ReclaimDecision, StagedArtifact,
 };
 use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
-use jammi_db::catalog::jobs_repo::{FinishJobWithModelParams, ProducedModel};
+use jammi_db::catalog::jobs_repo::{FinishJobWithModelParams, ModelRow, ProducedModel};
 use jammi_db::catalog::model_repo::{ModelLocation, RegisterModelParams};
 use jammi_db::catalog::status::{ArtifactState, JobStatus};
 use jammi_db::catalog::Catalog;
@@ -194,10 +194,16 @@ async fn a_won_finalize_publishes_and_attaches_in_one_transaction(backend: Backe
             instance_id: WORKER,
             attempts: attempt,
             result: r#"{"kind":"model"}"#,
-            output: ProducedModel {
-                materialization: Some(summary.clone()),
-                config_json: Some(r#"{"r":8}"#),
-                ..fine_tuned_model(&name, served)
+            output: {
+                let model = fine_tuned_model(&name, served);
+                ProducedModel {
+                    row: ModelRow {
+                        config_json: Some(r#"{"r":8}"#),
+                        ..model.row
+                    },
+                    materialization: Some(summary.clone()),
+                    ..model
+                }
             },
             epoch_checkpoints: vec![fine_tuned_model(&checkpoint_name, checkpoint)],
         })

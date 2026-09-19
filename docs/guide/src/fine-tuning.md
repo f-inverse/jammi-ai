@@ -248,17 +248,25 @@ sampled in memory and trained on directly. Giving the graph arm a
 `TrainingSet` table of its own is tracked at
 <https://github.com/f-inverse/jammi-ai/issues/538>.
 
-## Model-level cache reuse (`cache = Use`) is not yet supported
+## Model-level reuse (`cache = Use`)
 
-`fine_tune` (the column-source kind) and `fine_tune_graph` both accept the same
-opt-in `cache` dial the compute verbs (`generate_embeddings`, `infer`, …) carry,
-but neither honors `cache="use"`. It is refused, typed
-(`jammi.errors.InvalidArgument` on both transports): model-level cache reuse —
-binding a fine-tune job to an earlier run's already-published model instead of
-training — is not yet supported
-(<https://github.com/f-inverse/jammi-ai/issues/562>). `cache="bypass"` (the
-default, or omitting `cache` entirely) is unaffected on either kind: a fine-tune
-job always trains.
+`fine_tune` (the column-source kind) accepts the same opt-in `cache` dial the
+compute verbs (`generate_embeddings`, `infer`, …) carry. Under `cache="use"`
+the worker materialises the training set, computes the model's definition hash
+— the training set's content digest, the canonical spec, the base model's
+identity, the compute environment and the topology — and, if an
+already-published model artifact of that exact definition exists in the job's
+tenant or the global scope, completes the job against it: the job's own model
+row references that artifact, no training loop runs, and the job result's
+`cache_outcome` is `"reused:{artifact}"` naming the artifact it shares. On a
+miss the job trains as usual and records `"computed"`. `cache="bypass"` (the
+default, or omitting `cache` entirely) never probes: a fine-tune job always
+trains. `fine_tune_graph` accepts `cache` but refuses `"use"`: a graph sample
+has no model-level materialization to probe.
+
+Two model rows sharing one artifact are independent rows: deleting either
+leaves the other loadable, and the bytes are reclaimed only once no row
+references them (see [Operability](operability.md)).
 
 ### Python
 
@@ -271,7 +279,7 @@ job = db.fine_tune(
     task="embedding",
 )
 result = job.wait()
-print(result["cache_outcome"])  # always "computed"
+print(result["cache_outcome"])  # "computed", or "reused:{artifact}" under cache="use"
 print(f"Model: {result['model_id']}")
 ```
 
@@ -281,9 +289,9 @@ The embedded surface's cache dial lives on `jammi_wire::request::FineTuneRequest
 (submitted through `InferenceSession::submit_fine_tune`), not on the loose
 `InferenceSession::fine_tune`/`fine_tune_graph` methods shown above, which always
 train (`cache: CachePolicy::Bypass`, unconditionally). The remote
-`jammi_client::DataClient::submit_fine_tune` carries the same field, and `Use` is
-refused there too. Neither Rust surface returns `cache_outcome` from
-`TrainingJob::wait()` — only `model_id()` is exposed there.
+`jammi_client::DataClient::submit_fine_tune` carries the same field. Neither Rust
+surface returns `cache_outcome` from `TrainingJob::wait()` — only `model_id()` is
+exposed there.
 
 A stray `cache` key found under `graph_fine_tune` in a persisted `jobs.spec` row
 (the row is engine-written from an already-decoded spec, so this only arises from

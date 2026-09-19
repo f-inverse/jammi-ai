@@ -39,6 +39,7 @@ mod migrations;
 mod model_artifacts;
 mod model_finalize;
 mod model_lifecycle;
+mod model_reuse;
 mod models_delete_call_sites;
 #[cfg(feature = "test-hooks")]
 mod mutable_crash_recovery;

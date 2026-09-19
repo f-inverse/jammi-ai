@@ -364,6 +364,12 @@ why = "The prove-timings guard fires when a default drifts from its evidence."
 when = ["rig"]
 
 [[guard]]
+name = "prove surface self-test"
+run = "python3 ci/scripts/prove_surface.py --self-test"
+why = "The prove lane's expected tuples are derived from the script and the feature manifest, and a drift between them is refused."
+when = ["rig"]
+
+[[guard]]
 name = "gpu prove timings producer self-test"
 run = "python3 ci/scripts/perf/gpu_prove_timings.py --self-test"
 why = "The timings producer writes the artifact shape the guard reads."

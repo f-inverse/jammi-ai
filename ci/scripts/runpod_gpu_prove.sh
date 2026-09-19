@@ -31,7 +31,7 @@
 #
 # `rp_run_remote_watched` (runpod_lib.sh) layers an
 # inactivity watchdog on top of the ssh budget; `PROVE_GROUPS` below names
-# the six gating groups this driver's own pass/fail rule reads
+# the gating groups this driver's own pass/fail rule reads
 # `PROVE_GROUP_RC` markers for (`device` and `bench` are NOT members -- see
 # that array's own comment). The `jammi-kernels` clippy lane runs in
 # `ci.yml`'s own hermetic `Clippy jammi-kernels --features flash-attn
@@ -106,7 +106,7 @@ esac
 # sourced-execution guard below so `test_gpu_prove_lane.sh` can `source`
 # this file (RUNPOD_API_KEY/GPU_PROVE_ARCH pre-set, no network/ssh calls
 # made merely by sourcing) and see it, exactly as it sees `rp_prove_verdict`.
-PROVE_GROUPS=(capability-surface-build capability-surface-proof served-client-server-proof engine-core-sweep kernels-default kernels-cuda)
+PROVE_GROUPS=(capability-surface-build capability-surface-proof served-client-server-proof engine-core-sweep engine-lib-cuda kernels-default kernels-cuda encoders-cuda lora-cuda bench-cuda)
 
 # The driver rule: decide a leg's real verdict
 # from `rp_run_remote_watched`'s own return status (`$1`, taken after ITS OWN
@@ -320,7 +320,8 @@ fi
 echo "PROVE_GROUP_RC name=capability-surface-proof rc=\${grc}"
 echo "::endgroup::"
 
-# served-client-server-proof: the shipped served attention surface --
+# served-client-server-proof: the shipped served attention surface and the
+# remote-session read-back on the device --
 # widened to the FULL jammi-server lane (jetstream-broker/storage-cloud are
 # compile-time-only for this test binary; zero test hits under
 # crates/jammi-server/tests/it*) plus live-gpu-tests, per
@@ -328,7 +329,7 @@ echo "::endgroup::"
 echo "::group::served-client-server-proof"
 grc=0
 echo "PROVE_TUPLE crate=jammi-server kind=test features=cuda,flash-attn,jetstream-broker,live-gpu-tests,storage-cloud"
-cargo test -p jammi-server --features cuda,flash-attn,jetstream-broker,live-gpu-tests,storage-cloud --test it grpc_embedding_gpu -- --nocapture --test-threads=1 || grc=\$?
+cargo test -p jammi-server --features cuda,flash-attn,jetstream-broker,live-gpu-tests,storage-cloud --test it grpc_embedding_gpu grpc_remote_session_gpu -- --nocapture --test-threads=1 || grc=\$?
 [ "\$grc" -ne 0 ] && rc=\$grc
 echo "PROVE_GROUP_RC name=served-client-server-proof rc=\${grc}"
 echo "::endgroup::"
@@ -354,6 +355,15 @@ cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capa
 echo "PROVE_GROUP_RC name=engine-core-sweep rc=\${grc}"
 echo "::endgroup::"
 
+# engine-lib-cuda: jammi-ai's own unit tests, including its CUDA-device ones.
+echo "::group::engine-lib-cuda"
+grc=0
+echo "PROVE_TUPLE crate=jammi-ai kind=test features=cuda,flash-attn,live-gpu-tests"
+cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --lib -- --test-threads=1 || grc=\$?
+[ "\$grc" -ne 0 ] && rc=\$grc
+echo "PROVE_GROUP_RC name=engine-lib-cuda rc=\${grc}"
+echo "::endgroup::"
+
 # kernels-default: jammi-kernels' own lib tests at DEFAULT features (records
 # the x86_64 Linux run this pod is the only artifact for). prove_lane's own
 # \`default\` kind for jammi-kernels -- canonicalizes to no \`--features\` flag
@@ -369,16 +379,45 @@ cargo test -p jammi-kernels -- --nocapture --test-threads=1 || grc=\$?
 echo "PROVE_GROUP_RC name=kernels-default rc=\${grc}"
 echo "::endgroup::"
 
-# kernels-cuda: widened to \`cuda,flash-attn\` (prove_lane's jammi-kernels
-# \`test\` pair) -- this pod's GPU is the device the suite needs, and this is
-# the only lane that can compile \`cuda_parity\`'s flash-gated items and
-# the \`flash_smoke\` target (\`required-features = ["flash-attn"]\`).
+# kernels-cuda: every jammi-kernels test that needs CUDA device 0, the
+# FlashAttention-2 suites included.
 echo "::group::kernels-cuda"
 grc=0
-echo "PROVE_TUPLE crate=jammi-kernels kind=test features=cuda,flash-attn"
-cargo test -p jammi-kernels --features cuda,flash-attn -- --nocapture --test-threads=1 || grc=\$?
+echo "PROVE_TUPLE crate=jammi-kernels kind=test features=cuda,flash-attn,live-gpu-tests"
+cargo test -p jammi-kernels --features cuda,flash-attn,live-gpu-tests -- --nocapture --test-threads=1 || grc=\$?
 [ "\$grc" -ne 0 ] && rc=\$grc
 echo "PROVE_GROUP_RC name=kernels-cuda rc=\${grc}"
+echo "::endgroup::"
+
+# encoders-cuda: the encoder device tests. One asserts exact-arch arithmetic
+# and names sm89 (whose bf16 GEMM reassociates) as a device it cannot run on;
+# the sm89 leg excludes it by name.
+echo "::group::encoders-cuda"
+grc=0
+encoders_skip=()
+[ "\${CUDA_COMPUTE_CAP}" = 89 ] && encoders_skip=(--skip pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda)
+echo "PROVE_TUPLE crate=jammi-encoders kind=test features=cuda,flash-attn,live-gpu-tests"
+cargo test -p jammi-encoders --features cuda,flash-attn,live-gpu-tests -- --test-threads=1 "\${encoders_skip[@]}" || grc=\$?
+[ "\$grc" -ne 0 ] && rc=\$grc
+echo "PROVE_GROUP_RC name=encoders-cuda rc=\${grc}"
+echo "::endgroup::"
+
+# lora-cuda: the fused LoRA epilogue on the device.
+echo "::group::lora-cuda"
+grc=0
+echo "PROVE_TUPLE crate=jammi-lora kind=test features=cuda,live-gpu-tests"
+cargo test -p jammi-lora --features cuda,live-gpu-tests -- --test-threads=1 || grc=\$?
+[ "\$grc" -ne 0 ] && rc=\$grc
+echo "PROVE_GROUP_RC name=lora-cuda rc=\${grc}"
+echo "::endgroup::"
+
+# bench-cuda: the harness's own device tests (the padded fine-tune step).
+echo "::group::bench-cuda"
+grc=0
+echo "PROVE_TUPLE crate=jammi-bench kind=test features=cuda,flash-attn,live-gpu-tests"
+cargo test -p jammi-bench --features cuda,flash-attn,live-gpu-tests -- --test-threads=1 || grc=\$?
+[ "\$grc" -ne 0 ] && rc=\$grc
+echo "PROVE_GROUP_RC name=bench-cuda rc=\${grc}"
 echo "::endgroup::"
 
 # bench: recorded observability, deliberately NON-GATING -- \`bench_rc\`

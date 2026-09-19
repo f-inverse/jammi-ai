@@ -862,18 +862,13 @@ may still drive the two-host test BY HAND with the primitives above:
    both by log growth within `RP_INACTIVITY` and the T-10m budget).
 4. On the member running rank 0: export `JAMMI_GANG_TWO_HOSTS_RANK=0`,
    `JAMMI_GANG_TWO_HOSTS_WORLD=2`, `JAMMI_GANG_TWO_HOSTS_ID_FILE=<path>`,
-   `JAMMI_GANG_ARTIFACT_DIR=<path>`, `NCCL_SOCKET_IFNAME=ens1`,
-   `JAMMI_REQUIRE_CUDA_TWO_HOSTS=1` — set on BOTH members (this leg's own
-   require flag: a missing device or an incomplete/malformed env is a hard
-   FAIL here, never the silent skip a by-hand run with a misconfigured host
-   would otherwise read as "did not get to run" rather than "failed") — and
-   run `cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests
+   `JAMMI_GANG_ARTIFACT_DIR=<path>`, `NCCL_SOCKET_IFNAME=ens1`, and run
+   `cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-cluster-tests
    --test gpu_capability gang_nccl_two_hosts -- --nocapture
    --test-threads=1`.
 5. Once rank 0's id file holds exactly 128 bytes, `scp` it to the member
    running rank 1 (mode 0600; delete the local copy once the id has
-   crossed). Rank 1 runs with the SAME env (including
-   `JAMMI_REQUIRE_CUDA_TWO_HOSTS=1`), `JAMMI_GANG_TWO_HOSTS_RANK=1`, and its
+   crossed). Rank 1 runs with the SAME env, `JAMMI_GANG_TWO_HOSTS_RANK=1`, and its
    script blocks between its build and its proof until that file holds
    128 bytes — the proof, never the build, waits for the id.
 6. Read both `rank-<r>.json` reports back; `rp_cluster_delete` the cluster

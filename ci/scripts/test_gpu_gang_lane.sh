@@ -35,9 +35,10 @@
 #       out-of-band crossing ships with the cluster leg
 #       (docs/plans/67-distributed-training/UNITS.md § U7b acceptance (id-secrecy)), beside the
 #       crossing it backstops; G5 does not exercise it.
-#   G6  the two `JAMMI_REQUIRE_*` exports (U7b-A1-pull P3) are present in
-#       the `<<REMOTE` heredoc body, beside the existing env block; removing
-#       either is a mutation this case catches.
+#   G6  every `cargo test` in the `<<REMOTE` heredoc body enables
+#       `live-gpu-gang-tests`, the feature that compiles the gang tests;
+#       without it the filter matches nothing. Dropping it from either
+#       invocation is a mutation this case catches.
 #   G7  NO `schedule:` key exists anywhere in the committed `gpu-gang.yml`
 #       (U7b-A1-pull P5) — re-adding one (any cron) is a mutation this case
 #       catches. This row is itself deleted the moment U7b-A3 re-adds the
@@ -421,20 +422,14 @@ else
 fi
 
 # ============================================================================
-# G6: the two JAMMI_REQUIRE_* exports (U7b-A1-pull P3) are present in the
-# expanded <<REMOTE heredoc body, beside the existing env block.
+# G6: every cargo test in the expanded <<REMOTE heredoc compiles the gang tests.
 # ============================================================================
-if [[ "$remote_text" == *"export JAMMI_REQUIRE_CUDA=1"* ]] && [[ "$remote_text" == *"export JAMMI_REQUIRE_CUDA_GANG=1"* ]]; then
-  ok "G6: the expanded remote heredoc exports both JAMMI_REQUIRE_CUDA=1 and JAMMI_REQUIRE_CUDA_GANG=1"
+cargo_tests="$(printf '%s\n' "$remote_text" | grep -c '^cargo test ')"
+gang_tests="$(printf '%s\n' "$remote_text" | grep '^cargo test ' | grep -c -- '--features [^ ]*live-gpu-gang-tests')"
+if [ "$cargo_tests" -ge 2 ] && [ "$gang_tests" -eq "$cargo_tests" ]; then
+  ok "G6: all ${cargo_tests} remote cargo test invocations enable live-gpu-gang-tests"
 else
-  bad "G6: the expanded remote heredoc is missing one or both JAMMI_REQUIRE_* exports"
-fi
-
-require_env_mutation="$(printf '%s\n' "$remote_text" | grep -c '^export JAMMI_REQUIRE_CUDA')"
-if [ "$require_env_mutation" -eq 2 ]; then
-  ok "G6: exactly two JAMMI_REQUIRE_CUDA* export lines (removing either is the mutation this case catches)"
-else
-  bad "G6: expected exactly 2 JAMMI_REQUIRE_CUDA* export lines; found ${require_env_mutation}"
+  bad "G6: ${gang_tests} of ${cargo_tests} remote cargo test invocations enable live-gpu-gang-tests"
 fi
 
 # ============================================================================

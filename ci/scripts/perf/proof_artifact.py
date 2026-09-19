@@ -175,7 +175,7 @@ def build_artifact(src: str, tag: str, *, repo_root: str | None = None) -> dict:
         "box": env.get("hostname") or "unknown",
         "gates": gates,
         "cuda_parity": {
-            "command": "JAMMI_REQUIRE_CUDA=1 JAMMI_KERNELS_STRICT=1 cargo test -p jammi-kernels --features cuda --test cuda_parity",
+            "command": "JAMMI_KERNELS_STRICT=1 cargo test -p jammi-kernels --features live-gpu-tests --test cuda_parity",
             "results": parity_results,
             "tests": parity_tests,
         },
@@ -185,7 +185,7 @@ def build_artifact(src: str, tag: str, *, repo_root: str | None = None) -> dict:
             "path": PRODUCER_PATH,
             "kind": "script",
             "invocation": f"python3 {PRODUCER_PATH} <out_dir> {tag}",
-            "gating": "env:JAMMI_REQUIRE_CUDA",
+            "gating": "feature:live-gpu-tests",
         },
     }
     if git_sha is not None:

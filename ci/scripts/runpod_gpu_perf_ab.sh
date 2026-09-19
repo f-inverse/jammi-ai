@@ -150,7 +150,6 @@ echo "=== running gpu_inference_ab.sh on ${RP_HOST}:${RP_PORT} (GPU_PERF_AB_AA_N
 rp_run_remote <<REMOTE
 export CARGO_TERM_COLOR=never
 export CARGO_BUILD_RUSTC_WRAPPER=
-export JAMMI_REQUIRE_CUDA=1
 echo "::group::device"; nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv; echo "::endgroup::"
 
 echo "::group::disk space pre-flight"

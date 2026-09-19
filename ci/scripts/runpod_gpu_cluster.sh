@@ -101,8 +101,8 @@
 # (`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs`) — the two-HOST NCCL
 # leg (`ncclCommInitRank`, not the pod leg's single-process
 # `ncclCommInitAll`). Test env contract (see that module's own doc):
-# `JAMMI_GANG_TWO_HOSTS_RANK`/`_WORLD`/`_ID_FILE`, `JAMMI_GANG_ARTIFACT_DIR`,
-# `JAMMI_REQUIRE_CUDA_TWO_HOSTS`. `NCCL_SOCKET_IFNAME=ens1`/`NCCL_DEBUG=INFO`
+# `JAMMI_GANG_TWO_HOSTS_RANK`/`_WORLD`/`_ID_FILE`, `JAMMI_GANG_ARTIFACT_DIR`;
+# the test is compiled only under `live-gpu-cluster-tests`. `NCCL_SOCKET_IFNAME=ens1`/`NCCL_DEBUG=INFO`
 # are exported by THIS driver, never read by the test itself. The build+run
 # text is ONE shared function (`_rpc_remote_script`), expanded once per rank
 # — `world`/the member count derive from `RP_CLUSTER_POD_COUNT`
@@ -1035,10 +1035,9 @@ echo "=== id-wait: the id landed ==="'
   fi
   cat <<EOF
 export CARGO_TERM_COLOR=never
-export CARGO_BUILD_RUSTC_WRAPPER=  # wrapper-off (ledger row 17: no cross-target-dir reuse on this image)
+export CARGO_BUILD_RUSTC_WRAPPER=  # wrapper-off (sccache: no cross-target-dir reuse on this image)
 export CUDA_COMPUTE_CAP=${NATIVE_COMPUTE_CAP}
 export JAMMI_GANG_ARTIFACT_DIR=${CLUSTER_REMOTE_ARTIFACT_DIR}
-export JAMMI_REQUIRE_CUDA_TWO_HOSTS=1
 export JAMMI_GANG_TWO_HOSTS_RANK=${rank}
 export JAMMI_GANG_TWO_HOSTS_WORLD=${RP_CLUSTER_POD_COUNT}
 export JAMMI_GANG_TWO_HOSTS_ID_FILE=${CLUSTER_REMOTE_ID_FILE}
@@ -1066,7 +1065,7 @@ git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass \
 
 echo "::group::cluster-build"
 grc=0
-cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability --no-run || grc=\$?
+cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-cluster-tests --test gpu_capability --no-run || grc=\$?
 [ "\$grc" -ne 0 ] && rc=\$grc
 echo "PROVE_GROUP_RC name=cluster-build rc=\${grc}"
 echo "::endgroup::"
@@ -1076,7 +1075,7 @@ echo "::group::cluster-proof"
 grc=0
 mkdir -p "\${JAMMI_GANG_ARTIFACT_DIR}"
 rank_log=/tmp/cluster_proof_${rank}.log
-cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability ${CLUSTER_TEST_FILTER} -- --nocapture --test-threads=1 2>&1 | tee "\$rank_log"
+cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-cluster-tests --test gpu_capability ${CLUSTER_TEST_FILTER} -- --nocapture --test-threads=1 2>&1 | tee "\$rank_log"
 grc=\${PIPESTATUS[0]}
 ${cluster_zero_test_tripwire}
 if [ "\$grc" -eq 0 ] && [ -z "\$(ls -A "\${JAMMI_GANG_ARTIFACT_DIR}" 2>/dev/null)" ]; then # tripwire-ok: ls's stderr on a missing dir is not evidence; an empty result is exactly the "no artifact written" case this arm reports by name on the next line.
@@ -1202,7 +1201,7 @@ artifact = {
         "path": "ci/scripts/runpod_gpu_cluster.sh",
         "kind": "script",
         "invocation": "bash ci/scripts/runpod_gpu_cluster.sh",
-        "gating": "env:JAMMI_REQUIRE_CUDA_TWO_HOSTS",
+        "gating": "feature:live-gpu-cluster-tests",
     },
     "status": status,
     "artifact_kind": "gang",

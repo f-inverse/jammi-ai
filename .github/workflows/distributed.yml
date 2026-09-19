@@ -81,6 +81,7 @@ jobs:
             tests: >-
               one_job_n_workers_exactly_one_wins
               mixed_tenant_queue_completes_each_under_its_own_scope
+              rendezvous_placed_search_over_real_worker_processes
           # Not advisory (see this file's header comment). The two
           # `gang_chaos` rows SIGKILL
           # one process of a two-rank gang (a peer, then the coordinator)
@@ -117,6 +118,7 @@ jobs:
               two_schedulers_over_one_catalog_serve_jobs_sequentially
               device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan
               list_workers_and_compute_executor_devices_report_registered_devices
+              free_port_stays_below_the_ephemeral_floor_and_never_repeats
     continue-on-error: ${{ matrix.advisory }}
     container:
       image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
@@ -229,21 +231,18 @@ jobs:
       - name: Compile-check the distributed harness
         run: cargo test -p ${{ matrix.crate }} --features live-distributed-tests --test distributed --no-run
 
+      # One test at a time: each spawns its own worker fleet against the shared
+      # catalog and bucket. Every filter must run at least one test — one that
+      # matches nothing exits 0 having run nothing. `check_distributed_legs.py`
+      # asserts every distributed test is named by exactly one leg.
       - name: Run the ${{ matrix.name }} tests
-        # Serialise: every test spawns its own worker fleet and races on the
-        # shared catalog + bucket; one test at a time keeps the (already
-        # generous) terminal-state timeouts honest and the per-run unique
-        # prefixes the sole isolation needed. One cargo invocation per test
-        # filter, aborting on the first red (default `-e` shell).
-        # `JAMMI_REQUIRE_DISTRIBUTED=1` doubly enforces the "Require the
-        # distributed backends" step above: a skip inside the harness itself
-        # (rather than a misconfigured env var) is ALSO a hard failure here,
-        # never a silent hollow green.
-        env:
-          JAMMI_REQUIRE_DISTRIBUTED: "1"
         run: |
           for t in ${{ matrix.tests }}; do
-            cargo test -p ${{ matrix.crate }} --features live-distributed-tests --test distributed -- --test-threads=1 "$t"
+            out="$(cargo test -p ${{ matrix.crate }} --features live-distributed-tests --test distributed -- --test-threads=1 "$t" 2>&1)" \
+              || { echo "$out"; exit 1; }
+            echo "$out"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out" \
+              || { echo "::error::filter '$t' ran no test"; exit 1; }
           done
 
       - name: MinIO log (on failure)

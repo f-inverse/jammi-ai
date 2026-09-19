@@ -2760,20 +2760,16 @@ two independently-maintained ones.
 feature-gated oracle suites — `tests/parity.rs`
 (`#![cfg(feature = "parity-test")]`) and `tests/golden_parity.rs`
 (`#![cfg(feature = "golden-parity")]`) — and `jammi-kernels/tests/cuda_parity.rs`
-is `required-features = ["cuda"]` (`Cargo.toml`), gated on `JAMMI_REQUIRE_CUDA`
-for hard-fail-vs-skip semantics on a device-acquisition failure.
-`--features golden-parity` IS wired into CI's hermetic `test` job
+is `required-features = ["live-gpu-tests"]`: it is compiled only where CUDA
+device 0 exists, and fails naming the device when it cannot be opened.
+`--features golden-parity` runs in CI's hermetic `test` job
 (`.github/workflows/ci.yml`): its oracle is a committed PyTorch dump
 (`cookbook/fixtures/htsat_clap_tiny/goldens.safetensors`, a tracked binary),
-never a network call or a torch install, so it needs no pod. **No CI workflow
-passes `--features parity-test`, and no CI runner has a GPU to build
-`--features cuda` against (disclosed gap)** — those two lanes run only from a
-pod session (`ci/scripts/gpu-dev.sh`), by a human or an agent driving one.
-Wiring any parity/golden/cuda lane into a required CI check is a **human
-gate edit** (constitution: an executable gate is human-amend-only, tightening
-only); `golden-parity` is wired into the hermetic `test` job under that
-rule, `parity-test`/`cuda` are not — this guide states the gap honestly
-rather than implying a green check exists where none runs today.
+never a network call or a torch install. `parity-test` needs a PyTorch
+environment and `live-gpu-tests` a GPU, which no hosted runner has: CI lints
+the `live-gpu-tests` surfaces (the `flash-attn-compile` job), and they run on
+RunPod through `ci/scripts/runpod_gpu_prove.sh` (`gpu-prove.yml`) or a pod
+session (`ci/scripts/gpu-dev.sh`).
 
 **Numerics doctrine: reproduce-the-reference rounding decisions, not
 "whatever's convenient."** Each op's bf16 rounding order is a researched,
@@ -2881,12 +2877,7 @@ estimator least favourable to jammi) as the bar ratio, reports
 much relative to the 0.9 bar, and separately cross-checks `jammi-fused` vs
 `jammi-fused-2` (and the torch-sdpa pair) for premise drift ACROSS the two
 runs, independent of the same-run premise checks each pair already
-gets. **`JAMMI_REQUIRE_CUDA`** governs
-the separate `cuda_parity` suite (`crates/jammi-kernels/tests/cuda_parity.rs`,
-`required-features = ["cuda"]`): unset, a CUDA-acquisition failure on a
-GPU-less build reads as skip; set (the pod session's actual landing proof), it
-panics instead — so a broken device acquisition on the pod cannot silently
-read as passed-by-skipping.
+gets.
 
 ### 2.6b The training-set loader: committed order, the session memory pool, and the residency bound (`jammi-db` + `jammi-ai/fine_tune`)
 

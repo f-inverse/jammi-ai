@@ -46,10 +46,11 @@ must carry:
         `--exact <fn>`) | `"script"` (a tracked producer script) | `"none"`
         (reviewed legacy artifact — see `LEGACY_NONE_ALLOWLIST` below; a NEW
         file may never default to this).
-      - `gating`: `"#[ignore]"` | `"env:<VAR>"` | `"required-features"` |
-        `"none"` — how the named test/script stays out of a plain
-        `cargo test`/CI run (mirrors `docs/maintainer/cuda-kernel-guide.md`
-        §5's "no CI lane has a GPU" constraint).
+      - `gating`: `"feature:<name>"` | `"required-features"` | `"#[ignore]"` |
+        `"env:<VAR>"` | `"none"` — how the named test/script stays out of a
+        plain `cargo test`/CI run, as it was when the artifact was measured
+        (a test needing a GPU is compiled only under `live-gpu-tests`; older
+        records carry the `env:` form of their day).
   - `status` (string)
   - `merged_as` (40-hex, OPTIONAL) + `merged_via_pr` (int, OPTIONAL, required
     together with `merged_as`) — for a measured tip that was itself
@@ -252,6 +253,7 @@ GIT_SHA_RE = ancestry.GIT_SHA_RE
 PRODUCER_KINDS = {"cargo-test", "script", "none"}
 GATING_STATIC = {"#[ignore]", "required-features", "none"}
 GATING_ENV_RE = re.compile(r"^env:[A-Za-z_][A-Za-z0-9_]*$")
+GATING_FEATURE_RE = re.compile(r"^feature:[a-z0-9][a-z0-9_-]*$")
 README_PRODUCER_RE = re.compile(r"`([\w./-]*proof_artifact\.py)`")
 
 # --------------------------------------------------------------------------- #
@@ -438,10 +440,10 @@ def check_schema_types(data: dict) -> list[str]:
             failures.append(f"producer.kind must be one of {sorted(PRODUCER_KINDS)}, got {kind!r}")
         gating = producer.get("gating")
         if gating is not None and gating not in GATING_STATIC and not (
-            isinstance(gating, str) and GATING_ENV_RE.match(gating)
+            isinstance(gating, str) and (GATING_ENV_RE.match(gating) or GATING_FEATURE_RE.match(gating))
         ):
             failures.append(
-                f"producer.gating must be '#[ignore]' | 'required-features' | 'none' | 'env:<VAR>', got {gating!r}"
+                f"producer.gating must be '#[ignore]' | 'required-features' | 'none' | 'env:<VAR>' | 'feature:<name>', got {gating!r}"
             )
         for key in ("path", "invocation"):
             val = producer.get(key)
@@ -706,14 +708,25 @@ def _manifest_at(repo_root: Path, rev: str, rel_path: str) -> tuple[str, str] | 
 
 
 def _test_target_has_required_features(cargo_toml_text: str, test_stem: str) -> bool:
-    blocks = re.split(r"(?m)^\[\[test\]\]\s*$", cargo_toml_text)[1:]
-    for block in blocks:
+    return bool(_test_target_required_features(cargo_toml_text, test_stem))
+
+
+def _features_table(cargo_toml_text: str) -> str:
+    """The body of a manifest's `[features]` table."""
+    m = re.search(r"(?ms)^\[features\]\s*$(.*?)(?=^\[|\Z)", cargo_toml_text)
+    return m.group(1) if m else ""
+
+
+def _test_target_required_features(cargo_toml_text: str, test_stem: str) -> list[str]:
+    """The `required-features` of the `[[test]]` target named `test_stem`."""
+    for block in re.split(r"(?m)^\[\[test\]\]\s*$", cargo_toml_text)[1:]:
         end = re.search(r"(?m)^\[", block)
         body = block[: end.start()] if end else block
         name_m = re.search(r'name\s*=\s*"([^"]+)"', body)
         if name_m and name_m.group(1) == test_stem:
-            return "required-features" in body
-    return False
+            req = re.search(r"required-features\s*=\s*\[([^\]]*)\]", body)
+            return re.findall(r'"([^"]+)"', req.group(1)) if req else []
+    return []
 
 
 def _file_at(repo_root: Path, rev: str, rel_path: str) -> str | None:
@@ -827,6 +840,21 @@ def check_cargo_test_gating(data: dict, producer: dict, repo_root: Path) -> list
                     f"producer claims gating 'required-features' but {manifest_path} at {rev} "
                     f"has no `[[test]]` section named `{test_stem}` carrying `required-features`"
                 )
+    elif isinstance(gating, str) and gating.startswith("feature:"):
+        feature = gating.split(":", 1)[1]
+        manifest = _manifest_at(repo_root, rev, path)
+        declared = manifest is not None and re.search(
+            rf'(?m)^{re.escape(feature)}\s*=', _features_table(manifest[1])
+        )
+        gates = f'feature = "{feature}"' in source or (
+            manifest is not None
+            and feature in _test_target_required_features(manifest[1], Path(path).stem)
+        )
+        if not (declared and gates):
+            failures.append(
+                f"producer claims gating '{gating}' but at {rev} the crate does not declare "
+                f"`{feature}`, or neither {path} nor its `[[test]]` target is gated on it"
+            )
     # gating == "none": nothing further to verify.
 
     return failures
@@ -3235,6 +3263,28 @@ def self_test() -> int:
         bad["producer"]["path"] = "crates/no-rf-crate/tests/cuda_parity.rs"
         bad["producer"]["gating"] = "required-features"
         expect_hit(bad, "x.json", "has no `[[test]]` section", "rule (c): claimed required-features absent")
+
+        feat_dir = repo / "crates" / "feat-crate" / "tests"
+        feat_dir.mkdir(parents=True)
+        (feat_dir / "cuda_parity.rs").write_text(
+            '#[cfg(feature = "live-gpu-tests")]\n#[test]\nfn some_gated_test() {}\n'
+        )
+        (repo / "crates" / "feat-crate" / "Cargo.toml").write_text(
+            '[package]\nname = "feat-crate"\nversion = "0.0.0"\n\n'
+            '[features]\nlive-gpu-tests = []\n'
+        )
+        _run(["git", "add", "-A"], repo)
+        _run(["git", "commit", "-q", "-m", "feature-gated"], repo)
+        tracked = git_ls_files(repo)
+        feat_sha = _run(["git", "rev-parse", "HEAD"], repo).stdout.strip()
+        ok = baseline()
+        ok["git_sha"] = feat_sha
+        ok["producer"] = dict(ok["producer"])
+        ok["producer"]["path"] = "crates/feat-crate/tests/cuda_parity.rs"
+        ok["producer"]["gating"] = "feature:live-gpu-tests"
+        expect_clean(ok, "feature-gated.json", "rule (c): feature gating declared and applied")
+        bad = dict(ok, producer=dict(ok["producer"], gating="feature:live-metal-tests"))
+        expect_hit(bad, "x.json", "does not declare `live-metal-tests`", "rule (c): claimed feature absent")
 
         # rule (c) reads the test as it was when the artifact ran: a later
         # change to how the test is gated leaves the earlier record true.

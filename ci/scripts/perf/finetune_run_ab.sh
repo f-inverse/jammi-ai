@@ -188,19 +188,6 @@ set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 
-# require-env panic-not-skip (this repo's own `JAMMI_REQUIRE_CUDA` idiom --
-# see crates/jammi-ai/src/fine_tune/optimizer.rs, crates/jammi-kernels/
-# tests/cuda_parity.rs, ci/scripts/perf/clip_artifact_producer.sh's own
-# `export ... JAMMI_REQUIRE_CUDA=1`): a real (non-dry-run) run of this
-# producer is ALWAYS a GPU run -- there is no CPU-hermetic mode this
-# producer itself opts into by default (FINETUNE_RUN_AB_CPU=1 is an
-# explicit opt-OUT an operator can still set for local wiring smoke-tests).
-# Exporting this unconditionally makes a missing CUDA device on a real
-# invocation a hard failure inside the jammi-bench binary/its own test
-# surfaces, never a silent skip that would let a "green" run report numbers
-# that were actually computed on CPU.
-export JAMMI_REQUIRE_CUDA=1
-
 FINETUNE_RUN_AB_DRY_RUN="${FINETUNE_RUN_AB_DRY_RUN:-0}"
 FINETUNE_RUN_AB_SEEDS="${FINETUNE_RUN_AB_SEEDS:-1,2,3,4,5,6,7,8,9,10,11,12}"
 FINETUNE_RUN_AB_OBJECTIVE="${FINETUNE_RUN_AB_OBJECTIVE:-mnrl}"

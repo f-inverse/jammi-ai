@@ -20,8 +20,7 @@ pub(crate) const MANIFEST_PATH: &str = concat!(
 pub(crate) const MANIFEST_FUSED_OP_ADMISSION: &str = "fused_op_admission";
 
 /// The manifest capability list every [`ProbedOpKind::InternalSubkernel`] row
-/// belongs to — the category the campaign lead's manifest reclassification
-/// introduces for kernels that are launched unconditionally from inside an
+/// belongs to — the category for kernels that are launched unconditionally from inside an
 /// already-admitted parent's fused arm and therefore have NO admission gate
 /// of their own to assert `Holds` against.
 pub(crate) const MANIFEST_INTERNAL_SUBKERNELS: &str = "internal_subkernels";
@@ -36,7 +35,7 @@ pub(crate) const MANIFEST_FLASH_DTYPES: &str = "flash_dtypes";
 
 /// `(op, the parent whose fused dispatch proves it ran)`, DERIVED from
 /// [`PROBED_OPS`]'s [`ProbedOpKind::InternalSubkernel`] rows — the manifest's
-/// new `internal_subkernels` category.
+/// `internal_subkernels` category.
 pub(crate) fn internal_subkernel_ops() -> Vec<(&'static str, &'static str)> {
     PROBED_OPS
         .iter()
@@ -78,7 +77,7 @@ pub(crate) fn manifest_string_list(manifest: &serde_json::Value, capability: &st
 /// subkernel has no admission gate of its own and is PROVABLE only through its
 /// parent's dispatch, so the manifest records the proof RELATION alongside the
 /// name. A plain string list could name the op but not say what proves it —
-/// the same "claimed but unprovable" shape campaign #446 finding 2 was about.
+/// a "claimed but unprovable" entry.
 /// Returns `(op, parent)` pairs, sorted by op.
 pub(crate) fn manifest_internal_subkernels(manifest: &serde_json::Value) -> Vec<(String, String)> {
     let obj = manifest["lanes"][MANIFEST_LANE]["capabilities"][MANIFEST_INTERNAL_SUBKERNELS]

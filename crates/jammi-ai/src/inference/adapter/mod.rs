@@ -484,14 +484,12 @@ mod tests {
         assert_eq!(out.single_row_or_err(2).unwrap(), &[5.0, 6.0]);
     }
 
-    /// Pre-fix, `session.rs`'s `encode_image_query`/`encode_audio_query` read
-    /// `output.float_outputs[0][..dim].to_vec()` directly — a failed row 0
-    /// silently became the all-zero placeholder instead of an `Err`. This is
-    /// the oracle that would stay GREEN on that blind read (`[0.0, 0.0]` is a
-    /// valid slice) and only fails once the caller goes through the checked
-    /// accessor — verified by temporarily reverting `single_row_or_err`'s body
-    /// to `&self.float_outputs[0][row * dim..row * dim + dim]`, which turns
-    /// this RED (`Ok([0.0, 0.0])` vs the expected `Err`).
+    /// A caller reading `output.float_outputs[0][..dim]` directly turns a
+    /// failed row 0 into the all-zero placeholder instead of an `Err`
+    /// (`[0.0, 0.0]` is a valid slice). The checked accessor refuses it:
+    /// replacing `single_row_or_err`'s body with
+    /// `&self.float_outputs[0][row * dim..row * dim + dim]` fails this test
+    /// (`Ok([0.0, 0.0])` vs the expected `Err`).
     #[test]
     fn single_row_or_err_refuses_a_failed_row_naming_it() {
         let out = three_rows_row1_failed();
@@ -581,12 +579,11 @@ mod tests {
 
     // -- Shared consistency check (`checked_rows`), both accessors ---------
     //
-    // `all_rows_or_err` alone previously failed OPEN on an empty/short
-    // `row_status` (its `.position(|ok| !ok)` scan finds nothing wrong and
-    // would return a truncated/garbage slice as if every row succeeded),
-    // while `single_row_or_err` failed CLOSED via `row_status.get(row)`. Both
-    // now refuse, by name, on every one of these malformed states, via the
-    // one shared `checked_rows` gate.
+    // A `.position(|ok| !ok)` scan alone fails OPEN on an empty/short
+    // `row_status` (it finds nothing wrong and returns a truncated/garbage
+    // slice as if every row succeeded). Both accessors refuse, by name, on
+    // every one of these malformed states, via the one shared `checked_rows`
+    // gate.
 
     #[test]
     fn both_accessors_refuse_when_shapes_is_empty() {
@@ -671,15 +668,13 @@ mod tests {
         assert!(all_err.to_string().contains("row_errors"), "{all_err}");
     }
 
-    /// A producer with NO float head at all
-    /// (`float_outputs` empty) but a shape entry claiming 2 rows previously
-    /// PANICKED both accessors at `&self.float_outputs[0]` — `checked_rows`'s
-    /// old flat-length check read `float_outputs.first()` and treated an
-    /// absent head as an empty (len-0) buffer, which trivially satisfied
-    /// `rows*dim == 0` at `dim == 0` and let both accessors proceed to index
-    /// a `float_outputs` that has no element 0. Verified by reverting
-    /// `checked_rows` to drop the `float_outputs.len() != 1` check: this test
-    /// goes RED (a panic, not the `Err` asserted below).
+    /// A producer with NO float head at all (`float_outputs` empty) but a
+    /// shape entry claiming 2 rows. A flat-length check that reads
+    /// `float_outputs.first()` treats the absent head as an empty (len-0)
+    /// buffer, trivially satisfies `rows*dim == 0` at `dim == 0`, and lets
+    /// both accessors panic indexing `float_outputs[0]`. Dropping the
+    /// `float_outputs.len() != 1` check from `checked_rows` fails this test
+    /// (a panic, not the `Err` asserted below).
     #[test]
     fn both_accessors_refuse_a_producer_with_no_float_head() {
         let out = BackendOutput {
@@ -696,11 +691,10 @@ mod tests {
     /// Isolates the `float_outputs.len() != 1` check from the `dim == 0`
     /// check above: a NONZERO-dim shape with no float head at all would
     /// still slip past a `dim == 0` guard alone and panic at
-    /// `self.float_outputs[0]`. Verified by reverting `checked_rows` to drop
-    /// the `float_outputs.len() != 1` check (with the `dim == 0` check left
-    /// in place): this test goes RED (a panic, not the `Err` asserted
-    /// below), while the `dim == 0` fixture above would stay accidentally
-    /// green off the OTHER check alone.
+    /// `self.float_outputs[0]`. Dropping the `float_outputs.len() != 1` check
+    /// from `checked_rows` (with the `dim == 0` check left in place) fails
+    /// this test (a panic, not the `Err` asserted below), while the
+    /// `dim == 0` fixture above would still pass off the OTHER check alone.
     #[test]
     fn both_accessors_refuse_a_producer_with_no_float_head_and_a_nonzero_dim() {
         let out = BackendOutput {
@@ -714,12 +708,10 @@ mod tests {
         assert!(out.all_rows_or_err().is_err());
     }
 
-    /// A zero-dim head (`shapes[0].1 == 0`)
-    /// with a present-but-empty `float_outputs[0]` previously returned
-    /// `Ok(&[])` from both accessors — a vacuous "embedding" with no
-    /// dimensions, silently accepted as valid. Verified by reverting
-    /// `checked_rows` to drop the `dim == 0` check: this test goes RED
-    /// (`Ok([])` instead of the `Err` asserted below).
+    /// A zero-dim head (`shapes[0].1 == 0`) with a present-but-empty
+    /// `float_outputs[0]` must not return `Ok(&[])` — a vacuous "embedding"
+    /// with no dimensions. Dropping the `dim == 0` check from `checked_rows`
+    /// fails this test (`Ok([])` instead of the `Err` asserted below).
     #[test]
     fn both_accessors_refuse_a_zero_dim_head() {
         let out = BackendOutput {

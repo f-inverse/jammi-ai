@@ -1,9 +1,9 @@
 //! `InferenceSession::assemble_context` — context-set assembly + the
-//! permutation-invariant fixed-pooling set encoder (spec S16).
+//! permutation-invariant fixed-pooling set encoder.
 //!
 //! Hermetic: a tempdir-backed session embeds the `patents` fixture through the
 //! real embedding pipeline, then assembles and encodes context sets over the
-//! resulting embedding table. Exercises the contracts the spec bakes in —
+//! resulting embedding table. Exercises its contracts —
 //! self-exclusion (the leakage guard), determinism of exact pooling, the
 //! value-column hydration join, the empty-context path, and the materialised
 //! context table — and confirms the pool runs through the shared
@@ -474,9 +474,8 @@ async fn materialize_context_accepts_a_real_key_column_and_records_it() {
 }
 
 /// `recipe.value_columns` is recorded into the descriptor at this same write
-/// site, but was previously never checked against the source although the
-/// source is already resolved here — a decidable gap, the same class as the
-/// `key_column` guard above. A bad value column must be rejected at write
+/// site and is checked against the source, which is already resolved here —
+/// the same class of guard as the `key_column` one above. A bad value column must be rejected at write
 /// time, before it is recorded as a determinant `hydrate_value_columns` later
 /// discovers is unscannable.
 #[tokio::test]

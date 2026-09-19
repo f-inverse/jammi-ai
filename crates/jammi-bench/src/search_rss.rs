@@ -1,19 +1,19 @@
 //! The bounded-RSS proof for streamed exact vector search.
 //!
-//! W2 rewrote `exact_vector_search` to stream a DataFusion scan through a
-//! bounded top-`k` heap, replacing the old collect-every-vector pass. The bit-
-//! identical equivalence is proven inside the engine; what that proof cannot
+//! `exact_vector_search` streams a DataFusion scan through a bounded top-`k`
+//! heap rather than collecting every vector. Its bit-identical equivalence to a
+//! collect-all search is proven inside the engine; what that proof cannot
 //! show — because it runs in-process under a hermetic test — is that the
-//! streamed path actually *holds* a flat resident set while the old path's RSS
-//! grows with the corpus. This module is that out-of-process proof.
+//! streamed path actually *holds* a flat resident set while a collect-all
+//! path's RSS grows with the corpus. This module is that out-of-process proof.
 //!
 //! The shape of the proof:
 //!
-//! * A **negative control** — the old `O(N·d)` collect-all path, re-implemented
-//!   here (it no longer exists in the engine) so the assertion has teeth: if the
-//!   streamed path were secretly unbounded, the control would still grow, and a
-//!   "both flat" outcome would correctly *fail* the proof. RC1: an RSS assertion
-//!   must be able to fail.
+//! * A **negative control** — an `O(N·d)` collect-all path, implemented here
+//!   (the engine has none) so the assertion has teeth: if the streamed path
+//!   were secretly unbounded, the control would still grow, and a "both flat"
+//!   outcome would correctly *fail* the proof. An RSS assertion must be able to
+//!   fail.
 //! * Two corpus sizes, `N₁ < N₂`, chosen so the naive control's growth is
 //!   plainly visible (`N·d·4` bytes of vectors held at once) while staying well
 //!   under the box's RAM. The assertion: the streamed delta stays under a small
@@ -187,14 +187,14 @@ async fn scan_only_drain(
     Ok(seen)
 }
 
-/// A bench-only re-implementation of the *old* collect-all exact search — the
-/// negative control. It materializes every vector in the corpus into a single
-/// `Vec<Vec<f32>>` before scoring, exactly the `O(N·d)` pass W2 removed from the
-/// engine. Its result is bit-identical to the streamed path (proven in-engine);
-/// here only its *resident footprint* is the point.
+/// A bench-only collect-all exact search — the negative control. It
+/// materializes every vector in the corpus into a single `Vec<Vec<f32>>` before
+/// scoring, the `O(N·d)` pass the engine's streamed search avoids. Its result
+/// is bit-identical to the streamed path (proven in-engine); here only its
+/// *resident footprint* is the point.
 ///
-/// This deliberately duplicates the engine's pre-streaming shape rather than
-/// calling the engine — the engine no longer has this path, and the proof needs
+/// This deliberately implements the collect-all shape rather than calling the
+/// engine — the engine has no such path, and the proof needs
 /// the unbounded baseline to exist somewhere to drive RSS against.
 async fn naive_collect_all_search(
     ctx: &SessionContext,

@@ -6,8 +6,7 @@
 //! resolution, the `SortExec` the verb inserts, the operator, and the
 //! materialization funnel (the result table is a `ready` row carrying a manifest
 //! with a `ProducingDescriptor::AsofJoin` and an anchor for both inputs). The
-//! backward-inclusive correctness exit-criterion (#1) runs at the 1000-row × 50-
-//! group scale the spec pins.
+//! backward-inclusive correctness check runs at a 1000-row × 50-group scale.
 
 use std::sync::Arc;
 

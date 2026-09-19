@@ -1,14 +1,9 @@
 """A job handle outlives the connection that submitted it.
 
-`fine_tune` hands back a handle, but until now that handle was the ONLY way to
-reach the job from Python: it died with its connection (on the remote arm, with
-the channel), and no public verb re-attached to a job by id. The acceleration
-chapter hit this directly and had to build a `jammi.RemoteJob` out of
-`RemoteDatabase._job` / `._metadata` — private access it named as a gap.
-`JobService.ListJobs` was likewise served by the engine and exposed
-on neither arm, while the native `_NativeDatabase.job(job_id)` attach
-existed but was reachable through no client verb — the K4 asymmetry its own doc
-claims to close, still open one layer up.
+`fine_tune` hands back a handle, but a handle dies with its connection (on the
+remote arm, with the channel). `job(job_id)` re-attaches to a job by id from any
+connection, and `list_jobs()` exposes the engine's `JobService.ListJobs`, so no
+caller has to reach into private client state to find a job it did not submit.
 
 This module pins both verbs on the arm that needs no server:
 

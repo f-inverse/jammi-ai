@@ -20,8 +20,8 @@
 //! Because every attempt writes a unique `{job}/{worker}/{attempt}` prefix and
 //! the served pointer is written solely by the finalize CAS, the loser's prefix
 //! is never pointed-to; the only key the committed model resolves is the
-//! winner's. This is exactly the #22 content-addressed, commit-by-pointer
-//! contract, validated across process + host boundaries.
+//! winner's. This is the content-addressed, commit-by-pointer artifact
+//! model, validated across process + host boundaries.
 
 use jammi_db::storage::StorageUrl;
 

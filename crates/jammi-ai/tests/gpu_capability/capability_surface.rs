@@ -25,7 +25,7 @@
 //! ## TIER PREEMPTION: `attention_block` vs the flash cascade
 //!
 //! `ModernBertAttention::forward_training_attention`
-//! (`crates/jammi-encoders/src/modernbert.rs:~1192`) consults the flash
+//! (`crates/jammi-encoders/src/modernbert.rs`) consults the flash
 //! cascade FIRST and returns immediately on `CascadeOutcome::Fused` —
 //! `attention_block_fused`'s own `admit()` call is never even reached in
 //! that case. So on a `flash-attn`-compiled build, for a dtype the manifest's
@@ -95,10 +95,9 @@
 //! purpose-shaped ModernBERT (`hidden_size=64, num_attention_heads=1` →
 //! `head_dim=64`) directly via `jammi_encoders::ModernBert::builder`, with
 //! synthetic (`Tensor::randn`) weights written once to a temp safetensors
-//! file — the same pattern as
-//! `crates/jammi-encoders/tests/esc076_comparable_eager_control.rs` (driving
-//! the encoder/trainer seam with synthetic weights, checkpoint-shape fidelity
-//! preserved, for a controlled-shape admission probe).
+//! file — the same pattern as `jammi-encoders`' eager-control memory test
+//! (driving the encoder/trainer seam with synthetic weights, checkpoint-shape
+//! fidelity preserved, for a controlled-shape admission probe).
 //! `global_attn_every_n_layers = 1` makes every layer global (no
 //! sliding-window local-mask path), keeping the domain surface to exactly
 //! the dtype/head-dim/seq checks this test cares about. The whole model
@@ -114,9 +113,9 @@
 //! a "running 0 tests" match as a hard failure — this file's presence and
 //! this function's name are load-bearing, not cosmetic.
 //!
-//! Gated like the rest of the suite: `live-gpu-tests` + a meaningful run also
-//! needs `cuda` + a visible GPU; without them it skips loudly via
-//! `skip_without_gpu!` (never `#[ignore]`).
+//! Gated like the rest of the suite: compiled only under `live-gpu-tests`;
+//! CUDA device 0 is acquired through `jammi_test_resources`, which panics
+//! naming it when absent.
 //!
 //! ## `gelu_erf` needs its OWN architecture, not ModernBERT's
 //!
@@ -124,7 +123,9 @@
 //! (`crate::modernbert::geglu_apply_training`'s `gate.gelu_erf()? * up`) calls
 //! candle's plain `Tensor::gelu_erf()` directly — it never reaches
 //! `jammi_encoders::activations::gelu_erf`, the seam `gelu_erf_fused` actually
-//! admits through (wired ONLY at `BertIntermediate::forward`'s `gelu_erf(&hidden, training)` (`crates/jammi-encoders/src/bert.rs:296`) and `DistilBertFfn::forward`'s `gelu_erf(&mid, training)` (`crates/jammi-encoders/src/distilbert.rs:213`) — see
+//! admits through (wired ONLY at `BertIntermediate::forward`'s
+//! `gelu_erf(&hidden, training)` and `DistilBertFfn::forward`'s
+//! `gelu_erf(&mid, training)` — see
 //! `jammi_kernels::admission::PROBED_OPS`'s own `gelu_erf` row doc). So
 //! [`probe_dtype`]'s ModernBERT forward can never move `gelu_erf_fused`'s
 //! counter, regardless of dtype or Strict mode: declaring `gelu_erf` in the
@@ -199,7 +200,7 @@ fn dtype_class(p: ComputePrecision) -> DtypeClass {
 /// `"dropout"` and `"low_rank_residual_linear"` both resolve to
 /// `lora_linear_fused` — that is a fact of the table now, not of this file
 /// (the separate `lora_dropout` counter is permanently `{fused: 0, eager: 0}`,
-/// `crates/jammi-lora/src/lora_linear.rs:22`, per that counter's own doc;
+/// per `jammi_lora::lora_linear`'s dropout-counter doc;
 /// dropout is consumed directly inside `LowRankResidualLinear`'s own
 /// fused-or-eager arm, folded into the SAME dispatch decision).
 ///
@@ -308,9 +309,9 @@ fn probe_config() -> ModernBertConfig {
 }
 
 /// Every tensor `ModernBertBuilder::build` expects, at real-checkpoint names
-/// and shapes, filled with `Tensor::randn` — mirrors
-/// `crates/jammi-encoders/tests/esc076_comparable_eager_control.rs`'s
-/// `write_synthetic_checkpoint` (values never matter for an admission probe,
+/// and shapes, filled with `Tensor::randn` — mirrors the
+/// `write_synthetic_checkpoint` of `jammi-encoders`' eager-control memory test
+/// (values never matter for an admission probe,
 /// only shapes/dtypes/names do).
 fn write_synthetic_checkpoint(config: &ModernBertConfig, path: &Path) {
     let cpu = Device::Cpu;
@@ -692,8 +693,7 @@ async fn capability_surface() {
         // dispatch-registry key through the BERT/DistilBERT cascade wiring,
         // mirroring `ModernBertAttention`'s call but with `flash` always
         // `Declined` (BERT has no flash transport wired at all, any dtype —
-        // see `forward_training`'s own doc,
-        // `crates/jammi-encoders/src/bert.rs:190`). A snapshot taken AFTER
+        // see `jammi_encoders::bert`'s `forward_training` doc). A snapshot taken AFTER
         // `bert_probe_dtype` ran (e.g. re-reading live counters down in the
         // `attention_block` block, by which point the `gelu_erf` block's
         // `bert_probe_dtype` call has already run) folds BERT's own
@@ -879,21 +879,18 @@ async fn capability_surface() {
     }
 }
 
-/// The `gelu_erf` seam's CPU-hermetic two-sided counter proof (issue #463
-/// follow-up): [`bert_probe_dtype`]'s BERT-family training forward at CPU F32
+/// The `gelu_erf` seam's CPU-hermetic two-sided counter proof:
+/// [`bert_probe_dtype`]'s BERT-family training forward at CPU F32
 /// — the ONE dtype/device pair `gelu_admission_predicate`'s CPU domain admits
 /// (`crates/jammi-encoders/src/activations.rs`'s own `dtype_f32_only_on_cpu`
 /// check) — must bump `gelu_erf_fused`'s FUSED counter and leave its EAGER
 /// counter untouched.
 ///
-/// Runs on every lane: no `cuda` feature or GPU needed
-/// (`Bert::builder().backbone_dtype(DType::F32)` on `Device::Cpu` is an
-/// entirely ordinary CPU build). That is exactly why the async
-/// `capability_surface` test above cannot rely on this test ALONE — it still
-/// has to repeat the same proof on a real CUDA device at bf16/f16, which only
-/// a real GPU can admit (`gelu_admission_predicate`'s CUDA arm); this test
-/// covers the CPU F32 leg the `live-gpu-tests`-gated but GPU-less CI lane can
-/// actually run. Takes [`crate::harness::ADMISSION_COUNTER_SERIAL`] — see
+/// Needs no GPU (`Bert::builder().backbone_dtype(DType::F32)` on
+/// `Device::Cpu` is an entirely ordinary CPU build), so it covers only the
+/// CPU F32 leg: the async `capability_surface` test above repeats the same
+/// proof on a real CUDA device at bf16/f16, which only a real GPU can admit
+/// (`gelu_admission_predicate`'s CUDA arm). Takes [`crate::harness::ADMISSION_COUNTER_SERIAL`] — see
 /// that lock's own doc for why a process-wide registry counter needs one.
 #[test]
 fn gelu_erf_fused_bumps_on_a_bert_family_training_forward_cpu_hermetic() {

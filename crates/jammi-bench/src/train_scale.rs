@@ -750,7 +750,7 @@ mod tests {
 
     /// The committed throughput baseline is a real gating reference with teeth:
     /// a run *at* the baseline clears the gate, and a run that regressed past the
-    /// threshold *fails* it (RC1 — a regression gate must be able to fail). This
+    /// threshold *fails* it (a regression gate must be able to fail). This
     /// proves the committed `baselines/training.json` is a well-formed,
     /// generously-thresholded same-box baseline the `train-scale` subcommand's
     /// measured rate is gated against, without re-measuring the (slow,

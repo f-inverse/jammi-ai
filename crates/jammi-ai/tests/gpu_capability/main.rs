@@ -58,18 +58,20 @@
 //!
 //! ## Gating
 //!
-//! The suite is **off by default**: it compiles and runs only under the
-//! `live-gpu-tests` cargo feature, and a meaningful run *also* needs the `cuda`
-//! feature and a visible GPU. Every test early-returns with a `tracing::warn`
-//! skip (never `#[ignore]`) when the `cuda` feature is off or no CUDA device
-//! opens, so the default `cargo test` lane is unaffected. The GPU sessions pin
-//! `require_gpu = true`, so on a CUDA build with a real GPU a parity test that
-//! reached `select_device` *must* have run on the GPU — a GPU-less build fails
-//! fast at session construction rather than silently degrading to CPU and
-//! faking parity.
+//! The suite is **off by default**: it compiles only under the
+//! `live-gpu-tests` cargo feature (which enables `cuda`), so the default
+//! `cargo test` lane never builds it. Under that feature the host is declared
+//! to have CUDA device 0: a test acquires it through
+//! `jammi_test_resources::cuda_device` (or `harness::serial_cuda_device`),
+//! which panics naming the missing device. The two-device and two-host gang
+//! legs compile only under `live-gpu-gang-tests` / `live-gpu-cluster-tests`.
+//! The GPU sessions pin `require_gpu = true`, so a parity test that reached
+//! `select_device` *must* have run on the GPU — a host without one fails at
+//! session construction rather than silently degrading to CPU and faking
+//! parity.
 //!
-//! The live run is a GPU-host (A10G) gate:
-//! `cargo test -p jammi-ai --features cuda,live-gpu-tests gpu_capability \
+//! The live run is a GPU-host gate:
+//! `cargo test -p jammi-ai --features live-gpu-tests --test gpu_capability \
 //!  -- --nocapture --test-threads=1`.
 
 mod harness;

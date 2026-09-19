@@ -1,4 +1,4 @@
-//! `InferenceSession::assemble_context` over **declared edges** (spec S16-G):
+//! `InferenceSession::assemble_context` over **declared edges**:
 //! the bounded, target-anchored graph-neighbourhood context, its homophily
 //! diagnostic, and — load-bearing — that the gather runs inside the tenant
 //! scope so a cross-tenant edge endpoint is never materialised.

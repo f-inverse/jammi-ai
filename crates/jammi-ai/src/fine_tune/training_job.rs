@@ -53,7 +53,7 @@ impl TrainingJob {
                 .parse()
                 .map_err(|e| JammiError::FineTune(format!("{e}")))?;
             // Derived from `JobStatus::is_terminal_unsuccessful`/`Completed`
-            // (the ONE terminality predicate, `status.rs:70-72`/`:78-85`)
+            // (the ONE terminality predicate on `JobStatus`)
             // rather than a per-variant match arm, so a new terminal-
             // unsuccessful status joining the vocabulary ends this wait with a
             // one-line edit, not a hunt for every per-variant match arm.

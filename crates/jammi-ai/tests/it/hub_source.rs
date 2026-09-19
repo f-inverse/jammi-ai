@@ -44,8 +44,8 @@ async fn mount_repo_file(server: &MockServer, repo_id: &str, filename: &str, bod
         .and(path(format!("/{repo_id}/resolve/main/{filename}")))
         .respond_with(
             ResponseTemplate::new(200)
-                .insert_header("etag", "\"esc096-etag\"")
-                .insert_header("x-repo-commit", "esc096commit")
+                .insert_header("etag", "\"hub-source-etag\"")
+                .insert_header("x-repo-commit", "hubsourcecommit")
                 .insert_header("content-range", format!("bytes 0-0/{}", body.len()))
                 .set_body_bytes(body),
         )

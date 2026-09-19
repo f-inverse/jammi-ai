@@ -10,14 +10,10 @@
 //! mask that does not mean what the caller intended) and one genuinely
 //! padded end-to-end run.
 //!
-//! CUDA-gated cases (the padded-shape block-arm VRAM baseline leg, and the
+//! CUDA cases (the padded-shape block-arm VRAM baseline leg, and the
 //! padded loss-sequence flash-vs-block A/B) live in
-//! `finetune_step_padded_cuda.rs`, next to this file, gated on
-//! [`cuda_available`] — the SAME `#[cfg(feature = "cuda")]` +
-//! `Device::new_cuda(0).is_ok()` shape `crates/jammi-ai/tests/gpu_capability/
-//! harness.rs`'s own `gpu_available()` uses, so a GPU-less or
-//! cuda-feature-off host skips them HONESTLY (a stated per-skip reason,
-//! never a silent pass) rather than reading green for having run nothing.
+//! `finetune_step_padded_cuda.rs`, next to this file, compiled only under
+//! the `live-gpu-tests` feature.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

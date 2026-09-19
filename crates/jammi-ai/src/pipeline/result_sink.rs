@@ -33,7 +33,7 @@ pub struct ResultSink<'a> {
     /// rather than concatenating) — measured directly against an
     /// independently-collected merged batch count by
     /// `tests/it/rangesplit.rs`'s
-    /// `rs8_checkpoint_counts_the_merged_batches_under_partitions_two`,
+    /// `checkpoint_counts_the_merged_batches_under_partitions_two`,
     /// whose three-source-batch fixture (one 3-row file scanned under
     /// `engine.batch_size = 1`, so each row is its own batch) measures a
     /// non-trivial merged count of 3 across 2 partitions (asserted

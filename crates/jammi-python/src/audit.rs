@@ -1,4 +1,4 @@
-//! Python bindings for the per-query audit primitive (spec J2).
+//! Python bindings for the per-query audit primitive.
 //!
 //! Surfaces a `PerQueryAudit` record pyclass and a `db.audit` handle with
 //! `log`, `fetch_by_query_id`, and `fetch_recent`. The handle shares the

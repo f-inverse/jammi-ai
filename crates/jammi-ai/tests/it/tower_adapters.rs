@@ -459,7 +459,7 @@ async fn open_clip_text_tower_adapter_serves_cold_after_restart() {
         "open_clip text (cold vs warm)",
     );
 
-    common::assert_esc089_cold_restart_controls(common::Esc089ColdRestartControls {
+    common::assert_cold_restart_controls(common::ColdRestartControls {
         session_root: dir.path(),
         warm_session: &session,
         cold_session: &cold_session,
@@ -839,7 +839,7 @@ async fn open_clip_vision_tower_adapter_serves_cold_after_restart() {
     );
 
     let probe_bytes = Arc::new(probe_bytes);
-    common::assert_esc089_cold_restart_controls(common::Esc089ColdRestartControls {
+    common::assert_cold_restart_controls(common::ColdRestartControls {
         session_root: dir.path(),
         warm_session: &session,
         cold_session: &cold_session,
@@ -1035,7 +1035,7 @@ async fn clap_audio_tower_adapter_serves_cold_after_restart() {
     );
 
     let probe_bytes = Arc::new(probe_bytes);
-    common::assert_esc089_cold_restart_controls(common::Esc089ColdRestartControls {
+    common::assert_cold_restart_controls(common::ColdRestartControls {
         session_root: dir.path(),
         warm_session: &session,
         cold_session: &cold_session,
@@ -1083,8 +1083,8 @@ async fn unsupported_model_type_refuses_instead_of_coercing_to_bert() {
         .unwrap();
 
     // A byte-for-byte `tiny_bert` copy with ONE field changed. Everything else
-    // still parses as a `BertConfig`, which is precisely why the old default
-    // arm trained happily.
+    // still parses as a `BertConfig`, which is precisely why a catch-all
+    // default arm would train happily.
     let model_dir = dir.path().join("gpt2_flavoured_bert");
     std::fs::create_dir_all(&model_dir).unwrap();
     let fixture = common::cookbook_fixture("tiny_bert");

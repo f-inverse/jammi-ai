@@ -565,7 +565,7 @@ mod tests {
         );
     }
 
-    /// The teeth, GATE-FAILS direction (RC1: an assertion must be able to fail). A
+    /// The teeth, GATE-FAILS direction (an assertion must be able to fail). A
     /// simulated regression — a tampered golden value off the true fold by more
     /// than the tolerance — fails the gate, proving it is non-vacuous.
     #[test]

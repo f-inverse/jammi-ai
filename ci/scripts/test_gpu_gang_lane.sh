@@ -438,6 +438,19 @@ else
 fi
 
 # ============================================================================
+# G11: the expanded remote script deepens the clone exactly once. The shared
+# checkout (runpod_lib.sh) owns that step; a second `--unshallow`, on the
+# by-then complete repository, is a git error that ends the leg before it
+# builds anything — on a pod already rented.
+# ============================================================================
+unshallow_steps="$(printf '%s\n' "$remote_text" | grep -v '^[[:space:]]*#' | grep -cE 'git fetch[^|]*--unshallow')"
+if [ "$unshallow_steps" -eq 1 ]; then
+  ok "G11: the expanded remote script deepens the clone exactly once"
+else
+  bad "G11: the expanded remote script has $unshallow_steps --unshallow steps (expected exactly 1: a second one fails on a complete repository)"
+fi
+
+# ============================================================================
 # G7: NO schedule: key anywhere in the committed gpu-gang.yml (U7b-A1-pull
 # P5). This row is itself deleted the moment U7b-A3 re-adds the schedule
 # block with its own never-vacuous writer, in the same diff as that writer —

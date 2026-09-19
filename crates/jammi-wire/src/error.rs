@@ -1180,7 +1180,7 @@ mod tests {
     /// faithfully (see `mutable_table_variant_round_trips_faithfully`).
     #[test]
     fn foreign_source_variant_folds_to_other_with_faithful_display() {
-        let io = JammiError::Io(std::io::Error::new(
+        let io = JammiError::from(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "model.safetensors not found",
         ));

@@ -2904,10 +2904,7 @@ impl ResultStore {
                     .await;
                 let row_count = match storage::reader::count_parquet_rows(&parquet_handle).await {
                     Ok(n) => n,
-                    Err(storage::StorageError::Io {
-                        source: object_store::Error::NotFound { .. },
-                        ..
-                    }) => {
+                    Err(storage::StorageError::NotFound { .. }) => {
                         warn!(
                             table = table.table_name,
                             "Recovery: classified Promote but its Parquet vanished after claim, \
@@ -5272,7 +5269,7 @@ fn materialization_sidecar_path(handle: &JammiObjectStore) -> Result<object_stor
 pub fn manifest_to_jammi(e: ManifestError) -> JammiError {
     match e {
         ManifestError::Storage(s) => JammiError::Storage(s),
-        ManifestError::Serde(s) => JammiError::Json(s),
+        ManifestError::Serde(s) => s.into(),
         other => JammiError::Catalog(other.to_string()),
     }
 }

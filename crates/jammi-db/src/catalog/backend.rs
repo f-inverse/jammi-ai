@@ -768,7 +768,7 @@ impl FromSqlValue for serde_json::Value {
 
 /// Backend-agnostic error taxonomy. Variants are populated by [`classify`]
 /// from raw `sqlx::Error`.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum BackendError {
     #[error("backend execution failure: {0}")]
     Execution(String),
@@ -818,7 +818,7 @@ pub enum BackendError {
         detail: String,
     },
     #[error("sqlx backend error: {0}")]
-    Sqlx(#[from] sqlx::Error),
+    Sqlx(#[source] std::sync::Arc<sqlx::Error>),
 }
 
 /// Ceiling on the post-`close` drain. Reaching it means a connection never
@@ -1043,7 +1043,7 @@ pub fn classify(err: sqlx::Error) -> BackendError {
             }
         }
         PoolTimedOut | PoolClosed => BackendError::Unavailable(err.to_string()),
-        _ => BackendError::Sqlx(err),
+        _ => BackendError::Sqlx(std::sync::Arc::new(err)),
     }
 }
 

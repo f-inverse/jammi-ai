@@ -1,7 +1,12 @@
 use thiserror::Error;
 
 /// Unified error type for all Jammi DB operations.
-#[derive(Debug, Error)]
+///
+/// `Clone`: an error raised below an exchange reaches every consumer of it
+/// (DataFusion hands each a `Shared(Arc<_>)`), so every one of them must be able
+/// to take the typed error out. Foreign payloads that are not `Clone` are held
+/// behind an `Arc`.
+#[derive(Debug, Clone, Error)]
 pub enum JammiError {
     /// Invalid or missing configuration value.
     #[error("Configuration error: {0}")]
@@ -76,7 +81,7 @@ pub enum JammiError {
 
     /// Filesystem I/O error.
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[source] std::sync::Arc<std::io::Error>),
 
     /// Catalog backend (SQLite / Postgres) error.
     #[error("Backend error: {0}")]
@@ -92,7 +97,7 @@ pub enum JammiError {
 
     /// JSON serialization/deserialization error.
     #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
+    Json(#[source] std::sync::Arc<serde_json::Error>),
 
     /// DataFusion query-engine error.
     ///
@@ -105,7 +110,7 @@ pub enum JammiError {
     /// converts a DataFusion error routes through it by construction. The
     /// attribute keeps `source()` intact (thiserror's `#[from]` implied it).
     #[error("DataFusion error: {0}")]
-    DataFusion(#[source] datafusion::error::DataFusionError),
+    DataFusion(#[source] std::sync::Arc<datafusion::error::DataFusionError>),
 
     /// A channel-catalog operation (register a channel, append columns) failed
     /// with a caller-facing condition the gRPC surface must distinguish
@@ -544,51 +549,50 @@ impl NonUniqueScan {
 }
 
 /// The structural classifier: how EVERY DataFusion error becomes a
-/// [`JammiError`].
+/// [`JammiError`] — one borrowed walk of the `source()` chain, outermost first,
+/// stopping at the first error that is one of:
 ///
-/// Two shapes, in order. **(a) owned passthrough** — an
-/// `External(Box<JammiError>)` payload (a typed error a plan node, provider or
-/// UDF raised) is destructured BY VALUE back into the inner `JammiError`, also
-/// when nested under `Context`, `ArrowError(ExternalError)` or
-/// `ParquetError(External)`; a miss rebuilds the original unchanged. **(b) a
-/// borrowed `source()` walk** — an `object_store::Error::NotFound` found at any
-/// depth (the parquet reader wraps it under `ParquetError::External`, which
-/// neither a top-level `ObjectStore` arm nor DataFusion's `find_root` reaches)
-/// becomes [`JammiError::Storage`] with the existing `StorageError::Io { source:
-/// NotFound { .. } }` spelling every reader already matches. Everything else
-/// keeps the shape [`JammiError::DataFusion`] with `source()` intact.
-/// `Shared(Arc<_>)` cannot yield ownership and is a stated fidelity limit of
-/// shape (a); shape (b) still walks it.
+/// 1. a [`JammiError`] payload (a typed error a plan node, provider or UDF
+///    raised as `External`), cloned out — at any depth, under `Context`,
+///    `ArrowError(ExternalError)`, `ParquetError(External)`, or the
+///    `Shared(Arc<_>)` an exchange hands each of its consumers;
+/// 2. a `ResourcesExhausted`, always typed;
+/// 3. an `object_store::Error::NotFound` (the parquet reader wraps it under
+///    `ParquetError::External`, which no top-level arm reaches), as
+///    [`StorageError::NotFound`](crate::storage::StorageError::NotFound).
+///
+/// Everything else keeps the shape [`JammiError::DataFusion`] with `source()`
+/// intact.
 impl From<datafusion::error::DataFusionError> for JammiError {
     fn from(e: datafusion::error::DataFusionError) -> Self {
-        match unwrap_jammi(e) {
-            Ok(inner) => inner,
-            Err(e) => {
-                // Shape (c): a `ResourcesExhausted` anywhere in the source
-                // chain (bare, or nested under `Context`) is always typed —
-                // checked before shape (b)'s not-found walk so a pool
-                // exhaustion is never mistaken for an object-store miss.
-                if let Some(msg) = resources_exhausted_message(&e) {
-                    return JammiError::ResourcesExhausted {
-                        limit_bytes: parse_pool_size_bytes(&msg).unwrap_or(0),
-                        detail: msg,
-                    };
-                }
-                match not_found_path(&e) {
-                    Some((path, original)) => {
-                        JammiError::Storage(crate::storage::StorageError::Io {
-                            path: path.clone(),
-                            source: object_store::Error::NotFound {
-                                path,
-                                source: Box::<dyn std::error::Error + Send + Sync>::from(original),
-                            },
-                        })
-                    }
-                    None => JammiError::DataFusion(e),
-                }
+        use datafusion::error::DataFusionError as DF;
+        let typed = source_chain(&e).find_map(|err| {
+            if let Some(inner) = err.downcast_ref::<JammiError>() {
+                Some(inner.clone())
+            } else if let Some(DF::ResourcesExhausted(msg)) = err.downcast_ref::<DF>() {
+                Some(JammiError::ResourcesExhausted {
+                    limit_bytes: parse_pool_size_bytes(msg).unwrap_or(0),
+                    detail: msg.clone(),
+                })
+            } else if let Some(object_store::Error::NotFound { path, .. }) =
+                err.downcast_ref::<object_store::Error>()
+            {
+                Some(JammiError::Storage(
+                    crate::storage::StorageError::not_found(path.clone(), err.to_string()),
+                ))
+            } else {
+                None
             }
-        }
+        });
+        typed.unwrap_or_else(|| JammiError::DataFusion(std::sync::Arc::new(e)))
     }
+}
+
+/// `e`, then every error `source()` reaches from it.
+fn source_chain<'a>(
+    e: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+    std::iter::successors(Some(e), |err| err.source())
 }
 
 /// A refused query vector, classified by its provenance
@@ -661,81 +665,16 @@ impl From<jammi_numerics::query::QueryValidationError> for JammiError {
     }
 }
 
-/// Shape (a): destructure `e` by value looking for an `External(Box<JammiError>)`
-/// payload, recursing through the three Box-carrying wrappers and rebuilding the
-/// original on a miss.
-fn unwrap_jammi(
-    e: datafusion::error::DataFusionError,
-) -> std::result::Result<JammiError, datafusion::error::DataFusionError> {
-    use datafusion::error::DataFusionError as DF;
-    match e {
-        DF::External(b) => match b.downcast::<JammiError>() {
-            Ok(j) => Ok(*j),
-            Err(b) => Err(DF::External(b)),
-        },
-        DF::Context(msg, inner) => match unwrap_jammi(*inner) {
-            Ok(j) => Ok(j),
-            Err(back) => Err(DF::Context(msg, Box::new(back))),
-        },
-        DF::ArrowError(b, bt) => match *b {
-            arrow::error::ArrowError::ExternalError(inner) => {
-                match inner.downcast::<JammiError>() {
-                    Ok(j) => Ok(*j),
-                    Err(inner) => Err(DF::ArrowError(
-                        Box::new(arrow::error::ArrowError::ExternalError(inner)),
-                        bt,
-                    )),
-                }
-            }
-            other => Err(DF::ArrowError(Box::new(other), bt)),
-        },
-        DF::ParquetError(b) => match *b {
-            parquet::errors::ParquetError::External(inner) => {
-                match inner.downcast::<JammiError>() {
-                    Ok(j) => Ok(*j),
-                    Err(inner) => Err(DF::ParquetError(Box::new(
-                        parquet::errors::ParquetError::External(inner),
-                    ))),
-                }
-            }
-            other => Err(DF::ParquetError(Box::new(other))),
-        },
-        other => Err(other),
+impl From<std::io::Error> for JammiError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(std::sync::Arc::new(e))
     }
 }
 
-/// Shape (b): walk `source()` from `e` and return the first
-/// `object_store::Error::NotFound` (its `path` and the original's `Display`).
-fn not_found_path(e: &datafusion::error::DataFusionError) -> Option<(String, String)> {
-    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
-    while let Some(err) = cur {
-        if let Some(object_store::Error::NotFound { path, .. }) =
-            err.downcast_ref::<object_store::Error>()
-        {
-            return Some((path.clone(), err.to_string()));
-        }
-        cur = err.source();
+impl From<serde_json::Error> for JammiError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Json(std::sync::Arc::new(e))
     }
-    None
-}
-
-/// Shape (c): walk `source()` from `e` and return the first
-/// `DataFusionError::ResourcesExhausted`'s message, checking `e` itself
-/// first (the common case: a bare `ResourcesExhausted` with nothing wrapping
-/// it) then every inner error `.source()` reaches — a `Context(msg, inner)`
-/// wrapping one is the shape `unwrap_jammi`'s `Err` branch hands back
-/// unchanged when there was no `JammiError` payload to restore.
-fn resources_exhausted_message(e: &datafusion::error::DataFusionError) -> Option<String> {
-    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
-    while let Some(err) = cur {
-        if let Some(datafusion::error::DataFusionError::ResourcesExhausted(msg)) =
-            err.downcast_ref::<datafusion::error::DataFusionError>()
-        {
-            return Some(msg.clone());
-        }
-        cur = err.source();
-    }
-    None
 }
 
 /// Best-effort recovery of a `GreedyMemoryPool`/`FairSpillPool`'s configured
@@ -786,8 +725,8 @@ mod tests {
         }
     }
 
-    /// Shape (a): a typed engine error a plan node raised, wrapped by the
-    /// optimizer's `Context`, comes back as the exact variant.
+    /// A typed engine error a plan node raised, wrapped by the optimizer's
+    /// `Context`, comes back as the exact variant.
     #[test]
     fn classifier_restores_a_nested_external_jammi_error() {
         let e = DF::Context(
@@ -806,23 +745,52 @@ mod tests {
         }
     }
 
-    /// Shape (b): an object-store not-found nested under the parquet reader's
-    /// `External` (where no top-level arm reaches) becomes the typed `Storage`
-    /// not-found every reader already matches, naming the path.
+    /// An exchange hands every consumer the same upstream error as
+    /// `Shared(Arc<_>)`, and other clones of the `Arc` are alive while each one
+    /// classifies it. Every consumer still gets the exact typed variant.
+    #[test]
+    fn classifier_restores_a_typed_error_from_every_clone_of_a_shared_error() {
+        let shared = std::sync::Arc::new(DF::Context(
+            "below the exchange".into(),
+            Box::new(DF::External(Box::new(JammiError::InvalidKey {
+                column: "id".into(),
+                null_count: 3,
+            }))),
+        ));
+        let consumers = [DF::Shared(shared.clone()), DF::Shared(shared.clone())];
+        for e in consumers {
+            assert!(
+                matches!(
+                    JammiError::from(e),
+                    JammiError::InvalidKey { ref column, null_count: 3 } if column == "id"
+                ),
+                "every consumer of a shared error classifies it typed"
+            );
+        }
+        let exhausted = std::sync::Arc::new(DF::ResourcesExhausted("pool_size: 64.0 KB)".into()));
+        let _other_consumer = exhausted.clone();
+        assert!(matches!(
+            JammiError::from(DF::Shared(exhausted)),
+            JammiError::ResourcesExhausted {
+                limit_bytes: 65536,
+                ..
+            }
+        ));
+    }
+
+    /// An object-store not-found nested under the parquet reader's `External`
+    /// (where no top-level arm reaches) becomes the typed storage not-found,
+    /// naming the path.
     #[test]
     fn classifier_types_a_nested_object_store_not_found() {
         let e = DF::ParquetError(Box::new(parquet::errors::ParquetError::External(Box::new(
             not_found("t__v1.parquet"),
         ))));
         match JammiError::from(e) {
-            JammiError::Storage(crate::storage::StorageError::Io {
-                path,
-                source: object_store::Error::NotFound { path: inner, .. },
-            }) => {
+            JammiError::Storage(crate::storage::StorageError::NotFound { path, .. }) => {
                 assert_eq!(path, "t__v1.parquet");
-                assert_eq!(inner, "t__v1.parquet");
             }
-            other => panic!("expected Storage(Io(NotFound)), got {other:?}"),
+            other => panic!("expected Storage(NotFound), got {other:?}"),
         }
     }
 
@@ -831,7 +799,7 @@ mod tests {
     #[test]
     fn classifier_keeps_other_errors_as_datafusion_with_source() {
         match JammiError::from(DF::Plan("x".into())) {
-            JammiError::DataFusion(DF::Plan(m)) => assert_eq!(m, "x"),
+            JammiError::DataFusion(e) => assert!(matches!(&*e, DF::Plan(m) if m == "x")),
             other => panic!("expected DataFusion(Plan), got {other:?}"),
         }
         let j = JammiError::from(DF::ArrowError(
@@ -845,7 +813,7 @@ mod tests {
         );
     }
 
-    /// Shape (c): a bare `ResourcesExhausted` becomes the typed variant,
+    /// A bare `ResourcesExhausted` becomes the typed variant,
     /// naming the raising message verbatim in `detail` and recovering the
     /// pool size from its `Display` impl in `limit_bytes`.
     #[test]
@@ -866,10 +834,8 @@ mod tests {
         }
     }
 
-    /// Shape (c) nested: a `ResourcesExhausted` wrapped in `Context` (the
-    /// shape `unwrap_jammi`'s `Err` branch hands back unchanged, since there
-    /// is no `JammiError` payload inside) is still classified, never falling
-    /// through to the generic `DataFusion` catch-all.
+    /// A `ResourcesExhausted` wrapped in `Context` is still classified, never
+    /// falling through to the generic `DataFusion` catch-all.
     #[test]
     fn classifier_types_a_resources_exhausted_nested_under_context() {
         let e = DF::Context(

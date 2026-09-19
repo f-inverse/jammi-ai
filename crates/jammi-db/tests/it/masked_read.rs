@@ -706,13 +706,10 @@ async fn mid_scan_object_vanish_is_a_typed_not_found() {
         .unwrap()
         .expect_err("the vanished fragment must fail the query, never a partial count");
     match JammiError::from(err) {
-        JammiError::Storage(jammi_db::storage::StorageError::Io {
-            path,
-            source: object_store::Error::NotFound { .. },
-        }) => assert!(
+        JammiError::Storage(jammi_db::storage::StorageError::NotFound { path, .. }) => assert!(
             path.contains("__v1.parquet"),
             "the typed not-found names the fragment: {path}"
         ),
-        other => panic!("expected Storage(Io(NotFound)), got {other:?}"),
+        other => panic!("expected Storage(NotFound), got {other:?}"),
     }
 }

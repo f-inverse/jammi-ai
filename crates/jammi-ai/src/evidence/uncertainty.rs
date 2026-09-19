@@ -136,7 +136,7 @@ pub fn contribution(outputs: &[UncertaintyOutput]) -> Result<ChannelContribution
                 levels,
                 context_ref: ctx,
             } => {
-                let json = serde_json::to_string(levels).map_err(JammiError::Json)?;
+                let json = serde_json::to_string(levels).map_err(JammiError::from)?;
                 mean.push(None);
                 std.push(None);
                 quantiles.push(Some(json));
@@ -160,7 +160,7 @@ pub fn contribution(outputs: &[UncertaintyOutput]) -> Result<ChannelContribution
 /// Encode the optional S16 context provenance as a JSON id list, or `None`.
 fn encode_context(ctx: &Option<Vec<String>>) -> Result<Option<String>> {
     match ctx {
-        Some(ids) => Ok(Some(serde_json::to_string(ids).map_err(JammiError::Json)?)),
+        Some(ids) => Ok(Some(serde_json::to_string(ids).map_err(JammiError::from)?)),
         None => Ok(None),
     }
 }

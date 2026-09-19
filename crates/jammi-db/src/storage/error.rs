@@ -5,7 +5,7 @@ use super::url::Scheme;
 /// Typed error returned by every operation in the [`storage`](crate::storage)
 /// module. Variants name the failure mode so callers can pattern-match
 /// (e.g. retry transient I/O, surface a credential mistake to the user).
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum StorageError {
     /// Input string was not a recognisable URL.
     #[error("invalid storage URL '{input}': {reason}")]
@@ -42,15 +42,26 @@ pub enum StorageError {
         reason: String,
     },
 
-    /// Read / write against an already-constructed driver failed. Carries the
-    /// upstream `object_store::Error` so retries / 404 handling can pattern-match.
+    /// No object exists at this path. Its own variant, never a shape of
+    /// [`Self::Io`]: absence is an answer callers branch on (a probe, an
+    /// idempotent delete, a first publish), where an I/O fault is not.
+    #[error("no object at '{path}': {detail}")]
+    NotFound {
+        /// Path inside the bucket / volume that was being accessed.
+        path: String,
+        /// The driver's own description of the miss.
+        detail: String,
+    },
+
+    /// Read / write against an already-constructed driver failed for any
+    /// reason other than absence. Carries the upstream `object_store::Error`.
     #[error("object-store I/O error at '{path}': {source}")]
     Io {
         /// Path inside the bucket / volume that was being accessed.
         path: String,
         /// Underlying error from the `object_store` crate.
         #[source]
-        source: object_store::Error,
+        source: std::sync::Arc<object_store::Error>,
     },
 
     /// Layout / format error: a file the engine wrote was unreadable, a
@@ -103,11 +114,24 @@ pub enum StorageError {
 }
 
 impl StorageError {
-    /// Construct an [`StorageError::Io`] from a bare `object_store::Error`.
-    pub(crate) fn io(path: impl Into<String>, source: object_store::Error) -> Self {
-        Self::Io {
+    /// Classify a bare `object_store::Error` raised at `path`: a miss is
+    /// [`StorageError::NotFound`], anything else [`StorageError::Io`]. The one
+    /// place a driver error becomes a `StorageError`.
+    pub fn io(path: impl Into<String>, source: object_store::Error) -> Self {
+        match source {
+            object_store::Error::NotFound { .. } => Self::not_found(path, source.to_string()),
+            source => Self::Io {
+                path: path.into(),
+                source: std::sync::Arc::new(source),
+            },
+        }
+    }
+
+    /// Construct a [`StorageError::NotFound`].
+    pub fn not_found(path: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::NotFound {
             path: path.into(),
-            source,
+            detail: detail.into(),
         }
     }
 

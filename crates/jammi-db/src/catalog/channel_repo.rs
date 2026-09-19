@@ -18,7 +18,7 @@ use super::Catalog;
 /// code. Catalog corruption on read-back (a stored dtype token or channel slug
 /// that no longer parses) is NOT in this taxonomy: it is an engine invariant
 /// failure routed to `Internal`, not a caller error.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum ChannelCatalogError {
     /// A channel of this id is already registered for the bound tenant.
     #[error("channel '{0}': already exists")]

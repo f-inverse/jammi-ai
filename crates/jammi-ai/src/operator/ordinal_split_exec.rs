@@ -154,9 +154,7 @@
 //! branch on. Every
 //! OTHER partition of the same generation simply ends cleanly (`None`,
 //! like normal end-of-data) once `terminated` is set — never a second
-//! copy of the error, never `DataFusionError::Shared` (which cannot yield
-//! its `External(Box<JammiError>)` payload back BY VALUE — see
-//! `jammi_db::error`'s classifier doc on that fidelity limit). This
+//! copy of the error. This
 //! composes correctly with every plan this split ships in: every root
 //! puts a `SortPreservingMergeExec` (or, at `n<=1`,
 //! `CoalescePartitionsExec`) directly above it, and either one propagates

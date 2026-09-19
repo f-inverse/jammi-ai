@@ -229,7 +229,7 @@ absorbed into "reads through `pin_current_version`" claims elsewhere.
 | `ParentMoved { .. }` | Another refresh already published against this parent | The base-publish arm absorbs it and proceeds with the concurrent winner's version — no retry needed |
 
 A storage object that vanishes under a running scan is the typed
-`Storage(StorageError::Io { source: object_store::Error::NotFound })`, never a
+`Storage(StorageError::NotFound { path, .. })`, never a
 partial answer; every other DataFusion error keeps its `source()` chain under
 `JammiError::DataFusion`.
 

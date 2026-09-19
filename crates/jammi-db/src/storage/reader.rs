@@ -55,10 +55,7 @@ pub async fn validate_and_count_parquet_rows(
     let path = handle.data_path()?;
     let bytes = match handle.get_bytes(&path).await {
         Ok(bytes) => bytes,
-        Err(StorageError::Io {
-            source: object_store::Error::NotFound { .. },
-            ..
-        }) => return Ok(None),
+        Err(StorageError::NotFound { .. }) => return Ok(None),
         Err(e) => return Err(e),
     };
     Ok(ParquetRecordBatchReaderBuilder::try_new(bytes)

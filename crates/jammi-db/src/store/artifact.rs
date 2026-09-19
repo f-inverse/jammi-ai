@@ -369,7 +369,7 @@ impl ArtifactStore {
         match std::fs::rename(tmp.path(), &cache_dir) {
             Ok(()) => Ok(LocalArtifact { dir: cache_dir }),
             Err(_) if cache_dir.is_dir() => Ok(LocalArtifact { dir: cache_dir }),
-            Err(e) => Err(JammiError::Io(e)),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -731,10 +731,9 @@ impl ArtifactStore {
 /// is left as [`StorageError::Io`] unchanged.
 fn reclassify_missing_manifest(err: StorageError, prefix: &StorageUrl) -> JammiError {
     match &err {
-        StorageError::Io {
-            source: object_store::Error::NotFound { .. },
-            ..
-        } => JammiError::Storage(StorageError::not_published(prefix.as_str())),
+        StorageError::NotFound { .. } => {
+            JammiError::Storage(StorageError::not_published(prefix.as_str()))
+        }
         _ => JammiError::from(err),
     }
 }
@@ -762,10 +761,7 @@ fn reclassify_missing_manifest(err: StorageError, prefix: &StorageUrl) -> JammiE
 /// corrupt".
 fn reclassify_missing_key(err: StorageError, prefix: &StorageUrl, name: &str) -> JammiError {
     match &err {
-        StorageError::Io {
-            source: object_store::Error::NotFound { .. },
-            ..
-        } => JammiError::Storage(StorageError::layout(
+        StorageError::NotFound { .. } => JammiError::Storage(StorageError::layout(
             prefix.as_str(),
             format!("artifact file '{name}' missing under this prefix (manifest lists it)"),
         )),

@@ -373,8 +373,7 @@ fn decode_ann_search(
     // `DataFusionError` IN THIS PROCESS (a same-process test, or a future
     // in-process consumer of this codec) recovers the typed variant via
     // `jammi_db::error`'s structural `DataFusionError` -> `JammiError`
-    // classifier ("owned passthrough" shape) rather than the lossy
-    // catch-all `JammiError::DataFusion(e)`.
+    // classifier rather than the lossy catch-all `JammiError::DataFusion(e)`.
     //
     // This does NOT reach a client across a real distributed Ballista job.
     // `ballista-executor`'s task loop stringifies a failed task's error
@@ -383,8 +382,8 @@ fn decode_ann_search(
     // for the job as a whole, rebuilding it as a bare
     // `DataFusionError::Execution(String)`
     // (`ballista-core-54.1.0/src/execution_plans/distributed_query.rs:519,685`)
-    // — no boxed value survives that hop, so `unwrap_jammi` finds nothing to
-    // destructure and falls to `JammiError::DataFusion(e)`, which
+    // — no boxed value survives that hop, so the classifier finds no typed
+    // payload in the chain and falls to `JammiError::DataFusion(e)`, which
     // `jammi-server/src/grpc/wire.rs`'s classifier's catch-all
     // (`other => (Code::Internal, ..)` in `map_engine_error`) maps to `Internal`,
     // never `InvalidArgument`, regardless of which typed variant was boxed

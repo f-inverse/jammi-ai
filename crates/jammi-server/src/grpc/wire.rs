@@ -592,16 +592,16 @@ mod tests {
         use jammi_db::storage::StorageError;
 
         fn io_fault(path: &str) -> JammiError {
-            JammiError::Storage(StorageError::Io {
-                path: path.to_string(),
-                source: object_store::Error::Generic {
+            JammiError::Storage(StorageError::io(
+                path,
+                object_store::Error::Generic {
                     store: "LocalFileSystem",
                     source: Box::new(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
                         "permission denied",
                     )),
                 },
-            })
+            ))
         }
 
         // Resolver: corrupted catalog pointer (unparseable artifact_path) —

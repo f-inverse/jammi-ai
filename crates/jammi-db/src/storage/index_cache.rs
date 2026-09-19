@@ -44,7 +44,7 @@ use std::path::PathBuf;
 use bytes::Bytes;
 
 use crate::config::{AnnIndexConfig, StoragePrecision};
-use crate::error::{JammiError, Result};
+use crate::error::Result;
 use crate::index::sidecar::{
     SidecarIndex, RESCORE_COMPANION_EXTENSION, THRESHOLD_COMPANION_EXTENSION,
 };
@@ -165,7 +165,7 @@ impl SegmentIndexCache {
         match std::fs::rename(tmp.path(), &cache_dir) {
             Ok(()) => {}
             Err(_) if cache_dir.is_dir() => {}
-            Err(e) => return Err(JammiError::Io(e)),
+            Err(e) => return Err(e.into()),
         }
 
         SidecarIndex::load(&base, ann, expected_precision)

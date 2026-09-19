@@ -76,7 +76,8 @@ What this script deliberately does NOT do — and the reason is worth keeping,
 because it is the shortcut a reader will reach for the moment a catalog file is
 in sight — is open a raw CPython `sqlite3` handle on `catalog.db`. Beside a live
 embedded engine that is out of contract, and *deterministically* wrong
-(`crates/jammi-db/src/catalog/backend_sqlite.rs` module docs): the engine's pool opens through the `unix-excl` VFS with a HEAP-resident
+(`crates/jammi-db/src/catalog/backend_sqlite.rs` module docs): the engine's pool
+opens through the `unix-excl` VFS with a HEAP-resident
 wal-index and no `-shm` file, so CPython's separately-linked `libsqlite3` — a
 second SQLite **library instance in the same process** — cannot see the engine's
 locks or its wal-index. Its reads can be stale, and its `sqlite3_close` believes

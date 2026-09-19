@@ -76,8 +76,8 @@ REQUIRED: dict[str, list[str]] = {
         "base_model",
         "edge_provenance",
     ],
-    # attach-by-id + the tenant-scoped listing (every job kind): a job handle outlives the connection
-    # that submitted it, on both arms.
+    # attach-by-id + the tenant-scoped listing (every job kind): a job handle outlives the
+    # connection that submitted it, on both arms.
     "job": ["job_id"],
     "list_jobs": [],
     "cancel_job": ["job_id"],

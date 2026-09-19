@@ -371,8 +371,9 @@ def tier04(db, papers: str, cite: str, papers_rows: list[dict], cite_rows: list[
     the workflow RUNS end-to-end at all**: the predictor fits a real mean (≈2018.4,
     essentially unbiased across eras) with real spread, and the regression-conformal
     recipe executes. Authoring this keystone surfaced the collapse; the engine fix
-    makes the workflow work — the cookbook→engine→cookbook loop. What the recipe then *measures* is the same
-    honest lesson as Part B: the ``conformalize_interval`` (|y−ŷ| split conformal)
+    makes the workflow work — the cookbook→engine→cookbook loop. What the recipe then
+    *measures* is the same honest lesson as Part B: the ``conformalize_interval``
+    (|y−ŷ| split conformal)
     **under-covers** under the time-split, and weighting it is a **no-op** — not
     because cal and test residual magnitudes match (they do not: the test era's
     residuals run noticeably larger), but because *within* the calibration set,

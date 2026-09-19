@@ -315,7 +315,8 @@ ACCOUNTING: list[tuple[str, ExerciseEntry]] = [
         "20-recompute/recompute.qmd", 'load_artifact("recompute.',
     )),
     # `refresh_embeddings` / `compact_embeddings` / `expire_versions` are the
-    # versioned-embedding-table incremental-refresh verbs — a distinct model from `recompute` (full re-derivation): a
+    # versioned-embedding-table incremental-refresh verbs — a distinct model from
+    # `recompute` (full re-derivation): a
     # deletion mask over immutable segments, CAS-published versions,
     # compaction and expiry horizons. Deliberately NOT folded into
     # 20-recompute/recompute.qmd, whose own contrast (full recompute vs.

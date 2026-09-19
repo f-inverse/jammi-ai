@@ -109,13 +109,13 @@ pub(crate) fn cuda_fwd(
         return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, shape));
     }
 
-    // Contiguity is checked NEXT, before the (now `last != 0`) `n == 0`
+    // Contiguity is checked NEXT, before the (here `last != 0`) `n == 0`
     // fast path below — a `rows == 0` (`n == 0` with `last != 0`)
     // empty-but-non-contiguous layout still falls through `cpu_fwd`'s OWN
     // `contiguous_offsets()` call (only `last == 0`, handled above, skips
     // it there), so this arm must refuse the same layout rather than
     // silently admitting it through a combined `last == 0 || n == 0` fast
-    // path — the exact class of divergence this fix closes.
+    // path, which would be a CPU/CUDA domain divergence.
     let (o1, o2) = l1
         .contiguous_offsets()
         .ok_or(Error::RequiresContiguous { op: OP })?;
@@ -262,7 +262,7 @@ pub(crate) fn cuda_bwd_dscores(
         return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, shape));
     }
 
-    // Contiguity checked before the (now `last != 0`) `n == 0` fast path —
+    // Contiguity checked before the (here `last != 0`) `n == 0` fast path —
     // see `cuda_fwd`'s identical comment above.
     let (o1, o2) = l1
         .contiguous_offsets()

@@ -29,10 +29,10 @@
 //!
 //! - `x`: `[.., in]` (rank 2 — a pooled/flattened activation — or rank 3
 //!   — `[batch, seq, in]`), the backbone dtype (`F32`, `BF16`, or `F16` —
-//!   campaign #443 D1 widens the CUDA arm's admitted dtype set to `F16` on
-//!   the same basis `crate::cuda::attention_block`'s own widening states:
-//!   this op's `.cu`-kernel-free composition follows its callees'
-//!   (`DropoutFused`/`ScaledCastAdd`) compiled dispatch arms).
+//!   the CUDA arm admits `F16` on the same basis as
+//!   `crate::cuda::attention_block`: this op's `.cu`-kernel-free composition
+//!   follows its callees' (`DropoutFused`/`ScaledCastAdd`) compiled
+//!   dispatch arms).
 //! - `w`: `[out, in]`, the FROZEN base weight, same dtype as `x`.
 //! - `ab`: `F32` `[in + out + bias_rows, rank]`, THE pack layout — row 0
 //!   through `in - 1` holds `A^T` (`[in, rank]`), row `in` through
@@ -56,9 +56,7 @@
 //!   gradient) via cheap `narrow`s. The row-stacked layout is what makes
 //!   appending this bias block possible at all without disturbing either
 //!   existing slice's own stride (a dim-0 narrow's stride is invariant to
-//!   how many OTHER rows exist elsewhere in the buffer) — the layout the
-//!   "Bias" section below anticipated, and this revision actually
-//!   implements.
+//!   how many OTHER rows exist elsewhere in the buffer).
 //!
 //! ## Every rounding point, forward
 //!
@@ -83,20 +81,18 @@
 //!    `A^T` already (`[in, rank]`, row-contiguous), so this GEMM's rhs is
 //!    `ab.narrow(0, 0, in)` used DIRECTLY — no copy, no further transpose
 //!    (see "the packed-`ab` GEMM eligibility problem" below for why this
-//!    slicing is zero-cost, unlike the column-packed layout it replaces).
+//!    slicing is zero-cost, unlike a column-packed layout).
 //! 5. `delta = h @ B^T` — a third `F32` GEMM. `ab`'s remaining `out` rows
 //!    ARE `B` (`[out, rank]`, row-contiguous); `B^T` is that slice's
 //!    `.transpose(0, 1)` VIEW (`[rank, out]`, column-contiguous) — a
 //!    zero-copy reinterpretation `gemm_config`'s `CUBLAS_OP_T` branch
 //!    accepts directly (same citation below).
 //! 6. `out = round_once(cast_to(f32)(base) + delta * scale)` — reuses
-//!    [`super::ScaledCastAdd`]'s `cpu_fwd`/`cuda_fwd` DIRECTLY (esc-046 fix,
-//!    GH#374: `base` widens to `f32`, adds the already-`f32`-scaled
-//!    `delta`, rounds to `base`'s dtype ONCE — matching PEFT's
-//!    `Linear.forward`'s own promote-add-cast-once order, not the
-//!    round-the-delta-first model an earlier revision of this doc and
-//!    [`super::ScaledCastAdd`]'s module doc both claimed without checking
-//!    PEFT source).
+//!    [`super::ScaledCastAdd`]'s `cpu_fwd`/`cuda_fwd` DIRECTLY (`base`
+//!    widens to `f32`, adds the already-`f32`-scaled `delta`, rounds to
+//!    `base`'s dtype ONCE — matching PEFT's `Linear.forward`'s own
+//!    promote-add-cast-once order, not a round-the-delta-first model; see
+//!    [`super::ScaledCastAdd`]'s module doc).
 //!
 //! Step 1b (only when `self.has_bias`, inserted immediately after step 1,
 //! before step 2): `base = base.broadcast_add(bias)` at the STORAGE level
@@ -110,10 +106,9 @@
 //! a FRESH, offset-0 gather-copy of the bias slice — `to_dtype` never
 //! special-cases a same-dtype pair into a no-op — so this extra buffer is
 //! paid even at `F32`, not only when the bias slice is actually widened
-//! from `BF16`/`F16`. Negligible next to the three real GEMMs, stated
-//! honestly here rather than folded silently into "no extra cost" (the
-//! same disclosure register "Every rounding point, backward"'s own
-//! per-site `zeros_like` bullet uses, below).
+//! from `BF16`/`F16`. Negligible next to the three real GEMMs, but not
+//! zero (the same as "Every rounding point, backward"'s own per-site
+//! `zeros_like` bullet, below).
 //!
 //! ## Every rounding point, backward
 //!
@@ -171,14 +166,13 @@
 //!    block's slot must exist, at the full `[bias_rows, rank]` shape, or
 //!    that narrow has nothing to read. One `zeros_like([bias_rows, rank])`
 //!    per site per backward — negligible next to the three real GEMMs,
-//!    stated honestly here rather than folded silently into "no extra
-//!    cost".
+//!    but not zero.
 //!
-//! ## The packed-`ab` GEMM eligibility problem (and its fix)
+//! ## The packed-`ab` GEMM eligibility problem
 //!
-//! An EARLIER version of this op packed `ab = cat([A, B^T], 1)` — `A`
-//! (`[rank, in]`) and `B^T` (`[rank, out]`) SIDE BY SIDE along the feature
-//! axis (`[rank, in + out]`). Slicing either back out via
+//! Packing `ab = cat([A, B^T], 1)` — `A` (`[rank, in]`) and `B^T`
+//! (`[rank, out]`) SIDE BY SIDE along the feature axis
+//! (`[rank, in + out]`) — does not work. Slicing either back out via
 //! `Layout::narrow(1, ..)` yields a view whose ROW STRIDE is `in + out` —
 //! wider than its own logical width (`in` or `out`). CUDA's `gemm_config`
 //! (`cuda_backend/mod.rs:1398-1408`, `1412-1422`) admits an operand in
@@ -186,19 +180,18 @@
 //! WITH `row_stride == width`, `CUBLAS_OP_N`) or `rhs_m1 == k && rhs_m2 ==
 //! 1` (column-contiguous over the FULL matrix, `CUBLAS_OP_T`) — a
 //! narrower-than-its-storage-row slice satisfies NEITHER (`rhs_m2` is the
-//! padded `in + out`, matching neither `n` nor `1`), so cuBLAS refused it
-//! with `MatMulNonContiguous`. This was confirmed on-device (an A100 pod
-//! run against production transformer-encoder widths): EVERY
-//! `lora_linear_parity_*` CUDA leg failed with exactly this error at the
-//! `h = xd @ A^T` GEMM.
+//! padded `in + out`, matching neither `n` nor `1`), so cuBLAS refuses it
+//! with `MatMulNonContiguous` — on an A100 at production transformer-encoder
+//! widths, every `lora_linear_parity_*` CUDA leg fails with exactly this
+//! error at the `h = xd @ A^T` GEMM.
 //!
-//! **THE FIX: pack along the ROW axis (dim 0) instead.** `ab =
+//! **So `ab` is packed along the ROW axis (dim 0).** `ab =
 //! cat([A.t(), B], 0)` has shape `[in + out, rank]`. A leading-row slice
 //! of a row-major matrix (`Layout::narrow(0, start, len)`) NEVER changes
 //! the row stride — narrowing dim 0 only moves `start_offset` and shrinks
 //! the row COUNT, leaving `stride == [rank, 1]` untouched — so BOTH slices
 //! come out GEMM-eligible with **zero copies**, verified against the same
-//! `gemm_config` rules the failure above cites:
+//! `gemm_config` rules cited above:
 //!
 //! - `a_t_l = ab.narrow(0, 0, in)`: shape `[in, rank]`, stride `[rank, 1]`
 //!   — `rhs_m1 == 1 && rhs_m2 == rank == n` (the GEMM's own `n` for
@@ -216,13 +209,13 @@
 //! their own — `Tensor::cat(&[dA^T, dB], 0)` reassembles `d_ab` at the
 //! Tensor level (candle's `Op::Cat` backward, not this op's own concern).
 //!
-//! This is strictly better than the copy-based workaround the column
-//! layout required: no `to_dtype` gather-copy, no extra tape/storage
+//! This is strictly better than a copy-based workaround for the column
+//! layout: no `to_dtype` gather-copy, no extra tape/storage
 //! allocation, and BIT-EXACT relative to whatever the un-copied GEMM
-//! itself would have produced (there is no separate "copy" step left to
+//! itself would have produced (there is no separate "copy" step to
 //! introduce a divergent rounding order at all).
 //!
-//! ## CPU `BF16` matmul: a pre-existing candle limitation, not a regression
+//! ## CPU `BF16` matmul: a candle limitation, not this op's
 //!
 //! candle-core 0.11.0's CPU backend (without the `mkl`/`accelerate`
 //! features, neither enabled anywhere in this workspace) implements
@@ -233,8 +226,8 @@
 //! the IDENTICAL call `candle_nn::Linear::forward` issues for the eager
 //! composition this op replaces — so a `BF16`-backbone-on-CPU forward
 //! fails the same way with or without this op (a typed, loud error, never
-//! a silent wrong number — family D holds either way). This is a
-//! pre-existing, disclosed gap in candle's CPU backend, not something this
+//! a silent wrong number). This is a
+//! gap in candle's CPU backend, not something this
 //! op's domain check tries to route around: `BF16` production forwards are
 //! expected to run on CUDA only (a call site's own admission predicate is
 //! what decides this — see the domain section below), and the CPU
@@ -268,20 +261,16 @@
 //! A frozen linear base MAY carry a bias (`candle_nn::linear`'s
 //! `bias.is_some()`) — `has_bias` (construction data, `Copy`, set ONCE by
 //! the call site via [`LowRankResidualLinear::with_bias`]) tells this op
-//! whether `ab` carries the third block described above. An EARLIER
-//! revision of this op refused a biased base outright (a domain miss,
-//! counted eager fallback at the call site) on the theory that folding a
-//! bias into a single augmented matmul requires appending a constant `1`
-//! COLUMN to `x` itself (the classic bias-as-augmented-feature trick) —
-//! true for THAT fusion strategy (it would change `x`'s own domain and
-//! need the constant column excluded from dropout's per-element Bernoulli
-//! draw), but a bias can instead be added as a SEPARATE storage-level step
-//! (forward step 1b below) entirely outside the GEMM and entirely outside
-//! dropout's own domain — `x`'s shape and every element of `x32`'s
-//! independent per-element dropout draw are both untouched. The earlier
-//! rejection targeted the wrong fusion shape, not a genuine impossibility.
+//! whether `ab` carries the third block described above. The bias is NOT
+//! folded into an augmented matmul (the classic bias-as-augmented-feature
+//! trick appends a constant `1` COLUMN to `x`, which would change `x`'s
+//! own domain and need the constant column excluded from dropout's
+//! per-element Bernoulli draw); it is added as a SEPARATE storage-level
+//! step (forward step 1b below) entirely outside the GEMM and entirely
+//! outside dropout's own domain — `x`'s shape and every element of `x32`'s
+//! independent per-element dropout draw are both untouched.
 //!
-//! ### The three-variant rounding-point enumeration (rules 1-2)
+//! ### The three-variant rounding-point enumeration
 //!
 //! 1. **torch / PEFT.** PEFT v0.17.0 `src/peft/tuners/lora/layer.py:755-778`:
 //!    `result = self.base_layer(x)` is `F.linear`, whose bf16/CUDA path
@@ -326,13 +315,12 @@
 //! `base`'s shape `(m, out)` already equals the broadcast result, so only
 //! `bias` broadcasts — the macro's own `(false, true)` arm,
 //! `lhs.add(&rhs.broadcast_as(&shape)?)`), so the fused-with-bias forward
-//! is BIT-IDENTICAL to eager `Linear::forward` on both backends. The real,
-//! disclosed accuracy difference from torch is documented here, not
-//! silently introduced (family D: a confident wrong number is worse than
-//! a documented divergence), and it is PRE-EXISTING in jammi-eager (the
-//! ordinary, non-fused `LoraLinear::forward_composed` / `eager_epilogue`
-//! path already rounds this way), not a regression this fusion
-//! introduces.
+//! is BIT-IDENTICAL to eager `Linear::forward` on both backends. The real
+//! accuracy difference from torch is documented here, not silently
+//! introduced (a confident wrong number is worse than a documented
+//! divergence), and jammi-eager shares it (the ordinary, non-fused
+//! `LoraLinear::forward_composed` / `eager_epilogue` path rounds the same
+//! way) — it is not something this fusion introduces.
 //!
 //! ### The pack layout and the forward/backward mechanics
 //!
@@ -352,8 +340,8 @@
 //! `out_features < rank` (`bias_rows == 1`, the minimum) is a normal,
 //! covered case, not a boundary special-case.
 //!
-//! ## The `w` x `dweight_needed` lattice (family D, rule 3: full state
-//! ## enumeration for every guard on `w`'s tracked state)
+//! ## The `w` x `dweight_needed` lattice (full state enumeration for
+//! ## every guard on `w`'s tracked state)
 //!
 //! `bwd` gates on TWO independent predicates: `w.is_variable()` (true only
 //! for a genuine trainable `Var`) and `w.track_op()` (`is_variable() ||
@@ -370,28 +358,26 @@
 //! | untracked leaf (`!track_op()`)                | `true`            | mirror gate (`dweight_needed && w.track_op()`) is false; `dw = None`, NO wasted `dy^T @ x` GEMM | `dweight_needed_true_with_an_untracked_w_skips_dw_without_wasted_work` |
 //! | `Var` (`is_variable() && track_op()`)         | `false`           | self-contradiction refusal (`!dweight_needed && w.track_op()`); typed `Error::Msg`, never a panic | `dweight_needed_false_with_a_trainable_w_is_a_typed_refusal` |
 //! | `Var` (`is_variable() && track_op()`)         | `true`            | normal trainable-base backward; `dw = Some(dy^T @ x)`                  | `dweight_needed_returns_some_dw_otherwise_none` (the `dweight_needed=true` half) |
-//! | tracked, non-`Var` (`!is_variable() && track_op()`) | `false`     | self-contradiction refusal (SAME gate as the `Var`/`false` cell — `track_op()`, not `is_variable()`, is what the gate tests); typed `Error::Msg`. THE CELL THE PRE-FIX PANIC LIVED IN: an `is_variable()`-only gate let this state through, `dw` came back `None` from the mirror gate, and candle's `sorted_nodes()` walk (which recurses into any TRACKED node, not only `Var`s) later panicked at `backprop.rs:175` finding no `GradStore` entry for `w`'s own tracked node | `tracked_non_var_w_with_dweight_needed_false_is_a_typed_refusal_not_a_panic` |
+//! | tracked, non-`Var` (`!is_variable() && track_op()`) | `false`     | self-contradiction refusal (SAME gate as the `Var`/`false` cell — `track_op()`, not `is_variable()`, is what the gate tests); typed `Error::Msg`. An `is_variable()`-only gate would let this state through: `dw` comes back `None` from the mirror gate, and candle's `sorted_nodes()` walk (which recurses into any TRACKED node, not only `Var`s) then panics at `backprop.rs:175` finding no `GradStore` entry for `w`'s own tracked node | `tracked_non_var_w_with_dweight_needed_false_is_a_typed_refusal_not_a_panic` |
 //! | tracked, non-`Var` (`!is_variable() && track_op()`) | `true`      | mirror gate is true (`track_op()` alone, no `is_variable()` requirement); `dw = Some(dy^T @ x)` computed against `w`'s CURRENT values (algebraically identical to the `Var` case — `dy^T @ x` does not care whether `w` is itself a leaf) | `bwd_every_gemm_operand_is_admissible_at_boundary_and_production_ranks` exercises the same GEMM shape; no dedicated tracked-non-`Var`-true test exists because this cell is not a domain boundary (no refusal, no skipped work) — the `Var`-true cell above already proves the GEMM's correctness end to end via `Tensor::backward` |
 //!
-//! Both `bwd` gates key off `w.track_op()`, never `w.is_variable()` alone
-//! — that is the fix: an `is_variable()`-only self-contradiction check
-//! (as this file had before) leaves the two `!is_variable() && track_op()`
-//! rows unguarded on the refusal side while the mirror gate (already
-//! `track_op()`-keyed) correctly returns `None` for `dw`, so the ONLY
-//! observable symptom was the downstream `backprop.rs` panic, not a
-//! silently wrong gradient — still a defect (family D wants a typed
-//! refusal, not a panic reachable from any consumer of a `pub use`d op).
+//! Both `bwd` gates key off `w.track_op()`, never `w.is_variable()` alone:
+//! an `is_variable()`-only self-contradiction check leaves the two
+//! `!is_variable() && track_op()` rows unguarded on the refusal side while
+//! the mirror gate (`track_op()`-keyed) correctly returns `None` for `dw`,
+//! so the ONLY observable symptom would be the downstream `backprop.rs`
+//! panic, not a silently wrong gradient — still a defect (a typed refusal,
+//! not a panic reachable from any consumer of a `pub use`d op).
 //!
-//! ## Domain (family D / K2)
+//! ## Domain
 //!
 //! `x` rank 2 or 3, `w` rank 2 `[out, in]`, `ab` rank 2
 //! `[in+out+bias_rows, rank]` (`bias_rows == 0` unless `self.has_bias`;
 //! see "the packed-`ab` GEMM eligibility problem" above for why THIS
 //! orientation, not `[rank, in+out(+bias_rows)]`); dtype pairs
-//! `(F32, F32, F32)`, `(BF16, BF16, F32)`, and `(F16, F16, F32)` (campaign
-//! #443 D1 widens the CUDA arm's — and, per `cpu_f16_matches_manual_composition_bit_exact`,
-//! the CPU arm's — admitted dtype set to include `F16`; the stale two-row
-//! version of this table predates that widening) (base dtype must match
+//! `(F32, F32, F32)`, `(BF16, BF16, F32)`, and `(F16, F16, F32)` (on both
+//! the CUDA arm and, per `cpu_f16_matches_manual_composition_bit_exact`,
+//! the CPU arm) (base dtype must match
 //! between `x`/`w`; `ab` is always `F32` by this op's own domain
 //! requirement, regardless of the base dtype — see
 //! [`super::ScaledCastAdd`]'s own doc for the analogous epilogue
@@ -468,14 +454,13 @@ pub struct LowRankResidualLinear {
     /// base => `true`; `is_variable()` alone is not a safe signal here,
     /// since a tracked-but-non-`Var` intermediate is neither definitely
     /// frozen nor definitely trainable — see the call site's own gate
-    /// for the full three-way classification). CORRECTION (this field's
-    /// doc previously claimed the opposite of what `bwd` actually does):
-    /// `bwd` DOES inspect `w.track_op()` itself, TWICE — once as the
+    /// for the full three-way classification). `bwd` ALSO inspects
+    /// `w.track_op()` itself, TWICE — once as the
     /// self-contradiction refusal (`!dweight_needed && w.track_op()`) and
     /// once as the mirror gate deciding whether to compute `dW` at all
     /// (`dweight_needed && w.track_op()`) — precisely because this flag
-    /// alone is call-site data this op does not fully trust (family D: an
-    /// op trusts no caller for its own domain). See "The `w` ×
+    /// alone is call-site data this op does not fully trust (an op trusts
+    /// no caller for its own domain). See "The `w` ×
     /// `dweight_needed` lattice" in the module doc for the full state
     /// table both gates jointly cover.
     pub dweight_needed: bool,
@@ -486,9 +471,8 @@ pub struct LowRankResidualLinear {
     /// instance as construction data (the same "`dgamma_needed`"/
     /// `dweight_needed` idiom this crate uses throughout, never a prose
     /// convention the call site and this op could silently disagree
-    /// about). `false` by default ([`Self::new`]'s signature is unchanged
-    /// — every existing call site stays bias-free unless it explicitly
-    /// opts in via [`Self::with_bias`]). Read only through this type's own
+    /// about). `false` by default ([`Self::new`]; a call site opts in via
+    /// [`Self::with_bias`]). Read only through this type's own
     /// private `bias_rows` accessor — never re-derived ad hoc at a second
     /// call site — by `check_w_and_ab`, `cpu_fwd`, `cuda_fwd`, and `bwd`
     /// alike.
@@ -497,7 +481,7 @@ pub struct LowRankResidualLinear {
 
 impl LowRankResidualLinear {
     /// `scale` must be finite (a non-finite scaling would poison every
-    /// output silently otherwise — family F); `in_features`/`out_features`/
+    /// output silently otherwise); `in_features`/`out_features`/
     /// `rank` must each be `>= 1` (a zero-sized GEMM dimension is a
     /// degenerate case this op refuses rather than special-cases, unlike
     /// e.g. `LayerNormFused`'s `hidden == 0` empty-output path — no LoRA
@@ -550,9 +534,8 @@ impl LowRankResidualLinear {
 
     /// Opt into the bias-carrying pack (see the module doc's "Bias: packed
     /// into `ab`'s trailing rows" section) — the ONLY way `has_bias`
-    /// becomes `true`; [`Self::new`]'s own 6-argument signature is left
-    /// unchanged so every one of this crate's ~50 existing call sites
-    /// keeps constructing a bias-free op without modification. Consuming
+    /// becomes `true`; [`Self::new`] always constructs a bias-free op.
+    /// Consuming
     /// `self` and returning `Self` (rather than `&mut self`) matches this
     /// `Copy` type's usual builder-free construction style — a call site
     /// writes `LowRankResidualLinear::new(..)?.with_bias(pack.is_some())`
@@ -618,7 +601,7 @@ impl LowRankResidualLinear {
     /// layout — see the module doc's "packed-`ab` GEMM eligibility
     /// problem" section) and `F32`. Both
     /// checked structurally regardless of what the call site's own
-    /// admission predicate already verified (family D: an op trusts no
+    /// admission predicate already verified (an op trusts no
     /// caller for its own domain — the same doctrine `DropoutFused::new`
     /// documents). `pub(crate)`: shared with `crate::cuda::low_rank_residual_linear`
     /// (dims/dtype are device-erased, so this needs no `CpuStorage`/
@@ -700,7 +683,7 @@ impl LowRankResidualLinear {
     /// from `ab_l.start_offset()`: that derivation is only valid against
     /// a genuinely contiguous layout. This function re-checks the same
     /// fact independently rather than trusting either caller's loop
-    /// (family D: an op trusts no caller for its own domain — the same
+    /// (an op trusts no caller for its own domain — the same
     /// doctrine `materialize_contiguous_if_needed`'s own doc states),
     /// since it is `pub(crate)` and therefore reachable from a test
     /// calling it directly, bypassing both loops. The bias slots occupy
@@ -793,7 +776,7 @@ pub(crate) fn materialize_contiguous_if_needed<S: BackendStorage>(
 /// `KernelError::StrictModeFallback` refusal to an untyped string a STRICT-
 /// mode caller could only match by text. `predicate_holds` is always `true`
 /// at both of this file's
-/// two call sites (Wave 1 (e)/(f) — see `bwd`'s own comments): the fused
+/// cast-boundary call sites (see `bwd`'s own comments): the fused
 /// kernel is structurally applicable for every `BF16` case `bwd` reaches
 /// it from (this op's own domain already restricts `x`'s dtype to `F32`/
 /// `BF16`), so there is no runtime domain gap to gate on — `admit` is
@@ -1000,17 +983,16 @@ impl CustomOp3 for LowRankResidualLinear {
         // here: `track_op() == is_variable() || op.is_some()`
         // (candle-core-0.11.0 `tensor.rs:592-594`), a strict superset. A
         // `w.is_variable()`-only check misses the tracked-but-non-`Var`
-        // cell of the lattice below entirely — that cell is exactly what
-        // used to reach `Tensor::backward`'s `sorted_nodes()` walk (which
+        // cell of the lattice below entirely — that cell would reach
+        // `Tensor::backward`'s `sorted_nodes()` walk (which
         // recurses into ANY tracked node, `backprop.rs`'s `walk`, not only
         // `Var`s) with no `GradStore` entry for `w`'s node (this op's own
-        // mirror gate below, keyed the same way, correctly returned `None`
+        // mirror gate below, keyed the same way, correctly returns `None`
         // for the `dw` slot), and PANIC at `backprop.rs:175`'s
         // `grads.remove(node).expect("grad not populated")` the moment the
-        // walk reached `w`'s own tracked node — see
+        // walk reaches `w`'s own tracked node — see
         // `tracked_non_var_w_with_dweight_needed_false_is_a_typed_refusal_not_a_panic`
-        // for the reproduction (panics before this `track_op()` fix,
-        // returns a typed `Error::Msg` after it) and the module doc's
+        // (a typed `Error::Msg`, never a panic) and the module doc's
         // "The `w` × `dweight_needed` lattice" section for the full state
         // table this gate (together with the mirror gate below) covers.
         if !self.dweight_needed && w.track_op() {
@@ -1033,13 +1015,11 @@ impl CustomOp3 for LowRankResidualLinear {
         // d_lora = cast_f32(dy) * scale — ScaledCastAdd::bwd's own order
         // (cast to the LoRA dtype FIRST, scale second). The `grad_res` ==
         // `F32` branch has nothing to fuse (a single `affine` launch is
-        // already minimal); the `BF16` branch is the cast-boundary lever's
-        // Wave 1 (e) — `CastScaleBf16F32` folds the widening cast and the
-        // affine into one kernel (`ops::cast_scale`'s module doc has the
-        // full traffic model and bit-identity derivation). The `F16` branch
-        // (campaign #443 D1, the 8th admission-widening site) is the SAME
-        // lever at `F16`'s own margin — `CastScaleF16F32` (campaign #443
-        // W2c), a genuinely independent type (not `CastScaleBf16F32` with
+        // already minimal); in the `BF16` branch `CastScaleBf16F32` folds
+        // the widening cast and the affine into one kernel
+        // (`ops::cast_scale`'s module doc has the full traffic model and
+        // bit-identity derivation). The `F16` branch is the SAME lever at
+        // `F16`'s own margin — `CastScaleF16F32`, a genuinely independent type (not `CastScaleBf16F32` with
         // its input reinterpreted — `ops::cast_scale`'s module doc states
         // why an `F16` analog is real kernel authoring, not a cast). Each
         // 16-bit branch is dispatched through `admit` under its OWN op key
@@ -1135,17 +1115,15 @@ impl CustomOp3 for LowRankResidualLinear {
         // dx = dy @ w + d_x_lora, at the base dtype. The `base_dtype ==
         // F32` branch has nothing to fuse (a single `badd_f32` launch is
         // already minimal — `d_x_lora_f32_2d` needs no cast at all); the
-        // `BF16` branch is the cast-boundary lever's Wave 1 (f) —
-        // `CastAddBf16` folds the narrowing cast and the residual add into
-        // one kernel, rounding `d_xd` to `bf16` IN-REGISTER first and then
-        // adding in native `bf16` (`ops::cast_scale`'s module doc has the
-        // full traffic model, the rounding-order derivation, and the
-        // double-rounding-safety argument for the CPU arm). The `F16`
-        // branch (campaign #443 D1, `low_rank_residual_linear.rs`'s own
-        // `base_dtype_is_..._a_fusable_two_kernel_chain` predicate — the
-        // 8th admission-widening site from the phase-1 class enumeration)
-        // is the SAME lever at `F16`'s own margin, via `CastAddF16`
-        // (campaign #443 W2c) — a genuinely independent type, not
+        // `BF16` branch uses `CastAddBf16`, which folds the narrowing cast
+        // and the residual add into one kernel, rounding `d_xd` to `bf16`
+        // IN-REGISTER first and then adding in native `bf16`
+        // (`ops::cast_scale`'s module doc has the full traffic model, the
+        // rounding-order derivation, and the double-rounding-safety
+        // argument for the CPU arm). The `F16` branch (admitted by
+        // `base_dtype_is_..._a_fusable_two_kernel_chain`) is the SAME lever
+        // at `F16`'s own margin, via `CastAddF16` — a genuinely independent
+        // type, not
         // `CastAddBf16` reinterpreted (`ops::cast_scale`'s module doc's
         // "double-rounding-safety" note, restated at `F16`'s narrower
         // 11-bit significand). Each 16-bit branch is dispatched through
@@ -1188,7 +1166,7 @@ impl CustomOp3 for LowRankResidualLinear {
         };
         let dx = dx_2d.reshape(x.shape())?;
 
-        // The MIRROR gate (family D — the same doctrine as the
+        // The MIRROR gate (the same doctrine as the
         // `!dweight_needed && w.is_variable()` refusal above, but this
         // combination is wasteful rather than dangerous): `dweight_needed
         // == true` while `w` is not actually `track_op()`'d means the
@@ -1259,7 +1237,7 @@ mod tests {
     /// Independent, closed-form reference: `x @ w^T`, `A`/`B` supplied
     /// separately (not packed), plain `f64` accumulation on the host —
     /// the numpy-first oracle this test's fused-kernel output is checked
-    /// against, computed with NO shared code path (family F).
+    /// against, computed with NO shared code path.
     #[allow(clippy::too_many_arguments)]
     fn reference_forward(
         x: &[f32],
@@ -1450,13 +1428,13 @@ mod tests {
         );
     }
 
-    /// `F16`'s own CPU positive-path oracle (campaign #443 D1): UNLIKE
+    /// `F16`'s own CPU positive-path oracle: UNLIKE
     /// `BF16` (candle-core 0.11's CPU backend has no `BF16` `MatMul` impl —
     /// `bf16_base_on_cpu_is_a_typed_error...` above), `F16` DOES have a real
     /// CPU `MatMul` (candle's CPU backend links the `gemm-f16` crate; this
-    /// crate's own `cargo check` build graph pulls it in), so widening this
-    /// op's CPU dtype gate to `F16` (campaign #443 D1) makes it a genuinely
-    /// NEW, working capability, not a refusal deferred deeper — pinned here
+    /// crate's own `cargo check` build graph pulls it in), so admitting
+    /// `F16` at this op's CPU dtype gate is a genuinely working capability,
+    /// not a refusal deferred deeper — pinned here
     /// with the SAME exact-integer-fixture bit-exactness technique
     /// [`cpu_f32_matches_manual_composition_bit_exact`] uses: `exact_fixture`'s
     /// small-integer values (see that fn's own doc) are exactly
@@ -1509,14 +1487,14 @@ mod tests {
     }
 
     /// KO-6/guide-§3.5 "zero dispatch is RED, never green", restated for
-    /// the two `F16` cast-boundary sites this campaign's D1 widens
+    /// the two `F16` cast-boundary sites
     /// (`grad_res`'s `cast_scale_f16_f32` and `base_dtype`'s
     /// `cast_add_f16` — see `bwd`'s own doc comments at each `match`).
     /// `admission_mode()` defaults to Fused-unless-disabled, so a plain
     /// backward pass at `F16` must increment BOTH counters' `fused` side
     /// by exactly one per call, never the `eager` side, and never leave
-    /// either counter untouched (which would mean the `F16` arm added in
-    /// this campaign was never actually reached).
+    /// either counter untouched (which would mean the `F16` arm was never
+    /// actually reached).
     #[test]
     fn cpu_f16_bwd_dispatches_both_new_cast_boundary_kernels() {
         let device = Device::Cpu;
@@ -1739,10 +1717,9 @@ mod tests {
         }
     }
 
-    /// The dropout-arm counterpart to `gradcheck_cpu_f32_no_dropout`: closes
-    /// a real coverage gap an adversarial mutation audit found —
+    /// The dropout-arm counterpart to `gradcheck_cpu_f32_no_dropout`:
     /// neither an unmasked `d_xd` in `bwd` nor skipping the dropout
-    /// re-application in the recomputed `xd` moved the dropout-less
+    /// re-application in the recomputed `xd` moves the dropout-less
     /// gradcheck above, so this test is what actually exercises that
     /// branch's correctness. A Philox draw is a pure function of
     /// `(seed, layer_id, forward_idx, element_index, shape)` — NEVER of
@@ -1874,10 +1851,10 @@ mod tests {
         // `dweight_needed=true` needs a trainable `Var` `w` (the real
         // "also fine-tune the base" case); `dweight_needed=false` needs a
         // true frozen leaf (`w.is_variable() == false`) — `bwd`'s own
-        // domain check (added alongside this test: "an op trusts no
-        // caller for its own domain") now REFUSES the self-contradictory
-        // `dweight_needed=false` + `w.is_variable()` combination, so the
-        // two branches can no longer share one `w`.
+        // domain check ("an op trusts no caller for its own domain")
+        // REFUSES the self-contradictory `dweight_needed=false` +
+        // `w.is_variable()` combination, so the two branches cannot share
+        // one `w`.
         let device = Device::Cpu;
         let (rows, inf, outf, r) = (3usize, 3usize, 4usize, 2usize);
         let x = Tensor::randn(0f32, 1.0, (rows, inf), &device).unwrap();
@@ -1906,13 +1883,13 @@ mod tests {
         // A frozen leaf carries no gradient entry to inspect via `grads`
         // (it is never a `Var`); the real assertion is that this forward
         // and backward SUCCEED at all with `dweight_needed=false` and a
-        // genuinely frozen `w` — the self-contradiction check added
-        // alongside this test only refuses `!dweight_needed &&
-        // w.is_variable()`, never a true frozen leaf.
+        // genuinely frozen `w` — the self-contradiction check only
+        // refuses `!dweight_needed && w.track_op()`, never a true frozen
+        // leaf.
         let _ = out_false.sum_all().unwrap().backward().unwrap();
     }
 
-    /// The domain check `bwd` added alongside this test (family D: an op
+    /// `bwd`'s self-contradiction domain check (an op
     /// trusts no caller for its own domain, cited in `check_w_and_ab`'s
     /// own doc): `dweight_needed=false` combined with an ACTUALLY
     /// trainable `w` (a `Var`) is refused with a typed error rather than
@@ -1974,26 +1951,24 @@ mod tests {
         );
     }
 
-    /// REPRO-FIRST probe for the panic bug this test's fix addresses: `w`
-    /// is TRACKED but NOT a `Var` (`w_var.as_tensor() * 1.0` — a tracked
+    /// `w` is TRACKED but NOT a `Var` (`w_var.as_tensor() * 1.0` — a tracked
     /// `Op::Affine` intermediate) with `dweight_needed=false`. The
     /// call-site gate at `crates/jammi-lora/src/lib.rs` never reaches this
     /// state (it only ever passes a genuine leaf-or-Var `w`), but this op
     /// is `pub use`d (`ops/mod.rs`) and reachable directly by any consumer
     /// — `bwd`'s own domain check must not trust the call site here either
-    /// (family D: this op trusts no caller for its own domain, the same
-    /// doctrine `check_w_and_ab`'s doc states). BEFORE the fix, `bwd`'s
-    /// self-contradiction gate tested `w.is_variable()` (false for a
-    /// tracked-non-`Var`), so it let this state through; `bwd` then
-    /// returned `dw = None` for the w slot at the MIRROR gate
-    /// (`self.dweight_needed && w.track_op()` is false since
-    /// `dweight_needed` is false) while candle's `sorted_nodes()` still
-    /// visits `w` (its `Op::Affine` node is TRACKED, so `sorted_nodes`'s
-    /// own `walk` recurses into it via `node.op()`), and
+    /// (this op trusts no caller for its own domain, the same
+    /// doctrine `check_w_and_ab`'s doc states). A self-contradiction gate
+    /// keyed on `w.is_variable()` (false for a tracked-non-`Var`) would let
+    /// this state through; `bwd` would then return `dw = None` for the w
+    /// slot at the MIRROR gate (`self.dweight_needed && w.track_op()` is
+    /// false since `dweight_needed` is false) while candle's
+    /// `sorted_nodes()` still visits `w` (its `Op::Affine` node is TRACKED,
+    /// so `sorted_nodes`'s own `walk` recurses into it via `node.op()`), and
     /// `Tensor::backward`'s `grads.remove(node).expect("... grad not
     /// populated")` (`backprop.rs:175`) PANICS the moment the walk reaches
-    /// `w`'s node — see this test for the reproduction and the module
-    /// doc's state-table below for the full lattice this covers.
+    /// `w`'s node. This test pins the typed refusal instead; the module
+    /// doc's state table has the full lattice this covers.
     #[test]
     fn tracked_non_var_w_with_dweight_needed_false_is_a_typed_refusal_not_a_panic() {
         let device = Device::Cpu;
@@ -2001,8 +1976,8 @@ mod tests {
         let x = Tensor::randn(0f32, 1.0, (rows, inf), &device).unwrap();
         let w_var =
             Var::from_tensor(&Tensor::randn(0f32, 1.0, (outf, inf), &device).unwrap()).unwrap();
-        // Tracked (has an Op::Affine) but NOT itself a Var — the third,
-        // previously-unmodelled state.
+        // Tracked (has an Op::Affine) but NOT itself a Var — the third
+        // state `is_variable()` alone cannot tell apart.
         let w = (w_var.as_tensor() * 1.0).unwrap();
         assert!(
             !w.is_variable() && w.track_op(),
@@ -2094,8 +2069,8 @@ mod tests {
         assert!(LowRankResidualLinear::new(1.0, 4, 4, 0, None, false).is_err());
     }
 
-    /// Family D, revised: a non-contiguous `x` (e.g. a transposed view) is
-    /// no longer refused — see `materialize_contiguous_if_needed`'s doc
+    /// A non-contiguous `x` (e.g. a transposed view) is
+    /// not refused — see `materialize_contiguous_if_needed`'s doc
     /// for why `x` (unlike `w`/`ab`) gets a documented internal copy
     /// instead of a hard refusal. Proven by bit-exact equality against the
     /// SAME `x` made contiguous by the CALLER first: both paths gather the
@@ -2159,7 +2134,7 @@ mod tests {
         e
     }
 
-    /// The disclosed pre-existing candle limitation (see the module doc):
+    /// The disclosed candle limitation (see the module doc):
     /// a `BF16` base on CPU must fail with a typed error — the SAME error
     /// class `candle_nn::Linear::forward` already returns for a `BF16`
     /// CPU matmul today, never a panic and never a silently wrong number.
@@ -2229,7 +2204,7 @@ mod tests {
         // introducing a NEW failure mode.
         let eager_err = x
             .matmul(&w.t().unwrap())
-            .expect_err("the pre-existing eager composition must fail identically");
+            .expect_err("the eager composition must fail identically");
 
         // (b) IDENTICAL to the eager error on this platform, in this
         // environment: the outer variant (bare vs `WithBacktrace`, decided
@@ -2316,9 +2291,9 @@ mod tests {
     /// `dA^T = xd^T @ g`, `d_xd = g @ A`, `dx_base = dy @ w`, `dw = dy^T @
     /// x` — see the module doc's backward enumeration), not merely the
     /// five reducing over `inf`/`rank` — the base branch's `dx_base`/`dw`
-    /// reduce over `outf`/`rows` instead, a DIFFERENT `(b, m, n, k)` shape
-    /// this test was previously silent on. Forward's
-    /// own slices were already proven admissible by construction (module
+    /// reduce over `outf`/`rows` instead, a DIFFERENT `(b, m, n, k)` shape.
+    /// Forward's
+    /// own slices are proven admissible by construction (module
     /// doc); this test proves EVERY BACKWARD product is too, at `rank`
     /// 1/2/3 (this op's own domain boundary — `rank >= 1`) and at
     /// production width (a transformer-encoder-scale `in=1024`). Reconstructs
@@ -2531,9 +2506,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // `check_w_and_ab` (MUT-1: the whole body forced to `Ok(())`) — every
-    // shape/dtype refusal cell it covers, each its own test (the
-    // contract's explicit lattice requirement): `w`'s shape, `ab`'s row
+    // `check_w_and_ab` (mutation: the whole body forced to `Ok(())`) — every
+    // shape/dtype refusal cell it covers, each its own test (an
+    // explicit lattice): `w`'s shape, `ab`'s row
     // count, `ab`'s column count (`rank`), and `ab`'s dtype. Driven
     // through `fused_forward` (the real call site path), not the
     // `pub(crate)` helper directly, so these also prove the op refuses
@@ -2633,7 +2608,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // `cpu_fwd`'s `for (l, what) in [(l2, "w"), (l3, "ab")]` loop (MUT-1:
+    // `cpu_fwd`'s `for (l, what) in [(l2, "w"), (l3, "ab")]` loop (mutation:
     // the `"w"` match arm deleted, leaving only the `_ => "...(ab)"`
     // catch-all) — a non-contiguous `w` (contiguous `ab`) must be
     // refused with the `w`-labeled op string specifically, not the
@@ -2671,7 +2646,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // `bwd`'s three `==`->`!=` dtype-dispatch-branch survivors (MUT-1),
+    // `bwd`'s three `==`->`!=` dtype-dispatch-branch mutations,
     // named here by their `let` bindings: the `dy` upcast (`let dy_f32 =
     // if grad_res.dtype() == DType::F32`), the `x` upcast (`let x32_2d =
     // if base_dtype == DType::F32`), and the final `d_x_lora` downcast
@@ -2687,7 +2662,7 @@ mod tests {
     // EVERY intermediate GEMM in `bwd` stays dtype-consistent with its
     // neighbour): this can never fully SUCCEED on this crate's CPU
     // build (BF16 CPU matmul needs `mkl`/`accelerate`, neither enabled
-    // here — the same pre-existing limitation
+    // here — the same candle limitation
     // `bf16_base_on_cpu_is_a_typed_error...` discloses), so the real
     // assertion is WHERE it fails: correct code upcasts `dy`/`x` to F32
     // for every intermediate GEMM (the `dy` and `x` upcasts) and only the
@@ -2744,7 +2719,7 @@ mod tests {
                  earlier dtype-mismatch caused by a skipped F32 upcast"
             ),
             other => panic!(
-                "expected UnsupportedDTypeForOp(BF16, _) (the pre-existing CPU limitation, \
+                "expected UnsupportedDTypeForOp(BF16, _) (the known CPU limitation, \
                  reached only once every earlier intermediate GEMM upcast correctly), got \
                  {other:?}"
             ),
@@ -2762,12 +2737,8 @@ mod tests {
     // which requires its FIRST argument (`dx_base_2d`) to be `BF16` — but
     // `dx_base_2d = dy_base_2d.matmul(w)` is `F32` here (both operands are
     // F32), so `CastAddBf16::cpu_fwd`'s own domain check refuses it with a
-    // typed `UnsupportedDTypeForOp(F32, "cast_add_bf16")`. This is the
-    // POST-cast-boundary-lever descendant of the pre-fusion
-    // `dx_base + d_x_lora` `DTypeMismatchBinaryOp` this oracle used to
-    // observe (MUT-1): the branch it isolates moved (from a bare downcast
-    // `if` to `CastAddBf16`'s own dtype match), but the property proven is
-    // the same — a `base_dtype == BF16` site with a mismatched `w`/`x`
+    // typed `UnsupportedDTypeForOp(F32, "cast_add_bf16")`. The property
+    // proven: a `base_dtype == BF16` site with a mismatched `w`/`x`
     // dtype fails loudly rather than silently computing with `x`'s F32
     // gradient miscast as `bf16`.
     #[test]
@@ -2895,7 +2866,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // #428 P2b: the bias-carrying pack. `pack_ab`'s sibling
+    // The bias-carrying pack. `pack_ab`'s sibling
     // (`pack_ab_with_bias`) and `reference_forward`'s sibling
     // (`reference_forward_with_bias`) below are the shared fixtures every
     // test in this section builds on.
@@ -2926,7 +2897,7 @@ mod tests {
 
     /// [`reference_forward`] plus the frozen bias, added per output column
     /// — an independent, closed-form `f64` extension of the SAME oracle
-    /// (family F: computed with no shared code path with the op under
+    /// (computed with no shared code path with the op under
     /// test).
     #[allow(clippy::too_many_arguments)]
     fn reference_forward_with_bias(
@@ -3345,7 +3316,7 @@ mod tests {
         }
     }
 
-    /// #428 P2b round-2 fix: `apply_bias_if_present` re-checks `ab`'s
+    /// `apply_bias_if_present` re-checks `ab`'s
     /// contiguity itself rather than trusting `cpu_fwd`/`cuda_fwd`'s own
     /// `RequiresContiguous` loop (see that function's own doc) — this
     /// test calls it DIRECTLY, bypassing both loops entirely (unlike
@@ -3372,7 +3343,7 @@ mod tests {
         // Widen each row and narrow back to `r` columns — the SAME
         // wide-then-narrow non-contiguity lever
         // `fused_epilogue.rs`'s `build_base_with_noncontiguous_w` uses
-        // (jammi-lora): identical VALUES, a row stride that no longer
+        // (jammi-lora): identical VALUES, a row stride that does not
         // equals the column count.
         let ab_v = ab_contig.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let mut wide_v = Vec::with_capacity(ab_rows * 2 * r);

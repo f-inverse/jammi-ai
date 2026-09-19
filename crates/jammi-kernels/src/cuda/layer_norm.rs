@@ -163,14 +163,14 @@ pub(crate) fn cuda_fwd(
     }
 }
 
-/// #460 (C-LN): bias-carrying forward. `beta` is a THIRD, REQUIRED
+/// Bias-carrying forward. `beta` is a THIRD, REQUIRED
 /// `[hidden]` operand (no nullable-pointer branch here — see
 /// `layer_norm.cu`'s `template <bool HAS_BETA>` doc for why the row math
-/// itself is already generic to a future nullable caller even though this
+/// itself is generic to a nullable caller even though this
 /// one is not). Structurally identical to [`cuda_fwd`] above (same
 /// `hidden == 0` / contiguity / `n == 0` ordering — see that function's
 /// comments for the full rationale), plus one extra shape/dtype check on
-/// `beta` up front, mirroring [`cuda_bwd_dx`]'s existing `s1` vs `s3`
+/// `beta` up front, mirroring [`cuda_bwd_dx`]'s `s1` vs `s3`
 /// dtype check for the same reason: a `CustomOp3`'s third slot needs its
 /// own domain check, not just the first two.
 pub(crate) fn cuda_fwd_biased(

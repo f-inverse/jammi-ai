@@ -3,12 +3,12 @@
 // `cuda` feature is active (see ../../build.rs); the pinned build flags
 // (sm_80 baseline, no -use_fast_math) live there, not here.
 //
-// DELIBERATE DUPLICATION (campaign #443 W2b contract) — see
+// DELIBERATE DUPLICATION — see
 // `layer_norm_f16.cu`'s identical note: this is a SEPARATE translation
 // unit from `softmax.cu`, with its own copies of every file-scope
 // `__device__` helper (including its own f16 analogs of
 // `bf16_mul_rounded`/`bf16_add_rounded`) and its own `#include
-// <cuda_fp16.h>` — NOT a shared `.cuh`. `softmax.cu` is byte-untouched.
+// <cuda_fp16.h>` — NOT a shared `.cuh`, so nothing here can perturb `softmax.cu`.
 //
 // Domain, block/launch shape, and the mask-broadcast indexing are
 // IDENTICAL to `softmax.cu`'s module doc. Per the per-op f16

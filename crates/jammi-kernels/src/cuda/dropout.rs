@@ -9,7 +9,7 @@ use crate::ops::DropoutFused;
 /// See `crate::cuda`'s module doc for the module-name rationale.
 const MODULE_NAME: &str = "jammi_kernels_dropout";
 
-/// The F16 arm's OWN PTX module name (campaign #443 W2c) — `dropout_f16.cu`
+/// The F16 arm's OWN PTX module name — `dropout_f16.cu`
 /// is a SEPARATE translation unit (see that file's module doc), so it needs
 /// a distinct module name from [`MODULE_NAME`].
 const MODULE_NAME_F16: &str = "jammi_kernels_dropout_f16";
@@ -69,12 +69,12 @@ pub(crate) fn cuda_fwd(
     // `n == 0` fast path below -- so this arm's domain matches `cpu_fwd`'s
     // exactly (`ops::dropout::DropoutFused::cpu_fwd` has NO empty fast
     // path at all: it calls `contiguous_offsets()` unconditionally, so an
-    // empty tensor is only ever a no-op if it is ALSO contiguous). A prior
-    // version of this fn checked `n == 0` first and returned through the
-    // fast path before ever calling `contiguous_offsets()` -- silently
-    // ADMITTING a zero-element non-contiguous layout (e.g. a `(0, 3)`
-    // tensor transposed to `(3, 0)`) that `cpu_fwd` refuses outright. See
-    // `ops::dropout::DropoutFused::metal_fwd`'s identical fix (29e8b569)
+    // empty tensor is only ever a no-op if it is ALSO contiguous). Checking
+    // `n == 0` first and returning through the fast path before calling
+    // `contiguous_offsets()` would silently ADMIT a zero-element
+    // non-contiguous layout (e.g. a `(0, 3)` tensor transposed to `(3, 0)`)
+    // that `cpu_fwd` refuses outright. See
+    // `ops::dropout::DropoutFused::metal_fwd`'s identical ordering
     // for the full `Shape::is_contiguous`-at-a-zero-sized-dim rationale.
     // `o1`/`o2` are unused by the `n == 0` branch itself -- computed here
     // only so the domain check runs in the same place for both branches.

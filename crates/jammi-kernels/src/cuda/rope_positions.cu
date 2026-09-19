@@ -1,5 +1,5 @@
 // rope_positions.cu — RoPE rotate-half on the FA2-packed `[total, 3, h, d]`
-// `qkv` buffer (P6 Stage B B3-dense). Q/K slots (0, 1) get the SAME
+// `qkv` buffer (dense and ragged). Q/K slots (0, 1) get the SAME
 // per-element expression `rope.cu` uses (shared via `rope_common.cuh`,
 // see that header's doc); the V slot (2) passes through unchanged — this
 // buffer is handed to `flash_attention_varlen` as ONE tensor, so a valid
@@ -10,10 +10,9 @@
 // `rope_positions_dims`); `cos`/`sin` are `[period, d]` with `period ==
 // seq` (or `period == 1`, DENSE arm only), `d` even. `seq` is this call's
 // modulo base: `token = row / (3*h)`; `position = token % seq` — the
-// modulo form stated in the P6 Stage B v5 contract §3.6 ("position =
-// token % s for dense").
+// dense closed form.
 //
-// This SAME kernel serves BOTH the DENSE and the RAGGED (M1a — varlen
+// This SAME kernel serves BOTH the DENSE and the RAGGED (varlen
 // positions) arms without any change here: the GENERAL varlen mechanism,
 // `positions[r] = r - cu[seq(r)]` (a per-row lookup TABLE rather than one
 // shared `seq`), is implemented on the RUST side as a pre-gather —

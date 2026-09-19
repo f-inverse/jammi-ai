@@ -55,7 +55,7 @@ fn fused(x: &Tensor) -> candle_core::Result<Tensor> {
 
 /// `Phi(x) = 0.5*(1+erf(x/sqrt(2)))`, the standard-normal CDF, computed at
 /// F64 precision via [`libm::erf`] — this file's OWN independent ground
-/// truth (family F: a numpy-first-shaped reference, never re-derived from
+/// truth (a numpy-first-shaped reference, never re-derived from
 /// this crate's own f32 kernel code under test).
 fn phi_f64(x: f64) -> f64 {
     0.5 * (1.0 + libm::erf(x * std::f64::consts::FRAC_1_SQRT_2))

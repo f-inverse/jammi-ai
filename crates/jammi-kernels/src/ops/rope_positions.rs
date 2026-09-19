@@ -1,35 +1,32 @@
 //! Fused RoPE rotate-half on the FlashAttention-2-packed `[total, 3, h,
-//! d]` `qkv` buffer — P6 Stage B B3-dense. `RopeFused` (`ops::rope`)
+//! d]` `qkv` buffer. `RopeFused` (`ops::rope`)
 //! cannot take this layout directly: its `rope_dims` requires the axis
 //! immediately before `hidden` to equal `period` (or `period == 1`), and
 //! for a packed `qkv` that axis is `h` (the head axis), which is neither
 //! — applying `RopeFused` here would silently read the wrong table row
 //! for every row after the first (`ops::rope::rope_dims`'s own doc names
-//! this exact family-D hazard). This op decodes `token = row / (3*h)`
+//! this exact hazard). This op decodes `token = row / (3*h)`
 //! (`row = flat_idx / d`) directly, so it walks the correct axis
 //! regardless of `h`.
 //!
-//! ## Scope: dense only (`position = token % seq`)
+//! ## The op itself is dense (`position = token % seq`)
 //!
-//! The P6 Stage B v5 contract's general mechanism is `positions[r] = r -
-//! cu[seq(r)]` (a per-row lookup table, needed once a batch has real
-//! padding and `cu_seqlens` is non-uniform). For the DENSE fast path
+//! The general varlen mechanism is `positions[r] = r - cu[seq(r)]` (a
+//! per-row lookup table, needed once a batch has real padding and
+//! `cu_seqlens` is non-uniform). For the DENSE fast path
 //! (`cu_seqlens` uniform, every sequence length `== seq`) that reduces to
 //! the closed form `position = token % seq` — the SAME modulo
-//! [`super::rope::RopeFused`] already uses, just walking a different
-//! axis. This commit implements ONLY the dense closed form (one `seq:
-//! usize` field, no positions `Tensor`/device array at all) — the
-//! general table form is explicitly future work (the padded regime), not
-//! implemented here; a future generalization would add a `positions`
-//! argument alongside (or instead of) `seq` without changing this op's
-//! per-element math, mirroring how `rope_positions.cu`'s shared
-//! `rope_rotate` device function already factors the math out from the
-//! indexing.
+//! [`super::rope::RopeFused`] uses, just walking a different
+//! axis. The op carries only that closed form (one `seq: usize` field, no
+//! positions `Tensor`/device array at all); the table form is served by
+//! the ragged arm below, which pre-gathers per-row tables on the Rust side
+//! and reuses the same per-element math (`rope_positions.cu`'s shared
+//! `rope_rotate` device function factors the math out from the indexing).
 //!
 //! ## V slot pass-through
 //!
 //! `qkv`'s slot 2 (V) is copied through unchanged — RoPE only ever
-//! applies to Q/K (contract v5 §3.6) — because this op's OUTPUT is the
+//! applies to Q/K — because this op's OUTPUT is the
 //! single tensor `flash_attention_varlen` consumes directly (no separate
 //! V tensor to reassemble later): the packed buffer must remain a valid,
 //! complete `qkv` after this op runs.
@@ -54,7 +51,7 @@
 //! (and testable) independent of whether the vendored FlashAttention-2
 //! kernels are compiled in.
 //!
-//! ## Domain (family D)
+//! ## Domain
 //!
 //! `qkv`: rank 4, `[total, 3, h, d]`, contiguous, `d` even, `total ==
 //! qkv.dim(0)`. `cos`/`sin`: `[period, d]` (any leading dims of size 1
@@ -65,7 +62,7 @@
 //! fast path). `d == 0` degenerates to an empty output, same as
 //! `ops::rope`'s `hidden == 0` case.
 //!
-//! ## The ragged arm (M1a — varlen positions)
+//! ## The ragged arm (varlen positions)
 //!
 //! [`PositionArm::Ragged`] is a SECOND, arm-selective domain living on the
 //! SAME op/kernel: `position` degenerates to the row index itself (the
@@ -357,14 +354,11 @@ pub(crate) fn rope_positions_dims(
 /// `cu_seqlens_from_lengths`, which already refuses this for the exact
 /// same reason (`flash/mod.rs`: "a zero-length sequence has no rows to
 /// attend from or to ... refused rather than silently producing an empty
-/// ... slice of the batch"). An earlier version of this function accepted
-/// `len == 0` (reasoning it "contributes zero rows, a legitimate
-/// degenerate no-tokens-for-this-batch-element case") while
-/// `flash_attention_varlen_with_rope_ragged`'s OWN `CuSeqlens::from_lengths`
-/// call refused the identical `lengths` slice -- two different answers to
-/// the SAME question depending on which entry point a caller reached
-/// (`rope_positions_fused_ragged` silently succeeded on `lengths=[3, 0,
-/// 5]`; the flash entry on the exact same slice errored). Since this
+/// ... slice of the batch"). Accepting `len == 0` here (as "contributes
+/// zero rows") while `flash_attention_varlen_with_rope_ragged`'s OWN
+/// `CuSeqlens::from_lengths` call refuses the identical `lengths` slice
+/// would give two different answers to the SAME question depending on
+/// which entry point a caller reached. Since this
 /// function is the ONE place both entries derive `positions` from
 /// `lengths`, refusing here makes `rope_positions_fused_ragged` and
 /// `flash_attention_varlen_with_rope_ragged` agree on ONE `lengths`
@@ -450,7 +444,7 @@ pub(crate) fn gather_ragged_tables(
     Ok((total, cos_r, sin_r))
 }
 
-/// Ragged entry point (M1a — varlen positions): rotates Q/K in a packed
+/// Ragged entry point (varlen positions): rotates Q/K in a packed
 /// `[total, 3, h, d]` `qkv` buffer whose `total` rows are the
 /// CONCATENATION of `lengths.len()` variable-length segments (no
 /// padding). See the module doc's "The ragged arm" section for the full
@@ -704,7 +698,7 @@ impl CustomOp3 for RopePositionsFused {
     /// `RopeFused`'s module doc states for itself), and composing one for
     /// this op's packed-buffer-with-V-passthrough indexing is real,
     /// currently-unexercised work. Rather than silently return `None` for
-    /// a hypothetical future trainable table (the exact landmine
+    /// a trainable table (the exact landmine
     /// `LayerNormFused`'s doc warns a hardcoded `false`/`None` would be),
     /// a caller that DOES pass a TRACKED `cos`/`sin` gets a typed error,
     /// not a silently-missing gradient. Gated on `track_op()`, NOT
@@ -721,7 +715,7 @@ impl CustomOp3 for RopePositionsFused {
     /// downstream at `backprop.rs:175` ("grad not populated") instead of
     /// this typed refusal. The SAME predicate-hole class
     /// `low_rank_residual_linear.rs`'s and `jammi-lora`'s
-    /// `frozen_weight_gate` already fixed for their own `w`/`weight`
+    /// `frozen_weight_gate` close for their own `w`/`weight`
     /// slots; see `crate::ops::rope_positions`'s own test
     /// `rope_positions_fused_ragged_refuses_a_var_backed_base_table_not_a_panic`
     /// for the live probe.
@@ -842,7 +836,7 @@ mod tests {
             .collect()
     }
 
-    /// THE oracle (P6 Stage B B3-dense, contract v5 §3.6): `rope_positions`
+    /// THE oracle (dense arm): `rope_positions`
     /// on the packed layout is bit-identical to `RopeFused` applied to the
     /// SAME data in `[b, h, s, d]` form (the block arm's own operand
     /// shape, `gather_bhsd`'s target), for a real (non-trivial-angle)
@@ -917,7 +911,7 @@ mod tests {
         }
 
         // Slot 1 (K) must ALSO be bit-identical to `RopeFused` on the SAME
-        // data -- RoPE applies to Q *and* K (contract v5 §3.6), and the
+        // data -- RoPE applies to Q *and* K, and the
         // slot-0 check above says nothing about slot 1: a defect that
         // rotates only slot 0 (leaving K a pass-through, e.g. a
         // `slot == 2` condition mutated to `slot >= 1`) would sail through
@@ -959,7 +953,7 @@ mod tests {
     #[test]
     fn bit_identical_to_rope_fused_on_bhsd_head_dim_matches_production() {
         // head_dim=64 (ModernBERT-large's real head_dim), a smaller
-        // (b, s) so the CPU test stays fast — the pod leg covers full
+        // (b, s) so the CPU test stays fast — the CUDA parity leg covers full
         // production (b, s) at this head_dim in bf16.
         bit_identity_case(2, 4, 9, 64);
     }
@@ -1048,7 +1042,7 @@ mod tests {
         assert_eq!(out.elem_count(), 0);
     }
 
-    /// Family D: a table whose period disagrees with `seq` must be
+    /// Domain: a table whose period disagrees with `seq` must be
     /// refused, not silently misindexed.
     #[test]
     fn table_period_mismatch_is_refused() {
@@ -1059,12 +1053,12 @@ mod tests {
         assert!(format!("{err}").contains("cos/sin table covers"));
     }
 
-    /// Family D: `total` not a multiple of `seq` must be refused, not
+    /// Domain: `total` not a multiple of `seq` must be refused, not
     /// silently misindexed (`token % seq` is well-defined arithmetic even
     /// then, but semantically wrong -- mirrors `rope_dims`'s
     /// `total_rows_not_a_multiple_of_period_is_refused`). The table's own
-    /// period matches `seq` exactly, so this exercises ONLY the new
-    /// `total % seq` guard, not the pre-existing period check.
+    /// period matches `seq` exactly, so this exercises ONLY the
+    /// `total % seq` guard, not the period check.
     #[test]
     fn total_not_a_multiple_of_seq_is_refused() {
         let device = Device::Cpu;
@@ -1078,7 +1072,7 @@ mod tests {
         );
     }
 
-    /// Family D boundary: `seq=0` with a nonempty qkv is refused, not a
+    /// Domain boundary: `seq=0` with a nonempty qkv is refused, not a
     /// division-by-zero / modulo-by-zero panic.
     #[test]
     fn seq_zero_with_nonempty_qkv_is_refused_not_a_panic() {
@@ -1090,7 +1084,7 @@ mod tests {
     }
 
     /// A single identical token position (`s=1`, the degenerate/boundary
-    /// "one point" case family D asks every op to cover) still matches
+    /// "one point" case every op must cover) still matches
     /// `RopeFused` bit-for-bit.
     #[test]
     fn bit_identical_single_position_s_one() {
@@ -1114,17 +1108,15 @@ mod tests {
         assert!(format!("{err}").contains("gradient is not implemented"));
     }
 
-    /// PIN (audit's "the dense arm errors correctly" claim, made explicit
-    /// for the `track_op()` class fix): a tracked-but-not-`Var` `cos`
+    /// PIN (the dense arm's `track_op()` gate): a tracked-but-not-`Var` `cos`
     /// (`cos_var.as_tensor() * 1.0` -- the SAME construction
     /// `low_rank_residual_linear.rs`'s own regression test uses) reaching
     /// the DENSE entry directly must ALSO be a typed refusal, not a panic
-    /// -- the test above only proves the LITERAL-`Var` case (where
-    /// `is_variable()` alone already caught it, before AND after this
-    /// round's fix); this test proves the DENSE arm's `track_op()` gate
-    /// catches the tracked-non-Var case an `is_variable()`-only gate would
-    /// have missed, the same class the ragged arm's own probe (below)
-    /// exercises.
+    /// -- the test above only proves the LITERAL-`Var` case (which
+    /// `is_variable()` alone would catch); this test proves the DENSE arm's
+    /// `track_op()` gate catches the tracked-non-Var case an
+    /// `is_variable()`-only gate would miss, the same class the ragged
+    /// arm's own probe (below) exercises.
     #[test]
     fn cos_sin_tracked_non_variable_gradient_is_a_typed_error_not_silent_none() {
         use candle_core::Var;
@@ -1149,17 +1141,17 @@ mod tests {
         assert!(format!("{err}").contains("gradient is not implemented"));
     }
 
-    /// THE class fix's own probe (audit): the LIVE hazard a Var-backed
-    /// BASE table reaching the PUBLIC ragged entry point,
-    /// `rope_positions_fused_ragged`, used to trigger -- `gather_ragged_tables`'s
+    /// The ragged arm's probe: a Var-backed BASE table reaching the PUBLIC
+    /// ragged entry point, `rope_positions_fused_ragged` --
+    /// `gather_ragged_tables`'s
     /// `index_select` output (`cos_r`) is NEVER `is_variable()` (it is the
     /// `index_select` RESULT, not the `Var` itself) but ALWAYS `track_op()`
     /// whenever the caller's own `cos_base` is a `Var`, so an
-    /// `is_variable()`-only gate at `bwd` silently returned `Ok` and let
+    /// `is_variable()`-only gate at `bwd` would silently return `Ok` and let
     /// `apply3` return `(Some(dx), None, None)` -- candle's OWN
-    /// `sorted_nodes` walk (`backprop.rs`) still expected a gradient entry
+    /// `sorted_nodes` walk (`backprop.rs`) still expects a gradient entry
     /// for `cos_r` (its ancestry reaches `cos_base`, the `Var`), so
-    /// `Tensor::backward()` PANICKED at `backprop.rs:175` ("grad not
+    /// `Tensor::backward()` would PANIC at `backprop.rs:175` ("grad not
     /// populated") instead of returning this test's clean typed `Err`.
     #[test]
     fn rope_positions_fused_ragged_refuses_a_var_backed_base_table_not_a_panic() {
@@ -1189,10 +1181,10 @@ mod tests {
     }
 
     // =======================================================================
-    // M1a — varlen positions (the ragged arm). See the module doc's "The
-    // ragged arm" section. TRUTH oracle, DENSE INVARIANCE, and GUARD
-    // inventory (contract's oracle inventory items 1/3/4) all live here;
-    // item 2 (RETENTION, CUDA-only) lives in `ops::flash_attention`.
+    // Varlen positions (the ragged arm). See the module doc's "The
+    // ragged arm" section. The TRUTH oracle, DENSE INVARIANCE, and GUARD
+    // inventory all live here; the RETENTION oracle (CUDA-only) lives in
+    // `ops::flash_attention`.
     // =======================================================================
 
     /// Builds a `[total, 3, h, d]` ragged `qkv` (the concatenation of
@@ -1481,15 +1473,11 @@ mod tests {
         assert!(format!("{err}").contains("ragged arm refuses total=0"));
     }
 
-    /// UNIFIED `lengths` contract (audit advisory 2): a zero-length
+    /// UNIFIED `lengths` contract: a zero-length
     /// segment is refused by `rope_positions_fused_ragged`, matching
-    /// `flash_attention_varlen_with_rope_ragged`'s own (pre-existing,
-    /// `CuSeqlens::from_lengths`-derived) refusal of the SAME shape -- an
-    /// earlier version of this function silently accepted `lengths=[3, 0,
-    /// 5]` (treating a zero-length segment as "contributes zero rows"),
-    /// while the flash sibling refused it, giving two different answers
-    /// to the same question depending on which entry point a caller
-    /// reached. `total=8` (3+0+5) is nonempty, so this exercises ONLY the
+    /// `flash_attention_varlen_with_rope_ragged`'s own
+    /// (`CuSeqlens::from_lengths`-derived) refusal of the SAME shape, so
+    /// both entry points give one answer to the same question. `total=8` (3+0+5) is nonempty, so this exercises ONLY the
     /// per-segment `len == 0` guard, not the separate `total == 0` guard
     /// the test above covers.
     #[test]

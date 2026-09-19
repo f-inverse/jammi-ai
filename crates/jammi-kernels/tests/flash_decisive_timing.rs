@@ -1,26 +1,16 @@
-//! P6 Stage B decisive timing measurement (lead's directive, exclusive
-//! box). Raw `crate::flash::flash_varlen_fwd_into`/`flash_varlen_bwd_into`
-//! (KERNEL bracket, no allocation in the timed region) and
+//! Flash-attention timing measurement on an exclusive GPU. Raw
+//! `crate::flash::flash_varlen_fwd_into`/`flash_varlen_bwd_into` (KERNEL bracket, no allocation in the timed region) and
 //! `flash_varlen_fwd`/`flash_varlen_bwd` (WRAPPER bracket, the public
 //! convenience API that DOES allocate its outputs on every call) at
 //! production geometry: H=16, D=64, b8-s512 dense and b1-s512,
 //! `deterministic=true` only (see "Why deterministic-only" below), bf16
 //! random inputs at production amplitude (`|qkv| <= 18`).
 //!
-//! # Fix round (10b1f3b audit, BLOCKING finding 3; tightened by a same-day
-//! lead follow-up on a different kernel's unreproducible artifact)
+//! # Measurement discipline
 //!
-//! The audited version's single bracket (i) allocated `o`/`lse`/scratch/
-//! `d_qkv` INSIDE the timed loop, (ii) memset `dq_accum` TWICE per bwd call
-//! (once in `BwdScratch::alloc`, once again — unconditionally — inside
-//! `flash_varlen_bwd_into`), (iii) used only 5 warmup iterations (mean-p50
-//! gap was one max outlier over 25 samples), and (iv) reported a bimodal
-//! non-deterministic leg (min 0.26ms, p50 0.376ms) with no explanation.
-//! This version:
-//!
-//! - Separates a **KERNEL bracket** (buffers preallocated ONCE outside the
-//!   loop, `_into` called on reused views — zero device allocation inside
-//!   the timed region) from a **WRAPPER bracket** (the public
+//! - A **KERNEL bracket** (buffers preallocated ONCE outside the loop,
+//!   `_into` called on reused views — zero device allocation inside the
+//!   timed region) is kept separate from a **WRAPPER bracket** (the public
 //!   `flash_varlen_fwd`/`flash_varlen_bwd`, which allocates fresh outputs
 //!   every call — reported explicitly AS SUCH, never silently compared
 //!   against nsys/kernel-only numbers elsewhere in this repo).
@@ -29,17 +19,15 @@
 //!   bracket is REQUIRED to be steady-state (median within 5% of mean — no-producer: restates the `STEADY_STATE_REL_TOL` design threshold below) and
 //!   REFUSES (panics) rather than publishing a bimodal/outlier-dominated
 //!   sample. The **WRAPPER** bracket's steady-state flag is RECORDED, not
-//!   enforced — two independent runs on this box (`a100b`) found the
-//!   wrapper bracket (which allocates fresh device memory every call)
-//!   genuinely, reproducibly bimodal (run 1: `b8_s512_dense bwd wrapper`
-//!   min=0.43ms vs median=1.16ms, max=6.24ms; run 2 caught a DIFFERENT
-//!   leg's fwd kernel outlier before this fix separated the two brackets'
-//!   discipline) — a real allocator-pool-growth property of the PUBLIC API
-//!   itself, not a measurement artifact, and not something this harness
-//!   should hide by loosening the tolerance until it stops firing. Reported
-//!   honestly (`steady_state: false` in the JSON) rather than either
-//!   silently publishing it as clean or blocking the whole artifact on a
-//!   property outside the kernel's own control.
+//!   enforced — the wrapper bracket (which allocates fresh device memory
+//!   every call) is genuinely, reproducibly bimodal on an A100 (e.g.
+//!   `b8_s512_dense bwd wrapper` min=0.43ms vs median=1.16ms, max=6.24ms)
+//!   — a real allocator-pool-growth property of the PUBLIC API itself, not
+//!   a measurement artifact, and not something this harness should hide by
+//!   loosening the tolerance until it stops firing. Reported as
+//!   `steady_state: false` in the JSON rather than either silently
+//!   publishing it as clean or blocking the whole artifact on a property
+//!   outside the kernel's own control.
 //! - Runs the ENTIRE measurement **twice** (`RUNS = 2`) and writes both
 //!   runs into the artifact, so reproducibility is a stored fact, not an
 //!   assertion made once and never checked again.
@@ -50,22 +38,20 @@
 //!   crate's dependency version, so per-iteration sync is the method this
 //!   harness actually has).
 //!
-//! ## Why deterministic-only (the non-det bwd leg is DROPPED, not fixed)
+//! ## Why deterministic-only
 //!
-//! `10b1f3b`'s artifact measured `deterministic=false` bwd as bimodal
-//! (min 0.26ms / p50 0.376ms over 25 samples) with no root cause found.
+//! `deterministic=false` bwd measures bimodal (min 0.26ms / p50 0.376ms
+//! over 25 samples) with no known root cause.
 //! `crate::ops::flash_attention_varlen` (the only production entry point,
 //! see its own module doc's "Domain" section) never passes
 //! `deterministic=false` — every real call site pins `true` — so the
 //! non-deterministic path is not on the measured product's critical path.
-//! Rather than publish an unexplained number, this harness drops that leg
-//! entirely; `tests/flash_op_oracles.rs`'s
+//! Rather than publish an unexplained number, this harness does not time
+//! that leg; `tests/flash_op_oracles.rs`'s
 //! `poison_non_deterministic_dq_accum_is_a_dead_path_guard_not_reachable_via_the_op`
-//! already covers its CORRECTNESS as a dead-path guard on the lower-level
-//! primitive. A future timing pass that wants the non-det number should
-//! first characterise the bimodality (e.g. `nsys` on the two clusters) —
-//! that is out of scope for a fix round whose job is closing the audit's
-//! BLOCKING findings, not opening a new investigation.
+//! covers its CORRECTNESS as a dead-path guard on the lower-level
+//! primitive. Timing the non-det leg first needs the bimodality
+//! characterised (e.g. `nsys` on the two clusters).
 //!
 //! `#[ignore]`d: needs an EXCLUSIVE GPU. Invoke with `cargo test --release
 //! -p jammi-kernels --features flash-attn --test flash_decisive_timing --
@@ -79,10 +65,9 @@
 //! Every provenance field (`tip_sha`, `box`, `gpu`, `driver`,
 //! `compute_capability`) is either derived from a live query that this
 //! harness asserts succeeded and is non-empty, or read from a required env
-//! var — never defaulted to the string `"unknown"`. `10b1f3b`'s version
-//! defaulted three of these silently; a green artifact with unverifiable
-//! provenance is evidence about the harness, not the kernel (`docs/
-//! maintainer/cuda-kernel-guide.md` §4's "commit the artifact... carrying
+//! var — never defaulted to the string `"unknown"`. A green artifact with
+//! unverifiable provenance is evidence about the harness, not the kernel
+//! (`docs/maintainer/cuda-kernel-guide.md` §4's "commit the artifact... carrying
 //! the git_sha of the tip it measured" — the same principle extended to
 //! every other provenance field).
 
@@ -176,7 +161,7 @@ fn steady_state_message(label: &str, s: &Stats) -> String {
 /// KERNEL brackets: refuses (panics) rather than trusting a non-steady-state
 /// sample — mirrors `assert!(x.is_finite() && ...)`'s affirmative-write
 /// discipline (`docs/maintainer/cuda-kernel-guide.md` §3.7): a bimodal or
-/// outlier-dominated distribution is a RED result, not a number to publish.
+/// outlier-dominated distribution is a failing result, not a number to publish.
 /// A preallocated, zero-allocation timed region has no legitimate reason to
 /// be bimodal — if it is, something is wrong with the MEASUREMENT (a
 /// concurrent tenant, a thermal/clock event), not an inherent property of
@@ -447,7 +432,7 @@ fn time_bwd_wrapper(
 }
 
 /// One full measurement pass (all legs, both brackets, fwd+bwd) — run
-/// `RUNS` times to prove reproducibility (the lead's follow-up clause).
+/// `RUNS` times to prove reproducibility.
 fn one_full_run(dev: &CudaDevice) -> Vec<String> {
     let mut legs_json = Vec::new();
     for (leg_name, lengths) in [
@@ -574,17 +559,17 @@ fn decisive_timing_measurement() {
                   \\\"steady_state\\\" in each stats block. ENFORCED (panics, refuses to write \
                   the artifact) for kernel_ms — a preallocated, zero-allocation region has no \
                   legitimate reason to be bimodal. RECORDED ONLY for wrapper_ms, never enforced: \
-                  two independent runs on a100b found the wrapper bracket genuinely and \
+                  the wrapper bracket is genuinely and \
                   reproducibly bimodal (fresh device allocation every call has real \
                   allocator-pool-growth variance) — a property of the PUBLIC API itself, not a \
-                  measurement defect, so it is reported honestly rather than hidden by loosening \
+                  measurement defect, so it is reported rather than hidden by loosening \
                   the tolerance or blocking the artifact on something outside the kernel's own \
-                  control; see this file's module doc. non-deterministic bwd is DROPPED (not \
-                  measured): it is unreachable from the \
+                  control; see this file's module doc. non-deterministic bwd is not \
+                  measured: it is unreachable from the \
                   only production entry point (ops::flash_attention_varlen pins \
-                  deterministic=true at every real call site) and 10b1f3b's artifact found it \
-                  bimodal with no root cause — publishing an unexplained number was rejected in \
-                  favour of dropping the leg; see this file's module doc.";
+                  deterministic=true at every real call site) and it measures bimodal with no \
+                  known root cause — no unexplained number is published; see this file's module \
+                  doc.";
 
     let artifact = format!(
         "{{\n  \"tip_sha\": \"{sha}\",\n  \"box\": \"{sm_name}\",\n  \"gpu\": \"{gpu_name}\",\n  \

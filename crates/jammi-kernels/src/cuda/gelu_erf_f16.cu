@@ -3,7 +3,7 @@
 // (see ../../build.rs); the pinned build flags (sm_80 baseline, no
 // -use_fast_math) live there, not here.
 //
-// DELIBERATE DUPLICATION (campaign #443 W2b convention -- see
+// DELIBERATE DUPLICATION (see
 // `geglu_f16.cu`'s/`layer_norm_f16.cu`'s identical note): a SEPARATE
 // translation unit from `gelu_erf.cu`, with its own `#include
 // <cuda_fp16.h>` and its own `gelu_erf_pdf` helper -- NOT a shared `.cuh`.

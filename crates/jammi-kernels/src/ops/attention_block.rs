@@ -5,7 +5,7 @@
 //! tape node instead of the ~10-op eager chain (`RoPE` twice, a matmul, a
 //! scale, up to two mask adds, a softmax, a second matmul, a transpose and
 //! a reshape) `jammi-encoders`' ModernBERT attention call site builds today.
-//! Generic primitive (family L): this crate names no consumer — the
+//! Generic primitive: this crate names no consumer — the
 //! doc below cites ModernBERT's own shapes/values only to explain the
 //! numeric choices this op makes, never as a dependency.
 //!
@@ -28,7 +28,7 @@
 //! ## The `rope_pack` argument: packing `cos`+`sin` into `CustomOp3`'s
 //! third slot
 //!
-//! `CustomOp3` takes exactly three tensor arguments; this op's contract
+//! `CustomOp3` takes exactly three tensor arguments; this op
 //! needs FOUR conceptually independent tensors on the RoPE side alone
 //! (`qkv`, `cos`, `sin`, `mask`). Rather than inventing a new
 //! representation for the RoPE table, `rope_pack` is `Tensor::stack(&[cos,
@@ -38,11 +38,10 @@
 //! cos`, `rope_pack[1] == sin`) purely to fit `CustomOp3`'s arity. This
 //! introduces no new numeric representation and no rounding of its own
 //! (a `stack` is a pure memory copy of the SAME bytes); it is a resolved
-//! interpretation of the op contract's literal 3-argument constraint, not
-//! a numeric design choice — see this crate's hand-off notes for the
-//! disclosure.
+//! interpretation of `CustomOp3`'s literal 3-argument constraint, not a
+//! numeric design choice.
 //!
-//! ## Fixed domain: `head_dim == 64` (family D)
+//! ## Fixed domain: `head_dim == 64`
 //!
 //! Unlike every other op in this crate, this one pins `head_dim` to
 //! exactly `HEAD_DIM` (`64`) rather than accepting any positive even
@@ -57,15 +56,15 @@
 //! and the final division (no mantissa rounding is introduced by an
 //! exponent-only shift, provided no overflow/underflow — never a concern
 //! at this magnitude). Folding the scale into `Q` (`[batch, heads, seq,
-//! head_dim]`-sized, not `[batch, heads, seq, seq]`-sized) is the "fold"
-//! this crate's P1 commit established for the same reason: one
+//! head_dim]`-sized, not `[batch, heads, seq, seq]`-sized) is the same
+//! "fold" this crate's other scaled ops use, for the same reason: one
 //! elementwise pass over the SMALLER tensor replaces one over the
 //! quadratic one. A generic `head_dim` would not preserve this
 //! bit-exactness in general (`1/sqrt(d)` is irrational for most `d`), so
 //! this op refuses any other width rather than silently losing the
 //! guarantee.
 //!
-//! ## The window is construction data at the CALL SITE, not this op (family D)
+//! ## The window is construction data at the CALL SITE, not this op
 //!
 //! This op has no `window`/`half_window` field and computes no band
 //! predicate of its own. Whatever band a local-attention caller wants is
@@ -73,18 +72,15 @@
 //! is only that `mask[b, q, k]` is `0.0` for an attendable key and a
 //! value `< 0.0` at the [`WINDOW_MASKED_VALUE`] magnitude for a masked
 //! one — how the caller builds, caches, or combines the padding and band
-//! terms into that value is outside this op's knowledge (family L: this
-//! crate names no consumer, so no consumer's cache is a premise here; the
+//! terms into that value is outside this op's knowledge (this crate names
+//! no consumer, so no consumer's cache is a premise here; the
 //! sentinel-equality pin lives on the consumer side, in its own mask
 //! module). The caller passes this op ONE already-combined additive
 //! mask, exactly the shape
 //! [`super::SoftmaxLastDimFused`] already accepts (`[batch|1, 1, seq|1,
 //! seq]` — see that op's module doc's "supported mask broadcast class").
-//! Earlier revisions of this op re-derived the SAME band predicate three
-//! times more (once per CPU-forward row, once in a CUDA scratch-mask
-//! builder, once in `bwd`'s recompute) on top of the encoder's own copy —
-//! four copies of `i.abs_diff(k) <= half_window` for one predicate. This
-//! design removes all three: the op reads whatever additive value the
+//! The op holds no copy of the band predicate (`i.abs_diff(k) <=
+//! half_window`) in its CPU forward, CUDA arm, or `bwd` recompute: it reads whatever additive value the
 //! caller's combined mask carries at `(b, q, k)` and never asks whether
 //! that value came from padding, a window band, or both — it does not
 //! need to know, since [`WINDOW_MASKED_VALUE`] (`-10_000.0`) and
@@ -100,34 +96,30 @@
 //! reuses that exact policy type and, for the CPU arm, that exact row
 //! math — [`super::softmax::softmax_row_f32`] directly).
 //!
-//! `mask`'s domain therefore widened from the padding-only `[batch|1, 1,
-//! 1, seq]` shape earlier revisions required to `[batch|1, 1, seq|1,
-//! seq]` — the `seq|1` third axis lets a global layer keep passing the
+//! `mask`'s domain is therefore `[batch|1, 1, seq|1, seq]` — the `seq|1`
+//! third axis lets a global layer keep passing the
 //! narrower padding-only shape (no query-row broadcast needed) while a
 //! local layer passes the wider padding-plus-band sum. See
 //! [`check_mask`].
 //!
-//! ## Domain (family D)
+//! ## Domain
 //!
 //! `qkv`: rank 5 `[batch, seq, 3, heads, head_dim]`, contiguous, dtype
 //! `F32` (CPU and CUDA) or `BF16`/`F16` (CUDA only). This op's CPU domain
 //! accepts `F32` ONLY, refusing `BF16`/`F16` with a typed
 //! `UnsupportedDTypeForOp` rather than reaching a confusing failure three
-//! calls deep inside a matmul. CORRECTED reason (campaign #446 finding
-//! 14; an earlier revision of this line said candle-core 0.11's CPU
-//! backend "has no `BF16`/`F16` `MatMul` impl", which is only half true —
-//! [`LowRankResidualLinear`]'s module doc already states it correctly):
-//! candle's default gemm CPU `MatMul` admits `F16`/`F32`/`F64` and refuses
-//! `BF16`. `BF16` therefore IS a candle limitation; `F16` is not — it is
+//! calls deep inside a matmul. The reason differs per dtype (as
+//! [`LowRankResidualLinear`]'s module doc also states): candle's default
+//! gemm CPU `MatMul` admits `F16`/`F32`/`F64` and refuses `BF16`. `BF16` therefore IS a candle limitation; `F16` is not — it is
 //! refused because `cpu_fwd` below is written against `CpuStorage::F32`
 //! throughout (its GEMMs are literal `CpuStorage::F32(..).matmul(..)`
-//! calls), with no 16-bit arm to reach. `F16` (campaign #443 D1) is admitted on
-//! CUDA on exactly the same basis as `BF16`: this op has no `.cu` kernel of
+//! calls), with no 16-bit arm to reach. `F16` is admitted on CUDA on
+//! exactly the same basis as `BF16`: this op has no `.cu` kernel of
 //! its own (`crate::cuda::attention_block`'s module doc), so its dtype
 //! domain is the INTERSECTION of what candle's own generic storage ops
 //! support and what its two composed sub-kernels ([`RopeFused`],
-//! [`super::SoftmaxLastDimFused`]) dispatch for — both now compile real
-//! `F16` arms (campaign #443 W2b). `head_dim` must be exactly `HEAD_DIM`.
+//! [`super::SoftmaxLastDimFused`]) dispatch for — both compile real `F16`
+//! arms. `head_dim` must be exactly `HEAD_DIM`.
 //! `seq` must be `<= MAX_SEQ`. `rope_pack` (when `rope == true`): rank
 //! 5 `[2, 1, 1, seq_max, head_dim]`, `seq_max >= seq`, contiguous, same
 //! dtype as `qkv`. `mask`: rank 4 `[batch|1, 1, seq|1, seq]`, contiguous,
@@ -161,10 +153,9 @@
 //! `batch=8, seq=512`, `seed=42`, sha `8922094aa35d381d108420fefe82cba122bf6ebb`
 //! (`JAMMI_DEBUG_QKV_AMP=1` on the `Wqkv` output feeding
 //! `forward_training_attention`'s fused arm) — an order of magnitude past
-//! this ceiling. The op still admits and runs correctly there (this op's
-//! own defect history was a GEMM-operand-form determinism issue — see
-//! "GEMM operand form is a determinism concern" above — NOT an
-//! amplitude-domain violation), but this crate makes NO derived-bound
+//! this ceiling. The op still admits and runs correctly there (its
+//! fused-vs-eager sensitivity is GEMM operand form — see "GEMM operand
+//! form is a determinism concern" below — NOT amplitude), but this crate makes NO derived-bound
 //! CLAIM at that amplitude: the encoder-level oracle above compares fused
 //! vs eager through the REAL call site at `F32` (this op's CPU-only dtype)
 //! specifically because no bf16 bound at production amplitude exists to
@@ -218,7 +209,7 @@
 //! | `dkr = matmul_grad_rhs(q_scaled, ds)` then `.transpose()` | no — new | `q_scaled` transpose VIEW (already contiguous); the trailing `.transpose()` is a view too |
 //!
 //! (`ctx` itself — `fwd`'s SECOND GEMM — is never recomputed in `bwd`: the
-//! op contract's "no packed `[O|L]` output" design means `bwd` only ever
+//! op's "no packed `[O|L]` output" design means `bwd` only ever
 //! needs `dctx`, supplied by the caller as `grad_res`, never `ctx` itself.)
 //!
 //! `dv`/`dp` reach production's own operand form for free: `p` and `v_c`
@@ -248,62 +239,51 @@
 //! difference this causes is small (a few ULPs — `Bf16LegBounds` in
 //! `tests/cuda_parity.rs`) but SYSTEMATIC (a fixed function of the two
 //! operand forms, not i.i.d. noise): it does not average out across a
-//! training step or a layer stack. A prior round of this fix dropped
-//! `.contiguous()` from `dv`/`dp`/`dkr` on the theory that candle's
-//! `Op::Matmul` backward "never materializes"; that is true of `dv`/`dp`
-//! (whose forward operands are already contiguous either way) but false
-//! of `dqs`/`dkr`, whose forward (`scores`) IS materialized in
-//! production — a mismatch the prior round's own oracles could not see:
-//! a CPU/F32 encoder-level comparison runs at a dtype/device pair with no
-//! cuBLAS bf16 blocking sensitivity at all, and this file's bf16
-//! derived-bound legs compare a SINGLE `bwd` call, whose own
-//! `7 * bf16_ulp(dqkv_max)` floor swallows a divergence this small by
-//! construction (a single call cannot show that the divergence is
-//! SYSTEMATIC rather than ordinary bf16 rounding noise — only compounding
-//! it across a step can). `matmul_grad_lhs`/`matmul_grad_rhs` plus
-//! `kt_contig` (previous section) close the gap STRUCTURALLY: the fused
-//! and production GEMMs are the same call by definition now, not merely
-//! measured close —
+//! training step or a layer stack. `dv`/`dp`'s forward operands are
+//! contiguous either way, so their form is free; `dqs`/`dkr`'s forward
+//! (`scores`) IS materialized in production, so their form must match it.
+//! Two oracles cannot see a mismatch here: a CPU/F32 encoder-level
+//! comparison runs at a dtype/device pair with no cuBLAS bf16 blocking
+//! sensitivity at all, and this file's bf16 derived-bound legs compare a
+//! SINGLE `bwd` call, whose own `7 * bf16_ulp(dqkv_max)` floor swallows a
+//! divergence this small by construction (a single call cannot show that
+//! the divergence is SYSTEMATIC rather than ordinary bf16 rounding noise —
+//! only compounding it across a step can). `matmul_grad_lhs`/
+//! `matmul_grad_rhs` plus `kt_contig` (previous section) close the gap
+//! STRUCTURALLY: the fused and production GEMMs are the same call by
+//! definition, not merely measured close —
 //! `tests::attention_block_bwd_dqs_dkr_gemm_layouts_match_production_
 //! orientation_cuda` (`tests/cuda_parity.rs`, via
 //! [`bwd_gradient_gemm_layouts`]) proves it directly: it captures each
 //! gradient GEMM's operand `Layout` FROM `bwd_core`'s own code (not a
 //! fixture reconstructed separately from it) and asserts two STRUCTURAL
-//! properties that flip specifically between the pre-round-4 operand
-//! forms and this round's fix (that test's own doc has the exact
-//! stride/shape claims), so a future re-introduction of a bare
-//! `k_rot`/`q_scaled` operand in place of `kt_contig` fails immediately,
-//! structurally, without needing bf16 noise to average out first.
+//! properties that distinguish a bare `k_rot`/`q_scaled` operand from
+//! `kt_contig` (that test's own doc has the exact stride/shape claims), so
+//! re-introducing a bare operand fails immediately, structurally, without
+//! needing bf16 noise to average out first.
 //!
-//! This op's numeric backstop — for the ORIGINAL divergence this round
-//! exists to guard against, not for the `dqs`/`dkr` change specifically
-//! (see the next paragraph) — lives one crate up:
+//! This op's numeric backstop lives one crate up:
 //! `jammi_encoders::modernbert::tests::attention_block_fused_vs_eager_
 //! dqkv_divergence_grows_with_depth_bf16_cuda` (`jammi-encoders`,
 //! `src/modernbert.rs`) drives the REAL `forward_training_attention`/
 //! `forward_eager_training_attention_composition` 28 layers deep from
 //! ONE tracked `qkv` `Var` and asserts the fused/eager divergence does
-//! NOT grow with depth. It is RED with the original three
-//! `.contiguous()` calls restored on `dv`/`dp`/`dkr`, GREEN at this
-//! file's tip — both readings reported, not merely asserted, in this
-//! round's hand-off. Measured on the SAME pod run: reverting ONLY
-//! `dqs`/`dkr`'s operand form to the pre-round-4 form (`dv`/`dp` left at
-//! this round's fix) does NOT redden that oracle — its step-1 `r(1)` is
-//! exactly `0.0` for every slot, bit-identical to the fully-fixed build,
-//! at `b=8, s=512, h=16, d=64` bf16. The `dqs`/`dkr` change above is
+//! NOT grow with depth. It fails when `.contiguous()` is forced on
+//! `dv`/`dp`/`dkr`. It does NOT fail when only `dqs`/`dkr` take bare
+//! `k_rot`/`q_scaled` operands (`dv`/`dp` as here): its step-1 `r(1)` is
+//! exactly `0.0` for every slot, bit-identical to this build, at `b=8,
+//! s=512, h=16, d=64` bf16 on an A100. The `dqs`/`dkr` operand form is
 //! therefore justified STRUCTURALLY (the layout test, previous
-//! paragraph), not as a numerically-demonstrated-necessary fix at this
+//! paragraph), not as a numerically-demonstrated-necessary choice at this
 //! shape; whether it matters at another shape or another GPU/driver is
-//! UNCONFIRMED — stated here, not claimed.
+//! unconfirmed.
 //!
 //! ### The two-armed rule: which GEMMs stay a VIEW, which get materialized
 //!
-//! An earlier revision of this doc claimed every `bwd` GEMM operand is
-//! "either genuinely contiguous or a bare transposed VIEW — never a copy
-//! this op chose to make for its own sake". That is false on its face:
-//! `dctx` (`grad_res.reshape(...).transpose(1, 2)?.contiguous()?`) IS a
-//! copy `bwd` makes, unconditionally, every call. The REAL rule has two
-//! arms, and both are matches to a SPECIFIC real thing, never "for its
+//! Not every `bwd` GEMM operand is either genuinely contiguous or a bare
+//! transposed VIEW: `dctx` (`grad_res.reshape(...).transpose(1,
+//! 2)?.contiguous()?`) IS a copy `bwd` makes, unconditionally, every call.
+//! The rule has two arms, and both are matches to a SPECIFIC real thing, never "for its
 //! own sake": (1) a GEMM that RECOMPUTES a `fwd` GEMM (`scores`, the one
 //! row in the table above) keeps `fwd`'s OWN operand form — a view stays
 //! a view, because that is what `fwd` itself issues, and `bwd`'s job
@@ -432,9 +412,8 @@
 //! `SoftmaxLastDimFused`, which DO compute those for the dead-in-practice
 //! case a future trainable table/mask would need); a caller that
 //! nonetheless makes either argument trainable gets a loud, typed refusal
-//! here rather than a silently-missing gradient (family D) — this is the
-//! op contract's "construction-time `!track_op()` asserts on args 2, 3",
-//! enforced at the one point real `Tensor` values (rather than merely
+//! here rather than a silently-missing gradient — the `!track_op()`
+//! asserts on args 2 and 3, enforced at the one point real `Tensor` values (rather than merely
 //! construction data) are actually available to check it against.
 //!
 //! ## Rounding (CPU / F32, and the composed-CUDA arm's identical order)
@@ -483,8 +462,8 @@ pub const MAX_SEQ: usize = 4096;
 /// of the F32/BF16 rounding noise floor around `0.0`, not merely on the
 /// correct side of it by an arbitrarily thin margin. See
 /// `jammi-encoders`' own test pinning `MASKED_LOGIT == WINDOW_MASKED_VALUE`
-/// (family L: this crate names no consumer, so the pin lives on the
-/// encoder side, which DOES know this constant by name).
+/// (this crate names no consumer, so the pin lives on the encoder side,
+/// which DOES know this constant by name).
 pub const WINDOW_MASKED_VALUE: f32 = -10_000.0;
 
 /// Fused attention block. See the module doc for the full design.
@@ -545,9 +524,8 @@ impl AttentionBlockFused {
     /// zero — `scale.to_bits() & 0x007f_ffff == 0`. Refuses any `scale`
     /// that fails this check with a typed error rather than silently
     /// accepting a value whose bit-exactness claim this op cannot actually
-    /// make (family D): `0.125` (`1/sqrt(64)`, this op's own production
-    /// value) passes; `0.1` (used by earlier test fixtures as an
-    /// "arbitrary" scale) is refused.
+    /// make: `0.125` (`1/sqrt(64)`, this op's own production value)
+    /// passes; `0.1` (a typical "arbitrary" scale) is refused.
     pub fn new(scale: f32, fully_masked: FullyMaskedPolicy, rope: bool) -> Result<Self> {
         if !scale.is_finite() || scale <= 0.0 {
             return Err(Error::Msg(format!(
@@ -624,7 +602,7 @@ pub(crate) fn attention_dims(
 /// Validates `mask`'s domain (module doc). Returns the mask's own leading
 /// (batch) axis size and its query-row axis size (`1` or `s`) — see the
 /// module doc's "window is construction data at the call site" section:
-/// this op's `mask` is now [`super::SoftmaxLastDimFused`]'s OWN broadcast
+/// this op's `mask` is [`super::SoftmaxLastDimFused`]'s OWN broadcast
 /// class (padding alone, `[batch|1, 1, 1, seq]`, or padding-plus-band,
 /// `[batch|1, 1, seq, seq]`), not a narrower padding-only shape.
 ///
@@ -717,9 +695,8 @@ pub(crate) fn check_rope_pack(l: &Layout, s: usize, d: usize, op: &'static str) 
 /// backward via candle's own `Op::Matmul`, and this op's hand-written
 /// `bwd` — are one thing: this function IS that one definition, so `bwd`
 /// and production's eager arm cannot silently drift into issuing
-/// different GEMMs for the same gradient again (P3 fix round 4,
-/// deliverable 3 — see `bwd`'s own doc comment on `dqs`/`dkr` for why
-/// this mattered there specifically).
+/// different GEMMs for the same gradient (see `bwd_core`'s comment on
+/// `dqs`/`dkr` for why this matters there specifically).
 pub fn matmul_grad_lhs(grad: &Tensor, rhs: &Tensor) -> Result<Tensor> {
     grad.matmul(&rhs.t()?)
 }
@@ -753,12 +730,8 @@ impl CustomOp3 for AttentionBlockFused {
         // flows through the general path below (zero-trip gather loops,
         // zero-extent GEMMs — `tests::empty_{batch,seq,heads}_is_a_no_op_
         // not_a_panic`), so the domain checks below run on empty inputs
-        // too. An earlier revision returned an empty buffer here first; it
-        // was byte-equivalent to the general path on every empty cell
-        // (verified by disabling it under all three tests) — dead weight
-        // of the same class as the deleted dtype-mismatch arm below. The
-        // CUDA arm keeps its own early return: cuBLAS is never handed a
-        // zero-extent GEMM there.
+        // too. The CUDA arm keeps its own early return: cuBLAS is never
+        // handed a zero-extent GEMM there.
         let (mask_b, mask_q) = check_mask(l3, b, s, op)?;
         if s1.dtype() != s3.dtype() {
             return Err(Error::DTypeMismatchBinaryOp {
@@ -814,8 +787,7 @@ impl CustomOp3 for AttentionBlockFused {
             // A `qkv`/`mask` dtype MISMATCH never reaches this match — it is
             // refused by the explicit `DTypeMismatchBinaryOp` check above,
             // so the only non-`F32` pair left here is a MATCHING non-`F32`
-            // pair (an earlier revision carried a second, unreachable
-            // mismatch arm at this point; deleted).
+            // pair.
             //
             // `BF16` (or any other dtype) on CPU: candle-core 0.11's CPU
             // backend has no `BF16` `MatMul` impl — the same pre-existing
@@ -843,9 +815,9 @@ impl CustomOp3 for AttentionBlockFused {
     /// Delegates to `bwd_core` (private, this module), which this op's `dqkv` output and
     /// [`bwd_gradient_gemm_layouts`]'s test-side layout introspection both
     /// call — the SAME code path, not two independently maintained copies
-    /// of it (P3 fix round 4: a fixture reconstructed separately from
-    /// `bwd`'s own logic cannot regress when `bwd` does — see
-    /// `bwd_gradient_gemm_layouts`'s own doc).
+    /// of it (a fixture reconstructed separately from `bwd`'s own logic
+    /// cannot regress when `bwd` does — see `bwd_gradient_gemm_layouts`'s
+    /// own doc).
     fn bwd(
         &self,
         qkv: &Tensor,
@@ -858,7 +830,7 @@ impl CustomOp3 for AttentionBlockFused {
         if rope_pack.track_op() || mask.track_op() {
             return Err(Error::Msg(format!(
                 "{op}: this op computes no gradient for the RoPE table or the mask — asserted \
-                 here rather than silently returning None (family D): rope_pack/mask must never \
+                 here rather than silently returning None: rope_pack/mask must never \
                  be tracked (never a Var, never downstream of one)"
             )));
         }
@@ -882,9 +854,7 @@ impl CustomOp3 for AttentionBlockFused {
 /// ADJACENT `&Tensor` parameters (`qkv`, `rope_pack`, `mask`, `grad_res`)
 /// are silently swappable at a call site with no compiler help, and
 /// `bwd_core` has exactly that shape. Named fields make a transposition
-/// a compile error instead of a silent wrong-tensor bug (P3 fix round 4
-/// closing round: the file's own precedent, reintroduced by this round's
-/// refactor, now closed the same way as the forward path).
+/// a compile error instead of a silent wrong-tensor bug.
 struct BwdCoreParams<'a> {
     op: &'static str,
     rope: bool,
@@ -968,8 +938,7 @@ fn bwd_core(params: BwdCoreParams<'_>) -> Result<(Tensor, [(Tensor, Tensor); 4])
 
     // `mask` is ALREADY the caller's combined padding-plus-band sum
     // (module doc's "window is construction data at the call site"
-    // section) — no band to rebuild here, unlike earlier revisions of
-    // this op.
+    // section) — no band to rebuild here.
     //
     // `scores` uses the SAME transposed-VIEW `k_rot` GEMM shape `fwd`
     // issues (`.transpose(...)` with NO trailing `.contiguous()` — see
@@ -1036,26 +1005,17 @@ fn bwd_core(params: BwdCoreParams<'_>) -> Result<(Tensor, [(Tensor, Tensor); 4])
     // `.contiguous()` below reproduces that materialization directly,
     // and doubles as satisfying [`super::RopeFused`]'s own admission
     // contract (contiguous input only) when `rope` is `true`.
-    // (P3 fix round 4, deliverable 3: an earlier revision of `bwd`
-    // computed `dqs`/`dkr` from `k_rot` directly — `fwd`'s operand form,
-    // not production's — issuing a DIFFERENT cuBLAS call from
-    // production's eager arm for this GEMM specifically, even after the
-    // round-3 fix aligned `dv`/`dp`. Measured on the pod (A100, `b=8,
-    // s=512, h=16, d=64`, bf16): reverting ONLY this — `dqs`/`dkr` back
-    // to the pre-round-4 form, `dv`/`dp` left at this round's shared
-    // definition — does NOT redden `tests::attention_block_fused_vs_
-    // eager_dqkv_divergence_grows_with_depth_bf16_cuda`
-    // (`jammi-encoders`): `r(1)` stays exactly `0.0` for every slot, IDENTICAL
-    // to the fully-fixed build, at this shape. Restoring the ORIGINAL
-    // esc-044 defect too (`dv`/`dp`/`dkr`'s three `.contiguous()` calls)
-    // reddens it regardless of `dqs`/`dkr`'s form. This round's
-    // `kt_contig`/shared-definition change for `dqs`/`dkr` is therefore
-    // justified STRUCTURALLY here — it provably issues the identical GEMM
-    // production's own autograd would (checked by `tests::attention_
-    // block_bwd_dqs_dkr_gemm_layouts_match_production_orientation_cuda`)
-    // — not as a numerically-demonstrated-necessary fix at this shape;
-    // whether it matters at another shape or on another cuBLAS/driver
-    // version is unconfirmed, reported honestly rather than claimed.)
+    // `dqs`/`dkr` take `kt_contig` (production's operand form), not
+    // `k_rot` (`fwd`'s form), so this GEMM is the identical cuBLAS call
+    // production's own autograd issues (checked by `tests::attention_
+    // block_bwd_dqs_dkr_gemm_layouts_match_production_orientation_cuda`).
+    // That is a STRUCTURAL guarantee, not a numerically-demonstrated one:
+    // on an A100 at `b=8, s=512, h=16, d=64` bf16, `k_rot`-form `dqs`/`dkr`
+    // leave `tests::attention_block_fused_vs_eager_dqkv_divergence_grows_
+    // with_depth_bf16_cuda` (`jammi-encoders`) at `r(1) == 0.0` for every
+    // slot; forcing `.contiguous()` on `dv`/`dp`/`dkr` fails it regardless.
+    // Whether the form matters at another shape or cuBLAS/driver version
+    // is unconfirmed.
     let kt_contig = k_rot.transpose(D::Minus1, D::Minus2)?.contiguous()?;
     let dqs_operands = (ds.clone(), kt_contig.transpose(D::Minus1, D::Minus2)?);
     let dqs = matmul_grad_lhs(&ds, &kt_contig)?;
@@ -1110,8 +1070,7 @@ pub struct BwdGemmLayoutsParams<'a> {
 /// fixture reconstructed independently of it. Order matches the module
 /// doc's GEMM table: `dv`, `dp`, `dqs`, `dkr`. Used by
 /// `tests/cuda_parity.rs`'s `attention_block_bwd_dqs_dkr_gemm_layouts_
-/// match_production_orientation_cuda` (P3 fix round 4, deliverable 3's
-/// "mechanism pin" — see that test's own doc).
+/// match_production_orientation_cuda` (see that test's own doc).
 #[doc(hidden)]
 pub fn bwd_gradient_gemm_layouts(
     params: BwdGemmLayoutsParams<'_>,
@@ -1156,7 +1115,7 @@ struct AttentionFwdF32Params<'a> {
 
 /// The composed CPU forward: gather `Q`/`K`/`V` out of `qkv` into
 /// `[batch*heads, seq, head_dim]` contiguous buffers (fixed ascending
-/// `(batch, seq, heads)` gather order — family J), RoPE-rotate `Q`/`K`
+/// `(batch, seq, heads)` gather order), RoPE-rotate `Q`/`K`
 /// (reusing [`rope_fwd_row_f32`] directly — bit-exact to
 /// [`super::RopeFused`]'s own CPU math), fold `scale` into `Q`, batched
 /// `QKᵀ` via [`BackendStorage::matmul`] (the SAME call
@@ -1166,13 +1125,11 @@ struct AttentionFwdF32Params<'a> {
 /// scatter back to `[batch, seq, heads*head_dim]`. `mask` here is ALREADY
 /// the caller's combined padding-plus-band sum (see the module doc's
 /// "window is construction data at the call site" section) — this
-/// function computes no band predicate of its own, unlike earlier
-/// revisions.
+/// function computes no band predicate of its own.
 ///
 /// Inputs arrive as ONE [`AttentionFwdF32Params`] (named fields at the
-/// call site) rather than eleven positional arguments — the shape that
-/// let an earlier revision's `mask_batch`/`mask_query_rows` pair be
-/// silently swappable and needed a `clippy::too_many_arguments` allow.
+/// call site) rather than eleven positional arguments, under which the
+/// `mask_batch`/`mask_query_rows` pair is silently swappable.
 fn attention_fwd_f32(params: &AttentionFwdF32Params<'_>) -> Result<Vec<f32>> {
     let AttentionFwdF32Params {
         qkv,
@@ -1249,9 +1206,9 @@ fn attention_fwd_f32(params: &AttentionFwdF32Params<'_>) -> Result<Vec<f32>> {
     // doc's "fwd/bwd GEMM shape match" and "GEMM operand form is a
     // determinism concern" sections both depend on `fwd` and `bwd` issuing
     // this EXACT operand form, and `eager_reference`'s own `k_t` VIEW
-    // (this module's `#[cfg(test)]` section) is now held to the same
-    // shape by construction — this assertion is what would catch either
-    // side silently regressing back to `.contiguous()`.
+    // (this module's `#[cfg(test)]` section) is held to the same
+    // shape by construction — this assertion catches either side
+    // silently switching to `.contiguous()`.
     debug_assert!(
         d <= 1 || !k_t_layout.is_contiguous(),
         "attention_block_fused: k_t_layout must be a transpose VIEW, not a materialized copy \
@@ -1272,8 +1229,7 @@ fn attention_fwd_f32(params: &AttentionFwdF32Params<'_>) -> Result<Vec<f32>> {
     // `super::softmax::softmax_dims` validates for `SoftmaxLastDimFused`
     // — see `check_mask`'s doc): a batch element's own row block starts at
     // `bi * mask_query_rows * s` (`0` when `mask_batch == 1`, broadcasting
-    // over every batch element — this is the exact indexing audit item B2
-    // named: an `mrow_base` that stayed hardcoded to `0` regardless of
+    // over every batch element — an `mrow_base` that stayed hardcoded to `0` regardless of
     // `mask_batch` would silently broadcast batch element 0's mask onto
     // every OTHER batch element too, a bug this function's own oracle
     // (`cpu_fwd_per_batch_mask_row_indexing_is_not_hardcoded_to_zero`)
@@ -1362,11 +1318,10 @@ mod tests {
     /// `heads=16`) — proves `bwd`'s `.contiguous()` placement leaves no
     /// operand a raw doubly-strided view `gemm_config` would refuse.
     ///
-    /// DEMOTED from "the" regression oracle for the round-4 GEMM-
-    /// operand-FORM defect (P3 fix round 4, deliverable 3): this test
-    /// answers ADMISSIBILITY ("would cuBLAS accept this operand at all"),
-    /// which the pre-round-4 `dqs`/`dkr` forms ALSO satisfied — a wrong
-    /// but ADMISSIBLE GEMM is exactly the failure mode that shipped.
+    /// This is NOT the oracle for GEMM operand FORM: it answers
+    /// ADMISSIBILITY ("would cuBLAS accept this operand at all"), which a
+    /// bare-`k_rot` `dqs`/`dkr` form ALSO satisfies — a wrong but
+    /// ADMISSIBLE GEMM passes here.
     /// Because this test reconstructs its own operands from a hardcoded
     /// shape/transpose sequence rather than reading them FROM `bwd_core`,
     /// it stays green under a `bwd_core` regression by construction.
@@ -1404,8 +1359,7 @@ mod tests {
                 "scores rhs @ ({b},{s},{h},{d})"
             );
             // The mutation this guards against: reintroducing
-            // `.contiguous()` on `rhs` (as an earlier revision of `bwd`
-            // did) would make THIS assertion pass too (a materialized
+            // `.contiguous()` on `rhs` would make THIS assertion pass too (a materialized
             // contiguous tensor is still an admissible GEMM operand — the
             // shape mismatch is invisible to `is_gemm_operand_admissible`
             // alone) but flip `rhs.is_contiguous()` from `false` to `true`,
@@ -1509,8 +1463,8 @@ mod tests {
     /// the module doc's "window is construction data at the call site"
     /// section); this is the test suite's own stand-in for what
     /// `jammi_encoders::mask::sliding_window_mask` does at the real call
-    /// site, kept here (not imported — family L: this crate names no
-    /// consumer) purely to build EXPECTED values.
+    /// site, kept here (not imported — this crate names no consumer)
+    /// purely to build EXPECTED values.
     fn test_sliding_window_band(
         s: usize,
         half_window: usize,
@@ -1533,8 +1487,7 @@ mod tests {
     /// `QKᵀ`, mask-add, softmax, `PV`), via ordinary `Tensor` ops —
     /// EXACTLY the shape `ops::softmax::tests::eager`/`ops::rope::tests`
     /// use as their own comparison targets. Assembled here rather than
-    /// imported from `jammi-encoders` (family L: this crate names no
-    /// consumer). `mask` here is the CALLER's already-combined mask (the
+    /// imported from `jammi-encoders` (this crate names no consumer). `mask` here is the CALLER's already-combined mask (the
     /// SAME value [`fused`]'s own `mask` argument gets) — this function
     /// does no band-building itself; callers that want a window arm build
     /// one via [`test_sliding_window_band`] and combine it in first,
@@ -1560,16 +1513,14 @@ mod tests {
         };
         // `k`'s transpose is passed as a VIEW (no `.contiguous()`) — the
         // SAME operand form `AttentionBlockFused`'s own `cpu_fwd`/`cuda_fwd`
-        // use for this GEMM (an earlier revision of this reference used to
-        // MATERIALIZE the transpose, which put a DIFFERENT operand form
-        // into `gemm`'s
-        // packing/blocking decision on x86_64/AVX than the op under test —
-        // `is_gemm_operand_admissible` accepts both forms, but only the
+        // use for this GEMM. A MATERIALIZED transpose would put a
+        // DIFFERENT operand form into `gemm`'s packing/blocking decision on
+        // x86_64/AVX than the op under test — `is_gemm_operand_admissible` accepts both forms, but only the
         // VIEW form is what `fwd` itself issues, so only it is a genuine
         // "does this op compute the right VALUE" oracle rather than an
         // accidental "do two DIFFERENT gemm calls happen to agree" one).
         let k_t = k.transpose(D::Minus1, D::Minus2)?;
-        // PIN the convention this reference now shares with `fwd`: a
+        // PIN the convention this reference shares with `fwd`: a
         // transpose VIEW's `(row_stride, col_stride)` on its trailing two
         // axes is `(1, d)` for a `[.., s, d]`-contiguous `k` (cuBLAS reads
         // `rhs_cs=d, rhs_rs=1` in `attention_fwd_f32`'s own `k_t_layout` —
@@ -2187,9 +2138,9 @@ mod tests {
         assert_eq!(got.elem_count(), 0);
     }
 
-    /// Family D boundary oracle (campaign #443 D1): the CPU domain is
-    /// `F32`-only, unaffected by this campaign's CUDA-side `F16` widening
-    /// (`crate::cuda::attention_block`'s dtype check) — `cpu_fwd` is
+    /// Boundary oracle: the CPU domain is `F32`-only, unaffected by the
+    /// CUDA-side `F16` admission (`crate::cuda::attention_block`'s dtype
+    /// check) — `cpu_fwd` is
     /// written against `CpuStorage::F32` throughout, and `BF16` is
     /// additionally unsupported by candle's own CPU `MatMul` (module doc's
     /// "Domain" section states both halves precisely; candle's CPU
@@ -2231,7 +2182,7 @@ mod tests {
         assert_eq!(got.elem_count(), 0);
     }
 
-    /// `dqkv == cat(dq, dk, dv)` — the op contract's own oracle: gradcheck
+    /// `dqkv == cat(dq, dk, dv)` — the op's own scatter oracle: gradcheck
     /// via finite differences on a small fixture proves `bwd`'s SCATTER
     /// (`Tensor::cat` of the three per-slot gradients back into `qkv`'s own
     /// `[B,S,3,H,D]` layout) lines up with the forward's own `[Q|K|V]`

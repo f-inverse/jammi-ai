@@ -10,7 +10,7 @@ use crate::ops::MAX_HEAD_DIM;
 /// See `crate::cuda`'s module doc for the module-name rationale.
 const MODULE_NAME: &str = "jammi_kernels_rope_positions";
 
-/// The F16 arm's OWN PTX module name (campaign #443 W2c) —
+/// The F16 arm's OWN PTX module name —
 /// `rope_positions_f16.cu` is a SEPARATE translation unit (see that file's
 /// module doc), so it needs a distinct module name from [`MODULE_NAME`].
 const MODULE_NAME_F16: &str = "jammi_kernels_rope_positions_f16";
@@ -63,13 +63,13 @@ pub(crate) fn cuda_fwd(
         return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, shape));
     }
 
-    // Contiguity is checked NEXT, before the (now `d != 0`) `n == 0` fast
+    // Contiguity is checked NEXT, before the (here `d != 0`) `n == 0` fast
     // path below — a `total == 0` (`n == 0` with `d != 0`)
     // empty-but-non-contiguous layout still falls through `cpu_fwd`'s OWN
     // `contiguous_offsets()` calls (only `d == 0`, handled above, skips
     // them there), so this arm must refuse the same layout rather than
     // silently admitting it through a combined `d == 0 || n == 0` fast
-    // path — the exact class of divergence this fix closes.
+    // path, which would be a CPU/CUDA domain divergence.
     let (x1, x2) = l1
         .contiguous_offsets()
         .ok_or(Error::RequiresContiguous { op: OP })?;

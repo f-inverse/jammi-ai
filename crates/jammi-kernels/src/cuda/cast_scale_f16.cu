@@ -1,16 +1,16 @@
 // cast_scale_f16.cu — F16 monomorphic arms for `crate::ops::CastScaleF16F32`
 // / `crate::ops::CastAddF16` — the F16 analogs of `cast_scale.cu`'s
 // BF16-only `cast_scale_bf16_f32`/`cast_add_bf16` (see
-// `../ops/cast_scale.rs`'s module doc for why these are NEW, independent
+// `../ops/cast_scale.rs`'s module doc for why these are separate, independent
 // types rather than widened match arms: `CastScaleBf16F32`/`CastAddBf16`
 // are domain-restricted to BF16 by construction). Compiled to PTX only
 // when the `cuda` feature is active (see ../../build.rs); the pinned build
 // flags (sm_80 baseline, no -use_fast_math) live there, not here.
 //
-// DELIBERATE DUPLICATION (campaign #443 W2b/W2c contract) — see
+// DELIBERATE DUPLICATION — see
 // `layer_norm_f16.cu`'s identical note. This is a SEPARATE translation unit
 // from `cast_scale.cu` (a separate PTX module, `PTX_CAST_SCALE_F16` in
-// `../mod.rs`), so that file stays byte-untouched — provable by `git diff`.
+// `../mod.rs`), so nothing here can perturb that file's kernels.
 // No shared `.cuh`.
 //
 // `cast_scale_f16_f32`: out = f32(x) * scale + 0.0, x required F16 — the

@@ -208,7 +208,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -221,6 +221,7 @@ VALIDATED_SMS_RE = re.compile(r"const VALIDATED_SMS:\s*&\[&str\]\s*=\s*&\[(.*?)\
 STR_LIT_RE = re.compile(r'"([^"]*)"')
 COMPUTE_CAP_RE = re.compile(r"compute_cap\s+(\d+)\.(\d+)")
 TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # The flash surface (module doc "Rule 2 — freshness" above): relative,
 # forward-slash paths handed straight to `git diff -- <pathspec>...`. Each
@@ -305,17 +306,21 @@ def _changed_surface_files(sha: str, repo_root: Path, target: str = "HEAD") -> l
 
 
 def _parse_date(value) -> datetime:
-    """Best-effort ISO-8601 UTC parse for `date` — used ONLY to order
-    candidates by recency (never for pass/fail correctness). An unparsable
-    or missing value sorts as the oldest possible timestamp, so it can never
-    masquerade as "the newest evidence" over a genuinely dated sibling.
+    """Best-effort UTC parse for `date` — a `YYYY-MM-DDTHH:MM:SSZ` timestamp or
+    a bare `YYYY-MM-DD` day (its start) — used ONLY to order candidates by
+    recency, never for pass/fail. An unparsable or missing value sorts as the
+    oldest possible timestamp, so it can never masquerade as the newest
+    evidence over a dated sibling.
     """
-    if isinstance(value, str) and TS_RE.match(value):
-        try:
-            return datetime.fromisoformat(value[:-1] + "+00:00")
-        except ValueError:
-            pass
-    return datetime.min
+    if isinstance(value, str):
+        for text in (value[:-1] + "+00:00" if TS_RE.match(value) else None,
+                     value + "T00:00:00+00:00" if DAY_RE.match(value) else None):
+            if text is not None:
+                try:
+                    return datetime.fromisoformat(text)
+                except ValueError:
+                    pass
+    return datetime.min.replace(tzinfo=timezone.utc)
 
 
 # --------------------------------------------------------------------------- #
@@ -688,6 +693,15 @@ def self_test() -> int:
             repo_root / "crates" / "jammi-kernels" / "artifacts" / "cuda-runs",
             repo_root / "ci" / "scripts" / "arch_validation_freshness_allowlist.txt",
         )
+
+    # --- recency ordering across `date` forms ----------------------------
+    ordered = sorted(["2026-09-02T04:20:00Z", "2026-09-19", "not-a-date", None], key=_parse_date)
+    check(
+        "recency orders a timestamp, a bare day and an unparsable value together",
+        ordered == ["not-a-date", None, "2026-09-02T04:20:00Z", "2026-09-19"]
+        or ordered == [None, "not-a-date", "2026-09-02T04:20:00Z", "2026-09-19"],
+        f"{ordered}",
+    )
 
     # --- control: fresh single-arch fixture, artifact sha == HEAD ---------
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:

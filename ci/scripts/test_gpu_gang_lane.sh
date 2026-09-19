@@ -65,10 +65,6 @@ PASS=0
 FAIL=0
 ok()   { PASS=$((PASS + 1)); echo "ok   - $*"; }
 bad()  { FAIL=$((FAIL + 1)); echo "FAIL - $*"; }
-# note() is uncounted advisory output -- never a pass, never a fail; used
-# only where a real environment fact (root bypasses file permissions) makes
-# a fixture unable to establish anything one way or the other here.
-note() { echo "note - $*"; }
 
 SANDBOX="$(mktemp -d)"
 NETPROBE_LOG="$SANDBOX/netprobe.log"
@@ -534,32 +530,48 @@ else
 fi
 
 # G7 fixture: a mode-000 (unreadable) FILE is FAIL, never "no schedule key".
-# NOTE: root bypasses UNIX file permissions outright, so this fixture can
-# only establish the property when the invoking user is not root (this
-# repo's own CI lane runs `test_gpu_gang_lane.sh` inside a container image,
-# which runs as root by default) -- guarded with `note()`, never asserted
-# as a silent pass, so a root run never claims this property was checked.
+# Permission bits bind an unprivileged process only, so as root the reader
+# runs under `nobody` -- its imports resolved first, since root's own
+# site-packages are not `nobody`'s to read. The readable control beside it
+# ties the refusal to the file's mode, not to the account.
+g7_read_on_block() {
+  if [ "$(id -u)" -ne 0 ]; then
+    python3 "$PROVE_ONCE_PY" --read-on-block "$1"
+    return
+  fi
+  python3 - "$PROVE_ONCE_PY" --read-on-block "$1" <<'PY'
+import os, pwd, sys
+sys.argv = sys.argv[1:]
+sys.path.insert(0, os.path.dirname(sys.argv[0]))
+import check_gpu_prove_once
+nobody = pwd.getpwnam("nobody")
+os.setgroups([])
+os.setgid(nobody.pw_gid)
+os.setuid(nobody.pw_uid)
+sys.exit(check_gpu_prove_once.main())
+PY
+}
 g7_unreadable="$SANDBOX/g7-unreadable.yml"
 printf 'on:\n  workflow_dispatch:\n' > "$g7_unreadable"
+chmod 711 "$SANDBOX"
+g7c_out="$(g7_read_on_block "$g7_unreadable" 2>&1)"
+g7c_rc=$?
 chmod 000 "$g7_unreadable"
-if [ -r "$g7_unreadable" ]; then
-  note "G7: skipping the mode-000-file oracle -- the current user (euid $(id -u)) can read a mode-000 file (root or an ACL bypass), so this fixture cannot establish the unreadable-file property here"
-else
-  g7u_out="$(python3 "$PROVE_ONCE_PY" --read-on-block "$g7_unreadable" 2>&1)"
-  g7u_rc=$?
-  if [ "$g7u_rc" -ne 0 ] && [[ "$g7u_out" == *"cannot read file"* ]]; then
-    ok "G7: an unreadable (mode-000) file is FAILed by name, never read as 'no schedule key'"
-  else
-    bad "G7: expected a mode-000 file to FAIL naming 'cannot read file'; got rc=${g7u_rc} out=${g7u_out}"
-  fi
-fi
+g7u_out="$(g7_read_on_block "$g7_unreadable" 2>&1)"
+g7u_rc=$?
 chmod 644 "$g7_unreadable"
+chmod 700 "$SANDBOX"
+if [ "$g7c_rc" -eq 0 ] && [[ "$g7c_out" == "workflow_dispatch" ]] \
+   && [ "$g7u_rc" -ne 0 ] && [[ "$g7u_out" == *"cannot read file"* ]]; then
+  ok "G7: an unreadable (mode-000) file is FAILed by name, never read as 'no schedule key'; the same file is read while its mode allows"
+else
+  bad "G7: expected a mode-000 file to FAIL naming 'cannot read file' and the same file at its default mode to read as workflow_dispatch; got unreadable rc=${g7u_rc} out=${g7u_out}; readable rc=${g7c_rc} out=${g7c_out}"
+fi
 
 # G7 fixture: a DIRECTORY path is FAIL, never "no schedule key" -- unlike
 # mode-000, "this path is not a regular file" is not a permission bit, so
-# no euid (including root, which the container this repo's own CI lane
-# runs `test_gpu_gang_lane.sh` in uses by default) bypasses it; this case
-# proves the property on every user, where the mode-000 case above cannot.
+# no euid (root included) bypasses it and the reader runs as whoever runs
+# this suite.
 g7_dir="$SANDBOX/g7-a-directory.yml"
 mkdir -p "$g7_dir"
 g7d_out="$(python3 "$PROVE_ONCE_PY" --read-on-block "$g7_dir" 2>&1)"

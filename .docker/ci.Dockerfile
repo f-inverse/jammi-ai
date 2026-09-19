@@ -8,8 +8,8 @@
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
-# Platform SQLite runtime (`/lib64/libsqlite3.so.0`). The esc-073 harness
-# (`crates/jammi-db/tests/it/esc_073_foreign_sqlite_library.rs`) `dlopen`s it to
+# Platform SQLite runtime (`/lib64/libsqlite3.so.0`). The foreign-SQLite-library
+# harness (`crates/jammi-db/tests/it/esc_073_foreign_sqlite_library.rs`) `dlopen`s it to
 # get a SECOND SQLite library instance in one process alongside the statically
 # bundled `libsqlite3-sys`; with no platform library the harness has nothing to
 # collide with and reports itself vacuous. The base image happens to carry
@@ -49,7 +49,7 @@ RUN yum install -y jq openssh-clients rsync tmux \
 # without this comment claiming a stdlib guarantee that does not exist.
 # The real guard against that drift is downstream: the `import yaml` gate
 # prerequisite check (`_pyyaml_prerequisite_rc()`) fails loud, by name, the
-# instant a rebuilt image no longer has PyYAML importable -- it is what
+# instant a rebuilt image lacks an importable PyYAML -- it is what
 # actually protects the gates, not an assumption about this RUN line.
 RUN python3 -m ensurepip --upgrade \
     && python3 -m pip install --no-cache-dir 'PyYAML==6.*' safetensors

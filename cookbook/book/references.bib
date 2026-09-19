@@ -1,6 +1,6 @@
 % Bibliography for the Theory↔Computation Cookbook.
 % Every entry here was independently verified (author / year / venue) against the
-% primary source during the K-bridge pressure-test — not transcribed from the spec.
+% primary source — not transcribed from a secondary summary.
 % The citation map (chapters/07-bridge) cites these keys and the verticals' bridge
 % notes draw on them; Quarto fails the render on any dangling @cite.
 
@@ -422,7 +422,7 @@
 % FAILED_PRECONDITION (the operation was rejected because the system is not in the
 % state the operation requires), and INVALID_ARGUMENT (a problematic argument
 % regardless of system state) — the four codes the channel registry maps its
-% failures onto under #193, instead of INTERNAL (an internal-invariant fault).
+% failures onto, instead of INTERNAL (an internal-invariant fault).
 % Verified against the official gRPC documentation (grpc.io/docs/guides/status-codes),
 % which mirrors the google.rpc.Code enum.
 @misc{grpcstatuscodes,
@@ -548,7 +548,7 @@
 % with a fp32 master-weight copy and loss scaling to keep small-magnitude
 % gradients from flushing to zero -- the theory citation for WHY fp16's
 % narrower 5-bit exponent (vs bf16's 8-bit) is the dtype that historically
-% needed loss-scaling tricks, and for why this campaign's f16 stability probe
+% needed loss-scaling tricks, and for why the engine's f16 stability probe
 % checks late-epoch divergence explicitly rather than assuming fp16 "just
 % works" the way bf16 does. Verified: Micikevicius et al., ICLR 2018,
 % arXiv:1710.03740.
@@ -563,14 +563,14 @@
   note      = {arXiv:1710.03740}
 }
 
-% FlashAttention: the IO-aware exact-attention algorithm this campaign's FA2
+% FlashAttention: the IO-aware exact-attention algorithm the engine's FA2
 % (FlashAttention-2) admission gate names -- fuses the softmax/matmul chain
 % into one kernel that never materializes the full attention-score matrix in
 % HBM, tiling instead through fast on-chip SRAM. The reason this chapter's
 % acceleration-report `flash` field is a SEPARATE gate from the `ops` map's
 % per-primitive fused kernels: FlashAttention is one fused ALGORITHM over the
-% whole attention block, not a single-op numeric fusion, and (per this
-% campaign) is compiled for exactly one head dimension and one validated
+% whole attention block, not a single-op numeric fusion, and (in this
+% engine) is compiled for exactly one head dimension and one validated
 % architecture set. Verified: Dao et al., NeurIPS 2022, arXiv:2205.14135.
 @inproceedings{dao2022flashattention,
   title     = {Flash{A}ttention: Fast and Memory-Efficient Exact Attention

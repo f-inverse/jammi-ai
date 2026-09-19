@@ -105,8 +105,8 @@ jobs:
 
       # `ci/release-feature-manifest.json`'s `cpu-image` lane is the single
       # source of truth for this build's cargo feature list (fed into the
-      # Dockerfile's `CARGO_FEATURES` build-arg, required — no default —
-      # since #507) — read here, same idiom as server-image.yml.
+      # Dockerfile's `CARGO_FEATURES` build-arg, required — no default)
+      # — read here, same idiom as server-image.yml.
       - name: Read release feature list (ci/release-feature-manifest.json)
         id: manifest
         run: |

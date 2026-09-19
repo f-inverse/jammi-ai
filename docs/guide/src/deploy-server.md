@@ -510,7 +510,8 @@ RENDEZVOUS placement ring (`[server] placement = "rendezvous"`, below) admit
 only members whose identity equals the caller's own. Root-identity equality
 is still NECESSARY, never SUFFICIENT, for shared storage: two identical
 identities on two filesystems are indistinguishable to this comparison; the
-attestation VERIFY (a later unit) is what establishes sufficiency. The prune
+attestation VERIFY (the admission-time sidecar and the leaf inventory) is what
+establishes sufficiency. The prune
 window a stale member's row survives before deletion is strictly
 beyond the liveness margin used to judge freshness (`3 × lease` vs. `2 ×
 lease`), so a pruned-but-still-live process rejoins its gang on its very

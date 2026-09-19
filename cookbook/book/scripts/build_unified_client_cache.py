@@ -38,7 +38,7 @@ facts and freezes them:
 Every fact is measured against the LIVE surface — no fact is transcribed. The
 remote server faults (a wire ``INVALID_ARGUMENT`` / ``RESOURCE_EXHAUSTED``) are
 injected at the transport boundary exactly as a live server's status arrives —
-the same hermetic technique the engine's own U1 conformance suite uses
+the same hermetic technique the engine's own conformance suite uses
 (`crates/jammi-python/tests/test_conformance.py`) — so no server socket is
 dialed. This is an emit-only script; PR CI reads the committed cache
 (`test_unified_client_cache.py` re-derives the same facts live and asserts

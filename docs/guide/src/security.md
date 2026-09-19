@@ -23,7 +23,7 @@ Each line names the mechanism and the test or code path that proves it.
 | **Format-version reject-newer** | A persisted artifact stamped with a version newer than this build knows is a *typed rejection*, never a silent misparse into wrong data | `manifest.rs` (`UnsupportedManifestVersion`, the `read`-path guard) + test `newer_manifest_version_is_rejected`; `sidecar.rs` (`IncompatibleFormat`) + test `newer_rowmap_version_is_rejected` |
 | **Tenant-scope filtering on every catalog query** | The read-side analyzer injects `tenant_id = $current OR tenant_id IS NULL` on every scan; every `register_*` and the mutable-table sink calls `assert_tenant_matches` before INSERT; the backend SQL layer also carries the predicate. A Jammi-owned result table carries no `tenant_id` column (it is wholly owned by one tenant, or GLOBAL), so a tenant-gating result-table schema provider gates *resolution* on the catalog owner instead — over every lane (Flight `db.sql`, gRPC `sql`, search) a correctly-bound tenant resolves only its own and GLOBAL result tables; a peer's private table resolves not-found | `tenant_scope.rs` (`TenantScopeAnalyzerRule`) + `store::result_schema` (`ResultTableSchemaProvider`) + the catalog repos' `assert_tenant_matches`; proven across the verb surface by `tenant_isolation_oracle.rs::every_case_isolation_holds` (every wire rpc covered, asserted by `every_rpc_is_covered`) |
 | **Typed error surfaces** | Failures are typed variants with stable wire status, not opaque strings: a wrong on-disk shape is `JammiError::Schema`, a stale tenant write is `BackendError::TenantMismatch`, an incompatible format is `JammiError::IncompatibleFormat` | the typed-error definitions per crate; the [Format Stability](./format-stability.md) reject paths; the [tenant](./multi-tenant.md) write-guard |
-| **The BYO-auth resolver seam (covers every transport)** | Tenant binding is uniformly resolver-driven: a consumer composing the engine via `assemble_grpc_chain` supplies its own `TenantResolver` (async: request metadata → `TenantScope`), which the single async tenant-binding tower layer applies to **every engine gRPC verb** AND the Flight SQL `db.sql` lane (`TenantBoundProvider` drives the *same* resolver). One authenticating resolver, plugged in once, authenticates both transports — closing the cross-transport gap where the gRPC plane was authenticated but Flight bound from the unauthenticated `jammi-session-id` header ([#220](https://github.com/f-inverse/jammi-ai/issues/220), now closed). The seam is the same one downstreams compose with; the BYO-auth seam and the composability seam are one seam. The engine still authenticates nothing on its own — the *default* resolver (`SessionIdTenantResolver`) binds the tenant a caller asserts via `jammi-session-id`; supplying an authenticating resolver is the consumer's job | the seam proof `composability_seam.rs::resolver_seam_scopes_both_transports_and_rejects_missing_credential` (gRPC + Flight isolation and `UNAUTHENTICATED`-on-missing across both transports) and the mirror `grpc_byo_auth.rs::resolver_seam_binds_the_engine_and_rejects_missing_credential`; the lower-level custom-`Interceptor`-in-front pattern (for fronting your own single service) is pinned by the four guarantees below |
+| **The BYO-auth resolver seam (covers every transport)** | Tenant binding is uniformly resolver-driven: a consumer composing the engine via `assemble_grpc_chain` supplies its own `TenantResolver` (async: request metadata → `TenantScope`), which the single async tenant-binding tower layer applies to **every engine gRPC verb** AND the Flight SQL `db.sql` lane (`TenantBoundProvider` drives the *same* resolver). One authenticating resolver, plugged in once, authenticates both transports — so Flight can never bind from the unauthenticated `jammi-session-id` header while the gRPC plane is authenticated. The seam is the same one downstreams compose with; the BYO-auth seam and the composability seam are one seam. The engine still authenticates nothing on its own — the *default* resolver (`SessionIdTenantResolver`) binds the tenant a caller asserts via `jammi-session-id`; supplying an authenticating resolver is the consumer's job | the seam proof `composability_seam.rs::resolver_seam_scopes_both_transports_and_rejects_missing_credential` (gRPC + Flight isolation and `UNAUTHENTICATED`-on-missing across both transports) and the mirror `grpc_byo_auth.rs::resolver_seam_binds_the_engine_and_rejects_missing_credential`; the lower-level custom-`Interceptor`-in-front pattern (for fronting your own single service) is pinned by the four guarantees below |
 | **The `AdminAuthorizer` capability gate — gRPC-only, one grant, one transport** | Unlike the resolver seam above (one grant that covers both transports), `CatalogService.Reconcile`'s cross-tenant `all = true` admin pass is a SEPARATE, narrower gate: a synchronous `AdminAuthorizer` (`fn authorize(&self, metadata: &MetadataMap) -> Result<(), Status>`) a deployment supplies at `GrpcChain.admin_authorizer`. It is gRPC-only **by construction**, not by omission — `Reconcile` has no Flight SQL analogue to gate. The shipped default is `admin_authorizer: None`, which refuses EVERY `all = true` request with `PERMISSION_DENIED` naming this page; a tenant-scoped `Reconcile` (`all = false`) never consults it at all and runs under the caller's own resolved tenant scope like any other verb | `grpc/catalog.rs` (`AdminAuthorizer`, `CatalogServer::admin_authorizer`); default-deny proven by `grpc_remote_session.rs::remote_reconcile_all_is_denied_by_default_without_an_authorizer`; an authorized pass by `grpc_remote_session.rs::remote_reconcile_reports_like_local` and the cross-tenant isolation oracle `tenant_isolation_oracle.rs::assert_reconcile_isolated`, both via the test-only `AllowAllAdmin` (`tests/it/common/grpc.rs`); a worked example implementation is in [Scope a Session to a Tenant → Bring your own auth](./multi-tenant.md#bring-your-own-auth) |
 
 The BYO-auth seam's contract is pinned by `grpc_byo_auth.rs` as a worked
@@ -113,7 +113,7 @@ is stated as one invariant, **I-PEER**:
   peer authentication are the runtime's (a mesh, a network policy, mTLS at a
   sidecar), exactly as for the public listener. Default unset = no listener.
 - **`[server] placement = "rendezvous"` widens WHO the coordinator dials,
-  never WHAT the owner trusts.** The owner set for a segment is no longer a
+  never WHAT the owner trusts.** Under it the owner set for a segment is not a
   library-supplied `StaticPlacement`; it is SELF-ASSERTED through the catalog
   — any process that upserts an `instances` row with `peer_addr` set and a
   `result_root_identity` equal to the coordinator's own becomes a candidate
@@ -181,7 +181,7 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
   (`jammi_db::catalog::lease::{decode_lease_expires_at, last_seen_at_is_fresh}`),
   never a SQL-side cast, so a malformed value is a row fact the handler
   refuses on EITHER backend, never a read fault on one and a live-row fact on
-  the other (<https://github.com/f-inverse/jammi-ai/issues/574>); the CLAIM
+  the other; the CLAIM
   and RECLAIM predicates (`Catalog::claim_next`, `Catalog::reclaim_expired_jobs`)
   are the ones that still require a shared, single-writer clock (Postgres's
   `now()`) — those WRITE, and a wrongly-reaped live claimant is destructive in
@@ -236,13 +236,13 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
   unshared filesystems are indistinguishable to this predicate —
   sufficiency is the attestation VERIFY's (the admission-time sidecar and
   the leaf inventory), not this listing's.
-- **B5 (this listing is deliberately tenant-free).** `instances`/`workers`
+- **This listing is deliberately tenant-free.** `instances`/`workers`
   rows are deployment infrastructure (which processes exist, what they claim,
   where they are reachable), never tenant data — there is no tenant column on
   either table, so there is no tenant predicate to drop or keep, and
   `list_gang_members`/`peer_addr_of` return the identical answer under any
   tenant scope and under none. Neither verb is reachable from any RPC at all
-  today (no gang/peer handler calls either) — a vacuous truth, not yet a
+  (no gang/peer handler calls either) — a vacuous truth, not a
   tested boundary; the first RPC that calls one of them owes the enumerating
   unreachability-or-scoping oracle this listener's own precedent
   (`GANG_LISTENER_ALLOWLIST`/`PEER_LISTENER_ALLOWLIST`) already sets.
@@ -289,12 +289,12 @@ path; transport encryption is the deployer's runtime. It follows from the
 same primitives this page and the [Design Philosophy](./philosophy.md)
 already state:
 
-- **B4 ("one binary, every topology") constrains what the *engine* forks
+- **"One binary, every topology" constrains what the *engine* forks
   on, not what fronts it.** Terminating TLS is supplied by the runtime the
   engine deploys into — a proxy, a mesh sidecar, a load balancer — and that
   termination is not a topology-specific code path the engine would need to
   special-case per shape. A `tls` cargo feature would itself be the kind of
-  server-only gate B4 refuses: a build-time fork between "the engine" and
+  server-only gate that principle refuses: a build-time fork between "the engine" and
   "the engine, but for a server."
 - **Passing the discipline test is necessary, not sufficient.** A user who
   has never heard of any consumer does want the wire encrypted — TLS passes
@@ -321,9 +321,8 @@ already state:
   wants one, lives in the terminator or the proxy in front, not at the
   seam described under [The identity seam](./deploy-server.md#the-identity-seam).
   The CLI's `--target` refuses `grpcs://` and `https://` with a typed error
-  naming the accepted schemes (`crates/jammi-cli/src/main.rs:170-187`; the
-  CHANGELOG's "drop `grpcs://` and `https://` as accepted `--target`
-  schemes" entry (#480), commit `616bb6d4`) rather than advertising a
+  naming the accepted schemes (`crates/jammi-cli/src/main.rs:170-187`) rather
+  than advertising a
   transport it cannot speak
   — put a TLS-terminating proxy in front and point `--target` at it in
   plaintext (`grpc://`/`http://`). This is an asymmetry between the two

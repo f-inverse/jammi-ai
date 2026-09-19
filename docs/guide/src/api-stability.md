@@ -119,7 +119,7 @@ Concretely:
   reject-newer guard then makes an old reader fail loud rather than misparse, and
   the recovery is to re-emit (see [Format Stability](./format-stability.md)).
 
-**Pre-1.0 amendment (#485).** Until the 1.0 release, the `jammi.v1` wire
+**Pre-1.0 amendment.** Until the 1.0 release, the `jammi.v1` wire
 contract may still change — including a genuinely breaking rpc rename or
 removal — when BOTH of the following hold in the same PR: the frozen baseline
 (`crates/jammi-server/tests/it/api_freeze_baseline.txt`) is updated to match
@@ -130,11 +130,7 @@ amendment relaxes only WHICH edits to the baseline are allowed pre-1.0 (an
 announced breaking edit, not a silent one), never the mechanism that catches
 an *unannounced* divergence. The following release then bumps the **minor**
 version rather than the major — the terminal-0.x window is itself the
-"stabilizing" period the eventual 1.0 major bump closes. `TrainingService`
-folding into `JobService` (`StartTraining`→`SubmitJob`,
-`TrainingStatus`→`JobStatus`, `ListTrainingJobs`→`ListJobs`, plus new
-`WaitJob`/`CancelJob`/`ListWorkers`/`PruneJobs`) is the first change to ship
-under this amendment.
+"stabilizing" period the eventual 1.0 major bump closes.
 
 ## Experimental surfaces
 

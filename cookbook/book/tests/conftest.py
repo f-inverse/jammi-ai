@@ -89,7 +89,7 @@ every test has already finished) — the two are complementary, not
 redundant. What neither guard reaches at all is the non-pytest lanes
 (scripts, recipes, quickstart, the executed chapter cells) — those are
 covered instead by the AST gate
-``ci/scripts/check_cookbook_session_lifecycle.py`` (issue #539), which reads
+``ci/scripts/check_cookbook_session_lifecycle.py``, which reads
 the tree statically rather than running under any test harness.
 """
 
@@ -154,8 +154,7 @@ def remote():
 # the rail
 # --------------------------------------------------------------------------- #
 
-# Process-wide baseline for the `pytest_sessionfinish` sweep below (issue
-# #552 item 1): every handle `jammi.observe()` reports registered ANYWHERE
+# Process-wide baseline for the `pytest_sessionfinish` sweep below: every handle `jammi.observe()` reports registered ANYWHERE
 # in this process during the run, and every handle it reports unregistered.
 # Module globals, not fixture state — `pytest_sessionstart` fires before
 # `pytest_collection`, so subscribing there sees even a module-import-time
@@ -169,7 +168,7 @@ _session_unsubscribe = None
 
 def pytest_sessionstart(session: pytest.Session) -> None:  # noqa: ARG001
     """Subscribe to the registry for the WHOLE run, before collection —
-    the process-wide half of the leak rail (issue #552 item 1). Runs even
+    the process-wide half of the leak rail. Runs even
     when `_RAIL_ACTIVE` is False; the capability check below is what makes
     subscribing a no-op in that case, same as the per-test fixture."""
     global _session_unsubscribe
@@ -186,7 +185,7 @@ def pytest_sessionstart(session: pytest.Session) -> None:  # noqa: ARG001
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:  # noqa: ARG001
-    """The process-wide sweep (issue #552 item 1): every session registered
+    """The process-wide sweep: every session registered
     anywhere in this process during the run and never unregistered by the
     time it ends fails the WHOLE RUN, by label — independent of whether any
     single test's own `_no_leaked_sessions` window ever saw it (a
@@ -251,8 +250,7 @@ def _warn_if_rail_inactive() -> None:
 
 @pytest.fixture(autouse=True)
 def _no_leaked_sessions(request):
-    """esc-112 fix (`closes_escape: esc-112`): fail a test that leaves a jammi
-    session open.
+    """Fail a test that leaves a jammi session open.
 
     Subscribes to `jammi.observe()` for the duration of the test: every
     session ANY construction route registers fires `on_register(handle,

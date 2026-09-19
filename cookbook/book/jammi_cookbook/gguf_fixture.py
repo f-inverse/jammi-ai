@@ -1,4 +1,4 @@
-"""Programmatic ``q8_0`` GGUF fixture generation (issue #351).
+"""Programmatic ``q8_0`` GGUF fixture generation.
 
 The book has no Rust/candle binding, so it cannot call
 ``candle_core::quantized::gguf_file::write`` directly the way the engine's own

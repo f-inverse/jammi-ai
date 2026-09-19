@@ -1,6 +1,6 @@
 name: GPU how-well (RunPod)
 
-# Runs the unit-63 how-well A/B (CONTRACT H4) on a real NVIDIA A100 (sm_80)
+# Runs the fine-tune how-well A/B on a real NVIDIA A100 (sm_80)
 # via an ephemeral RunPod pod — `ci/scripts/perf/finetune_run_ab.sh` driving
 # `jammi-bench finetune-run` per (seed, arm, repeat) against the committed
 # cookbook/fixtures/finetune_heldout/ fixture, merged (sign test + conjunctive
@@ -10,19 +10,17 @@ name: GPU how-well (RunPod)
 # Off the merge path, same discipline gpu-prove.yml's own header states — GPU
 # minutes cost money and A100 capacity is intermittent. Fires on: the
 # `run-howwell` PR label (opt-in per PR) and manual dispatch ONLY — NO
-# schedule (CONTRACT H4/PLAN.md v2 delta 11: v1 stays operator-triggered, a
-# standing nightly A/B is a later decision, not this workflow's own default).
+# schedule: the A/B is operator-triggered, never a standing nightly run.
 # Needs the `RUNPOD_API_KEY` repo secret and a `model_dir` naming a
 # checkpoint the target pod has already provisioned (this workflow does not
 # provision one itself — see `runpod_gpu_howwell.sh`'s own doc for why that
 # stays a separate, pod-seed-owned concern).
 #
-# Merge-path CI checks only ever validate COMMITTED artifacts (a future
-# how-well artifact schema gate, the same shape
-# `check_cuda_run_artifacts.py` already gives the clip/kernel-oracle
-# artifacts) — this workflow itself, and the RunPod run it drives, never sit
-# on that path; H5's own committed calibration/A-B artifacts are what a
-# merge-path gate would validate, not a re-execution of this workflow.
+# Merge-path CI checks only ever validate COMMITTED artifacts (the shape
+# `check_cuda_run_artifacts.py` gives the clip/kernel-oracle artifacts) —
+# this workflow itself, and the RunPod run it drives, never sit on that
+# path; the committed calibration/A-B artifacts are what a merge-path gate
+# validates, not a re-execution of this workflow.
 
 on:
   workflow_dispatch:
@@ -68,9 +66,9 @@ jobs:
       group: gpu-howwell-${{ github.ref }}
       cancel-in-progress: false
     # This workflow sources runpod_lib.sh's own RP_TIMEOUT default directly
-    # (never runpod_gpu_prove.sh's esc-080 export, which raises that default
-    # to 100m for the prove lane specifically) -- own derivation, no longer a
-    # mirror of gpu-prove.yml's: RP_TIMEOUT (50m, library default) plus up to
+    # (never runpod_gpu_prove.sh's export, which raises that default to 100m
+    # for the prove lane specifically) -- its own derivation, not a mirror of
+    # gpu-prove.yml's: RP_TIMEOUT (50m, library default) plus up to
     # 4 deploy candidates (a100's own candidate-list length) at
     # RP_SSH_WAIT_SECS (600s) each = 40m worst case, well under this ceiling.
     timeout-minutes: 100
@@ -102,32 +100,19 @@ jobs:
           fi
           echo "objective=$OBJECTIVE" >> "$GITHUB_OUTPUT"
 
-          # unit-63 round-3 audit block 5: workflow_dispatch's own
-          # `lr0_seeds` input carries a pre-registered default ("1,2") baked
-          # into this workflow's schema above, so it is empty only when an
-          # operator EXPLICITLY clears it (a deliberate, recorded opt-out —
-          # ab_merge.py's own finetune-run merger separately refuses INVALID
-          # on an empty seed list unless --allow-missing-lr0-control is
-          # passed, which this workflow does not yet forward, so clearing
-          # this field on a dispatch run currently makes the merge INVALID
-          # by design rather than silently skipping the control). A
+          # workflow_dispatch's own `lr0_seeds` input carries a
+          # pre-registered default ("1,2") baked into this workflow's schema
+          # above, so it is empty only when an operator EXPLICITLY clears it.
+          # ab_merge.py's finetune-run merger refuses INVALID on an empty
+          # seed list unless --allow-missing-lr0-control is passed, which
+          # this workflow does not forward, so clearing this field makes the
+          # merge INVALID by design rather than silently skipping the control.
           #
-          # unit-63 round-4 audit advisory (A2), CURRENT TRUTH (an earlier
-          # draft of this comment claimed the ELSE branch below closed a gap
-          # where a run-howwell PR-label trigger silently dropped the
-          # control on EVERY run "with no visible signal" — that describes
-          # a run that could never start in the first place): a
-          # `pull_request: types: [labeled]` trigger carries NO
-          # workflow_dispatch inputs at all, so `model_dir` (and
-          # `objective`) above ALREADY refuse loudly before this step ever
-          # reaches the `lr0_seeds` branch below — the ELSE branch here is
-          # therefore dead code on every real trigger this workflow's own
-          # `on:` block admits today (`workflow_dispatch` always takes the
-          # `if`; `pull_request: labeled` never reaches this line at all).
-          # It is kept anyway, belt-and-braces, in case a FUTURE trigger is
-          # added to the `on:` block above without this step being
-          # revisited — a defensive refusal, not a fix for a reachable gap
-          # today.
+          # The ELSE branch is unreachable on every trigger the `on:` block
+          # admits: a `pull_request: types: [labeled]` trigger carries NO
+          # workflow_dispatch inputs, so `model_dir` and `objective` above
+          # refuse first. It is a defensive refusal for any trigger added
+          # to `on:` without this step being revisited.
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             LR0_SEEDS="${{ github.event.inputs.lr0_seeds }}"
           else
@@ -157,13 +142,12 @@ jobs:
         if: always() && steps.howwell.outputs.rc == '75'
         run: echo "::warning::how-well A/B FAILED for capacity — no A100 on RunPod (SUPPLY_CONSTRAINT), not a code/statistical regression. The run stays red (nothing was proven); re-run once capacity returns."
 
-      # unit-63 audit advisory (c): the merged artifact previously never left
-      # the pod at all. runpod_gpu_howwell.sh itself rsyncs it to
+      # runpod_gpu_howwell.sh rsyncs the merged artifact to
       # .gpu-pull/how-well/ before the pod is torn down; this step makes
-      # that local pull retrievable from the CI run too (the campaign's own
-      # committed-evidence path — a human still decides which run(s) get
-      # committed under a crate's own artifacts/ tree, this just keeps the
-      # bytes from being lost once the runner itself is recycled).
+      # that local pull retrievable from the CI run too (a human still
+      # decides which run(s) get committed under a crate's own artifacts/
+      # tree; this keeps the bytes from being lost once the runner is
+      # recycled).
       - name: Upload merged how-well artifact
         if: always()
         uses: actions/upload-artifact@v4

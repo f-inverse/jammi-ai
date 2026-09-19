@@ -1,4 +1,4 @@
-"""Unit tests for the determinism contract (K0 §3)."""
+"""Unit tests for the determinism contract."""
 
 from __future__ import annotations
 

@@ -14,7 +14,7 @@ no GPU, no recompute) and assert the chapter's load-bearing facts:
 * **the destructive-verb survival** — A's mutable table / topic SURVIVES a
   foreign-tenant drop: no cross-tenant data destruction (the property the standing
   oracle guards; the headline no-leak finding);
-* **the esc-024 result-table SCAN isolation, over the db.sql lane** — a result
+* **the result-table SCAN isolation, over the db.sql lane** — a result
   table (``asof_join``, ``generate_embeddings``, ...) carries no ``tenant_id``
   column, so resolution of its bare ``jammi.{name}`` identifier is gated on the
   catalog row's owner instead; B naming A's private result table is refused,
@@ -214,13 +214,13 @@ def test_remote_equals_embedded_for_cross_transport_verbs():
 
 
 # --------------------------------------------------------------------------- #
-# the esc-024 result-table SCAN isolation (db.sql lane, embedded-only)
+# the result-table SCAN isolation (db.sql lane, embedded-only)
 # --------------------------------------------------------------------------- #
 
 
 @_needs_cache
 def test_result_table_scan_isolated():
-    """The esc-024 mirror of the Rust oracle
+    """The mirror of the Rust oracle
     (``tenant_isolation_oracle.rs::assert_result_table_scan_isolated``), over the
     ``db.sql`` lane: A's own ``asof_join`` output reads a real positive count; a
     GLOBAL ``asof_join`` output is visible to both A and B; B naming A's private
@@ -228,7 +228,7 @@ def test_result_table_scan_isolated():
     after B's refusal for the oracle's internal ``admin_scope()`` bypass, which
     carries no public Python surface. Organizational resolution-visibility, not
     a hostile-principal boundary — the trusted-network + BYO-auth posture is
-    unchanged (esc-020)."""
+    unchanged."""
     rec = _record()
     rts = rec["result_table_scan"]
     assert rts["a_own_read"] > 0

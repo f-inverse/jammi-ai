@@ -32,9 +32,8 @@ jobs:
     name: GPU proof required
     # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
     # requires the release commit's already-recorded GPU-prove verdict
-    # before the package is published (#454 follow-up, operator direction:
-    # every release publisher gates on the prove verdict, all-or-nothing,
-    # not only the CUDA lanes). The tag guard (not an event guard) is what
+    # before the package is published (every release publisher gates on the
+    # prove verdict, all-or-nothing, not only the CUDA lanes). The tag guard (not an event guard) is what
     # keeps the promotion arm proven: an event-keyed guard would let a
     # dispatch publish unproven. A branch dispatch skips this job entirely
     # (it never needed a verdict for its build-and-test dry run).
@@ -51,7 +50,7 @@ jobs:
     # skip on a branch dispatch, where `gpu-proof` above never runs at all —
     # breaking the "branch dispatch is a build-and-test dry run" contract
     # this workflow's header states. `if: always()` keeps build+test
-    # unconditional (byte-unchanged from before this gate existed); the
+    # unconditional; the
     # actual publish gating lives on the "Publish" step below, whose `if:`
     # is a PURE conjunction of the tag guard and the prove verdict.
     needs: [gpu-proof]

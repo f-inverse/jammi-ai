@@ -28,7 +28,7 @@ name: GPU gang (RunPod)
 #       enforcers are that TTL and gpu-reap.yml's rp_sweep:
 #       (4 + 1) x 1 h x $3.18/h = $15.90.
 #
-# $3.18/h is the rate spike S4 measured for a SECURE 2-GPU
+# $3.18/h is the measured rate for a SECURE 2-GPU
 # A100-SXM4-80GB pod. The COMMUNITY 2-GPU rate is UNMEASURED — nothing has
 # priced one — so neither figure is stated for a COMMUNITY landing.
 # `ci/scripts/test_gpu_gang_lane.sh` re-derives (i) from the candidate list,
@@ -38,11 +38,11 @@ name: GPU gang (RunPod)
 # Whether the cold `cuda,flash-attn` build plus the gang tests FIT inside
 # the TTL hour is not established — no run has measured it; a 124 is a cost
 # decision for a human (raise the bound deliberately), never a silent raise.
-# A 2-GPU pod is also scarcer than a 1-GPU one: S4 found the A100 PCIe pool
-# with zero 2-GPU capacity, so the driver tries SXM4 candidates first.
+# A 2-GPU pod is also scarcer than a 1-GPU one: the A100 PCIe pool has been
+# seen with zero 2-GPU capacity, so the driver tries SXM4 candidates first.
 #
 # Off the merge path, and NEVER in the critical path of an automated
-# workflow — the same operator direction gpu-prove.yml's own header records
+# workflow — the same rule gpu-prove.yml's own header states
 # (GPU minutes cost money; capacity is intermittent), doubled here because
 # each run rents two GPUs. It fires on: the `run-gang` PR label (opt-in per
 # PR) and manual dispatch — deliberately NO `push:` and NO
@@ -84,9 +84,9 @@ jobs:
     #
     # cancel-in-progress is false because this job rents hardware and cleans
     # up in an EXIT trap. Cancelling SIGKILLs the runner, the trap never
-    # runs, and the pod it already rented is orphaned — that is how a
-    # toggled label leaked an A100 for seven days on 2026-07-24 ($187). Here
-    # the orphan would be a TWO-GPU pod. Letting a superseded run finish
+    # runs, and the pod it already rented is orphaned (a toggled label can
+    # leak an A100 for days; one such leak cost $187). Here the orphan
+    # would be a TWO-GPU pod. Letting a superseded run finish
     # costs at most this lane's own ceiling.
     concurrency:
       group: gpu-gang-${{ github.ref }}
@@ -130,7 +130,7 @@ jobs:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           GIT_REPO: https://github.com/${{ github.repository }}.git
           GIT_REF: ${{ github.head_ref || github.ref_name }}
-          # esc-084: the pod echoes PROVE_SHA after clone; runpod_lib.sh's
+          # The pod echoes PROVE_SHA after clone; runpod_lib.sh's
           # rp_run_remote_watched compares it against this and fails 77
           # ("wrong tree") rather than letting a moved ref silently prove
           # the wrong commit. Unset on a hand run of the script (never

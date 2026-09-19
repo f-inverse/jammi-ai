@@ -65,6 +65,16 @@ provide = "python3 -m pip install --user --quiet safetensors"
 probe = "command -v ssh-keygen"
 provide = "yum install -y -q openssh-clients"
 
+[need.readelf]
+probe = "command -v readelf"
+provide = "yum install -y -q binutils"
+
+# A Linux host, as root: what the CI image is. Nothing provides it — run the
+# guards through `ci/dev.sh` on any other host.
+[need.linux-root]
+probe = "test \"$(uname -s)\" = Linux && test \"$(id -u)\" = 0"
+provide = "echo 'run inside the CI image: ci/dev.sh python3 ci/scripts/run_guards.py' >&2; false"
+
 [need.jq]
 probe = "command -v jq"
 provide = "yum install -y -q jq"
@@ -241,6 +251,7 @@ why = "The fixture guard refuses each provisional shape it names."
 name = "cu12 jail-trace driver"
 run = "python3 ci/scripts/test_jail_trace.py"
 why = "The loader trace that proves the cu12 tarball self-contained reports a missing library as missing."
+needs = ["linux-root", "readelf"]
 
 [[guard]]
 name = "cu12 wheel component contract"

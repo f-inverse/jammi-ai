@@ -105,6 +105,7 @@ import io
 import os
 import signal
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -669,17 +670,37 @@ class GangIdSecrecyScanTest(unittest.TestCase):
         self.assertIn("raw encoding", out)
 
     def test_unreadable_artifact_file_is_unexaminable(self) -> None:
-        if os.geteuid() == 0:
-            self.skipTest("root bypasses DAC permission bits (chmod_bypassed class)")
+        # Permission bits bind an unprivileged process only, so the scan runs
+        # as its real command line in a child — under an unprivileged account
+        # when this process is root, which would read the file regardless.
         bad = self.artifact_dir / "no-read.json"
         bad.write_text("{}")
         bad.chmod(0)
+        unprivileged = {}
+        if os.geteuid() == 0:
+            for path in (self.root, *self.root.rglob("*")):
+                if path != bad:
+                    path.chmod(0o755 if path.is_dir() else 0o644)
+            unprivileged = {"user": "nobody", "group": "nobody", "extra_groups": []}
         try:
-            rc, out = self._run()
+            scan = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--staging-file", str(self.staging),
+                    "--artifact-dir", str(self.artifact_dir),
+                    "--log", str(self.log),
+                    "--assembled-artifact", str(self.assembled),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                **unprivileged,
+            )
         finally:
             bad.chmod(0o600)
-        self.assertEqual(rc, STATUS_UNEXAMINABLE)
-        self.assertIn("unreadable", out)
+        self.assertEqual(scan.returncode, STATUS_UNEXAMINABLE, scan.stdout + scan.stderr)
+        self.assertIn("unreadable", scan.stdout + scan.stderr)
 
     def test_missing_pulled_artifact_dir_is_unexaminable(self) -> None:
         import shutil

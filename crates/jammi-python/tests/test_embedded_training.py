@@ -26,11 +26,6 @@ _ROOT = Path(__file__).resolve().parents[3]
 _TINY_BERT = _ROOT / "cookbook" / "fixtures" / "tiny_bert"
 _TRAINING_PAIRS = _ROOT / "tests" / "fixtures" / "training_pairs.csv"
 
-pytestmark = pytest.mark.skipif(
-    not _TINY_BERT.is_dir() or not _TRAINING_PAIRS.is_file(),
-    reason="local tiny_bert / training_pairs fixtures not present",
-)
-
 
 def _connect(tmp_path: Path):
     db = jammi.connect(f"file://{tmp_path}")

@@ -127,10 +127,6 @@ class NameTranslationTests(unittest.TestCase):
         self.assertIsNone(tgo.translate_jammi_name_to_peft("layer.3.UnknownSite.lora_a"))
 
 
-@unittest.skipUnless(
-    os.path.isdir(TINY_FIXTURE_DIR),
-    f"committed fixture missing at {TINY_FIXTURE_DIR!r}",
-)
 class CheckpointIdentityTests(unittest.TestCase):
     """`checkpoint_identity` is the class-level fix for `_premise_violations`
     comparing an un-comparable `model_dir` PATH string (see

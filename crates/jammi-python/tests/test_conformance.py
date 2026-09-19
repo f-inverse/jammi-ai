@@ -1457,10 +1457,6 @@ _METRICS_TEST_TRAINING_PAIRS = (
 )
 
 
-@pytest.mark.skipif(
-    not _METRICS_TEST_TINY_BERT.is_dir() or not _METRICS_TEST_TRAINING_PAIRS.is_file(),
-    reason="local tiny_bert / training_pairs fixtures not present",
-)
 def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
     """`RemoteJob.metrics()` and the embedded `Job.metrics()` agree on the
     SAME three states the catalog's `jobs.result` payload's nested `metrics`
@@ -1698,10 +1694,6 @@ def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
     del malformed_job, malformed_db
 
 
-@pytest.mark.skipif(
-    not _METRICS_TEST_TINY_BERT.is_dir() or not _METRICS_TEST_TRAINING_PAIRS.is_file(),
-    reason="local tiny_bert / training_pairs fixtures not present",
-)
 def test_remote_and_embedded_job_acceleration_report_agree_on_all_three_states(
     tmp_path,
 ):

@@ -1631,7 +1631,6 @@ mod tests {
     /// norm, so a fixture whose norm ever drops below this fails loudly
     /// instead of silently testing the clamp-to-1.0 no-op arm).
     const CROSS_PROCESS_MAX_NORM: f32 = 1e-3;
-    const CROSS_PROCESS_CHILD_ENV: &str = "JAMMI_BENCH_CLIP_DETERMINISM_CHILD";
 
     /// The cross-PROCESS determinism proof: two separate invocations of this
     /// test binary, same seed, `--max-grad-norm` active (coefficient strictly
@@ -1643,104 +1642,94 @@ mod tests {
     /// would make the last bits of every clipped gradient, and therefore of
     /// every loss after the first, differ between two launches of the same
     /// command. A single-process test cannot see this (one process, one
-    /// hasher seed); this one re-executes itself as two child processes
-    /// (`std::env::current_exe()`, filtered `--exact` to this test, with
-    /// `CROSS_PROCESS_CHILD_ENV` set) and compares what they printed.
+    /// hasher seed); this one runs [`clip_on_losses_child`] as two child
+    /// processes and compares what they printed.
     /// Also checks the counted fact: `clip_invocations == steps + warmup
     /// + 1` in each child.
+    const CROSS_PROCESS_STEPS: usize = 3;
+    const CROSS_PROCESS_WARMUP: usize = 1;
+
+    /// One launch of the clipped run: proves the clip is active, runs the real
+    /// entry point, and prints the loss bits for the parent to compare.
+    #[test]
+    #[ignore = "child process of clip_on_losses_are_bit_identical_across_processes"]
+    fn clip_on_losses_child() {
+        const STEPS: usize = CROSS_PROCESS_STEPS;
+        const WARMUP: usize = CROSS_PROCESS_WARMUP;
+        let params = clip_tiny_params(Some(CROSS_PROCESS_MAX_NORM), STEPS, WARMUP);
+        let (_, _, host_norm) = first_step_grads_and_host_norm(&params);
+        assert!(
+            host_norm > (CROSS_PROCESS_MAX_NORM as f64) * 2.0,
+            "child: first-step grad norm {host_norm} is not comfortably above \
+             CROSS_PROCESS_MAX_NORM {CROSS_PROCESS_MAX_NORM} — the clip would not bite"
+        );
+        let tier = run(&params).expect("child run");
+        let bits: Vec<String> = tier
+            .losses
+            .iter()
+            .map(|l| format!("{:08x}", l.to_bits()))
+            .collect();
+        println!("CLIP_DETERMINISM_LOSSES {}", bits.join(","));
+        println!("CLIP_DETERMINISM_INVOCATIONS {}", tier.clip_invocations);
+        println!("CLIP_DETERMINISM_ATTENTION_ARM {}", tier.attention_arm);
+    }
+
     #[test]
     fn clip_on_losses_are_bit_identical_across_processes() {
-        const STEPS: usize = 3;
-        const WARMUP: usize = 1;
-        // One fn, two roles, selected by `CROSS_PROCESS_CHILD_ENV`: the
-        // PARENT role (below) spawns two CHILD-role invocations of this exact
-        // fn and compares what they print. It needs no host resource, so both
-        // roles always run their assertions; neither returns early.
-        if std::env::var_os(CROSS_PROCESS_CHILD_ENV).is_some() {
-            // CHILD: prove the clip is active, run the real entry point,
-            // print the loss bits for the parent to compare.
-            let params = clip_tiny_params(Some(CROSS_PROCESS_MAX_NORM), STEPS, WARMUP);
-            let (_, _, host_norm) = first_step_grads_and_host_norm(&params);
-            assert!(
-                host_norm > (CROSS_PROCESS_MAX_NORM as f64) * 2.0,
-                "child: first-step grad norm {host_norm} is not comfortably above \
-                 CROSS_PROCESS_MAX_NORM {CROSS_PROCESS_MAX_NORM} — the clip would not bite"
+        const STEPS: usize = CROSS_PROCESS_STEPS;
+        const WARMUP: usize = CROSS_PROCESS_WARMUP;
+        // libtest's name for the child is its module path WITHOUT the
+        // crate prefix (`finetune_step::tests::…`).
+        let (_, module) = module_path!()
+            .split_once("::")
+            .expect("module_path has a crate prefix");
+        let child = format!("{module}::clip_on_losses_child");
+        let run_child = |label: &str| -> (String, String, String) {
+            let stdout = jammi_test_resources::child_test_stdout(
+                &mut jammi_test_resources::child_test(&child),
             );
-            let tier = run(&params).expect("child run");
-            let bits: Vec<String> = tier
-                .losses
-                .iter()
-                .map(|l| format!("{:08x}", l.to_bits()))
-                .collect();
-            println!("CLIP_DETERMINISM_LOSSES {}", bits.join(","));
-            println!("CLIP_DETERMINISM_INVOCATIONS {}", tier.clip_invocations);
-            println!("CLIP_DETERMINISM_ATTENTION_ARM {}", tier.attention_arm);
-        } else {
-            let exe = std::env::current_exe().expect("current_exe");
-            // libtest's name for this fn is the module path WITHOUT the crate
-            // prefix (`finetune_step::tests::…`), which `module_path!()` carries.
-            let (_, module) = module_path!()
-                .split_once("::")
-                .expect("module_path has a crate prefix");
-            let name = format!("{module}::clip_on_losses_are_bit_identical_across_processes");
-            let run_child = |label: &str| -> (String, String, String) {
-                let out = std::process::Command::new(&exe)
-                    .args(["--exact", &name, "--nocapture", "--test-threads=1"])
-                    .env(CROSS_PROCESS_CHILD_ENV, "1")
-                    .output()
-                    .expect("spawn child test process");
-                let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-                assert!(
-                    out.status.success(),
-                    "child {label} failed ({:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
-                    out.status
-                );
-                // libtest prints `test <name> ... ` WITHOUT a newline before the
-                // test body's own first `println!` under `--nocapture`, so the
-                // first marker sits mid-line: match by substring, not prefix.
-                let grab = |key: &str| -> String {
-                    stdout
-                        .lines()
-                        .find_map(|l| l.split_once(key).map(|(_, v)| v.trim().to_string()))
-                        .unwrap_or_else(|| {
-                            panic!("child {label} printed no `{key}` line:\n{stdout}")
-                        })
-                };
-                (
-                    grab("CLIP_DETERMINISM_LOSSES "),
-                    grab("CLIP_DETERMINISM_INVOCATIONS "),
-                    grab("CLIP_DETERMINISM_ATTENTION_ARM "),
-                )
+            // libtest prints `test <name> ... ` WITHOUT a newline before the
+            // test body's own first `println!` under `--nocapture`, so the
+            // first marker sits mid-line: match by substring, not prefix.
+            let grab = |key: &str| -> String {
+                stdout
+                    .lines()
+                    .find_map(|l| l.split_once(key).map(|(_, v)| v.trim().to_string()))
+                    .unwrap_or_else(|| panic!("child {label} printed no `{key}` line:\n{stdout}"))
             };
-            let (losses_a, invocations_a, arm_a) = run_child("A");
-            let (losses_b, invocations_b, arm_b) = run_child("B");
-            assert_eq!(
-                losses_a.split(',').count(),
-                STEPS,
-                "child A must report one loss per measured step: {losses_a}"
-            );
-            assert_eq!(
-                losses_a, losses_b,
-                "same seed, same --max-grad-norm, two processes: clip-on losses must be \
-                 bit-identical (A={losses_a} B={losses_b}) — a mismatch means the clip folds \
-                 its norm in a per-process HashMap order"
-            );
-            assert_eq!(
-                invocations_a,
-                (STEPS + WARMUP + 1).to_string(),
-                "clip_invocations must count pre-step + warmup + measured"
-            );
-            assert_eq!(invocations_a, invocations_b);
-            assert_eq!(
-                arm_a, arm_b,
-                "attention_arm must be a function of the run, not the process"
-            );
-            assert!(
-                ["fused", "eager"].contains(&arm_a.as_str()),
-                "a single-arm run must read fused or eager, got {arm_a}"
-            );
-        }
+            (
+                grab("CLIP_DETERMINISM_LOSSES "),
+                grab("CLIP_DETERMINISM_INVOCATIONS "),
+                grab("CLIP_DETERMINISM_ATTENTION_ARM "),
+            )
+        };
+        let (losses_a, invocations_a, arm_a) = run_child("A");
+        let (losses_b, invocations_b, arm_b) = run_child("B");
+        assert_eq!(
+            losses_a.split(',').count(),
+            STEPS,
+            "child A must report one loss per measured step: {losses_a}"
+        );
+        assert_eq!(
+            losses_a, losses_b,
+            "same seed, same --max-grad-norm, two processes: clip-on losses must be \
+             bit-identical (A={losses_a} B={losses_b}) — a mismatch means the clip folds \
+             its norm in a per-process HashMap order"
+        );
+        assert_eq!(
+            invocations_a,
+            (STEPS + WARMUP + 1).to_string(),
+            "clip_invocations must count pre-step + warmup + measured"
+        );
+        assert_eq!(invocations_a, invocations_b);
+        assert_eq!(
+            arm_a, arm_b,
+            "attention_arm must be a function of the run, not the process"
+        );
+        assert!(
+            ["fused", "eager"].contains(&arm_a.as_str()),
+            "a single-arm run must read fused or eager, got {arm_a}"
+        );
     }
 
     /// The `attention_arm` derivation, pinned (see the tier field's doc):

@@ -958,7 +958,7 @@ async fn a_training_sets_registration_declares_its_order_so_the_read_back_plans_
 /// naming the table fires on recovery's registration path
 /// (`load_existing_tables` -> `bind_result_table` ->
 /// `training_set_registration_sort_order`), captured here the same way
-/// `jammi-ai`'s `model::cache::tests::catalog_read_error_skips_bookkeeping_write`
+/// `jammi-ai`'s `model::cache::load_bookkeeping_tests::catalog_read_error_skips_bookkeeping_write`
 /// captures a `tracing::warn!` — a real `tracing_subscriber::fmt` subscriber
 /// writing into an in-memory buffer this test inspects, never a log-crate
 /// shim. Deleting the `warn!` call (reverting to a bare `Ok(None)`) turns

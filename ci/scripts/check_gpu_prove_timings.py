@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPU-prove-timings gate (esc-080/esc-082/esc-083): the watchdog defaults
+"""GPU-prove-timings gate: the watchdog defaults
 and the two-term `RP_TIMEOUT` backstop are re-demanded against COMMITTED
 EVIDENCE (`ci/artifacts/gpu-prove-timings/*.json`), never trusted as a
 one-time derivation that can silently rot the moment the prove lane's own
@@ -88,14 +88,14 @@ RUNPOD_PROVE_REL = "ci/scripts/runpod_gpu_prove.sh"
 # (a genuine cut/kill whose cause is undetermined without one); `healthy`,
 # `suite-fail`, `capacity`, and `log-incomplete` need NONE, and a
 # `disposition` present on any of those four is ITSELF a schema FINDING
-# (round-2 audit fix: a disposition exists to explain an UNDETERMINED
+# (a disposition exists to explain an UNDETERMINED
 # cut/kill cause -- attaching one to an outcome that already has a
 # determined, self-explaining cause is either a bug in the producer or a
 # hand-edited artifact papering over a real finding). `suite-fail` names its
 # own cause in the leg's own suite output; `capacity` (exit 75) is a supply
-# condition, not a hang/cut; `log-incomplete` (BLOCK B) is a truncated log,
+# condition, not a hang/cut; `log-incomplete` is a truncated log,
 # not a real outcome to disposition at all -- it needs a fresh run, not a
-# reviewed explanation. `wrong-tree` (esc-084/#454) is likewise a DETERMINED
+# reviewed explanation. `wrong-tree` is likewise a DETERMINED
 # cause -- the ref moved under the clone, or a tag was moved -- self-
 # explaining exactly like `capacity`, never dispositioned.
 OUTCOME_VALUES = frozenset(
@@ -265,8 +265,7 @@ def check_r1(repo_root: Path = REPO_ROOT) -> tuple[list[str], dict[str, int]]:
             allowed_site_counts[(rel, var)] = allowed_site_counts.get((rel, var), 0) + 1
 
     # A SECOND default-setting assignment of the same var in an otherwise-
-    # allowed file is itself a hidden second source of truth (round-2 audit
-    # fix): the allowlist names exactly ONE legitimate default-setting site
+    # allowed file is itself a hidden second source of truth: the allowlist names exactly ONE legitimate default-setting site
     # per (file, var), not "as many as happen to live in that file".
     for (rel, var), count in allowed_site_counts.items():
         if count != 1:
@@ -354,7 +353,7 @@ def check_schema(artifacts: list[dict]) -> list[str]:
 # R2 / R3
 # --------------------------------------------------------------------------- #
 def check_r2(artifacts: list[dict], defaults: dict[str, int]) -> list[str]:
-    # Round-2 audit fix: R2 consumes HEALTHY artifacts ONLY. A
+    # R2 consumes HEALTHY artifacts ONLY. A
     # `watchdog-kill`'s own `silent_gap_lower_bound_s` is, by definition,
     # right-censored at RP_INACTIVITY (the kill fires exactly when that
     # threshold is crossed) -- feeding it back into the rule that SETS
@@ -457,7 +456,7 @@ def check_r4(artifacts: list[dict]) -> list[str]:
             if disp.get("kind") == "hang" and not evidence.get("issue"):
                 problems.append(f"R4: {label}: a 'hang' disposition requires disposition.evidence.issue")
             if disp.get("kind") == "slow-host":
-                # Round-2 audit advisory: "the host is just slow, not hung"
+                # "The host is just slow, not hung"
                 # is a CLAIM about that host's real behavior -- it must cite
                 # the follow-up run that actually RE-MEASURED it healthy,
                 # never asserted on its own say-so.
@@ -859,7 +858,7 @@ def _self_test() -> int:
     schema_problems2 = check_schema([a1, a2])
     check("same-sha-disagreeing-expected-id-caught", any("DISAGREEING expected_id" in p for p in schema_problems2), f"{schema_problems2}")
 
-    # --- round-2 audit: a SECOND assignment of the same var in an
+    # --- a SECOND assignment of the same var in an
     # otherwise-allowed file is still a hidden second source of truth. ---
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -872,14 +871,14 @@ def _self_test() -> int:
             f"{r1}",
         )
 
-    # --- round-2 audit: outcome typo rejection. ---
+    # --- outcome typo rejection. ---
     typo = _healthy_artifact("sm_80", 2000.0, 100.0)
     typo["outcome"] = "helthy"
     typo_problems = check_schema([typo])
     check("outcome-typo-rejected", any("is not one of the closed set" in p for p in typo_problems), f"{typo_problems}")
 
-    # --- round-2 audit: R2 vacuity arm (no HEALTHY artifact at all --
-    # only a budget-cut one, which R2 no longer consumes). ---
+    # --- R2 vacuity arm (no HEALTHY artifact at all -- only a budget-cut
+    # one, which R2 does not consume). ---
     only_cut = _healthy_artifact("sm_80", 2000.0, 100.0)
     only_cut["outcome"] = "budget-cut"
     del only_cut["wall_s"]
@@ -887,7 +886,7 @@ def _self_test() -> int:
     r2_vacuous = check_r2([only_cut], {"rp_inactivity": 600})
     check("r2-vacuous-with-no-healthy-artifact", any("VACUOUS" in p for p in r2_vacuous), f"{r2_vacuous}")
 
-    # --- round-2 audit: a disposition on a healthy/suite-fail/capacity/
+    # --- a disposition on a healthy/suite-fail/capacity/
     # log-incomplete outcome is itself a schema finding. ---
     for bad_outcome in ("healthy", "suite-fail", "capacity", "log-incomplete", "wrong-tree"):
         art = _healthy_artifact("sm_80", 2000.0, 100.0)
@@ -903,7 +902,7 @@ def _self_test() -> int:
             f"{probs}",
         )
 
-    # --- round-2 audit: a slow-host disposition must cite a followup_run_id
+    # --- a slow-host disposition must cite a followup_run_id
     # naming a committed HEALTHY artifact. ---
     kill_no_followup = _healthy_artifact("sm_86", 2000.0, 100.0)
     kill_no_followup["outcome"] = "watchdog-kill"

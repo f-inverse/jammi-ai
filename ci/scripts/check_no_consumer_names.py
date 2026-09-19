@@ -2,11 +2,11 @@
 """The mechanical half of the discipline test: flag platform pull leaking into the engine.
 
 Jammi is an engine of generic primitives that **names no consumer** and owns
-*mechanism*, not *governance* (LESSONS L24 / the model-catalog boundary: the
+*mechanism*, not *governance* (the model-catalog boundary: the
 registry mechanism — list/describe/delete — is open-core; lifecycle governance —
 promote/retire/approve — is platform-owned, lives in the consumer's repo). This
-gate is the cheap, generic backstop *behind* the LLM `discipline-test-auditor`; it
-asserts a class, never a bug-signature, and it hardcodes **no consumer name** —
+gate is the cheap, generic backstop behind human review; it asserts a class,
+never a bug-signature, and it hardcodes **no consumer name** —
 that would itself name a consumer inside the engine repo.
 
 It has no proper names of its own. It uses only GENERIC patterns:
@@ -173,13 +173,10 @@ LOCAL_DENYLIST = REPO_ROOT / "ci" / "scripts" / ".consumer_names.local"
 # (4) The waiver allowlist — see that file's own header for the full schema.
 ALLOWLIST_PATH = REPO_ROOT / "ci" / "scripts" / "no_consumer_names_allowlist.txt"
 
-# A `pub` item declaration and its identifier used to be found by a regex
-# (`PUB_DECL_RE`) over each file's/line's own raw text — retired: every
-# caller now cross-references the REAL `symbol-index` `syn` parse
-# (`build_symbol_index`, `_public_idents_in_file`) instead. Regex readers
-# over Rust source are the class this repo's own recorded lesson names
-# ("lost five audits"); this file's own first migrated run found the same
-# class of gap `check_plan_citations.py`'s own construction did.
+# A `pub` item declaration and its identifier are found through the REAL
+# `symbol-index` `syn` parse (`build_symbol_index`, `_public_idents_in_file`),
+# never a regex over raw text: a regex cannot see a declaration wrapped across
+# lines and matches text inside string literals and comments.
 
 
 def is_source_file(path: Path) -> bool:
@@ -270,7 +267,7 @@ def _census_governance_findings(index: dict, nouns: dict[str, str] | None) -> se
     """Every (identifier, path) `pub` item, TREE-WIDE (never diff-scoped —
     `check_governance_tripwire` stays diff-scoped; this is
     the self-test's own tree-wide oracle only), whose stem matches `governance_stem` under the
-    given noun table: `nouns={}` reproduces the PRE-#517 verb-only rule
+    given noun table: `nouns={}` reproduces the verb-only rule
     (temporarily empties `GOVERNANCE_NOUNS`, restored in `finally`, so this
     calls the REAL `governance_stem` rather than duplicating its logic —
     the two paths cannot drift apart by construction); `nouns=None` uses
@@ -317,7 +314,7 @@ _HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 def added_crate_lines_with_paths(base: str) -> list[tuple[str, int, str]]:
     """`[(file_path, new_file_line_no, added_line_text), ...]` for every
     added (`+`) line under `crates/` in `git diff <base>...HEAD` —
-    file-path-attributed (round for #508: the allowlist matches
+    file-path-attributed (the allowlist matches
     `(identifier, declaring_path)` PAIRS, so a finding needs to know which
     file it came from, not just its raw text) and line-number-attributed
     (so `check_governance_tripwire` can cross-reference a REAL parsed
@@ -641,7 +638,7 @@ def check_governance_tripwire(rows: list[AllowlistRow]) -> tuple[list[str], list
             f"ADVISORY: new public identifier `{ident}` in `{file_path}` has governance-verb "
             f"stem `{verb}` — confirm it is open-core MECHANISM "
             "(list/describe/delete/federation), not platform GOVERNANCE "
-            "(governance is platform-owned; LESSONS L24). If a human has already ruled this "
+            "(governance is platform-owned). If a human has already ruled this "
             f"mechanism, add a reviewed row to {ALLOWLIST_PATH.name} citing the ruling — "
             "never rename a correct identifier to dodge this tripwire."
         )
@@ -694,7 +691,7 @@ def check_leak_smells(rows: list[AllowlistRow]) -> tuple[list[str], list[str]]:
 
 
 # --------------------------------------------------------------------------- #
-# self-test (#508 contract delta: one fixture per rot rule 1-7, plus the
+# self-test (one fixture per rot rule 1-7, plus the
 # duplicate-pair vs. same-identifier-different-path distinction)
 # --------------------------------------------------------------------------- #
 def self_test() -> int:
@@ -708,8 +705,8 @@ def self_test() -> int:
     # baseline for every mutation below, rather than a synthetic tempdir
     # tree: `register_content_hash_udf` genuinely exists at this exact
     # path, its ruling_sha is a genuine ancestor of HEAD, and the
-    # identifier genuinely appears elsewhere in the crates tree (its OWN
-    # second row, `pinned_source_gate.rs`) -- so a mutation on ONE field
+    # identifier genuinely appears elsewhere in the crates tree (e.g.
+    # `pinned_source_gate.rs`) -- so a mutation on ONE field
     # exercises exactly the rule that field governs, nothing else.
     good_row = AllowlistRow(
         identifier="register_content_hash_udf",

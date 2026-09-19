@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Assert every embedded engine opened under `cookbook/**`'s NON-pytest lanes
-is closed before its `TemporaryDirectory` is removed (issue #539).
+is closed before its `TemporaryDirectory` is removed.
 
 **Guarded property**: for every `with tempfile.TemporaryDirectory() as X:`
 (or `tempfile.TemporaryDirectory` aliased through `tempfile.`, any spelling)
@@ -13,14 +13,13 @@ manager IS the `jammi.connect(...)` call directly — never a wrapper around
 it, an assignment, a subscript, an `.append(...)`, a walrus, a `return`, or
 `contextlib.ExitStack().enter_context(...)`.
 
-## Why this mechanism, not the registry observer (the issue's other candidate)
+## Why a static analysis, not the registry observer
 
-The issue names two candidates: (a) run these lanes under a harness that
-installs `clients/python/jammi/_sessions.py`'s registry observer and fails
-the lane BY LABEL, mirroring `cookbook/book/tests/conftest.py`'s pytest rail;
-or (b) a static control-flow analysis. (a) is REJECTED for this unit: every
-lane it would need to wrap (`build_*.py` cache scripts run at book-render
-time, `quickstart.py`, a recipe `example.py`, and — critically — a `.qmd`
+The alternative is to run these lanes under a harness that installs
+`clients/python/jammi/_sessions.py`'s registry observer and fails the lane BY
+LABEL, mirroring `cookbook/book/tests/conftest.py`'s pytest rail. That does
+not work here: every lane it would need to wrap (`build_*.py` cache scripts
+run at book-render time, `quickstart.py`, a recipe `example.py`, and — critically — a `.qmd`
 chapter's python cells, which quarto/jupyter execute as a persistent kernel
 across cells, never as one importable module a harness could wrap end-to-end
 without re-implementing quarto's own execution engine) has no single process
@@ -28,25 +27,20 @@ entry point this repo controls the way pytest's `conftest.py` controls test
 collection; installing an `atexit`/`observe()` listener around a `.qmd`
 render would report a leak only after the WHOLE chapter finishes, deep into
 a nightly render no PR ever exercises hermetically, defeating the "RED on a
-PR" requirement a guard exists for. This gate is therefore
-(b): the AST analysis, run over the real committed tree in every PR, no
-render needed.
+PR" requirement a guard exists for. This gate is therefore an AST analysis,
+run over the real committed tree in every PR, no render needed.
 
-## Why AST and not the excised regex/indent gate (`3a10b546`, issue #536)
+## Why AST and not line text
 
-The prior static gate (`test_session_lifecycle_shape.py`, deleted on
-`fix/536-embedded-close`) tracked taint by line INDENTATION and matched
-`jammi.connect(...)` with a single-line regex. A third audit on that PR found
-it unsound on: a `with`-item whose context manager is not the session itself
-(a wrapper), an `ExitStack` built outside the `with` block, two
-`TemporaryDirectory` items on one physical line, a >20-line parenthesized
-`with (` header, and any DEDENTED line inside the block — all passing with
-zero offenders while an ad hoc AST shadow oracle found the same zero
-offenders were genuinely fixed. This module is that shadow oracle, committed
-and CI-wired instead of thrown away: it walks the REAL block extent (a
-`with` statement's own `.items` and `.body`, at any nesting depth, via
-`ast.walk` — no line count, no indentation column ever enters the analysis),
-so every one of those five unsound shapes is structurally impossible here:
+A line-based gate (taint tracked by INDENTATION, `jammi.connect(...)` matched
+by a single-line regex) is unsound on: a `with`-item whose context manager is
+not the session itself (a wrapper), an `ExitStack` built outside the `with`
+block, two `TemporaryDirectory` items on one physical line, a long
+parenthesized `with (` header, and any DEDENTED line inside the block. This
+gate walks the REAL block extent (a `with` statement's own `.items` and
+`.body`, at any nesting depth, via `ast.walk` — no line count, no indentation
+column ever enters the analysis), so each of those five shapes is
+structurally handled:
 - **wrapper with-item**: credit requires a with-item's `context_expr` to BE
   the `jammi.connect(...)` `Call` node itself (`_credited_connect_ids`,
   computed once as identity-set over the whole tree); a wrapper's own call
@@ -58,16 +52,15 @@ so every one of those five unsound shapes is structurally impossible here:
 - **two `TemporaryDirectory` items on one physical line**: each with-item is
   its own AST node regardless of how many share a source line; both bind
   their own name into this statement's taint set.
-- **>20-line parenthesized header**: `ast.parse` handles a parenthesized
+- **long parenthesized header**: `ast.parse` handles a parenthesized
   `with (A as a, B as b):` (3.10+ grammar) exactly like the un-parenthesized
   form — same `With` node, same `.items` list, no length cliff.
 - **dedented line inside the block**: block membership is "is this node a
   descendant, in the real AST, of this `With` node's `.items`/`.body`" — a
   line's column offset in the source text never enters that question.
 
-Exit-path soundness (the "finally-body control flow" in the issue's title):
-crediting ONLY a with-item's own `context_expr` — never anything textually
-inside a `finally:` clause — is what makes this sound rather than merely
+Exit-path soundness (control flow through a `finally:` body): crediting
+ONLY a with-item's own `context_expr` — never anything textually inside a `finally:` clause — is what makes this sound rather than merely
 narrower. Python's `with` statement calls `__exit__` on every exit path from
 its body (a normal fall-through, a `return`, a `break`/`continue`, or an
 exception unwinding past it) as a language guarantee, so a with-item connect
@@ -76,11 +69,9 @@ what control flow the body executes, including a `return` buried inside a
 nested `try/finally`. A `close()` call written inside a `finally:` clause,
 by contrast, is NOT distinguishable — by any static analysis short of a full
 call-graph walk — from a close on an aliasing name, a close inside a nested
-`def`, or a close guarded by an `if`; crediting it was exactly what the
-excised gate did unsoundly. So this gate credits with-items only, same as
-the excised gate's own final (E1) oracle, but reaches that oracle by
-structure instead of by indentation text, which is what removes the five
-unsound shapes above rather than merely renaming them.
+`def`, or a close guarded by an `if`; crediting it would be unsound. So this
+gate credits with-items only, identified by AST structure rather than by
+indentation text.
 
 ## Scope
 
@@ -93,8 +84,7 @@ numbers in a finding still point at the real `.qmd` line).
 
 `cookbook/book/tests/**` is EXCLUDED on purpose: that is the pytest lane,
 already covered by `conftest.py::_no_leaked_sessions` (the registry rail),
-which the issue itself says needs no static gate alongside it ("No static
-shape gate exists for those lanes and none is needed.").
+which needs no static gate alongside it.
 
 ## Known limits (labelled, not silently absorbed)
 
@@ -102,19 +92,16 @@ shape gate exists for those lanes and none is needed.").
   `TemporaryDirectory` passed as a parameter into a helper that derives the
   real catalog directory several calls deep (`build_recompute_cache.py`'s
   `emit` -> `run_cache`/`_fresh_chain` -> `tempfile.mkdtemp(dir=...)` chain)
-  is invisible to this gate — found and fixed by hand on `fix/536-embedded-close`,
-  not by any static gate, before or after this one.
+  is invisible to this gate; such chains are verified by hand.
 - **`jammi.connect` only.** The taint sink this gate recognizes is the
   attribute call `jammi.connect(...)`; an aliased import
   (`from jammi import connect`) binding a bare `connect(...)` call is
-  invisible to it, the same limit the excised gate's `_CONNECT` regex had.
-  No cookbook `.py`/`.qmd` file does this today (swept: every
+  invisible to it. No cookbook `.py`/`.qmd` file does this today (swept: every
   `from jammi import ...` site in `cookbook/**` names `Session`/`Capability`,
   never `connect`) — a reviewer introducing one should not rely on this gate
   to catch it.
-- **A held, never-removed directory is out of scope by construction**, same
-  as before: `jammi.connect(f"file://{tempfile.mkdtemp(...)}")` opens a
-  catalog nothing ever `shutil.rmtree`s, so there is no removal race for this
+- **A held, never-removed directory is out of scope by construction**:
+  `jammi.connect(f"file://{tempfile.mkdtemp(...)}")` opens a catalog nothing ever `shutil.rmtree`s, so there is no removal race for this
   gate to speak to (`cookbook/recipes/*/0N-*.py`'s shared `ARTIFACT_DIR`, the
   quickstart's persisted example directories, etc.).
 """
@@ -222,8 +209,7 @@ def _tainted_by(call: ast.Call, names: set[str]) -> set[str]:
     `FormattedValue`, a `BoolOp` (`args.target or f"file://{d}"`), string
     concatenation (`"file://" + d`), and `d.name` (a `TemporaryDirectory`
     OBJECT's own attribute) all contain a plain `Name` node for `d`
-    somewhere in that subtree, so one walk covers all four shapes the issue
-    names."""
+    somewhere in that subtree, so one walk covers all four shapes."""
     arg = _connect_first_argument(call)
     if arg is None:
         return set()
@@ -349,7 +335,7 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             "Cookbook session-lifecycle AST gate: every embedded engine opened "
             "under cookbook/**'s non-pytest lanes on a TemporaryDirectory is "
-            "closed before that directory is removed (issue #539)."
+            "closed before that directory is removed."
         )
     )
     ap.add_argument("--self-test", action="store_true", help="run the RED-proof self-tests and exit")
@@ -448,7 +434,7 @@ def _self_test() -> int:
     check("nested-with-silent", offenses_for(nested_with) == [], str(offenses_for(nested_with)))
 
     # 4/6 wrapper control: the with-item's context manager is NOT the
-    # session itself -> RED (the exact shape the excised gate missed).
+    # session itself -> RED.
     wrapper = (
         "import tempfile\n"
         "import jammi\n"

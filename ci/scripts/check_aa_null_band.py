@@ -5,20 +5,18 @@ evidence and asserts equality — hermetic, static, no build, no GPU, modeled
 on `check_pod_build_timings.py`'s own shape (a real-tree run plus a
 `--self-test` synthetic-fixture leg, both guards in `ci/guards.toml`).
 
-## The class this closes (round-4 delta-audit F5)
+## Why
 
 `ci/scripts/perf/gpu_inference_ab.py`'s own module doc and
 `ci/artifacts/gpu-perf-aa-null/README.md`'s own "Band derivation" section
 both ASSERT, in prose, that `PRE_REGISTERED_ADVISORY_BAND = (0.75, 1.33)`
-is what the committed empirical-null campaign's PRIMARY evidence derives to
-— but nothing mechanically re-checked that claim before this gate. A PR
+is what the committed empirical-null runs' PRIMARY evidence derives to. A PR
 that edits either the committed artifacts, `manifest.json`'s own
 primary/aux classification, or the band constant itself, without updating
-the OTHER two in the same diff, would previously have gone GREEN on every
-existing test suite (none of them read the committed `ci/artifacts/`
-evidence at all) — this gate is what makes "never hand-tunes the two
-numbers" (`gpu_inference_ab.sh`'s own doc) an ENFORCED property, not merely
-an asserted one.
+the OTHER two in the same diff, goes GREEN on every other test suite (none
+of them read the committed `ci/artifacts/` evidence at all) — this gate is
+what makes "never hand-tunes the two numbers" (`gpu_inference_ab.sh`'s own
+doc) an ENFORCED property, not merely an asserted one.
 
 ## What this gate checks
 
@@ -31,7 +29,7 @@ an asserted one.
    `mode == "aa-null"` — the shape `gpu_inference_ab.py::build_report`'s own
    `--aa-null` producer mode writes, never re-implementing that module's own
    parser, just checking the four keys a re-derivation needs are present
-   and the record honestly claims to be a null-campaign run.
+   and the record honestly claims to be an empirical-null run.
 3. **Re-derivation**: over every `"primary"`-role file's own
    `adjacent_pair_ratios` values (both pairs, every primary file), computes
    the worst `|ln(ratio)|`, feeds it through
@@ -40,14 +38,13 @@ an asserted one.
    with), and asserts the result equals
    `gpu_inference_ab.PRE_REGISTERED_ADVISORY_BAND` exactly.
 
-4. **Directory completeness** (round-2 delta-audit B4): every `*.json`
-   under `ci/artifacts/gpu-perf-aa-null/` except `manifest.json` itself
-   must be LISTED in the manifest — an unlisted report is invisible to the
-   re-derivation, which is exactly the escape hatch this check closes
-   (drop a report from the manifest and the gate would otherwise stay
-   green no matter what its ratios say).
-5. **Primary start-window disjointness** (round-2 delta-audit B6, the
-   mechanized form of the very evidence that demoted `pcie-p1`/`p2`):
+4. **Directory completeness**: every `*.json` under
+   `ci/artifacts/gpu-perf-aa-null/` except `manifest.json` itself must be
+   LISTED in the manifest — an unlisted report is invisible to the
+   re-derivation (drop a report from the manifest and the gate would
+   otherwise stay green no matter what its ratios say).
+5. **Primary start-window disjointness** (the mechanized form of the
+   evidence that classifies `pcie-p1`/`p2` as aux):
    every `"primary"`-role run's `recorded_order` start-window
    (`[min, max]` over its four leg-start timestamps) must not overlap ANY
    other listed run's window. Overlapping start-windows are POSITIVE
@@ -82,8 +79,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 assert (REPO_ROOT / "Cargo.toml").is_file(), (
     f"REPO_ROOT resolved to {REPO_ROOT}, which has no Cargo.toml -- this script's own path-depth "
-    f"assumption (ci/scripts/<file>.py -> parents[2] == repo root) is wrong; see esc-063's own class "
-    f"(check_producer_provenance_gates.py's identical off-by-one) for why this assertion exists"
+    f"assumption (ci/scripts/<file>.py -> parents[2] == repo root) is wrong; an off-by-one here "
+    f"silently points every path below at the wrong tree"
 )
 AA_NULL_DIR = REPO_ROOT / "ci" / "artifacts" / "gpu-perf-aa-null"
 MANIFEST_PATH = AA_NULL_DIR / "manifest.json"
@@ -150,7 +147,7 @@ def load_and_validate_report(aa_null_dir: Path, filename: str) -> dict:
     if missing:
         raise BandGateError(f"{path} is missing required key(s) {missing} -- not a well-formed aa-null report")
     if report["mode"] != "aa-null":
-        raise BandGateError(f"{path}'s own mode is {report['mode']!r}, not 'aa-null' -- this gate only derives from empirical-null campaign reports")
+        raise BandGateError(f"{path}'s own mode is {report['mode']!r}, not 'aa-null' -- this gate only derives from empirical-null reports")
     pairs = report["adjacent_pair_ratios"]
     if not isinstance(pairs, dict) or not pairs:
         raise BandGateError(f"{path}'s own 'adjacent_pair_ratios' must be a non-empty object, got {pairs!r}")
@@ -192,10 +189,9 @@ def run_start_window(aa_null_dir: Path, filename: str, report: dict) -> tuple[in
 
 def check_directory_completeness(aa_null_dir: Path, runs: list[dict]) -> None:
     """Every `*.json` in the directory except `manifest.json` must be listed
-    in the manifest (round-2 delta-audit B4): the re-derivation iterates
-    manifest entries, so an unlisted report would be INVISIBLE to it —
-    omission would otherwise be a silent escape hatch from the very
-    evidence-completeness this gate exists to enforce.
+    in the manifest: the re-derivation iterates manifest entries, so an
+    unlisted report would be INVISIBLE to it and silently excluded from the
+    evidence this gate derives from.
     """
     on_disk = {p.name for p in aa_null_dir.glob("*.json")} - {"manifest.json"}
     listed = {entry["file"] for entry in runs}
@@ -239,7 +235,7 @@ def worst_abs_log_over_primary_pairs(aa_null_dir: Path) -> tuple[float, list[str
                 worst = abs_log
     if worst is None:
         raise BandGateError("no 'primary'-role runs found in the manifest -- cannot derive a band from zero pairs")
-    # Round-2 delta-audit B6, mechanized: a PRIMARY run's start-window
+    # A PRIMARY run's start-window
     # overlapping ANY other listed run's is the pcie-p1/p2 concurrency
     # signature -- positive contamination evidence, so that run cannot be
     # band evidence. Aux runs may overlap each other (that is why p1/p2
@@ -430,8 +426,8 @@ def self_test() -> int:
             pass
 
     # (8) Directory completeness: an on-disk report ABSENT from the
-    # manifest fails loudly (round-2 delta-audit B4's own demonstrated
-    # escape: an unlisted extreme-ratio report was invisible to the gate).
+    # manifest fails loudly (an unlisted extreme-ratio report would otherwise
+    # be invisible to the gate).
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
         _write_fixture_report(d / "listed.json", pair_a=0.95, pair_b=1.0, t0=1_000_000)
@@ -443,8 +439,7 @@ def self_test() -> int:
         except BandGateError:
             pass
 
-    # (9) Primary start-window overlap fails loudly (round-2 delta-audit
-    # B6, mechanized: the pcie-p1/p2 concurrency signature must be a gate
+    # (9) Primary start-window overlap fails loudly (the pcie-p1/p2 concurrency signature must be a gate
     # finding when a PRIMARY run carries it, whatever the sibling's role).
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)

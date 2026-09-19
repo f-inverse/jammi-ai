@@ -32,8 +32,7 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The FULL per-tower LoRA site sets `ci/scripts/perf/profile_421_legs.sh`
-/// pins on every real pod leg (`CLIP_FULL`/`CLAP_FULL` there) — spelled out
+/// The FULL per-tower LoRA site sets a real pod profile leg pins — spelled out
 /// literally here, never imported (this crate is `[[bin]]`-only, mirroring
 /// every other test file in this directory's own convention of re-deriving
 /// fixture/constant values locally; see `finetune_run_kernel_disable.rs`'s
@@ -350,9 +349,7 @@ fn assert_well_formed_media_report(stdout: &str, task: &str) {
 /// (`jammi-encoders/src/activations.rs`, `open_clip_vision.rs`), which has
 /// no fused seam and therefore no `admit` key at all, so its
 /// `gelu_seam_calls_per_forward` census is legitimately (and checkably) `0`
-/// on BOTH OpenCLIP towers — a real, falsifiable claim, not a skip
-/// (`profile_421_merge.py`'s own `A_LEG_FUSED_REQUIRED` doc states the same
-/// convention for the pod legs). HTSAT's Swin MLP routes through the house
+/// on BOTH OpenCLIP towers — a real, falsifiable claim, not a skip. HTSAT's Swin MLP routes through the house
 /// `gelu_erf` seam, so its census (and dispatch totals) must be non-zero.
 fn assert_positive_proof_equation(stdout: &str, task: &str, gelu_expects_zero: bool) {
     let report: serde_json::Value =

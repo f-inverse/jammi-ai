@@ -2266,7 +2266,7 @@ pub struct FinetuneRunTier {
     /// pairs with exactly one `jammi_kernels::admission` key —
     /// `lora_sites_wrapped` ↔ `lora_linear_fused`, `layer_norms` ↔
     /// `layer_norm_fused`, `gelu_seam_calls_per_forward` ↔ `gelu_erf_fused`
-    /// — and `ci/scripts/perf/profile_421_merge.py` reads its `calls`
+    /// — and a downstream merger reads its `calls` term
     /// straight off this struct to check `fused + eager == <field> ×
     /// batches` per key, per run. A `0` is a real, FALSIFIABLE claim there,
     /// not an absent one: a CLIP leg's `gelu_seam_calls_per_forward` is `0`
@@ -2294,10 +2294,7 @@ pub struct FinetuneRunTier {
     /// is one leg and the two coincide exactly;
     /// `tests/finetune_run_smoke.rs`'s
     /// `fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run`
-    /// proves it on the real CLI's own output, and
-    /// `ci/scripts/perf/profile_421_merge.py` REFUSES a leg outside the
-    /// convention by name rather than reporting a counter mismatch it never
-    /// had.
+    /// proves it on the real CLI's own output.
     ///
     /// PROVENANCE, not identity, and not a measurement. It is a structural
     /// property of the build — the same class as [`Self::batched_forward`]
@@ -3939,7 +3936,7 @@ mod tests {
     }
 
     /// The witnessed census reaches the emitted JSON under the EXACT three
-    /// field names `ci/scripts/perf/profile_421_merge.py` reads its `calls`
+    /// field names a downstream merger reads its `calls`
     /// term from (`lora_sites_wrapped` ↔ `lora_linear_fused`, `layer_norms`
     /// ↔ `layer_norm_fused`, `gelu_seam_calls_per_forward` ↔
     /// `gelu_erf_fused`). A rename on either side silently turns every

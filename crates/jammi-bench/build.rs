@@ -41,7 +41,7 @@
 //! a sha", never "is the value I was given TRUE".
 //!
 //! Git worktrees: `.git` is a FILE (not a directory) inside a linked
-//! worktree (`git worktree add`, e.g. `fa2_ab.sh:5`), so the literal path
+//! worktree (`git worktree add`), so the literal path
 //! `<manifest_dir>/../../.git/HEAD` does not exist there. `git rev-parse
 //! --git-path HEAD` resolves the REAL location (inside the worktree's own
 //! private git-dir) in both the plain-repo and worktree case, and is what

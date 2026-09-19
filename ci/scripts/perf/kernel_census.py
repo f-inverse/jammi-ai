@@ -280,8 +280,8 @@ the by-shape signatures uncomparable to the fixed-width legs). Passing
 `--excluded-from-chain-attribution` stamps `excluded_from_chain_attribution:
 true` on the report so a downstream merger/reader never mistakes E1's
 by-name/by-grid rows for chain-attributable evidence -- E1's own role is
-the ecological wall anchor, the LoRA counter check, and the width report
-(`fixture_width_report.py`), never `### Attribution`'s per-chain shares.
+the ecological wall anchor, the LoRA counter check, and the width report,
+never `### Attribution`'s per-chain shares.
 Omitted (the default) stamps `false`.
 
 Usage: kernel_census.py A.sqlite B.sqlite STEPS_A STEPS_B out.json

@@ -503,12 +503,6 @@ why = "The kernel census counts what an nsys capture recorded."
 when = ["perf"]
 
 [[guard]]
-name = "nsys kernel fixture self-test"
-run = "python3 ci/scripts/perf/fixtures/nsys_kernel_census/gen_nsys_kernel_fixture.py --self-test"
-why = "The committed nsys fixtures hold exactly the schema and rows their generator produces."
-when = ["perf"]
-
-[[guard]]
 name = "convert_legacy_bert_checkpoint"
 run = "JAMMI_CI_SAFETENSORS_EXPECTED=1 python3 ci/scripts/perf/test_convert_legacy_bert_checkpoint.py"
 why = "A legacy BERT checkpoint converts to the tensor names the engine loads."
@@ -533,81 +527,3 @@ run = "python3 ci/scripts/perf/test_gen_fixed_length_audio_corpus.py"
 why = "The fixed-length audio corpus is deterministic and of the length it claims."
 when = ["perf"]
 
-[[guard]]
-name = "fixture_width_report"
-run = "python3 ci/scripts/perf/test_fixture_width_report.py"
-why = "The width report's claim about a corpus follows from its per-row lengths."
-when = ["perf"]
-
-# ------------------------------------------------ closed investigations
-#
-# Drivers of finished one-off measurements (#356, #421, #428). Committed GPU
-# evidence still names them as its producers and the performance guide still
-# cites that evidence, so they stay runnable until that evidence is retired.
-
-[[guard]]
-name = "profile_356_legs dry run"
-run = "python3 ci/scripts/perf/test_profile_356_legs_dry_run.py"
-why = "The #356 profile driver runs its legs in the order and shape it records."
-when = ["perf"]
-
-[[guard]]
-name = "profile_421_legs dry run"
-run = "python3 ci/scripts/perf/test_profile_421_legs_dry_run.py"
-why = "The #421 tower-profile driver runs its legs in the order and shape it records."
-when = ["perf"]
-
-[[guard]]
-name = "profile_421_merge"
-run = "python3 ci/scripts/perf/test_profile_421_merge.py"
-why = "The #421 profile report is a tested function of its legs."
-when = ["perf"]
-
-[[guard]]
-name = "profile_421_attribute"
-run = "python3 ci/scripts/perf/test_profile_421_attribute.py"
-why = "The #421 kernel-time attribution is a tested function of its census."
-when = ["perf"]
-
-[[guard]]
-name = "profile_421_artifact"
-run = "python3 ci/scripts/perf/test_profile_421_artifact.py"
-why = "The committed #421 artifact is what its merge and attribution reports produce."
-when = ["perf"]
-
-[[guard]]
-name = "lora_bias_ab_merge"
-run = "python3 ci/scripts/perf/test_lora_bias_ab_merge.py"
-why = "The #428 LoRA-bias A/B verdict is a tested function of its legs."
-when = ["perf"]
-
-[[guard]]
-name = "lora_bias_ab dry run"
-run = "python3 ci/scripts/perf/test_lora_bias_ab_sh_dry_run.py"
-why = "The #428 LoRA-bias A/B driver runs its legs in the order and shape it records."
-when = ["perf"]
-
-[[guard]]
-name = "frontend_ab dry run"
-run = "python3 ci/scripts/perf/test_frontend_ab_dry_run.py"
-why = "The #421 frontend A/B driver runs its legs in the order and shape it records."
-when = ["perf"]
-
-[[guard]]
-name = "frontend_ab_merge"
-run = "python3 ci/scripts/perf/test_frontend_ab_merge.py"
-why = "The #421 frontend A/B verdict is a tested function of its legs."
-when = ["perf"]
-
-[[guard]]
-name = "frontend_ab_artifact"
-run = "python3 ci/scripts/perf/test_frontend_ab_artifact.py"
-why = "The committed #421 frontend artifact is what its merge report produces."
-when = ["perf"]
-needs = ["full-history"]
-
-[[guard]]
-name = "fa2_ab shape"
-run = "python3 ci/scripts/perf/test_fa2_ab_sh.py"
-why = "Each FlashAttention-2 A/B leg states which kernels it expects disabled, so the binary refuses a mislabelled leg."
-when = ["perf"]

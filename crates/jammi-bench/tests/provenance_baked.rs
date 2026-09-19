@@ -631,7 +631,7 @@ fn packed_ref_repo_still_tracks_the_next_commit() {
 }
 
 /// State (c): a linked worktree (`.git` is a FILE, not a directory —
-/// `build.rs`'s module doc names this exact shape, citing `fa2_ab.sh:5`; the
+/// `build.rs`'s module doc names this exact shape; the
 /// agent-worktree layout this very repo uses for parallel work is this
 /// state, checked out on a NEW branch rather than detached). Confirms
 /// `git rev-parse --git-path HEAD` resolves the worktree's OWN private

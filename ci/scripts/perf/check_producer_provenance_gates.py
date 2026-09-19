@@ -40,15 +40,15 @@ meaning.
 
 Disclosed, NOT-hidden scope gap: (B)'s scope trigger fires only on a
 LITERAL `/jammi-bench` PATH assignment appearing in the SAME file — a file
-that instead runs the binary via a caller-provided PARAMETER (`fa2_ab_leg.
-sh`'s `fa2_ab_run_leg() { local bin="$1" ...; "$bin" finetune-step ...; }`,
-sourced by `fa2_ab.sh`'s sweep loop, which resolves `$BIN=".../jammi-bench"`
-and cross-checks `"$BIN" provenance` ITSELF, before ever sourcing the leg
-file) is invisible to this trigger and is not pulled into scope at all —
-this scanner cannot see that `fa2_ab_leg.sh`'s `$bin` is, at every real call
-site, the exact value `fa2_ab.sh` already cross-checked. That today's one
-instance of this shape is safe rests on the sourcing PARENT's own
-discipline (fa2_ab.sh's own text, which (B) DOES check and require), not on
+that instead runs the binary via a caller-provided PARAMETER (a sourced
+leg file's `run_leg() { local bin="$1" ...; "$bin" finetune-step ...; }`,
+whose sourcing parent resolves `$BIN=".../jammi-bench"` and cross-checks
+`"$BIN" provenance` ITSELF, before ever sourcing the leg file) is
+invisible to this trigger and is not pulled into scope at all — this
+scanner cannot see that the leg file's `$bin` is, at every real call
+site, the exact value its parent already cross-checked. That such a
+shape is safe rests on the sourcing PARENT's own discipline (the
+parent's own text, which (B) DOES check and require), not on
 anything this scanner verifies about the parameter-taking file itself —
 recorded here, and in `main`'s own PASS banner, rather than silently
 claimed as covered. A future producer that takes its binary as a parameter
@@ -202,9 +202,7 @@ different CONCEPT of the rules.
 
 (A) only ever looks at names containing the literal substring `FAKE`. A
 SECOND shape of dry-run-only test lever carries no `FAKE` in its name at
-all — `profile_421_legs.sh`'s `PROFILE_421_LEGS_DRY_RUN_EXTRA_REQUESTED_KEY`
-/ `_TRUNCATE_CORPUS_VAR` and `lora_bias_ab.sh`'s `LORA_BIAS_AB_DRY_RUN_FAIL_OP`
-/ `_FAIL_PREDICATE` — every one named `<PREFIX>_DRY_RUN_<SUFFIX>`, i.e. the
+all — a knob named `<PREFIX>_DRY_RUN_<SUFFIX>`, i.e. the
 producer's OWN dry-run toggle (`<PREFIX>_DRY_RUN`) with a real suffix
 appended, structurally invisible to (A)'s `FAKE`-only name filter. (C)
 below closes that gap.
@@ -215,19 +213,17 @@ required):
   1. **Containment.** Every non-comment, non-self-defaulting read site of
      the knob sits textually inside SOME `if [ "$<PREFIX>_DRY_RUN" = "1" ]`
      -guarded region — most commonly a heredoc body written while
-     `<PREFIX>_DRY_RUN=1` (`profile_421_legs.sh`'s `fake_bench.sh` stub,
-     `lora_bias_ab.sh`'s `fake_bench.sh` stub): the knob is only ever READ
+     `<PREFIX>_DRY_RUN=1` (a `fake_bench.sh` stub): the knob is only ever READ
      by code that cannot execute unless the toggle is already on, so no
      separate preflight refusal is possible OR needed — there is no "real
      run" code path that could ever reach it.
   2. **Preflight refusal**, the exact (A) shape generalized off the `FAKE`
      name requirement: a line combining the knob, the governing
      `<PREFIX>_DRY_RUN` toggle, `!=`, and `"1"`, that `exit`s, appearing
-     BEFORE every other use — `profile_421_legs.sh`'s own
-     `PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR` guard (its action
-     truncates a corpus file in place, which WOULD corrupt a real leg, so
-     it needs the same "refuse before any leg runs" contract (A) already
-     enforces for a `FAKE` knob).
+     BEFORE every other use — the route for a knob whose action WOULD
+     corrupt a real leg (one that truncates a corpus file in place, say),
+     so it needs the same "refuse before any leg runs" contract (A) already
+     enforces for a `FAKE` knob.
 
 A "self-defaulting" read (`VAR="${VAR:-default}"`, the ordinary bash
 env-var-with-default idiom every knob in this file uses to declare its
@@ -245,8 +241,8 @@ else) is computed HEREDOC-AWARE: a heredoc body between a `<<[-]TERM`
 opener and its bare-`TERM` terminator line is treated as opaque data, never
 inspected for `if`/`fi` tokens of its own — exactly how bash itself treats
 it. A naive per-line `if`/`fi` depth counter that did NOT skip heredoc
-bodies would run straight past its block's real closing `fi`: both
-`profile_421_legs.sh`'s and `lora_bias_ab.sh`'s DRY_RUN stub heredocs embed
+bodies would run straight past its block's real closing `fi`: a DRY_RUN
+stub heredoc can embed
 a `python3 -c '...'` payload whose OWN `if`/`else` statements never close
 with a bash `fi` at all (Python doesn't have one) — those bare `if` tokens
 would inflate the depth counter with nothing to bring it back down,
@@ -286,8 +282,7 @@ guard-shaped text) sitting only inside a heredoc payload a refusal guard's
 own `then` arm writes out (a stub script generated for something else to
 run later) is DATA, not a real, executed statement of THIS script, and must
 never satisfy either check the way an unquoted, top-level `exit`/guard would
-(the exact shape `profile_421_legs.sh`/`lora_bias_ab.sh`'s own DRY_RUN stub
-heredocs take); and (2) a heredoc that never finds its own terminator by end
+(the exact shape a DRY_RUN stub heredoc takes); and (2) a heredoc that never finds its own terminator by end
 of file TRUNCATES the window at the point this scanner lost the thread,
 rather than extending it — an unresolved construct is never treated as
 "still inside the guarded region" all the way out to this walker's scan cap,
@@ -436,8 +431,8 @@ class _LineLex(NamedTuple):
     previous heredoc-body line — see `_lex_stream`'s own doc for why), so a
     heredoc payload that itself embeds a genuine multi-line single-quoted
     span (a `python3 -c '...'` script written out across many heredoc
-    lines, exactly `profile_421_legs.sh`'s/`lora_bias_ab.sh`'s own
-    `fake_bench.sh` stub shape) routinely has INDIVIDUAL lines whose
+    lines, exactly a `fake_bench.sh` stub's shape) routinely has
+    INDIVIDUAL lines whose
     own-line, fresh-stack quote count is locally ambiguous, even though the
     heredoc AS A WHOLE finds its terminator perfectly normally. `_if_taken_
     branch_extent`'s heredoc-content truncation reads THIS field, never
@@ -1265,8 +1260,8 @@ def _guard_block_lines(lines: list[str], lex: list[_LineLex], start_idx: int) ->
     an earlier version of this function claimed its callers "never see a
     heredoc payload at this call site", but that is false: a refusal
     guard's own `then` arm routinely writes a stub script via a heredoc
-    (`profile_421_legs.sh`'s and `lora_bias_ab.sh`'s `fake_bench.sh` stub is
-    exactly this shape), and an `exit` sitting inside that heredoc's DATA —
+    (a `fake_bench.sh` stub is exactly this shape), and an `exit` sitting
+    inside that heredoc's DATA —
     never actually executed by this script, only written out for some
     OTHER script to run later — must never be able to satisfy (A)/(C)'s
     "does this guard `exit`?" check the way a real, executed `exit`
@@ -1397,9 +1392,8 @@ def _heredoc_aware_block_extent(lines: list[str], lex: list[_LineLex], start_idx
     heredoc body between a `<<[-]TERM` opener and its bare-`TERM`
     terminator line as OPAQUE DATA — see this module's own doc for why a
     depth counter that does not skip heredoc bodies runs past its real
-    closing `fi` on both `profile_421_legs.sh` and `lora_bias_ab.sh`
-    (their DRY_RUN stub heredocs embed a `python3 -c '...'` payload whose
-    own `if`/`else` statements never close with a bash `fi`).
+    closing `fi` (a DRY_RUN stub heredoc embedding a `python3 -c '...'`
+    payload whose own `if`/`else` statements never close with a bash `fi`).
 
     Heredoc bodies are identified purely by reading `lex[i].in_heredoc_
     body` — the span `_lex_stream` already computed once for the whole
@@ -1449,8 +1443,8 @@ _IF_COND_UP_TO_THEN_RE = re.compile(r"\bif\b(.*?)(?:;\s*then\b|\bthen\b|$)")
 def _dry_run_true_block_intervals(lines: list[str], lex: list[_LineLex], governing: str) -> list[tuple[int, int]]:
     """Every `if [ "$<governing>" = "1" ]`-guarded region in `lines` (the
     guard may be one ANDed clause of a larger compound condition — e.g.
-    `profile_421_legs.sh`'s `if [ "$leg_status" = "ok" ] && [
-    "$PROFILE_421_LEGS_DRY_RUN" = "1" ] && [ -n "..." ]; then` — the
+    `if [ "$leg_status" = "ok" ] && [ "$<governing>" = "1" ] &&
+    [ -n "..." ]; then` — the
     equality test may be ANY clause of a chain joined ENTIRELY by `&&`, not
     only the line's sole clause). An opener is credited ONLY when the
     equality test's truth actually IMPLIES the taken branch runs — merely
@@ -1473,7 +1467,7 @@ def _dry_run_true_block_intervals(lines: list[str], lex: list[_LineLex], governi
     is not immediately preceded (ignoring whitespace) by a `!`. A pure
     `&&`-chain's own truth requires EVERY clause true, including ours, so
     the implication holds regardless of how many other `&&`-clauses are
-    present — exactly `profile_421_legs.sh`'s real shape above. (Residual,
+    present — exactly the compound shape above. (Residual,
     disclosed gap: this reads the CONDITION off `lines[i]` alone, never a
     later physical line a backslash line-continuation folds into the same
     logical condition — a `||`/leading `!` hidden on such a continuation
@@ -2170,8 +2164,7 @@ def self_test() -> int:
         # extent walker exists to catch: a knob read on the line
         # IMMEDIATELY AFTER a DRY_RUN=1 block's real closing `fi`, where
         # that block's own heredoc body embeds a `python3 -c` payload whose
-        # `if`/`else` never close with a bash `fi` (the exact shape both
-        # `profile_421_legs.sh` and `lora_bias_ab.sh` use). A depth counter
+        # `if`/`else` never close with a bash `fi`. A depth counter
         # that does NOT skip heredoc bodies never reaches depth<=0 at the
         # real `fi` (the two dangling python `if`s leave it short), so it
         # keeps scanning to the end of the file and wrongly reports the
@@ -2293,8 +2286,7 @@ def self_test() -> int:
             None,
         )
 
-        # (C) GREEN control: preflight refusal — `profile_421_legs.sh`'s
-        # own `PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR` shape,
+        # (C) GREEN control: preflight refusal — the (A) guard shape,
         # generalized off the `FAKE` name requirement.
         commit_and_check(
             "ci/scripts/perf/good_dry_run_knob_preflight_refusal.sh",
@@ -2512,7 +2504,7 @@ def self_test() -> int:
 
         # (C) GREEN control — positive `&&` control: an opener whose
         # condition ANDs the equality test with an unrelated clause must
-        # still be credited (`profile_421_legs.sh`'s own real shape) --
+        # still be credited --
         # proves the fix is specifically "no `||`, no leading `!`", not a
         # blanket "reject every compound condition" regression.
         commit_and_check(
@@ -2532,9 +2524,8 @@ def self_test() -> int:
         # refusal guard's `then` arm writes a stub script via a heredoc
         # whose DATA happens to contain the word `exit` -- never a real,
         # executed `exit` statement of THIS script (the stub is written out
-        # for something else to run later, exactly the shape
-        # `profile_421_legs.sh`/`lora_bias_ab.sh` use for their DRY_RUN
-        # stubs). A window that is not heredoc-content-aware would read
+        # for something else to run later, exactly a DRY_RUN stub's
+        # shape). A window that is not heredoc-content-aware would read
         # this `exit` as satisfying the refusal; it must not.
         commit_and_check(
             "ci/scripts/perf/bad_fake_knob_exit_only_inside_heredoc_payload.sh",
@@ -2681,8 +2672,8 @@ def main() -> int:
         "toggle is 1 (contained or preflight-refused), and every ci/scripts/perf/*.sh naming a "
         "jammi-bench binary path cross-checks its provenance build_sha. (B)'s scope trigger is a "
         "literal `/jammi-bench` PATH assignment in the SAME file — a producer that instead takes "
-        "its binary as a caller-provided parameter (`fa2_ab_leg.sh`'s `fa2_ab_run_leg BIN ...`, "
-        "sourced by `fa2_ab.sh`, which resolves and cross-checks `$BIN` itself before sourcing) "
+        "its binary as a caller-provided parameter (a sourced leg file's `run_leg BIN ...`, whose "
+        "sourcing parent resolves and cross-checks `$BIN` itself before sourcing) "
         "is invisible to this scanner and relies on that convention, not on this gate, to stay "
         "covered — see (B)'s module doc for why this is disclosed rather than silently claimed."
     )

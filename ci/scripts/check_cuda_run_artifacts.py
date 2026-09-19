@@ -61,8 +61,8 @@ must carry:
     `git_sha_unresolved`).
   - `producer.source_sha256` (OPTIONAL — `{<repo-root-relative path>: <sha256
     hex>}`): a producer's own CONTENT identity, for a producer whose module
-    doc names this the regeneration-provenance convention (e.g.
-    `profile_421_artifact.py`) instead of a git commit sha (see rule (j)).
+    doc names this the regeneration-provenance convention instead of a git
+    commit sha (see rule (j)).
   - `producer.identity` (OPTIONAL — MANDATORY for a known convention-
     declaring producer, see rule (j)): the fixed marker string
     `"source_sha256+input_manifest"`, stamped by a producer whose module doc
@@ -458,18 +458,36 @@ def check_schema_types(data: dict) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# rule (b) — producer.path exists and is tracked
+# A producer is LIVE (tracked at HEAD) or RETIRED (deleted, but in HEAD's
+# history). An artifact records a run that happened; retiring the script that
+# ran it does not unmake the run, so evidence is held to this repository's
+# history, never to today's tree alone.
+# --------------------------------------------------------------------------- #
+def historical_sha256s(repo_root: Path, path: str) -> frozenset[str]:
+    """The sha256 of every version of `path` committed in HEAD's history —
+    empty when no commit ever tracked it."""
+    commits = _run(["git", "log", "--format=%H", "--", path], repo_root).stdout.split()
+    blobs = (
+        subprocess.run(["git", "show", f"{commit}:{path}"], cwd=repo_root, capture_output=True)
+        for commit in commits
+    )
+    return frozenset(hashlib.sha256(blob.stdout).hexdigest() for blob in blobs if blob.returncode == 0)
+
+
+# --------------------------------------------------------------------------- #
+# rule (b) — producer.path is tracked, now or in this history
 # --------------------------------------------------------------------------- #
 def check_producer_path(producer: dict, repo_root: Path, tracked: set[str]) -> list[str]:
     path = producer.get("path")
     if not isinstance(path, str) or not path:
         return []
-    failures: list[str] = []
-    if not (repo_root / path).is_file():
-        failures.append(f"producer.path `{path}` does not exist on disk")
-    if path not in tracked:
-        failures.append(f"producer.path `{path}` is not `git ls-files`-tracked")
-    return failures
+    if path in tracked:
+        return []
+    if (repo_root / path).is_file():
+        return [f"producer.path `{path}` is not `git ls-files`-tracked"]
+    if historical_sha256s(repo_root, path):
+        return []
+    return [f"producer.path `{path}` does not exist on disk, and no commit in this history ever tracked it"]
 
 
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -487,10 +505,9 @@ PRODUCER_SOURCE_IDENTITY_MARKER = "source_sha256+input_manifest"
 # now on; this is the enforcement half of that promise, not a suggestion.
 SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS: frozenset[str] = frozenset(
     {
-        # `profile_421_artifact.py`'s own module doc, "Producer identity
-        # (regeneration provenance)" — `producer.path` on its own committed
-        # artifact names the LEG DRIVER script, not the artifact producer
-        # module itself (the schema's `producer.path` field is "the thing
+        # `producer.path` on the committed source-identity artifacts
+        # names the LEG DRIVER script, not the artifact-assembling
+        # module (the schema's `producer.path` field is "the thing
         # that ran", which for a `kind: "script"` producer is the driver a
         # human invoked, not every module that driver's pipeline imports).
         "ci/scripts/perf/profile_421_legs.sh",
@@ -530,21 +547,18 @@ SOURCE_IDENTITY_DECLARING_FILENAME_RE = re.compile(r"-profile-\d+-towers-|-front
 
 
 # --------------------------------------------------------------------------- #
-# rule (j) — producer.source_sha256: content-identity, re-hashed at THIS
-# gate's own HEAD, never a git commit sha nothing ever validated
+# rule (j) — producer.source_sha256: content identity this history can show
 # --------------------------------------------------------------------------- #
 def check_producer_source_sha256(producer: dict, repo_root: Path) -> list[str]:
-    """`producer.source_sha256` (OPTIONAL — only carried by a producer whose
-    own module doc names this its regeneration-provenance convention, e.g.
-    `profile_421_artifact.py`) is a `{<repo-root-relative path>: <sha256
-    hex>}` map naming every file whose BYTES can change a NUMBER that
-    producer emits. Unlike the retired `producer.tree_sha` (a git commit sha
-    nothing ever validated, and the wrong determinant anyway — the artifact
-    cannot know, at render time, which future commit will contain it), this
-    IS checked: every named path is re-hashed at THIS gate's own HEAD (the
-    real working tree, never a historical git blob) and a mismatch is
-    refused BY NAME — regenerating the artifact is the only way to clear a
-    hit, never a hand-edit of the recorded hash."""
+    """`producer.source_sha256` (OPTIONAL — carried by a producer whose
+    regeneration provenance is content identity rather than a commit sha) is
+    a `{<repo-root-relative path>: <sha256 hex>}` map naming every file whose
+    BYTES could change a NUMBER that producer emitted. Each recorded hash
+    must be the sha256 of some committed version of that path in this
+    history: the artifact states what it was rendered from, and the
+    repository can show it. A path that has since changed, or been deleted
+    with its retired producer, leaves the record true; a hash no commit ever
+    carried is refused BY NAME."""
     source_sha256 = producer.get("source_sha256")
     if source_sha256 is None:
         return []
@@ -554,28 +568,20 @@ def check_producer_source_sha256(producer: dict, repo_root: Path) -> list[str]:
     for path, expected in sorted(source_sha256.items()):
         if not isinstance(path, str) or not path:
             failures.append(f"producer.source_sha256 has a non-string/empty path key {path!r}")
-            continue
-        if not isinstance(expected, str) or not _SHA256_HEX_RE.match(expected):
+        elif not isinstance(expected, str) or not _SHA256_HEX_RE.match(expected):
             failures.append(f"producer.source_sha256[{path!r}] must be a 64-lowercase-hex sha256, got {expected!r}")
-            continue
-        full = repo_root / path
-        if not full.is_file():
-            failures.append(f"producer.source_sha256 names `{path}` which does not exist on disk at HEAD")
-            continue
-        actual = hashlib.sha256(full.read_bytes()).hexdigest()
-        if actual != expected:
+        elif expected not in historical_sha256s(repo_root, path):
             failures.append(
-                f"producer.source_sha256[{path!r}] = {expected} does not match `{path}`'s OWN bytes at HEAD "
-                f"({actual}) — the producer (or a file it reads a live constant from) changed since this "
-                "artifact was rendered; regenerate the artifact, never hand-edit the recorded hash"
+                f"producer.source_sha256[{path!r}] = {expected}: no committed version of `{path}` in this "
+                "history has that sha256 — the artifact names bytes this repository cannot show"
             )
     return failures
 
 
 def check_producer_input_sha256(producer: dict) -> list[str]:
     """`producer.input_sha256` (OPTIONAL — `{<input label>: <sha256 hex>}`,
-    e.g. `profile_421_artifact.py`'s `{"merge_json": ..., "attribution_json":
-    ..., "identity": ...}`): the sha256 of the producer's own INPUT files as
+    e.g. `{"merge_json": ..., "attribution_json": ..., "identity": ...}`):
+    the sha256 of the producer's own INPUT files as
     given at render time. Unlike `source_sha256` (repo-root-relative PATHS,
     re-hashable against this gate's own HEAD), an input's label is not a
     path this gate can re-resolve on its own — the recorded value is
@@ -2726,6 +2732,9 @@ def run_census() -> int:
 # self-test — an ephemeral `git init`'d fixture repo, never the real
 # checkout, proving each rule (a)-(f) actually bites.
 # --------------------------------------------------------------------------- #
+RETIRED_PRODUCER = "ci/scripts/perf/retired_producer.sh"
+
+
 def self_test() -> int:
     failures: list[str] = []
 
@@ -2779,10 +2788,16 @@ def self_test() -> int:
         (repo / "ci" / "scripts" / "runpod_gpu_gang.sh").write_text("# stub pod-leg gang driver\n")
         (repo / "ci" / "scripts" / "runpod_gpu_cluster.sh").write_text("# stub cluster-leg gang driver\n")
 
+        # A producer committed at the root and deleted by the next commit:
+        # retired, but in this history.
+        (repo / RETIRED_PRODUCER).write_text("# stub retired producer\n")
+        retired_hash = hashlib.sha256((repo / RETIRED_PRODUCER).read_bytes()).hexdigest()
+
         _run(["git", "add", "-A"], repo)
         _run(["git", "commit", "-q", "-m", "root"], repo)
         root_sha = _run(["git", "rev-parse", "HEAD"], repo).stdout.strip()
 
+        (repo / RETIRED_PRODUCER).unlink()
         (repo / "unrelated.txt").write_text("x\n")
         _run(["git", "add", "-A"], repo)
         _run(["git", "commit", "-q", "-m", "second"], repo)
@@ -2911,6 +2926,11 @@ def self_test() -> int:
         bad["producer"]["path"] = "crates/fixture-crate/tests/does_not_exist.rs"
         expect_hit(bad, "x.json", "does not exist on disk", "rule (b): nonexistent producer.path")
 
+        ok = baseline()
+        ok["producer"] = dict(ok["producer"])
+        ok["producer"].update(path=RETIRED_PRODUCER, kind="script", gating="none")
+        expect_clean(ok, "control-retired-producer.json", "rule (b): a producer deleted since, tracked in this history")
+
         untracked_dir = crate_dir / "tests"
         (untracked_dir / "untracked.rs").write_text("#[test]\n#[ignore]\nfn some_gated_test() {}\n")
         bad = baseline()
@@ -2918,7 +2938,7 @@ def self_test() -> int:
         bad["producer"]["path"] = "crates/fixture-crate/tests/untracked.rs"
         expect_hit(bad, "x.json", "is not `git ls-files`-tracked", "rule (b): untracked producer.path")
 
-        # rule (j) — producer.source_sha256 re-hashed at THIS gate's own HEAD --
+        # rule (j) — producer.source_sha256 names bytes this history holds ------
         real_relpath = "crates/fixture-crate/tests/cuda_parity.rs"
         real_hash = hashlib.sha256((repo / real_relpath).read_bytes()).hexdigest()
 
@@ -2942,12 +2962,21 @@ def self_test() -> int:
         bad = baseline()
         bad["producer"] = dict(bad["producer"])
         bad["producer"]["source_sha256"] = {real_relpath: "0" * 64}
-        expect_hit(bad, "x.json", "does not match", "rule (j): wrong sha256 for a real, existing path")
+        expect_hit(bad, "x.json", "no committed version of", "rule (j): a sha256 no version of a real, existing path ever had")
 
         bad = baseline()
         bad["producer"] = dict(bad["producer"])
         bad["producer"]["source_sha256"] = {"crates/fixture-crate/tests/does_not_exist.rs": real_hash}
-        expect_hit(bad, "x.json", "does not exist on disk at HEAD", "rule (j): source_sha256 names a nonexistent path")
+        expect_hit(bad, "x.json", "no committed version of", "rule (j): source_sha256 names a path no commit ever tracked")
+
+        retired = {"identity": "source_sha256+input_manifest", "input_sha256": {"merge_json": "0" * 64}}
+        ok = baseline()
+        ok["producer"] = {**ok["producer"], **retired, "source_sha256": {RETIRED_PRODUCER: retired_hash}}
+        expect_clean(ok, "control-retired-source.json", "rule (j): a deleted source whose recorded bytes are in this history")
+
+        bad = baseline()
+        bad["producer"] = {**bad["producer"], **retired, "source_sha256": {RETIRED_PRODUCER: real_hash}}
+        expect_hit(bad, "x.json", "no committed version of", "rule (j): a deleted source never committed with the recorded bytes")
 
         bad = baseline()
         bad["producer"] = dict(bad["producer"])
@@ -3113,8 +3142,8 @@ def self_test() -> int:
 
         ok = baseline()
         ok["producer"] = dict(ok["producer"])
-        # `kind`/`gating` switched to the real profile_421_artifact.py
-        # producer block's own shape ("script"/"none") — `cargo-test`'s
+        # `kind`/`gating` switched to a committed source-identity
+        # artifact's own producer-block shape ("script"/"none") — `cargo-test`'s
         # own rule (c) static scan has nothing to do with this rule and
         # would otherwise spuriously fire against a non-Rust stub path.
         ok["producer"]["path"] = "ci/scripts/perf/profile_421_legs.sh"

@@ -436,9 +436,8 @@ def _pool_cache_key(
     different CPython implementation entirely -- is not folded into this
     key. That is safe only because `--pool-cache-dir` is per-process (the
     caller allocates it via `tempfile.mkdtemp` and tears it down at
-    process exit -- see `test_profile_421_legs_dry_run.py`) and is
-    refused outside `DRY_RUN` (`profile_421_legs.sh`'s own
-    `POOL_CACHE_ARGS` guard): one invoking process, one interpreter, one
+    process exit) and is never set on a real run (see the module
+    doc): one invoking process, one interpreter, one
     platform, per cache directory, so there is never a second environment
     sharing that directory to collide against. `sys.version_info[:2]` is
     included anyway because the interpreter that runs `_build_pool` is as

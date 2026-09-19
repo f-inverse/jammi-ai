@@ -28,12 +28,9 @@ import uuid
 
 import pytest
 
-jammi = pytest.importorskip("jammi")
-
 from jammi_cookbook import contracts  # noqa: E402
 
 _EVAL = contracts._dataset_dir("eval")
-_HAVE_GOLDEN = (_EVAL / "golden_metrics.json").exists()
 
 
 @pytest.fixture
@@ -148,7 +145,6 @@ def test_tenant_isolation_and_non_collision(db):
     assert {"vector", "inference"} <= unbound
 
 
-@pytest.mark.skipif(not _HAVE_GOLDEN, reason="eval cache not emitted")
 def test_channel_goldens_reproduce_live(db):
     """The channel counts the emit froze reproduce live on the embedded engine:
     A's channel count, the annotated_by column count, zero tenant leak, zero

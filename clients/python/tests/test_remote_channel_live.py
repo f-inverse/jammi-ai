@@ -26,28 +26,19 @@ equality between the two transports is well-defined (each sees that tenant's own
 channels plus the shared global seeds, nothing leaked from a sibling test). The
 embedded peer binds the SAME tenant so the two namespaces line up.
 
-Gated, not hermetic: the test needs a built server binary, so it is skipped
-unless `JAMMI_SERVER_BIN` points at a `jammi-server` executable. CI's
-python-test job sets it after building the binary; a bare `pytest` skips it. The
-embedded engine (`jammi_native`) must also be importable (the parity peer).
+Selected by the `live_server` and `embedded` markers: it needs a built
+`jammi-server` (`JAMMI_SERVER_BIN`) and the in-process engine as the parity peer.
 """
 
 from __future__ import annotations
 
-import os
 import uuid
 
 import pytest
 
-pytest.importorskip("jammi_native")
-import jammi  # noqa: E402
+import jammi
 
-SERVER_BIN = os.environ.get("JAMMI_SERVER_BIN")
-
-pytestmark = pytest.mark.skipif(
-    not SERVER_BIN or not os.path.exists(SERVER_BIN),
-    reason="JAMMI_SERVER_BIN not set to a built jammi-server binary",
-)
+pytestmark = [pytest.mark.live_server, pytest.mark.embedded]
 
 
 def _fresh_tenant() -> str:

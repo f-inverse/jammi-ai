@@ -23,19 +23,14 @@ the wire, not the `Internal`-for-everything a catch-all produces:
 
 The cross-transport ``remote == embedded`` parity is a ONE-TIME emit-side LIVE
 check (recorded in ``channels_taxonomy.json``); PR CI never re-diffs two static
-artifacts. If the emitted cache is absent the matrix-backed checks skip, but the
-committed golden metrics, once present, are always asserted.
+artifacts. The cache is committed, so an absent artifact is a failure naming it.
 """
 
 from __future__ import annotations
 
-import pytest
-
 from jammi_cookbook import contracts
 
 _CHANNELS = contracts._dataset_dir("channels")
-_HAVE_CACHE = (_CHANNELS / "golden_metrics.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="channels taxonomy cache not emitted")
 
 # The four headline failure modes and the gRPC status code each maps to.
 _EXPECTED_WIRE = {
@@ -65,7 +60,6 @@ def _record() -> dict:
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_every_taxonomy_verdict_matches_golden():
     """Every committed taxonomy verdict matches its frozen golden — the golden the
     chapter renders against. A drift in any cell fails CI here."""
@@ -82,7 +76,6 @@ def test_every_taxonomy_verdict_matches_golden():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_each_mode_maps_to_its_typed_wire_code():
     """Each channel failure mode maps to its CORRECT typed gRPC status code on the
     grpc:// transport — duplicate→ALREADY_EXISTS, unknown→NOT_FOUND, column
@@ -95,7 +88,6 @@ def test_each_mode_maps_to_its_typed_wire_code():
         assert cell["wire_code"] == expected, f"{mode}: {cell['wire_code']} != {expected}"
 
 
-@_needs_cache
 def test_no_failure_collapses_to_internal():
     """The typed-taxonomy guarantee: no typed failure mode collapses to INTERNAL / UNKNOWN
     on the wire — each speaks its true gRPC code."""
@@ -109,7 +101,6 @@ def test_no_failure_collapses_to_internal():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_embedded_companion_carries_the_normalized_class():
     """The embedded engine raises the same NORMALIZED error class for each mode,
     with NO wire code (it is in-process, not on the wire) — the cross-transport
@@ -122,7 +113,6 @@ def test_embedded_companion_carries_the_normalized_class():
         assert cell["wire_code"] is None, f"{mode}: embedded carries no wire code"
 
 
-@_needs_cache
 def test_remote_equals_embedded_class_for_every_mode():
     """The recorded one-time live parity verdict: remote == embedded normalized
     error class for every channel failure mode. The two transports raise different
@@ -141,7 +131,6 @@ def test_remote_equals_embedded_class_for_every_mode():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_invalid_dtype_is_a_client_side_guard_not_a_wire_code():
     """An invalid column dtype STRING is rejected CLIENT-SIDE on both transports
     (a ValueError that never reaches the wire — no StatusCode), distinct from the
@@ -159,7 +148,6 @@ def test_invalid_dtype_is_a_client_side_guard_not_a_wire_code():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_internal_is_the_documented_residual_and_no_deviation():
     """INTERNAL is the documented residual of the taxonomy (a genuine DB fault is
     not fabricated), and the measured taxonomy has ZERO deviation — every mode maps

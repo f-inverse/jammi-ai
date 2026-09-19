@@ -20,19 +20,14 @@ The cross-transport ``remote == embedded`` parity is a ONE-TIME emit-side LIVE
 check (recorded in ``lifecycle.json``, continuously re-guarded by the engine's
 gated conformance + catalog tests); PR CI never re-diffs two static artifacts.
 
-If the emitted cache is absent the matrix-backed checks skip, but the committed
-golden metrics, once present, are always asserted.
+The cache is committed, so an absent artifact is a failure naming it.
 """
 
 from __future__ import annotations
 
-import pytest
-
 from jammi_cookbook import contracts
 
 _LIFECYCLE = contracts._dataset_dir("lifecycle")
-_HAVE_CACHE = (_LIFECYCLE / "golden_metrics.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="lifecycle cache not emitted")
 
 # The minimal client-facing projection keys with the per-run UUID model_id
 # stripped from the committed form (the projection is model_id + these).
@@ -52,7 +47,6 @@ def _record() -> dict:
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_every_catalog_verdict_matches_golden():
     """Every committed matrix verdict matches its frozen golden — the golden the
     chapter renders against. A drift in any cell fails CI here."""
@@ -72,7 +66,6 @@ def test_every_catalog_verdict_matches_golden():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_delete_while_referenced_raises_the_typed_referenced_error():
     """delete-while-referenced raises the typed ``ModelReferenced`` guard on BOTH
     a fine-tuned model (referenced by training_jobs.output_model_id) and its base
@@ -85,7 +78,6 @@ def test_delete_while_referenced_raises_the_typed_referenced_error():
     contracts.assert_close("lifecycle.delete.referenced_raises", 1.0)
 
 
-@_needs_cache
 def test_every_catalog_model_is_referenced():
     """The headline referential property: every model in the catalog is
     trained-and-referenced, so the delete-unreferenced-SUCCEEDS cell of the matrix
@@ -97,7 +89,6 @@ def test_every_catalog_model_is_referenced():
     assert "trained-and-referenced" in _record()["catalog_property"].lower()
 
 
-@_needs_cache
 def test_delete_absent_is_not_found_not_invalid_argument():
     """delete-absent WITHOUT if_exists is the ``not_found`` class — the typed
     ``ModelNotFound`` (the wire status is NOT_FOUND, never INVALID_ARGUMENT);
@@ -116,7 +107,6 @@ def test_delete_absent_is_not_found_not_invalid_argument():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_register_reflected_in_describe_and_list():
     """A fresh model registers as ``registered`` via the only public path
     (training) and is reflected by describe / list as the minimal projection."""
@@ -125,7 +115,6 @@ def test_register_reflected_in_describe_and_list():
     contracts.assert_close("lifecycle.register.status_registered", 1.0)
 
 
-@_needs_cache
 def test_committed_projections_carry_the_minimal_shape():
     """The committed model projections carry exactly the minimal client-facing
     keys (with the per-run UUID model_id stripped) — the same projection both
@@ -145,7 +134,6 @@ def test_committed_projections_carry_the_minimal_shape():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_remote_equals_embedded_for_every_observable():
     """The recorded one-time live parity verdict: remote == embedded for every
     catalog observable (the model projections and the normalized delete-error

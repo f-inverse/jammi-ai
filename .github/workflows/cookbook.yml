@@ -78,3 +78,10 @@ jobs:
         run: |
           . .venv/bin/activate
           python tests/cookbook_smoke.py
+
+      # The client's whole suite, the `live_server` tests included: this lane has
+      # both resources they need — the native engine and a built server.
+      - name: Python client suite against a live server
+        run: |
+          . .venv/bin/activate
+          JAMMI_SERVER_BIN="$GITHUB_WORKSPACE/target/release/jammi-server" make -C clients/python test-live

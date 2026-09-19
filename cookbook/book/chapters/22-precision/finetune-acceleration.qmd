@@ -115,7 +115,7 @@ import tempfile
 import time
 
 import jammi
-from jammi_cookbook.live_server import LiveServer
+from jammi.testing import LiveServer
 
 print(inspect.getsource(LiveServer))
 
@@ -124,12 +124,12 @@ ARTIFACT_DIR = tempfile.mkdtemp(prefix="jammi_srv_ftaccel_")
 
 # Server A: the training surface is mounted and accepts submissions, but this
 # process never claims — `[worker] enabled = false`.
-server_a = LiveServer(ARTIFACT_DIR, run_worker=False).__enter__()
+server_a = LiveServer(ARTIFACT_DIR, env={"JAMMI_WORKER__ENABLED": "false"}).__enter__()
 # The literal `grpc://` target — the same public front door every other
 # remote-transport chapter in this book opens, over a real live server this
 # render itself just started.
 remote_a = jammi.connect(server_a.endpoint)
-print(f"server A (run_worker=false) up at {server_a.endpoint}")
+print(f"server A (worker disabled) up at {server_a.endpoint}")
 print(f"  artifact dir: {ARTIFACT_DIR}")
 ```
 
@@ -274,7 +274,7 @@ print(f"server A closed (returncode={server_a.returncode})")
 # this open SUCCEEDS on the same directory is the release proof.
 server_b = LiveServer(ARTIFACT_DIR).__enter__()
 remote = jammi.connect(server_b.endpoint)
-print(f"server B (default run_worker) up at {server_b.endpoint}, same artifact dir")
+print(f"server B (worker enabled, the default) up at {server_b.endpoint}, same artifact dir")
 ```
 
 A job handle is **re-attachable across connections**, on both arms: `db.job(job_id)`

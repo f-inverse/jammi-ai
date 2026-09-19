@@ -9,7 +9,6 @@ the embedded arm monkeypatches `find_spec` to simulate the engine's absence.
 
 from __future__ import annotations
 
-import importlib.util
 
 import pytest
 
@@ -57,18 +56,10 @@ def test_dir_includes_lazy_names():
         assert name in names
 
 
-def test_embedded_symbol_without_engine_raises(monkeypatch):
-    """Simulate the client-only build: `find_spec('jammi_native')` misses, so an
-    embedded-only symbol is a truthful `NoEmbeddedEngineError` naming both the
-    attribute and the `[embedded]` extra — never a bare `ImportError`."""
-    real_find_spec = importlib.util.find_spec
-
-    def fake_find_spec(name, *args, **kwargs):
-        if name == "jammi_native":
-            return None
-        return real_find_spec(name, *args, **kwargs)
-
-    monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+def test_embedded_symbol_without_engine_raises(no_embedded_engine):
+    """In the client-only build an embedded-only symbol is a truthful
+    `NoEmbeddedEngineError` naming both the attribute and the `[embedded]`
+    extra — never a bare `ImportError`."""
     with pytest.raises(NoEmbeddedEngineError) as info:
         _ = jammi.PerQueryAudit
     msg = str(info.value)
@@ -76,10 +67,7 @@ def test_embedded_symbol_without_engine_raises(monkeypatch):
     assert "pip install jammi-ai[embedded]" in msg
 
 
-@pytest.mark.skipif(
-    importlib.util.find_spec("jammi_native") is None,
-    reason="embedded extra (`jammi_native`) not installed in this lane",
-)
+@pytest.mark.embedded
 def test_embedded_symbol_with_engine_returns_native_type():
     """With the engine importable, an embedded-only accessor returns the very
     type `jammi_native` exports — the lazy re-export, not a copy."""

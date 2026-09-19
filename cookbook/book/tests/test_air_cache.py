@@ -12,23 +12,16 @@ and the tenancy showcase. There is NO learn/predict tier here — the continent
 label is near-solved by lat/lon, so a tier-03/04 would be manufactured; that
 spine lives on ogbn-arxiv (the keystone).
 
-If the emitted cache is absent the heavy artifacts are skipped (the unit suite
-stays runnable without the GPU emit), but the committed golden metrics are always
-asserted.
+The cache is committed, so an absent artifact is a failure naming it.
 """
 
 from __future__ import annotations
 
-import pytest
-
 from jammi_cookbook import contracts
 
 _AIR = contracts._dataset_dir("air")
-_HAVE_CACHE = (_AIR / "golden_metrics.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="air cache not emitted")
 
 
-@_needs_cache
 def test_declared_hierarchy_is_more_homophilous_than_route():
     """Tier 01 — the construct contrast: the declared containment hierarchy is
     near-perfectly continent-consistent (~0.99), the route topology highly but not
@@ -42,7 +35,6 @@ def test_declared_hierarchy_is_more_homophilous_than_route():
     assert contains > 0.95, "the continent→airport hierarchy is near-perfectly homophilous"
 
 
-@_needs_cache
 def test_route_propagation_helps_continent_recall():
     """Tier 02 — propagation as a low-pass filter lifts same-continent recall.
 
@@ -61,7 +53,6 @@ def test_route_propagation_helps_continent_recall():
     assert abs((prop - raw) - delta) <= 1e-3, "the recorded delta is internally consistent"
 
 
-@_needs_cache
 def test_tenancy_record_captures_the_two_layers_and_the_caveat():
     """The showcase — the engine's two genuine isolation layers + the honest caveat.
 
@@ -88,7 +79,6 @@ def test_tenancy_record_captures_the_two_layers_and_the_caveat():
     assert record["global_source_visible"] == record["tenant_b_airports"]
 
 
-@_needs_cache
 def test_committed_air_artifacts_match_contract():
     """Every parquet/edge_table air artifact loads and carries its contracted columns."""
     for name in ("air.airports", "air.embeddings", "air.neighbor_graph",

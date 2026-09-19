@@ -18,16 +18,13 @@ starts. The Rust peer of this test (`crates/jammi-server/tests/it/
 grpc_remote_list.rs`) compares the same two answers as serialized wire bytes;
 this one compares the two PYTHON dict lists a caller actually holds.
 
-Skipped unless `JAMMI_SERVER_BIN` points at a built `jammi-server` AND the
-`[embedded]` extra is installed (the seeder needs the in-process engine) — the
-same gate shape every other live module in this directory declares.
+Selected by the `live_server` and `embedded` markers: it needs a built
+`jammi-server` (`JAMMI_SERVER_BIN`) and the in-process engine as the parity peer.
 """
 
 from __future__ import annotations
 
-import os
 import sqlite3
-from importlib.util import find_spec
 from pathlib import Path
 
 import pyarrow as pa
@@ -36,12 +33,7 @@ import pytest
 
 import jammi
 
-SERVER_BIN = os.environ.get("JAMMI_SERVER_BIN")
-
-pytestmark = pytest.mark.skipif(
-    not (SERVER_BIN and Path(SERVER_BIN).is_file()) or find_spec("jammi_native") is None,
-    reason="needs JAMMI_SERVER_BIN and the [embedded] extra (the seeder is the in-process engine)",
-)
+pytestmark = [pytest.mark.live_server, pytest.mark.embedded]
 
 DIM = 4
 N_CORPUS = 6

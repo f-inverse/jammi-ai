@@ -142,9 +142,9 @@ import jammi
 import pyarrow as pa
 import pyarrow.flight as flight
 import pyarrow.parquet as pq
+from jammi.testing import LiveServer
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
-from jammi_cookbook.live_server import LiveServer
 from jammi_cookbook.rails import assert_listing_isolated, assert_rows_isolated, tenant
 
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "tenancy_h3"

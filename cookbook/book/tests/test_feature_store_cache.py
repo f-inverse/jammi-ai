@@ -7,22 +7,16 @@ its frozen golden and conserves the feature mass, and — the honesty constraint
 mutable table is recorded as APPEND-ONLY (UPDATE / DELETE / duplicate-key INSERT each
 rejected on this surface).
 
-If the emitted cache is absent the heavy artifacts are skipped, but the committed golden
-metrics, once present, are always asserted.
+The cache is committed, so an absent artifact is a failure naming it.
 """
 
 from __future__ import annotations
 
-import pytest
-
 from jammi_cookbook import contracts
 
 _FS = contracts._dataset_dir("feature_store")
-_HAVE_CACHE = (_FS / "golden_metrics.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="feature_store cache not emitted")
 
 
-@_needs_cache
 def test_feature_rows_match_contract():
     """Every paper carries a citation-in-degree feature value (0 if uncited)."""
     art = contracts.artifact("feature_store.paper_features")
@@ -37,7 +31,6 @@ def test_feature_rows_match_contract():
     assert set(in_degree) == papers, "the feature column covers every paper"
 
 
-@_needs_cache
 def test_join_aggregate_conserves_feature_mass():
     """The subject-level SUM(in_degree) aggregate sums to the committed grand total."""
     record = contracts.load_artifact("feature_store.record")
@@ -55,7 +48,6 @@ def test_join_aggregate_conserves_feature_mass():
     assert subject_totals[record["top_subject"]] == record["top_subject_total"]
 
 
-@_needs_cache
 def test_surface_is_append_only():
     """The honesty constraint: UPDATE / DELETE / duplicate-key INSERT are each rejected."""
     record = contracts.load_artifact("feature_store.record")

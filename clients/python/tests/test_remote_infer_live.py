@@ -13,29 +13,21 @@ no batches, which the embedded binding surfaces as a schema-less empty
 `pyarrow.Table` and the wire carries as an empty `ArrowBatch` — decoded to the
 same schema-less empty table, so the transports agree on the degenerate shape.
 
-Gated, not hermetic: the test needs a built server binary, so it is skipped
-unless `JAMMI_SERVER_BIN` points at a `jammi-server` executable. The embedded
-engine (`jammi_native`) must also be importable (the parity peer).
+Selected by the `live_server` and `embedded` markers: it needs a built
+`jammi-server` (`JAMMI_SERVER_BIN`) and the in-process engine as the parity peer.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-pytest.importorskip("jammi_native")
-import jammi  # noqa: E402
+import jammi
 
-SERVER_BIN = os.environ.get("JAMMI_SERVER_BIN")
-
-pytestmark = pytest.mark.skipif(
-    not SERVER_BIN or not os.path.exists(SERVER_BIN),
-    reason="JAMMI_SERVER_BIN not set to a built jammi-server binary",
-)
+pytestmark = [pytest.mark.live_server, pytest.mark.embedded]
 
 # The repo's shared generic fixtures: the smallest source + deterministic local
 # model the embedded inference tests already run (`patents.parquet` through

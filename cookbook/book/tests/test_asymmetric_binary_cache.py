@@ -13,16 +13,11 @@ from __future__ import annotations
 
 import hashlib
 
-import pytest
-
 from jammi_cookbook import contracts
 
 _DIR = contracts._dataset_dir("asymmetric_binary")
-_HAVE_CACHE = (_DIR / "manifest.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="asymmetric_binary cache not emitted")
 
 
-@_needs_cache
 def test_manifest_records_a_real_modernbert_source_with_provenance():
     manifest = contracts.load_artifact("asymmetric_binary.manifest")
     assert manifest["base_model"] == "answerdotai/ModernBERT-base"
@@ -35,7 +30,6 @@ def test_manifest_records_a_real_modernbert_source_with_provenance():
     assert set(source["lfs_oids"]) == {"corpus_vectors.parquet", "query_vectors.parquet"}
 
 
-@_needs_cache
 def test_committed_vectors_match_manifest_shape_and_are_held_out():
     manifest = contracts.load_artifact("asymmetric_binary.manifest")
     corpus = contracts.load_artifact("asymmetric_binary.corpus_vectors")
@@ -53,7 +47,6 @@ def test_committed_vectors_match_manifest_shape_and_are_held_out():
     assert len(query_ids) == query.num_rows, "_row_id must be unique in the query set"
 
 
-@_needs_cache
 def test_checksums_cover_every_committed_file_and_match():
     checksums = contracts.load_artifact("asymmetric_binary.checksums")
     for name in ("corpus_vectors.parquet", "query_vectors.parquet", "manifest.json"):

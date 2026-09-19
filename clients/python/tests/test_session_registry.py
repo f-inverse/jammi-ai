@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import gc
 import threading
-from importlib.util import find_spec
 
 import grpc
 import pytest
@@ -68,10 +67,7 @@ def _dead_channel() -> grpc.Channel:
 # --- Route: jammi.connect("file://…") ---------------------------------------
 
 
-@pytest.mark.skipif(
-    find_spec("jammi_native") is None,
-    reason="needs the [embedded] extra to open a real file:// target",
-)
+@pytest.mark.embedded
 def test_connect_file_route_appears_and_disappears(tmp_path):
     db = jammi.connect(f"file://{tmp_path}")
     try:

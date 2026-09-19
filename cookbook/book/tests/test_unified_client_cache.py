@@ -24,9 +24,8 @@ recompute, only the client contract to hold to its frozen shape:
 
 The embedded backend under test is the REAL base-client `EmbeddedBackend` that
 `jammi.connect("file://…")` returns (the `[embedded]` extra's direct-FFI
-engine), not a convenience-bundle alias. If the emitted cache is absent the
-checks skip; the committed record, once present, is always asserted equal to the
-live surface.
+engine), not a convenience-bundle alias.
+The cache is committed, so an absent artifact is a failure naming it.
 """
 
 from __future__ import annotations
@@ -51,8 +50,6 @@ from jammi.errors import (
 from jammi_cookbook import contracts
 
 _UC = contracts._dataset_dir("unified_client")
-_HAVE_CACHE = (_UC / "unified_client.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="unified-client cache not emitted")
 
 
 def _record() -> dict:
@@ -75,7 +72,6 @@ def _session_protocol_verbs() -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_embedded_extra_pins_the_native_engine():
     """`jammi-ai` declares the opt-in `[embedded]` extra, pinning the compiled
     `jammi-ai-native` dist — read off the live dist metadata, matching the golden."""
@@ -94,7 +90,6 @@ def test_embedded_extra_pins_the_native_engine():
     assert extras == rec["extras"]
 
 
-@_needs_cache
 def test_file_uri_returns_embedded_backend_grpc_returns_remote(tmp_path):
     """The ONE front door, two arms: `connect("file://…")` returns the in-process
     `EmbeddedBackend` (direct FFI, no server), `connect("grpc://…")` a
@@ -123,7 +118,6 @@ def test_file_uri_returns_embedded_backend_grpc_returns_remote(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_session_protocol_vocabulary_present_on_both_backends(embedded, remote):
     """Every member the shared `Session` Protocol names is present on BOTH concrete
     backends, and both satisfy `Session` structurally — the parity the one-front-
@@ -146,7 +140,6 @@ def test_session_protocol_vocabulary_present_on_both_backends(embedded, remote):
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_supports_booleans_match_and_are_complementary(embedded, remote):
     """`supports(Capability.X)` is the committed boolean per backend, and the two
     CLOSED-four capability sets are exactly complementary."""
@@ -159,7 +152,6 @@ def test_supports_booleans_match_and_are_complementary(embedded, remote):
     assert rec["complementary"] is True
 
 
-@_needs_cache
 def test_wrong_side_capability_raises_not_supported(embedded, remote):
     """A one-sided feature invoked on the backend that lacks it raises the typed
     `NotSupportedOnBackend` (never a bare `AttributeError`), naming the capability."""
@@ -174,7 +166,6 @@ def test_wrong_side_capability_raises_not_supported(embedded, remote):
     assert rec["remote_wrong_side"]["raised"] == "NotSupportedOnBackend"
 
 
-@_needs_cache
 def test_capability_enum_is_the_closed_four():
     """The capability enum is the committed CLOSED four — no silent fifth.
 
@@ -231,7 +222,6 @@ class _RaisingStub:
         return _raise
 
 
-@_needs_cache
 def test_one_except_jammi_error_catches_both_transports(embedded, remote):
     """One `except JammiError` catches a bad-argument failure on BOTH the embedded
     engine (rejected in-process) and the remote client (a server status), and both
@@ -266,7 +256,6 @@ def test_one_except_jammi_error_catches_both_transports(embedded, remote):
     assert rec["remote_bad_arg"]["raised"] == "InvalidArgument"
 
 
-@_needs_cache
 def test_taxonomy_hierarchy_refines_honest_builtins():
     """Each leaf refines the closest honest built-in — the committed hierarchy holds
     on the live classes (an `except ValueError` still fires for a bad argument)."""
@@ -322,7 +311,6 @@ def _receive_at_cap(port: int, cap: int):
         channel.close()
 
 
-@_needs_cache
 def test_finite_receive_cap_raises_backend_error_remote_returns_embedded():
     """A real capped gRPC channel raises `RESOURCE_EXHAUSTED` for a payload above
     the cap — mapped by the real client onto `BackendError` — while a channel at
@@ -352,7 +340,6 @@ def test_finite_receive_cap_raises_backend_error_remote_returns_embedded():
     assert rec["generous_channel_returned_bytes"] == len(payload)
 
 
-@_needs_cache
 def test_embedded_returns_the_same_scale_payload_unbounded(embedded, tmp_path):
     """The embedded engine returns the same-scale payload in-process, exceeding the
     demo cap the remote channel rejected — the unbounded in-process counterpart.

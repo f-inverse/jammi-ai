@@ -35,8 +35,7 @@ are exercised here in pure Python with no engine — ``mint_token`` returns a BA
 token, ``verify_token`` strips the one ``"Bearer "`` the wire carries, and a
 forged token must NOT verify regardless of the committed cache.
 
-If the emitted cache is absent the matrix-backed checks skip; the committed golden
-metrics, once present, are always asserted.
+The cache is committed, so an absent artifact is a failure naming it.
 """
 
 from __future__ import annotations
@@ -44,13 +43,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 
-import pytest
-
 from jammi_cookbook import contracts
 
 _TENANCY = contracts._dataset_dir("tenancy_h3")
-_HAVE_CACHE = (_TENANCY / "golden_metrics.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="tenancy_h3 cache not emitted")
 
 # The hard-zero observables — a leak here is an isolation failure.
 _HARD_ZEROS = (
@@ -77,7 +72,6 @@ def _record() -> dict:
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_every_verdict_matches_golden():
     """Every committed matrix verdict matches its frozen golden — the golden the
     chapter renders against. A drift in any cell fails CI here."""
@@ -120,7 +114,6 @@ def test_every_verdict_matches_golden():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_every_tenant_scoped_verb_leaks_nothing():
     """For every tenant-scoped verb, tenant B sees/reaches ZERO of tenant A's
     resource — the standing oracle's property, measured per verb as a hard zero."""
@@ -129,7 +122,6 @@ def test_every_tenant_scoped_verb_leaks_nothing():
         assert m[cell] == 0, f"{cell} leaked {m[cell]} (expected a hard zero)"
 
 
-@_needs_cache
 def test_no_leak_finding_recorded():
     """The headline: no leak was found. The record states it explicitly, and the
     matrix backs it — every hard zero is 0 and A survives every foreign destructive
@@ -146,7 +138,6 @@ def test_no_leak_finding_recorded():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_stated_positives_are_real_positive_counts():
     """The honest caveats are POSITIVE counts, not hidden zeros: B sees the
     engine's built-in global channels, and A reads a discriminator-less source
@@ -168,7 +159,6 @@ def test_stated_positives_are_real_positive_counts():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_duplicate_ids_error_or_isolate_never_clobber():
     """A duplicate mutable-table name across tenants ERRORS on the global catalog
     PK (it does not clobber A's table); duplicate topic / channel ids isolate as
@@ -184,7 +174,6 @@ def test_duplicate_ids_error_or_isolate_never_clobber():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_destructive_verbs_do_not_reach_across_tenants():
     """B names A's mutable table / topic in a destructive call; B's call resolves
     in B's OWN namespace and A's resource SURVIVES — the load-bearing guarantee
@@ -200,7 +189,6 @@ def test_destructive_verbs_do_not_reach_across_tenants():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_remote_equals_embedded_for_cross_transport_verbs():
     """The recorded one-time live parity verdict: remote == embedded for every
     cross-transport observable (the catalog reads + the discriminator sql row
@@ -218,7 +206,6 @@ def test_remote_equals_embedded_for_cross_transport_verbs():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_result_table_scan_isolated():
     """The mirror of the Rust oracle
     (``tenant_isolation_oracle.rs::assert_result_table_scan_isolated``), over the
@@ -246,7 +233,6 @@ def test_result_table_scan_isolated():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_byo_auth_seam_verdict():
     """The committed BYO-auth verdict, over the REAL Flight SQL wire: the bearer is
     observed on the Flight lane (anonymous carries none); two authenticated tenants

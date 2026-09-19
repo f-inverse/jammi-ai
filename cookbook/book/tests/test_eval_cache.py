@@ -19,19 +19,14 @@ The cross-transport remote == embedded parity is a ONE-TIME emit-side LIVE check
 (recorded in ``eval.json``, continuously re-guarded by the engine's gated
 ``test_remote_eval_live.py``); PR CI never re-diffs two static artifacts here.
 
-If the emitted cache is absent the report-backed checks skip, but the committed
-golden metrics, once present, are always asserted.
+The cache is committed, so an absent artifact is a failure naming it.
 """
 
 from __future__ import annotations
 
-import pytest
-
 from jammi_cookbook import contracts
 
 _EVAL = contracts._dataset_dir("eval")
-_HAVE_CACHE = (_EVAL / "golden_metrics.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="eval cache not emitted")
 
 # The instance-minted keys the emit strips from the committed reports (their
 # presence is pinned by the engine's live _shape check, not the committed form).
@@ -47,7 +42,6 @@ def _report(name: str):
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_embeddings_aggregate_matches_golden():
     """The committed embeddings aggregate matches its frozen golden, every metric."""
     agg = _report("embeddings")["aggregate"]
@@ -55,7 +49,6 @@ def test_embeddings_aggregate_matches_golden():
         contracts.assert_close(f"eval.embeddings.{metric}", float(agg[metric]))
 
 
-@_needs_cache
 def test_classification_aggregate_matches_golden():
     """The committed classification aggregate (accuracy/f1) matches its golden."""
     agg = _report("inference_cls")["aggregate"]
@@ -64,7 +57,6 @@ def test_classification_aggregate_matches_golden():
     contracts.assert_close("eval.inference_cls.f1", float(agg["f1"]))
 
 
-@_needs_cache
 def test_ner_aggregate_matches_golden():
     """The committed NER aggregate (precision/recall/f1) matches its golden — the
     Python + remote NER eval coverage this chapter adds (the engine's own Python
@@ -81,7 +73,6 @@ def test_ner_aggregate_matches_golden():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_committed_reports_carry_expected_shape():
     """Each committed report carries the structural keys the chapter reads, with
     the instance-minted keys stripped from the committed form."""
@@ -108,7 +99,6 @@ def test_committed_reports_carry_expected_shape():
         assert report["per_record"], f"{task} must carry per-record predictions"
 
 
-@_needs_cache
 def test_per_query_sorted_by_id_byte_stable():
     """The committed per-query / embeddings per_query rows are sorted by id — the
     byte-stable normalisation the emit applies (engine output has no ORDER BY)."""
@@ -127,7 +117,6 @@ def test_per_query_sorted_by_id_byte_stable():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_compare_self_is_determinism_anchor():
     """The self-comparison is the determinism anchor: the baseline carries
     delta None, the treatment's every metric delta is exactly 0.0, and the
@@ -144,7 +133,6 @@ def test_compare_self_is_determinism_anchor():
     contracts.assert_close("eval.compare.self_significance_present", 1.0)
 
 
-@_needs_cache
 def test_compare_two_table_is_non_degenerate():
     """The two-table comparison is genuinely non-degenerate: the baseline carries
     delta None, the treatment carries a NON-ZERO recall delta and a present

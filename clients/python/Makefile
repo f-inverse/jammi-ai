@@ -1,4 +1,4 @@
-.PHONY: generate test clean
+.PHONY: generate test test-embedded test-live clean
 
 # The canonical jammi.v1 proto tree. `jammi-ai` is generated from the
 # SAME protos the Rust engine, npm client, and embed wheel speak — one source,
@@ -45,7 +45,16 @@ generate: clean
 	# Drop empty __init__.py files at every package level.
 	find $(OUT_DIR) -type d -exec touch {}/__init__.py \;
 
+# The native-free install: everything that needs neither the engine nor a server.
 test:
+	pytest tests/ -v -m "not embedded and not live_server"
+
+# With the [embedded] extra installed.
+test-embedded:
+	pytest tests/ -v -m "not live_server"
+
+# With the [embedded] extra and JAMMI_SERVER_BIN naming a built jammi-server.
+test-live:
 	pytest tests/ -v
 
 clean:

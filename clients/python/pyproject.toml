@@ -84,3 +84,10 @@ only-include = ["jammi"]
 
 [tool.hatch.build.targets.sdist]
 exclude = ["*"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers"
+markers = [
+    "embedded: needs the in-process engine (the [embedded] extra)",
+    "live_server: needs a built jammi-server named by JAMMI_SERVER_BIN",
+]

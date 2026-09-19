@@ -20,8 +20,7 @@ load-bearing facts:
   ``cascade='downstream'`` sweeps parent + child once; ``derives_from`` is one-hop
   ``result_digest`` lineage.
 
-If the emitted cache is absent the matrix-backed checks skip; the committed golden
-metrics, once present, are always asserted.
+The cache is committed, so an absent artifact is a failure naming it.
 """
 
 from __future__ import annotations
@@ -31,8 +30,6 @@ import pytest
 from jammi_cookbook import contracts
 
 _RECOMPUTE = contracts._dataset_dir("recompute")
-_HAVE_CACHE = (_RECOMPUTE / "golden_metrics.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="recompute cache not emitted")
 
 
 def _matrix() -> dict:
@@ -48,7 +45,6 @@ def _record() -> dict:
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_every_verdict_matches_golden():
     """Every committed matrix verdict matches its frozen golden — the golden the
     chapter renders against. A drift in any cell fails CI here."""
@@ -79,7 +75,6 @@ def test_every_verdict_matches_golden():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_exact_recomputation_is_reused_by_name_identity():
     """An exact prior materialisation is reused: ``build_neighbor_graph(k=3)`` under
     ``cache='use'`` returns the SAME table name as the ``cache='bypass'`` build, and
@@ -94,7 +89,6 @@ def test_exact_recomputation_is_reused_by_name_identity():
     assert names["prop_h1_a"] == names["prop_h1_b"]
 
 
-@_needs_cache
 def test_any_full_descriptor_change_recomputes():
     """The probe keys on the FULL producing descriptor, not just one knob: a
     different ``k``, a ``min_similarity``, or a different ``hops`` each yields a new
@@ -109,7 +103,6 @@ def test_any_full_descriptor_change_recomputes():
     assert names["prop_h2"] != names["prop_h1_a"]
 
 
-@_needs_cache
 def test_unpinned_producer_honestly_never_reuses():
     """``generate_embeddings`` is anchored on an ``UnpinnedAtInstant`` source (no
     version surface), so ``cache='use'`` twice returns two DIFFERENT names — the
@@ -124,7 +117,6 @@ def test_unpinned_producer_honestly_never_reuses():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_fresh_against_own_hash_stale_against_a_different_hash():
     """The ``definition_changed`` staleness arm: a table is ``fresh`` against its
     own recorded definition hash and ``stale`` against a different one, with reason
@@ -139,7 +131,6 @@ def test_fresh_against_own_hash_stale_against_a_different_hash():
     assert "recorded" in reason and "current" in reason
 
 
-@_needs_cache
 def test_result_digest_input_drift_arm_is_a_recorded_cut():
     """The sibling ``result_digest`` input-drift staleness arm is CUT — a written
     rationale, never a half-shipped fake demo. The record states the cut explicitly
@@ -157,7 +148,6 @@ def test_result_digest_input_drift_arm_is_a_recorded_cut():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_child_recompute_is_byte_identical():
     """``recompute(child, report_only)`` re-invokes the recorded producer over the
     inputs' current (unmoved) state and yields a byte-identical output: the
@@ -169,7 +159,6 @@ def test_child_recompute_is_byte_identical():
     assert rc["child_recompute_byte_identical"] is True
 
 
-@_needs_cache
 def test_report_only_reports_but_does_not_recompute_downstream():
     """``cascade='report_only'`` (the default) recomputes the NAMED table only and
     REPORTS the downstream-stale set (via ``derives_from_closure``); it recomputes
@@ -180,7 +169,6 @@ def test_report_only_reports_but_does_not_recompute_downstream():
     assert rc["downstream_stale_count"] == 1
 
 
-@_needs_cache
 def test_cascade_downstream_sweeps_parent_and_child_once():
     """``cascade='downstream'`` is ONE bounded topological sweep on ONE explicit
     request: the named parent then its transitive dependent (the child), in order,
@@ -189,7 +177,6 @@ def test_cascade_downstream_sweeps_parent_and_child_once():
     assert rc["cascade_recomputed_count"] == 2
 
 
-@_needs_cache
 def test_derives_from_is_one_hop_result_digest_lineage():
     """``derives_from(emb)`` returns the one-hop reverse-dependency edges — every
     ready table whose recorded input anchors name ``emb`` (the neighbor-graph + the
@@ -206,7 +193,6 @@ def test_derives_from_is_one_hop_result_digest_lineage():
 # --------------------------------------------------------------------------- #
 
 
-@_needs_cache
 def test_boundary_is_mechanism_not_the_loop():
     """The record states the SPEC-03 §7 boundary: the engine ships the bounded
     MECHANISM (one probe per call, one recompute per request, one bounded sweep);

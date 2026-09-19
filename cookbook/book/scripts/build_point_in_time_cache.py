@@ -71,10 +71,10 @@ import jammi
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+from jammi.testing import LiveServer
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
 from jammi_cookbook import contracts
-from jammi_cookbook.live_server import LiveServer
 
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "point_in_time"
 

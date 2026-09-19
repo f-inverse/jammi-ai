@@ -69,3 +69,19 @@ def test_load_artifact_missing_raises(monkeypatch, tmp_path):
     monkeypatch.setattr(contracts, "_ARTIFACT_ROOT", tmp_path)
     with pytest.raises(FileNotFoundError, match="not found"):
         contracts.load_artifact("arxiv.embeddings")
+
+
+def test_load_artifact_names_an_unpulled_lfs_pointer(monkeypatch, tmp_path):
+    """A checkout that has not run `git lfs pull` holds a pointer file where the
+    artifact should be; loading it names that, not a parquet decoding error."""
+    monkeypatch.setattr(contracts, "_ARTIFACT_ROOT", tmp_path)
+    art = contracts.artifact("arxiv.embeddings")
+    pointer = contracts._dataset_dir(art.dataset) / art.filename
+    pointer.parent.mkdir(parents=True)
+    pointer.write_bytes(
+        b"version https://git-lfs.github.com/spec/v1\n"
+        b"oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\n"
+        b"size 12345\n"
+    )
+    with pytest.raises(FileNotFoundError, match="git lfs pull"):
+        contracts.load_artifact("arxiv.embeddings")

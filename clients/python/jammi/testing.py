@@ -1,8 +1,9 @@
-"""A real ``jammi-server`` subprocess for the lanes that need a remote target.
+"""Helpers for testing code that talks to a Jammi engine.
 
-One implementation, shared by the cache-emit scripts and the chapters that talk
-to a live server, so every one of them gets the same port handling, readiness
-handshake and teardown.
+:class:`LiveServer` runs a real ``jammi-server`` subprocess for the duration of
+a ``with`` block — for a test suite, a notebook, or a script that needs a
+``grpc://`` target and has a server binary to hand (the ``jammi-server`` wheel
+puts one on ``PATH``).
 """
 
 from __future__ import annotations
@@ -13,8 +14,9 @@ import shutil
 import subprocess
 import threading
 import time
+from typing import Mapping
 
-import jammi
+from . import connect
 
 
 class LiveServer:
@@ -24,18 +26,22 @@ class LiveServer:
     BANNER = "jammi-server listening "
 
     def __init__(
-        self, artifact_dir: str, *, run_worker: bool = True, server_bin: str | None = None
+        self,
+        artifact_dir: "str | os.PathLike[str]",
+        *,
+        server_bin: "str | None" = None,
+        env: "Mapping[str, str] | None" = None,
     ) -> None:
         # The binary to run; by default the `jammi-server` on PATH.
         self._server_bin = server_bin
-        # The artifact directory is a PARAMETER, not something this harness
-        # invents: the two servers below open the SAME directory in sequence,
-        # which is what makes the job queue observably outlive a process.
-        self._artifact_dir = artifact_dir
-        # `[worker] enabled` — configuration, not a code path. `False`
-        # still mounts and serves the training surface (submissions are
-        # accepted); it only declines to run the claim loop.
-        self._run_worker = run_worker
+        # Deployment knobs for this server, read by its configuration loader
+        # exactly as an operator's environment would be (for example
+        # `JAMMI_WORKER__ENABLED=false`). Applied over the harness's own keys.
+        self._env = dict(env or {})
+        # The artifact directory is the caller's: two servers can open the same
+        # directory in sequence, and a catalog an embedded session seeded and
+        # released can be served as it stands.
+        self._artifact_dir = os.fspath(artifact_dir)
         # Set by `__exit__` from the awaited child exit; `None` while running.
         self.returncode = None
 
@@ -43,18 +49,17 @@ class LiveServer:
         server_bin = self._server_bin or shutil.which("jammi-server")
         if not server_bin:
             raise RuntimeError(
-                "jammi-server is not on PATH and no server_bin was given — a live-server "
-                "lane needs a real server binary (the render harness builds one and places "
-                "it on PATH; see cookbook-render.yml)"
+                "jammi-server is not on PATH and no server_bin was given — install the "
+                "`jammi-server` wheel or pass the path of a built binary"
             )
         env = dict(os.environ)
         env["JAMMI_ARTIFACT_DIR"] = self._artifact_dir
-        env["JAMMI_WORKER__ENABLED"] = "true" if self._run_worker else "false"
         # `:0` on BOTH listeners — the child binds, the kernel assigns, nothing
         # here ever holds-and-releases a port number.
         env["JAMMI_SERVER__FLIGHT_LISTEN"] = "127.0.0.1:0"
         env["JAMMI_SERVER__HEALTH_LISTEN"] = "127.0.0.1:0"
         env["JAMMI_SERVER__SERVICES"] = "all"
+        env.update(self._env)
         self.proc = subprocess.Popen(
             [server_bin],
             env=env,
@@ -96,7 +101,7 @@ class LiveServer:
             if self.proc.poll() is not None:
                 raise RuntimeError(f"jammi-server exited early:\n{''.join(self._log)}")
             try:
-                with jammi.connect(self.endpoint) as handshake:
+                with connect(self.endpoint) as handshake:
                     handshake.get_server_info()
                 return self
             except Exception:

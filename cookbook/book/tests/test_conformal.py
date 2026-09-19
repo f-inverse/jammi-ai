@@ -24,16 +24,11 @@ the complement of the keystone's ≈ −0.12.
 
 from __future__ import annotations
 
-import pytest
-
 from jammi_cookbook import contracts
 
 _ARXIV = contracts._dataset_dir("arxiv")
-_HAVE_CACHE = (_ARXIV / "golden_metrics.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="keystone cache not emitted")
 
 
-@_needs_cache
 def test_classification_scores_under_cover_and_aps_is_sharper():
     """LAC / APS / RAPS all under-cover; APS gives the sharper sets on this cache.
 
@@ -55,7 +50,6 @@ def test_classification_scores_under_cover_and_aps_is_sharper():
     assert lac > aps, "LAC reaches higher realised coverage (more conservative threshold)"
 
 
-@_needs_cache
 def test_raps_reduces_to_aps_on_this_cache():
     """The honest measured equality: RAPS == APS here (the rank-penalty does not bite)."""
     assert (
@@ -68,7 +62,6 @@ def test_raps_reduces_to_aps_on_this_cache():
     )
 
 
-@_needs_cache
 def test_regression_intervals_under_cover_and_cqr_is_wider():
     """Abs-residual and CQR both under-cover; CQR is wider and recovers more coverage."""
     nominal = contracts.golden("arxiv.conformal.nominal_coverage").value
@@ -81,7 +74,6 @@ def test_regression_intervals_under_cover_and_cqr_is_wider():
     assert cqr_cov > iv_cov, "the wider CQR band recovers a little more coverage"
 
 
-@_needs_cache
 def test_score_aligned_shift_genuinely_restores_coverage():
     """The keystone's complement: on a SCORE-ALIGNED shift, weighting RESTORES coverage.
 
@@ -109,7 +101,6 @@ def test_score_aligned_shift_genuinely_restores_coverage():
     )
 
 
-@_needs_cache
 def test_synthetic_shift_record_matches_contract():
     """The committed synthetic-shift record loads and carries the labelled construction."""
     record = contracts.load_artifact("arxiv.conformal_synthetic_shift")

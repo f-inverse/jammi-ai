@@ -10,8 +10,7 @@ assert the two K-rails properties the chapters demonstrate:
   (its declared-citation-edge context set) from the committed cache, and
   ``rails.provenance`` extracts the audit trail.
 
-If the emitted cache is absent the heavy artifacts are skipped; the golden
-metrics, once committed, are always asserted.
+The cache is committed, so an absent artifact is a failure naming it.
 """
 
 from __future__ import annotations
@@ -24,13 +23,8 @@ import pytest
 from jammi_cookbook import contracts, rails
 
 _ARXIV = contracts._dataset_dir("arxiv")
-_HAVE_CACHE = (_ARXIV / "golden_metrics.json").exists()
-_needs_cache = pytest.mark.skipif(not _HAVE_CACHE, reason="keystone cache not emitted")
 
-_ALPHA = (
-    round(1 - contracts.golden("arxiv.tier04.nominal_coverage").value, 4)
-    if _HAVE_CACHE else 0.1
-)
+_ALPHA = round(1 - contracts.golden("arxiv.tier04.nominal_coverage").value, 4)
 
 
 @pytest.fixture
@@ -45,7 +39,6 @@ def db(embedded):
     return embedded
 
 
-@_needs_cache
 def test_recall_chain_reads_in_order():
     """The construct→propagate→learn recall chain is the frozen 0.538 → 0.556 → 0.594."""
     base = contracts.golden("arxiv.tier01.recall_at_10").value
@@ -59,7 +52,6 @@ def test_recall_chain_reads_in_order():
                         # three graphs tried — declared > similarity > random)
 
 
-@_needs_cache
 def test_marginal_classification_conformal_recomputes_to_golden(db):
     """Live engine APS marginal coverage matches the frozen 0.867 — under-covers."""
     preds = contracts.load_artifact("arxiv.tier04_predictions").to_pylist()
@@ -73,7 +65,6 @@ def test_marginal_classification_conformal_recomputes_to_golden(db):
     assert cov < 1 - _ALPHA  # under-coverage — the honest lesson
 
 
-@_needs_cache
 def test_regression_interval_conformal_recomputes_to_golden(db):
     """Live conformalize_interval coverage matches the frozen golden — under-covers."""
     reg = contracts.load_artifact("arxiv.tier04_regression").to_pylist()
@@ -88,7 +79,6 @@ def test_regression_interval_conformal_recomputes_to_golden(db):
     assert cov < 1 - _ALPHA
 
 
-@_needs_cache
 def test_weighting_restores_neither_crux():
     """Regression weighting is an exact no-op; no classification scheme reaches nominal."""
     reg_w = contracts.load_artifact("arxiv.tier04_regression_weighting")
@@ -103,7 +93,6 @@ def test_weighting_restores_neither_crux():
     assert min(deltas.values()) < 0  # movements not systematically toward nominal
 
 
-@_needs_cache
 def test_provenance_reconstructs_informing_rows_from_cache():
     """A tier-04 prediction's exact informing rows come from the committed cite graph.
 

@@ -1100,6 +1100,11 @@ def assert_close(metric: str, observed: float) -> float:
     return observed
 
 
+# The first bytes of a Git LFS pointer file — what a checkout holds in place of
+# an LFS-tracked artifact until `git lfs pull` fetches it.
+_LFS_POINTER_MAGIC = b"version https://git-lfs.github.com/spec/"
+
+
 def load_artifact(name: str):
     """Load a committed artifact by registered name (never recomputes).
 
@@ -1114,6 +1119,12 @@ def load_artifact(name: str):
             f"artifact '{name}' not found at {path}. It is produced by {art.produced_by} "
             f"in the keystone slice; chapters load it and never recompute it."
         )
+    with path.open("rb") as handle:
+        if handle.read(len(_LFS_POINTER_MAGIC)) == _LFS_POINTER_MAGIC:
+            raise FileNotFoundError(
+                f"artifact '{name}' at {path} is a Git LFS pointer, not the artifact — "
+                "run `git lfs pull` in this checkout."
+            )
     if art.kind in ("parquet", "edge_table"):
         import pyarrow.parquet as pq
 

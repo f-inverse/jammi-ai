@@ -74,7 +74,7 @@ jobs:
         run: |
           . "$GITHUB_WORKSPACE/.venv/bin/activate"
           export PATH="$GITHUB_WORKSPACE/target/release:$PATH"
-          quarto render
+          python -m jammi.session_journal -- quarto render
 
       - name: Cache the rendered book for the Pages deploy
         # The executed render only happens here (nightly / on demand). The Docs

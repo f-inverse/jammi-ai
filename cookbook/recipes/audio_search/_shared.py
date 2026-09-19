@@ -35,18 +35,14 @@ GOLDEN_PARQUET = WORKDIR / "golden.parquet"
 
 
 def ensure_source(db, name: str, url: str, fmt: str = "parquet") -> None:
-    """Register a source, tolerating a prior registration.
+    """Register a source unless an earlier step already did.
 
     The numbered scripts each connect to the same persistent artifact dir, so
-    a source registered by an earlier step is still in the catalog. Re-adding
-    it raises "already registered" — which is fine here, the URL is identical.
+    a source registered by an earlier step is still in the catalog.
     `example.py` uses a fresh temp dir per run and does not need this.
     """
-    try:
+    if db.describe_source(name) is None:
         db.add_source(name, url=url, format=fmt)
-    except RuntimeError as err:
-        if "already registered" not in str(err):
-            raise
 
 
 def load_corpus_table() -> pa.Table:

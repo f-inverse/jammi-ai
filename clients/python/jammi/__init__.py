@@ -28,7 +28,14 @@ from ._backend import Backend, JobHandle, Session
 from ._capability import Capability
 from ._credentials import BearerCredentials, ChannelCredentials
 from ._database import RemoteDatabase, RemoteJob
-from ._sessions import observe, open_session_labels, open_sessions
+from ._session_journal import activate_from_env as _activate_session_journal
+from ._sessions import (
+    SessionWindow,
+    describe_sessions,
+    observe,
+    open_session_labels,
+    open_sessions,
+)
 # `_embedded` is native-free at import (it imports `jammi_native` lazily, inside
 # `_open_embedded`), so naming `EmbeddedBackend` here keeps `import jammi`
 # native-free — the client-import guard the positive conformance test pins.
@@ -47,11 +54,16 @@ from .errors import (
 
 __version__ = version("jammi-ai")
 
+# Before any session can exist: a process journals every session it opens or none.
+_activate_session_journal()
+
 __all__ = [
     "connect",
     "open_sessions",
     "open_session_labels",
     "observe",
+    "SessionWindow",
+    "describe_sessions",
     # Protocols — the transport-agnostic surface a caller writes against.
     "Session",
     "Backend",

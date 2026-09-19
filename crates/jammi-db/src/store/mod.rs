@@ -5310,16 +5310,9 @@ async fn build_result_table_provider(
 ) -> Result<Arc<dyn TableProvider>> {
     use datafusion::datasource::file_format::options::ParquetReadOptions;
 
-    // Make sure the engine's driver for this URL is the same one DataFusion
-    // sees — important for cloud schemes where DataFusion's default
-    // registry would otherwise build a credential-less duplicate.
-    let driver = registry.driver_for(url, None)?;
-    if !matches!(url.scheme(), Scheme::File | Scheme::Memory) {
-        let parsed = ::url::Url::parse(url.as_str()).map_err(|e| {
-            JammiError::Config(format!("Storage URL '{url}' did not re-parse: {e}"))
-        })?;
-        ctx.runtime_env().register_object_store(&parsed, driver);
-    }
+    // The engine's driver for this URL is the one DataFusion scans through —
+    // DataFusion's own would be a credential-less duplicate on a cloud scheme.
+    crate::storage::read_view::register_read_view(ctx, url, registry.driver_for(url, None)?)?;
 
     let config = ctx.copied_config();
     let mut listing_options =

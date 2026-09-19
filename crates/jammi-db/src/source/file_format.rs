@@ -120,7 +120,7 @@ pub async fn create_listing_table(
     }
 
     let driver = registry.driver_for(url, cloud)?;
-    register_driver_for_url(ctx, url, Arc::clone(&driver))?;
+    crate::storage::read_view::register_read_view(ctx, url, Arc::clone(&driver))?;
 
     let table_url = ListingTableUrl::parse(url.as_str())?;
 
@@ -200,29 +200,4 @@ pub async fn create_listing_table(
         .with_schema(schema);
     let table = ListingTable::try_new(config)?;
     Ok((Arc::new(table), resolved_for_persistence))
-}
-
-/// Register the driver we built ourselves with DataFusion's runtime so its
-/// `ListingTableUrl` resolves the same backend on every read.
-///
-/// `file://` is already known by DataFusion's own
-/// `DefaultObjectStoreRegistry` default (it pre-registers exactly that one
-/// scheme, nothing else); `memory://` is NOT, but is skipped here anyway —
-/// it is a test-only scheme (see [`crate::storage::Scheme::Memory`]) that no
-/// `File`-source registration path is driven through in practice.
-/// Only cloud schemes need the explicit registration below.
-fn register_driver_for_url(
-    ctx: &SessionContext,
-    url: &StorageUrl,
-    driver: Arc<dyn object_store::ObjectStore>,
-) -> Result<()> {
-    use crate::storage::Scheme;
-    match url.scheme() {
-        Scheme::File | Scheme::Memory => return Ok(()),
-        _ => {}
-    }
-    let parsed = ::url::Url::parse(url.as_str())
-        .map_err(|e| JammiError::Config(format!("Storage URL '{url}' did not re-parse: {e}")))?;
-    ctx.runtime_env().register_object_store(&parsed, driver);
-    Ok(())
 }

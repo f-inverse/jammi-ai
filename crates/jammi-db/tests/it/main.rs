@@ -47,6 +47,7 @@ mod read_vectors;
 mod reconcile;
 mod recovery;
 mod register_computed_embedding;
+mod registry_read_only;
 #[cfg(feature = "test-hooks")]
 mod rendezvous_ring;
 mod result_tables;

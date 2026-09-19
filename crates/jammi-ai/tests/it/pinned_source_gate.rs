@@ -3732,17 +3732,6 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
                    catalog at reload time is a deliberate refresh of that source's own tables.",
     },
     ReviewedRegistrationSite {
-        file: "crates/jammi-db/src/source/file_format.rs",
-        function: "register_driver_for_url",
-        ordinal: 1,
-        allowed: 1,
-        property: "register_object_store(..) keyed by the URL's own scheme+authority, with the \
-                   driver resolved through `StorageRegistry::driver_for`'s per-(scheme,root) \
-                   cache -- the identical idempotent-rebind shape reviewed for \
-                   `store/mod.rs::build_result_table_provider` below, executed by \
-                   `store::tests::register_object_store_twice_for_one_url_rebinds_the_same_driver_and_errors_on_neither`.",
-    },
-    ReviewedRegistrationSite {
         file: "crates/jammi-db/src/store/mod.rs",
         function: "bind_result_table",
         ordinal: 1,
@@ -3754,22 +3743,6 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
                    over that call's own already-written, immutable Parquet bytes -- every call for \
                    the same `table_name` rebinds the identical artifact. EXECUTED oracle: \
                    `crates/jammi-db/tests/it/materialization.rs::two_runs_over_one_pinned_definition_share_one_training_set`.",
-    },
-    ReviewedRegistrationSite {
-        file: "crates/jammi-db/src/store/mod.rs",
-        function: "build_result_table_provider",
-        ordinal: 1,
-        allowed: 1,
-        property: "for a non-file/-memory URL, calls `ctx.runtime_env().register_object_store(&parsed, driver)` \
-                   keyed by the URL's own scheme+authority, where `driver` is \
-                   `StorageRegistry::driver_for`'s CACHED value for that key -- two calls for one \
-                   URL rebind the identical driver, and DataFusion's own `register_object_store` \
-                   signature (`Option<Arc<dyn ObjectStore>>`, no `Result`) cannot error on either \
-                   call. EXECUTED oracle (NEW): \
-                   `crates/jammi-db/src/store/mod.rs::tests::register_object_store_twice_for_one_url_rebinds_the_same_driver_and_errors_on_neither` \
-                   -- pins the exact primitive this function calls; the function's own cloud-scheme \
-                   branch cannot be driven end-to-end in this crate's default test build, disclosed \
-                   in that test's own doc.",
     },
     ReviewedRegistrationSite {
         file: "crates/jammi-db/src/store/mod.rs",
@@ -4951,15 +4924,6 @@ const FINE_TUNE_REACHABLE_SITES: &[ReviewedRegistrationSite] = &[
                    reachable via the same session-construction path as `build` above.",
     },
     ReviewedRegistrationSite {
-        file: "crates/jammi-db/src/source/file_format.rs",
-        function: "register_driver_for_url",
-        ordinal: 1,
-        allowed: 1,
-        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: register_object_store( \
-                   ..) keyed by the URL's own scheme+authority, idempotent-rebind shape, executed \
-                   by `register_object_store_twice_for_one_url_rebinds_the_same_driver_and_errors_on_neither`.",
-    },
-    ReviewedRegistrationSite {
         file: "crates/jammi-db/src/store/mod.rs",
         function: "bind_result_table",
         ordinal: 1,
@@ -4970,15 +4934,6 @@ const FINE_TUNE_REACHABLE_SITES: &[ReviewedRegistrationSite] = &[
                    calls into directly, so this one is a GENUINE reachable path, not merely a name \
                    collision. EXECUTED oracle: \
                    materialization.rs::two_runs_over_one_pinned_definition_share_one_training_set.",
-    },
-    ReviewedRegistrationSite {
-        file: "crates/jammi-db/src/store/mod.rs",
-        function: "build_result_table_provider",
-        ordinal: 1,
-        allowed: 1,
-        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: idempotent-rebind of \
-                   the cached driver for a URL's scheme+authority -- reachable via the same \
-                   materialization path as bind_result_table, a genuine reachable site.",
     },
     ReviewedRegistrationSite {
         file: "crates/jammi-db/src/store/mod.rs",

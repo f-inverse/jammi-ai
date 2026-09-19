@@ -66,6 +66,7 @@ pub mod config;
 pub mod error;
 pub mod index_cache;
 pub mod object_store_handle;
+pub mod read_view;
 pub mod reader;
 pub mod registry;
 pub mod sidecar_layout;
@@ -85,6 +86,7 @@ pub use builder::{location_determinants, location_determinants_with, BuilderSeed
 pub use config::{AzureConfig, CloudConfig, GcsConfig, R2Config, S3Config};
 pub use error::StorageError;
 pub use object_store_handle::{DeleteOutcome, JammiObjectStore, ObjectMeta};
+pub use read_view::ReadView;
 pub use registry::StorageRegistry;
 pub use url::{Scheme, StorageUrl};
 pub use writer::ObjectParquetWriter;

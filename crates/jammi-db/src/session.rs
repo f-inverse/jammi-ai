@@ -247,6 +247,10 @@ impl JammiSession {
             .build();
 
         let ctx = SessionContext::new_with_state(federated_state);
+        // Every store a scan resolves is a read-only view, the pre-registered
+        // `file://` one included: the registry is reachable from every plan
+        // node, so it never holds a handle that can mutate a managed root.
+        crate::storage::read_view::register_local_read_view(&ctx)?;
 
         // Construct the mutable-table registry backed by the same backend
         // the catalog runs on.

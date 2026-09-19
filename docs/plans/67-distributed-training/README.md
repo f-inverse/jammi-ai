@@ -49,8 +49,9 @@ Declared non-goals (`DESIGN.md` §8): sharded model or optimizer state; elastic 
 
 Blocked on upstream releases and tracked in one place
 ([#613](https://github.com/f-inverse/jammi-ai/issues/613)): moving the workspace to the
-DataFusion 55 line; distributed SQL through `datafusion-distributed`; an accelerator dimension
-in Ballista's executor specification (device inventory is carried in
-`compute_executors.devices` until then). `jammi-ballista` is not offered upstream beyond that
-one contribution. Two unrelated backlog items are parked, not pending: Metal/f16 acceleration
-(#445) and a Kafka-protocol trigger broker (#478).
+DataFusion 55 line, and distributed SQL through `datafusion-distributed`. Ballista's executor
+specification has no accelerator dimension; `jammi-ballista` carries device inventory in the
+engine's own catalog (`compute_executors.devices`) and places device-bound tasks with its own
+distribution policy — an extension at the seam Ballista exposes, the way `jammi-kernels`
+extends candle, never a fork or an upstream request. Two unrelated backlog items are parked,
+not pending: Metal/f16 acceleration (#445) and a Kafka-protocol trigger broker (#478).

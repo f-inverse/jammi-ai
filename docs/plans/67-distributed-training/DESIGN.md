@@ -773,8 +773,9 @@ placement options only.
 Sharded model or optimizer state (FSDP-like); elastic gangs; SGD or gradient exchange as
 DataFusion operators or aggregates; `ContextPredictor` on a gang; hard-negative mining and
 GradCache at `world_size > 1` (typed refusal); a sixth pluggable backend; an engine-level GPU
-byte-equality guarantee (§6 states what is measured); Ballista's accelerator resource dimension
-(§9 — an upstream change, not something this repo forks for); upstreaming `jammi-ballista` itself.
+byte-equality guarantee (§6 states what is measured); changing Ballista itself — an accelerator
+resource dimension in its executor specification is carried by the engine's own catalog and
+placement policy (§9), never by a fork or an upstream request.
 
 ## 9. The Ballista extension
 
@@ -877,8 +878,7 @@ The runner is reached through a process-global installed once per process rather
 `TaskContext` extension, because an extension set on the submitting session's config never crosses
 the wire to the executor's reconstructed one. Modelling gang ranks as Ballista tasks with
 all-or-nothing binding was rejected: it would be a second gang mechanism with its own parity
-obligation. A gang stage kind in Ballista stays a possible upstream contribution, not a
-dependency. The executed cases are in `crates/jammi-ai/tests/it/gang_placed.rs`.
+obligation, and it would need a stage kind Ballista does not have. The executed cases are in `crates/jammi-ai/tests/it/gang_placed.rs`.
 
 **Device pinning does not move bytes.** The executor process runs on its configured
 `[gpu] devices`; device kind is already in `MaterializationEnv`; the ordinal is not
@@ -896,8 +896,8 @@ retries off and the re-launch guard in place, never makes consumer work runnable
 
 **Spice's fork, for comparison.** Multi-active HA via object-store state, object-store shuffle,
 mTLS, bidirectional control streams, catalog/UDF sync, their own shuffle format; one binary with
-`--role scheduler`; batch only; no GPU; upstreaming planned, none landed. Jammi keeps HA state at
-the `ClusterState` seam on the catalog and forks nothing.
+`--role scheduler`; batch only; no GPU. Jammi keeps HA state at the `ClusterState` seam on the
+catalog and forks nothing.
 
 ## 10. Hardware proof legs
 

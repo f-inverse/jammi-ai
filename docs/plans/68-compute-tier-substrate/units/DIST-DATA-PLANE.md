@@ -60,11 +60,11 @@ operators across the scheduler/executor boundary (`codec::JammiCodec`), adapts p
 hosts both roles from `[ballista]` configuration, and is what a placed training gang runs on. The
 workspace pins `ballista-core`/`-scheduler`/`-executor` `54.1` beside `datafusion = "54.1"`
 (`Cargo.toml::[workspace.dependencies]`), and their transitive `arrow-flight`, `datafusion-proto`,
-`object_store`, `prost` and `tonic` lines match the workspace's. The conditions under which Ballista
-would be admissible for a data plane, all upstream: (1) an accelerator resource dimension with
-affinity placement — open; (2) pluggable cluster state — met by the public traits above; (3) an
-object-store shuffle — open, with the `ExecutionEngine` rewrite as the seam a spike would prove. A
-fork is never an option.
+`object_store`, `prost` and `tonic` lines match the workspace's. What Ballista would need to be a
+data plane: (1) accelerator-aware placement — carried by jammi's own `DistributionPolicy` over the
+catalog's device inventory; (2) pluggable cluster state — met by the public traits above; (3) an
+object-store shuffle — not built, with the `ExecutionEngine` rewrite as the seam it would use.
+Each is an extension at a seam Ballista exposes; a fork or an upstream request is never an option.
 
 **D3 — Beyond-one-node ONLINE retrieval is S4: in-house scatter-gather over the existing gRPC
 tower, on a separate internal listener.** Principle: topology is configuration; "the library is
@@ -683,7 +683,7 @@ Postgres it would add `BEGIN`, two `SET TRANSACTION` statements and `COMMIT` aro
 ## 8. Not part of this design
 
 Sharded embedding jobs with a fan-in publish (D1); S3 adoption and any DataFusion upgrade for its
-sake (§9); the Ballista upstream contributions (D2); multi-node placement of a refreshed, versioned
+sake (§9); an object-store shuffle for Ballista (D2); multi-node placement of a refreshed, versioned
 table (§5.2); capability-scoped ring membership (§5.8); compaction, re-quantization and an mmap
 `view()` of a segment; an owner-side resident segment set across RPCs; retrieval-heavy SQL and graph
 builds beyond one node; eval beyond one node (force-local by D10); the multi-seed recall bench that

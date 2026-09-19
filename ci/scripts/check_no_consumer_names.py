@@ -75,7 +75,8 @@ allowlist's own rule-1 rot check both resolve against the REAL
 `symbol-index` tool (`cargo run --release -p symbol-index`, a `syn` AST
 parse) rather than a regex reader — a cold build pays once, cached the same
 way every other cargo-invoking gate/agent in this repo caches (sccache /
-CI cache).
+CI cache). A host without `cargo`, or a checkout in which no base ref
+resolves, fails naming what it lacks (`MissingHostResource`).
 """
 
 from __future__ import annotations
@@ -83,6 +84,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -92,6 +94,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 SYMBOL_INDEX_CRATE = "symbol-index"
+
+
+class MissingHostResource(RuntimeError):
+    """The host lacks something this gate reads. The gate fails naming it:
+    a check it cannot run is never a check that passed."""
 
 
 def build_symbol_index(roots: list[str], cwd: Path = REPO_ROOT) -> dict:
@@ -105,6 +112,12 @@ def build_symbol_index(roots: list[str], cwd: Path = REPO_ROOT) -> dict:
     overrides `CARGO_TARGET_DIR`/`RUSTC_WRAPPER` — the caller's own
     environment (if any) is inherited unchanged.
     """
+    if shutil.which("cargo") is None:
+        raise MissingHostResource(
+            f"cargo is not on PATH: the {SYMBOL_INDEX_CRATE} tool cannot be built, so no "
+            "public identifier can be resolved — run where the toolchain is (the CI image, "
+            "through ci/dev.sh)"
+        )
     proc = subprocess.run(
         ["cargo", "run", "--release", "-p", SYMBOL_INDEX_CRATE, "--", *roots],
         cwd=cwd,
@@ -322,25 +335,27 @@ def _census_governance_findings(index: dict, nouns: dict[str, str] | None) -> se
         GOVERNANCE_NOUNS = real_nouns
 
 
-def resolve_diff_base() -> str | None:
-    """Resolve a git ref to diff against, or None if none is available."""
+def resolve_diff_base(cwd: Path = REPO_ROOT) -> str:
+    """The first git ref of the base-branch candidates that resolves in the
+    checkout at `cwd`; a checkout where none does has no diff to examine."""
     candidates = [
-        f"origin/{os.environ['GITHUB_BASE_REF']}" if os.environ.get("GITHUB_BASE_REF") else None,
+        *([f"origin/{os.environ['GITHUB_BASE_REF']}"] if os.environ.get("GITHUB_BASE_REF") else []),
         "origin/main",
         "main",
     ]
     for ref in candidates:
-        if not ref:
-            continue
         result = subprocess.run(
             ["git", "rev-parse", "--verify", "--quiet", ref],
-            cwd=REPO_ROOT,
+            cwd=cwd,
             capture_output=True,
             text=True,
         )
         if result.returncode == 0 and result.stdout.strip():
             return ref
-    return None
+    raise MissingHostResource(
+        f"no diff base: none of {candidates} resolves, so the diff-scoped governance-verb "
+        "tripwire has nothing to examine — fetch the base branch"
+    )
 
 
 _HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
@@ -633,17 +648,7 @@ def check_governance_tripwire(rows: list[AllowlistRow]) -> tuple[list[str], list
     never this diff-scoped function, which only ever sees whatever the
     CURRENT diff happens to add.
     """
-    base = resolve_diff_base()
-    if base is None:
-        print(
-            "no-consumer-names: no diff base available "
-            "(origin/<base> / origin/main / main) — "
-            "skipping the diff-scoped governance-verb tripwire.",
-            file=sys.stderr,
-        )
-        return [], []
-
-    added = added_crate_lines_with_paths(base)
+    added = added_crate_lines_with_paths(resolve_diff_base())
     added_lines_by_file: dict[str, set[int]] = {}
     for file_path, line_no, _text in added:
         added_lines_by_file.setdefault(file_path, set()).add(line_no)
@@ -893,12 +898,7 @@ def self_test() -> int:
     # parse of `crates`, never the diff-scoped tripwire (`check_
     # governance_tripwire` examines only pub items on the diff's OWN added
     # lines, so it cannot see whether the noun table would newly flag
-    # something ALREADY in the tree). This self-test runs ONLY in ci.yml's
-    # container-backed `symbol-index-gates` job (a toolchain is always
-    # present there), so an index
-    # build failure here is a genuine environment problem, not a
-    # graceful-skip arm like this file's own missing-cargo advisory arm
-    # elsewhere.
+    # something ALREADY in the tree).
     census_index = build_symbol_index(["crates"])
     pub_items = [it for it in census_index["items"] if it["vis"].startswith("pub")]
     check(
@@ -940,6 +940,24 @@ def self_test() -> int:
         and any(rel.startswith(".github/workflows/") for rel in tracked),
         sorted(tracked)[:5],
     )
+
+    # A host that cannot run a leg fails naming what it lacks: no toolchain,
+    # and a checkout in which no base ref resolves.
+    with tempfile.TemporaryDirectory() as empty:
+        path, os.environ["PATH"] = os.environ["PATH"], empty
+        try:
+            build_symbol_index(["crates"])
+            check("missing cargo: the index build is refused", False)
+        except MissingHostResource as err:
+            check("missing cargo: the refusal names cargo", "cargo is not on PATH" in str(err), err)
+        finally:
+            os.environ["PATH"] = path
+        subprocess.run(["git", "init", "--quiet", empty], check=True)
+        try:
+            base = resolve_diff_base(cwd=Path(empty))
+            check("no diff base: the tripwire is refused", False, base)
+        except MissingHostResource as err:
+            check("no diff base: the refusal names the refs tried", "origin/main" in str(err), err)
 
     if failures:
         print("no-consumer-names self-test: FAIL", file=sys.stderr)
@@ -995,4 +1013,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except MissingHostResource as err:
+        print(f"no-consumer-names: {err}", file=sys.stderr)
+        sys.exit(1)

@@ -114,6 +114,7 @@ jobs:
       # and runs exactly those as an unprivileged account. Each must report one
       # passed test: a filter that matches nothing exits 0 having run nothing.
       - name: Permission-fault tests (unprivileged account)
+        shell: bash
         run: |
           set -euo pipefail
           id jammi-probe >/dev/null 2>&1 || useradd --no-create-home --shell /usr/sbin/nologin jammi-probe

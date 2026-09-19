@@ -26,16 +26,14 @@
 //! item index does for a bare-hint citation). Trait-body method
 //! SIGNATURES (never given a body in the trait itself) are NOT separately
 //! indexed as `Trait::method` — this repo's plan-doc citations name a
-//! concrete `impl`'s own method, never a trait interface declaration; a
-//! checked scope limit, not an unverified assumption (grepped
-//! `docs/plans/**` for a `TraitName::` citation form at the time this
-//! tool was written: none).
+//! concrete `impl`'s own method, never a trait interface declaration
+//! (`docs/plans/**` carries no `TraitName::` citation form).
 //!
 //! `is_test`/`in_test` (on `fn` items and call sites respectively): a
 //! `#[test]`/`#[tokio::test]`/… -attributed fn, or ANY item/call lexically
 //! inside a `#[cfg(test)] mod { … }` block, is marked — the same
-//! "non-test" boundary issue #557 item 2 needs to exclude test-only call
-//! sites from the required-attack-site set.
+//! "non-test" boundary a consumer uses to exclude test-only call sites from
+//! the required-attack-site set.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

@@ -288,15 +288,28 @@ class GpuLiveServer:
             if self.proc.poll() is not None:
                 out = self.proc.stdout.read().decode(errors="replace") if self.proc.stdout else ""
                 raise RuntimeError(f"jammi-server exited early:\n{out}")
+            # F1: while the server is still coming up, `get_server_info()`
+            # routinely raises (connection refused / not yet serving) and
+            # this loop retries for up to 120s -- every one of those retries
+            # opened a `probe` session that the old code only closed on the
+            # SUCCESS arm, leaking one registered session per failed retry
+            # (no `__del__` exists on the client's Session classes, and
+            # `RemoteDatabase.__init__` performs no RPC, so this is the
+            # TYPICAL bring-up path, not a rare corner). `probe` is seeded to
+            # `None` so `finally` is safe even if `jammi.connect` itself is
+            # what raised.
+            probe = None
             try:
                 probe = jammi.connect(self.endpoint)
                 probe.get_server_info()
-                probe.close()
                 self.pid = self.proc.pid
                 self.start_time = launch_time
                 return self.endpoint
             except Exception:
                 time.sleep(0.5)
+            finally:
+                if probe is not None:
+                    probe.close()
         self.proc.terminate()
         raise RuntimeError("jammi-server did not become ready within 120s")
 
@@ -505,34 +518,45 @@ def measure_tower(
         flush=True,
     )
     db2 = jammi.connect(restart["endpoint"])
-    described = db2.describe_model(tuned_model)
-    if described is None or described.get("task") != task:
-        raise RuntimeError(f"{label}: round-trip describe_model mismatch: {described}")
-    roundtrip_probe = _probe_source(db2, f"{source_prefix}_roundtrip_probe", column, dtype,
-                                     probe_value)
-    tuned_vec_roundtrip = _infer_vector(db2, roundtrip_probe, tuned_model, column, task)
-    roundtrip_diff = _max_abs_diff(canonical["tuned_vec"], tuned_vec_roundtrip)
-    print(f"  [{label}] round-trip (new process) max|Δ| vs first tuned read = "
-          f"{roundtrip_diff:.6f}", flush=True)
-    if roundtrip_diff >= ROUND_TRIP_CEILING:
-        # A real engine bug, not a noisy measurement to record and move past:
-        # refuse to emit a cache around a broken round trip rather than
-        # silently committing a golden that would make this pass. Compare
-        # against the base model's own read to name the failure precisely —
-        # a diff this large, equal to the change-vs-base signal, means the
-        # fresh process served the BASE model under the tuned model's id.
-        base_vec_after_restart = _infer_vector(db2, roundtrip_probe, base_model, column, task)
-        vs_base = _max_abs_diff(tuned_vec_roundtrip, base_vec_after_restart)
-        raise RuntimeError(
-            f"{label}: ROUND TRIP FAILED — a fresh jammi-server process (pid "
-            f"{restart['after']['pid']}, same --artifact-dir) served model_id="
-            f"{tuned_model!r} at max|Δ|={roundtrip_diff:.6f} from the pre-restart "
-            f"tuned read (ceiling {ROUND_TRIP_CEILING:g}); its distance from the "
-            f"BASE model's own read in this SAME fresh process is {vs_base:.6f} "
-            "-- describe_model found the catalog row, but infer did not apply "
-            "the persisted LoRA adapter after a real process restart. This is an "
-            "engine bug, not a cache to commit around."
-        )
+    # F1: every raise below (a `describe_model` mismatch, or a round-trip
+    # ceiling breach) previously left `db2` open -- caught here and closed
+    # before re-raising, so the caller's own exception path (emit()'s outer
+    # `finally`, or main()'s) never has to guess whether THIS function's
+    # local session needs closing too. The success path does NOT close here:
+    # `db2` is handed back live as the caller's next `db` (see the comment at
+    # the `return` below).
+    try:
+        described = db2.describe_model(tuned_model)
+        if described is None or described.get("task") != task:
+            raise RuntimeError(f"{label}: round-trip describe_model mismatch: {described}")
+        roundtrip_probe = _probe_source(db2, f"{source_prefix}_roundtrip_probe", column, dtype,
+                                         probe_value)
+        tuned_vec_roundtrip = _infer_vector(db2, roundtrip_probe, tuned_model, column, task)
+        roundtrip_diff = _max_abs_diff(canonical["tuned_vec"], tuned_vec_roundtrip)
+        print(f"  [{label}] round-trip (new process) max|Δ| vs first tuned read = "
+              f"{roundtrip_diff:.6f}", flush=True)
+        if roundtrip_diff >= ROUND_TRIP_CEILING:
+            # A real engine bug, not a noisy measurement to record and move past:
+            # refuse to emit a cache around a broken round trip rather than
+            # silently committing a golden that would make this pass. Compare
+            # against the base model's own read to name the failure precisely —
+            # a diff this large, equal to the change-vs-base signal, means the
+            # fresh process served the BASE model under the tuned model's id.
+            base_vec_after_restart = _infer_vector(db2, roundtrip_probe, base_model, column, task)
+            vs_base = _max_abs_diff(tuned_vec_roundtrip, base_vec_after_restart)
+            raise RuntimeError(
+                f"{label}: ROUND TRIP FAILED — a fresh jammi-server process (pid "
+                f"{restart['after']['pid']}, same --artifact-dir) served model_id="
+                f"{tuned_model!r} at max|Δ|={roundtrip_diff:.6f} from the pre-restart "
+                f"tuned read (ceiling {ROUND_TRIP_CEILING:g}); its distance from the "
+                f"BASE model's own read in this SAME fresh process is {vs_base:.6f} "
+                "-- describe_model found the catalog row, but infer did not apply "
+                "the persisted LoRA adapter after a real process restart. This is an "
+                "engine bug, not a cache to commit around."
+            )
+    except Exception:
+        db2.close()
+        raise
 
     record = {
         "task": task,
@@ -673,129 +697,137 @@ def emit(server: GpuLiveServer, vision_checkpoint: str, audio_checkpoint: str, d
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
     endpoint = server.start()
     db = jammi.connect(endpoint)
-    info = db.get_server_info()
-    print("server:", json.dumps(info), flush=True)
-    if info.get("version") != ENGINE_VERSION:
-        raise RuntimeError(
-            f"server version {info.get('version')} != pinned {ENGINE_VERSION} — STOP")
-    if jammi.__version__ != ENGINE_VERSION:
-        raise RuntimeError(
-            f"installed jammi client {jammi.__version__} != pinned {ENGINE_VERSION} — STOP")
+    # `db` is REBOUND on every `measure_tower` call below (each one closes the
+    # connection it was HANDED, in `measure_tower`'s own guard, and returns a
+    # brand-new post-restart connection as this function's next `db`) --  so
+    # the ONE `finally` below, closing whatever `db` currently names, covers
+    # every raise/return path out of this function's body: the version-check
+    # raises right after `jammi.connect` (closing arm F1 named), and every
+    # later raise from a `measure_tower`/`measure_cross_tower_selectivity`/
+    # `measure_corrupt_rows` call, which all leave `db` bound to whatever
+    # session was live at the point of failure (`close()` is documented
+    # idempotent on both transports -- see `RemoteDatabase.close` -- so this
+    # is safe even on the rare double-close race with a callee's own guard).
+    try:
+        info = db.get_server_info()
+        print("server:", json.dumps(info), flush=True)
+        if info.get("version") != ENGINE_VERSION:
+            raise RuntimeError(
+                f"server version {info.get('version')} != pinned {ENGINE_VERSION} — STOP")
+        if jammi.__version__ != ENGINE_VERSION:
+            raise RuntimeError(
+                f"installed jammi client {jammi.__version__} != pinned {ENGINE_VERSION} — STOP")
 
-    print("hashing checkpoint directories for an independent provenance digest...", flush=True)
-    vision_sha256 = _dir_sha256(Path(vision_checkpoint))
-    audio_sha256 = _dir_sha256(Path(audio_checkpoint))
+        print("hashing checkpoint directories for an independent provenance digest...", flush=True)
+        vision_sha256 = _dir_sha256(Path(vision_checkpoint))
+        audio_sha256 = _dir_sha256(Path(audio_checkpoint))
 
-    clip_base = f"local:{vision_checkpoint}"
-    clap_base = f"local:{audio_checkpoint}"
+        clip_base = f"local:{vision_checkpoint}"
+        clap_base = f"local:{audio_checkpoint}"
 
-    work = ARTIFACTS / "_work"
-    work.mkdir(parents=True, exist_ok=True)
-    image_triplets, image_probe = build_image_triplets(work)
-    audio_triplets, audio_probe = build_audio_triplets(work)
-    text_triplets, text_probe = build_text_triplets(work)
+        work = ARTIFACTS / "_work"
+        work.mkdir(parents=True, exist_ok=True)
+        image_triplets, image_probe = build_image_triplets(work)
+        audio_triplets, audio_probe = build_audio_triplets(work)
+        text_triplets, text_probe = build_text_triplets(work)
 
-    towers: dict[str, dict] = {}
+        towers: dict[str, dict] = {}
 
-    vision_record, db = measure_tower(
-        db, server=server, label="vision", task="image_embedding", column="image",
-        dtype=pa.binary(), base_model=clip_base, triplets=image_triplets,
-        probe_value=image_probe, source_prefix="vision", target_modules=CLIP_TARGET_MODULES,
-    )
-    vision_record["cross_tower_selectivity"] = measure_cross_tower_selectivity(
-        db, tuned_model=vision_record["model_id"], base_model=clip_base,
-        other_task="text_embedding", other_column="text", other_dtype=pa.utf8(),
-        other_probe_value=text_probe, source_prefix="vision",
-    )
-    towers["vision"] = vision_record
+        vision_record, db = measure_tower(
+            db, server=server, label="vision", task="image_embedding", column="image",
+            dtype=pa.binary(), base_model=clip_base, triplets=image_triplets,
+            probe_value=image_probe, source_prefix="vision", target_modules=CLIP_TARGET_MODULES,
+        )
+        vision_record["cross_tower_selectivity"] = measure_cross_tower_selectivity(
+            db, tuned_model=vision_record["model_id"], base_model=clip_base,
+            other_task="text_embedding", other_column="text", other_dtype=pa.utf8(),
+            other_probe_value=text_probe, source_prefix="vision",
+        )
+        towers["vision"] = vision_record
 
-    text_record, db = measure_tower(
-        db, server=server, label="text", task="text_embedding", column="text",
-        dtype=pa.utf8(), base_model=clip_base, triplets=text_triplets,
-        probe_value=text_probe, source_prefix="text", target_modules=CLIP_TARGET_MODULES,
-    )
-    text_record["cross_tower_selectivity"] = measure_cross_tower_selectivity(
-        db, tuned_model=text_record["model_id"], base_model=clip_base,
-        other_task="image_embedding", other_column="image", other_dtype=pa.binary(),
-        other_probe_value=image_probe, source_prefix="text",
-    )
-    towers["text"] = text_record
+        text_record, db = measure_tower(
+            db, server=server, label="text", task="text_embedding", column="text",
+            dtype=pa.utf8(), base_model=clip_base, triplets=text_triplets,
+            probe_value=text_probe, source_prefix="text", target_modules=CLIP_TARGET_MODULES,
+        )
+        text_record["cross_tower_selectivity"] = measure_cross_tower_selectivity(
+            db, tuned_model=text_record["model_id"], base_model=clip_base,
+            other_task="image_embedding", other_column="image", other_dtype=pa.binary(),
+            other_probe_value=image_probe, source_prefix="text",
+        )
+        towers["text"] = text_record
 
-    audio_record, db = measure_tower(
-        db, server=server, label="audio", task="audio_embedding", column="audio",
-        dtype=pa.binary(), base_model=clap_base, triplets=audio_triplets,
-        probe_value=audio_probe, source_prefix="audio", target_modules=CLAP_TARGET_MODULES,
-    )
-    towers["audio"] = audio_record
+        audio_record, db = measure_tower(
+            db, server=server, label="audio", task="audio_embedding", column="audio",
+            dtype=pa.binary(), base_model=clap_base, triplets=audio_triplets,
+            probe_value=audio_probe, source_prefix="audio", target_modules=CLAP_TARGET_MODULES,
+        )
+        towers["audio"] = audio_record
 
-    corrupt_rows = {
-        "image": {
-            mode: measure_corrupt_rows(
-                db, label="vision", task="image_embedding", column="image",
-                base_model=clip_base, good_value=image_probe, source_prefix="image",
-                input_mode=mode,
-            )
-            for mode in ("bytes", "path")
-        },
-        "audio": {
-            mode: measure_corrupt_rows(
-                db, label="audio", task="audio_embedding", column="audio",
-                base_model=clap_base, good_value=audio_probe, source_prefix="audio",
-                input_mode=mode,
-            )
-            for mode in ("bytes", "path")
-        },
-    }
+        corrupt_rows = {
+            "image": {
+                mode: measure_corrupt_rows(
+                    db, label="vision", task="image_embedding", column="image",
+                    base_model=clip_base, good_value=image_probe, source_prefix="image",
+                    input_mode=mode,
+                )
+                for mode in ("bytes", "path")
+            },
+            "audio": {
+                mode: measure_corrupt_rows(
+                    db, label="audio", task="audio_embedding", column="audio",
+                    base_model=clap_base, good_value=audio_probe, source_prefix="audio",
+                    input_mode=mode,
+                )
+                for mode in ("bytes", "path")
+            },
+        }
 
-    record = {
-        "engine_version": ENGINE_VERSION,
-        "vision_checkpoint": vision_checkpoint,
-        "audio_checkpoint": audio_checkpoint,
-        "rows_per_modality": ROWS,
-        "towers": towers,
-        "corrupt_rows": corrupt_rows,
-        "provenance": {
+        record = {
             "engine_version": ENGINE_VERSION,
-            "installed_client_version": jammi.__version__,
-            "server_info": info,
-            "hostname": socket.gethostname(),
-            "gpu_name": _gpu_name(),
-            "device": device,
-            "vision_checkpoint_sha256": vision_sha256,
-            "audio_checkpoint_sha256": audio_sha256,
-            "content_digest_via_shipped_surface": False,
-        },
-    }
-    (ARTIFACTS / "record.json").write_text(json.dumps(record, indent=2, sort_keys=True))
+            "vision_checkpoint": vision_checkpoint,
+            "audio_checkpoint": audio_checkpoint,
+            "rows_per_modality": ROWS,
+            "towers": towers,
+            "corrupt_rows": corrupt_rows,
+            "provenance": {
+                "engine_version": ENGINE_VERSION,
+                "installed_client_version": jammi.__version__,
+                "server_info": info,
+                "hostname": socket.gethostname(),
+                "gpu_name": _gpu_name(),
+                "device": device,
+                "vision_checkpoint_sha256": vision_sha256,
+                "audio_checkpoint_sha256": audio_sha256,
+                "content_digest_via_shipped_surface": False,
+            },
+        }
+        (ARTIFACTS / "record.json").write_text(json.dumps(record, indent=2, sort_keys=True))
 
-    metrics: dict[str, dict[str, float]] = {}
-    for name, rec in towers.items():
-        td = rec["tolerance_derivation"]
-        metrics[f"{name}.change_vs_base_max_abs_diff"] = {
-            "value": rec["change_vs_base_max_abs_diff"], "tol": td["change_tol"]}
-        metrics[f"{name}.same_input_control_max_abs_diff"] = {
-            "value": rec["same_input_control_max_abs_diff"], "tol": PRECISION_FLOOR}
-        metrics[f"{name}.round_trip_max_abs_diff"] = {
-            "value": rec["round_trip_max_abs_diff"], "tol": PRECISION_FLOOR}
-    for name in ("vision", "text"):
-        metrics[f"{name}.cross_tower_selectivity_max_abs_diff"] = {
-            "value": towers[name]["cross_tower_selectivity"]["max_abs_diff"], "tol": 0.0}
-    (ARTIFACTS / "golden_metrics.json").write_text(
-        json.dumps(metrics, indent=2, sort_keys=True))
+        metrics: dict[str, dict[str, float]] = {}
+        for name, rec in towers.items():
+            td = rec["tolerance_derivation"]
+            metrics[f"{name}.change_vs_base_max_abs_diff"] = {
+                "value": rec["change_vs_base_max_abs_diff"], "tol": td["change_tol"]}
+            metrics[f"{name}.same_input_control_max_abs_diff"] = {
+                "value": rec["same_input_control_max_abs_diff"], "tol": PRECISION_FLOOR}
+            metrics[f"{name}.round_trip_max_abs_diff"] = {
+                "value": rec["round_trip_max_abs_diff"], "tol": PRECISION_FLOOR}
+        for name in ("vision", "text"):
+            metrics[f"{name}.cross_tower_selectivity_max_abs_diff"] = {
+                "value": towers[name]["cross_tower_selectivity"]["max_abs_diff"], "tol": 0.0}
+        (ARTIFACTS / "golden_metrics.json").write_text(
+            json.dumps(metrics, indent=2, sort_keys=True))
+    finally:
+        # `db` here is whichever session is CURRENTLY live: the initial
+        # connection (a version-check raise, F1's :679/:682), or the most
+        # recent tower's post-restart connection (a raise from any
+        # `measure_cross_tower_selectivity`/`measure_corrupt_rows` call, or
+        # the audio tower's connection on the ordinary fall-through/return
+        # path -- issue #539's G5, now closed on every arm, not only the
+        # fall-through this file previously handled).
+        db.close()
 
-    # `db` is the audio tower's post-restart client (the last of the three
-    # `measure_tower` round trips, held open through the corrupt-rows
-    # measurement above) — never closed before this fix, so the LAST live
-    # client session outlived `server.stop()` and the caller's own
-    # `shutil.rmtree(artifact_dir)` right after it (issue #539's G5): the
-    # server process racing that rmtree with its catalog still nominally
-    # "connected to" is exactly the ordering this whole gate exists to rule
-    # out, even though this specific chain (mkdtemp -> constructor argument
-    # -> instance attribute -> a THIRD method's grpc endpoint string with no
-    # textual relationship to the removed path) is outside what this
-    # AST-only, intra-procedural gate can prove structurally (see the module
-    # docstring's "Known limits").
-    db.close()
     server.stop()
 
     # drop the working corpora + per-probe parquet scratch files — sources

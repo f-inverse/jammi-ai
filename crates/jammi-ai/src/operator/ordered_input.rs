@@ -157,6 +157,23 @@ mod tests {
         assert_eq!(hashes, vec!["a", "z", "a", "b", "c"]);
     }
 
+    /// Executed over more than one partition the count would be partial, so it
+    /// refuses to run at all.
+    #[tokio::test]
+    async fn a_key_check_over_several_partitions_refuses_to_execute() {
+        let src = four_partition_source(vec![
+            batch(vec![Some(1)], vec!["a"]),
+            batch(vec![None], vec!["b"]),
+        ]);
+        let check = KeyCheckExec::try_new(src, "id").unwrap();
+        let ctx = SessionContext::new();
+        let err = check
+            .execute(0, ctx.task_ctx())
+            .err()
+            .expect("a multi-partition input must refuse");
+        assert!(err.to_string().contains("one partition"), "{err}");
+    }
+
     /// A null key anywhere in the input is one typed refusal with the exact
     /// total, raised at end of input — the sort emits nothing before it.
     #[tokio::test]

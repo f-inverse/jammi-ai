@@ -1,13 +1,21 @@
 //! `KeyCheckExec` — the null-key refusal at the input edge.
 //!
-//! A single-partition-preserving passthrough: every batch flows through
-//! unchanged while the node counts the nulls in the RAW key column, and at end
-//! of input it yields exactly one `Err(External(JammiError::InvalidKey {
+//! A single-partition passthrough: every batch flows through unchanged while
+//! the node counts the nulls in the RAW key column, and at end of input it
+//! yields exactly one `Err(External(JammiError::InvalidKey {
 //! column, null_count }))` if the total is non-zero. Placed BELOW the blocking
 //! `SortExec` that [`crate::operator::ordered_input`] builds, so `InferenceExec`
 //! pulls zero batches before the refusal: the model is invoked zero times, the
 //! source is scanned once, and the count is exact. The runner's own cast keeps
 //! only a defensive check behind this.
+//!
+//! The count is a total only if one stream sees every row, so the node
+//! REQUIRES a single input partition ([`Distribution::SinglePartition`]). The
+//! declaration is what keeps an optimizer pass honest: a rule that treats an
+//! undeclared node as partition-transparent (`EnforceSorting` parallelising
+//! the sort above it, a distributed planner re-planning the subtree) would
+//! otherwise push the node below the coalesce and turn one exact count into a
+//! count per partition.
 //!
 //! It never overrides `supports_limit_pushdown` (default `false`) nor
 //! `with_fetch` (default `None`): a fetch must stay above it, never be pushed
@@ -21,10 +29,12 @@ use std::task::{Context, Poll};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use datafusion::common::internal_err;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
+    Partitioning, PlanProperties,
 };
 use futures::Stream;
 use jammi_db::error::JammiError;
@@ -45,7 +55,7 @@ impl KeyCheckExec {
         let key_index = input.schema().index_of(key_column)?;
         let properties = PlanProperties::new(
             input.equivalence_properties().clone(),
-            input.output_partitioning().clone(),
+            Partitioning::UnknownPartitioning(1),
             input.pipeline_behavior(),
             input.boundedness(),
         );
@@ -86,6 +96,10 @@ impl ExecutionPlan for KeyCheckExec {
         vec![true]
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -101,7 +115,14 @@ impl ExecutionPlan for KeyCheckExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
-        let inner = self.input.execute(partition, context)?;
+        let input_partitions = self.input.output_partitioning().partition_count();
+        if partition != 0 || input_partitions != 1 {
+            return internal_err!(
+                "KeyCheckExec counts over one partition: asked for partition {partition} \
+                 of an input with {input_partitions}"
+            );
+        }
+        let inner = self.input.execute(0, context)?;
         Ok(Box::pin(KeyCheckStream {
             inner,
             schema: self.schema(),

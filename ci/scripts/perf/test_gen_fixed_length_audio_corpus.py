@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""`gen_fixed_length_audio_corpus.py`'s own suite (issue #421 W2b): the
+"""`gen_fixed_length_audio_corpus.py`'s own suite: the
 LENGTH/RATE guarantee read back off the emitted WAV header, determinism
-(family J), the emitted JSONL schema pinned by a literal field-name check
+, the emitted JSONL schema pinned by a literal field-name check
 against `crates/jammi-bench/src/main.rs::MediaTripletRow`, the triplet
 separation asserted MECHANICALLY (intra-family sample distance strictly
 below inter-family), and the input-validation refusals.
@@ -326,8 +326,8 @@ class CliTests(unittest.TestCase):
 
 
 class PoolCacheTests(unittest.TestCase):
-    """`--pool-cache-dir` (esc-088 round-4 advisory: hermetic dry-run suite
-    runtime): opt-in, real runs never set it. Every assertion here drives
+    """`--pool-cache-dir` (keeps the hermetic dry-run suite's runtime
+    down): opt-in, real runs never set it. Every assertion here drives
     the REAL CLI (`gfa.main`), never `_build_pool`/`_load_or_build_pool`
     directly, so a cache-path bug in argument plumbing cannot hide behind
     a unit-level call that bypasses it."""
@@ -463,7 +463,7 @@ class PoolCacheTests(unittest.TestCase):
         self.assertEqual(gfa._pool_cache_key(*args), gfa._pool_cache_key(*args))
 
     def test_a_marker_recorded_for_a_different_shape_under_the_same_key_is_refused(self):
-        """Belt-and-braces at the point of use (round-5 audit B1(b)): a
+        """Belt-and-braces at the point of use: a
         `_DONE` marker's OWN recorded shape must agree, BY NAME, with the
         shape this call actually requested -- checked even though `key`
         already claims to identify the requested shape uniquely. Simulates
@@ -774,15 +774,15 @@ class RealSourceEditMovesTheKeyTests(unittest.TestCase):
 
     def test_editing_the_module_docstring_moves_the_key(self):
         key = self._key_after(
-            "LENGTH GUARANTEE (issue #421 PR B's pre-registered training-step profile):",
-            "LENGTH GUARANTEE EDITED (issue #421 PR B's pre-registered training-step profile):",
+            "LENGTH GUARANTEE (the pre-registered training-step profile):",
+            "LENGTH GUARANTEE EDITED (the pre-registered training-step profile):",
             "docstring",
         )
         self.assertNotEqual(self.baseline, key)
 
 
 class FractionalSecondsTests(unittest.TestCase):
-    """`--seconds` is a FLOAT and the #421 profile's declared audio shape is
+    """`--seconds` is a FLOAT and the training-step profile's declared audio shape is
     9.5 s at 48 kHz -- a fractional value on purpose (strictly below the CLAP
     front end's `nb_max_samples`, so the repeat-pad branch is the declared
     branch rather than a boundary case).
@@ -825,7 +825,7 @@ class FractionalSecondsTests(unittest.TestCase):
 
 
 class HeldOutSplitTests(unittest.TestCase):
-    """`--heldout-rows` (issue #421 P1-b(iv)) -- the audio twin of
+    """`--heldout-rows` -- the audio twin of
     `test_gen_fixed_shape_image_corpus.py`'s own `HeldOutSplitTests`, making
     the SAME assertions against this producer's own emitted tree.
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Hermetic git-SHAPE regression suite for `gpu_inference_ab_git.sh`
-(round-1 adversarial audit B2). No GPU, no network, no jammi-bench binary —
-builds a SCRATCH `origin` repo with real `git` subprocess calls, then
-drives the EXACT clone/checkout shapes `runpod_gpu_perf_ab.sh` uses (both
-the FIXED shape and the OLD, empirically-broken one) against it, sourcing
+"""Hermetic git-SHAPE regression suite for `gpu_inference_ab_git.sh`. No
+GPU, no network, no jammi-bench binary — builds a SCRATCH `origin` repo
+with real `git` subprocess calls, then drives clone/checkout shapes against
+it (`runpod_gpu_perf_ab.sh`'s full, non-single-branch shape and a shallow,
+single-branch shape that breaks the merge-base), sourcing
 `gpu_inference_ab_git.sh`'s own `gpu_inference_ab_ensure_history_for_merge_base`
 function via a real `bash -c 'source ...; <call>'` subprocess — never a
 re-implementation of that function's own logic in Python, and never a call
@@ -12,42 +12,34 @@ neither this suite's environment nor CI's hermetic runners carry).
 
 ## What this suite proves, not merely asserts
 
-1. The OLD bug is REAL, not a hypothesized one: replicating `git clone
-   --depth 1 -b <branch> <origin> <dest>` (the shape `runpod_gpu_perf_ab.sh`
-   used before this fix) and then running `git merge-base origin/main HEAD`
-   with NO repair step FAILS — the empirical "merge-base exits 128" the
-   audit found, reproduced here mechanically rather than taken on faith.
-2. The FIXED clone shape (a full, non-single-branch clone + a separate
-   `checkout`, `runpod_gpu_perf_ab.sh`'s own new shape) already creates a
-   working `origin/main` on its own, with or without the repair function.
-3. The repair function is ALSO defense-in-depth: called against the SAME
-   OLD, buggy single-branch/shallow clone shape from (1), it recovers a
-   working `origin/main` and a resolvable merge-base — so a caller of
-   `gpu_inference_ab.sh` whose OWN checkout is still shaped like (1) is not
-   left stranded either.
+1. The single-branch/shallow failure is REAL: `git clone --depth 1 -b
+   <branch> <origin> <dest>` followed by `git merge-base origin/main HEAD`
+   with NO repair step FAILS (exit 128), reproduced here mechanically
+   rather than taken on faith.
+2. `runpod_gpu_perf_ab.sh`'s clone shape (a full, non-single-branch clone
+   + a separate `checkout`) creates a working `origin/main` on its own,
+   with or without the repair function.
+3. The repair function also covers the shape from (1): called against it,
+   it recovers a working `origin/main` and a resolvable merge-base — so a
+   caller of `gpu_inference_ab.sh` whose OWN checkout is shaped like (1)
+   is not left stranded either.
 4. `dry_run=1` short-circuits before touching git at all (returns 0 even
    against a directory with no git repository whatsoever).
-
-Round-2 adversarial audit additions:
 5. `GitLibExitArmTests` — `gpu_inference_ab_ensure_history_for_merge_base`'s
    OWN `2` (unshallow fetch failed) and `75` (advisory `origin/main`
    refresh-fetch failed) exit arms, isolated against a shallow-vs-full
-   clone whose `origin` remote is repointed at a nonexistent path (F2;
-   only the `0` arm was exercised before this addition).
+   clone whose `origin` remote is repointed at a nonexistent path.
 6. `RunpodCloneCheckoutTests` — `runpod_clone_checkout.sh`'s own
-   clone+checkout+wrong-tree-verification function (F1), the SAME code
+   clone+checkout+wrong-tree-verification function, the SAME code
    `runpod_gpu_perf_ab.sh` inlines verbatim into its remote heredoc,
    driven against a scratch repo with a real ref, a nonexistent ref, and a
    ref that resolves to the default branch's own tip.
-
-Round-3 adversarial audit addition:
-7. `ClonePartialCompositionTests` (B1) — the REAL two-stage clone
-   composition (`runpod_perf_ab_clone_and_checkout`'s outer partial clone,
-   then `gpu_inference_ab.sh`'s own real, extracted inner clone command)
-   against a scratch origin that itself honors `--filter` (mirroring a
-   real GitHub remote): GREEN with `uploadpack.allowFilter=true` set on
-   the outer clone (the fix), RED (empirically `rc=128`) with it reverted
-   — the auditor's own reproduction of a fatal clone-composition bug.
+7. `ClonePartialCompositionTests` — the REAL two-stage clone composition
+   (`runpod_perf_ab_clone_and_checkout`'s outer partial clone, then
+   `gpu_inference_ab.sh`'s own real, extracted inner clone command) against
+   a scratch origin that itself honors `--filter` (mirroring a real GitHub
+   remote): GREEN with `uploadpack.allowFilter=true` set on the outer
+   clone, RED (`rc=128`) with it unset.
 
 Run: `python3 ci/scripts/perf/test_gpu_inference_ab_git_shape.py`
 """
@@ -121,17 +113,16 @@ def build_scratch_origin(root):
 
 
 def clone_fixed_shape(origin, dest):
-    """`runpod_gpu_perf_ab.sh`'s own FIXED clone shape (round-1 adversarial
-    audit B2): a full, non-single-branch clone, THEN a separate checkout —
-    never `clone -b`.
+    """`runpod_gpu_perf_ab.sh`'s own clone shape: a full, non-single-branch
+    clone, THEN a separate checkout — never `clone -b`.
     """
     _git(["clone", "--quiet", origin, dest], os.path.dirname(dest))
     _git(["checkout", "--quiet", "feature"], dest)
 
 
 def clone_old_buggy_shape(origin, dest):
-    """The OLD, empirically-broken shape this fix replaces: a SHALLOW,
-    SINGLE-BRANCH clone straight onto the target ref via `-b`. `origin` is
+    """The broken shape: a SHALLOW, SINGLE-BRANCH clone straight onto the
+    target ref via `-b`. `origin` is
     passed as a `file://` URL so `--depth` genuinely takes effect (see
     [`clone_shallow_with_broken_origin`]'s own doc for the local-clone
     quirk this avoids) — this fixture's own bug reproduction does not
@@ -157,13 +148,12 @@ def clone_shallow_with_broken_origin(origin, dest):
     """A SHALLOW clone whose `origin` remote is then repointed at a
     nonexistent path — forces
     `gpu_inference_ab_ensure_history_for_merge_base`'s OWN unshallow-fetch
-    step to fail (round-2 adversarial audit F2's `2` arm: the unshallow
-    fetch itself failed, a genuine infra problem).
+    step to fail (the `2` arm: the unshallow fetch itself failed, a genuine
+    infra problem).
 
     `origin` is passed as a `file://` URL, never a bare local path: git
     SILENTLY IGNORES `--depth` for a bare-local-path clone ("--depth is
-    ignored in local clones; use file:// instead", discovered empirically
-    while authoring this fixture) — the resulting clone would be a FULL
+    ignored in local clones; use file:// instead") — the resulting clone would be a FULL
     (non-shallow) one despite `--depth 1`, which would silently skip the
     exact code path (`is-shallow-repository` → true → the unshallow-fetch
     branch) this fixture exists to isolate.
@@ -176,8 +166,8 @@ def clone_full_with_broken_origin(origin, dest):
     """A FULL (non-shallow) clone whose `origin` remote is then repointed
     at a nonexistent path — the unshallow-fetch branch is SKIPPED entirely
     (the clone is not shallow), isolating a failure of the
-    explicit-refspec `origin/main` fetch ALONE (round-2 adversarial audit
-    F2's `75` arm: advisory, never a hard refusal).
+    explicit-refspec `origin/main` fetch ALONE (the `75` arm: advisory,
+    never a hard refusal).
     """
     _git(["clone", "--quiet", origin, dest], os.path.dirname(dest))
     _git(["remote", "set-url", "origin", os.path.join(os.path.dirname(dest), "no-such-origin")], dest)
@@ -191,7 +181,7 @@ def run_runpod_clone_and_checkout(dest, repo_url, git_ref, default_branch):
     """Sources `runpod_clone_checkout.sh` and calls
     `runpod_perf_ab_clone_and_checkout` — a REAL bash subprocess driving the
     EXACT function `runpod_gpu_perf_ab.sh` inlines verbatim into its own
-    remote heredoc (round-2 adversarial audit F1), never a Python
+    remote heredoc, never a Python
     re-implementation of its clone/checkout/wrong-tree-verification logic.
     """
     script = (
@@ -220,11 +210,10 @@ class GitShapeTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_old_single_branch_shallow_clone_is_the_proven_bug(self):
-        """THE negative control (RC1: an assertion must be able to fail,
-        proven the RED direction here): the OLD clone shape, with NO repair
-        step, must FAIL `git merge-base origin/main HEAD` — this is the
-        empirical bug the round-1 adversarial audit found (exit 128 in
-        practice), reproduced mechanically, not merely asserted in prose.
+        """THE negative control (an assertion must be able to fail): the
+        single-branch shallow clone shape, with NO repair step, must FAIL
+        `git merge-base origin/main HEAD` (exit 128 in practice), reproduced
+        mechanically, not merely asserted in prose.
         """
         origin, _merge_base_sha, _feature_tip = build_scratch_origin(self.root)
         dest = os.path.join(self.root, "dest")
@@ -233,15 +222,15 @@ class GitShapeTests(unittest.TestCase):
         ok, _out, rc = merge_base_resolves(dest)
         self.assertFalse(
             ok,
-            "the OLD single-branch shallow clone shape, with no repair step, was expected to FAIL "
+            "the single-branch shallow clone shape, with no repair step, was expected to FAIL "
             f"'git merge-base origin/main HEAD' (the proven bug) but it SUCCEEDED (rc={rc}) — either "
-            "git's own defaults changed underneath this test, or the bug this suite exists to pin no "
-            "longer reproduces the way the audit found it; re-derive, never just delete this test",
+            "git's own defaults changed underneath this test, or the failure this suite exists to pin "
+            "does not reproduce; re-derive, never just delete this test",
         )
 
     def test_fixed_clone_shape_gives_a_working_merge_base_with_no_repair_needed(self):
-        """The FIXED shape (`runpod_gpu_perf_ab.sh`'s own new clone+checkout,
-        [`clone_fixed_shape`]) already creates a working `origin/main` on
+        """`runpod_gpu_perf_ab.sh`'s own clone+checkout shape
+        ([`clone_fixed_shape`]) creates a working `origin/main` on
         its own — `git merge-base` resolves correctly to the TRUE common
         ancestor even before `gpu_inference_ab_ensure_history_for_merge_base`
         ever runs.
@@ -251,7 +240,7 @@ class GitShapeTests(unittest.TestCase):
         clone_fixed_shape(origin, dest)
 
         ok, resolved_sha, rc = merge_base_resolves(dest)
-        self.assertTrue(ok, f"merge-base must resolve on the fixed clone shape (rc={rc})")
+        self.assertTrue(ok, f"merge-base must resolve on the full clone shape (rc={rc})")
         self.assertEqual(
             resolved_sha,
             merge_base_sha,
@@ -259,14 +248,13 @@ class GitShapeTests(unittest.TestCase):
         )
 
     def test_ensure_function_returns_0_and_repairs_the_old_buggy_shape_too(self):
-        """The teeth (RC1, GREEN direction): `gpu_inference_ab_ensure_history_for_merge_base`,
-        run against the SAME OLD, buggy single-branch/shallow clone
+        """The GREEN direction: `gpu_inference_ab_ensure_history_for_merge_base`,
+        run against the SAME single-branch/shallow clone
         [`test_old_single_branch_shallow_clone_is_the_proven_bug`] proved
         broken, returns 0 AND leaves `git merge-base origin/main HEAD`
-        resolvable to the TRUE common ancestor afterward — the function is
-        defense-in-depth robust even against the exact shape this fix
-        replaces, not merely correct for the ONE new shape
-        `runpod_gpu_perf_ab.sh` itself now produces.
+        resolvable to the TRUE common ancestor afterward — the function
+        repairs that shape too, not only the full clone
+        `runpod_gpu_perf_ab.sh` itself produces.
         """
         origin, merge_base_sha, _feature_tip = build_scratch_origin(self.root)
         dest = os.path.join(self.root, "dest")
@@ -308,10 +296,9 @@ class GitShapeTests(unittest.TestCase):
 
 
 class GitLibExitArmTests(unittest.TestCase):
-    """round-2 adversarial audit F2: `gpu_inference_ab_ensure_history_for_merge_base`'s
-    OWN `2` (unshallow fetch failed) and `75` (advisory `origin/main`
-    refresh-fetch failed) exit arms — only the `0` arm was exercised
-    before this addition.
+    """`gpu_inference_ab_ensure_history_for_merge_base`'s OWN `2` (unshallow
+    fetch failed) and `75` (advisory `origin/main` refresh-fetch failed)
+    exit arms.
     """
 
     def setUp(self):
@@ -349,7 +336,7 @@ class GitLibExitArmTests(unittest.TestCase):
 
 
 class RunpodCloneCheckoutTests(unittest.TestCase):
-    """round-2 adversarial audit F1: `runpod_clone_checkout.sh`'s own
+    """`runpod_clone_checkout.sh`'s own
     clone+checkout+wrong-tree-verification function, driven against a
     scratch repo — EXECUTES the driver's own logic (never merely asserted
     from reading the source), including the wrong-tree refusal a bad or
@@ -379,7 +366,7 @@ class RunpodCloneCheckoutTests(unittest.TestCase):
         self.assertEqual(rc, 2, f"stdout={out}\nstderr={err}")
 
     def test_a_wrong_tree_ref_that_resolves_to_the_default_branch_head_refuses_with_exit_2(self):
-        """The wrong-tree refusal itself (round-2 adversarial audit F1): a
+        """The wrong-tree refusal itself: a
         NON-default ref that happens to resolve to the exact SAME commit
         as origin/main's own CURRENT tip must refuse, even though the
         checkout itself succeeded cleanly.
@@ -409,8 +396,7 @@ class RunpodCloneCheckoutTests(unittest.TestCase):
 
 def extract_inner_clone_command(gpu_inference_ab_sh_path):
     """Reads `gpu_inference_ab.sh`'s own `clone_and_checkout` function and
-    returns its REAL `git clone ...` line, VERBATIM (round-3 adversarial
-    audit B1's own citation), with the `run_cmd ` wrapper stripped and the
+    returns its REAL `git clone ...` line, VERBATIM, with the `run_cmd ` wrapper stripped and the
     trailing line-continuation backslash removed — never a hand-copied,
     independently-drifting duplicate of that command. Raises if the
     expected line is not found (fail-closed: a future edit to that
@@ -430,8 +416,7 @@ def extract_inner_clone_command(gpu_inference_ab_sh_path):
 
 
 class ClonePartialCompositionTests(unittest.TestCase):
-    """Round-3 adversarial audit B1 (fatal clone composition, the auditor's
-    own reproduction): `runpod_clone_checkout.sh`'s OUTER clone
+    """Fatal clone composition: `runpod_clone_checkout.sh`'s OUTER clone
     (`runpod_perf_ab_clone_and_checkout`) is itself a PARTIAL
     (`--filter=blob:none`) clone by the time `gpu_inference_ab.sh`'s own
     INNER clones (`clone_and_checkout`) clone AGAIN, also
@@ -522,7 +507,7 @@ class ClonePartialCompositionTests(unittest.TestCase):
         )
 
     def test_the_real_composition_succeeds_with_the_fix(self):
-        """GREEN: the real `runpod_perf_ab_clone_and_checkout` (which now
+        """GREEN: the real `runpod_perf_ab_clone_and_checkout` (which
         sets `uploadpack.allowFilter=true` on its own outer clone) followed
         by `gpu_inference_ab.sh`'s own real inner clone command succeeds.
         """
@@ -550,11 +535,10 @@ class ClonePartialCompositionTests(unittest.TestCase):
         )
 
     def test_the_real_composition_fails_rc_128_without_the_fix_the_red_control(self):
-        """RED (the negative control, RC1: an assertion must be able to
-        fail): the SAME composition, with `uploadpack.allowFilter` reverted
-        to unset on the outer clone (simulating the pre-fix state) — proves
-        the bug this fix closes is REAL, empirically `rc=128`, not merely
-        asserted in prose.
+        """RED (the negative control: an assertion must be able to fail):
+        the SAME composition, with `uploadpack.allowFilter` unset on the
+        outer clone — proves the failure `allowFilter` prevents is REAL,
+        `rc=128`, not merely asserted in prose.
         """
         origin = self._build_filter_capable_origin_with_missing_historical_blob()
         outer_dest = os.path.join(self.root, "outer")
@@ -565,17 +549,17 @@ class ClonePartialCompositionTests(unittest.TestCase):
         )
         self.assertEqual(outer_rc, 0, f"outer clone setup failed\nstdout={outer_out}\nstderr={outer_err}")
         self._assert_outer_clone_is_genuinely_partial(outer_dest)
-        # Revert exactly the one fix line -- the RED control's own premise.
+        # Unset exactly the one setting -- the RED control's own premise.
         _git(["config", "--unset", "uploadpack.allowFilter"], outer_dest)
 
         inner_rc, inner_out, inner_err = self._run_inner_clone(outer_dest, inner_dest)
         self.assertEqual(
             inner_rc,
             128,
-            f"the inner clone was expected to FAIL FATALLY (rc=128, the auditor's own empirical "
-            f"finding) once uploadpack.allowFilter is unset on a genuinely partial outer clone -- "
-            f"if this assertion fails, either git's own behavior changed underneath this test, or "
-            f"the bug this fix closes no longer reproduces the way the audit found it\n"
+            f"the inner clone was expected to FAIL FATALLY (rc=128) once uploadpack.allowFilter is "
+            f"unset on a genuinely partial outer clone -- if this assertion fails, either git's own "
+            f"behavior changed underneath this test, or the failure this control pins does not "
+            f"reproduce\n"
             f"stdout={inner_out}\nstderr={inner_err}",
         )
 

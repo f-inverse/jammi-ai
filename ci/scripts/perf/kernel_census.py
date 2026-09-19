@@ -1,64 +1,56 @@
 #!/usr/bin/env python3
 """Per-`(kernel, grid, block)` census over an nsys sqlite export, and the
 (M-N)-step DIFFERENCE of two exports (same declared workload, N vs M
-measured training steps -- CONTRACT `scratchpad/contract-356-profile.md`
-v3, `## Method` / `### Census`) -- isolates exactly `(M-N)` optimizer
-steps' worth of kernels without any landmark segmentation, because every
-`## Declared workload` flag is pinned identical across the pair
-(`--validation-fraction 0 --early-stopping-metric train_loss --epochs 1
---grad-accum 1`, fixed eval cadence) so validation/probe/checkpoint work
-is IDENTICAL across the two runs and cancels in the subtraction.
+measured training steps) -- isolates exactly `(M-N)` optimizer steps' worth
+of kernels without any landmark segmentation, because every workload flag
+is pinned identical across the pair (`--validation-fraction 0
+--early-stopping-metric train_loss --epochs 1 --grad-accum 1`, fixed eval
+cadence) so validation/probe/checkpoint work is IDENTICAL across the two
+runs and cancels in the subtraction.
 
-Promoted from the throwaway `scratchpad/pod/kernel_census.py` ancestor
-(P4, contract's precondition table): same schema query (CUPTI_ACTIVITY_
-KIND_KERNEL joined to StringIds; memcpy/memset totals; GPU wall span),
-hardened per contract. Every guard below is a DOMAIN check on whether the
+Schema query: CUPTI_ACTIVITY_KIND_KERNEL joined to StringIds; memcpy/memset
+totals; GPU wall span. Every guard below is a DOMAIN check on whether the
 two sqlite exports actually describe the declared same-workload (N, M)
 pair -- none of them are generic exception handling for its own sake:
 
-Kernel identity (round-4 pod-run fix, template-wrapper collapse): the
-per-bucket key is `(COALESCE(demangledName.value, shortName.value), grid,
-block)`, never `shortName` alone. cutlass's `Kernel2<...>` template
-wrapper -- and the same latent class in `magma_sgemmEx_kernel<...>` --
-gives every GEMM tile instantiation the SAME literal `shortName`
-(`Kernel2`, `magma_sgemmEx_kernel`); a same-workload leg's own captured
-export (`clip-text-A2`, `run_m.sqlite`) has three DISTINCT cutlass
-instantiations (`cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_{nn,nt,tn}_
-align1`) sharing `shortName='Kernel2'` AND `grid=[2,1,192]`,
-`block=[128,1,1]` -- grouping on `shortName` alone SUMS all three into one
-`Kernel2` row, hiding which tile shape actually ran. `demangledName` is
-NOT NULL on every row of this schema's `CUPTI_ACTIVITY_KIND_KERNEL` table
-(nsys 2025.3.2), so `COALESCE` is a defensive fallback for schema variance
-this module has not observed, not the common case; `LEFT JOIN` (not
-`JOIN`) on the demangled-name string, so a dangling/orphaned
-`demangledName` id (a corrupt export, not this schema's normal shape)
-degrades to the `shortName` value rather than dropping the row. Because
-`demangledName` is always at least as specific as `shortName` (it is
-`shortName`'s own template instantiation), this key is a strict
-REFINEMENT of the old `(shortName, grid, block)` key -- a bucket can only
-SPLIT under the new key, never merge two old buckets into fewer new ones
--- so `gpu_kernel_us_per_step` (a straight sum over every bucket's time
-delta) is bit-identical under the key change; only `by_kernel_and_grid`'s
-row count and per-row shares change. `magma_sgemmEx_kernel<...>`'s full
-demangled signature (its template bools/ints already distinguish real
-instantiations) and every other non-cutlass demangled name (`badd_bf16`,
-`splitKreduce_kernel<...>`) are reported AS-IS, unstripped -- only
-`void cutlass::Kernel2<INNER>(T1::Params)` is stripped down to `INNER`
-(`_strip_cutlass_kernel2_wrapper`), since `INNER` alone (e.g.
-`cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1`) is what a
-downstream reader (and the `#421` attribution's GEMM-family name rule)
-matches against, not the C++ wrapper syntax around it. Census reports
-produced before this change (the `#356` closeout and the `#421`
-2026-09-01/06 pod artifacts) carry the pre-fix, collapsed `Kernel2`/
-`magma_sgemmEx_kernel` rows in `by_kernel_and_grid` -- their `by_kernel_
-name` totals and every other headline number are unaffected (the
-refinement is sum-preserving, see above), only the per-instantiation
-breakdown was coarser.
+Kernel identity (template-wrapper collapse): the per-bucket key is
+`(COALESCE(demangledName.value, shortName.value), grid, block)`, never
+`shortName` alone. cutlass's `Kernel2<...>` template wrapper -- and the
+same latent class in `magma_sgemmEx_kernel<...>` -- gives every GEMM tile
+instantiation the SAME literal `shortName` (`Kernel2`,
+`magma_sgemmEx_kernel`); a real same-workload leg's captured export has
+three DISTINCT cutlass instantiations
+(`cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_{nn,nt,tn}_align1`)
+sharing `shortName='Kernel2'` AND `grid=[2,1,192]`, `block=[128,1,1]` --
+grouping on `shortName` alone SUMS all three into one `Kernel2` row,
+hiding which tile shape actually ran. `demangledName` is NOT NULL on every
+row of this schema's `CUPTI_ACTIVITY_KIND_KERNEL` table (nsys 2025.3.2), so
+`COALESCE` is a defensive fallback for schema variance this module has not
+observed, not the common case; `LEFT JOIN` (not `JOIN`) on the
+demangled-name string, so a dangling/orphaned `demangledName` id (a corrupt
+export, not this schema's normal shape) degrades to the `shortName` value
+rather than dropping the row. Because `demangledName` is always at least as
+specific as `shortName` (it is `shortName`'s own template instantiation),
+this key is a strict REFINEMENT of a `(shortName, grid, block)` key -- a
+bucket can only SPLIT, never merge -- so `gpu_kernel_us_per_step` (a
+straight sum over every bucket's time delta) is identical under either key;
+only `by_kernel_and_grid`'s row count and per-row shares differ.
+`magma_sgemmEx_kernel<...>`'s full demangled signature (its template
+bools/ints already distinguish real instantiations) and every other
+non-cutlass demangled name (`badd_bf16`, `splitKreduce_kernel<...>`) are
+reported AS-IS, unstripped -- only `void cutlass::Kernel2<INNER>(T1::Params)`
+is stripped down to `INNER` (`_normalize_kernel_name`), since
+`INNER` alone (e.g. `cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1`)
+is what a downstream reader's GEMM-family name rule matches against, not
+the C++ wrapper syntax around it. Census reports keyed on `shortName` carry
+collapsed `Kernel2`/`magma_sgemmEx_kernel` rows in `by_kernel_and_grid`;
+their `by_kernel_name` totals and every other headline number are the same
+(the refinement is sum-preserving), only the per-instantiation breakdown is
+coarser.
 
   - refuses (exit nonzero, no report) if EITHER export lacks a
-    `CUPTI_ACTIVITY_KIND_KERNEL` table -- the contract's own "Per-leg
-    check: export lacking the kernel table => leg INVALID" (`### Instrument`).
-    A missing kernel table means the export never records the kernel-level
+    `CUPTI_ACTIVITY_KIND_KERNEL` table -- an export lacking the kernel
+    table makes the leg INVALID. A missing kernel table means the export never records the kernel-level
     trace this whole census depends on; there is no partial/degraded
     report to emit, only a loud refusal.
   - refuses (exit nonzero, no report) if EITHER export's kernel table is
@@ -79,7 +71,7 @@ breakdown was coarser.
     is NEGATIVE beyond a tiny tolerance: for a genuine same-workload N<M
     pair, every kernel/memcpy/memset launch COUNT a training step causes
     should only ACCUMULATE going from the N-step export to the M-step
-    export (the contract's pinned flags make the two runs' non-training-
+    export (the pinned flags make the two runs' non-training-
     step work identical, so it cancels to exactly zero, never negative); a
     meaningfully negative delta is the mechanical signature of "the two
     exports were not actually the declared same-workload (N, M) pair" --
@@ -88,10 +80,10 @@ breakdown was coarser.
     into a report a reader could mistake for a clean measurement.
     EXCEPTION, a per-key bucket whose LAUNCH COUNT delta is <= 0 AND within
     `--launch-tolerance` of zero (this includes the EXACT dn==0 case) is
-    FIXED-COST, not part of the (M-N)-step differencing at all (round-4
-    pod-run fix, first real 14-leg census): the init probe / held-out eval
-    launch the SAME kernels the SAME number of times in the N-step export
-    as in the M-step export (the contract's fixed eval cadence means this
+    FIXED-COST, not part of the (M-N)-step differencing at all: the init
+    probe / held-out eval launch the SAME kernels the SAME number of times
+    in the N-step export as in the M-step export (the fixed eval cadence
+    means this
     non-training-step work is IDENTICAL across the pair, so its LAUNCH
     COUNT cancels, exactly or within the caller's own declared count
     noise), but its SUMMED time is a nanosecond-scale accumulator that
@@ -102,11 +94,10 @@ breakdown was coarser.
     non-positive count delta by `steps_b - steps_a` would either report a
     fixed-cost kernel as if it scaled with the differenced step count,
     which it does not, or emit a NEGATIVE `launches_per_step` into the
-    headline, which round-4's phase-4 audit reproduced as a live finding).
+    headline).
     A fixed-cost bucket's time delta is NEVER checked against the flat
     `--time-tolerance-us` the real added-work buckets use -- but it is NOT
-    unconditionally waved through either (phase-4 audit BLOCK 2 round-1,
-    tightened again round-2 re-audit BLOCK 1): the justifying premise is
+    unconditionally waved through either: the justifying premise is
     "nanosecond-scale jitter", so this is ENFORCED as a HYBRID bound --
     `|time delta| > max(--fixed-cost-jitter-floor-ns,
     --fixed-cost-jitter-rel-tolerance * max(time_a, time_b))` refuses,
@@ -119,10 +110,8 @@ breakdown was coarser.
     nanosecond absolute swing that is obviously still noise -- see
     `DEFAULT_FIXED_COST_JITTER_FLOOR_NS`/
     `DEFAULT_FIXED_COST_JITTER_REL_TOLERANCE`'s own comment for the full
-    calibration, including the round-4 pod-run LIVE FINDING's honest
-    relative jitter (0.9998, not "many multiples of 100%" -- a ratio of an
-    absolute-value numerator to a same-sign-or-larger denominator cannot
-    exceed 1.0). A fixed-cost KERNEL bucket whose jitter exceeds the
+    calibration, including the relative jitter (0.9998) of the real
+    fixed-cost bucket this guard exists to catch. A fixed-cost KERNEL bucket whose jitter exceeds the
     hybrid bound refuses exactly like every other per-key violation above
     (folded into the same `NonComparablePairError`). Every fixed-cost
     KERNEL bucket (whether it passed or would have failed the bound -- the
@@ -132,27 +121,25 @@ breakdown was coarser.
     (the largest single bucket's relative jitter observed) so the
     cancellation -- and how much headroom it used -- stays visible rather
     than silently vanishing. These three fields are KERNEL-BUCKET-ONLY
-    (phase-4 audit round-3 re-audit, correcting an earlier universal
-    overstatement in this same paragraph) -- see the memcpy/memset
+    -- see the memcpy/memset
     paragraph below for why they are deliberately excluded. A kernel
     bucket whose count delta is negative BEYOND `--launch-tolerance`, or
-    positive with a negative time delta, is NOT fixed-cost -- both remain
-    refused exactly as before this round.
+    positive with a negative time delta, is NOT fixed-cost -- both are
+    refused.
 
     memcpy/memset aggregate deltas are DELIBERATELY NOT part of any of
-    the above (phase-4 audit round-3 re-audit -- a narrow rebuild of an
-    earlier round's attempt to unify them with the per-kernel fixed-cost
-    classification, deleted rather than recalibrated further): their
+    the above (they are deliberately NOT unified with the per-kernel
+    fixed-cost classification): their
     COUNT delta still refuses exactly like a kernel bucket's count would
     (`_check_non_negative` against `--launch-tolerance` -- counts are
-    exact integers under the contract's pinned flags, so a negative
+    exact integers under the pinned flags, so a negative
     aggregate count beyond tolerance is still a genuine
     not-same-workload signal), but their TIME delta is PURELY
     INFORMATIONAL: reported SIGNED and jitter-inclusive in
     `memcpy_per_step`/`memset_per_step`'s own `"us"` field, exactly as
     measured, NEVER checked against any tolerance or bound, NEVER
     refused on, and NEVER part of `gpu_kernel_us_per_step` or any other
-    decision field (it already was not). Times and counts diverge here
+    decision field. Times and counts diverge here
     on purpose: memcpy/memset activity is not attributable to any single
     kernel bucket, so there is no principled per-bucket scale to bound a
     "nanosecond-scale jitter" claim against the way the kernel-bucket
@@ -164,10 +151,8 @@ breakdown was coarser.
     never used to gate anything itself.
 
     EVERY numeric knob `build_report`/`main()` accepts is itself
-    validated (phase-4 audit round-2 re-audit BLOCK 2, swept to EVERY
-    remaining knob round-3 re-audit BLOCK 1 -- the auditor's own method:
-    a fail-open/fail-silent mode exists for each one, so each one is
-    closed the same way, in one pass, rather than one knob at a time):
+    validated (a fail-open/fail-silent mode exists for each one, so each
+    one is closed the same way):
     `launch_tolerance` and `time_tolerance_us` must be finite and >= 0 (a
     negative `launch_tolerance` would silently EMPTY the fixed-cost range
     `[-launch_tolerance, 0]` and invert the negative-count-delta
@@ -177,11 +162,10 @@ breakdown was coarser.
     refuses regardless of how large the actual jitter is; a NaN floor
     makes every `>` comparison against it `False` in Python, the SAME
     silent "never refuses" failure mode by a different route -- both
-    closed the same way this sweep closes every other knob);
+    closed the same way as every other knob);
     `fixed_cost_jitter_rel_tolerance` must be
     finite and in `[0, 1)` (NaN/inf/>=1.0 would fail OPEN -- silently
-    never refusing a fixed-cost bucket's jitter, reopening the exact gap
-    round-1's fix closed -- and a negative value inverts the guard the
+    never refusing a fixed-cost bucket's jitter -- and a negative value inverts the guard the
     same way a negative `launch_tolerance` does). A caller passing an
     out-of-domain value for any of these FOUR tolerance knobs gets a
     usage-error refusal (`ValueError`, `main()` exit 2) naming the knob
@@ -199,7 +183,7 @@ breakdown was coarser.
     one-sided-`--wall-*` check already draws.
 
     A SECOND, independent guard closes the "every bucket happened to be
-    fixed-cost" degenerate case (phase-4 audit BLOCK 1): if ZERO buckets
+    fixed-cost" degenerate case: if ZERO buckets
     carry a POSITIVE launch-count delta at all (e.g. the M-step run
     silently executed only N steps, or the same export was diffed against
     itself), the classification above alone would still produce a
@@ -219,11 +203,9 @@ breakdown was coarser.
     non-finite, non-positive, equal, or inverted is not a valid
     same-workload M>N wall-clock pair either, and dividing by
     `steps_b - steps_a` would otherwise silently emit a negative or
-    infinite `wall_s_per_step` -- the finiteness check closes the
-    specific live gap `--wall-b inf` left: `inf > wall_a > 0` is a TRUE
-    ordering check that would have written a literal `Infinity` into the
-    persisted report, not valid JSON, phase-4 audit round-3 re-audit
-    BLOCK 1's own sibling finding).
+    infinite `wall_s_per_step` -- the finiteness check matters because
+    `--wall-b inf` satisfies `inf > wall_a > 0` and would write a literal
+    `Infinity` into the persisted report, which is not valid JSON).
   - cross-checks the CALLER-declared `steps_a`/`steps_b` against the
     report's own MEASURED `steps_measured` (`FinetuneRunTier`), when the
     caller supplies `--steps-measured-a`/`--steps-measured-b` -- refuses
@@ -233,35 +215,32 @@ breakdown was coarser.
     an early-stopping firing despite the never-stops idiom, or a caller
     passing the wrong (N, M) pair to this tool by mistake). Optional
     (omitted when the caller has no measured value to check against, e.g.
-    a build predating `train_run_wall_s`/`steps_measured` or a DRY_RUN
-    smoke stub that chooses not to populate it).
+    a build that does not emit `train_run_wall_s`/`steps_measured` or a
+    DRY_RUN smoke stub that chooses not to populate it).
   - a corrupt/truncated sqlite file (`sqlite3.DatabaseError`, e.g. a
     0-byte-but-nonzero-length garbage file, or a file truncated mid-write)
     is caught and re-raised as a NAMED, declared exit code -- never an
     unhandled Python traceback, which is indistinguishable from a bug in
     this tool itself to anything scraping this producer's exit status.
 
-Output JSON: the ancestor's shape (`steps_diff`, `gpu_kernel_us_per_step`,
+Output JSON: `steps_diff`, `gpu_kernel_us_per_step`,
 `launches_per_step`, `memcpy_per_step`, `memset_per_step`,
-`by_kernel_name`, `by_kernel_and_grid`) plus `nsys_sqlite_schema_ok`,
-`steps_a`, `steps_b` (CONTRACT P4's own field list), plus
+`by_kernel_name`, `by_kernel_and_grid`, `nsys_sqlite_schema_ok`,
+`steps_a`, `steps_b`, plus
 `fixed_cost_buckets`/`fixed_cost_time_us`/`fixed_cost_jitter_max_rel` --
-KERNEL-BUCKET-ONLY (round-1 pod-run fix -- see the fixed-cost exception
-in the guard list above; NOT memcpy/memset, see that paragraph's own
+KERNEL-BUCKET-ONLY (see the fixed-cost exception in the guard list above; NOT memcpy/memset, see that paragraph's own
 "DELIBERATELY NOT" wording). `memcpy_per_step`/`memset_per_step`'s own
 `"us"` field is PURELY INFORMATIONAL and SIGNED (jitter-inclusive, never
 clamped, never checked against any tolerance) -- excluded from
-`gpu_kernel_us_per_step` and every other decision field in this report,
-exactly as it already was before this round's memcpy/memset rebuild.
+`gpu_kernel_us_per_step` and every other decision field in this report.
 
-Wall denominator (round-3 pressure-test, contract v4 -- `### Wall
-denominator`): `--wall-a`/`--wall-b` (seconds, each run's OWN
+Wall denominator: `--wall-a`/`--wall-b` (seconds, each run's OWN
 `train_run_wall_s` -- `FinetuneRunTier`) are OPTIONAL; when BOTH are
 given (and pass the `wall_b > wall_a > 0` domain check above), the report
 also carries `wall_s_per_step = (wall_b - wall_a) / (steps_b - steps_a)`
 -- the same (M-N)-step differencing this module already applies to
 kernel/memcpy/memset counts, applied to the wall clock too, so
-`share_wall(C) = time(C)/wall_p50` (`### Wall denominator`) has a
+`share_wall(C) = time(C)/wall_p50` has a
 same-footing per-step wall figure to divide into. Omitted (both flags
 absent) leaves `wall_s_per_step` out of the report entirely -- never a
 fabricated 0.0 -- since this differencer has no way to independently
@@ -271,17 +250,16 @@ build that does not emit the field, a report shape it could not parse,
 or simply choosing not to wire it) must not have a wall denominator
 silently fabricated on its behalf.
 
-Chain-attribution exclusion (round-3 pressure-test, contract v4): E1 (the
-ecological, variable-width leg) is EXCLUDED from signature-based chain
-attribution (`### Attribution`'s element-count/shape signatures assume a
-FIXED width; E1's `BatchLongest` batching fans width out per batch, which
+Chain-attribution exclusion: an ecological, variable-width leg is EXCLUDED
+from signature-based chain attribution (element-count/shape signatures
+assume a FIXED width; a `BatchLongest` leg's batching fans width out per batch, which
 would fan the same kernel out across multiple grid/block buckets and make
 the by-shape signatures uncomparable to the fixed-width legs). Passing
 `--excluded-from-chain-attribution` stamps `excluded_from_chain_attribution:
-true` on the report so a downstream merger/reader never mistakes E1's
-by-name/by-grid rows for chain-attributable evidence -- E1's own role is
+true` on the report so a downstream merger/reader never mistakes such a
+leg's by-name/by-grid rows for chain-attributable evidence -- its role is
 the ecological wall anchor, the LoRA counter check, and the width report,
-never `### Attribution`'s per-chain shares.
+never per-chain shares.
 Omitted (the default) stamps `false`.
 
 Usage: kernel_census.py A.sqlite B.sqlite STEPS_A STEPS_B out.json
@@ -337,14 +315,15 @@ import sys
 # identity" paragraph): every GEMM tile instantiation's demangled name is
 # `void cutlass::Kernel2<INNER>(T1::Params)` -- `INNER` (e.g.
 # `cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1`) is the actual
-# tile identity a downstream reader (and the `#421` attribution's
-# GEMM-family name rule) matches against, so this is the only wrapper this
+# tile identity a downstream reader's GEMM-family name rule matches
+# against, so this is the only wrapper this
 # module strips. Every other demangled name -- including
 # `magma_sgemmEx_kernel<...>`'s own template signature and
 # `splitKreduce_kernel<...>`'s -- is reported AS-IS: their template
 # arguments are what DISTINGUISHES real instantiations for those kernels
 # (unlike `Kernel2`, whose own name never varies across instantiations),
-# so stripping them would re-introduce the exact collapse this fix closes.
+# so stripping them would re-introduce the collapse the key exists to
+# prevent.
 _CUTLASS_KERNEL2_WRAPPER_RE = re.compile(r"^void cutlass::Kernel2<(.+)>\(T1::Params\)$")
 
 
@@ -361,7 +340,7 @@ def _normalize_kernel_name(raw_name: str | None) -> str:
     return m.group(1) if m else raw_name
 
 
-# A "tiny tolerance" (contract's own phrasing): raw (pre-division) delta
+# A "tiny tolerance": raw (pre-division) delta
 # floors below which a negative per-key delta is treated as capture/export
 # noise rather than a sign the pair is not comparable. Deliberately small --
 # these are exact integer/nanosecond accumulators for a same-workload pair
@@ -372,14 +351,12 @@ DEFAULT_LAUNCH_TOLERANCE = 0
 DEFAULT_TIME_TOLERANCE_US = 0.0
 
 # The HYBRID bound a FIXED-COST bucket's (see module doc) time delta is
-# checked against (round-2 re-audit BLOCK 1 on the round-1 fix's own
-# single relative bound): a fixed-cost bucket refuses only if
+# checked against: a fixed-cost bucket refuses only if
 # `|time delta| > max(FIXED_COST_JITTER_FLOOR_NS, rel_tolerance *
 # max(time_a, time_b))` -- the LARGER of an ABSOLUTE floor and a RELATIVE
 # bound, never a relative bound alone. A relative-only bound has two
-# failure modes a pod-run adversarial pass actually found: (1) ZERO
-# margin at any calibrated rel value (the round-4 fix's own "must never
-# refuse" in-tree fixture measured rel == 0.100000 EXACTLY against a
+# failure modes: (1) ZERO margin at any calibrated rel value (an in-tree
+# "must never refuse" fixture can measure rel == 0.100000 EXACTLY against a
 # 0.10 bound -- a single extra nanosecond of jitter per launch flips it
 # to a false refusal), and (2) no floor at all means a bucket with a TINY
 # absolute duration (a single-launch eval-probe kernel a few hundred
@@ -390,24 +367,20 @@ DEFAULT_TIME_TOLERANCE_US = 0.0
 #
 # `FIXED_COST_JITTER_FLOOR_NS` = 1,000,000ns (1ms): comfortably above any
 # real per-bucket scheduler/clock-granularity jitter (which lands in the
-# tens-to-hundreds of nanoseconds, not milliseconds), and three orders of
-# magnitude below the round-4 pod-run LIVE FINDING this whole guard exists
-# to catch -- that finding's own numbers are a fixed-cost bucket whose
-# time delta was ~49.99ms against a bucket whose own max(time_a, time_b)
-# was ~50.01ms, i.e. a RELATIVE jitter of 0.9998 (49_990_000 / 50_010_000)
-# -- NOT "many multiples of 100%", which is arithmetically impossible for
-# a ratio of an absolute-value numerator to a same-sign-or-larger
-# denominator (phase-4 audit advisory 1, correcting an earlier overstated
-# claim in this same comment).
+# tens-to-hundreds of nanoseconds, not milliseconds), and well below the
+# real fixed-cost divergence this guard exists to catch: a bucket whose
+# time delta was ~49.99ms against a max(time_a, time_b) of ~50.01ms, i.e. a
+# RELATIVE jitter of 0.9998 (49_990_000 / 50_010_000). (A ratio of an
+# absolute-value numerator to a same-sign-or-larger denominator cannot
+# exceed 1.0.)
 #
-# `DEFAULT_FIXED_COST_JITTER_REL_TOLERANCE` = 0.5 (50%): the auditor's own
-# note is that ANY bound in [0.3, 0.9] catches the live finding's 0.9998
-# with margin; 0.5 sits in the middle of that range, comfortably clear of
-# both the live finding (0.9998) and genuine calibration fixtures well
-# under it, while still being loose enough that legitimate cross-run
-# scheduling variance on a shared GPU (which can plausibly swing a bucket
-# by tens of percent, not just single-digit percent) does not false-
-# refuse. A caller with box/nsys-version-specific evidence for a
+# `DEFAULT_FIXED_COST_JITTER_REL_TOLERANCE` = 0.5 (50%): ANY bound in
+# [0.3, 0.9] catches that 0.9998 with margin; 0.5 sits in the middle of
+# that range, comfortably clear of both 0.9998 and genuine calibration
+# fixtures well under it, while still being loose enough that legitimate
+# cross-run scheduling variance on a shared GPU (which can plausibly swing
+# a bucket by tens of percent, not just single-digit percent) does not
+# false-refuse. A caller with box/nsys-version-specific evidence for a
 # different pair overrides via `--fixed-cost-jitter-floor-ns`/
 # `--fixed-cost-jitter-rel-tolerance`.
 DEFAULT_FIXED_COST_JITTER_FLOOR_NS = 1_000_000
@@ -448,8 +421,7 @@ class StepsMismatchError(RuntimeError):
 class EmptyDifferencedCensusError(RuntimeError):
     """Named exception for the leg-INVALID "zero buckets carried a
     positive launch-count delta" condition -- every bucket classified as
-    FIXED-COST (or, before this round's fix, silently produced an
-    all-zero report) is not the same failure as a genuine per-key
+    FIXED-COST is not the same failure as a genuine per-key
     violation (`NonComparablePairError`): it means the pair never showed
     ANY differencing-relevant kernel work at all. See module doc."""
 
@@ -520,8 +492,7 @@ def census(path: str) -> tuple[dict, dict, tuple]:
         if not table_present:
             raise KernelTableMissingError(
                 f"{path}: no CUPTI_ACTIVITY_KIND_KERNEL table in this nsys sqlite export -- "
-                "leg INVALID (instrument failure, not a genuine measurement; contract "
-                "`### Instrument`'s per-leg check)"
+                "leg INVALID (instrument failure, not a genuine measurement)"
             )
         cur = con.cursor()
         try:
@@ -605,12 +576,10 @@ def _classify_delta(dn: float, launch_tolerance: float) -> str:
     doc's "EXCEPTION" paragraph): `"fixed_cost"` (`dn` in
     `[-launch_tolerance, 0]` -- includes the exact `dn==0` case),
     `"positive"` (`dn > 0`, real added work), or `"negative_regression"`
-    (`dn < -launch_tolerance`, always refused). KERNEL-BUCKET-ONLY (phase-4
-    audit round-3 re-audit -- a prior round applied this same
-    classification to the memcpy/memset aggregate deltas too; that
-    unification was DELETED, not recalibrated, since memcpy/memset
-    activity is not attributable to any single bucket -- see the module
-    doc's memcpy/memset paragraph)."""
+    (`dn < -launch_tolerance`, always refused). KERNEL-BUCKET-ONLY: it is
+    deliberately not applied to the memcpy/memset aggregate deltas, since
+    memcpy/memset activity is not attributable to any single bucket -- see
+    the module doc's memcpy/memset paragraph."""
     if -launch_tolerance <= dn <= 0:
         return "fixed_cost"
     if dn > 0:
@@ -629,8 +598,7 @@ def _fixed_cost_violation(
 ) -> tuple[float, str | None]:
     """For a bucket `_classify_delta` already called `"fixed_cost"`,
     returns `(relative jitter observed, violation message or None)` --
-    the HYBRID bound (phase-4 audit round-2 re-audit BLOCK 1, see
-    `DEFAULT_FIXED_COST_JITTER_FLOOR_NS`'s own comment for the full
+    the HYBRID bound (see `DEFAULT_FIXED_COST_JITTER_FLOOR_NS`'s own comment for the full
     calibration): refuses only if `|dns|` exceeds BOTH an absolute floor
     and a bound relative to the bucket's own `max(ns_a, ns_b)` -- i.e.
     `|dns| > max(jitter_floor_ns, jitter_rel_tolerance * max(ns_a, ns_b))`
@@ -676,9 +644,7 @@ def build_report(
             f"steps_b ({steps_b}) must be strictly greater than steps_a ({steps_a}) -- "
             "a census difference needs a genuine M>N same-workload pair"
         )
-    # Tolerance-knob domain validation (phase-4 audit round-2 re-audit
-    # BLOCK 2, swept to EVERY remaining numeric knob round-3 re-audit
-    # BLOCK 1): an out-of-domain value for any of these FOUR would
+    # Tolerance-knob domain validation: an out-of-domain value for any of these FOUR would
     # silently DEGRADE or DISABLE a guard rather than raise -- caught
     # here, once, before any of the per-key classification below ever
     # reads them, rather than ad-hoc checks scattered through the loop.
@@ -717,9 +683,8 @@ def build_report(
     # ValueError/exit 2 -- see module doc): non-finite is checked FIRST so
     # a caller gets "not finite" rather than a misleading "does not
     # satisfy wall_b > wall_a > 0" for e.g. `--wall-b inf`, which
-    # trivially SATISFIES that ordering comparison (phase-4 audit round-3
-    # re-audit BLOCK 1's own sibling finding: `inf > wall_a > 0` is `True`,
-    # so without this check `wall_s_per_step` would silently become a
+    # trivially SATISFIES that ordering comparison (`inf > wall_a > 0` is
+    # `True`, so without this check `wall_s_per_step` would silently become a
     # literal `Infinity` in the persisted JSON report).
     if wall_a is not None and not math.isfinite(wall_a):
         raise WallPairInvalidError(f"--wall-a={wall_a} must be finite")
@@ -772,8 +737,7 @@ def build_report(
             # per-step rows entirely (never checked against the FLAT
             # --time-tolerance-us the real added-work buckets use below).
             # Its own time delta is instead bounded by the HYBRID
-            # floor/relative bound (phase-4 audit round-2 re-audit
-            # BLOCK 1) -- see `_fixed_cost_violation`'s own doc.
+            # floor/relative bound -- see `_fixed_cost_violation`'s own doc.
             fixed_cost_buckets += 1
             fixed_cost_time_ns += abs(dns)
             rel, msg = _fixed_cost_violation(
@@ -815,10 +779,9 @@ def build_report(
         )
 
     # memcpy/memset COUNT deltas still refuse exactly like a kernel
-    # bucket's count would (phase-4 audit round-3 re-audit -- a narrow
-    # rebuild, by DELETION, of an earlier round's attempt to unify these
-    # with the per-kernel fixed-cost classification): counts are exact
-    # integers under the contract's pinned flags, so a negative aggregate
+    # bucket's count would (they are deliberately NOT unified with the
+    # per-kernel fixed-cost classification): counts are exact integers
+    # under the pinned flags, so a negative aggregate
     # count beyond --launch-tolerance is still a genuine
     # not-same-workload signal. TIME deltas are DELIBERATELY never
     # classified, never bounded, never refused on -- see the module doc's

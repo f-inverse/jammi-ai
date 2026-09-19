@@ -1,41 +1,31 @@
 #!/usr/bin/env python3
-"""Unification contract C4.2 — Python COMPARISON tuple ⊆ Rust K7-completeness
-const, for both jammi-vs-torch comparators this repo carries.
+"""Python COMPARISON tuple ⊆ Rust K7-completeness const, for both
+jammi-vs-torch comparators this repo carries.
 
 WHAT THIS CHECKS: `ci/scripts/perf/ab_merge.py`'s (re-exported from
-`ci/scripts/perf/identity_fields.py` as of PR #381) `FINETUNE_IDENTITY_FIELDS`
-and `ci/scripts/perf/compare_grad_oracle.py`'s `RUN_IDENTITY_FIELDS` are the
-two COMPARISON tuples a jammi-vs-torch leg-premise check actually gates on
-(contract C4.1: UNCHANGED BY THIS UNIT — growing either from WITHIN this
-unit's own phase-1 work would invalidate every existing merge, since torch
-never emits the Rust-only K7-completeness additions; it does NOT forbid
-independent upstream work with its own reason to grow a tuple — PR #381
-added `max_grad_norm`/`attention_arm`/`warmup` to `FINETUNE_IDENTITY_FIELDS`
-for its own device-clip feature, landed on `main` before this unit merged,
-and contract C3.4 explicitly names the rebase: "whichever of #381 and this
-phase lands second rebases and adds the entry" — this merge is that rebase).
+`ci/scripts/perf/identity_fields.py`) `FINETUNE_IDENTITY_FIELDS` and
+`ci/scripts/perf/compare_grad_oracle.py`'s `RUN_IDENTITY_FIELDS` are the
+two COMPARISON tuples a jammi-vs-torch leg-premise check actually gates on.
+Growing either invalidates every existing merge unless torch emits the new
+field too, since torch never emits the Rust-only K7-completeness additions.
 `crates/jammi-bench/src/report.rs`'s `FinetuneStepTier::IDENTITY_FIELDS` and
 `crates/jammi-bench/src/grad_oracle.rs`'s `GradOracleReport::IDENTITY_FIELDS`
-are the corresponding Rust consts (contract C3.1/C3.2) — a STRICT SUPERSET
-of the Python tuple, adding provenance/dispatch facts the comparison
-deliberately omits. This suite asserts, mechanically:
+are the corresponding Rust consts — a STRICT SUPERSET of the Python tuple,
+adding provenance/dispatch facts the comparison deliberately omits. This
+suite asserts, mechanically:
 
   1. Every entry of `FINETUNE_IDENTITY_FIELDS` is named in
      `FinetuneStepTier::IDENTITY_FIELDS`.
   2. Every entry of `RUN_IDENTITY_FIELDS` is named in
      `GradOracleReport::IDENTITY_FIELDS`.
-  3. `FINETUNE_IDENTITY_FIELDS` has EXACTLY 18 entries (14 from this unit's
-     own phase 1 + `max_grad_norm`/`attention_arm`/`warmup` from PR #381,
-     merged onto this branch, + `row_lengths` from the M1b B3-padded-batch
-     transport — `crates/jammi-bench/src/report.rs`'s own
-     `FinetuneStepTier::IDENTITY_FIELDS` doc names this file's growth to 18
-     as its expected companion docs-ci change) and `RUN_IDENTITY_FIELDS`
-     has EXACTLY 11 — the "unchanged BY THIS UNIT" half of C4.1 is a
+  3. `FINETUNE_IDENTITY_FIELDS` has EXACTLY 18 entries
+     (`crates/jammi-bench/src/report.rs`'s own
+     `FinetuneStepTier::IDENTITY_FIELDS` doc names this count as its
+     expected companion) and `RUN_IDENTITY_FIELDS` has EXACTLY 11 — a
      NUMBER this suite pins, not a promise left to prose (a silent addition
-     from WITHIN this unit that happened to still satisfy the subset check
-     would pass (1)/(2) above but fail this count; the count itself is
-     bumped only in lockstep with a real, externally-landed identity
-     field, as this merge does).
+     that still satisfied the subset check would pass (1)/(2) above but
+     fail this count; the count is bumped only in lockstep with a real
+     identity field both producers emit).
 
 HOW: the two Python tuples are IMPORTED directly (this is exactly what a
 `main()` caller of either module reads, never a re-parsed copy of the
@@ -43,9 +33,8 @@ literal). The two Rust consts are extracted with a REGEX over the tracked
 `.rs` source — never `rustc`/`cargo` (this checker's job is verifying the
 COMMITTED SOURCE a compiled binary would be built from, not compiling
 anything itself, so it stays a hermetic guard — no network, no build). A
-missing const, or a `.rs` file that no longer exists, is a FAIL-CLOSED
-`SystemExit`, never a silent skip (RED at base: `IDENTITY_FIELDS` does not
-exist there at all).
+missing const, or a missing `.rs` file, is a FAIL-CLOSED `SystemExit`,
+never a silent skip.
 
 Stdlib-only (`unittest`), same footing every other `ci/scripts/perf/test_*.py`
 in this directory takes.
@@ -114,9 +103,8 @@ def _extract_rust_identity_fields(path: str) -> list[str]:
 # struct's OWN `impl <Struct> {` marker onward, so the SAME "first matching
 # block" regex then unambiguously finds THAT struct's const — never the
 # unscoped file-wide first match. Mirrors `check_cuda_run_artifacts.py`'s own
-# restructure of `build_identity_tuples()` (unit-62 E6 gate-restructure
-# commit) — the SAME struct-scoping idea, applied independently here since
-# this checker never imports that gate module.
+# `build_identity_tuples()` — the SAME struct-scoping idea, applied
+# independently here since this checker never imports that gate module.
 _PROVENANCE_FIELDS_BLOCK_RE = re.compile(
     r"pub const PROVENANCE_FIELDS:\s*&'static \[\(&'static str,\s*"
     r"[\w:]*Nullable\)\]\s*=\s*&\[(.*?)\n    \];",
@@ -159,14 +147,11 @@ class FinetuneStepIdentityFieldsSubsetTests(unittest.TestCase):
         self.assertEqual(
             len(ab_merge.FINETUNE_IDENTITY_FIELDS),
             18,
-            "ab_merge.py::FINETUNE_IDENTITY_FIELDS must have EXACTLY 18 entries — 14 "
-            "from unit 61 phase 1 + max_grad_norm/attention_arm/warmup from PR #381 "
-            "+ row_lengths from the M1b B3-padded-batch transport (contract C3.4's "
-            "named rebase, then this row_lengths fold-in). A count OTHER than 18 "
-            "means either this unit grew the tuple itself (forbidden, contract C4.1) "
-            "or an upstream identity set changed shape after this fold-in was "
-            "written — either way, re-derive this number from source, never bump it "
-            "to make the test pass.",
+            "ab_merge.py::FINETUNE_IDENTITY_FIELDS must have EXACTLY 18 entries, the "
+            "count FinetuneStepTier::IDENTITY_FIELDS's own doc names. A count OTHER "
+            "than 18 means the tuple grew or shrank without both producers emitting "
+            "the change — re-derive this number from source, never bump it to make "
+            "the test pass.",
         )
         # The tuple itself must not carry a duplicate — a dup would let the
         # subset check below pass trivially without covering 18 distinct
@@ -188,9 +173,9 @@ class FinetuneStepIdentityFieldsSubsetTests(unittest.TestCase):
         )
 
     def test_the_rust_const_is_a_strict_superset(self):
-        # Not a hard requirement of C4.1, but documents the shape this
-        # suite expects: the Rust const carries the 5 K7-completeness
-        # additions beyond the 14-field comparison tuple.
+        # Not a hard requirement, but documents the shape this suite
+        # expects: the Rust const carries K7-completeness additions beyond
+        # the comparison tuple.
         extra = self.rust_fields - set(ab_merge.FINETUNE_IDENTITY_FIELDS)
         self.assertGreaterEqual(
             len(extra),
@@ -200,7 +185,7 @@ class FinetuneStepIdentityFieldsSubsetTests(unittest.TestCase):
             "(device_name / kernels_disabled_requested / kernels_disabled_fired / "
             "flash_compiled / build_features) — if this ever regresses to exactly "
             "the Python tuple, the two consts collapsed into one and the 'strict "
-            "superset' framing in report.rs's own doc is no longer true",
+            "superset' framing in report.rs's own doc is false",
         )
 
 
@@ -212,9 +197,8 @@ class GradOracleIdentityFieldsSubsetTests(unittest.TestCase):
         self.assertEqual(
             len(compare_grad_oracle.RUN_IDENTITY_FIELDS),
             11,
-            "compare_grad_oracle.py::RUN_IDENTITY_FIELDS must stay UNCHANGED at 11 "
-            "entries (contract C4.1) — a silent growth here invalidates every "
-            "existing comparison",
+            "compare_grad_oracle.py::RUN_IDENTITY_FIELDS must have EXACTLY 11 "
+            "entries — a silent growth here invalidates every existing comparison",
         )
         self.assertEqual(
             len(set(compare_grad_oracle.RUN_IDENTITY_FIELDS)),
@@ -243,7 +227,7 @@ class GradOracleIdentityFieldsSubsetTests(unittest.TestCase):
 
 
 class EncodeStepIdentityFieldsSubsetTests(unittest.TestCase):
-    """Unit-62 E6 mirror: `identity_fields.ENCODE_IDENTITY_FIELDS` (Python)
+    """`identity_fields.ENCODE_IDENTITY_FIELDS` (Python)
     against `EncodeStepTier::IDENTITY_FIELDS`/`::PROVENANCE_FIELDS` (Rust,
     `report.rs`). UNLIKE `FinetuneStepIdentityFieldsSubsetTests` above, this
     is an EQUALITY check, not a subset check — `EncodeStepTier` keeps its
@@ -268,9 +252,7 @@ class EncodeStepIdentityFieldsSubsetTests(unittest.TestCase):
             len(identity_fields.ENCODE_IDENTITY_FIELDS),
             15,
             "identity_fields.py::ENCODE_IDENTITY_FIELDS must have EXACTLY 15 entries "
-            "(unit-62 CONTRACT.md §E3/E6's pinned list, grown from 13 by the round-3 "
-            "audit F-5'/lead ruling's checkpoint_pooling_sha256 + device_requested "
-            "addition) — a count other than 15 means either this const drifted from "
+            "— a count other than 15 means either this const drifted from "
             "EncodeStepTier::IDENTITY_FIELDS or the Rust side itself grew/shrank; "
             "re-derive from source, never bump to make this test pass.",
         )
@@ -285,7 +267,7 @@ class EncodeStepIdentityFieldsSubsetTests(unittest.TestCase):
             len(self.rust_provenance_fields),
             7,
             f"EncodeStepTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 7 "
-            "entries (unit-62 CONTRACT.md §E3's pinned provenance list) — a count "
+            "entries — a count "
             f"other than 7 means the Rust const drifted: {sorted(self.rust_provenance_fields)}",
         )
 
@@ -305,7 +287,7 @@ class EncodeStepIdentityFieldsSubsetTests(unittest.TestCase):
         self.assertFalse(
             overlap,
             f"EncodeStepTier::IDENTITY_FIELDS and ::PROVENANCE_FIELDS share field(s) {sorted(overlap)} — "
-            "unit-62's E3 design keeps these two sets DISJOINT (never a field in both)",
+            "the design keeps these two sets DISJOINT (never a field in both)",
         )
         overlap_py = set(identity_fields.ENCODE_IDENTITY_FIELDS) & self.rust_provenance_fields
         self.assertFalse(
@@ -316,7 +298,7 @@ class EncodeStepIdentityFieldsSubsetTests(unittest.TestCase):
         )
 
     def test_attention_arm_is_not_an_identity_field(self):
-        # Negative control (v2 reshape 3 of the unit-62 plan): a dispatched
+        # Negative control: a dispatched
         # arm is post-hoc, never knowable before compute, so it can never be
         # a memoization key — mirrors EncodeStepTier's own Rust-side
         # negative-control test in encode_step.rs.
@@ -326,7 +308,7 @@ class EncodeStepIdentityFieldsSubsetTests(unittest.TestCase):
 
 
 class GpuInferenceIdentityFieldsSubsetTests(unittest.TestCase):
-    """Issue #335 D4 mirror: `identity_fields.GPU_INFERENCE_IDENTITY_FIELDS`
+    """`identity_fields.GPU_INFERENCE_IDENTITY_FIELDS`
     (Python) against `GpuInferenceTier::IDENTITY_FIELDS`/`::PROVENANCE_FIELDS`
     (Rust, `report.rs`). Mirrors `EncodeStepIdentityFieldsSubsetTests`'s own
     EQUALITY (not subset) shape exactly — `GpuInferenceTier` also keeps its
@@ -346,8 +328,7 @@ class GpuInferenceIdentityFieldsSubsetTests(unittest.TestCase):
             len(identity_fields.GPU_INFERENCE_IDENTITY_FIELDS),
             12,
             "identity_fields.py::GPU_INFERENCE_IDENTITY_FIELDS must have EXACTLY 12 "
-            "entries (issue #335 D4's pinned list, grown 9 -> 12 by round-1 "
-            "adversarial audit B1: corpus_seed, row_count, warmup, iters, "
+            "entries (corpus_seed, row_count, warmup, iters, "
             "corpus_sha256, compute_precision, and the embed/infer bundles' three "
             "checkpoint hashes each) — a count other than 12 means either this const "
             "drifted from GpuInferenceTier::IDENTITY_FIELDS or the Rust side itself "
@@ -385,7 +366,7 @@ class GpuInferenceIdentityFieldsSubsetTests(unittest.TestCase):
         self.assertFalse(
             overlap,
             f"GpuInferenceTier::IDENTITY_FIELDS and ::PROVENANCE_FIELDS share field(s) "
-            f"{sorted(overlap)} — issue #335 D4 keeps these two sets DISJOINT (never a field "
+            f"{sorted(overlap)} — the design keeps these two sets DISJOINT (never a field "
             "in both)",
         )
         overlap_py = set(identity_fields.GPU_INFERENCE_IDENTITY_FIELDS) & self.rust_provenance_fields
@@ -398,7 +379,7 @@ class GpuInferenceIdentityFieldsSubsetTests(unittest.TestCase):
 
 
 class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
-    """Unit-63 H4b mirror: `identity_fields.FINETUNE_RUN_IDENTITY_FIELDS`
+    """`identity_fields.FINETUNE_RUN_IDENTITY_FIELDS`
     (Python) against `FinetuneRunTier::IDENTITY_FIELDS`/`::PROVENANCE_FIELDS`
     (Rust, `report.rs`). Scoped to `impl FinetuneRunTier {` the same way
     `EncodeStepIdentityFieldsSubsetTests` above scopes to `impl
@@ -423,15 +404,10 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
             len(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS),
             37,
             "identity_fields.py::FINETUNE_RUN_IDENTITY_FIELDS must have EXACTLY 37 entries "
-            "(unit-63 adversarial-audit finding 5's pinned count of 32 -- the original CONTRACT "
-            "H4 35 minus split_rule/split_seed/batched_forward/steps_measured (4 reclassified "
-            "out of identity), plus heldout_pairs_sha256 (1 added), 35 - 4 + 1 = 32 -- PLUS issue "
-            "#356 P1 item 5's layers_to_transform (1 added), 32 + 1 = 33, PLUS issue #421 P1-b's "
-            "four (lora_init, task, train_media_sha256, heldout_media_sha256 -- the last three "
-            "close K7 holes --task and the media loader opened: the TOWER a leg trained and the "
-            "media corpus CONTENT behind a manifest of paths were both outside the comparison "
-            "tuple), 33 + 4 = 37, the SAME count FinetuneRunTier's own Rust-side test pins). A "
-            "count other than 37 means either this mirror drifted from "
+            "(the SAME count FinetuneRunTier's own Rust-side test pins; task, "
+            "train_media_sha256 and heldout_media_sha256 are what make the TOWER a leg "
+            "trained and the media corpus CONTENT behind a manifest of paths part of the "
+            "comparison). A count other than 37 means either this mirror drifted from "
             "FinetuneRunTier::IDENTITY_FIELDS or the Rust side itself grew/shrank; re-derive "
             "from source, never bump to make this test pass.",
         )
@@ -446,27 +422,24 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
             len(self.rust_provenance_fields),
             13,
             f"FinetuneRunTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 13 entries "
-            "(CONTRACT H4's original 7 -- arm, device_name, kernels_disabled_requested, "
-            "kernels_disabled_fired, flash_compiled, build_features, attention_arm -- plus the "
-            "unit-63 adversarial-audit finding-5(c)/advisory-(d) reclassifications split_rule, "
-            "batched_forward, steps_measured, plus issue #421 P1-b(i)'s "
-            "kernels_disabled_expected -- the CALLER-declared --expect-kernels-disabled claim, "
-            "provenance in exactly `arm`'s sense -- plus issue #421 §D4 item 1's "
+            "(arm, device_name, kernels_disabled_requested, kernels_disabled_fired, "
+            "flash_compiled, build_features, attention_arm, split_rule, batched_forward, "
+            "steps_measured; kernels_disabled_expected -- the CALLER-declared "
+            "--expect-kernels-disabled claim, provenance in exactly `arm`'s sense; "
             "fusible_site_census, the WITNESSED per-forward seam census the tower profile's "
             "positive-proof equation reads its `calls` term off: a STRUCTURAL property of the "
             "build in batched_forward's sense, fully determined by the identity fields that "
-            "already select the model and the adapter set, so provenance and never identity -- "
-            "12, plus the #421 media front-end parallelization follow-on's "
-            "rayon_pool_threads, the rayon GLOBAL pool size the run's process executed under "
+            "already select the model and the adapter set, so provenance and never identity; "
+            "and rayon_pool_threads, the rayon GLOBAL pool size the run's process executed under "
             "(machine/build provenance -- the pool size is fixed by the host and the process's "
             "own thread-pool init, never a determinant of what a step computes -- so "
-            "provenance and never identity, same as `device_name`), 12 + 1 = 13) "
+            "provenance and never identity, same as `device_name`)) "
             "— got: "
             f"{sorted(self.rust_provenance_fields)}",
         )
 
     def test_fusible_site_census_is_provenance_and_never_identity(self):
-        """Issue #421 §D4 item 1, per-field pin: a bare cardinality
+        """Per-field pin: a bare cardinality
         assertion goes green again if one field is added while another is
         dropped, so the new entry is named on BOTH sides of the split."""
         self.assertIn(
@@ -530,7 +503,7 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
         self.assertFalse(
             overlap,
             f"FinetuneRunTier::IDENTITY_FIELDS and ::PROVENANCE_FIELDS share field(s) "
-            f"{sorted(overlap)} — CONTRACT H4's design keeps these two sets DISJOINT (never a "
+            f"{sorted(overlap)} — the design keeps these two sets DISJOINT (never a "
             "field in both)",
         )
         overlap_py = set(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS) & self.rust_provenance_fields
@@ -562,7 +535,7 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
         # here as a count, because the property is set EQUALITY against a
         # set derived from source, and a hand-written count in this comment
         # is a second copy of that fact that goes stale the moment a field
-        # crosses NonNull/NullMeans (it already had, twice). A set this
+        # crosses NonNull/NullMeans. A set this
         # suite derives from
         # `report.rs` independently of the hand-written Python frozenset
         # above (regex over the FULL `("field", Nullable::NullMeans...)`
@@ -590,18 +563,13 @@ class F32StoredFieldCanonicalizerTests(unittest.TestCase):
     `max_grad_norm` — the ONLY two `IDENTITY_FIELD_CANONICALIZERS` members
     beyond `backbone_dtype`/`target_modules`) — TRUE literals throughout
     (never two values FABRICATED from the same Python literal on both
-    sides, which is exactly why this representational gap went uncaught
-    before this canonicalizer existed): `0.05000000074505806` is the REAL
-    `f64` a Python/JSON round-trip produces for the IEEE-754 `f32` nearest
-    `0.05`; `0.30000001192092896` is the same for `0.3`.
-
-    `closes_escape: esc-067-committed-producer-never-executed-end-to-end`
-    — before this canonicalizer, a real pod run of `finetune_ab.sh`
-    rejected every `dropout != 0` cross-stack row (jammi's own f32-stored
+    sides, which would hide this representational gap entirely):
+    `0.05000000074505806` is the REAL `f64` a Python/JSON round-trip produces
+    for the IEEE-754 `f32` nearest `0.05`; `0.30000001192092896` is the same
+    for `0.3`. Without this canonicalizer a real `finetune_ab.sh` run rejects
+    every `dropout != 0` cross-stack row (jammi's own f32-stored
     `0.05000000074505806` vs torch's f64 literal `0.05`) as a leg-premise
-    mismatch, one of three defects a real end-to-end run found that no
-    hermetic suite had ever exercised. This class is the hermetic,
-    RED-then-GREEN half of that fix's own eval.
+    mismatch.
     """
 
     def test_lora_dropout_f32_vs_f64_literal_matches(self):
@@ -661,7 +629,7 @@ class F32StoredFieldCanonicalizerTests(unittest.TestCase):
 
 
 class F32DomainGuardTests(unittest.TestCase):
-    """Advisory (adversarial audit): `_round_trip_f32`'s domain guard —
+    """`_round_trip_f32`'s domain guard —
     out-of-`f32`-range/non-finite input becomes a REFUSAL
     (`_NotRepresentableAsF32`), never an uncaught `OverflowError` crash.
     """
@@ -708,15 +676,15 @@ class F32DomainGuardTests(unittest.TestCase):
         self.assertNotEqual(a, b)
 
     def test_normal_values_are_unaffected_by_the_domain_guard(self):
-        # Positive control: the ordinary f32-round-trip match still works
-        # exactly as before this guard was added.
+        # Positive control: the ordinary f32-round-trip match is untouched
+        # by the guard.
         self.assertEqual(
             identity_fields.canonicalize_identity_field("lora_dropout", 0.05000000074505806),
             identity_fields.canonicalize_identity_field("lora_dropout", 0.05),
         )
 
     def test_repr_is_instance_unique_even_for_the_identical_raw_value(self):
-        """Advisory (ii), round-2 adversarial audit: `finetune_run_leg_
+        """`finetune_run_leg_
         identity_violations` (`ab_merge.py`) groups displayed values by
         `repr(display)` -- a plain dict KEY, never by `==`. A `raw`-only
         `__repr__` would let two DIFFERENT `_NotRepresentableAsF32`

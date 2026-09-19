@@ -3,7 +3,7 @@
 //! this file is the layer ABOVE it: the `Saved<T>`/`StatefulKernelOp`
 //! wiring specifically.
 
-use candle_core::{CudaDevice, DType, Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use jammi_kernels::flash::{CuSeqlens, VarlenConfig};
 use jammi_kernels::ops::{flash_attention_varlen, SavedError};
 

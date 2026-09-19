@@ -1261,6 +1261,51 @@ else
   bad "rp_wait_poll probe precedence: expected 10/3, got interval=${rp_wp_interval:-<empty>} countmax=${rp_wp_countmax:-<empty>}"
 fi
 
+# ============================================================================
+# cargo argument shape: `cargo test` takes ONE test-name filter before `--`;
+# libtest takes any number after it. A second filter before `--` is a cargo
+# usage error that fails the group before anything builds.
+# ============================================================================
+cargo_filter_count() {
+  python3 - "$1" <<'PY'
+import shlex, sys
+VALUED = {"-p", "--package", "--features", "-F", "--test", "--bench", "--bin", "--example",
+          "--target", "--target-dir", "--profile", "-j", "--jobs", "--manifest-path", "--color"}
+bad = []
+for n, line in enumerate(open(sys.argv[1]), 1):
+    text = line.strip().replace("\\$", "$")
+    if not text.startswith("cargo test "):
+        continue
+    words = shlex.split(text.split(" || ")[0].split(" 2>&1")[0], posix=True)[2:]
+    words = words[: words.index("--")] if "--" in words else words
+    positional, skip = [], False
+    for w in words:
+        if skip:
+            skip = False
+        elif w in VALUED:
+            skip = True
+        elif not w.startswith("-"):
+            positional.append(w)
+    if len(positional) > 1:
+        bad.append(f"{n}: {' '.join(positional)}")
+print("\n".join(bad))
+PY
+}
+filters="$(cargo_filter_count "$PROVE_SH")"
+if [ -z "$filters" ]; then
+  ok "cargo argument shape: every cargo test names at most one filter before --"
+else
+  bad "cargo argument shape: more than one test filter before -- at: $filters"
+fi
+two_filters="$(mktemp)"
+printf 'cargo test -p x --test it a b -- --nocapture || grc=$?\n' > "$two_filters"
+if [ -n "$(cargo_filter_count "$two_filters")" ]; then
+  ok "cargo argument shape: a second filter before -- is caught"
+else
+  bad "cargo argument shape: a second filter before -- went unnoticed"
+fi
+rm -f "$two_filters"
+
 echo
 echo "gpu-prove-lane: ${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ]

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Sourceable-only: `runpod_gpu_perf_ab.sh`'s own clone+checkout+wrong-tree-
-# verification block (round-2 adversarial audit F1), factored into its own
+# verification block, factored into its own
 # file so a hermetic test can `source` and drive this EXACT function against
 # a scratch repo -- and so the REMOTE pod runs the EXACT same code, never a
 # second, independently-drifting copy: `runpod_gpu_perf_ab.sh` embeds this
@@ -11,7 +11,7 @@
 # order of operations).
 #
 # The checkout step itself follows this repo's own bootstrap idiom
-# (runpod_lib.sh:1515) verbatim: `git checkout --quiet "$ref" || { echo
+# (runpod_lib.sh's rp_bootstrap) verbatim: `git checkout --quiet "$ref" || { echo
 # "::error::checkout $ref failed"; ...; }` — this function `return`s 2
 # instead of `exit`ing (it is meant to be CALLED, not sourced-and-run), and
 # the caller propagates that return code as its own exit code.
@@ -23,12 +23,11 @@
 # runpod_perf_ab_clone_and_checkout <dest> <repo_url> <git_ref> <default_branch>
 #
 # Clones <repo_url> into <dest> as a blobless partial clone
-# (`--filter=blob:none` — the SAME pod-clone idiom runpod_lib.sh:1505
-# already uses: this workload only ever needs ONE checked-out tree's file
+# (`--filter=blob:none` — the SAME pod-clone idiom runpod_lib.sh's
+# rp_bootstrap uses: this workload only ever needs ONE checked-out tree's file
 # contents plus the full commit graph for `git merge-base`, never every
-# historical blob), then sets `uploadpack.allowFilter=true` ON THAT CLONE
-# (round-3 adversarial audit B1, the auditor's own reproduction of a fatal
-# clone-composition bug): `gpu_inference_ab.sh`'s own inner clones
+# historical blob), then sets `uploadpack.allowFilter=true` ON THAT CLONE:
+# `gpu_inference_ab.sh`'s own inner clones
 # (`clone_and_checkout`) clone AGAIN, also `--filter=blob:none`, FROM
 # <dest> once this driver hands off to it. A git repo's DEFAULT
 # `uploadpack.allowFilter=false` means <dest>, acting as that inner
@@ -49,7 +48,7 @@
 # success (matching the caller's own prior inline `cd jammi-ai` step, so no
 # caller-side `cd` is needed after calling this).
 #
-# WRONG-TREE refusal (round-2 adversarial audit F1): when <git_ref> is NOT
+# WRONG-TREE refusal: when <git_ref> is NOT
 # literally <default_branch>, this REFUSES (return 2) if the checked-out
 # HEAD resolves to the EXACT SAME commit as origin/<default_branch>'s own
 # tip — a non-default ref that lands on main's own commit is almost
@@ -57,8 +56,8 @@
 # not a legitimate "this branch has zero commits ahead of main yet" case
 # worth trusting blindly for an A/B comparator whose entire point is
 # measuring TWO DIFFERENT trees. `<git_ref> == <default_branch>` is exempt
-# (an operator who deliberately targets the default branch is not making
-# this mistake).
+# (a caller who deliberately targets the default branch is not making this
+# mistake).
 #
 # Returns 0 on success, 2 on any clone/checkout/verification failure
 # (this script family's own usage/infra-error bucket).
@@ -68,8 +67,7 @@ runpod_perf_ab_clone_and_checkout() {
   git clone --quiet --filter=blob:none "$repo_url" "$dest" \
     || { echo "::error::cloning $repo_url -> $dest failed"; return 2; }
 
-  # round-3 adversarial audit B1 (fatal clone composition, the auditor's own
-  # reproduction): this clone is now ITSELF a partial (blobless) clone --
+  # This clone is ITSELF a partial (blobless) clone --
   # `gpu_inference_ab.sh`'s own inner clones (`clone_and_checkout`) clone
   # AGAIN, `--filter=blob:none`, FROM this dir (`file://$REPO_ROOT`) once
   # this driver hands off to it. A git repo's default

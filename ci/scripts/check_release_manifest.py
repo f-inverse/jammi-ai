@@ -3,7 +3,7 @@
 
 **Guarded property**: the manifest's three CUDA release lanes describe ONE
 shipped capability surface, and every op it names is classified by exactly
-ONE proof mechanism. The three CPU release lanes (#507) ship no capability
+ONE proof mechanism. The three CPU release lanes ship no capability
 surface at all — `capabilities` is required iff a lane's own
 `cargo_features` reaches `cuda`/`flash-attn`, forbidden otherwise.
 
@@ -38,7 +38,7 @@ network, no build, no toolchain):
      (SYNTACTIC here — a literal feature-name match; the toolchain-bearing
      `check_flash_attn_closure.py` re-derives the same fact from the real
      feature graph) — and `capabilities` is FORBIDDEN (a FINDING if present)
-     on every OTHER lane (#507: a CPU family ships no capability surface).
+     on every OTHER lane (a CPU family ships no capability surface).
      Fail-closed: a missing/renamed/extra key is a FINDING, never a silently
      skipped check.
   2. Every lane's `capabilities` block, among the lanes that carry one, is
@@ -61,7 +61,7 @@ real device. That is `capability_surface.rs`'s job (a live registry-delta
 probe) and `check_flash_attn_closure.py`'s (the feature-graph closure). This
 gate is the internal-consistency floor underneath both.
 
-  5. (esc-081) The top-level key set is CLOSED at exactly `{_schema_doc,
+  5. The top-level key set is CLOSED at exactly `{_schema_doc,
      lanes, server_only_cargo_features, prove_lane}` -- an extra top-level
      key is a FINDING, never silently ignored (the same "closed set, not a
      denylist" discipline `capabilities` already gets, one level up).
@@ -128,7 +128,7 @@ NON_CATEGORY_CAPABILITY_KEYS = frozenset(
 # ways a dispatch-registry key is named in this workspace.
 _REGISTRY_KEY_RE = re.compile(r"(?:cascade_)?counters_for\(\s*\"([a-z0-9_]+)\"")
 
-# #507: `capabilities` is REQUIRED on a lane iff its `cargo_features` names
+# `capabilities` is REQUIRED on a lane iff its `cargo_features` names
 # either of these — SYNTACTIC here (this gate has no toolchain, no cargo
 # metadata): a literal feature-name match, never a derived closure over the
 # workspace feature graph. `check_flash_attn_closure.py` (toolchain-bearing)
@@ -277,7 +277,7 @@ def check_manifest(manifest: dict, repo_root: Path = REPO_ROOT) -> list[str]:
     if not isinstance(lanes, dict) or not lanes:
         return ["manifest has no (or an empty) `lanes` object — nothing to check"]
 
-    # (1b)/(2) #507: `capabilities` is REQUIRED iff the lane's own
+    # (1b)/(2) `capabilities` is REQUIRED iff the lane's own
     # `cargo_features` names `cuda`/`flash-attn` (SYNTACTIC — see
     # `_lane_needs_capabilities`'s own doc), FORBIDDEN otherwise; among the
     # lanes that DO carry one, every block must be IDENTICAL (compared as
@@ -294,14 +294,14 @@ def check_manifest(manifest: dict, repo_root: Path = REPO_ROOT) -> list[str]:
             if not isinstance(caps, dict):
                 problems.append(
                     f"lane `{lane_name}`: `cargo_features` names `cuda` or `flash-attn` but "
-                    f"has no `capabilities` object (#507: capabilities is REQUIRED here)"
+                    f"has no `capabilities` object (capabilities is REQUIRED here)"
                 )
                 continue
             canonical[lane_name] = json.dumps(caps, indent=2, sort_keys=False)
         elif caps is not None:
             problems.append(
                 f"lane `{lane_name}`: `cargo_features` names neither `cuda` nor "
-                f"`flash-attn` — `capabilities` must be ABSENT (#507: forbidden on a "
+                f"`flash-attn` — `capabilities` must be ABSENT (forbidden on a "
                 f"non-CUDA family), found a {type(caps).__name__}"
             )
     if len(set(canonical.values())) > 1:
@@ -446,7 +446,7 @@ def _self_test() -> int:
     probs = check_manifest(m, REPO_ROOT)
     check("divergent-lane-capability-block-caught", any("differs from lane" in p for p in probs), f"{probs}")
 
-    # 1b. (#507) A CPU family carrying `capabilities` is a FINDING — the
+    # 1b. A CPU family carrying `capabilities` is a FINDING — the
     # syntactic rule reads `cargo_features`, never the presence of the
     # block alone.
     m = _fixture_manifest()
@@ -461,7 +461,7 @@ def _self_test() -> int:
         f"{probs}",
     )
 
-    # 1c. (#507) A CUDA family (cargo_features names `cuda`) with NO
+    # 1c. A CUDA family (cargo_features names `cuda`) with NO
     # `capabilities` block is a FINDING — capabilities is REQUIRED there.
     m = _fixture_manifest()
     del m["lanes"]["b"]["capabilities"]
@@ -472,7 +472,7 @@ def _self_test() -> int:
         f"{probs}",
     )
 
-    # 1d. (#507) A CPU family with NO `capabilities` block (the real,
+    # 1d. A CPU family with NO `capabilities` block (the real,
     # correct shape) is accepted.
     m = _fixture_manifest()
     m["lanes"]["c"] = {"cargo_features": ["jetstream-broker", "storage-cloud"]}
@@ -597,7 +597,7 @@ def _self_test() -> int:
     probs = check_manifest({"lanes": {}}, REPO_ROOT)
     check("empty-lanes-object-caught", probs != [], f"{probs}")
 
-    # 9. (esc-081) An extra top-level key is caught -- the closed-set rule.
+    # 9. An extra top-level key is caught -- the closed-set rule.
     m = _fixture_manifest()
     m["some_new_section"] = {"whatever": True}
     probs = check_manifest(m, REPO_ROOT)

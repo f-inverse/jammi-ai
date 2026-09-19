@@ -329,7 +329,7 @@ echo "::endgroup::"
 echo "::group::served-client-server-proof"
 grc=0
 echo "PROVE_TUPLE crate=jammi-server kind=test features=cuda,flash-attn,jetstream-broker,live-gpu-tests,storage-cloud"
-cargo test -p jammi-server --features cuda,flash-attn,jetstream-broker,live-gpu-tests,storage-cloud --test it grpc_embedding_gpu grpc_remote_session_gpu -- --nocapture --test-threads=1 || grc=\$?
+cargo test -p jammi-server --features cuda,flash-attn,jetstream-broker,live-gpu-tests,storage-cloud --test it -- grpc_embedding_gpu grpc_remote_session_gpu --nocapture --test-threads=1 || grc=\$?
 [ "\$grc" -ne 0 ] && rc=\$grc
 echo "PROVE_GROUP_RC name=served-client-server-proof rc=\${grc}"
 echo "::endgroup::"

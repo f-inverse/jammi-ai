@@ -53,16 +53,16 @@ pub(crate) mod softmax;
 
 pub(crate) const PTX_ADAMW_STEP: &str = include_str!(concat!(env!("OUT_DIR"), "/adamw_step.ptx"));
 pub(crate) const PTX_CAST_SCALE: &str = include_str!(concat!(env!("OUT_DIR"), "/cast_scale.ptx"));
-/// F16 monomorphic arm (campaign #443 W2c) — see `cast_scale_f16.cu`'s
-/// module doc. Backs the NEW `CastScaleF16F32`/`CastAddF16` types
-/// (`ops::cast_scale`), not a widened match arm on the existing
+/// F16 monomorphic arm — see `cast_scale_f16.cu`'s
+/// module doc. Backs the separate `CastScaleF16F32`/`CastAddF16` types
+/// (`ops::cast_scale`), not a widened match arm on the
 /// BF16-monomorphic `CastScaleBf16F32`/`CastAddBf16`.
 pub(crate) const PTX_CAST_SCALE_F16: &str =
     include_str!(concat!(env!("OUT_DIR"), "/cast_scale_f16.ptx"));
 pub(crate) const PTX_DROPOUT: &str = include_str!(concat!(env!("OUT_DIR"), "/dropout.ptx"));
-/// F16 monomorphic arm (campaign #443 W2c) — see `dropout_f16.cu`'s module
+/// F16 monomorphic arm — see `dropout_f16.cu`'s module
 /// doc; carries its own Philox4x32-10 device functions (no shared `.cuh`,
-/// per the W2b idiom this file continues).
+/// the same idiom as every F16 translation unit here).
 pub(crate) const PTX_DROPOUT_F16: &str = include_str!(concat!(env!("OUT_DIR"), "/dropout_f16.ptx"));
 pub(crate) const PTX_GEGLU: &str = include_str!(concat!(env!("OUT_DIR"), "/geglu.ptx"));
 pub(crate) const PTX_GELU_ERF: &str = include_str!(concat!(env!("OUT_DIR"), "/gelu_erf.ptx"));
@@ -80,16 +80,16 @@ pub(crate) const PTX_ROPE: &str = include_str!(concat!(env!("OUT_DIR"), "/rope.p
 pub(crate) const PTX_ROPE_F16: &str = include_str!(concat!(env!("OUT_DIR"), "/rope_f16.ptx"));
 pub(crate) const PTX_ROPE_POSITIONS: &str =
     include_str!(concat!(env!("OUT_DIR"), "/rope_positions.ptx"));
-/// F16 monomorphic arm (campaign #443 W2c) — see `rope_positions_f16.cu`'s
+/// F16 monomorphic arm — see `rope_positions_f16.cu`'s
 /// module doc; carries its own copy of `rope_common.cuh`'s `rope_rotate`
-/// (no shared `.cuh`, per `rope_f16.cu`'s identical W2b precedent).
+/// (no shared `.cuh`, the same as `rope_f16.cu`).
 pub(crate) const PTX_ROPE_POSITIONS_F16: &str =
     include_str!(concat!(env!("OUT_DIR"), "/rope_positions_f16.ptx"));
 pub(crate) const PTX_SCALED_CAST_ADD: &str =
     include_str!(concat!(env!("OUT_DIR"), "/scaled_cast_add.ptx"));
-/// F16 monomorphic arm (campaign #443 W2c) — see `scaled_cast_add_f16.cu`'s
+/// F16 monomorphic arm — see `scaled_cast_add_f16.cu`'s
 /// module doc. Three combinations (`F16`+`F32`, `F32`+`F16`, `F16`+`F16`),
-/// mirroring the existing four-combo `F32`/`BF16` matrix's own split.
+/// mirroring the four-combo `F32`/`BF16` matrix's own split.
 pub(crate) const PTX_SCALED_CAST_ADD_F16: &str =
     include_str!(concat!(env!("OUT_DIR"), "/scaled_cast_add_f16.ptx"));
 pub(crate) const PTX_SOFTMAX: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax.ptx"));
@@ -105,7 +105,7 @@ pub(crate) const PTX_GEGLU_F16: &str = include_str!(concat!(env!("OUT_DIR"), "/g
 /// "cuda")]` and they are pure arithmetic/domain facts (no device, no PTX,
 /// no launch): defining them here would mean their unit tests only ever
 /// compiled on a CUDA-feature build. See `ops::launch_domain`'s own module
-/// doc for the full indexing contract (campaign #446, finding 4: 64-bit
+/// doc for the full indexing contract (64-bit
 /// in-kernel index arithmetic, 32-bit kernel scalar parameters, and why
 /// each half needs the other).
 pub(crate) use crate::ops::launch_domain::{
@@ -126,17 +126,14 @@ pub(crate) fn elemwise_launch_config(n: u32) -> LaunchConfig {
 /// Wrap a freshly allocated, zero-length device buffer of `dtype` as a
 /// `CudaStorage` — the degenerate "0 output elements" fast path every op's
 /// `cuda_fwd` (and backward helper) takes identically: F32/BF16/F16 are
-/// this crate's production dtypes (F16 added in campaign #443 W2b for
-/// `layer_norm`/`softmax`/`geglu`/`rope`, extended in W2c to
-/// `rope_positions`/`dropout`/`scaled_cast_add` — every op with a
-/// compiled F16 dispatch arm), anything else a typed refusal.
+/// this crate's production dtypes (F16 for every op with a compiled F16
+/// dispatch arm: `layer_norm`/`softmax`/`geglu`/`rope`/
+/// `rope_positions`/`dropout`/`scaled_cast_add`), anything else a typed
+/// refusal.
 ///
 /// The two ops this crate ships WITHOUT an F16 dispatch arm
 /// (`cast_scale_bf16_f32`, `cast_add_bf16`) cannot reach this function's
-/// `DType::F16` arm at all, and the reason is STRUCTURAL rather than
-/// test-pinned (a prior revision of this comment cited a
-/// `tests::empty_f16_is_refused_for_an_op_with_no_f16_dispatch_arm` that
-/// has never existed in this tree — campaign #446, finding 14): their
+/// `DType::F16` arm at all, and the reason is STRUCTURAL: their
 /// CUDA glue (`cast_scale::cuda_fwd_cast_scale_bf16_f32`,
 /// `cuda_fwd_cast_add_bf16`) refuses any non-BF16 input with
 /// `UnsupportedDTypeForOp` at its FIRST statement, before the `n == 0`

@@ -6,7 +6,7 @@
 //! `(seed, layer, forward#, element index)` rather than a position in an
 //! advancing stream, so restoring it is an assignment (O(1)), not a replay.
 //!
-//! ## Provenance (cite in every consumer's doc, per the C7 contract)
+//! ## Provenance (cite in every consumer's doc)
 //!
 //! Ported from Random123 (D. E. Shaw Research,
 //! <https://github.com/DEShawResearch/random123>, BSD-3-Clause — see that
@@ -125,8 +125,8 @@ pub fn philox4x32_10(counter: [u32; 4], key: [u32; 2]) -> [u32; 4] {
 /// and WHICH element of the activation this is). Every element's draw is
 /// therefore a pure function of `(seed, layer, forward#, index)`, with no
 /// dependence on evaluation order, thread scheduling, or prior draws —
-/// this is what makes O(1) restore possible (closing esc-033) and what
-/// makes the mask never need to be materialized (closing wip finding #2).
+/// this is what makes O(1) restore possible and what
+/// makes the mask never need to be materialized.
 ///
 /// Only the FIRST of Philox's 4 output words is used as "the draw" for the
 /// KEEP/DROP decision (see `ops::dropout`'s module doc for why: one full

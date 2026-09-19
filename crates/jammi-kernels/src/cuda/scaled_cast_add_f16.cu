@@ -3,20 +3,20 @@
 // active (see ../../build.rs); the pinned build flags (sm_80 baseline, no
 // -use_fast_math) live there, not here.
 //
-// DELIBERATE DUPLICATION (campaign #443 W2b/W2c contract) — see
+// DELIBERATE DUPLICATION — see
 // `layer_norm_f16.cu`'s identical note. This is a SEPARATE translation unit
 // from `scaled_cast_add.cu` (a separate PTX module,
-// `PTX_SCALED_CAST_ADD_F16` in `../mod.rs`), so that file stays
-// byte-untouched — provable by `git diff`. No shared `.cuh`.
+// `PTX_SCALED_CAST_ADD_F16` in `../mod.rs`), so nothing here can perturb
+// that file's kernels. No shared `.cuh`.
 //
 // Three combinations (base, lora) in {F16, F32} minus the all-F32 case
 // (already covered by `scaled_cast_add_f32_f32` in `scaled_cast_add.cu`):
 // `F16`+`F32`, `F32`+`F16`, `F16`+`F16` — mirroring `ops/scaled_cast_add.rs`'s
 // own CPU-side split (`scaled_cast_add_f16_f32`/`scaled_cast_add_f32_f16`/
 // `scaled_cast_add_f16_f16`). Output dtype follows `base`'s dtype, exactly
-// like the existing F32/BF16 matrix.
+// like the F32/BF16 matrix.
 //
-// Rounding model (esc-046, GH#374; matches `scaled_cast_add.cu`'s own module
+// Rounding model (matches `scaled_cast_add.cu`'s own module
 // doc and `ops/scaled_cast_add.rs`'s CPU arms): `base` widens to `f32`
 // (lossless), adds the already-`f32`-scaled `lora`, rounds ONCE to `base`'s
 // dtype. `__fmul_rn`/`__fadd_rn` keep the multiply and the add as two

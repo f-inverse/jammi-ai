@@ -12,18 +12,18 @@
 //!      computes the SAME bias-free LayerNorm math
 //!      (mean/center/variance/normalize/gamma-in-f32/cast-once — the same
 //!      one-rounding shape `jammi-encoders::layer_norm::slow()`'s
-//!      bias-free arm has since the eager-LN one-rounding fix), f32
+//!      bias-free arm has), f32
 //!      asserted with a small stated tolerance (different op sequencing
 //!      can still round the last bit differently) and bf16 asserted
 //!      BIT-EXACT (measured on these fixtures; see the bf16 tests' own
 //!      docs for why that is not a structural guarantee at every shape).
 //!      NAMING NOTE (do not read this as an eager-parity claim): this
-//!      crate is a LEAF (no `jammi-*` deps — see its module doc / the
-//!      fused-kernels plan's scope decision 12), so `formula()` below
+//!      crate is a LEAF (no `jammi-*` deps — see its module doc), so
+//!      `formula()` below
 //!      cannot import `slow()` and is NOT a call into `slow()` — it is
 //!      an independently-written reproduction of the SAME MATH, updated
-//!      by hand whenever `slow()`'s own rounding placement changes (as
-//!      it did in this same PR), which makes a diff that changes both
+//!      by hand whenever `slow()`'s own rounding placement changes,
+//!      which makes a diff that changes both
 //!      `slow()` and `formula()` together structurally unable to prove
 //!      anything about `slow()`'s OWN correctness — only that this
 //!      file's copy of the math agrees with the fused kernel. The BITING
@@ -59,7 +59,7 @@ fn fused(eps: f64, dgamma_needed: bool, x: &Tensor, gamma: &Tensor) -> candle_co
     apply2(x, gamma, LayerNormFused::new(eps, dgamma_needed))
 }
 
-/// #460 (C-LN): the bias-carrying sibling of [`fused`] above.
+/// The bias-carrying sibling of [`fused`] above.
 fn fused_biased(
     eps: f64,
     dgamma_needed: bool,
@@ -118,7 +118,7 @@ fn formula(eps: f64, x: &Tensor, gamma: &Tensor) -> candle_core::Result<Tensor> 
     scaled_internal.to_dtype(x_dtype)
 }
 
-/// #460 (C-LN): [`formula`]'s bias-carrying twin — `beta` upcast to
+/// [`formula`]'s bias-carrying twin — `beta` upcast to
 /// `internal_dtype` and added THERE (never rounded to `x`'s dtype first),
 /// matching `jammi-encoders::layer_norm::LayerNorm::slow`'s biased arm and
 /// `LayerNormBiasedFused`'s own CPU/CUDA epilogue (`xhat * gamma + beta`,
@@ -562,7 +562,7 @@ fn dgamma_needed_false_on_a_frozen_leaf_gamma_neither_panics_nor_emits_a_gamma_g
 }
 
 // ---------------------------------------------------------------------
-// #460 (C-LN): `LayerNormBiasedFused` oracles — the same three-oracle
+// `LayerNormBiasedFused` oracles — the same three-oracle
 // shape as the bias-free op above, plus `dbeta`.
 // ---------------------------------------------------------------------
 
@@ -682,7 +682,7 @@ fn fused_vs_formula_biased_f32_fwd_and_bwd_match_within_stated_tolerance() {
 
 /// A deterministic (LCG-seeded) fixture generator, reused across the
 /// production-width tests below — no external RNG dependency, and the
-/// same seed always yields the same fixture (family J: reproducible
+/// same seed always yields the same fixture (reproducible
 /// numerics).
 fn lcg_f32(seed: &mut u32, half_width: f32) -> f32 {
     *seed = seed.wrapping_mul(1103515245).wrapping_add(12345);

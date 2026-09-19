@@ -13,7 +13,7 @@ use super::{PTX_CAST_SCALE, PTX_CAST_SCALE_F16};
 /// See `crate::cuda`'s module doc for the module-name rationale.
 const MODULE_NAME: &str = "jammi_kernels_cast_scale";
 
-/// The F16 arms' OWN PTX module name (campaign #443 W2c) —
+/// The F16 arms' OWN PTX module name —
 /// `cast_scale_f16.cu` is a SEPARATE translation unit (see that file's
 /// module doc), so it needs a distinct module name from [`MODULE_NAME`].
 const MODULE_NAME_F16: &str = "jammi_kernels_cast_scale_f16";
@@ -271,7 +271,7 @@ pub(crate) fn cuda_launch_cast_add_bf16_into(
     Ok(())
 }
 
-/// [`cuda_fwd_cast_scale_bf16_f32`]'s F16 analog (campaign #443 W2c), for
+/// [`cuda_fwd_cast_scale_bf16_f32`]'s F16 analog, for
 /// [`crate::ops::CastScaleF16F32`] — a SEPARATE, independent type from
 /// [`crate::ops::CastScaleBf16F32`] (see that type's own doc), backed by
 /// the SEPARATE `cast_scale_f16.cu` translation unit.
@@ -320,7 +320,7 @@ pub(crate) fn cuda_fwd_cast_scale_f16_f32(
     Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
 }
 
-/// [`cuda_fwd_cast_add_bf16`]'s F16 analog (campaign #443 W2c), for
+/// [`cuda_fwd_cast_add_bf16`]'s F16 analog, for
 /// [`crate::ops::CastAddF16`] — a SEPARATE, independent type from
 /// [`crate::ops::CastAddBf16`] (see that type's own doc), backed by the
 /// SEPARATE `cast_scale_f16.cu` translation unit.

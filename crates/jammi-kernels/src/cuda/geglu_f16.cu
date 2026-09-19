@@ -3,18 +3,16 @@
 // (see ../../build.rs); the pinned build flags (sm_80 baseline, no
 // -use_fast_math) live there, not here.
 //
-// DELIBERATE DUPLICATION (campaign #443 W2b contract) — see
+// DELIBERATE DUPLICATION — see
 // `layer_norm_f16.cu`'s identical note: this is a SEPARATE translation
 // unit from `geglu.cu`, with its own copy of the `gelu_erf_cdf`/
 // `gelu_erf_pdf` helpers and its own `#include <cuda_fp16.h>` — NOT a
-// shared `.cuh`. That campaign added this file WITHOUT touching
-// `geglu.cu` at all; the two have since been edited in lockstep exactly
-// once, by campaign #446's finding-4 indexing fix below, which is a
-// property of the shared loop shape rather than of either dtype.
+// shared `.cuh`. A change to the shared loop shape (e.g. the indexing
+// contract below) must be made in both files in lockstep.
 //
 // Domain, the purely-elementwise indexing, and the INDEXING CONTRACT
-// (`size_t` induction variable, 32-bit scalar parameters — campaign #446
-// finding 4) are IDENTICAL to `geglu.cu`'s module doc; that file states
+// (`size_t` induction variable, 32-bit scalar parameters) are IDENTICAL
+// to `geglu.cu`'s module doc; that file states
 // the contract and why each half of it needs the other. Per the per-op f16 reference-regime table
 // (`docs/maintainer/cuda-kernel-guide.md` §3.10), this op is DTYPE-NATIVE,
 // TWO rounding points in forward (round the activation to f16 immediately
@@ -22,7 +20,7 @@
 // materialize-then-multiply ordering, then multiply in f32 and round ONCE
 // more on the way out — ROUND 2), and TWO independent rounding points in
 // backward (`d_gate`/`d_up`, each f32-accumulated and rounded to f16
-// exactly once) — the exact same regime as the existing BF16 arm,
+// exactly once) — the exact same regime as the BF16 arm,
 // substituting the narrower 16-bit type.
 #include <cuda_fp16.h>
 #include <cstddef>

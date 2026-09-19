@@ -78,8 +78,8 @@
 //! test per cell" statement above):
 //!
 //! - **`FlashStatus::ComputeCapability`** (`check_device`, compute
-//!   capability major `< 8`): unreachable on the CI/pod hardware this crate
-//!   targets (the landing proof runs on an A100, cc 8.0); would need a
+//!   capability major `< 8`): unreachable on the GPU hardware this crate
+//!   is validated on (an A100, cc 8.0); would need a
 //!   pre-Ampere device to drive for real. Not simulated (faking
 //!   `cudaDeviceGetAttribute`'s return would test the C `if`, not the
 //!   actual refusal a pre-Ampere caller hits).
@@ -208,7 +208,7 @@ pub mod raw {
         pub window_size_right: i32,
         pub softmax_scale: f32,
         pub p_dropout: f32,
-        /// `jammi_flash_dtype` (campaign #443 D2): 0 = bf16, 1 = fp16. MUST
+        /// `jammi_flash_dtype`: 0 = bf16, 1 = fp16. MUST
         /// be the LAST field, matching the header's own append-only
         /// placement (`flash_api_jammi.h`'s own comment on this field).
         pub dtype: i32,
@@ -269,11 +269,11 @@ pub mod raw {
 }
 
 /// Head dimension the vendored kernels are instantiated for (the two
-/// dtypes compiled: `run_mha_{fwd,bwd}_<bf16, 64, false>` and, since
-/// campaign #443 D2, `run_mha_{fwd,bwd}_<fp16, 64, false>`).
+/// dtypes compiled: `run_mha_{fwd,bwd}_<bf16, 64, false>` and
+/// `run_mha_{fwd,bwd}_<fp16, 64, false>`).
 pub const HEAD_DIM: usize = 64;
 
-/// `jammi_flash_dtype` mirror (campaign #443 D2) — `raw::FwdArgs::dtype` /
+/// `jammi_flash_dtype` mirror — `raw::FwdArgs::dtype` /
 /// `raw::BwdArgs::dtype`'s two valid values, selecting which of the two
 /// compiled explicit specialisations `flash_api_jammi.cu` calls.
 const JAMMI_FLASH_DTYPE_BF16: i32 = 0;
@@ -315,7 +315,7 @@ pub enum FlashStatus {
     DqAccumSplits = 12,
     /// A window size below `-1`.
     Window = 13,
-    /// `dtype` is neither `0` (bf16) nor `1` (fp16) — campaign #443 D2.
+    /// `dtype` is neither `0` (bf16) nor `1` (fp16).
     Dtype = 14,
 }
 
@@ -367,10 +367,8 @@ pub enum FlashError {
     Geometry(String),
     /// The device's compute capability is not a MEMBER of the SET of
     /// compute capabilities `crate::admission::flash_validated_arches()`
-    /// names — the VALIDATED set (compiled AND has a green pod parity
-    /// leg), not merely `build.rs`'s compiled set (`check_arch`; round-2
-    /// audit finding C widened this variant's own meaning from "compiled"
-    /// to "validated" the same way `check_arch` itself was widened).
+    /// names — the VALIDATED set (compiled AND has a passing on-device
+    /// parity leg), not merely `build.rs`'s compiled set (`check_arch`).
     /// Deliberately a distinct variant from `Geometry` (an architecture
     /// mismatch is a capability question, not a shape one) and distinct
     /// from `FlashStatus::ComputeCapability` (the C wrapper's own
@@ -378,19 +376,18 @@ pub enum FlashError {
     /// it would NOT catch e.g. an sm_87 device on an sm_80/86/89/90-only
     /// build; this Rust-side check is exact SET membership and runs
     /// first). Membership is exact and enumerated, never `>=` and never
-    /// major-compat (M3 plan D2): an sm_86 device is admitted only because
+    /// major-compat: an sm_86 device is admitted only because
     /// `86` is literally in the validated set, not because `8 >= 8`.
     ///
     /// `built_for`/`built_for_sms` are a DELIBERATE dual representation of
-    /// the SAME set (round-2 audit advisory), not independent sources:
+    /// the SAME set, not independent sources:
     /// `built_for` (`Vec<(u32, u32)>`, one tuple per validated arch) is
     /// what `arch_mismatch` already has on hand — the SAME
     /// `&[ComputeCapability]` `flash_validated_arches()` returned,
     /// re-mapped to plain tuples for a `{:?}` that prints `(8, 0)` rather
     /// than `ComputeCapability { major: 8, minor: 0 }`; `built_for_sms`
     /// (`String`) is a SEPARATE, purely cosmetic read of
-    /// `env!("JAMMI_FLASH_GENCODE_SMS")` (note: still the COMPILED env
-    /// var, not `JAMMI_FLASH_VALIDATED_SMS` — this field's own doc below
+    /// `env!("JAMMI_FLASH_GENCODE_SMS")` (note: the COMPILED env var, not `JAMMI_FLASH_VALIDATED_SMS` — this field's own doc below
     /// names it as "the -gencode sm list", i.e. what's compiled, shown
     /// alongside `built_for`'s validated tuples for a reader comparing the
     /// two) for the message's `-gencode sm list: ...` clause. Neither
@@ -499,18 +496,15 @@ fn check_abi() -> Result<()> {
 
 /// Pure core of [`check_arch`]: `None` iff `device` is a MEMBER of
 /// `validated` (`crate::admission::flash_validated_arches()` — this
-/// module's SOLE source for the admission set, per round-2 audit findings
-/// F3 (delete the module's own independently-retyped parser; consume
-/// `admission.rs`'s accessor directly — `flash` is
-/// `#[cfg(feature = "flash-attn")]`-gated but `admission` is NOT, and
-/// `flash-attn` implies `cuda`, so `admission`'s items are always
-/// reachable here) and C (that accessor is now `flash_validated_arches`,
-/// not `flash_built_arches` — "compiled" was proven an insufficient
-/// admission criterion on its own; see `flash_validated_arches`'s own
-/// doc). Separated out from `check_arch` so the mismatch cell is
+/// module's SOLE source for the admission set (this module has no parser
+/// of its own; `flash` is `#[cfg(feature = "flash-attn")]`-gated but
+/// `admission` is NOT, and `flash-attn` implies `cuda`, so `admission`'s
+/// items are always reachable here). The set is VALIDATED arches, not
+/// merely compiled ones — "compiled" is an insufficient admission
+/// criterion on its own; see `flash_validated_arches`'s own doc. Separated out from `check_arch` so the mismatch cell is
 /// unit-testable without a device — the same `abi_mismatch`/`check_abi`
 /// split this module already uses. Membership, never `>=` and never
-/// major-compat (M3 plan D2) — see [`FlashError::Arch`]'s own doc for why.
+/// major-compat — see [`FlashError::Arch`]'s own doc for why.
 fn arch_mismatch(validated: &[ComputeCapability], device: (usize, usize)) -> Option<FlashError> {
     let probed = ComputeCapability::new(device.0, device.1);
     if validated.contains(&probed) {
@@ -727,8 +721,8 @@ impl CuSeqlens {
     /// i32::MAX`, `total_q <= i32::MAX`, the element-count guard the module
     /// already uses elsewhere), uploads the `i32` array, and derives
     /// `total_q`/`batch`/`max_seqlen` from the SAME lengths — they are never
-    /// independent inputs. This is the sanctioned entry point; Stage B's
-    /// encoder always has host lengths already (`BatchEncoding`), so this
+    /// independent inputs. This is the sanctioned entry point; an encoder
+    /// caller always has host lengths already (`BatchEncoding`), so this
     /// costs the real caller nothing beyond one small H2D copy per forward.
     pub fn from_lengths(lengths: &[usize], dev: &CudaDevice) -> Result<Self> {
         let (cu_i32, total_q, batch, max_seqlen) = cu_seqlens_from_lengths(lengths)?;
@@ -1266,7 +1260,7 @@ pub fn flash_varlen_bwd(
     Ok(d_qkv)
 }
 
-// ---- fp16 (campaign #443 D2) — monomorphic twins of the bf16 functions
+// ---- fp16 — monomorphic twins of the bf16 functions
 // above, per this crate's own established idiom for a second dtype at a
 // fixed fusion site (`crates/jammi-kernels/src/cuda/*_f16.rs`'s "separate
 // monomorphic file/functions, duplicated helpers" pattern, applied here to
@@ -1278,12 +1272,8 @@ pub fn flash_varlen_bwd(
 // check, every buffer-length derivation, and every `VarlenGeometry`/
 // `CuSeqlens` call is IDENTICAL, since none of that logic is dtype-aware
 // (the C shim's `dtype` field is the only place the two paths diverge).
-// The bf16 functions above are byte-unchanged apart from the new
-// `dtype: JAMMI_FLASH_DTYPE_BF16` field this campaign's struct-widening
-// requires at every call site (see `raw::FwdArgs`/`raw::BwdArgs`'s own
-// doc) — their behaviour is unchanged.
 
-/// [`flash_varlen_fwd_into`]'s fp16 twin (campaign #443 D2).
+/// [`flash_varlen_fwd_into`]'s fp16 twin.
 pub fn flash_varlen_fwd_into_f16(
     dev: &CudaDevice,
     qkv: CudaView<'_, f16>,
@@ -1336,7 +1326,7 @@ pub fn flash_varlen_fwd_into_f16(
     check_status(code)
 }
 
-/// [`flash_varlen_fwd`]'s fp16 twin (campaign #443 D2).
+/// [`flash_varlen_fwd`]'s fp16 twin.
 pub fn flash_varlen_fwd_f16(
     dev: &CudaDevice,
     qkv: &CudaSlice<f16>,
@@ -1360,7 +1350,7 @@ pub fn flash_varlen_fwd_f16(
     Ok((o, lse))
 }
 
-/// [`BwdBuffers`]'s fp16 twin (campaign #443 D2).
+/// [`BwdBuffers`]'s fp16 twin.
 pub struct BwdBuffersF16<'a> {
     pub qkv: CudaView<'a, f16>,
     pub o: CudaView<'a, f16>,
@@ -1372,7 +1362,7 @@ pub struct BwdBuffersF16<'a> {
     pub dq_accum_splits: usize,
 }
 
-/// [`flash_varlen_bwd_into`]'s fp16 twin (campaign #443 D2).
+/// [`flash_varlen_bwd_into`]'s fp16 twin.
 pub fn flash_varlen_bwd_into_f16(
     dev: &CudaDevice,
     cu: &CuSeqlens,
@@ -1462,7 +1452,7 @@ pub fn flash_varlen_bwd_into_f16(
     check_status(code)
 }
 
-/// [`flash_varlen_bwd`]'s fp16 twin (campaign #443 D2).
+/// [`flash_varlen_bwd`]'s fp16 twin.
 #[allow(clippy::too_many_arguments)]
 pub fn flash_varlen_bwd_f16(
     dev: &CudaDevice,
@@ -1502,11 +1492,9 @@ mod tests {
     //! The pure cells of the refusal lattice (no device needed).
     use super::*;
 
-    /// Round-2 audit findings F3 (this module has NO parser of its own
-    /// anymore — deleted `parse_one_gencode_sm`/`parse_gencode_sms`/
-    /// `built_for_compute_caps`, see `arch_mismatch`'s own doc) and C
-    /// (`check_arch` reads the VALIDATED set, not merely the compiled
-    /// one): proves `check_arch`'s `crate::admission::
+    /// This module has NO gencode parser of its own (see `arch_mismatch`'s
+    /// own doc), and `check_arch` reads the VALIDATED set, not merely the
+    /// compiled one. This test proves `check_arch`'s `crate::admission::
     /// flash_validated_arches()` call site resolves to the pinned
     /// four-arch VALIDATED set on a `flash-attn`-compiled build (this
     /// test only compiles under that feature, which implies
@@ -1540,7 +1528,7 @@ mod tests {
             ComputeCapability::new(9, 0),
         ];
         // Every compiled arch is admitted, exactly — set membership, never
-        // major-compat (M3 plan D2): `(8, 6)`/`(8, 9)` admit only because
+        // major-compat: `(8, 6)`/`(8, 9)` admit only because
         // they are LITERALLY in the compiled set, not because `8 >= 8`.
         for &admit in &built_for {
             assert!(
@@ -1561,8 +1549,8 @@ mod tests {
         let e = arch_mismatch(&built_for, (7, 0)).unwrap();
         let msg = e.to_string();
         assert!(msg.contains("(7, 0)") && msg.contains("(8, 0)"), "{msg}");
-        // A NEWER, uncompiled major (a hypothetical sm100) — the typed
-        // refusal D1 requires rather than an unvalidated PTX JIT.
+        // A NEWER, uncompiled major (a hypothetical sm100) — a typed
+        // refusal rather than an unvalidated PTX JIT.
         let e = arch_mismatch(&built_for, (10, 0)).unwrap();
         assert!(matches!(e, FlashError::Arch { .. }), "{e}");
     }
@@ -1594,7 +1582,7 @@ mod tests {
     // `CuSeqlens` / `cu_seqlens_from_lengths`. All pure (no
     // device): `cu_seqlens_from_lengths` is `CuSeqlens::from_lengths` minus
     // the upload, so the whole host-side lattice is testable here; the
-    // device-touching half is exercised by `flash_smoke.rs` on the pod.
+    // device-touching half is exercised by `flash_smoke.rs` on a GPU.
     // -----------------------------------------------------------------
 
     #[test]
@@ -1908,9 +1896,8 @@ mod tests {
 
     #[test]
     fn status_codes_round_trip_and_zero_is_ok() {
-        // campaign #443 D2 adds code 14 (`Dtype`) — the round-trip range
-        // widens from `1..=13` to `1..=14`, and the "unknown code" probe
-        // moves from the now-real `14` to `15`.
+        // Codes `1..=14` are known (`14` is `Dtype`); `15` is the first
+        // unknown code.
         for code in 1..=14 {
             let s = FlashStatus::from_code(code).expect("known code");
             assert_eq!(s as i32, code);
@@ -1922,15 +1909,11 @@ mod tests {
 
     #[test]
     fn args_struct_sizes_match_the_c_header() {
-        // campaign #443 D2 appends one `i32 dtype` field to each struct:
+        // Each struct ends in one `i32 dtype` field:
         // 5 pointers + 4 i64 + 11 × 4-byte = 40 + 32 + 44 = 116, rounded up
         // to the struct's own 8-byte alignment (from the pointer/i64
-        // fields) = 120 (was 112 pre-D2 — the OLD 10 × 4-byte tally with no
-        // trailing pad, since 40 was already a multiple of 8);
-        // 9 pointers + 8 i64 + 13 × 4-byte = 72 + 64 + 52 = 188, rounded up
-        // to 192 (was 184 pre-D2, same "already aligned" reason). Verified
-        // against a standalone `#[repr(C)]` probe with no candle/cuda
-        // dependency (`size_of` needs no CUDA toolkit) before landing.
+        // fields) = 120; 9 pointers + 8 i64 + 13 × 4-byte = 72 + 64 + 52 =
+        // 188, rounded up to 192. `size_of` needs no CUDA toolkit.
         assert_eq!(std::mem::size_of::<raw::FwdArgs>(), 120);
         assert_eq!(std::mem::size_of::<raw::BwdArgs>(), 192);
         // The linked library agrees (this is the same check the safe API

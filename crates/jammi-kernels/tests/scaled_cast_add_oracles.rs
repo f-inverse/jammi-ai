@@ -1,6 +1,6 @@
 //! CPU-hermetic oracles for `ScaledCastAdd` — the fused LoRA-site epilogue
-//! (`out = base + cast(lora * scaling)`) C6 replaces the eager `[mul, cast,
-//! add]` composition with.
+//! (`out = base + cast(lora * scaling)`) that replaces the eager `[mul,
+//! cast, add]` composition.
 //!
 //!   1. `gradcheck_*` — bwd vs. central finite differences (f32, two
 //!      scaling values so a sign error in either grad slot cannot hide).
@@ -8,30 +8,28 @@
 //!      F64 arm — the op's whole reason to exist is bf16-boundary
 //!      rounding, which F64 cannot exercise).
 //!   2. `fused_vs_eager_*` — fwd AND bwd vs. the eager `[mul, add, cast]`
-//!      composition `LoraLinear::forward` actually runs today (esc-046 fix,
-//!      GH#374: `base` promotes to `f32`, adds the `f32`-scaled `lora`,
-//!      rounds ONCE at the end — matching PEFT's `Linear.forward` source,
-//!      not the round-the-delta-first model an earlier revision of this op
-//!      used). `F32`/`F32` and `BF16`(base)/`F32`(lora) — the two dtype
+//!      composition `LoraLinear::forward` actually runs (`base` promotes to
+//!      `f32`, adds the `f32`-scaled `lora`, rounds ONCE at the end —
+//!      matching PEFT's `Linear.forward` source, not a round-the-delta-first
+//!      model). `F32`/`F32` and `BF16`(base)/`F32`(lora) — the two dtype
 //!      combinations `jammi-lora`'s admission predicate actually reaches —
 //!      are asserted BIT-EXACT (`assert_eq!`), not merely within a
-//!      tolerance: this op now follows this crate's "f32-accumulate,
-//!      round once" convention rather than diverging from it.
+//!      tolerance: this op follows this crate's "f32-accumulate,
+//!      round once" convention.
 //!   3. `bwd_*` — the chain-rule oracle through an intermediate
 //!      (non-`Var`) input, plus the two adjacent cases that separate
 //!      "candle never called `bwd`" from "`bwd` answered `None`" (see
 //!      `jammi_kernels::ops`'s module doc on why `is_variable()` is not a
 //!      safe gradient-need gate).
 //!   4. `f32_base_bf16_lora_*` / `bf16_base_bf16_lora_*` — the
-//!      UNREACHABLE-today `(F32, BF16)` and `(BF16, BF16)` combinations
+//!      unreachable `(F32, BF16)` and `(BF16, BF16)` combinations
 //!      (`ScaledCastAdd` accepts them; `jammi-lora`'s admission predicate
 //!      never dispatches them, since `lora_a`/`lora_b` are always `F32` in
 //!      this workspace — see the op's own module doc) do NOT reproduce
 //!      eager bit-for-bit, unlike the two reachable combinations oracle 2
-//!      covers. Measured and bounded here (relative-with-floor, the C4/C5
-//!      `bf16_close` pattern), not silently assumed equal just because the
-//!      crate is publishable and a future caller could reach this
-//!      combination.
+//!      covers. Measured and bounded here (relative-with-floor, the
+//!      `bf16_close` pattern), not silently assumed equal — the crate is
+//!      publishable, so another caller could reach this combination.
 //!
 //! Statelessness is enforced structurally (`Copy`), same argument as
 //! `oracles.rs`'s own doc — no runtime "interleaving oracle" here either.
@@ -45,18 +43,18 @@ fn fused_fwd(scaling: f64, base: &Tensor, lora: &Tensor) -> candle_core::Result<
 }
 
 /// The eager `[mul, add, cast]` composition `LoraLinear::forward` actually
-/// runs (see `crates/jammi-lora/src/lora_linear.rs`'s `eager_epilogue`,
-/// esc-046 fix, GH#374): `scaled = lora * scaling` (in `lora`'s own — `f32`
-/// — dtype), `base` widens to `scaled`'s dtype IF DIFFERENT (lossless),
-/// add, then the SUM casts down to `base`'s ORIGINAL dtype once — matching
-/// PEFT's `Linear.forward` promote-add-cast-once order, not the
-/// round-the-delta-first model this helper used before esc-046.
+/// runs (see `crates/jammi-lora/src/lora_linear.rs`'s `eager_epilogue`):
+/// `scaled = lora * scaling` (in `lora`'s own — `f32` — dtype), `base`
+/// widens to `scaled`'s dtype IF DIFFERENT (lossless), add, then the SUM
+/// casts down to `base`'s ORIGINAL dtype once — matching PEFT's
+/// `Linear.forward` promote-add-cast-once order, not a
+/// round-the-delta-first model.
 fn eager_fwd(scaling: f64, base: &Tensor, lora: &Tensor) -> candle_core::Result<Tensor> {
-    // esc-046 audit round 2, finding 1: promote to the WIDER of the two
+    // Promote to the WIDER of the two
     // dtypes (torch's own rule), never narrow base toward lora's dtype —
     // mirrors jammi_lora::lora_linear::wider_float_dtype exactly (kept as
     // a literal duplicate here, not an import, since this crate has no
-    // dependency on jammi-lora; family L/oracle-independence: this helper
+    // dependency on jammi-lora; oracle independence: this helper
     // exists to check FUSED-vs-EAGER wiring parity, not to independently
     // verify eager_epilogue's own correctness, which
     // scaled_cast_add_peft_rounding.rs and jammi-lora's own
@@ -195,20 +193,19 @@ fn fused_vs_eager_f32_f32_fwd_and_bwd_are_bit_exact() {
     );
 }
 
-/// The REJECTED, pre-esc-046 alternative rounding model: round the scaled
+/// The REJECTED alternative rounding model: round the scaled
 /// delta to `base`'s dtype FIRST, then add-and-round again — an extra
 /// round point PEFT's own source (`peft/tuners/lora/layer.py`
-/// `Linear.forward`, `v0.20.0`, lines 1044-1069) never takes (esc-046,
-/// GH#374). Used ONLY by the discrimination proof below, to show a fixture
-/// exists where the two models produce DIFFERENT bf16 results — i.e. a
-/// regression BACK to round-before-add would be caught, not silently
-/// passed.
+/// `Linear.forward`, `v0.20.0`, lines 1044-1069) never takes. Used ONLY by
+/// the discrimination proof below, to show a fixture exists where the two
+/// models produce DIFFERENT bf16 results — i.e. a round-before-add kernel
+/// would be caught, not silently passed.
 fn round_before_add(base: f32, lora: f32, scaling: f32) -> bf16 {
     let delta = bf16::from_f32(lora * scaling);
     bf16::from_f32(base + delta.to_f32())
 }
 
-/// This op's ACTUAL model since esc-046: accumulate the whole expression in
+/// This op's ACTUAL model: accumulate the whole expression in
 /// `f32` and round ONCE at the end (this crate's convention) — matches
 /// PEFT's `Linear.forward` source exactly (see this op's own module doc).
 fn f32_accumulate_round_once(base: f32, lora: f32, scaling: f32) -> bf16 {
@@ -221,24 +218,22 @@ fn f32_accumulate_round_once(base: f32, lora: f32, scaling: f32) -> bf16 {
 /// the DISCRIMINATING element, verified by hand below: it is not enough
 /// for a fixture to merely use "untidy" values — round-before-add and
 /// f32-accumulate must land on OPPOSITE sides of a bf16 rounding boundary
-/// for the same input, or a regression to the rejected model would pass
-/// this test vacuously (the earlier version of this fixture had exactly
-/// that defect: every element's rounding error was too small relative to
-/// its magnitude to ever cross a rounding boundary — `|scaled delta|
-/// ~= 0.2` against `|base| ~= 18.5` cannot move the sum's bf16 ULP
-/// (`~0.0625` there), so round-before-add and f32-accumulate always
-/// agreed on those five elements regardless of which model this op
-/// actually implemented).
+/// for the same input, or the rejected model would pass this test
+/// vacuously. Elements 0-4 alone cannot discriminate: their rounding error
+/// is too small relative to their magnitude to ever cross a rounding
+/// boundary — `|scaled delta| ~= 0.2` against `|base| ~= 18.5` cannot move
+/// the sum's bf16 ULP (`~0.0625` there), so round-before-add and
+/// f32-accumulate always agree on those five elements.
 ///
 /// Hand-verified model values for element 5, at `f32`/`f64` precision:
 /// `delta_f32 = 22.508249282836914 * 0.1 = 2.2508249282836914`.
-/// Round-before-add (the REJECTED, pre-esc-046 model): round `delta_f32`
+/// Round-before-add (the REJECTED model): round `delta_f32`
 /// to bf16 FIRST — `2.2508249282836914` is closest to the bf16 grid point
 /// `2.25` (ULP `2^-6 = 0.015625` at this magnitude) — then add
 /// `1.0078125 + 2.25 = 3.2578125` and round THAT sum to bf16: `3.2578125`
 /// sits EXACTLY halfway between the grid points `3.25` and `3.265625`, so
 /// round-to-nearest-even picks `3.25` (`208 * 2^-6`, even). Result: `3.25`.
-/// f32-accumulate (this op's ACTUAL model since esc-046, matching PEFT
+/// f32-accumulate (this op's ACTUAL model, matching PEFT
 /// source): sum first in `f32` —
 /// `1.0078125 + 2.2508249282836914 = 3.2586374282836914` — then round
 /// ONCE: this is closer to `3.265625` (`209 * 2^-6`) than to `3.25`.
@@ -287,11 +282,11 @@ fn fused_vs_eager_bf16_base_f32_lora_fwd_and_bwd_are_bit_exact_on_a_divergent_fi
 
     // The discrimination proof: this fixture is chosen so element 5's
     // rounding error crosses a bf16 rounding boundary, making the
-    // assertion below non-vacuous — a regression BACK to round-before-add
-    // (esc-046's rejected, pre-fix model) would fail it, not silently
-    // pass. Element 5's fused/eager result must equal the f32-accumulate
-    // model's hand-computed value (`3.265625`, this op's ACTUAL model
-    // since esc-046) and must DIFFER from the rejected round-before-add
+    // assertion below non-vacuous — a round-before-add kernel (the
+    // rejected model) would fail it, not silently pass. Element 5's
+    // fused/eager result must equal the f32-accumulate model's
+    // hand-computed value (`3.265625`, this op's ACTUAL model) and must
+    // DIFFER from the rejected round-before-add
     // model's value (`3.25`).
     let discriminating_idx = 5;
     let kernel_out = fused_v[discriminating_idx];
@@ -308,7 +303,7 @@ fn fused_vs_eager_bf16_base_f32_lora_fwd_and_bwd_are_bit_exact_on_a_divergent_fi
     assert_eq!(
         kernel_out,
         bf16::from_f32(3.265625),
-        "f32-accumulate (this op's ACTUAL model since esc-046) must equal the hand-computed \
+        "f32-accumulate (this op's ACTUAL model) must equal the hand-computed \
          3.265625"
     );
     assert_eq!(
@@ -328,7 +323,7 @@ fn fused_vs_eager_bf16_base_f32_lora_fwd_and_bwd_are_bit_exact_on_a_divergent_fi
     assert_ne!(
         kernel_out, rejected,
         "the fixture must be genuinely discriminating: a regression from f32-accumulate BACK \
-         to round-before-add (esc-046's rejected, pre-fix model) must change element \
+         to round-before-add (the rejected model) must change element \
          {discriminating_idx}'s result, not agree with it"
     );
 
@@ -342,7 +337,7 @@ fn fused_vs_eager_bf16_base_f32_lora_fwd_and_bwd_are_bit_exact_on_a_divergent_fi
     assert_eq!(d_lora_fused, d_lora_eager);
 }
 
-/// esc-031's own premise at the kernel level: `lora_b == 0` means
+/// The zero-initialised-adapter premise at the kernel level: `lora_b == 0` means
 /// `lora_out == 0`, so `scaled = 0`, and `out` must be bit-identical to
 /// `base` (the Frozen arm) for the reachable BF16/F32 combination too, not
 /// only the F32/F32 combination the file-level test above already covers.
@@ -429,9 +424,6 @@ fn bwd_populates_a_grad_for_a_true_frozen_leaf_input_too_and_it_is_harmless() {
 /// then returns `Some` for BOTH slots including the still-frozen one:
 /// together the two tests separate "candle never asked" from "the op
 /// answered `None`", which a single test cannot.
-///
-/// (Ported unchanged in campaign #446 W2-B from the deleted proof op's
-/// oracle file, which was this property's only home in the tree.)
 #[test]
 fn bwd_is_never_called_when_neither_input_leads_to_a_variable() {
     let device = Device::Cpu;
@@ -451,7 +443,7 @@ fn bwd_is_never_called_when_neither_input_leads_to_a_variable() {
 }
 
 // ---------------------------------------------------------------------
-// Oracle 4: the UNREACHABLE-today (F32, BF16) / (BF16, BF16) combinations
+// Oracle 4: the unreachable (F32, BF16) / (BF16, BF16) combinations
 // diverge from eager — measured, bounded, not assumed.
 // ---------------------------------------------------------------------
 
@@ -491,17 +483,15 @@ fn f32_base_bf16_lora_diffs(scaling: f64, basev: &[f32], lorav: &[f32]) -> Vec<(
 }
 
 /// Relative-with-floor bound for the (`F32` base, `BF16` lora) and
-/// (`BF16`, `BF16`) divergences — the C4/C5 `bf16_close` pattern (see
+/// (`BF16`, `BF16`) divergences — the `bf16_close` pattern (see
 /// `geglu_oracles.rs`'s `BF16_REL_TOL`/`BF16_ABS_FLOOR` derivation): a pure
 /// relative bound cannot describe a near-zero-crossing element (magnitude
 /// near 0 on one or both sides), so an additive absolute floor covers
 /// that class separately from the relative term, which covers ordinary
 /// non-trivial-magnitude divergence.
 ///
-/// RE-MEASURED for esc-046 (GH#374): `eager_fwd`'s rounding order changed
-/// (round-once, not round-before-add — see that function's own doc), which
-/// moves this UNREACHABLE combination's divergence from eager too. Same
-/// sweep as before (5 non-bf16-exact `scaling` values against 2000
+/// Measured against `eager_fwd`'s round-once order (see that function's
+/// own doc) with a sweep of 5 non-bf16-exact `scaling` values against 2000
 /// deterministic synthetic `(base, lora)` pairs each, 10,000 points, `base`
 /// amplitude ~50, `lora` amplitude ~30):
 ///

@@ -1,8 +1,7 @@
-//! f16 oracle scaffolds for campaign #443's numerics contract (Part 3 / W2a
-//! deliverable D4). W2b/W2c fill in the per-op `KO-1`..`KO-8` assertions
-//! (see `docs/maintainer/cuda-kernel-guide.md` §3 for the standing
-//! checklist and §3.10 for the per-op f16 reference-regime table); this
-//! module provides the SHARED primitives every one of those oracles needs,
+//! Shared primitives for the per-op f16 oracles (the per-op `KO-1`..`KO-8`
+//! assertions; see `docs/maintainer/cuda-kernel-guide.md` §3 for the
+//! standing checklist and §3.10 for the per-op f16 reference-regime table).
+//! This module provides the primitives every one of those oracles needs,
 //! so no op's oracle reinvents its own (and inevitably slightly-different)
 //! boundary/ULP logic.
 //!
@@ -16,25 +15,25 @@
 //! reference: past `F16_MAX`, the f32 reference and the f16 arm-under-test
 //! no longer share a representable range at all, so "how close is the f16
 //! value to the f32 one" is not even a well-formed question there (the f32
-//! value is finite; the correct f16 answer is `±inf`). This is the family
-//! D domain-validity mandate applied to the 16-bit boundary specifically:
+//! value is finite; the correct f16 answer is `±inf`). This is
+//! domain validity applied to the 16-bit boundary specifically:
 //! pin the actual IEEE754 semantics, not an approximation of them.
 //!
 //! **ULP-distance / derived-floor helpers** (`ulp_distance_f16`,
 //! `f16_ulp_size_at`, `assert_floor_below_f16_gradient_band`): these serve
-//! the INTERIOR (non-boundary) parity oracles W2b/W2c write — "how far is
+//! the INTERIOR (non-boundary) parity oracles — "how far is
 //! the fused f16 arm from the eager f16 (or f32-upcast) reference, at a
 //! magnitude where both CAN represent the answer". Per
 //! `docs/maintainer/cuda-kernel-guide.md` §3.8 (`KO-3`, "no absolute ULP
 //! floor"), a floor here must be DERIVED from f16's own quantization step
 //! at the tested magnitude, never a bare integer constant reused across
-//! magnitudes, and — the D4-specific addition — never shaped like a
+//! magnitudes, and never shaped like a
 //! COARSER dtype's floor (BF16's ULP is ~8x f16's at the same magnitude;
 //! copying a bf16-sized floor into an f16 oracle would silently accept an
 //! f16 divergence 8x worse than f16 itself can even represent, hiding
 //! exactly the defect class the oracle exists to catch).
 //!
-//! ## The boundary/degenerate checklist (family D)
+//! ## The boundary/degenerate checklist
 //!
 //! Every per-op f16 oracle should exercise, at minimum:
 //! 1. **Empty input** — the same "zero elements is a no-op, never a panic
@@ -100,14 +99,11 @@ pub const F16_MIN_POSITIVE_SUBNORMAL: f32 = 5.960_464_5e-8; // 2^-24
 /// f16 values are `0` and `F16_MIN_POSITIVE_SUBNORMAL`, and zero's mantissa
 /// (all bits clear) is the "even" one of the pair, so ties-to-even picks it.
 ///
-/// A phase-4 audit found this crate's stated underflow domain FALSE: an
-/// earlier revision of [`assert_underflows_to_zero`] (and this module's own
-/// checklist above, and two `tests/cuda_parity.rs` fixtures) claimed the
-/// boundary was "at or below `F16_MIN_POSITIVE_SUBNORMAL`" — which silently
-/// mis-describes the entire `(F16_UNDERFLOW_TIE, F16_MIN_POSITIVE_SUBNORMAL)`
-/// half of that band, where the true IEEE754 outcome is a nonzero subnormal,
-/// not zero. `no-producer: derived from f16's format (half of
-/// F16_MIN_POSITIVE_SUBNORMAL's own derivation)`.
+/// "At or below `F16_MIN_POSITIVE_SUBNORMAL`" is therefore the WRONG
+/// underflow boundary: it mis-describes the entire
+/// `(F16_UNDERFLOW_TIE, F16_MIN_POSITIVE_SUBNORMAL)` band, where the true
+/// IEEE754 outcome is a nonzero subnormal, not zero. `no-producer: derived
+/// from f16's format (half of F16_MIN_POSITIVE_SUBNORMAL's own derivation)`.
 pub const F16_UNDERFLOW_TIE: f32 = F16_MIN_POSITIVE_SUBNORMAL / 2.0; // 2^-25
 
 /// The round-to-finite / round-to-infinity TIE point for f16's overflow
@@ -129,14 +125,11 @@ pub const F16_UNDERFLOW_TIE: f32 = F16_MIN_POSITIVE_SUBNORMAL / 2.0; // 2^-25
 /// assumed — see this module's own `overflow_tie_rounds_up_to_infinity_not_down_to_f16_max`
 /// test.
 ///
-/// A round-2 adversarial audit found this crate's stated overflow domain
-/// FALSE: an earlier revision of [`assert_saturates_to_infinity`] (and this
-/// module's own checklist above) claimed the boundary was "strictly beyond
-/// `F16_MAX`" — under which a magnitude in `(F16_MAX, F16_OVERFLOW_TIE)`
-/// (e.g. `65510.0`) satisfies the precondition but rounds BACK to finite
-/// `65504`, not `±inf`, silently mis-describing that entire sub-band the
-/// same shape [`F16_UNDERFLOW_TIE`]'s own fix closed on the small-magnitude
-/// end. `no-producer: derived from f16's format ((F16_MAX + 65536.0) / 2.0)`.
+/// "Strictly beyond `F16_MAX`" is therefore the WRONG overflow boundary: a
+/// magnitude in `(F16_MAX, F16_OVERFLOW_TIE)` (e.g. `65510.0`) rounds BACK
+/// to finite `65504`, not `±inf` — the mirror of [`F16_UNDERFLOW_TIE`]'s
+/// band on the small-magnitude end. `no-producer: derived from f16's format
+/// ((F16_MAX + 65536.0) / 2.0)`.
 pub const F16_OVERFLOW_TIE: f32 = (F16_MAX + 65536.0) / 2.0; // 65520.0
 
 /// BEHAVIORAL saturation contract: an `x` AT OR BEYOND [`F16_OVERFLOW_TIE`]
@@ -168,7 +161,7 @@ pub fn assert_saturates_to_infinity(x: f32) {
         h.is_infinite(),
         "expected f16 saturation to +/-inf at magnitude {x} (>= F16_OVERFLOW_TIE = \
          {F16_OVERFLOW_TIE}), got {h:?} instead -- a confident WRONG finite number at the \
-         boundary is exactly the family D failure mode this oracle exists to catch, not a \
+         boundary is exactly the failure mode this oracle exists to catch, not a \
          saturation"
     );
     assert_eq!(
@@ -211,7 +204,7 @@ pub fn assert_underflows_to_zero(x: f32) {
     );
 }
 
-/// Non-finite detection (family F: a claimed numeric guarantee is asserted
+/// Non-finite detection (a claimed numeric guarantee is asserted
 /// against a NON-VACUOUS negative control, and every control must fail on
 /// EVERY bad path including non-finite — `NaN > c` is `false` in IEEE754,
 /// so a naive `assert!(!(x > bound))`-style comparison silently "passes"
@@ -279,7 +272,7 @@ pub fn f16_ulp_size_at(magnitude: f32) -> f32 {
 /// `typical_magnitude` (BF16 has 7 mantissa bits vs f16's 10, so BF16's
 /// ULP is `2^3 = 8x` coarser than f16's at the same magnitude) — the
 /// concrete, checkable form of "no bf16-shaped absolute floor" this
-/// crate's D4 deliverable requires. A floor at or above this line would
+/// crate's f16 oracles require. A floor at or above this line would
 /// silently accept an f16 divergence at least as coarse as bf16's own
 /// rounding noise, hiding exactly the class of f16-specific defect an f16
 /// oracle exists to catch (rather than merely re-measuring bf16-scale
@@ -305,8 +298,8 @@ mod tests {
     #[test]
     fn f16_max_matches_the_ieee754_binary16_finite_ceiling() {
         // (2 - 2^-10) * 2^15, computed independently of the module's own
-        // constant (a numpy-first-style independent recomputation, family
-        // F): the largest finite f16 has all-ones exponent-minus-one and
+        // constant (a numpy-first-style independent recomputation): the
+        // largest finite f16 has all-ones exponent-minus-one and
         // all-ones mantissa.
         let expected = (2.0 - 2f64.powi(-10)) * 2f64.powi(15);
         assert!(
@@ -320,10 +313,9 @@ mod tests {
 
     #[test]
     fn saturates_to_infinity_at_and_beyond_the_overflow_tie_both_signs() {
-        // A magnitude genuinely at/beyond the TIE (not merely past F16_MAX
-        // -- round-2 audit fix: F16_MAX * 1.001 = 65569.5.., well above
-        // F16_OVERFLOW_TIE = 65520.0, so this fixture was always valid; kept
-        // as-is, plus the exact tie and further-out magnitudes below).
+        // A magnitude genuinely at/beyond the TIE, not merely past F16_MAX:
+        // F16_MAX * 1.001 = 65569.5.., well above F16_OVERFLOW_TIE = 65520.0;
+        // plus the exact tie and further-out magnitudes below.
         assert_saturates_to_infinity(F16_MAX * 1.001);
         assert_saturates_to_infinity(-F16_MAX * 1.001);
         assert_saturates_to_infinity(1.0e6);
@@ -336,13 +328,13 @@ mod tests {
         assert_saturates_to_infinity(-F16_OVERFLOW_TIE);
     }
 
-    /// The band boundary, pinned from BOTH sides (round-2 adversarial audit
-    /// F2 fix, mirroring `magnitude_between_tie_and_full_subnormal_rounds_up_not_to_zero`
+    /// The band boundary, pinned from BOTH sides (mirroring
+    /// `magnitude_between_tie_and_full_subnormal_rounds_up_not_to_zero`
     /// exactly): a magnitude strictly ABOVE `F16_MAX` but still strictly
     /// BELOW `F16_OVERFLOW_TIE` rounds DOWN to finite `F16_MAX`, not up to
-    /// `±inf` -- the exact band the old "strictly beyond F16_MAX" domain
-    /// claim got wrong. Two halves: (a) `assert_saturates_to_infinity` must
-    /// now REFUSE this input (outside its documented domain); (b) the
+    /// `±inf` -- the band a "strictly beyond F16_MAX" domain
+    /// gets wrong. Two halves: (a) `assert_saturates_to_infinity` must
+    /// REFUSE this input (outside its documented domain); (b) the
     /// actual f16 conversion in this band is independently checked as the
     /// NON-inf, finite `F16_MAX` outcome, both signs, so "rounds back to
     /// finite F16_MAX, not inf" is demonstrated, not merely asserted.
@@ -414,12 +406,12 @@ mod tests {
         assert_underflows_to_zero(-F16_UNDERFLOW_TIE);
     }
 
-    /// The band boundary, pinned from BOTH sides (phase-4 audit fix): a
+    /// The band boundary, pinned from BOTH sides: a
     /// magnitude strictly ABOVE the tie but still strictly BELOW
     /// `F16_MIN_POSITIVE_SUBNORMAL` rounds UP to the nonzero subnormal, not
-    /// down to zero — the exact band the old "at or below
-    /// F16_MIN_POSITIVE_SUBNORMAL" domain claim got wrong. Two halves: (a)
-    /// `assert_underflows_to_zero` must now REFUSE this input (outside its
+    /// down to zero — the band an "at or below
+    /// F16_MIN_POSITIVE_SUBNORMAL" domain gets wrong. Two halves: (a)
+    /// `assert_underflows_to_zero` must REFUSE this input (outside its
     /// documented domain); (b) the actual f16 conversion in this band is
     /// independently checked NONZERO, both signs, so "rounds to the
     /// subnormal, not zero" is demonstrated, not merely asserted.

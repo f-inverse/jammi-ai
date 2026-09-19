@@ -13,12 +13,12 @@
 //! definition, not a second copy that could drift (`cuda::mod`'s
 //! `pub(crate) use` is a re-export, not a fork).
 //!
-//! ## The INDEXING CONTRACT (campaign #446, finding 4)
+//! ## The INDEXING CONTRACT
 //!
-//! `geglu_f16.cu`'s grid-stride loop used to carry a 32-bit induction
-//! variable (`for (unsigned int idx = ...; idx < n_out; idx += blockDim.x
-//! * gridDim.x)`); the f32/bf16 twins and the three `layer_norm` `dgamma`
-//! column loops carried the identical pattern. The stride is
+//! Consider a grid-stride loop with a 32-bit induction variable
+//! (`for (unsigned int idx = ...; idx < n_out; idx += blockDim.x
+//! * gridDim.x)`), as in the `geglu` kernels or the three `layer_norm`
+//! `dgamma` column loops. The stride is
 //! [`GEGLU_BLOCK`] * [`GEGLU_MAX_GRID`] = 16_776_960, so a 32-bit lane
 //! walks `idx = (idx + stride) mod 2^32` and can only ever hold values
 //! congruent to its own start modulo `gcd(stride, 2^32) = 256`. Two
@@ -39,8 +39,8 @@
 //!   than a wrong number — but the same loop shape in an ACCUMULATING
 //!   kernel would double-count.
 //!
-//! Both halves of the fix are stated here because they are one contract,
-//! and each half is only sound given the other:
+//! Both halves of the contract are stated here because they are one
+//! contract, and each half is only sound given the other:
 //!
 //! 1. **In-kernel INDEX arithmetic is 64-bit.** Every grid-stride loop in
 //!    `src/cuda/*.cu` declares its induction variable `size_t` (or
@@ -50,7 +50,7 @@
 //!    admit, so the hang is structurally impossible rather than merely
 //!    unreached. `tests::every_grid_stride_loop_in_a_cuda_source_is_64_bit`
 //!    below re-checks this against the `.cu` sources themselves, so a NEW
-//!    kernel written with the old pattern reds the CPU lane.
+//!    kernel written with a 32-bit induction variable reds the CPU lane.
 //!
 //! 2. **Kernel scalar PARAMETERS stay 32-bit** (`const unsigned int
 //!    n_out`, `const unsigned int hidden`, ...), and so does the launch
@@ -78,7 +78,7 @@ use candle_core::{Error, Result};
 /// why the parameter width is pinned at 32 bits and only the kernels'
 /// INDEX arithmetic is 64-bit). A truncated count under-launches, leaving
 /// the output allocation's tail uninitialized — a confident wrong answer,
-/// not a crash (family D / K2), so it is refused here instead.
+/// not a crash, so it is refused here instead.
 ///
 /// This is the ONE place that fact lives. Every op's own domain check
 /// calls it: `cuda::geglu::cuda_fwd`/`cuda_bwd_dwi_out` directly,
@@ -116,7 +116,7 @@ pub(crate) const GEGLU_BLOCK: u32 = 256;
 /// `if (i < n)` kernels (`scaled_cast_add`, `cast_scale`, `rope`), these
 /// do not need the grid to cover `n_out` in one pass.
 /// `GEGLU_BLOCK * GEGLU_MAX_GRID` is the grid-stride STRIDE, i.e. exactly
-/// the quantity that used to overflow a 32-bit induction variable (this
+/// the quantity that overflows a 32-bit induction variable (this
 /// module's doc).
 pub(crate) const GEGLU_MAX_GRID: u32 = 65_535;
 
@@ -253,10 +253,10 @@ mod tests {
         headers
     }
 
-    /// F4, kernel half of the indexing contract: no `.cu`/`.cuh` under
+    /// Kernel half of the indexing contract: no `.cu`/`.cuh` under
     /// `src/cuda` may walk a grid-stride loop (one whose increment or
     /// condition mentions `gridDim`) with a 32-bit induction variable. A
-    /// new kernel copying the old `unsigned int idx` pattern reds HERE, on
+    /// new kernel using an `unsigned int idx` induction variable reds HERE, on
     /// the CPU lane, rather than hanging a GPU at a shape no test can
     /// afford to allocate.
     #[test]
@@ -299,12 +299,12 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "grid-stride loops with a 32-bit induction variable wrap past `u32::MAX` and \
-             never terminate (campaign #446 finding 4); every one must be `size_t` or \
+             never terminate; every one must be `size_t` or \
              `unsigned long long`: {offenders:#?}"
         );
     }
 
-    /// F4, host half of the indexing contract: every CUDA dispatch module
+    /// Host half of the indexing contract: every CUDA dispatch module
     /// that launches one of this crate's own kernels must bound its
     /// element count through [`check_elem_count_fits_u32`] — or carry the
     /// reviewed `ELEM-COUNT-GUARD-WAIVER:` marker stating, at the site,
@@ -382,8 +382,8 @@ mod tests {
     /// The guard's own boundary oracle, run for EVERY op enumerated from
     /// the source: the largest legal count is admitted, and the three
     /// counts at and past the ceiling (including `u32::MAX - 255`, the
-    /// value at which the pre-fix 32-bit grid-stride loop wrapped, which
-    /// is LEGAL and must stay legal now that the loop is 64-bit) are
+    /// value at which a 32-bit grid-stride loop wraps, which
+    /// is LEGAL and must stay legal because the loop is 64-bit) are
     /// dispositioned correctly, with the op's own name in the refusal.
     #[test]
     fn the_element_count_guard_refuses_exactly_past_u32_max_for_every_op() {
@@ -399,7 +399,7 @@ mod tests {
             // short strings, in a test process).
             let op_static: &'static str = Box::leak(op.clone().into_boxed_str());
 
-            // Admitted: the pre-fix wrap point and the largest legal count.
+            // Admitted: the 32-bit wrap point and the largest legal count.
             // Both are inside the domain the 64-bit index arithmetic makes
             // walkable, so refusing either would be a false negative.
             for legal in [u32::MAX as usize - 255, u32::MAX as usize] {
@@ -428,7 +428,7 @@ mod tests {
         }
     }
 
-    /// Degenerate/boundary counts on the SMALL end (family D): zero and
+    /// Degenerate/boundary counts on the SMALL end: zero and
     /// one are ordinary, admitted counts — the guard is a ceiling, never a
     /// floor.
     #[test]
@@ -459,8 +459,8 @@ mod tests {
     }
 
     /// `index_modulus = Some(1 << 32)` models a `unsigned int` induction
-    /// variable (the pre-fix kernels); `None` models `size_t` (the fixed
-    /// ones). Nothing else differs between the two models — that is the
+    /// variable; `None` models `size_t` (what every kernel here declares).
+    /// Nothing else differs between the two models — that is the
     /// point.
     fn walk_grid_stride_lane(
         start: u64,
@@ -512,10 +512,10 @@ mod tests {
         old_s.rem_euclid(m as i128) as u64
     }
 
-    /// F4's mechanism-level RED, which no GPU run can afford to reproduce:
-    /// triggering it needs ~4.29e9 elements (≈26 GB for the f16 forward's
-    /// input alone, ≈42 GB for the backward), so a hardware oracle for
-    /// this finding would never run on any device this project tests on.
+    /// The 32-bit hang at the mechanism level, which no GPU run can afford
+    /// to reproduce: triggering it needs ~4.29e9 elements (≈26 GB for the
+    /// f16 forward's input alone, ≈42 GB for the backward), so a hardware
+    /// oracle for it would never run on any device this project tests on.
     /// This models the loop instead, at the EXACT stride the launch code
     /// builds ([`GEGLU_BLOCK`] * [`geglu_grid_blocks`], read from the same
     /// constants `crate::cuda::geglu::launch_config` reads — not re-typed
@@ -528,7 +528,7 @@ mod tests {
     /// `2^32 - n` values, so when `2^32 - n < g` it cannot contain one of
     /// every residue class — and every lane whose residue is missing spins
     /// forever. `2^32 - n < 256` is exactly `n > u32::MAX - 255`: the
-    /// finding's own window, re-derived here from the arithmetic rather
+    /// hang window, re-derived here from the arithmetic rather
     /// than restated. At `n = u32::MAX` the window is the single value
     /// `2^32 - 1 ≡ 255 (mod 256)`, so 255 of every 256 threads hang.
     #[test]
@@ -578,11 +578,11 @@ mod tests {
                 LaneWalk::Terminates { visits } => panic!(
                     "NEGATIVE CONTROL FAILED: the 32-bit model must NOT terminate at \
                      n_out = {n_out} (it terminated after {visits} visits) — if this \
-                     ever passes, the model no longer reproduces the finding it stands \
+                     ever passes, the model no longer reproduces the hang it stands \
                      in for"
                 ),
             }
-            // The fix, same n, same stride, only the index width changed.
+            // The 64-bit loop: same n, same stride, only the index width differs.
             assert_eq!(
                 walk_grid_stride_lane(0, stride, n, None),
                 LaneWalk::Terminates {
@@ -670,7 +670,7 @@ mod tests {
         assert_eq!(wide, LaneWalk::Terminates { visits: 1 });
     }
 
-    /// Coverage (family D, the "did the fixed loop still visit everything
+    /// Coverage (the "does the 64-bit loop visit everything
     /// exactly once" half): on a small synthetic geometry, walking EVERY
     /// lane of the 64-bit model visits each of `n` indices exactly once —
     /// including the tail, where `n` is not a multiple of the stride.
@@ -703,7 +703,7 @@ mod tests {
         }
     }
 
-    /// The launch geometry itself, at its own boundaries (family D): one
+    /// The launch geometry itself, at its own boundaries: one
     /// block minimum (never a zero-block, illegal launch), exact-multiple
     /// and tail shapes below the cap, and saturation at the cap.
     #[test]

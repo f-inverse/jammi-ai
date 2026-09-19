@@ -7,8 +7,8 @@ use candle_core::{CudaStorage, DType, Error, Layout, Result};
 /// stable and unique to this op.
 const MODULE_NAME: &str = "jammi_kernels_adamw_step";
 
-/// Domain check shared by both kernels here: F32 only (the optimizer is
-/// not gated by esc-045's BF16 boundary — see `ops::adamw_step`'s module
+/// Domain check shared by both kernels here: F32 only (the optimizer
+/// never sees the BF16 compute boundary — see `ops::adamw_step`'s module
 /// doc) and every buffer contiguous. Returns each buffer's
 /// `[start, end)` element range in its OWN base storage (`contiguous_
 /// offsets`, candle's own idiom for a `narrow`'d-but-contiguous view with a

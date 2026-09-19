@@ -19,7 +19,7 @@
 //! reuse — candle-core carries no separate per-file copyright header on
 //! the original to reproduce.
 //!
-//! Determinism (family J): iteration order is fixed by `dims`/`stride`
+//! Determinism: iteration order is fixed by `dims`/`stride`
 //! alone — the same layout always yields the same offset sequence, which is
 //! what makes every CPU fold order built on top of it reproducible.
 
@@ -38,7 +38,7 @@ impl<'a> StridedOffsets<'a> {
         let dims = layout.dims();
         let stride = layout.stride();
         let elem_count: usize = dims.iter().product();
-        // Degenerate/boundary case (family D): a zero-length dimension
+        // Degenerate/boundary case: a zero-length dimension
         // means zero elements, regardless of start_offset — the iterator
         // yields nothing rather than one spurious offset.
         let next = if elem_count == 0 {

@@ -19,7 +19,7 @@
 //! entry point builds an op node with `BackpropOp::none()` UNCONDITIONALLY,
 //! so a caller who forgets it is inside a `no_bwd` call gets a live forward
 //! value and a SILENTLY MISSING gradient rather than a loud
-//! `BackwardNotSupported` — exactly the esc-037 hazard class (a no-bwd op
+//! `BackwardNotSupported` — the silent-missing-gradient hazard (a no-bwd op
 //! reachable under grad, silently). This op exists SPECIFICALLY so nothing
 //! in this workspace ever needs that entry point for a quantized weight:
 //! `bwd` below is a REAL implementation (module doc section below), so the
@@ -73,8 +73,8 @@
 //! exactly one argument slot to fill (`arg`), and this op fills it, always.
 //!
 //! `bwd` NEVER returns `Ok(None)` for that one gradient slot: candle's own
-//! `Tensor::backward()` (`backprop.rs:663`, cited by this workspace's
-//! esc-037 finding) drops a `None` gradient SILENTLY rather than erroring —
+//! `Tensor::backward()` (`backprop.rs:663`)
+//! drops a `None` gradient SILENTLY rather than erroring —
 //! so a `CustomOp1::bwd` that decided "no meaningful gradient here" and
 //! returned `Ok(None)` would look, from the caller's side, EXACTLY like a
 //! correctly-computed all-zero gradient right up until a real training run
@@ -118,7 +118,7 @@
 //!    point" rounding doctrine (see e.g. `ops::mem_efficient_attention`'s
 //!    module doc).
 //!
-//! ## Domain (family D)
+//! ## Domain
 //!
 //! `W` (`self.w`): rank 2, `[out, in]` — enforced by `QTensor::cpu_fwd`'s
 //! own `self.shape.dims2()?` (an `Err`, not a silent reinterpretation, on
@@ -138,14 +138,14 @@
 //! states rank 2/3 because that is what this op's own callers ever
 //! construct, not because the implementation itself is narrower.
 //!
-//! ## `dtype` (family D: CPU accepts `f32`/`f16` only; `jammi-lora`'s own
+//! ## `dtype` (CPU accepts `f32`/`f16` only; `jammi-lora`'s own
 //! uniform rule keeps this op's dtype surface small)
 //!
 //! `QTensor::cpu_fwd` accepts `x` in `f32` or `f16` and refuses anything
 //! else with `"Expected f32/f16"` (`src/quantized/mod.rs:991`) — this op
 //! does not re-check that; `QTensor`'s own typed refusal is the domain
-//! boundary. `jammi_lora::QuantizedLinear` (the sole production caller,
-//! wave 3) additionally imposes a UNIFORM rule on top — cast `x` to `f32`
+//! boundary. `jammi_lora::QuantizedLinear` (the sole production caller)
+//! additionally imposes a UNIFORM rule on top — cast `x` to `f32`
 //! before calling [`quant_matmul_grad`], regardless of device — so in
 //! practice this op only ever receives `f32` `x` in this workspace; the
 //! wider `f16`-on-CPU acceptance is `QTensor`'s own, inherited, not
@@ -197,7 +197,7 @@
 //! site already holds its own `Arc<QTensor>` clone to construct a fresh
 //! [`QuantMatMulGrad`] from, via [`QuantMatMulGrad::new`]).
 //!
-//! Generic primitive (family L): this crate names no consumer. Module-doc
+//! Generic primitive: this crate names no consumer. Module-doc
 //! shapes/dtypes exist only to explain numeric choices.
 
 use std::sync::Arc;
@@ -312,7 +312,7 @@ impl CustomOp1 for QuantMatMulGrad {
 /// FIRST, on `x`'s own device (the device `apply_op1`'s dispatch actually
 /// keys off): a no-op on CPU/Metal and, after the first CUDA call this
 /// device's own ordinal makes, a cached table-lookup read (see that
-/// module's own doc for the full mechanism and why it exists — issue #434,
+/// module's own doc for the full mechanism and why it exists —
 /// the shipped `candle-kernels` 0.11 cu12 wheel's arch-mismatched
 /// single-arch-SASS quantized fast kernels silently returning
 /// uninitialized-memory garbage on an unsupported device rather than
@@ -368,11 +368,11 @@ mod tests {
     /// 256, QK_K's own block size).
     #[test]
     fn forward_parity_against_dense_dequantized_reference_q8_0_q4_0_q4k() {
-        // Tolerances are MEASURED, not asserted-by-hope (family F): the op's
+        // Tolerances are MEASURED, not asserted-by-hope: the op's
         // own quantized dot-product kernel (candle's `matmul_t`, block-wise
         // int accumulation) and the dense `dequantize -> matmul` reference
         // sum the SAME underlying quantized values in a DIFFERENT order —
-        // this is a genuine reduction-order divergence (family J: no
+        // this is a genuine reduction-order divergence (no
         // cross-order bit-identity is claimed), not a correctness bug.
         // Measured `max_abs_diff` at this fixture's shape/seed — see
         // `forward_parity_against_dense_dequantized_reference_q8_0_q4_0_q4k`
@@ -450,7 +450,7 @@ mod tests {
     /// Oracle (c): gradient reachability, no skip route — a single
     /// quantized-linear application, a trainable `Var` exclusively
     /// upstream, no residual: grad must be `Some` and non-zero (the
-    /// esc-037-faithful shape — a residual-skip fixture would let a
+    /// no-skip-route shape — a residual-skip fixture would let a
     /// silently-`None`-dropped gradient hide behind the residual's own
     /// contribution and would be vacuous).
     #[test]
@@ -487,7 +487,7 @@ mod tests {
 
     /// `bwd` never returns `Ok(None)` — a literal mechanism pin for the
     /// module doc's own claim (candle's `backprop.rs:663` drops `None`
-    /// silently, the esc-037 hazard this op exists to avoid).
+    /// silently, the hazard this op exists to avoid).
     #[test]
     fn bwd_never_returns_none_for_the_input_gradient() {
         let (out_f, in_f, rows) = (2usize, 32usize, 1usize);

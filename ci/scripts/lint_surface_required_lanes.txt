@@ -29,7 +29,6 @@
 # Host-resource test features (see `crates/jammi-test-resources`).
 jammi-ai        live-gpu-tests,live-gpu-gang-tests,live-gpu-cluster-tests  all-targets
 jammi-ai        unprivileged-tests                      all-targets
-jammi-ai        live-metal-tests                        tests
 jammi-db        unprivileged-tests,live-postgres-tests  all-targets
 jammi-db        live-broker-tests,live-s3-tests,live-gcs-tests,live-azure-tests,live-r2-tests  all-targets
 jammi-server    unprivileged-tests,live-postgres-tests  all-targets

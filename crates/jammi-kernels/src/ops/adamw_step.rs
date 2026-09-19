@@ -32,7 +32,7 @@
 //!    values). [`adamw_step_fused_t`] composes the three, in order, for one
 //!    `Var`, deriving `scale_m`/`scale_v` from the step counter `t` itself
 //!    (see that function's doc for why a caller-supplied `scale_m`/`scale_v`
-//!    — [`adamw_step_fused`]'s now-`#[deprecated]` shape — is a
+//!    — [`adamw_step_fused`]'s `#[deprecated]` shape — is a
 //!    bias-correction footgun). [`AdamWParams`] bundles the five scalar
 //!    hyperparameters that stay fixed across steps.
 //!
@@ -65,8 +65,9 @@
 //! **Bit-identity, both arms, not a CUDA tolerance.** Per-element, each of
 //! the three update rules above is evaluated as the SAME SEQUENCE of
 //! individually-rounded `f32` operations that candle's eager composition
-//! (`(m*beta1) + (g*(1-beta1))`, etc. — the literal `adamw.rs:94-100` chain
-//! this module's CPU unit tests reproduce as an independent oracle)
+//! (`(m*beta1) + (g*(1-beta1))`, etc. — the literal chain in `fn step` of
+//! `jammi-ai`'s `fine_tune/adamw.rs`, which this module's CPU unit tests
+//! reproduce as an independent oracle)
 //! performs — floating-point ELEMENTWISE operations have no cross-element
 //! interaction, so folding candle's separate full-array passes into one
 //! per-element expression changes nothing about that element's own
@@ -99,7 +100,7 @@
 //!   guarantee only this one needs). Each intrinsic is a single, non-fusable
 //!   IEEE round-to-nearest op, so ptxas cannot merge two of them into an
 //!   FMA the way it silently could with bare `*`/`+` — see `cuda/
-//!   adamw_step.cu` for the full per-site mapping against `adamw.rs:94-100`
+//!   adamw_step.cu` for the full per-site mapping against that eager chain
 //!   and the acceptance harness in `tests/cuda_parity.rs` (fused-CUDA vs
 //!   eager-CUDA `to_bits()` equality, plus fused-CPU vs fused-CUDA) and this
 //!   file's own CPU-side oracle for the CPU arm.
@@ -259,7 +260,7 @@ pub struct AdamThetaUpdate {
 
 impl AdamThetaUpdate {
     /// `lr_lambda = lr * weight_decay` (candle's own formula,
-    /// `adamw.rs:84`, computed in f64 exactly as here) folded into
+    /// computed in f64 exactly as the eager step does) folded into
     /// `one_minus_lr_lambda = 1.0 - lr_lambda` up front — matching eager's
     /// `theta.as_tensor() * (1f64 - lr_lambda)` operand exactly.
     pub fn new(lr: f64, weight_decay: f64, scale_m: f64, scale_v: f64, eps: f64) -> Self {
@@ -756,7 +757,7 @@ mod tests {
     }
 
     /// Fresh `theta`/`m`/`v`/`g` Vars for one test — `m`/`v` start at zero
-    /// (matching `AdamW::new`'s zero-init, `adamw.rs:52-53`), `theta`/`g`
+    /// (matching `AdamW::new`'s zero-init), `theta`/`g`
     /// take caller-supplied values.
     fn setup(theta_v: &[f32], g_v: &[f32], shape: (usize,)) -> (Tensor, Tensor, Tensor, Tensor) {
         let dev = Device::Cpu;
@@ -995,7 +996,7 @@ mod tests {
 
     /// Boundary oracle: `theta`/`g` identical everywhere (a common
     /// initialization for the LoRA `B` matrix, which starts at zero — see
-    /// `lora_linear.rs:408`), so `g == 0` too — degenerate zero-gradient
+    /// `jammi-lora`'s `LoraLinear`), so `g == 0` too — degenerate zero-gradient
     /// step, must not divide by zero or blow up (`eps` guards the
     /// denominator).
     #[test]

@@ -189,7 +189,7 @@ pub fn attention_block_flash_dispatch_snapshot() -> jammi_kernels::admission::Ca
 }
 
 /// A snapshot of the memory-efficient (chunked) attention cascade's
-/// dispatch counts (`mem_efficient_attention`, M2 — see
+/// dispatch counts (`mem_efficient_attention` — see
 /// `crate::modernbert`'s `mem_efficient_attention_predicate`/
 /// `ModernBertAttention::forward_training_attention` for the `admit_cascade`
 /// call site this counts). Mirrors [`attention_block_flash_dispatch_snapshot`]'s

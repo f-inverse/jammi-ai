@@ -81,16 +81,14 @@ use crate::{AnyEncoder, FusibleSiteCensus};
 // library dependency):
 //
 // 1. `lora_linear_fused` is admitted inside `jammi_lora::lora_linear`, where
-//    `counters_for("lora_linear_fused")` (`crates/jammi-lora/src/lora_linear.rs:201`)
-//    resolves the registry entry, compiled as a normal (non-`cfg(test)`)
+//    `counters_for("lora_linear_fused")` (`lora_linear_fused_counters` in
+//    `crates/jammi-lora/src/lora_linear.rs`) resolves the registry entry, compiled as a normal (non-`cfg(test)`)
 //    dependency of this crate. A per-thread counter scoped to
 //    `jammi-encoders`' own `cfg(test)` build cannot cover that key without
 //    an ALWAYS-ON API change to `jammi_lora` itself — which would move the
-//    shipped bench path at `lora_linear_fused_dispatch_before`
-//    (`crates/jammi-bench/src/finetune_run.rs:2060`) /
-//    `lora_linear_fused_dispatch_after`
-//    (`crates/jammi-bench/src/finetune_run.rs:2232`) that reads the SAME
-//    process-wide counter today.
+//    shipped bench path at `lora_linear_fused_dispatch_before` /
+//    `lora_linear_fused_dispatch_after` (`crates/jammi-bench/src/finetune_run.rs`)
+//    that reads the SAME process-wide counter.
 // 2. `jammi-bench`'s own positive-proof equation (`fused + eager == census
 //    x steps_measured`, `FusibleSiteCensus`'s own doc) reads the SAME
 //    process-WIDE counters this crate's unit tests read, including across

@@ -578,7 +578,7 @@ mod tests {
     /// Matching F16 `x`/`weight` holds: `jammi_kernels::cuda::layer_norm`
     /// has a compiled `(DType::F16, DType::F16)` arm, so admitting F16 is sound.
     #[test]
-    fn fused_admission_predicate_now_accepts_matching_f16() {
+    fn fused_admission_predicate_accepts_matching_f16() {
         let device = Device::Cpu;
         let hidden = 4;
         let xv: Vec<f16> = (0..hidden).map(|i| f16::from_f32(i as f32 * 0.5)).collect();
@@ -921,10 +921,10 @@ mod tests {
     /// candle-composed fold) — proved by a monotonic `LN_DISPATCH_COUNTERS`
     /// delta rather than exact equality.
     ///
-    /// Eval, `(Some(bias), false)`, still matches `forward`'s first arm
+    /// Eval, `(Some(bias), false)`, matches `forward`'s first arm
     /// (`candle_nn::ops::layer_norm` directly), pinned exactly.
     #[test]
-    fn biased_layer_norm_training_now_dispatches_fused_eval_is_unaffected() {
+    fn biased_layer_norm_training_dispatches_fused_eval_is_unaffected() {
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let hidden = 8;

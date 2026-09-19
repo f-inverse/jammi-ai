@@ -192,7 +192,7 @@ fn set_training_threading_gates_the_fused_rope_dispatch_counters() {
     );
 }
 
-/// The C4 (fused masked softmax) equivalent of the gate test above:
+/// The fused-masked-softmax equivalent of the gate test above:
 /// `ModernBert::set_training`'s threading down to `ModernBertAttention`
 /// (and from there to `softmax_apply_training`) exercised through the REAL
 /// encoder's forward call graph. See
@@ -266,7 +266,7 @@ fn set_training_threading_gates_the_fused_softmax_dispatch_counters() {
 
 /// Same real, end-to-end wiring proof as
 /// `set_training_threading_gates_the_fused_rope_dispatch_counters` /
-/// `..._softmax_dispatch_counters`, for the C5 fused GeGLU kernel (see
+/// `..._softmax_dispatch_counters`, for the fused GeGLU kernel (see
 /// `set_training_threading_gates_the_fused_rope_dispatch_counters`'s doc
 /// for the race-safety rationale behind [`DISPATCH_COUNTER_TEST_LOCK`],
 /// which this test also takes).

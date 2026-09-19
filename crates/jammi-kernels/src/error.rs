@@ -19,7 +19,7 @@ use thiserror::Error;
 /// domain validation.
 #[derive(Debug, Error)]
 pub enum KernelError {
-    /// STRICT admission mode (scope-6 / K2 in the fused-kernels plan): a
+    /// STRICT admission mode: a
     /// caller explicitly requested the fused path and the op's domain
     /// predicate failed. A silent fallback here would hide a real
     /// perf-or-correctness question from a strict-mode caller, so STRICT

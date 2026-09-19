@@ -1,11 +1,10 @@
-//! FlashAttention-2 FFI smoke — the pod-run landing proof for the vendored
-//! kernels + `flash_api_jammi.cu` + `jammi_kernels::flash`.
+//! FlashAttention-2 FFI smoke — the on-GPU proof for the vendored kernels +
+//! `flash_api_jammi.cu` + `jammi_kernels::flash`.
 //!
-//! Builds only with `--features flash-attn` (`required-features` in
-//! `Cargo.toml`). Device acquisition follows `cuda_parity.rs`: a failure to
-//! open CUDA device 0 is a SKIP unless `JAMMI_REQUIRE_CUDA` is set, in which
-//! case it PANICS — the pod session that is this file's landing proof sets
-//! it, so a silent skip can never read as green there.
+//! Builds only with `--features live-gpu-tests,flash-attn` (`required-features`
+//! in `Cargo.toml`). Every test acquires CUDA device 0 through
+//! `jammi_test_resources::cuda_backend`, which panics naming the missing
+//! device.
 //!
 //! Two fixtures, H = 2, D = 64, bf16 inputs from a deterministic `sin`
 //! fixture, `softmax_scale = 1/8`:
@@ -29,7 +28,7 @@
 //!
 //! Every tolerance below states its derivation, its mutation (what change
 //! it is proven to detect), and the ratio bound / max|signal| is printed
-//! from the run (the pod output is pasted into the landing commit).
+//! from the run.
 
 use candle_core::cuda_backend::cudarc::driver::DeviceRepr;
 use candle_core::{CudaDevice, Device};
@@ -41,7 +40,7 @@ use jammi_kernels::flash::{
 };
 
 /// Mirrors `crate::flash`'s private `JAMMI_FLASH_DTYPE_BF16` constant
-/// (campaign #443 D2's `raw::FwdArgs`/`raw::BwdArgs::dtype` field: `0` =
+/// (the `raw::FwdArgs`/`raw::BwdArgs::dtype` field: `0` =
 /// bf16, `1` = fp16) — duplicated here rather than imported because this
 /// file is a SEPARATE integration-test crate (`tests/`) and the source
 /// constant is crate-private by design (the C shim's own two valid values

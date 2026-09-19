@@ -32,7 +32,7 @@
 //! `[build-dependencies]` on its own crate graph) is where `build_cuda`
 //! actually needs to exist and compile; this hermetic pin file is not that
 //! compilation unit and has no business re-parsing a cuda-only fn at all.
-//! Skipping the whole file under `--features cuda` keeps the pins exactly
+//! Excluding the whole file under `--features cuda` keeps the pins exactly
 //! where they run and matter (the default, hermetic lane) and leaves
 //! nothing here for a cuda-feature test compile to trip over.
 #![cfg(not(feature = "cuda"))]

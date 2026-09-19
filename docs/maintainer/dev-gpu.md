@@ -600,21 +600,6 @@ MAINTAINER-GUIDE.md's release runbook for the exact sequencing.
 
 CI pods are always throwaway and always terminate.
 
-**Standing operator cost (R5, `check_gpu_prove_timings.py`):** proof surface ==
-shipped surface is enforced by fingerprinting the exact `(crate, kind) →
-features` pairs `runpod_gpu_prove.sh` proves (`ci/scripts/prove_surface.py`'s
-`expected_id`) and demanding a fresh, matching, healthy artifact per shipped
-arch. That fingerprint — and therefore this gate — moves the moment: a lane
-feature is added to or removed from `ci/release-feature-manifest.json`'s
-`cu12-tarball` lane; a `prove_lane.crates.<c>.prove_only` entry changes; or a
-crate starts or stops declaring a feature the lane already carries. None of
-those are prove-lane edits — they can land in an ordinary PR — but each one
-reds this gate until a fresh 4-pod `gpu-prove.yml` dispatch lands new
-`ci/artifacts/gpu-prove-timings/*.json` evidence for every arch. A waiver row
-in `ci/scripts/gpu_prove_timings_allowlist.txt` is for a genuinely reviewed,
-time-boxed exception on ONE arch — never a standing substitute for that
-dispatch.
-
 ### Cross-pod seed cache — not yet built
 
 The seed/clone substrate above is per-pod: a second pod builds its own seed

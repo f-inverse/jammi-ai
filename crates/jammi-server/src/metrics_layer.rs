@@ -19,8 +19,7 @@
 //!   (which carries this same layer);
 //! * `/jammi.v1.gang.GangService/<Rpc>` increments `gang_requests{rpc}` — a
 //!   coordinator's `RunRank` call reaching this member, seen only on the
-//!   `peer_bind` listener, never the public listener (see
-//!   `docs/rigor/contracts/feat_500-C-U5a-1.md` §1.7).
+//!   `peer_bind` listener, never the public listener.
 //!
 //! Counting at the whole-server layer (rather than per service / per
 //! interceptor) keeps all four metrics live at one site with no threading into

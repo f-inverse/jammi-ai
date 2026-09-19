@@ -146,10 +146,9 @@ impl ModelResolver {
                 message: format!(
                     "'{}' carries the reserved fine-tuned-output prefix \
                      '{FINE_TUNED_ID_PREFIX}' but its catalog row is typed \
-                     '{}', not 'fine-tuned' — this catalog was corrupted by a \
-                     build predating esc-089 (the model cache's post-load \
-                     bookkeeping used to rewrite this row's type, \
-                     base_model_id and artifact_path unconditionally). \
+                     '{}', not 'fine-tuned' — an older build's model cache \
+                     rewrote this row's type, base_model_id and \
+                     artifact_path after loading it. \
                      Refusing to resolve it as a base model, which would \
                      silently serve the unadapted checkpoint with no signal. \
                      Remedy: re-run the fine-tune job that produced this id \

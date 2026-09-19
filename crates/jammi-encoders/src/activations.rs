@@ -142,21 +142,6 @@ fn dispatch_gelu_erf_fused(x: &Tensor) -> Result<Tensor, EncoderError> {
 /// `projection_hidden_act == "gelu"`; that tower's own module doc carries
 /// the arithmetic and the oracles that pin it.
 ///
-/// Citation direction matters here, and the two directions are NOT
-/// symmetric (corrected in #421 P1-a, which tripped the second one):
-/// `ci/scripts/perf/check_citations.py` scans `crates/jammi-bench/**`,
-/// `ci/scripts/perf/**` and `crates/jammi-kernels/artifacts/cuda-runs/**`,
-/// re-resolving every `crates/<crate>/src/<file>.rs:<line>` citation it
-/// finds THERE. So (a) the `bert.rs:296`/`distilbert.rs:213` line numbers
-/// written HERE are NOT tracked — this file is not in any scanned root, and
-/// an edit to either call site's surrounding code drifts them silently
-/// (verify by name if in doubt) — while (b) a citation INTO this file from a
-/// scanned root IS mechanically re-checked every CI:
-/// `ci/scripts/perf/finetune_ab.sh` cites this function's own
-/// `"gelu_erf_fused"` op-key line by number, so any edit to this doc
-/// comment that shifts that line reds that gate until the citation is
-/// re-pointed.
-///
 /// **Not wired** (recorded here, per plan v2 R5', rather than silently
 /// excluded): `crate::context`'s
 /// GELU site has no train/eval split. The GeGLU eager reference arm

@@ -759,15 +759,13 @@ async fn single_file_ndjson_url_with_no_override_falls_back_and_serves_rows(back
 
 /// Zero-match guard test group (`closes_escape: esc-036-directory-source-silently-lists-zero-files`).
 ///
-/// esc-036 (`.jammi/escapes.jsonl`) named a directory/file source whose
-/// listing extension mismatches its actual files as silently resolving to a
-/// schema-less, row-less table with no diagnostic — no CLI-reachable
-/// override existed to rescue it, and no test exercised a mismatched
-/// extension at all. This function and its three siblings —
+/// A directory/file source whose listing extension mismatches its actual
+/// files must never silently resolve to a schema-less, row-less table with
+/// no diagnostic. This function and its three siblings —
 /// [`single_zero_byte_jsonl_file_is_a_loud_error_not_a_silent_empty_table`],
 /// [`directory_of_only_zero_byte_jsonl_files_is_a_loud_error_not_a_silent_empty_table`],
 /// and [`zero_match_guard_also_fires_on_a_non_jsonl_format`] — are that
-/// missing coverage: every one asserts a typed error naming BOTH the
+/// coverage: every one asserts a typed error naming BOTH the
 /// applied extension and the url, never a silent empty success.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]

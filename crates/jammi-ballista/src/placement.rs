@@ -198,7 +198,7 @@ impl DistributionPolicy for DevicePlacement {
                                 claimed_by = %claimant,
                                 "jammi-ballista DevicePlacement: refusing to bind a GangExec \
                                  whose job row is already claimed by another instance — the \
-                                 re-launch guard (contract §2.4)"
+                                 re-launch guard"
                             );
                             black_list.push(stage.stage_id);
                             continue;

@@ -41,24 +41,21 @@ It has no proper names of its own. It uses only GENERIC patterns:
      never committed, because a committed consumer name is itself the bug this
      gate exists to prevent.
 
-  4. **The waiver allowlist (`no_consumer_names_allowlist.txt`).** #508
-     amendment: a finding a human has already ruled MECHANISM (not governance;
-     no consumer name) used to have exactly two exits — rename the identifier to
-     dodge the grep, or admin-merge past every gate in the job — both worse than
-     the finding. A reviewed row in `no_consumer_names_allowlist.txt` (that
-     file's own header carries the full 5-field, 7-rot-rule schema) is the
-     annotate path: it is scoped to the exact `(identifier, declaring_path)`
+  4. **The waiver allowlist (`no_consumer_names_allowlist.txt`).** A finding a
+     maintainer has ruled MECHANISM (not governance; no consumer name) needs an
+     exit better than renaming a correct identifier to dodge the grep. A
+     reviewed row in `no_consumer_names_allowlist.txt` (that file's own header
+     carries the full 5-field, 7-rot-rule schema) is the annotate path: it is
+     scoped to the exact `(identifier, declaring_path)`
      pair a finding names — never the identifier alone, so one row can never
      amnesty a whole class — and it is re-verified for rot on every run, fail-
      closed. A waived finding still PRINTS, as an informational line naming the
-     row and its ruling, so it never goes silent. The allowlist file is in
-     `swarm.yml`'s human-amend-only glob: adding a row costs an admin-merge once
-     per identifier, same discipline as every other reviewed waiver in this
-     repo, but the ruling then lands in the tree instead of in a merge button.
+     row and its ruling, so it never goes silent, and the ruling lands in the
+     tree where a reviewer reads it.
 
 Scope is engine RUNTIME paths only (`crates/**` code / config / fixtures, plus the
-workspace `Cargo.toml` / `.cargo`) — never `docs/**` or `.claude/**` prose, which
-legitimately *names* these anti-patterns to forbid them.
+workspace `Cargo.toml` / `.cargo`) — never `docs/**` prose, which legitimately
+*names* these anti-patterns to forbid them.
 
 Fail-closed: any un-waived finding, any malformed allowlist row, or any rotted
 allowlist row is a non-zero exit. Every un-waived finding is labelled ADVISORY —
@@ -296,7 +293,6 @@ def _census_governance_findings(index: dict, nouns: dict[str, str] | None) -> se
 def resolve_diff_base() -> str | None:
     """Resolve a git ref to diff against, or None if none is available."""
     candidates = [
-        os.environ.get("SWARM_DIFF_BASE"),
         f"origin/{os.environ['GITHUB_BASE_REF']}" if os.environ.get("GITHUB_BASE_REF") else None,
         "origin/main",
         "main",
@@ -473,9 +469,8 @@ def _resolve_ruling_ref(ref: str) -> str | None:
     Either a bare issue/PR number (`#123`/`123`) — accepted on FORMAT alone;
     this gate is hermetic (no network), so it cannot dial GitHub to confirm
     the issue carries a verdict, only that the citation is well-formed — or
-    a `<doc-path>#<heading>` pair, resolved the same substring way
-    `check_constitution_anchors.py`'s `doc_heading` anchor kind resolves
-    (the heading text must literally appear in the doc).
+    a `<doc-path>#<heading>` pair (the heading text must literally appear in
+    the doc).
     """
     if ISSUE_OR_PR_REF_RE.match(ref):
         return None
@@ -610,7 +605,7 @@ def check_governance_tripwire(rows: list[AllowlistRow]) -> tuple[list[str], list
     if base is None:
         print(
             "no-consumer-names: no diff base available "
-            "(SWARM_DIFF_BASE / origin/<base> / origin/main / main) — "
+            "(origin/<base> / origin/main / main) — "
             "skipping the diff-scoped governance-verb tripwire.",
             file=sys.stderr,
         )
@@ -872,7 +867,7 @@ def self_test() -> int:
     # lines, so it cannot see whether the noun table would newly flag
     # something ALREADY in the tree). This self-test runs ONLY in ci.yml's
     # container-backed `symbol-index-gates` job (a toolchain is always
-    # present there — never the toolchain-less swarm lane), so an index
+    # present there), so an index
     # build failure here is a genuine environment problem, not a
     # graceful-skip arm like this file's own missing-cargo advisory arm
     # elsewhere.

@@ -127,7 +127,7 @@ kernel) fired. This means:
     can never exercise the pre-registered differential at all, making the
     experiment null on such a build. `finetune_run_ab.sh` now builds
     `--features cuda,jammi-encoders/flash-attn` (mirroring
-    `fa2_ab.sh`'s/`stacked_sweep.sh`'s own flash-A/B build feature list)
+    `stacked_sweep.sh`'s own flash-A/B build feature list)
     for exactly this reason — a CPU-hermetic golden can never carry a real
     `flash_compiled: true` leg's dispatch counters (this repo's own build
     environment has no CUDA device to run one against).
@@ -603,9 +603,8 @@ alone that this SAME `tiny_bert` fixture now exercises for the first time:
     own numerics slightly; still real, measured output of the compiled
     binary, never invented.
 
-`python3 -m unittest ci/scripts/perf/test_ab_merge.py`,
-`python3 ci/scripts/perf/test_profile_356_legs_dry_run.py`, and
-`python3 ci/scripts/perf/check_producer_provenance_gates.py` were all
+`python3 -m unittest ci/scripts/perf/test_ab_merge.py` and
+`python3 ci/scripts/perf/check_producer_provenance_gates.py` were both
 re-run against the regenerated file (see this unit's own hand-off for exit
 codes).
 
@@ -719,9 +718,7 @@ supersession used) is an equally valid representative leg as `r2`. Evidence
 path (files copied verbatim):
 `raw/seed1__fused__r1.json` -> `modernbert_fused.json`;
 `raw/seed1__alloff__r1.json` -> `modernbert_alloff.json` (pulled from the
-producing pod to
-`/private/tmp/claude-501/-Users-vijaychakilam-git-f-inverse-jammi-ai/603bf965-740c-4156-8bad-6973659317e4/scratchpad/cb-pull/golden-legs-r5/raw/`
-in the regenerating agent's own scratchpad; not a repo-relative path).
+producing pod to a local directory; not a repo-relative path).
 
 **Verbatim-copy proof** (sha256 of the golden file == sha256 of the source
 evidence-path file, byte-for-byte — the raw legs pulled off the pod are

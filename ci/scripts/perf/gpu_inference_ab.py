@@ -165,7 +165,7 @@ disclosure that the rule was formalized after the constant)
 to `[0.75, 1.33]` — mechanically re-derived from the committed evidence and
 its `manifest.json` classification, and checked equal to
 [`PRE_REGISTERED_ADVISORY_BAND`], by `ci/scripts/check_aa_null_band.py`
-(wired into `ci.yml`'s Guard matrix) — this is ENFORCED, never merely
+(a guard in `ci/guards.toml`) — this is ENFORCED, never merely
 asserted in prose. See `ci/artifacts/gpu-perf-aa-null/README.md`'s own
 "Band derivation" section for the full worked numeric example, including
 why the rounding rule produces `1.33` rather than the `1.32` an

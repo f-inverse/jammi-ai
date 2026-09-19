@@ -1,7 +1,5 @@
 //! esc-046 (GH#374) — the production-width, REAL-DISPATCH biting oracle.
-//! `.jammi/escapes.jsonl`'s
-//! `esc-046-lora-forward-epilogue-rounds-the-delta-before-the-add-vs-peft`
-//! row's leg (1) BLINDNESS (a same-build fused-vs-eager A/B is structurally
+//! Leg (1) BLINDNESS (a same-build fused-vs-eager A/B is structurally
 //! blind to a defect BOTH arms carry identically) and controls (a) POWER OF
 //! THE COMPARISON, (b) F32-TRUTH DIRECTION, (c) NON-VACUITY AND A
 //! DISCRIMINATING FIXTURE, (d) NON-FINITE COUNTS AS MISMATCH, (e) THE

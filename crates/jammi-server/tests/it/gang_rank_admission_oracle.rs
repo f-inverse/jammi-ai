@@ -1,6 +1,5 @@
-//! Two enumerating-caller oracles (see
-//! `docs/rigor/contracts/feat_500-C-U5a-1.md` § 1.6 — the I-GANG row
-//! predicate), MEASURED claims (never prose): `Catalog::get_job_for_rank`
+//! Two enumerating-caller oracles for the I-GANG row predicate, MEASURED
+//! claims (never prose): `Catalog::get_job_for_rank`
 //! is called from nowhere outside the gang `RunRank` handler (plus
 //! `jammi-db`'s own tests, which call it directly to exercise it in
 //! isolation, and the producer→consumer parity test), and the strict
@@ -294,8 +293,7 @@ fn only_the_gang_run_rank_handler_calls_get_job_for_rank() {
             "unexpected `get_job_for_rank(` occurrence outside the allowed set: {hit} \
              (allowed: {allowed:?}) — a new caller of this primary-key-only, \
              non-tenant-scoped verb must be reviewed and this allowlist \
-             deliberately grown, never left stale \
-             (see docs/rigor/contracts/feat_500-C-U5a-1.md § A1)"
+             deliberately grown, never left stale"
         );
     }
     for must_hit in &allowed {

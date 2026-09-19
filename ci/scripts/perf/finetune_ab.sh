@@ -223,7 +223,7 @@
 # row in the sweep reads `INVALID`, never PASS/FAIL, until the flash
 # feature is compiled in. This build therefore always turns on
 # `--features cuda,jammi-encoders/flash-attn` — the SAME convention
-# `finetune_run_ab.sh:305`/`fa2_ab.sh:7`/`clip_artifact_producer.sh`'s own
+# `finetune_run_ab.sh:305`/`clip_artifact_producer.sh`'s own
 # flash build already use, never a second, independently-drifting
 # feature-list spelling.
 #
@@ -637,7 +637,7 @@ build_binary() {
 }
 
 # --- provenance cross-check (unification contract C5.1), same shape as
-# stacked_sweep.sh/clip_artifact_producer.sh/fa2_ab.sh: called immediately
+# stacked_sweep.sh/clip_artifact_producer.sh: called immediately
 # after the one build above, BEFORE any leg runs. Refuses if the
 # jammi-bench binary's own baked identity does not match the sha ACTUALLY
 # checked out (`git rev-parse HEAD`). `unknown`/a `-dirty` suffix can

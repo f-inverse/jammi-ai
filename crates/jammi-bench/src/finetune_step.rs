@@ -718,8 +718,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     //
     //   - BINARY-ENFORCED (this check, `--expect-kernels-disabled` always
     //     passed, even as the empty string on a fused/control leg —
-    //     `finetune_ab.sh:582`'s own convention, adopted by `fa2_ab.sh`
-    //     after the re-audit that raised this doc): a mismatch refuses
+    //     `finetune_ab.sh:582`'s own convention): a mismatch refuses
     //     BEFORE any step runs, per the doc above.
     //   - POST-HOC SCRIPT PREDICATE (no `--expect-kernels-disabled` on
     //     the command line at all; the calling script reads the emitted

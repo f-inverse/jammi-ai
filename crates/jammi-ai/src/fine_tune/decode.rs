@@ -111,7 +111,7 @@ fn refuse_null_cell(col: &dyn arrow::array::Array, column: &str) -> Result<()> {
         return Err(JammiError::FineTune(format!(
             "'{column}' has a NULL cell at row {i}: a declared triplet format must carry an \
              explicit value for every row, never silently read as whatever an unchecked \
-             null-slot read on this column type happens to return (issue #538 GA3)"
+             null-slot read on this column type happens to return"
         )));
     }
     Ok(())
@@ -880,7 +880,7 @@ impl ChunkAccumulator {
                     return Err(JammiError::FineTune(
                         "classification needs a whole-table label vocabulary before a per-step \
                          chunk can assign class indices — build one via `LabelVocabulary::\
-                         from_labels` over the WHOLE table first (#500 U2c §11 F3)"
+                         from_labels` over the WHOLE table first"
                             .into(),
                     ));
                 }

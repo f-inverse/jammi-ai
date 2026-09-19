@@ -87,9 +87,7 @@
 //! This leg proves world 2 only. Whether the NCCL pin set (`NCCL_SOCKET_IFNAME`
 //! and friends) that works at world 2 still suffices at world ≥ 3 — a
 //! multi-rail / multi-NIC topology a 2-host gang cannot exercise — is
-//! **uncovered** here; it is out of scope for this unit and filed in the
-//! contract of record (`docs/rigor/contracts/feat_500-C-U7b.md`) rather than
-//! silently assumed.
+//! **uncovered** here, and stated as such rather than silently assumed.
 
 // Unconditional (not `#[cfg(feature = "cuda")]`): `harness::serial_cuda_device`
 // and `harness::SerialGpu` need no `cuda` feature to name — the device

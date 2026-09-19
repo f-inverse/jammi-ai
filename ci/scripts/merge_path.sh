@@ -8,8 +8,8 @@
 # Stages, in order:
 #   static   fmt, the four clippy surfaces, rustdoc -D warnings, the guide build
 #            (ci.yml `check`, docs.yml `build`)
-#   guards   every `guard` matrix command in ci.yml (read from the file at run
-#            time, never a copied list — the list that drifted cost a CI round)
+#   guards   the guards this change can affect (`ci/guards.toml`), through the
+#            same runner ci.yml's `guard` job calls
 #   index    ci.yml's `symbol-index-gates` steps (the guards that build a
 #            workspace crate), each step's `run:` block executed WHOLE (a
 #            multi-line guard split into lines is never evaluated)
@@ -130,15 +130,6 @@ run_sh() {
   run "$stage" "$label" bash -e -c "$cmd"
 }
 
-# Same as run_sh, with the rustc wrapper pointed at a path that does not
-# exist — the ci.yml guard runner's shape for a non-toolchain leg (sccache
-# absent while config.toml mandates it; see the guards stage below).
-run_sh_nosccache() {
-  local stage="$1" label="$2" cmd
-  cmd="$(expand "$3")" || exit 2
-  run "$stage" "$label" env RUSTC_WRAPPER="$NOSCCACHE_WRAPPER" bash -e -c "$cmd"
-}
-
 export GITHUB_EVENT_NAME=pull_request GITHUB_BASE_REF="$BASE_REF" GITHUB_HEAD_REF="$HEAD_REF" \
   GITHUB_ACTOR="${GITHUB_ACTOR:-local}" GITHUB_WORKSPACE="$ROOT"
 
@@ -198,57 +189,7 @@ fi
 
 # ---------------------------------------------------------------- guards
 if stage_wanted guards; then
-  GUARD_LIST="$LOG_DIR/guard-matrix.tsv"
-  python3 - "$GUARD_LIST" <<'PY'
-import sys, yaml
-ci = yaml.safe_load(open('.github/workflows/ci.yml'))
-entries = ci['jobs']['guard']['strategy']['matrix']['include']
-with open(sys.argv[1], 'w') as out:
-    for e in entries:
-        tc = 'true' if e.get('toolchain') is True else 'false'
-        out.write(e['name'] + '\t' + tc + '\t' + ' '.join(e['cmd'].split()) + '\n')
-print(f"merge_path: {len(entries)} guard-matrix commands read from ci.yml")
-PY
-  # ci.yml's `guard` runner is bare ubuntu (no container): cargo and rustc
-  # are present, `sccache` — which `.cargo/config.toml` makes the mandatory
-  # rustc wrapper — is not, and neither is a linker. A guard that shells out
-  # to cargo fails there ("could not execute process `sccache ... rustc -vV`")
-  # unless its matrix entry declares `toolchain: true` (then `setup-rust-ci`
-  # installs sccache — enough for `cargo metadata`, never for a build; a guard
-  # that builds Rust lives in ci.yml's container-backed `symbol-index-gates`
-  # job, which the index stage below runs). A developer
-  # machine has sccache, so the same guard passes here. Mirror the runner:
-  # every NON-toolchain leg runs with RUSTC_WRAPPER pointed at a path that
-  # does not exist (the env var overrides config.toml, so cargo fails exactly
-  # as on the runner; sccache shares ~/.cargo/bin with cargo, so hiding it by
-  # PATH would hide cargo too, which is NOT the runner's shape); toolchain
-  # legs run as-is. The stage refuses to start if that path exists.
-  NOSCCACHE_WRAPPER="/nonexistent/sccache-absent-on-the-guard-runner"
-  if [ -e "$NOSCCACHE_WRAPPER" ]; then
-    printf 'FAIL  [guards] %s exists — the non-toolchain mirror needs an unexecutable wrapper path\n' "$NOSCCACHE_WRAPPER"
-    exit 2
-  fi
-  # A toolchain leg gets sccache and a fetched registry on the runner and
-  # links with the runner's own `ld` — which is enough for `cargo metadata`
-  # and for building a FIXTURE workspace (`pod build substrate` does both),
-  # but not for building a WORKSPACE crate: `.cargo/config.toml` mandates
-  # `-fuse-ld=mold` for x86_64 Linux and the bare runner has no mold (PR #587:
-  # `collect2: cannot find 'ld'` from the eager-disable sweep's `cargo run -p
-  # probed-ops-index`). That divergence has no macOS mirror; the rule is
-  # placement — a guard that builds a workspace crate lives in ci.yml's
-  # container-backed `symbol-index-gates` job — and the draft PR's CI is the
-  # check. Toolchain legs run as-is here.
-  # The guard runner has an ssh client and, on a toolchain leg, a fetched
-  # registry (`cargo metadata --frozen` reads it); the image has neither.
-  provide_in_image guards openssh-clients command -v ssh-keygen
-  run guards "cargo fetch (a toolchain leg's registry)" cargo fetch --locked
-  while IFS=$'\t' read -r name toolchain cmd; do
-    if [ "$toolchain" = "true" ]; then
-      run_sh guards "$name" "$cmd"
-    else
-      run_sh_nosccache guards "$name" "$cmd"
-    fi
-  done < "$GUARD_LIST"
+  run guards "run_guards.py --base $BASE_REF" python3 ci/scripts/run_guards.py --base "$BASE_SHA"
 fi
 
 # ---------------------------------------------------------------- index

@@ -1564,7 +1564,7 @@ impl ModelFingerprint {
                         let current_mtime = meta.modified().map_err(|e| JammiError::Model {
                             model_id: path.display().to_string(),
                             message: format!(
-                                "esc-058 staleness probe: {path:?} has no mtime available on \
+                                "staleness probe: {path:?} has no mtime available on \
                                  this platform/filesystem: {e}"
                             ),
                         })?;
@@ -1596,7 +1596,7 @@ impl ModelFingerprint {
                             vanished_arm_error = Some(JammiError::Model {
                                 model_id: path.display().to_string(),
                                 message: format!(
-                                    "esc-058 staleness probe: {path:?} (fingerprinted as \
+                                    "staleness probe: {path:?} (fingerprinted as \
                                      {rel:?} at load time) is no longer readable: {e}"
                                 ),
                             });
@@ -1611,7 +1611,7 @@ impl ModelFingerprint {
                         return Err(JammiError::Model {
                             model_id: path.display().to_string(),
                             message: format!(
-                                "esc-058 staleness probe: {path:?} (fingerprinted as {rel:?} \
+                                "staleness probe: {path:?} (fingerprinted as {rel:?} \
                                  at load time) is no longer readable: {e}"
                             ),
                         });
@@ -1667,7 +1667,7 @@ fn compute_model_fingerprint(resolved: &ResolvedModel) -> Result<ModelFingerprin
                     let mtime = meta.modified().map_err(|e| JammiError::Model {
                         model_id: resolved.model_id.0.clone(),
                         message: format!(
-                            "{path:?} has no mtime available for esc-058 load-time \
+                            "{path:?} has no mtime available for load-time \
                              fingerprinting: {e}"
                         ),
                     })?;
@@ -1680,7 +1680,7 @@ fn compute_model_fingerprint(resolved: &ResolvedModel) -> Result<ModelFingerprin
                     return Err(JammiError::Model {
                         model_id: resolved.model_id.0.clone(),
                         message: format!(
-                            "failed to stat {path:?} for esc-058 load-time fingerprinting: {e}"
+                            "failed to stat {path:?} for load-time fingerprinting: {e}"
                         ),
                     });
                 }

@@ -345,7 +345,7 @@ class PoolCacheTests(unittest.TestCase):
     def test_cache_hit_and_miss_are_byte_identical_to_the_uncached_path(self):
         """Drives the PRODUCTION shape
         (`--heldout-rows`/`--heldout-families`, exactly as
-        `profile_421_legs.sh` calls this producer) and compares EVERY
+        a leg sweep calls this producer) and compares EVERY
         emitted file, not just the WAVs -- `triplets.jsonl`,
         `heldout_ids.txt`, and `heldout_triplets.jsonl` all move under a
         `--rows`/held-out-shape change the same way the audio pool moves

@@ -303,10 +303,10 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
 /// (issue #421 §D4 item 1): for each fusible key, `fused + eager ==
 /// <witnessed census field> × steps_measured`.
 ///
-/// This is the assertion `ci/scripts/perf/profile_421_merge.py` applies to
+/// This is the assertion a profile merger applies to
 /// every pod leg, run here against the CLI's own stdout so the equation is
-/// proven to HOLD on real production output rather than only on the
-/// synthetic JSON that merger's own hermetic tests feed it. A subprocess is
+/// proven to HOLD on real production output rather than only on
+/// synthetic JSON. A subprocess is
 /// the right home for it and an in-crate unit test is not: the dispatch
 /// counters are PROCESS-WIDE, and this crate's unit tests drive `run_impl`
 /// concurrently on several threads of one process, so an exact-count
@@ -340,10 +340,7 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
 ///
 /// This is a convention pin, not a bug hunt: at `--epochs 1` (every #421
 /// leg, A and D alike) the two coincide exactly, which is what the
-/// assertion below proves on real output. `profile_421_merge.py` REFUSES a
-/// leg whose `epochs`/`grad_accum` are not `1`, naming this reason, rather
-/// than reporting an equation failure for a leg that simply was not run
-/// under the convention the equation is defined for.
+/// assertion below proves on real output.
 #[test]
 fn fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run() {
     let config: serde_json::Value = serde_json::from_slice(

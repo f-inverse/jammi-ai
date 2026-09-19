@@ -739,8 +739,7 @@ impl JammiSession {
         // removed by migration 004), so this statement cannot itself observe
         // — let alone refuse — a table CREATED for this source in the window
         // between step 1's atomic delete and this statement. That race is
-        // still open and is tracked as an escape (`.jammi/escapes.jsonl`),
-        // not fixed here: the still-live consequence is an orphan
+        // still open, not fixed here: the still-live consequence is an orphan
         // `result_tables` row whose source is gone, left for a `reconcile`
         // pass to eventually reap by the ordinary orphan-object rule.
         self.catalog.remove_source(source_id).await?;

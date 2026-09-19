@@ -159,54 +159,7 @@ change here is caught only by review, and is recorded as a **BREAKING** entry
 in the CHANGELOG the same way every other breaking change in this workspace
 is, naming the item, what changed, and what the caller does instead.
 
-**Deriving this section.** Do not hand-maintain this list from memory — a
-prior round of this same section missed at least seven breaking changes,
-including a `pub fn` removed with no entry anywhere, and its own scope
-sentence named 2 of these 11 crates. Enumerate every public item whose
-signature, visibility, or existence changed across the range instead. **The
-range is a set of commits, not a contiguous `<base>..<head>` span**: this
-unit's commits are interleaved on the branch with other units' commits (a
-plain `git diff <base> <head>` between the oldest and newest of this unit's
-own commits also picks up whatever any OTHER unit changed in between — that
-is how a sibling unit's own unannounced removal was mistaken for this
-section's gap in a prior round). Derive the exact commit set from the
-commit-message tag every round of this unit's own history carries, and diff
-the UNION of those commits, never a span:
-
-```bash
-# Every commit belonging to THIS unit, oldest first. NOT a literal
-# '#482 DIST' substring match: this unit's own history also carries the tag
-# as 'DIST-1' and 'DELTA/DIST' (a hyphen or a slash immediately after
-# 'DIST', never a space) — a plain `--grep='#482 DIST'` silently drops those
-# and under-ranges the set (measured, DIST round 8: it returns 3 commits and
-# misses 3 more, including the one that introduced the sites a round-8 fix
-# corrected). `-E --grep='#482.*DIST'` matches all three spellings because
-# it does not require a space between the issue number and the tag:
-commits=$(git log --oneline --reverse -E --grep='#482.*DIST' | cut -d' ' -f1)
-for c in $commits; do
-  git diff --name-only "$c"^.."$c" | grep '^crates/.*/src/.*\.rs$'
-  # for each changed file, diff its `pub fn|struct|enum|trait|type|const|
-  # static|use` items between "$c"^ and "$c" — a struct/enum/trait's full
-  # brace-balanced body, a fn/const/static/type/use's signature up to its
-  # body or `;` — and treat a normalized-text change as added-old +
-  # added-new (catches a removal with no replacement, not just a same-line
-  # diff hunk).
-done
-# Cross-check the crate list above against every `crates/*/Cargo.toml`
-# lacking `publish = false`.
-```
-
-Nine commits are current state as of this release (the range this section
-has covered started as three, was five, was six, was seven, was eight as of
-DELTA round 6's own fold, and is nine as of DIST round 7's own fold — state
-the true count rather than repeating a stale one). The corrected recipe
-above resolves to SIX commits (`3a696a65`, `cbd427b4`, `320b73ee`,
-`f37cb743`, `b1665c14`, `a2dfcb1f`) — three more than the three the old,
-narrower grep found — but the three added (`320b73ee`'s re-apply, `cbd427b4`'s
-formatting-only fmt, `3a696a65`'s masked-load reuse with no new `pub` item)
-introduce no public-surface change beyond what the bullets below already
-list; checked by diffing each for an added/removed/changed `pub` item
-against the crate list above, not assumed.
+Breaking changes to this surface in the current release:
 
 - **The vector-search API takes a validated query type, not a bare slice.**
   `jammi_numerics::query::ValidatedQuery` is the only type
@@ -274,13 +227,10 @@ against the crate list above, not assumed.
   rather than trusting this sentence.)
   `QuerySource::source()` on `QueryValidationError` now returns
   `Option<&QuerySource>` (`None` for `ArtifactMismatch`) rather than
-  `&QuerySource` unconditionally. (DIST round 6/7 shipped a third
-  `QuerySource` variant, `Artifact { name }`, to carry this same
-  information; round 8 removed it in favor of the dedicated
-  `ArtifactMismatch` error variant above, so `QuerySource` is back to
-  exactly two variants, `Caller` and `Stored` — the states a query's own
-  provenance can actually be. A round-6/7 caller matching on three
-  `QuerySource` variants needs the arm removed, not added.) `JammiError::Schema`
+  `&QuerySource` unconditionally. `QuerySource` has exactly two variants,
+  `Caller` and `Stored` — the states a query's own provenance can actually
+  be; an artifact mismatch is the dedicated `ArtifactMismatch` error variant
+  above. `JammiError::Schema`
   constructions in `jammi_db::index::exact::exact_vector_search`,
   `jammi_db::index::placed::PlacedIndex::search_mixed`,
   `jammi_db::store::vectors::{extend_with_fixed_size_list_f32,
@@ -299,14 +249,7 @@ against the crate list above, not assumed.
   resolve — a version publish landing between the two could straddle.
   Call `ResultStore::pin_current_version(record).await?.input_anchor()`
   instead; the versioned arm already delegated to exactly that internally,
-  so the returned value is unchanged. (This item predates the compute-tier
-  substrate epic — it shipped in an earlier release — so its removal here
-  is a genuine breaking change to an already-released surface, not internal
-  churn within this epic's own unreleased history; the two DELTA-round
-  functions that went `pub` → private/`pub(crate)` entirely within this
-  epic's own unreleased commits, `current_version_provider` and
-  `current_version_identity`, never shipped as `pub` in any release and so
-  carry no such entry.)
+  so the returned value is unchanged.
 
 ## Enforcement: the freeze-guard
 

@@ -1,8 +1,6 @@
 //! `GangService` — the coordinator-to-member admission wire for a multi-host
-//! gang run (`docs/rigor/contracts/feat_500-C-U5a-1.md` is the committed
-//! mechanism contract for the wire, the I-GANG row predicate and the
-//! training-set identity pair; this module is the `HostAdmission` half:
-//! admit-and-hold, the holder lattice, drain, re-verification).
+//! gang run. This module is the `HostAdmission` half: admit-and-hold, the
+//! holder lattice, drain, re-verification.
 //!
 //! `GangServer::run_rank` decides, in this order, before a single stream
 //! event is emitted: the wire-level K2 edges (`world == 0`, `rank >= world`)
@@ -134,8 +132,7 @@ use crate::grpc::proto::gang::{
     Outcome, RankControl, RankEvent, TrainedOutcome,
 };
 
-/// Non-disclosure (`docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P2); #566
-/// R3): every I-GANG refusal — ambient admin scope, row absent, wrong
+/// Non-disclosure: every I-GANG refusal — ambient admin scope, row absent, wrong
 /// status, wrong claimant, wrong attempt, lease not live, an undecodable
 /// `world_size`, the caller's `Assign.world` not matching the row's own
 /// `world_size`, the world>1 conjunct's every determinant (pair missing,
@@ -377,8 +374,7 @@ impl GangRefusalHandle {
     }
 }
 
-/// The transient class this admission path uses (see
-/// `docs/rigor/contracts/feat_500-C-U5a-1.md` §B4): a genuine catalog fault
+/// The transient class this admission path uses: a genuine catalog fault
 /// reached DURING admission — `Catalog::get_job_for_rank`'s own read,
 /// `Catalog::get_result_table_for_tenant`'s own read, or
 /// `Catalog::fresh_instance`'s own read ERRORING rather than simply finding
@@ -935,9 +931,8 @@ impl GangService for GangServer {
             }
         };
 
-        // Wire-level K2 (`docs/rigor/contracts/feat_500-C-U5a-1.md` §1.2),
-        // decided before I-GANG runs: `world == 0` and `rank >=
-        // world` are refused `InvalidArgument`, one case each.
+        // Wire-level K2, decided before I-GANG runs: `world == 0` and
+        // `rank >= world` are refused `InvalidArgument`, one case each.
         if assign.world == 0 {
             return Err(Status::invalid_argument("world must be greater than zero"));
         }
@@ -1085,9 +1080,8 @@ impl GangService for GangServer {
             None
         };
 
-        // Coordinator freshness (`docs/rigor/contracts/feat_500-C-U5a-1.md`
-        // §1.5): the coordinator's own `instances` row must be fresh. A
-        // genuine catalog fault reading this row is `Unavailable`
+        // Coordinator freshness: the coordinator's own `instances` row must
+        // be fresh. A genuine catalog fault reading this row is `Unavailable`
         // (`admission_catalog_fault`).
         match catalog
             .fresh_instance(&assign.coordinator_instance_id, self.lease)

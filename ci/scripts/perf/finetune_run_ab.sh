@@ -321,7 +321,7 @@ run_cmd() {
 # adamw_step_fused" -- the A/B's own differential IS the flash cascade.
 # Building WITHOUT flash-attn (as this line used to) makes
 # attention_block_flash unable to dispatch in EITHER arm, nulling the
-# experiment the campaign exists to run -- mirrors fa2_ab.sh's/
+# experiment the campaign exists to run -- mirrors
 # stacked_sweep.sh's own flash-A/B build feature list exactly
 # (`--features cuda,jammi-encoders/flash-attn`), never a second,
 # independently-drifting feature-list spelling.
@@ -331,7 +331,7 @@ if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
 fi
 
 # --- provenance cross-check (unification contract C5.1), same shape as
-# fa2_ab.sh/finetune_ab.sh/encode_ab.sh/stacked_sweep.sh/
+# finetune_ab.sh/encode_ab.sh/stacked_sweep.sh/
 # clip_artifact_producer.sh: refuse BEFORE any leg runs if the binary's own
 # baked identity does not match the sha this checkout is actually at.
 SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"

@@ -19,6 +19,13 @@ FROM ${BASE_IMAGE}
 RUN yum install -y sqlite-libs \
     && yum clean all
 
+# What the guards in `ci/guards.toml` declare they need of their host (its
+# `[need.*]` tables). The guard runner provides a missing need at run time, so
+# an image built before a need was declared still works; baking them here
+# keeps a CI run off the package mirrors.
+RUN yum install -y jq openssh-clients rsync tmux \
+    && yum clean all
+
 # PyYAML: a declared prerequisite of `ci/scripts/check_execution_surface_
 # reachability.py`'s shared workflow loader (the `on:`/`jobs:` YAML parse
 # every gate built on it -- `check_gpu_prove_once.py`, `check_lint_surface_
@@ -45,7 +52,7 @@ RUN yum install -y sqlite-libs \
 # instant a rebuilt image no longer has PyYAML importable -- it is what
 # actually protects the gates, not an assumption about this RUN line.
 RUN python3 -m ensurepip --upgrade \
-    && python3 -m pip install --no-cache-dir 'PyYAML==6.*'
+    && python3 -m pip install --no-cache-dir 'PyYAML==6.*' safetensors
 
 # Per-arch download variables. TARGETARCH is set by buildx per platform
 # (`linux/amd64` -> `amd64`, `linux/arm64` -> `arm64`) and is NOT the same

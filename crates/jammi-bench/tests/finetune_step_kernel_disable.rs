@@ -520,15 +520,15 @@ fn expect_kernels_disabled_matches_a_genuine_correctly_forwarded_run() {
     );
 }
 
-/// Advisory A1 (round-4 adversarial audit, `fa2_ab.sh`): the "flash" leg of
-/// that script always passes `--expect-kernels-disabled ""` (never omits
+/// A producer's fused/control leg (`finetune_ab.sh`'s own convention)
+/// always passes `--expect-kernels-disabled ""` (never omits
 /// the flag) specifically to guard against an ambient `JAMMI_KERNELS_DISABLE`
 /// leaking into that leg from the calling shell — `parse_disable_list(Some(""))`
 /// collapses to the EMPTY set, so `""` claims "nothing is disabled". If this
 /// check used SUBSET semantics (`expected.is_subset(&requested)`) instead of
 /// exact equality, the empty expected set would be a subset of ANY requested
 /// set — including a non-empty one — and this refusal would vacuously pass,
-/// silently turning the "flash" leg back into a "block" leg wearing a flash
+/// silently turning the fused leg into a disabled leg wearing a fused
 /// label. Equality is what makes `""` a genuine "I expect NOTHING disabled"
 /// claim rather than a no-op. This is the negative control for that
 /// distinction: it fails under subset semantics and must pass under

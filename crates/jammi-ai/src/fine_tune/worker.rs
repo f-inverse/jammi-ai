@@ -8693,7 +8693,7 @@ async fn persist_acceleration_report(
                 worker_id = %worker_id,
                 attempt,
                 %holder,
-                "esc-075: record_acceleration_report's lease guard did not match (lease lost or \
+                "record_acceleration_report's lease guard did not match (lease lost or \
                  stale attempt); continuing without a persisted acceleration report"
             );
         }
@@ -8703,7 +8703,7 @@ async fn persist_acceleration_report(
                 worker_id = %worker_id,
                 attempt,
                 error = %e,
-                "esc-075: record_acceleration_report failed; continuing without a persisted \
+                "record_acceleration_report failed; continuing without a persisted \
                  acceleration report"
             );
         }
@@ -9579,7 +9579,7 @@ fn run_backward_and_optimizer_probe(varmap: &candle_nn::VarMap, output: &candle_
         vars.iter().map(|v| v.as_tensor().copy().ok()).collect();
     let Some(snapshot) = snapshot else {
         tracing::warn!(
-            "esc-075: could not snapshot every trainable var before the acceleration-report \
+            "could not snapshot every trainable var before the acceleration-report \
              probe's backward+optimizer step; skipping it entirely rather than risk an \
              unrestorable mutation of this job's real initial weights"
         );
@@ -9601,7 +9601,7 @@ fn run_backward_and_optimizer_probe(varmap: &candle_nn::VarMap, output: &candle_
     if let Err(e) = &result {
         tracing::warn!(
             error = %e,
-            "esc-075: acceleration-report probe's backward+optimizer step failed (non-fatal; \
+            "acceleration-report probe's backward+optimizer step failed (non-fatal; \
              restoring pre-probe weights regardless)"
         );
     }
@@ -9610,7 +9610,7 @@ fn run_backward_and_optimizer_probe(varmap: &candle_nn::VarMap, output: &candle_
         if let Err(e) = var.set(original) {
             tracing::warn!(
                 error = %e,
-                "esc-075: failed to restore a trainable var after the acceleration-report \
+                "failed to restore a trainable var after the acceleration-report \
                  probe's backward+optimizer step — this job's initial weights may now differ \
                  from what it was configured with"
             );

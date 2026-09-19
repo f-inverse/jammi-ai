@@ -131,7 +131,7 @@ cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT
 # carries flash-attn BY CONTRACT: the CONTRACT 63 Frame pre-registers the
 # arms as "fused cascade vs ALLOFF=attention_block_flash,adamw_step_fused"
 # (the script's own comment: building WITHOUT flash-attn nulls the
-# experiment the campaign exists to run), mirroring fa2_ab.sh's/
+# experiment the campaign exists to run), mirroring
 # stacked_sweep.sh's own flash-A/B feature list. ---
 cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$REPO_ROOT/Cargo.toml"	finetune_run_ab.sh's own build leg (unit 63 H4b, `run_cmd cargo build ...`) — operator-run on a rented pod, invoked from no merge-path workflow (gpu-howwell.yml is dispatch/label-only, see this section's header); needs the CUDA toolchain + a provisioned CUTLASS submodule.
 
@@ -143,15 +143,6 @@ cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn -
 # greps this script's own source for a cross-check invariant, never
 # EXECUTES it) — an operator/perf-lane tool, run by hand on a rented pod. ---
 cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$WORKTREE/Cargo.toml"	stacked_sweep.sh's own flash-attn build leg (`run_cmd cargo build ...`) — operator-run, invoked from no workflow; needs the CUDA toolchain + a provisioned CUTLASS submodule.
-
-# --- ci/scripts/perf/fa2_ab.sh — a one-build FA2 A/B timing driver (its own
-# module comment: "a100b (exclusive timing box)"). NEVER INVOKED by any
-# workflow: grep over .github/workflows/*.yml for this script's own
-# filename finds ONE hit, the same `#`-prefixed "producer provenance
-# gates" comment line stacked_sweep.sh's own row above cites (a static
-# grep over source, never an execution) — an operator/perf-lane tool, run
-# by hand on a rented, exclusively-reserved pod. ---
-cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn 2>&1 | tail -n 1	fa2_ab.sh's own one-shot flash-attn build (`;`-chained after the worktree checkout) — operator-run, invoked from no workflow; needs the CUDA toolchain + a provisioned CUTLASS submodule.
 
 # --- ci/scripts/perf/gpu_inference_ab.sh -- issue #335 within-run GPU perf
 # A/B producer (unification contract C5.1's `run_cmd` provenance-logging

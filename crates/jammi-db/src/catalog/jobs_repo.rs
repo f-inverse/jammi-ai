@@ -368,10 +368,10 @@ fn assembly_backoff(failures: u32) -> Duration {
 }
 
 /// The row [`Catalog::get_job_for_rank`] returns — every field the I-GANG
-/// row predicate needs (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A1),
-/// computed in ONE statement, plus the three row facts the `world_size > 1`
-/// conjunct reads ([`Self::tenant_id`], [`Self::training_set_ref`],
-/// [`Self::training_set_location`]). Every column decode here is
+/// row predicate needs, computed in ONE statement, plus the three row facts
+/// the `world_size > 1` conjunct reads ([`Self::tenant_id`],
+/// [`Self::training_set_ref`], [`Self::training_set_location`]). Every
+/// column decode here is
 /// INFALLIBLE by construction — `tenant_id` is carried as the row's raw
 /// text, never parsed here (see that field) — so `Err` from
 /// `get_job_for_rank` means the read itself faulted, never that this
@@ -2486,15 +2486,13 @@ impl Catalog {
     }
 
     /// The row `GangService::run_rank`'s I-GANG row predicate reads
-    /// (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A1; `GangService` is a
-    /// `jammi-server` type this crate has no visibility into — named here
-    /// only in prose, never as an intra-doc link).
+    /// (`GangService` is a `jammi-server` type this crate has no visibility
+    /// into — named here only in prose, never as an intra-doc link).
     /// Primary-key only (`WHERE job_id = $1`) — no tenant
     /// predicate, never [`TenantBinding::is_admin_scope`] (this method does
     /// not consult it at all). The row's OWN `tenant_id` comes back as raw
     /// text ([`RankAdmissionRow::tenant_id`]) for the CALLER to derive and
-    /// pin — "tenant is derived, never accepted"
-    /// (`docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P3)) — together with
+    /// pin — "tenant is derived, never accepted" — together with
     /// the training-set identity pair the `world_size > 1` conjunct
     /// resolves under that tenant.
     /// ONE statement: the row's `status`/`claimed_by`/`attempts`/`spec`/

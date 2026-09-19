@@ -1,5 +1,4 @@
-//! esc-076 (`.jammi/escapes.jsonl`, `esc-076-f16-eager-finetune-oom-nonmonotone-memory`)
-//! fix: sequence-length BUCKETING — the pure, candle-free arithmetic half of
+//! Sequence-length BUCKETING — the pure, candle-free arithmetic half of
 //! the allocator-shape-bounding mechanism.
 //!
 //! ## Why this lives here, not in `jammi-ai` or `jammi-encoders`

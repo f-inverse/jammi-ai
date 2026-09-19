@@ -2205,7 +2205,8 @@ if printf '%s' "$out" | grep -q "RC=0 id_landed=1 rank0_rc=0 rank1_rc=0" \
    && [ "$(grep -n '^scp ' "$P12_DIR/calls" | wc -l | tr -d ' ')" -eq 2 ] \
    && grep -m1 '^scp ' "$P12_DIR/calls" | grep -q "root@10.0.0.1:/remote/nccl.id" \
    && grep '^scp ' "$P12_DIR/calls" | tail -1 | grep -q -- "-o ProxyJump=root@jump:1 -P 2202 .* root@10.0.0.2:/remote/nccl.id" \
-   && grep '^ssh ' "$P12_DIR/calls" | tail -1 | grep -q -- "-o ProxyJump=root@jump:1 -p 2202 root@10.0.0.2"; then
+   && [ "$(grep '^ssh ' "$P12_DIR/calls" | grep -c -- "-o ProxyJump=root@jump:1 -p 2202 root@10.0.0.2")" -eq 1 ] \
+   && [ "$(grep '^ssh ' "$P12_DIR/calls" | grep -v -- "ProxyJump" | grep -c -- "-p 2201 root@10.0.0.1")" -eq 1 ]; then
   ok "P12: happy path -- both ranks launched up front (2 ssh, rank 1 with its own options), the id scp'd down from the primary then up to the member exactly once each, both ranks rc 0, id_landed=1"
   p14_r0="$(grep -l '^echo start0' "$P12_DIR"/stdin-* | head -1)"; p14_r1="$(grep -l '^echo start1' "$P12_DIR"/stdin-* | head -1)"
   if [ -n "$p14_r0" ] && [ -n "$p14_r1" ] && [ "$(head -1 "$p14_r0")" = ": env-preamble-sentinel" ] && [ "$(head -1 "$p14_r1")" = ": env-preamble-sentinel" ]; then

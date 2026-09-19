@@ -618,9 +618,7 @@ pub struct FinetuneRunParams {
     /// `None` — an operator may legitimately run it with OTHER, unrelated
     /// op keys disabled; the two-sided witness that a DECISION leg's
     /// `--arm fused` run really was unlabeled (no ambient contamination)
-    /// lives in the driver (`profile_421_legs.sh`'s
-    /// `_check_no_ambient_disables`) and the merger
-    /// (`profile_421_merge.py`'s A-leg refusal), not in this binary.
+    /// is the driver script's and its merger's to supply, not this binary's.
     ///
     /// When `Some`, [`run`] enforces THREE separate things a
     /// `JAMMI_KERNELS_DISABLE` leg can each fail independently — the leg is
@@ -1582,9 +1580,9 @@ fn run_impl(
 ) -> Result<(FinetuneRunTier, VarMap), Box<dyn std::error::Error + Send + Sync>> {
     if params.early_stopping_patience < 10_000 {
         return Err(format!(
-            "finetune-run: --early-stopping-patience {} is below the CONTRACT Frame's never-\
-             stops idiom (10_000) — a run that can early-stop before the configured epoch \
-             budget cannot be paired at the FINAL epoch the C16/H2 sign test requires",
+            "finetune-run: --early-stopping-patience {} is below 10_000, the \
+             never-stops setting — a run that can early-stop before the configured epoch \
+             budget cannot be paired at the FINAL epoch the paired sign test requires",
             params.early_stopping_patience
         )
         .into());

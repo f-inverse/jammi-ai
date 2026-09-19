@@ -1875,7 +1875,6 @@ async fn migration_033_is_ordered_after_032_and_adds_model_materialization_colum
 }
 
 /// Migration `034_jobs_training_set_identity`
-/// (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A6)
 /// is present, ordered AFTER `033_model_materialization` (K5: relative
 /// position, never `.last()`), adds `jobs.training_set_ref` /
 /// `jobs.training_set_location` as nullable `TEXT` columns, and pins the

@@ -1,10 +1,8 @@
-//! esc-076 (`.jammi/escapes.jsonl`,
-//! `esc-076-f16-eager-finetune-oom-nonmonotone-memory`) — the COMPARABLE-
-//! EAGER control the escape's own spec names as unbuilt: "a fully-eager
-//! bf16 leg at identical shape must be constructed somewhere (cuda-gated
-//! Rust test at the library seam, or a new/relaxed harness arm ...) and
-//! its result recorded; both branches handled: fully-eager bf16 also OOMs
-//! => defect is eager-composition memory; completes => f16-specific."
+//! The COMPARABLE-EAGER control for the f16 eager fine-tune OOM: a
+//! fully-eager bf16 leg at identical shape, constructed as a cuda-gated Rust
+//! test at the library seam, with both branches handled: fully-eager bf16
+//! also OOMs => defect is eager-composition memory; completes =>
+//! f16-specific.
 //!
 //! ## Why this is a LIBRARY-SEAM test, not the bench arm
 //!
@@ -119,8 +117,7 @@
 //!
 //! ## D3 ATTRIBUTION (campaign #443 W2c)
 //!
-//! The lead's own discriminator legs (`.jammi/ledger/aa09a171-443-fa2-f16.jsonl`,
-//! "esc-076 MECHANISM PINNED") measured, on the real bench path: a full f16
+//! Discriminator legs measured, on the real bench path: a full f16
 //! leg reproduces the OOM (0->49GB@5s->78GB@25s); a 4-step TRUNCATED (seq
 //! capped at 64) f16 leg peaks 63.3GB and completes; a 4-step DUPLICATED-
 //! batch f16 leg (the SAME shape repeated, never a new one) peaks at an

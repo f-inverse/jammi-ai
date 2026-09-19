@@ -724,8 +724,8 @@ impl ModernBertAttention {
             let Some(flash) = flash else {
                 return Err(EncoderError::Config(
                     "training-mode attention reached without the per-forward flash-cascade \
-                     decision — ModernBert::forward_hidden decides it once per forward \
-                     (contract v4 §3.2); a direct caller in training mode must supply it too"
+                     decision — ModernBert::forward_hidden decides it once per forward; \
+                     a direct caller in training mode must supply it too"
                         .into(),
                 ));
             };

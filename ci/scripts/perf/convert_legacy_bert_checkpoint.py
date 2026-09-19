@@ -61,7 +61,7 @@ itself does not expose `__metadata__` at all, so this module reads it via
 one small, separately-documented primitive (`_read_metadata`) straight
 off the same already-validated header bytes, never a second independent
 trust boundary on unvalidated input. Loud degrade if `safetensors` is not
-importable (the `fixture_width_report.py` precedent): refuses with a
+importable: refuses with a
 named, non-network, non-torch error rather than an unhandled
 `ImportError` traceback. Copies nothing else -- only the one named
 safetensors file; `config.json`/`tokenizer.json` are the caller's own

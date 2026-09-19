@@ -3,8 +3,7 @@
 `PRE_REGISTERED_ADVISORY_BAND` from the COMMITTED `ci/artifacts/gpu-perf-aa-null/`
 evidence and asserts equality — hermetic, static, no build, no GPU, modeled
 on `check_pod_build_timings.py`'s own shape (a real-tree run plus a
-`--self-test` synthetic-fixture leg, wired into `ci.yml`'s Guard matrix
-alongside that sibling gate).
+`--self-test` synthetic-fixture leg, both guards in `ci/guards.toml`).
 
 ## The class this closes (round-4 delta-audit F5)
 

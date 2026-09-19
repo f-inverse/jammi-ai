@@ -410,12 +410,10 @@ for the failure ladder). Three facts fix the shape:
   tuple (the `instances` row and, if this process runs a claim loop, its
   `workers` row) in one transaction. `instances.result_root` records the
   configured root SPELLING verbatim, but neither `list_gang_members` (the
-  gang-membership listing verb, contract `feat_500-C-U5b-1a` §12) nor this
-  ring consults it in this unit — root identity across spellings, and any
-  membership predicate built on it, is a separate, not-yet-built unit. Were
+  gang-membership listing verb) nor this ring consults it. Were
   root-string equality ever made part of a membership predicate here, it
   would still be necessary, never sufficient, for shared storage — the
-  attestation VERIFY a later unit owns is what establishes sufficiency.
+  attestation VERIFY is what establishes sufficiency.
 
 **A REFRESHED table's `Mixed` arm is not version-aware.** The single-node
 (`AllLocal`, every segment this replica's own) search path always resolves a

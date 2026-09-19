@@ -306,8 +306,8 @@ impl PyJob {
         serializable_to_pydict(py, &value)
     }
 
-    /// This job's per-attempt acceleration determination (esc-075), as a
-    /// dict, or `None`.
+    /// This job's per-attempt acceleration determination, as a dict, or
+    /// `None`.
     ///
     /// This is exactly what the catalog's `jobs.acceleration_report` column
     /// carries, decoded the same way `metrics()` decodes its column — but

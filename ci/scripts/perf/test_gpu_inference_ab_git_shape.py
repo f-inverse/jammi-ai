@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Hermetic git-SHAPE regression suite for `gpu_inference_ab_git.sh`
 (round-1 adversarial audit B2). No GPU, no network, no jammi-bench binary —
-builds a SCRATCH `origin` repo with real `git` subprocess calls (the SAME
-`_scratch_git` idiom `test_check_ci_guard_wiring.py` already uses), then
+builds a SCRATCH `origin` repo with real `git` subprocess calls, then
 drives the EXACT clone/checkout shapes `runpod_gpu_perf_ab.sh` uses (both
 the FIXED shape and the OLD, empirically-broken one) against it, sourcing
 `gpu_inference_ab_git.sh`'s own `gpu_inference_ab_ensure_history_for_merge_base`
@@ -64,8 +63,7 @@ PERF_DIR = os.path.dirname(os.path.abspath(__file__))
 GIT_LIB = os.path.join(PERF_DIR, "gpu_inference_ab_git.sh")
 GPU_INFERENCE_AB_SH = os.path.join(PERF_DIR, "gpu_inference_ab.sh")
 
-# Mirrors test_check_ci_guard_wiring.py's own `_scratch_git` convention:
-# never let a scratch repo's `git` invocation kick off a background
+# Never let a scratch repo's `git` invocation kick off a background
 # maintenance daemon that outlives this test process.
 _GIT_NO_BACKGROUND_MAINTENANCE = ("-c", "gc.auto=0", "-c", "gc.autoDetach=false", "-c", "maintenance.auto=false")
 

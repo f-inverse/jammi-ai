@@ -30,8 +30,7 @@ use super::url::{Scheme, StorageUrl};
 /// idempotent never distinguish the two — the AWS driver used for both
 /// `s3://` and `r2://` roots issues a bare `DELETE` and returns success on a
 /// 204, which S3 answers for a key that does not exist, so `Absent` is
-/// unreachable on those roots and an already-gone key is reported `Deleted`
-/// (open as esc-103 in `.jammi/escapes.jsonl`).
+/// unreachable on those roots and an already-gone key is reported `Deleted`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteOutcome {
     /// The driver's `delete` call returned success. On a driver whose

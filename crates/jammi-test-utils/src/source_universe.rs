@@ -93,7 +93,7 @@ mod tests {
         for admitted in [
             "crates/jammi-db/src/store/mod.rs",
             "crates/jammi-kernels/build.rs",
-            "crates/jammi-bench/examples/frontend_serial_tail.rs",
+            "crates/jammi-bench/examples/anything.rs",
             "crates/jammi-bench/benches/anything.rs",
             "ci/tools/symbol-index/src/main.rs",
             "crates/jammi-bench/examples/tests/main.rs",

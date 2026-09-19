@@ -31,9 +31,7 @@ venv (`TORCH_VENV` env var, default `<repo>/.venv-torch-ref`, mirroring
 `finetune_ab.sh`'s OWN default — see that script's module doc) with
 `torch`/`transformers`/`peft`/`safetensors` installed
 (`ci/scripts/perf/finetune_ab.sh`'s `setup_torch_venv` provisions exactly
-this). NOT wired into the hermetic `Guard` CI matrix (see
-`ci/scripts/ci_guard_wiring_allowlist.txt`'s entry for this file's own
-reason) for the same reason `finetune_ab.sh` itself is not: it needs a real
+this). Not a guard in `ci/guards.toml`, for the same reason `finetune_ab.sh` itself is not: it needs a real
 cargo build and a real torch install, neither of which the hermetic guard
 lane provisions — this is a manually-run (or pod-dispatched) verification
 script, run once as part of THIS fix round's own RED->GREEN evidence, not a

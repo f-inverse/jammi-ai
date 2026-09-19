@@ -12,7 +12,4 @@ pip install \
     pyarrow \
     pytest
 
-# --- Claude Code (native installer) ---
-curl -fsSL https://claude.ai/install.sh | bash
-
 echo "Development environment ready"

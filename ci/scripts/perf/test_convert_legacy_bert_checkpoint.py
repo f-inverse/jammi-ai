@@ -5,9 +5,8 @@ functions.
 
 `renamed_name` (the suffix-anchored `.gamma`->`.weight` / `.beta`->`.bias`
 string logic) is a PURE function of a name string -- covered without the
-`safetensors` package, the same "pure function first" split
-`fixture_width_report.py`'s own suite already uses for its
-package-independent half.
+`safetensors` package: the package-independent half of a "pure function
+first" split.
 
 `convert`'s file-level behavior (renames happen, values AND shape/dtype
 are byte-identical/preserved for both f32 and a non-f32 dtype, an
@@ -17,25 +16,19 @@ result refuses, `out_path == in_path` refuses) needs a REAL synthetic
 safetensors fixture built in-test via the real `safetensors` package
 (`TensorSpec`/`serialize`) -- exercised only when `safetensors` is
 actually importable, skipped (never silently treated as passing)
-otherwise, exactly the `tokenizers`-dependent-half precedent
-`fixture_width_report.py`'s own suite already established. `ci.yml`'s
-Guard job installs `safetensors` for THIS ONE matrix leg only (phase-4
-audit round-2 re-audit advisory 4, the same `if:`-gated exception the
-"pod build substrate" leg's own Rust toolchain already uses) so these
-arms are actually CI-EXECUTED, not merely proven in a local venv and
-silently skipped in the real gate.
+otherwise. This suite's
+guard in `ci/guards.toml` declares a `safetensors` need, so these arms are
+actually CI-EXECUTED, not merely proven in a local venv and silently
+skipped in the real gate.
 
 The "package not importable" loud-refusal path is exercised via a real
 subprocess, skipped if the real package IS installed in this environment
 (there is then nothing to hide it behind without also breaking other
-tests' imports) -- the same `NotImportableRefusalTests` shape
-`test_fixture_width_report.py` uses for `tokenizers`. Because CI now
+tests' imports). Because CI
 installs `safetensors` for this leg, THIS ONE test is the one arm that
 skips in CI (and runs for real only in an environment without the
 package, e.g. this repo's own base dev checkout) -- the inverse trade-off
-of the file-level tests above, and the same trade-off
-`test_fixture_width_report.py` already accepts for `tokenizers` (never
-installed there at all).
+of the file-level tests above.
 
 `CiExecutionAssertionTests` (phase-4 audit round-3 re-audit advisory 3,
 this repo's own zero-execution-is-RED doctrine): NEVER `skipUnless`-gated
@@ -315,8 +308,8 @@ class ConvertFileLevelTests(unittest.TestCase):
 class MainCliUsageTests(unittest.TestCase):
     """Usage-level refusals below the "is safetensors importable" check --
     package-gated the same as `ConvertFileLevelTests` (`main()`'s own
-    importability check runs FIRST, same order as `fixture_width_report.py`'s
-    precedent, so exercising anything past it needs the real package)."""
+    importability check runs FIRST, so exercising anything past it needs
+    the real package)."""
 
     def test_main_missing_input_file_exit_2(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -69,9 +69,7 @@ set actually changed ever compiles again.
 
 This replaced an S3-backed sccache cache tried earlier: measured live on a
 real pod (fresh `CARGO_TARGET_DIR` each leg, `cargo build --release -p
-jammi-bench --features cuda`; session ledger row 17, producer
-`/root/sccache-remeasure.sh` — `.jammi/ledger/` is gitignored, so the row is
-named here rather than linked), sccache gave **zero cross-target-dir cache
+jammi-bench --features cuda`), sccache gave **zero cross-target-dir cache
 reuse** for rustc units — every populate-then-reuse pair against a fresh
 target dir re-missed everything sccache had just written — while adding
 **+33% to +37.5% wall clock** to every build that ran it (344s wrapper-off
@@ -976,8 +974,7 @@ leg; the release verdict is the prove lane's.
 **Known-unmeasured.** This leg proves world 2 only. Whether the NCCL pin set
 (`NCCL_SOCKET_IFNAME=ens1` and friends) that works at world 2 still suffices
 at world >= 3 — a multi-rail/multi-NIC topology a 2-host gang cannot
-exercise — is uncovered here; filed in the contract of record
-(`docs/rigor/contracts/feat_500-C-U7b.md`) rather than silently assumed.
+exercise — is uncovered here, and stated as such rather than silently assumed.
 
 ## Notes
 

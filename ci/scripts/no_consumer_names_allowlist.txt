@@ -3,11 +3,10 @@
 #
 # The governance-verb tripwire and the leak-smell scan are advisory: a
 # generic pattern match, not a proven violation. Their failure message used
-# to say "resolve or annotate" with no annotate path — a finding a human has
-# already ruled MECHANISM (not governance; no consumer name) had exactly two
-# exits, both worse than the finding: rename a correct identifier to dodge
-# the grep, or admin-merge past every gate in the job. This file is the
-# annotate path: a reviewed ruling lands in the tree, and a waived finding
+# to say "resolve or annotate" with no annotate path — a finding a maintainer
+# has ruled MECHANISM (not governance; no consumer name) had one exit, worse
+# than the finding: rename a correct identifier to dodge the grep. This file
+# is the annotate path: a reviewed ruling lands in the tree, and a waived finding
 # still PRINTS (as an informational line naming this row and its ruling) so
 # it stays visible in every CI log — silence is how a waiver becomes
 # invisible.
@@ -27,9 +26,7 @@
 #                      ruling below was made.
 #   - ruling_ref      a resolvable citation carrying the verdict: either a
 #                      `<doc-path>#<heading>` pair (the heading text must
-#                      appear in that doc, the same substring check
-#                      check_constitution_anchors.py's `doc_heading` anchor
-#                      kind uses) or a bare issue/PR number (`#123`).
+#                      appear in that doc) or a bare issue/PR number (`#123`).
 #   - reason          ONE sentence, in MECHANISM vocabulary, naming what
 #                      state the identifier changes. Must not itself lead
 #                      with a governance-verb stem as its main verb (that
@@ -53,10 +50,6 @@
 #      `identifier` alone — a second site with the same identifier needs
 #      its own row (enforced by construction: matching is always by the
 #      exact pair, and a duplicate pair is itself a hard fail at load time).
-#
-# This file is in `.github/workflows/swarm.yml`'s human-amend-only glob
-# (SWARM_GATE_TOUCHED) — adding a row costs an admin-merge once per
-# identifier, same discipline as every other reviewed waiver in this repo.
 #
 # `register_content_hash_udf` — a Datafusion UDF registration
 # (`SessionContext::register_udf`), the exact use `check_no_consumer_

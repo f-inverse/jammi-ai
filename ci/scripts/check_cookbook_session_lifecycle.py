@@ -28,7 +28,7 @@ entry point this repo controls the way pytest's `conftest.py` controls test
 collection; installing an `atexit`/`observe()` listener around a `.qmd`
 render would report a leak only after the WHOLE chapter finishes, deep into
 a nightly render no PR ever exercises hermetically, defeating the "RED on a
-PR" requirement `ci.yml`'s guard matrix exists for. This gate is therefore
+PR" requirement a guard exists for. This gate is therefore
 (b): the AST analysis, run over the real committed tree in every PR, no
 render needed.
 

@@ -626,7 +626,7 @@ STUB
   SEED_TARGET_SH="$REPO_ROOT/ci/scripts/pod_seed_target.sh"
   MANIFEST="$REPO_ROOT/ci/scripts/pod_seed_key_inputs.toml"
   BINDGEN=""
-  for f in "$HOME"/.cargo/registry/src/*/bindgen_cuda-*/src/lib.rs; do
+  for f in "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/bindgen_cuda-*/src/lib.rs; do
     [ -f "$f" ] && BINDGEN="$f" && break
   done
 
@@ -664,7 +664,7 @@ DRV
     [ -z "$unlisted" ] && ok "(e-ii) every rerun-if-env-changed literal in bindgen_cuda is manifest-accounted" \
       || bad "(e-ii) unlisted rerun-if-env-changed literal(s) in bindgen_cuda: $unlisted"
   else
-    bad "(e) vendored bindgen_cuda source not found under \$HOME/.cargo/registry/src — this box's registry appears unfetched; the (e-i)/(e-ii) bindgen_cuda legs cannot run (fetch the workspace's dependencies first)"
+    bad "(e) vendored bindgen_cuda source not found under \${CARGO_HOME:-\$HOME/.cargo}/registry/src — this box's registry appears unfetched; the (e-i)/(e-ii) bindgen_cuda legs cannot run (fetch the workspace's dependencies first)"
   fi
 
   unlisted="$(bash "$DRIVER" rerun_only "$KERNELS_BUILDRS")"

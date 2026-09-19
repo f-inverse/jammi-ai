@@ -37,11 +37,11 @@ on:
         type: string
         default: "1,2,3,4,5,6,7,8,9,10,11,12"
       objective:
-        description: "mnrl or triplet — the probe's objective selection. REQUIRED, no default: the choice must be made deliberately on every dispatch, never silently assumed (CONTRACT amendment 2026-08-28's default-on-ties rule governs how the MERGE step reads a tie, not this workflow's own selection)."
+        description: "mnrl or triplet — the probe's objective. Required, with no default: the choice is made deliberately on every dispatch."
         required: true
         type: string
       lr0_seeds:
-        description: "Comma-separated lr=0 RED control seeds (default: '1,2' — the first two of the pre-registered 12-seed gate set, CONTRACT H5 step 3's own 'x2 seeds' control; CONTRACT Frame 'RED control: lr=0 arm x2 seeds fails learning-happened'. This input only has a source on a workflow_dispatch trigger — a run-howwell PR-label trigger carries no inputs at all and this workflow now refuses loudly rather than silently dropping the control (see the 'Resolve' step). ab_merge.py's own finetune-run merger separately refuses (INVALID) whenever the resolved seed list is empty unless --allow-missing-lr0-control was explicitly passed, so clearing this field on a dispatch run records a deliberate, visible opt-out rather than a silent skip.)"
+        description: "Comma-separated lr=0 control seeds (default: '1,2'): an arm that cannot learn must fail the learning-happened premise. Clearing this field records a deliberate opt-out; the merge step then refuses the run unless --allow-missing-lr0-control was passed."
         required: false
         type: string
         default: "1,2"

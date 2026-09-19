@@ -42,8 +42,7 @@ HOW: the two Python tuples are IMPORTED directly (this is exactly what a
 literal). The two Rust consts are extracted with a REGEX over the tracked
 `.rs` source — never `rustc`/`cargo` (this checker's job is verifying the
 COMMITTED SOURCE a compiled binary would be built from, not compiling
-anything itself, so it stays usable in the plain-shallow-checkout `guard`
-matrix leg alongside `check_citations.py` — no network, no build). A
+anything itself, so it stays a hermetic guard — no network, no build). A
 missing const, or a `.rs` file that no longer exists, is a FAIL-CLOSED
 `SystemExit`, never a silent skip (RED at base: `IDENTITY_FIELDS` does not
 exist there at all).

@@ -2,18 +2,11 @@
 //! enum variant, struct field, and CALL SITE under the given root
 //! directories, with file path + line, emitted as JSON.
 //!
-//! CI-only. Never a product binary, never published — the swarm's Rust-
-//! source-facing gates (`check_plan_citations.py`'s construct-citation
-//! resolver, `check_no_consumer_names.py`'s public-declaration scan,
-//! `check_rigor_record.py`'s AST-derived required-call-site set, issue
-//! #557 item 2) all resolve against ONE real parse of the tree instead of
-//! each carrying its own regex reader over Rust source — the class this
-//! repo's own recorded lesson names ("regex readers over YAML/Rust lost
-//! five audits"; this tool's own construction found two indexer defects
-//! in ITS FIRST real run against `crates/jammi-db/src/catalog/
-//! jobs_repo.rs`, the same class, caught only because syn's own parser
-//! cannot be fooled by a brace inside a string literal the way a
-//! line-based brace counter can).
+//! CI-only. Never a product binary, never published. The checks that read
+//! Rust source (`check_no_consumer_names.py`'s public-declaration scan, the
+//! eager-disable key sweep) resolve against ONE real parse of the tree instead
+//! of each carrying its own regex reader: syn's parser cannot be fooled by a
+//! brace inside a string literal the way a line-based brace counter can.
 //!
 //! Usage: `cargo run --release -p symbol-index -- <root-dir>... [--out <path>]`
 //! (no `--out` → JSON on stdout). Malformed/unparseable files are SKIPPED

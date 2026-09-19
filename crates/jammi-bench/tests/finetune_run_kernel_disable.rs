@@ -298,8 +298,8 @@ fn fused_arm_never_hard_errors_on_a_missing_kernels_disable_env_var() {
 /// forced eager for the whole run, and the leg is still valid, because the
 /// fused arm never claimed that key was live in the first place. The
 /// two-sided witness that a DECISION leg's `--arm fused` run really was
-/// unlabeled lives OUTSIDE this binary, in `profile_421_legs.sh`'s
-/// `_check_no_ambient_disables` and `profile_421_merge.py`'s A-leg refusal.
+/// unlabeled lives OUTSIDE this binary, with the driver script and its
+/// merger.
 #[test]
 fn fused_arm_with_no_flag_and_an_unrelated_ambient_disable_still_succeeds() {
     let work_dir = tempfile::tempdir().expect("tempdir");
@@ -489,7 +489,7 @@ fn expect_kernels_disabled_refuses_an_extra_env_key_beyond_the_claim() {
     );
 }
 
-/// Advisory A1 (round-4 adversarial audit, `fa2_ab.sh`): the SAME
+/// The SAME
 /// `--expect-kernels-disabled ""` equality semantics `finetune_step_kernel_
 /// disable.rs`'s sibling test pins for `finetune-step`, ported to
 /// `finetune-run`'s identical check (mirrors `FinetuneRunParams::

@@ -109,7 +109,7 @@ rule, which is the wrong answer for a change that touched zero bytes of
 compiled or executed code. `VENDORED.md` DOES also carry the sha256-pinned
 file manifest and the per-arch VALIDATED table (not merely incidental
 prose) — but doc HONESTY (that a table cell matches what the code and
-artifacts actually say) is `check_citations.py`/`check_doc_parity.py`'s job,
+artifacts actually say) is `check_doc_parity.py`'s job,
 not this gate's; and, structurally, a genuine vendored-SOURCE update always
 touches the real non-`.md` `.cu`/`.h` files in the same commit (that is
 what "vendored" means), so THAT change still trips this rule via the

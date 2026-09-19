@@ -11,7 +11,7 @@
 # second, independently-drifting comparator.
 #
 # WHY TWO REPLICATE LEGS, NOT A JAMMI-VS-TORCH A/B: unlike
-# `finetune_ab.sh`/`fa2_ab.sh`, there is no torch twin for the encode
+# `finetune_ab.sh`, there is no torch twin for the encode
 # surface today (unit-62 PLAN.md v2 OQ4 ruling: "torch_encode.py NOT now --
 # C16-style front-door record; eval is single-arm") and no forced-attention-
 # arm A/B either (CONTRACT.md's Frame: "NO forced-arm encode A/B" -- the
@@ -19,13 +19,13 @@
 # this surface and FORBIDDEN from identity). So the one meaningful A/B this
 # producer runs is a same-binary, same-premise REPRODUCIBILITY check: two
 # independent invocations must agree on every identity field (the complete
-# output-affecting parameter set for this surface), the same "r1 vs r2"
-# replicate convention `fa2_ab.sh` already uses for its own timing legs.
+# output-affecting parameter set for this surface), an "r1 vs r2"
+# replicate convention.
 #
 # `jammi-bench encode-step` takes ONE flag, `--cuda <ordinal>` (omit for
 # CPU -- `EncodeStepParams::gpu_device` defaults to `CPU_HERMETIC_DEVICE`,
 # `main.rs`'s CI-hermetic const), the SAME `Option<usize>` convention
-# `finetune_ab.sh`/`fa2_ab.sh` already thread through their own
+# `finetune_ab.sh` already threads through its own
 # `--cuda "$AB_CUDA_ORDINAL"`. This script mirrors that convention via
 # `ENCODE_AB_CUDA_ORDINAL` (below): UNSET keeps the CPU-hermetic default
 # path byte-for-byte unchanged (no `--cuda` flag, no `cuda` cargo feature);
@@ -101,7 +101,7 @@ if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
 fi
 
 # --- provenance cross-check (unification contract C5.1), same shape as
-# fa2_ab.sh/finetune_ab.sh/stacked_sweep.sh/clip_artifact_producer.sh:
+# finetune_ab.sh/stacked_sweep.sh/clip_artifact_producer.sh:
 # refuse BEFORE any leg runs if the binary's own baked identity does not
 # match the sha this checkout is actually at.
 SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"

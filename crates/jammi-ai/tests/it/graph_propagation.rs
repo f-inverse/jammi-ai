@@ -1,4 +1,4 @@
-//! `InferenceSession::propagate_embeddings` (spec S12): the decoupled-GNN
+//! `InferenceSession::propagate_embeddings`: the decoupled-GNN
 //! forward pass over a declared graph.
 //!
 //! Hermetic: a tempdir session carries a synthetic node embedding table (a
@@ -9,12 +9,12 @@
 //! vocabulary appears — the fixtures are a neutral citation-/co-purchase-style
 //! graph.
 //!
-//! The tests assert the contracts the spec bakes in: self-loop correctness
+//! The tests assert its contracts: self-loop correctness
 //! (isolated node → `X⁽⁰⁾`), the homophily gain / heterophily-loss directional
 //! pair, oversmoothing control via the `α`-restart, determinism across two
 //! `target_partitions` settings, the edge-similarity clamp, the hop cap, the
 //! load-bearing cross-tenant exclusion, the Jumping-Knowledge output shape, and
-//! `derived_from` lineage + a re-graphable / R1-evaluable output.
+//! `derived_from` lineage + a re-graphable / evaluable output.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -627,7 +627,7 @@ async fn heterophily_propagation_is_worse_than_raw() {
     // Adversarial bipartite-by-class wiring: every edge crosses the class
     // boundary, so neighbour-averaging mixes opposing signal. Propagation must be
     // SIGNIFICANTLY worse than raw (directional, seeded margin) — the evidence
-    // that gates the learned-attention answer (S13).
+    // that gates the learned-attention answer.
     let per_class = 6;
     let mut nodes = Vec::new();
     for class in 0..2 {
@@ -666,7 +666,7 @@ async fn heterophily_propagation_is_worse_than_raw() {
 
     // Cross-class averaging collapses the class separation: propagated
     // separation must be SIGNIFICANTLY below raw (a seeded directional margin) —
-    // the evidence that gates the learned-attention answer (S13).
+    // the evidence that gates the learned-attention answer.
     let raw_sep = class_separation(&raw, &class_of);
     let prop_sep = class_separation(&propagated, &class_of);
     assert!(
@@ -1112,11 +1112,11 @@ async fn output_is_model_kind_with_lineage_and_is_regraphable() {
 }
 
 #[tokio::test]
-async fn evaluable_through_r1_eval_embeddings() {
-    // R1 hook: a propagated table is a normal embedding table the eval runner
+async fn evaluable_through_eval_embeddings() {
+    // A propagated table is a normal embedding table the eval runner
     // (`EvalRunner::eval_embeddings`) resolves by name and reads through its
     // per-query `search_vectors` loop. Exercise that resolve + search path
-    // directly (no live encoder), which is exactly the R1 read seam.
+    // directly (no live encoder), which is exactly the eval runner's read seam.
     let (nodes, edges) = two_class_homophilous(5);
     let (session, _dir) = graph_session(&nodes, &edges, None).await;
     let table = session
@@ -1137,7 +1137,7 @@ async fn evaluable_through_r1_eval_embeddings() {
     assert_eq!(resolved.dimensions_raw(), Some(DIM as i32));
 
     // The eval runner's per-query loop runs `search_vectors` over the resolved
-    // table — exercise exactly that read path (the R1 hook) without a live
+    // table — exercise exactly that read path without a live
     // encoder: a query vector against the propagated table returns ranked hits.
     let probe = read_table_vectors(&session, &table).await["c0_0"].clone();
     let hits = session

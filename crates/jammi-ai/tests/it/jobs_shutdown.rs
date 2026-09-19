@@ -792,7 +792,7 @@ async fn release_with_the_loop_paused_in_the_claim_to_hold_prologue_self_release
 
 /// The loop's OWN `EmbeddedWorker` never calls `release_and_stop` at
 /// all here — `InferenceSession::release_job_leases` (the "no loop to stop"
-/// sibling, `session.rs:439`, the shape `runtime.rs`/`database.rs` use on
+/// sibling, the shape `runtime.rs`/`database.rs` use on
 /// their `worker.is_none()` arm) is called directly while a REAL, live loop
 /// on the SAME session is parked in the claim→hold prologue
 /// (`register_job_hold_or_release`, before the hold is registered, phase

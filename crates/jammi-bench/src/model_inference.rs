@@ -897,7 +897,7 @@ mod tests {
         );
     }
 
-    /// The teeth, GATE-FAILS direction for the EMBED verb (RC1: an assertion must
+    /// The teeth, GATE-FAILS direction for the EMBED verb (an assertion must
     /// be able to fail). Serving the *classifier* bundle through the embed verb
     /// produces a different embedding (a different model, different weights and
     /// hidden geometry), so the embed digest moves off the IN-PROCESS baseline (the
@@ -947,7 +947,7 @@ mod tests {
     }
 
     /// The committed serving baselines gate with teeth: a run at the baseline
-    /// clears the gate, a run past the threshold fails it (RC1). Asserts the
+    /// clears the gate, a run past the threshold fails it. Asserts the
     /// committed baselines are well-formed, generously-thresholded same-box
     /// references — the coarse code-path net, not the full-scale SLO.
     #[test]

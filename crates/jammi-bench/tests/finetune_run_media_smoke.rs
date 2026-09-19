@@ -1,5 +1,5 @@
 //! CPU-hermetic end-to-end smoke test for `finetune-run --task
-//! image_embedding` / `--task audio_embedding` (issue #421 W2b): drives the
+//! image_embedding` / `--task audio_embedding`: drives the
 //! REAL compiled `jammi-bench finetune-run` subcommand over the COMMITTED
 //! media producers' output and the committed tiny OpenCLIP / HF-CLAP
 //! fixtures, proving the whole chain — producer → media JSONL → media row
@@ -9,15 +9,14 @@
 //!
 //! # Why the corpus comes from the Python producers
 //!
-//! The contract offered two ways to get media fixtures into this test: call
-//! `ci/scripts/perf/gen_fixed_shape_image_corpus.py` when `python3` is
-//! present, or synthesise the files in Rust. This file takes the FIRST,
-//! deliberately: those producers ARE PR B's declared workload, and a test
-//! that generated its own lookalike files would prove the loader reads
-//! *something* while leaving the actual profile inputs unexercised. The
-//! producers are stdlib-only and offline, so the choice costs no hermeticity
-//! — only a `python3` on PATH, which every lane that runs
-//! `ci/scripts/perf/test_*.py` already has.
+//! The media fixtures come from `ci/scripts/perf/gen_fixed_shape_image_corpus.py`
+//! and its siblings rather than files synthesised in Rust: those producers ARE
+//! the profile's declared workload, and a test that generated its own
+//! lookalike files would prove the loader reads *something* while leaving the
+//! actual profile inputs unexercised. The producers are stdlib-only and
+//! offline, so this costs no hermeticity — only a `python3` on PATH
+//! (acquired through `jammi_test_resources::executable`), which every lane
+//! that runs `ci/scripts/perf/test_*.py` already has.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,13 +31,11 @@ fn repo_root() -> PathBuf {
 /// fixture/constant values locally; see `finetune_run_kernel_disable.rs`'s
 /// own doc for the same reasoning about `ALLOFF_KEYS`).
 ///
-/// Unit-467 pressure-test folded advisory: the positive-proof equation
-/// assertions below (`assert_positive_proof_equation`) are witnessed at
-/// THESE site sets specifically, not the earlier `in_proj,c_fc`/
-/// `query,value` this file used before — matching the REAL profile leg's
-/// shape is what makes this smoke test's witnessed census numbers directly
-/// comparable to a pod leg's, rather than a shape only this file has ever
-/// exercised.
+/// The positive-proof equation assertions below
+/// (`assert_positive_proof_equation`) are witnessed at THESE full site sets
+/// specifically, not a subset — matching the REAL profile leg's shape is what
+/// makes this smoke test's witnessed census numbers directly comparable to a
+/// pod leg's, rather than a shape only this file exercises.
 const CLIP_FULL_TARGET_MODULES: &str = "in_proj,out_proj,c_fc,c_proj";
 const CLAP_FULL_TARGET_MODULES: &str =
     "query,key,value,attention_output,intermediate_dense,output_dense,reduction,linear1,linear2";
@@ -210,7 +207,7 @@ fn assert_well_formed_media_report(stdout: &str, task: &str) {
             .is_some_and(|s| s.len() == 64),
         "{task}: checkpoint_weights_sha256 must be a measured sha256"
     );
-    // Issue #421 P1-b: the tower this leg trained is IDENTITY on the report,
+    // The tower this leg trained is IDENTITY on the report,
     // not something a reader has to infer from the row shape. On a
     // multi-tower checkpoint (`tiny_open_clip` carries a text tower AND a
     // vision tower behind ONE `checkpoint_weights_sha256`) this is the only
@@ -228,7 +225,7 @@ fn assert_well_formed_media_report(stdout: &str, task: &str) {
         serde_json::json!("triplet"),
         "{task}: --objective triplet must be accepted and recorded for this task"
     );
-    // Issue #421 P1-b: on a MEDIA task the JSONL is a manifest of PATHS, so
+    // On a MEDIA task the JSONL is a manifest of PATHS, so
     // `train_pairs_file_sha256` cannot anchor the corpus CONTENT — the two
     // media digests do, and they must be real measured digests, not `null`.
     // On the text task they are `null` BY DESIGN (there the manifest IS the
@@ -254,7 +251,7 @@ fn assert_well_formed_media_report(stdout: &str, task: &str) {
             );
         }
     }
-    // Issue #421 P1-b(v): the DIRECT media front-end timer. On a media leg
+    // The DIRECT media front-end timer. On a media leg
     // it must be a real, positive, FINITE measurement that is STRICTLY LESS
     // than the run's own training wall (it is measured inside
     // `TrainingLoop::run`, so it is a subset of that span) -- checking mere
@@ -300,8 +297,7 @@ fn assert_well_formed_media_report(stdout: &str, task: &str) {
     }
 }
 
-/// The profile's POSITIVE-PROOF equation (issue #421 §D4 item 1; unit-467
-/// pressure-test folded advisory), checked LIVE on THIS leg's own real CLI
+/// The profile's POSITIVE-PROOF equation, checked LIVE on THIS leg's own real CLI
 /// output — the same assertion `finetune_run_smoke.rs`'s
 /// `fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run`
 /// applies to tiny_bert/text, extended here to the three media towers this
@@ -311,17 +307,16 @@ fn assert_well_formed_media_report(stdout: &str, task: &str) {
 /// `census`/`steps_measured` are read LIVE off this run's own report, never
 /// hardcoded — the equation is proven on whatever the committed fixture and
 /// this command's flags actually built, not on a number transcribed from a
-/// prior run. (A pressure-test run against this branch's tip measured
-/// `htsat_clap_tiny` at census `53/21/8` over `steps_measured=2` — totals
-/// `106/42/16` — and `tiny_open_clip` at `4/4/0` for the image tower and
-/// `4/3/0` for the text tower; this helper's own equation is what a future
-/// regression there would trip, not those specific numbers.)
+/// prior run. (On the committed fixtures `htsat_clap_tiny` measures census
+/// `53/21/8` over `steps_measured=2` — totals `106/42/16` — and
+/// `tiny_open_clip` `4/4/0` for the image tower and `4/3/0` for the text
+/// tower; the equation, not those specific numbers, is what this checks.)
 ///
 /// `gelu_expects_zero`: OpenCLIP's MLP activation is `quick_gelu`
 /// (`jammi-encoders/src/activations.rs`, `open_clip_vision.rs`), which has
 /// no fused seam and therefore no `admit` key at all, so its
 /// `gelu_seam_calls_per_forward` census is legitimately (and checkably) `0`
-/// on BOTH OpenCLIP towers — a real, falsifiable claim, not a skip. HTSAT's Swin MLP routes through the house
+/// on BOTH OpenCLIP towers — a real, falsifiable claim. HTSAT's Swin MLP routes through the house
 /// `gelu_erf` seam, so its census (and dispatch totals) must be non-zero.
 fn assert_positive_proof_equation(stdout: &str, task: &str, gelu_expects_zero: bool) {
     let report: serde_json::Value =
@@ -446,8 +441,8 @@ fn image_embedding_leg_runs_end_to_end_over_the_committed_producer() {
 /// Deliberately the smallest corpus that still clears the trainer's own
 /// validation-split floor (8 rows at `--batch 4`, `--validation-fraction
 /// 0.25`) and the shortest clip the CLAP front end folds without a
-/// degenerate resample — this leg exists to prove the AUDIO chain runs, and
-/// the cost measurement it enables is PR B's job, not this test's.
+/// degenerate resample — this leg exists to prove the AUDIO chain runs, not
+/// to measure its cost.
 #[test]
 fn audio_embedding_leg_runs_end_to_end_over_the_committed_producer() {
     let tmp = tempfile::tempdir().expect("tempdir");

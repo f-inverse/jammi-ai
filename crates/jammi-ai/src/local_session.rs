@@ -432,7 +432,7 @@ impl Session {
     ///
     /// The verdict attests the Parquet **data**, never the ANN search index (the
     /// index is a derived accelerator reconstructible from the data). A table
-    /// created before the contract landed carries no manifest and verifies as
+    /// that carries no manifest verifies as
     /// [`MatchVerdict::MissingManifest`] — a truthful unknown, never a fabricated
     /// match.
     pub async fn verify_materialization(
@@ -462,8 +462,8 @@ impl Session {
     /// caller computes it from the producer's current descriptor + environment;
     /// a divergence from the recorded hash is a `DefinitionChanged` reason. An
     /// input with no reproducible current anchor makes the verdict
-    /// [`Staleness::Undecidable`] (never a confident `Fresh`). A pre-contract
-    /// table (no recorded definition) is [`Staleness::MissingManifest`].
+    /// [`Staleness::Undecidable`] (never a confident `Fresh`). A table with no
+    /// recorded definition is [`Staleness::MissingManifest`].
     ///
     /// Tenant-scoped: the table is resolved through the tenant-filtered
     /// `get_result_table`, so a peer cannot sense a table it cannot resolve.
@@ -528,7 +528,7 @@ impl Session {
     /// reconstructs the producing verb call from its typed parameters, and runs it
     /// through the unmodified materialization funnel with
     /// [`CachePolicy::Bypass`](jammi_db::store::CachePolicy::Bypass) (a recompute
-    /// always recomputes). A pre-contract table (no recorded descriptor) is the
+    /// always recomputes). A table with no recorded descriptor is the
     /// typed [`JammiError::NotRecomputable`] — a loud refusal, never a re-run
     /// guessed from columns.
     ///

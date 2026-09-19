@@ -170,11 +170,9 @@ impl EncoderFamily {
     /// [`AdapterConfig::model_type`](jammi_lora::AdapterConfig::model_type).
     ///
     /// TOTAL by design, and the ONE place in this crate where an unknown
-    /// string still becomes `Bert`. That coercion is not a shortcut — it
-    /// reproduces the historical fine-tune worker's `_ => BERT` arm, which
-    /// means every adapter already written to disk by a released build
-    /// carries whatever `model_type` string its base config happened to
-    /// declare (including the BERT aliases `roberta` / `camembert` /
+    /// string still becomes `Bert`. That coercion is not a shortcut: a
+    /// BERT-tower adapter carries whatever `model_type` string its base
+    /// config happened to declare (including the BERT aliases `roberta` / `camembert` /
     /// `xlm-roberta`, and anything else that parsed as a `BertConfig`). Those
     /// adapters were trained on a BERT tower and must keep loading onto one;
     /// refusing them here would strand shipped artifacts.

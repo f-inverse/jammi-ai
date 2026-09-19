@@ -10,10 +10,11 @@
 //! NOT drawn from a small, fixed set fragments/grows its reserved footprint
 //! with the COUNT of DISTINCT shapes it has ever been asked to satisfy,
 //! independent of dtype: duplicated-batch runs plateau, variable-shape runs
-//! OOM (`crates/jammi-encoders/tests/esc076_comparable_eager_control.rs`
-//! measures this). `jammi-encoders`' per-op eager fallbacks cannot fix this
-//! without corrupting the math (padding an activation INSIDE a mean/variance
-//! reduction fabricates values), so the fix point is the trainer's own
+//! OOM (the comparable eager-control test in `crates/jammi-encoders/tests/`,
+//! `esc076_comparable_eager_control.rs`, measures this). `jammi-encoders`'
+//! per-op eager fallbacks cannot fix this without corrupting the math
+//! (padding an activation INSIDE a mean/variance reduction fabricates
+//! values), so the fix point is the trainer's own
 //! batch-construction step — this module, and its TRAINING-STEP call site in
 //! `TrainingLoop::encode_texts` (`tokenize_and_bucket`).
 //!
@@ -194,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn bucket_seq_len_the_full_ladder_for_esc076_reporter_max_seq_length() {
+    fn bucket_seq_len_the_full_ladder_for_max_seq_length_128() {
         // The exact bucket SET a `max_seq_length = 128` run ever presents to
         // the encoder, over every possible natural width — the "small, fixed
         // set of buckets" that bounds the allocator: 5 distinct shapes,
@@ -206,7 +207,7 @@ mod tests {
         assert_eq!(
             seen,
             std::collections::BTreeSet::from([8, 16, 32, 64, 128]),
-            "the reporter shape's bucket ladder must be exactly this bounded set"
+            "the max_seq_length = 128 bucket ladder must be exactly this bounded set"
         );
     }
 

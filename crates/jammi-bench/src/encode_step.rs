@@ -487,7 +487,7 @@ mod tests {
         );
     }
 
-    /// The teeth, GATE-FAILS direction (RC1: an assertion must be able to
+    /// The teeth, GATE-FAILS direction (an assertion must be able to
     /// fail): `run()` drives the REAL serving surface end to end on
     /// `Device::Cpu` — real tokenization, real checksums, a real
     /// `generate_text_embeddings` serve — and every declared identity AND

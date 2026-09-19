@@ -1,9 +1,9 @@
-//! Schema-shape contract between the data-driven channel mechanism
-//! and the legacy provenance output.
+//! Schema-shape contract of the data-driven channel mechanism's provenance
+//! output.
 //!
 //! Locks in the canonical Arrow schema produced when `vector` and
-//! `inference` channels participate, so future refactors that drift the
-//! shape are caught at test time.
+//! `inference` channels participate, so a change that drifts the shape is
+//! caught at test time.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

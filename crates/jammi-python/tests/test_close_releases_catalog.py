@@ -289,8 +289,7 @@ def test_use_after_close_raises_the_typed_error_and_close_is_idempotent(tmp_path
 # `docs/guide/src/catalog-and-broker.md` states for operators) is only
 # real if it is REACHABLE from there, so it is pinned there too — separately,
 # because a wrapper that dropped the call (or raised
-# `NotSupportedOnBackend`, as it did before this change) is invisible to every
-# oracle above.
+# `NotSupportedOnBackend`) is invisible to every oracle above.
 # ---------------------------------------------------------------------------
 
 # The public-surface peer of `_SUCCESSOR`: the child opens through

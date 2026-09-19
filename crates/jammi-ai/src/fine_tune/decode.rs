@@ -951,8 +951,8 @@ impl ChunkAccumulator {
 /// same columns. The refusal WORDING is this path's own: the eager
 /// `build_training_data_loader`'s Pairs/Triplet arms add operator guidance
 /// (the image/audio-triplet hint) that the stream's per-column message does
-/// not carry — a pre-existing divergence of the two entry points' prose, not
-/// of what they accept.
+/// not carry — the two entry points differ in prose, not in what they
+/// accept.
 pub(crate) enum DecodedBatch<'a> {
     Contrastive {
         texts_a: StringCells<'a>,

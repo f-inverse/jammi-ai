@@ -1,4 +1,4 @@
-//! #527/#567/#578: an ENUMERATING oracle over every literal wall-clock bound
+//! An ENUMERATING oracle over every literal wall-clock bound
 //! FORM in this crate's four test targets (`it`, `distributed`,
 //! `gpu_capability`, `metal_quantized_gpu`) — not a sample, and not scoped
 //! to "training progress" at the SCAN step (that judgement is not
@@ -8,8 +8,8 @@
 //!
 //! * `Class::A` — an OBSERVED-EVENT rendezvous
 //!   (`jammi_ai::fine_tune::worker::loop_test_hooks::{arm_observed,
-//!   Event}`, or the pre-existing `arm_pause_before_spawn_blocking` oneshot)
-//!   now gates the property; the literal bound this site names is only the
+//!   Event}`, or the `arm_pause_before_spawn_blocking` oneshot)
+//!   gates the property; the literal bound this site names is only the
 //!   backstop wrapping that rendezvous. Checked: the site's own text window
 //!   names the rendezvous.
 //! * `Class::B` — DERIVED from the config the test itself set
@@ -242,8 +242,7 @@ struct Site {
 
 const WEDGED: &str = "wedged or starved machine";
 
-/// #527/#567/#578's full inventory — see `contracts/testbounds-impl.md`'s
-/// B3 table for the prose version of this same list.
+/// The full inventory of reviewed wall-clock bounds.
 const REVIEWED_SITES: &[Site] = &[
     // ---- timeout(Duration::from_secs( ------------------------------------
     Site { file: "crates/jammi-ai/tests/it/fine_tune.rs", item: "cancelled_run_reclaims_epoch_checkpoints_that_actually_existed", ordinal: 2, class: Class::C, marker: WEDGED, reason: "" },

@@ -333,7 +333,7 @@ impl PyDatabase {
                     (None, false) => Ok(()),
                 };
                 // `InferenceSession::close` shuts the session's lease
-                // keeper (N3) down and joins its dedicated thread — closing
+                // keeper down and joins its dedicated thread — closing
                 // its OWN catalog connection — before closing the shared
                 // pool. Closing only the shared pool without this step
                 // would leave the keeper's connection open, and for the
@@ -1278,7 +1278,7 @@ impl PyDatabase {
         ))
     }
 
-    /// Predict a target's distribution with a trained context predictor (S19) by
+    /// Predict a target's distribution with a trained context predictor by
     /// assembling its live context and running one in-context forward — no
     /// gradient update. Returns a dict: `{"kind": "gaussian", "mean", "std"}` or
     /// `{"kind": "quantile", "levels": [[level, value], …]}`.
@@ -1409,7 +1409,7 @@ impl PyDatabase {
     }
 
     /// Read back the persisted per-query eval records for a run from a serialized
-    /// `EvalPerQueryRequest` body (spec J9), scoped to the calling tenant. The
+    /// `EvalPerQueryRequest` body, scoped to the calling tenant. The
     /// thin Python `Database` wrapper builds this request with the same pure-Python
     /// assembly the remote client uses (`jammi._assembly`), serializes it,
     /// and hands the bytes here, so the embedded and remote per-query readback

@@ -5,9 +5,9 @@
 //!
 //! Reuses `pooling_config.rs`'s hermetic `tiny_bert` fixture-copy helpers
 //! (`build_local_model_dir`, `cls_pooling_config`, `mean_pooling_config`) —
-//! the identical mutation `pooling_config.rs:202-263`
-//! (`cls_declared_pooling_differs_from_mean_declared_pooling`, key assertion
-//! at `pooling_config.rs:246-251`) already proves changes the pooled
+//! the identical mutation `pooling_config.rs`'s
+//! `cls_declared_pooling_differs_from_mean_declared_pooling` already proves
+//! changes the pooled
 //! vectors, so the assertions below rest on a production-proven trigger,
 //! not a hypothetical one.
 //!
@@ -372,7 +372,7 @@ async fn warm_hit_after_same_length_mutation_is_mtime_dependent_diagnostic() {
 // ── Appearance of a newly-output-affecting file ──
 
 /// The `ModelCache` peer of
-/// `model::backend::candle::digest_fingerprint_audit62_tests::pooling_config_appearing_after_fingerprint_trips_the_probe`:
+/// `model::backend::candle::digest_fingerprint_tests::pooling_config_appearing_after_fingerprint_trips_the_probe`:
 /// `1_Pooling/config.json` APPEARING (not merely changing) between a warm
 /// load and a warm replay — a bare BERT dir gets a `1_Pooling/` directory it
 /// did not have at load time — must trip the staleness probe and reload,
@@ -860,9 +860,9 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
 
     // Non-vacuous control: the post-deletion vectors must match an
     // independent, freshly-resolved model with NO 1_Pooling/ directory at
-    // all — the exact mean-fallback shape `pooling_config.rs:202-263`
-    // (`cls_declared_pooling_differs_from_mean_declared_pooling`, control
-    // (3) at :253-262) already proves matches a mean-declared model.
+    // all — the exact mean-fallback shape `pooling_config.rs`'s
+    // `cls_declared_pooling_differs_from_mean_declared_pooling` (its control
+    // (3)) already proves matches a mean-declared model.
     let reference_dir = tmp.path().join("reference_no_pooling_dir");
     build_local_model_dir(&reference_dir, None);
     let reference_model = cache
@@ -1041,7 +1041,7 @@ async fn warm_hit_after_required_weights_deleted_evicts_and_second_call_hits_the
 ///
 /// **Caveat.** The "persisted record" language above must not be read as the catalog row
 /// being some fixed, identity-pinned fact once written. `Catalog::register_model`
-/// (`model_repo.rs:159-167`) is an UNCONDITIONAL UPSERT on every load:
+/// is an UNCONDITIONAL UPSERT on every load:
 /// `backend`, `task`, and `model_type` are overwritten with
 /// `excluded.<col>` on every `ON CONFLICT`, last-writer-wins — only
 /// `artifact_path` gets the `COALESCE(excluded, existing)` set-but-never-

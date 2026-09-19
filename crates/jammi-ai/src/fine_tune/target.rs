@@ -605,15 +605,12 @@ mod tests {
         );
     }
 
-    /// The defect: a 2-LEVEL quantile head (`quantile_levels = [0.25, 0.75]`) is
-    /// width 2, exactly like a Gaussian head. The old serving dispatch keyed
-    /// gaussian-vs-quantile on head WIDTH, so this head wrongly hit the Gaussian
-    /// branch — which de-standardises only column 0 and leaves column 1 (the 0.75
-    /// quantile) RAW (near 0), so the served upper quantile was wrong by ≈μ_y.
-    ///
-    /// With the dispatch on the persisted `DistributionForm`, a width-2 quantile
-    /// head de-standardises EVERY column. This test fails before the fix (column 1
-    /// served raw, ≈0) and passes after (both columns ≈μ_y).
+    /// A 2-LEVEL quantile head (`quantile_levels = [0.25, 0.75]`) is width 2,
+    /// exactly like a Gaussian head, so serving must dispatch on the persisted
+    /// `DistributionForm`, never on head WIDTH. A width-keyed dispatch sends this
+    /// head down the Gaussian branch, which de-standardises only column 0 and
+    /// leaves column 1 (the 0.75 quantile) RAW (≈0), wrong by ≈μ_y; the correct
+    /// dispatch de-standardises EVERY column (both ≈μ_y).
     #[test]
     fn two_level_quantile_head_destandardises_both_columns_after_round_trip() {
         let device = Device::Cpu;

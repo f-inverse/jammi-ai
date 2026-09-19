@@ -1,4 +1,4 @@
-//! Python bindings for the ephemeral session-storage primitive (spec J6).
+//! Python bindings for the ephemeral session-storage primitive.
 //!
 //! Surfaces `db.ephemeral_session(timeout_seconds=...)` returning a
 //! context-manager `EphemeralSession`. Tables created inside the `with` block

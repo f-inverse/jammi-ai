@@ -166,10 +166,10 @@ high-water mark that cannot miss an intra-step spike the way a discrete poll
 (a per-step read, or jammi's own 25ms `nvidia-smi` interval) can.
 
 jammi's `peak_vram_bytes` is a whole-device `nvidia-smi` poll
-(`device_memory_used_bytes`, finetune_step.rs:225), sampled every 25ms
-(`std::thread::sleep`, finetune_step.rs:260) over the ENTIRE warmup+measured
-loop, then reduced via `peak.saturating_sub(baseline)`, finetune_step.rs:276
-against a baseline snapshot (`vram_baseline`, finetune_step.rs:821) taken
+(`nvidia_smi_memory_used`), sampled every 25ms (`VramSampler::start`) over
+the ENTIRE warmup+measured loop, then reduced via
+`peak.saturating_sub(baseline)` (`VramSampler::finish`) against a baseline
+snapshot (`vram_baseline` in `run_with`) taken
 once right after the model+optimizer are built (before the loop starts) — at
 which point candle's `AdamW::new` has
 ALREADY allocated the (zero-initialized) first/second moment tensors, since
@@ -521,8 +521,8 @@ def provenance(device, fast_path_globals):
 # list: the SAME shape `FinetuneStepTier::IDENTITY_FIELDS` /
 # `GradOracleReport::IDENTITY_FIELDS` carry on the Rust side
 # (`crates/jammi-bench/src/report.rs`, `grad_oracle.rs`), for THIS producer.
-# The 14 entries `ab_merge.py`'s own `FINETUNE_IDENTITY_FIELDS` compares
-# (`ab_merge.py:114-129`) — present here at whichever placement this
+# The entries `ab_merge.py`'s own `FINETUNE_IDENTITY_FIELDS` compares
+# (imported from `identity_fields.py`) — present here at whichever placement this
 # producer's own report actually uses (`report["args"][field]` for the three
 # named in `ab_merge.py`'s `_TORCH_ARGS_LEVEL_FIELDS`, `report["finetune_step"]
 # [field]` for the rest — see that module's own doc) — plus 14

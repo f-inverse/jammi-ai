@@ -528,7 +528,7 @@ mod tests {
         );
     }
 
-    /// The teeth, GATE-FAILS direction (RC1: an assertion must be able to fail).
+    /// The teeth, GATE-FAILS direction (an assertion must be able to fail).
     ///
     /// The floor's job is to catch a *material* coverage regression — one larger
     /// than the [`FLOOR_MARGIN`] headroom. The class of conformal bug that

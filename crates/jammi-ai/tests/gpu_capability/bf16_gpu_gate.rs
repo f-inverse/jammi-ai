@@ -21,13 +21,12 @@
 //! to f32) is structural: the gate's `BF16` arm either maps to `DType::BF16` or
 //! returns a typed error — there is no silent-fallback path — so a session that
 //! loads and encodes on a `compute_precision = BF16` config *did* run bf16.
-//! A bf16-rejecting gate (e.g. the pre-gate code, which rejected bf16
-//! unconditionally) would make `encode_text_query` return `Err`, failing the
-//! `.expect` below.
+//! A bf16-rejecting gate would make `encode_text_query` return `Err`, failing
+//! the `.expect` below.
 //!
-//! Gated exactly like the rest of the suite: `live-gpu-tests` + a meaningful run
-//! needs `cuda` + a visible GPU; without them it skips loudly via
-//! `skip_without_gpu!` (never `#[ignore]`).
+//! Gated like the rest of the suite: compiled only under `live-gpu-tests`,
+//! and the GPU session it builds fails naming the missing device on a host
+//! without CUDA device 0.
 
 use jammi_numerics::ComputePrecision;
 use tempfile::TempDir;

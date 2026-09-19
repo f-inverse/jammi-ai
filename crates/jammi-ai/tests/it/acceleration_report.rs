@@ -248,7 +248,7 @@ fn expect_determined_report_fails_closed_on_pending_marker() {
 // serializing the whole binary) guard against an unrelated concurrently
 // running test's forward pass also nudging the same counters; that residual
 // is accepted here on the same precedent `inference.rs` already established.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn second_f16_job_in_process_still_reports_its_own_eager_ops() {
     let (session, _dir) = session_with_training_data().await;
@@ -348,7 +348,7 @@ async fn second_f16_job_in_process_still_reports_its_own_eager_ops() {
 // serializing the whole binary) guard against an unrelated concurrently
 // running test's forward pass also nudging the same counters; that residual
 // is accepted here on the same precedent `inference.rs` already established.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn f32_positive_control_reports_ops_holds() {
     let (session, _dir) = session_with_training_data().await;
@@ -410,7 +410,7 @@ async fn f32_positive_control_reports_ops_holds() {
 // serializing the whole binary) guard against an unrelated concurrently
 // running test's forward pass also nudging the same counters; that residual
 // is accepted here on the same precedent `inference.rs` already established.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn submission_writes_pending_then_claim_overwrites_with_determined() {
     let (session, _dir) = session_with_training_data().await;
@@ -459,7 +459,7 @@ async fn submission_writes_pending_then_claim_overwrites_with_determined() {
 }
 
 /// "One record, two transports". Transport A is the embedded SDK path
-/// (`session.fine_tune`, `session.rs:1131`); transport B is a raw catalog
+/// (`session.fine_tune`); transport B is a raw catalog
 /// write mirroring what a non-embedded (e.g. remote/gRPC) submission path
 /// does at its substrate — `submit_job` directly, with a
 /// hand-assembled [`TrainingSpec`] — then relies on the SAME already-running
@@ -475,7 +475,7 @@ async fn submission_writes_pending_then_claim_overwrites_with_determined() {
 // serializing the whole binary) guard against an unrelated concurrently
 // running test's forward pass also nudging the same counters; that residual
 // is accepted here on the same precedent `inference.rs` already established.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn embedded_and_raw_transports_produce_the_same_report_shape() {
     let (session, _dir) = session_with_training_data().await;
@@ -523,7 +523,7 @@ async fn embedded_and_raw_transports_produce_the_same_report_shape() {
         cache: jammi_db::store::CachePolicy::Bypass,
     };
     let spec_json = serde_json::to_string(&spec).unwrap();
-    let job_b_id = "esc075-raw-transport-job".to_string();
+    let job_b_id = "accel-report-raw-transport-job".to_string();
     session
         .catalog()
         .submit_job(SubmitJobParams {
@@ -589,7 +589,7 @@ async fn embedded_and_raw_transports_produce_the_same_report_shape() {
 /// `flash_report_no_probe_attempted`'s doc). `ops` must be empty regardless
 /// (never a fabricated per-op measurement for an arm that built no
 /// dtype-typed encoder).
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn projection_head_arm_reports_no_probe_attempted_not_a_fabricated_failure() {
     let (session, _dir) = session_with_training_data().await;
@@ -643,8 +643,8 @@ async fn projection_head_arm_reports_no_probe_attempted_not_a_fabricated_failure
 /// checkpoint, not ModernBERT: BERT's training forward reaches the shared
 /// `attention_cascade::training_attention_cascade` but always
 /// supplies `flash: &FlashDecision::Declined { outcome: CapabilityMiss,
-/// reason: "flash_transport_not_wired" }` (`crates/jammi-encoders/src/
-/// bert.rs:418-420` — BERT never wires the encoder-boundary flash transport
+/// reason: "flash_transport_not_wired" }` (`jammi_encoders::bert`'s
+/// `forward_hidden` — BERT never wires the encoder-boundary flash transport
 /// protocol). `head64`, not plain `tiny_bert`, only because the fixture
 /// happens to share the SAME 256-token vocab this suite's `training_pairs.csv`
 /// already tokenizes against (`tests/fixtures/generate_tiny_bert_head64.py`'s
@@ -669,10 +669,10 @@ fn tiny_bert_head64_model() -> String {
 /// `"device_is_cpu_or_metal_not_cuda"` (`cuda` feature compiled, but this
 /// session never resolves a real CUDA device), exactly like every OTHER
 /// architecture on the same build. `admit_cascade`
-/// (`crates/jammi-kernels/src/admission.rs:407-457`) records every
+/// (`jammi_kernels::admission`) records every
 /// decline — including BERT's own `"flash_transport_not_wired"` — into the
 /// SAME thread-local probe-capture sink `admit_inner` uses
-/// (`record_probe_miss`, `admission.rs:421,432,442`), and
+/// (`record_probe_miss`), and
 /// `flash_cascade_decline_reason` reads it back verbatim on a real
 /// CUDA+flash-compiled build; that mechanism is proven directly, without
 /// needing a CUDA device, by
@@ -685,7 +685,7 @@ fn tiny_bert_head64_model() -> String {
 /// through the SAME encoder-adapters path the ModernBERT tests above already
 /// cover, and that this build's device-level reason is never overridden by a
 /// fabricated `"flash_transport_not_wired"` it cannot actually observe.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn bert_family_job_reports_flash_decline_honestly() {
     let (session, _dir) = session_with_training_data().await;
@@ -787,8 +787,8 @@ fn ops_keys(report: &serde_json::Value) -> std::collections::BTreeSet<String> {
 /// before/after delta on `cast_scale_f16_f32` / `cast_add_f16` — the exact
 /// registry keys the table names for `DtypeClass::F16` — actually moved,
 /// i.e. if some workspace call site really does resolve to those keys
-/// (`"cast_scale_f16_f32"`, `crates/jammi-kernels/src/admission.rs:2077`, and
-/// `"cast_add_f16"`, `crates/jammi-kernels/src/admission.rs:2085`,
+/// (`"cast_scale_f16_f32"` in `jammi_kernels::admission::CAST_SCALE`, and
+/// `"cast_add_f16"` in `jammi_kernels::admission::CAST_ADD`,
 /// both reached from `LowRankResidualLinear::bwd`'s `admit_cast_boundary(&CAST_SCALE, DtypeClass::F16, ..)`/
 /// `admit_cast_boundary(&CAST_ADD, DtypeClass::F16, ..)` calls, during
 /// the probe's backward pass). A table naming only `cast_add_bf16` would
@@ -828,7 +828,7 @@ fn ops_keys(report: &serde_json::Value) -> std::collections::BTreeSet<String> {
 /// pass) fails here.
 // `jammi_kernels::admission`'s dispatch registries are process-wide — same
 // `#[serial]` rationale as the other tests in this file.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_deterministic() {
     let (session, _dir) = session_with_training_data().await;
@@ -909,7 +909,7 @@ async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_determinist
                 serde_json::json!(true),
                 "the {label} f16 job's report must carry {key:?} as `holds: true` — \
                  LowRankResidualLinear::bwd dispatches its F16 cast-boundary kernels fused on \
-                 CPU (low_rank_residual_linear.rs:814,911); a probed-op table naming only \
+                 CPU (via `admit_cast_boundary`); a probed-op table naming only \
                  `cast_add_bf16` would leave an f16 job's report structurally unable to \
                  contain this key at all. Report: {report}"
             );
@@ -1005,7 +1005,7 @@ async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_determinist
 /// determination, only about the verbatim key attached to it.
 // `jammi_kernels::admission`'s dispatch registries and its warn-dedup set are
 // process-wide — same `#[serial]` rationale as the other tests in this file.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn each_job_reports_its_own_miss_predicate_not_the_most_recent_different_one() {
     const HEAD_DIM_MISS: &str = "head_dim_is_attention_block_fixed_head_dim";
@@ -1072,7 +1072,7 @@ async fn each_job_reports_its_own_miss_predicate_not_the_most_recent_different_o
 /// synthetic dataset is not tuned to guarantee that — `wait_for_any_terminal`
 /// accepts either outcome, since the marker is written BEFORE training even
 /// starts).
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn context_predictor_job_reports_not_applicable_acceleration() {
     use arrow::array::{ArrayRef, Float64Array, StringArray};
@@ -1152,7 +1152,7 @@ async fn context_predictor_job_reports_not_applicable_acceleration() {
         .unwrap();
 
     let predictor_spec = ContextPredictorTrainConfig {
-        model_id: "esc075-ctx-predictor".to_string(),
+        model_id: "accel-report-ctx-predictor".to_string(),
         architecture: ContextArchitecture::Cnp,
         key_column: "_row_id".to_string(),
         task_column: "task".to_string(),
@@ -1200,7 +1200,7 @@ async fn context_predictor_job_reports_not_applicable_acceleration() {
 /// submission-time `{"state":"pending"}` marker past this job's terminal
 /// `failed` status. The self-describing `{"state":"undetermined",
 /// "reason":"failed_before_device_resolution"}` marker must land instead.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn pre_device_resolution_failure_reports_undetermined_acceleration() {
     let (session, _dir) = session_with_training_data().await;
@@ -1227,7 +1227,7 @@ async fn pre_device_resolution_failure_reports_undetermined_acceleration() {
     // fails in `run_claimed_job` before `run_spec`/`run_fine_tune_blocking`
     // (and therefore the device resolution + measuring probe) are ever
     // reached.
-    let job_id = "esc075-pre-device-resolution-failure".to_string();
+    let job_id = "accel-report-pre-device-resolution-failure".to_string();
     let seed_model_ref = seed_record
         .model_ref
         .clone()
@@ -1404,7 +1404,7 @@ fn assert_terminal_report_is_undetermined(
 ///   reset to `pending`).
 // `jammi_kernels::admission`'s dispatch registries are process-wide — same
 // `#[serial]` rationale as the other tests in this file.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
     let (session, _dir) = session_with_training_data().await;
@@ -1450,16 +1450,16 @@ async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
 
     let cases = [
         (
-            "esc446-f1-missing-artifact",
+            "accel-report-missing-artifact",
             spec_for(
                 "training",
-                "local:/nonexistent/esc446/f1/no-such-checkpoint",
+                "local:/nonexistent/accel-report/no-such-checkpoint",
             ),
             "path 4 (base-model artifact missing)",
         ),
         (
-            "esc446-f1-unknown-source",
-            spec_for("no_such_table_esc446", &tiny_modernbert_model()),
+            "accel-report-unknown-source",
+            spec_for("no_such_table_accel_report", &tiny_modernbert_model()),
             "path 3 (source SQL / loader reconstruction)",
         ),
     ];
@@ -1553,12 +1553,12 @@ async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
 ///   the swallowed write and not by the finalize itself.
 // `jammi_kernels::admission`'s dispatch registries are process-wide — same
 // `#[serial]` rationale as the other tests in this file.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
     /// The `claimed_by` identity the raw legs below claim under — a real
     /// lease holder, just not an `EmbeddedWorker`.
-    const WORKER: &str = "esc446-f1-success-path-worker";
+    const WORKER: &str = "accel-report-success-path-worker";
     /// A determined payload of the shape `build_acceleration_report_json`
     /// produces. Only its `"state"` is load-bearing here: what is under test
     /// is WHETHER the write lands, not what it measures.
@@ -1674,10 +1674,10 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
                 job_id,
                 instance_id: WORKER,
                 attempts,
-                result: r#"{"kind":"model","model_id":"esc446-f1-no-such-output-model","artifact_path":"esc446-f1/unused/","metrics":null}"#,
-                output_model_id: "esc446-f1-no-such-output-model",
+                result: r#"{"kind":"model","model_id":"accel-report-no-such-output-model","artifact_path":"accel-report/unused/","metrics":null}"#,
+                output_model_id: "accel-report-no-such-output-model",
                 output_model_version: 1,
-                artifact_path: "esc446-f1/unused/",
+                artifact_path: "accel-report/unused/",
                 epoch_checkpoints: &[],
             })
             .await
@@ -1685,7 +1685,7 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
     };
 
     // ── Leg 2: the swallowed probe write, then a successful finalize ──────
-    let swallowed = "esc446-f1-swallowed-report-write";
+    let swallowed = "accel-report-swallowed-report-write";
     let claimed = claim(swallowed).await;
     // THE SWALLOWED WRITE. `persist_acceleration_report` calls exactly this,
     // and logs-and-continues on the `false` it returns. A stale attempt is
@@ -1737,7 +1737,7 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
     );
 
     // ── Leg 3: the mechanism trace — same shape, correct attempt ──────────
-    let landed_ok = "esc446-f1-report-write-landed";
+    let landed_ok = "accel-report-report-write-landed";
     let claimed = claim(landed_ok).await;
     let landed = session
         .catalog()
@@ -1786,7 +1786,7 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
 /// actually reached instrumented kernels, and the `flash` reason proves the
 /// report never labels this job with the failure sentinel. A token-only
 /// probe fails both.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn media_encoder_adapters_job_probes_its_own_modality() {
     let dir = TempDir::new().unwrap();

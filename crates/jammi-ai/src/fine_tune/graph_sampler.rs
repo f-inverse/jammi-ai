@@ -2,7 +2,7 @@
 //! into the `(anchor, positive, [hard_negative])` text pairs the existing
 //! fine-tune trainer consumes. This is node2vec/DeepWalk realised as a data
 //! loader — it samples the graph, it does **not** author a GNN (no message
-//! passing, no learned aggregation; that is S12/S13).
+//! passing, no learned aggregation).
 //!
 //! # What it produces
 //!
@@ -10,7 +10,7 @@
 //! co-walk *positives* — nodes that are graph-close at walk length `L`, not just
 //! 1-hop neighbours (`L = 1` is the degenerate 1-hop special case). Each
 //! `(anchor, positive)` pair drives the existing in-batch-negative objective
-//! (S10/MNRL), and the sampler additionally mines **structure-aware hard
+//! (MNRL), and the sampler additionally mines **structure-aware hard
 //! negatives** — nodes that are reachable but *outside* the anchor's k-hop
 //! neighbourhood, i.e. the sibling / near-but-not-neighbour discrimination dense
 //! retrieval needs.
@@ -20,11 +20,11 @@
 //! The encoder needs text input, so every graph node carries its text in
 //! [`TextNode::text`] — there is no constructor for a node without text. An edge
 //! endpoint that does not resolve to a [`TextNode`] is a typed error, never a
-//! silent skip. Pure-vector nodes are S12/S13 territory, not S11.
+//! silent skip. Pure-vector nodes belong to graph propagation, not this sampler.
 //!
 //! # Circularity — the load-bearing caveat
 //!
-//! Training on **S9-similarity edges** ([`EdgeProvenance::Similarity`]) largely
+//! Training on **similarity edges** ([`EdgeProvenance::Similarity`]) largely
 //! re-learns the base embedding metric: the edges were *drawn by* that metric,
 //! so co-walk positives over them mostly restate "things the model already
 //! thinks are close" → little new signal, a degenerate feedback loop. Genuine
@@ -33,14 +33,15 @@
 //! does **not** already encode. The sampler tracks each edge's provenance and
 //! [`GraphSampler::has_declared_supervision`] reports whether any declared edge
 //! is present; similarity-only supervision is a weak bootstrap, never the sole
-//! supervision. See the cookbook page for the full R1 evaluation protocol.
+//! supervision. See the cookbook page for the full evaluation protocol.
 //!
-//! # Composition with S12
+//! # Composition with graph propagation
 //!
-//! S11 (fine-tune the head on graph pairs) and S12 (propagate embeddings over
-//! the graph) both encode homophily; stacking them naively double-counts the
-//! same smoothing. The recommended order is **propagate (S12) → fine-tune
-//! (S11)** — the SGC/APPNP decoupling — not two independent smoothing passes.
+//! Fine-tuning the head on graph pairs and propagating embeddings over the
+//! graph (`crate::pipeline::graph_propagation`) both encode homophily;
+//! stacking them naively double-counts the same smoothing. The recommended
+//! order is **propagate → fine-tune** — the SGC/APPNP decoupling — not two
+//! independent smoothing passes.
 //!
 //! # References
 //! - Perozzi et al. 2014, *DeepWalk*: <https://arxiv.org/abs/1403.6652>
@@ -63,9 +64,10 @@ use crate::pipeline::graph_neighbourhood::{Adjacency, SplitMix64};
 pub enum EdgeProvenance {
     /// External / declared structure: hierarchy, crosswalk, citation, a
     /// coder-confirmed pair. Independent of the base embedding metric, so it can
-    /// teach the model something new. This is the supervision S11 is *for*.
+    /// teach the model something new. This is the supervision graph fine-tuning
+    /// is *for*.
     Declared,
-    /// An S9 k-NN similarity edge: drawn *by* the base embedding metric. Training
+    /// A k-NN similarity edge: drawn *by* the base embedding metric. Training
     /// on it largely re-learns that metric (the degenerate feedback loop), so it
     /// is acceptable only as a weak bootstrap, never the sole supervision.
     Similarity,
@@ -85,7 +87,7 @@ pub struct TextNode {
 impl TextNode {
     /// Construct a text-bearing node. There is deliberately no constructor that
     /// omits the text — a graph node without text cannot be fed to the encoder,
-    /// so S11 makes that unrepresentable.
+    /// so the type makes that unrepresentable.
     pub fn new(id: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -102,7 +104,7 @@ pub struct GraphEdge {
     pub src: String,
     /// Destination node id.
     pub dst: String,
-    /// Where the edge came from (declared vs S9-similarity).
+    /// Where the edge came from (declared vs similarity).
     pub provenance: EdgeProvenance,
 }
 
@@ -117,7 +119,7 @@ impl GraphEdge {
         }
     }
 
-    /// An S9-similarity edge — a weak bootstrap only (see the circularity
+    /// A similarity edge — a weak bootstrap only (see the circularity
     /// caveat in the module docs).
     pub fn similarity(src: impl Into<String>, dst: impl Into<String>) -> Self {
         Self {
@@ -143,9 +145,9 @@ impl GraphEdge {
 /// in-crate and `jammi-server` reference sampler calls this ONE function
 /// rather than re-deriving the sort inline — a comparison against a
 /// reference that skips it, or sorts differently, is silently vacuous
-/// (GA1's own oracle: two physical layouts of the identical set must
-/// sample identically, which this function is what makes a fixture's
-/// layout agree with a real scan's in the first place).
+/// (two physical layouts of the identical set must sample identically;
+/// this function is what makes a fixture's layout agree with a real
+/// scan's).
 pub fn sort_into_graph_read_order(nodes: &mut [TextNode], edges: &mut [GraphEdge]) {
     nodes.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.text.cmp(&b.text)));
     edges.sort_by(|a, b| a.src.cmp(&b.src).then_with(|| a.dst.cmp(&b.dst)));
@@ -306,7 +308,7 @@ pub struct GraphSampler {
     /// Undirected adjacency for the k-hop false-negative guard and the node2vec
     /// p/q bias: an edge in either direction makes the endpoints neighbours. The
     /// shared [`Adjacency`] whose bounded BFS the k-hop exclusion walks — one
-    /// bounded-expansion core, shared with context assembly (S16-G).
+    /// bounded-expansion core, shared with graph context assembly.
     undirected: Adjacency,
     /// Whether any edge is declared (vs similarity-only) — the circularity
     /// signal, computed at build time.
@@ -334,7 +336,7 @@ impl GraphSampler {
             ));
         }
 
-        // (issue #538): the node id is the sole ordering key a caller's
+        // The node id is the sole ordering key a caller's
         // "ORDER BY id" scan can offer, so a duplicate id makes that key-only
         // order non-total — which of the two rows' text a tie-broken scan
         // would keep is undefined, and a silent "last write wins" would make
@@ -379,8 +381,9 @@ impl GraphSampler {
                 if !node_map.contains_key(endpoint) {
                     return Err(JammiError::FineTune(format!(
                         "edge {which} endpoint '{endpoint}' has no text-bearing node; \
-                         every edge endpoint must resolve to a TextNode (S11 nodes \
-                         must be text-bearing — pure-vector nodes are S12/S13)"
+                         every edge endpoint must resolve to a TextNode (graph \
+                         fine-tune nodes must be text-bearing — pure-vector nodes \
+                         belong to graph propagation)"
                     )));
                 }
             }
@@ -408,14 +411,14 @@ impl GraphSampler {
     }
 
     /// Whether the graph carries any declared / external edge. `false` means the
-    /// supervision is S9-similarity-only — a weak bootstrap that largely
+    /// supervision is similarity-only — a weak bootstrap that largely
     /// re-learns the base metric (the circularity caveat). Consumers should
     /// treat similarity-only supervision as a bootstrap, never the sole signal.
     pub fn has_declared_supervision(&self) -> bool {
         self.has_declared
     }
 
-    /// The sample config this sampler was built with (issue #538): the
+    /// The sample config this sampler was built with: the
     /// authority `TrainingDataLoader::from_graph` reads `hard_negatives`
     /// from to decide `pairs` vs `triplet` — a CONFIG decision,
     /// never re-derived from which negatives the first sampled pair happens
@@ -426,7 +429,7 @@ impl GraphSampler {
     }
 
     /// A byte estimate for what this sampler holds RESIDENT for random
-    /// access over its whole lifetime (GA7, issue #538): every node id +
+    /// access over its whole lifetime: every node id +
     /// text, the forward adjacency (`out_adj`, `biased_walk`'s own table),
     /// and the undirected adjacency (`k_hop_neighbourhood`'s bounded BFS,
     /// `biased_choice`'s p/q lookup). This is the shape `reconstruct_graph_
@@ -474,7 +477,7 @@ impl GraphSampler {
 
     /// Sample the graph into `(anchor, positive, [hard_negative])` text rows,
     /// calling `emit` once per row AS IT IS PRODUCED — never building a
-    /// `Vec<SampledPair>` of the whole output (GA7, issue #538): a caller
+    /// `Vec<SampledPair>` of the whole output: a caller
     /// materialising the output (`fine_tune::worker::
     /// materialize_graph_training_set`) streams straight into its own
     /// bounded batch buffer, so peak residency is the sampler's own O(|V|+
@@ -507,7 +510,7 @@ impl GraphSampler {
                         continue;
                     }
                     let negatives = self.sample_negatives(start, visited, &excluded, &mut rng);
-                    // (issue #538): an empty negative pool under a config
+                    // An empty negative pool under a config
                     // that DEMANDS hard negatives is refused HERE, at sample
                     // time, naming the anchor — never emitted as a row with
                     // no negatives for `from_graph`'s later, generic
@@ -787,11 +790,9 @@ mod tests {
 
     #[test]
     fn build_rejects_duplicate_node_id() {
-        // GA1: a duplicate node id is refused, typed, naming the id — never
-        // the silent "last text wins" that made the sampled text a function
-        // of scan order rather than of the node SET (mutation: reverting this
-        // check to the old `HashMap::insert`-and-overwrite shape makes this
-        // assert `is_ok()` again — RED under that mutation).
+        // A duplicate node id is refused, typed, naming the id — never a
+        // silent "last text wins", which would make the sampled text a
+        // function of scan order rather than of the node SET.
         let nodes = vec![
             TextNode::new("n0005", "FIRST text of node 5"),
             TextNode::new("n0006", "text of node 6"),
@@ -810,7 +811,7 @@ mod tests {
 
     #[test]
     fn build_keeps_duplicate_edges_asymmetry_with_duplicate_nodes() {
-        // GA1's stated asymmetry: a duplicate EDGE is benign (the projected
+        // The asymmetry: a duplicate EDGE is benign (the projected
         // edge tuple carries no third field that can differ, so keeping both
         // copies is well-defined and output-affecting only in count, never in
         // content) while a duplicate NODE id is not (rejected above). Two
@@ -837,7 +838,7 @@ mod tests {
         assert!(format!("{err}").contains("min_negatives"));
     }
 
-    /// Family D/F (advisory 7, issue #538): `NaN <= 0.0` is `false`, so a
+    /// `NaN <= 0.0` is `false`, so a
     /// naive `<= 0.0` bound would silently let a NaN `return_p`/`in_out_q`
     /// pass validation. `validate` must refuse it, named, same as any other
     /// invalid value — never a confidently-wrong bias reaching
@@ -1034,7 +1035,7 @@ mod tests {
 
     #[test]
     fn k_hop_uses_the_shared_bounded_frontier() {
-        // The fine-tune k-hop exclusion and the S16-G context gather share ONE
+        // The fine-tune k-hop exclusion and the graph context gather share ONE
         // bounded BFS (`graph_neighbourhood::Adjacency::bounded_frontier`). This
         // asserts the sampler's `k_hop_neighbourhood` is exactly that shared core
         // driven with the exclusion bounds (undirected, include-start, no
@@ -1083,7 +1084,7 @@ mod tests {
 
     /// A star graph: hub `c0` reaches every spoke directly, so
     /// `exclude_hops=1` excludes c0's WHOLE candidate pool — its negative
-    /// pool is empty. Issue #538: requesting `hard_negatives > 0` over this
+    /// pool is empty. Requesting `hard_negatives > 0` over this
     /// graph must refuse AT SAMPLE TIME, naming the hub, never silently emit
     /// a pair with no negatives for a later, generic caller to reject with
     /// no anchor context.
@@ -1121,7 +1122,7 @@ mod tests {
         );
     }
 
-    /// GA3: the SAME star graph with `hard_negatives = 0` never mines a
+    /// The SAME star graph with `hard_negatives = 0` never mines a
     /// pool at all, so it succeeds — the format decision (`pairs`) is
     /// a config fact, not a property this graph's structure could violate.
     #[test]
@@ -1139,7 +1140,7 @@ mod tests {
         assert!(pairs.iter().all(|p| p.hard_negatives.is_empty()));
     }
 
-    /// GA7 (issue #538): `resident_bytes` is a REAL measurement, not a
+    /// `resident_bytes` is a REAL measurement, not a
     /// placeholder — it moves when the resident text does, and a graph with
     /// more edges (a wider `out_adj`/`undirected`) reports MORE resident
     /// bytes than an isolated-looking one with identical node text alone.

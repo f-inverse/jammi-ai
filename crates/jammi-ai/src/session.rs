@@ -37,12 +37,12 @@ pub struct InferenceSession {
     ann_cache: Arc<AnnCache>,
     device_config: DeviceConfig,
     /// The one Hugging Face Hub client this session's resolver and fine-tune
-    /// worker share (esc-096) — built once, below, from `[models]`.
+    /// worker share — built once, below, from `[models]`.
     hub: HubSource,
     /// Registry of open ephemeral sessions, shared with the timeout scanner.
     ephemeral_sessions: jammi_db::ephemeral::ActiveSessions,
     /// This process's identity in the `instances`/`jobs.claimed_by`
-    /// vocabulary (N3): a UUID minted once at construction
+    /// vocabulary: a UUID minted once at construction
     /// ([`crate::fine_tune::worker::mint_instance_id`]) and never taken
     /// from the environment — `JAMMI_WORKER_ID` is only the row's `label`
     /// ([`crate::fine_tune::worker::worker_label`]), so two processes
@@ -66,7 +66,7 @@ pub struct InferenceSession {
     /// [`Self::instance_registration`]); the gang admission handler and the
     /// claim loop contend for the holder; DRAIN/RELEASE flip the phase.
     host_admission: Arc<crate::fine_tune::worker::HostAdmission>,
-    /// The process's one lease-renewal thread (N3) — every claimed lease
+    /// The process's one lease-renewal thread — every claimed lease
     /// this session (or a job/table it owns) holds is held open here instead
     /// of spawning its own `tokio::spawn` heartbeat task, so a CPU-bound
     /// inline compute job on the main runtime can never starve a renewal.
@@ -229,8 +229,7 @@ impl InferenceSession {
         let inner = Arc::new(inner);
         let catalog = Arc::clone(inner.catalog());
 
-        // The ONE choke point (contract §10, the round-3 excision), run
-        // FIRST — before the lease keeper starts, before the result store
+        // The ONE choke point, run FIRST — before the lease keeper starts, before the result store
         // creates a single directory, before any other side effect:
         // `peer_advertise` unset yields a non-member registration
         // (`peer_addr`/`member_root` both `None`) with no filesystem/config
@@ -241,15 +240,14 @@ impl InferenceSession {
         // funnel every `InferenceSession` constructor reaches, so a
         // hand-built config (never routed through `JammiConfig::load_from`)
         // is still covered here.
-        // #540 RANGESPLIT advisory: `JammiConfig::load_from` calls
-        // `InferenceConfig::validate` (rejects `partitions == 0` and above
-        // `MAX_PARTITIONS`), but a hand-built `JammiConfig` handed straight
-        // to an `InferenceSession` constructor — the way every test in this
-        // crate, and any embedding caller, builds one — never runs
-        // `load_from` at all. `wrap_with` is the same universal funnel that
-        // already covers `MembershipConfig::validate` for the identical
-        // reason (see the comment above), so validating here closes the
-        // same gap for `inference.partitions`.
+        // `JammiConfig::load_from` calls `InferenceConfig::validate`
+        // (rejects `partitions == 0` and above `MAX_PARTITIONS`), but a
+        // hand-built `JammiConfig` handed straight to an `InferenceSession`
+        // constructor — the way every test in this crate, and any embedding
+        // caller, builds one — never runs `load_from` at all. `wrap_with` is
+        // the same universal funnel that covers `MembershipConfig::validate`
+        // for the identical reason (see the comment above), so
+        // `inference.partitions` is validated here too.
         inner.config().inference.validate()?;
 
         let instance_id = crate::fine_tune::worker::mint_instance_id();
@@ -263,7 +261,7 @@ impl InferenceSession {
             )?,
         );
 
-        // N3: one lease-renewal thread per process, started before anything
+        // One lease-renewal thread per process, started before anything
         // holds a lease with it (the result store's `BuildingTable`
         // adoptions below, this session's own `instances` row, and every
         // job/table lease a `JobWorker`/`run_now` claim holds later).
@@ -320,7 +318,7 @@ impl InferenceSession {
                 .with_lease_keeper(Arc::clone(&lease_keeper)),
         );
         let artifact_store = result_store.artifact_store();
-        // The K4 choke point (esc-096): `[models]` -> `HubSource`, exactly
+        // The Hub choke point: `[models]` -> `HubSource`, exactly
         // once per session. Every downstream Hub call (the resolver's
         // HuggingFace arm, the fine-tune worker's HF fallback) shares this
         // one client rather than each re-deriving its own from
@@ -389,7 +387,7 @@ impl InferenceSession {
                 lease_intervals.lease(),
             ))
             .await?;
-        // `Catalog::prune_jobs` is tenant-scoped (F2, issue #485): every
+        // `Catalog::prune_jobs` is tenant-scoped: every
         // `JobService::PruneJobs` RPC call runs it under the CALLER's own
         // `scoped(...)` tenant, like every other job RPC. This construction
         // sweep is not an RPC — it runs once per process boot, before any
@@ -501,7 +499,7 @@ impl InferenceSession {
         Ok((holds, sweep))
     }
 
-    /// This process's `instances`/`jobs.claimed_by` identity (N3): a UUID
+    /// This process's `instances`/`jobs.claimed_by` identity: a UUID
     /// minted at construction, never `JAMMI_WORKER_ID` (which is only the
     /// row's label). Shared by every claimant on this session — a
     /// [`crate::fine_tune::worker::JobWorker`]'s poll loop and
@@ -517,7 +515,7 @@ impl InferenceSession {
     /// [`crate::fine_tune::worker::EmbeddedWorker`] guard spawned over it)
     /// is the sole owner of its `worker` half: it sets the cell only AFTER
     /// every row write as ONE fact with the row (`write_worker_facts` in
-    /// `fine_tune::worker`, contract `feat_500-C-U5b-1a` §13): the cell is
+    /// `fine_tune::worker`): the cell is
     /// set to the facts about to be UPSERTED and reverted if that upsert
     /// fails — after a failed first write it is `None` again — and cleared
     /// before every `delete_worker` call. A keeper reregister therefore
@@ -536,7 +534,7 @@ impl InferenceSession {
         &self.host_admission
     }
 
-    /// This process's one lease-renewal thread (N3). A
+    /// This process's one lease-renewal thread. A
     /// [`crate::fine_tune::worker::JobWorker`] and [`Self::run_now`] both
     /// hold their claimed job leases here rather than spawning their own
     /// heartbeat task.
@@ -554,7 +552,7 @@ impl InferenceSession {
     }
 
     /// Release every catalog connection this session holds — its own
-    /// shared backend pool AND the lease keeper's (N3) dedicated
+    /// shared backend pool AND the lease keeper's dedicated
     /// connection — so a successor process can open the SAME catalog
     /// directory immediately.
     ///
@@ -724,7 +722,7 @@ impl InferenceSession {
     /// The shared catalog handle behind an `Arc` — the form a [`TrainingJob`]
     /// handle clones to poll its job after the submitting call returns, and
     /// the form `jammi-ballista`'s `CatalogClusterState`/`CatalogJobState`/
-    /// `DevicePlacement` (contract `feat_500-wave4.md` §3) need to hold
+    /// `DevicePlacement` need to hold
     /// their own long-lived handle rather than borrowing this session's.
     pub fn catalog_arc(&self) -> &Arc<jammi_db::catalog::Catalog> {
         self.inner.catalog()
@@ -917,7 +915,7 @@ impl InferenceSession {
     }
 
     /// The one Hugging Face Hub client this session's resolver was built
-    /// with (esc-096) — the fine-tune worker's HF fallback path threads this
+    /// with — the fine-tune worker's HF fallback path threads this
     /// through `RunFineTuneParams` rather than building its own.
     pub(crate) fn hub(&self) -> &HubSource {
         &self.hub
@@ -1069,7 +1067,7 @@ impl InferenceSession {
         let regression_form = guard.model.regression_form().cloned();
         drop(guard);
 
-        // #540 RANGESPLIT: see `operator::inference_exec::
+        // See `operator::inference_exec::
         // wrap_with_split_and_merge`'s doc. `input` here is CALLER-supplied
         // (`query::QueryBuilder::annotate`'s fluent chain, or the Flight-SQL
         // `annotate` table function's scan) and may already have more than
@@ -1142,7 +1140,7 @@ impl InferenceSession {
     }
 
     /// Generate embeddings for a source with the given model and modality —
-    /// the thin [`Self::run_now`] wrapper (item 2/K4) unifying the three
+    /// the thin [`Self::run_now`] wrapper unifying the three
     /// modality-specific materializers
     /// ([`Self::generate_text_embeddings`], [`Self::generate_image_embeddings`],
     /// [`Self::generate_audio_embeddings`]) behind one
@@ -1409,8 +1407,8 @@ impl InferenceSession {
     /// TEST-ONLY non-vacuity seam for the regression surface, generalized
     /// from [`Self::served_regression_col0_for_test`] to any distribution
     /// column (`col_idx < head_width` — a Gaussian head has `head_width ==
-    /// 2`, a quantile head `head_width == quantile_levels.len()`). Added so a
-    /// power-limited seed sweep (esc-182: `untrained_quantile_head_collapses_
+    /// 2`, a quantile head `head_width == quantile_levels.len()`), so a
+    /// power-limited seed sweep (`untrained_quantile_head_collapses_
     /// to_mu_no_separation` in `tests/it/regression_surface.rs`) can pool
     /// EVERY already-trained quantile level's separation, not only column 0,
     /// for `3x` the independent samples per seed at ZERO extra training cost
@@ -1440,7 +1438,7 @@ impl InferenceSession {
     }
 
     /// Run inference on a registered source using a model — the thin
-    /// [`Self::run_now`] wrapper every embedded caller reaches (item 2/K4):
+    /// [`Self::run_now`] wrapper every embedded caller reaches:
     /// submits a [`crate::jobs::ComputeSpec::Infer`], executes it inline
     /// under the same claim/lease/finish path a queued `infer` kind runs,
     /// and returns the terminal rows read back through the SAME ordered SQL
@@ -1486,7 +1484,7 @@ impl InferenceSession {
     /// [`crate::jobs::execute_compute`] (from [`Self::run_now`] or a claimed
     /// `infer` job) with the claim's [`JobAttempt`](jammi_db::catalog::result_repo::JobAttempt)
     /// so the result table's `partial_result` CAS lands under the correct
-    /// attempt (N1); every OTHER internal caller that materializes directly
+    /// attempt; every OTHER internal caller that materializes directly
     /// without a job of record ([`crate::pipeline::recompute`]'s replay,
     /// [`crate::eval::runner::EvalRunner`]) passes `None`.
     ///
@@ -1609,7 +1607,7 @@ impl InferenceSession {
             }
         }
 
-        // Wrap with InferenceExec. #540 RANGESPLIT: see
+        // Wrap with InferenceExec. See
         // `operator::inference_exec::wrap_with_split_and_merge`'s doc. At
         // the default `InferenceConfig::partitions == 1` it coalesces
         // `input_plan` to one partition if it is not already one — a no-op
@@ -1770,8 +1768,8 @@ impl InferenceSession {
     }
 
     /// Materialize the k-nearest-neighbour graph of a source's embedding table
-    /// as a queryable edge `result_table` — the thin [`Self::run_now`] wrapper
-    /// (item 2/K4): submits a [`crate::jobs::ComputeSpec::NeighborGraph`] and
+    /// as a queryable edge `result_table` — the thin [`Self::run_now`] wrapper:
+    /// submits a [`crate::jobs::ComputeSpec::NeighborGraph`] and
     /// returns the terminal [`ResultTableRecord`] + [`CacheOutcome`](jammi_db::store::CacheOutcome)
     /// [`Self::run_now`] produced, so a direct call and a queued-and-claimed
     /// `neighbor_graph` job of the same spec run identical code
@@ -1876,7 +1874,7 @@ impl InferenceSession {
     }
 
     /// Assemble a point-in-time-correct table — the thin [`Self::run_now`]
-    /// wrapper (item 2/K4): submits a [`crate::jobs::ComputeSpec::AsofJoin`]
+    /// wrapper: submits a [`crate::jobs::ComputeSpec::AsofJoin`]
     /// and returns the terminal [`ResultTableRecord`] [`Self::run_now`]
     /// produced, so a direct call and a queued-and-claimed `asof_join` job of
     /// the same spec run identical code
@@ -2080,10 +2078,10 @@ impl InferenceSession {
         // [`crate::fine_tune::spec::admit_training_spec`]. A refusal leaves
         // no row behind, because no row has been written yet. Consuming
         // `spec` here and reading it back only through `admitted.spec()` is
-        // the witness enforcement (#573 round 2): there is no path below
-        // this line that could serialize/submit the pre-admission `spec`
-        // value, because that binding no longer exists. This function
-        // builds no `SubmitJobParams` of its own (#573 round 3, N3-seam):
+        // the witness enforcement: there is no path below this line that
+        // could serialize/submit the pre-admission `spec` value, because
+        // that binding is consumed. This function builds no
+        // `SubmitJobParams` of its own:
         // [`crate::fine_tune::spec::submit_admitted_training`] is the one
         // place that construction happens.
         let admitted = crate::fine_tune::spec::admit_training_spec(self.inner.config(), spec)?;
@@ -2203,11 +2201,11 @@ impl InferenceSession {
             .catalog_pk)
     }
 
-    /// Graph-supervised fine-tune (S11): learn an embedding metric that encodes
+    /// Graph-supervised fine-tune: learn an embedding metric that encodes
     /// a graph's structure. Reads a node-text source and an edge source, samples
     /// the graph into `(anchor, positive, [hard_negative])` text pairs via biased
     /// random walks (node2vec), and drives the existing in-batch-negative
-    /// (S10/MNRL) or triplet objective — **no new loss**.
+    /// (MNRL) or triplet objective — **no new loss**.
     ///
     /// `node_source` supplies the text the encoder embeds, keyed by `id_column`,
     /// with the text in `text_column`. `edge_source` supplies directed edges
@@ -2216,7 +2214,7 @@ impl InferenceSession {
     /// a typed error.
     ///
     /// `provenance` declares whether the edges are external/declared structure or
-    /// S9-similarity edges — **the load-bearing distinction**: training on
+    /// similarity edges — **the load-bearing distinction**: training on
     /// similarity edges largely re-learns the base metric (a degenerate feedback
     /// loop), so genuine gain comes from declared edges. Similarity-only edges
     /// are a weak bootstrap, never the sole supervision.
@@ -2361,7 +2359,7 @@ impl InferenceSession {
             .await
     }
 
-    /// Evaluate whether a predictor's uncertainty is honest (spec R2).
+    /// Evaluate whether a predictor's uncertainty is honest.
     ///
     /// `golden_source` is a held-out set pairing a predictive distribution with
     /// its realised `outcome`; `shape` selects the predictor's output family
@@ -2406,11 +2404,10 @@ fn infer_ordered_read_back_sql(table: &str) -> String {
 /// ([`jammi_db::store::ResultStore::register_table`]'s doc: "the resolved
 /// Arrow schema (Utf8View under the Arrow parquet-reader default) matches")
 /// widens string columns to the View encoding on every read-back, which
-/// [`InferenceSession::infer`]'s ordered read-back (item 6) now takes on
-/// BOTH arms — so without this normalization a caller downcasting `_status`/
-/// `_error`/a string task column to `StringArray` would see a shape it
-/// never saw before this item's read-back-on-every-arm change, purely as an
-/// accidental side effect of routing through SQL rather than returning the
+/// [`InferenceSession::infer`]'s ordered read-back takes on BOTH arms — so
+/// without this normalization a caller downcasting `_status`/`_error`/a
+/// string task column to `StringArray` would see a different shape purely
+/// as a side effect of routing through SQL rather than returning the
 /// in-memory compute batch. Every OTHER column (including `_ordinal`
 /// itself) passes through unchanged.
 fn normalize_view_columns(batch: &RecordBatch) -> Result<RecordBatch> {
@@ -2613,9 +2610,9 @@ mod extract_test_column_tests {
     }
 
     /// A `BackendOutput` with no shape entry at all must be a named refusal,
-    /// not an index into an absent element 0. Verified by temporarily
-    /// reverting the `shapes.first()` guard to an unchecked `output.shapes[0]`:
-    /// this test goes RED (a panic, not the `Err` asserted below).
+    /// not an index into an absent element 0 (an unchecked
+    /// `output.shapes[0]` would panic instead of returning the `Err` asserted
+    /// below).
     #[test]
     fn refuses_when_no_output_head_shape_is_present() {
         let out = BackendOutput {
@@ -2630,9 +2627,8 @@ mod extract_test_column_tests {
     }
 
     /// A `BackendOutput` with no float head at all must be a named refusal,
-    /// not an index into an absent element 0. Verified by temporarily
-    /// reverting the `float_outputs.first()` guard to an unchecked
-    /// `output.float_outputs[0]`: this test goes RED (a panic, not the `Err`
+    /// not an index into an absent element 0 (an unchecked
+    /// `output.float_outputs[0]` would panic instead of returning the `Err`
     /// asserted below).
     #[test]
     fn refuses_when_no_float_head_is_present() {
@@ -2649,9 +2645,8 @@ mod extract_test_column_tests {
 
     /// A flat buffer / `row_status` that disagree with `num_rows * head_width`
     /// must be a named refusal, not a read past (or short of) the intended
-    /// rows. Verified by temporarily removing the consistency check: this
-    /// test goes RED (an out-of-bounds index panic, not the `Err` asserted
-    /// below).
+    /// rows (without the consistency check, an out-of-bounds index panics
+    /// instead of returning the `Err` asserted below).
     #[test]
     fn refuses_when_flat_and_row_status_disagree_with_shape() {
         let out = BackendOutput {
@@ -2669,10 +2664,9 @@ mod extract_test_column_tests {
 
     /// `num_rows * head_width` computed with a raw multiply could silently
     /// overflow on an adversarial shape; the checked multiply must refuse by
-    /// name instead. Verified by temporarily reverting the checked multiply
-    /// to a raw `num_rows * head_width`: this test goes RED (a debug-mode
-    /// overflow panic, or a wrapped small `expected` in release, rather than
-    /// the `Err` asserted below).
+    /// name instead (a raw multiply panics in debug, or wraps to a small
+    /// `expected` in release, rather than returning the `Err` asserted
+    /// below).
     #[test]
     fn refuses_an_overflowing_num_rows_times_head_width_without_panicking() {
         let out = BackendOutput {

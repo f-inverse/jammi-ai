@@ -11,24 +11,24 @@
 //!   knobs, distinct from the text-row-shaped fine-tune `TrainingFormat` (a
 //!   context-set→target model is not a text row, so it gets its own config);
 //! - the **episodic sampler** — per target row, assemble its context through the
-//!   S16 retrieval (`search` + `exclude_self` + a same-task split), read the
+//!   context-set retrieval (`search` + `exclude_self` + a same-task split), read the
 //!   members' x-vectors and y-labels **through the generic SQL surface**, and
 //!   build a padded [`ContextEpisode`] plus the held-out target `y`. Tasks (not
 //!   points) are partitioned into train/test, and a `min_task_count` guard
 //!   rejects a degenerate meta-dataset;
 //! - the trainer — build the predictor in a [`VarMap`], drive the generalized
-//!   [`train_loop`] with the predictor's forward and S18's proper-scoring loss,
+//!   [`train_loop`] with the predictor's forward and a proper-scoring loss,
 //!   persist the trained weights, and register the artifact in the catalog.
 //!
-//! ## Leakage (the HIGH context-leakage contract)
+//! ## Leakage
 //!
 //! A target must never appear in its own context, within or across episodes. The
-//! sampler inherits S16's two guards verbatim: every per-target context request
-//! sets `exclude_self` (dropping the target's own key) and scopes the context to
+//! sampler inherits the context-set pipeline's two guards verbatim: every per-target context
+//! request sets `exclude_self` (dropping the target's own key) and scopes the context to
 //! the target's own task split, so a target's own outcome is held out of every
 //! episode's conditioning set.
 //!
-//! ## Held-out **task** split (the HIGH meta-overfitting contract)
+//! ## Held-out **task** split
 //!
 //! Generalisation is evaluated on held-out *tasks*, not held-out *points*: the
 //! distinct values of the task column are partitioned, the predictor trains on
@@ -74,8 +74,8 @@ use crate::predict::conformal::{ConformalModel, IntervalScore};
 use crate::session::InferenceSession;
 
 /// Shape of the predictive-distribution head the predictor emits and the
-/// objective scores — the S18 output families, selected by config rather than by
-/// a tensor op the caller writes.
+/// objective scores — the distributional output families, selected by config
+/// rather than by a tensor op the caller writes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum PredictiveHead {
@@ -93,7 +93,7 @@ pub enum PredictiveHead {
 }
 
 /// Which proper score a [`PredictiveHead::Gaussian`] head trains against — the
-/// S18 objectives, reused, never reinvented here.
+/// `regression_loss` proper scores, reused, never reinvented here.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum GaussianObjective {
     /// (β-)Gaussian negative log-likelihood; `beta` in `[0, 1]`, `0` the plain
@@ -117,7 +117,7 @@ impl PredictiveHead {
     }
 
     /// Score `preds` (`[B, head_width]`) against the held-out target `y` (`[B]`)
-    /// with this head's S18 proper-scoring objective — the training loss, and
+    /// with this head's proper-scoring objective — the training loss, and
     /// the same objective a consumer evaluates a held-out-task generalisation
     /// gap with. No new loss code: dispatches to the `regression_loss` proper
     /// scores the fine-tune trainer also uses.
@@ -353,7 +353,7 @@ pub struct SampledEpisodes {
 /// one borrow rather than a long argument list.
 struct EpisodeSampling<'a> {
     source_id: &'a str,
-    /// The pinned source embedding table (M1): the target vector and the
+    /// The pinned source embedding table: the target vector and the
     /// context members' vectors both read through this ONE resolution
     /// (`ResultStore::pinned_provider`), so a trained checkpoint's rows
     /// can never straddle a version publish mid-run.
@@ -406,9 +406,9 @@ impl InferenceSession {
     /// Sample the episodic meta-dataset for `spec` over `source_id`'s embedding
     /// table, partitioning distinct **tasks** (not points) into train/test.
     ///
-    /// For each target row in a task, the context is assembled through S16's
-    /// retrieval with `exclude_self` and a same-task split (the leakage
-    /// contract), the surviving members' x-vectors and y-labels are read back
+    /// For each target row in a task, the context is assembled through
+    /// context-set retrieval with `exclude_self` and a same-task split (the
+    /// leakage guards), the surviving members' x-vectors and y-labels are read back
     /// **through the generic SQL surface**, and a padded [`ContextEpisode`] plus
     /// the held-out target `y` are built. The task's targets become one
     /// [`EpisodeBatch`].
@@ -428,7 +428,7 @@ impl InferenceSession {
             .catalog()
             .resolve_embedding_table(source_id, None)
             .await?;
-        // ONE resolution of the source table's current version (M1): the
+        // ONE resolution of the source table's current version: the
         // per-target target vector and member vectors below both read
         // through this pin, never a second, independent resolve of
         // `current_version` — a trained checkpoint's rows can never
@@ -563,10 +563,9 @@ impl InferenceSession {
         };
         // One of the three durable submit edges for a `TrainingSpec` — see
         // `admit_training_spec`'s own doc for the other two. Consuming
-        // `training_spec` here (the witness enforcement, #573 round 2)
-        // leaves no path below this line that could submit the
-        // pre-admission value. This function builds no `SubmitJobParams` of
-        // its own (#573 round 3, N3-seam):
+        // `training_spec` here leaves no path below this line that could
+        // submit the pre-admission value. This function builds no
+        // `SubmitJobParams` of its own:
         // [`crate::fine_tune::spec::submit_admitted_training`] is the one
         // place that construction happens.
         let admitted =
@@ -770,10 +769,10 @@ impl InferenceSession {
         let mut contexts = Vec::with_capacity(targets.len());
         for (target_key, target_y) in &targets {
             // The target's own stored vector, read through the SAME pin
-            // (M1) `read_member_vectors` below reads the context members
+            // `read_member_vectors` below reads the context members
             // through — a one-key slice, rather than `read_vector_by_key`
-            // (that helper is `search_by_id`'s read path, out of class for
-            // a persisting producer): the target's vector and its context
+            // (that helper is `search_by_id`'s read path, not a persisting
+            // producer's): the target's vector and its context
             // members must agree on one version, or the checkpoint this
             // episode trains could learn from a target/member pair that
             // straddled a version publish.
@@ -789,7 +788,7 @@ impl InferenceSession {
                     ))
                 })?;
 
-            // S16 retrieval, leakage-scoped: exclude_self drops the target's own
+            // Context-set retrieval, leakage-scoped: exclude_self drops the target's own
             // key, the split keeps the context inside the same task — so the
             // target's outcome can never enter its own context, in or across
             // episodes. value_columns hydrates the members' y-labels in key order.
@@ -800,7 +799,7 @@ impl InferenceSession {
             request.split = Some(split.clone());
             request.aggregator = SetAggregator::Mean;
             request.value_columns = vec![env.spec.value_column.clone()];
-            // M2 (round 5): `env.table` is already a held `PinnedSource` (see
+            // `env.table` is already a held `PinnedSource` (see
             // its field doc); calling `assemble_context` here would resolve a
             // SECOND, independent pin for the member set/vectors/value rows
             // while `target_x` above and `member_x` below read through the
@@ -1003,8 +1002,8 @@ impl InferenceSession {
             },
             metrics: None,
             // The episodic in-context-predictor path has no per-epoch
-            // checkpointing (unit 348 is fine-tune-specific; v1 out of
-            // scope here) — nothing to register.
+            // checkpointing (per-epoch checkpoints are fine-tune-specific) —
+            // nothing to register.
             epoch_checkpoints: Vec::new(),
             // `ProducingDescriptor::FineTune` covers only the column-source
             // `TrainingSpec::FineTune` kind (its own doc); a context
@@ -1015,7 +1014,7 @@ impl InferenceSession {
 }
 
 /// A served predictive distribution for one target — the trained head floats run
-/// through the S18 [`DistributionAdapter`], so a Gaussian head yields a
+/// through the [`DistributionAdapter`], so a Gaussian head yields a
 /// `(mean, std)` and a quantile head an ascending `(level, value)` set. This is
 /// exactly the per-row distribution the fine-tune regression serving path emits;
 /// the only difference is the head was produced by an in-context forward over a
@@ -1069,7 +1068,8 @@ impl PredictedDistribution {
 }
 
 /// The live-context source a served predictor assembles each target's context
-/// from. `Ann` reproduces S16 retrieval (using the trained `context_k`);
+/// from. `Ann` reproduces the training-time retrieval (using the trained
+/// `context_k`);
 /// `Edges`/`Hybrid` re-gather against a *pinned* declared-edge snapshot so a
 /// graph-conditioned predictor conditions on the consumer's declared relations.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1207,8 +1207,7 @@ impl InferenceSession {
         let record = self.catalog().get_model(model_id).await?.ok_or_else(|| {
             JammiError::Catalog(format!("context predictor '{model_id}' not found"))
         })?;
-        // Advisory 2 (esc-089 fold, id-shape backstop's second member): unlike
-        // a fine-tuned id, a context-predictor id is caller-chosen and carries
+        // Unlike a fine-tuned id, a context-predictor id is caller-chosen and carries
         // no reserved prefix `ModelResolver::try_catalog_lookup` can cross-check
         // by shape, so this surface asserts its own row-shape invariant
         // directly — every row this call reads must actually BE a
@@ -1363,8 +1362,7 @@ impl InferenceSession {
         // does not even parse as a storage URL) is a client-visible
         // precondition failure, not this surface's own `JammiError::Inference`
         // — `JammiError::Model` mirrors `ModelResolver`'s fine-tuned reload
-        // arm (`resolver.rs`) exactly, so both surfaces genuinely agree
-        // (round-3 audit F3) rather than merely claiming to.
+        // arm (`resolver.rs`) exactly, so both surfaces agree.
         let prefix = record
             .artifact_path
             .as_deref()
@@ -1380,9 +1378,8 @@ impl InferenceSession {
                      storage URL: {e} — this catalog record's pointer is corrupted"
                 ),
             })?;
-        // esc-089 negative control (sibling reload surface): re-type two
-        // DISTINCT typed storage outcomes this arm must NOT conflate (F2/F3,
-        // round-3 audit), matching `ModelResolver`'s fine-tuned reload arm so
+        // Re-type two DISTINCT typed storage outcomes this arm must NOT
+        // conflate, matching `ModelResolver`'s fine-tuned reload arm so
         // both surfaces agree:
         //
         //   - `StorageError::NotPublished` — no manifest is in hand at all.
@@ -1457,11 +1454,11 @@ impl InferenceSession {
     /// running the predictor's in-context forward once — no gradient update.
     ///
     /// The target's own stored vector is read by key (an ordinary SQL-surface
-    /// read), used as the retrieval query, and the S16 context is assembled with
+    /// read), used as the retrieval query, and the context set is assembled with
     /// `exclude_self` on (the target never enters its own context) and the
     /// served predictor's serving split. The padded episode flows through one
     /// `forward` to the `[1, head_width]` head, and those floats run through the
-    /// S18 [`DistributionAdapter`] for the served distribution — the same
+    /// [`DistributionAdapter`] for the served distribution — the same
     /// float→distribution transform the fine-tune regression path serves
     /// through.
     ///
@@ -1491,18 +1488,15 @@ impl InferenceSession {
     /// A graph-conditioned prediction is therefore never *unattributed*: the
     /// `source` fact and the neighbour keys ride out of the serving layer so
     /// governance can see how the context was built and decide whether a marginal
-    /// coverage claim over it is sound — exactly the seam S16-G's coverage
-    /// doctrine requires (the engine surfaces the fact; governance chooses the
-    /// lever).
+    /// coverage claim over it is sound (the engine surfaces the fact; governance
+    /// chooses the lever).
     pub async fn predict_with_context_predictor_provenanced(
         self: &Arc<Self>,
         served: &ServedContextPredictor,
         target_key: &str,
     ) -> Result<PredictionWithProvenance> {
-        // `current_version_provider` (the record-taking, per-call resolver)
-        // left the public surface with M1: a PERSISTING producer must not
-        // assemble its own read from a bare `&ResultTableRecord`, and this
-        // serve is a persisting producer's read path (it feeds
+        // A PERSISTING producer must not assemble its own read from a bare
+        // `&ResultTableRecord`, and this serve is a persisting producer's read path (it feeds
         // `PredictionWithProvenance`, whose `source` fact is durable
         // provenance). So this serve — like the training sampler — pins
         // once per call via `pin_current_version`: the target's own vector
@@ -1544,7 +1538,7 @@ impl InferenceSession {
         // did, so the live predict hydrates the value column exactly as the
         // episodic sampler did.
         request.value_columns = vec![served.value_column.clone()];
-        // M2 (round 5): `pin` above is the one resolution `target_x` and
+        // `pin` above is the one resolution `target_x` and
         // `member_x` below both read through; `assemble_context` would take
         // a SECOND, independent pin for the member set/vectors/value rows,
         // reopening the exact straddle this serve pins once to close.
@@ -1578,7 +1572,7 @@ impl InferenceSession {
         )?;
 
         // The head is in z-space (it trained against z-scored targets and σ). The
-        // S18 adapter turns the raw floats into a z-space distribution; that
+        // distribution adapter turns the raw floats into a z-space distribution; that
         // distribution is then de-standardised back to raw outcome units —
         // `mean → μ_y + σ_y·z_mean`, `σ → σ_y·σ_z` (re-floored), quantiles
         // `→ μ_y + σ_y·z_q`. De-standardising the *distribution* (not the raw
@@ -1602,7 +1596,7 @@ impl InferenceSession {
 /// the predictive distribution, the assembly `source` fact, and the context
 /// member keys. The `source` fact and keys are what ride the uncertainty-channel
 /// `context_ref` provenance — so a marginal claim over a graph-assembled context
-/// is never unattributed (the S16-G coverage contract).
+/// is never unattributed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PredictionWithProvenance {
     /// The served predictive distribution (Gaussian or quantiles).
@@ -1649,7 +1643,7 @@ fn destandardize_distribution(
 }
 
 /// Turn a `[1, head_width]` head tensor into a [`PredictedDistribution`] through
-/// the S18 [`DistributionAdapter`] for the given form. One target, so the
+/// the [`DistributionAdapter`] for the given form. One target, so the
 /// adapter serves a single row; its `(mean, std)` or sorted `quantile_{level}`
 /// columns are read back into the typed distribution.
 fn distribution_from_head(head: &Tensor, form: &DistributionForm) -> Result<PredictedDistribution> {
@@ -1701,9 +1695,8 @@ fn distribution_from_head(head: &Tensor, form: &DistributionForm) -> Result<Pred
 /// [`ConformalModel`] plus the served predictor's distribution form, so a
 /// `predict` output is turned into a coverage-guaranteed interval. The
 /// calibration set is **held-out tasks** (never the training tasks) — an
-/// amortized posterior is sharp but not automatically calibrated (the HIGH
-/// calibration contract), so the S17 conformal wrap restores coverage over a
-/// disjoint calibration split.
+/// amortized posterior is sharp but not automatically calibrated, so the
+/// conformal wrap restores coverage over a disjoint calibration split.
 pub struct ConformalContextPredictor {
     conformal: ConformalModel,
     form: DistributionForm,
@@ -1749,14 +1742,14 @@ impl ConformalContextPredictor {
 /// The conformal calibration lever a caller / governance supplies. The engine
 /// **applies** the chosen lever; it never **chooses** one. `Marginal` is the
 /// default and always serves; `Mondrian`/`Weighted` route to the group-
-/// conditional / importance-weighted S17 constructors with caller-supplied
-/// cohorts / weights (one per calibration point).
+/// conditional / importance-weighted [`ConformalModel`] constructors with
+/// caller-supplied cohorts / weights (one per calibration point).
 ///
 /// Graph-assembled context can break the exchangeability split-conformal
 /// *marginal* coverage assumes; the levers are the honest repair — but *which*
-/// cohort or weights, and *whether* to apply them, is governance's call (the
-/// verbatim doctrine: "choosing the cohorts is governance, not a serving
-/// output"). The engine surfaces the `source` fact and applies what it is told.
+/// cohort or weights, and *whether* to apply them, is governance's call:
+/// choosing the cohorts is governance, not a serving output. The engine surfaces the `source` fact
+/// and applies what it is told.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConformalLevers {
     /// Plain marginal split-conformal (the default; always serves).
@@ -1782,15 +1775,16 @@ impl InferenceSession {
     /// the in-context forward, and the conformal score is taken against the
     /// observed outcome: `|y - μ|` for a Gaussian head (absolute-residual), or
     /// `max(q_lo - y, y - q_hi)` for a quantile head (CQR). The finite-sample
-    /// quantile of those scores at `alpha` is the wrap's threshold. Composes S17
-    /// — it does not modify the conformal primitive, only feeds it.
+    /// quantile of those scores at `alpha` is the wrap's threshold. Composes
+    /// [`ConformalModel`] — it does not modify the conformal primitive, only
+    /// feeds it.
     ///
     /// `levers` is the caller / governance choice of marginal (the default,
     /// which always serves), Mondrian (group-conditional), or weighted
     /// (importance-weighted) calibration — *applied* here, never *chosen* here.
     /// Graph-assembled context can break exchangeability; supplying a cohort or
     /// weights is the honest repair, but the choice is governance's, not the
-    /// engine's (the verbatim conformal doctrine).
+    /// engine's.
     pub async fn calibrate_context_predictor_conformal(
         self: &Arc<Self>,
         served: &ServedContextPredictor,
@@ -1854,7 +1848,7 @@ impl InferenceSession {
         };
         // The score family decides which arrays carry signal (point estimates for
         // absolute-residual, quantile bounds for CQR); the lever decides which
-        // existing S17 constructor those feed. `Marginal` reproduces the plain
+        // existing `ConformalModel` constructor those feed. `Marginal` reproduces the plain
         // split-conformal interval exactly.
         let conformal = match &levers {
             ConformalLevers::Marginal => {
@@ -2254,8 +2248,8 @@ mod tests {
     /// Tensorise one task's raw contexts into an [`EpisodeBatch`], z-scoring both
     /// the context members' `y` and the held-out target `y` with `scaler` when one
     /// is supplied — the engine's standardised path. With `scaler = None` the raw
-    /// outcomes go in untouched: the pre-fix behaviour, kept so the oracle can show
-    /// the collapse the standardisation repairs.
+    /// outcomes go in untouched: the un-standardised control, so the oracle can
+    /// show the collapse the standardisation repairs.
     fn batch_from_raw(
         rows: &[TargetContext],
         scaler: Option<&TargetScaler>,
@@ -2350,7 +2344,7 @@ mod tests {
         )
         .unwrap();
 
-        // Serve the first probe target: one forward → the S18 distribution → the
+        // Serve the first probe target: one forward → the adapter distribution → the
         // de-standardising affine (the served path's transform).
         let head = predictor.forward(&probe.episode).unwrap();
         let row0 = head.narrow(0, 0, 1).unwrap();
@@ -2370,7 +2364,7 @@ mod tests {
     /// `(level, value)` pairs at the first probe target — read back through the
     /// exact serving parse ([`distribution_from_head`] → [`destandardize_distribution`]),
     /// so the assertion sees only what the served path would emit. The de-standardise
-    /// is the identity when `scaler` is `None` (the pre-fix arm).
+    /// is the identity when `scaler` is `None` (the un-standardised control arm).
     fn train_and_serve_first_quantiles(
         spec: &ContextPredictorTrainConfig,
         batches: &[EpisodeBatch],
@@ -2406,7 +2400,7 @@ mod tests {
         .unwrap();
 
         // Serve the first probe target through the quantile form: one forward → the
-        // S18 quantile distribution (sorted, non-crossing) → the de-standardising
+        // adapter's quantile distribution (sorted, non-crossing) → the de-standardising
         // affine — the served path's transform, end to end.
         let head = predictor.forward(&probe.episode).unwrap();
         let row0 = head.narrow(0, 0, 1).unwrap();
@@ -2424,10 +2418,10 @@ mod tests {
 
     /// ORACLE: the amortized in-context Gaussian predictor must serve a mean ≈ the
     /// true high-offset target mean (calendar years ≈ 2017) with a real,
-    /// non-collapsed σ — and the raw (un-standardised) path it replaced must
-    /// collapse (mean far off, σ pinned at the floor). This is the exact failure
-    /// the published `train_context_predictor(output="gaussian", value_column=
-    /// "year")` exhibited: mean ≈ 2163, σ ≈ 0.001 on every row.
+    /// non-collapsed σ — and the raw (un-standardised) control path must
+    /// collapse (mean far off, σ pinned at the floor), the failure an
+    /// un-standardised `train_context_predictor(output="gaussian", value_column=
+    /// "year")` shows: mean ≈ 2163, σ ≈ 0.001 on every row.
     ///
     /// The standardised path z-scores both the context members' `y` and the
     /// held-out target `y` with one train-derived scaler, trains the head in
@@ -2460,7 +2454,7 @@ mod tests {
             .map(|r| batch_from_raw(r, Some(&scaler), k, &device))
             .collect();
 
-        // The standardised (fixed) path: served mean lands near the true mean and
+        // The standardised path: served mean lands near the true mean and
         // σ is a real spread (well above the floor).
         let (mean, sigma) =
             train_and_serve_first(&spec, &std_batches, &probe, Some(&scaler), &device);
@@ -2476,9 +2470,8 @@ mod tests {
              (the target spread is ≈ 2; a real σ must be well off the floor)"
         );
 
-        // The pre-fix (raw, un-standardised) path collapses: the head cannot reach
-        // the high offset under Adam and the σ pins near the floor. This is the
-        // arm that fails on main (no standardisation), demonstrating the bug.
+        // The raw, un-standardised control path collapses: the head cannot reach
+        // the high offset under Adam and the σ pins near the floor.
         let raw_batches: Vec<EpisodeBatch> = raw_per_task
             .iter()
             .map(|r| batch_from_raw(r, None, k, &device))
@@ -2491,8 +2484,8 @@ mod tests {
         // a non-finite served value — the un-standardised path is numerically
         // unstable on a high offset and sometimes diverges to NaN/∞ outright. A
         // non-finite mean is the strongest possible evidence of collapse, so it
-        // must count here; the prior predicate let `NaN > 100 || NaN < 0.05`
-        // (both false) masquerade as a fit and flake the oracle.
+        // must count here: `NaN > 100 || NaN < 0.05` alone is false for NaN and
+        // would read as a fit.
         let collapsed = !raw_mean.is_finite()
             || !raw_sigma.is_finite()
             || (raw_mean as f64 - true_mean).abs() > 100.0
@@ -2501,24 +2494,21 @@ mod tests {
             collapsed,
             "the un-standardised path was expected to collapse on a high-offset \
              target (non-finite, mean far off, OR σ pinned at the floor), but \
-             served mean {raw_mean}, σ {raw_sigma} — if this no longer collapses \
+             served mean {raw_mean}, σ {raw_sigma} — if this does not collapse \
              the oracle is not exercising the bug"
         );
     }
 
     /// ORACLE (quantile peer): the amortized in-context **quantile** predictor must
     /// serve quantiles that bracket the true high-offset target mean (calendar years
-    /// ≈ 2017), ascending and non-crossing — and the raw (un-standardised) path it
-    /// replaced must collapse exactly as the Gaussian peer's does. This closes PR1's
-    /// thesis to all four offset-bearing heads: the context-predictor quantile head
-    /// is the last one without a high-offset train-to-fit behavioural oracle.
+    /// ≈ 2017), ascending and non-crossing — and the raw (un-standardised) control
+    /// path must collapse exactly as the Gaussian peer's does.
     ///
     /// The assertion reads the **served, de-standardised** `(level, value)` pairs —
     /// the same [`distribution_from_head`] → [`destandardize_distribution`] parse the
-    /// serving path runs — so, exactly as the auditor proved for the Gaussian case,
-    /// the fit assertion would FAIL if the `TargetScaler` reparameterisation were
-    /// bypassed: a raw-space pinball head crawls ≈ lr·steps units under Adam and
-    /// stalls thousands short of 2017, which is the collapse arm below.
+    /// serving path runs — so, as for the Gaussian case, the fit assertion would FAIL if the
+    /// `TargetScaler` reparameterisation were bypassed: a raw-space pinball head crawls ≈ lr·steps
+    /// units under Adam and stalls thousands short of 2017, which is the collapse arm below.
     #[test]
     fn quantile_in_context_head_fits_high_offset_low_variance_target() {
         let device = Device::Cpu;
@@ -2543,7 +2533,7 @@ mod tests {
             .map(|r| batch_from_raw(r, Some(&scaler), k, &device))
             .collect();
 
-        // The standardised (fixed) path: the served quantiles are ascending
+        // The standardised path: the served quantiles are ascending
         // (non-crossing) and each lands near the true mean (a low-variance target,
         // so the spread between the 0.1 and 0.9 levels is small relative to the bar).
         let served =
@@ -2579,14 +2569,12 @@ mod tests {
             );
         }
 
-        // NON-VACUITY (the destructive experiment): the pre-fix, un-standardised
-        // path must FAIL the very fit bar the standardised path just cleared. The
-        // pinball head cannot reach the high offset under Adam from its ≈0 init, so
-        // at least one served level strands far from 2017 (or goes non-finite). This
-        // is the arm that fails on main: it proves the fit above is bought by the
-        // `TargetScaler` reparameterisation and not by the budget alone — exactly
-        // the experiment the auditor ran for the Gaussian peer, now read back
-        // through the identical served-quantile parse.
+        // NON-VACUITY: the un-standardised control path must FAIL the very fit
+        // bar the standardised path just cleared. The pinball head cannot reach
+        // the high offset under Adam from its ≈0 init, so at least one served
+        // level strands far from 2017 (or goes non-finite). This proves the fit
+        // above is bought by the `TargetScaler` reparameterisation and not by the
+        // budget alone, read back through the identical served-quantile parse.
         let raw_batches: Vec<EpisodeBatch> = raw_per_task
             .iter()
             .map(|r| batch_from_raw(r, None, k, &device))

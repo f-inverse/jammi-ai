@@ -1,5 +1,5 @@
-//! Distributional regression objectives (S18): the stateless, batched autodiff
-//! peers of the R2 calibration metrics and the inference adapter's σ map.
+//! Distributional regression objectives: the stateless, batched autodiff
+//! peers of the calibration metrics and the inference adapter's σ map.
 //!
 //! These are pure functions of a head output `(batch, k)` and a target — they
 //! read no training state, and they score the head's **z-space** output against
@@ -62,14 +62,13 @@ pub(crate) const STD_FLOOR: f64 = 1e-3;
 /// - the **in-context** predictor, via `destandardize_distribution` (which builds
 ///   the typed `PredictedDistribution`).
 ///
-/// The two paths cannot yet share the *whole* de-standardise: they apply the mean
+/// The two paths do not share the *whole* de-standardise: they apply the mean
 /// affine at different points (the fine-tune path at the backend's
 /// `TargetScaler::destandardize`, before the adapter; the in-context path inside
 /// `destandardize_distribution`, after a scaler-free adapter) and emit different
-/// output types (an Arrow `ArrayRef` vs a typed `PredictedDistribution`). Unifying
-/// the full transport is the H3 serve-path unification; until then this helper is
-/// the one shared piece of σ math, so a change to the σ rule cannot drift between
-/// the two surfaces.
+/// output types (an Arrow `ArrayRef` vs a typed `PredictedDistribution`). This
+/// helper is the one shared piece of σ math, so a change to the σ rule cannot
+/// drift between the two surfaces.
 pub(crate) fn destandardize_sigma(std_scale: f32, sigma_z: f32) -> f32 {
     (std_scale * sigma_z).max(STD_FLOOR as f32)
 }
@@ -312,7 +311,7 @@ pub(crate) fn gaussian_params(input: &Tensor) -> Result<(Tensor, Tensor)> {
 /// variance-collapse / mean-starvation pathology of joint `μ,σ²` NLL.
 ///
 /// Shares the closed form with [`jammi_numerics::calibration::gaussian_nll`]
-/// (the R2 eval metric); this is its differentiable, batched autodiff peer.
+/// (the eval metric); this is its differentiable, batched autodiff peer.
 pub(crate) fn gaussian_nll_loss(input: &Tensor, target: &Tensor, beta: f64) -> Result<Tensor> {
     let (mean, sigma) = gaussian_params(input)?;
     let var = sigma
@@ -358,7 +357,7 @@ pub(crate) fn gaussian_nll_loss(input: &Tensor, target: &Tensor, beta: f64) -> R
 /// `CRPS = σ ( z(2Φ(z) − 1) + 2φ(z) − 1/√π )`. This is exactly
 /// [`jammi_numerics::calibration::crps_gaussian`]'s closed form; here it is the
 /// differentiable, batched autodiff peer (`Φ` via `erf`, `φ` the Gaussian PDF),
-/// so the training loss and the R2 metric are one formula.
+/// so the training loss and the eval metric are one formula.
 pub(crate) fn crps_gaussian_loss(input: &Tensor, target: &Tensor) -> Result<Tensor> {
     let (mean, sigma) = gaussian_params(input)?;
     let z = ((&mean - target).map_err(|e| JammiError::FineTune(format!("crps resid: {e}")))?
@@ -493,9 +492,8 @@ pub(crate) fn softplus_std_for_test(raw: f64) -> f64 {
     STD_FLOOR + sp
 }
 
-/// K3's own standalone oracle: before this module existed, the
-/// whole-prefix-vs-loss-scale claim had only the end-to-end byte-parity pin
-/// as a witness. This proves the mechanism directly: the
+/// Standalone oracle for the target scaler (the end-to-end byte-parity pin
+/// is the other witness). This proves the mechanism directly: the
 /// scaler [`TrainingLoop::run`] builds once before the loop
 /// (`train_loader.regression_targets()`, then [`TargetScaler::from_targets`])
 /// is a function of the WHOLE train prefix's targets, never of how many

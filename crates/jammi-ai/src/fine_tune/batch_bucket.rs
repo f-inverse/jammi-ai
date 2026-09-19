@@ -1,101 +1,80 @@
 //! Sequence-length BUCKETING at the fine-tune trainer's own
 //! batch-construction seam.
 //!
-//! ## The mechanism this closes
+//! ## Why bucket
 //!
-//! `crates/jammi-encoders/tests/esc076_comparable_eager_control.rs`'s D3
-//! ATTRIBUTION (campaign #443 W2c, read there — not owned by this crate, not
-//! edited by this module) pins the root cause precisely: `cudarc` (and
-//! candle-core's own CUDA backend, which allocates through the same
-//! `CudaDevice::alloc`/`alloc_zeros` primitives) has NO caching allocator —
-//! every tensor is a raw `cuMemAlloc`/`cuMemFree` pair. A raw, non-pooling
-//! allocator fed a training loop whose per-step tensor shapes are NOT drawn
-//! from a small, fixed set fragments/grows its reserved footprint with the
-//! COUNT of DISTINCT shapes it has ever been asked to satisfy, independent
-//! of dtype — the ledger's own "duplicated-batch legs plateau; variable-shape
-//! legs OOM" finding is exactly this. `jammi-encoders`' own per-op eager
-//! fallbacks cannot fix this without corrupting the math (padding an
-//! activation INSIDE a mean/variance reduction fabricates values); the D3
-//! doc names the sound fix point as "the trainer's own batch-construction
-//! step (padding/bucketing sequence lengths to a small, fixed set of
-//! buckets)" — this module, and its TRAINING-STEP call site in
+//! `cudarc` (and candle-core's own CUDA backend, which allocates through the
+//! same `CudaDevice::alloc`/`alloc_zeros` primitives) has NO caching
+//! allocator — every tensor is a raw `cuMemAlloc`/`cuMemFree` pair. A raw,
+//! non-pooling allocator fed a training loop whose per-step tensor shapes are
+//! NOT drawn from a small, fixed set fragments/grows its reserved footprint
+//! with the COUNT of DISTINCT shapes it has ever been asked to satisfy,
+//! independent of dtype: duplicated-batch runs plateau, variable-shape runs
+//! OOM (`crates/jammi-encoders/tests/esc076_comparable_eager_control.rs`
+//! measures this). `jammi-encoders`' per-op eager fallbacks cannot fix this
+//! without corrupting the math (padding an activation INSIDE a mean/variance
+//! reduction fabricates values), so the fix point is the trainer's own
+//! batch-construction step — this module, and its TRAINING-STEP call site in
 //! `TrainingLoop::encode_texts` (`tokenize_and_bucket`).
 //!
-//! **Eval amendment (adversarial-audit round 2, campaign #443, item 3;
-//! bound corrected per r3 finding B4 — read `tokenize_natural_width`'s own
-//! doc for the full argument, this is only the summary):** bucketing is a
-//! TRAINING-STEP-only concern — it bounds the allocator's distinct-shape
-//! count across a sequence of per-step batches that is UNBOUNDED across
-//! the whole run. An eval pass (`evaluate`/`evaluate_held_out`) is bounded
-//! on a DIFFERENT axis than "how often it runs": its held-out/val
-//! partition is DETERMINISTIC (same rows, same batch order, every pass),
-//! so it re-presents the IDENTICAL width sequence each time — its
-//! distinct-shape contribution is paid ONCE per run, never growing
-//! per-step or per-epoch, regardless of `eval_cadence`. That one-time set's
-//! SIZE is still caller-dependent (bounded by the split's own natural-width
-//! diversity, not by this ladder), so this exemption RESTORES the
-//! pre-esc-076 eval baseline rather than newly bounding it — esc-076
-//! remains OPEN on that residual, caller-dependent axis. `encode_texts`
-//! only calls into this module while `self.training_mode` is `true`; while
-//! evaluating (`training_mode == false`) it calls the natural-width
-//! sibling `tokenize_natural_width` instead — see that function's own doc
-//! for the measured OOM (a real 321-token held-out batch bucketed up to
-//! the 512 rung) this exemption closes.
+//! **Eval is not bucketed** (see `tokenize_natural_width`'s doc for the full
+//! argument): bucketing bounds the allocator's distinct-shape count across a
+//! sequence of per-step batches that is UNBOUNDED across the whole run. An
+//! eval pass (`evaluate`/`evaluate_held_out`) re-presents a DETERMINISTIC
+//! held-out/val partition (same rows, same batch order, every pass), so its
+//! distinct-shape contribution is paid ONCE per run, never growing per-step
+//! or per-epoch, regardless of `eval_cadence`. That one-time set's SIZE is
+//! still caller-dependent (bounded by the split's own natural-width
+//! diversity, not by this ladder). `encode_texts` only calls into this module
+//! while `self.training_mode` is `true`; while evaluating it calls the
+//! natural-width sibling `tokenize_natural_width` instead — bucketing a
+//! 321-token held-out batch up to the 512 rung OOMs.
 //!
 //! ## Bucket DECISION lives in `jammi-numerics`, not here
 //!
 //! [`bucket_seq_len`] (re-exported from `jammi_numerics::bucket_seq_len`,
-//! see that function's own doc for the full ladder design and rationale) is
-//! a pure `usize -> usize` decision with no tensor/row dependency —
-//! `jammi-encoders`' own D3 GPU oracle
-//! (`tests/esc076_comparable_eager_control.rs`) needs the IDENTICAL decision
-//! to prove the fix bounds memory at the library seam, and campaign #443's
-//! dependency-direction rule forbids `jammi-encoders` depending on
-//! `jammi-ai` (this crate) — `jammi-numerics` is the shared, candle-free
-//! crate both already depend on, so the decision moved there; this module
-//! keeps only the row-mutating half ([`pad_rows_to_bucket`]) and its own
-//! call site.
+//! see that function's own doc for the ladder design) is a pure
+//! `usize -> usize` decision with no tensor/row dependency. `jammi-encoders`'
+//! GPU oracle needs the IDENTICAL decision and must not depend on `jammi-ai`,
+//! so the decision lives in `jammi-numerics`, the candle-free crate both
+//! depend on; this module keeps only the row-mutating half
+//! ([`pad_rows_to_bucket`]) and its call site.
 //!
-//! ## Correctness (K2/K7): padded positions are FULLY masked, never a wrong
-//! answer wearing a fixed shape
+//! ## Correctness: padded positions are FULLY masked, never a wrong answer
+//! wearing a fixed shape
 //!
 //! [`pad_rows_to_bucket`] extends each row's `input_ids` with `pad_id` (`0`
 //! — `crates/jammi-ai/src/model/tokenizer.rs`'s `TokenizerWrapper::from_file`
 //! never overrides `tokenizers::PaddingParams::default()`'s own `pad_id: 0`,
 //! so this is the SAME pad value the tokenizer's own `BatchLongest` padding
-//! already used for every row shorter than the batch's natural width — this
-//! module never invents a second padding convention) and its
+//! uses for every row shorter than the batch's natural width) and its
 //! `attention_mask` with `0` (fully masked — the identical mechanism
-//! `BatchLongest` already relies on for intra-batch length variance; this
-//! module only extends how FAR that trailing zero run goes, never how it is
+//! `BatchLongest` relies on for intra-batch length variance; this module
+//! only extends how FAR that trailing zero run goes, never how it is
 //! interpreted downstream). `bucketed_and_natural_batches_produce_the_same_
-//! pooled_output` (this module's own unit test, below) proves this
-//! output-invariance claim on a real encoder rather than asserting it from
-//! the padding contract alone; `crate::fine_tune::trainer`'s own
-//! `encode_texts_bucketing_oracle` module proves the same property AND
-//! shape-bucketing itself at the real production call site
-//! (`TrainingLoop::encode_texts`'s `EncoderAdapters` branch, via that
-//! file's own `tokenize_and_bucket` helper — the sole caller of
-//! [`pad_rows_to_bucket`] outside this module's tests), since a unit test
-//! that only calls [`pad_rows_to_bucket`] directly cannot catch the call
-//! site itself going unwired.
+//! pooled_output` (below) proves this output-invariance on a real encoder;
+//! `crate::fine_tune::trainer`'s `encode_texts_bucketing_oracle` module
+//! proves the same property AND shape-bucketing itself at the production
+//! call site (`TrainingLoop::encode_texts`'s `EncoderAdapters` branch, via
+//! `tokenize_and_bucket` — the sole caller of [`pad_rows_to_bucket`] outside
+//! this module's tests), since a unit test that only calls
+//! [`pad_rows_to_bucket`] directly cannot catch the call site going unwired.
 
 /// Re-exported from `jammi_numerics::bucket_seq_len`/`MIN_BUCKET_LEN` — see
 /// that function's own doc for the full ladder design, and this module's own
 /// doc ("Bucket DECISION lives in `jammi-numerics`, not here") for why the
-/// decision moved out of this crate. Re-exported (not merely called
+/// decision lives outside this crate. Re-exported (not merely called
 /// fully-qualified at the one call site below) so this file's own tests keep
 /// exercising the exact names this crate's call site imports.
 pub use jammi_numerics::{bucket_seq_len, MIN_BUCKET_LEN};
 
 /// The bucket rung a batch's rows are padded to: `pinned`, if the caller
 /// supplies one, or [`bucket_seq_len`] of THIS batch's own natural width
-/// otherwise (every reachable call site today, including a real gang — see
+/// otherwise (every production call site, including a real gang — see
 /// below).
 ///
-/// **Why a real gang does NOT need to pin one (corrected, U4b — design
-/// pressure round, finding 6; an earlier revision of this doc claimed the
-/// opposite).** The gather DESIGN.md §4 defines concatenates each rank's
+/// **Why a real gang does NOT need to pin one.** The cross-rank gather
+/// concatenates each rank's
 /// POOLED `[rows, hidden]` output along dim 0 (the row axis) — never along
 /// dim 1, the sequence axis this bucket rung governs. Two ranks whose local
 /// batches bucket to two DIFFERENT rungs still produce IDENTICAL trailing
@@ -110,11 +89,9 @@ pub use jammi_numerics::{bucket_seq_len, MIN_BUCKET_LEN};
 /// `1e-4`/`1e-5`-scale bound on a padded-vs-natural-width forward, not a
 /// bit-identity claim) — never a reason to force every rank onto one rung.
 ///
-/// `pinned` itself stays a real, callable parameter — DESIGN.md §2 still
-/// names rung-pinning as an OPTION a future caller could exercise (e.g. to
-/// bound the per-run distinct-shape count across ranks, esc-076's own
-/// concern, rather than for gather correctness) — just not one this unit
-/// wires to any call site.
+/// `pinned` is a real, callable parameter for a caller that wants to bound
+/// the per-run distinct-shape count across ranks (an allocator concern, not
+/// a gather-correctness one); no production call site sets it.
 pub fn resolve_bucket_rung(
     natural_cols: usize,
     effective_max: usize,
@@ -156,8 +133,8 @@ mod tests {
     use super::*;
 
     /// `None` reproduces exactly what an unconditional `bucket_seq_len` call
-    /// computes — the W=1 parity oracle for `resolve_bucket_rung`'s only
-    /// reachable arm today.
+    /// computes — the W=1 parity oracle for `resolve_bucket_rung`'s
+    /// production arm.
     #[test]
     fn resolve_bucket_rung_with_no_pin_matches_bucket_seq_len() {
         for natural in [1usize, MIN_BUCKET_LEN, MIN_BUCKET_LEN + 1, 9, 200] {
@@ -202,7 +179,7 @@ mod tests {
 
     #[test]
     fn bucket_seq_len_never_exceeds_max_seq_length() {
-        // esc-076's own reporter shape: max_seq_length = 128.
+        // A common encoder shape: max_seq_length = 128.
         for natural in 0..=128 {
             let bucketed = bucket_seq_len(natural, 128);
             assert!(
@@ -219,9 +196,9 @@ mod tests {
     #[test]
     fn bucket_seq_len_the_full_ladder_for_esc076_reporter_max_seq_length() {
         // The exact bucket SET a `max_seq_length = 128` run ever presents to
-        // the encoder, over every possible natural width — this is the
-        // "small, fixed set of buckets" the D3 attribution names as the fix:
-        // 5 distinct shapes, never 128.
+        // the encoder, over every possible natural width — the "small, fixed
+        // set of buckets" that bounds the allocator: 5 distinct shapes,
+        // never 128.
         let mut seen = std::collections::BTreeSet::new();
         for natural in 1..=128 {
             seen.insert(bucket_seq_len(natural, 128));
@@ -286,13 +263,11 @@ mod tests {
         assert_eq!(masks[0], vec![1, 1, 0, 0]);
     }
 
-    /// K2/K7 CORRECTNESS OBLIGATION (esc-076 contract item 2): the SAME
-    /// batch, encoded once at its natural (unbucketed) width and once
-    /// bucketed via [`bucket_seq_len`]/[`pad_rows_to_bucket`], must produce
-    /// the SAME pooled output — bucketing is a shape-canonicalization knob,
-    /// never an output-affecting one (if it were, it would need identity-
-    /// field/K7 treatment instead, per this contract's own "STOP and
-    /// report" clause).
+    /// The SAME batch, encoded once at its natural (unbucketed) width and
+    /// once bucketed via [`bucket_seq_len`]/[`pad_rows_to_bucket`], must
+    /// produce the SAME pooled output — bucketing is a shape-canonicalization
+    /// knob, never an output-affecting one (if it were, it would have to be
+    /// part of the result's identity).
     ///
     /// Reasoned correctness, then PROVEN on a real encoder rather than
     /// merely asserted from the reasoning: `jammi_encoders::pooling::
@@ -355,8 +330,7 @@ mod tests {
 
         // Two rows of DIFFERENT real-token lengths (5 and 10), matching a
         // genuine `BatchLongest` natural width of 10 — token ids kept well
-        // inside `vocab_size=256`, deterministic (family L/J: no unseeded
-        // RNG).
+        // inside `vocab_size=256`, deterministic (no unseeded RNG).
         let row_a: Vec<u32> = vec![10, 11, 12, 13, 14];
         let row_b: Vec<u32> = vec![20, 21, 22, 23, 24, 25, 26, 27, 28, 29];
         let natural_cols = row_b.len(); // BatchLongest's own natural width.

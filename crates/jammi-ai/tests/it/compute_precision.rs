@@ -164,7 +164,7 @@ async fn session_with_patents_at(
 }
 
 /// (c) The compute precision is folded into the embedding materialization
-/// identity (K7): two runs of the *same* model over the *same* input,
+/// identity: two runs of the *same* model over the *same* input,
 /// differing only in `compute_precision`, must produce different
 /// `DefinitionHash`es — never collide on one identity.
 #[tokio::test]
@@ -218,12 +218,12 @@ async fn run_embedding_and_read_definition_hash(
     (record, manifest.definition_hash)
 }
 
-/// K7, the `Inference` path specifically (classification/NER/regression) —
+/// The `Inference` path specifically (classification/NER/regression) —
 /// not just `Embedding`: two `infer()` runs of the identical model over the
 /// identical input, differing only in `compute_precision`, must produce
-/// different `DefinitionHash`es. This is the regression guard for the bug
-/// 06f22e5 shipped precision-blind: it folded `compute_precision` into
-/// `ProducingDescriptor::Embedding` only, leaving `Inference` collision-prone.
+/// different `DefinitionHash`es. `compute_precision` is folded into
+/// `ProducingDescriptor::Inference` as well as `::Embedding`; without it
+/// the two runs would collide on one identity.
 /// Folding it into `ModelIdentity` (part of `MaterializationEnv`, shared by
 /// every model-producing descriptor) fixes both at once — this proves the
 /// `Inference` half specifically.
@@ -280,12 +280,11 @@ async fn run_classification_and_read_definition_hash(
     manifest.definition_hash
 }
 
-/// Crash-coverage (adversarial-audit finding): the embedding/image/audio/
-/// regression paths cast their head output to `F32` before `to_vec::<f32>()`,
-/// but classification did not — so at `F16` the classifier emits `F16`
-/// logits and `to_vec2::<f32>()` hits candle's `UnexpectedDType`. RED before
-/// the classification-logits cast, GREEN after: this proves the cast fixed a
-/// real crash, not merely "some assertion passes".
+/// Crash coverage: every head path (embedding/image/audio/regression and
+/// classification) casts its output to `F32` before `to_vec::<f32>()`. At
+/// `F16` the classifier emits `F16` logits, and without the
+/// classification-logits cast `to_vec2::<f32>()` hits candle's
+/// `UnexpectedDType`.
 #[tokio::test]
 async fn classification_at_f16_produces_finite_confidence() {
     let dir = TempDir::new().unwrap();

@@ -1,6 +1,6 @@
-//! The training set as a producer output (#500) — the `jammi-ai` half.
+//! The training set as a producer output — the `jammi-ai` half.
 //!
-//! A tabular fine-tune no longer re-runs its source query into memory: it
+//! A tabular fine-tune does not re-run its source query into memory: it
 //! materialises the projected rows into an immutable `TrainingSet` result table
 //! through `ResultStore::materialize_training_set`, then reads that table back
 //! with the producer's own canonical `ORDER BY` re-applied. These tests pin the
@@ -131,7 +131,7 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
     let job_id = job.job_id.clone();
     job.wait().await.unwrap();
 
-    // #500 U2c §10: the pinned adapter prints below must be produced by the
+    // The pinned adapter prints below must be produced by the
     // STREAMED path, not a silently-unchanged eager one — a `test-hooks`
     // observation of the source kind `run_spec` actually bound for this job
     // (mining/GradCache are off in `parity_config`, so `whole_set_arm` is
@@ -158,49 +158,32 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
     pinned_prints(local.dir())
 }
 
-/// (c) Refactor parity — a PINNED oracle, not a RED-at-base one.
+/// (c) Refactor parity — a PINNED oracle.
 ///
 /// Every file the smallest deterministic job-path fine-tune publishes,
-/// fingerprinted at base `9db8d395` (`crates/jammi-ai/src/fine_tune/**`
-/// untouched) with the recipe that actually runs: `git checkout 9db8d395 --
-/// crates/jammi-ai/src` on ITS OWN does not work, because every OTHER test in
-/// this file references `TrainingSet` APIs (`materialize_projection`,
-/// `ResultTableKind::TrainingSet`, …) that do not exist at base, so the whole
-/// `--test it` binary fails to compile with only `src/` reverted. The working
-/// recipe is a full checkout plus a graft:
-///
-/// ```text
-/// git worktree add /tmp/base-9db8d395 9db8d395
-/// # Base predates this test file. Copy `refactor_parity` and its helpers
-/// # (`fingerprint`, `tiny_bert_model`, `parity_config`, `parity_columns`,
-/// # `session_over`, `run_parity_fixture`) into a test module in that
-/// # checkout — nothing else in this file, which would not compile there.
-/// cd /tmp/base-9db8d395
-/// cargo test -p jammi-ai --test it -- \
-///     training_set::refactor_parity --exact --nocapture
-/// ```
+/// fingerprinted as it was when the trainer read its rows straight out of the
+/// source query.
 ///
 /// Routing the rows through an immutable Parquet table instead of straight out
 /// of the source query changes *where* the trainer's rows come from; it must
 /// not change *which* rows, in *what* order, so it must not change one adapter
 /// byte. This fixture carries no NULLs, so the producer's `NULLS FIRST` order
-/// key and the base read's default NULL placement agree on it — the parity
+/// key and a plain source read's default NULL placement agree on it — the parity
 /// claim is over row order and row content, not over NULL placement.
 ///
 /// **What this pin does NOT cover.** Only the TABULAR arm
 /// (`training_set::materialize_projection`) is fingerprinted here. The graph
 /// arm never goes through `training_set` at all: it samples in memory and
-/// trains directly, with its own byte-identity pin at
-/// `graph_finetune::fine_tune_graph_end_to_end_completes`
-/// (<https://github.com/f-inverse/jammi-ai/issues/538> tracks giving it a
-/// table of its own). The `NULLS FIRST` order key is likewise stated as
+/// trains directly (it has no training-set table of its own), with its own
+/// byte-identity pin at `graph_finetune::fine_tune_graph_end_to_end_completes`.
+/// The `NULLS FIRST` order key is likewise stated as
 /// intended in `training_set`'s module docs, not pinned by (c), which carries
 /// no NULLs to exercise it.
 ///
 /// The per-step `checkpoint_N` files are pinned alongside the final adapter on
 /// purpose: they fingerprint the *trajectory*, so a row-order change that a
 /// converged final adapter might wash out still moves `checkpoint_1`. All eight
-/// files were byte-stable across repeated base runs before being pinned — a
+/// files were byte-stable across repeated runs before being pinned — a
 /// fingerprint that drifts run-to-run would make this oracle noise, not a pin.
 /// The bytes are a function of the CPU architecture — the trainer's float
 /// kernels differ between x86_64 and aarch64 — and not of the operating
@@ -249,30 +232,22 @@ async fn refactor_parity() {
     );
 }
 
-/// U2b's refactor-parity criterion, the regression shape — the fixture
+/// Refactor parity, the regression shape — the fixture
 /// extends [`refactor_parity`] (which only covers the contrastive shape)
 /// with the SAME pinned-oracle discipline over `task=regression`.
 ///
-/// Pinned at THIS unit's own base (`4e27156a`, U2b's dispatch base — U2a and
-/// U4a already landed, so `task=regression` already routed through the
-/// `TrainingSet` producer and read it back eagerly). Fingerprinted with the
-/// recipe: `git worktree add <dir> 4e27156a`, copy
-/// `regression_parity_columns`/`regression_parity_config`/
-/// `run_regression_parity_fixture`/`regression_parity_baseline_capture` (a
-/// print-only capture, no assertion) into a test module there, `cargo test
-/// -p jammi-ai --test it -- training_set::regression_parity_baseline_capture
-/// --exact --nocapture`, twice, to confirm byte-stability before pinning.
+/// Pinned from the eager `TrainingSet` read-back, run twice to confirm
+/// byte-stability before pinning.
 ///
-/// The regression fixture routes the K3 scaler (`TrainingDataLoader::
+/// The regression fixture routes the target scaler (`TrainingDataLoader::
 /// regression_targets`) and the `Regression` `TextChunk` decode
 /// (`worker::build_training_data_loader`'s regression arm) through paths
 /// [`refactor_parity`]'s contrastive fixture never exercises at all.
 ///
 /// Platform-specific like [`PARITY_ADAPTER_PRINTS`]: the Linux set is what the
-/// CI hermetic lane produced for this fixture (recorded from its run at the
-/// PR-B2 head where the Apple Silicon pin first met Linux; the next CI run
-/// re-verifies it, a drifting print failing there), the other set is from the
-/// Apple Silicon host the fixture was first pinned on.
+/// CI hermetic lane produces for this fixture (every CI run re-verifies it, a
+/// drifting print failing there), the other set is from an Apple Silicon
+/// host.
 #[cfg(target_arch = "x86_64")]
 const REGRESSION_PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
     ("adapter.safetensors", "1888:89f81b61ca42fde5"),
@@ -327,7 +302,7 @@ async fn run_regression_parity_fixture(
     let job_id = job.job_id.clone();
     job.wait().await.unwrap();
 
-    // #500 U2c §10/§11 F2: the K3 scaler and the pinned prints below must
+    // The target scaler and the pinned prints below must
     // both come from the STREAMED path.
     assert_eq!(
         jammi_ai::fine_tune::worker::training_test_hooks::source_kind_for(&job_id),
@@ -366,35 +341,28 @@ async fn regression_refactor_parity() {
     assert_eq!(
         prints, expected,
         "the adapter bytes moved: which rows the trainer sees, in which \
-         order, and how the K3 scaler is computed must stay unchanged"
+         order, and how the target scaler is computed must stay unchanged"
     );
 }
 
-/// U2b's GradCache criterion: GradCache (`FineTuneConfig::cached = true`) at `W=1`
+/// GradCache (`FineTuneConfig::cached = true`) at `W=1`
 /// on the eager `TextRows` path, digest-pinned like [`refactor_parity`]'s
 /// adapter bytes (this file's own FNV-1a [`fingerprint`], for the reason
 /// stated there: neither `sha2` nor `DefaultHasher` can back a constant
 /// pinned in source).
 ///
-/// **Provenance.** The fixture (a `Pairs`-format projection — `anchor,
-/// positive` only — of the 15-row `training_triplets.csv` source, one epoch,
-/// rank-4 LoRA, GradCache on, `MultipleNegativesRanking` at temperature 20)
-/// is recovered verbatim from `git show 803b5139:crates/jammi-ai/tests/it/
-/// streaming_loader.rs`'s `gradcache_completes_through_the_streaming_loader_
-/// at_w1_with_a_pinned_adapter_digest`, pinned there against a streaming
-/// loader that module implements. This unit's loader is the eager `TextRows`
-/// path: running the identical fixture through it produces digests
-/// BYTE-IDENTICAL to that commit's pin — the M1 chunk-for-chunk parity
-/// property holds for this fixture, so the same pinned bytes stand as this
-/// eager-path witness. Confirmed byte-stable across two repeated runs before
-/// being pinned.
+/// The fixture: a `Pairs`-format projection — `anchor, positive` only — of
+/// the 15-row `training_triplets.csv` source, one epoch, rank-4 LoRA,
+/// GradCache on, `MultipleNegativesRanking` at temperature 20. A streaming
+/// loader over the same fixture produces BYTE-IDENTICAL digests (chunk-for-
+/// chunk parity), so the same pinned bytes witness the eager path. Confirmed
+/// byte-stable across two repeated runs before being pinned.
 #[tokio::test(flavor = "multi_thread")]
 async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
     use jammi_ai::fine_tune::EmbeddingLoss;
 
     // Platform-specific like `PARITY_ADAPTER_PRINTS`: the Linux set from the
-    // CI hermetic lane at the PR-B2 head, the other from the Apple Silicon
-    // host the fixture was first pinned on.
+    // CI hermetic lane, the other from an Apple Silicon host.
     #[cfg(target_arch = "x86_64")]
     const GRADCACHE_ADAPTER_PRINTS: &[(&str, &str)] = &[
         ("adapter.safetensors", "1184:aff14fbe59384868"),
@@ -441,7 +409,7 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
         .await
         .expect("a W=1 GradCache run over the eager loader must complete");
 
-    // #500 U2c §11 F6: `whole_set_arm` must select `Resident` for a
+    // `whole_set_arm` must select `Resident` for a
     // GradCache-eligible configuration — the complementary oracle to
     // `refactor_parity`/`regression_refactor_parity`'s `Streamed`
     // observation above (mining on / GradCache on → `Resident`, never
@@ -477,14 +445,12 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
     );
 }
 
-/// #551's mining W=1 byte-parity oracle (second half; GANG3A round 3,
-/// N2-gate) — the non-vacuity control #551 names: U2b's own attempted
-/// digest test set `hard_negatives.mine = true` with NO `embedding_loss` at
-/// all, so `mining_eligible()` (which ALSO requires the in-batch-negative
-/// objective, `source.rs`'s own doc) never admitted mining, and flipping
-/// `mine` off left the pinned bytes identical because the miner never ran
-/// either way — it measured nothing. This test sets an `embedding_loss` the
-/// predicate admits (`MultipleNegativesRanking`) and drives the SAME
+/// The mining W=1 byte-parity oracle, with its non-vacuity control: a test
+/// that sets `hard_negatives.mine = true` with NO `embedding_loss` at all
+/// measures nothing, because `mining_eligible()` (which ALSO requires the
+/// in-batch-negative objective, `source.rs`'s own doc) never admits mining,
+/// and flipping `mine` off leaves the pinned bytes identical. This test sets an `embedding_loss`
+/// the predicate admits (`MultipleNegativesRanking`) and drives the SAME
 /// fixture twice, `mine` the only field that differs, then asserts the
 /// trained adapter bytes MOVE.
 ///
@@ -493,12 +459,12 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
 /// BEFORE `gradcache_eligible` (`source.rs::whole_set_arm`'s own doc), but a
 /// bare `Resident` source-kind observation is ambiguous between the two
 /// arms when both COULD be eligible — no test hook distinguishing them
-/// directly exists (a gap disclosed here, not closed). Pinning
+/// directly exists. Pinning
 /// `cached: false` removes that ambiguity structurally instead: with
 /// GradCache ineligible on this config, `Resident` cannot be explained by
 /// anything other than `WholeSetArm::Mining`.
 ///
-/// **The byte-for-byte pin, GradCache-shaped, honestly incomplete (#551).**
+/// **The byte-for-byte pin, GradCache-shaped.**
 /// Like [`gradcache_completes_at_w1_with_a_pinned_adapter_digest`],
 /// this crate's CPU backprop is demonstrably not byte-identical across
 /// CPU architectures (a measured divergence on this very fixture, not a
@@ -507,26 +473,20 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
 /// local runs (confirmed byte-stable, the same discipline
 /// [`gradcache_completes_at_w1_with_a_pinned_adapter_digest`]'s own doc
 /// states). The Linux constant is pinned from two agreeing captures on
-/// x86_64 Linux: the hermetic `Test` job's own stdout (ci.yml run
-/// 35334270497, `ubuntu-latest`), read from the `println!` below, printed
-/// BEFORE the assert on every run, and a second run of this test inside the
-/// same CI image (`ghcr.io/f-inverse/jammi-ai-ci`, `linux/amd64`) on another
-/// host; every CI run re-measures it and a divergence fails BY NAME here
-/// (never `#[ignore]`d).
-/// This run's live mining-on-vs-off inequality (below) is the non-vacuity control this
-/// module's doc names: #551's own oracle gap (an earlier attempted digest
-/// test set `hard_negatives.mine = true` with no `embedding_loss` at all, so
-/// `mining_eligible()` never admitted mining and flipping `mine` left the
-/// pinned bytes identical because the miner never ran either way).
+/// x86_64 Linux (the hermetic CI job and the CI image on another host), read
+/// from the `println!` below, printed BEFORE the assert on every run; every
+/// CI run re-measures it and a divergence fails BY NAME here.
+/// This run's live mining-on-vs-off inequality (below) is the non-vacuity
+/// control described above.
 #[tokio::test(flavor = "multi_thread")]
 async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it_unreached() {
     use jammi_ai::fine_tune::{EmbeddingLoss, HardNegativeConfig};
 
     // Platform-specific, like `PARITY_ADAPTER_PRINTS` above: the Linux pair
     // is captured from the hermetic CI job's stdout (this test's own
-    // `println!`, below; run 35334270497) and confirmed by a second run in
-    // the CI image on another x86_64 host; the macOS pair is pinned from two
-    // repeated local runs on this implementer's host.
+    // `println!`, below) and confirmed by a second run in the CI image on
+    // another x86_64 host; the macOS pair is pinned from two repeated local
+    // runs.
     #[cfg(target_arch = "x86_64")]
     const MINING_ADAPTER_PRINTS: &[(&str, &str)] = &[
         ("adapter.safetensors", "1184:18ce9f6cfea22f83"),
@@ -614,8 +574,8 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
     );
 
     // Printed BEFORE the byte-for-byte assert below, unconditionally on every
-    // run (Linux included) — a failing test's captured stdout is the lead's
-    // only read for the Linux constant this pin is missing.
+    // run (Linux included) — a failing test's captured stdout is the value
+    // to re-pin from.
     println!("MINING_ADAPTER_PRINTS = {mining_prints:#?}");
 
     let off_dir = TempDir::new().unwrap();
@@ -638,11 +598,9 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
         mining_print, off_print,
         "hard-negative mining must change the trained adapter bytes — an identical adapter print \
          with mining flipped on would mean the miner's replaced (anchor, positive, mined-negative) \
-         triplets never reached the trainer. #551's non-vacuity control: U2b's own attempted pin \
-         found this identical because `mining_eligible()` never admitted mining without an \
+         triplets never reached the trainer. `mining_eligible()` never admits mining without an \
          `embedding_loss` set at all; this run sets one, so a regression that silently dropped the \
-         mined loader (falling back to the original triplets) reproduces exactly U2b's vacuous \
-         result and this assertion catches it."
+         mined loader (falling back to the original triplets) is caught here."
     );
 
     // The byte-for-byte pin, asserted on both platforms; a divergence fails
@@ -812,7 +770,7 @@ async fn two_jobs_over_one_plain_source_materialise_two_training_sets() {
         );
     }
 
-    // K7: the definition hash folds source/columns/task/format/order_rule —
+    // The definition hash folds source/columns/task/format/order_rule —
     // NOT the anchor, the table id, or anything about which job ran it. Two
     // tables that are never reused (because their anchors are unpinned and so
     // never compare equal) still name the SAME definition: it is the anchor
@@ -832,7 +790,7 @@ async fn two_jobs_over_one_plain_source_materialise_two_training_sets() {
     );
 }
 
-/// (e) K2 — a projection that yields zero rows is refused with the typed
+/// (e) A projection that yields zero rows is refused with the typed
 /// `EmptyTrainingSet` before any training set exists, through the JOB path.
 ///
 /// A zero-row training set is the shape that trains silently on nothing: the
@@ -872,9 +830,9 @@ async fn empty_projection_is_refused_through_the_job_path() {
         .unwrap();
     let outcome = job.wait().await;
     let record = session.catalog().get_job(&job.job_id).await.unwrap();
-    println!("K2 job outcome = {outcome:?}");
+    println!("empty-training-set job outcome = {outcome:?}");
     println!(
-        "K2 job status = {:?} error = {:?}",
+        "empty-training-set job status = {:?} error = {:?}",
         record.status, record.error
     );
 
@@ -972,8 +930,8 @@ async fn read_back_re_applies_the_committed_order_across_row_groups() {
     );
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
 
-    // The 70,000-row multi-row-group fixture (#500 U2c §2): lifted out of
-    // this test's own body into ONE builder every U2c oracle calls.
+    // The 70,000-row multi-row-group fixture: ONE builder every streaming
+    // oracle calls.
     let fixture = common::multi_row_group_pairs(&session, dir.path(), true).await;
     let table = fixture.table.clone();
     let columns = fixture.columns.clone();
@@ -1080,9 +1038,7 @@ async fn a_result_table_cannot_be_a_fine_tune_source() {
 
     // ... and yet neither its catalog name nor its registered name resolves as
     // a fine-tune SOURCE, on either the submit or the materialize path.
-    // `registered_name` itself was deleted (#551: zero production
-    // callers) — the registered form is spelled out here instead, the same
-    // `jammi.{table_name}` shape it used to return.
+    // The registered form is spelled out here: `jammi.{table_name}`.
     for name in [
         table.table_name().to_string(),
         format!("jammi.{}", table.table_name()),
@@ -1103,7 +1059,7 @@ async fn a_result_table_cannot_be_a_fine_tune_source() {
     }
 }
 
-/// K1 — a `TrainingSet` table's recorded producer replays, byte-identically
+/// A `TrainingSet` table's recorded producer replays, byte-identically
 /// when the source has not moved, and the replay genuinely RECOMPUTES rather
 /// than resolving back to the table it was asked to replay.
 ///
@@ -1155,7 +1111,7 @@ async fn a_training_set_replays_from_its_recorded_descriptor() {
     );
 }
 
-/// M2 — `recompute`'s `TrainingSet` replay re-anchors from the ORIGINAL
+/// `recompute`'s `TrainingSet` replay re-anchors from the ORIGINAL
 /// manifest's recorded relation names, not from the recomputed table's single
 /// `source_id` lineage column.
 ///
@@ -1260,7 +1216,7 @@ async fn recompute_re_anchors_every_recorded_relation() {
     );
 }
 
-/// M2's first unwitnessed refusal — a `TrainingSet` descriptor recorded under
+/// A `TrainingSet` descriptor recorded under
 /// an `order_rule` this build does not implement is `NotRecomputable`, never a
 /// replay guessed under a rule the recorded descriptor does not claim.
 ///
@@ -1333,7 +1289,7 @@ async fn recompute_refuses_a_training_set_with_an_unknown_order_rule() {
 /// `recompute` at all, so the refusal it drives is `recompute`'s outer
 /// dispatch reading the descriptor through `ResultStore::producing_descriptor`
 /// and finding no sidecar there — the same first read every other kind's
-/// recompute refuses on. The narrower race M2 also names — a sidecar that
+/// recompute refuses on. The narrower race — a sidecar that
 /// vanishes strictly BETWEEN that descriptor read and
 /// `recompute_training_set`'s own anchor read — cannot be constructed by
 /// driving this public entry point end to end (the outer guard above already
@@ -1438,13 +1394,12 @@ async fn artifact_digest(session: &InferenceSession, table: &str) -> String {
 /// `ready` `TrainingSet` row and asserts the typed refusal plus the state it
 /// leaves behind.
 ///
-/// **R-A — this is caller discipline, not a storage-layer impossibility.** The
-/// db owner's executed probe publishes a base version on a `TrainingSet` row
-/// through `Catalog::publish_base_version` (`current_version` None → `Some(0)`)
-/// and allocates a second through `ResultStore::allocate_version` (`Ok(1)`):
-/// both succeed. The `kind = 'model'` predicate in `resolve_embedding_table`
-/// gates only source_id-addressed resolution, which none of these verbs uses.
-/// Nothing in the schema keeps a version off a training-set row; only the
+/// **This is caller discipline, not a storage-layer impossibility.**
+/// Publishing a base version on a `TrainingSet` row through `Catalog::publish_base_version`
+/// (`current_version` None → `Some(0)`) and allocating a second through
+/// `ResultStore::allocate_version` (`Ok(1)`) both succeed. The `kind = 'model'` predicate in
+/// `resolve_embedding_table` gates only source_id-addressed resolution, which none of these verbs
+/// uses. Nothing in the schema keeps a version off a training-set row; only the
 /// refusal asserted here does, so this oracle is the whole guard.
 #[tokio::test(flavor = "multi_thread")]
 async fn refresh_and_compaction_refuse_a_training_set_leaving_it_versionless() {

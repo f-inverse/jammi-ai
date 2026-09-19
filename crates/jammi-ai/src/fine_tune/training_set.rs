@@ -1,7 +1,7 @@
 //! The rows a fine-tune trains on, as a **producer output** rather than a run's
 //! scratch space.
 //!
-//! A training run no longer re-runs its source query into memory. It
+//! A training run does not re-run its source query into memory. It
 //! materialises the projected rows once, through
 //! [`ResultStore::materialize_training_set`](jammi_db::store::ResultStore::materialize_training_set), into an immutable Parquet result
 //! table of kind `TrainingSet` carrying a definition hash and the standard
@@ -59,27 +59,27 @@
 //! walk, not of a query the engine can express as durable SQL, so this
 //! module's `training_set_spec`/`materialize_projection*` helpers (SQL-only)
 //! are not it. Instead `worker.rs::materialize_graph_training_set` re-reads the
-//! node/edge sources (ordered — `GRAPH_READ_ORDER_RULE_V1`, GA1), samples
+//! node/edge sources (ordered — `GRAPH_READ_ORDER_RULE_V1`), samples
 //! them, and hands the sampled pairs to
 //! [`ResultStore::materialize_training_set`](jammi_db::store::ResultStore::materialize_training_set)
 //! as a [`TrainingSetInput::Batches`] stream (a leading `_ordinal` column,
-//! GA4: never re-sorted — the producer's own committed order IS the
+//! never re-sorted — the producer's own committed order IS the
 //! sampler's emission order) under a
 //! [`jammi_db::store::manifest::ProducingDescriptor::GraphTrainingSet`]
-//! descriptor (GA2), never this module's `ProducingDescriptor::TrainingSet`.
+//! descriptor, never this module's `ProducingDescriptor::TrainingSet`.
 //! The written table is still `ResultTableKind::TrainingSet` — the SAME
 //! catalog kind, registration, and reuse-probe machinery this module's arm
 //! uses — and `pipeline/recompute.rs`'s `recompute_graph_training_set`
 //! replays it through the identical shared sample-then-materialise
-//! function a fresh run calls (GA9). A `Peer` gang does NOT admit a member
+//! function a fresh run calls. A `Peer` gang does NOT admit a member
 //! against this table: `run_spec` refuses a graph fine-tune's
 //! `TopologyDecision::Peer` by name (`world_size` above `[worker]
 //! local_ranks`) — a member's own rank body has no read path over this
 //! table in the SAME `_ordinal`-committed order rank 0 reads, and no
 //! executed oracle proves the resulting per-rank shards combine into a
 //! correct gradient; `Single` and in-process `Local` gangs are unaffected.
-//! The empty-negative-pool refusal (GA3) and the named
-//! `training_set_graph_sample` residency reservation (GA7) are the graph
+//! The empty-negative-pool refusal and the named
+//! `training_set_graph_sample` residency reservation are the graph
 //! arm's own, with no tabular-arm counterpart.
 
 use arrow::array::RecordBatch;
@@ -95,7 +95,7 @@ use crate::session::InferenceSession;
 /// order** — the reader's half of the order contract, in one place.
 ///
 /// A thin call into [`TrainingSetTable::relation`]'s
-/// `TrainingSetRelation::select_ordered` (#551): the relation and its
+/// `TrainingSetRelation::select_ordered`: the relation and its
 /// order clause are minted together, from the table's OWN recorded order
 /// columns, by that one method, which takes no projection argument at all
 /// — there is no caller-supplied value left to trust or
@@ -103,7 +103,7 @@ use crate::session::InferenceSession;
 /// a parameter this function never read would be exactly the
 /// band-aid shape a caller could mistake for still influencing the SQL.
 ///
-/// `Result`, not a bare `String` (#551): [`TrainingSetTable::relation`]
+/// `Result`, not a bare `String`: [`TrainingSetTable::relation`]
 /// refuses an empty order-column list, typed — a `TrainingSetTable` this
 /// crate ever hands out never actually has one, but this function does not
 /// swallow that refusal into a panic or an assumption; it propagates.
@@ -155,7 +155,7 @@ pub(crate) fn training_set_spec<'a>(
 /// [`read_back`]'s own doc for the reservation this pays). A `Streamed`
 /// [`super::source::TrainingSource`] calls [`materialize_projection_table`]
 /// instead — the table-only form — and never reaches this function, so no
-/// `Vec<RecordBatch>` is ever collected for it (#500 U2c §11 F1).
+/// `Vec<RecordBatch>` is ever collected for it.
 pub async fn materialize_projection(
     session: &InferenceSession,
     source_id: &str,
@@ -213,7 +213,7 @@ pub async fn materialize_projection_table(
     .await
 }
 
-/// Materialise a spec through the producer. Reads NO row (#500 U2c §11 F1) —
+/// Materialise a spec through the producer. Reads NO row —
 /// the reader's half of the order contract ([`read_back`]) is a SEPARATE
 /// call, made only by a caller that actually wants the rows in memory.
 pub async fn materialize(
@@ -234,7 +234,7 @@ pub async fn materialize(
 /// read-back resolves without a second registration and a reused table is read
 /// exactly like a fresh one.
 ///
-/// **The eager reservation route (#500 U2c, §9 B6).** The collected batches'
+/// **The eager reservation route.** The collected batches'
 /// `RecordBatch::get_array_memory_size()` sum is reserved against a
 /// `MemoryConsumer("training_set_eager")` on `session.memory_pool()` right
 /// after collection — the SAME pool a per-rank [`super::stream::
@@ -262,7 +262,7 @@ pub async fn read_back(
 }
 
 /// [`read_back`]'s twin for a caller that must KEEP the eager reservation
-/// alive after this call returns (#500 U2c c3c, P-R): reserves the SAME
+/// alive after this call returns: reserves the SAME
 /// `training_set_eager`-named bytes and hands the live
 /// [`MemoryReservation`](datafusion::execution::memory_pool::MemoryReservation)
 /// back rather than freeing it — the caller attaches it to whatever owns the
@@ -312,31 +312,29 @@ fn reserve_eager_batches(
 /// with the ONE property each entry must hold: it applies
 /// [`training_set_order_by`](jammi_db::store::training_set_order_by) itself
 /// (or is reviewed as not reading a training-set relation at all — see the
-/// widened needles below). A caller that reads a relation by name without
+/// needles below). A caller that reads a relation by name without
 /// applying the order loses it silently on a multi-row-group table scanned by
 /// more than one partition.
 ///
-/// # #551 — the honest guarantee, widened, never claimed closed
+/// # The guarantee, and its residual
 ///
 /// [`TrainingSetTable::relation`](jammi_db::store::TrainingSetTable::relation)
 /// makes the SAFE route the only one with no order key to supply — every
-/// production reader in this crate that names a training-set relation now
-/// goes through it (`read_back_sql`, below), and that route cannot render an
+/// production reader in this crate that names a training-set relation goes
+/// through it (`read_back_sql`, below), and that route cannot render an
 /// unordered read. It does NOT make the UNSAFE routes unreachable: the bare
 /// catalog name is reachable off any `ResultTableRecord` — a fresh
 /// `Catalog::get_result_table(name)` call, or `ResultTableRecord::table_name`
 /// directly on a value obtained some other way — entirely independently of
 /// `TrainingSetTable`, so a hand-built
 /// `format!("SELECT * FROM \"jammi.{{}}\"", record.table_name)` remains
-/// representable. This scan is what still catches that: it is the DISCLOSED
-/// RESIDUAL on #551, not a closed set over meaning. Its needle set widened
-/// this round to name the catalog-record route explicitly rather than only
-/// the accessor-spelling routes:
+/// representable. This scan is what catches that; it is a residual check,
+/// not a closed set over meaning. Its needles:
 /// - `.sql_relation(` — the dot-call form of
 ///   [`TrainingSetTable::sql_relation`](jammi_db::store::TrainingSetTable::sql_relation).
 /// - `sql_relation(&` — its UFCS form.
-/// - `registered_name(` — the now-deleted `TrainingSetTable::registered_name`'s
-///   spelling; kept as a needle in case a future symbol reuses the name.
+/// - `registered_name(` — a needle guarding the name against reuse by a
+///   future symbol.
 /// - `result_table_relation(` —
 ///   [`jammi_db::store::result_table_relation`], `sql_relation`'s
 ///   general-purpose sibling minter every other registered-relation reader in
@@ -360,33 +358,26 @@ fn reserve_eager_batches(
 /// is invisible to it — the residual this module's doc states, not a claim
 /// this scan closes.
 ///
-/// A further disclosed residual (#551): every needle match is a
-/// single-LINE `contains` check, so a rustfmt-split expression whose needle
-/// text spans two lines — `.record`/`.table_name` on separate lines, e.g. a
-/// method-chain break rustfmt inserts for a long line — is invisible to it
-/// the same way, even though the compiled code reaches the identical
-/// field. `.sql_relation(`, `registered_name(`, and `result_table_relation(`
-/// are single tokens rustfmt never splits mid-call, so they do not carry
-/// this gap. `sql_relation(&` is NOT a single token — it is a call's `(`
-/// followed by a separate `&` token, and rustfmt CAN break a call's argument
-/// list onto its own line after `(` for a long enough invocation — so this
-/// needle belongs with the split-prone ones on the same footing as
-/// `.record.table_name`/`.table_name()`; it is listed here rather than left
-/// unstated because today, workspace-wide, there are ZERO call sites that
-/// spell `TrainingSetTable::sql_relation(&..)` in its UFCS form at all
-/// (every real call is the dot-call `self.sql_relation()`/`table.sql_relation()`
-/// form) — so this gap is currently vacuous, not closed.
+/// Every needle match is a single-LINE `contains` check, so a rustfmt-split
+/// expression whose needle text spans two lines — `.record`/`.table_name` on
+/// separate lines, e.g. a method-chain break rustfmt inserts for a long line
+/// — is invisible to it the same way, even though the compiled code reaches
+/// the identical field. `.sql_relation(`, `registered_name(`, and
+/// `result_table_relation(` are single tokens rustfmt never splits mid-call,
+/// so they do not carry this gap. `sql_relation(&` is NOT a single token —
+/// rustfmt CAN break a call's argument list onto its own line after `(` — so
+/// it carries the same gap as `.record.table_name`/`.table_name()`; no call
+/// site in the workspace spells `TrainingSetTable::sql_relation(&..)` in UFCS
+/// form (every real call is the dot-call form), so that gap is currently
+/// vacuous, not closed.
 ///
-/// A SECOND disclosed residual of the same line-granularity check (#551):
-/// the accessor-impl exclusion below (`accessor_impl_line_ranges`) treats its
-/// `(start, end)` span as INCLUSIVE of `end`, the impl block's closing-brace
-/// LINE — so a needle appearing on that SAME line, after the `}` (e.g.
-/// `} let _ = record.table_name;`), would be excluded as if it were still
-/// inside the impl block, even though it lexically is not. This shape is not
-/// reachable through this repository's own required gates: `cargo fmt
-/// --check` (a required CI step) rejects it — rustfmt always places an
-/// item's closing brace alone on its own line, never followed by another
-/// statement on the same line — so no rustfmt-clean commit can produce it.
+/// The accessor-impl exclusion below (`accessor_impl_line_ranges`) treats
+/// its `(start, end)` span as INCLUSIVE of `end`, the impl block's
+/// closing-brace LINE — so a needle appearing on that SAME line, after the
+/// `}` (e.g. `} let _ = record.table_name;`), would be excluded as if it were
+/// still inside the impl block. `cargo fmt --check` (a required CI step)
+/// rejects that shape — rustfmt always places an item's closing brace alone
+/// on its own line — so no rustfmt-clean commit can produce it.
 ///
 /// One exclusion, by construction rather than by allow-listing: the
 /// accessors' OWN implementations
@@ -396,16 +387,14 @@ fn reserve_eager_batches(
 /// a caller reaching for the relation key, so the scan skips matches whose
 /// LINE falls inside `TrainingSetTable`'s or `TrainingSetRelation`'s own
 /// `impl` block SPAN (see `accessor_impl_line_ranges`, which parses the file
-/// with `syn` rather than a text heuristic — #551) — never a
-/// function-NAME match file-wide, which would (and, before this fix, did)
-/// also silently swallow `PinnedSource::table_name`'s identically-named but
-/// unrelated method in the SAME file; that hit is reviewed and allow-listed
-/// below instead.
+/// with `syn` rather than a text heuristic) — never a function-NAME match
+/// file-wide, which would also silently swallow `PinnedSource::table_name`'s
+/// identically-named but unrelated method in the SAME file; that hit is
+/// reviewed and allow-listed below instead.
 ///
 /// [`read_back_sql`] itself carries NO entry in [`ALLOWED`] — it spells none
-/// of this scan's needles any more (`TrainingSetTable::relation` is not one),
-/// which is the point: the safe route dropped OFF this allow-list rather
-/// than earning a permanent place on it, because there is no longer a
+/// of this scan's needles (`TrainingSetTable::relation` is not one), which
+/// is the point: the safe route needs no allow-list entry because it has no
 /// spelling to review. Its own order guarantee is pinned separately, by
 /// `training_set::read_back_re_applies_the_committed_order_across_row_groups`
 /// (`tests/it/training_set.rs`).
@@ -427,9 +416,9 @@ fn reserve_eager_batches(
 #[cfg(test)]
 mod reader_class_allow_list {
     /// `(workspace-relative path, enclosing function name)` for every
-    /// production call site this fold has audited and accepted.
+    /// production call site that has been reviewed and accepted.
     const ALLOWED: &[(&str, &str, usize)] = &[
-        // --- `.table_name()` needle, the catalog-record route (#551):
+        // --- `.table_name()` needle, the catalog-record route:
         // none of the sites below reach a TRAINING-SET relation.
         // `run_spec` reads `TrainingSetTable::table_name` TWICE — the
         // identity pair a `Peer` gang admits against, and a materialization-
@@ -501,11 +490,9 @@ mod reader_class_allow_list {
         ),
         // `PinnedSource::table_name`'s OWN body (`&self.record.table_name`) —
         // NOT excluded by the accessor-impl-span mechanism above, since
-        // `PinnedSource`'s impl block is a DIFFERENT, unrelated span this
-        // round does not touch (#551: `PinnedSource::record`/
-        // `table_name` are the SAME residual-route class as
-        // `TrainingSetTable`'s own former `record()`, left unreviewed and
-        // unchanged, per that method's own doc). Reviewed here instead: the
+        // `PinnedSource`'s impl block is a DIFFERENT, unrelated span
+        // (`PinnedSource::record`/`table_name` are the same residual-route
+        // class the module doc names). Reviewed here instead: the
         // method builds its OWN return value, the identical shape the
         // construction-exclusion covers for `TrainingSetTable`/
         // `TrainingSetRelation`, just not folded into that exclusion's span.
@@ -513,8 +500,8 @@ mod reader_class_allow_list {
         // `BuildingTable::table_name` — a test-utility helper's own table
         // label for its refusal path.
         ("crates/jammi-test-utils/src/lib.rs", "abandon_building", 1),
-        // --- `result_table_relation(` needle: every reviewed migration site
-        // (#551 — `crates/jammi-ai/tests/it/
+        // --- `result_table_relation(` needle: every reviewed site
+        // (`crates/jammi-ai/tests/it/
         // pinned_source_gate.rs`'s SESSION_LITERAL_ALLOWED entry for this
         // same minter is the sibling review of the SAME call sites, for a
         // different risk class) plus this crate's own quoted-relation reads.
@@ -548,7 +535,7 @@ mod reader_class_allow_list {
             1,
         ),
         ("crates/jammi-bench/src/corpus.rs", "load_vectors", 1),
-        // `recompute_graph_training_set` (#538) returns the freshly
+        // `recompute_graph_training_set` returns the freshly
         // materialised graph table's bare name to its caller alongside the
         // cache outcome — a value handed UP, never a relation string built
         // here; the table's own read goes through `TrainingSetTable::relation`.
@@ -566,28 +553,27 @@ mod reader_class_allow_list {
     const ACCESSOR_IMPL_FILE: &str = "crates/jammi-db/src/store/mod.rs";
 
     /// The `Self` type names whose top-level `impl` blocks are excluded —
-    /// NEVER a function-name match file-wide (#551): `PinnedSource`
-    /// has its own `table_name`/`record` methods in the SAME file, and a
-    /// name-only exclusion silently swallowed its body as if it were
+    /// NEVER a function-name match file-wide: `PinnedSource` has its own
+    /// `table_name`/`record` methods in the SAME file, and a name-only
+    /// exclusion would silently swallow its body as if it were
     /// `TrainingSetTable::table_name`'s.
     const ACCESSOR_IMPL_TYPES: &[&str] = &["TrainingSetTable", "TrainingSetRelation"];
 
     /// `(start, end)` 0-based line indices (inclusive) for every top-level
     /// `impl` block in `text` whose `Self` type is one of
     /// [`ACCESSOR_IMPL_TYPES`] — via the REAL parser (`syn::parse_file`), not
-    /// a line-text heuristic (#551): a line-based "the next line
-    /// that is exactly `}` at zero indentation closes the block" heuristic
-    /// silently EXTENDS the excluded span past a rustfmt-clean trailing
-    /// comment on that same closing brace (`} // end impl TrainingSetRelation`
-    /// still reads as exactly the brace text on ITS line, but a heuristic
-    /// scanning for the LITERAL line `"}"` would miss it and keep walking
-    /// past the true end) — an auditor's planted hand-built read placed
-    /// right after such a brace was silently swallowed by the widened span,
-    /// invisible to the scan. `syn`'s span for a parsed `ItemImpl` ends at
-    /// the closing brace TOKEN itself, regardless of what shares its line or
-    /// how any doc comment inside the block spells `{`/`}` in prose (a
-    /// tokenizer never confuses a comment's or a string literal's braces
-    /// with real block structure, unlike a naive text scan).
+    /// a line-text heuristic: a line-based "the next line that is exactly
+    /// `}` at zero indentation closes the block" heuristic silently EXTENDS
+    /// the excluded span past a rustfmt-clean trailing comment on that same
+    /// closing brace (`} // end impl TrainingSetRelation` is not the LITERAL
+    /// line `"}"`, so the heuristic keeps walking past the true end), and a
+    /// hand-built read placed right after such a brace would be swallowed
+    /// by the widened span, invisible to the scan. `syn`'s span for a parsed
+    /// `ItemImpl` ends at the closing brace TOKEN itself, regardless of what
+    /// shares its line or how any doc comment inside the block spells
+    /// `{`/`}` in prose (a tokenizer never confuses a comment's or a string
+    /// literal's braces with real block structure, unlike a naive text
+    /// scan).
     fn accessor_impl_line_ranges(text: &str) -> Vec<(usize, usize)> {
         use syn::spanned::Spanned;
 
@@ -597,7 +583,7 @@ mod reader_class_allow_list {
                  scan's accessor-impl exclusion cannot run: {e}"
             )
         });
-        // Named, not just spanned (#551): a PER-NAME count is asserted
+        // Named, not just spanned: a PER-NAME count is asserted
         // below, not merely a total across all of `ACCESSOR_IMPL_TYPES` — a
         // total-length check alone cannot tell "two `impl TrainingSetRelation`
         // blocks and zero `impl TrainingSetTable` blocks" (2 total, matching
@@ -753,11 +739,9 @@ mod reader_class_allow_list {
     fn every_production_sql_relation_call_site_is_on_the_allow_list() {
         let root = workspace_root();
         let needles = needles();
-        // One entry PER OCCURRENCE, never deduped (#551): a
-        // (path, fn) key alone let a SECOND hand-built read inside an
-        // already-allow-listed function pass silently, since `found.dedup()`
-        // collapsed both occurrences into the one entry `ALLOWED` already
-        // covered. Counting fixes it — see the assertion below.
+        // One entry PER OCCURRENCE, never deduped: a (path, fn) key alone
+        // would let a SECOND hand-built read inside an already-allow-listed
+        // function pass silently. The assertion below compares counts.
         let mut found: Vec<(String, String)> = Vec::new();
         for path in all_workspace_src_files(&root) {
             let text = std::fs::read_to_string(&path)

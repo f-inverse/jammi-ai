@@ -324,7 +324,7 @@ async fn e2e_error_rows_have_null_vector_and_error_message() {
     }
 }
 
-// ─── Systemic forward failure propagates loudly (esc-028 / #319 / #326) ────
+// ─── Systemic forward failure propagates loudly ────────────────────────────
 //
 // A `model.forward` failure is always systemic (a broken kernel, a
 // contiguity/PTX/dtype mismatch, or — as exercised here — a model that
@@ -368,8 +368,8 @@ async fn e2e_systemic_forward_failure_propagates_from_embedding_pipeline() {
     // `ModelTask::ImageEmbedding` on a text-only checkpoint (no vision tower)
     // fails identically for every row — a systemic, non-OOM `model.forward`
     // error. It must propagate out of `generate_image_embeddings` as an `Err`
-    // rather than silently persisting an empty "ready" embedding table (the
-    // #319 hole this fix closes) or an all-error relation.
+    // rather than silently persisting an empty "ready" embedding table or an
+    // all-error relation.
     let (session, _dir) = session_with_patents().await;
     let model_id = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
 
@@ -420,8 +420,8 @@ async fn e2e_all_input_invalid_fails_loud_not_empty_ready_table() {
     // propagate from the runner. The embedding pipeline must still fail loud
     // rather than drop every row and flip the catalog row to `ready` with
     // `row_count = 0` — a silently-empty table that searches to nothing. This is
-    // the case the repurposed #319 guard covers (distinct from the systemic
-    // forward failures the runner now propagates).
+    // the case the empty-table guard covers (distinct from the systemic
+    // forward failures the runner propagates).
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
     use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};

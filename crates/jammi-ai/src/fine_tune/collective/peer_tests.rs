@@ -1240,12 +1240,12 @@ fn verify_partition_leaves_over_a_file_store_reads_one_bounded_range_per_leaf_an
     let path = dir.path().join("data.parquet");
     let bytes = three_row_group_parquet();
     std::fs::write(&path, &bytes).expect("write");
-    // The test builds its OWN driver directly (route 4 — no crate boundary
-    // can seal direct `object_store` construction against paths this
-    // process can already reach): a `LocalFileSystem` rooted at the tempdir
-    // itself, never a bare `LocalFileSystem::new()` rooted at `/` — jammi-db
-    // never hands this test a raw driver to wrap (`JammiObjectStore::open`
-    // has no such seam since #588's closing audit removed `open_with`).
+    // The test builds its OWN driver directly (no crate boundary can seal
+    // direct `object_store` construction against paths this process can
+    // already reach): a `LocalFileSystem` rooted at the tempdir itself,
+    // never a bare `LocalFileSystem::new()` rooted at `/` — jammi-db never
+    // hands this test a raw driver to wrap (`JammiObjectStore::open` has no
+    // such seam).
     let url = StorageUrl::parse("file:///data.parquet").expect("url");
     let ranges = Arc::new(Mutex::new(Vec::new()));
     let driver = object_store::local::LocalFileSystem::new_with_prefix(dir.path())

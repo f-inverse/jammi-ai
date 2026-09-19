@@ -1,6 +1,5 @@
 //! Partition rule v1 ("block-by-global-batch") and the global-batch step
-//! formula every step quantity indexes by (DESIGN.md §2; PRESSURE round-2
-//! design findings 5, 6).
+//! formula every step quantity indexes by.
 //!
 //! With per-rank batch `B` and world `W`, global batch `t` is rows
 //! `[t·W·B, (t+1)·W·B)` of the train prefix; rank `r` reads
@@ -12,14 +11,14 @@
 //!
 //! The trailing global batch is **kept**: ranks then hold unequal counts,
 //! and when `train_count mod (W·B) <= r·B` rank `r` holds **zero** rows for
-//! that step — a valid state (K2), never a division by zero or an
+//! that step — a valid state, never a division by zero or an
 //! out-of-bounds slice. [`PartitionSpec::rows_for_step`] returns an empty
 //! range rather than panicking or wrapping.
 
 use std::ops::Range;
 
-/// The row-partitioning rule a training set's rows are read under. `V1` is
-/// the only rule this plan defines.
+/// The row-partitioning rule a training set's rows are read under.
+/// "block-by-global-batch" is the only rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartitionRule {
     /// "block-by-global-batch" — see the module doc.
@@ -32,7 +31,7 @@ pub enum PartitionRule {
 /// the global `W·B` batch.
 ///
 /// Fields are PRIVATE: [`Self::single_rank`] (rank 0 of world 1, W=1's only
-/// value) and [`Self::for_gang`] (U4b's validated arbitrary-rank
+/// value) and [`Self::for_gang`] (the validated arbitrary-rank
 /// constructor, for a real `Local`/`Peer`/`Nccl` gang) are the only
 /// constructors reachable outside this module in a release build, so every
 /// `PartitionSpec` a running trainer ever holds has already cleared
@@ -63,7 +62,7 @@ impl PartitionSpec {
 
     /// Test-only constructor for an arbitrary `(rank, world)` assignment —
     /// used to exercise the partition rule itself (the multiset oracle, the
-    /// K3 scaler oracle) at worlds a release build never reaches. Absent
+    /// target-scaler oracle) at worlds a release build never reaches. Absent
     /// from a release build, so it can never become a second production
     /// route to a `rank != 0` / `world != 1` spec.
     #[cfg(test)]
@@ -76,14 +75,14 @@ impl PartitionSpec {
         }
     }
 
-    /// A VALIDATED arbitrary-rank constructor (#500 U2c §9 advisory): `world
+    /// A VALIDATED arbitrary-rank constructor: `world
     /// >= 1`, `rank < world`, `batch >= 1`, refused by name otherwise. Gated
     /// `#[cfg(any(test, feature = "test-hooks"))]`, reachable from
     /// `tests/it` only through this crate's own `test-hooks` dev-dependency
     /// (`Cargo.toml`), never from a release build. Thin wrapper over
     /// [`Self::for_gang`] — see that constructor's own doc for the bounds and
     /// for why a release build's own multi-rank route is that one, not this
-    /// one. Used by the per-rank stream's `P5` oracle (`world = 2`), which
+    /// one. Used by the per-rank stream's oracle (`world = 2`), which
     /// needs a real, out-of-this-module `PartitionSpec` value rather than
     /// `for_test`'s `pub(crate)`-only visibility.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -96,7 +95,7 @@ impl PartitionSpec {
         Self::for_gang(rank, world, batch, rule)
     }
 
-    /// U4b's validated, PRODUCTION arbitrary-rank constructor: `world >= 1`,
+    /// The validated, PRODUCTION arbitrary-rank constructor: `world >= 1`,
     /// `rank < world`, `batch >= 1`, refused by name otherwise — a real
     /// `Local`/`Peer`/`Nccl` gang's rank builds its own
     /// [`super::trainer::RankContext`] through this, one call per rank, every
@@ -152,7 +151,7 @@ impl PartitionSpec {
     /// `world * batch` batch) — `stream.rs::run_pump` reads this to derive
     /// its own `step_bound` (`batches_per_epoch(train_count, world, batch)`)
     /// identically to the trainer's `train_batches_per_epoch`, so the two
-    /// can never drift apart (U4b tail).
+    /// can never drift apart.
     pub fn batch(&self) -> usize {
         self.batch
     }
@@ -163,7 +162,8 @@ impl PartitionSpec {
     /// `world == 0` or `batch == 0` names an unrepresentable assignment (no
     /// rank could read anything); it returns an empty range rather than
     /// dividing by zero — the caller that built such a spec is the one that
-    /// should have refused it (K2 names the boundary, not this leaf).
+    /// should have refused it ([`Self::for_gang`] names the boundary, not this
+    /// leaf).
     ///
     /// Every arm is `.min(train_count)` before subtraction, so `start <=
     /// end` always holds and the range is never inverted: a rank whose slice
@@ -189,7 +189,7 @@ impl PartitionSpec {
     /// `train_count` rows: `counts[r]` is the row count [`Self::rows_for_step`]
     /// would compute for rank `r` — EVERY rank's, not just `self.rank`'s.
     ///
-    /// DESIGN.md §4's "Counts are derived, never exchanged": every rank knows
+    /// Counts are derived, never exchanged: every rank knows
     /// `train_count` (the shared training set) and its own `(world, batch,
     /// rule)` (the shared spec), so every rank computes the IDENTICAL
     /// `counts` vector locally, with no round-trip — this is the pure
@@ -219,14 +219,13 @@ impl PartitionSpec {
 
 /// `ceil(train_count / (world * batch))` — the number of global batches (and
 /// therefore of trainer-relevant steps) a train prefix takes at this
-/// world/batch (DESIGN.md §2, `batches_per_epoch = ceil(train_count /
-/// (W·B))`).
+/// world/batch.
 ///
 /// `0` when there is nothing to divide by (`world == 0` or `batch == 0`) or
 /// nothing to divide (`train_count == 0`) — the same edge cases
 /// [`super::data::TrainingDataLoader::num_batches`] already special-cases, so
 /// at `world == 1` this function's value equals that method's for every
-/// `batch`: the **W=1 parity oracle** this unit's acceptance (f) pins.
+/// `batch` (the **W=1 parity oracle** the tests below pin).
 pub fn batches_per_epoch(train_count: usize, world: usize, batch: usize) -> usize {
     if world == 0 || batch == 0 || train_count == 0 {
         return 0;
@@ -238,8 +237,7 @@ pub fn batches_per_epoch(train_count: usize, world: usize, batch: usize) -> usiz
 mod tests {
     use super::*;
 
-    /// (f), part 2: the formula at `world = 2` is `ceil(train_count / (2B))`
-    /// — RED at base (this function does not exist there).
+    /// The formula at `world = 2` is `ceil(train_count / (2B))`.
     #[test]
     fn batches_per_epoch_at_world_two_halves_the_w1_count() {
         for &train_count in &[0usize, 1, 2, 3, 4, 5, 7, 8, 10, 11, 100] {
@@ -258,11 +256,10 @@ mod tests {
         }
     }
 
-    /// (f), part 1 (the W=1 parity oracle): `batches_per_epoch(n, 1, b)` must
-    /// equal `n.div_ceil(b)` for every `n`, `b` — the exact value
-    /// `TrainingDataLoader::num_batches` already computes today, so wiring
-    /// the trainer's step formula through this function at `world = 1`
-    /// changes not one byte of any existing run.
+    /// The W=1 parity oracle: `batches_per_epoch(n, 1, b)` must equal
+    /// `n.div_ceil(b)` for every `n`, `b` — the exact value
+    /// `TrainingDataLoader::num_batches` computes, so the trainer's step
+    /// formula at `world = 1` is the plain single-rank batch count.
     #[test]
     fn batches_per_epoch_at_world_one_matches_div_ceil() {
         for train_count in 0..40usize {
@@ -280,7 +277,7 @@ mod tests {
         assert_eq!(batches_per_epoch(0, 1, 4), 0);
     }
 
-    /// K2: a world or batch of zero is an unrepresentable assignment, not a
+    /// A world or batch of zero is an unrepresentable assignment, not a
     /// panic — `rows_for_step` returns the empty range.
     #[test]
     fn rows_for_step_never_panics_on_a_degenerate_spec() {
@@ -301,7 +298,7 @@ mod tests {
     }
 
     /// The single-rank constructor is exactly rank 0 of world 1 under the
-    /// v1 rule — what `run_spec` always builds at this commit.
+    /// v1 rule.
     #[test]
     fn single_rank_is_rank_zero_of_world_one() {
         let spec = PartitionSpec::single_rank(8, PartitionRule::BlockByGlobalBatch);
@@ -317,7 +314,7 @@ mod tests {
     }
 
     /// A rank whose slice starts exactly at `train_count` (not past it) is
-    /// the boundary K2 names: still zero rows, still no panic.
+    /// the boundary case: still zero rows, still no panic.
     #[test]
     fn a_rank_starting_exactly_at_train_count_is_zero_rows_not_an_overshoot() {
         // world=2, batch=3: global batch = 6. train_count=6 -> the NEXT step
@@ -331,7 +328,7 @@ mod tests {
         assert_eq!(rank0.rows_for_step(6, 1), 6..6);
     }
 
-    /// U4b: `for_gang` clears its bounds, `for_rank` (its test/`test-hooks`
+    /// `for_gang` clears its bounds, `for_rank` (its test/`test-hooks`
     /// wrapper) agrees with it byte-for-byte, and every out-of-bounds input
     /// is refused by name rather than panicking downstream.
     #[test]
@@ -347,11 +344,11 @@ mod tests {
         assert!(PartitionSpec::for_gang(0, 3, 0, PartitionRule::BlockByGlobalBatch).is_err());
     }
 
-    /// U4b acceptance (b)/(d)'s own primitive: `counts_for_step` computes
+    /// `counts_for_step` computes
     /// EVERY rank's row count from one rank's spec, agreeing with
     /// `rows_for_step` for each rank it stands in for, with no exchange.
     /// `train_count = 8`, `W = 2`, `B = 3`: global batch 6; step 0 is full
-    /// (3, 3); step 1 is the zero-row-rank case DESIGN.md §2 names (train
+    /// (3, 3); step 1 is the zero-row-rank case (train
     /// count 8 mod 6 = 2, so rank 1's slice `[9, 12)` clamped to `[8, 8)` is
     /// empty while rank 0's `[6, 9)` clamped to `[6, 8)` still holds 2 rows).
     #[test]

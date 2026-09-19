@@ -13,7 +13,7 @@
 //!   batch-halving attempt: bounded, self-correcting (the next attempt
 //!   either succeeds smaller or hits the real failure again unchanged). It
 //!   is never attached to a durable, caller-facing message, so it also
-//!   carries the bare `oom` token (#319: only a genuine OOM should take the
+//!   carries the bare `oom` token (only a genuine OOM should take the
 //!   retry, but a false-positive retry is cheap — the token's ambiguity is
 //!   an acceptable cost here specifically because it's bounded).
 //! - [`is_definite_oom_message`] (the **strict** predicate) matches only the
@@ -133,9 +133,8 @@ mod tests {
         }
     }
 
-    /// Table-driven divergence test over the two adversarial sets an audit
-    /// exercised: false positives (a bare "oom" fragment embedded in
-    /// user-controlled text) and false negatives (real long driver/framework
+    /// Table-driven divergence test over two adversarial sets: false positives (a bare "oom"
+    /// fragment embedded in user-controlled text) and false negatives (real long driver/framework
     /// spellings). Asserts BOTH predicates' answers for every string, so a
     /// regression in either predicate — or the two drifting apart — fails
     /// here directly.

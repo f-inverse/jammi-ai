@@ -1,28 +1,27 @@
-//! W5-PR0b acceptance test — CPU fine-tuning init is bit-reproducible.
+//! CPU fine-tuning init is bit-reproducible.
 //!
 //! A LoRA fine-tune on `Device::Cpu` must be a pure function of
 //! `(seed, source rows, config)`: two runs with the SAME seed produce
 //! BYTE-IDENTICAL adapter weights, and a DIFFERENT seed produces different
-//! weights (so the seed is provably honoured, not ignored). The four
-//! nondeterminism sources PR0b fixes — unseeded LoRA Kaiming/Gaussian init
-//! (#1/#2), unseeded dropout (#3), and unstable source row order (#6) — would
-//! each break this.
+//! weights (so the seed is provably honoured, not ignored). Each of the
+//! nondeterminism sources — unseeded LoRA Kaiming/Gaussian init, unseeded
+//! dropout, and unstable source row order — would break this.
 //!
 //! SCOPE OF THIS FILE. These tests drive the loop with PRECOMPUTED
 //! `TrainingBatch`es, which the trainer routes straight to `compute_loss` over
 //! the raw embeddings — `LoraLinear::forward` is never called. So this file pins
-//! only the **seeded init** halves of the contract (#1/#2): same-seed byte
+//! only the **seeded init** halves of the contract: same-seed byte
 //! equality and different-seed divergence of the initialised adapter, plus the
 //! isolated init probe below. The **trained-forward** halves of the contract —
 //! that the adapter genuinely TRAINS off zero-init and that the seeded **dropout**
-//! mask (#3) is reproducible on the executed `forward` — are proven by the
+//! mask is reproducible on the executed `forward` — are proven by the
 //! in-crate module `fine_tune::trainer::determinism_through_forward`, which drives
 //! the production `forward` → `regress` → `compute_loss` → AdamW dispatch (private
 //! to the crate, hence in-crate). That module also carries the non-vacuity check:
 //! swapping the seeded mask for candle's unseeded `ops::dropout` makes its
 //! same-seed byte-equality assertion fail.
 //!
-//! The design (§4) measured candle CPU ops bit-identical across thread counts,
+//! Candle CPU ops are bit-identical across thread counts,
 //! so these tests do NOT pin `RAYON_NUM_THREADS`; they run on a multi-thread
 //! runtime. If a same-seed run is ever not byte-identical, that is a
 //! design-invalidating finding — do not loosen to a tolerance.

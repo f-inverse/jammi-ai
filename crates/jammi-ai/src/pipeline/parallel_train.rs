@@ -107,7 +107,7 @@ where
 {
     // Deterministic (name-sorted) order, never `VarMap::all_vars()`'s raw
     // `HashMap` iteration order — see `optimizer::sorted_trainable_vars`'s own
-    // doc (esc-182): a raw `all_vars()` order is stable within one process but
+    // doc: a raw `all_vars()` order is stable within one process but
     // randomized ACROSS process invocations by `HashMap`'s per-process hasher
     // seed, which would make the clip's f32 fold order — and therefore its
     // last bits — depend on process-launch randomness rather than `config`'s
@@ -195,12 +195,11 @@ mod tests {
     /// promises for "a reduced-precision dtype" — is never entered. A BF16
     /// loss forces it.
     ///
-    /// Mutation tried: `replace == with !=` on that condition — the mutant
-    /// keeps a non-F32 loss in ITS OWN dtype (skips the cast) and routes an
+    /// A mutant that replaces `==` with `!=` on that condition keeps a
+    /// non-F32 loss in ITS OWN dtype (skips the cast) and routes an
     /// already-F32 loss through a redundant (no-op, invisible) `to_dtype`
-    /// instead. RED here: `to_scalar::<f32>()` on an uncast BF16 tensor is a
-    /// dtype mismatch candle refuses — `Result::unwrap()` panics instead of
-    /// returning `Ok`.
+    /// instead. This test catches it: `to_scalar::<f32>()` on an uncast BF16
+    /// tensor is a dtype mismatch candle refuses, so `Result::unwrap()` panics.
     #[test]
     fn scalar_loss_casts_a_non_f32_loss_before_reading_it() {
         let dev = Device::Cpu;

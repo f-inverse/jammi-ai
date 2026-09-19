@@ -71,9 +71,8 @@ static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A CUDA device that cannot be held without also holding [`GPU_SERIAL`].
 ///
-/// Campaign #446, finding 9 (the class sibling of
-/// `crates/jammi-encoders/tests/esc076_comparable_eager_control.rs`'s own
-/// `SerialGpu`). `gguf_quantized_gpu.rs`'s admission-truthfulness oracle
+/// The sibling of `crates/jammi-encoders/tests/esc076_comparable_eager_control.rs`'s
+/// own `SerialGpu`. `gguf_quantized_gpu.rs`'s admission-truthfulness oracle
 /// reads DEVICE-GLOBAL memory (`nvidia-smi --query-gpu=memory.used`, a
 /// whole-device figure) as a before/after DELTA around a model load. Any
 /// concurrent allocation on the same device inside that window is charged to
@@ -85,41 +84,38 @@ static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// A test added tomorrow cannot forget to serialize, because it cannot obtain
 /// the device without doing so.
 ///
-/// # Why there is no `Deref<Target = Device>` (round-1 audit)
+/// # Why there is no `Deref<Target = Device>`
 ///
-/// This type used to `impl Deref<Target = Device>`, which kept `&device` call
-/// sites unchanged — and let `let d = (*serial_cuda_device().unwrap()).clone();`
-/// type-check. That one-liner ENDS the serialization: the temporary guard
+/// A `Deref<Target = Device>` impl would let
+/// `let d = (*serial_cuda_device().unwrap()).clone();` type-check. That
+/// one-liner ENDS the serialization: the temporary guard
 /// (and with it the slot) is dropped at the end of the statement, while `d`
 /// is a live, owned `Device` the caller then measures on with no slot held —
 /// the exact escape the wrapper exists to prevent, spelled as ordinary deref
 /// usage.
 ///
-/// [`Self::device`] replaces it: the borrow it returns is tied to `&self`, so
-/// no `&Device` can outlive the guard. Every call site passes
-/// `guard.device()` where it used to pass `&guard`.
+/// [`Self::device`] is the accessor instead: the borrow it returns is tied to
+/// `&self`, so no `&Device` can outlive the guard.
 ///
-/// **What is still open, stated rather than implied.** `candle_core::Device`
+/// **What remains possible.** `candle_core::Device`
 /// is `Clone`, so `guard.device().clone()` compiles and always will —
 /// nothing an API of this shape can do prevents cloning a `Clone` type
 /// reachable by reference (a `&DeviceRef` newtype does not help: if it
 /// derefs to `Device` the clone resolves straight through it, and if it does
-/// not, no call site can pass it where `&Device` is wanted). What changed is
-/// that the escape is now an EXPLICIT, greppable `.device().clone()` rather
-/// than an incidental consequence of deref — a reviewer looking for it has a
+/// not, no call site can pass it where `&Device` is wanted). The escape is an
+/// EXPLICIT, greppable `.device().clone()` rather than an incidental
+/// consequence of deref — a reviewer looking for it has a
 /// single spelling to grep for, and no correct call site needs it.
 ///
-/// **What this does NOT close, stated plainly rather than implied.** Only the
+/// **What this does NOT cover.** Only the
 /// callers of `serial_cuda_device` take the slot. The other thirteen modules
 /// in this binary build GPU-pinned sessions through [`gpu_session`] and
-/// allocate on the same device without taking it; today they are held off the
+/// allocate on the same device without taking it; they are held off the
 /// measurement window ONLY by `ci/scripts/runpod_gpu_prove.sh`'s
-/// `--test-threads=1` on the `gpu_capability` invocation — a CI flag, i.e.
-/// exactly the kind of convention finding 9 is about. Closing that residual
-/// means routing every device acquisition in this binary through this slot
-/// (a change to `gpu_session`'s signature at every call site), which is a
-/// separate, larger unit; it is recorded here so the remaining exposure is
-/// visible at the mechanism rather than only in a review note.
+/// `--test-threads=1` on the `gpu_capability` invocation — a CI convention,
+/// not a structural guarantee. Closing it means routing every device
+/// acquisition in this binary through this slot (a change to `gpu_session`'s
+/// signature at every call site).
 ///
 /// A poisoned lock is recovered with `into_inner` rather than unwrapped: one
 /// leg panicking must fail THAT leg, not turn every sibling into a confusing
@@ -212,8 +208,8 @@ fn gpu_slot_is_exclusive_while_held() {
 /// sibling test dispatching the SAME counter mid-window would corrupt a
 /// before/after delta. This binary's first CPU-hermetic counter test
 /// (`capability_surface`'s
-/// `gelu_erf_fused_bumps_on_a_bert_family_training_forward_cpu_hermetic`,
-/// issue #463 follow-up) takes this lock; any sibling added later must take
+/// `gelu_erf_fused_bumps_on_a_bert_family_training_forward_cpu_hermetic`)
+/// takes this lock; any sibling added later must take
 /// the SAME one rather than minting a second the first cannot see.
 pub static ADMISSION_COUNTER_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -591,7 +587,7 @@ pub fn assert_loss_decreases(label: &str, curve: &[(u64, f64)]) -> (f64, f64) {
 }
 
 /// Assert every loss value across one or more captured curves is finite, BY
-/// COUNT (family F9: never a vacuous "some finite" pass — every reported
+/// COUNT (never a vacuous "some finite" pass — every reported
 /// value is checked and the tally is asserted, not merely the endpoints
 /// [`assert_loss_decreases`] happens to touch).
 pub fn assert_all_finite(label: &str, curves: &[&[(u64, f64)]]) {

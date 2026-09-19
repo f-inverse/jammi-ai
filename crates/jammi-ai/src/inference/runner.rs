@@ -41,7 +41,7 @@ pub struct InferenceRunner {
     /// Input columns copied verbatim to the end of every emitted sub-batch
     /// (see `schema::build_output_schema`'s `passthrough`).
     passthrough: Vec<String>,
-    /// RS7: the per-`InferenceExec`-instance admission bounding how many `forward()` calls run
+    /// The per-`InferenceExec`-instance admission bounding how many `forward()` calls run
     /// concurrently across every partition of the SAME `InferenceExec`
     /// (shared via one `Arc` across the `N` `InferenceRunner`s
     /// `InferenceExec::execute` builds — one per partition). `None` is the
@@ -94,7 +94,7 @@ pub mod test_hooks {
             .insert(source_id.to_string(), 0);
     }
 
-    /// RS7's oracle: the peak number of `forward()` calls observed IN FLIGHT
+    /// Test oracle: the peak number of `forward()` calls observed IN FLIGHT
     /// SIMULTANEOUSLY over `source_id` since the last reset, so a test can
     /// prove the per-`InferenceExec`-instance forward permit (`InferenceRunner::
     /// with_forward_permits`) actually bounds concurrency rather than merely
@@ -200,7 +200,7 @@ impl InferenceRunner {
     }
 
     /// Bound `forward()` concurrency across every partition sharing this
-    /// semaphore (RS7). See `forward_permits`'s field doc.
+    /// semaphore. See `forward_permits`'s field doc.
     pub fn with_forward_permits(mut self, permits: Arc<tokio::sync::Semaphore>) -> Self {
         self.forward_permits = Some(permits);
         self
@@ -340,7 +340,7 @@ impl InferenceRunner {
             let chunk_ordinals = ordinals.slice(chunk_start, chunk_len);
 
             let start = Instant::now();
-            // RS7: acquire this exec's forward admission BEFORE the model
+            // Acquire this exec's forward admission BEFORE the model
             // is ever invoked, and hold it for the whole forward call — an
             // OOM-halving retry below re-acquires on its next loop iteration,
             // never holding the permit across the halving decision itself.
@@ -412,8 +412,8 @@ impl InferenceRunner {
     /// [`crate::model::oom`] for the shared spelling table and why this uses
     /// the retry predicate [`is_oom_message`] (matches every table entry,
     /// including the bare `oom` token) rather than the training classifier's
-    /// stricter, long-spellings-only predicate (#319's misroute risk, and
-    /// why a false positive here is bounded/self-correcting).
+    /// stricter, long-spellings-only predicate (the misroute risk, and why a
+    /// false positive here is bounded/self-correcting).
     fn is_oom_error(e: &JammiError) -> bool {
         is_oom_message(&e.to_string().to_lowercase())
     }
@@ -474,7 +474,7 @@ mod tests {
 
     /// `is_oom_error` must classify ONLY genuine out-of-memory errors. A CUDA
     /// kernel/loader failure (e.g. `INVALID_PTX`) is not OOM — misrouting it to
-    /// the batch-halving retry (and never surfacing it) is #319.
+    /// the batch-halving retry would hide it from the caller.
     #[test]
     fn is_oom_error_matches_only_real_oom() {
         let oom = |m: &str| InferenceRunner::is_oom_error(&JammiError::Inference(m.into()));
@@ -569,12 +569,10 @@ mod tests {
     /// sub-batch `run_chunks` sends for one stream — including across an
     /// OOM-halving retry, which resends the SAME row slice at a smaller
     /// size: the retried rows must get the ordinals their failed attempt
-    /// never emitted, never a gap and never a value reused. Verified by
-    /// reverting `run_chunks`' "advance only on a batch that was actually
-    /// sent" placement (advancing `next_ordinal` before the OOM-retry check
-    /// instead of after it): this test goes RED with a gap in the sequence
-    /// where the failed, retried attempt's ordinals were burned and never
-    /// reassigned.
+    /// never emitted, never a gap and never a value reused. `run_chunks`
+    /// advances `next_ordinal` only on a batch that was actually sent (after
+    /// the OOM-retry check); advancing it before would burn the failed
+    /// attempt's ordinals and leave a gap.
     #[tokio::test]
     async fn run_chunks_ordinal_is_contiguous_across_an_oom_halving_retry() {
         let row_count = 300;
@@ -627,13 +625,12 @@ mod tests {
         );
     }
 
-    /// #330: a successful OOM-halving retry must resend the FULL slice at the
+    /// A successful OOM-halving retry must resend the FULL slice at the
     /// smaller size, and the cursor loop must read `current_batch_size`
     /// fresh on both the slice length and the advance — so a shrink never
-    /// diverges from the outer cursor (the old `step_by` + mutable-halving
-    /// split let the two drift apart and silently dropped rows, empirically
-    /// 100 of 300). Every one of 300 input rows must appear in the output
-    /// stream exactly once.
+    /// diverges from the outer cursor (a `step_by` stride with a separately
+    /// halved batch size drifts apart and silently drops rows). Every one of
+    /// 300 input rows must appear in the output stream exactly once.
     #[tokio::test]
     async fn run_chunks_conserves_every_row_across_oom_halving() {
         let row_count = 300;
@@ -683,7 +680,7 @@ mod tests {
         expected.sort();
         assert_eq!(
             ids, expected,
-            "every input row must appear exactly once — no drops (#330), no duplicates"
+            "every input row must appear exactly once — no drops, no duplicates"
         );
     }
 
@@ -735,7 +732,7 @@ mod tests {
         );
     }
 
-    /// #331: a non-OOM forward failure is always systemic — it must
+    /// A non-OOM forward failure is always systemic — it must
     /// propagate immediately, never be misrouted through the OOM-halving
     /// retry, and never emit any output batch.
     #[tokio::test]
@@ -783,7 +780,7 @@ mod tests {
         );
     }
 
-    /// RS7: `forward()` concurrency across partitions is bounded by the
+    /// `forward()` concurrency across partitions is bounded by the
     /// shared per-`InferenceExec`-instance permit, never by accident of scheduling. Four
     /// concurrent `run_chunks` callers (simulating `N=4` partitions of one
     /// `InferenceExec` sharing one `Arc<Semaphore>`, as
@@ -791,10 +788,10 @@ mod tests {
     /// while "forwarding", so overlapping calls are actually observable —
     /// a synchronous sleep, not `tokio::time::sleep`, because the injected
     /// `forward` closure is sync and must genuinely occupy a worker thread
-    /// for overlap to be possible at all. Verified by passing `None` instead
-    /// of `Some(&permits)`: this test goes RED (`peak_concurrent_forwards_for`
-    /// observes 4 concurrent forwards, exceeding the 2-permit bound the
-    /// assertion checks).
+    /// for overlap to be possible at all. Without the shared permit (`None`
+    /// instead of `Some(&permits)`), `peak_concurrent_forwards_for` observes 4
+    /// concurrent forwards, exceeding the 2-permit bound the assertion
+    /// checks.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn run_chunks_bounds_concurrent_forwards_to_the_shared_permit() {
         let source_id = "rs7-concurrency-test-source";
@@ -860,7 +857,7 @@ mod tests {
         }
     }
 
-    /// RS7's CPU speedup measurement: `N=1` sequential vs `N=4` concurrent
+    /// CPU speedup measurement: `N=1` sequential vs `N=4` concurrent
     /// CPU-bound "forward" calls on a `std::thread::available_parallelism()`
     /// machine, sharing a `default_forward_permits(Cpu)`-sized semaphore
     /// (unbounded here in intent — the permit count is `available_parallelism`,
@@ -943,7 +940,7 @@ mod tests {
 
         let speedup = seq_elapsed.as_secs_f64() / par_elapsed.as_secs_f64();
         eprintln!(
-            "RS7 CPU speedup at N={n} on this machine: sequential={:.1}ms concurrent={:.1}ms speedup={speedup:.2}x",
+            "CPU speedup at N={n} on this machine: sequential={:.1}ms concurrent={:.1}ms speedup={speedup:.2}x",
             seq_elapsed.as_secs_f64() * 1000.0,
             par_elapsed.as_secs_f64() * 1000.0,
         );

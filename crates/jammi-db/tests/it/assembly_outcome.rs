@@ -1,5 +1,4 @@
-//! The assembly cooldown/counter (migration 037,
-//! `docs/plans/67-distributed-training/UNITS.md` § U5b-1b-ii):
+//! The assembly cooldown/counter (migration 037):
 //! `Catalog::claim_next`'s cooldown term in its CANDIDATE subselect,
 //! `Catalog::record_assembly_outcome`'s exhaustive [`AssemblyOutcome`] rule,
 //! and `Catalog::materialize_or_reuse_training_set` (the coordinator's
@@ -226,7 +225,7 @@ async fn cooldown_job_never_blocks_a_lower_priority_ready_job(backend: BackendKi
 /// A source scan, hermetic: `jobs_repo.rs` must render every clock-bearing
 /// SQL fragment through `catalog::lease`'s helpers
 /// (`lease_expired_clause`/`lease_deadline_expr`), never a hand-written
-/// second clock source. RED against a mutation that inlines
+/// second clock source. Fails against a mutation that inlines
 /// `CURRENT_TIMESTAMP`, `datetime('now'`, or `chrono::Utc::now()` directly
 /// into the cooldown SQL instead of delegating.
 #[test]

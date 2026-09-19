@@ -46,7 +46,7 @@ use channel_repo::ChannelRepo;
 /// Tenant binding: optional. When set, every catalog write reads the bound
 /// tenant on each call, writes `tenant_id = <bound>` (NULL when Unscoped),
 /// and asserts via [`backend::Transaction::assert_tenant_matches`] before the
-/// underlying INSERT to honour SPEC-03 §7 defence-in-depth. Reads filter to
+/// underlying INSERT, as defence in depth. Reads filter to
 /// `tenant_id = <bound> OR tenant_id IS NULL`. When unbound (default), every
 /// row is written with NULL `tenant_id` and reads return every row — the
 /// no-op identity for single-tenant deployments.

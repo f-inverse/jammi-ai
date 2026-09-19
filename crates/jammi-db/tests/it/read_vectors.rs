@@ -125,12 +125,10 @@ async fn read_vectors_surfaces_typed_engine_fault_on_wrong_column_shape(backend:
     // The parquet at the registered table's URL carries a `vector` column
     // typed Utf8, not FixedSizeList<Float32>. This is the TABLE's own stored
     // artifact — the corruption is never the caller's fault, so
-    // `read_vectors` must surface `JammiError::IncompatibleFormat` (round-8
-    // DIST fix: a standing oracle used to pin the caller class,
-    // `JammiError::Schema`, for exactly this engine-owned defect) with the
-    // actual shape populated — proves callers see a typed, correctly-
-    // attributed signal instead of the panic-on-downcast the OSS path used
-    // to emit when consumers reached straight at the parquet.
+    // `read_vectors` must surface `JammiError::IncompatibleFormat` (never
+    // the caller class, `JammiError::Schema`, for this engine-owned defect)
+    // with the actual shape populated — callers see a typed,
+    // correctly-attributed signal, never a panic on downcast.
     let dir = tempdir().unwrap();
     let session = make_test_session(backend, dir.path()).await;
 

@@ -1,4 +1,4 @@
-//! One lease-renewal thread per process (N3): a dedicated OS thread running
+//! One lease-renewal thread per process: a dedicated OS thread running
 //! its own `current_thread` tokio runtime and its OWN catalog connection,
 //! renewing every lease the process holds from a hold list.
 //!
@@ -7,7 +7,7 @@
 //! the same worker threads an inline compute job's CPU-bound (blocking)
 //! work occupies. N+1 such jobs on an N-thread runtime can starve every
 //! async task on it — including the heartbeat — for the whole duration of
-//! the blocking work, which is exactly the shape that let a live holder's
+//! the blocking work, which lets a live holder's
 //! lease expire out from under it and be reclaimed by a peer. A dedicated
 //! `std::thread` with its own runtime and its own connection can never be
 //! starved by contention on the main runtime's worker pool.
@@ -924,11 +924,9 @@ async fn release_job_holds_on_thread(
         }
     }
     // A real assert, not `debug_assert_eq!`: this pass runs at most once per
-    // RELEASE (never in a hot loop), and `HoldRelease::attempted` is now a
+    // RELEASE (never in a hot loop), and `HoldRelease::attempted` is a
     // value consumers evaluate `confirms_release()` against — a corrupted
-    // count must never reach a caller silently in a release build (contract
-    // `CONTRACT-OPS-fix4.md` M5: a check compiled out in release build is
-    // not a check).
+    // count must never reach a caller silently in a release build.
     assert_eq!(
         outcome.released + outcome.not_required + outcome.failed,
         outcome.attempted,

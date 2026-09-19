@@ -1,6 +1,5 @@
 //! `catalog::compute_repo` — generic CRUD over `compute_executors` /
-//! `compute_jobs` (migration 038, `docs/plans/67-distributed-training/
-//! UNITS.md` § U8b). Parameterized sqlite/postgres, the `migrations.rs` /
+//! `compute_jobs` (migration 038). Parameterized sqlite/postgres, the `migrations.rs` /
 //! `gang_membership.rs` shape: every test also runs a `::postgres` arm
 //! gated by `live-postgres-tests`.
 //!
@@ -23,7 +22,7 @@ use crate::common::catalog_on;
 
 /// Tests own their rows: the Postgres arm shares one database with every
 /// other lane on this host, so every executor row a test registers is
-/// removed on the way out — on the GREEN arm and on a PANIC alike (the
+/// removed on the way out — on the passing arm and on a PANIC alike (the
 /// body runs under `catch_unwind`, the rows are removed, then the panic
 /// resumes). A `cuda` row a red test left behind would make a later lane's
 /// device-kind refusal admit a plan no live executor can run.
@@ -226,8 +225,7 @@ async fn adjust_compute_slots_is_atomic_across_the_whole_batch(kind: BackendKind
         );
 
         // A batch where `a`'s delta is fine but `b`'s would push available_slots
-        // (currently 2) below 0 by more than task_slots allows -- RED at base
-        // (the verb does not exist without this commit): the WHOLE batch must
+        // (currently 2) below 0 by more than task_slots allows: the WHOLE batch must
         // refuse, and `a`'s row (already valid on its own) must be unchanged.
         let err = catalog
             .adjust_compute_slots(&[(a.as_str(), -1), (b.as_str(), -3)])

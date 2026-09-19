@@ -3,13 +3,12 @@
 //! [`BuildingTable::abort`].
 //!
 //! The catalog row a writer creates is published in two steps — bytes first,
-//! then a single row flip `building -> ready` — and until the lease landed
-//! nothing on the row said who was producing it or whether they were alive.
-//! Startup recovery in a peer process therefore reaped a live writer's
-//! `building` row, and the writer's unguarded promote then flipped the reaped
-//! row to `ready` over deleted bytes (esc-094, issue #479). This handle is the
-//! writer's side of the fix: it owns the row's `writer_id`, keeps the lease
-//! renewed by holding it with the process's [`crate::catalog::lease_keeper::LeaseKeeper`] (N3), and routes
+//! then a single row flip `building -> ready`. Without a lease on the row,
+//! startup recovery in a peer process could reap a live writer's `building`
+//! row, and the writer's unguarded promote would then flip the reaped row to
+//! `ready` over deleted bytes. This handle is the writer's side of the lease:
+//! it owns the row's `writer_id`, keeps the lease renewed by holding it with
+//! the process's [`crate::catalog::lease_keeper::LeaseKeeper`], and routes
 //! every transition on the row through the [`ResultTableCas`] predicate naming
 //! that writer, so a peer's recovery (which touches only rows whose lease is
 //! absent or expired) and a live writer can never both act on one row.
@@ -211,7 +210,7 @@ impl BuildingTable {
     ///
     /// 1. **renew the lease** by CAS — a writer whose lease was claimed by
     ///    recovery learns it here, before it writes an attestation over bytes
-    ///    it no longer owns (K7: the sidecar is written only after a
+    ///    it no longer owns (the sidecar is written only after a
     ///    successful renew);
     /// 2. [`ResultStore::write_attestation`] — compute the artifact digest
     ///    over the durable Parquet bytes, build the
@@ -351,7 +350,7 @@ impl BuildingTable {
         }
     }
 
-    /// Detach the handle from its row with NO catalog transition (N2): stop
+    /// Detach the handle from its row with NO catalog transition: stop
     /// renewing (release the keeper hold), mark the handle done, issue no
     /// CAS, delete nothing. The state a job that lost its lease — or whose
     /// attempt was superseded by a reclaim — leaves behind: the row stays
@@ -359,7 +358,7 @@ impl BuildingTable {
     /// expires (or, if already expired, is immediately reclaimable). Drop
     /// marks nothing further. A recovery sweep after the lease expires
     /// reconciles the row exactly as it would a dead writer's; the successor
-    /// attempt that reclaims it adopts or fails it (N1).
+    /// attempt that reclaims it adopts or fails it.
     ///
     /// Distinct from [`Self::abort`] (a CAS-fail-and-delete, the OWNER's own
     /// decision that its output should never exist) — `detach` is for the

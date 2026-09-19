@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn session_scope_closes_the_record_tenant_verify_leak() {
-        // The RED→GREEN contrast, pinned as a regression test. A record signed
+        // The record-scoped vs. session-scoped contrast. A record signed
         // by tenant A is presented to tenant B's session.
         let env = lock();
         env.set(TEST_KEY);
@@ -247,7 +247,7 @@ mod tests {
         let mut a_record = scoped(); // tenant_id = "tenant-a"
         sign_record(&mut a_record, &store).unwrap();
 
-        // RED — the record-scoped primitive derives the secret from the
+        // The record-scoped primitive derives the secret from the
         // record's OWN `tenant_id` ("tenant-a"), so it confirms the signature as
         // valid to WHOEVER holds the record, including a peer: a cross-tenant
         // integrity leak.
@@ -256,7 +256,7 @@ mod tests {
             "record-scoped verify confirms A's record regardless of the caller — the leak",
         );
 
-        // GREEN — the session-scoped primitive derives the secret from the
+        // The session-scoped primitive derives the secret from the
         // presenting tenant ("tenant-b"), whose secret differs, so the same
         // record does not verify. The session, not a field on the record, is the
         // authority.

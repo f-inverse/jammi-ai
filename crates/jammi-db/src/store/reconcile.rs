@@ -38,7 +38,7 @@
 //! the SAME objects and sizes `apply=true` would reclaim (see
 //! [`ReconcileOptions::apply`]'s pinned dry-run/apply parity invariant).
 //!
-//! **A promotion is not a reclaim (#484 design revision).** An expired
+//! **A promotion is not a reclaim.** An expired
 //! `building` row with a valid Parquet and its manifest sidecar present is
 //! PROMOTED, not reaped — an internal `ExpiredRowOutcome::Promote`
 //! classification. Promoting an embedding row's rebuild
@@ -129,7 +129,7 @@ pub struct ReconcileOptions {
     /// whose delete is idempotent (`s3://`/`r2://`) a vanished key is
     /// reported [`crate::storage::DeleteOutcome::Deleted`] instead, so it is
     /// credited into `bytes_reclaimed` at its listed size exactly like a
-    /// real reclaim — the over-credit esc-103 tracks.
+    /// real reclaim — an over-credit this pass cannot detect.
     pub apply: bool,
     /// An orphan candidate younger than this is `pending`, never deleted —
     /// the window a concurrent writer's just-landed bytes have to grow a
@@ -569,7 +569,7 @@ impl ResultStore {
             })
             .collect::<Vec<_>>();
 
-        // Expired-building pre-pass (esc-094 follow-up): an expired-lease
+        // Expired-building pre-pass: an expired-lease
         // `building` row's objects are NEVER reaped through this pass's
         // orphan arm below (no claim, no CAS) — under `apply` they are
         // reconciled through the SAME recovery arm `ResultStore::recover`
@@ -729,7 +729,7 @@ impl ResultStore {
         // to `failed` FIRST (ONLY the CAS is skipped when `!apply`,
         // matching "apply=false mutates nothing" — the catalog row itself
         // is untouched), so its bytes fall out of the referenced set built
-        // below (the standard `failed`-rows-are-orphans rule, A12) in BOTH
+        // below (the standard `failed`-rows-are-orphans rule) in BOTH
         // modes. Removing the row from `still_ready` under `!apply` too
         // (never re-adding it, matching the `apply` arm exactly) is what
         // makes the dry-run/apply parity invariant on
@@ -784,8 +784,7 @@ impl ResultStore {
             .referenced_result_keys(&ready_rows, &live_building)
             .await?;
 
-        // The former `training_jobs` read now walks the kind-agnostic `jobs`
-        // table (migration 029, G7): `running` rows are fully referenced,
+        // Walk the kind-agnostic `jobs` table: `running` rows are fully referenced,
         // `queued` rows protect only their `_resume/**` prefix. Compute kinds
         // write nothing under `models/` at all, so they simply never
         // contribute a prefix here — no separate filter is needed for them.
@@ -1040,14 +1039,14 @@ impl ResultStore {
                         // pre-pass, won the race and deleted it first): this
                         // call freed nothing, so it is neither an orphan
                         // this pass reclaimed nor a failure to retry — esp.
-                        // never credited (esc-484's vanish-window defect).
+                        // never credited.
                         // Reached only on a driver that surfaces the vanish
                         // as `NotFound` (the local filesystem driver). The
                         // `s3://`/`r2://` AWS driver's delete is idempotent
                         // and never returns `NotFound`, so on those roots
                         // this arm is never taken and the vanished key falls
                         // into the `Deleted` arm above instead, over-crediting
-                        // `bytes_reclaimed` (esc-103).
+                        // `bytes_reclaimed`.
                         Ok(DeleteOutcome::Absent) => {
                             tracing::warn!(
                                 key,
@@ -1376,7 +1375,7 @@ mod credit_reaped_tests {
         );
     }
 
-    /// esc-484 item 2: a PARTIAL delete failure — the deleter's returned key
+    /// A PARTIAL delete failure — the deleter's returned key
     /// set omits the key whose `delete_if_exists` errored — must credit ONLY
     /// the keys that actually succeeded, never the one left out. This is the
     /// oracle for "`reap_after_fail_cas` credits only bytes whose delete

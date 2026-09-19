@@ -104,9 +104,8 @@ pub struct SegmentId(pub i64);
 /// loss* — it only bites when a segment's own graph returns less than its exact
 /// top, a scale/seed-dependent property that is not robustly isolable at
 /// deterministic unit scale (the merge-correctness unit tests below hold at
-/// `1.0` too). Its floor is therefore guarded by a committed multi-seed recall
-/// bench in `jammi-bench` (a follow-up), not by a single-seed unit assertion —
-/// naming the gap rather than pretending a flaky unit test closes it.
+/// `1.0` too). Its floor is therefore guarded by the multi-seed recall bench
+/// in `jammi-bench` (`recall.rs`), not by a single-seed unit assertion.
 pub const DEFAULT_SEGMENT_OVERFETCH_FACTOR: f32 = 2.0;
 
 /// Per-segment fetch width for a merge that wants a global top-`m` over
@@ -784,7 +783,7 @@ mod tests {
         }
     }
 
-    // Test 9b (A1) — the Binary two-segment `search_final` at `k = 1`,
+    // The Binary two-segment `search_final` at `k = 1`,
     // `oversample = 1` (so `candidate_k = 1`, `width = over_fetch(1, 2) = 2`).
     // Per-segment Hamming distances are fit against each segment's OWN τ, so
     // they are not on one scale: a merge that truncates the candidate set on
@@ -839,8 +838,8 @@ mod tests {
     // It does NOT isolate `DEFAULT_SEGMENT_OVERFETCH_FACTOR` — the factor only
     // pays off when a segment's own HNSW recall is below 100%, which is not
     // robustly reproducible at deterministic unit scale (this test holds at
-    // factor `1.0` too). That floor is seamed to a multi-seed recall bench; see
-    // the const's SEAM note.
+    // factor `1.0` too). That floor is guarded by the multi-seed recall bench;
+    // see the const's SEAM note.
     #[test]
     fn two_segment_quantized_search_final_equals_brute_force_under_truncation() {
         fn normalize(mut v: Vec<f32>) -> Vec<f32> {
@@ -930,7 +929,7 @@ mod tests {
         );
     }
 
-    // A3 (sync entry) — N=1 byte identity at EVERY precision: `search_final`
+    // N=1 byte identity at EVERY precision: `search_final`
     // over one segment returns the identical `(row_id, distance)` bytes a
     // manual retrieve→rescore over the lone `SidecarIndex` produces
     // (`over_fetch(m, 1) = m`, one rescore of the same candidate set, the same
@@ -1045,11 +1044,11 @@ mod tests {
         (hits, reads.get())
     }
 
-    // A2 — the exact-read count per precision, on the kernels through a
+    // The exact-read count per precision, on the kernels through a
     // counting closure (no `SidecarIndex` instrumentation). `k = 5`,
     // `oversample = 4` → `candidate_k = 20`:
     //   F16 / Int8 at N=1 and N=2 → exactly 20 (rescore only the merge's
-    //     survivors — today's count);
+    //     survivors);
     //   Binary at N=2 → `2 · over_fetch(20, 2) = 80` (every segment rescores
     //     its own width before the merge — the multiplier is paid only here);
     //   F32 → 0.
@@ -1147,9 +1146,9 @@ mod tests {
 
     /// A wrong-width query is refused at the SEARCH ENTRY with a typed error
     /// naming both widths — never a panic, and never a silent answer over a
-    /// prefix. `Binary` is the case that used to panic: the query packs to
+    /// prefix. `Binary` is the subtle case: the query packs to
     /// `ceil(len/8)` bytes, so usearch accepts an over-long query and the
-    /// fault only surfaces inside `cosine_distance`.
+    /// fault would only surface inside `cosine_distance`.
     #[test]
     fn a_wrong_width_query_is_a_typed_refusal_on_every_precision() {
         let rows = corpus(); // 8-wide
@@ -1221,9 +1220,8 @@ mod tests {
         for (precision, expected) in [
             (StoragePrecision::F32, Some(1.0f32)),
             (StoragePrecision::F16, Some(1.0)),
-            // 0.5 was the contract's figure on ITS fixture; measured here on
-            // an 8-d corpus it is 0.6464466. The load-bearing property is the
-            // same on every precision: FINITE, never NaN.
+            // Measured on this 8-d corpus: 0.6464466. The load-bearing
+            // property is the same on every precision: FINITE, never NaN.
             (StoragePrecision::Int8, Some(0.646_446_6)),
             (StoragePrecision::Binary, None),
         ] {

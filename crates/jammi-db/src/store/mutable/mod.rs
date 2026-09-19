@@ -5,8 +5,6 @@
 //! shared deployments), supports transactional `INSERT` / `UPDATE` / `DELETE`
 //! through DataFusion DML, and federates with Parquet result tables and
 //! external sources in one query plan.
-//!
-//! See `docs/plans/cp9-substrate-primitives/SPEC-02-mutable-tables.md`.
 
 pub mod definition;
 pub mod postgres;

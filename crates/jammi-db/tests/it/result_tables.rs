@@ -1,4 +1,4 @@
-//! OPS (#482) — the building-table lease class under RELEASE: the linked
+//! The building-table lease class under RELEASE: the linked
 //! sweep `Catalog::release_building_tables_of_claimant` (scoped through the
 //! `jobs` linkage, never through `writer_id` alone), the `lease_present`
 //! arm every `renew_lease` carries so a released building lease is never
@@ -83,7 +83,7 @@ fn fast_intervals() -> jammi_db::catalog::lease::LeaseIntervals {
     .unwrap()
 }
 
-/// The sweep oracle (D11's two-class form): after `release_jobs_claimed_by`
+/// The sweep oracle (two-class form): after `release_jobs_claimed_by`
 /// + `release_building_tables_of_claimant`, exactly the building rows of
 /// THIS instance's loop-claimed compute jobs have a NULL lease and are
 /// claimable by a successor at once; a second sweep matches 0 rows; an
@@ -445,7 +445,7 @@ async fn the_sweep_writes_a_null_lease_the_backend_reads_back(backend: BackendKi
 // ---------------------------------------------------------------------------
 // `Catalog::get_result_table_for_tenant` — the STRICT tenant-pinned resolver
 // the gang admission handler resolves a `world_size > 1` job's
-// `training_set_location` through (I-GANG; #566 R2(b)).
+// `training_set_location` through.
 // ---------------------------------------------------------------------------
 
 fn strict_tenant(n: u8) -> jammi_db::TenantId {

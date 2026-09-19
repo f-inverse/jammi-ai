@@ -4,8 +4,8 @@
 //!
 //! # Why a custom `Deserializer` instead of two passes
 //!
-//! A "parse the file, then patch fields from env" two-pass loader (the shape
-//! `apply_env_overrides` used before this module) has to hand-list every
+//! A "parse the file, then patch fields from env" two-pass loader has to
+//! hand-list every
 //! overridable field and cannot express "this externally-tagged enum section
 //! is selected by an env var, but its payload still needs the file's
 //! sibling keys" or "an unknown `JAMMI_CATALOG__POSTGRES__BOGUS` must be
@@ -16,7 +16,7 @@
 //! externally-tagged enum, and every nested struct gets env-override support
 //! for free, with no per-field hand-listing.
 //!
-//! # The `Override` node and type-directed lowering (H1)
+//! # The `Override` node and type-directed lowering
 //!
 //! A file table and an env leaf can legitimately disagree on SHAPE at one
 //! path — the file spells out `[catalog.postgres]` with its fields, and the
@@ -35,7 +35,7 @@
 //!   field-by-field), so that specific combination is a typed error naming
 //!   the variable.
 //!
-//! # Laziness (D1/T4)
+//! # Laziness
 //!
 //! An env leaf never eagerly guesses its type: `deserialize_bool`/`i*`/`u*`/
 //! `f*` parse `raw` as that primitive, `deserialize_str`/`string`/`any`
@@ -44,10 +44,10 @@
 //! document (so `JAMMI_INFERENCE__HTTP__HEADERS='{ X-Api-Key = "v" }'`
 //! parses as a map). `deserialize_enum` treats the raw string as the
 //! variant's bare name, with an empty payload for a struct or newtype
-//! variant (X4) — never a panic, a `missing field` error surfaces exactly as
+//! variant — never a panic, a `missing field` error surfaces exactly as
 //! it would for a file table missing the same key.
 //!
-//! # No error ever echoes a VALUE (phase-4 audit)
+//! # No error ever echoes a VALUE
 //!
 //! An error derived from an env or file VALUE never includes that value —
 //! only the struct path, the `JAMMI_*` variable name, the expected
@@ -71,10 +71,10 @@
 //! "unknown variant" error names the variable and the expected variant
 //! list — never the value a bare env override supplied when that value
 //! does not itself name a variant (`deserialize_enum`'s `Node::Env` arm,
-//! and the `Node::Override` enum-lowering arm, which used to synthesize a
-//! table keyed by the raw value and let the generic multi-key path re-echo
-//! it — see [`Node::deserialize_enum`]'s Override arm for why membership is
-//! now checked before that table is ever built, not after).
+//! and the `Node::Override` enum-lowering arm, which checks membership
+//! before building a table keyed by the raw value, so the generic multi-key
+//! path can never re-echo it — see [`Node::deserialize_enum`]'s Override
+//! arm).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -99,7 +99,7 @@ pub(crate) enum Node {
     File(toml::Value),
     /// One `JAMMI_*` variable. `var` is the full name (used in every error
     /// message so a deployer can grep straight to the offending line in
-    /// their env); `raw` is its string value, parsed lazily (D1/T4).
+    /// their env); `raw` is its string value, parsed lazily.
     Env { var: String, raw: String },
     /// A lower (file-rooted) and upper (env-rooted) node disagree on shape
     /// at this path. See the module docs for how each `deserialize_*`
@@ -205,7 +205,7 @@ impl Node {
     }
 
     /// Parse an env value as a standalone TOML document — used by every
-    /// seq/map/struct-position env leaf (D1/T4): `JAMMI_...=raw` is parsed
+    /// seq/map/struct-position env leaf: `JAMMI_...=raw` is parsed
     /// as `key = raw` and the value extracted, so `raw` is read with TOML's
     /// own grammar (quoting, inline tables, arrays) rather than treated as
     /// pre-quoted text.
@@ -297,7 +297,7 @@ fn safe_type_error(source: Option<&str>, e: toml::de::Error, expected: &str) -> 
     }
 }
 
-/// Deep-merge `over` onto `base`. Type-blind (H1): a genuine shape
+/// Deep-merge `over` onto `base`. Type-blind: a genuine shape
 /// disagreement (a table meeting a leaf) is recorded as [`Node::Override`]
 /// rather than resolved here, because only the eventual `deserialize_*` call
 /// knows whether this is an enum position.
@@ -485,7 +485,7 @@ impl<'de> Deserializer<'de> for Node {
                 .deserialize_seq(visitor)
                 .map_err(|e| safe_type_error(None, e, "a sequence (TOML array)")),
             Node::Table { .. } => Err(NodeError("expected a sequence, found a table".into())),
-            // H14: a seq position takes the whole upper value — a file
+            // A seq position takes the whole upper value — a file
             // array is wholly replaced by an env array, never merged.
             Node::Override { upper, .. } => upper.deserialize_seq(visitor),
         }
@@ -517,10 +517,9 @@ impl<'de> Deserializer<'de> for Node {
                 iter: entries.into_iter(),
                 value: None,
             }),
-            // H14: a map position takes the whole upper value — a file
+            // A map position takes the whole upper value — a file
             // `[a.b]` table is wholly replaced by an env inline table, never
-            // merged. (t8.rs's `deserialize_any` dispatch here is
-            // superseded by this explicit `deserialize_map`.)
+            // merged.
             Node::Override { upper, .. } => upper.deserialize_map(visitor),
         }
     }
@@ -531,7 +530,7 @@ impl<'de> Deserializer<'de> for Node {
         _fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, NodeError> {
-        // H14: a struct position cannot take a whole-value env override — a
+        // A struct position cannot take a whole-value env override — a
         // struct is set field-by-field from env, never in one variable.
         // This refusal is identical whether or not a lower (file) layer is
         // present at this path: with a file layer the merge records
@@ -571,7 +570,7 @@ impl<'de> Deserializer<'de> for Node {
     ) -> Result<V::Value, NodeError> {
         match self {
             Node::Table { entries, .. } => {
-                // X2: fail-closed on any key that is not a known variant,
+                // Fail-closed on any key that is not a known variant,
                 // even when an env override selects a different, valid one.
                 for (k, v) in entries.iter() {
                     if !variants.contains(&k.as_str()) {
@@ -611,7 +610,7 @@ impl<'de> Deserializer<'de> for Node {
                     value: Some(value),
                 })
             }
-            // X4: a bare file string at an enum position behaves exactly
+            // A bare file string at an enum position behaves exactly
             // like a bare env leaf.
             Node::File(toml::Value::String(s)) => visitor.visit_enum(NodeEnum {
                 key: s.trim().to_string(),
@@ -623,8 +622,7 @@ impl<'de> Deserializer<'de> for Node {
             Node::Env { ref var, ref raw } => {
                 let key = raw.trim().to_string();
                 if !variants.contains(&key.as_str()) {
-                    // H13 pinned oracle: a bare env selection naming an
-                    // unknown variant, with no file layer to blame,
+                    // A bare env selection naming an unknown variant, with no file layer to blame,
                     // errors naming the VARIABLE — never `key`/`raw`: a bare
                     // enum-position env override that ISN'T a real variant
                     // name is exactly the shape a whole-value payload like
@@ -637,15 +635,14 @@ impl<'de> Deserializer<'de> for Node {
                 }
                 visitor.visit_enum(NodeEnum { key, value: None })
             }
-            // H1 + H14: the round-4 type-directed lowering. Only the
-            // deserializer (here) knows the variant list, so the merge
-            // deferred this decision to us.
+            // The type-directed lowering. Only the deserializer (here) knows the variant list, so
+            // the merge deferred this decision to us.
             Node::Override { lower, upper } => {
                 let lowered = match (*lower, *upper) {
                     // A bare env variant name over a file table: keep the
                     // file's payload for THAT SAME variant. Every key in
                     // the resulting table — winner included — is still
-                    // membership-checked below (H13 wording).
+                    // membership-checked below, with the same wording.
                     (
                         Node::Table {
                             entries: mut base, ..
@@ -744,7 +741,7 @@ struct NodeVariant(Option<Node>);
 impl<'de> VariantAccess<'de> for NodeVariant {
     type Error = NodeError;
 
-    // X3: a unit variant refuses a non-empty payload.
+    // A unit variant refuses a non-empty payload.
     fn unit_variant(self) -> Result<(), NodeError> {
         match self.0 {
             None => Ok(()),
@@ -766,7 +763,7 @@ impl<'de> VariantAccess<'de> for NodeVariant {
         }
     }
 
-    // X4: a bare selection (no payload) deserializes as if it named an
+    // A bare selection (no payload) deserializes as if it named an
     // empty table — a struct/newtype payload of all-optional fields parses
     // to its defaults, and one with a required field surfaces the ordinary
     // `missing field` error, never a panic.
@@ -785,7 +782,7 @@ impl<'de> VariantAccess<'de> for NodeVariant {
         visitor: V,
     ) -> Result<V::Value, NodeError> {
         // Route through `deserialize_struct` (not `deserialize_map`
-        // directly) so the H14 Override/struct-position rule applies
+        // directly) so the Override/struct-position rule applies
         // uniformly whether the struct is a bare field or an enum
         // variant's payload.
         self.0

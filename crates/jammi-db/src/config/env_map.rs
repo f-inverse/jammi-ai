@@ -1,12 +1,12 @@
 //! `JAMMI_*` environment variables → the env-layer [`Node`] tree, and the
-//! namespace rule (T5) that decides which `JAMMI_*` variables are config at
+//! namespace rule that decides which `JAMMI_*` variables are config at
 //! all.
 //!
 //! # The namespace rule
 //!
 //! - `JAMMI_<X>__<path>` is **always** config: an unknown `X` (not one of
 //!   [`TOP_LEVEL_FIELDS`]) is a typed error naming the variable, never a
-//!   silent no-op. This is esc-095's fix: `JAMMI_CATALOG__KIND=postgres` — a
+//!   silent no-op. So `JAMMI_CATALOG__KIND=postgres` — a
 //!   typo one segment short of `JAMMI_CATALOG__POSTGRES__…` — refuses rather
 //!   than running SQLite with nothing to explain why.
 //! - `JAMMI_<X>` with no `__` is config **iff** `X` exactly names a
@@ -14,13 +14,13 @@
 //!   `JAMMI_*` name — and everything without the `JAMMI_` prefix — is a
 //!   runtime knob outside this layer's namespace (`JAMMI_AUDIT_MASTER_KEY`,
 //!   `JAMMI_CONFIG`, `JAMMI_TEST_PG_URL`, `JAMMI_KERNELS_DISABLE`, …) and is
-//!   silently ignored here, exactly as it always was.
+//!   silently ignored here.
 //!
 //! Path segments (after the first) are lowercased on the way into the tree,
 //! matching every config struct's `snake_case` field names; a map key
 //! reached via a path segment is therefore always lowercased, while a value
 //! written as a TOML inline table (`JAMMI_INFERENCE__HTTP__HEADERS='{ X-Api-Key
-//! = "v" }'`) preserves the case of its own keys (R8) because those keys
+//! = "v" }'`) preserves the case of its own keys because those keys
 //! never pass through this segment-splitting logic at all — they are parsed
 //! as TOML by [`super::layers::Node`]'s lazy env leaf.
 
@@ -107,7 +107,7 @@ where
     })
 }
 
-/// Insert one `var=raw` pair at `segments` into `map`, applying the T6
+/// Insert one `var=raw` pair at `segments` into `map`, applying the
 /// order-independent leaf/table collision rule: a variable that would set a
 /// value at a path another variable already nests under (or vice versa) is
 /// a typed error naming BOTH variables, regardless of insertion order —

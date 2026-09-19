@@ -1,13 +1,9 @@
 //! Kind-agnostic job-queue primitives on the `jobs`/`instances`/`workers`
 //! catalog tables (migration 029): atomic claim (queued and inline), lease
 //! heartbeat, the full attempt guard, expired-lease/dead-instance reclaim,
-//! and the esc-075 acceleration-report pending/retirement lifecycle.
-//! Supersedes the former `training_jobs`-specific `fine_tune_queue.rs`,
-//! whose claim/heartbeat/reclaim/finalize/acceleration-report coverage this
-//! file carries forward against the generalised table — including the
-//! atomic finish-with-model-registration-and-epoch-checkpoints machinery
-//! [`Catalog::finish_job_with_model`] (the C1a design-gap this unit closes;
-//! see the handoff doc's "Resolved" section).
+//! the acceleration-report pending/retirement lifecycle, and the atomic
+//! finish-with-model-registration-and-epoch-checkpoints machinery
+//! [`Catalog::finish_job_with_model`].
 //!
 //! Every test is parameterised over [`BackendKind`] via `test_case` +
 //! `cfg_attr`. The SQLite lane is always generated; the Postgres lane is
@@ -1136,13 +1132,12 @@ async fn prune_jobs_deletes_only_terminal_rows_past_the_window(backend: BackendK
     assert!(catalog.get_job("old-running").await.is_ok());
 }
 
-// ─── F3: `submit_job_deduped`'s durable per-tenant idempotency key (migration
+// ─── `submit_job_deduped`'s durable per-tenant idempotency key (migration
 // 030) ───────────────────────────────────────────────────────────────────
 
-/// RED before migration 030 + `submit_job_deduped`: there was no
-/// `jobs.idempotency_key` column and no way to dedupe a retry durably (the
-/// old dedupe lived in a process `HashMap`, forgotten across a restart and
-/// racy under two concurrent identical submissions).
+/// The dedupe is durable: it lives in `jobs.idempotency_key`, never in a
+/// process `HashMap` that a restart forgets and two concurrent identical
+/// submissions race.
 ///
 /// Sequential retry: a second `submit_job_deduped` call carrying the SAME
 /// non-empty key as a still-known prior submission returns THAT prior job's
@@ -1386,14 +1381,12 @@ async fn force_job_status_and_age(catalog: &Catalog, job_id: &str, status: &str,
 
 // ---------------------------------------------------------------------------
 // `Catalog::finish_job_with_model` — the atomic finish-with-model-
-// registration-and-epoch-checkpoints machinery `training_repo::finalize_
-// training_job` provided, reimplemented on the generalised `jobs` schema's
-// full attempt guard (C1a design-gap resolution; see the handoff doc).
+// registration-and-epoch-checkpoints machinery, under the `jobs` schema's
+// full attempt guard.
 // ---------------------------------------------------------------------------
 
 /// A minimal queued job over `q-base`, carrying `output_model_id` — set at
-/// submit time on the new schema (unlike the removed `training_jobs`, where
-/// it was written only by `finalize_training_job`).
+/// submit time.
 fn job_params_with_output<'a>(job_id: &'a str, output_model_id: &'a str) -> SubmitJobParams<'a> {
     SubmitJobParams {
         output_model_id: Some(output_model_id),
@@ -1401,7 +1394,7 @@ fn job_params_with_output<'a>(job_id: &'a str, output_model_id: &'a str) -> Subm
     }
 }
 
-/// RED without the transaction: `finish_job_with_model` must be a single
+/// `finish_job_with_model` must be a single
 /// attempt-guarded compare-and-set. A worker that lost its lease (a zombie)
 /// must finish nothing — not the job status, not the output model's served
 /// path, and not a single epoch-checkpoint row, even when it presents a
@@ -1705,7 +1698,7 @@ async fn a_retained_epoch_checkpoints_own_row_makes_its_exact_prefix_referenced(
     );
 }
 
-/// B5 hardening regression (unit 348), ported: the finish-with-model CAS's
+/// The finish-with-model CAS's
 /// model-row `UPDATE` must be scoped by `name AND version AND tenant`, never
 /// `name` alone — three rows share the name "acme/tuned": (tenant-a, v1),
 /// (tenant-a, v2), (tenant-b, v1) — and a tenant-a finish naming version 1
@@ -1964,8 +1957,8 @@ async fn finish_job_with_model_skips_a_name_occupied_epoch_checkpoint(backend: B
 }
 
 // ---------------------------------------------------------------------------
-// esc-075 — the tri-state `acceleration_report` lifecycle is closed AT THE
-// CATALOG EDGE, ported onto the generalised `jobs` schema.
+// The tri-state `acceleration_report` lifecycle is closed AT THE
+// CATALOG EDGE.
 //
 // `submit_job` stamps `{"state":"pending"}` = "submitted, no claimant has
 // computed a determination YET". That sentence stops being true the moment
@@ -2218,7 +2211,7 @@ async fn acceleration_report_survives_fail(backend: BackendKind) {
 /// marker (a new attempt will re-probe), while the terminal attempts-
 /// exhausted arm preserves whatever determination the last attempt recorded
 /// — the two arms move `acceleration_report` in OPPOSITE directions because
-/// they mean opposite things about the job's future (#446 finding 1).
+/// they mean opposite things about the job's future.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -2513,7 +2506,7 @@ async fn reclaim_exhausted_rewrites_a_pending_report_to_undetermined(backend: Ba
 
 /// (iv, new arm) An `inline`-execution job's owning `instances` row going
 /// stale/absent is ALSO a terminal `failed` transition with no live
-/// claimant — the same esc-075 rule applies with its own distinct reason,
+/// claimant — the same retirement rule applies with its own distinct reason,
 /// `inline_executor_died`, never conflated with the queued-execution
 /// exhaustion reason above.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
@@ -2554,7 +2547,7 @@ async fn inline_liveness_reclaim_rewrites_a_pending_report_to_undetermined(backe
 }
 
 // ---------------------------------------------------------------------------
-// esc-107 — `Catalog::create_result_table`'s `jobs.partial_result` CAS must
+// `Catalog::create_result_table`'s `jobs.partial_result` CAS must
 // carry the full `(job_id, claimed_by, attempts)` attempt guard, not
 // `job_id` alone: a `job_id`-only predicate lets a zombie of a REQUEUED and
 // RE-CLAIMED attempt still win the CAS, because the job genuinely IS
@@ -2586,7 +2579,7 @@ fn result_table_params<'a>(
     }
 }
 
-/// RED against the `job_id`-only predicate this unit replaced: a zombie
+/// Fails against a `job_id`-only predicate: a zombie
 /// presenting a SUPERSEDED attempt (its lease expired, the job was requeued
 /// and re-claimed by a different instance, all while the zombie never
 /// learned its lease was gone) must not win the `partial_result` CAS just
@@ -2690,7 +2683,7 @@ async fn create_result_table_cas_rejects_a_zombies_stale_attempt_across_a_reclai
 }
 
 // ---------------------------------------------------------------------------
-// OPS (#482) — lease RELEASE on the jobs class: `release_job_lease` /
+// Lease RELEASE on the jobs class: `release_job_lease` /
 // `release_jobs_claimed_by` (the heartbeat CAS + `lease_expires_at = NULL,
 // releases = releases + 1`, both carrying `AND lease_expires_at IS NOT NULL`),
 // the release-aware reclaim cap (`attempts - releases`), the re-arm guard on
@@ -2787,12 +2780,11 @@ async fn released_job_is_requeued_by_the_next_reclaim_without_waiting_for_expiry
     assert_eq!(untouched.releases, 0);
 }
 
-/// R2 (round-2 REFINE, #482): the release write's own per-arm effect,
-/// pinned as a before/after DELTA rather than a cross-arm row-equality
-/// claim (the deleted `release_write_is_identical_on_library_and_server`
-/// had zero true-positive capacity — both its arms funnelled into the
-/// SAME `release_and_stop` call, and the design's own outcome (iii)
-/// permits the two rows it compared to differ). `release_job_lease`'s SQL
+/// The release write's own per-arm effect, pinned as a before/after DELTA
+/// rather than a cross-arm row-equality claim (a library-vs-server row
+/// comparison has no true-positive capacity: both arms funnel into the SAME
+/// `release_and_stop` call, and the two rows may legitimately differ).
+/// `release_job_lease`'s SQL
 /// (`jobs_repo.rs`) sets exactly three columns —
 /// `lease_expires_at = NULL, releases = releases + 1, updated_at = $now`
 /// — so this asserts that delta EXACTLY: every other `JobRecord` field is
@@ -3038,16 +3030,16 @@ async fn release_jobs_claimed_by_write_is_exactly_lease_null_releases_plus_one_a
     assert_eq!(catalog.release_jobs_claimed_by("me").await.unwrap(), 0);
 }
 
-/// #516: the release-write delta oracles above compare through `JobRecord`
-/// (`SELECT_COLS`), so a column outside that projection — `idempotency_key`
-/// (`schema.rs:1066`, sitting outside `SELECT_COLS`) is the one that
-/// surfaced the gap — is invisible to them by construction; a future
+/// The release-write delta oracles above compare through `JobRecord`
+/// (`SELECT_COLS`), so a column outside that projection — e.g.
+/// `idempotency_key` — is invisible to them by construction; a future
 /// release statement that touched it would pass both oracles above
 /// unnoticed. This one asserts the SAME delta over a LIVE all-columns
 /// snapshot instead: the column list is read from `PRAGMA table_info('jobs')`
 /// / `information_schema.columns` at test time (never a hardcoded list, so
 /// a column added after this test is written is covered the day it lands,
-/// never invisible the way `SELECT_COLS` was) and every column is projected
+/// never invisible the way a `SELECT_COLS` projection is) and every column
+/// is projected
 /// `CAST(col AS TEXT)` — the `Row` seam has no column-enumeration API, so
 /// this is the explicit workaround, not a permanent second reader.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
@@ -3061,7 +3053,7 @@ async fn release_job_lease_write_delta_is_visible_over_every_live_column(backend
     let (_session, catalog) = queue_session(backend, dir.path()).await;
     let lease = Duration::from_secs(3600);
 
-    // `idempotency_key` set to a non-NULL value: the column #516 names,
+    // `idempotency_key` set to a non-NULL value: a column outside `SELECT_COLS`,
     // proving the snapshot is not vacuously passing on a NULL == NULL
     // comparison.
     catalog
@@ -3110,7 +3102,7 @@ async fn release_job_lease_write_delta_is_visible_over_every_live_column(backend
     );
     assert_eq!(
         before["idempotency_key"], after["idempotency_key"],
-        "the column #516 named must round-trip byte-identical across the release"
+        "idempotency_key (outside SELECT_COLS) must round-trip byte-identical across the release"
     );
 
     // A row claimed by a different instance stays completely untouched on
@@ -3125,7 +3117,7 @@ async fn release_job_lease_write_delta_is_visible_over_every_live_column(backend
 /// The live `jobs` column list, backend-appropriate: `PRAGMA
 /// table_info('jobs')` on SQLite, `information_schema.columns` on Postgres.
 /// Never hardcoded — a future migration's new column is picked up here
-/// automatically, which is the whole point of #516's fix.
+/// automatically, which is the whole point.
 async fn live_jobs_columns(catalog: &Catalog, backend: BackendKind) -> Vec<String> {
     catalog
         .backend_arc()
@@ -3417,8 +3409,7 @@ async fn a_double_release_increments_releases_once(backend: BackendKind) {
 /// `create_result_table`'s `partial_result` CAS: after the successor's
 /// claim-and-fail arm clears the column, the SAME attempt's own
 /// `create_result_table` records its fresh table instead of landing
-/// `JobAttemptSuperseded` (the pre-existing defect the 68 README records,
-/// escape `esc-110`). A stale attempt or a different table name clears
+/// `JobAttemptSuperseded`. A stale attempt or a different table name clears
 /// nothing.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
@@ -3512,7 +3503,7 @@ async fn clear_partial_result_lets_the_next_attempt_record_its_own_table(backend
 
 /// The finalize CAS is `claimed_by / status / attempts`, never the lease
 /// (`jobs_repo.rs` finish/fail): a released row can still be finished by
-/// its old holder — the named library-only divergence (D19), pinned here as
+/// its old holder — a named library-only divergence, pinned here as
 /// a fact rather than left implicit.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
@@ -3768,8 +3759,8 @@ async fn set_worker_state_round_trips_through_list_workers(backend: BackendKind)
     assert!(catalog.delete_worker("w-state").await.unwrap());
 }
 
-/// `upsert_worker`'s `devices` param round-trips through `list_workers`
-/// (67 wave-4 U8b): unset (`&[]`) reads back as an empty list, a written
+/// `upsert_worker`'s `devices` param round-trips through `list_workers`:
+/// unset (`&[]`) reads back as an empty list, a written
 /// device list reads back exactly, and a re-upsert REPLACES the device list
 /// (never merges).
 #[test_case(BackendKind::Sqlite ; "sqlite")]
@@ -3844,8 +3835,7 @@ async fn upsert_worker_devices_round_trips_through_list_workers(backend: Backend
 
 /// A malformed `workers.devices` value (planted out-of-band — never through
 /// `upsert_worker`) is a ROW FACT: `list_workers` still returns the row,
-/// with `devices` decoded as an empty list, never a read fault (issue
-/// #574's shape).
+/// with `devices` decoded as an empty list, never a read fault.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -3899,8 +3889,7 @@ async fn malformed_worker_devices_is_a_row_fact_not_a_read_fault(backend: Backen
     );
 }
 
-// ─── transfer_claim: the placed-gang hand-off (67 wave-4 U8b, design
-// contract feat_500-wave4.md § 2.4) ─────────────────────────────────────────
+// ─── transfer_claim: the placed-gang hand-off ─────────────────────────────
 
 /// A transfer moves `claimed_by` and stamps a fresh lease deadline, leaving
 /// `attempts`/`releases`/`status` untouched (zero net attempts: a hand-off,

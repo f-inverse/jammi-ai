@@ -8,7 +8,7 @@
 //! (`LeaseTarget::ResultTableVersion`), routes every transition through the
 //! [`VersionCas`] naming that writer, and stamps every segment it appends
 //! with its version number. The table's own row is never touched: a versioned
-//! table never re-enters `building` (I-A2), and nothing this handle writes is
+//! table never re-enters `building`, and nothing this handle writes is
 //! visible before [`crate::catalog::Catalog::publish_version`]'s single
 //! transaction.
 //!
@@ -182,7 +182,7 @@ impl BuildingVersion {
         self.store.append_segment_for_version(self, index).await
     }
 
-    /// The sole commit point (D5): renew-by-CAS, `building -> ready` on the
+    /// The sole commit point: renew-by-CAS, `building -> ready` on the
     /// version row, and the `current_version = parent -> N` swap on the
     /// table row, one transaction ([`crate::catalog::Catalog::publish_version`]).
     /// On success the handle is done (no further renewal, Drop a no-op); on a

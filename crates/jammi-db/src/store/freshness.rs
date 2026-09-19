@@ -445,7 +445,7 @@ impl ResultStore {
     ///   to read a live version from (see the module docs). This is honest, not
     ///   a fabricated read against a surface that does not exist.
     ///
-    /// **Disclosed residual (round 7, not closed):** for a versioned parent,
+    /// **Known limitation:** for a versioned parent,
     /// [`CurrentAnchor::ResultDigest`] carries the SAME identity value
     /// [`ResultStore::pin_current_version`]'s anchor would for that table —
     /// a version-resolved digest with no paired content read. This function's

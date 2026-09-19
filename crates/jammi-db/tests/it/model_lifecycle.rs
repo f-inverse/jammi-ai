@@ -7,7 +7,7 @@
 //! for the two FK-backed ones (`jobs.model_ref`, `eval_runs.model_id`).
 //! A pk-keyed scan would silently miss the two name-keyed edges, so each is
 //! exercised directly. DELETE is strictly tenant-scoped — a tenant touches only a
-//! row it owns. The two `jobs` edges are additionally age-gated (N9): a
+//! row it owns. The two `jobs` edges are additionally age-gated: a
 //! `[jobs] retention_days`-aged terminal row stops blocking, while a
 //! non-terminal row blocks indefinitely and a young terminal row still blocks.
 //!
@@ -141,7 +141,7 @@ async fn submit_referencing_job(
 }
 
 /// Force `jobs.status` and `jobs.updated_at` directly (bypassing every
-/// lease guard) so the retention age-predicate (N9) can be exercised without
+/// lease guard) so the retention age-predicate can be exercised without
 /// a claim/finish/fail dance for every fixture row. `days_ago` ages
 /// `updated_at`; `status` is written byte-for-byte (`"queued"`, `"running"`,
 /// `"completed"`, `"failed"`, or any other string a caller wants to probe).
@@ -314,7 +314,7 @@ async fn delete_blocked_by_job_model_ref_pk_edge(backend: BackendKind) {
 /// `ModelSource` string an `embedding`/`infer` kind resolves its model
 /// against) is a blocking edge like `result_tables.model_id`: a running
 /// job still reading the model blocks its delete via the typed scan, and
-/// the same N9 age gate lifts the block once the job is terminal and past
+/// the same age gate lifts the block once the job is terminal and past
 /// the retention window.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
@@ -361,7 +361,7 @@ async fn delete_blocked_by_job_model_source_name_edge_until_terminal_and_aged(
         .expect("a terminal model_source job past the retention window must not block");
 }
 
-/// N9: a TERMINAL `jobs` row past `retention_days` does not block — the
+/// A TERMINAL `jobs` row past `retention_days` does not block — the
 /// referential predicate is age-gated, not sweep-dependent (`prune_jobs`
 /// never has to run first for the delete to succeed).
 #[test_case(BackendKind::Sqlite ; "sqlite")]
@@ -384,7 +384,7 @@ async fn delete_unblocked_by_a_terminal_job_past_the_retention_window(backend: B
         .expect("a terminal job past the retention window must not block delete");
 }
 
-/// N9: a NON-TERMINAL `jobs` row blocks indefinitely, regardless of age — the
+/// A NON-TERMINAL `jobs` row blocks indefinitely, regardless of age — the
 /// age gate only ever lifts a TERMINAL row's block.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
@@ -414,7 +414,7 @@ async fn delete_still_blocked_by_an_old_non_terminal_job(backend: BackendKind) {
     }
 }
 
-/// N9: a YOUNG terminal `jobs` row (inside the retention window) still
+/// A YOUNG terminal `jobs` row (inside the retention window) still
 /// blocks — the gate is on age, not merely on `status`.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]

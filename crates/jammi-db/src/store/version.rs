@@ -1,5 +1,5 @@
 //! The per-version manifest of a versioned result table
-//! (`{table}__v{N}.version.json`) and the version identity (K7).
+//! (`{table}__v{N}.version.json`) and the version identity.
 //!
 //! A version is a snapshot: the fragments (immutable Parquet objects) whose
 //! union is the table's physical row set, the ANN segments indexing them, the

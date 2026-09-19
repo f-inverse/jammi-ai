@@ -1,12 +1,10 @@
-//! End-to-end migration tests. Asserts via the new `applied_migrations`
+//! End-to-end migration tests. Asserts via the `applied_migrations`
 //! ledger and direct sqlx queries against the on-disk catalog.
 //!
 //! The two `concurrent_migrate_on_fresh_*_is_safe` tests race two independent
-//! backends' `migrate()` on one FRESH catalog (escape-ledger row
-//! `esc-093-postgres-migrations-race-without-cross-process-lock`, issue #479):
-//! the SQLite arm is a regression guard that was green before the fix (the
-//! backend's `BEGIN IMMEDIATE` already serialises it); the Postgres arm is the
-//! RED-then-GREEN oracle for the advisory lock `catalog::migrations::run` takes.
+//! backends' `migrate()` on one FRESH catalog: on SQLite the backend's
+//! `BEGIN IMMEDIATE` serialises them; the Postgres arm is the oracle for the
+//! advisory lock `catalog::migrations::run` takes.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -18,7 +16,7 @@ use tempfile::tempdir;
 use tokio::sync::Barrier;
 
 /// Every migration name, in ledger order. Mirrors `catalog::migrations::MIGRATIONS`
-/// (K5: append-only, currently ending at 038) -- a new migration is added here
+/// (append-only) -- a new migration is added here
 /// in the same change.
 const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "001_core_tables",
@@ -755,7 +753,7 @@ async fn migration_023_adds_storage_precision_and_oversample_columns() {
 /// Migration 029 creates `jobs`/`instances`/`workers` and drops
 /// `training_jobs` (and its predecessor name, `fine_tune_jobs`) entirely — no
 /// shim, no compatibility view. `idx_jobs_claim`, `idx_jobs_lease`, and
-/// `idx_instances_seen` (N10) all exist on a fresh, fully-migrated catalog.
+/// `idx_instances_seen` all exist on a fresh, fully-migrated catalog.
 #[tokio::test]
 async fn migration_029_creates_jobs_instances_workers_and_drops_training_jobs() {
     use jammi_db::catalog::backend::SqlValue;
@@ -858,7 +856,7 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                 // fail on "table already exists". The reopened `workers`
                 // table below is missing `devices` as a result, which this
                 // test's `jobs`-only assertions never observe. `039` DOES
-                // join this list (replay-idempotence, R5): its `jobs`/
+                // join this list (replay-idempotence): its `jobs`/
                 // `instances` triggers were dropped along with the tables
                 // above (`DROP TABLE` drops a table's own triggers in
                 // SQLite), so it must replay to reinstall them, or the
@@ -984,10 +982,10 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
         "training_jobs must be dropped by migration 029"
     );
 
-    // The fourth K5 pin site gets teeth: 035 is on the ledger's DELETE list
+    // 035 is on the ledger's DELETE list
     // above (it ALTERs `instances`, created fresh by 029's replayed DDL), so
     // an omission from that list would leave the reopened `instances`
-    // missing both columns here -- RED, not a silent pass.
+    // missing both columns here -- a failure, not a silent pass.
     let instance_columns: Vec<String> = raw_backend
         .transaction(
             TxOptions {
@@ -1015,10 +1013,10 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
         );
     }
 
-    // The fifth K5 pin site gets teeth: 037 is on the ledger's DELETE list
+    // 037 is on the ledger's DELETE list
     // above (it ALTERs `jobs`, dropped and recreated fresh by 029's
     // replayed DDL), so an omission from that list would leave the
-    // reopened `jobs` missing both columns here -- RED, not a silent pass.
+    // reopened `jobs` missing both columns here -- a failure, not a silent pass.
     let job_columns: Vec<String> = raw_backend
         .transaction(
             TxOptions {
@@ -1113,7 +1111,7 @@ async fn race_migrate<B: CatalogBackend + 'static>(
     )
 }
 
-/// Regression guard, GREEN before the esc-093 change: two `SqliteBackend`
+/// Two `SqliteBackend`
 /// pools in one process race `migrate()` on one fresh `catalog.db`. SQLite's
 /// backend opens every write transaction
 /// `BEGIN IMMEDIATE` under a 5 s `busy_timeout`, so the second runner waits for
@@ -1207,16 +1205,16 @@ fn with_database(url: &str, db: &str) -> String {
     parsed.to_string()
 }
 
-/// esc-093 oracle: two independent `PostgresBackend`s (separate pools) race
-/// `migrate()` on a FRESH database created for this test alone. Both must
-/// return `Ok` and the ledger must name every migration exactly once. Before
-/// the advisory lock in `catalog::migrations::run` the loser failed with
-/// SQLSTATE 42P07 (`relation already exists`) or 23505 on the ledger PK.
+/// Two independent `PostgresBackend`s (separate pools) race `migrate()` on a
+/// FRESH database created for this test alone. Both must return `Ok` and the
+/// ledger must name every migration exactly once. Without the advisory lock
+/// in `catalog::migrations::run` the loser fails with SQLSTATE 42P07
+/// (`relation already exists`) or 23505 on the ledger PK.
 ///
 /// With `feature = "test-hooks"` the runner's ledger-read rendezvous is armed
 /// so both runners are held between the ledger read and the first DDL for as
-/// long as the lock lets them both get there (in the fixed world it lets only
-/// one; the other blocks on the lock and passes through afterwards).
+/// long as the lock lets them both get there (it lets only one; the other
+/// blocks on the lock and passes through afterwards).
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_migrate_on_fresh_postgres_is_safe() {
@@ -1303,7 +1301,7 @@ async fn concurrent_migrate_on_fresh_postgres_is_safe() {
     }
 }
 
-/// Migration 027 adds the writer-lease columns to `result_tables` (esc-094):
+/// Migration 027 adds the writer-lease columns to `result_tables`:
 /// `writer_id` and `lease_expires_at`, both nullable so a row born before the
 /// migration reads back as "no writer, no lease" — the absent-lease state
 /// recovery reconciles exactly as it always did — plus the
@@ -1372,9 +1370,9 @@ async fn migration_027_adds_result_table_lease_columns_nullable() {
     );
 }
 
-/// OPS (#482) — migration `031_jobs_releases_workers_state` is present and
-/// ordered AFTER `030_jobs_idempotency_key` (K5: relative position, never
-/// `.last()`, so the lead's renumber-on-second-merge keeps this green), and
+/// Migration `031_jobs_releases_workers_state` is present and
+/// ordered AFTER `030_jobs_idempotency_key` (relative position, never
+/// `.last()`, so a renumber keeps this green), and
 /// a fresh catalog carries what it adds: `jobs.releases`, `workers.state`,
 /// and the gauge index `idx_jobs_kind_status`.
 #[tokio::test]
@@ -1387,7 +1385,7 @@ async fn migration_031_is_ordered_after_030_and_adds_releases_and_workers_state(
     };
     assert!(
         position("031_jobs_releases_workers_state") > position("030_jobs_idempotency_key"),
-        "the OPS migration must follow 030"
+        "031_jobs_releases_workers_state must follow 030"
     );
 
     let dir = tempdir().unwrap();
@@ -1644,8 +1642,8 @@ async fn migration_032_creates_result_table_versions(
     assert_eq!(dflt, 0, "next_version defaults to 0");
 }
 
-/// Migration `033_model_materialization` (#500) is present and ordered
-/// AFTER `032_result_table_versions` (K5: relative position, never
+/// Migration `033_model_materialization` is present and ordered
+/// AFTER `032_result_table_versions` (relative position, never
 /// `.last()`, so a renumber on a later merge keeps this green), adds
 /// the two NULLABLE `models` columns (`definition_hash`,
 /// `input_anchors_json`), the `idx_models_definition_hash` cache-lookup
@@ -1769,8 +1767,8 @@ async fn migration_033_is_ordered_after_032_and_adds_model_materialization_colum
     }
     assert!(
         columns.iter().all(|(c, _)| c != "manifest_path"),
-        "manifest_path must never exist on models (P7: dropped before merge; \
-         the sidecar path is derived from the artifact prefix, never recorded); got {columns:?}"
+        "manifest_path must never exist on models (the sidecar path is derived from the \
+         artifact prefix, never recorded); got {columns:?}"
     );
 
     for index_name in ["idx_models_definition_hash", "idx_models_artifact_path"] {
@@ -1866,7 +1864,7 @@ async fn migration_033_is_ordered_after_032_and_adds_model_materialization_colum
 }
 
 /// Migration `034_jobs_training_set_identity`
-/// is present, ordered AFTER `033_model_materialization` (K5: relative
+/// is present, ordered AFTER `033_model_materialization` (relative
 /// position, never `.last()`), adds `jobs.training_set_ref` /
 /// `jobs.training_set_location` as nullable `TEXT` columns, and pins the
 /// pair's stop rule ("never one column without the other in the same
@@ -2052,9 +2050,8 @@ async fn migration_034_is_ordered_after_033_and_pins_the_pair_at_the_schema_edge
     );
 }
 
-/// Migration `035_instances_peer_addr_result_root`
-/// (`docs/plans/67-distributed-training/UNITS.md` § U5b-1a) is present,
-/// ordered AFTER `034_jobs_training_set_identity` (K5: relative position,
+/// Migration `035_instances_peer_addr_result_root` is present,
+/// ordered AFTER `034_jobs_training_set_identity` (relative position,
 /// never `.last()`), and adds `instances.peer_addr` / `instances.result_root`
 /// as nullable `TEXT` columns, on both backends.
 #[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
@@ -2186,10 +2183,9 @@ async fn migration_035_is_ordered_after_034_and_adds_instances_peer_addr_result_
         .expect("both set must be a valid row");
 }
 
-/// Migration `036_instances_result_root_identity`
-/// (`docs/plans/67-distributed-training/README.md` unit U5b-1a-A2) is
-/// present, ordered AFTER `035_instances_peer_addr_result_root` (K5:
-/// relative position, never `.last()`), and adds
+/// Migration `036_instances_result_root_identity` is
+/// present, ordered AFTER `035_instances_peer_addr_result_root` (relative
+/// position, never `.last()`), and adds
 /// `instances.result_root_identity` as a nullable `TEXT` column, on both
 /// backends — the column `Catalog::list_gang_members` compares.
 #[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
@@ -2280,9 +2276,8 @@ async fn migration_036_is_ordered_after_035_and_adds_instances_result_root_ident
     );
 }
 
-/// Migration `037_jobs_assembly_failures_next_after`
-/// (`docs/plans/67-distributed-training/UNITS.md` § U5b-1b-ii) is present,
-/// ordered AFTER `036_instances_result_root_identity` (K5: relative
+/// Migration `037_jobs_assembly_failures_next_after` is present,
+/// ordered AFTER `036_instances_result_root_identity` (relative
 /// position, never `.last()`), and adds `jobs.assembly_failures`
 /// (`NOT NULL DEFAULT 0`) and `jobs.next_assembly_after` (nullable `TEXT`,
 /// the SAME representation `jobs.lease_expires_at` uses) on both backends.
@@ -2429,11 +2424,10 @@ async fn migration_037_is_ordered_after_036_and_adds_assembly_failures_next_afte
     assert_eq!(next_after, None, "next_assembly_after defaults to NULL");
 }
 
-/// Migration `038_compute_cluster_state`
-/// (`docs/plans/67-distributed-training/UNITS.md` § U8b) is present, ordered
+/// Migration `038_compute_cluster_state` is present, ordered
 /// AFTER BOTH `035_instances_peer_addr_result_root` (its
 /// `compute_executors.instance_id` join target) and
-/// `037_jobs_assembly_failures_next_after` (K5: relative position, never
+/// `037_jobs_assembly_failures_next_after` (relative position, never
 /// `.last()`), creates `compute_executors`/`compute_jobs`, and adds
 /// `workers.devices` (`NOT NULL DEFAULT '[]'`) on both backends.
 #[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
@@ -2523,7 +2517,7 @@ async fn migration_038_is_ordered_after_035_and_037_and_creates_compute_tables(
     }
 
     // `compute_executors.devices` is a NOT NULL column -- the placement
-    // policy's own device authority (pressure-round delta 3), distinct
+    // policy's own device authority, distinct
     // from `workers.devices` below.
     let columns: Vec<(String, bool)> = backend
         .transaction(
@@ -2720,8 +2714,8 @@ async fn migration_038_is_ordered_after_035_and_037_and_creates_compute_tables(
 
 /// The 13 `(table, column)` pairs `catalog::lease`'s schema-edge domain
 /// (migration `039_canonical_stamps`) enforces — the universe gate this
-/// oracle enumerates against (R5: "a future rebuild-dance migration cannot
-/// silently drop enforcement").
+/// oracle enumerates against (a later rebuild-dance migration cannot
+/// silently drop enforcement).
 const CANONICAL_STAMP_COLUMNS: &[(&str, &str)] = &[
     ("jobs", "lease_expires_at"),
     ("jobs", "next_assembly_after"),
@@ -2756,8 +2750,8 @@ fn every_column_stale_before_clause_accepts_is_schema_enforced() {
     }
 }
 
-/// Migration `039_canonical_stamps` (R5, `catalog::lease`'s pin sites) is
-/// ordered after `038_compute_cluster_state` (K5: relative position, never
+/// Migration `039_canonical_stamps` is
+/// ordered after `038_compute_cluster_state` (relative position, never
 /// `.last()` — it names `compute_executors`, which `038` creates), and the
 /// enforcement set it installs — on SQLite, a `BEFORE INSERT` AND a
 /// `BEFORE UPDATE OF <col>` trigger per [`CANONICAL_STAMP_COLUMNS`] entry
@@ -2884,7 +2878,7 @@ async fn migration_039_is_ordered_after_038_and_the_enforcement_set_is_exact(
     }
 }
 
-/// R2 (round-2 REFINE): S2's fail-closed migration is an OUTCOME property,
+/// The rewrite's fail-closed behaviour is an OUTCOME property,
 /// not a mechanism — a refused re-application of `039_canonical_stamps`
 /// must leave the ledger at 038, the offending row's own value untouched,
 /// AND install NEITHER the trigger nor the `CHECK` for the column it could
@@ -2899,21 +2893,18 @@ async fn migration_039_is_ordered_after_038_and_the_enforcement_set_is_exact(
 /// test manufactures an offending value for. On a private tempdir catalog
 /// (this test's own, touched by nothing else) that is harmless — every
 /// other column's trigger/rewrite is a no-op against already-canonical
-/// data. The Postgres arm was tried first and DROPPED after it corrupted
-/// the shared `jammi_test` database's migration ledger twice in a row
-/// (this file's own PR history): re-applying 039 there re-attempted
-/// `ADD CONSTRAINT` for the 12 OTHER columns this test never touched,
-/// which already existed from the real, once-only migration every other
-/// test in this suite depends on, and failed with `already exists` —
-/// requiring a manual `pg_dump`/`psql` repair of shared infrastructure. A
-/// migration that is monolithic across many columns cannot safely be
-/// partially rewound against a database other concurrent test runs share;
-/// SQLite's per-test isolation is the only backend this specific fixture
-/// shape is safe on. The property itself — a failed migration's
-/// transaction never commits — is backend-symmetric (verified once by
-/// hand against a live Postgres scratch table during development) and is
-/// exercised by EVERY OTHER migration's own tests on both backends
-/// already (the runner's transaction wrapping is not 039-specific code).
+/// data. On Postgres the lane shares one `jammi_test` database: re-applying
+/// 039 there re-attempts `ADD CONSTRAINT` for the 12 OTHER columns this test
+/// never touched, which already exist from the real, once-only migration
+/// every other test in this suite depends on, and fails with `already
+/// exists` — corrupting the shared migration ledger. A migration that is
+/// monolithic across many columns cannot safely be partially rewound
+/// against a database other concurrent test runs share; SQLite's per-test
+/// isolation is the only backend this fixture shape is safe on. The property
+/// itself — a failed migration's transaction never commits — is
+/// backend-symmetric and is exercised by EVERY OTHER migration's own tests on
+/// both backends (the runner's transaction wrapping is not 039-specific
+/// code).
 #[tokio::test]
 async fn migration_039_on_an_unclassifiable_value_fails_closed() {
     use jammi_db::catalog::backend::SqlValue;
@@ -3056,14 +3047,12 @@ async fn migration_039_on_an_unclassifiable_value_fails_closed() {
     );
 }
 
-/// `catalog::lease::pg_canonical_stamp`'s GUC-independence (S1's own oracle
-/// requirement): `to_char` with an explicit picture must render the SAME
-/// text regardless of the session's `DateStyle`/`TimeZone`, unlike a bare
-/// `::text` cast. `SET LOCAL` (transaction-scoped, reverted automatically
-/// at commit or rollback) rather than `SET`, since this runs on a POOLED
-/// connection another test could reuse afterward. Self-contained: no
-/// table at all, a plain `SELECT` of a literal expression, never touching
-/// the shared schema.
+/// `catalog::lease::pg_canonical_stamp`'s GUC-independence: `to_char` with an explicit picture must
+/// render the SAME text regardless of the session's `DateStyle`/`TimeZone`, unlike a bare `::text`
+/// cast. `SET LOCAL` (transaction-scoped, reverted automatically at commit or rollback) rather than
+/// `SET`, since this runs on a POOLED connection another test could reuse afterward.
+/// Self-contained: no table at all, a plain `SELECT` of a literal expression, never touching the
+/// shared schema.
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn pg_canonical_stamp_is_independent_of_session_datestyle_and_timezone() {
@@ -3155,21 +3144,19 @@ async fn pg_canonical_stamp_is_independent_of_session_datestyle_and_timezone() {
     );
 }
 
-/// GRAPH (#515) contracts/graph.md §4.6/§5 G8: a ledger-level source oracle.
-/// `jobs` is (or, once the still-held migration lands, will be) the FIRST FK
-/// PARENT in this schema, and `PRAGMA foreign_keys` is ON for the pool
+/// A ledger-level source oracle. `jobs` may become an FK PARENT in this
+/// schema, and `PRAGMA foreign_keys` is ON for the pool
 /// migrations run on (`backend_sqlite.rs`'s `.foreign_keys(true)`) — so a
-/// FUTURE migration that rebuilds `jobs` with this codebase's own canonical
-/// SQLite create-new/copy/DROP-old/RENAME idiom (schema.rs already uses it
+/// migration that rebuilds `jobs` with this codebase's own canonical
+/// SQLite create-new/copy/DROP-old/RENAME idiom (schema.rs uses it
 /// for `topics`, `eval_runs`, `evidence_channels`, `training_jobs`) would
 /// silently CASCADE-delete every row of any table that FK-references
 /// `jobs(job_id) ON DELETE CASCADE` the moment the old `jobs` table is
 /// dropped, unless that migration explicitly disables FK enforcement (or
 /// otherwise preserves the referencing rows) for the swap. No migration in
-/// `MIGRATIONS` does this today (verified by this test — 040's future
-/// `job_dependencies`/`job_ancestors` tables have not landed yet, and every
-/// EXISTING rebuild targets a different table); this oracle pins that state
-/// so a future migration cannot introduce the hazard unnoticed. Scoped by
+/// `MIGRATIONS` rebuilds `jobs` (every existing rebuild targets a different
+/// table); this oracle pins that state so a later migration cannot
+/// introduce the hazard unnoticed. Scoped by
 /// TABLE NAME, not substring: `training_jobs` (migration 029's own DROP) is
 /// a DIFFERENT table and must not false-positive.
 #[test]
@@ -3188,7 +3175,7 @@ fn no_migration_text_rebuilds_the_jobs_table_without_a_stated_preserving_idiom()
          (job_dependencies/job_ancestors) once `jobs` is a FK parent under \
          PRAGMA foreign_keys = ON: {forbidden:?}. Either this migration explicitly disables \
          FK enforcement for the swap (documented in its own rustdoc, matching \
-         schema.rs:1438-1444's rule for 039) or the change belongs elsewhere."
+         the FK rule migration 039's rustdoc in schema.rs states) or the change belongs elsewhere."
     );
 }
 

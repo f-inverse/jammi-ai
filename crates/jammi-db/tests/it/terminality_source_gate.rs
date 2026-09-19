@@ -1,21 +1,16 @@
-//! G6 (#515): terminality is ONE predicate,
+//! Terminality is ONE predicate,
 //! [`jammi_db::catalog::status::JobStatus::is_terminal`]. This gate asserts
 //! — by scanning tracked source, never by prose — that no OTHER site in
 //! either language hand-enumerates the job-status terminality vocabulary as
 //! a literal string compare (`status == "completed"`, `status != "failed"`,
 //! and their reversed/`match`-arm shapes). A literal compare outside the one
-//! predicate is exactly the class of defect that made `WaitJob`, the
-//! embedded `Job.wait`/`TrainingJob.wait`/`RemoteJob.wait`, and the Python
-//! client's `_TERMINAL_STATES` liable to silently hang or misclassify the
-//! moment this vocabulary ever grows a new terminal member (the job-
-//! dependency graph, #515, deferred — this gate is the standalone
-//! terminality-hygiene fix that survives its deferral, without adding the
-//! `Cancelled` status that unit would need: a status with no writer is dead
-//! vocabulary) — see `crates/jammi-ai/tests/it/pinned_source_gate.rs` for
-//! the established idiom this file follows: the scanned universe is derived
-//! from `git ls-files`, never a hand-rolled directory walk, so a file the
-//! scan should reach but cannot read is a hard failure naming it, never a
-//! silent skip.
+//! predicate makes `WaitJob`, the embedded
+//! `Job.wait`/`TrainingJob.wait`/`RemoteJob.wait`, and the Python client's
+//! `_TERMINAL_STATES` liable to silently hang or misclassify the moment this
+//! vocabulary grows a new terminal member — see `crates/jammi-ai/tests/it/pinned_source_gate.rs`
+//! for the established idiom this file follows: the scanned universe is derived from `git
+//! ls-files`, never a hand-rolled directory walk, so a file the scan should reach but cannot read
+//! is a hard failure naming it, never a silent skip.
 //!
 //! **Scope.** The WHOLE tracked tree: `crates/*/src/**/*.rs`,
 //! `crates/*/tests/**/*.rs`, `clients/python/jammi/**/*.py` AND
@@ -242,19 +237,19 @@ fn scan(
 
 /// The Rust half. Scans `crates/*/src` AND `crates/*/tests` (the WHOLE
 /// tracked Rust tree) for a literal job-status terminality compare outside
-/// `status.rs`. RED before this unit's fixes (executed): reverting
+/// `status.rs`. Mutation-checked: rewriting
 /// `grpc/job.rs`'s success-result guard from `record.status ==
-/// JobStatus::Completed.to_string()` back to the pre-fix
+/// JobStatus::Completed.to_string()` to
 /// `record.status == "completed"` reds naming
-/// `crates/jammi-server/src/grpc/job.rs`; reverting `acceleration_report.rs`'s
-/// `wait_for_any_terminal` from `record.is_terminal()` back to
+/// `crates/jammi-server/src/grpc/job.rs`; rewriting `acceleration_report.rs`'s
+/// `wait_for_any_terminal` from `record.is_terminal()` to
 /// `matches!(record.status.as_str(), "completed" | "failed")` (a `matches!`
 /// arm, not an `==`, so NOT independently caught by this test — the class
-/// this detector's `==`/`!=` shape cannot see; tracked in Uncovered) is a
-/// separate, already-fixed site; the CANONICAL red for the widened universe
-/// is reverting `crates/jammi-ai/tests/it/jammi.rs`'s
-/// `status != jammi_db::catalog::status::JobStatus::Queued.to_string()` back
-/// to `status != "queued"`, which reds naming that exact file/line.
+/// this detector's `==`/`!=` shape cannot see; tracked in Uncovered); the
+/// CANONICAL red for the whole-tree universe is rewriting
+/// `crates/jammi-ai/tests/it/jammi.rs`'s
+/// `status != jammi_db::catalog::status::JobStatus::Queued.to_string()` to
+/// `status != "queued"`, which reds naming that exact file/line.
 #[test]
 fn no_literal_job_status_terminality_compare_outside_the_one_predicate_rust() {
     let root = repo_root();
@@ -275,10 +270,10 @@ fn no_literal_job_status_terminality_compare_outside_the_one_predicate_rust() {
 
 /// The Python half. Scans `clients/python/jammi` AND `clients/python/tests`
 /// for a literal job-status terminality compare outside the two designated
-/// set constants and the one named success line. RED before this unit's fix
-/// (executed): reverting `RemoteJob.wait`'s
-/// `if resp.status in _TERMINAL_UNSUCCESSFUL_STATES:` back to the pre-fix
-/// `if resp.status == "failed":` reintroduces exactly the bare-literal shape
+/// set constants and the one named success line. Mutation-checked: rewriting
+/// `RemoteJob.wait`'s
+/// `if resp.status in _TERMINAL_UNSUCCESSFUL_STATES:` to
+/// `if resp.status == "failed":` introduces exactly the bare-literal shape
 /// this test forbids, and it reports that one hit, naming
 /// `clients/python/jammi/_database.py`.
 #[test]
@@ -308,7 +303,7 @@ mod detector_self_tests {
     /// literal regardless of context) -> this test's negative case
     /// (`"the connection failed"`, an unrelated error message, no `status`
     /// anywhere on the line) starts reporting a false-positive hit, which
-    /// this test's `assert!(hits.is_empty())` catches (RED).
+    /// this test's `assert!(hits.is_empty())` catches.
     #[test]
     fn an_unrelated_string_literal_is_not_a_hit() {
         let text = "    return Err(format!(\"the connection failed: {e}\"));\n";

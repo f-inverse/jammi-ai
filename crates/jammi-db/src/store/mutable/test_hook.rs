@@ -142,10 +142,10 @@ pub const MATERIALIZATION_CHECKPOINT_ENV: &str = "JAMMI_TEST_MATERIALIZATION_CHE
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MaterializationPoint {
     /// After `create_table`'s INSERT committed and the heartbeat started; no
-    /// bytes yet (the W1 window of esc-094).
+    /// bytes yet.
     TableCreated,
     /// Inside `finish`, after the lease renew and before the manifest sidecar
-    /// write (the W2 window of esc-094 and the SIGKILL harness's window).
+    /// write (the SIGKILL harness's window).
     Materialization,
 }
 

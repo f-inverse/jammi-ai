@@ -1,9 +1,7 @@
-//! The gang-membership carrier: [`PeerAddr`] (the wire address a coordinator
-//! dials a gang member / segment owner at — moved here from `index::peer`,
-//! re-exported there, so the peer listener and the gang listener can never
-//! drift into two distinct address types), [`MemberRoot`] (the VERBATIM
-//! configured result-table root — see
-//! [`crate::config::JammiConfig::resolved_result_root`] — carried on the
+//! The gang-membership carrier: [`PeerAddr`] (the wire address a coordinator dials a gang member /
+//! segment owner at — re-exported by `index::peer`, so the peer listener and the gang listener can
+//! never drift into two distinct address types), [`MemberRoot`] (the VERBATIM configured
+//! result-table root — see [`crate::config::JammiConfig::resolved_result_root`] — carried on the
 //! `instances` row byte-for-byte, paired with its [`RootIdentity`]: the
 //! identity of that root ACROSS SPELLINGS, computed once by the process
 //! that owns the root and carried on the same row, which IS what the
@@ -15,8 +13,7 @@
 //! [`GangListing`] / [`GangMember`] are [`super::Catalog::list_gang_members`]'s
 //! request and response shapes; the predicate admits on `kinds` +
 //! `workers.state` + `peer_addr` presence + freshness + self-exclusion +
-//! ROOT IDENTITY EQUALITY (`docs/plans/67-distributed-training/README.md`
-//! unit U5b-1a-A2, the predicate U5b-1a filed and this unit builds).
+//! ROOT IDENTITY EQUALITY.
 //!
 //! **The root is interpreted in exactly one place, by its owner, at
 //! registration** (`MemberRoot::resolved`, the only production constructor;
@@ -62,8 +59,7 @@ impl PeerAddr {
     /// is refused, never silently split on its own last colon: the split is
     /// ambiguous (nothing distinguishes "the last hextet's `:` continues the
     /// address" from "the last `:` is the port separator"), so `[::1]:9000`
-    /// is the only accepted IPv6 wire form (P-Y4, contract
-    /// `feat_500-C-U5b-1a` §12).
+    /// is the only accepted IPv6 wire form.
     pub fn parse(input: &str) -> Result<Self> {
         let (host, port) = input.rsplit_once(':').ok_or_else(|| {
             JammiError::Config(format!("peer address '{input}' must be 'host:port'"))
@@ -385,10 +381,9 @@ fn canonical_local_root(root: &str, path: &str) -> Result<String> {
 /// `"metal"`, opaque here — never interpreted by this crate; a placement
 /// policy reads it as an exact-match token) and its ORDINAL within that
 /// kind (rank 0's device is ordinal 0, etc. — never a global, cross-kind
-/// index). Serialized as JSON `{kind, ordinal}` — no other field (67
-/// pressure-round delta 3 drops a `memory_bytes` this tree has no source
-/// for). The ONE shape both device columns 67's wave-4 migration adds
-/// carry a `Vec` of: `workers.devices`
+/// index). Serialized as JSON `{kind, ordinal}` — no other field (there is
+/// no source for a `memory_bytes`). The ONE shape both `devices` columns
+/// (migration 038) carry a `Vec` of: `workers.devices`
 /// ([`WorkerFacts::devices`], the `[worker]` process's own inventory,
 /// carried for `ListWorkers` only) and `compute_executors.devices`
 /// (`super::compute_repo::ComputeExecutorRecord::devices`, the compute
@@ -406,7 +401,7 @@ pub struct DeviceFact {
 /// Decode a `devices` JSON column (`workers.devices` /
 /// `compute_executors.devices`) into its device list. Non-`NULL` text that
 /// does not parse as `[{kind, ordinal}]` is a ROW FACT on both backends,
-/// never a read FAULT — the shape issue #574 established for
+/// never a read FAULT — the same shape as
 /// `jobs.lease_expires_at` ([`super::lease::LeaseFact`]): the read that
 /// found the row still succeeds, with an EMPTY device list AND a
 /// `tracing::warn!` naming `row_label` (the executor/instance id) — never a
@@ -431,7 +426,7 @@ pub fn decode_devices_json(raw: &str, row_label: &str) -> Vec<DeviceFact> {
 /// triple `Catalog::upsert_worker` writes. Owned exclusively by `JobWorker`
 /// (`crates/jammi-ai/src/fine_tune/worker.rs`): `run_until` sets it only
 /// as ONE fact with every row write (`write_worker_facts` in jammi-ai's
-/// `fine_tune::worker`, contract `feat_500-C-U5b-1a` §13): set to the facts
+/// `fine_tune::worker`): set to the facts
 /// about to be UPSERTED, reverted if that upsert fails (`None` again after a
 /// failed first write), cleared before `delete_worker` — so
 /// [`InstanceRegistration::worker`] reflects only facts a row write of this
@@ -441,8 +436,8 @@ pub struct WorkerFacts {
     /// The `,`-joined kind set this worker claims — the ONLY encoding: no
     /// "otherwise producer-encoded" alternative exists.
     /// `Catalog::list_gang_members` splits this column on `,` and trims
-    /// each token (`jobs_repo.rs` §"gang-membership listing verb", where
-    /// the row's `kinds` is matched against `listing.kind`).
+    /// each token (see `Catalog::list_gang_members`, where the row's `kinds`
+    /// is matched against `listing.kind`).
     pub kinds: String,
     /// The claim loop's lifecycle state at this instant.
     pub state: WorkerState,
@@ -519,18 +514,15 @@ impl InstanceRegistration {
             .clone()
     }
 
-    /// The WHOLE registration-eligibility check, in ONE place:
-    /// [`MembershipConfig::validate`] (`[server] peer_advertise` parses as a
-    /// [`PeerAddr`], `peer_bind` is set) PLUS the VERBATIM root
-    /// ([`crate::config::JammiConfig::resolved_result_root`] — no
-    /// filesystem access, no interpretation) carried onto the row for
-    /// U5b-1a-A2 — or, with `peer_advertise` unset, a non-member
-    /// registration with NULL `peer_addr`/`member_root`. `member_root` is
-    /// never consulted by [`super::Catalog::list_gang_members`]'s admission
-    /// predicate in this unit (see [`GangListing`]'s doc); `peer_addr`
-    /// still is (presence + the returned address). The ONLY constructor
-    /// [`super::Catalog::upsert_instance`]/[`super::Catalog::
-    /// reregister_instance`] accept in production:
+    /// The WHOLE registration-eligibility check, in ONE place: [`MembershipConfig::validate`]
+    /// (`[server] peer_advertise` parses as a [`PeerAddr`], `peer_bind` is set) PLUS the VERBATIM
+    /// root ([`crate::config::JammiConfig::resolved_result_root`] — no filesystem access, no
+    /// interpretation) carried onto the row — or, with `peer_advertise` unset, a non-member
+    /// registration with NULL `peer_addr`/`member_root`. `member_root` is never consulted by
+    /// [`super::Catalog::list_gang_members`]'s admission predicate (see [`GangListing`]'s doc);
+    /// `peer_addr` still is (presence + the returned address). The ONLY constructor
+    /// [`super::Catalog::upsert_instance`]/[`super::Catalog:: reregister_instance`] accept in
+    /// production:
     /// `InferenceSession::wrap_with` calls it once per session (every
     /// `InferenceSession` constructor funnels through `wrap_with`), and
     /// [`crate::config::JammiConfig::load_from`] calls
@@ -559,8 +551,7 @@ impl InstanceRegistration {
     }
 }
 
-/// The WHOLE pure membership check (contract `feat_500-C-U5b-1a` §10, the
-/// round-3 excision): `[server] peer_advertise` parses as a [`PeerAddr`]
+/// The WHOLE pure membership check: `[server] peer_advertise` parses as a [`PeerAddr`]
 /// ∧ `peer_bind` is set — no filesystem access, no root interpretation at
 /// all (the root is carried verbatim, see [`MemberRoot`]'s doc).
 /// [`crate::config::JammiConfig::load_from`] calls [`Self::validate`]
@@ -580,7 +571,7 @@ impl MembershipConfig {
     /// `artifact_dir` on its own.
     pub fn validate(config: &crate::config::JammiConfig) -> Result<Option<Self>> {
         let Some(advertise) = &config.server.peer_advertise else {
-            // RENDEZVOUS RV4: `[server] placement = "rendezvous"` needs a
+            // `[server] placement = "rendezvous"` needs a
             // member row to have any ring to read — refused by NAME, at this
             // ONE choke point, so neither `load_from` nor a struct-literal
             // config reaching `from_config` directly can skip it.
@@ -658,7 +649,7 @@ pub(crate) fn live_with_root_clause(
 /// compares a bare claim; a row whose identity is NULL, written before the
 /// column existed or by a process with no membership, never matches).
 /// Necessary for shared storage, never sufficient: sufficiency is the
-/// attestation VERIFY (U5a-1's admission-time sidecar, U5b-0's leaf
+/// attestation VERIFY (the admission-time sidecar and the leaf
 /// inventory).
 #[derive(Debug, Clone, Copy)]
 pub struct GangListing<'a> {
@@ -728,7 +719,7 @@ mod tests {
         assert_eq!(a.as_str(), "coordinator.internal:9000");
     }
 
-    /// P-Y4 (contract `feat_500-C-U5b-1a` §12): an UNBRACKETED IPv6 literal
+    /// An UNBRACKETED IPv6 literal
     /// is refused, never silently split on its own last colon (which would
     /// treat `9000` as the port and `2001:db8::1` as the host, indistinguishable
     /// from a shorter address whose author simply forgot the brackets).

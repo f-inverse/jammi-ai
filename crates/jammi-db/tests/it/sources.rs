@@ -499,9 +499,8 @@ async fn directory_source_with_only_ndjson_files_registered_as_jsonl_falls_back_
     // default extension) has zero matches, so the adaptive fallback tries
     // `.ndjson` next and finds this directory's 2 rows — `.ndjson` has no
     // wire/CLI surface of its own, so this fallback is the only reachable
-    // path onto it. Registration SUCCEEDS and the rows are queryable, not an
-    // error (the enshrined "zero matches" test this replaces predates the
-    // adaptive fallback the lead specified).
+    // path onto it. Registration SUCCEEDS and the rows are queryable, not a
+    // "zero matches" error.
     let listing_dir = dir.path().join("ndjson_only");
     std::fs::create_dir_all(&listing_dir).unwrap();
     std::fs::write(listing_dir.join("a.ndjson"), "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
@@ -715,7 +714,7 @@ async fn single_file_ndjson_url_with_no_override_falls_back_and_serves_rows(back
     );
 }
 
-/// Zero-match guard test group (`closes_escape: esc-036-directory-source-silently-lists-zero-files`).
+/// Zero-match guard test group: a directory source never silently lists zero files.
 ///
 /// A directory/file source whose listing extension mismatches its actual
 /// files must never silently resolve to a schema-less, row-less table with
@@ -1054,7 +1053,7 @@ async fn adaptive_extension_is_pinned_at_registration_and_survives_a_later_exten
         );
     }
 
-    // The auditor's exact repro: AFTER registration, add a `.jsonl` file to
+    // AFTER registration, add a `.jsonl` file to
     // the SAME directory. Without pinning, a re-derived adaptive resolution
     // on the next reload would find `.jsonl` non-empty and silently switch
     // to it — this reload would then serve only the NEW file's 1 row

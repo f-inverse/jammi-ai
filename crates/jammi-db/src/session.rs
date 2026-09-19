@@ -249,8 +249,7 @@ impl JammiSession {
         let ctx = SessionContext::new_with_state(federated_state);
 
         // Construct the mutable-table registry backed by the same backend
-        // the catalog runs on. Phase 2 ships the SQLite renderer; a Postgres
-        // deployment would swap the renderer when `BackendKind::Postgres`.
+        // the catalog runs on.
         let mutable_backend: Arc<dyn MutableBackend> = match catalog.backend_arc().backend_kind() {
             crate::catalog::backend::BackendKind::Sqlite => {
                 Arc::new(SqliteMutableBackend::new(catalog.backend_arc()))
@@ -769,7 +768,7 @@ impl JammiSession {
 
     /// Execute a SQL query and collect results as Arrow `RecordBatch`es.
     ///
-    /// The Flight SQL surface carries query + data-DML only (per ADR-01 §3.2);
+    /// The Flight SQL surface carries query + data-DML only;
     /// topic lifecycle is the typed `register_topic` / `drop_topic` surface, not
     /// a SQL statement.
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
@@ -1159,9 +1158,7 @@ impl JammiSession {
 /// rule), every registered catalog, and the memory pool. `ctx.state()` is a
 /// cheap clone (no I/O); nothing here executes a row.
 ///
-/// The ONE derivation two independent single-partition plans build through
-/// (#500 U2c c3c — a single source, cited by both, replacing a duplicate
-/// `jammi-ai`-side copy):
+/// The ONE derivation two independent single-partition plans build through:
 /// - [`crate::store::ResultStore::materialize_training_set`]'s writer plans
 ///   its explicit full-tuple sort at `target_partitions = 1` so the physical
 ///   plan is ONE external sort at ONE output partition, never a partitioned
@@ -1258,7 +1255,7 @@ async fn build_broker_from_config(config: &JammiConfig) -> Result<Arc<dyn Trigge
         } => {
             // `credentials` is the `.creds` CONTENTS (a resolved `Secret`),
             // handed to the broker as the text async-nats parses. `url` is
-            // a `Secret` too (K2): a NATS URL can carry userinfo/token auth
+            // a `Secret` too: a NATS URL can carry userinfo/token auth
             // inline (`nats://user:pass@host`).
             let creds = credentials.as_ref().map(crate::config::Secret::expose);
             build_jetstream_broker(url.expose(), *retention_seconds, creds).await

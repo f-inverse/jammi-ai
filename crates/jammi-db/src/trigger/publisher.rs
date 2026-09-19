@@ -1,7 +1,7 @@
 //! Transactional-outbox publisher for trigger-stream topics.
 //!
-//! Per SPEC-04 §7.2, every successful publish writes the augmented batch to
-//! the topic's Phase-2 backing table inside one `CatalogBackend::transaction`
+//! Every successful publish writes the augmented batch to
+//! the topic's backing table inside one `CatalogBackend::transaction`
 //! closure (the authoritative log) and then fans out to the broker (a best-
 //! effort delivery accelerator). A broker fan-out failure after commit is
 //! recorded and the RPC still returns `Ok` — subscribers replay from the

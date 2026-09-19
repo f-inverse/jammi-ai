@@ -2,7 +2,7 @@
 //! coordinator's `instances` row FRESH within
 //! `instance_liveness_margin(lease) == 2 * lease`? Decoded in RUST from
 //! `last_seen_at`'s raw stored text (`jammi_db::catalog::lease::
-//! last_seen_at_is_fresh`, since <https://github.com/f-inverse/jammi-ai/issues/574>)
+//! last_seen_at_is_fresh`)
 //! against THIS PROCESS's own clock — never a SQL-side `col::timestamptz`
 //! cast — because `last_seen_at` is ALWAYS an application-clock stamp on
 //! either backend (`Catalog::upsert_instance` never writes the database
@@ -189,16 +189,13 @@ async fn fresh_instance_false_just_outside_the_liveness_margin(kind: BackendKind
     );
 }
 
-/// #574's own parity oracle — REWRITTEN by `catalog::lease`'s S4/migration
-/// `039_canonical_stamps`, the same shape as `gang_rank_admission.rs`'s
-/// sibling test for `jobs.lease_expires_at`. Before the fix (`fresh_instance`
-/// comparing via a SQL-side `stale_before_clause` cast), a `last_seen_at`
-/// that did not parse at all read as `Ok(false)` on SQLite (a plain string
-/// compare, never erroring) but `Err` on Postgres
-/// (`last_seen_at::timestamptz` raised a genuine SQL error) — the
-/// backend-dependent classification issue #574 reported for this column
-/// too. That asymmetry is CLOSED (every value a live Postgres write can
-/// leave in this column is now cast-valid). What remains: SQLite's trigger
+/// The backend-parity oracle for `last_seen_at`, the same shape as
+/// `gang_rank_admission.rs`'s sibling test for `jobs.lease_expires_at`. A
+/// SQL-side `::timestamptz` cast of an unparseable `last_seen_at` would read
+/// as `Ok(false)` on SQLite (a plain string compare, never erroring) but
+/// `Err` on Postgres — a backend-dependent classification. Migration
+/// `039_canonical_stamps` rules that out: every value a live Postgres write
+/// can leave in this column is cast-valid. What remains: SQLite's trigger
 /// checks SHAPE only, so a shape-valid, CALENDAR-invalid value (a month of
 /// `13` — a leap second does NOT serve this role, `lease.rs`'s own docs
 /// state why) is still representable there and still reads `false` (chrono

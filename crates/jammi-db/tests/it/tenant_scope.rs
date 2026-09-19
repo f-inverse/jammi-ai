@@ -1,6 +1,5 @@
-//! Phase 3 integration tests — tenant-scoped sessions deliver disjoint
-//! views of mutable companion tables. Engine-only scope (no wire-surface
-//! tests; those land with the ADR-01 substrate PR).
+//! Tenant-scoped sessions deliver disjoint views of mutable companion
+//! tables. Engine-only scope (no wire-surface tests).
 
 use std::sync::Arc;
 
@@ -559,7 +558,7 @@ async fn catalog_unscoped_session_sees_global_only_after_scoped_writes(backend: 
     assert_eq!(ids, vec![global_src]);
 }
 
-/// SPEC-03 §12 #2 — one federated source carries a `tenant_id` column;
+/// One federated source carries a `tenant_id` column;
 /// the analyzer rule injects a per-session filter that yields 6 rows for
 /// tenant A and 4 rows for tenant B on the same on-disk Parquet table.
 /// Verifies the read-side predicate-injection path end-to-end against a
@@ -616,8 +615,8 @@ async fn federated_source_tenant_column_filters_split_6_4(backend: BackendKind) 
 
     // Register the source ONCE — unscoped (tenant_id NULL on the catalog
     // row) — so both per-tenant sessions read it from the catalog on
-    // reload. SPEC-03 §12 #2 calls for "one source registration, one
-    // connection pool, no per-tenant table".
+    // reload: one source registration, one connection pool, no per-tenant
+    // table.
     {
         let registrar = make_test_session(backend, dir.path()).await;
         registrar
@@ -1051,7 +1050,7 @@ async fn subscribe_scoped_stream_remains_tenant_filtered_after_closure_returns(
     let topic_name = format!("global.events.{}", unique_suffix());
 
     // Build a global (unscoped) topic so both tenants can write to the
-    // same backing table. The leak the PR fixes is on the read side; the
+    // same backing table. The isolation under test is on the read side; the
     // backing-table population happens by hand below so the test does not
     // depend on the publisher's tenant propagation path.
     let topic_schema = Arc::new(Schema::new(vec![

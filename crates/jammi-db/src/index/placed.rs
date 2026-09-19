@@ -610,7 +610,7 @@ impl PlacedIndex {
 
     /// The error a caller fault surfaces as at the coordinator.
     ///
-    /// Every own-data disagreement an owner can report ladders (F1): the
+    /// Every own-data disagreement an owner can report ladders: the
     /// owner's `INVALID_ARGUMENT` is TERMINAL only for a request the
     /// COORDINATOR itself built — width and finiteness are enforced against
     /// an authority (a local index or the catalog's recorded `dimensions`)
@@ -932,7 +932,7 @@ mod tests {
         .unwrap()
     }
 
-    // A3 (placed entry) — with every segment local, `search_final_placed`
+    // With every segment local, `search_final_placed`
     // returns the identical `(row_id, distance)` bytes `SegmentedIndex::
     // search_final` returns for the same corpus / query / k / oversample, at
     // every precision, at N = 1 and N = 2.
@@ -985,18 +985,15 @@ mod tests {
         }
     }
 
-    // M4c (DIST round 8) — the deferred-authority promise on the ALL-LOCAL
-    // path. With no catalog width on record (`dimensions: None`) and every
-    // segment local, `search_final_placed` used to go straight to
-    // `SegmentedIndex::search_final` with nothing having checked the query
-    // against any authority — the first (and only) width check it then met
-    // was `segment.rs`'s `require_width`, the downstream, artifact-only
-    // class BY CONSTRUCTION, engine-fault regardless of provenance. So a
-    // genuine caller width mistake was billed to the engine — the reverse
-    // direction of the M2 defect (`exact.rs`/`placed.rs`'s absent-width
-    // arms billing the ENGINE's gap to the caller). Fixed by checking the
-    // set's own first segment's width here, exactly `exact_vector_search`'s
-    // no-catalog-width fallback, one layer up.
+    // The deferred-authority promise on the ALL-LOCAL path. With no catalog
+    // width on record (`dimensions: None`) and every segment local,
+    // `search_final_placed` checks the query against the set's own first
+    // segment's width (exactly `exact_vector_search`'s no-catalog-width
+    // fallback, one layer up) before `SegmentedIndex::search_final`.
+    // Otherwise the first width check the query meets is `segment.rs`'s
+    // `require_width` — the downstream, artifact-only class, engine-fault
+    // regardless of provenance — and a genuine caller width mistake would be
+    // billed to the engine.
     #[tokio::test]
     async fn all_local_with_no_catalog_width_still_attributes_a_wrong_width_query_to_the_caller() {
         let rows = corpus(); // every row is 8-wide

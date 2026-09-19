@@ -144,7 +144,7 @@ fn jammi_config_default_uses_sqlite_and_in_memory() {
     assert_eq!(cfg.broker, BrokerConfig::InMemory);
 }
 
-/// The redaction oracle (H9 scope, extended per the phase-4 audit): a
+/// The redaction oracle: a
 /// `Debug` render of the whole config — the thing a startup log line or a
 /// panic message prints — must never carry a secret, at ANY secret
 /// position the config has: the catalog URL, broker credentials, an HTTP
@@ -246,7 +246,7 @@ fn jammi_config_debug_never_prints_a_secret() {
     }
 }
 
-/// Phase-4 audit item 1 (HIGH): the file layer is parsed AFTER `${VAR}`
+/// The file layer is parsed AFTER `${VAR}`
 /// interpolation, so a TOML syntax error on the interpolated text must
 /// never render via `Display` (which quotes a code frame of the offending
 /// source line verbatim — the exact source line an unquoted `url =
@@ -274,7 +274,7 @@ fn file_parse_error_after_env_interpolation_never_echoes_the_expanded_secret() {
     }
 }
 
-/// Phase-4 audit item 2 (MEDIUM): a whole-value env override at a seq/map
+/// A whole-value env override at a seq/map
 /// position that fails serde's `invalid_type` check must not echo the
 /// value — `invalid type: string "…", expected …` bakes the value into the
 /// message text with no way to strip it after the fact, so the whole
@@ -295,14 +295,12 @@ fn env_whole_value_type_mismatch_at_a_map_position_never_echoes_the_value() {
     }
 }
 
-/// The missing arm: `Node::parse_as_toml`'s OWN error path (layers.rs's
-/// "env value is not valid TOML" branch) — genuinely malformed TOML syntax
-/// at a seq/map-position env leaf, as opposed to the sibling test above
-/// (valid TOML, wrong shape). Only the FILE arm of this same safe-rendering
-/// discipline was covered before this test (`describe_toml_error` is
-/// exercised by `file_parse_error_after_env_interpolation_never_echoes_the_expanded_secret`);
-/// this pins the ENV-leaf arm names the offending variable and never echoes
-/// the value.
+/// The missing arm: `Node::parse_as_toml`'s OWN error path (layers.rs's "env value is not valid
+/// TOML" branch) — genuinely malformed TOML syntax at a seq/map-position env leaf, as opposed to
+/// the sibling test above (valid TOML, wrong shape). The FILE arm of this same safe-rendering
+/// discipline is `file_parse_error_after_env_interpolation_never_echoes_the_expanded_secret`
+/// (`describe_toml_error`); this pins the ENV-leaf arm names the offending variable and never
+/// echoes the value.
 #[test]
 fn env_leaf_invalid_toml_syntax_never_echoes_the_value_and_names_the_variable() {
     let err = JammiConfig::parse_from(
@@ -328,7 +326,7 @@ fn env_leaf_invalid_toml_syntax_never_echoes_the_value_and_names_the_variable() 
     }
 }
 
-/// Phase-4 audit item 2's FILE-arm half: a file value can itself be a
+/// The FILE-arm half of the same rule: a file value can itself be a
 /// `${VAR}` expansion, so the same `invalid_type` leak is reachable with NO
 /// env override at all — `[inference.http] headers = "${TOKEN}"` expands to
 /// a bare string at a map position.
@@ -348,7 +346,7 @@ fn file_value_type_mismatch_at_a_map_position_never_echoes_an_expanded_secret() 
     }
 }
 
-/// Phase-4 audit item 3 (MEDIUM), the direct bare-env case: an env
+/// The direct bare-env case: an env
 /// whole-value at an ENUM position that does not itself name a variant
 /// must not be echoed as the "unknown variant" — the message names only
 /// the variable and the expected variant list.
@@ -371,12 +369,11 @@ fn env_whole_value_at_an_enum_position_never_echoes_the_value() {
     }
 }
 
-/// Phase-4 audit item 3, the `Node::Override` enum-lowering path: the SAME
-/// leak, but reached with a file layer present (forcing the merge to
-/// record `Node::Override` instead of a bare `Node::Env`) — the lowering
-/// arm used to synthesize a table keyed by the raw value before checking
-/// variant membership, letting the generic multi-key path re-echo it (and
-/// misattribute the origin to "the config file").
+/// The `Node::Override` enum-lowering path: the SAME leak, but reached with a
+/// file layer present (forcing the merge to record `Node::Override` instead
+/// of a bare `Node::Env`) — a lowering arm that built a table keyed by the raw
+/// value before checking variant membership would let the generic multi-key
+/// path re-echo it (and misattribute the origin to "the config file").
 #[test]
 fn env_whole_value_at_an_enum_position_via_override_never_echoes_the_value() {
     let err = JammiConfig::parse_from(
@@ -396,7 +393,7 @@ fn env_whole_value_at_an_enum_position_via_override_never_echoes_the_value() {
     }
 }
 
-/// Phase-4 audit item 4 (LOW): `broker.jet_stream.url` is `Secret`-typed —
+/// `broker.jet_stream.url` is `Secret`-typed —
 /// a NATS URL can carry userinfo/token auth inline
 /// (`nats://user:pass@host`), the same class of leak `catalog.postgres.url`
 /// guards against.
@@ -417,7 +414,7 @@ fn broker_jetstream_url_is_redacted_like_catalog_postgres_url() {
     assert!(!format!("{cfg:?}").contains("hunter2-nats-url-secret"));
 }
 
-/// Phase-4 audit item 5 (LOW): `ServiceSelection`'s array form trims and
+/// `ServiceSelection`'s array form trims and
 /// filters empties exactly like its comma-list string form — a trailing
 /// newline or blank token from a templated array value is not a value.
 #[test]
@@ -746,7 +743,7 @@ fn worker_kinds_default_is_all() {
 
 #[test]
 fn worker_kinds_toml_all_forms_parse_like_services() {
-    // `kinds` shares `services`' exact grammar (H7) — the same three forms.
+    // `kinds` shares `services`' exact grammar — the same three forms.
     let sentinel: JammiConfig = toml::from_str("[worker]\nkinds = \"all\"\n").unwrap();
     assert_eq!(sentinel.worker.kinds, WorkerKinds::All(AllSentinel::All));
 
@@ -808,8 +805,8 @@ fn distributed_config_zero_max_world_size_is_refused_at_load() {
 
 /// `[distributed]` loads independently of `[worker]`: setting one section's
 /// knob leaves the other at its own default, and neither section's loader
-/// consults the other's value (DESIGN.md § 7 — "the two knobs load
-/// independently, with no cross-check").
+/// consults the other's value ("the two knobs load independently, with no
+/// cross-check").
 #[test]
 fn distributed_config_loads_independently_of_worker() {
     let cfg: JammiConfig = toml::from_str("[distributed]\nmax_world_size = 4\n").unwrap();
@@ -905,13 +902,13 @@ fn jobs_config_rejects_unknown_key() {
     assert!(err.to_string().contains("bogus"), "got: {err}");
 }
 
-// ── N7: the stale `[training]` env name is a typed load error ────────────
+// ── The stale `[training]` env name is a typed load error ───────────────
 
 #[test]
 fn stale_jammi_training_run_worker_env_name_is_a_typed_load_error() {
-    // `[training]` is gone entirely (PR-C); `JAMMI_TRAINING__RUN_WORKER` no
-    // longer names a top-level section at all, so it is refused by the SAME
-    // namespace rule `esc-095`'s `JAMMI_CATALOG__KIND` typo case exercises —
+    // There is no `[training]` section; `JAMMI_TRAINING__RUN_WORKER` names no
+    // top-level section at all, so it is refused by the SAME namespace rule
+    // the `JAMMI_CATALOG__KIND` typo case exercises —
     // never silently ignored as a stray runtime knob, and never silently
     // reinterpreted as `[worker].enabled`.
     let err = JammiConfig::parse_from(
@@ -1165,7 +1162,7 @@ fn server_peer_local_load_bytes_parses_and_zero_is_refused() {
     .unwrap();
     assert_eq!(cfg.server.peer_local_load_bytes, Some(4096));
 
-    // K2: `Some(0)` has no sane reading (a budget that admits nothing is not
+    // `Some(0)` has no sane reading (a budget that admits nothing is not
     // "unbounded") and is refused, naming the key.
     let cfg = JammiConfig::parse_from("[server]\npeer_local_load_bytes = 0\n", vec![]).unwrap();
     let err = cfg.server.validate().unwrap_err();
@@ -1175,8 +1172,8 @@ fn server_peer_local_load_bytes_parses_and_zero_is_refused() {
     );
 }
 
-// Commit-2 oracle (a): `[server] peer_bind` parses (RED at base: `deny_unknown_fields`
-// refuses the key), and unset means no third listener.
+// `[server] peer_bind` parses (it is a declared key under `deny_unknown_fields`),
+// and unset means no third listener.
 #[test]
 fn server_peer_bind_parses_and_defaults_unset() {
     let cfg = JammiConfig::parse_from("[server]\n", vec![]).unwrap();
@@ -1597,7 +1594,7 @@ fn effective_oversample_for_honors_an_explicit_deployment_override() {
 
 #[test]
 fn effective_oversample_for_honors_an_explicit_four_on_binary_not_widened_to_thirty_two() {
-    // The exact case the adversarial audit flagged: a deployment that has
+    // A deployment that has
     // EXPLICITLY configured `oversample = 4` on a `Binary` table must be
     // honored verbatim as 4, never silently widened to Binary's own
     // per-precision default of 32.
@@ -1620,12 +1617,11 @@ fn effective_oversample_for_none_on_binary_resolves_to_thirty_two() {
     assert_eq!(ann.effective_oversample_for(StoragePrecision::Binary), 32);
 }
 
-// ── esc-095: layered `JAMMI_*` env overrides ─────────────────────────────
+// ── Layered `JAMMI_*` env overrides ─────────────────────────────────────
 
-/// esc-095's oracle: an env-only selection of Postgres + JetStream must
-/// actually run Postgres + JetStream — before this fix, `apply_env_overrides`
-/// hand-listed 18 variables and silently ignored `JAMMI_CATALOG__*` /
-/// `JAMMI_BROKER__*` entirely, so this exact scenario ran SQLite.
+/// An env-only selection of Postgres + JetStream must actually run
+/// Postgres + JetStream — every `JAMMI_CATALOG__*` / `JAMMI_BROKER__*` path is
+/// config, never a silently ignored variable that leaves SQLite running.
 #[test]
 fn env_only_postgres_and_jetstream_selection_round_trips() {
     let cfg = JammiConfig::parse_from(
@@ -1673,7 +1669,8 @@ fn env_only_oracle_control_empty_env_stays_default() {
 #[test]
 fn env_unknown_top_level_section_refuses_naming_the_variable() {
     // `JAMMI_CATLOG__KIND` — one segment short of `JAMMI_CATALOG__...` — is
-    // exactly esc-095's typo shape: it must refuse, not silently no-op.
+    // exactly the typo shape the namespace rule exists for: it must refuse,
+    // not silently no-op.
     let err = JammiConfig::parse_from(
         "",
         vec![("JAMMI_CATLOG__KIND".to_string(), "postgres".to_string())],
@@ -1900,7 +1897,7 @@ fn env_bare_selection_plus_nested_key_collision_both_orders() {
     }
 }
 
-/// T6's real order oracle: driven directly against `env_map::build_env_layer`
+/// The order-independence oracle: driven directly against `env_map::build_env_layer`
 /// (which — unlike `parse_from` — iterates its input in exactly the order
 /// given, never through a `BTreeMap` first), so the two orderings are
 /// genuinely different inputs. The collision is refused either way, but
@@ -1959,7 +1956,7 @@ fn broker_in_memory_bogus_key_refuses_naming_it() {
     }
 }
 
-/// H14's struct-position rule: an env leaf cannot stand in for a whole
+/// The struct-position rule: an env leaf cannot stand in for a whole
 /// struct payload.
 #[test]
 fn env_whole_value_override_of_a_struct_position_is_refused() {
@@ -1974,16 +1971,15 @@ fn env_whole_value_override_of_a_struct_position_is_refused() {
     }
 }
 
-/// H14's struct-position rule, the BARE-env case: with NO file layer at
+/// The struct-position rule, the BARE-env case: with NO file layer at
 /// all, `Node::merge` never has a lower (file) node to disagree with, so
 /// the env leaf reaches `deserialize_struct` directly as a bare
 /// `Node::Env`, never wrapped in `Node::Override`. That case must refuse
-/// identically to the with-file-layer case above — the auditor's exact
-/// reproduction: `JAMMI_MODELS='{ offline = true }'` and
+/// identically to the with-file-layer case above:
+/// `JAMMI_MODELS='{ offline = true }'` and
 /// `JAMMI_SERVER='{ health_listen = "1.2.3.4:1" }'` against an otherwise
-/// empty config, each of which (pre-fix) was silently ACCEPTED as a
-/// whole-struct value and reset every sibling field of that struct to its
-/// default.
+/// empty config would otherwise be ACCEPTED as a whole-struct value and reset
+/// every sibling field of that struct to its default.
 #[test]
 fn env_whole_value_struct_position_is_refused_even_with_no_file_layer() {
     let err = JammiConfig::parse_from(
@@ -2010,7 +2006,7 @@ fn env_whole_value_struct_position_is_refused_even_with_no_file_layer() {
     }
 }
 
-/// H14's map-position rule: a whole-value env override REPLACES a file map,
+/// The map-position rule: a whole-value env override REPLACES a file map,
 /// it does not merge into it.
 #[test]
 fn env_whole_value_override_of_a_map_position_replaces_not_merges() {
@@ -2028,7 +2024,7 @@ fn env_whole_value_override_of_a_map_position_replaces_not_merges() {
     assert!(!headers.contains_key("a"));
 }
 
-/// H1's fourth oracle: a nested per-key env override MERGES into a file
+/// A nested per-key env override MERGES into a file
 /// map at the same path (never replaces the whole map) — the seq/map
 /// "whole value" rule above only fires when the env var names the map's OWN
 /// path, not a deeper key under it.
@@ -2047,11 +2043,9 @@ fn file_header_map_plus_nested_env_header_merges() {
     assert_eq!(headers.get("b").map(Secret::expose), Some("2"));
 }
 
-/// `[engine] memory_limit` is no longer an unread String field once
-/// [`EngineConfig::memory_limit_bytes`] parses it (K2, contract
-/// `feat_500-B-U2c` §9 B5) — `[gpu] memory_limit` stays unread (out of this
-/// unit's scope), so it is the string field this oracle now pairs with the
-/// integer coercion.
+/// `[engine] memory_limit` is parsed by [`EngineConfig::memory_limit_bytes`];
+/// `[gpu] memory_limit` is an unread String field, so it is the string field
+/// this oracle pairs with the integer coercion.
 #[test]
 fn env_integer_field_parses_leading_zeros_string_field_keeps_them_verbatim() {
     let cfg = JammiConfig::parse_from(
@@ -2091,7 +2085,7 @@ fn engine_with(memory_limit: &str) -> EngineConfig {
     }
 }
 
-/// `[engine] memory_limit`'s grammar (K2): every arm, both accepted and
+/// `[engine] memory_limit`'s grammar: every arm, both accepted and
 /// refused, driven straight through [`EngineConfig::memory_limit_bytes`].
 mod memory_limit_grammar {
     use super::*;
@@ -2232,7 +2226,7 @@ fn services_grammar_all_forms() {
     let all: Holder = toml::from_str("services = \"all\"").unwrap();
     assert_eq!(all.services, ServiceSelection::All(AllSentinel::All));
 
-    // H7: case-sensitive — "ALL" is a one-token tier list, not the sentinel.
+    // Case-sensitive — "ALL" is a one-token tier list, not the sentinel.
     let shout: Holder = toml::from_str("services = \"ALL\"").unwrap();
     assert_eq!(shout.services, ServiceSelection::Only(vec!["ALL".into()]));
 
@@ -2252,7 +2246,7 @@ fn services_grammar_all_forms() {
     );
 }
 
-/// H7 stays case-sensitive; a trailing newline (what a secrets file or a
+/// The grammar stays case-sensitive; a trailing newline (what a secrets file or a
 /// heredoc-sourced env var actually carries) is trimmed before both the
 /// case-sensitive `"all"` check and the comma split — it is not part of the
 /// value.
@@ -2275,7 +2269,7 @@ fn services_all_trims_whitespace_but_stays_case_sensitive() {
         ServiceSelection::All(AllSentinel::All)
     );
 
-    // Trimming never loosens H7's case sensitivity: padded "ALL" is still a
+    // Trimming never loosens the grammar's case sensitivity: padded "ALL" is still a
     // one-token tier list, not the sentinel.
     let shout: Holder = toml::from_str("services = \" ALL \"").unwrap();
     assert_eq!(shout.services, ServiceSelection::Only(vec!["ALL".into()]));
@@ -2304,7 +2298,7 @@ fn env_services_all_and_comma_list() {
     );
 }
 
-/// X1 oracle: a persisted `sources.options` row in the pre-existing,
+/// A persisted `sources.options` row in the pre-existing,
 /// internally tagged shape — including an unknown, forward-compat key — must
 /// still reload through the REAL, unmodified `CloudConfig`.
 #[test]
@@ -2359,7 +2353,7 @@ fn parse_from_interpolates_from_the_passed_env_map() {
     );
 }
 
-/// H15: the resolution order is injectable — every step probed against a
+/// The resolution order is injectable — every step probed against a
 /// tempdir, never the real `/etc`.
 #[test]
 fn resolve_config_path_in_honors_the_documented_order() {
@@ -2446,9 +2440,9 @@ fn parse_from_empty_is_the_defaults_control() {
 
 // ── unknown credentials_path key oracle ──────────────────────────────────
 
-/// The retired `credentials_path` key (#483) is no longer silently ignored:
+/// An unknown `credentials_path` key is never silently ignored:
 /// `BrokerConfig::JetStream` has `deny_unknown_fields`, so a config that
-/// still spells the retired key is refused, naming it.
+/// spells it is refused, naming it.
 #[test]
 fn broker_jetstream_credentials_path_is_a_refused_unknown_key() {
     let err = JammiConfig::parse_from(
@@ -2462,7 +2456,7 @@ fn broker_jetstream_credentials_path_is_a_refused_unknown_key() {
     }
 }
 
-// ── ModelsConfig (H5) ─────────────────────────────────────────────────────
+// ── ModelsConfig ──────────────────────────────────────────────────────────
 
 #[test]
 fn models_config_round_trips_and_defaults() {
@@ -2545,7 +2539,7 @@ fn unknown_server_key_such_as_tls_is_a_typed_load_error() {
     }
 }
 
-// ── Top-level field namespace (T5) ────────────────────────────────────────
+// ── Top-level field namespace ─────────────────────────────────────────────
 
 #[test]
 fn top_level_fields_matches_jammi_config() {
@@ -2645,7 +2639,7 @@ fn limits_config_rejects_unknown_key() {
 
 #[test]
 fn limits_config_zero_in_flight_knobs_mean_unbounded_not_an_error() {
-    // K2: `0` is a valid, meaningful value for the four concurrency/budget
+    // `0` is a valid, meaningful value for the four concurrency/budget
     // knobs -- it means unbounded, never "refuse everything".
     let limits = LimitsConfig {
         max_in_flight: 0,
@@ -2775,7 +2769,7 @@ fn env_override_limits_lands_through_the_struct_derived_layer() {
     );
 }
 
-// ── `[observability]` (#486 OTLP export) ──────────────────────────────────
+// ── `[observability]` (OTLP export) ───────────────────────────────────────
 
 #[test]
 fn observability_config_defaults_match_the_documented_values() {
@@ -2910,7 +2904,7 @@ fn env_override_observability_lands_through_the_struct_derived_layer() {
 }
 
 // ---------------------------------------------------------------------------
-// OPS (#482) — `[server] preload_models` entries: a bare id (task from the
+// `[server] preload_models` entries: a bare id (task from the
 // `models` row) or `{ id, task }`; an unknown task token or key is a typed
 // load-time error naming it.
 // ---------------------------------------------------------------------------
@@ -3057,7 +3051,7 @@ fn gpu_devices_parses_from_toml_and_from_env() {
     let cfg = load_src("[gpu]\ndevice = 2\ndevices = [2, 0, 1]\n").unwrap();
     assert_eq!(cfg.gpu.device_list(), vec![2, 0, 1]);
 
-    // The env layer carries the array as a TOML array (H14: it replaces the
+    // The env layer carries the array as a TOML array (it replaces the
     // file's list wholly, never merges into it).
     let cfg = JammiConfig::parse_from(
         "[gpu]\ndevices = [0, 1, 2, 3]\n",
@@ -3412,7 +3406,7 @@ fn load_of_a_pre_distributed_config_is_unchanged() {
     assert!(!cfg.worker.topology(&cfg.gpu).unwrap().is_distributed());
 }
 
-// ─── U5b-1a (contract §10, round-3 excision): `[server] peer_advertise` and
+// ─── `[server] peer_advertise` and
 // `InstanceRegistration::from_config` carrying `resolved_result_root()`
 // VERBATIM — no filesystem access, no URL parse, no scheme handling, no
 // interpretation of the root at all. ───────────────────────────────────
@@ -3460,7 +3454,7 @@ fn advertising_config(artifact_dir: &std::path::Path, result_root: Option<&str>)
     }
 }
 
-/// P-M5 (contract §10): `peer_advertise` without `peer_bind` is refused
+/// `peer_advertise` without `peer_bind` is refused
 /// naming BOTH keys — the ONLY thing `MembershipConfig::validate` checks
 /// beyond parsing the address, exercised through the real `load_from`
 /// loader.
@@ -3479,7 +3473,7 @@ fn load_from_peer_advertise_without_peer_bind_is_refused_naming_both_keys() {
     );
 }
 
-/// The same P-M5 arm, over `InstanceRegistration::from_config` directly.
+/// The same arm, over `InstanceRegistration::from_config` directly.
 #[test]
 fn from_config_peer_advertise_without_peer_bind_is_refused_naming_both_keys() {
     let cfg = JammiConfig {
@@ -3498,7 +3492,7 @@ fn from_config_peer_advertise_without_peer_bind_is_refused_naming_both_keys() {
     );
 }
 
-/// RENDEZVOUS RV4: `[server] placement = "rendezvous"` with no
+/// `[server] placement = "rendezvous"` with no
 /// `peer_advertise` is refused BY NAME from `load_from` — the same choke
 /// point `peer_advertise`-without-`peer_bind` is refused at.
 #[test]
@@ -3553,7 +3547,7 @@ fn server_placement_defaults_local_and_parses_rendezvous() {
     assert_eq!(cfg.server.placement, crate::config::PlacementMode::Local);
 }
 
-/// P-X1 (contract §10): `InstanceRegistration::from_config`'s `member_root`
+/// `InstanceRegistration::from_config`'s `member_root`
 /// is the byte-for-byte output of `resolved_result_root()` — VERBATIM —
 /// over the whole arm list: unset, `file://`, `memory://`, `s3://`, both
 /// `gcs://` and `gs://` (two DIFFERENT strings — `Scheme`'s alias table is
@@ -3605,8 +3599,8 @@ fn from_config_member_root_is_resolved_result_root_verbatim_over_every_arm() {
 /// `gcs://b/p` and `gs://b/p` are DIFFERENT `member_root` STRINGS — the
 /// membership path performs no scheme aliasing when writing the row (this
 /// is a claim about the VALUE, not about `list_gang_members`'s admission
-/// predicate: that predicate does not consult `result_root` at all in this
-/// unit — contract §12, the round-5 excision — so two members with these
+/// predicate: that predicate does not consult `result_root` at all, so two
+/// members with these
 /// two different root strings ARE gang members of each other;
 /// `gang_membership.rs`'s
 /// `gcs_and_gs_spelled_members_are_gang_members_of_each_other_root_is_not_consulted`
@@ -3787,9 +3781,9 @@ fn resolved_result_root_mirrors_the_two_derivation_sites() {
     assert_eq!(set.resolved_result_root().unwrap(), "r2://bucket/prefix");
 }
 
-// ─── `[ballista]` (67 U8a-cfg / CFGDB) ──────────────────────────────────────
+// ─── `[ballista]` ───────────────────────────────────────────────────────────
 
-/// Unset `[ballista]` = no roles = today's process, byte-for-byte: neither
+/// Unset `[ballista]` = no roles: neither
 /// accessor reports a role, and validation against a default `[server]`
 /// passes trivially (there is nothing to check).
 #[test]
@@ -3802,7 +3796,7 @@ fn ballista_unset_means_no_roles() {
 
 /// `JAMMI_BALLISTA__SCHEDULER_BIND` (the `__`-segmented env form) reaches
 /// `ballista.scheduler_bind` — the `TOP_LEVEL_FIELDS` namespace-registration
-/// half of adding a new top-level section (esc-095: an unregistered section
+/// half of adding a new top-level section (an unregistered section
 /// name is a typed "unknown top-level config section" error, never a silent
 /// no-op).
 #[test]

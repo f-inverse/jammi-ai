@@ -1,5 +1,4 @@
-//! `Catalog::list_gang_members` / `Catalog::peer_addr_of` (DESIGN.md § 4,
-//! contract `feat_500-C-U5b-1a` §12 and unit U5b-1a-A2): the gang-membership
+//! `Catalog::list_gang_members` / `Catalog::peer_addr_of`: the gang-membership
 //! listing and by-id resolution verbs. `result_root` is written to every
 //! member row verbatim, and its IDENTITY across spellings
 //! (`result_root_identity`, derived by `MemberRoot::resolved`) is what the admission
@@ -192,9 +191,8 @@ fn listing<'a>(kind: &'a str, self_instance: &'a str, root: &'a MemberRoot) -> G
 }
 
 // ---------------------------------------------------------------------------
-// The exclusion matrix (P-M3, narrowed by P-Y1 §12 — the root arm is gone,
-// replaced below by the "root is not consulted" inclusion oracles), each
-// its own named case.
+// The exclusion matrix (the verbatim root is not an exclusion arm — see the
+// "root is not consulted" inclusion oracles below), each its own named case.
 // ---------------------------------------------------------------------------
 
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
@@ -744,7 +742,7 @@ async fn list_excludes_an_instance_with_no_workers_row(kind: BackendKind) {
     catalog.upsert_instance(&reg).await.unwrap();
     // Deliberately no `upsert_worker` call: an `instances` row with no
     // `workers` row is a live process that never runs the claim loop, not a
-    // fleet member (the INNER join, DESIGN.md § 4).
+    // fleet member (the INNER join).
     let members = catalog
         .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
@@ -790,7 +788,7 @@ async fn list_includes_a_fresh_multi_kind_claiming_worker(kind: BackendKind) {
     assert_eq!(member.peer_addr.as_str(), "10.0.0.5:9000");
 }
 
-/// P-M3's byte-order property, with the §8 control: ids inserted in
+/// The byte-order property, with a raw-order control: ids inserted in
 /// DESCENDING byte order so the DB's natural (no `ORDER BY`) return order is
 /// provably NOT already sorted — the raw-order control fails BY NAME, never
 /// skips, if this assumption ever stops holding.
@@ -1075,15 +1073,14 @@ async fn list_gang_members_returns_the_typed_error_for_a_corrupted_peer_addr(kin
 }
 
 // ---------------------------------------------------------------------------
-// M4 / P-M4 (restated over membership, §8 B1): the keeper's whole-tuple
-// re-registration, and the prune window.
+// The keeper's whole-tuple re-registration, and the prune window.
 // ---------------------------------------------------------------------------
 
 /// A process whose `instances` row was force-deleted during a transient
 /// outage (its `workers` row cascades with it) is a gang member again after
 /// ONE real `LeaseKeeper` pass — `peer_addr`, `result_root`, `kinds`, and
-/// `state` all byte-identical to before. RED at base: `touch_instance` is a
-/// pure `UPDATE` that can never resurrect a deleted row. Uses the REAL
+/// `state` all byte-identical to before — `touch_instance` alone, a pure
+/// `UPDATE`, could never resurrect a deleted row. Uses the REAL
 /// `LeaseKeeper`, never a direct re-insert.
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(

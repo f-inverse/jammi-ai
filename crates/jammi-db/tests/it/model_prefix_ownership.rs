@@ -1,16 +1,13 @@
-//! I5 (#547), restated by the wave-5 pressure round (F4): `delete_model`
-//! deletes a catalog ROW only — it carries no owner-vs-reuser refusal, and
+//! `delete_model` deletes a catalog ROW only — it carries no owner-vs-reuser refusal, and
 //! needs none, because byte safety over a prefix TWO `models` rows name is
 //! already GLOBAL: `ResultStore::prefix_is_referenced` /
 //! `Catalog::count_models_naming_prefix_all_tenants` counts across every
-//! tenant (and untenanted rows) regardless of which tenant's session is
-//! asking. This file is the executed oracle #547 asks for in place of a
-//! migration and an owner-refusal: two `models` rows naming ONE artifact
-//! prefix, deleted in BOTH orders, same-tenant and cross-tenant, proving
-//! U3's acceptance (a) — "delete one row, the other loads; delete both, the
-//! sweep reaps" — holds regardless of which row is called the "owner" and
-//! regardless of deletion order, with NO tenant-bound call ever learning the
-//! other row exists (delete_model's own referential scan never queries
+//! tenant (and untenanted rows) regardless of which tenant's session is asking. This file is the
+//! executed oracle for that, in place of an owner-refusal: two `models` rows naming ONE artifact
+//! prefix, deleted in BOTH orders, same-tenant and cross-tenant, proving "delete one row, the other
+//! loads; delete both, the sweep reaps" holds regardless of which row is called the "owner" and
+//! regardless of deletion order, with NO tenant-bound call ever learning the other row exists
+//! (delete_model's own referential scan never queries
 //! `models` at all — see `model_repo.rs::delete_model`'s doc — so there is
 //! no channel for it to disclose anything about a peer row through).
 
@@ -38,7 +35,7 @@ fn tenant_b() -> TenantId {
 /// One shared artifact prefix two `models` rows will name — computed
 /// through [`jammi_db::store::ArtifactStore::prefix_url`] (never a
 /// hand-built string) so it is genuinely under `store`'s own models root,
-/// exactly as `delete_artifact_prefix`'s I1 `debug_assert!` requires. Never
+/// exactly as `delete_artifact_prefix`'s `debug_assert!` requires. Never
 /// resolved to real bytes; this file exercises the CATALOG-level reference
 /// count only, the same predicate `ResultStore::delete_unreferenced_prefix`
 /// consults in production.
@@ -63,7 +60,7 @@ fn register_params<'a>(model_id: &'a str, artifact_path: &'a str) -> RegisterMod
 }
 
 /// Register two rows naming the SAME `artifact_path`, delete them in the
-/// order `(first, second)`, and assert the shape F4 pins at every step:
+/// order `(first, second)`, and assert the shape at every step:
 /// after `first` is gone, `second` still `get_model`s and the prefix is
 /// still referenced exactly once (never reapable); after `second` is also
 /// gone, the prefix is unreferenced (the sweep would now reap it).
@@ -183,7 +180,8 @@ async fn same_tenant_two_rows_one_prefix_owner_first(
 }
 
 /// Same fixture, REVERSED delete order: the reuser first, the owner second
-/// — U3's acceptance (a) must hold in both orders, not just one.
+/// — "delete one row, the other loads; delete both, the sweep reaps" must
+/// hold in both orders, not just one.
 #[test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -241,7 +239,7 @@ async fn cross_tenant_two_rows_one_prefix_both_orders(
     both_orders_hold(&store, &base, &cat_b, "i5-cross-b2", &cat_a, "i5-cross-a2").await;
 }
 
-/// The disclosure half of F4's property, stated as its own oracle rather
+/// The disclosure half of the property, stated as its own oracle rather
 /// than folded into `both_orders_hold`'s assertions: a tenant-bound
 /// `delete_model` NEVER queries the `models` table for a peer row at all
 /// (`model_repo.rs::delete_model`'s own doc: the referential scan is over
@@ -249,12 +247,9 @@ async fn cross_tenant_two_rows_one_prefix_both_orders(
 /// own row cannot even in principle learn tenant A's row exists. Proven by
 /// mutation: if `delete_model` were changed to consult
 /// `count_models_naming_prefix_all_tenants` and refuse while a peer exists
-/// (the owner-refusal #547's design round considered and F4 rejects), THIS
-/// test's `tenant_b`-scoped delete would start failing with `Referenced`
-/// instead of succeeding — reddening the assertion below. Run the mutation
-/// by hand: temporarily add such a refusal to `delete_model` and re-run;
-/// the assertion changes from `Ok` to `Err`, confirming today's absence of
-/// an owner-refusal is exactly what this test pins.
+/// (an owner-refusal), THIS test's `tenant_b`-scoped delete would start
+/// failing with `Referenced` instead of succeeding — reddening the assertion
+/// below. The absence of an owner-refusal is exactly what this test pins.
 #[test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",

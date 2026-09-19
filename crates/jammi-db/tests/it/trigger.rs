@@ -1,11 +1,9 @@
-//! Integration tests for Phase 4 — trigger-stream primitive.
+//! Integration tests for the trigger-stream primitive.
 //!
 //! Exercises the in-memory broker through the publisher/subscriber surface
-//! plus the topic-catalog repo, covering SPEC-04 §15 exit criteria
-//! #1 (register-publish-subscribe-filter), #2 (replay correctness),
-//! #3 (broadcast fan-out), #4 (tenant-scope isolation), #9 (schema
-//! validation), and #10 (backpressure smoke test). The live-broker
-//! variant (#5) and the gRPC surface tests land with Phases 4b/4c.
+//! plus the topic-catalog repo: register-publish-subscribe-filter, replay
+//! correctness, broadcast fan-out, tenant-scope isolation, schema
+//! validation, and a backpressure smoke test.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -164,7 +162,7 @@ fn batch_of(ids: &[i64], kinds: &[&str], values: &[f64]) -> RecordBatch {
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn register_publish_subscribe_filter_end_to_end(backend: BackendKind) {
-    // SPEC-04 §15 #1 — register a topic, publish 100 batches of 10 rows,
+    // Register a topic, publish 100 batches of 10 rows,
     // subscribe with `kind = 'X'`, verify only matching batches arrive.
     let h = build_harness(backend).await;
     let topic = topic_def(&unique_topic("events.changes"), None);
@@ -224,7 +222,7 @@ async fn register_publish_subscribe_filter_end_to_end(backend: BackendKind) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn replay_correctness_after_broker_restart(backend: BackendKind) {
-    // SPEC-04 §15 #2 — publish 100 batches, drop the broker (and the
+    // Publish 100 batches, drop the broker (and the
     // subscriber), construct a fresh broker, subscribe with from_offset=0,
     // expect all 100 batches replayed from the backing table.
     let h = build_harness(backend).await;
@@ -276,7 +274,7 @@ async fn replay_correctness_after_broker_restart(backend: BackendKind) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn broadcast_fan_out_to_two_subscribers(backend: BackendKind) {
-    // SPEC-04 §15 #3 — one topic, two subscriptions with different
+    // One topic, two subscriptions with different
     // predicates, mixed publishes; each subscriber sees its matching subset.
     let h = build_harness(backend).await;
     let topic = topic_def(&unique_topic("events.changes"), None);
@@ -327,7 +325,7 @@ async fn broadcast_fan_out_to_two_subscribers(backend: BackendKind) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn tenant_scope_isolates_topics(backend: BackendKind) {
-    // SPEC-04 §15 #4 — tenant A registers t1, tenant B registers t2,
+    // Tenant A registers t1, tenant B registers t2,
     // neither sees the other's topic via lookup_by_name; the global None
     // tenant sees both.
     let tenant_a = TenantId::from_uuid(Uuid::new_v4()).unwrap();
@@ -370,7 +368,7 @@ async fn tenant_scope_isolates_topics(backend: BackendKind) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn publish_rejects_schema_mismatch(backend: BackendKind) {
-    // SPEC-04 §15 #9 — a batch whose schema does not match the topic's
+    // A batch whose schema does not match the topic's
     // returns BatchSchemaMismatch and writes nothing to the backing table.
     let h = build_harness(backend).await;
     let topic = topic_def(&unique_topic("events.changes"), None);
@@ -403,7 +401,7 @@ async fn publish_rejects_schema_mismatch(backend: BackendKind) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn backpressure_slows_publisher_without_dropping(backend: BackendKind) {
-    // SPEC-04 §15 #10 — a slow subscriber slows the broker tail but does
+    // A slow subscriber slows the broker tail but does
     // not drop events; offsets must be contiguous and complete after
     // catch-up.
     let h = build_harness(backend).await;
@@ -452,7 +450,7 @@ async fn backpressure_slows_publisher_without_dropping(backend: BackendKind) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn empty_predicate_matches_every_batch(backend: BackendKind) {
-    // Predicate-dialect smoke test: empty string ≡ match_all per SPEC-04 §3.5.
+    // Predicate-dialect smoke test: empty string ≡ match_all.
     let h = build_harness(backend).await;
     let topic = topic_def(&unique_topic("events.changes"), None);
     h.broker.register_topic(&topic).await.unwrap();
@@ -557,7 +555,7 @@ async fn session_drop_missing_topic_is_not_found(backend: BackendKind) {
 
 #[tokio::test]
 async fn predicate_rejects_unsupported_constructs() {
-    // SPEC-04 §8.2 — subqueries, aggregates, and other forms are rejected
+    // Subqueries, aggregates, and other forms are rejected
     // at parse time with `PredicateUnsupported`.
     let session = SessionContext::new();
     let schema = topic_schema();
@@ -959,7 +957,7 @@ async fn publish_returns_error_on_tenant_mismatch_when_topic_is_tenant_pinned(
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn list_consumers_returns_each_subscribers_last_delivered_offset(backend: BackendKind) {
-    // SPEC-04 backup/restore hook: `TriggerBroker::list_consumers` returns one
+    // Backup/restore hook: `TriggerBroker::list_consumers` returns one
     // `ConsumerOffsetSnapshot` per live subscription, carrying the broker's
     // last-delivered stream sequence. The capture is what a downstream
     // consumer's backup path will dump into the manifest so a restored
@@ -1125,7 +1123,7 @@ async fn session_with_broker_swallows_fan_out_failure(backend: BackendKind) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn crash_mid_publish_replays_committed_offsets_with_no_loss(backend: BackendKind) {
-    // Track T1 — crash-mid-publish replay (hermetic, in-memory).
+    // Crash-mid-publish replay (hermetic, in-memory).
     //
     // Publish N batches against a real backing table, injecting a
     // post-commit broker fan-out failure on one of them via
@@ -1196,7 +1194,7 @@ async fn crash_mid_publish_replays_committed_offsets_with_no_loss(backend: Backe
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn live_tail_resumes_with_no_loss_after_post_commit_fan_out_failure(backend: BackendKind) {
-    // Track T1 — the in-memory analogue of the JetStream consumer-recreate
+    // The in-memory analogue of the JetStream consumer-recreate
     // resume test. A late subscriber attaches at `from_offset` AFTER a
     // post-commit fan-out failure has skewed the broker's view from the
     // engine `_offset`, then keeps consuming as new publishes arrive live.
@@ -1274,7 +1272,7 @@ async fn live_tail_resumes_with_no_loss_after_post_commit_fan_out_failure(backen
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn at_least_once_no_skip_property_over_randomized_states(backend: BackendKind) {
-    // Track T1 — at-least-once / no-skip property test.
+    // At-least-once / no-skip property test.
     //
     // Over randomized publish counts, subscriber attach points, and an
     // injected post-commit broker fan-out failure offset, assert the

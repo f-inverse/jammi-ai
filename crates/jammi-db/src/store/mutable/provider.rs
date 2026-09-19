@@ -1,10 +1,8 @@
 //! `TableProvider` implementation for mutable companion tables.
 //!
-//! Phase 2 ships a minimum viable provider that supports `scan` (full-table
-//! reads) and `insert_into` (DataFusion DML through [`MutableTableSink`]).
-//! Predicate pushdown, projection, and limit are translated to backend SQL
-//! when straightforward; otherwise DataFusion's planner handles them above
-//! the scan node.
+//! The provider supports `scan` (full-table reads) and `insert_into` (DataFusion DML through
+//! [`MutableTableSink`]). Predicate pushdown, projection, and limit are translated to backend SQL
+//! when straightforward; otherwise DataFusion's planner handles them above the scan node.
 
 use std::fmt;
 use std::sync::Arc;
@@ -175,7 +173,7 @@ impl TableProvider for MutableTableProvider {
         if !matches!(insert_op, InsertOp::Append | InsertOp::Replace) {
             return Err(DataFusionError::NotImplemented(format!(
                 "InsertOp {insert_op:?} not supported on mutable tables; \
-                 use Append or Replace (see SPEC-02 §13 OQ#5)"
+                 use Append or Replace"
             )));
         }
         let sink = Arc::new(MutableTableSink::new(

@@ -1,4 +1,4 @@
-//! Integration tests for the per-query audit primitive (spec J2).
+//! Integration tests for the per-query audit primitive.
 //!
 //! Exercises the success criteria end-to-end against a real session
 //! (SQLite and Postgres): signed writes, signature verification, tenant
@@ -126,10 +126,9 @@ async fn tenant_isolation(backend: BackendKind) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn two_tenants_can_both_log(backend: BackendKind) {
-    // Regression for the per-tenant audit-topic uniqueness defect: the
-    // `topics` catalog table used to enforce a *global* `UNIQUE(name)`, so the
-    // first tenant to `log` claimed `jammi.audit.search.v1` process-wide and
-    // the SECOND tenant's first `log` crashed with
+    // Topic-name uniqueness is per tenant: under a *global* `UNIQUE(name)` on
+    // `topics`, the first tenant to `log` would claim `jammi.audit.search.v1`
+    // process-wide and the SECOND tenant's first `log` would fail with
     // `UNIQUE constraint failed: topics.name`. Both tenants must succeed, and
     // each must see only its own audit records (delivered isolation preserved).
     let _g = env_lock().lock().await;

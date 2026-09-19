@@ -376,10 +376,9 @@ async fn search_vectors_local_with_no_catalog_width_attributes_a_wrong_width_que
 // mismatch is ALWAYS the artifact class regardless of which check catches
 // it (`require_width` or `require_authority_width` — neither can express a
 // caller fault for `Stored`), so this is NOT a `Schema` (caller-class)
-// refusal: what the unconditional check changes is WHICH artifact gets
-// named. Before this fix, the artifact was the downstream SEGMENT the
-// query happened to meet; after it, the artifact is the query's own
-// Stored-provenance table — pinpointing the actual corrupt source rather
+// refusal: what the unconditional check decides is WHICH artifact gets
+// named — the query's own Stored-provenance table, never the downstream
+// SEGMENT the query happened to meet — pinpointing the actual corrupt source rather
 // than an innocent segment that merely disagreed with it.
 #[tokio::test]
 async fn search_vectors_local_with_a_catalog_width_still_checks_a_deferred_stored_query() {
@@ -679,7 +678,7 @@ async fn ready_table(store: &ResultStore) -> ResultTableRecord {
         .unwrap()
 }
 
-// C2 — the version allocator is monotonic and never reuses a number: two
+// The version allocator is monotonic and never reuses a number: two
 // allocations take 0 and 1; failing 1 keeps it; the next allocation takes 2;
 // expiring 1 never lowers `next_version`. A segment appended under a version
 // is stamped with it (excluded from the base set) and reaped with it; the
@@ -908,20 +907,18 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
     d2.detach();
 }
 
-// DELTA fix round 2 (audit a98bf51479b523692 advisory / design round
-// a1492adfcf0d0f8e6 item 3) — the monotonicity guard's refused direction:
+// The monotonicity guard's refused direction:
 // `publish_version`'s parent must be strictly less than the version being
 // published. Two allocations off parent 0 (versions 1 and 2, the same
 // fixture `allocation_is_monotonic_and_never_reused` uses); publish v2
 // FIRST (parent 0, the always-true direction), THEN attempt to publish v1
-// with `parent: Some(2)` — the refused direction (`2 >= 1`). Before the
-// guard moved into Rust, the SQL conjunct's miss fell through
-// `classify_ready_cas_miss` to `CasFailed { status: "ready" }` (the row's
-// `current_version` (2) equals `expected_parent` (2), so `ParentMoved`
-// never fired) — the same misnaming-for-a-ready-row shape `ParentMoved`
-// exists to stop. The precondition now refuses typed, deterministically,
-// before any transaction opens, on both backends, with no concurrency
-// required.
+// with `parent: Some(2)` — the refused direction (`2 >= 1`). A SQL-side
+// conjunct's miss would fall through `classify_ready_cas_miss` to
+// `CasFailed { status: "ready" }` (the row's `current_version` (2) equals
+// `expected_parent` (2), so `ParentMoved` never fires) — the
+// misnaming-for-a-ready-row shape `ParentMoved` exists to stop. The
+// precondition refuses typed, deterministically, before any transaction
+// opens, on both backends, with no concurrency required.
 #[cfg_attr(test, test_case(BackendKind::Sqlite ; "sqlite"))]
 #[cfg_attr(
     all(test, feature = "live-postgres-tests"),
@@ -1018,17 +1015,15 @@ async fn publish_refuses_a_non_monotonic_parent(kind: BackendKind) {
     d2.detach();
 }
 
-// O1 (DELTA fix round 1, audit a25424e2aa5e91337 F1) — the serialized
-// interleaving the pre-fix §6.7 oracle could never build: A publishes
-// FULLY (allocates AND publishes) from parent P, THEN B — still holding
-// its OWN read of P from before A's publish — attempts to allocate. Before
-// this fix, `allocate_result_table_version` re-read `current_version`
-// itself and handed it back as B's parent, so B's allocation silently
-// SUCCEEDED against A's new current_version and B's manifest would later
-// disagree with its own `parent_version` (K7 broken). The fix pins the
-// allocating UPDATE's WHERE clause to the caller's `expected_parent`: B's
-// allocation now refuses typed (`ParentMoved`) BEFORE `next_version`
-// increments, so B's stale attempt consumes no version number and inserts
+// The serialized interleaving: A publishes FULLY (allocates AND publishes)
+// from parent P, THEN B — still holding its OWN read of P from before A's
+// publish — attempts to allocate. If `allocate_result_table_version`
+// re-read `current_version` itself and handed it back as B's parent, B's
+// allocation would silently SUCCEED against A's new current_version and B's
+// manifest would later disagree with its own `parent_version`. The
+// allocating UPDATE's WHERE clause is pinned to the caller's
+// `expected_parent`: B's allocation refuses typed (`ParentMoved`) BEFORE
+// `next_version` increments, so B's stale attempt consumes no version number and inserts
 // no `building` row (no manifest, no fragment ever gets a chance to be
 // written for it). `refresh_embeddings` and `compact_embeddings` both
 // allocate through this exact `ResultStore::allocate_version` /
@@ -1165,7 +1160,7 @@ async fn allocation_refuses_when_the_parent_moved(kind: BackendKind) {
     assert_eq!(final_row.current_version, Some(next_before));
 }
 
-// §6.14 — shard-ordering property: segments appended to one building version
+// Shard-ordering property: segments appended to one building version
 // in either order yield an identical masked merge; masking depends only on
 // the version stamps, never on segment id order.
 #[tokio::test]

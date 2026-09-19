@@ -972,6 +972,20 @@ impl JammiSession {
         &self.ctx
     }
 
+    /// Append `rule` to this session's physical optimizer, after every rule
+    /// already registered. Every context derived from this session's state
+    /// plans with it.
+    pub fn add_physical_optimizer_rule(
+        &self,
+        rule: Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>,
+    ) {
+        let state = self.ctx.state_ref();
+        let mut state = state.write();
+        *state = SessionStateBuilder::new_from_existing(state.clone())
+            .with_physical_optimizer_rule(rule)
+            .build();
+    }
+
     /// Return a reference to the artifact catalog.
     pub fn catalog(&self) -> &Arc<Catalog> {
         &self.catalog

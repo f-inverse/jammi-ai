@@ -21,7 +21,10 @@ use crate::model::cache::ModelCache;
 use crate::model::hub::HubSource;
 use crate::model::resolver::ModelResolver;
 use crate::model::{ModelSource, ModelTask};
-use crate::operator::inference_exec::InferenceExecBuilder;
+use crate::operator::inference_exec::{
+    plan_inference, InferenceFanOut, InferenceRuntime, InferenceSpec,
+};
+use crate::operator::numbered_input_exec::RowOrder;
 use crate::pipeline::embedding::EmbeddingPipeline;
 use crate::query::QueryBuilder;
 use jammi_db::cache::ann_cache::AnnCache;
@@ -240,15 +243,16 @@ impl InferenceSession {
         // funnel every `InferenceSession` constructor reaches, so a
         // hand-built config (never routed through `JammiConfig::load_from`)
         // is still covered here.
-        // `JammiConfig::load_from` calls `InferenceConfig::validate`
-        // (rejects `partitions == 0` and above `MAX_PARTITIONS`), but a
+        // `JammiConfig::load_from` calls `InferenceConfig::validate`, but a
         // hand-built `JammiConfig` handed straight to an `InferenceSession`
-        // constructor — the way every test in this crate, and any embedding
-        // caller, builds one — never runs `load_from` at all. `wrap_with` is
-        // the same universal funnel that covers `MembershipConfig::validate`
-        // for the identical reason (see the comment above), so
-        // `inference.partitions` is validated here too.
+        // constructor never runs `load_from` at all. `wrap_with` is the same
+        // universal funnel that covers `MembershipConfig::validate` for the
+        // identical reason (see the comment above), so the `[inference]`
+        // fan-out and batch size are validated here too.
         inner.config().inference.validate()?;
+        // A query this session plans through the optimizer keeps the
+        // inference fan-out its plan was built with.
+        inner.add_physical_optimizer_rule(Arc::new(InferenceFanOut));
 
         let instance_id = crate::fine_tune::worker::mint_instance_id();
         let label = crate::fine_tune::worker::worker_label();
@@ -902,6 +906,15 @@ impl InferenceSession {
         &self.model_cache
     }
 
+    /// The handles an `InferenceExec` bound in this process runs against:
+    /// this session's model cache and observer.
+    pub fn inference_runtime(&self) -> InferenceRuntime {
+        InferenceRuntime {
+            model_cache: Arc::clone(&self.model_cache),
+            observer: self.observer.clone(),
+        }
+    }
+
     /// Access the result store.
     pub fn result_store(&self) -> Arc<ResultStore> {
         Arc::clone(&self.result_store)
@@ -957,11 +970,6 @@ impl InferenceSession {
     /// Access the ANN cache.
     pub fn ann_cache(&self) -> &Arc<AnnCache> {
         &self.ann_cache
-    }
-
-    /// Access the inference observer.
-    pub(crate) fn observer(&self) -> &Option<Arc<dyn InferenceObserver>> {
-        &self.observer
     }
 
     /// Start a vector-search-seeded compound query over an embedding table.
@@ -1067,49 +1075,25 @@ impl InferenceSession {
         let regression_form = guard.model.regression_form().cloned();
         drop(guard);
 
-        // See `operator::inference_exec::
-        // wrap_with_split_and_merge`'s doc. `input` here is CALLER-supplied
-        // (`query::QueryBuilder::annotate`'s fluent chain, or the Flight-SQL
-        // `annotate` table function's scan) and may already have more than
-        // one partition with nothing coalescing it — at the default
-        // `InferenceConfig::partitions == 1`, `wrap_with_split_and_merge`
-        // coalesces such an `input` to one partition before building
-        // InferenceExec: an uncoalesced multi-partition `input` would make
-        // InferenceExec declare N partitions while every partition's own
-        // runner independently restarts `_ordinal` at 0, and every in-crate
-        // `.execute(0, ..)` caller would see only a fraction of the rows —
-        // this is a REAL, load-bearing plan-shape change on this specific
-        // path, not a no-op, whenever `input` was not already a single
-        // partition.
-        let partitions = self.inner.config().inference.partitions;
-        let batch_size = self.inner.config().inference.batch_size;
-        let observer = self.observer.clone();
-        let model_cache = Arc::clone(&self.model_cache);
-        let device_kind = self.compute_device().kind();
-        let model = model.clone();
-        let columns = columns.to_vec();
-        let key_column = key_column.to_string();
-        let plan = crate::operator::inference_exec::wrap_with_split_and_merge(
-            input,
-            partitions,
-            move |input| {
-                InferenceExecBuilder::new(
-                    input,
-                    model,
-                    task,
-                    columns,
-                    key_column,
-                    String::new(),
-                    model_cache,
-                    device_kind,
-                )
-                .batch_size(batch_size)
-                .observer(observer)
-                .embedding_dim(embedding_dim)
-                .regression_form(regression_form)
-                .build()
-            },
-        )?;
+        // `input` is caller-supplied — the fluent chain's plan, or the
+        // `annotate` table function's scan — with no key order to impose, so
+        // its rows are numbered as they arrive.
+        let inference = &self.inner.config().inference;
+        let spec = InferenceSpec {
+            source: model.clone(),
+            task,
+            content_columns: columns.to_vec(),
+            key_column: key_column.to_string(),
+            source_id: String::new(),
+            backend: None,
+            batch_size: inference.forward_batch_size()?,
+            embedding_dim,
+            regression_form,
+            passthrough: Vec::new(),
+            device_kind: self.compute_device().kind(),
+            partitions: inference.fan_out()?,
+        };
+        let plan = plan_inference(input, RowOrder::Arrival, spec, self.inference_runtime())?;
 
         Ok(plan)
     }
@@ -1535,12 +1519,6 @@ impl InferenceSession {
             .create_physical_plan()
             .await
             .map_err(|e| JammiError::Inference(format!("Failed to create scan plan: {e}")))?;
-        // The same plan shape the embedding pipeline uses (coalesce →
-        // null-key check → total order), so `infer` refuses a null key typed
-        // before any model call and its output is deterministic across
-        // `execution_threads`.
-        let input_plan = crate::operator::ordered_input::ordered_input(input_plan, key_column)?;
-
         // Pre-load the model to get embedding dimensions for schema construction.
         // This also warms the cache so execute() hits a cache hit.
         let guard = self.model_cache.get_or_load(source, task, None).await?;
@@ -1607,41 +1585,31 @@ impl InferenceSession {
             }
         }
 
-        // Wrap with InferenceExec. See
-        // `operator::inference_exec::wrap_with_split_and_merge`'s doc. At
-        // the default `InferenceConfig::partitions == 1` it coalesces
-        // `input_plan` to one partition if it is not already one — a no-op
-        // here, since `ordered_input` just above already produced exactly
-        // one partition.
-        let partitions = self.inner.config().inference.partitions;
-        let batch_size = self.inner.config().inference.batch_size;
-        let observer = self.observer.clone();
-        let model_cache = Arc::clone(&self.model_cache);
-        let device_kind = self.compute_device().kind();
-        let source_clone = source.clone();
-        let content_columns_owned = content_columns.to_vec();
-        let key_column_owned = key_column.to_string();
-        let source_id_owned = source_id.to_string();
-        let inference_exec = crate::operator::inference_exec::wrap_with_split_and_merge(
+        // The same plan the embedding pipeline runs: the keyed input refuses
+        // a null key typed before any model call, and the total order makes
+        // the output deterministic across `execution_threads`.
+        let inference = &self.inner.config().inference;
+        let spec = InferenceSpec {
+            source: source.clone(),
+            task,
+            content_columns: content_columns.to_vec(),
+            key_column: key_column.to_string(),
+            source_id: source_id.to_string(),
+            backend: None,
+            batch_size: inference.forward_batch_size()?,
+            embedding_dim,
+            regression_form,
+            passthrough: Vec::new(),
+            device_kind: self.compute_device().kind(),
+            partitions: inference.fan_out()?,
+        };
+        let inference_exec = plan_inference(
             input_plan,
-            partitions,
-            move |input| {
-                InferenceExecBuilder::new(
-                    input,
-                    source_clone,
-                    task,
-                    content_columns_owned,
-                    key_column_owned,
-                    source_id_owned,
-                    model_cache,
-                    device_kind,
-                )
-                .batch_size(batch_size)
-                .observer(observer)
-                .embedding_dim(embedding_dim)
-                .regression_form(regression_form)
-                .build()
+            RowOrder::Keyed {
+                key_column: key_column.to_string(),
             },
+            spec,
+            self.inference_runtime(),
         )?;
 
         // Execute and collect results — both through the structural

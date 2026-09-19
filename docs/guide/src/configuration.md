@@ -86,24 +86,20 @@ compute_precision = "f32"
 [inference]
 # Default backend selection strategy. Default: "auto".
 default_backend = "auto"
-# Maximum rows per inference batch. Default: 32.
+# Rows per model forward. Row i of an ordered input is forwarded in chunk
+# i / batch_size, whatever the fan-out below. 0 is refused at load.
+# Default: 32.
 batch_size = 32
 # Timeout for batch accumulation in server mode (seconds). Default: 300.
 batch_timeout_secs = 300
 # Maximum models kept loaded simultaneously. 0 = unlimited. Default: 0.
 max_loaded_models = 0
-# Number of ordinal-keyed partitions an inference/embedding plan fans a
-# model's forward pass out to below one merge. 1 is the default (and the
-# minimum accepted value: 0 is refused at load, never silently treated as
-# 1). A value greater than 1 fans the model forward out N ways IN-PROCESS
-# on the executor that runs it, each partition's forward call admitted by a
-# permit scoped to that ONE InferenceExec instance (not a whole device):
-# two concurrent InferenceExec instances targeting the same GPU each get
-# their own permit and run their own forward concurrently — a real,
-# device-wide admission scheduler is a named future seam
-# (jammi_ai::concurrency::GpuScheduler), not built by this permit. Not yet
-# distributable: a value greater than 1 has no wire form and is refused if
-# submitted to a Ballista cluster. Default: 1.
+# The inference fan-out: how many partitions of one plan forward chunks
+# concurrently — threads of one process, or tasks of a cluster when the plan
+# is submitted to one. The rows a model forwards together are decided by
+# batch_size alone, so the written bytes are identical at every value. 1 is
+# the default and the minimum: 0 is refused at load, never silently treated
+# as 1. Default: 1.
 partitions = 1
 
 [inference.http]

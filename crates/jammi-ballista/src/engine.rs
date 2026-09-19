@@ -1,10 +1,10 @@
 //! `JammiExecutionEngine` — wraps Ballista's [`DefaultExecutionEngine`] and
 //! adds jammi's own per-stage duties before delegating.
 //!
-//! Device pinning: `InferenceExec::device_kind()` is a required
-//! constructor argument, so every `InferenceExec` — decoded or in-process —
-//! names a concrete kind (`InferenceExecBuilder::new`, `inference_exec.rs`;
-//! the codec never invents or rewrites it, `codec.rs`); `GangExec`'s
+//! Device pinning: `InferenceSpec::device_kind` is a required field, so
+//! every `InferenceExec` — decoded or in-process — names a concrete kind
+//! (`inference_exec.rs`; the codec never invents or rewrites it,
+//! `codec.rs`); `GangExec`'s
 //! descriptor carries the same kind, stamped by the submitter
 //! (`GangDescriptor::device_kind`, `jammi_ai::fine_tune::worker::
 //! JobWorker::submit_placed`). A stage whose `InferenceExec`/`GangExec`
@@ -99,7 +99,7 @@ pub fn required_device_kind(plan: &Arc<dyn ExecutionPlan>) -> Option<ComputeDevi
         return Some(exec.descriptor().device_kind);
     }
     if let Some(exec) = plan.downcast_ref::<InferenceExec>() {
-        return Some(exec.device_kind());
+        return Some(exec.spec().device_kind);
     }
     plan.children().into_iter().find_map(required_device_kind)
 }

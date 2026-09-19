@@ -21,7 +21,7 @@ message ModelSource {
   }
 }
 
-// `InferenceExec`'s construction inputs (`jammi_ai::operator::inference_exec`).
+// `InferenceExec`'s `InferenceSpec` (`jammi_ai::operator::inference_exec`).
 // The child plan is NOT carried here — the generic physical-plan-to-proto
 // framework encodes/decodes it via `ExecutionPlan::children()` /
 // `PhysicalExtensionCodec::try_decode`'s own `inputs` slice
@@ -43,13 +43,21 @@ message InferenceExecNode {
   // `DistributionForm` via `serde_json` (already `Serialize`/`Deserialize`).
   optional string regression_form_json = 9;
   repeated string passthrough = 10;
-  // The device KIND this descriptor must run on ("cpu"|"cuda"|"metal"),
-  // absent when the constructing call site left it unset — in which case
-  // the codec stamps it from the
-  // SUBMITTING session's own `compute_device().kind()` at encode time, so
-  // the field is ALWAYS present on the wire even when absent at
-  // construction.
+  // The device KIND this descriptor must run on ("cpu"|"cuda"|"metal"):
+  // exactly the value the node was constructed with. The codec never invents
+  // or rewrites it.
   string device_kind = 11;
+  // The fan-out the node declares: how many partitions forward chunks
+  // concurrently.
+  uint64 partitions = 12;
+}
+
+// `NumberedInputExec`'s construction input (`jammi_ai::operator::
+// numbered_input_exec`): the order it numbers its single child's rows in.
+message NumberedInputExecNode {
+  // The key column of the keyed total order. Absent: rows are numbered in
+  // arrival order.
+  optional string key_column = 1;
 }
 
 // `AnnSearchExec`'s construction inputs (`jammi_ai::operator::ann_search_exec`).
@@ -80,13 +88,6 @@ message AsofJoinExecNode {
 message KeyCheckExecNode {
   string key_column = 1;
 }
-
-// `OrdinalSplitExec` (`jammi_ai::operator::ordinal_split_exec`) has NO
-// message here — it is not distributable in v1. See
-// `jammi_ballista::codec`'s module doc for why (a Ballista
-// SortPreservingMergeExec is a stage boundary, so this node's in-process
-// shared-mutex mechanism has no meaning across the resulting per-task
-// process split).
 
 // `GangExec`'s construction inputs.
 message GangExecNode {

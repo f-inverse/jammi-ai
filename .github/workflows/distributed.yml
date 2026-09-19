@@ -99,7 +99,8 @@ jobs:
               killed_coordinator_job_is_reclaimed_and_completed_by_a_new_gang
           # The Ballista compute-plane lane: a real three(+)-process
           # `jammi-server` fleet with `[ballista]` roles configured, proving
-          # embedding-across-two-executors, placed-gang-completes-elsewhere,
+          # embedding-across-two-executors (at a fan-out of one and of four),
+          # placed-gang-completes-elsewhere,
           # killed-executor-mid-gang reclaim, scheduler restart, two
           # schedulers over one catalog, the device-less/KIND-MATCH refusal,
           # and `list_workers`/`list_compute_executor_devices` device
@@ -112,6 +113,7 @@ jobs:
             advisory: false
             tests: >-
               embedding_job_across_two_executors_matches_in_process
+              embedding_job_fanned_out_four_ways_matches_in_process
               placed_gang_completes_on_a_registered_executor_other_than_the_submitter
               killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_completes
               scheduler_restart_keeps_executors_and_serves_a_new_job

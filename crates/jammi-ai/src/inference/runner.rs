@@ -1,3 +1,4 @@
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,15 +10,15 @@ use jammi_db::error::{JammiError, Result};
 use tokio::sync::mpsc::Sender;
 
 use super::adapter::{create_adapter, BackendOutput, OutputAdapter};
+use super::chunk::ChunkAssembler;
 use super::observer::InferenceObserver;
-use super::schema::{build_prefix_columns, extract_or_generate_ordinals};
+use super::schema::{build_prefix_columns, ORDINAL_COLUMN};
 use super::{extract_column, extract_columns, slice_columns};
-use crate::model::cache::ModelCache;
 use crate::model::oom::is_oom_message;
-use crate::model::{BackendType, ModelSource, ModelTask};
+use crate::operator::inference_exec::{InferenceRuntime, InferenceSpec};
 
-/// Processes input RecordBatches through a model, handling batching and
-/// dynamic batch sizing.
+/// Runs one partition of an `InferenceExec`: gathers its input into forward
+/// chunks by `_ordinal` ([`ChunkAssembler`]) and forwards each chunk.
 ///
 /// A model-forward failure is always systemic (a broken kernel, a
 /// contiguity/PTX/dtype mismatch, or a model incapable of the requested
@@ -25,29 +26,14 @@ use crate::model::{BackendType, ModelSource, ModelTask};
 /// per-row `_status = error`. `run` propagates it as an `Err` sent through
 /// the output stream, failing the operation loudly. The only recovery this
 /// runner performs is OOM batch-halving, folded into the cursor loop in
-/// `run_chunks`: it retries the SAME unsent slice at a
-/// smaller size; every other forward failure, and a persistent OOM at the
-/// minimum batch size (1), propagates.
+/// `run_chunk`: it retries the SAME unsent slice at a smaller size; every
+/// other forward failure, and a persistent OOM at the minimum batch size (1),
+/// propagates.
 pub struct InferenceRunner {
-    model_cache: Arc<ModelCache>,
-    source: ModelSource,
-    task: ModelTask,
-    content_columns: Vec<String>,
-    key_column: String,
-    source_id: String,
-    backend: Option<BackendType>,
-    batch_size: usize,
-    observer: Option<Arc<dyn InferenceObserver>>,
-    /// Input columns copied verbatim to the end of every emitted sub-batch
-    /// (see `schema::build_output_schema`'s `passthrough`).
-    passthrough: Vec<String>,
-    /// The per-`InferenceExec`-instance admission bounding how many `forward()` calls run
-    /// concurrently across every partition of the SAME `InferenceExec`
-    /// (shared via one `Arc` across the `N` `InferenceRunner`s
-    /// `InferenceExec::execute` builds — one per partition). `None` is the
-    /// unrestricted default for a caller that never opts in (this runner's
-    /// own unit tests below): forward calls proceed with no admission gate,
-    /// exactly as every release before this bound existed.
+    spec: InferenceSpec,
+    runtime: InferenceRuntime,
+    /// Bounds how many `forward()` calls run concurrently across every runner
+    /// sharing the semaphore. `None` admits every forward.
     forward_permits: Option<Arc<tokio::sync::Semaphore>>,
 }
 
@@ -148,11 +134,43 @@ pub mod test_hooks {
     }
 }
 
+/// The columns the runner reads off one chunk, or off a sub-slice of one.
+struct ChunkColumns {
+    content: Vec<ArrayRef>,
+    keys: ArrayRef,
+    passthrough: Vec<ArrayRef>,
+    ordinals: ArrayRef,
+}
+
+impl ChunkColumns {
+    fn of(chunk: &RecordBatch, spec: &InferenceSpec) -> Result<Self> {
+        Ok(Self {
+            content: extract_columns(chunk, &spec.content_columns)?,
+            keys: extract_column(chunk, &spec.key_column)?,
+            passthrough: extract_columns(chunk, &spec.passthrough)?,
+            ordinals: extract_column(chunk, ORDINAL_COLUMN)?,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn slice(&self, start: usize, len: usize) -> Self {
+        Self {
+            content: slice_columns(&self.content, start, len),
+            keys: self.keys.slice(start, len),
+            passthrough: slice_columns(&self.passthrough, start, len),
+            ordinals: self.ordinals.slice(start, len),
+        }
+    }
+}
+
 /// Everything needed to shape a successful forward's raw output into a
 /// labeled `RecordBatch` and observe it — bundled because these are all
 /// per-runner-invocation constants, distinct from the per-chunk batching
-/// mechanics (`content`, `keys`, `current_batch_size`) that vary every
-/// iteration of [`InferenceRunner::run_chunks`].
+/// mechanics ([`ChunkColumns`], `current_batch_size`) that vary every
+/// iteration of [`InferenceRunner::run_chunk`].
 struct OutputContext<'a> {
     output_schema: &'a SchemaRef,
     adapter: &'a dyn OutputAdapter,
@@ -164,49 +182,22 @@ struct OutputContext<'a> {
 }
 
 impl InferenceRunner {
-    /// Create a runner for the given model, task, and column configuration.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        model_cache: Arc<ModelCache>,
-        source: ModelSource,
-        task: ModelTask,
-        content_columns: Vec<String>,
-        key_column: String,
-        source_id: String,
-        backend: Option<BackendType>,
-        batch_size: usize,
-        observer: Option<Arc<dyn InferenceObserver>>,
-    ) -> Self {
+    /// A runner computing `spec` against `runtime`.
+    pub fn new(spec: InferenceSpec, runtime: InferenceRuntime) -> Self {
         Self {
-            model_cache,
-            source,
-            task,
-            content_columns,
-            key_column,
-            source_id,
-            backend,
-            batch_size,
-            observer,
-            passthrough: Vec::new(),
+            spec,
+            runtime,
             forward_permits: None,
         }
     }
 
-    /// Name input columns copied verbatim to the end of every emitted
-    /// sub-batch, in this order (after the task columns).
-    pub fn with_passthrough(mut self, passthrough: Vec<String>) -> Self {
-        self.passthrough = passthrough;
-        self
-    }
-
-    /// Bound `forward()` concurrency across every partition sharing this
-    /// semaphore. See `forward_permits`'s field doc.
+    /// Bound `forward()` concurrency across every runner sharing `permits`.
     pub fn with_forward_permits(mut self, permits: Arc<tokio::sync::Semaphore>) -> Self {
         self.forward_permits = Some(permits);
         self
     }
 
-    /// Consume the input stream, run inference in sub-batches, and send results to `tx`.
+    /// Consume the input stream, forward it chunk by chunk, and send results to `tx`.
     pub async fn run(
         &self,
         mut input: SendableRecordBatchStream,
@@ -234,110 +225,116 @@ impl InferenceRunner {
         tx: &Sender<datafusion::error::Result<RecordBatch>>,
         output_schema: &SchemaRef,
     ) -> Result<()> {
-        // Load model (or get from cache)
+        let spec = &self.spec;
         let guard = self
+            .runtime
             .model_cache
-            .get_or_load(&self.source, self.task, self.backend)
+            .get_or_load(&spec.source, spec.task, spec.backend)
             .await?;
+        let adapter = create_adapter(spec.task, &guard.model)?;
+        let model_label = spec.source.to_string();
+        let ctx = OutputContext {
+            output_schema,
+            adapter: adapter.as_ref(),
+            source_id: &spec.source_id,
+            model_label: &model_label,
+            observer: self.runtime.observer.as_deref(),
+            key_column: &spec.key_column,
+        };
 
-        // Create output adapter for this task
-        let adapter = create_adapter(self.task, &guard.model)?;
-
-        // Track dynamic batch size. A shrink from OOM recovery persists
-        // across input batches (never grows back), so this is threaded
-        // through every call to `run_chunks` below. Floored at 1: a misconfigured
-        // batch size of 0 would make the cursor advance by 0 and spin forever
-        // (the cursor loop replaced the old `step_by`, which panicked on 0) — a
-        // silent hang is worse than a loud error, so treat 0 as 1.
-        let mut current_batch_size = self.batch_size.max(1);
-        // `_ordinal`'s fallback running counter: only advanced by
-        // `extract_or_generate_ordinals` on the arm where THIS partition's
-        // input carries no `_ordinal` column of its own (no `OrdinalSplitExec`
-        // below — see that function's doc and `schema::common_prefix_fields`).
-        let mut next_ordinal: u64 = 0;
-        let model_label = self.source.to_string();
-        let task = self.task;
+        // The size of one forward. A chunk never exceeds `batch_size`; an OOM
+        // halves this, and the shrink persists for the rest of the stream.
+        let mut current_batch_size = spec.batch_size.get();
+        let mut assembler = ChunkAssembler::try_new(input.schema(), spec.batch_size)?;
         let model = &guard.model;
+        let task = spec.task;
 
-        // Process input stream
-        while let Some(input_batch) = input.next().await {
-            // The structural classifier, never a stringification: a typed
-            // refusal raised below this runner (`KeyCheckExec`'s
-            // `InvalidKey`) must reach the caller as that variant.
-            let input_batch = input_batch.map_err(JammiError::from)?;
+        let mut forward = |content: &[ArrayRef]| model.forward(content, task);
 
-            let content = extract_columns(&input_batch, &self.content_columns)?;
-            let keys = extract_column(&input_batch, &self.key_column)?;
-            let passthrough = extract_columns(&input_batch, &self.passthrough)?;
-            let ordinals = extract_or_generate_ordinals(&input_batch, &mut next_ordinal);
-
-            let ctx = OutputContext {
-                output_schema,
-                adapter: adapter.as_ref(),
-                source_id: &self.source_id,
-                model_label: &model_label,
-                observer: self.observer.as_deref(),
-                key_column: &self.key_column,
+        let mut input_ended = false;
+        while !input_ended {
+            let chunks: Vec<RecordBatch> = match input.next().await {
+                // The structural classifier, never a stringification: a
+                // typed refusal raised below this runner (the numbered
+                // input's `InvalidKey`) must reach the caller as that variant.
+                Some(batch) => assembler.push(&batch.map_err(JammiError::from)?)?,
+                None => {
+                    input_ended = true;
+                    assembler.finish()?.into_iter().collect()
+                }
             };
-
-            Self::run_chunks(
-                &content,
-                &keys,
-                &passthrough,
-                &ordinals,
-                &mut current_batch_size,
-                &ctx,
-                tx,
-                self.forward_permits.as_ref(),
-                |chunk_content| model.forward(chunk_content, task),
-            )
-            .await?;
+            let flow = self
+                .run_chunks(&chunks, &mut current_batch_size, &ctx, tx, &mut forward)
+                .await?;
+            if flow.is_break() {
+                break;
+            }
         }
-
         Ok(())
     }
 
-    /// Drive one input batch's rows through `forward` in dynamically-sized
-    /// sub-batches.
+    /// Forward each of `chunks` in turn. `Break` once the receiver is gone.
+    async fn run_chunks<F>(
+        &self,
+        chunks: &[RecordBatch],
+        current_batch_size: &mut usize,
+        ctx: &OutputContext<'_>,
+        tx: &Sender<datafusion::error::Result<RecordBatch>>,
+        forward: &mut F,
+    ) -> Result<ControlFlow<()>>
+    where
+        F: FnMut(&[ArrayRef]) -> Result<BackendOutput>,
+    {
+        for chunk in chunks {
+            let flow = Self::run_chunk(
+                &ChunkColumns::of(chunk, &self.spec)?,
+                current_batch_size,
+                ctx,
+                tx,
+                self.forward_permits.as_ref(),
+                &mut *forward,
+            )
+            .await?;
+            if flow.is_break() {
+                return Ok(flow);
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    /// Drive one chunk's rows through `forward` in dynamically-sized
+    /// sub-batches — the whole chunk in one forward unless an OOM has shrunk
+    /// `current_batch_size` below it.
     ///
     /// `current_batch_size` is read fresh for both the slice length AND the
     /// cursor advance on every iteration, so a shrink from OOM recovery is
-    /// never stale for one side and fresh for the other (the old
-    /// `step_by(current_batch_size)` + mutable-halving split let the two
-    /// diverge and silently dropped rows). On a successful forward the
-    /// cursor advances by exactly the slice that was just sent — no
-    /// concatenation, no batching-of-batches: each successful sub-batch is
-    /// sent as its own `RecordBatch` immediately. On OOM,
-    /// `current_batch_size` halves (floored at 1) and the SAME unsent slice
-    /// is retried, so no row is ever skipped or duplicated. A non-OOM error,
-    /// or a persistent OOM at batch size 1, propagates rather than being
-    /// annotated as a per-row `_status = error` batch (see the module doc
-    /// comment). `forward` is injected so this control flow is unit-testable
-    /// without a real model.
-    #[allow(clippy::too_many_arguments)]
-    async fn run_chunks<F>(
-        content: &[ArrayRef],
-        keys: &ArrayRef,
-        passthrough: &[ArrayRef],
-        ordinals: &ArrayRef,
+    /// never stale for one side and fresh for the other. On a successful
+    /// forward the cursor advances by exactly the slice that was just sent:
+    /// each successful sub-batch is sent as its own `RecordBatch`
+    /// immediately. On OOM, `current_batch_size` halves (floored at 1) and
+    /// the SAME unsent slice is retried, so no row is ever skipped or
+    /// duplicated. A non-OOM error, or a persistent OOM at batch size 1,
+    /// propagates rather than being annotated as a per-row `_status = error`
+    /// batch (see the type's doc). `forward` is injected so this control flow
+    /// is unit-testable without a real model. `Break` once the receiver is
+    /// gone (the query was cancelled).
+    async fn run_chunk<F>(
+        chunk: &ChunkColumns,
         current_batch_size: &mut usize,
         ctx: &OutputContext<'_>,
         tx: &Sender<datafusion::error::Result<RecordBatch>>,
         permits: Option<&Arc<tokio::sync::Semaphore>>,
         mut forward: F,
-    ) -> Result<()>
+    ) -> Result<ControlFlow<()>>
     where
         F: FnMut(&[ArrayRef]) -> Result<BackendOutput>,
     {
-        let row_count = keys.len();
+        let row_count = chunk.len();
         let mut chunk_start = 0;
 
         while chunk_start < row_count {
             let chunk_len = (*current_batch_size).min(row_count - chunk_start);
-            let chunk_content = slice_columns(content, chunk_start, chunk_len);
-            let chunk_keys = keys.slice(chunk_start, chunk_len);
-            let chunk_passthrough = slice_columns(passthrough, chunk_start, chunk_len);
-            let chunk_ordinals = ordinals.slice(chunk_start, chunk_len);
+            let rows = chunk.slice(chunk_start, chunk_len);
 
             let start = Instant::now();
             // Acquire this exec's forward admission BEFORE the model
@@ -355,30 +352,22 @@ impl InferenceRunner {
                 test_hooks::record_forward(ctx.source_id);
                 test_hooks::enter_forward(ctx.source_id);
             }
-            let forward_result = forward(&chunk_content);
+            let forward_result = forward(&rows.content);
             #[cfg(feature = "test-hooks")]
             test_hooks::exit_forward(ctx.source_id);
             drop(_permit);
             match forward_result {
                 Ok(raw_output) => {
                     let latency_ms = start.elapsed().as_secs_f32() * 1000.0;
-                    let output_batch = Self::build_output_batch(
-                        ctx,
-                        &chunk_keys,
-                        &chunk_passthrough,
-                        &raw_output,
-                        chunk_len,
-                        latency_ms,
-                        &chunk_ordinals,
-                    )?;
+                    let output_batch =
+                        Self::build_output_batch(ctx, &rows, &raw_output, latency_ms)?;
 
                     if let Some(obs) = ctx.observer {
                         obs.on_batch(&output_batch, ctx.model_label, start.elapsed());
                     }
 
                     if tx.send(Ok(output_batch)).await.is_err() {
-                        // Receiver dropped (query cancelled).
-                        return Ok(());
+                        return Ok(ControlFlow::Break(()));
                     }
                     chunk_start += chunk_len;
                 }
@@ -405,7 +394,7 @@ impl InferenceRunner {
             }
         }
 
-        Ok(())
+        Ok(ControlFlow::Continue(()))
     }
 
     /// Only a genuine out-of-memory error gets the batch-halving retry — see
@@ -419,18 +408,15 @@ impl InferenceRunner {
     }
 
     /// Build an output RecordBatch from a successful model forward pass.
-    #[allow(clippy::too_many_arguments)]
     fn build_output_batch(
         ctx: &OutputContext<'_>,
-        keys: &ArrayRef,
-        passthrough: &[ArrayRef],
+        rows: &ChunkColumns,
         raw_output: &BackendOutput,
-        row_count: usize,
         latency_ms: f32,
-        ordinals: &ArrayRef,
     ) -> Result<RecordBatch> {
+        let row_count = rows.len();
         let prefix = build_prefix_columns(
-            keys,
+            &rows.keys,
             ctx.key_column,
             ctx.source_id,
             ctx.model_label,
@@ -438,13 +424,12 @@ impl InferenceRunner {
             &raw_output.row_errors,
             latency_ms,
             row_count,
-            ordinals,
+            &rows.ordinals,
         )?;
-        // Defensive only: `KeyCheckExec` below the blocking sort refuses a
-        // null key before any row reaches this runner, so this is unreachable
-        // on every planned path — but a hand-built plan that bypasses it must
-        // still get the typed refusal, never a stringly `RecordBatch::try_new`
-        // "non-nullable column contains nulls".
+        // A keyed input refuses a null key before any row reaches this
+        // runner; an arrival-order input does not check keys, so this is
+        // where its null key becomes the typed refusal rather than a stringly
+        // `RecordBatch::try_new` "non-nullable column contains nulls".
         let null_keys = prefix[0].null_count();
         if null_keys > 0 {
             return Err(JammiError::InvalidKey {
@@ -456,7 +441,7 @@ impl InferenceRunner {
 
         let mut all_columns = prefix;
         all_columns.extend(task_columns);
-        all_columns.extend(passthrough.iter().cloned());
+        all_columns.extend(rows.passthrough.iter().cloned());
 
         RecordBatch::try_new(Arc::clone(ctx.output_schema), all_columns)
             .map_err(|e| JammiError::Inference(format!("Failed to build output batch: {e}")))
@@ -471,6 +456,7 @@ mod tests {
     use super::*;
     use crate::inference::adapter::EmbeddingAdapter;
     use crate::inference::schema::build_output_schema;
+    use crate::model::ModelTask;
 
     /// `is_oom_error` must classify ONLY genuine out-of-memory errors. A CUDA
     /// kernel/loader failure (e.g. `INVALID_PTX`) is not OOM — misrouting it to
@@ -507,6 +493,16 @@ mod tests {
 
     fn test_content(n: usize) -> Vec<ArrayRef> {
         vec![Arc::new(StringArray::from(vec!["x"; n])) as ArrayRef]
+    }
+
+    /// One chunk of `n` rows, numbered from 0.
+    fn test_chunk(n: usize) -> ChunkColumns {
+        ChunkColumns {
+            content: test_content(n),
+            keys: test_keys(n),
+            passthrough: Vec::new(),
+            ordinals: Arc::new((0..n as u64).collect::<arrow::array::UInt64Array>()),
+        }
     }
 
     fn test_output_schema() -> SchemaRef {
@@ -565,19 +561,14 @@ mod tests {
         ordinals
     }
 
-    /// `_ordinal` is a contiguous, gap-free 0-based sequence across EVERY
-    /// sub-batch `run_chunks` sends for one stream — including across an
-    /// OOM-halving retry, which resends the SAME row slice at a smaller
-    /// size: the retried rows must get the ordinals their failed attempt
-    /// never emitted, never a gap and never a value reused. `run_chunks`
-    /// advances `next_ordinal` only on a batch that was actually sent (after
-    /// the OOM-retry check); advancing it before would burn the failed
-    /// attempt's ordinals and leave a gap.
+    /// The chunk's `_ordinal` values reach the output exactly once each and
+    /// in order across EVERY sub-batch `run_chunk` sends — including across
+    /// an OOM-halving retry, which resends the SAME row slice at a smaller
+    /// size: the retried rows carry the ordinals their failed attempt never
+    /// emitted, never a gap and never a value repeated.
     #[tokio::test]
-    async fn run_chunks_ordinal_is_contiguous_across_an_oom_halving_retry() {
+    async fn run_chunk_ordinal_is_contiguous_across_an_oom_halving_retry() {
         let row_count = 300;
-        let keys = test_keys(row_count);
-        let content = test_content(row_count);
         let adapter = EmbeddingAdapter::new(1);
         let output_schema = test_output_schema();
         let ctx = OutputContext {
@@ -589,16 +580,11 @@ mod tests {
             key_column: "id",
         };
         let mut current_batch_size = 100;
-        let batch_ordinals: ArrayRef =
-            Arc::new((0..row_count as u64).collect::<arrow::array::UInt64Array>());
         let oom_threshold = 64;
 
         let (tx, rx) = tokio::sync::mpsc::channel(row_count);
-        InferenceRunner::run_chunks(
-            &content,
-            &keys,
-            &[],
-            &batch_ordinals,
+        let flow = InferenceRunner::run_chunk(
+            &test_chunk(row_count),
             &mut current_batch_size,
             &ctx,
             &tx,
@@ -613,7 +599,8 @@ mod tests {
             },
         )
         .await
-        .expect("run_chunks succeeds once the batch size shrinks under the OOM threshold");
+        .expect("run_chunk succeeds once the batch size shrinks under the OOM threshold");
+        assert!(flow.is_continue(), "the receiver is still listening");
         drop(tx);
 
         let ordinals = drain_ordinals(rx).await;
@@ -632,10 +619,8 @@ mod tests {
     /// halved batch size drifts apart and silently drops rows). Every one of
     /// 300 input rows must appear in the output stream exactly once.
     #[tokio::test]
-    async fn run_chunks_conserves_every_row_across_oom_halving() {
+    async fn run_chunk_conserves_every_row_across_oom_halving() {
         let row_count = 300;
-        let keys = test_keys(row_count);
-        let content = test_content(row_count);
         let adapter = EmbeddingAdapter::new(1);
         let output_schema = test_output_schema();
         let ctx = OutputContext {
@@ -647,16 +632,11 @@ mod tests {
             key_column: "id",
         };
         let mut current_batch_size = 100;
-        let batch_ordinals: ArrayRef =
-            Arc::new((0..row_count as u64).collect::<arrow::array::UInt64Array>());
         let oom_threshold = 64;
 
         let (tx, rx) = tokio::sync::mpsc::channel(row_count);
-        InferenceRunner::run_chunks(
-            &content,
-            &keys,
-            &[],
-            &batch_ordinals,
+        let flow = InferenceRunner::run_chunk(
+            &test_chunk(row_count),
             &mut current_batch_size,
             &ctx,
             &tx,
@@ -671,7 +651,8 @@ mod tests {
             },
         )
         .await
-        .expect("run_chunks succeeds once the batch size shrinks under the OOM threshold");
+        .expect("run_chunk succeeds once the batch size shrinks under the OOM threshold");
+        assert!(flow.is_continue(), "the receiver is still listening");
         drop(tx);
 
         let mut ids = drain_row_ids(rx).await;
@@ -690,10 +671,8 @@ mod tests {
     /// (never reach 0, which would divide the input into an infinite number
     /// of empty chunks).
     #[tokio::test]
-    async fn run_chunks_propagates_persistent_oom_at_minimum_batch_size() {
+    async fn run_chunk_propagates_persistent_oom_at_minimum_batch_size() {
         let row_count = 10;
-        let keys = test_keys(row_count);
-        let content = test_content(row_count);
         let adapter = EmbeddingAdapter::new(1);
         let output_schema = test_output_schema();
         let ctx = OutputContext {
@@ -705,15 +684,10 @@ mod tests {
             key_column: "id",
         };
         let mut current_batch_size = 4;
-        let batch_ordinals: ArrayRef =
-            Arc::new((0..row_count as u64).collect::<arrow::array::UInt64Array>());
 
         let (tx, _rx) = tokio::sync::mpsc::channel(row_count);
-        let result = InferenceRunner::run_chunks(
-            &content,
-            &keys,
-            &[],
-            &batch_ordinals,
+        let result = InferenceRunner::run_chunk(
+            &test_chunk(row_count),
             &mut current_batch_size,
             &ctx,
             &tx,
@@ -736,10 +710,8 @@ mod tests {
     /// propagate immediately, never be misrouted through the OOM-halving
     /// retry, and never emit any output batch.
     #[tokio::test]
-    async fn run_chunks_propagates_non_oom_error_immediately() {
+    async fn run_chunk_propagates_non_oom_error_immediately() {
         let row_count = 10;
-        let keys = test_keys(row_count);
-        let content = test_content(row_count);
         let adapter = EmbeddingAdapter::new(1);
         let output_schema = test_output_schema();
         let ctx = OutputContext {
@@ -751,15 +723,10 @@ mod tests {
             key_column: "id",
         };
         let mut current_batch_size = 4;
-        let batch_ordinals: ArrayRef =
-            Arc::new((0..row_count as u64).collect::<arrow::array::UInt64Array>());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(row_count);
-        let result = InferenceRunner::run_chunks(
-            &content,
-            &keys,
-            &[],
-            &batch_ordinals,
+        let result = InferenceRunner::run_chunk(
+            &test_chunk(row_count),
             &mut current_batch_size,
             &ctx,
             &tx,
@@ -782,7 +749,7 @@ mod tests {
 
     /// `forward()` concurrency across partitions is bounded by the
     /// shared per-`InferenceExec`-instance permit, never by accident of scheduling. Four
-    /// concurrent `run_chunks` callers (simulating `N=4` partitions of one
+    /// concurrent `run_chunk` callers (simulating `N=4` partitions of one
     /// `InferenceExec` sharing one `Arc<Semaphore>`, as
     /// `InferenceExec::execute` wires it) each sleep on a REAL OS thread
     /// while "forwarding", so overlapping calls are actually observable —
@@ -793,7 +760,7 @@ mod tests {
     /// concurrent forwards, exceeding the 2-permit bound the assertion
     /// checks.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn run_chunks_bounds_concurrent_forwards_to_the_shared_permit() {
+    async fn run_chunk_bounds_concurrent_forwards_to_the_shared_permit() {
         let source_id = "rs7-concurrency-test-source";
         #[cfg(feature = "test-hooks")]
         test_hooks::reset_forward_concurrency_for(source_id);
@@ -804,8 +771,6 @@ mod tests {
             let permits = Arc::clone(&permits);
             handles.push(tokio::spawn(async move {
                 let row_count = 2;
-                let keys = test_keys(row_count);
-                let content = test_content(row_count);
                 let adapter = EmbeddingAdapter::new(1);
                 let output_schema = test_output_schema();
                 let ctx = OutputContext {
@@ -816,15 +781,10 @@ mod tests {
                     observer: None,
                     key_column: "id",
                 };
-                let ordinals: ArrayRef =
-                    Arc::new((0..row_count as u64).collect::<arrow::array::UInt64Array>());
                 let mut current_batch_size = row_count;
                 let (tx, mut rx) = tokio::sync::mpsc::channel(row_count);
-                InferenceRunner::run_chunks(
-                    &content,
-                    &keys,
-                    &[],
-                    &ordinals,
+                let flow = InferenceRunner::run_chunk(
+                    &test_chunk(row_count),
                     &mut current_batch_size,
                     &ctx,
                     &tx,
@@ -836,6 +796,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+                assert!(flow.is_continue(), "the receiver is still listening");
                 drop(tx);
                 while rx.recv().await.is_some() {}
             }));
@@ -866,10 +827,10 @@ mod tests {
     /// reported measurement, never a CI assertion (a loaded/undersized CI
     /// runner would make a fixed speedup threshold flaky) — run explicitly
     /// with `cargo test --lib -p jammi-ai -- --ignored --nocapture
-    /// run_chunks_reports_cpu_speedup_at_n4`.
+    /// run_chunk_reports_cpu_speedup_at_n4`.
     #[ignore = "manual measurement, not a CI assertion — see the doc comment"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn run_chunks_reports_cpu_speedup_at_n4() {
+    async fn run_chunk_reports_cpu_speedup_at_n4() {
         fn spin(ms: u64) -> BackendOutput {
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
             let mut x: u64 = 0;
@@ -882,8 +843,6 @@ mod tests {
 
         async fn run_one_partition(permits: Option<Arc<tokio::sync::Semaphore>>, work_ms: u64) {
             let row_count = 1;
-            let keys = test_keys(row_count);
-            let content = test_content(row_count);
             let adapter = EmbeddingAdapter::new(1);
             let output_schema = test_output_schema();
             let ctx = OutputContext {
@@ -894,15 +853,10 @@ mod tests {
                 observer: None,
                 key_column: "id",
             };
-            let ordinals: ArrayRef =
-                Arc::new((0..row_count as u64).collect::<arrow::array::UInt64Array>());
             let mut current_batch_size = row_count;
             let (tx, mut rx) = tokio::sync::mpsc::channel(row_count);
-            InferenceRunner::run_chunks(
-                &content,
-                &keys,
-                &[],
-                &ordinals,
+            let flow = InferenceRunner::run_chunk(
+                &test_chunk(row_count),
                 &mut current_batch_size,
                 &ctx,
                 &tx,
@@ -911,6 +865,7 @@ mod tests {
             )
             .await
             .unwrap();
+            assert!(flow.is_continue(), "the receiver is still listening");
             drop(tx);
             while rx.recv().await.is_some() {}
         }

@@ -27,9 +27,7 @@ use ballista_scheduler::planner::DefaultDistributedPlanner;
 use ballista_scheduler::state::execution_graph::{ExecutionGraphBox, StaticExecutionGraph};
 use ballista_scheduler::state::task_manager::JobInfoCache;
 
-use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec};
-use jammi_ai::operator::inference_exec::InferenceExecBuilder;
 use jammi_ballista::client::submit_physical_plan;
 use jammi_ballista::cluster::{executor_is_live, executor_liveness_window, CatalogClusterState};
 use jammi_ballista::placement::DevicePlacement;
@@ -53,10 +51,10 @@ async fn catalog(kind: BackendKind) -> Arc<Catalog> {
 }
 
 /// A throwaway `InferenceSession` (always SQLite — unrelated to the
-/// per-backend catalog under test) whose ONLY purpose is to hand
-/// [`InferenceExecBuilder`] a real `model_cache()`; the plan built against
-/// it is never executed, only inspected/planned, so which catalog backs it
-/// is immaterial.
+/// per-backend catalog under test) whose ONLY purpose is to hand an
+/// inference plan a real model cache; the plan built against it is never
+/// executed, only inspected/planned, so which catalog backs it is
+/// immaterial.
 async fn inference_session() -> Arc<jammi_ai::session::InferenceSession> {
     let dir = tempfile::tempdir().unwrap();
     let cfg = jammi_test_utils::test_config(dir.path());
@@ -409,20 +407,12 @@ async fn cuda_stamped_stage_never_binds_to_a_device_less_executor(kind: BackendK
             .unwrap();
 
         let session = inference_session().await;
-        let node = InferenceExecBuilder::new(
+        let plan = crate::inference_plan(
+            &session,
             scan(),
-            ModelSource::hf("m"),
-            ModelTask::TextEmbedding,
-            vec!["text".to_string()],
-            "text".to_string(),
-            "src-1".to_string(),
-            Arc::clone(session.model_cache()),
             jammi_db::store::manifest::ComputeDeviceKind::Cuda,
-        )
-        .embedding_dim(Some(2))
-        .build()
-        .unwrap();
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(node);
+            1,
+        );
 
         let job_id: JobId = "job-gpu".to_string().into();
         let cache = job_info_cache(&job_id, plan);
@@ -517,20 +507,12 @@ async fn cuda_stamped_stage_never_binds_to_a_cpu_only_executor(kind: BackendKind
             .unwrap();
 
         let session = inference_session().await;
-        let node = InferenceExecBuilder::new(
+        let plan = crate::inference_plan(
+            &session,
             scan(),
-            ModelSource::hf("m"),
-            ModelTask::TextEmbedding,
-            vec!["text".to_string()],
-            "text".to_string(),
-            "src-1".to_string(),
-            Arc::clone(session.model_cache()),
             jammi_db::store::manifest::ComputeDeviceKind::Cuda,
-        )
-        .embedding_dim(Some(2))
-        .build()
-        .unwrap();
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(node);
+            1,
+        );
 
         let job_id: JobId = "job-cuda".to_string().into();
         let cache = job_info_cache(&job_id, plan);
@@ -602,20 +584,12 @@ async fn cpu_stamped_stage_binds_to_a_cpu_only_executor(kind: BackendKind) {
             .unwrap();
 
         let session = inference_session().await;
-        let node = InferenceExecBuilder::new(
+        let plan = crate::inference_plan(
+            &session,
             scan(),
-            ModelSource::hf("m"),
-            ModelTask::TextEmbedding,
-            vec!["text".to_string()],
-            "text".to_string(),
-            "src-1".to_string(),
-            Arc::clone(session.model_cache()),
             jammi_db::store::manifest::ComputeDeviceKind::Cpu,
-        )
-        .embedding_dim(Some(2))
-        .build()
-        .unwrap();
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(node);
+            1,
+        );
 
         let job_id: JobId = "job-cpu".to_string().into();
         let cache = job_info_cache(&job_id, plan);
@@ -979,20 +953,11 @@ async fn a_stale_cuda_row_never_admits_a_cuda_plan_at_the_submit_edge() {
         catalog.upsert_compute_executor(&stale).await.unwrap();
 
         let cuda_plan = || -> Arc<dyn ExecutionPlan> {
-            Arc::new(
-                InferenceExecBuilder::new(
-                    scan(),
-                    ModelSource::hf("m"),
-                    ModelTask::TextEmbedding,
-                    vec!["text".to_string()],
-                    "text".to_string(),
-                    "src-1".to_string(),
-                    Arc::clone(session.model_cache()),
-                    jammi_db::store::manifest::ComputeDeviceKind::Cuda,
-                )
-                .embedding_dim(Some(2))
-                .build()
-                .unwrap(),
+            crate::inference_plan(
+                &session,
+                scan(),
+                jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+                1,
             )
         };
         let unreachable = "http://127.0.0.1:9";

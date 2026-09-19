@@ -4099,10 +4099,8 @@ fn ballista_executor_advertise_host_is_required_iff_the_bind_host_is_unspecified
     assert!(BallistaConfig::validate(&cfg).is_ok());
 }
 
-/// `[inference] partitions = 0` is refused at load, naming the key —
-/// `OrdinalSplitExec`/`wrap_with_split_and_merge` floor it to `1`
-/// defensively, but that silent flooring must never be the FIRST thing a
-/// `0` a config author wrote actually does.
+/// `[inference] partitions = 0` is refused at load, naming the key: a `0` a
+/// config author wrote is never silently treated as `1`.
 #[test]
 fn inference_partitions_zero_is_rejected_at_load() {
     let dir = tempfile::tempdir().unwrap();
@@ -4132,6 +4130,18 @@ fn inference_partitions_above_the_maximum_is_rejected_at_load() {
     let msg = err.to_string();
     assert!(msg.contains("partitions"));
     assert!(msg.contains(&InferenceConfig::MAX_PARTITIONS.to_string()));
+}
+
+/// `[inference] batch_size = 0` is refused at load, naming the key: it is the
+/// divisor of the forward-chunk id.
+#[test]
+fn inference_batch_size_zero_is_rejected_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jammi.toml");
+    std::fs::write(&path, "[inference]\nbatch_size = 0\n").unwrap();
+    let err = JammiConfig::load_from(Some(&path), std::iter::empty())
+        .expect_err("batch_size = 0 must be refused, never silently treated as 1");
+    assert!(err.to_string().contains("batch_size"));
 }
 
 /// A `partitions` value inside `[1, MAX_PARTITIONS]` — including both

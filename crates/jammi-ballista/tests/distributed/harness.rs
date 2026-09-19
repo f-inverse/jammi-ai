@@ -22,7 +22,8 @@ use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
 use jammi_db::config::{
-    CatalogConfig, DistributedConfig, JammiConfig, LeaseConfig, StorageConfig, WorkerConfig,
+    CatalogConfig, DistributedConfig, InferenceConfig, JammiConfig, LeaseConfig, StorageConfig,
+    WorkerConfig,
 };
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
@@ -600,8 +601,19 @@ pub async fn harness_session(
     backends: &DistributedBackends,
     result_root: &str,
 ) -> (Arc<InferenceSession>, TempDir) {
+    harness_session_with(backends, result_root, InferenceConfig::default()).await
+}
+
+/// [`harness_session`] planning its inference with `inference` — the fan-out
+/// and chunk size a submitted plan carries to the executors.
+pub async fn harness_session_with(
+    backends: &DistributedBackends,
+    result_root: &str,
+    inference: InferenceConfig,
+) -> (Arc<InferenceSession>, TempDir) {
     let dir = TempDir::new().expect("harness artifact_dir");
     let config = JammiConfig {
+        inference,
         artifact_dir: dir.path().to_path_buf(),
         gpu: jammi_db::config::GpuConfig {
             device: -1,

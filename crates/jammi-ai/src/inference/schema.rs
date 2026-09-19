@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Float32Array, StringArray, UInt64Array};
+use arrow::array::{ArrayRef, Float32Array, StringArray};
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use jammi_db::error::{JammiError, Result};
@@ -16,19 +16,10 @@ pub const ORDINAL_COLUMN: &str = "_ordinal";
 
 /// Common prefix columns on every inference output.
 ///
-/// `_ordinal` is a monotonic row-emission counter (0-based). When
-/// `InferenceExec`'s input is an
-/// [`OrdinalSplitExec`](crate::operator::ordinal_split_exec::OrdinalSplitExec)
-/// (every production plan with `InferenceConfig::partitions > 1`), that
-/// split assigns ONE global sequence, before fan-out, over
-/// its whole single-partition input, and `InferenceExec` reads it back as a
-/// named INPUT column (never a `passthrough`) at each of its `N` partitions —
-/// see [`extract_or_generate_ordinals`]. When there is no split below it
-/// (`partitions == 1`, or a caller that builds `InferenceExec` directly, e.g.
-/// this crate's own unit tests), `InferenceExec`'s single partition
-/// self-generates the sequence. Either way there is exactly one sequence per partition's share of
-/// the rows it is responsible for, and (per-partition) it is gap-free and
-/// contiguous within that partition's own subsequence.
+/// `_ordinal` is the row's position in the input order, 0-based and
+/// contiguous over the whole input. `InferenceExec` reads it as a required
+/// input column and carries it through unchanged, so it is one global
+/// sequence at every partition count.
 ///
 /// It exists so a caller can read the result table back in the SAME order
 /// the model actually produced it (`ORDER BY _row_id, _ordinal`) even when
@@ -107,9 +98,9 @@ pub fn build_output_schema(
 /// call ordering, not a safety dependency.
 ///
 /// `ordinals` is this batch's `_ordinal` column (one `UInt64` entry per row,
-/// non-null) — see [`common_prefix_fields`] and [`extract_or_generate_ordinals`]
-/// for where it comes from; this function only places it and checks its
-/// length agrees with every other prefix column.
+/// non-null), read off the input — see [`common_prefix_fields`]; this
+/// function only places it and checks its length agrees with every other
+/// prefix column.
 #[allow(clippy::too_many_arguments)]
 pub fn build_prefix_columns(
     keys: &ArrayRef,
@@ -169,7 +160,7 @@ pub fn build_prefix_columns(
     // misattribute the failure to whatever column happened to trip over the wrong type first (see
     // the unit oracle `build_prefix_columns_refuses_a_key_that_cannot_cast_to_utf8`
     // below, and the end-to-end oracle
-    // `crates/jammi-ai/tests/it/rangesplit.rs`'s
+    // `crates/jammi-ai/tests/it/partitioned_inference.rs`'s
     // `struct_key_through_annotate_is_a_typed_refusal_naming_the_key`).
     let row_ids: ArrayRef = if keys.data_type() == &DataType::Utf8 {
         Arc::clone(keys)
@@ -193,35 +184,10 @@ pub fn build_prefix_columns(
     ])
 }
 
-/// This batch's `_ordinal` column: the input's own `_ordinal` column when
-/// present (an [`OrdinalSplitExec`](crate::operator::ordinal_split_exec::OrdinalSplitExec)
-/// child assigned it before fan-out), or a freshly self-generated
-/// contiguous run starting at `*next_ordinal` otherwise (no split below —
-/// `partitions == 1`, or a caller that built `InferenceExec` directly).
-/// `*next_ordinal` advances by `batch.num_rows()` only on the self-generate
-/// arm, so the fallback sequence stays contiguous across every input batch of
-/// one partition's stream; the split-supplied arm never touches it (the
-/// split already assigned every value, spanning batches on ITS OWN
-/// single-writer counter, before this partition ever saw the row).
-pub fn extract_or_generate_ordinals(
-    batch: &arrow::record_batch::RecordBatch,
-    next_ordinal: &mut u64,
-) -> ArrayRef {
-    match batch.column_by_name(ORDINAL_COLUMN) {
-        Some(col) => Arc::clone(col),
-        None => {
-            let row_count = batch.num_rows() as u64;
-            let start = *next_ordinal;
-            *next_ordinal += row_count;
-            Arc::new((start..start + row_count).collect::<UInt64Array>()) as ArrayRef
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Array;
+    use arrow::array::{Array, UInt64Array};
 
     /// `row_status` shorter than `row_count` (with `row_errors` matching
     /// `row_count`, as `BackendOutput`'s two independently-sized fields can
@@ -332,8 +298,7 @@ mod tests {
     }
 
     /// `build_prefix_columns` places the CALLER'S `ordinals` array verbatim
-    /// at `_ordinal` — it never recomputes it. See
-    /// [`extract_or_generate_ordinals`] for where that array comes from.
+    /// at `_ordinal` — it never recomputes it.
     #[test]
     fn build_prefix_columns_places_the_given_ordinals_verbatim() {
         let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
@@ -429,55 +394,5 @@ mod tests {
         .expect_err("ordinals shorter than row_count must be a typed refusal");
         let msg = err.to_string();
         assert!(msg.contains("ordinals"), "must name the field: {msg}");
-    }
-
-    /// [`extract_or_generate_ordinals`] reads the `_ordinal` column when the
-    /// input carries one (the `OrdinalSplitExec` shape) rather than
-    /// generating a fresh sequence — it must not touch `next_ordinal` on
-    /// this arm.
-    #[test]
-    fn extract_or_generate_ordinals_prefers_the_input_column() {
-        use arrow::record_batch::RecordBatch;
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new(ORDINAL_COLUMN, DataType::UInt64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
-                Arc::new(UInt64Array::from(vec![100u64, 101])) as ArrayRef,
-            ],
-        )
-        .unwrap();
-        let mut next_ordinal = 5u64;
-        let ords = extract_or_generate_ordinals(&batch, &mut next_ordinal);
-        let ords = ords.as_any().downcast_ref::<UInt64Array>().unwrap();
-        assert_eq!(ords.values(), &[100u64, 101]);
-        assert_eq!(
-            next_ordinal, 5,
-            "the split-supplied arm must not advance the fallback counter"
-        );
-    }
-
-    /// The fallback arm (no `_ordinal` input column) self-generates a
-    /// contiguous run and DOES advance `next_ordinal` — the behaviour for a
-    /// caller with no `OrdinalSplitExec` below it.
-    #[test]
-    fn extract_or_generate_ordinals_falls_back_and_advances() {
-        use arrow::record_batch::RecordBatch;
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef],
-        )
-        .unwrap();
-        let mut next_ordinal = 5u64;
-        let ords = extract_or_generate_ordinals(&batch, &mut next_ordinal);
-        let ords = ords.as_any().downcast_ref::<UInt64Array>().unwrap();
-        assert_eq!(ords.values(), &[5u64, 6, 7]);
-        assert_eq!(next_ordinal, 8, "the fallback arm advances by row_count");
     }
 }

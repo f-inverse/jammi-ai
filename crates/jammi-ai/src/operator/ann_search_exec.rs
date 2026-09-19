@@ -56,12 +56,10 @@ impl AnnSearchExec {
         session_ctx: datafusion::prelude::SessionContext,
     ) -> Result<Self> {
         let schema = Self::output_schema();
-        // `UnknownPartitioning(1)`, unconditionally: this node has no input plan at all (it drives
-        // the ANN sidecar directly, `result_store`/`session_ctx` fields, not a child
-        // `ExecutionPlan`) and never routes through `InferenceExec` — the
-        // N-way `OrdinalSplitExec` fan-out is strictly an `InferenceExec`-
-        // INPUT operator (`operator::inference_exec::wrap_with_split_and_
-        // merge`), so it has nothing to attach to here.
+        // `UnknownPartitioning(1)`, unconditionally: this node has no input
+        // plan at all (it drives the ANN sidecar directly through
+        // `result_store`/`session_ctx`, not a child `ExecutionPlan`), so there
+        // is nothing to partition.
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(1),

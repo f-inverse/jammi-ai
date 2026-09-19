@@ -13,7 +13,7 @@
 //! 2. KIND MATCH: a stage
 //!    whose plan carries a required device kind — a `GangExec` (its
 //!    descriptor's own stamped `device_kind`, CPU included) or an
-//!    `InferenceExec` (its `device_kind()`) —
+//!    `InferenceExec` (its `spec().device_kind`) —
 //!    [`crate::engine::required_device_kind`], the ONE predicate this policy
 //!    and `client::submit_physical_plan`'s pre-submission refusal both use
 //!    — binds only to an executor whose OWN registration lists THAT EXACT

@@ -39,6 +39,7 @@ use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec};
+use jammi_ai::operator::inference_exec::InferenceExec;
 use jammi_ai::pipeline::embedding::build_embedding_plan;
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::client::submit_physical_plan;
@@ -48,24 +49,9 @@ use harness::{BallistaRole, Fleet, JobSize, ProcSpec, WorkerRole};
 use jammi_test_utils::DistributedBackends;
 
 /// The deepest (leaf) plan node's own partition count — the scan stage's,
-/// regardless of how many `CoalescePartitionsExec`/operator nodes wrap it
-/// (`InferenceExec(SortExec(KeyCheckExec(CoalescePartitionsExec(scan))))`).
-/// At the default `InferenceConfig::partitions == 1` (this lane's own
-/// session default, never configured otherwise), `wrap_with_split_and_merge`
-/// (`jammi_ai::operator::inference_exec`) inserts no `OrdinalSplitExec`/
-/// `SortPreservingMergeExec` and coalesces `InferenceExec`'s input to one
-/// partition ONLY IF it was not already one — for `build_embedding_plan`
-/// specifically, its input already went through `operator::ordered_input`
-/// (coalesce + sort), so that coalesce is a no-op and the leaf keeps the
-/// scan's partition count.
-///
-/// `OrdinalSplitExec` (`partitions > 1`, which this lane never configures)
-/// has NO wire form at all — not distributable in v1. See `jammi_ballista::
-/// codec`'s module doc for why (a Ballista `SortPreservingMergeExec` is a
-/// stage boundary, so the N-partition `InferenceExec(OrdinalSplitExec(..))`
-/// that split feeds would become its own stage of N tasks each executing
-/// ONE partition, in general in a separate process — this node's
-/// in-process shared-mutex mechanism has no meaning across that split).
+/// whatever wraps it (`jammi_ai::operator::inference_exec::plan_inference`'s
+/// shape: the coalesce, the numbered input, the exchange, `InferenceExec`,
+/// the merge).
 fn leaf_partition_count(plan: &Arc<dyn ExecutionPlan>) -> usize {
     let children = plan.children();
     match children.first() {
@@ -87,27 +73,19 @@ fn ipc_bytes(batch: &RecordBatch) -> Vec<u8> {
     buf
 }
 
-/// Sort `batches` by `key_column` (ascending), concatenate into one batch —
-/// the sink's own deterministic order once collected out of order across
-/// two executors' partitions — and drop `_latency_ms` (wall-clock timing,
-/// legitimately different between the in-process and the through-Ballista
-/// run — the same exclusion `crates/jammi-ai/tests/it/content_hash.rs`'s
-/// own thread-count-invariance oracle names: "excluding the wall-clock
-/// `_latency_ms`").
-fn sort_and_concat(batches: &[RecordBatch], key_column: &str) -> RecordBatch {
+/// `batches` concatenated IN THE ORDER THEY ARRIVED, without `_latency_ms`
+/// (wall-clock timing, legitimately different between two runs). Never
+/// re-sorted: the plan's merge on `_ordinal` makes the row order part of what
+/// a placed run must reproduce.
+fn concat_in_arrival_order(batches: &[RecordBatch]) -> RecordBatch {
     let non_empty: Vec<RecordBatch> = batches
         .iter()
         .filter(|b| b.num_rows() > 0)
         .cloned()
         .collect();
-    assert!(!non_empty.is_empty(), "no non-empty batches to sort/concat");
-    let schema = non_empty[0].schema();
-    let combined = arrow::compute::concat_batches(&schema, &non_empty).unwrap();
-    let sort_indices =
-        arrow::compute::sort_to_indices(combined.column_by_name(key_column).unwrap(), None, None)
-            .unwrap();
-    let sorted = arrow::compute::take_record_batch(&combined, &sort_indices).unwrap();
-    drop_column(&sorted, "_latency_ms")
+    assert!(!non_empty.is_empty(), "no non-empty batches to concat");
+    let combined = arrow::compute::concat_batches(&non_empty[0].schema(), &non_empty).unwrap();
+    drop_column(&combined, "_latency_ms")
 }
 
 /// `batch` with `name` projected out, if present (a no-op otherwise) —
@@ -236,10 +214,47 @@ async fn await_fleet_registered(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn embedding_job_across_two_executors_matches_in_process() {
-    const TEST: &str = "embedding_job_across_two_executors_matches_in_process";
+    embedding_job_matches_in_process("embedding_job_across_two_executors_matches_in_process", 1)
+        .await;
+}
+
+/// The same parity at a fan-out of four: the inference stage runs as four
+/// tasks across the executors, each forwarding whole chunks, and the merge
+/// stage restores the one row sequence — so the placed bytes equal the
+/// in-process bytes in order, with nothing re-sorted on either side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn embedding_job_fanned_out_four_ways_matches_in_process() {
+    embedding_job_matches_in_process("embedding_job_fanned_out_four_ways_matches_in_process", 4)
+        .await;
+}
+
+/// The plan's `InferenceExec` partition count.
+fn inference_partition_count(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    match plan.downcast_ref::<InferenceExec>() {
+        Some(exec) => exec.properties().output_partitioning().partition_count(),
+        None => plan
+            .children()
+            .into_iter()
+            .map(inference_partition_count)
+            .max()
+            .unwrap_or(0),
+    }
+}
+
+/// Build the embedding plan at a fan-out of `partitions`, collect it
+/// in-process and through the fleet, and hold the two to the same bytes in
+/// the same order.
+async fn embedding_job_matches_in_process(test: &str, partitions: usize) {
     let backends = DistributedBackends::from_env();
-    let result_root = backends.unique_result_root(TEST);
-    let (session, dir) = harness::harness_session(&backends, &result_root).await;
+    let result_root = backends.unique_result_root(test);
+    // One row per forward chunk, so the source's eight rows are eight chunks
+    // for the exchange to spread over the fan-out.
+    let inference = jammi_db::config::InferenceConfig {
+        batch_size: 1,
+        partitions,
+        ..Default::default()
+    };
+    let (session, dir) = harness::harness_session_with(&backends, &result_root, inference).await;
 
     // Force per-file partition splitting: DataFusion's default file-group
     // builder coalesces files below `repartition_file_min_size` (10 MiB)
@@ -287,13 +302,18 @@ async fn embedding_job_across_two_executors_matches_in_process() {
         "the two-file source's scan stage must have >= 2 partitions for this test to be \
          non-vacuous, got {scan_partitions}"
     );
+    assert_eq!(
+        inference_partition_count(&plan),
+        partitions,
+        "the inference stage must run as {partitions} tasks"
+    );
 
     // In-process, on the harness session — the parity baseline.
     let task_ctx = session.context().task_ctx();
     let in_process = datafusion::physical_plan::collect(plan.clone(), task_ctx)
         .await
         .expect("in-process collect");
-    let in_process = sort_and_concat(&in_process, "_row_id");
+    let in_process = concat_in_arrival_order(&in_process);
 
     // Across the fleet, through the scheduler.
     let (specs, scheduler_port) = standard_fleet_specs();
@@ -333,13 +353,13 @@ async fn embedding_job_across_two_executors_matches_in_process() {
         fleet.dump_diagnostics(&format!("collecting the placed stream failed: {e}"));
         panic!("collecting the placed stream failed: {e}");
     });
-    let placed = sort_and_concat(&placed, "_row_id");
+    let placed = concat_in_arrival_order(&placed);
 
     assert_eq!(
         ipc_bytes(&in_process),
         ipc_bytes(&placed),
-        "the plan collected through Ballista must be Arrow-IPC-byte-identical to the same \
-         plan collected in-process"
+        "the plan collected through Ballista must be Arrow-IPC-byte-identical, row order \
+         included, to the same plan collected in-process"
     );
 
     // Both non-submitter executors actually ran a task of this job — read

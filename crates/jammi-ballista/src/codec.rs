@@ -32,28 +32,14 @@
 //! model cache, result store, and DataFusion context are the decoding
 //! session's, never serialized.
 //!
-//! `jammi_ai::operator::ordinal_split_exec::OrdinalSplitExec` has NO wire
-//! form here — no `NodeTag`, no `plan.proto`
-//! message, no encode/decode arm — the same v1 cut as `MaskExec` below.
-//! WHY: in Ballista 54.1, `SortPreservingMergeExec` is a STAGE BOUNDARY
-//! (`ballista-scheduler-54.1.0/src/planner.rs:219-232` inserts a shuffle
-//! write below it and starts a new stage above), so the `N`-partition
-//! `InferenceExec(OrdinalSplitExec(..))` this split would sit under
-//! becomes its own stage of `N` TASKS — each task executing exactly ONE
-//! partition, in general on a DIFFERENT executor process
-//! (`ballista-scheduler-54.1.0/src/state/execution_stage.rs:1043-1053,530`;
-//! `ballista-executor-54.1.0/src/execution_engine.rs:359-369`). This
-//! node's mechanism is a single IN-PROCESS `tokio::sync::Mutex`-guarded
-//! pull shared across its `N` partitions (`OrdinalSplitExec`'s own module
-//! doc) — it has no meaning, and no way to share its state, across a
-//! process boundary, so putting it on the wire at all would silently
-//! produce `N` independent, uncoordinated splits (each executor's task
-//! would open its OWN copy of `input`, reassign ITS OWN ordinal sequence
-//! from 0, and see none of the other tasks' rows) rather than one
-//! N-way fan-out. `InferenceConfig::partitions` defaults to `1`, which
-//! never inserts this node at all, so this cut affects nothing this
-//! codec's other callers already exercise.
+//! A partitioned inference plan (`jammi_ai::operator::inference_exec::
+//! plan_inference`) crosses whole: `InferenceExec` and `NumberedInputExec`
+//! are this codec's, and the exchange, merge and coalesce between them are
+//! stock operators `datafusion-proto` already carries. Ballista cuts a stage
+//! at each of those three, so the numbered input runs as one task, the
+//! `N`-partition `InferenceExec` as `N` tasks, and the merge as one.
 
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Weak};
 
 use datafusion::error::DataFusionError;
@@ -70,8 +56,9 @@ use jammi_ai::inference::adapter::DistributionForm;
 use jammi_ai::model::{BackendType, ModelSource, ModelTask};
 use jammi_ai::operator::ann_search_exec::AnnSearchExec;
 use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec};
-use jammi_ai::operator::inference_exec::{InferenceExec, InferenceExecBuilder};
+use jammi_ai::operator::inference_exec::{InferenceExec, InferenceSpec};
 use jammi_ai::operator::key_check_exec::KeyCheckExec;
+use jammi_ai::operator::numbered_input_exec::{NumberedInputExec, RowOrder};
 use jammi_ai::pipeline::asof::exec::AsofJoinExec;
 use jammi_ai::pipeline::asof::spec::AsofJoinSpec;
 use jammi_ai::session::InferenceSession;
@@ -105,6 +92,7 @@ pub enum NodeTag {
     AsofJoin = 2,
     KeyCheck = 3,
     Gang = 4,
+    NumberedInput = 5,
 }
 
 /// The codec `jammi-ballista`'s scheduler and executor roles both install.
@@ -180,6 +168,7 @@ impl PhysicalExtensionCodec for JammiCodec {
             t if t == NodeTag::AsofJoin as u8 => decode_asof(body, inputs),
             t if t == NodeTag::KeyCheck as u8 => decode_key_check(body, inputs),
             t if t == NodeTag::Gang as u8 => decode_gang(body),
+            t if t == NodeTag::NumberedInput as u8 => decode_numbered_input(body, inputs),
             other => Err(Error::Decode(format!("unknown jammi node tag {other}")).into_df_error()),
         }
     }
@@ -200,12 +189,14 @@ impl PhysicalExtensionCodec for JammiCodec {
         if let Some(exec) = node.downcast_ref::<GangExec>() {
             return encode_gang(exec, buf);
         }
+        if let Some(exec) = node.downcast_ref::<NumberedInputExec>() {
+            return encode_numbered_input(exec, buf);
+        }
         // Not one of ours — delegate to Ballista's own codec (shuffle
         // reader/writer, unresolved shuffle, ...). A node NEITHER codec
-        // knows (e.g. `MaskExec`, or `OrdinalSplitExec` — the module doc's
-        // stage-boundary reason — both named v1 cuts) surfaces as the
-        // delegate's own typed "Unsupported plan node" error naming it —
-        // this codec adds no catch-all of its own.
+        // knows (e.g. `MaskExec`, a named v1 cut) surfaces as the delegate's
+        // own typed "Unsupported plan node" error naming it — this codec
+        // adds no catch-all of its own.
         self.inner.try_encode(node, buf)
     }
 
@@ -263,36 +254,52 @@ fn device_kind_from_str(s: &str) -> DfResult<ComputeDeviceKind> {
 }
 
 fn encode_inference(exec: &InferenceExec, buf: &mut Vec<u8>) -> DfResult<()> {
-    let source = match exec.source() {
+    let spec = exec.spec();
+    let source = match &spec.source {
         ModelSource::HuggingFace(id) => pb::model_source::Source::HuggingFace(id.clone()),
         ModelSource::Local(path) => {
             pb::model_source::Source::Local(path.to_string_lossy().into_owned())
         }
     };
-    let backend_json = exec.backend().map(|b| to_json_string(&b)).transpose()?;
-    let regression_form_json = exec.regression_form().map(to_json_string).transpose()?;
-    // The wire carries exactly the constructed value — the codec never
-    // invents or rewrites a device kind.
-    let device_kind = exec.device_kind();
     let msg = pb::InferenceExecNode {
         source: Some(pb::ModelSource {
             source: Some(source),
         }),
-        task: exec.task().as_db_str().to_string(),
-        content_columns: exec.content_columns().to_vec(),
-        key_column: exec.key_column().to_string(),
-        source_id: exec.source_id().to_string(),
-        backend_json,
-        batch_size: exec.batch_size() as u64,
-        embedding_dim: exec.embedding_dim().map(|d| d as u64),
-        regression_form_json,
-        passthrough: exec.passthrough().to_vec(),
-        device_kind: device_kind_str(device_kind).to_string(),
+        task: spec.task.as_db_str().to_string(),
+        content_columns: spec.content_columns.clone(),
+        key_column: spec.key_column.clone(),
+        source_id: spec.source_id.clone(),
+        backend_json: spec.backend.as_ref().map(to_json_string).transpose()?,
+        batch_size: spec.batch_size.get() as u64,
+        embedding_dim: spec.embedding_dim.map(|d| d as u64),
+        regression_form_json: spec
+            .regression_form
+            .as_ref()
+            .map(to_json_string)
+            .transpose()?,
+        passthrough: spec.passthrough.clone(),
+        // The wire carries exactly the constructed value — the codec never
+        // invents or rewrites a device kind.
+        device_kind: device_kind_str(spec.device_kind).to_string(),
+        partitions: spec.partitions.get() as u64,
     };
     buf.extend_from_slice(&MAGIC);
     buf.push(NodeTag::Inference as u8);
     msg.encode(buf)
         .map_err(|e| Error::Decode(e.to_string()).into_df_error())
+}
+
+/// A wire count that must be at least one.
+fn non_zero(field: &str, value: u64) -> DfResult<NonZeroUsize> {
+    usize::try_from(value)
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .ok_or_else(|| {
+            Error::Decode(format!(
+                "InferenceExecNode: {field} = {value} is not a count >= 1"
+            ))
+            .into_df_error()
+        })
 }
 
 fn decode_inference(
@@ -313,36 +320,67 @@ fn decode_inference(
             return Err(Error::Decode("InferenceExecNode: missing source".into()).into_df_error())
         }
     };
-    let task =
-        ModelTask::try_from_db_str(&msg.task).map_err(|e| Error::Catalog(e).into_df_error())?;
-    let backend = msg
-        .backend_json
-        .as_deref()
-        .map(from_json_str::<BackendType>)
-        .transpose()?;
-    let regression_form = msg
-        .regression_form_json
-        .as_deref()
-        .map(from_json_str::<DistributionForm>)
-        .transpose()?;
-    let node = InferenceExecBuilder::new(
-        input,
+    let spec = InferenceSpec {
         source,
-        task,
-        msg.content_columns,
-        msg.key_column,
-        msg.source_id,
-        Arc::clone(session.model_cache()),
-        device_kind_from_str(&msg.device_kind)?,
-    )
-    .batch_size(msg.batch_size as usize)
-    .backend(backend)
-    .embedding_dim(msg.embedding_dim.map(|d| d as usize))
-    .regression_form(regression_form)
-    .passthrough(msg.passthrough)
-    .build()
-    .map_err(|e| Error::Catalog(e).into_df_error())?;
-    Ok(Arc::new(node))
+        task: ModelTask::try_from_db_str(&msg.task)
+            .map_err(|e| Error::Catalog(e).into_df_error())?,
+        content_columns: msg.content_columns,
+        key_column: msg.key_column,
+        source_id: msg.source_id,
+        backend: msg
+            .backend_json
+            .as_deref()
+            .map(from_json_str::<BackendType>)
+            .transpose()?,
+        batch_size: non_zero("batch_size", msg.batch_size)?,
+        embedding_dim: msg.embedding_dim.map(|d| d as usize),
+        regression_form: msg
+            .regression_form_json
+            .as_deref()
+            .map(from_json_str::<DistributionForm>)
+            .transpose()?,
+        passthrough: msg.passthrough,
+        device_kind: device_kind_from_str(&msg.device_kind)?,
+        partitions: non_zero("partitions", msg.partitions)?,
+    };
+    // The same constructor `with_new_children` uses, bound to the DECODING
+    // session's model cache and observer.
+    Ok(Arc::new(InferenceExec::bind(
+        input,
+        spec,
+        session.inference_runtime(),
+    )?))
+}
+
+fn encode_numbered_input(exec: &NumberedInputExec, buf: &mut Vec<u8>) -> DfResult<()> {
+    let msg = pb::NumberedInputExecNode {
+        key_column: match exec.order() {
+            RowOrder::Keyed { key_column } => Some(key_column.clone()),
+            RowOrder::Arrival => None,
+        },
+    };
+    buf.extend_from_slice(&MAGIC);
+    buf.push(NodeTag::NumberedInput as u8);
+    msg.encode(buf)
+        .map_err(|e| Error::Decode(e.to_string()).into_df_error())
+}
+
+fn decode_numbered_input(
+    body: &[u8],
+    inputs: &[Arc<dyn ExecutionPlan>],
+) -> DfResult<Arc<dyn ExecutionPlan>> {
+    let msg = pb::NumberedInputExecNode::decode(body)
+        .map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
+    let input = inputs
+        .first()
+        .cloned()
+        .ok_or_else(|| Error::Decode("NumberedInputExecNode: no input".into()).into_df_error())?;
+    let order = msg
+        .key_column
+        .map_or(RowOrder::Arrival, |key_column| RowOrder::Keyed {
+            key_column,
+        });
+    Ok(Arc::new(NumberedInputExec::try_new(input, order)?))
 }
 
 fn encode_ann_search(exec: &AnnSearchExec, buf: &mut Vec<u8>) -> DfResult<()> {

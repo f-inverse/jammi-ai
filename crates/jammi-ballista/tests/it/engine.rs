@@ -11,9 +11,7 @@ use datafusion::prelude::SessionConfig;
 
 use ballista_executor::execution_engine::ExecutionEngine;
 
-use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::operator::gang_exec::GangExec;
-use jammi_ai::operator::inference_exec::InferenceExecBuilder;
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::engine::JammiExecutionEngine;
 use jammi_db::store::manifest::ComputeDeviceKind;
@@ -46,20 +44,7 @@ async fn refuses_a_stage_whose_inference_exec_names_a_different_device_kind() {
         ComputeDeviceKind::Cpu,
         "test precondition: the fixture session runs on CPU"
     );
-    let node = InferenceExecBuilder::new(
-        scan(),
-        ModelSource::hf("m"),
-        ModelTask::TextEmbedding,
-        vec!["text".to_string()],
-        "text".to_string(),
-        "src-1".to_string(),
-        Arc::clone(session.model_cache()),
-        ComputeDeviceKind::Cuda,
-    )
-    .embedding_dim(Some(2))
-    .build()
-    .unwrap();
-    let plan: Arc<dyn ExecutionPlan> = Arc::new(node);
+    let plan = crate::inference_plan(&session, scan(), ComputeDeviceKind::Cuda, 1);
 
     let engine = JammiExecutionEngine::new(Arc::clone(&session));
     let err = engine
@@ -89,20 +74,7 @@ async fn refuses_a_stage_whose_inference_exec_names_a_different_device_kind() {
 async fn does_not_refuse_a_matching_device_kind() {
     let session = session().await;
     let own_kind = session.compute_device().kind();
-    let node = InferenceExecBuilder::new(
-        scan(),
-        ModelSource::hf("m"),
-        ModelTask::TextEmbedding,
-        vec!["text".to_string()],
-        "text".to_string(),
-        "src-1".to_string(),
-        Arc::clone(session.model_cache()),
-        own_kind,
-    )
-    .embedding_dim(Some(2))
-    .build()
-    .unwrap();
-    let plan: Arc<dyn ExecutionPlan> = Arc::new(node);
+    let plan = crate::inference_plan(&session, scan(), own_kind, 1);
 
     let engine = JammiExecutionEngine::new(Arc::clone(&session));
     let err = engine

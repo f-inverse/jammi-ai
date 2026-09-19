@@ -8,9 +8,10 @@ use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 
-use jammi_ai::model::{ModelSource, ModelTask};
-use jammi_ai::operator::inference_exec::InferenceExecBuilder;
+use jammi_ai::model::ModelTask;
+use jammi_ai::operator::inference_exec::InferenceExec;
 use jammi_ai::operator::key_check_exec::KeyCheckExec;
+use jammi_ai::operator::numbered_input_exec::{NumberedInputExec, RowOrder};
 use jammi_ai::pipeline::asof::exec::AsofJoinExec;
 use jammi_ai::pipeline::asof::spec::{AsofJoinSpecBuilder, AsofKey};
 use jammi_ai::session::InferenceSession;
@@ -38,6 +39,22 @@ fn string_scan(name: &str, values: &[&str]) -> Arc<dyn ExecutionPlan> {
     )
     .unwrap();
     MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap()
+}
+
+/// One partition per entry of `partitions`.
+fn partitioned_string_scan(name: &str, partitions: &[&[&str]]) -> Arc<dyn ExecutionPlan> {
+    let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, true)]));
+    let batches: Vec<Vec<RecordBatch>> = partitions
+        .iter()
+        .map(|values| {
+            vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from(values.to_vec()))],
+            )
+            .unwrap()]
+        })
+        .collect();
+    MemorySourceConfig::try_new_exec(&batches, schema, None).unwrap()
 }
 
 fn two_col_scan(a: &str, b: &str, vals: &[&str]) -> Arc<dyn ExecutionPlan> {
@@ -73,26 +90,24 @@ fn magic_never_collides_with_a_ballista_oneof_tag() {
     assert_eq!(wire_type, 7, "wire type must be illegal (7)");
 }
 
+/// `plan`'s `InferenceExec`, searching depth-first.
+fn inference_node(plan: &Arc<dyn ExecutionPlan>) -> &InferenceExec {
+    let mut stack = vec![plan];
+    while let Some(node) = stack.pop() {
+        if let Some(exec) = node.downcast_ref::<InferenceExec>() {
+            return exec;
+        }
+        stack.extend(node.children());
+    }
+    panic!("the plan has no InferenceExec")
+}
+
 #[tokio::test]
 async fn inference_exec_round_trips() {
     let session = session().await;
     let scan = string_scan("text", &["hello", "world"]);
-    let node = InferenceExecBuilder::new(
-        scan,
-        ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-        ModelTask::TextEmbedding,
-        vec!["text".to_string()],
-        "text".to_string(),
-        "src-1".to_string(),
-        Arc::clone(session.model_cache()),
-        session.compute_device().kind(),
-    )
-    .batch_size(8)
-    .embedding_dim(Some(4))
-    .passthrough(vec![])
-    .build()
-    .expect("inference exec builds");
-    let node: Arc<dyn ExecutionPlan> = Arc::new(node);
+    let node = crate::inference_plan(&session, scan, session.compute_device().kind(), 1);
+    let spec = inference_node(&node).spec().clone();
 
     let codec = JammiCodec::new(&session);
     let mut buf = Vec::new();
@@ -101,32 +116,41 @@ async fn inference_exec_round_trips() {
         .expect("encode");
     assert_eq!(&buf[0..4], &[0x07, b'J', b'M', b'B'], "magic prefix");
 
-    let inputs = [string_scan("text", &["hello", "world"])];
+    // The child crosses the wire on its own, so the decode is handed it.
+    let inputs = [Arc::clone(node.children()[0])];
     let ctx = session.context().task_ctx();
     let decoded = codec.try_decode(&buf, &inputs, &ctx).expect("decode");
-    {
-        let d = decoded
-            .downcast_ref::<jammi_ai::operator::inference_exec::InferenceExec>()
-            .expect("decodes to InferenceExec");
-        assert_eq!(
-            d.source(),
-            &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2")
-        );
-        assert_eq!(d.task(), ModelTask::TextEmbedding);
-        assert_eq!(d.content_columns(), &["text".to_string()]);
-        assert_eq!(d.key_column(), "text");
-        assert_eq!(d.source_id(), "src-1");
-        assert_eq!(d.batch_size(), 8);
-        assert_eq!(d.embedding_dim(), Some(4));
-        assert_eq!(d.device_kind(), session.compute_device().kind());
-    }
+    assert_eq!(
+        inference_node(&decoded).spec(),
+        &spec,
+        "every field of the spec crosses the wire"
+    );
+    assert_eq!(spec, crate::text_embedding_spec(spec.device_kind, 1));
 
-    // Re-encoding the SAME decoded `Arc<dyn ExecutionPlan>` reproduces the
-    // same bytes: device_kind is stamped once, at construction, so the
-    // second encode stamps nothing new.
+    // Re-encoding the decoded node reproduces the same bytes: nothing is
+    // stamped or defaulted on the way through.
     let mut buf2 = Vec::new();
     codec.try_encode(decoded, &mut buf2).expect("re-encode");
     assert_eq!(buf, buf2, "encode -> decode -> encode is byte-identical");
+}
+
+/// A decode binds through the same constructor the planner uses, so a peer
+/// cannot hand an executor an `InferenceExec` over an input that was never
+/// numbered.
+#[tokio::test]
+async fn inference_decode_refuses_an_unnumbered_input() {
+    let session = session().await;
+    let scan = string_scan("text", &["hello"]);
+    let node = crate::inference_plan(&session, scan, session.compute_device().kind(), 1);
+    let codec = JammiCodec::new(&session);
+    let mut buf = Vec::new();
+    codec.try_encode(node, &mut buf).unwrap();
+
+    let inputs = [string_scan("text", &["hello"])];
+    let err = codec
+        .try_decode(&buf, &inputs, &session.context().task_ctx())
+        .expect_err("an input without _ordinal must refuse");
+    assert!(err.to_string().contains("_ordinal"), "{err}");
 }
 
 /// The codec never invents or rewrites a
@@ -138,44 +162,58 @@ async fn codec_never_rewrites_device_kind() {
     let session = session().await; // a CPU session (`jammi_test_utils::test_config`)
     assert_eq!(
         session.compute_device().kind(),
-        jammi_db::store::manifest::ComputeDeviceKind::Cpu,
+        ComputeDeviceKind::Cpu,
         "precondition: the fixture session runs on CPU"
     );
     let scan = string_scan("text", &["hello"]);
-    let node = InferenceExecBuilder::new(
-        scan,
-        ModelSource::hf("m"),
-        ModelTask::TextEmbedding,
-        vec!["text".to_string()],
-        "text".to_string(),
-        "src-1".to_string(),
-        Arc::clone(session.model_cache()),
-        jammi_db::store::manifest::ComputeDeviceKind::Cuda,
-    )
-    .embedding_dim(Some(2))
-    .build()
-    .unwrap();
+    let node = crate::inference_plan(&session, scan, ComputeDeviceKind::Cuda, 1);
     assert_eq!(
-        node.device_kind(),
-        jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+        inference_node(&node).spec().device_kind,
+        ComputeDeviceKind::Cuda,
         "constructed explicitly onto a kind other than the session's own"
     );
-    let node: Arc<dyn ExecutionPlan> = Arc::new(node);
 
     let codec = JammiCodec::new(&session);
     let mut buf = Vec::new();
     codec.try_encode(Arc::clone(&node), &mut buf).unwrap();
-    let inputs = [string_scan("text", &["hello"])];
+    let inputs = [Arc::clone(node.children()[0])];
     let ctx = session.context().task_ctx();
     let decoded = codec.try_decode(&buf, &inputs, &ctx).unwrap();
-    let decoded = decoded
-        .downcast_ref::<jammi_ai::operator::inference_exec::InferenceExec>()
-        .unwrap();
     assert_eq!(
-        decoded.device_kind(),
-        jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+        inference_node(&decoded).spec().device_kind,
+        ComputeDeviceKind::Cuda,
         "the codec never rewrites device_kind to the decoding/encoding session's own kind"
     );
+}
+
+/// `NumberedInputExec` carries its one construction input, the row order, in
+/// both of its forms.
+#[tokio::test]
+async fn numbered_input_exec_round_trips() {
+    let session = session().await;
+    let codec = JammiCodec::new(&session);
+    let ctx = session.context().task_ctx();
+    for order in [
+        RowOrder::Arrival,
+        RowOrder::Keyed {
+            key_column: "id".into(),
+        },
+    ] {
+        let node: Arc<dyn ExecutionPlan> = Arc::new(
+            NumberedInputExec::try_new(
+                two_col_scan("id", "_content_hash", &["b", "a"]),
+                order.clone(),
+            )
+            .unwrap(),
+        );
+        let mut buf = Vec::new();
+        codec.try_encode(Arc::clone(&node), &mut buf).unwrap();
+        let inputs = [two_col_scan("id", "_content_hash", &["b", "a"])];
+        let decoded = codec.try_decode(&buf, &inputs, &ctx).unwrap();
+        let decoded = decoded.downcast_ref::<NumberedInputExec>().unwrap();
+        assert_eq!(decoded.order(), &order);
+        assert_eq!(decoded.schema(), node.schema());
+    }
 }
 
 #[tokio::test]
@@ -366,35 +404,95 @@ async fn mask_exec_is_refused_typed() {
     );
 }
 
-/// `OrdinalSplitExec` gets the SAME v1-cut treatment as `MaskExec` above —
-/// no `NodeTag`, no
-/// `plan.proto` message, no encode/decode arm — so a plan containing it
-/// (only ever built when `InferenceConfig::partitions > 1`; the default `1`
-/// never inserts this node) is refused typed rather than silently
-/// mis-encoded or handed to Ballista's own delegate (which does not know it
-/// either). See `jammi_ballista::codec`'s module doc for WHY: in Ballista
-/// 54.1 a `SortPreservingMergeExec` is a stage boundary, so the N-partition
-/// `InferenceExec(OrdinalSplitExec)` this node feeds would become its own
-/// stage of N tasks each executing ONE partition, in general in a separate
-/// process — this node's in-process shared-mutex mechanism has no meaning
-/// across that split.
+/// A plan fanned out four ways is ADMITTED by a cluster. The plan the
+/// production planner builds round-trips whole through `JammiCodec` to the
+/// identical shape and spec, and Ballista's own planner cuts it into the four
+/// stages the shape implies — the scan; the numbered input, written through a
+/// hash shuffle on the chunk id; `InferenceExec` over that shuffle as FOUR
+/// tasks; the merge — each of which round-trips through the codec in turn, as
+/// it must to reach an executor.
 #[tokio::test]
-async fn ordinal_split_exec_is_refused_typed() {
-    let input = string_scan("id", &["a"]);
-    let node = jammi_ai::operator::ordinal_split_exec::OrdinalSplitExec::new(input, 2)
-        .expect("OrdinalSplitExec builds over a plain scan");
+async fn a_plan_fanned_out_four_ways_is_admitted_and_staged() {
+    use ballista_scheduler::planner::{DefaultDistributedPlanner, DistributedPlanner};
+    use datafusion::config::ConfigOptions;
+    use datafusion::physical_plan::displayable;
+    use datafusion_proto::physical_plan::AsExecutionPlan;
+    use datafusion_proto::protobuf::PhysicalPlanNode;
+    use prost::Message;
+
     let session = session().await;
     let codec = JammiCodec::new(&session);
-    let mut buf = Vec::new();
-    let err = codec
-        .try_encode(Arc::new(node), &mut buf)
-        .expect_err("OrdinalSplitExec must be refused, never silently encoded");
-    let msg = err.to_string();
-    assert!(
-        msg.to_lowercase().contains("unsupported")
-            || msg.to_lowercase().contains("ordinalsplitexec"),
-        "refusal must name the node: {msg}"
+    let ctx = session.context().task_ctx();
+    let round_trip = |plan: Arc<dyn ExecutionPlan>| -> Arc<dyn ExecutionPlan> {
+        let bytes = PhysicalPlanNode::try_from_physical_plan(plan, &codec)
+            .expect("the plan encodes")
+            .encode_to_vec();
+        PhysicalPlanNode::decode(bytes.as_slice())
+            .expect("the bytes parse")
+            .try_into_physical_plan(&ctx, &codec)
+            .expect("the plan decodes")
+    };
+    let shape = |plan: &Arc<dyn ExecutionPlan>| displayable(plan.as_ref()).indent(true).to_string();
+
+    let scan = partitioned_string_scan("text", &[&["a", "b"], &["c"], &["d", "e"], &["f"]]);
+    let plan = crate::inference_plan(&session, scan, ComputeDeviceKind::Cpu, 4);
+    let decoded = round_trip(Arc::clone(&plan));
+    assert_eq!(shape(&decoded), shape(&plan));
+    assert_eq!(
+        inference_node(&decoded).spec(),
+        inference_node(&plan).spec()
     );
+
+    let stages = DefaultDistributedPlanner::new()
+        .plan_query_stages(
+            &"job-n4".to_string().into(),
+            plan,
+            &ConfigOptions::default(),
+        )
+        .expect("the plan stages");
+    let shapes: Vec<String> = stages
+        .iter()
+        .map(|stage| shape(&(Arc::clone(stage) as Arc<dyn ExecutionPlan>)))
+        .collect();
+    let all = shapes.join("\n");
+    assert_eq!(
+        stages.len(),
+        4,
+        "scan, numbered input, inference, merge:\n{all}"
+    );
+
+    assert_eq!(stages[0].input_partition_count(), 4, "{all}");
+    assert!(shapes[0].contains("DataSourceExec"), "{all}");
+
+    assert_eq!(stages[1].input_partition_count(), 1, "{all}");
+    assert!(
+        shapes[1].contains("NumberedInputExec: order=arrival"),
+        "{all}"
+    );
+    assert!(!shapes[1].contains("InferenceExec"), "{all}");
+    let shuffle = stages[1]
+        .shuffle_output_partitioning()
+        .expect("the numbered input is written through a hash shuffle");
+    assert_eq!(shuffle.to_string(), "Hash([_ordinal@1 / 8], 4)", "{all}");
+
+    assert_eq!(
+        stages[2].input_partition_count(),
+        4,
+        "the inference stage runs as four tasks:\n{all}"
+    );
+    assert!(shapes[2].contains("InferenceExec"), "{all}");
+    assert!(stages[2].shuffle_output_partitioning().is_none(), "{all}");
+
+    assert_eq!(stages[3].input_partition_count(), 1, "{all}");
+    assert!(
+        shapes[3].contains("SortPreservingMergeExec: [_ordinal@1 ASC NULLS LAST]"),
+        "{all}"
+    );
+
+    for (stage, expected) in stages.iter().zip(&shapes) {
+        let decoded = round_trip(Arc::clone(stage) as Arc<dyn ExecutionPlan>);
+        assert_eq!(&shape(&decoded), expected);
+    }
 }
 
 /// A plain in-memory scan is unknown to jammi's codec (not one of the four
@@ -458,20 +556,7 @@ async fn no_magic_buffer_delegates_to_ballistas_own_codec() {
 async fn dead_session_is_refused_typed() {
     let session = session().await;
     let scan = string_scan("text", &["a"]);
-    let node = InferenceExecBuilder::new(
-        scan,
-        ModelSource::hf("m"),
-        ModelTask::TextEmbedding,
-        vec!["text".to_string()],
-        "text".to_string(),
-        "src-1".to_string(),
-        Arc::clone(session.model_cache()),
-        session.compute_device().kind(),
-    )
-    .embedding_dim(Some(2))
-    .build()
-    .unwrap();
-    let node: Arc<dyn ExecutionPlan> = Arc::new(node);
+    let node = crate::inference_plan(&session, scan, session.compute_device().kind(), 1);
     let codec = JammiCodec::new(&session);
     let mut buf = Vec::new();
     codec.try_encode(node, &mut buf).unwrap();

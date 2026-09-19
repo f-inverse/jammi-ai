@@ -121,12 +121,9 @@ impl std::fmt::Debug for GangExec {
 impl GangExec {
     /// One task, one partition — `Partitioning::UnknownPartitioning(1)`,
     /// bounded, incremental emission (a single terminal batch). Unconditional:
-    /// this node is a leaf (no child `ExecutionPlan`
-    /// — it drives the placed gang's coordinator/worker fleet directly via
-    /// `descriptor`) and never routes through `InferenceExec` — the N-way
-    /// `OrdinalSplitExec` fan-out is strictly an `InferenceExec`-INPUT
-    /// operator (`operator::inference_exec::wrap_with_split_and_merge`), so
-    /// there is nothing here for it to attach to.
+    /// this node is a leaf (no child `ExecutionPlan` — it drives the placed
+    /// gang's coordinator/worker fleet directly via `descriptor`), so there is
+    /// nothing to partition.
     pub fn new(descriptor: GangDescriptor) -> Self {
         let schema = gang_output_schema();
         let properties = PlanProperties::new(

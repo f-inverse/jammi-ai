@@ -7,6 +7,20 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### BREAKING
+- **`InferenceExec` is built by `plan_inference` from an `InferenceSpec` (#540).**
+  `InferenceExecBuilder`, `InferenceExec`'s per-field getters, `wrap_with_split_and_merge`,
+  `operator::ordered_input` and `operator::ordinal_split_exec` are removed. A caller builds
+  the whole plan with `operator::inference_exec::plan_inference(input, order, spec, runtime)`,
+  reads a node through `InferenceExec::spec()`, and rebinds one with `InferenceExec::bind`,
+  which refuses an input without `_ordinal: UInt64 NOT NULL` — no `InferenceExec` runs over
+  an un-numbered input, and `InferenceRunner` no longer numbers rows itself.
+  `key_checked` lives in `operator::key_check_exec`. `InferenceRunner::new` takes the spec
+  and an `InferenceRuntime`.
+- **Forward chunks follow `_ordinal`, and `[inference] batch_size = 0` is refused (#540).**
+  Row `i` of the ordered input is forwarded in chunk `i / batch_size`, where it was the
+  `i`-th row of whichever batch it arrived in. An `annotate` over a multi-batch input, or a
+  `batch_size` that does not divide `[engine] batch_size`, forwards different row groups than
+  before, so its vectors may differ in the last bits. `batch_size = 0` was treated as `1`.
 - **A cancelled job ends `cancelled`, not `failed` (#515).** `cancelled` is a terminal job
   status. A cancel on a job no worker has claimed ends it at once, with no attempt spent; a
   running job is flagged and its executor ends it `cancelled` at its next checkpoint. `wait()`
@@ -125,13 +139,16 @@ workspace ships every publishable crate at the same
   above `[worker] local_ranks` trains as a `Peer` gang like `fine_tune` does; it was refused by
   name. A graph sample is one more producer of a pairs/triplet training set: members bind it by
   the identity on the job row and read it in its committed `_ordinal` order.
-- **`[inference] partitions = N` (#540).** Splits the model forward `N` ways in-process
-  below every `InferenceExec` (default `1`, refused outside `1..=1024`): each partition
-  pulls the next batch on demand and stamps a global `_ordinal`, and a
-  `SortPreservingMergeExec` on `_ordinal` restores the single-partition row sequence
-  exactly. Forwards are admitted by a per-exec permit (CPU: available parallelism; GPU:
-  one). A plan carrying the split is refused, typed, for distributed submission (the
-  split has no wire form in v1; #540).
+- **`[inference] partitions = N` (#540).** Runs the model over `N` partitions of one plan
+  (default `1`, refused outside `1..=1024`), in one process or — submitted to a Ballista
+  cluster — as `N` tasks across its executors. `plan_inference` builds one shape at every
+  scale: a `NumberedInputExec` orders and numbers the rows (`_ordinal`), a stock hash
+  exchange on the forward-chunk id `_ordinal / batch_size` fans them out, and a stock
+  `SortPreservingMergeExec` on `_ordinal` restores the row sequence. The rows a model
+  forwards together are decided by that chunk id alone, so the written bytes are identical
+  at every `N` and between an in-process and a placed run. A session that plans through
+  DataFusion's optimizer registers the `InferenceFanOut` rule, which keeps the exchange at
+  the plan's own `N` (the optimizer re-derives it at `target_partitions`).
 - **`[server] placement = "local" | "rendezvous"` and
   `jammi_db::index::RendezvousPlacement` (#500).** Beyond-one-node retrieval
   over the LIVE `instances` ring, derived at query time (never declared):

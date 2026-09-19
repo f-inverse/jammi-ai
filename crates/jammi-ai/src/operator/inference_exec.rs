@@ -1,32 +1,111 @@
+//! `InferenceExec` and the one plan every model forward runs in.
+//!
+//! [`plan_inference`] builds the same shape at every scale — one partition in
+//! one process, `N` partitions in one process, `N` tasks on a cluster:
+//!
+//! ```text
+//! SortPreservingMergeExec [_ordinal ASC]                  restores the row sequence
+//!   InferenceExec                                          N partitions
+//!     RepartitionExec Hash([_ordinal / batch_size], N)     the fan-out
+//!       NumberedInputExec                                  orders and numbers the rows
+//!         CoalescePartitionsExec
+//!           input
+//! ```
+//!
+//! The exchange, the merge and the coalesce are stock DataFusion operators,
+//! so an optimizer re-derives them from this module's declared requirements
+//! and a distributed planner cuts its stages at them. Each is the identity
+//! over one partition and is left out there: at `N == 1` the plan is
+//! `InferenceExec(NumberedInputExec(input))`.
+//!
+//! The fan-out `N` has one source: [`InferenceSpec::partitions`], which the
+//! node carries and declares. DataFusion has no vocabulary for a declared
+//! partition COUNT — `EnforceDistribution` strips the exchange and re-adds
+//! it from the declared hash requirement at the session's
+//! `target_partitions`, or not at all when that is 1 — so a session that
+//! plans through the optimizer registers [`InferenceFanOut`], which puts
+//! every `InferenceExec` back over an exchange of the node's own width.
+//!
+//! The rows a model forwards together are a function of `_ordinal` alone
+//! ([`crate::inference::chunk`]). The exchange hashes on that same chunk id,
+//! so a chunk is never divided between partitions, and every partition count
+//! — and every re-batching an exchange or a shuffle performs on the way —
+//! forwards identical chunks and writes identical bytes.
+
 use std::fmt::{self, Formatter};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use arrow::datatypes::SchemaRef;
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion::config::ConfigOptions;
+use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::expressions::col;
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
+use datafusion::physical_expr::{EquivalenceProperties, OrderingRequirements, PhysicalExpr};
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{
     stream::RecordBatchReceiverStreamBuilder, DisplayAs, DisplayFormatType, Distribution,
     ExecutionPlan, ExecutionPlanProperties, Partitioning, PlanProperties,
 };
 
 use crate::inference::adapter::DistributionForm;
+use crate::inference::chunk::chunk_expr;
 use crate::inference::observer::InferenceObserver;
 use crate::inference::runner::InferenceRunner;
-use crate::inference::schema::{build_output_schema, ORDINAL_COLUMN};
+use crate::inference::schema::build_output_schema;
 use crate::model::cache::ModelCache;
 use crate::model::{BackendType, ModelSource, ModelTask};
+use crate::operator::numbered_input_exec::{ordinal_ordering, NumberedInputExec, RowOrder};
+use crate::operator::single_partition;
+use jammi_db::error::Result;
 use jammi_db::store::manifest::ComputeDeviceKind;
 
-/// The default forward admission, scoped to ONE `InferenceExec` INSTANCE
-/// (never a whole device — see `forward_permits`' field doc for what that
-/// means for two concurrent instances sharing a GPU): `available_
-/// parallelism()` concurrent forwards on the CPU (bounded parallel CPU
-/// inference actually helps — see `InferenceRunner`'s CPU speedup
-/// measurement), 1 on a CUDA or Metal device (a conservative default:
-/// DEVICE-WIDE admission across every concurrent instance — e.g. multiple
-/// small models, or a scheduler-approved batch split — is
-/// `concurrency::GpuScheduler`'s seam, not this one).
+/// What an [`InferenceExec`] computes: plain data, and everything about the
+/// node that crosses a process boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferenceSpec {
+    /// The model to run.
+    pub source: ModelSource,
+    /// The task it performs.
+    pub task: ModelTask,
+    /// The input columns whose content the model reads.
+    pub content_columns: Vec<String>,
+    /// The row-identity column, carried to the output as `_row_id`.
+    pub key_column: String,
+    /// The catalog source id the output is attributed to.
+    pub source_id: String,
+    /// An explicit backend; `None` defers to the model cache's resolution.
+    pub backend: Option<BackendType>,
+    /// The rows of one forward chunk: chunk id is `_ordinal / batch_size`.
+    pub batch_size: NonZeroUsize,
+    /// The embedding output width, for a task that produces one.
+    pub embedding_dim: Option<usize>,
+    /// The served regression head's persisted distribution form.
+    pub regression_form: Option<DistributionForm>,
+    /// Input columns copied verbatim to the end of every output batch.
+    pub passthrough: Vec<String>,
+    /// The device kind this node must run on. A submitter placing the plan
+    /// onto a kind other than its own session's names that kind here; nothing
+    /// downstream rewrites it.
+    pub device_kind: ComputeDeviceKind,
+    /// The fan-out: how many partitions forward chunks concurrently.
+    pub partitions: NonZeroUsize,
+}
+
+/// The process-local handles an [`InferenceExec`] runs against. Never
+/// serialized: a node rebuilt in another process binds to that process's own.
+#[derive(Clone)]
+pub struct InferenceRuntime {
+    /// Where the node's model is loaded from and kept.
+    pub model_cache: Arc<ModelCache>,
+    /// Observes every output batch.
+    pub observer: Option<Arc<dyn InferenceObserver>>,
+}
+
+/// The default forward admission of one `InferenceExec` instance:
+/// `available_parallelism()` concurrent forwards on the CPU, 1 on a CUDA or
+/// Metal device.
 fn default_forward_permits(device_kind: ComputeDeviceKind) -> usize {
     match device_kind {
         ComputeDeviceKind::Cpu => std::thread::available_parallelism()
@@ -36,269 +115,93 @@ fn default_forward_permits(device_kind: ComputeDeviceKind) -> usize {
     }
 }
 
-/// InferenceExec — the core intelligence operator.
-/// Reads input RecordBatches, runs model inference, and outputs
-/// RecordBatches with common prefix + task-specific columns.
+/// Runs a model over a numbered input, one forward per chunk, emitting the
+/// common prefix columns followed by the task's own.
 pub struct InferenceExec {
     input: Arc<dyn ExecutionPlan>,
-    source: ModelSource,
-    task: ModelTask,
-    content_columns: Vec<String>,
-    key_column: String,
-    source_id: String,
-    backend: Option<BackendType>,
-    batch_size: usize,
-    model_cache: Arc<ModelCache>,
-    observer: Option<Arc<dyn InferenceObserver>>,
-    embedding_dim: Option<usize>,
-    /// Served regression head's persisted distribution form, for schema
-    /// construction. `None` for non-regression tasks.
-    regression_form: Option<DistributionForm>,
-    /// Input columns copied verbatim to the end of every output batch.
-    passthrough: Vec<String>,
-    /// The device KIND this descriptor
-    /// declares it must run on: a REQUIRED constructor argument, stamped at
-    /// every call site from `session.compute_device().kind()` (or, for a
-    /// submitter placing this plan onto another kind, that kind directly —
-    /// there is no separate override setter). The wire carries exactly this
-    /// value; a decoding codec never invents or rewrites it (`jammi-
-    /// ballista`'s codec, `codec.rs`).
-    device_kind: ComputeDeviceKind,
+    spec: InferenceSpec,
+    runtime: InferenceRuntime,
+    /// `_ordinal / batch_size` over the input schema: the key this node
+    /// requires its input hash-partitioned on.
+    chunk_id: Arc<dyn PhysicalExpr>,
     properties: Arc<PlanProperties>,
-    /// The forward admission shared by every partition of THIS
-    /// `InferenceExec` instance (cloned into each partition's
-    /// `InferenceRunner` at `execute()` time). This is per-INSTANCE, never
-    /// per-device: two concurrent `InferenceExec` instances targeting the
-    /// SAME GPU each get their own `forward_permits` and will each run one
-    /// forward concurrently (up to two total on that device) — bounding a
-    /// whole device's admission across every instance is the named,
-    /// unbuilt seam (`concurrency::GpuScheduler`; `default_forward_
-    /// permits`'s doc). Sized from `device_kind` at build time.
+    /// The forward admission shared by every partition of this instance.
     forward_permits: Arc<tokio::sync::Semaphore>,
 }
 
-impl std::fmt::Debug for InferenceExec {
+impl fmt::Debug for InferenceExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("InferenceExec")
-            .field("source", &self.source)
-            .field("task", &self.task)
-            .field("content_columns", &self.content_columns)
-            .finish()
-    }
-}
-
-/// Builder for constructing an `InferenceExec` operator.
-pub struct InferenceExecBuilder {
-    input: Arc<dyn ExecutionPlan>,
-    source: ModelSource,
-    task: ModelTask,
-    content_columns: Vec<String>,
-    key_column: String,
-    source_id: String,
-    model_cache: Arc<ModelCache>,
-    backend: Option<BackendType>,
-    batch_size: usize,
-    observer: Option<Arc<dyn InferenceObserver>>,
-    embedding_dim: Option<usize>,
-    regression_form: Option<DistributionForm>,
-    passthrough: Vec<String>,
-    device_kind: ComputeDeviceKind,
-}
-
-impl InferenceExecBuilder {
-    /// `device_kind` is a REQUIRED constructor argument — a submitter placing this plan onto a
-    /// device kind other than its own session's builds with that kind directly;
-    /// there is no separate optional override setter.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        input: Arc<dyn ExecutionPlan>,
-        source: ModelSource,
-        task: ModelTask,
-        content_columns: Vec<String>,
-        key_column: String,
-        source_id: String,
-        model_cache: Arc<ModelCache>,
-        device_kind: ComputeDeviceKind,
-    ) -> Self {
-        Self {
-            input,
-            source,
-            task,
-            content_columns,
-            key_column,
-            source_id,
-            model_cache,
-            backend: None,
-            batch_size: 32,
-            observer: None,
-            embedding_dim: None,
-            regression_form: None,
-            passthrough: Vec::new(),
-            device_kind,
-        }
-    }
-
-    /// Copy the named input columns verbatim to the end of every output
-    /// batch (after the task columns), keeping their input fields. The
-    /// embedding pipeline passes `["_content_hash"]`.
-    pub fn passthrough(mut self, columns: Vec<String>) -> Self {
-        self.passthrough = columns;
-        self
-    }
-
-    pub fn batch_size(mut self, batch_size: usize) -> Self {
-        self.batch_size = batch_size;
-        self
-    }
-
-    /// Explicit backend override (`None` defers to the model cache's own
-    /// resolution). Needed to round-trip a decoded node's exact backend
-    /// choice (`jammi-ballista`'s codec); `with_new_children` below threads
-    /// it through too.
-    pub fn backend(mut self, backend: Option<BackendType>) -> Self {
-        self.backend = backend;
-        self
-    }
-
-    pub fn observer(mut self, observer: Option<Arc<dyn InferenceObserver>>) -> Self {
-        self.observer = observer;
-        self
-    }
-
-    pub fn embedding_dim(mut self, dim: Option<usize>) -> Self {
-        self.embedding_dim = dim;
-        self
-    }
-
-    pub fn regression_form(mut self, form: Option<DistributionForm>) -> Self {
-        self.regression_form = form;
-        self
-    }
-
-    pub fn build(self) -> jammi_db::error::Result<InferenceExec> {
-        let output_schema = build_output_schema(
-            &self.task,
-            &self.input.schema(),
-            &self.key_column,
-            self.embedding_dim,
-            self.regression_form.as_ref(),
-            &self.passthrough,
-        )?;
-        let properties = InferenceExec::compute_properties(output_schema, &self.input);
-        let forward_permits = Arc::new(tokio::sync::Semaphore::new(
-            default_forward_permits(self.device_kind).max(1),
-        ));
-        Ok(InferenceExec {
-            input: self.input,
-            source: self.source,
-            task: self.task,
-            content_columns: self.content_columns,
-            key_column: self.key_column,
-            source_id: self.source_id,
-            backend: self.backend,
-            batch_size: self.batch_size,
-            model_cache: self.model_cache,
-            observer: self.observer,
-            embedding_dim: self.embedding_dim,
-            regression_form: self.regression_form,
-            passthrough: self.passthrough,
-            device_kind: self.device_kind,
-            properties: Arc::new(properties),
-            forward_permits,
-        })
+            .field("spec", &self.spec)
+            .finish_non_exhaustive()
     }
 }
 
 impl InferenceExec {
-    /// The model source this node runs inference against.
-    pub fn source(&self) -> &ModelSource {
-        &self.source
+    /// Bind `spec` to `input` in this process. The one constructor: the
+    /// planner, `with_new_children` and a wire decode all build the node here.
+    ///
+    /// Refuses an `input` that is not numbered (`_ordinal: UInt64 NOT NULL`),
+    /// and one of several partitions that is not hash-partitioned on the
+    /// chunk id — either would let a chunk's rows be forwarded apart.
+    pub fn bind(
+        input: Arc<dyn ExecutionPlan>,
+        spec: InferenceSpec,
+        runtime: InferenceRuntime,
+    ) -> DfResult<Self> {
+        let input_schema = input.schema();
+        let chunk_id = chunk_expr(input_schema.as_ref(), spec.batch_size)?;
+        let by_chunk = Distribution::HashPartitioned(vec![Arc::clone(&chunk_id)]);
+        if !input
+            .output_partitioning()
+            .satisfaction(&by_chunk, input.equivalence_properties(), false)
+            .is_satisfied()
+        {
+            return Err(DataFusionError::Plan(format!(
+                "InferenceExec: an input of {} partitions must be hash-partitioned on the \
+                 forward chunk, found {}",
+                input.output_partitioning().partition_count(),
+                input.output_partitioning()
+            )));
+        }
+        let schema = build_output_schema(
+            &spec.task,
+            &input_schema,
+            &spec.key_column,
+            spec.embedding_dim,
+            spec.regression_form.as_ref(),
+            &spec.passthrough,
+        )
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let mut eq = EquivalenceProperties::new(Arc::clone(&schema));
+        eq.add_ordering(ordinal_ordering(schema.as_ref())?);
+        let properties = PlanProperties::new(
+            eq,
+            Partitioning::UnknownPartitioning(input.output_partitioning().partition_count()),
+            datafusion::physical_plan::execution_plan::EmissionType::Incremental,
+            datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+        );
+        let forward_permits = Arc::new(tokio::sync::Semaphore::new(default_forward_permits(
+            spec.device_kind,
+        )));
+        Ok(Self {
+            input,
+            spec,
+            runtime,
+            chunk_id,
+            properties: Arc::new(properties),
+            forward_permits,
+        })
     }
 
-    /// The inference task this node performs.
-    pub fn task(&self) -> ModelTask {
-        self.task
-    }
-
-    /// The input columns whose content this node reads.
-    pub fn content_columns(&self) -> &[String] {
-        &self.content_columns
-    }
-
-    /// The row-identity column threaded through to the output.
-    pub fn key_column(&self) -> &str {
-        &self.key_column
-    }
-
-    /// The catalog source id this node's output is attributed to.
-    pub fn source_id(&self) -> &str {
-        &self.source_id
-    }
-
-    /// The explicit backend override, if any (`None` defers to the model
-    /// cache's own resolution).
-    pub fn backend(&self) -> Option<BackendType> {
-        self.backend
-    }
-
-    /// The inference batch size.
-    pub fn batch_size(&self) -> usize {
-        self.batch_size
-    }
-
-    /// The embedding output width, for tasks that produce one.
-    pub fn embedding_dim(&self) -> Option<usize> {
-        self.embedding_dim
-    }
-
-    /// The served regression head's persisted distribution form, if any.
-    pub fn regression_form(&self) -> Option<&DistributionForm> {
-        self.regression_form.as_ref()
-    }
-
-    /// Input columns copied verbatim to the end of every output batch.
-    pub fn passthrough(&self) -> &[String] {
-        &self.passthrough
+    /// What this node computes.
+    pub fn spec(&self) -> &InferenceSpec {
+        &self.spec
     }
 
     /// The child plan this node reads from.
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.input
-    }
-
-    /// The device kind this descriptor declares it must run on.
-    pub fn device_kind(&self) -> ComputeDeviceKind {
-        self.device_kind
-    }
-
-    /// `output_partitioning` propagates the CHILD's own partition count
-    /// (never a hardcoded 1): with a declared `UnknownPartitioning(1)`, a
-    /// multi-partition child (the UDTF/`annotate` scan) would have its extra
-    /// partitions silently unreachable, since a call site calling
-    /// `.execute(0, ..)` gives the optimizer no reason to ever coalesce
-    /// first. The equivalence
-    /// properties publish `[_ordinal ASC]` — true BY CONSTRUCTION regardless
-    /// of whether an `OrdinalSplitExec` sits below (see
-    /// `inference::schema::extract_or_generate_ordinals`'s doc: either arm
-    /// hands this operator, and this operator alone emits, a strictly
-    /// increasing per-partition `_ordinal` subsequence).
-    fn compute_properties(schema: SchemaRef, input: &Arc<dyn ExecutionPlan>) -> PlanProperties {
-        let mut eq = EquivalenceProperties::new(Arc::clone(&schema));
-        if let Ok(ordinal) = col(ORDINAL_COLUMN, schema.as_ref()) {
-            let sort_opts = arrow::compute::SortOptions {
-                descending: false,
-                nulls_first: false,
-            };
-            if let Some(ordering) = LexOrdering::new([PhysicalSortExpr::new(ordinal, sort_opts)]) {
-                eq.add_ordering(ordering);
-            }
-        }
-        PlanProperties::new(
-            eq,
-            Partitioning::UnknownPartitioning(input.output_partitioning().partition_count()),
-            datafusion::physical_plan::execution_plan::EmissionType::Incremental,
-            datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-        )
     }
 }
 
@@ -306,8 +209,12 @@ impl DisplayAs for InferenceExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "InferenceExec: model={}, task={:?}, columns={:?}",
-            self.source, self.task, self.content_columns
+            "InferenceExec: model={}, task={:?}, columns={:?}, batch_size={}, partitions={}",
+            self.spec.source,
+            self.spec.task,
+            self.spec.content_columns,
+            self.spec.batch_size,
+            self.spec.partitions
         )
     }
 }
@@ -325,32 +232,35 @@ impl ExecutionPlan for InferenceExec {
         vec![&self.input]
     }
 
-    /// `UnspecifiedDistribution` (never `SinglePartition`) — this node
-    /// does not require its child to be coalesced; `OrdinalSplitExec`'s own
-    /// `SinglePartition` requirement (or a multi-partition scan directly
-    /// below, on the `n == 1` no-split shape) is what `EnforceDistribution`
-    /// actually satisfies.
+    /// A fan-out of one reads one partition. A wider one reads partitions
+    /// hashed on the chunk id, so an optimizer that strips the exchange
+    /// re-adds it from this requirement rather than serialising the node.
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::UnspecifiedDistribution]
+        vec![if self.spec.partitions.get() == 1 {
+            Distribution::SinglePartition
+        } else {
+            Distribution::HashPartitioned(vec![Arc::clone(&self.chunk_id)])
+        }]
     }
 
-    /// `false`, not the DataFusion default (`true` for a node whose
-    /// `required_input_distribution` is `Unspecified`). The default would let
-    /// `EnforceDistribution` insert a round-robin `RepartitionExec` between
-    /// `OrdinalSplitExec` and this node whenever it judges that repartitioning
-    /// "benefits" — defeating the point of the split. Without this override
-    /// (`vec![true]`), 60 of the 120-cell grid's cells fail
-    /// (`tests/it/rangesplit.rs`'s
-    /// `nothing_between_split_and_inference_across_the_grid`); the exact count shifts with which
-    /// optimizer passes fire.
+    /// `true` exactly when the node fans out. `EnforceDistribution` adds a
+    /// hash exchange over a single-partition child only for a node that
+    /// benefits from partitioning; without this the numbered input's one
+    /// partition would satisfy the hash requirement as it stands.
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false]
+        vec![self.spec.partitions.get() > 1]
     }
 
-    /// Each partition forwards its input rows in arrival order and
-    /// stamps `_ordinal` (or reads the split's own) without ever reordering
-    /// them — the per-partition ordering this node's own `[_ordinal ASC]`
-    /// equivalence claims is genuinely maintained, never merely declared.
+    /// Chunks are gathered from consecutive rows, so each partition must
+    /// arrive in `_ordinal` order.
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
+        vec![ordinal_ordering(self.input.schema().as_ref())
+            .ok()
+            .map(OrderingRequirements::from)]
+    }
+
+    /// Each partition emits its chunks in the order it read them, which is
+    /// what makes the `[_ordinal ASC]` output ordering true.
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true]
     }
@@ -358,125 +268,140 @@ impl ExecutionPlan for InferenceExec {
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(
-            InferenceExecBuilder::new(
-                Arc::clone(&children[0]),
-                self.source.clone(),
-                self.task,
-                self.content_columns.clone(),
-                self.key_column.clone(),
-                self.source_id.clone(),
-                Arc::clone(&self.model_cache),
-                self.device_kind,
-            )
-            .batch_size(self.batch_size)
-            .backend(self.backend)
-            .observer(self.observer.clone())
-            .embedding_dim(self.embedding_dim)
-            .regression_form(self.regression_form.clone())
-            .passthrough(self.passthrough.clone())
-            .build()
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
-        ))
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self::bind(
+            Arc::clone(&children[0]),
+            self.spec.clone(),
+            self.runtime.clone(),
+        )?))
     }
 
     fn execute(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
-    ) -> datafusion::error::Result<SendableRecordBatchStream> {
+    ) -> DfResult<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
         let output_schema = self.schema();
 
-        // Bounded channel for backpressure (capacity = 2 batches)
-        let mut builder = RecordBatchReceiverStreamBuilder::new(output_schema.clone(), 2);
+        // A bounded channel (two batches) is the backpressure on the model.
+        let mut builder = RecordBatchReceiverStreamBuilder::new(Arc::clone(&output_schema), 2);
         let tx = builder.tx();
-
-        // Build the runner with everything it needs
-        let runner = InferenceRunner::new(
-            Arc::clone(&self.model_cache),
-            self.source.clone(),
-            self.task,
-            self.content_columns.clone(),
-            self.key_column.clone(),
-            self.source_id.clone(),
-            self.backend,
-            self.batch_size,
-            self.observer.clone(),
-        )
-        .with_passthrough(self.passthrough.clone())
-        .with_forward_permits(Arc::clone(&self.forward_permits));
-
+        let runner = InferenceRunner::new(self.spec.clone(), self.runtime.clone())
+            .with_forward_permits(Arc::clone(&self.forward_permits));
         builder.spawn(async move { runner.run(input_stream, tx, output_schema).await });
-
         Ok(builder.build())
     }
 }
 
-/// Wire `InferenceConfig::partitions` into one of this
-/// crate's four `InferenceExec`-building call sites: `partitions <= 1`
-/// coalesces `input` to a single partition when it is not already one
-/// (`build_inference` always sees exactly ONE partition — see the
-/// implementation below for why this coalesce is load-bearing, not
-/// cosmetic) and builds `build_inference` on it with no split and no
-/// merge. `partitions > 1` inserts
-/// [`OrdinalSplitExec`](crate::operator::ordinal_split_exec::OrdinalSplitExec)
-/// below `input` (which coalesces a multi-partition `input` itself, the
-/// same way) and wraps the built `InferenceExec` in a
-/// `SortPreservingMergeExec([_ordinal ASC])` (the merge key — see that
-/// module's doc for why `_ordinal` alone, never `[_row_id, _ordinal]`).
-///
-/// `session::annotate_plan`, `session::infer_materialize` (`infer`'s actual
-/// materializer), `pipeline::embedding::build_embedding_plan`, and
-/// `pipeline::embedding_refresh::infer_delta` all call this rather than
-/// each repeating the wrap/merge logic — the "four roots" invariant holds
-/// because all four share this one function, and is checked live by
-/// `tests/it/rangesplit.rs`'s `split_merge_source_oracle` (a `syn`-based scan of
-/// every `InferenceExecBuilder::new` call site in this crate).
-pub fn wrap_with_split_and_merge(
-    input: Arc<dyn ExecutionPlan>,
-    partitions: usize,
-    build_inference: impl FnOnce(Arc<dyn ExecutionPlan>) -> jammi_db::error::Result<InferenceExec>,
-) -> jammi_db::error::Result<Arc<dyn ExecutionPlan>> {
-    if partitions <= 1 {
-        // `InferenceExec::compute_properties` (below) propagates the
-        // CHILD's own partition count rather than a hardcoded 1, so an
-        // uncoalesced multi-partition `input` here would make it declare
-        // more than one partition while every one of those partitions'
-        // `InferenceRunner`s independently self-generates `_ordinal`
-        // starting at 0 (no split providing a shared global sequence), and
-        // a caller that always calls `.execute(0, ..)` (every one in this
-        // crate) would see only a fraction of the rows. Coalesce
-        // defensively, exactly as `OrdinalSplitExec::new` does at
-        // `partitions > 1` for the identical reason.
-        let input: Arc<dyn ExecutionPlan> = if input.output_partitioning().partition_count() > 1 {
-            Arc::new(
-                datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(input),
-            )
-        } else {
-            input
-        };
-        return Ok(Arc::new(build_inference(input)?));
+/// `numbered` hashed on the chunk id `spec.partitions` ways: a stock
+/// exchange, left out where it would be the identity.
+fn exchanged(
+    numbered: Arc<dyn ExecutionPlan>,
+    spec: &InferenceSpec,
+) -> DfResult<Arc<dyn ExecutionPlan>> {
+    let partitions = spec.partitions.get();
+    if partitions == 1 {
+        return Ok(numbered);
     }
-    let split = Arc::new(
-        crate::operator::ordinal_split_exec::OrdinalSplitExec::new(input, partitions).map_err(
-            |e| jammi_db::error::JammiError::Inference(format!("OrdinalSplitExec: {e}")),
-        )?,
-    );
-    let inference: Arc<dyn ExecutionPlan> = Arc::new(build_inference(split)?);
-    let schema = inference.schema();
-    let sort_opts = arrow::compute::SortOptions {
-        descending: false,
-        nulls_first: false,
-    };
-    let ordinal_expr = col(ORDINAL_COLUMN, schema.as_ref())
-        .map_err(|e| jammi_db::error::JammiError::Inference(format!("merge ordering: {e}")))?;
-    let ordering = LexOrdering::new([PhysicalSortExpr::new(ordinal_expr, sort_opts)])
-        .ok_or_else(|| jammi_db::error::JammiError::Inference("merge ordering: empty".into()))?;
-    Ok(Arc::new(
-        datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec::new(
-            ordering, inference,
-        ),
-    ))
+    let chunk_id = chunk_expr(numbered.schema().as_ref(), spec.batch_size)?;
+    Ok(Arc::new(RepartitionExec::try_new(
+        numbered,
+        Partitioning::Hash(vec![chunk_id], partitions),
+    )?))
+}
+
+/// `inference`'s partitions merged back into the one `_ordinal` sequence: a
+/// stock merge, left out where it would be the identity.
+fn merged(inference: Arc<dyn ExecutionPlan>) -> DfResult<Arc<dyn ExecutionPlan>> {
+    if inference.output_partitioning().partition_count() == 1 {
+        return Ok(inference);
+    }
+    let ordering = ordinal_ordering(inference.schema().as_ref())?;
+    Ok(Arc::new(SortPreservingMergeExec::new(ordering, inference)))
+}
+
+/// The plan that runs `spec` over `input`: the one shape in the module doc,
+/// which every caller that runs a model builds through here.
+///
+/// `order` is how the rows are ordered before they are numbered; a keyed
+/// order must name the column the rows are identified by.
+pub fn plan_inference(
+    input: Arc<dyn ExecutionPlan>,
+    order: RowOrder,
+    spec: InferenceSpec,
+    runtime: InferenceRuntime,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if let RowOrder::Keyed { key_column } = &order {
+        if key_column != &spec.key_column {
+            return Err(DataFusionError::Plan(format!(
+                "plan_inference: the input is ordered by '{key_column}' but its rows are \
+                 identified by '{}'",
+                spec.key_column
+            ))
+            .into());
+        }
+    }
+    let numbered: Arc<dyn ExecutionPlan> =
+        Arc::new(NumberedInputExec::try_new(single_partition(input), order)?);
+    let inference = InferenceExec::bind(exchanged(numbered, &spec)?, spec, runtime)?;
+    Ok(merged(Arc::new(inference))?)
+}
+
+/// Restores the fan-out an optimized plan lost: every `InferenceExec` whose
+/// input does not have the node's own `partitions` is put back over an
+/// exchange of that width. See the module doc for why a declaration alone
+/// cannot carry the count.
+///
+/// Registered after DataFusion's own rules. A node the optimizer left serial
+/// gains the exchange below and the merge above, so it still presents one
+/// `_ordinal`-ordered partition; one it fanned out at another width has the
+/// exchange re-sized in place.
+#[derive(Debug, Default)]
+pub struct InferenceFanOut;
+
+impl InferenceFanOut {
+    fn restore(node: Arc<dyn ExecutionPlan>) -> DfResult<Transformed<Arc<dyn ExecutionPlan>>> {
+        let Some(exec) = node.downcast_ref::<InferenceExec>() else {
+            return Ok(Transformed::no(node));
+        };
+        let input = exec.input();
+        let width = input.output_partitioning().partition_count();
+        if width == exec.spec.partitions.get() {
+            return Ok(Transformed::no(node));
+        }
+        let (numbered, presents_one) = match input.downcast_ref::<RepartitionExec>() {
+            Some(exchange) => (Arc::clone(exchange.input()), false),
+            None if width == 1 => (Arc::clone(input), true),
+            None => return Ok(Transformed::no(node)),
+        };
+        let inference: Arc<dyn ExecutionPlan> = Arc::new(InferenceExec::bind(
+            exchanged(numbered, &exec.spec)?,
+            exec.spec.clone(),
+            exec.runtime.clone(),
+        )?);
+        Ok(Transformed::yes(if presents_one {
+            merged(inference)?
+        } else {
+            inference
+        }))
+    }
+}
+
+impl PhysicalOptimizerRule for InferenceFanOut {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        plan.transform_up(Self::restore).data()
+    }
+
+    fn name(&self) -> &str {
+        "InferenceFanOut"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
 }

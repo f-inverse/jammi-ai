@@ -69,7 +69,7 @@ The sidecar files are disposable — deleting them falls back to brute-force exa
 | `vector` | FixedSizeList(Float32, N) | L2-normalized embedding vector |
 | `_content_hash` | Utf8 (nullable) | Hex SHA-256 over the embedded source columns, in `columns` order, rendered exactly as the model read them (`jammi.content_hash.v1`); `NULL` on a table no embedding pipeline produced (an import, a context set, a propagation) |
 
-Failed rows (null or empty text) are excluded — only successfully embedded rows appear in the output. Rows are written in key order: `CAST(key AS Utf8)` ascending, ties broken by `_content_hash`, so the table's bytes are identical across `engine.execution_threads`.
+Failed rows (null or empty text) are excluded — only successfully embedded rows appear in the output. Rows are written in key order: `CAST(key AS Utf8)` ascending, ties broken by `_content_hash`, and row `i` of that order is forwarded in chunk `i / inference.batch_size`, so the table's bytes are identical across `engine.execution_threads`, across `inference.partitions`, and between an in-process run and the same plan run on a cluster.
 
 A `NULL` in the **key** column is not a per-row failure: the whole call is refused with the typed `InvalidKey { column, null_count }` before the model runs (the null count is exact; zero rows are embedded and nothing is written). Every row needs a key.
 
@@ -313,13 +313,17 @@ served as an all-`"error"` relation or an empty "ready" embedding table.
 
 ## Dynamic batch sizing
 
-The runner starts with the configured `inference.batch_size` (default: 32). If an out-of-memory error occurs:
+Each forward takes one chunk of `inference.batch_size` rows (default: 32). If an out-of-memory error occurs:
 
-1. Halve the batch size
-2. Retry (up to 3 times)
-3. If OOM persists at batch size 1, the call fails with an error
+1. Halve the forward size
+2. Retry the same rows
+3. If OOM persists at a forward size of 1, the call fails with an error
 
-The reduced batch size is sticky for the remainder of the stream.
+The reduced size is sticky for the remainder of the stream.
+
+## Parallel and distributed inference
+
+`inference.partitions = N` runs the model over `N` partitions of one plan. The input is ordered and numbered once, the chunks are spread over the partitions by a hash exchange on the chunk number, and a merge restores the row order — all stock DataFusion operators, so the same plan runs as `N` threads of one process or, submitted to a Ballista cluster, as `N` tasks across its executors. Output is byte-identical at every `N`.
 
 ## Crash recovery
 

@@ -47,8 +47,9 @@ use jammi_db::store::version::{
 use jammi_db::store::{BuildingVersion, ResultStore};
 use jammi_db::tenant_scope::TenantBinding;
 
-use crate::operator::inference_exec::InferenceExecBuilder;
-use crate::operator::ordered_input::{key_checked, ordered_input};
+use crate::operator::inference_exec::{plan_inference, InferenceSpec};
+use crate::operator::key_check_exec::key_checked;
+use crate::operator::numbered_input_exec::RowOrder;
 use crate::pipeline::embedding::{embedding_definition, EmbeddingDefinition};
 use crate::pipeline::result_sink::ResultSink;
 use crate::session::InferenceSession;
@@ -933,42 +934,28 @@ impl InferenceSession {
             // rejects true for any join type other than LeftAnti.
             false,
         )?);
-        let input = ordered_input(join, &params.key_column)?;
-        // See `wrap_with_split_and_merge`'s doc. At the
-        // default `InferenceConfig::partitions == 1` it coalesces `input` to
-        // one partition if it is not already one — a no-op here, since
-        // `ordered_input` just above already produced exactly one.
-        let partitions = self.inner_config().inference.partitions;
-        let batch_size = self.inner_config().inference.batch_size;
-        let observer = self.observer().clone();
-        let model_cache = Arc::clone(self.model_cache());
-        let device_kind = self.compute_device().kind();
-        let model_source = definition.model_source.clone();
-        let task = params.task;
-        let columns = params.columns.clone();
-        let key_column = params.key_column.clone();
-        let source_id = params.source_id.clone();
-        let embedding_dim = definition.embedding_dim;
-        let inference_exec = crate::operator::inference_exec::wrap_with_split_and_merge(
-            input,
-            partitions,
-            move |input| {
-                InferenceExecBuilder::new(
-                    input,
-                    model_source,
-                    task,
-                    columns,
-                    key_column,
-                    source_id,
-                    model_cache,
-                    device_kind,
-                )
-                .batch_size(batch_size)
-                .observer(observer)
-                .embedding_dim(Some(embedding_dim))
-                .passthrough(vec![CONTENT_HASH_COLUMN.to_string()])
-                .build()
+        let inference = &self.inner_config().inference;
+        let spec = InferenceSpec {
+            source: definition.model_source.clone(),
+            task: params.task,
+            content_columns: params.columns.clone(),
+            key_column: params.key_column.clone(),
+            source_id: params.source_id.clone(),
+            backend: None,
+            batch_size: inference.forward_batch_size()?,
+            embedding_dim: Some(definition.embedding_dim),
+            regression_form: None,
+            passthrough: vec![CONTENT_HASH_COLUMN.to_string()],
+            device_kind: self.compute_device().kind(),
+            partitions: inference.fan_out()?,
+        };
+        let inference_exec = plan_inference(
+            join,
+            RowOrder::Keyed {
+                key_column: params.key_column.clone(),
             },
+            spec,
+            self.inference_runtime(),
         )?;
 
         let fragment_url = version.fragment_url()?;

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -969,27 +970,18 @@ impl GpuConfig {
 pub struct InferenceConfig {
     /// Backend selection strategy. Default: `Auto`.
     pub default_backend: BackendSelection,
-    /// Maximum requests per inference batch. Default: 32.
+    /// Rows per model forward. Row `i` of an ordered input is forwarded in
+    /// chunk `i / batch_size`, whatever the fan-out. Default: 32.
     pub batch_size: usize,
     /// Seconds to wait before flushing an incomplete batch. Default: 300.
     pub batch_timeout_secs: u64,
     /// Maximum number of models held in memory simultaneously. 0 means unlimited. Default: 0.
     pub max_loaded_models: usize,
-    /// The number of `OrdinalSplitExec` fan-out partitions `InferenceExec` runs
-    /// concurrently below its merge. At `1` (the default)
-    /// no `OrdinalSplitExec`/`SortPreservingMergeExec` node is inserted at
-    /// all; `InferenceExec`'s single caller-supplied input is coalesced to
-    /// one partition first if it is not already one (needed on at least one
-    /// call site — `InferenceSession::annotate_plan` — whose input may
-    /// already have more than one partition with nothing coalescing it), so
-    /// this is a genuine no-op ONLY when the input was already a single
-    /// partition. A value `> 1` inserts the split (see `jammi_ai::operator::
-    /// ordinal_split_exec` for the mechanism). This node is NOT distributable
-    /// in v1: it has no wire form at all (`jammi_ballista::codec`'s module
-    /// doc states why — a Ballista `SortPreservingMergeExec` is a stage
-    /// boundary, so this node's in-process shared-mutex mechanism has no
-    /// meaning across the resulting per-task process split), so a value
-    /// `> 1` is an in-process-only capability. Default: 1.
+    /// The inference fan-out: how many partitions of one plan forward chunks
+    /// concurrently — threads of one process, or tasks of a cluster when the
+    /// plan is submitted to one. Written bytes are identical at every value:
+    /// the rows a model forwards together are decided by `batch_size` alone.
+    /// Default: 1.
     pub partitions: usize,
     /// HTTP backend configuration (for remote inference endpoints).
     pub http: HttpConfig,
@@ -2754,50 +2746,60 @@ impl Default for InferenceConfig {
 }
 
 impl InferenceConfig {
-    /// `partitions` above this is refused — not a compute limit (the model
-    /// forward itself is bounded elsewhere, by the per-instance
-    /// semaphore), but a RESIDENCY one: `partitions` is the count of
-    /// resident copies one query holds open at once — one `InferenceRunner`
-    /// and one upstream-adjacent stream slot PER partition (a STRUCTURAL
-    /// bound — `OrdinalSplitExec`'s own module doc — never an instrumented
-    /// one; there is no per-partition in-flight-batch buffer to count) — so
-    /// an unbounded value is an unbounded number of resident
-    /// runners/streams, never a compute cost that merely runs slower.
-    /// `1024` is generous relative to any real deployment's device or core
-    /// count while still refusing an obviously-mistyped value (a raw row
-    /// count, a byte size) before it ever reaches `OrdinalSplitExec`.
+    /// `partitions` above this is refused — not a compute limit (forwards
+    /// are admitted elsewhere), but a RESIDENCY one: each partition holds a
+    /// runner, an exchange channel and a chunk being gathered, so an unbounded
+    /// value is an unbounded number of resident runners per query. `1024` is
+    /// generous relative to any real deployment's device or core count while
+    /// still refusing an obviously-mistyped value (a raw row count, a byte
+    /// size).
     pub const MAX_PARTITIONS: usize = 1024;
 
-    /// Reject `partitions == 0` (silently flooring it to `1` at
-    /// `OrdinalSplitExec`/`wrap_with_split_and_merge` would let a config
-    /// author's `0` mean something other than what they wrote) and
-    /// `partitions > MAX_PARTITIONS` (see that constant's doc for the
-    /// growing term it bounds), naming the offending value either way.
-    ///
-    /// Called by [`JammiConfig::load_from`]. A `JammiConfig` built by
-    /// struct literal (or by `parse_from` alone) and handed straight to an
-    /// `InferenceSession` constructor — the way every test in
-    /// `crates/jammi-ai` builds one — never runs `load_from`, so it would
-    /// never run this check either; the second call site is
-    /// `jammi_ai::session::InferenceSession::wrap_with`, the same
-    /// universal constructor funnel that already covers
-    /// [`crate::catalog::instance::MembershipConfig::validate`] for the
-    /// identical "struct-literal config skips `load_from`" reason.
-    pub fn validate(&self) -> Result<()> {
-        if self.partitions == 0 {
-            return Err(JammiError::Config(
+    /// `batch_size` as the non-zero chunk size a plan is built with. `0` is
+    /// refused by name: it is the divisor of the chunk id.
+    pub fn forward_batch_size(&self) -> Result<NonZeroUsize> {
+        NonZeroUsize::new(self.batch_size).ok_or_else(|| {
+            JammiError::Config(
+                "[inference] batch_size must be >= 1 (0 is refused, never silently treated as 1)"
+                    .into(),
+            )
+        })
+    }
+
+    /// `partitions` as the non-zero fan-out a plan is built with. `0` is
+    /// refused by name — a config author who wrote `0` meant something, and
+    /// silently getting `1` back is not it — and so is a value above
+    /// [`Self::MAX_PARTITIONS`].
+    pub fn fan_out(&self) -> Result<NonZeroUsize> {
+        let partitions = NonZeroUsize::new(self.partitions).ok_or_else(|| {
+            JammiError::Config(
                 "[inference] partitions must be >= 1 (0 is refused, never silently treated as 1)"
                     .into(),
-            ));
-        }
-        if self.partitions > Self::MAX_PARTITIONS {
+            )
+        })?;
+        if partitions.get() > Self::MAX_PARTITIONS {
             return Err(JammiError::Config(format!(
                 "[inference] partitions = {} exceeds the maximum {} — partitions is a count of \
-                 RESIDENT runners/streams/batches held open by one query, not a compute knob",
+                 RESIDENT runners held open by one query, not a compute knob",
                 self.partitions,
                 Self::MAX_PARTITIONS
             )));
         }
+        Ok(partitions)
+    }
+
+    /// Refuse a `batch_size` or `partitions` no plan can be built with.
+    ///
+    /// Called by [`JammiConfig::load_from`]. A `JammiConfig` built by
+    /// struct literal (or by `parse_from` alone) and handed straight to an
+    /// `InferenceSession` constructor never runs `load_from`, so the second
+    /// call site is `jammi_ai::session::InferenceSession::wrap_with`, the
+    /// universal constructor funnel that also covers
+    /// [`crate::catalog::instance::MembershipConfig::validate`] for the
+    /// identical reason.
+    pub fn validate(&self) -> Result<()> {
+        self.forward_batch_size()?;
+        self.fan_out()?;
         Ok(())
     }
 }
@@ -3092,19 +3094,10 @@ impl JammiConfig {
         // `load_from` entirely is still covered there. The `Option` is
         // discarded; this call is for its early-failure side effect only.
         let _ = crate::catalog::instance::MembershipConfig::validate(&config)?;
-        // Reject `[inference] partitions = 0` at load time, naming the key —
-        // `OrdinalSplitExec`/`wrap_with_split_and_merge` floor it to 1
-        // defensively, but a config author who wrote `0` meant something
-        // and silently getting `1` back is a confident-wrong-number, not a
-        // degrade. Also caps it: the growing term this knob multiplies is
-        // resident copies — N `InferenceRunner`s, N open upstream-adjacent
-        // streams per query (a structural bound over `OrdinalSplitExec`'s
-        // own field list, never an instrumented one — see
-        // `InferenceConfig::MAX_PARTITIONS`'s own doc) — never compute
-        // alone, so an unbounded `partitions` is an unbounded number of
-        // resident runners/streams per query. The second call site (a
-        // struct-literal `JammiConfig` that skips this function entirely)
-        // is named on `InferenceConfig::validate`'s own doc.
+        // Refuse an `[inference]` fan-out or batch size no plan can be built
+        // with, at load time and by name. The second call site (a
+        // struct-literal `JammiConfig` that skips this function entirely) is
+        // named on `InferenceConfig::validate`'s own doc.
         config.inference.validate()?;
         Ok(config)
     }

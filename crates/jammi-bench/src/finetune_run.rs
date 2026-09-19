@@ -1,8 +1,6 @@
 //! The finetune-run tier: one full fine-tune (seed, arm) run driving the REAL
 //! `jammi_ai::fine_tune::trainer::TrainingLoopBuilder` and the public
-//! per-example held-out seam (`TrainingLoop::evaluate_held_out`, unit 63 H1),
-//! feeding CONTRACT H4/PLAN (d)'s finetune-run tier (unit 63, C16's phase-2
-//! lift).
+//! per-example held-out seam (`TrainingLoop::evaluate_held_out`).
 //!
 //! ## Why this tier is a "heavier" build than [`crate::finetune_step`]
 //!
@@ -16,14 +14,12 @@
 //! (if CPU-hermetic, file-backed) `Catalog` + `ArtifactStore` and claim a real
 //! training-job row, exactly as `fine_tune::worker::run_fine_tune_blocking`
 //! does for a production job. That plumbing — not the training math — is
-//! what the plan's closing budget note prices as "a heavier tier build".
+//! what makes this "a heavier tier build".
 //!
 //! ## The full per-epoch trajectory: resume-cycling, not a callback
 //!
-//! `TrainingLoop::run()` has no per-epoch callback — CONTRACT H4 is explicit
-//! that `TrainingLoopBuilder`'s surface is the "real construction surface"
-//! this tier must drive, and this crate does not own `jammi-ai` (ai-core
-//! domain), so adding a hook there is out of scope. The ONLY way to observe
+//! `TrainingLoop::run()` has no per-epoch callback, and this tier drives
+//! `TrainingLoopBuilder`'s real construction surface only. The ONLY way to observe
 //! `evaluate_held_out()` at an EPOCH BOUNDARY through the public surface
 //! alone is the same mechanism a crash-and-resume across a process boundary
 //! already uses: `run()` with `config.epochs = k+1` against a loop RESTORED
@@ -47,8 +43,8 @@
 //! [`FinetuneRunParams::eval_cadence`] controls how often `evaluate_held_out`
 //! is called against the held-out fixture as this cycle advances (every
 //! `eval_cadence` epochs, and unconditionally on the LAST epoch so the
-//! FINAL-EPOCH endpoint is always present — CONTRACT H4/Frame: `d_i` = the
-//! FINAL epoch's `evaluate_held_out().mean`, never
+//! FINAL-EPOCH endpoint is always present: the paired statistic's `d_i` is
+//! the FINAL epoch's `evaluate_held_out().mean`, never
 //! `TrainingResult::final_loss`, which is `best_val_loss`, a min-over-epochs
 //! order statistic).
 //!
@@ -67,25 +63,24 @@
 //! CALLER told this run to be (`--arm`), and
 //! [`FinetuneRunTier::attention_arm`]/`kernels_disabled_requested` record
 //! what the PROCESS actually resolved — both are PROVENANCE fields, never
-//! identity: the C16/H2 sign test is a PAIRED comparison ACROSS arms (`d_i =
+//! identity: the paired sign test is a comparison ACROSS arms (`d_i =
 //! fused - alloff`, same seed), so a merger that treated the arm as identity
-//! could never pair the two legs it exists to compare (CONTRACT H4: "the arm
-//! is provenance, never identity").
+//! could never pair the two legs it exists to compare.
 //!
 //! ## Held-out split is disjoint from the internal train/val split
 //!
 //! `TrainingDataLoader::split` (inside `TrainingLoop::run`) carves an early-
 //! stopping validation slice OUT OF the rows this tier passes as its TRAIN
-//! loader. The C16/H2 held-out fixture is a SEPARATE, disjoint loader that
+//! loader. The held-out fixture is a SEPARATE, disjoint loader that
 //! never enters `run()` at all — it is fed ONLY to `evaluate_held_out`,
-//! directly. This is the DISJOINT convention `EncodeStepTier` established
-//! (E3's precedent, see that struct's own `PROVENANCE_FIELDS` doc) rather
+//! directly. This is the DISJOINT convention `EncodeStepTier` also follows
+//! (see that struct's own `PROVENANCE_FIELDS` doc) rather
 //! than a superset: a row can be a member of the training set's internal val
-//! split AND the C16 held-out set only by construction error, and disjointness
+//! split AND the held-out set only by construction error, and disjointness
 //! is enforced by the CALLER supplying two non-overlapping row sets (this
 //! module does not itself check the two lists for overlap — the committed
 //! fixture's own `train_ids_sha256.json` vs `heldout_ids.txt` partition is
-//! the source of that guarantee, docs-ci/cookbook domain).
+//! the source of that guarantee).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -136,8 +131,7 @@ pub enum Arm {
     /// The fused cascade — no kernels forced eager.
     Fused,
     /// `JAMMI_KERNELS_DISABLE=attention_block_flash,adamw_step_fused` — both
-    /// levers ALLOFF at once (CONTRACT Frame; v2 delta 10 pre-registers a
-    /// flash-only / adamw-only TRIAGE arm for a RED result, not built here).
+    /// levers ALLOFF at once. There is no flash-only / adamw-only arm.
     Alloff,
 }
 
@@ -174,10 +168,10 @@ fn sendify<E: std::fmt::Display>(e: E) -> Box<dyn std::error::Error + Send + Syn
 }
 
 /// The op keys the `alloff` arm expects `JAMMI_KERNELS_DISABLE` to name —
-/// CONTRACT Frame's `ALLOFF=attention_block_flash,adamw_step_fused` verbatim.
+/// `ALLOFF=attention_block_flash,adamw_step_fused` verbatim.
 pub const ALLOFF_KEYS: [&str; 2] = ["attention_block_flash", "adamw_step_fused"];
 
-/// `--lora-init`'s CLI spelling → [`LoraInitMode`] (issue #421 P1-b(ii)).
+/// `--lora-init`'s CLI spelling → [`LoraInitMode`].
 ///
 /// The two tokens are `jammi_lora::LoraInitMode`'s own variants in
 /// snake_case, matching the spelling `grad_oracle.rs`'s tier already
@@ -205,18 +199,14 @@ pub fn lora_init_as_str(mode: LoraInitMode) -> &'static str {
     }
 }
 
-/// Which embedding objective this run trains — CONTRACT H4's 2026-08-28
-/// amendment ("objective selection under the triplet-shaped fixture"): H4a
-/// found the committed H3 fixture TRIPLET-shaped
-/// (`anchor_id\tpositive_id\tnegative_id`), while the Frame's own
-/// "embedding_loss+temp" phrasing anticipated MNRL. Both families train over
-/// the SAME committed fixture — `Triplet` natively (all three columns),
+/// Which embedding objective this run trains. The committed held-out fixture
+/// is TRIPLET-shaped (`anchor_id\tpositive_id\tnegative_id`); both families
+/// train over the SAME committed fixture — `Triplet` natively (all three columns),
 /// `Mnrl` via the (anchor, positive) PROJECTION of the identical rows in the
 /// identical committed order (see [`project_to_pairs`]): dropping the mined
 /// negative column and letting the rest of each batch supply in-batch
-/// negatives instead. H5 step 0's dynamic-range probe runs BOTH (one seed
-/// each) and pre-registers which one v1 keeps; this tier does not itself
-/// choose — the CALLER selects via `--objective`.
+/// negatives instead. This tier does not itself choose — the CALLER selects
+/// via `--objective`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Objective {
     /// `EmbeddingLoss::Triplet { margin }` — explicit mined negative per row.
@@ -250,9 +240,9 @@ impl std::str::FromStr for Objective {
 
 /// Project committed [`IdTriplet`] rows to the MNRL (anchor, positive) shape
 /// — the SAME rows, in the SAME committed order, with the mined negative
-/// column DROPPED (CONTRACT amendment: "the fixture's (anchor, positive)
-/// projection serves MNRL losslessly; in-batch negatives replace the mined
-/// negative"). A pure function (no id, no shuffling) so both the train split
+/// column DROPPED: the (anchor, positive) projection serves MNRL losslessly,
+/// with in-batch negatives replacing the mined negative. A pure function (no
+/// id, no shuffling) so both the train split
 /// and the held-out fixture project identically — [`run`] calls this for
 /// both when [`Objective::Mnrl`] is selected.
 fn project_to_pairs(pairs: &[IdTriplet]) -> Vec<(String, String)> {
@@ -265,13 +255,13 @@ fn project_to_pairs(pairs: &[IdTriplet]) -> Vec<(String, String)> {
 /// One (anchor, positive, negative) text triplet, keyed by a stable id — the
 /// shape both the train split and the held-out fixture are supplied in,
 /// regardless of which [`Objective`] this run trains. The committed held-out
-/// fixture (`cookbook/fixtures/finetune_heldout`, CONTRACT H3) mines an
+/// fixture (`cookbook/fixtures/finetune_heldout`) mines an
 /// EXPLICIT negative per row (`heldout_ids.txt`'s
 /// `anchor_id\tpositive_id\tnegative_id` shape); [`Objective::Triplet`]
 /// consumes all three columns natively, [`Objective::Mnrl`] consumes only
 /// the (anchor, positive) projection ([`project_to_pairs`]) — see
-/// [`crate::report::FinetuneRunTier::margin`]'s doc for the CONTRACT-vs-
-/// fixture naming note.
+/// [`crate::report::FinetuneRunTier::margin`]'s doc for the field-naming
+/// note.
 #[derive(Debug, Clone)]
 pub struct IdTriplet {
     pub id: String,
@@ -340,7 +330,7 @@ pub fn media_corpus_sha256(rows: &[MediaTriplet]) -> String {
     hex::encode(hasher.finalize())
 }
 
-// P-B1 oracle hook: a per-thread sleep [`RowSet::loader`] applies to itself
+// Oracle hook: a per-thread sleep [`RowSet::loader`] applies to itself
 // when nonzero, test-only (`#[cfg(test)]`, so this does not exist in a
 // release build). Module-scoped (not inside `mod tests`) so `RowSet::loader`
 // itself — OUTSIDE that module — can read it; `mod tests`' own
@@ -403,8 +393,7 @@ impl<'a> RowSet<'a> {
     ///
     /// Text rows are unaffected (`Ok`): the text corpora this tier consumes
     /// are committed fixtures whose partition is anchored by
-    /// `heldout_ids_sha256`, and adding a new refusal on that path would
-    /// change existing legs' behaviour, which this unit does not do.
+    /// `heldout_ids_sha256`, so this refusal applies to media rows only.
     fn validate_media_members_are_distinct(&self, label: &str) -> Result<(), String> {
         let RowSet::Media(rows) = self else {
             return Ok(());
@@ -450,7 +439,7 @@ impl<'a> RowSet<'a> {
     /// objectives are not interchangeable and a leg mislabelled that way
     /// would be unpairable with every other MNRL leg.
     ///
-    /// Test-only (P-B1 oracle): sleeps
+    /// Test-only: sleeps
     /// `LOADER_BUILD_SLEEP_MS_FOR_TEST` milliseconds first, when nonzero,
     /// so a test can make this call's own wall-clock cost large and
     /// deterministic and prove it is excluded from
@@ -509,16 +498,14 @@ pub struct FinetuneRunParams {
     pub arm: Arm,
     /// Which tower of `model_dir`'s checkpoint this run trains, and hence
     /// which of the two row vectors below carries this run's data (see
-    /// [`Task`]'s own doc). [`Task::Text`] is the default, so an
-    /// invocation written before this field existed selects exactly the
-    /// behaviour it always had.
+    /// [`Task`]'s own doc). [`Task::Text`] is the default.
     pub task: Task,
     /// Training rows for a TEXT task (disjoint from `heldout_pairs`; see
     /// this module's doc). Empty for a media task.
     pub train_pairs: Vec<IdTriplet>,
     /// The held-out fixture's rows for a TEXT task, in the fixture's
-    /// COMMITTED order — this order is scoring identity (CONTRACT H1: "the
-    /// batch partition IS identity"), never re-sorted or shuffled by this
+    /// COMMITTED order — this order is scoring identity (the batch partition
+    /// IS identity), never re-sorted or shuffled by this
     /// tier. Empty for a media task.
     pub heldout_pairs: Vec<IdTriplet>,
     /// Training rows for a MEDIA task — the decoded file BYTES of each
@@ -534,8 +521,7 @@ pub struct FinetuneRunParams {
     /// committed fixture manifest's own `dataset_sha256` (a Merkle over
     /// per-pair digests, built off-process); see
     /// [`crate::report::FinetuneRunTier::train_pairs_file_sha256`]'s own doc
-    /// for why this field carries a distinct name (unit-63 adversarial-audit
-    /// finding 5(b)).
+    /// for why this field carries a distinct name.
     pub train_pairs_file_sha256: String,
     /// sha256 (hex) of the held-out id list's committed content — likewise
     /// caller-supplied (the fixture manifest's own `heldout_ids_sha256`).
@@ -544,12 +530,11 @@ pub struct FinetuneRunParams {
     /// by `main.rs::load_heldout_fixture` off the file this run actually
     /// opened — the held-out TEXT is a total determinant of every per-
     /// example loss `d_i`, so (like `heldout_ids_sha256`) it must be
-    /// content-anchored, never merely trusted by filename (unit-63
-    /// adversarial-audit finding 5(a)).
+    /// content-anchored, never merely trusted by filename.
     pub heldout_pairs_sha256: String,
     pub seed: u64,
     /// Optimizer/schedule/objective knobs. `early_stopping_patience` MUST be
-    /// `10_000` (CONTRACT Frame's never-stops idiom) — [`run`] refuses a
+    /// `10_000` (the never-stops idiom) — [`run`] refuses a
     /// smaller value rather than silently letting an early-stopped run
     /// masquerade as a full-budget one.
     pub epochs: usize,
@@ -564,8 +549,8 @@ pub struct FinetuneRunParams {
     pub early_stopping_patience: usize,
     pub early_stopping_metric: EarlyStoppingMetric,
     pub max_grad_norm: f64,
-    /// Which embedding objective this run trains (CONTRACT H4 amendment;
-    /// see [`Objective`]'s own doc).
+    /// Which embedding objective this run trains (see [`Objective`]'s own
+    /// doc).
     pub objective: Objective,
     /// The Triplet objective's margin — used to build `EmbeddingLoss::Triplet`
     /// when `objective == Objective::Triplet`; ignored (but still a valid,
@@ -584,20 +569,17 @@ pub struct FinetuneRunParams {
     pub lora_alpha: f64,
     pub lora_dropout: f64,
     /// `--lora-init`: which LoRA initialization mode this run's adapters are
-    /// built under (issue #421 P1-b(ii)). Default
-    /// [`LoraInitMode::ZerosB`] — the value BOTH construction sites
-    /// hardcoded before this field existed
-    /// ([`build_encoder_adapters`]'s `LoraBuildConfig` and
-    /// [`base_config`]'s `FineTuneConfig::init_lora_weights`), so an
-    /// invocation written before this flag is byte-identical under the
-    /// default. Threaded into BOTH sites, never one: a run whose encoder
+    /// built under. Default [`LoraInitMode::ZerosB`]. Threaded into BOTH
+    /// construction sites ([`build_encoder_adapters`]'s `LoraBuildConfig`
+    /// and [`base_config`]'s `FineTuneConfig::init_lora_weights`), never
+    /// one: a run whose encoder
     /// adapters were built `Gaussian` while the trainer's own config still
     /// said `ZerosB` would carry a `FineTuneConfig` that DISAGREES with the
     /// weights it is training (the config is what a resume/adapter-save
     /// path re-reads), so splitting them would be a silent
     /// provenance-vs-reality fork, not a smaller change.
     ///
-    /// Why the flag exists: the #421 BF16 pre-flight (contract P2) needs a
+    /// Why the flag exists: a BF16 pre-flight needs a
     /// non-identity adapter at step 0 — under `ZerosB` every LoRA `A` has
     /// `dL/dA = 0` at the first step (`B = 0` kills the gradient path), so
     /// a "every LoRA Var has a non-zero gradient" bf16 check is VACUOUS in
@@ -606,14 +588,12 @@ pub struct FinetuneRunParams {
     /// [`crate::report::FinetuneRunTier::lora_init`]).
     pub lora_init: LoraInitMode,
     /// `--expect-kernels-disabled`: the op key set this invocation CLAIMS
-    /// `JAMMI_KERNELS_DISABLE` carries (issue #421 P1-b(i)), sorted and
+    /// `JAMMI_KERNELS_DISABLE` carries, sorted and
     /// deduplicated by
     /// [`jammi_kernels::admission::parse_disable_list`] — the SAME parser
-    /// the env var itself is read through, never a second one (that
-    /// module's own doc records a round-3 audit where a divergent
-    /// duplicate-preserving parser hard-failed a VALID leg). `None` is the
-    /// ordinary, unchecked case and the ONLY state an invocation written
-    /// before this flag existed can be in. The `fused` arm in particular
+    /// the env var itself is read through, never a second one (a divergent
+    /// duplicate-preserving parser would hard-fail a VALID leg). `None` is the
+    /// ordinary, unchecked case. The `fused` arm in particular
     /// makes no claim about `JAMMI_KERNELS_DISABLE` at all when this is
     /// `None` — an operator may legitimately run it with OTHER, unrelated
     /// op keys disabled; the two-sided witness that a DECISION leg's
@@ -629,13 +609,11 @@ pub struct FinetuneRunParams {
     ///    [`jammi_kernels::admission::disabled_ops_requested`] EXACTLY —
     ///    the SAME set EQUALITY
     ///    [`crate::finetune_step::FinetuneStepParams::expect_kernels_disabled`]
-    ///    uses. (Finding F1's fix: an earlier revision of this check was a
-    ///    SUBSET check, on the premise that `--arm alloff` could carry a
-    ///    "combined leg" naming a chain key on top of [`ALLOFF_KEYS`] — but
-    ///    the `--arm alloff` arm-level check below refuses anything but
-    ///    EXACT equality to `ALLOFF_KEYS`, so that combined leg can never
-    ///    exist, and the weaker subset check bought nothing while hiding
-    ///    an ambient extra key.) The failure mode the check exists for — a
+    ///    uses. (Not a SUBSET check: a "combined leg" naming a chain key on
+    ///    top of [`ALLOFF_KEYS`] can never exist, because the `--arm alloff`
+    ///    arm-level check refuses anything but EXACT equality to
+    ///    `ALLOFF_KEYS`, and a subset check would hide an ambient extra
+    ///    key.) The failure mode the check exists for — a
     ///    dropped, mistyped, unforwarded, or ambient-contaminated env var —
     ///    is caught either way: a dropped var makes the requested set
     ///    empty, a mistyped key is absent from it, and an ambient extra key
@@ -656,10 +634,9 @@ pub struct FinetuneRunParams {
     /// (`--layers-to-transform`; `jammi_lora::should_apply_lora`'s own doc:
     /// `Some(ids)` requires `layer_idx` to appear in it). `None` means no
     /// restriction — every layer matching `target_modules` gets a LoRA
-    /// adapter, the SAME behavior this tier had before this field existed
-    /// (both [`build_encoder_adapters`]'s `LoraBuildConfig`s and
-    /// [`base_config`]'s `FineTuneConfig::layers_to_transform` hardcoded
-    /// `None`).
+    /// adapter (both [`build_encoder_adapters`]'s `LoraBuildConfig`s and
+    /// [`base_config`]'s `FineTuneConfig::layers_to_transform` receive this
+    /// value).
     pub layers_to_transform: Option<Vec<usize>>,
     pub backbone_dtype: jammi_numerics::ComputePrecision,
     pub max_seq_length: usize,
@@ -684,7 +661,7 @@ pub struct FinetuneRunParams {
     /// (kept alive for the whole run).
     pub work_dir: PathBuf,
 
-    // ── Mutant provenance (unit 63 round-7 audit, finding 1) ────────────
+    // ── Mutant provenance ───────────────────────────────────────────────
     //
     // These three are HONEST-LABELING fields, never identity or provenance
     // in [`crate::report::FinetuneRunTier::IDENTITY_FIELDS`]/
@@ -696,8 +673,8 @@ pub struct FinetuneRunParams {
     // `fused` leg (`mutants/README.md`'s "what M1 does NOT touch"), so
     // stamping the mutant's name onto either comparison tuple would make a
     // mutant leg permanently unpairable with the clean legs it exists to be
-    // compared against (CONTRACT H4's "the arm is provenance, never
-    // identity" logic applies here a fortiori: identity/provenance name
+    // compared against (the "arm is provenance, never identity" logic
+    // applies here a fortiori: identity/provenance name
     // WHAT WAS MEASURED, this names WHICH BINARY did the measuring). They
     // are a caller-declared self-report — this process cannot verify from
     // inside itself that it was actually built from the claimed patch —
@@ -709,9 +686,9 @@ pub struct FinetuneRunParams {
     //
     // All three are OPTIONAL and all-or-none: [`run`] refuses (typed error,
     // not a panic) unless EITHER all three were never touched (`None`) OR
-    // all three are non-empty after trimming — round-8 finding 4 tightened
-    // this from a mere `is_some()` presence count to a non-emptiness count,
-    // since the CLI happily parses `--mutant-base-sha ""` (and any
+    // all three are non-empty after trimming — a non-emptiness count, not a
+    // mere `is_some()` presence count, since the CLI happily parses
+    // `--mutant-base-sha ""` (and any
     // whitespace-only value) into `Some(_)`; a trio that is explicitly
     // supplied but empty/whitespace in every position is refused too, not
     // silently treated as the ordinary non-mutant case — see [`run_impl`]'s
@@ -721,8 +698,7 @@ pub struct FinetuneRunParams {
     // (non-mutant) leg supplies `None` for all three, and the emitted JSON
     // omits all three keys entirely (`#[serde(skip_serializing_if =
     // "Option::is_none")]` on [`crate::report::FinetuneRunTier`]'s mirror
-    // fields), so a normal leg's report bytes are unchanged by this finding
-    // (committed goldens unaffected).
+    // fields), so a normal leg's report carries no mutant keys.
     /// `--mutant-id`: the mutant's own label (e.g. `"eps-0.10"` — no-producer:
     /// an illustrative example label, not a measurement — see
     /// `docs/plans/63-how-well/mutants/README.md`'s dose-family naming).
@@ -808,8 +784,7 @@ struct Trajectory {
 /// two (text and vision) and an HF-CLAP checkpoint's audio half is the one
 /// this tier trains, so for those the task is the ONLY thing that decides
 /// which tower gets the LoRA adapters. The default is
-/// [`Task::Text`], so every invocation written before this flag
-/// existed selects exactly the tower it always did.
+/// [`Task::Text`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Task {
     /// Train a text tower over `--train-jsonl`'s `*_text` columns
@@ -887,8 +862,8 @@ impl std::str::FromStr for Task {
 /// dispatch counters — see [`fused_dispatch_proof_gate`]).
 ///
 /// A free function rather than a method because [`EncoderFamily`] is
-/// `jammi-ai`'s type (issue #421 D7: ONE architecture predicate for the
-/// workspace); this is a bench-tier fact about a measurement control, not a
+/// `jammi-ai`'s type (ONE architecture predicate for the workspace); this
+/// is a bench-tier fact about a measurement control, not a
 /// property of the architecture itself.
 pub(crate) fn attention_cascade_is_live(family: EncoderFamily) -> bool {
     match family {
@@ -903,10 +878,9 @@ pub(crate) fn attention_cascade_is_live(family: EncoderFamily) -> bool {
 /// Every consumer in this module — the base-model load, the encoder build,
 /// the reported `checkpoint_config_sha256`/`checkpoint_weights_sha256`, and
 /// the catalog row's `model_type` — reads THESE fields, so the digests a run
-/// reports are digests of the bytes it actually opened. Before this existed,
-/// three separate call sites each joined `"config.json"`/
-/// `"model.safetensors"` onto `model_dir` by hand, which silently could not
-/// see an OpenCLIP checkpoint at all.
+/// reports are digests of the bytes it actually opened. Joining
+/// `"config.json"`/`"model.safetensors"` onto `model_dir` by hand would
+/// silently miss an OpenCLIP checkpoint, whose files are named differently.
 pub(crate) struct Checkpoint {
     /// The architecture family, resolved from [`Self::config_json`] by the
     /// workspace's ONE predicate (`jammi_ai::model::arch::EncoderFamily::from_config`).
@@ -924,8 +898,8 @@ pub(crate) struct Checkpoint {
 impl Checkpoint {
     /// Resolve `model_dir` through the ONE chain — `jammi_ai::model::arch`'s
     /// `config_candidates`/`weights_candidates`, the same frozen precedence
-    /// the resolver, the serving loader and the esc-058 fingerprint walk
-    /// (issue #421 D7). This tier deliberately does NOT keep a private
+    /// the resolver, the serving loader and the model-content fingerprint
+    /// walk use. This tier deliberately does NOT keep a private
     /// candidate list: a bench that disagreed with serving about which file
     /// in a directory is "the weights" would report digests for bytes no
     /// serving load ever reads.
@@ -1107,7 +1081,7 @@ fn tower_site_names(family: EncoderFamily, task: Task) -> &'static str {
     }
 }
 
-/// # `(family, task)` dispatch (issue #421 W2b)
+/// # `(family, task)` dispatch
 ///
 /// The checkpoint's [`EncoderFamily`] says which architectures a directory
 /// can build; `task` says WHICH TOWER of it to inject LoRA into. The three
@@ -1124,9 +1098,7 @@ fn tower_site_names(family: EncoderFamily, task: Task) -> &'static str {
 /// `model_type` AND, for the multi-tower families, `tower` — the two fields
 /// together are what a serving load needs to pick the right tower to install
 /// the adapter on (`jammi_lora::AdapterConfig::tower`'s own doc). A
-/// single-tower family leaves `tower` at `None`, so an adapter saved by an
-/// existing text leg is byte-identical to the one it produced before this
-/// flag existed.
+/// single-tower family leaves `tower` at `None`.
 #[allow(clippy::too_many_arguments)]
 fn build_encoder_adapters(
     checkpoint: &Checkpoint,
@@ -1137,8 +1109,7 @@ fn build_encoder_adapters(
     lora_alpha: f64,
     lora_dropout: f64,
     // Which LoRA initialization the built adapters use — threaded from
-    // `FinetuneRunParams::lora_init` (issue #421 P1-b(ii)), previously the
-    // hardcoded `LoraInitMode::ZerosB` literal in `lora_build_1` below.
+    // `FinetuneRunParams::lora_init`.
     lora_init: LoraInitMode,
     backbone_dtype: jammi_numerics::ComputePrecision,
     seed: u64,
@@ -1238,7 +1209,6 @@ fn build_encoder_adapters(
             .into())
         }
     };
-    // Contract v2 addition (round-2 pressure-test of the profile contract):
     // ZERO trainable Vars on the just-built encoder must refuse loudly here
     // — UNCONDITIONALLY, mirroring `finetune_step.rs`'s `build_fixture`
     // precedent EXACTLY ("no trainable LoRA tensors — target_modules matched
@@ -1259,14 +1229,14 @@ fn build_encoder_adapters(
     // matches nothing on `bert`'s or `distilbert`'s
     // `query`/`key`/`value`/`dense`-style naming.
     if encoder.trainable_params().is_empty() {
-        // Phase-4 audit follow-up: TWO producers can land here —
+        // TWO producers can land here —
         // `target_modules` matching no linear at all, or a `layers_to_transform`
         // restriction excluding every layer `target_modules` WOULD otherwise
         // have matched (e.g. `Some([99])` on a fixture with fewer layers, or
         // `Some([1])` when the matching selector only exists on layer 0). The
         // message must name `layers_to_transform` whenever it is `Some` —
         // never blame `target_modules`/"correct the selectors" alone on the
-        // exact N-twin path the profile contract mandates (one selector +
+        // exact N-twin profile path (one selector +
         // `layers_to_transform: Some([0])`), where an off-by-one layer index
         // is the likeliest operator error, not a bad selector string.
         let restriction = match layers_to_transform {
@@ -1285,29 +1255,29 @@ fn build_encoder_adapters(
         )
         .into());
     }
-    // Re-audit round-2 fix (unit 63 finding 2): `ModernBert::builder().build(..)` /
+    // `ModernBert::builder().build(..)` /
     // `Bert::builder().build(..)` construct a FRESH encoder in EVAL mode
     // (`training: false` at construction — see each builder's own `build`)
     // — a plain `TrainingTarget::EncoderAdapters(..)` wrap of that fresh
     // encoder therefore drives every forward through the EVAL attention
     // path, and `ModernBertAttention::forward`'s `self.training` gate never
     // reaches `forward_training_attention` at all, so the fused
-    // whole-attention-block kernel (the C16 A/B's entire measurand) cannot
+    // whole-attention-block kernel (the A/B's entire measurand) cannot
     // dispatch in EITHER arm — the fused leg is silently indistinguishable
     // from a bug that always runs eval. `TrainingLoop::run()` itself never
     // calls `set_training(true)` for the ordinary (non-GradCache)
     // per-batch path either (only `mine_hard_negatives`/`run_gradcache_epoch`
     // do, and neither applies to `EncoderAdapters`), so this call is NOT
-    // redundant with anything the trainer does today — mirrors
+    // redundant with anything the trainer does — mirrors
     // `finetune_step.rs`'s own `build_fixture`'s `encoder.set_training(true)`
     // call EXACTLY, so this tier's fresh-per-epoch build starts from the
     // same training-mode precondition that tier's fixture always has. This
     // is belt-and-braces alongside `run`'s own dispatch-counter proof below
     // (`attention_block_fused_dispatches`/`attention_block_eager_dispatches`/
-    // `attention_block_flash_*`): a caller must not depend on either fix in
+    // `attention_block_flash_*`): a caller must not depend on either check in
     // isolation to catch a future regression in the other.
     encoder.set_training(true);
-    // Read the flag BACK off the object (issue #421 W2b). The dispatch-
+    // Read the flag BACK off the object. The dispatch-
     // counter gate below is the process-wide proof for the BERT family, but
     // the three cross-modal towers have no attention-admission counter at
     // all (`attention_cascade_is_live`'s doc) — for them this
@@ -1334,8 +1304,8 @@ fn build_encoder_adapters(
     // the SAVED `adapter_config.json` records (`AdapterConfig::from_build`),
     // so a `lora_init` threaded into `lora_build_1` alone would ship an
     // adapter whose declared init mode contradicts the weights actually
-    // built — hence BOTH sites read the same `lora_init` parameter (issue
-    // #421 P1-b(ii)), never one literal and one variable.
+    // built — hence BOTH sites read the same `lora_init` parameter, never
+    // one literal and one variable.
     let lora_build_2 = jammi_lora::LoraBuildConfig {
         target_modules,
         layers_to_transform,
@@ -1404,7 +1374,7 @@ fn base_config(params: &FinetuneRunParams, epochs: usize) -> FineTuneConfig {
         }),
         classification_loss: None,
         regression_loss: None,
-        // Cost fixture: per-epoch checkpointing stays off (the #348 default) —
+        // Cost fixture: per-epoch checkpointing stays off (the default) —
         // a checkpoint upload inside the timed epoch loop would be a
         // measurement contaminant, not a feature.
         keep_last_n_checkpoints: None,
@@ -1419,7 +1389,7 @@ fn base_config(params: &FinetuneRunParams, epochs: usize) -> FineTuneConfig {
         layers_to_transform: params.layers_to_transform.clone(),
         use_rslora: false,
         rank_pattern: HashMap::new(),
-        // The THIRD site `--lora-init` reaches (issue #421 P1-b(ii)): the
+        // The THIRD site `--lora-init` reaches: the
         // `FineTuneConfig` the trainer itself carries. `build_encoder_adapters`
         // above is what actually initializes this tier's weights, so this
         // one is the config-vs-reality consistency half — a `FineTuneConfig`
@@ -1437,17 +1407,14 @@ fn base_config(params: &FinetuneRunParams, epochs: usize) -> FineTuneConfig {
     }
 }
 
-/// The all-zero-attention validity gate (unit 63 re-audit round-2 finding
-/// 2; widened by the C-ATTN unit, campaign #462/#463): `Err` iff this run
+/// The all-zero-attention validity gate: `Err` iff this run
 /// took at least one optimizer step (`cumulative_steps > 0`) but every one
 /// of the four training-mode attention dispatch counters
 /// (`attention_block_fused_dispatches`, `attention_block_eager_dispatches`,
 /// `attention_block_flash_fused_dispatches`,
 /// `attention_block_flash_declined_dispatches`) reads `0`.
 ///
-/// Originally scoped to `model_type == "modernbert"` on the premise that
-/// ModernBert was the ONLY architecture with a fused whole-attention-block
-/// kernel at all. That premise no longer holds: BERT and DistilBERT now
+/// Not scoped to `model_type == "modernbert"`: BERT and DistilBERT
 /// admit the SAME fused whole-attention-block kernel through the SAME
 /// predicate, dispatched by TENSOR STATE (`head_dim == 64`), never by
 /// architecture name (`jammi_encoders::attention_cascade`'s doc) — so a
@@ -1464,9 +1431,8 @@ fn base_config(params: &FinetuneRunParams, epochs: usize) -> FineTuneConfig {
 /// four dispatch counters reading zero at once is not a legitimate
 /// "declined by domain" outcome (that reads `N eager / 0 fused`, never
 /// `0/0/0/0`), it is proof the encoder never entered training mode at all
-/// (this finding's root cause: a fresh `builder().build(..)` starts
-/// `training: false`, and neither `build_encoder_adapters` above nor
-/// `TrainingLoop::run`'s ordinary per-batch path used to flip it via
+/// (a fresh `builder().build(..)` starts `training: false`, and
+/// `TrainingLoop::run`'s ordinary per-batch path does not flip it via
 /// `encoder.set_training(true)`). Refusing loudly here beats silently
 /// emitting a plausible-looking report for a run that measured the eval
 /// path — this check does NOT depend on `encoder.set_training(true)` being
@@ -1477,7 +1443,7 @@ fn base_config(params: &FinetuneRunParams, epochs: usize) -> FineTuneConfig {
 /// admission-by-counters behaviour is unit-testable without a real
 /// end-to-end training run.
 ///
-/// # Two families, two live counters (issue #421 W2b)
+/// # Two families, two live counters
 ///
 /// Adding the three cross-modal towers made "all four attention counters
 /// zero" ambiguous: a CLIP-text / OpenCLIP-vision / HTSAT tower composes
@@ -1569,8 +1535,8 @@ pub fn run(
 /// `--` CLI surface or [`run`] itself (which always passes `true` and
 /// discards the varmap). Exists solely so
 /// `tests::init_probe_does_not_perturb_the_training_trajectory_bitwise`
-/// (amendment 2026-08-29b, item 4) can drive the identical resume-cycle with
-/// and without the new pre-`run()` init probe and compare the RESULT —
+/// can drive the identical resume-cycle with
+/// and without the pre-`run()` init probe and compare the RESULT —
 /// including the actual trained weights, not merely the reported numbers —
 /// bit for bit.
 fn run_impl(
@@ -1590,8 +1556,7 @@ fn run_impl(
     if params.epochs == 0 {
         return Err("finetune-run: --epochs 0 has no final epoch to measure".into());
     }
-    // Mutant provenance is all-or-none (unit 63 round-7 audit, finding 1;
-    // tightened round-8, finding 4): a subset of the three flags present but
+    // Mutant provenance is all-or-none: a subset of the three flags present but
     // incomplete is a labeling error the merger could not attribute to a
     // specific patch either way (`finetune_run_mutant_column_violations`'s
     // per-field emptiness check), so this producer refuses it up front
@@ -1618,8 +1583,7 @@ fn run_impl(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    // unit-63 round-9 audit advisory (b), comment corrected by round-10
-    // audit F2: lowercased AFTER trim, not merely `to_string`'d, so the
+    // Lowercased AFTER trim, not merely `to_string`'d, so the
     // stamped artifact records canonical-case hex (sha is case-insensitive
     // by domain). CANONICALIZATION ONLY -- `mutant_base_sha` has no
     // downstream comparison anywhere in this pair (ab_merge.py only checks
@@ -1636,19 +1600,14 @@ fn run_impl(
     // Same canonicalization, but `mutant_patch_sha256` DOES have a
     // downstream comparison: ab_merge.py's
     // `finetune_run_mutant_column_violations` checks this leg's own
-    // stamped value against the caller-supplied `--mutant-legs` spec.
-    // Round-9 advisory (b) lowercased ONLY this producer side, which
-    // regressed an all-uppercase leg/spec pair (previously an exact-string
-    // match) into a false "labeling error" the moment this side started
-    // normalizing and the caller side did not. Round-10 audit F2 fixed the
-    // comparison ITSELF -- ab_merge.py's `finetune_run_mutant_column_violations`
-    // (the per-leg comparison) and the `--mutant-legs` CLI fold (the spec
-    // parse) -- to case-fold both sides at the comparison site, so this
-    // producer-side lowercasing is back to being canonicalization of the
-    // artifact, never something the comparison's correctness depends on.
-    // Cited by FUNCTION NAME, never by line number: ab_merge.py's own
-    // line numbers have already rotted past this comment once (unit-63
-    // round-11 audit advisory (b)).
+    // stamped value against the caller-supplied `--mutant-legs` spec. That
+    // comparison case-folds both sides itself (ab_merge.py's
+    // `finetune_run_mutant_column_violations` and the `--mutant-legs` CLI
+    // fold), so this producer-side lowercasing is canonicalization of the
+    // artifact only, never something the comparison's correctness depends
+    // on (lowercasing one side alone would turn an all-uppercase leg/spec
+    // pair into a false "labeling error"). Cited by FUNCTION NAME, never by
+    // line number.
     let mutant_patch_sha256 = params
         .mutant_patch_sha256
         .as_deref()
@@ -1662,8 +1621,8 @@ fn run_impl(
         mutant_id.is_some() && mutant_base_sha.is_some() && mutant_patch_sha256.is_some();
     if !never_touched && !fully_labeled {
         // Names each flag's actual state — `None` (never touched), a
-        // trimmed value, or "supplied but empty/whitespace-only" (the
-        // finding-4 case the old `is_some()` count silently accepted) —
+        // trimmed value, or "supplied but empty/whitespace-only" (the case a
+        // bare `is_some()` count would silently accept) —
         // rather than the raw `Option<String>` `Debug` output, so a
         // whitespace-only value doesn't render as an indistinguishable
         // `Some("")`-shaped string in the refusal.
@@ -1732,7 +1691,7 @@ fn run_impl(
             .into());
         }
     }
-    // `--expect-kernels-disabled`, check (1) of 3 (issue #421 P1-b(i); the
+    // `--expect-kernels-disabled`, check (1) of 3 (the
     // other two are at the END of this function, where the dispatch sites
     // have had their chance to fire): this field must equal this process's
     // real `JAMMI_KERNELS_DISABLE` EXACTLY. Checked HERE, at the very top,
@@ -1745,10 +1704,9 @@ fn run_impl(
     // this check states).
     //
     // Set EQUALITY, not a subset — see `FinetuneRunParams::expect_kernels_disabled`'s
-    // doc, finding F1, for why an earlier, weaker subset check here was
-    // wrong (the "legitimate combined leg on top of `--arm alloff`" premise
-    // it rested on cannot occur — the arm-level check above already forces
-    // `--arm alloff` to an exact set). Both `expected` and `requested` are
+    // doc (a "combined leg on top of `--arm alloff`" cannot occur — the
+    // arm-level check above already forces `--arm alloff` to an exact set).
+    // Both `expected` and `requested` are
     // sorted, deduplicated `Vec<String>`s built by the same
     // `jammi_kernels::admission::parse_disable_list` (see the CLI fold in
     // `main.rs` and `disabled_ops_requested`'s own doc), so `!=` is a
@@ -1794,7 +1752,7 @@ fn run_impl(
         compute_precision: params.backbone_dtype,
     };
 
-    // ONE resolution chain (issue #421 D7): which config/weights files this
+    // ONE resolution chain: which config/weights files this
     // directory actually holds, and which architecture family they name.
     // Every consumer below reads THESE paths, so the reported digests are
     // digests of the bytes this run opened — an OpenCLIP checkpoint (whose
@@ -1871,8 +1829,8 @@ fn run_impl(
         config_json: None,
     }))?;
     // A REAL admitted `TrainingSpec::FineTune`, submitted through the SAME
-    // seam every production training submit edge uses (#573 round 3,
-    // N3-seam) — never a hand-built `SubmitJobParams` carrying a
+    // seam every production training submit edge uses — never a
+    // hand-built `SubmitJobParams` carrying a
     // placeholder `spec: "{}"`. This crate drives `TrainingLoop::run`
     // directly afterward (this module's own doc explains why: the row
     // exists to obtain a real, claimable `job_id`, not to be reconstructed
@@ -1923,7 +1881,7 @@ fn run_impl(
     // `Objective::Triplet` consumes the fixture's (anchor, positive,
     // negative) columns natively; `Objective::Mnrl` consumes only the
     // (anchor, positive) PROJECTION of the SAME rows in the SAME committed
-    // order ([`project_to_pairs`]) — CONTRACT amendment 2026-08-28. Both
+    // order ([`project_to_pairs`]). Both
     // loaders below are built from the identical `params.train_pairs` /
     // `params.heldout_pairs` slices, so the row ORDER (and hence
     // `heldout_ids`' pairing with the loader's rows) is identical regardless
@@ -1935,14 +1893,12 @@ fn run_impl(
     //
     // `train_loader` itself is rebuilt fresh inside the epoch loop below
     // (never hoisted as one value reused by reference): `TrainingLoop::run`
-    // now takes an owned `TrainingSource` (#500 U2c §10), and
+    // takes an owned `TrainingSource`, and
     // `TrainingDataLoader` carries no `Clone` (`data.rs`'s own doc —
     // `with_reservation`'s pool-accounted bytes must have exactly one
     // owner). Rebuilding from `train_rows` — the SAME borrowed fixture rows
     // this loader was always built from, never mutated by a `run()` leg —
-    // reproduces byte-identical content and order every epoch, which is
-    // exactly what the old `run(&train_loader)` call obtained by borrowing
-    // one hoisted loader `params.epochs` times. This tier's `train_loader`
+    // reproduces byte-identical content and order every epoch. This tier's `train_loader`
     // is `TrainingDataLoader::from_triplets`/`from_pairs`/
     // `from_media_triplets` over in-memory fixture rows — it never goes
     // through `read_back_with_reservation`/`materialize_projection_table`
@@ -1954,9 +1910,9 @@ fn run_impl(
     // SAME "reservation-free by construction" state `from_triplets` et al.
     // document for every non-worker caller. This tier's numbers (wall time,
     // dispatch counters, loss/held-out trajectories) are therefore measured
-    // OUTSIDE the loader-residency pool this unit adds: they report training
+    // OUTSIDE the loader-residency pool: they report training
     // math identically to the eager path DataFusion pool accounting never
-    // touches, not the pool's own bound (P2/P3), which is exercised by
+    // touches, not the pool's own bound, which is exercised by
     // `jammi-ai`'s own `tests/it/training_set_stream.rs` oracles instead.
     let heldout_ids: Vec<String> = heldout_rows.ids();
     let heldout_loader = heldout_rows.loader(params.objective)?;
@@ -1964,12 +1920,9 @@ fn run_impl(
     // A fixed, deterministic TRAIN-side probe — one batch's worth of the
     // TRAIN rows (never the held-out fixture), scored through the SAME
     // public seam once BEFORE the first `run()` leg (the UNTRAINED model)
-    // and then once after EVERY epoch's `run()` leg — CONTRACT amendment
-    // 2026-08-29b, item 1(a)/(b), fixing the prior bug where the baseline
-    // was taken AFTER epoch 0 had already trained, silently excluding the
-    // largest-learning epoch from the premise window despite the field's
-    // own doc claiming "over the run" (no contract string is cited here for
-    // that endpoint choice; the amendment above is the pre-registration).
+    // and then once after EVERY epoch's `run()` leg. The baseline is taken
+    // BEFORE epoch 0 trains: a baseline after epoch 0 would silently exclude
+    // the largest-learning epoch from the premise window.
     // This producer emits the result as a RAW per-epoch series
     // (`train_probe_series`: index 0 = the untrained/init probe, one entry
     // per epoch thereafter, last = final) — never a pre-derived scalar; a
@@ -1998,24 +1951,24 @@ fn run_impl(
     let probe_ids: Vec<String> = probe_rows.ids();
 
     let mut trajectory = Trajectory { points: Vec::new() };
-    // Amendment 2026-08-29b: the raw probe series, index 0 = the untrained
+    // The raw probe series, index 0 = the untrained
     // model's init probe, one entry per epoch thereafter (see the doc above
     // on `probe_len`).
     let mut train_probe_series: Vec<f64> = Vec::with_capacity(params.epochs + 1);
     let mut cumulative_steps = 0usize;
-    // CONTRACT v2 addition (#356 P1, item 3): wall-clock seconds around
+    // Wall-clock seconds around
     // this run's `training_loop.run()` invocation(s) ONLY, summed across
     // every resume-cycled epoch leg — see `FinetuneRunTier::train_run_wall_s`'s
     // own doc for the exact scope (excludes `build_encoder_adapters`, the
     // resume-checkpoint fetch/restore, and every `evaluate_held_out` call,
     // all of which are separate statements outside this timer's span below).
     let mut train_run_wall_s = 0.0f64;
-    // The DIRECT media decode/preprocess wall (contract P1-b(v)), summed the
+    // The DIRECT media decode/preprocess wall, summed the
     // same way across every resume-cycled epoch leg — see the accumulation
     // site below and `crate::report::FinetuneRunTier::media_front_end_wall_s`'s
     // own doc for the measured boundary.
     let mut media_front_end_wall_s = 0.0f64;
-    // The WITNESSED per-forward fusible-seam census (contract §D4 item 1),
+    // The WITNESSED per-forward fusible-seam census,
     // taken off the encoder each epoch's `build_encoder_adapters` actually
     // returned — see `crate::report::FinetuneRunTier::fusible_site_census`
     // for what a downstream reader does with it. Captured every epoch, not
@@ -2033,7 +1986,7 @@ fn run_impl(
     // epoch's `run()` leg produced.
     let mut last_varmap: Option<VarMap> = None;
 
-    // Fused-dispatch-proof channel (unit 63 re-audit round-2 finding 2):
+    // Fused-dispatch-proof channel:
     // mirrors `finetune_step.rs::run`'s "before"/"after" dispatch-counter
     // snapshot convention EXACTLY (same functions, same field names on the
     // emitted tier — see `FinetuneRunTier`'s own field docs). Taken once
@@ -2048,7 +2001,7 @@ fn run_impl(
     let rope_dispatch_before = jammi_encoders::rope_dispatch_snapshot();
     let softmax_dispatch_before = jammi_encoders::softmax_dispatch_snapshot();
     let geglu_dispatch_before = jammi_encoders::geglu_dispatch_snapshot();
-    // Same mechanism, for the C-MLP fused GELU-erf activation kernel
+    // Same mechanism, for the fused GELU-erf activation kernel
     // (BERT's/DistilBERT's FFN, admit key `gelu_erf_fused`) — read
     // directly off the process-wide registry, the same shape
     // `adamw_dispatch_before` below already uses, since this counter has
@@ -2064,7 +2017,7 @@ fn run_impl(
     // The WHOLE registry, by op name — the same before/after window every
     // named counter above is read over, but keyed at RUNTIME so
     // `--expect-kernels-disabled`'s arbitrary caller-supplied keys can be
-    // checked through it (issue #421 P1-b(i), check (3)). A DELTA, never an
+    // checked through it (check (3)). A DELTA, never an
     // absolute read: the counters are process-wide and additive, so an
     // absolute `fused > 0` would also indict dispatches from anything that
     // ran before this window (this tier's own pre-loop init probe among
@@ -2173,8 +2126,8 @@ fn run_impl(
 
         // The loader build (`RowSet::loader`, a per-epoch-leg clone of every
         // row's text/media bytes into the trainer's owned `TrainingDataLoader`)
-        // sits OUTSIDE `train_run_t0`, not inside it: `train_run_wall_s`'s own
-        // contract (`report.rs`'s doc on that field) times ONLY this tier's
+        // sits OUTSIDE `train_run_t0`, not inside it: `train_run_wall_s`
+        // (`report.rs`'s doc on that field) times ONLY this tier's
         // `training_loop.run()` call(s), and construction is not part of
         // `run()` — it is this tier's own row-marshalling step, done once per
         // epoch leg before the timed span starts.
@@ -2182,7 +2135,7 @@ fn run_impl(
         let train_run_t0 = Instant::now();
         let result = training_loop.run(call, TrainingSource::Resident(train_loader))?;
         train_run_wall_s += train_run_t0.elapsed().as_secs_f64();
-        // The DIRECT media front-end wall (contract P1-b(v)), summed across
+        // The DIRECT media front-end wall, summed across
         // resume legs exactly as `train_run_wall_s` above is —
         // `TrainingResult::media_front_end_wall`'s own doc requires it:
         // `TrainingLoop::run` RESETS its accumulator at the start of every
@@ -2296,8 +2249,7 @@ fn run_impl(
         .declined
         .saturating_sub(attention_block_flash_dispatch_before.declined);
 
-    // Belt-and-braces typed refusal (unit 63 re-audit round-2 finding 2;
-    // widened by the C-ATTN unit, campaign #462/#463) — see
+    // Belt-and-braces typed refusal — see
     // `fused_dispatch_proof_gate`'s own doc for the full rationale.
     if let Err(message) = fused_dispatch_proof_gate(
         family,
@@ -2332,15 +2284,14 @@ fn run_impl(
     let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();
     let resolved_attention_arm = attention_arm(&kernels_disabled_requested).to_string();
 
-    // `--expect-kernels-disabled`, checks (2) and (3) of 3 (issue #421
-    // P1-b(i)) — both END-of-run by necessity: `jammi_kernels::admission`'s
+    // `--expect-kernels-disabled`, checks (2) and (3) of 3 — both
+    // END-of-run by necessity: `jammi_kernels::admission`'s
     // fired-disable registry and its dispatch counters are populated by
     // OBSERVATION, so neither can be validated before every call site that
     // was going to fire this run has had its chance to.
     //
-    // Scoped to `Some` deliberately: a run that makes no claim keeps EXACTLY
-    // the behaviour it had before this flag existed (this tier never read
-    // `unmatched_disables()` at all), so no existing invocation changes.
+    // Scoped to `Some` deliberately: a run that makes no claim never reads
+    // `unmatched_disables()` at all.
     let kernels_disabled_expected = match &params.expect_kernels_disabled {
         None => Vec::new(),
         Some(expected) => {
@@ -2422,7 +2373,7 @@ fn run_impl(
 
     let max_grad_norm = (params.max_grad_norm > 0.0).then_some(params.max_grad_norm);
 
-    // The media corpora's own CONTENT digests (issue #421 P1-b) — computed
+    // The media corpora's own CONTENT digests — computed
     // off the rows THIS run actually consumed, in the order it consumed
     // them, never re-read from disk (the bytes are already here, and a
     // second read could see a different file). `None` on a text task, where
@@ -2504,8 +2455,7 @@ fn run_impl(
         split_rule: "positional_fraction_split".to_string(),
         batched_forward: true,
         steps_measured: cumulative_steps,
-        // Issue #421 follow-on ("media front-end parallelization" contract
-        // §B): the rayon GLOBAL pool size this process actually executed
+        // The rayon GLOBAL pool size this process actually executed
         // under, read via `jammi_ai::fine_tune::media_front_end_pool_threads()`
         // (ai-core's own seam — never `rayon::current_num_threads()` called
         // directly here, so this crate never gains a direct `rayon` dep) —
@@ -2572,7 +2522,7 @@ fn run_impl(
 mod tests {
     use super::*;
 
-    // ── `media_corpus_sha256` (issue #421 P1-b) ─────────────────────────
+    // ── `media_corpus_sha256` ───────────────────────────────────────────
     //
     // The reference values below are computed by an INDEPENDENT
     // implementation (CPython's `hashlib`, not this crate's `sha2`), so
@@ -2680,8 +2630,8 @@ mod tests {
 
     /// The committed OpenCLIP fixture — `open_clip_config.json` +
     /// `open_clip_model.safetensors` + `tokenizer.json`, i.e. a checkpoint
-    /// the OLD hard-coded `config.json`/`model.safetensors` joins could not
-    /// see at all.
+    /// that hard-coded `config.json`/`model.safetensors` joins cannot see at
+    /// all.
     fn tiny_open_clip_model_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_open_clip")
     }
@@ -2744,14 +2694,14 @@ mod tests {
             warmup_steps: 0,
             weight_decay: 0.0,
             gradient_accumulation_steps: 1,
-            // Audit round 7, finding 5: matches the campaign's own
+            // Matches the CLI's own
             // `--validation-fraction` default (`FinetuneRunArgs`'s
             // `default_value_t = 0.1`), not an arbitrary `0.0` — with 4 rows
             // this still rounds to a 0-row internal val split
             // (`round(4 * 0.1) == 0`), which is harmless here because
             // `early_stopping_metric` is `TrainLoss` (the `ValLoss`-only
             // empty-loader refusal in `TrainingLoop::run` never fires for
-            // this metric), so this change exercises the campaign's real
+            // this metric), so this exercises the CLI's real
             // knob value without altering what the resume-cycle actually
             // trains over.
             validation_fraction: 0.1,
@@ -2764,7 +2714,7 @@ mod tests {
             matryoshka_dims: Vec::new(),
             lora_rank: 2,
             lora_alpha: 4.0,
-            // Audit round 7, finding 5: `0.0` made `jammi_lora::LoraLinear`'s
+            // Not `0.0`: that would make `jammi_lora::LoraLinear`'s
             // `dropout_masks` field structurally `None` for every LoRA layer
             // (`build_encoder_adapters`'s `lora_dropout_opt = (lora_dropout
             // > 0.0).then_some(..)` — `0.0` maps to `None`), so the mask
@@ -2774,17 +2724,16 @@ mod tests {
             // `with_dropout_disabled` bracket entirely could not have turned
             // this test red, because there was no dropout stream left for a
             // broken bracket to leave un-disabled. `0.05` matches the
-            // campaign's own `--lora-dropout` default
+            // CLI's own `--lora-dropout` default
             // (`FinetuneRunArgs`'s `default_value_t = 0.05`), making the
             // channel live — see
             // `dropout_forward_counter_is_live_at_the_campaigns_lora_dropout_and_held_still_under_eval_mode`
-            // below for the committed proof that the channel is now Some and
+            // below for the committed proof that the channel is Some and
             // that toggling training mode is what actually gates it (the
-            // RED-provable mechanism `with_dropout_disabled` relies on).
+            // falsifiable mechanism `with_dropout_disabled` relies on).
             lora_dropout: 0.05,
-            // The default this tier had before `--lora-init` existed, so
-            // every test built on these params exercises the UNCHANGED
-            // path; `lora_init_mode_reaches_both_lora_build_sites` below
+            // The `--lora-init` default, so every test built on these params
+            // exercises the default path; `lora_init_mode_reaches_both_lora_build_sites` below
             // overrides it explicitly to prove the other mode is threaded.
             lora_init: LoraInitMode::ZerosB,
             // `None` = the ordinary, unchecked case (no
@@ -2804,15 +2753,14 @@ mod tests {
         }
     }
 
-    /// The mask-counter proof unit-63 round-7 audit finding 5 requires:
-    /// with the campaign's own `lora_dropout` (`0.05`, matching
-    /// [`non_perturbation_test_params`]'s now-live value — see that
+    /// The mask-counter proof: with the CLI's own `lora_dropout` (`0.05`,
+    /// matching [`non_perturbation_test_params`]'s live value — see that
     /// function's own doc), every LoRA-wrapped layer's dropout forward
     /// counter (`jammi_lora::LoraLinear::dropout_position`,
     /// `AnyEncoder::dropout_positions`) is `Some` (the mask channel
     /// `init_probe_does_not_perturb_the_training_trajectory_bitwise`'s own
     /// doc names — "draws no dropout mask and so touches no RNG stream" —
-    /// is actually PRESENT here, not structurally absent the way it was at
+    /// is actually PRESENT here, not structurally absent as it is at
     /// `lora_dropout: 0.0`), that it ADVANCES on a training-mode forward
     /// (the state the extra init probe would leave the encoder in if
     /// `TrainingLoop::with_dropout_disabled`'s bracket were bypassed or
@@ -2822,38 +2770,24 @@ mod tests {
     /// own doc on `with_dropout_disabled`) — around every
     /// `evaluate_held_out` call.
     ///
-    /// This is the "assert via the mask-counter state" form the audit named
-    /// as an acceptable alternative to a test-only shadow bypass of
-    /// `jammi-ai`'s bracket (this crate does not own `jammi-ai`, so it
-    /// cannot commit a mutation there): it proves the property
+    /// This asserts via the mask-counter state rather than a test-only
+    /// shadow bypass of `jammi-ai`'s bracket: it proves the property
     /// [`init_probe_does_not_perturb_the_training_trajectory_bitwise`] pins
-    /// is now LIVE (can fail), rather than vacuously true, by directly
+    /// is LIVE (can fail), rather than vacuously true, by directly
     /// exhibiting one code path (training-mode forward) that DOES perturb
     /// the counter and one (eval-mode forward) that provably does not — the
     /// exact dichotomy a broken bracket would erase.
     ///
-    /// RED proof performed by hand while authoring this fix (not
-    /// committed — `jammi-ai` is not this crate's file to modify or commit
-    /// against): temporarily editing `TrainingLoop::with_dropout_disabled`
-    /// in `jammi-ai/src/fine_tune/trainer.rs` to skip the
-    /// `self.set_training(false)` call entirely (leaving only `let
-    /// was_training = self.training_mode; let result = f(self);
-    /// self.set_training(was_training); result`) and re-running
-    /// `init_probe_does_not_perturb_the_training_trajectory_bitwise` at
-    /// this fix's now-live `lora_dropout: 0.05` (no-producer: this crate's
-    /// own `--lora-dropout` CLI default, not a measured quantity) made
-    /// THAT test fail —
-    /// `named_with != named_without` ("trained weights diverged bit-for-bit
-    /// between WITH and WITHOUT the init probe") — because the extra init
-    /// probe's now-live dropout draw perturbed the first epoch's own
-    /// dropout-stream position, changing its trained weights. Re-running
-    /// the SAME test at the pre-fix `lora_dropout: 0.0` with the identical
-    /// bypass produced NO failure (`named_with == named_without` still
-    /// held), confirming finding 5's diagnosis: the pin could not
-    /// previously fail because the channel it exists to protect was
-    /// structurally absent, not because the bracket was correct. The
-    /// `jammi-ai` edit was reverted immediately after both runs (`git diff`
-    /// clean on that crate).
+    /// Mutation (in `jammi-ai`, not committable from this crate): make
+    /// `TrainingLoop::with_dropout_disabled` in
+    /// `jammi-ai/src/fine_tune/trainer.rs` skip the `self.set_training(false)`
+    /// call and `init_probe_does_not_perturb_the_training_trajectory_bitwise`
+    /// fails at `lora_dropout: 0.05` (`named_with != named_without`): the
+    /// extra init probe's dropout draw perturbs the first epoch's own
+    /// dropout-stream position, changing its trained weights. At
+    /// `lora_dropout: 0.0` the same mutation produces NO failure — the
+    /// channel the pin protects is structurally absent there, which is why
+    /// the params use `0.05`.
     #[test]
     fn dropout_forward_counter_is_live_at_the_campaigns_lora_dropout_and_held_still_under_eval_mode(
     ) {
@@ -2880,7 +2814,7 @@ mod tests {
         assert!(
             !positions_at_build.is_empty(),
             "lora_dropout 0.05 must leave at least one LoRA layer's dropout_masks Some (the \
-             channel must be structurally present, unlike the pre-fix lora_dropout 0.0 config): \
+             channel must be structurally present, unlike a lora_dropout 0.0 config): \
              {positions_at_build:?}"
         );
         assert!(
@@ -3080,7 +3014,7 @@ mod tests {
         );
     }
 
-    /// CONTRACT v2 addition (#356 P1, item 5): `--layers-to-transform`
+    /// `--layers-to-transform`
     /// plumbing — `Some([0])` on a TWO-layer encoder must wrap ONLY layer
     /// 0's matching linears, never layer 1's, so the trainable LoRA tensor
     /// count under the restriction is EXACTLY HALF the unrestricted
@@ -3140,7 +3074,7 @@ mod tests {
         );
     }
 
-    /// Phase-4 audit follow-up: the zero-trainable refusal has TWO
+    /// The zero-trainable refusal has TWO
     /// producers — `target_modules` matching nothing, and a
     /// `layers_to_transform` restriction excluding every site
     /// `target_modules` would otherwise have matched (e.g. `Some([99])` on
@@ -3206,8 +3140,8 @@ mod tests {
         dir
     }
 
-    /// Negative control (moved to the resolution chain by issue #421 W2b,
-    /// where the family is now decided): a `model_type` this tier does not
+    /// Negative control (at the resolution chain, where the family is
+    /// decided): a `model_type` this tier does not
     /// know must still error, and the error must honestly name every family
     /// this tier DOES support — not silently coerce to BERT, and not go
     /// stale as new arms are added.
@@ -3254,7 +3188,7 @@ mod tests {
     /// key at all resolves as BERT, per
     /// `jammi_ai::model::arch::UNDECLARED_MODEL_TYPE_FAMILY` — the one owner
     /// of the "undeclared -> bert" rule every reader in this workspace
-    /// (serving's own load, the fine-tune worker, and now this tier) applies.
+    /// (serving's own load, the fine-tune worker, and this tier) applies.
     /// A config that DECLARES an unrecognised string is a different case and
     /// stays a typed refusal (`checkpoint_resolve_rejects_unknown_model_type_and_names_every_family`
     /// above).
@@ -3271,10 +3205,9 @@ mod tests {
     }
 
     /// A BERT config-compatible alias resolves to BERT — the alias set the
-    /// serving text arm has always accepted, now shared. Pinned here because
-    /// this tier previously refused `"roberta"` from its own private list;
-    /// consuming the shared predicate widens it, and a widening deserves a
-    /// test that says so out loud.
+    /// serving text arm accepts, shared with this tier. Pinned here because
+    /// consuming the shared predicate admits `"roberta"`, and that deserves
+    /// a test that says so out loud.
     #[test]
     fn checkpoint_resolve_accepts_the_bert_config_aliases() {
         for alias in ["bert", "roberta", "camembert", "xlm-roberta"] {
@@ -3314,8 +3247,7 @@ mod tests {
         );
     }
 
-    /// Contract v2 addition (phase-1 pressure-test of the profile contract):
-    /// a NON-EMPTY `target_modules` that matches zero linear layers on the
+    /// A NON-EMPTY `target_modules` that matches zero linear layers on the
     /// built encoder must REFUSE loudly, mirroring
     /// `finetune_step.rs`'s `build_fixture` precedent ("no trainable LoRA
     /// tensors — target_modules matched nothing"). This is the CLI's real
@@ -3360,7 +3292,7 @@ mod tests {
             msg.contains("bert"),
             "error must name the model_type: {msg}"
         );
-        // Round-2 audit advisory: `layers_to_transform` was `&None` here, so
+        // `layers_to_transform` is `&None` here, so
         // the message's " restricted to layers {layers:?}" clause must be
         // ABSENT — this is the negative control for
         // `build_encoder_adapters_names_layers_to_transform_when_it_causes_the_zero_trainable_refusal`'s
@@ -3380,7 +3312,7 @@ mod tests {
         );
     }
 
-    /// CORRECTED (round-2 pressure-test): an explicitly EMPTY
+    /// An explicitly EMPTY
     /// `target_modules` must ALSO refuse in this TRAINING tier, mirroring
     /// `finetune_step.rs`'s `build_fixture` precedent
     /// (`trainable.is_empty()`) EXACTLY — that check is unconditional on
@@ -3447,9 +3379,8 @@ mod tests {
             .collect()
     }
 
-    /// CONTRACT amendment 2026-08-29b, item 4 (falsifiability of the "the
-    /// corrected probe does not touch the training path" prediction, item
-    /// 2(i)): an EXTRA `evaluate_held_out` call on the UNTRAINED model, made
+    /// The init probe does not touch the training path: an EXTRA
+    /// `evaluate_held_out` call on the UNTRAINED model, made
     /// before the very first `run()` leg, must not perturb the resulting
     /// training trajectory at all — `TrainingLoop::evaluate_held_out`'s own
     /// `with_dropout_disabled` bracket ("Dropout bracket" in that method's
@@ -3465,14 +3396,12 @@ mod tests {
     /// not merely their reported summary numbers. CPU-hermetic, over the
     /// tiny generic `tiny_bert` fixture.
     ///
-    /// RED proof (performed by hand while authoring this test, not
-    /// committed): temporarily changing the per-epoch probe's loader to
-    /// re-use `train_loader` instead of a fresh `probe_loader` built from
-    /// `probe_triplet_rows`/`probe_pair_rows` (a stand-in for a
-    /// perturbation the seam is NOT supposed to have) made this test FAIL —
-    /// `named_with != named_without` — confirming the assertion is live,
-    /// not vacuously true because both sides always match regardless of
-    /// what `run_impl` actually does.
+    /// Mutation: make the per-epoch probe's loader re-use `train_loader`
+    /// instead of a fresh `probe_loader` built from
+    /// `probe_triplet_rows`/`probe_pair_rows` (a stand-in for a perturbation
+    /// the seam is NOT supposed to have) and this test FAILS —
+    /// `named_with != named_without` — so the assertion is live, not
+    /// vacuously true.
     #[tokio::test]
     async fn init_probe_does_not_perturb_the_training_trajectory_bitwise() {
         let work_dir_with = tempfile::tempdir().expect("tempdir with");
@@ -3531,7 +3460,7 @@ mod tests {
         );
     }
 
-    /// CONTRACT v2 addition (#356 P1, item 3): `train_run_wall_s` must be a
+    /// `train_run_wall_s` must be a
     /// REAL, measured, nonzero wall-clock time (never a stub/hardcoded
     /// value), and — because it times ONLY `training_loop.run()` calls,
     /// excluding `build_encoder_adapters`, the resume-checkpoint fetch, and
@@ -3568,14 +3497,13 @@ mod tests {
         );
     }
 
-    /// #500 U2c closing-round P-B1: `train_run_wall_s`'s composition excludes
-    /// [`RowSet::loader`]'s own build cost — the fix for finding F1, where an
-    /// earlier revision started `train_run_t0` BEFORE `train_rows.loader(..)`
-    /// ran, folding one epoch leg's row-marshalling clone into the field
+    /// `train_run_wall_s`'s composition excludes [`RowSet::loader`]'s own
+    /// build cost: starting `train_run_t0` BEFORE `train_rows.loader(..)`
+    /// would fold one epoch leg's row-marshalling clone into the field
     /// `report.rs`'s own doc says is `training_loop.run()` alone.
     ///
     /// The prior test above (`..._strictly_less_than_the_outer_wall_clock`)
-    /// cannot catch a re-contamination on this fixture: `RowSet::loader`'s
+    /// cannot catch that contamination on this fixture: `RowSet::loader`'s
     /// real cost (cloning 4-8 short synthetic strings) is nanoseconds,
     /// dwarfed by noise on any wall-clock comparison. This test makes
     /// construction's cost LARGE and DETERMINISTIC instead of relying on the
@@ -3648,11 +3576,11 @@ mod tests {
         );
     }
 
-    /// Phase-4 audit follow-up ("unproven-as-emitted"): the committed
-    /// goldens predate `layers_to_transform`/`train_run_wall_s`, so nothing
-    /// previously bound the declared Rust consts
-    /// (`FinetuneRunTier::IDENTITY_FIELDS`'s `layers_to_transform` entry,
-    /// and `train_run_wall_s` itself) to the ACTUAL bytes a real run emits.
+    /// Proven as emitted: the committed goldens carry no
+    /// `layers_to_transform`/`train_run_wall_s`, so this test is what binds
+    /// the declared Rust consts (`FinetuneRunTier::IDENTITY_FIELDS`'s
+    /// `layers_to_transform` entry, and `train_run_wall_s` itself) to the
+    /// ACTUAL bytes a real run emits.
     /// Runs the real CPU-fixture path (the same `run_impl` the smoke tests
     /// drive), wraps the resulting [`crate::report::FinetuneRunTier`] in a
     /// real [`crate::report::Report`], serializes THAT (not the bare tier),
@@ -3660,19 +3588,17 @@ mod tests {
     /// the Rust struct fields back — that `tiers.finetune_run` carries both
     /// keys.
     ///
-    /// RED evidence (round-2 audit, both performed by hand, reverted
-    /// immediately after): (1) the `layers_to_transform` half is doubly
-    /// covered — temporarily adding `#[serde(skip_serializing_if =
-    /// "Option::is_none")]` to that field made THIS test fail before even
+    /// Mutations: (1) the `layers_to_transform` half is doubly
+    /// covered — adding `#[serde(skip_serializing_if =
+    /// "Option::is_none")]` to that field makes THIS test fail before even
     /// reaching its own assertion, inside `run_impl`'s own
     /// `assert_identity_fields_present` self-check (`IDENTITY_FIELDS names
     /// "layers_to_transform", absent on this report`) — so a second,
-    /// independent mechanism already guards it. (2) Temporarily hardcoding
-    /// `train_run_wall_s: 0.0` at [`run_impl`]'s tier construction site made
+    /// independent mechanism already guards it. (2) Hardcoding
+    /// `train_run_wall_s: 0.0` at [`run_impl`]'s tier construction site makes
     /// this test's own `wall_s > 0.0` assertion fail
     /// (`tiers.finetune_run.train_run_wall_s must carry a real, measured,
-    /// nonzero value in the emitted JSON, got 0`) — round-3 audit
-    /// correction: the SAME mutation ALSO fails
+    /// nonzero value in the emitted JSON, got 0`); the SAME mutation ALSO fails
     /// [`train_run_wall_s_is_measured_and_strictly_less_than_the_outer_wall_clock`]
     /// above (its `tier.train_run_wall_s > 0.0` assertion), so this test is
     /// NOT that field's sole guard. The two tests cover DIFFERENT things:
@@ -3680,7 +3606,7 @@ mod tests {
     /// (`tier.train_run_wall_s`, never serialized); this one's unique
     /// contribution is proving the value actually survives
     /// `serde_json::to_value` NESTED under the real `tiers.finetune_run`
-    /// JSON path (the "unproven-as-emitted" gap this test exists to close)
+    /// JSON path
     /// — a producer that computed the field correctly but wired it to the
     /// wrong JSON key, or dropped it via a stray `skip_serializing_if`,
     /// would still pass the other test while failing this one.
@@ -3743,7 +3669,7 @@ mod tests {
         assert!(err.contains("triplet") && err.contains("mnrl"), "{err}");
     }
 
-    /// Projection correctness (unit 63 H4a-delta, task item 4): the MNRL
+    /// Projection correctness: the MNRL
     /// loader's (anchor, positive) rows must be EXACTLY the same rows, in
     /// the SAME committed order, as the source triplets — negative column
     /// dropped, nothing reordered, nothing dropped or duplicated — against
@@ -3802,7 +3728,7 @@ mod tests {
         assert!(project_to_pairs(&[]).is_empty());
     }
 
-    /// Unit 63 round-7 audit, finding 1: `--mutant-id`/`--mutant-base-sha`/
+    /// `--mutant-id`/`--mutant-base-sha`/
     /// `--mutant-patch-sha256` are all-or-none. This check fires FIRST, before
     /// any device/catalog/filesystem setup (see `run_impl`'s own leading
     /// validation block), so a plain `#[test]` (no tokio runtime) suffices —
@@ -3855,7 +3781,7 @@ mod tests {
     /// value on failure) cannot be used against it directly — this is the
     /// same shape as the `match result { Ok(_) => panic!(...), Err(e) => e
     /// }` pattern `mutant_provenance_flags_are_refused_when_partially_supplied`
-    /// already uses above, pulled out so the round-8 tests below don't each
+    /// already uses above, pulled out so the tests below don't each
     /// repeat it.
     fn expect_refused(
         result: Result<(FinetuneRunTier, VarMap), Box<dyn std::error::Error + Send + Sync>>,
@@ -3867,11 +3793,11 @@ mod tests {
         }
     }
 
-    /// Round-8 audit, finding 4: the all-or-none gate counts PRESENCE
-    /// (`is_some()`), not NON-EMPTINESS, so `--mutant-base-sha ""` (which
-    /// the CLI happily parses into `Some(String::new())`) sailed through as
-    /// "present" and produced a half-labeled leg. All three explicitly
-    /// supplied as the empty string must be refused — NOT silently treated
+    /// The all-or-none gate counts NON-EMPTINESS, not PRESENCE
+    /// (`is_some()`): `--mutant-base-sha ""` (which the CLI happily parses
+    /// into `Some(String::new())`) must not count as "present" and produce
+    /// a half-labeled leg. All three explicitly supplied as the empty
+    /// string must be refused — NOT silently treated
     /// as the ordinary non-mutant (`None`-trio) case, which is a distinct
     /// state (see [`mutant_provenance_all_absent_is_not_the_same_state_as_an_empty_trio`]).
     #[test]
@@ -3898,7 +3824,7 @@ mod tests {
         );
     }
 
-    /// Round-8 audit, finding 4: a whitespace-only trio is exactly as
+    /// A whitespace-only trio is exactly as
     /// un-attributable as an empty-string one — `trim()` must run BEFORE the
     /// emptiness check, not after (or not at all), so a padded value can't
     /// slip past as "present".
@@ -3922,13 +3848,12 @@ mod tests {
         );
     }
 
-    /// Round-8 audit, finding 4: exactly one of the three empty/whitespace
+    /// Exactly one of the three empty/whitespace
     /// (with the other two genuinely valid) must be refused just like the
-    /// classic `None`-mixed-with-`Some` partial subsets above — this is the
-    /// specific "half-labeled leg" shape the auditor found the old
-    /// `is_some()` count let through (all three `is_some()`, so the OLD
-    /// check saw "3 present" and did not refuse it). Exercised in all three
-    /// flag positions.
+    /// classic `None`-mixed-with-`Some` partial subsets above — the
+    /// "half-labeled leg" shape a bare `is_some()` count would let through
+    /// (all three `is_some()`, so it sees "3 present"). Exercised in all
+    /// three flag positions.
     #[test]
     fn mutant_provenance_one_empty_among_three_is_refused() {
         let valid_id = || Some("eps-0.10".to_string());
@@ -3962,7 +3887,7 @@ mod tests {
         }
     }
 
-    /// Round-8 audit, finding 4: malformed (non-hex or wrong-length) shas in
+    /// Malformed (non-hex or wrong-length) shas in
     /// an otherwise-complete, non-empty trio get their own typed, flag-named
     /// refusal — a "3 present" trio is necessary but not sufficient; the
     /// content must actually be a plausible sha. Fires before any
@@ -4024,7 +3949,7 @@ mod tests {
         );
     }
 
-    /// Round-8 audit, finding 4: a fully-supplied, non-empty trio clears the
+    /// A fully-supplied, non-empty trio clears the
     /// gate and the STAMPED values (in the returned tier) are the TRIMMED
     /// strings, never the raw, whitespace-padded CLI input — driven through
     /// the REAL `run_impl` end to end (not merely the leading validation
@@ -4049,14 +3974,10 @@ mod tests {
         assert_eq!(tier.mutant_patch_sha256, Some("a".repeat(64)));
     }
 
-    /// Advisory 6 (round-8): this module previously carried
-    /// `mutant_provenance_all_absent_clears_the_all_or_none_gate`, which
-    /// re-implemented the gate's own `is_some()`-counting predicate INLINE
-    /// and asserted it against itself — tautological, since it never called
-    /// `run_impl` and so could not observe whether the gate the production
-    /// code actually runs lets the all-absent case through. It has been
-    /// deleted rather than "fixed", because a real positive control for
-    /// "all-absent clears the gate" already exists and is exercised on
+    /// Pins only the TYPE-level distinction; it deliberately does not
+    /// re-implement the gate's predicate inline (a test asserting a copy of
+    /// the predicate against itself would be tautological). The real
+    /// positive control for "all-absent clears the gate" is exercised on
     /// every test run:
     ///
     /// - In-process: `init_probe_does_not_perturb_the_training_trajectory_bitwise`
@@ -4089,14 +4010,12 @@ mod tests {
         );
     }
 
-    /// C-ATTN widening (campaign #462/#463): the all-zero-attention validity
-    /// gate must now refuse an all-zero-counters run at `model_type` `"bert"`
-    /// and `"distilbert"`, not just `"modernbert"` — admission by counters,
-    /// never by architecture name. RED at base (pre-#462/#463): this gate
-    /// read `model_type == "modernbert"` literally, so a `bert`/`distilbert`
-    /// leg with real optimizer steps and all-zero attention counters read
-    /// `Ok(())` here — silently passing a run that never entered training
-    /// mode.
+    /// The all-zero-attention validity gate refuses an all-zero-counters run
+    /// at `model_type` `"bert"` and `"distilbert"`, not just `"modernbert"`
+    /// — admission by counters, never by architecture name. A gate reading
+    /// `model_type == "modernbert"` literally would pass a `bert`/`distilbert`
+    /// leg with real optimizer steps and all-zero attention counters —
+    /// silently passing a run that never entered training mode.
     #[test]
     fn fused_dispatch_proof_gate_refuses_all_zero_attention_for_every_supported_model_type() {
         for family in [
@@ -4167,29 +4086,25 @@ mod tests {
         assert!(fused_dispatch_proof_gate(EncoderFamily::Bert, 0, 0, 0, 0, 0, 0, 0).is_ok());
     }
 
-    /// The `"bert"` counted-eager head16 shape, dedicated (C-ATTN unit,
-    /// campaign #462/#463 fix round): `(attention_block_fused_dispatches,
+    /// The `"bert"` counted-eager head16 shape, dedicated:
+    /// `(attention_block_fused_dispatches,
     /// attention_block_eager_dispatches) == (0, 2)` are the EXACT counts
     /// `tests/finetune_run_smoke.rs`'s `tiny_bert` (`hidden_size: 32,
     /// num_attention_heads: 2` — `head_dim == 16 != 64`) end-to-end run
     /// measures for a 1-epoch, 2-batch leg: every training-mode attention
-    /// forward reaches `admit("attention_block_fused", ..)` (the C-ATTN
-    /// seam) and is DECLINED by the `head_dim == 64` domain predicate, so
+    /// forward reaches `admit("attention_block_fused", ..)` and is DECLINED
+    /// by the `head_dim == 64` domain predicate, so
     /// it counts as eager, never fused — the flash cascade is consulted
     /// first and also declines (`attention_block_flash_declined_dispatches
-    /// == 2`), never fires. This is the widened gate's headline claim made
-    /// concrete for the SPECIFIC architecture/shape this fix round
-    /// restored `tiny_bert` coverage for: `bert` at `head_dim != 64` no
-    /// longer reads all-zero forever (pre-C-ATTN premise this gate's own
-    /// doc used to state), it reads `(0, >0)`, and the gate must accept
-    /// that shape, not refuse it.
+    /// == 2`), never fires. So `bert` at `head_dim != 64` reads `(0, >0)`,
+    /// never all-zero, and the gate must accept that shape, not refuse it.
     #[test]
     fn fused_dispatch_proof_gate_passes_bert_counted_eager_head16_shape() {
         assert!(fused_dispatch_proof_gate(EncoderFamily::Bert, 2, 0, 2, 0, 2, 0, 0).is_ok());
     }
 
-    /// The complementary `"bert"` fused-arm shape, dedicated (C-ATTN unit,
-    /// campaign #462/#463 fix round): `(attention_block_fused_dispatches,
+    /// The complementary `"bert"` fused-arm shape, dedicated:
+    /// `(attention_block_fused_dispatches,
     /// attention_block_eager_dispatches) == (>0, 0)` is what a `bert` leg
     /// at `head_dim == 64` (the tensor-state predicate
     /// `jammi_encoders::attention_cascade`'s own doc names, not this
@@ -4207,15 +4122,13 @@ mod tests {
         assert!(fused_dispatch_proof_gate(EncoderFamily::Bert, 2, 2, 0, 0, 0, 0, 0).is_ok());
     }
 
-    // ── issue #421 W2b: the three towers, one resolution chain ──────────
+    // ── The three towers, one resolution chain ──────────────────────────
 
     /// The ONE-chain claim, made concrete: `tiny_open_clip` holds NEITHER
     /// `config.json` NOR `model.safetensors` — its files are
-    /// `open_clip_config.json` / `open_clip_model.safetensors`. Before this
-    /// unit, every consumer in this module joined the two hard-coded names
-    /// onto `model_dir` by hand, so this committed checkpoint was invisible
-    /// to the tier. RED at base: `Checkpoint` did not exist and the joins
-    /// pointed at files that are not there.
+    /// `open_clip_config.json` / `open_clip_model.safetensors`, so joining
+    /// the two hard-coded names onto `model_dir` by hand would leave this
+    /// committed checkpoint invisible to the tier.
     #[test]
     fn checkpoint_resolve_finds_the_open_clip_pair_and_names_the_family() {
         let dir = tiny_open_clip_model_dir();
@@ -4353,10 +4266,9 @@ mod tests {
     /// carries `#[serde(default, skip_serializing_if = "Option::is_none")]`,
     /// so a BERT adapter's `adapter_config.json` OMITS the `tower` key
     /// entirely rather than serialising an explicit `"tower":null` — the
-    /// pre-`#421` shape every already-shipped single-tower bundle has. This
-    /// pins that the key is genuinely absent from the emitted bytes (not
-    /// merely `None` after a round trip), so a bundle produced by this tier
-    /// is byte-identical to one from before this unit.
+    /// shape every single-tower bundle has. This pins that the key is
+    /// genuinely absent from the emitted bytes (not merely `None` after a
+    /// round trip).
     #[test]
     fn a_bert_adapter_carries_no_tower_stamp() {
         let varmap = VarMap::new();
@@ -4385,7 +4297,7 @@ mod tests {
         assert!(
             !json.contains("tower"),
             "a single-tower family must OMIT the tower key entirely (skip_serializing_if), not \
-             emit a null value — the pre-#421 wire shape: {json}"
+             emit a null value — the single-tower wire shape: {json}"
         );
         for stamped in ["\"text\"", "\"vision\"", "\"audio\""] {
             assert!(
@@ -4544,8 +4456,8 @@ mod tests {
         }
     }
 
-    /// The tower families' half of the dispatch-proof gate (issue #421
-    /// W2b). Both directions, because a control that only ever passes is not
+    /// The tower families' half of the dispatch-proof gate. Both
+    /// directions, because a control that only ever passes is not
     /// a control:
     ///
     /// - all-zero ATTENTION counters must NOT refuse a tower leg (a tower

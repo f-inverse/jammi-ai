@@ -1,9 +1,8 @@
-//! OPS (#482): warm-before-ready — `[server] preload_models` is loaded
+//! Warm-before-ready — `[server] preload_models` is loaded
 //! before `/readyz` reports ready, the claim loop is parked at its gate
 //! (`workers.state = warming`) until every entry is cached, a failed entry
 //! is a startup error, and a signal during the preload exits without
-//! serving. Base: the list has no reader (`/readyz` 200 with a cold cache,
-//! an unloadable entry serves anyway).
+//! serving.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -84,13 +83,13 @@ async fn get(url: String) -> (u16, serde_json::Value) {
 }
 
 /// This process's `workers.state` as `ListWorkers` reports it over the wire
-/// — the K4 half of the row read below.
+/// — the wire half of the row read below.
 ///
 /// Only callable once the process is SERVING: `serve_with_signals` binds the
 /// gRPC listener at `bind` but starts accepting on it only after the preload
 /// completes, so a connect during the warming window completes at TCP and
 /// then waits forever for an HTTP/2 handshake nothing is there to answer.
-/// `warming` is therefore a ROW fact (B4: the row is what another process
+/// `warming` is therefore a ROW fact (the row is what another process
 /// reads) — a peer replica sharing the catalog sees this one as `warming`
 /// over ITS wire; this process cannot report its own.
 async fn wire_worker_state(addr: std::net::SocketAddr) -> Option<String> {
@@ -158,7 +157,7 @@ fn one_epoch_fine_tune() -> jammi_ai::jobs::JobSpec {
     .into()
 }
 
-/// Acceptance 8: `/readyz` is 503 "preloading 0/1" while the listed model
+/// `/readyz` is 503 "preloading 0/1" while the listed model
 /// is parked before its load, `/healthz` is 200 throughout, the worker's
 /// row reads `warming` and a queued job stays `queued`; once the preload
 /// completes `/readyz` is 200, the row flips to `claiming` and the job
@@ -185,7 +184,7 @@ async fn readyz_is_503_until_preload_models_are_loaded_then_200() {
     assert_eq!(body["detail"], "preloading 0/1");
     let (status, body) = get(format!("http://{}/healthz", served.health_addr)).await;
     assert_eq!(status, 200, "liveness is 200 during preload: {body}");
-    // Acceptance 9's `warming` leg is asserted on the ROW: this process is
+    // The `warming` state is asserted on the ROW: this process is
     // not accepting gRPC yet (see `wire_worker_state`), and the row is what
     // a peer's `ListWorkers` reads.
     wait_worker_state(&served.session, "warming").await;
@@ -262,8 +261,7 @@ async fn readyz_is_503_until_preload_models_are_loaded_then_200() {
 
 /// An unloadable entry is a startup error: `serve` returns
 /// `Err(ServerError::Preload)`, gRPC never served, the worker's row
-/// deleted before the session closed. Base: the list has no reader, the
-/// server serves.
+/// deleted before the session closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preload_of_an_unloadable_model_is_a_startup_error() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -383,13 +381,13 @@ async fn signal_during_preload_exits_without_serving() {
     }
 }
 
-/// O4/W2: `ShutdownOutcome::Released` must come from a path that actually
+/// `ShutdownOutcome::Released` must come from a path that actually
 /// issued the release mechanism — not merely from whichever signal happened
 /// to preempt the preload. Arms the `ReleaseAt2e` rendezvous (the first
 /// statement of `EmbeddedWorker::release_and_stop`'s 2e) before sending the
-/// release signal: base called `stop_and_join` unconditionally on this arm,
-/// so 2e is never reached and the rendezvous never fires, even though the
-/// returned outcome already read `Released`.
+/// release signal: a path that calls `stop_and_join` unconditionally on this
+/// arm never reaches 2e, so the rendezvous never fires even though the
+/// returned outcome reads `Released`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn release_signal_during_preload_actually_releases() {
     let dir = tempfile::TempDir::new().unwrap();

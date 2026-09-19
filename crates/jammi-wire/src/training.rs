@@ -421,10 +421,10 @@ mod tests {
     /// An all-unset wire config — the shape a remote client builds when the
     /// caller omits every hyperparameter. With explicit presence on every
     /// scalar, this decodes to exactly the engine default: an omitted field is
-    /// the engine default, never a literal `0`/`false`. This is the regression
-    /// the pre-fix raw-cast decode silently broke (it read each scalar as `0`,
-    /// disabling weight decay / clipping / dropout / warmup / val split, or
-    /// failing validation outright on the count knobs).
+    /// the engine default, never a literal `0`/`false`. A raw-cast decode would
+    /// read each scalar as `0`, silently disabling weight decay / clipping /
+    /// dropout / warmup / val split, or failing validation outright on the
+    /// count knobs.
     #[test]
     fn all_unset_config_decodes_to_engine_default() {
         let proto = pb::FineTuneConfig::default();
@@ -445,19 +445,14 @@ mod tests {
         assert_eq!(decoded.batch_size, 8);
     }
 
-    /// NON-BUG GOLDEN for #347.
+    /// An explicit `validation_fraction = 0` survives the wire: no serde
+    /// default overrides it into the 10% default. The proto field carries
+    /// explicit presence, so a set-to-zero and an unset field are
+    /// distinguishable on the wire, and the converter honours both.
     ///
-    /// #347's first stated root cause is that a serde default overrides an
-    /// explicit `validation_fraction = 0`, so a user who asks for no validation
-    /// split silently gets 10%. That is false, and this pins why so nobody
-    /// "fixes" it later: the proto field carries explicit presence, so a set-to
-    /// -zero and an unset field are distinguishable on the wire, and the
-    /// converter honours both.
-    ///
-    /// The existing all-unset test covers only the omitted half — which is
-    /// exactly why the misconception was plausible. Both halves are asserted
-    /// here. A future change that made the field non-optional, or that coerced
-    /// `0.0` to the default, would fail this.
+    /// The all-unset test covers only the omitted half; this one asserts the
+    /// explicit-zero half. Making the field non-optional, or coercing `0.0`
+    /// to the default, fails this.
     #[test]
     fn explicit_zero_validation_fraction_survives_the_wire_round_trip() {
         let cfg = FineTuneConfig {
@@ -566,8 +561,8 @@ mod tests {
     /// presence on `k`/`exclude_hops`/`refresh_every`, this overlays onto the
     /// engine default rather than decoding the scalars as `0` — so the resulting
     /// config carries the engine's `k=1, exclude_hops=1, refresh_every=1` and
-    /// passes `validate`, instead of the pre-fix `refresh_every = 0` that
-    /// `validate` rejected for a knob the caller never set.
+    /// passes `validate`, never a raw-cast `refresh_every = 0` that
+    /// `validate` would reject for a knob the caller never set.
     #[test]
     fn hard_negatives_mine_only_overlays_engine_defaults() {
         let proto = pb::HardNegativeConfig {
@@ -689,7 +684,7 @@ mod world_size_tests {
 
     /// APPEND-ONLY. Every pre-existing `SubmitJobRequest` tag keeps its number
     /// and `world_size` takes the next free one that is not HELD — 9, because 7
-    /// and 8 are reserved for the deferred job-dependency unit (#515). A
+    /// and 8 are reserved for job dependencies. A
     /// renumbering, or taking a held tag, would decode a payload built against
     /// either contract into the wrong field.
     #[test]
@@ -713,11 +708,10 @@ mod world_size_tests {
         );
     }
 
-    /// HELD. Tags 7 and 8 belong to the deferred job-dependency unit
-    /// (`depends_on = 7`, `parent_id = 8`, #515): the message reserves them, so
-    /// `protoc` refuses any later field that tries to take one and the
-    /// cherry-pick reviving that unit cannot collide with a field appended in
-    /// the meantime. Same policy as `jammi.v1.error`'s vacant 37/38.
+    /// HELD. Tags 7 and 8 are reserved for job dependencies
+    /// (`depends_on = 7`, `parent_id = 8`): the message reserves them, so
+    /// `protoc` refuses any field that tries to take one. Same policy as
+    /// `jammi.v1.error`'s vacant 37/38.
     #[test]
     fn tags_seven_and_eight_are_held_for_the_deferred_dependency_unit() {
         assert_eq!(submit_job_request_reserved_tags(), vec![7, 8]);
@@ -922,8 +916,8 @@ mod cache_tests {
     }
 
     /// APPEND-ONLY. `cache` takes the next free tag after `world_size` (9) —
-    /// 10, since 7 and 8 stay reserved for the deferred job-dependency unit
-    /// (#515) — and every pre-existing field keeps its number. A renumbering,
+    /// 10, since 7 and 8 stay reserved for job dependencies — and every
+    /// pre-existing field keeps its number. A renumbering,
     /// or taking a held tag, would decode a payload built against either
     /// contract into the wrong field.
     #[test]

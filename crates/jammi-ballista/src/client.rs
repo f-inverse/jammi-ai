@@ -26,7 +26,7 @@ use crate::error::{Error, Result};
 /// upgrade_for_ballista`) so the scheduler resolves the same UDFs/session
 /// options the submitter's plan was built under.
 ///
-/// The KIND MATCH refusal (contract §3, LANE pressure-round correction):
+/// The KIND MATCH refusal:
 /// when `plan` requires a device kind ([`required_device_kind`] — the SAME
 /// predicate `placement::DevicePlacement` uses — a `GangExec`'s stamped
 /// kind or an `InferenceExec`'s, CPU included) and NO registered compute

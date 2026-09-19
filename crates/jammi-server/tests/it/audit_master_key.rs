@@ -4,12 +4,11 @@
 //! legs use to prove `main.rs`'s `ExitCode`/stderr mapping rather than just
 //! the in-process `Result`.
 //!
-//! Before this check existed, nothing decoded `JAMMI_AUDIT_MASTER_KEY` at
-//! boot: `jammi-server serve` started successfully with a malformed key, and
-//! audit signing stayed dead until the first `AuditService/AuditLog` call
-//! decoded it and failed deep inside a request — the RED this file's first
-//! test turns GREEN (see the eval-verdict RED text for the exact pre-fix
-//! `serve` invocation and its exit-0 observation).
+//! Without this check, nothing decodes `JAMMI_AUDIT_MASTER_KEY` at boot:
+//! `jammi-server serve` starts successfully with a malformed key, and audit
+//! signing stays dead until the first `AuditService/AuditLog` call decodes
+//! it and fails deep inside a request. This file's first test pins the
+//! startup refusal.
 
 use std::process::Stdio;
 use std::time::Duration;

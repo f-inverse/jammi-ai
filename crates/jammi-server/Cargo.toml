@@ -26,7 +26,7 @@ jammi-ai.workspace = true
 jammi-db.workspace = true
 jammi-numerics.workspace = true
 # The Ballista compute plane: `OssServer::bind` hosts the scheduler/executor
-# roles from `[ballista]`. No cargo feature — roles are config-shaped (B4).
+# roles from `[ballista]`. No cargo feature — roles are config-shaped.
 jammi-ballista.workspace = true
 ballista-core.workspace = true
 ballista-scheduler.workspace = true
@@ -68,7 +68,7 @@ async-trait.workspace = true
 reqwest.workspace = true
 
 [features]
-# Vendor-neutral OTLP trace export (#486), by-name passthrough to
+# Vendor-neutral OTLP trace export, by-name passthrough to
 # `jammi-ai`'s own `telemetry-otlp` feature (same precedent as `cuda`/
 # `metal`/`flash-attn` below). Default-on: every published `jammi-server`
 # binary and image carries it, so `[observability] otlp_endpoint` works with
@@ -78,7 +78,7 @@ reqwest.workspace = true
 # `--features -telemetry-otlp`, which cargo does not support removing a
 # default feature that way -- use `--no-default-features --features
 # <the others you want>`) compiles a build that REFUSES to start if
-# `otlp_endpoint` is configured (K2) rather than silently dropping every
+# `otlp_endpoint` is configured rather than silently dropping every
 # span.
 telemetry-otlp = ["jammi-ai/telemetry-otlp"]
 default = ["telemetry-otlp"]

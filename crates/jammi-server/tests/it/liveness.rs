@@ -1,7 +1,6 @@
-//! OPS (#482): `/healthz` liveness — 503 within one heartbeat of the lease
+//! `/healthz` liveness — 503 within one heartbeat of the lease
 //! keeper thread dying, 503 when the claim loop task panics, 200 while
-//! draining (with `/readyz` 503) — off a full `OssServer`. Base: `/healthz`
-//! is a stateless 200.
+//! draining (with `/readyz` 503) — off a full `OssServer`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -99,7 +98,7 @@ async fn wait_healthz(
     }
 }
 
-/// Acceptance 7: 503 within one `heartbeat_secs` of the keeper thread
+/// 503 within one `heartbeat_secs` of the keeper thread
 /// dying (`kill_thread_for_test` lands at its next tick), naming the keeper.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn healthz_flips_to_503_within_one_heartbeat_after_the_keeper_thread_dies() {
@@ -125,7 +124,7 @@ async fn healthz_flips_to_503_within_one_heartbeat_after_the_keeper_thread_dies(
 
     let _ = served.drain_tx.send(true);
     let _ = served.release_tx.send(true);
-    // Producer-driven P-2B oracle (contract CONTRACT-OPS-fix4.md M1): the
+    // Producer-driven oracle: the
     // keeper thread is dead, so its per-hold pass can never be confirmed to
     // have run — `release_outcome` must read that as `ReleaseDegraded`, not
     // `Released`, even though the RELEASE call itself returns `Ok`. This is

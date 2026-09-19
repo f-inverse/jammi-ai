@@ -147,7 +147,7 @@ fn status_class(code: Code) -> &'static str {
 mod tests {
     use super::*;
 
-    /// K4 (embedded ⇄ remote parity): the class the embedded engine raises for
+    /// Embedded ⇄ remote parity: the class the embedded engine raises for
     /// `EmptyTrainingSet` is the class the remote transport raises for the same
     /// failure.
     ///
@@ -156,9 +156,9 @@ mod tests {
     /// (`jammi_server::grpc::wire::map_engine_error`, pinned by that crate's
     /// `empty_training_set_round_trips_as_its_typed_variant_not_other`), and
     /// [`status_class`] is this crate's copy of the remote client's
-    /// code → class partition. Before this arm existed the variant fell through
-    /// to `BackendError`, so a caller catching `InvalidArgument` saw the K2
-    /// refusal remotely and missed it embedded.
+    /// code → class partition. Were the variant to fall through to
+    /// `BackendError`, a caller catching `InvalidArgument` would see the
+    /// empty-training-set refusal remotely and miss it embedded.
     #[test]
     fn empty_training_set_raises_the_class_the_remote_transport_raises() {
         let err = JammiError::EmptyTrainingSet {
@@ -173,7 +173,7 @@ mod tests {
     }
 
     /// The residual bucket is still the residual bucket: a fault that is not a
-    /// caller error keeps mapping to `BackendError`, so the arm above narrowed
+    /// caller error keeps mapping to `BackendError`, so the arm above narrows
     /// exactly one variant rather than widening the caller-error class.
     #[test]
     fn a_non_caller_fault_still_classifies_as_a_backend_error() {

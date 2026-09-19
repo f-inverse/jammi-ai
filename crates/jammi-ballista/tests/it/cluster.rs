@@ -1,9 +1,8 @@
-//! `CatalogClusterState` / `CatalogJobState` / `DevicePlacement` — oracle
-//! over BOTH catalog backends (contract `feat_500-wave4.md` §3; UNITS §U8b;
-//! acceptance b2/b3/b6's substrate, the `unbind_tasks` atomicity property, and
-//! A10's CAS-before-stamp ordering). Each property is one body taking the
-//! backend, run by a `_sqlite` test and, under `live-postgres-tests`, a
-//! `_postgres` test.
+//! `CatalogClusterState` / `CatalogJobState` / `DevicePlacement` — oracle over
+//! BOTH catalog backends: shared-catalog scheduler state, the `unbind_tasks`
+//! atomicity property, and the CAS-before-stamp ordering. Each property is one
+//! body taking the backend, run by a `_sqlite` test and, under
+//! `live-postgres-tests`, a `_postgres` test.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -95,8 +94,8 @@ fn executor_metadata(id: &str, task_slots: u32) -> (ExecutorMetadata, ExecutorDa
 
 /// Build a real, one-stage `JobInfoCache` around `plan` — no shuffle
 /// boundary, so `DefaultDistributedPlanner` produces exactly one
-/// `ShuffleWriter`-rooted stage that is immediately `Running` (contract §2.3:
-/// this is the SAME shape a placed gang's own single task takes).
+/// `ShuffleWriter`-rooted stage that is immediately `Running` (the SAME
+/// shape a placed gang's own single task takes).
 fn job_info_cache(job_id: &JobId, plan: Arc<dyn ExecutionPlan>) -> JobInfoCache {
     let mut planner = DefaultDistributedPlanner::new();
     let graph = StaticExecutionGraph::new(
@@ -751,10 +750,10 @@ async fn already_transferred_gang_is_never_bound_postgres() {
     already_transferred_gang_is_never_bound(BackendKind::Postgres).await;
 }
 
-/// A11 (this unit's own): the slot CAS happens BEFORE the graph's task info
-/// is stamped — an executor with ZERO available slots never has a task
-/// bound to it even though it is the only registered executor (contract §9
-/// A10). Mutation: skip the `bind_compute_slots` CAS and always stamp, and
+/// The slot CAS happens BEFORE the graph's task info is stamped — an
+/// executor with ZERO available slots never has a task bound to it even
+/// though it is the only registered executor. Mutation: skip the
+/// `bind_compute_slots` CAS and always stamp, and
 /// this reds (a task is "bound" to an executor with no real capacity).
 async fn a_slot_less_executor_never_gets_a_task_stamped(kind: BackendKind) {
     let catalog = catalog(kind).await;
@@ -958,7 +957,7 @@ async fn terminating_and_stale_executors_are_never_bound_postgres() {
 /// fresh `cuda` row does admit it (the call then proceeds to the scheduler
 /// and fails on the unreachable address, a DIFFERENT error). Mutation: drop
 /// `executor_is_live` from `submit_physical_plan`'s read and the stale row
-/// admits the plan (the first call no longer returns the refusal).
+/// admits the plan (the first call does not return the refusal).
 #[tokio::test]
 async fn a_stale_cuda_row_never_admits_a_cuda_plan_at_the_submit_edge() {
     let session = inference_session().await;

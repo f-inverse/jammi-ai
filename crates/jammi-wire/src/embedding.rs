@@ -264,7 +264,7 @@ mod result_table_kind_tests {
             .collect()
     }
 
-    /// The frozen wire numbering. `ResultTableKind` is append-only (H4): a
+    /// The frozen wire numbering. `ResultTableKind` is append-only: a
     /// renumbered or dropped value is a breaking change to a served enum, and
     /// an added one is appended here in the same change that adds it to the
     /// proto.

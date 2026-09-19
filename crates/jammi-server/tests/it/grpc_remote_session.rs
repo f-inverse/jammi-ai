@@ -477,7 +477,7 @@ async fn remote_binds_and_reads_tenant_over_the_wire() {
     let _ = server.handle.await;
 }
 
-/// K4 parity: the remote `CatalogService.Reconcile` and a local
+/// Parity: the remote `CatalogService.Reconcile` and a local
 /// `ResultStore::reconcile` / `reconcile_all` over the SAME engine report the
 /// IDENTICAL `ReconcileReport`, byte-for-byte on the wire encoding — proven on
 /// the divergence-prone shape (multiple non-empty repeated fields landing at
@@ -1145,7 +1145,7 @@ fn keys_and_scores(batches: Vec<arrow::record_batch::RecordBatch>) -> Vec<(Strin
     out
 }
 
-/// K4 for the incremental-embedding verbs: the SAME edit refreshed through a
+/// Parity for the incremental-embedding verbs: the SAME edit refreshed through a
 /// local `Session` and through the data-plane client, on one engine, one host,
 /// with the batch cadence pinned by the shared config, yields equal version
 /// identities, fragment digests, deletes digests and counts; only

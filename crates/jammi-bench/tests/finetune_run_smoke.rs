@@ -1,5 +1,5 @@
-//! CPU-hermetic end-to-end smoke test for the `finetune-run` tier (unit 63,
-//! CONTRACT H4): drives the REAL compiled `jammi-bench finetune-run`
+//! CPU-hermetic end-to-end smoke test for the `finetune-run` tier: drives
+//! the REAL compiled `jammi-bench finetune-run`
 //! subcommand — never `finetune_run::run` in-process (this crate is
 //! `[[bin]]`-only, see `finetune_step_kernel_disable.rs`'s own doc for why a
 //! fresh child process is this crate's convention) — over a TINY generic
@@ -28,8 +28,8 @@ fn model_dir() -> PathBuf {
 }
 
 /// Write `n` synthetic (anchor, positive, negative) triplets as JSONL, using
-/// the SAME field names the committed `finetune_heldout` fixture (CONTRACT
-/// H3) uses, so this generic synthetic fixture and the real committed one
+/// the SAME field names the committed `finetune_heldout` fixture uses, so
+/// this generic synthetic fixture and the real committed one
 /// are structurally interchangeable inputs to this CLI.
 fn write_triplets_jsonl(dir: &Path, name: &str, n: usize, offset: usize) -> PathBuf {
     let path = dir.join(name);
@@ -63,8 +63,8 @@ fn write_heldout_ids(dir: &Path, n: usize, offset: usize) -> PathBuf {
 /// One `finetune-run` invocation over the tiny synthetic fixture: 4 train
 /// triplets (2 batches at `--batch 2`), 2 held-out triplets (1 batch),
 /// 2 epochs, `--eval-cadence 1` (so both epochs call `evaluate_held_out`).
-/// `objective` is `"triplet"` or `"mnrl"` (unit 63 H4a-delta, CONTRACT
-/// amendment 2026-08-28): the SAME fixture rows and `--heldout-ids` order
+/// `objective` is `"triplet"` or `"mnrl"`: the SAME fixture rows and
+/// `--heldout-ids` order
 /// feed either — `mnrl` drops the negative column via the tier's own
 /// `project_to_pairs` projection.
 fn base_command(work_dir: &Path, fixtures_dir: &Path, objective: &str) -> Command {
@@ -72,8 +72,8 @@ fn base_command(work_dir: &Path, fixtures_dir: &Path, objective: &str) -> Comman
 }
 
 /// [`base_command`] with the epoch count as a parameter. `2` is the
-/// resume-cycle case every pre-existing test here drives; `1` is what the
-/// #421 profile legs pin, and the two are NOT interchangeable for
+/// resume-cycle case most tests here drive; `1` is what the
+/// profile legs pin, and the two are NOT interchangeable for
 /// `steps_measured` — see
 /// [`fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run`]
 /// for the exact difference and why it matters.
@@ -228,7 +228,7 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
         assert!(!v.is_null(), "provenance field {field:?} is null: {v:?}");
     }
 
-    // The endpoint fields (CONTRACT H4/Frame).
+    // The endpoint fields.
     assert_eq!(obj["final_epoch"], serde_json::json!(1));
     assert!(obj["held_out_example_mean"].as_f64().is_some());
     assert_eq!(obj["held_out_count"], serde_json::json!(2));
@@ -246,9 +246,9 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
     assert_eq!(trajectory[0]["epoch"], serde_json::json!(0));
     assert_eq!(trajectory[1]["epoch"], serde_json::json!(1));
 
-    // Advisory (e) (unit 63 round-7 audit): `train_probe_series` must exist
+    // `train_probe_series` must exist
     // and carry exactly `epochs + 1` entries (the init probe plus one per
-    // epoch — CONTRACT amendment 2026-08-29b) in the CLI-level report the
+    // epoch) in the CLI-level report the
     // merger actually reads, not merely in an in-process unit test —
     // `--epochs 2` here, so `2 + 1 == 3`.
     let train_probe_series = obj["train_probe_series"]
@@ -270,7 +270,7 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
     // `--arm fused` was declared; the process made no kernel-disable claim.
     assert_eq!(obj["arm"], serde_json::json!("fused"));
 
-    // C-MLP GELU-erf positive-proof (campaign #462/#463): `tiny_bert`'s
+    // GELU-erf positive-proof: `tiny_bert`'s
     // FFN (`BertIntermediate::forward`, `hidden_act: "gelu"`) calls
     // `jammi_encoders::activations::gelu_erf` in training mode at least
     // once per layer per forward — this run's `--arm fused` and CPU F32
@@ -288,8 +288,7 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
         obj["gelu_fused_dispatches"]
     );
 
-    // Identity-value semantics (unit 63 H4a-delta, CONTRACT amendment
-    // 2026-08-28): `--objective triplet` → `embedding_loss: "triplet"`,
+    // Identity-value semantics: `--objective triplet` → `embedding_loss: "triplet"`,
     // `temperature: null`, `margin` non-null (already checked above).
     assert_eq!(obj["embedding_loss"], serde_json::json!("triplet"));
     assert!(
@@ -299,8 +298,8 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
     );
 }
 
-/// The profile's POSITIVE-PROOF equation, checked LIVE on a real run
-/// (issue #421 §D4 item 1): for each fusible key, `fused + eager ==
+/// The profile's POSITIVE-PROOF equation, checked LIVE on a real run: for
+/// each fusible key, `fused + eager ==
 /// <witnessed census field> × steps_measured`.
 ///
 /// This is the assertion a profile merger applies to
@@ -319,13 +318,13 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
 /// wrapped arms per layer (2 here — `query,value`), `embeddings + 2 per
 /// layer` LayerNorms, one GELU seam call per layer.
 ///
-/// ## The `--epochs 1` pin is LOAD-BEARING, and this test found out why
+/// ## The `--epochs 1` pin is LOAD-BEARING
 ///
 /// `batches == steps_measured` holds only at `--epochs 1 --grad-accum 1`,
-/// which is exactly what the #421 legs pin — and this test is written at
+/// which is exactly what the profile legs pin — and this test is written at
 /// that pin rather than at this file's `base_command` default of `2`
-/// BECAUSE the first version of it, at `--epochs 2`, failed:
-/// `steps_measured` read `6` where the run took `4` training forwards
+/// BECAUSE at `--epochs 2` the equation does not hold:
+/// `steps_measured` reads `6` where the run took `4` training forwards
 /// (`lora_linear_fused_dispatches == 8` over `2` wrapped sites).
 ///
 /// The cause is this tier's resume-cycle. `finetune_run::run` drives
@@ -338,8 +337,8 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
 /// `6` over-counts. `steps_measured` is therefore a faithful count of
 /// TRAINING FORWARDS only when there is a single leg.
 ///
-/// This is a convention pin, not a bug hunt: at `--epochs 1` (every #421
-/// leg, A and D alike) the two coincide exactly, which is what the
+/// This is a convention pin, not a bug hunt: at `--epochs 1` (every
+/// profile leg) the two coincide exactly, which is what the
 /// assertion below proves on real output.
 #[test]
 fn fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run() {
@@ -448,8 +447,8 @@ fn fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run() {
     }
 }
 
-/// The MNRL twin of [`finetune_run_smoke_end_to_end_cpu_hermetic`] (unit 63
-/// H4a-delta): the SAME fixture, SAME held-out id order, `--objective mnrl`
+/// The MNRL twin of [`finetune_run_smoke_end_to_end_cpu_hermetic`]: the
+/// SAME fixture, SAME held-out id order, `--objective mnrl`
 /// instead — proving this tier actually drives the (anchor, positive)
 /// projection through `TrainingLoopBuilder` + `evaluate_held_out` end to
 /// end, across the same 2-epoch resume-cycle.
@@ -536,7 +535,7 @@ fn finetune_run_smoke_mnrl_end_to_end_cpu_hermetic() {
         "expected one evaluate_held_out point per epoch at eval_cadence=1: {trajectory:?}"
     );
 
-    // Advisory (e) (unit 63 round-7 audit): the MNRL objective's
+    // The MNRL objective's
     // `train_probe_series` must carry the same `epochs + 1` shape as the
     // Triplet leg — this field's shape does not depend on which objective
     // was selected.

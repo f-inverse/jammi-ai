@@ -1,11 +1,10 @@
-//! `ExecutorRole::begin_drain` (contract `feat_500-wave4` §9b F2), in its
+//! `ExecutorRole::begin_drain`, in its
 //! OWN test binary/process for the same reason `roles_drain.rs` is:
 //! `begin_drain`'s first statement stores `ballista_executor::
 //! executor_server::TERMINATING` (a crate-wide `static AtomicBool` nothing
 //! resets), after which every executor hosted in this process reports
 //! `Terminating` and is never bound again — so this test may never share a
-//! process with an executor-hosting test that needs a task bound
-//! (closing audit #5's block: the oracle first landed in `tests/it`).
+//! process with an executor-hosting test that needs a task bound.
 
 use std::sync::Arc;
 
@@ -26,7 +25,7 @@ async fn session() -> Arc<InferenceSession> {
     Arc::new(s)
 }
 
-/// The DRAIN instant (contract §9 B6): `ExecutorRole::begin_drain` reports
+/// The DRAIN instant: `ExecutorRole::begin_drain` reports
 /// `Terminating` to the scheduler and, over the catalog-backed cluster
 /// state, the executor's OWN row reads `Terminating` and not live — the
 /// binder stops binding here before the process's worker has finished

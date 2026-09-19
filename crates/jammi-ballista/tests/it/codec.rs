@@ -1,4 +1,4 @@
-//! Hermetic codec round-trip oracles (contract `feat_500-wave4` §7 (a1)).
+//! Hermetic codec round-trip oracles.
 
 use std::sync::Arc;
 
@@ -51,7 +51,7 @@ fn two_col_scan(a: &str, b: &str, vals: &[&str]) -> Arc<dyn ExecutionPlan> {
     MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap()
 }
 
-/// A1: the magic's first byte is an illegal prost tag — pinned against
+/// The magic's first byte is an illegal prost tag — pinned against
 /// Ballista's own `BallistaPhysicalPlanNode` oneof's five variants' first
 /// bytes (`ballista-core-54.1.0/src/serde/generated/ballista.rs:31-54`), so
 /// an upstream 6th variant landing on the same byte is caught.
@@ -129,8 +129,7 @@ async fn inference_exec_round_trips() {
     assert_eq!(buf, buf2, "encode -> decode -> encode is byte-identical");
 }
 
-/// Replaces `inference_exec_device_kind_defaults_to_the_submitting_sessions_own`
-/// (contract `feat_500-wave4` §9 B3): the codec never invents or rewrites a
+/// The codec never invents or rewrites a
 /// `device_kind` — it carries exactly the constructed value across the wire,
 /// even when the constructing session's own device kind differs from the
 /// descriptor's.
@@ -207,9 +206,8 @@ async fn gang_exec_round_trips() {
         submitter: "instance-a".to_string(),
         // Deliberately NOT the session's own kind (Cpu): the wire must
         // carry exactly what was constructed, never the decoding session's
-        // own default (LANE pressure-round correction, the same "codec
-        // never rewrites device_kind" rule `InferenceExec` round-trips
-        // under).
+        // own default (the same "codec never rewrites device_kind" rule
+        // `InferenceExec` round-trips under).
         device_kind: ComputeDeviceKind::Cuda,
     };
     let node = jammi_ai::operator::gang_exec::GangExec::new(descriptor.clone());
@@ -347,7 +345,7 @@ async fn ann_search_exec_round_trips() {
 
 /// `MaskExec` (a masked result-table scan) is the named v1 cut: neither
 /// codec knows it, so it is refused typed, naming it — the SAME shape the
-/// contract's "a node neither codec knows is refused typed" property
+/// "a node neither codec knows is refused typed" property
 /// covers for any other unknown node (proven by `unknown_node_is_refused_typed`
 /// below over a plain `DataSourceExec`, which is unknown to BOTH codecs).
 #[tokio::test]
@@ -368,8 +366,8 @@ async fn mask_exec_is_refused_typed() {
     );
 }
 
-/// RS6 (#540 RANGESPLIT), the contract's stop-rule exit: `OrdinalSplitExec`
-/// gets the SAME v1-cut treatment as `MaskExec` above — no `NodeTag`, no
+/// `OrdinalSplitExec` gets the SAME v1-cut treatment as `MaskExec` above —
+/// no `NodeTag`, no
 /// `plan.proto` message, no encode/decode arm — so a plan containing it
 /// (only ever built when `InferenceConfig::partitions > 1`; the default `1`
 /// never inserts this node) is refused typed rather than silently
@@ -595,12 +593,10 @@ async fn ann_search_decode_refuses_another_tenants_table_and_a_tenant_free_read_
 /// `Code::Internal` (`jammi-server/src/grpc/wire.rs`'s catch-all), never
 /// `InvalidArgument`, regardless of which typed variant this decode boxes.
 /// The caller-class path for a remote client is the coordinator's own
-/// `QueryBuilder::new` check, which runs before any plan is shipped —
-/// tracked as a residual on #519, its own unit, not a fold of this test.
+/// `QueryBuilder::new` check, which runs before any plan is shipped.
 ///
-/// Mutation executed: revert the fix (pass `None` instead of
-/// `table.dimensions()`) — this test reds (the malformed query decodes
-/// instead of being refused).
+/// Mutation: pass `None` instead of `table.dimensions()` and this test reds
+/// (the malformed query decodes instead of being refused).
 #[tokio::test(flavor = "multi_thread")]
 async fn ann_search_decode_checks_width_against_the_catalog_authority_it_holds() {
     use jammi_ballista::codec::{pb, NodeTag, MAGIC};

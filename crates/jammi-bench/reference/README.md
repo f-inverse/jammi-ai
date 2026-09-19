@@ -9,7 +9,7 @@ tape at once), a cosine-margin triplet loss over L2-normalized mean-pooled
 embeddings, one backward into the LoRA tensors, one AdamW step — so the two
 can be compared step-for-step on the same box.
 
-## B2: what this is not
+## What this is not
 
 * Not a Cargo dependency. `torch`/`transformers`/`peft` never appear in any
   crate's `Cargo.toml`, and this script is never invoked from CI (`torch` is
@@ -46,10 +46,8 @@ torch==2.13.0  transformers==5.15.1  peft==0.20.0
 
 **Minimum requirement, not a suggestion:** `transformers >= 4.48.0` — that is
 the release ModernBERT (`ModernBertConfig`/`ModernBertModel`) shipped in
-(2025-01-10). An earlier draft of this file pinned `transformers==4.44.2`
-(2024-08-22) as "developed against"; that version predates ModernBERT
-entirely and could not have run this script — that claim was false and has
-been removed. Every report's `provenance` block records the versions that
+(2025-01-10); no earlier `transformers` can run this script. Every report's
+`provenance` block records the versions that
 actually produced that report; treat that block as authoritative over
 anything in this README or the script's own docstring.
 
@@ -72,7 +70,7 @@ python3 torch_finetune_step.py \
 ```
 
 Run it twice per config — once with `--attn eager`, once with `--attn sdpa`
-— and record both rows: `sdpa` is torch's best-case number (what a `#352`
+— and record both rows: `sdpa` is torch's best-case number (what a
 throughput ratio should compare `jammi-fused` against); `eager` is the
 semantic twin of jammi's own attention composition (no fused SDPA kernel).
 The report's `finetune_step.attn_implementation` field is the RESOLVED
@@ -135,12 +133,12 @@ silently downgraded.
 | `--lora-init` | *(none in jammi — new; see below)* | `peft` (default) or `jammi`. Controls the LoRA `A` matrix's initial distribution. See "LoRA init" below — this is NOT a cosmetic flag, the two inits differ by a ~1.73x bound factor. |
 | `--max-grad-norm` | `--max-grad-norm` | See "The trainer-shaped step: `--max-grad-norm`" below. Both sides absent-by-default (clip OFF); when supplied, torch runs `torch.nn.utils.clip_grad_norm_(trainable, max_norm)` after `backward()` (after `scaler.unscale_` under AMP) and jammi runs the production `clip_gradients` at the same point. `max_grad_norm` is a member of the SHARED identity set (`ci/scripts/perf/identity_fields.py`'s `FINETUNE_IDENTITY_FIELDS`, where `null` is a value meaning "off"), so `ab_merge.py` refuses a row whose two legs differ; each leg also reports `clip_invocations`, the counted number of clip calls, which `ab_merge.clip_fact_violations` checks against the request. |
 | `JAMMI_KERNELS_DISABLE=attention_block` (env) | `--attn` | `attention_arm` — the attention REFERENCE CLASS a leg was ASKED to run (`"eager"` or `"fused"`) — is a shared identity field too: torch derives it from the RESOLVED `_attn_implementation` (`eager` → `"eager"`, `sdpa`/flash/flex → `"fused"`), jammi from the operator's resolved `JAMMI_KERNELS_DISABLE` request (an attention base — `attention_block`, `attention_block_flash`, `all` — in `kernels_disabled_requested` → `"eager"`, else `"fused"`). Deliberately NOT the dispatch counters: those read eager on a by-design domain decline (`head_dim != 64`, `seq > 4096`, dtype/contiguity/mask), a measurement `fused_proof` already owns. `ab_merge.py` refuses a jammi-eager ↔ torch-sdpa pairing — the "two references, never mixed" rule as a checked premise — and treats a FALLBACK leg (torch-sdpa OOM → torch-eager) as "not comparable", never as a mismatch. The raw strings/counters stay in provenance. |
-| *(n/a)* | `ln_fused_dispatches`/`ln_eager_dispatches`/`rope_fused_dispatches`/`rope_eager_dispatches`/`softmax_fused_dispatches`/`softmax_eager_dispatches`/`geglu_fused_dispatches`/`geglu_eager_dispatches`/`gelu_fused_dispatches`/`gelu_eager_dispatches`/`lora_epilogue_fused_dispatches`/`lora_epilogue_eager_dispatches`/`attention_block_fused_dispatches`/`attention_block_eager_dispatches`/`adamw_fused_dispatches`/`adamw_eager_dispatches` | Not reported here — those are jammi's own fused-kernel dispatch counters (`jammi_kernels::ops::LayerNormFused`/`RopeFused`/`SoftmaxLastDimFused`/`GegluFused`/`GeluErfFused`/`ScaledCastAdd`/`AttentionBlockFused`/`adamw_step_fused_t`); there is no equivalent concept on the torch side (`--attn` is the closest analogue for attention, and torch's own kernel dispatch inside `sdpa`/`eager` is not independently observable through the public API this script is restricted to). **Honest note on `attention_block_*`:** `AttentionBlockFused`'s domain is fixed at `head_dim == 64` (`jammi_kernels::ops::ATTENTION_BLOCK_HEAD_DIM`) — on any checkpoint whose `hidden_size / num_attention_heads != 64`, the admission predicate refuses by domain (`"head_dim_is_attention_block_fixed_head_dim"`) on every call, so the pair reads `attention_block_fused_dispatches: 0` / `attention_block_eager_dispatches: N` (`N` = the number of attention calls the step made) even on a run whose OTHER fused counters (`ln`/`rope`/`softmax`/`geglu`/`lora_epilogue`) are non-zero. That all-eager reading is the predicate working as designed, not a broken fused path — never read `0` fused dispatches here as evidence the kernel is unreachable in general; check the checkpoint's `head_dim` first — this restriction is now shared: BERT and DistilBERT admit the SAME fused whole-attention-block kernel through the SAME `head_dim == 64` predicate (C-ATTN unit, campaign #462/#463), so this note applies identically across every architecture this tier supports, never by architecture name. **Honest note on `gelu_*`:** `GeluErfFused` (admit key `gelu_erf_fused`, C-MLP unit) is wired ONLY at BERT's and DistilBERT's FFN activation call sites — ModernBERT's FFN is GeGLU (counted in `geglu_*` above, whose internal `gelu_erf` composition step is a SEPARATE thing this pair never counts), so a ModernBert leg reads `gelu_fused_dispatches: 0` / `gelu_eager_dispatches: 0` by construction, not by domain decline. `adamw_fused_dispatches`/`adamw_eager_dispatches` are the forced-arm A/B's production switch: `JAMMI_KERNELS_DISABLE=adamw_step_fused` forces every `AdamW::step` call this run onto the eager arm (see `jammi_ai::fine_tune::adamw::AdamW::step`'s doc). |
+| *(n/a)* | `ln_fused_dispatches`/`ln_eager_dispatches`/`rope_fused_dispatches`/`rope_eager_dispatches`/`softmax_fused_dispatches`/`softmax_eager_dispatches`/`geglu_fused_dispatches`/`geglu_eager_dispatches`/`gelu_fused_dispatches`/`gelu_eager_dispatches`/`lora_epilogue_fused_dispatches`/`lora_epilogue_eager_dispatches`/`attention_block_fused_dispatches`/`attention_block_eager_dispatches`/`adamw_fused_dispatches`/`adamw_eager_dispatches` | Not reported here — those are jammi's own fused-kernel dispatch counters (`jammi_kernels::ops::LayerNormFused`/`RopeFused`/`SoftmaxLastDimFused`/`GegluFused`/`GeluErfFused`/`ScaledCastAdd`/`AttentionBlockFused`/`adamw_step_fused_t`); there is no equivalent concept on the torch side (`--attn` is the closest analogue for attention, and torch's own kernel dispatch inside `sdpa`/`eager` is not independently observable through the public API this script is restricted to). **Honest note on `attention_block_*`:** `AttentionBlockFused`'s domain is fixed at `head_dim == 64` (`jammi_kernels::ops::ATTENTION_BLOCK_HEAD_DIM`) — on any checkpoint whose `hidden_size / num_attention_heads != 64`, the admission predicate refuses by domain (`"head_dim_is_attention_block_fixed_head_dim"`) on every call, so the pair reads `attention_block_fused_dispatches: 0` / `attention_block_eager_dispatches: N` (`N` = the number of attention calls the step made) even on a run whose OTHER fused counters (`ln`/`rope`/`softmax`/`geglu`/`lora_epilogue`) are non-zero. That all-eager reading is the predicate working as designed, not a broken fused path — never read `0` fused dispatches here as evidence the kernel is unreachable in general; check the checkpoint's `head_dim` first — this restriction is shared: BERT and DistilBERT admit the SAME fused whole-attention-block kernel through the SAME `head_dim == 64` predicate, so this note applies identically across every architecture this tier supports, never by architecture name. **Honest note on `gelu_*`:** `GeluErfFused` (admit key `gelu_erf_fused`) is wired ONLY at BERT's and DistilBERT's FFN activation call sites — ModernBERT's FFN is GeGLU (counted in `geglu_*` above, whose internal `gelu_erf` composition step is a SEPARATE thing this pair never counts), so a ModernBert leg reads `gelu_fused_dispatches: 0` / `gelu_eager_dispatches: 0` by construction, not by domain decline. `adamw_fused_dispatches`/`adamw_eager_dispatches` are the forced-arm A/B's production switch: `JAMMI_KERNELS_DISABLE=adamw_step_fused` forces every `AdamW::step` call this run onto the eager arm (see `jammi_ai::fine_tune::adamw::AdamW::step`'s doc). |
 
 ## The trainer-shaped step: `--max-grad-norm`
 
-Every `finetune-step` row recorded before this flag existed measured a step
-the product does not run. The shipped trainer's `FineTuneConfig` defaults
+A `finetune-step` row without this flag measures a step the product does
+not run. The shipped trainer's `FineTuneConfig` defaults
 `max_grad_norm` to `1.0`
 (`crates/jammi-wire/src/fine_tune.rs`'s `default_max_grad_norm`), and
 `fine_tune::trainer::TrainingLoop::process_batch_loss` always calls
@@ -158,8 +156,7 @@ skipped those ops.
 same point in the sequence the trainer does — after `backward()`, before the
 optimizer step (`finetune_step.rs`'s step loop, mirroring
 `trainer.rs`'s `process_batch_loss`). Omit the flag (the default) to measure
-the step this tier always measured before — bit-identical to before this
-flag existed, and useful as the isolated no-clip reference point. Supply it
+the no-clip step — the isolated no-clip reference point. Supply it
 (`--max-grad-norm 1.0` to match the trainer's own default) to measure the
 step the product actually runs; the delta between an on row and an off row
 on the *same box* is the device-side clip's cost (the `4n + 4` device ops
@@ -224,15 +221,15 @@ loop (warmup + measured), then subtracts a baseline snapshot
 after the model+optimizer are built (before the loop starts) — see
 `vram_baseline`, finetune_step.rs:821.
 
-**An earlier draft of this script got the sampling point wrong.** It polled
-`torch.cuda.memory_allocated()` once per step, at the same point the clock
-stopped — i.e. AFTER `backward()` + `optimizer.step()` + the `.item()` sync,
-the one instant in each step where every saved activation has already been
-freed. Measured directly: that poll captured 403 KiB of a 9087 KiB in-step
-peak (~4.4%), systematically, on every measured step — a discrete poll
-phase-locked to the step's deterministic TROUGH, not its peak. That
-per-step poll has been REMOVED. There was a second, independent asymmetry in
-the same draft: torch's `AdamW` allocates its `exp_avg`/`exp_avg_sq` moment
+**Sampling point matters.** Polling `torch.cuda.memory_allocated()` once per
+step, at the same point the clock stops — i.e. AFTER `backward()` +
+`optimizer.step()` + the `.item()` sync — reads the one instant in each step
+where every saved activation has already been freed. Measured directly:
+such a poll captured 403 KiB of a 9087 KiB in-step peak (~4.4%),
+systematically, on every measured step — a discrete poll phase-locked to the
+step's deterministic TROUGH, not its peak. This script does not poll per
+step. A second, independent asymmetry: torch's `AdamW` allocates its
+`exp_avg`/`exp_avg_sq` moment
 tensors LAZILY, on the first `optimizer.step()` call (measured: 0 optimizer
 state tensors before that first step, 48 after, on a tiny test model) —
 while candle's `AdamW::new` allocates them EAGERLY, before jammi's own
@@ -241,7 +238,7 @@ returns (before any step) would therefore NOT yet include the moments, and
 their one-time first-step allocation would land inside the measured delta
 instead of being absorbed into the baseline the way jammi's is.
 
-Both problems are fixed the same way: this script now runs ONE UNTIMED
+Both are handled the same way: this script runs ONE UNTIMED
 optimizer step (forward + backward + `optimizer.step()`, via the internal
 `_step_once` helper — not counted in `--warmup`/`--steps`, never part of any
 reported timing) immediately after the model+optimizer are built, BEFORE
@@ -254,13 +251,13 @@ reported `--warmup` step 0 begins. This does not affect any reported number
 actual values, and this script never reports or interprets the loss value
 itself.)
 
-With that fixed baseline point established, BOTH VRAM fields now come from
+With that baseline point established, BOTH VRAM fields come from
 torch's own CONTINUOUS allocator high-water mark — `torch.cuda.reset_peak_memory_stats()`
 called ONCE right after the untimed warm-up step (i.e. right before the
 timed warmup+measured loop starts, matching the window jammi's sampler
 covers), then `torch.cuda.max_memory_allocated()` read once after the loop
 ends. A continuous tracker cannot miss an intra-step spike the way ANY
-discrete poll can — this script's old per-step read, or jammi's own 25ms
+discrete poll can — a per-step read, or jammi's own 25ms
 `nvidia-smi` interval:
 
 * **`peak_vram_delta_bytes`** — the field COMPARABLE to jammi's
@@ -269,7 +266,7 @@ discrete poll can — this script's old per-step read, or jammi's own 25ms
   model+optimizer construction AND after the one untimed moment-warmup step,
   recorded separately as `peak_vram_baseline_bytes`). Computed as
   `max_memory_allocated() - peak_vram_baseline_bytes` after the loop.
-  **RESIDUAL ASYMMETRY, stated rather than papered over:** this is now a
+  **RESIDUAL ASYMMETRY, stated rather than papered over:** this is a
   CONTINUOUS allocator high-water mark; jammi's is a 25ms-interval discrete
   poll. `peak_vram_delta_bytes` may therefore legitimately read HIGHER than
   jammi's `peak_vram_bytes` even when the underlying activation footprint is
@@ -325,14 +322,12 @@ exists so that if a `transformers` version ever makes the
 `from_pretrained(..., reference_compile=False)` call itself raise, this
 script falls back to the plain call rather than failing the whole run.
 
-**Whether the pin took is never inferred from "the call didn't raise."** An
-earlier draft of this script recorded a boolean `..._accepted` flag set to
-`True` purely because `from_pretrained` didn't raise — but it was measured
-`True` in exactly the case where the kwarg was silently dropped
-(`hasattr(cfg, "reference_compile")` was `False` immediately after that
-"successful" call), which is precisely backwards. That boolean has been
-replaced with two RESOLVED readbacks, taken directly off `model.config`,
-never inferred from call success:
+**Whether the pin took is never inferred from "the call didn't raise."** A
+boolean set because `from_pretrained` didn't raise reads `True` in exactly
+the case where the kwarg was silently dropped
+(`hasattr(cfg, "reference_compile")` is `False` immediately after that
+"successful" call), which is precisely backwards. The report instead
+carries two RESOLVED readbacks, taken directly off `model.config`:
 
 * `finetune_step.reference_compile_resolved` — `getattr(model.config,
   "reference_compile", "absent")`, read right after `AutoModel.from_pretrained`
@@ -381,7 +376,7 @@ reach.
 construction — before `--dry-run`'s own donor-checkpoint build, before
 `load_model`, before `wrap_lora` — because peft's default LoRA init draws
 `A` from torch's global generator at `get_peft_model` time; seeding after
-that call (an earlier draft of this script did) would leave the adapter
+that call would leave the adapter
 init unseeded by `--seed`; `--lora-init jammi`'s re-draw also depends on
 this ordering for its own determinism. Seeding before the `--dry-run` donor
 checkpoint's own random init means the WHOLE random-draw pipeline is
@@ -409,7 +404,7 @@ sdpa`), the two `reference_compile_*` readbacks, and
 `FinetuneStepTier` in `crates/jammi-bench/src/report.rs` wherever the
 concept is the same. No number in this report is asserted or gated inside
 the script; it is a measurement to be read alongside jammi's own JSON
-report by whatever process consumes both (a later contract's A/B table).
+report by whatever process consumes both (e.g. an A/B table).
 
 ## Range guards
 
@@ -425,7 +420,7 @@ just because `--dry-run` happened to make it irrelevant.
 ## `torch_grad_oracle.py` — the jammi-vs-torch LEARNING oracle's torch side
 
 A SEPARATE script, not a mode of `torch_finetune_step.py` (different
-contract: one forward+backward at IDENTICAL LoRA weights, no optimizer
+measurement: one forward+backward at IDENTICAL LoRA weights, no optimizer
 step, no timing). See `crates/jammi-bench/src/grad_oracle.rs`'s module doc
 for the full "why gradients, not loss trajectories" argument, and this
 script's own module doc for the exact jammi<->PEFT tensor-name translation
@@ -433,22 +428,19 @@ table it owns (jammi's `grad-oracle` subcommand does zero translation — the
 shared weight-interchange file is a plain `safetensors` file in jammi's OWN
 internal naming; this script translates both directions).
 
-**PROVENANCE — read before trusting this script's output**: as of the
-F2/F3 audit-fix round on PR #372, it HAS been run once, live, on an A100
-pod (ModernBERT-large, `--batch 8 --seq 128 --seed 42`, jammi tip
-`e62c8a8`) — reported by the lead who dispatched that pod job, not
-verified locally by this fix round (no GPU was available here). See
-`torch_grad_oracle.py`'s own module-doc PROVENANCE banner for the full
-disclosure, including the measured cosine similarities from that run.
-Beyond that one confirmed config, everything else (other checkpoints,
+**PROVENANCE — read before trusting this script's output**: it has been
+run live on one config, on an A100 (ModernBERT-large, `--batch 8 --seq 128
+--seed 42`, jammi at `e62c8a8`). See `torch_grad_oracle.py`'s own
+module-doc PROVENANCE banner for the measured cosine similarities from that
+run. Beyond that one confirmed config, everything else (other checkpoints,
 `target_modules` sets, dtypes/ranks/batch/seq combinations) remains
 UNVERIFIED against a live run — one successful execution is evidence the
 mechanism works, not a proof it is correct everywhere this script accepts
 flags for. Its NAME-TRANSLATION functions are, independently, locally
 tested (`test_torch_grad_oracle_names.py`, stdlib-only, no torch needed —
-that suite caught and pinned a real bug in an early draft: `Wi`, an MLP
-site whose jammi-side name carries no `mlp.` prefix, was misrouted to
-`attn.Wi` by a naive string-prefix heuristic).
+that suite pins, among others, `Wi`: an MLP site whose jammi-side name
+carries no `mlp.` prefix, which a naive string-prefix heuristic misroutes
+to `attn.Wi`).
 
 **Structural limitation, confirmed on that live run: a single fresh-init
 call tests ONLY `dL/dB`, never `dL/dA`.** Both `grad_oracle.rs` and this
@@ -464,15 +456,12 @@ doc section and `compare_grad_oracle.py`'s `is_vacuous_pair`/
 `vacuous_tensor_count`, which classify and surface this case explicitly
 rather than let a `0.0` cosine there masquerade as either a pass or a
 fail. Catching a real `dL/dA` defect needs at least one optimizer step
-first (moving `B` away from zero); not implemented this round.
+first (moving `B` away from zero), which neither script does.
 
 `ci/scripts/perf/compare_grad_oracle.py` reads a jammi `grad-oracle` dump
 and a `torch_grad_oracle.py` dump — SAME JSON schema on both sides,
 INCLUDING `batch_token_id_sums` (both producers emit it; the comparator
-refuses if either side omits it or the two disagree — an earlier draft of
-this script left `batch_token_id_sums` out of this dict entirely, which
-this line used to describe as "same schema" while that gap existed; fixed
-in the F3 audit round on PR #372) — and reports gradient-DIRECTION
+refuses if either side omits it or the two disagree) — and reports gradient-DIRECTION
 agreement (cosine similarity), never a loss comparison, ONLY after
 verifying its own premise: that both dumps recorded a loaded
 `--lora-weights-in` file, that their per-tensor `weight` arrays actually
@@ -484,8 +473,7 @@ On the live A100 run above, this weight-identity check held by actual
 agreement, not by luck of a loose bound: `max|w_jammi - w_torch| =
 1.86e-9` over 224 tensors -- orders of magnitude inside the ULP-relative
 tolerance `compare_grad_oracle.py`'s `WEIGHT_MATCH_ULPS`/`_weight_element_tolerance`
-derive (advisory ii, round-2 audit fix on PR #372: a fixed `1e-4` absolute
-constant, now an f32-ULP-relative bound).
+derive (an f32-ULP-relative bound, not a fixed absolute constant).
 
 See that script's own module doc for the derived (never fitted) bf16
 ULP-based cosine floor, and its `derive_cosine_floor` doc for why that

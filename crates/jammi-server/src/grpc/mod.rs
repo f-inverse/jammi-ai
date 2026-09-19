@@ -1,6 +1,6 @@
 //! gRPC services exposed by `jammi-server`.
 //!
-//! The wire surface is hybrid (per ADR-01): Flight SQL retains query/result;
+//! The wire surface is hybrid: Flight SQL carries query/result;
 //! typed gRPC services split the rest into one control plane and the data-plane
 //! compute/stream services. The control plane is [`catalog::CatalogServer`] —
 //! one `CatalogService` holding every catalog / metadata / lifecycle /

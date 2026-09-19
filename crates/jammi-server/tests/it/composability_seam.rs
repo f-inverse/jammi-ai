@@ -1,4 +1,4 @@
-//! The S2 composability seam: `assemble_grpc_chain` → `AssembledChain`
+//! The composability seam: `assemble_grpc_chain` → `AssembledChain`
 //! (`mount` / `serve` / `into_axum_router`) → `ChainParts`.
 //!
 //! These cases prove a downstream can mount its own gRPC service beside the
@@ -166,7 +166,7 @@ async fn serve_assembled(
     (addr, shutdown_tx, handle)
 }
 
-/// TEST #1 + #8 (positive) — a downstream mounts its own `LifecycleService`
+/// A downstream mounts its own `LifecycleService`
 /// beside the engine's `CatalogService` on one server; the engine core answers
 /// through the seam, the mounted service answers, the ledger records it, and a
 /// `with_bearer` client's session id + bearer both reach the mounted service.
@@ -224,7 +224,7 @@ async fn downstream_mounts_a_service_beside_the_engine_and_both_answer() {
     let _ = handle.await;
 }
 
-/// TEST #7 — an OSS server (assembled with NO `LifecycleService` mounted)
+/// An OSS server (assembled with NO `LifecycleService` mounted)
 /// answers `UNIMPLEMENTED` for the lifecycle contract. The doorway is defined in
 /// the wire descriptor; the room is empty in OSS.
 #[tokio::test]
@@ -253,7 +253,7 @@ async fn oss_server_answers_unimplemented_for_lifecycle() {
     let _ = handle.await;
 }
 
-/// TEST #6 — the candle-free `LifecycleClient` round-trips all four verbs
+/// The candle-free `LifecycleClient` round-trips all four verbs
 /// against the stub server, decoding each response shape. `apply_license`
 /// surfaces `LicenseApplied` verbatim; `bootstrap` forwards `display_name` +
 /// `bootstrap_token` and maps `""` to absent; `login` decodes a non-expiring
@@ -305,7 +305,7 @@ async fn lifecycle_client_round_trips_the_four_verbs() {
     let _ = handle.await;
 }
 
-/// TEST #8 (negative) — `with_bearer` is fallible: a non-ASCII token cannot
+/// `with_bearer` is fallible: a non-ASCII token cannot
 /// parse as gRPC ASCII metadata and surfaces as `JammiError::Config`, never a
 /// panic or a silently dropped header.
 #[tokio::test]
@@ -330,7 +330,7 @@ async fn with_bearer_rejects_a_non_ascii_token() {
     let _ = handle.await;
 }
 
-/// TEST #2 — the single-listener `into_axum_router` path: assemble, mount the
+/// The single-listener `into_axum_router` path: assemble, mount the
 /// stub service, split into a layer-free `axum::Router` + `ChainParts`, re-apply
 /// the transport layers test-side (the seam contract: the downstream owns them
 /// on this path), nest the gRPC routes beside a plain HTTP route under one axum
@@ -751,7 +751,7 @@ async fn flight_select_ids(
 ///       row);
 /// (iii) a MISSING/invalid credential is `UNAUTHENTICATED` and the handler never
 ///       runs — for a gRPC verb AND the Flight `db.sql` lane — so the engine
-///       plane no longer runs unscoped when a resolver is present.
+///       plane never runs unscoped when a resolver is present.
 ///
 /// The resolver REPLACES the stock `jammi-session-id` interceptor (single
 /// binder): the tenant is the one the credential authorizes, never one a header
@@ -896,8 +896,7 @@ async fn resolver_seam_scopes_both_transports_and_rejects_missing_credential() {
     );
 
     // (iii) Flight — a MISSING credential is rejected before any query binds, so
-    // the `db.sql` lane never runs unscoped (the #220 cross-transport bypass is
-    // closed).
+    // the `db.sql` lane never runs unscoped (no cross-transport bypass).
     let flight_err = flight_select_ids(addr, "Bogus nonsense")
         .await
         .expect_err("an invalid credential must reject the Flight query");

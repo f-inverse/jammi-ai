@@ -235,7 +235,7 @@ pub const ATTENTION_BLOCK_MAX_SEQ: usize = attention_block::MAX_SEQ;
 /// so the combined mask's out-of-window contribution matches what
 /// [`AttentionBlockFused`]'s own `< 0.0` fully-masked-row rule expects;
 /// pinned by value, not merely by sign, so a caller can assert the two
-/// crates agree exactly (family F: a measured, asserted equality, not an
+/// crates agree exactly (a measured, asserted equality, not an
 /// assumed one).
 pub const ATTENTION_BLOCK_WINDOW_MASKED_VALUE: f32 = attention_block::WINDOW_MASKED_VALUE;
 /// TEST-ONLY preallocated-output entry points (doc-hidden in
@@ -393,9 +393,9 @@ pub fn apply_inplace3<T: KernelOp + InplaceOp3>(
 /// - Every call site in this crate constructs a fresh instance and passes
 ///   it BY VALUE into [`apply_stateful1`] (mirroring [`apply1`]/[`apply2`]/
 ///   [`apply3`]'s own by-value shape and every existing op's inline
-///   `::new()`-at-the-call-site convention — e.g. `AttentionBlockFused::new`,
-///   `crates/jammi-encoders/src/attention_cascade.rs:928`; `DropoutFused::new`,
-///   `crates/jammi-lora/src/lora_linear.rs:1143`); nothing in this crate
+///   `::new()`-at-the-call-site convention — e.g. `AttentionBlockFused::new`
+///   in `jammi-encoders`' `attention_cascade.rs`, `DropoutFused::new` in
+///   `jammi-lora`'s `lora_linear.rs`); nothing in this crate
 ///   ever clones an op value, stateful or not.
 /// - If a stateful op were `Clone`, a caller could hold one instance in a
 ///   struct field (`struct Layer { op: FlashVarlenAttention }`) and reuse
@@ -598,8 +598,7 @@ mod tests {
             other => panic!("expected an empty F16 storage, got {other:?}"),
         }
 
-        // Same layout, F32/BF16: the pre-existing arms this fix must not
-        // disturb, used here as the "matches" comparator the test name
+        // Same layout, F32/BF16: the other arms, used here as the "matches" comparator the test name
         // promises rather than an independent assertion.
         let s1_f32 = CpuStorage::F32(Vec::new());
         let s2_f32 = CpuStorage::F32(Vec::new());

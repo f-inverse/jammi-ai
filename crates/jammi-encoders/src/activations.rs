@@ -113,9 +113,8 @@ fn dispatch_gelu_erf_fused(x: &Tensor) -> Result<Tensor, EncoderError> {
 /// `gelu_erf_fused` on [`gelu_admission_predicate`]'s domain and dispatches
 /// to [`dispatch_gelu_erf_fused`] (the real `GeluErfFused` `CustomOp1` — see
 /// that function's own doc) or the same unchanged eager call, recording
-/// which happened either way. Wired at `bert.rs:296`
-/// (`BertIntermediate::forward`'s `activations::gelu_erf(&hidden,
-/// training)`), `distilbert.rs:213` (`DistilBertFfn::forward`'s
+/// which happened either way. Wired at `BertIntermediate::forward`'s
+/// `activations::gelu_erf(&hidden, training)`, `DistilBertFfn::forward`'s
 /// `activations::gelu_erf(&mid, training)`), and `crate::htsat_audio`'s two
 /// sites (`SwinBlock::forward`'s MLP and
 /// `ClapAudioProjection::forward_unnormalized_with_training`'s `"gelu"`

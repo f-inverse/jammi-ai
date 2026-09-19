@@ -177,7 +177,7 @@ pub(crate) fn alloc_empty(
 /// output — the exact shape `layer_norm::ops`'s CPU reference
 /// (`ln_bwd_dgamma_f32`'s `vec![0f32; hidden]`) returns for the same
 /// input, so returning `alloc_empty`'s `[0]`-shaped buffer here instead
-/// would be a cross-arm shape divergence (family D).
+/// would be a cross-arm shape divergence.
 pub(crate) fn alloc_zeros(
     device: &CudaDevice,
     dtype: DType,

@@ -2504,9 +2504,9 @@ mod tests {
     /// doc), so `grads.get` comes back `None`, not zero — a step worse than
     /// CLIP's shared-weight case, where V's surviving path at least forces
     /// the accumulator to exist. Independent of the training-arm fix (eval
-    /// always uses `softmax_last_dim`), so this stays green under the
-    /// fix-verifier's revert; paired with the test above it also catches a
-    /// dropped `set_training` propagation line.
+    /// always uses `softmax_last_dim`), so this stays green if the
+    /// training-arm fix is reverted; paired with the test above it also
+    /// catches a dropped `set_training` propagation line.
     #[test]
     fn training_false_rel_bias_table_grad_is_none_for_every_block() {
         let device = Device::Cpu;
@@ -3506,8 +3506,8 @@ mod tests {
     /// this crate's own per-element bit assertion of it). So CPU bits are
     /// unchanged in BOTH modes: eval because the seam short-circuits to the
     /// unchanged call, training because the fused CPU arm reproduces it
-    /// exactly. Eval bytes crate-wide are pinned by `tests/bits_snapshot.rs`
-    /// and `tests/golden_parity.rs`, neither of which sets training at all.
+    /// exactly. Eval bytes crate-wide are pinned by `tests/golden_parity.rs`,
+    /// which never sets training at all.
     /// The fused-vs-eager question that CANNOT be settled bit-exactly — CUDA
     /// F32/BF16/F16 — is not this test's to settle: it is
     /// `jammi-kernels`'s own `tests/cuda_parity.rs::gelu_erf_parity_*` suite

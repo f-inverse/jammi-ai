@@ -251,7 +251,7 @@ fn bf16_bit_diff(a: bf16, b: bf16) -> i32 {
 }
 
 #[test]
-fn fused_vs_formula_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
+fn fused_vs_formula_bf16_fwd_is_bit_exact_with_one_rounding() {
     let device = Device::Cpu;
     let (batch, heads, seq, hidden) = (1, 2, 4, 8);
     let n = batch * heads * seq * hidden;
@@ -301,7 +301,7 @@ fn fused_vs_formula_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
 /// `dx` is bit-exact — see the forward oracle's doc for why
 /// that is not a structural guarantee at every shape.
 #[test]
-fn fused_vs_formula_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
+fn fused_vs_formula_bf16_bwd_is_bit_exact_with_one_rounding() {
     let device = Device::Cpu;
     let (batch, heads, seq, hidden) = (1, 2, 4, 8);
     let n = batch * heads * seq * hidden;

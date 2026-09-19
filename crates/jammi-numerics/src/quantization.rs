@@ -21,7 +21,7 @@
 //! type is local to this crate — the orphan rule forbids it, mirroring
 //! `ComputePrecision`'s own module doc on this point).
 //!
-//! # Wire order (family J: determinism needs a stable tie-break key)
+//! # Wire order (determinism needs a stable tie-break key)
 //!
 //! [`WeightQuantization::gguf_wire_id`] returns the GGML wire ID GGUF itself
 //! assigns each dtype (`ggml.h`'s `enum ggml_type`, mirrored by candle's own
@@ -141,7 +141,7 @@ impl PartialOrd for WeightQuantization {
 
 impl Ord for WeightQuantization {
     /// Keyed on [`Self::gguf_wire_id`] (module doc), never on declaration
-    /// order — the stable tie-break key family J's determinism contract
+    /// order — the stable tie-break key the crate's determinism contract
     /// requires for e.g. sorting a `Vec<WeightQuantization>` reproducibly.
     fn cmp(&self, other: &Self) -> Ordering {
         self.gguf_wire_id().cmp(&other.gguf_wire_id())
@@ -266,7 +266,7 @@ mod tests {
         }
     }
 
-    /// Determinism (family J): sorting a shuffled `Vec<WeightQuantization>`
+    /// Determinism: sorting a shuffled `Vec<WeightQuantization>`
     /// with the derived-nothing, table-keyed `Ord` impl reproduces
     /// ascending wire-ID order — the stable tie-break key a caller needing
     /// deterministic iteration over a set of formats depends on.

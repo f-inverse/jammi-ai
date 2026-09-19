@@ -70,8 +70,8 @@ live-metal-tests = ["metal"]
 
 # The fused LoRA epilogue against the PEFT reference at production width, on CUDA.
 [[test]]
-name = "esc046_epilogue_biting_oracle"
-path = "tests/esc046_epilogue_biting_oracle.rs"
+name = "epilogue_peft_rounding"
+path = "tests/epilogue_peft_rounding.rs"
 required-features = ["live-gpu-tests"]
 
 # Dropout position and resume on a real Metal device.

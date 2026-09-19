@@ -2360,7 +2360,7 @@ mod tests {
 
     #[test]
     fn band_chunk_matches_independent_full_reference_at_boundaries() {
-        // Real row length >= half_window + 2 (the M1b visibility-
+        // Real row length >= half_window + 2 (the visibility-
         // threshold discipline): half_window=32, seq=66.
         let half_window = 32usize;
         let seq = 66usize;

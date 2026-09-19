@@ -7832,6 +7832,7 @@ mod tests {
         /// exactly like `BF16` does, and a dtype genuinely outside the compiled
         /// set (`F32`) must still miss it, under the reason key
         /// `dtype_is_bf16_or_f16`.
+        #[cfg(feature = "flash-attn")]
         #[test]
         fn flash_capability_gates_admits_f16_alongside_bf16_on_real_cuda_arch_and_head_dim() {
             let device = jammi_test_resources::cuda_device(0);
@@ -8013,7 +8014,7 @@ mod tests {
         /// spread) and box/driver variation (unmeasured here, but a same-class
         /// unknown this margin is sized to absorb) -- never re-fitted to
         /// exactly the measured mean or max.
-        #[cfg(feature = "flash-attn")]
+        #[cfg(feature = "live-flash-oracle-tests")]
         const FLASH_ORACLE_PADDED_BOUND: f64 = 0.5;
 
         /// One seed's real-row `relative_l1_error(flash, block)` measurement
@@ -8026,7 +8027,7 @@ mod tests {
         /// (`fused == num_hidden_layers, declined == 0`) and the
         /// pad-rows-exact-zero premise PER SEED, not just once, since a
         /// per-seed fresh model/forward is a genuinely independent run.
-        #[cfg(feature = "flash-attn")]
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn flash_padded_real_row_ratio_at_seed(
             config: &ModernBertConfig,
             weights: &std::path::Path,
@@ -8116,8 +8117,8 @@ mod tests {
         /// asserting the MEAN [`relative_l1_error`] against
         /// [`FLASH_ORACLE_PADDED_BOUND`] (see that constant's own doc for its
         /// derivation status).
-        #[test]
         #[cfg(feature = "live-flash-oracle-tests")]
+        #[test]
         fn flash_arm_padded_matches_block_arm_on_real_rows_cuda() {
             let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
             let cuda = jammi_test_resources::cuda_device(0);
@@ -8191,8 +8192,8 @@ mod tests {
         /// [`jammi_kernels::ops::flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override`]
         /// seam, ported from the dense arm's
         /// [`jammi_kernels::ops::flash_attention_varlen_with_rope_test_only_bwd_window_override`]).
-        #[test]
         #[cfg(feature = "live-flash-oracle-tests")]
+        #[test]
         fn flash_arm_padded_red_control_lengths_off_by_one_cuda() {
             let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
             let cuda = jammi_test_resources::cuda_device(0);
@@ -8285,8 +8286,8 @@ mod tests {
         /// why the assert must be `>=` the GROWING threshold, not the looser
         /// shrinking one). A fixture shrink vacuates LOUDLY (a failed
         /// `assert!`), never silently.
-        #[test]
         #[cfg(feature = "live-flash-oracle-tests")]
+        #[test]
         fn flash_arm_padded_red_control_window_radius_off_by_one_cuda() {
             let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
             let cuda = jammi_test_resources::cuda_device(0);
@@ -8386,7 +8387,7 @@ mod tests {
         /// `admission` must be a genuinely padded (`!is_dense`) `CompactedBatch`
         /// — this harness does not implement the dense-arm fallback, since its
         /// whole point is to characterize the RAGGED arm's own fault surface.
-        #[cfg(feature = "flash-attn")]
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn forward_hidden_padded_with_ragged_bwd_window_fault(
             model: &ModernBert,
             input_ids: &Tensor,
@@ -8464,7 +8465,7 @@ mod tests {
         /// LAST-layer probe) deliberately needs an EARLY layer: see that
         /// control's own doc for why the last (global) layer's gradient cannot
         /// see a LOCAL-layer-only backward defect at all.
-        #[cfg(feature = "flash-attn")]
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn flash_oracle_wqkv_lora_b_of_layer(model: &ModernBert, idx: usize) -> &Tensor {
             match &model.layers[idx].attention.wqkv {
                 MaybeLoraLinear::Lora(l) => &l.lora_b,
@@ -8480,7 +8481,7 @@ mod tests {
         /// counterpart of [`flash_oracle_pooled_and_grad`], generalised to an
         /// arbitrary layer (see [`flash_oracle_wqkv_lora_b_of_layer`]'s own
         /// doc for why).
-        #[cfg(feature = "flash-attn")]
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn flash_oracle_hidden_and_early_grad(
             model: &ModernBert,
             hidden: &Tensor,
@@ -8553,8 +8554,8 @@ mod tests {
         /// all). The `seq=64` fixture's longest segment (64) sat two short of
         /// the threshold on a `half_window=64` checkpoint. Asserted in-test below
         /// so a future fixture shrink re-vacuates LOUDLY instead of silently.
-        #[test]
         #[cfg(feature = "live-flash-oracle-tests")]
+        #[test]
         fn flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda() {
             let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
             let cuda = jammi_test_resources::cuda_device(0);
@@ -8636,6 +8637,7 @@ mod tests {
         /// Eight fixed seeds, reused IDENTICALLY across the healthy oracle and
         /// every RED control below, at every shape (property 2 above) -- a
         /// single seed's draw is not a distribution.
+        #[cfg(feature = "live-flash-oracle-tests")]
         const FLASH_ORACLE_SWEEP_SEEDS: [u64; 8] = [201, 202, 203, 204, 205, 206, 207, 208];
 
         /// Mean-ratio bound, pooled-embedding leg (`err(other,f32) /
@@ -8650,6 +8652,7 @@ mod tests {
         /// two means while sitting more than 3x below the WEAKEST measured
         /// mutant mean on this same leg (window-dropped, 5.2189; K-unrotated
         /// 9.9498; bad-softmax-scale 19.4144).
+        #[cfg(feature = "live-flash-oracle-tests")]
         const FLASH_ORACLE_K_MEAN_POOLED: f64 = 1.6;
 
         /// Mean-ratio bound, LoRA-gradient leg (last layer `Wqkv` LoRA `B`,
@@ -8670,6 +8673,7 @@ mod tests {
         /// mutant's own max (6.62) sits INSIDE that bound on at least one seed
         /// draw. [`assert_red_control_violates_bound`] asserts only the MEAN
         /// legs.
+        #[cfg(feature = "live-flash-oracle-tests")]
         const FLASH_ORACLE_K_MEAN_GRAD: f64 = 4.5;
 
         /// Asserts `device` can run the flash kernels this build compiled: its
@@ -8688,6 +8692,7 @@ mod tests {
         /// A deterministic (SplitMix64-derived) token-id batch, `vocab`-bounded
         /// and `seed`-keyed -- every arm below is driven by the exact SAME
         /// `input_ids` for a given `(batch, seq, seed)`.
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn flash_oracle_synthetic_ids(
             batch: usize,
             seq: usize,
@@ -8716,6 +8721,7 @@ mod tests {
         /// DISTINCT odd constant from [`flash_oracle_synthetic_ids`]'s own, so
         /// the token-id draw and the cotangent draw never correlate at the
         /// same seed. Values in `[-1, 1)`.
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn flash_oracle_seeded_dy(
             batch: usize,
             hidden: usize,
@@ -8743,6 +8749,7 @@ mod tests {
         /// whether `forward_hidden` reaches the admission cascade at all
         /// (`true`) or takes the always-eager eval composition (`false` -- the
         /// F32 reference's own arm).
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn flash_oracle_build_model(
             config: &ModernBertConfig,
             weights: &std::path::Path,
@@ -8791,6 +8798,7 @@ mod tests {
         /// [`forward_hidden_forcing_flash_decision`] instead. `#[cfg(feature =
         /// "cuda")]`: every call site is a CUDA-gated test (the block-arm vs.
         /// flash-arm comparison only means something on a real CUDA device).
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn forward_hidden_forcing_flash(
             model: &ModernBert,
             input_ids: &Tensor,
@@ -8810,7 +8818,7 @@ mod tests {
         /// bit-identity anchor proving this whole harness has not drifted from
         /// production (see `flash_arm_fault_harness_nofault_matches_production_bit_identical`
         /// below).
-        #[cfg(feature = "flash-attn")]
+        #[cfg(feature = "live-flash-oracle-tests")]
         enum FlashFault {
             /// No injection at all -- exactly production's
             /// `forward_flash_dense_attention` composition.
@@ -8833,7 +8841,7 @@ mod tests {
         /// flash-`Holds`-eligible (asserted up front) -- this harness does not
         /// implement the block-arm fallback, since its whole point is to
         /// characterize the flash arm's OWN fault surface.
-        #[cfg(feature = "flash-attn")]
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn forward_hidden_flash_with_fault(
             model: &ModernBert,
             input_ids: &Tensor,
@@ -8959,6 +8967,7 @@ mod tests {
         /// covered at the op level, where the window is a per-call parameter,
         /// by `jammi-kernels`' own
         /// `tests/cuda_parity.rs::flash_upstream_acceptance_form_red_control_bwd_only_window_dropped_cuda`.
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn flash_oracle_wqkv_lora_b(model: &ModernBert) -> &Tensor {
             let last = model
                 .layers
@@ -8980,6 +8989,7 @@ mod tests {
         /// (identically `batch`, gradient identically zero -- see this
         /// section's own block comment, defect 1). Returns `(pooled embedding,
         /// dL/d(last layer Wqkv LoRA B))`, both `F32`, flattened.
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn flash_oracle_pooled_and_grad(
             model: &ModernBert,
             hidden: &Tensor,
@@ -9017,6 +9027,7 @@ mod tests {
         /// real SIGNAL (`sum|reference| > 0`) before dividing -- the exact
         /// check that would have caught this section's own vacuous-loss defect
         /// (defect 1 above) the moment it shipped.
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn relative_l1_error(arm: &[f32], reference: &[f32]) -> f64 {
             assert_eq!(
                 arm.len(),
@@ -9067,6 +9078,7 @@ mod tests {
         /// matters for a LoRA training step, and is what the grad leg uses
         /// below. Same affirmative-finite-first (guide §3.7) and signal-assert
         /// (both norms `> 0`) discipline as [`relative_l1_error`].
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn cosine_distance(arm: &[f32], reference: &[f32]) -> f64 {
             assert_eq!(
                 arm.len(),
@@ -9107,6 +9119,7 @@ mod tests {
         /// finiteness check first (guide §3.7) and a `total_cmp` fold (float
         /// `max`/`min` combinators are NaN-blind -- `f64::max(NaN, x)
         /// == x`, silently dropping the NaN rather than failing).
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn mean_max(values: &[f64]) -> (f64, f64) {
             assert!(!values.is_empty(), "mean_max: empty slice");
             let non_finite = values.iter().filter(|v| !v.is_finite()).count();
@@ -9127,6 +9140,7 @@ mod tests {
         /// [`relative_l1_error`]; grad uses [`cosine_distance`] (see that
         /// function's own doc for why the grad leg needs a scale-invariant
         /// metric).
+        #[cfg(feature = "live-flash-oracle-tests")]
         #[derive(Clone, Copy, Debug)]
         struct FlashOracleSeedMeasurement {
             seed: u64,
@@ -9136,6 +9150,7 @@ mod tests {
             grad_block: f64,
         }
 
+        #[cfg(feature = "live-flash-oracle-tests")]
         impl FlashOracleSeedMeasurement {
             fn pooled_ratio(&self) -> f64 {
                 self.pooled_other / self.pooled_block
@@ -9153,6 +9168,7 @@ mod tests {
         /// forward+backward is real training-step memory, and holding more
         /// than one arm's graph alive at once OOM'd on an 80GB A100, confirmed
         /// live).
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn flash_oracle_measure_arm<B, F>(
             build: B,
             forward: F,
@@ -9176,6 +9192,7 @@ mod tests {
         /// [`FlashOracleSeedMeasurement`] per seed, printed as it goes
         /// (`--nocapture`) so the full per-seed table is always visible, not
         /// just the reduced statistic.
+        #[cfg(feature = "live-flash-oracle-tests")]
         #[allow(clippy::too_many_arguments)]
         fn flash_oracle_sweep<BO, FO>(
             config: &ModernBertConfig,
@@ -9244,6 +9261,7 @@ mod tests {
         /// (the committed `2026-08-25-flash-arm-encoder-oracle-*.json`
         /// artifacts are built FROM this output), not just the reduced mean/max
         /// statistic.
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn print_seed_ratio_table(label: &str, measurements: &[FlashOracleSeedMeasurement]) {
             for m in measurements {
                 eprintln!(
@@ -9263,6 +9281,7 @@ mod tests {
         /// [`FLASH_ORACLE_K_MEAN_GRAD`] -- there is no per-seed MAX assertion
         /// (see [`FLASH_ORACLE_K_MEAN_GRAD`]'s own doc for why one existed
         /// before and was deleted).
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn run_flash_oracle_shape_sweep(
             config: &ModernBertConfig,
             weights: &std::path::Path,
@@ -9328,6 +9347,7 @@ mod tests {
         /// sampler polls through `nvidia-smi`, just called in-process so it can
         /// be interleaved with individual layer forwards rather than only
         /// sampled on a background thread. Returns free memory in MiB.
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn cuda_free_mib(device: &Device) -> f64 {
             device
                 .synchronize()
@@ -9341,6 +9361,7 @@ mod tests {
         /// the OTHER half of its `(free, total)` pair — this device's TOTAL
         /// installed memory in MiB, a fixed hardware property (not a
         /// currently-free reading). [`assert_vram_floor`]'s own probe.
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn cuda_total_mib(device: &Device) -> f64 {
             device
                 .synchronize()
@@ -9370,6 +9391,7 @@ mod tests {
         /// between two confirmed data points, not a precisely-derived one; a
         /// future SKU landing between 48 and 80 GiB would need its own real
         /// measurement to place this floor more precisely.
+        #[cfg(feature = "live-flash-oracle-tests")]
         const FLASH_ORACLE_ENCODER_LEVEL_VRAM_FLOOR_MIB: f64 = 64.0 * 1024.0;
 
         /// Asserts `device` has the memory the encoder-level real-checkpoint
@@ -9405,6 +9427,7 @@ mod tests {
         /// `--nocapture` output; this function asserts nothing -- it is a
         /// diagnostic tool, not an oracle (the calling test's own dispatch
         /// count assertion is the oracle that the intended arm actually ran).
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn forward_hidden_forcing_flash_vram_probe(
             model: &ModernBert,
             input_ids: &Tensor,
@@ -9490,8 +9513,8 @@ mod tests {
         /// fresh model (fresh `VarMap`) per arm, exactly
         /// [`run_flash_oracle_shape_sweep`]'s own precedent, so one arm's
         /// retained graph cannot skew the other's baseline.
-        #[test]
         #[cfg(feature = "live-flash-oracle-tests")]
+        #[test]
         fn flash_vs_block_per_layer_vram_attribution_probe_cuda() {
             let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
             let cuda = jammi_test_resources::cuda_device(0);
@@ -9569,8 +9592,8 @@ mod tests {
         /// checkpoint is committed to this repo, so the checkpoint comes from
         /// `JAMMI_FLASH_ORACLE_MODEL_DIR`, and a missing CUDA device, arch, VRAM
         /// floor or model dir each panics naming what is missing.
-        #[test]
         #[cfg(feature = "live-flash-oracle-tests")]
+        #[test]
         fn flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16() {
             let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
             let cuda = jammi_test_resources::cuda_device(0);
@@ -9600,8 +9623,8 @@ mod tests {
         /// mirrors"). If this test ever goes red, every RED control below
         /// stops being trustworthy -- they all inject faults into THIS
         /// harness, not into production directly.
-        #[test]
         #[cfg(feature = "live-flash-oracle-tests")]
+        #[test]
         fn flash_arm_fault_harness_nofault_matches_production_bit_identical() {
             let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
             let cuda = jammi_test_resources::cuda_device(0);
@@ -9653,8 +9676,8 @@ mod tests {
         /// on every layer, see the block comment above) must VIOLATE the same
         /// bound the real oracle asserts above, on BOTH legs, in MEAN, over
         /// the SAME [`FLASH_ORACLE_SWEEP_SEEDS`].
-        #[test]
         #[cfg(feature = "live-flash-oracle-tests")]
+        #[test]
         fn flash_arm_encoder_level_oracle_red_control_window_dropped() {
             let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
             let cuda = jammi_test_resources::cuda_device(0);
@@ -9704,8 +9727,8 @@ mod tests {
         /// the block comment above) must VIOLATE the same bound the real
         /// oracle asserts above, on BOTH legs, in MEAN, over the SAME
         /// [`FLASH_ORACLE_SWEEP_SEEDS`].
-        #[test]
         #[cfg(feature = "live-flash-oracle-tests")]
+        #[test]
         fn flash_arm_encoder_level_oracle_red_control_k_unrotated() {
             run_flash_arm_fault_red_control("k_unrotated_b8_s512", &FlashFault::KUnrotated);
         }
@@ -9713,8 +9736,8 @@ mod tests {
         /// RED control: a wrong `softmax_scale` (class sweep -- see the block
         /// comment above) must VIOLATE the same bound too, on BOTH legs, in
         /// MEAN, over the SAME [`FLASH_ORACLE_SWEEP_SEEDS`].
-        #[test]
         #[cfg(feature = "live-flash-oracle-tests")]
+        #[test]
         fn flash_arm_encoder_level_oracle_red_control_bad_softmax_scale() {
             run_flash_arm_fault_red_control(
                 "bad_softmax_scale_b8_s512",
@@ -9764,6 +9787,7 @@ mod tests {
         /// pooled ratio AND MEAN grad ratio, over [`FLASH_ORACLE_SWEEP_SEEDS`],
         /// must each exceed the healthy bound -- if either does not, the real
         /// oracle above would NOT have caught this defect on that leg.
+        #[cfg(feature = "live-flash-oracle-tests")]
         fn assert_red_control_violates_bound(
             label: &str,
             measurements: &[FlashOracleSeedMeasurement],

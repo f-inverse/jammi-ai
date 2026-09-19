@@ -162,8 +162,8 @@ use tempfile::TempDir;
 use jammi_kernels::admission::{DtypeClass, ProbedOpKind, PROBED_OPS};
 
 use crate::release_manifest::{
-    internal_subkernel_ops, load_manifest, manifest_internal_subkernels, manifest_string_list,
-    MANIFEST_FLASH_DTYPES, MANIFEST_FUSED_OP_ADMISSION, MANIFEST_LANE,
+    internal_subkernel_ops, load_manifest, manifest_string_list, MANIFEST_FLASH_DTYPES,
+    MANIFEST_FUSED_OP_ADMISSION, MANIFEST_LANE,
 };
 
 /// This test's `ComputePrecision` as the dtype class [`PROBED_OPS`] resolves

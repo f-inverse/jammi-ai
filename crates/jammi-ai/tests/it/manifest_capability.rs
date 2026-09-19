@@ -6,10 +6,53 @@ use jammi_ai::fine_tune::ComputePrecision;
 use jammi_kernels::admission::{ProbedOpKind, PROBED_OPS};
 
 use crate::release_manifest::{
-    internal_subkernel_ops, load_manifest, manifest_internal_subkernels, manifest_string_list,
-    MANIFEST_FLASH_DTYPES, MANIFEST_FUSED_OP_ADMISSION, MANIFEST_INTERNAL_SUBKERNELS,
-    MANIFEST_LANE,
+    internal_subkernel_ops, load_manifest, manifest_string_list, MANIFEST_FLASH_DTYPES,
+    MANIFEST_FUSED_OP_ADMISSION, MANIFEST_LANE,
 };
+
+/// The manifest capability list every [`ProbedOpKind::InternalSubkernel`] row
+/// belongs to — the category for kernels that are launched unconditionally from inside an
+/// already-admitted parent's fused arm and therefore have NO admission gate
+/// of their own to assert `Holds` against.
+const MANIFEST_INTERNAL_SUBKERNELS: &str = "internal_subkernels";
+
+/// `capabilities.internal_subkernels`, which — unlike its sibling capability
+/// lists — is an OBJECT keyed by op, not a string array:
+/// `{"<op>": {"parent": "<op>", "launch_site": "<path>"}, ..}`
+/// (`ci/scripts/check_release_manifest.py` validates that every `parent`
+/// resolves and every `launch_site` exists).
+///
+/// The shape is the point, not an inconsistency to paper over: an internal
+/// subkernel has no admission gate of its own and is PROVABLE only through its
+/// parent's dispatch, so the manifest records the proof RELATION alongside the
+/// name. A plain string list could name the op but not say what proves it —
+/// a "claimed but unprovable" entry.
+/// Returns `(op, parent)` pairs, sorted by op.
+fn manifest_internal_subkernels(manifest: &serde_json::Value) -> Vec<(String, String)> {
+    let obj = manifest["lanes"][MANIFEST_LANE]["capabilities"][MANIFEST_INTERNAL_SUBKERNELS]
+        .as_object()
+        .unwrap_or_else(|| {
+            panic!(
+                "manifest lane {MANIFEST_LANE:?}'s capabilities.{MANIFEST_INTERNAL_SUBKERNELS} \
+                 must be an OBJECT keyed by op (each value carrying `parent` + `launch_site`), \
+                 not an array — see ci/scripts/check_release_manifest.py"
+            )
+        });
+    let mut out: Vec<(String, String)> = obj
+        .iter()
+        .map(|(op, entry)| {
+            let parent = entry["parent"].as_str().unwrap_or_else(|| {
+                panic!(
+                    "capabilities.{MANIFEST_INTERNAL_SUBKERNELS}[{op:?}] must carry a string \
+                     `parent` — the op whose fused dispatch is what proves this subkernel ran"
+                )
+            });
+            (op.clone(), parent.to_string())
+        })
+        .collect();
+    out.sort();
+    out
+}
 
 /// The ONLY manifest capabilities allowed to enumerate names: the two proof
 /// mechanisms this file cross-checks against [`PROBED_OPS`] by kind, plus

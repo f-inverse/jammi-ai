@@ -31,7 +31,7 @@
 //! from the run.
 
 use candle_core::cuda_backend::cudarc::driver::DeviceRepr;
-use candle_core::{CudaDevice, Device};
+use candle_core::CudaDevice;
 use half::bf16;
 use jammi_kernels::flash::{
     self, dq_accum_splits, flash_varlen_bwd, flash_varlen_bwd_into, flash_varlen_fwd,

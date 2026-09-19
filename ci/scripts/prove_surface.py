@@ -261,11 +261,12 @@ def _self_test() -> int:
         f"{expected('jammi-bench', 'release', manifest)}",
     )
 
-    # jammi-kernels: test widens to cuda,flash-attn (both declared and in
-    # the lane); default canonicalizes to [] regardless of manifest content.
+    # jammi-kernels: test is cuda,flash-attn (both declared and in the lane)
+    # plus prove_only; default canonicalizes to [] regardless of manifest
+    # content.
     check(
         "jammi-kernels-test",
-        expected("jammi-kernels", "test", manifest) == ["cuda", "flash-attn"],
+        expected("jammi-kernels", "test", manifest) == ["cuda", "flash-attn", "live-gpu-tests"],
         f"{expected('jammi-kernels', 'test', manifest)}",
     )
     check(

@@ -31,11 +31,12 @@
 //!      relative term alone, and its argmax `x`, and asserts `1.5x`
 //!      headroom against `COND_AWARE_ABS_FLOOR` (`jammi_kernels::ops::
 //!      gelu_erf`'s own doc on that constant cites this exact mechanism).
-//!   3. `ko1_*` — the producer-injected control (`KO-1`): a hand-built
+//!   3. `dropping_the_x_phi_term_*` — the producer-injected control
+//!      (`KO-1`): a hand-built
 //!      "backward with the `x*phi(x)` term dropped" must FAIL the SAME
 //!      bound somewhere on the pre-registered grid `x in +-[0.05, 4]`
 //!      (no-producer: a pre-registered design choice, not a measurement —
-//!      see [`ko1_dropping_the_x_phi_term_fails_the_condition_aware_bound_on_the_registered_grid`]
+//!      see [`dropping_the_x_phi_term_fails_the_condition_aware_bound_on_the_registered_grid`]
 //!      below for the exact grid construction), as a MAX-OVER-GRID
 //!      assertion (a per-point ratio is degenerate near `x = 0`, where
 //!      `x*phi(x) -> 0`).
@@ -226,7 +227,7 @@ fn backward_matches_candles_own_composition_within_the_condition_aware_bound() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn ko1_dropping_the_x_phi_term_fails_the_condition_aware_bound_on_the_registered_grid() {
+fn dropping_the_x_phi_term_fails_the_condition_aware_bound_on_the_registered_grid() {
     // Pre-registered grid: x in +-[0.05, 4] -- deliberately excludes a
     // neighborhood of 0 (where x*phi(x) -> 0, so the dropped term itself
     // vanishes and a max-over-grid check would be degenerate there) and
@@ -282,7 +283,7 @@ fn ko1_dropping_the_x_phi_term_fails_the_condition_aware_bound_on_the_registered
     // Disclosure with a real producer (KO-4): the exact margin is MEASURED
     // right here, not asserted from an external, unverifiable number.
     println!(
-        "ko1 control: worst point x={worst_x}, |dropped-x*phi composition - correct| = \
+        "KO-1 control: worst point x={worst_x}, |dropped-x*phi composition - correct| = \
          {worst_diff}, bound = {worst_bound}, excess over bound = {max_excess}"
     );
     assert!(

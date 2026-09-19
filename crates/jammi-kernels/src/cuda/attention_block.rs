@@ -36,14 +36,14 @@
 //! and no `broadcast_as`/`binary_impl::<Add>` combination step in this
 //! file at all: `SoftmaxLastDimFused::cuda_fwd` already implements the
 //! general `[batch|1, 1, seq|1, seq]`-broadcasts-onto-`[batch, heads, seq,
-//! seq]` class this op's own `mask` domain now matches exactly (see
+//! seq]` class this op's own `mask` domain matches exactly (see
 //! `crate::ops::attention_block::check_mask`'s doc) — reusing that
 //! broadcast logic rather than re-deriving it here.
 //!
 //! This file compiles only under the `cuda` feature and mirrors
 //! `crate::cuda::rope`/`crate::cuda::softmax`/`LowRankResidualLinear`'s
 //! CUDA glue idioms; `tests/cuda_parity.rs`'s `attention_block_*` legs are
-//! its landing proof.
+//! its GPU parity proof.
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CudaStorage, CustomOp2, CustomOp3, DType, Error, Layout, Result, Shape};

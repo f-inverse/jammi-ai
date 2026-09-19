@@ -10,7 +10,7 @@
 //! `fine_tune::batch_bucket::pad_rows_to_bucket` — the tensor/row-padding
 //! half, which stays there since it is not candle-free-independent the same
 //! way: it mutates the caller's own `Vec<u32>` rows) and `jammi-encoders`
-//! (`crates/jammi-encoders/tests/esc076_comparable_eager_control.rs`'s
+//! (`crates/jammi-encoders/tests/eager_training_memory.rs`'s
 //! bucketed leg, which needs the IDENTICAL bucket decision to prove bucketing bounds memory at the
 //! library seam, never re-deriving its own copy) need the SAME decision —
 //! `jammi-numerics` is the one candle-free crate both already depend on.
@@ -139,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn bucket_seq_len_the_full_ladder_for_esc076_reporter_max_seq_length() {
+    fn bucket_seq_len_full_ladder_at_max_seq_length_128() {
         // The exact bucket SET a `max_seq_length = 128` run ever presents to
         // the encoder, over every possible natural width — this is the
         // "small, fixed set of buckets" that bounds the allocator:

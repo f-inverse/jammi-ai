@@ -777,9 +777,10 @@ pub(crate) fn materialize_contiguous_if_needed<S: BackendStorage>(
 /// mode caller could only match by text. `predicate_holds` is always `true`
 /// at both of this file's
 /// cast-boundary call sites (see `bwd`'s own comments): the fused
-/// kernel is structurally applicable for every `BF16` case `bwd` reaches
-/// it from (this op's own domain already restricts `x`'s dtype to `F32`/
-/// `BF16`), so there is no runtime domain gap to gate on — `admit` is
+/// kernel is structurally applicable for every `BF16` or `F16` case `bwd`
+/// reaches it from (this op's own domain already restricts `x`'s dtype to
+/// `F32`/`BF16`/`F16`, and `F32` never reaches this function), so there is
+/// no runtime domain gap to gate on — `admit` is
 /// called purely for its `JAMMI_KERNELS_DISABLE`/`DispatchCounters`
 /// observability, not to decide fused-vs-eager itself.
 ///
@@ -800,7 +801,7 @@ pub(crate) fn materialize_contiguous_if_needed<S: BackendStorage>(
 /// only change behaviour on a branch already proven unreachable, it would
 /// tax every real backward pass with three extra `is_contiguous()` calls
 /// on a hot path, and — worse — in `Strict` mode a failed predicate is a
-/// hard `KernelError::StrictModeFallback` (`admission.rs`'s `admit_inner`),
+/// hard `KernelError::StrictModeFallback` (`admission::admit_inner`),
 /// a SECOND error surface for the exact case `RequiresContiguous` already
 /// covers, rather than one typed refusal a reader has to reason about
 /// once. The CUDA kernel's own `RequiresContiguous` stays the single

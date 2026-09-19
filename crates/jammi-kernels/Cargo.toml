@@ -70,7 +70,7 @@ tracing.workspace = true
 # oracle numbers (`geglu_oracles.rs`'s measured tolerances/residuals), not a
 # silent per-crate drift.
 libm.workspace = true
-# `#[derive(VariantArray)]` for `admission::ProbedOpId` (#546 K1: the closed
+# `#[derive(VariantArray)]` for `admission::ProbedOpId` (the closed
 # admission-op enum a definition-hash fold reads by construction). Not a
 # `jammi-*` crate — this crate's own "leaf crate: no jammi-* dependencies"
 # description is unaffected.

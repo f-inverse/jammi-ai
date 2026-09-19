@@ -55,7 +55,7 @@ workspace crate.
   ```sh
   git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
   cargo build -p jammi-kernels --features flash-attn
-  JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-kernels --features flash-attn --test flash_smoke
+  cargo test -p jammi-kernels --features live-gpu-tests,flash-attn --test flash_smoke
   ```
 
   Provenance, file hashes, shims, flags and measured compile time:

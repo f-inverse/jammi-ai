@@ -81,8 +81,8 @@ pub struct FusibleSiteCensus {
     /// writer does not.
     ///
     /// This is a NARROWER question than "is this site adapted"
-    /// (`jammi_lora::MaybeLoraLinear::is_lora`, that method's own doc records
-    /// the caveat this field's doc used to omit): `LoraLinear::forward`
+    /// (`jammi_lora::MaybeLoraLinear::is_lora`; that method's own doc records
+    /// the same caveat): `LoraLinear::forward`
     /// branches on `FrozenBase::Dense` vs `FrozenBase::Quantized` BEFORE it
     /// ever reaches `admit()`, so a `Lora` site over a `FrozenBase::Quantized`
     /// base — the shape a QLoRA backbone builds for every adapted site — is

@@ -1,21 +1,13 @@
-//! CPU↔CUDA parity oracle for every fused op in this crate — this is the
-//! landing proof the lead's pod session runs, not a smoke test.
+//! CPU↔CUDA parity oracle for every fused op in this crate, forward and
+//! backward.
 //!
-//! Compiles and links ONLY with the `cuda` feature (`required-features =
-//! ["cuda"]` in `Cargo.toml` — a plain `cargo test -p jammi-kernels` never
-//! even builds this file). At runtime, a machine that compiled with the
-//! feature but has no physical GPU attached (a real shape: a build image
-//! with the CUDA toolkit but no driver) is treated as "skip", not "fail" —
-//! `Device::new_cuda(0)` erroring is the signal — UNLESS the environment
-//! variable `JAMMI_REQUIRE_CUDA` is set (the pod session that is this
-//! file's actual landing proof sets it), in which case a device-
-//! acquisition failure PANICS with the underlying error instead of
-//! returning. Without that distinction, a broken device acquisition on the
-//! pod would silently read as 5 skipped tests rather than 5 failed ones —
-//! exactly the "fell back/skipped everywhere and it read as green" failure
-//! mode `admission::AdmissionMode::Strict` exists to prevent, reproduced
-//! here in the one file whose entire job is to be that failure mode's
-//! landing proof.
+//! This test target requires the `live-gpu-tests` feature (a plain
+//! `cargo test -p jammi-kernels` never builds it). Every test acquires CUDA
+//! device 0 through `jammi_test_resources::cuda_device`, which panics naming
+//! the missing device, so a broken device acquisition fails rather than
+//! reading as green — the test-side counterpart of the "fell back everywhere
+//! and it read as green" failure mode `admission::AdmissionMode::Strict`
+//! exists to prevent.
 //!
 //! Every op's suite covers the same divergence-prone classes this
 //! crate's own review found real bugs in: a contiguous case, a NARROWED
@@ -89,32 +81,31 @@ fn exact_fixture(n: usize, phase: i64) -> Vec<f32> {
 }
 
 // =========================================================================
-// Discriminating-backward toolkit (test/cuda-parity-discriminating-backward).
+// Discriminating-backward toolkit.
 //
-// Every `assert_*_parity_bf16`/`assert_*_parity_f32` leg below used to seed
-// `.backward()` either directly on a non-scalar root or via `sum_all()`
-// (both are the SAME implicit all-ones cotangent `Tensor::backward()`
-// assigns a non-scalar root). Under `dy == 1`, `round(dy * x)` collapses to
+// No `assert_*_parity_bf16`/`assert_*_parity_f32` leg below seeds
+// `.backward()` directly on a non-scalar root or via `sum_all()` (both are
+// the SAME implicit all-ones cotangent `Tensor::backward()` assigns a
+// non-scalar root). Under `dy == 1`, `round(dy * x)` collapses to
 // `round(x)`, hiding a rounding-PLACEMENT defect (round-the-product vs
-// round-the-factor — esc-045 rounds 2/3, GH#374, commits 16a1699/50ef2ae);
-// worse, for an op whose backward formula involves centering (LayerNorm's
+// round-the-factor); worse, for an op whose backward formula involves centering (LayerNorm's
 // `dy - mean(dy) - xhat*mean(dy*xhat)`), `dy == 1` makes the WHOLE gradient
 // analytically zero (`mean(1) == 1`, `mean(1*xhat) == mean(xhat) == 0`), so
 // the parity check compares `0.0` to `0.0` and proves nothing regardless of
-// what the kernel computes (family F: a non-vacuous control). Every leg
+// what the kernel computes (a non-vacuous control). Every leg
 // below instead seeds with [`cotangent_fixture`] — fixed, sign-mixed,
 // production-amplitude — via `(&out * &dy).sum_all().backward()`.
 //
-// Bounds moved from an absolute-with-hardcoded-floor
+// Bounds are not absolute-with-hardcoded-floor
 // (`k * ulp * c.abs().max(g).max(1.0)`, guide §3.8: a max-keyed floor
-// charges every element the largest's allowance) to a strictly PER-ELEMENT
+// charges every element the largest's allowance) but a strictly PER-ELEMENT
 // relative bound keyed to that element's own reference magnitude, floored
 // (only for near-zero references) at a value MEASURED from this run's own
 // data, never a constant.
 
 /// A small, fixed-seed xorshift64 PRNG (Marsaglia 2003) — deterministic and
 /// platform-independent (integer-only, no libm), so this file owns and can
-/// re-seed its own cotangent fixtures bit-for-bit (family J) rather than
+/// re-seed its own cotangent fixtures bit-for-bit rather than
 /// depending on an external crate's algorithm version.
 struct XorShift64(u64);
 
@@ -179,41 +170,35 @@ fn measured_near_zero_floor(reference: &[f32]) -> f32 {
     }
 }
 
-// Every `f32` leg below used to floor its bound at `max_abs(INPUT
-// fixture)` (this file's own `max_abs`) via `f32_relative_bound(r, floor,
-// k)` — `k * ulp(max(r, floor))`, a SINGLE term. A first pass floored at
-// the comparison array's own smallest-nonzero element instead and a real
-// pod run found THAT insufficient: several ops (RoPE's rotation, GeGLU's
+// Why the `f32` legs below use a two-term bound. Flooring at the comparison
+// array's own smallest-nonzero element is insufficient: several ops (RoPE's rotation, GeGLU's
 // `gelu` near its root, LayerNorm's centered reduction) can produce an
 // OUTPUT/gradient value orders of magnitude smaller than the operands
 // that computed it — via ordinary cancellation, not a defect — while the
 // absolute CPU<->CUDA divergence AT that element is still set by the
 // INPUT's own `f32` precision (`ulp(max|input|)`), not by the tiny
-// output's; flooring at the tiny output's own magnitude gave that
-// element an absurdly tight allowance and false-failed on ordinary
+// output's; flooring at the tiny output's own magnitude gives that
+// element an absurdly tight allowance and false-fails on ordinary
 // fmad/rsqrt-intrinsic noise (measured: LN `dgamma` off by ~13-14 ULPs
 // of ITS OWN value at `rows` 3-4).
 //
-// Moving the floor to `max_abs(INPUT)` fixed that false failure, but a
-// later audit round (test/cuda-parity-discriminating-backward, item 1)
-// correctly flagged `k * ulp(max(r, floor))` itself as guide §3.8's
-// exact objection: a `max`-keyed floor charges EVERY element the SAME
+// A single-term `k * ulp(max(r, floor))` with the floor at
+// `max_abs(INPUT)` avoids that, but is guide §3.8's exact objection: a
+// `max`-keyed floor charges EVERY element the SAME
 // operand-scale allowance once `floor` dominates (true for any element
 // whose own magnitude sits anywhere near the input scale — i.e. most of
 // them), not just the handful that are genuinely cancelled near zero.
-// [`f32_two_term_bound`] replaces the `max` with an ADDITIVE sum of two
-// independently-sized terms instead: a per-element RELATIVE term (`k_rel
+// [`f32_two_term_bound`] uses an ADDITIVE sum of two independently-sized
+// terms instead: a per-element RELATIVE term (`k_rel
 // * ulp(|r|)`, tight for a typical, non-cancelled element, scaled by this
-// op's own reduction depth where relevant) plus a SMALL, POD-MEASURED
+// op's own reduction depth where relevant) plus a SMALL, GPU-MEASURED
 // absolute term at the OPERANDS' scale (`k_abs * ulp(operand_amplitude)`,
 // [`F32_CANCELLATION_ULPS`]) that only matters once `r` is small enough
 // for the relative term to underflow it — never large enough to swamp the
-// relative term for a typical element the way the old `max`-keyed floor
-// did. `bf16` legs keep [`measured_near_zero_floor`] plus a small,
-// per-leg `k` (see each bf16 leg's own citation) — swept across
-// production ModernBERT shapes for this same failure mode (item 6) and
-// found not floor-driven; see the pod evidence cited in this branch's
-// hand-off report.
+// relative term for a typical element the way a `max`-keyed floor does.
+// `bf16` legs keep [`measured_near_zero_floor`] plus a small, per-leg `k`
+// (see each bf16 leg's own citation) — swept across production ModernBERT
+// shapes for this same failure mode and found not floor-driven.
 
 /// `k` bf16 ULPs of `reference`'s own magnitude (floored at `floor` for a
 /// near-zero reference) — the shared bound every `assert_*_parity_bf16` leg
@@ -229,7 +214,7 @@ fn bf16_relative_bound(reference: f32, floor: f32, k: f32) -> f32 {
 
 /// [`f32_two_term_bound`]'s bf16 analogue — a per-element RELATIVE term
 /// (`k_rel * bf16_ulp(|reference|)`, bf16-scale — this is a comparison of
-/// two bf16-rounded outputs) plus an ADDITIVE, POD-MEASURED absolute term
+/// two bf16-rounded outputs) plus an ADDITIVE, GPU-MEASURED absolute term
 /// at the OPERANDS' own scale, but at F32 granularity
 /// (`k_abs * f32_ulp(operand_amplitude)`) — see the "why F32, not bf16"
 /// paragraph below.
@@ -267,9 +252,9 @@ fn bf16_relative_bound(reference: f32, floor: f32, k: f32) -> f32 {
 /// (KO-1)`) stop discriminating on the smallest fixture
 /// (`gelu_erf_parity_contiguous_small`) — exactly guide §3.8's failure mode
 /// from the OTHER direction (a floor so generous it hides the very defect
-/// the control exists to catch). `f32_ulp` fixes both legs simultaneously:
-/// still >= 2x headroom over this term's own F32-scale divergence, and the
-/// KO-1 control discriminates again on every fixture width (see
+/// the control exists to catch). `f32_ulp` serves both legs: still >= 2x
+/// headroom over this term's own F32-scale divergence, and the KO-1
+/// control discriminates on every fixture width (see
 /// [`gelu_erf_parity_contiguous_small`], whose `gelu_erf bf16 dx (KO-1)`
 /// leg exercises this exact control and prints its `worst Δ/bound` on
 /// every run via `assert_forced_defect_exceeds_bound_indexed`).
@@ -281,7 +266,7 @@ fn bf16_two_term_bound(reference: f32, operand_amplitude: f32, k_rel: f32, k_abs
 /// `|reference|` this run's own comparison array produced, or (all-zero)
 /// f16's own smallest representable positive (subnormal) magnitude —
 /// `f16_oracle::F16_MIN_POSITIVE_SUBNORMAL` — rather than bf16's coarser
-/// one (campaign #443 D4: "never a coarser dtype's floor").
+/// one ("never a coarser dtype's floor").
 fn measured_near_zero_floor_f16(reference: &[f32]) -> f32 {
     let smallest_nonzero = reference
         .iter()
@@ -320,18 +305,17 @@ fn f32_ulp(x: f32) -> f32 {
     2f32.powi((e - 23).max(-149))
 }
 
-/// A POD-MEASURED f32 ULP multiplier for the `k_abs` term of every
+/// A GPU-MEASURED f32 ULP multiplier for the `k_abs` term of every
 /// [`f32_two_term_bound`] call belonging to a REDUCTION op — LayerNorm
 /// (`mean`/`var`/`dx`'s two centering reductions over `hidden`, `dgamma`'s
 /// reduction over `rows`) and `attention_block` (the `head_dim`/`seq`
 /// softmax+AV reductions). Not derived from closed-form theory (no
 /// formula predicts a cross-device reduction-order divergence's absolute
-/// floor exactly); measured on an A100 pod at production ModernBERT
+/// floor exactly); measured on an A100 at production ModernBERT
 /// shapes (b8*s128, b8*s512, hidden 1024, head_dim 64) as the worst
 /// observed `|c-g| / (k_rel * f32_ulp(|r|))` ratio across these legs'
-/// near-zero-reference elements (originally cited from LN `dgamma`'s
-/// rows=3-4 cancellation case), then given >=2x headroom — see this
-/// branch's hand-off report for the run that produced this value. NOT
+/// near-zero-reference elements (worst: LN `dgamma`'s rows=3-4
+/// cancellation case), then given >=2x headroom. NOT
 /// shared with the elementwise (no-reduction, no-cancellation) legs below
 /// — see [`F32_ELEMENTWISE_CANCELLATION_ULPS`]'s own doc for why a
 /// reduction-sized `k_abs` would dominate those legs' bound 6:1 over their
@@ -353,8 +337,8 @@ const F32_CANCELLATION_ULPS: f32 = 24.0;
 /// site below) even though nothing here ever cancels toward zero, which
 /// is exactly the "one term swamps the other and hides a real regression"
 /// failure mode the two-term design exists to avoid (this section's
-/// header comment). Pod-validated at this value (see this branch's
-/// hand-off report for the re-run's per-leg worst `Δ/bound`).
+/// header comment). GPU-validated at this value (each leg prints its worst
+/// `Δ/bound`).
 const F32_ELEMENTWISE_CANCELLATION_ULPS: f32 = 3.0;
 
 /// The `k_abs` term for GeGLU f32 specifically — NOT
@@ -368,23 +352,22 @@ const F32_ELEMENTWISE_CANCELLATION_ULPS: f32 = 3.0;
 /// within ordinary cross-platform libm ULP" — i.e. an acknowledged,
 /// independent-implementation gap, unlike `rope`/`scaled_cast_add`,
 /// whose two arms compute the IDENTICAL arithmetic expression with no
-/// special-function call at all). Pod-measured: at
-/// `F32_ELEMENTWISE_CANCELLATION_ULPS` (3.0) `geglu f32 fwd` landed at
+/// special-function call at all). GPU-measured: at
+/// `F32_ELEMENTWISE_CANCELLATION_ULPS` (3.0) `geglu f32 fwd` lands at
 /// 1.93x headroom on `geglu_parity_non_power_of_two_intermediate` — under
-/// the required >=2x bar — confirming the plain elementwise value is too
-/// tight for this leg's genuine extra divergence source; re-measured at
-/// this value with real headroom (see this branch's hand-off report).
+/// the required >=2x bar — so the plain elementwise value is too tight for
+/// this leg's genuine extra divergence source; this value has real
+/// headroom.
 const F32_GELU_ERF_LIBM_ULPS: f32 = 8.0;
 
-/// GeGLU's 16-bit FORWARD parity `k`, DERIVED (campaign #446) from the
+/// GeGLU's 16-bit FORWARD parity `k`, DERIVED from the
 /// kernel's rounding-point STRUCTURE rather than from its rounding-point
 /// COUNT — `no-producer: derived`.
 ///
 /// `geglu_fwd_f16`/`geglu_fwd_bf16` have two rounding points
 /// (`cuda/geglu_f16.cu:57` ROUND 1, `:59` ROUND 2), and the guide's §3.10
-/// row records exactly that ("2 fwd"). The pre-#446 `k = 2` read the count
-/// off that row directly — which undercounts, because ROUND 1 is UPSTREAM
-/// of a multiply:
+/// row records exactly that ("2 fwd"). A `k = 2` read off that row directly
+/// undercounts, because ROUND 1 is UPSTREAM of a multiply:
 ///
 /// * ROUND 1 rounds `act = gate·Φ(gate)` to 16-bit. The two arms compute
 ///   `Φ` with different libraries (CUDA `erff` vs the CPU reference's
@@ -478,13 +461,11 @@ fn count_bound_violations_indexed(
 /// The shared GREEN-path assertion every leg below calls after computing
 /// its own per-element bound: every element must be within `bound_fn` of
 /// `reference` (non-finite `actual` counts as a violation, guide §3.7),
-/// and the worst observed `|Δ|/bound` ratio is printed so a pod run's
+/// and the worst observed `|Δ|/bound` ratio is printed so a GPU run's
 /// captured log is direct evidence of how much headroom this leg's bound
-/// actually has (item 1's "report the max observed ratio" requirement) —
-/// this supersedes `assert_bound_discriminates`'s old "clean must be
-/// green" half; the discriminating half is now
+/// actually has. The discriminating half is
 /// [`assert_forced_defect_exceeds_bound`], driven by a REAL per-op
-/// semantic mutant rather than a poisoned array index (item 3).
+/// semantic mutant rather than a poisoned array index.
 fn assert_relative_bound(
     label: &str,
     reference: &[f32],
@@ -497,7 +478,7 @@ fn assert_relative_bound(
 /// [`assert_relative_bound`]'s index-aware form — see
 /// [`count_bound_violations_indexed`] for why an index-aware allowance
 /// exists at all. Identical reporting (the worst `|Δ|/bound` ratio is
-/// still printed for the pod log).
+/// still printed for the run log).
 fn assert_relative_bound_indexed(
     label: &str,
     reference: &[f32],
@@ -530,10 +511,10 @@ fn assert_relative_bound_indexed(
 /// leg's own op (a sign flip, a dropped term, a swapped variant, a wrong
 /// knob — see each call site's own doc for the specific defect and how
 /// it is reached through the op's PUBLIC surface, never by editing a
-/// correct `actual` array's bits — item 3), computed independently of
+/// correct `actual` array's bits), computed independently of
 /// `actual`. Asserts this leg's own `bound_fn` (the SAME closure the
 /// green-path check above just used) actually flags at least one element
-/// of `defect`, and prints the worst `|Δ|/bound` ratio so a pod log shows
+/// of `defect`, and prints the worst `|Δ|/bound` ratio so a run log shows
 /// RED as a MAGNITUDE (how far past the edge), not merely a boolean.
 fn assert_forced_defect_exceeds_bound(
     label: &str,
@@ -608,7 +589,7 @@ fn ln_forward(
 /// Forced-defect reference for LN forward: a REAL plausible bug (forgot
 /// the affine `* gamma` multiply, leaving `out = xhat`) computed
 /// independently, in plain `f64`-accumulated Rust, from the SAME `xv`
-/// fixture — never by editing the correct `out_gpu_v` array (item 3). LN
+/// fixture — never by editing the correct `out_gpu_v` array. LN
 /// has no public knob that reaches this defect (unlike RoPE's
 /// `negate_sin`), so this and every other LN forced
 /// defect below is an independently-computed wrong formula rather than a
@@ -713,7 +694,7 @@ fn assert_ln_parity_f32(
     assert_eq!(out_gpu_v.len(), n, "LN GPU fwd length mismatch");
     // `k_rel = 2 * hidden`: `mean`/`var` both reduce over `hidden`, same
     // Higham-shaped, amplitude-scaled rationale as `dx`'s bound below.
-    // `k_abs = F32_CANCELLATION_ULPS` (item 1's two-term bound, see this
+    // `k_abs = F32_CANCELLATION_ULPS` (the two-term bound, see this
     // file's leading comment): a SMALL, shared, operand-scale absolute
     // term for the near-zero-reference case the `k_rel` term alone
     // underflows.
@@ -729,7 +710,7 @@ fn assert_ln_parity_f32(
     // backward formula (`dy - mean(dy) - xhat*mean(dy*xhat)`) is
     // ANALYTICALLY ZERO (`mean(1) == 1`, `mean(xhat) == 0`), so a naive
     // `out.backward()` here compares `0.0` to `0.0` and proves nothing
-    // about `bwd` regardless of what the kernel computes (family F). See
+    // about `bwd` regardless of what the kernel computes. See
     // this file's discriminating-backward toolkit header doc.
     let dyv = cotangent_fixture(n, 0xDA57_1D5E_2000_0001, 3.0);
     let dy_cpu = Tensor::from_slice(&dyv, (rows, hidden), &cpu).unwrap();
@@ -832,9 +813,9 @@ fn assert_ln_parity_bf16(
     // zero, a vacuous control regardless of dtype.
     //
     // `k = 2` below (not `1`): the CPU op computes `invvar` as
-    // `1.0 / (var + eps).sqrt()` (`ops/layer_norm.rs:507` — two
+    // `1.0 / (var + eps).sqrt()` (`ops/layer_norm.rs` — two
     // separately-rounded IEEE operations), while the CUDA kernel calls
-    // `rsqrtf()` (`src/cuda/layer_norm.cu:90` — one hardware fused
+    // `rsqrtf()` (`src/cuda/layer_norm.cu` — one hardware fused
     // reciprocal-sqrt intrinsic with its own, looser accuracy contract)
     // — a real cross-device numerical-function divergence, not merely
     // fmad contraction.
@@ -911,7 +892,7 @@ fn assert_ln_parity_bf16(
     assert_forced_defect_exceeds_bound("ln bf16 dgamma", &dg_cpu_v, &dg_defect, dg_bound);
 }
 
-/// [`assert_ln_parity_bf16`]'s F16 twin (campaign #443 W2b) — compares the
+/// [`assert_ln_parity_bf16`]'s F16 twin — compares the
 /// SAME op's two device arms (CPU `CpuStorage::F16` vs CUDA
 /// `layer_norm_f16.cu`), both f32-internal/round-once per the per-op f16
 /// regime table (`docs/maintainer/cuda-kernel-guide.md` §3.10). `k = 2`,
@@ -957,7 +938,7 @@ fn assert_ln_parity_f16(
     assert_eq!(out_cpu_v.len(), n);
     assert_eq!(out_gpu_v.len(), n, "LN f16 GPU fwd length mismatch");
     assert_floor_below_f16_gradient_band(2, max_abs(xv).max(max_abs(gv)));
-    let out_floor = measured_near_zero_floor_f16(&out_cpu_v); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
+    let out_floor = measured_near_zero_floor_f16(&out_cpu_v);
     let out_bound = |r: f32| f16_relative_bound(r, out_floor, 2.0);
     assert_relative_bound("ln f16 fwd", &out_cpu_v, &out_gpu_v, out_bound);
     let out_defect = ln_fwd_no_gamma_defect(xv, rows, hidden, eps);
@@ -988,7 +969,7 @@ fn assert_ln_parity_f16(
         dx_norm.sqrt()
     );
     // Every element of `dx`/`dgamma`'s gradient must be a genuinely
-    // finite f16 (KO-6/KO-7 live signal, family F non-vacuous negative
+    // finite f16 (KO-6 live signal, non-vacuous negative
     // control): a NaN gradient must be caught here, not silently accepted
     // by a naive tolerance comparison (`NaN > c` is `false`).
     let dx_gpu_f16: Vec<f16> = grads_gpu
@@ -1005,7 +986,7 @@ fn assert_ln_parity_f16(
     for (i, h) in dx_gpu_f16.iter().enumerate() {
         assert_finite_f16(*h, &format!("ln f16 dx[{i}]"));
     }
-    let dx_floor = measured_near_zero_floor_f16(&dx_cpu_v); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
+    let dx_floor = measured_near_zero_floor_f16(&dx_cpu_v);
     let dx_bound = |r: f32| f16_relative_bound(r, dx_floor, 2.0);
     assert_relative_bound("ln f16 dx", &dx_cpu_v, &dx_gpu_v, dx_bound);
     let dx_defect = ln_bwd_dx_no_centering_defect(xv, gv, &dyv_f, rows, hidden, eps);
@@ -1015,14 +996,14 @@ fn assert_ln_parity_f16(
     let dg_gpu_v = to_f32(&grads_gpu.get(&g_gpu).unwrap().to_device(&cpu).unwrap());
     assert_eq!(dg_cpu_v.len(), hidden);
     assert_eq!(dg_gpu_v.len(), hidden, "LN f16 GPU dgamma length mismatch");
-    let dg_floor = measured_near_zero_floor_f16(&dg_cpu_v); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
+    let dg_floor = measured_near_zero_floor_f16(&dg_cpu_v);
     let dg_bound = |r: f32| f16_relative_bound(r, dg_floor, 2.0);
     assert_relative_bound("ln f16 dgamma", &dg_cpu_v, &dg_gpu_v, dg_bound);
     let dg_defect = ln_bwd_dgamma_mean_not_sum_defect(xv, &dyv_f, rows, hidden, eps);
     assert_forced_defect_exceeds_bound("ln f16 dgamma", &dg_cpu_v, &dg_defect, dg_bound);
 }
 
-/// Behavioral boundary oracle (family D / campaign #443 D4): the fused
+/// Behavioral boundary oracle: the fused
 /// F16 CUDA kernel's OWN final `__float2half` rounding must saturate to
 /// `±inf` at a magnitude beyond `F16_MAX`, exactly like `half::f16`'s
 /// conversion does on the CPU arm -- NEVER a tolerance-vs-finite-f32
@@ -1062,7 +1043,7 @@ fn ln_parity_f16_output_saturates_to_infinity_beyond_f16_max() {
         any_saturated,
         "expected at least one output element to saturate to +/-inf beyond F16_MAX \
          ({F16_MAX}); got {out_gpu:?} -- a confident wrong finite number at this \
-         boundary is exactly the family D failure mode this oracle exists to catch"
+         boundary is exactly the failure mode this oracle exists to catch"
     );
     for h in &out_gpu {
         assert!(
@@ -1107,13 +1088,11 @@ fn ln_parity_f16_output_underflows_to_zero_below_f16_min_subnormal() {
     // Isolated reference (KO-8): the smaller-magnitude elements' true f32
     // product (|xhat| ~= 0.4472 for x in {2,3}, no-producer: hand-derived
     // from the fixture's own LayerNorm formula, not measured) really is
-    // below the subnormal floor. Reconciled against the phase-4 fix to
-    // `assert_underflows_to_zero`'s domain (`f16_oracle::F16_UNDERFLOW_TIE`
-    // = HALF of F16_MIN_POSITIVE_SUBNORMAL, not the full value): 0.4472 (no-producer: same hand-derived quantity above) <
-    // 0.5, so this fixture sits
-    // comfortably inside the TRUE round-to-zero domain on both the old
-    // (false) and the corrected boundary -- this call site needed no value
-    // change, only the shared helper did.
+    // below the subnormal floor. `assert_underflows_to_zero`'s domain is
+    // bounded by `f16_oracle::F16_UNDERFLOW_TIE` (HALF of
+    // F16_MIN_POSITIVE_SUBNORMAL, not the full value): 0.4472 (no-producer:
+    // the same hand-derived quantity above) < 0.5, so this fixture sits
+    // comfortably inside the TRUE round-to-zero domain.
     assert_underflows_to_zero(0.4472 * F16_MIN_POSITIVE_SUBNORMAL);
 }
 
@@ -1252,20 +1231,19 @@ fn ln_parity_empty_batch() {
 }
 
 // =======================================================================
-// #460 (C-LN): LayerNormBiasedFused CPU<->CUDA parity. Same divergence-
+// LayerNormBiasedFused CPU<->CUDA parity. Same divergence-
 // prone classes and same `k`-derivation discipline as `LayerNormFused`'s
 // suite above (this module's own comments cite the identical `rsqrtf()`-
 // vs-`1.0/sqrt()` cross-device divergence for the `k=2` 16-bit bound), plus
 // `dbeta` (exact on an integer fixture — an ordinary `Tensor::sum`
 // composition, not a further kernel, so its own CPU/CUDA agreement is
 // governed by candle's own reduction, not this crate's kernel code) and
-// two regression pins: the bias-free kernels' own output must be
-// UNCHANGED by this addition (append-only `.cu` edits — see those files'
-// own module docs), and same-device fused-vs-`slow()`-style composition
+// two regression pins: a spot-check of the bias-free kernels' own output,
+// and same-device fused-vs-`slow()`-style composition
 // bound (NOT bit-exact: the composition folds via `broadcast_*`/`sum_
 // keepdim` in a different order than the fused kernel's own row loop).
 //
-// KO-1 forced-defect coverage in THIS block (round 1 of #460's fix):
+// KO-1 forced-defect coverage in THIS block:
 // fwd carries its own forced-defect leg on every dtype (f32/bf16/f16) —
 // the bias-free `LayerNormFused` op run on the SAME x/gamma IS the defect
 // (beta silently dropped is the one plausible bug this new bias-carrying
@@ -1300,7 +1278,7 @@ fn ln_forward_biased(
 
 /// F32 leg: fwd + dx + dgamma (the file's standard two-term bound, same
 /// derivation as `assert_ln_parity_f32`) + dbeta EXACT on an integer `dy`
-/// fixture (family F: no rounding-tolerance judgment call needed at all —
+/// fixture (no rounding-tolerance judgment call needed at all —
 /// `.sum_all()`'s upstream gradient is all-`1.0`, so `dbeta_i = rows`
 /// exactly, on both devices, in f32).
 fn assert_ln_parity_biased_f32(
@@ -1413,8 +1391,8 @@ fn assert_ln_parity_biased_f32(
     );
 
     // Second pass: sign-mixed cotangent for dx/dgamma (dbeta re-checked
-    // for cross-device agreement too, though it is no longer the
-    // exact-integer leg above once dy is non-uniform).
+    // for cross-device agreement too, though it is not the exact-integer
+    // leg above once dy is non-uniform).
     let x_cpu2 = Var::from_tensor(&Tensor::from_slice(xv, (rows, hidden), &cpu).unwrap()).unwrap();
     let g_cpu2 = Var::from_tensor(&Tensor::from_slice(gv, (hidden,), &cpu).unwrap()).unwrap();
     let b_cpu2 = Var::from_tensor(&Tensor::from_slice(bv, (hidden,), &cpu).unwrap()).unwrap();
@@ -1485,7 +1463,7 @@ fn assert_ln_parity_biased_f32(
 /// rounds mid-reduction on a real accumulate, so this is a relative bound,
 /// not the f32 leg's exact-integer claim).
 ///
-/// `floor_fn`/`bound_fn` are the CALLER-selected, dtype-OWN pair (D4:
+/// `floor_fn`/`bound_fn` are the CALLER-selected, dtype-OWN pair (
 /// `measured_near_zero_floor`/`bf16_relative_bound` for a `T = bf16` call,
 /// `measured_near_zero_floor_f16`/`f16_relative_bound` for `T = f16`) —
 /// this function is generic over `T` (the tensor dtype) but a bound
@@ -1616,24 +1594,15 @@ fn assert_ln_parity_biased_16bit<T, F>(
     );
 }
 
-/// What this test actually is: a `±F32_TOL` tolerance spot-check of the
-/// CURRENT tip's bias-free CUDA `layer_norm_fwd` output against a
-/// hand-computed f32 reference, at a shape/seed independent of every other
-/// test above. It does NOT run the pre-#460 binary and cannot, by
-/// construction, prove bit-identity with it — `F32_TOL` (1e-4) is wide
-/// enough to hide a change far smaller than any real bug this file's other
-/// forced-defect legs are built to catch. The actual bit-identity proof for
-/// "the bias-free kernels are unchanged by #460" is NOT a runtime test at
-/// all: it is that `src/cuda/layer_norm.cu` and `layer_norm_f16.cu`'s
-/// pre-#460 bias-free translation units were edited APPEND-ONLY (see those
-/// files' own module docs) — no existing line in either file was touched,
-/// so the bias-free kernels' compiled bytes are provably identical to the
-/// pre-#460 tip's, independent of any test run's numeric tolerance. This
-/// test is a live sanity check that the (unchanged) bias-free kernel still
-/// computes the right answer, not the mechanism that proves it is
-/// unchanged.
+/// A `±F32_TOL` tolerance spot-check of the bias-free CUDA `layer_norm_fwd`
+/// output against a hand-computed f32 reference, at a shape/seed
+/// independent of every other test above. `F32_TOL` (1e-4) is wide enough
+/// to hide a change far smaller than any real bug this file's other
+/// forced-defect legs are built to catch, so this is a live sanity check
+/// that the bias-free kernel computes the right answer, not a bit-identity
+/// proof.
 #[test]
-fn ln_parity_bias_free_kernels_unchanged_by_the_460_addition() {
+fn ln_parity_bias_free_kernel_matches_a_hand_computed_reference() {
     let cuda = jammi_test_resources::cuda_device(0);
     let rows = 2;
     let hidden = 16;
@@ -1657,7 +1626,8 @@ fn ln_parity_bias_free_kernels_unchanged_by_the_460_addition() {
             let got = out_gpu[r * hidden + i];
             assert!(
                 (got - expected).abs() <= F32_TOL as f32,
-                "bias-free ln fwd[{r},{i}] must be unchanged by #460: cuda {got} vs {expected}"
+                "bias-free ln fwd[{r},{i}] must match the hand-computed reference: cuda {got} vs \
+                 {expected}"
             );
         }
     }
@@ -1900,7 +1870,7 @@ fn assert_rope_parity_f32(cuda: &Device, batch: usize, seq: usize, hidden: usize
     // `k_rel = 4`: RoPE is purely elementwise (one rotation per (x, x_rot)
     // pair, no cross-element reduction) — a small chain-of-two-products
     // fmad allowance, never scaled by `seq`/`hidden`. `k_abs =
-    // F32_CANCELLATION_ULPS` (item 1's two-term bound) covers a
+    // F32_CANCELLATION_ULPS` (the two-term bound) covers a
     // near-cancelled rotation output at this element's own operand scale.
     let out_floor = max_abs(xv);
     let out_bound =
@@ -2025,13 +1995,12 @@ fn assert_rope_parity_bf16(cuda: &Device, batch: usize, seq: usize, hidden: usiz
     let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
     assert_eq!(out_cpu_v.len(), n);
     assert_eq!(out_gpu_v.len(), n, "rope bf16 GPU fwd length mismatch");
-    // `k = 1` (item 4/5, esc-048): both the CPU (`ops/rope.rs`'s
+    // `k = 1`: both the CPU (`ops/rope.rs`'s
     // `rope_fwd_row_bf16`) and CUDA (`src/cuda/rope.cu`'s `rope_fwd_bf16`)
     // arms compute the WHOLE `x*cos + rotate_half(x)*sin` expression in
-    // `f32` and round to `bf16` EXACTLY ONCE at the very end — verified by
-    // reading both this round (neither arm rounds an intermediate product
-    // to `bf16` first, so this is NOT the double-rounding defect class
-    // PR #382 fixed). `hidden`/`seq` add no reduction depth (RoPE is
+    // `f32` and round to `bf16` EXACTLY ONCE at the very end (neither arm
+    // rounds an intermediate product to `bf16` first, so this is NOT the
+    // double-rounding defect class). `hidden`/`seq` add no reduction depth (RoPE is
     // purely elementwise, no cancellation), and round-to-nearest-even is
     // MONOTONE: two pre-rounding values less than one `bf16` ULP apart
     // land on adjacent grid points AT MOST, so nvcc's `--fmad=true`
@@ -2040,9 +2009,9 @@ fn assert_rope_parity_bf16(cuda: &Device, batch: usize, seq: usize, hidden: usiz
     // never more — a >1-ULP gap would need a pre-rounding delta exceeding
     // `2^-8` of the value's magnitude (~1.3e5 `f32` ULPs), which neither
     // fmad contraction nor this op's cancellation-free elementwise formula
-    // can produce. `k = 1` is therefore the honest bound (not `k = 2`);
-    // confirmed green on a100b and a100d. A 2-3 `bf16`-ULP divergence
-    // observed on a100c at this same tree is an unexplained, box-specific
+    // can produce. `k = 1` is therefore the honest bound (not `k = 2`),
+    // confirmed on two A100s. A 2-3 `bf16`-ULP divergence observed on a
+    // third A100 at the same tree is an unexplained, box-specific
     // divergence, not folded into this bound.
     let out_floor = measured_near_zero_floor(&out_cpu_v);
     let out_bound = |r: f32| bf16_relative_bound(r, out_floor, 1.0);
@@ -2093,7 +2062,7 @@ fn assert_rope_parity_bf16(cuda: &Device, batch: usize, seq: usize, hidden: usiz
     assert_forced_defect_exceeds_bound("rope bf16 dx", &dx_cpu_v, &dx_defect, dx_bound);
 }
 
-/// [`assert_rope_parity_bf16`]'s F16 twin (campaign #443 W2b): compares
+/// [`assert_rope_parity_bf16`]'s F16 twin: compares
 /// the SAME op's two device arms (CPU `CpuStorage::F16` vs CUDA
 /// `rope_f16.cu`). `k = 1`, mirroring the bf16 leg's identical
 /// monotone-round-to-nearest-even rationale (both arms compute the whole
@@ -2138,7 +2107,7 @@ fn assert_rope_parity_f16(cuda: &Device, batch: usize, seq: usize, hidden: usize
     assert_eq!(out_cpu_v.len(), n);
     assert_eq!(out_gpu_v.len(), n, "rope f16 GPU fwd length mismatch");
     assert_floor_below_f16_gradient_band(1, max_abs(xv));
-    let out_floor = measured_near_zero_floor_f16(&out_cpu_v); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
+    let out_floor = measured_near_zero_floor_f16(&out_cpu_v);
     let out_bound = |r: f32| f16_relative_bound(r, out_floor, 1.0);
     assert_relative_bound("rope f16 fwd", &out_cpu_v, &out_gpu_v, out_bound);
     let out_defect: Vec<f32> = to_f32(
@@ -2166,7 +2135,7 @@ fn assert_rope_parity_f16(cuda: &Device, batch: usize, seq: usize, hidden: usize
     let dx_gpu_v = to_f32(&grads_gpu.get(&x_gpu).unwrap().to_device(&cpu).unwrap());
     assert_eq!(dx_cpu_v.len(), n);
     assert_eq!(dx_gpu_v.len(), n, "rope f16 GPU dx length mismatch");
-    // Live-signal, non-vacuous finiteness (KO-6/KO-7, family F).
+    // Live-signal, non-vacuous finiteness (KO-6).
     let dx_gpu_f16: Vec<f16> = grads_gpu
         .get(&x_gpu)
         .unwrap()
@@ -2181,7 +2150,7 @@ fn assert_rope_parity_f16(cuda: &Device, batch: usize, seq: usize, hidden: usize
     for (i, h) in dx_gpu_f16.iter().enumerate() {
         assert_finite_f16(*h, &format!("rope f16 dx[{i}]"));
     }
-    let dx_floor = measured_near_zero_floor_f16(&dx_cpu_v); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
+    let dx_floor = measured_near_zero_floor_f16(&dx_cpu_v);
     let dx_bound = |r: f32| f16_relative_bound(r, dx_floor, 1.0);
     assert_relative_bound("rope f16 dx", &dx_cpu_v, &dx_gpu_v, dx_bound);
     let dx_defect: Vec<f32> = {
@@ -2202,17 +2171,17 @@ fn assert_rope_parity_f16(cuda: &Device, batch: usize, seq: usize, hidden: usize
 /// saturate to `±inf` at that one rounding — never a silently clamped
 /// finite value.
 ///
-/// REWRITTEN, campaign #446 finding 7: the previous version built its
-/// `cos` table as `f16::from_f32(100_000.0)`. `100_000 > F16_MAX`, so the
-/// TABLE ITSELF was already `+inf` before the kernel ever read it, and
-/// `inf * x` is `inf` under any implementation — the assertion could not
-/// fail, and in particular could not distinguish "the final `__float2half`
+/// The table must stay FINITE: a `cos` table built as
+/// `f16::from_f32(100_000.0)` (`100_000 > F16_MAX`) is already `+inf`
+/// before the kernel reads it, and `inf * x` is `inf` under any
+/// implementation — the assertion could not fail, and in particular could
+/// not distinguish "the final `__float2half`
 /// saturates correctly" (the thing under test) from "an infinity was
 /// propagated" (a different thing entirely, and not a property of this
-/// kernel). Every input here is now finite by construction and CHECKED to
-/// be, which is the vacuous-control guard: re-widening the fixture back
-/// past `F16_MAX` fails the fixture assertions instead of silently
-/// re-vacating the oracle.
+/// kernel). Every input here is finite by construction and CHECKED to be,
+/// which is the vacuous-control guard: widening the fixture past
+/// `F16_MAX` fails the fixture assertions instead of silently vacating the
+/// oracle.
 ///
 /// The construction, stated: `cos[i] = F16_MAX` (65504.0 — the LARGEST
 /// FINITE f16, exactly representable, so the table is at the top of the
@@ -2338,7 +2307,7 @@ fn rope_parity_f16_output_saturates_to_infinity_beyond_f16_max() {
     }
 }
 
-/// Mirror-image boundary oracle (family D, the small-magnitude end):
+/// Mirror-image boundary oracle (the small-magnitude end):
 /// `x*cos` computed in f32 then rounded to f16 must underflow to EXACT
 /// zero when the true product's magnitude sits strictly below f16's
 /// smallest representable subnormal, never a sign flip or a subnormal
@@ -2381,9 +2350,8 @@ fn rope_parity_f16_output_underflows_to_zero_below_f16_min_subnormal() {
     }
     // Isolated reference (KO-8): the true f32 product really is below the
     // subnormal floor -- and by a huge margin (F16_MIN_POSITIVE_SUBNORMAL
-    // squared is ~3.55e-15, many orders of magnitude below even the
-    // corrected tie, f16_oracle::F16_UNDERFLOW_TIE = subnormal/2), so this
-    // fixture needed no value change for the phase-4 domain fix.
+    // squared is ~3.55e-15, many orders of magnitude below the tie,
+    // f16_oracle::F16_UNDERFLOW_TIE = subnormal/2).
     assert_underflows_to_zero(F16_MIN_POSITIVE_SUBNORMAL * F16_MIN_POSITIVE_SUBNORMAL);
 }
 
@@ -2635,7 +2603,7 @@ fn assert_softmax_parity_f32(cuda: &Device, rows: usize, last: usize, sv: &[f32]
         );
     }
 
-    // Non-uniform dy (family F): `Tensor::backward()`'s implicit all-ones
+    // Non-uniform dy: `Tensor::backward()`'s implicit all-ones
     // seed makes `dscores = (dy - sum(dy*y)) * y` IDENTICALLY zero for
     // every softmax row (`sum(y) == 1`), so a parity check seeded that way
     // would pass VACUOUSLY even with `bwd` badly broken (e.g. `* scale`
@@ -2667,7 +2635,7 @@ fn assert_softmax_parity_f32(cuda: &Device, rows: usize, last: usize, sv: &[f32]
         .unwrap();
     assert_eq!(dx_cpu.len(), n);
     assert_eq!(dx_gpu.len(), n, "softmax GPU dscores length mismatch");
-    // Non-vacuity (family F): pin that the CPU reference itself is
+    // Non-vacuity: pin that the CPU reference itself is
     // measurably nonzero -- otherwise the parity loop below would pass
     // trivially without proving `bwd` ran the real formula.
     let dx_cpu_norm: f64 = dx_cpu
@@ -2739,7 +2707,7 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
     );
     assert_forced_defect_exceeds_bound("softmax bf16 fwd", &out_cpu_v, &out_defect, out_bound);
 
-    // Non-uniform dy (family F): see `assert_softmax_parity_f32`'s
+    // Non-uniform dy: see `assert_softmax_parity_f32`'s
     // identical note -- an implicit all-ones seed makes `dscores`
     // identically zero for a softmax row, which would pass vacuously.
     let dy_seed_f = fixture(n, 5.0);
@@ -2759,7 +2727,7 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
         n,
         "softmax bf16 GPU dscores length mismatch"
     );
-    // Non-vacuity (family F): pin that the CPU reference itself is
+    // Non-vacuity: pin that the CPU reference itself is
     // measurably nonzero before trusting the parity loop below.
     let dx_cpu_norm: f64 = dx_cpu_v
         .iter()
@@ -2795,8 +2763,8 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
     assert_forced_defect_exceeds_bound("softmax bf16 dscores", &dx_cpu_v, &dx_defect, dx_bound);
 }
 
-/// The PROPAGATED-INPUT term of the f16 `dscores` allowance — campaign
-/// #446's `softmax_parity_f16_row_length_regimes` RED, root-caused.
+/// The PROPAGATED-INPUT term of the f16 `dscores` allowance (the root
+/// cause of a `softmax_parity_f16_row_length_regimes` failure without it).
 ///
 /// `dscores_i = (dy_i - dot)·y_i`, `dot = Σ_j dy_j·y_j`, and the two arms
 /// of this comparison do NOT run the backward on the same `y`: each runs
@@ -2819,15 +2787,14 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
 /// against `|dy_i - dot| = 0.0247`, a 317x cancellation, turning `1.46e-4`
 /// into 6 f16 ULPs of the 1.06e-3 result) — see
 /// [`softmax_parity_f16_row_length_regimes`], whose own doc restates this
-/// exact finding.
+/// exact measurement.
 ///
-/// This is the SAME failure this file already diagnosed and fixed for its
-/// `f32` legs with [`f32_two_term_bound`] (see that function's doc and the
+/// This is the SAME failure this file's `f32` legs handle with
+/// [`f32_two_term_bound`] (see that function's doc and the
 /// floor design note above [`measured_near_zero_floor`]: "an OUTPUT/gradient
 /// value orders of magnitude smaller than the operands that computed it —
-/// via ordinary cancellation, not a defect"). The f16 legs never received
-/// it because until campaign #446's finding 7 the only f16 softmax shape in
-/// this file was `last = 8`, where there is no room for a flip to land.
+/// via ordinary cancellation, not a defect"). At `last = 8` there is no
+/// room for a flip to land; at the longer row-length regimes there is.
 ///
 /// The term below is NOT a widened `k`. It is the exact triangle-inequality
 /// bound on the algebraic identity
@@ -2864,7 +2831,7 @@ fn softmax_f16_dscores_propagation_terms(
         let span = r * last..(r + 1) * last;
         // `dot` as the CPU reference forms it, and `Δdot` as the measured
         // forward difference propagates into it. Both in f64 so this
-        // allowance is itself fold-order-independent (family J).
+        // allowance is itself fold-order-independent.
         let dot: f64 = (0..last)
             .map(|i| dy[span.start + i] as f64 * y_cpu[span.start + i] as f64)
             .sum();
@@ -2889,7 +2856,7 @@ fn softmax_f16_dscores_propagation_terms(
 ///
 /// `dot = Σ_j dy_j·y_j` is an f32 reduction, and the two arms fold it
 /// differently: `dscores_row_f16` sums sequentially in ascending index
-/// order (its own doc says so — family J), while
+/// order (its own doc says so), while
 /// `softmax_bwd_dscores_f16` sums a 256-way strided per-thread partial
 /// into a shared-memory tree. Higham Thm 4.2 bounds each arm's departure
 /// from the exact sum by `γ_n · Σ_j |dy_j·y_j|`, so the two arms differ by
@@ -2939,7 +2906,7 @@ fn softmax_f16_dscores_dot_fold_terms(
 }
 
 /// Non-vacuity control for [`softmax_f16_dscores_propagation_terms`]
-/// (family F). Needs no GPU — it runs on any host that builds this target,
+///. Needs no GPU — it runs on any host that builds this target,
 /// device or not, because it pins the new allowance's OWN behavior against
 /// hand-computed values rather than against a measurement. The term can
 /// therefore never quietly become a blanket widening.
@@ -2992,8 +2959,8 @@ fn softmax_f16_dscores_propagation_term_is_inert_without_a_forward_divergence() 
     );
     // And the active term really is the thing that matters at a cancelled
     // element: at `i = 1` it dwarfs the k=2 rounding allowance it is added
-    // to (2 f16 ULPs at the row-1 dscores scale), which is exactly why the
-    // pre-#446 single-term bound false-failed.
+    // to (2 f16 ULPs at the row-1 dscores scale), which is exactly why a
+    // single-term bound false-fails.
     assert!(
         active[1] > 2.0 * f16_ulp_size_at(0.25),
         "expected the propagated term ({}) to exceed the k=2 term it supplements",
@@ -3024,7 +2991,7 @@ fn softmax_f16_dscores_propagation_term_is_inert_without_a_forward_divergence() 
     );
 }
 
-/// [`assert_softmax_parity_bf16`]'s F16 twin (campaign #443 W2b): compares
+/// [`assert_softmax_parity_bf16`]'s F16 twin: compares
 /// the SAME op's two device arms (CPU `CpuStorage::F16` vs CUDA
 /// `softmax_f16.cu`). Per the per-op f16 regime table
 /// (`docs/maintainer/cuda-kernel-guide.md` §3.10) this op is
@@ -3063,7 +3030,7 @@ fn assert_softmax_parity_f16(cuda: &Device, rows: usize, last: usize, sv: &[f32]
     assert_eq!(out_cpu_v.len(), n);
     assert_eq!(out_gpu_v.len(), n, "softmax f16 GPU fwd length mismatch");
     assert_floor_below_f16_gradient_band(2, max_abs(sv).max(max_abs(&mv)));
-    let out_floor = measured_near_zero_floor_f16(&out_cpu_v); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
+    let out_floor = measured_near_zero_floor_f16(&out_cpu_v);
     let out_bound = |r: f32| f16_relative_bound(r, out_floor, 2.0);
     assert_relative_bound("softmax f16 fwd", &out_cpu_v, &out_gpu_v, out_bound);
     // Forced defect: the mask dropped, same mutant class every other
@@ -3100,7 +3067,7 @@ fn assert_softmax_parity_f16(cuda: &Device, rows: usize, last: usize, sv: &[f32]
         "CPU dscores must be measured-nonzero (norm {dx_cpu_norm}) -- a vacuous \
          all-zero reference would make the parity check below prove nothing"
     );
-    // Live-signal, non-vacuous finiteness (KO-6/KO-7, family F).
+    // Live-signal, non-vacuous finiteness (KO-6).
     let dx_gpu_f16: Vec<f16> = grads_gpu
         .get(&s_gpu)
         .unwrap()
@@ -3115,14 +3082,14 @@ fn assert_softmax_parity_f16(cuda: &Device, rows: usize, last: usize, sv: &[f32]
     for (i, h) in dx_gpu_f16.iter().enumerate() {
         assert_finite_f16(*h, &format!("softmax f16 dscores[{i}]"));
     }
-    let dx_floor = measured_near_zero_floor_f16(&dx_cpu_v); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
-                                                            // Three additive terms, one per mechanism, none of them a widened `k`:
-                                                            // `k = 2` for this leg's own rounding (each arm's single final cast to
-                                                            // f16, guide §3.10's "dscores bwd is 1"), plus the FORWARD's own
-                                                            // within-bound `Δy` after this op's cancellation amplifies it, plus the
-                                                            // `dot` reduction's fold-order difference between the two arms. See
-                                                            // [`softmax_f16_dscores_propagation_terms`] and
-                                                            // [`softmax_f16_dscores_dot_fold_terms`].
+    let dx_floor = measured_near_zero_floor_f16(&dx_cpu_v);
+    // Three additive terms, one per mechanism, none of them a widened `k`:
+    // `k = 2` for this leg's own rounding (each arm's single final cast to
+    // f16, guide §3.10's "dscores bwd is 1"), plus the FORWARD's own
+    // within-bound `Δy` after this op's cancellation amplifies it, plus the
+    // `dot` reduction's fold-order difference between the two arms. See
+    // [`softmax_f16_dscores_propagation_terms`] and
+    // [`softmax_f16_dscores_dot_fold_terms`].
     let dx_prop =
         softmax_f16_dscores_propagation_terms(&out_cpu_v, &out_gpu_v, &dy_seed_f, rows, last);
     let dx_fold = softmax_f16_dscores_dot_fold_terms(&out_cpu_v, &dy_seed_f, rows, last);
@@ -3183,7 +3150,7 @@ fn softmax_parity_f16_scale_multiply_saturates_to_infinity_beyond_f16_max() {
     // After the scale-multiply saturates to +inf for every position, the
     // row-max subtraction (`v - maxv`) is `inf - inf = NaN` for the max
     // element itself under naive IEEE754 arithmetic, so the CONTRACT here
-    // is non-finite detection (family F), not a specific output value:
+    // is non-finite detection, not a specific output value:
     // this boundary input is outside the op's intended `scale` domain
     // (`SoftmaxLastDimFused::with_scale`'s own finite-positive-scale
     // contract governs ORDINARY use; this test proves the KERNEL's raw
@@ -3195,13 +3162,13 @@ fn softmax_parity_f16_scale_multiply_saturates_to_infinity_beyond_f16_max() {
     // must surface this as a genuine non-finite value, NEVER silently
     // compute some plausible-looking but WRONG finite probability
     // distribution at a magnitude outside this op's intended domain
-    // (family F: the non-finite path must actually be reachable and
+    // (the non-finite path must actually be reachable and
     // detected, not silently absorbed into a finite-looking result).
     assert!(
         out_gpu.iter().any(|h| !h.is_finite()),
         "expected at least one non-finite output at this out-of-domain scale \
          (huge_scale={huge_scale}) -- a fully-finite result here would be a confident \
-         WRONG softmax distribution, exactly the family D/F failure mode this oracle \
+         WRONG softmax distribution, exactly the failure mode this oracle \
          exists to catch: {out_gpu:?}"
     );
     // The scale-multiply step itself, isolated (KO-8 independent
@@ -3210,11 +3177,11 @@ fn softmax_parity_f16_scale_multiply_saturates_to_infinity_beyond_f16_max() {
     // magnitude, establishing what the kernel's own rounding step must
     // reproduce.
     for &v in &sv {
-        // Round-2 audit F2 reconciliation: `sv = [1.0, 2.0, 3.0, 4.0]`
-        // (above) times `huge_scale = 100_000.0` yields magnitudes in
-        // `[100_000, 400_000]`, all comfortably at/above
-        // `f16_oracle::F16_OVERFLOW_TIE` (65_520.0) -- this call sits in
-        // the corrected domain, not merely "beyond F16_MAX".
+        // `sv = [1.0, 2.0, 3.0, 4.0]` (above) times `huge_scale =
+        // 100_000.0` yields magnitudes in `[100_000, 400_000]`, all
+        // comfortably at/above `f16_oracle::F16_OVERFLOW_TIE` (65_520.0) --
+        // this call sits in the saturating domain, not merely "beyond
+        // F16_MAX".
         assert_saturates_to_infinity(v * huge_scale);
     }
 }
@@ -3240,10 +3207,9 @@ fn softmax_parity_long_row_seq_512_class() {
     let sv = fixture(rows * last, 2.0);
     assert_softmax_parity_f32(&cuda, rows, last, &sv);
     assert_softmax_parity_bf16(&cuda, rows, last, &sv);
-    // Campaign #446, finding 7: the f16 leg was MISSING here while
-    // production reaches exactly this `last` on the f16 arm (ModernBERT's
-    // `attention_block` f16 path), so the shipped long-row f16 kernel had
-    // no parity oracle at all above `last = 8`.
+    // Production reaches exactly this `last` on the f16 arm (ModernBERT's
+    // `attention_block` f16 path), so the long-row f16 kernel needs a
+    // parity oracle above `last = 8`.
     assert_softmax_parity_f16(&cuda, rows, last, &sv);
 }
 
@@ -3257,14 +3223,13 @@ fn softmax_parity_non_power_of_two_last_dim() {
     let sv = fixture(rows * last, 3.0);
     assert_softmax_parity_f32(&cuda, rows, last, &sv);
     assert_softmax_parity_bf16(&cuda, rows, last, &sv);
-    // f16 leg added with the same finding-7 rationale as
+    // f16 leg for the same reason as
     // `softmax_parity_long_row_seq_512_class` above.
     assert_softmax_parity_f16(&cuda, rows, last, &sv);
 }
 
 /// F16 coverage of EVERY row-length regime `softmax_f16.cu` actually has,
-/// on BOTH sides of each boundary (campaign #446, finding 7 — before this,
-/// the only f16 softmax parity shape in this file was `last = 8`).
+/// on BOTH sides of each boundary.
 ///
 /// The kernel has exactly one row-length structure: one block of
 /// `SM_BLOCK = 256` threads per row, with every pass over the row written
@@ -3290,7 +3255,7 @@ fn softmax_parity_non_power_of_two_last_dim() {
 /// admission boundary). `last = 512` and `last = 300` are deliberately NOT
 /// repeated here; they are covered by the two named tests above.
 ///
-/// **What this test found (campaign #446).** At `last = 257` — the FIRST
+/// **What this test measures.** At `last = 257` — the FIRST
 /// shape here where a thread accumulates across iterations — the L40S
 /// measures a forward `Δy/bound` of 0.5: the CUDA forward's f32 row sum,
 /// folded as a strided partial plus a shared-memory tree, differs from
@@ -3301,9 +3266,9 @@ fn softmax_parity_non_power_of_two_last_dim() {
 /// and lands as 6 f16 ULPs of `dscores[35]`. The kernel is NOT at fault
 /// (`softmax_bwd_dscores_f16` keeps every step in f32 through one rounding
 /// point, exactly as §3.10 specifies, and its own block-reduction fold
-/// order is device-measured at <=1 ULP wherever `Δy` is bit-zero); the
-/// pre-#446 `dscores` bound was, for omitting the propagated-input term.
-/// See [`softmax_f16_dscores_propagation_terms`].
+/// order is device-measured at <=1 ULP wherever `Δy` is bit-zero); a
+/// `dscores` bound that omits the propagated-input term is. See
+/// [`softmax_f16_dscores_propagation_terms`].
 #[test]
 fn softmax_parity_f16_row_length_regimes() {
     let cuda = jammi_test_resources::cuda_device(0);
@@ -3443,7 +3408,7 @@ fn softmax_parity_empty_batch() {
 const HEAD_DIM_64_SCALE: f32 = 0.125;
 
 fn softmax_scale(scores: &Tensor, mask: &Tensor, scale: f32) -> candle_core::Result<Tensor> {
-    // `.with_scale` validates `scale` (family D — see its own doc) and
+    // `.with_scale` validates `scale` (see its own doc) and
     // returns `KernelError`; every fixture in this file passes a genuine
     // finite positive scale, so `.expect` here is a test-fixture
     // assumption, not a silent unwrap of a real fallible path.
@@ -3492,7 +3457,7 @@ fn assert_softmax_scale_parity_f32(
         );
     }
 
-    // Non-uniform dy (family F): `Tensor::backward()`'s implicit all-ones
+    // Non-uniform dy: `Tensor::backward()`'s implicit all-ones
     // seed makes `dscores = (dy - sum(dy*y)) * y` IDENTICALLY zero for
     // every softmax row (`sum(y) == 1`) -- with a uniform seed, `dscores`
     // would be an uninformative all-zero on BOTH devices, exercising
@@ -3535,7 +3500,7 @@ fn assert_softmax_scale_parity_f32(
         .unwrap();
     assert_eq!(dx_cpu.len(), n);
     assert_eq!(dx_gpu.len(), n, "softmax scale GPU dscores length mismatch");
-    // Non-vacuity (family F): pin that the CPU reference itself is
+    // Non-vacuity: pin that the CPU reference itself is
     // measurably nonzero -- otherwise the parity loop below proves
     // nothing about the CUDA kernel's own `scale` multiply.
     let dx_cpu_norm: f64 = dx_cpu
@@ -3620,7 +3585,7 @@ fn assert_softmax_scale_parity_bf16(
         out_bound,
     );
 
-    // Non-uniform dy (family F): see `assert_softmax_scale_parity_f32`'s
+    // Non-uniform dy: see `assert_softmax_scale_parity_f32`'s
     // identical note -- this exercises `SoftmaxBwdDScores`'s forward-y
     // coupling on a measurably-nonzero `dscores`, not the shared `* scale`
     // multiply (which a CPU<->CUDA comparison cannot catch either way;
@@ -3643,7 +3608,7 @@ fn assert_softmax_scale_parity_bf16(
         n,
         "softmax scale bf16 GPU dscores length mismatch"
     );
-    // Non-vacuity (family F): pin that the CPU reference itself is
+    // Non-vacuity: pin that the CPU reference itself is
     // measurably nonzero before trusting the parity loop below.
     let dx_cpu_norm: f64 = dx_cpu_v
         .iter()
@@ -3829,9 +3794,7 @@ fn softmax_scale_parity_narrowed_with_nonzero_offset() {
 // intermediate round-after-multiply step runs -- the head_dim=64 leg
 // still proves CUDA/CPU-independent same-device bit-exactness at the real
 // production scale, but a mutant that drops the intermediate rounding
-// entirely passes it unchanged. Both legs are gated by
-// `JAMMI_REQUIRE_CUDA` like every other test in this file (via
-// `cuda_device()`'s early return).
+// entirely passes it unchanged.
 // =======================================================================
 
 /// A REL-POS-BIAS-shaped mask: small, continuous, NEVER `0.0` and NEVER
@@ -3920,8 +3883,8 @@ fn geglu(wi_out: &Tensor) -> candle_core::Result<Tensor> {
 }
 
 /// Forced-defect reference for GeGLU: `gelu(gate) * up` becomes `gate *
-/// up` (the activation dropped to identity) — the exact "gelu→identity"
-/// mutant this branch's audit names, computed independently in plain
+/// up` (the activation dropped to identity) — the "gelu→identity"
+/// mutant, computed independently in plain
 /// Rust from the SAME `wv` fixture (`GeluVariant::Tanh` is a TYPED
 /// REFUSAL per this op's own module doc, not a reachable "wrong but
 /// still computed" knob, so this is an independently-computed wrong
@@ -3998,9 +3961,8 @@ fn assert_geglu_parity_f32(cuda: &Device, rows: usize, intermediate: usize, wv: 
 
     // Sign-mixed, production-amplitude cotangent — never the implicit
     // ones `.backward()` assigns a non-scalar root: `round(dy * x)`
-    // collapses to `round(x)` under `dy == 1`, hiding the exact
-    // round-the-product-vs-round-the-factor defect esc-045 round 2 fixed
-    // (commit 16a1699, GH#374).
+    // collapses to `round(x)` under `dy == 1`, hiding a
+    // round-the-product-vs-round-the-factor defect.
     let dyv = cotangent_fixture(n_out, 0x6E61_1D5E_2000_0001, 3.0);
     let dy_cpu = Tensor::from_slice(&dyv, (rows, intermediate), &cpu).unwrap();
     let dy_gpu = Tensor::from_slice(&dyv, (rows, intermediate), cuda).unwrap();
@@ -4091,12 +4053,12 @@ fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv:
     // here.)
     //
     // Floor at a SMALL FRACTION of `wv`'s own amplitude (`2^-10`), not
-    // [`measured_near_zero_floor`] of the output array: a real pod run
-    // found `gelu(x1)` near its root produces an output orders of
+    // [`measured_near_zero_floor`] of the output array: on a real GPU
+    // `gelu(x1)` near its root produces an output orders of
     // magnitude smaller than `wv`'s own scale (cancellation, not a
     // defect — see this file's `f32` floor design note above
     // `measured_near_zero_floor`), and flooring at THAT tiny output's
-    // own magnitude gave it an unreasonably tight bf16 allowance
+    // own magnitude gives it an unreasonably tight bf16 allowance
     // (observed: cpu `-3.19e-6` vs cuda `-1.59e-6`, exactly the kind of
     // divergence a coarse bf16 step at that magnitude produces). Unlike
     // the `f32` legs' floor, this is a FRACTION of the input amplitude,
@@ -4143,7 +4105,7 @@ fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv:
     assert_forced_defect_exceeds_bound("geglu bf16 dwi_out", &dwi_cpu_v, &dwi_defect, dwi_bound);
 }
 
-/// [`assert_geglu_parity_bf16`]'s F16 twin (campaign #443 W2b): compares
+/// [`assert_geglu_parity_bf16`]'s F16 twin: compares
 /// the SAME op's two device arms (CPU `CpuStorage::F16` vs CUDA
 /// `geglu_f16.cu`). Same `k` as the bf16 leg and for the same reason:
 /// [`GEGLU_FWD_ROUND1_PROPAGATION_ULPS`] (3) forward, `k = 2` for the
@@ -4184,7 +4146,7 @@ fn assert_geglu_parity_f16(cuda: &Device, rows: usize, intermediate: usize, wv: 
     // (the near-root-gelu floor rationale [`assert_geglu_parity_bf16`]
     // documents above, re-derived from f16's own quantization step
     // instead of copying bf16's `2^-10` input-fraction constant).
-    let out_floor = f16_ulp_size_at(max_abs(wv)); // no-producer: the digits the checker sees here are from the `f16` in `f16_ulp_size_at`, not a numeric literal -- the floor is that function's own live per-run output
+    let out_floor = f16_ulp_size_at(max_abs(wv));
     let out_bound = |r: f32| f16_relative_bound(r, out_floor, GEGLU_FWD_ROUND1_PROPAGATION_ULPS);
     assert_relative_bound("geglu f16 fwd", &out_cpu_v, &out_gpu_v, out_bound);
     let out_defect = geglu_identity_activation_defect(wv, rows, intermediate);
@@ -4211,7 +4173,7 @@ fn assert_geglu_parity_f16(cuda: &Device, rows: usize, intermediate: usize, wv: 
         rows * 2 * intermediate,
         "geglu f16 GPU dwi_out length mismatch"
     );
-    // Live-signal, non-vacuous finiteness (KO-6/KO-7, family F).
+    // Live-signal, non-vacuous finiteness (KO-6).
     let dwi_gpu_f16: Vec<f16> = grads_gpu
         .get(&wi_gpu)
         .unwrap()
@@ -4226,7 +4188,7 @@ fn assert_geglu_parity_f16(cuda: &Device, rows: usize, intermediate: usize, wv: 
     for (i, h) in dwi_gpu_f16.iter().enumerate() {
         assert_finite_f16(*h, &format!("geglu f16 dwi_out[{i}]"));
     }
-    let dwi_floor = f16_ulp_size_at(max_abs(wv)); // no-producer: the digits the checker sees here are from the `f16` in `f16_ulp_size_at`, not a numeric literal -- the floor is that function's own live per-run output
+    let dwi_floor = f16_ulp_size_at(max_abs(wv));
     let dwi_bound = |r: f32| f16_relative_bound(r, dwi_floor, 2.0);
     assert_relative_bound("geglu f16 dwi_out", &dwi_cpu_v, &dwi_gpu_v, dwi_bound);
     let dwi_defect = geglu_identity_activation_dwi_defect(wv, &dyv_f, rows, intermediate);
@@ -4272,7 +4234,7 @@ fn geglu_parity_f16_product_saturates_to_infinity_beyond_f16_max() {
         out_gpu[0].is_infinite() && out_gpu[0].is_sign_positive(),
         "expected gate*up to saturate to +inf beyond F16_MAX ({F16_MAX}) for \
          gate={gate}, up={up}; got {:?} -- a confident wrong finite number here is \
-         exactly the family D failure mode this oracle exists to catch",
+         exactly the failure mode this oracle exists to catch",
         out_gpu[0]
     );
     // Isolated reference (KO-8): the product itself, computed
@@ -4289,15 +4251,13 @@ fn geglu_parity_f16_product_saturates_to_infinity_beyond_f16_max() {
 /// underflow to EXACT zero when the true product's magnitude sits at or
 /// below [`f16_oracle::F16_UNDERFLOW_TIE`] — the genuine round-to-zero
 /// threshold for round-to-nearest-even at this boundary, HALF of
-/// `F16_MIN_POSITIVE_SUBNORMAL`, not the full value (a phase-4 audit fixed
-/// `assert_underflows_to_zero`'s own domain to match this exactly — see
-/// that function's doc and `F16_UNDERFLOW_TIE`'s). This test's OWN fixture
-/// discovery is what surfaced the gap: a first draft used `gate = 1.0`
-/// (`gelu_erf(1.0) ~= 0.8413`), whose product with `F16_MIN_POSITIVE_SUBNORMAL`
-/// landed at `~0.84 * subnormal`, ABOVE the true `0.5 * subnormal` tie, and
-/// rounded UP to the subnormal rather than down to zero — a real, hermetic
-/// RED this oracle caught, not a false positive; see this branch's hand-off
-/// report. `gate = 0.1` (`gelu_erf(0.1) ~= 0.05399`) times
+/// `F16_MIN_POSITIVE_SUBNORMAL`, not the full value
+/// (`assert_underflows_to_zero`'s own domain matches this exactly — see
+/// that function's doc and `F16_UNDERFLOW_TIE`'s). The fixture must sit
+/// below the tie: `gate = 1.0` (`gelu_erf(1.0) ~= 0.8413`) times
+/// `F16_MIN_POSITIVE_SUBNORMAL` lands at `~0.84 * subnormal`, ABOVE the
+/// true `0.5 * subnormal` tie, and correctly rounds UP to the subnormal
+/// rather than down to zero. `gate = 0.1` (`gelu_erf(0.1) ~= 0.05399`) times
 /// `up = F16_MIN_POSITIVE_SUBNORMAL` (a legitimately representable,
 /// nonzero f16 value) lands at `~0.054 * subnormal`, safely below the tie.
 #[test]
@@ -4366,11 +4326,9 @@ fn geglu_parity_non_power_of_two_intermediate() {
     let wv = fixture(rows * 2 * intermediate, 3.0);
     assert_geglu_parity_f32(&cuda, rows, intermediate, &wv);
     assert_geglu_parity_bf16(&cuda, rows, intermediate, &wv);
-    // Campaign #446, finding 7: the f16 leg was MISSING on every geglu
-    // shape except `geglu_parity_contiguous_small` (n_out = 32, a SINGLE
-    // partial block), so the shipped f16 kernel's grid-stride TAIL — the
-    // `idx` values a launch's last block does not cover uniformly — had no
-    // oracle. This is the tail half of that gap.
+    // `geglu_parity_contiguous_small` (n_out = 32, a SINGLE partial block)
+    // never reaches the f16 kernel's grid-stride TAIL — the `idx` values a
+    // launch's last block does not cover uniformly. This covers the tail.
     assert_geglu_parity_f16(&cuda, rows, intermediate, &wv);
 }
 
@@ -4503,14 +4461,12 @@ fn geglu_parity_empty_last_dim() {
 }
 
 // =======================================================================
-// GeluErfFused CUDA parity — NOT compilable on this Mac (no `cuda`
-// feature); written against this file's own established idioms
+// GeluErfFused CUDA parity, using this file's own idioms
 // (`assert_relative_bound`/`assert_forced_defect_exceeds_bound`,
-// `f32_two_term_bound`, `bf16_relative_bound`/`f16_relative_bound`) and
-// left for the pod lane to actually run. See `ops::gelu_erf`'s module doc
-// for the op's design.
+// `f32_two_term_bound`, `bf16_relative_bound`/`f16_relative_bound`). See
+// `ops::gelu_erf`'s module doc for the op's design.
 //
-// Three legs per dtype, matching the contract's own shape:
+// Three legs per dtype:
 //   1. FORWARD `==` candle's own CUDA eager `Tensor::gelu_erf()?` — BIT
 //      EXACT, not a tolerance: this op's CUDA arm is DESIGNED to reproduce
 //      candle-kernels' `ugelu_erf_{f32,bf16,f16}` exactly (see the module
@@ -4523,9 +4479,9 @@ fn geglu_parity_empty_last_dim() {
 //      is not accuracy, anchor with a higher-precision reference" shape
 //      guide §3.3/KO-8 states).
 //   3. KO-1: the SAME producer-injected control as the CPU-only leaf test
-//      (`tests/gelu_erf_oracles.rs`'s `ko1_*`) — a hand-built "backward
-//      with `x*phi(x)` dropped" must fail the SAME bound the green path
-//      just used.
+//      (`tests/gelu_erf_oracles.rs`'s `dropping_the_x_phi_term_*`) — a
+//      hand-built "backward with `x*phi(x)` dropped" must fail the SAME
+//      bound the green path just used.
 // =======================================================================
 
 fn gelu_erf(x: &Tensor) -> candle_core::Result<Tensor> {
@@ -4582,33 +4538,29 @@ fn gelu_erf_correct_bwd_f64(xv: &[f32], dyv: &[f32]) -> Vec<f32> {
 /// quantity (`normcdf(x) = 0.5*(1+erf(x/sqrt(2)))`), reached by two
 /// genuinely different numerical routines, exactly the "real, disclosed
 /// cross-implementation gap" `F32_GELU_ERF_LIBM_ULPS`'s own doc names for
-/// GeGLU's `erff`-vs-`erff` case. `no-producer: NOT YET POD-MEASURED` —
-/// seeded at the SAME order of magnitude as `F32_GELU_ERF_LIBM_ULPS` (a
-/// comparable cross-library special-function gap) rather than derived from
-/// a real run; the pod lane that first runs this file must confirm >=2x
-/// headroom on every leg below (this crate's own campaign convention) and
-/// tighten or widen this constant from that measurement, per this crate's
-/// process for every OTHER `k_abs`/`k` constant in this file.
+/// GeGLU's `erff`-vs-`erff` case. `no-producer: not a committed
+/// measurement` — set at the SAME order of magnitude as
+/// `F32_GELU_ERF_LIBM_ULPS` (a comparable cross-library special-function
+/// gap); every leg below must show >=2x headroom against it.
 ///
-/// **Re-derivation protocol (audit round, item 4): read it off the pod
-/// log, do not re-measure by hand.** `assert_relative_bound`/
+/// **Re-derivation protocol: read it off the run log, do not re-measure
+/// by hand.** `assert_relative_bound`/
 /// `assert_relative_bound_indexed` (this file, above) already `eprintln!`s
 /// `"{label}: n=.. max|Δ|=.. max_bound=.. worst Δ/bound=.."` for EVERY leg
 /// that calls them — including `"gelu_erf f32 dx"` and
 /// `"gelu_erf f32 dx vs f64 closed-form truth"`, the two legs this
-/// constant gates. A pod run of `cuda_parity` captures both lines; the
+/// constant gates. A GPU run of `cuda_parity` captures both lines; the
 /// printed `worst Δ/bound` ratio (which must be `<= 0.5` for >=2x
-/// headroom under this constant's current value) is the number a
-/// follow-on commit tightens or widens this constant from — never a
-/// number re-derived by hand outside that log.
+/// headroom under this constant's current value) is the number this
+/// constant is tightened or widened from — never a number re-derived by
+/// hand outside that log.
 const F32_GELU_ERF_NORMCDF_ULPS: f32 = 8.0;
 
-/// The BF16/F16 leg's own `k`, for the SAME "not yet pod-measured" reason
-/// as [`F32_GELU_ERF_NORMCDF_ULPS`] — seeded at `GEGLU_FWD_ROUND1_PROPAGATION_ULPS`'s
-/// value (3) as a starting point (this op's forward has the SAME
-/// two-rounding-point structure GeGLU's own derivation covers: round the
-/// CDF, then round the product), pending the pod's own re-derivation from
-/// a real measured worst-case ratio.
+/// The BF16/F16 leg's own `k`, not a committed measurement for the SAME
+/// reason as [`F32_GELU_ERF_NORMCDF_ULPS`] — set at
+/// `GEGLU_FWD_ROUND1_PROPAGATION_ULPS`'s value (3) (this op's forward has
+/// the SAME two-rounding-point structure GeGLU's own derivation covers:
+/// round the CDF, then round the product).
 ///
 /// **Re-derivation protocol: the SAME printed readout
 /// [`F32_GELU_ERF_NORMCDF_ULPS`]'s doc describes**, one dtype down: this
@@ -4617,7 +4569,7 @@ const F32_GELU_ERF_NORMCDF_ULPS: f32 = 8.0;
 /// separate `k_abs` term that same leg needs), `"gelu_erf bf16 dx vs f32
 /// truth"`, `"gelu_erf bf16 dx truth vs f64 closed-form"`, `"gelu_erf f16
 /// fwd vs f32 truth"`, and `"gelu_erf f16 dx vs f32 truth"` — five printed
-/// `worst Δ/bound` lines per pod run, one per leg, each independently
+/// `worst Δ/bound` lines per GPU run, one per leg, each independently
 /// re-derivable from its own printed ratio.
 const GELU_ERF_16BIT_ULPS: f32 = 3.0;
 
@@ -4627,16 +4579,14 @@ const GELU_ERF_16BIT_ULPS: f32 = 3.0;
 /// formula and CUDA's `normcdff` intrinsic do not cancel identically).
 /// Seeded at the SAME order of magnitude as
 /// [`F32_GELU_ERF_NORMCDF_ULPS`]'s own cross-CDF-library gap, one dtype
-/// down (`no-producer: derived by analogy, not yet an independent
-/// measurement`) pending pod re-derivation — an A100 pod run (audit
-/// round, `fix/463-audit-kernels`, `ssh jammi-cam`) exercised the three
+/// down (`no-producer: derived by analogy`); an A100 run of the three
 /// `gelu_erf_parity_*` legs that call this constant
 /// (`gelu_erf_parity_contiguous_small`, `_production_width`,
-/// `_non_multiple_of_launch_block`) and confirmed this value fixes the
-/// leg with real headroom; see [`F32_GELU_ERF_NORMCDF_ULPS`]'s doc for the
-/// general re-derivation protocol (read `assert_relative_bound`'s printed
-/// `worst Δ/bound` off the pod log — the `"gelu_erf bf16 fwd vs f32
-/// truth"` line is this constant's own).
+/// `_non_multiple_of_launch_block`) passes with real headroom; see
+/// [`F32_GELU_ERF_NORMCDF_ULPS`]'s doc for the general re-derivation
+/// protocol (read `assert_relative_bound`'s printed `worst Δ/bound` off
+/// the run log — the `"gelu_erf bf16 fwd vs f32 truth"` line is this
+/// constant's own).
 const GELU_ERF_BF16_FWD_ABS_ULPS: f32 = 8.0;
 
 /// The bf16 BACKWARD-vs-f32-truth leg's own `k_abs` — the SAME mechanism
@@ -4644,10 +4594,8 @@ const GELU_ERF_BF16_FWD_ABS_ULPS: f32 = 8.0;
 /// `Phi(x)+x*phi(x)` decays in the tails exactly like `Phi(x)` alone does,
 /// so this leg's `dx` can ALSO land on a genuinely-tiny gradient at a
 /// large `|x|`, where the two CDF/PDF routines' own tail rounding does
-/// not cancel identically. Pod-confirmed (audit round,
-/// `fix/463-audit-kernels`) to fix the leg (previously a hard failure at
-/// [`measured_near_zero_floor`]'s max-keyed floor — guide §3.8) with real
-/// headroom; see [`F32_GELU_ERF_NORMCDF_ULPS`]'s doc for the general
+/// not cancel identically. GPU-confirmed with real headroom (the leg fails
+/// at [`measured_near_zero_floor`]'s max-keyed floor — guide §3.8); see [`F32_GELU_ERF_NORMCDF_ULPS`]'s doc for the general
 /// re-derivation protocol (`"gelu_erf bf16 dx vs f32 truth"`'s printed
 /// `worst Δ/bound` is this constant's own readout).
 const GELU_ERF_BF16_DX_ABS_ULPS: f32 = 8.0;
@@ -4733,7 +4681,7 @@ fn assert_gelu_erf_parity_f32(cuda: &Device, n: usize, xv: &[f32]) {
     let dx_bound = |r: f32| f32_two_term_bound(r, dx_floor, 4.0, F32_GELU_ERF_NORMCDF_ULPS);
     assert_relative_bound("gelu_erf f32 dx", &dx_cpu, &dx_gpu, dx_bound);
 
-    // F64 TRUTH (family F): leg 2 above only proves `dx_cpu` (this crate's
+    // F64 TRUTH: leg 2 above only proves `dx_cpu` (this crate's
     // OWN `GeluErfFused::bwd`, walked through a real `.backward()` call)
     // agrees with `dx_gpu` (the SAME crate's OWN CUDA arm) — a systematic
     // error shared by both arms (e.g. the wrong closed-form derivative)
@@ -4864,7 +4812,7 @@ fn assert_gelu_erf_parity_bf16(cuda: &Device, n: usize, xv: &[f32]) {
         .unwrap();
     assert_eq!(dx_gpu_v.len(), n, "gelu_erf bf16 GPU dx length mismatch");
     // Same TWO-TERM shape as the forward leg above, for the identical
-    // reason (a pod run first surfaced this leg failing the SAME way): the
+    // reason (on a GPU this leg fails the SAME way without it): the
     // backward's own `Phi(x)+x*phi(x)` term decays in the tails exactly
     // like the forward's `Phi(x)` does, so a `measured_near_zero_floor`
     // (keyed to whatever else this run's `dx_truth` array contains) can
@@ -4888,7 +4836,7 @@ fn assert_gelu_erf_parity_bf16(cuda: &Device, n: usize, xv: &[f32]) {
         dx_bound,
     );
 
-    // F64 TRUTH (family F), mirroring the F32 leg's own: `dx_truth` above
+    // F64 TRUTH, mirroring the F32 leg's own: `dx_truth` above
     // is STILL this crate's OWN `GeluErfFused::bwd` (run at F32 on the
     // bf16-rounded inputs), so leg 2's check only proves internal
     // self-consistency between the truth arm and the CUDA arm, never that
@@ -4966,7 +4914,7 @@ fn assert_gelu_erf_parity_f16(cuda: &Device, n: usize, xv: &[f32]) {
         assert_finite_f16(*h, "gelu_erf f16 fwd");
     }
     let out_gpu_v: Vec<f32> = out_gpu_bits.iter().map(|v| v.to_f32()).collect();
-    let out_floor = f16_ulp_size_at(measured_near_zero_floor_f16(&out_truth_v)); // no-producer: the digits the checker sees here are from the `f16` in `f16_ulp_size_at`, not a numeric literal -- the floor is that function's own live per-run output
+    let out_floor = f16_ulp_size_at(measured_near_zero_floor_f16(&out_truth_v));
     let out_bound = |r: f32| f16_relative_bound(r, out_floor, GELU_ERF_16BIT_ULPS);
     assert_relative_bound(
         "gelu_erf f16 fwd vs f32 truth",
@@ -4993,7 +4941,7 @@ fn assert_gelu_erf_parity_f16(cuda: &Device, n: usize, xv: &[f32]) {
         .to_vec1()
         .unwrap();
     assert_eq!(dx_gpu_v.len(), n, "gelu_erf f16 GPU dx length mismatch");
-    let dx_floor = f16_ulp_size_at(measured_near_zero_floor_f16(&dx_truth)); // no-producer: the digits the checker sees here are from the `f16` in `f16_ulp_size_at`, not a numeric literal -- the floor is that function's own live per-run output
+    let dx_floor = f16_ulp_size_at(measured_near_zero_floor_f16(&dx_truth));
     let dx_bound = |r: f32| f16_relative_bound(r, dx_floor, GELU_ERF_16BIT_ULPS);
     assert_relative_bound(
         "gelu_erf f16 dx vs f32 truth",
@@ -5002,7 +4950,7 @@ fn assert_gelu_erf_parity_f16(cuda: &Device, n: usize, xv: &[f32]) {
         dx_bound,
     );
 
-    // F64 TRUTH (family F), mirroring the F32/BF16 legs' own: `dx_truth`
+    // F64 TRUTH, mirroring the F32/BF16 legs' own: `dx_truth`
     // above is STILL this crate's OWN `GeluErfFused::bwd` (run at F32 on
     // the f16-rounded inputs) — anchor it against the independent F64
     // closed form too, the KO-1 leg's own "the bound must still ADMIT the
@@ -5131,7 +5079,7 @@ fn gelu_erf_parity_empty_input_is_refused_on_both_devices() {
     let x_cpu = Tensor::from_slice(&[] as &[f32], (0,), &cpu).unwrap();
     let x_gpu = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
 
-    // Domain (family D/K2): empty is a TYPED REFUSAL for this op (unlike
+    // Domain: empty is a TYPED REFUSAL for this op (unlike
     // GeGLU's `last == 0` no-op), on BOTH devices — never an illegal
     // zero-block launch on CUDA, and never silently admitted on CPU.
     gelu_erf(&x_cpu).expect_err("CPU: empty input must be refused, not silently accepted");
@@ -5488,7 +5436,7 @@ fn scaled_cast_add_parity_multi_block_not_a_multiple_of_block_size() {
 // vectors run through `PhiloxKatProbe`'s CUDA arm (`dropout.cu`'s
 // `philox_kat` device function) and asserted bit-identical to the exact
 // same vectors `jammi_kernels::philox`'s own CPU tests assert. THIS is
-// the proof the C7 contract requires: the Rust CPU port and the CUDA
+// the proof that the Rust CPU port and the CUDA
 // device function compute the identical `u32` stream, not merely "both
 // happen to compile" — see `crate::philox`'s module doc (embedded via
 // `jammi_kernels::philox`, re-exercised here) and `ops::PhiloxKatProbe`'s
@@ -5863,54 +5811,47 @@ fn bf16_round_bound(value: f64) -> f64 {
 
 /// Arch-aware `abs_floor` for
 /// [`lora_linear_parity_bf16_base_backward_production_width`]'s `dx`
-/// bound (M3 four-arch pod round-2 finding 2; round-3 sweep REVISED the
-/// diagnosis below). This is jammi's OWN `lora_linear` CUDA kernel — a
+/// bound. This is jammi's OWN `lora_linear` CUDA kernel — a
 /// cuBLAS strided-batched GEMM, NOTHING to do with
 /// `flash-attn`/`GENCODE_ARCHES` admission — so this widening is entirely
 /// independent of `crate::admission::flash_validated_arches()`.
 ///
-/// ## REVISED DIAGNOSIS: deterministic per (arch, build), not flaky
+/// ## Deterministic per (arch, build), not flaky
 ///
-/// An earlier revision of this doc read the element movement across two
-/// single-shot observations (`dx[10523]` then `dx[32574]`) as run-to-run
-/// FLICKER and reached for the [`FLASH_ORACLE_K_MEAN_GRAD`]/`K_MAX`
-/// precedent (a max-shaped bound that does not transfer across draws).
-/// That framing is WRONG: a 40-repeat sweep (**N = 20 invocations, in TWO
-/// independent labeled blocks of 20**, per the earlier PENDING-ARTIFACT
-/// spec this revision closes out) found the SAME worst element and the
-/// SAME `diff`/`bound`/`required_floor` on ALL 40 repeats, on BOTH Ada
-/// SKUs, bit-for-bit. The computation is DETERMINISTIC for a given (arch,
-/// build) — the earlier two-observation "movement" tracked BUILD changes
-/// (this constant's own successive revisions altered the bound formula,
-/// which changes WHICH element ranks worst), not measurement noise. The
-/// repeat sweep's actual role, then, is a DETERMINISM CHECK, not a
-/// distribution characterization: confirming n=40-identical is what makes
-/// "one measured value per (arch, fixture, build)" a sound derivation
-/// input, rather than the mean/max of an unstable process.
+/// The worst element moves between builds (a bound-formula change changes
+/// WHICH element ranks worst), which can look like run-to-run flicker; it
+/// is not. A 40-repeat sweep (two independent blocks of 20 invocations)
+/// finds the SAME worst element and the SAME `diff`/`bound`/`required_floor`
+/// on ALL 40 repeats, on BOTH Ada SKUs, bit-for-bit. The sweep is a
+/// DETERMINISM CHECK, not a distribution characterization: n=40-identical
+/// is what makes "one measured value per (arch, fixture, build)" a sound
+/// derivation input, rather than the mean/max of an unstable process (so
+/// the [`FLASH_ORACLE_K_MEAN_GRAD`]/`K_MAX` max-over-draws shape does not
+/// apply).
 ///
 /// Sweep results (both blocks, both arches — identical within each arch):
 /// - **sm89 (L40S)**: worst element index `244121`, `diff = 1.2832888`,
 ///   `bound = 1.0417905` (at the prior `abs_floor = 1.0`),
-///   `ratio = 1.231811` (FAILED all 40 — `23.2%` over, no-producer: from
-///   the pod sweep this fn's own doc describes, whose cuda-runs artifact
-///   is PENDING, not yet committed to the tree), `required_floor
-///   = 1.2414983` (the TRUE minimal sufficient floor for this element,
-///   independent of whatever `abs_floor` was in effect — see the test
-///   body's own `max_required_floor` for the exact, direction-symmetric
-///   formula this fixed the earlier buggy diagnostic to).
-/// - **sm86 (A40)**: worst element index `196871`, `ratio = 0.224994` (no-producer: same pending pod sweep) at
-///   `abs_floor = 1.0` (PASSED all 40, comfortably) — well below even the
+///   `ratio = 1.231811` (FAILED all 40 — `23.2%` over; measured by
+///   `crates/jammi-kernels/artifacts/cuda-runs/2026-08-28-m3-arch-set-80a451a-l40s.json`),
+///   `required_floor = 1.2414983` (the TRUE minimal sufficient floor for
+///   this element, independent of whatever `abs_floor` is in effect — see
+///   the test body's own `max_required_floor` for the exact,
+///   direction-symmetric formula).
+/// - **sm86 (A40)**: worst element index `196871`, `ratio = 0.224994`
+///   (`no-producer`: no committed A40 sweep artifact) at `abs_floor = 1.0`
+///   (PASSED all 40, comfortably) — well below even the
 ///   ORIGINAL `0.3` A100 floor's own bound, i.e. A40 needs NO widening at
 ///   all.
 ///
 /// **sm86 and sm89 diverge WITHIN the same 99 KB smem tier** (A40
-/// comfortable, L40S `23%` over, no-producer: same pending pod sweep):
+/// comfortable, L40S `23%` over):
 /// "Ada-class" is not one behavior — these two SKUs run genuinely
 /// DIFFERENT cuBLAS accumulation kernels for the
 /// identical problem shape (consistent with arch-specific cuBLAS kernel
 /// selection, not a tier-wide property), so the floor is PER-ARCH, not
-/// "per Ada". The unconditional `required_floor` diagnostic this fix adds
-/// to the test body means a FUTURE fixture or bound-formula change that
+/// "per Ada". The unconditional `required_floor` diagnostic in the test
+/// body means a fixture or bound-formula change that
 /// moves the worst element again needs only ONE re-run per arch to
 /// re-derive the number, not a fresh multi-run sweep — that one-run
 /// re-derivation IS the real protection this diagnostic buys, not the
@@ -5933,40 +5874,30 @@ fn bf16_round_bound(value: f64) -> f64 {
 /// ```
 /// sm86 (A40) keeps the TIGHT, unwidened floor: the sweep proved it does
 /// not need widening (`required_floor` well under the base bound), and
-/// per family D ("never loosen a bound you don't have to") there is no
+/// since a bound is never loosened without evidence, there is no
 /// reason to trade away A40's own discriminating power for one-rule
 /// simplicity with sm89 — the evidence says they are genuinely different
-/// arches, so the code now treats them as genuinely different arches.
-/// `(8, 0)`/A100 and `(9, 0)`/H100 (confirmed fully green, zero flakiness,
-/// across the full four-arch pod run) also keep the original floor.
-///
-/// **PENDING-ARTIFACT** (narrowed by this revision — the DERIVATION above
-/// is done, not pending; only the COMMITTED evidence artifact is): the
-/// lead reruns this exact test on both Ada pods to confirm green against
-/// the constants below, then produces the per-arch `cuda-runs` artifacts
-/// citing these sweep values as the derivation evidence — cite that
-/// artifact path here once it lands.
+/// arches, so the code treats them as genuinely different arches.
+/// `(8, 0)`/A100 and `(9, 0)`/H100 (fully green, zero flakiness, across a
+/// four-arch GPU run) also keep the tight floor.
 fn lora_linear_dx_abs_floor(cuda: &Device) -> f64 {
     use jammi_kernels::admission::{probe_cuda_compute_capability, ComputeCapability};
-    // sm80/sm86/sm90-proven tight floor: A100 and H100 have always used
-    // it (zero flakiness across the full four-arch pod run); the round-3
-    // sweep additionally proved A40 (sm86) needs no widening at all
-    // (measured ratio 0.225 against the base bound, no-producer: from the
-    // pod sweep this fn's own doc describes, whose cuda-runs artifact is
-    // PENDING, not yet committed to the tree) -- see this function's own
-    // doc.
-    const TIGHT_FLOOR: f64 = 3e-1; // no-producer: sm80/sm86/sm90's pre-sweep tight floor, unchanged by the pending artifact
+    // sm80/sm86/sm90-proven tight floor: A100 and H100 pass with it (zero
+    // flakiness across a four-arch GPU run), and A40 (sm86) needs no
+    // widening (measured ratio 0.225 against the base bound) -- see this
+    // function's own doc.
+    const TIGHT_FLOOR: f64 = 3e-1; // no-producer: the A100/H100-proven tight floor
                                    // sm89 (L40S)-derived: 1.2414983 (measured, 40/40-deterministic
                                    // required_floor) * 1.5 (margin) = 1.86224745, rounded up to 2.0 --
                                    // see this function's own doc for the full arithmetic.
-    const SM89_FLOOR: f64 = 2.0; // no-producer: derived by the arithmetic in this fn's own doc from a pod sweep whose cuda-runs artifact is PENDING
+    const SM89_FLOOR: f64 = 2.0; // no-producer: derived by the arithmetic in this fn's own doc
     match probe_cuda_compute_capability(cuda) {
         Some(cap) if cap == ComputeCapability::new(8, 9) => SM89_FLOOR,
         // Every OTHER probed capability (sm80, sm86, sm90, or an
         // unrecognised future arch) keeps the tight floor deliberately:
         // an untested arch should fail LOUD against the narrow bound
         // (prompting investigation) rather than silently pass under an
-        // over-widened one it was never shown to need (family D: default
+        // over-widened one it was never shown to need (default
         // to the side that cannot silently accept a wrong number).
         _ => TIGHT_FLOOR,
     }
@@ -6465,7 +6396,7 @@ fn lora_linear_parity_f32_dropout_matches_across_devices() {
 ///
 /// This fixture's `base` and `scale * delta` happen to nearly CANCEL
 /// (`base[191] ~= -45163`, `delta_scaled[191] ~= +47549`, `out[191] ~=
-/// 2385`) — family K: a bound proportional to `out`'s own (cancelled, much
+/// 2385`): a bound proportional to `out`'s own (cancelled, much
 /// smaller) magnitude is the WRONG shape of bound for a computation this
 /// close to catastrophic cancellation; `base`'s ~128 absolute error, which
 /// is tiny relative to `base`'s own ~45000 magnitude, becomes a spurious
@@ -6574,7 +6505,7 @@ fn lora_linear_parity_bf16_base_production_width() {
 /// autograd walking the EAGER composition this op replaces (`base = x @
 /// w^T`, `delta = scale * (x @ A^T) @ B^T`, `out = base + delta`, plain
 /// `matmul`/`affine`/`add` nodes), an INDEPENDENT code path from this
-/// op's own hand-derived `CustomOp3::bwd` (family F). `w` stays a frozen
+/// op's own hand-derived `CustomOp3::bwd`. `w` stays a frozen
 /// (non-`Var`) leaf and `dweight_needed: false` on the CUDA side — the
 /// same LoRA use case every other test in this file assumes — so only
 /// `dx`/`da`/`db` are compared; `dw` is out of scope.
@@ -6655,9 +6586,8 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
     // `d_x_lora_cpu` (this test's own closed-form re-derivation of what
     // the bound below sizes itself to) would silently omit `dy`'s own
     // bf16 quantization error propagated through a `outf`-wide (`3072`)
-    // reduction — a real pod run measured exactly this gap (a `4.16x`
-    // bound overshoot at one index, `dx_base ~= 4.5`, `d_x_lora ~=
-    // -1.4`) before this fix. Rounding once and reusing the SAME
+    // reduction — measured on a GPU as a `4.16x` bound overshoot at one
+    // index (`dx_base ~= 4.5`, `d_x_lora ~= -1.4`). Rounding once and reusing the SAME
     // round-tripped values for both `dy_cpu` (cast back to `f32`, exact)
     // and `dy_gpu` (native `bf16`, exact) makes them the identical real
     // number in two dtypes, eliminating that gap at its source rather
@@ -6810,44 +6740,37 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
     assert_eq!(db_gpu.len(), outf * r, "GPU db length mismatch");
 
     // A small floor covers the `f32`-only summation-order noise both
-    // branches carry regardless of dtype; re-measured at `0.3` (not the
-    // sibling forward test's `0.1`) after this test's own cotangent
-    // moved from `sum_all().backward()`'s all-ones seed to a sign-mixed
-    // one (this file's discriminating-backward toolkit): `dx_base` and
-    // `d_x_lora` can now land much closer to canceling at a given index
-    // than the uniform ones seed produced, and the observed divergence
-    // there exceeded the `0.1` floor's total bound by a small margin.
-    // A100/H100-proven at `0.3`; ARCH-AWARE beyond that (M3 four-arch pod
-    // round-2 finding 2 — see [`lora_linear_dx_abs_floor`]'s own doc for
-    // the full derivation, the PENDING-artifact marker, and why Ada-class
-    // hardware (sm86/sm89) needs a wider floor here).
+    // branches carry regardless of dtype; `0.3` (not the sibling forward
+    // test's `0.1`) because this test's cotangent is sign-mixed (this
+    // file's discriminating-backward toolkit): `dx_base` and `d_x_lora` can
+    // land much closer to canceling at a given index than an all-ones seed
+    // produces, and the observed divergence there exceeds the `0.1`
+    // floor's total bound by a small margin. A100/H100-proven at `0.3`;
+    // ARCH-AWARE beyond that — see [`lora_linear_dx_abs_floor`]'s own doc
+    // for the full derivation and why sm89 needs a wider floor here.
     let abs_floor = lora_linear_dx_abs_floor(&cuda);
 
-    // A second, SCALED re-measurement: two real pod runs after the
-    // sign-mixed cotangent found the per-term `bf16_round_bound`s
-    // themselves (not just the flat floor above) too tight at production
-    // width — a non-canceling index (`dx_base ~= 72.8`, `d_x_lora ~=
-    // 22.6`, summing plainly to `dx ~= 95.4`, cuda `93`) diverged by
-    // `2.41`, `1.34x` the `2.0 * BF16_U` bound's total. `bf16_round_bound`
+    // The per-term `bf16_round_bound`s themselves (not just the flat
+    // floor above) are too tight at production width under the sign-mixed
+    // cotangent, measured on two GPU runs — a non-canceling index
+    // (`dx_base ~= 72.8`, `d_x_lora ~= 22.6`, summing plainly to
+    // `dx ~= 95.4`, cuda `93`) diverged by `2.41`, `1.34x` the `2.0 * BF16_U` bound's total. `bf16_round_bound`
     // is a SHARED helper other (currently-passing) legs in this section
     // also call at their own already-adequate margin, so this test scales
     // its OWN three per-term contributions by an extra `2.0x` locally
     // (comfortable headroom over the measured `1.34x` gap) rather than
     // loosening every caller of the shared helper.
     let dx_bound_margin = 2.0f64;
-    // Round-3 pod refinement (finding 2's own follow-up, TWICE refined —
-    // see [`lora_linear_dx_abs_floor`]'s own doc for the full history):
-    // track the WORST element (max `diff / bound` ratio, under the
+    // Track the WORST element (max `diff / bound` ratio, under the
     // CURRENT `abs_floor`) across the FULL tensor instead of panicking at
     // the first violation, so the pass/fail decision is always the true
     // tensor-wide worst case, not whichever index happens to be scanned
-    // first. SEPARATELY (round-3's own fix — the first cut of this
-    // diagnostic printed a NEGATIVE, meaningless number on a passing run,
-    // because it read the required-floor back out of the RATIO-maximizing
-    // index, which need not be the index that actually needs the largest
-    // floor): track `max_required_floor` as its OWN, independent
-    // maximum — `diff_i - architecture_invariant_i` for EVERY element,
-    // where `architecture_invariant_i` is `dx_bound_margin *
+    // first. SEPARATELY, track `max_required_floor` as its OWN,
+    // independent maximum (reading the required floor back out of the
+    // RATIO-maximizing index is wrong — that index need not be the one that
+    // needs the largest floor, and can yield a NEGATIVE, meaningless number
+    // on a passing run) — `diff_i - architecture_invariant_i` for EVERY
+    // element, where `architecture_invariant_i` is `dx_bound_margin *
     // sum(bf16_round_bound(..))` WITHOUT `abs_floor` folded in. This is
     // the TRUE minimal `abs_floor` that would make every element pass,
     // by construction: element `i` passes iff `diff_i <= invariant_i +
@@ -6860,7 +6783,7 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
     let mut worst_idx = 0usize;
     let mut worst_diff = 0.0f64;
     let mut worst_bound = 0.0f64;
-    let mut max_required_floor = f64::NEG_INFINITY; // no-producer: not a literal -- the "64" here is from `f64::NEG_INFINITY`, the loop below computes the real value live every run
+    let mut max_required_floor = f64::NEG_INFINITY;
     let mut max_required_floor_idx = 0usize;
     for (i, (c, g)) in dx_cpu.iter().zip(dx_gpu.iter()).enumerate() {
         let invariant = dx_bound_margin
@@ -6904,19 +6827,18 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
         d_x_lora_cpu[worst_idx]
     );
 
-    // RULE-2 DISCRIMINATION PROOF (was vacuous before this fix): the
-    // predecessor of this pair of bounds reused `lora_linear_parity_tolerance`
-    // with the RAW fixture slices, giving `tol == 337.5` against `da`'s own
-    // measured max magnitude of `41.7` — a `bound / max|signal|` ratio of
-    // `8.1`, so `da_gpu == 0.0` (a mutation that drops the entire `da`
-    // gradient) would have PASSED (`|41.7 - 0.0| == 41.7 < 337.5`). The
+    // RULE-2 DISCRIMINATION PROOF: `lora_linear_parity_tolerance` with the
+    // RAW fixture slices gives `tol == 337.5` against `da`'s own measured
+    // max magnitude of `41.7` — a `bound / max|signal|` ratio of `8.1`, so
+    // `da_gpu == 0.0` (a mutation that drops the entire `da` gradient)
+    // would PASS (`|41.7 - 0.0| == 41.7 < 337.5`). The
     // asymmetric bound below is keyed to the ACTUAL operand magnitudes
     // feeding `da`'s/`db`'s own dominant reduction (see
     // `lora_linear_parity_tolerance_asymmetric`'s doc) — measured here at
     // `da_tol ~= 6.3` against `da`'s own max `~41.7` (ratio `~0.15`) and
     // `db_tol ~= 601.3` against `db`'s own max `~3962.0` (ratio `~0.15`),
     // both `< 1`: a zeroed or otherwise wrong-order-of-magnitude gradient on
-    // EITHER slot is now caught, not just a fine-grained rounding bug.
+    // EITHER slot is caught, not just a fine-grained rounding bug.
     let da_tol = lora_linear_parity_tolerance_asymmetric(
         rows,
         max_abs(&d_after_a_cpu),
@@ -6938,9 +6860,9 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
     }
 }
 
-/// Cast-boundary lever Wave 1 (e)/(f) — `ops::cast_scale`'s
-/// `CastScaleBf16F32`/`CastAddBf16`, folded directly into
-/// `LowRankResidualLinear::bwd`'s B1/B3 sites (see that op's module doc).
+/// Cast-boundary lever — `ops::cast_scale`'s `CastScaleBf16F32`/
+/// `CastAddBf16`, folded directly into `LowRankResidualLinear::bwd`'s
+/// epilogue and residual-add sites (see that op's module doc).
 /// Zero dispatch is RED, never green (guide §3.5): this asserts the
 /// `DispatchCounters` for BOTH new op keys actually incremented `fused`
 /// (and recorded no `eager`) across a real CUDA `bf16`-base backward at
@@ -7014,16 +6936,14 @@ fn lora_linear_bf16_base_backward_dispatches_the_fused_cast_boundary_kernels_on_
 }
 
 // ---------------------------------------------------------------------
-// Cast-boundary lever Wave 1 — DEVICE-SIDE oracles (phase-4 audit Block
-// 2). Before this, the CUDA arms of `CastScaleBf16F32`/`CastAddBf16`
-// (`src/cuda/cast_scale.rs:31,:57`) were exercised on device only by the
-// dispatch-counter delta test above, which proves the fused kernel RAN
-// but asserts nothing about the VALUE it produced — every genuinely
-// value-level oracle lived only in `ops/cast_scale.rs`'s CPU-only `#[cfg(
-// test)]` module. The five tests below close that gap directly against a
-// real CUDA device.
+// Cast-boundary lever — DEVICE-SIDE value oracles for the CUDA arms of
+// `CastScaleBf16F32`/`CastAddBf16` (`src/cuda/cast_scale.rs`). The
+// dispatch-counter delta test above proves the fused kernel RAN but
+// asserts nothing about the VALUE it produced, and `ops/cast_scale.rs`'s
+// value-level oracles are CPU-only; the five tests below check values
+// against a real CUDA device.
 
-/// A fixed, deterministic bf16 fixture (family J) carrying the boundary
+/// A fixed, deterministic bf16 fixture carrying the boundary
 /// values the oracles below need alongside bulk sine-wave content: exact
 /// zero, negative zero (at two different indices, to catch an
 /// index-dependent bug), the smallest positive/negative subnormals,
@@ -7049,11 +6969,11 @@ fn cast_boundary_fixture_bf16(n: usize) -> Vec<bf16> {
     v
 }
 
-/// Block 2, leg (e) — `CastScaleBf16F32` vs candle's own two-kernel chain
+/// `CastScaleBf16F32` vs candle's own two-kernel chain
 /// (`x.to_dtype(F32)` then `.affine(scale, 0.0)`), asserted with a REAL
 /// device-side value oracle, 0 mismatches required. Production width
-/// (guide §3.4): `m=12288, outf=3072`, B1's own census shape
-/// (`ops::cast_scale`'s module doc). Sweeps every scale this op's real
+/// (guide §3.4): `m=12288, outf=3072`, the epilogue site's production
+/// shape (ModernBERT-large's `Wqkv` at b8-s512). Sweeps every scale this op's real
 /// caller passes (`alpha/rank`-shaped, non-power-of-two) plus an extreme
 /// `1e-30` to catch a naive-multiply underflow difference, and asserts
 /// `fused[-0.0]`'s bits are EXACTLY `0x00000000` for a positive scale —
@@ -7062,7 +6982,7 @@ fn cast_boundary_fixture_bf16(n: usize) -> Vec<bf16> {
 #[test]
 fn cast_scale_bit_identical_to_the_eager_two_kernel_chain_on_cuda_across_scales() {
     let cuda = jammi_test_resources::cuda_device(0);
-    let n = 12_288usize * 256; // B1's own census m·outf population.
+    let n = 12_288usize * 256; // The epilogue site's production m·outf population.
     let xv = cast_boundary_fixture_bf16(n);
     let x = Tensor::from_slice(&xv, (n,), &cuda).unwrap();
     for &scale in &[0.11048f64, 0.03125, 2.0, 1e-30, 3.0] {
@@ -7115,17 +7035,17 @@ fn cast_scale_bit_identical_to_the_eager_two_kernel_chain_on_cuda_across_scales(
     }
 }
 
-/// Block 2, leg (f) — `CastAddBf16` vs candle's own two-kernel chain
+/// `CastAddBf16` vs candle's own two-kernel chain
 /// (`f32val.to_dtype(BF16)` then a real `Tensor::add`), with the
 /// accumulate-then-round RED control measured LIVE against this fixture
-/// (guide §3.7/§3.8, family F: a claimed guarantee is computed live and
+/// (guide §3.7/§3.8: a claimed guarantee is computed live and
 /// asserted, not merely printed) — diverges on ~16.5k of this production-
 /// width fixture's 1.57M elements. Production width: `m=12288, inf=1024`,
-/// B3's own census shape.
+/// the residual-add site's production shape.
 #[test]
 fn cast_add_bit_identical_to_the_eager_two_kernel_chain_on_cuda_with_red_control() {
     let cuda = jammi_test_resources::cuda_device(0);
-    let n = 12_288usize * 128; // B3's own census m·inf population.
+    let n = 12_288usize * 128; // The residual-add site's production m·inf population.
     let mut base_v: Vec<bf16> = (0..n)
         .map(|i| bf16::from_f32(((i as f32) * 0.0131).cos() * 4.0))
         .collect();
@@ -7196,7 +7116,7 @@ fn cast_add_bit_identical_to_the_eager_two_kernel_chain_on_cuda_with_red_control
     );
 }
 
-/// Block 2 — a NARROWED (contiguous, nonzero `start_offset`) view is read
+/// A NARROWED (contiguous, nonzero `start_offset`) view is read
 /// correctly by both ops' CUDA arms (the `Layout::contiguous_offsets()`
 /// slice, not a hardcoded `0..n`), and a genuinely STRIDED (`.t()`) view
 /// is refused with the TYPED `Error::RequiresContiguous` — never silently
@@ -7285,7 +7205,7 @@ fn cast_ops_nonzero_start_offset_and_noncontiguous_view_refused_on_cuda() {
     );
 }
 
-/// Block 2 — the launch-config boundary sweep both ops need alongside the
+/// The launch-config boundary sweep both ops need alongside the
 /// bulk oracles above: `n=1024` exercises an EXACT multiple of the
 /// elementwise launch's block size, and `n=1023`/`1025`/`4097`/`65537`
 /// exercise a PARTIAL last block on either side of that boundary. `n=0`
@@ -7371,7 +7291,7 @@ fn cast_ops_n_sweep_partial_block_and_empty_on_cuda() {
     }
 }
 
-/// Block 2 — `LowRankResidualLinear::bwd`'s REAL output (`dx`, at
+/// `LowRankResidualLinear::bwd`'s REAL output (`dx`, at
 /// production width `rows=256, inf=1024, outf=3072, r=16`), fused vs the
 /// original two-kernel eager chain, bit-for-bit. `JAMMI_KERNELS_DISABLE`
 /// is read ONCE per process via a `OnceLock` (`admission.rs`'s own module
@@ -7395,8 +7315,8 @@ fn cast_ops_n_sweep_partial_block_and_empty_on_cuda() {
 ///
 /// The byte-identity claim itself is proven by running this test twice
 /// (env unset, then the `DISABLE` env set) and `cmp -s`-ing the two dump
-/// files — see this unit's own committed CUDA-runs artifact for the
-/// actual command and result.
+/// files — see `crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-cast-w1-80f02fb-a100-sxm4.json`
+/// for the command and result.
 #[test]
 fn lrrl_bwd_dx_fused_vs_disabled_cast_boundary_dump_and_dispatch_proof() {
     let cuda = jammi_test_resources::cuda_device(0);
@@ -7605,17 +7525,13 @@ fn assert_lora_linear_parity_f32_bit_exact(
 /// sum down to `bf16`. The expected reference is built with that SAME
 /// single rounding (`bf16::from_f32(exact_sum)`), and the epilogue's own
 /// ONE rounding point (`ScaledCastAdd`'s "widen base to `f32`, add the
-/// `f32`-scaled delta, round ONCE" — esc-046 fix, GH#374, matching PEFT's
-/// own `Linear.forward` order; see `ops::scaled_cast_add`'s module doc) is
-/// reproduced by hand with the exact same formula
-/// `scaled_cast_add_bf16_f32` uses. An earlier revision of this reference
-/// (pre-esc-046) rounded the delta to `bf16` FIRST, then added and rounded
-/// AGAIN — matching the kernel's OWN pre-fix rounding order, so this test
-/// stayed green while a real defect (esc-046, GH#374) shipped: the
-/// reference tracked the kernel's rounding PLACEMENT rather than PEFT's,
-/// so a regression in placement would have agreed with this reference
-/// instead of catching it. Updated in the same change that fixed the
-/// kernel, to the once-rounded formula both now share. This is BIT-EXACT (not a tolerance
+/// `f32`-scaled delta, round ONCE", matching PEFT's own `Linear.forward`
+/// order; see `ops::scaled_cast_add`'s module doc) is reproduced by hand
+/// with the exact same formula `scaled_cast_add_bf16_f32` uses. The
+/// reference must follow PEFT's rounding PLACEMENT, not the kernel's: a
+/// reference that tracks the kernel (e.g. rounding the delta to `bf16`
+/// FIRST, then adding and rounding AGAIN) agrees with a placement
+/// regression instead of catching it. This is BIT-EXACT (not a tolerance
 /// leg): a half-term drop, a wrong row, or a transposed operand would
 /// almost certainly miss this exact reference, unlike the loose
 /// term-magnitude bound `lora_linear_parity_bf16_base_production_width`
@@ -7637,7 +7553,7 @@ fn lora_linear_parity_bf16_exact_integer_fixture_is_bit_exact() {
     // The exact (f64, then losslessly narrowed to f32 — every partial sum
     // stays a small exact integer) base and delta pieces, computed
     // independently of candle's own GEMM so this reference shares no code
-    // path with the op under test (family F).
+    // path with the op under test.
     let mut base_bf16_expected = vec![bf16::from_f32(0.0); rows * outf];
     let mut delta_f32_exact = vec![0.0f32; rows * outf];
     for i in 0..rows {
@@ -7663,7 +7579,7 @@ fn lora_linear_parity_bf16_exact_integer_fixture_is_bit_exact() {
         .iter()
         .zip(delta_f32_exact.iter())
         .map(|(&base, &delta)| {
-            // Mirrors `scaled_cast_add_bf16_f32` exactly (esc-046 fix:
+            // Mirrors `scaled_cast_add_bf16_f32` exactly (PEFT's order:
             // widen base to f32, add the f32-scaled delta, round ONCE —
             // no intermediate bf16-rounded delta).
             bf16::from_f32(base.to_f32() + delta * scale)
@@ -7702,7 +7618,7 @@ fn lora_linear_parity_bf16_exact_integer_fixture_is_bit_exact() {
 }
 
 // =======================================================================
-// #428 P2b: the bias-carrying pack. CPU<->CUDA parity, forward + all three
+// The bias-carrying pack. CPU<->CUDA parity, forward + all three
 // backward outputs (dx, dw/da/db — `dw` only where `dweight_needed` is
 // exercised elsewhere in this file; the bias-carrying legs below keep the
 // SAME `w`-frozen convention as `lora_linear_parity_bf16_base_backward_
@@ -7720,13 +7636,7 @@ fn lora_linear_parity_bf16_exact_integer_fixture_is_bit_exact() {
 // three-rounding-point (base-store, bias-add, epilogue) enumeration these
 // tests reproduce.
 //
-// **PENDING-ARTIFACT**: authored on a CPU-only development host (no
-// `nvcc`) — compiles and type-checks under `cargo check --features cuda`
-// (this file's usual standard), but has never actually RUN against a CUDA
-// device. The lead's pod session must run this block on an A100 (or
-// wider, per this file's existing per-arch floor idioms) before it is
-// trusted as a real proof; a `cuda_device() == None` skip on this host is
-// expected, not a green signal.
+// No committed `cuda-runs` artifact records this block's results yet.
 // =======================================================================
 
 /// `pack_ab`'s bias-carrying sibling — see
@@ -7740,9 +7650,9 @@ fn lora_linear_parity_bf16_exact_integer_fixture_is_bit_exact() {
 /// building its own pack): `Tensor::to_vec1::<f32>()` does NOT implicitly
 /// cast — it is a typed refusal on a dtype mismatch — so reading a
 /// half-dtype `bias` straight into `to_vec1::<f32>()` without this cast
-/// first panicked every `BF16`/`F16` bias leg at construction, before the
-/// op under test ever ran (round-2 fix; a measured RED on an A100 pod,
-/// not a theoretical concern).
+/// first panics every `BF16`/`F16` bias leg at construction, before the
+/// op under test ever runs (measured on an A100, not a theoretical
+/// concern).
 fn pack_ab_with_bias(
     a: &Tensor,
     b: &Tensor,
@@ -7900,7 +7810,7 @@ fn lora_linear_parity_bf16_bias_exact_integer_fixture_is_bit_exact() {
     let bias_bf16: Vec<bf16> = bias_v.iter().map(|&v| bf16::from_f32(v)).collect();
 
     // The exact (i64-accumulated, then losslessly narrowed to f32)
-    // reference, computed independently of candle's own GEMM (family F).
+    // reference, computed independently of candle's own GEMM.
     let mut base_bf16_expected = vec![bf16::from_f32(0.0); rows * outf];
     let mut delta_f32_exact = vec![0.0f32; rows * outf];
     for i in 0..rows {
@@ -7933,7 +7843,7 @@ fn lora_linear_parity_bf16_bias_exact_integer_fixture_is_bit_exact() {
         .zip(delta_f32_exact.iter())
         .map(|(&base_plus_bias, &delta)| {
             // Rounding 3 (the epilogue): widen to f32, add the f32-scaled
-            // delta, round ONCE — esc-046's own order.
+            // delta, round ONCE — PEFT's order.
             bf16::from_f32(base_plus_bias.to_f32() + delta * scale)
         })
         .collect();
@@ -7963,9 +7873,8 @@ fn lora_linear_parity_bf16_bias_exact_integer_fixture_is_bit_exact() {
     );
 }
 
-/// The `F16` counterpart to the two exact-integer bias legs above
-/// (campaign #443 D1 widened this op's dtype domain to `F16` end to end;
-/// the bias pack rides the SAME three rounding points, just at `F16`'s
+/// The `F16` counterpart to the two exact-integer bias legs above (this
+/// op's dtype domain includes `F16` end to end; the bias pack rides the SAME three rounding points, just at `F16`'s
 /// narrower — but still exact-integer-capable up to `2^11 = 2048` —
 /// mantissa).
 #[test]
@@ -8161,11 +8070,10 @@ fn lora_linear_parity_bf16_bias_base_production_width() {
 /// `[r, inf]` / `[outf, r]` storage. cuBLAS picks a different
 /// kernel/tiling (and therefore a different f32 accumulation order) for
 /// those two operand forms even on one identical device, so a REALISTIC
-/// (non-integer) fixture's rounding can and did diverge between the two
-/// arms here — the A100 landing run for this leg and its `F16` twin
-/// failed their `assert_eq!` deep in the output on exactly that fixture
-/// (esc-044's "correct but different order" lesson, applied to a same-
-/// device pair rather than a cross-device one). Switching to
+/// (non-integer) fixture's rounding diverges between the two arms here —
+/// on an A100 this leg and its `F16` twin fail their `assert_eq!` deep in
+/// the output on exactly that fixture (two correct kernels, different
+/// order, applied to a same-device pair rather than a cross-device one).
 /// `exact_fixture` closes the gap by construction: every partial sum on
 /// BOTH operand forms is a small exact integer, and an exact-integer sum
 /// is identical regardless of which valid summation order either GEMM
@@ -8220,7 +8128,7 @@ fn lora_linear_bias_bf16_fused_matches_eager_composition_bit_exact_on_cuda() {
     // sub-linears run on `x` cast to `F32` (`forward_composed`'s
     // `x_lora`/`ScaledCastAdd`'s own module doc: "today, always F32 in
     // this workspace"). Mixing `x` (bf16) directly into a matmul with
-    // `a`/`b` (F32) — as an earlier revision of this test did — is not
+    // `a`/`b` (F32) is not
     // what `forward_composed` computes and panics on a candle dtype
     // mismatch; casting to F32 first (`x32`) is required and is what step
     // 2 of `ops::low_rank_residual_linear`'s "Every rounding point,
@@ -8307,8 +8215,7 @@ fn lora_linear_bias_bf16_fused_matches_eager_composition_bit_exact_on_cuda() {
 /// `.matmul(&a.t())` / `.matmul(&b.t())` (a T-form transposed view), and
 /// cuBLAS's differing kernel/tiling choice for those two operand forms —
 /// even on one identical device — makes a realistic fixture's rounding
-/// arm-dependent (this leg's own A100 landing-run failure was the second
-/// confirmation of that gap, alongside its `bf16` twin). An exact-integer
+/// arm-dependent (measured on an A100 for this leg and its `bf16` twin). An exact-integer
 /// fixture makes every partial sum on both operand forms a small exact
 /// integer, so the shared f32 value both arms round to `f16` once is
 /// bit-identical regardless of operand form — `tol == 0` by construction.
@@ -8412,11 +8319,7 @@ fn lora_linear_bias_f16_fused_matches_eager_composition_bit_exact_on_cuda() {
 }
 
 // -----------------------------------------------------------------------
-// AttentionBlockFused — CPU<->CUDA parity, forward AND backward. Compiles
-// and type-checks under `cargo check --features cuda` (no `nvcc` in this
-// development environment — see `cuda_device`'s module doc for the
-// `JAMMI_REQUIRE_CUDA` skip-vs-fail distinction this file's every leg
-// honours).
+// AttentionBlockFused — CPU<->CUDA parity, forward AND backward.
 //
 // CPU domain is F32-only for this op (candle-core 0.11's CPU backend has
 // no `BF16` `MatMul` — see that op's own module doc); `BF16` is therefore
@@ -8513,8 +8416,8 @@ fn combined_attention_mask(
 //   `k` rounding points on its chain (counted per leg below).
 // * `k · ulp(max_j |x_j|)`: an upstream flip lands in `x_i` through a
 //   dot product as ONE product term, bounded by one ULP of the largest
-//   element of that output (the floor the audit asked for — never `1.0`,
-//   which was ~60x the gradient signal).
+//   element of that output (never `1.0`, which is ~60x the gradient
+//   signal).
 // * softmax-flip term (forward `out` only): a flipped SCORE `s_j`
 //   perturbs its row's softmax by `Δp_j = p_j (1 - p_j) Δs_j`, at most
 //   `ulp(S_max) / 4`, which reaches `out_i` as `Δp_j (v_j - out_i)` —
@@ -8535,7 +8438,7 @@ fn combined_attention_mask(
 //   transpose mode — proven byte-identical at f32 on A100 for exactly
 //   these shapes by the f32 `assert_eq!` legs, and at bf16 by the diag
 //   leg), under which the expected `max|Δ|` is exactly 0; the printed
-//   `max|Δ| / max|signal|` per leg is what the pod artifact records.
+//   `max|Δ| / max|signal|` per leg is what a GPU run artifact records.
 //
 // Discrimination (per assertion, verified on the CPU arm of the same
 // op): dropping the scale from `dq` (`let dqr = dqs.clone()` in `bwd`)
@@ -8670,10 +8573,10 @@ impl Bf16LegBounds {
 }
 
 /// Asserts `|a_i - b_i| <= bound(i)` elementwise and PRINTS the leg's
-/// `max|Δ|`, `max|signal|`, the largest bound, and the two ratios the pod
-/// artifact records (`max|Δ| / max|signal|`, `max|Δ| / bound`) — run the
-/// pod's `cuda_parity` with `--show-output` (or `--nocapture`) to land
-/// them in the captured log.
+/// `max|Δ|`, `max|signal|`, the largest bound, and the two ratios a GPU run
+/// artifact records (`max|Δ| / max|signal|`, `max|Δ| / bound`) — run
+/// `cuda_parity` with `--show-output` (or `--nocapture`) to land them in
+/// the captured log.
 fn assert_within_and_report(
     label: &str,
     a: &[f32],
@@ -8779,7 +8682,7 @@ fn assert_attention_block_parity_f32(
     // shape this file exercises, so it drives the Higham-shaped
     // reduction-depth allowance (same rationale as `assert_ln_parity_f32`'s
     // `dx` bound). `k_abs = F32_CANCELLATION_ULPS` covers this reduction's
-    // own near-zero cancellation case (item 1's two-term bound).
+    // own near-zero cancellation case (the two-term bound).
     let out_floor = max_abs(qkv_v);
     let out_bound =
         |r: f32| f32_two_term_bound(r, out_floor, 2.0 * seq as f32, F32_CANCELLATION_ULPS);
@@ -8928,10 +8831,9 @@ fn attention_block_parity_f32_fully_masked_row_is_zero_on_both_devices() {
 /// and the softmax kernel apply on the device), so the only differences
 /// left are f32 accumulation-ORDER flips, bounded per element by the
 /// derived `Bf16LegBounds::fwd` (section comment above; `k = 4` here:
-/// RoPE output, scores, `P`, `PV`, plus the softmax-flip term). An
-/// earlier revision compared against a plain f32 reference under
-/// `4 * 2^-7 * max(|c|, |g|, 1.0)` — an absolute `0.031` floor with no
-/// derivation behind it.
+/// RoPE output, scores, `P`, `PV`, plus the softmax-flip term), never an
+/// underived absolute floor such as `4 * 2^-7 * max(|c|, |g|, 1.0)`
+/// (`0.031`).
 ///
 /// The `qkv` fixture is scaled to `0.1x` the amplitude every OTHER fixture
 /// in this file uses (`fixture()` is bounded `[-10, 10]`). At the full
@@ -9137,7 +9039,7 @@ fn attention_block_bf16_emulated_cpu_reference(
 /// has no domain here, unlike the SAME-form legs in
 /// `attention_block_bwd_parity_*_cuda`, which drop this operand's
 /// `.contiguous()` specifically so they compare identical cuBLAS calls).
-/// Pinned to A100 / CUDA 12.6 (this pod's toolchain): a different cuBLAS
+/// Pinned to A100 / CUDA 12.6: a different cuBLAS
 /// version could legitimately pick different blocking and shift the
 /// measured `max|Δ|` within the same bound, or even land at 0 — the bound
 /// is derived from `Bf16LegBounds`'s own error model (same op, same
@@ -9410,8 +9312,8 @@ fn splitmix64_next(state: &mut u64) -> u64 {
 /// a SplitMix64 uniform source — deterministic and reproducible (SAME
 /// `seed` always produces the SAME `Vec`), unlike `qkv_fixture`'s smooth
 /// bounded sinusoid: this is the SECOND, statistically distinct fixture
-/// family the FA2 dense arm's upstream acceptance form (below) sweeps,
-/// per the lead's course-correction — a smooth deterministic fixture
+/// family the FA2 dense arm's upstream acceptance form (below) sweeps —
+/// a smooth deterministic fixture
 /// alone cannot rule out a defect that only a genuinely random operand
 /// distribution exercises. `#[cfg(feature = "flash-attn")]` for the same
 /// reason as [`splitmix64_next`].
@@ -9442,8 +9344,8 @@ fn gaussian_fixture(n: usize, seed: u64, std: f32) -> Vec<f32> {
 /// AFTER the graph runs in `dtype` (any divergence already happened in
 /// `dtype` and survives the upcast exactly).
 ///
-/// NOT independent of `bwd`'s OWN operand-form choice for the round-4
-/// GEMM-operand-FORM defect (P3 fix round 4, deliverable 2/3): this
+/// NOT independent of `bwd`'s OWN operand-form choice for the
+/// GEMM-operand-FORM defect class: this
 /// reference's own `scores`/`ctx` matmuls deliberately keep `fwd`'s
 /// transposed-VIEW operand form (see the doc below on `k_rot`'s
 /// transpose), NOT production's `crate::contiguous_matmul` materialized
@@ -9584,7 +9486,7 @@ fn attention_block_bwd_eager_reference(
 /// computes on the eager fallback path when the fused whole-attention-
 /// block op declines but softmax fusion still fires. The FA2 dense arm's
 /// own upstream acceptance form below (`measure_flash_upstream_form`)
-/// measures against THIS reference, per the lead's course-correction: the
+/// measures against THIS reference: the
 /// OTHER reference pre-multiplies `q` by `scale` before an un-contiguous
 /// matmul and hands the softmax kernel NO scale (an implicit `1.0`,
 /// silently vacuous for a scale-sensitivity claim) — neither this crate's
@@ -9830,9 +9732,8 @@ fn assert_attention_block_bwd_parity_cuda(
             // (+ the softmax-flip term), `4` for the V slot, `7` for the
             // Q/K slots of `dqkv`. Same device, same kernels on both
             // sides, so the expected `max|Δ|` is 0 — the printed ratio is
-            // the record. An earlier revision used
-            // `8 * 2^-7 * max(|c|, |g|, 1.0)`: an absolute `0.0625` floor,
-            // ~60x the O(1e-3) gradient signal.
+            // the record. Never `8 * 2^-7 * max(|c|, |g|, 1.0)`: an
+            // absolute `0.0625` floor, ~60x the O(1e-3) gradient signal.
             let s_max =
                 attention_scores_max_f32_cpu(&qkv_v, &rope_v, batch, seq, heads, head_dim, scale);
             let v_max = qkv_v
@@ -9934,11 +9835,8 @@ fn attention_block_bwd_parity_bf16_window_s512_cuda() {
 // dqkv_divergence_grows_with_depth_bf16_cuda` is that oracle; the legs
 // below (both dtypes, swept past the real checkpoint's own measured
 // max|qkv|) are op-level VALUE-correctness coverage, not a defect
-// oracle, and were not sufficient on their own to catch this round's
-// defect — see the module doc's own citation of both this fact and the
-// depth oracle that replaces the earlier single-checkpoint measurement
-// this comment used to quote (unreproducible from this repo — withdrawn,
-// see `three_way_vs_f32_reference`'s own doc).
+// oracle: they cannot see a GEMM-operand-form defect that only compounds
+// through depth (see `three_way_vs_f32_reference`'s own doc).
 #[test]
 fn attention_block_bwd_parity_f32_window_s512_b1_cuda() {
     let cuda = jammi_test_resources::cuda_device(0);
@@ -9951,28 +9849,27 @@ fn attention_block_bwd_parity_bf16_window_s512_b1_cuda() {
     assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 1, 512, 16, 64, Some(64), 22.0);
 }
 
-/// P3 fix round 4, deliverable 3's "mechanism pin": captures `bwd`'s OWN
+/// The operand-form "mechanism pin": captures `bwd`'s OWN
 /// `dqs`/`dkr` gradient-GEMM operand `Layout`s via
 /// [`bwd_gradient_gemm_layouts`] — never a fixture reconstructed
 /// independently of `bwd`'s code (the earlier
 /// `bwd_every_gemm_operand_is_admissible_at_boundary_and_production_ranks`
 /// test, `src/ops/attention_block.rs`, rebuilds these operands in the
 /// test body with its OWN hardcoded `.contiguous()` placement, so it
-/// stays green under a `bwd` regression — demoted, not counted, as this
-/// round's oracle) — and asserts two STRUCTURAL properties that flip
-/// specifically between `bwd`'s pre-round-4 form (`dqs = ds.matmul(&
-/// k_rot)`, `dkr = ds.transpose(...).matmul(&q_scaled)`) and this round's
-/// fix (`kt_contig` materialized, `matmul_grad_lhs`/`matmul_grad_rhs`):
+/// stays green under a `bwd` regression) — and asserts two STRUCTURAL
+/// properties that distinguish the view form (`dqs = ds.matmul(&k_rot)`,
+/// `dkr = ds.transpose(...).matmul(&q_scaled)`) from the production form
+/// (`kt_contig` materialized, `matmul_grad_lhs`/`matmul_grad_rhs`):
 /// (1) `dqs`'s second operand (`ds`'s matmul partner) has a NON-unit
 /// last-axis stride — true only when it is a transposed VIEW of a
-/// MATERIALIZED `[B,H,D,S]` buffer (`kt_contig.transpose(...)`, this
-/// round's fix); `k_rot` passed directly (pre-round-4) is `[B,H,S,D]`
+/// MATERIALIZED `[B,H,D,S]` buffer (`kt_contig.transpose(...)`, the
+/// production form); `k_rot` passed directly (the view form) is `[B,H,S,D]`
 /// row-major, last-axis stride `1`. (2) `dkr`'s FIRST operand has shape
-/// `[B,H,D,S]`, not `[B,H,S,S]` — pre-round-4's `dkr` GEMM was `ds.t() @
-/// q_scaled` (lhs shape `[B,H,S,S]`); this round's is `q_scaled.t() @
-/// ds` (lhs shape `[B,H,D,S]`) — a categorically different GEMM, not
-/// merely a different operand form of the same one (deliverable 3's own
-/// finding: `m`/`n` swapped). Neither check depends on comparing against
+/// `[B,H,D,S]`, not `[B,H,S,S]` — the view form's `dkr` GEMM is `ds.t() @
+/// q_scaled` (lhs shape `[B,H,S,S]`); the production form's is
+/// `q_scaled.t() @ ds` (lhs shape `[B,H,D,S]`) — a categorically different
+/// GEMM (`m`/`n` swapped), not merely a different operand form of the same
+/// one. Neither check depends on comparing against
 /// a "production" reconstruction in this test body — both are intrinsic
 /// properties of the Layout `bwd_core` itself produces.
 #[test]
@@ -10026,16 +9923,16 @@ fn attention_block_bwd_dqs_dkr_gemm_layouts_match_production_orientation_cuda() 
     assert_ne!(
         dqs_rhs_last_stride, 1,
         "dqs's rhs operand has unit last-axis stride ({dqs_rhs_last_stride}) — this is `k_rot` \
-         passed directly (pre-round-4's operand form), not a transposed VIEW of a materialized \
-         `kt_contig` (this round's fix) — layout={dqs_rhs:?}"
+         passed directly (the view operand form), not a transposed VIEW of a materialized \
+         `kt_contig` (the production form) — layout={dqs_rhs:?}"
     );
     let dkr_lhs_dims = dkr_lhs.dims();
     assert_eq!(
         dkr_lhs_dims[dkr_lhs_dims.len() - 2..],
         [head_dim, seq],
-        "dkr's lhs operand shape is {dkr_lhs_dims:?}, not [.., {head_dim}, {seq}] — this round's \
-         fix issues `q_scaled.t() @ ds` (lhs [B,H,D,S]); pre-round-4's `dkr` issued `ds.t() @ \
-         q_scaled` (lhs [B,H,S,S]) — a categorically different GEMM, not just a different operand \
+        "dkr's lhs operand shape is {dkr_lhs_dims:?}, not [.., {head_dim}, {seq}] — the \
+         production form issues `q_scaled.t() @ ds` (lhs [B,H,D,S]); the view form issues \
+         `ds.t() @ q_scaled` (lhs [B,H,S,S]) — a categorically different GEMM, not just a different operand \
          form of the same one"
     );
 }
@@ -10193,15 +10090,9 @@ fn three_way_vs_f32_reference(
 }
 
 /// A SANITY leg (see [`three_way_vs_f32_reference`]'s own doc for why it
-/// is not this crate's discriminating oracle for the round-4 GEMM-
-/// operand-form defect). WITHDRAWN: an earlier revision of this doc
-/// quoted per-tensor numbers (`Σ|fused-ref|`/`Σ|eager-ref|`/a 65-vs-44-
-/// vs-115 "closer tensor" split) measured on the real ModernBERT-large
-/// checkpoint by a script committed NOWHERE in this repo — unreproducible
-/// from this tree, so withdrawn rather than repeated. This op-level leg
-/// is the reproducible replacement: it asserts (not merely prints) a
-/// generous sanity bound at `--nocapture`-visible amplitude, no real
-/// checkpoint needed.
+/// is not this crate's discriminating oracle for the GEMM-operand-form
+/// defect class). It asserts (not merely prints) a generous sanity bound
+/// at `--nocapture`-visible amplitude, no real checkpoint needed.
 #[test]
 fn attention_block_bf16_three_way_vs_f32_reference_b1_and_b8_cuda() {
     let cuda = jammi_test_resources::cuda_device(0);
@@ -10214,12 +10105,10 @@ fn attention_block_bf16_three_way_vs_f32_reference_b1_and_b8_cuda() {
 
 // =======================================================================
 // FA2 dense arm's OWN op-level oracle, in the vendored kernel's own
-// upstream acceptance form (numerics agent, round 7, lead course-
-// correction on top of the encoder-level rebuild below). `three_way_vs_
-// f32_reference` above compares `AttentionBlockFused` (the BLOCK arm) —
-// never the flash op — against an F32 reference; it is not a claim about
-// the FA2 dense arm this round is actually about. This section is that
-// claim, using the SAME acceptance form the vendored kernel ships its own
+// upstream acceptance form. `three_way_vs_f32_reference` above compares
+// `AttentionBlockFused` (the BLOCK arm) — never the flash op — against an
+// F32 reference; it is not a claim about the FA2 dense arm. This section
+// is that claim, using the SAME acceptance form the vendored kernel ships its own
 // numeric-parity tests with.
 //
 // Dao-AILab/flash-attention `tests/test_flash_attn.py` (the SAME tree as
@@ -10287,9 +10176,9 @@ impl FlashUpstreamMeasurement {
 }
 
 /// Affirmative-finite-first (guide §3.7) `max|a_i - b_i|`, over `f64` —
-/// NEVER a silent `NaN`-dropping fold (family J: `f64::max` is NaN-blind).
+/// NEVER a silent `NaN`-dropping fold (`f64::max` is NaN-blind).
 /// `#[cfg(feature = "flash-attn")]`: every caller is the FA2 upstream
-/// oracle below — a cuda-only build (the seed's own T3 clippy leg) would
+/// oracle below — a cuda-only build (e.g. a `cuda`-only clippy leg) would
 /// otherwise see it as dead code under `-D warnings`.
 #[cfg(feature = "flash-attn")]
 fn max_abs_diff_finite_first(label: &str, a: &[f32], b: &[f32]) -> f64 {
@@ -10413,7 +10302,7 @@ fn flash_bwd_fused(
 }
 
 /// The two statistically distinct operand families the FA2 dense arm's
-/// upstream acceptance form sweeps (lead course-correction): a smooth
+/// upstream acceptance form sweeps: a smooth
 /// deterministic fixture alone cannot rule out a defect only a genuinely
 /// random operand distribution exercises.
 /// `#[cfg(feature = "flash-attn")]` for the same reason as its consumers.
@@ -10439,9 +10328,9 @@ enum FlashFixtureKind {
 /// through, but no op-level RED control here exercises it: a dropped
 /// softmax scale (`flash_scale = Some(1.0)`) is a bounded convex
 /// combination of V, so it is NOT visible to this op-level magnitude
-/// bound — measured on a100c, `softmax_scale=1.0` gave out max|Δ|=85.0
-/// against a 2x bound of 115.8 and dqkv max|Δ|=2496 against a 3x bound of
-/// 4272, both INSIDE bound (ledger row 344). That defect class IS caught
+/// bound — measured on an A100, `softmax_scale=1.0` gives out
+/// max|Δ|=85.0 against a 2x bound of 115.8 and dqkv max|Δ|=2496 against a
+/// 3x bound of 4272, both INSIDE bound. That defect class IS caught
 /// by the encoder-level three-way oracle (20.9x/70x over bound,
 /// `jammi-encoders::modernbert::flash_arm_encoder_level_oracle_red_
 /// control_bad_softmax_scale`), which is why the op-level RED control here
@@ -10569,7 +10458,7 @@ fn measure_flash_upstream_form(
 }
 
 /// The healthy oracle: production geometry (`b1_s128`/`b4_s128`/
-/// `b8_s512` — the three shapes the lead's course-correction names),
+/// `b8_s512`),
 /// `window` `Some(64)`/`None`, `>= 3` seeds, and BOTH fixture families
 /// (`FlashFixtureKind::SmoothAmplitude(12.0)` — inside the real
 /// checkpoint's own measured `max|qkv|` range 9-18, same citation
@@ -10630,22 +10519,20 @@ fn flash_upstream_acceptance_form_vs_f32_reference_dense_cuda() {
 
 /// RED control: the FLASH leg's own window radius collapsed to `Some(0)`
 /// (self-only attention) while the reference/eager side keeps the real
-/// radius (64) — must VIOLATE the upstream bound (out, dqkv, or both). A
-/// prior round measured two WEAKER perturbations (an off-by-one radius,
-/// `Some(64) -> Some(63)`, and dropping the window entirely, `Some(64) ->
-/// None`) NOT discriminating at this shape/fixture/amplitude —
-/// `qkv_fixture`'s smooth, deterministic sinusoid + RoPE decays fast
-/// enough that this fixture's own attention mass concentrates well inside
-/// a 63-token radius, so widening or removing the window past that point
-/// changed nothing that (now-superseded) reference could see — `Some(0)`
-/// was the discriminating perturbation that round found (guide §3.8: no
-/// absolute floor here, so this is not absorbed the way it would be under
-/// a `+ 0.05` floor — no-producer: a hypothetical contrast value, not a
-/// bound this test asserts). The numbers cited in that finding were measured
-/// against `attention_block_bwd_eager_reference` (superseded above by
-/// `attention_block_bwd_production_eager_reference`); this test now
-/// re-measures against the production-faithful reference — see the
-/// printed `FLASH_UPSTREAM` line for the live numbers this run produced.
+/// radius (64) — must VIOLATE the upstream bound (out, dqkv, or both).
+/// Two WEAKER perturbations (an off-by-one radius, `Some(64) -> Some(63)`,
+/// and dropping the window entirely, `Some(64) -> None`) do NOT
+/// discriminate at this shape/fixture/amplitude against the form-aligned
+/// `attention_block_bwd_eager_reference`: `qkv_fixture`'s smooth,
+/// deterministic sinusoid + RoPE decays fast enough that the attention
+/// mass concentrates well inside a 63-token radius, so widening or
+/// removing the window past that point changes nothing visible; `Some(0)`
+/// does (guide §3.8: no absolute floor here, so this is not absorbed the
+/// way it would be under a `+ 0.05` floor — no-producer: a hypothetical
+/// contrast value, not a bound this test asserts). This test measures
+/// against the production-faithful
+/// `attention_block_bwd_production_eager_reference` — see the printed
+/// `FLASH_UPSTREAM` line for the live numbers this run produced.
 #[test]
 #[cfg(feature = "flash-attn")]
 fn flash_upstream_acceptance_form_red_control_window_radius_zero_cuda() {
@@ -10685,11 +10572,10 @@ fn flash_upstream_acceptance_form_red_control_window_radius_zero_cuda() {
 /// reuses) while the reference/eager side keeps K correctly rotated —
 /// must VIOLATE the upstream bound (out, dqkv, or both).
 ///
-/// WITHDRAWN (ledger row 344): an earlier revision of this control dropped
-/// the FLASH leg's `softmax_scale` to `1.0` instead. Measured on a100c,
-/// that perturbation was VACUOUS at this op-level magnitude bound: out
-/// max|Δ|=85.0 stayed under the 2x bound of 115.8, and dqkv max|Δ|=2496
-/// stayed under the 3x bound of 4272 — a dropped softmax scale still
+/// A dropped `softmax_scale` (`1.0`) is VACUOUS at this op-level
+/// magnitude bound (measured on an A100: out max|Δ|=85.0 under the 2x
+/// bound of 115.8, dqkv max|Δ|=2496 under the 3x bound of 4272) — a
+/// dropped softmax scale still
 /// yields a bounded convex combination of V, so magnitude alone can't see
 /// it. That defect class IS caught by the encoder-level three-way oracle
 /// (20.9x/70x over bound,
@@ -10942,11 +10828,11 @@ fn measure_flash_upstream_form_bwd_window_dropped(
 /// bound (forward is untouched by this defect) and VIOLATE the dqkv bound.
 ///
 /// FIXTURE: `FlashFixtureKind::Gaussian`, NOT `SmoothAmplitude` (the other
-/// two op-level controls' own fixture) -- measured this round on a100b: at
+/// two op-level controls' own fixture) -- measured on an A100: at
 /// `SmoothAmplitude(12.0)` (production-checkpoint-magnitude `qkv`), NEITHER
 /// `bwd_window = None` NOR the more extreme `Some(0)` (self-only backward
-/// attention) discriminates at this bound (no-producer: a rejected, uncommitted trial sweep — dqkv ratio-to-bound 0.02-0.16
-/// across a 5-seed sweep at both `b1_s128` and `b8_s512` -- widening or
+/// attention) discriminates at this bound (no-producer: an uncommitted
+/// trial sweep — dqkv ratio-to-bound 0.02-0.16 across a 5-seed sweep at both `b1_s128` and `b8_s512` -- widening or
 /// zeroing the backward-only window changes the SCALE of the already-large
 /// eager/bf16 noise floor at this amplitude, not its SIGN, so a bounded
 /// multiple of it stays bounded). `Gaussian`'s own tiny cotangent
@@ -10973,9 +10859,9 @@ fn measure_flash_upstream_form_bwd_window_dropped(
 /// defect never touches the forward launch, so a control that let `out`
 /// fail too would not be proving anything about the GRADIENT arm
 /// specifically -- and the `k_unrotated` control's own dqkv leg (7.36e2,
-/// inside its 3x bound of 2.904e3, measured this round on a100b) shows the
-/// dqkv arm of the `!out_ok() || !dqkv_ok()` form had NEVER actually fired
-/// on any committed control before this one.
+/// inside its 3x bound of 2.904e3, measured on an A100) shows the dqkv arm
+/// of the `!out_ok() || !dqkv_ok()` form does not fire on the other
+/// controls; this one is the dqkv arm's own proof.
 #[test]
 #[cfg(feature = "flash-attn")]
 fn flash_upstream_acceptance_form_red_control_bwd_only_window_dropped_cuda() {
@@ -11007,27 +10893,20 @@ fn flash_upstream_acceptance_form_red_control_bwd_only_window_dropped_cuda() {
 }
 
 // =======================================================================
-// M1a — varlen positions: `flash_attention_varlen_with_rope_ragged`'s own
+// Varlen positions: `flash_attention_varlen_with_rope_ragged`'s own
 // oracles (a VALUES-PARITY oracle vs the two-op composition, flash-level
 // DENSE INVARIANCE against the existing dense entry, and the no-CPU-arm
 // guard). See `jammi_kernels::ops::rope_positions`'s module doc, "The
 // ragged arm" section, for the representation this relies on. `#[cfg(
 // feature = "flash-attn")]` throughout -- every path under test but the
-// guard is CUDA-only; moved here (from an earlier draft inline in
-// `src/ops/flash_attention.rs`) specifically so `cuda_device`'s skip is
-// MECHANICALLY enforced by `check_kernel_oracles.py`'s KO-7 scan (which
-// covers `crates/jammi-kernels/tests/**`, not `crates/jammi-kernels/
-// src/**`) rather than voluntarily mirrored, and so no NEW
-// `ci/kernel-oracle-helpers.txt` entry is needed -- this file's own
-// `cuda_device` (registered there already) is reused directly.
+// guard is CUDA-only.
 //
-// NOT a retention oracle (audit correction): the test below measures
-// VALUES ONLY (bit-identical fwd output and dqkv) -- it does not measure
-// VRAM/retention at all, so calling it a "RETENTION oracle" overclaimed
-// what it checks. `FlashVarlenAttentionFusedRope`'s module doc's own
+// NOT a retention oracle: the test below measures VALUES ONLY
+// (bit-identical fwd output and dqkv) -- it does not measure
+// VRAM/retention at all. `FlashVarlenAttentionFusedRope`'s module doc's own
 // motivation (`crates/jammi-kernels/src/ops/flash_attention.rs`, "Measured"
 // section) is retention SAVINGS relative to the two-op composition, from
-// no longer retaining a second `[total, 3, H, 64]` rotated `qkv` buffer;
+// not retaining a second `[total, 3, H, 64]` rotated `qkv` buffer;
 // the RAGGED arm partially gives some of that saving back: candle's
 // `BackpropOp::new3` (`op.rs`) retains EVERY tracked argument of a
 // `CustomOp3` node unconditionally, so `FlashVarlenAttentionFusedRope`'s
@@ -11048,10 +10927,8 @@ fn flash_upstream_acceptance_form_red_control_bwd_only_window_dropped_cuda() {
 // division of the two numbers cited above, not itself a separate
 // measurement) of the saving given back at full packing, worst case (a
 // partially-packed ragged batch, `total < batch * seq`, gives back LESS).
-// A REAL, stated cost, not
-// zero -- an actual VRAM/retention measurement of this specific delta is
-// deferred to the pod/VRAM legs (this file has no VRAM instrumentation);
-// this doc paragraph is the honest bound this pass can state without one.
+// A REAL, stated cost, not zero; this file has no VRAM instrumentation,
+// so this is a derived bound, not a measurement.
 // =======================================================================
 
 /// A real (non-trivial-angle) BASE rotary table, `[period_base, hidden]`,
@@ -11279,10 +11156,10 @@ fn fused_rope_ragged_refuses_a_non_cuda_qkv() {
     );
 }
 
-/// UNIFIED `lengths` contract (audit advisory 2): `flash_attention_varlen_with_rope_ragged`
+/// UNIFIED `lengths` contract: `flash_attention_varlen_with_rope_ragged`
 /// refuses a zero-length segment via the SAME shared check
 /// `jammi_kernels::ops::rope_positions`'s `ragged_positions_from_lengths`
-/// now enforces for `rope_positions_fused_ragged` too (see that op's own
+/// enforces for `rope_positions_fused_ragged` (see that op's own
 /// test, `ops::rope_positions::tests::rope_positions_fused_ragged_refuses_a_zero_length_segment`)
 /// -- ONE `lengths` contract, not two independently-drifting ones. Needs a
 /// real CUDA `qkv` (the no-CPU-arm guard above would otherwise fire
@@ -11313,14 +11190,14 @@ fn fused_rope_ragged_refuses_a_zero_length_segment_cuda() {
 }
 
 // =======================================================================
-// RopePositionsFused CPU<->CUDA parity + THE B3-dense identity oracle
-// (P6 Stage B B3-dense, contract v5 §3.6): `rope_positions_fused` on the
+// RopePositionsFused CPU<->CUDA parity + THE dense identity oracle:
+// `rope_positions_fused` on the
 // packed `[total, 3, h, d]` buffer is bit-identical to `RopeFused` on the
 // SAME data in `[b, h, s, d]` form (the block arm's own operand shape,
 // `gather_bhsd`'s target) -- run here on CUDA, bf16, production head_dim
 // (64), both a GLOBAL-style theta (160_000, ModernBERT's
 // `global_rope_theta`) and a LOCAL-style theta (10_000,
-// `local_rope_theta`, contract v5's "both bases"), b1 AND b8, s128 AND
+// `local_rope_theta` — both bases), b1 AND b8, s128 AND
 // s512. RED control: sign flipped must NOT match.
 // =======================================================================
 
@@ -11638,7 +11515,7 @@ fn rope_positions_bwd_reaches_qkv_gradient_cuda() {
 // copy-paste.
 
 /// Timing statistics from [`time_kernel`]. `min_ms`/`median_ms` are
-/// computed with a fixed fold order (family J): sorted with
+/// computed with a fixed fold order: sorted with
 /// `f64::total_cmp` (never a NaN-unstable `partial_cmp` sort), median
 /// averaging the two middle samples on an even count rather than picking
 /// one arbitrarily.
@@ -11650,15 +11527,13 @@ struct TimingStats {
 }
 
 /// Isolated-kernel-timing harness every `isolated_kernel_timing_*` test in
-/// this file shares — extracted so the Cast-boundary Wave 1 timing defect
-/// (phase-4 audit Block 1) cannot recur by copy-paste in a future timing
-/// test. THE DEFECT: the original `isolated_kernel_timing_cast_boundary_
-/// wave1` batched 50 launches under ONE trailing `synchronize()`, with a
-/// fresh `device.alloc::<f32>(n)` (a 151 MB output buffer) allocated
-/// INSIDE the timed region on every one of those 50 calls — a re-run on
-/// an otherwise-idle box found a **2.35x spread** across repeats (0.273 /
-/// 0.619 / 0.641 / 0.321 ms), an artifact of that batching/allocator
-/// interaction, not the kernel's own cost.
+/// this file shares, so a batching timing defect cannot recur by
+/// copy-paste. THE DEFECT: batching 50 launches under ONE trailing
+/// `synchronize()`, with a fresh `device.alloc::<f32>(n)` (a 151 MB output
+/// buffer) allocated INSIDE the timed region on every one of those 50
+/// calls, shows a **2.35x spread** across repeats on an otherwise-idle box
+/// (0.273 / 0.619 / 0.641 / 0.321 ms) — an artifact of that
+/// batching/allocator interaction, not the kernel's own cost.
 ///
 /// `prealloc` runs ONCE, before any timing, to build the reusable `State`
 /// (e.g. the input tensor(s)) — nothing the timed region needs to
@@ -11672,9 +11547,8 @@ struct TimingStats {
 /// iteration, warm-ups included, is bracketed by its OWN
 /// `Device::synchronize()`: batching N launches under one trailing sync
 /// is exactly what this harness makes structurally impossible to
-/// reintroduce. `nsys` was unavailable/broken on the pod image this first
-/// ran on (`nsys --version` errors "hasn't been installed with CUDA
-/// Toolkit 12.6"), so this is wall-clock, including per-launch CPU-side
+/// reintroduce. This is wall-clock (`nsys` is not assumed available on the
+/// GPU image), including per-launch CPU-side
 /// dispatch overhead, not a device-side-only `nsys` timeline — every
 /// caller's own `println!` should state that rather than imply
 /// kernel-only cost.
@@ -11748,29 +11622,25 @@ fn print_timing_stats(
 }
 
 // ---------------------------------------------------------------------
-// Cast-boundary lever Wave 1 — ISOLATED kernel timing (guide §4), on
-// [`time_kernel`] above. `cargo test --features cuda --test cuda_parity
-// -- --ignored --nocapture isolated_kernel_timing_cast_boundary_wave1` on
-// an EXCLUSIVE box (check `nvidia-smi` first — co-tenancy inflates
-// wall-clock launch time, not just kernel occupancy). Reports BOTH min
-// and median over >= 200 iterations after >= 20 warm-ups (guide's
-// Block-1 fix instruction) — see [`time_kernel`]'s own doc for the
-// batching defect this replaced and the 2.35x-spread number that proved
-// it.
+// Cast-boundary lever — ISOLATED kernel timing (guide §4), on
+// [`time_kernel`] above. `cargo test -p jammi-kernels --features
+// live-gpu-tests --test cuda_parity -- --ignored --nocapture
+// isolated_kernel_timing_cast_boundary` on an EXCLUSIVE box (check
+// `nvidia-smi` first — co-tenancy inflates wall-clock launch time, not
+// just kernel occupancy). Reports BOTH min and median over >= 200
+// iterations after >= 20 warm-ups — see [`time_kernel`]'s own doc for the
+// batching defect this avoids.
 //
-// SECOND FORM (post-lead-review): the FIRST fix (per-iteration sync,
-// min+median) was necessary but not sufficient — a clean, exclusive-box
-// re-run of that fixed harness (both on a100d and on a100b) still showed
-// `cast_scale_bf16_f32` at ~2.1 ms (5.2% roofline), not the 53% this
-// file's own earlier revision reported. Root cause, found by the lead:
-// `apply1` allocates its 151 MB `f32` OUTPUT storage inside `launch`
+// Per-iteration sync plus min+median is necessary but not sufficient: on
+// a clean, exclusive A100, `cast_scale_bf16_f32` through `apply1` measures
+// ~2.1 ms (5.2% roofline). `apply1` allocates its 151 MB `f32` OUTPUT storage inside `launch`
 // EVERY iteration (`device.alloc::<f32>(n)`, `src/cuda/cast_scale.rs`),
 // and cudarc has NO caching allocator — a fresh `cuMemAlloc` + the
 // matching `cuMemFree` when the returned `Tensor` drops at the end of
 // each iteration is a genuine ~2 ms of device-driver work, not a
 // measurement artifact. `cast_add_bf16`'s 25 MB output pays far less of
-// this tax, which is why ITS number was already accurate. This test now
-// measures and reports BOTH numbers for both ops, explicitly labelled:
+// this tax. This test measures and reports BOTH numbers for both ops,
+// explicitly labelled:
 // the WRAPPER number (`apply1`/`apply2`, what a real caller pays, alloc
 // included) and the KERNEL-ONLY number (`cast_scale_bf16_f32_into`/
 // `cast_add_bf16_into`, `ops/cast_scale.rs`'s `#[doc(hidden)]`
@@ -11778,13 +11648,13 @@ fn print_timing_stats(
 // `Tensor` allocated ONCE outside the timed loop).
 #[test]
 #[ignore]
-fn isolated_kernel_timing_cast_boundary_wave1() {
+fn isolated_kernel_timing_cast_boundary() {
     let cuda = jammi_test_resources::cuda_device(0);
 
     const N_WARMUP: u32 = 20;
     const N_ITERS: u32 = 200;
 
-    // (e) B1's own shape at the census's m/outf: the Wqkv site's
+    // (e) The epilogue site's production shape: the Wqkv site's
     // Σout-sized population, m = 12288 (b8-s512 batched-forward), outf =
     // 3072.
     let (m_e, outf_e) = (12_288usize, 3_072usize);
@@ -11792,7 +11662,7 @@ fn isolated_kernel_timing_cast_boundary_wave1() {
     let cast_scale_op = CastScaleBf16F32::new(scale);
     let shape_e = format!("m={m_e} outf={outf_e}");
 
-    // Correctness FIRST (family F: a claimed number is measured AND
+    // Correctness FIRST (a claimed number is measured AND
     // asserted, never assumed) — the preallocated-output path must be
     // bit-identical to `apply1`'s own output before its timing means
     // anything.
@@ -11869,8 +11739,8 @@ fn isolated_kernel_timing_cast_boundary_wave1() {
         &stats_e_kernel_only,
     );
 
-    // (f) B3's own shape at the census's m/inf: the Wqkv site's Σin-sized
-    // population, m = 12288, inf = 1024.
+    // (f) The residual-add site's production shape: the Wqkv site's
+    // Σin-sized population, m = 12288, inf = 1024.
     let (m_f, inf_f) = (12_288usize, 1_024usize);
     let cast_add_op = CastAddBf16::new();
     let shape_f = format!("m={m_f} inf={inf_f}");
@@ -11963,18 +11833,16 @@ fn isolated_kernel_timing_cast_boundary_wave1() {
 // ---------------------------------------------------------------------
 // adamw_step_fused_t — the multi-tensor-AdamW lever's bit-identity leg.
 //
-// FIX ROUND: the previous
-// version of this section compared fused-CPU vs fused-CUDA within an
-// absolute `F32_TOL`, on ZERO prior moments only, and never checked the
-// CUDA arm against candle's OWN eager CUDA chain at all — so nvcc silently
-// FMA-contracting `adamw_moment_update_f32`'s `beta*m[i] + one_minus_beta*
-// gv` into a single-rounding hardware FMA (measured: 5145/16384 `m`
-// elements differed from the eager CUDA chain at t=3, nonzero prior
-// moments) passed every test in this file. Per `cuda/adamw_step.cu`'s fix
-// (explicit-rounding `__fmul_rn`/`__fadd_rn`/`__fsub_rn`/`__fdiv_rn`
-// intrinsics, matching candle's own per-site `affine(x, mul, 0.0)`
-// composition bit-for-bit), this is now a BIT-IDENTITY oracle on THREE
-// legs, all via `to_bits()` equality, finiteness-affirmative first (guide
+// A fused-CPU vs fused-CUDA comparison within an absolute `F32_TOL`, on
+// ZERO prior moments only, without checking the CUDA arm against candle's
+// OWN eager CUDA chain, cannot see nvcc silently FMA-contracting
+// `adamw_moment_update_f32`'s `beta*m[i] + one_minus_beta*gv` into a
+// single-rounding hardware FMA (measured: 5145/16384 `m` elements differ
+// from the eager CUDA chain at t=3, nonzero prior moments). With
+// `cuda/adamw_step.cu`'s explicit-rounding `__fmul_rn`/`__fadd_rn`/
+// `__fsub_rn`/`__fdiv_rn` intrinsics (matching candle's own per-site
+// `affine(x, mul, 0.0)` composition bit-for-bit), this is a BIT-IDENTITY
+// oracle on THREE legs, all via `to_bits()` equality, finiteness-affirmative first (guide
 // §3.7/§3.8 — no absolute ULP floor):
 //   1. fused-CUDA  vs  eager-CUDA  (the real oracle: candle's own eager
 //      chain run ON THE CUDA DEVICE, via [`eager_step`] below — proves the
@@ -12362,7 +12230,7 @@ fn adamw_step_zero_weight_decay_bit_identical() {
     );
 }
 
-/// Boundary/degenerate oracle (family D) on CUDA specifically: an empty
+/// Boundary/degenerate oracle on CUDA specifically: an empty
 /// tensor must not build the illegal `(0,1,1)` launch grid
 /// `LaunchConfig::for_num_elems(0)` would yield — `moment_update_cuda_fwd`/
 /// `theta_update_cuda_fwd` both return early before ever launching.
@@ -12405,7 +12273,7 @@ fn non_contiguous_first_moment_is_refused_on_cuda() {
     );
 }
 
-/// RED CONTROL (family F, CUDA leg — the CPU-side twin lives in
+/// RED CONTROL (CUDA leg — the CPU-side twin lives in
 /// `ops::adamw_step::tests::negative_control_...`): the deliberately WRONG,
 /// FMA-contracted [`AdamMomentUpdateFmaContractedRedControl`] kernel MUST
 /// diverge from candle's own eager CUDA chain on nonzero prior moments,
@@ -12467,16 +12335,10 @@ fn adamw_step_fma_contracted_red_control_diverges_from_eager_cuda() {
 }
 
 // =========================================================================
-// mem_efficient_attention CUDA parity (M2 part 2 F3, adversarial audit
-// round 3): the CUDA composition landed with ZERO oracle authored — "pod-
-// deferred" covered EXECUTION, never authorship. Every leg below is
-// cuda-gated + require-env (`cuda_device()`, this file's own established
-// pattern) so it compiles into every `--features cuda` test binary and
-// runs (or loudly refuses to silently skip, under `JAMMI_REQUIRE_CUDA`) on
-// the pod that re-smokes this branch.
+// mem_efficient_attention CUDA parity.
 //
-// Metric class (plan v4 delta 5, FLASH_ORACLE_PADDED_BOUND's own doc
-// records the fixed defect): BARE `relative_l1_error`
+// Metric class (see `FLASH_ORACLE_PADDED_BOUND`'s own doc): BARE
+// `relative_l1_error`
 // (`Σ|arm-reference|/Σ|reference|`), never a ratio-calibrated ULP bound —
 // this op's chunked online-softmax accumulator has no eager call site to
 // bit-match against at depth (module doc's own "reduction-order growth
@@ -12496,9 +12358,8 @@ fn adamw_step_fma_contracted_red_control_diverges_from_eager_cuda() {
 /// `chunk` the PRODUCTION constructor accepts at all
 /// (`jammi_kernels::ops::MEM_EFFICIENT_MIN_CHUNK`, `512`), NOT the
 /// production DEFAULT a real training forward actually uses
-/// (`jammi_encoders::modernbert::MEM_EFFICIENT_CHUNK`, `1024` — round-6
-/// audit finding F-2 corrected an earlier doc here that conflated the
-/// two). Every small-`seq` leg below uses this FLOOR directly
+/// (`jammi_encoders::modernbert::MEM_EFFICIENT_CHUNK`, `1024`) — the two
+/// are distinct. Every small-`seq` leg below uses this FLOOR directly
 /// (degenerating to one mega-chunk at these toy shapes, module doc's own
 /// documented behaviour for `chunk > seq`);
 /// [`mem_efficient_cuda_matches_cpu_band_multi_chunk_f32`] picks a `seq`
@@ -12689,29 +12550,24 @@ fn assert_mem_efficient_fwd_parity_sweep(
     );
 }
 
-/// **F32 fwd/policy/eager-reference bound — first-pass, NOT YET
-/// recalibrated from a per-seed measurement (round-6 audit advisory,
-/// stated honestly rather than left silently uncorrected).** `cuBLAS`
-/// (CUDA `matmul`) and the CPU `gemm` crate reduce in a DIFFERENT order
-/// than each other (both correct, esc-044's own lesson) — the SAME jitter
+/// **F32 fwd/policy/eager-reference bound — NOT calibrated from a
+/// per-seed measurement.** `cuBLAS` (CUDA `matmul`) and the CPU `gemm`
+/// crate reduce in a DIFFERENT order than each other (both correct) — the
+/// SAME jitter
 /// class `F32_TOL` (this file's own elementwise-fmad bound) already prices for
 /// a single fused op; this op chains several GEMMs (`QKᵀ`, `PV`) plus an
-/// online-softmax recurrence per chunk. `2026-08-28-m2-memeff-cuda-84e98ac-a100-sxm4.json`
-/// (this branch's own landing artifact, cited by filename — the FIRST
-/// on-device execution of this op's CUDA composition) confirms every leg
-/// this constant guards passed GREEN on both A100 and L40S, but its
-/// `observed` block records ONLY the bwd legs' per-seed numbers
+/// online-softmax recurrence per chunk.
+/// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-28-m2-memeff-cuda-84e98ac-a100-sxm4.json`
+/// records every leg this constant guards passing on both A100 and L40S,
+/// but its `observed` block records ONLY the bwd legs' per-seed numbers
 /// ([`MEM_EFFICIENT_BWD_F32_BOUND`]/[`MEM_EFFICIENT_BWD_BF16_BOUND`],
 /// below) — the fwd/policy-discriminator/eager-reference legs this
-/// constant guards have no per-seed data recorded yet to derive a tight
-/// margin FROM (this crate's own "K_MAX lesson": a bound gets tightened
-/// after a real measurement exists, never asserted as final before one
-/// does — a future artifact recording those legs' own per-seed values is
-/// what tightens this constant next, the same way the bwd artifact just
-/// tightened [`MEM_EFFICIENT_BWD_F32_BOUND`]).
+/// constant guards have no per-seed data to derive a tight margin FROM (a
+/// bound is tightened after a real measurement exists, never asserted as
+/// final before one does).
 const MEM_EFFICIENT_F32_BOUND: f64 = 1e-3;
 
-/// **BF16 fwd/policy/eager-reference bound** — the SAME "GREEN but not yet
+/// **BF16 fwd/policy/eager-reference bound** — the SAME "passing but not
 /// per-seed-measured for THESE legs specifically" status as
 /// [`MEM_EFFICIENT_F32_BOUND`]'s own doc states, wider than F32 for the
 /// same reduction-depth + rounding reason `attention_block`'s own bf16
@@ -12721,19 +12577,18 @@ const MEM_EFFICIENT_F32_BOUND: f64 = 1e-3;
 /// fraction, not a per-element bound.
 const MEM_EFFICIENT_BF16_BOUND: f64 = 0.06;
 
-/// **F32 bwd bound, DERIVED (round-6 audit finding F-3) from
+/// **F32 bwd bound, DERIVED from
 /// `2026-08-28-m2-memeff-cuda-84e98ac-a100-sxm4.json`'s own
 /// `bwd_f32_rope_window_dqkv_relative_l1_per_seed`** (the `f32
 /// rope+window` leg, [`assert_mem_efficient_bwd_parity`]'s own label,
 /// `half_window=Some(3)`, `rope=true`): 8-seed mean `1.4503630840829083e-05`
 /// (`≈1.45e-5`), worst single seed `1.7665936624974642e-05` (seed `207`,
-/// `≈1.77e-5` — `≈1.22`x the mean, a tight spread). The PRIOR bound here
-/// (the shared `MEM_EFFICIENT_F32_BOUND`, `1e-3`) gave `≈69`x margin over
-/// this mean — an unmeaning bound wide enough to hide a real regression,
-/// not a first-pass placeholder anymore now that a real measurement
-/// exists (the SAME class `FLASH_ORACLE_PADDED_BOUND`'s own doc argues
-/// against: a bound this loose asserts nothing). Tightened to `5e-5`,
-/// following that constant's own margin convention: `5e-5 / 1.4503630840829083e-05`
+/// `≈1.77e-5` — `≈1.22`x the mean, a tight spread). The shared
+/// `MEM_EFFICIENT_F32_BOUND` (`1e-3`) would give `≈69`x margin over this
+/// mean — an unmeaning bound wide enough to hide a real regression (the
+/// SAME class `FLASH_ORACLE_PADDED_BOUND`'s own doc argues against: a
+/// bound this loose asserts nothing). `5e-5`, following that constant's
+/// own margin convention: `5e-5 / 1.4503630840829083e-05`
 /// `≈3.45`x margin over the measured MEAN (comparable to
 /// [`FLASH_ORACLE_K_MEAN_GRAD`]'s own `~3.1`x mean margin,
 /// `FLASH_ORACLE_PADDED_BOUND`'s own `~3.44`x) and `5e-5 /
@@ -12747,7 +12602,7 @@ const MEM_EFFICIENT_BF16_BOUND: f64 = 0.06;
 /// or max.
 const MEM_EFFICIENT_BWD_F32_BOUND: f64 = 5e-5;
 
-/// **BF16 bwd bound, DERIVED (round-6 audit finding F-3), measured by
+/// **BF16 bwd bound, DERIVED, measured by
 /// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-28-m2-memeff-cuda-84e98ac-a100-sxm4.json`'s
 /// own `bwd_bf16_rope_window_dqkv_relative_l1_per_seed`** (same
 /// leg/fixture as the F32 bound above, `dtype=BF16`): 8-seed mean
@@ -12856,22 +12711,20 @@ fn mem_efficient_cuda_matches_cpu_rope_bf16() {
 /// own `chunk` FLOOR (`MEM_EFFICIENT_MIN_CHUNK_FOR_TEST`, `512` —
 /// `jammi_kernels::ops::MEM_EFFICIENT_MIN_CHUNK`; NOT the production
 /// default — see [`mem_efficient_cuda_matches_cpu_band_production_chunk_width_f32`]
-/// below for that leg, fixed at round-6 audit finding F-2: an earlier
-/// revision of THIS doc wrongly named `512` "the PRODUCTION `chunk=512`
-/// default" — `jammi_encoders::modernbert::MEM_EFFICIENT_CHUNK` is `1024`;
-/// `512` is only ever `MIN_CHUNK`, the FLOOR that op's own constructor
-/// enforces, never a caller's chosen width) gives THREE chunks (`[0,512),
+/// below for that leg: `jammi_encoders::modernbert::MEM_EFFICIENT_CHUNK` is
+/// `1024`; `512` is only ever `MIN_CHUNK`, the FLOOR that op's own
+/// constructor enforces, never a caller's chosen width) gives THREE chunks (`[0,512),
 /// [512,1024), [1024,1200)`), genuinely exercising chunk-boundary
 /// correctness on CUDA at a NON-production width — every OTHER
 /// `MIN_CHUNK`-or-above, `seq`-below-that leg in this file degenerates to
 /// a single mega-chunk (module doc: "a caller may pass `chunk > seq`").
 /// `half_window=64` (production `local_attention=128`'s own half-width)
 /// with `lengths=[1200, 900, 70]` — every real row length `>= half_window
-/// + 2 = 66` (the M1b window-visibility discipline this crate's own band
+/// + 2 = 66` (the window-visibility discipline this crate's own band
 ///   tests already establish: a shorter real length would make the
 ///   fully-masked-row PREDICATE, not the band predicate, the effective
 ///   constraint, hiding what this leg means to exercise) — asserted
-///   in-test, not merely stated in prose (round-6 audit advisory).
+///   in-test, not merely stated in prose.
 #[test]
 fn mem_efficient_cuda_matches_cpu_band_multi_chunk_f32() {
     let cuda = jammi_test_resources::cuda_device(0);
@@ -12902,11 +12755,11 @@ fn mem_efficient_cuda_matches_cpu_band_multi_chunk_f32() {
     );
 }
 
-/// The `BF16` twin of the leg above (round-6 audit finding F-4: no `bf16`
-/// leg anywhere in this file had window/lengths/multi-chunk coverage —
-/// every `bf16` leg before this one was mask-free and single-chunk-only,
-/// so a `bf16`-specific bug reachable ONLY through the band predicate,
-/// padding, or a chunk boundary had no on-device leg to catch it at all).
+/// The `BF16` twin of the leg above: the only `bf16` leg with
+/// window/lengths/multi-chunk coverage (every other `bf16` leg is
+/// mask-free and single-chunk-only), so a `bf16`-specific bug reachable
+/// ONLY through the band predicate, padding, or a chunk boundary has an
+/// on-device leg to catch it.
 /// Identical fixture (`seq=1200`, `half_window=64`,
 /// `lengths=[1200, 900, 70]`, `MIN_CHUNK`-width — the SAME
 /// window-visibility premise asserted in-test), `dtype=BF16`.
@@ -12940,10 +12793,10 @@ fn mem_efficient_cuda_matches_cpu_band_multi_chunk_bf16() {
     );
 }
 
-/// The PRODUCTION-width leg (round-6 audit finding F-2: no leg exercised
+/// The PRODUCTION-width leg: the only leg at
 /// `jammi_encoders::modernbert::MEM_EFFICIENT_CHUNK` itself — every other
 /// leg in this file runs at `MEM_EFFICIENT_MIN_CHUNK_FOR_TEST`, `512`, the
-/// FLOOR, never the `1024` a real training forward actually uses).
+/// FLOOR, never the `1024` a real training forward actually uses.
 /// `chunk=1024` (mirrored here as a literal — that constant lives in
 /// `jammi-encoders`, a downstream crate this file cannot depend on) at
 /// `seq=1500` gives exactly TWO, deliberately LOPSIDED chunks (`[0,1024),
@@ -12984,7 +12837,7 @@ fn mem_efficient_cuda_matches_cpu_band_production_chunk_width_f32() {
     );
 }
 
-/// **F1's own discriminator, closed on-device.** A batch item that is
+/// **The fully-masked-policy discriminator, on-device.** A batch item that is
 /// ENTIRELY padding (`lengths[1] == 0`) makes every one of its rows fully
 /// masked under EITHER policy's own trigger — but the two policies must
 /// produce OBSERVABLY DIFFERENT outputs on those rows: `Zeros` forces
@@ -12992,22 +12845,20 @@ fn mem_efficient_cuda_matches_cpu_band_production_chunk_width_f32() {
 /// additive value is the SAME constant here — a genuine tie, not `-inf` —
 /// so softmax is well-defined and uniform) division, landing on the
 /// UNIFORM average of `V` over that batch's own row 0..seq — never all
-/// zeros unless `V` itself is (this fixture's `V` is not). This is the
-/// exact bug F1 found: `cuda_fwd` applied the `Zeros` algebra
-/// UNCONDITIONALLY, so `Propagate` silently became `Zeros` — a fixture
-/// where the two policies would have been INDISTINGUISHABLE (no fully-
-/// masked row at all) could not have caught it; this one can, and does,
-/// on BOTH policies independently matching their OWN `cpu_fwd` reference
-/// (proving the fix, not merely proving SOME divergence exists).
+/// zeros unless `V` itself is (this fixture's `V` is not). The defect this
+/// catches: `cuda_fwd` applying the `Zeros` algebra UNCONDITIONALLY, so
+/// `Propagate` silently becomes `Zeros` — a fixture where the two policies
+/// are INDISTINGUISHABLE (no fully-masked row at all) cannot catch it;
+/// this one does, on BOTH policies independently matching their OWN
+/// `cpu_fwd` reference (not merely proving SOME divergence exists).
 #[test]
 fn mem_efficient_cuda_fully_masked_zeros_vs_propagate_diverge_observably() {
     let cuda = jammi_test_resources::cuda_device(0);
     assert_mem_efficient_fully_masked_policy_split(&cuda, DType::F32, MEM_EFFICIENT_F32_BOUND);
 }
 
-/// The `BF16` twin (round-6 audit finding F-4: no `bf16` leg had
-/// fully-masked-row coverage at all — the discriminator above was
-/// `F32`-only). Same fixture, `dtype=BF16`.
+/// The `BF16` twin (the only `bf16` leg with fully-masked-row coverage).
+/// Same fixture, `dtype=BF16`.
 #[test]
 fn mem_efficient_cuda_fully_masked_zeros_vs_propagate_diverge_observably_bf16() {
     let cuda = jammi_test_resources::cuda_device(0);
@@ -13015,8 +12866,8 @@ fn mem_efficient_cuda_fully_masked_zeros_vs_propagate_diverge_observably_bf16() 
 }
 
 /// Body shared by the `F32`/`BF16` fully-masked-policy-split legs above
-/// (round-6 audit finding F-4 refactor: extracted so the `bf16` twin is a
-/// real parameterization, not a hand-copied duplicate that could drift).
+/// (extracted so the `bf16` twin is a real parameterization, not a
+/// hand-copied duplicate that could drift).
 fn assert_mem_efficient_fully_masked_policy_split(cuda: &Device, dtype: DType, bound: f64) {
     let (batch, seq, heads, head_dim) = (2usize, 6usize, 1usize, 16usize);
     let lengths = [6usize, 0]; // batch row 1 is ENTIRELY padding.
@@ -13053,7 +12904,7 @@ fn assert_mem_efficient_fully_masked_policy_split(cuda: &Device, dtype: DType, b
     );
 
     // Each policy independently matches ITS OWN cpu_fwd reference — the
-    // real closure of F1 (not merely "the two policies differ from each
+    // real proof (not merely "the two policies differ from each
     // other on CUDA", which a policy-blind bug could also produce if BOTH
     // arms happened to diverge from cpu_fwd in the same wrong direction).
     let err_zeros = mem_efficient_relative_l1_error(&gpu_zeros, &cpu_zeros);
@@ -13072,7 +12923,7 @@ fn assert_mem_efficient_fully_masked_policy_split(cuda: &Device, dtype: DType, b
     );
 
     // The masked batch row (index 1) itself: Zeros must be EXACT zero;
-    // Propagate must NOT be (the observable divergence F1 is about).
+    // Propagate must NOT be (the observable divergence under test).
     let row_elems = seq * heads * head_dim;
     let masked_row_gpu_zeros = &gpu_zeros[row_elems..2 * row_elems];
     let masked_row_gpu_prop = &gpu_prop[row_elems..2 * row_elems];
@@ -13236,7 +13087,7 @@ fn mem_efficient_cuda_matches_independent_eager_reference_f32() {
     );
 }
 
-/// **F3's "bwd cross-check leg on-device."** `dqkv` cpu-vs-cuda, through
+/// **The bwd cross-check leg on-device.** `dqkv` cpu-vs-cuda, through
 /// ordinary `.backward()` (both `cpu_fwd`'s and `cuda_fwd`'s `bwd` is the
 /// SAME shared `Tensor`-level composition — module doc's "`bwd`: ordinary
 /// composition" — so this leg is also a real end-to-end proof that
@@ -13383,16 +13234,14 @@ fn mem_efficient_bwd_cuda_matches_cpu_bf16() {
 }
 
 // ---------------------------------------------------------------------
-// `QuantMatMulGrad` (issue #351 wave 17): CUDA-gated GPU parity oracles
+// `QuantMatMulGrad`: GPU parity oracles
 // for `ops::quant_matmul_grad` (`src/ops/quant_matmul_grad.rs`). That
 // file's own `#[cfg(test)]` module already proves forward/backward
 // correctness ON CPU ONLY (delegating to `QTensor::cpu_fwd`); every test
 // below instead exercises `QTensor::cuda_fwd`
 // (`candle-core` 0.11.0 `quantized/mod.rs:1007-1016`, itself delegating to
-// `QCudaStorage::fwd`, `quantized/cuda.rs:846-877`) -- the pod's
-// `cargo test -p jammi-kernels --features cuda` run (`ci/scripts/
-// runpod_gpu_prove.sh`) is the FIRST place this op's CUDA path runs at
-// all.
+// `QCudaStorage::fwd`, `quantized/cuda.rs:846-877`) -- the only place
+// this op's CUDA path runs.
 // ---------------------------------------------------------------------
 
 /// Quantizes `w` (CPU `f32`) into a `GgmlDType` `QTensor` EXACTLY ONCE
@@ -13449,14 +13298,10 @@ fn qmm_grad_x_fixture(rows: usize, in_f: usize, seed: f64) -> Vec<f32> {
 }
 
 /// Headroom multiplier over [`q8_1_activation_quant_bound`]'s analytic
-/// worst case. This bound is DERIVED, not pod-measured: the host this
-/// test was authored on has no CUDA device to run it against (see this
-/// file's own `cuda_device` doc -- the pod session is this file's actual
-/// landing proof). Every assertion using this bound PRINTS its own
-/// measured `max_abs_diff` (`--nocapture`), so a pod run can confirm the
-/// analytic bound holds with real headroom to spare, the same "derive
-/// now, pod-confirm later" posture this file's `lora_linear_dx_abs_floor`
-/// doc already documents for a different op.
+/// worst case. This bound is DERIVED, not measured. Every assertion using
+/// this bound PRINTS its own measured `max_abs_diff` (`--nocapture`), so a
+/// GPU run confirms the analytic bound holds with real headroom to
+/// spare.
 const Q8_1_ACTIVATION_QUANT_MARGIN: f64 = 2.0;
 
 /// CPU `cpu_fwd` (`QTensor::matmul_t`, module doc: quantized `W` dotted
@@ -13484,7 +13329,7 @@ const Q8_1_ACTIVATION_QUANT_MARGIN: f64 = 2.0;
 /// survives as a first-order term. Propagated through one `k`-deep dot
 /// product against a weight row of magnitude at most `weight_amplitude`,
 /// the WORST CASE (every term's rounding error aligned in sign -- never
-/// assumed to cancel; family D's "never a confident wrong number" applied
+/// assumed to cancel; the "never a confident wrong number" applied
 /// to the bound's own derivation, not just the op) is `k *
 /// weight_amplitude * 0.5 * activation_amplitude / 127`,
 /// [`Q8_1_ACTIVATION_QUANT_MARGIN`]-widened for the reasons in that
@@ -13640,7 +13485,7 @@ fn quant_matmul_grad_forward_parity_kernel_arm_sweep_cuda() {
     }
 }
 
-/// Every element of `grad` must be finite (family F: a naive `diff <
+/// Every element of `grad` must be finite (a naive `diff <
 /// bound` comparison silently reads `NaN` as passing since `NaN < bound`
 /// is `false` only for the ASSERTION, not for a `NaN` masquerading as a
 /// small residual after a lossy cast elsewhere -- this is an explicit,
@@ -13689,7 +13534,7 @@ fn quant_matmul_grad_backward_parity_cuda_dense_reference_and_cpu() {
     let grad_op_cuda = grads_op_cuda.get(x_op_cuda.as_tensor());
     assert!(
         grad_op_cuda.is_some(),
-        "quant_matmul_grad bwd on CUDA must never be None (esc-037: candle's own \
+        "quant_matmul_grad bwd on CUDA must never be None (candle's own \
          backprop.rs:663 drops a None gradient silently)"
     );
     let grad_op_cuda_v = grad_op_cuda
@@ -13832,21 +13677,21 @@ fn quant_matmul_grad_eval_prune_matches_tracked_value_on_cuda() {
 }
 
 // ---------------------------------------------------------------------
-// Quantized-CUDA canary (issue #434 remediation, PR #435): the engine
+// Quantized-CUDA canary: the engine
 // guard `jammi_kernels::quantized_cuda_canary::ensure_quantized_cuda_admitted`
 // runs before `quant_matmul_grad`'s FIRST CUDA dispatch every process (see
 // that module's own doc for the full mechanism). Every OTHER test above
 // this section already exercises `quant_matmul_grad` on CUDA, so the
-// canary has ALREADY run (and, on a healthy pod, ALREADY settled on
+// canary has ALREADY run (and, on a healthy device, ALREADY settled on
 // `FastKernelsTrusted`) by the time this test executes in the same test
 // binary -- this test's own value is asserting that outcome EXPLICITLY,
 // by name, rather than only implicitly through every other test's own
 // numeric parity passing. See this module's own doc's "what this guard can
 // and cannot detect" section: this does NOT and cannot reproduce the true
 // sm_90/cap_80 arch-mismatch scenario hermetically (that needs a genuinely
-// arch-mismatched cubin, a CI/build-matrix concern -- a separate
-// remediation wave; see issue #434); the true mismatch scenario was proven
-// end-to-end on a live H100 pod per that issue's own root-cause comment.
+// arch-mismatched cubin, a CI/build-matrix concern); the true mismatch
+// scenario is reproducible end-to-end only on real mismatched hardware
+// (an H100 running an sm_80-only quantized build).
 // ---------------------------------------------------------------------
 #[test]
 fn quantized_cuda_canary_passes_on_a_healthy_build_and_device() {
@@ -13864,7 +13709,7 @@ fn quantized_cuda_canary_passes_on_a_healthy_build_and_device() {
             &cuda
         ),
         "quantized-CUDA canary must settle on FastKernelsTrusted on a healthy, arch-matched \
-         build+device -- a LegacyDmmvFallback verdict here would mean either the pod's own \
+         build+device -- a LegacyDmmvFallback verdict here would mean either this host's own \
          build genuinely mismatches this device's arch (a real, reportable finding) or the \
          canary's own known-answer case/bound is miscalibrated; either way this test failing \
          is signal, not noise"
@@ -13872,7 +13717,7 @@ fn quantized_cuda_canary_passes_on_a_healthy_build_and_device() {
 }
 
 // =======================================================================
-// Campaign #443 W2c — f16 kernels, batch 2: `rope_positions`,
+// f16 kernels: `rope_positions`,
 // `dropout`, `scaled_cast_add`, `cast_scale`/`cast_add`'s NEW F16 analogs.
 // Per-op tolerances derived from the §3.10 regime table (each op is
 // f32-internal, single-fmad-class or bit-exact per its own kernel's use
@@ -13981,8 +13826,8 @@ fn dropout_parity_f16_empty_tensor_is_a_no_op_not_an_error() {
 
 /// F16's exact twin of `assert_rope_positions_bit_identical_to_rope_fused_bf16`
 /// — both `rope_f16.cu` and `rope_positions_f16.cu` compute the IDENTICAL
-/// `rope_rotate`-shaped expression (own duplicated copies, per the W2b/W2c
-/// no-shared-`.cuh` contract), so this is expected BIT-EXACT on real
+/// `rope_rotate`-shaped expression (own duplicated copies — the f16 TUs
+/// share no `.cuh`), so this is expected BIT-EXACT on real
 /// hardware, mirroring the bf16 oracle's own zero-tolerance precedent.
 fn assert_rope_positions_bit_identical_to_rope_fused_f16(
     cuda: &Device,
@@ -14116,7 +13961,7 @@ fn assert_scaled_cast_add_parity_f16_base(
         out_gpu.len()
     );
     assert_floor_below_f16_gradient_band(2, max_abs(basev).max(max_abs(loraev)));
-    let out_floor = measured_near_zero_floor_f16(&out_cpu); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
+    let out_floor = measured_near_zero_floor_f16(&out_cpu);
     let out_bound = |r: f32| f16_relative_bound(r, out_floor, 2.0);
     assert_relative_bound(
         "scaled_cast_add f16-base fwd",
@@ -14182,7 +14027,7 @@ fn assert_scaled_cast_add_parity_f32_base_f16_lora(
     // fmad-class elementwise leg here) since `lora`'s own quantization
     // (before this op ever runs) is the coarsest step in the pipeline.
     assert_floor_below_f16_gradient_band(2, max_abs(basev).max(max_abs(loraev)));
-    let out_floor = measured_near_zero_floor_f16(&out_cpu); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
+    let out_floor = measured_near_zero_floor_f16(&out_cpu);
     let out_bound = |r: f32| f16_relative_bound(r, out_floor, 2.0);
     assert_relative_bound(
         "scaled_cast_add f32-base/f16-lora fwd",
@@ -14240,7 +14085,7 @@ fn assert_scaled_cast_add_parity_f16_f16(
     assert_eq!(out_cpu.len(), n);
     assert_eq!(out_gpu.len(), n, "f16/f16 GPU fwd length mismatch");
     assert_floor_below_f16_gradient_band(2, max_abs(basev).max(max_abs(loraev)));
-    let out_floor = measured_near_zero_floor_f16(&out_cpu); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
+    let out_floor = measured_near_zero_floor_f16(&out_cpu);
     let out_bound = |r: f32| f16_relative_bound(r, out_floor, 2.0);
     assert_relative_bound("scaled_cast_add f16/f16 fwd", &out_cpu, &out_gpu, out_bound);
     let wrong_scaling = if scaling == 1.0 { 0.0 } else { 1.0 };
@@ -14300,14 +14145,13 @@ fn scaled_cast_add_parity_f16_empty_tensor_is_a_no_op_not_an_error() {
     assert!(out2.is_empty());
 }
 
-/// D1 audit fix, family D: the `BF16`+`F16` and `F16`+`BF16` PAIRS are NOT
+/// The `BF16`+`F16` and `F16`+`BF16` PAIRS are NOT
 /// implemented on either arm (no kernel exists for mixing those two
 /// 16-bit dtypes — see `ops::scaled_cast_add`'s module doc) even though
 /// EACH dtype independently is otherwise supported. This must refuse
-/// IDENTICALLY at `n == 0` and `n > 0` — a shape-dependent split here would
-/// reproduce the exact `alloc_empty` hazard campaign #443's D1 audit named
-/// for `dropout`/`rope_positions` before this wave widened their
-/// own dispatch (`crate::cuda::mod`'s `alloc_empty`/`alloc_zeros` doc).
+/// IDENTICALLY at `n == 0` and `n > 0` — a shape-dependent split here is
+/// the `alloc_empty` hazard (`crate::cuda::mod`'s `alloc_empty`/`alloc_zeros`
+/// doc): a dtype accepted at `n == 0` but refused at `n > 0`.
 #[test]
 fn scaled_cast_add_bf16_f16_pair_is_refused_identically_empty_and_nonempty() {
     let cuda = jammi_test_resources::cuda_device(0);
@@ -14324,7 +14168,7 @@ fn scaled_cast_add_bf16_f16_pair_is_refused_identically_empty_and_nonempty() {
     assert!(matches!(err_nonempty, Error::UnsupportedDTypeForOp(..)));
 }
 
-// ---- cast_scale_f16_f32 / cast_add_f16 (NEW types, campaign #443 W2c) ----
+// ---- cast_scale_f16_f32 / cast_add_f16 ---------------------------------
 
 /// F16 twin of `cast_scale_bit_identical_to_the_eager_two_kernel_chain_on_cuda_across_scales`
 /// — `CastScaleF16F32` is a NEW, independent type (not a widened
@@ -14484,15 +14328,13 @@ fn cast_add_f16_empty_tensor_is_a_no_op_not_an_error() {
     assert!(out.is_empty());
 }
 
-/// D1 audit fix: `CastScaleBf16F32`/`CastAddBf16` (the ORIGINAL, BF16-only
-/// types) remain WITHOUT an F16 dispatch arm after this wave (see
-/// `ops::cast_scale`'s module doc — `CastScaleF16F32`/`CastAddF16` are NEW,
-/// independent types, never a widened match arm on these). Pin the typed
+/// `CastScaleBf16F32`/`CastAddBf16` (BF16-only types) have NO F16 dispatch
+/// arm (see `ops::cast_scale`'s module doc — `CastScaleF16F32`/`CastAddF16`
+/// are independent types, never a widened match arm on these). Pin the typed
 /// refusal on F16 input EXPLICITLY at BOTH `n > 0` and `n == 0` — these two
 /// ops' own `cuda_fwd` functions check `s1.dtype() != DType::BF16`
 /// UNCONDITIONALLY, before their `n == 0` fast path, so no shape-dependent
-/// accept/refuse split exists here (unlike `dropout`/
-/// `rope_positions`'s pre-W2c hazard) — this test makes that fact an
+/// accept/refuse split exists here — this test makes that fact an
 /// asserted invariant, not merely an implication of reading the source.
 #[test]
 fn cast_scale_bf16_f32_and_cast_add_bf16_refuse_f16_both_empty_and_nonempty() {

@@ -1285,7 +1285,7 @@ mod bias_gate_tests {
 /// snapshot EQUALITY assertion here is race-free under `cargo test`'s
 /// default concurrent-test-thread execution — an integration-test-level
 /// version of this same claim would NOT be safe (see
-/// `tests/fused_epilogue.rs`'s `esc_031_quantized_twin` module
+/// `tests/fused_epilogue.rs`'s `quantized_zero_b_golden` module
 /// for why: sibling tests IN THAT FILE deliberately increment the same
 /// process-global counter for their own Dense-base assertions).
 #[cfg(test)]
@@ -1436,7 +1436,7 @@ mod lora_scaling_tests {
 /// `eager_epilogue` itself, CPU-hermetic, exercised
 /// directly (not through `LoraLinear::forward`'s dispatch — the
 /// production-width, real-dispatch biting oracle with `DispatchCounters`
-/// live in `crates/jammi-lora/tests/esc046_epilogue_biting_oracle.rs`,
+/// live in `crates/jammi-lora/tests/epilogue_peft_rounding.rs`,
 /// this crate's own integration-test tier). Both tests here compare
 /// against a truth built from candle's own (trusted, generic) `Tensor`
 /// arithmetic and `to_dtype` cast — NEVER a re-implementation of

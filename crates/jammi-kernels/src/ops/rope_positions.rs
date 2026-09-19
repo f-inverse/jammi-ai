@@ -960,8 +960,8 @@ mod tests {
 
     /// Direct assertion of the module doc's `bwd` claim ("the same
     /// sign-flip reuse `RopeFused` already established"): `bwd` for BOTH
-    /// [`RopePositionsFused`] (`rope_positions.rs:350-377`) and
-    /// [`super::super::rope::RopeFused`] (`rope.rs:348-368`) delegate to
+    /// [`RopePositionsFused`] and [`super::super::rope::RopeFused`]
+    /// (each op's `CustomOp3::bwd`) delegate to
     /// their OWN forward with `negate_sin` flipped — that makes bit-
     /// identity of the two ops' `bwd` outputs a CONSEQUENCE of the
     /// already-proven forward bit-identity (`bit_identity_case`, above)

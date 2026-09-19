@@ -218,8 +218,9 @@
 //! already-contiguous tensor is a no-op clone), so
 //! `matmul_grad_rhs`/`matmul_grad_lhs` see the identical operand shapes
 //! either way. `dqs`/`dkr` do NOT get that for free: production's forward
-//! for the `scores` GEMM — `contiguous_matmul`, `crates/jammi-encoders/src/lib.rs:225`,
-//! called from `raw_scores = crate::contiguous_matmul`, `crates/jammi-encoders/src/attention_cascade.rs:732` — materializes BOTH operands, unlike `fwd`'s own
+//! for the `scores` GEMM — `jammi_encoders::contiguous_matmul`, called as
+//! `raw_scores = crate::contiguous_matmul(..)` in `jammi-encoders`'
+//! `attention_cascade.rs` — materializes BOTH operands, unlike `fwd`'s own
 //! view-based `scores` GEMM this op recomputes above — so `bwd` builds a
 //! SEPARATE materialized `kt_contig` specifically for the `dqs`/`dkr`
 //! gradient GEMMs (never for the `scores` recompute, which keeps `fwd`'s
@@ -980,9 +981,8 @@ fn bwd_core(params: BwdCoreParams<'_>) -> Result<(Tensor, [(Tensor, Tensor); 4])
 
     // `dqs`/`dkr` differentiate `scores = q_scaled · k_rotᵀ` — but
     // PRODUCTION's forward for THIS GEMM is
-    // `jammi_encoders::contiguous_matmul` (`crates/jammi-encoders/
-    // src/lib.rs:139-141`, called from `forward_eager_training_
-    // attention_composition` at `modernbert.rs:1016`), which
+    // `jammi_encoders::contiguous_matmul` (called from
+    // `forward_eager_training_attention_composition`), which
     // materializes BOTH operands, NOT the transposed-VIEW `k_rotᵀ`
     // `scores`'s recompute above uses. Matching `contiguous_matmul`'s
     // materialization here (deliberately NOT `fwd`'s own form, unlike

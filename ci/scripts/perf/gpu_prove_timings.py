@@ -31,9 +31,7 @@ Two modes:
     passed on the command line; `source` is recorded as `"run-metadata"`,
     every `groups[].rc` is `null` (no per-group marker existed), and
     `surface.expected_id` is `null` (a legacy leg's surface predates this
-    canonicalization entirely -- `check_gpu_prove_timings.py`'s R5 only
-    demands a matching `expected_id` from `prove-lane`-kind artifacts, never
-    `legacy-pre-d1` ones, precisely so these seeds never trip it).
+    canonicalization entirely).
 
 No `cargo metadata`, no network -- pure stdlib text parsing plus
 `ci/scripts/prove_surface.py` (itself `tomllib`-only).

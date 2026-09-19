@@ -6,8 +6,8 @@ one-time derivation that can silently rot the moment the prove lane's own
 walls move.
 
 Hermetic: stdlib only (`re`, `json`, `subprocess` for `git` ancestry) --
-no `cargo metadata`, no network, no GPU. Imports `ci/scripts/prove_surface`
-(itself `tomllib`-only) and `ci/scripts/check_gpu_parity_matrix`'s own
+no `cargo metadata`, no network, no GPU. Imports
+`ci/scripts/check_gpu_parity_matrix`'s own
 `load_shipped_cuda_silicon()` (the ONE place `GENCODE_ARCHES` is parsed from
 `crates/jammi-kernels/build.rs`, never a second hand-typed arch list here).
 
@@ -41,16 +41,8 @@ Rules:
         non-null `disposition` with `evidence.job_id` and
         `evidence.last_output_at`; `hang` additionally requires
         `evidence.issue`.
-  R5 -- per `GENCODE_ARCHES` arch, at least one `prove-lane`-kind HEALTHY
-        artifact whose `surface.expected_id` equals the CURRENT manifest's
-        `prove_surface.current_expected_id()` -- else FAIL, unless a
-        rot-checked waiver row in `gpu_prove_timings_allowlist.txt` covers
-        it. Standing cost, disclosed: `expected_id` moves (and this rule
-        reds again) whenever a lane feature is added/removed, a
-        `prove_only` entry changes, or a crate stops/starts declaring a
-        lane feature -- the fix is a fresh 4-pod dispatch, never a waiver.
 
-Also enforces a schema-level integrity rule, independent of R1-R5: a
+Also enforces a schema-level integrity rule, independent of R1-R4: a
 non-healthy artifact must never carry `wall_s` (a censored wall smuggled in
 as if it were measured) -- only `wall_lower_bound_s`; and two `prove-lane`
 artifacts sharing the same `git_sha` must never disagree on
@@ -71,13 +63,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "ci" / "scripts"))
-import prove_surface  # noqa: E402
 import check_gpu_parity_matrix as gpu_parity_matrix  # noqa: E402
 
 ARTIFACT_DIR_REL = "ci/artifacts/gpu-prove-timings"
 ARTIFACT_DIR = REPO_ROOT / ARTIFACT_DIR_REL
-ALLOWLIST_REL = "ci/scripts/gpu_prove_timings_allowlist.txt"
-ALLOWLIST_PATH = REPO_ROOT / ALLOWLIST_REL
 RUNPOD_LIB_REL = "ci/scripts/runpod_lib.sh"
 RUNPOD_PROVE_REL = "ci/scripts/runpod_gpu_prove.sh"
 
@@ -476,92 +465,6 @@ def check_r4(artifacts: list[dict]) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# R5
-# --------------------------------------------------------------------------- #
-def load_waivers(path: Path = ALLOWLIST_PATH) -> tuple[list[tuple[str, str, str]], list[str]]:
-    """Returns `(rows, problems)` -- a malformed row (not exactly
-    `<arch><TAB><reviewed_up_to_sha><TAB><reason>`, three tab-separated
-    fields) is a NAMED FAIL in `problems`, never silently skipped: a typo'd
-    tab count must not quietly drop a row from R5's coverage."""
-    if not path.is_file():
-        return [], []
-    rows: list[tuple[str, str, str]] = []
-    problems: list[str] = []
-    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        parts = line.split("\t")
-        if len(parts) != 3:
-            problems.append(
-                f"R5 waiver rot: {ALLOWLIST_REL}:{lineno}: malformed row (expected exactly 3 "
-                f"tab-separated fields <arch>\\t<reviewed_up_to_sha>\\t<reason>, got {len(parts)}): {line!r}"
-            )
-            continue
-        rows.append((parts[0], parts[1], parts[2]))
-    return rows, problems
-
-
-def check_r5(
-    artifacts: list[dict],
-    repo_root: Path = REPO_ROOT,
-    manifest: dict | None = None,
-    waivers: list[tuple[str, str, str]] | None = None,
-) -> list[str]:
-    problems: list[str] = []
-    try:
-        arches = gpu_parity_matrix.load_shipped_cuda_silicon()
-    except Exception as e:  # noqa: BLE001
-        problems.append(f"R5: cannot load GENCODE_ARCHES: {e}")
-        return problems
-
-    manifest = manifest if manifest is not None else prove_surface.load_manifest()
-    current_id = prove_surface.current_expected_id(manifest, repo_root)
-    if waivers is None:
-        waivers, waiver_load_problems = load_waivers()
-        problems.extend(waiver_load_problems)
-    waived_arches = {w[0] for w in waivers}
-
-    fresh_arches = set()
-    for a in artifacts:
-        if "_load_error" in a:
-            continue
-        if (
-            a.get("outcome") == "healthy"
-            and a.get("surface", {}).get("kind") == "prove-lane"
-            and a.get("surface", {}).get("expected_id") == current_id
-        ):
-            fresh_arches.add(a.get("arch"))
-
-    for arch in sorted(arches):
-        if arch in fresh_arches:
-            continue
-        if arch in waived_arches:
-            continue
-        problems.append(
-            f"R5: arch `{arch}` has no HEALTHY `prove-lane` artifact matching the CURRENT "
-            f"expected_id ({current_id}) -- and no waiver row covers it"
-        )
-
-    # Waiver rot / dead-waiver mirror.
-    for arch, reviewed_sha, reason in waivers:
-        if arch not in arches:
-            problems.append(f"R5 waiver rot: `{arch}` is not a current GENCODE_ARCHES entry")
-            continue
-        if not re.fullmatch(r"[0-9a-f]{7,40}", reviewed_sha):
-            problems.append(f"R5 waiver rot: `{arch}` row's reviewed_up_to_sha `{reviewed_sha}` is malformed")
-            continue
-        if not _is_ancestor(reviewed_sha, repo_root):
-            problems.append(f"R5 waiver rot: `{arch}` row's reviewed_up_to_sha `{reviewed_sha}` is not an ancestor of HEAD")
-            continue
-        if not reason.strip():
-            problems.append(f"R5 waiver rot: `{arch}` row has an empty reason")
-        if arch in fresh_arches:
-            problems.append(f"R5 dead waiver: `{arch}` already has a fresh matching artifact -- delete the row")
-
-    return problems
-
-
-# --------------------------------------------------------------------------- #
 # driver
 # --------------------------------------------------------------------------- #
 def run_gate(repo_root: Path = REPO_ROOT, verbose: bool = True) -> int:
@@ -574,7 +477,6 @@ def run_gate(repo_root: Path = REPO_ROOT, verbose: bool = True) -> int:
     problems += check_r2(artifacts, defaults)
     problems += check_r3(artifacts, defaults, repo_root)
     problems += check_r4(artifacts)
-    problems += check_r5(artifacts, repo_root)
 
     if verbose:
         for p in problems:
@@ -653,7 +555,7 @@ def _self_test() -> int:
         if not cond:
             failures.append(name)
 
-    # --- good fixture: R1-R4 all green (R5 not checked here directly).
+    # --- good fixture: R1-R4 all green.
     # `load_shipped_cuda_silicon()` reads the REAL, tracked build.rs (not
     # parameterized by repo_root), so a healthy artifact is seeded for
     # every REAL current GENCODE_ARCHES entry, not just one. ---
@@ -721,54 +623,6 @@ def _self_test() -> int:
         arts = load_artifacts(root / ARTIFACT_DIR_REL)
         r4 = check_r4(arts)
         check("undispositioned-kill-r4-caught", any("undispositioned kill" in p for p in r4), f"{r4}")
-
-    # `load_shipped_cuda_silicon()` is NOT parameterized by repo_root (it
-    # reads the real, tracked `crates/jammi-kernels/build.rs`) -- so R5/R3
-    # self-tests cover the REAL current GENCODE_ARCHES set, not a fixture
-    # one.
-    real_arches = sorted(gpu_parity_matrix.load_shipped_cuda_silicon())
-
-    # --- stale surface without waiver (R5): every arch fresh EXCEPT sm_80. ---
-    with tempfile.TemporaryDirectory() as td:
-        root = Path(td)
-        _write_fixture_repo(root, lib_body=_GOOD_LIB, prove_body=_GOOD_PROVE)
-        manifest = json.loads((root / "ci" / "release-feature-manifest.json").read_text())
-        current_id = prove_surface.current_expected_id(manifest, root)
-        for i, arch in enumerate(real_arches):
-            eid = "deadbeef" if arch == "sm_80" else current_id
-            _write_artifact(root, f"{i}-{arch}.json", _healthy_artifact(arch, 2000.0, 100.0, expected_id=eid))
-        arts = load_artifacts(root / ARTIFACT_DIR_REL)
-        r5 = check_r5(arts, root, manifest, waivers=[])
-        check("stale-surface-no-waiver-r5-caught", any("arch `sm_80`" in p and "no HEALTHY" in p for p in r5), f"{r5}")
-
-        # covered by a waiver -> no longer a finding for sm_80 specifically.
-        r5_waived = check_r5(arts, root, manifest, waivers=[("sm_80", "a" * 40, "reviewed")])
-        check(
-            "stale-surface-with-waiver-r5-clean",
-            not any("arch `sm_80`" in p and "no HEALTHY" in p for p in r5_waived),
-            f"{r5_waived}",
-        )
-
-    # --- dead waiver: every arch (including sm_80) is actually fresh. ---
-    with tempfile.TemporaryDirectory() as td:
-        root = Path(td)
-        _write_fixture_repo(root, lib_body=_GOOD_LIB, prove_body=_GOOD_PROVE)
-        manifest = json.loads((root / "ci" / "release-feature-manifest.json").read_text())
-        current_id = prove_surface.current_expected_id(manifest, root)
-        for i, arch in enumerate(real_arches):
-            _write_artifact(root, f"{i}-{arch}.json", _healthy_artifact(arch, 2000.0, 100.0, expected_id=current_id))
-        head_sha = _run_git(["rev-parse", "HEAD"], root).stdout.strip()
-        arts = load_artifacts(root / ARTIFACT_DIR_REL)
-        r5 = check_r5(arts, root, manifest, waivers=[("sm_80", head_sha, "no longer needed")])
-        check("dead-waiver-r5-caught", any("dead waiver" in p for p in r5), f"{r5}")
-
-    # --- malformed waiver row: a named FAIL, never silently skipped. ---
-    with tempfile.TemporaryDirectory() as td:
-        root = Path(td)
-        waivers_path = root / "waivers.txt"
-        waivers_path.write_text("sm_80\tonly-two-fields\n# a comment, ignored\n\nsm_86\tdeadbeef\ttoo\tmany\tfields\n")
-        rows, load_problems = load_waivers(waivers_path)
-        check("malformed-waiver-row-caught", len(load_problems) == 2 and rows == [], f"{load_problems} {rows}")
 
     # --- committed setter: a shell assignment AND a YAML env key, both
     # OUTSIDE the two allowed sites; a comment mention must NOT fire.

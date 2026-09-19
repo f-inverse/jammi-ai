@@ -181,8 +181,7 @@ def feature_text(features: list[str]) -> str:
 def expected_id(surface: dict[str, dict[str, list[str]]]) -> str:
     """One canonicalization over `{crate: {kind: [features...]}}` -- used by
     the producer (`ci/scripts/perf/gpu_prove_timings.py`) to fingerprint
-    which surface a run actually proved, and by `check_gpu_prove_timings.py`
-    (R5) to demand a fresh artifact whenever the surface moves. Sorted keys
+    which surface a run actually proved. Sorted keys
     and sorted feature lists at every level -- key/list ORDER is never
     significant to the identity of a proof surface."""
     canon = {
@@ -283,7 +282,7 @@ def _self_test() -> int:
     )
 
     # expected_id is order-insensitive at every level and changes when the
-    # surface changes (the property R5 in check_gpu_prove_timings.py needs).
+    # surface changes.
     a = expected_id({"jammi-ai": {"test": ["cuda", "flash-attn"]}})
     b = expected_id({"jammi-ai": {"test": ["flash-attn", "cuda"]}})
     check("expected-id-order-insensitive", a == b, f"{a} != {b}")
@@ -301,12 +300,7 @@ def _self_test() -> int:
     pairs = declared_pairs(manifest)
     check(
         "declared-pairs-cover-manifest",
-        ("jammi-server", "release") in pairs
-        and ("jammi-server", "test") in pairs
-        and ("jammi-ai", "test") in pairs
-        and ("jammi-bench", "release") in pairs
-        and ("jammi-kernels", "default") in pairs
-        and ("jammi-kernels", "test") in pairs,
+        pairs == {(c, k) for c, spec in manifest["prove_lane"]["crates"].items() for k in spec["kinds"]},
         f"{sorted(pairs)}",
     )
 

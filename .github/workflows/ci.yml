@@ -546,12 +546,10 @@ jobs:
       # Same trap as the hermetic `test` job above and `dep-dag.yml`'s
       # freshness step: a container `run:` step's `git` is a different UID
       # than the checkout. This job's own it-suite shells out to `git
-      # ls-files` (`crates/jammi-db/tests/it/whose_fault_gate.rs`'s
-      # `tracked_rs_files`), which hits "fatal: detected dubious ownership"
+      # ls-files` (`crates/jammi-db/tests/it/terminality_source_gate.rs`'s
+      # `tracked_files`), which hits "fatal: detected dubious ownership"
       # (exit 128) without the safe.directory mark
-      # `./.github/actions/setup-rust-ci` sets once for every job (above) —
-      # measured against PR #521's CI run, where this job's whole
-      # `whose_fault_gate` suite failed at that one shared line.
+      # `./.github/actions/setup-rust-ci` sets once for every job (above).
 
       - name: Install and start nats-server (with JetStream)
         # GHA `services:` cannot override the upstream image's CMD to pass

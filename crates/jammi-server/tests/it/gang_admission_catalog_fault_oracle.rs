@@ -16,10 +16,9 @@
 //! false failure, and never "the whole `impl` block", which would let a
 //! genuine violation hide past `run_rank`'s own closing brace. Comments,
 //! doc comments, and string/char literals are masked to spaces first
-//! (`mask_non_code`, ported verbatim from
-//! `gang_rank_admission_oracle.rs`/`crates/jammi-db/tests/it/whose_fault_gate.rs`'s
-//! function of the same name) — this very file's own doc comments name both
-//! call-tokens, so an unmasked scan would self-hit.
+//! (`mask_non_code`, the same function as `gang_rank_admission_oracle.rs`'s)
+//! — this very file's own doc comments name both call-tokens, so an
+//! unmasked scan would self-hit.
 //!
 //! Two assertions over that ONE span: it must NOT contain
 //! `map_engine_error` as code (a plain substring check is deliberately
@@ -54,9 +53,8 @@ fn repo_root() -> PathBuf {
     )
 }
 
-/// Ported verbatim from `gang_rank_admission_oracle.rs`'s function of the
-/// same name (itself ported from `crates/jammi-db/tests/it/whose_fault_gate.rs`):
-/// replaces every line comment, block comment, string literal (plain and
+/// The same function as `gang_rank_admission_oracle.rs`'s: replaces every
+/// line comment, block comment, string literal (plain and
 /// raw), and char literal in `text` with spaces — same length, same
 /// newlines, so byte offsets computed against the masked text still index
 /// correctly into the ORIGINAL text.

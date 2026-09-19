@@ -69,4 +69,3 @@ mod trigger_jetstream;
 mod trigger_multi_replica_offsets;
 mod trigger_replay_column_types;
 mod trigger_replay_row_order;
-mod whose_fault_gate;

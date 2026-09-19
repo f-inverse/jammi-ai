@@ -10,15 +10,13 @@
 //!
 //! The scanned surface is derived from `git ls-files` (never a hand-rolled
 //! directory walk) over the whole tracked tree — `crates/**` and everything
-//! else — matching `crates/jammi-db/tests/it/whose_fault_gate.rs`'s own
-//! precedent for this shape of claim. A tracked file `git ls-files` reports
+//! else. A tracked file `git ls-files` reports
 //! that this process cannot then read is a hard failure naming the file.
 //!
 //! The detector is a substring match on the call-token (`name(`), but ONLY
 //! over CODE: every line comment, block comment, string literal (plain and
-//! raw), and char literal is masked to spaces first (`mask_non_code`,
-//! ported verbatim from `whose_fault_gate.rs`'s own function of the same
-//! name). This is load-bearing, not cosmetic — this very oracle file names
+//! raw), and char literal is masked to spaces first (`mask_non_code`). This
+//! is load-bearing, not cosmetic — this very oracle file names
 //! the call-token in its own doc comments, in its assert messages, and as a
 //! string-literal argument to `files_containing` itself; an unmasked
 //! substring scan would find those and self-hit, and the fix must never be
@@ -35,7 +33,8 @@
 //! end in the token, immediately followed by its own empty parameter
 //! list's `(`. `contains_code_token` closes that gap with an
 //! identifier-boundary check (the `boundary_ok` idiom
-//! `whose_fault_gate.rs`'s `find_fn_regions` already uses): a match is
+//! `crates/jammi-ai/tests/it/pinned_source_gate.rs`'s `find_fn_regions`
+//! uses): a match is
 //! only a hit if the byte immediately before it is not itself an
 //! identifier byte, which a real call site (`catalog.get_job_for_rank(`,
 //! preceded by `.`) always satisfies and a same-tokened longer identifier
@@ -75,10 +74,9 @@ fn git_ls_files(root: &Path) -> Vec<String> {
 
 /// Replace every line comment, block comment, string literal (plain and
 /// raw), and char literal in `text` with spaces — same length, same
-/// newlines, so line numbers still match the original file. Ported
-/// verbatim from `crates/jammi-db/tests/it/whose_fault_gate.rs`'s
-/// `mask_non_code` (same stated limit: a nested block comment's interior is
-/// treated as code — this surface has none, checked by the fact that the
+/// newlines, so line numbers still match the original file. Stated limit:
+/// a nested block comment's interior is treated as code (this surface has
+/// none, checked by the fact that the
 /// masking self-test below and the two oracle tests are both green).
 fn mask_non_code(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
@@ -214,8 +212,7 @@ fn mask_non_code(text: &str) -> String {
 }
 
 /// `true` for an ASCII identifier byte (`[A-Za-z0-9_]`) — this surface's
-/// identifiers are ASCII throughout, the same assumption
-/// `whose_fault_gate.rs`'s own `is_ident_byte` makes.
+/// identifiers are ASCII throughout.
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }

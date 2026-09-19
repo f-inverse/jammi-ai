@@ -125,3 +125,54 @@ pub async fn keeper_for_backend(
     .await
     .expect("the keeper connects within the lease window")
 }
+
+/// The environment variable a crash-recovery child test reads its artifact
+/// directory from.
+#[cfg(feature = "test-hooks")]
+pub const ARTIFACT_DIR_ENV: &str = "JAMMI_TEST_ARTIFACT_DIR";
+
+/// Runs child test `path` on artifact directory `dir` with the test-hook
+/// checkpoint variable `checkpoint.0` set to `checkpoint.1`, waits until the
+/// hook parks it, and `SIGKILL`s it.
+///
+/// The hook writes the ready file only from inside the checkpoint, so reaching
+/// the kill proves the child stopped exactly there, mid-transaction.
+///
+/// # Panics
+/// When the child exits, or does not park within 30 s.
+#[cfg(feature = "test-hooks")]
+pub async fn kill_child_at_checkpoint(path: &str, dir: &std::path::Path, checkpoint: (&str, &str)) {
+    use jammi_db::store::mutable::test_hook::READY_FILE_ENV;
+    use std::time::{Duration, Instant};
+
+    let ready_file = dir.join("ready");
+    let mut child = tokio::process::Command::from(jammi_test_resources::child_test(path))
+        .env(ARTIFACT_DIR_ENV, dir)
+        .env(READY_FILE_ENV, &ready_file)
+        .env(checkpoint.0, checkpoint.1)
+        .spawn()
+        .expect("spawn the child test process");
+
+    // 30 s covers a cold runner's first spawn; a warm one parks in well under a second.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !tokio::fs::try_exists(&ready_file)
+        .await
+        .expect("check for the ready file")
+    {
+        if let Some(status) = child.try_wait().expect("poll the child") {
+            panic!(
+                "{path} exited before its {} checkpoint: {status}",
+                checkpoint.1
+            );
+        }
+        if Instant::now() > deadline {
+            child.kill().await.expect("SIGKILL the stalled child");
+            panic!(
+                "{path} never reached its {} checkpoint within 30 s",
+                checkpoint.1
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    child.kill().await.expect("SIGKILL the parked child");
+}

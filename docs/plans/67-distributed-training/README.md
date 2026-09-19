@@ -95,7 +95,7 @@ those still in force are restated here in their v4 form. Principle in parenthese
     holder — it deliberately runs beside a loop-claimed job or an admitted rank, never excluded
     by either. No new worker state beyond the holder cell itself. (B1; OPS D6.)
 28. **Membership substrate is built by 67, used by both plans.** 68 DIST "unit 2" is a design
-    sketch (`docs/plans/68-compute-tier-substrate/units/DIST-DATA-PLANE.md#58-unit-2--membership-post-pr-c-designed-here-not-built-in-the-first-unit`),
+    sketch (`docs/plans/68-compute-tier-substrate/units/DIST-DATA-PLANE.md#58-membership`),
     not a plannable unit, so **U5b-1a** lands the
     substrate it sketches: `[server] peer_advertise` (the ONE choke point,
     `InstanceRegistration::from_config`: `peer_advertise ⇒ peer_bind`, named-key error

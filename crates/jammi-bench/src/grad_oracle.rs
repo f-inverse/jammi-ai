@@ -15,9 +15,10 @@
 //! `loss_final_ratio`, `torch_finetune_step.py`'s own module doc) is NOT a
 //! substitute, for two reasons that are structural, not incidental:
 //!
-//! 1. **The optimizer-update placement was off by one** (B1, now fixed —
-//!    see [`crate::finetune_step::run`]'s own doc) — but even fixed, the
-//!    trajectories diverge from step 0 for reason 2.
+//! 1. **The optimizer-update placement must match exactly** (see
+//!    [`crate::finetune_step::run`]'s own doc for the untimed pre-step
+//!    both stacks take) — but even matched, the trajectories diverge from
+//!    step 0 for reason 2.
 //! 2. **`--lora-init jammi` is DISTRIBUTION-matched, never BIT-matched**
 //!    (`torch_finetune_step.py`'s "LoRA INIT IS NOT A MATCH BY DEFAULT"
 //!    section): jammi draws `A` from a SplitMix64 stream keyed by
@@ -82,10 +83,9 @@
 //! shape `[rank, in_features]`, matching jammi's `lora_a` orientation
 //! exactly) and jammi's naming above, in BOTH directions — see
 //! `crates/jammi-bench/reference/torch_grad_oracle.py`'s own module doc
-//! for the exact table. **That script is UNTESTED in this round** — no
-//! `torch` install was available in this environment; see this crate's
-//! test-suite doc / the dispatch verdict for what WAS exercised
-//! (jammi-side unit tests only, CPU/F32, the tiny fixture).
+//! for the exact table and its own PROVENANCE banner for how far it has
+//! been exercised live. This crate's own tests exercise only the jammi
+//! side (CPU/F32, the tiny fixture).
 //!
 //! ## Structural limitation: a single fresh-init call tests ONLY `dL/dB`
 //!
@@ -109,9 +109,9 @@
 //! either a pass or a fail signal. Catching a real `dL/dA` defect needs AT
 //! LEAST one optimizer step first (moving `B` away from zero) — see "What
 //! this tier does NOT do" below for the N-step extension that would close
-//! this gap; not implemented this round.
+//! this gap.
 //!
-//! ## What this tier does NOT do (design, not shipped, this round)
+//! ## What this tier does NOT do
 //!
 //! Extending to N steps in TEACHER-FORCED form — after each step,
 //! overwrite one side's weights with the other's, so both always take the
@@ -121,8 +121,8 @@
 //! `--lora-weights-out` writing the POST-this-forward's weights are NOT
 //! written here since no optimizer step ran — a future step would need an
 //! `AdamW::new`+`.step()` call added and the updated `VarMap` re-dumped)
-//! so that extension is a thin wrapper around repeated single-step calls,
-//! not a rewrite. Not implemented this round.
+//! so that extension would be a thin wrapper around repeated single-step
+//! calls, not a rewrite. It is not implemented.
 //!
 //! ## Determinant table — every field either producer emits, classified
 //!
@@ -170,7 +170,7 @@
 //! | `trainable_tensor_count` | measurement (redundant with the tensor NAME SET, which `compare_reports`'s `only_in_a`/`only_in_b` already checks structurally) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `loss` / `gradients` / per-tensor `weight` | measurement — the oracle's actual output | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `ln`/`rope`/`softmax`/`geglu`/`lora_epilogue`/`lora_linear`/`attention_block` `_fused_dispatches`/`_eager_dispatches` (14 fields) | measurement (jammi-only; no torch equivalent — torch's analog is the `attn_requested`/`attn_implementation` provenance pair above) | `run()`'s dispatch-counter delta, mirroring `finetune_step.rs`'s own `*_dispatch_before`/`*_dispatch_after` snapshot pattern | n/a |
-//! | `kernels_disabled_requested`/`kernels_disabled_fired` | provenance — K-aux (`feat/kernels-admission-disable`) landed on `main` at `c0f0e98`; this tier now records the resolved `JAMMI_KERNELS_DISABLE` state unconditionally, mirroring `FinetuneStepTier`'s own pair exactly, but does NOT gate on `unmatched_disables()` the way `finetune_step.rs`'s `run()` does (that INVALID-run check is scoped to the forced-eager A/B use case this oracle's own CLI has no equivalent flag for) | `run()`'s report literal, via `jammi_kernels::admission::disabled_ops_requested`/`disabled_ops_fired` | n/a (torch has no equivalent env var) |
+//! | `kernels_disabled_requested`/`kernels_disabled_fired` | provenance — this tier records the resolved `JAMMI_KERNELS_DISABLE` state unconditionally, mirroring `FinetuneStepTier`'s own pair exactly, but does NOT gate on `unmatched_disables()` the way `finetune_step.rs`'s `run()` does (that INVALID-run check is scoped to the forced-eager A/B use case this oracle's own CLI has no equivalent flag for) | `run()`'s report literal, via `jammi_kernels::admission::disabled_ops_requested`/`disabled_ops_fired` | n/a (torch has no equivalent env var) |
 //! | `tool` | identity, but only for SAME-vs-DIFFERENT-producer detection, not compared as a normal identity field — `compare_grad_oracle.py`'s `_same_producer_violation` refuses when both dumps carry the SAME `tool` string (`compare a.json a.json`, or a jammi-vs-jammi mix-up), overridable via `--allow-same-producer` for a deliberate self-consistency check | `run()`'s report literal (`"jammi_grad_oracle"`) | `torch_grad_oracle.py`'s report literal (`"torch_grad_oracle"`) |
 //!
 //! `RUN_IDENTITY_FIELDS` in `compare_grad_oracle.py` is the tuple that
@@ -252,12 +252,9 @@ pub struct GradOracleReport {
     pub device_name: String,
     /// This binary's own baked `build_sha` (`report::Provenance::baked`),
     /// `None` when that resolved to the literal `"unknown"` — a COMPILE-time
-    /// value now (unification contract C2.4), never a run-time `git
-    /// rev-parse HEAD` (the deleted `tip_sha()` used to shell out to `git`
-    /// on every call; that read raced nothing and was itself correct, but
-    /// duplicated the exact same fact `build.rs` now bakes once for the
-    /// WHOLE binary, including the `-dirty` suffix `tip_sha()` never
-    /// carried). PROVENANCE, never compared (mirrors
+    /// value, never a run-time `git rev-parse HEAD` (`build.rs` bakes the
+    /// fact once for the WHOLE binary, including the `-dirty` suffix).
+    /// PROVENANCE, never compared (mirrors
     /// `torch_finetune_step.py`'s own `git_rev`, which stays a genuine
     /// run-time `git rev-parse HEAD` on the torch side — Python has no
     /// build-time baking step).
@@ -293,8 +290,8 @@ pub struct GradOracleReport {
     /// comparing gradients through DIFFERENT arithmetic at step zero (see
     /// this module's doc's determinant table for the `ZerosB` `dL/dA ==
     /// 0` degeneracy this field lets a reader rule out as the cause of an
-    /// unexpected `dL/dA` mismatch). K7-completeness (unification contract
-    /// C3.2): part of [`GradOracleReport::IDENTITY_FIELDS`].
+    /// unexpected `dL/dA` mismatch). Identity completeness: part of
+    /// [`GradOracleReport::IDENTITY_FIELDS`].
     pub lora_init: jammi_lora::LoraInitMode,
     pub lora_weights_in: Option<String>,
     pub lora_weights_out: Option<String>,
@@ -337,8 +334,8 @@ pub struct GradOracleReport {
     pub attention_block_fused_dispatches: u64,
     pub attention_block_eager_dispatches: u64,
     /// The `JAMMI_KERNELS_DISABLE` op keys this process REQUESTED (sorted,
-    /// empty when the env var was unset or empty) — K-aux lands on `main`
-    /// this round; mirrors `FinetuneStepTier::kernels_disabled_requested`
+    /// empty when the env var was unset or empty) — mirrors
+    /// `FinetuneStepTier::kernels_disabled_requested`
     /// exactly (`jammi_kernels::admission::disabled_ops_requested`).
     /// PROVENANCE (recorded, never compared cross-producer — torch has no
     /// equivalent env var).
@@ -348,7 +345,7 @@ pub struct GradOracleReport {
     /// `FinetuneStepTier::kernels_disabled_fired` exactly
     /// (`jammi_kernels::admission::disabled_ops_fired`). PROVENANCE. This
     /// tier does NOT gate on `jammi_kernels::admission::unmatched_disables`
-    /// the way `finetune_step.rs`'s `run()` does (contract K-aux's INVALID-run
+    /// the way `finetune_step.rs`'s `run()` does (that INVALID-run
     /// check is scoped to that tier's forced-eager A/B use case, which this
     /// oracle's own CLI has no equivalent flag for) — recorded unconditionally,
     /// same posture as the 14 dispatch counters above.
@@ -360,10 +357,10 @@ pub struct GradOracleReport {
 }
 
 impl GradOracleReport {
-    /// K7-completeness: the 11 `compare_grad_oracle.py::RUN_IDENTITY_FIELDS`
-    /// comparison entries (§2 C2; unification contract C4.1 — UNCHANGED,
-    /// growing THAT tuple would invalidate every existing comparison), plus
-    /// two K7-completeness additions the comparison tuple omits by design:
+    /// Identity completeness: the 11 `compare_grad_oracle.py::RUN_IDENTITY_FIELDS`
+    /// comparison entries (growing THAT tuple would invalidate every
+    /// existing comparison), plus two identity-completeness additions the
+    /// comparison tuple omits by design:
     /// `lora_init` (this tier's ONE hardcoded mode — see that field's own
     /// doc) and `device_name` (provenance, never compared cross-producer —
     /// this module's doc's determinant table). Unlike
@@ -371,11 +368,11 @@ impl GradOracleReport {
     /// [`crate::report::Report`] (it is its own standalone top-level JSON
     /// document, written straight to `--out`), so it has no
     /// `report.provenance` to fall back on for the report-level triple —
-    /// its own `git_rev` field (now sourced from the SAME baked
-    /// `build_sha` `Provenance::baked` computes, unification contract C2.4)
-    /// is its local provenance echo instead.
+    /// its own `git_rev` field (sourced from the SAME baked
+    /// `build_sha` `Provenance::baked` computes) is its local provenance
+    /// echo instead.
     ///
-    /// `ci/scripts/perf/test_identity_fields_subset.py` (contract C4.2)
+    /// `ci/scripts/perf/test_identity_fields_subset.py`
     /// asserts `RUN_IDENTITY_FIELDS` ⊆ this list;
     /// `grad_oracle_identity_fields_are_emitted` (below) asserts every
     /// field named here is actually present on a real, serialized report.
@@ -564,8 +561,8 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
     let lora_linear_fused_dispatch_after = jammi_lora::lora_linear_fused_dispatch_snapshot();
     let attention_block_dispatch_after = jammi_encoders::attention_block_dispatch_snapshot();
 
-    // The RESOLVED `JAMMI_KERNELS_DISABLE` state (contract K-aux, now on
-    // `main`) — see `GradOracleReport::kernels_disabled_requested`'s own
+    // The RESOLVED `JAMMI_KERNELS_DISABLE` state — see
+    // `GradOracleReport::kernels_disabled_requested`'s own
     // doc for why this tier records it unconditionally but does not gate
     // on `unmatched_disables()` the way `finetune_step.rs`'s `run()` does.
     let kernels_disabled_requested = jammi_kernels::admission::disabled_ops_requested();
@@ -669,8 +666,8 @@ pub fn run(params: &GradOracleParams) -> Result<GradOracleReport, Box<dyn std::e
         kernels_disabled_fired,
         gradients,
     };
-    // K7-completeness, enforced on every real run (unification contract
-    // C3.2) — see `crate::report::assert_identity_fields_present`'s own doc.
+    // Identity completeness, enforced on every real run — see
+    // `crate::report::assert_identity_fields_present`'s own doc.
     let value = serde_json::to_value(&report).expect("serialize GradOracleReport for self-check");
     crate::report::assert_identity_fields_present(&value, GradOracleReport::IDENTITY_FIELDS);
     Ok(report)
@@ -696,9 +693,8 @@ mod tests {
             // 3, deliberately NOT 2: `run()`'s batched arm computes the
             // negative group's row offset as `2 * b`. At `b == 2`,
             // `2 * b == 2 + b == 4` — a MUTATION of that `*` to `+` is
-            // undetectable by ANY test using `batch: 2` (cargo-mutants
-            // caught exactly this: `replace * with + in run` survived
-            // until this fixture moved off `b == 2`). `b == 3` makes
+            // undetectable by ANY test using `batch: 2` (the cargo-mutants
+            // mutant `replace * with + in run` survives there). `b == 3` makes
             // `2 * b = 6` and `2 + b = 5` diverge.
             batch: 3,
             seq: 8,
@@ -825,8 +821,7 @@ mod tests {
     /// though `B == 0` — `dL/dB` is proportional to `(A @ x)`, which
     /// changes with `A` — so it is both meaningful (catches a silently
     /// skipped/wrong-path `varmap.load`) and cheap (no optimizer step
-    /// needed to make it informative, unlike an earlier draft of this
-    /// test's docstring claimed).
+    /// needed to make it informative).
     #[test]
     fn grad_oracle_lora_weights_in_actually_overrides_the_fresh_init() {
         let dir = tempdir();
@@ -1049,14 +1044,12 @@ mod tests {
         dir
     }
 
-    /// Unification contract C3.2/C4.2: every field named in
+    /// Every field named in
     /// `GradOracleReport::IDENTITY_FIELDS` must actually be present, and
     /// non-null where declared `NonNull`, on a REAL report produced by
     /// `run()` (never a hand-built literal standing in for one — the same
     /// "measured, not transcribed" discipline `finetune_step_identity_
     /// fields_are_emitted` (`report.rs`) applies to `FinetuneStepTier`).
-    /// RED at base: `IDENTITY_FIELDS` does not exist on `main`, so this
-    /// fails to COMPILE, not merely to assert.
     #[test]
     fn grad_oracle_identity_fields_are_emitted() {
         let dir = tiny_model_dir();

@@ -1,4 +1,4 @@
-//! `--row-lengths` (contract v4 §1 item 1) through the REAL `jammi-bench
+//! `--row-lengths` through the REAL `jammi-bench
 //! finetune-step` CLI entry point — mirroring
 //! `finetune_step_kernel_disable.rs`'s own process-isolation discipline (a
 //! fresh child PROCESS per case, never `finetune_step::run` in-process,
@@ -10,8 +10,8 @@
 //! mask that does not mean what the caller intended) and one genuinely
 //! padded end-to-end run.
 //!
-//! CUDA-gated cases (item 2, the A5 padded-shape block-arm VRAM baseline
-//! leg, and item 3, the A3 padded loss-sequence flash-vs-block A/B) live in
+//! CUDA-gated cases (the padded-shape block-arm VRAM baseline leg, and the
+//! padded loss-sequence flash-vs-block A/B) live in
 //! `finetune_step_padded_cuda.rs`, next to this file, gated on
 //! [`cuda_available`] — the SAME `#[cfg(feature = "cuda")]` +
 //! `Device::new_cuda(0).is_ok()` shape `crates/jammi-ai/tests/gpu_capability/
@@ -98,9 +98,8 @@ fn row_lengths_rejects_a_count_that_does_not_match_batch() {
     );
 }
 
-/// A zero-length row must be refused (the B3-padded arm's own guard
-/// inventory: `total == 0` is a REFUSAL, never a silently-accepted empty
-/// row).
+/// A zero-length row must be refused (the padded arm's guards: `total ==
+/// 0` is a REFUSAL, never a silently-accepted empty row).
 #[test]
 fn row_lengths_rejects_a_zero_length_row() {
     let dir = model_dir();
@@ -170,7 +169,7 @@ fn row_lengths_padded_batch_runs_end_to_end_on_cpu_and_reports_itself_honestly()
     );
 }
 
-/// A4 (dense invariance), through the real CLI: omitting `--row-lengths`
+/// Dense invariance, through the real CLI: omitting `--row-lengths`
 /// entirely reports the dense-leg IDENTITY value `[seq; batch]` — here
 /// `[6, 6]` (`--batch 2 --seq 6`).
 #[test]

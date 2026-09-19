@@ -30,22 +30,21 @@ PACKAGE jammi.v1.eval
 # multi-host job's training set under that tenant alone (I-GANG).
 PACKAGE jammi.v1.gang
 PACKAGE jammi.v1.inference
-# ADDED (additive, minor-compatible, #485/#486): the durable job queue's own
+# ADDED (additive, minor-compatible): the durable job queue's own
 # envelope package (SubmitJob/JobStatus/WaitJob/ListJobs/CancelJob/
 # ListWorkers/PruneJobs). Imports the surviving `jammi.v1.training` spec
 # vocabulary (FineTuneSpec/GraphFineTuneSpec/ContextPredictorSpec/
 # FineTuneConfig) rather than duplicating it.
 PACKAGE jammi.v1.job
 PACKAGE jammi.v1.lifecycle
-# ADDED (additive, minor-compatible, #482): the engine-internal segment-search
+# ADDED (additive, minor-compatible): the engine-internal segment-search
 # seam between replicas. Served ONLY on the separate `[server] peer_bind`
 # listener — the public listener answers UNIMPLEMENTED for its rpcs — and
 # deliberately tenant-free (the coordinator enforces tenant scope; I-PEER).
 PACKAGE jammi.v1.peer
 PACKAGE jammi.v1.pipeline
-# The `TrainingService` rpc paths below are REMOVED (folded into
-# `jammi.v1.job.JobService` — see api-stability.md's amendment) but this
-# package name survives: it still carries the training spec message
+# `jammi.v1.training` serves no rpcs (training jobs submit through
+# `jammi.v1.job.JobService`): the package carries the training spec message
 # vocabulary (`FineTuneSpec`/`GraphFineTuneSpec`/`ContextPredictorSpec`/
 # `FineTuneConfig`/…) `JobService.SubmitJob`'s oneof imports.
 PACKAGE jammi.v1.training
@@ -87,7 +86,7 @@ RPC CatalogService/RemoveSource
 RPC CatalogService/SetTenant
 RPC CatalogService/Staleness
 RPC CatalogService/VerifyMaterialization
-# ADDED (additive, minor-compatible, #482): the incremental-embedding
+# ADDED (additive, minor-compatible): the incremental-embedding
 # actuators over a versioned embedding table — refresh only the changed rows,
 # compact the live rows, expire old versions.
 RPC EmbeddingService/CompactEmbeddings
@@ -107,11 +106,8 @@ RPC EvalService/EvalPerQuery
 RPC GangService/RunRank
 RPC InferenceService/Infer
 RPC InferenceService/Predict
-# ADDED (additive, minor-compatible, #485/#486): JobService replaces
-# TrainingService — StartTraining folds into SubmitJob, TrainingStatus into
-# JobStatus, ListTrainingJobs into ListJobs. WaitJob (resumable server-stream
-# wait), CancelJob, ListWorkers, and PruneJobs are new (Breaking: see
-# CHANGELOG and api-stability.md's amendment).
+# JobService — the durable job queue: SubmitJob, JobStatus, ListJobs,
+# WaitJob (resumable server-stream wait), CancelJob, ListWorkers, PruneJobs.
 RPC JobService/CancelJob
 RPC JobService/JobStatus
 RPC JobService/ListJobs
@@ -123,7 +119,7 @@ RPC LifecycleService/ApplyLicense
 RPC LifecycleService/Bootstrap
 RPC LifecycleService/Login
 RPC LifecycleService/Status
-# ADDED (additive, minor-compatible, #482): `PeerService` — served only on
+# ADDED (additive, minor-compatible): `PeerService` — served only on
 # `peer_bind`, never on the public listener.
 RPC PeerService/ExactRescore
 RPC PeerService/SegmentSearch

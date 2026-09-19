@@ -1,5 +1,5 @@
-//! Hermetic role-hosting oracle (contract `feat_500-wave4` §7 acceptance,
-//! one process, in-memory cluster): `host_scheduler` + `host_executor` come
+//! Hermetic role-hosting oracle (one process, in-memory cluster):
+//! `host_scheduler` + `host_executor` come
 //! up, `submit_physical_plan` of a shuffle-boundary plan returns rows equal
 //! to in-process execution, and `stop()` closes both ports within 5s.
 //!
@@ -155,8 +155,8 @@ async fn scheduler_and_executor_host_in_one_process_and_submit_round_trips() {
 
 #[tokio::test]
 async fn unset_ballista_config_hosts_no_roles() {
-    // The config-level property (contract §2.1): unset `[ballista]` = no
-    // roles = today's process. Exercised at the config layer (jammi-server's
+    // The config-level property: unset `[ballista]` = no roles = a plain
+    // jammi process. Exercised at the config layer (jammi-server's
     // `tests/it/ballista_roles.rs` hosts the full negative case against a
     // real `OssServer`); this crate's own oracle is that `hosts_scheduler`/
     // `hosts_executor` are false on the default config, so `OssServer::bind`

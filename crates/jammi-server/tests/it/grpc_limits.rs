@@ -393,7 +393,7 @@ async fn wait_job_with_no_timeout_header_is_bounded_by_the_configured_budget_as_
     );
 }
 
-/// K4: the SAME `max_message_bytes` bound refuses an oversize inbound
+/// The SAME `max_message_bytes` bound refuses an oversize inbound
 /// message identically on Flight SQL, not only on the `jammi.v1.*` gRPC
 /// plane -- both transports are constructed with the identical
 /// `.max_decoding_message_size(limits.max_message_bytes)` in

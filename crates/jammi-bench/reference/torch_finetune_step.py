@@ -68,16 +68,14 @@ two stacks — see `synthetic_ids` below, a literal LCG port of
 BOTH stacks discarding the same number of optimizer updates before recording
 starts: this script always runs one untimed `_step_once` pre-step before its
 `--warmup`/`--steps` loop (documented above), and `finetune_step.rs`'s own
-`run()` now does the identical untimed pre-step immediately before its own
+`run()` does the identical untimed pre-step immediately before its own
 timed loop — so both stacks' `losses[k]` is the loss after `warmup+k+1` total
-optimizer updates. (An earlier revision of `finetune_step.rs` had no such
-pre-step, so its `losses[k]` was the loss after only `warmup+k` updates —
-one update stale relative to this script, worst-case visible in
-`loss_first`: with `LoraInitMode::ZerosB` the LoRA delta is identically zero
-at construction, so the un-fixed `loss_first` was literally the PRISTINE,
-zero-optimizer-update loss while this script's `loss_first` was already one
-update in. `finetune_step.rs::tests::finetune_step_loss_first_is_the_post_pre_step_update`
-pins the fixed placement.) `--warmup` values that differ between the two
+optimizer updates. (Without the pre-step on one side, that side's
+`losses[k]` would be one update stale, worst-case visible in `loss_first`:
+with `LoraInitMode::ZerosB` the LoRA delta is identically zero at
+construction, so `loss_first` would be the PRISTINE, zero-optimizer-update
+loss. `finetune_step.rs::tests::finetune_step_loss_first_is_the_post_pre_step_update`
+pins the placement.) `--warmup` values that differ between the two
 runs break the index correspondence even with everything else matched,
 since each stack's `losses[0]` is anchored to its OWN `--warmup` value.
 Identical INPUT ids does NOT make the two stacks' loss VALUES a meaningful
@@ -121,7 +119,7 @@ they are properties of a torch/HF stack, not of jammi's own encoder:
   differ from the request — e.g. silently falling back to `eager` when
   `sdpa` isn't available for a given config/device), never echoed from
   `args`. Run both: `sdpa` is torch's best-case number (what the throughput
-  bar in #352 compares against); `eager` is the semantic twin of jammi's own
+  bar compares against); `eager` is the semantic twin of jammi's own
   attention composition (no fused SDPA kernel), so state which row a
   headline ratio uses. On `--attn sdpa` and CUDA, `finetune_step.sdpa_backend_probe`
   RECORDS (never assumes) which torch SDPA kernel a real forward at OUR
@@ -155,19 +153,17 @@ they are properties of a torch/HF stack, not of jammi's own encoder:
   needs one) — requesting it on CPU (including under `--dry-run`) is a hard
   error, never a silent relabel to a dtype that did not run.
 
-VRAM: two DIFFERENT fields, mapped to DIFFERENT jammi concepts, BOTH now
+VRAM: two DIFFERENT fields, mapped to DIFFERENT jammi concepts, BOTH
 backed by torch's own CONTINUOUS allocator high-water mark (not a discrete
-poll — an earlier draft of this script sampled `memory_allocated()` once per
-step, which was measured to land at the deterministic TROUGH of each step
-(after backward+step+the `.item()` sync, when every saved activation is
-already freed): 403 KiB captured of a 9087 KiB in-step peak, ~4.4%,
-systematically, on both measured steps. That per-step poll has been REMOVED;
-both VRAM fields below now come from one `torch.cuda.reset_peak_memory_stats()`
+poll — sampling `memory_allocated()` once per step was measured to land at
+the deterministic TROUGH of each step (after backward+step+the `.item()`
+sync, when every saved activation is already freed): 403 KiB captured of a
+9087 KiB in-step peak, ~4.4%, systematically, on both measured steps). Both
+VRAM fields below come from one `torch.cuda.reset_peak_memory_stats()`
 call made once, before the warmup+measured loop starts, and one
 `torch.cuda.max_memory_allocated()` read after it ends — a continuous
 high-water mark that cannot miss an intra-step spike the way a discrete poll
-(this script's old per-step read, or jammi's own 25ms `nvidia-smi` interval)
-can.
+(a per-step read, or jammi's own 25ms `nvidia-smi` interval) can.
 
 jammi's `peak_vram_bytes` is a whole-device `nvidia-smi` poll
 (`device_memory_used_bytes`, finetune_step.rs:225), sampled every 25ms
@@ -203,7 +199,7 @@ affected.)
   above, recorded separately as `peak_vram_baseline_bytes`).
   `peak_vram_delta_bytes = max_memory_allocated() - peak_vram_baseline_bytes`
   after the loop. RESIDUAL ASYMMETRY, stated rather than papered over: this
-  is now a CONTINUOUS allocator high-water mark; jammi's is a 25ms-interval
+  is a CONTINUOUS allocator high-water mark; jammi's is a 25ms-interval
   discrete poll. A continuous tracker cannot miss an intra-step spike a
   25ms poll can straddle — so `peak_vram_delta_bytes` may legitimately read
   HIGHER than jammi's `peak_vram_bytes` even when the underlying activation
@@ -256,12 +252,9 @@ forward risk to guard against on that version in the first place.
 Install: developed and exercised against (via `uv`, a fresh venv, CPU-only,
 `--dry-run`): `torch==2.13.0  transformers==5.15.1  peft==0.20.0`. Minimum
 `transformers>=4.48.0` is REQUIRED for `ModernBertConfig`/`ModernBertModel`
-to exist at all (ModernBERT landed in that release, 2025-01-10) — an earlier
-docstring in this file claimed `transformers==4.44.2` (2024-08-22) as the
-developed-against version, which predates ModernBERT and could not have
-exercised this script; that claim was false and has been corrected here to
-the versions actually run. No requirements-pinning file ships next to this
-script on purpose (B2: a pinning file here is something CI could pick up and
+to exist at all (ModernBERT landed in that release, 2025-01-10). No
+requirements-pinning file ships next to this
+script on purpose (a pinning file here is something CI could pick up and
 start enforcing against a crate that has no Python toolchain; the versions
 live in this docstring and in the README instead, and the `provenance` block
 below records the versions actually present at run time — that block is the
@@ -378,7 +371,7 @@ def validate_row_lengths(lengths, batch: int, seq: int) -> None:
     """Literal port of `finetune_step.rs::validate_row_lengths`: refuse a
     `--row-lengths` whose shape cannot describe a real right-padded
     `[batch, seq]` batch -- wrong element count, or any entry outside
-    `1..=seq` (`0` is a refusal in the B3-padded arm's own guard inventory;
+    `1..=seq` (`0` is refused: every row needs at least one real token;
     a length above `seq` cannot describe a real row of a `[batch, seq]`
     mask). Raises `ValueError`, mirroring the Rust side's typed refusal --
     never silently building a mask that does not mean what the caller
@@ -392,8 +385,8 @@ def validate_row_lengths(lengths, batch: int, seq: int) -> None:
     for row, length in enumerate(lengths):
         if length < 1 or length > seq:
             raise ValueError(
-                f"row {row}'s length {length} is outside 1..={seq} -- 0 is a refusal in the "
-                "B3-padded arm's own guard inventory (every row needs at least one real "
+                f"row {row}'s length {length} is outside 1..={seq} -- 0 is refused "
+                "(every row needs at least one real "
                 f"token), and a length above --seq {seq} cannot describe a real row of a "
                 "[batch, seq] mask"
             )
@@ -524,7 +517,7 @@ def provenance(device, fast_path_globals):
     return info
 
 
-# Unification contract C3.5 — this producer's own K7-completeness identity
+# This producer's own identity-completeness
 # list: the SAME shape `FinetuneStepTier::IDENTITY_FIELDS` /
 # `GradOracleReport::IDENTITY_FIELDS` carry on the Rust side
 # (`crates/jammi-bench/src/report.rs`, `grad_oracle.rs`), for THIS producer.
@@ -533,7 +526,7 @@ def provenance(device, fast_path_globals):
 # producer's own report actually uses (`report["args"][field]` for the three
 # named in `ab_merge.py`'s `_TORCH_ARGS_LEVEL_FIELDS`, `report["finetune_step"]
 # [field]` for the rest — see that module's own doc) — plus 14
-# K7-completeness additions this producer alone carries: five environment/
+# identity-completeness additions this producer alone carries: five environment/
 # version facts (`torch_version`, `torch_cuda_version`, `transformers_version`,
 # `peft_version`, `python_version`), the attention/compile/LoRA-init
 # determinants this producer's own `--attn`/`--lora-init` CLI flags resolve
@@ -544,7 +537,7 @@ def provenance(device, fast_path_globals):
 # `fast_path_globals`, `device_name`, `git_rev`.
 #
 # `provenance`'s own `if device.type == "cuda":` guard (immediately above)
-# governs THREE fields, not one — round-2 audit (B4) caught the other two:
+# governs THREE fields, not one:
 # `device_name` (:476, initialised `None`, filled only under that guard) and
 # `torch_cuda_version` (:471, `torch.version.cuda` — `None` on a CPU-only
 # torch build regardless of THIS run's `--cuda` flag, since it reflects how
@@ -553,7 +546,7 @@ def provenance(device, fast_path_globals):
 # means "this run had no CUDA device" / "this torch install has no CUDA
 # support", never "this producer predates the field".
 #
-# Round-3 audit (advisory 1): three MORE fields are independently nullable,
+# Three MORE fields are independently nullable,
 # each governed by its OWN separate guard (not the CUDA one above) — `git_rev`
 # (:441-452, `None` when `git` is not on `PATH`, this file is not inside a
 # git worktree, or the subprocess times out — mirrors `grad_oracle.rs`'s own
@@ -575,7 +568,7 @@ TORCH_IDENTITY_FIELDS = (
     "margin",
     "target_modules",
     "batched_forward",
-    # IDENTITY (contract v4 §1 item 1, K7 audit): always present, dense or
+    # IDENTITY: always present, dense or
     # padded -- see this producer's own `report["finetune_step"]["row_lengths"]`
     # emission site, and jammi's `FinetuneStepTier::row_lengths` doc for the
     # cross-producer meaning.
@@ -604,8 +597,8 @@ TORCH_IDENTITY_FIELDS = (
 # Field -> what a `null`/absent reading on THIS producer means. Every
 # `TORCH_IDENTITY_FIELDS` entry not listed here is `NonNull` (a null/absent
 # reading is itself a finding, mirroring the Rust `Nullable::NonNull` class).
-# Round-3 audit (advisory 1): `git_rev`/`transformers_version`/`peft_version`
-# joined the CUDA-guard trio below — each has its OWN independent reason to
+# `git_rev`/`transformers_version`/`peft_version` sit beside the CUDA-guard
+# trio below — each has its OWN independent reason to
 # read `null` (see the doc paragraph directly above `TORCH_IDENTITY_FIELDS`).
 TORCH_IDENTITY_FIELDS_NULL_MEANS = {
     "nvidia_driver_version": "no CUDA",
@@ -653,11 +646,11 @@ def checkpoint_identity(model_dir: str) -> dict:
     `model_dir/config.json` and `model_dir/model.safetensors`'s raw bytes,
     plus the weights file's byte length -- computed IDENTICALLY on both
     stacks (`finetune_step.rs`'s/`grad_oracle.rs`'s shared `sha256_and_len`,
-    this function's Rust counterpart). Round-4 audit fold-in on PR #372:
-    lives HERE (torch_finetune_step.py, the file both torch_grad_oracle.py
-    and this file's own `run()` share machinery through) rather than as a
-    second, independently-drifting copy in torch_grad_oracle.py — that
-    script's own `checkpoint_identity` name is now a thin alias for this
+    this function's Rust counterpart). Lives HERE (torch_finetune_step.py,
+    the file both torch_grad_oracle.py and this file's own `run()` share
+    machinery through) rather than as a second, independently-drifting copy
+    in torch_grad_oracle.py — that script's own `checkpoint_identity` name
+    is a thin alias for this
     function (see its own module doc).
 
     STREAMING (a bounded-size chunk buffer, never `fh.read()` of the whole
@@ -1124,9 +1117,8 @@ def run(args):
         # the exact bytes `load_model` just read -- `args.model_dir` is valid
         # here whether this run is a real `--model-dir` or a `--dry-run`
         # donor checkpoint (the `TemporaryDirectory` context is still open
-        # for the rest of this function's body). Round-4 audit fold-in on
-        # PR #372: the SAME determinant `grad_oracle.rs`'s tier already
-        # carries, now on THIS tier too.
+        # for the rest of this function's body). The SAME determinant
+        # `grad_oracle.rs`'s tier carries.
         checkpoint_identity_fields = checkpoint_identity(args.model_dir)
 
         model = wrap_lora(model, args)
@@ -1156,8 +1148,8 @@ def run(args):
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
         vocab = config.vocab_size
-        # `--row-lengths` (contract v4 §1 item 1): `None` is this script's
-        # ORIGINAL, unchanged dense behaviour (an all-ones mask); a supplied
+        # `--row-lengths`: `None` is this script's
+        # dense behaviour (an all-ones mask); a supplied
         # value is validated FIRST (mirrors finetune_step.rs's own
         # `run()`-top validation posture) and the mask is built FROM it
         # (`prefix_mask`), never derived separately, so the two can never
@@ -1267,9 +1259,8 @@ def run(args):
             "finetune_step": {
                 "device": str(device),
                 "backbone_dtype": args.dtype,
-                # Same placement as jammi's own FinetuneStepTier (round-4
-                # audit fold-in on PR #372) -- IDENTITY, see checkpoint_identity's
-                # own doc.
+                # Same placement as jammi's own FinetuneStepTier -- IDENTITY,
+                # see checkpoint_identity's own doc.
                 **checkpoint_identity_fields,
                 "attn_implementation": resolved_attn_implementation,
                 "sdpa_backend_probe": sdpa_backend_probe_result,
@@ -1285,11 +1276,11 @@ def run(args):
                     t.strip() for t in args.target_modules.split(",") if t.strip()
                 ],
                 "batched_forward": args.batched_forward,
-                # IDENTITY (contract v4 §1 item 1, K7 audit: identity_fields.py's
-                # FINETUNE_IDENTITY_FIELDS grows 17 -> 18 with this field): same
+                # IDENTITY (a member of identity_fields.py's
+                # FINETUNE_IDENTITY_FIELDS): same
                 # placement as jammi's own FinetuneStepTier::row_lengths -- see
                 # that field's own doc. DENSE-LEG VALUE (args.row_lengths is
-                # None, this script's ORIGINAL behaviour): `[seq] * batch`,
+                # None): `[seq] * batch`,
                 # matching jammi's own dense-leg convention exactly. NEVER
                 # null -- both producers always emit a concrete vector.
                 "row_lengths": args.row_lengths
@@ -1400,7 +1391,7 @@ def parse_args(argv=None):
         "--lora-rank",
         type=int,
         default=16,
-        help="Default 16 per the C8 contract's reference adapter shape — NOTE this "
+        help="Default 16, the reference adapter shape — NOTE this "
         "differs from jammi-bench's own CLI default of 8; pass --lora-rank to match "
         "whatever a specific jammi run used.",
     )
@@ -1408,7 +1399,7 @@ def parse_args(argv=None):
         "--lora-alpha",
         type=float,
         default=32.0,
-        help="Default 32 per the C8 contract (jammi-bench's own CLI default is 16).",
+        help="Default 32, the reference adapter shape (jammi-bench's own CLI default is 16).",
     )
     p.add_argument("--lora-dropout", type=float, default=0.05)
     p.add_argument(
@@ -1437,7 +1428,7 @@ def parse_args(argv=None):
         default="sdpa",
         help="Requested HF attention backend. The report's attn_implementation field "
         "is the RESOLVED value read back from the loaded model's own config, which "
-        "can differ from this request. sdpa is torch's best-case number (what a #352 "
+        "can differ from this request. sdpa is torch's best-case number (what a "
         "throughput ratio should compare jammi-fused against); eager is the semantic "
         "twin of jammi's own attention composition. Run both, state which is headline.",
     )
@@ -1464,8 +1455,7 @@ def parse_args(argv=None):
         help="torch.nn.utils.clip_grad_norm_'s max_norm, applied after backward and "
         "before the optimizer step (AMP: after scaler.unscale_). Mirrors jammi's own "
         "--max-grad-norm (crates/jammi-bench/src/main.rs), absent by default — omitting "
-        "this flag skips clipping entirely, bit-identical to this script's behaviour "
-        "before this flag existed. Must be finite and > 0.0 when supplied. "
+        "this flag skips clipping entirely. Must be finite and > 0.0 when supplied. "
         "max_grad_norm is a shared identity field (ci/scripts/perf/identity_fields.py's "
         "FINETUNE_IDENTITY_FIELDS), so ci/scripts/perf/ab_merge.py refuses an A/B row "
         "where the jammi and torch legs' values differ; a config run with jammi's own "
@@ -1478,7 +1468,7 @@ def parse_args(argv=None):
         default=None,
         help="Comma-separated per-row REAL (non-pad) lengths for a genuinely "
         "right-padded batch -- one int per row, --batch entries total, each in "
-        "1..=--seq. Omit for this script's ORIGINAL, unchanged dense behaviour "
+        "1..=--seq. Omit for this script's dense behaviour "
         "(an all-ones mask). row_lengths is a shared identity field "
         "(ci/scripts/perf/identity_fields.py's FINETUNE_IDENTITY_FIELDS): two "
         "legs differing here ran a different padding structure over the SAME "

@@ -10,8 +10,8 @@
 //! this suite never touches `cargo:rustc-env`/`cargo:rerun-if-changed`
 //! output or spawns `git`.
 //!
-//! Round-2 audit (B5): "`JAMMI_BUILD_SHA=deadbeef` ⇒ `unknown` (a build.rs
-//! unit case)" — `deadbeef_falls_through_shape_check` below is that case,
+//! "`JAMMI_BUILD_SHA=deadbeef` ⇒ `unknown`" as a build.rs unit case —
+//! `deadbeef_falls_through_shape_check` below is that case,
 //! isolated to the ONE function (`is_40_lowercase_hex`) whose shape check is
 //! what actually rejects it, so this suite stays a true unit test rather
 //! than needing a real subprocess build (that end-to-end shape — "fresh
@@ -40,11 +40,9 @@ fn is_40_lowercase_hex_accepts_only_the_exact_shape() {
     assert!(!is_40_lowercase_hex(""), "empty rejected");
 }
 
-/// Contract §6 F3's second half, as a unit case: `deadbeef` is 8 characters
-/// — it fails `is_40_lowercase_hex`'s LENGTH check, the exact function
-/// `build.rs::main` calls before ever falling through to `git`. RED at base
-/// (before this suite existed): nothing in the tree checked this shape at
-/// all.
+/// `deadbeef` is 8 characters — it fails `is_40_lowercase_hex`'s LENGTH
+/// check, the exact function `build.rs::main` calls before ever falling
+/// through to `git`.
 #[test]
 fn deadbeef_falls_through_shape_check() {
     assert!(

@@ -10,7 +10,7 @@ import "google/protobuf/empty.proto";
 // imperative session methods — signing, tenant-injection, and signature
 // verification are non-SQL logic — so they live as typed gRPC RPCs alongside
 // the other engine-backed services rather than on the Flight SQL surface
-// (query/result only, per ADR-01 §3.2). The verbs name a substrate primitive —
+// (query/result only). The verbs name a substrate primitive —
 // a signed per-query audit log — and carry no tenant-domain concept.
 //
 // Each verb delegates 1:1 to the consumer-facing `Session` abstraction

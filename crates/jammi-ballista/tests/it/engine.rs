@@ -1,5 +1,5 @@
-//! `JammiExecutionEngine` K7 device-kind refusal (contract `feat_500-wave4`
-//! §9 B3).
+//! `JammiExecutionEngine`'s per-stage refusals: device-kind mismatch and a
+//! multi-partition gang stage.
 
 use std::sync::Arc;
 
@@ -74,16 +74,16 @@ async fn refuses_a_stage_whose_inference_exec_names_a_different_device_kind() {
         .expect_err("a device-kind mismatch must be refused, never silently run");
     let msg = err.to_string();
     assert!(
-        msg.contains("K7"),
+        msg.contains("requires device_kind"),
         "the refusal must name the property: {msg}"
     );
     assert!(msg.contains("Cuda") && msg.contains("Cpu"), "{msg}");
 }
 
 /// The matching-kind arm: a descriptor whose kind agrees with the executor's
-/// own device is NOT refused by the K7 check (it proceeds to
+/// own device is NOT refused by the device-kind check (it proceeds to
 /// `DefaultExecutionEngine`, which then fails for an unrelated reason — no
-/// real `ShuffleWriterExec` wraps this plan — proving the K7 gate itself let
+/// real `ShuffleWriterExec` wraps this plan — proving the device-kind gate itself let
 /// it through rather than raising a false positive).
 #[tokio::test]
 async fn does_not_refuse_a_matching_device_kind() {
@@ -118,12 +118,12 @@ async fn does_not_refuse_a_matching_device_kind() {
             "this plan is not shuffle-writer-rooted, so DefaultExecutionEngine itself errors",
         );
     assert!(
-        !err.to_string().contains("K7"),
-        "a matching device kind must not be refused by the K7 gate: {err}"
+        !err.to_string().contains("requires device_kind"),
+        "a matching device kind must not be refused by the device-kind gate: {err}"
     );
 }
 
-/// LANE pressure-round correction: K7 also covers `GangExec` — its
+/// The device-kind check also covers `GangExec` — its
 /// descriptor's own stamped `device_kind` is compared against this
 /// executor's kind the same way `InferenceExec`'s is. The test session's
 /// default device is CPU, so a descriptor explicitly stamped `Cuda`
@@ -158,13 +158,13 @@ async fn refuses_a_gang_exec_stage_whose_descriptor_names_a_different_device_kin
         .expect_err("a device-kind mismatch on a GangExec must be refused, never silently run");
     let msg = err.to_string();
     assert!(
-        msg.contains("K7"),
+        msg.contains("requires device_kind"),
         "the refusal must name the property: {msg}"
     );
     assert!(msg.contains("Cuda") && msg.contains("Cpu"), "{msg}");
 }
 
-/// README r41 (contract §2.2/§9): a stage plan wrapping a `GangExec` under a
+/// A stage plan wrapping a `GangExec` under a
 /// MULTI-partition node is refused typed — one gang mechanism, never a
 /// multi-partition fan-out of the coordinator body. Two `GangExec` leaves
 /// under a `UnionExec` (partition count 2, `GangExec` itself is always

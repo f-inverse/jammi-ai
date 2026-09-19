@@ -62,7 +62,7 @@ test-hooks = ["jammi-ai/test-hooks", "jammi-db/test-hooks"]
 # harness session, which needs the candle-backed local inference backend —
 # mirrors jammi-ai's own `live-distributed-tests` feature
 # (`crates/jammi-ai/Cargo.toml`). No cargo feature gates the crate's own
-# code — roles are config-shaped (B4) — this feature gates the test target
+# code — roles are config-shaped — this feature gates the test target
 # only.
 live-distributed-tests = ["jammi-ai/local", "jammi-db/storage-s3"]
 # Compiles the tests that need a live Postgres at JAMMI_TEST_PG_URL.

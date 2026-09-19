@@ -9,8 +9,8 @@ repository.workspace = true
 publish = false
 # Bakes this binary's build-time identity (`JAMMI_BUILD_SHA`/`JAMMI_BUILD_TARGET`/
 # `JAMMI_BUILD_PROFILE`) into compile-time env vars `report::Provenance::baked`
-# reads back with `env!()` — never at run time (unification contract C1; see
-# `build.rs`'s own module doc).
+# reads back with `env!()` — never at run time (see `build.rs`'s own module
+# doc).
 build = "build.rs"
 
 [[bin]]
@@ -33,7 +33,7 @@ jammi-encoders.workspace = true
 # `jammi_kernels::admission::unmatched_disables()` directly — Rust does not
 # let a crate name a transitive dependency's items without its own
 # `[dependencies]` entry, even when that dependency is already linked in via
-# another direct dependency's public API (contract K-aux).
+# another direct dependency's public API.
 jammi-kernels.workspace = true
 candle-core.workspace = true
 candle-nn.workspace = true

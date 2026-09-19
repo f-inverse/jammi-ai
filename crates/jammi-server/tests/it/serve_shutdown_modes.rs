@@ -1,4 +1,4 @@
-//! OPS (#482): the two shutdown modes on the SERVER — `BoundServer::
+//! The two shutdown modes on the SERVER — `BoundServer::
 //! serve_with_signals` driven by the drain / release watches (the exact
 //! coupling the OS-signal watcher uses), plus the `jammi-server release`
 //! subcommand against a real child process.
@@ -84,7 +84,7 @@ struct Served {
     /// both the guard and the loop task itself), so this stays upgradable
     /// for as long as `task` has not returned, letting a test observe
     /// [`jammi_ai::fine_tune::worker::LoopState`] directly rather than
-    /// inferring it from elapsed wall-clock time (O1). `None` when the
+    /// inferring it from elapsed wall-clock time. `None` when the
     /// fixture disabled the worker.
     worker_shared: Option<Weak<jammi_ai::fine_tune::worker::WorkerShared>>,
     flight_addr: std::net::SocketAddr,
@@ -110,14 +110,13 @@ impl Served {
 
     /// Poll-until-predicate (never a blind sleep) for the loop task's OWN
     /// reported [`LoopState`](jammi_ai::fine_tune::worker::LoopState) to
-    /// leave `Running` — O1's mechanism assertion: the loop task's actual
+    /// leave `Running` — the mechanism assertion: the loop task's actual
     /// termination, not merely that some bounded amount of wall-clock time
     /// has passed (a skipped-abort defect and a real abort both satisfy a
     /// wall-clock bound when the timeout backstop is one heartbeat; only
     /// the mechanism distinguishes them). Panics with the observed state
-    /// (or "no worker") if `bound` elapses first — the RED signal at base,
-    /// where the loop never leaves `Running` because nothing ever aborts
-    /// it.
+    /// (or "no worker") if `bound` elapses first — the failure signal when
+    /// nothing ever aborts the loop, so it never leaves `Running`.
     async fn wait_loop_state_left_running(
         &self,
         bound: Duration,
@@ -378,11 +377,11 @@ async fn stream_terminal(
 // DRAIN
 // ---------------------------------------------------------------------------
 
-/// Acceptance 1: worker mid-job + DRAIN → the job lands `completed` under
+/// Worker mid-job + DRAIN → the job lands `completed` under
 /// the draining instance, attempt 1, with adapter bytes byte-identical to an
 /// uninterrupted run; the serve task returns `Drained { worker_joined: true }`.
-/// Base: the chain dropped the worker guard (abort) when serve returned and
-/// the row was left `running`.
+/// (Dropping the worker guard when serve returns would abort the job and
+/// leave the row `running`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sigterm_drains_the_in_flight_job_and_exits_drained() {
     // The uninterrupted control run.
@@ -488,9 +487,9 @@ async fn worker_does_not_stop_before_drain_is_signalled() {
     ));
 }
 
-/// Acceptance 5: an idle `Subscribe` stream is ended by the DRAIN with
-/// `UNAVAILABLE` "server draining" within 5 s (base: the stream holds the
-/// drain open forever) and the refusal is counted under `reason="draining"`.
+/// An idle `Subscribe` stream is ended by the DRAIN with
+/// `UNAVAILABLE` "server draining" within 5 s (never holding the drain open
+/// forever) and the refusal is counted under `reason="draining"`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_subscribe_stream_ends_with_unavailable_draining_on_sigterm() {
     let dir = TempDir::new().unwrap();
@@ -565,11 +564,11 @@ async fn drain_runs_rpc_drain_and_worker_join_concurrently() {
 // RELEASE
 // ---------------------------------------------------------------------------
 
-/// Acceptance 2: a second signal while draining releases within two
+/// A second signal while draining releases within two
 /// heartbeats — the row `running`/lease NULL/`releases 1` — and a fresh
 /// process's `reclaim + claim_next` claims it at once with `attempts 2`.
 ///
-/// R5 (round-2 REFINE, #482): O1 is made DETERMINISTIC by parking the loop
+/// The mechanism assertion is made DETERMINISTIC by parking the loop
 /// at `ParkPoint::BeforeHold` (the claim→hold prologue, after the claim's
 /// own COMMIT, before the hold is registered) instead of racing a wall
 /// clock against a real training run. Parked there, the loop cannot bail
@@ -579,21 +578,16 @@ async fn drain_runs_rpc_drain_and_worker_join_concurrently() {
 /// and suspends on the parked loop's own terminal state; when RELEASE
 /// preempts it, `tokio::select!` drops that suspended future, and
 /// `TakenHandle::drop` restores the handle as `LoopTask::Abandoned` rather
-/// than losing it to a bare detach (the F1 defect this state type closes);
-/// `release_and_stop`'s 2e then finds `Abandoned`, `taken.reclaimed()` is
-/// true, and aborts it unconditionally. Base (`cbd427b4`, prior to the
-/// state-type fix): the same preemption instead loses the handle to a bare
-/// `Option::take()` cancelled mid-await, so 2e's `if let Some(handle) =
-/// self.take_handle()` finds `None` and skips its abort arm entirely — the
-/// parked loop then runs on forever, detached, and its own `LoopState`
-/// never leaves `Running` until this test's bound times out. (The prior
-/// version of this oracle raced a real 20 000-epoch trainer against a
-/// 300 ms `DRAIN`→`RELEASE` gap instead of a park, and — because the
-/// trainer CAN legitimately bail cooperatively at its next epoch boundary
-/// once 2b's keeper pass flips its hold `lost` before any abort lands —
-/// flaked once in 33 paired runs asserting `Aborted` when the relay's own
-/// recorded base run observed `Stopped`; that recorded run is what the
-/// comment above described, not a fabricated narrative.)
+/// than losing it to a bare detach; `release_and_stop`'s 2e then finds
+/// `Abandoned`, `taken.reclaimed()` is true, and aborts it unconditionally.
+/// Were the handle a bare `Option::take()` cancelled mid-await, 2e's
+/// `if let Some(handle) = self.take_handle()` would find `None` and skip its
+/// abort arm entirely — the parked loop would run on forever, detached, and
+/// its own `LoopState` would never leave `Running` until this test's bound
+/// times out. A real trainer instead of the park would make the oracle
+/// racy: the trainer CAN legitimately bail cooperatively at its next epoch
+/// boundary once 2b's keeper pass flips its hold `lost` before any abort
+/// lands, reporting `Stopped` instead of `Aborted`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sigint_while_draining_releases_and_returns_released_within_two_heartbeats() {
     let dir = TempDir::new().unwrap();
@@ -622,12 +616,12 @@ async fn sigint_while_draining_releases_and_returns_released_within_two_heartbea
     served.drain();
     // Lets DRAIN's `gated_join` actually reach and suspend inside
     // `stop_and_join`'s `state_rx.wait_for(..)` before RELEASE preempts it
-    // — the exact SIGTERM-then-SIGINT hazard F1 names.
+    // — the exact SIGTERM-then-SIGINT hazard `TakenHandle` exists for.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let released_at = tokio::time::Instant::now();
     served.release();
 
-    // O1's mechanism assertion: the loop task's OWN reported termination,
+    // The mechanism assertion: the loop task's OWN reported termination,
     // never elapsed wall-clock time alone.
     let loop_state = served
         .wait_loop_state_left_running(Duration::from_secs(FAST_TIMING.heartbeat + 3))
@@ -817,7 +811,7 @@ async fn released_server_never_finalizes_the_aborted_job() {
     );
 }
 
-/// D3: the worker guard is hoisted onto `BoundServer` when `[worker]
+/// The worker guard is hoisted onto `BoundServer` when `[worker]
 /// enabled`, absent otherwise.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bound_server_holds_the_worker_guard_when_worker_enabled() {
@@ -847,7 +841,7 @@ async fn bound_server_holds_the_worker_guard_when_worker_enabled() {
     }
 }
 
-/// Acceptance 9 / K4: `ListWorkers` shows `state` equal to the row, and this
+/// Parity: `ListWorkers` shows `state` equal to the row, and this
 /// process's transitions arrive in order — `claiming` while the loop is
 /// live, `draining` once a DRAIN begins with a job in flight — and the row
 /// is gone after the release.
@@ -898,7 +892,7 @@ async fn list_workers_reports_state_over_the_wire() {
             let wire = wire_state(served.flight_addr).await?;
             let row = row_state(&served.session).await;
             if wire.as_deref() == Some(want) {
-                assert_eq!(wire, row, "K4: the wire state equals the row");
+                assert_eq!(wire, row, "parity: the wire state equals the row");
                 return Ok(());
             }
             assert!(
@@ -930,9 +924,9 @@ async fn list_workers_reports_state_over_the_wire() {
     )
     .await;
     served.drain();
-    // DRAIN closes the gRPC listener (tonic's graceful shutdown; D12), so a
+    // DRAIN closes the gRPC listener (tonic's graceful shutdown), so a
     // fresh connection can never read `draining` over the wire — the row is
-    // the truth another process reads (B4), and it is observed here.
+    // the truth another process reads, and it is observed here.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let row = row_state(&served.session).await;
@@ -968,7 +962,7 @@ async fn list_workers_reports_state_over_the_wire() {
 
 const BIN: &str = env!("CARGO_BIN_EXE_jammi-server");
 
-/// Acceptance 10: a real child `jammi-server` (fast lease) with a long job
+/// A real child `jammi-server` (fast lease) with a long job
 /// running; SIGTERM (DRAIN) then `jammi-server release --pid <child>` sends
 /// SIGINT; the child exits 0 within two heartbeats and its row reads
 /// `running`/lease NULL/`releases 1`.
@@ -1326,8 +1320,8 @@ async fn traffic_then_drain_wall_clock(cfg: JammiConfig) -> (Duration, ShutdownO
 /// returns park at once there (the `draining` upsert and the `workers`
 /// delete, milliseconds apart) and whether the single-pass barrier's last
 /// sweep runs before or between their landings is the scheduler's call
-/// (measured: two of four base runs passed), so that arm could not be a
-/// RED oracle; the idle SQLite arm above and
+/// (measured: two of four runs passed), so that arm cannot be a
+/// reliable oracle; the idle SQLite arm above and
 /// `jammi_db::catalog::backend::close_barrier_tests` cover the backend.
 /// Runs against the live Postgres at `JAMMI_TEST_PG_URL`.
 #[cfg(feature = "live-postgres-tests")]

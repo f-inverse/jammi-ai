@@ -10,8 +10,8 @@ import "jammi/v1/embedding.proto";
 // catalog / metadata / lifecycle / observability RPC a remote client reaches.
 // The verbs are imperative session methods (registry reads + lifecycle
 // mutations), not SQL queries, so they live as typed gRPC RPCs distinct from
-// the Flight SQL data-plane (which carries query/result only, per ADR-01
-// §3.2) and the compute/stream data-plane services (embedding / inference /
+// the Flight SQL data-plane (which carries query/result only) and the
+// compute/stream data-plane services (embedding / inference /
 // training / eval / pipeline / trigger / audit).
 //
 // Each verb delegates 1:1 to the consumer-facing `Session`
@@ -439,7 +439,7 @@ message VerifyMaterializationResponse {
     Mismatch mismatch = 2;
     // The artifact verifies, but at least one input was unpinned.
     MatchWithUnpinnedInputs match_with_unpinned_inputs = 3;
-    // No manifest exists for the table (a pre-contract table).
+    // No manifest exists for the table.
     MissingManifest missing_manifest = 4;
   }
 
@@ -501,7 +501,7 @@ message StalenessResponse {
     // Cannot be confidently asserted: one or more inputs have no reproducible
     // current anchor. Any confidently-decided reasons are still reported.
     Undecidable undecidable = 3;
-    // No recorded definition (a pre-contract table) — a truthful unknown.
+    // No recorded definition (the table has no manifest) — a truthful unknown.
     MissingManifest missing_manifest = 4;
   }
 

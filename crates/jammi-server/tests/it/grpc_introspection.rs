@@ -403,7 +403,7 @@ async fn remote_server_info_like_local() {
         "this fixture mounts no trigger, so the event tier is absent"
     );
 
-    // K4: embedded and remote report the IDENTICAL runtime broker fact — the
+    // Embedded and remote report the IDENTICAL runtime broker fact — the
     // test fixture's config defaults to the in-process broker.
     assert_eq!(
         local_info.broker, remote_info.broker,
@@ -418,7 +418,7 @@ async fn remote_server_info_like_local() {
     let _ = server.handle.await;
 }
 
-/// K4, non-default arm: `remote_server_info_like_local` above only exercises
+/// Parity, non-default arm: `remote_server_info_like_local` above only exercises
 /// this fixture's config DEFAULT (`in_memory`) -- a bug that special-cased
 /// the default kind (or a `ServerInfo.broker` wiring that silently ignored
 /// the config and always reported `in_memory`) would still pass it. Here the

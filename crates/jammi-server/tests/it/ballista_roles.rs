@@ -1,4 +1,4 @@
-//! `[ballista]` role hosting on `OssServer` (contract `feat_500-wave4` §7):
+//! `[ballista]` role hosting on `OssServer`:
 //! unset = no Ballista listener; set = both roles bind, the executor
 //! registers, and DRAIN stops both roles within the grace.
 
@@ -60,7 +60,8 @@ async fn ballista_roles_bind_executor_registers_and_drain_stops_both() {
     assert_ne!(grpc_addr.port(), 0);
 
     // Registration is not independently observable over gRPC with
-    // `ballista-scheduler`'s `rest-api` off (by design — A10/README r43); a
+    // `ballista-scheduler`'s `rest-api` off (by design: it errors on a
+    // restarted scheduler's graph-less status rows); a
     // successful bind is this oracle's determinant, matching
     // `jammi-ballista`'s own hermetic `roles::scheduler_and_executor_host_
     // in_one_process_and_submit_round_trips`, which exercises the stronger

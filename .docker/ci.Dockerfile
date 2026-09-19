@@ -9,10 +9,10 @@ ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
 # Platform SQLite runtime (`/lib64/libsqlite3.so.0`). The foreign-SQLite-library
-# harness (`crates/jammi-db/tests/it/esc_073_foreign_sqlite_library.rs`) `dlopen`s it to
+# harness (`crates/jammi-db/tests/it/sqlite_foreign_library.rs`) `dlopen`s it to
 # get a SECOND SQLite library instance in one process alongside the statically
 # bundled `libsqlite3-sys`; with no platform library the harness has nothing to
-# collide with and reports itself vacuous. The base image happens to carry
+# collide with and fails naming it. The base image happens to carry
 # `sqlite-libs` today, but NO package in it requires that package, so a base
 # rebuild could drop it and silently hollow out the harness. Named explicitly
 # here instead of inherited by luck (a no-op when already present).

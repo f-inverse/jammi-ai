@@ -369,8 +369,7 @@ async fn submit_and_await_placed_claim(
     source: &str,
     size: JobSize,
 ) -> (Fleet, String, String, String) {
-    let (specs, scheduler_port) = standard_fleet_specs();
-    let _ = scheduler_port;
+    let (specs, _) = standard_fleet_specs();
     let mut fleet = Fleet::spawn(backends, result_root, specs);
     await_fleet_registered(
         session,
@@ -818,8 +817,7 @@ async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
         .await;
         match attempt {
             Ok(Ok(stream)) => break stream,
-            Ok(Err(e)) if std::time::Instant::now() < submit_deadline => {
-                let _ = e;
+            Ok(Err(_)) if std::time::Instant::now() < submit_deadline => {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
             }

@@ -61,10 +61,7 @@ import argparse
 import hashlib
 import json
 import os
-import socket
-import subprocess
 import tempfile
-import time
 from pathlib import Path
 
 import jammi
@@ -72,6 +69,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
+from jammi_cookbook.live_server import LiveServer
 
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "lifecycle"
 
@@ -245,59 +243,6 @@ def _parity(name: str, embedded, remote) -> dict:
 # --------------------------------------------------------------------------- #
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-class LiveServer:
-    """A real CPU `jammi-server` on a free port, readiness-polled via a client
-    handshake, torn down on exit — the same shape the engine's conftest uses."""
-
-    def __init__(self, server_bin: str):
-        self.server_bin = server_bin
-        self.proc = None
-        self.endpoint = None
-        self._artifact_dir = None
-
-    def __enter__(self) -> str:
-        self._artifact_dir = tempfile.mkdtemp(prefix="jammi_srv_lifecycle_")
-        flight_port = _free_port()
-        health_port = _free_port()
-        env = dict(os.environ)
-        env["JAMMI_ARTIFACT_DIR"] = self._artifact_dir
-        env["JAMMI_SERVER__FLIGHT_LISTEN"] = f"127.0.0.1:{flight_port}"
-        env["JAMMI_SERVER__HEALTH_LISTEN"] = f"127.0.0.1:{health_port}"
-        env["JAMMI_SERVER__SERVICES"] = "all"
-        self.proc = subprocess.Popen(
-            [self.server_bin], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-        )
-        self.endpoint = f"grpc://127.0.0.1:{flight_port}"
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            if self.proc.poll() is not None:
-                out = self.proc.stdout.read().decode(errors="replace") if self.proc.stdout else ""
-                raise RuntimeError(f"jammi-server exited early:\n{out}")
-            try:
-                handshake = jammi.connect(self.endpoint)
-                handshake.get_server_info()
-                handshake.close()
-                return self.endpoint
-            except Exception:
-                time.sleep(0.25)
-        self.proc.terminate()
-        raise RuntimeError("jammi-server did not become ready within 30s")
-
-    def __exit__(self, *exc):
-        if self.proc is not None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-
-
 # --------------------------------------------------------------------------- #
 # Emit
 # --------------------------------------------------------------------------- #
@@ -362,7 +307,11 @@ def emit(fixtures_root: Path, server_bin: str) -> None:
             embedded_matrix = run_catalog(embedded, corpus_path, base_model, tag="emb")
 
         # --- remote transport (live grpc:// parity) ------------------------- #
-        with LiveServer(server_bin) as endpoint:
+        with (
+            tempfile.TemporaryDirectory(prefix="jammi_srv_lifecycle_") as server_dir,
+            LiveServer(server_dir, server_bin=server_bin) as server,
+        ):
+            endpoint = server.endpoint
             print(f"== remote engine up at {endpoint} ==", flush=True)
             remote = jammi.connect(endpoint)
             try:

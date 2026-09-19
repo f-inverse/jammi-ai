@@ -14,7 +14,7 @@
 //!      `formula()` below cannot import `apply()` and is NOT a call into
 //!      it — it is an independently-written reproduction of the SAME
 //!      MATH, updated by hand whenever `apply()`'s own rounding placement
-//!      changes (as it did in this same PR), which makes a diff that
+//!      changes, which makes a diff that
 //!      changes both `apply()` and `formula()` together structurally
 //!      unable to prove anything about `apply()`'s OWN correctness — only
 //!      that this file's copy of the math agrees with the fused kernel.
@@ -31,7 +31,7 @@
 //!      confirms it; the crate's derive-the-tolerance doctrine means a
 //!      tolerance is stated only where the model predicts real
 //!      divergence, never as a default hedge. BF16 is ALSO asserted
-//!      BIT-EXACT since the RoPE one-rounding fix (`formula()` now
+//!      BIT-EXACT (`formula()`
 //!      upcasts every operand to f32 before the rotation and rounds once
 //!      at the end, the same shape `RopeFused` itself computes) —
 //!      measured on these fixtures; see the bf16 tests' own docs for why
@@ -69,8 +69,8 @@ fn fused(negate_sin: bool, x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_cor
 /// multiply/add, and the result is cast to the input dtype exactly once
 /// at the end — the same one-rounding shape `RopeFused` itself already
 /// computes (`cuda/rope.cu:62`). For F32 inputs `internal_dtype == F32`,
-/// so every cast here is a same-dtype no-op and this degenerates to the
-/// original (already bit-exact) composition.
+/// so every cast here is a same-dtype no-op and this degenerates to a
+/// plain f32 (already bit-exact) composition.
 fn formula(x: &Tensor, cos_b: &Tensor, sin_b: &Tensor) -> candle_core::Result<Tensor> {
     let x_dtype = x.dtype();
     let internal_dtype = match x_dtype {
@@ -234,17 +234,16 @@ fn fused_vs_formula_f32_fwd_and_bwd_are_bit_exact() {
     assert_eq!(dxf, dxe, "dx must be bit-exact, not merely close");
 }
 
-/// bf16 fwd: BEFORE the one-rounding fix, the formula composition rounded
-/// intermediate products (`x*cos`, `rotate_half(x)*sin`, the sum) to
-/// bf16 at each op boundary while the fused kernel accumulated the whole
-/// elementwise expression in f32 and rounded ONCE — measured on this
-/// same fixture, that was a genuine, non-vacuous divergence. `formula()`
-/// above now runs the IDENTICAL one-rounding shape (every operand
+/// bf16 fwd: a formula composition that rounds intermediate products
+/// (`x*cos`, `rotate_half(x)*sin`, the sum) to bf16 at each op boundary
+/// diverges, measurably on this fixture, from the fused kernel, which
+/// accumulates the whole elementwise expression in f32 and rounds ONCE.
+/// `formula()` above runs the IDENTICAL one-rounding shape (every operand
 /// upcast to f32, one cast back at the end), so formula and fused are
 /// expected to — and on this fixture, measured to — agree BIT-EXACTLY,
-/// the same outcome the LN oracle's identical fix produced. `bf16_bit_diff`
+/// the same outcome the LN oracle's identical formula gives. `bf16_bit_diff`
 /// is kept for the same reason `layer_norm_oracles.rs` keeps its own copy:
-/// it is the tool a future regression (e.g. a production-`head_dim`-sized
+/// it is the tool a regression (e.g. a production-`head_dim`-sized
 /// fixture exposing a reduction-order difference) would use to re-derive
 /// a tolerance.
 fn bf16_bit_diff(a: bf16, b: bf16) -> i32 {
@@ -286,20 +285,20 @@ fn fused_vs_formula_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
         .zip(formula_out.iter())
         .map(|(&f, &e)| bf16_bit_diff(f, e))
         .collect();
-    println!("fused_vs_formula_bf16_fwd: measured bit-diffs (post-fix) = {diffs:?}");
+    println!("fused_vs_formula_bf16_fwd: measured bit-diffs = {diffs:?}");
     assert_eq!(
         fused_out, formula_out,
-        "fwd must now be bit-exact (measured diffs: {diffs:?}) — the pre-fix double-rounding \
-         defect (see `RotaryEmbedding::apply`'s doc) is gone"
+        "fwd must be bit-exact (measured diffs: {diffs:?}) — a nonzero diff means a \
+         double-rounding formula (see `RotaryEmbedding::apply`'s doc)"
     );
 }
 
 /// Backward analog: `Tensor::backward()`'s ones-seed cancels bf16
-/// rounding divergence (per the fused-kernels plan's C2 lesson — `1.0 *
+/// rounding divergence (`1.0 *
 /// anything` rounds identically regardless of dtype), so this weights the
 /// output with a non-uniform, bf16-awkward vector before summing, making
 /// the effective `dy` genuinely non-trivial. Measured on this fixture,
-/// post-fix, `dx` is bit-exact — see the forward oracle's doc for why
+/// `dx` is bit-exact — see the forward oracle's doc for why
 /// that is not a structural guarantee at every shape.
 #[test]
 fn fused_vs_formula_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
@@ -355,11 +354,8 @@ fn fused_vs_formula_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
         .zip(dxe.iter())
         .map(|(&f, &e)| bf16_bit_diff(f, e))
         .collect();
-    println!("fused_vs_formula_bf16_bwd: measured dx bit-diffs (post-fix) = {diffs:?}");
-    assert_eq!(
-        dxf, dxe,
-        "dx must now be bit-exact (measured diffs: {diffs:?})"
-    );
+    println!("fused_vs_formula_bf16_bwd: measured dx bit-diffs = {diffs:?}");
+    assert_eq!(dxf, dxe, "dx must be bit-exact (measured diffs: {diffs:?})");
 }
 
 /// Chain-rule oracle: `x` is an INTERMEDIATE (`w.affine(2, 0)`) on a path

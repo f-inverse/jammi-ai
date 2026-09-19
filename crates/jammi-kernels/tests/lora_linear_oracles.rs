@@ -1,26 +1,25 @@
 //! `LowRankResidualLinear` production-width oracles: CPU-hermetic, `F32`
 //! (candle-core 0.11.0's CPU backend has no `BF16` matmul without
 //! `mkl`/`accelerate` — see `ops::low_rank_residual_linear`'s module doc; the `BF16`
-//! leg lives in `cuda_parity.rs`, pod-run).
+//! leg lives in `cuda_parity.rs`, run on a GPU).
 //!
-//! `crates/jammi-kernels/src/ops/lora_linear.rs`'s own `#[cfg(test)]`
-//! module already covers the kernel's small-dimension math (closed-form
-//! reference, bit-exact-vs-manual-composition, gradcheck, domain
-//! refusals). This file adds what that module deliberately does NOT: the
-//! shapes the #352 profile actually measured
+//! `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs`'s own
+//! `#[cfg(test)]` module covers the kernel's small-dimension math
+//! (closed-form reference, bit-exact-vs-manual-composition, gradcheck,
+//! domain refusals). This file adds what that module deliberately does
+//! NOT: the profiled production shapes
 //! (`[24, 128, 1024] -> {3072, 5248}`, ModernBERT-large's Wqkv/Wo/Wi
-//! widths) run end to end against the CURRENT eager composition
+//! widths) run end to end against the eager composition
 //! (`LoraLinear::forward`'s training-arm math, reproduced here with plain
 //! `Tensor` ops so this file needs no `jammi-lora` dependency — a leaf
-//! crate names no consumer, family L), plus a boundary set (empty rows,
-//! a single row, a rank-2 pooled head) family D calls for.
+//! crate names no consumer), plus a boundary set (empty rows,
+//! a single row, a rank-2 pooled head).
 //!
-//! ## The oracle contract, honestly stated
+//! ## The oracle contract
 //!
-//! An A100 pod run found two of these tests' `tol == 0.0` assertions
-//! failing by exactly 1 `f32` ULP on x86/AVX-512 (they passed reliably on
-//! Apple/NEON, where this suite was originally authored). The cause is
-//! NOT a correctness bug: the fused op and the "eager" reference below
+//! A `tol == 0.0` assertion on sine-valued fixtures fails by exactly 1
+//! `f32` ULP on x86/AVX-512 (A100 host) while passing on Apple/NEON. The
+//! cause is NOT a correctness bug: the fused op and the "eager" reference below
 //! can legitimately hand `Tensor::matmul` DIFFERENT operand stride
 //! patterns for the mathematically-identical GEMM, and `gemm`'s internal
 //! kernel/blocking selection — and hence its floating-point SUMMATION
@@ -38,10 +37,10 @@
 //! rule: parity is about WHERE a comparison rounds, not that every
 //! intermediate reduction sums in the same order).
 //!
-//! This file therefore draws the line honestly rather than loosening
-//! `tol` on the EXISTING (sine-valued) fixtures to paper over it:
+//! This file therefore draws the line explicitly rather than loosening
+//! `tol` on sine-valued fixtures:
 //!
-//! - **Bit-exact legs** (`tol == 0.0`) now use [`exact_fixture`]:
+//! - **Bit-exact legs** (`tol == 0.0`) use [`exact_fixture`]:
 //!   small-integer `f32` values (`{-4, .., 4}`) chosen so every partial
 //!   sum this op's GEMMs form stays a SMALL EXACT INTEGER, well under
 //!   `f32`'s 24-bit mantissa's exact range at every width this file
@@ -64,14 +63,14 @@
 //!   magnitude bound and this op's largest reduction depth, not tuned
 //!   post hoc to make a failing assertion pass.
 //! - The FD gradchecks (`production_width_backward_matches_candle_
-//!   autograd_of_the_current_composition`) are unchanged: they were
-//!   already a `1e-3` tolerance, never a `tol == 0.0` claim.
+//!   autograd_of_the_current_composition`) use a `1e-3` tolerance,
+//!   never a `tol == 0.0` claim.
 
 use candle_core::{DType, Device, Error, Result, Tensor, Var};
 use jammi_kernels::ops::{DropoutKey, LowRankResidualLinear};
 
-/// The eager composition `LoraLinear::forward`'s training arm builds
-/// today, reproduced directly over plain tensors (no dropout): `base_out
+/// The eager composition `LoraLinear::forward`'s training arm builds,
+/// reproduced directly over plain tensors (no dropout): `base_out
 /// + scale * (x @ A^T @ B^T)`, `A` `[r, in]`, `B` `[out, r]`.
 fn eager_forward(x: &Tensor, w: &Tensor, a: &Tensor, b: &Tensor, scale: f64) -> Result<Tensor> {
     let base_out = x.matmul(&w.t()?)?;
@@ -85,13 +84,13 @@ fn eager_forward(x: &Tensor, w: &Tensor, a: &Tensor, b: &Tensor, scale: f64) -> 
 /// `jammi_kernels::ops::low_rank_residual_linear`'s module doc, "the packed-`ab` GEMM
 /// eligibility problem". `a.t()` is a non-contiguous VIEW; `Tensor::cat`'s
 /// dim-0 path handles that via each arg's own `Layout` (no `.contiguous()`
-/// call needed first — unlike the column-packed layout this replaced,
-/// which needed one for `B^T`).
+/// call needed first — unlike a column-packed layout,
+/// which would need one for `B^T`).
 fn pack_ab(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     Tensor::cat(&[&a.t()?, b], 0)
 }
 
-/// #428 P2b: `pack_ab`'s bias-carrying sibling — appends the frozen
+/// `pack_ab`'s bias-carrying sibling — appends the frozen
 /// bias's own `bias_rows = out_features.div_ceil(rank)` rows, flattened
 /// row-major and zero-padded past `out_features` (see
 /// `jammi_kernels::ops::low_rank_residual_linear`'s module doc, "Bias:
@@ -139,7 +138,7 @@ fn fused_forward(x: &Tensor, w: &Tensor, ab: &Tensor, op: LowRankResidualLinear)
 /// A fixed, deterministic (not `Tensor::randn`-seeded — this crate does
 /// not depend on `rand`) f32 fixture, values in a modest range
 /// (`|v| <= 0.3`). Realistic/non-integer — see the module doc's "oracle
-/// contract" section for why this is now paired with a DERIVED tolerance
+/// contract" section for why this is paired with a DERIVED tolerance
 /// rather than `tol == 0.0`.
 fn fixture(n: usize, phase: f32) -> Vec<f32> {
     (0..n)
@@ -188,7 +187,7 @@ fn assert_close(got: &[f32], expected: &[f32], tol: f32, label: &str) {
 }
 
 /// Wqkv-shaped: `in=1024, out=3072` (3x hidden, the fused QKV projection),
-/// `B_eff*S = 24*128 = 3072` rows, `rank=16` — the #352 profile's own
+/// `B_eff*S = 24*128 = 3072` rows, `rank=16` — the profiled production
 /// numbers.
 #[test]
 fn production_width_wqkv_forward_matches_the_eager_composition() {
@@ -211,7 +210,7 @@ fn production_width_wqkv_forward_matches_the_eager_composition() {
     assert_close(&fused_v, &eager_v, 0.0, "wqkv_forward");
 }
 
-/// The honest, random-valued counterpart to the exact-integer leg above:
+/// The random-valued counterpart to the exact-integer leg above:
 /// realistic (non-integer) production values via [`fixture`], compared
 /// within a tolerance DERIVED from the `n`-term `f32` dot-product
 /// reordering-error bound — see the module doc's "oracle contract"
@@ -246,7 +245,7 @@ fn production_width_wqkv_forward_matches_the_eager_composition_within_a_derived_
 
 /// Wo-shaped: `in=3072/? -> here in=1024,out=1024` GeGLU's `Wi` (packed,
 /// `out=5248` for ModernBERT-large's intermediate*2) is the SECOND shape
-/// the #352 profile names; exercised here at `in=1024, out=5248`.
+/// the profile names; exercised here at `in=1024, out=5248`.
 #[test]
 fn production_width_wi_forward_matches_the_eager_composition() {
     let device = Device::Cpu;
@@ -436,11 +435,10 @@ fn production_width_backward_matches_candle_autograd_of_the_current_composition(
 /// SAME comparison, but with `dropout: Some(key)` on the fused side and
 /// the identical `DropoutFused` key applied by hand to the LoRA branch's
 /// input on the eager side (never the base — dropout only ever touches
-/// the LoRA path, see the op's own module doc). Closes a real coverage
-/// gap an adversarial mutation audit found: NEITHER an unmasked
+/// the LoRA path, see the op's own module doc). NEITHER an unmasked
 /// `d_xd` in `bwd` (dropping the gradient re-mask entirely) NOR skipping
-/// the dropout re-application in the recomputed `xd` moved this file's
-/// prior (dropout-less) backward oracle — this test is what actually
+/// the dropout re-application in the recomputed `xd` moves this file's
+/// dropout-less backward oracle — this test is what actually
 /// exercises that code path's gradient correctness.
 #[test]
 fn production_width_backward_matches_candle_autograd_of_the_current_composition_with_dropout() {
@@ -602,7 +600,7 @@ fn rank2_pooled_classification_head_matches_the_eager_composition() {
     );
 }
 
-/// Boundary (family D): a single-row `x` (`M == 1`) — the degenerate GEMM
+/// Boundary: a single-row `x` (`M == 1`) — the degenerate GEMM
 /// dimension every `bmnk` derivation must still handle correctly (not
 /// merely "happens to work" for `M > 1`).
 #[test]
@@ -629,7 +627,7 @@ fn single_row_boundary_matches_the_eager_composition() {
     );
 }
 
-/// Boundary (family D): an empty `x` (`M == 0`, e.g. a zero-length
+/// Boundary: an empty `x` (`M == 0`, e.g. a zero-length
 /// leading batch dim) must be a no-op output of the right shape, not a
 /// panic or an illegal-shaped GEMM.
 #[test]
@@ -650,7 +648,7 @@ fn empty_rows_boundary_produces_an_empty_output_not_a_panic() {
 /// Dropout at production width: the fused kernel's internal draw must
 /// match `DropoutFused` applied directly with the SAME key — the same
 /// determinism proof `ops::low_rank_residual_linear`'s own unit test makes at small
-/// scale, repeated here at the width the #352 profile measured so a
+/// scale, repeated here at the profiled production width so a
 /// scale-dependent indexing bug (e.g. an `i as u32` truncation somewhere
 /// in the flatten path) cannot hide in a small fixture. `p = 0.5` (so the
 /// inverted-dropout scale `1/(1-p) == 2.0` is exact in binary) and
@@ -701,12 +699,10 @@ fn production_width_dropout_matches_dropout_fused_applied_directly() {
 /// `F64` (a genuinely unsupported dtype, distinct from `F32`/`BF16`/`F16`)
 /// reaching the fused op's `w`/`x` slot is a typed domain refusal, not a
 /// silent misinterpretation — this op's dtype domain is `F32`, `BF16`, or
-/// `F16` only (campaign #443 D1 retargets this MUT-1 sentinel from `F16`,
-/// which is now a genuinely SUPPORTED dtype on CPU — see
-/// `f16_base_on_cpu_matches_the_f32_eager_reference` below — to `F64`, a
-/// dtype still outside this op's domain on every arm, keeping the
-/// forced-`true`-mutant kill this sentinel exists for alive against a real
-/// still-refused dtype rather than a stale claim).
+/// `F16` only. The sentinel is `F64` because `F16` is a SUPPORTED dtype on
+/// CPU (see `f16_base_on_cpu_matches_the_f32_eager_reference` below):
+/// killing the forced-`true` mutant this sentinel exists for needs a dtype
+/// outside this op's domain on every arm.
 #[test]
 fn f64_base_is_a_typed_domain_refusal() {
     let device = Device::Cpu;
@@ -731,9 +727,9 @@ fn f64_base_is_a_typed_domain_refusal() {
     );
 }
 
-/// `F16` positive-path oracle (campaign #443 D1): candle-core 0.11's CPU
-/// backend DOES have a real `F16` `MatMul` (unlike `BF16`), so widening
-/// this op's CPU dtype gate to `F16` is a genuinely new working capability
+/// `F16` positive-path oracle: candle-core 0.11's CPU
+/// backend DOES have a real `F16` `MatMul` (unlike `BF16`), so admitting
+/// `F16` at this op's CPU dtype gate is a genuinely working capability
 /// — proven here at the public `apply_op3` surface (mirroring this file's
 /// own `production_width_*` bit-exact legs) rather than only at the
 /// internal `ops::low_rank_residual_linear` module-test surface. Exact-integer
@@ -774,7 +770,7 @@ fn f16_base_on_cpu_matches_the_f32_eager_reference_bit_exact() {
     );
 }
 
-/// #428 P2b: every BERT-base / DistilBERT projection width the bias-
+/// Every BERT-base / DistilBERT projection width the bias-
 /// carrying pack must run at — `768x768` (self-attention Q/K/V/O),
 /// `768x3072` (the MLP up-projection), `3072x768` (the MLP
 /// down-projection) — `rank = 8` (a realistic LoRA rank), bit-exact

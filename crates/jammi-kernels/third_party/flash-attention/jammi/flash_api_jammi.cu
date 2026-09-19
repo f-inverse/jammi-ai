@@ -1,7 +1,7 @@
 /*
  * flash_api_jammi.cu — jammi's torch-free wrapper over the vendored
- * FlashAttention-2 hdim64/{bf16,fp16}/sm80 non-causal kernels (campaign
- * #443 D2 adds the fp16 pair; `args->dtype` selects which). See
+ * FlashAttention-2 hdim64/{bf16,fp16}/sm80 non-causal kernels
+ * (`args->dtype` selects which). See
  * flash_api_jammi.h for the ABI and the layout it serves.
  *
  * Every `params.*` assignment below cites the upstream line in
@@ -25,8 +25,7 @@
 
 namespace FLASH_NAMESPACE {
 // The four explicit specialisations defined in
-// flash_{fwd,bwd}_hdim64_{bf16,fp16}_sm80.cu (campaign #443 D2 adds the
-// fp16 pair). Declared here so the calls below bind to those definitions
+// flash_{fwd,bwd}_hdim64_{bf16,fp16}_sm80.cu. Declared here so the calls below bind to those definitions
 // rather than implicitly instantiating the (definition-less) primary
 // templates from flash.h:189-192.
 template <>
@@ -76,12 +75,12 @@ int32_t query_device(int *device, int *num_sms, int *cc_major) {
 // (Is_dropout)` (only the further uses at :535/:541/:546 are guarded).
 // Upstream always points `rng_state` at a live 2-element device tensor,
 // unconditionally, in the forward (flash_api.cpp:725) and always forwards
-// it in the backward (flash_api.cpp:1171-1172); leaving it NULL here (as
-// this wrapper originally did) is a null pointer dereferenced by every
-// backward launch — it happened to pass because nvcc dead-code-eliminated
-// the load when `Is_dropout` is false at compile time (this build's
+// it in the backward (flash_api.cpp:1171-1172). Leaving it NULL would be a
+// null pointer dereferenced by every backward launch — one that only
+// appears to work because nvcc dead-code-eliminates the load when
+// `Is_dropout` is false at compile time (this build's
 // FLASHATTENTION_DISABLE_DROPOUT), which is a compiler behaviour, not a
-// language guarantee. Fixed with a lazily-allocated, zeroed, 2-element
+// language guarantee. Hence a lazily-allocated, zeroed, 2-element
 // scratch buffer, reused for the process's lifetime (never freed, like a
 // static): its VALUES are never read past that unconditional line (dropout
 // is compiled out), only the pointer must be dereferenceable.
@@ -140,7 +139,7 @@ int32_t check_common(int32_t total_q, int32_t batch, int32_t num_heads, int32_t 
     // `p_dropout == 0.0f`). Any non-zero value — including NaN, which
     // compares unequal to everything — is refused.
     if (!(p_dropout == 0.0f)) return JAMMI_FLASH_ERR_DROPOUT_UNSUPPORTED;
-    // This crate's own rule for a multiplicative scale (family D): finite
+    // This crate's own rule for a multiplicative scale: finite
     // and > 0. `!(x > 0)` also catches NaN.
     if (!(softmax_scale > 0.0f) || !std::isfinite(softmax_scale)) return JAMMI_FLASH_ERR_SCALE;
     // -1 is the only negative value with a meaning (unbounded).
@@ -155,9 +154,8 @@ int32_t check_common(int32_t total_q, int32_t batch, int32_t num_heads, int32_t 
     return JAMMI_FLASH_OK;
 }
 
-// campaign #443 D2: `dtype` must be one of the two compiled
-// specialisations — anything else is refused loudly rather than silently
-// treated as bf16 (family D: a caller passing an out-of-range enum value
+// `dtype` must be one of the two compiled specialisations — anything else
+// is refused loudly rather than silently treated as bf16 (a caller passing an out-of-range enum value
 // gets a typed error naming the field, never a default).
 bool dtype_is_valid(int32_t dtype) {
     return dtype == JAMMI_FLASH_DTYPE_BF16 || dtype == JAMMI_FLASH_DTYPE_FP16;
@@ -181,15 +179,14 @@ int32_t check_device() {
 // is_bf16` and the caller's own choice of `run_mha_{fwd,bwd}_<T, ...>`
 // downstream communicate to the kernel) and `params.is_bf16` (flash_api.
 // cpp:58 / :198, read by the online-softmax kernel to pick its own
-// internal rounding — campaign #443 D2's ENTIRE fp16 addition is this one
-// compile-time switch plus the two new TUs; no other line in this
-// function changes per dtype).
+// internal rounding — this one compile-time switch plus the fp16 TUs is
+// the ENTIRE per-dtype difference; no other line changes per dtype).
 template <typename T>
 constexpr bool kIsBf16 = std::is_same<T, cutlass::bfloat16_t>::value;
 
 // set_params_fprop, flash_api.cpp:26-159, for the packed varlen layout.
 // `window_size_*` must already be normalised by check_common. `T` is
-// `cutlass::bfloat16_t` or `cutlass::half_t` (campaign #443 D2) — the
+// `cutlass::bfloat16_t` or `cutlass::half_t` — the
 // SAME function body upstream's own `set_params_fprop` runs for both
 // dtypes (upstream takes an `at::ScalarType` at runtime and reads
 // `q.dtype() == torch::kBFloat16`; this templated form picks the SAME
@@ -298,7 +295,7 @@ void fill_fprop(FLASH_NAMESPACE::Flash_fwd_params &params, const void *qkv, void
     params.rng_state = rng_state_scratch();
 }
 
-// The dtype-dependent tail of `jammi_flash_varlen_bwd` (campaign #443 D2):
+// The dtype-dependent tail of `jammi_flash_varlen_bwd`:
 // `set_params_dgrad`, flash_api.cpp:161-241, continued past `fill_fprop`'s
 // own `set_params_fprop` prefix. Templated on `T` for the SAME reason
 // `fill_fprop` is — `dq_ptr`/`dk_ptr`/`dv_ptr`'s pointer arithmetic is
@@ -368,8 +365,7 @@ int32_t run_bwd_for_dtype(const jammi_flash_varlen_bwd_args *a, int32_t window_s
     (void)cudaGetLastError();
     // flash_api.cpp:1163,1185 `run_mha_bwd(params, stream)` →
     // flash_api.cpp:761 `run_mha_bwd_<elem_type, kHeadDim, Is_causal>` —
-    // `elem_type` selected by `a->dtype` at the call site below (campaign
-    // #443 D2; was hardcoded `cutlass::bfloat16_t` before this campaign).
+    // `elem_type` selected by `a->dtype` at the call site below.
     FLASH_NAMESPACE::run_mha_bwd_<T, 64, false>(params, static_cast<cudaStream_t>(a->stream));
     if (cudaGetLastError() != cudaSuccess) return JAMMI_FLASH_ERR_CUDA;
     return JAMMI_FLASH_OK;
@@ -447,8 +443,7 @@ int32_t jammi_flash_varlen_fwd(const jammi_flash_varlen_fwd_args *a) {
     (void)cudaGetLastError();
     // flash_api.cpp:738-739 `run_mha_fwd(params, stream, /*force_split_kernel=*/paged_KV=false)`
     // → flash_api.cpp:248 `run_mha_fwd_<elem_type, kHeadDim, Is_causal>` —
-    // `elem_type` selected by `a->dtype` (campaign #443 D2; was hardcoded
-    // `cutlass::bfloat16_t` before this campaign).
+    // `elem_type` selected by `a->dtype`.
     if (a->dtype == JAMMI_FLASH_DTYPE_FP16) {
         fill_fprop<cutlass::half_t>(params, a->qkv, a->o, a->softmax_lse, a->cu_seqlens, a->total_q,
                                     a->batch, a->num_heads, a->max_seqlen, a->softmax_scale,
@@ -513,8 +508,7 @@ int32_t jammi_flash_varlen_bwd(const jammi_flash_varlen_bwd_args *a) {
     st = check_device();
     if (st != JAMMI_FLASH_OK) return st;
 
-    // The dtype-dependent tail lives in `run_bwd_for_dtype<T>` (campaign
-    // #443 D2) — every check above this line is dtype-independent and
+    // The dtype-dependent tail lives in `run_bwd_for_dtype<T>` — every check above this line is dtype-independent and
     // therefore runs exactly once regardless of `a->dtype`.
     if (a->dtype == JAMMI_FLASH_DTYPE_FP16) {
         return run_bwd_for_dtype<cutlass::half_t>(a, window_size_left, window_size_right,

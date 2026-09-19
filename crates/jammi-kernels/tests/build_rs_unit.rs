@@ -18,12 +18,11 @@
 //! touches `cargo:rustc-env`/`cargo:rerun-if-changed` output or spawns a
 //! subprocess.
 //!
-//! Whole-file `#![cfg(not(feature = "cuda"))]` (pod-smoke fix, M3-defect
-//! class): `build.rs::build_cuda` is itself `#[cfg(feature = "cuda")]`-gated
-//! and does `use bindgen_cuda::Builder` internally — under the DEFAULT
-//! feature set that whole function (import included) is stripped before
-//! this file's `#[path]` include ever re-parses it, which is the only
-//! reason this suite has ever compiled clean. `bindgen_cuda` is a
+//! Whole-file `#![cfg(not(feature = "cuda"))]`: `build.rs::build_cuda` is
+//! itself `#[cfg(feature = "cuda")]`-gated and does `use bindgen_cuda::Builder`
+//! internally — under the DEFAULT feature set that whole function (import
+//! included) is stripped before this file's `#[path]` include re-parses it,
+//! which is what lets this suite compile. `bindgen_cuda` is a
 //! `[build-dependencies]` crate: invisible to a `[[test]]` target's own
 //! crate graph regardless of features. Building THIS test target with
 //! `--features cuda` turns `cfg(feature = "cuda")` on for the include too,
@@ -46,15 +45,10 @@ use build_script::{
 };
 
 /// Pins the REAL `build.rs::GENCODE_ARCHES` constant's four entries
-/// exactly — round-2 audit finding F1's fix: an EARLIER revision of this
-/// test passed hand-typed literal strings (`"arch=compute_80,code=sm_80"`,
-/// ...) to `gencode_sm` instead of reading `GENCODE_ARCHES` itself, which
-/// meant a mutation to that array (the audit's own mutant: rewritten to a
-/// pre-Ampere-inclusive, 89/90-dropping `sm_70/sm_80/sm_86` set) went
-/// completely undetected here — this test would have stayed green against
-/// its own stale literal copies regardless of what the real array said.
-/// Reading `GENCODE_ARCHES` directly through the `#[path]` seam closes
-/// that gap structurally: there is no longer a hand-typed copy for the
+/// exactly. It reads `GENCODE_ARCHES` directly through the `#[path]` seam
+/// rather than passing hand-typed literals to `gencode_sm`, so a mutation to
+/// the real array (e.g. a pre-Ampere-inclusive, 89/90-dropping
+/// `sm_70/sm_80/sm_86` set) fails here; there is no hand-typed copy for the
 /// real array to drift away from.
 #[test]
 fn gencode_sm_parses_every_pinned_gencode_entry() {
@@ -94,7 +88,7 @@ fn parse_nvcc_release_returns_none_on_unrecognised_output() {
     assert_eq!(parse_nvcc_release("release not-a-version"), None);
 }
 
-/// Negative control (audit advisory): `"prerelease"` contains `"release"`
+/// Negative control: `"prerelease"` contains `"release"`
 /// as a literal SUBSTRING (`p-r-e-r-e-l-e-a-s-e`, positions 3..10 spell
 /// `release`), so an unanchored `.split("release ")`-style match would
 /// wrongly fire on a `"...prerelease 12.0..."` token shape and report a

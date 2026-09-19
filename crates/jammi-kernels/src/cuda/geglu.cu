@@ -17,11 +17,11 @@
 //   gate = wi_out[row*2*intermediate + col]
 //   up   = wi_out[row*2*intermediate + intermediate + col]
 //
-// INDEXING CONTRACT (campaign #446, finding 4 — see
+// INDEXING CONTRACT (see
 // `../ops/launch_domain.rs`'s module doc for the whole rule and the CPU
 // lane that enforces it): `idx`, `row` and the stride are `size_t`, while
 // `intermediate`/`n_out` stay 32-bit `unsigned int` PARAMETERS. This
-// asymmetry is deliberate. These loops used to declare `unsigned int idx`;
+// asymmetry is deliberate. With an `unsigned int idx`,
 // the stride is `GEGLU_BLOCK * GEGLU_MAX_GRID == 16'776'960`, so a 32-bit
 // lane could only ever hold values congruent to its own start modulo
 // `gcd(stride, 2^32) == 256`. Above `n_out == UINT_MAX - 255` the exit

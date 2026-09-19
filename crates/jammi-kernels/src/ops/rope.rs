@@ -1,7 +1,7 @@
 //! Fused RoPE (rotary position embedding) rotate-half forward + backward.
 //!
 //! `out = x*cos + rotate_half(x)*sin`, `rotate_half(x) = cat(-x[..,half:],
-//! x[..,:half])` — reproduced bit-for-bit from the EXISTING eager
+//! x[..,:half])` — reproduced bit-for-bit from the eager
 //! composition (`RotaryEmbedding::apply` in `jammi-encoders`' ModernBERT
 //! port) as a single elementwise `CustomOp3`, replacing that ~12-op chain
 //! (two `narrow`s, a `neg`, a `Tensor::cat` copy, two broadcast muls, an
@@ -50,15 +50,14 @@
 //! pays a real `x.contiguous()` copy on its hot path: Q/K reach RoPE as a
 //! `transpose(1, 2)` VIEW whose axis order this op's `%period` model
 //! cannot address without materializing it into the row-major layout the
-//! model assumes. A future generalization — replacing the single
+//! model assumes. Replacing the single
 //! `period` derived from `cos`/`sin`'s own shape with an explicit
 //! `rows_per_table_row: usize` construction parameter decoupled from
-//! `cos`/`sin`'s literal shape — could in principle let the op walk a
-//! transposed layout's strides directly and remove that copy; not done
-//! here (this commit's scope is the rotate-half math, not a strided
+//! `cos`/`sin`'s literal shape could in principle let the op walk a
+//! transposed layout's strides directly and remove that copy; this op
+//! does not (it owns the rotate-half math, not a strided
 //! index walk on top of it — `layout_walk.rs`'s `StridedOffsets` exists
-//! for exactly that, and the ops that use it do so on their CPU arms only;
-//! adopting it here is a deliberate, separate design decision).
+//! for exactly that, and the ops that use it do so on their CPU arms only).
 //!
 //! ## `bwd`: RoPE with the sign of `sin` flipped
 //!
@@ -73,8 +72,7 @@
 //! to `dy` with `sin` negated computes exactly `dx` — no permutation of
 //! `dy` needed. [`RopeFused::negate_sin`] exists so `bwd` can reuse this
 //! one `KernelOp` for that (the flash-attn `conjugate=True` /
-//! TransformerEngine `-shared_mem_sin` precedent cited in the
-//! fused-kernels plan), rather than a second kernel — mirroring how
+//! TransformerEngine `-shared_mem_sin` precedent), rather than a second kernel — mirroring how
 //! `LayerNormFused::bwd` dispatches into internal helper `KernelOp`s
 //! (`jammi_kernels::ops::layer_norm`'s module doc) instead of composing
 //! ordinary `Tensor` ops.
@@ -86,25 +84,24 @@
 //! flag needed — unlike `dgamma_needed`, `bwd` already receives `cos`/
 //! `sin` themselves as arguments, so there is nothing to freeze ahead of
 //! time) and computes a REAL gradient — via ordinary `Tensor` composition,
-//! not a further fused kernel, since this path is provably dead in every
-//! call site today (the same "correctness over micro-optimization" choice
-//! `ops`'s module doc documents) — rather than hardcoding `None` forever and
+//! not a further fused kernel, since no shipped call site reaches this
+//! path (the same "correctness over micro-optimization" choice
+//! `ops`'s module doc documents) — rather than hardcoding `None` and
 //! risking the exact silent-missing-gradient landmine `LayerNormFused`'s
-//! doc warns a hardcoded `dgamma_needed = false` would have been.
-//! `track_op()`, NOT `is_variable()` alone: an earlier version of this
-//! check used `is_variable()`, reasoning that `cos`/`sin` are "genuine
-//! leaf construction data with no upstream op, never an intermediate on a
-//! path to a `Var`" — sound for every call site's LITERAL `cos`/`sin`
-//! handle, but NOT for a caller who derives its own table from a `Var`
+//! doc warns a hardcoded `dgamma_needed = false` would be.
+//! `track_op()`, NOT `is_variable()` alone: treating `cos`/`sin` as
+//! "genuine leaf construction data with no upstream op, never an
+//! intermediate on a path to a `Var`" is sound for every call site's
+//! LITERAL `cos`/`sin` handle, but NOT for a caller who derives its own table from a `Var`
 //! through an intermediate op (e.g. `crate::ops::rope_positions`'s ragged
 //! arm gathers a per-row table via `Tensor::index_select` before ever
 //! calling a fused op) and hands the RESULT here: that result has
 //! `is_variable() == false` (it is not itself a `Var`) but `track_op() ==
 //! true` (it carries an `Op`, and — since candle's own `sorted_nodes`
 //! walk, `backprop.rs`, recurses through `Op::IndexSelect`'s left operand
-//! — that `Op` chain DOES reach a `Var`), so the old `is_variable()`-only
-//! check silently returned `None` for a slot candle's own backward walk
-//! still expected an entry for, panicking downstream at `backprop.rs:175`
+//! — that `Op` chain DOES reach a `Var`), so an `is_variable()`-only
+//! check would silently return `None` for a slot candle's own backward walk
+//! still expects an entry for, panicking downstream at `backprop.rs:175`
 //! ("grad not populated") instead of computing the real gradient this
 //! `bwd` is fully able to produce. `rope_grad_table` (below) never reads
 //! `table`'s VALUES — only its `elem_count()`/`shape()` — so widening the
@@ -112,9 +109,9 @@
 //! whether `arg2`/`arg3` is itself a `Var` or a tracked intermediate on a
 //! path to one; this is the SAME predicate-hole class
 //! `low_rank_residual_linear.rs`'s and `jammi-lora`'s `frozen_weight_gate`
-//! already fixed for their own `w`/`weight` slots.
+//! close for their own `w`/`weight` slots.
 //!
-//! ## Domain (family D)
+//! ## Domain
 //!
 //! `x`, `cos`, `sin` must be fully contiguous (`contiguous_offsets()`,
 //! same idiom as `LayerNormFused` and for the same reason: this op's
@@ -127,13 +124,13 @@
 //! `LayerNormFused`'s `hidden == 0` case documents. CPU supports F32 and
 //! BF16 (RoPE's real training dtypes; matches `LayerNormFused`'s CPU
 //! domain deliberately, for the same reason: the profiled workload never
-//! needs F64 here), plus F16 (`rope_fwd_f16` below). Campaign #443 W2b
-//! added the matching CUDA F16 dispatch arm (`crate::cuda::rope`'s
-//! `DType::F16` arm, backed by the SEPARATE `cuda/rope_f16.cu` translation
+//! needs F64 here), plus F16 (`rope_fwd_f16` below). The matching CUDA
+//! F16 dispatch arm (`crate::cuda::rope`'s
+//! `DType::F16` arm) is backed by the SEPARATE `cuda/rope_f16.cu` translation
 //! unit — see that file's module doc for why it duplicates rather than
-//! shares code with the F32/BF16 kernel), so `jammi-encoders`' admission
-//! predicate is now widened to F16 too (K2's no-Hold-without-dispatch
-//! rule); see `docs/maintainer/cuda-kernel-guide.md`'s per-op f16
+//! shares code with the F32/BF16 kernel — so `jammi-encoders`' admission
+//! predicate admits F16 too (an admission predicate never admits a dtype
+//! without a dispatch arm); see `docs/maintainer/cuda-kernel-guide.md`'s per-op f16
 //! reference-regime table.
 
 use candle_core::backend::BackendStorage;
@@ -241,7 +238,7 @@ pub(crate) fn rope_dims(
     // flattening makes `row % period` walk the WRONG axis (`x`'s size-2
     // axis, not its size-3 one), silently reading table row 0 for x-rows
     // that should read table row 1 and vice versa — a confident wrong
-    // number, not a shape error, which is exactly the family-D failure
+    // number, not a shape error, which is exactly the domain-validity failure
     // this op's domain must not admit. Requiring the axis just before
     // `hidden` to equal `period` is what makes `row % period` (this
     // file's math below, and the CUDA kernel's identical indexing) provably
@@ -433,10 +430,10 @@ fn rotate_half_tensor(x: &Tensor) -> Result<Tensor> {
 /// negates `sin`, per the module doc). Ordinary `Tensor` composition
 /// (reshape + sum), not a further fused kernel — deliberately, since
 /// `cos`/`sin` are never `Var`s in any call site this crate ships (see
-/// the module doc); this exists so a future caller that DID make them
+/// the module doc); this exists so a caller that DID make them
 /// trainable gets a correct gradient rather than a silently-`None` one,
-/// without over-investing a dedicated kernel in a path with no current
-/// exerciser.
+/// without over-investing a dedicated kernel in a path with no
+/// shipped exerciser.
 fn rope_grad_table(
     x: &Tensor,
     grad_res: &Tensor,
@@ -459,7 +456,7 @@ fn rope_grad_table(
         .reshape(table.shape().clone())
 }
 
-/// Fixed fold order (family J): rows walked `0..total_rows` in ascending
+/// Fixed fold order: rows walked `0..total_rows` in ascending
 /// order, columns `0..hidden` within each row — a given `(x, cos, sin)`
 /// triple always yields the same output bit-for-bit. No reduction is
 /// performed here (this op is purely elementwise, unlike LayerNorm), so
@@ -716,9 +713,9 @@ mod tests {
         assert!(matches!(err, Error::RequiresContiguous { .. }));
     }
 
-    /// The auditor-flagged misindexing case: `total_rows` (`6`) IS a
-    /// clean multiple of `period` (`3`), which the OLD (weaker) check
-    /// accepted — but `x`'s axis immediately before `hidden` is `2`, not
+    /// The misindexing case: `total_rows` (`6`) IS a
+    /// clean multiple of `period` (`3`), which a divisibility-only check would
+    /// accept — but `x`'s axis immediately before `hidden` is `2`, not
     /// `3`, so `row % period` would silently walk the wrong axis (see
     /// `rope_dims`'s doc). Refused, not silently misindexed.
     #[test]
@@ -991,7 +988,7 @@ mod tests {
         }
     }
 
-    /// The `track_op()` class fix (audit): `cos`/`sin` derived from a
+    /// The `track_op()` gate: `cos`/`sin` derived from a
     /// `Var` through an intermediate op (`* 1.0`, the SAME tracked-but-
     /// not-a-`Var` construction `low_rank_residual_linear.rs`'s own
     /// regression test uses) have `is_variable() == false` but

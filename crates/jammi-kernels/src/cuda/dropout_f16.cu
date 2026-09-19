@@ -4,11 +4,10 @@
 // ../../build.rs); the pinned build flags (sm_80 baseline, no
 // -use_fast_math) live there, not here.
 //
-// DELIBERATE DUPLICATION (campaign #443 W2b/W2c contract) — see
+// DELIBERATE DUPLICATION — see
 // `layer_norm_f16.cu`'s identical note. This is a SEPARATE translation unit
 // from `dropout.cu` (a separate PTX module, `PTX_DROPOUT_F16` in
-// `../mod.rs`), so `dropout.cu` stays byte-untouched — provable by
-// `git diff`. It carries its OWN copy of the Philox4x32-10 device functions
+// `../mod.rs`), so nothing here can perturb `dropout.cu`. It carries its OWN copy of the Philox4x32-10 device functions
 // (ported from Random123, D. E. Shaw Research, BSD-3-Clause — see
 // `dropout.cu`'s module doc for the full citation, identical here) rather
 // than `#include`-ing anything: no shared `.cuh`.

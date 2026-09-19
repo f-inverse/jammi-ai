@@ -1,9 +1,8 @@
-//! The quantized-CUDA load-time canary (issue #434): a known-answer check
+//! The quantized-CUDA load-time canary: a known-answer check
 //! run lazily before the FIRST quantized CUDA matmul this process performs
 //! — the engine-side guard for the shipped `candle-kernels` 0.11 cu12
-//! wheel's own packaging defect (proven on a live H100 pod; see issue
-//! #434's root-cause comment for the full localization matrix), not merely
-//! the CI image that happened to reproduce it.
+//! wheel's own packaging defect (reproduced on an H100), not merely a
+//! property of one CI image.
 //!
 //! ## The failure class this guards against
 //!
@@ -17,13 +16,13 @@
 //! never call `cudaGetLastError` — a launch that fails with `209`
 //! (`cudaErrorNoKernelImageForDevice`) fails SILENTLY, and the caller then
 //! reads back an uninitialized `dev.alloc` buffer: deterministic-per-
-//! allocation garbage (`O(10)`-`O(1e38)` observed on the pod, reproduced to
-//! the digit against CI's own numbers), not an `Err`.
+//! allocation garbage (`O(10)`-`O(1e38)` observed on an H100, identical to
+//! the digit on CI), not an `Err`.
 //!
 //! `candle_core::quantized::cuda::set_force_dmmv(true)` routes
 //! `QCudaStorage::fwd` around BOTH fast arms entirely (`cuda.rs:853`) onto
 //! the legacy, PTX-JIT'd dequantize-then-matvec path — proven correct on
-//! the mismatched build (issue #434: measured `0.0288`, ordinary
+//! the mismatched build (measured `0.0288`, ordinary
 //! quantization error, vs `18.6` garbage on the broken fast path — the same
 //! `0.0288` magnitude is independently reproduced in-tree, see
 //! `forward_parity_against_dense_dequantized_reference_q8_0_q4_0_q4k`'s own
@@ -42,18 +41,16 @@
 //! this exact known-answer case wrong (a candle upstream regression in the
 //! fast kernels would ALSO be caught here, indistinguishably, and routed
 //! to the same DMMV fallback — the conservative, correct response either
-//! way: K2, refusal/fallback beats a confident wrong number); or prove
+//! way: refusal/fallback beats a confident wrong number); or prove
 //! that EVERY shape/dtype this workspace's quantized matmul ever sees is
-//! safe — only that THIS ONE fixed case is. The true sm_90-cap_80-mismatch
-//! scenario this guard was written against was proven end-to-end on a live
-//! H100 pod per issue #434's root-cause comment; this crate's own
-//! CUDA-gated test (`quantized_cuda_canary_passes_on_a_healthy_build_and_device`,
+//! safe — only that THIS ONE fixed case is. The sm_90-cap_80-mismatch
+//! scenario itself is reproduced only on real H100 hardware; this crate's
+//! own CUDA-gated test (`quantized_cuda_canary_passes_on_a_healthy_build_and_device`,
 //! `tests/cuda_parity.rs`) proves only that the canary's OWN mechanism
 //! (construct the fixed case, dispatch, compare, classify) runs and passes
 //! on whatever CI's own arch-matched prove lane provides — it does not and
 //! cannot reproduce the mismatch itself hermetically (that needs a
-//! genuinely arch-mismatched cubin, a CI/build-matrix concern and a
-//! separate remediation wave; see issue #434).
+//! genuinely arch-mismatched cubin, a CI/build-matrix concern).
 //!
 //! ## Cache granularity: per-device VERDICT, per-process REMEDIATION
 //!
@@ -62,11 +59,8 @@
 //! `canary_device_ordinal` — a `FastKernelsTrusted` verdict on ordinal 0
 //! never admits ordinal 1 unchecked; a multi-GPU process with one
 //! arch-matched and one arch-mismatched device gets each device's OWN
-//! known-answer run. (An earlier version of this guard cached a single
-//! process-global verdict regardless of ordinal — a real defect, not a
-//! documented tradeoff: it let one passing device silently vouch for every
-//! other CUDA device in the process. Fixed as part of issue #434's
-//! remediation.)
+//! known-answer run. A single process-global verdict would let one passing
+//! device silently vouch for every other CUDA device in the process.
 //!
 //! The one thing that IS still process-global, unavoidably, is the
 //! REMEDIATION `set_force_dmmv` itself applies: it is a `candle_core`-
@@ -112,10 +106,10 @@
 //! calls this module, so the kernel entry under test is byte-identical
 //! without the recursion.
 //!
-//! ## The known-answer case and its bound (family F: measured, not assumed)
+//! ## The known-answer case and its bound (measured, not assumed)
 //!
 //! One `Q8_0` block (`GgmlDType::Q8_0`'s own block size — the smallest
-//! shape `QTensor::quantize` accepts at all, family D): a `[1, 32]` weight
+//! shape `QTensor::quantize` accepts at all): a `[1, 32]` weight
 //! alternating `+1.0`/`-1.0` (exact `Q8_0` amplitude `1.0`, no rounding
 //! ambiguity at construction) dotted against a fixed `cos`-fixture
 //! activation of amplitude `<= 1.0` (identical shape to this crate's own
@@ -146,16 +140,15 @@
 //! while sitting decisively BELOW this fixture's own known-answer
 //! magnitude (`~0.664`, see
 //! `canary_diff_passes_rejects_the_all_zeros_failed_launch_signature`'s own
-//! pinned fixture) and orders of magnitude below any garbage value issue
-//! #434 actually observed (`O(10)`-`O(1e38)`, uninitialized device memory
-//! read back after a silently-failed kernel launch). This is the fix for a
-//! real defect an earlier version of this guard had: `CANARY_BOUND == 1.0`
-//! admitted an ALL-ZEROS output — `|0.664 - 0| == 0.664 < 1.0` — the
-//! canonical signature of a failed launch reading back a zeroed (rather
-//! than uninitialized-garbage) allocation, which this fixture's own
-//! magnitude happens to be small enough to hide behind a bound sized only
-//! against the garbage-value ceiling and not against the known answer
-//! itself. `0.3 < 0.664` closes that gap: a zeroed buffer now fails
+//! pinned fixture) and orders of magnitude below any observed garbage
+//! value (`O(10)`-`O(1e38)`, uninitialized device memory
+//! read back after a silently-failed kernel launch). The bound must sit
+//! below the known answer, not merely below the garbage ceiling: a bound
+//! of `1.0` would admit an ALL-ZEROS output — `|0.664 - 0| == 0.664 < 1.0`
+//! — the canonical signature of a failed launch reading back a zeroed
+//! (rather than uninitialized-garbage) allocation, which this fixture's
+//! own magnitude is small enough to hide behind. `0.3 < 0.664` closes
+//! that gap: a zeroed buffer fails
 //! decisively, proven by `canary_case_outcome`'s own decision-core test
 //! (see
 //! `canary_case_outcome_reports_a_known_answer_disagreement_as_ok_false`)
@@ -247,7 +240,7 @@ fn decide(verdict: CanaryVerdict) -> Result<()> {
 /// `CANARY_BOUND` paragraph for why `0.3` decisively separates ordinary
 /// quantization noise (`~0.252`) from BOTH this fixture's own known-answer
 /// magnitude (`~0.664`, the boundary an all-zeros failed-launch readback
-/// used to hide behind at the old `1.0` bound) and any larger garbage
+/// would hide behind at a `1.0` bound) and any larger garbage
 /// value a genuinely arch-mismatched launch produces.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn canary_diff_passes(diff: f32) -> bool {
@@ -292,9 +285,9 @@ fn canary_device_ordinal(device: &Device) -> usize {
 }
 
 /// Computed once PER CUDA ORDINAL (module doc's "cache granularity"
-/// section — this used to be a single process-global `OnceLock`, which let
-/// ordinal 0's verdict silently vouch for every other CUDA device in the
-/// process; fixed as part of issue #434's remediation). An infra `Err` from
+/// section — a single process-global `OnceLock` would let ordinal 0's
+/// verdict silently vouch for every other CUDA device in the process). An
+/// infra `Err` from
 /// [`run_canary`] is NEVER cached here — it propagates straight to the
 /// caller (see [`canary_case_outcome`]'s own doc) and the NEXT call for
 /// this ordinal retries from scratch, exactly as if nothing had run yet.
@@ -337,7 +330,7 @@ fn run_canary(device: &Device) -> candle_core::Result<CanaryVerdict> {
     }
     tracing::warn!(
         "quantized fast-path kernels (fast_mmvq/fast_mmq) cannot execute correctly on this \
-         device -- arch-mismatched single-arch SASS build (see issue #434); falling back to \
+         device -- arch-mismatched single-arch SASS build; falling back to \
          the legacy PTX-JIT'd DMMV path: correct, slower"
     );
     candle_core::quantized::cuda::set_force_dmmv(true);
@@ -496,14 +489,14 @@ mod tests {
 
     /// [`decide`] refuses on [`CanaryVerdict::Refused`] with the typed
     /// [`KernelError::QuantizedCudaCanaryFailed`] — refusal beats a
-    /// confident wrong number (K2), never a silent `Ok`.
+    /// confident wrong number, never a silent `Ok`.
     #[test]
     fn decide_refuses_when_both_paths_fail() {
         let err = decide(CanaryVerdict::Refused).unwrap_err();
         assert!(matches!(err, KernelError::QuantizedCudaCanaryFailed));
     }
 
-    /// The missing downcast oracle (audit advisory 4): `decide`'s typed
+    /// The downcast oracle: `decide`'s typed
     /// `KernelError`, wrapped through
     /// [`impl From<KernelError> for candle_core::Error`](crate::error) —
     /// the SAME conversion `ensure_quantized_cuda_admitted` and
@@ -559,7 +552,7 @@ mod tests {
     }
 
     /// [`canary_diff_passes`] REJECTS the all-zeros failed-launch signature
-    /// this guard's old `CANARY_BOUND == 1.0` used to admit: a zeroed
+    /// a `CANARY_BOUND == 1.0` would admit: a zeroed
     /// device readback against this fixture's own known-answer magnitude
     /// (`~0.664`) yields `diff == 0.664` — the exact zero-output state the
     /// module doc's `CANARY_BOUND` paragraph names.
@@ -571,7 +564,7 @@ mod tests {
     /// [`canary_diff_passes`] rejects non-finite input outright — `NaN <
     /// CANARY_BOUND` is `false` in IEEE-754 either way, but the explicit
     /// `is_finite()` guard makes that fact load-bearing rather than
-    /// incidental (family F: a negative control must fail on every bad
+    /// incidental (a negative control must fail on every bad
     /// path, non-finite included, never merely rely on a comparison that
     /// happens to already reject it).
     #[test]

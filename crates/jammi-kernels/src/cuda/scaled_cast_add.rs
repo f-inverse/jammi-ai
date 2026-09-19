@@ -9,7 +9,7 @@ use super::{PTX_SCALED_CAST_ADD, PTX_SCALED_CAST_ADD_F16};
 /// stable and unique to this op (see `crate::cuda`'s module doc).
 const MODULE_NAME: &str = "jammi_kernels_scaled_cast_add";
 
-/// The F16 arms' OWN PTX module name (campaign #443 W2c) —
+/// The F16 arms' OWN PTX module name —
 /// `scaled_cast_add_f16.cu` is a SEPARATE translation unit (see that file's
 /// module doc), so it needs a distinct module name from [`MODULE_NAME`].
 const MODULE_NAME_F16: &str = "jammi_kernels_scaled_cast_add_f16";
@@ -66,9 +66,8 @@ pub(crate) fn cuda_fwd(
         // on ONE operand, but neither pair is a supported COMBINATION (no
         // such kernel exists) — checking each side separately would
         // silently ADMIT that unsupported pair at `n == 0` while the
-        // non-empty match refuses it, exactly the shape-dependent dtype
-        // domain split campaign #443's D1 audit named for `alloc_empty`'s
-        // callers (family D). Matching the pair directly here closes it.
+        // non-empty match refuses it — a shape-dependent dtype domain
+        // split. Matching the pair directly here rules it out.
         match (s1.dtype(), s2.dtype()) {
             (DType::F32, DType::F32)
             | (DType::F32, DType::BF16)
@@ -90,7 +89,7 @@ pub(crate) fn cuda_fwd(
         ));
     }
 
-    // K2 (refuse, don't compute past the domain): see
+    // Refuse, don't compute past the domain: see
     // `crate::ops::launch_domain::check_elem_count_fits_u32`'s own doc —
     // the launch grid and the kernel's own bounds check are both 32-bit.
     super::check_elem_count_fits_u32("scaled_cast_add", n)?;

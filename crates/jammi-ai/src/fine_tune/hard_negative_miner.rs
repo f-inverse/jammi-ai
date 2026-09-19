@@ -7,7 +7,7 @@
 //!
 //! jammi mines them with its own retrieval primitive: build the cosine
 //! [`VectorIndex`] over the candidate corpus (the dogfooding story — the same
-//! index `search` and the S9 neighbour graph use), then for each anchor retrieve
+//! index `search` and the neighbour graph use), then for each anchor retrieve
 //! the top-`k` nearest candidates as hard negatives.
 //!
 //! # False-negative guard
@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(mined, vec!["near".to_string()]);
     }
 
-    /// A3 — a wrong-width or non-finite anchor is a TYPED refusal (the
+    /// A wrong-width or non-finite anchor is a TYPED refusal (the
     /// schema class every caller-side query fault maps to), never a backend
     /// error string and never a panic: the anchor is validated against the
     /// index's own width before `search` runs.

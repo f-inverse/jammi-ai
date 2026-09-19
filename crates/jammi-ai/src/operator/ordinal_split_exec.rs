@@ -1,22 +1,20 @@
 //! `OrdinalSplitExec` — the N-way fan-out below `InferenceExec`, keyed on a
-//! GLOBAL `_ordinal` assigned before fan-out (#540 RANGESPLIT).
+//! GLOBAL `_ordinal` assigned before fan-out.
 //!
-//! Two design rounds (`rangesplit-design.md`, `rangesplit-design-v2.md`) executed
-//! every premise below against DataFusion 54.1's `EnforceDistribution` /
-//! `EnforceSorting` — see the implementation contract's §0 executed record.
+//! Every premise below holds against DataFusion 54.1's `EnforceDistribution`
+//! / `EnforceSorting`.
 //!
 //! A design that pre-assigns each row to a fixed partition through a
 //! bounded channel (a spawned background writer pushing onto per-partition
 //! `tokio::mpsc` channels) is unsound for this node: `execute()` is not
-//! guaranteed to be called for every partition (the shape EVERY
-//! pre-RANGESPLIT call site uses, `.execute(0, ..)` alone, calls it for
-//! exactly one), and a receiver that is never taken keeps its channel open
-//! forever — the writer then wedges trying to fill that partition's channel
+//! guaranteed to be called for every partition (a single-consumer call
+//! site's `.execute(0, ..)` alone calls it for exactly one), and a receiver that is never taken
+//! keeps its channel open forever — the writer then wedges trying to fill that partition's channel
 //! past capacity, and every OTHER partition wedges behind it, since the
 //! writer is the single thread advancing all of them. See "Mechanism" below
 //! for the design that makes this class of wedge structurally impossible.
 //!
-//! # Mechanism (RS1, RS2, RS3)
+//! # Mechanism
 //!
 //! `OrdinalSplitExec::new(input, n)` requires `input` at a SINGLE partition
 //! (`required_input_distribution = [Distribution::SinglePartition]`) and
@@ -27,8 +25,8 @@
 //! `tokio::sync::Mutex`; a partition's stream, EVERY time it is polled,
 //! locks the mutex, pulls exactly the next batch off the shared upstream
 //! stream, assigns it the next slice of the GLOBAL, contiguous, 0-based
-//! `_ordinal` counter (fixed fold order — deterministic, no unseeded RNG,
-//! family J), and returns it — this is DEMAND-DRIVEN: a batch is handed to
+//! `_ordinal` counter (fixed fold order — deterministic, no unseeded RNG),
+//! and returns it — this is DEMAND-DRIVEN: a batch is handed to
 //! WHICHEVER partition happens to poll next, never pre-assigned to a fixed
 //! partition ahead of time.
 //!
@@ -45,7 +43,7 @@
 //! `execute(0)` alone yields ALL of `input`'s rows (every batch request
 //! from the shared stream is satisfied by partition 0's own polls) — which
 //! is also the correct meaning for a single consumer, and is what makes
-//! every pre-RANGESPLIT `.execute(0, ..)` call site (session::annotate_plan
+//! every single-consumer `.execute(0, ..)` call site (session::annotate_plan
 //! via query::builder.rs's fluent chain in particular) see every row
 //! regardless of `n`, with no separate coalesce needed above this node.
 //!
@@ -64,10 +62,9 @@
 //! "current generation" slot would have a second run's call EVICT a
 //! first, still-in-progress run's generation, making the first run's
 //! LATER partition calls (still its own context) incorrectly start a
-//! THIRD, fresh generation instead of rejoining their own run — this was
-//! executed and confirmed against exactly this shape before the map
-//! replaced a single slot (`two_interleaved_runs_each_see_every_row_exactly_once`'s
-//! own history). A `Generation` bundles the shared pull with a `claimed:
+//! THIRD, fresh generation instead of rejoining their own run
+//! (`two_interleaved_runs_each_see_every_row_exactly_once` pins this). A
+//! `Generation` bundles the shared pull with a `claimed:
 //! Vec<bool>` recording which partition indices this generation has
 //! already handed a stream to; its run identity is the map's OWN key —
 //! never duplicated onto the `Generation` itself.
@@ -133,8 +130,8 @@
 //! Each partition's OWN received ordinals are still strictly increasing
 //! (a partition never polls itself concurrently, so its own successive
 //! pulls happen in program order under the mutex), which is what backs
-//! `InferenceExec`'s `[_ordinal ASC]` publication (RS2) — though a
-//! partition's own ordinals are no longer contiguous in general (they are
+//! `InferenceExec`'s `[_ordinal ASC]` publication — though a partition's
+//! own ordinals are not contiguous in general (they are
 //! whichever slice of the global sequence it happened to pull), only
 //! GLOBALLY contiguous, WITHIN ONE GENERATION, across the union of every
 //! partition polled.
@@ -150,11 +147,11 @@
 //! an `External(Box<JammiError>)` payload BY VALUE, which only works if
 //! the value crossing this node is
 //! the original, not a `String` round-trip through `DataFusionError::
-//! Internal(e.to_string())` (an EARLIER version of this arm did exactly
-//! that, re-classing every typed error below the split into an untyped,
-//! "please file a bug report"-flavoured `Internal` string — a confident
-//! silent-wrong-shape across gRPC/wire/Python, since typed-vs-`Internal`
-//! is exactly what the wire and the Python bindings branch on). Every
+//! Internal(e.to_string())` — that would re-class every typed error below
+//! the split into an untyped, "please file a bug report"-flavoured
+//! `Internal` string, a silent wrong shape across gRPC/wire/Python, since
+//! typed-vs-`Internal` is exactly what the wire and the Python bindings
+//! branch on. Every
 //! OTHER partition of the same generation simply ends cleanly (`None`,
 //! like normal end-of-data) once `terminated` is set — never a second
 //! copy of the error, never `DataFusionError::Shared` (which cannot yield
@@ -171,7 +168,7 @@
 //! placement), and never generated by `InferenceRunner` when this node is the
 //! child (`InferenceRunner` still self-generates a per-run sequence as a
 //! documented fallback for a caller that builds `InferenceExec` directly on a
-//! plan with no `_ordinal` column, e.g. today's tests and the `n == 1`
+//! plan with no `_ordinal` column, e.g. unit tests and the `n == 1`
 //! production shape below, which never inserts this node at all — see
 //! `inference::schema::extract_or_generate_ordinals`).
 //!
@@ -188,31 +185,27 @@
 //! cannot pass by having nothing to check) on a 120-cell grid: `{PIPE,
 //! UDTF} x {bare, GROUP BY, ORDER BY, WHERE, LIMIT} x N in {1,2,4} x
 //! target_partitions in {1,2,4,8}` (`tests/it/rangesplit.rs`; dropping the
-//! `benefits_from_input_partitioning` override sends exactly HALF of those
-//! cells RED — 60 of 120 as of this tree (re-measured by executing that
-//! one-line mutation and reading the test's own failure count; re-measure
-//! the same way after any change to this file, since the exact count
-//! shifts with which optimizer passes fire). It inserts one
+//! `benefits_from_input_partitioning` override fails exactly HALF of those
+//! cells, 60 of 120 — the exact count shifts with which optimizer passes
+//! fire). It inserts one
 //! `CoalescePartitionsExec` BELOW this split instead, satisfying
 //! `SinglePartition` when the split's own input plan has more than one
 //! partition (the UDTF/annotate path's scan).
 //!
-//! A merge keyed `[_row_id, _ordinal]` (the first design round's proposal)
-//! DIVERGES from the 1-partition row sequence on the UDTF path's unsorted
-//! input, and the optimizer deletes a user's `ORDER BY _row_id` SortExec on
-//! the strength of that FALSE published ordering, deadlocking the collect —
-//! executed and reproduced in the design round's probes, and re-confirmed
-//! against this file's own real types: `SanityCheckPlan` rejects an SPM
+//! A merge keyed `[_row_id, _ordinal]` DIVERGES from the 1-partition row
+//! sequence on the UDTF path's unsorted input, and the optimizer deletes a
+//! user's `ORDER BY _row_id` SortExec on the strength of that FALSE
+//! published ordering, deadlocking the collect; `SanityCheckPlan` rejects an SPM
 //! keyed `[_row_id, _ordinal]` whose child (`InferenceExec`) only publishes
 //! `[_ordinal]`. A merge (and `InferenceExec`'s own published ordering)
 //! keyed on `[_ordinal]` ALONE does not have this failure mode: it is
 //! identical, PER ROW, over every column but `_latency_ms`, to the
 //! 1-partition sequence at every `N` on both a pre-sorted and an unsorted
-//! input shape (`tests/it/rangesplit.rs`'s per-row RS2 oracle), and the
+//! input shape (`tests/it/rangesplit.rs`'s per-row oracle), and the
 //! optimizer keeps a real `SortExec` for a user `ORDER BY` rather than
 //! trusting a stale claim.
 //!
-//! # Residency (RS3)
+//! # Residency
 //!
 //! This node buffers NOTHING internally: a batch is handed directly from
 //! the shared pull to whichever partition's poll requested it, with no
@@ -225,19 +218,14 @@
 //! have been handed a stream this generation), never a batch or a
 //! reference to one. None of this is a queue or a copy of a `RecordBatch`,
 //! by inspection of the types alone — there is deliberately NO runtime
-//! residency instrument (no counter, no gauge) anywhere in this node: an
-//! EARLIER version tracked a "does partition p currently hold a batch it
-//! has not asked to supersede" flag and asserted its own popcount never
-//! exceeded `n`; that assertion is true of a length-`n` `Vec<bool>`
-//! unconditionally (counting `true`s in a fixed-length vector can never
-//! exceed the vector's own length), so it measured nothing about the
-//! SYSTEM and was removed along with the flag it counted, rather than
-//! replaced by a better one — the residency bound stated above is a
-//! structural argument over the field list, never an instrumented one, and
-//! must not be re-added as a "measured" claim without a real, falsifiable
-//! instrument backing it.
+//! residency instrument (no counter, no gauge) anywhere in this node. A
+//! per-partition "holds a batch" flag whose popcount is asserted `<= n` is
+//! true of a length-`n` `Vec<bool>` unconditionally, so it measures nothing
+//! about the SYSTEM; the residency bound stated above is a structural
+//! argument over the field list, and must not be stated as a "measured"
+//! claim without a real, falsifiable instrument backing it.
 //!
-//! # The wire (RS6)
+//! # The wire
 //!
 //! `OrdinalSplitExec` has no `NodeTag`, no `plan.proto` message, and no
 //! `JammiCodec` encode/decode arm — a plan containing it surfaces the SAME
@@ -248,13 +236,12 @@
 //! this node feeds would become its own stage of N TASKS, each executing
 //! exactly ONE partition — in a SEPARATE process per task in general,
 //! which cannot share this node's in-process `tokio::sync::Mutex`-guarded
-//! pull at all). This is deliberate for v1: `InferenceConfig::partitions`
-//! defaults to `1`, which never inserts this node at all, so every existing
-//! wire submission (the distributed oracle's `build_embedding_plan` call,
-//! `tests/distributed/main.rs`) is unaffected. Configuring `partitions > 1`
-//! is an in-process-only capability; RS6 is named on #540 for a future
-//! design (a per-task-local split reconstructed from a contiguous key RANGE
-//! rather than a shared in-process stream) rather than built here.
+//! pull at all). `InferenceConfig::partitions` defaults to `1`, which never
+//! inserts this node at all, so a wire submission (the distributed oracle's
+//! `build_embedding_plan` call, `tests/distributed/main.rs`) is unaffected.
+//! Configuring `partitions > 1` is an in-process-only capability; a wire
+//! form would need a per-task-local split reconstructed from a contiguous
+//! key RANGE rather than a shared in-process stream.
 
 use std::collections::HashMap;
 use std::fmt::{self, Formatter};
@@ -693,8 +680,8 @@ mod tests {
         assert_eq!(all_ordinals, expected);
     }
 
-    /// A consumer that executes ONLY partition 0 of an n=4 split (the shape
-    /// every pre-RANGESPLIT call site uses) must see ALL of the source's
+    /// A consumer that executes ONLY partition 0 of an n=4 split (the
+    /// single-consumer shape) must see ALL of the source's
     /// rows, and must complete — never wedge (a spawned-writer-plus-
     /// bounded-channel design wedges here: partitions 1-3's receivers are
     /// never taken, so their channels fill and the single writer thread
@@ -771,7 +758,7 @@ mod tests {
         assert_eq!(total, 37 * 5);
     }
 
-    /// RS2's generation-boundary property, both arms: (a) executing the
+    /// The generation-boundary property, both arms: (a) executing the
     /// SAME partition index again under a DIFFERENT `TaskContext` (a
     /// genuinely new run) sees every row again (a fresh generation, not
     /// `Ok(0 rows)`); (b) a partition asked for LATE under that SAME
@@ -842,7 +829,7 @@ mod tests {
         );
     }
 
-    /// F1: an upstream that raises a TYPED error (an `External(Box<
+    /// An upstream that raises a TYPED error (an `External(Box<
     /// JammiError>)` payload, or a native `DataFusionError::
     /// ResourcesExhausted`) after `n_ok` good batches. `err` is called
     /// fresh each time `execute()` runs so a second poll (a different
@@ -935,14 +922,14 @@ mod tests {
         }
     }
 
-    /// F1's mechanism oracle: a typed refusal raised below the split
-    /// reaches the caller classified IDENTICALLY at `n=4` and with no
-    /// split at all (`n=1`, still a real `OrdinalSplitExec` — this crate
-    /// never omits the node, `wrap_with_split_and_merge` does that at a
-    /// layer above). Mutation: reinstating the `to_string()`/`Internal`
-    /// re-wrap (either error arm in `execute()`'s `unfold` body) reds this
-    /// test, since `DataFusionError::Internal(String)` no longer carries
-    /// an `External(Box<JammiError>)` payload for the classifier to
+    /// A typed refusal raised below the split reaches the caller classified
+    /// IDENTICALLY at `n=4` and with no split at all (`n=1`, still a real
+    /// `OrdinalSplitExec` — this crate never omits the node,
+    /// `wrap_with_split_and_merge` does that at a layer above). A
+    /// `to_string()`/`Internal` re-wrap in either error arm of `execute()`'s
+    /// `unfold` body would fail this test, since
+    /// `DataFusionError::Internal(String)` carries no
+    /// `External(Box<JammiError>)` payload for the classifier to
     /// destructure, and is never recognised by `resources_exhausted_
     /// message` either — both err sides fall through to the generic
     /// `JammiError::DataFusion(Internal(..))` arm, which `classify` panics
@@ -990,16 +977,15 @@ mod tests {
         }
     }
 
-    /// The generation-termination property this replaces: a failing
-    /// upstream terminates the generation for every partition (the ONE
-    /// whose poll observed the failure returns it typed; every OTHER
-    /// partition of the same generation ends cleanly, `None`, like normal
-    /// end-of-data — never a second copy of the error). Mutation: making
-    /// every partition return the SAME stored error (the reverted design)
-    /// is not distinguishable from this property by ROW OUTCOME alone,
-    /// which is exactly why F1 replaced that design — a partition ending
-    /// cleanly and a partition never having been polled are both `Ok`
-    /// arms here; the FAILURE classification itself is covered by
+    /// The generation-termination property: a failing upstream terminates
+    /// the generation for every partition (the ONE whose poll observed the
+    /// failure returns it typed; every OTHER partition of the same
+    /// generation ends cleanly, `None`, like normal end-of-data — never a
+    /// second copy of the error). Every partition returning the SAME stored
+    /// error is not distinguishable from this property by ROW OUTCOME alone
+    /// — a partition ending cleanly and a partition never having been
+    /// polled are both `Ok` arms here; the FAILURE classification itself is
+    /// covered by
     /// `a_typed_refusal_below_the_split_classifies_identically_at_every_n`
     /// above.
     #[tokio::test]

@@ -1,16 +1,14 @@
-//! Issue #351 (GGUF/k-quant inference + fail-loud QLoRA), phase-6 acceptance
-//! suite. Every fixture below is built PROGRAMMATICALLY (no checked-in
+//! GGUF/k-quant inference + fail-loud QLoRA acceptance suite. Every
+//! fixture below is built PROGRAMMATICALLY (no checked-in
 //! binary `.gguf`/`.safetensors` file): a tiny BERT-shaped checkpoint's
 //! tensors are generated deterministically, written once as an ordinary
 //! `model.safetensors` (the F32 reference) and once as a `model.gguf` (via
 //! `candle_core::quantized::gguf_file::write`, quantizing the matmul-site
 //! tensors and densifying everything else at `F32` — exactly the shape
-//! `QTensor::quantize` + `gguf_file::write` the design pin calls for).
+//! `QTensor::quantize` + `gguf_file::write` produce).
 //!
-//! These tests do not exist on the pre-#351 tree (the RED oracle the
-//! design's phase-6 gate names): `model::WeightsFormat::Gguf`,
-//! `LoadedModel::quantization`, and the `model.gguf` resolver/backend arms
-//! this file exercises are all new in this unit.
+//! The surfaces under test: `model::WeightsFormat::Gguf`,
+//! `LoadedModel::quantization`, and the `model.gguf` resolver/backend arms.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -35,7 +33,7 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 // ─────────────────────────────────────────────────────────────────────────
-// Deterministic fixture construction (family J: no unseeded RNG anywhere)
+// Deterministic fixture construction (no unseeded RNG anywhere)
 // ─────────────────────────────────────────────────────────────────────────
 
 /// FNV-1a over `name`'s bytes — a stable per-tensor-name seed so every
@@ -51,7 +49,7 @@ fn name_seed(name: &str) -> u64 {
 }
 
 /// `n` deterministic small-magnitude values, keyed by `name` — fixed fold
-/// order, no RNG (family J).
+/// order, no RNG.
 fn det_vec(name: &str, n: usize) -> Vec<f32> {
     let seed = name_seed(name) as f64;
     (0..n)
@@ -208,7 +206,7 @@ fn write_gguf_checkpoint(
 ) {
     std::fs::create_dir_all(dir).unwrap();
     let mut names: Vec<&String> = tensors.keys().collect();
-    names.sort(); // deterministic write order (family J)
+    names.sort(); // deterministic write order
     let mut qtensors: Vec<(String, QTensor)> = Vec::with_capacity(names.len());
     for name in names {
         let t = &tensors[name];
@@ -275,7 +273,8 @@ async fn try_resolve_and_load(
     backend.load(&resolved, &device_config())
 }
 
-/// The standard tiny fixture geometry every A1/A2/A4 test below shares:
+/// The standard tiny fixture geometry every inference/identity/error test below
+/// shares:
 /// `hidden=32, layers=1, heads=2, intermediate=128` — small enough to run
 /// fast, `hidden % 32 == 0` so `q8_0`/`q4_0` quantize without a block-size
 /// refusal (both need `last_dim % 32 == 0`).
@@ -311,7 +310,7 @@ fn small_fixture(device: &Device) -> (HashMap<String, Tensor>, serde_json::Value
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// A1: resolve -> load -> embed through the public embedding path (CPU);
+// Resolve -> load -> embed through the public embedding path (CPU);
 // cosine vs. the f32 safetensors run of the SAME checkpoint; all values
 // finite by COUNT.
 // ─────────────────────────────────────────────────────────────────────────
@@ -361,7 +360,7 @@ async fn gguf_embedding_matches_f32_reference_within_a_measured_cosine_floor() {
         cosines.push(dot / (na * nb));
     }
 
-    // F9: every embedding value must be finite, BY COUNT (never a "some
+    // Every embedding value must be finite, BY COUNT (never a "some
     // finite" vacuous pass).
     assert_eq!(
         finite_values, total_values,
@@ -370,8 +369,8 @@ async fn gguf_embedding_matches_f32_reference_within_a_measured_cosine_floor() {
 
     let mean_cosine: f32 = cosines.iter().sum::<f32>() / cosines.len() as f32;
     let min_cosine: f32 = cosines.iter().cloned().fold(f32::INFINITY, f32::min);
-    // MEASURED (F9), not assumed: on this workspace's hermetic CPU dev/CI
-    // arm (2026-08-30), a `q8_0`-quantized 1-layer/32-dim BERT tower's
+    // MEASURED, not assumed: on the hermetic CPU dev/CI arm, a
+    // `q8_0`-quantized 1-layer/32-dim BERT tower's
     // pooled embedding vs. its F32 reference (identical underlying weight
     // values) measured `mean_cosine=0.99999964`, `min_cosine=0.9999995`
     // over the five-sentence fixture set above — `q8_0` is the
@@ -385,12 +384,9 @@ async fn gguf_embedding_matches_f32_reference_within_a_measured_cosine_floor() {
         mean_cosine > 0.999,
         "mean cosine {mean_cosine} (min {min_cosine}) below the measured floor; cosines={cosines:?}"
     );
-    // MEASURED (F9), not assumed — re-confirmed on this workspace's hermetic
-    // CPU dev/CI arm (2026-08-31, issue #351 wave 5 audit): `min_cosine=
-    // 0.9999995`, matching the doc comment above exactly. `min_cosine` was
-    // previously computed and printed into failure messages but never
-    // itself asserted — a per-sentence outlier well below the mean could
-    // slip through unnoticed. The floor here (0.999, the SAME wide-margin
+    // MEASURED, not assumed: `min_cosine=0.9999995` on the same arm.
+    // `min_cosine` is asserted in its own right — a per-sentence outlier
+    // well below the mean would otherwise slip through. The floor here (0.999, the SAME wide-margin
     // floor `mean_cosine` already clears) is a real, non-vacuous bound: a
     // broken dequantize/dtype-cast path corrupting even ONE sentence's
     // embedding would land its cosine far below this, not merely nudge the
@@ -402,7 +398,7 @@ async fn gguf_embedding_matches_f32_reference_within_a_measured_cosine_floor() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// A2: ModelIdentity.quantization is Some(...); definition_hash differs from
+// ModelIdentity.quantization is Some(...); definition_hash differs from
 // the f32 run's; digest byte-mutation changes content_digest; in-place
 // mutation marks a warm ModelCache entry stale.
 // ─────────────────────────────────────────────────────────────────────────
@@ -550,7 +546,7 @@ async fn warm_cache_reload_after_gguf_in_place_mutation_reports_a_fresh_digest()
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// A3 (QLoRA): per-site input-gradient parity between a `FrozenBase::Quantized`
+// QLoRA: per-site input-gradient parity between a `FrozenBase::Quantized`
 // site and a `FrozenBase::Dense` (dequantized) reference, plus a
 // loss-decrease smoke check on both.
 // ─────────────────────────────────────────────────────────────────────────
@@ -668,8 +664,8 @@ fn qlora_input_gradient_parity_vs_dense_dequantized_reference() {
         .map(|(a, b)| (a - b).abs())
         .fold(0f32, f32::max);
 
-    // MEASURED (F9), not assumed, on this workspace's hermetic CPU dev/CI
-    // arm (2026-08-30), `out_f=8, in_f=32, rank=4`:
+    // MEASURED, not assumed, on the hermetic CPU dev/CI arm,
+    // `out_f=8, in_f=32, rank=4`:
     // `fwd_max_abs_diff=1.9994e-4` (the q8_0 forward-rounding error — the
     // fused quantized-matmul kernel's own summation order differs slightly
     // from a plain dense matmul over the identical dequantized weight),
@@ -680,7 +676,7 @@ fn qlora_input_gradient_parity_vs_dense_dequantized_reference() {
     // tolerances below (1e-2 for BOTH) are a wide margin over the measured
     // forward diff and are trivially satisfied — not vacuously, though:
     // asserted against the measured `grad_max_abs_diff` reported above
-    // rather than assumed, per F9.
+    // rather than assumed.
     assert!(
         fwd_max_abs_diff < 1e-2,
         "forward max abs diff {fwd_max_abs_diff} exceeds tolerance"
@@ -722,18 +718,15 @@ fn qlora_input_gradient_parity_vs_dense_dequantized_reference() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Advisory fold (issue #351 wave 5 audit): a training-mode `Quantized`
-// forward with `lora_dropout > 0`, so the esc-032/033 dropout-stream
-// reservation actually fires on the `FrozenBase::Quantized` arm at least
-// once. `LoraLinear::forward`'s own doc ("Dropout key reservation")
-// documents that `DropoutMasks::next_key` is called EXACTLY ONCE per
-// training forward, reserved UNIFORMLY regardless of base storage format —
-// but every training-mode forward this it-suite drove before this fold used
-// `lora_dropout == 0` (the A3 parity test above explicitly disables
-// training: `lora.set_training(false)`), so a Quantized base's dropout
-// reservation had never actually executed under test. Drives
-// `jammi_lora::LoraLinear` directly (its own public API — no change to
-// `jammi-lora` itself).
+// A training-mode `Quantized` forward with `lora_dropout > 0`, so the
+// dropout-stream reservation actually fires on the `FrozenBase::Quantized`
+// arm at least once. `LoraLinear::forward`'s own doc ("Dropout key
+// reservation") documents that `DropoutMasks::next_key` is called EXACTLY
+// ONCE per training forward, reserved UNIFORMLY regardless of base storage
+// format; the QLoRA parity test above disables training
+// (`lora.set_training(false)`), so this is the test that executes a
+// Quantized base's dropout reservation. Drives `jammi_lora::LoraLinear`
+// directly through its own public API.
 // ─────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -789,8 +782,8 @@ fn quantized_base_training_forward_with_dropout_reserves_the_dropout_stream() {
     // `lora_dropout > 0` must advance the dropout-stream position by
     // EXACTLY one (`DropoutMasks::next_key` called once, per `forward`'s
     // own doc) — proof the reservation fired on this arm, not skipped
-    // (which would leave the position at 0, esc-033's O(1)-resume
-    // invariant silently broken for every Quantized-base QLoRA run) and
+    // (which would leave the position at 0, the O(1)-resume invariant
+    // silently broken for every Quantized-base QLoRA run) and
     // not double-drawn (which would advance it by two).
     assert_eq!(
         lora.dropout_position().unwrap(),
@@ -810,7 +803,7 @@ fn quantized_base_training_forward_with_dropout_reserves_the_dropout_stream() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// A4: typed-error suite.
+// Typed-error suite.
 // ─────────────────────────────────────────────────────────────────────────
 
 fn model_err_message(err: &JammiError) -> String {
@@ -849,32 +842,25 @@ async fn other_gguf_filename_without_the_canonical_name_is_a_typed_refusal() {
     );
 }
 
-/// Dual-format precedence pin (oracle advisory (b), issue #351 wave 12; test
-/// honesty fold, issue #351 wave 13 audit advisory 3; two-phase rework,
-/// issue #351 wave 14 round-8 audit): a LOCAL directory carrying BOTH
+/// Dual-format precedence pin: a LOCAL directory carrying BOTH
 /// `model.safetensors` and `model.gguf` resolves to
 /// `WeightsFormat::Safetensors`, with the `model.gguf` sibling wholly
-/// ignored — the frozen precedence `resolve_local` has always applied, now
-/// pinned so a future refactor of the local path can't accidentally
-/// acquire the Hub-path defect (a fallback keyed off download/read
-/// FAILURE rather than presence).
+/// ignored — the frozen precedence of `resolve_local`, pinned so a
+/// refactor of the local path cannot acquire a fallback keyed off
+/// download/read FAILURE rather than presence.
 ///
-/// The single-phase predecessor of this test corrupted `model.gguf`
-/// BEFORE ever calling `try_resolve`, which destroyed its own
-/// discriminator: a resolver refactored to "try gguf, fall back to
-/// safetensors only on a gguf READ failure" — the exact class this unit
-/// forbids — would ALSO take the safetensors fallback against an
-/// already-corrupt file, passing that test identically to the correct
-/// presence-keyed implementation. This version instead runs the SAME set
-/// of assertions in two phases against the SAME directory:
+/// Corrupting `model.gguf` BEFORE resolving would destroy the
+/// discriminator: a resolver that tries gguf and falls back to safetensors
+/// only on a gguf READ failure would ALSO take the safetensors fallback
+/// against an already-corrupt file. So the SAME assertions run in two
+/// phases against the SAME directory:
 ///
 /// - Phase 1 (presence-precedence): both `model.safetensors` and
 ///   `model.gguf` are left VALID. A presence-keyed resolver (the correct,
 ///   frozen behavior) picks safetensors here regardless of whether
 ///   `model.gguf` is readable. A read-failure-keyed resolver would instead
 ///   read the valid `model.gguf` successfully and return
-///   `WeightsFormat::Gguf`, FAILING this phase's format/path assertions —
-///   this is the discriminator the corrupt-before-resolve version lost.
+///   `WeightsFormat::Gguf`, FAILING this phase's format/path assertions.
 /// - Phase 2 (no-read): `model.gguf` is corrupted only AFTER phase 1 has
 ///   already resolved successfully, and the identical assertions are
 ///   re-checked. This pins that the format decision never depends on
@@ -1051,7 +1037,8 @@ async fn missing_matmul_site_tensor_is_a_typed_refusal_listing_the_key() {
 }
 
 /// A GGUF resolve for a HF-CLAP-typed config: "quantized serving not
-/// supported for this architecture" (K2, never a silent degradation).
+/// supported for this architecture" (a typed refusal, never a silent
+/// degradation).
 #[tokio::test]
 async fn unsupported_architecture_gguf_is_a_typed_refusal() {
     let device = Device::Cpu;

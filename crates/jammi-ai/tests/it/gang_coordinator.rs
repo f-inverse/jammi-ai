@@ -1,10 +1,8 @@
-//! Plan 67 U5b-1b-ii — the coordinator body and the topology fan-out, driven
-//! through the REAL claim → `run_claimed_job` → `run_spec` path over a
-//! hermetic session (no server, no member: what a library process can do).
+//! The coordinator body and the topology fan-out, driven through the REAL
+//! claim → `run_claimed_job` → `run_spec` path over a hermetic session (no
+//! server, no member: what a library process can do).
 //!
-//! Three rows, each RED at the base (no coordinator body, no topology
-//! decision, a submit edge that refused a two-rank job on a one-device
-//! host):
+//! Three properties:
 //!
 //! - (d) a `world_size` within the serveable world but beyond this host's
 //!   own devices SUBMITS and REACHES ASSEMBLY: with no fleet member to list,
@@ -16,14 +14,14 @@
 //!   as it found them;
 //! - the local fan-out: a `local_ranks = 2` host runs a two-rank job through
 //!   the real `run_spec` as an in-process `Local` gang and publishes an
-//!   adapter whose bytes EQUAL a U4b-shaped `LocalGang` run of the same
+//!   adapter whose bytes EQUAL a two-rank `LocalGang` run of the same
 //!   fixture (same rows, config, seed, base model) driven directly through
 //!   `TrainingLoop::run` — the artifact is the oracle, not a hook. The job
 //!   is a `graph_fine_tune`: the graph arm is the one `Resident` source
-//!   `run_spec` binds for a training job at this tip (a column-source
-//!   `fine_tune` binds `Streamed`, which the trainer refuses at `world > 1`
-//!   until U4b's streamed arm lands — the same rows through the same
-//!   `Local` gang are what the property is about, not the arm).
+//!   `run_spec` binds for a training job (a column-source `fine_tune` binds
+//!   `Streamed`, which the trainer refuses at `world > 1` — the same rows
+//!   through the same `Local` gang are what the property is about, not the
+//!   arm).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -139,8 +137,8 @@ fn graph_sources() -> GraphFineTuneSources {
 /// (`sort_into_graph_read_order`, `GRAPH_READ_ORDER_RULE_V1`), through the
 /// same seeded sampler. `graph_nodes`/`graph_edges` are declared in a
 /// bidirected shape (two triangles + a bridge), NOT already `(id,
-/// text)`/`(src, dst)`-sorted — sorting here is required, not cosmetic; a
-/// closing audit caught this omission by the byte mismatch it caused.
+/// text)`/`(src, dst)`-sorted — sorting here is required, not cosmetic:
+/// without it the reference's bytes do not match the job's.
 pub(crate) fn graph_loader() -> TrainingDataLoader {
     let mut nodes: Vec<TextNode> = graph_nodes()
         .into_iter()
@@ -442,7 +440,7 @@ async fn a_moved_claim_exits_the_coordinator_body_with_no_write() {
 /// device), a two-rank `graph_fine_tune` runs through the REAL `run_spec`
 /// as an in-process `Local` gang (`TopologyDecision::Local { world: 2 }`,
 /// no coordinator body), completes, and publishes an adapter whose bytes
-/// equal the U4b-shaped `LocalGang` reference's rank-0 adapter over the
+/// equal the two-rank `LocalGang` reference's rank-0 adapter over the
 /// same sampled rows (`TrainingDataLoader::from_graph` over the same seeded
 /// sampler), config, seed and base model.
 #[tokio::test(flavor = "multi_thread")]
@@ -492,7 +490,7 @@ async fn a_local_ranks_two_host_fans_a_two_rank_job_out_through_run_spec_and_pub
     assert_eq!(after.status, "completed", "{after:?}");
     assert_eq!(after.error, None);
 
-    // The seed split, through the real `run_spec` (DESIGN.md §4): the two
+    // The seed split, through the real `run_spec`: the two
     // ranks' dropout seeds differ (rank 0 keeps `config.seed`, the identity)
     // and every head layer's own dropout Philox seed is the one its rank was
     // given, while the ranks' pre-step adapter weights are byte-identical —
@@ -542,9 +540,9 @@ async fn a_local_ranks_two_host_fans_a_two_rank_job_out_through_run_spec_and_pub
     );
 }
 
-/// UNITS.md § U5b-2's `BackOff` row, executed against the tree as the
-/// refutation of its premise: a crashed coordinator's live `building`
-/// training-set row is NEVER met by the successor at this tip. The
+/// A crashed coordinator's live `building` training-set row is NEVER met
+/// by the successor, so the training path needs no `BackOff`
+/// disposition. The
 /// training-set producer names every table uniquely (`ResultStore::
 /// create_table`: `{source}__{task}__{model}__{nanos}_{uuid}`), anchors a
 /// registered source `UnpinnedAtInstant` (`training_set::
@@ -648,14 +646,14 @@ async fn a_live_building_training_set_row_left_by_a_crashed_coordinator_is_never
     orphan.abort().await.expect("the fixture's own abort");
 }
 
-/// K4, pinned (UNITS.md § U5b-1b-iii): a `world_size == 1` job through the
-/// REAL claim → `run_claimed_job` → `run_spec` path is today's loop path —
+/// A `world_size == 1` job through the REAL claim → `run_claimed_job` →
+/// `run_spec` path is the plain loop path —
 /// the topology is `Single`, the attempt's hold is registered as the
 /// `LoopClaimer`, rank 0 runs as `Holder(LoopClaimer)` and nothing else
 /// runs, the coordinator body is never entered, and the row completes
-/// through the loop's own finalize. Mutation: `TopologyDecision::decide`
-/// answering `Peer` for `world_size <= 1` sends the job through the
-/// coordinator (a `ShortListed` end, the `Coordinator` role) → RED.
+/// through the loop's own finalize. A `TopologyDecision::decide` that
+/// answered `Peer` for `world_size <= 1` would send the job through the
+/// coordinator (a `ShortListed` end, the `Coordinator` role).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_single_rank_job_runs_as_the_loop_claimer_and_never_traverses_the_coordinator() {
     let (session, _dir) = coordinating_session(|_| {}).await;

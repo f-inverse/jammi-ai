@@ -19,15 +19,15 @@ use crate::model::{BackendType, ModelSource, ModelTask};
 use crate::operator::ordinal_split_exec::ORDINAL_COLUMN;
 use jammi_db::store::manifest::ComputeDeviceKind;
 
-/// RS7's default forward admission, scoped to ONE `InferenceExec` INSTANCE
+/// The default forward admission, scoped to ONE `InferenceExec` INSTANCE
 /// (never a whole device — see `forward_permits`' field doc for what that
 /// means for two concurrent instances sharing a GPU): `available_
 /// parallelism()` concurrent forwards on the CPU (bounded parallel CPU
-/// inference actually helps — RS7's CPU speedup measurement), 1 on a CUDA
-/// or Metal device (the conservative default until a future unit wires
-/// this to `concurrency::GpuScheduler`'s own admission, which is the named
-/// seam for DEVICE-WIDE admission across every concurrent instance — e.g.
-/// multiple small models, or a scheduler-approved batch split).
+/// inference actually helps — see `InferenceRunner`'s CPU speedup
+/// measurement), 1 on a CUDA or Metal device (a conservative default:
+/// DEVICE-WIDE admission across every concurrent instance — e.g. multiple
+/// small models, or a scheduler-approved batch split — is
+/// `concurrency::GpuScheduler`'s seam, not this one).
 fn default_forward_permits(device_kind: ComputeDeviceKind) -> usize {
     match device_kind {
         ComputeDeviceKind::Cpu => std::thread::available_parallelism()
@@ -57,7 +57,7 @@ pub struct InferenceExec {
     regression_form: Option<DistributionForm>,
     /// Input columns copied verbatim to the end of every output batch.
     passthrough: Vec<String>,
-    /// The device KIND (contract `feat_500-wave4` §9 B3) this descriptor
+    /// The device KIND this descriptor
     /// declares it must run on: a REQUIRED constructor argument, stamped at
     /// every call site from `session.compute_device().kind()` (or, for a
     /// submitter placing this plan onto another kind, that kind directly —
@@ -66,7 +66,7 @@ pub struct InferenceExec {
     /// ballista`'s codec, `codec.rs`).
     device_kind: ComputeDeviceKind,
     properties: Arc<PlanProperties>,
-    /// RS7: the forward admission shared by every partition of THIS
+    /// The forward admission shared by every partition of THIS
     /// `InferenceExec` instance (cloned into each partition's
     /// `InferenceRunner` at `execute()` time). This is per-INSTANCE, never
     /// per-device: two concurrent `InferenceExec` instances targeting the
@@ -107,9 +107,8 @@ pub struct InferenceExecBuilder {
 }
 
 impl InferenceExecBuilder {
-    /// `device_kind` is a REQUIRED constructor argument (contract
-    /// `feat_500-wave4` §9 B3) — a submitter placing this plan onto a device
-    /// kind other than its own session's builds with that kind directly;
+    /// `device_kind` is a REQUIRED constructor argument — a submitter placing this plan onto a
+    /// device kind other than its own session's builds with that kind directly;
     /// there is no separate optional override setter.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -155,9 +154,8 @@ impl InferenceExecBuilder {
 
     /// Explicit backend override (`None` defers to the model cache's own
     /// resolution). Needed to round-trip a decoded node's exact backend
-    /// choice (`jammi-ballista`'s codec); `with_new_children` below now
-    /// threads it through too (a pre-existing gap this fixes as a side
-    /// effect of adding the setter).
+    /// choice (`jammi-ballista`'s codec); `with_new_children` below threads
+    /// it through too.
     pub fn backend(mut self, backend: Option<BackendType>) -> Self {
         self.backend = backend;
         self
@@ -269,18 +267,17 @@ impl InferenceExec {
         &self.input
     }
 
-    /// The device kind this descriptor declares it must run on (contract
-    /// `feat_500-wave4` §9 B3).
+    /// The device kind this descriptor declares it must run on.
     pub fn device_kind(&self) -> ComputeDeviceKind {
         self.device_kind
     }
 
-    /// RS1/RS2: `output_partitioning` propagates the CHILD's own partition
-    /// count (never a hardcoded 1) — the fix for the pre-RANGESPLIT bug where
-    /// a multi-partition child (the UDTF/`annotate` scan) had its extra
-    /// partitions silently unreachable, since every call site here always
-    /// calls `.execute(0, ..)` and a declared `UnknownPartitioning(1)` gave
-    /// the optimizer no reason to ever coalesce first. The equivalence
+    /// `output_partitioning` propagates the CHILD's own partition count
+    /// (never a hardcoded 1): with a declared `UnknownPartitioning(1)`, a
+    /// multi-partition child (the UDTF/`annotate` scan) would have its extra
+    /// partitions silently unreachable, since a call site calling
+    /// `.execute(0, ..)` gives the optimizer no reason to ever coalesce
+    /// first. The equivalence
     /// properties publish `[_ordinal ASC]` — true BY CONSTRUCTION regardless
     /// of whether an `OrdinalSplitExec` sits below (see
     /// `inference::schema::extract_or_generate_ordinals`'s doc: either arm
@@ -329,7 +326,7 @@ impl ExecutionPlan for InferenceExec {
         vec![&self.input]
     }
 
-    /// RS1: `UnspecifiedDistribution` (never `SinglePartition`) — this node
+    /// `UnspecifiedDistribution` (never `SinglePartition`) — this node
     /// does not require its child to be coalesced; `OrdinalSplitExec`'s own
     /// `SinglePartition` requirement (or a multi-partition scan directly
     /// below, on the `n == 1` no-split shape) is what `EnforceDistribution`
@@ -338,24 +335,20 @@ impl ExecutionPlan for InferenceExec {
         vec![Distribution::UnspecifiedDistribution]
     }
 
-    /// RS1: `false`, not the DataFusion default (`true` for a node whose
+    /// `false`, not the DataFusion default (`true` for a node whose
     /// `required_input_distribution` is `Unspecified`). The default would let
     /// `EnforceDistribution` insert a round-robin `RepartitionExec` between
     /// `OrdinalSplitExec` and this node whenever it judges that repartitioning
-    /// "benefits" — defeating the point of the split. Dropping this override
-    /// (setting it to `vec![true]`) sends 60 of the 120-cell grid's cells RED
+    /// "benefits" — defeating the point of the split. Without this override
+    /// (`vec![true]`), 60 of the 120-cell grid's cells fail
     /// (`tests/it/rangesplit.rs`'s `rs1_nothing_between_split_and_
-    /// inference_across_the_grid`, re-measured directly against this tree by
-    /// applying that exact one-line mutation and reading the test's own
-    /// failure count) — re-measure the same way after any change to this
-    /// file or to `OrdinalSplitExec`, since which optimizer passes fire (and
-    /// so how many cells fail) can shift; never assume this number without
-    /// re-running the mutation.
+    /// inference_across_the_grid`); the exact count shifts with which
+    /// optimizer passes fire.
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         vec![false]
     }
 
-    /// RS2: each partition forwards its input rows in arrival order and
+    /// Each partition forwards its input rows in arrival order and
     /// stamps `_ordinal` (or reads the split's own) without ever reordering
     /// them — the per-partition ordering this node's own `[_ordinal ASC]`
     /// equivalence claims is genuinely maintained, never merely declared.
@@ -422,7 +415,7 @@ impl ExecutionPlan for InferenceExec {
     }
 }
 
-/// Wire `InferenceConfig::partitions` (#540 RANGESPLIT) into one of this
+/// Wire `InferenceConfig::partitions` into one of this
 /// crate's four `InferenceExec`-building call sites: `partitions <= 1`
 /// coalesces `input` to a single partition when it is not already one
 /// (`build_inference` always sees exactly ONE partition — see the
@@ -432,14 +425,14 @@ impl ExecutionPlan for InferenceExec {
 /// [`OrdinalSplitExec`](crate::operator::ordinal_split_exec::OrdinalSplitExec)
 /// below `input` (which coalesces a multi-partition `input` itself, the
 /// same way) and wraps the built `InferenceExec` in a
-/// `SortPreservingMergeExec([_ordinal ASC])` (RS2's merge key — see that
+/// `SortPreservingMergeExec([_ordinal ASC])` (the merge key — see that
 /// module's doc for why `_ordinal` alone, never `[_row_id, _ordinal]`).
 ///
 /// `session::annotate_plan`, `session::infer_materialize` (`infer`'s actual
 /// materializer), `pipeline::embedding::build_embedding_plan`, and
 /// `pipeline::embedding_refresh::infer_delta` all call this rather than
-/// each repeating the wrap/merge logic — RS5's "the four roots" invariant
-/// holds because all four share this one function, and is checked live by
+/// each repeating the wrap/merge logic — the "four roots" invariant holds
+/// because all four share this one function, and is checked live by
 /// `tests/it/rangesplit.rs`'s `rs5_source_oracle` (a `syn`-based scan of
 /// every `InferenceExecBuilder::new` call site in this crate).
 pub fn wrap_with_split_and_merge(

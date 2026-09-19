@@ -167,9 +167,9 @@ where
 /// emergent from whichever pool is installed.
 ///
 /// Errors are collected per row and the LOWEST-INDEX failing row is the one
-/// surfaced, with a row-indexed message — the same selection the pre-unit
-/// sequential decode loop made by construction (it returned on the first
-/// failure it walked into, in row order).
+/// surfaced, with a row-indexed message — the same selection a sequential
+/// decode loop makes by construction (returning on the first failure it
+/// walks into, in row order).
 pub fn decode_audio_batch_indexed<T>(row_ids: &[usize], items: &[T]) -> Result<Vec<DecodedAudio>>
 where
     T: AsRef<[u8]> + Sync,
@@ -502,8 +502,8 @@ pub fn preprocess_clap_fusion_indexed(
         }
         // Named separately from the "rounds to zero samples" refusal below:
         // `clip.sample_rate == 0` makes `resampled_len`'s ratio `to_rate /
-        // 0.0`, which (pre-fix) rounds to `usize::MAX` rather than `0` and
-        // slips past that guard, then feeds `Vec::with_capacity(usize::MAX)`
+        // 0.0`, which rounds to `usize::MAX` rather than `0` and would slip
+        // past that guard, then feeds `Vec::with_capacity(usize::MAX)`
         // in `resample_linear`. A decoded clip's own decoder already refuses
         // `sample_rate == 0`, but this is a defense-in-depth check for any
         // other `DecodedAudio` producer (including this module's own tests).
@@ -958,7 +958,7 @@ fn fft_f64(re: &mut [f64], im: &mut [f64]) {
 mod tests {
     use super::*;
 
-    /// Compile-time `Send` assertion (K4/family-J precedent:
+    /// Compile-time `Send` assertion (same shape as
     /// `jammi-kernels/src/ops/saved.rs`'s `saved_is_send_and_sync`): the types
     /// that cross the parallel decode/preprocess boundary in
     /// [`decode_audio_batch`] and [`preprocess_clap_fusion`] must be `Send`,
@@ -1364,11 +1364,9 @@ mod tests {
     /// constructed `DecodedAudio` — as every test here does — is not routed
     /// through that decoder) must be a NAMED typed refusal, never a
     /// division-by-zero-derived `usize::MAX` that then feeds
-    /// `Vec::with_capacity` downstream. Verified by temporarily removing the
-    /// `clip.sample_rate == 0` check in the sequential pre-check above: this
-    /// test goes RED (`resample_linear`'s `Vec::with_capacity(usize::MAX)`
-    /// aborts the process rather than returning the typed `Err` asserted
-    /// below).
+    /// `Vec::with_capacity` downstream (without the `clip.sample_rate == 0`
+    /// pre-check, `resample_linear`'s `Vec::with_capacity(usize::MAX)` aborts
+    /// the process rather than returning the typed `Err` asserted below).
     #[test]
     fn preprocess_clap_fusion_indexed_rejects_a_zero_sample_rate_clip_by_name() {
         let clip = DecodedAudio {
@@ -1390,14 +1388,13 @@ mod tests {
         assert_eq!(resampled_len(100, 0, 16_000), 0);
     }
 
-    // -- Media front-end parallelization (#421 follow-on) --------------------
+    // -- Media front-end parallelization -------------------------------------
 
     #[test]
     fn decode_audio_batch_empty_is_ok_empty() {
-        // Decode-stage empty is a no-op (K2's "empty batch refused" guard
-        // lives at the PREPROCESS stage, which still refuses — see
-        // `fusion_empty_batch_errors` above — matching the pre-unit
-        // sequential decode loop, which also never rejected zero rows).
+        // Decode-stage empty is a no-op (the "empty batch refused" guard
+        // lives at the PREPROCESS stage, which refuses — see
+        // `fusion_empty_batch_errors` above).
         let items: Vec<Vec<u8>> = Vec::new();
         let decoded = decode_audio_batch(&items).unwrap();
         assert!(decoded.is_empty());
@@ -1567,7 +1564,7 @@ mod tests {
     /// rate — every other synthetic clip is generated AT `config.sample_rate`
     /// specifically to isolate the parallel-write mechanism from
     /// `resample_linear`'s own arithmetic (see `synthetic_clip`'s doc), which
-    /// means the K4 bit-identity oracle below would otherwise never exercise
+    /// means the bit-identity oracle below would otherwise never exercise
     /// per-clip resampling at all. Appending one clip that genuinely needs
     /// resampling closes that gap without disturbing the other 24 clips'
     /// existing branch coverage.
@@ -1607,15 +1604,14 @@ mod tests {
         })
     }
 
-    /// The PRE-UNIT sequential implementation, transcribed verbatim from
-    /// `c1b0b0ba`'s `preprocess_clap_fusion` (before the `par_chunks_mut`
-    /// rewrite) — kept ONLY as a test oracle, INDEPENDENT of the shipped
-    /// parallel code path, so the bit-identity assertions below compare the
-    /// new code against a second implementation rather than against itself
+    /// A sequential implementation of `preprocess_clap_fusion` (no
+    /// `par_chunks_mut`) — kept ONLY as a test oracle, INDEPENDENT of the
+    /// shipped parallel code path, so the bit-identity assertions below
+    /// compare the shipped code against a second implementation rather than against itself
     /// at a different pool size (a pool-1-vs-pool-k comparison alone cannot
     /// catch a bug the SAME code makes at every pool size). Reuses
     /// `mel_filterbank_hz`, `hann_periodic`, `resample_linear` and
-    /// `clap_fusion_features`, all unchanged by this unit.
+    /// `clap_fusion_features`, which both paths share.
     fn preprocess_clap_fusion_reference_sequential(
         clips: &[DecodedAudio],
         config: &ClapFrontendConfig,
@@ -1637,8 +1633,8 @@ mod tests {
         (tensor, vec![true; clips.len()])
     }
 
-    /// Oracle 1 (K4): element-wise bit identity between the PRE-UNIT
-    /// sequential reference above and the shipped parallel code at pool sizes
+    /// Oracle 1: element-wise bit identity between the sequential
+    /// reference above and the shipped parallel code at pool sizes
     /// {1, 5, 7, 24} (non-dividing counts included), on a batch that hits all
     /// three of `clap_fusion_features`'s length-determined branches
     /// (repeatpad; fusion crop; fusion crop's `total == chunk` corner case)
@@ -1661,18 +1657,18 @@ mod tests {
             let (got, got_is_longer) = run_at_pool_size(k, &clips, &config);
             assert_eq!(
                 got_is_longer, reference_is_longer,
-                "is_longer flags must match the pre-unit reference at pool size {k}"
+                "is_longer flags must match the sequential reference at pool size {k}"
             );
             assert_eq!(
                 got.len(),
                 reference.len(),
-                "output length must match the pre-unit reference at pool size {k}"
+                "output length must match the sequential reference at pool size {k}"
             );
             for (idx, (&a, &b)) in got.iter().zip(reference.iter()).enumerate() {
                 assert_eq!(
                     a.to_bits(),
                     b.to_bits(),
-                    "element {idx} differs from the pre-unit sequential reference at pool \
+                    "element {idx} differs from the sequential reference at pool \
                      size {k}: {a} (bits {:x}) vs {b} (bits {:x})",
                     a.to_bits(),
                     b.to_bits()

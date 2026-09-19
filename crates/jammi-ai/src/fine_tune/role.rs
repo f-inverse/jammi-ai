@@ -1,6 +1,6 @@
 //! Who runs one attempt's training body, and therefore who may write.
 //!
-//! DESIGN.md §4 (the gang's single-writer rule): the process that claimed a
+//! The gang's single-writer rule: the process that claimed a
 //! job — the lease holder — is the ONE writer of that job's row, of its
 //! durable checkpoints and of its published artifact. Every other rank of a
 //! gang computes, reduces and writes nothing durable: no per-rank fragment,
@@ -12,8 +12,8 @@
 //!   registration and its `Releasing` self-release arm, the holder
 //!   accounting, the acceleration-report write, every `record_failed` site,
 //!   `finish_job_with_model`'s call site, the coordinator's assembly-outcome
-//!   and lease-release writes). It has exactly two values — today's loop
-//!   path and the `Peer` gang's coordinator — and no value for a rank.
+//!   and lease-release writes). It has exactly two values — the in-process
+//!   loop path and the `Peer` gang's coordinator — and no value for a rank.
 //! - [`RunnerRole`](crate::fine_tune::role::RunnerRole) is what a training body runs AS: a lease holder, or a
 //!   rank `>= 1` of a gang. A `Rank` carries no `LeaseHolder`, so a rank
 //!   body that tried to call a job-row writer would have nothing to pass:
@@ -22,16 +22,15 @@
 //!   checkpoints) are gated on the same role
 //!   (`crate::fine_tune::trainer::TrainingLoopBuilder::runner_role`).
 //!
-//! `W == 1` is [`LeaseHolder::LoopClaimer`](crate::fine_tune::role::LeaseHolder::LoopClaimer) on every path (K4): the
-//! single-rank run never traverses the coordinator body, and every
-//! pre-gang byte of behaviour is that role's.
+//! `W == 1` is [`LeaseHolder::LoopClaimer`](crate::fine_tune::role::LeaseHolder::LoopClaimer) on
+//! every path: the single-rank run never traverses the coordinator body.
 
 use std::fmt;
 
 /// The lease holder of one attempt — the ONE writer of the job row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseHolder {
-    /// Today's loop path: the claimant runs the whole job in-process — a
+    /// The in-process loop path: the claimant runs the whole job in-process — a
     /// single rank, or rank 0 of an in-process `Local` gang whose other
     /// ranks are threads of the same process. Never traverses the
     /// coordinator body.

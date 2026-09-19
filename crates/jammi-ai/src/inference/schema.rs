@@ -13,16 +13,15 @@ use crate::model::ModelTask;
 /// `_ordinal` is a monotonic row-emission counter (0-based). When
 /// `InferenceExec`'s input is an
 /// [`OrdinalSplitExec`](crate::operator::ordinal_split_exec::OrdinalSplitExec)
-/// (every production plan with `InferenceConfig::partitions > 1` — #540
-/// RANGESPLIT), that split assigns ONE global sequence, before fan-out, over
+/// (every production plan with `InferenceConfig::partitions > 1`), that
+/// split assigns ONE global sequence, before fan-out, over
 /// its whole single-partition input, and `InferenceExec` reads it back as a
 /// named INPUT column (never a `passthrough`) at each of its `N` partitions —
 /// see [`extract_or_generate_ordinals`]. When there is no split below it
 /// (`partitions == 1`, or a caller that builds `InferenceExec` directly, e.g.
 /// this crate's own unit tests), `InferenceExec`'s single partition
-/// self-generates the sequence exactly as every release before RANGESPLIT
-/// did. Either way there is exactly one sequence per partition's share of the
-/// rows it is responsible for, and (per-partition) it is gap-free and
+/// self-generates the sequence. Either way there is exactly one sequence per partition's share of
+/// the rows it is responsible for, and (per-partition) it is gap-free and
 /// contiguous within that partition's own subsequence.
 ///
 /// It exists so a caller can read the result table back in the SAME order
@@ -156,14 +155,13 @@ pub fn build_prefix_columns(
         })
         .collect();
 
-    // Cast keys to Utf8 if needed (key column may be Int64, etc.). RS4: a
-    // key type the engine cannot render as Utf8 (a Struct/Map, whose Arrow
-    // cast kernel has no Utf8 arm) is a typed, named refusal — never the
-    // silent `unwrap_or_else(|_| Arc::clone(keys))` fallback this replaced,
-    // which passed the RAW non-Utf8 array through as `_row_id` and let a
-    // downstream schema-shape mismatch misattribute the failure to whatever
-    // column happened to trip over the wrong type first (see the unit
-    // oracle `build_prefix_columns_refuses_a_key_that_cannot_cast_to_utf8`
+    // Cast keys to Utf8 if needed (key column may be Int64, etc.). A key
+    // type the engine cannot render as Utf8 (a Struct/Map, whose Arrow cast
+    // kernel has no Utf8 arm) is a typed, named refusal — never a silent
+    // `unwrap_or_else(|_| Arc::clone(keys))` fallback, which would pass the
+    // RAW non-Utf8 array through as `_row_id` and let a downstream schema-shape mismatch
+    // misattribute the failure to whatever column happened to trip over the wrong type first (see
+    // the unit oracle `build_prefix_columns_refuses_a_key_that_cannot_cast_to_utf8`
     // below, and the end-to-end oracle
     // `crates/jammi-ai/tests/it/rangesplit.rs`'s
     // `rs4_struct_key_through_annotate_is_a_typed_refusal_naming_the_key`).
@@ -191,7 +189,7 @@ pub fn build_prefix_columns(
 
 /// This batch's `_ordinal` column: the input's own `_ordinal` column when
 /// present (an [`OrdinalSplitExec`](crate::operator::ordinal_split_exec::OrdinalSplitExec)
-/// child assigned it before fan-out — RS2), or a freshly self-generated
+/// child assigned it before fan-out), or a freshly self-generated
 /// contiguous run starting at `*next_ordinal` otherwise (no split below —
 /// `partitions == 1`, or a caller that built `InferenceExec` directly).
 /// `*next_ordinal` advances by `batch.num_rows()` only on the self-generate
@@ -225,12 +223,11 @@ mod tests {
     /// `row_status.len()` while `_error` and the rest of the prefix are built
     /// off `row_count` — that mismatch is a shape bug only
     /// `RecordBatch::try_new`'s generic error would ever catch, far from the
-    /// producer that emitted the disagreeing length. Verified by reverting
-    /// the length checks (restoring the old `row_status.get(i)` default-to-
-    /// "not ok" policy that never refuses): this test goes RED (`Ok` with a
-    /// `_status` column of length 1 sitting next to `_error`/`_row_id`
-    /// columns of length 3, a mutually-inconsistent batch, instead of the
-    /// `Err` asserted below).
+    /// producer that emitted the disagreeing length. Without the length
+    /// checks (a `row_status.get(i)` default-to-"not ok" policy never
+    /// refuses), the result is `Ok` with a `_status` column of length 1 next
+    /// to `_error`/`_row_id` columns of length 3 — a mutually-inconsistent
+    /// batch — instead of the `Err` asserted below.
     fn ordinals_for(row_count: usize, start: u64) -> ArrayRef {
         Arc::new((start..start + row_count as u64).collect::<UInt64Array>())
     }
@@ -267,10 +264,9 @@ mod tests {
 
     /// The peer of the above: `row_errors` shorter than `row_count` (with
     /// `row_status` matching `row_count`) must be refused the same way.
-    /// Verified by reverting the length checks: this test goes RED (`Ok`
-    /// with an `_error` column built by iterating the short `row_errors`,
-    /// producing a column shorter than the rest of the prefix, instead of
-    /// the `Err` asserted below).
+    /// Without the length checks, the result is `Ok` with an `_error` column
+    /// built by iterating the short `row_errors` — shorter than the rest of
+    /// the prefix — instead of the `Err` asserted below.
     #[test]
     fn build_prefix_columns_refuses_a_row_errors_shorter_than_row_count() {
         let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
@@ -354,15 +350,13 @@ mod tests {
         assert_eq!(ordinals.values(), &[7u64, 8, 9]);
     }
 
-    /// RS4: a key type the Arrow cast kernel cannot render as Utf8 (a Struct,
-    /// verbatim `inference/schema.rs`'s former fallback fixture) is a typed
-    /// `JammiError::Inference` naming the key COLUMN, its TYPE, and "cannot
-    /// be cast to Utf8" — never the silent `unwrap_or_else(|_|
-    /// Arc::clone(keys))` this replaced, which passed the raw Struct array
-    /// through as `_row_id` and let `RecordBatch::try_new` fail later with a
-    /// schema-shape error that named the wrong column. Verified by reverting
-    /// to the `unwrap_or_else` fallback: this test goes RED (`Ok` with a
-    /// Struct-typed `_row_id` column instead of the `Err` asserted below).
+    /// A key type the Arrow cast kernel cannot render as Utf8 (a Struct) is
+    /// a typed `JammiError::Inference` naming the key COLUMN, its TYPE, and
+    /// "cannot be cast to Utf8" — never a silent `unwrap_or_else(|_|
+    /// Arc::clone(keys))` fallback, which would pass the raw Struct array
+    /// through as `_row_id` (`Ok` with a Struct-typed `_row_id` column) and
+    /// let `RecordBatch::try_new` fail later with a schema-shape error that
+    /// names the wrong column.
     #[test]
     fn build_prefix_columns_refuses_a_key_that_cannot_cast_to_utf8() {
         use arrow::array::{Int32Array, StructArray};
@@ -466,8 +460,8 @@ mod tests {
     }
 
     /// The fallback arm (no `_ordinal` input column) self-generates a
-    /// contiguous run and DOES advance `next_ordinal` — the pre-RANGESPLIT
-    /// behaviour, preserved for a caller with no `OrdinalSplitExec` below it.
+    /// contiguous run and DOES advance `next_ordinal` — the behaviour for a
+    /// caller with no `OrdinalSplitExec` below it.
     #[test]
     fn extract_or_generate_ordinals_falls_back_and_advances() {
         use arrow::record_batch::RecordBatch;

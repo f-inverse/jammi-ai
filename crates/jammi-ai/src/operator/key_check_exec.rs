@@ -1,4 +1,4 @@
-//! `KeyCheckExec` — the null-key refusal at the input edge (K2).
+//! `KeyCheckExec` — the null-key refusal at the input edge.
 //!
 //! A single-partition-preserving passthrough: every batch flows through
 //! unchanged while the node counts the nulls in the RAW key column, and at end

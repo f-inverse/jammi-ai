@@ -1,4 +1,4 @@
-//! P5: train/serve parity between the differentiable segment-aggregate
+//! Train/serve parity between the differentiable segment-aggregate
 //! (`jammi_encoders::segment_aggregate`) and the data-plane vector-aggregation
 //! UDAF (`vector_mean`/`vector_sum`/`vector_max`), plus the non-text parallel
 //! training loop.

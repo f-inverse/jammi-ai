@@ -37,7 +37,7 @@ pub(crate) fn pairs() -> Vec<(String, String)> {
         .collect()
 }
 
-/// The U4b gang oracle's config: two epochs, per-rank batch 2, no dropout,
+/// The gang oracle's config: two epochs, per-rank batch 2, no dropout,
 /// no validation split, a fixed seed.
 pub(crate) fn gang_config(epochs: usize) -> FineTuneConfig {
     gang_config_with_dropout(epochs, 0.0)
@@ -147,7 +147,7 @@ pub(crate) fn file_store() -> Arc<ArtifactStore> {
     Arc::new(ArtifactStore::with_root(root, StorageRegistry::new(), cache).unwrap())
 }
 
-/// The reference: the U4b gang oracle's shape — a two-rank `LocalGang` on
+/// The reference: the gang oracle's shape — a two-rank `LocalGang` on
 /// the CPU, each rank a `TrainingLoop` built directly (projection head over
 /// tiny_bert through `build_projection_head_for_rank` at the rank's own
 /// `RankContext::dropout_seed`, `PartitionSpec::for_gang(r, 2, 2, ..)`),

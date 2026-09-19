@@ -1,5 +1,5 @@
 //! End-to-end integration tests for the public `db.fine_tune(task="regression")`
-//! surface (W5-PR4 — the consumer on-ramp).
+//! surface (the consumer on-ramp).
 //!
 //! These drive the FULL public path a real consumer hits — `add_source` → the
 //! worker's column→loader detector (`build_training_data_loader` →
@@ -32,25 +32,23 @@
 //! produce — it gives `μ_y` for both, i.e. ~0 separation. The
 //! [`untrained_regression_head_collapses_to_mu_no_separation`] guard proves
 //! exactly that collapse against the same fixture, locking these tests against a
-//! future regression that drops the trained head on serve (the original Break 5).
+//! future regression that drops the trained head on serve.
 //!
 //! ## Objective choice
 //!
 //! These surface tests use `Crps` (a Gaussian-form head) and `Pinball` (the
 //! quantile head) — the two robust objectives — to exercise the served-form and
 //! quantile-vs-Gaussian dispatch on a realistic-variance target (σ_y ≈ 19.5 here,
-//! vs the PR1 oracle's σ ≈ 2).
+//! vs the trainer-level oracle's σ ≈ 2).
 //!
-//! Historically (pre-W5-PR5) the Gaussian NLL objectives (`GaussianNll`,
-//! `BetaNll`) DIVERGED on this scale: the loss scored `(y-μ)²/σ²` in raw outcome
-//! units, so a tens-of-years residual blew the loss past the trainer's divergence
-//! guard (`> 100`) before the head's raw σ could adapt. W5-PR5 fixed that by
-//! scoring the loss in standardized (z) space — `db.fine_tune(task=regression)`
-//! now converges for ALL FOUR objectives on any target scale (see the
-//! `standardization_contract` high-variance oracle for the per-objective proof).
-//! These tests keep `Crps`/`Pinball` because the surface they pin (separation +
-//! served-form dispatch) is objective-independent and they were green pre- and
-//! post-fix, locking the public read path against either regression.
+//! The loss is scored in standardized (z) space, so
+//! `db.fine_tune(task=regression)` converges for ALL FOUR objectives on any
+//! target scale (see the `standardization_contract` high-variance oracle for the
+//! per-objective proof); scored in raw outcome units, a tens-of-years residual
+//! would blow the Gaussian NLL objectives (`GaussianNll`, `BetaNll`) past the
+//! trainer's divergence guard (`> 100`) before the head's raw σ could adapt.
+//! These tests use `Crps`/`Pinball` because the surface they pin (separation +
+//! served-form dispatch) is objective-independent.
 
 use std::sync::Arc;
 
@@ -85,25 +83,19 @@ const GROUP_B: &[&str] = &[
 /// for a head that learned the group split.
 const GAUSSIAN_MIN_SEPARATION: f32 = 3.0;
 
-/// De-pinned from a single seed=7 trajectory (test-robustness fix, see this
-/// commit's message for the measured pre-change table): the quantile
-/// separation surface is now judged over a PINNED 12-seed sweep rather than
-/// one hard-coded seed at a hard threshold. `seed=7` (the trajectory the
-/// original single-seed test happened to calibrate against) is kept IN the
-/// pool — it is not special, just one more sample — plus 10 other small
-/// integers and [`jammi_wire::fine_tune::DEFAULT_FINE_TUNE_SEED`] (42, the
+/// The quantile separation surface is judged over a PINNED 12-seed sweep
+/// rather than one hard-coded seed at a hard threshold. The pool is 11 small
+/// integers plus [`jammi_wire::fine_tune::DEFAULT_FINE_TUNE_SEED`] (42, the
 /// actual seed a caller who passes none hits in production).
 ///
-/// MEASURED (base, this commit, `lora_dropout=0.05` — the shipped default —
+/// MEASURED (`lora_dropout=0.05` — the shipped default —
 /// median-column `mean(B)-mean(A)` per seed): 1→16.85, 2→6.66, 3→13.88,
 /// 4→23.06, 5→2.09, 6→8.64, 7→12.55, 8→−0.61, 9→0.30, 10→11.81, 11→17.01,
-/// 42→6.39. Three of these twelve seeds (5, 8, 9) individually fail the OLD
-/// single-seed 5.0 bar under the CURRENT (pre-C7) stream — seed 8 even flips
-/// sign — which is why a single hard-coded seed at a hard threshold was
-/// never a sound test of "the quantile head learns to separate the groups":
-/// it was one draw from a distribution wide enough to fail on its own,
-/// TODAY, without any dropout-stream change. See this commit's message for
-/// the full per-level table.
+/// 42→6.39. Three of these twelve seeds (5, 8, 9) individually fail a
+/// single-seed 5.0 bar — seed 8 even flips sign — which is why a single
+/// hard-coded seed at a hard threshold is not a sound test of "the quantile
+/// head learns to separate the groups": it is one draw from a distribution
+/// wide enough to fail on its own.
 const QUANTILE_SEP_SEEDS: [u64; 12] = [
     1,
     2,
@@ -127,7 +119,7 @@ const QUANTILE_SEP_SEEDS: [u64; 12] = [
 /// gives EXACTLY 0 for every level — a structural property of the zero base
 /// weight in `fine_tune::lora::build_distribution_head`, not a distribution
 /// this bound needs to bound (see
-/// [`untrained_quantile_head_collapses_to_mu_no_separation`], which now
+/// [`untrained_quantile_head_collapses_to_mu_no_separation`], which
 /// judges the zeroed head against a self-normalizing band derived from its
 /// OWN measured spread, not this literal). `3.0` sits with 3.7-9.6
 /// raw-year headroom below the weakest measured level (0.1) and far above 0,
@@ -146,19 +138,14 @@ const QUANTILE_SEP_AGG_MIN: f32 = 3.0;
 const QUANTILE_SEP_POSITIVE_BAR: usize = 9;
 
 /// PER-SEED sign-count arm for
-/// [`untrained_quantile_head_collapses_to_mu_no_separation`]'s Arm 3 — the
-/// #383-class fix: a trimmed-mean MARGIN over this test's 12-seed sweep
-/// (120 epochs, `lr=1e-1`, `max_grad_norm` clipping active on ~99% of
-/// steps) is not a resolving oracle at this operating point. Proved by
-/// injecting a forced 1-ULP-of-`f32` perturbation of the clip coefficient
-/// (env-gated, through `clip_gradients`'s public surface — a throwaway
-/// diagnostic, never committed) and re-running this exact sweep: the
-/// trimmed mean swung 12-30% from that single, unavoidable, minimal
-/// floating-point perturbation alone (main: `3.9417 -> 3.4609`; this
-/// branch, same fixture: `4.7780 -> 4.2866`), with individual seeds'
-/// separations moving by up to 6 raw units and one seed sign-flipping
-/// (seed 7, main: `-3.51 -> +1.71`) — see the fix-round's own commit
-/// message for the full per-seed tables. A margin built on raw separation
+/// [`untrained_quantile_head_collapses_to_mu_no_separation`]'s Arm 3. A
+/// trimmed-mean MARGIN over this test's 12-seed sweep (120 epochs,
+/// `lr=1e-1`, `max_grad_norm` clipping active on ~99% of steps) is not a
+/// resolving oracle at this operating point: a forced 1-ULP-of-`f32`
+/// perturbation of the clip coefficient (a throwaway diagnostic) swings the
+/// trimmed mean 12-30% (`3.9417 -> 3.4609` and `4.7780 -> 4.2866` on two
+/// trees), moves individual seeds' separations by up to 6 raw units, and
+/// flips one seed's sign (seed 7, `-3.51 -> +1.71`). A margin built on raw separation
 /// MAGNITUDE cannot tell "the code changed" from "an unavoidable ULP of
 /// rounding landed differently" at this operating point.
 ///
@@ -168,8 +155,8 @@ const QUANTILE_SEP_POSITIVE_BAR: usize = 9;
 /// `0.0` for every seed (the structural per-seed check in that test),
 /// "trained_sep\[i\] > zeroed_sep\[i\]" reduces to "trained_sep\[i\] >
 /// 0.0". MEASURED positive-count across FIVE independent runs of the exact
-/// sweep (2 on main, 2 on this branch, 1 from CI — spanning the pre-fix
-/// and post-fix clip formula AND the forced 1-ULP mutant, on and off):
+/// sweep (spanning two clip formulas AND the forced 1-ULP mutant, on and
+/// off):
 /// `9, 10, 10, 11, 11` out of 12 — IDENTICAL VERDICT (all clear this bar)
 /// despite the same ULP-scale perturbation that swings the trimmed mean by
 /// double-digit percent. `7` sits 2 seeds below the weakest of those five
@@ -196,9 +183,8 @@ const QUANTILE_SEP_POSITIVE_BAR: usize = 9;
 /// and should not be assumed to have, power against a training-strength
 /// regression (a lr/epochs/optimizer bug that degrades the head without
 /// flipping enough seeds' signs) — only against the specific rounding-scale
-/// noise measured above. A future round wanting that coverage needs a
-/// magnitude-sensitive arm built to be chaos-robust by construction (e.g.
-/// judged against a self-normalizing band derived from a graded-degradation
+/// noise measured above. That coverage needs a magnitude-sensitive arm built to be chaos-robust by
+/// construction (e.g. judged against a self-normalizing band derived from a graded-degradation
 /// sweep's own spread, the way Arm 1 already is for the zeroed leg), not
 /// this one stretched to cover a claim it was not built or measured for.
 const QUANTILE_SEP_UNTRAINED_POSITIVE_BAR: usize = 7;
@@ -324,8 +310,8 @@ async fn gaussian_regression_separates_groups_through_public_path() {
                 learning_rate: 3e-2,
                 warmup_steps: 8,
                 lr_schedule: LrSchedule::Constant,
-                // CRPS — a Gaussian-form objective (serves mean/std). Post-W5-PR5
-                // (z-space loss) GaussianNll/BetaNll also converge on this σ≈19.5
+                // CRPS — a Gaussian-form objective (serves mean/std). With the
+                // z-space loss GaussianNll/BetaNll also converge on this σ≈19.5
                 // target; CRPS is kept here as the robust Gaussian-form surface.
                 regression_loss: Some(RegressionLoss::Crps),
                 seed: 7,
@@ -402,13 +388,12 @@ async fn gaussian_regression_separates_groups_through_public_path() {
 /// BREAK #4 NON-VACUITY — QUANTILE SERVED CORRECTLY *AND* LEARNING: a
 /// Pinball/Quantile head fine-tuned through the public path is (a) read back via
 /// `Infer` as its quantile columns (one per level, non-crossing), NOT silently
-/// mis-served as a Gaussian `(mean, std)` — this FAILS on the pre-fix
-/// hardcoded-Gaussian behaviour — and (b) SEPARATES the two groups: served on
+/// mis-served as a Gaussian `(mean, std)` (a hardcoded-Gaussian serve path
+/// fails this) — and (b) SEPARATES the two groups: served on
 /// held-out items, group A's quantiles sit below group B's by a margin an
 /// untrained head (μ_y for both → ~0) cannot produce.
 ///
-/// De-pinned from a single seed=7 hard-threshold trajectory (test-robustness
-/// fix — see this commit's message): trains + serves the SAME two-group
+/// Trains + serves the SAME two-group
 /// public-path scenario once per seed in [`QUANTILE_SEP_SEEDS`], and judges
 /// separation via a trimmed-mean AGGREGATE (`QUANTILE_SEP_AGG_MIN`) plus a
 /// per-seed sign-count arm (`QUANTILE_SEP_POSITIVE_BAR`) — the pattern
@@ -585,15 +570,15 @@ async fn quantile_regression_serves_and_separates_groups() {
 /// PERMANENT NON-VACUITY GUARD (locks the separation bar against a future
 /// head-serving regression): train the SAME two-group model, then serve each
 /// group through a copy of the head whose trained `distribution.lora_b` is
-/// zeroed (the in-process equivalent of an auditor destructively zeroing the
+/// zeroed (the in-process equivalent of destructively zeroing the
 /// LoRA delta on disk — the untrained-head state). The de-standardising affine
 /// then emits `μ_y + σ_y·0 = μ_y` for EVERY input, so the served value is
 /// identical across both groups → ~0 separation, and the
 /// `GAUSSIAN_MIN_SEPARATION` bar the trained test asserts FAILS.
 ///
 /// This is the destructive proof that the trained tests measure LEARNING: if the
-/// served head ever silently stops applying its learned distribution layer (the
-/// original Break 5: serving the pooled embedding, or a head reset to base), the
+/// served head ever silently stops applying its learned distribution layer
+/// (serving the pooled embedding, or a head reset to base), the
 /// separation collapses to what this guard pins, and the trained tests above go
 /// red.
 #[tokio::test(flavor = "multi_thread")]
@@ -682,37 +667,27 @@ async fn untrained_regression_head_collapses_to_mu_no_separation() {
 
 /// PERMANENT NON-VACUITY GUARD for the QUANTILE separation aggregate —
 /// mirrors [`untrained_regression_head_collapses_to_mu_no_separation`] but
-/// for the Pinball/quantile surface, so the NEW aggregate/per-seed-sign-count
+/// for the Pinball/quantile surface, so the aggregate/per-seed-sign-count
 /// checker in [`quantile_regression_serves_and_separates_groups`] is proven,
 /// not assumed, to reject a head that does NOT separate.
 ///
-/// De-pinned from a single seed=7 hard-threshold trajectory a second time
-/// (test-robustness fix, see this commit's message): the ORIGINAL version of
-/// THIS control made exactly the mistake it was written to guard against —
-/// its own "the TRAINED head clearly separates" sanity leg trained ONE seed
-/// (7) and compared to a hard-coded literal (`QUANTILE_ZERO_CONTROL_MIN` =
-/// 1.5, calibrated to that seed's measured 3.82 under the OLD stream). Under
-/// a stream change that single trajectory's level-0.1 separation flips to
-/// -3.51, so the sanity leg itself fails — the same single-seed fragility
-/// class as the primary sweep test, just relocated into this control.
+/// A "the TRAINED head clearly separates" sanity leg that trains ONE seed
+/// and compares to a hard-coded literal is itself single-seed fragile: a
+/// dropout-stream change flips seed 7's level-0.1 separation from 3.82 to
+/// -3.51.
 ///
-/// Diagnosis (measured under the CURRENT stream in this worktree, all 12
-/// pinned seeds, level-0.1 `served_regression_col0_for_test` column): the
-/// DESTRUCTIVE (zeroed) leg is untouched by the stream change — it reads
-/// EXACTLY 0.0 separation, `max_dev` EXACTLY 0.0, on EVERY one of the 12
-/// seeds, under BOTH streams. This is structural, not coincidental: the
+/// The DESTRUCTIVE (zeroed) leg is independent of the dropout stream — it
+/// reads EXACTLY 0.0 separation, `max_dev` EXACTLY 0.0, on EVERY one of the 12
+/// pinned seeds (level-0.1 `served_regression_col0_for_test` column). This is
+/// structural, not coincidental: the
 /// distribution head's BASE weight is a literal `zeros(output_dim,
 /// hidden_size)` (see `fine_tune::lora::build_distribution_head`), so with
 /// `lora_b` also zeroed the head's raw output is `0 @ x = 0` for every input
 /// regardless of the (stream-dependent) projection layer's state — the
 /// de-standardised value is `μ_y + σ_y·0 = μ_y`, and `μ_y` itself is a pure
-/// function of the fixed training targets, never the dropout stream. So the
-/// escape's framing ("the mutant clears the rejection bound on enough
-/// seeds") does not hold here; the actual break is the TRAINED sanity leg's
-/// single-trajectory literal. Full per-seed table is in this commit's
-/// message.
+/// function of the fixed training targets, never the dropout stream.
 ///
-/// FIX (self-normalizing, stream-agnostic BY CONSTRUCTION): sweep
+/// Self-normalizing, stream-agnostic BY CONSTRUCTION: sweep
 /// [`QUANTILE_SEP_SEEDS`] (reusing the same pinned 12 seeds as the primary
 /// sweep test) for BOTH the trained and the destructively-zeroed
 /// (`served_regression_col0_for_test(.., true)`) separation, then judge via
@@ -731,14 +706,14 @@ async fn untrained_regression_head_collapses_to_mu_no_separation() {
 ///      wide a genuinely-separating head could sneak through it as
 ///      "collapsed", i.e. the control is non-vacuous.
 ///   3. A PAIRED SIGN-COUNT arm (`QUANTILE_SEP_UNTRAINED_POSITIVE_BAR`, see
-///      its own doc for the derivation and the 1-ULP-mutant proof that
-///      replaced a raw-magnitude trimmed-mean margin here): the trained
+///      its own doc for the derivation and the 1-ULP-mutant measurement
+///      that rules out a raw-magnitude trimmed-mean margin here): the trained
 ///      aggregate must show POSITIVE separation (`trained_sep\[i\] >
 ///      zeroed_sep\[i\]`, i.e. `> 0.0`) on at least
 ///      [`QUANTILE_SEP_UNTRAINED_POSITIVE_BAR`] of the 12 pinned seeds — an
 ///      ORDINAL claim (did this seed separate at all, not by how much)
-///      immune to the ULP-scale magnitude swings the ex-margin arm could
-///      not tell apart from a genuine regression.
+///      immune to the ULP-scale magnitude swings a magnitude margin cannot
+///      tell apart from a genuine regression.
 #[tokio::test(flavor = "multi_thread")]
 async fn untrained_quantile_head_collapses_to_mu_no_separation() {
     let levels = vec![0.1, 0.5, 0.9];
@@ -830,9 +805,7 @@ async fn untrained_quantile_head_collapses_to_mu_no_separation() {
     // literally `0.0` for every seed, not merely close to it), so
     // `mutant_zero_band` reduces to its `1e-3` floor on every run — this
     // "self-normalizing" band is, in practice, the `1e-3` literal it was
-    // built to avoid being. Not a regression this round introduced or a
-    // gap this round is closing (audited pre-existing behavior); noted so
-    // a future reader does not mistake the `3.0 * mutant_spread` term for
+    // built to avoid being. Noted so a reader does not mistake the `3.0 * mutant_spread` term for
     // a live, data-dependent computation.
     let mutant_zero_band = (3.0 * mutant_spread).max(1e-3);
     assert!(
@@ -860,8 +833,8 @@ async fn untrained_quantile_head_collapses_to_mu_no_separation() {
     );
 
     // Arm 3 (PAIRED SIGN-COUNT — see `QUANTILE_SEP_UNTRAINED_POSITIVE_BAR`'s
-    // own doc for the 1-ULP-mutant proof this replaced a raw-magnitude
-    // trimmed-mean margin with): an ORDINAL claim, not a cardinal one —
+    // own doc for why a raw-magnitude trimmed-mean margin cannot be used
+    // here): an ORDINAL claim, not a cardinal one —
     // "did this seed's trained head separate the groups in the right
     // direction at all" rather than "by how much". A zeroed head's
     // separation is EXACTLY 0.0 for every seed (the structural per-seed

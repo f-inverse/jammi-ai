@@ -269,7 +269,7 @@ impl<'a> NeighborGraphPipeline<'a> {
             .catalog()
             .resolve_embedding_table(source_id, embedding_table)
             .await?;
-        // ONE resolution of the source table's current version (M1): its
+        // ONE resolution of the source table's current version: its
         // anchor (below) and every row `read_nodes` reads both derive from
         // this single pin, so a version publish racing this build can never
         // straddle the two the way two independent resolves could.

@@ -32,7 +32,7 @@ treatment.
 | CUTLASS submodule | `dc4817921edda44a549197ff3a9dcf5df0636e7b` (the tag's `csrc/cutlass` gitlink), vendored as the git submodule `crates/jammi-kernels/third_party/cutlass` |
 | upstream directory | `csrc/flash_attn/src/` → `src/` here |
 | local edits to upstream files | **none** (see "Shims") |
-| kernels compiled | `run_mha_fwd_<cutlass::bfloat16_t, 64, false>`, `run_mha_bwd_<cutlass::bfloat16_t, 64, false>` (head dim 64, bf16, non-causal; native cubins for sm80/86/89/90 — no PTX, see "Supported archs") |
+| kernels compiled | `run_mha_{fwd,bwd}_<cutlass::bfloat16_t, 64, false>` and `run_mha_{fwd,bwd}_<cutlass::half_t, 64, false>` (head dim 64, bf16 and fp16, non-causal; native cubins for sm80/86/89/90 — no PTX, see "Supported archs") |
 | wrapper | `jammi/flash_api_jammi.{h,cu}` — jammi's own, torch-free, not upstream |
 
 Why this tag: it is the newest `2.8.x` release at vendoring time and the
@@ -55,6 +55,12 @@ command in its message when `include/cutlass/cutlass.h` is missing.
 Nothing else is fetched at build time.
 
 ## Files (sha256 of the vendored copy; every one byte-identical to the tag)
+
+The table covers the shared headers, the two bf16 translation units, `LICENSE` and
+`AUTHORS`. The two fp16 translation units (`src/flash_fwd_hdim64_fp16_sm80.cu`,
+`src/flash_bwd_hdim64_fp16_sm80.cu`), also compiled by `build.rs`, are upstream's
+generated files but have no recorded hash here; verify them against the tag with the
+command below.
 
 | file | sha256 |
 |---|---|
@@ -116,8 +122,9 @@ sha256 of the shims: `c10/cuda/CUDAException.h`
 
 ## Build (`crates/jammi-kernels/build.rs::build_flash_attn`, feature `flash-attn`)
 
-Three translation units — `src/flash_fwd_hdim64_bf16_sm80.cu`,
-`src/flash_bwd_hdim64_bf16_sm80.cu`, `jammi/flash_api_jammi.cu` — compiled
+Five translation units — `src/flash_{fwd,bwd}_hdim64_bf16_sm80.cu`,
+`src/flash_{fwd,bwd}_hdim64_fp16_sm80.cu`, `jammi/flash_api_jammi.cu` (the `tus`
+array in `build_flash_attn`) — compiled
 concurrently by `nvcc` with EXACTLY this flag group (upstream `setup.py`'s
 group, with one native `-gencode` pair per compiled arch instead of a
 single one), archived by `ar` into
@@ -147,7 +154,7 @@ single one), archived by `ar` into
   one TU. This is a WALL-TIME flag, NOT a memory optimization: this build
   ALSO spawns its TUs as concurrent processes, so a flat per-TU `N`
   multiplies into `TUs × N` simultaneous nvcc front-ends, each with its
-  own footprint — `3 × 4 = 12` is enough to OOM a 16 GB `ubuntu-latest`
+  own footprint — `5 × 4 = 20` is enough to OOM a 16 GB `ubuntu-latest`
   CI runner. `N` defaults to `available_parallelism() / <TU count>`,
   bounding TOTAL front-end concurrency to roughly the machine's own core
   count. Overridable via `$NVCC_THREADS` (a caller who has measured their
@@ -259,9 +266,9 @@ compiled). Per-arch evidence lives in
 | arch | compute cap | bwd tile path | GPU parity leg | status |
 |---|---|---|---|---|
 | sm80 (A100) | `(8, 0)` | 128×128 | Full four-gencode-build suite, ALL legs (`flash_smoke.rs`, `flash_op_oracles.rs`, the padded 8-seed encoder-level oracle + all three negative controls, `cuda_parity.rs`'s flash-relevant legs, bench legs) | **VALIDATED** — fully green on the 4-gencode object |
-| sm86 (A40) | `(8, 6)` | 64×128 | `flash_smoke.rs` + `flash_op_oracles.rs` + bench legs + the padded 8-seed encoder-level oracle (all three negative controls) — green. The FOUR 80GB-class encoder-level real-checkpoint tests (`flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16` + its three negative controls) capability-SKIP here (named VRAM-floor reason, `vram_capable_or_skip`) rather than running — that fixture's own doc states its footprint is 80GB-class BY DESIGN (`flash_oracle_measure_arm`'s "holding more than one arm's graph alive at once OOM'd on an 80GB A100, confirmed live"), so a 48GB SKU structurally cannot run it | **VALIDATED for flash-attn admission**, with the coverage caveat above — the 80GB-class legs are proven ONLY on sm80/sm90. `cuda_parity.rs`'s OWN `lora_linear` bf16-backward parity bound has a separate, arch-aware widening on this tile class (unrelated to flash-attn/`GENCODE_ARCHES` admission — a different jammi kernel entirely; see that test's own doc); it does NOT gate this cell |
+| sm86 (A40) | `(8, 6)` | 64×128 | `flash_smoke.rs` + `flash_op_oracles.rs` + bench legs + the padded 8-seed encoder-level oracle (all three negative controls) — green. The FOUR 80GB-class encoder-level real-checkpoint tests (`flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16` + its three negative controls) are not run here: they are compiled only under `live-flash-oracle-tests` and assert a 64 GiB device-memory floor (`assert_vram_floor` in `jammi-encoders`' `modernbert.rs`), because one arm of production-scale ModernBERT-large at forward+backward is 80GB-class and a 48GB SKU cannot hold it | **VALIDATED for flash-attn admission**, with the coverage caveat above — the 80GB-class legs are proven ONLY on sm80/sm90. `cuda_parity.rs`'s OWN `lora_linear` bf16-backward parity bound has a separate, arch-aware widening on this tile class (unrelated to flash-attn/`GENCODE_ARCHES` admission — a different jammi kernel entirely; see that test's own doc); it does NOT gate this cell |
 | sm89 (L40S) | `(8, 9)` | 64×128 | Same leg set/coverage as sm86 (A40) — identical 64×128 tile class | **VALIDATED for flash-attn admission**, same coverage caveat and `lora_linear` cross-reference as sm86 |
-| sm90 (H100) | `(9, 0)` | 128×128 | Full four-gencode-build suite, ALL legs, INCLUDING the 80GB-class encoder-level tests (H100 SKUs used are 80GB-class, so no VRAM-floor skip fires here) | **VALIDATED** — fully green, also proves the `sm_90` gencode loads at all (a genuinely different major, not merely a forward-compat question) |
+| sm90 (H100) | `(9, 0)` | 128×128 | Full four-gencode-build suite, ALL legs, INCLUDING the 80GB-class encoder-level tests (the H100 SKUs used are 80GB-class, above the VRAM floor) | **VALIDATED** — fully green, also proves the `sm_90` gencode loads at all (a genuinely different major, not merely a forward-compat question) |
 
 This table's own truth is enforced standing, not merely asserted once and trusted forever: `ci/scripts/check_arch_validation_freshness.py` re-demands the evidence above on every CI run — it requires each `VALIDATED_SMS` entry to have a committed, GREEN, ancestor-sha artifact under `crates/jammi-kernels/artifacts/cuda-runs/` (the discriminator is exactly the `compute_cap <major>.<minor>` substring each `box` field above carries) whose evidence predates no later change to `build.rs`, `src/flash/`, this directory (including this file), or `src/admission.rs`; a later change to any of those without a fresh GPU pass turns a VALIDATED cell red on the next CI run rather than leaving it silently stale.
 

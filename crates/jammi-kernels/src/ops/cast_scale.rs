@@ -964,7 +964,7 @@ mod tests {
     /// off its own hand formula and fail here, not silently pass because
     /// only a 2-element fixture was ever checked at scale.
     #[test]
-    fn cast_add_bwd_dx_path_bit_identical_to_hand_formula_at_production_width_esc046_control_g() {
+    fn cast_add_bwd_dx_path_bit_identical_to_hand_formula_at_production_width() {
         let device = Device::Cpu;
         let n = 4096usize;
         // `base` unused by `bwd` (the op's own `d_base = grad_res` identity
@@ -1465,10 +1465,9 @@ mod tests {
         // accumulating `1.0 + f32val` at FULL f32 precision first pushes
         // the true sum just past the halfway point BETWEEN `1.0` and the
         // next f16 above it, rounding UP to `1.0009766` instead — an
-        // exhaustive brute-force search (0.1 microstep, `half` crate,
-        // documented here rather than re-derived by hand: see this
-        // fixture's own hand-off report) confirmed this is a genuine
-        // divergence, not a hand-calculation error.
+        // exhaustive brute-force search (0.1 microstep, `half` crate)
+        // confirms this is a genuine divergence, not a hand-calculation
+        // error; the two asserts below re-check it on every run.
         let base = f16::from_f32(1.0);
         let f32val = 0.0004884_f32;
         let correct = base + f16::from_f32(f32val); // round f32val to f16 FIRST, then add

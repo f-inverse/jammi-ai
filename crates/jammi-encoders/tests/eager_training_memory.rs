@@ -1,240 +1,121 @@
-//! The COMPARABLE-EAGER control for the f16 eager fine-tune OOM: a
-//! fully-eager bf16 leg at identical shape, constructed as a cuda-gated Rust
-//! test at the library seam, with both branches handled: fully-eager bf16
-//! also OOMs => defect is eager-composition memory; completes =>
-//! f16-specific.
+//! Eager-composition training memory on CUDA: a fully-eager bf16 leg and a fully-eager f16
+//! leg at identical shape, driven at the library seam, tell an eager-composition memory
+//! defect (both OOM) from an f16-specific one (only f16 OOMs); a variable-shape leg shows
+//! sequence-length bucketing keeps a variable-shape run within the fixed-shape run's memory.
 //!
-//! ## Why this is a LIBRARY-SEAM test, not the bench arm
+//! ## Why the library seam
 //!
-//! Campaign #443's own §Folded defect is explicit: "the comparable-eager
-//! control's vehicle is a cuda-gated Rust test at the library seam, owned
-//! in W2a ... NOT the bench arm — widening the arm validator is W4's
-//! domain and mutates `arm`, the A/B protocol's declared independent
-//! variable." So this file drives `jammi_encoders::ModernBert` and
-//! `jammi_kernels::admission` DIRECTLY, mirroring the shape of a real
-//! LoRA fine-tune step (three forward passes — anchor/positive/negative —
-//! through the SAME weight-tied model, a margin loss, one backward) rather
-//! than going through `jammi-bench`'s `finetune-run`/`finetune-step` CLI
-//! or its `arm` validator at all.
+//! This file drives `jammi_encoders::ModernBert` and `jammi_kernels::admission` directly,
+//! mirroring one LoRA fine-tune step (three weight-tied forward passes —
+//! anchor/positive/negative — a margin loss, one backward), rather than going through
+//! `jammi-bench`'s CLI, whose `arm` is the A/B protocol's independent variable and must not
+//! be widened to carry this control.
 //!
-//! ## Why synthetic weights, not a real checkpoint
+//! ## Why synthetic weights
 //!
-//! The reporter shape is ModernBERT-large (`hidden_size=1024,
-//! num_hidden_layers=28, num_attention_heads=16, intermediate_size=2624,
-//! vocab_size=50368, max_position_embeddings=8192,
-//! global_attn_every_n_layers=3, local_attention=128` — the public
-//! `answerdotai/ModernBERT-large` `config.json` values, ALSO this port's
-//! own compiled-in defaults for every field the JSON omits:
-//! `DEFAULT_LAYER_NORM_EPS`/`DEFAULT_GLOBAL_ROPE_THETA`/
-//! `DEFAULT_LOCAL_ROPE_THETA`/`DEFAULT_LOCAL_ATTENTION`/
-//! `DEFAULT_GLOBAL_ATTN_EVERY_N_LAYERS` in `src/modernbert.rs`). This
-//! wave's charter explicitly permits driving the encoder/trainer seam with
-//! SYNTHETIC weights "if checkpoint-shape fidelity is preserved" — the
-//! question under test is peak-memory/OOM behavior of the EAGER
-//! composition, which depends on tensor SHAPES and DTYPES, never on
-//! weight VALUES. [`write_synthetic_checkpoint`] builds every tensor
-//! `ModernBertBuilder::build` expects, at the exact real-checkpoint names
-//! and shapes (`model.embeddings.tok_embeddings.weight`,
-//! `model.layers.{n}.attn.{Wqkv,Wo}.weight`, `model.layers.{n}.mlp.
-//! {Wi,Wo}.weight`, the `attn_norm`/`mlp_norm`/`emb_norm`/`final_norm`
-//! bias-free LayerNorm weights — see that function's own doc for the
-//! exact list, cross-checked against `ModernBertBuilder::build`'s own
-//! `frozen_vb.pp(..)` call sites), filled with `Tensor::randn` (finite,
-//! nonzero, never a degenerate all-same-value fixture) at F32, written to
-//! a temp safetensors file ONCE and reused for both dtype legs (candle's
-//! `VarBuilder::from_mmaped_safetensors` casts to the requested
-//! `backbone_dtype` on `get`, so one F32 file serves both the BF16 and F16
-//! legs without rewriting it).
+//! The shape is ModernBERT-large (`hidden_size=1024, num_hidden_layers=28,
+//! num_attention_heads=16, intermediate_size=2624, vocab_size=50368,
+//! max_position_embeddings=8192, global_attn_every_n_layers=3, local_attention=128` — the
+//! public `answerdotai/ModernBERT-large` `config.json`, and this port's compiled-in
+//! defaults for every field the JSON omits: `DEFAULT_LAYER_NORM_EPS`/
+//! `DEFAULT_GLOBAL_ROPE_THETA`/`DEFAULT_LOCAL_ROPE_THETA`/`DEFAULT_LOCAL_ATTENTION`/
+//! `DEFAULT_GLOBAL_ATTN_EVERY_N_LAYERS` in `src/modernbert.rs`). Peak memory depends on
+//! tensor shapes and dtypes, never on weight values, so [`write_synthetic_checkpoint`]
+//! builds every tensor `ModernBertBuilder::build` reads, at the real checkpoint's names
+//! and shapes, filled with `Tensor::randn` at F32 and written once; candle's
+//! `VarBuilder::from_mmaped_safetensors` casts to the requested `backbone_dtype` on `get`,
+//! so one file serves both the BF16 and F16 legs.
 //!
-//! ## The four esc-076 vacuity controls, as implemented here
+//! ## The four vacuity controls
 //!
-//! 1. **ANTI-SIDESTEP** ([`assert_ran_eager`]): `JAMMI_KERNELS_DISABLE=all`
-//!    is set as the FIRST statement of EVERY `#[test]` in this file (this
-//!    file is its own Cargo-autodiscovered test binary/process, so there is
-//!    no other test file racing `jammi_kernels::admission::disabled_ops`'s
-//!    process-wide `OnceLock` for who initializes it first — see that
-//!    function's own doc and `crates/jammi-bench/tests/finetune_step_kernel_disable.rs`'s
-//!    identical concern, resolved there by spawning a child process
-//!    instead). That `OnceLock` specifically is safe under concurrency
-//!    here precisely BECAUSE every test sets the identical value `"all"` —
-//!    the race the doc above would matter for is between DIFFERENT disable
-//!    configurations, never between two writers agreeing on the same one.
-//!    CORRECTED (campaign #446, finding 9): an earlier revision of this
-//!    paragraph generalized that one env var's safety into "this file's
-//!    own tests are safe to run concurrently in the SAME process", which
-//!    is FALSE for the part of these oracles that matters — see
-//!    [`SerialGpu`] and the section below. [`assert_ran_eager`]
-//!    reads [`jammi_encoders::ln_dispatch_snapshot`] (this crate's own
-//!    published counter, the same `LayerNormFused`/eager-fallback pair
-//!    every other dispatch-count oracle in this crate's own test suite
-//!    reads) before/after each leg and asserts `fused == 0` — the eager
-//!    fallback contract is proven to hold on its OWN terms, not assumed
-//!    from the env var alone.
-//! 2. **ANTI-SHRINK**: the real legs run at the EXACT measured failing
-//!    shape (`batch=16, seq=128`, ModernBERT-large) — [`REPORTER_BATCH`]/
-//!    [`REPORTER_SEQ`] are never reduced for test speed. A SEPARATE,
-//!    deliberately-oversized witness leg ([`oom_capability_witness_leg`])
-//!    proves this harness's OWN OOM-classification path is alive
-//!    (`assert_oom_classification_is_a_capability_witness_not_hollow`):
-//!    without it, "neither leg OOM'd" could mean either "the defect is
-//!    fixed" or "this harness cannot detect an OOM at all", and green
-//!    would not distinguish them.
-//! 3. **ANTI-HOLLOW-PASS**: a completing leg is checked for a finite loss
-//!    (`assert!(loss.is_finite())`, never `!(x > bound)` — KO-2/family F)
-//!    AND that each pooled forward output's dtype is STILL the requested
-//!    one (`a.dtype() == dtype`, checked for all three of
-//!    anchor/positive/negative before the loss's own `to_dtype(F32)` cast)
-//!    — a silent internal upcast would read as "it works" for the wrong
-//!    reason, and would invalidate the whole dtype comparison.
-//! 4. **COMPARABLE-EAGER ARM EXISTS**: this whole file IS that arm — both
-//!    `run_leg(DType::BF16, ..)` and `run_leg(DType::F16, ..)` drive the
-//!    IDENTICAL pipeline (same weights file, same synthetic token ids,
-//!    same margin-loss/backward shape), differing ONLY in `backbone_dtype`.
+//! 1. **Anti-sidestep** ([`assert_ran_eager`]): every `#[test]` sets
+//!    `JAMMI_KERNELS_DISABLE=all` as its first statement. This file is its own test binary,
+//!    and every test sets the identical value, so the process-wide `OnceLock` in
+//!    `jammi_kernels::admission::disabled_ops` cannot be initialised to a different
+//!    configuration by a sibling (`crates/jammi-bench/tests/finetune_step_kernel_disable.rs`
+//!    has the same concern and spawns a child instead). That makes the env var safe; it does
+//!    NOT make the device-memory oracles safe to run concurrently — see [`SerialGpu`].
+//!    [`assert_ran_eager`] then reads [`jammi_encoders::ln_dispatch_snapshot`] around each
+//!    leg and asserts `fused == 0`, so eager execution is proven, not assumed from the env
+//!    var.
+//! 2. **Anti-shrink**: the legs run at the full reference shape (`batch=16, seq=128`,
+//!    ModernBERT-large); [`REFERENCE_BATCH`]/[`REFERENCE_SEQ`] are never reduced for test
+//!    speed. A deliberately oversized witness leg ([`oom_capability_witness_leg`]) proves the
+//!    harness's own OOM classification works; without it, "neither leg OOM'd" could not be
+//!    told apart from "this harness cannot detect an OOM".
+//! 3. **Anti-hollow-pass**: a completing leg must have a finite loss
+//!    (`assert!(loss.is_finite())`, never `!(x > bound)`, which a NaN passes) AND every
+//!    pooled output must still be in the requested dtype (checked for anchor, positive and
+//!    negative before the loss's own `to_dtype(F32)`): a silent internal upcast would make
+//!    the dtype comparison meaningless.
+//! 4. **Comparable eager arm**: `run_leg(DType::BF16, ..)` and `run_leg(DType::F16, ..)`
+//!    drive the identical pipeline (same weights file, same token ids, same margin loss and
+//!    backward), differing only in `backbone_dtype`.
 //!
 //! ## One test at a time, structurally
 //!
-//! This file has THREE `#[test]` fns (two run by default; the pre-fix RED
-//! reproduction is `#[ignore]`d), and every one of them measures
-//! DEVICE-GLOBAL free memory. Concurrency between them is not a style
-//! question: two legs sampling `cuMemGetInfo` while a third holds tens of
-//! GB of eager activations read each other's allocations as their own.
-//! [`SerialGpu`] makes single-test-at-a-time a property of the ONLY way
-//! this file can obtain a `Device`, so it holds for tests that do not
-//! exist yet. It replaces a comment that asserted the opposite and a
-//! `--test-threads=1` expectation nothing in CI supplies.
+//! Every test here measures DEVICE-GLOBAL free memory. Two legs sampling `cuMemGetInfo`
+//! while a third holds tens of GB of eager activations read each other's allocations as
+//! their own. [`SerialGpu`] makes single-test-at-a-time a property of the only way this
+//! file can obtain a `Device`, so it holds for tests that do not exist yet, without relying
+//! on `--test-threads=1`.
 //!
 //! ## Reading the verdict
 //!
-//! `main()`-adjacent to the single `#[test]`, `print_diagnosis` states
-//! which of esc-076's two root-cause branches this run's evidence supports
-//! — printed via `--nocapture`, not asserted as a hard pass/fail condition
-//! (per campaign #443's Part 3 item 4 fold-the-fix note: "Do NOT fix the
-//! root cause yet ... this wave delivers the DIAGNOSIS and the control
-//! test"). The test itself still FAILS on any outcome that is neither "ran
-//! to completion, finite" nor "refused with the CUDA out-of-memory driver
-//! error" — an unrelated panic, shape error, or silent dtype coercion is a
-//! harness defect, not a diagnosis.
+//! [`print_diagnosis`] states which of the two root-cause branches (eager composition vs
+//! f16-specific) a run's evidence supports, printed under `--nocapture` rather than
+//! asserted. The test still FAILS on any outcome that is neither "completed, finite" nor
+//! "refused with the CUDA out-of-memory driver error": an unrelated panic, a shape error
+//! or a silent dtype coercion is a harness defect, not a diagnosis.
 //!
-//! ## D3 ATTRIBUTION (campaign #443 W2c)
+//! ## Where eager training memory goes
 //!
-//! Discriminator legs measured, on the real bench path: a full f16
-//! leg reproduces the OOM (0->49GB@5s->78GB@25s); a 4-step TRUNCATED (seq
-//! capped at 64) f16 leg peaks 63.3GB and completes; a 4-step DUPLICATED-
-//! batch f16 leg (the SAME shape repeated, never a new one) peaks at an
-//! IDENTICAL 63.1GB — "shape-variability exonerated within a few steps,
-//! but full-run growth tracks the COUNT OF DISTINCT batch shapes"; and a
-//! same-config bf16-fused/f32-fused pair lands at 44.2/41.7GB — i.e. the
-//! eager composition (any dtype) carries a ~19GB BASE offset over the
-//! fused path PLUS a per-NEW-shape growth term, and the defect is
-//! dtype-INDEPENDENT in principle (only f16-shaped in practice because
-//! admission today routes only f16 to the eager fallback at all).
+//! Measured on the bench path: a full f16 eager run at the reference shape runs out of
+//! memory (0 → 49 GB at 5 s → 78 GB at 25 s); a 4-step run with seq capped at 64 peaks at
+//! 63.3 GB and completes; a 4-step run repeating ONE batch shape peaks at an identical
+//! 63.1 GB; a bf16-fused/f32-fused pair of the same config lands at 44.2/41.7 GB. So the
+//! eager composition (any dtype) carries a ~19 GB base offset over the fused path plus a
+//! growth term that tracks the number of DISTINCT batch shapes. The defect is
+//! dtype-independent in principle, and f16-shaped in practice only because admission
+//! routes f16 to the eager fallback.
 //!
-//! **Attribution, reasoned from that evidence plus this crate's own build
-//! facts.** `crate::cuda::cast_scale`'s own doc states the load-bearing
-//! fact: "cudarc has no caching allocator" — every `CudaStorage` this
-//! crate (and candle-core's OWN CUDA backend, which allocates through the
-//! SAME `cudarc::driver::CudaDevice::alloc`/`alloc_zeros` primitives) ever
-//! creates is a RAW `cuMemAlloc`/`cuMemFree` pair, never pooled or cached
-//! Rust-side. A raw, non-pooling allocator hitting MANY DIFFERENT
-//! allocation sizes over a run's lifetime is exactly the shape CUDA's own
-//! driver-level allocator is known to fragment under (the driver's arena
-//! cannot always satisfy a NEW size class from a block freed at a
-//! DIFFERENT size, so its total reserved footprint grows with the COUNT OF
-//! DISTINCT sizes ever requested, not with any one tensor's own lifetime)
-//! — this is the textbook mechanism the ledger's "growth tracks count of
-//! DISTINCT batch shapes" finding describes, and it requires NO f16-
-//! specific or jammi-encoders-specific defect to explain: it is a property
-//! of feeding a raw (non-caching) CUDA allocator a training loop whose
-//! per-step tensor shapes are not drawn from a small, fixed set.
+//! **The growth term.** `cudarc` has no caching allocator: every `CudaStorage` this crate
+//! (and candle-core's own CUDA backend, through the same `CudaDevice::alloc`/`alloc_zeros`)
+//! creates is a raw `cuMemAlloc`/`cuMemFree` pair. A raw, non-pooling allocator fed many
+//! distinct allocation sizes fragments at the driver level — a new size class cannot
+//! always be served from a block freed at a different size — so the reserved footprint
+//! grows with the count of distinct sizes ever requested. Every one of those sizes is a
+//! direct function of the `(batch, seq)` the caller hands `ModernBert::forward`; nothing
+//! inside this crate's per-op eager arms can reduce the count without changing the
+//! computation (padding an intermediate inside `LayerNorm::slow` would inject values into a
+//! mean/variance reduction). Canonicalising shapes is only sound before tokens reach the
+//! encoder, at the trainer's batch construction: `jammi-ai`'s
+//! `fine_tune::batch_bucket`, wired at `TrainingLoop::encode_texts`, rounds each batch's
+//! natural width up to a small, fixed power-of-two ladder, and the f16 run at the
+//! reference shape completes at a flat 44.3 GB with it. The bucket decision itself
+//! (`bucket_seq_len`/`MIN_BUCKET_LEN`) lives in `jammi_numerics`, below both crates, so
+//! [`variable_shape_bucketed_steps_complete_with_bounded_memory`] calls the identical
+//! decision at this seam without depending on `jammi-ai`.
 //!
-//! **Where the ~19GB BASE offset comes from (jammi-encoders' own share).**
-//! The eager composition materialises MORE simultaneously-live, separately-
-//! allocated tensors per op than the fused kernels do (e.g. `fn slow`'s
-//! upcast-compute-cast-back — `fn slow`, `jammi-encoders/src/layer_norm.rs:730` — and the
-//! analogous multi-step compositions in `softmax`/`geglu`'s own eager
-//! fallbacks) — each such intermediate is its own `cuMemAlloc`, at its OWN
-//! (upcast, often F32) size, on top of whatever the fused kernel would
-//! have needed zero extra allocations for. This portion IS attributable to
-//! this crate. It is a FIXED, shape-count-independent overhead (present
-//! even in the flat, fixed-shape leg above) — bounding it would mean
-//! reusing scratch buffers across an op's own intermediates, a real but
-//! separate, larger refactor than this wave's scope names, and NOT what
-//! drives the escape's actual OOM (the fixed-shape leg above does not
-//! OOM at 40 steps; only variable-shape growth does).
+//! **The base offset.** The eager composition materialises more simultaneously-live,
+//! separately-allocated tensors per op than the fused kernels (e.g. `LayerNorm::slow`'s
+//! upcast-compute-cast-back in `src/layer_norm.rs`, and the analogous compositions in the
+//! `softmax`/`geglu` eager fallbacks), each its own `cuMemAlloc` at its own (often F32)
+//! size. This is a fixed, shape-count-independent overhead that does not by itself run out
+//! of memory at 40 fixed-shape steps; bounding it means reusing scratch buffers across an
+//! op's intermediates.
 //!
-//! **Where the GROWTH term (the actual OOM trigger) belongs, and why it is
-//! NOT a jammi-encoders fix.** The growth is driven by the NUMBER OF
-//! DISTINCT INPUT SHAPES the eager composition is ever asked to run at —
-//! and every one of those shapes is a direct, undistorted function of the
-//! `(batch, seq)` the CALLER hands to `ModernBert::forward`. Nothing
-//! inside this crate's per-op eager arms can reduce that count without
-//! CHANGING the computation: padding an intermediate activation's shape
-//! inside e.g. `LayerNorm::slow` would inject fabricated values into a
-//! mean/variance reduction, corrupting the result — canonicalizing shapes
-//! is only sound BEFORE the real tokens ever reach the encoder, i.e. at
-//! the trainer's own batch-construction step (padding/bucketing sequence
-//! lengths to a small, fixed set of buckets so the SAME small set of
-//! shapes recurs across steps, exactly the shape the ledger's "duplicated
-//! batches plateau" leg already proved bounds growth). That decision is
-//! `jammi-ai`'s trainer/dataloader, never `jammi-encoders`'s own forward
-//! path. Per campaign #443's own instruction and the extend-seams-not-
-//! upstream doctrine (never patch candle's/cudarc's allocator internals
-//! either — there is no house seam exposing an allocator policy knob to
-//! wrap), this wave does NOT reach into `jammi-ai` to add bucketing:
-//! **the seam is reported here, precisely, for the lead to route.**
-//!
-//! [`esc076_variable_shape_unbucketed_reproduces_the_pre_fix_oom`] (below,
-//! `#[ignore]`d) is the committed reproduction of the growth mechanism at
-//! THIS crate's own seam (variable seq length per step vs a fixed-shape
-//! control at the identical step count) — it FAILS (RED) whenever run,
-//! by design, and is not part of the default green suite once the fix
-//! below landed; `fix-verifier` runs it explicitly (`--ignored`) as
-//! esc-076's RED oracle: revert `jammi-ai`'s bucketing fix and this test
-//! must fail the identical way it does today.
-//!
-//! **FOLLOW-UP (fix landed): `jammi-ai`'s sequence-length bucketing.**
-//! `crates/jammi-ai/src/fine_tune/batch_bucket.rs`, wired at
-//! `TrainingLoop::encode_texts`, now rounds each batch's natural width up
-//! to a small, fixed power-of-two bucket ladder before any tensor is
-//! built — the reporter-shape f16 leg completes on the pod (44.3GB flat)
-//! post-fix. The bucket DECISION itself
-//! (`bucket_seq_len`/`MIN_BUCKET_LEN`) lives in `jammi_numerics`
-//! (`crates/jammi-numerics/src/batch_shape.rs`) rather than `jammi-ai`,
-//! specifically so THIS crate's own D3 oracle
-//! ([`esc076_variable_shape_bucketed_completes_with_bounded_memory`],
-//! below) can call the IDENTICAL decision without depending on
-//! `jammi-ai` (the wrong dependency direction — `jammi-numerics` sits
-//! below both crates). That GREEN leg proves the fix bounds memory at
-//! THIS library seam directly, not merely inferred from `jammi-ai`'s own
-//! unit tests.
-//!
-//! **Pod finding, disclosed honestly (this branch's own landing run):** the
-//! FIRST attempt at [`VARIABLE_SHAPE_SEQS`] (five values, all `<=
-//! REPORTER_SEQ = 128`, `20` steps) produced a FLAT trace on BOTH the
-//! variable-shape leg AND its fixed-shape control (`0.0` MiB drop, both) —
-//! a genuine NEGATIVE result at that scale, not silently discarded (kept
-//! as this constant's own prior-value note). Reproduction required
-//! WIDENING the shape range up to `512` (`11` values, `33` steps) — at
-//! which point the variable-shape leg OOM'd after only 3 completed steps
-//! (having reached seq lengths 64, 96, 128 before failing at 160), while
-//! the fixed-shape control (33 steps at the fixed `REPORTER_SEQ = 128`)
-//! completed cleanly. This is an HONEST but IMPERFECT isolation of the
-//! ledger's own "count of DISTINCT shapes" variable: this leg's shapes
-//! both vary in COUNT and GROW in AMPLITUDE across the cycle (unlike the
-//! ledger's own controls, which held amplitude fixed and varied only
-//! whether a shape repeated), so this reproduction demonstrates "a
-//! realistic variable-length-batch training loop OOMs at a moderate,
-//! ordinary shape where a fixed-shape loop of the same nominal severity
-//! does not" — the same CLASS of defect and the same practical
-//! consequence — without cleanly separating "shape variety alone" from
-//! "the largest shape reached, retained via a non-releasing allocator"
-//! as independent causes. Either framing routes to the SAME fix (bound
-//! the shape variety AND the peak amplitude a step can introduce, i.e.
-//! bucket/pad at the batch-construction layer), so the attribution and
-//! routing above stand; a reader wanting the cleaner isolation should
-//! re-run at a FIXED amplitude (all shapes `== REPORTER_SEQ`'s own
-//! token count, permuted only in which axis carries it) before treating
-//! "distinct count alone, no growth" as separately confirmed.
+//! **What the variable-shape legs show, and what they do not.** With five sequence lengths
+//! all `<= 128` over 20 steps, the variable-shape leg and its fixed-shape control both
+//! stayed flat (0.0 MiB drop). With [`VARIABLE_SHAPE_SEQS`] (11 lengths up to 512, 33
+//! steps), the unbucketed variable-shape leg ran out of memory after 3 completed steps
+//! (64, 96, 128, failing at 160) while the fixed-shape control completed all 33. Those
+//! shapes vary both in count and in amplitude, so this shows that a realistic
+//! variable-length training loop runs out of memory where a fixed-shape loop of the same
+//! nominal size does not, without separating "shape variety alone" from "the largest
+//! shape reached, retained by a non-releasing allocator". Both route to the same remedy
+//! (bound shape variety and peak amplitude at batch construction); isolating shape count
+//! alone needs a run at fixed amplitude.
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Optimizer, VarMap};
@@ -244,12 +125,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-/// The escape's own measured failing shape (`esc-076`'s `observable`
-/// field: "f16 fine-tune ... terminates rc=1 ... Backward:
-/// DriverError(CUDA_ERROR_OUT_OF_MEMORY) ~85s in" at
-/// `--batch 16 --max-seq-length 128`).
-const REPORTER_BATCH: usize = 16;
-const REPORTER_SEQ: usize = 128;
+/// The reference training shape, `--batch 16 --max-seq-length 128`: the f16 eager
+/// fine-tune at this shape fails in backward with `CUDA_ERROR_OUT_OF_MEMORY` about 85 s in.
+const REFERENCE_BATCH: usize = 16;
+const REFERENCE_SEQ: usize = 128;
 
 /// Public `answerdotai/ModernBERT-large` `config.json` values (see this
 /// file's own module doc for the full citation and cross-check against
@@ -277,48 +156,29 @@ static GPU_SERIAL: Mutex<()> = Mutex::new(());
 
 /// A CUDA device that cannot be held without also holding [`GPU_SERIAL`].
 ///
-/// Campaign #446, finding 9. This file's oracles read DEVICE-GLOBAL free
-/// memory (`cuda_free_mib` -> `cuMemGetInfo`), and it has THREE `#[test]`
-/// fns, two of which run by default. `cargo test` runs the tests of one
-/// binary CONCURRENTLY, so two legs measuring the same device's free
-/// memory while a third is allocating tens of GB of eager activations
-/// attribute each other's allocations to their own trace -- a false RED
-/// (or, worse, a false GREEN when the interleaving happens to cancel
-/// out).
+/// This file's oracles read DEVICE-GLOBAL free memory (`cuda_free_mib` -> `cuMemGetInfo`),
+/// and `cargo test` runs one binary's tests concurrently, so two legs measuring the same
+/// device while a third allocates tens of GB of eager activations attribute each other's
+/// allocations to their own trace -- a false failure, or a false pass when the interleaving
+/// cancels out.
 ///
-/// The remedy is structural, not documentary: `cuda_device` is the ONLY
-/// source of a `Device` in this file, and it now hands back this wrapper,
-/// which holds the process-wide lock for as long as the caller holds the
-/// device. A test added tomorrow cannot forget to serialize, because it
-/// cannot obtain a device without doing so -- whereas a comment asking
-/// for `--test-threads=1` (nothing in CI passes it) is exactly the kind
-/// of instruction a new test silently does not read.
+/// `cuda_device` is the only source of a `Device` in this file and returns this wrapper,
+/// which holds the process-wide lock for as long as the caller holds the device, so a new
+/// test cannot forget to serialize.
 ///
 /// # Why there is no `Deref<Target = Device>`
 ///
-/// This type used to `impl Deref<Target = Device>`, which kept every
-/// `&device` call site working unchanged -- and let
-/// `let d = (*cuda_device().unwrap()).clone();` type-check. That one-liner
-/// ENDS the serialization: the temporary guard (and with it the slot) is
-/// dropped at the end of the statement, while `d` is a live, owned
-/// `Device` the caller then measures device-global free memory on with no
-/// slot held -- the exact escape this wrapper exists to prevent, spelled
-/// as ordinary deref usage. Mirrors `jammi-ai`'s
-/// `tests/gpu_capability/harness.rs` fix of the same shape.
+/// A `Deref` would let `let d = (*cuda_device()).clone();` type-check, which ends the
+/// serialization: the temporary guard (and the slot) drops at the end of the statement
+/// while `d` is a live `Device` measured with no slot held. [`SerialGpu::device`] ties the
+/// borrow to `&self`, so no `&Device` outlives the guard. `jammi-ai`'s
+/// `tests/gpu_capability/harness.rs` has the same shape.
 ///
-/// [`SerialGpu::device`] replaces it: the borrow it returns is tied to
-/// `&self`, so no `&Device` can outlive the guard. Every call site passes
-/// `device.device()` where it used to pass `&device`.
-///
-/// **What is still open, stated rather than implied.** `candle_core::Device`
-/// is `Clone`, so `guard.device().clone()` compiles and always will --
-/// nothing an API of this shape can do prevents cloning a `Clone` type
-/// reachable by reference (a `&DeviceRef` newtype does not help: if it
-/// derefs to `Device` the clone resolves straight through it by autoderef,
-/// and if it does not, no call site can pass it where `&Device` is
-/// wanted). What changed is that the escape is now an EXPLICIT, greppable
-/// `.device().clone()` rather than an incidental consequence of deref, and
-/// no call site in this file needs it.
+/// `candle_core::Device` is `Clone`, so `guard.device().clone()` still compiles; no API of
+/// this shape can prevent cloning a `Clone` type reachable by reference (a `&DeviceRef`
+/// newtype either derefs to `Device`, and the clone resolves through it, or cannot be
+/// passed where `&Device` is wanted). That escape hatch is an explicit, greppable
+/// `.device().clone()`, and no call site in this file needs it.
 ///
 /// A poisoned lock is recovered with `into_inner` rather than unwrapped:
 /// one leg panicking must fail THAT leg, not turn every sibling into a
@@ -369,23 +229,18 @@ fn take_gpu_slot() -> MutexGuard<'static, ()> {
 /// **The release half.** `jammi-ai`'s `tests/gpu_capability/harness.rs`
 /// twin also asserts `try_lock().is_ok()` after the guard drops. That
 /// assertion is sound THERE because it runs on the CPU lane, where no
-/// sibling can take the slot. Here it is not: this file is
-/// `#![cfg(feature = "cuda")]` in its entirety, so the control only ever
-/// runs alongside legs that hold the slot for MINUTES, and `cargo test`
-/// runs a binary's tests concurrently -- a sibling holding the slot at that
-/// instant is CORRECT behavior, not a leak, and asserting on it is a
-/// coin-flip. (Measured, not predicted: the first version of this control
-/// asserted it and failed on an L40S pod for exactly that reason, with
-/// `esc076_variable_shape_bucketed_completes_with_bounded_memory` holding
-/// the slot.) Release is `MutexGuard`'s own `Drop`, which is not this
+/// sibling can take the slot. Here it is not: this whole test target
+/// requires `live-gpu-tests`, so the control only ever runs alongside legs
+/// that hold the slot for MINUTES, and `cargo test` runs a binary's tests
+/// concurrently -- a sibling holding the slot at that instant is CORRECT
+/// behavior, not a leak, and asserting on it fails intermittently
+/// (observed on an L40S, with
+/// `variable_shape_bucketed_steps_complete_with_bounded_memory` holding
+/// the slot). Release is `MutexGuard`'s own `Drop`, which is not this
 /// file's code; exclusion is the part that is.
 ///
-/// **CPU-lane coverage.** Unlike the `jammi-ai` twin, this control cannot
-/// run without the `cuda` feature -- that lane compiles none of this file.
-/// What it does buy is that it needs no DEVICE: every `cuda`-featured lane
-/// runs it, including one where `Device::new_cuda` fails and no
-/// [`SerialGpu`] can be constructed at all, which is exactly where this
-/// file's other tests skip out.
+/// **No CPU-lane coverage.** Unlike the `jammi-ai` twin, this control is
+/// compiled only with `live-gpu-tests`. It needs no DEVICE itself.
 #[test]
 fn gpu_slot_is_exclusive_while_held() {
     let slot = take_gpu_slot();
@@ -477,19 +332,16 @@ fn write_synthetic_checkpoint(config: &ModernBertConfig, path: &Path) {
 }
 
 /// `Wqkv`-only, rank 16, alpha 32.0, Gaussian init, seed 1 -- matches
-/// `esc-076`'s own reproduction seed and `flash_oracle_build_model`'s
-/// (`src/modernbert.rs`) production-shaped LoRA fixture. DISCLOSED
-/// assumption: the escape's own `symptom_spec` does not state its exact
-/// `--lora-rank`/`--lora-alpha`, so this is the best-available production-
-/// like stand-in, not a verified-exact reproduction of those two flags.
+/// `flash_oracle_build_model`'s (`src/modernbert.rs`) production-shaped LoRA
+/// fixture. The reference failure does not fix `--lora-rank`/`--lora-alpha`,
+/// so this is a production-like stand-in for those two flags.
 fn production_lora_config() -> (Vec<String>, HashMap<String, usize>) {
     (vec!["Wqkv".to_string()], HashMap::new())
 }
 
 /// `with_lora`: when `true`, `Wqkv` gets a REAL trainable LoRA adapter
 /// (see [`production_lora_config`]) instead of [`LoraBuildConfig::frozen`].
-/// This matters far more than it first appears (this file's own landing
-/// run's finding, see the module doc's amended verdict): a `frozen()`
+/// This matters: a `frozen()`
 /// build has NO `Var` anywhere in the graph, so `Tensor::backward()`'s
 /// walk finds nothing needing a gradient and candle can drop every
 /// intermediate activation as soon as its Rust-side reference count hits
@@ -497,9 +349,8 @@ fn production_lora_config() -> (Vec<String>, HashMap<String, usize>) {
 /// fine-tune's trainable LoRA A/B matrices are genuine `Var`s, so every
 /// intermediate activation on ANY path from a LoRA-touched layer through
 /// to the loss must stay alive until `.backward()` runs -- the actual
-/// eager-composition memory profile `esc-076` measured. `frozen()` alone
-/// is therefore not a comparable control for the escape's own defect,
-/// regardless of dtype.
+/// eager-composition memory profile of a real fine-tune. `frozen()` alone
+/// is therefore not a comparable control, regardless of dtype.
 fn build_model(
     config: &ModernBertConfig,
     weights: &Path,
@@ -530,13 +381,12 @@ fn build_model(
         .backbone_dtype(dtype)
         .lora(lora)
         .build(&[weights], config, device, &varmap)
-        .unwrap_or_else(|e| panic!("esc076: build ModernBert ({dtype:?}) failed: {e}"));
+        .unwrap_or_else(|e| panic!("build ModernBert ({dtype:?}) failed: {e}"));
     model.set_training(true);
     (model, varmap)
 }
 
-/// Synthetic token ids -- deterministic (no external RNG dependency,
-/// family L), `< vocab_size`, `[batch, seq]`.
+/// Synthetic token ids -- deterministic (no external RNG dependency), `< vocab_size`, `[batch, seq]`.
 fn synthetic_ids(batch: usize, seq: usize, vocab: usize, salt: u32, device: &Device) -> Tensor {
     let ids: Vec<u32> = (0..batch * seq)
         .map(|i| ((i as u32).wrapping_mul(2654435761).wrapping_add(salt)) % vocab as u32)
@@ -559,8 +409,7 @@ fn ln_dispatch_delta(
 enum LegOutcome {
     /// `steps_completed == STEPS_PER_LEG`: the whole run completed. `losses`
     /// is per-step, for a human `--nocapture` read; `free_mib_after_step`
-    /// is the SAME per-step trace `esc-076`'s own title
-    /// ("nonmonotone-memory") asks about -- a leg that "completes" but
+    /// is the per-step free-memory trace -- a leg that "completes" but
     /// shows a MONOTONE downward free-memory trend (no plateau) is still a
     /// leak, just one this device's 80GB happened to absorb.
     Completed {
@@ -568,8 +417,8 @@ enum LegOutcome {
         free_mib_after_step: Vec<f64>,
     },
     /// `steps_completed < STEPS_PER_LEG`: OOM'd partway through -- the
-    /// escape's own observable ("~85s in", not immediately) is exactly
-    /// this shape, a multi-step run, not a single-step peak.
+    /// reference failure (about 85 s in, not immediately) has this shape, a
+    /// multi-step run, not a single-step peak.
     CudaOutOfMemory {
         steps_completed: usize,
         free_mib_after_step: Vec<f64>,
@@ -580,12 +429,11 @@ enum LegOutcome {
     },
 }
 
-/// Number of training steps per leg. The escape's own observable
-/// ("Backward: DriverError(CUDA_ERROR_OUT_OF_MEMORY) ~85s in") reports a
-/// failure well after the FIRST step, which is the title's own
-/// "nonmonotone-memory" framing: this is a MULTI-STEP memory-growth
-/// question, not a single-step peak-memory question. This wave's own
-/// landing run found a single forward+backward step at the reporter shape
+/// Number of training steps per leg. The reference failure
+/// ("Backward: DriverError(CUDA_ERROR_OUT_OF_MEMORY)" about 85 s in) comes
+/// well after the FIRST step: this is a MULTI-STEP memory-growth
+/// question, not a single-step peak-memory question. A single
+/// forward+backward step at the reference shape
 /// leaves tens of GiB of headroom on an 80GB A100 (see
 /// [`oom_capability_witness_leg`]'s doc for the single-step numbers) --
 /// `STEPS_PER_LEG` is chosen to give a real optimizer loop (with its own
@@ -607,10 +455,9 @@ fn cuda_free_mib(device: &Device) -> f64 {
     free as f64 / (1024.0 * 1024.0)
 }
 
-/// Runs a MULTI-STEP fully-eager training leg at `(REPORTER_BATCH,
-/// REPORTER_SEQ)`: each step is three forward passes (anchor/positive/
+/// Runs a MULTI-STEP fully-eager training leg at `(REFERENCE_BATCH,
+/// REFERENCE_SEQ)`: each step is three forward passes (anchor/positive/
 /// negative, weight-tied -- the real LoRA fine-tune step's own shape,
-/// `docs/maintainer/cuda-kernel-guide.md` §3.6's
 /// `mean(relu(margin - cos(a,p) + cos(a,n)))`), pooled + L2-normalised
 /// (`ModernBert::forward`'s own `pool_and_normalize`), a margin loss, one
 /// `AdamW::backward_step` (a REAL optimizer step -- `Var::set` in place,
@@ -637,12 +484,12 @@ fn run_leg(dtype: DType, config: &ModernBertConfig, weights: &Path, device: &Dev
          point (see build_model's own doc on why frozen() alone is not comparable)"
     );
     let mut optimizer = candle_nn::AdamW::new_lr(trainable_vars, 1e-4)
-        .unwrap_or_else(|e| panic!("esc076: AdamW::new_lr failed: {e}"));
+        .unwrap_or_else(|e| panic!("AdamW::new_lr failed: {e}"));
 
-    let anchor = synthetic_ids(REPORTER_BATCH, REPORTER_SEQ, config.vocab_size, 1, device);
-    let positive = synthetic_ids(REPORTER_BATCH, REPORTER_SEQ, config.vocab_size, 2, device);
-    let negative = synthetic_ids(REPORTER_BATCH, REPORTER_SEQ, config.vocab_size, 3, device);
-    let mask = Tensor::ones((REPORTER_BATCH, REPORTER_SEQ), DType::U32, device).unwrap();
+    let anchor = synthetic_ids(REFERENCE_BATCH, REFERENCE_SEQ, config.vocab_size, 1, device);
+    let positive = synthetic_ids(REFERENCE_BATCH, REFERENCE_SEQ, config.vocab_size, 2, device);
+    let negative = synthetic_ids(REFERENCE_BATCH, REFERENCE_SEQ, config.vocab_size, 3, device);
+    let mask = Tensor::ones((REFERENCE_BATCH, REFERENCE_SEQ), DType::U32, device).unwrap();
 
     let mut losses = Vec::with_capacity(STEPS_PER_LEG);
     let mut free_mib_after_step = Vec::with_capacity(STEPS_PER_LEG);
@@ -719,13 +566,13 @@ fn run_leg(dtype: DType, config: &ModernBertConfig, weights: &Path, device: &Dev
 /// oversized leg -- `seq` raised to `config.max_position_embeddings`
 /// (`8192`, ModernBERT-large's own RoPE-table ceiling, so this is still a
 /// VALID input the model accepts, never an out-of-domain shape) at the
-/// SAME `REPORTER_BATCH` -- that must ALWAYS classify as
+/// SAME `REFERENCE_BATCH` -- that must ALWAYS classify as
 /// [`LegOutcome::CudaOutOfMemory`] on any real GPU: attention's own
 /// `[batch, heads, seq, seq]` scores tensor ALONE is
 /// `16*16*8192*8192*4 bytes ~= 68.7 GiB` at this shape (global layer 0),
 /// well past any single real GPU's VRAM even before any other tensor is
-/// counted. MEASURED (this file's own landing run): raising ONLY `batch`
-/// (to `16 * 64 = 1024`, holding `seq = REPORTER_SEQ = 128`) did NOT OOM
+/// counted. Raising ONLY `batch`
+/// (to `16 * 64 = 1024`, holding `seq = REFERENCE_SEQ = 128`) did NOT OOM
 /// on an 80GB A100 -- `forward_hidden` alone at that shape completed --
 /// confirming the quadratic-in-`seq` lever is the reliable one here, not
 /// a linear-in-`batch` scale-up. If this ever reads as `Completed` (an
@@ -738,7 +585,7 @@ fn oom_capability_witness_leg(
     weights: &Path,
     device: &Device,
 ) -> LegOutcome {
-    let batch = REPORTER_BATCH;
+    let batch = REFERENCE_BATCH;
     let seq = config.max_position_embeddings;
     let (model, _varmap) = build_model(
         config,
@@ -775,47 +622,28 @@ fn oom_capability_witness_leg(
     }
 }
 
-/// Distinct sequence lengths cycled round-robin, one per step — the
-/// concrete, checkable form of the REAL bench path's "duplicated identical
-/// batches plateau; DISTINCT batch shapes keep growing" finding (campaign
-/// #443 W2c contract, D3; `esc-076 MECHANISM PINNED` ledger row: "4-step
-/// DUPLICATED-batch f16 peaks 63.1GB — identical ramp => shape-variability
-/// exonerated within few steps, but full-run growth tracks count of
-/// DISTINCT batch shapes"). All five are `<= REPORTER_SEQ` (never exceed
-/// the already-proven-representative reporter shape) and span a REAL
-/// range a variable-length-batch trainer would actually produce, never a
-/// single repeated value (which would degenerate to the fixed-shape leg
-/// this file already carries).
-/// AMENDED (this branch's first pod run): the initial 5-value,
-/// `<=REPORTER_SEQ` set produced a flat, non-reproducing trace (0.0 MiB
-/// drop, identical to the fixed-shape control) — an honest negative
-/// result at that scale, not a silently-adjusted one (see this file's
-/// module doc, D3 ATTRIBUTION, for the full disclosure). Widened to 11
-/// values spanning up to `max_position_embeddings`'s own practical
-/// mid-range (`512` — the escape's OWN second failing config, `b8*s512`,
-/// per `esc-076`'s `observable` field) so the leg sweeps genuinely NOVEL
-/// allocation sizes across a wider range, closer to what a real
-/// variable-length-sentence dataset would produce (natural sentence
-/// lengths rarely repeat exactly), rather than 5 small values a
-/// non-caching allocator's driver-level arena might already have slack
-/// for.
+/// Distinct sequence lengths cycled round-robin, one per step: the
+/// checkable form of "repeated batch shapes plateau; distinct batch shapes
+/// keep growing" (module doc, "Where eager training memory goes"). The
+/// range runs up to `512` (the second failing configuration, `b8*s512`) so
+/// the leg sweeps genuinely new allocation sizes, as a variable-length
+/// sentence dataset does; five lengths all `<= REFERENCE_SEQ` leave the
+/// trace flat, indistinguishable from the fixed-shape control.
 const VARIABLE_SHAPE_SEQS: [usize; 11] = [64, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512];
 
 /// Steps for the variable-shape leg: 3 full cycles through
 /// [`VARIABLE_SHAPE_SEQS`] (`11 * 3 = 33`) — enough for a genuine trend
 /// (vs a single cycle, which cannot distinguish "one-time cost per NEW
-/// shape, then plateau" from "unbounded per-cycle growth") while staying
-/// inside a pod session's practical wall-clock budget (this crate's own
-/// `STEPS_PER_LEG=40` fixed-shape leg is the existing budget precedent;
-/// the WIDER shape range above, up to 4x `REPORTER_SEQ`'s own token
-/// count, already costs proportionally more per step than the original
-/// 5-value/20-step design did, so the step count is not raised further).
+/// shape, then plateau" from "unbounded per-cycle growth") within a
+/// practical wall-clock budget (shapes up to 4x `REFERENCE_SEQ`'s token
+/// count cost proportionally more per step than the fixed-shape leg's
+/// `STEPS_PER_LEG=40`).
 const VARIABLE_SHAPE_STEPS: usize = 33;
 
 /// The fixed-shape twin of an un-bucketed variable-shape leg at the SAME
 /// [`VARIABLE_SHAPE_STEPS`] step count (never [`STEPS_PER_LEG`] — a
 /// different step count would make the two traces' `total_drop`
-/// incomparable) — every step uses the IDENTICAL `REPORTER_SEQ`, so this
+/// incomparable) — every step uses the IDENTICAL `REFERENCE_SEQ`, so this
 /// isolates "many steps at ONE shape" from "many steps across several
 /// shapes", the ONE independent variable an un-bucketed variable-shape leg
 /// changes.
@@ -828,12 +656,12 @@ fn run_leg_fixed_shape_same_step_count(
     let (model, varmap) = build_model(config, weights, dtype, device, /* with_lora */ true);
     let trainable_vars = varmap.all_vars();
     let mut optimizer = candle_nn::AdamW::new_lr(trainable_vars, 1e-4)
-        .unwrap_or_else(|e| panic!("esc076: AdamW::new_lr failed: {e}"));
+        .unwrap_or_else(|e| panic!("AdamW::new_lr failed: {e}"));
 
-    let anchor = synthetic_ids(REPORTER_BATCH, REPORTER_SEQ, config.vocab_size, 1, device);
-    let positive = synthetic_ids(REPORTER_BATCH, REPORTER_SEQ, config.vocab_size, 2, device);
-    let negative = synthetic_ids(REPORTER_BATCH, REPORTER_SEQ, config.vocab_size, 3, device);
-    let mask = Tensor::ones((REPORTER_BATCH, REPORTER_SEQ), DType::U32, device).unwrap();
+    let anchor = synthetic_ids(REFERENCE_BATCH, REFERENCE_SEQ, config.vocab_size, 1, device);
+    let positive = synthetic_ids(REFERENCE_BATCH, REFERENCE_SEQ, config.vocab_size, 2, device);
+    let negative = synthetic_ids(REFERENCE_BATCH, REFERENCE_SEQ, config.vocab_size, 3, device);
+    let mask = Tensor::ones((REFERENCE_BATCH, REFERENCE_SEQ), DType::U32, device).unwrap();
 
     let mut losses = Vec::with_capacity(VARIABLE_SHAPE_STEPS);
     let mut free_mib_after_step = Vec::with_capacity(VARIABLE_SHAPE_STEPS);
@@ -883,29 +711,20 @@ fn run_leg_fixed_shape_same_step_count(
 }
 
 /// The cap [`jammi_numerics::bucket_seq_len`] rounds each step's raw
-/// length up against — set to [`REPORTER_SEQ`] (`128`), matching the REAL
-/// `jammi-ai` trainer's own `effective_max` at the reporter shape (the
-/// SAME config the coordinator's own landing claim cites: "the
-/// reporter-shape f16 leg now completes on the pod (44.3GB flat)").
+/// length up against — [`REFERENCE_SEQ`] (`128`), the `jammi-ai`
+/// trainer's `effective_max` at the reference shape, where the f16 run
+/// completes at a flat 44.3 GB.
 ///
-/// **POD FINDING (this branch's own landing run, disclosed honestly): a
-/// cap of `512` (matching [`VARIABLE_SHAPE_SEQS`]'s own raw maximum, this
-/// constant's FIRST value) does NOT green this leg** — bucketing to
-/// `{64, 128, 256, 512}` still visits `256`/`512`, and EACH of those
-/// individually costs tens of GB at this harness's shape (28-layer
-/// ModernBERT-large, 3-forward eager LoRA backward) — the leg OOM'd after
-/// 3 steps, identically to the un-bucketed RED leg. This is a REAL,
-/// important distinction bucketing does NOT erase: bucketing bounds the
-/// COUNT of distinct shapes within an ALREADY-reasonable `max_seq_length`
-/// ceiling; it does not lower that ceiling. A trainer configured with
-/// `max_seq_length = 512` and genuinely-512-token batches pays that cost
-/// regardless of bucketing — the lever for THAT is the `max_seq_length`
-/// config value itself, a data/config decision, not this mechanism. The
-/// coordinator's own "reporter-shape f16 leg... completes" claim is
-/// specifically about `max_seq_length = 128` (`REPORTER_SEQ`), so THAT is
-/// the cap this leg proves against — matching, not overreaching, the
-/// fix's real proven domain.
-const VARIABLE_SHAPE_BUCKET_CAP: usize = REPORTER_SEQ;
+/// **A cap of `512` ([`VARIABLE_SHAPE_SEQS`]'s raw maximum) does not pass
+/// this leg**: bucketing to `{64, 128, 256, 512}` still visits `256`/`512`,
+/// each of which costs tens of GB at this harness's shape (28-layer
+/// ModernBERT-large, 3-forward eager LoRA backward), and the leg runs out
+/// of memory after 3 steps. Bucketing bounds the COUNT of distinct shapes
+/// under a reasonable `max_seq_length` ceiling; it does not lower that
+/// ceiling. A trainer configured with `max_seq_length = 512` and
+/// genuinely 512-token batches pays that cost regardless; the lever for
+/// that is the `max_seq_length` config value itself.
+const VARIABLE_SHAPE_BUCKET_CAP: usize = REFERENCE_SEQ;
 
 /// The bucketed twin of an un-bucketed variable-shape leg: the IDENTICAL raw
 /// `VARIABLE_SHAPE_SEQS` cycle, but each step's raw length is FIRST
@@ -922,12 +741,11 @@ const VARIABLE_SHAPE_BUCKET_CAP: usize = REPORTER_SEQ;
 /// rather than IMPORTED, since `jammi-encoders` must not depend on
 /// `jammi-ai` (the wrong dependency direction for this workspace — only
 /// the candle-free bucket DECISION is shared, via `jammi-numerics`, never
-/// the row-mutation helper). This is the GREEN leg proving the fix AT ITS
-/// OWN PROVEN DOMAIN: truncate-then-bucket at `REPORTER_SEQ` collapses
-/// `VARIABLE_SHAPE_SEQS`'s 11 raw values (many `> REPORTER_SEQ`) down to
+/// the row-mutation helper). Truncate-then-bucket at `REFERENCE_SEQ` collapses
+/// `VARIABLE_SHAPE_SEQS`'s 11 raw values (many `> REFERENCE_SEQ`) down to
 /// just `{64, 128}` (2 distinct shapes, both already known-safe from the
-/// fixed-shape control) — completing without the un-bucketed
-/// an un-bucketed variable-shape leg's pre-fix OOM.
+/// fixed-shape control), and the leg completes where the unbucketed cycle
+/// runs out of memory.
 fn run_leg_variable_shape_bucketed(
     dtype: DType,
     config: &ModernBertConfig,
@@ -942,7 +760,7 @@ fn run_leg_variable_shape_bucketed(
          identical assertion)"
     );
     let mut optimizer = candle_nn::AdamW::new_lr(trainable_vars, 1e-4)
-        .unwrap_or_else(|e| panic!("esc076: AdamW::new_lr failed: {e}"));
+        .unwrap_or_else(|e| panic!("AdamW::new_lr failed: {e}"));
 
     // A row's ids/mask at the BUCKETED width: the first `raw_len` columns
     // are real synthetic content (mirroring `synthetic_ids`'s own hash),
@@ -950,9 +768,9 @@ fn run_leg_variable_shape_bucketed(
     // mask `0` — exactly `pad_rows_to_bucket`'s own contract, restated for
     // a flat `(batch, bucketed_len)` tensor build.
     let build_bucketed = |raw_len: usize, bucketed_len: usize, salt: u32| -> (Tensor, Tensor) {
-        let mut ids: Vec<u32> = Vec::with_capacity(REPORTER_BATCH * bucketed_len);
-        let mut mask: Vec<u32> = Vec::with_capacity(REPORTER_BATCH * bucketed_len);
-        for row in 0..REPORTER_BATCH {
+        let mut ids: Vec<u32> = Vec::with_capacity(REFERENCE_BATCH * bucketed_len);
+        let mut mask: Vec<u32> = Vec::with_capacity(REFERENCE_BATCH * bucketed_len);
+        for row in 0..REFERENCE_BATCH {
             for col in 0..bucketed_len {
                 if col < raw_len {
                     let flat = (row * raw_len + col) as u32;
@@ -967,8 +785,8 @@ fn run_leg_variable_shape_bucketed(
             }
         }
         (
-            Tensor::from_vec(ids, (REPORTER_BATCH, bucketed_len), device).unwrap(),
-            Tensor::from_vec(mask, (REPORTER_BATCH, bucketed_len), device).unwrap(),
+            Tensor::from_vec(ids, (REFERENCE_BATCH, bucketed_len), device).unwrap(),
+            Tensor::from_vec(mask, (REFERENCE_BATCH, bucketed_len), device).unwrap(),
         )
     };
 
@@ -982,7 +800,7 @@ fn run_leg_variable_shape_bucketed(
         // `bucket_seq_len` domain violation the caller silently walks into,
         // it is the SAME "already truncated to max_seq_length" precondition
         // that function's own doc states.
-        let raw_len = VARIABLE_SHAPE_SEQS[step % VARIABLE_SHAPE_SEQS.len()].min(REPORTER_SEQ);
+        let raw_len = VARIABLE_SHAPE_SEQS[step % VARIABLE_SHAPE_SEQS.len()].min(REFERENCE_SEQ);
         let bucketed_len = jammi_numerics::bucket_seq_len(raw_len, VARIABLE_SHAPE_BUCKET_CAP);
         let (anchor_ids, anchor_mask) = build_bucketed(raw_len, bucketed_len, 1);
         let (positive_ids, _positive_mask) = build_bucketed(raw_len, bucketed_len, 2);
@@ -990,10 +808,9 @@ fn run_leg_variable_shape_bucketed(
         // All three rows share the SAME mask (identical raw_len/bucketed_len
         // per step, mirroring an un-bucketed variable-shape leg's own single shared
         // `mask` per step) — `_positive_mask`/`_negative_mask` are built
-        // (not skipped) so a future divergence in per-row padding would
-        // still construct a real tensor to compare against, even though
-        // this leg's own uniform-length-per-step design makes them
-        // identical to `anchor_mask` today.
+        // anyway so a divergence in per-row padding would still construct
+        // a real tensor to compare against; this leg's uniform length per
+        // step makes them identical to `anchor_mask`.
         let mask = anchor_mask;
 
         let forward = |ids: &Tensor| -> Result<Tensor, jammi_encoders::EncoderError> {
@@ -1073,71 +890,31 @@ fn total_drop_mib(outcome: &LegOutcome) -> Option<f64> {
     Some(trace[0] - trace[trace.len() - 1])
 }
 
-/// esc-076 D3(a)'s ORIGINAL honest RED at the library seam — PRE-FIX
-/// reproduction, kept `#[ignore]`d now that the fix has landed
-/// (`crates/jammi-ai/src/fine_tune/batch_bucket.rs`, wired at
-/// `TrainingLoop::encode_texts`, campaign #443 follow-up). Runs BF16 (the
-/// escape's own comparable-eager arm's calibrated-good dtype — see
-/// `esc076_fully_eager_bf16_vs_f16_at_reporter_shape`'s `print_diagnosis`)
-/// fully-eager at [`VARIABLE_SHAPE_SEQS`] cycled round-robin, WITHOUT any
-/// bucketing (the pathological, pre-fix shape of a real variable-length
-/// trainer loop), and its fixed-shape twin at the IDENTICAL step count,
-/// then asserts the two total-memory-drop traces are COMPARABLE — a
-/// variable-shape leg that drops SUBSTANTIALLY more free memory than its
-/// own fixed-shape control over the SAME number of steps is measured,
-/// non-vacuous evidence of exactly the "distinct shapes keep growing"
-/// mechanism the ledger's MECHANISM PINNED finding names.
-///
-/// **`#[ignore]`d by default so the branch's GPU suite is green** — this
-/// test's OWN job now is being esc-076's RED oracle for `fix-verifier`
-/// (revert the bucketing fix, this test must fail the SAME way it did
-/// before the fix landed; confirm it, then re-apply the fix) — run it
-/// explicitly with `cargo test -- --ignored
-/// esc076_variable_shape_unbucketed_reproduces_the_pre_fix_oom`. It is
-/// EXPECTED TO fail (OOM) whenever it runs, by design: this is the
-/// UNBUCKETED path, which the fix's own point is to make unreachable from
-/// `jammi-ai`'s real trainer (see
-/// [`esc076_variable_shape_bucketed_completes_with_bounded_memory`] below
-/// for the GREEN, post-fix leg proving the SAME shape cycle completes once
-/// bucketed). A relative (never absolute) bound: `k = 3.0` applied to the
-/// fixed-shape leg's OWN drop (comparable_eager oracle design rule — a
-/// bound relative to the SAME run's own baseline, never a constant pulled
-/// from a different session).
 #[test]
 #[ignore = "esc-076 pre-fix RED reproduction (unbucketed eager growth) -- \
             run explicitly by fix-verifier with --ignored, not part of the \
             default green suite; see this fn's own doc"]
-/// esc-076 D3 FIX VERIFICATION (GREEN, runs by default): the SAME
-/// [`VARIABLE_SHAPE_SEQS`] cycle the pre-fix RED leg
-/// ([`esc076_variable_shape_unbucketed_reproduces_the_pre_fix_oom`], above,
-/// `#[ignore]`d) OOMs on, except each step's raw length is FIRST truncated
-/// to [`VARIABLE_SHAPE_BUCKET_CAP`] (`REPORTER_SEQ` — mirroring the real
-/// trainer's own tokenizer truncation, `Some(effective_max)`) and THEN
-/// rounded up through `jammi_numerics::bucket_seq_len` — the SAME
-/// candle-free decision `jammi-ai`'s own trainer now calls at its
-/// batch-construction seam (`crates/jammi-ai/src/fine_tune/trainer.rs`,
-/// via `crates/jammi-ai/src/fine_tune/batch_bucket.rs`). Collapses
-/// `VARIABLE_SHAPE_SEQS`'s 11 raw values (most `> REPORTER_SEQ`) down to
-/// just `{64, 128}` (2 distinct shapes, [`VARIABLE_SHAPE_BUCKET_CAP`]'s own
-/// doc) — this proves the fix AT its own claimed domain (the reporter
-/// shape, `max_seq_length = REPORTER_SEQ`), at the `jammi-encoders`
-/// library seam directly (never through `jammi-ai`, which this crate must
-/// not depend on) rather than only inferred from `jammi-ai`'s own unit
-/// tests. See [`VARIABLE_SHAPE_BUCKET_CAP`]'s own doc for the POD FINDING
-/// that a cap matching the RAW range's own maximum (`512`) does NOT green
-/// this leg — bucketing bounds shape COUNT, not shape AMPLITUDE, and this
-/// leg is deliberately scoped to the domain where the fix's own landing
-/// claim was measured.
+/// The [`VARIABLE_SHAPE_SEQS`] cycle that runs out of memory unbucketed,
+/// with each step's raw length first truncated to
+/// [`VARIABLE_SHAPE_BUCKET_CAP`] (`REFERENCE_SEQ`, as the trainer's
+/// tokenizer truncates with `Some(effective_max)`) and then rounded up
+/// through `jammi_numerics::bucket_seq_len`, the same candle-free decision
+/// `jammi-ai`'s trainer calls at batch construction
+/// (`fine_tune::batch_bucket`). The 11 raw lengths (most
+/// `> REFERENCE_SEQ`) collapse to `{64, 128}`. This proves the bound at the
+/// `jammi-encoders` library seam directly, at `max_seq_length =
+/// REFERENCE_SEQ`; bucketing bounds shape COUNT, not shape AMPLITUDE (see
+/// [`VARIABLE_SHAPE_BUCKET_CAP`]).
 ///
 /// Asserts BOTH: (a) every one of `VARIABLE_SHAPE_STEPS` steps completes
-/// with a finite loss (never merely "did not panic" — KO-2/family F), and
-/// (b) the bucketed leg's own total free-memory drop stays within the SAME
-/// `3x`-of-its-fixed-shape-control bound the pre-fix RED leg uses to prove
-/// the OPPOSITE outcome — bucketing should genuinely BOUND this leg's
-/// memory behavior, not merely happen not to OOM at this run's particular
-/// step count.
+/// with a finite loss (never merely "did not panic"), and (b) the bucketed
+/// leg's total free-memory drop stays within `3x` its fixed-shape control's
+/// drop over the same step count -- a bound relative to the same run's own
+/// baseline, never a constant from a different session -- so bucketing
+/// genuinely BOUNDS memory rather than merely not running out at this step
+/// count.
 #[test]
-fn esc076_variable_shape_bucketed_completes_with_bounded_memory() {
+fn variable_shape_bucketed_steps_complete_with_bounded_memory() {
     std::env::set_var("JAMMI_KERNELS_DISABLE", "all");
 
     let device = cuda_device();
@@ -1161,7 +938,7 @@ fn esc076_variable_shape_bucketed_completes_with_bounded_memory() {
         });
 
     println!(
-        "[esc-076 D3 FIX] bucketed variable-shape bf16 ({VARIABLE_SHAPE_STEPS} steps, raw \
+        "[bucketed variable-shape] bucketed variable-shape bf16 ({VARIABLE_SHAPE_STEPS} steps, raw \
          seqs={VARIABLE_SHAPE_SEQS:?}, bucket cap={VARIABLE_SHAPE_BUCKET_CAP}): {}",
         match &bucketed_outcome {
             LegOutcome::Completed {
@@ -1191,17 +968,16 @@ fn esc076_variable_shape_bucketed_completes_with_bounded_memory() {
             for (step, loss) in losses.iter().enumerate() {
                 assert!(
                     loss.is_finite(),
-                    "[esc-076 D3 FIX] step {step} completed but loss is non-finite ({loss}) -- a \
+                    "[bucketed variable-shape] step {step} completed but loss is non-finite ({loss}) -- a \
                      completing bucketed leg must produce a genuinely finite result at EVERY \
                      step, never a silently-propagated NaN/inf read as success"
                 );
             }
         }
         other => panic!(
-            "[esc-076 D3 FIX] the bucketed variable-shape leg must COMPLETE now that jammi-ai's \
-             sequence-length bucketing fix has landed -- got {other:?} instead. Either the fix \
-             regressed, or this leg's own shape/step budget needs re-measuring against the fix's \
-             own bucket ladder."
+            "[bucketed variable-shape] the bucketed variable-shape leg must COMPLETE -- got \
+             {other:?} instead. Either sequence-length bucketing no longer bounds memory, or this \
+             leg's shape/step budget needs re-measuring against the bucket ladder."
         ),
     }
 
@@ -1210,20 +986,19 @@ fn esc076_variable_shape_bucketed_completes_with_bounded_memory() {
     let fixed_drop = total_drop_mib(&fixed_outcome)
         .expect("the fixed-shape reference leg records free memory after every step");
     println!(
-        "[esc-076 D3 FIX] total_drop_mib: bucketed-variable={bucketed_drop:.1} \
+        "[bucketed variable-shape] total_drop_mib: bucketed-variable={bucketed_drop:.1} \
          fixed-shape={fixed_drop:.1} ratio={:.2}",
         bucketed_drop / fixed_drop.max(1.0)
     );
     const GROWTH_RATIO_BOUND: f64 = 3.0;
     assert!(
         bucketed_drop <= GROWTH_RATIO_BOUND * fixed_drop.max(1.0),
-        "[esc-076 D3 FIX] bucketed variable-shape eager composition dropped {bucketed_drop:.1} \
+        "[bucketed variable-shape] bucketed variable-shape eager composition dropped {bucketed_drop:.1} \
          MiB of free memory over {VARIABLE_SHAPE_STEPS} steps vs {fixed_drop:.1} MiB for its \
-         fixed-shape control -- a {:.2}x ratio, past the SAME {GROWTH_RATIO_BOUND}x bound the \
-         pre-fix RED leg (above, #[ignore]d) uses to prove the OPPOSITE outcome -- bucketing \
-         should collapse this leg's own distinct-shape count down to {{64,128}} (2 buckets \
-         total, matching the ledger's own duplicated-shape-plateaus finding), not merely \
-         shrink the un-bucketed growth without genuinely bounding it.",
+         fixed-shape control -- a {:.2}x ratio, past the {GROWTH_RATIO_BOUND}x bound -- \
+         bucketing should collapse this leg's distinct-shape count to {{64,128}} (2 buckets, \
+         where repeated shapes plateau), not merely shrink the unbucketed growth without \
+         bounding it.",
         bucketed_drop / fixed_drop.max(1.0)
     );
 }
@@ -1256,17 +1031,13 @@ fn assert_ran_eager<T>(label: &str, f: impl FnOnce() -> T) -> T {
 }
 
 #[test]
-fn esc076_fully_eager_bf16_vs_f16_at_reporter_shape() {
-    // SAFETY-of-test: this file is Cargo-autodiscovered as its OWN test
-    // binary/process (no `tests/it/`-style shared harness), and this is
-    // the FIRST statement that could touch `jammi_kernels::admission`'s
-    // process-wide `OnceLock` -- see this file's own module doc, control
-    // 1. CORRECTED (campaign #446, finding 9): this comment used to also
-    // claim there was "no other `#[test]` in this file". There are THREE,
-    // and they set the identical `"all"` value, which is what actually
-    // makes the `OnceLock` safe here. Mutual exclusion for the
-    // DEVICE-GLOBAL memory oracles is a separate concern, handled
-    // structurally by `SerialGpu` rather than by this comment.
+fn fully_eager_bf16_vs_f16_at_reference_shape() {
+    // This file is its own test binary, and this is the FIRST statement
+    // that could touch `jammi_kernels::admission`'s process-wide
+    // `OnceLock` (module doc, control 1). Every test here sets the
+    // identical `"all"` value, which is what makes the `OnceLock` safe;
+    // mutual exclusion for the DEVICE-GLOBAL memory oracles is
+    // `SerialGpu`'s job.
     std::env::set_var("JAMMI_KERNELS_DISABLE", "all");
 
     let device = cuda_device();
@@ -1285,12 +1056,12 @@ fn esc076_fully_eager_bf16_vs_f16_at_reporter_shape() {
     match &witness {
         LegOutcome::CudaOutOfMemory { message, .. } => {
             println!(
-                "[esc-076] OOM capability witness: CONFIRMED (harness can detect a real CUDA \
+                "[eager-memory] OOM capability witness: CONFIRMED (harness can detect a real CUDA \
                  OOM) -- {message}"
             );
         }
         other => panic!(
-            "oom_capability_witness_leg (batch={REPORTER_BATCH}, seq=max_position_embeddings) \
+            "oom_capability_witness_leg (batch={REFERENCE_BATCH}, seq=max_position_embeddings) \
              did not classify as CUDA OOM on this device -- got {other:?} instead. Either this \
              device has more VRAM than the witness's deliberately-oversized shape needs (raise \
              the witness further), or this harness's OOM-string-match classification is broken \
@@ -1299,10 +1070,10 @@ fn esc076_fully_eager_bf16_vs_f16_at_reporter_shape() {
         ),
     }
 
-    let bf16_outcome = assert_ran_eager("bf16_reporter_shape", || {
+    let bf16_outcome = assert_ran_eager("bf16_reference_shape", || {
         run_leg(DType::BF16, &config, &weights_path, device.device())
     });
-    let f16_outcome = assert_ran_eager("f16_reporter_shape", || {
+    let f16_outcome = assert_ran_eager("f16_reference_shape", || {
         run_leg(DType::F16, &config, &weights_path, device.device())
     });
 
@@ -1332,7 +1103,7 @@ fn esc076_fully_eager_bf16_vs_f16_at_reporter_shape() {
             LegOutcome::OtherError { message } => {
                 panic!(
                     "[{label}] unexpected error class (neither a clean completion nor a \
-                     classified CUDA OOM) -- this is a harness defect, not an esc-076 finding: \
+                     classified CUDA OOM) -- this is a harness defect, not a memory finding: \
                      {message}"
                 );
             }
@@ -1345,8 +1116,7 @@ fn esc076_fully_eager_bf16_vs_f16_at_reporter_shape() {
 /// Free-MiB trace summary -- first/last few points plus the delta, rather
 /// than a raw `{:?}` dump of a `STEPS_PER_LEG`-long vector. A MONOTONE
 /// downward trend across steps (rather than a drop-then-plateau) is the
-/// concrete, checkable form of `esc-076`'s own "nonmonotone-memory" title:
-/// a plateau after step 1 is ordinary steady-state retention; a trend that
+/// checkable form of memory growth: a plateau after step 1 is ordinary steady-state retention; a trend that
 /// keeps falling step after step is a leak.
 fn summarize_free_mib_trace(trace: &[f64]) -> String {
     if trace.len() < 2 {
@@ -1373,10 +1143,9 @@ fn summarize_free_mib_trace(trace: &[f64]) -> String {
     )
 }
 
-/// States which of esc-076's two pre-registered root-cause branches this
-/// run's evidence supports. Printed (`--nocapture`), not asserted as a
-/// pass/fail condition -- campaign #443's Part 3 item 4 fold-the-fix note:
-/// this wave delivers the DIAGNOSIS and the control test, not the fix.
+/// States which of the two root-cause branches (eager composition vs
+/// f16-specific) this run's evidence supports. Printed (`--nocapture`), not
+/// asserted: the verdict is a diagnosis, not a pass/fail condition.
 fn print_diagnosis(bf16: &LegOutcome, f16: &LegOutcome) {
     let oom = |o: &LegOutcome| matches!(o, LegOutcome::CudaOutOfMemory { .. });
     for (label, outcome) in [("bf16", bf16), ("f16", f16)] {
@@ -1386,13 +1155,13 @@ fn print_diagnosis(bf16: &LegOutcome, f16: &LegOutcome) {
                 free_mib_after_step,
             } => {
                 println!(
-                    "[esc-076] {label} (fully-eager, reporter shape): Completed, \
+                    "[eager-memory] {label} (fully-eager, reference shape): Completed, \
                      {} steps, final loss={:.6}",
                     losses.len(),
                     losses.last().copied().unwrap_or(f32::NAN)
                 );
                 println!(
-                    "[esc-076] {label} free-memory trace: {}",
+                    "[eager-memory] {label} free-memory trace: {}",
                     summarize_free_mib_trace(free_mib_after_step)
                 );
             }
@@ -1402,41 +1171,41 @@ fn print_diagnosis(bf16: &LegOutcome, f16: &LegOutcome) {
                 message,
             } => {
                 println!(
-                    "[esc-076] {label} (fully-eager, reporter shape): CudaOutOfMemory after \
+                    "[eager-memory] {label} (fully-eager, reference shape): CudaOutOfMemory after \
                      {steps_completed} steps -- {message}"
                 );
                 println!(
-                    "[esc-076] {label} free-memory trace (up to the OOM'ing step): {}",
+                    "[eager-memory] {label} free-memory trace (up to the OOM'ing step): {}",
                     summarize_free_mib_trace(free_mib_after_step)
                 );
             }
             LegOutcome::OtherError { message } => {
-                println!("[esc-076] {label}: OtherError -- {message}");
+                println!("[eager-memory] {label}: OtherError -- {message}");
             }
         }
     }
     match (oom(bf16), oom(f16)) {
         (true, true) => println!(
-            "[esc-076] VERDICT: fully-eager BF16 ALSO OOMs at the reporter shape -- the defect \
+            "[eager-memory] VERDICT: fully-eager BF16 ALSO OOMs at the reference shape -- the defect \
              is EAGER-COMPOSITION MEMORY (dtype-independent), not f16-specific. The retained \
              three-forward-pass tape (anchor/positive/negative) under a fully-eager composition \
              is the more likely culprit than any f16-only allocation path."
         ),
         (false, true) => println!(
-            "[esc-076] VERDICT: fully-eager BF16 completes but fully-eager F16 OOMs at the \
-             IDENTICAL shape -- the defect is F16-SPECIFIC. Candidate mechanisms to check next \
-             (W2b/W2c): candle f16 op fallbacks upcasting internally (extra retained f32 \
+            "[eager-memory] VERDICT: fully-eager BF16 completes but fully-eager F16 OOMs at the \
+             IDENTICAL shape -- the defect is F16-SPECIFIC. Candidate mechanisms to check next: \
+             candle f16 op fallbacks upcasting internally (extra retained f32 \
              copies), F16-specific autograd retention, or F16 CPU<->GPU transfer/alloc overhead \
              this composition does not pay for BF16."
         ),
         (true, false) => println!(
-            "[esc-076] UNEXPECTED: fully-eager BF16 OOMs but fully-eager F16 completes at the \
-             identical shape -- the reverse of the escape's own observable. Re-verify the \
-             fixture/config against the escape's exact reproduction before trusting this run."
+            "[eager-memory] UNEXPECTED: fully-eager BF16 OOMs but fully-eager F16 completes at the \
+             identical shape -- the reverse of the reference failure. Re-verify the \
+             fixture/config against the reference shape before trusting this run."
         ),
         (false, false) => println!(
-            "[esc-076] INCONCLUSIVE on OOM alone at this device/step-count: neither fully-eager \
-             leg OOM'd at the reporter shape over {STEPS_PER_LEG} steps (both completed) -- \
+            "[eager-memory] INCONCLUSIVE on OOM alone at this device/step-count: neither fully-eager \
+             leg OOM'd at the reference shape over {STEPS_PER_LEG} steps (both completed) -- \
              READ THE free-memory trace lines above before concluding the defect no longer \
              reproduces. An 'ACCELERATING drop' or unbroken 'LINEAR drop' trend on the f16 leg \
              (and not on bf16, at a comparable magnitude) is still evidence of the SAME \

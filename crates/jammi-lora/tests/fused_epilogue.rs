@@ -22,7 +22,7 @@
 //!    predicate's real dtype domain (`F32`/`BF16`/`F16` all fuse when `x`
 //!    and the base weight MATCH; a mismatched pair falls back regardless
 //!    of either individual dtype's own support).
-//! 4. `esc_031_golden_holds_through_the_fused_path_with_dispatch_proof` —
+//! 4. `zero_b_golden_holds_through_the_fused_path_with_dispatch_proof` —
 //!    the zero-B golden (`Lora(W) == Frozen(W)` at `lora_b == 0`),
 //!    re-run here with an explicit assertion that the FUSED kernel (not a
 //!    fallback) is what produced the agreement, so the golden is not
@@ -430,7 +430,7 @@ fn training_mode_on_an_f16_backbone_dispatches_fused_and_is_counted() {
 /// predicate regression that always falls back could not hide behind this
 /// test still being green.
 #[test]
-fn esc_031_golden_holds_through_the_fused_path_with_dispatch_proof() {
+fn zero_b_golden_holds_through_the_fused_path_with_dispatch_proof() {
     let _guard = DISPATCH_COUNTER_PAIR_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -1411,13 +1411,13 @@ fn rslora_irrational_scaling_agrees_between_fused_and_eager_arms_at_f32() {
 }
 
 /// The quantized twin of the zero-B golden: `Lora(Wq) == Frozen(Wq)`
-/// at `lora_b == 0`, mirroring `esc_031_golden_holds_through_the_fused_path_
+/// at `lora_b == 0`, mirroring `zero_b_golden_holds_through_the_fused_path_
 /// with_dispatch_proof`'s Dense golden above. A `Quantized` base NEVER
 /// touches `lora_linear_fused_counters()` (the fused kernel's domain requires
 /// a dense weight `Tensor`); that claim is pinned by `lora_linear.rs`'s lib
 /// unit test `quantized_base_forward_never_touches_the_fused_dispatch_counters`,
 /// not here — see the comment inside `lora_wq_equals_frozen_wq_at_lora_b_zero`.
-mod esc_031_quantized_twin {
+mod quantized_zero_b_golden {
     use std::sync::Arc;
 
     use candle_core::quantized::{GgmlDType, QTensor};

@@ -85,7 +85,7 @@
 //! training a grad-less parameter — a safe failure mode, not a
 //! silent-wrong one.
 //!
-//! ## Domain (family D)
+//! ## Domain
 //!
 //! `x` and `gamma` must be fully contiguous (`contiguous_offsets()`,
 //! honoring a nonzero `start_offset` from a narrowed-but-contiguous view —
@@ -112,8 +112,8 @@
 //! (`docs/maintainer/cuda-kernel-guide.md`'s per-op f16 reference-regime
 //! table names this op's regime as f32-internal, round-once, matching
 //! `jammi_encoders::layer_norm::LayerNorm::slow`'s F16 upcast —
-//! `DType::F16 | DType::BF16 => DType::F32`, `jammi-encoders/src/layer_norm.rs:754` —
-//! inside `fn slow`, `crates/jammi-encoders/src/layer_norm.rs:730`). The
+//! `DType::F16 | DType::BF16 => DType::F32` inside `fn slow` in
+//! `crates/jammi-encoders/src/layer_norm.rs`). The
 //! matching CUDA F16 dispatch arm (`crate::cuda::layer_norm`'s
 //! `(DType::F16, DType::F16)` arms) is backed by the SEPARATE
 //! `cuda/layer_norm_f16.cu` translation unit — see that file's module doc
@@ -572,7 +572,7 @@ pub struct LayerNormBiasedFused {
     /// applied to this op's own `gamma` slot.
     pub dgamma_needed: bool,
     /// The `beta` analog of `dgamma_needed`, gated the same way at the
-    /// call site (family D: bias is tensor state, gated identically to
+    /// call site (bias is tensor state, gated identically to
     /// gamma, never a model-family special case).
     pub dbeta_needed: bool,
 }
@@ -751,7 +751,7 @@ fn dbeta_from_grad(grad_res: &Tensor, beta_dtype: candle_core::DType) -> Result<
 }
 
 // -----------------------------------------------------------------------
-// CPU math. Fixed fold order throughout (family J): every reduction below
+// CPU math. Fixed fold order throughout: every reduction below
 // walks its row in plain ascending index order, so a given `(x, gamma)`
 // (or `(x, gamma, dy)`) pair always yields the same output bit-for-bit —
 // no parallel/unordered accumulation on this path.
@@ -772,7 +772,7 @@ fn mean_var_f32(row: &[f32], hidden: usize) -> (f32, f32) {
 }
 
 /// BF16 row mean/variance, accumulated in f32 — same two-pass, ascending-
-/// index fold order as [`mean_var_f32`] (family J: one fixed reduction
+/// index fold order as [`mean_var_f32`] (one fixed reduction
 /// order, not "whatever the loop happened to do"), so every bf16 call site
 /// below (`ln_fwd_row_bf16`, `ln_bwd_dx_row_bf16`, `ln_bwd_dgamma_bf16`)
 /// computes the identical numeric sequence the CUDA kernel's own
@@ -1098,7 +1098,7 @@ fn ln_bwd_dx_f16(
 
 /// `dgamma_i = sum_rows(dy_i * xhat_i)` — fixed fold order: rows walked
 /// `0..rows` in ascending order, accumulating into `dgamma[i]` each time
-/// (family J: the same input always folds in the same order).
+/// (the same input always folds in the same order).
 fn ln_bwd_dgamma_f32(x: &[f32], dy: &[f32], rows: usize, hidden: usize, eps: f32) -> Vec<f32> {
     let mut dgamma = vec![0f32; hidden];
     for r in 0..rows {
@@ -1526,8 +1526,8 @@ mod tests {
     // The `+`->`-` mutation instead computes `sqrt(var - eps) =
     // sqrt(-eps)`, which is NaN for any `eps > 0` in this degenerate-
     // variance regime — `bound/max|signal| = 0/0`: not "within
-    // tolerance", but a hard finite-vs-non-finite divergence (family F:
-    // every element of a `0.0 * NaN = NaN` product), the strongest
+    // tolerance", but a hard finite-vs-non-finite divergence
+    // (every element of a `0.0 * NaN = NaN` product), the strongest
     // possible measurement of an eps-sign flip. A non-degenerate `eps` (
     // 1e-2, far from f32's own ULP at this magnitude) rules out this
     // being a rounding-noise artifact.

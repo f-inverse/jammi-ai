@@ -34,15 +34,14 @@
 //!    reach candle's `apply_op1`/`apply_op3` ONLY through
 //!    `super::apply_stateful1`/`super::apply_stateful3`, never directly.
 //!
-//!    **Scoped by PROPERTY, not by filename** — `10b1f3b`'s audit found the
-//!    previous version hardcoded `flash_attention.rs` by name (advisory
-//!    finding: "discipline test keyed on filename"). A file is in scope iff
+//!    **Scoped by PROPERTY, not by filename** (a filename-keyed scope stops
+//!    enforcing the ban on a stateful op added under any other filename).
+//!    A file is in scope iff
 //!    it declares a struct field of type `Saved<...>` OR `Arc<...>` on a
 //!    non-comment line ([`declares_a_stateful_field`]) — `Saved<...>` is
 //!    the exact shape every `Saved`-bearing `StatefulKernelOp` in this
 //!    crate uses to hold its interior-mutable state (`ops::saved`'s module
-//!    doc); `Arc<...>` WIDENS the property (round-5, `ops::quant_matmul_grad`
-//!    landing) to the SAME hazard class for a struct that carries its
+//!    doc); `Arc<...>` extends the property to the SAME hazard class for a struct that carries its
 //!    interior-mutable/shareable state through an `Arc` it did not
 //!    construct itself, rather than an owned `Saved<T>` — `QuantMatMulGrad`
 //!    holds `Arc<candle_core::quantized::QTensor>`, and `QTensor` itself
@@ -52,32 +51,30 @@
 //!    carries state that is NOT plain, owned, `Copy`-able construction
 //!    data", and an `Arc<...>` field is exactly as much a structural signal
 //!    of that as a `Saved<...>` one, even though `QuantMatMulGrad` itself
-//!    declares no `Saved<T>` field. A future stateful op added under ANY
-//!    OTHER filename, using EITHER shape, is caught automatically; the
-//!    previous filename-keyed version would have silently stopped
-//!    enforcing the ban on it, and the previous `Saved<`-only property
-//!    would have silently let an `Arc`-only op like `QuantMatMulGrad`
-//!    reach `.apply_op1(`/`.apply_op3(` directly, bypassing
+//!    declares no `Saved<T>` field. A stateful op added under ANY filename,
+//!    using EITHER shape, is caught automatically; a `Saved<`-only property
+//!    would let an `Arc`-only op like `QuantMatMulGrad` reach
+//!    `.apply_op1(`/`.apply_op3(` directly, bypassing
 //!    `apply_stateful1`/`apply_stateful3`'s gate, unchecked.
 //! 3. No `Saved`-bearing struct may derive `Clone`/`Copy`, and no field may
-//!    be `Arc<Saved<...>>` in place of an owned `Saved<...>` — the shape
-//!    `10b1f3b`'s audit demonstrated compiles and ALIASES (`Arc<X>` is
+//!    be `Arc<Saved<...>>` in place of an owned `Saved<...>` — a shape that
+//!    compiles and ALIASES (`Arc<X>` is
 //!    `Clone` regardless of whether `X` itself is; wrapping the `Saved`
 //!    field in an extra `Arc` makes the OUTER op struct cheaply `Clone`-able
 //!    through `&self`, sidestepping the move-out-of-`&self` compile error
 //!    the crate's whole "cannot hoist a stateful op" argument rests on —
-//!    see `ops/mod.rs`'s `StatefulKernelOp` doc for the corrected claim).
+//!    see `ops/mod.rs`'s `StatefulKernelOp` doc).
 //!
 //! Comment lines (trimmed text starting `//`) are skipped in all three
 //! checks: several files discuss these names/types in PROSE without using
-//! them (e.g. `ops/softmax.rs`'s esc-037 disposition section:
+//! them (e.g. `ops/softmax.rs`'s module doc:
 //! `` (`apply_op1_no_bwd`) ``, no trailing paren — a bare mention;
 //! `jammi-encoders/src/attention.rs`'s own doc comment additionally quotes
 //! a REAL call-syntax example, `` xs.apply_op1_no_bwd(&SoftmaxLastDim) ``,
 //! WITH a trailing paren, of candle_nn's own pre-existing (non-jammi)
 //! softmax path — exactly the shape that would false-positive without
 //! comment-skipping; that file is outside this test's scanned tree
-//! (`jammi-kernels/src` only) today, but the skip is correctness
+//! (`jammi-kernels/src` only), but skipping comments is correct
 //! regardless of scope; `ops/mod.rs`'s own doc discusses `Saved<T>` in
 //! prose extensively and must NOT be swept into check 2/3's scope by that
 //! alone). No CUDA needed (pure source-text scan); runs in every default
@@ -119,9 +116,8 @@ fn is_comment_line(line: &str) -> bool {
 
 /// PROPERTY-based scope check (see module doc, point 2): a file is in scope
 /// for the bare-call ban iff it declares a struct FIELD of type `Saved<` OR
-/// `Arc<` somewhere on a non-comment line — WIDENED (round-5,
-/// `ops::quant_matmul_grad` landing) from the original `Saved<`-only
-/// property, per this file's own module doc's scope section: an
+/// `Arc<` somewhere on a non-comment line, per this file's own module doc's
+/// scope section: an
 /// `Arc<...>`-carried field is the same "not plain, owned, `Copy`-able
 /// construction data" hazard shape a `Saved<T>` field is, even when the op
 /// struct declares no `Saved<T>` field of its own (`QuantMatMulGrad` holds
@@ -298,7 +294,7 @@ fn the_forbidden_needle_match_is_not_vacuous() {
          module doc does exactly this and must stay out of scope"
     );
 
-    // --- Scope property widening (round-5, QuantMatMulGrad landing): an
+    // --- Scope property, `Arc` shape: an
     // Arc<...>-carried field (no Saved<T> field at all) must ALSO scope a
     // file in — this is what mechanically forces ops/quant_matmul_grad.rs
     // into the discipline apparatus despite holding Arc<QTensor>, not

@@ -304,18 +304,15 @@ fn fused_vs_formula_f32_fwd_and_bwd_match_within_stated_tolerance() {
     }
 }
 
-/// bf16: BEFORE the one-rounding fix, the formula composition rounded
-/// `xhat` to bf16 BEFORE multiplying by `gamma`
-/// (`normalized.to_dtype(x_dtype)?.broadcast_mul(&weight)`, the pre-fix
-/// `slow()`), while the fused kernel multiplied `xhat * gamma` in f32 and
-/// rounded ONCE at the very end — measured on this same fixture, that was
-/// a genuine, non-vacuous divergence. `formula()` above now runs the
-/// IDENTICAL one-rounding shape (`gamma` upcast to f32, multiplied,
-/// rounded once), so formula and fused are expected to — and on this
-/// fixture, measured to — agree BIT-EXACTLY. `bf16_bit_diff` is kept
-/// (rather than deleted along with the tolerance) because it is still
-/// what prints the measured max in the backward oracle below, and as the
-/// tool a future regression would use to re-derive a tolerance if a
+/// bf16: a formula composition that rounds `xhat` to bf16 BEFORE
+/// multiplying by `gamma` (`normalized.to_dtype(x_dtype)?.broadcast_mul(&weight)`)
+/// diverges, on this fixture, from the fused kernel, which multiplies
+/// `xhat * gamma` in f32 and rounds ONCE at the very end. `formula()` above
+/// runs the IDENTICAL one-rounding shape (`gamma` upcast to f32,
+/// multiplied, rounded once), so formula and fused are expected to — and
+/// on this fixture, measured to — agree BIT-EXACTLY. `bf16_bit_diff`
+/// prints the measured diffs in both oracles below, and is the tool a
+/// regression would use to re-derive a tolerance if a
 /// production-`hidden`-sized fixture ever exposed a reduction-order
 /// difference between candle's `sum_keepdim` and the fused kernel's
 /// ascending-index scalar fold (neither this small fixture nor the
@@ -325,11 +322,10 @@ fn bf16_bit_diff(a: bf16, b: bf16) -> i32 {
 }
 
 #[test]
-fn fused_vs_formula_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
+fn fused_vs_formula_bf16_fwd_is_bit_exact_with_one_rounding() {
     let device = Device::Cpu;
-    // The same fixture the pre-fix divergence oracle used (chosen to make
-    // the OLD two-rounding-path mismatch as visible as possible) — kept
-    // unchanged so the before/after comparison is apples to apples.
+    // A fixture chosen to make a two-rounding-path mismatch as visible as
+    // possible.
     let x0: [f32; 8] = [-18.5, -18.5, -18.5, -17.75, 3.375, -4.125, 9.0625, -2.5];
     let gamma0: [f32; 4] = [0.1, 1.703125, -2.015625, 2.234375];
     let eps = 1e-5;
@@ -359,11 +355,11 @@ fn fused_vs_formula_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
         .zip(formula_out.iter())
         .map(|(&f, &e)| bf16_bit_diff(f, e))
         .collect();
-    println!("fused_vs_formula_bf16_fwd: measured bit-diffs (post-fix) = {diffs:?}");
+    println!("fused_vs_formula_bf16_fwd: measured bit-diffs = {diffs:?}");
     assert_eq!(
         fused_out, formula_out,
-        "fwd must now be bit-exact (measured diffs: {diffs:?}) — the pre-fix double-rounding \
-         defect (see `LayerNorm::slow`'s doc) is gone"
+        "fwd must be bit-exact (measured diffs: {diffs:?}) — a double rounding (see \
+         `LayerNorm::slow`'s doc) diverges here"
     );
 }
 
@@ -379,18 +375,18 @@ fn fused_vs_formula_bf16_fwd_is_bit_exact_after_the_one_rounding_fix() {
 ///
 /// `dx` (the analytical Apex/ATen-canonical closed form `LayerNormBwdDx`
 /// computes) and the formula composition's `dx` (candle autograd
-/// differentiating through the composed ops) were already two DIFFERENT
-/// derivations of the same gradient before this fix — the forward
-/// one-rounding fix removes one source of divergence (the forward
-/// rounding-order mismatch feeding into both graphs' `xhat`), not
-/// necessarily every source (the two `dx` derivations remain distinct op
-/// sequences in principle). Measured on this fixture, post-fix, both `dx`
+/// differentiating through the composed ops) are two DIFFERENT
+/// derivations of the same gradient — the forward one-rounding shape
+/// removes one source of divergence (the forward rounding-order mismatch
+/// feeding into both graphs' `xhat`), not necessarily every source (the
+/// two `dx` derivations remain distinct op sequences in principle).
+/// Measured on this fixture, both `dx`
 /// and `dgamma` are bit-exact (`diffs` printed below are all `0`) — see
 /// the forward oracle's doc for why a small `hidden` (here 4) makes exact
 /// agreement plausible even though it is not a structural guarantee for
 /// an arbitrary shape.
 #[test]
-fn fused_vs_formula_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
+fn fused_vs_formula_bf16_bwd_is_bit_exact_with_one_rounding() {
     let device = Device::Cpu;
     let x0: [f32; 8] = [-18.5, -18.5, -18.5, -17.75, 3.375, -4.125, 9.0625, -2.5];
     let gamma0: [f32; 4] = [0.1, 1.703125, -2.015625, 2.234375];
@@ -447,10 +443,10 @@ fn fused_vs_formula_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
         .zip(dxe.iter())
         .map(|(&f, &e)| bf16_bit_diff(f, e))
         .collect();
-    println!("fused_vs_formula_bf16_bwd: measured dx bit-diffs (post-fix) = {dx_diffs:?}");
+    println!("fused_vs_formula_bf16_bwd: measured dx bit-diffs = {dx_diffs:?}");
     assert_eq!(
         dxf, dxe,
-        "dx must now be bit-exact (measured diffs: {dx_diffs:?})"
+        "dx must be bit-exact (measured diffs: {dx_diffs:?})"
     );
 
     let dgf: Vec<bf16> = grads_f.get(&g_f).unwrap().to_vec1().unwrap();
@@ -460,10 +456,10 @@ fn fused_vs_formula_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
         .zip(dge.iter())
         .map(|(&f, &e)| bf16_bit_diff(f, e))
         .collect();
-    println!("fused_vs_formula_bf16_bwd: measured dgamma bit-diffs (post-fix) = {dg_diffs:?}");
+    println!("fused_vs_formula_bf16_bwd: measured dgamma bit-diffs = {dg_diffs:?}");
     assert_eq!(
         dgf, dge,
-        "dgamma must now be bit-exact (measured diffs: {dg_diffs:?})"
+        "dgamma must be bit-exact (measured diffs: {dg_diffs:?})"
     );
 }
 
@@ -581,7 +577,7 @@ fn gradcheck_dbeta_f32() {
     let beta = Var::from_tensor(&Tensor::from_slice(&beta0, (hidden,), &device).unwrap()).unwrap();
 
     // A non-uniform loss weight, matching `fused_vs_formula_bf16_bwd_is_
-    // bit_exact_after_the_one_rounding_fix`'s rationale: `backward()`
+    // bit_exact_with_one_rounding`'s rationale: `backward()`
     // seeds an all-ones upstream gradient, which would make every
     // `dbeta_i` trivially equal `rows` regardless of a real bug in the
     // reduction's per-element wiring (a permutation of columns would

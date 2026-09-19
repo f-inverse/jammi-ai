@@ -3,22 +3,18 @@
 //! each element's KEEP/DROP decision is computed in-kernel from
 //! [`crate::philox::philox_draw`] and discarded immediately after use.
 //!
-//! This is the fused replacement for `jammi-lora`'s old
-//! `DropoutStream::draw_mask` + `Tensor::from_vec` + elementwise `mul`
-//! composition: a host-side `SplitMix64` PRNG filled a full-size `Vec<f32>`
-//! mask, copied it to the activation's device, and multiplied — a real H2D
+//! A host-materialized mask (a host PRNG filling a full-size `Vec<f32>`,
+//! copied to the device, then an elementwise `mul`) costs a real H2D
 //! transfer and a retained mask tensor on the backward tape (candle's
 //! `Binary::Mul` backward computes and stores a full-size gradient FOR the
 //! mask operand and never frees it, `backprop.rs:197-204`, since the mask
-//! is not itself a graph leaf `sorted_nodes` walks). See `jammi-lora`'s
-//! `LoraLinear::forward` module doc for the measured cost this replaces
-//! (2.9x step time, 16.7 GB at dropout 0.05, #352).
+//! is not itself a graph leaf `sorted_nodes` walks) — measured at 2.9x step
+//! time and 16.7 GB at dropout 0.05.
 //!
-//! ## The rejected mechanism, and why (wip/device-side-dropout, superseded)
+//! ## Why not `Device::set_seed` + `Tensor::rand`
 //!
-//! A prior attempt (`wip/device-side-dropout`, preserved, not merged) tried
-//! `Device::set_seed(key)` followed by `Tensor::rand` to draw a per-device
-//! mask. That is a NON-ATOMIC read-modify-write of process-global device
+//! Drawing a per-device mask with `Device::set_seed(key)` followed by
+//! `Tensor::rand` is a NON-ATOMIC read-modify-write of process-global device
 //! RNG state (`set_seed` takes and releases a mutex, `rand_uniform`
 //! re-takes it separately) — `LoraLinear` is deliberately `Sync`, so a
 //! concurrent draw on the same device could silently yield the wrong mask,
@@ -50,7 +46,7 @@
 //! exact failure mode a `u64` threshold structurally avoids; see
 //! [`tests::p_zero_is_a_bit_exact_no_op`]).
 //!
-//! Research context (2026-08-24, cited per the C7 contract): PyTorch/JAX
+//! PyTorch/JAX
 //! compute the decision as a FLOAT compare (`curand_uniform` is `(0,1]`,
 //! compared `< p`; JAX's `uniform < p`). FlashAttention-2's own dropout
 //! (`csrc/flash_attn/src/dropout.h`) instead compares an 8-BIT INTEGER
@@ -73,10 +69,8 @@
 //!
 //! `p` is validated to `[0.0, 1.0)` in [`DropoutFused::new`] (a typed
 //! `candle_core::Error`, not a silently-clamped or silently-NaN-propagated
-//! value) — `jammi-lora`'s `lora_dropout` was UNVALIDATED before this
-//! commit (`config.rs`'s `lora_dropout: Option<f32>` field took any `f32`),
-//! and this op independently re-validates rather than trusting its caller,
-//! per family D's "validate at every numeric edge".
+//! value) — this op validates independently rather than trusting its
+//! caller's config (`validate at every numeric edge`).
 //!
 //! ## The applied scale: pinned bit-identical CPU/CUDA
 //!
@@ -90,10 +84,9 @@
 //! which this build's un-pinned `--fmad` default could in principle treat
 //! differently in a future nvcc version if this expression ever grew a
 //! neighboring add) so the pinning is stated in the kernel text itself,
-//! not merely inferred from "there happens to be no add nearby" — the same
-//! doctrine C1 established for this crate's FMA-contraction disclosure
-//! (`build.rs`'s PINNED FLAGS comment), applied here as a POSITIVE
-//! guarantee instead of a disclosed gap.
+//! not merely inferred from "there happens to be no add nearby" — the
+//! positive form of this crate's FMA-contraction disclosure (`build.rs`'s
+//! PINNED FLAGS comment).
 //!
 //! ## No save-for-backward (candle 0.11): bwd IS fwd
 //!
@@ -107,21 +100,21 @@
 //! SAME construction data — applied to `grad_res` instead of `x`. This is
 //! not a coincidental shortcut; it is the mathematical content of "bwd
 //! regenerates the SAME decision from the SAME counter, dx = dy * mask *
-//! scale" (this commit's own design), and it structurally eliminates wip
-//! branch's finding #2 (candle's `Binary::Mul` backward retaining a
-//! full-size gradient FOR the mask): there is no mask tensor anywhere on
+//! scale", and it structurally eliminates the retained mask gradient
+//! (candle's `Binary::Mul` backward keeping a full-size gradient FOR the
+//! mask): there is no mask tensor anywhere on
 //! the tape to retain — `DropoutFused` is one `CustomOp1` node forward,
 //! and the identical op is one MORE `CustomOp1` node backward, with no
 //! third tensor (no mask) ever created.
 //!
-//! ## Domain (family D)
+//! ## Domain
 //!
 //! Contiguous storage only (`Layout::contiguous_offsets`) — a raw-pointer
 //! per-element kernel has no flat linear index for a strided view, and
 //! contiguity is what makes "logical index" and "storage index" coincide
 //! (see the counter-mapping section above). CPU and CUDA support `F32`,
-//! `BF16`, and (campaign #443 W2c, via the SEPARATE `cuda/dropout_f16.cu`
-//! monomorphic translation unit — see that file's module doc) `F16`; Metal
+//! `BF16`, and (via the SEPARATE `cuda/dropout_f16.cu` monomorphic
+//! translation unit — see that file's module doc) `F16`; Metal
 //! supports `F32`/`BF16` only (see the "Metal: a device-scoped
 //! deterministic host fallback" section below — F16 is deliberately NOT
 //! widened there, CUDA-only scope). Any other dtype is a typed
@@ -129,18 +122,17 @@
 //! no-op, not an error.
 //!
 //! ## Metal: a device-scoped deterministic host fallback, NOT a Metal
-//! Philox kernel (issue #433)
+//! Philox kernel
 //!
-//! `jammi-kernels` has no Metal kernel-launch infrastructure at all today
-//! (no `.metal` shader sources, no `MTLComputePipelineState` build path —
-//! contrast `crate::cuda`, a full PTX build step) — porting Philox to a
-//! Metal compute shader from nothing, for one op, was judged
-//! disproportionate to the defect (a LoRA/QLoRA training run failing on
-//! Apple Silicon at the shipped default `lora_dropout = 0.05` (no-producer:
-//! the shipped LoRA config default, not a measured value), GH #433)
-//! versus the alternative below, which reuses [`dropout_f32`]/
-//! [`dropout_bf16`] — the SAME functions [`DropoutFused::cpu_fwd`] calls —
-//! verbatim.
+//! `jammi-kernels` has no Metal kernel-launch infrastructure (no `.metal`
+//! shader sources, no `MTLComputePipelineState` build path — contrast
+//! `crate::cuda`, a full PTX build step), and candle's default
+//! `CustomOp1::metal_fwd` is a typed `Err`, so without a Metal arm every
+//! LoRA/QLoRA training forward with dropout configured fails on Apple
+//! Silicon. Porting Philox to a Metal compute shader from nothing, for one
+//! op, is disproportionate next to the arm below, which reuses
+//! [`dropout_f32`]/[`dropout_bf16`] — the SAME functions
+//! [`DropoutFused::cpu_fwd`] calls — verbatim.
 //!
 //! [`DropoutFused::metal_fwd`] downloads the input's raw backing buffer to
 //! the host (`MetalStorage::to_cpu_storage`, a synchronous blit +
@@ -159,29 +151,23 @@
 //! / `dropout_bf16_mask_matches_cpu` for the actual cross-device round
 //! trip.
 //!
-//! **This is not a state-racing risk of the kind the rejected mechanism
-//! above was refused for.** `Device::set_seed`+`Tensor::rand` raced a
-//! process-global, mutably-shared RNG; this arm touches no such state — it
+//! **This is not a state-racing risk.** `Device::set_seed`+`Tensor::rand`
+//! race a process-global, mutably-shared RNG; this arm touches no such state — it
 //! is a pure function of `self`'s own `Copy` construction data and the
 //! element's index, identically to every other arm.
 //!
-//! **Honest cost disclosure (esc-032's harm, re-measured for THIS
-//! device).** esc-032 quantified the OLD host-mask design's cost on CUDA's
-//! *discrete* memory (0.98G host RNG draws + 3.92 GB H2D copy per step at
-//! batch 16 / seq 128, GPU idle throughout) — that H2D transfer's dollar
-//! cost is largely ABSENT here: Apple Silicon's unified memory means the
+//! **Cost.** A host-materialized mask on CUDA's *discrete* memory costs
+//! 0.98G host RNG draws + a 3.92 GB H2D copy per step at batch 16 / seq 128,
+//! GPU idle throughout; that H2D transfer's cost is largely ABSENT here: Apple Silicon's unified memory means the
 //! "upload" is not a distinct physical bus transfer the way CUDA's PCIe
 //! H2D is. What is NOT absent: the mask is still computed by a
 //! single-threaded host loop over `elem_count` elements (the same
 //! `dropout_f32`/`dropout_bf16` iterator `cpu_fwd` runs), so this arm's
 //! per-step cost is real CPU time proportional to activation size, unlike
-//! CUDA's `cuda_fwd`, which launches a device kernel and returns. This is
-//! the honest, disclosed trade the constraint asked for — not "free",
-//! merely far cheaper than the original bug and, unlike a state-racing
-//! device-RNG shortcut, provably byte-identical to the CPU stream. A real
-//! Metal Philox compute kernel (candidate shape (a)) would remove the
-//! host round trip entirely; it remains future work, tracked by this
-//! module doc rather than silently declared out of scope.
+//! CUDA's `cuda_fwd`, which launches a device kernel and returns. Not free,
+//! but, unlike a state-racing device-RNG shortcut, provably byte-identical
+//! to the CPU stream. A Metal Philox compute kernel would remove the host
+//! round trip entirely.
 
 use candle_core::backend::BackendStorage;
 use candle_core::{
@@ -224,7 +210,7 @@ impl DropoutFused {
     /// `p` must be finite and in `[0.0, 1.0)` — `p == 1.0` would drop
     /// every element and make `scale` infinite; `p < 0.0` or `p` non-finite
     /// (including `NaN`, which fails every ordinary comparison silently —
-    /// family F's "a naive comparison silently passes on NaN" hazard,
+    /// the "a naive comparison silently passes on NaN" hazard,
     /// refused here by requiring `is_finite()` explicitly rather than
     /// relying on the range check alone) is refused with a typed error
     /// rather than silently clamped.
@@ -364,11 +350,10 @@ impl CustomOp1 for DropoutFused {
             // this arm's fast path has to check explicitly since it
             // bypasses that match entirely).
             // NOTE: deliberately NOT widened to F16 alongside `cpu_fwd`
-            // above — this crate's D2 f16-oracle work is CUDA-facing only
-            // (F16 admission is not proposed for Metal at all; see
+            // above — F16 is admitted on CUDA only (not on Metal at all; see
             // `docs/maintainer/cuda-kernel-guide.md`'s per-op f16
-            // reference-regime table), so the Metal host fallback keeps
-            // refusing F16 exactly as before.
+            // reference-regime table), so the Metal host fallback refuses
+            // F16.
             match s1.dtype() {
                 DType::F32 | DType::BF16 => {}
                 dtype => return Err(Error::UnsupportedDTypeForOp(dtype, self.name())),
@@ -407,7 +392,7 @@ impl CustomOp1 for DropoutFused {
     }
 }
 
-/// Fixed fold order (family J): ascending logical index, no reduction —
+/// Fixed fold order: ascending logical index, no reduction —
 /// every element is independent, so this is simply "iterate 0..n".
 fn dropout_f32(params: &DropoutFused, x: &[f32]) -> Vec<f32> {
     x.iter()
@@ -444,14 +429,10 @@ fn dropout_bf16(params: &DropoutFused, x: &[bf16]) -> Vec<bf16> {
 
 /// [`dropout_bf16`]'s exact twin, substituting `half::f16` — this op's
 /// F16 CPU arm, which doubles as the reference the CUDA F16 arm is
-/// compared against. CORRECTION (campaign #446, finding 14): an earlier
-/// revision of this comment said "no CUDA/Metal F16 dispatch arm exists
-/// yet". That is false for CUDA and has been since campaign #443 W2c —
-/// `cuda/dropout.rs`'s `cuda_fwd` has a real `DType::F16` arm dispatching
+/// compared against (`cuda/dropout.rs`'s `cuda_fwd` dispatches
 /// `dropout_fwd_f16` from the separate `cuda/dropout_f16.cu` translation
-/// unit (this module's own doc, "supports ... `F16`", was already
-/// correct; only this line lagged). It remains true for METAL: `metal_fwd`
-/// deliberately admits `F32`/`BF16` only — see its own `DType::F32 |
+/// unit). METAL has no F16 arm: `metal_fwd` deliberately admits
+/// `F32`/`BF16` only — see its own `DType::F32 |
 /// DType::BF16 => {}` gate and the "deliberately NOT widened to F16"
 /// note there. Byte-identical KEEP/DROP decision (the mask is
 /// dtype-independent), one rounding point on a KEPT element.
@@ -625,9 +606,9 @@ mod tests {
     }
 
     /// The keep-rate oracle (a non-vacuous, measured, numpy-comparable
-    /// statistic — family F): over a large draw, the fraction kept must be
+    /// statistic): over a large draw, the fraction kept must be
     /// within a stated binomial bound of `p_keep`. `n = 1_000_000`,
-    /// `p = 0.05` (the shipped default, per #352): std dev of a Binomial
+    /// `p = 0.05` (the shipped LoRA default): std dev of a Binomial
     /// `(n, p_keep)` count is `sqrt(n*p*(1-p))` ≈ 217 for `p=0.05`, so 6
     /// std devs ≈ 1302 elements ≈ 0.0013 of `n` — a generous, explicitly
     /// derived, non-arbitrary bound (not a "just wide enough to pass" one).

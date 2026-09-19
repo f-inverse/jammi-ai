@@ -602,9 +602,9 @@ mod tests {
     }
 
     /// F32 leg: the dtype-following mask is BYTE-IDENTICAL at F32 to a
-    /// hardcoded `f32::MIN` upper triangle. This is the construction-level
-    /// companion to `tests/bits_snapshot.rs`'s end-to-end bits hash — it localises a
-    /// regression to the mask rather than leaving it to a whole-tower digest.
+    /// hardcoded `f32::MIN` upper triangle. A construction-level check: it
+    /// localises a regression to the mask rather than leaving it to a
+    /// whole-tower end-to-end comparison.
     #[test]
     fn causal_mask_at_f32_is_byte_identical_to_the_hardcoded_f32_min_triangle() {
         let device = Device::Cpu;
@@ -690,7 +690,7 @@ mod tests {
 
     /// The frozen `load` path and the builder's `frozen()` path are ONE
     /// loader (`ClipText::load_with`), so their outputs agree bit-for-bit —
-    /// A2-i at the unit level, on a `VarMap`-backed tower (the
+    /// Eval bit-identity (i) at the unit level, on a `VarMap`-backed tower (the
     /// fixture-backed leg lives in `tests/tower_lora.rs`). Also pins that a
     /// frozen tower reports no trainable params.
     #[test]
@@ -875,7 +875,7 @@ mod tests {
         // `block0_backward` forwards through `ln_1`/`ln_2` (biased, training
         // mode) — a counter bumper on `crate::layer_norm::LN_DISPATCH_COUNTERS`
         // even though this test never reads that counter itself. Same lock
-        // discipline as `clip_text_training_ln_dispatch_is_now_counted` below
+        // discipline as `clip_text_training_ln_dispatch_is_counted` below
         // (see `crate::test_support::seam_counter_lock`'s doc).
         let _lock = crate::test_support::seam_counter_lock();
         let cfg = tiny_config();
@@ -1140,7 +1140,7 @@ mod tests {
     /// `slow()` would read `0/0` on the `ln` counter), on top of the
     /// gradient oracles above.
     #[test]
-    fn clip_text_training_ln_dispatch_is_now_counted() {
+    fn clip_text_training_ln_dispatch_is_counted() {
         let _lock = crate::test_support::seam_counter_lock();
         let cfg = tiny_config();
         let device = Device::Cpu;

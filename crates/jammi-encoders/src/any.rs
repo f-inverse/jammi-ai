@@ -861,7 +861,7 @@ mod tests {
         );
     }
 
-    /// A4: EVERY wrong (encoder, input) modality pairing is a typed refusal
+    /// EVERY wrong (encoder, input) modality pairing is a typed refusal
     /// naming BOTH modalities — not a shape error from deep inside a matmul,
     /// and never a silently reinterpreted tensor. Walks the full 3x3 grid so
     /// no arm is covered by accident.
@@ -931,7 +931,7 @@ mod tests {
         );
     }
 
-    /// A4: the two token-sequence-only accessors refuse on a media variant
+    /// The two token-sequence-only accessors refuse on a media variant
     /// rather than inventing a number. `max_seq_length` in particular has no
     /// honest value for a vision or audio tower — see its own doc.
     #[test]
@@ -1016,7 +1016,7 @@ mod tests {
     /// `probe_input` yields a batch for the encoder's OWN modality, and one
     /// its own `forward_input` accepts — asserted here for the text
     /// variants (the media legs, which need real checkpoints to forward,
-    /// live in `tests/tower_lora.rs`'s A7 oracle).
+    /// live in `tests/tower_lora.rs`'s probe-input oracle).
     #[test]
     fn probe_input_is_accepted_by_its_own_encoder() {
         let device = Device::Cpu;

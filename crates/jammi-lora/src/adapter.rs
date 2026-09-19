@@ -214,7 +214,7 @@ mod tests {
     /// constructed here explicitly rather than by re-deriving it from the
     /// struct (which would not catch a regression back to emitting the key).
     #[test]
-    fn from_build_for_text_family_omits_tower_key_and_matches_pre_unit_shape() {
+    fn from_build_for_text_family_omits_tower_key_and_matches_the_tower_less_shape() {
         let fixture = TextFamilyBuildFixture::new();
         let cfg = AdapterConfig::from_build("bert", &fixture.build_config(), ComputePrecision::F32);
         assert_eq!(cfg.tower, None);
@@ -238,7 +238,7 @@ mod tests {
         let actual: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             actual, expected,
-            "pre-unit JSON shape must be preserved byte-for-byte (as JSON values)"
+            "the tower-less JSON shape must be preserved byte-for-byte (as JSON values)"
         );
     }
 

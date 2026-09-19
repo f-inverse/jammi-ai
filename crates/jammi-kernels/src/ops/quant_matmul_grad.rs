@@ -159,8 +159,8 @@
 //! `cpu_fwd`'s own `self.repacked_qs.get_or_init(..)` at
 //! `src/quantized/mod.rs:944`), consulted only for `Q4K`-dtype, `n %
 //! 8 == 0` CPU matmuls on that target. This is exactly the "interior-
-//! mutable/Arc-carried field" `tests/stateful_op_discipline.rs`'s widened
-//! scope (see that file's own doc) now sweeps this module into: `self.w`
+//! mutable/Arc-carried field" `tests/stateful_op_discipline.rs`'s scope
+//! (see that file's own doc) covers: `self.w`
 //! is `Arc<QTensor>`, and `QTensor` itself (behind that `Arc`) owns a
 //! `OnceLock`. Argued, not denied, safe for THREE independent reasons:
 //! 1. **Content-derived**: the closure `get_or_init` runs reads only
@@ -191,7 +191,7 @@
 //! `StatefulKernelOp` doc "Clone is actively refused AT THEIR DEFINITION
 //! SITE" section) — not because cloning an `Arc<QTensor>` would corrupt
 //! anything (points 1-3 above show it would not), but because the crate-
-//! wide discipline this op is now inside (`tests/stateful_op_discipline.rs`)
+//! wide discipline this op is inside (`tests/stateful_op_discipline.rs`)
 //! is "construct fresh, pass by value, never reuse an op instance across
 //! calls", and following it uniformly costs nothing here (every real call
 //! site already holds its own `Arc<QTensor>` clone to construct a fresh

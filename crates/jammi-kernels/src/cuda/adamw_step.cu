@@ -33,7 +33,7 @@
 // standalone binary add/sub/div/mul kernel for every `Tensor <op> Tensor`)
 // — so matching it bit-for-bit means reproducing THAT many separate
 // roundings, not the fewest-operations fusion a human would otherwise
-// write. Per `adamw.rs:94-100`:
+// write. Per `fn step` in `jammi-ai`'s `fine_tune/adamw.rs`:
 //   next_m = (m*beta1) + (g*(1-beta1))            -- affine(m,b1,0) + affine(g,1-b1,0)
 //   next_v = (v*beta2) + ((g*g)*(1-beta2))         -- affine(v,b2,0) + affine(g*g,1-b2,0), g*g itself a standalone unary Sqr (v*v, op.rs:591)
 //   m_hat  = next_m*scale_m                        -- affine(next_m,scale_m,0)

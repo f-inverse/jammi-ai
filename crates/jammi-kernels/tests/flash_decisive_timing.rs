@@ -54,7 +54,7 @@
 //! characterised (e.g. `nsys` on the two clusters).
 //!
 //! `#[ignore]`d: needs an EXCLUSIVE GPU. Invoke with `cargo test --release
-//! -p jammi-kernels --features flash-attn --test flash_decisive_timing --
+//! -p jammi-kernels --features live-gpu-tests,flash-attn --test flash_decisive_timing --
 //! --ignored --nocapture`. Requires `JAMMI_TIMING_BOX_NAME` (refused if
 //! unset — see "No unknown fields" below) and a clean worktree (refused if
 //! dirty, or if `JAMMI_TIMING_SHA` disagrees with `git rev-parse HEAD`).
@@ -172,7 +172,7 @@ fn assert_steady_state(label: &str, s: &Stats) {
 
 /// WRAPPER brackets: RECORDS the steady-state flag (in the returned
 /// `Stats`, surfaced in the JSON) rather than enforcing it. Two independent
-/// runs on `a100b` found the wrapper bracket (which allocates fresh device
+/// runs on one A100 found the wrapper bracket (which allocates fresh device
 /// memory every call, unlike the kernel bracket) genuinely and reproducibly
 /// bimodal — see this file's module doc. That is real information about the
 /// PUBLIC API's own allocator-driven behaviour, not a defect in this

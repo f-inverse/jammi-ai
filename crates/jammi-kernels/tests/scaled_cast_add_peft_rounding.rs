@@ -2,9 +2,9 @@
 //! (3) NON-VACUITY, (4) FINITENESS-AFFIRMATIVE, and control (b) F32-TRUTH
 //! DIRECTION. Leg (1) BLINDNESS and the production-width, real-dispatch
 //! BITING oracle live in
-//! `crates/jammi-lora/tests/esc046_epilogue_biting_oracle.rs`
+//! `crates/jammi-lora/tests/epilogue_peft_rounding.rs`
 //! (needs `LoraLinear`/`LowRankResidualLinear` through a REAL `BF16` GEMM,
-//! so it is CUDA-gated — see that file's own doc for why a `BF16` full
+//! so it requires `live-gpu-tests` — see that file's own doc for why a `BF16` full
 //! `LoraLinear::forward` pipeline cannot be exercised on CPU at all) —
 //! this file is CPU-hermetic, testing
 //! [`ScaledCastAdd`] directly (the crate that owns this arm), which never

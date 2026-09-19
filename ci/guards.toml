@@ -53,6 +53,14 @@ paths = ["ci/**", "crates/jammi-kernels/**"]
 probe = "python3 -c 'import yaml'"
 provide = "python3 -m pip install --user --quiet 'PyYAML==6.*'"
 
+[need.numpy]
+probe = "python3 -c 'import numpy'"
+provide = "python3 -m pip install --user --quiet numpy"
+
+[need.tokenizers]
+probe = "python3 -c 'import tokenizers'"
+provide = "python3 -m pip install --user --quiet tokenizers"
+
 [need.actionlint]
 probe = "command -v actionlint"
 provide = "bash ci/scripts/install_actionlint.sh"
@@ -466,6 +474,7 @@ name = "compare_grad_oracle"
 run = "python3 ci/scripts/perf/test_compare_grad_oracle.py"
 why = "The Jammi-vs-PyTorch gradient comparator refuses legs that did not run the same problem."
 when = ["perf"]
+needs = ["numpy"]
 
 [[guard]]
 name = "ab_merge"
@@ -535,7 +544,7 @@ when = ["perf"]
 
 [[guard]]
 name = "convert_legacy_bert_checkpoint"
-run = "JAMMI_CI_SAFETENSORS_EXPECTED=1 python3 ci/scripts/perf/test_convert_legacy_bert_checkpoint.py"
+run = "python3 ci/scripts/perf/test_convert_legacy_bert_checkpoint.py"
 why = "A legacy BERT checkpoint converts to the tensor names the engine loads."
 when = ["perf"]
 needs = ["safetensors"]
@@ -545,6 +554,7 @@ name = "gen_fixed_width_corpus"
 run = "python3 ci/scripts/perf/test_gen_fixed_width_corpus.py"
 why = "The fixed-width text corpus is deterministic and of the width it claims."
 when = ["perf"]
+needs = ["tokenizers"]
 
 [[guard]]
 name = "gen_fixed_shape_image_corpus"

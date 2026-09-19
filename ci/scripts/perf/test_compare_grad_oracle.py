@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Tests for `compare_grad_oracle.py`.
 
-Runs the FULL suite twice: once against whatever numpy availability this
-environment actually has, and once with `ab_merge`-style dependency
-injection forcing the pure-Python fallback path (`HAVE_NUMPY = False`) --
-this repo's dev/CI environment may or may not have numpy importable
-(`torch`'s own transitive dependency, present inside `$TORCH_VENV`, absent
-in a bare CI Python), so the fallback path needs its OWN direct coverage,
-not just "whatever happened to run today".
+The comparator has two arithmetic arms, numpy and a pure-Python fallback,
+and every host runs both: the comparator-math suite runs once per arm (the
+fallback forced through `HAVE_NUMPY = False`), `ArmParityTests` holds the two
+arms equal on the same inputs, and `ArmSelectionAtTheCommandLineTests` runs
+the real command line with numpy and in a child process whose `numpy` import
+fails. numpy is this suite's
+`numpy` need in `ci/guards.toml`: the guard runner provides it, and without
+it the numpy-arm tests fail naming it.
 
 Run directly: `python3 ci/scripts/perf/test_compare_grad_oracle.py`
 """
@@ -18,12 +19,17 @@ import itertools
 import json
 import math
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import compare_grad_oracle as cgo  # noqa: E402
+from without_package import run_script_without  # noqa: E402
+
+SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compare_grad_oracle.py")
+NUMPY_NEED = "numpy is not importable: it is this suite's `numpy` need in ci/guards.toml"
 
 # Every `make_report()` call gets a UNIQUE default `tool` value (a monotonic
 # counter, not a fixed literal): TWO SEPARATE calls (the overwhelmingly
@@ -179,14 +185,8 @@ class ComparatorMathTestsMixin:
             cgo.compare_tensor("t", [1.0, 2.0], [1.0])
 
     def test_dot_and_max_abs_delta_raise_on_length_mismatch_under_whichever_arm_is_active(self):
-        """UNGATED companion of `ArmParityTests`' own length-mismatch
-        coverage (that class `skipUnless(cgo.HAVE_NUMPY, ...)`s, so it does
-        not run at all in an environment without numpy -- see that class's
-        own doc for the CI Guard disclosure). This mixin runs under BOTH
-        `ComparatorMathTestsWhateverNumpyIsAvailable` and
-        `ComparatorMathTestsForcedPureFallback`, so `_require_same_length`
-        gets AT LEAST one arm's worth of real coverage regardless of
-        whether numpy is importable here.
+        """`_require_same_length` runs before either arm's own branch, so
+        both concrete subclasses of this mixin must see the same refusal.
         """
         with self.assertRaises(ValueError):
             cgo._dot([1.0, 2.0], [1.0])
@@ -548,9 +548,8 @@ class PremiseAndWeightChecks(unittest.TestCase):
         """
         wa = [1.0, 1.0, 1.0]
         wb = [1.0, float("nan"), 1.0]
+        self.assertTrue(cgo.HAVE_NUMPY, NUMPY_NEED)
         for forced_numpy in (True, False):
-            if forced_numpy and not cgo.HAVE_NUMPY:
-                continue  # this arm genuinely does not exist here -- see ArmParityTests' skip
             orig = cgo.HAVE_NUMPY
             cgo.HAVE_NUMPY = forced_numpy
             try:
@@ -1417,19 +1416,6 @@ class SameProducerGuardTests(unittest.TestCase):
         self.assertIn("PREMISE VIOLATION", err.getvalue())
 
 
-@unittest.skipUnless(
-    cgo.HAVE_NUMPY,
-    "numpy is not importable in this environment -- this class compares the numpy arm "
-    "against the pure-Python fallback arm on the SAME divergent inputs; with no numpy, there "
-    "is only one arm to compare, so arm PARITY cannot be exercised here. NOTE: this repo's "
-    "CI Guard job (.github/workflows/ci.yml's `guard` matrix, the "
-    "lane that runs this file) installs NO python packages at all before invoking `python3` -- "
-    "no actions/setup-python with a requirements file, no `pip install numpy` step anywhere in "
-    "that job -- so on a stock ubuntu-latest runner's system python3 this class is expected to "
-    "SKIP there too. Treat 'the numpy arm's own correctness' as verified ONLY in an environment "
-    "that separately provisions numpy (e.g. $TORCH_VENV, which pulls it in as torch's own "
-    "transitive dependency) -- do not claim CI Guard coverage this class does not actually run.",
-)
 class ArmParityTests(unittest.TestCase):
     """The numpy arm and the pure-Python fallback arm asserted equal on the
     SAME divergent input -- the "run twice" pattern other tests use (`ComparatorMathTestsMixin`'s
@@ -1445,7 +1431,7 @@ class ArmParityTests(unittest.TestCase):
 
     def setUp(self):
         self._orig = cgo.HAVE_NUMPY
-        self.assertTrue(self._orig, "guarded by skipUnless(cgo.HAVE_NUMPY, ...) above")
+        self.assertTrue(self._orig, NUMPY_NEED)
 
     def tearDown(self):
         cgo.HAVE_NUMPY = self._orig
@@ -1532,16 +1518,16 @@ class ArmParityTests(unittest.TestCase):
         self.assertAlmostEqual(numpy_result[1], pure_result[1], places=9)
 
 
-class ComparatorMathTestsWhateverNumpyIsAvailable(ComparatorMathTestsMixin, unittest.TestCase):
-    """Runs under this environment's ACTUAL numpy availability (whatever
-    that is) -- `cgo.HAVE_NUMPY` at import time.
-    """
+class ComparatorMathTestsNumpyArm(ComparatorMathTestsMixin, unittest.TestCase):
+    """The numpy arm: `cgo.HAVE_NUMPY` as the import left it."""
+
+    def setUp(self):
+        self.assertTrue(cgo.HAVE_NUMPY, NUMPY_NEED)
 
 
 class ComparatorMathTestsForcedPureFallback(ComparatorMathTestsMixin, unittest.TestCase):
-    """Forces `cgo.HAVE_NUMPY = False` for the duration of each test, so
-    the pure-Python fallback path is exercised regardless of whether numpy
-    happens to be importable in the environment running this suite.
+    """The pure-Python fallback arm: `cgo.HAVE_NUMPY` forced `False` for the
+    duration of each test.
     """
 
     def setUp(self):
@@ -1550,6 +1536,40 @@ class ComparatorMathTestsForcedPureFallback(ComparatorMathTestsMixin, unittest.T
 
     def tearDown(self):
         cgo.HAVE_NUMPY = self._orig
+
+
+class ArmSelectionAtTheCommandLineTests(unittest.TestCase):
+    """The import-time selection of the fallback arm, at the real command
+    line: a genuinely matching pair still passes, and the report says which
+    arm computed it.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.paths = []
+        for name in ("a.json", "b.json"):
+            path = os.path.join(self._tmp.name, name)
+            with open(path, "w") as fh:
+                json.dump(make_report(0.3, {"t": [1.0, 2.0, 3.0, 4.0]}), fh)
+            self.paths.append(path)
+
+    def test_a_host_without_numpy_compares_on_the_fallback_arm(self):
+        result = run_script_without("numpy", SCRIPT, *self.paths, "--cosine-floor", "0.9")
+        self.assertEqual(result.returncode, cgo.EXIT_PASS, result.stdout + result.stderr)
+        self.assertIn("(numpy=no, pure-python fallback)", result.stdout)
+        self.assertIn("PASS", result.stdout.splitlines())
+
+    def test_a_host_with_numpy_compares_on_the_numpy_arm(self):
+        result = subprocess.run(
+            [sys.executable, SCRIPT, *self.paths, "--cosine-floor", "0.9"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(result.returncode, cgo.EXIT_PASS, result.stdout + result.stderr)
+        self.assertIn("(numpy=yes)", result.stdout, NUMPY_NEED)
 
 
 if __name__ == "__main__":

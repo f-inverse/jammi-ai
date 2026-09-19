@@ -215,7 +215,7 @@
 # row in the sweep reads `INVALID`, never PASS/FAIL, until the flash
 # feature is compiled in. This build therefore always turns on
 # `--features cuda,jammi-encoders/flash-attn` — the SAME convention
-# `finetune_run_ab.sh:305`/`clip_artifact_producer.sh`'s own
+# `finetune_run_ab.sh`/`clip_artifact_producer.sh`'s own
 # flash build already use, never a second, independently-drifting
 # feature-list spelling.
 #

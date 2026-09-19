@@ -155,7 +155,7 @@ CONTROL_FEATURE = "cuda"
 ROOT_ALL_FEATURES_EXEMPT_SPEC = [f"jammi-ai/{FORBIDDEN_FEATURE}"]
 
 # Workspace members permitted to reach TARGET_PKG/FORBIDDEN_FEATURE under
-# their OWN `--all-features` selection ONLY (P6 Stage B, `jammi-encoders`'s
+# their OWN `--all-features` selection ONLY (`jammi-encoders`'s
 # `crate::modernbert` flash-cascade admission needs a declared forwarding
 # path for `flash_attention_varlen`/`CuSeqlens` — a `#[cfg(feature =
 # "flash-attn")]` call site, never a bare `cfg!()` runtime check around a
@@ -1072,7 +1072,7 @@ def self_test() -> int:
         "flash-attn must FAIL"
     )
 
-    # The ALL_FEATURES_FLASH_EXEMPT mechanism (P6 Stage B): a member that
+    # The ALL_FEATURES_FLASH_EXEMPT mechanism: a member that
     # declares its OWN by-name `flash-attn` passthrough must pass under
     # `--all-features` (the exemption fires) but still FAIL if the SAME
     # feature leaks through a real lane (`cuda`/`default`), and must NOT

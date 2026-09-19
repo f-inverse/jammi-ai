@@ -17,7 +17,7 @@ name: GPU how-well (RunPod)
 # stays a separate, pod-seed-owned concern).
 #
 # Merge-path CI checks only ever validate COMMITTED artifacts (the shape
-# `check_cuda_run_artifacts.py` gives the clip/kernel-oracle artifacts) —
+# `check_cuda_run_artifacts.py` gives the clip and kernel artifacts) —
 # this workflow itself, and the RunPod run it drives, never sit on that
 # path; the committed calibration/A-B artifacts are what a merge-path gate
 # validates, not a re-execution of this workflow.

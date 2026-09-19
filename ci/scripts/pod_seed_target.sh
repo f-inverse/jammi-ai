@@ -334,7 +334,7 @@ sys.exit(2)
 # `.rmeta`, which the first two stems miss (a BINARY-only fixture has no
 # [lib] target and cannot show the gap).
 #
-# test_pod_substrate.sh's `(q/A2)` leg builds a real
+# test_pod_substrate.sh's `(q/real-build)` leg builds a real
 # two-member cargo workspace (lib jammi-zzlib + bin jammi-zzbin), runs a
 # REAL `cargo build` + `cargo build --release`, takes its artifact list
 # from a REAL `find` (never a hand-typed filename), and asserts every real
@@ -377,7 +377,7 @@ import sys, json, os, re
 target_dir = sys.argv[1]
 d = json.load(sys.stdin)
 members_by_id = {p["id"]: p["name"] for p in d["packages"]}
-# Stems per member, derived from cargo naming rules (the `(q/A2)` leg in
+# Stems per member, derived from cargo naming rules (the `(q/real-build)` leg in
 # test_pod_substrate.sh exercises them against a REAL cargo library build):
 # hyphenated (.fingerprint/build), underscored (deps/incremental
 # NON-library entries, e.g. jammi_zzlib-<hash>.d), and "lib" + underscored
@@ -878,7 +878,7 @@ print(json.dumps({
     # the exit code, and a resource snapshot at failure time — never a bare
     # tail alone. `pod_seed_write_failure_marker` is a standalone function
     # (not inlined here) so it has its own hermetic test — test_pod_
-    # substrate.sh's `(n/addendum)` leg: a fixture log whose only
+    # substrate.sh's `(n/seed-helpers)` leg: a fixture log whose only
     # diagnostic line sits 200 lines above the tail must survive into the
     # marker (RED on a tail-only revert, same leg).
     pod_seed_write_failure_marker "$log" "$FAILED_MARKER" "$rc"

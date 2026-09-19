@@ -2,7 +2,7 @@
 //! binaries with `[ballista]` roles configured (one hosting the scheduler +
 //! an executor, the rest hosting executors only), plus the fine-tune
 //! submission helpers (`add_training_source`, `submit_gang_fine_tune`,
-//! `submit_fine_tune`, `JobSize`, `await_job`, `unique_source_name`,
+//! `JobSize`, `await_job`, `unique_source_name`,
 //! `training_pairs_url`, `tiny_bert_model`, `label_of`) ported from
 //! `crates/jammi-ai/tests/distributed/harness.rs`.
 //!
@@ -10,8 +10,6 @@
 //! of a DIFFERENT crate, unreachable from here, so a reduced copy is the
 //! honest shape — named here as a copy, a candidate for the lead's
 //! consolidation to lift into `jammi-test-utils`.
-
-#![allow(dead_code)]
 
 use std::net::TcpListener;
 use std::os::unix::process::ExitStatusExt;
@@ -28,83 +26,9 @@ use jammi_db::config::{
     CatalogConfig, DistributedConfig, JammiConfig, LeaseConfig, StorageConfig, WorkerConfig,
 };
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_db::storage::{CloudConfig, S3Config};
 use jammi_db::store::CachePolicy;
+use jammi_test_utils::DistributedBackends;
 use tempfile::TempDir;
-
-/// The live backends this lane needs: Postgres, an S3-compatible object
-/// store (MinIO), and the S3 credentials the spawned children authenticate
-/// with. `detect()` returns the first missing variable's name, rather than
-/// silently running a degraded lane.
-pub struct Backends {
-    pub pg_url: String,
-    pub s3_endpoint: String,
-    pub s3_bucket: String,
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    pub region: String,
-}
-
-impl Backends {
-    pub fn detect() -> Result<Self, String> {
-        fn var(name: &str) -> Option<String> {
-            std::env::var(name).ok().filter(|s| !s.is_empty())
-        }
-        let need = |name: &str| var(name).ok_or_else(|| format!("{name} is unset"));
-        Ok(Self {
-            pg_url: need("JAMMI_TEST_PG_URL")?,
-            s3_endpoint: need("JAMMI_TEST_S3_ENDPOINT")?,
-            s3_bucket: need("JAMMI_TEST_S3_BUCKET")?,
-            access_key_id: need("AWS_ACCESS_KEY_ID")?,
-            secret_access_key: need("AWS_SECRET_ACCESS_KEY")?,
-            region: var("AWS_REGION").unwrap_or_else(|| "us-east-1".to_string()),
-        })
-    }
-
-    /// A unique `s3://bucket/prefix` for this test run.
-    pub fn unique_result_root(&self, test: &str) -> String {
-        format!(
-            "s3://{}/dist-ballista-{}-{}",
-            self.s3_bucket,
-            test,
-            uuid::Uuid::new_v4().simple()
-        )
-    }
-
-    fn cloud(&self) -> CloudConfig {
-        CloudConfig::S3(S3Config {
-            region: Some(self.region.clone()),
-            endpoint: Some(self.s3_endpoint.clone()),
-            access_key_id: Some(self.access_key_id.clone()),
-            secret_access_key: Some(self.secret_access_key.clone().into()),
-            session_token: None,
-            allow_http: self.s3_endpoint.starts_with("http://"),
-        })
-    }
-}
-
-/// `Backends::detect`, upgraded to a hard failure when
-/// `JAMMI_REQUIRE_DISTRIBUTED` is set — this lane's own require-gate (the
-/// same idiom `crates/jammi-ai/tests/distributed/{kill9_reclaim,gang_chaos}.rs`
-/// each carry per-file). `None` is still returned for an ad-hoc local run
-/// with no backends configured and no require flag.
-#[allow(clippy::collapsible_if)]
-pub fn required_backends(test: &str) -> Option<Backends> {
-    let backends = Backends::detect();
-    match backends {
-        Ok(b) => Some(b),
-        Err(reason) => {
-            if std::env::var_os("JAMMI_REQUIRE_DISTRIBUTED").is_some() {
-                panic!(
-                    "{test}: JAMMI_REQUIRE_DISTRIBUTED is set but the distributed lane's shared \
-                     backends are unconfigured ({reason}) — a silent skip is not acceptable here"
-                );
-            }
-            eprintln!("SKIPPED {test}: {reason}");
-            None
-        }
-    }
-}
 
 const LEASE_SECS: u64 = 3;
 const HEARTBEAT_SECS: u64 = 1;
@@ -185,15 +109,12 @@ const TEST_AUDIT_MASTER_KEY: &str =
 
 /// This process's Ballista role, if any: `SchedulerAndExecutor` renders both
 /// `[ballista] scheduler_bind` and `[ballista.executor]`; `Executor` renders
-/// `[ballista.executor]` only (pointed at `scheduler_port`);
-/// `SchedulerOnly` renders `[ballista] scheduler_bind` only (b2's second
-/// scheduler); `None` renders no `[ballista]` section at all (the plain,
-/// wave-3-path comparison fleet).
+/// `[ballista.executor]` only (pointed at `scheduler_port`); `None` renders
+/// no `[ballista]` section at all (the plain, wave-3-path comparison fleet).
 #[derive(Clone, Copy)]
 pub enum BallistaRole {
     SchedulerAndExecutor { scheduler_port: u16 },
     Executor { scheduler_port: u16 },
-    SchedulerOnly { scheduler_port: u16 },
     None,
 }
 
@@ -245,12 +166,12 @@ impl ProcSpec {
 }
 
 fn render_toml(
-    backends: &Backends,
+    backends: &DistributedBackends,
     result_root: &str,
     artifact_dir: &str,
     spec: &ProcSpec,
 ) -> String {
-    let allow_http = backends.s3_endpoint.starts_with("http://");
+    let allow_http = backends.allows_http();
     let kinds = match spec.worker.kind {
         Some(k) => format!("kinds = [\"{k}\"]"),
         None => "kinds = \"all\"".to_string(),
@@ -326,11 +247,6 @@ services = []
                 spec.exec_bind_port, spec.exec_grpc_port,
             ));
         }
-        BallistaRole::SchedulerOnly { scheduler_port } => {
-            out.push_str(&format!(
-                "\n[ballista]\nscheduler_bind = \"127.0.0.1:{scheduler_port}\"\n"
-            ));
-        }
     }
     out
 }
@@ -346,23 +262,8 @@ pub struct WorkerProc {
     spec: ProcSpec,
 }
 
-impl WorkerProc {
-    /// The `http://host:port` this process's Ballista scheduler listens on,
-    /// if it hosts one.
-    pub fn scheduler_url(&self) -> Option<String> {
-        match self.spec.ballista {
-            BallistaRole::SchedulerAndExecutor { scheduler_port }
-            | BallistaRole::SchedulerOnly { scheduler_port } => {
-                Some(format!("http://127.0.0.1:{scheduler_port}"))
-            }
-            _ => None,
-        }
-    }
-}
-
 pub struct Fleet {
     workers: Vec<WorkerProc>,
-    backends_for_respawn: (String, String), // (pg_url snapshot unused placeholder)
     run_id: String,
 }
 
@@ -375,7 +276,7 @@ impl Fleet {
     /// label (Postgres persists across the whole live-lane process, unlike
     /// SQLite's per-test-fixture isolation) — a stale row would silently
     /// resolve to the wrong instance.
-    pub fn spawn(backends: &Backends, result_root: &str, specs: Vec<ProcSpec>) -> Self {
+    pub fn spawn(backends: &DistributedBackends, result_root: &str, specs: Vec<ProcSpec>) -> Self {
         let exe = jammi_server_binary();
         let run_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let workers = specs
@@ -391,11 +292,7 @@ impl Fleet {
                 )
             })
             .collect();
-        Self {
-            workers,
-            backends_for_respawn: (String::new(), String::new()),
-            run_id,
-        }
+        Self { workers, run_id }
     }
 
     pub fn worker_labels(&self) -> Vec<&str> {
@@ -413,21 +310,18 @@ impl Fleet {
     /// reclaimer), added only after the earlier processes' own claim/
     /// placement race has already resolved, so it plays no part in that
     /// race. Returns the new process's own index (for `Fleet::label`).
-    pub fn spawn_more(&mut self, backends: &Backends, result_root: &str, spec: ProcSpec) -> usize {
+    pub fn spawn_more(
+        &mut self,
+        backends: &DistributedBackends,
+        result_root: &str,
+        spec: ProcSpec,
+    ) -> usize {
         let exe = jammi_server_binary();
         let idx = self.workers.len();
         let label = format!("lane-{}-{}", self.run_id, idx + 1);
         self.workers
             .push(spawn_one(&exe, backends, result_root, &label, spec));
         idx
-    }
-
-    pub fn scheduler_url_of(&self, label: &str) -> String {
-        self.workers
-            .iter()
-            .find(|w| w.label == label)
-            .and_then(|w| w.scheduler_url())
-            .unwrap_or_else(|| panic!("worker {label:?} hosts no Ballista scheduler"))
     }
 
     /// The captured stdout+stderr log of the worker labelled `label`, read
@@ -460,7 +354,7 @@ impl Fleet {
     /// assertion (contract acceptance list) only needs the OTHER executors'
     /// registrations and the job status rows to survive, which the shared
     /// catalog carries regardless of the replacement's own identity.
-    pub fn respawn(&mut self, backends: &Backends, result_root: &str, label: &str) {
+    pub fn respawn(&mut self, backends: &DistributedBackends, result_root: &str, label: &str) {
         let exe = jammi_server_binary();
         let idx = self
             .workers
@@ -541,7 +435,7 @@ fn sigkill(child: &mut Child) {
 
 fn spawn_one(
     exe: &Path,
-    backends: &Backends,
+    backends: &DistributedBackends,
     result_root: &str,
     label: &str,
     spec: ProcSpec,
@@ -706,7 +600,7 @@ pub async fn await_condition(timeout: Duration, mut predicate: impl FnMut() -> b
 /// MinIO, rooted at `result_root`. `[worker] enabled = false`: it only
 /// submits and observes.
 pub async fn harness_session(
-    backends: &Backends,
+    backends: &DistributedBackends,
     result_root: &str,
 ) -> (Arc<InferenceSession>, TempDir) {
     let dir = TempDir::new().expect("harness artifact_dir");
@@ -857,29 +751,6 @@ pub async fn submit_gang_fine_tune(
         })
         .await
         .expect("submit a queued gang fine-tune job to the shared catalog");
-    (job.job_id.clone(), job.model_id().to_string())
-}
-
-pub async fn submit_fine_tune(
-    session: &Arc<InferenceSession>,
-    source: &str,
-    size: JobSize,
-) -> (String, String) {
-    let job = session
-        .fine_tune(
-            source,
-            &tiny_bert_model(),
-            &[
-                "text_a".to_string(),
-                "text_b".to_string(),
-                "score".to_string(),
-            ],
-            FineTuneMethod::Lora,
-            ModelTask::TextEmbedding,
-            Some(lane_fine_tune_config(size)),
-        )
-        .await
-        .expect("submit queued fine-tune job to shared catalog");
     (job.job_id.clone(), job.model_id().to_string())
 }
 

@@ -2109,55 +2109,11 @@ async fn context_predictor_reload_unpublished_bundle_is_not_described_as_corrupt
     );
 }
 
-/// The flip side: a context predictor's bundle is published and INTACT, but
-/// `model.safetensors` is unreadable for a reason that has nothing to do with
-/// the bundle's own content — a permission fault standing in for a transient
-/// object-store outage (real `chmod` fault injection, Unix-only). This must
-/// NOT be folded into the typed `JammiError::Model` refusal the sibling
-/// missing-file test above pins — it is not this model's fault, and must
-/// propagate as its own storage-layer variant so a gRPC client sees
-/// `Internal`, not a bad-request-shaped code.
-///
-/// The require-gate polarity every `chmod` permission-fault probe in this
-/// suite shares (esc-089): `probe` performs the fault-injection premise
-/// check itself — "can this process still read/write through a chmod'd
-/// path?" — and returns `true` if the fault was BYPASSED (root, or a
-/// mode-ignoring filesystem). A bypass is normally a loud, `eprintln`'d skip:
-/// the fault-injection premise the caller needs simply does not hold on this
-/// host. But under `JAMMI_REQUIRE_POSIX_PERMS=1` (the CI lane that is
-/// SUPPOSED to run unprivileged with real POSIX permission enforcement) a
-/// bypass is instead a hard `panic!` — silently returning `true` in that lane
-/// would let a permission-fault regression go completely uncaught.
-///
-/// This is a thin local wrapper of the same canonical shape carried by every
-/// other `chmod`/permission-fault probe in this crate (`ci/kernel-oracle-
-/// helpers.txt`'s KO-7 registry is `(file, fn)`-scoped: a shared helper
-/// defined in `common/mod.rs` cannot be registered for a call site in a
-/// DIFFERENT file, so each file that needs this polarity carries its own
-/// copy rather than delegating).
-///
-/// Returns `true` if the caller must restore permissions and skip; `false` if
-/// the fault was genuinely injected and the test should proceed.
-#[cfg(unix)]
-fn chmod_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
-    let bypassed = probe();
-    if bypassed {
-        if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
-            panic!(
-                "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
-                 permission fault (root, or a mode-ignoring filesystem) — the fault-injection \
-                 premise this test needs does not hold; a silent skip is not acceptable here"
-            );
-        }
-        eprintln!("{test_name}: chmod bypassed (root?) — skipping");
-    }
-    bypassed
-}
-
-#[cfg(unix)]
+#[cfg(all(unix, feature = "unprivileged-tests"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn context_predictor_reload_permission_fault_is_not_a_typed_model_error() {
     use std::os::unix::fs::PermissionsExt;
+    jammi_test_resources::assert_permissions_enforced();
 
     let rows = synthetic_meta_dataset(12, 16, 4244);
     let (session, dir) = session_with_meta_dataset(&rows).await;
@@ -2182,20 +2138,7 @@ async fn context_predictor_reload_permission_fault_is_not_a_typed_model_error() 
     let bundle_dir = std::path::PathBuf::from(prefix_url.path());
     let weights_path = bundle_dir.join("model.safetensors");
 
-    // PROBE: root (and a mode-ignoring filesystem) bypasses chmod — skip
-    // loudly rather than assert against a fault that was never injected.
-    // Shared require-gate polarity (esc-089): under
-    // `JAMMI_REQUIRE_POSIX_PERMS=1` a bypass panics rather than skipping.
     std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let bypassed = chmod_bypassed(
-        "context_predictor_reload_permission_fault_is_not_a_typed_model_error",
-        || std::fs::read(&weights_path).is_ok(),
-    );
-    if bypassed {
-        let _ = std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644));
-        return;
-    }
-
     let cold = Arc::new(
         InferenceSession::new(common::test_config(dir.path()))
             .await

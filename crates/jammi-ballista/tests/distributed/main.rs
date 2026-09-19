@@ -9,8 +9,9 @@
 //! 3. `JAMMI_TEST_S3_ENDPOINT` / `_S3_BUCKET` / `AWS_ACCESS_KEY_ID` /
 //!    `AWS_SECRET_ACCESS_KEY` (an S3-compatible object store, MinIO in
 //!    dev/CI).
-//! 4. `JAMMI_REQUIRE_DISTRIBUTED=1` to turn an unconfigured-lane skip into a
-//!    hard failure (CI's own posture).
+//!
+//! A test fails naming the first of these variables that is unset
+//! ([`jammi_test_utils::DistributedBackends::from_env`]).
 //!
 //! **Uncovered** (named here and in this crate's contract file, never a
 //! silent skip in the exit code CI reads): acceptance (a3)'s "both
@@ -31,8 +32,6 @@
 
 mod harness;
 
-use harness::required_backends;
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,7 +45,8 @@ use jammi_ai::session::InferenceSession;
 use jammi_ballista::client::submit_physical_plan;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
-use harness::{Backends, BallistaRole, Fleet, JobSize, ProcSpec, WorkerRole};
+use harness::{BallistaRole, Fleet, JobSize, ProcSpec, WorkerRole};
+use jammi_test_utils::DistributedBackends;
 
 /// The deepest (leaf) plan node's own partition count — the scan stage's,
 /// regardless of how many `CoalescePartitionsExec`/operator nodes wrap it
@@ -239,9 +239,7 @@ async fn await_fleet_registered(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn embedding_job_across_two_executors_matches_in_process() {
     const TEST: &str = "embedding_job_across_two_executors_matches_in_process";
-    let Some(backends) = required_backends(TEST) else {
-        return;
-    };
+    let backends = DistributedBackends::from_env();
     let result_root = backends.unique_result_root(TEST);
     let (session, dir) = harness::harness_session(&backends, &result_root).await;
 
@@ -367,7 +365,7 @@ async fn embedding_job_across_two_executors_matches_in_process() {
 /// Standard fleet + a submitted `world_size = 2` gang fine-tune, polled to
 /// `running`. Returns `(fleet, job_id, expected_model, claimant_instance_id)`.
 async fn submit_and_await_placed_claim(
-    backends: &Backends,
+    backends: &DistributedBackends,
     result_root: &str,
     session: &Arc<InferenceSession>,
     source: &str,
@@ -410,9 +408,7 @@ async fn submit_and_await_placed_claim(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter() {
     const TEST: &str = "placed_gang_completes_on_a_registered_executor_other_than_the_submitter";
-    let Some(backends) = required_backends(TEST) else {
-        return;
-    };
+    let backends = DistributedBackends::from_env();
     let result_root = backends.unique_result_root(TEST);
     let (session, _dir) = harness::harness_session(&backends, &result_root).await;
     let source = harness::unique_source_name(TEST);
@@ -550,9 +546,7 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
 async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_completes() {
     const TEST: &str =
         "killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_completes";
-    let Some(backends) = required_backends(TEST) else {
-        return;
-    };
+    let backends = DistributedBackends::from_env();
     let result_root = backends.unique_result_root(TEST);
     let (session, _dir) = harness::harness_session(&backends, &result_root).await;
     let source = harness::unique_source_name(TEST);
@@ -568,7 +562,7 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
     // whole gang in-process (no scheduler role of its own installs a
     // `PlacedGangSubmitter` — `roles::host_scheduler`'s doc), never
     // exercising the placed path a5 needs; a SECOND SCHEDULER able to place
-    // independently (`BallistaRole::SchedulerOnly`) reds a different way —
+    // independently (a scheduler hosting no executor) reds a different way —
     // Ballista's OWN task binder gates on ITS OWN executor-heartbeat CACHE
     // (`ballista-scheduler-54.1.0/src/state/executor_manager.rs:117-121`'s
     // `get_alive_executors`), which a second scheduler never populates for
@@ -722,9 +716,7 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
     const TEST: &str = "scheduler_restart_keeps_executors_and_serves_a_new_job";
-    let Some(backends) = required_backends(TEST) else {
-        return;
-    };
+    let backends = DistributedBackends::from_env();
     let result_root = backends.unique_result_root(TEST);
     let (session, dir) = harness::harness_session(&backends, &result_root).await;
 
@@ -879,9 +871,7 @@ async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
     const TEST: &str = "two_schedulers_over_one_catalog_serve_jobs_sequentially";
-    let Some(backends) = required_backends(TEST) else {
-        return;
-    };
+    let backends = DistributedBackends::from_env();
     let result_root = backends.unique_result_root(TEST);
     let (session, dir) = harness::harness_session(&backends, &result_root).await;
 
@@ -896,9 +886,8 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
     let source = harness::unique_source_name(TEST);
     harness::add_training_source(&session, &source).await;
 
-    // Scheduler 4 hosts its OWN local executor too (`SchedulerAndExecutor`,
-    // never `SchedulerOnly`). Executed refutation: a `SchedulerOnly`
-    // scheduler 4 reds every submission with Ballista's OWN "There are no
+    // Scheduler 4 hosts its OWN local executor too (`SchedulerAndExecutor`).
+    // A scheduler 4 hosting no executor of its own reds every submission with Ballista's OWN "There are no
     // alive executors to bind tasks" (`ballista-scheduler-54.1.0/src/state/
     // executor_manager.rs:117-121`'s `get_alive_executors`, gated on THIS
     // scheduler's own executor-HEARTBEAT cache — never the raw
@@ -1036,9 +1025,7 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
     const TEST: &str = "device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan";
-    let Some(backends) = required_backends(TEST) else {
-        return;
-    };
+    let backends = DistributedBackends::from_env();
     let result_root = backends.unique_result_root(TEST);
     let (session, dir) = harness::harness_session(&backends, &result_root).await;
 
@@ -1142,9 +1129,7 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn list_workers_and_compute_executor_devices_report_registered_devices() {
     const TEST: &str = "list_workers_and_compute_executor_devices_report_registered_devices";
-    let Some(backends) = required_backends(TEST) else {
-        return;
-    };
+    let backends = DistributedBackends::from_env();
     let result_root = backends.unique_result_root(TEST);
     let (session, _dir) = harness::harness_session(&backends, &result_root).await;
 

@@ -39,23 +39,6 @@ pub const COSINE_FLOOR: f64 = 0.9999;
 /// floor: no single lane may diverge by more than this regardless of direction.
 pub const ELEMENTWISE_ABS_TOL: f64 = 1e-3;
 
-// ─── CUDA-availability skip guard ──────────────────────────────────────────
-
-/// Whether a CUDA device is usable for this build. `false` whenever the `cuda`
-/// feature is off (the engine compiles no CUDA path) or no device opens, so the
-/// suite skips cleanly on a CPU build / GPU-less host instead of failing.
-#[cfg(feature = "cuda")]
-pub fn gpu_available() -> bool {
-    candle_core::Device::new_cuda(0).is_ok()
-}
-
-/// Without the `cuda` feature the engine has no CUDA path at all, so the suite
-/// always skips.
-#[cfg(not(feature = "cuda"))]
-pub fn gpu_available() -> bool {
-    false
-}
-
 // ─── The one-at-a-time GPU slot for DEVICE-GLOBAL oracles ──────────────────
 
 /// This process's single GPU slot for a DEVICE-GLOBAL measurement. See
@@ -154,23 +137,17 @@ fn take_gpu_slot() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// A CUDA device bound to this binary's one-at-a-time [`GPU_SERIAL`] slot —
-/// the ONLY device source a device-global oracle may use. `None` when no CUDA
-/// device opens, which without the `cuda` feature is always: `Device::new_cuda`
-/// exists in either build and simply errors there, so this needs no `cfg` arm
-/// of its own (the caller's `skip_without_gpu!` has already returned in that
-/// lane anyway).
-pub fn serial_cuda_device() -> Option<SerialGpu> {
-    // Taken BEFORE `Device::new_cuda`, so even device ACQUISITION (which
+/// CUDA device 0 bound to this binary's one-at-a-time [`GPU_SERIAL`] slot —
+/// the ONLY device source a device-global oracle may use.
+pub fn serial_cuda_device() -> SerialGpu {
+    // Taken BEFORE the device opens, so even device acquisition (which
     // allocates a context on the device) is serialized against a sibling
     // leg's memory trace.
     let slot = take_gpu_slot();
-    candle_core::Device::new_cuda(0)
-        .ok()
-        .map(|device| SerialGpu {
-            device,
-            _slot: slot,
-        })
+    SerialGpu {
+        device: jammi_test_resources::cuda_device(0),
+        _slot: slot,
+    }
 }
 
 /// The slot is a real mutual exclusion, and it is released only when the
@@ -216,22 +193,6 @@ fn gpu_slot_is_exclusive_while_held() {
 /// issue #463 follow-up) takes this lock; any sibling added later must take
 /// the SAME one rather than minting a second the first cannot see.
 pub static ADMISSION_COUNTER_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Early-return a test with a loud `tracing::warn` skip (never `#[ignore]`)
-/// when no GPU is usable, so the GPU-less / CPU lane runs the suite as a no-op
-/// rather than a failure. Returns `true` when the caller should skip.
-#[macro_export]
-macro_rules! skip_without_gpu {
-    () => {{
-        if !$crate::harness::gpu_available() {
-            tracing::warn!(
-                "SKIP: no usable CUDA device (build the suite with \
-                 `--features cuda,live-gpu-tests` on a GPU host to run it)"
-            );
-            return;
-        }
-    }};
-}
 
 // ─── Fixture paths ───────────────────────────────────────────────────────────
 
@@ -323,8 +284,7 @@ pub async fn cpu_session(artifact_dir: &Path) -> Arc<InferenceSession> {
 }
 
 /// Build a GPU-pinned (`gpu.device = 0`, `require_gpu = true`) session over a
-/// fresh artifact dir, at the default `F32` precision. Only call after
-/// [`gpu_available`] / `skip_without_gpu!`.
+/// fresh artifact dir, at the default `F32` precision.
 pub async fn gpu_session(artifact_dir: &Path) -> Arc<InferenceSession> {
     gpu_session_with_precision(artifact_dir, ComputePrecision::F32).await
 }
@@ -332,8 +292,7 @@ pub async fn gpu_session(artifact_dir: &Path) -> Arc<InferenceSession> {
 /// Build a GPU-pinned (`gpu.device = 0`, `require_gpu = true`) session over a
 /// fresh artifact dir at an explicit inference `precision` — the entry point
 /// for exercising the compute-precision gate on a real device (e.g. `BF16`,
-/// whose runtime compute-capability gate only resolves on a CUDA device). Only
-/// call after [`gpu_available`] / `skip_without_gpu!`.
+/// whose runtime compute-capability gate only resolves on a CUDA device).
 pub async fn gpu_session_with_precision(
     artifact_dir: &Path,
     precision: ComputePrecision,

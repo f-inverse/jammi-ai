@@ -693,14 +693,16 @@ def _extract_fn_body(source: str, fn_kw_start: int) -> str:
     return source[brace_start:]
 
 
-def _find_crate_root(repo_root: Path, rel_path: str) -> Path | None:
-    p = (repo_root / rel_path).parent
-    while True:
-        if (p / "Cargo.toml").is_file():
-            return p
-        if p == repo_root or p.parent == p:
-            return None
-        p = p.parent
+def _manifest_at(repo_root: Path, rev: str, rel_path: str) -> tuple[str, str] | None:
+    """The nearest `Cargo.toml` above `rel_path` at commit `rev`, as
+    `(its path, its content)`."""
+    parent = Path(rel_path).parent
+    for directory in [parent, *parent.parents]:
+        candidate = (directory / "Cargo.toml").as_posix()
+        text = _file_at(repo_root, rev, candidate)
+        if text is not None:
+            return candidate, text
+    return None
 
 
 def _test_target_has_required_features(cargo_toml_text: str, test_stem: str) -> bool:
@@ -714,14 +716,46 @@ def _test_target_has_required_features(cargo_toml_text: str, test_stem: str) -> 
     return False
 
 
+def _file_at(repo_root: Path, rev: str, rel_path: str) -> str | None:
+    """`rel_path`'s content at commit `rev`, or `None` when that commit does
+    not hold it."""
+    shown = subprocess.run(
+        ["git", "show", f"{rev}:{rel_path}"], cwd=repo_root, capture_output=True
+    )
+    if shown.returncode != 0:
+        return None
+    return shown.stdout.decode("utf-8", errors="replace")
+
+
+def _measured_tree(repo_root: Path, data: dict) -> str | None:
+    """The commit holding the tree the artifact measured: its `git_sha` when this
+    repository has that commit, else the `merged_as` commit that landed it."""
+    for key in ("git_sha", "merged_as"):
+        rev = data.get(key)
+        if isinstance(rev, str) and rev:
+            exists = subprocess.run(
+                ["git", "cat-file", "-e", f"{rev}^{{commit}}"], cwd=repo_root, capture_output=True
+            )
+            if exists.returncode == 0:
+                return rev
+    return None
+
+
 def check_cargo_test_gating(data: dict, producer: dict, repo_root: Path) -> list[str]:
+    """The artifact's recorded gating is how its test was gated WHEN IT RAN, so
+    it is checked against the test file (and its crate's manifest) at the
+    artifact's own `git_sha`, never against today's tree: a later change to how
+    tests are gated leaves every earlier record true."""
     path = producer.get("path")
     invocation = producer.get("invocation") or ""
     gating = producer.get("gating")
     if not isinstance(path, str) or not path:
         return ["producer.kind == 'cargo-test' requires a non-null producer.path"]
-    if not (repo_root / path).is_file():
-        return []  # rule (b) already reported the missing-file failure
+    if data.get("status") == "SUPERSEDED":
+        return []  # a superseded record proves nothing; its replacement is checked
+    rev = _measured_tree(repo_root, data)
+    if rev is None:
+        return []  # rule (a) owns a missing or unresolved sha
 
     m = EXACT_RE.search(invocation)
     if not m:
@@ -732,7 +766,9 @@ def check_cargo_test_gating(data: dict, producer: dict, repo_root: Path) -> list
     fn_full = m.group(1)
     fn_short = fn_full.rsplit("::", 1)[-1]
 
-    source = (repo_root / path).read_text(encoding="utf-8", errors="replace")
+    source = _file_at(repo_root, rev, path)
+    if source is None:
+        return [f"producer.path `{path}` does not exist at the artifact's git_sha {rev}"]
     fn_re = re.compile(rf"\bfn\s+{re.escape(fn_short)}\s*\(")
     fn_m = fn_re.search(source)
     if not fn_m:
@@ -778,15 +814,17 @@ def check_cargo_test_gating(data: dict, producer: dict, repo_root: Path) -> list
                 f"appears in `{fn_short}`'s body in {path}"
             )
     elif gating == "required-features":
-        crate_root = _find_crate_root(repo_root, path)
-        if crate_root is None:
-            failures.append(f"no Cargo.toml found above {path}; cannot verify required-features")
+        manifest = _manifest_at(repo_root, rev, path)
+        if manifest is None:
+            failures.append(
+                f"no Cargo.toml above {path} at {rev}; cannot verify required-features"
+            )
         else:
+            manifest_path, cargo_toml = manifest
             test_stem = Path(path).stem
-            cargo_toml = (crate_root / "Cargo.toml").read_text(encoding="utf-8", errors="replace")
             if not _test_target_has_required_features(cargo_toml, test_stem):
                 failures.append(
-                    f"producer claims gating 'required-features' but {crate_root / 'Cargo.toml'} "
+                    f"producer claims gating 'required-features' but {manifest_path} at {rev} "
                     f"has no `[[test]]` section named `{test_stem}` carrying `required-features`"
                 )
     # gating == "none": nothing further to verify.
@@ -3190,11 +3228,35 @@ def self_test() -> int:
         _run(["git", "add", "-A"], repo)
         _run(["git", "commit", "-q", "-m", "third"], repo)
         tracked = git_ls_files(repo)
+        no_rf_sha = _run(["git", "rev-parse", "HEAD"], repo).stdout.strip()
         bad = baseline()
+        bad["git_sha"] = no_rf_sha
         bad["producer"] = dict(bad["producer"])
         bad["producer"]["path"] = "crates/no-rf-crate/tests/cuda_parity.rs"
         bad["producer"]["gating"] = "required-features"
         expect_hit(bad, "x.json", "has no `[[test]]` section", "rule (c): claimed required-features absent")
+
+        # rule (c) reads the test as it was when the artifact ran: a later
+        # change to how the test is gated leaves the earlier record true.
+        (crate_dir / "tests" / "cuda_parity.rs").write_text(
+            "#[test]\n#[ignore]\nfn some_gated_test() {\n    assert!(true);\n}\n\n"
+            "#[test]\nfn env_gated_test() {\n    assert!(true);\n}\n"
+        )
+        _run(["git", "add", "-A"], repo)
+        _run(["git", "commit", "-q", "-m", "regate"], repo)
+        tracked = git_ls_files(repo)
+        ok = baseline()
+        ok["producer"] = dict(ok["producer"])
+        ok["producer"]["invocation"] = "cargo test -p fixture-crate --test cuda_parity -- --exact env_gated_test"
+        ok["producer"]["gating"] = "env:JAMMI_REQUIRE_CUDA"
+        expect_clean(ok, "control-gating-at-its-own-commit.json", "rule (c): gating is read at the artifact's git_sha")
+
+        # A superseded record proves nothing; its replacement is what is checked.
+        ok = baseline()
+        ok["status"] = "SUPERSEDED"
+        ok["producer"] = dict(ok["producer"])
+        ok["producer"]["path"] = "crates/no-rf-crate/tests/cuda_parity.rs"
+        expect_clean(ok, "control-superseded.json", "rule (c): a superseded record is not held to its producer")
 
         # rule (k) — the `gang` artifact kind -----------------------------------
         # One mutation per DETERMINANT of the kind: each required field

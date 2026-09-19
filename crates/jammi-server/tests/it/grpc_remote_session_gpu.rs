@@ -137,17 +137,9 @@ struct GpuEngineServer {
 }
 
 /// Spin up an in-process gRPC + Flight SQL server whose `InferenceSession` is
-/// pinned to the first CUDA device. Returns `None` — a clean skip — when no
-/// usable GPU opens, so this suite is a no-op off a CUDA host rather than a
-/// failure (mirrors `grpc_embedding_gpu.rs::start_gpu_embedding_server`
-/// exactly), UNLESS `JAMMI_REQUIRE_CUDA` is set, in which case ANY
-/// `InferenceSession::open` failure — not just a device-absent one — is a
-/// hard panic carrying the underlying error, per the repo-wide
-/// `JAMMI_REQUIRE_CUDA` opt-in-panic idiom (see the module doc comment). A
-/// returned `Some` guarantees the session was constructed on the GPU, so
-/// every RPC against it (including the Flight SQL reads below) runs the real
-/// CUDA-served path.
-async fn start_gpu_engine_server() -> Option<GpuEngineServer> {
+/// pinned to the first CUDA device (`require_gpu = true`), so every RPC against
+/// it (including the Flight SQL reads below) runs the real CUDA-served path.
+async fn start_gpu_engine_server() -> GpuEngineServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut cfg = test_config(dir.path());
     cfg.gpu.device = 0;
@@ -156,22 +148,9 @@ async fn start_gpu_engine_server() -> Option<GpuEngineServer> {
     // `open` (not `new`) registers the compound-query SQL functions on the
     // session context — matching the production `OssServer` shape and what
     // the Flight SQL read-back below needs available.
-    let session = match InferenceSession::open(cfg).await {
-        Ok(session) => session,
-        Err(err) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!(
-                    "grpc_remote_session_gpu: JAMMI_REQUIRE_CUDA is set but \
-                     InferenceSession::open failed — refusing to silently skip: {err}"
-                );
-            }
-            tracing::warn!(
-                "SKIP grpc_remote_session_gpu: no usable CUDA device — build with \
-                 `--features cuda,live-gpu-tests` on a GPU host to run it ({err})"
-            );
-            return None;
-        }
-    };
+    let session = InferenceSession::open(cfg)
+        .await
+        .expect("a session pinned to CUDA device 0 (require_gpu = true)");
 
     let store = SessionStore::new();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -191,13 +170,13 @@ async fn start_gpu_engine_server() -> Option<GpuEngineServer> {
     };
     let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
 
-    Some(GpuEngineServer {
+    GpuEngineServer {
         addr,
         shutdown: shutdown_tx,
         _dir: dir,
         handle,
         engine,
-    })
+    }
 }
 
 /// Connect a `DataClient` to the in-process GPU server.
@@ -274,19 +253,7 @@ fn keyed_vectors(table_name: &str, batches: &[RecordBatch]) -> Vec<(String, Vec<
 /// device coverage of the CPU assertion at `grpc_remote_session.rs:174-176`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_flight_read_matches_local_readback_bitwise_on_gpu() {
-    let Some(server) = start_gpu_engine_server().await else {
-        // `start_gpu_engine_server` already panics under `JAMMI_REQUIRE_CUDA`
-        // on any `open` failure, so a `None` here can only happen with the
-        // flag unset — reasserted for defense in depth (the same idiom
-        // `finetune_step.rs`'s `..._is_measured_on_a_box_with_nvidia_smi`
-        // uses at its own early-return).
-        assert!(
-            std::env::var_os("JAMMI_REQUIRE_CUDA").is_none(),
-            "remote_flight_read_matches_local_readback_bitwise_on_gpu: JAMMI_REQUIRE_CUDA is \
-             set but start_gpu_engine_server returned None — a silent skip is not acceptable"
-        );
-        return;
-    };
+    let server = start_gpu_engine_server().await;
     let remote = remote(&server).await;
     let local = local(&server);
     let model_id = head64_model_id();
@@ -371,19 +338,7 @@ async fn remote_flight_read_matches_local_readback_bitwise_on_gpu() {
 /// on pod evidence, not decided here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn encode_query_two_compute_gpu_repeat_determinism_is_recorded_not_gated() {
-    let Some(server) = start_gpu_engine_server().await else {
-        // See the sibling test's identical guard: `start_gpu_engine_server`
-        // already panics under `JAMMI_REQUIRE_CUDA` on any `open` failure, so
-        // this reasserts the invariant for defense in depth rather than
-        // trusting the helper alone.
-        assert!(
-            std::env::var_os("JAMMI_REQUIRE_CUDA").is_none(),
-            "encode_query_two_compute_gpu_repeat_determinism_is_recorded_not_gated: \
-             JAMMI_REQUIRE_CUDA is set but start_gpu_engine_server returned None — a silent \
-             skip is not acceptable"
-        );
-        return;
-    };
+    let server = start_gpu_engine_server().await;
     let remote = remote(&server).await;
     let local = local(&server);
     let model_id = head64_model_id();

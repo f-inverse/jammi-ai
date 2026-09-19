@@ -882,7 +882,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: JAMMI_REQUIRE_LOCK_TEST=1 bash ci/scripts/test_pod_substrate.sh
+      - run: bash ci/scripts/test_pod_substrate.sh
 """
 
 

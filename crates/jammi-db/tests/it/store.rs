@@ -322,13 +322,7 @@ async fn resolve_embedding_table_accepts_every_embedding_variant() {
 #[tokio::test]
 async fn resolve_embedding_table_picks_newest_by_created_at_not_table_name(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = match make_test_session(backend, dir.path()).await {
-        Some(s) => s,
-        None => {
-            eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
-            return;
-        }
-    };
+    let session = make_test_session(backend, dir.path()).await;
     let catalog = session.catalog();
 
     let suffix = unique_suffix();
@@ -986,13 +980,7 @@ fn sortable_at(seq: u64) -> String {
 #[tokio::test]
 async fn result_table_none_dimensions_round_trips_as_null(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = match make_test_session(backend, dir.path()).await {
-        Some(s) => s,
-        None => {
-            eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
-            return;
-        }
-    };
+    let session = make_test_session(backend, dir.path()).await;
     let catalog = session.catalog();
 
     let suffix = unique_suffix();

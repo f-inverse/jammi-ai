@@ -73,6 +73,10 @@ provide = "yum install -y -q rsync"
 probe = "command -v tmux"
 provide = "yum install -y -q tmux"
 
+[need.flock]
+probe = "command -v flock"
+provide = "yum install -y -q util-linux"
+
 # `cargo metadata --frozen` reads the registry; it never builds.
 [need.cargo-registry]
 probe = "cargo metadata --format-version 1 --frozen >/dev/null"
@@ -116,19 +120,14 @@ run = "python3 ci/scripts/check_doc_parity.py"
 why = "Every enum the docs enumerate lists exactly the variants the code has."
 
 [[guard]]
+name = "no run-time test skips"
+run = "bash ci/scripts/check_no_require_flags.sh"
+why = "No test reads green when its resource is missing: none reads a JAMMI_REQUIRE_* flag, because none has a skip for one to guard."
+
+[[guard]]
 name = "GPU parity matrix"
 run = "python3 ci/scripts/check_gpu_parity_matrix.py"
 why = "Every shipped (architecture × verb) cell is covered by a GPU parity test, structurally excluded, or named as pending."
-
-[[guard]]
-name = "kernel oracle standard"
-run = "python3 ci/scripts/check_kernel_oracles.py"
-why = "A test that skips without its hardware fails instead when that hardware is required: an unrun oracle is red, never green."
-
-[[guard]]
-name = "kernel oracle standard suite"
-run = "python3 ci/scripts/test_check_kernel_oracles.py"
-why = "The kernel-oracle guard fires on each skip shape it names."
 
 [[guard]]
 name = "engine dep-direction"
@@ -318,10 +317,10 @@ needs = ["ssh-keygen", "jq"]
 
 [[guard]]
 name = "pod build substrate"
-run = "JAMMI_REQUIRE_LOCK_TEST=1 bash ci/scripts/test_pod_substrate.sh"
+run = "bash ci/scripts/test_pod_substrate.sh"
 why = "A pod's build environment, its seed-cache key manifest and its pushed-tree stamp are what the pod lanes assume."
 when = ["rig"]
-needs = ["cargo-registry", "jq", "rsync", "tmux"]
+needs = ["cargo-registry", "jq", "rsync", "tmux", "flock"]
 
 [[guard]]
 name = "pod build timings"

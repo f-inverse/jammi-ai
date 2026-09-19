@@ -1161,8 +1161,7 @@ exists) a `test_pod_substrate.sh` leg.
 **Test suite:**
 
 ```bash
-bash ci/scripts/test_pod_substrate.sh          # every leg (a)-(z), hermetic, no pod
-JAMMI_REQUIRE_LOCK_TEST=1 bash ci/scripts/test_pod_substrate.sh   # additionally requires flock present (Linux-only leg (d))
+bash ci/scripts/test_pod_substrate.sh          # every leg (a)-(z), hermetic, no pod; needs flock and tmux
 bash ci/scripts/test_gpu_dev_lifecycle.sh      # gpu-dev.sh's own dispatch/session lifecycle legs
 ```
 

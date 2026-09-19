@@ -73,6 +73,8 @@
 //!  -- --nocapture --test-threads=1`.
 
 mod harness;
+#[path = "../it/release_manifest.rs"]
+mod release_manifest;
 
 mod bf16_gpu_gate;
 mod capability_surface;

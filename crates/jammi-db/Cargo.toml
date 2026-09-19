@@ -48,6 +48,9 @@ live-s3-tests = ["storage-s3"]
 live-gcs-tests = ["storage-gcs"]
 live-azure-tests = ["storage-azure"]
 live-r2-tests = ["storage-r2"]
+# Compiles the tests that need file permissions to apply to the test process: a
+# non-root user on a filesystem that enforces mode bits.
+unprivileged-tests = []
 
 [dependencies]
 # Internal
@@ -126,6 +129,7 @@ libc.workspace = true
 tempfile = "3"
 tokio.workspace = true
 jammi-test-utils.workspace = true
+jammi-test-resources.workspace = true
 test-case = { workspace = true }
 # `libc` moved to `[dependencies]` above (now a real, non-dev dependency);
 # still available to every test in this crate through that promotion.

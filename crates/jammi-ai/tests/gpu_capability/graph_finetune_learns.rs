@@ -30,7 +30,6 @@ use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
 
 use crate::harness;
-use crate::skip_without_gpu;
 
 fn write_csv(dir: &Path, name: &str, header: &str, rows: &[(String, String)]) -> String {
     let mut body = String::from(header);
@@ -63,7 +62,6 @@ async fn add_csv(session: &Arc<InferenceSession>, id: &str, url: String) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fine_tune_graph_learns_on_gpu() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     harness::loss_capture::reset();
 

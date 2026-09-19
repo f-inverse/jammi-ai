@@ -2,8 +2,7 @@
 //! `compute_jobs` (migration 038, `docs/plans/67-distributed-training/
 //! UNITS.md` § U8b). Parameterized sqlite/postgres, the `migrations.rs` /
 //! `gang_membership.rs` shape: every test also runs a `::postgres` arm
-//! gated by `live-postgres-tests`, skipping (never failing) when
-//! `JAMMI_TEST_PG_URL` is unset.
+//! gated by `live-postgres-tests`.
 //!
 //! The Postgres arm runs against ONE shared, persistent database
 //! (`jammi_test_utils::unique_suffix`'s doc), so every row this file plants
@@ -19,29 +18,8 @@ use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::compute_repo::{ComputeExecutorRecord, ComputeJobRecord};
 use jammi_db::catalog::instance::DeviceFact;
 use jammi_db::catalog::Catalog;
-use jammi_test_utils::make_test_session;
-use tempfile::tempdir;
 
-async fn open_catalog(kind: BackendKind) -> Option<(tempfile::TempDir, Arc<Catalog>)> {
-    let dir = tempdir().unwrap();
-    let session = make_test_session(kind, dir.path()).await?;
-    Some((dir, Arc::clone(session.catalog())))
-}
-
-/// The require-gate for the Postgres arm: a direct, crate-qualified call to
-/// the registered `shared:` helper, textually in each `#[test]` fn's own body
-/// (the KO-7 scanner is per-fn textual; `open_catalog`'s internal `?` on
-/// `make_test_session` is one function away and does not dominate the skip —
-/// `gang_membership.rs`'s own shape).
-macro_rules! skip_unless_ready {
-    ($kind:expr) => {
-        if matches!($kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none()
-        {
-            eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-            return;
-        }
-    };
-}
+use crate::common::catalog_on;
 
 /// Tests own their rows: the Postgres arm shares one database with every
 /// other lane on this host, so every executor row a test registers is
@@ -99,10 +77,7 @@ fn job(id: &str, owner: &str) -> ComputeJobRecord {
 )]
 #[tokio::test]
 async fn upsert_list_get_remove_round_trip(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = open_catalog(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let owned = RefCell::new(Vec::<String>::new());
     with_owned_rows(&catalog, &owned, async {
         let id = format!("exec-rt-{}", jammi_test_utils::unique_suffix());
@@ -151,10 +126,7 @@ async fn upsert_list_get_remove_round_trip(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn heartbeat_updates_only_status_and_heartbeat_at(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = open_catalog(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let owned = RefCell::new(Vec::<String>::new());
     with_owned_rows(&catalog, &owned, async {
         let target = format!("exec-hb-target-{}", jammi_test_utils::unique_suffix());
@@ -213,10 +185,7 @@ async fn heartbeat_updates_only_status_and_heartbeat_at(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn adjust_compute_slots_is_atomic_across_the_whole_batch(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = open_catalog(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let owned = RefCell::new(Vec::<String>::new());
     with_owned_rows(&catalog, &owned, async {
         let a = format!("exec-adj-a-{}", jammi_test_utils::unique_suffix());
@@ -321,10 +290,7 @@ async fn adjust_compute_slots_is_atomic_across_the_whole_batch(kind: BackendKind
 )]
 #[tokio::test]
 async fn bind_compute_slots_cas_admits_exactly_capacity_concurrent_binders(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = open_catalog(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let owned = RefCell::new(Vec::<String>::new());
     with_owned_rows(&catalog, &owned, async {
         let id = format!("exec-cas-{}", jammi_test_utils::unique_suffix());
@@ -377,10 +343,7 @@ async fn bind_compute_slots_cas_admits_exactly_capacity_concurrent_binders(kind:
 )]
 #[tokio::test]
 async fn compute_jobs_put_get_list_delete(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = open_catalog(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let id = format!("job-{}", jammi_test_utils::unique_suffix());
     let rec = job(&id, "owner-1");
     catalog.put_compute_job(&rec).await.unwrap();
@@ -412,10 +375,7 @@ async fn compute_jobs_put_get_list_delete(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn list_compute_executor_devices_reads_the_executors_own_column(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = open_catalog(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let owned = RefCell::new(Vec::<String>::new());
     with_owned_rows(&catalog, &owned, async {
         let no_devices = format!("exec-dev-none-{}", jammi_test_utils::unique_suffix());

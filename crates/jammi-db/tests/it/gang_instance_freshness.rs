@@ -8,50 +8,19 @@
 //! either backend (`Catalog::upsert_instance` never writes the database
 //! clock here). Parameterized (sqlite/postgres, the `migrations.rs` shape):
 //! every test here also runs a `::postgres` arm gated by
-//! `live-postgres-tests`, skipping (never failing) when `JAMMI_TEST_PG_URL`
-//! is unset — kept parameterized even though the decode itself is now
+//! `live-postgres-tests` — kept parameterized even though the decode itself is now
 //! backend-independent, so the parity oracle
 //! (`fresh_instance_malformed_last_seen_at_is_not_fresh_on_sqlite_and_a_write_refusal_on_postgres`)
 //! actually pins the stated asymmetry between the two backends (a row fact
 //! on SQLite, a write refusal on Postgres — see that test's own docs), not
 //! merely that each compiles.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
-use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::Catalog;
-use jammi_db::model_task::ModelTask;
-use jammi_test_utils::make_test_session;
-use tempfile::tempdir;
 
-/// Returns `None` (never a panic) when `kind = Postgres` and
-/// `JAMMI_TEST_PG_URL` is unset, so callers skip exactly like
-/// `migrations.rs`'s own parameterized tests. The Postgres lane shares ONE
-/// live database across the whole run (`jammi_test_utils::
-/// make_test_session`'s own docs); every test in this file upserts its own
-/// distinct `instance_id`, so no cross-test reset is needed the way
-/// `gang_rank_admission.rs`'s `reset_queue` is for `jobs`.
-async fn base_catalog_kind(kind: BackendKind) -> Option<(tempfile::TempDir, Arc<Catalog>)> {
-    let dir = tempdir().unwrap();
-    let session = make_test_session(kind, dir.path()).await?;
-    let catalog = Arc::clone(session.catalog());
-    catalog
-        .register_model(RegisterModelParams {
-            model_id: "q-base",
-            version: 1,
-            model_type: "embedding",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: None,
-            config_json: None,
-        })
-        .await
-        .unwrap();
-    Some((dir, catalog))
-}
+use crate::common::catalog_on;
 
 /// Force `instances.last_seen_at` into the past via raw SQL — the state a
 /// dead process leaves behind (nothing heartbeats it any more).
@@ -85,20 +54,7 @@ async fn force_stale_instance(catalog: &Catalog, instance_id: &str, ago: Duratio
 )]
 #[tokio::test]
 async fn fresh_instance_true_for_a_recently_seen_instance(kind: BackendKind) {
-    // The require-gate itself: a direct, crate-qualified call to the
-    // registered `shared:` helper (`ci/kernel-oracle-helpers.txt`), textually
-    // in THIS test fn's own body — `base_catalog_kind`'s internal `?` on
-    // `make_test_session` is one function away and does not dominate this
-    // skip for the KO-7 scanner, which is per-`#[test]`-fn textual, not
-    // whole-file (`migrations.rs`'s own parameterized tests use this exact
-    // shape).
-    if matches!(kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none() {
-        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-        return;
-    }
-    let (_dir, catalog) = base_catalog_kind(kind).await.expect(
-        "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
-    );
+    let (_dir, catalog) = catalog_on(kind).await;
     catalog
         .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
             "inst-fresh",
@@ -123,20 +79,7 @@ async fn fresh_instance_true_for_a_recently_seen_instance(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn fresh_instance_false_for_an_absent_instance(kind: BackendKind) {
-    // The require-gate itself: a direct, crate-qualified call to the
-    // registered `shared:` helper (`ci/kernel-oracle-helpers.txt`), textually
-    // in THIS test fn's own body — `base_catalog_kind`'s internal `?` on
-    // `make_test_session` is one function away and does not dominate this
-    // skip for the KO-7 scanner, which is per-`#[test]`-fn textual, not
-    // whole-file (`migrations.rs`'s own parameterized tests use this exact
-    // shape).
-    if matches!(kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none() {
-        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-        return;
-    }
-    let (_dir, catalog) = base_catalog_kind(kind).await.expect(
-        "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
-    );
+    let (_dir, catalog) = catalog_on(kind).await;
     let fresh = catalog
         .fresh_instance("no-such-instance-gang-freshness", Duration::from_secs(30))
         .await
@@ -151,20 +94,7 @@ async fn fresh_instance_false_for_an_absent_instance(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn fresh_instance_false_for_a_stale_instance(kind: BackendKind) {
-    // The require-gate itself: a direct, crate-qualified call to the
-    // registered `shared:` helper (`ci/kernel-oracle-helpers.txt`), textually
-    // in THIS test fn's own body — `base_catalog_kind`'s internal `?` on
-    // `make_test_session` is one function away and does not dominate this
-    // skip for the KO-7 scanner, which is per-`#[test]`-fn textual, not
-    // whole-file (`migrations.rs`'s own parameterized tests use this exact
-    // shape).
-    if matches!(kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none() {
-        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-        return;
-    }
-    let (_dir, catalog) = base_catalog_kind(kind).await.expect(
-        "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
-    );
+    let (_dir, catalog) = catalog_on(kind).await;
     catalog
         .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
             "inst-stale",
@@ -198,20 +128,7 @@ async fn fresh_instance_false_for_a_stale_instance(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn fresh_instance_true_just_inside_the_liveness_margin(kind: BackendKind) {
-    // The require-gate itself: a direct, crate-qualified call to the
-    // registered `shared:` helper (`ci/kernel-oracle-helpers.txt`), textually
-    // in THIS test fn's own body — `base_catalog_kind`'s internal `?` on
-    // `make_test_session` is one function away and does not dominate this
-    // skip for the KO-7 scanner, which is per-`#[test]`-fn textual, not
-    // whole-file (`migrations.rs`'s own parameterized tests use this exact
-    // shape).
-    if matches!(kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none() {
-        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-        return;
-    }
-    let (_dir, catalog) = base_catalog_kind(kind).await.expect(
-        "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
-    );
+    let (_dir, catalog) = catalog_on(kind).await;
     catalog
         .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
             "inst-borderline",
@@ -247,20 +164,7 @@ async fn fresh_instance_true_just_inside_the_liveness_margin(kind: BackendKind) 
 )]
 #[tokio::test]
 async fn fresh_instance_false_just_outside_the_liveness_margin(kind: BackendKind) {
-    // The require-gate itself: a direct, crate-qualified call to the
-    // registered `shared:` helper (`ci/kernel-oracle-helpers.txt`), textually
-    // in THIS test fn's own body — `base_catalog_kind`'s internal `?` on
-    // `make_test_session` is one function away and does not dominate this
-    // skip for the KO-7 scanner, which is per-`#[test]`-fn textual, not
-    // whole-file (`migrations.rs`'s own parameterized tests use this exact
-    // shape).
-    if matches!(kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none() {
-        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-        return;
-    }
-    let (_dir, catalog) = base_catalog_kind(kind).await.expect(
-        "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
-    );
+    let (_dir, catalog) = catalog_on(kind).await;
     catalog
         .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
             "inst-just-outside",
@@ -310,20 +214,7 @@ async fn fresh_instance_false_just_outside_the_liveness_margin(kind: BackendKind
 async fn fresh_instance_malformed_last_seen_at_is_not_fresh_on_sqlite_and_a_write_refusal_on_postgres(
     kind: BackendKind,
 ) {
-    // The require-gate itself: a direct, crate-qualified call to the
-    // registered `shared:` helper (`ci/kernel-oracle-helpers.txt`), textually
-    // in THIS test fn's own body — `base_catalog_kind`'s internal `?` on
-    // `make_test_session` is one function away and does not dominate this
-    // skip for the KO-7 scanner, which is per-`#[test]`-fn textual, not
-    // whole-file (`migrations.rs`'s own parameterized tests use this exact
-    // shape).
-    if matches!(kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none() {
-        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-        return;
-    }
-    let (_dir, catalog) = base_catalog_kind(kind).await.expect(
-        "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
-    );
+    let (_dir, catalog) = catalog_on(kind).await;
     let instance_id = format!(
         "inst-lease-undecodable-{}",
         jammi_test_utils::unique_suffix()

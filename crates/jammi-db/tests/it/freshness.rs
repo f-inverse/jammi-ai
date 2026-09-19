@@ -10,14 +10,17 @@
 //! misses on a one-bit change and never hits on an unpinned anchor; and that the
 //! `derives_from` lineage is correct, walks transitively stack-safely, and
 //! surfaces a cycle as a typed `DependencyCycle`.
+//!
+//! Every result table this module creates gets a fresh UUID-suffixed name
+//! ([`ResultStore::create_table`]), so the shared Postgres lane never needs a
+//! per-test unique source id: lineage/staleness queries here are always keyed
+//! on that unique `table_name`, never on a fixed literal.
 
 use std::sync::Arc;
 
 use arrow::array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
 use jammi_db::catalog::backend::BackendKind;
-use jammi_db::catalog::backend_postgres::PostgresBackend;
-use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::catalog::Catalog;
@@ -33,6 +36,8 @@ use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{BuildingTable, ResultStore, StaleReason, Staleness};
 use tempfile::tempdir;
 use test_case::test_case;
+
+use crate::common::fresh_catalog;
 
 const DIMS: usize = 4;
 
@@ -56,45 +61,6 @@ fn unique_version() -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     jammi_test_utils::unique_suffix().hash(&mut hasher);
     hasher.finish()
-}
-
-/// Build a catalog on `backend`, running migrations. Returns `None` for the
-/// Postgres arm when `JAMMI_TEST_PG_URL` is unset, so callers skip (never
-/// `#[ignore]`) exactly like [`jammi_test_utils::make_test_session`]. Every
-/// result table this module creates gets a fresh UUID-suffixed name
-/// ([`ResultStore::create_table`]), so the shared Postgres lane never needs a
-/// per-test unique source id: lineage/staleness queries here are always keyed
-/// on that unique `table_name`, never on a fixed literal.
-async fn fresh_catalog(backend: BackendKind, dir: &std::path::Path) -> Option<Arc<Catalog>> {
-    let backend_impl = match backend {
-        BackendKind::Sqlite => {
-            let b = SqliteBackend::open(&dir.join("catalog.db")).await.unwrap();
-            jammi_db::catalog::backend::BackendImpl::Sqlite(b)
-        }
-        BackendKind::Postgres => {
-            let url = jammi_test_utils::pg_url_for_tests()?;
-            let pg = PostgresBackend::open_with_options(&url, 8, None)
-                .await
-                .unwrap();
-            jammi_db::catalog::backend::BackendImpl::Postgres(pg)
-        }
-    };
-    backend_impl.migrate().await.unwrap();
-    Some(Arc::new(Catalog::from_backend(backend_impl)))
-}
-
-/// Fetch a backend-parameterized catalog, skipping the test (with a warning)
-/// when the Postgres arm has no `JAMMI_TEST_PG_URL`.
-macro_rules! fresh_catalog_or_skip {
-    ($backend:expr, $dir:expr) => {
-        match fresh_catalog($backend, $dir.path()).await {
-            Some(c) => c,
-            None => {
-                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
-                return;
-            }
-        }
-    };
 }
 
 fn store(dir: &std::path::Path, catalog: Arc<Catalog>) -> ResultStore {
@@ -209,7 +175,7 @@ async fn materialize(
 #[tokio::test]
 async fn fresh_when_definition_and_inputs_are_unchanged(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -234,7 +200,7 @@ async fn fresh_when_definition_and_inputs_are_unchanged(backend: BackendKind) {
 #[tokio::test]
 async fn stale_when_the_definition_changes(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -266,7 +232,7 @@ async fn stale_when_the_definition_changes(backend: BackendKind) {
 #[tokio::test]
 async fn stale_when_a_parent_is_recomputed_to_a_new_digest(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -312,7 +278,7 @@ async fn stale_when_a_parent_is_recomputed_to_a_new_digest(backend: BackendKind)
 #[tokio::test]
 async fn stale_input_vanished_reason(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -344,7 +310,7 @@ async fn stale_input_vanished_reason(backend: BackendKind) {
 #[tokio::test]
 async fn missing_manifest_for_a_pre_contract_table(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
 
     // A pre-contract row: bytes + a `ready` row, but NO definition_hash summary.
@@ -374,7 +340,7 @@ async fn missing_manifest_for_a_pre_contract_table(backend: BackendKind) {
 #[tokio::test]
 async fn unpinned_input_is_never_fresh(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -413,7 +379,7 @@ async fn unpinned_input_is_never_fresh(backend: BackendKind) {
 #[tokio::test]
 async fn undecidable_still_reports_a_confidently_decided_definition_change(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -455,7 +421,7 @@ async fn undecidable_still_reports_a_confidently_decided_definition_change(backe
 #[tokio::test]
 async fn lookup_cached_hits_an_exact_match(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -475,7 +441,7 @@ async fn lookup_cached_hits_an_exact_match(backend: BackendKind) {
 #[tokio::test]
 async fn lookup_cached_misses_on_a_one_bit_anchor_change(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -504,7 +470,7 @@ async fn lookup_cached_misses_on_a_one_bit_anchor_change(backend: BackendKind) {
 #[tokio::test]
 async fn lookup_cached_never_hits_an_unpinned_request(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -531,7 +497,7 @@ async fn lookup_cached_never_hits_an_unpinned_request(backend: BackendKind) {
 #[tokio::test]
 async fn derives_from_reports_the_one_hop_dependents(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -561,7 +527,7 @@ async fn derives_from_reports_the_one_hop_dependents(backend: BackendKind) {
 #[tokio::test]
 async fn derives_from_closure_walks_transitively(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -594,7 +560,7 @@ async fn derives_from_closure_walks_transitively(backend: BackendKind) {
 #[tokio::test]
 async fn derives_from_closure_is_stack_safe_on_a_deep_chain(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -627,7 +593,7 @@ async fn derives_from_closure_is_stack_safe_on_a_deep_chain(backend: BackendKind
 #[tokio::test]
 async fn derives_from_closure_surfaces_a_cycle_as_a_typed_error(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -682,7 +648,7 @@ async fn derives_from_closure_collects_a_diamond_descendant_once(backend: Backen
     // at C for a back-edge cycle. This is the distinction a flat visited-set walk
     // cannot make — the W-61a audit's follow-up.
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -740,7 +706,7 @@ async fn derives_from_closure_collects_a_diamond_descendant_once(backend: Backen
 #[tokio::test]
 async fn probe_cache_hits_an_exact_match_with_an_extant_artifact(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -765,7 +731,7 @@ async fn probe_cache_misses_when_the_artifact_was_reaped(backend: BackendKind) {
     // cannot read. The bare `lookup_cached` sensor still reports the catalog hit;
     // `probe_cache` re-confirms the bytes and falls through to a miss.
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -804,7 +770,7 @@ async fn probe_cache_record_reuses_an_intact_newer_row_when_an_older_same_key_ro
     // reaped candidate must not shadow another candidate at the exact same key
     // (esc-023 — the false-miss this test pins down).
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -843,7 +809,7 @@ async fn probe_cache_record_falls_through_a_reaped_newest_row_to_an_intact_older
     // in the opposite direction. This is the case a DESC-ordering-only change
     // (no iteration) would still get wrong.
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -873,7 +839,7 @@ async fn probe_cache_record_falls_through_a_reaped_newest_row_to_an_intact_older
 #[tokio::test]
 async fn probe_cache_misses_on_a_one_bit_change(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -905,7 +871,7 @@ async fn probe_cache_record_returns_the_reusable_record_on_a_hit(backend: Backen
     // without a second catalog read. On a hit it is the cached table's record;
     // on a one-bit-changed probe it is `None`.
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -942,7 +908,7 @@ async fn probe_cache_record_returns_the_reusable_record_on_a_hit(backend: Backen
 #[tokio::test]
 async fn probe_cache_never_hits_an_unpinned_request(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let catalog = fresh_catalog(backend, dir.path()).await;
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 

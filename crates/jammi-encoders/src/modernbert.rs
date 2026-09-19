@@ -3166,27 +3166,11 @@ mod tests {
     /// round made), and a dtype genuinely outside the compiled set (`F32`)
     /// must still miss it, under the RENAMED reason key
     /// (`dtype_is_bf16_or_f16`, not the stale singular `dtype_is_bf16`).
-    /// Requires `--features cuda` (and, to reach a real `Holds`/pass-through
-    /// rather than an early `arch_in_flash_validated_set` skip, an actual
-    /// Ampere-or-newer device) — `JAMMI_REQUIRE_CUDA=1` turns a missing
-    /// device into a hard failure rather than a silent skip, matching every
-    /// other CUDA-gated test in this module.
     #[test]
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn flash_capability_gates_admits_f16_alongside_bf16_on_real_cuda_arch_and_head_dim() {
-        let Some(device) = growth_oracle_cuda_device() else {
-            return;
-        };
-        if !flash_arch_ok(&device) {
-            flash_arch_gate(
-                "flash_capability_gates_admits_f16_alongside_bf16_on_real_cuda_arch_and_head_dim",
-            );
-            eprintln!(
-                "flash_capability_gates_admits_f16_alongside_bf16_on_real_cuda_arch_and_head_dim: \
-                 skipping -- this device's arch is not in flash_validated_arches()"
-            );
-            return;
-        }
+        let device = jammi_test_resources::cuda_device(0);
+        assert_flash_arch(&device);
         for dtype in [DType::BF16, DType::F16] {
             let miss = flash_capability_gates(true, &device, dtype, FLASH_HEAD_DIM);
             assert_eq!(
@@ -3898,11 +3882,9 @@ mod tests {
     /// arm fires instead — this test is meaningful (and green) under
     /// EITHER feature combination, not just the real one.
     #[test]
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn forward_hidden_dispatches_attention_block_flash_fused_on_a_dense_cuda_bf16_checkpoint() {
-        let Some(device) = growth_oracle_cuda_device() else {
-            return;
-        };
+        let device = jammi_test_resources::cuda_device(0);
         let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
@@ -4592,7 +4574,7 @@ mod tests {
     /// spread) and box/driver variation (unmeasured here, but a same-class
     /// unknown this margin is sized to absorb) -- never re-fitted to
     /// exactly the measured mean or max.
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    #[cfg(all(feature = "live-gpu-tests", feature = "flash-attn"))]
     const FLASH_ORACLE_PADDED_BOUND: f64 = 0.5;
 
     /// One seed's real-row `relative_l1_error(flash, block)` measurement
@@ -4605,7 +4587,7 @@ mod tests {
     /// (`fused == num_hidden_layers, declined == 0`) and the
     /// pad-rows-exact-zero premise PER SEED, not just once, since a
     /// per-seed fresh model/forward is a genuinely independent run.
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    #[cfg(all(feature = "live-gpu-tests", feature = "flash-attn"))]
     fn flash_padded_real_row_ratio_at_seed(
         config: &ModernBertConfig,
         weights: &std::path::Path,
@@ -4697,25 +4679,15 @@ mod tests {
     /// [`FLASH_ORACLE_PADDED_BOUND`] (see that constant's own doc for its
     /// derivation status).
     #[test]
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    #[cfg(feature = "live-flash-oracle-tests")]
     fn flash_arm_padded_matches_block_arm_on_real_rows_cuda() {
-        let Ok(model_dir) = std::env::var("JAMMI_FLASH_ORACLE_MODEL_DIR") else {
-            flash_oracle_require_gate("flash_arm_padded_matches_block_arm_on_real_rows_cuda");
-            return;
-        };
-        let Some(cuda) = growth_oracle_cuda_device() else {
-            return;
-        };
+        let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
+        let cuda = jammi_test_resources::cuda_device(0);
         let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !flash_compiled_or_skip(
-            "flash_arm_padded_matches_block_arm_on_real_rows_cuda",
-            &cuda,
-        ) {
-            return;
-        }
+        assert_flash_arch(&cuda);
 
         let dir = std::path::PathBuf::from(&model_dir);
         let config: ModernBertConfig =
@@ -4783,25 +4755,15 @@ mod tests {
     /// seam, ported from the dense arm's
     /// [`jammi_kernels::ops::flash_attention_varlen_with_rope_test_only_bwd_window_override`]).
     #[test]
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    #[cfg(feature = "live-flash-oracle-tests")]
     fn flash_arm_padded_red_control_lengths_off_by_one_cuda() {
-        let Ok(model_dir) = std::env::var("JAMMI_FLASH_ORACLE_MODEL_DIR") else {
-            flash_oracle_require_gate("flash_arm_padded_red_control_lengths_off_by_one_cuda");
-            return;
-        };
-        let Some(cuda) = growth_oracle_cuda_device() else {
-            return;
-        };
+        let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
+        let cuda = jammi_test_resources::cuda_device(0);
         let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !flash_compiled_or_skip(
-            "flash_arm_padded_red_control_lengths_off_by_one_cuda",
-            &cuda,
-        ) {
-            return;
-        }
+        assert_flash_arch(&cuda);
 
         let dir = std::path::PathBuf::from(&model_dir);
         let config: ModernBertConfig =
@@ -4886,25 +4848,15 @@ mod tests {
     /// looser shrinking one). A future fixture shrink now re-vacuates
     /// LOUDLY (a failed `assert!`, not a silent pass) instead of silently.
     #[test]
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    #[cfg(feature = "live-flash-oracle-tests")]
     fn flash_arm_padded_red_control_window_radius_off_by_one_cuda() {
-        let Ok(model_dir) = std::env::var("JAMMI_FLASH_ORACLE_MODEL_DIR") else {
-            flash_oracle_require_gate("flash_arm_padded_red_control_window_radius_off_by_one_cuda");
-            return;
-        };
-        let Some(cuda) = growth_oracle_cuda_device() else {
-            return;
-        };
+        let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
+        let cuda = jammi_test_resources::cuda_device(0);
         let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !flash_compiled_or_skip(
-            "flash_arm_padded_red_control_window_radius_off_by_one_cuda",
-            &cuda,
-        ) {
-            return;
-        }
+        assert_flash_arch(&cuda);
 
         let dir = std::path::PathBuf::from(&model_dir);
         let config: ModernBertConfig =
@@ -4996,7 +4948,7 @@ mod tests {
     /// `admission` must be a genuinely padded (`!is_dense`) `CompactedBatch`
     /// — this harness does not implement the dense-arm fallback, since its
     /// whole point is to characterize the RAGGED arm's own fault surface.
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    #[cfg(all(feature = "live-gpu-tests", feature = "flash-attn"))]
     fn forward_hidden_padded_with_ragged_bwd_window_fault(
         model: &ModernBert,
         input_ids: &Tensor,
@@ -5074,7 +5026,7 @@ mod tests {
     /// LAST-layer probe) deliberately needs an EARLY layer: see that
     /// control's own doc for why the last (global) layer's gradient cannot
     /// see a LOCAL-layer-only backward defect at all.
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    #[cfg(all(feature = "live-gpu-tests", feature = "flash-attn"))]
     fn flash_oracle_wqkv_lora_b_of_layer(model: &ModernBert, idx: usize) -> &Tensor {
         match &model.layers[idx].attention.wqkv {
             MaybeLoraLinear::Lora(l) => &l.lora_b,
@@ -5090,7 +5042,7 @@ mod tests {
     /// counterpart of [`flash_oracle_pooled_and_grad`], generalised to an
     /// arbitrary layer (see [`flash_oracle_wqkv_lora_b_of_layer`]'s own
     /// doc for why).
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    #[cfg(all(feature = "live-gpu-tests", feature = "flash-attn"))]
     fn flash_oracle_hidden_and_early_grad(
         model: &ModernBert,
         hidden: &Tensor,
@@ -5165,27 +5117,15 @@ mod tests {
     /// the threshold on a `half_window=64` checkpoint. Asserted in-test below
     /// so a future fixture shrink re-vacuates LOUDLY instead of silently.
     #[test]
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    #[cfg(feature = "live-flash-oracle-tests")]
     fn flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda() {
-        let Ok(model_dir) = std::env::var("JAMMI_FLASH_ORACLE_MODEL_DIR") else {
-            flash_oracle_require_gate(
-                "flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda",
-            );
-            return;
-        };
-        let Some(cuda) = growth_oracle_cuda_device() else {
-            return;
-        };
+        let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
+        let cuda = jammi_test_resources::cuda_device(0);
         let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !flash_compiled_or_skip(
-            "flash_arm_padded_red_control_bwd_only_window_off_by_one_cuda",
-            &cuda,
-        ) {
-            return;
-        }
+        assert_flash_arch(&cuda);
 
         let dir = std::path::PathBuf::from(&model_dir);
         let config: ModernBertConfig =
@@ -5406,7 +5346,7 @@ mod tests {
     /// Eight fixed seeds, reused IDENTICALLY across the healthy oracle and
     /// every RED control below, at every shape (defect 2 above) -- a
     /// single seed's draw is not a distribution.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     const FLASH_ORACLE_SWEEP_SEEDS: [u64; 8] = [201, 202, 203, 204, 205, 206, 207, 208];
 
     /// Mean-ratio bound, pooled-embedding leg (`err(other,f32) /
@@ -5423,7 +5363,7 @@ mod tests {
     /// two means while sitting more than 3x below the WEAKEST measured
     /// mutant mean on this same leg (window-dropped, 5.2189; K-unrotated
     /// 9.9498; bad-softmax-scale 19.4144).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     const FLASH_ORACLE_K_MEAN_POOLED: f64 = 1.6;
 
     /// Mean-ratio bound, LoRA-gradient leg (last layer `Wqkv` LoRA `B`,
@@ -5448,219 +5388,26 @@ mod tests {
     /// so no control ever exercised the deleted max asserts either -- this
     /// is a straight deletion of dead, seed-unstable gates, not a
     /// re-derivation of a new bound.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     const FLASH_ORACLE_K_MEAN_GRAD: f64 = 4.5;
 
-    /// Panics instead of skipping when `JAMMI_REQUIRE_FLASH_ORACLE` is set
-    /// -- mirrors [`growth_oracle_cuda_device`]'s own `JAMMI_REQUIRE_CUDA`
-    /// gate: a machine that should be running this real-checkpoint-gated
-    /// suite (the pod lane) must not silently read a missing
-    /// `JAMMI_FLASH_ORACLE_MODEL_DIR` as green.
-    #[cfg(feature = "cuda")]
-    /// KO-7 require-gate for an arch-conditioned flash skip (registered in
-    /// `ci/kernel-oracle-helpers.txt`): under `JAMMI_REQUIRE_CUDA` a device
-    /// whose arch is outside `flash_validated_arches()` must FAIL the test
-    /// loudly, never skip it silently — the prove lanes pin exactly the
-    /// validated arches, so a skip there is a wrong pod, not a soft pass.
-    #[cfg(feature = "cuda")]
-    fn flash_arch_gate(test_name: &str) {
-        if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-            panic!(
-                "{test_name}: JAMMI_REQUIRE_CUDA is set but this device's arch is not in \
-                 flash_validated_arches() — a silent arch skip is not acceptable on a prove lane"
-            );
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    fn flash_oracle_require_gate(test_name: &str) {
-        if std::env::var_os("JAMMI_REQUIRE_FLASH_ORACLE").is_some() {
-            panic!(
-                "{test_name}: JAMMI_REQUIRE_FLASH_ORACLE is set but \
-                 JAMMI_FLASH_ORACLE_MODEL_DIR is not -- this lane must run the real-checkpoint \
-                 flash-arm oracle, not skip it"
-            );
-        }
-        eprintln!("{test_name}: skipping — JAMMI_FLASH_ORACLE_MODEL_DIR not set");
-    }
-
-    /// Mirrors [`growth_oracle_cuda_device`]'s own `JAMMI_REQUIRE_CUDA` gate
-    /// AND [`flash_oracle_require_gate`]'s own `JAMMI_REQUIRE_FLASH_ORACLE`
-    /// gate, for the THIRD and FOURTH gates every flash-arm-vs-block-arm
-    /// oracle in this module checks before it can run:
-    /// `jammi_kernels::admission::FLASH_COMPILED` (was this build's
-    /// `jammi-kernels` compiled with `flash-attn`?) AND (M1b delta re-audit
-    /// finding F1-sibling, widened by the M3 plan) `device`'s own compute
-    /// capability is a MEMBER of `jammi_kernels::admission::
-    /// flash_validated_arches()` ([`flash_arch_ok`]) -- the `flash-attn` build's
-    /// kernels are compiled for an ENUMERATED arch set (sm80/86/89/90
-    /// today, same class the bench gate's own wrong-arch bug was, just
-    /// widened from a single exact match to set membership), so a
-    /// `flash-attn`-compiled BINARY running on a device OUTSIDE that set
-    /// (a V100, sm70, or a Jetson Orin, sm87) must ALSO skip rather than
-    /// dispatch into kernels this build never generated a cubin for --
-    /// without this check, every one of the nine call sites through this
-    /// helper would hard-FAIL its own live-dispatch-count assertions on
-    /// such a pod (`FLASH_COMPILED == true` alone is not "this device can
-    /// actually run it"). Without EITHER check, a build that compiled
-    /// without the feature, or runs on an unadmitted arch, reads every one
-    /// of those nine call sites GREEN with no escape hatch -- the exact
-    /// "fell back/skipped everywhere and it read as green" failure mode
-    /// `AdmissionMode::Strict` exists to prevent, just at the
-    /// FEATURE-COMPILATION/ARCH layer instead of the admission layer.
-    /// Returns `true` (caller proceeds) iff BOTH `FLASH_COMPILED` and
-    /// `flash_arch_ok(device)`; otherwise panics when `JAMMI_REQUIRE_FLASH`
-    /// is set (the pod lane exports it -- "must run the real flash arm"
-    /// means BOTH conditions, not compilation alone) or prints a skip
-    /// message NAMING which of the two failed (and the probed arch AND the
-    /// compiled set, on an arch mismatch) and returns `false`.
-    #[cfg(feature = "cuda")]
-    fn flash_compiled_or_skip(test_name: &str, device: &Device) -> bool {
-        let compiled = jammi_kernels::admission::FLASH_COMPILED;
-        if compiled {
-            if flash_arch_ok(device) {
-                return true;
-            }
-            let built = flash_validated_arches();
-            if std::env::var_os("JAMMI_REQUIRE_FLASH").is_some() {
-                panic!(
-                    "{test_name}: JAMMI_REQUIRE_FLASH is set but this device's compute \
-                     capability {:?} is not a member of the flash build's validated arch set \
-                     {built:?} (see flash_arch_ok's own doc) -- this lane must run the real \
-                     flash arm, not skip it",
-                    probe_cuda_compute_capability(device)
-                );
-            }
-            eprintln!(
-                "{test_name}: skipping — device compute capability {:?} is not a member of the \
-                 flash build's validated arch set {built:?}; see flash_arch_ok's own doc",
-                probe_cuda_compute_capability(device)
-            );
-            return false;
-        }
-        if std::env::var_os("JAMMI_REQUIRE_FLASH").is_some() {
-            panic!(
-                "{test_name}: JAMMI_REQUIRE_FLASH is set but this build's jammi-kernels was \
-                 compiled without the flash-attn feature (FLASH_COMPILED=false) -- this lane \
-                 must run the real flash arm, not skip it"
-            );
-        }
-        eprintln!(
-            "{test_name}: skipping — built without the flash-attn feature \
-             (FLASH_COMPILED=false); this test needs a real flash arm to compare against"
-        );
-        false
-    }
-
-    /// The panic arm of [`flash_compiled_or_skip`], pinned directly (not
-    /// only exercised transitively by the five real oracle call sites,
-    /// every one of which ALSO requires `JAMMI_FLASH_ORACLE_MODEL_DIR` to
-    /// even reach this gate). Only meaningful on a build where
-    /// `FLASH_COMPILED` is `false` (this crate's own default/no-`flash-attn`
-    /// test build): on a `flash-attn`-compiled build `flash_compiled_or_skip`
-    /// returns `true` before ever consulting `JAMMI_REQUIRE_FLASH`, so the
-    /// panic pinned here would be unreachable on that build — rather than
-    /// compiling and skipping at runtime, this test does not compile on a
-    /// `flash-attn`-compiled build at all.
-    /// Mutates the process-global `JAMMI_REQUIRE_FLASH` env var restored
-    /// via a `catch_unwind`/`set_var` pair, run single-threaded by this
-    /// crate's own pod convention (`--test-threads=1`) to avoid racing a
-    /// real oracle test that reaches the same gate concurrently. Passes
-    /// `&Device::Cpu` for the (F1-sibling audit fix's new) `device`
-    /// parameter -- irrelevant here: `FLASH_COMPILED == false` short-
-    /// circuits `flash_compiled_or_skip` before the arch check is ever
-    /// consulted, on ANY device.
-    #[test]
-    #[cfg(all(feature = "cuda", not(feature = "flash-attn")))]
-    fn flash_compiled_or_skip_panics_under_require_flash_when_not_compiled() {
-        // SAFETY-of-test: single env var, restored before returning either
-        // way (including on panic, via the `unwrap`/re-panic pattern
-        // below), and this crate's pod lane runs its test suite with
-        // `--test-threads=1`.
-        std::env::set_var("JAMMI_REQUIRE_FLASH", "1");
-        let result = std::panic::catch_unwind(|| {
-            flash_compiled_or_skip(
-                "flash_compiled_or_skip_panics_under_require_flash_when_not_compiled",
-                &Device::Cpu,
-            )
-        });
-        std::env::remove_var("JAMMI_REQUIRE_FLASH");
-        let err = result.expect_err(
-            "flash_compiled_or_skip must panic when JAMMI_REQUIRE_FLASH is set and \
-             FLASH_COMPILED is false",
-        );
-        let msg = err
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
-            .unwrap_or_default();
+    /// Asserts `device` can run the flash kernels this build compiled: its
+    /// compute capability is in `flash_validated_arches()`. The GPU lanes pin
+    /// exactly those arches, so any other device is the wrong host.
+    #[cfg(all(feature = "live-gpu-tests", feature = "flash-attn"))]
+    fn assert_flash_arch(device: &Device) {
         assert!(
-            msg.contains("JAMMI_REQUIRE_FLASH") && msg.contains("flash-attn"),
-            "panic message must name the env var and the missing feature: {msg}"
+            flash_arch_ok(device),
+            "this test needs a device in flash_validated_arches() {:?}; this one is {:?}",
+            flash_validated_arches(),
+            probe_cuda_compute_capability(device)
         );
-
-        // No env var set: must skip (return false), not panic.
-        std::env::remove_var("JAMMI_REQUIRE_FLASH");
-        assert!(!flash_compiled_or_skip(
-            "flash_compiled_or_skip_panics_under_require_flash_when_not_compiled",
-            &Device::Cpu,
-        ));
-    }
-
-    /// M1b delta re-audit finding F1-sibling's OWN regression test: the NEW
-    /// arch-mismatch branch [`flash_compiled_or_skip`] added. Deliberately
-    /// CPU-hermetic-in-EFFECT even though it requires a `flash-attn`
-    /// build to compile (`FLASH_COMPILED` must be `true` to even REACH the
-    /// arch check): passing `&Device::Cpu` makes
-    /// [`flash_arch_ok`]/`probe_cuda_compute_capability` deterministically
-    /// report "not a member of the validated arch set" WITHOUT needing real
-    /// off-arch hardware (a V100, sm70, or a Jetson Orin, sm87 -- an L40S
-    /// or H100 no longer illustrates a mismatch here: the M3 plan's D1
-    /// widened the compiled set to include sm89/sm90) to prove the branch
-    /// fires correctly -- mirrors
-    /// [`flash_compiled_or_skip_panics_under_require_flash_when_not_compiled`]'s
-    /// own structure for the SIBLING (not-compiled) branch.
-    #[test]
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
-    fn flash_compiled_or_skip_panics_under_require_flash_when_arch_mismatched() {
-        // SAFETY-of-test: same single-env-var/catch_unwind/restore
-        // discipline as the not-compiled sibling above, same pod
-        // `--test-threads=1` convention.
-        std::env::set_var("JAMMI_REQUIRE_FLASH", "1");
-        let result = std::panic::catch_unwind(|| {
-            flash_compiled_or_skip(
-                "flash_compiled_or_skip_panics_under_require_flash_when_arch_mismatched",
-                &Device::Cpu,
-            )
-        });
-        std::env::remove_var("JAMMI_REQUIRE_FLASH");
-        let err = result.expect_err(
-            "flash_compiled_or_skip must panic when JAMMI_REQUIRE_FLASH is set and the device \
-             is not a member of the validated arch set (Device::Cpu deterministically fails \
-             flash_arch_ok)",
-        );
-        let msg = err
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
-            .unwrap_or_default();
-        assert!(
-            msg.contains("JAMMI_REQUIRE_FLASH") && msg.contains("compute capability"),
-            "panic message must name the env var and the arch mismatch: {msg}"
-        );
-
-        // No env var set: must skip (return false), not panic.
-        std::env::remove_var("JAMMI_REQUIRE_FLASH");
-        assert!(!flash_compiled_or_skip(
-            "flash_compiled_or_skip_panics_under_require_flash_when_arch_mismatched",
-            &Device::Cpu,
-        ));
     }
 
     /// A deterministic (SplitMix64-derived) token-id batch, `vocab`-bounded
     /// and `seed`-keyed -- every arm below is driven by the exact SAME
     /// `input_ids` for a given `(batch, seq, seed)`.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn flash_oracle_synthetic_ids(
         batch: usize,
         seq: usize,
@@ -5689,7 +5436,7 @@ mod tests {
     /// DISTINCT odd constant from [`flash_oracle_synthetic_ids`]'s own, so
     /// the token-id draw and the cotangent draw never correlate at the
     /// same seed. Values in `[-1, 1)`.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn flash_oracle_seeded_dy(batch: usize, hidden: usize, seed: u64, device: &Device) -> Tensor {
         let mut state = seed ^ 0xD1B5_4A32_D192_ED03;
         let mut values = Vec::with_capacity(batch * hidden);
@@ -5712,7 +5459,7 @@ mod tests {
     /// whether `forward_hidden` reaches the admission cascade at all
     /// (`true`) or takes the always-eager eval composition (`false` -- the
     /// F32 reference's own arm).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn flash_oracle_build_model(
         config: &ModernBertConfig,
         weights: &std::path::Path,
@@ -5762,7 +5509,7 @@ mod tests {
     /// [`forward_hidden_forcing_flash_decision`] instead. `#[cfg(feature =
     /// "cuda")]`: every call site is a CUDA-gated test (the block-arm vs.
     /// flash-arm comparison only means something on a real CUDA device).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn forward_hidden_forcing_flash(
         model: &ModernBert,
         input_ids: &Tensor,
@@ -5797,7 +5544,7 @@ mod tests {
     /// bit-identity anchor proving this whole harness has not drifted from
     /// production (see `flash_arm_fault_harness_nofault_matches_production_bit_identical`
     /// below).
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    #[cfg(all(feature = "live-gpu-tests", feature = "flash-attn"))]
     enum FlashFault {
         /// No injection at all -- exactly production's
         /// `forward_flash_dense_attention` composition.
@@ -5820,7 +5567,7 @@ mod tests {
     /// flash-`Holds`-eligible (asserted up front) -- this harness does not
     /// implement the block-arm fallback, since its whole point is to
     /// characterize the flash arm's OWN fault surface.
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    #[cfg(all(feature = "live-gpu-tests", feature = "flash-attn"))]
     fn forward_hidden_flash_with_fault(
         model: &ModernBert,
         input_ids: &Tensor,
@@ -5941,7 +5688,7 @@ mod tests {
     /// covered at the op level, where the window is a per-call parameter,
     /// by `jammi-kernels`' own
     /// `tests/cuda_parity.rs::flash_upstream_acceptance_form_red_control_bwd_only_window_dropped_cuda`.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn flash_oracle_wqkv_lora_b(model: &ModernBert) -> &Tensor {
         let last = model
             .layers
@@ -5963,7 +5710,7 @@ mod tests {
     /// (identically `batch`, gradient identically zero -- see this
     /// section's own block comment, defect 1). Returns `(pooled embedding,
     /// dL/d(last layer Wqkv LoRA B))`, both `F32`, flattened.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn flash_oracle_pooled_and_grad(
         model: &ModernBert,
         hidden: &Tensor,
@@ -6001,7 +5748,7 @@ mod tests {
     /// real SIGNAL (`sum|reference| > 0`) before dividing -- the exact
     /// check that would have caught this section's own vacuous-loss defect
     /// (defect 1 above) the moment it shipped.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn relative_l1_error(arm: &[f32], reference: &[f32]) -> f64 {
         assert_eq!(
             arm.len(),
@@ -6053,7 +5800,7 @@ mod tests {
     /// matters for a LoRA training step, and is what the grad leg uses
     /// below. Same affirmative-finite-first (guide §3.7) and signal-assert
     /// (both norms `> 0`) discipline as [`relative_l1_error`].
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn cosine_distance(arm: &[f32], reference: &[f32]) -> f64 {
         assert_eq!(
             arm.len(),
@@ -6094,7 +5841,7 @@ mod tests {
     /// finiteness check first (guide §3.7) and a `total_cmp` fold (family
     /// J: float `max`/`min` combinators are NaN-blind -- `f64::max(NaN, x)
     /// == x`, silently dropping the NaN rather than failing).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn mean_max(values: &[f64]) -> (f64, f64) {
         assert!(!values.is_empty(), "mean_max: empty slice");
         let non_finite = values.iter().filter(|v| !v.is_finite()).count();
@@ -6115,7 +5862,7 @@ mod tests {
     /// [`relative_l1_error`]; grad uses [`cosine_distance`] (see that
     /// function's own doc for why the grad leg needs a scale-invariant
     /// metric).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     #[derive(Clone, Copy, Debug)]
     struct FlashOracleSeedMeasurement {
         seed: u64,
@@ -6125,7 +5872,7 @@ mod tests {
         grad_block: f64,
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     impl FlashOracleSeedMeasurement {
         fn pooled_ratio(&self) -> f64 {
             self.pooled_other / self.pooled_block
@@ -6143,7 +5890,7 @@ mod tests {
     /// forward+backward is real training-step memory, and holding more
     /// than one arm's graph alive at once OOM'd on an 80GB A100, confirmed
     /// live).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn flash_oracle_measure_arm<B, F>(
         build: B,
         forward: F,
@@ -6167,7 +5914,7 @@ mod tests {
     /// [`FlashOracleSeedMeasurement`] per seed, printed as it goes
     /// (`--nocapture`) so the full per-seed table is always visible, not
     /// just the reduced statistic.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     #[allow(clippy::too_many_arguments)]
     fn flash_oracle_sweep<BO, FO>(
         config: &ModernBertConfig,
@@ -6236,7 +5983,7 @@ mod tests {
     /// (this round's own committed `2026-08-25-flash-arm-encoder-oracle-*.json`
     /// artifact is built FROM this output), not just the reduced mean/max
     /// statistic.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn print_seed_ratio_table(label: &str, measurements: &[FlashOracleSeedMeasurement]) {
         for m in measurements {
             eprintln!(
@@ -6256,7 +6003,7 @@ mod tests {
     /// [`FLASH_ORACLE_K_MEAN_GRAD`] -- there is no per-seed MAX assertion
     /// (see [`FLASH_ORACLE_K_MEAN_GRAD`]'s own doc for why one existed
     /// before and was deleted).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn run_flash_oracle_shape_sweep(
         config: &ModernBertConfig,
         weights: &std::path::Path,
@@ -6322,7 +6069,7 @@ mod tests {
     /// sampler polls through `nvidia-smi`, just called in-process so it can
     /// be interleaved with individual layer forwards rather than only
     /// sampled on a background thread. Returns free memory in MiB.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn cuda_free_mib(device: &Device) -> f64 {
         device
             .synchronize()
@@ -6336,7 +6083,7 @@ mod tests {
     /// the OTHER half of its `(free, total)` pair — this device's TOTAL
     /// installed memory in MiB, a fixed hardware property (not a
     /// currently-free reading). [`vram_capable_or_skip`]'s own probe.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn cuda_total_mib(device: &Device) -> f64 {
         device
             .synchronize()
@@ -6366,58 +6113,21 @@ mod tests {
     /// between two confirmed data points, not a precisely-derived one; a
     /// future SKU landing between 48 and 80 GiB would need its own real
     /// measurement to place this floor more precisely.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     const FLASH_ORACLE_ENCODER_LEVEL_VRAM_FLOOR_MIB: f64 = 64.0 * 1024.0;
 
-    /// Capability gate for the four 80GB-class encoder-level real-checkpoint
-    /// oracles — NOT an admission-fence concern (this has nothing to do
-    /// with `jammi_kernels::admission::flash_validated_arches()`/arch
-    /// admission; it is a VRAM-CAPACITY requirement on one specific test
-    /// FIXTURE). Round-2 pod finding 1: these four tests ran as four
-    /// CONCURRENT threads and all died with `CUDA_ERROR_OUT_OF_MEMORY` at
-    /// model-load; a SERIALIZED (`--test-threads=1`) solo rerun STILL
-    /// OOM'd on both L40S and A40 with the device otherwise fully empty —
-    /// refuting an earlier concurrency-lock theory. The actual cause is
-    /// already documented on [`flash_oracle_measure_arm`]: "production-scale
-    /// ModernBERT-large (28 layers, hidden=1024) at forward+backward is
-    /// real training-step memory, and holding more than one arm's graph
-    /// alive at once OOM'd on an 80GB A100, confirmed live" — this
-    /// fixture's footprint is 80GB-CLASS BY DESIGN, not a bug; a 48 GiB
-    /// SKU is STRUCTURALLY unable to run it, the same class of limit as a
-    /// device below compute capability 8.0 being unable to run bf16
-    /// tensor-core kernels at all.
-    ///
-    /// Returns `true` (caller proceeds) iff the device's TOTAL memory
-    /// meets [`FLASH_ORACLE_ENCODER_LEVEL_VRAM_FLOOR_MIB`]. FAIL-CLOSED
-    /// semantics, mirroring [`flash_compiled_or_skip`]'s own convention:
-    /// - Below the floor: ALWAYS skips, with a VRAM-specific named reason
-    ///   distinct from `flash_oracle_require_gate`'s model-dir-missing
-    ///   message — this fires REGARDLESS of `JAMMI_REQUIRE_FLASH_ORACLE`.
-    ///   Forcing this onto genuinely incapable hardware would be
-    ///   dishonest, not strict: the require-gate's OWN purpose (catch a
-    ///   lane that silently skipped on hardware that COULD have run it)
-    ///   does not apply to a lane that is structurally incapable — there
-    ///   is no "just try harder" available on a 48 GiB card.
-    /// - At or above the floor: ALWAYS proceeds — this function never
-    ///   itself skips a capable device, so `JAMMI_REQUIRE_FLASH_ORACLE`'s
-    ///   unrun-is-RED force still applies on genuinely 80GB-class lanes
-    ///   (A100, H100) via the caller's OTHER gates
-    ///   (`flash_oracle_require_gate`/`flash_compiled_or_skip`, both
-    ///   already run before this one at every call site).
-    #[cfg(feature = "cuda")]
-    fn vram_capable_or_skip(test_name: &str, device: &Device) -> bool {
+    /// Asserts `device` has the memory the encoder-level real-checkpoint
+    /// oracles need: one arm of production-scale ModernBERT-large at
+    /// forward+backward is 80GB-class training-step memory, so a 48 GiB card
+    /// cannot hold it.
+    #[cfg(feature = "live-flash-oracle-tests")]
+    fn assert_vram_floor(device: &Device) {
         let total_mib = cuda_total_mib(device);
-        if total_mib >= FLASH_ORACLE_ENCODER_LEVEL_VRAM_FLOOR_MIB {
-            return true;
-        }
-        eprintln!(
-            "{test_name}: skipping — device total memory {total_mib:.0} MiB is below this \
-             fixture's {FLASH_ORACLE_ENCODER_LEVEL_VRAM_FLOOR_MIB:.0} MiB floor; this is an \
-             80GB-class real-checkpoint oracle BY DESIGN (flash_oracle_measure_arm's own doc: \
-             holding one arm's full ModernBERT-large fwd+bwd graph alive needs 80GB-class VRAM) \
-             -- a 48GB-class SKU is structurally unable to run it, not merely slow at it"
+        assert!(
+            total_mib >= FLASH_ORACLE_ENCODER_LEVEL_VRAM_FLOOR_MIB,
+            "this test needs at least {FLASH_ORACLE_ENCODER_LEVEL_VRAM_FLOOR_MIB:.0} MiB of \
+             device memory; this device has {total_mib:.0} MiB"
         );
-        false
     }
 
     /// Per-layer VRAM attribution probe (numerics write-owner round closing
@@ -6442,7 +6152,7 @@ mod tests {
     /// `--nocapture` output; this function asserts nothing -- it is a
     /// diagnostic tool, not an oracle (the calling test's own dispatch
     /// count assertion is the oracle that the intended arm actually ran).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn forward_hidden_forcing_flash_vram_probe(
         model: &ModernBert,
         input_ids: &Tensor,
@@ -6527,15 +6237,10 @@ mod tests {
     /// [`run_flash_oracle_shape_sweep`]'s own precedent, so one arm's
     /// retained graph cannot skew the other's baseline.
     #[test]
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-flash-oracle-tests")]
     fn flash_vs_block_per_layer_vram_attribution_probe_cuda() {
-        let Ok(model_dir) = std::env::var("JAMMI_FLASH_ORACLE_MODEL_DIR") else {
-            flash_oracle_require_gate("flash_vs_block_per_layer_vram_attribution_probe_cuda");
-            return;
-        };
-        let Some(cuda) = growth_oracle_cuda_device() else {
-            return;
-        };
+        let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
+        let cuda = jammi_test_resources::cuda_device(0);
         // Class-sweep addition (round-2 pod finding 1's own enumeration,
         // beyond the four tests the fix was originally scoped to): this
         // test builds a REAL ModernBERT-large model at the SAME (8, 512)
@@ -6559,15 +6264,8 @@ mod tests {
         // `JAMMI_REQUIRE_FLASH` exactly as it always has; `vram_capable_or_skip`
         // is a genuinely ADDITIONAL, never-forceable gate evaluated only
         // when the first one passes.
-        if !flash_compiled_or_skip(
-            "flash_vs_block_per_layer_vram_attribution_probe_cuda",
-            &cuda,
-        ) || !vram_capable_or_skip(
-            "flash_vs_block_per_layer_vram_attribution_probe_cuda",
-            &cuda,
-        ) {
-            return;
-        }
+        assert_flash_arch(&cuda);
+        assert_vram_floor(&cuda);
         let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
@@ -6639,29 +6337,17 @@ mod tests {
     /// `JAMMI_REQUIRE_FLASH_ORACLE` turns a missing `JAMMI_FLASH_ORACLE_MODEL_DIR`
     /// into a hard failure too (`flash_oracle_require_gate`'s own contract).
     #[test]
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-flash-oracle-tests")]
     fn flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16() {
-        let Ok(model_dir) = std::env::var("JAMMI_FLASH_ORACLE_MODEL_DIR") else {
-            flash_oracle_require_gate("flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16");
-            return;
-        };
-        let Some(cuda) = growth_oracle_cuda_device() else {
-            return;
-        };
+        let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
+        let cuda = jammi_test_resources::cuda_device(0);
         // KO-7 note: see `flash_vs_block_per_layer_vram_attribution_probe_cuda`'s
         // own comment for why this is ONE compound `if`/`return` rather
         // than two sequential ones (the registered `flash_compiled_or_skip`
         // call must be textually present in this single skip's own
         // window; `vram_capable_or_skip` is deliberately unregistrable).
-        if !flash_compiled_or_skip(
-            "flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16",
-            &cuda,
-        ) || !vram_capable_or_skip(
-            "flash_arm_encoder_level_three_way_oracle_dense_cuda_bf16",
-            &cuda,
-        ) {
-            return;
-        }
+        assert_flash_arch(&cuda);
+        assert_vram_floor(&cuda);
         let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
@@ -6687,27 +6373,15 @@ mod tests {
     /// stops being trustworthy -- they all inject faults into THIS
     /// harness, not into production directly.
     #[test]
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    #[cfg(feature = "live-flash-oracle-tests")]
     fn flash_arm_fault_harness_nofault_matches_production_bit_identical() {
-        let Ok(model_dir) = std::env::var("JAMMI_FLASH_ORACLE_MODEL_DIR") else {
-            flash_oracle_require_gate(
-                "flash_arm_fault_harness_nofault_matches_production_bit_identical",
-            );
-            return;
-        };
-        let Some(cuda) = growth_oracle_cuda_device() else {
-            return;
-        };
+        let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
+        let cuda = jammi_test_resources::cuda_device(0);
         let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !flash_compiled_or_skip(
-            "flash_arm_fault_harness_nofault_matches_production_bit_identical",
-            &cuda,
-        ) {
-            return;
-        }
+        assert_flash_arch(&cuda);
 
         let dir = std::path::PathBuf::from(&model_dir);
         let config: ModernBertConfig =
@@ -6751,26 +6425,14 @@ mod tests {
     /// bound the real oracle asserts above, on BOTH legs, in MEAN, over
     /// the SAME [`FLASH_ORACLE_SWEEP_SEEDS`].
     #[test]
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-flash-oracle-tests")]
     fn flash_arm_encoder_level_oracle_red_control_window_dropped() {
-        let Ok(model_dir) = std::env::var("JAMMI_FLASH_ORACLE_MODEL_DIR") else {
-            flash_oracle_require_gate("flash_arm_encoder_level_oracle_red_control_window_dropped");
-            return;
-        };
-        let Some(cuda) = growth_oracle_cuda_device() else {
-            return;
-        };
+        let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
+        let cuda = jammi_test_resources::cuda_device(0);
         // KO-7 note: see `flash_vs_block_per_layer_vram_attribution_probe_cuda`'s
         // own comment for why this is ONE compound `if`/`return`.
-        if !flash_compiled_or_skip(
-            "flash_arm_encoder_level_oracle_red_control_window_dropped",
-            &cuda,
-        ) || !vram_capable_or_skip(
-            "flash_arm_encoder_level_oracle_red_control_window_dropped",
-            &cuda,
-        ) {
-            return;
-        }
+        assert_flash_arch(&cuda);
+        assert_vram_floor(&cuda);
         let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
@@ -6816,7 +6478,7 @@ mod tests {
     /// oracle asserts above, on BOTH legs, in MEAN, over the SAME
     /// [`FLASH_ORACLE_SWEEP_SEEDS`].
     #[test]
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    #[cfg(feature = "live-flash-oracle-tests")]
     fn flash_arm_encoder_level_oracle_red_control_k_unrotated() {
         run_flash_arm_fault_red_control("k_unrotated_b8_s512", &FlashFault::KUnrotated);
     }
@@ -6825,7 +6487,7 @@ mod tests {
     /// comment above) must VIOLATE the same bound too, on BOTH legs, in
     /// MEAN, over the SAME [`FLASH_ORACLE_SWEEP_SEEDS`].
     #[test]
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    #[cfg(feature = "live-flash-oracle-tests")]
     fn flash_arm_encoder_level_oracle_red_control_bad_softmax_scale() {
         run_flash_arm_fault_red_control(
             "bad_softmax_scale_b8_s512",
@@ -6838,25 +6500,16 @@ mod tests {
     /// healthy oracle asserts against -- proving the oracle actually
     /// catches the fault as a DISTRIBUTION-level effect, not merely that
     /// it "looks wrong" on one lucky draw.
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    #[cfg(feature = "live-flash-oracle-tests")]
     fn run_flash_arm_fault_red_control(label: &str, fault: &FlashFault) {
-        let Ok(model_dir) = std::env::var("JAMMI_FLASH_ORACLE_MODEL_DIR") else {
-            flash_oracle_require_gate(label);
-            return;
-        };
-        let Some(cuda) = growth_oracle_cuda_device() else {
-            return;
-        };
-        if !vram_capable_or_skip(label, &cuda) {
-            return;
-        }
+        let model_dir = jammi_test_resources::env("JAMMI_FLASH_ORACLE_MODEL_DIR");
+        let cuda = jammi_test_resources::cuda_device(0);
+        assert_vram_floor(&cuda);
+        assert_flash_arch(&cuda);
         let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !flash_compiled_or_skip(label, &cuda) {
-            return;
-        }
 
         let dir = std::path::PathBuf::from(&model_dir);
         let config: ModernBertConfig =
@@ -6884,7 +6537,7 @@ mod tests {
     /// pooled ratio AND MEAN grad ratio, over [`FLASH_ORACLE_SWEEP_SEEDS`],
     /// must each exceed the healthy bound -- if either does not, the real
     /// oracle above would NOT have caught this defect on that leg.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn assert_red_control_violates_bound(label: &str, measurements: &[FlashOracleSeedMeasurement]) {
         print_seed_ratio_table(label, measurements);
         let pooled_ratios: Vec<f64> = measurements.iter().map(|m| m.pooled_ratio()).collect();
@@ -10359,28 +10012,6 @@ mod tests {
         );
     }
 
-    /// Mirrors `tests/cuda_parity.rs`'s own `cuda_device` (`jammi-kernels`):
-    /// a machine that compiled with the `cuda` feature but has no
-    /// physical GPU is "skip", not "fail", UNLESS `JAMMI_REQUIRE_CUDA` is
-    /// set, in which case device-acquisition failure panics rather than
-    /// silently reading as a skip.
-    #[cfg(feature = "cuda")]
-    fn growth_oracle_cuda_device() -> Option<Device> {
-        match Device::new_cuda(0) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                    panic!(
-                        "attention_block_fused_vs_eager_dqkv_divergence_grows_with_depth_bf16_cuda: \
-                         JAMMI_REQUIRE_CUDA is set but no CUDA device could be acquired: {e}"
-                    );
-                }
-                eprintln!("depth-growth oracle: skipping — no CUDA device available ({e})");
-                None
-            }
-        }
-    }
-
     /// P3 fix round 4, deliverable 1 (esc-044's phase-0.7 `symptom_spec`):
     /// a `.contiguous()`-restored regression is invisible to any SINGLE
     /// fused-vs-eager `bwd` call — its systematic bias is smaller than
@@ -10423,11 +10054,9 @@ mod tests {
     /// to it), so it exists only to catch the two `bf16` arms being wrong
     /// TOGETHER in some unrelated way — confirmation, never the gate.
     #[test]
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "live-gpu-tests")]
     fn attention_block_fused_vs_eager_dqkv_divergence_grows_with_depth_bf16_cuda() {
-        let Some(device) = growth_oracle_cuda_device() else {
-            return;
-        };
+        let device = jammi_test_resources::cuda_device(0);
         let _lock = crate::test_support::seam_counter_lock();
 
         const L_MAX: usize = 28; // the real ModernBERT-large depth this defect was found on.

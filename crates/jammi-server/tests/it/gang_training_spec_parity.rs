@@ -89,31 +89,24 @@ fn context_predictor_spec() -> TrainingSpec {
 /// default, `Decoded(DEFAULT_WORLD_SIZE)`.
 ///
 /// Parameterized over BOTH backends (the gap #566 named): the SQLite arm
-/// always; the Postgres arm against `JAMMI_TEST_PG_URL`, skipping (never
-/// failing) when it is unset — `jammi_test_utils::make_test_session`'s own
-/// contract, the same shape `jammi-db`'s `test_case`-parameterized gang
-/// tests use (this crate carries no `test_case` dev-dependency, so the two
-/// arms are two named test fns over one body). Job ids are unique per run:
+/// always; the Postgres arm under `live-postgres-tests`, against
+/// `JAMMI_TEST_PG_URL` (this crate carries no `test_case` dev-dependency, so
+/// the two arms are two named test fns over one body). Job ids are unique per run:
 /// the Postgres lane shares one database across the whole run.
 #[tokio::test]
 async fn get_job_for_rank_world_size_matches_the_real_training_spec_producer_sqlite() {
     parity_over(BackendKind::Sqlite).await;
 }
 
+#[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn get_job_for_rank_world_size_matches_the_real_training_spec_producer_postgres() {
-    if jammi_test_utils::pg_url_for_tests().is_none() {
-        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-        return;
-    }
     parity_over(BackendKind::Postgres).await;
 }
 
 async fn parity_over(kind: BackendKind) {
     let dir = tempfile::tempdir().unwrap();
-    let session = jammi_test_utils::make_test_session(kind, dir.path())
-        .await
-        .expect("the backend is available (the postgres arm skipped above when it is not)");
+    let session = jammi_test_utils::make_test_session(kind, dir.path()).await;
     let catalog = Arc::clone(session.catalog());
     let suffix = jammi_test_utils::unique_suffix();
     let world_two_id = format!("job-parity-world-two-{suffix}");

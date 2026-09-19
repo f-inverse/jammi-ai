@@ -653,10 +653,9 @@ jammi's math is right; its bf16 backward was 6.5× further from truth than torch
 
 Each rule cites the `cuda-kernel-guide.md` §3 discipline it is an instance of, the
 kernel-oracle-standard id (`KO-1`..`KO-8`, `cuda-kernel-guide.md` §3) that covers it, and the
-escape that paid for it. The standard's mechanical subset is live in CI: `KO-2`/`KO-5`/`KO-7`
-are enforced by `ci/scripts/check_kernel_oracles.py` (a guard in `ci/guards.toml`), `KO-3` by
-`ci/scripts/check_cuda_run_artifacts.py` (optional per artifact leg); `KO-1`/`KO-4`/`KO-6`/`KO-8` are
-auditor-only by design (each needs running code or a judgment a static scan cannot make). A rule
+escape that paid for it. `KO-7` holds by construction (a GPU test is compiled only under a
+`live-*` feature and cannot obtain "no device"), `KO-3` is checked per artifact by
+`ci/scripts/check_cuda_run_artifacts.py`, and the rest are held in review. A rule
 with no close §3 analog (2, 12 — this guide's own additions, not folded into the kernel guide)
 prints `—` in the guide column; a rule whose substance no KO id mechanizes prints
 "judgment-level" in the KO column.
@@ -670,7 +669,7 @@ prints `—` in the guide column; a rule whose substance no KO id mechanizes pri
 | 5 | No absolute floors — bounds are per element and relative, with any near-zero floor *measured* from the same run | §3.8 no absolute ULP floor | KO-3 (check_cuda_run_artifacts.py, optional per artifact leg) | the pre-#386 bf16 legs bounded with a fixed floor for every element below 1.0; esc-044's signature fit inside it |
 | 6 | Bounds hold off-sample, not fitted to the seeds on hand | §3.2 key the oracle on growth against the same run's own r(1), never a fitted constant | KO-5 (check_kernel_oracles.py) | the FA2 encoder oracle's seed-fitted bounds gave false RED on fresh seeds and overlapped the mutants; deleted, not re-fitted |
 | 7 | Live signal — the fixture's own cotangent/gradient must be nonzero before a mutant can be seen | §3.5 zero dispatch is RED (same failure shape one level up: a leg that cannot register a defect) | KO-6 (auditor-only — a static scan cannot evaluate a tensor norm) | a gradient leg's loss was identically the batch size; a real mutant *improved* and passed; fixed with a seed-keyed random cotangent and a nonzero reference sum |
-| 8 | Unrun is RED — a GPU-less host must never silently pass as green | §3.5 zero dispatch is RED | KO-7 (check_kernel_oracles.py, total over every scanned file) | CUDA tests skip on a GPU-less host unless `JAMMI_REQUIRE_CUDA`/`JAMMI_REQUIRE_FLASH` is set, in which case a missing device panics instead of reading green |
+| 8 | Unrun is RED — a GPU-less host must never silently pass as green | §3.5 zero dispatch is RED | KO-7 (by construction) | a GPU test compiles only under `live-gpu-tests` and acquires its device through `jammi-test-resources`, so without a device it fails instead of reading green |
 | 9 | Producers for every number — a doc comment or artifact must cite what produced it | §3.9 no number without a producer | KO-4 (auditor-only) | the repo's only committed b8·s512 artifact once provenanced the *defective* pre-esc-044 build |
 | 10 | The two-term Higham bound, per leg — a relative term plus an absolute term at the operands' own scale | §3.8 no absolute ULP floor (the two-term form is how the floor is derived, not assumed) | KO-3 (the §3.8 family; the two-term derivation itself is auditor judgment) | one shared absolute term dominated the elementwise legs until split by reduction term count |
 | 11 | Cotangent fixtures — fixed, sign-mixed, production-amplitude, never `dy = 1` | §3.4 test at production shape and amplitude | judgment-level (§3.4 carries no KO id; the vacuous-cotangent failure it prevents is KO-6's territory) | under `dy = 1`, LayerNorm's centered backward is identically zero and the leg compared 0.0 to 0.0 |

@@ -11,11 +11,9 @@ use jammi_db::store::CachePolicy;
 use tempfile::TempDir;
 
 use crate::harness;
-use crate::skip_without_gpu;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn generate_embeddings_cpu_gpu_parity() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     let model = harness::local_model_id("tiny_bert");
 
@@ -82,7 +80,6 @@ async fn generate_embeddings_cpu_gpu_parity() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn encode_query_cpu_gpu_parity() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     let model = harness::local_model_id("tiny_bert");
     let query = "a method for quantum error correction in superconducting qubits";

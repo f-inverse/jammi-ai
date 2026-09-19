@@ -15,19 +15,19 @@
 //! `order_column = _offset`) that emits `ORDER BY _offset, _row_idx`,
 //! pinning intra-batch row order exactly.
 //!
-//! Parameterised over both backends per the parity suite's require-gate
-//! shape (`recovery.rs`): SQLite always runs; Postgres runs when
-//! `JAMMI_TEST_PG_URL` is set (`JAMMI_REQUIRE_PG` turns an unset URL into a
-//! hard failure rather than a silent skip).
+//! Parameterised over both backends: SQLite always runs; Postgres runs under
+//! `live-postgres-tests`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use jammi_db::catalog::backend::{BackendImpl, BackendKind};
+#[cfg(feature = "live-postgres-tests")]
+use jammi_db::catalog::backend::BackendImpl;
+use jammi_db::catalog::backend::BackendKind;
+#[cfg(feature = "live-postgres-tests")]
 use jammi_db::catalog::backend_postgres::PostgresBackend;
-use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::catalog::topic_repo::TopicRepo;
 use jammi_db::catalog::Catalog;
 use jammi_db::source::mutable::MutableTableRegistry;
@@ -50,24 +50,7 @@ fn topic_schema() -> SchemaRef {
 #[tokio::test]
 async fn intra_batch_row_order_survives_replay(backend: BackendKind) {
     let dir = tempfile::tempdir().unwrap();
-    let backend_impl = match backend {
-        BackendKind::Sqlite => {
-            let sqlite = SqliteBackend::open(&dir.path().join("catalog.db"))
-                .await
-                .unwrap();
-            BackendImpl::Sqlite(sqlite)
-        }
-        BackendKind::Postgres => {
-            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                return;
-            };
-            let pg = PostgresBackend::open_with_options(&url, 8, None)
-                .await
-                .unwrap();
-            BackendImpl::Postgres(pg)
-        }
-    };
+    let backend_impl = jammi_test_utils::open_backend(backend, dir.path()).await;
     backend_impl.migrate().await.unwrap();
 
     let tenant_binding = TenantBinding::unscoped();
@@ -187,16 +170,10 @@ async fn intra_batch_row_order_survives_replay(backend: BackendKind) {
 /// region or otherwise preserve scan order, and is not expected to reorder
 /// the same way -- not claimed as evidence here; the escape row's
 /// evidence is the Postgres run above.
+#[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn intra_batch_row_order_survives_update_churn_on_an_early_row_postgres() {
-    let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-        eprintln!(
-            "skipping intra_batch_row_order_survives_update_churn_on_an_early_row_postgres: \
-             JAMMI_TEST_PG_URL unset"
-        );
-        return;
-    };
-    let pg = PostgresBackend::open_with_options(&url, 8, None)
+    let pg = PostgresBackend::open_with_options(&jammi_test_utils::postgres_url(), 8, None)
         .await
         .unwrap();
     let backend_impl = BackendImpl::Postgres(pg);

@@ -71,3 +71,14 @@ cuda = ["jammi-ai/cuda"]
 # crate's `--all-features` selection on the same verified 1:1 idiom as
 # `jammi-encoders`'s own `flash-attn` entry.
 flash-attn = ["jammi-ai/flash-attn"]
+# Compiles the tests that need CUDA device 0: the padded-transport legs, which
+# run this binary on the device and read its report.
+live-gpu-tests = ["cuda"]
+
+[dev-dependencies]
+jammi-test-resources.workspace = true
+
+[[test]]
+name = "finetune_step_padded_cuda"
+path = "tests/finetune_step_padded_cuda.rs"
+required-features = ["live-gpu-tests"]

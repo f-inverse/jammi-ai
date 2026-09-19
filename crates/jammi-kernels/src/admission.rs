@@ -2445,61 +2445,24 @@ mod tests {
         assert!(!ComputeCapability::new(0, 0).meets_minimum());
     }
 
-    /// Panics if `JAMMI_REQUIRE_FLASH` is set, since a caller in that lane
-    /// must not be allowed to silently skip the flash-arm assertions.
-    #[cfg(test)]
-    fn require_flash_compiled_or_skip(test_name: &str) {
-        if std::env::var_os("JAMMI_REQUIRE_FLASH").is_some() {
-            panic!(
-                "{test_name}: JAMMI_REQUIRE_FLASH is set but this build's jammi-kernels was \
-                 compiled without the flash-attn feature (FLASH_COMPILED=false) -- this lane \
-                 must run the real flash arm, not skip it"
-            );
-        }
+    /// Without `flash-attn` no flash kernel is compiled, so no arch is built.
+    #[cfg(not(feature = "flash-attn"))]
+    #[test]
+    fn flash_built_arches_is_empty_without_flash_attn() {
+        let arches = flash_built_arches();
+        assert!(
+            arches.is_empty(),
+            "flash-attn not compiled: flash_built_arches() must be empty, not {arches:?}"
+        );
     }
 
-    /// The `flash_built_arches()` ACCESSOR's own behavior under this crate's
-    /// default (no `flash-attn`) test build: `arches.is_empty()` here proves
-    /// only that the `FLASH_COMPILED` gate degrades correctly (M3 plan v2
-    /// delta 3) — it does NOT, by itself, prove `GENCODE_ARCHES` still pins
-    /// the intended sm80/86/89/90 set, because the early `return` below
-    /// skips the pinned-set assertion entirely whenever this crate's own
-    /// `flash-attn` feature is off (every hermetic default-feature lane,
-    /// which is every lane this agent's own local run and most of CI take).
-    /// A round-2 audit (mutant: `GENCODE_ARCHES` rewritten to
-    /// `sm_70/sm_80/sm_86` — a REGRESSION, dropping a pre-Ampere floor
-    /// violation in AND dropping 89/90) proved this test alone stayed GREEN
-    /// against that mutant in the hermetic lane: an earlier revision of
-    /// this doc comment claimed this test was what pins the set "in every
-    /// hermetic CI/laptop run" — that claim was WRONG. The actual hermetic
-    /// pin, which DOES run (and DOES go red on that exact mutant) in every
-    /// feature configuration including this crate's default build, is
-    /// [`gencode_smss_env_var_matches_the_pinned_build_rs_set`] below — see
-    /// that test's own doc for why `env!()` makes it possible.
-    ///
-    /// Panics rather than silently letting this test skip its
-    /// exact-pinned-arch-set assertions when `JAMMI_REQUIRE_FLASH` is set
-    /// but this build was not compiled with the `flash-attn` feature
-    /// (`FLASH_COMPILED == false`) — mirrors `jammi_encoders::modernbert`'s
-    /// own `flash_compiled_or_skip` gate (same env var, same "this lane
-    /// must run the real flash arm, not skip it" rationale), narrowed here
-    /// to the feature-compilation check alone via
-    /// [`require_flash_compiled_or_skip`]: this test has no device to
-    /// probe, `flash_built_arches()` is a pure compile-time accessor, so
-    /// there is no arch-membership half to check.
+    /// With `flash-attn`, the built set is exactly sm80/86/89/90, every one of
+    /// them Ampere-or-newer. [`gencode_smss_env_var_matches_the_pinned_build_rs_set`]
+    /// pins the same set in every build.
+    #[cfg(feature = "flash-attn")]
     #[test]
-    fn flash_built_arches_degrades_to_empty_without_flash_compiled() {
+    fn flash_built_arches_is_the_pinned_set_with_flash_attn() {
         let arches = flash_built_arches();
-        if !FLASH_COMPILED {
-            assert!(
-                arches.is_empty(),
-                "flash-attn not compiled: flash_built_arches() must be empty, not {arches:?}"
-            );
-            require_flash_compiled_or_skip(
-                "flash_built_arches_degrades_to_empty_without_flash_compiled",
-            );
-            return;
-        }
         let want = [
             ComputeCapability::new(8, 0),
             ComputeCapability::new(8, 6),
@@ -2513,11 +2476,6 @@ mod tests {
                 "{arch:?} must meet MIN_CUDA_COMPUTE_CAP -- every compiled arch is Ampere-or-newer"
             );
         }
-        assert_eq!(
-            arches.iter().min().copied(),
-            Some(ComputeCapability::new(8, 0)),
-            "sm80 is the true floor of the compiled set"
-        );
     }
 
     /// THE hermetic pin on `build.rs::GENCODE_ARCHES` — round-2 audit
@@ -2814,57 +2772,9 @@ mod tests {
         assert!(!FLASH_COMPILED || CUDA_COMPILED);
     }
 
-    /// Acquire a Metal device for [`device_is_supported_rejects_metal`]'s
-    /// own `metal`-feature-only leg, or `None` to skip — unless
-    /// `JAMMI_REQUIRE_METAL` is set, in which case a device-acquisition
-    /// failure PANICS. Wraps `Device::new_metal(0)` in
-    /// `std::panic::catch_unwind`, mirroring `tests/metal_parity.rs`'s own
-    /// `metal_device_or_skip`: on at least one real GH `macos-14` runner
-    /// `Device::new_metal(0)` does not merely return `Err` on a
-    /// missing/broken device — an `objc2` class lookup inside
-    /// candle-metal-kernels' `residency_set.rs:18`
-    /// (`MTLResidencySetDescriptor`) can PANIC instead, a probe-time
-    /// failure mode a bare `Result` cannot model. Catching that panic here
-    /// is sound for the same reason `tests/metal_parity.rs`'s own doc
-    /// gives: the probe owns no lock and mutates no shared state before
-    /// failing, so unwinding out of it leaves nothing poisoned to clean
-    /// up. Both failure shapes (a returned `Err`, or a caught panic) fold
-    /// into the same skip/require decision below.
-    #[cfg(all(test, feature = "metal"))]
-    fn metal_device_or_skip(test_name: &str) -> Option<Device> {
-        let outcome: std::result::Result<Device, String> =
-            match std::panic::catch_unwind(|| Device::new_metal(0)) {
-                Ok(Ok(d)) => Ok(d),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(payload) => {
-                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                        (*s).to_string()
-                    } else if let Some(s) = payload.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "<non-string panic payload>".to_string()
-                    };
-                    Err(format!("Device::new_metal(0) panicked: {msg}"))
-                }
-            };
-        match outcome {
-            Ok(d) => Some(d),
-            Err(msg) => {
-                if std::env::var_os("JAMMI_REQUIRE_METAL").is_some() {
-                    panic!(
-                        "{test_name}: JAMMI_REQUIRE_METAL is set but no Metal device is \
-                         available: {msg}"
-                    );
-                }
-                eprintln!(
-                    "{test_name}: no Metal device available in this build/host -- skipping the \
-                     Metal leg"
-                );
-                None
-            }
-        }
-    }
-
+    // A build with `metal` on can only construct a real Metal device, which
+    // needs a Metal host; without `metal`, candle's unit `MetalDevice` stands in.
+    #[cfg(any(not(feature = "metal"), feature = "live-metal-tests"))]
     #[test]
     fn device_is_supported_rejects_metal() {
         // `device_is_supported` must reject `Device::Metal` STRUCTURALLY —
@@ -2880,9 +2790,7 @@ mod tests {
         // is the one place that legitimately needs a `cfg` branch. Mirrors
         // `jammi_encoders::layer_norm::tests::device_is_supported_rejects_metal`.
         #[cfg(feature = "metal")]
-        let Some(metal) = metal_device_or_skip("device_is_supported_rejects_metal") else {
-            return;
-        };
+        let metal = jammi_test_resources::metal_device();
         #[cfg(not(feature = "metal"))]
         let metal = Device::Metal(candle_core::MetalDevice);
         assert!(!device_is_supported(&metal));

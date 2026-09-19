@@ -57,53 +57,9 @@
 //! `ci/kernel-oracle-helpers.txt` (KO-7 gating is `(file, fn)`-scoped, so a
 //! same-named helper in one file never gates another file's skips).
 
-#![cfg(feature = "metal")]
-
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, VarBuilder, VarMap};
 use jammi_lora::{LoraInitMode, LoraLinear};
-
-/// A panic payload folded to a human-readable string — see
-/// `metal_parity.rs`'s identically-named helper for why only `&str`/
-/// `String` downcasts are needed.
-fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "<non-string panic payload>".to_string()
-    }
-}
-
-/// Acquire a Metal device, or `None` to skip — unless `JAMMI_REQUIRE_METAL`
-/// is set, in which case a failure PANICS. See `metal_parity.rs`'s
-/// identically-shaped `metal_device_or_skip` for the full rationale (this
-/// file registers its OWN copy in `ci/kernel-oracle-helpers.txt`, per that
-/// registry's `(file, fn)`-scoping).
-fn metal_device_or_skip() -> Option<Device> {
-    let outcome: Result<Device, String> = match std::panic::catch_unwind(|| Device::new_metal(0)) {
-        Ok(Ok(d)) => Ok(d),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(payload) => Err(format!(
-            "Device::new_metal(0) panicked: {}",
-            panic_payload_to_string(payload.as_ref())
-        )),
-    };
-    match outcome {
-        Ok(d) => Some(d),
-        Err(msg) => {
-            if std::env::var_os("JAMMI_REQUIRE_METAL").is_some() {
-                panic!(
-                    "metal_dropout_position: JAMMI_REQUIRE_METAL is set but no Metal device is \
-                     available: {msg}"
-                );
-            }
-            eprintln!("metal_dropout_position: skipping — no Metal device available: {msg}");
-            None
-        }
-    }
-}
 
 /// Deterministic, non-degenerate base weight — same construction every
 /// call, mirroring `fused_epilogue.rs`'s own `build_base` (family L: a
@@ -128,9 +84,7 @@ fn ones_input(device: &Device) -> Tensor {
 /// the `i`-th successful forward, for `N` forwards in a row.
 #[test]
 fn metal_successful_train_forwards_advance_dropout_position_by_exactly_one_each() {
-    let Some(device) = metal_device_or_skip() else {
-        return;
-    };
+    let device = jammi_test_resources::metal_device();
     const N: u64 = 5;
 
     let base = build_base(8, 16, &device);
@@ -185,9 +139,7 @@ fn metal_successful_train_forwards_advance_dropout_position_by_exactly_one_each(
 /// this file's module doc).
 #[test]
 fn metal_restore_dropout_position_reproduces_an_earlier_forward_bit_identically() {
-    let Some(device) = metal_device_or_skip() else {
-        return;
-    };
+    let device = jammi_test_resources::metal_device();
     const N: usize = 6;
     const K: u64 = 2;
 
@@ -272,9 +224,7 @@ fn metal_restore_dropout_position_reproduces_an_earlier_forward_bit_identically(
 /// `fused_arm_production_path_would_catch_an_off_by_one_resume_position`.
 #[test]
 fn metal_would_catch_an_off_by_one_resume_position() {
-    let Some(device) = metal_device_or_skip() else {
-        return;
-    };
+    let device = jammi_test_resources::metal_device();
     const N: usize = 5;
     const K: u64 = 2;
 
@@ -336,9 +286,7 @@ fn metal_would_catch_an_off_by_one_resume_position() {
 /// (`training: false`, `dropout: None`), across successful Metal forwards.
 #[test]
 fn metal_layer_with_no_dropout_configured_reports_position_none() {
-    let Some(device) = metal_device_or_skip() else {
-        return;
-    };
+    let device = jammi_test_resources::metal_device();
     let x = ones_input(&device);
 
     // Training-mode, no dropout configured at all.

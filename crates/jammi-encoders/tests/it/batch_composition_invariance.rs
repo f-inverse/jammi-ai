@@ -434,54 +434,6 @@ fn pooled_embedding_red_control_window_radius_off_by_one_f32_cpu() {
 // own doc.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Mirrors `src/modernbert.rs`'s own `growth_oracle_cuda_device` /
-/// `tests/cuda_parity.rs`'s `cuda_device`: a machine built with the
-/// `cuda` feature but with no physical GPU reads as "skip", not "fail",
-/// UNLESS `JAMMI_REQUIRE_CUDA` is set, in which case device-acquisition
-/// failure panics rather than silently reading as a skip.
-#[cfg(feature = "cuda")]
-fn cuda_device_or_skip(test_name: &str) -> Option<Device> {
-    match Device::new_cuda(0) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!("{test_name}: JAMMI_REQUIRE_CUDA is set but no CUDA device: {e}");
-            }
-            eprintln!("{test_name}: skipping -- no CUDA device available ({e})");
-            None
-        }
-    }
-}
-
-/// Require-gate (KO-7) for the sm89 window-radius admissibility exclusion
-/// documented above `pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda`
-/// (module doc's "Conjunctive red controls (scoped per-arch)" section): this
-/// control's own measured minimum separation on sm89 (L40S) is SMALLER than
-/// `SM89_COMPOSITION_FLOOR`, so it is genuinely, documentedly INADMISSIBLE
-/// there and taking this branch (skip, not assert) is correct even during a
-/// full `JAMMI_REQUIRE_CUDA=1` pod sweep that includes an sm89 arch (unit 62
-/// landing round, pod `kccwbawx92pou1`). A DIFFERENT resource is what this
-/// gate protects: not "is a CUDA device present" (that is
-/// `cuda_device_or_skip`'s own job), but "is this exclusion still exactly
-/// the one measured, documented sm89 case" -- a lane that wants to prove
-/// this branch never silently fires (e.g. a `probe_cuda_compute_capability`
-/// regression that misclassifies every arch as sm89, which would silently
-/// widen this exclusion to every arch and make the control vacuous
-/// everywhere) sets `JAMMI_REQUIRE_CUDA_SM89_WINDOW_CONTROL_EXCLUSION`, in
-/// which case taking this branch at all panics rather than silently
-/// skipping. Ordinary landing/CI runs -- including the four-arch pod sweep
-/// this file's own bounds were measured from -- leave it unset.
-#[cfg(feature = "cuda")]
-fn sm89_window_control_exclusion_require_gate(test_name: &str) {
-    if std::env::var_os("JAMMI_REQUIRE_CUDA_SM89_WINDOW_CONTROL_EXCLUSION").is_some() {
-        panic!(
-            "{test_name}: JAMMI_REQUIRE_CUDA_SM89_WINDOW_CONTROL_EXCLUSION is set but this leg \
-             is taking the sm89 window-radius admissibility exclusion -- this lane requires \
-             that exclusion be proven never to silently fire, not silently taken"
-        );
-    }
-}
-
 /// `Σ|a_i - b_i| / max(Σ|a_i|, f32::EPSILON)` -- a bare relative-L1
 /// ratio whose noise-free value is `0.0` (matching this file's CPU
 /// metric's floor), used for the `bf16` legs where an absolute
@@ -622,13 +574,13 @@ fn relative_l1_error(a: &[f32], b: &[f32]) -> f64 {
 /// turns that into a loud, named panic rather than a silent guess (family
 /// D: an untested arch must fail loud, never silently borrow a floor it
 /// was never shown to need).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "live-gpu-tests")]
 const EXACT_ARCH_COMPOSITION_FLOOR: f64 = 1e-5;
 
 /// See [`gpu_composition_floor`]'s doc for the full sm89 derivation
 /// (measured max `4.118649354617619e-3`, `1.02x` margin, rounded to a
 /// clean `4.2e-3`).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "live-gpu-tests")]
 const SM89_COMPOSITION_FLOOR: f64 = 4.2e-3;
 
 /// Arch-conditional lookup for [`EXACT_ARCH_COMPOSITION_FLOOR`] /
@@ -661,7 +613,7 @@ const SM89_COMPOSITION_FLOOR: f64 = 4.2e-3;
 /// tightening it -- per-SKU measurement, or a documented argument that
 /// capability alone suffices -- is deferred, not resolved, by this
 /// lookup.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "live-gpu-tests")]
 fn gpu_composition_floor(device: &Device) -> f64 {
     use jammi_kernels::admission::{probe_cuda_compute_capability, ComputeCapability};
     match probe_cuda_compute_capability(device) {
@@ -728,7 +680,7 @@ fn gpu_composition_floor(device: &Device) -> f64 {
 /// ```
 /// giving `~2.36x` headroom over the measured cross-arch worst case
 /// (`1e-2 / 4.233727028564512e-3 ~= 2.362x`).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "live-gpu-tests")]
 const GPU_TRUTH_DRIFT_BOUND: f64 = 1e-2;
 
 /// Refuses to let an unmeasured floor value (identified by `floor_name`)
@@ -761,12 +713,10 @@ fn require_pod_measured_floor(test_name: &str, floor_name: &str, floor: f64) {
 }
 
 #[test]
-#[cfg(feature = "cuda")]
+#[cfg(feature = "live-gpu-tests")]
 fn pooled_embedding_alone_matches_padded_batch_real_row_bf16_cuda() {
     let test_name = "pooled_embedding_alone_matches_padded_batch_real_row_bf16_cuda";
-    let Some(device) = cuda_device_or_skip(test_name) else {
-        return;
-    };
+    let device = jammi_test_resources::cuda_device(0);
     let composition_floor = gpu_composition_floor(&device);
     require_pod_measured_floor(test_name, "gpu_composition_floor", composition_floor);
     require_pod_measured_floor(test_name, "GPU_TRUTH_DRIFT_BOUND", GPU_TRUTH_DRIFT_BOUND);
@@ -824,12 +774,10 @@ fn pooled_embedding_alone_matches_padded_batch_real_row_bf16_cuda() {
 }
 
 #[test]
-#[cfg(feature = "cuda")]
+#[cfg(feature = "live-gpu-tests")]
 fn pooled_embedding_red_control_row_length_off_by_one_bf16_cuda() {
     let test_name = "pooled_embedding_red_control_row_length_off_by_one_bf16_cuda";
-    let Some(device) = cuda_device_or_skip(test_name) else {
-        return;
-    };
+    let device = jammi_test_resources::cuda_device(0);
     let composition_floor = gpu_composition_floor(&device);
     require_pod_measured_floor(test_name, "gpu_composition_floor", composition_floor);
     let config = load_config();
@@ -874,37 +822,22 @@ fn pooled_embedding_red_control_row_length_off_by_one_bf16_cuda() {
 }
 
 #[test]
-#[cfg(feature = "cuda")]
+#[cfg(feature = "live-gpu-tests")]
 fn pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda() {
     let test_name = "pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda";
-    let Some(device) = cuda_device_or_skip(test_name) else {
-        return;
-    };
-    // Admissibility scoping (reshape, never tune -- see
-    // `gpu_composition_floor`'s own doc for the full measured numbers this
-    // scoping cites): on sm89 (L40S) the window-radius control's own
-    // measured minimum separation (`1.139471768897301e-3`, unit 62 landing
-    // round, pod `kccwbawx92pou1`, tree `67ba2394`) is SMALLER than
-    // `SM89_COMPOSITION_FLOOR` (`4.2e-3`) -- the control cannot separate
-    // above the floor on this arch at all, so it is INADMISSIBLE there and
-    // SKIPPED, loudly, rather than asserted (which would either be vacuous
-    // or reject a passing arch on control noise, not a real defect). The
-    // row-length control above stays universal and is NOT skipped on any
-    // arch.
+    let device = jammi_test_resources::cuda_device(0);
+    // On sm89 (L40S) bf16 composition noise (SM89_COMPOSITION_FLOOR, 4.2e-3)
+    // exceeds this control's separation (measured minimum 1.14e-3): a one-token
+    // window change cannot be told from noise there, so the control has no
+    // power on that arch and the sm89 lane does not run it. The row-length
+    // control above does separate on sm89.
     use jammi_kernels::admission::{probe_cuda_compute_capability, ComputeCapability};
-    if probe_cuda_compute_capability(&device) == Some(ComputeCapability::new(8, 9)) {
-        eprintln!(
-            "{test_name}: SKIPPED on sm89 (L40S) -- the window-radius red control is \
-             INADMISSIBLE on this arch (measured min separation 1.139471768897301e-3 < \
-             SM89_COMPOSITION_FLOOR 4.2e-3; unit 62 landing round, pod kccwbawx92pou1, \
-             tree 67ba2394). Per contract E4, an inadmissible control is scoped out with a \
-             loud documented reason, never silently tuned to pass -- see \
-             gpu_composition_floor's own doc for the full derivation and the row-length \
-             control's universal admissibility on this same arch."
-        );
-        sm89_window_control_exclusion_require_gate(test_name);
-        return;
-    }
+    assert_ne!(
+        probe_cuda_compute_capability(&device),
+        Some(ComputeCapability::new(8, 9)),
+        "the window-radius red control cannot separate from sm89's bf16 composition noise; \
+         run it on an exact-arch device (sm80/86/90)"
+    );
     let composition_floor = gpu_composition_floor(&device);
     require_pod_measured_floor(test_name, "gpu_composition_floor", composition_floor);
     let config = load_config();
@@ -939,8 +872,7 @@ fn pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda() {
         .unwrap();
 
     let ratio = relative_l1_error(&alone_long, &pooled_batch_mut[long_idx]);
-    // Only reachable on the exact-arches class (sm89 returns above): this
-    // control's own measured min separation there (`7.508231757090548e-4`)
+    // On the exact-arch class this control's own measured min separation (`7.508231757090548e-4`)
     // clears `EXACT_ARCH_COMPOSITION_FLOOR * 5.0` (`5e-5`) by `~15x` -- see
     // `gpu_composition_floor`'s own doc.
     assert!(
@@ -1095,7 +1027,7 @@ fn require_pod_measured_floor_panics_on_unmeasured_nan() {
 /// per-row lengths) -- only which rows participate and in what order/total
 /// batch size varies, so any divergence measured here traces to composition
 /// (operand shape), never to content drift between compositions.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "live-gpu-tests")]
 const MEASUREMENT_COMPOSITION_SWEEP: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
 
 /// Maps a `composition_id` (`0..8`, [`MEASUREMENT_COMPOSITION_SWEEP`]) to
@@ -1103,7 +1035,7 @@ const MEASUREMENT_COMPOSITION_SWEEP: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
 /// batch: full set, both halves, even/odd interleave, full-reversed-order,
 /// and two overlapping three-quarter windows -- eight structurally distinct
 /// `(batch, seq)` operand shapes and orderings from one fixed content pool.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "live-gpu-tests")]
 fn composition_row_indices(composition_id: usize, n: usize) -> Vec<usize> {
     match composition_id {
         0 => (0..n).collect(),
@@ -1123,7 +1055,7 @@ fn composition_row_indices(composition_id: usize, n: usize) -> Vec<usize> {
 /// [`build_fixture`]'s row content/lengths verbatim (no re-derivation) so
 /// every composition draws from the identical content this file's gating
 /// tests already exercise.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "live-gpu-tests")]
 fn build_composition(
     device: &Device,
     base: &Fixture,
@@ -1154,7 +1086,7 @@ fn build_composition(
 /// discipline (family J) `mean_max` in `src/modernbert.rs` uses, re-derived
 /// here since this file does not import that module's private helper (see
 /// this file's own module doc on why it re-derives its small helpers).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "live-gpu-tests")]
 fn measurement_max(values: &[f64]) -> f64 {
     values.iter().copied().fold(f64::NEG_INFINITY, |a, b| {
         if b.total_cmp(&a).is_gt() {
@@ -1168,7 +1100,7 @@ fn measurement_max(values: &[f64]) -> f64 {
 /// `(mean, total_cmp-folded max)` over `values`. Panics on an empty slice --
 /// a measurement sweep that produced zero data points is itself a defect in
 /// this test, not a `0.0`/`NaN` result to silently propagate.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "live-gpu-tests")]
 fn measurement_mean_max(values: &[f64]) -> (f64, f64) {
     assert!(!values.is_empty(), "measurement_mean_max: empty slice");
     let sum: f64 = values.iter().sum();
@@ -1191,7 +1123,7 @@ fn measurement_mean_max(values: &[f64]) -> (f64, f64) {
 /// pass), never silently dropped or averaged away.
 ///
 /// Two independent, structural reasons this cannot run inside the
-/// CI-hermetic gate: (1) `#[cfg(feature = "cuda")]` means the function does
+/// CI-hermetic gate: (1) `#[cfg(feature = "live-gpu-tests")]` means the function does
 /// not even exist in a plain `cargo test -p jammi-encoders` build (CI's
 /// default, no `--features cuda`); (2) even a `--features cuda` build
 /// compiles it but `cargo test`'s documented default behavior skips
@@ -1218,13 +1150,11 @@ fn measurement_mean_max(values: &[f64]) -> (f64, f64) {
 /// per-composition line after it keeps the pre-existing byte-stable
 /// format unchanged (downstream tooling greps those lines).
 #[test]
-#[cfg(feature = "cuda")]
+#[cfg(feature = "live-gpu-tests")]
 #[ignore = "measurement-only: prints ratios for pod floor derivation, asserts nothing beyond finiteness"]
 fn measure_gpu_floors_print_only() {
     let test_name = "measure_gpu_floors_print_only";
-    let Some(device) = cuda_device_or_skip(test_name) else {
-        return;
-    };
+    let device = jammi_test_resources::cuda_device(0);
 
     // Producer self-identification (unit 62 final audit, BLOCK 1): printed
     // ONCE, before any per-row line, so a captured log substantiates which

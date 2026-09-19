@@ -86,8 +86,6 @@
 //! the git_sha of the tip it measured" — the same principle extended to
 //! every other provenance field).
 
-#![cfg(feature = "flash-attn")]
-
 use std::path::PathBuf;
 use std::time::Instant;
 

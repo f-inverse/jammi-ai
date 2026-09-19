@@ -76,22 +76,74 @@ pub fn assert_permissions_enforced() {
     );
 }
 
+/// A command that runs test `path` (`module::test_name`) of the current test
+/// binary, alone, in a fresh process.
+///
+/// A test that must run in its own process (a clean environment, a process-wide
+/// setting read once, a crash to survive) is split in two: the parent test that
+/// spawns and checks it, and the child body, marked
+/// `#[ignore = "child process of <parent>"]` so the harness reports it as ignored
+/// rather than running it in place. This runs exactly that one test with
+/// `--ignored --exact`; add the child's environment to the returned command.
+pub fn child_test(path: &str) -> std::process::Command {
+    let exe = std::env::current_exe().expect("the running test binary's path");
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args([path, "--exact", "--ignored", "--nocapture"]);
+    cmd
+}
+
+/// Runs `cmd` (from [`child_test`]) to completion and returns its stdout.
+///
+/// # Panics
+/// When the child fails, or when it did not run exactly one test: a filter that
+/// matches nothing exits successfully having run nothing.
+pub fn child_test_stdout(cmd: &mut std::process::Command) -> String {
+    let output = cmd.output().expect("spawn the child test process");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the child test failed ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stdout.contains("test result: ok. 1 passed;"),
+        "the child test process did not run exactly one test:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    stdout
+}
+
 /// CUDA device `ordinal`.
 ///
 /// # Panics
-/// When the device cannot be opened.
-#[cfg(feature = "cuda")]
+/// When the device cannot be opened — including in a build without candle's
+/// CUDA backend.
+#[cfg(feature = "candle")]
 pub fn cuda_device(ordinal: usize) -> candle_core::Device {
     candle_core::Device::new_cuda(ordinal)
         .unwrap_or_else(|e| panic!("this test needs CUDA device {ordinal}: {e}"))
 }
 
+/// CUDA device `ordinal`'s backend handle, for code that launches kernels on it
+/// directly.
+///
+/// # Panics
+/// As [`cuda_device`].
+#[cfg(feature = "candle")]
+pub fn cuda_backend(ordinal: usize) -> candle_core::CudaDevice {
+    cuda_device(ordinal)
+        .as_cuda_device()
+        .unwrap_or_else(|e| panic!("CUDA device {ordinal} has no CUDA backend: {e}"))
+        .clone()
+}
+
 /// The Metal device.
 ///
 /// # Panics
-/// When no Metal device can be opened. `Device::new_metal` itself panics on a
-/// host with no Metal support; that panic is reported the same way.
-#[cfg(feature = "metal")]
+/// When no Metal device can be opened — including in a build without candle's
+/// Metal backend. `Device::new_metal` itself panics on some hosts with no Metal
+/// support; that panic is reported the same way.
+#[cfg(feature = "candle")]
 pub fn metal_device() -> candle_core::Device {
     let opened = std::panic::catch_unwind(|| candle_core::Device::new_metal(0));
     match opened {
@@ -134,5 +186,24 @@ mod tests {
     #[test]
     fn executable_resolves_a_program_on_path() {
         assert!(executable("sh").is_absolute());
+    }
+
+    #[test]
+    #[ignore = "child process of child_test_runs_exactly_the_named_child"]
+    fn child_body_prints_a_marker() {
+        println!("CHILD_MARKER={}", std::env::var("CHILD_INPUT").unwrap());
+    }
+
+    #[test]
+    fn child_test_runs_exactly_the_named_child() {
+        let mut cmd = child_test("tests::child_body_prints_a_marker");
+        cmd.env("CHILD_INPUT", "from-the-parent");
+        assert!(child_test_stdout(&mut cmd).contains("CHILD_MARKER=from-the-parent"));
+    }
+
+    #[test]
+    #[should_panic(expected = "did not run exactly one test")]
+    fn child_test_refuses_a_filter_that_matches_nothing() {
+        child_test_stdout(&mut child_test("tests::no_such_test"));
     }
 }

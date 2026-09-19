@@ -236,8 +236,6 @@
 //! token count, permuted only in which axis carries it) before treating
 //! "distinct count alone, no growth" as separately confirmed.
 
-#![cfg(feature = "cuda")]
-
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Optimizer, VarMap};
 use jammi_encoders::{ModernBert, ModernBertConfig, Pooling};
@@ -270,20 +268,6 @@ fn modernbert_large_config() -> ModernBertConfig {
         local_attention: 128,
         global_attn_every_n_layers: 3,
         attention_dropout: 0.0,
-    }
-}
-
-/// KO-7 require-gate for the drop-ratio INCONCLUSIVE fallback branches
-/// (registered in `ci/kernel-oracle-helpers.txt`): under `JAMMI_REQUIRE_CUDA`
-/// a too-short memory trace must FAIL loudly rather than fall back to an
-/// inconclusive skip — on a prove lane an unmeasurable oracle is a failure,
-/// never a soft pass.
-fn esc076_trace_gate(context: &str) {
-    if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-        panic!(
-            "{context}: JAMMI_REQUIRE_CUDA is set but the memory trace was too short to compare \
-             — an inconclusive drop-ratio oracle is not acceptable on a prove lane"
-        );
     }
 }
 
@@ -413,29 +397,14 @@ fn gpu_slot_is_exclusive_while_held() {
     drop(slot);
 }
 
-fn cuda_device() -> Option<SerialGpu> {
-    // Taken BEFORE `Device::new_cuda`, so even device ACQUISITION (which
+fn cuda_device() -> SerialGpu {
+    // Taken BEFORE the device opens, so even device acquisition (which
     // allocates a context on the device) is serialized against a sibling
     // leg's memory trace.
     let slot = take_gpu_slot();
-    match Device::new_cuda(0) {
-        Ok(device) => Some(SerialGpu {
-            device,
-            _slot: slot,
-        }),
-        Err(e) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!(
-                    "esc076_comparable_eager_control: JAMMI_REQUIRE_CUDA is set but no CUDA \
-                     device could be acquired -- this is a landing proof, a silent skip here is \
-                     not acceptable: {e}"
-                );
-            }
-            eprintln!(
-                "esc076_comparable_eager_control: skipping -- no CUDA device available ({e})"
-            );
-            None
-        }
+    SerialGpu {
+        device: jammi_test_resources::cuda_device(0),
+        _slot: slot,
     }
 }
 
@@ -843,106 +812,12 @@ const VARIABLE_SHAPE_SEQS: [usize; 11] = [64, 96, 128, 160, 192, 224, 256, 320, 
 /// 5-value/20-step design did, so the step count is not raised further).
 const VARIABLE_SHAPE_STEPS: usize = 33;
 
-/// The variable-shape twin of [`run_leg`]: IDENTICAL pipeline (same
-/// weights, same LoRA config, same three-forward-pass margin-loss shape,
-/// same real `AdamW::backward_step`), except each step's `(anchor,
-/// positive, negative, mask)` are rebuilt at `VARIABLE_SHAPE_SEQS[step %
-/// 5]` instead of the fixed `REPORTER_SEQ` — reproducing the ONE
-/// independent variable the mechanism finding isolated (distinct batch
-/// SHAPE, not dtype, not batch count) at the library seam, never through
-/// `jammi-bench`'s `arm` validator (this file's own module doc, "why this
-/// is a library-seam test").
-fn run_leg_variable_shape(
-    dtype: DType,
-    config: &ModernBertConfig,
-    weights: &Path,
-    device: &Device,
-) -> LegOutcome {
-    let (model, varmap) = build_model(config, weights, dtype, device, /* with_lora */ true);
-    let trainable_vars = varmap.all_vars();
-    assert!(
-        !trainable_vars.is_empty(),
-        "sanity: with_lora=true must register at least one trainable Var (see run_leg's \
-         identical assertion)"
-    );
-    let mut optimizer = candle_nn::AdamW::new_lr(trainable_vars, 1e-4)
-        .unwrap_or_else(|e| panic!("esc076: AdamW::new_lr failed: {e}"));
-
-    let mut losses = Vec::with_capacity(VARIABLE_SHAPE_STEPS);
-    let mut free_mib_after_step = Vec::with_capacity(VARIABLE_SHAPE_STEPS);
-
-    for step in 0..VARIABLE_SHAPE_STEPS {
-        let seq = VARIABLE_SHAPE_SEQS[step % VARIABLE_SHAPE_SEQS.len()];
-        let anchor = synthetic_ids(REPORTER_BATCH, seq, config.vocab_size, 1, device);
-        let positive = synthetic_ids(REPORTER_BATCH, seq, config.vocab_size, 2, device);
-        let negative = synthetic_ids(REPORTER_BATCH, seq, config.vocab_size, 3, device);
-        let mask = Tensor::ones((REPORTER_BATCH, seq), DType::U32, device).unwrap();
-
-        let forward = |ids: &Tensor| -> Result<Tensor, jammi_encoders::EncoderError> {
-            model.forward(ids, &mask)
-        };
-        let step_result: Result<f32, jammi_encoders::EncoderError> = (|| {
-            let a = forward(&anchor)?;
-            let p = forward(&positive)?;
-            let n = forward(&negative)?;
-            if step == 0 {
-                for (label, t) in [("anchor", &a), ("positive", &p), ("negative", &n)] {
-                    assert_eq!(
-                        t.dtype(),
-                        dtype,
-                        "[{dtype:?}] variable-shape {label}'s pooled output dtype is {:?}, not \
-                         the requested {dtype:?}",
-                        t.dtype()
-                    );
-                }
-            }
-            let a32 = a.to_dtype(DType::F32)?;
-            let p32 = p.to_dtype(DType::F32)?;
-            let n32 = n.to_dtype(DType::F32)?;
-            let cos_ap = (&a32 * &p32)?.sum(candle_core::D::Minus1)?;
-            let cos_an = (&a32 * &n32)?.sum(candle_core::D::Minus1)?;
-            let margin = 0.2f64;
-            let hinge = (cos_an - cos_ap)?.affine(1.0, margin)?.relu()?;
-            let loss = hinge.mean_all()?;
-            let loss_scalar = loss.to_scalar::<f32>()?;
-            optimizer.backward_step(&loss)?;
-            Ok(loss_scalar)
-        })();
-
-        match step_result {
-            Ok(loss) => {
-                losses.push(loss);
-                free_mib_after_step.push(cuda_free_mib(device));
-            }
-            Err(e) => {
-                let message = e.to_string();
-                return if message.contains("CUDA_ERROR_OUT_OF_MEMORY")
-                    || message.contains("OutOfMemory")
-                {
-                    LegOutcome::CudaOutOfMemory {
-                        steps_completed: step,
-                        free_mib_after_step,
-                        message,
-                    }
-                } else {
-                    LegOutcome::OtherError { message }
-                };
-            }
-        }
-    }
-
-    LegOutcome::Completed {
-        losses,
-        free_mib_after_step,
-    }
-}
-
-/// The fixed-shape twin of [`run_leg_variable_shape`] at the SAME
+/// The fixed-shape twin of an un-bucketed variable-shape leg at the SAME
 /// [`VARIABLE_SHAPE_STEPS`] step count (never [`STEPS_PER_LEG`] — a
 /// different step count would make the two traces' `total_drop`
 /// incomparable) — every step uses the IDENTICAL `REPORTER_SEQ`, so this
 /// isolates "many steps at ONE shape" from "many steps across several
-/// shapes", the ONE independent variable [`run_leg_variable_shape`]
+/// shapes", the ONE independent variable an un-bucketed variable-shape leg
 /// changes.
 fn run_leg_fixed_shape_same_step_count(
     dtype: DType,
@@ -1032,7 +907,7 @@ fn run_leg_fixed_shape_same_step_count(
 /// fix's real proven domain.
 const VARIABLE_SHAPE_BUCKET_CAP: usize = REPORTER_SEQ;
 
-/// The bucketed twin of [`run_leg_variable_shape`]: the IDENTICAL raw
+/// The bucketed twin of an un-bucketed variable-shape leg: the IDENTICAL raw
 /// `VARIABLE_SHAPE_SEQS` cycle, but each step's raw length is FIRST
 /// truncated to [`VARIABLE_SHAPE_BUCKET_CAP`] (mirroring the REAL
 /// trainer's own tokenizer call, `tokenizer.encode_batch(&text_refs,
@@ -1052,7 +927,7 @@ const VARIABLE_SHAPE_BUCKET_CAP: usize = REPORTER_SEQ;
 /// `VARIABLE_SHAPE_SEQS`'s 11 raw values (many `> REPORTER_SEQ`) down to
 /// just `{64, 128}` (2 distinct shapes, both already known-safe from the
 /// fixed-shape control) — completing without the un-bucketed
-/// [`run_leg_variable_shape`]'s pre-fix OOM.
+/// an un-bucketed variable-shape leg's pre-fix OOM.
 fn run_leg_variable_shape_bucketed(
     dtype: DType,
     config: &ModernBertConfig,
@@ -1113,7 +988,7 @@ fn run_leg_variable_shape_bucketed(
         let (positive_ids, _positive_mask) = build_bucketed(raw_len, bucketed_len, 2);
         let (negative_ids, _negative_mask) = build_bucketed(raw_len, bucketed_len, 3);
         // All three rows share the SAME mask (identical raw_len/bucketed_len
-        // per step, mirroring `run_leg_variable_shape`'s own single shared
+        // per step, mirroring an un-bucketed variable-shape leg's own single shared
         // `mask` per step) — `_positive_mask`/`_negative_mask` are built
         // (not skipped) so a future divergence in per-row padding would
         // still construct a real tensor to compare against, even though
@@ -1232,106 +1107,6 @@ fn total_drop_mib(outcome: &LegOutcome) -> Option<f64> {
 #[ignore = "esc-076 pre-fix RED reproduction (unbucketed eager growth) -- \
             run explicitly by fix-verifier with --ignored, not part of the \
             default green suite; see this fn's own doc"]
-fn esc076_variable_shape_unbucketed_reproduces_the_pre_fix_oom() {
-    std::env::set_var("JAMMI_KERNELS_DISABLE", "all");
-
-    let Some(device) = cuda_device() else {
-        return;
-    };
-
-    let config = modernbert_large_config();
-    let dir = tempfile::tempdir().expect("tempdir for synthetic checkpoint");
-    let weights_path = dir.path().join("model.safetensors");
-    write_synthetic_checkpoint(&config, &weights_path);
-
-    let variable_outcome = assert_ran_eager("variable_shape_bf16", || {
-        run_leg_variable_shape(DType::BF16, &config, &weights_path, device.device())
-    });
-    let fixed_outcome = assert_ran_eager("fixed_shape_bf16_same_step_count", || {
-        run_leg_fixed_shape_same_step_count(DType::BF16, &config, &weights_path, device.device())
-    });
-
-    println!(
-        "[esc-076 D3] variable-shape bf16 ({VARIABLE_SHAPE_STEPS} steps, seqs={VARIABLE_SHAPE_SEQS:?}): {}",
-        match &variable_outcome {
-            LegOutcome::Completed { free_mib_after_step, .. } =>
-                summarize_free_mib_trace(free_mib_after_step),
-            LegOutcome::CudaOutOfMemory { steps_completed, free_mib_after_step, message } => format!(
-                "CudaOutOfMemory after {steps_completed} steps -- {message}; trace so far: {}",
-                summarize_free_mib_trace(free_mib_after_step)
-            ),
-            LegOutcome::OtherError { message } => format!("OtherError -- {message}"),
-        }
-    );
-    println!(
-        "[esc-076 D3] fixed-shape bf16 ({VARIABLE_SHAPE_STEPS} steps, seq={REPORTER_SEQ}): {}",
-        match &fixed_outcome {
-            LegOutcome::Completed {
-                free_mib_after_step,
-                ..
-            } => summarize_free_mib_trace(free_mib_after_step),
-            LegOutcome::CudaOutOfMemory {
-                steps_completed,
-                free_mib_after_step,
-                message,
-            } => format!(
-                "CudaOutOfMemory after {steps_completed} steps -- {message}; trace so far: {}",
-                summarize_free_mib_trace(free_mib_after_step)
-            ),
-            LegOutcome::OtherError { message } => format!("OtherError -- {message}"),
-        }
-    );
-
-    // A variable-shape leg that itself OOMs (while the fixed-shape control
-    // at the IDENTICAL step count does not) is the sharpest possible
-    // reproduction of the defect -- an immediate, unambiguous RED, no
-    // ratio needed.
-    if matches!(variable_outcome, LegOutcome::CudaOutOfMemory { .. })
-        && matches!(fixed_outcome, LegOutcome::Completed { .. })
-    {
-        panic!(
-            "[esc-076 D3] REPRODUCED: the variable-shape leg OOM'd while its fixed-shape control \
-             (identical step count, identical dtype, identical everything except which seq \
-             lengths are cycled) completed -- this is the monotone-growth-tracks-distinct-shapes \
-             mechanism, reproduced as a committed oracle. See this file's module doc's D3 \
-             ATTRIBUTION section for the seam this fix belongs at (jammi-ai batch \
-             bucketing/padding, out of this crate's worktree scope)."
-        );
-    }
-
-    let (Some(var_drop), Some(fixed_drop)) = (
-        total_drop_mib(&variable_outcome),
-        total_drop_mib(&fixed_outcome),
-    ) else {
-        println!(
-            "[esc-076 D3] INCONCLUSIVE on the drop-ratio oracle: at least one leg's trace was too \
-             short to compare (see the OOM-branch check above for the sharper reproduction this \
-             falls back from)."
-        );
-        esc076_trace_gate("esc076_variable_shape_unbucketed_reproduces_the_pre_fix_oom");
-        return;
-    };
-    println!(
-        "[esc-076 D3] total_drop_mib: variable-shape={var_drop:.1} fixed-shape={fixed_drop:.1} \
-         ratio={:.2}",
-        var_drop / fixed_drop.max(1.0)
-    );
-    const GROWTH_RATIO_BOUND: f64 = 3.0;
-    assert!(
-        var_drop <= GROWTH_RATIO_BOUND * fixed_drop.max(1.0),
-        "[esc-076 D3] REPRODUCED: variable-shape eager composition dropped {var_drop:.1} MiB of \
-         free memory over {VARIABLE_SHAPE_STEPS} steps vs {fixed_drop:.1} MiB for its \
-         fixed-shape control at the IDENTICAL step count -- a {:.2}x ratio, past the {} \
-         no-producer:derived-comparable-eager-oracle-bound (three times the SAME run's own \
-         fixed-shape baseline, family K's 'measure against the strongest baseline' rule) -- this \
-         is the mechanism the ledger's MECHANISM PINNED finding names ('growth tracks count of \
-         DISTINCT batch shapes'), reproduced as a committed, re-runnable oracle. See this file's \
-         module doc's D3 ATTRIBUTION section for the seam this fix belongs at.",
-        var_drop / fixed_drop.max(1.0),
-        GROWTH_RATIO_BOUND
-    );
-}
-
 /// esc-076 D3 FIX VERIFICATION (GREEN, runs by default): the SAME
 /// [`VARIABLE_SHAPE_SEQS`] cycle the pre-fix RED leg
 /// ([`esc076_variable_shape_unbucketed_reproduces_the_pre_fix_oom`], above,
@@ -1365,9 +1140,7 @@ fn esc076_variable_shape_unbucketed_reproduces_the_pre_fix_oom() {
 fn esc076_variable_shape_bucketed_completes_with_bounded_memory() {
     std::env::set_var("JAMMI_KERNELS_DISABLE", "all");
 
-    let Some(device) = cuda_device() else {
-        return;
-    };
+    let device = cuda_device();
 
     let config = modernbert_large_config();
     let dir = tempfile::tempdir().expect("tempdir for synthetic checkpoint");
@@ -1432,18 +1205,10 @@ fn esc076_variable_shape_bucketed_completes_with_bounded_memory() {
         ),
     }
 
-    let (Some(bucketed_drop), Some(fixed_drop)) = (
-        total_drop_mib(&bucketed_outcome),
-        total_drop_mib(&fixed_outcome),
-    ) else {
-        println!(
-            "[esc-076 D3 FIX] INCONCLUSIVE on the drop-ratio bound: a trace was too short to \
-             compare (the completion assertion above already establishes the primary GREEN \
-             claim)."
-        );
-        esc076_trace_gate("esc076_variable_shape_bucketed_completes_with_bounded_memory");
-        return;
-    };
+    let bucketed_drop = total_drop_mib(&bucketed_outcome)
+        .expect("the completed bucketed leg records free memory after every step");
+    let fixed_drop = total_drop_mib(&fixed_outcome)
+        .expect("the fixed-shape reference leg records free memory after every step");
     println!(
         "[esc-076 D3 FIX] total_drop_mib: bucketed-variable={bucketed_drop:.1} \
          fixed-shape={fixed_drop:.1} ratio={:.2}",
@@ -1504,9 +1269,7 @@ fn esc076_fully_eager_bf16_vs_f16_at_reporter_shape() {
     // structurally by `SerialGpu` rather than by this comment.
     std::env::set_var("JAMMI_KERNELS_DISABLE", "all");
 
-    let Some(device) = cuda_device() else {
-        return;
-    };
+    let device = cuda_device();
 
     let config = modernbert_large_config();
     let dir = tempfile::tempdir().expect("tempdir for synthetic checkpoint");

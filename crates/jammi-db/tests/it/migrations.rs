@@ -1221,12 +1221,9 @@ fn with_database(url: &str, db: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_migrate_on_fresh_postgres_is_safe() {
     use jammi_db::catalog::backend_postgres::PostgresBackend;
-    use jammi_test_utils::pg_url_for_tests;
 
     const TEST_NAME: &str = "concurrent_migrate_on_fresh_postgres_is_safe";
-    let Some(admin_url) = pg_url_for_tests() else {
-        return;
-    };
+    let admin_url = jammi_test_utils::postgres_url();
 
     let admin = sqlx::PgPool::connect(&admin_url)
         .await
@@ -1497,10 +1494,7 @@ async fn migration_032_creates_result_table_versions(
             BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
         }
         BackendKind::Postgres => {
-            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                return;
-            };
+            let url = jammi_test_utils::postgres_url();
             BackendImpl::Postgres(
                 jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
                     &url, 4, None,
@@ -1686,10 +1680,7 @@ async fn migration_033_is_ordered_after_032_and_adds_model_materialization_colum
             BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
         }
         BackendKind::Postgres => {
-            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                return;
-            };
+            let url = jammi_test_utils::postgres_url();
             BackendImpl::Postgres(
                 jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
                     &url, 4, None,
@@ -1910,10 +1901,7 @@ async fn migration_034_is_ordered_after_033_and_pins_the_pair_at_the_schema_edge
             BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
         }
         BackendKind::Postgres => {
-            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                return;
-            };
+            let url = jammi_test_utils::postgres_url();
             BackendImpl::Postgres(
                 jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
                     &url, 4, None,
@@ -2098,10 +2086,7 @@ async fn migration_035_is_ordered_after_034_and_adds_instances_peer_addr_result_
             BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
         }
         BackendKind::Postgres => {
-            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                return;
-            };
+            let url = jammi_test_utils::postgres_url();
             BackendImpl::Postgres(
                 jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
                     &url, 4, None,
@@ -2234,10 +2219,7 @@ async fn migration_036_is_ordered_after_035_and_adds_instances_result_root_ident
             BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
         }
         BackendKind::Postgres => {
-            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                return;
-            };
+            let url = jammi_test_utils::postgres_url();
             BackendImpl::Postgres(
                 jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
                     &url, 4, None,
@@ -2331,10 +2313,7 @@ async fn migration_037_is_ordered_after_036_and_adds_assembly_failures_next_afte
             BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
         }
         BackendKind::Postgres => {
-            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                return;
-            };
+            let url = jammi_test_utils::postgres_url();
             BackendImpl::Postgres(
                 jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
                     &url, 4, None,
@@ -2489,10 +2468,7 @@ async fn migration_038_is_ordered_after_035_and_037_and_creates_compute_tables(
             BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
         }
         BackendKind::Postgres => {
-            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                return;
-            };
+            let url = jammi_test_utils::postgres_url();
             BackendImpl::Postgres(
                 jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
                     &url, 4, None,
@@ -2822,10 +2798,7 @@ async fn migration_039_is_ordered_after_038_and_the_enforcement_set_is_exact(
             BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
         }
         BackendKind::Postgres => {
-            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                return;
-            };
+            let url = jammi_test_utils::postgres_url();
             BackendImpl::Postgres(
                 jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
                     &url, 4, None,
@@ -3096,10 +3069,7 @@ async fn migration_039_on_an_unclassifiable_value_fails_closed() {
 async fn pg_canonical_stamp_is_independent_of_session_datestyle_and_timezone() {
     use jammi_db::catalog::lease::pg_canonical_stamp;
 
-    let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-        eprintln!("skipping: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let url = jammi_test_utils::postgres_url();
     let backend = BackendImpl::Postgres(
         jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(&url, 2, None)
             .await

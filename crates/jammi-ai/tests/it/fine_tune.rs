@@ -2713,43 +2713,7 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
 // tokio's separate blocking pool, but the warn under test fires from
 // `publish_and_finalize`, back on the single async thread, not from inside
 // that closure).
-/// The require-gate polarity every `chmod` permission-fault probe in this
-/// suite shares (esc-089 F1): `probe` performs the fault-injection premise
-/// check itself — "can this process still read/write through a chmod'd
-/// path?" — and returns `true` if the fault was BYPASSED (root, or a
-/// mode-ignoring filesystem). A bypass is normally a loud, `eprintln`'d skip:
-/// the fault-injection premise the caller needs simply does not hold on this
-/// host. But under `JAMMI_REQUIRE_POSIX_PERMS=1` (the CI lane that is
-/// SUPPOSED to run unprivileged with real POSIX permission enforcement) a
-/// bypass is instead a hard `panic!` — silently returning `true` in that lane
-/// would let a permission-fault regression go completely uncaught.
-///
-/// This is a thin local wrapper of the same canonical shape carried by every
-/// other `chmod`/permission-fault probe in this crate (`ci/kernel-oracle-
-/// helpers.txt`'s KO-7 registry is `(file, fn)`-scoped: a shared helper
-/// defined in `common/mod.rs` cannot be registered for a call site in a
-/// DIFFERENT file, so each file that needs this polarity carries its own
-/// copy rather than delegating).
-///
-/// Returns `true` if the caller must restore permissions and skip; `false` if
-/// the fault was genuinely injected and the test should proceed.
-#[cfg(unix)]
-fn chmod_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
-    let bypassed = probe();
-    if bypassed {
-        if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
-            panic!(
-                "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
-                 permission fault (root, or a mode-ignoring filesystem) — the fault-injection \
-                 premise this test needs does not hold; a silent skip is not acceptable here"
-            );
-        }
-        eprintln!("{test_name}: chmod bypassed (root?) — skipping");
-    }
-    bypassed
-}
-
-#[cfg(unix)]
+#[cfg(all(unix, feature = "unprivileged-tests"))]
 #[tokio::test]
 async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
     use std::io;
@@ -2760,6 +2724,7 @@ async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
     use jammi_ai::fine_tune::worker::JobWorker;
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::fmt::MakeWriter;
+    jammi_test_resources::assert_permissions_enforced();
 
     #[derive(Clone)]
     struct BufferWriter(Arc<Mutex<Vec<u8>>>);
@@ -2873,29 +2838,6 @@ async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-    // PROBE the injection before relying on it: root (and mode-ignoring
-    // filesystems) can delete through a 0o555 directory, so the failed-prune
-    // premise never exists there — skip loudly (the environment-conditional
-    // convention this batch applies in candle.rs's device_tests too). The
-    // run is aborted rather than awaited: nothing below is meaningful
-    // without the injected fault.
-    let probe = epoch0_dir.join(".root_probe");
-    let bypassed = chmod_bypassed(
-        "finalize_reclaims_a_persistently_failed_prune_and_warns",
-        || {
-            let ok = std::fs::write(&probe, b"x").is_ok();
-            if ok {
-                let _ = std::fs::remove_file(&probe);
-            }
-            ok
-        },
-    );
-    if bypassed {
-        let _ = std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o755));
-        handle.abort();
-        return;
-    }
-
     // Let the run finish naturally (no cancellation this time — this is the
     // WINNER path). Bounded wait.
     tokio::time::timeout(Duration::from_secs(60), handle)

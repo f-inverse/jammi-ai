@@ -75,38 +75,24 @@ fn patents_url() -> String {
 }
 
 /// Spin up an in-process gRPC server whose `InferenceSession` is pinned to the
-/// first CUDA device (`gpu.device = 0`, `require_gpu = true`). Returns `None`
-/// — a clean skip — when no usable GPU opens (a CPU build, or a GPU-less host),
-/// so the suite is a no-op off a CUDA host rather than a failure. A returned
-/// `Some` guarantees the session was constructed on the GPU, so every wire call
-/// against it runs the real CUDA served path.
-async fn start_gpu_embedding_server() -> Option<(
+/// first CUDA device (`gpu.device = 0`, `require_gpu = true`), so every wire
+/// call against it runs the real CUDA served path.
+async fn start_gpu_embedding_server() -> (
     SocketAddr,
     oneshot::Sender<()>,
     TempDir,
     tokio::task::JoinHandle<()>,
-)> {
+) {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut cfg = test_config(dir.path());
     cfg.gpu.device = 0;
     cfg.gpu.require_gpu = true;
 
-    let session = match InferenceSession::new(cfg).await {
-        Ok(session) => Arc::new(session),
-        Err(err) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!(
-                    "grpc_embedding_gpu: JAMMI_REQUIRE_CUDA is set but \
-                     InferenceSession::new failed — refusing to silently skip: {err}"
-                );
-            }
-            tracing::warn!(
-                "SKIP grpc_embedding_gpu: no usable CUDA device — build with \
-                 `--features cuda,live-gpu-tests` on a GPU host to run it ({err})"
-            );
-            return None;
-        }
-    };
+    let session = Arc::new(
+        InferenceSession::new(cfg)
+            .await
+            .expect("a session pinned to CUDA device 0 (require_gpu = true)"),
+    );
 
     let store = SessionStore::new();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -125,7 +111,7 @@ async fn start_gpu_embedding_server() -> Option<(
     };
     let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
 
-    Some((addr, shutdown_tx, dir, handle))
+    (addr, shutdown_tx, dir, handle)
 }
 
 /// The served GPU path end-to-end: register a corpus, embed it (TEXT tower on
@@ -135,9 +121,7 @@ async fn start_gpu_embedding_server() -> Option<(
 /// the same wire verbs a `grpc://` client calls, running on real silicon.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn text_embeddings_served_over_the_wire_on_gpu() {
-    let Some((addr, shutdown, _dir, handle)) = start_gpu_embedding_server().await else {
-        return;
-    };
+    let (addr, shutdown, _dir, handle) = start_gpu_embedding_server().await;
     let model_id = tiny_bert_model_id();
     let mut client = EmbeddingServiceClient::new(channel(addr).await);
 

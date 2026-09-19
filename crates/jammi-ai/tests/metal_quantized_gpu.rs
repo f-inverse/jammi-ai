@@ -5,10 +5,9 @@
 //! suite's `harness.rs` hardcodes CUDA (`Device::new_cuda`, a CUDA-only
 //! driver/compute-capability admission gate); Metal needs neither, and
 //! reusing that harness would mean threading a device-kind enum through code
-//! that has no third case today. Required feature is `metal` alone (not
-//! `live-gpu-tests`): `metal = ["local", ...]` already implies the engine, and
-//! this binary's own `skip_without_gpu!` guard is the meaningful-run gate, not
-//! a separate opt-in knob.
+//! that has no third case today. Compiled only under `live-metal-tests`: every
+//! test builds a Metal-pinned session (`require_gpu = true`), which refuses to
+//! open on a host without a Metal device.
 //!
 //! Fixture construction (the GGUF/f32 checkpoint writers) is DELIBERATELY
 //! duplicated from `gguf_quantized_gpu.rs` (itself duplicated from
@@ -114,10 +113,6 @@
 //! reaching for a threshold change; the honest fix is re-pointing the
 //! assertion at the faithful signal, not touching the workload that
 //! produced it).
-//!
-//! Gated exactly like the rest of the GPU suites: every test early-returns
-//! with a loud `tracing::warn` skip (`skip_without_gpu!`, never `#[ignore]`)
-//! when no Metal device is usable.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -135,75 +130,6 @@ use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_lora::{FrozenBase, LoraInitMode, LoraLinear, QuantizedLinear};
 use jammi_numerics::ComputePrecision;
 use tempfile::TempDir;
-
-// ─────────────────────────────────────────────────────────────────────────
-// Metal-availability skip guard — mirrors `gpu_capability/harness.rs`'s CUDA
-// guard exactly, substituting `Device::new_metal` for `Device::new_cuda`.
-// Metal has no driver/compute-capability admission floor to duplicate: candle
-// 0.11's Metal backend carries no analogous JIT-version or architecture gate.
-// ─────────────────────────────────────────────────────────────────────────
-
-/// Probes for a Metal device, folding a returned `Err` AND a caught panic
-/// into the same `false` (no device) outcome. Wrapped in
-/// `std::panic::catch_unwind`: on at least one real GH `macos-14` runner,
-/// `Device::new_metal(0)` does not merely return `Err` on a missing/broken
-/// device — an `objc2` class lookup inside candle-metal-kernels'
-/// `residency_set.rs:18` (`MTLResidencySetDescriptor`) can PANIC instead, a
-/// probe-time failure mode a bare `Result` cannot model. Mirrors
-/// `crates/jammi-kernels/tests/metal_parity.rs::metal_device_or_skip`'s
-/// panic-safety mechanism exactly (see that fn's own doc for why catching
-/// this particular panic is sound: the probe owns no lock and mutates no
-/// shared state before failing, so unwinding out of it leaves nothing
-/// poisoned to clean up).
-#[cfg(feature = "metal")]
-fn metal_probe_ok() -> bool {
-    std::panic::catch_unwind(|| Device::new_metal(0).is_ok()).unwrap_or(false)
-}
-
-#[cfg(not(feature = "metal"))]
-fn metal_probe_ok() -> bool {
-    false
-}
-
-/// Whether a Metal device is usable for this build — the real skip/require
-/// decision every `skip_without_gpu!` call site defers to. Carries the same
-/// `JAMMI_REQUIRE_METAL` require-gate CANONICAL shape (a real runtime
-/// `std::env::var_os` read, whose taken-when-set branch is EXACTLY one
-/// `panic!`) `crates/jammi-kernels/tests/metal_parity.rs::
-/// metal_device_or_skip` and `ci/kernel-oracle-helpers.txt`'s other KO-7
-/// registry entries carry, for the identical reason: without this
-/// distinction a broken/missing device on a runner that is SUPPOSED to have
-/// one would silently read as skipped tests, not failed ones. This fn IS
-/// registered in `ci/kernel-oracle-helpers.txt` — `check_kernel_oracles.py`'s
-/// KO-7 scan roots cover every crate's own `tests/`/`src/` directory
-/// (`scan_roots`/`scan_files`), which includes this file, so `verify_helper_
-/// registry` resolves and shape-checks this entry the same as any other.
-/// The mechanism was implemented here matching the canonical shape
-/// byte-for-byte even before the scan widened to reach this file, so the
-/// BEHAVIOR was always honest regardless of whether the static verifier
-/// could see it — registering it here only makes that already-true fact
-/// mechanically checked too.
-fn gpu_available() -> bool {
-    if metal_probe_ok() {
-        return true;
-    }
-    if std::env::var_os("JAMMI_REQUIRE_METAL").is_some() {
-        panic!("JAMMI_REQUIRE_METAL is set but no Metal device is available");
-    }
-    false
-}
-
-macro_rules! skip_without_gpu {
-    () => {{
-        if !gpu_available() {
-            tracing::warn!(
-                "SKIP: no usable Metal device (build with `--features metal` on a Mac with a \
-                 Metal GPU to run this suite)"
-            );
-            return;
-        }
-    }};
-}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Session builders — mirrors `gpu_capability/harness.rs::{cpu_session,
@@ -240,7 +166,6 @@ async fn cpu_session(artifact_dir: &Path) -> Arc<InferenceSession> {
 }
 
 /// Build a Metal-pinned (`gpu.device = 0`, `require_gpu = true`) session.
-/// Only call after [`gpu_available`] / `skip_without_gpu!`.
 async fn gpu_session(artifact_dir: &Path) -> Arc<InferenceSession> {
     Arc::new(
         InferenceSession::new(config_for(artifact_dir, 0))
@@ -707,7 +632,6 @@ const GGUF_METAL_ELEMENTWISE_ABS_TOL: f64 = 1e-3;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gguf_embedding_cpu_metal_parity() {
-    skip_without_gpu!();
     loss_capture::install();
 
     let tmp = TempDir::new().unwrap();
@@ -793,7 +717,6 @@ const GGUF_VS_F32_METAL_COSINE_FLOOR: f64 = 0.99999;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gguf_on_metal_vs_f32_on_metal_quantization_loss_floor() {
-    skip_without_gpu!();
     loss_capture::install();
 
     let tmp = TempDir::new().unwrap();
@@ -860,7 +783,6 @@ async fn add_training_source(session: &Arc<InferenceSession>) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn qlora_learns_on_metal_with_gguf_base() {
-    skip_without_gpu!();
     loss_capture::install();
     loss_capture::reset();
 
@@ -1010,9 +932,7 @@ async fn qlora_learns_on_metal_with_gguf_base() {
 /// edge.
 #[tokio::test(flavor = "multi_thread")]
 async fn qlora_gradients_are_finite_by_count_on_metal() {
-    skip_without_gpu!();
-
-    let device = Device::new_metal(0).expect("gpu_available() already confirmed a Metal device");
+    let device = jammi_test_resources::metal_device();
     let cpu = Device::Cpu;
 
     let out_features = HIDDEN;
@@ -1113,7 +1033,6 @@ async fn qlora_gradients_are_finite_by_count_on_metal() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gguf_vs_f32_metal_throughput_baseline() {
-    skip_without_gpu!();
     loss_capture::install();
 
     let tmp = TempDir::new().unwrap();

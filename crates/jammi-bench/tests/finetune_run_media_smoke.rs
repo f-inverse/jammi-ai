@@ -18,12 +18,6 @@
 //! producers are stdlib-only and offline, so the choice costs no hermeticity
 //! — only a `python3` on PATH, which every lane that runs
 //! `ci/scripts/perf/test_*.py` already has.
-//!
-//! When `python3` is genuinely unavailable the test prints an explicit
-//! stderr warning and returns rather than asserting — a silent pass would be
-//! worse than a stated non-run, and the in-crate unit tests
-//! (`finetune_run::tests::build_encoder_adapters_builds_the_*_tower`) cover
-//! the tower dispatch on the committed fixtures with no Python at all.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -49,26 +43,15 @@ const CLIP_FULL_TARGET_MODULES: &str = "in_proj,out_proj,c_fc,c_proj";
 const CLAP_FULL_TARGET_MODULES: &str =
     "query,key,value,attention_output,intermediate_dense,output_dense,reduction,linear1,linear2";
 
-/// KO-7 require-gate helper for every `python3`-unavailable skip below (to
-/// be registered in `ci/kernel-oracle-helpers.txt`): a lane that
-/// specifically wants to prove the media end-to-end legs (the hermetic CI
-/// runner, which has `python3`) sets `JAMMI_REQUIRE_MEDIA_SMOKE` — if that
-/// lane's box unexpectedly cannot launch `python3` (so the producer, and
-/// therefore the whole leg, cannot be observed), this is a hard failure,
-/// never a silent skip.
-fn media_producer_require_gate() {
-    if std::env::var_os("JAMMI_REQUIRE_MEDIA_SMOKE").is_some() {
-        panic!(
-            "finetune_run_media_smoke: python3 is not runnable but JAMMI_REQUIRE_MEDIA_SMOKE is set; a silent skip is not acceptable"
-        );
-    }
+/// The Python interpreter the committed producers run under.
+fn python3() -> Command {
+    Command::new(jammi_test_resources::executable("python3"))
 }
 
-/// Run one committed producer into `out_dir`. Returns `false` (having said
-/// so on stderr) when `python3` cannot be launched at all; panics when the
-/// producer itself fails, which is a real regression, not an environment gap.
-fn run_producer(script: &str, out_dir: &Path, rows: usize, extra: &[&str]) -> bool {
-    let mut cmd = Command::new("python3");
+/// Run one committed producer into `out_dir`; a producer failure is a real
+/// regression.
+fn run_producer(script: &str, out_dir: &Path, rows: usize, extra: &[&str]) {
+    let mut cmd = python3();
     cmd.current_dir(repo_root())
         .arg(script)
         .arg("--rows")
@@ -78,23 +61,12 @@ fn run_producer(script: &str, out_dir: &Path, rows: usize, extra: &[&str]) -> bo
         .arg("--out-dir")
         .arg(out_dir)
         .args(extra);
-    match cmd.output() {
-        Ok(output) => {
-            assert!(
-                output.status.success(),
-                "{script} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            true
-        }
-        Err(e) => {
-            eprintln!(
-                "python3 is not runnable here ({e}); the media end-to-end leg for {script} was \
-                 NOT exercised in this run"
-            );
-            false
-        }
-    }
+    let output = cmd.output().expect("run the producer under python3");
+    assert!(
+        output.status.success(),
+        "{script} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Write the committed held-out id-order file from the first `n` rows of the
@@ -431,7 +403,7 @@ fn assert_positive_proof_equation(stdout: &str, task: &str, gelu_expects_zero: b
 fn image_embedding_leg_runs_end_to_end_over_the_committed_producer() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let corpus = tmp.path().join("corpus");
-    if !run_producer(
+    run_producer(
         "ci/scripts/perf/gen_fixed_shape_image_corpus.py",
         &corpus,
         32,
@@ -439,10 +411,7 @@ fn image_embedding_leg_runs_end_to_end_over_the_committed_producer() {
         // corpus is generated at exactly the tower's input shape — the
         // fixed-shape premise this producer exists for.
         &["--size", "8"],
-    ) {
-        media_producer_require_gate();
-        return;
-    }
+    );
     let work_dir = tmp.path().join("work");
     std::fs::create_dir_all(&work_dir).expect("mkdir work");
     let model_dir = repo_root().join("cookbook/fixtures/tiny_open_clip");
@@ -483,15 +452,12 @@ fn image_embedding_leg_runs_end_to_end_over_the_committed_producer() {
 fn audio_embedding_leg_runs_end_to_end_over_the_committed_producer() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let corpus = tmp.path().join("corpus");
-    if !run_producer(
+    run_producer(
         "ci/scripts/perf/gen_fixed_length_audio_corpus.py",
         &corpus,
         8,
         &["--seconds", "0.1", "--sample-rate", "16000"],
-    ) {
-        media_producer_require_gate();
-        return;
-    }
+    );
     let work_dir = tmp.path().join("work");
     std::fs::create_dir_all(&work_dir).expect("mkdir work");
     let model_dir = repo_root().join("cookbook/fixtures/htsat_clap_tiny");
@@ -530,7 +496,7 @@ fn audio_embedding_leg_runs_end_to_end_over_the_committed_producer() {
 fn text_embedding_leg_selects_the_clip_text_tower_of_the_same_checkpoint() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let jsonl = tmp.path().join("text.jsonl");
-    let produced = Command::new("python3")
+    let produced = python3()
         .current_dir(repo_root())
         .args([
             "ci/scripts/perf/gen_fixed_width_corpus.py",
@@ -543,15 +509,8 @@ fn text_embedding_leg_selects_the_clip_text_tower_of_the_same_checkpoint() {
             "--out",
         ])
         .arg(&jsonl)
-        .output();
-    let produced = match produced {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("python3 is not runnable here ({e}); the CLIP-text leg was NOT exercised");
-            media_producer_require_gate();
-            return;
-        }
-    };
+        .output()
+        .expect("run the text producer under python3");
     assert!(
         produced.status.success(),
         "gen_fixed_width_corpus failed: {}",
@@ -645,15 +604,12 @@ fn a_text_corpus_under_a_media_task_is_refused_by_the_cli() {
 fn a_media_task_under_the_mnrl_objective_is_refused() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let corpus = tmp.path().join("corpus");
-    if !run_producer(
+    run_producer(
         "ci/scripts/perf/gen_fixed_shape_image_corpus.py",
         &corpus,
         8,
         &["--size", "8"],
-    ) {
-        media_producer_require_gate();
-        return;
-    }
+    );
     let work_dir = tmp.path().join("work");
     std::fs::create_dir_all(&work_dir).expect("mkdir work");
     let model_dir = repo_root().join("cookbook/fixtures/tiny_open_clip");

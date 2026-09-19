@@ -1267,7 +1267,6 @@ mod rs5_source_oracle {
             concat!(
                 "pub struct InferenceExecBuilder;\n",
                 "impl InferenceExecBuilder {\n",
-                // kernel-oracles: fn-in-literal reviewed: a synthetic source fixture the alias-resolution oracle parses
                 "    pub fn new() -> Self { InferenceExecBuilder }\n",
                 "}\n"
             ),
@@ -1282,7 +1281,6 @@ mod rs5_source_oracle {
             tmp.path().join("bypass.rs"),
             concat!(
                 "use crate::reexport::Aliased;\n",
-                // kernel-oracles: fn-in-literal reviewed: a synthetic source fixture the alias-resolution oracle parses
                 "fn bad() {\n",
                 "    let _ = Aliased::new();\n",
                 "}\n"
@@ -1317,7 +1315,6 @@ mod rs5_source_oracle {
             concat!(
                 "pub struct InferenceExecBuilder;\n",
                 "impl InferenceExecBuilder {\n",
-                // kernel-oracles: fn-in-literal reviewed: a synthetic source fixture the alias-resolution oracle parses
                 "    pub fn new() -> Self { InferenceExecBuilder }\n",
                 "}\n"
             ),
@@ -1332,7 +1329,6 @@ mod rs5_source_oracle {
             tmp.path().join("bypass.rs"),
             concat!(
                 "use crate::alias::Aliased;\n",
-                // kernel-oracles: fn-in-literal reviewed: a synthetic source fixture the alias-resolution oracle parses
                 "fn bad() {\n",
                 "    let _ = Aliased::new();\n",
                 "}\n"

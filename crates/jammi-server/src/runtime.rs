@@ -2565,54 +2565,21 @@ mod audit_master_key_tests {
         );
     }
 
-    /// The require-gate polarity every `chmod` permission-fault probe in the
-    /// workspace's test suites shares (esc-089 F1): `probe` performs the
-    /// fault-injection premise check itself and returns `true` if the fault
-    /// was BYPASSED (root, or a mode-ignoring filesystem). A bypass is
-    /// normally a loud, `eprintln`'d skip; under `JAMMI_REQUIRE_POSIX_PERMS=1`
-    /// (the CI lane that is SUPPOSED to run unprivileged with real POSIX
-    /// permission enforcement) a bypass is instead a hard `panic!` — never a
-    /// silent `return`. Each probe file carries its own copy of this wrapper
-    /// in the canonical shape the kernel-oracle registry
-    /// (`ci/kernel-oracle-helpers.txt`) verifies per file.
-    fn chmod_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
-        let bypassed = probe();
-        if bypassed {
-            if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
-                panic!(
-                    "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
-                     permission fault (root, or a mode-ignoring filesystem) — the \
-                     fault-injection premise this test needs does not hold; a silent skip is \
-                     not acceptable here"
-                );
-            }
-            eprintln!("{test_name}: chmod bypassed (root?) — skipping");
-        }
-        bypassed
-    }
-
     /// `SigningKeyConfig::File`, an existing but UNREADABLE file (`0o000`):
     /// this is the case advisory 2 closes — `std::fs::metadata` still sees
     /// the path (so this is NOT read as absent), and the subsequent read
     /// fails, so the check fails CLOSED (refuses startup) rather than
     /// silently booting with signing dead.
+    #[cfg(all(unix, feature = "unprivileged-tests"))]
     #[test]
     fn file_source_unreadable_file_refuses_startup() {
         use std::os::unix::fs::PermissionsExt;
+        jammi_test_resources::assert_permissions_enforced();
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("audit-master-key");
         std::fs::write(&path, "ab".repeat(32)).expect("write valid key");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
-
-        let bypassed = chmod_bypassed("file_source_unreadable_file_refuses_startup", || {
-            std::fs::read_to_string(&path).is_ok()
-        });
-        if bypassed {
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-                .expect("restore permissions");
-            return;
-        }
 
         let err = validate_audit_master_key(&file_config(&path))
             .expect_err("an unreadable file key must refuse to start, not boot with signing dead");

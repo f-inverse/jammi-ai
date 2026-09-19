@@ -72,7 +72,6 @@ use jammi_db::store::ArtifactStore;
 use tempfile::TempDir;
 
 use crate::harness;
-use crate::skip_without_gpu;
 
 // ─────────────────────────────────────────────────────────────────────────
 // Fixture construction — duplicated (deliberately) from
@@ -435,7 +434,6 @@ fn gguf_cuda_elementwise_abs_tol() -> f64 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gguf_embedding_cpu_gpu_parity_within_q8_1_activation_quant_floor() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     // Finding 9: this file's admission oracle reads DEVICE-GLOBAL memory as a
     // before/after delta, so every OTHER test in this file must be held out of
@@ -540,7 +538,6 @@ const GGUF_VS_F32_GPU_COSINE_FLOOR: f64 = 0.9999;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gguf_on_gpu_vs_f32_safetensors_on_gpu_quantization_loss_floor() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     // Finding 9: this file's admission oracle reads DEVICE-GLOBAL memory as a
     // before/after delta, so every OTHER test in this file must be held out of
@@ -621,7 +618,6 @@ async fn add_training_source(session: &Arc<jammi_ai::session::InferenceSession>)
 
 #[tokio::test(flavor = "multi_thread")]
 async fn qlora_learns_on_gpu_with_gguf_base() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     harness::loss_capture::reset();
     // Finding 9: this file's admission oracle reads DEVICE-GLOBAL memory as a
@@ -755,29 +751,6 @@ fn device_memory_used_bytes() -> Option<u64> {
         .map(|mib| mib * 1024 * 1024)
 }
 
-/// [`device_memory_used_bytes`], or a hard failure when `JAMMI_REQUIRE_CUDA`
-/// is set and the reading is unavailable. `skip_without_gpu!` already
-/// requires a real CUDA device on this path; on the pod session that is
-/// SUPPOSED to have one (`JAMMI_REQUIRE_CUDA=1`), `nvidia-smi` being
-/// unusable is also a hard failure, never a silent skip — the same
-/// require-gate idiom `crates/jammi-ai/src/fine_tune/optimizer.rs::
-/// cuda_device` and `crates/jammi-bench/src/finetune_step.rs::
-/// vram_probe_present`'s callers carry for device-measurement channels.
-fn device_memory_used_bytes_or_require(test: &str) -> Option<u64> {
-    match device_memory_used_bytes() {
-        Some(v) => Some(v),
-        None => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!(
-                    "{test}: JAMMI_REQUIRE_CUDA is set but nvidia-smi is unavailable — cannot \
-                     measure device memory; a silent skip is not acceptable here"
-                );
-            }
-            None
-        }
-    }
-}
-
 /// One CUDA caching-allocator pool block, per
 /// `crates/jammi-bench/src/finetune_step.rs`'s own documented convention
 /// (also recorded in `crates/jammi-kernels/artifacts/cuda-runs/
@@ -884,24 +857,16 @@ fn ephemeral_hub_source() -> jammi_ai::model::hub::HubSource {
 /// `harness::SerialGpu`'s own doc, rather than left to be rediscovered.
 #[tokio::test(flavor = "multi_thread")]
 async fn gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_memory() {
-    skip_without_gpu!();
     harness::loss_capture::install();
 
     // Phase 0: settle the CUDA device (context/stream/pool bring-up paid)
     // BEFORE the `before` snapshot — see `settle_cuda_device`'s own doc. The
-    // slot this returns is held for the whole measurement window (finding 9);
-    // `skip_without_gpu!` above already proved a CUDA device opens, so a
-    // `None` here is a genuine late failure, not the GPU-less lane.
-    let cuda = harness::serial_cuda_device()
-        .expect("skip_without_gpu! already proved a CUDA device opens");
+    // slot this returns is held for the whole measurement window.
+    let cuda = harness::serial_cuda_device();
     settle_cuda_device(cuda.device());
 
-    let Some(before) = device_memory_used_bytes_or_require(
-        "gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_memory",
-    ) else {
-        tracing::warn!("SKIP: nvidia-smi unavailable — cannot measure device memory delta");
-        return;
-    };
+    let before =
+        device_memory_used_bytes().expect("this test reads device memory through nvidia-smi");
 
     let tmp = TempDir::new().unwrap();
     let gguf_dir = tmp.path().join("gguf_model");
@@ -934,14 +899,8 @@ async fn gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_me
     // snapshot despite its own comment claiming to "keep the model resident
     // through the synchronize/measure window". `drop(loaded)` now runs
     // AFTER `after` is captured.
-    let Some(after) = device_memory_used_bytes_or_require(
-        "gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_memory",
-    ) else {
-        tracing::warn!(
-            "SKIP: nvidia-smi unavailable after load — cannot measure device memory delta"
-        );
-        return;
-    };
+    let after =
+        device_memory_used_bytes().expect("this test reads device memory through nvidia-smi");
     drop(loaded);
 
     // Signed so a genuine DECREASE (memory freed elsewhere during the
@@ -974,32 +933,15 @@ async fn gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_me
          is wrong"
     );
 
-    // Soft skip (audit advisory 5), same shape as this test's two
-    // nvidia-smi-unavailable arms above: `nvidia-smi`'s whole-device
-    // reading is quantized to `ALLOCATOR_POOL_BLOCK_BYTES`, so a genuinely
-    // small GGUF load can round down to an observed delta of exactly zero.
-    // That is a measurement-granularity artifact, not evidence
-    // `estimated_memory` is untruthful — assert nothing about it and skip.
-    if raw_delta == 0 {
-        // Re-verify the measurement channel is still healthy before treating
-        // a zero delta as an honest granularity artifact rather than a
-        // silently degraded `nvidia-smi` read: routes through the SAME
-        // require-gated helper the before/after snapshots use, so
-        // `JAMMI_REQUIRE_CUDA` still turns a genuinely broken channel into a
-        // hard failure here too, never a laundered skip.
-        let _ = device_memory_used_bytes_or_require(
-            "gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_memory: \
-             zero-delta re-check",
-        );
-        tracing::warn!(
-            "SKIP: measured device-memory delta was 0 (before={before} after={after}) — \
-             nvidia-smi's whole-device reading is quantized to \
-             {ADMISSION_ALLOWANCE_BYTES}-byte allocator pool blocks and can round a genuinely \
-             small GGUF load down to zero; cannot say whether estimated_memory={estimated} is \
-             truthful"
-        );
-        return;
-    }
+    // A model load grows the allocator's pool by whole blocks: one 32 MiB block
+    // on sm_80/86/89 and two on sm_90 for this fixture (prove run 33447277692).
+    // A zero delta means the load was not observed at all, so nothing below
+    // could judge `estimated_memory`.
+    assert!(
+        raw_delta > 0,
+        "gguf_gpu_admission_truthfulness: the load grew device memory by nothing \
+         (before={before} after={after}); the measurement did not observe it"
+    );
     let measured_delta = raw_delta as u64;
 
     // This bound is independent of `measured_delta` entirely — it closes
@@ -1056,7 +998,6 @@ async fn gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_me
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gguf_vs_f32_gpu_throughput_baseline() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     // Finding 9, and doubly so here: a THROUGHPUT baseline shares a device
     // with the admission oracle's memory window, so leaving them concurrent

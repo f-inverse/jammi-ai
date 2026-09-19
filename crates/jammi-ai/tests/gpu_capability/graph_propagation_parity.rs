@@ -36,7 +36,6 @@ use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
 
 use crate::harness;
-use crate::skip_without_gpu;
 
 const DIM: usize = 16;
 
@@ -305,7 +304,6 @@ async fn device_independence_for(label: &str, tune: impl Fn(PropagateRequest) ->
 
 #[tokio::test(flavor = "multi_thread")]
 async fn propagate_sgc_is_device_independent() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     // SGC: no restart, degree-normalised Â, three hops.
     device_independence_for("propagate_sgc", |r| {
@@ -318,7 +316,6 @@ async fn propagate_sgc_is_device_independent() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn propagate_appnp_is_device_independent() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     // APPNP: personalised-PageRank restart (α = 0.3), degree-normalised, three hops.
     device_independence_for("propagate_appnp", |r| {

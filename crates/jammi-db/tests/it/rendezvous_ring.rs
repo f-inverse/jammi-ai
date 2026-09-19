@@ -13,8 +13,8 @@ use jammi_db::catalog::instance::{InstanceRegistration, MemberRoot, PeerAddr};
 use jammi_db::catalog::lease::instance_liveness_margin;
 use jammi_db::catalog::Catalog;
 use jammi_db::index::{RendezvousPlacement, SegmentId, SegmentPlacement};
-use jammi_test_utils::make_test_session;
-use tempfile::tempdir;
+
+use crate::common::catalog_on;
 
 const LEASE: Duration = Duration::from_secs(30);
 
@@ -53,12 +53,6 @@ fn fresh_root() -> String {
     let root = format!("file://{}/jammi_db", dir.path().to_str().unwrap());
     std::mem::forget(dir);
     root
-}
-
-async fn base_catalog_kind(kind: BackendKind) -> Option<(tempfile::TempDir, Arc<Catalog>)> {
-    let dir = tempdir().unwrap();
-    let session = make_test_session(kind, dir.path()).await?;
-    Some((dir, Arc::clone(session.catalog())))
 }
 
 async fn force_stale_instance(catalog: &Catalog, instance_id: &str, ago: Duration) {
@@ -104,16 +98,6 @@ async fn seed_instance(
     catalog.upsert_instance(&reg).await.unwrap();
 }
 
-macro_rules! skip_unless_ready {
-    ($kind:expr) => {
-        if matches!($kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none()
-        {
-            eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-            return;
-        }
-    };
-}
-
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -121,10 +105,7 @@ macro_rules! skip_unless_ready {
 )]
 #[tokio::test]
 async fn self_appears_as_a_candidate(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let self_id = format!("self-{}", jammi_test_utils::unique_suffix());
     seed_instance(&catalog, &self_id, Some("10.0.0.1:9000"), Some(root())).await;
     let ring = catalog
@@ -144,10 +125,7 @@ async fn self_appears_as_a_candidate(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn a_stale_row_is_excluded(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let self_id = format!("self-{}", jammi_test_utils::unique_suffix());
     let stale_id = format!("stale-{}", jammi_test_utils::unique_suffix());
     seed_instance(&catalog, &self_id, Some("10.0.0.1:9000"), Some(root())).await;
@@ -181,10 +159,7 @@ async fn a_stale_row_is_excluded(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn a_root_identity_mismatched_row_is_excluded(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let self_id = format!("self-{}", jammi_test_utils::unique_suffix());
     let elsewhere_id = format!("elsewhere-{}", jammi_test_utils::unique_suffix());
     seed_instance(&catalog, &self_id, Some("10.0.0.1:9000"), Some(root())).await;
@@ -213,10 +188,7 @@ async fn a_root_identity_mismatched_row_is_excluded(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn a_non_advertising_process_is_not_a_member(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let self_id = format!("self-{}", jammi_test_utils::unique_suffix());
     let library_id = format!("library-{}", jammi_test_utils::unique_suffix());
     seed_instance(&catalog, &self_id, Some("10.0.0.1:9000"), Some(root())).await;
@@ -241,10 +213,7 @@ async fn a_non_advertising_process_is_not_a_member(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn an_advertising_replica_with_no_workers_row_is_still_a_member(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let self_id = format!("self-{}", jammi_test_utils::unique_suffix());
     // `[worker] enabled = false`: advertises (`peer_advertise` set) but never
     // runs a claim loop, so it never upserts a `workers` row at all. RV2:
@@ -272,10 +241,7 @@ async fn an_advertising_replica_with_no_workers_row_is_still_a_member(kind: Back
 async fn plan_falls_back_to_all_local_and_counts_when_self_is_absent_from_the_ring(
     kind: BackendKind,
 ) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     // `self_instance_id` names a row that was NEVER registered: the
     // self-referencing subquery in `list_ring_members` returns no rows, so
     // `result_root_identity = (subquery)` is `NULL = anything` (never true)
@@ -312,10 +278,7 @@ async fn plan_falls_back_to_all_local_and_counts_when_self_is_absent_from_the_ri
 )]
 #[tokio::test]
 async fn plan_arms_local_when_self_is_the_only_ring_member(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let self_id = format!("self-{}", jammi_test_utils::unique_suffix());
     seed_instance(
         &catalog,
@@ -389,13 +352,8 @@ async fn plan_arms_local_when_self_is_the_only_ring_member(kind: BackendKind) {
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn ring_read_cost_is_measured_at_100_and_10k_instance_rows() {
-    let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-        eprintln!("skipping ring_read_cost_is_measured_at_100_and_10k_instance_rows: JAMMI_TEST_PG_URL unset");
-        return;
-    };
-    let (_dir, catalog) = base_catalog_kind(BackendKind::Postgres)
-        .await
-        .expect("already skipped above when unconfigured");
+    let url = jammi_test_utils::postgres_url();
+    let (_dir, catalog) = catalog_on(BackendKind::Postgres).await;
     let self_id = format!("cost-self-{}", jammi_test_utils::unique_suffix());
     seed_instance(&catalog, &self_id, Some("10.0.0.1:9000"), Some(root())).await;
 
@@ -543,10 +501,7 @@ async fn ring_read_cost_is_measured_at_100_and_10k_instance_rows() {
 )]
 #[tokio::test]
 async fn a_corrupted_peer_addr_is_a_typed_catalog_error(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let self_id = format!("self-{}", jammi_test_utils::unique_suffix());
     seed_instance(&catalog, &self_id, Some("10.0.0.1:9000"), Some(root())).await;
     let corrupt_id = format!("corrupt-{}", jammi_test_utils::unique_suffix());

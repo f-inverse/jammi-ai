@@ -27,8 +27,6 @@
 //! `if (i < n)` bounds check on a partial last block), every supported
 //! dtype, and both forward AND backward.
 
-#![cfg(feature = "cuda")]
-
 use candle_core::quantized::{GgmlDType, QStorage, QTensor};
 use candle_core::{DType, Device, Error, Layout, Tensor, Var, D};
 use half::{bf16, f16};
@@ -58,23 +56,6 @@ use std::sync::Arc;
 /// generous relative to that gap while still tight enough to catch a real
 /// error (wrong offset, reversed operand, wrong dtype cast).
 const F32_TOL: f64 = 1e-4;
-
-fn cuda_device() -> Option<Device> {
-    match Device::new_cuda(0) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!(
-                    "cuda_parity: JAMMI_REQUIRE_CUDA is set but no CUDA device could be \
-                     acquired — this is the landing proof, a silent skip here is not \
-                     acceptable: {e}"
-                );
-            }
-            eprintln!("cuda_parity: skipping — no CUDA device available ({e})");
-            None
-        }
-    }
-}
 
 /// A fixed, deterministic f32 fixture of length `n`, values in a modest
 /// range so f32/bf16 rounding stays representative rather than degenerate.
@@ -1050,9 +1031,7 @@ fn assert_ln_parity_f16(
 /// `xhat` (`O(1)` magnitude) times `gamma` crosses `F16_MAX`.
 #[test]
 fn ln_parity_f16_output_saturates_to_infinity_beyond_f16_max() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let hidden = 4;
     let xv = [1.0f32, 2.0, 3.0, 4.0];
     let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
@@ -1103,9 +1082,7 @@ fn ln_parity_f16_output_saturates_to_infinity_beyond_f16_max() {
 /// `var=1.25`, not measured) lands strictly below the subnormal floor.
 #[test]
 fn ln_parity_f16_output_underflows_to_zero_below_f16_min_subnormal() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let hidden = 4;
     let xv = [1.0f32, 2.0, 3.0, 4.0];
     let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
@@ -1142,9 +1119,7 @@ fn ln_parity_f16_output_underflows_to_zero_below_f16_min_subnormal() {
 
 #[test]
 fn ln_parity_contiguous_hidden_1024_modernbert_shape() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let rows = 4;
     let hidden = 1024;
     let x = fixture(rows * hidden, 1.0);
@@ -1156,9 +1131,7 @@ fn ln_parity_contiguous_hidden_1024_modernbert_shape() {
 
 #[test]
 fn ln_parity_contiguous_non_1024_hidden() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // Not a power of two, not a multiple of the kernel's LN_BLOCK (256) —
     // exercises the grid-stride tail within a row.
     let rows = 3;
@@ -1172,9 +1145,7 @@ fn ln_parity_contiguous_non_1024_hidden() {
 
 #[test]
 fn ln_parity_narrowed_with_nonzero_offset() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // A [3, rows, hidden] tensor narrowed to its middle "batch" slab: the
     // resulting [rows, hidden] view is contiguous but has a nonzero
     // `start_offset` — the missing-offset class this file's module doc
@@ -1252,9 +1223,7 @@ fn ln_parity_narrowed_with_nonzero_offset() {
 
 #[test]
 fn ln_parity_empty_batch() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let hidden = 8;
     let x_cpu = Tensor::from_slice(&[] as &[f32], (0, hidden), &cpu).unwrap();
@@ -1665,9 +1634,7 @@ fn assert_ln_parity_biased_16bit<T, F>(
 /// unchanged.
 #[test]
 fn ln_parity_bias_free_kernels_unchanged_by_the_460_addition() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let rows = 2;
     let hidden = 16;
     let x = fixture(rows * hidden, 11.0);
@@ -1702,9 +1669,7 @@ fn ln_parity_bias_free_kernels_unchanged_by_the_460_addition() {
 /// rule 15's pre-registered exposure, derived here rather than assumed).
 #[test]
 fn ln_parity_biased_fused_vs_composition_bound_same_device() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let rows = 4;
     let hidden = 1024;
     let x = fixture(rows * hidden, 13.0);
@@ -1752,9 +1717,7 @@ fn ln_parity_biased_fused_vs_composition_bound_same_device() {
 
 #[test]
 fn ln_parity_biased_contiguous_hidden_1024_modernbert_shape() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let rows = 4;
     let hidden = 1024;
     let x = fixture(rows * hidden, 16.0);
@@ -1793,9 +1756,7 @@ fn ln_parity_biased_contiguous_hidden_1024_modernbert_shape() {
 
 #[test]
 fn ln_parity_biased_contiguous_non_1024_hidden() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let rows = 3;
     let hidden = 300;
     let x = fixture(rows * hidden, 19.0);
@@ -1834,9 +1795,7 @@ fn ln_parity_biased_contiguous_non_1024_hidden() {
 
 #[test]
 fn ln_parity_biased_empty_batch() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let hidden = 8;
     let x_cpu = Tensor::from_slice(&[] as &[f32], (0, hidden), &cpu).unwrap();
@@ -2275,9 +2234,7 @@ fn assert_rope_parity_f16(cuda: &Device, batch: usize, seq: usize, hidden: usize
 /// restatement of the CUDA one.
 #[test]
 fn rope_parity_f16_output_saturates_to_infinity_beyond_f16_max() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let hidden = 4;
     let period = 1;
@@ -2391,9 +2348,7 @@ fn rope_parity_f16_output_saturates_to_infinity_beyond_f16_max() {
 /// subnormal floor.
 #[test]
 fn rope_parity_f16_output_underflows_to_zero_below_f16_min_subnormal() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let hidden = 4;
     let period = 1;
     let tiny = f16::from_f32(F16_MIN_POSITIVE_SUBNORMAL);
@@ -2434,9 +2389,7 @@ fn rope_parity_f16_output_underflows_to_zero_below_f16_min_subnormal() {
 
 #[test]
 fn rope_parity_contiguous_head_dim_64_modernbert_large_shape() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let batch = 2;
     let seq = 6;
     let hidden = 64;
@@ -2448,9 +2401,7 @@ fn rope_parity_contiguous_head_dim_64_modernbert_large_shape() {
 
 #[test]
 fn rope_parity_non_power_of_two_even_head_dim() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // 20 is even (a valid rotate-half split) but not a power of two and
     // not a multiple of any convenient block size — exercises the
     // grid-stride tail and the `col < half` boundary.
@@ -2464,9 +2415,7 @@ fn rope_parity_non_power_of_two_even_head_dim() {
 
 #[test]
 fn rope_parity_narrowed_with_nonzero_offset() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // A [3, batch, seq, hidden] tensor narrowed to its middle "batch"
     // slab: contiguous but nonzero `start_offset` — the same class of bug
     // `LayerNormFused`'s CUDA arm had (reading the base buffer's
@@ -2529,9 +2478,7 @@ fn rope_parity_narrowed_with_nonzero_offset() {
 
 #[test]
 fn rope_parity_empty_batch() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let hidden = 8;
     let seq = 4;
@@ -2570,9 +2517,7 @@ fn rope_parity_empty_batch() {
 /// existing `(dy - sum(dy*y)) * y` formula with `y == 0`).
 #[test]
 fn softmax_parity_fully_masked_row_is_zero_on_both_devices() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let last = 8;
     let sv = fixture(last, 1.0);
@@ -3218,9 +3163,7 @@ fn assert_softmax_parity_f16(cuda: &Device, rows: usize, last: usize, sv: &[f32]
 /// does reach the rounding step under test.
 #[test]
 fn softmax_parity_f16_scale_multiply_saturates_to_infinity_beyond_f16_max() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let last = 4;
     let sv = [1.0f32, 2.0, 3.0, 4.0];
     let sh: Vec<f16> = sv.iter().map(|&v| f16::from_f32(v)).collect();
@@ -3278,9 +3221,7 @@ fn softmax_parity_f16_scale_multiply_saturates_to_infinity_beyond_f16_max() {
 
 #[test]
 fn softmax_parity_contiguous_small() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let rows = 4;
     let last = 8;
     let sv = fixture(rows * last, 1.0);
@@ -3291,9 +3232,7 @@ fn softmax_parity_contiguous_small() {
 
 #[test]
 fn softmax_parity_long_row_seq_512_class() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // seq=512: ModernBERT's quadratic-regime shape, exercising the
     // grid-stride reduction over many more than one block width (256).
     let rows = 2;
@@ -3310,9 +3249,7 @@ fn softmax_parity_long_row_seq_512_class() {
 
 #[test]
 fn softmax_parity_non_power_of_two_last_dim() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // 300 is not a power of two and not a multiple of SM_BLOCK (256) --
     // exercises the grid-stride tail within a row.
     let rows = 3;
@@ -3369,9 +3306,7 @@ fn softmax_parity_non_power_of_two_last_dim() {
 /// See [`softmax_f16_dscores_propagation_terms`].
 #[test]
 fn softmax_parity_f16_row_length_regimes() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let rows = 2;
     for last in [255usize, 256, 257, 513, 1024, MAX_LAST_DIM] {
         assert!(
@@ -3386,9 +3321,7 @@ fn softmax_parity_f16_row_length_regimes() {
 
 #[test]
 fn softmax_parity_narrowed_with_nonzero_offset() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // A [3, rows, last] tensor narrowed to its middle "batch" slab: the
     // resulting [rows, last] view is contiguous but has a nonzero
     // `start_offset` -- the same class of bug this crate's other CUDA arms
@@ -3464,9 +3397,7 @@ fn softmax_parity_narrowed_with_nonzero_offset() {
 
 #[test]
 fn softmax_parity_empty_batch() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let last = 8;
     let s_cpu = Tensor::from_slice(&[] as &[f32], (0, last), &cpu).unwrap();
@@ -3755,9 +3686,7 @@ fn assert_softmax_scale_parity_bf16(
 
 #[test]
 fn softmax_scale_parity_contiguous_small() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let rows = 4;
     let last = 8;
     let sv = fixture(rows * last, 1.0);
@@ -3768,9 +3697,7 @@ fn softmax_scale_parity_contiguous_small() {
 /// `seq = 128` — ModernBERT-large's small-`seq` production class.
 #[test]
 fn softmax_scale_parity_head_dim_64_seq_128_class() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let rows = 4; // e.g. batch*heads collapsed onto the leading axis.
     let last = 128;
     let sv = fixture(rows * last, 2.0);
@@ -3783,9 +3710,7 @@ fn softmax_scale_parity_head_dim_64_seq_128_class() {
 /// grid-stride reduction over many more than one block width (256).
 #[test]
 fn softmax_scale_parity_head_dim_64_seq_512_class() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let rows = 2;
     let last = 512;
     let sv = fixture(rows * last, 3.0);
@@ -3795,9 +3720,7 @@ fn softmax_scale_parity_head_dim_64_seq_512_class() {
 
 #[test]
 fn softmax_scale_parity_narrowed_with_nonzero_offset() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // A [3, rows, last] tensor narrowed to its middle "batch" slab (the
     // SAME class of bug this crate's other CUDA arms had — see
     // `softmax_parity_narrowed_with_nonzero_offset`'s identical
@@ -3966,9 +3889,7 @@ fn assert_softmax_scale_bf16_bit_exact_same_device_cuda(
 
 #[test]
 fn softmax_scale_bf16_small_additive_mask_bit_exact_same_device_head_dim_64() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_softmax_scale_bf16_bit_exact_same_device_cuda(
         &cuda,
         2,
@@ -3980,9 +3901,7 @@ fn softmax_scale_bf16_small_additive_mask_bit_exact_same_device_head_dim_64() {
 
 #[test]
 fn softmax_scale_bf16_small_additive_mask_bit_exact_same_device_head_dim_128() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let scale = 1.0 / 128.0f64.sqrt();
     assert_softmax_scale_bf16_bit_exact_same_device_cuda(&cuda, 2, 16, 128, scale);
 }
@@ -4324,9 +4243,7 @@ fn assert_geglu_parity_f16(cuda: &Device, rows: usize, intermediate: usize, wv: 
 /// exactly like `half::f16`'s own conversion.
 #[test]
 fn geglu_parity_f16_product_saturates_to_infinity_beyond_f16_max() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let intermediate = 1;
     // Both f16-representable (60_000 is an exact multiple of f16's ULP at
     // this magnitude, 32) and both well beyond the region where
@@ -4385,9 +4302,7 @@ fn geglu_parity_f16_product_saturates_to_infinity_beyond_f16_max() {
 /// nonzero f16 value) lands at `~0.054 * subnormal`, safely below the tie.
 #[test]
 fn geglu_parity_f16_product_underflows_to_zero_below_f16_min_subnormal() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let intermediate = 1;
     let gate = 0.1f32;
     let up = F16_MIN_POSITIVE_SUBNORMAL;
@@ -4418,9 +4333,7 @@ fn geglu_parity_f16_product_underflows_to_zero_below_f16_min_subnormal() {
 
 #[test]
 fn geglu_parity_contiguous_small() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let rows = 4;
     let intermediate = 8;
     let wv = fixture(rows * 2 * intermediate, 1.0);
@@ -4431,9 +4344,7 @@ fn geglu_parity_contiguous_small() {
 
 #[test]
 fn geglu_parity_production_width_modernbert_large() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // ModernBERT-large's real `intermediate_size` (HuggingFace's published
     // `answerdotai/ModernBERT-large` `config.json`) — also comfortably
     // multi-block for the 256-wide grid-stride kernel.
@@ -4446,9 +4357,7 @@ fn geglu_parity_production_width_modernbert_large() {
 
 #[test]
 fn geglu_parity_non_power_of_two_intermediate() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // 300 is not a power of two and not a multiple of GEGLU_BLOCK (256) --
     // exercises the grid-stride tail: n_out = 3*300 = 900 = 3 full blocks
     // plus a 132-element tail.
@@ -4467,9 +4376,7 @@ fn geglu_parity_non_power_of_two_intermediate() {
 
 #[test]
 fn geglu_parity_multi_block_exact_multiple_of_block_size() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // n_out = rows*intermediate = 2*512 = 1024 = exactly 4 * GEGLU_BLOCK
     // (256).
     let rows = 2;
@@ -4488,9 +4395,7 @@ fn geglu_parity_multi_block_exact_multiple_of_block_size() {
 
 #[test]
 fn geglu_parity_narrowed_with_nonzero_offset() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // A [3, rows, 2*intermediate] tensor narrowed to its middle "batch"
     // slab: the resulting view is contiguous but has a nonzero
     // `start_offset` -- the same class of bug this crate's other CUDA arms
@@ -4572,9 +4477,7 @@ fn geglu_parity_narrowed_with_nonzero_offset() {
 
 #[test]
 fn geglu_parity_empty_last_dim() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let rows = 3;
     let wi_cpu = Tensor::from_slice(&[] as &[f32], (rows, 0), &cpu).unwrap();
@@ -5119,9 +5022,7 @@ fn assert_gelu_erf_parity_f16(cuda: &Device, n: usize, xv: &[f32]) {
 
 #[test]
 fn gelu_erf_parity_contiguous_small() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let n = 32;
     let xv = fixture(n, 1.0);
     assert_gelu_erf_parity_f32(&cuda, n, &xv);
@@ -5131,9 +5032,7 @@ fn gelu_erf_parity_contiguous_small() {
 
 #[test]
 fn gelu_erf_parity_production_width() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // ModernBERT-large's real `intermediate_size` x 2 rows, comfortably
     // beyond a single 1024-thread launch block.
     let n = 2 * 2624;
@@ -5144,9 +5043,7 @@ fn gelu_erf_parity_production_width() {
 
 #[test]
 fn gelu_erf_parity_non_multiple_of_launch_block() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // 1024 is exactly one launch block (`elemwise_launch_config`'s own
     // 1024-thread block, `cudarc`'s `LaunchConfig::for_num_elems`); 1099
     // is not a multiple of it, exercising the kernel's `if (i < n)` bounds
@@ -5160,9 +5057,7 @@ fn gelu_erf_parity_non_multiple_of_launch_block() {
 
 #[test]
 fn gelu_erf_parity_narrowed_with_nonzero_offset() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // A `[3, n]` tensor narrowed to its middle row: contiguous, but with a
     // nonzero `start_offset` — the same class of bug this crate's other
     // CUDA arms had (reading the base buffer's first `n` elements instead
@@ -5231,9 +5126,7 @@ fn gelu_erf_parity_narrowed_with_nonzero_offset() {
 
 #[test]
 fn gelu_erf_parity_empty_input_is_refused_on_both_devices() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let x_cpu = Tensor::from_slice(&[] as &[f32], (0,), &cpu).unwrap();
     let x_gpu = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
@@ -5467,9 +5360,7 @@ fn assert_scaled_cast_add_parity_bf16_base(
 
 #[test]
 fn scaled_cast_add_parity_contiguous_small() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let base = fixture(8, 1.0);
     let lora = fixture(8, 2.0);
     assert_scaled_cast_add_parity_f32_f32(&cuda, 1.75, &base, &lora);
@@ -5478,9 +5369,7 @@ fn scaled_cast_add_parity_contiguous_small() {
 
 #[test]
 fn scaled_cast_add_parity_narrowed_with_nonzero_offset() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // Build a [3, 8] tensor and narrow to the middle row — the missing-
     // offset class this crate's own review found (this file's module doc).
     let base_all = fixture(24, 3.0);
@@ -5555,9 +5444,7 @@ fn scaled_cast_add_parity_narrowed_with_nonzero_offset() {
 
 #[test]
 fn scaled_cast_add_parity_empty() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let base_cpu = Tensor::from_slice(&[] as &[f32], (0,), &cpu).unwrap();
     let lora_cpu = Tensor::from_slice(&[] as &[f32], (0,), &cpu).unwrap();
@@ -5581,9 +5468,7 @@ fn scaled_cast_add_parity_empty() {
 
 #[test]
 fn scaled_cast_add_parity_multi_block_exact_multiple_of_block_size() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let base = fixture(4096, 5.0);
     let lora = fixture(4096, 6.0);
     assert_scaled_cast_add_parity_f32_f32(&cuda, 0.5, &base, &lora);
@@ -5591,9 +5476,7 @@ fn scaled_cast_add_parity_multi_block_exact_multiple_of_block_size() {
 
 #[test]
 fn scaled_cast_add_parity_multi_block_not_a_multiple_of_block_size() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let base = fixture(2000, 7.0);
     let lora = fixture(2000, 8.0);
     assert_scaled_cast_add_parity_f32_f32(&cuda, -2.25, &base, &lora);
@@ -5615,9 +5498,7 @@ fn scaled_cast_add_parity_multi_block_not_a_multiple_of_block_size() {
 
 #[test]
 fn philox_kat_vectors_match_on_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let dummy = Tensor::from_slice(&[0.0f32], (1,), &cuda).unwrap();
     // The three vectors are `jammi_kernels::philox::tests`'s own —
@@ -5818,18 +5699,14 @@ fn assert_dropout_parity_f32(
 
 #[test]
 fn dropout_parity_contiguous_small() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let x = fixture(2048, 1.0);
     assert_dropout_parity_f32(&cuda, 4242, 7, 3, 0.05, &x);
 }
 
 #[test]
 fn dropout_parity_p_zero_is_bit_exact_no_op_on_both_devices() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let x = fixture(512, 2.0);
     let x_cpu = Tensor::from_slice(&x, (512,), &cpu).unwrap();
@@ -5847,9 +5724,7 @@ fn dropout_parity_p_zero_is_bit_exact_no_op_on_both_devices() {
 
 #[test]
 fn dropout_parity_narrowed_with_nonzero_offset() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let base = fixture(3 * 256, 3.0);
 
@@ -5896,9 +5771,7 @@ fn dropout_parity_narrowed_with_nonzero_offset() {
 
 #[test]
 fn dropout_parity_empty() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let x_cpu = Tensor::from_slice(&[] as &[f32], (0,), &cpu).unwrap();
     let x_gpu = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
@@ -5916,9 +5789,7 @@ fn dropout_parity_empty() {
 
 #[test]
 fn dropout_parity_multi_block_not_a_multiple_of_block_size() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // 2000 spans multiple 256-thread blocks with a partial last block.
     let x = fixture(2000, 9.0);
     assert_dropout_parity_f32(&cuda, 7, 1, 12, 0.4, &x);
@@ -6348,9 +6219,7 @@ fn assert_lora_linear_parity_f32(
 
 #[test]
 fn lora_linear_parity_f32_contiguous_small() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (rows, inf, outf, r) = (6usize, 5usize, 7usize, 3usize);
     let x = fixture(rows * inf, 1.0);
     let w = fixture(outf * inf, 2.0);
@@ -6361,9 +6230,7 @@ fn lora_linear_parity_f32_contiguous_small() {
 
 #[test]
 fn lora_linear_parity_f32_production_width_wqkv() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (rows, inf, outf, r) = (24 * 128, 1024usize, 3072usize, 16usize);
     let x = fixture(rows * inf, 0.1);
     let w = fixture(outf * inf, 0.2);
@@ -6374,9 +6241,7 @@ fn lora_linear_parity_f32_production_width_wqkv() {
 
 #[test]
 fn lora_linear_parity_f32_narrowed_with_nonzero_offset() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let (rows, inf, outf, r) = (4usize, 6usize, 5usize, 2usize);
     // Build a [3*rows, inf] tensor and narrow to the middle `rows` block —
@@ -6444,9 +6309,7 @@ fn lora_linear_parity_f32_narrowed_with_nonzero_offset() {
 /// device (`CudaStorage::to_dtype`'s own cast kernel vs the CPU backend's).
 #[test]
 fn lora_linear_parity_f32_transposed_x_is_materialized_identically_on_both_devices() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let (inf, outf, r) = (6usize, 5usize, 2usize);
     let rows = 4usize;
@@ -6510,9 +6373,7 @@ fn lora_linear_parity_f32_transposed_x_is_materialized_identically_on_both_devic
 
 #[test]
 fn lora_linear_parity_f32_dropout_matches_across_devices() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let (rows, inf, outf, r) = (8usize, 6usize, 5usize, 2usize);
     let key = DropoutKey {
@@ -6614,9 +6475,7 @@ fn lora_linear_parity_f32_dropout_matches_across_devices() {
 /// from `out_cpu` alone).
 #[test]
 fn lora_linear_parity_bf16_base_production_width() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let (rows, inf, outf, r) = (256usize, 1024usize, 3072usize, 16usize);
     let scale = 0.5f32;
@@ -6745,9 +6604,7 @@ fn lora_linear_parity_bf16_base_production_width() {
 ///   summation-order noise.
 #[test]
 fn lora_linear_parity_bf16_base_backward_production_width() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let (rows, inf, outf, r) = (256usize, 1024usize, 3072usize, 16usize);
     let scale = 0.5f32;
@@ -7098,9 +6955,7 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
 /// same counters before this test's turn.
 #[test]
 fn lora_linear_bf16_base_backward_dispatches_the_fused_cast_boundary_kernels_on_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (rows, inf, outf, r) = (256usize, 1024usize, 3072usize, 16usize);
     let scale = 0.5f32;
 
@@ -7206,9 +7061,7 @@ fn cast_boundary_fixture_bf16(n: usize) -> Vec<bf16> {
 /// cast_scale`'s module doc, "the `+0.0f` term is REQUIRED").
 #[test]
 fn cast_scale_bit_identical_to_the_eager_two_kernel_chain_on_cuda_across_scales() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let n = 12_288usize * 256; // B1's own census m·outf population.
     let xv = cast_boundary_fixture_bf16(n);
     let x = Tensor::from_slice(&xv, (n,), &cuda).unwrap();
@@ -7271,9 +7124,7 @@ fn cast_scale_bit_identical_to_the_eager_two_kernel_chain_on_cuda_across_scales(
 /// B3's own census shape.
 #[test]
 fn cast_add_bit_identical_to_the_eager_two_kernel_chain_on_cuda_with_red_control() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let n = 12_288usize * 128; // B3's own census m·inf population.
     let mut base_v: Vec<bf16> = (0..n)
         .map(|i| bf16::from_f32(((i as f32) * 0.0131).cos() * 4.0))
@@ -7352,9 +7203,7 @@ fn cast_add_bit_identical_to_the_eager_two_kernel_chain_on_cuda_with_red_control
 /// misread, and never confused for a different error variant.
 #[test]
 fn cast_ops_nonzero_start_offset_and_noncontiguous_view_refused_on_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let n = 4096usize;
     let xv = cast_boundary_fixture_bf16(n);
     let x = Tensor::from_slice(&xv, (n,), &cuda).unwrap();
@@ -7450,9 +7299,7 @@ fn cast_ops_nonzero_start_offset_and_noncontiguous_view_refused_on_cuda() {
 /// it cannot serve as this sweep's eager comparator at `n=0`.
 #[test]
 fn cast_ops_n_sweep_partial_block_and_empty_on_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
 
     // n=0: candle's own eager `to_dtype`/`Tensor::add` cannot run on an
     // empty CUDA tensor (see this test's own doc), so this asserts only
@@ -7552,9 +7399,7 @@ fn cast_ops_n_sweep_partial_block_and_empty_on_cuda() {
 /// actual command and result.
 #[test]
 fn lrrl_bwd_dx_fused_vs_disabled_cast_boundary_dump_and_dispatch_proof() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (rows, inf, outf, r) = (256usize, 1024usize, 3072usize, 16usize);
     let scale = 0.11048f32;
     let xv = fixture(rows * inf, 1.0);
@@ -7654,9 +7499,7 @@ fn lrrl_bwd_dx_fused_vs_disabled_cast_boundary_dump_and_dispatch_proof() {
 /// implementation picks — see `exact_fixture`'s own doc.
 #[test]
 fn lora_linear_parity_f32_exact_integer_fixture_is_bit_exact() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (rows, inf, outf, r) = (24usize, 1024usize, 3072usize, 16usize);
     let x = exact_fixture(rows * inf, 1);
     let w = exact_fixture(outf * inf, 2);
@@ -7779,9 +7622,7 @@ fn assert_lora_linear_parity_f32_bit_exact(
 /// uses for its realistic (non-integer) fixture.
 #[test]
 fn lora_linear_parity_bf16_exact_integer_fixture_is_bit_exact() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let (rows, inf, outf, r) = (8usize, 1024usize, 12usize, 4usize);
     let scale = 2.0f32; // exact in binary.
@@ -8016,9 +7857,7 @@ fn assert_lora_linear_parity_f32_bias_bit_exact(
 
 #[test]
 fn lora_linear_parity_f32_bias_exact_integer_fixture_is_bit_exact() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (rows, inf, outf, r) = (24usize, 1024usize, 3072usize, 16usize);
     let x = exact_fixture(rows * inf, 1);
     let w = exact_fixture(outf * inf, 2);
@@ -8046,9 +7885,7 @@ fn lora_linear_parity_f32_bias_exact_integer_fixture_is_bit_exact() {
 /// fixture leg below carries a derived tolerance instead (rule 5).
 #[test]
 fn lora_linear_parity_bf16_bias_exact_integer_fixture_is_bit_exact() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let (rows, inf, outf, r) = (8usize, 1024usize, 12usize, 4usize);
     let scale = 2.0f32; // exact in binary.
@@ -8133,9 +7970,7 @@ fn lora_linear_parity_bf16_bias_exact_integer_fixture_is_bit_exact() {
 /// mantissa).
 #[test]
 fn lora_linear_parity_f16_bias_exact_integer_fixture_is_bit_exact() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let (rows, inf, outf, r) = (8usize, 1024usize, 12usize, 4usize);
     let scale = 2.0f32;
@@ -8212,9 +8047,7 @@ fn lora_linear_parity_f16_bias_exact_integer_fixture_is_bit_exact() {
 /// contract's explicit instruction).
 #[test]
 fn lora_linear_parity_bf16_bias_base_production_width() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let (rows, inf, outf, r) = (256usize, 1024usize, 3072usize, 16usize);
     let scale = 0.5f32;
@@ -8345,9 +8178,7 @@ fn lora_linear_parity_bf16_bias_base_production_width() {
 /// fused op and this eager reference both dispatch to.
 #[test]
 fn lora_linear_bias_bf16_fused_matches_eager_composition_bit_exact_on_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let (rows, inf, outf, r) = (32usize, 256usize, 384usize, 8usize);
     let scale = 0.5f32; // exact in binary.
@@ -8483,9 +8314,7 @@ fn lora_linear_bias_bf16_fused_matches_eager_composition_bit_exact_on_cuda() {
 /// bit-identical regardless of operand form — `tol == 0` by construction.
 #[test]
 fn lora_linear_bias_f16_fused_matches_eager_composition_bit_exact_on_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let (rows, inf, outf, r) = (32usize, 256usize, 384usize, 8usize);
     let scale = 0.5f32; // exact in binary.
@@ -9049,9 +8878,7 @@ fn assert_attention_block_parity_f32(
 
 #[test]
 fn attention_block_parity_f32_global_head_dim_64() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (batch, seq, heads, head_dim) = (2usize, 6usize, 2usize, 64usize);
     let qkv_v = qkv_fixture(batch, seq, heads, head_dim, 1.0);
     assert_attention_block_parity_f32(&cuda, batch, seq, heads, head_dim, None, &qkv_v);
@@ -9059,9 +8886,7 @@ fn attention_block_parity_f32_global_head_dim_64() {
 
 #[test]
 fn attention_block_parity_f32_local_window_head_dim_64() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (batch, seq, heads, head_dim) = (1usize, 9usize, 3usize, 64usize);
     let qkv_v = qkv_fixture(batch, seq, heads, head_dim, 2.0);
     assert_attention_block_parity_f32(&cuda, batch, seq, heads, head_dim, Some(2), &qkv_v);
@@ -9069,9 +8894,7 @@ fn attention_block_parity_f32_local_window_head_dim_64() {
 
 #[test]
 fn attention_block_parity_f32_fully_masked_row_is_zero_on_both_devices() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let (batch, seq, heads, head_dim) = (1usize, 3usize, 1usize, 64usize);
     let qkv_v = qkv_fixture(batch, seq, heads, head_dim, 3.0);
@@ -9139,9 +8962,7 @@ fn attention_block_parity_f32_fully_masked_row_is_zero_on_both_devices() {
 /// unrepresentative, out-of-domain fixture.
 #[test]
 fn attention_block_parity_bf16_cuda_vs_f32_cpu_reference() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let (batch, seq, heads, head_dim) = (1usize, 6usize, 2usize, 64usize);
     let qkv_v: Vec<f32> = qkv_fixture(batch, seq, heads, head_dim, 4.0)
@@ -9324,9 +9145,7 @@ fn attention_block_bf16_emulated_cpu_reference(
 /// re-derived per platform.
 #[test]
 fn attention_block_diag_bf16_fused_cublas_cross_form_determinism_probe_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (batch, seq, heads, head_dim) = (1usize, 6usize, 2usize, 64usize);
     let qkv_v = qkv_fixture(batch, seq, heads, head_dim, 4.0);
     let rope_v = attention_rope_pack(seq, head_dim);
@@ -9452,9 +9271,7 @@ fn attention_block_diag_bf16_fused_cublas_cross_form_determinism_probe_cuda() {
 // check `cuda_fwd` now applies before that derivation.
 #[test]
 fn attention_block_transposed_rope_pack_is_refused_on_cuda_too() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (batch, seq, heads, head_dim) = (1usize, 3usize, 1usize, 64usize);
     let qkv_v = qkv_fixture(batch, seq, heads, head_dim, 5.0);
     let qkv = Tensor::from_slice(&qkv_v, (batch, seq, 3, heads, head_dim), &cuda).unwrap();
@@ -9484,9 +9301,7 @@ fn attention_block_transposed_rope_pack_is_refused_on_cuda_too() {
 // on the CUDA arm.
 #[test]
 fn attention_block_per_batch_mask_row_indexing_is_not_hardcoded_to_zero_on_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let (batch, seq, heads, head_dim) = (3usize, 6usize, 2usize, 64usize);
     let qkv_v = qkv_fixture(batch, seq, heads, head_dim, 6.0);
@@ -10055,65 +9870,49 @@ fn assert_attention_block_bwd_parity_cuda(
 
 #[test]
 fn attention_block_bwd_parity_f32_global_s128_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_attention_block_bwd_parity_cuda(&cuda, DType::F32, 2, 128, 16, 64, None, 7.0);
 }
 
 #[test]
 fn attention_block_bwd_parity_f32_global_s512_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_attention_block_bwd_parity_cuda(&cuda, DType::F32, 2, 512, 16, 64, None, 8.0);
 }
 
 #[test]
 fn attention_block_bwd_parity_f32_window_s128_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_attention_block_bwd_parity_cuda(&cuda, DType::F32, 2, 128, 16, 64, Some(16), 9.0);
 }
 
 #[test]
 fn attention_block_bwd_parity_f32_window_s512_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_attention_block_bwd_parity_cuda(&cuda, DType::F32, 2, 512, 16, 64, Some(64), 10.0);
 }
 
 #[test]
 fn attention_block_bwd_parity_bf16_global_s128_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 2, 128, 16, 64, None, 11.0);
 }
 
 #[test]
 fn attention_block_bwd_parity_bf16_global_s512_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 2, 512, 16, 64, None, 12.0);
 }
 
 #[test]
 fn attention_block_bwd_parity_bf16_window_s128_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 2, 128, 16, 64, Some(16), 13.0);
 }
 
 #[test]
 fn attention_block_bwd_parity_bf16_window_s512_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 2, 512, 16, 64, Some(64), 14.0);
 }
 
@@ -10142,17 +9941,13 @@ fn attention_block_bwd_parity_bf16_window_s512_cuda() {
 // see `three_way_vs_f32_reference`'s own doc).
 #[test]
 fn attention_block_bwd_parity_f32_window_s512_b1_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_attention_block_bwd_parity_cuda(&cuda, DType::F32, 1, 512, 16, 64, Some(64), 21.0);
 }
 
 #[test]
 fn attention_block_bwd_parity_bf16_window_s512_b1_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_attention_block_bwd_parity_cuda(&cuda, DType::BF16, 1, 512, 16, 64, Some(64), 22.0);
 }
 
@@ -10182,9 +9977,7 @@ fn attention_block_bwd_parity_bf16_window_s512_b1_cuda() {
 /// properties of the Layout `bwd_core` itself produces.
 #[test]
 fn attention_block_bwd_dqs_dkr_gemm_layouts_match_production_orientation_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (batch, seq, heads, head_dim) = (2usize, 512usize, 16usize, 64usize);
     let qkv_v = qkv_fixture(batch, seq, heads, head_dim, 60.0);
     let rope_v = attention_rope_pack(seq, head_dim);
@@ -10411,9 +10204,7 @@ fn three_way_vs_f32_reference(
 /// checkpoint needed.
 #[test]
 fn attention_block_bf16_three_way_vs_f32_reference_b1_and_b8_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // Amplitude 12: inside the real checkpoint's own measured max|qkv|
     // range (9-18, `ops::attention_block`'s module doc's "BF16
     // validated-coverage ceiling" section).
@@ -10791,9 +10582,7 @@ fn measure_flash_upstream_form(
 #[test]
 #[cfg(feature = "flash-attn")]
 fn flash_upstream_acceptance_form_vs_f32_reference_dense_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     const SEEDS: [u64; 3] = [101, 102, 103];
     for &(batch, seq) in &[(1usize, 128usize), (4usize, 128usize), (8usize, 512usize)] {
         for &window in &[Some(64usize), None] {
@@ -10860,9 +10649,7 @@ fn flash_upstream_acceptance_form_vs_f32_reference_dense_cuda() {
 #[test]
 #[cfg(feature = "flash-attn")]
 fn flash_upstream_acceptance_form_red_control_window_radius_zero_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let m = measure_flash_upstream_form(
         &cuda,
         8,
@@ -10911,9 +10698,7 @@ fn flash_upstream_acceptance_form_red_control_window_radius_zero_cuda() {
 #[test]
 #[cfg(feature = "flash-attn")]
 fn flash_upstream_acceptance_form_red_control_k_unrotated_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let m = measure_flash_upstream_form(
         &cuda,
         8,
@@ -11194,9 +10979,7 @@ fn measure_flash_upstream_form_bwd_window_dropped(
 #[test]
 #[cfg(feature = "flash-attn")]
 fn flash_upstream_acceptance_form_red_control_bwd_only_window_dropped_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let m = measure_flash_upstream_form_bwd_window_dropped(
         &cuda,
         8,
@@ -11307,9 +11090,7 @@ fn fused_rope_ragged_matches_two_op_composition_bit_identical_fwd_and_bwd_cuda()
         rope_positions_fused_ragged,
     };
 
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let dev = cuda.as_cuda_device().unwrap().clone();
     let lengths = vec![3usize, 7, 2, 5]; // non-uniform -- the ragged case's whole point
     let total: usize = lengths.iter().sum();
@@ -11394,9 +11175,7 @@ fn fused_rope_ragged_matches_dense_entry_at_uniform_lengths_bit_identical_fwd_an
         flash_attention_varlen_with_rope, flash_attention_varlen_with_rope_ragged,
     };
 
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let dev = cuda.as_cuda_device().unwrap().clone();
     let (batch, seq, h, d) = (3usize, 6usize, 2usize, HEAD_DIM);
     let lengths = vec![seq; batch];
@@ -11514,9 +11293,7 @@ fn fused_rope_ragged_refuses_a_zero_length_segment_cuda() {
     use jammi_kernels::flash::{VarlenConfig, HEAD_DIM};
     use jammi_kernels::ops::flash_attention_varlen_with_rope_ragged;
 
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let lengths = [3usize, 0, 5];
     let total: usize = lengths.iter().sum();
     let (h, d) = (2usize, HEAD_DIM);
@@ -11688,33 +11465,25 @@ fn assert_rope_positions_bit_identical_to_rope_fused_bf16(
 
 #[test]
 fn rope_positions_bit_identical_to_rope_fused_bf16_b8_s512_global_theta_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_rope_positions_bit_identical_to_rope_fused_bf16(&cuda, 8, 16, 512, 160_000.0);
 }
 
 #[test]
 fn rope_positions_bit_identical_to_rope_fused_bf16_b8_s512_local_theta_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_rope_positions_bit_identical_to_rope_fused_bf16(&cuda, 8, 16, 512, 10_000.0);
 }
 
 #[test]
 fn rope_positions_bit_identical_to_rope_fused_bf16_b1_s512_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_rope_positions_bit_identical_to_rope_fused_bf16(&cuda, 1, 16, 512, 160_000.0);
 }
 
 #[test]
 fn rope_positions_bit_identical_to_rope_fused_bf16_b8_s128_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_rope_positions_bit_identical_to_rope_fused_bf16(&cuda, 8, 16, 128, 160_000.0);
 }
 
@@ -11724,9 +11493,7 @@ fn rope_positions_bit_identical_to_rope_fused_bf16_b8_s128_cuda() {
 /// conventions (contiguous, production head_dim).
 #[test]
 fn rope_positions_parity_f32_contiguous_head_dim_64_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let cpu = Device::Cpu;
     let (b, h, s, d) = (2usize, 3usize, 6usize, 64usize);
     let total = b * s;
@@ -11774,9 +11541,7 @@ fn rope_positions_parity_f32_contiguous_head_dim_64_cuda() {
 /// elementwise op has no `softmax_scale`-style injection analogue).
 #[test]
 fn rope_positions_bwd_reaches_qkv_gradient_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (b, h, s, d) = (1usize, 2usize, 4usize, 64usize);
     let total = b * s;
     let n = total * 3 * h * d;
@@ -12014,10 +11779,7 @@ fn print_timing_stats(
 #[test]
 #[ignore]
 fn isolated_kernel_timing_cast_boundary_wave1() {
-    let Some(cuda) = cuda_device() else {
-        eprintln!("isolated_kernel_timing: skipping — no CUDA device available");
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
 
     const N_WARMUP: u32 = 20;
     const N_ITERS: u32 = 200;
@@ -12468,9 +12230,7 @@ fn default_adamw_params() -> AdamWParams {
 /// `1..=5`, edge-value theta (`-0.0`, a subnormal, an exact `0.0`).
 #[test]
 fn adamw_step_cpu_cuda_bit_identical_lora_a_shape() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (rows, cols) = (16usize, 1024usize);
     let n = rows * cols;
     assert_adamw_bit_identical(
@@ -12489,9 +12249,7 @@ fn adamw_step_cpu_cuda_bit_identical_lora_a_shape() {
 /// fused QKV projection.
 #[test]
 fn adamw_step_cpu_cuda_bit_identical_lora_b_wqkv_shape() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (rows, cols) = (3072usize, 16usize);
     let n = rows * cols;
     assert_adamw_bit_identical(
@@ -12509,9 +12267,7 @@ fn adamw_step_cpu_cuda_bit_identical_lora_b_wqkv_shape() {
 /// Production LoRA-B shape for `Wo` (`out_features=1024, rank=16`).
 #[test]
 fn adamw_step_cpu_cuda_bit_identical_lora_b_wo_shape() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (rows, cols) = (1024usize, 16usize);
     let n = rows * cols;
     assert_adamw_bit_identical(
@@ -12530,9 +12286,7 @@ fn adamw_step_cpu_cuda_bit_identical_lora_b_wo_shape() {
 /// GeGLU-doubled FFN-up projection.
 #[test]
 fn adamw_step_cpu_cuda_bit_identical_lora_b_wi_shape() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (rows, cols) = (5248usize, 16usize);
     let n = rows * cols;
     assert_adamw_bit_identical(
@@ -12555,9 +12309,7 @@ fn adamw_step_cpu_cuda_bit_identical_lora_b_wi_shape() {
 /// cannot hide behind a single-step check.
 #[test]
 fn adamw_step_changing_lr_over_five_steps_bit_identical() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (rows, cols) = (16usize, 1024usize);
     let n = rows * cols;
     // `assert_adamw_bit_identical` re-derives its own grad fixture per
@@ -12589,9 +12341,7 @@ fn adamw_step_changing_lr_over_five_steps_bit_identical() {
 /// pure-Adam update path on either device.
 #[test]
 fn adamw_step_zero_weight_decay_bit_identical() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (rows, cols) = (16usize, 1024usize);
     let n = rows * cols;
     assert_adamw_bit_identical(
@@ -12618,9 +12368,7 @@ fn adamw_step_zero_weight_decay_bit_identical() {
 /// `theta_update_cuda_fwd` both return early before ever launching.
 #[test]
 fn adamw_step_empty_tensor_on_cuda_is_a_no_op_not_a_crash() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let theta = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
     let m = Tensor::zeros((0,), DType::F32, &cuda).unwrap();
     let v = Tensor::zeros((0,), DType::F32, &cuda).unwrap();
@@ -12642,9 +12390,7 @@ fn adamw_step_empty_tensor_on_cuda_is_a_no_op_not_a_crash() {
 /// refused before any kernel launches, not silently misread.
 #[test]
 fn non_contiguous_first_moment_is_refused_on_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let theta = Tensor::zeros((2, 3), DType::F32, &cuda).unwrap();
     let m_base = Tensor::zeros((3, 2), DType::F32, &cuda).unwrap();
     let m = m_base.t().unwrap();
@@ -12673,9 +12419,7 @@ fn non_contiguous_first_moment_is_refused_on_cuda() {
 /// unrelated reasons.
 #[test]
 fn adamw_step_fma_contracted_red_control_diverges_from_eager_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (rows, cols) = (16usize, 1024usize);
     let n = rows * cols;
     let m0_v = fixture(n, 0.55);
@@ -13030,9 +12774,7 @@ const MEM_EFFICIENT_BWD_BF16_BOUND: f64 = 0.06;
 
 #[test]
 fn mem_efficient_cuda_matches_cpu_plain_f32() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_mem_efficient_fwd_parity_sweep(
         "plain f32",
         &cuda,
@@ -13052,9 +12794,7 @@ fn mem_efficient_cuda_matches_cpu_plain_f32() {
 
 #[test]
 fn mem_efficient_cuda_matches_cpu_plain_bf16() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_mem_efficient_fwd_parity_sweep(
         "plain bf16",
         &cuda,
@@ -13074,9 +12814,7 @@ fn mem_efficient_cuda_matches_cpu_plain_bf16() {
 
 #[test]
 fn mem_efficient_cuda_matches_cpu_rope_f32() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_mem_efficient_fwd_parity_sweep(
         "rope f32",
         &cuda,
@@ -13096,9 +12834,7 @@ fn mem_efficient_cuda_matches_cpu_rope_f32() {
 
 #[test]
 fn mem_efficient_cuda_matches_cpu_rope_bf16() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_mem_efficient_fwd_parity_sweep(
         "rope bf16",
         &cuda,
@@ -13138,9 +12874,7 @@ fn mem_efficient_cuda_matches_cpu_rope_bf16() {
 ///   in-test, not merely stated in prose (round-6 audit advisory).
 #[test]
 fn mem_efficient_cuda_matches_cpu_band_multi_chunk_f32() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let half_window = 64usize;
     let lengths = [1200usize, 900, 70];
     for &len in &lengths {
@@ -13178,9 +12912,7 @@ fn mem_efficient_cuda_matches_cpu_band_multi_chunk_f32() {
 /// window-visibility premise asserted in-test), `dtype=BF16`.
 #[test]
 fn mem_efficient_cuda_matches_cpu_band_multi_chunk_bf16() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let half_window = 64usize;
     let lengths = [1200usize, 900, 70];
     for &len in &lengths {
@@ -13223,9 +12955,7 @@ fn mem_efficient_cuda_matches_cpu_band_multi_chunk_bf16() {
 /// asserted in-test.
 #[test]
 fn mem_efficient_cuda_matches_cpu_band_production_chunk_width_f32() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     const PRODUCTION_CHUNK: usize = 1024;
     let half_window = 64usize;
     let lengths = [1500usize, 1100, 70];
@@ -13271,9 +13001,7 @@ fn mem_efficient_cuda_matches_cpu_band_production_chunk_width_f32() {
 /// (proving the fix, not merely proving SOME divergence exists).
 #[test]
 fn mem_efficient_cuda_fully_masked_zeros_vs_propagate_diverge_observably() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_mem_efficient_fully_masked_policy_split(&cuda, DType::F32, MEM_EFFICIENT_F32_BOUND);
 }
 
@@ -13282,9 +13010,7 @@ fn mem_efficient_cuda_fully_masked_zeros_vs_propagate_diverge_observably() {
 /// `F32`-only). Same fixture, `dtype=BF16`.
 #[test]
 fn mem_efficient_cuda_fully_masked_zeros_vs_propagate_diverge_observably_bf16() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_mem_efficient_fully_masked_policy_split(&cuda, DType::BF16, MEM_EFFICIENT_BF16_BOUND);
 }
 
@@ -13454,9 +13180,7 @@ fn mem_efficient_eager_reference_v(
 /// composition of it, would not show up there).
 #[test]
 fn mem_efficient_cuda_matches_independent_eager_reference_f32() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (batch, seq, heads, head_dim) = (2usize, 13usize, 2usize, 16usize);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let mut sum = 0.0f64;
@@ -13624,9 +13348,7 @@ fn assert_mem_efficient_bwd_parity(
 
 #[test]
 fn mem_efficient_bwd_cuda_matches_cpu_f32() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_mem_efficient_bwd_parity(
         "f32 rope+window",
         &cuda,
@@ -13644,9 +13366,7 @@ fn mem_efficient_bwd_cuda_matches_cpu_f32() {
 
 #[test]
 fn mem_efficient_bwd_cuda_matches_cpu_bf16() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_mem_efficient_bwd_parity(
         "bf16 rope+window",
         &cuda,
@@ -13850,9 +13570,7 @@ fn assert_qmm_grad_fwd_parity_cuda(cuda: &Device, label: &str, leg: QmmGradFwdLe
 /// `rows` across the dispatch boundary.
 #[test]
 fn quant_matmul_grad_forward_parity_cpu_vs_cuda_q8_0_q4_0_q4k_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     for (dtype, out_f, in_f) in [
         (GgmlDType::Q8_0, 4usize, 64usize),
         (GgmlDType::Q4_0, 4usize, 64usize),
@@ -13891,9 +13609,7 @@ fn quant_matmul_grad_forward_parity_cpu_vs_cuda_q8_0_q4_0_q4k_cuda() {
 /// every arm, for every dtype.
 #[test]
 fn quant_matmul_grad_forward_parity_kernel_arm_sweep_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let arms: [(&str, usize); 5] = [
         ("fast_mmvq: single-row decode (rows=1)", 1),
         ("fast_mmvq: mid-batch (rows=4)", 4),
@@ -13960,9 +13676,7 @@ fn assert_all_finite_by_count(label: &str, grad: &[f32]) {
 /// mechanism (activation quantization) that does not exist on this path.
 #[test]
 fn quant_matmul_grad_backward_parity_cuda_dense_reference_and_cpu() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (out_f, in_f, rows) = (5usize, 64usize, 3usize);
     let (wq_cpu, wq_cuda) = qmm_grad_weight_pair(out_f, in_f, GgmlDType::Q8_0, 0.25, &cuda);
     let x_v = qmm_grad_x_fixture(rows, in_f, 2.0);
@@ -14083,9 +13797,7 @@ fn quant_matmul_grad_backward_parity_cuda_dense_reference_and_cpu() {
 /// no separate "eval" branch that could compute a different number.
 #[test]
 fn quant_matmul_grad_eval_prune_matches_tracked_value_on_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let (out_f, in_f, rows) = (3usize, 32usize, 2usize);
     let (_wq_cpu, wq_cuda) = qmm_grad_weight_pair(out_f, in_f, GgmlDType::Q4_0, 3.25, &cuda);
     let x_v = qmm_grad_x_fixture(rows, in_f, 1.1);
@@ -14138,9 +13850,7 @@ fn quant_matmul_grad_eval_prune_matches_tracked_value_on_cuda() {
 // ---------------------------------------------------------------------
 #[test]
 fn quantized_cuda_canary_passes_on_a_healthy_build_and_device() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     // Force a quantized CUDA dispatch (and, through it, the canary) even
     // if no earlier test in this binary already triggered it -- this test
     // must not depend on run order.
@@ -14247,27 +13957,21 @@ fn assert_dropout_parity_f16(
 
 #[test]
 fn dropout_parity_f16_production_width() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let xv = fixture(12_288, 2.0);
     assert_dropout_parity_f16(&cuda, 4242, 3, 7, 0.3, &xv);
 }
 
 #[test]
 fn dropout_parity_f16_p_zero_is_bit_exact_no_op() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let xv = fixture(4096, 3.0);
     assert_dropout_parity_f16(&cuda, 1, 0, 0, 0.0, &xv);
 }
 
 #[test]
 fn dropout_parity_f16_empty_tensor_is_a_no_op_not_an_error() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let x = Tensor::from_slice(&[] as &[f16], (0,), &cuda).unwrap();
     let out: Vec<f16> = dropout(1, 0, 0, 0.3, &x).unwrap().to_vec1().unwrap();
     assert!(out.is_empty());
@@ -14345,25 +14049,19 @@ fn assert_rope_positions_bit_identical_to_rope_fused_f16(
 
 #[test]
 fn rope_positions_bit_identical_to_rope_fused_f16_b8_s512_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_rope_positions_bit_identical_to_rope_fused_f16(&cuda, 8, 16, 512, 160_000.0);
 }
 
 #[test]
 fn rope_positions_bit_identical_to_rope_fused_f16_b1_s128_cuda() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     assert_rope_positions_bit_identical_to_rope_fused_f16(&cuda, 1, 16, 128, 10_000.0);
 }
 
 #[test]
 fn rope_positions_parity_f16_degenerate_d_zero_is_empty_not_a_panic() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let qkv = Tensor::zeros((3, 3, 2, 0), DType::F16, &cuda).unwrap();
     let cos = Tensor::zeros((4, 0), DType::F16, &cuda).unwrap();
     let sin = Tensor::zeros((4, 0), DType::F16, &cuda).unwrap();
@@ -14564,9 +14262,7 @@ fn assert_scaled_cast_add_parity_f16_f16(
 
 #[test]
 fn scaled_cast_add_parity_f16_combinations_contiguous_small() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let base = fixture(64, 1.0);
     let lora = fixture(64, 4.0);
     assert_scaled_cast_add_parity_f16_base(&cuda, 1.75, &base, &lora);
@@ -14576,9 +14272,7 @@ fn scaled_cast_add_parity_f16_combinations_contiguous_small() {
 
 #[test]
 fn scaled_cast_add_parity_f16_combinations_production_width() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let base = fixture(12_288, 2.0);
     let lora = fixture(12_288, 6.0);
     assert_scaled_cast_add_parity_f16_base(&cuda, -2.25, &base, &lora);
@@ -14588,9 +14282,7 @@ fn scaled_cast_add_parity_f16_combinations_production_width() {
 
 #[test]
 fn scaled_cast_add_parity_f16_empty_tensor_is_a_no_op_not_an_error() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let base = Tensor::from_slice(&[] as &[f16], (0,), &cuda).unwrap();
     let lora = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
     let out: Vec<f16> = scaled_cast_add(1.0, &base, &lora)
@@ -14618,9 +14310,7 @@ fn scaled_cast_add_parity_f16_empty_tensor_is_a_no_op_not_an_error() {
 /// own dispatch (`crate::cuda::mod`'s `alloc_empty`/`alloc_zeros` doc).
 #[test]
 fn scaled_cast_add_bf16_f16_pair_is_refused_identically_empty_and_nonempty() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let base_bf16_empty = Tensor::from_slice(&[] as &[bf16], (0,), &cuda).unwrap();
     let lora_f16_empty = Tensor::from_slice(&[] as &[f16], (0,), &cuda).unwrap();
     let err_empty = scaled_cast_add(1.0, &base_bf16_empty, &lora_f16_empty)
@@ -14646,9 +14336,7 @@ fn scaled_cast_add_bf16_f16_pair_is_refused_identically_empty_and_nonempty() {
 /// `mul + 0.0` fma is numerically a no-op).
 #[test]
 fn cast_scale_f16_bit_identical_to_the_eager_two_kernel_chain_on_cuda_across_scales() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let n = 12_288usize * 256;
     let mut xv: Vec<f16> = (0..n)
         .map(|i| f16::from_f32(((i as f32) * 0.017).sin() * 60.0))
@@ -14709,9 +14397,7 @@ fn cast_scale_f16_bit_identical_to_the_eager_two_kernel_chain_on_cuda_across_sca
 
 #[test]
 fn cast_scale_f16_empty_tensor_is_a_no_op_not_an_error() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let x = Tensor::from_slice(&[] as &[f16], (0,), &cuda).unwrap();
     let out = apply1(&x, CastScaleF16F32::new(2.0))
         .unwrap()
@@ -14726,9 +14412,7 @@ fn cast_scale_f16_empty_tensor_is_a_no_op_not_an_error() {
 /// operands, matching `half::f16::Add`'s widen-add-round CPU idiom).
 #[test]
 fn cast_add_f16_bit_identical_to_the_eager_two_kernel_chain_on_cuda_with_red_control() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let n = 12_288usize * 128;
     let mut base_v: Vec<f16> = (0..n)
         .map(|i| f16::from_f32(((i as f32) * 0.0131).cos() * 4.0))
@@ -14790,9 +14474,7 @@ fn cast_add_f16_bit_identical_to_the_eager_two_kernel_chain_on_cuda_with_red_con
 
 #[test]
 fn cast_add_f16_empty_tensor_is_a_no_op_not_an_error() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
     let base = Tensor::from_slice(&[] as &[f16], (0,), &cuda).unwrap();
     let f32val = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
     let out = apply2(&base, &f32val, CastAddF16::new())
@@ -14814,9 +14496,7 @@ fn cast_add_f16_empty_tensor_is_a_no_op_not_an_error() {
 /// asserted invariant, not merely an implication of reading the source.
 #[test]
 fn cast_scale_bf16_f32_and_cast_add_bf16_refuse_f16_both_empty_and_nonempty() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
+    let cuda = jammi_test_resources::cuda_device(0);
 
     let x_f16_nonempty = Tensor::from_slice(&[f16::from_f32(1.0); 8], (8,), &cuda).unwrap();
     let err = apply1(&x_f16_nonempty, CastScaleBf16F32::new(1.0))

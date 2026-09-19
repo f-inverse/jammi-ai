@@ -97,11 +97,11 @@ metal = ["jammi-ai/metal"]
 # IN explicitly via `ci/release-feature-manifest.json`'s per-lane
 # `cargo_features` list — it is never reachable from `cuda`/`default` alone.
 flash-attn = ["jammi-ai/flash-attn"]
-# Compiles the gated GPU-host integration lane (the client/server-topology GPU
-# proof in `tests/it/grpc_embedding_gpu.rs`). Off by default; a meaningful run
-# also needs `cuda` + a visible GPU, otherwise the suite skips. Mirrors
-# `jammi-ai`'s `live-gpu-tests` gate.
-live-gpu-tests = []
+# Compiles the served GPU proofs (`tests/it/grpc_*_gpu.rs`): a gRPC server
+# whose engine is pinned to CUDA device 0.
+live-gpu-tests = ["cuda", "jammi-ai/live-gpu-tests"]
+# Compiles the tests that need a live Postgres at JAMMI_TEST_PG_URL.
+live-postgres-tests = []
 # Compiles the JetStream broker driver into the binary so production
 # deploys can run Postgres + NATS via config without rebuilding from
 # source. CI publishes the OSS image with this feature enabled.
@@ -125,8 +125,12 @@ storage-cloud = ["jammi-db/storage-cloud"]
 # dependencies]` union below; the published binary never enables it, and an
 # enabled hook is inert unless a test arms it.
 test-hooks = ["jammi-ai/test-hooks"]
+# Compiles the tests that need file permissions to apply to the test process: a
+# non-root user on a filesystem that enforces mode bits.
+unprivileged-tests = []
 
 [dev-dependencies]
+jammi-test-resources.workspace = true
 # The `gang_rounds` it-module drives one real collective round through this
 # crate's round seam and compares its tensors to the in-process fold; the
 # tensor type is candle's (already linked through `jammi-ai`'s default

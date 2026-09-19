@@ -19,11 +19,9 @@ use tempfile::TempDir;
 use jammi_db::store::CachePolicy;
 
 use crate::harness;
-use crate::skip_without_gpu;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn modernbert_generate_embeddings_cpu_gpu_parity() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     let model = harness::local_fixture_model_id("tiny_modernbert");
 
@@ -93,7 +91,6 @@ async fn modernbert_generate_embeddings_cpu_gpu_parity() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn modernbert_encode_query_cpu_gpu_parity() {
-    skip_without_gpu!();
     harness::loss_capture::install();
     let model = harness::local_fixture_model_id("tiny_modernbert");
     let query = "a method for quantum error correction in superconducting qubits";

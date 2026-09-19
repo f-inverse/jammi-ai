@@ -5,8 +5,7 @@
 //! re-armed, and the keeper's behaviour on a released `ResultTable` hold.
 //!
 //! Every test is parameterised over [`BackendKind`] the way `jobs_queue.rs`
-//! is (SQLite always; Postgres under `live-postgres-tests`, skipped at
-//! runtime when `JAMMI_TEST_PG_URL` is unset).
+//! is (SQLite always; Postgres under `live-postgres-tests`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +13,6 @@ use std::time::Duration;
 use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::lease_keeper::LeaseTarget;
-use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::{
     CreateResultTableParams, JobAttempt, ResultTableCas, ResultTableKind,
 };
@@ -23,58 +21,10 @@ use jammi_db::catalog::Catalog;
 use jammi_db::config::{LeaseConfig, StoragePrecision};
 use jammi_db::error::JammiError;
 use jammi_db::model_task::ModelTask;
-use jammi_test_utils::{make_test_session, unique_suffix};
 use tempfile::tempdir;
 use test_case::test_case;
 
-use crate::common::keeper_for_backend;
-
-macro_rules! skip_if_no_backend {
-    ($backend:expr, $dir:expr) => {
-        match make_test_session($backend, $dir).await {
-            Some(s) => s,
-            None => {
-                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
-                return;
-            }
-        }
-    };
-}
-
-/// A backend-parameterised catalog with the FK base model registered and
-/// the queue tables cleared (the Postgres lane shares one database).
-macro_rules! catalog_for {
-    ($backend:expr, $dir:expr) => {{
-        let session = skip_if_no_backend!($backend, $dir);
-        let catalog = Arc::clone(session.catalog());
-        catalog
-            .backend_arc()
-            .transaction(TxOptions::default(), |tx| {
-                Box::pin(async move {
-                    tx.execute("DELETE FROM jobs", &[]).await?;
-                    tx.execute("DELETE FROM workers", &[]).await?;
-                    tx.execute("DELETE FROM instances", &[]).await?;
-                    Ok(())
-                })
-            })
-            .await
-            .unwrap();
-        catalog
-            .register_model(RegisterModelParams {
-                model_id: "rt-base",
-                version: 1,
-                model_type: "embedding",
-                backend: "candle",
-                task: ModelTask::TextEmbedding,
-                base_model_id: None,
-                artifact_path: None,
-                config_json: None,
-            })
-            .await
-            .ok();
-        (session, catalog)
-    }};
-}
+use crate::common::{keeper_for_backend, queue_session, unique_suffix, BASE_MODEL_ID};
 
 fn compute_job(job_id: &str, execution: JobExecution) -> SubmitJobParams<'_> {
     SubmitJobParams {
@@ -97,7 +47,7 @@ fn building_row<'a>(
     CreateResultTableParams {
         table_name: table,
         source_id: "src",
-        model_id: "rt-base",
+        model_id: BASE_MODEL_ID,
         task: ModelTask::TextEmbedding,
         kind: ResultTableKind::Model,
         derived_from: None,
@@ -150,7 +100,7 @@ fn fast_intervals() -> jammi_db::catalog::lease::LeaseIntervals {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn released_building_table_is_claimable_by_the_successor_at_once(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = catalog_for!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     let suffix = unique_suffix();
     let writer = format!("writer-{suffix}");
     let queued_table = format!("sw_queued_{suffix}");
@@ -330,7 +280,7 @@ async fn released_building_table_is_claimable_by_the_successor_at_once(backend: 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_released_building_lease_is_never_re_armed_by_the_keeper(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = catalog_for!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     let suffix = unique_suffix();
     let writer = format!("writer-{suffix}");
     let table = format!("rearm_{suffix}");
@@ -434,7 +384,7 @@ fn lease_present_is_false_in_every_builder_and_set_by_with_lease_present() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_sweep_writes_a_null_lease_the_backend_reads_back(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = catalog_for!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     let suffix = unique_suffix();
     let writer = format!("writer-{suffix}");
     let table = format!("raw_{suffix}");
@@ -523,7 +473,7 @@ async fn get_result_table_for_tenant_never_matches_a_null_tenant_row_for_a_real_
     kind: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let (session, catalog) = catalog_for!(kind, dir.path());
+    let (session, catalog) = queue_session(kind, dir.path()).await;
     let table = format!("strict_null_tenant_{}", unique_suffix());
     catalog
         .create_result_table(building_row(&table, "writer-strict", None))
@@ -597,7 +547,7 @@ async fn get_result_table_for_tenant_never_matches_a_null_tenant_row_for_a_real_
 #[tokio::test]
 async fn get_result_table_for_tenant_resolves_only_the_owning_tenant(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let (session, catalog) = catalog_for!(kind, dir.path());
+    let (session, catalog) = queue_session(kind, dir.path()).await;
     let table = format!("strict_owned_{}", unique_suffix());
     let tenant_a = strict_tenant(0x1a);
     let tenant_b = strict_tenant(0x1b);

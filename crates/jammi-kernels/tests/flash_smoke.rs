@@ -30,7 +30,6 @@
 //! Every tolerance below states its derivation, its mutation (what change
 //! it is proven to detect), and the ratio bound / max|signal| is printed
 //! from the run (the pod output is pasted into the landing commit).
-#![cfg(feature = "flash-attn")]
 
 use candle_core::cuda_backend::cudarc::driver::DeviceRepr;
 use candle_core::{CudaDevice, Device};
@@ -51,23 +50,6 @@ use jammi_kernels::flash::{
 /// ([`RawBuffers`]'s own fields), so every raw-args literal below
 /// legitimately uses THIS value, never the fp16 one.
 const DTYPE_BF16: i32 = 0;
-
-fn cuda_device() -> Option<CudaDevice> {
-    match Device::new_cuda(0) {
-        Ok(d) => Some(d.as_cuda_device().unwrap().clone()),
-        Err(e) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!(
-                    "flash_smoke: JAMMI_REQUIRE_CUDA is set but no CUDA device could be \
-                     acquired — this is the landing proof, a silent skip here is not \
-                     acceptable: {e}"
-                );
-            }
-            eprintln!("flash_smoke: skipping — no CUDA device available ({e})");
-            None
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Fixture + CPU reference
@@ -394,13 +376,13 @@ fn fwd_matches_cpu_reference_window_none_and_some2_body(dev: &CudaDevice, lens: 
 
 #[test]
 fn fwd_matches_cpu_reference_window_none_and_some2() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     fwd_matches_cpu_reference_window_none_and_some2_body(&dev, &SMALL_LENS);
 }
 
 #[test]
 fn fwd_matches_cpu_reference_window_none_and_some2_multi_tile() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     fwd_matches_cpu_reference_window_none_and_some2_body(&dev, &LARGE_LENS);
 }
 
@@ -444,13 +426,13 @@ fn fwd_twice_is_bit_identical_in_o_and_lse_body(dev: &CudaDevice, lens: &[usize]
 
 #[test]
 fn fwd_twice_is_bit_identical_in_o_and_lse() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     fwd_twice_is_bit_identical_in_o_and_lse_body(&dev, &SMALL_LENS);
 }
 
 #[test]
 fn fwd_twice_is_bit_identical_in_o_and_lse_multi_tile() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     fwd_twice_is_bit_identical_in_o_and_lse_body(&dev, &LARGE_LENS);
 }
 
@@ -636,7 +618,7 @@ fn slot_stats(a: &[f64], b: &[f64], mass: &[f64], lens: &[usize], slot: usize) -
 /// at multi-tile scale).
 #[test]
 fn bwd_matches_central_finite_differences() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let lens = &SMALL_LENS;
     let fx = fixture(lens);
     let dfx = upload(&dev, &fx);
@@ -708,7 +690,7 @@ fn bwd_matches_central_finite_differences() {
 /// wrong window and the wrong scale.
 #[test]
 fn bwd_matches_analytic_reference_multi_tile() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let lens = &LARGE_LENS;
     let fx = fixture(lens);
     let dfx = upload(&dev, &fx);
@@ -786,13 +768,13 @@ fn bwd_deterministic_rerun_is_bit_identical_body(dev: &CudaDevice, lens: &[usize
 
 #[test]
 fn bwd_deterministic_rerun_is_bit_identical() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     bwd_deterministic_rerun_is_bit_identical_body(&dev, &SMALL_LENS);
 }
 
 #[test]
 fn bwd_deterministic_rerun_is_bit_identical_multi_tile() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     bwd_deterministic_rerun_is_bit_identical_body(&dev, &LARGE_LENS);
 }
 
@@ -914,7 +896,7 @@ fn status_of(code: i32) -> Option<FlashStatus> {
 
 #[test]
 fn c_wrapper_refuses_dropout_with_the_typed_status() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let fx = fixture(&SMALL_LENS);
     let b = raw_buffers(&dev, &fx);
     // Positive control first: the unmutated args run (the cell table
@@ -952,7 +934,7 @@ fn c_wrapper_refuses_dropout_with_the_typed_status() {
 
 #[test]
 fn c_wrapper_refusal_cells() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let fx = fixture(&SMALL_LENS);
     let b = raw_buffers(&dev, &fx);
     let ok = valid_fwd_args(&dev, &b);
@@ -1126,7 +1108,7 @@ fn c_wrapper_refusal_cells() {
 
 #[test]
 fn rust_boundary_refuses_wrong_buffer_lengths_and_splits() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let fx = fixture(&SMALL_LENS);
     let dfx = upload(&dev, &fx);
     let g = geom(&dfx.cu);
@@ -1419,13 +1401,13 @@ fn guard_regions_around_every_output_and_scratch_buffer_are_untouched_body(
 
 #[test]
 fn guard_regions_around_every_output_and_scratch_buffer_are_untouched() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     guard_regions_around_every_output_and_scratch_buffer_are_untouched_body(&dev, &SMALL_LENS);
 }
 
 #[test]
 fn guard_regions_around_every_output_and_scratch_buffer_are_untouched_multi_tile() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     guard_regions_around_every_output_and_scratch_buffer_are_untouched_body(&dev, &LARGE_LENS);
 }
 
@@ -1440,7 +1422,7 @@ fn guard_regions_around_every_output_and_scratch_buffer_are_untouched_multi_tile
 /// buffer itself.
 #[test]
 fn bwd_deterministic_ignores_a_poisoned_dq_accum_on_entry() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let fx = fixture(&SMALL_LENS);
     let dfx = upload(&dev, &fx);
     let g = geom(&dfx.cu);
@@ -1502,7 +1484,7 @@ fn bwd_deterministic_ignores_a_poisoned_dq_accum_on_entry() {
 
 #[test]
 fn num_sms_and_dq_accum_splits_agree() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let n = flash::num_sms(&dev).unwrap();
     // Any GPU this feature targets has many SMs (A100: 108); a stub
     // answer of 0 or 1 is not a device.

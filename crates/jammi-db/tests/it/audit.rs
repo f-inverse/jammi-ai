@@ -7,6 +7,7 @@
 
 use std::sync::OnceLock;
 
+use crate::common::kept_dir_session;
 use futures::StreamExt;
 use jammi_db::audit::{
     self, EnvSigningKeyStore, PerQueryAudit, AUDIT_TABLE_NAME, AUDIT_TOPIC, MASTER_KEY_ENV,
@@ -14,7 +15,6 @@ use jammi_db::audit::{
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::tenant::TenantId;
 use jammi_db::trigger::Predicate;
-use jammi_test_utils::make_test_session;
 use test_case::test_case;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -47,26 +47,6 @@ fn fresh_tenant() -> TenantId {
     TenantId::from_uuid(Uuid::new_v4()).unwrap()
 }
 
-/// Fetch a backend-parameterized session, skipping the test (with a warning,
-/// never `#[ignore]`) when the Postgres arm has no `JAMMI_TEST_PG_URL`.
-macro_rules! session_or_skip {
-    ($backend:expr) => {{
-        let dir = tempfile::tempdir().expect("tempdir");
-        match make_test_session($backend, dir.path()).await {
-            Some(s) => {
-                // Keep the catalog dir alive for the process; the harness
-                // exits cleanly.
-                std::mem::forget(dir);
-                s
-            }
-            None => {
-                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
-                return;
-            }
-        }
-    }};
-}
-
 fn sample(model: &str) -> PerQueryAudit {
     PerQueryAudit::new(
         Uuid::now_v7(),
@@ -86,7 +66,7 @@ async fn log_then_fetch_and_signature_verifies(backend: BackendKind) {
     let _g = env_lock().lock().await;
     set_master_key();
     let tenant_a = fresh_tenant();
-    let s = session_or_skip!(backend).with_tenant(tenant_a);
+    let s = kept_dir_session(backend).await.with_tenant(tenant_a);
 
     let rec = sample("test/model");
     let qid = rec.query_id;
@@ -123,7 +103,7 @@ async fn log_then_fetch_and_signature_verifies(backend: BackendKind) {
 async fn tenant_isolation(backend: BackendKind) {
     let _g = env_lock().lock().await;
     set_master_key();
-    let s = session_or_skip!(backend);
+    let s = kept_dir_session(backend).await;
 
     // Tenant A writes two records.
     let tenant_a = fresh_tenant();
@@ -154,7 +134,7 @@ async fn two_tenants_can_both_log(backend: BackendKind) {
     // each must see only its own audit records (delivered isolation preserved).
     let _g = env_lock().lock().await;
     set_master_key();
-    let s = session_or_skip!(backend);
+    let s = kept_dir_session(backend).await;
 
     // Tenant A's first log registers its own `jammi.audit.search.v1` topic.
     let a_tenant = fresh_tenant();
@@ -222,7 +202,7 @@ async fn two_tenants_can_both_log(backend: BackendKind) {
 async fn raw_sql_is_tenant_scoped(backend: BackendKind) {
     let _g = env_lock().lock().await;
     set_master_key();
-    let s = session_or_skip!(backend);
+    let s = kept_dir_session(backend).await;
 
     let tenant_a = fresh_tenant();
     let tenant_b = fresh_tenant();
@@ -249,7 +229,7 @@ async fn lineage_cap_enforced(backend: BackendKind) {
     let _g = env_lock().lock().await;
     set_master_key();
     std::env::set_var(audit::MAX_LINEAGE_BYTES_ENV, "64");
-    let s = session_or_skip!(backend).with_tenant(fresh_tenant());
+    let s = kept_dir_session(backend).await.with_tenant(fresh_tenant());
 
     let big = "x".repeat(200);
     let rec = PerQueryAudit::new(
@@ -274,7 +254,7 @@ async fn lineage_cap_enforced(backend: BackendKind) {
 async fn log_requires_tenant_binding(backend: BackendKind) {
     let _g = env_lock().lock().await;
     set_master_key();
-    let s = session_or_skip!(backend);
+    let s = kept_dir_session(backend).await;
     let err = s.audit().log(vec![sample("m")]).await.unwrap_err();
     assert!(matches!(err, audit::AuditError::NoTenantBinding));
 }
@@ -285,7 +265,7 @@ async fn log_requires_tenant_binding(backend: BackendKind) {
 async fn master_key_missing_is_fatal_for_writes(backend: BackendKind) {
     let _g = env_lock().lock().await;
     std::env::remove_var(MASTER_KEY_ENV);
-    let s = session_or_skip!(backend).with_tenant(fresh_tenant());
+    let s = kept_dir_session(backend).await.with_tenant(fresh_tenant());
     // Criterion 8 (data path): with no master key, signing — and thus the log
     // call — fails. `audit::ensure_master_key_present` is the startup check a
     // server can call to fail fast on the same condition, asserted here too.
@@ -301,7 +281,7 @@ async fn published_to_trigger_topic(backend: BackendKind) {
     let _g = env_lock().lock().await;
     set_master_key();
     let tenant_a = fresh_tenant();
-    let s = session_or_skip!(backend).with_tenant(tenant_a);
+    let s = kept_dir_session(backend).await.with_tenant(tenant_a);
 
     // The first log registers the audit topic (via the catalog topic repo) and
     // provisions its backing table. Look it up so we subscribe to the exact id
@@ -354,7 +334,7 @@ async fn published_to_trigger_topic(backend: BackendKind) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn reserved_table_name_rejected_for_users(backend: BackendKind) {
-    let s = session_or_skip!(backend);
+    let s = kept_dir_session(backend).await;
     use jammi_db::store::mutable::{MutableTableDefinitionBuilder, MutableTableId};
     let id = MutableTableId::new(AUDIT_TABLE_NAME).unwrap();
     let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
@@ -382,7 +362,7 @@ async fn bench_bulk_insert() {
     let _g = env_lock().lock().await;
     set_master_key();
     let backend = BackendKind::Sqlite;
-    let s = session_or_skip!(backend).with_tenant(fresh_tenant());
+    let s = kept_dir_session(backend).await.with_tenant(fresh_tenant());
 
     for &n in &[10usize, 100, 1000] {
         let records: Vec<PerQueryAudit> = (0..n).map(|_| sample("bench/model")).collect();

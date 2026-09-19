@@ -169,8 +169,8 @@ why = "Every enum the docs enumerate lists exactly the variants the code has."
 
 [[guard]]
 name = "no run-time test skips"
-run = "bash ci/scripts/check_no_require_flags.sh"
-why = "No test reads green when its resource is missing: none reads a JAMMI_REQUIRE_* flag, because none has a skip for one to guard."
+run = "bash ci/scripts/check_no_runtime_skips.sh"
+why = "No test reads green when its resource is missing: none calls a run-time skip, and none reads a JAMMI_REQUIRE_* flag, because none has a skip for one to guard."
 
 [[guard]]
 name = "GPU parity matrix"

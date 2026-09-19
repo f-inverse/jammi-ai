@@ -33,16 +33,14 @@
 //!
 //! [`attention_softmax`] is the single dispatch point every attention module
 //! in this crate composes: `training == false` (the default) takes
-//! `softmax_last_dim`, matching every eval path's numerics unchanged from
-//! before this module existed; `training == true` takes
+//! `softmax_last_dim`, the eval numerics; `training == true` takes
 //! `candle_nn::ops::softmax(scores, D::Minus1)`, the ordinary differentiable
 //! max/sub/exp/sum/div composition, so backward reaches every operand.
 //!
 //! The two arms are measured bit-identical on CPU at f32 and bf16 (see
 //! [`tests::softmax_last_dim_and_composed_softmax_are_cpu_bit_identical`]),
-//! so `training == false` costs nothing to keep byte-identical to the
-//! pre-existing eval path. This is NOT guaranteed on CUDA: candle's fused
-//! softmax kernel and the composed primitive-op reduction can differ in
+//! so on CPU the choice of arm never changes a number. This is NOT guaranteed on CUDA: candle's
+//! fused softmax kernel and the composed primitive-op reduction can differ in
 //! floating-point reduction order there, which is why `training` stays a
 //! caller-controlled flag rather than always taking the composed arm.
 
@@ -82,10 +80,8 @@ pub(crate) const OUT_PROJ_SITE: &str = "out_proj";
 /// it. The Q/K/V split (`qkv.i(0..2)?`) yields non-contiguous slices of the
 /// permuted fused projection, but no explicit `.contiguous()` is needed on
 /// them here: every consumer is [`crate::contiguous_matmul`], which
-/// contiguous-izes both its operands unconditionally, so the vision tower's
-/// op sequence is exactly what it was before this module existed (one
-/// implicit contiguous copy per operand, made inside the matmul primitive,
-/// not two).
+/// contiguous-izes both its operands unconditionally (one implicit
+/// contiguous copy per operand, made inside the matmul primitive, not two).
 pub(crate) struct MultiHeadAttention {
     /// The FUSED QKV projection as ONE LoRA site. Q/K/V are three row
     /// ranges of a single `[3*width, width]` weight in the OpenCLIP
@@ -120,22 +116,20 @@ impl MultiHeadAttention {
         Ok((FrozenBase::Dense(in_proj), FrozenBase::Dense(out_proj)))
     }
 
-    /// Fully frozen construction — no adapter on either site. Byte-for-byte
-    /// the module this constructor always built: routed through
+    /// Fully frozen construction — no adapter on either site. Routed through
     /// [`Self::load_with`] with a [`FrozenSiteHolder`]'s decline-everything
     /// site, so there is exactly ONE construction path and an unselected
     /// site is `MaybeLoraLinear::Frozen(FrozenBase::Dense(linear))`, whose
     /// forward is `Linear::forward` unchanged.
     ///
     /// `#[cfg(test)]`-only: both owning towers (`crate::clip_text`,
-    /// `crate::open_clip_vision`) now construct through [`Self::load_with`]
-    /// — their own frozen `load` entry points supply the
-    /// decline-everything site once, at the TOWER level, rather than each
-    /// block re-deriving one. What remains are this crate's own test
-    /// modules, which build a bare `MultiHeadAttention` directly and have
-    /// no `LoraSite` to hand it. Kept (rather than deleted) precisely so
-    /// those attention-level oracles keep exercising the same frozen
-    /// construction the towers do.
+    /// `crate::open_clip_vision`) construct through [`Self::load_with`] —
+    /// their own frozen `load` entry points supply the decline-everything
+    /// site once, at the TOWER level, rather than each block re-deriving
+    /// one. This crate's test modules build a bare `MultiHeadAttention`
+    /// directly and have no `LoraSite` to hand it; this constructor keeps
+    /// those attention-level oracles on the same frozen construction the
+    /// towers use.
     #[cfg(test)]
     pub(crate) fn load(
         vb: VarBuilder,
@@ -301,14 +295,12 @@ mod tests {
         Ok(attn.out_proj.forward(&attn_output)?)
     }
 
-    /// Advisory (i)'s claim, MEASURED: dropping the three redundant
-    /// `qkv.i(_)?.contiguous()?` calls (since [`crate::contiguous_matmul`]
-    /// already contiguous-izes both its operands) changes NO output byte —
-    /// `.contiguous()` only ever materializes a data layout, never a value,
-    /// so contiguous-izing an operand once (inside `contiguous_matmul`)
-    /// versus twice (once explicitly here, redundantly, then again inside
-    /// `contiguous_matmul`, a true no-op the second time) cannot change the
-    /// numbers either way. Covers both the causally-masked shape
+    /// MEASURED: omitting explicit `qkv.i(_)?.contiguous()?` calls (since
+    /// [`crate::contiguous_matmul`] already contiguous-izes both its
+    /// operands) changes NO output byte — `.contiguous()` only ever
+    /// materializes a data layout, never a value, so contiguous-izing an
+    /// operand once (inside `contiguous_matmul`) versus twice (a true no-op
+    /// the second time) cannot change the numbers either way. Covers both the causally-masked shape
     /// (`clip_text`'s) and the unmasked shape (`open_clip_vision`'s), at an
     /// odd `seq_len` so no accidental symmetry could mask a real
     /// divergence.

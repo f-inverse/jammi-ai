@@ -28,10 +28,9 @@
 //! So this type takes an ALREADY-RESOLVED [`FrozenBase`] and owns only the
 //! decision that is common: *does this site get an adapter, at what rank,
 //! and where do its A/B tensors live?* Each tower's loader keeps resolving
-//! its own bases exactly as it always has, which is also why the frozen
-//! (unadapted) path stays byte-identical by construction — an unselected
-//! site is `MaybeLoraLinear::Frozen(base)` around the very same `Linear` the
-//! loader built before this module existed.
+//! its own bases, which is also why the frozen (unadapted) path is
+//! byte-identical by construction — an unselected site is
+//! `MaybeLoraLinear::Frozen(base)` around the very `Linear` the loader built.
 //!
 //! The BERT family is deliberately NOT migrated onto this seam: it has its
 //! own working, proven site builder, and a migration would re-open three
@@ -202,7 +201,7 @@ mod tests {
         }
     }
 
-    /// Plan 67 U4b's seed split at the tower seam every non-BERT tower's
+    /// The init/dropout seed split at the tower seam every non-BERT tower's
     /// sites go through: `LoraBuildConfig::seed` keys the A/B init draw and
     /// `dropout_seed` keys the mask draw, independently — two sites built
     /// with the same `seed` and different `dropout_seed`s have byte-identical

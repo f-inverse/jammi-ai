@@ -61,7 +61,7 @@ use crate::lora_linear::frozen_weight_gate;
 /// in_features]`, the same convention `candle_nn::Linear`'s own weight
 /// uses) plus an optional dense `f32`-or-narrower bias.
 ///
-/// # The uniform F32 activation rule (K2: no unsupported dtype can reach candle)
+/// # The uniform F32 activation rule (no unsupported dtype can reach candle)
 ///
 /// [`Self::forward`] ALWAYS casts `x` to `F32` before calling
 /// `quant_matmul_grad`, adds the bias (also cast to `F32`), and casts the
@@ -86,9 +86,9 @@ pub struct QuantizedLinear {
 }
 
 impl QuantizedLinear {
-    /// `weight` must be rank 2, `[out_features, in_features]` (family D —
-    /// checked here, in ADDITION to `QTensor::cpu_fwd`'s own `dims2()?`
-    /// check at dispatch time, so a malformed weight is refused at
+    /// `weight` must be rank 2, `[out_features, in_features]` (checked
+    /// here, in ADDITION to `QTensor::cpu_fwd`'s own `dims2()?` check at
+    /// dispatch time, so a malformed weight is refused at
     /// CONSTRUCTION with a clear message rather than only at the first
     /// forward). `bias`, when present, must be `[out_features]`.
     pub fn new(weight: Arc<QTensor>, bias: Option<Tensor>) -> Result<Self, LoraError> {
@@ -208,10 +208,9 @@ impl FrozenBase {
     /// be DEAD CODE: no production call path in this workspace can ever
     /// construct a `QuantizedLinear` whose weight is anything other than a
     /// true frozen `Arc<QTensor>` leaf. Documented here, not guarded with
-    /// an unreachable typed error, per this crate's own K2 discipline
-    /// (a typed refusal for a genuinely unreachable case reads as evidence
-    /// of a real hazard where none exists). Asserted by
-    /// `dweight_needed_is_constant_false_for_a_quantized_base` in
+    /// an unreachable typed error (a typed refusal for a genuinely
+    /// unreachable case reads as evidence of a real hazard where none
+    /// exists). Asserted by `dweight_needed_is_constant_false_for_a_quantized_base` in
     /// `lora_linear.rs`'s test module.
     pub fn dweight_needed(&self) -> Result<bool, LoraError> {
         match self {
@@ -220,10 +219,8 @@ impl FrozenBase {
         }
     }
 
-    /// `forward` — module doc consumers 1 and 5: `Dense`'s cast-to-weight-
-    /// dtype-then-forward is PRESERVED BYTE-FOR-BYTE from every prior
-    /// release (the exact composition `wrapper.rs`'s `MaybeLoraLinear::
-    /// forward`'s `Frozen` arm used inline before this type existed);
+    /// `forward` — module doc consumers 1 and 5: `Dense` casts the input to
+    /// the weight's dtype, then runs the plain `Linear` forward;
     /// `Quantized` routes through [`QuantizedLinear::forward`]'s uniform F32
     /// rule.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, LoraError> {

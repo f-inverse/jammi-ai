@@ -21,24 +21,18 @@
 //!    — the positive/negative dispatch-counter proof across the admission
 //!    predicate's real dtype domain (`F32`/`BF16`/`F16` all fuse when `x`
 //!    and the base weight MATCH; a mismatched pair falls back regardless
-//!    of either individual dtype's own support — campaign #443 D1 widened
-//!    both the fused kernel's own domain and this call-site predicate to
-//!    admit `F16`; esc-076 found the predicate widening had been missed).
+//!    of either individual dtype's own support).
 //! 4. `esc_031_golden_holds_through_the_fused_path_with_dispatch_proof` —
-//!    the esc-031 golden (`Lora(W) == Frozen(W)` at `lora_b == 0`),
+//!    the zero-B golden (`Lora(W) == Frozen(W)` at `lora_b == 0`),
 //!    re-run here with an explicit assertion that the FUSED kernel (not a
 //!    fallback) is what produced the agreement, so the golden is not
 //!    accidentally green only because the fused path never engaged.
 //!
-//! **Migrated (whole-site fusion commit):** items 3 and 4 originally
-//! asserted on `lora_epilogue_dispatch_snapshot` (the single-op epilogue
-//! counter). `LoraLinear::forward`'s training arm now routes through
-//! `jammi_kernels::ops::LowRankResidualLinear` — the WHOLE site, not just the
-//! epilogue — so these three tests now assert on
-//! `lora_linear_fused_dispatch_snapshot` instead, and
-//! `training_mode_on_a_supported_dtype_dispatches_fused_and_is_counted`
-//! additionally pins that `lora_epilogue`'s own counter stays untouched by
-//! a fused-site dispatch (documented, not silently left stale).
+//! `LoraLinear::forward`'s training arm routes the WHOLE site (not just the
+//! epilogue) through `jammi_kernels::ops::LowRankResidualLinear`, so items 3
+//! and 4 assert on `lora_linear_fused_dispatch_snapshot`, and the F16 test
+//! additionally pins that `lora_epilogue`'s own counter stays untouched by a
+//! fused-site dispatch.
 
 use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::{Linear, Module, VarBuilder, VarMap};
@@ -86,12 +80,17 @@ fn rand_input(device: &Device) -> Tensor {
 }
 
 /// Same weight VALUES as [`build_base`], but as a NON-CONTIGUOUS `w` — a
-/// dim-1 narrow of a wider, untracked-leaf matrix. #428 P2b made a
-/// bias-carrying base FUSE (see this file's own module doc's "Migrated"
-/// note for the prior lever this replaces): `bias.is_some()` alone no
-/// longer forces `LoraLinear::forward`'s eager-fallback arm, so
-/// `lora_linear_admission_predicate`'s `w_contiguous` refusal is the new
-/// forced-eager lever instead — a domain miss with NOTHING to do with
+/// dim-1 narrow of a wider, untracked-leaf matrix. A bias-carrying base
+/// FUSES, so `bias.is_some()` does not force `LoraLinear::forward`'s
+/// eager-fallback arm; `lora_linear_admission_predicate`'s `w_contiguous`
+/// refusal is the forced-eager lever instead — a domain miss with NOTHING to
+/// do with bias, so this is the "same math, forced-eager" fixture the
+/// cross-arm oracles below need: any output difference between a
+/// fused-arm and an eager-arm instance built with this vs [`build_base`]
+/// is attributable ONLY to which arm dispatched. `w` remains a true
+/// untracked leaf here (`frozen_weight_gate` still passes; ONLY the
+/// contiguity changes) — the wider buffer's second `in_features` columns
+/// are pure filler, never read by any GEMM this file issues.
 /// bias, so this is still the "same math, forced-eager" fixture the
 /// cross-arm oracles below need: any output difference between a
 /// fused-arm and an eager-arm instance built with this vs [`build_base`]
@@ -137,9 +136,8 @@ fn build_base_with_noncontiguous_w(
 /// packs `lora_a`/`lora_b` into one row-packed `ab` buffer; the eager path
 /// calls three independent `Linear::forward`s), and `gemm`'s own
 /// summation-order choice can depend on that — a real, EXPECTED 1-`f32`-
-/// ULP divergence this test used to hit on non-integer (`Tensor::randn`/
-/// `sin`-fixture) values, NOT a wiring bug (see
-/// `ops::low_rank_residual_linear`'s own module doc and
+/// ULP divergence on non-integer (`Tensor::randn`/`sin`-fixture) values,
+/// NOT a wiring bug (see `ops::low_rank_residual_linear`'s own module doc and
 /// `lora_linear_oracles.rs`'s "oracle contract" section for the same
 /// citation). This test's OWN stated purpose is proving the WIRING (same
 /// `base_out`/`lora_out`, no extra divergence) — exact-integer values let
@@ -202,8 +200,7 @@ fn fused_epilogue_matches_manual_eager_reconstruction_bit_exactly() {
 
     // Manual eager reconstruction using the SAME lora_a/lora_b the fused
     // call used (public fields) and an independently-built, bit-identical
-    // base weight — the exact `[mul, cast, add]` composition
-    // `LoraLinear::forward` used to run unconditionally.
+    // base weight — the plain `[mul, cast, add]` composition.
     let base_out = base_for_eager.forward(&x).unwrap();
     let a_lin = Linear::new(lora.lora_a.clone(), None);
     let after_a = a_lin.forward(&x).unwrap();
@@ -311,14 +308,13 @@ fn training_mode_on_a_supported_dtype_dispatches_fused_and_is_counted() {
     .unwrap();
 
     // `>` rather than `== +1`: the counters are process-wide, but every
-    // counter-touching test in this binary now holds
-    // `DISPATCH_COUNTER_PAIR_LOCK` (acquired above), which serialises them
-    // against each other. `>` is kept here because this assertion only
+    // counter-touching test in this binary holds `DISPATCH_COUNTER_PAIR_LOCK` (acquired above),
+    // which serialises them against each other. `>` is kept here because this assertion only
     // claims "did dispatch"; wherever a test also claims exclusivity (that
     // the OTHER arm's counter did NOT move), it asserts `== before` on that
     // counter directly — see the cross-arm bias oracle above.
     let before = lora_linear_fused_dispatch_snapshot();
-    // `lora_epilogue`'s OWN counter, unchanged by this forward: the P2
+    // `lora_epilogue`'s OWN counter, unchanged by this forward: the
     // fused LoRA site never calls `ScaledCastAdd` through `admit` (it
     // reuses `ScaledCastAdd::cpu_fwd` directly, internally — see
     // `jammi_lora::lora_epilogue_counters`'s doc). A fused-dispatch
@@ -350,13 +346,10 @@ fn training_mode_on_a_mismatched_dtype_pair_falls_back_and_is_counted() {
     // `x` (`rand_input`) is always `F32`; the base weight here is `F16` —
     // a MISMATCHED `(x, w)` pair, which `lora_linear_admission_predicate`
     // must refuse regardless of whether either individual dtype is, on
-    // its own, in the op's supported set (campaign #443 D1 widened that
-    // set — and this predicate — to admit `F16` too, but only a genuine
-    // `(F16, F16)` pair; see
+    // its own, in the op's supported set (`F16` is admitted, but only as a
+    // genuine `(F16, F16)` pair; see
     // `training_mode_on_an_f16_backbone_dispatches_fused_and_is_counted`
-    // for that positive case). Named for what this fixture actually is
-    // (a mismatch), not "F16 is categorically unsupported" — the doc this
-    // replaced was stale the moment `F16` support landed.
+    // for that positive case).
     let base = build_base(8, 16, &device, DType::F16);
     let x = rand_input(&device);
 
@@ -386,20 +379,10 @@ fn training_mode_on_a_mismatched_dtype_pair_falls_back_and_is_counted() {
 /// The positive counterpart to
 /// `training_mode_on_a_mismatched_dtype_pair_falls_back_and_is_counted`:
 /// a GENUINE `(F16, F16)` pair (both `x` and the base weight) must
-/// dispatch the fused kernel, exactly like the existing `F32`/`BF16` cells
-/// — campaign #443 D1 widened `LowRankResidualLinear`'s (and
-/// `ScaledCastAdd`'s CPU epilogue's) own domain to `F16` end to end, and
-/// this predicate must actually admit it rather than leaving an `F16`
-/// backbone permanently eager-only (esc-075/esc-076's own triage row: this
-/// call site's `F16` gap left it silently, permanently eager; the pod's
-/// own 17360-fused/0-eager trace, reproduced by this test's own
-/// counter-delta assertion below, is the measured proof this widening
-/// closes it). This is NOT a claimed fix for the separate `s512`
-/// held-out-eval OOM esc-076 also tracked — that OOM reproduced on BOTH
-/// `bf16` and `f16` `alloff` legs alike and was pinned to, and fixed at, a
-/// different call site entirely (`evaluate_held_out`'s eval-batch
-/// bucket-up, `be1450ae`); no causal link between the two is asserted
-/// here.
+/// dispatch the fused kernel, exactly like the `F32`/`BF16` cells:
+/// `LowRankResidualLinear`'s (and `ScaledCastAdd`'s CPU epilogue's) own
+/// domain covers `F16` end to end, and the call-site predicate must admit it
+/// rather than leave an `F16` backbone permanently eager.
 #[test]
 fn training_mode_on_an_f16_backbone_dispatches_fused_and_is_counted() {
     let _guard = DISPATCH_COUNTER_PAIR_LOCK
@@ -441,7 +424,7 @@ fn training_mode_on_an_f16_backbone_dispatches_fused_and_is_counted() {
     );
 }
 
-/// esc-031's golden (`Lora(W) == Frozen(W)` at `lora_b == 0`), re-run with
+/// The zero-B golden (`Lora(W) == Frozen(W)` at `lora_b == 0`), re-run with
 /// an explicit dispatch-counter proof that the FUSED kernel — not a
 /// silent fallback — produced the agreement, so a future admission-
 /// predicate regression that always falls back could not hide behind this
@@ -490,18 +473,15 @@ fn esc_031_golden_holds_through_the_fused_path_with_dispatch_proof() {
     );
 }
 
-/// esc-033's determinism/resume oracles, restated against the PRODUCTION
-/// `LoraLinear::forward` path (an adversarial mutation audit finding: the
-/// prior oracle suite only exercised `DropoutMasks::apply` directly, never
-/// `forward` itself — a corrupted `forward_idx` reservation at the actual
-/// call site, or a divergence between the fused-site key and the
-/// eager-fallback key, could have slipped through). `dispatch_fused`
-/// selects which arm dispatches (`true`: F32 backbone, no bias -> fused;
-/// `false`: a non-contiguous-`w` base -> eager fallback, #428 P2b's own
-/// lever — see `build_base_with_noncontiguous_w`'s doc; a zero/untracked-
-/// leaf bias no longer forces eager since #428 P2b made a bias-carrying
-/// contiguous base FUSE), so this proves the SAME resume invariant on
-/// BOTH arms independently.
+/// The dropout determinism/resume oracles, stated against the PRODUCTION
+/// `LoraLinear::forward` path rather than `DropoutMasks::apply` directly — a
+/// corrupted `forward_idx` reservation at the actual call site, or a
+/// divergence between the fused-site key and the eager-fallback key, would
+/// otherwise slip through. `dispatch_fused` selects which arm dispatches
+/// (`true`: F32 backbone, no bias -> fused; `false`: a non-contiguous-`w`
+/// base -> eager fallback — see `build_base_with_noncontiguous_w`'s doc; a
+/// bias does not force eager, since a bias-carrying contiguous base FUSES),
+/// so this proves the SAME resume invariant on BOTH arms independently.
 fn resume_reproduces_the_uninterrupted_dropout_stream(dispatch_fused: bool) {
     let device = cpu();
     const N: usize = 6;
@@ -634,10 +614,9 @@ fn eager_arm_production_path_resume_reproduces_the_uninterrupted_dropout_stream(
     resume_reproduces_the_uninterrupted_dropout_stream(false);
 }
 
-/// The negative control proving the oracle above has teeth (esc-033's
-/// anti-relaxation clause, restated at the production `LoraLinear::forward`
-/// level): restoring to `K + 1` instead of `K` must NOT reproduce the
-/// uninterrupted run's continuation.
+/// The negative control proving the oracle above has teeth, at the
+/// production `LoraLinear::forward` level: restoring to `K + 1` instead of `K` must NOT reproduce
+/// the uninterrupted run's continuation.
 #[test]
 fn fused_arm_production_path_would_catch_an_off_by_one_resume_position() {
     let _guard = DISPATCH_COUNTER_PAIR_LOCK
@@ -799,21 +778,16 @@ fn resume_past_the_forward_counter_ceiling_is_a_typed_refusal_at_the_production_
     );
 }
 
-/// (Round-2 audit finding B1): every prior resume oracle in this file
-/// compares an arm against ITSELF (fused-vs-fused, or eager-vs-eager) —
-/// none of them ever cross-compares the FUSED arm's actual dropout draw
-/// against the EAGER arm's, so a divergence introduced ONLY on one arm's
-/// key (e.g. a `forward_idx` off-by-one applied to just the fused
-/// construction call) would survive the whole suite. This test closes
-/// that gap directly: SAME `ResumeState` (both fresh, position 0), SAME
-/// seed/prefix/config (hence identical seeded `A`/`B` AND identical
-/// `layer_id`), SAME input — one instance forced fused (a contiguous
-/// base), one forced eager (the SAME weight values as a NON-CONTIGUOUS
-/// `w` — #428 P2b's forced-eager lever, `build_base_with_noncontiguous_w`'s
-/// own doc explains why a zero bias no longer works) — their outputs must
-/// be BIT-IDENTICAL. This is
-/// the strongest form of "the same key produces the same result" this
-/// crate can state: not merely that resuming reproduces a FIXED arm's own
+/// Every other resume oracle in this file compares an arm against ITSELF
+/// (fused-vs-fused, or eager-vs-eager), so a divergence introduced ONLY on
+/// one arm's key (e.g. a `forward_idx` off-by-one applied to just the fused
+/// construction call) would survive them. This test cross-compares: SAME
+/// `ResumeState` (both fresh, position 0), SAME seed/prefix/config (hence
+/// identical seeded `A`/`B` AND identical `layer_id`), SAME input — one
+/// instance forced fused (a contiguous base), one forced eager (the SAME
+/// weight values as a NON-CONTIGUOUS `w`; see `build_base_with_noncontiguous_w`'s doc) — their
+/// outputs must be BIT-IDENTICAL. This is the strongest form of "the same key produces the same
+/// result" this crate can state: not merely that resuming reproduces a FIXED arm's own
 /// earlier run, but that the two DIFFERENT arms of the SAME logical
 /// forward never diverge.
 #[test]
@@ -866,8 +840,7 @@ fn fused_and_eager_arms_draw_the_bit_identical_dropout_stream_at_the_same_resume
     let varmap_e = VarMap::new();
     let vb_e = VarBuilder::from_varmap(&varmap_e, DType::F32, &device);
     // Non-contiguous `w`, carrying the SAME `w_v` values as `base_f`'s —
-    // #428 P2b's forced-eager lever (`build_base_with_noncontiguous_w`'s
-    // own doc explains why a zero bias no longer forces eager at all).
+    // the forced-eager lever (see `build_base_with_noncontiguous_w`'s doc).
     let mut w_wide_v = Vec::with_capacity(2 * in_features * out_features);
     for row in 0..out_features {
         w_wide_v.extend_from_slice(&w_v[row * in_features..(row + 1) * in_features]);
@@ -925,8 +898,8 @@ fn fused_and_eager_arms_draw_the_bit_identical_dropout_stream_at_the_same_resume
 /// different Philox key on both the seeded-init AND the dropout draw)
 /// must NOT produce the same output. If they did, the positive oracle
 /// above would be vacuously insensitive to a divergent key — exactly the
-/// class of bug (one arm's key silently diverging from the other's) B1
-/// exists to catch.
+/// class of bug (one arm's key silently diverging from the other's) that
+/// oracle exists to catch.
 #[test]
 fn fused_and_eager_arms_with_different_seeds_do_not_coincidentally_match() {
     let _guard = DISPATCH_COUNTER_PAIR_LOCK
@@ -981,12 +954,10 @@ fn fused_and_eager_arms_with_different_seeds_do_not_coincidentally_match() {
     );
 }
 
-/// (Round-2 audit finding B2): the module doc's tape-node-reduction claim
-/// was never MEASURED against the actual PRODUCTION `LoraLinear::forward`
-/// path (only against a from-scratch reconstruction in
-/// `jammi_kernels::ops::low_rank_residual_linear`'s own test suite). This
-/// measures it directly, at the shape/config the doc's headline
-/// describes: rank-3 `x`, `F32`, `dropout = 0.3` (a `Var`-tracked
+/// The tape-node-reduction claim, MEASURED against the actual PRODUCTION
+/// `LoraLinear::forward` path (not only a from-scratch reconstruction in
+/// `jammi_kernels::ops::low_rank_residual_linear`'s own test suite), at the shape/config the doc's
+/// headline describes: rank-3 `x`, `F32`, `dropout = 0.3` (a `Var`-tracked
 /// intermediate — the dropout DOES add tracked nodes, unlike the
 /// dropout-less measurement in `jammi_kernels::ops`), a frozen (plain,
 /// non-`Var`) `w`. `Tensor::sorted_nodes()` is candle's own PUBLIC
@@ -1032,8 +1003,8 @@ fn production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback() {
     );
     let nodes_fused = y_f.sorted_nodes().len();
 
-    // EAGER-FALLBACK arm: non-contiguous-w base forces fallback (#428
-    // P2b's lever), same shapes/config.
+    // EAGER-FALLBACK arm: non-contiguous-w base forces fallback, same
+    // shapes/config.
     let varmap_e = VarMap::new();
     let vb_e = VarBuilder::from_varmap(&varmap_e, DType::F32, &device);
     let base_e = build_base_with_noncontiguous_w(in_features, out_features, &device, DType::F32);
@@ -1069,9 +1040,8 @@ fn production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback() {
     assert_eq!(nodes_eager, 11, "measured production-path EAGER node count");
 }
 
-/// #428 P2b: the bias-carrying sibling of
-/// `production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback` —
-/// same harness (rank-3 `x`, `F32`, `dropout = 0.3`), but both bases now
+/// The bias-carrying sibling of `production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback`
+/// — same harness (rank-3 `x`, `F32`, `dropout = 0.3`), but both bases
 /// carry a real, untracked-leaf bias (the overwhelmingly common case —
 /// see `bias_gate`'s own doc). MEASURED separately because
 /// `lora_linear_fused_counters`'s own doc (`jammi_lora::lora_linear`)
@@ -1162,10 +1132,8 @@ fn production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback_with_bias() 
     );
 }
 
-/// #428 P2b: the bias-carrying cross-arm oracle this contract calls for —
-/// a REAL (non-zero, non-`Var`) base bias FUSES (unlike every test above
-/// this file's "Migrated" note predates, which used a bias-free or
-/// zero-bias base): fused arm (a biased, contiguous base) vs eager arm
+/// The bias-carrying cross-arm oracle — a REAL (non-zero, non-`Var`) base
+/// bias FUSES: fused arm (a biased, contiguous base) vs eager arm
 /// (the SAME biased base, forced eager via the non-contiguous-`w` lever —
 /// `build_base_with_noncontiguous_w`'s own doc) must agree bit-for-bit on
 /// exact-integer fixtures (the SAME architecture-independence argument
@@ -1262,26 +1230,17 @@ fn bias_carrying_base_fuses_and_matches_the_noncontiguous_w_eager_fallback_bit_e
     );
 }
 
-/// #428 P2b round-2 fix: a TRAINABLE `Var` base bias is a COUNTED eager
-/// refusal (`bias_is_frozen_leaf`, `jammi_lora::lora_linear`'s private
-/// `bias_gate` — this test proves the OBSERVABLE behaviour through the
-/// public dispatch-counter API, not by calling that private function
-/// directly) — but ONLY relative to the SAME base with an UNTRACKED-LEAF
-/// bias, which must dispatch FUSED. The PRIOR version of this test
-/// asserted only the eager half, against a base built with
-/// `base_has_no_bias`-shaped semantics: at main (before #428), EVERY
-/// bias-carrying base was an unconditional eager refusal regardless of
-/// Var-vs-leaf, so that half-a-test would have passed unconditionally,
-/// with or without #428's own `bias_is_frozen_leaf` discrimination. The
-/// LEAF half below is the one that is actually RED at main (hand-mutation
-/// verified: restoring the blanket `if base_has_bias { .. }` refusal in
-/// `lora_linear_admission_predicate` turns the leaf-half assertion RED —
-/// see this crate's narrow-fix-round report for the exact failure text).
-/// Distinguishes the Var state from "no bias at all" (which is ALSO an
-/// eager-uninvolved `None` from `bias_gate`, but for a completely
-/// different, non-refusal reason) — see `lora_linear_admission_predicate`'s
-/// own doc for why `base_has_bias && !bias_pack_is_some` is the ONLY
-/// remaining bias-shaped refusal.
+/// A TRAINABLE `Var` base bias is a COUNTED eager refusal
+/// (`bias_is_frozen_leaf`, `jammi_lora::lora_linear`'s private `bias_gate` —
+/// this test proves the OBSERVABLE behaviour through the public
+/// dispatch-counter API) — but ONLY relative to the SAME base with an
+/// UNTRACKED-LEAF bias, which must dispatch FUSED. The LEAF half is what
+/// catches a blanket `if base_has_bias { .. }` refusal in
+/// `lora_linear_admission_predicate`: an eager-only assertion would pass
+/// under it. Distinguishes the Var state from "no bias at all" (also a
+/// `None` from `bias_gate`, but for a non-refusal reason) — see
+/// `lora_linear_admission_predicate`'s own doc for why
+/// `base_has_bias && !bias_pack_is_some` is the only bias-shaped refusal.
 #[test]
 fn trainable_var_bias_is_a_counted_eager_refusal() {
     let _guard = DISPATCH_COUNTER_PAIR_LOCK
@@ -1360,7 +1319,7 @@ fn trainable_var_bias_is_a_counted_eager_refusal() {
     );
 }
 
-/// (Round-2 audit A3): the fused arm's `self.scaling as f32` (a plain Rust
+/// The fused arm's `self.scaling as f32` (a plain Rust
 /// narrowing cast) vs the eager arm's `lora_out * self.scaling` (an `f64`
 /// scalar multiplied onto an `F32` tensor via candle's `Affine` CPU
 /// kernel) — MEASURED, not assumed equal, at an rsLoRA scaling that is
@@ -1451,15 +1410,13 @@ fn rslora_irrational_scaling_agrees_between_fused_and_eager_arms_at_f32() {
     );
 }
 
-/// esc-031's quantized twin golden (issue #351): `Lora(Wq) == Frozen(Wq)`
+/// The quantized twin of the zero-B golden: `Lora(Wq) == Frozen(Wq)`
 /// at `lora_b == 0`, mirroring `esc_031_golden_holds_through_the_fused_path_
-/// with_dispatch_proof`'s Dense golden above — but the PROOF shape is the
-/// opposite one: `LoraLinear::forward`'s own doc states a `Quantized` base
-/// NEVER touches `lora_linear_fused_counters()` at all (neither `Fused` nor
-/// `Eager` — the fused kernel's domain requires a dense weight `Tensor`
-/// argument, so a quantized base is never even offered to it), so the
-/// dispatch-counter proof here is that BOTH counts stay UNCHANGED across
-/// the forward, not that one of them increased.
+/// with_dispatch_proof`'s Dense golden above. A `Quantized` base NEVER
+/// touches `lora_linear_fused_counters()` (the fused kernel's domain requires
+/// a dense weight `Tensor`); that claim is pinned by `lora_linear.rs`'s lib
+/// unit test `quantized_base_forward_never_touches_the_fused_dispatch_counters`,
+/// not here — see the comment inside `lora_wq_equals_frozen_wq_at_lora_b_zero`.
 mod esc_031_quantized_twin {
     use std::sync::Arc;
 

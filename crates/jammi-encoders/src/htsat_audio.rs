@@ -100,7 +100,7 @@ use crate::lora_site::{FrozenSiteHolder, LoraSite};
 /// # Every config field that names a computation is dispatched on or refused
 ///
 /// Every field below that NAMES a computation is either genuinely dispatched
-/// on or refused as unsupported — never silently ignored (family D). Five
+/// on or refused as unsupported — never silently ignored. Five
 /// fields name a computation this tower's forward path has hard-coded to one
 /// value, and `HtsatAudioEncoder::load_with` REFUSES, before any tensor is
 /// touched, any checkpoint that declares the other one: `hidden_act` (must be
@@ -2459,7 +2459,7 @@ mod tests {
         (rel_bias_grads, x)
     }
 
-    /// RED oracle: fails if `SwinSelfAttention::forward`'s training arm is
+    /// Fails if `SwinSelfAttention::forward`'s training arm is
     /// reverted to `softmax_last_dim` (or if `HtsatAudio::set_training`'s
     /// propagation down to `SwinStage`/`SwinBlock` is dropped) — under
     /// either regression `rel_bias_table`'s gradient comes back `None` for
@@ -2580,7 +2580,7 @@ mod tests {
             .unwrap()
     }
 
-    /// End-to-end RED oracle through the REAL front half (`is_longer=[true]`,
+    /// End-to-end oracle through the REAL front half (`is_longer=[true]`,
     /// exercising the fused `mel_conv2d`/AFF path — see
     /// [`run_front_and_spine`]'s doc) and the full Swin spine. With BOTH the
     /// attention-softmax arm and every `LayerNorm` (patch-embed norm,
@@ -2802,7 +2802,7 @@ mod tests {
     /// `layernorm_after` either way, so composing up to `pooler_out` is
     /// sufficient for this assertion without pulling in the projection
     /// head's own weights as noise. `Some`/finite/nonzero under
-    /// `training=true`, `None` under `training=false`. RED-verified: deleting
+    /// `training=true`, `None` under `training=false`. Deleting
     /// `self.layernorm_before.set_training(training)` from
     /// `SwinBlock::set_training` flips the training=true half of this test
     /// (`layernorm_before.weight` comes back `None` instead of `Some`)
@@ -2855,25 +2855,22 @@ mod tests {
     /// Direct, isolated backward test for [`HtsatPatchEmbed::forward`]'s
     /// fused (`is_longer=true`) branch reaching `mel_conv2d`'s own conv
     /// weight — narrower than the full-tower oracle above (stops at
-    /// `patch_embed`, not the whole Swin spine), and the exact test that
-    /// FAILED before [`tile_nonoverlapping`]'s narrow-before-unfold fix.
+    /// `patch_embed`, not the whole Swin spine), pinning
+    /// [`tile_nonoverlapping`]'s narrow-before-unfold.
     ///
-    /// Pre-fix failure signature (reproduced in isolation by
-    /// [`unfold_backward_is_a_plain_reshape_in_candle`] on a minimal
-    /// fixture; MEASURED here by temporarily reverting `mel_conv2d`'s tiling
-    /// to plain `x.unfold(2, kh, kh)?.unfold(3, kw, kw)?` with no `narrow`
-    /// first): on the real `htsat_clap_tiny` geometry (`spec_size=128`,
-    /// `kw=patch_size*3=12`, `128 / 12 = 10` windows with an 8-wide tail
+    /// Without the `narrow` (plain `x.unfold(2, kh, kh)?.unfold(3, kw, kw)?`;
+    /// the mechanism is reproduced in isolation by
+    /// [`unfold_backward_is_a_plain_reshape_in_candle`]), on the real `htsat_clap_tiny` geometry
+    /// (`spec_size=128`, `kw=patch_size*3=12`, `128 / 12 = 10` windows with an 8-wide tail
     /// dropped, `patch_embed_input_channels=3` local channels, batch=1),
-    /// `loss.backward()` itself returned
-    /// `Err("shape mismatch in reshape, lhs: [3, 1, 32, 10, 4, 12], rhs:
-    /// [3, 1, 32, 128, 4]")` — `unfold`'s `Op::Reshape` backward trying to
+    /// `loss.backward()` itself returns
+    /// `Err("shape mismatch in reshape, lhs: [3, 1, 32, 10, 4, 12], rhs: [3, 1, 32, 128, 4]")`
+    /// — `unfold`'s `Op::Reshape` backward trying to
     /// reshape the width-unfold's gradient (`[..., 10, 4, 12]`, sized by the
     /// DROPPED-tail 120-of-128 output) back to the pre-width-unfold input
     /// shape (`[..., 128, 4]`, the full un-narrowed 128) — a loud `Err`, not
-    /// a panic, but this test's `.expect(...)` on that `Result` is what
-    /// turns it into a failing assertion — before any `grads.get(...)` call
-    /// was even reached.
+    /// a panic, which this test's `.expect(...)` on that `Result` turns into
+    /// a failing assertion before any `grads.get(...)` call is reached.
     #[test]
     fn mel_conv2d_backward_reaches_conv_weight_through_the_fused_patch_embed_path() {
         // `patch_embed.forward` below ends in `self.norm.forward(&flat)`
@@ -2907,9 +2904,9 @@ mod tests {
 
         let loss = nonuniform_loss(&patch_embed_out, cfg.patch_embeds_hidden_size, &device);
         let grads = loss.backward().expect(
-            "backward through the fused (is_longer=true) patch-embed path must succeed now \
-             that mel_conv2d's tiling narrows before unfolding — see this test's doc for the \
-             exact pre-fix Err this .expect(...) turns into a failing assertion for",
+            "backward through the fused (is_longer=true) patch-embed path must succeed: \
+             mel_conv2d's tiling narrows before unfolding — see this test's doc for the \
+             Err an unfold without the narrow returns",
         );
 
         let mel_conv_weight = find_var(&varmap, "mel_conv2d.weight");
@@ -2992,7 +2989,9 @@ mod tests {
             let fd = (loss_value(&plus) - loss_value(&minus)) / (2.0 * eps);
 
             let diff = (analytic[i] - fd).abs();
-            let tol = 1e-4 * fd.abs().max(1.0); // relative-with-floor — no-producer: the floor guards the fd ~ 0 regime, a chosen margin, not a measurement.
+            // Relative-with-floor: the floor guards the fd ~ 0 regime (a chosen margin, not a
+            // measurement).
+            let tol = 1e-4 * fd.abs().max(1.0);
             assert!(
                 diff <= tol,
                 "element {i}: analytic grad {} vs central-difference {fd} differ by {diff} \
@@ -3305,7 +3304,7 @@ mod tests {
         );
     }
 
-    /// D10: the tower's `BatchNorm` stays pinned to EVAL statistics even
+    /// The tower's `BatchNorm` stays pinned to EVAL statistics even
     /// under `set_training(true)` (`forward_front`'s `forward_t(&x, false)`).
     /// HF's own HTSAT pins it the same way, and a LoRA fine-tune leaves the
     /// backbone frozen — recomputing batch statistics from a fine-tuning
@@ -3322,9 +3321,8 @@ mod tests {
         // The `set_training(true)` forward below runs `patch_embed.forward`'s
         // `self.norm.forward` (biased, training mode) — a counter bumper on
         // `crate::layer_norm::LN_DISPATCH_COUNTERS` even though this test
-        // never reads it (esc-092 / issue #476: this was the ORIGINAL
-        // unlocked writer that motivated the mechanical gate
-        // `crate::test_support::assert_seam_lock_held` now enforces).
+        // never reads it (the mechanical gate `crate::test_support::assert_seam_lock_held` enforces
+        // the lock).
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let varmap = VarMap::new();
@@ -3369,7 +3367,7 @@ mod tests {
         );
     }
 
-    /// D6 for this tower's shift-window mask: it follows the backbone dtype
+    /// This tower's shift-window mask follows the backbone dtype
     /// and keeps HF's own `-100.0` magnitude, which is exactly representable
     /// in F32, F16 and BF16 alike — so the cast is lossless and the F32
     /// tensor's bits are unchanged. Unlike `crate::clip_text`'s causal
@@ -3481,7 +3479,7 @@ mod tests {
         );
     }
 
-    /// The GELU seam's exact per-forward dispatch count (family F: an
+    /// The GELU seam's exact per-forward dispatch count (an
     /// independently-known number, computed live and asserted, not an
     /// "advanced by some amount" smoke check). On the real `htsat_clap_tiny`
     /// geometry `depths = [2, 2, 2, 2]`, so the spine has `2+2+2+2 = 8` Swin
@@ -3497,7 +3495,7 @@ mod tests {
     /// decision at all — and the count comes in below 8 rather than
     /// producing any visibly wrong number.
     ///
-    /// # Why K4 (eval bytes) is untouched, and where CUDA is proved
+    /// # Why eval bytes are untouched, and where CUDA is proved
     ///
     /// On CPU F32 every one of those 8 tensors is contiguous and non-empty,
     /// so `gelu_admission_predicate` HOLDS and all 8 go down the FUSED arm —
@@ -3607,7 +3605,7 @@ mod tests {
     }
 
     /// The COMPOSITE count both site classes sum to, measured rather than
-    /// inferred (family F): the same `htsat_clap_tiny` geometry with
+    /// inferred: the same `htsat_clap_tiny` geometry with
     /// `projection_hidden_act` flipped to `"gelu"` must dispatch the seam
     /// `sum(depths) + 1 = 9` times per full-tower forward — 8 Swin-block
     /// MLPs plus the projection head, all reporting to the SAME process-wide
@@ -3867,7 +3865,7 @@ mod tests {
             .expect("hidden_act='gelu' (the fixture's own value) must load");
     }
 
-    /// (b) The domain-validity edge this unit closes: `SwinBlock::forward`
+    /// (b) The domain-validity edge: `SwinBlock::forward`
     /// is unconditionally gelu-erf (this module's own doc), so a config
     /// declaring any OTHER `hidden_act` must be REFUSED at load — named,
     /// not silently computed as gelu-erf regardless — through BOTH
@@ -3989,8 +3987,7 @@ mod tests {
         }
     }
 
-    /// #421 P1-a3, the HTSAT leg — the same oracle as
-    /// `crate::bert::tests::
+    /// The HTSAT leg — the same oracle as `crate::bert::tests::
     /// fusible_site_census_is_the_exact_per_forward_seam_call_count`, run
     /// on the committed `htsat_clap_tiny` checkpoint through the REAL
     /// builder, at BOTH projection activations.

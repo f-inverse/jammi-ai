@@ -116,8 +116,8 @@ mod tests {
     /// (see that op's module doc's "window is construction data at the
     /// call site" section), and the op's own fully-masked-row rule reads
     /// that combined value with NO knowledge of which crate contributed
-    /// which term. This test is the measured, asserted proof (family F)
-    /// the two crates' independently-defined sentinels are the SAME value
+    /// which term. This test is the measured, asserted proof that the two
+    /// crates' independently-defined sentinels are the SAME value
     /// — not merely the same sign — so a doubly-masked key (padded AND
     /// out-of-window, `MASKED_LOGIT + jammi_kernels`'s own sentinel) lands
     /// at a magnitude with the same clearance from the `0.0`/masked
@@ -136,11 +136,9 @@ mod tests {
     }
 
     /// [`jammi_kernels::ops::MemEfficientAttention`]'s own SECOND copy of
-    /// the band predicate (M2 plan v3 delta 3, adversarial audit round 3
-    /// advisory: this pin was required and missing) — extends the SAME
-    /// clearance-from-zero argument above to this op's `MEM_EFFICIENT_WINDOW_MASKED_VALUE`.
-    /// Unlike `AttentionBlockFused` (which reads ONE caller-combined mask
-    /// tensor and has no window construction data of its own), memeff
+    /// the band predicate — extends the SAME clearance-from-zero argument above to this op's
+    /// `MEM_EFFICIENT_WINDOW_MASKED_VALUE`. Unlike `AttentionBlockFused` (which reads ONE
+    /// caller-combined mask tensor and has no window construction data of its own), memeff
     /// re-derives its band internally and SUMS it with the caller's own
     /// `MASKED_LOGIT`-sentinel `key_mask` per chunk
     /// (`ModernBertAttention::forward_memeff_attention` hands it the raw

@@ -23,7 +23,7 @@ RUN yum install -y sqlite-libs \
 # `[need.*]` tables). The guard runner provides a missing need at run time, so
 # an image built before a need was declared still works; baking them here
 # keeps a CI run off the package mirrors.
-RUN yum install -y jq openssh-clients rsync tmux \
+RUN yum install -y jq openssh-clients rsync tmux util-linux perl-Digest-SHA glibc-langpack-en \
     && yum clean all
 
 # PyYAML: a declared prerequisite of `ci/scripts/check_execution_surface_

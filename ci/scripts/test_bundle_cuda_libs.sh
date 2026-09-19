@@ -707,10 +707,10 @@ vdso_report_rc=$?
 assert_eq "loader verify: a vdso-only report fails (vacuous pass closed)" "$vdso_report_rc" "1"
 assert_contains "loader verify: the vdso-only failure names an absent required soname" "$vdso_report_out" "libcudart.so.12"
 
-# 13c. Defect (3) closed: the loader's own self-named (no `=>`) line is
-#      parsed as a RESOLVED platform entry, so an otherwise CORRECT stage —
-#      every bundled member from lib_dir, every platform/driver member from
-#      the host, the loader naming itself with no `=>` — passes cleanly.
+# 13c. The loader's own self-named (no `=>`) line is parsed as a RESOLVED
+#      platform entry, so an otherwise CORRECT stage — every bundled member
+#      from lib_dir, every platform/driver member from the host, the loader
+#      naming itself with no `=>` — passes cleanly.
 correct_report="libcudart.so.12 => ${LOADER_LIB}/libcudart.so.12 (0x1)
 libnccl.so.2 => ${LOADER_LIB}/libnccl.so.2 (0x2)
 libc.so.6 => /lib64/libc.so.6 (0x3)

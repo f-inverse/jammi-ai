@@ -6,11 +6,9 @@
 //! cover the two populations: [`LayerNormFused`] (`CustomOp2`: `x`,
 //! `gamma`) for the bias-free case (ModernBERT — no `norm_bias` field
 //! exists in its config at all), and `LayerNormBiasedFused` (`CustomOp3`:
-//! `x`, `gamma`, `beta`) for the bias-carrying case (#460, C-LN —
-//! BERT/DistilBERT/CLIP-text, whose LayerNorms all carry a bias). Until
-//! #460, every biased LayerNorm trained through `jammi-encoders`'
-//! `slow()` eager composition with no `admit()` and no dispatch counter at
-//! all; see `jammi-encoders`' call site (`LayerNorm::forward`) for the ONE
+//! `x`, `gamma`, `beta`) for the bias-carrying case
+//! (BERT/DistilBERT/CLIP-text, whose LayerNorms all carry a bias). See
+//! `jammi-encoders`' call site (`LayerNorm::forward`) for the ONE
 //! admission key (`"layer_norm_fused"`) both variants share — bias
 //! presence is TENSOR STATE decided at the call site, never a model-family
 //! special case.
@@ -20,8 +18,8 @@
 //! `CustomOp2::fwd` returns exactly one `(Storage, Shape)` — there is no
 //! channel to stash `mean`/`invvar` for `bwd` to read back later (unlike,
 //! say, PyTorch's `ctx.save_for_backward`). `bwd` therefore RECOMPUTES
-//! `mean`/`invvar` from `x` (one extra read of `x`, budgeted per the
-//! fused-kernels plan) rather than caching anything in the op itself —
+//! `mean`/`invvar` from `x` (one extra read of `x`)
+//! rather than caching anything in the op itself —
 //! which would also violate the `Copy`/stateless requirement every op in
 //! this crate is held to (see `ops`'s module doc).
 //!
@@ -39,7 +37,7 @@
 //!     ONE kernel launch: recompute `mean`/`invvar` from `x`, the two
 //!     per-row reduction scalars (Apex/ATen canonical), then `dx` — all in
 //!     the same launch (a two-phase bwd would double LN backward launches
-//!     post-fusion, which the fused-kernels plan explicitly rejects).
+//!     post-fusion).
 //!   - `LayerNormBwdDgamma` (`CustomOp2`: `x`, `grad_output`) → `dgamma`
 //!     (shape `[hidden]`, summed over rows) — needs no `gamma` input at
 //!     all (`dgamma_i = sum_rows(grad_output_i * xhat_i)`), only invoked
@@ -51,14 +49,10 @@
 //! at construction, before `apply2` ever runs — the op itself still
 //! never inspects any tensor's state at call time, so it stays exactly
 //! as stateless as every other op in this crate (see `ops`'s module
-//! doc's `Copy` discussion). What changed from this crate's original
-//! design (and the fused-kernels plan's original wording, "construction
-//! data, not a runtime predicate") is WHAT THE CALL SITE PASSES IN:
-//! `jammi-encoders`' call site now sets it to `self.weight.is_variable()`,
-//! re-evaluated on every call, rather than a single hardcoded `false`
-//! chosen once and never revisited.
+//! doc's `Copy` discussion). `jammi-encoders`' call site sets it to
+//! `self.weight.is_variable()`, re-evaluated on every call.
 //!
-//! That deviation is DELIBERATE and sound, not a relapse into the
+//! That is sound, not the
 //! `is_variable()` hazard `ops`'s module doc warns about (`is_variable()`
 //! cannot tell a true external constant apart from an INTERMEDIATE on a
 //! path to a `Var`, and gating `bwd`'s OWN return value on it reproduces
@@ -73,18 +67,14 @@
 //! `is_variable()` ambiguous for an arbitrary tensor simply cannot arise
 //! for it. The only two real states left are "is a `Var`" (trainable)
 //! and "is a true frozen leaf", and `is_variable() == true` is a
-//! SUFFICIENT (not merely convenient) signal for the former. A first
-//! version of this call site hardcoded `dgamma_needed = false`
-//! reasoning "gamma is always frozen today, only LoRA A/B train" — sound
-//! as of that commit, but a SILENT-WRONG landmine for the future: candle's
-//! own backward walk skips accumulating into a `None` slot with no error
-//! (`backprop.rs`'s `Op::CustomOp2` arm only calls `grads.or_insert` when
-//! `bwd` returned `Some`), so a later trainable-gamma mode would have
-//! silently never trained `gamma` — no panic, no error, just a parameter
-//! an optimizer step quietly skips. Re-deriving the flag from
-//! `is_variable()` on every call closes that hole structurally instead of
-//! relying on whoever adds trainable-gamma support later to remember to
-//! flip a hardcoded bool. Here there is no ambiguity for `dx`'s slot —
+//! SUFFICIENT (not merely convenient) signal for the former. A hardcoded
+//! `dgamma_needed = false` would be SILENT-WRONG for a trainable gamma:
+//! candle's own backward walk skips accumulating into a `None` slot with
+//! no error (`backprop.rs`'s `Op::CustomOp2` arm only calls
+//! `grads.or_insert` when `bwd` returned `Some`), so `gamma` would never
+//! train — no panic, no error, just a parameter an optimizer step quietly
+//! skips. Deriving the flag from `is_variable()` on every call rules that
+//! out structurally. There is no ambiguity for `dx`'s slot —
 //! `LayerNormFused::bwd` ALWAYS returns `Some(dx)` for `x`, exactly like
 //! every other op's bwd here returns `Some` for its input slots, regardless of
 //! whether `x` happens to be an intermediate. If `gamma` somehow WERE an
@@ -95,7 +85,7 @@
 //! training a grad-less parameter — a safe failure mode, not a
 //! silent-wrong one.
 //!
-//! ## Domain (family D)
+//! ## Domain
 //!
 //! `x` and `gamma` must be fully contiguous (`contiguous_offsets()`,
 //! honoring a nonzero `start_offset` from a narrowed-but-contiguous view —
@@ -117,23 +107,22 @@
 //! (ModernBERT-large, bf16) never
 //! needs F64 here and keeping the domain device-uniform avoids a
 //! CPU-passes/CUDA-refuses split with no oracle covering it. **F16**: the
-//! CPU F16 arm (`ln_fwd_f16`/`ln_bwd_dx_f16`/`ln_bwd_dgamma_f16` below)
-//! originally existed only to serve as the independent-reference arm the
-//! f16 oracle suites need (`docs/maintainer/cuda-kernel-guide.md`'s per-op
-//! f16 reference-regime table names this op's regime as f32-internal,
-//! round-once, matching `jammi_encoders::layer_norm::LayerNorm::slow`'s
-//! F16 upcast — `DType::F16 | DType::BF16 => DType::F32`, `jammi-encoders/src/layer_norm.rs:754` —
-//! inside `fn slow`, `crates/jammi-encoders/src/layer_norm.rs:730`); campaign
-//! #443 W2b added the matching CUDA F16 dispatch arm
-//! (`crate::cuda::layer_norm`'s `(DType::F16, DType::F16)` arms, backed by
-//! the SEPARATE `cuda/layer_norm_f16.cu` translation unit — see that
-//! file's module doc for why it duplicates rather than shares code with
-//! the F32/BF16 kernels), so `jammi-encoders`' admission predicate is now
-//! widened to F16 too (K2's no-Hold-without-dispatch rule: the predicate
-//! widening landed in the SAME change as the dispatch arm it depends on).
+//! CPU F16 arm (`ln_fwd_f16`/`ln_bwd_dx_f16`/`ln_bwd_dgamma_f16` below) is
+//! the independent-reference arm the f16 oracle suites need
+//! (`docs/maintainer/cuda-kernel-guide.md`'s per-op f16 reference-regime
+//! table names this op's regime as f32-internal, round-once, matching
+//! `jammi_encoders::layer_norm::LayerNorm::slow`'s F16 upcast —
+//! `DType::F16 | DType::BF16 => DType::F32` inside `fn slow` in
+//! `crates/jammi-encoders/src/layer_norm.rs`). The
+//! matching CUDA F16 dispatch arm (`crate::cuda::layer_norm`'s
+//! `(DType::F16, DType::F16)` arms) is backed by the SEPARATE
+//! `cuda/layer_norm_f16.cu` translation unit — see that file's module doc
+//! for why it duplicates rather than shares code with the F32/BF16
+//! kernels — so `jammi-encoders`' admission predicate admits F16 too (an
+//! admission predicate never admits a dtype without a dispatch arm).
 //! `hidden == 0` degenerates to an empty output (nothing to normalize) —
 //! this makes `rows = elem_count / hidden` safe without a separate empty
-//! fast-path, since `elem_count == 0` follows fromm `hidden == 0` (a
+//! fast-path, since `elem_count == 0` follows from `hidden == 0` (a
 //! zero-length dimension implies zero elements) and the same is true in
 //! reverse whenever the last dim is genuinely 0.
 //!
@@ -515,14 +504,13 @@ impl CustomOp2 for LayerNormBwdDgamma {
     // No `bwd` override — see `LayerNormBwdDx`'s identical note.
 }
 
-/// #460 (C-LN): bias-carrying LayerNorm forward — `y = xhat * gamma +
+/// Bias-carrying LayerNorm forward — `y = xhat * gamma +
 /// beta`, `CustomOp3(x, gamma, beta)`. The sibling of [`LayerNormFused`]
 /// (bias-free): every BERT/DistilBERT LayerNorm carries a bias, so this is
 /// the op that actually fuses their training-mode forward — see
 /// `jammi-encoders`' call site (`LayerNorm::forward_fused_or_fallback`)
 /// for the ONE admission key (`"layer_norm_fused"`) both variants share:
-/// bias presence is TENSOR STATE, not a model-family special case (one
-/// common architecture — the operator's own framing for #460).
+/// bias presence is TENSOR STATE, not a model-family special case.
 ///
 /// ## `beta` is REQUIRED, not nullable
 ///
@@ -535,22 +523,21 @@ impl CustomOp2 for LayerNormBwdDgamma {
 /// kernels this op dispatches to (`layer_norm_fwd_{f32,bf16,f16}_biased`
 /// in `cuda/layer_norm.cu`/`cuda/layer_norm_f16.cu`) each define their OWN
 /// `template <bool HAS_BETA>` row body — a SEPARATE, textually duplicated
-/// copy of the pre-existing bias-free kernel's row math, not a shared
-/// definition the bias-free kernel also calls (that kernel's bytes are
-/// append-only-preserved, byte-for-byte, by this addition — see those
-/// files' own module docs for the accepted-drift-surface rationale). The
-/// template's `bool` parameter COULD serve a future nullable-beta caller
+/// copy of the bias-free kernel's row math, not a shared
+/// definition the bias-free kernel also calls (see those files' own module
+/// docs for the drift-surface rationale). The
+/// template's `bool` parameter COULD serve a nullable-beta caller
 /// without a kernel-body rewrite, but only the `HAS_BETA = true`
-/// instantiation is ever emitted as a kernel today.
+/// instantiation is emitted as a kernel.
 ///
 /// ## `bwd`: three independent slots, three independent gates
 ///
-/// - `dx` — ALWAYS `Some`, via the EXISTING `LayerNormBwdDx` (`x`,
+/// - `dx` — ALWAYS `Some`, via `LayerNormBwdDx` (`x`,
 ///   `gamma`, `grad_output`) — `dx` does not depend on `beta` at all
 ///   (`d(xhat*gamma+beta)/dx` has no `beta` term), so this is the exact
-///   same helper `LayerNormFused`'s own `bwd` already calls, re-dispatched
-///   through the same `apply3` seam. No new kernel, no new op.
-/// - `dgamma` — `Some` via the EXISTING `LayerNormBwdDgamma` (`x`,
+///   same helper `LayerNormFused`'s own `bwd` calls, re-dispatched
+///   through the same `apply3` seam.
+/// - `dgamma` — `Some` via `LayerNormBwdDgamma` (`x`,
 ///   `grad_output`) exactly when `self.dgamma_needed`, `None` otherwise —
 ///   again the identical helper the bias-free op already uses; `dgamma`
 ///   has no `beta` dependence either (`dgamma_i = sum_rows(dy_i *
@@ -585,7 +572,7 @@ pub struct LayerNormBiasedFused {
     /// applied to this op's own `gamma` slot.
     pub dgamma_needed: bool,
     /// The `beta` analog of `dgamma_needed`, gated the same way at the
-    /// call site (family D: bias is tensor state, gated identically to
+    /// call site (bias is tensor state, gated identically to
     /// gamma, never a model-family special case).
     pub dbeta_needed: bool,
 }
@@ -764,7 +751,7 @@ fn dbeta_from_grad(grad_res: &Tensor, beta_dtype: candle_core::DType) -> Result<
 }
 
 // -----------------------------------------------------------------------
-// CPU math. Fixed fold order throughout (family J): every reduction below
+// CPU math. Fixed fold order throughout: every reduction below
 // walks its row in plain ascending index order, so a given `(x, gamma)`
 // (or `(x, gamma, dy)`) pair always yields the same output bit-for-bit —
 // no parallel/unordered accumulation on this path.
@@ -785,7 +772,7 @@ fn mean_var_f32(row: &[f32], hidden: usize) -> (f32, f32) {
 }
 
 /// BF16 row mean/variance, accumulated in f32 — same two-pass, ascending-
-/// index fold order as [`mean_var_f32`] (family J: one fixed reduction
+/// index fold order as [`mean_var_f32`] (one fixed reduction
 /// order, not "whatever the loop happened to do"), so every bf16 call site
 /// below (`ln_fwd_row_bf16`, `ln_bwd_dx_row_bf16`, `ln_bwd_dgamma_bf16`)
 /// computes the identical numeric sequence the CUDA kernel's own
@@ -888,13 +875,12 @@ fn ln_fwd_f16(x: &[f16], gamma: &[f16], rows: usize, hidden: usize, eps: f32) ->
 }
 
 // -----------------------------------------------------------------------
-// #460 (C-LN): bias-carrying forward row math. Each `_biased` function
+// Bias-carrying forward row math. Each `_biased` function
 // below shares its row's mean/variance computation with its bias-free
 // twin above via the SAME [`mean_var_f32`]/[`mean_var_bf16`]/[`mean_var_f16`]
-// helpers — the bias-free row functions (`ln_fwd_row_f32` etc.) are not
-// touched by this addition at all, so their own output is bit-identical
-// by construction (same discipline the CUDA `.cu` files' append-only
-// addition documents). `y = xhat * gamma + beta`, matching ATen's
+// helpers, so the two agree on mean/variance bit for bit; the bias-free row
+// functions (`ln_fwd_row_f32` etc.) never call into the `_biased` path.
+// `y = xhat * gamma + beta`, matching ATen's
 // `LayerNormForwardCUDAKernel` (T_ACC accumulate, one cast at the end —
 // see `jammi_encoders::layer_norm::LayerNorm::slow`'s own citation) and
 // `LayerNormFused`'s bias-free epilogue's rounding placement exactly,
@@ -1112,7 +1098,7 @@ fn ln_bwd_dx_f16(
 
 /// `dgamma_i = sum_rows(dy_i * xhat_i)` — fixed fold order: rows walked
 /// `0..rows` in ascending order, accumulating into `dgamma[i]` each time
-/// (family J: the same input always folds in the same order).
+/// (the same input always folds in the same order).
 fn ln_bwd_dgamma_f32(x: &[f32], dy: &[f32], rows: usize, hidden: usize, eps: f32) -> Vec<f32> {
     let mut dgamma = vec![0f32; hidden];
     for r in 0..rows {
@@ -1345,16 +1331,14 @@ mod tests {
     // -----------------------------------------------------------------
     // `LayerNormFused::cpu_fwd`'s dtype-mismatch guard (its `(s1, s2) if
     // s1.dtype() != s2.dtype()` match arm), the SAME-unsupported-dtype
-    // cell (MUT-1: that guard forced `true` survived). The "!=" false-arm (a real
-    // mismatch, e.g. F32 vs BF16) is already `dtype_mismatch_between_
+    // cell. The "!=" false-arm (a real
+    // mismatch, e.g. F32 vs BF16) is `dtype_mismatch_between_
     // x_and_gamma_is_refused` above; that test alone does not kill the
     // guard-forced-`true` mutant, because BOTH the real code and the
     // `true` mutant return `DTypeMismatchBinaryOp` on a real mismatch.
     // Only a SAME (equal), UNSUPPORTED dtype on both operands (F64 here
-    // — not F32, not BF16, not F16: this crate's D2 f16-oracle work added
-    // a real F16 CPU arm, so F16 stopped being a same-unsupported-dtype
-    // witness and F64 replaces it, verified to still fall through to the
-    // same `_ => UnsupportedDTypeForOp` arm) tells them apart: real code
+    // — not F32, not BF16, not F16, all three of which have real CPU arms)
+    // tells them apart: real code
     // falls through to `UnsupportedDTypeForOp`; the `true` mutant reports
     // `DTypeMismatchBinaryOp` instead even though the two dtypes agree.
     // -----------------------------------------------------------------
@@ -1373,12 +1357,11 @@ mod tests {
 
     // -----------------------------------------------------------------
     // `LayerNormBwdDx::cpu_fwd`'s own dtype guard (`s1` = x, `s2` =
-    // gamma; MUT-1 mutations of its `(s1, s2, _) if s1.dtype() !=
+    // gamma; mutations of its `(s1, s2, _) if s1.dtype() !=
     // s2.dtype()` match arm: guard forced `true`, forced `false`, and
-    // `!=` -> `==`). No existing test calls this
-    // internal helper directly (it is normally reached only through
-    // `LayerNormFused::bwd`, which candle's autograd invokes with
-    // matching dtypes by construction) — both cells below are new.
+    // `!=` -> `==`). The cells below call this internal helper directly,
+    // because it is normally reached only through `LayerNormFused::bwd`,
+    // which candle's autograd invokes with matching dtypes by construction.
     // -----------------------------------------------------------------
     fn ln_bwd_dx(eps: f64, x: &Tensor, gamma: &Tensor, dy: &Tensor) -> Result<Tensor> {
         crate::ops::apply3(x, gamma, dy, LayerNormBwdDx { eps })
@@ -1407,8 +1390,8 @@ mod tests {
         }
     }
 
-    /// Same-unsupported-dtype cell (x == gamma == dy == F64, per the same
-    /// F16-now-real-arm retarget as `same_unsupported_dtype_is_unsupported_
+    /// Same-unsupported-dtype cell (x == gamma == dy == F64, for the same
+    /// reason as `same_unsupported_dtype_is_unsupported_
     /// not_a_false_mismatch` above): kills the guard-forced-`true` mutant,
     /// which would otherwise report `DTypeMismatchBinaryOp` for two
     /// operands that actually agree.
@@ -1525,11 +1508,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // The four `+`->`-` eps-sign-flip survivors in the row kernels
+    // The four `+`->`-` eps-sign-flip mutations in the row kernels
     // (`ln_fwd_row_bf16`, `ln_bwd_dx_row_f32`, `ln_bwd_dgamma_f32`,
     // `ln_bwd_dgamma_bf16`), all of the shape `invvar = 1.0 / (var +
-    // eps).sqrt()`. Rule 2 of the contract
-    // (tolerance failures): derive a bound so tight the flip cannot hide
+    // eps).sqrt()`: derive a bound so tight the flip cannot hide
     // inside it, rather than shrinking `eps` relative to a fixed abs
     // tolerance.
     //
@@ -1544,8 +1526,8 @@ mod tests {
     // The `+`->`-` mutation instead computes `sqrt(var - eps) =
     // sqrt(-eps)`, which is NaN for any `eps > 0` in this degenerate-
     // variance regime — `bound/max|signal| = 0/0`: not "within
-    // tolerance", but a hard finite-vs-non-finite divergence (family F:
-    // every element of a `0.0 * NaN = NaN` product), the strongest
+    // tolerance", but a hard finite-vs-non-finite divergence
+    // (every element of a `0.0 * NaN = NaN` product), the strongest
     // possible measurement of an eps-sign flip. A non-degenerate `eps` (
     // 1e-2, far from f32's own ULP at this magnitude) rules out this
     // being a rounding-noise artifact.
@@ -1660,7 +1642,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // #460 (C-LN): `LayerNormBiasedFused` oracles.
+    // `LayerNormBiasedFused` oracles.
     // -----------------------------------------------------------------
 
     fn ln_biased(
@@ -1707,14 +1689,12 @@ mod tests {
         }
     }
 
-    /// Regression pin (K4-style, applied at the op level): `beta = 0`
+    /// Regression pin at the op level: `beta = 0`
     /// must reduce `LayerNormBiasedFused`'s output to EXACTLY
     /// `LayerNormFused`'s own output, bitwise — `v + 0.0 == v` exactly in
     /// IEEE-754 for any finite, non-negative-zero `v`, so this is not a
-    /// tolerance claim. This is the "bias-free op output bitwise
-    /// unchanged" oracle: the reference here IS the pre-existing
-    /// [`LayerNormFused`] op itself (never touched by this file's #460
-    /// addition), not a hand-rolled duplicate.
+    /// tolerance claim. The reference here IS the bias-free
+    /// [`LayerNormFused`] op itself, not a hand-rolled duplicate.
     #[test]
     fn beta_all_zero_is_bitwise_identical_to_the_bias_free_op() {
         let device = Device::Cpu;
@@ -1905,11 +1885,11 @@ mod tests {
     }
 
     /// The bias-free twin of [`hidden_zero_biased_f16_is_a_no_op_not_an_error`]
-    /// below: `(F16, hidden == 0)` through the PRE-EXISTING [`LayerNormFused`]
+    /// below: `(F16, hidden == 0)` through the bias-free [`LayerNormFused`]
     /// op (not `LayerNormBiasedFused`) — the SAME `empty_like` CPU/CUDA
-    /// domain gap #460 closes (see `ops::mod`'s own
+    /// domain case (see `ops::mod`'s own
     /// `empty_like_f16_hidden_zero_matches_f32_and_bf16_shape` for the
-    /// helper-level unit), exercised end-to-end through this bias-free
+    /// helper-level test), exercised end-to-end through this bias-free
     /// op's real `cpu_fwd` on CPU: must return an EMPTY output, not an
     /// error.
     #[test]
@@ -1925,9 +1905,9 @@ mod tests {
         assert!(out.iter().all(|row| row.is_empty()));
     }
 
-    /// `hidden == 0` is a no-op on F16 too (the CPU/CUDA domain gap #460
-    /// closes in `empty_like` — see `ops::mod`'s own test for the
-    /// `empty_like` unit itself; this is the SAME gap exercised through
+    /// `hidden == 0` is a no-op on F16 too (the CPU/CUDA domain case
+    /// `empty_like` covers — see `ops::mod`'s own test for
+    /// `empty_like` itself; this exercises the SAME case through
     /// this op's real `cpu_fwd`).
     #[test]
     fn hidden_zero_biased_f16_is_a_no_op_not_an_error() {
@@ -1943,7 +1923,7 @@ mod tests {
         assert!(out.iter().all(|row| row.is_empty()));
     }
 
-    /// Beta-independence (K4-style): `dx`/`dgamma` from
+    /// Beta-independence: `dx`/`dgamma` from
     /// `LayerNormBiasedFused::bwd` must be BITWISE IDENTICAL to
     /// `LayerNormFused::bwd`'s own, given the same `x`/`gamma` and the
     /// same upstream gradient — `dx`/`dgamma`'s math has no `beta` term at

@@ -394,7 +394,7 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
             detail: e.detail,
         },
         Some(Variant::Other(e)) => JammiError::Other(e.message),
-        // The unknown-oneof case (B5): `message` is the enclosing `Status`'s
+        // The unknown-oneof case: `message` is the enclosing `Status`'s
         // own text, so the reconstructed error still carries the real fault
         // description even though this build cannot recover which specific
         // variant a newer peer set.
@@ -980,7 +980,7 @@ mod tests {
         error_from_status(&status)
     }
 
-    /// Compile-time half of the completeness proof (K4 error-parity oracle):
+    /// Compile-time half of the completeness proof (the error-parity oracle):
     /// exhaustive over EVERY `JammiError` variant, own-shape or genuinely-
     /// foreign, with NO catch-all arm. A new variant added to `JammiError`
     /// fails to compile here until it is listed — forcing the author to

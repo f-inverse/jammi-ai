@@ -8,70 +8,65 @@ use crate::layout_walk::StridedOffsets;
 /// `scaling` is fixed at construction; `base` and `lora` may differ in
 /// dtype (the whole reason this op exists — see below).
 ///
-/// A generic Tensor-API primitive (family L: this crate names no consumer),
+/// A generic Tensor-API primitive (this crate names no consumer),
 /// but the shape it was designed to fuse away is `jammi-lora`'s LoRA-site
 /// epilogue: `base_out + scaling * lora_out`, where `base_out` is the frozen
 /// matmul's output at the backbone dtype and `lora_out` is the small A/B
-/// GEMM's output at the LoRA adapter's own dtype (today, always `F32` in
+/// GEMM's output at the LoRA adapter's own dtype (always `F32` in
 /// this workspace — a call-site fact, not a `candle_nn::VarBuilder::
 /// from_varmap` API guarantee: its dtype is caller-supplied, not hardcoded;
 /// see `jammi-lora`'s `LoraLinear::forward` module doc for the exact call
-/// sites that make it `F32` today). The eager composition this replaces is
+/// sites that make it `F32`). The eager composition this replaces is
 /// `[mul, cast, add]` — three tape nodes, one `CustomOp2` here.
 ///
 /// STATELESS BY CONSTRUCTION: `Copy`, the argument `ops`'s module doc
 /// makes — `scaling` is construction data, not runtime state.
 ///
-/// ## Domain (family D)
+/// ## Domain
 ///
 /// NOT a broadcasting op: `base` and `lora` must have identical shape (a
 /// mismatch is `Error::ShapeMismatchBinaryOp`, never silently broadcast).
 /// CPU forward supports `base`/`lora` each independently `F32`, `BF16`, or
-/// `F16` (seven combinations — the four `{F32,BF16}x{F32,BF16}` plus three
-/// new `F16`+`F16`, `F16`+`F32`, `F32`+`F16`; `BF16`+`F16` and `F16`+`BF16`
+/// `F16` (seven combinations — the four `{F32,BF16}x{F32,BF16}` plus
+/// `F16`+`F16`, `F16`+`F32`, `F32`+`F16`; `BF16`+`F16` and `F16`+`BF16`
 /// are NOT implemented, on either arm — no kernel exists for mixing those
 /// two 16-bit dtypes); any other dtype, or an unimplemented pair, is a
 /// typed `Error::UnsupportedDTypeForOp`. The CUDA forward (feature-gated)
-/// supports the SAME seven combinations (campaign #443 W2c added the three
-/// F16 combinations via the SEPARATE `cuda/scaled_cast_add_f16.cu`
-/// translation unit — monomorphic kernels, not template instantiations
-/// sharing code with the F32/BF16 kernels) and additionally requires
-/// contiguous storage.
+/// supports the SAME seven combinations (the three F16 combinations via the
+/// SEPARATE `cuda/scaled_cast_add_f16.cu` translation unit — monomorphic
+/// kernels, not template instantiations sharing code with the F32/BF16
+/// kernels) and additionally requires contiguous storage.
 ///
-/// ## The bf16 rounding model: f32-accumulate, round ONCE (esc-046 fix)
+/// ## The bf16 rounding model: f32-accumulate, round ONCE
 ///
-/// This now follows this crate's "f32-accumulate, round once" convention
-/// after all — an EARLIER revision of this doc claimed PEFT
-/// rounds the scaled delta to the base dtype BEFORE the add (two round
-/// points) and cited that as the reason this op deliberately diverged from
-/// that convention. That claim was never checked at PEFT source and is FALSE
-/// (esc-046, GH#374): `peft/tuners/lora/layer.py`'s `Linear.forward`
-/// (`peft==0.20.0`, lines 1044-1069, re-read at source on pod a100e
-/// 2026-08-26) computes
+/// This follows this crate's "f32-accumulate, round once" convention,
+/// because PEFT does too — PEFT does NOT round the scaled delta to the base
+/// dtype before the add. `peft/tuners/lora/layer.py`'s `Linear.forward`
+/// (`peft==0.20.0`, lines 1044-1069) computes
 /// `result = result + lora_B(lora_A(dropout(x))) * scaling` (line 1058,
 /// inside the per-adapter loop) — torch's `+` PROMOTES the bf16 `result`
 /// to the delta's `f32` dtype (standard type promotion, no rounding lost
 /// on `result`'s side), adds in `f32`, and only THEN does
 /// `result = result.to(torch_result_dtype)` (line 1069, AFTER the loop)
 /// cast back down — ONE round point, at the very end, not two. This op
-/// now reproduces THAT model: widen `base` to `f32` (lossless), add the
+/// reproduces THAT model: widen `base` to `f32` (lossless), add the
 /// already-`f32` scaled `lora`, round the sum to `base`'s own dtype once.
 /// The CPU (`F32`,`F32`)/(`BF16`,`F32`) combinations `jammi-lora`'s
-/// admission predicate actually reaches stay BIT-EXACT against the eager
+/// admission predicate actually reaches are BIT-EXACT against the eager
 /// `[mul, add]` composition (see `tests/scaled_cast_add_oracles.rs`), not
-/// merely within a stated ULP tolerance — the composition itself lost its
-/// separate `cast` step for the same reason (see `jammi-lora`'s
-/// `eager_epilogue`, corrected in the same round).
+/// merely within a stated ULP tolerance — the eager composition has no
+/// separate `cast` step before the add either (see `jammi-lora`'s
+/// `eager_epilogue`).
 ///
-/// Confirmed with a live torch experiment (torch 2.11.0+cu128, peft
-/// 0.20.0, A100, 2026-08-26): `base~N(0,100²)` bf16, `delta~N(0,3²)` f32,
+/// Measured in torch (torch 2.11.0+cu128, peft
+/// 0.20.0, A100): `base~N(0,100²)` bf16, `delta~N(0,3²)` f32,
 /// `n=4096` → 176/4096 elements differ between the once-rounded
 /// (`(base.float()+delta).to(bf16)`) and round-then-add
 /// (`base.float()+delta.to(bf16).float()).to(bf16)`) formulas, max
 /// `|diff| = 1.0` (one bf16 ULP at `|base|~100`; at ModernBERT-large's own
-/// layer-18 residual magnitude, `-6688` (esc-045), one ULP there is `32` —
-/// the extra rounding point this fix removes sat directly on the residual
-/// stream every subsequent layer's forward AND recomputed-backward reads).
+/// layer-18 residual magnitude, `-6688`, one ULP there is `32` — an extra
+/// rounding point here would sit directly on the residual stream every
+/// subsequent layer's forward AND recomputed-backward reads).
 /// The same amplitude and discriminating-fixture claim is reproduced
 /// in-tree, with its own independently-seeded fixture — see
 /// `bf16_epilogue_matches_peft_rounding_not_the_round_delta_first_formula`
@@ -84,10 +79,10 @@ use crate::layout_walk::StridedOffsets;
 ///
 /// `(F32, BF16)` (a `BF16`-dtype `lora`) and `(BF16, BF16)` are accepted by
 /// this op's domain (`cpu_fwd` implements all four `{F32,BF16} x {F32,BF16}`
-/// combinations) but are UNREACHABLE today — `jammi-lora`'s admission
-/// predicate never dispatches them, because `lora_a`/`lora_b` are always
-/// `F32` in this workspace (see the "generic Tensor-API primitive" note
-/// above). Should a future caller reach either combination, it will NOT be
+/// combinations) but are unreachable in this workspace — `jammi-lora`'s
+/// admission predicate never dispatches them, because `lora_a`/`lora_b` are
+/// always `F32` (see the "generic Tensor-API primitive" note
+/// above). A caller that reaches either combination will NOT get a result
 /// bit-exact against eager: candle-core 0.11.0's own CPU `Affine` impl
 /// (`cpu_backend/mod.rs`, `impl Map1 for Affine`: `let mul =
 /// T::from_f64(self.0);` then `v * mul + add` in `T`'s own arithmetic)
@@ -98,11 +93,10 @@ use crate::layout_walk::StridedOffsets;
 /// NOT when it is `BF16`). The divergence is therefore keyed on LORA'S
 /// dtype being `BF16`, not on `base`'s — both `(F32, BF16)` and `(BF16,
 /// BF16)` inherit it identically. Measured and bounded (relative-with-
-/// floor, the C4/C5 `bf16_close` pattern) in
+/// floor, the `bf16_close` pattern) in
 /// `tests/scaled_cast_add_oracles.rs`'s `f32_base_bf16_lora_diverges_…`
-/// and `bf16_base_bf16_lora_diverges_…` — not silently assumed equal just
-/// because the crate is publishable and a future caller could reach this
-/// combination.
+/// and `bf16_base_bf16_lora_diverges_…` — not silently assumed equal: the
+/// crate is publishable, so another caller could reach this combination.
 #[derive(Debug, Clone, Copy)]
 pub struct ScaledCastAdd {
     pub scaling: f64,
@@ -196,8 +190,8 @@ impl CustomOp2 for ScaledCastAdd {
     ///
     /// `d_lora = cast_to(lora.dtype())(dy) * scaling` — the chain rule
     /// through the (straight-through) round and the scalar multiply, in
-    /// THAT order (cast first, then scale), matching the C6 contract's
-    /// stated backward and the eager composition's own gradient (`dy` ->
+    /// THAT order (cast first, then scale), matching the eager
+    /// composition's own gradient (`dy` ->
     /// `to_dtype(f32)` -> `* scaling`, since `lora_out` before its own cast
     /// is `F32` in every reachable configuration).
     ///
@@ -224,7 +218,7 @@ impl CustomOp2 for ScaledCastAdd {
     }
 }
 
-/// Fixed fold order (family J): `StridedOffsets` walked in the same
+/// Fixed fold order: `StridedOffsets` walked in the same
 /// sequence for a given pair of layouts every time.
 fn scaled_cast_add_f32_f32(
     scaling: f64,
@@ -255,7 +249,7 @@ fn scaled_cast_add_f32_bf16(
 }
 
 /// The reachable production combination (`BF16` backbone, `F32` LoRA
-/// adapter): esc-046 fix (GH#374) — widens `base` to `f32` (lossless),
+/// adapter): widens `base` to `f32` (lossless),
 /// adds the already-`f32` scaled `lora` (no intermediate bf16-rounded
 /// `delta`), and rounds the sum to `bf16` ONCE. Matches PEFT's
 /// `Linear.forward` (`result + lora_out*scaling` under torch's own bf16->
@@ -399,8 +393,8 @@ mod tests {
 
     #[test]
     fn zero_scaling_leaves_base_unchanged_at_every_supported_combo() {
-        // The esc-031 golden's premise, exercised directly at the kernel
-        // level: `scaling == 0` (or, equivalently, `lora == 0`) must be a
+        // The zero-initialised-adapter premise, exercised directly at the
+        // kernel level: `scaling == 0` (or, equivalently, `lora == 0`) must be a
         // bit-exact no-op on `base` for every supported dtype pair.
         let device = Device::Cpu;
         for (base_bf16, lora_bf16) in [(false, false), (false, true), (true, false), (true, true)] {

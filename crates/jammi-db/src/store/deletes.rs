@@ -119,7 +119,7 @@ impl DeletionMask {
         Ok((entries.len(), ArtifactDigest::of_bytes(&bytes)))
     }
 
-    /// Read a mask back, schema-checked (K2): a file that is not exactly the
+    /// Read a mask back, schema-checked: a file that is not exactly the
     /// two-column mask shape is a typed [`JammiError::IncompatibleFormat`] —
     /// this ENGINE's own sidecar (only [`Self::write`], in this module,
     /// ever produces one), so a corrupt mask is never the caller's fault —
@@ -200,11 +200,11 @@ mod tests {
         assert!(!mask.masks_version(2));
     }
 
-    /// (DIST round 8) The mask sidecar is ENGINE-owned: only [`DeletionMask::write`]
+    /// The mask sidecar is ENGINE-owned: only [`DeletionMask::write`]
     /// in this module ever produces one, so a corrupt on-disk mask is never
-    /// the caller's fault. `read` used to refuse it with `JammiError::Schema`
-    /// (the caller class, gRPC `InvalidArgument`) — this asserts the fixed
-    /// engine class, `IncompatibleFormat` (gRPC `Internal`).
+    /// the caller's fault — `read` refuses it with the engine class,
+    /// `IncompatibleFormat` (gRPC `Internal`), never `JammiError::Schema`
+    /// (the caller class, gRPC `InvalidArgument`).
     #[tokio::test]
     async fn a_corrupt_mask_file_is_the_engine_class_never_the_caller_s() {
         let dir = tempfile::tempdir().unwrap();

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Hermetic tests for `ci/scripts/jail_trace.py` — the jail arm's tolerant
-`LD_TRACE_LOADED_OBJECTS` trace driver (see #534). No cu12 jail, no real
+`LD_TRACE_LOADED_OBJECTS` trace driver. No cu12 jail, no real
 CUDA binary (the root arm builds a trivial loader-only jail), no `chroot` privilege assumed: `os.chroot` is exercised for
 REAL (it is cheap and always available
 as a syscall attempt), and its OUTCOME is asserted against the process's own

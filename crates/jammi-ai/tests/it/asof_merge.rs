@@ -5,7 +5,7 @@
 //! and [`AsofJoinExec`]-shaped projection the operator uses, so the merge's
 //! semantics are pinned independent of the planning/IO machinery: the four knobs
 //! (direction, boundary, tolerance, tie-break) each shown changing the result,
-//! the null/preservation rules (§5.4), the empty-`by` global group, and the
+//! the null/preservation rules, the empty-`by` global group, and the
 //! bit-reproducible determinism the tie-break guarantees.
 
 use std::sync::Arc;

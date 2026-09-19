@@ -47,12 +47,12 @@ fn never_runs_job_request() -> SubmitJobRequest {
 }
 
 /// An oversize inbound message is refused -- never silently truncated -- and
-/// counted under the `message_size` reason (N5: tonic's own per-service
+/// counted under the `message_size` reason (tonic's own per-service
 /// `max_decoding_message_size` codec rejection, with no `RefusedBound`
 /// extension, is what `RefusalStatusLayer` defaults to that label for).
 /// Verified against the vendored tonic 0.14.5 source
 /// (`codec/decode.rs:185-195`): this specific rejection is `OUT_OF_RANGE`,
-/// not `RESOURCE_EXHAUSTED` -- see `crate::limits`'s N5 module doc.
+/// not `RESOURCE_EXHAUSTED` -- see `crate::limits`'s module doc.
 #[tokio::test]
 async fn oversize_inbound_message_is_refused_and_counted_as_message_size() {
     let server = start_engine_server_with_limits(LimitsConfig {
@@ -393,7 +393,7 @@ async fn wait_job_with_no_timeout_header_is_bounded_by_the_configured_budget_as_
     );
 }
 
-/// K4: the SAME `max_message_bytes` bound refuses an oversize inbound
+/// The SAME `max_message_bytes` bound refuses an oversize inbound
 /// message identically on Flight SQL, not only on the `jammi.v1.*` gRPC
 /// plane -- both transports are constructed with the identical
 /// `.max_decoding_message_size(limits.max_message_bytes)` in

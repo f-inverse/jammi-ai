@@ -107,8 +107,8 @@ pub fn aggregate_named_metrics(agg: &AggregateMetrics) -> [(&'static str, f64); 
 //     `serve(base_id)` bit-identical to the first (base-side determinism);
 //   - the cold mechanism assertion: `v_cold == v_warm` bit-for-bit;
 //   - the mechanism co-assertion: after the restart, the fine-tuned id's
-//     catalog record (read through `Catalog::get_model`, the same db-API
-//     read path the esc-089 RED dump used) still carries `model_type ==
+//     catalog record (read through `Catalog::get_model`, the db-API read
+//     path) still carries `model_type ==
 //     "fine-tuned"`, `artifact_path.is_some()`, `base_model_id.is_some()`;
 //   - the negative control: with the published bundle's `adapter.safetensors`
 //     deleted, a COLD serve through a brand-new `InferenceSession` (the real
@@ -164,7 +164,7 @@ pub fn audio_serve(model_id: impl Into<String>, bytes: Arc<Vec<u8>>) -> ServeFn 
     })
 }
 
-/// esc-089 positive control (a): every component of `v` is finite and `v`'s
+/// Positive control (a): every component of `v` is finite and `v`'s
 /// L2 norm is `> 1e-6` — rules out a degenerate (NaN-laced, all-zero, or
 /// near-zero) embedding making the downstream difference/bit-equality
 /// checks pass vacuously.
@@ -187,9 +187,9 @@ pub fn assert_finite_and_nondegenerate(v: &[f32], label: &str) {
     );
 }
 
-/// esc-089 positive control (b): `max|other[i] - base[i]|`, taken ONLY over
-/// index pairs where both components are finite (family F: a control must
-/// fail on every bad path, including non-finite — `NaN > c` is `false`, so
+/// Positive control (b): `max|other[i] - base[i]|`, taken ONLY over index
+/// pairs where both components are finite (a control must fail on every bad
+/// path, including non-finite — `NaN > c` is `false`, so
 /// letting a non-finite component silently poison the max would make this
 /// assertion pass vacuously on exactly the input it exists to reject). Panics
 /// if `base`/`other` share no finite pair at all, rather than reporting a
@@ -219,7 +219,7 @@ pub fn assert_min_diff_over_finite_pairs(base: &[f32], other: &[f32], min_diff: 
     );
 }
 
-/// The cold-restart mechanism assertion, unchanged from before this unit:
+/// The cold-restart mechanism assertion:
 /// `served` and `reference` must be bit-for-bit identical.
 pub fn assert_bit_equal(served: &[f32], reference: &[f32], label: &str) {
     assert_eq!(
@@ -236,14 +236,13 @@ pub fn assert_bit_equal(served: &[f32], reference: &[f32], label: &str) {
     }
 }
 
-/// esc-089 mechanism co-assertion: after a cold restart, `model_id`'s catalog
-/// record — read through [`jammi_db::catalog::Catalog::get_model`], the same
-/// db-API read path the esc-089 RED dump used to show the corrupted row —
-/// still carries the three fields `ModelResolver::try_catalog_lookup`'s
+/// Mechanism co-assertion: after a cold restart, `model_id`'s catalog record
+/// — read through [`jammi_db::catalog::Catalog::get_model`], the db-API read
+/// path — still carries the three fields `ModelResolver::try_catalog_lookup`'s
 /// fine-tuned arm depends on. This pins the ROW, not just the served vector:
 /// a regression that clobbers `model_type`/`artifact_path`/`base_model_id`
-/// (esc-089's actual root cause — `ModelCache::do_load`'s post-load
-/// bookkeeping) but happens to leave both warm and cold resolving to the
+/// (e.g. in `ModelCache::do_load`'s post-load bookkeeping) but happens to
+/// leave both warm and cold resolving to the
 /// SAME corrupted row would still pass a bit-equality-only oracle.
 pub async fn assert_fine_tuned_record_intact(
     session: &InferenceSession,
@@ -273,7 +272,7 @@ pub async fn assert_fine_tuned_record_intact(
     );
 }
 
-/// esc-089 negative control: with the published bundle's `adapter.safetensors`
+/// Negative control: with the published bundle's `adapter.safetensors`
 /// deleted, a COLD serve through a brand-new [`InferenceSession`] opened over
 /// `session_root` (the real resolver, never a hand-built `ResolvedModel`)
 /// must refuse — a typed `JammiError::Model` whose message names the missing
@@ -330,17 +329,17 @@ pub async fn assert_deleted_adapter_refuses_by_name(
     }
 }
 
-/// Named-field parameter bundle for [`assert_esc089_cold_restart_controls`].
+/// Named-field parameter bundle for [`assert_cold_restart_controls`].
 ///
-/// The positional 10-arg signature this replaces held three same-typed
-/// `&[f32]` (`v_base`/`v_warm`/`v_cold`) and two same-typed `&ServeFn`
+/// A positional signature would hold three same-typed `&[f32]`
+/// (`v_base`/`v_warm`/`v_cold`) and two same-typed `&ServeFn`
 /// (`serve_base`/`serve_tuned`) back to back — a caller transposing any pair
-/// compiles silently and asserts the wrong control. Named fields make a
+/// would compile silently and assert the wrong control. Named fields make a
 /// transposition a field-name typo instead. Follows this repo's
 /// params-struct convention for a naturally-wide argument list (see
 /// `crates/jammi-ai/src/fine_tune/worker.rs`'s `ModelRegistration`) rather
 /// than `#[allow(clippy::too_many_arguments)]`.
-pub struct Esc089ColdRestartControls<'a> {
+pub struct ColdRestartControls<'a> {
     /// The session's on-disk root, needed to locate and delete
     /// `adapter.safetensors` for the negative control.
     pub session_root: &'a Path,
@@ -367,12 +366,12 @@ pub struct Esc089ColdRestartControls<'a> {
     pub serve_tuned: &'a ServeFn,
 }
 
-/// Runs the FULL esc-089 `symptom_spec.control` set against one
+/// Runs the FULL cold-restart control set against one
 /// already-completed cold-restart round trip. Called identically by
 /// `tower_adapters.rs`'s three cross-modal `*_serves_cold_after_restart`
 /// tests and `fine_tune.rs`'s BERT-family peer.
-pub async fn assert_esc089_cold_restart_controls(controls: Esc089ColdRestartControls<'_>) {
-    let Esc089ColdRestartControls {
+pub async fn assert_cold_restart_controls(controls: ColdRestartControls<'_>) {
+    let ColdRestartControls {
         session_root,
         warm_session,
         cold_session,
@@ -411,10 +410,8 @@ pub async fn assert_esc089_cold_restart_controls(controls: Esc089ColdRestartCont
     .await;
 }
 
-/// The 70,000-row multi-row-group `(anchor, positive)` fixture — lifted, as
-/// ONE builder, out of the inline body
-/// `training_set::read_back_re_applies_the_committed_order_across_row_groups`
-/// used to carry (#500 U2c §2 fold): 70,000 rows so the writer's 65,536-row
+/// The 70,000-row multi-row-group `(anchor, positive)` fixture, ONE builder
+/// shared by the training-set ordering oracles: 70,000 rows so the writer's 65,536-row
 /// group boundary is crossed (more than one row group), scrambled by a
 /// permutation with no fixed point in the sort order, and every `anchor`
 /// value appears twice so `positive` is the tie-breaker (a key-column-only
@@ -423,7 +420,8 @@ pub async fn assert_esc089_cold_restart_controls(controls: Esc089ColdRestartCont
 /// `session` must already exist (each `#[tokio::test]` owns its own
 /// session/tempdir — a session is bound to its runtime, so ONE shared
 /// fixture *session* across tests is not meaningful; "one fixture per
-/// binary" is met as ONE fixture DEFINITION, called by every U2c oracle).
+/// binary" is met as ONE fixture DEFINITION, called by every ordering
+/// oracle).
 /// Registers the CSV source under `"pairs"` and materialises the
 /// `(anchor, positive)` projection.
 ///
@@ -534,7 +532,7 @@ pub async fn multi_row_group_pairs(
 }
 
 /// A `(text, target)` regression fixture whose row PAYLOAD is padded to
-/// roughly `pad_bytes` per row — built for the P3 residency oracle
+/// roughly `pad_bytes` per row — built for the streamed-residency oracle
 /// (`training_set_stream.rs`), which needs a table whose EAGER collected
 /// size genuinely exceeds `[engine] memory_limit`'s 64 MiB floor (the
 /// smallest pool the normal config-validated session-build path can ever

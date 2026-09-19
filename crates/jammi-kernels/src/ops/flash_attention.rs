@@ -37,11 +37,9 @@
 //! # Why `StatefulKernelOp`, not `KernelOp`, for all THREE op types
 //!
 //! [`FlashVarlenAttention`], [`FlashVarlenBwdHelper`], AND
-//! [`FlashVarlenAttentionFusedRope`] (round-4 audit correction, F4: an
-//! earlier draft of this heading said "BOTH op types", undercounting this
-//! module's own third one — the fused-RoPE forward, "Two op types, one
-//! seam" above still names the pattern by its two SEAM shapes, not a
-//! total type count) each hold a `Saved` field (interior-mutable), so
+//! [`FlashVarlenAttentionFusedRope`] ("Two op types, one seam" above
+//! names the pattern by its two SEAM shapes, not a total type count) each
+//! hold a `Saved` field (interior-mutable), so
 //! NONE of the three can be `Copy` — see
 //! [`crate::ops::StatefulKernelOp`]'s own doc for why `Clone` is refused
 //! too, and why that makes hoisting any of them into a long-lived field a
@@ -61,12 +59,11 @@
 //!   fits `i32`, `total_q` in `qkv` matches `cu_seqlens`' own `total_q`
 //!   — checked here, since the FFI has no way to know `qkv`'s shape
 //!   disagreed with the geometry it was handed).
-//! - RoPE: NOT applied here. The caller (Stage B2's encoder) rotates Q/K
-//!   and packs `qkv` BEFORE calling [`flash_attention_varlen`] — see the
-//!   P6 Stage B contract §3.6.
+//! - RoPE: NOT applied here. The caller (the encoder) rotates Q/K and packs
+//!   `qkv` BEFORE calling [`flash_attention_varlen`].
 //! - `deterministic`: `cfg.deterministic` is whatever the caller passes;
-//!   Stage B2 pins it `true` at the call site (this op itself has no
-//!   opinion — it is a generic primitive, family L).
+//!   the encoder pins it `true` at the call site (this op itself has no
+//!   opinion — it is a generic primitive).
 
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::CudaSlice;
@@ -92,7 +89,7 @@ fn saved_err(who: &'static str, e: crate::ops::saved::SavedError) -> Error {
 }
 
 /// `qkv`'s expected packed shape: rank 4, `[total_q, 3, H, HEAD_DIM]`,
-/// bf16 OR f16 (campaign #443 D2: both dtype pairs of the vendored kernel
+/// bf16 OR f16 (both dtype pairs of the vendored kernel
 /// are compiled UNCONDITIONALLY under `flash-attn` — `build.rs` builds all
 /// 5 TUs regardless of which dtype a given call site ends up using — so
 /// there is no compiled-vs-not distinction to gate on here, only "is this
@@ -194,7 +191,7 @@ impl CustomOp1 for FlashVarlenAttention {
             .ok_or(Error::RequiresContiguous { op: OP_NAME })?;
         let out_shape = Shape::from((total_q, num_heads, HEAD_DIM));
 
-        // Per-dtype dispatch (campaign #443 D2): `check_qkv_domain` above
+        // Per-dtype dispatch: `check_qkv_domain` above
         // already narrowed `dtype` to `{BF16, F16}` — this match is
         // therefore exhaustive over the op's real domain, with a named
         // (unreachable-in-practice) refusal for anything else, mirroring
@@ -363,7 +360,7 @@ impl CustomOp3 for FlashVarlenBwdHelper {
             .ok_or(Error::RequiresContiguous { op: BWD_OP_NAME })?;
         let out_shape = Shape::from((total_q, 3, num_heads, HEAD_DIM));
 
-        // Per-dtype dispatch (campaign #443 D2) — see
+        // Per-dtype dispatch — see
         // `FlashVarlenAttention::cuda_fwd`'s identical match for the
         // exhaustiveness rationale.
         match dtype {
@@ -432,9 +429,7 @@ impl CustomOp3 for FlashVarlenBwdHelper {
 
     // Second-order gradient (differentiating THROUGH `d_qkv`, this op's own
     // output) is NOT routed to candle's default `CustomOp3::bwd`
-    // (`Error::BackwardNotSupported`) — an earlier version of this comment
-    // claimed that, and `10b1f3b`'s audit found it FALSE (advisory finding,
-    // confirmed correct by the auditor; pinned by a test below). The real
+    // (`Error::BackwardNotSupported`); pinned by a test below. The
     // mechanism: `FlashVarlenAttention::bwd` (above) calls `arg.detach()` /
     // `res.detach()` / `grad_res.detach()` before constructing `d_qkv`
     // through `apply_stateful3` — by design, so backpropagating through
@@ -520,9 +515,9 @@ const FUSED_ROPE_BWD_OP_NAME: &str = "flash_attention_varlen_fused_rope_bwd";
 /// `modernbert::tests::flash_vs_block_per_layer_vram_attribution_probe_cuda`)
 /// found the two-op composition's per-layer forward retention averaging
 /// ≈28 MiB MORE than the block arm's own per-layer retention at this
-/// shape (`b=8, s=512, h=16, head_dim=64`, bf16) — this type is the fix
-/// that measurement motivated; see the P6 flash-vram-attribution round's
-/// artifact for the before/after `peak_vram_bytes` numbers.
+/// shape (`b=8, s=512, h=16, head_dim=64`, bf16), which this type removes;
+/// see `crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-p6-fa2-vram-attrib-b0eaee6-a100-sxm4.json`
+/// for the `peak_vram_bytes` numbers.
 ///
 /// # Correctness: bit-identical to the two-op composition
 ///
@@ -568,8 +563,7 @@ pub(crate) struct FlashVarlenAttentionFusedRope {
     /// always reads `cfg`. `None` for every production call site
     /// ([`flash_attention_varlen_with_rope`], the only public constructor
     /// besides the test-only one below), so production behaviour is
-    /// completely unchanged by this field's existence: `bwd` then reads
-    /// `cfg` exactly as it did before this field was added. See
+    /// unaffected by this field: `bwd` then reads `cfg`. See
     /// [`flash_attention_varlen_with_rope_test_only_bwd_window_override`]'s
     /// own doc for why a mismatched fwd/bwd config needs a real op-level
     /// seam rather than a crafted input tensor.
@@ -578,7 +572,7 @@ pub(crate) struct FlashVarlenAttentionFusedRope {
     /// (`position = token % seq`, [`flash_attention_varlen_with_rope`]'s
     /// arm) or `Ragged` (`seq` holds the gathered table's own row-total,
     /// `position` degenerates to the row index,
-    /// [`flash_attention_varlen_with_rope_ragged`]'s arm — M1a). BOTH
+    /// [`flash_attention_varlen_with_rope_ragged`]'s arm). BOTH
     /// `cuda_fwd` and `bwd`'s recompute read this field so the rotation
     /// `bwd` recomputes is provably the SAME one `fwd` applied — see
     /// [`super::rope_positions`]'s module doc, "The ragged arm" section.
@@ -653,7 +647,7 @@ impl CustomOp3 for FlashVarlenAttentionFusedRope {
             })?;
         let out_shape = Shape::from((total_q, num_heads, HEAD_DIM));
 
-        // Per-dtype dispatch (campaign #443 D2) — see
+        // Per-dtype dispatch — see
         // `FlashVarlenAttention::cuda_fwd`'s identical match for the
         // exhaustiveness rationale. `rot_storage`'s own dtype is `dtype`
         // (the rotation preserves it), so this match's arm selection is
@@ -830,8 +824,8 @@ pub fn flash_attention_varlen_with_rope(
     super::apply_stateful3(qkv, cos, sin, op)
 }
 
-/// Ragged counterpart of [`flash_attention_varlen_with_rope`] (M1a —
-/// varlen positions): `qkv`'s `total_q` rows are the CONCATENATION of
+/// Ragged counterpart of [`flash_attention_varlen_with_rope`] (varlen
+/// positions): `qkv`'s `total_q` rows are the CONCATENATION of
 /// `lengths.len()` variable-length segments (no padding), never a padded
 /// `[batch, seq]` grid. `cu_seqlens` (the FFI's own varlen geometry) and
 /// the per-row rotation table are BOTH derived from this ONE `lengths`
@@ -992,45 +986,13 @@ pub fn flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override(
     super::apply_stateful3(qkv, &cos_r, &sin_r, op)
 }
 
-/// Acquire a CUDA device for this file's own CUDA-gated `#[cfg(test)]`
-/// modules, or `None` to skip — unless `JAMMI_REQUIRE_CUDA` is set, in
-/// which case a device-acquisition failure PANICS instead of returning.
-/// Mirrors `tests/cuda_parity.rs`'s own `cuda_device` exactly (same
-/// skip-vs-fail rationale: without this distinction a broken device
-/// acquisition on a machine that IS supposed to have a GPU would silently
-/// read as a skipped test rather than a failed one).
-///
-/// Registered in `ci/kernel-oracle-helpers.txt` as
-/// `crates/jammi-kernels/src/ops/flash_attention.rs::cuda_device_or_skip`
-/// (issue #437's KO-7 scan-root widening brought `crates/jammi-kernels/
-/// src/**` into scope alongside `crates/jammi-kernels/tests/**` and
-/// `crates/jammi-encoders/src/**`; this helper already had the canonical
-/// shape before that widening landed, so it needed only the registry-line
-/// addition, not a code change). Used by both `#[test]` fns below, matching
-/// the SAME `JAMMI_REQUIRE_CUDA` lattice every OTHER CUDA-gated skip in
-/// this crate uses.
-#[cfg(test)]
-fn cuda_device_or_skip() -> Option<candle_core::Device> {
-    match candle_core::Device::new_cuda(0) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!("JAMMI_REQUIRE_CUDA is set but no CUDA device could be acquired: {e}");
-            }
-            eprintln!("flash_attention: skipping — no CUDA device available: {e}");
-            None
-        }
-    }
-}
-
 /// Structural (white-box) proof that [`flash_attention_varlen`] does not
 /// silently pin `cfg.deterministic` — see the module doc's "Domain"
 /// section: "`cfg.deterministic` is whatever the caller passes ... this op
-/// itself has no opinion". `10b1f3b`'s audit asked for a test deciding and
-/// documenting this ("a caller passing `deterministic: false` gets it
-/// PINNED to true by the op, or the op refuses"): the decision is NEITHER
-/// — a generic primitive (family L) has no opinion of its own; Stage B2's
-/// encoder is the ONLY place that pins `true`, at ITS call site, not here.
+/// itself has no opinion". A caller passing `deterministic: false` gets
+/// neither a pin to `true` nor a refusal — a generic primitive has no
+/// opinion of its own; the encoder is the ONLY place that pins `true`, at
+/// ITS call site, not here.
 /// Mirrors `flash_attention_varlen`'s own construction exactly and reads
 /// the field back — CUDA is needed only to build a real `CuSeqlens`, not to
 /// launch anything.
@@ -1038,30 +1000,33 @@ fn cuda_device_or_skip() -> Option<candle_core::Device> {
 mod deterministic_passthrough {
     use super::*;
 
-    #[test]
-    fn cfg_deterministic_flows_through_construction_unmodified() {
-        let Some(cuda) = cuda_device_or_skip() else {
-            return;
-        };
-        let dev = cuda.as_cuda_device().unwrap().clone();
-        for det in [true, false] {
-            let cu_seqlens = crate::flash::CuSeqlens::from_lengths(&[8usize], &dev).unwrap();
-            let cfg = crate::flash::VarlenConfig {
-                softmax_scale: 0.125,
-                window: None,
-                deterministic: det,
-            };
-            // The SAME construction `flash_attention_varlen` performs.
-            let op = FlashVarlenAttention {
-                cu_seqlens,
-                num_heads: 1,
-                cfg,
-                lse: Saved::empty(),
-            };
-            assert_eq!(
-                op.cfg.deterministic, det,
-                "the op must store exactly what the caller passed — never overriding it"
-            );
+    #[cfg(feature = "live-gpu-tests")]
+    mod gpu {
+        use super::*;
+
+        #[test]
+        fn cfg_deterministic_flows_through_construction_unmodified() {
+            let cuda = jammi_test_resources::cuda_device(0);
+            let dev = cuda.as_cuda_device().unwrap().clone();
+            for det in [true, false] {
+                let cu_seqlens = crate::flash::CuSeqlens::from_lengths(&[8usize], &dev).unwrap();
+                let cfg = crate::flash::VarlenConfig {
+                    softmax_scale: 0.125,
+                    window: None,
+                    deterministic: det,
+                };
+                // The SAME construction `flash_attention_varlen` performs.
+                let op = FlashVarlenAttention {
+                    cu_seqlens,
+                    num_heads: 1,
+                    cfg,
+                    lse: Saved::empty(),
+                };
+                assert_eq!(
+                    op.cfg.deterministic, det,
+                    "the op must store exactly what the caller passed — never overriding it"
+                );
+            }
         }
     }
 }
@@ -1108,124 +1073,123 @@ mod fused_rope_matches_two_op_composition {
         (cos, sin)
     }
 
-    #[test]
-    fn fused_rope_matches_two_op_composition_bit_identical_fwd_and_bwd_cuda() {
-        let Some(cuda) = cuda_device_or_skip() else {
-            return;
-        };
-        let dev = cuda.as_cuda_device().unwrap().clone();
-        let (batch, seq, h, d) = (2usize, 8usize, 2usize, HEAD_DIM);
-        let total = batch * seq;
-        let n = total * 3 * h * d;
-        // Non-trivial, non-symmetric, distinct-per-element data.
-        let xv: Vec<f32> = (0..n).map(|k| (k as f32 * 0.037).sin() * 3.0).collect();
-        let qkv_bf16 = Tensor::from_vec(xv, (total, 3, h, d), &cuda)
-            .unwrap()
-            .to_dtype(DType::BF16)
-            .unwrap();
-        let qkv_var = Var::from_tensor(&qkv_bf16).unwrap();
-        let (cos, sin) = rope_table(seq, d, &cuda);
-        let lengths = vec![seq; batch];
-        let cu_seqlens_a = CuSeqlens::from_lengths(&lengths, &dev).unwrap();
-        let cu_seqlens_b = CuSeqlens::from_lengths(&lengths, &dev).unwrap();
-        let cfg = VarlenConfig {
-            softmax_scale: 1.0 / (d as f32).sqrt(),
-            window: None,
-            deterministic: true,
-        };
+    #[cfg(feature = "live-gpu-tests")]
+    mod gpu {
+        use super::*;
 
-        // Path A: the pre-fix two-op composition — rotate via a TRACKED
-        // `RopePositionsFused` apply, then `flash_attention_varlen` on the
-        // already-rotated buffer.
-        let qkv_rot_a = crate::ops::apply3(
-            qkv_var.as_tensor(),
-            &cos,
-            &sin,
-            crate::ops::RopePositionsFused::new(seq, false),
-        )
-        .unwrap();
-        let o_a = flash_attention_varlen(&qkv_rot_a, &cu_seqlens_a, &cfg).unwrap();
-
-        // Path B: this round's fix.
-        let o_b = flash_attention_varlen_with_rope(
-            qkv_var.as_tensor(),
-            &cos,
-            &sin,
-            seq,
-            &cu_seqlens_b,
-            &cfg,
-        )
-        .unwrap();
-
-        let to_f32_vec = |t: &Tensor| -> Vec<f32> {
-            t.flatten_all()
+        #[test]
+        fn fused_rope_matches_two_op_composition_bit_identical_fwd_and_bwd_cuda() {
+            let cuda = jammi_test_resources::cuda_device(0);
+            let dev = cuda.as_cuda_device().unwrap().clone();
+            let (batch, seq, h, d) = (2usize, 8usize, 2usize, HEAD_DIM);
+            let total = batch * seq;
+            let n = total * 3 * h * d;
+            // Non-trivial, non-symmetric, distinct-per-element data.
+            let xv: Vec<f32> = (0..n).map(|k| (k as f32 * 0.037).sin() * 3.0).collect();
+            let qkv_bf16 = Tensor::from_vec(xv, (total, 3, h, d), &cuda)
                 .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let qkv_var = Var::from_tensor(&qkv_bf16).unwrap();
+            let (cos, sin) = rope_table(seq, d, &cuda);
+            let lengths = vec![seq; batch];
+            let cu_seqlens_a = CuSeqlens::from_lengths(&lengths, &dev).unwrap();
+            let cu_seqlens_b = CuSeqlens::from_lengths(&lengths, &dev).unwrap();
+            let cfg = VarlenConfig {
+                softmax_scale: 1.0 / (d as f32).sqrt(),
+                window: None,
+                deterministic: true,
+            };
+
+            // Path A: the two-op composition — rotate via a TRACKED
+            // `RopePositionsFused` apply, then `flash_attention_varlen` on the
+            // already-rotated buffer.
+            let qkv_rot_a = crate::ops::apply3(
+                qkv_var.as_tensor(),
+                &cos,
+                &sin,
+                crate::ops::RopePositionsFused::new(seq, false),
+            )
+            .unwrap();
+            let o_a = flash_attention_varlen(&qkv_rot_a, &cu_seqlens_a, &cfg).unwrap();
+
+            // Path B: the fused rotate-then-attend op.
+            let o_b = flash_attention_varlen_with_rope(
+                qkv_var.as_tensor(),
+                &cos,
+                &sin,
+                seq,
+                &cu_seqlens_b,
+                &cfg,
+            )
+            .unwrap();
+
+            let to_f32_vec = |t: &Tensor| -> Vec<f32> {
+                t.flatten_all()
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap()
+            };
+            let o_a_v = to_f32_vec(&o_a);
+            let o_b_v = to_f32_vec(&o_b);
+            assert!(
+                o_a_v.iter().chain(o_b_v.iter()).all(|v| v.is_finite()),
+                "forward outputs must be finite before comparing"
+            );
+            assert_eq!(
+                o_a_v, o_b_v,
+                "flash_attention_varlen_with_rope's forward output must be bit-identical to the \
+                 two-op composition it replaces"
+            );
+
+            let loss_a = o_a
                 .to_dtype(DType::F32)
                 .unwrap()
-                .to_vec1()
+                .sqr()
                 .unwrap()
-        };
-        let o_a_v = to_f32_vec(&o_a);
-        let o_b_v = to_f32_vec(&o_b);
-        assert!(
-            o_a_v.iter().chain(o_b_v.iter()).all(|v| v.is_finite()),
-            "forward outputs must be finite before comparing"
-        );
-        assert_eq!(
-            o_a_v, o_b_v,
-            "flash_attention_varlen_with_rope's forward output must be bit-identical to the \
-             two-op composition it replaces"
-        );
-
-        let loss_a = o_a
-            .to_dtype(DType::F32)
-            .unwrap()
-            .sqr()
-            .unwrap()
-            .sum_all()
-            .unwrap();
-        let loss_b = o_b
-            .to_dtype(DType::F32)
-            .unwrap()
-            .sqr()
-            .unwrap()
-            .sum_all()
-            .unwrap();
-        let grads_a = loss_a.backward().unwrap();
-        let grads_b = loss_b.backward().unwrap();
-        let dqkv_a = grads_a
-            .get(qkv_var.as_tensor())
-            .expect("path A: qkv must have a gradient");
-        let dqkv_b = grads_b
-            .get(qkv_var.as_tensor())
-            .expect("path B: qkv must have a gradient");
-        let dqkv_a_v = to_f32_vec(dqkv_a);
-        let dqkv_b_v = to_f32_vec(dqkv_b);
-        assert!(
-            dqkv_a_v
-                .iter()
-                .chain(dqkv_b_v.iter())
-                .all(|v| v.is_finite()),
-            "gradients must be finite before comparing"
-        );
-        assert_eq!(
-            dqkv_a_v, dqkv_b_v,
-            "flash_attention_varlen_with_rope's dqkv must be bit-identical to the two-op \
-             composition's own dqkv"
-        );
+                .sum_all()
+                .unwrap();
+            let loss_b = o_b
+                .to_dtype(DType::F32)
+                .unwrap()
+                .sqr()
+                .unwrap()
+                .sum_all()
+                .unwrap();
+            let grads_a = loss_a.backward().unwrap();
+            let grads_b = loss_b.backward().unwrap();
+            let dqkv_a = grads_a
+                .get(qkv_var.as_tensor())
+                .expect("path A: qkv must have a gradient");
+            let dqkv_b = grads_b
+                .get(qkv_var.as_tensor())
+                .expect("path B: qkv must have a gradient");
+            let dqkv_a_v = to_f32_vec(dqkv_a);
+            let dqkv_b_v = to_f32_vec(dqkv_b);
+            assert!(
+                dqkv_a_v
+                    .iter()
+                    .chain(dqkv_b_v.iter())
+                    .all(|v| v.is_finite()),
+                "gradients must be finite before comparing"
+            );
+            assert_eq!(
+                dqkv_a_v, dqkv_b_v,
+                "flash_attention_varlen_with_rope's dqkv must be bit-identical to the two-op \
+                 composition's own dqkv"
+            );
+        }
     }
 }
 
-// M1a — varlen positions: the CUDA-gated RETENTION oracle, flash-level
-// DENSE INVARIANCE oracle, and no-CPU-arm guard for
-// [`flash_attention_varlen_with_rope_ragged`] moved to
+// Varlen positions: the CUDA RETENTION oracle, flash-level DENSE
+// INVARIANCE oracle, and no-CPU-arm guard for
+// [`flash_attention_varlen_with_rope_ragged`] live in
 // `tests/cuda_parity.rs` (`fused_rope_ragged_matches_two_op_composition_
-// bit_identical_fwd_and_bwd_cuda` and its two siblings) so their CUDA
-// skip is MECHANICALLY enforced by `check_kernel_oracles.py`'s KO-7 scan
-// (`crates/jammi-kernels/tests/**`, not `crates/jammi-kernels/src/**`)
-// via that file's already-registered `cuda_device` helper, rather than
-// voluntarily mirrored here with no ci/kernel-oracle-helpers.txt entry to
-// enforce it. The CPU-hermetic TRUTH oracle, `gather_ragged_tables`
+// bit_identical_fwd_and_bwd_cuda` and its two siblings), which is compiled
+// only under `live-gpu-tests`. The CPU-hermetic TRUTH oracle, `gather_ragged_tables`
 // assertions, GUARDS, and op-level DENSE INVARIANCE for the ragged arm
 // itself remain in `crate::ops::rope_positions`'s own `#[cfg(test)] mod
 // tests` (see that module's own doc, "The ragged arm" section).
@@ -1234,14 +1198,13 @@ mod fused_rope_matches_two_op_composition {
 mod tests {
     //! Pure cells (no CUDA device needed) — `check_qkv_domain`/
     //! `check_o_domain` are OR-chains of independent predicates
-    //! (family K's "a lattice per predicate" standing clause): each
+    //! (the "a lattice per predicate" standing clause): each
     //! disjunct gets its OWN cell, violated ALONE (every other field
     //! correct), so a `||` -> `&&` mutation (which only fails when
     //! MULTIPLE disjuncts are simultaneously true) cannot survive —
-    //! these are exactly the two cells `cargo mutants` found MISSED
-    //! before this block existed (only integration-level, CUDA-requiring
-    //! tests exercised these functions previously, none violating a
-    //! single disjunct in isolation).
+    //! without these cells `cargo mutants` finds the two mutants MISSED
+    //! (the integration-level, CUDA-requiring tests never violate a single
+    //! disjunct in isolation).
     use super::*;
 
     const OK_DIMS: [usize; 4] = [21, 3, 4, HEAD_DIM];
@@ -1253,10 +1216,9 @@ mod tests {
         assert_eq!(num_heads, 4);
     }
 
-    /// Campaign #443 D2: the op's domain widened from BF16-only to
-    /// `{BF16, F16}` — this cell pins that F16 is accepted, not merely
-    /// that BF16 still is (a regression here would silently narrow the
-    /// domain back without any other test noticing, since every OTHER
+    /// The op's domain is `{BF16, F16}` — this cell pins that F16 is
+    /// accepted, not merely that BF16 is (a regression here would silently
+    /// narrow the domain without any other test noticing, since every OTHER
     /// cell in this module only exercises BF16).
     #[test]
     fn check_qkv_domain_accepts_f16() {
@@ -1315,7 +1277,7 @@ mod tests {
         check_o_domain(&OK_O_DIMS, DType::BF16, 21, 4).unwrap();
     }
 
-    /// Campaign #443 D2 — same widening as `check_qkv_domain_accepts_f16`,
+    /// The same F16 acceptance as `check_qkv_domain_accepts_f16`,
     /// on `o`/`d_o`'s own domain check.
     #[test]
     fn check_o_domain_accepts_f16() {

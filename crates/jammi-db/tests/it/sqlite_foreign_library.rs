@@ -1,10 +1,9 @@
-//! esc-073 RED oracle (`closes_escape: esc-073`) — a foreign SQLite **library
-//! instance** coexisting with a live engine pool on one catalog file must never
-//! kill the process.
+//! A foreign SQLite **library instance** coexisting with a live engine pool on
+//! one catalog file never kills the process.
 //!
-//! Contract under test: a foreign in-process SQLite connection writing to
+//! Invariant: a foreign in-process SQLite connection writing to
 //! `catalog.db` while an engine session's pool is live is OUT OF CONTRACT
-//! (`unix-excl`, docs/guide/src/catalog-and-broker.md:159 — the VFS clause
+//! (`unix-excl`, docs/guide/src/catalog-and-broker.md — the VFS clause
 //! enforcing single-process / engine-owned catalog access) —
 //! but out-of-contract input must fail with a typed refusal or an
 //! `SQLITE_BUSY`-class error, never a process-fatal signal. No topology
@@ -17,19 +16,19 @@
 //! (`cargo tree -p jammi-python -i libsqlite3-sys -e features`): the extension
 //! **statically bundles its own SQLite amalgamation** (3.46.0 in
 //! `libsqlite3-sys 0.30.1`). CPython's `sqlite3` module is a separate shared
-//! object linked against the platform `libsqlite3` (3.53.4 here). So
-//! `test_conformance.py`'s raw-`sqlite3` seed and the engine's `sqlx` pool are
-//! two DIFFERENT SQLite library instances inside ONE process.
+//! object linked against the platform `libsqlite3`. So a Python caller's
+//! raw-`sqlite3` connection and the engine's `sqlx` pool are two DIFFERENT
+//! SQLite library instances inside ONE process.
 //!
 //! That is the whole hazard, and it does not need Python to reproduce: this
 //! test binary already carries the bundled SQLite statically, so `dlopen`-ing
 //! the platform `libsqlite3` gives the identical two-instances-one-process
 //! topology with no extension build, no interpreter, and no test-collection
-//! ordering. The foreign connection here performs exactly the sequence
-//! `test_conformance.py:968-978`'s `_set_metrics` performs: open → `UPDATE` →
-//! commit → close.
+//! ordering. The foreign connection here performs the sequence a Python
+//! caller's `_set_metrics`-shaped helper would: open → `UPDATE` → commit →
+//! close.
 //!
-//! ## Hypothesis under test (to confirm or refute, not to assume)
+//! ## The mechanism the arms discriminate
 //!
 //! POSIX `fcntl` advisory locks are per-PROCESS: two library instances in one
 //! process cannot see each other's locks, and closing any descriptor for the
@@ -55,7 +54,7 @@
 //! until it reproduces or exhausts its attempt budget and reports the rate and
 //! the exact signal.
 //!
-//! FAILURE, per the row's control: ANY process-fatal signal (`SIGBUS`,
+//! FAILURE: ANY process-fatal signal (`SIGBUS`,
 //! `SIGSEGV`, `SIGABRT`, …) from either side. An `SQLITE_BUSY` / typed error
 //! surfaced to either connection is the acceptable refusal shape and is
 //! reported, not failed.
@@ -74,13 +73,13 @@ use jammi_db::catalog::Catalog;
 use jammi_test_utils::child::{Capture, Completeness, DrainedChild, Epoch};
 
 /// Env var carrying the child's role. Absent ⇒ this process is the parent.
-const ROLE_ENV: &str = "JAMMI_ESC073_ROLE";
+const ROLE_ENV: &str = "JAMMI_FOREIGN_SQLITE_ROLE";
 
 /// Env var carrying the exact `--exact` path this process was invoked with,
 /// so [`Role::Grandchild`]'s body can reuse it when spawning its own
 /// grandchild — the parent's `run_child` sets this on every spawn, unused by
 /// every role except `Grandchild`.
-const SELF_EXACT_ENV: &str = "JAMMI_ESC073_SELF_EXACT";
+const SELF_EXACT_ENV: &str = "JAMMI_FOREIGN_SQLITE_SELF_EXACT";
 
 /// The [`ROLE_ENV`] value [`Role::Grandchild`]'s body spawns its OWN child
 /// with (the "grandchild-of-grandchild") — deliberately NOT a [`Role`]
@@ -100,13 +99,13 @@ const GRANDCHILD_CHILD_ROLE_VALUE: &str = "sleeper";
 /// [`run_grandchild_of_grandchild`] runs — set by [`run_grandchild`] and read
 /// by [`Role::Grandchild`]'s own body (which forwards it onto its spawn) and
 /// then by the grandchild-of-grandchild itself.
-const GRANDCHILD_MODE_ENV: &str = "JAMMI_ESC073_GRANDCHILD_MODE";
+const GRANDCHILD_MODE_ENV: &str = "JAMMI_FOREIGN_SQLITE_GRANDCHILD_MODE";
 
 /// [`GRANDCHILD_MODE_ENV`] value: a continuous writer, one line every 10 ms
 /// for 3 s. The reader threads in `jammi_test_utils::child` are poll-based
 /// (`libc::poll`, 50 ms timeout) and conclude EOF on the first EMPTY poll
 /// after the target process (here, `Role::Grandchild` itself) is reaped — a
-/// holder that merely holds the pipe open no longer delays completeness at
+/// holder that merely holds the pipe open does not delay completeness at
 /// all under that mechanism. Only a holder that keeps WRITING with gaps
 /// shorter than the 50 ms poll timeout keeps presenting `POLLIN`, so the
 /// reader never sees the empty poll and keeps draining: this is the
@@ -136,13 +135,12 @@ const GRANDCHILD_SENTINEL: &str = "[child] GRANDCHILD-DONE";
 
 /// Env var overriding [`Role::Flood`]'s line count (default 65536, exactly 4
 /// MiB, when absent) — parameterizes the EXISTING `Flood` role by an env var,
-/// the same shape [`GRANDCHILD_MODE_ENV`] already uses, so the H1
+/// the same shape [`GRANDCHILD_MODE_ENV`] already uses, so the
 /// retention-cap oracle can flood well past `DEFAULT_HEAD_CAP +
 /// DEFAULT_TAIL_CAP` (8 MiB) without a new role.
-const FLOOD_LINES_ENV: &str = "JAMMI_ESC073_FLOOD_LINES";
+const FLOOD_LINES_ENV: &str = "JAMMI_FOREIGN_SQLITE_FLOOD_LINES";
 
-/// Attempt budget per arm. The row records a historical ~2-in-4 reproduction
-/// rate for the pytest shape; the parent stops at the first reproduction, so a
+/// Attempt budget per arm. The parent stops at the first reproduction, so a
 /// deterministic mechanism costs one attempt and a rare one still gets 40.
 const ATTEMPTS: usize = 40;
 
@@ -160,8 +158,8 @@ const ENGINE_LOAD_TASKS: usize = 4;
 const CHILD_CEILING: Duration = Duration::from_secs(120);
 
 /// Platform `libsqlite3` candidates, most-specific first. The first entry is
-/// the exact library CPython's `_sqlite3` extension links here (`otool -L`), so
-/// the harness collides against the same instance the conformance suite does.
+/// the library a Homebrew CPython's `_sqlite3` extension links (`otool -L`), so
+/// the harness collides against the same instance a Python caller would.
 const FOREIGN_LIB_CANDIDATES: &[&str] = &[
     "/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib",
     "/usr/lib/libsqlite3.dylib",
@@ -173,8 +171,8 @@ const FOREIGN_LIB_CANDIDATES: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
     /// Engine pool live; foreign connections opened, written, and CLOSED in a
-    /// loop — the `_set_metrics` shape. This is the arm the row's control
-    /// judges.
+    /// loop — the `_set_metrics` shape. This is the arm the invariant is
+    /// judged on.
     Collide,
     /// Identical to [`Role::Collide`] except one foreign connection stays open
     /// for the whole run, so no foreign close is ever the last connection.
@@ -185,12 +183,13 @@ enum Role {
     /// the engine's close-time checkpoint is the one that can truncate a
     /// mapping the foreign instance holds.
     EngineChurn,
-    /// esc-071's SYMPTOM in esc-073's topology, with no concurrency at all:
+    /// A cross-session stale read in the two-library topology, with no
+    /// concurrency at all:
     /// engine commits → foreign `_set_metrics` cycle → engine reads back,
     /// strictly sequential. Answers whether the two-library topology alone
     /// (not pooling, not races) is what makes a committed value invisible.
     StaleRead,
-    /// Synthetic (esc-078/esc-079 harness-drain oracle): writes a 4 MiB flood
+    /// Synthetic (harness-drain oracle): writes a 4 MiB flood
     /// to stderr past any undrained pipe's capacity, then its sentinel, and
     /// exits 0. The `DrainedChild`-consumption oracle for `Terminus::Sentinel`.
     Flood,
@@ -256,11 +255,10 @@ impl Role {
         }
     }
 
-    /// Parses a role env value, panicking on anything unrecognized (the
-    /// seam's own `dispatch_child` sets this precedent, `:420-433`): an
-    /// unknown role text is a harness bug — a typo in a role literal, or a
-    /// stale value from an old harness — not a "fall through to the parent"
-    /// case. Call sites read the env var first and only call `parse` when it
+    /// Parses a role env value, panicking on anything unrecognized (as
+    /// `sqlite_single_process_seam.rs`'s `dispatch_child` does): an unknown
+    /// role text is a harness bug — a typo in a role literal — not a "fall
+    /// through to the parent" case. Call sites read the env var first and only call `parse` when it
     /// is present (`.ok().map(|r| Role::parse(&r))`), so an ABSENT env var
     /// still takes the parent path unchanged. The grandchild's own sleeper
     /// sub-mode is checked (and dispatched) BEFORE this ever runs — see
@@ -279,7 +277,7 @@ impl Role {
             "bannerless" => Role::Bannerless,
             "postmarker" => Role::PostMarker,
             "grandchild" => Role::Grandchild,
-            other => panic!("esc-073 harness: unknown {ROLE_ENV}={other:?}"),
+            other => panic!("foreign-lib harness: unknown {ROLE_ENV}={other:?}"),
         }
     }
 
@@ -361,7 +359,7 @@ enum Terminus {
 
 /// Exit code a child uses for "this arm's own observation tripped" — a typed
 /// error or a vanished table, as opposed to a fatal signal or a harness fault.
-/// Kept distinct so the parent can report WHICH kind of RED it got.
+/// Kept distinct so the parent can report WHICH kind of failure it got.
 const EXIT_TRIPPED: i32 = 66;
 
 /// Exit code for the residual outcome: one instance read a *stale but
@@ -370,14 +368,14 @@ const EXIT_TRIPPED: i32 = 66;
 /// unclosable from the engine side.
 const EXIT_STALE: i32 = 67;
 
-/// Exit code for the pre-fix outcome the seam is required to have removed: the
-/// database file itself came back malformed (`SQLITE_CORRUPT`). Reported as
-/// its own class because a corrupt catalog is a materially worse failure than
-/// a stale read, and the fix's claim is precisely that this class is gone.
+/// Exit code for the outcome the `unix-excl` seam rules out: the database
+/// file itself came back malformed (`SQLITE_CORRUPT`). Reported as its own
+/// class because a corrupt catalog is a materially worse failure than a stale
+/// read, and the seam's claim is precisely that this class cannot occur.
 const EXIT_CORRUPT: i32 = 68;
 
-/// Exit code for "no platform `libsqlite3` to collide with". The PARENT
-/// decides what that means: a loud local skip, a hard failure under `CI`.
+/// Exit code for "no platform `libsqlite3` to collide with"; the parent fails
+/// the test naming the library it needs.
 const EXIT_NO_FOREIGN_LIB: i32 = 77;
 
 /// Report an observation failure from the child and exit with
@@ -630,7 +628,7 @@ fn open_engine(rt: &tokio::runtime::Runtime, dir: &Path) -> Arc<Catalog> {
 /// Re-open an engine catalog on a directory a foreign library instance has
 /// been writing. A failure here is an ACCEPTABLE refusal, not a harness fault:
 /// the foreign instance's writes are not arbitrated with this one's, so the
-/// image the engine finds may genuinely be unusable. The row's control is that
+/// image the engine finds may genuinely be unusable. The invariant is that
 /// the process stays alive and says so.
 fn try_open_engine(rt: &tokio::runtime::Runtime, dir: &Path) -> Result<Arc<Catalog>, String> {
     rt.block_on(Catalog::open(dir))
@@ -643,12 +641,12 @@ fn seed_probe(rt: &tokio::runtime::Runtime, catalog: &Catalog) {
     rt.block_on(backend.transaction(TxOptions::default(), |tx| {
         Box::pin(async move {
             tx.execute(
-                "CREATE TABLE IF NOT EXISTS esc073_probe (id INTEGER PRIMARY KEY, v TEXT)",
+                "CREATE TABLE IF NOT EXISTS foreign_probe (id INTEGER PRIMARY KEY, v TEXT)",
                 &[],
             )
             .await?;
             tx.execute(
-                "INSERT OR REPLACE INTO esc073_probe (id, v) VALUES (1, 'seed')",
+                "INSERT OR REPLACE INTO foreign_probe (id, v) VALUES (1, 'seed')",
                 &[],
             )
             .await?;
@@ -669,7 +667,7 @@ fn engine_write(
     rt.block_on(backend.transaction(TxOptions::default(), move |tx| {
         Box::pin(async move {
             tx.execute(
-                "UPDATE esc073_probe SET v = $1 WHERE id = 1",
+                "UPDATE foreign_probe SET v = $1 WHERE id = 1",
                 &[SqlValue::TextOwned(value)],
             )
             .await?;
@@ -690,7 +688,7 @@ fn engine_read(rt: &tokio::runtime::Runtime, catalog: &Catalog) -> Result<Option
         },
         |tx| {
             Box::pin(async move {
-                tx.query_opt("SELECT v FROM esc073_probe WHERE id = 1", &[], |r| {
+                tx.query_opt("SELECT v FROM foreign_probe WHERE id = 1", &[], |r| {
                     r.get::<String>("v")
                 })
                 .await
@@ -705,8 +703,7 @@ fn engine_read(rt: &tokio::runtime::Runtime, catalog: &Catalog) -> Result<Option
 /// immediately before `backend.transaction(...)` and cleared after it
 /// returns. The main thread reads both, right before joining the task, to
 /// name a stall inside a synchronous foreign C call without the load task
-/// itself printing anything (see the "Phase markers" section of the W2
-/// design: load tasks emit NO new lines).
+/// itself printing anything (load tasks emit no phase markers).
 struct LoadTaskHandle {
     join: tokio::task::JoinHandle<()>,
     iterations: Arc<AtomicU64>,
@@ -741,13 +738,13 @@ fn spawn_engine_load(
                             Box::pin(async move {
                                 let _ = tx
                                     .query_opt(
-                                        "SELECT v FROM esc073_probe WHERE id = 1",
+                                        "SELECT v FROM foreign_probe WHERE id = 1",
                                         &[],
                                         |r| r.get::<String>("v"),
                                     )
                                     .await?;
                                 tx.execute(
-                                    "UPDATE esc073_probe SET v = $1 WHERE id = 1",
+                                    "UPDATE foreign_probe SET v = $1 WHERE id = 1",
                                     &[SqlValue::TextOwned(value)],
                                 )
                                 .await?;
@@ -777,7 +774,7 @@ fn spawn_engine_load(
         .collect()
 }
 
-// ── Synthetic roles (esc-078/esc-079 harness-drain oracle) ──────────────────
+// ── Synthetic roles (harness-drain oracle) ──────────────────────────────────
 
 /// One 64-byte flood line: `[child] flood <012-digit n>` right-padded with
 /// spaces to 63 bytes, plus a trailing newline. Deliberately the same
@@ -799,7 +796,8 @@ fn synthetic_flood_line(n: u32) -> [u8; 64] {
 /// `DrainedChild` consumption in this harness; a caller can override the
 /// count via `FLOOD_LINES_ENV` (parameterizing the EXISTING role by an env
 /// var, the same shape `GRANDCHILD_MODE_ENV` already uses, rather than adding
-/// a new role) to flood well past the retention cap for the H1 oracle.
+/// a new role) to flood well past the retention cap for the retention-cap
+/// oracle.
 fn synthetic_flood() -> ! {
     let lines: u32 = std::env::var(FLOOD_LINES_ENV)
         .ok()
@@ -910,7 +908,7 @@ fn run_grandchild_of_grandchild() -> ! {
         // Holds the inherited pipe open without ever writing to it. Under
         // the poll-based reader, the first EMPTY poll after `Role::Grandchild`
         // itself is reaped concludes EOF immediately — merely holding the fd
-        // open no longer delays completeness at all.
+        // open does not delay completeness at all.
         std::thread::sleep(Duration::from_secs(3));
         std::process::exit(0);
     }
@@ -956,7 +954,9 @@ fn child_main(role: Role) -> ! {
     seed_probe(&rt, &catalog);
 
     let Some(lib) = ForeignSqlite::load() else {
-        eprintln!("[child] SKIP: no platform libsqlite3 at any of {FOREIGN_LIB_CANDIDATES:?}");
+        eprintln!(
+            "[child] NO-FOREIGN-LIB: no platform libsqlite3 at any of {FOREIGN_LIB_CANDIDATES:?}"
+        );
         std::process::exit(EXIT_NO_FOREIGN_LIB);
     };
     let bundled = rt
@@ -1017,7 +1017,7 @@ fn child_main(role: Role) -> ! {
             // has to observe.
             let keeper = if role == Role::Keeper {
                 let k = lib.open(&db_path).expect("keeper foreign connection");
-                let (rc, msg) = k.exec("SELECT count(*) FROM esc073_probe");
+                let (rc, msg) = k.exec("SELECT count(*) FROM foreign_probe");
                 if rc != 0 {
                     tripped(format!(
                         "the foreign instance's FIRST read could not see the table the engine \
@@ -1047,7 +1047,7 @@ fn child_main(role: Role) -> ! {
                 };
                 let _ = conn.exec("PRAGMA busy_timeout = 5000");
                 let (rc, msg) = conn.exec(&format!(
-                    "UPDATE esc073_probe SET v = 'foreign-{i}' WHERE id = 1"
+                    "UPDATE foreign_probe SET v = 'foreign-{i}' WHERE id = 1"
                 ));
                 if rc != 0 {
                     refusals += 1;
@@ -1089,7 +1089,7 @@ fn child_main(role: Role) -> ! {
                 };
                 let _ = conn.exec("PRAGMA busy_timeout = 5000");
                 let (rc, msg) = conn.exec(&format!(
-                    "UPDATE esc073_probe SET v = '{foreign_value}' \
+                    "UPDATE foreign_probe SET v = '{foreign_value}' \
                      WHERE id = 1 AND v = '{engine_value}'"
                 ));
                 if rc != 0 {
@@ -1152,7 +1152,7 @@ fn child_main(role: Role) -> ! {
                 };
                 eprintln!("[child] phase: churn {i} write");
                 let (rc, msg) = conn.exec(&format!(
-                    "UPDATE esc073_probe SET v = 'foreign-churn-{i}' WHERE id = 1"
+                    "UPDATE foreign_probe SET v = 'foreign-churn-{i}' WHERE id = 1"
                 ));
                 if rc != 0 {
                     refusals += 1;
@@ -1168,7 +1168,7 @@ fn child_main(role: Role) -> ! {
                     );
                 }
                 eprintln!("[child] phase: churn {i} read");
-                let (rc, msg) = conn.exec("SELECT count(*) FROM esc073_probe");
+                let (rc, msg) = conn.exec("SELECT count(*) FROM foreign_probe");
                 if rc != 0 {
                     refusals += 1;
                     eprintln!("[child] foreign read refused rc={rc} msg={msg:?} (acceptable)");
@@ -1203,15 +1203,11 @@ fn child_main(role: Role) -> ! {
         );
         if let Err(join_err) = rt.block_on(task.join) {
             // A panicked load task must fail the attempt, not vanish behind
-            // a clean-looking exit 0: route it through the EXISTING
-            // `EXIT_TRIPPED`/`Attempt::Tripped` arm (no new `Attempt`
-            // variant) by printing and exiting BEFORE the terminal line is
-            // ever reached. `terminus_satisfied`'s `EngineArm` check only
-            // requires the terminal line's presence, so silently dropping
-            // this `JoinError` (as before) would leave `Attempt::Survived`
-            // even though a background worker crashed — this line is what
-            // the parent's `has_tripped_line`/`classify` and
-            // `Summary::is_clean()` already score as a failure.
+            // a clean-looking exit 0: `terminus_satisfied`'s `EngineArm`
+            // check only requires the terminal line's presence, so a dropped
+            // `JoinError` would score `Attempt::Survived`. Exiting through
+            // `EXIT_TRIPPED` BEFORE the terminal line makes the parent's
+            // `classify` and `Summary::is_clean()` score it as a failure.
             tripped(format!("load task {n} panicked: {join_err}"));
         }
     }
@@ -1236,19 +1232,20 @@ fn child_main(role: Role) -> ! {
 #[derive(Debug)]
 enum Attempt {
     Survived,
-    Skipped,
-    /// Process-fatal signal — the row's headline failure.
+    /// No platform `libsqlite3` to collide with.
+    NoForeignLib,
+    /// Process-fatal signal — the headline failure.
     Signal(i32),
     /// The arm's own observation tripped with a TYPED error. Not a signal.
     Tripped,
     /// One instance read a stale-but-well-formed image. The documented
     /// residual of the two-library-instances topology.
     Stale,
-    /// The database file came back malformed. The pre-fix class the seam is
-    /// required to have removed.
+    /// The database file came back malformed. The class the `unix-excl` seam
+    /// rules out.
     Corrupt,
     /// Exited with a code whose class was recognized, but the per-role
-    /// terminus (or, for a `TRIPPED`/`SKIP` code, its own required line) was
+    /// terminus (or, for a `TRIPPED`/`NO-FOREIGN-LIB` code, its own required line) was
     /// not found — evidence lost or malformed, not a clean member of that
     /// class.
     Truncated {
@@ -1273,7 +1270,7 @@ enum Attempt {
     /// but the class's own required line is missing; `Incomplete` means the
     /// evidence itself is not fully collected/trustworthy, so no
     /// content-dependent class (`Survived`/`Tripped`/`Stale`/`Corrupt`/
-    /// `Skipped`) may ever be reported. Carries the reason text (see
+    /// `NoForeignLib`) may ever be reported. Carries the reason text (see
     /// [`incompleteness_reason`] for which of the four conditions it names).
     Incomplete(String),
 }
@@ -1329,7 +1326,7 @@ fn terminus_satisfied(stderr: &[u8], role: Role) -> bool {
 
 /// `Some(reason)` when `cap`'s evidence cannot be trusted for a
 /// content-dependent classification (`Survived`/`Tripped`/`Stale`/`Corrupt`/
-/// `Skipped`, every one of which decides its outcome by reading
+/// `NoForeignLib`, every one of which decides its outcome by reading
 /// `cap.stderr`). The veto is deliberately narrower than
 /// `Capture::is_trustworthy()`: reader completeness
 /// (`complete != Completeness::Complete`, including `Completeness::Undrained`)
@@ -1353,7 +1350,7 @@ fn terminus_satisfied(stderr: &[u8], role: Role) -> bool {
 /// - the banner (`bundled(sqlx, static)=`, checked by `terminus_satisfied`'s
 ///   `EngineArm` arm) is the FIRST diagnostic line `child_main` ever prints,
 ///   well inside the head;
-/// - the terminal / `[child] TRIPPED(<code>):` / `[child] SKIP:` line
+/// - the terminal / `[child] TRIPPED(<code>):` / `[child] NO-FOREIGN-LIB:` line
 ///   (checked by `terminus_satisfied`, `has_tripped_line`, and the
 ///   `EXIT_NO_FOREIGN_LIB` arm) is the LAST line before `exit`, well inside
 ///   the tail;
@@ -1369,12 +1366,12 @@ fn terminus_satisfied(stderr: &[u8], role: Role) -> bool {
 /// at render time and never appears in the raw buffers a comparator sees.
 ///
 /// Meanwhile the load tasks' `[child] engine error …` lines
-/// (`spawn_engine_load`) are UNBOUNDED, and draining removed the pipe's
-/// implicit 64 KiB backpressure that used to throttle them: a
+/// (`spawn_engine_load`) are UNBOUNDED, and draining removes the pipe's
+/// implicit 64 KiB backpressure that would otherwise throttle them: a
 /// persistently-erroring CI attempt can cross the combined 8 MiB cap in
 /// seconds on an otherwise-healthy run. Vetoing on truncation would hard-fail
-/// that attempt on output VOLUME alone — on exactly the class of arm esc-079
-/// exists to observe, not on any actual missing evidence. See
+/// that attempt on output VOLUME alone — on exactly the class of arm the
+/// drain exists to observe, not on any actual missing evidence. See
 /// `flood_role_survives_past_the_retention_cap_with_truncation` for the
 /// behavior-pinning oracle.
 fn incompleteness_reason(cap: &Capture) -> Option<String> {
@@ -1405,18 +1402,17 @@ fn incompleteness_reason(cap: &Capture) -> Option<String> {
 ///   [`Attempt::Tripped`]/[`Attempt::Stale`]/[`Attempt::Corrupt`] iff stderr's
 ///   last non-empty line starts with `[child] TRIPPED(<code>):`, else
 ///   [`Attempt::Truncated`]`{ code }`;
-/// - exit [`EXIT_NO_FOREIGN_LIB`] (77) → [`Attempt::Skipped`] iff stderr
-///   contains `[child] SKIP:`, else [`Attempt::Truncated`]`{ code: 77 }`;
+/// - exit [`EXIT_NO_FOREIGN_LIB`] (77) → [`Attempt::NoForeignLib`] iff stderr
+///   contains `[child] NO-FOREIGN-LIB:`, else [`Attempt::Truncated`]`{ code: 77 }`;
 /// - any other exit code → [`Attempt::ExitCode`];
 /// - a signal death (`status.signal()`) → [`Attempt::Signal`];
 /// - `cap.hung` → [`Attempt::Hung`].
 fn classify(cap: &Capture, role: Role) -> Attempt {
-    // `hung` is now `true` iff `wait_bounded` issued a `kill()` and the
-    // reaped status is a signal death or a reap give-up — a genuine
-    // self-inflicted crash (a signal death `wait_bounded` never killed for)
-    // is `hung == false`, and falls through to the `status.signal()` check
-    // below unaffected: this ordering (hung, then signal) already routes a
-    // self-signalled child to `Attempt::Signal`, not `Attempt::Hung`.
+    // `hung` is `true` iff `wait_bounded` issued a `kill()` and the reaped
+    // status is a signal death or a reap give-up. A self-inflicted crash (a
+    // signal death `wait_bounded` never killed for) is `hung == false` and
+    // falls through to the `status.signal()` check, so this ordering (hung,
+    // then signal) routes it to `Attempt::Signal`, not `Attempt::Hung`.
     if cap.hung {
         return Attempt::Hung;
     }
@@ -1473,8 +1469,8 @@ fn classify(cap: &Capture, role: Role) -> Attempt {
             if let Some(reason) = incomplete {
                 return Attempt::Incomplete(reason);
             }
-            if String::from_utf8_lossy(&cap.stderr).contains("[child] SKIP:") {
-                Attempt::Skipped
+            if String::from_utf8_lossy(&cap.stderr).contains("[child] NO-FOREIGN-LIB:") {
+                Attempt::NoForeignLib
             } else {
                 Attempt::Truncated {
                     code: EXIT_NO_FOREIGN_LIB,
@@ -1502,10 +1498,10 @@ impl Summary {
         self.signals.is_empty() && self.tripped == 0 && self.stale == 0 && self.corrupt == 0
     }
 
-    /// The contract this row actually carries for an out-of-contract topology:
-    /// no process-fatal signal, and — post-seam — no damaged database file
-    /// either. A typed error or a stale read is the acceptable residual and is
-    /// recorded, not failed.
+    /// What the engine guarantees for this out-of-contract topology: no
+    /// process-fatal signal and, with the `unix-excl` seam in place, no damaged
+    /// database file. A typed error or a stale read is the acceptable residual
+    /// and is recorded, not failed.
     fn is_signal_free_and_uncorrupted(&self) -> bool {
         self.signals.is_empty() && self.corrupt == 0
     }
@@ -1522,8 +1518,7 @@ impl Summary {
 /// Re-execute this test binary as a child in `role`, running only `test_name`,
 /// via [`DrainedChild`] (both streams drained on background threads while the
 /// child runs, so a chatty-but-healthy child is never mistaken for a hang and
-/// a killed child's progress is never discarded — the esc-078 fix this
-/// harness now consumes). Bounded by `ceiling` from [`Epoch::Spawn`].
+/// a killed child's progress is never discarded). Bounded by `ceiling` from [`Epoch::Spawn`].
 ///
 /// [`SELF_EXACT_ENV`] is set unconditionally (`test_name`, the exact `--exact`
 /// path this spawn used) so [`Role::Grandchild`]'s body can reuse it for its
@@ -1561,7 +1556,7 @@ fn run_grandchild(test_name: &str, ceiling: Duration, mode: &str) -> (Attempt, C
 
 /// Like [`run_child`], specialized to [`Role::Flood`]: also sets
 /// [`FLOOD_LINES_ENV`] to `lines`, so a caller can flood well past
-/// `DEFAULT_HEAD_CAP + DEFAULT_TAIL_CAP` without a new role — the H1
+/// `DEFAULT_HEAD_CAP + DEFAULT_TAIL_CAP` without a new role — the
 /// retention-cap oracle's only caller.
 fn run_flood(test_name: &str, ceiling: Duration, lines: u32) -> (Attempt, Capture) {
     let exe = std::env::current_exe().expect("current test binary");
@@ -1576,8 +1571,8 @@ fn run_flood(test_name: &str, ceiling: Duration, lines: u32) -> (Attempt, Captur
     (attempt, cap)
 }
 
-/// Render both of a [`Capture`]'s streams (stdout then stderr, matching the
-/// pre-drain harness's own `log` shape) for a panic/failure message. Prefers
+/// Render both of a [`Capture`]'s streams (stdout then stderr) for a
+/// panic/failure message. Prefers
 /// `Capture::render_stdout`/`render_stderr` over the free `render` function:
 /// they always use the head-retention cap the capture was actually built
 /// with, so they cannot be called with a mismatched cap.
@@ -1601,7 +1596,7 @@ fn hung_diagnostic(
     cap: &Capture,
 ) -> String {
     format!(
-        "esc-073 [{}]: attempt {attempt_no}/{total} hung past {ceiling:?}; last phase \
+        "foreign-lib [{}]: attempt {attempt_no}/{total} hung past {ceiling:?}; last phase \
          marker={:?} silence={:?}. Both streams:\n{}",
         role.as_str(),
         last_phase_marker(&cap.stderr),
@@ -1619,7 +1614,7 @@ fn truncated_diagnostic(
     cap: &Capture,
 ) -> String {
     format!(
-        "esc-073 [{}]: attempt {attempt_no}/{total} exited {code} without its expected terminus \
+        "foreign-lib [{}]: attempt {attempt_no}/{total} exited {code} without its expected terminus \
          (evidence lost or malformed); last phase marker={:?} silence={:?}. Both streams:\n{}",
         role.as_str(),
         last_phase_marker(&cap.stderr),
@@ -1637,8 +1632,8 @@ fn incomplete_diagnostic(
     cap: &Capture,
 ) -> String {
     format!(
-        "esc-073 [{}]: attempt {attempt_no}/{total} produced an INCOMPLETE capture ({reason}) — \
-         it can never be scored Survived/Tripped/Stale/Corrupt/Skipped from untrustworthy \
+        "foreign-lib [{}]: attempt {attempt_no}/{total} produced an INCOMPLETE capture ({reason}) — \
+         it can never be scored Survived/Tripped/Stale/Corrupt/NoForeignLib from untrustworthy \
          evidence; last phase marker={:?} silence={:?}. Both streams:\n{}",
         role.as_str(),
         last_phase_marker(&cap.stderr),
@@ -1677,30 +1672,16 @@ fn drive_with(role: Role, test_name: &str, stop_at_first_failure: bool) -> Summa
                 summary.survived += 1;
                 false
             }
-            Attempt::Skipped => {
-                // Fail closed under CI: a harness that silently evaporates on
-                // the machine that gates merges proves nothing. Locally it is
-                // a loud skip.
-                assert!(
-                    std::env::var_os("CI").is_none(),
-                    "esc-073 [{}]: no platform libsqlite3 at any of {FOREIGN_LIB_CANDIDATES:?}, \
-                     so this harness is VACUOUS — and `CI` is set, where a vacuous escape oracle \
-                     is a failure. Install a platform libsqlite3 in the CI image or add its path \
-                     to FOREIGN_LIB_CANDIDATES.\n{}",
-                    role.as_str(),
-                    summary.log
-                );
-                eprintln!(
-                    "esc-073 [{}]: SKIPPED — no platform libsqlite3 to collide with; this \
-                     harness is vacuous on this machine:\n{}",
-                    role.as_str(),
-                    summary.log
-                );
-                return summary;
-            }
+            Attempt::NoForeignLib => panic!(
+                "foreign-lib [{}]: this test needs a platform libsqlite3 to collide with; none \
+                 was found at any of {FOREIGN_LIB_CANDIDATES:?}. Install one (the CI image ships \
+                 sqlite-libs) or add its path to FOREIGN_LIB_CANDIDATES.\n{}",
+                role.as_str(),
+                summary.log
+            ),
             Attempt::Signal(sig) => {
                 eprintln!(
-                    "esc-073 [{}]: attempt {attempt_no}/{ATTEMPTS} died with SIGNAL {sig}",
+                    "foreign-lib [{}]: attempt {attempt_no}/{ATTEMPTS} died with SIGNAL {sig}",
                     role.as_str()
                 );
                 summary.signals.push(sig);
@@ -1708,7 +1689,7 @@ fn drive_with(role: Role, test_name: &str, stop_at_first_failure: bool) -> Summa
             }
             Attempt::Tripped => {
                 eprintln!(
-                    "esc-073 [{}]: attempt {attempt_no}/{ATTEMPTS} tripped with a TYPED error",
+                    "foreign-lib [{}]: attempt {attempt_no}/{ATTEMPTS} tripped with a TYPED error",
                     role.as_str()
                 );
                 summary.tripped += 1;
@@ -1716,7 +1697,7 @@ fn drive_with(role: Role, test_name: &str, stop_at_first_failure: bool) -> Summa
             }
             Attempt::Stale => {
                 eprintln!(
-                    "esc-073 [{}]: attempt {attempt_no}/{ATTEMPTS} observed a STALE READ",
+                    "foreign-lib [{}]: attempt {attempt_no}/{ATTEMPTS} observed a STALE READ",
                     role.as_str()
                 );
                 summary.stale += 1;
@@ -1724,7 +1705,7 @@ fn drive_with(role: Role, test_name: &str, stop_at_first_failure: bool) -> Summa
             }
             Attempt::Corrupt => {
                 eprintln!(
-                    "esc-073 [{}]: attempt {attempt_no}/{ATTEMPTS} found the database file \
+                    "foreign-lib [{}]: attempt {attempt_no}/{ATTEMPTS} found the database file \
                      MALFORMED",
                     role.as_str()
                 );
@@ -1738,7 +1719,7 @@ fn drive_with(role: Role, test_name: &str, stop_at_first_failure: bool) -> Summa
                 )
             }
             Attempt::ExitCode(code) => panic!(
-                "esc-073 [{}]: attempt {attempt_no}/{ATTEMPTS} exited {code} (harness fault, not \
+                "foreign-lib [{}]: attempt {attempt_no}/{ATTEMPTS} exited {code} (harness fault, not \
                  a crash):\n{}",
                 role.as_str(),
                 summary.log
@@ -1770,13 +1751,12 @@ fn drive_with(role: Role, test_name: &str, stop_at_first_failure: bool) -> Summa
 /// fatal signal is not.
 #[test]
 fn foreign_library_write_cycle_never_kills_the_process() {
-    let name =
-        "esc_073_foreign_sqlite_library::foreign_library_write_cycle_never_kills_the_process";
+    let name = "sqlite_foreign_library::foreign_library_write_cycle_never_kills_the_process";
     dispatch_if_child();
     let s = drive(Role::Collide, name);
     assert!(
         s.is_clean(),
-        "esc-073: a foreign SQLite library instance's open/write/close cycle broke the process \
+        "foreign-lib: a foreign SQLite library instance's open/write/close cycle broke the process \
          ({}) — an out-of-contract topology must refuse, never die by signal. Child log:\n{}",
         s.census(),
         s.log
@@ -1788,18 +1768,18 @@ fn foreign_library_write_cycle_never_kills_the_process() {
 /// never treats a closing connection as the last one and never runs the
 /// close-time checkpoint + `-wal`/`-shm` truncate.
 ///
-/// Read this arm against the oracle: oracle RED + this arm GREEN confirms the
-/// close-time truncate-under-a-live-mapping hypothesis; both RED refutes it and
-/// points at plain concurrent-WAL-write incompatibility instead.
+/// Read this arm against the oracle: oracle failing + this arm passing
+/// confirms the close-time truncate-under-a-live-mapping mechanism; both
+/// failing refutes it and points at plain concurrent-WAL-write
+/// incompatibility instead.
 #[test]
 fn keeper_connection_suppresses_the_close_time_checkpoint() {
-    let name =
-        "esc_073_foreign_sqlite_library::keeper_connection_suppresses_the_close_time_checkpoint";
+    let name = "sqlite_foreign_library::keeper_connection_suppresses_the_close_time_checkpoint";
     dispatch_if_child();
     let s = drive(Role::Keeper, name);
     assert!(
         s.is_clean(),
-        "esc-073 keeper arm: {}. Child log:\n{}",
+        "foreign-lib keeper arm: {}. Child log:\n{}",
         s.census(),
         s.log
     );
@@ -1819,28 +1799,29 @@ fn keeper_connection_suppresses_the_close_time_checkpoint() {
 /// hang.
 #[test]
 fn engine_pool_churn_under_a_live_foreign_connection_never_kills_the_process() {
-    let name = "esc_073_foreign_sqlite_library::\
+    let name = "sqlite_foreign_library::\
                 engine_pool_churn_under_a_live_foreign_connection_never_kills_the_process";
     dispatch_if_child();
     let s = drive(Role::EngineChurn, name);
     assert!(
         s.is_clean(),
-        "esc-073 reverse direction: an engine pool closing under a live foreign connection \
+        "foreign-lib reverse direction: an engine pool closing under a live foreign connection \
          broke the process ({}). Child log:\n{}",
         s.census(),
         s.log
     );
 }
 
-/// **esc-071's symptom, in esc-073's topology.** Strictly sequential — no
+/// **A cross-session stale read, in the two-library topology.** Strictly sequential — no
 /// background load, no concurrency, no sleep, no retry: engine commits, the
 /// foreign library instance performs one `_set_metrics` cycle, and each side
 /// looks for what the other just committed.
 ///
-/// This is the arm that connects the two rows: a lone foreign
-/// open/write/close makes a committed value invisible with no race in sight,
-/// so the read-visibility lag the python wave attributed to engine pooling is
-/// a property of the two-library-instances-one-file topology, not of the pool.
+/// This is the arm that connects this file to
+/// `sqlite_cross_session_visibility.rs`: a lone foreign open/write/close
+/// makes a committed value invisible with no race in sight, so a
+/// read-visibility lag seen from Python is a property of the
+/// two-library-instances-one-file topology, not of engine pooling.
 ///
 /// # What this arm asserts, and what it deliberately does not
 ///
@@ -1848,12 +1829,13 @@ fn engine_pool_churn_under_a_live_foreign_connection_never_kills_the_process() {
 /// achievable from the engine side and is not asserted here. Their `fcntl`
 /// locks are the same process's locks, so neither instance can see the other's
 /// WAL-index state; `jammi_db::catalog::backend_sqlite`'s module docs record
-/// that residual. What IS asserted is the pair of classes the fix removed:
+/// that residual. What IS asserted is the pair of classes the `unix-excl`
+/// seam rules out:
 ///
-/// * **no process-fatal signal** — the row's headline failure (`SIGBUS` from a
+/// * **no process-fatal signal** — the headline failure (`SIGBUS` from a
 ///   truncated, mmapped `-shm`), and
-/// * **no malformed database file** — the pre-fix `SQLITE_CORRUPT` this arm
-///   returned 17 times in 20 on the default VFS.
+/// * **no malformed database file** — `SQLITE_CORRUPT`, which this arm
+///   returns 17 times in 20 on the default VFS.
 ///
 /// A stale read or a typed error is the acceptable residual; the census
 /// records which, so a regression from "stale" back to "corrupt" is visible in
@@ -1861,25 +1843,25 @@ fn engine_pool_churn_under_a_live_foreign_connection_never_kills_the_process() {
 /// driven (not stopped at the first hit) so the census is a rate.
 #[test]
 fn the_stale_read_topology_neither_signals_nor_corrupts_the_file() {
-    let name = "esc_073_foreign_sqlite_library::\
+    let name = "sqlite_foreign_library::\
                 the_stale_read_topology_neither_signals_nor_corrupts_the_file";
     dispatch_if_child();
     let s = drive_all(Role::StaleRead, name);
     assert!(
         s.is_signal_free_and_uncorrupted(),
-        "esc-073 stale-read arm: {} over {ATTEMPTS} attempt(s). A signal, or a malformed \
+        "foreign-lib stale-read arm: {} over {ATTEMPTS} attempt(s). A signal, or a malformed \
          database file, is a failure; a stale read or a typed error is the documented residual. \
          Child log:\n{}",
         s.census(),
         s.log
     );
     eprintln!(
-        "esc-073 stale-read arm census over {ATTEMPTS} attempt(s): {}",
+        "foreign-lib stale-read arm census over {ATTEMPTS} attempt(s): {}",
         s.census()
     );
 }
 
-// ── Role machinery + synthetic-role classification (esc-078/esc-079) ───────
+// ── Role machinery + synthetic-role classification ─────────────────────────
 
 /// `Role::parse`/`as_str`/`synthetic`/`expected_terminus` must round-trip and
 /// be total over every one of the eleven variants — the four production
@@ -1908,7 +1890,7 @@ fn role_round_trip_and_totality_covers_all_eleven_variants() {
 /// `Role::parse` panics on unknown text rather than silently falling through
 /// to the parent path — an unrecognized role env value is a harness bug.
 #[test]
-#[should_panic(expected = "esc-073 harness: unknown")]
+#[should_panic(expected = "foreign-lib harness: unknown")]
 fn role_parse_panics_on_unrecognized_text() {
     Role::parse("not-a-real-role");
 }
@@ -1919,7 +1901,7 @@ fn role_parse_panics_on_unrecognized_text() {
 /// test in this file, so a future refactor that changes which test name is
 /// reused cannot silently drop the guard.
 const GUARD_TEST: &str =
-    "esc_073_foreign_sqlite_library::foreign_library_write_cycle_never_kills_the_process";
+    "sqlite_foreign_library::foreign_library_write_cycle_never_kills_the_process";
 
 /// [`Role::Flood`] must be classified `Survived`, with every one of its 4 MiB
 /// of flood bytes retained (asserted on the RAW `Capture::stderr`, never the
@@ -1944,7 +1926,7 @@ fn flood_role_survives_and_retains_every_byte() {
     assert_eq!(cap.stderr_truncated, 0, "well under the retention cap");
 }
 
-/// **H1 oracle: a retention-cap truncation must NEVER veto a
+/// **Retention-cap oracle: a retention-cap truncation must NEVER veto a
 /// content-dependent classification.** [`FLOOD_LINES_ENV`] parameterizes the
 /// EXISTING `Role::Flood` (no new role) to flood well past
 /// `DEFAULT_HEAD_CAP + DEFAULT_TAIL_CAP` (6 MiB + 2 MiB = 8 MiB); its
@@ -2073,15 +2055,15 @@ fn wedge_role_is_hung_with_its_last_phase_marker() {
 /// GRANDCHILD_SENTINEL` regardless of how many of the 300 repeats got
 /// captured before the settle gave up (terminus-satisfied). That combination
 /// — untrustworthy AND terminus-satisfied at once — is deliberate and
-/// load-bearing: a distinct one-off "heartbeat" line there (an earlier draft
-/// of this test used one) would leave the terminus permanently unsatisfied,
+/// load-bearing: a distinct one-off "heartbeat" line there would leave the
+/// terminus permanently unsatisfied,
 /// and a `classify` that checked terminus BEFORE the trust gate would still
 /// (coincidentally) return `Incomplete` via its terminus-failed fallback
 /// branch — the two orderings would be indistinguishable to this test, an
 /// untested branch masquerading as coverage. With the sentinel repeated,
 /// checking terminus first would find it SATISFIED and return `Survived` —
-/// exactly the false GREEN this gate exists to prevent — so this test now
-/// actually reds under that reordering. Sibling:
+/// exactly the false pass this gate exists to prevent — so this test reds
+/// under that reordering. Sibling:
 /// [`holding_grandchild_capture_is_complete`] pins the OTHER side of the
 /// completeness boundary — a grandchild-of-grandchild that only holds the
 /// pipe, never writing, does NOT produce `SettleExpired`.
@@ -2154,7 +2136,7 @@ fn grandchild_capture_is_incomplete_not_survived() {
 /// grandchild-of-grandchild here ([`GRANDCHILD_MODE_HOLDING`]) merely holds
 /// the inherited pipe open for 3 s and never writes to it. Under the
 /// poll-based reader, the first EMPTY poll after `Role::Grandchild` itself is
-/// reaped concludes EOF immediately — a silent fd-holder no longer delays
+/// reaped concludes EOF immediately — a silent fd-holder does not delay
 /// completeness at all, regardless of why it still has the pipe open. That
 /// alone flips the outcome from `Incomplete` to `Survived`, pinning the exact
 /// boundary `jammi_test_utils::child` documents between "holding" and

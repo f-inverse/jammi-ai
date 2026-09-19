@@ -1,11 +1,11 @@
-"""SPEC-03 §12 #6 — Python `Database` tenant surface end-to-end.
+"""Python `Database` tenant surface end-to-end.
 
 Tests the PyO3 binding from the consumer's seat: a `jammi.connect`
 yields a Database; `set_tenant` mutates the underlying engine binding
 in place, while `tenant_scope` binds for the duration of a `with` block and
 restores the prior tenant on exit; subsequent `sql` / `list_sources` calls
 observe the tenant-scoped predicate the engine's `TenantScopeAnalyzerRule`
-injects. Mirrors the engine-side SPEC-03 §12 #2 federated split (Parquet local
+injects. Mirrors the engine-side federated split (Parquet local
 source with a tenant_id column, 10 rows split 6/4) but reaches it through the
 Python API.
 
@@ -44,7 +44,7 @@ def _write_split_parquet(path: str, n_a: int = 6, n_b: int = 4) -> None:
 
 
 def test_set_tenant_filters_federated_source(tmp_path):
-    """SPEC-03 §12 #2 + #6 — Python session bound to tenant A reads 6 rows;
+    """Python session bound to tenant A reads 6 rows;
     tenant B reads 4; tenant binding is observable through the SQL surface."""
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
@@ -232,8 +232,7 @@ def test_tenant_scope_stray_exit_is_a_noop(tmp_path):
 
 
 def test_register_channel_round_trips_through_python(tmp_path):
-    """SPEC-01 §7 dual-language hook landed in this iteration: register
-    a new evidence-provenance channel from Python; merging in the engine
+    """Register a new evidence-provenance channel from Python; merging in the engine
     sees the declared columns."""
     db = jammi.connect(f"file://{tmp_path}")
     db.register_channel(

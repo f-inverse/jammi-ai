@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Self-test for `gpu_inference_ab.py` (issue #335) — the `test_ab_merge.py`
+"""Self-test for `gpu_inference_ab.py` — the `test_ab_merge.py`
 style: drives the REAL `build_report`/`main` entry points against fixture
 leg directories shaped exactly like `gpu_inference_ab.sh`'s own
 `.exit`/`.json` output, never a hand-rolled call into an inner helper with
@@ -69,7 +69,7 @@ def gpu_inference_tier(embed_p50_ms=8.0, infer_p50_ms=6.0, **identity_overrides)
 
 
 def write_mode(raw_dir, mode):
-    """Writes the `mode` marker (round-3 adversarial audit B2) the REAL
+    """Writes the `mode` marker the REAL
     producer writes into `raw_dir` before any leg runs. A test that wants
     `--aa-null` (or an unconfirmed/absent-mode) routing behavior calls this
     EXPLICITLY, BEFORE its own `write_leg` calls (see that function's own
@@ -80,10 +80,9 @@ def write_mode(raw_dir, mode):
 
 
 def write_enforce(raw_dir, value="1"):
-    """Writes the `enforce` marker (issue #335's final unit, the
-    enforcement flip) the REAL producer writes into `raw_dir` before any leg
-    runs — the SAME file-based state-passing convention [`write_mode`]
-    already exercises. A test that wants ENFORCING mode calls this
+    """Writes the `enforce` marker the REAL producer writes into `raw_dir`
+    before any leg runs — the SAME file-based state-passing convention
+    [`write_mode`] exercises. A test that wants ENFORCING mode calls this
     EXPLICITLY (any call site that never mentions it stays non-enforcing,
     [`gpu_inference_ab.load_enforce`]'s own safe default for an absent
     file).
@@ -93,10 +92,10 @@ def write_enforce(raw_dir, value="1"):
 
 
 def write_pod_id(raw_dir, value):
-    """Writes the `pod_id` marker (round-4 delta-audit F3(d), the
-    structural fix for the concurrent-invocations-sharing-one-pod
-    contamination class `ci/artifacts/gpu-perf-aa-null/README.md`'s own
-    "Disclosure" section documents by hand) the REAL producer writes into
+    """Writes the `pod_id` marker (which makes the
+    concurrent-invocations-sharing-one-pod contamination class
+    `ci/artifacts/gpu-perf-aa-null/README.md`'s own "Disclosure" section
+    documents by hand detectable) the REAL producer writes into
     `raw_dir` before any leg runs — `${RUNPOD_POD_ID:-$(hostname)}`, see
     `gpu_inference_ab.sh`'s own doc.
     """
@@ -106,17 +105,15 @@ def write_pod_id(raw_dir, value):
 
 def write_leg(raw_dir, name, tier=None, exit_code="0", build_sha=None, started_at=None):
     """Writes the SAME `.exit`/`.json`/`.started_at` file triple
-    `gpu_inference_ab.sh`'s own `run_leg` writes (round-2 adversarial audit
-    F3). `started_at` defaults to `1000 + LEG_ORDER.index(name)` — a
-    non-decreasing A,B,B,A-ordered value by default, so every EXISTING
-    call site (which never mentions `started_at`) keeps producing a
-    verifiably-ordered fixture without being rewritten; a test that wants
-    to construct an out-of-order fixture passes an explicit override.
+    `gpu_inference_ab.sh`'s own `run_leg` writes. `started_at` defaults to
+    `1000 + LEG_ORDER.index(name)` — a non-decreasing A,B,B,A-ordered value
+    by default, so a call site that never mentions `started_at` produces a
+    verifiably-ordered fixture; a test that wants to construct an
+    out-of-order fixture passes an explicit override.
 
-    Also writes the `mode` marker (round-3 adversarial audit B2), defaulted
-    to `"ab"`, the ONE time no `mode` file exists yet in `raw_dir` — every
-    EXISTING call site (which never mentions mode) keeps implicitly
-    exercising the normal `ab`-mode routing without being rewritten; a test
+    Also writes the `mode` marker, defaulted to `"ab"`, the ONE time no
+    `mode` file exists yet in `raw_dir` — a call site that never mentions
+    mode implicitly exercises the normal `ab`-mode routing; a test
     that wants a DIFFERENT mode calls [`write_mode`] explicitly first (this
     function then leaves that pre-written file alone).
     """
@@ -190,8 +187,7 @@ class BuildReportGreenPathTests(unittest.TestCase):
         a premise-clean run with an unfavorable ratio is never itself a
         refusal unless enforcement was explicitly opted into (see
         `EnforceModeTests` below). `classify_advisory` deliberately never
-        returns "pass"/"fail" (round-1 adversarial audit advisory: those
-        words read as a gate verdict).
+        returns "pass"/"fail" (those words read as a gate verdict).
         """
         with tempfile.TemporaryDirectory() as raw_dir:
             # b/a ratio = 16/8 = 2.0 for both pairs -- well outside the
@@ -233,7 +229,7 @@ class BuildReportGreenPathTests(unittest.TestCase):
 
 
 class EnforceModeTests(unittest.TestCase):
-    """issue #335's final unit — the enforcement flip. `GPU_INFERENCE_AB_ENFORCE`
+    """Enforcement. `GPU_INFERENCE_AB_ENFORCE`
     is read off the `enforce` marker file the producer writes into `raw_dir`
     ([`write_enforce`] here, [`gpu_inference_ab.load_enforce`] in
     production) — never a direct env var read by `gpu_inference_ab.py`
@@ -243,7 +239,7 @@ class EnforceModeTests(unittest.TestCase):
     """
 
     def test_enforce_above_band_green_premises_exits_1_named_perf_regression_verdict(self):
-        """RED-first case: ENFORCING mode, ratio ABOVE the upper edge,
+        """ENFORCING mode, ratio ABOVE the upper edge,
         premises GREEN -- must exit 1 with `enforce_verdict ==
         "PERF_REGRESSION"`, `status` STAYING `"GREEN"` (the premises really
         did agree; this is not a correctness refusal), and a
@@ -273,8 +269,7 @@ class EnforceModeTests(unittest.TestCase):
         self.assertNotIn("invalid_measurement_reason", merged)
 
     def test_enforce_below_band_green_premises_exits_1_named_outside_band_fast_verdict(self):
-        """round-4 delta-audit F1 (RED-first, the finding's own teeth): a
-        NULL band is two-sided -- ratio BELOW the lower edge must NOT be
+        """A NULL band is two-sided -- ratio BELOW the lower edge must NOT be
         folded into `PERF_REGRESSION` (a one-sided "slower is bad, faster
         is fine" reading would be WRONG on a null band: a b-role leg that
         silently short-circuited/broke reads suspiciously FAST, not slow).
@@ -366,7 +361,7 @@ class EnforceModeTests(unittest.TestCase):
         self.assertNotIn("perf_regression_reason", merged)
 
     def test_enforce_with_aa_null_mode_is_enforce_invalid_mode_exit_1(self):
-        """round-4 delta-audit F4: enforcement is only defined for a real
+        """Enforcement is only defined for a real
         A/B run (`mode == "ab"`). `--aa-null`'s own b-role legs are ALSO
         parent-sha clones -- enforcing there would misfire the very
         instrument the band was derived from. Must refuse (exit 1,
@@ -418,7 +413,7 @@ class EnforceModeTests(unittest.TestCase):
         self.assertIn("None", merged["enforce_invalid_mode_reason"])
 
     def test_enforce_marker_present_distinguishes_absent_from_explicit_zero(self):
-        """round-4 delta-audit advisory (4): `enforce` (a plain bool) folds
+        """`enforce` (a plain bool) folds
         an ABSENT marker file and an EXPLICIT `"0"` into the SAME `False` --
         correct for control flow, but `enforce_marker_present` recovers the
         distinction for auditability (an older producer that never wrote
@@ -459,11 +454,10 @@ class EnforceModeTests(unittest.TestCase):
 
 
 class PodIdProvenanceTests(unittest.TestCase):
-    """round-4 delta-audit F3(d): pod identity, recorded into every OK
-    leg's own `provenance.pod_id` — the structural fix for the
-    concurrent-invocations-sharing-one-pod class
+    """Pod identity, recorded into every OK leg's own `provenance.pod_id` —
+    makes the concurrent-invocations-sharing-one-pod class
     `ci/artifacts/gpu-perf-aa-null/README.md`'s own "Disclosure" section
-    reconstructs by hand today. Drives the REAL `build_report`/`load_pod_id`
+    reconstructs by hand detectable from the report. Drives the REAL `build_report`/`load_pod_id`
     production functions, never a re-implementation.
     """
 
@@ -479,8 +473,8 @@ class PodIdProvenanceTests(unittest.TestCase):
 
     def test_pod_id_is_none_when_marker_absent_an_older_producer(self):
         """Every report committed under `ci/artifacts/gpu-perf-aa-null/`
-        today predates this field entirely -- `None` here is the honest,
-        common case for that whole directory, never raised or fabricated.
+        lacks this field -- `None` here is the honest, common case for that
+        whole directory, never raised or fabricated.
         """
         with tempfile.TemporaryDirectory() as raw_dir:
             write_all_ok_legs(raw_dir, {"a1": 8.0, "b1": 8.0, "b2": 8.0, "a2": 8.0})
@@ -497,14 +491,14 @@ class PodIdProvenanceTests(unittest.TestCase):
             self.assertEqual(gpu_inference_ab.load_pod_id(raw_dir), "some-pod-id")
 
     def test_empty_pod_id_marker_is_none_but_marker_present_distinguishes(self):
-        """round-2 delta-audit B5: an EMPTY marker (host with no
+        """An EMPTY marker (host with no
         RUNPOD_POD_ID and a failing `hostname` under the producer's
         `set -u`-no-`-e` shell) must stay `pod_id=None` (a sentinel value
         would FALSE-MATCH across two broken hosts in the same-pod-id
         contamination check), but `pod_id_marker_present=True` must
         distinguish it from an older producer that never wrote the marker
         at all — the same absent-vs-explicit split `enforce_marker_present`
-        already carries one field over.
+        carries.
         """
         with tempfile.TemporaryDirectory() as raw_dir:
             write_pod_id(raw_dir, "")
@@ -527,11 +521,11 @@ class PodIdProvenanceTests(unittest.TestCase):
 
 
 class DeriveAdvisoryBandDomainTests(unittest.TestCase):
-    """round-2 delta-audit B2/B3: the derivation's valid input domain is
-    named and guarded (never a degenerate, inverted, or divide-by-zero
-    band), and the outward (band-widening) guarantee holds by construction
-    on BOTH edges — including the small-spread region where the
-    reciprocal-only formulation was proven inward.
+    """The derivation's valid input domain is named and guarded (never a
+    degenerate, inverted, or divide-by-zero band), and the outward
+    (band-widening) guarantee holds by construction on BOTH edges —
+    including the small-spread region where a reciprocal-only formulation
+    would land inward.
     """
 
     def test_committed_input_reproduces_the_committed_band(self):
@@ -547,9 +541,8 @@ class DeriveAdvisoryBandDomainTests(unittest.TestCase):
                     gpu_inference_ab.derive_advisory_band(bad)
 
     def test_band_is_outward_on_both_edges_across_the_domain(self):
-        """Sweeps the valid domain including the round-2 audit's own first
-        counterexample (w=0.00664, where floored-reciprocal alone landed
-        INSIDE the raw upper edge): the derived band must CONTAIN the raw
+        """Sweeps the valid domain including the counterexample w=0.00664,
+        where the floored reciprocal alone lands INSIDE the raw upper edge: the derived band must CONTAIN the raw
         interval everywhere, and lo < hi always.
         """
         import math as _math
@@ -561,7 +554,7 @@ class DeriveAdvisoryBandDomainTests(unittest.TestCase):
             self.assertLess(lo, hi, f"w={w}: inverted band ({lo}, {hi})")
             self.assertLessEqual(lo, raw_lo, f"w={w}: lower edge {lo} inside raw {raw_lo}")
             self.assertGreaterEqual(hi, raw_hi, f"w={w}: upper edge {hi} inside raw {raw_hi}")
-        # the audit's named counterexample, pinned exactly:
+        # the reciprocal-only counterexample, pinned exactly:
         lo, hi = gpu_inference_ab.derive_advisory_band(0.00664)
         self.assertGreaterEqual(hi, _math.exp(1.5 * 0.00664))
 
@@ -608,9 +601,8 @@ class IdentityMismatchTests(unittest.TestCase):
         self.assertTrue(any("embed_checkpoint_weights_sha256" in v for v in merged["leg_premise_violations"]))
 
     def test_a_parent_leg_missing_identity_fields_entirely_is_neutral_not_invalid(self):
-        """round-1 adversarial audit B3: a PARENT leg built before issue
-        #335's own identity contract landed simply cannot EMIT a field this
-        older binary never knew to record — its report JSON is missing the
+        """A PARENT leg built by an older tool version simply cannot EMIT a
+        field that binary never knew to record — its report JSON is missing the
         key entirely, never present-but-different. This is NOT the same
         claim as "the two legs proved they ran a different premise" (that
         earns INVALID/1 above); it earns the neutral INCOMPLETE_IDENTITY/75
@@ -687,8 +679,7 @@ class MissingLegTests(unittest.TestCase):
         leg failure and a parent-side leg's total absence are the same
         "could not compare" state from this merger's own point of view.
         See [`test_a_b_role_failed_leg_is_invalid_exit_1`] for why a
-        `b`-role failure is treated differently (round-2 adversarial audit
-        F5).
+        `b`-role failure is treated differently.
         """
         with tempfile.TemporaryDirectory() as raw_dir:
             write_leg(raw_dir, "a1", tier=None, exit_code="1")  # FAIL leg, a-role
@@ -703,7 +694,7 @@ class MissingLegTests(unittest.TestCase):
         self.assertEqual(merged["missing_legs"], ["a1"])
 
     def test_a_b_role_failed_leg_is_invalid_exit_1(self):
-        """round-2 adversarial audit F5: a PR-side (`b`-role) leg that ran
+        """A PR-side (`b`-role) leg that ran
         but exited nonzero is a STRONGER signal than a non-compiling one
         (the binary built fine; the measured serve itself crashed/errored)
         — a real correctness-of-measurement refusal (INVALID/1), never the
@@ -723,12 +714,10 @@ class MissingLegTests(unittest.TestCase):
         self.assertIn("b1", merged["invalid_reason"])
 
     def test_empty_raw_dir_is_incomplete_exit_75_nothing_ran_at_all(self):
-        """round-3 adversarial audit B2 correction (the auditor's own
-        reproduction): round-2's own fix collapsed EVERY b-role ABSENCE --
-        including a leg that never even ran at all (`MISSING`, no `.exit`
-        file whatsoever) -- into the SAME "PR's own problem" bucket a
-        genuine RUNTIME failure earns. "Nothing ran" carries NO runtime
-        signal about a PR binary at all: `b1`/`b2` being among the four
+        """A b-role leg that never even ran at all (`MISSING`, no `.exit`
+        file whatsoever) is NOT the "PR's own problem" bucket a genuine
+        RUNTIME failure earns. "Nothing ran" carries NO runtime signal
+        about a PR binary at all: `b1`/`b2` being among the four
         MISSING legs here (nothing wrote ANY file, no `mode` marker either)
         must be the neutral INCOMPLETE/75 "nothing to compare" case, never
         INVALID/1.
@@ -743,11 +732,11 @@ class MissingLegTests(unittest.TestCase):
         self.assertIn("nothing ran", merged["incomplete_reason"])
 
     def test_a_b_role_fail_under_aa_null_mode_is_incomplete_exit_75_no_pr_to_blame(self):
-        """round-3 adversarial audit B2: under `--aa-null`, `b`-role legs
+        """Under `--aa-null`, `b`-role legs
         are ALSO parent-sha clones -- a `b`-role RUNTIME failure there
         carries no "the PR's own problem" signal at all (there is no PR
         leg in play), matching the SAME routing the shell producer's own
-        `--aa-null` BUILD-failure classification already gives (neutral,
+        `--aa-null` BUILD-failure classification gives (neutral,
         the parent-shaped bucket).
         """
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -765,8 +754,7 @@ class MissingLegTests(unittest.TestCase):
         self.assertEqual(merged["missing_legs"], ["b1"])
 
     def test_a_b_role_fail_with_unconfirmed_mode_never_escalates_to_invalid(self):
-        """An OLDER producer that predates the `mode` marker (round-3
-        adversarial audit B2): a `b`-role FAIL with NO `mode` file present
+        """An OLDER producer that predates the `mode` marker: a `b`-role FAIL with NO `mode` file present
         at all must NOT escalate to INVALID/1 either -- this module cannot
         CONFIRM `ab` mode, so it never claims the signal is real.
         """
@@ -785,7 +773,7 @@ class MissingLegTests(unittest.TestCase):
 
 
 class InvalidMeasurementTests(unittest.TestCase):
-    """round-1 adversarial audit advisory: an identity-CLEAN leg set can
+    """An identity-CLEAN leg set can
     still carry a malformed MEASUREMENT (a `null` `p50_ms.value`, a zero
     baseline) — `_measurement_value`/`adjacent_pair_ratio` deliberately
     raise on this rather than silently substituting a placeholder;
@@ -885,8 +873,7 @@ class IdentityFieldsSharedCoreTests(unittest.TestCase):
 
 
 class OrderBindingTests(unittest.TestCase):
-    """round-2 adversarial audit F3: the A, B, B, A leg order is now
-    MACHINE-CHECKED against each leg's own RECORDED start timestamp
+    """The A, B, B, A leg order is MACHINE-CHECKED against each leg's own RECORDED start timestamp
     (`gpu_inference_ab.sh`'s own `run_leg` writes `<name>.started_at`
     BEFORE invoking that leg's binary), not merely trusted from reading
     `gpu_inference_ab.sh`'s own source code.
@@ -901,7 +888,7 @@ class OrderBindingTests(unittest.TestCase):
         self.assertEqual(merged["status"], "GREEN")
         # The default write_leg started_at values (1000, 1001, 1002, 1003)
         # are non-decreasing in LEG_ORDER's own a1,b1,b2,a2 sequence.
-        # round-3 adversarial audit B3: recorded_order's own schema is now
+        # recorded_order's own schema is
         # {name: {"value": ..., "unavailable_reason": ...}}, never a bare
         # int -- honestly distinguishing "parsed value" from "why
         # unavailable" for a committed report's own reader.
@@ -941,8 +928,8 @@ class OrderBindingTests(unittest.TestCase):
         self.assertEqual(merged["recorded_order"]["b1"]["value"], 1000)
 
     def test_a_leg_with_no_started_at_file_is_incomplete_order_exit_75(self):
-        """round-3 adversarial audit B3 correction: an OLDER producer that
-        predates F3 (or a hand-crafted fixture) writing no `.started_at`
+        """An OLDER producer that predates the order binding (or a
+        hand-crafted fixture) writing no `.started_at`
         file at all for a leg is NOT itself proof the A,B,B,A order was
         violated -- an environment/producer-version gap, the neutral
         INCOMPLETE_ORDER/75, never the PR-blame INVALID/1 bucket a genuine
@@ -959,8 +946,7 @@ class OrderBindingTests(unittest.TestCase):
         self.assertTrue(any("missing" in v and "'b1'" in v for v in merged["leg_premise_violations"]))
 
     def test_a_leg_with_an_unparseable_timestamp_is_incomplete_order_exit_75(self):
-        """round-3 adversarial audit B3 (the auditor's own scenario: a
-        non-GNU `date` binary emitting a different format than `%s%N`): a
+        """A non-GNU `date` binary emits a different format than `%s%N`: a
         `.started_at` file that EXISTS but does not parse as a plain
         integer must ALSO land in the neutral INCOMPLETE_ORDER/75 bucket,
         never INVALID/1 -- an unparseable timestamp is not evidence the
@@ -1035,18 +1021,17 @@ def multiplicative_drift(true_value, k, t):
 
 
 class DriftCancellationTests(unittest.TestCase):
-    """Round-1 adversarial audit B4: an earlier version of
-    `gpu_inference_ab.py`'s own module doc claimed adjacent-pair averaging
-    ([`gpu_inference_ab.combined_embed_p50_ratio`]) was a SUPERIOR estimator
-    to a naive mean-of-all-A-vs-mean-of-all-B one -- that claim was FALSE.
-    Under a MULTIPLICATIVE linear drift model, the A,B,B,A leg ORDER is
+    """Adjacent-pair averaging
+    ([`gpu_inference_ab.combined_embed_p50_ratio`]) is NOT a superior
+    estimator to a naive mean-of-all-A-vs-mean-of-all-B one. Under a
+    MULTIPLICATIVE linear drift model, the A,B,B,A leg ORDER is
     what cancels the first-order drift term (placing the two B-role legs
     symmetrically BETWEEN the two A-role legs equalizes each role's own
     MEAN measurement time), and BOTH combining conventions are unbiased to
     first order under that order -- adjacent-pairing is a REPORTING
     convention (it additionally surfaces two per-pair ratios for
     diagnostic visibility), not a smaller-bias estimator. This class proves
-    the corrected claim mechanically: the real production estimator
+    that mechanically: the real production estimator
     recovers the true ratio to first order under the A,B,B,A order it
     actually runs, and the SAME drift would NOT have cancelled under an
     A,A,B,B order (an order this producer never actually uses -- see
@@ -1087,7 +1072,7 @@ class DriftCancellationTests(unittest.TestCase):
         # `pair_ratios` individually, only about the combined estimator.
 
     def test_an_a_a_b_b_order_would_not_have_cancelled_the_same_drift(self):
-        """Order sanity (round-1 adversarial audit B4): the SAME
+        """Order sanity: the SAME
         multiplicative drift, injected as if the legs had run in A, A, B, B
         order instead -- a shape `gpu_inference_ab.sh` never actually
         produces (it always runs A, B, B, A, see that script's own header)
@@ -1123,9 +1108,8 @@ class DriftCancellationTests(unittest.TestCase):
 
 
 class SensitivityMirrorTests(unittest.TestCase):
-    """round-2 delta-audit advisory: the module doc claims its sensitivity
-    paragraph is restated VERBATIM from the README's Band-derivation
-    section — this pins the claim mechanically so the two texts cannot
+    """The module doc restates its sensitivity paragraph VERBATIM from the
+    README's Band-derivation section — this pins that mechanically so the two texts cannot
     drift apart undetected (whitespace/wrapping normalized; every word
     must match).
     """

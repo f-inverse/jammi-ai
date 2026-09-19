@@ -1,4 +1,4 @@
-//! SPEC-03 §12 #4 — Flight SQL `jammi-session-id`-bound tenant isolation.
+//! Flight SQL `jammi-session-id`-bound tenant isolation.
 //!
 //! Co-mounted with `SessionService` on one Tonic server. A client binds a
 //! tenant via the gRPC `SessionService.SetTenant` call carrying a

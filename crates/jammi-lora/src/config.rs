@@ -33,8 +33,8 @@ pub struct LoraBuildConfig<'a> {
     /// reproduces byte-identical adapters across processes — and across the
     /// ranks of a gang, which all build from the same value.
     pub seed: u64,
-    /// The dropout-mask seed, split from [`Self::seed`] (plan 67 U4b: "each
-    /// rank's dropout seed derives as `f(seed, rank)`"): a gang's ranks share
+    /// The dropout-mask seed, split from [`Self::seed`] (each rank's
+    /// dropout seed derives as `f(seed, rank)`): a gang's ranks share
     /// `seed` and differ here, so every rank starts from identical adapter
     /// weights and draws its own masks. A single-rank run passes the same
     /// value for both (`LoraLinear::new_with_base`'s own `init_seed ==

@@ -24,21 +24,19 @@
 //!
 //! # Why this exists
 //!
-//! This module exists to fix a specific mechanism defect (esc-078):
-//! `jammi-db`'s `esc_073_foreign_sqlite_library.rs` harness (and the sibling
-//! `sqlite_single_process_seam.rs`) pipe a child's stdout/stderr with
-//! [`std::process::Stdio::piped`] and only read them **after** the child has
-//! either exited or been killed at a ceiling, via `wait_with_output`. A pipe's
+//! A harness that pipes a child's stdout/stderr with
+//! [`std::process::Stdio::piped`] and only reads them **after** the child has
+//! either exited or been killed at a ceiling, via `wait_with_output`, loses
+//! evidence. A pipe's
 //! kernel buffer is small (on Linux, ~64 KiB); a child whose `stderr` is
 //! chattier than that fills the buffer and parks in `write(2)` until a reader
 //! drains it. Since nothing reads while the child runs, a sufficiently
 //! chatty-but-otherwise-healthy child is indistinguishable from a genuinely
 //! wedged one: both sit past the ceiling and get killed, and because the log
 //! is read only on the exit/kill path (never concurrently), the kill path
-//! discards it outright — the one outcome the harness's own module doc calls
-//! "a FAILURE of the same weight as a crash" is the one outcome that leaves
-//! no evidence at all. Draining both streams while the child runs (above)
-//! fixes the mechanism: a chatty child never fills the pipe, and a killed
+//! discards it outright — the outcome that most needs evidence is the one
+//! that leaves none. Draining both streams while the child runs (above)
+//! removes that failure: a chatty child never fills the pipe, and a killed
 //! child's progress up to the kill is still on hand.
 //!
 //! # Retention cap
@@ -117,9 +115,9 @@
 //! runs — the same mechanism this module generalizes — but reads
 //! line-by-line through `BufReader::read_line`, which silently truncates a
 //! stream at its first invalid-UTF-8 byte. This module works on raw bytes
-//! throughout and never decodes, so it has no such failure mode; the two
-//! implementations are not consolidated here (that's `jammi-cli`-domain
-//! debt, out of scope for this fix).
+//! throughout and never decodes, so it has no such failure mode. The two
+//! implementations are separate: `server_harness.rs` does not use this
+//! module.
 //!
 //! # Precondition for a complete log
 //!
@@ -132,7 +130,7 @@
 //! reaped the child, an empty poll means the reader concludes `Eof`
 //! immediately — it does NOT wait for the pipe to actually close, so
 //! **something else merely holding the write end open (without writing to
-//! it) no longer delays completeness at all**, regardless of why that other
+//! it) does not delay completeness at all**, regardless of why that other
 //! holder has the fd. Two distinct things can put another fd on the same
 //! pipe:
 //!
@@ -148,7 +146,7 @@
 //!    this module itself performs is serialized across its own
 //!    pipe-creation-to-exec window by a process-wide lock, cutting this off
 //!    for driver-to-driver races — cheap defense in depth, but a
-//!    **mitigation**, not the fix: it cannot help against a non-driver
+//!    **mitigation**, not the guarantee: it cannot help against a non-driver
 //!    `Command::spawn` racing in the same process (anything that does not go
 //!    through this module), and Linux never needs it (`pipe2(O_CLOEXEC)` is
 //!    atomic there).
@@ -167,28 +165,27 @@
 //! `SettleExpired` — the mechanism cannot tell "paused" from "done" on any
 //! single poll, only "still actively streaming" from "not". For a genuinely
 //! tight writer, `finish_drained`'s settle bound (about 1 s) is what
-//! eventually gives up, a rarely-hit fallback now rather than the primary
+//! eventually gives up, a rarely-hit fallback rather than the primary
 //! mechanism. Either way `wait_bounded` still returns promptly
 //! with `hung == false` (never a hang), but `Capture::complete` reports
 //! `Completeness::SettleExpired` and the returned log can be missing
 //! whatever the other writer produces after the settle bound — honest,
 //! never `Completeness::Complete`. The non-unix fallback reader has none of
 //! this: it blocks in `read()` until an actual EOF, so both causes above
-//! still delay it there, exactly as on unix pre-fix.
+//! still delay it there.
 //!
-//! # Revert recipe
+//! # The undrained differential
 //!
-//! To reproduce the pre-fix (undrained) driver exactly: swap the body of
-//! `spawn` for `spawn_undrained`'s (`readers: None`). `wait_bounded` already
-//! dispatches internally between the drained and undrained finish paths
-//! based on whether readers were installed, so that one swap is sufficient —
-//! nothing else needs to change. Under it,
-//! `flood_child_is_drained_and_its_evidence_is_retained` goes RED (the child
-//! hangs at the harness's own ceiling instead of finishing, with its log
-//! discarded). The standing differential `flood_is_a_hang_on_the_undrained_driver`
-//! keeps that RED shape alive permanently, without a manual swap, by
-//! exercising the undrained constructor directly against the same flood
-//! child.
+//! `spawn_undrained` (`readers: None`, test-only) is the undrained driver
+//! shape. `wait_bounded` dispatches internally between the drained and
+//! undrained finish paths based on whether readers were installed, so
+//! swapping the body of `spawn` for `spawn_undrained`'s is the whole
+//! mutation: under it, `flood_child_is_drained_and_its_evidence_is_retained`
+//! fails (the child hangs at the harness's own ceiling instead of finishing,
+//! with its log discarded). The standing differential
+//! `flood_is_a_hang_on_the_undrained_driver` exercises the undrained
+//! constructor directly against the same flood child, so that failure shape
+//! stays demonstrated without a manual swap.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -242,8 +239,7 @@ fn lock_or_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// `spawn_reader`) already treats a mis-inherited-but-never-written-to fd as
 /// harmless regardless of whether this lock ran. A test that could write to
 /// that specific, unpredictable fd number would need to enumerate the
-/// process's own open descriptors, a materially larger fixture than this
-/// round's scope covers; tracked as a residual, not fixed here.
+/// process's own open descriptors, which this suite does not do.
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 /// A stream's retained bytes: the first `head_cap` bytes seen plus the last
@@ -507,7 +503,7 @@ pub struct DrainedChild {
     spawned_at: Instant,
     head_cap: usize,
     /// `None` only for the `cfg(test)` undrained constructor (the standing
-    /// pre-fix differential); a `DrainedChild` built via [`DrainedChild::spawn`]
+    /// undrained differential); a `DrainedChild` built via [`DrainedChild::spawn`]
     /// always has readers.
     readers: Option<Readers>,
 }
@@ -587,7 +583,7 @@ impl DrainedChild {
         })
     }
 
-    /// Test-only: the pre-fix shape — both streams are still piped (so a
+    /// Test-only: the undrained shape — both streams are still piped (so a
     /// well-behaved exit can still be read via `wait_with_output`), but
     /// nothing drains them while the child runs, and a kill path never reads
     /// the pipe at all. This is the standing differential that keeps
@@ -827,7 +823,7 @@ impl DrainedChild {
 
     /// Undrained exit path: the child is known to have exited already (via
     /// `try_wait`); `wait_with_output` reads whatever remains in the pipes to
-    /// completion, matching the pre-fix shape's own only read. Any error is
+    /// completion, the undrained shape's only read. Any error is
     /// recorded in `Capture::wait_error` rather than silently swallowed.
     fn finish_undrained_exit(self, status: ExitStatus, epoch_base: Instant) -> Capture {
         let head_cap = self.head_cap;
@@ -860,10 +856,8 @@ impl DrainedChild {
 
     /// Undrained kill path: deliberately does **not** read the pipe (reading
     /// here would return whatever the ~64 KiB pipe still holds and break
-    /// fidelity to the pre-fix shape, which discarded the log outright on a
-    /// kill) — this is a literal reproduction of the undrained driver's
-    /// pre-fix shape, not a byte-for-byte replay of any specific esc-078 CI
-    /// incident (that log is gone; that loss is the defect).
+    /// fidelity to the undrained shape, which discards the log outright on a
+    /// kill) — a literal reproduction of the undrained driver's shape.
     fn finish_undrained_hung(
         self,
         status: Option<ExitStatus>,
@@ -1397,7 +1391,7 @@ mod tests {
 
     /// Sleeps 3 s (holding whatever stdio it inherited open, but never
     /// writing to it) then exits 0. With the poll-based unix reader, merely
-    /// inheriting the pipe no longer delays completeness — see
+    /// inheriting the pipe does not delay completeness — see
     /// `writing_sleeper_child` for the shape that still does.
     fn sleeper_child() -> ! {
         thread::sleep(Duration::from_secs(3));
@@ -1606,16 +1600,14 @@ mod tests {
         assert!(!disposition(None, false));
     }
 
-    // ---- the esc-078 oracle and its differentials ---------------------
+    // ---- the drain oracle and its differentials ----------------------
 
-    /// closes_escape: esc-078
-    ///
-    /// The oracle for the fix itself: a child that writes exactly 4 MiB
+    /// The drain oracle: a child that writes exactly 4 MiB
     /// (65536 fixed-width lines) to stderr, well past the ~64 KiB an
     /// undrained pipe can hold, must finish, have every byte retained, and
-    /// have both reader threads reach a clean EOF. Pre-fix (see the module
-    /// doc's "Revert recipe"), this test hangs at the harness's own ceiling
-    /// and loses the log entirely — the exact esc-078 symptom.
+    /// have both reader threads reach a clean EOF. On the undrained driver
+    /// (see the module doc's "The undrained differential"), this test hangs
+    /// at the harness's own ceiling and loses the log entirely.
     #[test]
     fn flood_child_is_drained_and_its_evidence_is_retained() {
         dispatch_if_child();
@@ -1670,17 +1662,16 @@ mod tests {
         );
     }
 
-    /// Standing differential for esc-078 (kept live, not hand-run): replays
-    /// the exact flood child above through [`DrainedChild::spawn_undrained`]
-    /// (the pre-fix, undrained shape) at a 5 s ceiling. The undrained driver
+    /// Standing differential for the drain oracle (kept live, not hand-run):
+    /// replays the exact flood child above through
+    /// [`DrainedChild::spawn_undrained`] at a 5 s ceiling. The undrained driver
     /// never reads the pipe while the child runs, so the 4 MiB flood parks
     /// the child in `write(2)` and the ceiling kills it before it can
     /// finish — `hung == true` with an **empty** stderr. That empty-stderr
-    /// assert is a literal check of the undrained driver's own pre-fix shape
-    /// (`finish_undrained_hung` never reads the pipe on the kill path), not a
-    /// claim that it reproduces the exact bytes any specific esc-078 CI
-    /// incident lost — that original log is gone; the loss itself is the
-    /// defect this differential keeps demonstrating. If this test ever stops
+    /// assert is a literal check of the undrained driver's own shape
+    /// (`finish_undrained_hung` never reads the pipe on the kill path) — the
+    /// log loss is the failure this differential keeps demonstrating. If this
+    /// test ever stops
     /// hanging (e.g. on a platform with a much larger pipe buffer), it is
     /// this test that reds, marking the oracle above as vacuous rather than
     /// silently losing coverage.
@@ -1703,11 +1694,11 @@ mod tests {
         );
     }
 
-    /// esc-078 control (1): a child killed at the ceiling must still yield
+    /// Drain control (1): a child killed at the ceiling must still yield
     /// its progress (`phase: b`) and an accurate `silence()`. Its undrained
-    /// twin is the same literal pre-fix-shape check as the flood
+    /// twin is the same literal undrained-shape check as the flood
     /// differential above — the kill path never reads the pipe — showing
-    /// that the bug was in the kill path itself, not only in pipe
+    /// that the undrained log loss is in the kill path itself, not only in pipe
     /// backpressure (the wedge child's own two lines never come close to
     /// filling a pipe).
     #[test]
@@ -1779,7 +1770,7 @@ mod tests {
     /// the fd -- so the capture is `Completeness::Complete` and
     /// `is_trustworthy()`, not `SettleExpired`. The non-unix fallback reader
     /// has no such short-circuit (it blocks in `read()` until an actual
-    /// EOF), so it still shows the pre-fix `SettleExpired` shape there. See
+    /// EOF), so it still shows the `SettleExpired` shape there. See
     /// `settle_expires_only_when_the_grandchild_keeps_writing` for the one
     /// shape that still produces `SettleExpired` on unix too. The 2.5 s wall
     /// bound (vs the grandchild's 3 s sleep) is generous enough to hold on
@@ -1825,8 +1816,8 @@ mod tests {
     /// child) has already exited keeps `POLLIN` arriving, so the poll-based
     /// unix reader keeps draining it and never falsely concludes `Eof` --
     /// only `finish_drained`'s bounded settle (about 1 s) ends the wait,
-    /// leaving `Completeness::SettleExpired`. This is the one case the fix
-    /// does not (and should not) short-circuit: those bytes are genuinely
+    /// leaving `Completeness::SettleExpired`. This is the one case the
+    /// poll-based reader does not (and should not) short-circuit: those bytes are genuinely
     /// still arriving, so calling it anything but incomplete would be
     /// dishonest.
     #[test]
@@ -2082,15 +2073,15 @@ mod tests {
     /// sibling's code never targets, so it is only ever silently held, not
     /// written to, regardless of whether the lock ran. Nor does it
     /// discriminate the poll-based reader's immunity to a silently-held
-    /// foreign fd (confirmed by reverting the reader to a plain blocking
-    /// `read()` and rerunning this same test unchanged: still green, 30-100
-    /// runs) -- the CLOEXEC race this test tries to hit is itself too rare
+    /// foreign fd (against a plain blocking-`read()` reader this same test
+    /// still passes, 30-100 runs) -- the CLOEXEC race this test tries to hit
+    /// is itself too rare
     /// to reproduce reliably here, on either mechanism. The real oracle for
     /// "a foreign process silently holding an inherited pipe end does not
     /// block completeness" is `settle_returns_within_bound_when_a_grandchild_holds_the_pipe`,
     /// which constructs that holding deterministically (via direct,
-    /// unredirected fd inheritance, not an accidental race) and does go red
-    /// against a reverted (blocking-read) reader.
+    /// unredirected fd inheritance, not an accidental race) and does fail
+    /// against a blocking-read reader.
     #[test]
     fn concurrent_spawns_do_not_race_the_pipe_cloexec_window() {
         dispatch_if_child();
@@ -2123,7 +2114,7 @@ mod tests {
         assert!(flood_cap.is_trustworthy(), "{flood_cap:?}");
     }
 
-    /// The oracle for the reader's exit-observation ordering (F1), pinned
+    /// The oracle for the reader's exit-observation ordering, pinned
     /// deterministically rather than hoped for: drives `spawn_reader`
     /// directly (bypassing `DrainedChild`/subprocesses entirely) with a
     /// hand-controlled real pipe, using the `ready_hook` parameter to pause
@@ -2133,17 +2124,16 @@ mod tests {
     /// child writes its final line, exits, and is reaped inside the
     /// interval between poll-returned-0 and the flag read" on demand, on
     /// every run, rather than relying on wall-clock alignment (a live
-    /// subprocess reproduction of this exact shape did not naturally occur
-    /// in 580 attempts across two earlier probing sessions on a real box --
-    /// the true window is narrower than timing alone can reliably hit, which
-    /// is exactly why this test drives the mechanism directly instead).
+    /// subprocess reproduction of this exact shape did not occur in 580
+    /// attempts -- the true window is narrower than timing alone can
+    /// reliably hit, which is why this test drives the mechanism directly).
     ///
-    /// Pre-fix ordering (load `child_exited` AFTER `poll`, reproduced by
-    /// moving the load in `spawn_reader` below the `poll` call and rerunning
-    /// this same test): RED, deterministically, every time --
-    /// `complete_outcome=Some(Eof) has_final=false stderr=""`, byte-for-byte
-    /// the shape this fix closes. Post-fix (the committed ordering): GREEN,
-    /// deterministically -- the flag was already `false` when sampled
+    /// Mutation: load `child_exited` AFTER `poll` (move the load in
+    /// `spawn_reader` below the `poll` call) and this test fails
+    /// deterministically, every time --
+    /// `complete_outcome=Some(Eof) has_final=false stderr=""`. With the
+    /// committed ordering it passes deterministically -- the flag was already
+    /// `false` when sampled
     /// before this `poll` call, so the reader `continue`s and re-polls,
     /// correctly observing the data the hook just wrote.
     #[cfg(unix)]

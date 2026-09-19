@@ -1,4 +1,4 @@
-//! `Catalog::list_ring_members` (RENDEZVOUS RV2): the RENDEZVOUS ring read —
+//! `Catalog::list_ring_members`: the RENDEZVOUS ring read —
 //! live, root-sharing, `peer_addr`-set `instances` rows, SELF INCLUDED, no
 //! `workers` join and no kind vocabulary. Mirrors `gang_membership.rs`'s
 //! fixtures and discipline: parameterized sqlite/postgres, a test asserts the
@@ -13,8 +13,8 @@ use jammi_db::catalog::instance::{InstanceRegistration, MemberRoot, PeerAddr};
 use jammi_db::catalog::lease::instance_liveness_margin;
 use jammi_db::catalog::Catalog;
 use jammi_db::index::{RendezvousPlacement, SegmentId, SegmentPlacement};
-use jammi_test_utils::make_test_session;
-use tempfile::tempdir;
+
+use crate::common::catalog_on;
 
 const LEASE: Duration = Duration::from_secs(30);
 
@@ -53,12 +53,6 @@ fn fresh_root() -> String {
     let root = format!("file://{}/jammi_db", dir.path().to_str().unwrap());
     std::mem::forget(dir);
     root
-}
-
-async fn base_catalog_kind(kind: BackendKind) -> Option<(tempfile::TempDir, Arc<Catalog>)> {
-    let dir = tempdir().unwrap();
-    let session = make_test_session(kind, dir.path()).await?;
-    Some((dir, Arc::clone(session.catalog())))
 }
 
 async fn force_stale_instance(catalog: &Catalog, instance_id: &str, ago: Duration) {
@@ -104,16 +98,6 @@ async fn seed_instance(
     catalog.upsert_instance(&reg).await.unwrap();
 }
 
-macro_rules! skip_unless_ready {
-    ($kind:expr) => {
-        if matches!($kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none()
-        {
-            eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-            return;
-        }
-    };
-}
-
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -121,10 +105,7 @@ macro_rules! skip_unless_ready {
 )]
 #[tokio::test]
 async fn self_appears_as_a_candidate(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let self_id = format!("self-{}", jammi_test_utils::unique_suffix());
     seed_instance(&catalog, &self_id, Some("10.0.0.1:9000"), Some(root())).await;
     let ring = catalog
@@ -144,10 +125,7 @@ async fn self_appears_as_a_candidate(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn a_stale_row_is_excluded(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let self_id = format!("self-{}", jammi_test_utils::unique_suffix());
     let stale_id = format!("stale-{}", jammi_test_utils::unique_suffix());
     seed_instance(&catalog, &self_id, Some("10.0.0.1:9000"), Some(root())).await;
@@ -168,7 +146,7 @@ async fn a_stale_row_is_excluded(kind: BackendKind) {
 /// The exclusion is proven here; it is NOT separately counted anywhere (no
 /// metric distinguishes "excluded for a foreign root" from "excluded for
 /// staleness" or "no peer_addr") — a second statement to tag the reason
-/// would violate RV6's single-statement budget for a distinction only
+/// would break the ring read's single-statement budget for a distinction only
 /// human debugging would use, never placement correctness. See
 /// `RendezvousPlacement`'s own rustdoc for the full reasoning; this test is
 /// that claim's executed oracle, alongside `gang_membership`'s own
@@ -181,10 +159,7 @@ async fn a_stale_row_is_excluded(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn a_root_identity_mismatched_row_is_excluded(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let self_id = format!("self-{}", jammi_test_utils::unique_suffix());
     let elsewhere_id = format!("elsewhere-{}", jammi_test_utils::unique_suffix());
     seed_instance(&catalog, &self_id, Some("10.0.0.1:9000"), Some(root())).await;
@@ -213,10 +188,7 @@ async fn a_root_identity_mismatched_row_is_excluded(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn a_non_advertising_process_is_not_a_member(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let self_id = format!("self-{}", jammi_test_utils::unique_suffix());
     let library_id = format!("library-{}", jammi_test_utils::unique_suffix());
     seed_instance(&catalog, &self_id, Some("10.0.0.1:9000"), Some(root())).await;
@@ -241,15 +213,12 @@ async fn a_non_advertising_process_is_not_a_member(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn an_advertising_replica_with_no_workers_row_is_still_a_member(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let self_id = format!("self-{}", jammi_test_utils::unique_suffix());
     // `[worker] enabled = false`: advertises (`peer_advertise` set) but never
-    // runs a claim loop, so it never upserts a `workers` row at all. RV2:
-    // "a `[worker] enabled=false` advertising replica IS a member" — the
-    // ring predicate joins no `workers` table, unlike `list_gang_members`.
+    // runs a claim loop, so it never upserts a `workers` row at all. Such an
+    // advertising replica IS a member — the ring predicate joins no `workers`
+    // table, unlike `list_gang_members`.
     let quiet_id = format!("quiet-{}", jammi_test_utils::unique_suffix());
     seed_instance(&catalog, &self_id, Some("10.0.0.1:9000"), Some(root())).await;
     seed_instance(&catalog, &quiet_id, Some("10.0.0.2:9000"), Some(root())).await;
@@ -272,10 +241,7 @@ async fn an_advertising_replica_with_no_workers_row_is_still_a_member(kind: Back
 async fn plan_falls_back_to_all_local_and_counts_when_self_is_absent_from_the_ring(
     kind: BackendKind,
 ) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     // `self_instance_id` names a row that was NEVER registered: the
     // self-referencing subquery in `list_ring_members` returns no rows, so
     // `result_root_identity = (subquery)` is `NULL = anything` (never true)
@@ -312,10 +278,7 @@ async fn plan_falls_back_to_all_local_and_counts_when_self_is_absent_from_the_ri
 )]
 #[tokio::test]
 async fn plan_arms_local_when_self_is_the_only_ring_member(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let self_id = format!("self-{}", jammi_test_utils::unique_suffix());
     seed_instance(
         &catalog,
@@ -345,19 +308,20 @@ async fn plan_arms_local_when_self_is_the_only_ring_member(kind: BackendKind) {
     );
 }
 
-/// RENDEZVOUS RV6: the per-search ring-read cost, measured (never assumed)
+/// The per-search ring-read cost, measured (never assumed)
 /// at 100 and 10k `instances` rows on the scratch Postgres, over
 /// `BackendImpl::query_untransacted` (no `BEGIN`/`SET TRANSACTION
 /// .../COMMIT` — see `RendezvousPlacement`'s own rustdoc for the wrapper's
-/// measured cost at each scale). Live only (requires `JAMMI_TEST_PG_URL`;
-/// skips, never fails, otherwise) — this is a COST measurement, not a
+/// measured cost at each scale). Compiled only under `live-postgres-tests`
+/// (panics naming `JAMMI_TEST_PG_URL` when it is unset) — this is a COST
+/// measurement, not a
 /// correctness oracle (those are the tests above), so it prints the
 /// measured milliseconds and asserts a HOST-RELATIVE bound: at each scale
 /// the ring read may cost at most four times a plain transfer of the same
 /// number of `(instance_id, peer_addr)` rows through this test's own pool
 /// (plus a 2 ms floor for sub-millisecond noise), measured in the same
 /// process seconds apart. That isolates what this measurement is about —
-/// the predicate and plan cost RV3/RV6 changed — from wire transfer and
+/// the predicate and plan cost — from wire transfer and
 /// per-row decode, which scale with the ring size AND the host (an absolute
 /// budget calibrated on one host tripped on a shared CI runner at 24.9 ms
 /// for a read this host does in ~10 ms). Measured here over 3 repeated runs
@@ -367,11 +331,9 @@ async fn plan_arms_local_when_self_is_the_only_ring_member(kind: BackendKind) {
 /// size because the fixed per-statement cost (planning plus the root
 /// InitPlan) dominates, which is what the 2 ms floor is for; 8.6-8.9 ms at
 /// 10,101 rows against a 6.8-7.1 ms transfer of the same 5,051 rows (1.2-1.3x:
-/// past the fixed cost, the read IS the transfer). Earlier captures on this
-/// host measured ~10.2-10.9 ms at 10,101 rows (`EXPLAIN` shows a Seq Scan — see `RendezvousPlacement`'s
-/// doc for why, and why the remaining cost past the scan itself is the
-/// 5,051-row result transfer, not the scan or the transaction wrapper this
-/// read no longer pays at all). The 50 %-root-sharing 10k-row shape is a
+/// past the fixed cost, the read IS the transfer; `EXPLAIN` shows a Seq Scan —
+/// see `RendezvousPlacement`'s doc for why, and why the remaining cost past
+/// the scan itself is the 5,051-row result transfer, not the scan). The 50 %-root-sharing 10k-row shape is a
 /// deliberately ADVERSARIAL stress fixture (a fleet that let `instances`
 /// bloat with thousands of unpruned rows sharing one root), never the
 /// realistic ring size this placement is sized for, so the bound is stated
@@ -389,13 +351,8 @@ async fn plan_arms_local_when_self_is_the_only_ring_member(kind: BackendKind) {
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn ring_read_cost_is_measured_at_100_and_10k_instance_rows() {
-    let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-        eprintln!("skipping ring_read_cost_is_measured_at_100_and_10k_instance_rows: JAMMI_TEST_PG_URL unset");
-        return;
-    };
-    let (_dir, catalog) = base_catalog_kind(BackendKind::Postgres)
-        .await
-        .expect("already skipped above when unconfigured");
+    let url = jammi_test_utils::postgres_url();
+    let (_dir, catalog) = catalog_on(BackendKind::Postgres).await;
     let self_id = format!("cost-self-{}", jammi_test_utils::unique_suffix());
     seed_instance(&catalog, &self_id, Some("10.0.0.1:9000"), Some(root())).await;
 
@@ -482,7 +439,7 @@ async fn ring_read_cost_is_measured_at_100_and_10k_instance_rows() {
         let ring = catalog.list_ring_members(&self_id, margin).await.unwrap();
         let elapsed = start.elapsed();
         eprintln!(
-            "RENDEZVOUS RV6: list_ring_members over {cumulative_instances} cumulative instances \
+            "list_ring_members over {cumulative_instances} cumulative instances \
              rows (+{n} this batch) took {elapsed:?} ({} ring members)",
             ring.len()
         );
@@ -509,12 +466,12 @@ async fn ring_read_cost_is_measured_at_100_and_10k_instance_rows() {
         );
         let bound = baseline_elapsed * 4 + Duration::from_millis(2);
         eprintln!(
-            "RENDEZVOUS RV6: plain transfer of {} rows took {baseline_elapsed:?}; bound {bound:?}",
+            "plain transfer of {} rows took {baseline_elapsed:?}; bound {bound:?}",
             baseline.len()
         );
         assert!(
             elapsed <= bound,
-            "RV6 bound: the ring read at {cumulative_instances} cumulative instances rows took \
+            "ring-read bound: the ring read at {cumulative_instances} cumulative instances rows took \
              {elapsed:?}, more than four times (+2 ms) a plain transfer of the same {} rows on this \
              host ({baseline_elapsed:?}) — the predicate or the plan regressed, not the host",
             baseline.len()
@@ -543,10 +500,7 @@ async fn ring_read_cost_is_measured_at_100_and_10k_instance_rows() {
 )]
 #[tokio::test]
 async fn a_corrupted_peer_addr_is_a_typed_catalog_error(kind: BackendKind) {
-    skip_unless_ready!(kind);
-    let (_dir, catalog) = base_catalog_kind(kind)
-        .await
-        .expect("already skipped above when unconfigured");
+    let (_dir, catalog) = catalog_on(kind).await;
     let self_id = format!("self-{}", jammi_test_utils::unique_suffix());
     seed_instance(&catalog, &self_id, Some("10.0.0.1:9000"), Some(root())).await;
     let corrupt_id = format!("corrupt-{}", jammi_test_utils::unique_suffix());

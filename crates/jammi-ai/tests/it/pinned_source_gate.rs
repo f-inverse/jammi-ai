@@ -1,4 +1,4 @@
-//! The DELTA contract's source gate — a source-text scan over
+//! The pinned-source gate — a source-text scan over
 //! `crates/jammi-db/src` and `crates/jammi-ai/src`, verified by compiling
 //! this file's own detector functions into a standalone harness and driving
 //! synthetic producers through them.
@@ -80,8 +80,7 @@
 //!    way) and re-derives `.current_version` from it inside its own body,
 //!    rather than taking an already-resolved version/manifest/[`PinnedSource`]
 //!    as a parameter — the shape that let `read_vectors` reach an unpinned,
-//!    version-branched content read through the session's own registration,
-//!    outside the module the old sweep ever looked at.
+//!    version-branched content read through the session's own registration.
 //! 3. [`session_registration_literal_sites`] — the session-registered
 //!    `jammi.{table}` reference spelled out directly in source text, over the
 //!    WHOLE two-crate surface rather than one crate's `src/pipeline/`
@@ -110,12 +109,9 @@
 //! REAL token stream `proc-macro2`'s fallback lexer produces (the same lexer
 //! `rustc` itself is built on) and uses each token's own `Span::byte_range()`
 //! to decide what is code, what is a string/char literal, and what is a
-//! comment — never a hand-counted quote or `/*`/`*/` pair. This closes the
-//! R-A limits a prior hand-rolled scanner had here (closing audit #9 of
-//! U2a, 2026-09-14, measured them live on this tree: 22 code lines blanked as
-//! comments and 12 real comments left unblanked around raw strings in
-//! `crates/jammi-db/src/{storage/config.rs,config/tests.rs,config/secret.rs,
-//! sql/ident.rs}`) rather than merely disclosing them: a raw string's
+//! comment — never a hand-counted quote or `/*`/`*/` pair. A hand-rolled
+//! character scanner desyncs around raw strings (blanking code lines as
+//! comments and leaving real comments unblanked); the tokenizer does not: a raw string's
 //! `r#"..."#` delimiter (any hash count, any number of embedded physical
 //! newlines) is a single [`proc_macro2::Literal`] token regardless of what
 //! `"`/`//`/`/*` text it contains, and a (non-doc) block comment nests
@@ -159,41 +155,26 @@
 //! permanent slack a later, different site can spend.
 //!
 //! **The allowlist's own prose is itself a claim that needs checking.**
-//! Deleting the hand-written sweep this file's enforcement replaced did not
-//! eliminate unverified human claims; every allowlist entry below still
-//! clears its site with a
-//! hand-written justification, and three of those justifications named a
-//! CALLER SET in prose — an enumeration, not a dataflow property, and
-//! therefore exactly as derivable as everything else this file checks. Two
-//! were false: `producing_descriptor`'s declared set omitted a real caller
-//! (`compact_embeddings`), and `refreshable_record`'s omitted TWO — the
-//! destructive ones, `compact_embeddings` (publishes a new version) and
-//! `expire_versions` (permanently reaps old ones). Both are now DATA
-//! (`PRODUCING_DESCRIPTOR_CALLERS`, `REFRESHABLE_RECORD_CALLERS`, below —
-//! see [`callers_of`]'s doc), checked by `caller_set_claims_match_reality`
-//! against the real surface; a claim that cannot be expressed as a caller
-//! set (what a caller DOES with the value, rather than who the caller is)
-//! stays prose. One allowlisted entry's MECHANISM claim was also false, not
-//! just its caller set — `refreshable_record`'s entry cleared itself by
-//! asserting every later pairing comes from a fresh re-fetch, when the
-//! function it named (`ensure_base_version`) documents, in its OWN entry,
-//! that its dominant arm returns the same record unchanged; both entries are
-//! corrected together. One negative control asserted that the exact escape
-//! shape pattern 4 exists to catch (self-fetch, then resolve the version
-//! identity as a plain string) must never be flagged merely because it
-//! delegates to a named, reviewed helper — clearance by a callee's name is
-//! the same failure this file's own module doc disowns for a return TYPE's
-//! name; it is corrected to make the delegate's caller set the thing that is
-//! actually checked, rather than asserting the shape itself is safe.
+//! Every allowlist entry below clears its site with a hand-written
+//! justification. A justification that names a CALLER SET is an enumeration,
+//! not a dataflow property, and therefore exactly as derivable as everything
+//! else this file checks: such sets are DATA (`PRODUCING_DESCRIPTOR_CALLERS`,
+//! `REFRESHABLE_RECORD_CALLERS`, below — see [`callers_of`]'s doc), checked by
+//! `caller_set_claims_match_reality` against the real surface. A claim that
+//! cannot be expressed as a caller set (what a caller DOES with the value,
+//! rather than who the caller is) stays prose. Delegating to a named,
+//! reviewed helper never clears a site by the callee's NAME — the same
+//! failure this module doc disowns for a return TYPE's name; the delegate's
+//! caller set is what is checked.
 
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The whole surface this gate's property quantifies over
-/// (`CONTRACT-DELTA-fix7.md`: "every Rust source in `crates/jammi-db/src`
-/// and `crates/jammi-ai/src`"), relative to the repo root — stated honestly,
+/// The whole surface this gate's property quantifies over — every Rust
+/// source in `crates/jammi-db/src` and `crates/jammi-ai/src`, relative to the
+/// repo root — stated honestly,
 /// not merely by construction: a registration verb or DDL literal living
 /// anywhere OUTSIDE these two trees is outside every check in this file's
 /// "literal-occurrence gate" section (below) entirely, whether that is a
@@ -259,8 +240,8 @@ fn tracked_rs_files(root: &Path, dir: &str) -> Vec<String> {
 /// [`SURFACE_DIRS`] entry, as `(repo-relative path, source text)`. Reading a
 /// file `git ls-files` reports as tracked is not optional — a tracked file
 /// this process cannot read (deleted on disk without being staged, or a
-/// worktree race) is a hard failure naming the file, never a silent skip,
-/// per `CONTRACT-DELTA-fix7.md`'s "failing closed" requirement.
+/// worktree race) is a hard failure naming the file, never a silent skip:
+/// the gate fails closed.
 pub(crate) fn scan_surface() -> Vec<(String, String)> {
     let root = repo_root();
     let mut out = Vec::new();
@@ -290,7 +271,7 @@ pub(crate) fn scan_surface() -> Vec<(String, String)> {
     out
 }
 
-/// #554 item 4: [`SURFACE_DIRS`]'s "stated honestly" claim, executed rather
+/// [`SURFACE_DIRS`]'s "stated honestly" claim, executed rather
 /// than taken on prose. `crates/jammi-bench/src/corpus.rs` carries a real,
 /// live `ctx.register_parquet(TableReference::bare(format!(
 /// "jammi.{table_name}")), ..)` call today -- checked directly below, not
@@ -339,8 +320,7 @@ fn falsification_registration_verb_scan_states_its_universe_honestly() {
 /// whether a literal's CONTENT is ever a masking candidate at all. Delegated
 /// to `syn::Lit`'s own parser rather than a hand-written prefix check (`b`?
 /// `r`? how many `#`? `'` vs `"`?) precisely so the raw-string hash-counting
-/// class of bug this function replaces can never recur here by
-/// reintroducing a hand-rolled parse of the same shape one layer up.
+/// class of bug a hand-rolled parse invites cannot appear here one layer up.
 fn literal_is_string_or_char(rendered: &str) -> bool {
     matches!(
         syn::parse_str::<syn::Lit>(rendered),
@@ -393,9 +373,7 @@ enum MaskKind {
 /// [`falsification_real_tokenizer_mask_handles_raw_strings_and_nested_comments`]
 /// exercises this directly: a doc comment is blanked in BOTH
 /// [`mask_non_code`] and [`mask_comments_only`], the same as a plain `//`
-/// line comment, matching this file's pre-existing behaviour (the old
-/// hand-rolled scanner treated `///` as an ordinary `//` line comment too,
-/// since it never inspected the third `/`).
+/// line comment.
 fn collect_mask_units(
     ts: proc_macro2::TokenStream,
     out: &mut Vec<(std::ops::Range<usize>, MaskKind)>,
@@ -573,12 +551,11 @@ fn find_matching(chars: &[char], open_idx: usize, open: char, close: char) -> Op
 /// list at that arrow, desynchronized the scan from the following `(`, and
 /// dropped the WHOLE function from [`find_fn_regions`]'s output — invisible
 /// to every detector below even when its own return type carried
-/// `InputAnchor` verbatim. Reachability was checked, not assumed: an
-/// independent `fn <ident>` token count over the real surface (4136) equals
-/// the number of regions produced with or without this fix, so no function
-/// on today's tree used this shape — the bug was latent, not live — but it
-/// was a silent fail-OPEN in the only enforcement, so it is fixed rather
-/// than left as a disclosed limit.
+/// `InputAnchor` verbatim. No function on today's tree uses this shape (an
+/// independent `fn <ident>` token count over the real surface equals the
+/// number of regions produced), but mis-parsing it would be a silent
+/// fail-OPEN in the only enforcement, so it is handled rather than left as a
+/// disclosed limit.
 fn find_matching_angle(chars: &[char], open_idx: usize) -> Option<usize> {
     debug_assert_eq!(chars[open_idx], '<');
     let mut depth = 1i64;
@@ -877,23 +854,20 @@ fn reads_current_version_field(body: &str) -> bool {
 /// FIELD (see [`reads_current_version_field`]'s doc for why this must be a
 /// field match, not a substring one).
 ///
-/// **No idiom conjunct.** An earlier design of this detector additionally
-/// required the literal idiom `.get_result_table(` to appear in the same
-/// function's body. Measuring that conjunct's cost directly (`p4_no_idiom` in
-/// a standalone harness) rather than arguing it showed: dropping it raises
-/// the real-surface hit count from 1 to 6 — five more allowlist entries, not
-/// hundreds — and the conjunct was never load-bearing against false
-/// positives, only against coverage. It was a narrowing that let three of the
-/// module doc's own
-/// named evasions through: a record resolved through ANY OTHER catalog
+/// **No idiom conjunct.** This detector does NOT additionally require the
+/// literal idiom `.get_result_table(` in the same function's body. Such a
+/// conjunct cuts the real-surface hit count from 6 to 1 — five allowlist
+/// entries, not hundreds — and is never load-bearing against false
+/// positives, only against coverage: it would let three of the module doc's
+/// own named evasions through: a record resolved through ANY OTHER catalog
 /// method (`probe_cache_record`, `exact_match_candidates`), the SAME method
 /// called in fully-qualified/UFCS form (`ResultRepo::get_result_table(...)`,
 /// which never spells `.get_result_table(`), and a parameter typed through a
 /// local alias of `ResultTableRecord` (which fails pattern 2's own
-/// parameter-text precondition and, before this fix, ALSO failed pattern 4's
-/// idiom precondition since such a function never self-fetches at all — it
-/// already holds the record, just not under the literal type name pattern 2
-/// looks for). All three are closed by dropping the conjunct: none of them
+/// parameter-text precondition and would ALSO fail an idiom precondition,
+/// since such a function never self-fetches at all — it already holds the
+/// record, just not under the literal type name pattern 2 looks for). All
+/// three are closed without the conjunct: none of them
 /// require the self-fetch idiom, they only require a `.current_version`
 /// FIELD read outside a function whose parameter TEXT names
 /// `ResultTableRecord`. A fourth named evasion, destructuring
@@ -903,7 +877,7 @@ fn reads_current_version_field(body: &str) -> bool {
 /// module doc's disclosure list; a text-only check cannot distinguish that
 /// shape from an ordinary struct-literal field-init shorthand
 /// (`ResultTableRecord { current_version, .. other }`) without becoming a
-/// parser, so per R-A it stays disclosed rather than "fixed" by a check that
+/// parser, so it stays disclosed rather than "fixed" by a check that
 /// would also flag unrelated row-construction code (checked: relaxing the
 /// field match to a bare, both-sides-bounded `current_version` identifier —
 /// dropping the leading-dot requirement — pulls in
@@ -1033,7 +1007,7 @@ fn session_registration_literal_sites(
 // function: attribute every `.method(` call site to its innermost
 // containing region. What a caller DOES with the value it gets (whether it
 // persists it, discards it, or pairs it with something else) is NOT
-// enumerable this way and stays prose in the entry itself, per R-A.
+// enumerable this way and stays prose in the entry itself.
 
 /// The `(file, enclosing function name)` sites whose masked body contains a
 /// call `.method(` — an ENUMERATION, not a dataflow analysis: it names every
@@ -1195,8 +1169,7 @@ fn caller_set_claims_match_reality() {
 // ── Allowlists. Every entry is a hit this gate's scan finds TODAY (verified
 // by running each detector with an empty allowlist and transcribing every
 // hit), never a guess. Each carries its own review note — a bare list of
-// paths is not a review, it is the same failure mode this contract exists
-// to close for the sweep it replaces.
+// paths is not a review.
 //
 // Keyed on `(file, function name, ORDINAL)` (see [`assign_ordinals`]'s doc),
 // not `(file, function name)` alone (a same-named sibling in the same file
@@ -1218,7 +1191,7 @@ const ANCHOR_RETURN_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "input_anchor",
-        1, // ordinal 1 — the only `input_anchor` in this file; line 306 today
+        1, // ordinal 1 — the only `input_anchor` in this file
            // `PinnedSource::input_anchor` — SAFE BY CONSTRUCTION: only reachable
            // through a `&PinnedSource`, which already carries the record and
            // (for a versioned table) the manifest `ResultStore::pinned_provider`
@@ -1231,7 +1204,7 @@ const ANCHOR_RETURN_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/store/freshness.rs",
         "current_anchor",
-        1, // ordinal 1 — the only `current_anchor` in this file; line 458 today
+        1, // ordinal 1 — the only `current_anchor` in this file
            // `ResultStore::current_anchor` — NOT CLOSED, disclosed rather than
            // hidden. Its only in-tree callers (`freshness.rs`'s own staleness
            // comparison, same file) use the returned
@@ -1243,7 +1216,7 @@ const ANCHOR_RETURN_ALLOWED: &[(&str, &str, usize)] = &[
            // byte-identical to `PinnedSource::input_anchor`'s on both arms.
            // Nothing in the type system stops a FUTURE caller from pairing
            // this anchor with an independently-resolved read and persisting
-           // the pair — the exact straddle this contract names. Closing that
+           // the pair — the exact straddle this gate names. Closing that
            // (narrow the type so it cannot be separated from content, or fold
            // this crate's callers onto `pin_current_version`) is a design
            // change this gate does not itself make; this entry is the gate's
@@ -1259,7 +1232,7 @@ const ANCHOR_RETURN_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-ai/src/pipeline/graph_propagation.rs",
         "edge_source_anchor",
-        1, // ordinal 1 — the only `edge_source_anchor` in this file; line 821 today
+        1, // ordinal 1 — the only `edge_source_anchor` in this file
            // Delegates to `pin_current_version(record).await?.input_anchor()`
            // — the sanctioned pattern every `result_digest_anchor` caller is
            // migrated to, not an independent anchor-only resolve. The
@@ -1268,13 +1241,13 @@ const ANCHOR_RETURN_ALLOWED: &[(&str, &str, usize)] = &[
            // unpinned, session-registered scan
            // (`session_registration_literal_sites`'s allowlist entry for this
            // same file), so the anchor and the edge content are NOT from one
-           // resolution. This is a disclosed, reviewed exception for the S9
-           // edge relation specifically (never the pinned embedding table).
+           // resolution. This is a disclosed, reviewed exception for the
+           // `neighbor_graph` edge relation specifically (never the pinned embedding table).
     ),
     (
         "crates/jammi-ai/src/pipeline/recompute.rs",
         "reresolve_recorded_anchor",
-        1, // ordinal 1 -- the only `reresolve_recorded_anchor` in this file; line 567 today
+        1, // ordinal 1 -- the only `reresolve_recorded_anchor` in this file
            // `InferenceSession::reresolve_recorded_anchor` -- never mints a NEW
            // pinned anchor from arbitrary live state: it dispatches on the KIND
            // already recorded in the table's OWN `.materialization.json`
@@ -1302,7 +1275,7 @@ const ANCHOR_RETURN_ALLOWED: &[(&str, &str, usize)] = &[
            // "Anchors" doc: both `materialize_projection` and
            // `materialize_sampled_pairs` record `UnpinnedAtInstant` only) --
            // this arm is exercised by the two tests above via a forged
-           // manifest, future-proofing the exhaustive `AnchorKind` match (K7)
+           // manifest, future-proofing the exhaustive `AnchorKind` match
            // for a producer that does, the same disclosed-but-unreached shape
            // `recompute_fine_tune`'s own doc names for its arm.
     ),
@@ -1313,7 +1286,7 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "current_version_identity",
-        1, // ordinal 1 — the only `current_version_identity` in this file; line 1164 today
+        1, // ordinal 1 — the only `current_version_identity` in this file
            // `CURRENT_VERSION_IDENTITY_CALLERS` above is the machine-checked
            // claim: its two in-tree callers are `current_anchor`
            // (`ANCHOR_RETURN_ALLOWED`'s entry — discards the value after an
@@ -1324,7 +1297,7 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "verify_materialization",
-        1, // ordinal 1 — the only `verify_materialization` in this file; line 1301 today
+        1, // ordinal 1 — the only `verify_materialization` in this file
            // Read-only integrity check: compares a version's RECORDED identity
            // against a freshly recomputed one and reports a `MatchVerdict`. It
            // never persists a new anchor or a new artifact.
@@ -1332,10 +1305,9 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "resolve_search_mode_local",
-        1, // ordinal 1 — the only `resolve_search_mode_local` in this file; line 2280 today
-           // Disclosed, not closed (M4, carried from the deleted sweep):
-           // candidate SELECTION (which rows a producer's pooled read gathers)
-           // is out of this contract's scope. `pin_current_version`'s own doc
+        1, // ordinal 1 — the only `resolve_search_mode_local` in this file
+           // Disclosed, not closed: candidate SELECTION (which rows a
+           // producer's pooled read gathers) is out of this gate's scope. `pin_current_version`'s own doc
            // states the residual: a pinned producer's POOLED VECTORS are
            // single-version by construction, but its MEMBER SET may have been
            // chosen from a different, unpinned view via this function.
@@ -1343,7 +1315,7 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "bind_result_table",
-        1, // ordinal 1 — the only `bind_result_table` in this file; line 2516 today
+        1, // ordinal 1 — the only `bind_result_table` in this file
            // Documented "Read class" residual on its own doc comment: serves a
            // possibly-stale session-bound registration, never persists an
            // anchor. Every producer that DOES persist an anchor is required
@@ -1353,7 +1325,7 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "current_version_provider",
-        1, // ordinal 1 — the only `current_version_provider` in this file; line 2675 today
+        1, // ordinal 1 — the only `current_version_provider` in this file
            // Private; `CURRENT_VERSION_PROVIDER_CALLERS` above is the machine-
            // checked claim: its only in-tree caller is `pinned_provider`'s own
            // unversioned arm. Reading `.current_version` off the SAME
@@ -1364,7 +1336,7 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "pin_current_version",
-        1, // ordinal 1 — the only `pin_current_version` in this file; line 2756 today
+        1, // ordinal 1 — the only `pin_current_version` in this file
            // The seam itself: reads `record.current_version` once to decide
            // which arm to take, then returns a `PinnedSource` that carries the
            // record, the resolved version, and (for a versioned table) the
@@ -1374,7 +1346,7 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "allocate_version",
-        1, // ordinal 1 — the only `allocate_version` in this file; line 2917 today
+        1, // ordinal 1 — the only `allocate_version` in this file
            // Reads `table.current_version` only as the CAS's EXPECTED PARENT
            // (refuses with `ParentMoved` on mismatch); never reads content
            // under a version it resolves itself.
@@ -1382,7 +1354,7 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/store/freshness.rs",
         "producing_descriptor",
-        1, // ordinal 1 — the only `producing_descriptor` in this file; line 505 today
+        1, // ordinal 1 — the only `producing_descriptor` in this file
            // NOT CLOSED, disclosed rather than hidden. Its callers use the
            // returned `ProducingDescriptor` only to select WHICH producer
            // verb/params to replay — never as content or as a persisted anchor
@@ -1406,14 +1378,14 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/session.rs",
         "read_vectors",
-        1, // ordinal 1 — the only `read_vectors` in this file; line 977 today
+        1, // ordinal 1 — the only `read_vectors` in this file
            // NOT CLOSED, disclosed rather than hidden. The versioned arm reads
            // content through this SESSION's own `jammi.{table}` registration
            // (see `session_registration_literal_sites`'s allowlist entry for
            // this same file) rather than through `pinned_provider` — an
            // unpinned, version-branched content read, re-exported publicly at
-           // `read_vectors`, `jammi-ai/src/session.rs:1229` and
-           // `read_vectors`, `jammi-ai/src/local_session.rs:365`.
+           // `jammi-ai`'s `InferenceSession::read_vectors` and
+           // `LocalSession::read_vectors`.
            // `READ_VECTORS_CALLERS` above is the machine-checked claim: its
            // only two in-tree callers are those two forwarding wrappers, each
            // a one-line delegate, never a provenance-persisting producer.
@@ -1421,18 +1393,18 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str, usize)] = &[
            // `pin_current_version`/`pinned_provider`, or require a
            // caller-supplied `PinnedSource`) is a design change this gate does
            // not itself make; the straddle this function makes constructible
-           // is exactly the class this contract names as real and unclosed.
+           // is exactly the class this gate names as real and unclosed.
     ),
     (
         "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
         "ensure_base_version",
-        1, // ordinal 1 — the only `ensure_base_version` in this file; line 657 today
+        1, // ordinal 1 — the only `ensure_base_version` in this file
            // Guard clause only on its DOMINANT arm:
            // `record.current_version.is_some()` short-circuits to "already
            // versioned, return the SAME record UNCHANGED" — no re-fetch, no
            // content read branches on the value. Only the non-dominant,
-           // never-based-before arm re-fetches (`embedding_refresh.rs:751`,
-           // after its own base-publish CAS) before returning. See
+           // never-based-before arm re-fetches (after its own base-publish
+           // CAS) before returning. See
            // `SELF_FETCHED_RECORD_ALLOWED`'s `refreshable_record` entry for
            // why this dominant-arm behaviour is what that entry's review
            // actually depends on.
@@ -1445,24 +1417,20 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str, usize)] = &[
 /// one: dropping the `.get_result_table(` idiom conjunct
 /// (`self_fetched_record_version_hits`'s own doc) raised the real-surface
 /// hit count from 1 to 6 — the measured "five more, not hundreds" this
-/// contract pays for wider coverage.
-///
-/// The `compact_embeddings`/`expire_versions` entries below cite their
-/// current declaration lines for human traceability only — an unrelated
-/// merge elsewhere in this same file could still drift a line number without
-/// the function itself changing, desynchronizing a line-keyed allowlist from
-/// the code it names, which is exactly the failure the ordinal key avoids.
+/// gate pays for wider coverage. Entries are keyed by ordinal, never by
+/// line: an unrelated edit elsewhere in the same file drifts a line number
+/// without the function itself changing.
 const SELF_FETCHED_RECORD_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
         "refresh_embeddings",
-        1, // ordinal 1 — the only `refresh_embeddings` in this file; line 340 today
+        1, // ordinal 1 — the only `refresh_embeddings` in this file
            // This function never itself calls `.get_result_table(` — it calls
            // the wrapper `refreshable_record`. Reads `record.current_version`
-           // once (`parent_version`, line 357) off the record
+           // once (`parent_version`) off the record
            // `refreshable_record` returned, then uses that SAME value to
            // resolve the parent manifest (`store.resolve_version_manifest(
-           // &record, parent_version)`, line 366) — one fetch, one field, one
+           // &record, parent_version)`) — one fetch, one field, one
            // value threaded through to both the version DECISION and the
            // content READ. There is no second, independent resolution to
            // straddle against.
@@ -1470,7 +1438,7 @@ const SELF_FETCHED_RECORD_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
         "refreshable_record",
-        1, // ordinal 1 — the only `refreshable_record` in this file; line 579 today
+        1, // ordinal 1 — the only `refreshable_record` in this file
            // `InferenceSession::refreshable_record` — step 0's readiness GATE:
            // it self-fetches the record from a bare table name via
            // `self.catalog().get_result_table(table)`, then reads
@@ -1483,7 +1451,7 @@ const SELF_FETCHED_RECORD_ALLOWED: &[(&str, &str, usize)] = &[
            // `REFRESHABLE_RECORD_CALLERS` above, machine-checked, shows THREE
            // in-tree callers: `refresh_embeddings`, and the two destructive
            // ones, `compact_embeddings` (PUBLISHES a new version —
-           // `version.publish(...)`, `embedding_refresh.rs:1170`) and
+           // `version.publish(...)`) and
            // `expire_versions` (PERMANENTLY REAPS old ones —
            // `store.reap_expired_version(...)`, its own doc comment calls
            // this "a PERMANENT delete"). All three are reviewed in their own
@@ -1509,7 +1477,7 @@ const SELF_FETCHED_RECORD_ALLOWED: &[(&str, &str, usize)] = &[
            // manifest. One fetch, one field, one value — never two independent
            // resolutions to straddle. On the non-dominant, never-based arm,
            // `ensure_base_version` DOES re-fetch once
-           // (`embedding_refresh.rs:751`, after its own base-publish CAS), and
+           // (after its own base-publish CAS), and
            // THAT fresh record is what flows forward instead — still a single
            // resolution per call, just a different one depending on the arm.
            // Either way the anchor and the content pairing this gate polices
@@ -1523,33 +1491,33 @@ const SELF_FETCHED_RECORD_ALLOWED: &[(&str, &str, usize)] = &[
            // It never constructs or persists an `InputAnchor`; the value read
            // here never becomes a provenance artifact, only a retention-set
            // selector for a destructive delete — the same "candidate SELECTION
-           // is out of this contract's scope" residual `resolve_search_mode_local`'s
+           // is out of this gate's scope" residual `resolve_search_mode_local`'s
            // entry above discloses for a different function. A version publish
            // landing between this read and the reap could pick a stale
-           // retention set (a garbage-collection race its own `M5` doc comment
-           // already tracks) — never mint a mismatched anchor/content pair,
+           // retention set (a garbage-collection race its own doc comment
+           // states) — never mint a mismatched anchor/content pair,
            // because no anchor is ever minted on this path.
     ),
     (
         "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
         "compact_embeddings",
-        1, // ordinal 1 — the only `compact_embeddings` in this file; line 1024 today
+        1, // ordinal 1 — the only `compact_embeddings` in this file
            // No direct `.get_result_table(` call in its own body. Same
            // mechanism as `refresh_embeddings`: calls `refreshable_record`
            // then `ensure_base_version`, reads `record.current_version` once
-           // as `parent_version` (line 1027), and uses that SAME value to
+           // as `parent_version`, and uses that SAME value to
            // resolve `store.resolve_version_manifest(&record, parent_version)`
-           // (line 1034) for the content it compacts. See `refreshable_record`'s
+           // for the content it compacts. See `refreshable_record`'s
            // entry above for the full mechanism review.
     ),
     (
         "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
         "expire_versions",
-        1, // ordinal 1 — the only `expire_versions` in this file; line 1206 today
+        1, // ordinal 1 — the only `expire_versions` in this file
            // Calls `refreshable_record` (never `ensure_base_version`), reads
-           // `record.current_version` once (`current`, line 1209) and uses
+           // `record.current_version` once (`current`) and uses
            // that SAME value to resolve the retention manifest
-           // (`store.resolve_version_manifest(&record, current)`, line 1228)
+           // (`store.resolve_version_manifest(&record, current)`)
            // its deletion loop reaps every OTHER version against. See
            // `refreshable_record`'s entry above for why this never mints an
            // anchor.
@@ -1557,7 +1525,7 @@ const SELF_FETCHED_RECORD_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/catalog/version_repo.rs",
         "classify_ready_cas_miss",
-        1, // ordinal 1 — the only `classify_ready_cas_miss` in this file; line 245 today
+        1, // ordinal 1 — the only `classify_ready_cas_miss` in this file
            // Takes `target: Option<CasTarget>`, never a `ResultTableRecord` —
            // `CasTarget` merely happens to name its own version field
            // `current_version` too, which is what this text-only check
@@ -1569,7 +1537,7 @@ const SELF_FETCHED_RECORD_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "reconcile_ready_manifests",
-        1, // ordinal 1 — the only `reconcile_ready_manifests` in this file; line 1941 today
+        1, // ordinal 1 — the only `reconcile_ready_manifests` in this file
            // A read-only recovery sweep over already-`ready` tables: for
            // each, checks whether the CURRENT version's manifest
            // sidecar exists on disk and fails the row/version if it does not
@@ -1579,7 +1547,7 @@ const SELF_FETCHED_RECORD_ALLOWED: &[(&str, &str, usize)] = &[
     ),
 ];
 
-/// Pattern 3 — `(file, function name, declaration line, allowed occurrence
+/// Pattern 3 — `(file, function name, ordinal, allowed occurrence
 /// count)`. Keyed on the (path, function, ORDINAL) SITE, not on `file` alone
 /// (a per-file `usize` allowance would let a NEW unpinned read inside an
 /// already-allowlisted file pass review-free whenever an existing one in a
@@ -1592,27 +1560,17 @@ const SELF_FETCHED_RECORD_ALLOWED: &[(&str, &str, usize)] = &[
 /// see [`assign_ordinals`]'s doc for why an ORDINAL, not a line number, is
 /// the stable third element).
 const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
-    // `graph_propagation.rs::edge_scan_sql` (the S9 `neighbor_graph` edge
-    // scan) was HERE — round 3 (#551, N2-gate) migrated it onto
-    // `jammi_db::store::result_table_relation`, so its `"jammi.{` literal is
-    // gone from this function's body; the SAME literal now lives at the
-    // minter's own site (`crates/jammi-db/src/store/mod.rs::
-    // result_table_relation`, below), and this list shrank to match.
     (
         "crates/jammi-ai/src/pipeline/graph_neighbourhood.rs",
         "load_neighbor_graph_edges",
-        1, // ordinal 1 — the only `load_neighbor_graph_edges` in this file; line 511 today
+        1, // ordinal 1 — the only `load_neighbor_graph_edges` in this file
         1,
-        // Same class, the S9 edge relation.
+        // The `neighbor_graph` edge relation: an unquoted registration site.
     ),
-    // `jammi-db/src/index/exact.rs::exact_vector_search` was HERE — round 3
-    // (#551, N2-gate) migrated it onto `crate::store::result_table_relation`
-    // too, for the same reason: its `"jammi.{` literal moved to the
-    // minter's site.
     (
         "crates/jammi-db/src/session.rs",
         "read_vectors",
-        1, // ordinal 1 — the only `read_vectors` in this file; line 977 today
+        1, // ordinal 1 — the only `read_vectors` in this file
         1,
         // See `RECORD_VERSION_BRANCH_ALLOWED`'s entry for this same
         // function — builds a `TableReference::bare(format!("jammi.{table}"))`
@@ -1622,29 +1580,22 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
     (
         "crates/jammi-db/src/session.rs",
         "read_vector_by_key",
-        1, // ordinal 1 — the only `read_vector_by_key` in this file; line 1045 today
+        1, // ordinal 1 — the only `read_vector_by_key` in this file
         1,
         // Same shape as `read_vectors`, a different function in the same
         // file — kept as its own site so the two allowances cannot be
         // spent interchangeably.
     ),
-    // `registered_name` was HERE — #551 deleted the function itself
-    // (zero production callers; `TrainingSetTable::table_name`/`sql_relation`
-    // cover its two legitimate uses), so this entry is removed by rule
-    // rather than left pointing at a site that no longer exists. The
-    // versionlessness argument this entry made (a `TrainingSet` row is
-    // immutable and can never straddle a version boundary because every
+    // `TrainingSetTable::sql_relation`/`table_name` carry no literal of their
+    // own (they delegate to `result_table_relation`, below) and resolve no
+    // version: a `TrainingSet` row is immutable, since every
     // version-publishing verb refuses this kind — see
     // `refreshable_record`/`NotEmbeddingTable`, pinned by
-    // `training_set::refresh_and_compaction_refuse_a_training_set_leaving_it_versionless`)
-    // still holds for `TrainingSetTable::sql_relation`/`table_name`, neither
-    // of which resolves a version either — it just no longer needs an entry
-    // of ITS OWN here, since the `"jammi.{` literal both used to share now
-    // lives only at `result_table_relation`'s site, below.
+    // `training_set::refresh_and_compaction_refuse_a_training_set_leaving_it_versionless`.
     (
         "crates/jammi-db/src/store/mod.rs",
         "register_table",
-        1, // ordinal 1 — the only `register_table` in this file; line 1073 today
+        1, // ordinal 1 — the only `register_table` in this file
         1,
         // The registration write itself — defines what `jammi.{name}` maps
         // to, never a read.
@@ -1652,7 +1603,7 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "bind_result_table",
-        1, // ordinal 1 — the only `bind_result_table` in this file; line 2516 today
+        1, // ordinal 1 — the only `bind_result_table` in this file
         2,
         // Its two `add_result_table` calls (its documented "Read class"
         // residual — see `RECORD_VERSION_BRANCH_ALLOWED`'s entry). Both
@@ -1664,13 +1615,11 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
     (
         "crates/jammi-db/src/store/result_schema.rs",
         "deregister_result_tables",
-        1, // ordinal 1 — the only `deregister_result_tables` in this file; line 193 today
+        1, // ordinal 1 — the only `deregister_result_tables` in this file
         1,
-        // Read in full (`deregister_result_tables`,
-        // `crates/jammi-db/src/store/result_schema.rs:193-211`
-        // today): this function makes exactly ONE call against the schema
-        // provider it resolves — `provider.remove(&format!("jammi.{name}"))`
-        // (line 209) — and no other. It never calls `.table(`/
+        // Read in full: this function makes exactly ONE call against the
+        // schema provider it resolves — `provider.remove(&format!("jammi.{name}"))`
+        // — and no other. It never calls `.table(`/
         // `.table_exist(`, never reads `.current_version` off any record,
         // never constructs or returns an `InputAnchor`/`CurrentAnchor`.
         // `ResultTableSchemaProvider::remove` (this same file, the
@@ -1684,7 +1633,7 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
         // read here to straddle against, only a registration entry being
         // torn down.
         //
-        // Per R-A: this is a REVIEWED CLAIM about this one function's
+        // This is a REVIEWED CLAIM about this one function's
         // behaviour (its body was read in full and every call in it
         // enumerated by hand above), not a machine-checked one — nothing in
         // this gate's detectors verifies "this function never resolves a
@@ -1694,38 +1643,27 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
         // would not be caught by anything here and would need a fresh
         // review, not a renewed allowlist entry.
     ),
-    // `session.rs::infer_ordered_read_back_sql` was HERE — round 3 (#551,
-    // N2-gate) migrated it onto `jammi_db::store::result_table_relation`
-    // too; its `"jammi.{` literal moved to the minter's site, below.
     (
         "crates/jammi-db/src/store/mod.rs",
         "result_table_relation",
-        1, // ordinal 1 — the only `result_table_relation` in this file; line 427 today (#551 re-key)
+        1, // ordinal 1 — the only `result_table_relation` in this file
         1,
-        // #551 round 3 (N2-gate): the general-purpose minter every OTHER
-        // reader of a session-registered `jammi.{name}` relation across the
-        // workspace now calls (`TrainingSetTable::sql_relation` delegates to
-        // it too) instead of hand-building the quoted string itself. This is
-        // the ONE reviewed construction site the `"jammi.{` literal is
-        // allowed to exist at for the quoted-relation class this round
-        // migrated — every quoted call site this round found
-        // (`session.rs::infer_ordered_read_back_sql`,
+        // The general-purpose minter every OTHER reader of a
+        // session-registered `jammi.{name}` relation across the workspace
+        // calls (`TrainingSetTable::sql_relation`,
+        // `session.rs::infer_ordered_read_back_sql`,
         // `graph_propagation.rs::edge_scan_sql`,
-        // `index/exact.rs::exact_vector_search`, plus
-        // `jammi-bench`'s `propagate.rs`/`search_rss.rs`/`corpus.rs`, which
-        // this gate's `SURFACE_DIRS` does not scan) now calls this function
-        // and carries no literal of its own. The pre-existing UNQUOTED
-        // `TableReference::bare(format!("jammi.{{name}}"))` registration
-        // sites (`load_neighbor_graph_edges`,
+        // `index/exact.rs::exact_vector_search`, plus `jammi-bench`'s
+        // `propagate.rs`/`search_rss.rs`/`corpus.rs`, which this gate's
+        // `SURFACE_DIRS` does not scan) instead of hand-building the quoted
+        // string itself. This is the ONE reviewed construction site the
+        // `"jammi.{` literal may exist at for the quoted-relation class. The
+        // UNQUOTED `TableReference::bare(format!("jammi.{{name}}"))`
+        // registration sites (`load_neighbor_graph_edges`,
         // `jammi-db/src/session.rs::read_vectors`/`read_vector_by_key`,
         // `register_table`, `bind_result_table`) are a DIFFERENT risk class
-        // (what a name registers AS, not what a raw-SQL read quotes) this
-        // round did not migrate — reviewed and left as-is, their own
-        // existing entries unchanged. `registered_name` itself, which USED
-        // to be listed alongside them here, was deleted in #551
-        // (zero production callers) — its own allow-list entry is removed by
-        // rule, above, rather than kept pointing at a site that no longer
-        // exists.
+        // (what a name registers AS, not what a raw-SQL read quotes), each
+        // reviewed in its own entry.
     ),
 ];
 
@@ -1827,7 +1765,7 @@ fn no_new_unpinned_session_registration_literal() {
     }
 }
 
-// ── Falsification (R-A): these prove the four detectors and the mask/region
+// ── Falsification: these prove the four detectors and the mask/region
 // finder they share actually fire on the shapes they claim to catch, on
 // synthetic snippets that never touch git or the real tree — the file-scan
 // tests above already prove the real surface is reached; these prove the
@@ -1846,7 +1784,6 @@ fn falsification_anchor_shaped_return_is_detected() {
         r#"
         impl ResultStore {
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for `anchor_shaped_return_hits` — synthetic producer text fed to that detector, not real code in this file
         r#"            pub async fn sneaky_anchor(
                 &self,
                 t: &ResultTableRecord,
@@ -1869,19 +1806,17 @@ fn falsification_anchor_shaped_return_is_detected() {
 
 #[test]
 fn falsification_anchor_shaped_return_ignores_non_anchor_signatures() {
-    // Negative control (family F): a function that takes an `InputAnchor`
+    // Negative control: a function that takes an `InputAnchor`
     // as a PARAMETER (not a return type) and returns something else must
     // NOT fire — otherwise the detector would be vacuously triggered by any
     // function mentioning the identifier at all.
     let src = concat!(
         r#"
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for `anchor_shaped_return_hits`'s negative control — synthetic producer text, not real code in this file
         r#"        pub async fn compare_anchor(&self, anchor: &InputAnchor) -> Result<CurrentAnchor> {
             Ok(CurrentAnchor::Undecidable)
         }
 "#,
-        // kernel-oracles: fn-in-literal reviewed: same negative-control fixture's second synthetic function — not real code in this file
         r#"        pub fn benign(&self, anchor: &InputAnchor) -> bool {
             true
         }
@@ -1903,7 +1838,6 @@ fn falsification_bare_record_version_branch_is_detected() {
     let src = concat!(
         r#"
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for `bare_record_version_branch_hits` — synthetic producer text fed to that detector, not real code in this file
         r#"        async fn sneaky_read(&self, table: &ResultTableRecord) -> Result<Vec<u8>> {
             if let Some(v) = table.current_version {
                 return read_version(v).await;
@@ -1932,7 +1866,6 @@ fn falsification_bare_record_version_branch_ignores_explicit_version_param() {
     let src = concat!(
         r#"
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the explicit-version negative control — synthetic producer text fed to `bare_record_version_branch_hits`, not real code in this file
         r#"        pub async fn resolve_version_manifest(
             &self,
             table: &ResultTableRecord,
@@ -1961,7 +1894,6 @@ fn falsification_self_fetched_record_version_is_detected() {
         r#"
         impl ResultStore {
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the self-fetched-record-version detector (a self-fetch-then-read shape) — synthetic producer text, not real code in this file
         r#"            pub async fn anchor_identity_for(&self, table_name: &str) -> Result<Option<String>> {
                 let record = self.catalog.get_result_table(table_name).await?.unwrap();
                 let Some(version) = record.current_version else { return Ok(None); };
@@ -2018,7 +1950,6 @@ fn falsification_self_fetched_record_version_ignores_reviewed_delegation_and_par
         r#"
         impl ResultStore {
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for pattern 4's reviewed-delegation control — synthetic producer text, not real code in this file
         r#"            pub async fn wraps_identity(&self, table_name: &str) -> Result<Option<String>> {
                 let record = self.catalog.get_result_table(table_name).await?.unwrap();
                 self.current_version_identity(&record).await
@@ -2030,7 +1961,7 @@ fn falsification_self_fetched_record_version_ignores_reviewed_delegation_and_par
     let hits = self_fetched_record_version_hits(&surface);
     assert!(
         hits.is_empty(),
-        "UNCOVERED, per R-A, not a guarantee: pattern 4 does not see this \
+        "UNCOVERED, disclosed, not a guarantee: pattern 4 does not see this \
          self-fetch-then-delegate shape — a change here would mean the field-boundary check \
          regressed to a bare substring match: {hits:?}"
     );
@@ -2058,7 +1989,6 @@ fn falsification_self_fetched_record_version_ignores_reviewed_delegation_and_par
     let src_parameterized = concat!(
         r#"
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for pattern 4's negative control 2 — synthetic producer text fed to `self_fetched_record_version_hits`, not real code in this file
         r#"        async fn sneaky_read(&self, table: &ResultTableRecord) -> Result<Vec<u8>> {
             if let Some(v) = table.current_version {
                 return read_version(v).await;
@@ -2088,7 +2018,6 @@ fn falsification_generic_arrow_bound_region_is_found() {
         r#"
         impl ResultStore {
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the generic-arrow-bound region finder — synthetic producer text (a `Fn(&str) -> String` trait bound), not real code in this file
         r#"            pub async fn anchor_with<F: Fn(&str) -> String>(&self, rec: &ResultTableRecord, f: F) -> Result<InputAnchor> {
                 let v = rec.current_version.unwrap();
                 Ok(InputAnchor::result_digest(f(&rec.table_name), v))
@@ -2102,7 +2031,7 @@ fn falsification_generic_arrow_bound_region_is_found() {
         regions.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
         vec!["anchor_with"],
         "a function whose generic bound contains a `->` return arrow must still be found as a \
-         region — before the fix this function vanished entirely"
+         region, never dropped from the scan"
     );
     let surface = vec![("__probe__.rs".to_string(), src.to_string())];
     assert_eq!(
@@ -2134,7 +2063,6 @@ fn falsification_generic_arrow_bound_does_not_break_plain_generics() {
         r#"
         impl Foo {
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the plain-generics negative control — synthetic producer text, not real code in this file
         r#"            pub fn plain<T: Clone, U>(&self, a: T, b: U) -> Result<InputAnchor> {
                 todo!()
             }
@@ -2174,11 +2102,9 @@ fn falsification_session_registration_literal_binds_to_its_enclosing_function() 
     // function of their name in this synthetic file, so both key as
     // ordinal 1 regardless of which source line either starts on.
     let src = concat!(
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the site-binding fix — synthetic producer text fed to `session_registration_literal_sites`, not real code in this file
         "fn one(table: &str) {\n",
         "    let a = TableReference::bare(format!(\"jammi.{}\", table));\n",
         "}\n",
-        // kernel-oracles: fn-in-literal reviewed: same site-binding fixture's second synthetic function — not real code in this file
         "fn two(table: &str) {\n",
         "    let b = TableReference::bare(format!(\"jammi.{}\", table));\n",
         "    let c = TableReference::bare(format!(\"jammi.{}\", table));\n",
@@ -2219,7 +2145,6 @@ fn falsification_ordinal_survives_a_line_shift_above_it() {
         r#"
         impl ResultStore {
 "#,
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the ordinal-vs-line stability property — synthetic producer text, not real code in this file
         r#"            pub async fn drifting_anchor(
                 &self,
                 t: &ResultTableRecord,
@@ -2240,7 +2165,6 @@ fn falsification_ordinal_survives_a_line_shift_above_it() {
         // four
         impl ResultStore {
 "#,
-        // kernel-oracles: fn-in-literal reviewed: same ordinal-vs-line stability fixture, four lines further down — not real code in this file
         r#"            pub async fn drifting_anchor(
                 &self,
                 t: &ResultTableRecord,
@@ -2308,7 +2232,7 @@ fn falsification_ordinal_survives_a_line_shift_above_it() {
         "an allowlist entry keyed on the ordinal derived from the PRE-shift code must still match \
          the POST-shift hit — a line-keyed allowlist would desync from exactly this edit instead"
     );
-    // The failure mode this replaces, shown directly rather than merely
+    // The failure mode a line key has, shown directly rather than merely
     // asserted away: the equivalent LINE-keyed lookup from the same review
     // does NOT survive the shift.
     let line_keyed_allowlist_from_before: &[(&str, &str, usize)] =
@@ -2355,7 +2279,6 @@ fn mask_non_code_ignores_comments_and_string_braces() {
     // corrupting where `real`'s body is judged to end.
     let src = concat!(
         "// fn ignored_in_comment(x: ResultTableRecord) { x.current_version }\n",
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for `mask_non_code`'s brace-counting — synthetic producer text, not real code in this file
         "fn real(x: i32) -> i32 {\n",
         "    let s = format!(\"jammi.{}\", x);\n",
         "    let t = format!(\"{v}\", v = x);\n",
@@ -2376,14 +2299,13 @@ fn mask_non_code_ignores_comments_and_string_braces() {
     );
 }
 
-/// The real-tokenizer masking rebuild's own executed proof, both directions
-/// -- closing audit #9 of U2a's fifth residual (raw strings) plus the R-A
-/// nested-block-comment limit the module doc used to disclose as inert:
+/// The real-tokenizer masking's own executed proof, both directions, for raw
+/// strings and nested block comments:
 ///
 /// 1. A raw string containing an escaped quote and an embedded `//`/`/*`
 ///    must have its content (and ONLY its content) blanked by
-///    [`mask_non_code`] -- a hand-counted quote scanner (the deleted
-///    implementation) pairs the FIRST `"` with the NEXT `"`, closing the
+///    [`mask_non_code`] -- a hand-counted quote scanner pairs the FIRST
+///    `"` with the NEXT `"`, closing the
 ///    raw string early at the escaped `\"` and leaving everything after it
 ///    (including a REAL `//comment`) unmasked as if it were code.
 /// 2. That SAME raw string's embedded `"jammi.{table}"`-shaped text must
@@ -2391,18 +2313,15 @@ fn mask_non_code_ignores_comments_and_string_braces() {
 ///    literal candidate outside the string -- it stays untouched, inside
 ///    the (still-visible) string, exactly where it belongs.
 /// 3. A `///` doc comment must be blanked the same as a plain `//` comment
-///    by BOTH masks (matching this file's pre-existing behaviour, since the
-///    old scanner never inspected the third `/`).
+///    by BOTH masks.
 /// 4. A NESTED block comment (`/* outer /* inner */ still-outer */`) must
-///    have its ENTIRE extent blanked, not just up to the first `*/` -- the
-///    R-A limit the deleted scanner disclosed as inert is closed here by
-///    construction: the tokenizer's own trivia-skipping decides where the
+///    have its ENTIRE extent blanked, not just up to the first `*/` --
+///    by construction: the tokenizer's own trivia-skipping decides where the
 ///    comment ends, not a hand-counted `*/`.
 #[test]
 fn falsification_real_tokenizer_mask_handles_raw_strings_and_nested_comments() {
     let src = concat!(
         "/// a doc comment mentioning CREATE TABLE in prose\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn f() {\n",
         "    let raw = r#\"a \\\" quote, a // comment, and a /* block */ all inside\"#;\n",
         "    /* outer /* inner */ still-outer */\n",
@@ -2452,8 +2371,7 @@ fn allowlists_match_current_hits_exactly() {
     // whose site no longer produces that hit — the
     // code was fixed, renamed, or removed — must shrink with it. A
     // permanent allowance is dead slack a LATER, different site could spend
-    // without any new review at all, which is exactly the failure mode this
-    // contract names for the sweep it replaces.
+    // without any new review at all.
     let surface = scan_surface();
 
     let anchor_hits: HashSet<(String, String, usize)> = anchor_shaped_return_hits(&surface)
@@ -2567,17 +2485,15 @@ fn allowlists_match_current_hits_exactly() {
     }
 }
 
-// ── #500 U2a — the graph arm's excised registration guard ──────────────────
+// ── No session registration under fine_tune/ ────────────────────────────────
 //
-// The graph arm's per-call sampled-pairs relation (`register_table`/
-// `deregister_table` on the shared `SessionContext`, keyed by spec identity +
-// job id) collided under reclaim: two overlapping materializations of ONE job
-// id (a lease lost mid-sampling, then reclaimed by a second worker) still
-// collide, because the resource the guard named is scoped to one CALL while
-// the name was unique only per JOB. The guard is deleted outright, not
-// narrowed: the graph arm is `origin/main`'s shape (sample in memory, train
-// directly, no table); the follow-on unit that gives it a table of its own is
-// <https://github.com/f-inverse/jammi-ai/issues/538>.
+// A per-call relation registered on the shared `SessionContext`
+// (`register_table`/`deregister_table`, keyed by spec identity + job id)
+// collides under reclaim: two overlapping materializations of ONE job id (a
+// lease lost mid-sampling, then reclaimed by a second worker) bind the same
+// name, because the resource is scoped to one CALL while the name is unique
+// only per JOB. The graph arm therefore samples in memory and trains
+// directly, with no table.
 //
 // This is the standing oracle for the DIRECT half of the underlying property:
 // no file under `crates/jammi-ai/src/fine_tune/**` may itself WRITE a call to
@@ -2600,10 +2516,10 @@ fn allowlists_match_current_hits_exactly() {
 // occurrence of these verbs anywhere under BOTH crates' `src` trees, not
 // merely `fine_tune/**` — [`registration_verb_occurrences_are_all_reviewed`]
 // and [`REGISTRATION_VERB_SITES`], further down this file — a SEPARATE
-// oracle, not a hand-waved exception to this one. Tracing which of those
-// sites a `fine_tune/` call can actually REACH (as opposed to reviewing every
-// site unconditionally, reachable or not) is a distinct question, filed as
-// <https://github.com/f-inverse/jammi-ai/issues/549>.
+// oracle, not a hand-waved exception to this one. Which of those sites a
+// `fine_tune/` call can actually REACH (as opposed to reviewing every site
+// unconditionally, reachable or not) is answered separately, by
+// [`fine_tune_reachable_sites_are_all_reviewed`].
 //
 // **The DataFusion-wrapper shape this verb list closes.** A two-literal
 // detector naming only `register_table(`/`deregister_table(` misses
@@ -2642,9 +2558,9 @@ fn allowlists_match_current_hits_exactly() {
 //       THIS test: the wrapper's own call site is reviewed by
 //       [`registration_verb_occurrences_are_all_reviewed`] instead, which
 //       scans BOTH crates' whole `src` trees rather than one directory;
-//       whether `fine_tune/` can actually reach that wrapper is a separate,
-//       unanswered question (<https://github.com/f-inverse/jammi-ai/issues/549>),
-//       not one this test or that whole-surface review resolves.
+//       whether `fine_tune/` can actually reach that wrapper is answered by
+//       [`fine_tune_reachable_sites_are_all_reviewed`], not by this test or
+//       that whole-surface review.
 //
 // **The whole verb surface, enumerated from the pinned source
 // (`datafusion = "54.1"`, locked at `54.1.0` in `Cargo.lock`;
@@ -2946,14 +2862,12 @@ fn fine_tune_ddl_relation_binding_hits(
     hits
 }
 
-/// RED at `fe96bf39` (the excised commit's parent): `training_set.rs` had a
-/// `ctx.register_table(relation.as_str(), ...)` call and `DeregisterOnDrop`'s
-/// `self.ctx.deregister_table(...)` — two hits under the original two-verb
-/// detector. GREEN once the guard and its `MemTable` machinery are removed
-/// and the graph arm reverts to sampling in memory: zero hits,
-/// unconditionally, no allowlist — now checked against the full 24-literal
-/// verb surface above (`fine_tune_session_registration_hits`) PLUS the DDL
-/// surface (`fine_tune_ddl_relation_binding_hits`).
+/// Zero hits under `fine_tune/`, unconditionally, no allowlist — checked
+/// against the full 24-literal verb surface above
+/// (`fine_tune_session_registration_hits`) PLUS the DDL surface
+/// (`fine_tune_ddl_relation_binding_hits`). A `ctx.register_table(..)` call
+/// or a drop guard's `self.ctx.deregister_table(..)` under `fine_tune/`
+/// fails it.
 ///
 /// **This test's property is DIRECT call sites under `fine_tune/**` only.**
 /// It says nothing about whether a name gets bound INDIRECTLY, through an
@@ -2962,7 +2876,7 @@ fn fine_tune_ddl_relation_binding_hits(
 /// [`ddl_literal_occurrences_are_all_reviewed`], further down this file,
 /// which review every occurrence anywhere under both crates' `src` trees
 /// (never tracing whether `fine_tune/` can actually reach any given one —
-/// that reachability question is <https://github.com/f-inverse/jammi-ai/issues/549>).
+/// that is [`fine_tune_reachable_sites_are_all_reviewed`]).
 /// The module-level comment above states why the split is real rather than
 /// an oversight: a directory-scoped literal scan structurally cannot see a
 /// call that never appears inside `fine_tune/**`, no matter how many verbs
@@ -2978,7 +2892,7 @@ fn no_session_registration_under_fine_tune() {
          a session-binding verb (a `SessionContext`/`CatalogProvider` register_/deregister_ verb) \
          or a DDL literal that binds a relation (CREATE VIEW/TABLE/EXTERNAL TABLE/SCHEMA) — the \
          shared session is not a per-call namespace, and any name that is not unique per CALL \
-         collides under reclaim (see https://github.com/f-inverse/jammi-ai/issues/538). This is a \
+         collides under reclaim. This is a \
          DIRECT-call-site property only; the reviewed bindings anywhere under both crates' `src` \
          trees (including those reached through `ResultStore::materialize_training_set`) are a \
          separate, pinned property — see pinned_source_gate::REGISTRATION_VERB_SITES. verb hits: \
@@ -2986,7 +2900,7 @@ fn no_session_registration_under_fine_tune() {
     );
 }
 
-/// Falsification (R-A): every INCLUDED verb literal must fire the detector
+/// Falsification: every INCLUDED verb literal must fire the detector
 /// on its own line, scoped to `fine_tune/`, and masked out of a comment; and
 /// every EXCLUDED verb literal (a real `SessionContext` registration method
 /// this gate deliberately does not police) must NOT fire even when called
@@ -3009,7 +2923,6 @@ fn falsification_fine_tune_session_registration_is_detected_and_scoped() {
     let mut hit_src = String::from("\n");
     for lit in &included {
         hit_src.push_str(&format!(
-            // kernel-oracles: fn-in-literal reviewed: falsification fixture for `fine_tune_session_registration_hits` — synthetic producer text fed to that detector, not real code in this file
             "async fn synthetic(ctx: &SessionContext) {{\n    ctx.{lit}ARG).unwrap();\n}}\n"
         ));
     }
@@ -3031,8 +2944,8 @@ fn falsification_fine_tune_session_registration_is_detected_and_scoped() {
     );
 
     // Same text, a file OUTSIDE fine_tune/ — must not count (this gate's
-    // property is scoped to the excised arm's own module tree, not the
-    // whole crate).
+    // property is scoped to the `fine_tune/` module tree, not the whole
+    // crate).
     let outside_hits = fine_tune_session_registration_hits(&[(
         "crates/jammi-ai/src/pipeline/embedding.rs".to_string(),
         hit_src.clone(),
@@ -3067,7 +2980,6 @@ fn falsification_fine_tune_session_registration_is_detected_and_scoped() {
     let mut excluded_src = String::from("\n");
     for lit in EXCLUDED_REGISTRATION_VERB_LITERALS {
         excluded_src.push_str(&format!(
-            // kernel-oracles: fn-in-literal reviewed: negative-control fixture for the excluded `SessionContext` verbs — synthetic producer text fed to `fine_tune_session_registration_hits`, not real code in this file
             "async fn synthetic_excluded(ctx: &SessionContext) {{\n    ctx.{lit}ARG);\n}}\n"
         ));
     }
@@ -3125,7 +3037,6 @@ fn falsification_no_included_literal_is_a_substring_of_another_unless_the_declar
 #[test]
 fn falsification_probe_a_catalog_register_schema_is_caught() {
     let src = concat!(
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture reproducing the `ctx.catalog(..).unwrap().register_schema(..)` shape — synthetic producer text fed to `fine_tune_session_registration_hits`, not real code in this file
         "async fn probe(ctx: &SessionContext, name: &str) {\n",
         "    ctx.catalog(\"datafusion\").unwrap().register_schema(name, \
          std::sync::Arc::new(MemorySchemaProvider::new())).unwrap();\n",
@@ -3149,7 +3060,6 @@ fn falsification_probe_a_catalog_register_schema_is_caught() {
 #[test]
 fn falsification_probe_b_create_view_ddl_is_caught() {
     let src = concat!(
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture reproducing the `CREATE VIEW` DDL-string shape — synthetic producer text fed to `fine_tune_ddl_relation_binding_hits`, not real code in this file
         "async fn probe(ctx: &SessionContext, name: &str) {\n",
         "    ctx.sql(&format!(\"CREATE VIEW {name} AS SELECT 1\")).await.unwrap();\n",
         "}\n",
@@ -3174,7 +3084,6 @@ fn falsification_probe_b_create_view_ddl_is_caught() {
 fn falsification_every_ddl_literal_is_detected_and_scoped() {
     for lit in DDL_RELATION_BINDING_LITERALS {
         let src = format!(
-            // kernel-oracles: fn-in-literal reviewed: falsification fixture for `fine_tune_ddl_relation_binding_hits` — synthetic producer text, not real code in this file
             "async fn probe(ctx: &SessionContext) {{\n    ctx.sql(\"{lit} t AS SELECT 1\").await.unwrap();\n}}\n"
         );
         let hits = fine_tune_ddl_relation_binding_hits(&[(
@@ -3203,7 +3112,6 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
     let outside_hits = fine_tune_ddl_relation_binding_hits(&[(
         "crates/jammi-ai/src/pipeline/embedding.rs".to_string(),
         concat!(
-            // kernel-oracles: fn-in-literal reviewed: falsification fixture for the directory-scoping control on `fine_tune_ddl_relation_binding_hits` — synthetic producer text, not real code in this file
             "async fn probe(ctx: &SessionContext) {\n",
             "    ctx.sql(\"CREATE VIEW t AS SELECT 1\").await.unwrap();\n",
             "}\n",
@@ -3216,7 +3124,7 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
     );
 }
 
-// ── The literal-occurrence gate replaces call-graph reachability. ─────────
+// ── The literal-occurrence gate. ─────────────────────────────────────────────
 //
 // The two checks above (`no_session_registration_under_fine_tune` and its
 // falsifications) are the DIRECT-call-site layer: no file under
@@ -3225,76 +3133,28 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
 // of defense.
 //
 // The INDIRECT half -- an in-tree function defined OUTSIDE `fine_tune/` that
-// itself binds a session/catalog name, reached through some chain of in-tree
-// calls `fine_tune/` makes -- is no longer answered by tracing a call graph
-// at all. A `syn`-based AST call-graph test file (deleted; it lived
-// alongside this one under `crates/jammi-ai/tests/it/`) missed a
-// registration verb reached through a function-pointer argument,
-// `.map(Self::f)`, a call inside a macro invocation such as
-// `assert!`/`tokio::select!`, or a
-// fn-pointer struct field, and missed a DDL keyword sitting in a module-level
-// `const SQL = "..."`, split across two `format!`/`concat!` arguments, or
-// pulled in via `include_str!` -- a SOUNDNESS gap in what any finite set of
-// AST node-kind handlers can promise to cover exhaustively. That gate is
-// deleted, along with its `syn`/`proc-macro2` dev-dependencies (no
-// production code ever depended on either). The dependency-closure/
-// reachability question it existed to answer is its own unit,
-// <https://github.com/f-inverse/jammi-ai/issues/549>.
-//
-// **What replaces it, stated as its own honest universe.** Rather than
-// trace which binder a `fine_tune/` call can REACH, this gate finds every
-// SINGLE-LINE occurrence of one of the 24 `register_*`/`deregister_*`
+// itself binds a session/catalog name -- is answered in two layers. This
+// gate finds every occurrence of one of the 24 `register_*`/`deregister_*`
 // call-site patterns ([`PAIRED_REGISTRATION_VERBS`]/
-// [`UNPAIRED_REGISTRATION_VERBS`]) or the DDL-statement shape
-// ([`ddl_statement_shape`]) in `crates/jammi-ai/src` and
-// `crates/jammi-db/src` (both whole trees, [`SURFACE_DIRS`]) -- not only
-// `crates/jammi-ai/src/fine_tune/**`, which
-// [`fine_tune_session_registration_hits`]/[`fine_tune_ddl_relation_binding_hits`]
-// above already police as the cheap, zero-tolerance DIRECT layer -- and keys
-// each hit to `(file, enclosing function, ordinal)`, so a human reviews and
-// pins one property per site regardless of how many matching lines that
-// site contains.
+// [`UNPAIRED_REGISTRATION_VERBS`]) or a DDL-shaped string ([`ddl_hit_lines`]:
+// single literals, `format!`/`concat!`/`write!` argument concatenations,
+// literals inside any other macro, and `include_str!` targets) in
+// `crates/jammi-ai/src` and `crates/jammi-db/src` (both whole trees,
+// [`SURFACE_DIRS`]), keys each to `(file, enclosing function, ordinal)`, and
+// COUNTS occurrences per key, so a human reviews and pins one property per
+// site and a second occurrence planted inside a reviewed function is
+// OVER-COUNT. A site is reviewed whether or not anything under `fine_tune/`
+// can reach it -- a site with zero real callers (e.g. a trait method a
+// language feature requires but nothing in-tree invokes) is listed the same
+// as a site with a hundred callers; see each entry's own prose for which
+// case it is. Which of those sites `fine_tune/` can actually REACH is the
+// second layer, the "fine_tune/ reachability" section further down.
 //
-// That key is also this gate's own residual, not a solved problem the
-// deleted gate merely approximated. It counts SITES, never per-site
-// OCCURRENCES: a second `register_table(..)` call planted inside an
-// already-reviewed function, or a second module-scope DDL `const` added to
-// a file that already has one, keys to the SAME `(file, function, ordinal)`
-// an earlier, different line already occupies, and so raises no new hit for
-// [`registration_verb_occurrences_are_all_reviewed`]/
-// [`ddl_literal_occurrences_are_all_reviewed`] to catch. This scan is also
-// strictly line-based: a DDL literal split across two `concat!`/`format!`
-// arguments on separate lines, or pulled in through `include_str!`, is
-// invisible to it -- the same two shapes the deleted AST gate also missed,
-// carried over rather than closed by this replacement. And it is scoped to
-// exactly [`SURFACE_DIRS`]: a registration verb or DDL literal living
-// anywhere outside those two `src` trees is outside its universe entirely --
-// under `tests/it/` in either crate (e.g. the six `.register_table(`
-// calls this file's own review list keys to, `.register_table(`,
-// `crates/jammi-db/tests/it/materialization.rs:569/:636/:694/:696/:1318/:1569`,
-// none of them under `crates/jammi-db/src`), or in a third crate, both
-// count the same way. A fifth gap sits inside the scan itself, not at its
-// boundary: [`mask_comments_only`]'s masking step desyncs on a raw string
-// today (its own doc above states the raw-string/char-literal residual
-// and the file/line evidence), so a DDL literal sitting on a desynced
-// line is invisible to [`ddl_literal_occurrences`] regardless of which
-// directory it lives in.
-// None of these five gaps (per-site counts, split literals, `include_str!`
-// targets, anything outside `SURFACE_DIRS` including `tests/it/`, the
-// masking step's raw-string desync) is closed here; the rebuild that would
-// close them is <https://github.com/f-inverse/jammi-ai/issues/554>.
-//
-// What this gate DOES buy over the deleted call-graph gate is recall over
-// call SHAPE, not occurrence count or literal assembly: every function, in
-// either crate's `src` tree ([`SURFACE_DIRS`] -- never the whole
-// repository; `tests/it/` and any third crate are the gap named above),
-// whose own body contains at least one line
-// matching one of the 24 patterns or the DDL shape is found and reviewed
-// here, whether or not anything under `fine_tune/` can reach it -- a site
-// with zero real callers (e.g. a trait method a language feature requires
-// but nothing in-tree invokes) is still listed and reviewed here, the same
-// as a site with a hundred callers -- see each entry's own prose for which
-// case it is.
+// The gate's boundary is [`SURFACE_DIRS`]: a registration verb or DDL literal
+// living outside those two `src` trees -- under `tests/` in either crate
+// (e.g. the `.register_table(` calls in
+// `crates/jammi-db/tests/it/materialization.rs`), or in a third crate -- is
+// outside its universe entirely.
 
 /// One occurrence a review has cleared: the registration-verb call/
 /// declaration or DDL-shaped string literal at `(file, function, ordinal)` --
@@ -3305,10 +3165,9 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
 /// `allowed` COUNT: how many times this exact (file, function, ordinal) site
 /// is reviewed to occur, never merely whether it occurs at all. A `BTreeSet`
 /// key alone cannot see a SECOND `ctx.register_table(...)` planted inside an
-/// already-reviewed function collapse onto the same key — closing audit #8
-/// of U2a (2026-09-14, head d1fee4e7) executed exactly that escape and it
-/// stayed green under the set-only scheme; `registration_verb_occurrences`/
-/// `ddl_literal_occurrences` (below) now return a per-key COUNT, and
+/// already-reviewed function collapse onto the same key, so
+/// `registration_verb_occurrences`/`ddl_literal_occurrences` (below) return
+/// a per-key COUNT, and
 /// [`assert_occurrences_reviewed`] fails a key whose real count exceeds its
 /// `allowed` one, not merely a key that is altogether missing or stale. Every
 /// field is read: `file`/`function`/`ordinal` key the comparison against the
@@ -3316,8 +3175,7 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
 /// [`ddl_literal_occurrences_are_all_reviewed`]); `property` is asserted
 /// non-trivial by [`every_reviewed_registration_site_states_its_property`]
 /// and printed in every failure message via `#[derive(Debug)]` -- no field
-/// here is decorative the way the deleted call-graph gate's `#[allow(dead_code)]`
-/// `arm`/`reason` fields were.
+/// here is decorative.
 #[derive(Debug)]
 struct ReviewedRegistrationSite {
     file: &'static str,
@@ -3365,9 +3223,7 @@ fn attribute_hit_to_enclosing_fn(regions: &[FnRegion], line_no: usize) -> (Strin
 /// PATTERN, attributed to its enclosing function and COUNTED, not merely
 /// noted present -- a `(file, function, ordinal)` key maps to how many times
 /// the pattern occurs there, so a SECOND occurrence planted inside an
-/// already-reviewed function (closing audit #8 of U2a, 2026-09-14, head
-/// d1fee4e7, executed exactly this escape against the earlier `BTreeSet`
-/// version of this function) bumps the count past its `allowed` ceiling
+/// already-reviewed function bumps the count past its `allowed` ceiling
 /// instead of collapsing onto the same, already-present key. Deliberately a
 /// superset of "genuine calls": the same substring match
 /// `fine_tune_session_registration_hits` uses also matches the verb's own
@@ -3412,11 +3268,11 @@ fn registration_verb_occurrences(
 
 /// A [`syn`]-driven scan (never a masked-line substring search) collecting
 /// every 1-based source LINE at which a DDL-shaped string occurs anywhere in
-/// `text`, from three independent sources -- #554's items 2 and 3:
+/// `text`, from these independent sources:
 ///
 /// 1. Any single [`syn::LitStr`]'s own DECODED `.value()` (`visit_lit_str`,
 ///    syn's normal AST traversal, so it finds a plain `SessionContext::sql(
-///    "CREATE TABLE ..")` call argument the same way the old scan did) --
+///    "CREATE TABLE ..")` call argument) --
 ///    immune to the raw-string/masking-desync class of bug entirely, by
 ///    construction: `syn` decodes the literal's real VALUE, so an `r#"..`
 ///    delimiter or an escaped `\"` plays no part in what this sees.
@@ -3432,8 +3288,8 @@ fn registration_verb_occurrences(
 ///    literals -- so a DDL string buried inside `assert!(..)`,
 ///    `println!(..)`, or any custom macro (none of which `syn::visit::Visit`
 ///    descends into as typed `Expr`/`Lit` nodes on its own, since a macro's
-///    body is opaque `TokenStream` to the AST) is still found, matching what
-///    the deleted line-based scan saw regardless of macro boundaries.
+///    body is opaque `TokenStream` to the AST) is still found, regardless of
+///    macro boundaries.
 /// 4. `include_str!(..)`'s own TARGET FILE, resolved the same way `rustc`
 ///    resolves it (relative to the INCLUDING file's own directory), read and
 ///    scanned as if its content were inlined -- a hard failure naming the
@@ -3488,8 +3344,8 @@ struct DdlLiteralScanner {
 /// (`store/mutable/postgres.rs`, `store/mutable/sqlite.rs`), was reported at
 /// line 1 (that file's own module doc comment line, an innocent coincidence
 /// of line-1 attribution landing on line 1's `<module-scope>` sentinel)
-/// rather than the DDL literal's real line, until this fix; caught directly
-/// by [`falsification_general_macro_ddl_literal_is_attributed_to_its_real_line`].
+/// rather than the DDL literal's real line if spans were not preserved;
+/// pinned by [`falsification_general_macro_ddl_literal_is_attributed_to_its_real_line`].
 fn string_literals_in_tokens(ts: proc_macro2::TokenStream) -> Vec<syn::LitStr> {
     let mut out = Vec::new();
     for tt in ts {
@@ -3740,7 +3596,6 @@ fn unresolved_include_str_targets_are_reviewed() {
 /// different argument yields a different key.
 #[test]
 fn unresolved_include_str_review_key_is_line_independent_and_argument_sensitive() {
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fed to `ddl_hit_lines` to pin the review key's shape, not real code in this file
     let src = "fn f() -> &'static str { include_str!(concat!(env!(\"X\"), \"/a.txt\")) }\n";
     let dir = repo_root();
     let (_, a) = ddl_hit_lines(&dir, src);
@@ -3933,7 +3788,6 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         function: "register_table",
         ordinal: 1,
         allowed: 1,
-        // kernel-oracles: fn-in-literal reviewed: the property string below names the literal shape `fn register_table(` in prose, describing a real declaration elsewhere in this file — not a fn-keyword desync in this line
         property: "this hit is the `fn register_table(` DECLARATION line, not a call site (see \
                    `registration_verb_occurrences`'s own doc on this scan's inability to tell the \
                    two apart). The function itself never calls a `register_table`/`deregister_table` \
@@ -3954,42 +3808,22 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
                    `ResultTableSchemaProvider`, not a call site written in this crate: the only \
                    in-tree paths that dispatch to it are DataFusion's own `SessionContext::register_table` \
                    top-level API and `CREATE TABLE` DDL execution, when the target schema resolves \
-                   to this provider (i.e. after `install_result_schema` runs). Checked, not assumed, \
-                   and the command run is stated exactly because an earlier draft of this entry got \
-                   it wrong: `grep -rn '\\.register_table(' crates/jammi-db/src crates/jammi-ai/src` \
-                   -- the two `src` trees [`SURFACE_DIRS`] scans -- returns exactly ONE call site, the \
-                   5-argument `.register_table(ctx, &record.table_name, &url, owner, file_sort_order)` \
-                   call at `store/mod.rs:3748` (its other three hits, `store/mod.rs:180/:5156/:5224`, \
-                   are prose naming the verb); it does NOT find the ten 2-argument \
-                   `.register_table(name, provider)` calls, because all ten live under `tests/` \
-                   trees, outside both `src` trees entirely. \
-                   The command that actually produces the ten is repo-wide: \
-                   `grep -rn '\\.register_table(' --include='*.rs' crates/` returns \
-                   `crates/jammi-db/tests/it/materialization.rs:569/:636/:694/:696/:1318/:1569`, \
-                   `crates/jammi-ai/tests/it/rangesplit.rs:219/:359/:416` and \
-                   `crates/jammi-ballista/tests/it/roles.rs:70` (plus that same `store/mod.rs:3748` \
-                   line, and several prose mentions of the verb inside this very file that are text, \
-                   not call sites). Of those ten 2-argument calls, only the one at \
-                   `materialization.rs:1569`, inside \
-                   `install_result_schema_twice_on_one_session_binds_the_same_schema_and_errors_on_neither`, \
-                   actually dispatches to THIS implementation: it is the only one of the ten whose \
-                   `ctx` already had `install_result_schema` called on it earlier in the same \
-                   function, which is what makes the target schema resolve here (traced, not \
-                   assumed: `install_result_schema`'s call at that test's line 1563 precedes its \
-                   `:1569` `register_table` call; the other nine calls' enclosing functions --\
-                   `ts_session` (`:569`), `pinned_session` (`:636`), `pinned_session_two` \
-                   (`:694`, `:696`), \
-                   `the_file_sort_order_declares_a_dotted_column_verbatim_not_as_a_qualified_reference` \
-                   (`:1318`), and the rangesplit and ballista fixtures -- never call \
-                   `install_result_schema` on their `ctx` at all, \
-                   so they resolve to DataFusion's \
-                   own default `MemorySchemaProvider` instead). That one call is deliberate, to \
+                   to this provider (i.e. after `install_result_schema` runs). Within the two `src` \
+                   trees [`SURFACE_DIRS`] scans, the only `.register_table(` call is \
+                   `ResultStore::register_table`'s 5-argument \
+                   `.register_table(ctx, &record.table_name, &url, owner, file_sort_order)`; every \
+                   2-argument `.register_table(name, provider)` call lives under a `tests/` tree. Of \
+                   those, only the one in `crates/jammi-db/tests/it/materialization.rs`'s \
+                   `install_result_schema_twice_on_one_session_binds_the_same_schema_and_errors_on_neither` \
+                   dispatches to THIS implementation: it is the only one whose `ctx` already had \
+                   `install_result_schema` called on it earlier in the same function, which is what \
+                   makes the target schema resolve here; every other test fixture resolves to \
+                   DataFusion's own default `MemorySchemaProvider`. That one call is deliberate, to \
                    prove the \"preserves the tables it already holds\" property survives a second \
-                   install -- no PRODUCTION call reaches this implementation today. Its own body inserts \
+                   install -- no PRODUCTION call reaches this implementation. Its own body inserts \
                    UNCONDITIONALLY and returns the displaced provider on a name collision (a \
-                   SILENT overwrite, closing audit #3's own finding, `CONTRACT-U2a-fix1.md` round \
-                   3) -- moot for `fine_tune/` (#549 is the tracked follow-on for a table of its \
-                   own), since no in-tree caller picks a per-job/per-call name through this path.",
+                   SILENT overwrite) -- moot for `fine_tune/`, since no in-tree caller picks a \
+                   per-job/per-call name through this path.",
     },
     ReviewedRegistrationSite {
         file: "crates/jammi-db/src/store/result_schema.rs",
@@ -4041,8 +3875,8 @@ const DDL_LITERAL_SITES: &[ReviewedRegistrationSite] = &[
         file: "crates/jammi-db/src/catalog/schema.rs",
         function: "<module-scope>",
         ordinal: 0,
-        // 13 -- transcribed from the gate's own output (the real-tokenizer
-        // rebuild's `ddl_hit_lines`, #554), never hand-counted: this module
+        // 13 -- transcribed from the gate's own output (`ddl_hit_lines`),
+        // never hand-counted: this module
         // holds MANY migration-SQL constants (`CREATE TABLE sources`,
         // `result_tables`, and every other table this catalog's migrations
         // create), each its own `ddl_statement_shape` hit at module scope.
@@ -4104,9 +3938,8 @@ const DDL_LITERAL_SITES: &[ReviewedRegistrationSite] = &[
 /// entry is UNREVIEWED (fails naming the site); a reviewed entry whose site
 /// no longer produces a hit is STALE (also fails -- an allowance is never
 /// permanent slack a later, different site can spend); and a reviewed entry
-/// whose site's REAL count exceeds its `allowed` one is OVER-COUNT -- the
-/// check closing audit #8 of U2a's escape needed and the set-only version of
-/// this file never had: a second `ctx.register_table(...)` planted inside an
+/// whose site's REAL count exceeds its `allowed` one is OVER-COUNT: a second
+/// `ctx.register_table(...)` planted inside an
 /// already-reviewed function does not create a NEW key, it bumps an
 /// EXISTING one's count past what was reviewed.
 fn assert_occurrences_reviewed(
@@ -4160,7 +3993,7 @@ fn ddl_literal_occurrences_are_all_reviewed() {
     assert_occurrences_reviewed(&found, &allow, "DDL literal");
 }
 
-/// #549's own DDL-position list: a module-level `const SQL: &str = "CREATE
+/// A DDL position: a module-level `const SQL: &str = "CREATE
 /// TABLE .."` -- exactly the real shape `crates/jammi-db/src/catalog/
 /// schema.rs`'s 13 reviewed module-scope hits already are, reproduced here
 /// as a clean, minimal fixture (a bare per-literal `visit_lit_str` hit, not
@@ -4171,7 +4004,6 @@ fn falsification_module_level_const_ddl_is_detected() {
     let source = concat!(
         "const PROBE_TABLE_DDL: &str = \"CREATE TABLE probe (id INT)\";\n",
         "\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn unrelated() {}\n",
     );
     let (hits, _unresolved) = ddl_hit_lines(&dir, source);
@@ -4183,18 +4015,16 @@ fn falsification_module_level_const_ddl_is_detected() {
     );
 }
 
-/// #554 item 2: a DDL keyword split across two `concat!` string-literal
+/// A DDL keyword split across two `concat!` string-literal
 /// arguments on separate lines is invisible to a per-literal check (neither
 /// `"CREATE "` nor `"TABLE probe"` is independently DDL-shaped) but visible
 /// to the ARGUMENT-ORDER CONCATENATION `ddl_hit_lines` builds for
-/// `concat!`/`format!`/`write!`/`writeln!` -- RED under the deleted
-/// line-based scan (each half sits on its own line, neither DDL-shaped
-/// alone), GREEN here.
+/// `concat!`/`format!`/`write!`/`writeln!` -- a line-based scan misses it
+/// (each half sits on its own line, neither DDL-shaped alone).
 #[test]
 fn falsification_ddl_keyword_split_across_concat_arguments_is_detected() {
     let dir = repo_root();
     let source = concat!(
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the concat!-split DDL shape -- synthetic producer text, not real code in this file
         "fn build_ddl() -> &'static str {\n",
         "    concat!(\n",
         "        \"CREATE \",\n",
@@ -4210,7 +4040,7 @@ fn falsification_ddl_keyword_split_across_concat_arguments_is_detected() {
     );
 }
 
-/// #554 item 3: `include_str!(..)`'s own target file content is scanned as
+/// `include_str!(..)`'s own target file content is scanned as
 /// if inlined -- a fixture file containing `CREATE TABLE` is included by a
 /// synthetic source and must be detected.
 #[test]
@@ -4224,7 +4054,6 @@ fn falsification_include_str_target_ddl_is_detected() {
     std::fs::write(&included_path, "CREATE TABLE probe_included (id INT);\n")
         .expect("write the include_str! probe's target file");
     let source = concat!(
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the include_str! DDL shape -- synthetic producer text, not real code in this file
         "fn embedded_ddl() -> &'static str {\n",
         "    include_str!(\"probe_included.sql\")\n",
         "}\n",
@@ -4241,13 +4070,12 @@ fn falsification_include_str_target_ddl_is_detected() {
 /// The general per-literal macro scan and the format!/concat!-combined
 /// check must never BOTH fire for the common single-literal-template shape
 /// (`format!("CREATE TABLE ..", ..)`) -- exactly the double count this file
-/// measured live in `store/mutable/{postgres,sqlite}.rs::create_table_ddl`
-/// before the fix (real count 2 against a reviewed `allowed: 1`).
+/// would produce in `store/mutable/{postgres,sqlite}.rs::create_table_ddl`
+/// (real count 2 against a reviewed `allowed: 1`).
 #[test]
 fn falsification_format_macro_ddl_literal_is_not_double_counted() {
     let dir = repo_root();
     let source = concat!(
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture proving the format!-template DDL count is 1, not 2 -- synthetic producer text, not real code in this file
         "fn build_ddl(name: &str) -> String {\n",
         "    format!(\"CREATE TABLE {} (id INT)\", name)\n",
         "}\n",
@@ -4264,16 +4092,13 @@ fn falsification_format_macro_ddl_literal_is_not_double_counted() {
 /// [`string_literals_in_tokens`]'s span-preservation fix, executed directly:
 /// a literal buried two macro-groups deep must be reported on ITS OWN real
 /// source line, never line 1 (`syn::parse_str::<syn::Lit>(&lit.to_string())`
-/// -- the bug this replaces -- re-lexes the token's rendered text as a
-/// brand-new one-line source, so every literal it returned carried a
-/// PHANTOM `line 1` span regardless of where it actually lived; this is
-/// exactly how the real `postgres.rs`/`sqlite.rs` hits were misattributed
-/// to `<module-scope>` at line 1 before the fix).
+/// re-lexes the token's rendered text as a brand-new one-line source, so
+/// every literal it returns carries a PHANTOM `line 1` span regardless of
+/// where it actually lived, misattributing it to `<module-scope>`).
 #[test]
 fn falsification_general_macro_ddl_literal_is_attributed_to_its_real_line() {
     let dir = repo_root();
     let source = concat!(
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture proving real-span attribution for a macro-nested literal -- synthetic producer text, not real code in this file
         "fn f() {\n",
         "    // five filler lines push the DDL literal well past line 1\n",
         "    let _ = 1;\n",
@@ -4320,7 +4145,6 @@ fn falsification_new_verb_occurrence_in_a_new_file_is_flagged() {
     let surface = vec![(
         "crates/jammi-db/src/store/__probe_new_registration_site__.rs".to_string(),
         concat!(
-            // kernel-oracles: fn-in-literal reviewed: falsification fixture for `registration_verb_occurrences` -- synthetic producer text, not real code in this file
             "fn planted_caller(ctx: &SessionContext, provider: Arc<dyn TableProvider>) {\n",
             "    ctx.register_table(\"planted\", provider).unwrap();\n",
             "}\n",
@@ -4348,19 +4172,17 @@ fn falsification_new_verb_occurrence_in_a_new_file_is_flagged() {
     );
 }
 
-/// Non-vacuousness for the OVER-COUNT arm [`assert_occurrences_reviewed`]
-/// added (#554 item 1): a site already reviewed at `allowed: 1` that the
-/// real scan now finds TWICE (a second `ctx.register_table(...)` planted
-/// inside the same, already-reviewed function -- exactly closing audit #8 of
-/// U2a's own escape, reproduced here as a fixture rather than against the
-/// live 600+-file surface) is reported OVER-COUNT, never silently absorbed
-/// the way a `BTreeSet`-keyed version of this gate absorbed it.
+/// Non-vacuousness for [`assert_occurrences_reviewed`]'s OVER-COUNT arm: a
+/// site already reviewed at `allowed: 1` that the real scan now finds TWICE
+/// (a second `ctx.register_table(...)` planted inside the same,
+/// already-reviewed function, reproduced here as a fixture rather than
+/// against the live 600+-file surface) is reported OVER-COUNT, never silently
+/// absorbed the way a `BTreeSet`-keyed key would absorb it.
 #[test]
 fn falsification_a_second_occurrence_inside_an_already_reviewed_function_is_over_count() {
     let surface = vec![(
         "crates/jammi-db/src/store/__probe_double_registration__.rs".to_string(),
         concat!(
-            // kernel-oracles: fn-in-literal reviewed: falsification fixture for the count-keyed over-count arm -- synthetic producer text, not real code in this file
             "fn bind_result_table(ctx: &SessionContext, provider: Arc<dyn TableProvider>) {\n",
             "    ctx.register_table(\"a\", provider.clone()).unwrap();\n",
             "    ctx.register_table(\"b\", provider).unwrap();\n",
@@ -4406,7 +4228,6 @@ fn falsification_paired_verb_occurrence_count_does_not_double_count_deregister()
     let surface = vec![(
         "crates/jammi-db/src/store/__probe_paired_verb_count__.rs".to_string(),
         concat!(
-            // kernel-oracles: fn-in-literal reviewed: falsification fixture proving paired-verb occurrence counting arithmetic -- synthetic producer text, not real code in this file
             "fn both_forms(ctx: &SessionContext, provider: Arc<dyn TableProvider>) {\n",
             "    ctx.register_table(\"a\", provider).unwrap();\n",
             "    ctx.deregister_table(\"a\").unwrap();\n",
@@ -4442,7 +4263,6 @@ fn falsification_removing_a_reviewed_entry_leaves_its_site_unreviewed() {
     let surface = vec![(
         "crates/jammi-ai/src/query/content_hash_udf.rs".to_string(),
         concat!(
-            // kernel-oracles: fn-in-literal reviewed: falsification fixture reproducing a real reviewed site -- synthetic producer text, not read from the real file
             "pub fn register_content_hash_udf(ctx: &SessionContext) {\n",
             "    ctx.register_udf(ScalarUDF::new_from_impl(ContentHashUdf::default()));\n",
             "}\n",
@@ -4461,7 +4281,7 @@ fn falsification_removing_a_reviewed_entry_leaves_its_site_unreviewed() {
     );
 }
 
-// ── #549 -- fine_tune/ reachability over the binding surface ───────────────
+// ── fine_tune/ reachability over the binding surface ─────────────────────────
 //
 // The literal-occurrence gate above reviews every registration-verb/DDL
 // occurrence under SURFACE_DIRS UNCONDITIONALLY -- reachable from
@@ -4470,10 +4290,10 @@ fn falsification_removing_a_reviewed_entry_leaves_its_site_unreviewed() {
 // through every indirection shape a hand-rolled reachability sweep can miss
 // (a fn-pointer argument, a `Self::method` path handed to `.map(..)`, a call
 // buried inside `assert!`/`tokio::select!`, a fn-pointer struct field, a
-// `macro_rules!`-generated fn item)? A prior attempt at this (U2a fix round
-// 7, `call_graph_gate.rs`) was excised at fix round 8 after its own closing
-// audit #7 found it unsound on exactly these five call shapes and four DDL
-// positions -- this section's own fixtures are that same list, executed.
+// `macro_rules!`-generated fn item)? A typed-AST call graph built from a
+// finite set of node-kind handlers is unsound on exactly these five call
+// shapes and four DDL positions -- this section's own fixtures are that same
+// list, executed.
 //
 // **The universe is NOT jammi-ai's own (forward) dependency closure.**
 // `cargo metadata`'s FULL package graph (no `--no-deps`) is 697 packages,
@@ -4504,8 +4324,8 @@ fn falsification_removing_a_reviewed_entry_leaves_its_site_unreviewed() {
 // unrelated functions sharing a name are treated as ONE reachability target,
 // so a call this graph cannot actually prove distinct is still followed (a
 // FALSE reachable is the safe direction; a false NOT-reachable is the
-// failure mode this whole rebuild exists to close). Two shapes this section
-// cannot resolve BY NAME are handled by FAILING CLOSED instead, per G2:  a
+// failure mode this section exists to close). Two shapes this section
+// cannot resolve BY NAME are handled by FAILING CLOSED instead:  a
 // fn-pointer struct field call `(s.f)(ctx)` is resolved by finding every
 // site anywhere in the binding surface that assigns a value into a field of
 // that SAME name (also name-keyed) -- if NONE exists, the call is reported
@@ -4799,7 +4619,7 @@ impl FileGraphBuilder {
 
     /// Every direct ARGUMENT of a call/method-call that is (after unwrapping
     /// `Paren`/`Reference`/`Group`) a bare `Expr::Path` -- the `for_each(b)`
-    /// and `.map(Self::b)` edge shapes G8 requires, handled uniformly since
+    /// and `.map(Self::b)` edge shapes, handled uniformly since
     /// neither is anything more than "a path expression sitting directly in
     /// argument position", regardless of how many segments the path has.
     fn record_path_arguments(
@@ -5297,7 +5117,7 @@ fn fine_tune_reachable_sites_are_all_reviewed() {
     assert_occurrences_reviewed(&found, &allow, "fine_tune/-reachable registration/DDL site");
 }
 
-/// G8's own wall-time bound, measured and stated (not merely claimed): the
+/// The reachability computation's wall-time bound, measured and stated (not merely claimed): the
 /// reachability computation over the REAL binding surface (337 tracked
 /// `.rs` files at this head) must complete in under 10 seconds.
 #[test]
@@ -5361,20 +5181,17 @@ fn reachable_contains_fn(graph: &CallGraph, reachable: &HashSet<usize>, name: &s
     reachable.iter().any(|&i| graph.nodes[i].name == name)
 }
 
-/// G8 edge shape 1: a bare function NAME handed directly to a call as an
+/// Edge shape 1: a bare function NAME handed directly to a call as an
 /// argument (`for_each(callee)`) -- the callee is invoked THROUGH the
 /// fn-pointer `for_each` receives, never spelled as a call site of its own.
 #[test]
 fn falsification_fn_pointer_argument_edge_is_found() {
     let (graph, reachable) = probe_reachability(concat!(
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn caller(items: &[i32]) {\n",
         "    items.iter().for_each(|_| callee());\n",
         "    items.iter().for_each(direct_callee);\n",
         "}\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn direct_callee() {}\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn callee() {}\n",
     ));
     assert!(
@@ -5383,7 +5200,7 @@ fn falsification_fn_pointer_argument_edge_is_found() {
     );
 }
 
-/// G8 edge shape 2: a qualified path (`Self::b`) handed directly to
+/// Edge shape 2: a qualified path (`Self::b`) handed directly to
 /// `.map(..)` as an argument -- the same argument-position shape as
 /// `for_each(b)`, with a multi-segment path instead of a bare identifier.
 #[test]
@@ -5391,11 +5208,9 @@ fn falsification_map_self_method_argument_edge_is_found() {
     let (graph, reachable) = probe_reachability(concat!(
         "struct S;\n",
         "impl S {\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "    fn caller(items: Vec<i32>) -> Vec<i32> {\n",
         "        items.into_iter().map(Self::b).collect()\n",
         "    }\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "    fn b(x: i32) -> i32 { x }\n",
         "}\n",
     ));
@@ -5405,17 +5220,15 @@ fn falsification_map_self_method_argument_edge_is_found() {
     );
 }
 
-/// G8 edge shape 3a: a call inside an `assert!(..)` macro invocation's
+/// Edge shape 3a: a call inside an `assert!(..)` macro invocation's
 /// token stream -- opaque to `syn`'s typed AST, so only the raw token walk
 /// ([`call_shaped_idents_in_tokens`]) can see it at all.
 #[test]
 fn falsification_call_inside_assert_macro_edge_is_found() {
     let (graph, reachable) = probe_reachability(concat!(
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn caller() {\n",
         "    assert!(callee().is_ok());\n",
         "}\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn callee() -> Result<(), ()> { Ok(()) }\n",
     ));
     assert!(
@@ -5424,19 +5237,17 @@ fn falsification_call_inside_assert_macro_edge_is_found() {
     );
 }
 
-/// G8 edge shape 3b: a call inside a `tokio::select!` arm -- a macro DSL
+/// Edge shape 3b: a call inside a `tokio::select!` arm -- a macro DSL
 /// `syn` cannot parse as ordinary expressions at all, so this shape can only
 /// be found by the same raw token walk as the `assert!` case.
 #[test]
 fn falsification_call_inside_tokio_select_arm_edge_is_found() {
     let (graph, reachable) = probe_reachability(concat!(
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "async fn caller() {\n",
         "    tokio::select! {\n",
         "        _ = callee() => {}\n",
         "    }\n",
         "}\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "async fn callee() {}\n",
     ));
     assert!(
@@ -5445,7 +5256,7 @@ fn falsification_call_inside_tokio_select_arm_edge_is_found() {
     );
 }
 
-/// G8 edge shape 4: a fn-pointer struct field `(s.f)(ctx)` -- resolved by
+/// Edge shape 4: a fn-pointer struct field `(s.f)(ctx)` -- resolved by
 /// finding every RHS ever assigned to a field of that SAME name anywhere in
 /// the (synthetic, here single-file) binding surface.
 #[test]
@@ -5454,15 +5265,12 @@ fn falsification_fn_pointer_struct_field_edge_is_found() {
         "struct Handlers {\n",
         "    f: fn(),\n",
         "}\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn make() -> Handlers {\n",
         "    Handlers { f: callee }\n",
         "}\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn caller(s: &Handlers) {\n",
         "    (s.f)();\n",
         "}\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn callee() {}\n",
     ));
     assert!(
@@ -5481,7 +5289,7 @@ fn falsification_fn_pointer_struct_field_edge_is_found() {
     );
 }
 
-/// G2, applied to G8's fn-pointer-field shape: when NO assignment to the
+/// Fail-closed, applied to the fn-pointer-field shape: when NO assignment to the
 /// field exists anywhere, the gate refuses to pass silently -- it is a
 /// NAMED, unresolved finding, never a silent dead end.
 #[test]
@@ -5492,7 +5300,6 @@ fn falsification_unresolved_fn_pointer_field_call_fails_closed() {
             "struct Handlers {\n",
             "    f: fn(),\n",
             "}\n",
-            // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
             "fn caller(s: &Handlers) {\n",
             "    (s.f)();\n",
             "}\n",
@@ -5508,7 +5315,7 @@ fn falsification_unresolved_fn_pointer_field_call_fails_closed() {
     );
 }
 
-/// G8 edge shape 5: a `macro_rules!`-generated fn item -- the generated
+/// Edge shape 5: a `macro_rules!`-generated fn item -- the generated
 /// function's NAME is a macro metavariable resolved only per invocation
 /// site, so it can never be traced through to a specific call-graph node;
 /// instead, the DEFINITION's own template body is checked directly for a
@@ -5535,7 +5342,7 @@ fn falsification_macro_rules_template_binding_site_is_flagged() {
     );
 }
 
-/// G8's own soundness posture, executed directly: "name-keyed
+/// The reachability graph's own soundness posture, executed directly: "name-keyed
 /// over-approximation is safe-direction (a new same-named binder is
 /// REPORTED)". A call to `helper()` must mark EVERY node named `helper`
 /// reachable, including one this graph cannot prove is a DIFFERENT
@@ -5544,12 +5351,9 @@ fn falsification_macro_rules_template_binding_site_is_flagged() {
 #[test]
 fn falsification_name_keyed_over_approximation_reports_a_new_same_named_binder() {
     let (graph, reachable) = probe_reachability(concat!(
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for name-keyed safe-direction over-approximation -- synthetic producer text fed to build_call_graph, not real code in this file
         "fn caller() { helper(); }\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "fn helper() {}\n",
         "mod other {\n",
-        // kernel-oracles: fn-in-literal reviewed: synthetic Rust source fed to the source gate's own scanner (a call-graph / literal-occurrence fixture), not real code in this file
         "    pub fn helper() {}\n",
         "}\n",
     ));

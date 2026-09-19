@@ -440,7 +440,7 @@ mod tests {
         assert_eq!(tier.digest.measured, spec.digest);
     }
 
-    /// The teeth, GATE-FAILS direction (RC1: an assertion must be able to fail).
+    /// The teeth, GATE-FAILS direction (an assertion must be able to fail).
     ///
     /// Perturbed samples — the SAME committed graph re-sampled through the SAME
     /// real engine sampler with a regressed knob — must each produce a different
@@ -500,7 +500,7 @@ mod tests {
 
     /// The committed throughput baseline gates with teeth: a run *at* the baseline
     /// clears the gate and a run that regressed past the threshold *fails* it
-    /// (RC1). Asserts the committed baseline is a well-formed, generously
+    /// Asserts the committed baseline is a well-formed, generously
     /// thresholded same-box reference without re-measuring the (noisy) rate in the
     /// hermetic test lane.
     #[test]

@@ -96,7 +96,7 @@ impl PyDatabase {
     /// Like [`Self::open`], but over an already-built runtime rather than
     /// constructing a fresh one.
     ///
-    /// `open_local` (#486) needs this: `jammi_ai::telemetry::otlp_layer`
+    /// `open_local` needs this: `jammi_ai::telemetry::otlp_layer`
     /// builds a tonic `Channel` that requires an ACTIVE Tokio reactor merely
     /// to construct (no connection attempt happens at that point — the
     /// channel connects lazily — but the executor it wraps still needs
@@ -279,18 +279,15 @@ impl PyDatabase {
     /// the word.
     ///
     /// `close` is therefore an ordinary member of the client's `Session`
-    /// surface on BOTH transports, not a `jammi.Capability` — the enum member
-    /// `CLOSE` no longer exists. It was there while the wrapper raised
-    /// `NotSupportedOnBackend` on the claim that the embedded engine "releases
-    /// on drop"; that claim is exactly what the `unix-excl` seam falsifies (see
-    /// above — a drop releases nothing at any bounded moment), so the flag was
-    /// hiding a primitive that existed rather than describing a divergence.
+    /// surface on BOTH transports, not a `jammi.Capability`: the embedded
+    /// engine does not "release on drop" (see above — under the `unix-excl`
+    /// seam a drop releases nothing at any bounded moment), so an explicit
+    /// release is a primitive both transports share, not a divergence.
     ///
-    /// What each transport releases still differs, and the remote arm is
-    /// unaffected in every respect: `jammi.RemoteDatabase.close()` closes a
-    /// gRPC channel and a Flight client, and holds no catalog file at all — the
-    /// file this releases exists only on the embedded arm. The CONTRACT is
-    /// shared, though: both are idempotent, and after either one every verb
+    /// What each transport releases differs: `jammi.RemoteDatabase.close()`
+    /// closes a gRPC channel and a Flight client, and holds no catalog file at
+    /// all — the file this releases exists only on the embedded arm. The
+    /// contract is shared, though: both are idempotent, and after either one every verb
     /// raises `jammi.errors.BackendError`.
     ///
     /// Idempotent — calling `close()` again is a no-op that returns `None`,
@@ -336,7 +333,7 @@ impl PyDatabase {
                     (None, false) => Ok(()),
                 };
                 // `InferenceSession::close` shuts the session's lease
-                // keeper (N3) down and joins its dedicated thread — closing
+                // keeper down and joins its dedicated thread — closing
                 // its OWN catalog connection — before closing the shared
                 // pool. Closing only the shared pool without this step
                 // would leave the keeper's connection open, and for the
@@ -352,9 +349,9 @@ impl PyDatabase {
     /// Attach to an existing job by id, on a freshly-opened connection that
     /// never submitted it — the embedded peer of the remote client's
     /// `RemoteJob`, which always attaches by id (every one of its verbs
-    /// re-fetches state over the wire per call). Closes the K4 asymmetry
-    /// where the embedded engine could otherwise only ever hand out a `Job`
-    /// at submit time. Works for ANY row the generalised `jobs` table holds
+    /// re-fetches state over the wire per call), so the embedded engine is not
+    /// limited to handing out a `Job` at submit time. Works for ANY row the
+    /// generalised `jobs` table holds
     /// — a training kind this connection submitted, or a compute-kind row
     /// created internally by another verb — not only a training job.
     ///
@@ -1281,7 +1278,7 @@ impl PyDatabase {
         ))
     }
 
-    /// Predict a target's distribution with a trained context predictor (S19) by
+    /// Predict a target's distribution with a trained context predictor by
     /// assembling its live context and running one in-context forward — no
     /// gradient update. Returns a dict: `{"kind": "gaussian", "mean", "std"}` or
     /// `{"kind": "quantile", "levels": [[level, value], …]}`.
@@ -1412,7 +1409,7 @@ impl PyDatabase {
     }
 
     /// Read back the persisted per-query eval records for a run from a serialized
-    /// `EvalPerQueryRequest` body (spec J9), scoped to the calling tenant. The
+    /// `EvalPerQueryRequest` body, scoped to the calling tenant. The
     /// thin Python `Database` wrapper builds this request with the same pure-Python
     /// assembly the remote client uses (`jammi._assembly`), serializes it,
     /// and hands the bytes here, so the embedded and remote per-query readback
@@ -1498,7 +1495,7 @@ impl PyDatabase {
         serializable_to_pydict(py, &report)
     }
 
-    /// Evaluate whether a predictor's uncertainty is honest (spec R2) from a
+    /// Evaluate whether a predictor's uncertainty is honest from a
     /// serialized `EvalCalibrationRequest` body. The thin Python `Database`
     /// wrapper builds this request with the same pure-Python assembly the remote
     /// client uses (`jammi._assembly`), serializes it, and hands the bytes
@@ -1628,7 +1625,8 @@ impl PyDatabase {
     /// a peer cannot recompute a table it cannot resolve. Returns the serialized
     /// `RecomputeReport` proto the Python wrapper parses — the same message the
     /// remote client receives over gRPC. A malformed or invalid body raises
-    /// `ValueError`; a pre-contract table raises the typed `NotRecomputable`.
+    /// `ValueError`; a table with no recorded descriptor raises the typed
+    /// `NotRecomputable`.
     fn _recompute_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
         self.check_open()?;
         let args = jammi_ai::wire::recompute_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
@@ -1935,7 +1933,7 @@ impl PyTenantScope {
 /// Build a declared-edge gather ([`EdgeGather`]) from the Python edge kwargs, or
 /// `None` when no `edge_source` was given (the ANN-only default). Covers the
 /// "bring your own graph" case: a registered external edge source with the
-/// common gather knobs. (The S9 `neighbor_graph` edge source and as-of pinning
+/// common gather knobs. (The `neighbor_graph` edge source and as-of pinning
 /// are reachable through the Rust surface; the governance / continual half is a
 /// downstream SDK.)
 #[allow(clippy::too_many_arguments)]

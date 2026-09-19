@@ -3,17 +3,14 @@
 // (see ../../build.rs); the pinned build flags (sm_80 baseline, no
 // -use_fast_math) live there, not here.
 //
-// DELIBERATE DUPLICATION (campaign #443 W2b contract): this file is a
-// SEPARATE translation unit from `layer_norm.cu` (the existing F32/BF16
-// kernels), carrying its OWN copy of every file-scope `__device__` helper
-// and its own `#include <cuda_fp16.h>` — NOT a shared `.cuh` (`build.rs`'s
-// own comment on `rope_common.cuh` documents the non-tracked-header
-// staleness hazard: `bindgen_cuda` does not track `#include`d header
-// dependencies, so a header-only edit would not trigger recompilation of
-// every `.cu` that includes it). Keeping this file wholly separate also
-// makes `layer_norm.cu`'s own byte-identity (this campaign's audit
-// assertion — `git diff` on it must be empty) trivially provable: nothing
-// in this file ever touches that one.
+// DELIBERATE DUPLICATION: this file is a SEPARATE translation unit from
+// `layer_norm.cu` (the F32/BF16 kernels), carrying its OWN copy of every
+// file-scope `__device__` helper and its own `#include <cuda_fp16.h>` — NOT
+// a shared `.cuh` (`build.rs`'s own comment on `rope_common.cuh` documents
+// the non-tracked-header staleness hazard: `bindgen_cuda` does not track
+// `#include`d header dependencies, so a header-only edit would not trigger
+// recompilation of every `.cu` that includes it). Keeping this file wholly
+// separate also means nothing in it can perturb `layer_norm.cu`'s kernels.
 //
 // Domain, block/launch shape, and the two-pass `dgamma` design are
 // IDENTICAL to `layer_norm.cu`'s module doc — see that file for the full
@@ -21,7 +18,7 @@
 // `__nv_bfloat16` and matches the per-op f16 reference-regime table
 // (`docs/maintainer/cuda-kernel-guide.md` §3.10): f32-internal
 // (mean/var/xhat accumulate in f32), ONE rounding to f16 on the way out —
-// the exact same regime as the existing BF16 arms, substituting the
+// the exact same regime as the BF16 arms, substituting the
 // narrower 16-bit type.
 #include <cuda_fp16.h>
 #include <cstddef>
@@ -198,15 +195,13 @@ extern "C" __global__ void layer_norm_cast_f32_to_f16(
 }
 
 // ---------------------------------------------------------------------
-// #460 (C-LN): bias-carrying forward, F16. APPEND-ONLY — see
-// `layer_norm.cu`'s identical comment above this block's F32/BF16 twin for
-// the full design rationale: ATen citation, `--fmad=true` form, and why
-// this NEW `template <bool HAS_BETA>` row body is a SEPARATE, textually
-// duplicated copy of the pre-existing bias-free F16 row body above this
-// comment (NOT a shared definition the bias-free kernel also calls) — an
-// accepted drift surface, the direct cost of keeping the bias-free
-// kernel's bytes provably untouched. Every kernel ABOVE this comment in
-// THIS file is byte-for-byte unchanged by this addition.
+// Bias-carrying forward, F16 — see `layer_norm.cu`'s identical comment
+// above this block's F32/BF16 twin for the full design rationale: ATen
+// citation, `--fmad=true` form, and why this `template <bool HAS_BETA>` row
+// body is a SEPARATE, textually duplicated copy of the bias-free F16 row
+// body above this comment (NOT a shared definition the bias-free kernel
+// also calls) — a drift surface kept in sync only by review and the
+// CPU<->CUDA parity suite.
 // ---------------------------------------------------------------------
 
 template <bool HAS_BETA>

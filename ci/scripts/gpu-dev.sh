@@ -18,13 +18,13 @@
 # a git worktree (a worktree add fails on the checked-out ref, and a shared
 # .git couples trees that must be able to diverge independently). `--tree
 # <name>` selects one on run/push/pull/attach/logs/target; the default tree
-# ("jammi-ai") is the historical single checkout at /root/jammi-ai that every
-# session already has from bootstrap.
+# ("jammi-ai") is the single checkout at /root/jammi-ai that every session
+# has from bootstrap.
 #
 # `push`/`run`/`target` act on YOUR OWN checkout — REPO_ROOT below (what
 # push rsyncs, and the checkout whose gpu-dev.sh copy you must be running)
 # is resolved from THIS SCRIPT's own on-disk location, never from $PWD. On a
-# laptop with more than one checkout of this repo (a multi-worktree swarm),
+# laptop with more than one checkout of this repo (several worktrees),
 # always invoke the copy INSIDE the tree you mean to act on — these three
 # verbs refuse (naming both paths) when $PWD's own git toplevel disagrees
 # with that location; RP_ALLOW_ROOT_MISMATCH=1 overrides for deliberate
@@ -42,7 +42,7 @@
 #                                                      already-WARM dir that carries none
 #   gpu-dev.sh attach  [session] [--tree T]           shell into a surviving session
 #   gpu-dev.sh run     [session] [--tree T] <cmd...>  run <cmd> detached under tmux — REFUSES
-#                      [--wave W]                      (esc-077) unless <tree>'s CARGO_TARGET_DIR
+#                      [--wave W]                      unless <tree>'s CARGO_TARGET_DIR
 #                                                      carries a `target`-stamped clone marker
 #                                                      (`.jammi-clone-of-seed`); remedy in the
 #                                                      error, or RP_ALLOW_COLD_TARGET=1 to force —
@@ -88,8 +88,8 @@
 #        cross-tree use.
 # --replace: `up` normally REFUSES to touch a session alias that already has a
 #        recorded pod id — even one that failed to answer SSH — rather than
-#        silently deploying a second pod under the same alias (that is how an
-#        unrelated stale pod got terminated on 2026-08-25). --replace opts in
+#        silently deploying a second pod under the same alias (which can get
+#        an unrelated stale pod terminated). --replace opts in
 #        to overwriting the LOCAL record only; it does not terminate the old
 #        pod (`down` it first if it should be).
 # Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,
@@ -136,7 +136,7 @@ gpu-dev.sh — GPU development on RunPod
   attach  [session] [--tree T]            join a surviving session's running job
                                           (--shell for a plain prompt instead)
   run     [session] [--tree T] <cmd...>   run <cmd> detached under tmux, in <tree> — REFUSES
-          [--wave W]                     (esc-077) unless <tree>'s CARGO_TARGET_DIR carries a
+          [--wave W]                      unless <tree>'s CARGO_TARGET_DIR carries a
                                           `target`-stamped clone marker (else a silent cold
                                           full-workspace build); RP_ALLOW_COLD_TARGET=1 bypasses.
                                           ALSO refuses (one-pod-per-wave, WAVE-scoped) while a
@@ -240,7 +240,7 @@ Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,
      Disk sizing once the seed/clone substrate is in use: RP_DISK_GB >= 25
      (base) + S_src + S_seed + N*S_clone (one clone per tree this pod hosts);
      the S_src/S_seed/S_clone byte counts are MEASURED by
-     ci/scripts/perf/pod_build_timings.sh (A2), not guessed — see
+     ci/scripts/perf/pod_build_timings.sh, not guessed — see
      docs/maintainer/dev-gpu.md, which cites the committed JSON under
      ci/artifacts/pod-build-timings/ (src/seed/clone ≈ 3.6/7.8/8.1 GB). Add 3 GB per OTHER concurrent agent target
      dir + 2 GB per `cargo mutants` job — a mutation-testing session wants
@@ -282,16 +282,15 @@ case "$CMD" in
     ;;
 esac
 
-# esc-056 (defect 2): REPO_ROOT above is derived from THIS SCRIPT'S OWN
+# REPO_ROOT above is derived from THIS SCRIPT'S OWN
 # on-disk location, never from the caller's $PWD — a laptop with more than
-# one checkout of this repo (a multi-worktree swarm: separate `git
-# worktree` checkouts, each with its own copy of this very script) can
+# one checkout of this repo (separate `git worktree` checkouts, each with
+# its own copy of this very script) can
 # invoke ONE tree's copy of gpu-dev.sh from INSIDE a DIFFERENT tree's
 # directory, and push/run/target would then silently act on the SCRIPT's
 # own tree (REPO_ROOT) — never the tree the caller believes they are
-# standing in. Observed live: M1b's pod legs initially validated the WRONG
-# tree via the main checkout's own script copy; the push-stamp's own
-# laptop_head field was the only tell. Fail closed rather than silently
+# standing in, and the push-stamp's own laptop_head field is the only tell.
+# Fail closed rather than silently
 # doing the wrong thing: refuse when $PWD's own git toplevel names a
 # DIFFERENT root than REPO_ROOT, naming both paths and the fix (invoke that
 # tree's OWN copy of this script) — checked here, before require_pod/rp_init
@@ -364,8 +363,7 @@ case "$CMD" in
           [ "$CMD" = "up" ] || { echo "::error::--replace applies only to 'up' ($CMD has no session to replace)"; exit 2; }
           REPLACE=1; shift ;;
         # Forces the seed build to rerun even if .jammi-seed-complete already
-        # exists (pod_seed_target.sh's own default is otherwise a no-op —
-        # see M1).
+        # exists (pod_seed_target.sh's own default is otherwise a no-op).
         --reseed) RESEED=1; shift ;;
         # Asking for help is not an error, and `up -h` is where someone reaches
         # when they have forgotten the flag they came to look up.
@@ -483,11 +481,11 @@ case "$CMD" in
     # a tree within it. `--wave` (one-pod-per-wave, the WAVE identity a
     # concurrency claim is recorded/compared under — see
     # rp_concurrency_preflight_lines) is narrower still: only `run` (which
-    # records the claim) and `push` (so an operator can set the SAME
+    # records the claim) and `push` (so a caller can set the SAME
     # `--wave`/RP_WAVE across both verbs without either one rejecting it —
     # `push` itself writes no claim; the claim exists only once a job
-    # actually launches) accept it. A LOOP, not a one-shot `case` like the
-    # old `--tree`-only form: the two flags may now appear in either order.
+    # actually launches) accept it. A LOOP, not a one-shot `case`: the two
+    # flags may appear in either order.
     case "$CMD" in
       attach|run|logs|push|pull)
         while :; do
@@ -576,10 +574,10 @@ case "$CMD" in
   wait-seed|wait-job) wait_resolve_knobs "$WAIT_TIMEOUT" ;;
 esac
 
-# `up` sessions persist past the terminal and are the ones the 2026-08-25
-# incident hit: runpod_lib.sh's own RP_TTL_HOURS default (8h) is sized for a
-# throwaway `shell`/CI pod, not a dev session someone is actively using —
-# so a session rented at the default died at 8h no matter what. An explicit
+# `up` sessions persist past the terminal: runpod_lib.sh's own RP_TTL_HOURS
+# default (8h) is sized for a throwaway `shell`/CI pod, not a dev session
+# someone is actively using — a session rented at that default dies at 8h
+# no matter what. An explicit
 # RP_TTL_HOURS from the caller always wins (checked BEFORE runpod_lib.sh
 # applies its OWN "${RP_TTL_HOURS:-8}" default); only in its absence does `up`
 # alone raise the floor to RP_DEV_TTL_HOURS. `shell` and every CI lane
@@ -608,14 +606,14 @@ fi
 source "$DIR/runpod_lib.sh"
 
 # Validated BEFORE any path derives from it or any remote heredoc could
-# embed it (round-N audit: the injection class `wait-job`'s own new heredoc
-# site joins — see rp_tree_name_check's own doc). The default "jammi-ai"
+# embed it (see rp_tree_name_check's own doc for the injection exposure).
+# The default "jammi-ai"
 # passes trivially; only a caller-supplied --tree can fail this.
 RP_TREE_CHECK_VALUE="$TREE" rp_tree_name_check || exit 2
 # `target`'s POSITIONAL name is a tree name too — it is what rp_target_dir/
 # rp_tree_dir resolve for that verb (:1148), and both results go straight
 # into a remote heredoc. It never passes through $TREE, so the check above
-# does not cover it: `target a100 '<injection>'` reached the pod unchecked.
+# does not cover it: `target a100 '<injection>'` would reach the pod unchecked.
 # Empty is the "no name given" state `target --verify` legitimately has, so
 # only a non-empty value is checked here; the verb's own
 # "need a tree name" refusal still handles the empty case.
@@ -628,29 +626,27 @@ RP_TREE_CHECK_VALUE="$TREE" rp_tree_name_check || exit 2
 # computed identically since both sides apply the exact same function).
 # TREE_DIR is the SOURCE checkout (rsync'd by push); TARGET_DIR is the
 # build-substrate CLONE's own CARGO_TARGET_DIR — a deliberately DISJOINT
-# directory (round-2 audit finding 1: conflating the two made `target`'s
-# clone destination collide with `push --tree`'s rsync destination, so the
-# first push after a `target` deleted the clone it had just made).
+# directory (conflating the two makes `target`'s clone destination collide
+# with `push --tree`'s rsync destination, so the first push after a `target`
+# deletes the clone it had just made).
 TREE_DIR="$(rp_tree_dir "$TREE")"
 TARGET_DIR="$(rp_target_dir "$TREE")"
 # `=`-anchored so a tmux SESSION lookup never prefix-matches another tree's
 # session (`jammi-ai` would otherwise match a session literally named
-# `jammi-ai-2`) — the fix for the shipped unanchored `-t jammi` bug (M6).
+# `jammi-ai-2`).
 TMUX_SESSION="jammi-${TREE}"
-# One-pod-per-wave is WAVE-scoped, not tree-scoped (operator-directed
-# refinement of the original tree-scoped gate, 8515cbb9): a single wave
-# legitimately spans more than one tree (e.g. a CPU-build sub-unit and a
-# GPU-test sub-unit sharing the same warm seed), and the old tree-scoped
-# check tripped a wave against ITSELF the moment it used a second tree.
+# One-pod-per-wave is WAVE-scoped, not tree-scoped: a single wave
+# legitimately spans more than one tree (e.g. a CPU-build job and a
+# GPU-test job sharing the same warm seed), and a tree-scoped check trips
+# a wave against ITSELF the moment it uses a second tree.
 # WAVE defaults to the tree name — a caller who sets neither `--wave` nor
-# RP_WAVE gets EXACTLY 8515cbb9's tree-scoped behavior (the regression this
-# default is required to preserve; pinned by Group 10's own
-# default-wave-is-tree-scoped test). Resolved here, for every verb that
+# RP_WAVE gets tree-scoped behavior (pinned by test_gpu_dev_lifecycle.sh's
+# Group 10 default-wave-is-tree-scoped test). Resolved here, for every verb that
 # reaches this point (not just `run`), so `push --wave X` / `RP_WAVE=X
 # gpu-dev.sh push ...` is accepted rather than erroring on an unrecognised
 # concept — `push` itself writes no claim (only `run`'s job launch does;
-# see rp_job_wrapper_with_marker_lines's own doc), so this is purely so an
-# operator can set ONE `--wave`/RP_WAVE across a whole push-then-run
+# see rp_job_wrapper_with_marker_lines's own doc), so this is purely so a
+# caller can set ONE `--wave`/RP_WAVE across a whole push-then-run
 # sequence without either verb rejecting it.
 WAVE="${RP_WAVE:-$TREE}"
 # Same rule as --tree, for the same reason: WAVE is written into the pod's
@@ -677,7 +673,7 @@ esac
 rp_login_cmd() { # $1 = "job" to join a live tmux job, $2 = tree dir, $3 = tmux session
   local tree_dir="${2:?rp_login_cmd needs a tree dir}" tmux_sess="${3:?rp_login_cmd needs a tmux session name}"
   # Built from the SAME rp_job_wrapper_lines `run`'s own job wrapper uses
-  # (round-3 audit Class B) — never a second hand-rolled copy of the
+  # — never a second hand-rolled copy of the
   # source-env/CARGO_TARGET_DIR/cd sequence that could silently drift from
   # it. The no-op job line (":") is dropped (an interactive shell has no
   # job to run); `cd` gets its own `2>/dev/null` so a not-yet-provisioned
@@ -709,7 +705,7 @@ require_pod() {
   exit 1
 }
 
-# esc-056: a bootstrap failure ends this invocation before `rp_keep` is ever
+# A bootstrap failure ends this invocation before `rp_keep` is ever
 # called, so the EXIT trap's own best-effort `rp_terminate` (rp_cleanup,
 # runpod_lib.sh) is the ONLY thing standing between this pod and orphaned
 # billing — and that call throws its own response away by design (it also
@@ -756,7 +752,7 @@ bootstrap_or_die() {
 # `shell`/`up` (a cold seed is real compile minutes). Idempotent:
 # pod_seed_target.sh itself no-ops when .jammi-seed-complete already exists
 # (unless --reseed). Runs under the SAME lock-in-pane pattern as `run
-# --timing` (M6): the flock acquisition is the FIRST thing the detached
+# --timing`: the flock acquisition is the FIRST thing the detached
 # pane's own command does, so the lock's lifetime is the seed job's
 # lifetime, not this short-lived launcher's.
 #
@@ -768,11 +764,10 @@ bootstrap_or_die() {
 # member set / lockfile the checkout does not have, which is a worse
 # inconsistency than the one being avoided. No laptop-side preflight reads
 # a marker THIS script's version-specific behavior would need to agree
-# with (unlike pod_target_clone.sh's marker, which esc-077's
+# with (unlike pod_target_clone.sh's marker, which
 # rp_target_preflight_lines DOES check) — the seed's own completion marker
-# (.jammi-seed-complete) is read by rp_seed_wait_script, whose OWN
-# reasonable expectations (a JSON marker existing/not) have not changed
-# across any version relevant here.
+# (.jammi-seed-complete) is read by rp_seed_wait_script, which only
+# expects a JSON marker to exist or not.
 start_seed_build() {
   local reseed_flag=""
   [ "$RESEED" = "1" ] && reseed_flag="--reseed"
@@ -840,16 +835,16 @@ case "$CMD" in
         exit 0
       elif [ "$REPLACE" != "1" ]; then
         # A recorded-but-unreachable pod is NOT proof the pod is gone — it can
-        # be reaped, mid-reboot, or (the 2026-08-25 incident) a DIFFERENT
-        # process's `up` on this same alias racing this one. Silently deploying
+        # be reaped, mid-reboot, or a DIFFERENT process's `up` on this same
+        # alias racing this one. Silently deploying
         # a second pod here overwrites the local record of whichever pod is
         # real, so the wrong one gets `down`ed later. Refuse instead: the
-        # operator decides, with the recorded pod in front of them.
+        # user decides, with the recorded pod in front of them.
         # `up` takes an ARCH positionally, never a session name — they are
         # only the same string until RP_SESSION overrides it (same reasoning
-        # as the ref-mismatch message above). Naming the SESSION here (as an
-        # earlier version of this message did) reads back as a valid `up`
-        # invocation only when SESSION happens to equal ARCH, and boots the
+        # as the ref-mismatch message above). Naming the SESSION here would
+        # read back as a valid `up` invocation only when SESSION happens to
+        # equal ARCH, and boot the
         # WRONG alias — silently, since `up bare-session-name` is parsed as
         # an arch — whenever RP_SESSION was used to override it.
         SESSION_ENV=""
@@ -908,18 +903,17 @@ case "$CMD" in
     [ $# -gt 0 ] || { echo "run: need a command"; exit 2; }
     require_pod; rp_keep
 
-    # esc-077: refuse a job whose CARGO_TARGET_DIR (TARGET_DIR, resolved at
-    # :562 from --tree) never went through the seed-clone substrate
+    # Refuse a job whose CARGO_TARGET_DIR (TARGET_DIR, resolved above from
+    # --tree) never went through the seed-clone substrate
     # (pod_target_clone.sh, the `target` verb below) — a missing or unmarked
     # target dir means this job would silently pay a full COLD workspace
     # build (~20-40min) instead of the seeded clone's ~80s incremental
-    # build, and nothing else at this launch choke point would notice
-    # (esc-077's own observable: four wave contracts paid this cost
-    # unnoticed). Checked on the POD's filesystem — TARGET_DIR is a remote
+    # build, and nothing else at this launch choke point would notice.
+    # Checked on the POD's filesystem — TARGET_DIR is a remote
     # path — before anything is launched. RP_ALLOW_COLD_TARGET=1 is the
     # SOLE, explicit bypass; `ci/scripts/perf/pod_build_timings.sh`'s own
     # cold-build leg sets it deliberately (see that script's own comment).
-    # Documented residual: this covers only a job launched THROUGH this
+    # Residual: this covers only a job launched THROUGH this
     # verb — a caller who `ssh`es in directly and runs `cargo` by hand
     # bypasses this wrapper entirely (stated in docs/maintainer/
     # pod-build-guide.md and this script's own usage header).
@@ -960,12 +954,10 @@ EOF
       esac
     fi
 
-    # esc-077-class (one-pod-per-wave, WAVE-scoped): refuse a job when this
-    # pod already has a LIVE job for a DIFFERENT WAVE — an operator kept
-    # re-learning this norm from prose alone (the same class esc-077 fixed
-    # for cold builds). Scoped to WAVE, not tree (operator-directed
-    # refinement): a single wave spanning two trees (e.g. a CPU-build
-    # sub-unit and a GPU-test sub-unit sharing the warm seed) is the
+    # One-pod-per-wave, WAVE-scoped: refuse a job when this pod already has
+    # a LIVE job for a DIFFERENT WAVE. Scoped to WAVE, not tree: a single
+    # wave spanning two trees (e.g. a CPU-build job and a GPU-test job
+    # sharing the warm seed) is the
     # SANCTIONED shape and must proceed; two DIFFERENT waves' builds/tests
     # competing for the same pod's CPU/disk/nvcc still produce meaningless
     # timings at best and can corrupt a shared CARGO_TARGET_DIR at worst.
@@ -1014,25 +1006,23 @@ EOF
     # suffices). `$$` + `$RANDOM` alongside the timestamp keeps two `run`s
     # issued in the same wall-clock second from sharing a token.
     RUN_TOKEN="$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM}"
-    # Per-tree job script/log (round-4/5 finding: a global /root/job.sh +
-    # /root/jammi.log meant `run --tree b` clobbered tree a's still-running
-    # job) — `=`-anchored tmux target (M6), `remain-on-exit off` so a job
+    # Per-tree job script/log (a global job script + log would let
+    # `run --tree b` clobber tree a's still-running job) — `=`-anchored tmux
+    # target, `remain-on-exit off` so a job
     # that exits leaves its output visible in `logs`/`attach` rather than the
     # pane vanishing before either can read it.
     #
-    # `--timing`'s own flock acquisition now happens INSIDE the generated
+    # `--timing`'s own flock acquisition happens INSIDE the generated
     # `.jammi-job.sh` (rp_job_wrapper_with_marker_lines, runpod_lib.sh) —
-    # still essentially the first thing the detached pane's own script does
-    # (M6's own reasoning: never in the short-lived ssh invocation that
+    # essentially the first thing the detached pane's own script does
+    # (never in the short-lived ssh invocation that
     # starts tmux and returns immediately, which would release the lock the
     # instant IT exits, not when the real job does) — rather than split
     # across an outer `flock -n -E 75 ... bash job.sh` command line, so a
     # lock refusal and the job's own real exit code can never collide on the
-    # same literal value (round-N audit finding B3). LAUNCH is now the SAME
-    # shape either way: redirection (`>`), not a `| tee` pipe, for BOTH —
-    # the wrapper's own marker write is what wait-job reads now, so there is
-    # no need to preserve `flock`'s outer exit code through the pane's own
-    # command anymore either.
+    # same literal value. The wrapper's own marker write is what wait-job
+    # reads, so nothing depends on preserving an outer exit code through the
+    # pane's own command.
     if [ "$TIMING" = "1" ]; then
       LAUNCH="bash '${TREE_DIR}'/.jammi-job.sh > '${TREE_DIR}'/.jammi.log 2>&1"
     else
@@ -1058,10 +1048,9 @@ EOF
     ;;
 
   wait-seed)
-    # Blocks until the pod's own build-substrate seed reports a verdict — the
-    # fail-open-watcher lesson: an operator's hand-rolled poll loop silently
-    # idled forever whenever SSH dropped, because "no evidence yet" and
-    # "could not check" read as the SAME thing to it. rp_wait_poll (see its
+    # Blocks until the pod's own build-substrate seed reports a verdict — a
+    # poll loop that reads "no evidence yet" and "could not check" as the
+    # SAME thing idles forever whenever SSH drops. rp_wait_poll (see its
     # own doc in runpod_lib.sh) makes them different signals; this script's
     # only job is to name the three states the seed itself can be in.
     require_pod; rp_keep
@@ -1076,8 +1065,8 @@ EOF
     # runpod_lib.sh) — succeeding only on a real rc=0, naming a real job
     # failure and a refused-timing-lock (rc=75) distinctly, and reporting
     # "no evidence this job ever ran" when neither a live session nor a
-    # marker exists (round-N audit finding B3 — see rp_job_wait_script's
-    # own doc for why a bare "does a log file exist" check was not enough).
+    # marker exists (see rp_job_wait_script's own doc for why a bare "does
+    # a log file exist" check is not enough).
     require_pod; rp_keep
     JOB_WAIT_SCRIPT="$(rp_job_wait_script "$TREE_DIR" "$TMUX_SESSION" "$TREE")"
     rp_wait_poll "job(${SESSION}:${TREE})" "$JOB_WAIT_SCRIPT" "$WAIT_INTERVAL_S" "$WAIT_TIMEOUT_S" "$WAIT_MAX_FAIL"
@@ -1086,11 +1075,11 @@ EOF
 
   push)
     require_pod; rp_keep
-    # esc-056: rsync creates only the LAST path component of its own
+    # rsync creates only the LAST path component of its own
     # destination — never a missing PARENT chain. On a fresh pod the very
     # first `push --tree <name>` for a name that has never been pushed
-    # before failed outright ("mkdir ... No such file or directory") since
-    # nothing else on the pod provisions /root/trees itself. A bounded,
+    # before would fail outright ("mkdir ... No such file or directory")
+    # since nothing else on the pod provisions /root/trees itself. A bounded,
     # idempotent remote `mkdir -p` on the tree's parent (rp_push_ensure_parent,
     # runpod_lib.sh — the SAME rp_run_remote primitive every other
     # pod-reaching verb here uses) runs BEFORE the rsync below, on every
@@ -1102,18 +1091,15 @@ EOF
     # exclude set is defined ONCE, in pod_push_stamp.sh, so the real rsync
     # and the stamp's own manifest hash below can never drift apart. cutlass
     # (a submodule) is excluded here too — it is provisioned by `target
-    # --with-cutlass` (never `push` — round-3 audit Class B: an earlier
-    # comment here invented a `push --with-cutlass` flag that has never
-    # existed), never pushed as plain files (an rsync --delete of it would
-    # otherwise delete the pod's own checkout).
+    # --with-cutlass` (`push` has no such flag), never pushed as plain files
+    # (an rsync --delete of it would otherwise delete the pod's own
+    # checkout).
     EXCLUDE_ARGS=()
     while IFS= read -r pat; do
       [ -n "$pat" ] || continue
       EXCLUDE_ARGS+=(--exclude "$pat")
     done < <("$DIR/pod_push_stamp.sh" excludes)
-    # round-6 audit item D (a real, class-shaped failure: "the scripts
-    # assume a git state of the tree that a pushed/provisioned tree does
-    # not have"): `-a` (archive) includes `-o -g` (preserve owner/group)
+    # `-a` (archive) includes `-o -g` (preserve owner/group)
     # — meaningful only when the RECEIVING process can chown, which this
     # one can, since it connects as root@pod. Without `--no-owner
     # --no-group`, the pushed tree's files land OWNED BY THE LAPTOP
@@ -1152,21 +1138,16 @@ EOF
 
   target)
     require_pod; rp_keep
-    # Deployment-gap fix (numerics r2 wave finding, folded into esc-077):
-    # this verb used to run `/root/jammi-ai/ci/scripts/pod_target_clone.sh`
-    # — the POD's own bootstrapped checkout, baked at boot time from
-    # whatever `main` was THEN, which can predate (or simply differ from)
-    # THIS laptop checkout by any number of commits. The esc-077 run-
-    # preflight (rp_target_preflight_lines, THIS checkout's own copy,
-    # always laptop-side) checks for a marker ONLY the matching version of
-    # pod_target_clone.sh knows to stamp — a pod booted before esc-077
-    # landed would clone successfully but stamp NOTHING, and the very next
-    # `run` would then refuse a perfectly legitimate clone. Fixed by
-    # STAGING this checkout's OWN copies of the pod-side scripts `target`
-    # depends on (never executing the pod's bootstrapped copies for this
-    # verb) — version consistency BY CONSTRUCTION, not by hoping the pod
-    # tree happens to be fresh, and immune to the SAME class of drift no
-    # matter which future commit adds the next pod-side behavior a local
+    # This verb STAGES this checkout's OWN copies of the pod-side scripts it
+    # depends on, never executing the pod's bootstrapped copies
+    # (`/root/jammi-ai/ci/scripts/…`, baked at boot time from whatever
+    # `main` was THEN, which can differ from THIS laptop checkout by any
+    # number of commits). `run`'s preflight (rp_target_preflight_lines,
+    # THIS checkout's own copy, always laptop-side) checks for a marker ONLY
+    # the matching version of pod_target_clone.sh knows to stamp; an older
+    # pod-side copy would clone successfully but stamp NOTHING, and the next
+    # `run` would refuse a perfectly legitimate clone. Staging gives version
+    # consistency BY CONSTRUCTION, for every pod-side behavior a local
     # preflight needs to agree with.
     #
     # Four files, not just pod_target_clone.sh itself: it `.`-sources
@@ -1190,8 +1171,8 @@ EOF
       || { echo "::error::target: failed to stage this checkout's own pod-side scripts to ${STAGE_DIR} on the pod"; exit 1; }
     # NAME_TARGET_DIR is the CLONE destination (a CARGO_TARGET_DIR — build
     # OUTPUT), NAME_SOURCE_TREE_DIR is the tree's own SOURCE checkout — two
-    # deliberately DIFFERENT directories (round-2 audit finding 1; see
-    # rp_target_dir's own doc in runpod_lib.sh). `target` clones INTO the
+    # deliberately DIFFERENT directories (see rp_target_dir's own doc in
+    # runpod_lib.sh). `target` clones INTO the
     # former; cutlass (below) is provisioned into the LATTER, since it is
     # C++ source consumed by build.rs, not a build artifact.
     NAME_TARGET_DIR="$(rp_target_dir "$TARGET_NAME")"
@@ -1227,22 +1208,18 @@ EOF
     fi
     rc=$?
     if [ "$rc" -eq 0 ] && [ "$TARGET_WITH_CUTLASS" = "1" ]; then
-      # round-5 audit A1: this logic used to be inlined as heredoc TEXT
-      # right here — the only coverage for it was two `grep`s against that
-      # text (a proxy never run against a real instance; shellcheck cannot
-      # parse a heredoc body either) — and that shape is exactly what let
-      # a `set -e`-vs-bare-command regression (the mismatch-remediation
-      # arm silently becoming dead code) ship undetected. Extracted into
-      # ci/scripts/pod_provision_cutlass.sh, a real file this checkout's
-      # own hermetic suite sources and runs against a genuine two-commit
-      # submodule fixture — see that file's own module doc for the
+      # The provisioning logic lives in ci/scripts/pod_provision_cutlass.sh,
+      # a real file (never inline heredoc TEXT, which neither shellcheck nor
+      # a test can run) that this checkout's own hermetic suite sources and
+      # runs against a genuine two-commit submodule fixture — see that
+      # file's own module doc for the
       # mechanism (source of truth: the tree's own push stamp;
       # provisioning: `cp -a` from /root/jammi-ai's initialised submodule,
       # never `git submodule` inside the tree). `/root/jammi-ai` in the
       # ARGUMENT below (super-dir, the git checkout whose own initialised
-      # cutlass submodule gets copied FROM) is unrelated to the STAGE_DIR
-      # fix above — it names the real submodule content's location, never
-      # a script version.
+      # cutlass submodule gets copied FROM) is unrelated to STAGE_DIR above
+      # — it names the real submodule content's location, never a script
+      # version.
       rp_run_remote <<EOF
 set -uo pipefail
 bash ${STAGE_DIR}/pod_provision_cutlass.sh '${NAME_SOURCE_TREE_DIR}' /root/jammi-ai
@@ -1263,12 +1240,10 @@ EOF
       # still present in the account AND named like one of this tooling's
       # own pods before terminating anything. This is what stops `down`
       # from ending a pod that a race with another `up` on the same alias
-      # silently swapped in underneath this session's record (2026-08-25
-      # incident) — a mismatch refuses rather than acts. The id is
-      # authoritative (RunPod pod ids are globally unique); the TTL never
-      # gates release — see rp_pod_verify's own doc in runpod_lib.sh for why
-      # two earlier attempts to make the TTL part of this check were both
-      # removed rather than patched again.
+      # silently swapped in underneath this session's record — a mismatch
+      # refuses rather than acts. The id is authoritative (RunPod pod ids
+      # are globally unique); the TTL never gates release — see
+      # rp_pod_verify's own doc in runpod_lib.sh for why.
       rp_pod_verify "$RP_POD_ID" >/dev/null
       verify_rc=$?
       if [ "$verify_rc" -eq 0 ]; then
@@ -1297,7 +1272,7 @@ EOF
         # sweep) — the single most common way a session's pod goes away.
         # Nothing is left to release, so this is cleanup, not a refusal:
         # forget the record and say so plainly, rather than leaving it
-        # stuck until an operator remembers `up --replace`.
+        # stuck until someone remembers `up --replace`.
         #
         # This shares rp_pod_verify's underlying assumption (see
         # rp_pod_gone's own doc in runpod_lib.sh, which states it directly):
@@ -1321,14 +1296,11 @@ EOF
         echo "::error::refusing to terminate pod ${RP_POD_ID} for session '${SESSION}' — it did not verify against the account's live pod list (see above)."
         echo "::error::the local session record is KEPT (not forgotten), so this alias still refuses a plain 'up' rather than deploying on top of the ambiguity."
         # `reap` is ACCOUNT-WIDE — it judges EVERY jammi-gpu* pod against its
-        # OWN deadline, never just this one (probed: `reap 1` terminated
-        # unrelated 4h-old pods) — so it is never a per-pod remedy. There is
-        # also no per-pod OVERRIDE remedy any more: an explicit
-        # RP_TTL_HOURS on this invocation was tried and found INERT — the
-        # exact TTL was never part of the check to begin with once
-        # rp_pod_verify moved to id + name shape, so an override had nothing
-        # left to override (round-3 audit, probe d2) — and was removed
-        # rather than left as a promise that does nothing.
+        # OWN deadline, never just this one (`reap 1` terminates unrelated
+        # 4h-old pods) — so it is never a per-pod remedy. There is no
+        # per-pod TTL OVERRIDE remedy either: rp_pod_verify checks id + name
+        # shape, never the exact TTL, so an override has nothing to
+        # override.
         echo "::error::inspect it: $(basename "$0") ls   /   the RunPod console"
         exit 1
       fi

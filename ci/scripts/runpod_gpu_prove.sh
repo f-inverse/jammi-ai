@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 # GPU prove-lane: build jammi from source on a real GPU and run the gated GPU
 # suites — the served client/server proof (grpc_embedding_gpu) and the
-# engine-core correctness suite (gpu_capability). Doubles as the #277 regression
-# gate: builds candle's kernels at THIS LEG'S NATIVE CUDA_COMPUTE_CAP (see
-# NATIVE_COMPUTE_CAP below — overrides the image's baked cap, issue #434) and
+# engine-core correctness suite (gpu_capability). Doubles as the compute-cap
+# floor regression gate: builds candle's kernels at THIS LEG'S NATIVE
+# CUDA_COMPUTE_CAP (see NATIVE_COMPUTE_CAP below — overrides the image's
+# baked cap) and
 # runs them on a real device. Shared deploy/run/teardown lives in runpod_lib.sh.
 #
 # GPU_PROVE_ARCH selects WHICH shipped CUDA arch (crates/jammi-kernels/build.rs
-# GENCODE_ARCHES: sm_80/sm_86/sm_89/sm_90 today) this lane proves; default is
-# today's A100 (sm_80) behavior. The sm_XX -> `rp_deploy_arch` key mapping
+# GENCODE_ARCHES: sm_80/sm_86/sm_89/sm_90) this lane proves; default is
+# A100 (sm_80). The sm_XX -> `rp_deploy_arch` key mapping
 # below is the ONE place that translation lives; `rp_deploy_arch` itself
 # (runpod_lib.sh) is the ONE place the arch key -> actual RunPod GPU-type-id
 # candidate list lives — this script never hand-types a GPU-type-id string.
 #
-# esc-081 (proof surface == shipped surface): every CUDA-bearing cargo
+# Proof surface == shipped surface: every CUDA-bearing cargo
 # invocation below carries a LITERAL `--features` tuple -- never a shell
 # variable -- immediately preceded by a `PROVE_TUPLE crate=<c> kind=<k>
 # features=<literal>` echo, so `check_execution_surface_reachability.py`'s
@@ -23,19 +24,19 @@
 # `ci/release-feature-manifest.json`'s `prove_lane.crates.<c>.kinds`
 # declaration and these invocations (`ci/scripts/prove_surface.py`'s shared
 # canonicalization computes the expected literal for each declared pair).
-# The manifest is still READ at runtime (see the capability-surface-build
+# The manifest is also READ at runtime (see the capability-surface-build
 # group) as a TRIPWIRE ONLY -- comparing manifest-derived features against
 # the literal below and failing loud on drift -- never used to BUILD the
 # `--features` argument itself.
 #
-# esc-080/esc-082/esc-083: `rp_run_remote_watched` (runpod_lib.sh) layers an
+# `rp_run_remote_watched` (runpod_lib.sh) layers an
 # inactivity watchdog on top of the ssh budget; `PROVE_GROUPS` below names
-# the six gating groups this driver's own pass/fail rule reads
+# the gating groups this driver's own pass/fail rule reads
 # `PROVE_GROUP_RC` markers for (`device` and `bench` are NOT members -- see
-# that array's own comment). The `jammi-kernels` clippy lane that used to run
-# here (esc-051, esc-059) has moved entirely to `ci.yml`'s own hermetic
-# `Clippy jammi-kernels --features flash-attn --all-targets` step (nvcc, no
-# GPU needed) -- see `check_lint_surface_closure.py`'s own module doc.
+# that array's own comment). The `jammi-kernels` clippy lane runs in
+# `ci.yml`'s own hermetic `Clippy jammi-kernels --features flash-attn
+# --all-targets` step (nvcc, no GPU needed), not here -- see
+# `check_lint_surface_closure.py`'s own module doc.
 #
 # Exit 0 = suites passed (see the driver rule below for what "passed" means
 # once the bench-cut exception is folded in); 75 = no capacity for the
@@ -50,10 +51,10 @@ RP_TTL_HOURS="${RP_TTL_HOURS:-3}"
 # shellcheck source=ci/scripts/runpod_lib.sh
 source "$DIR/runpod_lib.sh"
 
-# esc-080: the prove lane's own budget, exported HERE ONLY (never in
+# The prove lane's own budget, exported HERE ONLY (never in
 # runpod_lib.sh, whose own `${RP_TIMEOUT:-3000}` default stays 3000s for
-# every OTHER caller -- gpu-dev.sh, runpod_gpu_perf_ab.sh). Two-term backstop
-# (esc-083, lead-amended control): `RP_TIMEOUT >= 1.5 * max healthy wall` AND
+# every OTHER caller -- gpu-dev.sh, runpod_gpu_perf_ab.sh). Two-term backstop:
+# `RP_TIMEOUT >= 1.5 * max healthy wall` AND
 # `RP_TIMEOUT >= max healthy wall + 3 * RP_INACTIVITY` -- the inactivity
 # watchdog is the hang detector, so the backstop only needs to outlast the
 # slowest healthy leg plus a late-detected hang, not a from-scratch multiple
@@ -61,7 +62,7 @@ source "$DIR/runpod_lib.sh"
 # committed healthy artifact on every run. Platform ceiling: with the tag-ref
 # 3-attempt retry budget (`gpu-prove.yml`'s own header), `3 * 80m deploy-
 # worst-case + 2 * 5m overhead + RP_TIMEOUT/60 <= 360m` bounds RP_TIMEOUT
-# well above 6000s, so this value is not yet constrained by the job-timeout
+# well above 6000s, so this value is not constrained by the job-timeout
 # ceiling.
 export RP_TIMEOUT="${RP_TIMEOUT:-6000}"
 
@@ -80,13 +81,13 @@ REMOTE_CHECKOUT_LINES="$(rp_remote_checkout_lines "${GIT_REF}" "${GIT_REPO}")"
 # in the remote build env below: candle-kernels 0.11 builds the quantized
 # fast-path kernels as single-arch SASS (no PTX) from that env var, so every
 # leg building at the image's one baked cap produces kernels that silently
-# cannot launch on the other legs' devices (issue #434). Comment on each line
+# cannot launch on the other legs' devices. Comment on each line
 # names the SASS target the leg proves.
 GPU_PROVE_ARCH="${GPU_PROVE_ARCH:-sm_80}"
 case "$GPU_PROVE_ARCH" in
-  sm_80) RP_DEPLOY_ARCH=a100 NATIVE_COMPUTE_CAP=80 ;; # Ampere floor — proves sm_80, #277.
+  sm_80) RP_DEPLOY_ARCH=a100 NATIVE_COMPUTE_CAP=80 ;; # Ampere floor — proves sm_80.
   sm_86) RP_DEPLOY_ARCH=a40  NATIVE_COMPUTE_CAP=86 ;; # Ampere workstation class — proves sm_86.
-  sm_89) RP_DEPLOY_ARCH=l4_l40s NATIVE_COMPUTE_CAP=89 ;; # Ada — proves sm_89, fp8 #308. L4 first (canonical commodity inference card, ~half L40S rental); L40S is a capacity-only fallback — same sm_89 SASS, identical correctness proof.
+  sm_89) RP_DEPLOY_ARCH=l4_l40s NATIVE_COMPUTE_CAP=89 ;; # Ada — proves sm_89, fp8. L4 first (canonical commodity inference card, ~half L40S rental); L40S is a capacity-only fallback — same sm_89 SASS, identical correctness proof.
   sm_90) RP_DEPLOY_ARCH=h100 NATIVE_COMPUTE_CAP=90 ;; # Hopper — proves sm_90.
   *)
     echo "::error::unknown GPU_PROVE_ARCH '${GPU_PROVE_ARCH}' (want: sm_80|sm_86|sm_89|sm_90)"
@@ -94,10 +95,10 @@ case "$GPU_PROVE_ARCH" in
     ;;
 esac
 
-# esc-081: the six PROOF groups this leg's driver rule below gates on --
+# The six PROOF groups this leg's driver rule below gates on --
 # `::group::` names in the heredoc below, verbatim. `device` and `bench` are
 # NOT members: `device` carries no proof (it is the compute_cap tripwire),
-# and `bench` is deliberately NON-GATING (esc-082) -- a cut/hang inside
+# and `bench` is deliberately NON-GATING -- a cut/hang inside
 # `bench` with every group below still `rc=0` passes the leg (see
 # `rp_prove_verdict` below). A group added to the script without a
 # corresponding entry here (or vice versa) is caught by
@@ -105,9 +106,9 @@ esac
 # sourced-execution guard below so `test_gpu_prove_lane.sh` can `source`
 # this file (RUNPOD_API_KEY/GPU_PROVE_ARCH pre-set, no network/ssh calls
 # made merely by sourcing) and see it, exactly as it sees `rp_prove_verdict`.
-PROVE_GROUPS=(capability-surface-build capability-surface-proof served-client-server-proof engine-core-sweep kernels-default kernels-cuda)
+PROVE_GROUPS=(capability-surface-build capability-surface-proof served-client-server-proof engine-core-sweep engine-lib-cuda kernels-cuda encoders-cuda lora-cuda bench-cuda)
 
-# esc-080/esc-082/esc-083 driver rule (D3/D4): decide a leg's real verdict
+# The driver rule: decide a leg's real verdict
 # from `rp_run_remote_watched`'s own return status (`$1`, taken after ITS OWN
 # final drain to EOF) plus the `PROVE_GROUP_RC`/`PROVE_EXIT` markers actually
 # landed in the log file (`$2`). A plain function (not inlined after the
@@ -127,7 +128,7 @@ rp_prove_verdict() {
   local raw_rc="$1" log="$2"
   declare -A grc_map=()
   local line
-  # `|| [ -n "$line" ]` (BLOCK 3 audit fix): a bare `while IFS= read -r line;
+  # `|| [ -n "$line" ]`: a bare `while IFS= read -r line;
   # do ...; done < "$log"` silently DROPS the log's final line whenever it
   # has no trailing newline (`read` returns non-zero at EOF, which ends the
   # loop BEFORE the body runs for that last read, even though `read` already
@@ -196,8 +197,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 # Sweep before renting anything. This workflow sets cancel-in-progress, so a
 # superseded run is SIGKILLed and never runs its EXIT trap; the pod it had just
 # rented is orphaned. Running the sweep here bounds any such orphan to the gap
-# until the next prove run rather than "until the account empties" — which is
-# what happened on 2026-07-24. A non-zero rc here is pre-run HYGIENE, never
+# until the next prove run rather than "until the account empties". A non-zero rc here is pre-run HYGIENE, never
 # this run's own proof failure (the sweep enumerates and reaps PAST orphans;
 # it has no bearing on whether THIS run's own pod later proves anything) --
 # logged loudly rather than silently discarded so a real "could not
@@ -212,7 +212,7 @@ echo "=== running GPU prove suites on ${RP_HOST}:${RP_PORT} ==="
 LOG="$(mktemp)"
 # RP_WATCH_POLL_S: FIXTURE/DIAGNOSTIC-ONLY escape hatch for
 # rp_run_remote_watched's own poll-interval parameter (default 5s). A real
-# leg never sets it (defaults to 5); test_gpu_prove_lane.sh's F7 sets it to
+# leg never sets it (defaults to 5); test_gpu_prove_lane.sh's fixtures set it to
 # a sub-second value so the REAL executed exit path stays fast and
 # deterministic under its own watchdog scenarios, exactly like every other
 # fixture's own fast-poll argument. Deliberately named OUTSIDE
@@ -222,12 +222,12 @@ LOG="$(mktemp)"
 # flagged.
 rp_run_remote_watched "" "${RP_WATCH_POLL_S:-5}" <<REMOTE | tee "$LOG"
 export CARGO_TERM_COLOR=never
-export CARGO_BUILD_RUSTC_WRAPPER=  # wrapper-off (ledger row 17: no cross-target-dir reuse, ~+33% wall on this image)
+export CARGO_BUILD_RUSTC_WRAPPER=  # wrapper-off (sccache: no cross-target-dir reuse, ~+33% wall on this image)
 # Override the image's baked CUDA_COMPUTE_CAP with this leg's NATIVE arch.
 # candle-kernels 0.11 builds the quantized fast-path as single-arch SASS (no
 # PTX) from this var; leaving the baked cap in place would build every leg's
 # fast kernels for the image's one arch, which silently cannot launch on the
-# other legs' devices (issue #434). The load-time canary (crates/jammi-kernels)
+# other legs' devices. The load-time canary (crates/jammi-kernels)
 # is the shipped-artifact guard for that failure mode; this makes each prove
 # leg build and test its own native arch instead.
 export CUDA_COMPUTE_CAP=${NATIVE_COMPUTE_CAP}
@@ -235,8 +235,8 @@ echo "::group::device"; nvidia-smi --query-gpu=name,compute_cap,driver_version -
 # Hard assertion: nvidia-smi's reported compute_cap (e.g. "8.0") and the
 # NATIVE_COMPUTE_CAP override above (e.g. "80") must name the SAME device --
 # a mismatch here means the rented pod is not the arch this leg thinks it is,
-# and every kernel built below would be silently wrong for it (issue #434's
-# exact failure mode, one layer earlier). nvidia-smi's dotted form is
+# and every kernel built below would be silently wrong for it (the
+# single-arch-SASS failure mode above, one layer earlier). nvidia-smi's dotted form is
 # normalized (dot stripped) before comparing against CUDA_COMPUTE_CAP's bare
 # digit form.
 compute_cap_raw="\$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d '[:space:]')"
@@ -248,7 +248,7 @@ fi
 ${REMOTE_CHECKOUT_LINES}
 echo "PROVE_SHA=\$(git rev-parse HEAD)"
 rc=0
-# The vendored FlashAttention-2 build (\`flash-attn\`, now in the manifest's
+# The vendored FlashAttention-2 build (\`flash-attn\`, in the manifest's
 # cu12-tarball feature list read below) needs the CUTLASS submodule; a plain
 # shallow \`git clone\` above does not fetch submodules.
 git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass \
@@ -256,7 +256,7 @@ git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass \
 
 # capability-surface-build: builds the shipped cu12-tarball server binary and
 # compile-checks the jammi-ai capability-surface test binary. The manifest
-# read below is a TRIPWIRE ONLY (esc-081) -- it never feeds the literal
+# read below is a TRIPWIRE ONLY -- it never feeds the literal
 # \`--features\` arguments the two cargo invocations carry; a divergence
 # between the manifest and the literals fails this group loud rather than
 # silently building a narrower (or wider) surface than the manifest claims.
@@ -300,9 +300,8 @@ cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capa
 echo "PROVE_GROUP_RC name=capability-surface-build rc=\${grc}"
 echo "::endgroup::"
 
-# capability-surface-proof: \`capability_surface\` is delivered by ai-core in
-# a LATER wave of THIS SAME PR (campaign #443) — this group must FAIL LOUD,
-# never silently skip, if that test is absent from this ref: a name filter
+# capability-surface-proof: this group must FAIL LOUD, never silently skip,
+# if \`capability_surface\` is absent from this ref: a name filter
 # that matches zero tests exits 0 ("running 0 tests ... test result: ok"),
 # which would otherwise read as a false-green capability proof.
 echo "::group::capability-surface-proof"
@@ -312,7 +311,7 @@ cap_out="\$(JAMMI_KERNELS_STRICT=1 cargo test -p jammi-ai --features cuda,flash-
 cap_rc=\$?
 echo "\${cap_out}"
 if echo "\${cap_out}" | grep -q "running 0 tests"; then
-  echo "::error::jammi-ai gpu_capability's capability_surface test matched ZERO tests on this ref — ai-core's capability-surface delivery (campaign #443) has not landed here; refusing to read a 0-test run as a pass" >&2
+  echo "::error::jammi-ai gpu_capability's capability_surface test matched ZERO tests on this ref — the capability-surface test is absent here; refusing to read a 0-test run as a pass" >&2
   grc=1
 elif [ "\${cap_rc}" -ne 0 ]; then
   grc=\${cap_rc}
@@ -321,68 +320,107 @@ fi
 echo "PROVE_GROUP_RC name=capability-surface-proof rc=\${grc}"
 echo "::endgroup::"
 
-# served-client-server-proof: the shipped served attention surface (K4) --
-# widened to the FULL jammi-server lane (jetstream-broker/storage-cloud are
-# compile-time-only for this test binary; zero test hits under
-# crates/jammi-server/tests/it*) plus live-gpu-tests, per
-# prove_lane.crates.jammi-server in the manifest.
+# The groups below run only tests that need the GPU: a target that is GPU-only
+# as a whole (\`required-features = ["live-gpu-tests"]\`), or the \`gpu\` module a
+# CPU target keeps its GPU tests in, selected by \`gpu::\`. Every CPU test runs
+# on the hosted CI runners instead. \`ran_tests\` fails a run in which any test
+# binary ran no test: a filter or target that selects nothing proves nothing.
+# \$1 = the cargo exit status; reads the run's log from /tmp/gpu_tests.log.
+ran_tests() {
+  [ "\$1" -eq 0 ] || return "\$1"
+  if ! grep -q 'test result: ok' /tmp/gpu_tests.log || grep -Eq 'test result: ok\. 0 passed' /tmp/gpu_tests.log; then
+    echo "::error::a test binary in this run ran no test" >&2
+    return 1
+  fi
+}
+
+# served-client-server-proof: the shipped served attention surface and the
+# remote-session read-back on the device.
 echo "::group::served-client-server-proof"
 grc=0
 echo "PROVE_TUPLE crate=jammi-server kind=test features=cuda,flash-attn,jetstream-broker,live-gpu-tests,storage-cloud"
-cargo test -p jammi-server --features cuda,flash-attn,jetstream-broker,live-gpu-tests,storage-cloud --test it grpc_embedding_gpu -- --nocapture --test-threads=1 || grc=\$?
+cargo test -p jammi-server --features cuda,flash-attn,jetstream-broker,live-gpu-tests,storage-cloud --test it -- gpu:: --nocapture --test-threads=1 2>&1 | tee /tmp/gpu_tests.log
+ran_tests \${PIPESTATUS[0]} || grc=\$?
 [ "\$grc" -ne 0 ] && rc=\$grc
 echo "PROVE_GROUP_RC name=served-client-server-proof rc=\${grc}"
 echo "::endgroup::"
 
-# engine-core-sweep: \`--skip capability_surface\` -- this generic sweep does
-# not set JAMMI_KERNELS_STRICT=1 (other gpu_capability tests legitimately
-# exercise the FALLBACK admission path, which strict mode would break), but
-# capability_surface.rs's own module doc REQUIRES strict mode and asserts it
-# at the top of the test — a real, fail-closed guard, correctly tripping
-# "wrong mode" here. It is NOT skipped because it is unimportant: the
-# dedicated capability-surface-proof group above already runs it, correctly,
-# under JAMMI_KERNELS_STRICT=1. Never weaken capability_surface's own guard
-# and never set strict mode on this generic sweep to work around it — do the
-# opposite (name-exclude it from the one group that cannot satisfy its
-# precondition). Widened to include flash-attn (prove_lane's jammi-ai \`test\`
-# pair) — this leg now also exercises the shipped flash cascade through the
-# engine-core suite, not only the dedicated capability-surface probe.
+# engine-core-sweep: \`--skip capability_surface\` -- this sweep does not set
+# JAMMI_KERNELS_STRICT=1 (other gpu_capability tests exercise the FALLBACK
+# admission path, which strict mode would break); capability_surface requires
+# strict mode and runs, under it, in capability-surface-proof above.
 echo "::group::engine-core-sweep"
 grc=0
 echo "PROVE_TUPLE crate=jammi-ai kind=test features=cuda,flash-attn,live-gpu-tests"
-cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1 --skip capability_surface || grc=\$?
+cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1 --skip capability_surface 2>&1 | tee /tmp/gpu_tests.log
+ran_tests \${PIPESTATUS[0]} || grc=\$?
 [ "\$grc" -ne 0 ] && rc=\$grc
 echo "PROVE_GROUP_RC name=engine-core-sweep rc=\${grc}"
 echo "::endgroup::"
 
-# kernels-default: jammi-kernels' own lib tests at DEFAULT features (records
-# the x86_64 Linux run this pod is the only artifact for). prove_lane's own
-# \`default\` kind for jammi-kernels -- canonicalizes to no \`--features\` flag
-# at all, so it carries no gated tuple and needs no PROVE_TUPLE echo for
-# \`is_gated\` purposes, but one is still emitted (features=<empty>) so the
-# set-equality rule in check_flash_attn_closure.py has a uniform (crate,
-# kind) -> literal pairing for EVERY declared prove_lane entry, gated or not.
-echo "::group::kernels-default"
+# engine-lib-cuda: jammi-ai's own CUDA-device unit tests.
+echo "::group::engine-lib-cuda"
 grc=0
-echo "PROVE_TUPLE crate=jammi-kernels kind=default features="
-cargo test -p jammi-kernels -- --nocapture --test-threads=1 || grc=\$?
+echo "PROVE_TUPLE crate=jammi-ai kind=test features=cuda,flash-attn,live-gpu-tests"
+cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --lib -- gpu:: --test-threads=1 2>&1 | tee /tmp/gpu_tests.log
+ran_tests \${PIPESTATUS[0]} || grc=\$?
 [ "\$grc" -ne 0 ] && rc=\$grc
-echo "PROVE_GROUP_RC name=kernels-default rc=\${grc}"
+echo "PROVE_GROUP_RC name=engine-lib-cuda rc=\${grc}"
 echo "::endgroup::"
 
-# kernels-cuda: widened to \`cuda,flash-attn\` (prove_lane's jammi-kernels
-# \`test\` pair) -- this pod's GPU is the device the suite needs, and this is
-# now the only lane that can compile \`cuda_parity\`'s flash-gated items and
-# the \`flash_smoke\` target (\`required-features = ["flash-attn"]\`).
+# kernels-cuda: jammi-kernels' device suites, the FlashAttention-2 ones
+# included, then the GPU tests its lib and admission-class oracle keep in
+# \`gpu\` modules.
 echo "::group::kernels-cuda"
 grc=0
-echo "PROVE_TUPLE crate=jammi-kernels kind=test features=cuda,flash-attn"
-cargo test -p jammi-kernels --features cuda,flash-attn -- --nocapture --test-threads=1 || grc=\$?
+echo "PROVE_TUPLE crate=jammi-kernels kind=test features=cuda,flash-attn,live-gpu-tests"
+cargo test -p jammi-kernels --features cuda,flash-attn,live-gpu-tests --test cuda_parity --test flash_smoke --test flash_op_oracles --test flash_torch_parity --test flash_torch_parity_f16 -- --test-threads=1 2>&1 | tee /tmp/gpu_tests.log
+ran_tests \${PIPESTATUS[0]} || grc=\$?
+echo "PROVE_TUPLE crate=jammi-kernels kind=test features=cuda,flash-attn,live-gpu-tests"
+cargo test -p jammi-kernels --features cuda,flash-attn,live-gpu-tests --lib --test empty_non_contiguous_admission_class_oracle -- gpu:: --test-threads=1 2>&1 | tee /tmp/gpu_tests.log
+ran_tests \${PIPESTATUS[0]} || grc=\$?
 [ "\$grc" -ne 0 ] && rc=\$grc
 echo "PROVE_GROUP_RC name=kernels-cuda rc=\${grc}"
 echo "::endgroup::"
 
-# bench: recorded observability, deliberately NON-GATING (esc-082) -- \`bench_rc\`
+# encoders-cuda: the encoder device tests. One asserts exact-arch arithmetic
+# and names sm89 (whose bf16 GEMM reassociates) as a device it cannot run on;
+# the sm89 leg excludes it by name.
+echo "::group::encoders-cuda"
+grc=0
+encoders_skip=()
+[ "\${CUDA_COMPUTE_CAP}" = 89 ] && encoders_skip=(--skip pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda)
+echo "PROVE_TUPLE crate=jammi-encoders kind=test features=cuda,flash-attn,live-gpu-tests"
+cargo test -p jammi-encoders --features cuda,flash-attn,live-gpu-tests --lib --test it -- gpu:: --test-threads=1 "\${encoders_skip[@]}" 2>&1 | tee /tmp/gpu_tests.log
+ran_tests \${PIPESTATUS[0]} || grc=\$?
+echo "PROVE_TUPLE crate=jammi-encoders kind=test features=cuda,flash-attn,live-gpu-tests"
+cargo test -p jammi-encoders --features cuda,flash-attn,live-gpu-tests --test eager_training_memory -- --test-threads=1 2>&1 | tee /tmp/gpu_tests.log
+ran_tests \${PIPESTATUS[0]} || grc=\$?
+[ "\$grc" -ne 0 ] && rc=\$grc
+echo "PROVE_GROUP_RC name=encoders-cuda rc=\${grc}"
+echo "::endgroup::"
+
+# lora-cuda: the fused LoRA epilogue against the PEFT reference on the device.
+echo "::group::lora-cuda"
+grc=0
+echo "PROVE_TUPLE crate=jammi-lora kind=test features=cuda,live-gpu-tests"
+cargo test -p jammi-lora --features cuda,live-gpu-tests --test epilogue_peft_rounding -- --test-threads=1 2>&1 | tee /tmp/gpu_tests.log
+ran_tests \${PIPESTATUS[0]} || grc=\$?
+[ "\$grc" -ne 0 ] && rc=\$grc
+echo "PROVE_GROUP_RC name=lora-cuda rc=\${grc}"
+echo "::endgroup::"
+
+# bench-cuda: the harness's padded fine-tune step on the device.
+echo "::group::bench-cuda"
+grc=0
+echo "PROVE_TUPLE crate=jammi-bench kind=test features=cuda,flash-attn,live-gpu-tests"
+cargo test -p jammi-bench --features cuda,flash-attn,live-gpu-tests --test finetune_step_padded_cuda -- --test-threads=1 2>&1 | tee /tmp/gpu_tests.log
+ran_tests \${PIPESTATUS[0]} || grc=\$?
+[ "\$grc" -ne 0 ] && rc=\$grc
+echo "PROVE_GROUP_RC name=bench-cuda rc=\${grc}"
+echo "::endgroup::"
+
+# bench: recorded observability, deliberately NON-GATING -- \`bench_rc\`
 # never touches \`rc\`, and this group runs LAST so a cut/hang here, with every
 # group above already at rc=0, never blocks the leg (see the driver rule in
 # runpod_gpu_prove.sh, after this heredoc). Widened to \`cuda,flash-attn\`

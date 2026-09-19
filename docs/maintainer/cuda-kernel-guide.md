@@ -60,53 +60,52 @@ Fixes, in the order that usually pays:
 
 ## 3. The oracles — a fused kernel is not believed until these pass
 
-Ordered by how much pain each one has already saved. Every claim below is from a real escape.
+Every rule below is grounded in a real defect that got past green tests.
 
 **The kernel-acceptance-oracle standard.** An oracle is not evidence because it exists; it is
 evidence only if it (a) genuinely ran (never silently skipped in a way that still reports green),
 (b) checks every bound it claims to check, (c) grounds every number and every floor it asserts
 against in a real producer, (d) was validated out-of-sample of wherever it was calibrated, and (e)
 demonstrates — not merely asserts — real separation between healthy noise and the defect it exists
-to catch. The eight rules below (`KO-1` through `KO-8`) are the standing checklist an auditor runs
-over any oracle, novel or not; four of them (`KO-2`, `KO-3`, `KO-5`, `KO-7`) are mechanically
-enforced today by `ci/scripts/check_kernel_oracles.py` / `ci/scripts/check_cuda_run_artifacts.py`
-(KO-3, optional per artifact); the remaining four (`KO-1`, `KO-4`, `KO-6`, `KO-8`) require running
-code or human judgment a static scan cannot make and stay auditor-only. Each mechanical id below is an INSTANCE of one of the numbered rules 3.1-3.9 that
+to catch. The eight rules below (`KO-1` through `KO-8`) are the standing checklist a reviewer runs
+over any oracle, novel or not. `KO-7` holds by construction: a GPU test is compiled only under
+a `live-*` feature and acquires its device through `jammi-test-resources`, which cannot return
+"no device", so an unrun oracle cannot report green. `KO-3` is checked per artifact by
+`ci/scripts/check_cuda_run_artifacts.py`. The rest need running code or judgment and are held
+in review. Each id below is an INSTANCE of one of the numbered rules 3.1-3.9 that
 follow — tagged inline — never a parallel standard: the checklist and the numbered rules are the
 same discipline read two ways, not two disciplines.
 
-<!-- BEGIN KERNEL-ORACLE-STANDARD-IDS -->
-- `KO-1` — producer-injected controls (auditor-only; generalizes 3.6)
-- `KO-2` — bound coverage parity (mechanical; instances 3.7)
-- `KO-3` — separation in the artifact (mechanical, optional per artifact leg; instances 3.8)
-- `KO-4` — floors cite a producer (auditor-only; generalizes 3.9)
-- `KO-5` — off-sample bounds (mechanical, marker-scoped; instances 3.2)
-- `KO-6` — live signal (auditor-only; generalizes 3.5)
-- `KO-7` — unrun-is-RED (mechanical, total over every scanned file; instances 3.5)
-- `KO-8` — independent reference (auditor-only; generalizes 3.1 and 3.3)
-<!-- END KERNEL-ORACLE-STANDARD-IDS -->
+- `KO-1` — producer-injected controls (review; generalizes 3.6)
+- `KO-2` — bound coverage parity (review; instances 3.7)
+- `KO-3` — separation in the artifact (checked per artifact leg; instances 3.8)
+- `KO-4` — floors cite a producer (review; generalizes 3.9)
+- `KO-5` — off-sample bounds (review; instances 3.2)
+- `KO-6` — live signal (review; generalizes 3.5)
+- `KO-7` — unrun-is-RED (by construction; instances 3.5)
+- `KO-8` — independent reference (review; generalizes 3.1 and 3.3)
 
 `KO-1` (producer-injected controls) is not mechanical because whether a RED control's failure is
 CAUSALLY the specific defect under test, rather than some unrelated red result, is a semantic
-judgment about what a perturbation means — the same discipline esc-046's leg 3 states ("a
-deliberately mis-ordered reference MUST read GREEN pre-fix and RED post-fix") but verifying the
-perturbation is the real one, not a stand-in, needs a human (or `fix-verifier`) reading the diff.
+judgment about what a perturbation means — the same discipline as a deliberately mis-ordered
+reference that MUST read GREEN before a rounding fix and RED after it — but verifying the
+perturbation is the real one, not a stand-in, needs a human reading the diff.
 
 `KO-6` (live signal) is not mechanical because "this value is genuinely nonzero at runtime, not
-zeroed/detached/short-circuited" (esc-045's `||g_f32|| > 0` signal clause) can only be known by
+zeroed/detached/short-circuited" (a gradient oracle's `||g_f32|| > 0` signal clause) can only be known by
 executing the oracle — a static scan cannot evaluate a tensor norm.
 
 `KO-8` (independent reference) is not mechanical because "the reference computation does not share
-the arm-under-test's own bug" (esc-044's root cause: an eager reference rebuilt in the test body,
-GREEN under revert BY CONSTRUCTION) requires reading the reference's provenance against upstream
-truth (PyTorch/HF/PEFT at source, never this repo's own prior belief about them) — exactly the
-`validate-kernel-semantics-at-aten-source` discipline, which is a research act, not a grep.
+the arm-under-test's own bug" (an eager reference rebuilt in the test body is GREEN under revert
+BY CONSTRUCTION) requires reading the reference's provenance against upstream
+truth (PyTorch/HF/PEFT at source, never this repo's own prior belief about them) — validating
+kernel semantics at ATen source is a research act, not a grep.
 
-**Pressure-test design rule: a metric is inadmissible until its own noise floor is measured.** A
+**Design rule: a metric is inadmissible until its own noise floor is measured.** A
 bound is not "the fused arm agrees with the reference" in the abstract; it is only meaningful
 relative to how much the EXTERNAL reference stack itself disagrees with ITS OWN higher-precision
 version, at the SAME operating point (same shape, same seed, same dtype) — never a constant pulled
-from a different run or a different amplitude. esc-045's backward budget is the working instance:
+from a different run or a different amplitude. The bf16 gradient-fidelity budget is the working instance:
 `mean_cos(jammi bf16, jammi f32) >= mean_cos(torch bf16, torch f32) minus the same run's own noise
 leg (torch bf16-eager vs bf16-sdpa)` — the reference stack's (torch's) own bf16-vs-f32 spread, on
 the identical fixture, IS the budget; a hand-picked absolute constant would be unfalsifiable (there
@@ -114,7 +113,7 @@ would be no way to tell "the fused kernel is worse" from "bf16 is just noisy at 
 Until that external-stack spread is measured at the operating point, the metric has no basis for a
 pass/fail line at all.
 
-**3.1 Match the eager reference's GEMM OPERAND FORM, not just its maths (esc-044). [`KO-8`]
+**3.1 Match the eager reference's GEMM OPERAND FORM, not just its maths. [`KO-8`]
 candle's own `Op::Matmul` backward differentiates through transposed **views**
 (`grad.matmul(&rhs.t())`); both candle's CPU `gemm` and cuBLAS pick packing/blocking/split-k from
 operand STRIDES. A fused bwd that materialises `pᵀ`/`vᵀ`/`dsᵀ` with `.contiguous()` issues a
@@ -125,7 +124,7 @@ each GEMM is issued, called by both arms; assert the `(rows, cols, row_stride, c
 operand, captured FROM the op, never rebuilt in the test body.
 
 **3.2 A compounding defect is invisible at one call — key the oracle on GROWTH. [`KO-5`]**
-esc-044's single-layer divergence was ~2e-3 relative, INSIDE the bf16 bound, and reached O(1) over 28
+The operand-form defect's single-layer divergence was ~2e-3 relative, INSIDE the bf16 bound, and reached O(1) over 28
 layers. So assert `r(L) = Σ|fused−eager| / Σ|eager|` over an L-deep stack against **the same run's own
 r(1)** — `r(L_max) <= C · max(r(1), measured_floor)`, C small. Never against an absolute ULP constant.
 
@@ -158,7 +157,7 @@ element the allowance of the largest and hides exactly the divergence you are hu
 
 **3.9 No number without a producer. [`KO-4`]** A doc comment or `assert!` message that states a
 precise-looking measurement — a mismatch count (`5145/16384`), a percentage (`26% of elements`), a
-bare cosine (`0.796`) — reads as evidence, so a reader (or a fix agent citing it as ground truth)
+bare cosine (`0.796`) — reads as evidence, so a reader (or a later change citing it as ground truth)
 must be able to re-derive or re-locate it: cite the real producer inline, `see <test_fn>` /
 `printed by <test_fn>` (a real function, grep-verifiable) or `measured by <artifact path>` (a
 tracked file), or tag it `no-producer: <reason>` when the number is genuinely *derived*, not
@@ -175,8 +174,7 @@ F32 internally and round once on the way out; others compute dtype-native (in th
 constant, `no-producer: derived from f16's 10-bit mantissa`) tolerance would be either too loose
 (hiding a real divergence in an op that should be f32-accumulate-exact) or meaningless (an op that
 genuinely rounds mid-loop needs a *behavioral* boundary oracle, not a tolerance at all — see
-`docs/maintainer/cuda-kernel-guide.md` §3's KO-8 and the f16 boundary-contract doctrine in D4 of
-campaign #443's numerics contract). Every row below states: (a) the eager reference's regime
+§3's KO-8). Every row below states: (a) the eager reference's regime
 (`f32-internal` = upcasts to F32, computes, rounds back once; `dtype-native` = computes in the
 tensor's own 16-bit type at the stated step, matching what candle's un-fused ops would do), (b) the
 rounding-POINT count (how many times a value crosses a 16-bit rounding boundary), and (c) whether
@@ -190,7 +188,7 @@ the op has a CPU F16 reference arm today, and what backs it.
 | `gelu_erf` (`GeluErfFused`/`GeluErfBwdDx`) | dtype-native on CUDA, deliberately reproducing candle-kernels' OWN `ugelu_erf_{bf16,f16}` bit-for-bit (`normcdff`-based, NOT the `erff`-based formula `geglu` tracks — see `crates/jammi-kernels/src/ops/gelu_erf.rs`'s module doc, "three cdf formulations"): the CDF rounds to the 16-bit dtype first, then the (already-16-bit) activation multiplies the (already-16-bit) input natively (`__hmul`) — bit-identical to candle's own eager CUDA dispatch, `tests/cuda_parity.rs` asserts `==`. Backward is f32-accumulate, round once (this crate's usual convention). | 2 fwd (round the CDF, round the `__hmul` product); 1 bwd (final cast) | **None, deliberately** — a DIFFERENT reason from `attention_block`'s BF16-matmul gap below: candle's OWN CPU BF16/F16 `GeluErf` arms compute in **f64** (`op.rs`), a THIRD formulation neither this op's CPU F32 arm (which tracks candle's CPU F32 `erf_f32` polynomial) nor its CUDA arm (which tracks candle's CUDA `normcdff` intrinsic) reproduces — admitting CPU BF16/F16 here would silently diverge from `Tensor::gelu_erf()?` in a way this op's "track candle bit-for-bit" contract cannot honor without a THIRD CPU code path solely to reproduce an f64 detour. `jammi-encoders`' admission predicate treats CPU BF16/F16 as a counted eager fallback. |
 | `rope`/`rope_positions` (`RopeFused`/`RopePositionsFused`) | f32-internal (accumulate in f32, matching `layer_norm`'s BF16 arms and the CUDA kernel) | 1 (final cast) | **Present** — `rope_fwd_row_f16`/`rope_fwd_f16` (`ops/rope.rs`), `rope_positions_fwd_f16` (`ops/rope_positions.rs`) |
 | `dropout` | dtype-independent decision (Philox mask is a pure function of position, not value) + f32-internal scale multiply on a KEPT element | 1 (KEPT element only; a DROPPED element is exact zero, no rounding) | **Present** — `dropout_f16`, `crates/jammi-kernels/src/ops/dropout.rs` (Metal host-fallback arm deliberately NOT widened — out of this campaign's CUDA-only scope) |
-| `scaled_cast_add` (`ScaledCastAdd`) | f32-internal (esc-046 fix: widen `base` to f32, add the already-f32 scaled `lora`, round the sum once — matches PEFT's own promote-add-cast-once model) | 1 | **Present** — `scaled_cast_add_f16_f32`/`scaled_cast_add_f32_f16`/`scaled_cast_add_f16_f16`, `crates/jammi-kernels/src/ops/scaled_cast_add.rs` (mirrors the existing 4-combo F32/BF16 matrix with 3 new F16 combos) |
+| `scaled_cast_add` (`ScaledCastAdd`) | f32-internal (widen `base` to f32, add the already-f32 scaled `lora`, round the sum once — matches PEFT's own promote-add-cast-once model) | 1 | **Present** — `scaled_cast_add_f16_f32`/`scaled_cast_add_f32_f16`/`scaled_cast_add_f16_f16`, `crates/jammi-kernels/src/ops/scaled_cast_add.rs` (mirrors the existing 4-combo F32/BF16 matrix with 3 new F16 combos) |
 | `cast_scale`/`cast_add` (`CastScaleBf16F32`/`CastAddBf16`; F16: `CastScaleF16F32`/`CastAddF16`) | N/A — **each type is structurally dtype-monomorphic, not dtype-generic** | N/A | **Present, as a SEPARATE pair of types** — `CastScaleF16F32` (`crates/jammi-kernels/src/ops/cast_scale.rs`) and `CastAddF16` (`crates/jammi-kernels/src/ops/cast_scale.rs`), each with its own CPU arm and its own CUDA arm in `cast_scale_f16.cu` (`crates/jammi-kernels/src/cuda/cast_scale_f16.cu`). They are not match arms on the BF16 types: those are domain-restricted to BF16 by construction (`CastScaleBf16F32`'s own doc: "this op's domain is BF16-only rather than accepting F32 too — nothing to fuse there"), so the F16 analogs carry their own double-rounding-safety argument at F16's 11-bit significand (`24 >= 2*11+2` holds with EQUALITY — at the boundary, not far past it the way BF16's margin is; each type's doc states this explicitly rather than inheriting BF16's). `low_rank_residual_linear`'s F16 backward admits both, once for the upcast `dy` and once for the F16 arm itself — `admit_cast_boundary` (`crates/jammi-kernels/src/ops/low_rank_residual_linear.rs`) and `admit_cast_boundary` (`crates/jammi-kernels/src/ops/low_rank_residual_linear.rs`), and both are pinned bit-identical to the eager two-kernel chain by `cast_scale_f16_bit_identical_to_the_eager_two_kernel_chain_on_cuda_across_scales` (`crates/jammi-kernels/tests/cuda_parity.rs`) and `cast_add_f16_bit_identical_to_the_eager_two_kernel_chain_on_cuda_with_red_control` (`crates/jammi-kernels/tests/cuda_parity.rs`) — cited by TEST NAME first, line second: a line number alone rots the moment a neighbouring test is added or deleted, a name does not. |
 | `attention_block` (`AttentionBlockFused`) | f32-only on CPU by a **real, disclosed candle limitation for BF16** (candle-core 0.11's CPU backend has no BF16 `MatMul` impl) — **but this limitation does NOT extend to F16**: `candle-core-0.11.0/src/cpu_backend/mod.rs`'s `MatMul::f` accepts `DType::F16 \| F32 \| F64` (the `gemm` crate ships a real `gemm-f16` backend, confirmed present in this workspace's own dependency tree), so an F16 CPU matmul arm is architecturally possible where a BF16 one never was. Rounding regime unstated (`f32 accumulate throughout` per the module doc's own F32-only CPU domain — an F16 arm would need to decide de novo whether QK^T/PV GEMMs run in f16-native or f32-accumulated precision, i.e. this is a fresh design decision, not a mechanical copy) | N/A (none designed) | **None.** The CPU forward matches only `(CpuStorage::F32(qkv), CpuStorage::F32(mask))` (`crates/jammi-kernels/src/ops/attention_block.rs`) — a ~500-line monomorphic `attention_fwd_f32` with its own `AttentionFwdF32Params` struct, RoPE-packing, mask-broadcast, and paired `bwd_core`/gradient-GEMM-layout machinery. An F16 arm is a second monomorphic forward, not a match-arm extension, and would have to decide de novo whether the QK^T/PV GEMMs run f16-native or f32-accumulated. |
 | `mem_efficient_attention` (`MemEfficientAttentionFused`) | Same F32-only-CPU-by-BF16-matmul-limitation shape as `attention_block`; F16 matmul is architecturally possible for the same `gemm-f16` reason above | N/A (none designed) | **None.** Same shape as `attention_block`: the CPU forward matches only `(CpuStorage::F32(qkv), CpuStorage::F32(mask))` (`crates/jammi-kernels/src/ops/mem_efficient_attention.rs`), a chunked/flash-style forward of ~2900 lines with its own GEMM-layout oracle machinery. |
@@ -211,7 +209,7 @@ matmul gap.
 
 The `Rounding points` column above answers "how many times does a value cross a 16-bit rounding
 boundary". It does **not** answer "how far apart may two correct arms of this op land", and reading
-it as if it did is what produced both of campaign #446's f16 bound findings. The count is only the
+it as if it did produces wrong f16 parity bounds. The count is only the
 *local* allowance; a rounding point also **propagates** whenever its result is afterwards
 multiplied, or is consumed by a later step whose own condition number is large. Two rules,
 each with a live instance in `crates/jammi-kernels/tests/cuda_parity.rs`:
@@ -264,12 +262,12 @@ to guess.
 The distinction is load-bearing when reading a capability report: an internal sub-kernel
 is neither "unreachable" nor "independently admitted" — it runs exactly when its parent
 does. Wiring a real `admit()` call site (or an admitted parent that launches it) is what
-moves an op between these rows, in the same unit as that code edit.
+moves an op between these rows, in the same change as that code edit.
 
 There is no third, compiled-only status, and a kernel that would need one does not stay.
 A kernel with no `admit()` site and no admitted parent has no row here and no manifest
 category: the only thing a shipped build says about it is that it compiled, which no
-capability report can act on. Such a kernel is wired or deleted in the same unit as its
+capability report can act on. Such a kernel is wired or deleted in the same change as its
 authoring, decided by measuring its share of shipped-leg GPU time against a threshold
 fixed before the numbers are seen — see
 `crates/jammi-kernels/artifacts/cuda-runs/2026-09-01-axpy-census-bdeb80c-a100-pcie.json`,
@@ -285,7 +283,7 @@ because it was a small share of runtime. An isolated number alone is not a resul
 * End-to-end: `jammi-bench finetune-step` with the dispatch counters, against the same box's torch
   reference. Compare `s_per_step_p50` and `peak_vram_bytes`.
 * Profile with `nsys` and difference two step counts (N=5 vs N=10) to isolate per-step work.
-* Commit the artifact under `crates/jammi-kernels/artifacts/cuda-runs/<date>-<unit>-<sha7>-<gpu>.json`
+* Commit the artifact under `crates/jammi-kernels/artifacts/cuda-runs/<date>-<name>-<sha7>-<gpu>.json`
   carrying the **git_sha of the tip it measured**. A green artifact whose sha is not an ancestor of
   the branch is evidence about the ORACLE, not the code.
 * After a squash merge of a branch carrying green artifacts, the merger stamps `merged_as`/

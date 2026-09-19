@@ -201,17 +201,14 @@ pub(crate) struct Row {
 /// sha256 (hex) content hash of the RESOLVED corpus this `(corpus_seed,
 /// row_count)` pair ACTUALLY produces — [`build_corpus`]'s own OUTPUT row
 /// texts (in row order), never the raw `(SENTENCES, corpus_seed, row_count)`
-/// INPUTS independently re-derived (round-2 adversarial audit F4: an earlier
-/// version of this function hashed the whole [`SENTENCES`] array plus the two
-/// scalar inputs directly, WITHOUT ever calling [`build_corpus`] itself — a
-/// bug that changed the SELECTION/ROTATION rule (e.g. the audit's own cited
-/// example: `% 4` in place of the real `% SENTENCES.len()`) would silently
-/// produce a DIFFERENT resolved corpus while this function kept reporting the
-/// SAME digest, since the digest never depended on the selection ALGORITHM at
-/// all, only on its raw inputs — structurally blind to exactly the class of
-/// bug this identity field exists to catch). Exists so
-/// `GpuInferenceTier::corpus_sha256` (issue #335's within-run A/B identity
-/// contract, round-1 adversarial audit B1) has a single content hash
+/// INPUTS independently re-derived (hashing the whole [`SENTENCES`] array
+/// plus the two scalar inputs directly, WITHOUT calling [`build_corpus`]
+/// itself, would miss a bug that changed the SELECTION/ROTATION rule — e.g.
+/// `% 4` in place of the real `% SENTENCES.len()` — which produces a
+/// DIFFERENT resolved corpus under the SAME raw inputs: structurally blind
+/// to exactly the class of bug this identity field exists to catch). Exists so
+/// `GpuInferenceTier::corpus_sha256` (the within-run A/B identity
+/// contract) has a single content hash
 /// standing in for "the corpus this leg SERVED came from the same generator,
 /// via the same selection logic" — the same belt-and-suspenders role
 /// `checkpoint_*_sha256` plays for a model bundle: `corpus_seed`/`row_count`
@@ -223,8 +220,8 @@ pub(crate) struct Row {
 /// `u64` in [`corpus_sha256_of_rows`] below, but [`Row`]/[`build_corpus`]
 /// themselves are written in terms of `usize`-indexed Rust collections, so
 /// this function makes no cross-architecture (32-bit vs 64-bit) guarantee —
-/// not a live concern for the within-run A/B comparator this field backs
-/// (issue #335), which always compares two legs built/run on the SAME pod,
+/// not a live concern for the within-run A/B comparator this field backs,
+/// which always compares two legs built/run on the SAME pod,
 /// but disclosed here honestly rather than silently assumed.
 pub(crate) fn corpus_sha256(corpus_seed: u64, row_count: usize) -> String {
     let spec = ModelInferenceSpec {
@@ -300,8 +297,8 @@ async fn corpus_session(
 /// — so a requested CUDA ordinal that the box cannot actually satisfy fails
 /// loud with a typed `JammiError::Gpu` at the FIRST model load
 /// (`CandleBackend::load`'s `select_device(device_config)?`), rather than
-/// silently degrading to `Device::Cpu` with only a `tracing::warn!` (unit-62
-/// audit round-4 F-C: a `--cuda N` leg must never be able to publish
+/// silently degrading to `Device::Cpu` with only a `tracing::warn!` (a
+/// `--cuda N` leg must never be able to publish
 /// `device_requested:"cuda:N"` + a real `device_name` for a run that actually
 /// executed on CPU). The `gpu_device = -1` CPU-hermetic default is untouched
 /// (`require_gpu` computes to `false`, and `select_device` selects
@@ -763,20 +760,18 @@ mod tests {
         );
     }
 
-    /// round-2 adversarial audit F4: the teeth this test replaces (a
-    /// hand-computed hash over a manually-perturbed sentence array,
-    /// entirely bypassing `corpus_sha256`'s own real selection logic) was
-    /// STRUCTURALLY BLIND to the class of bug this identity field actually
+    /// A hand-computed hash over a manually-perturbed sentence array,
+    /// entirely bypassing `corpus_sha256`'s own real selection logic, would
+    /// be STRUCTURALLY BLIND to the class of bug this identity field actually
     /// exists to catch — a changed SELECTION/ROTATION RULE, not merely a
     /// changed byte layout at the same selected indices. This constructs
     /// an ALTERNATIVE resolved corpus using a DELIBERATELY WRONG rotation
-    /// formula (`% 4` in place of the real `% SENTENCES.len()` == `% 8` —
-    /// the audit's own cited failure shape) and proves the REAL
+    /// formula (`% 4` in place of the real `% SENTENCES.len()` == `% 8`)
+    /// and proves the REAL
     /// `corpus_sha256_of_rows` primitive discriminates between the two: if
     /// some FUTURE bug in `build_corpus`'s own selection formula silently
     /// changed which sentence a row index draws, this digest would move
-    /// for the SAME `(corpus_seed, row_count)` input — no longer
-    /// structurally blind to it.
+    /// for the SAME `(corpus_seed, row_count)` input.
     #[test]
     fn corpus_sha256_reacts_to_a_changed_selection_rule_not_just_a_changed_byte_layout() {
         let corpus_seed = 0u64;
@@ -902,7 +897,7 @@ mod tests {
         );
     }
 
-    /// The teeth, GATE-FAILS direction for the EMBED verb (RC1: an assertion must
+    /// The teeth, GATE-FAILS direction for the EMBED verb (an assertion must
     /// be able to fail). Serving the *classifier* bundle through the embed verb
     /// produces a different embedding (a different model, different weights and
     /// hidden geometry), so the embed digest moves off the IN-PROCESS baseline (the
@@ -952,7 +947,7 @@ mod tests {
     }
 
     /// The committed serving baselines gate with teeth: a run at the baseline
-    /// clears the gate, a run past the threshold fails it (RC1). Asserts the
+    /// clears the gate, a run past the threshold fails it. Asserts the
     /// committed baselines are well-formed, generously-thresholded same-box
     /// references — the coarse code-path net, not the full-scale SLO.
     #[test]

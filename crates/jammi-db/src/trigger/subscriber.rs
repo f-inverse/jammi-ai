@@ -201,11 +201,10 @@ impl Subscriber {
             // arms') enforce `from_offset` as a genuine lower bound even
             // when nothing was replayed: `from_offset(N)` with an empty
             // window can only admit an offset `> floor == N - 1`, i.e.
-            // `>= N`, never anything below it (the bug this seeding closes —
-            // previously `last_replayed.or(watermark)` alone left this
-            // `None` for exactly that case, so the FIRST live event was
-            // admitted regardless of `from_offset`, and a subsequent lag
-            // reseeded lag-replay from `-1`, the entire backing table).
+            // `>= N`, never anything below it. `last_replayed.or(watermark)`
+            // alone is `None` in exactly that case, which would admit the
+            // FIRST live event regardless of `from_offset` and reseed a
+            // later lag-replay from `-1`, the entire backing table.
             let mut last_yielded = last_replayed.or(floor).or(watermark);
             for delivered in replay_delivered {
                 yield delivered;

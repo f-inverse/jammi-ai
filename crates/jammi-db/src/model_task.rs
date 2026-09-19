@@ -33,7 +33,7 @@ pub enum ModelTask {
     /// `(mean, std)` or a set of quantiles — rather than a point. The
     /// distributional decoder ([`DistributionAdapter`](../../jammi-ai/inference/adapter/distribution.rs))
     /// and the proper-scoring objectives (NLL/CRPS/pinball) train and serve it.
-    /// Unlike S9's similarity edge — a *derivation* over embeddings that earned
+    /// Unlike a similarity edge — a *derivation* over embeddings, which has
     /// no variant — this is a genuine model output type, so it belongs in
     /// [`Self::ALL`] and the resolution path.
     Regression,

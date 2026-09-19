@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Hermetic `AB_DRY_RUN=1` smoke test for `finetune_ab.sh` itself — mirrors
-`test_gpu_inference_ab_sh_dry_run.py`'s own "the shell PRODUCER itself had
-ZERO automated execution" doctrine, applied here to the F5 (empty
-`--expect-kernels-disabled` on both fused legs) and F2 (the
-`TWO_RUN_PROTOCOL_MARKER` file) fold-ins specifically — neither is
+`test_gpu_inference_ab_sh_dry_run.py`'s own "the shell PRODUCER itself must
+be executed, not only its merge stage" doctrine, applied here to the empty
+`--expect-kernels-disabled` on both fused legs and the
+`TWO_RUN_PROTOCOL_MARKER` file specifically — neither is
 observable from `ab_merge.py`'s own test suite alone, since that suite
 drives fixture `raw_dir`s directly and never invokes the shell script's
 own argv construction.
@@ -50,20 +50,15 @@ def run_dry(out_dir, extra_env=None):
 
 
 class DryRunSmokeTests(unittest.TestCase):
-    """`closes_escape: esc-067-committed-producer-never-executed-end-to-end`
-    — real pod runs of the committed `finetune_ab.sh` found three defects
-    (a provenance check ordered after a now-removed ref-switch, the
-    f32/f64 `lora_dropout` mismatch, and a build missing the flash
-    feature the acceptance artifact measures) that no hermetic suite had
-    ever exercised because nothing ever ran this script's own control
-    flow end-to-end before landing it. This class is the CI-safe,
-    hardware-free half of that fix's own eval: it drives the REAL
-    subprocess through its REAL argv construction, build-once ordering,
-    and `TWO_RUN_PROTOCOL_MARKER` write, under `AB_DRY_RUN=1` so it needs
-    no GPU/network/build. It proves the SCRIPT's control flow is correct;
-    it does NOT by itself prove the producer completes on real hardware —
-    see this escape row's own `symptom_spec.control` for the residual
-    (closes fully only once a real pod run joins a recurring lane).
+    """Defects in this script's own control flow (a provenance check
+    ordered wrong relative to the build, a build missing the flash feature
+    the sweep measures) are invisible to every suite that does not run the
+    script end-to-end. This class is the CI-safe, hardware-free check: it
+    drives the REAL subprocess through its REAL argv construction,
+    build-once ordering, and `TWO_RUN_PROTOCOL_MARKER` write, under
+    `AB_DRY_RUN=1` so it needs no GPU/network/build. It proves the
+    SCRIPT's control flow is correct; it does NOT prove the producer
+    completes on real hardware — only a real pod run does.
     """
 
     def test_dry_run_runs_end_to_end_and_exits_zero(self):
@@ -81,7 +76,7 @@ class DryRunSmokeTests(unittest.TestCase):
             self.assertTrue(report["configs"])
 
     def test_two_run_protocol_marker_is_written_before_any_leg_runs(self):
-        """F2: the marker's own promise -- written unconditionally, even
+        """The marker's own promise -- written unconditionally, even
         under AB_DRY_RUN, so `ab_merge.py`'s own `two_run_protocol_active`
         reads `True` and the merged report records `two_run_protocol:
         true` for THIS run.
@@ -99,10 +94,10 @@ class DryRunSmokeTests(unittest.TestCase):
             self.assertTrue(report["two_run_protocol"])
 
     def test_both_fused_legs_pass_an_empty_expect_kernels_disabled(self):
-        """F5: `jammi-fused` AND `jammi-fused-2` both carry
+        """`jammi-fused` AND `jammi-fused-2` both carry
         `--expect-kernels-disabled ''` (an EMPTY argument, hard-failing on
-        any ambient `JAMMI_KERNELS_DISABLE`) -- never omitted the way an
-        earlier version of this script left them unguarded.
+        any ambient `JAMMI_KERNELS_DISABLE`) -- never omitted, which would
+        leave them unguarded.
         """
         with tempfile.TemporaryDirectory() as out_dir:
             result = run_dry(out_dir)

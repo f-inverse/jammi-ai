@@ -9,24 +9,22 @@
 # this test's own environment carry). Defines exactly one function and runs
 # nothing on source — safe to `source` from any shell, any working directory.
 #
-# ## Round-1 adversarial audit B2: the bug this file exists to fix
+# ## Why a shallow, single-branch checkout breaks the merge-base
 #
-# `runpod_gpu_perf_ab.sh`'s own initial clone onto the rented pod used to be
-# `git clone --depth 1 -b "$GIT_REF" "$GIT_REPO" jammi-ai` — a SHALLOW,
-# SINGLE-BRANCH clone. A single-branch clone's remote config scopes its OWN
-# default fetch refspec to that ONE branch alone
+# A clone like `git clone --depth 1 -b "$GIT_REF" "$GIT_REPO" jammi-ai` is
+# SHALLOW and SINGLE-BRANCH. A single-branch clone's remote config scopes its
+# OWN default fetch refspec to that ONE branch alone
 # (`+refs/heads/<GIT_REF>:refs/remotes/origin/<GIT_REF>`) — a later `git
 # fetch origin main` against that remote config does NOT create a
 # `refs/remotes/origin/main` tracking ref at all (git fetches the commit
 # objects but has no configured DESTINATION ref to write them under), so
 # `git merge-base origin/main HEAD` run afterward fails outright
-# (`fatal: ... unknown revision`, empirically exit 128) — `origin/main`
-# genuinely never existed as a local ref. `runpod_gpu_perf_ab.sh`'s own
-# clone is fixed (full, non-single-branch, so `origin/main` exists from the
-# initial clone onward) — this function is defense-in-depth for any OTHER
-# caller of `gpu_inference_ab.sh` whose own checkout might still be
-# single-branch/shallow, and the one place that FORCES the tracking ref to
-# exist regardless: an EXPLICIT destination refspec
+# (`fatal: ... unknown revision`, exit 128) — `origin/main` never exists as
+# a local ref. `runpod_gpu_perf_ab.sh`'s own clone is full and
+# non-single-branch, so `origin/main` exists from the initial clone onward
+# — this function covers any OTHER caller of `gpu_inference_ab.sh` whose own
+# checkout might be single-branch/shallow, and is the one place that FORCES
+# the tracking ref to exist regardless: an EXPLICIT destination refspec
 # (`+refs/heads/main:refs/remotes/origin/main`) creates
 # `refs/remotes/origin/main` unconditionally, independent of whatever
 # narrower refspec the remote's own config carries.
@@ -46,8 +44,8 @@
 #   2  -- the (only-if-actually-shallow) unshallow fetch failed — a genuine
 #         infra/usage problem: this repo can never compute a real
 #         merge-base without real history, and no fallback exists.
-#   75 -- the explicit-refspec `origin/main` fetch failed — NEUTRAL (issue
-#         #335 round-1 adversarial audit B2), not a hard refusal: if a
+#   75 -- the explicit-refspec `origin/main` fetch failed — NEUTRAL, not a
+#         hard refusal: if a
 #         PREVIOUS clone step already populated `origin/main` (the normal
 #         case after `runpod_gpu_perf_ab.sh`'s own full, non-single-branch
 #         initial clone), this is a transient refresh failure against an

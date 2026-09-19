@@ -1,28 +1,25 @@
-//! Escape row esc-099-multi-replica-trigger-offset-collision:
-//! **multi-replica offset collision**.
+//! Multi-replica trigger-offset assignment never collides.
 //!
-//! Symptom: two engine replicas (or, in-process, two independent
+//! Invariant: two engine replicas (or, in-process, two independent
 //! [`Publisher`] instances wired to the SAME catalog backend and topic --
 //! the shape two OS processes sharing one Postgres database would take)
-//! publish concurrently. Before this fix, [`Publisher`] assigned offsets
-//! from a per-process `AtomicU64` counter lazily seeded from `MAX(_offset)`
-//! on the backing table -- read ONCE, then incremented locally forever
-//! after. Two such counters seeded against the SAME empty table both start
-//! at `0` and increment independently, **oblivious to each other**: they
-//! assign the identical offset sequence `0, 1, 2, …` to two disjoint sets of
-//! rows, colliding on the backing table's `(_offset, _row_idx)` composite
-//! primary key.
+//! publishing concurrently never assign the same offset twice. A
+//! per-process counter seeded once from `MAX(_offset)` would not hold this:
+//! two such counters seeded against the SAME empty table both start at `0`
+//! and assign the identical offset sequence `0, 1, 2, …` to two disjoint
+//! sets of rows, colliding on the backing table's `(_offset, _row_idx)`
+//! composite primary key.
 //!
-//! Control: a SINGLE `Publisher` publishing the same total row count assigns
-//! a gap-free, collision-free offset sequence (already covered by
-//! `trigger.rs`'s existing single-publisher tests).
-//!
-//! Fix (this commit): the offset is assigned by ONE row-locked
+//! Mechanism: the offset is assigned by ONE row-locked
 //! `UPDATE topics SET next_offset = … RETURNING` statement inside the SAME
 //! transaction as the row insert (`topics.next_offset`, migration 028) --
 //! the row lock on the `topics` catalog row is the cross-instance mutual
 //! exclusion, so two `Publisher`s (in-process OR cross-process on Postgres)
 //! serialize on it and never compute the same offset twice.
+//!
+//! Control: a SINGLE `Publisher` publishing the same total row count assigns
+//! a gap-free, collision-free offset sequence (covered by `trigger.rs`'s
+//! single-publisher tests).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -110,7 +107,7 @@ async fn two_replica_publishers_assign_gap_free_offsets() {
 
     let topic = TopicDefinition {
         id: TopicId::new(),
-        name: "esc_099.multi_replica".to_string(),
+        name: "trigger.multi_replica".to_string(),
         schema: topic_schema(),
         tenant: None,
         broker_metadata: BTreeMap::new(),

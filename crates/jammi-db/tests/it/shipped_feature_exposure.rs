@@ -53,9 +53,9 @@
 //! CPU image, load-only) — eleven call sites over six manifest lanes, each a
 //! `jq -r '.lanes["<key>"].cargo_features | ...'` invocation this test does not itself verify.
 //! `cu12_features`, ci/scripts/runpod_gpu_prove.sh:287 carries a literal cargo
-//! feature tuple OUTSIDE this universe on purpose (esc-081): it is compared against the
+//! feature tuple OUTSIDE this universe on purpose: it is compared against the
 //! manifest-derived value with its own loud `PROVE_SURFACE_DRIFT` error rather than reading the
-//! manifest directly. The lead names this residual on the tracking issue for this class.
+//! manifest directly.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

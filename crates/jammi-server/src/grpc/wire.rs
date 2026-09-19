@@ -184,7 +184,7 @@ pub fn map_engine_error(err: JammiError) -> Status {
             (Code::Internal, format!("channel assembly: {detail}"))
         }
         // The building-row CAS zero-row classification (`catalog::result_repo`'s
-        // `ResultTableCas` / esc-094): each of the four outcomes is a distinct
+        // `ResultTableCas`): each of the four outcomes is a distinct
         // caller condition, never a bare `Internal`. `RowGone` — the row was
         // already deleted underneath the caller — is `NotFound`. `TenantMismatch`
         // — the STRICT tenant arm refused the write — is `PermissionDenied`, the
@@ -368,8 +368,8 @@ mod tests {
 
     /// An absent model from a lifecycle verb is `ModelNotFound`, which maps to
     /// gRPC `NotFound` — distinct from the bad-argument `Model` fault, which maps
-    /// to `InvalidArgument`. This is the contract the catalog handlers rely on
-    /// after dropping their manual `Model → not_found` interception.
+    /// to `InvalidArgument`. The catalog handlers rely on this mapping; they
+    /// carry no manual `Model → not_found` interception.
     #[test]
     fn model_not_found_maps_to_not_found() {
         let status = map_engine_error(JammiError::ModelNotFound {
@@ -385,9 +385,9 @@ mod tests {
         assert_eq!(bad.code(), Code::InvalidArgument);
     }
 
-    /// The building-row CAS zero-row classification (esc-094 follow-up)
-    /// each maps to a DISTINCT gRPC code, never the generic `Internal` the
-    /// catch-all arm gave them before: `RowGone` → `NotFound`,
+    /// The building-row CAS zero-row classification
+    /// each maps to a DISTINCT gRPC code, never the catch-all arm's generic
+    /// `Internal`: `RowGone` → `NotFound`,
     /// `TenantMismatch` → `PermissionDenied`, `LeaseLost` / `CasFailed` →
     /// `Aborted` (a retryable conflict, not a permanent precondition
     /// failure), `SourceBusy` → `FailedPrecondition` (mirroring
@@ -486,12 +486,13 @@ mod tests {
         ));
     }
 
-    /// K2's refusal must reach a remote caller as the refusal it is. An empty
+    /// The empty-training-set refusal must reach a remote caller as the
+    /// refusal it is. An empty
     /// training set is raised by the producer before any row or byte exists;
     /// folded into `Other`/`Internal` a remote caller would read a server
     /// fault where the embedded caller reads a typed, caller-fixable
     /// `EmptyTrainingSet` naming the query — the two surfaces disagreeing on
-    /// exactly the degenerate input K2 exists to catch. This pins the classified
+    /// exactly the degenerate input the refusal exists to catch. This pins the classified
     /// code, the typed reconstruction, and the `Display` text through the same
     /// `attach_error_detail` → real `tonic::Status` → `error_from_status` chain
     /// a live call uses.
@@ -551,7 +552,7 @@ mod tests {
         );
     }
 
-    /// esc-089: this wire test pins
+    /// This wire test pins
     /// ONLY the LAST leg of the chain — a variant, once produced, maps to
     /// the right gRPC code — never a substitute for the it-tests in
     /// `crates/jammi-ai/tests/it/models.rs` /

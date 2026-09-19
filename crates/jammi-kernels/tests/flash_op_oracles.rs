@@ -1,30 +1,11 @@
-//! O0(b)/(c)/(d) (P6 Stage B contract §4) — the `ops::flash_attention_varlen`
-//! `Tensor`/autograd-level oracles. O0(a) (numeric parity vs torch) is
-//! `tests/flash_torch_parity.rs`, at the `crate::flash` FFI-boundary layer;
+//! The `ops::flash_attention_varlen` `Tensor`/autograd-level oracles. Numeric
+//! parity vs torch is `tests/flash_torch_parity.rs`, at the `crate::flash` FFI-boundary layer;
 //! this file is the layer ABOVE it: the `Saved<T>`/`StatefulKernelOp`
 //! wiring specifically.
 
-#![cfg(feature = "flash-attn")]
-
-use candle_core::{CudaDevice, DType, Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use jammi_kernels::flash::{CuSeqlens, VarlenConfig};
 use jammi_kernels::ops::{flash_attention_varlen, SavedError};
-
-fn cuda_device() -> Option<CudaDevice> {
-    match Device::new_cuda(0) {
-        Ok(d) => Some(d.as_cuda_device().unwrap().clone()),
-        Err(e) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!(
-                    "flash_op_oracles: JAMMI_REQUIRE_CUDA is set but no CUDA device could be \
-                     acquired — a silent skip here is not acceptable: {e}"
-                );
-            }
-            eprintln!("flash_op_oracles: skipping — no CUDA device available ({e})");
-            None
-        }
-    }
-}
 
 const NUM_HEADS: usize = 4;
 const HEAD_DIM: usize = 64;
@@ -55,7 +36,7 @@ fn cfg() -> VarlenConfig {
     }
 }
 
-/// O0(d): bwd lattice. `FlashVarlenAttention` is a `CustomOp1` — there is
+/// Bwd lattice. `FlashVarlenAttention` is a `CustomOp1` — there is
 /// exactly ONE slot (`qkv`), never a "provably constant leaf" (RoPE'd
 /// Q/K/V always need a gradient in training) — so the lattice has one
 /// cell: `Some(dqkv)`, always. Verified via a real `.backward()` on the
@@ -63,7 +44,7 @@ fn cfg() -> VarlenConfig {
 /// entry is `.backward()`).
 #[test]
 fn bwd_always_returns_some_dqkv_for_the_single_qkv_slot() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let device = Device::Cuda(dev.clone());
     let lengths = [64usize];
     let cu = CuSeqlens::from_lengths(&lengths, &dev).unwrap();
@@ -83,7 +64,7 @@ fn bwd_always_returns_some_dqkv_for_the_single_qkv_slot() {
     assert_eq!(d_qkv.dtype(), qkv_var.as_tensor().dtype());
 }
 
-/// O0(c), GREEN half: two `flash_attention_varlen` calls on distinct
+/// Interleaving, GREEN half: two `flash_attention_varlen` calls on distinct
 /// batches, losses concatenated, ONE `.backward()` — each call's own
 /// `bwd` must read its OWN `lse` (a fresh op instance per call, per
 /// `apply_stateful1`'s own contract). If the two calls somehow shared
@@ -94,7 +75,7 @@ fn bwd_always_returns_some_dqkv_for_the_single_qkv_slot() {
 /// gradients.
 #[test]
 fn interleaved_calls_on_distinct_batches_each_read_their_own_lse() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let device = Device::Cuda(dev.clone());
     let cu_a = CuSeqlens::from_lengths(&[64usize], &dev).unwrap();
     let cu_b = CuSeqlens::from_lengths(&[48usize, 16], &dev).unwrap();
@@ -136,9 +117,9 @@ fn interleaved_calls_on_distinct_batches_each_read_their_own_lse() {
     }
 }
 
-/// O0(c), GradCache-shaped GREEN: forward, drop WITHOUT backward (pass 1,
-/// detached), forward again, backward (pass 2) — `crates/jammi-ai/src/
-/// fine_tune/gradcache.rs:78-81`'s exact sequence, through the real `pub
+/// Interleaving, GradCache-shaped GREEN: forward, drop WITHOUT backward
+/// (pass 1, detached), forward again, backward (pass 2) — `jammi-ai`'s
+/// `fine_tune/gradcache.rs` pass-1/pass-2 sequence, through the real `pub
 /// fn`. The FIRST forward's `Saved` slot is left `Some` when its op
 /// instance is dropped (never taken) — `saved::tests::
 /// set_without_take_drops_cleanly_forward_only_gradcache_shape` proves
@@ -147,7 +128,7 @@ fn interleaved_calls_on_distinct_batches_each_read_their_own_lse() {
 /// first call's abandoned state cannot leak into or block the second).
 #[test]
 fn gradcache_detached_pass_one_then_a_real_forward_backward_is_green() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let device = Device::Cuda(dev.clone());
     let cu = CuSeqlens::from_lengths(&[64usize], &dev).unwrap();
 
@@ -180,18 +161,16 @@ fn gradcache_detached_pass_one_then_a_real_forward_backward_is_green() {
     );
 }
 
-/// O0(e) (P6 Stage B contract §4): calling `.backward()` TWICE on the SAME
+/// Calling `.backward()` TWICE on the SAME
 /// output node re-walks the SAME `FlashVarlenAttention` op instance's `bwd`
 /// closure a second time — `self.lse.take()` hits an ALREADY-EMPTIED
 /// `Saved` slot (the first `.backward()` consumed it). This must surface
 /// the TYPED `SavedError::Empty` (wrapped as a `candle_core::Error::Msg` by
 /// `ops::flash_attention`'s own `saved_err` helper), never panic and never
-/// silently return a wrong/stale gradient. `10b1f3b`'s audit confirmed this
-/// behaviour live (advisory finding: "O0(e) double-backward test missing
-/// (behaviour verified correct)"); this test PINS it as a real oracle.
+/// silently return a wrong/stale gradient.
 #[test]
 fn double_backward_on_the_same_node_surfaces_the_typed_saved_error() {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let device = Device::Cuda(dev.clone());
     let cu = CuSeqlens::from_lengths(&[64usize], &dev).unwrap();
 
@@ -220,7 +199,7 @@ fn double_backward_on_the_same_node_surfaces_the_typed_saved_error() {
     );
 }
 
-/// Pins the (corrected) doc/comment in `ops/flash_attention.rs`'s
+/// Pins the doc/comment in `ops/flash_attention.rs`'s
 /// `FlashVarlenBwdHelper::cuda_fwd`'s trailing `bwd`-omission note:
 /// differentiating a SECOND time through `d_qkv` (the OUTPUT of
 /// `FlashVarlenAttention::bwd`) does NOT reach candle's
@@ -230,13 +209,10 @@ fn double_backward_on_the_same_node_surfaces_the_typed_saved_error() {
 /// (`candle_core::op::BackpropOp::new3` only records a backprop edge if at
 /// least one of its three operands is still tracked — none are, once
 /// detached), so `d_qkv` carries no lineage back to `qkv_var` at all.
-/// `10b1f3b`'s audit flagged the OLD comment as false (the auditor
-/// confirmed THIS behaviour, not `BackwardNotSupported`); this test PINS
-/// the corrected claim.
 #[test]
 fn second_order_backward_through_flash_attention_varlen_output_is_a_silent_absent_gradient_not_an_error(
 ) {
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let device = Device::Cuda(dev.clone());
     let cu = CuSeqlens::from_lengths(&[64usize], &dev).unwrap();
 
@@ -264,9 +240,9 @@ fn second_order_backward_through_flash_attention_varlen_output_is_a_silent_absen
     );
 }
 
-/// O0(b): poison-then-verify on `softmax_d` — always live (read by every
-/// backward regardless of `deterministic`, `flash/mod.rs:822`'s
-/// uninitialised-inter-tile-padding-rows doc). Fills the RAW scratch
+/// Poison-then-verify on `softmax_d` — always live (read by every
+/// backward regardless of `deterministic`; see `crate::flash`'s
+/// `BwdScratch` doc on uninitialised inter-tile padding rows). Fills the RAW scratch
 /// buffer with NaN before the backward launch (via `crate::flash`'s own
 /// `BwdScratch`/`flash_varlen_bwd_into` at the FFI-boundary layer — the op
 /// layer allocates its own scratch internally and does not expose a hook
@@ -283,7 +259,7 @@ fn poison_softmax_d_before_backward_does_not_change_any_output_bit() {
         flash_varlen_bwd_into, flash_varlen_fwd, BwdBuffers, BwdScratch, HEAD_DIM as FD,
     };
 
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let lengths = [5usize, 137, 260, 128, 129]; // multi-tile, matches flash_smoke.rs's LARGE_LENS
     let cu = CuSeqlens::from_lengths(&lengths, &dev).unwrap();
     let total_q: usize = lengths.iter().sum();
@@ -361,11 +337,11 @@ fn poison_softmax_d_before_backward_does_not_change_any_output_bit() {
     );
 }
 
-/// O0(b), labelled dead-path guard (per the lead's v5 correction): the
-/// NON-deterministic `dq_accum` scratch's uninitialised inter-tile rows
-/// are documented as never-read too (`flash/mod.rs:829`), but
+/// Poison-then-verify, labelled dead-path guard: the NON-deterministic
+/// `dq_accum` scratch's uninitialised inter-tile rows are documented as
+/// never-read too (`crate::flash`'s `BwdScratch` doc), but
 /// `ops::flash_attention_varlen`'s own `cfg.deterministic` is pinned
-/// `true` by every real call site (Stage B2) — this cell is NEVER reached
+/// `true` by every real call site (the encoder) — this cell is NEVER reached
 /// through the op's public surface. Kept as defense-in-depth on the
 /// LOWER-level `crate::flash` primitive itself (which a future,
 /// non-deterministic caller COULD reach), not as coverage of anything
@@ -377,7 +353,7 @@ fn poison_non_deterministic_dq_accum_is_a_dead_path_guard_not_reachable_via_the_
         flash_varlen_bwd_into, flash_varlen_fwd, BwdBuffers, BwdScratch, HEAD_DIM as FD,
     };
 
-    let Some(dev) = cuda_device() else { return };
+    let dev = jammi_test_resources::cuda_backend(0);
     let lengths = [5usize, 137, 260, 128, 129];
     let cu = CuSeqlens::from_lengths(&lengths, &dev).unwrap();
     let total_q: usize = lengths.iter().sum();

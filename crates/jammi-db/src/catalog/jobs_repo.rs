@@ -107,13 +107,11 @@ pub struct JobRecord {
     /// Migration 024's temporary operator hold: a `false` row is excluded
     /// from `claim_next` without being deleted or given a new status.
     pub claimable: bool,
-    /// The job's per-attempt acceleration determination (esc-075), as an
+    /// The job's per-attempt acceleration determination, as an
     /// opaque, self-describing JSON payload whose vocabulary the payload's
     /// *producer* owns — matching `spec`'s and `result`'s schema-at-the-
-    /// producer deferral, not a closed enum pinned here. Carries forward the
-    /// exact contract the removed `training_repo::TrainingJobRecord` field
-    /// of the same name documented, generalised from training-only to every
-    /// job kind:
+    /// producer deferral, not a closed enum pinned here. The same contract
+    /// holds for every job kind:
     ///
     ///   - `None` (SQL `NULL`) — unknown: a row this code never touched
     ///     (there is no such row on a fresh catalog, since [`Catalog::submit_job`]
@@ -237,8 +235,8 @@ pub enum TrainingSetFillOutcome {
 }
 
 /// The coordinator's call-site wrapper of [`TrainingSetFillOutcome`], named
-/// in DESIGN.md § 4's own vocabulary ("the coordinator materializes or
-/// reuses the training set") — see
+/// for what the coordinator does ("materializes or reuses the training
+/// set") — see
 /// [`Catalog::materialize_or_reuse_training_set`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrainingSetAssembly {
@@ -257,9 +255,8 @@ pub enum TrainingSetAssembly {
 }
 
 /// The closed set of reasons a coordinator's ASSEMBLY attempt (membership →
-/// dispatch, DESIGN.md § 4) did not proceed to a run, each carrying its own
-/// cooldown/counting rule
-/// (`docs/plans/67-distributed-training/UNITS.md` § U5b-1b-ii). A new
+/// dispatch) did not proceed to a run, each carrying its own
+/// cooldown/counting rule. A new
 /// variant with no rule is a COMPILE error — `AssemblyOutcome::effect`
 /// matches every variant explicitly, never a wildcard arm.
 ///
@@ -268,7 +265,7 @@ pub enum TrainingSetAssembly {
 /// - [`Self::Refuted`] / [`Self::AllRootDivergent`] — a genuine, terminal-
 ///   looking refusal of THIS attempt: counted AND cooled down.
 /// - [`Self::Unavailable`] / [`Self::StoreUnavailable`] / [`Self::ShortListed`]
-///   — a member-scoped or transient condition (OPS D10): cooled down so the
+///   — a member-scoped or transient condition: cooled down so the
 ///   next attempt does not immediately repeat the same failed dispatch, but
 ///   NOT counted — the job itself did nothing wrong.
 /// - [`Self::NoBody`] / [`Self::Drain`] / [`Self::Cancelled`] — assembly
@@ -282,7 +279,7 @@ pub enum AssemblyOutcome {
     /// The coordinator's own row was refuted at re-verification.
     Refuted,
     /// Every listed member's result-root identity diverged from the
-    /// coordinator's own (U5b-1a-A2's root predicate): no admissible member
+    /// coordinator's own (the membership root predicate): no admissible member
     /// existed for this attempt at all.
     AllRootDivergent,
     /// A member the listing named answered unavailable/unreachable at
@@ -295,7 +292,7 @@ pub enum AssemblyOutcome {
     ShortListed,
     /// No coordinator body exists to run this attempt at all.
     NoBody,
-    /// The host is draining (68 OPS) and refuses new assembly.
+    /// The host is draining and refuses new assembly.
     Drain,
     /// The job was cancelled before assembly completed.
     Cancelled,
@@ -327,7 +324,7 @@ impl AssemblyOutcome {
     /// terminal-refusal class ([`Self::Refuted`], [`Self::AllRootDivergent`]),
     /// which the coordinator leaves for reclaim on its lease (an attempt
     /// spent), as opposed to every other outcome, which costs the job no
-    /// attempt (the coordinator hands its lease back at once, OPS D10).
+    /// attempt (the coordinator hands its lease back at once).
     /// Derived from `Self::effect` — never a second table.
     pub fn counts_toward_failures(self) -> bool {
         self.effect() == AssemblyEffect::CooldownAndCounted
@@ -410,15 +407,14 @@ pub struct RankAdmissionRow {
     /// construction on EITHER backend, exactly like [`Self::world_size`]:
     /// text that does not parse is [`super::lease::LeaseFact::Undecodable`],
     /// a ROW FACT the caller refuses, never a fault of the read that found
-    /// it (the resolution of
-    /// <https://github.com/f-inverse/jammi-ai/issues/574>).
+    /// it.
     pub lease: super::lease::LeaseFact,
     /// The row's `spec` column VERBATIM — the same JSON the claiming worker
     /// reconstructs its run from, and what an admitted member's rank body
     /// reconstructs ITS run from (`jammi-ai`'s `run_member_rank`): the
     /// job's training spec is a row fact a member reads through the
     /// admission it was granted, never a value the coordinator sends on the
-    /// wire (DESIGN.md §4: no URL and no spec travels in the `Assign`).
+    /// wire (no URL and no spec travels in the `Assign`).
     pub spec: String,
     /// The ROW's own rank count, decoded from the SAME `spec` JSON the
     /// claiming worker reconstructs its run from — never the caller's own
@@ -443,8 +439,7 @@ pub struct RankAdmissionRow {
     /// with every other column populated, and the caller (the gang admission
     /// handler) decides how to refuse it. `Err` from `get_job_for_rank` means
     /// the read itself faulted — never that this row's `spec` failed to
-    /// decode a `world_size`, and never (since
-    /// <https://github.com/f-inverse/jammi-ai/issues/574>) that this row's
+    /// decode a `world_size`, and never that this row's
     /// `lease_expires_at` failed to decode a lease: see [`Self::lease`].
     pub world_size: WorldSizeFact,
 }
@@ -519,7 +514,7 @@ const SELECT_COLS: &str = "job_id, kind, tenant_id, status, execution, spec, par
 
 /// The explicit submission-time marker [`Catalog::submit_job`] writes into
 /// `acceleration_report`: the job exists but no claimant has yet computed an
-/// acceleration determination for it (esc-075). Distinct from SQL `NULL` (a
+/// acceleration determination for it. Distinct from SQL `NULL` (a
 /// row this code never touched) — see [`JobRecord::acceleration_report`]'s
 /// producer-owned-payload contract. This is the only value the catalog ever
 /// writes that is not a retirement of itself: every terminal write matches
@@ -664,9 +659,7 @@ pub struct FinishJobParams<'a> {
 
 /// One retained epoch checkpoint's catalog row, inserted inside the same
 /// attempt-guarded finish transaction that commits the output model's served
-/// path ([`Catalog::finish_job_with_model`]) — ported from the removed
-/// `training_repo::EpochCheckpointRow` (unit 348) onto the generalised `jobs`
-/// schema.
+/// path ([`Catalog::finish_job_with_model`]).
 ///
 /// Lifecycle: a row is inserted **only** when the finish CAS this call rides
 /// on actually wins — the insert sits inside the same `if job_updated == 1`
@@ -716,19 +709,19 @@ pub struct FinishJobWithModelParams<'a> {
     pub output_model_id: &'a str,
     /// The output model's catalog VERSION — together with `output_model_id`
     /// and the tenant, the exact row the served-path `UPDATE` must touch and
-    /// no other (B5, unit 348).
+    /// no other.
     pub output_model_version: i32,
     /// The object-store prefix this caller published the output artifact
     /// under — committed as the model row's `artifact_path`.
     pub artifact_path: &'a str,
     /// Every RETAINED epoch checkpoint to register alongside the output
-    /// model (unit 348) — empty for a training kind with no per-epoch
+    /// model — empty for a training kind with no per-epoch
     /// checkpointing.
     pub epoch_checkpoints: &'a [EpochCheckpointRow<'a>],
 }
 
 /// A row from the `workers` table joined with its owning `instances` row —
-/// `ListWorkers`' wire shape (N12).
+/// `ListWorkers`' wire shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRecord {
     pub instance_id: String,
@@ -751,7 +744,7 @@ pub struct WorkerRecord {
     /// — never the placement policy's authority; see
     /// `super::compute_repo::ComputeExecutorRecord::devices`'s doc. A
     /// malformed stored value decodes to an empty list with a
-    /// `tracing::warn!` naming `instance_id` (the #574 row-fact rule; see
+    /// `tracing::warn!` naming `instance_id` (a row fact, not a fault; see
     /// [`super::instance::decode_devices_json`]), never a read fault.
     pub devices: Vec<DeviceFact>,
 }
@@ -776,7 +769,7 @@ fn parse_worker_row(
 
 /// One `instances JOIN workers` candidate row, before
 /// [`Catalog::list_gang_members`]'s own Rust-side exclusion filters run —
-/// a named struct rather than a five-element tuple (A5: `clippy::
+/// a named struct rather than a five-element tuple (`clippy::
 /// type_complexity` is a signal to name the shape, not to suppress it).
 struct GangCandidateRow {
     instance_id: String,
@@ -840,7 +833,7 @@ impl Catalog {
     /// Submit a new job, `status = 'queued'` — the row's own claim (by
     /// [`Self::claim_next`] for `execution = 'queued'`, or by
     /// [`Self::claim_by_id`] for `execution = 'inline'`) performs the
-    /// `queued -> running` transition. Tenant bound + asserted (SPEC-03 §7).
+    /// `queued -> running` transition. Tenant bound + asserted.
     /// Never deduped — a thin `idempotency_key: None` call onto
     /// [`Self::submit_job_deduped`], kept as the plain entry point every
     /// pre-existing caller (every compute verb, every training kind's
@@ -1277,8 +1270,7 @@ impl Catalog {
         Ok(updated == 1)
     }
 
-    /// The placed-gang hand-off (design contract `feat_500-wave4.md` §
-    /// 2.4): move `job_id`'s claim from `from_instance` to `to_instance` —
+    /// The placed-gang hand-off: move `job_id`'s claim from `from_instance` to `to_instance` —
     /// `claimed_by = $to`, a fresh `lease` deadline, `updated_at` — WITHOUT
     /// touching `attempts` or `releases` (zero net attempts: this is a
     /// hand-off, never a re-claim). `Ok(false)` when the guard misses:
@@ -1355,7 +1347,7 @@ impl Catalog {
     /// This is a TERMINAL write, so the same attempt-guarded UPDATE also
     /// retires a still-`pending` `acceleration_report` to
     /// `{"state":"undetermined","reason":"finalized_without_determination"}`
-    /// (esc-075) — see [`JobRecord::acceleration_report`]'s lifecycle
+    /// — see [`JobRecord::acceleration_report`]'s lifecycle
     /// section. A training kind that also needs to commit its output
     /// model's served path and epoch checkpoints atomically with this
     /// transition should call [`Catalog::finish_job_with_model`] instead,
@@ -1401,12 +1393,10 @@ impl Catalog {
 
     /// Finish a job the caller still owns as a single attempt-guarded
     /// compare-and-set that ALSO commits the output model's served artifact
-    /// path and registers every surviving epoch-checkpoint row (unit 348) —
+    /// path and registers every surviving epoch-checkpoint row —
     /// the atomic finish-with-model-registration peer of [`Self::finish_job`],
-    /// ported from the removed `training_repo::finalize_training_job` onto
-    /// the generalised `jobs` schema's full attempt guard (`job_id AND
-    /// claimed_by AND status = 'running' AND attempts = $n`, where the old
-    /// method carried only `job_id AND claimed_by AND status`).
+    /// under the full attempt guard (`job_id AND claimed_by AND status =
+    /// 'running' AND attempts = $n`).
     ///
     /// In one transaction it flips the job row to `completed` and writes
     /// `result` — and, only if that job-row CAS matched, records
@@ -1440,7 +1430,7 @@ impl Catalog {
     /// the way `job_id` is.
     ///
     /// This is a TERMINAL write, so the same CAS also retires a still-pending
-    /// `acceleration_report` (esc-075) exactly as [`Self::finish_job`] does
+    /// `acceleration_report` exactly as [`Self::finish_job`] does
     /// — see [`JobRecord::acceleration_report`]'s lifecycle section.
     ///
     /// An epoch-checkpoint whose catalog NAME is already occupied by another
@@ -1521,8 +1511,8 @@ impl Catalog {
                     // the attempt that won the job-row CAS commits the
                     // served path and the epoch rows — pinned by
                     // `jobs_queue.rs::finish_job_with_model_is_an_attempt_guarded_compare_and_set`,
-                    // the finish-side sibling of esc-107's `create_result_table`
-                    // control.
+                    // the finish-side sibling of `create_result_table`'s
+                    // attempt-guard control.
                     if job_updated == 1 {
                         tx.assert_tenant_matches(tenant, "models")?;
                         let tenant_val = SqlValue::from(tenant.map(|t| t.to_string()));
@@ -1827,8 +1817,7 @@ impl Catalog {
     /// `partial_result IS NULL`) and never cleared, so every attempt >= 2
     /// that failed its predecessor's table and then created its own would
     /// find that CAS matching zero rows and land `JobAttemptSuperseded` —
-    /// a terminal `failed` for a job whose successor did everything right
-    /// (escape `esc-110`).
+    /// a terminal `failed` for a job whose successor did everything right.
     pub async fn clear_partial_result(
         &self,
         job_id: &str,
@@ -1869,7 +1858,7 @@ impl Catalog {
 
     /// Record `partial_result` on a job the caller still owns, outside a
     /// `create_result_table` transaction (e.g. adopting a predecessor's
-    /// already-`ready` table on a reclaimed attempt — N1). `false` when the
+    /// already-`ready` table on a reclaimed attempt). `false` when the
     /// attempt guard misses. The narrower, `job_id`-only CAS
     /// [`Self::create_result_table`] performs at table-CREATION time is a
     /// separate, deliberately weaker write — see its doc.
@@ -1910,7 +1899,7 @@ impl Catalog {
         Ok(updated == 1)
     }
 
-    /// Record the claiming instance's acceleration determination (esc-075)
+    /// Record the claiming instance's acceleration determination
     /// for this attempt of a job the caller still owns — the report-writing
     /// peer of [`Self::progress_job`]. Replaces `acceleration_report`
     /// **only** while the row is still `running`, `claimed_by == instance_id`,
@@ -2068,7 +2057,7 @@ impl Catalog {
     ///
     /// Every arm also moves `acceleration_report`, in its OWN `UPDATE` (never
     /// a read-then-write): a requeue resets it to the pending marker
-    /// (esc-075) — the row will re-probe under its next attempt — while both
+    /// — the row will re-probe under its next attempt — while both
     /// terminal arms (attempts-exhausted, inline-executor-dead) retire a
     /// still-pending marker with their own distinct reason. See
     /// [`JobRecord::acceleration_report`]'s lifecycle section.
@@ -2128,7 +2117,7 @@ impl Catalog {
 
                     // Arm 1a: queued-execution, lease expired, attempts left -> requeue.
                     // Unconditionally RESETS acceleration_report to the pending
-                    // marker (esc-075): the row returns to `queued` for a NEW
+                    // marker: the row returns to `queued` for a NEW
                     // attempt that will re-probe, so "no claimant has computed a
                     // determination yet" is once again exactly true, even when
                     // the dead attempt had already recorded a `determined`
@@ -2168,7 +2157,7 @@ impl Catalog {
 
                     // Arm 1b: queued-execution, lease expired, attempts exhausted -> fail.
                     // TERMINAL, so it retires a still-pending acceleration_report
-                    // (esc-075) — see `JobRecord::acceleration_report`'s lifecycle
+                    // — see `JobRecord::acceleration_report`'s lifecycle
                     // section.
                     {
                         let mut params: Vec<SqlValue<'static>> = vec![
@@ -2206,7 +2195,7 @@ impl Catalog {
 
                     // Arm 2: inline-execution, owning instance absent or stale -> fail.
                     // TERMINAL (an inline job has no requeue arm), so it retires
-                    // a still-pending acceleration_report (esc-075) — see
+                    // a still-pending acceleration_report — see
                     // `JobRecord::acceleration_report`'s lifecycle section.
                     {
                         let margin = instance_liveness_margin(lease);
@@ -2349,15 +2338,13 @@ impl Catalog {
             .await?)
     }
 
-    /// The coordinator's call site into [`Self::fill_training_set_identity`]
-    /// — DESIGN.md § 4's own vocabulary ("the coordinator materializes or
-    /// reuses the training set"), returned as [`TrainingSetAssembly`] rather
-    /// than the lower-level [`TrainingSetFillOutcome`] so the coordinator's
-    /// own call site never has to re-derive "moved" from "aborted".
+    /// The coordinator's call site into [`Self::fill_training_set_identity`] ("the coordinator
+    /// materializes or reuses the training set"), returned as [`TrainingSetAssembly`] rather than
+    /// the lower-level [`TrainingSetFillOutcome`] so the coordinator's own call site never has to
+    /// re-derive "moved" from "aborted".
     ///
-    /// This crate ships the verb and its own oracle here; the production
-    /// caller is the coordinator body (`jammi-ai`'s `fine_tune/worker.rs`,
-    /// U5b-1b-i / U5a-2) — DEFERRED, not built in this crate.
+    /// The production caller is the coordinator body (`jammi-ai`'s
+    /// `fine_tune/worker.rs`).
     pub async fn materialize_or_reuse_training_set(
         &self,
         job_id: &str,
@@ -2506,8 +2493,7 @@ impl Catalog {
     /// when no such job exists. `Err` means the READ ITSELF faulted — never
     /// that a row's content failed to decode: neither `spec` failing to
     /// decode a `world_size` ([`RankAdmissionRow::world_size`] as
-    /// [`WorldSizeFact::Undecodable`]) nor (since
-    /// <https://github.com/f-inverse/jammi-ai/issues/574>) `lease_expires_at`
+    /// [`WorldSizeFact::Undecodable`]) nor `lease_expires_at`
     /// failing to parse ([`RankAdmissionRow::lease`] as
     /// [`super::lease::LeaseFact::Undecodable`]) is ever conflated with the
     /// read faulting — both are returned `Ok(Some(row))` with every other
@@ -2728,9 +2714,7 @@ impl Catalog {
     /// member-scoped `FailedPrecondition`, disclosing nothing about which.
     /// `last_seen_at`'s raw stored text is decoded in RUST
     /// ([`super::lease::last_seen_at_is_fresh`]) — never a SQL-side
-    /// `col::timestamptz` cast — so a malformed value never faults the read
-    /// (the resolution of
-    /// <https://github.com/f-inverse/jammi-ai/issues/574> for this column);
+    /// `col::timestamptz` cast — so a malformed value never faults the read;
     /// this column is ALWAYS an application-clock stamp on either backend
     /// (`Catalog::upsert_instance` / `Catalog::reregister_instance` /
     /// `Catalog::touch_instance` never write the database clock here), so
@@ -2768,7 +2752,7 @@ impl Catalog {
         }))
     }
 
-    /// The ONE by-id peer-address resolution verb (DESIGN.md § 4): `Some`
+    /// The ONE by-id peer-address resolution verb: `Some`
     /// iff `instance_id`'s row is present, its `peer_addr` is non-NULL, and
     /// it is fresh under [`super::lease::instance_liveness_margin`] on the
     /// DB clock. No kind / root / self filter — a rank resolving its own
@@ -2831,7 +2815,7 @@ impl Catalog {
         }
     }
 
-    /// The gang-membership listing verb (DESIGN.md § 4, M3): every FRESH,
+    /// The gang-membership listing verb: every FRESH,
     /// `claiming` worker whose `kinds` contains `listing.kind` as a whole,
     /// trimmed, comma-split token, excluding `listing.self_instance` —
     /// sorted by `instance_id` BYTE ORDER, in Rust, never a SQL `ORDER BY`
@@ -2840,7 +2824,7 @@ impl Catalog {
     /// `instances` carries no tenant column: the same answer under a scoped
     /// tenant binding and under none.
     ///
-    /// **Root identity is part of this predicate** (unit U5b-1a-A2): a
+    /// **Root identity is part of this predicate**: a
     /// candidate's `instances.result_root_identity` must EQUAL the identity
     /// of `listing.root`, the caller's own [`super::instance::MemberRoot`]
     /// (the value its row carries — never a bare identity; the identity is
@@ -2948,9 +2932,8 @@ impl Catalog {
     /// process's root identity has exactly one source of truth (its own
     /// catalog row), never a second Rust-side copy that could drift from it.
     /// Liveness + root-sharing is `live_with_root_clause`, the SAME
-    /// fragment [`Self::list_gang_members`] evaluates (`docs/plans/
-    /// 68-compute-tier-substrate/units/DIST-DATA-PLANE.md`'s "one definition
-    /// of live with my root").
+    /// fragment [`Self::list_gang_members`] evaluates ("one definition of
+    /// live with my root").
     ///
     /// A caller whose own row is absent (never yet registered, or pruned)
     /// gets an empty ring, never a fault: [`crate::index::peer::
@@ -2980,7 +2963,7 @@ impl Catalog {
             "SELECT instance_id AS instance_id, peer_addr AS peer_addr \
              FROM instances WHERE {live_with_root}"
         );
-        // RV6: ONE statement, no transaction wrapper — `query_untransacted`
+        // ONE statement, no transaction wrapper — `query_untransacted`
         // issues this `SELECT` directly against the pool (no `BEGIN`/`SET
         // TRANSACTION ...`/`COMMIT`), which is what the ring read's own
         // budget assumes (see that function's doc for the measured cost of
@@ -3028,14 +3011,11 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// Under `feature = "test-hooks"`, a failure armed for `instance_id`
-    /// through `worker_test_hooks::arm_upsert_worker_failure` (not an
-    /// intra-doc link: that module exists only under `feature =
-    /// "test-hooks"`, so a link to it fails `cargo doc`'s default-feature
-    /// pass) is returned here, once, with no write attempted — the
-    /// deterministic fixture P-Y4 (contract `feat_500-C-U5b-1a` §12) needs
-    /// to prove the caller's registration cell stays cleared when this call
-    /// fails.
+    /// Under `feature = "test-hooks"`, a failure armed for `instance_id` through
+    /// `worker_test_hooks::arm_upsert_worker_failure` (not an intra-doc link: that module exists
+    /// only under `feature = "test-hooks"`, so a link to it fails `cargo doc`'s default-feature
+    /// pass) is returned here, once, with no write attempted — the deterministic registration-cell
+    /// fixture needs to prove the caller's registration cell stays cleared when this call fails.
     pub async fn upsert_worker(
         &self,
         instance_id: &str,
@@ -3169,7 +3149,7 @@ impl Catalog {
         Ok(deleted == 1)
     }
 
-    /// List every worker, joined with its owning `instances` row (N12).
+    /// List every worker, joined with its owning `instances` row.
     pub async fn list_workers(&self) -> Result<Vec<WorkerRecord>> {
         Ok(self
             .backend()

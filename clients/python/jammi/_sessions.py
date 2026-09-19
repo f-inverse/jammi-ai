@@ -66,14 +66,14 @@ _session_handles: "weakref.WeakKeyDictionary[object, int]" = (
 # (a dropped-without-close session stays visible here).
 #
 # Bounded to `_LEDGER_CAP` entries: a leak DETECTOR must not itself retain an
-# unbounded copy of what it detects (issue #552 item 3 — 5000 sessions
-# dropped without `close()` used to mean 5000 retained entries, forever, for
-# the life of the process). Registering past the cap evicts the OLDEST
+# unbounded copy of what it detects (an unbounded ledger retains one entry per
+# session dropped without `close()`, forever, for the life of the process).
+# Registering past the cap evicts the OLDEST
 # still-open entry (FIFO by registration order — a plain `dict` already
 # preserves insertion order since 3.7, so no separate ordering structure is
 # needed) rather than growing further. This bounds `open_session_labels()`'s
 # own retrospective view; it does NOT weaken detection for anything that
-# actually uses this module's leak-catching property today: `observe()` (the
+# actually uses this module's leak-catching property: `observe()` (the
 # cookbook leak rail's mechanism — `cookbook/book/tests/conftest.py`) sees
 # every register/unregister EVENT synchronously, as it fires, independent of
 # the ledger's size or the cap — a subscriber watching a bounded window (one
@@ -103,8 +103,8 @@ def register(session: object, label: str) -> int:
     `session` itself here, so it survives collection in the ledger and in a
     delivered event even after the session object is gone.
 
-    A falsy `label` (issue #552 item 4: `EmbeddedBackend.__init__`'s
-    direct-construction route defaults to `label=""`) is never stored or
+    A falsy `label` (`EmbeddedBackend.__init__`'s direct-construction route
+    defaults to `label=""`) is never stored or
     delivered as `""` — that collapses "unlabeled" (this construction route
     passed nothing) with "labeled the empty string" (a caller explicitly
     named an empty target), and a downstream leak report naming `''` reads

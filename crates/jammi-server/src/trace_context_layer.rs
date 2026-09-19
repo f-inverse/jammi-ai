@@ -1,4 +1,4 @@
-//! Whole-server W3C `traceparent` continuation layer (#486).
+//! Whole-server W3C `traceparent` continuation layer.
 //!
 //! Sits beside [`crate::metrics_layer::MetricsLayer`] on the SAME combined
 //! Flight SQL + gRPC chain (added at the same level — see

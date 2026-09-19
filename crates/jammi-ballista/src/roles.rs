@@ -7,8 +7,8 @@
 //! `ballista-scheduler` in this crate's `Cargo.toml` is
 //! `default-features = false`: no `rest-api` surface. This is load-bearing,
 //! not merely a smaller build — the REST API's `get_running_jobs` errors on
-//! a status row with no execution graph (README r43's restart property: a
-//! scheduler restart keeps `compute_jobs` STATUS rows but never revives the
+//! a status row with no execution graph (a scheduler restart keeps
+//! `compute_jobs` STATUS rows but never revives the
 //! graph itself), so a deployment that turned the REST API back on would
 //! regress that property the moment it queried a restarted scheduler.
 
@@ -76,8 +76,8 @@ impl SchedulerRole {
 /// Build the scheduler role: `create_scheduler::<LogicalPlanNode,
 /// PhysicalPlanNode>` over `cluster`, served on `bind` with jammi's own
 /// shutdown. Push-staged, `task_max_failures = stage_max_failures = 0`
-/// (README r40). `cluster`/`distribution` are the ONE constructor argument
-/// U8b swaps behind (contract §3): `jammi-server`'s own hosting always
+/// (retries are the jobs table's, not Ballista's). `cluster`/`distribution`
+/// are the ONE constructor argument pair: `jammi-server`'s own hosting always
 /// passes `BallistaCluster::new(CatalogClusterState, CatalogJobState)` and
 /// `TaskDistributionPolicy::Custom(Arc::new(DevicePlacement))` — there is no
 /// knob, `DevicePlacement` is the shipped policy — kept as parameters here
@@ -101,9 +101,8 @@ pub async fn host_scheduler(
     // (`external_host:bind_port`), which the scheduler stamps into every
     // task it pushes as the identity the executor's status-report loop
     // dials BACK — a `0` there makes every task-status report fail with
-    // "Fail to connect to scheduler ...:0" (found by executing this exact
-    // path in `tests/it/roles.rs` before this fix: red at `addr.port()`,
-    // green at `local_addr.port()`).
+    // "Fail to connect to scheduler ...:0" (`tests/it/roles.rs` fails with
+    // `addr.port()` there and passes with `local_addr.port()`).
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
 
@@ -126,7 +125,7 @@ pub async fn host_scheduler(
         .map_err(Error::Ballista)?;
     let server = SchedulerGrpcServer::new(scheduler);
 
-    // Install the `PlacedGangSubmitter` seam (README r41/contract §2.3): a
+    // Install the `PlacedGangSubmitter` seam: a
     // claimant on THIS host submits its own gang as one Ballista task
     // instead of running it in-process. Write-once on the session; a
     // second `bind` of the same session keeps the first (the same shape
@@ -157,8 +156,8 @@ pub async fn host_scheduler(
 }
 
 /// The `SchedulerConfig` `host_scheduler` builds — pulled into its own pure
-/// function so `task_max_failures`/`stage_max_failures` (README r40: retries
-/// are the jobs table's, not Ballista's) are unit-testable without standing
+/// function so `task_max_failures`/`stage_max_failures` (retries are the
+/// jobs table's, not Ballista's) are unit-testable without standing
 /// up a live scheduler.
 fn scheduler_config(
     bind_ip: String,
@@ -189,7 +188,7 @@ fn scheduler_config(
 
 /// The scheduler role's [`jammi_ai::fine_tune::worker::PlacedGangSubmitter`]:
 /// submits a claimant's own gang as one `GangExec` Ballista task instead of
-/// running it in-process (contract §2.3). `placement_available()` answers
+/// running it in-process. `placement_available()` answers
 /// "a LIVE registered executor other than this instance exists" from the
 /// catalog with `cluster::executor_is_live`, the binder's and the submit
 /// edge's own predicate — `run_claimed_job_under` treats `false` as "run
@@ -262,7 +261,7 @@ impl jammi_ai::fine_tune::worker::PlacedGangSubmitter for SchedulerPlacedGangSub
 
 /// The executor role's [`jammi_ai::fine_tune::worker::PlacedGangRunner`]:
 /// runs a placed gang's coordinator body on THIS process via
-/// `JobWorker::run_placed_gang` (contract §2.3 (ii)-(iv)) — `GangExec::
+/// `JobWorker::run_placed_gang` — `GangExec::
 /// execute` reaches this through the process-global seam `install_
 /// placed_gang_runner` registers, since a Ballista executor's `TaskContext`
 /// carries no jammi session.
@@ -302,7 +301,7 @@ pub struct ExecutorRole {
 }
 
 impl ExecutorRole {
-    /// This executor's own devices (kind × ordinal, no memory field — U8b's
+    /// This executor's own devices (kind × ordinal, no memory field — the
     /// `compute_executors.devices` shape, `jammi_db::catalog::instance::
     /// DeviceFact`). Best-effort: a `[worker]`-disabled process (no
     /// local-rank topology) reports none.
@@ -311,14 +310,14 @@ impl ExecutorRole {
     }
 
     /// This executor's instance id, the same id `HostAdmission`/gang
-    /// placement use to identify it (contract §2.3/§9 B1: the executor id
-    /// IS the jammi instance id).
+    /// placement use to identify it (the executor id IS the jammi instance
+    /// id).
     pub fn executor_id(&self) -> &str {
         &self.executor_id
     }
 
     /// RELEASE: stop admitting new work immediately and tear down both
-    /// listeners without waiting for in-flight tasks (contract §9 B6).
+    /// listeners without waiting for in-flight tasks.
     pub async fn stop(self) {
         let _ = self.notifier.notify_shutdown.send(());
         let _ = self.flight_handle.await;
@@ -330,7 +329,7 @@ impl ExecutorRole {
     /// path sends (`executor_process.rs`'s `TERMINATING` flag +
     /// `heart_beat_from_executor` call) so the scheduler stops binding new
     /// tasks here — then wait for every in-flight task to finish, THEN stop
-    /// (contract §9 B6; never tear down a running placed gang).
+    /// (never tear down a running placed gang).
     pub async fn drain(self) {
         self.begin_drain().await;
         TasksDrainedFuture(Arc::clone(&self.executor)).await;
@@ -372,7 +371,7 @@ const SCHEDULER_CONNECT_RETRY: std::time::Duration = std::time::Duration::from_m
 /// task/heartbeat gRPC service + scheduler registration on `cfg.grpc_bind`
 /// via `executor_server::startup` (push-staged), both under jammi's own
 /// shutdown. The executor id IS `session.instance_id()` — the join
-/// `DevicePlacement` (U8b) uses.
+/// `DevicePlacement` uses.
 pub async fn host_executor(
     session: &Arc<InferenceSession>,
     cfg: &BallistaExecutorConfig,
@@ -400,7 +399,7 @@ pub async fn host_executor(
         .parse()
         .map_err(|e| Error::Config(format!("invalid scheduler_address port: {e}")))?;
 
-    // A3: `advertise_host` is required whenever `bind`'s host is
+    // `advertise_host` is required whenever `bind`'s host is
     // unspecified — also enforced at config-load time
     // (`jammi_db::config::BallistaConfig::validate`); re-checked here so a
     // struct-literal config that skipped `load_from` still cannot stand up
@@ -478,7 +477,7 @@ pub async fn host_executor(
         task_scheduling_policy: TaskSchedulingPolicy::PushStaged,
         work_dir: Some(work_dir.clone()),
         concurrent_tasks: cfg.task_slots as usize,
-        // Documentation only on THIS path (A3): the codec that actually
+        // Documentation only on THIS path: the codec that actually
         // governs decode is the one passed to `executor_server::startup`
         // below, not this field — `startup` never reads
         // `ExecutorProcessConfig.override_physical_codec` (only
@@ -572,7 +571,7 @@ pub async fn host_executor(
     let devices = device_facts(session);
 
     // Stamp this executor's OWN device claim onto its `compute_executors`
-    // row (contract §9 B5) — `ClusterState::register_executor`'s fixed
+    // row — `ClusterState::register_executor`'s fixed
     // signature (the gRPC call `executor_server::startup` just completed
     // above triggered) carries no device field, so this process patches its
     // own row directly over the SAME shared catalog right after
@@ -612,7 +611,7 @@ pub async fn host_executor(
         }
     }
 
-    // Install the `PlacedGangRunner` seam (contract §2.3): `GangExec::
+    // Install the `PlacedGangRunner` seam: `GangExec::
     // execute` reaches this process's coordinator body through it, since a
     // Ballista executor's `TaskContext` carries no jammi session.
     // Write-once, same shape as `install_member_dialer`.
@@ -636,8 +635,8 @@ pub async fn host_executor(
     })
 }
 
-/// This session's device facts (contract §9 B5/B7; U8b's `compute_executors.
-/// devices` shape): kind × every rank ordinal `[worker]`'s topology names
+/// This session's device facts (the `compute_executors.devices` shape):
+/// kind × every rank ordinal `[worker]`'s topology names
 /// (the CPU sentinel `-1` becomes `0` — a `DeviceFact` ordinal is never
 /// negative), or empty when this process runs no local ranks (`[worker]
 /// enabled = false` / `local_ranks` unset — an executor-only process is not
@@ -651,7 +650,7 @@ fn device_facts(session: &Arc<InferenceSession>) -> Vec<jammi_db::catalog::insta
 mod scheduler_config_tests {
     use super::*;
 
-    /// README r40: both roles pin `task_max_failures = stage_max_failures =
+    /// Both roles pin `task_max_failures = stage_max_failures =
     /// 0` — retries are the jobs table's, never Ballista's own. Mutation:
     /// dropping either literal (or flipping to `SchedulerConfig::default()`'s
     /// `4`) reds this immediately.

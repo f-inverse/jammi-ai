@@ -35,7 +35,7 @@
 //!   matches the f32 direction. This is the only place the gate's *admit* path
 //!   runs — the CPU suite reaches only the non-cuda reject arm and the decision
 //!   predicate in isolation. See `bf16_gpu_gate`.
-//! - **P5 — GGUF/k-quant serving + QLoRA on GPU (issue #351).** CPU↔GPU embed
+//! - **P5 — GGUF/k-quant serving + QLoRA on GPU.** CPU↔GPU embed
 //!   parity over a programmatically-written GGUF-quantized fixture (a
 //!   Q8_1-activation-quantization-specific cosine floor — CUDA's quantized
 //!   matmul re-quantizes the activation, CPU's does not, so the plain P1
@@ -54,25 +54,29 @@
 //! dispatching `ModelTask` verb) cell and requires each to be COVERED (a
 //! `//! gpu-parity-cell: <Arch> × <Verb>` marker in one of these modules),
 //! STRUCTURALLY_EXCLUDED, or PENDING — so an untested cell cannot silently
-//! hide a divergence the way ModernBert×Classification once did (esc-028).
+//! hide a CPU↔GPU divergence.
 //!
 //! ## Gating
 //!
-//! The suite is **off by default**: it compiles and runs only under the
-//! `live-gpu-tests` cargo feature, and a meaningful run *also* needs the `cuda`
-//! feature and a visible GPU. Every test early-returns with a `tracing::warn`
-//! skip (never `#[ignore]`) when the `cuda` feature is off or no CUDA device
-//! opens, so the default `cargo test` lane is unaffected. The GPU sessions pin
-//! `require_gpu = true`, so on a CUDA build with a real GPU a parity test that
-//! reached `select_device` *must* have run on the GPU — a GPU-less build fails
-//! fast at session construction rather than silently degrading to CPU and
-//! faking parity.
+//! The suite is **off by default**: it compiles only under the
+//! `live-gpu-tests` cargo feature (which enables `cuda`), so the default
+//! `cargo test` lane never builds it. Under that feature the host is declared
+//! to have CUDA device 0: a test acquires it through
+//! `jammi_test_resources::cuda_device` (or `harness::serial_cuda_device`),
+//! which panics naming the missing device. The two-device and two-host gang
+//! legs compile only under `live-gpu-gang-tests` / `live-gpu-cluster-tests`.
+//! The GPU sessions pin `require_gpu = true`, so a parity test that reached
+//! `select_device` *must* have run on the GPU — a host without one fails at
+//! session construction rather than silently degrading to CPU and faking
+//! parity.
 //!
-//! The live run is a GPU-host (A10G) gate:
-//! `cargo test -p jammi-ai --features cuda,live-gpu-tests gpu_capability \
+//! The live run is a GPU-host gate:
+//! `cargo test -p jammi-ai --features live-gpu-tests --test gpu_capability \
 //!  -- --nocapture --test-threads=1`.
 
 mod harness;
+#[path = "../it/release_manifest.rs"]
+mod release_manifest;
 
 mod bf16_gpu_gate;
 mod capability_surface;

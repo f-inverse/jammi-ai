@@ -1,5 +1,5 @@
-//! Shared machinery for the GPU-capability suite: the CUDA-availability skip
-//! guard, the paired CPU / GPU session builders, the fixture paths, and the
+//! Shared machinery for the GPU-capability suite: the serialized CUDA device
+//! slot, the paired CPU / GPU session builders, the fixture paths, and the
 //! parity tolerances + comparison helpers every property reuses.
 
 use std::collections::HashMap;
@@ -39,23 +39,6 @@ pub const COSINE_FLOOR: f64 = 0.9999;
 /// floor: no single lane may diverge by more than this regardless of direction.
 pub const ELEMENTWISE_ABS_TOL: f64 = 1e-3;
 
-// ─── CUDA-availability skip guard ──────────────────────────────────────────
-
-/// Whether a CUDA device is usable for this build. `false` whenever the `cuda`
-/// feature is off (the engine compiles no CUDA path) or no device opens, so the
-/// suite skips cleanly on a CPU build / GPU-less host instead of failing.
-#[cfg(feature = "cuda")]
-pub fn gpu_available() -> bool {
-    candle_core::Device::new_cuda(0).is_ok()
-}
-
-/// Without the `cuda` feature the engine has no CUDA path at all, so the suite
-/// always skips.
-#[cfg(not(feature = "cuda"))]
-pub fn gpu_available() -> bool {
-    false
-}
-
 // ─── The one-at-a-time GPU slot for DEVICE-GLOBAL oracles ──────────────────
 
 /// This process's single GPU slot for a DEVICE-GLOBAL measurement. See
@@ -71,9 +54,8 @@ static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A CUDA device that cannot be held without also holding [`GPU_SERIAL`].
 ///
-/// Campaign #446, finding 9 (the class sibling of
-/// `crates/jammi-encoders/tests/esc076_comparable_eager_control.rs`'s own
-/// `SerialGpu`). `gguf_quantized_gpu.rs`'s admission-truthfulness oracle
+/// The sibling of the `SerialGpu` in `jammi-encoders`' eager-control memory
+/// test (the fused-vs-eager allocator-growth comparison). `gguf_quantized_gpu.rs`'s admission-truthfulness oracle
 /// reads DEVICE-GLOBAL memory (`nvidia-smi --query-gpu=memory.used`, a
 /// whole-device figure) as a before/after DELTA around a model load. Any
 /// concurrent allocation on the same device inside that window is charged to
@@ -85,41 +67,38 @@ static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// A test added tomorrow cannot forget to serialize, because it cannot obtain
 /// the device without doing so.
 ///
-/// # Why there is no `Deref<Target = Device>` (round-1 audit)
+/// # Why there is no `Deref<Target = Device>`
 ///
-/// This type used to `impl Deref<Target = Device>`, which kept `&device` call
-/// sites unchanged — and let `let d = (*serial_cuda_device().unwrap()).clone();`
-/// type-check. That one-liner ENDS the serialization: the temporary guard
+/// A `Deref<Target = Device>` impl would let
+/// `let d = (*serial_cuda_device().unwrap()).clone();` type-check. That
+/// one-liner ENDS the serialization: the temporary guard
 /// (and with it the slot) is dropped at the end of the statement, while `d`
 /// is a live, owned `Device` the caller then measures on with no slot held —
 /// the exact escape the wrapper exists to prevent, spelled as ordinary deref
 /// usage.
 ///
-/// [`Self::device`] replaces it: the borrow it returns is tied to `&self`, so
-/// no `&Device` can outlive the guard. Every call site passes
-/// `guard.device()` where it used to pass `&guard`.
+/// [`Self::device`] is the accessor instead: the borrow it returns is tied to
+/// `&self`, so no `&Device` can outlive the guard.
 ///
-/// **What is still open, stated rather than implied.** `candle_core::Device`
+/// **What remains possible.** `candle_core::Device`
 /// is `Clone`, so `guard.device().clone()` compiles and always will —
 /// nothing an API of this shape can do prevents cloning a `Clone` type
 /// reachable by reference (a `&DeviceRef` newtype does not help: if it
 /// derefs to `Device` the clone resolves straight through it, and if it does
-/// not, no call site can pass it where `&Device` is wanted). What changed is
-/// that the escape is now an EXPLICIT, greppable `.device().clone()` rather
-/// than an incidental consequence of deref — a reviewer looking for it has a
+/// not, no call site can pass it where `&Device` is wanted). The escape is an
+/// EXPLICIT, greppable `.device().clone()` rather than an incidental
+/// consequence of deref — a reviewer looking for it has a
 /// single spelling to grep for, and no correct call site needs it.
 ///
-/// **What this does NOT close, stated plainly rather than implied.** Only the
+/// **What this does NOT cover.** Only the
 /// callers of `serial_cuda_device` take the slot. The other thirteen modules
 /// in this binary build GPU-pinned sessions through [`gpu_session`] and
-/// allocate on the same device without taking it; today they are held off the
+/// allocate on the same device without taking it; they are held off the
 /// measurement window ONLY by `ci/scripts/runpod_gpu_prove.sh`'s
-/// `--test-threads=1` on the `gpu_capability` invocation — a CI flag, i.e.
-/// exactly the kind of convention finding 9 is about. Closing that residual
-/// means routing every device acquisition in this binary through this slot
-/// (a change to `gpu_session`'s signature at every call site), which is a
-/// separate, larger unit; it is recorded here so the remaining exposure is
-/// visible at the mechanism rather than only in a review note.
+/// `--test-threads=1` on the `gpu_capability` invocation — a CI convention,
+/// not a structural guarantee. Closing it means routing every device
+/// acquisition in this binary through this slot (a change to `gpu_session`'s
+/// signature at every call site).
 ///
 /// A poisoned lock is recovered with `into_inner` rather than unwrapped: one
 /// leg panicking must fail THAT leg, not turn every sibling into a confusing
@@ -145,38 +124,31 @@ impl SerialGpu {
 /// rather than unwrapping it (see [`SerialGpu`]'s doc for why).
 ///
 /// Split out from [`serial_cuda_device`] so the exclusion property itself is
-/// testable on a GPU-less lane, where no `SerialGpu` can ever be constructed:
-/// `gpu_slot_is_exclusive_while_held` below is the non-vacuous control that
-/// the slot is a real mutex and not a decorative field.
+/// testable without opening a device: `gpu_slot_is_exclusive_while_held`
+/// below is the non-vacuous control that the slot is a real mutex and not a
+/// decorative field.
 fn take_gpu_slot() -> std::sync::MutexGuard<'static, ()> {
     GPU_SERIAL
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// A CUDA device bound to this binary's one-at-a-time [`GPU_SERIAL`] slot —
-/// the ONLY device source a device-global oracle may use. `None` when no CUDA
-/// device opens, which without the `cuda` feature is always: `Device::new_cuda`
-/// exists in either build and simply errors there, so this needs no `cfg` arm
-/// of its own (the caller's `skip_without_gpu!` has already returned in that
-/// lane anyway).
-pub fn serial_cuda_device() -> Option<SerialGpu> {
-    // Taken BEFORE `Device::new_cuda`, so even device ACQUISITION (which
+/// CUDA device 0 bound to this binary's one-at-a-time [`GPU_SERIAL`] slot —
+/// the ONLY device source a device-global oracle may use.
+pub fn serial_cuda_device() -> SerialGpu {
+    // Taken BEFORE the device opens, so even device acquisition (which
     // allocates a context on the device) is serialized against a sibling
     // leg's memory trace.
     let slot = take_gpu_slot();
-    candle_core::Device::new_cuda(0)
-        .ok()
-        .map(|device| SerialGpu {
-            device,
-            _slot: slot,
-        })
+    SerialGpu {
+        device: jammi_test_resources::cuda_device(0),
+        _slot: slot,
+    }
 }
 
 /// The slot is a real mutual exclusion, and it is released only when the
 /// guard drops — the property every device-global oracle in this binary
-/// leans on, pinned on EVERY lane (this one needs no GPU, so the CPU lane
-/// proves it too, where no [`SerialGpu`] can be constructed at all).
+/// leans on. This test opens no device.
 ///
 /// Non-vacuous in both directions: `try_lock` must FAIL while the slot is
 /// held (a decorative, always-available mutex fails here) and SUCCEED once it
@@ -212,26 +184,10 @@ fn gpu_slot_is_exclusive_while_held() {
 /// sibling test dispatching the SAME counter mid-window would corrupt a
 /// before/after delta. This binary's first CPU-hermetic counter test
 /// (`capability_surface`'s
-/// `gelu_erf_fused_bumps_on_a_bert_family_training_forward_cpu_hermetic`,
-/// issue #463 follow-up) takes this lock; any sibling added later must take
+/// `gelu_erf_fused_bumps_on_a_bert_family_training_forward_cpu_hermetic`)
+/// takes this lock; any sibling added later must take
 /// the SAME one rather than minting a second the first cannot see.
 pub static ADMISSION_COUNTER_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Early-return a test with a loud `tracing::warn` skip (never `#[ignore]`)
-/// when no GPU is usable, so the GPU-less / CPU lane runs the suite as a no-op
-/// rather than a failure. Returns `true` when the caller should skip.
-#[macro_export]
-macro_rules! skip_without_gpu {
-    () => {{
-        if !$crate::harness::gpu_available() {
-            tracing::warn!(
-                "SKIP: no usable CUDA device (build the suite with \
-                 `--features cuda,live-gpu-tests` on a GPU host to run it)"
-            );
-            return;
-        }
-    }};
-}
 
 // ─── Fixture paths ───────────────────────────────────────────────────────────
 
@@ -323,8 +279,7 @@ pub async fn cpu_session(artifact_dir: &Path) -> Arc<InferenceSession> {
 }
 
 /// Build a GPU-pinned (`gpu.device = 0`, `require_gpu = true`) session over a
-/// fresh artifact dir, at the default `F32` precision. Only call after
-/// [`gpu_available`] / `skip_without_gpu!`.
+/// fresh artifact dir, at the default `F32` precision.
 pub async fn gpu_session(artifact_dir: &Path) -> Arc<InferenceSession> {
     gpu_session_with_precision(artifact_dir, ComputePrecision::F32).await
 }
@@ -332,8 +287,7 @@ pub async fn gpu_session(artifact_dir: &Path) -> Arc<InferenceSession> {
 /// Build a GPU-pinned (`gpu.device = 0`, `require_gpu = true`) session over a
 /// fresh artifact dir at an explicit inference `precision` — the entry point
 /// for exercising the compute-precision gate on a real device (e.g. `BF16`,
-/// whose runtime compute-capability gate only resolves on a CUDA device). Only
-/// call after [`gpu_available`] / `skip_without_gpu!`.
+/// whose runtime compute-capability gate only resolves on a CUDA device).
 pub async fn gpu_session_with_precision(
     artifact_dir: &Path,
     precision: ComputePrecision,
@@ -591,7 +545,7 @@ pub fn assert_loss_decreases(label: &str, curve: &[(u64, f64)]) -> (f64, f64) {
 }
 
 /// Assert every loss value across one or more captured curves is finite, BY
-/// COUNT (family F9: never a vacuous "some finite" pass — every reported
+/// COUNT (never a vacuous "some finite" pass — every reported
 /// value is checked and the tally is asserted, not merely the endpoints
 /// [`assert_loss_decreases`] happens to touch).
 pub fn assert_all_finite(label: &str, curves: &[&[(u64, f64)]]) {

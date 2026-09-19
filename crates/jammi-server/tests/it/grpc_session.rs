@@ -1,4 +1,4 @@
-//! SPEC-03 §12 #5 — gRPC `CatalogService.SetTenant` + `CatalogService.ListTopics`
+//! gRPC `CatalogService.SetTenant` + `CatalogService.ListTopics`
 //! end-to-end isolation. An in-process server hosts the control plane behind the
 //! shared `SessionStore` + `SessionIdTenantResolver`. Two clients distinguished by
 //! `jammi-session-id` headers bind different tenants and observe the

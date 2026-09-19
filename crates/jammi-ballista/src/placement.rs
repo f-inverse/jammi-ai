@@ -1,8 +1,6 @@
 //! `DevicePlacement` — the `TaskDistributionPolicy::Custom` jammi installs
-//! on every scheduler role (contract `feat_500-wave4.md` §3 and §9 B1;
-//! UNITS §U8a introduced the submitter exclusion, U8b EXTENDS the SAME
-//! policy with the device predicate and the re-launch guard rather than
-//! adding a second one).
+//! on every scheduler role: one policy carrying the submitter exclusion,
+//! the device predicate, and the re-launch guard.
 //!
 //! Round-robin over executor slots, with three refinements over plain
 //! round-robin:
@@ -10,9 +8,9 @@
 //! 1. A stage whose plan contains a `GangExec` is never bound to the
 //!    executor whose id equals the descriptor's own `submitter` instance id
 //!    — the submitter's own host holds a rank/job admission for the whole
-//!    await (contract §9 B1/B2), so binding the gang task back to it would
+//!    await, so binding the gang task back to it would
 //!    deadlock the placed run against itself.
-//! 2. KIND MATCH (contract §3, LANE pressure-round correction): a stage
+//! 2. KIND MATCH: a stage
 //!    whose plan carries a required device kind — a `GangExec` (its
 //!    descriptor's own stamped `device_kind`, CPU included) or an
 //!    `InferenceExec` (its `device_kind()`) —
@@ -23,15 +21,14 @@
 //!    [`jammi_db::catalog::Catalog::list_compute_executor_devices`] — never
 //!    a join through `workers.instance_id`, see that method's doc). A stage
 //!    carrying no device kind (a plain scan/shuffle stage) is unconstrained
-//!    by this refinement. This replaced an earlier "is this GPU-bound"
-//!    predicate that would have refused every `GangExec` on an all-CPU
-//!    cluster (a gang's kind is a property of its DESCRIPTOR, not of the
+//!    by this refinement. The predicate is KIND MATCH, never "is this
+//!    GPU-bound": a gang's kind is a property of its DESCRIPTOR, not of the
 //!    node type — a CPU-stamped gang must bind to a CPU executor, exactly
-//!    as a CPU-stamped `InferenceExec` does).
+//!    as a CPU-stamped `InferenceExec` does.
 //! 3. A `GangExec` stage whose job row is already `claimed_by` an executor
 //!    OTHER than this stage's own submitter is never bound to ANY slot —
-//!    the bind-time half of the re-launch guard (contract §2.4's `
-//!    transfer_claim` is the other half): Ballista's own reset-on-
+//!    the bind-time half of the re-launch guard (`transfer_claim` is the
+//!    other half): Ballista's own reset-on-
 //!    `ExecutorLost` can re-offer a gang's task for binding after the
 //!    original launch already transferred the claim, and this predicate
 //!    refuses that second launch before it ever reaches an executor. A job
@@ -40,7 +37,7 @@
 //!    ownership cannot be verified.
 //!
 //! The slot CAS ([`jammi_db::catalog::Catalog::bind_compute_slots`]) happens
-//! per candidate BEFORE the graph's task info is stamped (contract §9 A10):
+//! per candidate BEFORE the graph's task info is stamped:
 //! a lost CAS — the catalog's committed `available_slots` is the truth,
 //! never this call's in-memory snapshot — leaves that slot's local count at
 //! zero for the rest of this call and the task UNSTAMPED, tried again on the
@@ -267,7 +264,7 @@ impl DistributionPolicy for DevicePlacement {
                             partition_id,
                         };
                         // The distributed lane's per-executor task-binding
-                        // determinant (contract §2.5, acceptance (a3)): the
+                        // determinant: the
                         // Ballista client API exposes no `job_id`/task
                         // attribution to a `submit_physical_plan` caller, so
                         // the lane's own oracle (`tests/distributed/main.rs`)

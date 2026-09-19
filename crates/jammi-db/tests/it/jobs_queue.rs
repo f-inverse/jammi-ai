@@ -1,20 +1,15 @@
 //! Kind-agnostic job-queue primitives on the `jobs`/`instances`/`workers`
 //! catalog tables (migration 029): atomic claim (queued and inline), lease
 //! heartbeat, the full attempt guard, expired-lease/dead-instance reclaim,
-//! and the esc-075 acceleration-report pending/retirement lifecycle.
-//! Supersedes the former `training_jobs`-specific `fine_tune_queue.rs`,
-//! whose claim/heartbeat/reclaim/finalize/acceleration-report coverage this
-//! file carries forward against the generalised table — including the
-//! atomic finish-with-model-registration-and-epoch-checkpoints machinery
-//! [`Catalog::finish_job_with_model`] (the C1a design-gap this unit closes;
-//! see the handoff doc's "Resolved" section).
+//! the acceleration-report pending/retirement lifecycle, and the atomic
+//! finish-with-model-registration-and-epoch-checkpoints machinery
+//! [`Catalog::finish_job_with_model`].
 //!
 //! Every test is parameterised over [`BackendKind`] via `test_case` +
 //! `cfg_attr`. The SQLite lane is always generated; the Postgres lane is
-//! generated only when the `live-postgres-tests` feature is on, and skips at
-//! runtime when `JAMMI_TEST_PG_URL` is unset. The Postgres lane exercises the
-//! `FOR UPDATE SKIP LOCKED` claim path and the global expired-lease reclaim
-//! scan that the SQLite serialized-UPDATE path cannot.
+//! generated only when the `live-postgres-tests` feature is on. The Postgres
+//! lane exercises the `FOR UPDATE SKIP LOCKED` claim path and the global
+//! expired-lease reclaim scan that the SQLite serialized-UPDATE path cannot.
 //!
 //! The claim and reclaim queries scan `jobs` globally (not tenant- or
 //! id-scoped). On the Postgres lane that table is shared across the whole
@@ -25,6 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::common::{make_test_session, queue_session, register_base_model, reset_queue};
 use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::jobs_repo::{
     EpochCheckpointRow, FinishJobParams, FinishJobWithModelParams, SubmitJobParams, WorkerState,
@@ -35,24 +31,8 @@ use jammi_db::catalog::status::{JobExecution, JobStatus};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::StoragePrecision;
 use jammi_db::model_task::ModelTask;
-use jammi_test_utils::make_test_session;
 use tempfile::tempdir;
 use test_case::test_case;
-
-/// SAFETY note: the Postgres lane returns `None` when `JAMMI_TEST_PG_URL`
-/// is unset so the test can early-return rather than `#[ignore]`'ing
-/// (CLAUDE.md forbids `#[ignore]`).
-macro_rules! skip_if_no_backend {
-    ($backend:expr, $dir:expr) => {
-        match make_test_session($backend, $dir).await {
-            Some(s) => s,
-            None => {
-                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
-                return;
-            }
-        }
-    };
-}
 
 const KIND: &str = "fine_tune";
 const KINDS: &[&str] = &[KIND];
@@ -107,44 +87,6 @@ fn run_suffix() -> String {
 /// artifact-path literal added later cannot forget the suffix.
 fn artifact_path(run: &str, tail: &str) -> String {
     format!("file:///artifacts/{run}/{tail}")
-}
-
-/// Register the FK target model `q-base` once per test catalog.
-async fn register_base_model(catalog: &Catalog) {
-    catalog
-        .register_model(RegisterModelParams {
-            model_id: "q-base",
-            version: 1,
-            model_type: "embedding",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: None,
-            config_json: None,
-        })
-        .await
-        .unwrap();
-}
-
-/// Clear every row from `jobs`/`instances`/`workers` so the global
-/// claim/reclaim scans see only the rows this test creates. Needed because
-/// the Postgres lane shares one catalog DB across the run; the SQLite lane
-/// has a fresh tempdir per test but running the reset there too keeps both
-/// lanes on one path. Run under `--test-threads=1` on the Postgres lane, so
-/// it cannot race a sibling test.
-async fn reset_queue(catalog: &Catalog) {
-    catalog
-        .backend_arc()
-        .transaction(TxOptions::default(), |tx| {
-            Box::pin(async move {
-                tx.execute("DELETE FROM jobs", &[]).await?;
-                tx.execute("DELETE FROM workers", &[]).await?;
-                tx.execute("DELETE FROM instances", &[]).await?;
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
 }
 
 /// Force `lease_expires_at = NULL` on one row via raw SQL — the state a
@@ -219,19 +161,6 @@ async fn force_stale_instance(catalog: &Catalog, instance_id: &str, days_ago: i6
         .unwrap();
 }
 
-/// Open a backend-parameterised catalog with the FK base model registered and
-/// an empty queue. Returns `None` to signal the caller should skip (Postgres
-/// without `JAMMI_TEST_PG_URL`).
-macro_rules! queue_catalog {
-    ($backend:expr, $dir:expr) => {{
-        let session = skip_if_no_backend!($backend, $dir);
-        let catalog = Arc::clone(session.catalog());
-        reset_queue(&catalog).await;
-        register_base_model(&catalog).await;
-        (session, catalog)
-    }};
-}
-
 /// Two concurrent claims against a single queued job run on separate tasks of
 /// a multi-thread runtime: exactly one wins, the other sees an empty queue.
 /// The winner's record is `running`, leased to it, and `attempts` is
@@ -247,7 +176,7 @@ macro_rules! queue_catalog {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_worker_claim_exclusivity_grants_one_winner(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("q-1")).await.unwrap();
 
@@ -292,7 +221,7 @@ async fn two_worker_claim_exclusivity_grants_one_winner(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inline_rows_are_never_returned_by_claim_next(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(inline_job_params("in-1")).await.unwrap();
     catalog.submit_job(job_params("q-1")).await.unwrap();
@@ -335,7 +264,7 @@ async fn inline_rows_are_never_returned_by_claim_next(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claim_returns_oldest_queued_job_first(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("old")).await.unwrap();
     // A distinct, strictly-later created_at so ORDER BY is unambiguous.
@@ -359,7 +288,7 @@ async fn claim_returns_oldest_queued_job_first(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claim_honors_priority_over_created_at(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("low")).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -397,7 +326,7 @@ async fn claim_honors_priority_over_created_at(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claim_skips_a_held_job_without_erroring(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("held")).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -447,7 +376,7 @@ async fn claim_skips_a_held_job_without_erroring(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reclaimed_job_retains_priority_and_reenters_ordering(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("sibling")).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -488,7 +417,7 @@ async fn reclaimed_job_retains_priority_and_reenters_ordering(backend: BackendKi
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_claim_composes_with_priority_ordering(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("low")).await.unwrap();
     catalog.submit_job(job_params("high")).await.unwrap();
@@ -521,7 +450,7 @@ async fn concurrent_claim_composes_with_priority_ordering(backend: BackendKind) 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn heartbeat_renews_for_owner_only(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("hb")).await.unwrap();
     let claimed = catalog
@@ -586,7 +515,7 @@ async fn heartbeat_renews_for_owner_only(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attempts_guard_covers_finish_and_progress(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("ag")).await.unwrap();
     // Claim, expire (zero lease), and reclaim: attempts goes 0 -> 1 -> back to
@@ -659,7 +588,7 @@ async fn attempts_guard_covers_finish_and_progress(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reclaim_requeues_then_fails_when_attempts_exhausted(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("rc")).await.unwrap();
 
@@ -721,7 +650,7 @@ async fn reclaim_requeues_then_fails_when_attempts_exhausted(backend: BackendKin
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fail_is_a_lease_guarded_compare_and_set(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("fl")).await.unwrap();
 
@@ -776,7 +705,7 @@ async fn fail_is_a_lease_guarded_compare_and_set(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelling_a_queued_job_retires_it_without_a_claim(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     catalog.submit_job(job_params("cq")).await.unwrap();
 
     assert!(catalog.cancel_request("cq").await.unwrap());
@@ -817,7 +746,7 @@ async fn cancelling_a_queued_job_retires_it_without_a_claim(backend: BackendKind
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelling_a_running_job_flags_it_and_its_owner_ends_it_cancelled(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     catalog.submit_job(job_params("cr")).await.unwrap();
     let claimed = catalog
         .claim_next("worker-a", KINDS, Duration::from_secs(3600))
@@ -860,7 +789,7 @@ async fn cancelling_a_running_job_flags_it_and_its_owner_ends_it_cancelled(backe
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelling_a_queued_inline_job_only_flags_it(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     catalog.submit_job(inline_job_params("ci")).await.unwrap();
 
     assert!(catalog.cancel_request("ci").await.unwrap());
@@ -879,7 +808,7 @@ async fn cancelling_a_queued_inline_job_only_flags_it(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reclaim_leaves_live_leases_untouched(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("live")).await.unwrap();
     catalog
@@ -908,7 +837,7 @@ async fn reclaim_leaves_live_leases_untouched(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claim_always_stamps_a_non_null_lease(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("stamped")).await.unwrap();
     let claimed = catalog
@@ -941,7 +870,7 @@ async fn claim_always_stamps_a_non_null_lease(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_running_row_with_a_null_lease_is_reclaimed(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("nl")).await.unwrap();
     catalog
@@ -975,7 +904,7 @@ async fn a_running_row_with_a_null_lease_is_reclaimed(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inline_job_failed_when_owning_instance_is_stale(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog
         .submit_job(inline_job_params("dead-owner"))
@@ -1024,7 +953,7 @@ async fn inline_job_failed_when_owning_instance_is_stale(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inline_job_failed_when_owning_instance_is_absent(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog
         .submit_job(inline_job_params("no-owner"))
@@ -1053,7 +982,7 @@ async fn inline_job_failed_when_owning_instance_is_absent(backend: BackendKind) 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inline_job_untouched_when_owning_instance_is_live(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog
         .submit_job(inline_job_params("live-owner"))
@@ -1105,7 +1034,7 @@ async fn dead_instances_inline_job_is_failed_while_a_live_peer_with_the_same_lab
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     let lease = Duration::from_secs(3600);
     let label = "gpu-node-7";
 
@@ -1178,7 +1107,7 @@ async fn dead_instances_inline_job_is_failed_while_a_live_peer_with_the_same_lab
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prune_jobs_deletes_only_terminal_rows_past_the_window(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog
         .submit_job(job_params("old-terminal"))
@@ -1203,13 +1132,12 @@ async fn prune_jobs_deletes_only_terminal_rows_past_the_window(backend: BackendK
     assert!(catalog.get_job("old-running").await.is_ok());
 }
 
-// ─── F3: `submit_job_deduped`'s durable per-tenant idempotency key (migration
+// ─── `submit_job_deduped`'s durable per-tenant idempotency key (migration
 // 030) ───────────────────────────────────────────────────────────────────
 
-/// RED before migration 030 + `submit_job_deduped`: there was no
-/// `jobs.idempotency_key` column and no way to dedupe a retry durably (the
-/// old dedupe lived in a process `HashMap`, forgotten across a restart and
-/// racy under two concurrent identical submissions).
+/// The dedupe is durable: it lives in `jobs.idempotency_key`, never in a
+/// process `HashMap` that a restart forgets and two concurrent identical
+/// submissions race.
 ///
 /// Sequential retry: a second `submit_job_deduped` call carrying the SAME
 /// non-empty key as a still-known prior submission returns THAT prior job's
@@ -1222,7 +1150,7 @@ async fn prune_jobs_deletes_only_terminal_rows_past_the_window(backend: BackendK
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submit_job_deduped_sequential_retry_returns_the_same_job_id(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     let first = catalog
         .submit_job_deduped(job_params("dedupe-first"), Some("retry-key-1"))
@@ -1260,7 +1188,7 @@ async fn submit_job_deduped_sequential_retry_returns_the_same_job_id(backend: Ba
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn submit_job_deduped_concurrent_retry_produces_exactly_one_row(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     let cat_1 = Arc::clone(&catalog);
     let cat_2 = Arc::clone(&catalog);
@@ -1299,7 +1227,7 @@ async fn submit_job_deduped_concurrent_retry_produces_exactly_one_row(backend: B
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submit_job_deduped_after_the_row_is_pruned_submits_fresh(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     let first = catalog
         .submit_job_deduped(job_params("dedupe-pruned-first"), Some("prune-key"))
@@ -1339,7 +1267,7 @@ async fn submit_job_deduped_different_tenants_may_reuse_a_key(backend: BackendKi
     use jammi_db::TenantId;
 
     let dir = tempdir().unwrap();
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = make_test_session(backend, dir.path()).await;
     let base = Arc::clone(session.catalog());
     reset_queue(&base).await;
     register_base_model(&base).await;
@@ -1380,7 +1308,7 @@ async fn submit_job_deduped_different_tenants_may_reuse_a_key(backend: BackendKi
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submit_job_deduped_refuses_a_key_one_byte_over_the_bound(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     let oversize_key = "x".repeat(jammi_db::catalog::jobs_repo::MAX_IDEMPOTENCY_KEY_BYTES + 1);
     let err = catalog
@@ -1416,7 +1344,7 @@ async fn submit_job_deduped_refuses_a_key_one_byte_over_the_bound(backend: Backe
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submit_job_deduped_accepts_a_key_exactly_at_the_bound(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     let at_bound_key = "x".repeat(jammi_db::catalog::jobs_repo::MAX_IDEMPOTENCY_KEY_BYTES);
     let id = catalog
@@ -1453,14 +1381,12 @@ async fn force_job_status_and_age(catalog: &Catalog, job_id: &str, status: &str,
 
 // ---------------------------------------------------------------------------
 // `Catalog::finish_job_with_model` — the atomic finish-with-model-
-// registration-and-epoch-checkpoints machinery `training_repo::finalize_
-// training_job` provided, reimplemented on the generalised `jobs` schema's
-// full attempt guard (C1a design-gap resolution; see the handoff doc).
+// registration-and-epoch-checkpoints machinery, under the `jobs` schema's
+// full attempt guard.
 // ---------------------------------------------------------------------------
 
 /// A minimal queued job over `q-base`, carrying `output_model_id` — set at
-/// submit time on the new schema (unlike the removed `training_jobs`, where
-/// it was written only by `finalize_training_job`).
+/// submit time.
 fn job_params_with_output<'a>(job_id: &'a str, output_model_id: &'a str) -> SubmitJobParams<'a> {
     SubmitJobParams {
         output_model_id: Some(output_model_id),
@@ -1468,7 +1394,7 @@ fn job_params_with_output<'a>(job_id: &'a str, output_model_id: &'a str) -> Subm
     }
 }
 
-/// RED without the transaction: `finish_job_with_model` must be a single
+/// `finish_job_with_model` must be a single
 /// attempt-guarded compare-and-set. A worker that lost its lease (a zombie)
 /// must finish nothing — not the job status, not the output model's served
 /// path, and not a single epoch-checkpoint row, even when it presents a
@@ -1486,7 +1412,7 @@ fn job_params_with_output<'a>(job_id: &'a str, output_model_id: &'a str) -> Subm
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn finish_job_with_model_is_an_attempt_guarded_compare_and_set(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     let run = run_suffix();
     let job_id = format!("fz-{run}");
     let model = format!("jammi:fine-tuned:{job_id}");
@@ -1674,7 +1600,7 @@ async fn a_retained_epoch_checkpoints_own_row_makes_its_exact_prefix_referenced(
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     let run = run_suffix();
     let job_id = format!("epoch-ref-{run}");
     let model = format!("jammi:fine-tuned:{job_id}");
@@ -1772,7 +1698,7 @@ async fn a_retained_epoch_checkpoints_own_row_makes_its_exact_prefix_referenced(
     );
 }
 
-/// B5 hardening regression (unit 348), ported: the finish-with-model CAS's
+/// The finish-with-model CAS's
 /// model-row `UPDATE` must be scoped by `name AND version AND tenant`, never
 /// `name` alone — three rows share the name "acme/tuned": (tenant-a, v1),
 /// (tenant-a, v2), (tenant-b, v1) — and a tenant-a finish naming version 1
@@ -1789,7 +1715,7 @@ async fn finish_job_with_model_update_is_scoped_by_version_and_tenant(backend: B
     use jammi_db::TenantId;
 
     let dir = tempdir().unwrap();
-    let session = skip_if_no_backend!(backend, dir.path());
+    let session = make_test_session(backend, dir.path()).await;
     let base = Arc::clone(session.catalog());
     reset_queue(&base).await;
     let run = run_suffix();
@@ -1927,7 +1853,7 @@ async fn finish_job_with_model_update_is_scoped_by_version_and_tenant(backend: B
 #[tokio::test]
 async fn finish_job_with_model_skips_a_name_occupied_epoch_checkpoint(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     let run = run_suffix();
     let job_id = format!("oc-{run}");
     let model = format!("jammi:fine-tuned:oc-{run}");
@@ -2031,8 +1957,8 @@ async fn finish_job_with_model_skips_a_name_occupied_epoch_checkpoint(backend: B
 }
 
 // ---------------------------------------------------------------------------
-// esc-075 — the tri-state `acceleration_report` lifecycle is closed AT THE
-// CATALOG EDGE, ported onto the generalised `jobs` schema.
+// The tri-state `acceleration_report` lifecycle is closed AT THE
+// CATALOG EDGE.
 //
 // `submit_job` stamps `{"state":"pending"}` = "submitted, no claimant has
 // computed a determination YET". That sentence stops being true the moment
@@ -2083,7 +2009,7 @@ async fn set_acceleration_report_raw(catalog: &Catalog, job_id: &str, report: Op
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn record_acceleration_report_writes_under_a_valid_lease(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("ar-1")).await.unwrap();
     let submitted = catalog.get_job("ar-1").await.unwrap();
@@ -2141,7 +2067,7 @@ async fn record_acceleration_report_writes_under_a_valid_lease(backend: BackendK
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn record_acceleration_report_rejects_a_zombies_stale_attempt(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("ar-zombie")).await.unwrap();
 
@@ -2208,7 +2134,7 @@ async fn record_acceleration_report_rejects_a_zombies_stale_attempt(backend: Bac
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acceleration_report_survives_finish(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("ar-fin")).await.unwrap();
     let claimed = catalog
@@ -2252,7 +2178,7 @@ async fn acceleration_report_survives_finish(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acceleration_report_survives_fail(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("ar-fail")).await.unwrap();
     let claimed = catalog
@@ -2285,7 +2211,7 @@ async fn acceleration_report_survives_fail(backend: BackendKind) {
 /// marker (a new attempt will re-probe), while the terminal attempts-
 /// exhausted arm preserves whatever determination the last attempt recorded
 /// — the two arms move `acceleration_report` in OPPOSITE directions because
-/// they mean opposite things about the job's future (#446 finding 1).
+/// they mean opposite things about the job's future.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -2296,7 +2222,7 @@ async fn acceleration_report_reclaim_arms_reset_on_requeue_and_persist_on_exhaus
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("ar-rc")).await.unwrap();
     let claimed = catalog
@@ -2365,7 +2291,7 @@ async fn acceleration_report_reclaim_arms_reset_on_requeue_and_persist_on_exhaus
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fail_rewrites_a_pending_report_to_undetermined(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog
         .submit_job(job_params("ar-f-pending"))
@@ -2414,7 +2340,7 @@ async fn fail_rewrites_a_pending_report_to_undetermined(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn finish_rewrites_a_pending_report_to_undetermined(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog
         .submit_job(job_params("ar-fz-pending"))
@@ -2457,7 +2383,7 @@ async fn finish_rewrites_a_pending_report_to_undetermined(backend: BackendKind) 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fail_preserves_an_already_terminal_report(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     let cases = [
         (
@@ -2515,7 +2441,7 @@ async fn fail_preserves_an_already_terminal_report(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fail_leaves_a_legacy_null_report_unknown(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("ar-f-null")).await.unwrap();
     set_acceleration_report_raw(&catalog, "ar-f-null", None).await;
@@ -2551,7 +2477,7 @@ async fn fail_leaves_a_legacy_null_report_unknown(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reclaim_exhausted_rewrites_a_pending_report_to_undetermined(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("ar-rc-exh")).await.unwrap();
     catalog
@@ -2580,7 +2506,7 @@ async fn reclaim_exhausted_rewrites_a_pending_report_to_undetermined(backend: Ba
 
 /// (iv, new arm) An `inline`-execution job's owning `instances` row going
 /// stale/absent is ALSO a terminal `failed` transition with no live
-/// claimant — the same esc-075 rule applies with its own distinct reason,
+/// claimant — the same retirement rule applies with its own distinct reason,
 /// `inline_executor_died`, never conflated with the queued-execution
 /// exhaustion reason above.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
@@ -2591,7 +2517,7 @@ async fn reclaim_exhausted_rewrites_a_pending_report_to_undetermined(backend: Ba
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inline_liveness_reclaim_rewrites_a_pending_report_to_undetermined(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog
         .submit_job(inline_job_params("ar-inline-dead"))
@@ -2621,7 +2547,7 @@ async fn inline_liveness_reclaim_rewrites_a_pending_report_to_undetermined(backe
 }
 
 // ---------------------------------------------------------------------------
-// esc-107 — `Catalog::create_result_table`'s `jobs.partial_result` CAS must
+// `Catalog::create_result_table`'s `jobs.partial_result` CAS must
 // carry the full `(job_id, claimed_by, attempts)` attempt guard, not
 // `job_id` alone: a `job_id`-only predicate lets a zombie of a REQUEUED and
 // RE-CLAIMED attempt still win the CAS, because the job genuinely IS
@@ -2653,7 +2579,7 @@ fn result_table_params<'a>(
     }
 }
 
-/// RED against the `job_id`-only predicate this unit replaced: a zombie
+/// Fails against a `job_id`-only predicate: a zombie
 /// presenting a SUPERSEDED attempt (its lease expired, the job was requeued
 /// and re-claimed by a different instance, all while the zombie never
 /// learned its lease was gone) must not win the `partial_result` CAS just
@@ -2670,7 +2596,7 @@ async fn create_result_table_cas_rejects_a_zombies_stale_attempt_across_a_reclai
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     let job_id = format!("rt-1-{}", run_suffix());
     let zombie_table = format!("{job_id}-zombie-table");
     let live_table = format!("{job_id}-live-table");
@@ -2757,7 +2683,7 @@ async fn create_result_table_cas_rejects_a_zombies_stale_attempt_across_a_reclai
 }
 
 // ---------------------------------------------------------------------------
-// OPS (#482) — lease RELEASE on the jobs class: `release_job_lease` /
+// Lease RELEASE on the jobs class: `release_job_lease` /
 // `release_jobs_claimed_by` (the heartbeat CAS + `lease_expires_at = NULL,
 // releases = releases + 1`, both carrying `AND lease_expires_at IS NOT NULL`),
 // the release-aware reclaim cap (`attempts - releases`), the re-arm guard on
@@ -2789,7 +2715,7 @@ async fn released_job_is_requeued_by_the_next_reclaim_without_waiting_for_expiry
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     let lease = Duration::from_secs(3600);
 
     catalog.submit_job(job_params("rel")).await.unwrap();
@@ -2854,12 +2780,11 @@ async fn released_job_is_requeued_by_the_next_reclaim_without_waiting_for_expiry
     assert_eq!(untouched.releases, 0);
 }
 
-/// R2 (round-2 REFINE, #482): the release write's own per-arm effect,
-/// pinned as a before/after DELTA rather than a cross-arm row-equality
-/// claim (the deleted `release_write_is_identical_on_library_and_server`
-/// had zero true-positive capacity — both its arms funnelled into the
-/// SAME `release_and_stop` call, and the design's own outcome (iii)
-/// permits the two rows it compared to differ). `release_job_lease`'s SQL
+/// The release write's own per-arm effect, pinned as a before/after DELTA
+/// rather than a cross-arm row-equality claim (a library-vs-server row
+/// comparison has no true-positive capacity: both arms funnel into the SAME
+/// `release_and_stop` call, and the two rows may legitimately differ).
+/// `release_job_lease`'s SQL
 /// (`jobs_repo.rs`) sets exactly three columns —
 /// `lease_expires_at = NULL, releases = releases + 1, updated_at = $now`
 /// — so this asserts that delta EXACTLY: every other `JobRecord` field is
@@ -2880,7 +2805,7 @@ async fn release_job_lease_write_is_exactly_lease_null_releases_plus_one_and_tim
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     let lease = Duration::from_secs(3600);
 
     catalog.submit_job(job_params("delta")).await.unwrap();
@@ -3027,7 +2952,7 @@ async fn release_jobs_claimed_by_write_is_exactly_lease_null_releases_plus_one_a
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     let lease = Duration::from_secs(3600);
 
     catalog.submit_job(job_params("sweep-a")).await.unwrap();
@@ -3105,16 +3030,16 @@ async fn release_jobs_claimed_by_write_is_exactly_lease_null_releases_plus_one_a
     assert_eq!(catalog.release_jobs_claimed_by("me").await.unwrap(), 0);
 }
 
-/// #516: the release-write delta oracles above compare through `JobRecord`
-/// (`SELECT_COLS`), so a column outside that projection — `idempotency_key`
-/// (`schema.rs:1066`, sitting outside `SELECT_COLS`) is the one that
-/// surfaced the gap — is invisible to them by construction; a future
+/// The release-write delta oracles above compare through `JobRecord`
+/// (`SELECT_COLS`), so a column outside that projection — e.g.
+/// `idempotency_key` — is invisible to them by construction; a future
 /// release statement that touched it would pass both oracles above
 /// unnoticed. This one asserts the SAME delta over a LIVE all-columns
 /// snapshot instead: the column list is read from `PRAGMA table_info('jobs')`
 /// / `information_schema.columns` at test time (never a hardcoded list, so
 /// a column added after this test is written is covered the day it lands,
-/// never invisible the way `SELECT_COLS` was) and every column is projected
+/// never invisible the way a `SELECT_COLS` projection is) and every column
+/// is projected
 /// `CAST(col AS TEXT)` — the `Row` seam has no column-enumeration API, so
 /// this is the explicit workaround, not a permanent second reader.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
@@ -3125,10 +3050,10 @@ async fn release_jobs_claimed_by_write_is_exactly_lease_null_releases_plus_one_a
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn release_job_lease_write_delta_is_visible_over_every_live_column(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     let lease = Duration::from_secs(3600);
 
-    // `idempotency_key` set to a non-NULL value: the column #516 names,
+    // `idempotency_key` set to a non-NULL value: a column outside `SELECT_COLS`,
     // proving the snapshot is not vacuously passing on a NULL == NULL
     // comparison.
     catalog
@@ -3177,7 +3102,7 @@ async fn release_job_lease_write_delta_is_visible_over_every_live_column(backend
     );
     assert_eq!(
         before["idempotency_key"], after["idempotency_key"],
-        "the column #516 named must round-trip byte-identical across the release"
+        "idempotency_key (outside SELECT_COLS) must round-trip byte-identical across the release"
     );
 
     // A row claimed by a different instance stays completely untouched on
@@ -3192,7 +3117,7 @@ async fn release_job_lease_write_delta_is_visible_over_every_live_column(backend
 /// The live `jobs` column list, backend-appropriate: `PRAGMA
 /// table_info('jobs')` on SQLite, `information_schema.columns` on Postgres.
 /// Never hardcoded — a future migration's new column is picked up here
-/// automatically, which is the whole point of #516's fix.
+/// automatically, which is the whole point.
 async fn live_jobs_columns(catalog: &Catalog, backend: BackendKind) -> Vec<String> {
     catalog
         .backend_arc()
@@ -3281,7 +3206,7 @@ async fn snapshot_all_jobs_columns(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reclaim_cap_counts_attempts_minus_releases(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     const MAX: u32 = 3;
     let lease = Duration::from_secs(3600);
 
@@ -3409,7 +3334,7 @@ async fn reclaim_cap_counts_attempts_minus_releases(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_double_release_increments_releases_once(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     let lease = Duration::from_secs(3600);
 
     catalog.submit_job(job_params("dbl")).await.unwrap();
@@ -3484,8 +3409,7 @@ async fn a_double_release_increments_releases_once(backend: BackendKind) {
 /// `create_result_table`'s `partial_result` CAS: after the successor's
 /// claim-and-fail arm clears the column, the SAME attempt's own
 /// `create_result_table` records its fresh table instead of landing
-/// `JobAttemptSuperseded` (the pre-existing defect the 68 README records,
-/// escape `esc-110`). A stale attempt or a different table name clears
+/// `JobAttemptSuperseded`. A stale attempt or a different table name clears
 /// nothing.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
@@ -3495,7 +3419,7 @@ async fn a_double_release_increments_releases_once(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clear_partial_result_lets_the_next_attempt_record_its_own_table(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     let suffix = run_suffix();
     let t1 = format!("cpr_t1_{suffix}");
     let t2 = format!("cpr_t2_{suffix}");
@@ -3579,7 +3503,7 @@ async fn clear_partial_result_lets_the_next_attempt_record_its_own_table(backend
 
 /// The finalize CAS is `claimed_by / status / attempts`, never the lease
 /// (`jobs_repo.rs` finish/fail): a released row can still be finished by
-/// its old holder — the named library-only divergence (D19), pinned here as
+/// its old holder — a named library-only divergence, pinned here as
 /// a fact rather than left implicit.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
@@ -3589,7 +3513,7 @@ async fn clear_partial_result_lets_the_next_attempt_record_its_own_table(backend
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn finalize_cas_still_matches_a_released_lease(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     let lease = Duration::from_secs(3600);
 
     // `finish_job` (the compute finalize).
@@ -3689,7 +3613,7 @@ async fn finalize_cas_still_matches_a_released_lease(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn count_jobs_by_kind_status_matches_row_counts(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     let lease = Duration::from_secs(3600);
 
     assert!(
@@ -3767,7 +3691,7 @@ async fn count_jobs_by_kind_status_matches_row_counts(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_worker_state_round_trips_through_list_workers(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     let state_of = |workers: Vec<jammi_db::catalog::jobs_repo::WorkerRecord>| {
         workers
             .into_iter()
@@ -3835,8 +3759,8 @@ async fn set_worker_state_round_trips_through_list_workers(backend: BackendKind)
     assert!(catalog.delete_worker("w-state").await.unwrap());
 }
 
-/// `upsert_worker`'s `devices` param round-trips through `list_workers`
-/// (67 wave-4 U8b): unset (`&[]`) reads back as an empty list, a written
+/// `upsert_worker`'s `devices` param round-trips through `list_workers`:
+/// unset (`&[]`) reads back as an empty list, a written
 /// device list reads back exactly, and a re-upsert REPLACES the device list
 /// (never merges).
 #[test_case(BackendKind::Sqlite ; "sqlite")]
@@ -3849,7 +3773,7 @@ async fn upsert_worker_devices_round_trips_through_list_workers(backend: Backend
     use jammi_db::catalog::instance::DeviceFact;
 
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
     let devices_of = |workers: Vec<jammi_db::catalog::jobs_repo::WorkerRecord>| {
         workers
             .into_iter()
@@ -3911,8 +3835,7 @@ async fn upsert_worker_devices_round_trips_through_list_workers(backend: Backend
 
 /// A malformed `workers.devices` value (planted out-of-band — never through
 /// `upsert_worker`) is a ROW FACT: `list_workers` still returns the row,
-/// with `devices` decoded as an empty list, never a read fault (issue
-/// #574's shape).
+/// with `devices` decoded as an empty list, never a read fault.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -3921,7 +3844,7 @@ async fn upsert_worker_devices_round_trips_through_list_workers(backend: Backend
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_worker_devices_is_a_row_fact_not_a_read_fault(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog
         .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
@@ -3966,8 +3889,7 @@ async fn malformed_worker_devices_is_a_row_fact_not_a_read_fault(backend: Backen
     );
 }
 
-// ─── transfer_claim: the placed-gang hand-off (67 wave-4 U8b, design
-// contract feat_500-wave4.md § 2.4) ─────────────────────────────────────────
+// ─── transfer_claim: the placed-gang hand-off ─────────────────────────────
 
 /// A transfer moves `claimed_by` and stamps a fresh lease deadline, leaving
 /// `attempts`/`releases`/`status` untouched (zero net attempts: a hand-off,
@@ -3982,7 +3904,7 @@ async fn transfer_claim_moves_the_row_leaving_attempts_releases_status_unchanged
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("xfer-ok")).await.unwrap();
     let claimed = catalog
@@ -4043,7 +3965,7 @@ async fn transfer_claim_refuses_wrong_from_stale_attempts_and_a_second_launch(
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("xfer-stale")).await.unwrap();
     catalog
@@ -4121,7 +4043,7 @@ async fn transfer_claim_refuses_wrong_from_stale_attempts_and_a_second_launch(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transfer_claim_after_lease_expiry_fails(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog
         .submit_job(job_params("xfer-expired"))
@@ -4147,7 +4069,7 @@ async fn transfer_claim_after_lease_expiry_fails(backend: BackendKind) {
     assert!(!moved, "an expired lease must never transfer");
 }
 
-/// Pressure-round delta 2: a RELEASE ([`Catalog::release_job_lease`]) NULLs
+/// A RELEASE ([`Catalog::release_job_lease`]) NULLs
 /// the lease, and `transfer_claim`'s lease conjunct is a POSITIVE
 /// comparison (`lease_expires_at > now`), never `IS NULL OR …` — so a
 /// transfer of a released claim must fail, not succeed. The row is left
@@ -4160,7 +4082,7 @@ async fn transfer_claim_after_lease_expiry_fails(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transfer_claim_after_release_fails(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog
         .submit_job(job_params("xfer-released"))
@@ -4217,7 +4139,7 @@ async fn transfer_claim_after_release_fails(backend: BackendKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transfer_claim_new_holder_can_heartbeat_old_holder_cannot(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
 
     catalog.submit_job(job_params("xfer-hb")).await.unwrap();
     catalog

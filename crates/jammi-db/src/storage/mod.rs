@@ -8,7 +8,7 @@
 //! [`writer::ObjectParquetWriter`] and [`sidecar_layout`] to round-trip
 //! Arrow data + USearch indexes.
 //!
-//! # Sealed: no raw driver leaves this crate via the registry/builder (#588)
+//! # Sealed: no raw driver leaves this crate via the registry/builder
 //!
 //! `registry::StorageRegistry::driver_for` and
 //! `builder::build_object_store` hand back the raw, unguarded
@@ -39,10 +39,8 @@
 //! A shorter path, `jammi_db::storage::build_object_store` (skipping the
 //! `builder::` segment), is fenced too — but by a DIFFERENT error, because
 //! this module's own `pub use` list below never re-exports the function at
-//! all (sealing it here would have been the OTHER way to close this path,
-//! and was rejected: a `pub use` of a `pub(crate)` item is itself a compile
-//! error, `E0364`, so there was never a working re-export to narrow — the
-//! path is simply absent):
+//! all (a `pub use` of a `pub(crate)` item is itself a compile error,
+//! `E0364`, so there is no re-export to narrow — the path is simply absent):
 //!
 //! ```compile_fail,E0425
 //! let url = jammi_db::storage::StorageUrl::memory("x");
@@ -51,8 +49,8 @@
 //! let _driver = jammi_db::storage::build_object_store(&url, None);
 //! ```
 //!
-//! Mutation executed to prove each doctest bites: flipping `driver_for`/
-//! `build_object_store` back to `pub` makes the first two snippets compile;
+//! Each doctest bites: making `driver_for`/`build_object_store` `pub` makes
+//! the first two snippets compile;
 //! adding `pub use builder::build_object_store;` to this module's `pub use`
 //! list makes the third compile too (a real path would then exist). Either
 //! mutation makes `cargo test -p jammi-db --doc` report the corresponding

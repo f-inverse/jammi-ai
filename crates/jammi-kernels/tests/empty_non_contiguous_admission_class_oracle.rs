@@ -1,39 +1,33 @@
-//! Class regression oracle for issue #436 / PR #435's consolidated fix:
-//! across this crate's `crate::cuda::*` glue, a zero-element fast path
-//! (`if hidden == 0 || n == 0 { .. }` and its siblings) used to run
-//! BEFORE the arm's own `contiguous_offsets()` layout check, so a
-//! zero-element NON-CONTIGUOUS layout (e.g. a `(0, 3)` tensor transposed
-//! to `(3, 0)`: `candle_core::Shape::is_contiguous` resets its running
-//! stride accumulator to `0` at a zero-sized dim, so a LATER dim with a
-//! real stride correctly reads as non-contiguous even though the tensor
-//! holds no elements — reproduced directly below) was silently ADMITTED
-//! on CUDA while `cpu_fwd` refused it outright. The reference fix is
-//! `ops::dropout::DropoutFused::metal_fwd`'s identical shape (commit
-//! `29e8b569`); every `crate::cuda::*` site now checks contiguity FIRST,
-//! matching each op's own `cpu_fwd` domain exactly (see each site's own
-//! comment in `crate::cuda::{dropout,layer_norm,softmax,rope,
-//! rope_positions,attention_block}` for the specific split — an axis
-//! that `cpu_fwd` itself EXEMPTS from contiguity, e.g. `LayerNormFused`'s
-//! `hidden == 0`, still exempts it here too; only the broader `n == 0`
-//! sub-case that `cpu_fwd` does NOT exempt was the actual bug).
+//! Class oracle: across this crate's `crate::cuda::*` glue, the arm's own
+//! `contiguous_offsets()` layout check runs BEFORE any zero-element fast
+//! path (`if hidden == 0 || n == 0 { .. }` and its siblings). In the other
+//! order a zero-element NON-CONTIGUOUS layout (e.g. a `(0, 3)` tensor
+//! transposed to `(3, 0)`: `candle_core::Shape::is_contiguous` resets its
+//! running stride accumulator to `0` at a zero-sized dim, so a LATER dim
+//! with a real stride correctly reads as non-contiguous even though the
+//! tensor holds no elements — reproduced directly below) is silently
+//! ADMITTED on CUDA while `cpu_fwd` refuses it outright.
+//! `ops::dropout::DropoutFused::metal_fwd` has the identical shape; every
+//! `crate::cuda::*` site checks contiguity FIRST, matching each op's own
+//! `cpu_fwd` domain exactly (see each site's own comment in
+//! `crate::cuda::{dropout,layer_norm,softmax,rope,rope_positions,
+//! attention_block}` for the specific split — an axis that `cpu_fwd`
+//! itself EXEMPTS from contiguity, e.g. `LayerNormFused`'s `hidden == 0`,
+//! is exempt here too; only the broader `n == 0` sub-case is not).
 //!
-//! This file is the ONE shared class oracle the fix's issue asks for —
-//! not 18 independent copies. [`assert_class_refuses_empty_non_contiguous_admission`]
+//! This file is ONE shared class oracle, not one copy per op. [`assert_class_refuses_empty_non_contiguous_admission`]
 //! is the single assertion helper, run against `Device::Cpu`
 //! unconditionally (so a plain `cargo test -p jammi-kernels` — no `cuda`
 //! feature — still proves the CPU side, which is every one of these
 //! representative ops' actual documented domain) and, under the `cuda`
-//! feature (the prove lane), against a real CUDA device too — the SAME
+//! `live-gpu-tests` feature, against a real CUDA device too — the SAME
 //! fixtures, the SAME assertions, one code path for both devices.
 //!
 //! ## Representative op set — chosen for domain-SHAPE coverage, not for size
 //!
-//! Three distinct `cpu_fwd` domain shapes exist across the fixed class
-//! (module docs of each op cited below); one representative per shape is
-//! enough to prove the CUDA glue's admission now matches ALL of them,
-//! since a shape not covered by ONE of these three would not have been
-//! `cpu_fwd`-domain-aligned by this fix's own method (reading `cpu_fwd`
-//! first) either:
+//! Three distinct `cpu_fwd` domain shapes exist across the class (module
+//! docs of each op cited below); one representative per shape is enough to
+//! prove the CUDA glue's admission matches ALL of them:
 //!
 //! 1. **No empty fast path at all** — `ops::dropout::DropoutFused::cpu_fwd`
 //!    calls `contiguous_offsets()` UNCONDITIONALLY; an empty tensor is a
@@ -46,27 +40,25 @@
 //!    NOT for a `rows == 0`-but-that-axis-nonzero empty-non-contiguous
 //!    layout, which still hits `contiguous_offsets()`. [`LayerNormFused`]
 //!    and [`SoftmaxLastDimFused`] are this leg (two, since each fused
-//!    op's CUDA glue independently OR'd its axis check with a broader
-//!    `n == 0` before this fix — worth pinning on more than one sibling).
+//!    op's CUDA glue decides its axis check independently — worth pinning
+//!    on more than one sibling).
 //! 3. **No empty fast path at ALL, for a THIRD reason (a composed op)** —
 //!    `ops::attention_block::AttentionBlockFused::cpu_fwd`'s own comment:
 //!    "No empty fast path on this arm" — its mask/dtype/contiguity checks
 //!    run even when `b`/`s`/`h` is 0; only the actual GEMM/gather compute
 //!    is skipped for an empty `qkv`. [`AttentionBlockFused`] is this leg.
 //!
-//! `crate::cuda::{scaled_cast_add,cast_scale,adamw_step}`'s own fix
-//! (the SAME reordering, `crate::cuda`'s own module doc) is a
-//! DIFFERENT shape not exercised by THIS file: those ops' `cpu_fwd` arms
+//! `crate::cuda::{scaled_cast_add,cast_scale,adamw_step}` (the SAME
+//! ordering, `crate::cuda`'s own module doc) are a DIFFERENT shape not
+//! exercised by THIS file: those ops' `cpu_fwd` arms
 //! never call `contiguous_offsets()` at all (they walk `StridedOffsets`,
 //! tolerating any stride), so there is no "same refusal on CPU" to prove
-//! for them — the fix there is the CUDA arm's OWN internal
-//! self-consistency (an empty tensor should be refused the same way a
-//! non-empty one already is, matching that arm's own documented domain),
-//! not a CPU/CUDA parity fact this file's shared-assertion shape can
-//! state. Diagnosed, not merged in for a superficial fixture-count bump
-//! (family K: matching the right tool to the actual structure).
+//! for them — the property there is the CUDA arm's OWN internal
+//! self-consistency (an empty tensor is refused the same way a non-empty
+//! one is, matching that arm's own documented domain), not a CPU/CUDA
+//! parity fact this file's shared-assertion shape can state.
 //! `ops::geglu::GegluFused`'s CUDA glue was read against the SAME method
-//! and found ALREADY aligned (its `intermediate == 0` fast path is the
+//! and is aligned (its `intermediate == 0` fast path is the
 //! IDENTICAL condition `cpu_fwd` itself gates on, in the same relative
 //! position) — no divergence, so no fixture is needed there either.
 
@@ -111,9 +103,9 @@ fn assert_class_refuses_empty_non_contiguous_admission(device: &Device) {
     // Leg 2a (shape 2 — axis-exempt, `hidden`): `LayerNormFused`. `x`'s
     // OWN reduction axis (last dim, `hidden`) stays a NONZERO `5`; the
     // ZERO axis sits earlier (`rows == 0` via a DIFFERENT dim), pinning
-    // the exact split this fix introduces between `hidden == 0` (`cpu_fwd`
-    // exempts contiguity there) and this `n == 0`-with-`hidden != 0` case
-    // (`cpu_fwd` does NOT exempt it — the actual bug).
+    // the exact split between `hidden == 0` (`cpu_fwd` exempts contiguity
+    // there) and this `n == 0`-with-`hidden != 0` case (`cpu_fwd` does NOT
+    // exempt it).
     {
         let x = Tensor::zeros((0usize, 3usize, 5usize), DType::F32, device)
             .unwrap()
@@ -137,10 +129,9 @@ fn assert_class_refuses_empty_non_contiguous_admission(device: &Device) {
 
     // Leg 2b (shape 2 — axis-exempt, `last`): `SoftmaxLastDimFused`. The
     // identical construction as leg 2a, over `scores`/`mask` instead of
-    // `x`/`gamma` — a SIBLING fused op whose CUDA glue independently OR'd
-    // `last == 0` with a broader `n == 0` before this fix, so it is
-    // pinned separately rather than assumed to share `LayerNormFused`'s
-    // fate.
+    // `x`/`gamma` — a SIBLING fused op whose CUDA glue decides its
+    // `last == 0` exemption independently, so it is pinned separately
+    // rather than assumed to share `LayerNormFused`'s behavior.
     {
         let scores = Tensor::zeros((0usize, 3usize, 5usize), DType::F32, device)
             .unwrap()
@@ -164,8 +155,8 @@ fn assert_class_refuses_empty_non_contiguous_admission(device: &Device) {
 
     // Leg 3 (shape 3 — composed op, no empty fast path at all):
     // `AttentionBlockFused`. `qkv`'s OWN `seq` axis is empty (`s == 0`,
-    // one of the three axes the CUDA arm's `b == 0 || s == 0 || h == 0`
-    // fast path used to check BEFORE contiguity); `batch`/`heads` stay
+    // one of the three axes of the CUDA arm's `b == 0 || s == 0 || h == 0`
+    // fast path, which runs AFTER contiguity); `batch`/`heads` stay
     // nonzero. `rope: false`, so `rope_pack`'s own shape/dtype is
     // irrelevant (never read on this path — module doc); `mask` is a
     // small, VALID, contiguous fixture (its own domain is not what this
@@ -215,13 +206,12 @@ fn cpu_refuses_empty_non_contiguous_admission_across_representative_ops() {
     assert_class_refuses_empty_non_contiguous_admission(&Device::Cpu);
 }
 
-/// A DIFFERENT class from the admission-order fix above (shape, not
-/// cause): `crate::cuda::layer_norm::cuda_bwd_dgamma`'s `rows == 0,
-/// hidden != 0` fast path used to return `alloc_empty`'s `[0]`-shaped
-/// buffer — `cpu_fwd`'s OWN `rows == 0` path (`ln_bwd_dgamma_f32`'s
-/// `vec![0f32; hidden]`) returns a `[hidden]`-shaped, all-zero buffer
-/// instead, so the CUDA arm produced a WRONG-SHAPED `dgamma` for a
-/// zero-row batch. Pinned via the only public surface that reaches the
+/// A DIFFERENT class from the admission order above (shape, not cause):
+/// `crate::cuda::layer_norm::cuda_bwd_dgamma`'s `rows == 0, hidden != 0`
+/// fast path must return a `[hidden]`-shaped, all-zero buffer, as
+/// `cpu_fwd`'s OWN `rows == 0` path (`ln_bwd_dgamma_f32`'s
+/// `vec![0f32; hidden]`) does — not `alloc_empty`'s `[0]`-shaped buffer, a
+/// WRONG-SHAPED `dgamma` for a zero-row batch. Pinned via the only public surface that reaches the
 /// (private) `LayerNormBwdDgamma` op: `LayerNormFused` with
 /// `dgamma_needed: true`, differentiated through `Tensor::backward()` —
 /// matching `ops::layer_norm::tests::bwd_dgamma_zero_rows_hidden_nonzero_
@@ -267,54 +257,27 @@ fn cpu_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero() {
     assert_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero(&Device::Cpu);
 }
 
-/// The CUDA leg — compiled only under the `cuda` feature, this crate's
-/// prove-lane landing proof that `crate::cuda::layer_norm::cuda_bwd_
-/// dgamma`'s `rows == 0, hidden != 0` fast path now returns a `[hidden]`-
-/// shaped, all-zero `dgamma`, matching `cpu_fwd` exactly, rather than the
-/// `[0]`-shaped buffer it returned before this fix.
-#[cfg(feature = "cuda")]
-#[test]
-fn cuda_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero() {
-    let Some(device) = cuda_device_or_skip() else {
-        return;
-    };
-    assert_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero(&device);
-}
+#[cfg(feature = "live-gpu-tests")]
+mod gpu {
+    use super::*;
 
-/// Acquire a CUDA device for this file's own CUDA-gated leg, or `None` to
-/// skip — unless `JAMMI_REQUIRE_CUDA` is set, in which case a
-/// device-acquisition failure PANICS instead of returning. Mirrors
-/// `tests/cuda_parity.rs`'s own `cuda_device` exactly (same skip-vs-fail
-/// rationale); registered as ITS OWN entry in
-/// `ci/kernel-oracle-helpers.txt` (KO-7 gating is scoped per `(file, fn)`,
-/// never shared cross-file by name alone).
-#[cfg(feature = "cuda")]
-fn cuda_device_or_skip() -> Option<Device> {
-    match Device::new_cuda(0) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!("JAMMI_REQUIRE_CUDA is set but no CUDA device could be acquired: {e}");
-            }
-            eprintln!(
-                "empty_non_contiguous_admission_class_oracle: skipping — no CUDA device \
-                 available: {e}"
-            );
-            None
-        }
+    /// The CUDA leg — compiled only under `live-gpu-tests`: proves
+    /// `crate::cuda::layer_norm::cuda_bwd_dgamma`'s `rows == 0, hidden != 0`
+    /// fast path returns a `[hidden]`-shaped, all-zero `dgamma`, matching
+    /// `cpu_fwd` exactly.
+    #[test]
+    fn cuda_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero() {
+        let device = jammi_test_resources::cuda_device(0);
+        assert_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero(&device);
     }
-}
 
-/// The CUDA leg — compiled only under the `cuda` feature, this crate's
-/// prove-lane landing proof that `crate::cuda::{dropout,layer_norm,
-/// softmax,attention_block}`'s glue now refuses the SAME fixtures the CPU
-/// leg above does, rather than silently admitting them through the
-/// zero-element fast path this fix reorders past contiguity.
-#[cfg(feature = "cuda")]
-#[test]
-fn cuda_refuses_empty_non_contiguous_admission_across_representative_ops() {
-    let Some(device) = cuda_device_or_skip() else {
-        return;
-    };
-    assert_class_refuses_empty_non_contiguous_admission(&device);
+    /// The CUDA leg — compiled only under `live-gpu-tests`: proves
+    /// `crate::cuda::{dropout,layer_norm,softmax,attention_block}`'s glue
+    /// refuses the SAME fixtures the CPU leg above does, rather than silently
+    /// admitting them through a zero-element fast path.
+    #[test]
+    fn cuda_refuses_empty_non_contiguous_admission_across_representative_ops() {
+        let device = jammi_test_resources::cuda_device(0);
+        assert_class_refuses_empty_non_contiguous_admission(&device);
+    }
 }

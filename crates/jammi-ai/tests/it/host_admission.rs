@@ -1,5 +1,5 @@
 //! `HostAdmission` — this host's single job-slot holder cell and shutdown
-//! phase (plan 67 README r27; OPS D6/D10), exercised at the cell and through
+//! phase, exercised at the cell and through
 //! the REAL claim loop.
 //!
 //! The lattice: `Free` admits a rank; `ClaimProbe` is waited on for at most
@@ -279,7 +279,7 @@ async fn the_phase_cell_drains_once_and_release_wins() {
 }
 
 // ---------------------------------------------------------------------------
-// The real claim loop (d2', OPS D6).
+// The real claim loop.
 // ---------------------------------------------------------------------------
 
 /// The loop moves the holder `Free → ClaimProbe` (observed parked in the
@@ -327,7 +327,7 @@ async fn the_claim_loop_moves_the_holder_free_probe_run_free() {
     session.close().await;
 }
 
-/// A peer never claims while it holds a rank (OPS D6): with a `Rank` held,
+/// A peer never claims while it holds a rank: with a `Rank` held,
 /// an idle loop skips every claim (`claim_next` is never called across two
 /// idle polls, the queued job stays `queued`); the moment the hold drops,
 /// the loop claims it. Mutation proof: removing the `probe_claim` gate lets
@@ -436,7 +436,7 @@ async fn an_inline_run_now_never_touches_the_holder() {
     session.close().await;
 }
 
-/// RELEASE reads the holder KIND (OPS D10): with a `Rank` held beside a
+/// RELEASE reads the holder KIND: with a `Rank` held beside a
 /// loop that is NOT idle — parked after `reclaim_expired_jobs`, before its
 /// second gate read (`arm_after_reclaim`), the one place an idle-slot loop
 /// can still be mid-round-trip when 2e runs — `release_and_stop` neither
@@ -444,7 +444,7 @@ async fn an_inline_run_now_never_touches_the_holder() {
 /// park is released 300 ms in, the loop's second gate read sees
 /// `Releasing` and exits cooperatively (`Stopped`, witnessed); the phase
 /// flips to `Releasing`, which is what ends the held rank's own session.
-/// Mutation proof (executed): treating a `Rank` like `JobRun` (abort now)
+/// Mutation proof: treating a `Rank` like `JobRun` (abort now)
 /// aborts the parked task before the park is ever released — the report
 /// reads `Aborted`, not `Stopped`. An idle loop would exit at 2a's stop
 /// before 2e runs and could not tell the two arms apart, which is why the

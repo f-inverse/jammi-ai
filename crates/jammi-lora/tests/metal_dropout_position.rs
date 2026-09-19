@@ -1,20 +1,14 @@
-//! Metal-gated dropout-position semantics oracle for `LoraLinear::forward`
-//! (esc-070 conjunct 5).
+//! Dropout-position semantics of `LoraLinear::forward` on a real Metal device.
 //!
 //! `tests/fused_epilogue.rs`'s dropout-position/resume oracles
 //! (`resume_reproduces_the_uninterrupted_dropout_stream` and friends) all
-//! hardcode `Device::Cpu` — nothing in this crate's own test suite ever
-//! proved `LoraLinear::dropout_position`/`restore_dropout_position` on a
-//! REAL Metal device. That gap was not merely "untested on one more
-//! device": before issue #433's fix, `jammi_kernels::ops::DropoutFused` had
-//! no `metal_fwd` at all, and candle-core's default `CustomOp1::metal_fwd`
-//! is a typed `Err`, not a fallback — so EVERY `LoraLinear::forward` call
-//! with dropout configured, on a real Metal device, in training mode,
-//! FAILED outright. A CPU-only test suite could never have caught a
-//! Metal-specific regression here (or proved the fix): this file is the
-//! landing proof that a Metal training forward now actually SUCCEEDS, and
-//! that the position/resume/no-dropout semantics `fused_epilogue.rs` pins
-//! on CPU hold on real Metal hardware too.
+//! run on `Device::Cpu`. On Metal, a training forward with dropout
+//! configured reaches `jammi_kernels::ops::DropoutFused::metal_fwd`, and
+//! candle-core's default `CustomOp1::metal_fwd` is a typed `Err`, not a
+//! fallback — so without a Metal implementation EVERY such forward fails.
+//! A CPU-only suite cannot see that: this file proves a Metal training
+//! forward succeeds, and that the position/resume/no-dropout semantics
+//! `fused_epilogue.rs` pins on CPU hold on real Metal hardware too.
 //!
 //! ## Why every training forward here takes the EAGER arm
 //!
@@ -36,78 +30,22 @@
 //! Metal forward that reaches the dropout op at all, and returns `Ok`,
 //! proves the counter advanced for a call that ACTUALLY dispatched
 //! `DropoutFused::metal_fwd`, not merely one that reserved a key and then
-//! errored out before ever reaching the op (which is exactly what
-//! happened, unconditionally, on the pre-#433 Metal build this file
-//! guards against).
+//! errored out before ever reaching the op.
 //!
-//! Compiles and links ONLY with the `metal` feature (`required-features =
-//! ["metal"]` in `Cargo.toml`; a plain `cargo test -p jammi-lora` never
-//! even builds this file) — mirrors
-//! `crates/jammi-kernels/tests/metal_parity.rs`'s own gating convention
-//! (the crate that owns `DropoutFused` itself). At runtime, a machine that
-//! compiled with the feature but has no physical Metal device (or is not
-//! on macOS) is treated as "skip", not "fail" — `Device::new_metal(0)`
-//! erroring, OR PANICKING, is the signal — UNLESS `JAMMI_REQUIRE_METAL` is
-//! set, in which case a device-acquisition failure PANICS instead of
-//! returning. `metal_device_or_skip` below is copied, verbatim in shape
-//! (including the `catch_unwind` wrapper for the same real-hardware
-//! probe-time panic mode — see `metal_parity.rs`'s own module doc for the
-//! `objc2`/`residency_set.rs` citation), from `metal_parity.rs`'s helper of
-//! the same name; this file registers its own copy in
-//! `ci/kernel-oracle-helpers.txt` (KO-7 gating is `(file, fn)`-scoped, so a
-//! same-named helper in one file never gates another file's skips).
-
-#![cfg(feature = "metal")]
+//! This test target requires the `live-metal-tests` feature (a plain
+//! `cargo test -p jammi-lora` never builds it), like
+//! `crates/jammi-kernels/tests/metal_parity.rs` in the crate that owns
+//! `DropoutFused`. Every test acquires the device through
+//! `jammi_test_resources::metal_device`, which panics naming the missing
+//! device.
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, VarBuilder, VarMap};
 use jammi_lora::{LoraInitMode, LoraLinear};
 
-/// A panic payload folded to a human-readable string — see
-/// `metal_parity.rs`'s identically-named helper for why only `&str`/
-/// `String` downcasts are needed.
-fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "<non-string panic payload>".to_string()
-    }
-}
-
-/// Acquire a Metal device, or `None` to skip — unless `JAMMI_REQUIRE_METAL`
-/// is set, in which case a failure PANICS. See `metal_parity.rs`'s
-/// identically-shaped `metal_device_or_skip` for the full rationale (this
-/// file registers its OWN copy in `ci/kernel-oracle-helpers.txt`, per that
-/// registry's `(file, fn)`-scoping).
-fn metal_device_or_skip() -> Option<Device> {
-    let outcome: Result<Device, String> = match std::panic::catch_unwind(|| Device::new_metal(0)) {
-        Ok(Ok(d)) => Ok(d),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(payload) => Err(format!(
-            "Device::new_metal(0) panicked: {}",
-            panic_payload_to_string(payload.as_ref())
-        )),
-    };
-    match outcome {
-        Ok(d) => Some(d),
-        Err(msg) => {
-            if std::env::var_os("JAMMI_REQUIRE_METAL").is_some() {
-                panic!(
-                    "metal_dropout_position: JAMMI_REQUIRE_METAL is set but no Metal device is \
-                     available: {msg}"
-                );
-            }
-            eprintln!("metal_dropout_position: skipping — no Metal device available: {msg}");
-            None
-        }
-    }
-}
-
 /// Deterministic, non-degenerate base weight — same construction every
-/// call, mirroring `fused_epilogue.rs`'s own `build_base` (family L: a
-/// generic synthetic fixture, no external generator).
+/// call, mirroring `fused_epilogue.rs`'s own `build_base` (a generic
+/// synthetic fixture, no external generator).
 fn build_base(in_features: usize, out_features: usize, device: &Device) -> Linear {
     let mut row = Vec::with_capacity(in_features * out_features);
     for i in 0..out_features {
@@ -128,9 +66,7 @@ fn ones_input(device: &Device) -> Tensor {
 /// the `i`-th successful forward, for `N` forwards in a row.
 #[test]
 fn metal_successful_train_forwards_advance_dropout_position_by_exactly_one_each() {
-    let Some(device) = metal_device_or_skip() else {
-        return;
-    };
+    let device = jammi_test_resources::metal_device();
     const N: u64 = 5;
 
     let base = build_base(8, 16, &device);
@@ -159,7 +95,7 @@ fn metal_successful_train_forwards_advance_dropout_position_by_exactly_one_each(
     for i in 1..=N {
         let out = lora
             .forward(&x)
-            .expect("a Metal training forward with dropout configured must SUCCEED (issue #433)");
+            .expect("a Metal training forward with dropout configured must SUCCEED");
         assert!(
             out.flatten_all()
                 .unwrap()
@@ -179,15 +115,13 @@ fn metal_successful_train_forwards_advance_dropout_position_by_exactly_one_each(
 
 /// (b) `restore_dropout_position(pos)` then re-forwarding reproduces the
 /// earlier Metal forward's output BIT-IDENTICALLY — the production-path
-/// resume invariant (esc-033), proved on real Metal hardware. Mirrors
+/// resume invariant, proved on real Metal hardware. Mirrors
 /// `fused_epilogue.rs`'s `resume_reproduces_the_uninterrupted_dropout_stream`,
 /// specialized to Metal (where there is only the eager arm to prove — see
 /// this file's module doc).
 #[test]
 fn metal_restore_dropout_position_reproduces_an_earlier_forward_bit_identically() {
-    let Some(device) = metal_device_or_skip() else {
-        return;
-    };
+    let device = jammi_test_resources::metal_device();
     const N: usize = 6;
     const K: u64 = 2;
 
@@ -272,9 +206,7 @@ fn metal_restore_dropout_position_reproduces_an_earlier_forward_bit_identically(
 /// `fused_arm_production_path_would_catch_an_off_by_one_resume_position`.
 #[test]
 fn metal_would_catch_an_off_by_one_resume_position() {
-    let Some(device) = metal_device_or_skip() else {
-        return;
-    };
+    let device = jammi_test_resources::metal_device();
     const N: usize = 5;
     const K: u64 = 2;
 
@@ -336,9 +268,7 @@ fn metal_would_catch_an_off_by_one_resume_position() {
 /// (`training: false`, `dropout: None`), across successful Metal forwards.
 #[test]
 fn metal_layer_with_no_dropout_configured_reports_position_none() {
-    let Some(device) = metal_device_or_skip() else {
-        return;
-    };
+    let device = jammi_test_resources::metal_device();
     let x = ones_input(&device);
 
     // Training-mode, no dropout configured at all.

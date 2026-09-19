@@ -19,10 +19,10 @@ This is the tier Neptune structurally lacks: a **graph-conditioned prediction**
 with an honest coverage guarantee. It carries two results, both real and both
 measured against the committed cache:
 
-1. **The bidirectional win** — a year-regression-conformal *workflow* that an engine
-   bug once made impossible now **runs end-to-end**. The headline is the loop:
-   authoring this keystone surfaced the gaussian-collapse bug, and the engine fix
-   made the whole recipe executable.
+1. **The bidirectional win** — a year-regression-conformal *workflow* **runs
+   end-to-end**, on an engine behavior this keystone's authoring surfaced as
+   missing. The headline is the loop: writing the recipe found the gaussian-collapse
+   bug, and the engine fix is what makes the recipe executable.
 2. **The conformal-under-shift lesson** — under the dataset's time-split, **both**
    the year-regression interval *and* the subject-classification set *under-cover*,
    and the textbook weighted-conformal remedy is a **no-op in both cases**, for two
@@ -36,17 +36,17 @@ runs on CPU against the cache.
 
 ## Part A — the bidirectional win: year-regression conformal
 
-Authoring this keystone surfaced an engine bug. Training the gaussian context
-predictor on the paper *year* used to collapse — `predict_with_context_predictor`
-returned a near-zero spread (std ≈ 0.001) and a badly biased mean (~2163 for a
-2014–2020 target), so a regression-conformal interval was meaningless. The fix
-landed in two parts: 0.26.1 standardized the fine-tune projection head's target, but
-the *amortized context predictor* still collapsed; 0.26.2 completed it with z-space
-standardization of the predictor's target. **The bidirectional win is that this
-workflow now runs end-to-end at all**: the predictor fits a real mean (essentially
-unbiased across eras) with real spread, and the previously-impossible
-regression-conformal recipe executes. That is the cookbook → engine → cookbook
-loop: writing the recipe found the bug, the engine fix made the recipe work.
+Training a gaussian context predictor on the paper *year* needs its regression
+target standardized. Without that, `predict_with_context_predictor` collapses to a
+near-zero spread (std ≈ 0.001) and a badly biased mean (~2163 for a 2014–2020
+target), and a regression-conformal interval is meaningless. The engine standardizes
+both the fine-tune projection head's target and — in z-space — the *amortized
+context predictor's* target; standardizing only the head still leaves the context
+predictor collapsed. **The bidirectional win is that this workflow runs end-to-end
+at all**: the predictor fits a real mean (essentially unbiased across eras) with
+real spread, and the regression-conformal recipe executes. That is the cookbook →
+engine → cookbook loop: writing the recipe found the bug, and the engine fix is
+what makes the recipe work.
 
 What the recipe then *measures* is the honest part, and it is the same lesson as
 Part B: the interval **under-covers** under the time-split, and weighting it is a
@@ -106,8 +106,8 @@ print(f"mean interval width:     {reg_width:.2f} years")
 ```{python}
 # | echo: false
 # Measured verdict: the regression-conformal interval UNDER-covers under the
-# time-split (below nominal). The workflow was impossible under the gaussian-collapse
-# bug; it now runs, and what it measures is an honest under-coverage.
+# time-split (below nominal). The workflow runs only because the predictor's target is
+# standardized, and what it measures is an honest under-coverage.
 rails.measure("arxiv.tier04.reg_interval_coverage", reg_cov)
 rails.measure("arxiv.tier04.reg_interval_width", reg_width)
 assert reg_cov < 1 - alpha  # under-coverage — the honest finding under the time-split

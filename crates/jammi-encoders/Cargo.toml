@@ -42,13 +42,14 @@ thiserror.workspace = true
 
 [dev-dependencies]
 candle-transformers.workspace = true
+jammi-test-resources = { workspace = true, features = ["candle"] }
 hf-hub.workspace = true
 # `dirs::home_dir()` -- the live-hub-tests harness's non-panicking root
 # fallback (HF_HUB_CACHE -> HF_HOME/hub -> dirs::home_dir() -> a named test
 # failure), so it never reaches `hf_hub::Cache::from_env()`'s own
 # `Cache::default()` panic path. Already resolved transitively through
 # hf-hub 0.5 in Cargo.lock (6.0.0) -- pinned here as a direct dev-dependency
-# only because this test harness now calls it by name.
+# only because this test harness calls it by name.
 dirs = "6"
 # NO `half` here: it is a regular dependency above (the dtype-following mask
 # sentinels), and a `[dependencies]` entry is already visible to tests,
@@ -59,27 +60,23 @@ tempfile = "3"
 
 [features]
 default = []
-# Forwards to candle's own `cuda` feature chain via jammi-kernels — THE
-# feature this crate did not have before this commit (jammi-ai's own `cuda`
-# feature bypassed jammi-encoders entirely; this is the first real link in
-# that chain). Adds jammi-kernels' CUDA build (nvcc/PTX) — never required
+# Forwards to candle's own `cuda` feature chain via jammi-kernels. Adds
+# jammi-kernels' CUDA build (nvcc/PTX) — never required
 # by a plain `cargo build` (see jammi-kernels/build.rs's early-return gate).
 cuda = ["jammi-kernels/cuda"]
 # Forwards to `jammi-kernels`'s `flash-attn` feature — one link of the
-# `jammi-kernels -> jammi-encoders -> jammi-ai -> jammi-bench` chain the
-# lead's P6 Stage B v5 correction asks B2 to lay down now, with no real
-# code depending on it yet: `crate::modernbert`'s flash-cascade admission
-# predicate reads `jammi_kernels::admission::FLASH_COMPILED` (a plain,
-# unconditionally-compiled `bool`, NOT this local feature) precisely
-# because it must stay correct even before `jammi-ai`/`jammi-bench` forward
-# this feature — see `FLASH_COMPILED`'s own doc. This feature exists so a
-# FUTURE real dependency on `jammi_kernels::flash` types (B1's
-# `CuSeqlens`/`flash_attention_varlen`) has a declared forwarding path to
-# land behind, and so `rustc`'s `unexpected_cfgs` lint has a declared
-# feature name if a future call site DOES need `#[cfg(feature =
-# "flash-attn")]` (never a bare `cfg!()` runtime check around a
-# `jammi_kernels::flash` type reference — see `FLASH_COMPILED`'s doc for
-# why that would fail to compile with this feature off).
+# `jammi-kernels -> jammi-encoders -> jammi-ai -> jammi-bench` chain.
+# `crate::modernbert`'s flash-cascade admission predicate reads
+# `jammi_kernels::admission::FLASH_COMPILED` (a plain,
+# unconditionally-compiled `bool`, NOT this local feature) so it stays
+# correct whether or not `jammi-ai`/`jammi-bench` forward this feature — see
+# `FLASH_COMPILED`'s own doc. This feature gives a dependency on
+# `jammi_kernels::flash` types (`CuSeqlens`/`flash_attention_varlen`) a
+# declared forwarding path, and gives `rustc`'s `unexpected_cfgs` lint a
+# declared feature name for a `#[cfg(feature = "flash-attn")]` call site
+# (never a bare `cfg!()` runtime check around a `jammi_kernels::flash` type
+# reference — see `FLASH_COMPILED`'s doc for why that would fail to compile
+# with this feature off).
 flash-attn = ["jammi-kernels/flash-attn"]
 # Enables tests/parity.rs which depends on candle-transformers as a numerical
 # oracle for the Bert frozen forward pass.
@@ -94,6 +91,12 @@ golden-parity = []
 # tower reproduces its audio embedding on the committed pinned input. Live: makes
 # a network call, so the default `cargo test` stays hermetic.
 live-hub-tests = []
+# Compiles the tests that need CUDA device 0.
+live-gpu-tests = ["cuda"]
+# Compiles the encoder-level FlashAttention oracles over a real ModernBERT-large
+# checkpoint: an 80GB-class CUDA device in the validated arch set, and the
+# checkpoint directory at JAMMI_FLASH_ORACLE_MODEL_DIR.
+live-flash-oracle-tests = ["live-gpu-tests", "flash-attn"]
 
 [[test]]
 name = "it"
@@ -110,3 +113,10 @@ path = "tests/golden_parity.rs"
 [[test]]
 name = "live_real_clap"
 path = "tests/live_real_clap.rs"
+
+# Long-shape training memory on CUDA: sequence-length bucketing keeps a
+# variable-shape run within the fixed-shape run's memory.
+[[test]]
+name = "eager_training_memory"
+path = "tests/eager_training_memory.rs"
+required-features = ["live-gpu-tests"]

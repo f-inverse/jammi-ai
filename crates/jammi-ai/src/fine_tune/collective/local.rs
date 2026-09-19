@@ -701,8 +701,7 @@ impl Collective for Local {
             // `exchange` only publishes once every rank's descriptor agrees,
             // including `root`: the rank at `root_index` is the one every
             // rank named as root, and it is the only one whose payload is
-            // `Some`, so this can never be the `None` a disagreeing root
-            // used to leave here.
+            // `Some`, so a disagreeing root can never leave `None` here.
             let from_root = from_root
                 .as_ref()
                 .expect("the agreed root's slot in a published round always carries a payload");
@@ -877,9 +876,8 @@ mod rendezvous_state_tests {
     /// final per-slot store, and `broadcast`'s `from_root.to_device` CAN fail
     /// on real hardware (an OOM, a transfer error), which faults the gang for
     /// the round that just published itself — exactly the asymmetry this
-    /// test manufactures, but reached for real. That route is UNCOVERED
-    /// here; U4b's pod leg is where a real multi-device `LocalGang` exists
-    /// to exercise it (`docs/plans/67-distributed-training/UNITS.md` § U4b).
+    /// test manufactures, but reached for real. That route needs a real
+    /// multi-device `LocalGang` and is not covered by this CPU-only module.
     /// So this test manufactures it directly, the
     /// same way `a_round_holding_a_superseded_contribution_is_refused_by_the_rank_completing_it`
     /// manufactures its condition: rank 1 is parked in `exchange`, waiting on

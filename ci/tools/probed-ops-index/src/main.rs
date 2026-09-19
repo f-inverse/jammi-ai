@@ -12,7 +12,7 @@
 //! Output shape: `{"registry_keys": [...], "report_keys": [...]}`, both
 //! sorted, deduplicated string arrays. `registry_keys` is
 //! [`jammi_kernels::admission::ProbedOp::all_registry_keys`] over every
-//! [`jammi_kernels::admission::ProbedOpId::ALL`] row (#546 K4: the CLOSED
+//! [`jammi_kernels::admission::ProbedOpId::ALL`] row (the CLOSED
 //! enum is the enumeration source, never the open `PROBED_OPS` table
 //! directly — `ProbedOpId::ALL` and `PROBED_OPS` are pinned identical by
 //! `probed_op_id_variants_cover_every_probed_ops_row` in `admission.rs`'s

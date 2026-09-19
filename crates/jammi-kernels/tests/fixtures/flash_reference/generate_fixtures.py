@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generates the B0 parity fixtures for jammi-kernels' FA2 varlen op (P6
-Stage B, contract-P6-stage-B-v4.md §5 B0 / §4 O0(a)).
+"""Generates the torch-reference parity fixtures for jammi-kernels' FA2 varlen
+op (consumed by `tests/flash_torch_parity.rs` and `tests/flash_torch_parity_f16.rs`).
 
 Reference: torch's OWN vendored FlashAttention-2, `torch.ops.aten.
 _flash_attention_forward` / `_flash_attention_backward` (varlen, packed
@@ -12,9 +12,7 @@ directory's `sidecar.json`'s `version_mismatch_note` for the reference's
 exact identity (torch's vendored FA2 build is one patch release above
 jammi's, defines `UNFUSE_FMA`, skips `--use_fast_math`).
 
-# Fix round (`10b1f3b` audit, BLOCKING findings 1 and 5)
-
-Two changes from the prior version:
+# What each leg carries
 
 1. **A TRUTH tensor per leg per output** (`o`/`lse`/`dq`/`dk`/`dv`),
    computed by a from-scratch, non-tiled eager attention implementation in
@@ -23,15 +21,13 @@ Two changes from the prior version:
    from the SAME bf16-exact inputs both `o1` (jammi) and this script's own
    `ref` (torch's FA2) consume. This is the higher-precision anchor
    `docs/maintainer/cuda-kernel-guide.md` §3.3 requires ("Agreement is not
-   accuracy... anchor with a higher-precision reference"); the auditor
-   computed one by hand with numpy for `b1_s512_win64` and found
-   `|truth - ref_o|max = 0.0036`, `|truth - ref_lse|max = 7.7e-7` — the
-   consuming Rust oracle (`tests/flash_torch_parity.rs`) now asserts
-   `jammi`'s own distance to this SAME truth is bounded by a small multiple
-   of torch FA2's distance to it, rather than an absolute ULP-derived
-   constant (which the auditor showed a 5% `softmax_scale` injection
-   PASSED through: 50-100x wider than the real divergence).
-2. **Production shape/amplitude**: `H = 16` (was 4) and inputs are drawn
+   accuracy... anchor with a higher-precision reference"). The consuming
+   Rust oracle (`tests/flash_torch_parity.rs`) asserts `jammi`'s own
+   distance to this SAME truth is bounded by a small multiple of torch
+   FA2's distance to it, rather than an absolute ULP-derived constant (a
+   5% `softmax_scale` injection passes such a constant: 50-100x wider than
+   the real divergence).
+2. **Production shape/amplitude**: `H = 16` and inputs are drawn
    with a spread matched to the decisive-timing harness's own convention
    (`tests/flash_decisive_timing.rs`'s `random_bf16`: production ModernBERT
    post-LN activations run roughly `[-18, 18]`), not `torch.randn`'s
@@ -44,7 +40,7 @@ Two changes from the prior version:
    dtype-dispatch match arm exists; nothing ever constructs a `Header` with
    `descr: DType::BF16` via parsing), so a numpy file claiming a bf16 dtype
    is not readable through `Tensor::read_npy` regardless of what wrote it —
-   this is a `no-hard-candle-dependency` constraint (memory), not something
+   this is a no-hard-candle-dependency constraint, not something
    to work around by patching candle. `int16` is a supported `descr` on
    both sides (numpy `'<i2'` <-> candle `DType::I16`) and the SAME 2 bytes
    per element as bf16, so this halves input storage vs f32 with zero
@@ -59,15 +55,14 @@ Two changes from the prior version:
 Usage: /root/jammi-ai/.venv-torch-ref/bin/python generate_fixtures.py [--dtype bfloat16|float16]
 Requires CUDA. Writes into this directory.
 
-# fp16 twin (campaign #443, D2/D3)
+# fp16 twin
 
 `--dtype float16` generates the SAME `LEGS` sweep, at the SAME production
 amplitude/spread and the SAME from-scratch f64 TRUTH derivation, for the fp16
 twin of this op (`crate::flash::flash_varlen_{fwd,bwd}_f16`) — every file this
 produces is prefixed `f16_` (`f16_{name}_q.npy`, ..., sidecar written to
 `sidecar_f16.json`) so it NEVER collides with or overwrites the bf16 fixtures
-above; the bf16 invocation (no `--dtype`, or `--dtype bfloat16`) is
-byte-for-byte unchanged from before this parametrisation. Storage differs from
+above (the bf16 invocation is no `--dtype`, or `--dtype bfloat16`). Storage differs from
 the bf16 legs' own `int16`-bit-pattern workaround: numpy has a NATIVE
 `float16` dtype (`'<f2'`), and candle-core 0.11.0's `npy.rs` `Header::parse`
 DOES map `"f2"`/`"e"` to `DType::F16` (unlike bf16, which has no descr mapping
@@ -93,7 +88,7 @@ D = 64
 # `docs/maintainer/cuda-kernel-guide.md` §3.4's "test at production
 # amplitude"). A scaled-and-clamped normal draw puts real mass near
 # saturation rather than torch.randn's unclamped unit-variance draw (which
-# every parity leg the 10b1f3b audit reproduced used, and which the guide
+# a naive parity leg would use, and which the guide
 # calls out by name as "decoration" when production amplitude is far wider).
 AMPLITUDE = 18.0
 SPREAD = 9.0
@@ -332,8 +327,8 @@ def main():
         choices=["bfloat16", "float16"],
         default="bfloat16",
         help=(
-            "bf16 (default, unchanged historical behaviour, files unprefixed) or "
-            "float16 (campaign #443 D2/D3 fp16 twin, files prefixed f16_, sidecar "
+            "bf16 (default, files unprefixed) or "
+            "float16 (the fp16 twin, files prefixed f16_, sidecar "
             "written to sidecar_f16.json)."
         ),
     )
@@ -412,8 +407,7 @@ def main():
             "exp2f(__fmul_rn(x,scale)-max) instead of the fusable "
             "exp2f(x*scale-max)) and does NOT pass --use_fast_math, while "
             "jammi's five flash translation units DO (the bf16 and fp16 "
-            "fwd/bwd .cu sources plus the flash_api_jammi.cu wrapper -- "
-            "campaign #443's fp16 twins widened this from three to five; "
+            "fwd/bwd .cu sources plus the flash_api_jammi.cu wrapper; "
             "see crates/jammi-kernels/build.rs's flash source list and "
             "crates/jammi-kernels/third_party/flash-attention/VENDORED.md's "
             "Build section)."

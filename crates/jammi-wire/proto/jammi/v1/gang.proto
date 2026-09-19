@@ -163,7 +163,7 @@ message FailedOutcome {
 // contribution is refused by the faulted coordinator — so no rank ever
 // continues past a round every rank did not apply.
 //
-// Every numeric field here is range-checked by its reader before use (K2):
+// Every numeric field here is range-checked by its reader before use:
 // `world`, `root < world`, every `counts` value and every `dims` entry as a
 // `usize` with an overflow-checked element product, `chunk_count`, `index <
 // chunk_count`, and the reassembled byte length against the bound the

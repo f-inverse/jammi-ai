@@ -3,22 +3,18 @@
 //! each element's KEEP/DROP decision is computed in-kernel from
 //! [`crate::philox::philox_draw`] and discarded immediately after use.
 //!
-//! This is the fused replacement for `jammi-lora`'s old
-//! `DropoutStream::draw_mask` + `Tensor::from_vec` + elementwise `mul`
-//! composition: a host-side `SplitMix64` PRNG filled a full-size `Vec<f32>`
-//! mask, copied it to the activation's device, and multiplied — a real H2D
+//! A host-materialized mask (a host PRNG filling a full-size `Vec<f32>`,
+//! copied to the device, then an elementwise `mul`) costs a real H2D
 //! transfer and a retained mask tensor on the backward tape (candle's
 //! `Binary::Mul` backward computes and stores a full-size gradient FOR the
 //! mask operand and never frees it, `backprop.rs:197-204`, since the mask
-//! is not itself a graph leaf `sorted_nodes` walks). See `jammi-lora`'s
-//! `LoraLinear::forward` module doc for the measured cost this replaces
-//! (2.9x step time, 16.7 GB at dropout 0.05, #352).
+//! is not itself a graph leaf `sorted_nodes` walks) — measured at 2.9x step
+//! time and 16.7 GB at dropout 0.05.
 //!
-//! ## The rejected mechanism, and why (wip/device-side-dropout, superseded)
+//! ## Why not `Device::set_seed` + `Tensor::rand`
 //!
-//! A prior attempt (`wip/device-side-dropout`, preserved, not merged) tried
-//! `Device::set_seed(key)` followed by `Tensor::rand` to draw a per-device
-//! mask. That is a NON-ATOMIC read-modify-write of process-global device
+//! Drawing a per-device mask with `Device::set_seed(key)` followed by
+//! `Tensor::rand` is a NON-ATOMIC read-modify-write of process-global device
 //! RNG state (`set_seed` takes and releases a mutex, `rand_uniform`
 //! re-takes it separately) — `LoraLinear` is deliberately `Sync`, so a
 //! concurrent draw on the same device could silently yield the wrong mask,
@@ -50,7 +46,7 @@
 //! exact failure mode a `u64` threshold structurally avoids; see
 //! [`tests::p_zero_is_a_bit_exact_no_op`]).
 //!
-//! Research context (2026-08-24, cited per the C7 contract): PyTorch/JAX
+//! PyTorch/JAX
 //! compute the decision as a FLOAT compare (`curand_uniform` is `(0,1]`,
 //! compared `< p`; JAX's `uniform < p`). FlashAttention-2's own dropout
 //! (`csrc/flash_attn/src/dropout.h`) instead compares an 8-BIT INTEGER
@@ -73,10 +69,8 @@
 //!
 //! `p` is validated to `[0.0, 1.0)` in [`DropoutFused::new`] (a typed
 //! `candle_core::Error`, not a silently-clamped or silently-NaN-propagated
-//! value) — `jammi-lora`'s `lora_dropout` was UNVALIDATED before this
-//! commit (`config.rs`'s `lora_dropout: Option<f32>` field took any `f32`),
-//! and this op independently re-validates rather than trusting its caller,
-//! per family D's "validate at every numeric edge".
+//! value) — this op validates independently rather than trusting its
+//! caller's config (`validate at every numeric edge`).
 //!
 //! ## The applied scale: pinned bit-identical CPU/CUDA
 //!
@@ -90,10 +84,9 @@
 //! which this build's un-pinned `--fmad` default could in principle treat
 //! differently in a future nvcc version if this expression ever grew a
 //! neighboring add) so the pinning is stated in the kernel text itself,
-//! not merely inferred from "there happens to be no add nearby" — the same
-//! doctrine C1 established for this crate's FMA-contraction disclosure
-//! (`build.rs`'s PINNED FLAGS comment), applied here as a POSITIVE
-//! guarantee instead of a disclosed gap.
+//! not merely inferred from "there happens to be no add nearby" — the
+//! positive form of this crate's FMA-contraction disclosure (`build.rs`'s
+//! PINNED FLAGS comment).
 //!
 //! ## No save-for-backward (candle 0.11): bwd IS fwd
 //!
@@ -107,21 +100,21 @@
 //! SAME construction data — applied to `grad_res` instead of `x`. This is
 //! not a coincidental shortcut; it is the mathematical content of "bwd
 //! regenerates the SAME decision from the SAME counter, dx = dy * mask *
-//! scale" (this commit's own design), and it structurally eliminates wip
-//! branch's finding #2 (candle's `Binary::Mul` backward retaining a
-//! full-size gradient FOR the mask): there is no mask tensor anywhere on
+//! scale", and it structurally eliminates the retained mask gradient
+//! (candle's `Binary::Mul` backward keeping a full-size gradient FOR the
+//! mask): there is no mask tensor anywhere on
 //! the tape to retain — `DropoutFused` is one `CustomOp1` node forward,
 //! and the identical op is one MORE `CustomOp1` node backward, with no
 //! third tensor (no mask) ever created.
 //!
-//! ## Domain (family D)
+//! ## Domain
 //!
 //! Contiguous storage only (`Layout::contiguous_offsets`) — a raw-pointer
 //! per-element kernel has no flat linear index for a strided view, and
 //! contiguity is what makes "logical index" and "storage index" coincide
 //! (see the counter-mapping section above). CPU and CUDA support `F32`,
-//! `BF16`, and (campaign #443 W2c, via the SEPARATE `cuda/dropout_f16.cu`
-//! monomorphic translation unit — see that file's module doc) `F16`; Metal
+//! `BF16`, and (via the SEPARATE `cuda/dropout_f16.cu` monomorphic
+//! translation unit — see that file's module doc) `F16`; Metal
 //! supports `F32`/`BF16` only (see the "Metal: a device-scoped
 //! deterministic host fallback" section below — F16 is deliberately NOT
 //! widened there, CUDA-only scope). Any other dtype is a typed
@@ -129,18 +122,17 @@
 //! no-op, not an error.
 //!
 //! ## Metal: a device-scoped deterministic host fallback, NOT a Metal
-//! Philox kernel (issue #433)
+//! Philox kernel
 //!
-//! `jammi-kernels` has no Metal kernel-launch infrastructure at all today
-//! (no `.metal` shader sources, no `MTLComputePipelineState` build path —
-//! contrast `crate::cuda`, a full PTX build step) — porting Philox to a
-//! Metal compute shader from nothing, for one op, was judged
-//! disproportionate to the defect (a LoRA/QLoRA training run failing on
-//! Apple Silicon at the shipped default `lora_dropout = 0.05` (no-producer:
-//! the shipped LoRA config default, not a measured value), GH #433)
-//! versus the alternative below, which reuses [`dropout_f32`]/
-//! [`dropout_bf16`] — the SAME functions [`DropoutFused::cpu_fwd`] calls —
-//! verbatim.
+//! `jammi-kernels` has no Metal kernel-launch infrastructure (no `.metal`
+//! shader sources, no `MTLComputePipelineState` build path — contrast
+//! `crate::cuda`, a full PTX build step), and candle's default
+//! `CustomOp1::metal_fwd` is a typed `Err`, so without a Metal arm every
+//! LoRA/QLoRA training forward with dropout configured fails on Apple
+//! Silicon. Porting Philox to a Metal compute shader from nothing, for one
+//! op, is disproportionate next to the arm below, which reuses
+//! [`dropout_f32`]/[`dropout_bf16`] — the SAME functions
+//! [`DropoutFused::cpu_fwd`] calls — verbatim.
 //!
 //! [`DropoutFused::metal_fwd`] downloads the input's raw backing buffer to
 //! the host (`MetalStorage::to_cpu_storage`, a synchronous blit +
@@ -159,29 +151,23 @@
 //! / `dropout_bf16_mask_matches_cpu` for the actual cross-device round
 //! trip.
 //!
-//! **This is not a state-racing risk of the kind the rejected mechanism
-//! above was refused for.** `Device::set_seed`+`Tensor::rand` raced a
-//! process-global, mutably-shared RNG; this arm touches no such state — it
+//! **This is not a state-racing risk.** `Device::set_seed`+`Tensor::rand`
+//! race a process-global, mutably-shared RNG; this arm touches no such state — it
 //! is a pure function of `self`'s own `Copy` construction data and the
 //! element's index, identically to every other arm.
 //!
-//! **Honest cost disclosure (esc-032's harm, re-measured for THIS
-//! device).** esc-032 quantified the OLD host-mask design's cost on CUDA's
-//! *discrete* memory (0.98G host RNG draws + 3.92 GB H2D copy per step at
-//! batch 16 / seq 128, GPU idle throughout) — that H2D transfer's dollar
-//! cost is largely ABSENT here: Apple Silicon's unified memory means the
+//! **Cost.** A host-materialized mask on CUDA's *discrete* memory costs
+//! 0.98G host RNG draws + a 3.92 GB H2D copy per step at batch 16 / seq 128,
+//! GPU idle throughout; that H2D transfer's cost is largely ABSENT here: Apple Silicon's unified memory means the
 //! "upload" is not a distinct physical bus transfer the way CUDA's PCIe
 //! H2D is. What is NOT absent: the mask is still computed by a
 //! single-threaded host loop over `elem_count` elements (the same
 //! `dropout_f32`/`dropout_bf16` iterator `cpu_fwd` runs), so this arm's
 //! per-step cost is real CPU time proportional to activation size, unlike
-//! CUDA's `cuda_fwd`, which launches a device kernel and returns. This is
-//! the honest, disclosed trade the constraint asked for — not "free",
-//! merely far cheaper than the original bug and, unlike a state-racing
-//! device-RNG shortcut, provably byte-identical to the CPU stream. A real
-//! Metal Philox compute kernel (candidate shape (a)) would remove the
-//! host round trip entirely; it remains future work, tracked by this
-//! module doc rather than silently declared out of scope.
+//! CUDA's `cuda_fwd`, which launches a device kernel and returns. Not free,
+//! but, unlike a state-racing device-RNG shortcut, provably byte-identical
+//! to the CPU stream. A Metal Philox compute kernel would remove the host
+//! round trip entirely.
 
 use candle_core::backend::BackendStorage;
 use candle_core::{
@@ -224,7 +210,7 @@ impl DropoutFused {
     /// `p` must be finite and in `[0.0, 1.0)` — `p == 1.0` would drop
     /// every element and make `scale` infinite; `p < 0.0` or `p` non-finite
     /// (including `NaN`, which fails every ordinary comparison silently —
-    /// family F's "a naive comparison silently passes on NaN" hazard,
+    /// the "a naive comparison silently passes on NaN" hazard,
     /// refused here by requiring `is_finite()` explicitly rather than
     /// relying on the range check alone) is refused with a typed error
     /// rather than silently clamped.
@@ -364,11 +350,10 @@ impl CustomOp1 for DropoutFused {
             // this arm's fast path has to check explicitly since it
             // bypasses that match entirely).
             // NOTE: deliberately NOT widened to F16 alongside `cpu_fwd`
-            // above — this crate's D2 f16-oracle work is CUDA-facing only
-            // (F16 admission is not proposed for Metal at all; see
+            // above — F16 is admitted on CUDA only (not on Metal at all; see
             // `docs/maintainer/cuda-kernel-guide.md`'s per-op f16
-            // reference-regime table), so the Metal host fallback keeps
-            // refusing F16 exactly as before.
+            // reference-regime table), so the Metal host fallback refuses
+            // F16.
             match s1.dtype() {
                 DType::F32 | DType::BF16 => {}
                 dtype => return Err(Error::UnsupportedDTypeForOp(dtype, self.name())),
@@ -407,7 +392,7 @@ impl CustomOp1 for DropoutFused {
     }
 }
 
-/// Fixed fold order (family J): ascending logical index, no reduction —
+/// Fixed fold order: ascending logical index, no reduction —
 /// every element is independent, so this is simply "iterate 0..n".
 fn dropout_f32(params: &DropoutFused, x: &[f32]) -> Vec<f32> {
     x.iter()
@@ -444,14 +429,10 @@ fn dropout_bf16(params: &DropoutFused, x: &[bf16]) -> Vec<bf16> {
 
 /// [`dropout_bf16`]'s exact twin, substituting `half::f16` — this op's
 /// F16 CPU arm, which doubles as the reference the CUDA F16 arm is
-/// compared against. CORRECTION (campaign #446, finding 14): an earlier
-/// revision of this comment said "no CUDA/Metal F16 dispatch arm exists
-/// yet". That is false for CUDA and has been since campaign #443 W2c —
-/// `cuda/dropout.rs`'s `cuda_fwd` has a real `DType::F16` arm dispatching
+/// compared against (`cuda/dropout.rs`'s `cuda_fwd` dispatches
 /// `dropout_fwd_f16` from the separate `cuda/dropout_f16.cu` translation
-/// unit (this module's own doc, "supports ... `F16`", was already
-/// correct; only this line lagged). It remains true for METAL: `metal_fwd`
-/// deliberately admits `F32`/`BF16` only — see its own `DType::F32 |
+/// unit). METAL has no F16 arm: `metal_fwd` deliberately admits
+/// `F32`/`BF16` only — see its own `DType::F32 |
 /// DType::BF16 => {}` gate and the "deliberately NOT widened to F16"
 /// note there. Byte-identical KEEP/DROP decision (the mask is
 /// dtype-independent), one rounding point on a KEPT element.
@@ -523,61 +504,6 @@ mod tests {
     fn dropout(seed: u64, layer_id: u32, forward_idx: u32, p: f32, x: &Tensor) -> Result<Tensor> {
         let op = DropoutFused::new(seed, layer_id, forward_idx, p)?;
         crate::ops::apply1(x, op)
-    }
-
-    /// Acquire a Metal device for one of this module's in-file Metal-parity
-    /// tests, or `None` to skip — unless `JAMMI_REQUIRE_METAL` is set, in
-    /// which case a missing device PANICS. Mirrors `tests/metal_parity.rs`'s
-    /// `metal_device_or_skip` (wave A's require/skip lattice shape), shared
-    /// here between both of this file's own Metal legs so the same shape is
-    /// written once, not duplicated per call site. `caller` names the test
-    /// in the panic/skip message.
-    ///
-    /// Wraps `Device::new_metal(0)` in `std::panic::catch_unwind`, mirroring
-    /// `tests/metal_parity.rs`'s own `metal_device_or_skip`: on at least
-    /// one real GH `macos-14` runner `Device::new_metal(0)` does not merely
-    /// return `Err` on a missing/broken device — an `objc2` class lookup
-    /// inside candle-metal-kernels' `residency_set.rs:18`
-    /// (`MTLResidencySetDescriptor`) can PANIC instead, a probe-time
-    /// failure mode a bare `Result` cannot model. Catching that panic here
-    /// is sound for the same reason `tests/metal_parity.rs`'s own doc
-    /// gives: the probe owns no lock and mutates no shared state before
-    /// failing, so unwinding out of it leaves nothing poisoned to clean up.
-    /// Both failure shapes (a returned `Err`, or a caught panic) fold into
-    /// the same skip/require decision below, so both of this fn's call
-    /// sites (`:743`, `:884`) inherit the containment from this ONE wrap.
-    fn metal_device_or_skip(caller: &str) -> Option<Device> {
-        let outcome: std::result::Result<Device, String> =
-            match std::panic::catch_unwind(|| Device::new_metal(0)) {
-                Ok(Ok(d)) => Ok(d),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(payload) => {
-                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                        (*s).to_string()
-                    } else if let Some(s) = payload.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "<non-string panic payload>".to_string()
-                    };
-                    Err(format!("Device::new_metal(0) panicked: {msg}"))
-                }
-            };
-        match outcome {
-            Ok(d) => Some(d),
-            Err(msg) => {
-                if std::env::var_os("JAMMI_REQUIRE_METAL").is_some() {
-                    panic!(
-                        "{caller}: JAMMI_REQUIRE_METAL is set but no Metal device is \
-                         available: {msg}"
-                    );
-                }
-                eprintln!(
-                    "{caller}: no Metal device available in this build/host -- skipping \
-                     the Metal leg"
-                );
-                None
-            }
-        }
     }
 
     /// `PhiloxKatProbe` through the CPU arm of the SAME `apply1` dispatch
@@ -680,9 +606,9 @@ mod tests {
     }
 
     /// The keep-rate oracle (a non-vacuous, measured, numpy-comparable
-    /// statistic — family F): over a large draw, the fraction kept must be
+    /// statistic): over a large draw, the fraction kept must be
     /// within a stated binomial bound of `p_keep`. `n = 1_000_000`,
-    /// `p = 0.05` (the shipped default, per #352): std dev of a Binomial
+    /// `p = 0.05` (the shipped LoRA default): std dev of a Binomial
     /// `(n, p_keep)` count is `sqrt(n*p*(1-p))` ≈ 217 for `p=0.05`, so 6
     /// std devs ≈ 1302 elements ≈ 0.0013 of `n` — a generous, explicitly
     /// derived, non-arbitrary bound (not a "just wide enough to pass" one).
@@ -714,124 +640,65 @@ mod tests {
         );
     }
 
-    /// esc-070 conjunct 4: a Philox-EXACT drop-count oracle.
-    ///
-    /// see `keep_rate_matches_p_within_a_binomial_bound` above, which is
-    /// explicitly a DISTRIBUTIONAL check — its own docstring states the
-    /// 6-sigma band —
-    /// and a band, by construction, tolerates a threshold/rounding bug
-    /// anywhere inside it: at that test's OWN `n = 1_000_000`, `p = 0.05`
-    /// fixture the band is ~1302 elements (~0.13% of `n`, no-producer:
-    /// analytically derived from the same 6-sigma binomial-bound formula
-    /// that test's own doc states, not a value this test itself measures),
-    /// so an off-by-a-handful (or even off-by-a-thousand) threshold bug
-    /// passes it silently. esc-070's
-    /// control demands the mask's keep-count EQUAL an independently-derived
-    /// Philox-exact count, not merely fall within a band — this test
-    /// supplies that oracle without displacing the band test above (kept as
-    /// the distribution-sanity companion).
-    ///
-    /// The replay below is genuinely independent of the op's own code
-    /// path: it calls ONLY [`philox_draw`] (`crate::philox`'s public
-    /// function — the same one [`DropoutFused::keeps`] itself calls, but
-    /// nothing further downstream of it), and reimplements the
-    /// `u64`-threshold comparison FROM SCRATCH, from the documented stream
-    /// contract in this module's own "KEEP/DROP: an INTEGER threshold"
-    /// doc section (`threshold = round(p_keep * 2^32)`, decision `draw <
-    /// threshold` in `u64` space) — written here as a standalone
-    /// expression, not by reading `DropoutFused`'s private `threshold`
-    /// field or by calling [`DropoutFused::keeps`], [`dropout_f32`], or
-    /// [`dropout_bf16`] (the op's own mask functions). Calling any of
-    /// those would make this test circular — it would prove only that the
-    /// op agrees with itself, not that its threshold logic is correct.
-    #[test]
-    fn philox_exact_drop_count_matches_an_independent_replay() {
-        let seed: u64 = 0x0BAD_C0FF_EE00_1234;
-        let layer_id: u32 = 3;
-        let forward_idx: u32 = 11;
-        let p: f32 = 0.05;
-        let n: usize = 131_072; // >= 100_000, per esc-070 conjunct 4
+    // A Philox-EXACT keep-count oracle. The binomial band in
+    // `keep_rate_matches_p_within_a_binomial_bound` tolerates any threshold or
+    // rounding bug inside the band (~1300 elements at its n and p); this pair
+    // requires the op's count to EQUAL a count replayed independently of the
+    // op's own mask code, so an off-by-one threshold is caught.
+    const REPLAY_SEED: u64 = 0x0BAD_C0FF_EE00_1234;
+    const REPLAY_LAYER: u32 = 3;
+    const REPLAY_FORWARD: u32 = 11;
+    const REPLAY_P: f32 = 0.05;
+    const REPLAY_N: usize = 131_072;
 
-        // Independent replay of the documented threshold formula --
-        // written standalone (not via `super::TWO_POW_32` or
-        // `DropoutFused`'s private `threshold` field).
-        let p_keep = 1.0_f64 - f64::from(p);
-        let two_pow_32 = 2.0_f64.powi(32);
-        let expected_threshold = (p_keep * two_pow_32).round() as u64;
-
-        // Independent replay of the per-element draw->threshold decision,
-        // calling ONLY the philox module's public draw function -- never
-        // `DropoutFused::keeps`/`dropout_f32`/`dropout_bf16`.
-        let derived_keep_count = (0..n as u64)
+    /// The Philox-exact keep count for the replay constants above, derived
+    /// without the op: the documented threshold `round(p_keep * 2^32)` and the
+    /// decision `draw < threshold` in `u64` space, over the philox module's
+    /// public draw function only.
+    fn independent_keep_count() -> usize {
+        let p_keep = 1.0_f64 - f64::from(REPLAY_P);
+        let threshold = (p_keep * 2.0_f64.powi(32)).round() as u64;
+        let kept = (0..REPLAY_N as u64)
             .filter(|&i| {
-                let draw = philox_draw(seed, layer_id, forward_idx, i);
-                u64::from(draw) < expected_threshold
+                u64::from(philox_draw(REPLAY_SEED, REPLAY_LAYER, REPLAY_FORWARD, i)) < threshold
             })
             .count();
-
-        // Non-degenerate (per the spec): a threshold that keeps
-        // everything or nothing would make the equality assertions below
-        // vacuous.
+        // A threshold that keeps everything or nothing would make the
+        // equality below vacuous.
         assert!(
-            derived_keep_count > 0 && derived_keep_count < n,
-            "derived keep-count {derived_keep_count} must be strictly \
-             between 0 and n={n} -- p={p} yields threshold \
-             {expected_threshold}"
+            kept > 0 && kept < REPLAY_N,
+            "derived keep-count {kept} must be strictly between 0 and n={REPLAY_N} \
+             (p={REPLAY_P}, threshold {threshold})"
         );
-        eprintln!(
-            "philox_exact_drop_count_matches_an_independent_replay: n={n} \
-             threshold={expected_threshold} derived_keep_count={derived_keep_count}"
-        );
+        kept
+    }
 
-        // CPU: run the actual op through the real dispatch path and count
-        // kept elements exactly (equality, not a band).
-        let cpu_device = Device::Cpu;
-        let v = vec![1.0f32; n];
-        let x_cpu = Tensor::from_slice(&v, (n,), &cpu_device).unwrap();
-        let out_cpu: Vec<f32> = dropout(seed, layer_id, forward_idx, p, &x_cpu)
+    /// Elements the op keeps of a ones-vector of the replay length on `device`,
+    /// through the real dispatch path.
+    fn op_keep_count(device: &Device) -> usize {
+        let x = Tensor::from_slice(&vec![1.0f32; REPLAY_N], (REPLAY_N,), device).unwrap();
+        dropout(REPLAY_SEED, REPLAY_LAYER, REPLAY_FORWARD, REPLAY_P, &x)
             .unwrap()
-            .to_vec1()
-            .unwrap();
-        let cpu_keep_count = out_cpu.iter().filter(|&&y| y != 0.0).count();
-        assert_eq!(
-            cpu_keep_count, derived_keep_count,
-            "CPU keep-count must EQUAL the independently-derived \
-             Philox-exact count, not merely fall within a distributional \
-             band -- cpu={cpu_keep_count} derived={derived_keep_count}"
-        );
-        eprintln!(
-            "philox_exact_drop_count_matches_an_independent_replay: \
-             cpu_keep_count={cpu_keep_count} (== derived_keep_count)"
-        );
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .filter(|&&y| y != 0.0)
+            .count()
+    }
 
-        // Metal: same equality oracle, run on a real Metal device when one
-        // is available on this host/build -- an honest, documented skip via
-        // `metal_device_or_skip` (mirrors
-        // `metal_matches_cpu_mask_for_identical_seed_key_position` below),
-        // loud (not silent) under `JAMMI_REQUIRE_METAL`; not the enforced
-        // proof itself (`tests/metal_parity.rs` carries the
-        // `required-features = ["metal"]` gate for that).
-        let Some(metal_device) =
-            metal_device_or_skip("philox_exact_drop_count_matches_an_independent_replay")
-        else {
-            return;
-        };
-        let x_metal = Tensor::from_slice(&v, (n,), &metal_device).unwrap();
-        let out_metal: Vec<f32> = dropout(seed, layer_id, forward_idx, p, &x_metal)
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        let metal_keep_count = out_metal.iter().filter(|&&y| y != 0.0).count();
-        eprintln!(
-            "philox_exact_drop_count_matches_an_independent_replay: \
-             metal_keep_count={metal_keep_count} (== derived_keep_count)"
-        );
-        assert_eq!(
-            metal_keep_count, derived_keep_count,
-            "Metal keep-count must EQUAL the independently-derived \
-             Philox-exact count -- metal={metal_keep_count} \
-             derived={derived_keep_count}"
-        );
+    /// The CPU op keeps EXACTLY the independently-derived count, not merely a
+    /// count within a distributional band.
+    #[test]
+    fn philox_exact_drop_count_matches_an_independent_replay() {
+        assert_eq!(op_keep_count(&Device::Cpu), independent_keep_count());
+    }
+
+    /// The Metal op keeps exactly the same count.
+    #[cfg(feature = "live-metal-tests")]
+    #[test]
+    fn philox_exact_drop_count_on_metal_matches_an_independent_replay() {
+        let metal = jammi_test_resources::metal_device();
+        assert_eq!(op_keep_count(&metal), independent_keep_count());
     }
 
     #[test]
@@ -946,66 +813,5 @@ mod tests {
                 "element {i}: KEEP/DROP must agree across dtypes (f32 vs f16)"
             );
         }
-    }
-
-    /// Cross-device determinism oracle (issue #433 / the esc-032/033
-    /// determinism contract, restated for Metal): a Metal-resident input
-    /// must produce mask bytes byte-identical to `cpu_fwd`'s for the same
-    /// `(seed, layer_id, forward_idx)` — the concrete, observable form of
-    /// "the mask stream is a pure function of position" once a real
-    /// physical device is involved. `metal_device_or_skip` erroring is a
-    /// documented, honest — but loud under `JAMMI_REQUIRE_METAL` — skip
-    /// (the dummy Metal backend structurally cannot construct a Metal
-    /// tensor at all, so this build has nothing to prove) — NOT the
-    /// enforced proof itself: `tests/metal_parity.rs`
-    /// (this crate's `[[test]] required-features = ["metal"]`, mirroring
-    /// `cuda_parity.rs`) is what makes the assertion non-skippable in a
-    /// Metal-capable build; this in-file copy exists so the same assertion
-    /// also runs from a plain `cargo test -p jammi-kernels --features
-    /// metal` without needing the separate binary.
-    #[test]
-    fn metal_matches_cpu_mask_for_identical_seed_key_position() {
-        let Some(metal_device) =
-            metal_device_or_skip("metal_matches_cpu_mask_for_identical_seed_key_position")
-        else {
-            return;
-        };
-        let cpu_device = Device::Cpu;
-        let n = 4096usize;
-        let v: Vec<f32> = (0..n).map(|i| 1.0 + i as f32 * 0.001).collect();
-        let x_cpu = Tensor::from_slice(&v, (n,), &cpu_device).unwrap();
-        let x_metal = Tensor::from_slice(&v, (n,), &metal_device).unwrap();
-
-        let out_cpu: Vec<f32> = dropout(777, 4, 9, 0.3, &x_cpu).unwrap().to_vec1().unwrap();
-        let out_metal: Vec<f32> = dropout(777, 4, 9, 0.3, &x_metal)
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        assert_eq!(
-            out_cpu, out_metal,
-            "Metal's mask stream must be byte-identical to CPU's for the \
-             same (seed, layer_id, forward_idx)"
-        );
-
-        // Same oracle for BF16, this op's other production dtype.
-        let vb: Vec<bf16> = v.iter().map(|&x| bf16::from_f32(x)).collect();
-        let x_cpu_bf16 = Tensor::from_slice(&vb, (n,), &cpu_device).unwrap();
-        let x_metal_bf16 = Tensor::from_slice(&vb, (n,), &metal_device).unwrap();
-        let out_cpu_bf16: Vec<f32> = dropout(777, 4, 9, 0.3, &x_cpu_bf16)
-            .unwrap()
-            .to_dtype(DType::F32)
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        let out_metal_bf16: Vec<f32> = dropout(777, 4, 9, 0.3, &x_metal_bf16)
-            .unwrap()
-            .to_dtype(DType::F32)
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        assert_eq!(
-            out_cpu_bf16, out_metal_bf16,
-            "BF16 Metal mask stream must be byte-identical to CPU's"
-        );
     }
 }

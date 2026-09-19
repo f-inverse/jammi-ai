@@ -1,5 +1,5 @@
-//! What a [`super::trainer::TrainingLoop::run`] call trains from (#500 U2c
-//! §10/§11, the production binding of the residency-bounded stream).
+//! What a [`super::trainer::TrainingLoop::run`] call trains from (the
+//! production binding of the residency-bounded stream).
 //!
 //! [`TrainingSource`] is the type the worker hands `run`: either an already
 //! in-memory [`TrainingDataLoader`] ([`TrainingSource::Resident`] — the
@@ -7,13 +7,12 @@
 //! a [`StreamedSet`] ([`TrainingSource::Streamed`] — everything else at
 //! `W = 1`), which names a materialised table and a row window WITHOUT ever
 //! reading a row back: the eager `Vec<RecordBatch>` collect
-//! ([`super::training_set::read_back`]) never runs for a `Streamed` source
-//! (F1).
+//! ([`super::training_set::read_back`]) never runs for a `Streamed` source.
 //!
 //! `whole_set_arm` is the ONE predicate that decides which arm a
 //! configuration takes — the worker's source selection
 //! (`worker.rs::run_spec`) and the trainer's own dispatch (`trainer.rs::run`,
-//! which refuses a whole-set arm reached with a `Streamed` source, F6) call
+//! which refuses a whole-set arm reached with a `Streamed` source) call
 //! the SAME function, so the two can never disagree about which
 //! configurations must stay resident.
 
@@ -55,11 +54,11 @@ pub struct StreamedSet {
     /// `spawn_blocking` pool via `Handle::block_on`, a fresh top-level poll
     /// on a different OS thread that does NOT inherit a Tokio task-local —
     /// so every per-epoch stream open re-enters this scope explicitly rather
-    /// than relying on inheritance (#500 U2c c3d). `None` for an unscoped
+    /// than relying on inheritance. `None` for an unscoped
     /// run (the queue-drain worker's own claim, or a test session that never
     /// bound a tenant).
     pub(crate) tenant: Option<jammi_db::TenantId>,
-    /// Built ONCE by the worker's own whole-table sweep (F3) — `None` for
+    /// Built ONCE by the worker's own whole-table sweep — `None` for
     /// every non-classification task. Carries the FULL label→index
     /// assignment, not just its cardinality: every per-epoch training-window
     /// open AND the validation-window open need the actual vocabulary to
@@ -79,7 +78,7 @@ impl StreamedSet {
     /// non-classification task, `Some(vocab.num_classes())` otherwise. The
     /// SAME quantity the eager path's `TrainingFormat::Classification {
     /// num_classes }` carries, computed from the identical whole-table
-    /// vocabulary (F3).
+    /// vocabulary.
     pub(crate) fn num_classes(&self) -> Option<usize> {
         self.label_vocab.as_ref().map(LabelVocabulary::num_classes)
     }
@@ -116,7 +115,7 @@ impl TrainingSource {
 }
 
 /// The two whole-table training arms a [`StreamedSet`] is exempted from
-/// (M3's `Σ E` term, `stream.rs`'s module doc): mining scores every
+/// (the `Σ E` term of `stream.rs`'s module doc): mining scores every
 /// candidate against the FULL corpus, and GradCache treats the whole
 /// dataset as one in-batch-negative batch — both need every row resident
 /// before the epoch can begin, so neither one can ever run against a
@@ -160,7 +159,7 @@ pub(crate) fn gradcache_eligible(config: &FineTuneConfig, has_base_model: bool) 
 
 /// Whether `config` (under a run that does/doesn't have a base model to
 /// embed through) takes a whole-set arm AT ALL — the predicate
-/// `worker.rs::run_spec`'s source selection calls (#500 U2c §11 F6): the
+/// `worker.rs::run_spec`'s source selection calls: the
 /// worker selects [`TrainingSource::Resident`] whenever this returns
 /// `Some`, and `trainer.rs::run` refuses (typed) reaching a whole-set arm
 /// with a `Streamed` source — so the two decisions can never come apart.
@@ -169,10 +168,10 @@ pub(crate) fn gradcache_eligible(config: &FineTuneConfig, has_base_model: bool) 
 /// (regardless of whether [`gradcache_eligible`] ALSO holds — see that
 /// function's own doc on the two being independent): this return value is
 /// consumed only as "is some whole-set arm active" (the worker's
-/// Resident-vs-Streamed choice) and as a diagnostic label (the trainer's F6
-/// refusal message), never to pick which per-epoch branch runs — that
+/// Resident-vs-Streamed choice) and as a diagnostic label (the trainer's
+/// streamed-whole-set refusal message), never to pick which per-epoch branch runs — that
 /// choice is `mining_eligible()`/`gradcache_eligible()`, called
-/// independently, as it always was.
+/// independently.
 pub(crate) fn whole_set_arm(config: &FineTuneConfig, has_base_model: bool) -> Option<WholeSetArm> {
     if mining_eligible(config, has_base_model) {
         Some(WholeSetArm::Mining)
@@ -188,12 +187,10 @@ mod tests {
     use super::*;
     use crate::fine_tune::data::split_index;
 
-    /// `split_index` (factored out of `TrainingDataLoader::split`) is the
+    /// `split_index` (shared with `TrainingDataLoader::split`) is the
     /// SAME boundary a hand-rolled `total - round(total * fraction)`
     /// computes, for every `total` a training set could realistically hold
-    /// and every fraction `FineTuneConfig::validate` admits (#500 U2c §10:
-    /// "a unit test pins equality for every `total ∈ 0..=1000` and every
-    /// fraction the config admits").
+    /// and every fraction `FineTuneConfig::validate` admits.
     #[test]
     fn split_index_matches_the_resident_split_boundary() {
         for total in 0..=1000usize {

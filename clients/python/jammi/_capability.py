@@ -8,18 +8,16 @@ against this enum, and invoking a feature the backend lacks raises
 ``AttributeError``.
 
 The set is CLOSED: exactly the features that genuinely diverge between the two
-transports today. It names no consumer — each value is a generic engine feature
+transports. It names no consumer — each value is a generic engine feature
 (an audit log, a session-scoped storage context, a model preload, a connection
 id), reachable by any user who never heard of a particular one.
 
 "Genuinely diverge" is load-bearing in both directions, and a member LEAVES when
-it stops diverging. `CLOSE` was such a member: the embedded arm was documented as
-releasing on drop, so `close()` was remote-only. That was never true under the
-engine's `unix-excl` catalog seam — releasing the catalog file is an AWAITED
-event the engine exposes as `close()`, and the flag was hiding a primitive that
-existed rather than describing a divergence. Both transports now carry `close()`,
-so it is an ordinary member of the :class:`~jammi.Session` surface and NOT a
-capability: a flag every backend sets is a predicate that never discriminates.
+it stops diverging. `close()` is not a member: both transports carry it (the
+embedded arm's is the AWAITED catalog-file release under the engine's
+`unix-excl` catalog seam, not a release on drop), so it is an ordinary member of
+the :class:`~jammi.Session` surface — a flag every backend sets is a predicate
+that never discriminates.
 """
 
 from __future__ import annotations

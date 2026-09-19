@@ -1,14 +1,14 @@
 //! Two cast-boundary fusions for [`super::LowRankResidualLinear::bwd`]'s
-//! epilogue and residual-add sites (the "cast-boundary lever", Wave 1
-//! (e)/(f): B1 is the epilogue's `to_dtype(F32)` + `.affine(scale, 0.0)`
-//! pair fused as [`CastScaleBf16F32`]; B3 is the residual-add's
+//! epilogue and residual-add sites (the "cast-boundary lever"): the
+//! epilogue's `to_dtype(F32)` + `.affine(scale, 0.0)`
+//! pair fused as [`CastScaleBf16F32`]; the residual-add's
 //! `to_dtype(bf16)` + `Tensor::add` pair fused as [`CastAddBf16`] — see
-//! each type's own doc below for its exact expression and traffic model).
-//! Both ops are generic Tensor-API primitives (family L: this crate names
+//! each type's own doc below for its exact expression and traffic model.
+//! Both ops are generic Tensor-API primitives (this crate names
 //! no consumer); `LowRankResidualLinear::bwd` is their first caller, not a
 //! fixed contract.
 //!
-//! ## [`CastScaleBf16F32`] — B1's `to_dtype(F32)` + `.affine(scale, 0.0)`
+//! ## [`CastScaleBf16F32`] — the epilogue's `to_dtype(F32)` + `.affine(scale, 0.0)`
 //!
 //! `out_f32 = f32(x_bf16) * scale + 0.0` in ONE kernel, replacing candle's
 //! own two-launch chain: `cast_bf16_f32` (`candle-kernels-0.11.0/src/
@@ -28,14 +28,13 @@
 //! term is REQUIRED (not an optimizable no-op): it is what makes this
 //! bit-identical to `affine_f32`'s own `x * mul + add` for the signed-zero
 //! case (`-0.0 * scale + 0.0 == +0.0` in IEEE 754 round-to-nearest, whereas
-//! `-0.0 * scale` alone stays `-0.0` when `scale > 0` — see the RED control
-//! in this file's own tests).
+//! `-0.0 * scale` alone stays `-0.0` when `scale > 0` — see the negative
+//! control in this file's own tests).
 //!
-//! Traffic: old = cast(read 2B + write 4B) + affine(read 4B + write 4B) =
-//! 14 B/elem; new = read 2B + write 4B = 6 B/elem (design study §1's (e),
-//! credit 8 B/elem).
+//! Traffic: eager = cast(read 2B + write 4B) + affine(read 4B + write 4B) =
+//! 14 B/elem; fused = read 2B + write 4B = 6 B/elem (saves 8 B/elem).
 //!
-//! Domain (family D): input MUST be `BF16` — this op's own name states the
+//! Domain: input MUST be `BF16` — this op's own name states the
 //! one dtype pair it fuses; a caller with an already-`F32` `grad_res` has
 //! nothing to fuse (candle's `affine_f32` alone is already the minimal
 //! single kernel for that case) and should call `Tensor::affine` directly,
@@ -48,7 +47,7 @@
 //! See "Contiguity at the call site" below for why `bwd` never actually
 //! reaches this refusal in production.
 //!
-//! ## [`CastAddBf16`] — B3's `to_dtype(bf16)` + the `dx_base + d_x_lora` add
+//! ## [`CastAddBf16`] — the residual-add's `to_dtype(bf16)` + the `dx_base + d_x_lora` add
 //!
 //! `out_bf16 = base_bf16 + round_to_bf16(f32val)`, replacing candle's own
 //! two-launch chain: `cast_f32_bf16` (`cast.cu`'s `cast_<float,
@@ -63,7 +62,7 @@
 //! question `binary.cu:5` answers for candle's own kernel, by construction
 //! rather than by re-deriving what the hardware intrinsic does.
 //!
-//! The rounding order the task requires — round the f32 intermediate to
+//! The required rounding order — round the f32 intermediate to
 //! bf16 IN-REGISTER first (`__float2bfloat16`), THEN add in native bf16 —
 //! is exactly what the two-argument order encodes: `f32val` is rounded to
 //! `delta: __nv_bfloat16` before it ever reaches the `+`.
@@ -72,8 +71,7 @@
 //! citation trail.** PEFT's `Linear.forward` (installed `peft==0.20.0`,
 //! `peft/tuners/lora/layer.py:1056`) casts its input UP before the adapter
 //! GEMMs: `x = self._cast_input_dtype(x, lora_A.weight.dtype)`.
-//! `_cast_input_dtype` (`peft/tuners/tuners_utils.py:1777-1792`, verified at
-//! the installed source this session) is a plain `x.to(dtype=dtype)` when
+//! `_cast_input_dtype` (`peft/tuners/tuners_utils.py:1777-1792`) is a plain `x.to(dtype=dtype)` when
 //! the dtypes differ (`:1790-1792`) — an ordinary torch `.to()` cast, not a
 //! custom op. `dx` (this op's `f32val` argument, `d_xd` in
 //! `LowRankResidualLinear::bwd`) is the gradient flowing BACKWARD through
@@ -85,17 +83,11 @@
 //! a cast is a cast of the gradient" rule (`tools/autograd/derivatives.yaml`
 //! / `torch/csrc/autograd/FunctionsManual.cpp`'s `_to_copy_backward`) — i.e.
 //! round-then-add on the `dx` path, exactly what this kernel's argument
-//! order preserves. UNVERIFIED-AT-SOURCE-THIS-SESSION: no torch
-//! installation or vendored `derivatives.yaml`/`FunctionsManual.cpp` was
-//! reachable from this environment (checked: no `torch` Python module, no
-//! `derivatives.yaml` on this filesystem) — the `_to_copy_backward`
-//! citation is stated from the standard "cast backward is a cast" autograd
-//! convention documented in torch's own public docs and PEFT's own
-//! matching forward-cast shape, NOT confirmed by reading the C++ source
-//! directly this session. A future reader with pod/torch access should
-//! confirm `derivatives.yaml`'s `_to_copy: self: _to_copy_backward(grad,
-//! self.options())` line before treating this as source-verified rather
-//! than convention-inferred.
+//! order preserves. The `_to_copy_backward` citation rests on the standard
+//! "cast backward is a cast" autograd convention in torch's public docs and
+//! PEFT's matching forward-cast shape; it is NOT source-verified against
+//! `derivatives.yaml`'s `_to_copy: self: _to_copy_backward(grad,
+//! self.options())` line.
 //!
 //! **CPU arm and the double-rounding argument.** The CPU arm cannot call an
 //! `operator+`; it must decide what "native bf16 add" means in software.
@@ -123,7 +115,7 @@
 //! makes the same claim and is backed by an on-device oracle,
 //! `tests/scaled_cast_add_oracles.rs`).
 //!
-//! **A real, discovered divergence this file's own tests route around:**
+//! **A real divergence this file's own tests route around:**
 //! candle-core-0.11.0's CPU `Tensor::add` for `BF16`, on any host compiled
 //! with `target_feature = "neon"` (this crate's own arm64 dev/CI hosts
 //! included) WITHOUT the separate `target_feature = "bf16"` dot-product
@@ -135,7 +127,7 @@
 //! — only the `n % 32` scalar "leftover" elements take the correctly-
 //! rounded `half::bf16::Add` path this file's own arm matches. This means
 //! a literal `Tensor::add` at production width (`n >> 32`) is NOT a
-//! portable oracle (family J: its bit pattern depends on the HOST
+//! portable oracle (its bit pattern depends on the HOST
 //! compiler's `target_feature` flags, not just the math) and is NOT what
 //! this op's own correctness target is anyway — CUDA's `badd_bf16` is a
 //! correctly-rounded hardware bf16 add, which this crate's round-to-
@@ -146,11 +138,11 @@
 //! (`n = 8`, under `STEP`) proving bit-exactness against a REAL
 //! `Tensor::add` call on the scalar (round-to-nearest) path.
 //!
-//! Traffic: old = cast(read 4B + write 2B) + badd(read 2B + read 2B + write
-//! 2B) = 12 B/elem; new = read `f32val` 4B + read `base` 2B + write `out`
-//! 2B = 8 B/elem (design study §1's (f), credit 4 B/elem).
+//! Traffic: eager = cast(read 4B + write 2B) + badd(read 2B + read 2B + write
+//! 2B) = 12 B/elem; fused = read `f32val` 4B + read `base` 2B + write `out`
+//! 2B = 8 B/elem (saves 4 B/elem).
 //!
-//! Domain (family D): `base` MUST be `BF16`, `f32val` MUST be `F32`, same
+//! Domain: `base` MUST be `BF16`, `f32val` MUST be `F32`, same
 //! shape (not broadcasting). The `base_dtype == F32` case in
 //! `LowRankResidualLinear::bwd` (`dx = dx_base + d_x_lora`, both already
 //! `F32`) is already a single candle `badd_f32` launch with nothing to
@@ -183,7 +175,7 @@
 //! `dev.alloc::<T>(elem_count)` calls) and `d_x_lora_f32_2d` (either that
 //! same fresh-GEMM shape or [`super::DropoutFused`]'s own kernel output,
 //! also freshly allocated) — neither is ever a narrowed/transposed VIEW.
-//! `RequiresContiguous` is therefore reachable only if a future change to
+//! `RequiresContiguous` is therefore reachable only if a change to
 //! `bwd` threads a genuinely non-contiguous tensor through one of these two
 //! slots; kept as a typed refusal (not a panic, not silently misread
 //! strides) rather than trusted away, per this crate's usual "an op trusts
@@ -193,16 +185,16 @@
 //! Both ops dispatch through [`crate::admission::admit`] with their own
 //! [`crate::admission::DispatchCounters`] key (`op.name()`), so
 //! `JAMMI_KERNELS_DISABLE=cast_scale_bf16_f32` / `cast_add_bf16` force the
-//! ORIGINAL two-kernel eager composition back on for a same-build forced
+//! two-kernel eager composition back on for a same-build forced
 //! A/B, and a zero-dispatch run is observable (never silently green).
 //!
-//! ## [`CastScaleF16F32`] / [`CastAddF16`] — F16 analogs, campaign #443 W2c
+//! ## [`CastScaleF16F32`] / [`CastAddF16`] — F16 analogs
 //!
 //! [`CastScaleBf16F32`] and [`CastAddBf16`] are domain-restricted to `BF16`
 //! BY CONSTRUCTION (see each type's own doc) — an F16 analog is therefore a
-//! NEW, independent pair of types, not a widened match arm on either
-//! existing one (per the per-op f16 reference-regime table's own structural
-//! finding, `docs/maintainer/cuda-kernel-guide.md` §3.10). See each new
+//! separate, independent pair of types, not a widened match arm on either
+//! BF16 one (per the per-op f16 reference-regime table,
+//! `docs/maintainer/cuda-kernel-guide.md` §3.10). See each F16
 //! type's own doc for its double-rounding-safety margin at F16's narrower
 //! (11-bit, vs BF16's 8-bit) significand — the classical bound holds with
 //! EQUALITY rather than comfortable headroom, worth stating explicitly
@@ -263,12 +255,12 @@ impl CustomOp1 for CastScaleBf16F32 {
     /// rule through the (straight-through, matching
     /// [`super::ScaledCastAdd::bwd`]'s convention) round and the scalar
     /// multiply/widening-cast pair this op's forward composes. Dead in
-    /// `LowRankResidualLinear::bwd`'s own usage today (its `grad_res`
+    /// `LowRankResidualLinear::bwd`'s own usage (its `grad_res`
     /// argument is an untracked upstream-gradient tensor, never itself
     /// re-differentiated — see that op's own module doc, "Tensor-level"),
     /// implemented anyway for the same reason
     /// [`super::ScaledCastAdd::bwd`] always returns
-    /// `Some`: this is a generic primitive (family L), not guaranteed to
+    /// `Some`: this is a generic primitive, not guaranteed to
     /// stay behind an untracked call site forever.
     fn bwd(&self, arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> Result<Option<Tensor>> {
         let d = grad_res.affine(self.scale, 0.0)?;
@@ -281,7 +273,7 @@ impl CustomOp1 for CastScaleBf16F32 {
     }
 }
 
-/// Fixed fold order (family J): `StridedOffsets` walked in the same
+/// Fixed fold order: `StridedOffsets` walked in the same
 /// sequence for a given layout every time.
 fn cast_scale_bf16_f32(scale: f64, x: &[bf16], lx: &Layout) -> Vec<f32> {
     let scale = scale as f32;
@@ -360,9 +352,9 @@ impl CustomOp2 for CastAddBf16 {
     /// coefficient" convention); `d_f32val = cast_to(F32)(dy)` — the chain rule through
     /// the (straight-through) round, matching
     /// [`super::ScaledCastAdd::bwd`]'s `d_lora` cast. Dead in
-    /// `LowRankResidualLinear::bwd`'s own usage today for the same reason
+    /// `LowRankResidualLinear::bwd`'s own usage for the same reason
     /// [`CastScaleBf16F32::bwd`]'s doc states; implemented for completeness
-    /// as a generic primitive (family L).
+    /// as a generic primitive.
     fn bwd(
         &self,
         _base: &Tensor,
@@ -380,7 +372,7 @@ impl CustomOp2 for CastAddBf16 {
     }
 }
 
-/// Fixed fold order (family J), and the double-rounding-safety argument the
+/// Fixed fold order, and the double-rounding-safety argument the
 /// module doc states: widen both `bf16` operands to `f32`, add, round once
 /// — bit-identical to a genuine single-rounding narrow add at this
 /// precision gap, and to `half::bf16::Add` (hence candle's own CPU
@@ -396,10 +388,10 @@ fn cast_add_bf16(base: &[bf16], lb: &Layout, f32val: &[f32], lf: &Layout) -> Vec
         .collect()
 }
 
-/// [`CastScaleBf16F32`]'s F16 analog (campaign #443 W2c): `out = f32(x) *
-/// scale + 0.0`, `x` required `F16`. This is a NEW, independent type — not
+/// [`CastScaleBf16F32`]'s F16 analog: `out = f32(x) *
+/// scale + 0.0`, `x` required `F16`. This is a separate, independent type — not
 /// a widened match arm on [`CastScaleBf16F32`] — per the per-op f16
-/// reference-regime table's own structural finding
+/// reference-regime table
 /// (`docs/maintainer/cuda-kernel-guide.md` §3.10): `CastScaleBf16F32` is
 /// domain-restricted to `BF16` BY CONSTRUCTION (its own name and doc state
 /// this), so an F16 analog is genuine kernel authoring, mirroring the SAME
@@ -418,7 +410,7 @@ fn cast_add_bf16(base: &[bf16], lb: &Layout, f32val: &[f32], lf: &Layout) -> Vec
 /// round to F16 on the way out — no intermediate narrow-precision value at
 /// all), so the classical double-rounding hazard (which requires an
 /// intermediate ALSO being rounded) does not arise here regardless of
-/// margin size; the margin is stated because a future caller composing
+/// margin size; the margin is stated because a caller composing
 /// this op's F32 output with a SECOND F16 rounding step would be operating
 /// exactly at that boundary, not comfortably past it.
 ///
@@ -473,7 +465,7 @@ impl CustomOp1 for CastScaleF16F32 {
 }
 
 /// [`cast_scale_bf16_f32`]'s exact twin, substituting `half::f16`. Fixed
-/// fold order (family J): `StridedOffsets` walked in the same sequence for
+/// fold order: `StridedOffsets` walked in the same sequence for
 /// a given layout every time.
 fn cast_scale_f16_f32(scale: f64, x: &[f16], lx: &Layout) -> Vec<f32> {
     let scale = scale as f32;
@@ -482,9 +474,9 @@ fn cast_scale_f16_f32(scale: f64, x: &[f16], lx: &Layout) -> Vec<f32> {
         .collect()
 }
 
-/// [`CastAddBf16`]'s F16 analog (campaign #443 W2c): `out = base +
+/// [`CastAddBf16`]'s F16 analog: `out = base +
 /// round_to_f16(f32val)`, `base` required `F16`, `f32val` required `F32`,
-/// identical shape (not broadcasting). A NEW, independent type for the SAME
+/// identical shape (not broadcasting). A separate, independent type for the SAME
 /// structural reason [`CastScaleF16F32`]'s doc states — `CastAddBf16` is
 /// domain-restricted to `BF16` by construction.
 ///
@@ -579,7 +571,7 @@ impl CustomOp2 for CastAddF16 {
 }
 
 /// [`cast_add_bf16`]'s exact twin, substituting `half::f16`. Fixed fold
-/// order (family J), and the double-rounding-safety argument
+/// order, and the double-rounding-safety argument
 /// [`CastAddF16`]'s doc states.
 fn cast_add_f16(base: &[f16], lb: &Layout, f32val: &[f32], lf: &Layout) -> Vec<f16> {
     StridedOffsets::from_layout(lb)
@@ -667,7 +659,7 @@ mod tests {
         // primitive — exercised directly here (not through `apply1`+
         // `backward()`, since `grad_res` in the real call site is never
         // itself tracked) to close the mutation surface `bwd` otherwise
-        // leaves untested (MUT-1 discipline: every function this crate
+        // leaves untested (every function this crate
         // ships gets a covering test, not only the ones a current call
         // site happens to reach).
         let device = Device::Cpu;
@@ -728,8 +720,8 @@ mod tests {
     fn bit_identical_to_the_eager_two_kernel_chain_at_production_amplitude() {
         // Production width (>= 4096 elements, guide §3.4) and amplitude
         // spanning the range this op's real caller sees: base-residual-like
-        // magnitudes up to ~6.7e3 (esc-045's own layer-18 residual
-        // magnitude, the real checkpoint measurement this fixture's
+        // magnitudes up to ~6.7e3 (a real layer-18 residual
+        // magnitude, measured on a real checkpoint, which this fixture's
         // amplitude is sized from), exact zeros, negative zeros, and
         // subnormals.
         let device = Device::Cpu;
@@ -740,7 +732,7 @@ mod tests {
                 bf16::from_f32(v)
             })
             .collect();
-        // Force a few boundary values explicitly (family D: an oracle keyed
+        // Force a few boundary values explicitly (an oracle keyed
         // on production shape AND amplitude, not decoration).
         xv[0] = bf16::from_f32(0.0);
         xv[1] = bf16::from_f32(-0.0);
@@ -782,14 +774,14 @@ mod tests {
 
     #[test]
     fn red_control_a_missing_plus_zero_diverges_on_negative_zero() {
-        // Non-vacuity (guide §3.7/§3.8, family F): a deliberately WRONG
+        // Non-vacuity (guide §3.7/§3.8): a deliberately WRONG
         // expression (`x * scale` without `+ 0.0f`) must diverge from the
         // real kernel on an input containing -0.0 — proving the assertion
         // above is not vacuously true regardless of the `+ 0.0` term.
         let scale = 3.0_f32;
         let neg_zero = bf16::from_f32(-0.0);
         let correct = neg_zero.to_f32() * scale + 0.0f32; // no-producer: IEEE-754 identity (`-0.0 + 0.0 == +0.0`), not a tolerance floor.
-        let wrong = neg_zero.to_f32() * scale; // the RED control expression
+        let wrong = neg_zero.to_f32() * scale; // the negative-control expression
         assert_eq!(correct.to_bits(), 0f32.to_bits(), "correct must be +0.0");
         assert_eq!(
             wrong.to_bits(),
@@ -899,7 +891,7 @@ mod tests {
     #[test]
     fn cast_add_bwd_matches_a_hand_computed_straight_through_gradient() {
         // Dead in `LowRankResidualLinear::bwd`'s own usage (see this op's
-        // `bwd` doc); exercised directly for the same MUT-1 reason
+        // `bwd` doc); exercised directly for the same reason
         // `cast_scale_bwd_matches_a_hand_computed_straight_through_gradient`
         // states.
         let device = Device::Cpu;
@@ -957,24 +949,22 @@ mod tests {
         assert_eq!(got, [4.0, -8.0]);
     }
 
-    /// esc-046 (GH#374) control (g) SCOPE FENCE: the FORWARD fix
-    /// (`ScaledCastAdd`'s epilogue rounding order, `ops/scaled_cast_add.rs`)
-    /// touches a DIFFERENT op entirely — this file (`cast_scale.rs`) has no
-    /// diff in that change at all. This is the biting pin that makes that
-    /// claim checkable rather than merely asserted: `CastAddBf16::bwd`'s
+    /// SCOPE FENCE: `ScaledCastAdd`'s forward epilogue rounding order
+    /// (`ops/scaled_cast_add.rs`) belongs to a DIFFERENT op entirely, and
+    /// this op's backward must not follow it. This pins that: `CastAddBf16::bwd`'s
     /// `dx` path (`d_base = grad_res` identity, `d_f32val =
     /// cast_to(f32val.dtype())(grad_res)`) is re-derived independently here
     /// (elementwise, from the two small-`n` fixtures above's OWN documented
     /// formula, not by importing this file's `bwd` and trusting it) and
     /// pinned bit-for-bit at PRODUCTION width (`n = 4096`, matching
-    /// esc-046's own forward-side production-width fixture in
-    /// `tests/scaled_cast_add_peft_rounding.rs`) — a future change to this
+    /// the forward-side production-width fixture in
+    /// `tests/scaled_cast_add_peft_rounding.rs`) — a change to this
     /// op's rounding placement (e.g. mistakenly "fixing" it to match
-    /// `ScaledCastAdd`'s new round-once forward model) would move this test
+    /// `ScaledCastAdd`'s round-once forward model) would move this test
     /// off its own hand formula and fail here, not silently pass because
     /// only a 2-element fixture was ever checked at scale.
     #[test]
-    fn cast_add_bwd_dx_path_bit_identical_to_hand_formula_at_production_width_esc046_control_g() {
+    fn cast_add_bwd_dx_path_bit_identical_to_hand_formula_at_production_width() {
         let device = Device::Cpu;
         let n = 4096usize;
         // `base` unused by `bwd` (the op's own `d_base = grad_res` identity
@@ -988,7 +978,7 @@ mod tests {
             .collect();
         let f32_v: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.029).sin()) * 3.7).collect();
         // The upstream gradient (`grad_res`) is F32 — the shape a real
-        // `LowRankResidualLinear::bwd` call threads through this op today
+        // `LowRankResidualLinear::bwd` call threads through this op
         // (`res`'s own dtype is BF16, but `bwd`'s `grad_res` argument here
         // is exercised directly, white-box, at F32 — the branch this op's
         // own doc states as the "chain rule through the round" case,
@@ -1118,7 +1108,7 @@ mod tests {
         // test's production width (`n = 4096`, `>> 32`), comparing against
         // a literal `Tensor::add` would make the "reference" depend on
         // this HOST'S compile-time `target_feature` flags — not a portable
-        // oracle (family J), and not what production cares about anyway:
+        // oracle, and not what production cares about anyway:
         // the real target is CUDA's `badd_bf16` (a hardware bf16 add,
         // correctly-rounded per IEEE 754), which this hand-computed
         // round-to-nearest reference matches, and candle's own NEON
@@ -1264,7 +1254,7 @@ mod tests {
         );
     }
 
-    // ---- CastScaleF16F32 / CastAddF16 (campaign #443 W2c) ----
+    // ---- CastScaleF16F32 / CastAddF16 ----
 
     fn cast_scale_f16(scale: f64, x: &Tensor) -> Result<Tensor> {
         crate::ops::apply1(x, CastScaleF16F32::new(scale))
@@ -1475,10 +1465,9 @@ mod tests {
         // accumulating `1.0 + f32val` at FULL f32 precision first pushes
         // the true sum just past the halfway point BETWEEN `1.0` and the
         // next f16 above it, rounding UP to `1.0009766` instead — an
-        // exhaustive brute-force search (0.1 microstep, `half` crate,
-        // documented here rather than re-derived by hand: see this
-        // fixture's own hand-off report) confirmed this is a genuine
-        // divergence, not a hand-calculation error.
+        // exhaustive brute-force search (0.1 microstep, `half` crate)
+        // confirms this is a genuine divergence, not a hand-calculation
+        // error; the two asserts below re-check it on every run.
         let base = f16::from_f32(1.0);
         let f32val = 0.0004884_f32;
         let correct = base + f16::from_f32(f32val); // round f32val to f16 FIRST, then add

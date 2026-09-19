@@ -110,47 +110,37 @@ pub(crate) fn gaussian_fill(rng: &mut SplitMix64, len: usize, stdev: f32) -> Vec
 }
 
 /// A LoRA layer's dropout mask source: COUNTER-KEYED, not an advancing
-/// stream. Adopts the shape preserved from `wip/device-side-dropout`
-/// (that branch's `DropoutMasks`/atomic-counter design was worth keeping;
-/// its `Device::set_seed` draw mechanism was NOT — see this crate's
-/// `jammi_kernels::ops::dropout` module doc for the full rejected-mechanism
-/// writeup) with the mechanism this commit actually ships: every draw runs
-/// through `jammi_kernels::ops::DropoutFused`, a counter-based Philox
-/// `CustomOp1` — never a per-device RNG, and (CPU/CUDA) never a
-/// host-materialized mask at all. **Metal is the one disclosed exception**
-/// (issue #433): `DropoutFused::metal_fwd` has no Metal Philox compute
-/// kernel to run in-kernel the way CPU/CUDA do, so it computes the SAME
-/// decision via a transient host round trip instead (download, run the
-/// identical CPU decision function, re-upload) — see
-/// `jammi_kernels::ops::dropout`'s module doc, "Metal: a device-scoped
-/// deterministic host fallback", for the full design and the honestly
-/// disclosed cost. That transient host buffer is never a `Tensor`, never a
-/// graph node, and never retained past the single `metal_fwd` call, so the
-/// esc-032 residency clause below (no mask tensor on the autograd tape)
-/// still holds on Metal exactly as it does on CPU/CUDA — only the "no host
-/// round trip at all" claim is Metal-specific and disclosed as such.
+/// stream. Every draw runs through `jammi_kernels::ops::DropoutFused`, a
+/// counter-based Philox `CustomOp1` — never a per-device RNG such as
+/// `Device::set_seed` (see `jammi_kernels::ops::dropout`'s module doc for why
+/// that mechanism is rejected), and (CPU/CUDA) never a host-materialized mask
+/// at all. **Metal is the one disclosed exception**: `DropoutFused::metal_fwd`
+/// has no Metal Philox compute kernel, so it computes the SAME decision via a
+/// transient host round trip (download, run the identical CPU decision
+/// function, re-upload) — see `jammi_kernels::ops::dropout`'s module doc,
+/// "Metal: a device-scoped deterministic host fallback", for the design and
+/// its cost. That transient host buffer is never a `Tensor`, never a graph
+/// node, and never retained past the single `metal_fwd` call, so the
+/// no-mask-tensor-on-the-tape property below holds on Metal too — only the
+/// "no host round trip at all" claim is Metal-specific.
 ///
 /// The mask for a layer's k-th training forward is a pure function of
 /// `(run seed, layer_id, k, element_index)` — IDENTICALLY on every device,
 /// including Metal (see `jammi_kernels::ops::dropout`'s
 /// `tests::metal_matches_cpu_mask_for_identical_seed_key_position` and the
 /// crate-level `tests/metal_parity.rs` for the byte-identity proof). Two
-/// properties follow, and both were absent from the advancing-stream
-/// design this replaces:
+/// properties follow that an advancing stream cannot give:
 ///
-/// * **Restore is O(1).** The old stream had no closed-form skip, so
-///   restoring a persisted position replayed that many draws one at a
-///   time from the origin. The position advanced by ONE DRAW PER
-///   ACTIVATION ELEMENT (`batch * seq * in_features` per forward), so
-///   after a single epoch of a large encoder that is on the order of 1e11
-///   draws per layer — resume did not merely slow down, it failed to
-///   finish (esc-033). Restoring a counter is an assignment, on every
+/// * **Restore is O(1).** A stream with no closed-form skip restores a
+///   persisted position by replaying that many draws from the origin — one
+///   draw per activation element (`batch * seq * in_features` per forward),
+///   on the order of 1e11 draws per layer after one epoch of a large
+///   encoder, which does not finish. Restoring a counter is an assignment, on every
 ///   device — this crate's own `restore_position`/O(1) contract is device-
 ///   independent, since it only ever touches the atomic counter, never a
 ///   device buffer.
 /// * **The mask is never materialized as a graph-tape tensor, on any
-///   device** — closing the wip branch's finding #2 (candle's
-///   `Binary::Mul` backward retains a full-size gradient FOR a host-built
+///   device** (candle's `Binary::Mul` backward retains a full-size gradient FOR a host-built
 ///   mask tensor, since the mask is not itself a graph leaf `sorted_nodes`
 ///   walks). `DropoutFused` is one `CustomOp1` node forward and one more
 ///   node backward, with no third (mask) tensor EVER created on the
@@ -176,8 +166,7 @@ pub(crate) struct DropoutMasks {
     /// Training forwards taken through this layer so far. The mask key,
     /// and the whole resume state. An `AtomicU64` (not a `Mutex`) so a
     /// `LoraLinear` held behind `&self` (as `Module`-style `forward`
-    /// requires) can still advance it without a lock — mirrors the wip
-    /// branch's "atomic counter replacing the per-layer `Mutex`" choice.
+    /// requires) can still advance it without a lock.
     counter: AtomicU64,
 }
 
@@ -191,14 +180,13 @@ impl DropoutMasks {
     }
 
     /// Forwards taken so far — the unit of resume state for this layer's
-    /// dropout (a FORWARD COUNT, not a draw count — the unit this commit
-    /// changes `ResumeState::dropout_positions` to, see
-    /// `jammi-ai/src/fine_tune/resume.rs`).
+    /// dropout (a FORWARD COUNT, not a draw count — the unit of
+    /// `ResumeState::dropout_positions`, see `jammi-ai/src/fine_tune/resume.rs`).
     pub(crate) fn position(&self) -> u64 {
         self.counter.load(Ordering::Relaxed)
     }
 
-    /// This layer's own Philox `seed` component (U4b tail) — see
+    /// This layer's own Philox `seed` component — see
     /// [`crate::LoraLinear::dropout_run_seed`]'s doc for why this needs to
     /// be independently observable from [`Self::position`]: the forward
     /// COUNT is deliberately rank-invariant (both ranks of a gang take the
@@ -224,12 +212,12 @@ impl DropoutMasks {
     /// *after* reserving the key and have BOTH arms consume the identical
     /// key — critically, the fallback arm must NOT reserve a SECOND,
     /// different `forward_idx` for the same logical forward (that would
-    /// break esc-033's O(1) resume invariant: two arms of the SAME
+    /// break the O(1) resume invariant: two arms of the SAME
     /// forward must advance the counter by exactly one between them, not
     /// one each). `p` must already be validated to
     /// `[0.0, 1.0)` by the caller (`LoraLinear::new`); the eventual
     /// `DropoutFused::new` construction re-validates independently
-    /// regardless (family D).
+    /// regardless.
     pub(crate) fn next_key(&self, p: f32) -> Result<DropoutKey, candle_core::Error> {
         // The overflow check happens BEFORE the counter advances — a
         // refused draw must leave `self.counter` untouched, or a caller
@@ -392,15 +380,10 @@ mod tests {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
     }
 
-    /// Test-only replacement for the deleted `DropoutMasks::apply`
-    /// convenience method: reserves this layer's NEXT key
-    /// (`DropoutMasks::next_key`) and applies it directly, exactly as
-    /// `apply` used to. Lives ONLY under `#[cfg(test)]` — the production
-    /// call site (`LoraLinear::forward`) has its OWN reason to call
-    /// `next_key` directly (so both the fused and eager-fallback arms can
-    /// share one reserved key), so a shipped `apply` convenience method
-    /// was genuinely dead code in the non-test build; this helper is not
-    /// (every test below exercises it).
+    /// Reserves this layer's NEXT key (`DropoutMasks::next_key`) and applies
+    /// it directly. Test-only: the production call site
+    /// (`LoraLinear::forward`) calls `next_key` itself so both the fused and
+    /// eager-fallback arms share one reserved key.
     fn apply_via_next_key(
         masks: &DropoutMasks,
         x: &Tensor,
@@ -548,20 +531,15 @@ mod tests {
         );
     }
 
-    // The remaining esc-033 resume oracles this module used to state
-    // directly against `DropoutMasks::apply` — the basic
-    // "restore-then-one-forward" check, the full-stream byte-identity
-    // check, and the off-by-one negative control — are now stated at the
-    // PRODUCTION `LoraLinear::forward` call site instead (both the fused
-    // and eager-fallback arms):
+    // The resume oracles — the basic "restore-then-one-forward" check, the
+    // full-stream byte-identity check, and the off-by-one negative control
+    // — are stated at the PRODUCTION `LoraLinear::forward` call site (both
+    // the fused and eager-fallback arms):
     // `crates/jammi-lora/tests/fused_epilogue.rs`'s
     // `{fused,eager}_arm_production_path_resume_reproduces_the_
     // uninterrupted_dropout_stream` and
-    // `fused_arm_production_path_would_catch_an_off_by_one_resume_position`.
-    // No assertion is lost — the claims are IDENTICAL, just exercised
-    // through the actual call site's own `next_key` reservation (the code
-    // path esc-033 was really about) rather than through this module's
-    // own `#[cfg(test)]`-only helper.
+    // `fused_arm_production_path_would_catch_an_off_by_one_resume_position`,
+    // exercised through the call site's own `next_key` reservation.
 
     /// Restoring must not depend on how far into the run the position is —
     /// a replay-based restore would take time proportional to it; this

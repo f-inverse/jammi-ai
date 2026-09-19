@@ -1,31 +1,27 @@
-//! The pod-leg artifact producer for `fine_tune::collective::nccl` (plan
-//! #500, U4b's pod-leg acceptance, contract §2c; plan row B8).
+//! The pod-leg artifact producer for `fine_tune::collective::nccl`.
 //!
 //! `ci/scripts/runpod_gpu_gang.sh` (1 pod × 2 A100s, `cargo test … --test
-//! gpu_capability gang_ -- --nocapture --test-threads=1`) has run this
-//! tree's `gang_` tests on real hardware and passed every one of them, then
-//! refused the leg because nothing wrote `$JAMMI_GANG_ARTIFACT_DIR`'s
-//! required `gang`-kind artifact (`gang.leg == "pod"`,
+//! gpu_capability gang_ -- --nocapture --test-threads=1`) requires a
+//! `gang`-kind artifact in `$JAMMI_GANG_ARTIFACT_DIR` (`gang.leg == "pod"`,
 //! `ci/scripts/check_cuda_run_artifacts.py`'s rule (k)). [`gang_nccl.rs`]
 //! proves the collective itself (rank-ordered sum, unequal-count gather,
-//! lockstep flags, abort) over two real devices; it is not this leg's
-//! evidence producer — U4b's contract (§2) left the pod leg UNCOVERED. This
-//! module is that producer.
+//! lockstep flags, abort) over two real devices but writes no such artifact;
+//! this module is that artifact's producer.
 //!
 //! [`gang_nccl.rs`]: super::gang_nccl
 //!
-//! # The property (UNITS.md § U4b, the pod-leg acceptance)
+//! # The property
 //!
 //! On a real 2-GPU pod, [`gang_pod_leg_two_ranks_over_nccl_reproduce_and_match_w1`]
-//! trains a real two-rank gang (U4a's single-process multi-GPU
-//! `Nccl::single_process`, U4b's `RankContext` + `PartitionSpec::for_gang`)
+//! trains a real two-rank gang (single-process multi-GPU
+//! `Nccl::single_process`, `RankContext` + `PartitionSpec::for_gang`)
 //! through the production `TrainingLoop::run`, over a real `tiny_bert`
 //! projection-head fixture at `lora_dropout = 0.0`, and:
 //!
 //! - **(a)** runs the SAME two-rank gang TWICE, from the SAME seed: the
 //!   published `adapter.safetensors` rank 0 holds after the last step must
 //!   be BYTE-IDENTICAL across the two runs (no unseeded RNG on the
-//!   trainable-parameter path — family J).
+//!   trainable-parameter path).
 //! - **(c)** compares that gang against a W=1 reference trained at DOUBLE
 //!   the per-rank batch (the same global batch, one rank instead of two),
 //!   same seed, same data: the per-epoch training loss must agree within
@@ -44,25 +40,20 @@
 //! suppressed, because a non-reproducible run's own numbers are exactly the
 //! evidence that has to survive.
 //!
-//! # Deviations from a byte-for-byte U4b/CPU-oracle mirror (with the code
-//! cited for each)
+//! # Deviations from the CPU-hermetic oracle
 //!
 //! - **Per-EPOCH, not per-step, loss deltas.** The CPU-hermetic
 //!   `gather_exactness_w2_matches_w1_within_pre_registered_epsilon` reads
 //!   PER-STEP loss off `TrainingLoop::compute_loss_gathered`/`encode_chunk`
-//!   — both private to `trainer.rs` (no `pub` accessor), and this unit's
-//!   own scope is `crates/jammi-ai/tests/gpu_capability/**` only (three
-//!   concurrent implementers own `worker.rs`/`gang.rs`/`ci/scripts/
-//!   runpod_*`; `trainer.rs` is the lead/shared-declaration class for this
-//!   wave). The only per-run-progress granularity this test target CAN
+//!   — both private to `trainer.rs` (no `pub` accessor). The only
+//!   per-run-progress granularity this test target CAN
 //!   observe is the per-EPOCH `avg_train_loss` `harness::loss_capture`
 //!   already captures off the trainer's own `tracing::info!("Epoch
 //!   complete", …)` event (the SAME mechanism `fine_tune_learns.rs`'s P2
 //!   uses). `gang.per_step_loss_delta` therefore carries one entry per
-//!   EPOCH here, not per optimizer step — the registry field itself is
-//!   untyped prose (`ci/scripts/check_cuda_run_artifacts.py` only requires
-//!   a non-empty list of finite numbers), so this is a granularity
-//!   deviation from the brief's wording, not a schema violation.
+//!   EPOCH here, not per optimizer step — `ci/scripts/check_cuda_run_artifacts.py`
+//!   only requires a non-empty list of finite numbers there, so this is a
+//!   granularity choice, not a schema violation.
 //! - **No `Collective` import.** [`gang_nccl.rs`] imports `fine_tune::
 //!   collective::Collective` because it calls collective methods
 //!   (`all_reduce_sum`, `all_gather`, …) DIRECTLY on a `Nccl` value. This
@@ -72,40 +63,28 @@
 //!   Collective>` is `Arc::new(nccl_rank)` handed to `RankContext::new`,
 //!   whose parameter type already names the trait, so the unsized
 //!   coercion needs no local `use`.
-//! - **Own copies of small helpers**, never edits to files this unit does
-//!   not own: [`serial_cuda_device_or_require`]/[`second_cuda_device_or_require`]
-//!   mirror [`gang_nccl.rs`]'s same-named (but private-to-that-module)
-//!   functions; [`claimed_job`]/[`ephemeral_artifact_store`]/
+//! - **Own copies of small helpers**: [`claimed_job`]/[`ephemeral_artifact_store`]/
 //!   [`ephemeral_hub_source`] mirror `trainer.rs`'s `test_fixtures::
 //!   claimed_job` and `gguf_quantized_gpu.rs`'s own private helpers of the
-//!   same shape. Each is a small (<20 line), already-proven pattern copied
-//!   because the original is private to a file this unit's scope excludes
-//!   from editing.
+//!   same shape, which are private to those files.
 //!
 //! # Uncovered
 //!
 //! - **World ≥ 3.** This leg proves world 2 only (one pod, `gpuCount: 2`) —
 //!   the same "known-unmeasured" boundary [`gang_nccl.rs`]'s own module doc
-//!   states, filed in the contract of record rather than assumed.
-//! - **The cluster (two-host) leg.** Out of scope here; it is U7b-A2b's own
-//!   unit and carries a different registry
+//!   states.
+//! - **The cluster (two-host) leg.** Covered by [`gang_nccl.rs`]'s two-host
+//!   test, which carries a different registry
 //!   (`GANG_CLUSTER_FIELD_REGISTRY`, no `digests`/`per_step_loss_delta`/
 //!   `epsilon` row at all).
-//! - **No CUDA toolchain in this authoring environment.** Every line that
-//!   touches a CUDA device, NCCL, or a real `tiny_bert` GPU forward pass is
-//!   gated behind `#[cfg(feature = "cuda")]` and is UNEXERCISED here (no
-//!   `nvcc`/`libnccl` in this authoring sandbox). What IS exercised here,
-//!   on CPU: every non-`cuda` arm type-checks
-//!   (`cargo check -p jammi-ai --features live-gpu-tests --test
-//!   gpu_capability`), and the artifact's SHAPE is proven by the hermetic
-//!   [`synthetic_artifact_tests`] below, which calls the SAME
+//! - **Artifact shape vs pod numerics.** The artifact's SHAPE is proven
+//!   without a GPU by [`synthetic_artifact_tests`] below, which calls the SAME
 //!   [`build_gang_pod_artifact`]/[`write_gang_pod_artifact`] the real pod
 //!   run calls, from fixed inputs, and validates the result against
 //!   `ci/scripts/check_cuda_run_artifacts.py`'s REAL `validate_artifact`
-//!   (never a hand port of its rules). The pod run's own numerics
-//!   (digest equality, the ε comparison) are therefore UNCOVERED here; the
-//!   lead runs the leg on the pod and returns the compiler's/driver's
-//!   output on a failure.
+//!   (never a hand port of its rules). The pod run's own numerics (digest
+//!   equality, the ε comparison) are proven only by running the leg on a
+//!   2-GPU pod.
 //!
 //! ## Derivation of [`GANG_POD_LEG_EPSILON`]
 //!
@@ -140,8 +119,6 @@
 //! this ε's own use in a measured run existed — the pre-registration
 //! `ci/scripts/check_cuda_run_artifacts.py`'s rule (k) requires.
 
-use crate::skip_without_gpu;
-
 #[cfg(feature = "cuda")]
 use jammi_ai::fine_tune::collective::nccl::Nccl;
 #[cfg(feature = "cuda")]
@@ -161,9 +138,8 @@ pub(crate) const GANG_POD_LEG_EPSILON: f32 = 2.0e-4;
 /// can never drift apart from each other.
 pub(crate) const GANG_POD_LEG_EPSILON_DERIVATION: &str = "2e-4 = 2x the CPU-hermetic gather-exactness floor (1e-4, gather_exactness_w2_matches_w1_within_pre_registered_epsilon's GATHER_EXACTNESS_EPSILON in crates/jammi-ai/src/fine_tune/trainer.rs), admitting exactly one further fp32 reduction reassociation a real GPU pod run adds beyond that CPU oracle: cuBLAS's own forward/backward accumulation order plus NCCL's ring/tree ncclAllReduce summation order. Analytically bounded: an (n-1)*eps_f32*max|term| reassociation-error bound (eps_f32 = 2^-23 ~= 1.19e-7, n <= 4 terms this fixture's global batch sums) is ~= 3.6e-7, three orders of magnitude under 2e-4, while staying more than three orders of magnitude below the O(1) divergence a real gradient-routing bug produces (the same oracle's own executed red-proof measured 0.37497652 vs 1.0657526).";
 
-/// The commit [`GANG_POD_LEG_EPSILON`] was registered at — this unit's
-/// FIRST commit, landed before this test (and the pod run it gates) ever
-/// existed. `ci/scripts/check_cuda_run_artifacts.py`'s rule (k)
+/// The commit [`GANG_POD_LEG_EPSILON`] was registered at, which precedes
+/// this test and every pod run it gates. `ci/scripts/check_cuda_run_artifacts.py`'s rule (k)
 /// (`_gang_check_epsilon`/`_gang_evidence_anchor`) requires this to be a
 /// STRICT ancestor of the artifact's own measured `git_sha`.
 pub(crate) const GANG_POD_LEG_EPSILON_REGISTERED_SHA: &str =
@@ -171,7 +147,7 @@ pub(crate) const GANG_POD_LEG_EPSILON_REGISTERED_SHA: &str =
 
 /// This leg's sole registered producer path —
 /// `GANG_LEG_PRODUCER_PATH[GANG_LEG_POD]` in
-/// `ci/scripts/check_cuda_run_artifacts.py` (F4: a self-declared `gang.leg`
+/// `ci/scripts/check_cuda_run_artifacts.py` (a self-declared `gang.leg`
 /// cannot point at a different, or no, driver).
 const GANG_POD_LEG_PRODUCER_PATH: &str = "ci/scripts/runpod_gpu_gang.sh";
 
@@ -391,51 +367,6 @@ fn git_head_sha() -> String {
 // ─── CUDA-only machinery: device acquisition, model loading, the per-rank
 // driver, and the two run shapes (W=2 gang, W=1 reference) ─────────────────
 
-/// [`crate::harness::serial_cuda_device`], hard-failing under
-/// `JAMMI_REQUIRE_CUDA` rather than skipping — the SAME require-gate idiom
-/// `gang_nccl.rs::serial_cuda_device_or_require` uses (that function is
-/// private to `gang_nccl.rs`, out of this unit's file scope, so this is a
-/// deliberate second copy of an already-proven ~10-line pattern, not a
-/// re-derivation). `ci/scripts/runpod_gpu_gang.sh` exports
-/// `JAMMI_REQUIRE_CUDA=1`, so the pod's own run hard-fails rather than
-/// skipping.
-#[cfg(feature = "cuda")]
-fn serial_cuda_device_or_require(test: &str) -> Option<crate::harness::SerialGpu> {
-    match crate::harness::serial_cuda_device() {
-        Some(slot) => Some(slot),
-        None => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!(
-                    "{test}: JAMMI_REQUIRE_CUDA is set but no usable CUDA device could be \
-                     acquired — a silent skip is not acceptable here"
-                );
-            }
-            None
-        }
-    }
-}
-
-/// A second CUDA device, hard-failing under `JAMMI_REQUIRE_CUDA_GANG` —
-/// mirrors `gang_nccl.rs::second_cuda_device_or_require` (private to that
-/// module; see [`serial_cuda_device_or_require`]'s own doc for why this is
-/// a second copy). `ci/scripts/runpod_gpu_gang.sh` exports
-/// `JAMMI_REQUIRE_CUDA_GANG=1`.
-#[cfg(feature = "cuda")]
-fn second_cuda_device_or_require(test: &str) -> Option<candle_core::Device> {
-    match candle_core::Device::new_cuda(1) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA_GANG").is_some() {
-                panic!(
-                    "{test}: JAMMI_REQUIRE_CUDA_GANG is set but a second CUDA device could not \
-                     be acquired — a two-rank NCCL gang needs two visible devices: {e}"
-                );
-            }
-            None
-        }
-    }
-}
-
 /// An in-memory `ArtifactStore` — only [`jammi_ai::model::resolver::
 /// ModelResolver::new`] requires one (this leg checkpoints nothing durable);
 /// mirrors `gguf_quantized_gpu.rs::ephemeral_artifact_store` (private to
@@ -471,8 +402,7 @@ fn ephemeral_hub_source() -> jammi_ai::model::hub::HubSource {
 
 /// A catalog holding a registered model and a job `tag` claimed by
 /// `{tag}-worker` — mirrors `trainer.rs`'s `test_fixtures::claimed_job`
-/// (private to `trainer.rs`, a shared-declaration file this unit does not
-/// edit). Returns the catalog and the tempdir backing it.
+/// (private to `trainer.rs`). Returns the catalog and the tempdir backing it.
 #[cfg(feature = "cuda")]
 async fn claimed_job(
     tag: &str,
@@ -564,7 +494,7 @@ async fn load_tiny_bert_on(device_ordinal: i32) -> std::sync::Arc<jammi_ai::mode
 }
 
 /// `FineTuneConfig` for the W=2 gang: per-rank batch [`POD_LEG_PER_RANK_BATCH`],
-/// `lora_dropout = 0.0` (this leg's acceptance pins it — U4b's per-rank
+/// `lora_dropout = 0.0` (this leg's property pins it — the per-rank
 /// dropout Philox split is `dropout_seed_split_*`'s own property, not
 /// this one's).
 #[cfg(feature = "cuda")]
@@ -808,15 +738,6 @@ fn run_pod_reference(
     dedup_by_epoch(&crate::harness::loss_capture::captured())
 }
 
-/// The pod-leg producer test: two same-seed W=2 gangs (a reproducible
-/// digest pair) plus a W=1×2B reference (the per-epoch loss-delta bound),
-/// writing the registry's `gang` artifact into `$JAMMI_GANG_ARTIFACT_DIR`
-/// on both the pass and the fail arm. See the module doc for the full
-/// property and its deviations/uncovered determinants.
-///
-/// `JAMMI_GANG_ARTIFACT_DIR` unset: the assertions below still execute in
-/// full (this test still proves the property on this run), but nothing is
-/// written — stated via a loud `tracing::warn`, never silently skipped.
 /// A graph-sampled training set for the pod leg: an 8-node ring sampled by
 /// seeded walks into `(anchor, positive)` pairs — the loader a `graph_fine_tune`
 /// job trains from. Its rows are a whole number of global batches (see the
@@ -877,24 +798,17 @@ fn pod_leg_graph_sample_is_a_whole_number_of_global_batches() {
 /// the single-rank gradient over the union batch. The pairs test below owns
 /// this leg's committed artifact; this one asserts the same three properties
 /// for the loader a `graph_fine_tune` job trains from.
+#[cfg(feature = "live-gpu-gang-tests")]
 #[test]
 fn gang_pod_leg_graph_sample_two_ranks_reproduce_and_match_w1() {
-    skip_without_gpu!();
-
     #[cfg(feature = "cuda")]
     {
         const TEST: &str = "gang_pod_leg_graph_sample_two_ranks_reproduce_and_match_w1";
         crate::harness::loss_capture::install();
 
-        let Some(slot) = serial_cuda_device_or_require(TEST) else {
-            tracing::warn!("SKIP: no usable CUDA device");
-            return;
-        };
+        let slot = crate::harness::serial_cuda_device();
         let dev0 = slot.device().clone();
-        let Some(dev1) = second_cuda_device_or_require(TEST) else {
-            tracing::warn!("SKIP: a two-rank NCCL gang needs two CUDA devices; this host has one");
-            return;
-        };
+        let dev1 = jammi_test_resources::cuda_device(1);
 
         let (digest_a, curve_a) =
             run_pod_gang("podleg-graph-a", &dev0, &dev1, pod_leg_graph_sample);
@@ -927,10 +841,18 @@ fn gang_pod_leg_graph_sample_two_ranks_reproduce_and_match_w1() {
     }
 }
 
+/// The pod-leg producer test: two same-seed W=2 gangs (a reproducible
+/// digest pair) plus a W=1×2B reference (the per-epoch loss-delta bound),
+/// writing the registry's `gang` artifact into `$JAMMI_GANG_ARTIFACT_DIR`
+/// on both the pass and the fail arm. See the module doc for the full
+/// property and its deviations/uncovered determinants.
+///
+/// `JAMMI_GANG_ARTIFACT_DIR` unset: the assertions below still execute in
+/// full (this test still proves the property on this run), but no artifact
+/// is written, which a `tracing::warn` states.
+#[cfg(feature = "live-gpu-gang-tests")]
 #[test]
 fn gang_pod_leg_two_ranks_over_nccl_reproduce_and_match_w1() {
-    skip_without_gpu!();
-
     let artifact_dir = std::env::var_os("JAMMI_GANG_ARTIFACT_DIR").map(std::path::PathBuf::from);
     if artifact_dir.is_none() {
         tracing::warn!(
@@ -944,15 +866,9 @@ fn gang_pod_leg_two_ranks_over_nccl_reproduce_and_match_w1() {
         const TEST: &str = "gang_pod_leg_two_ranks_over_nccl_reproduce_and_match_w1";
         crate::harness::loss_capture::install();
 
-        let Some(slot) = serial_cuda_device_or_require(TEST) else {
-            tracing::warn!("SKIP: no usable CUDA device");
-            return;
-        };
+        let slot = crate::harness::serial_cuda_device();
         let dev0 = slot.device().clone();
-        let Some(dev1) = second_cuda_device_or_require(TEST) else {
-            tracing::warn!("SKIP: a two-rank NCCL gang needs two CUDA devices; this host has one");
-            return;
-        };
+        let dev1 = jammi_test_resources::cuda_device(1);
 
         // (a) two independent same-seed W=2 gangs -> a reproducible digest pair.
         let (digest_a, curve_a) = run_pod_gang("podleg-a", &dev0, &dev1, pod_leg_pairs);
@@ -1048,7 +964,7 @@ fn gang_pod_leg_two_ranks_over_nccl_reproduce_and_match_w1() {
     }
 }
 
-// ─── Hermetic oracle for the artifact's SHAPE (no GPU, no CUDA feature) ────
+// ─── Hermetic oracle for the artifact's SHAPE (no GPU) ─────────────────────
 
 #[cfg(test)]
 mod synthetic_artifact_tests {
@@ -1217,10 +1133,8 @@ print(json.dumps(findings))
     /// EXECUTED MUTATION: dropping `gang.epsilon` from an otherwise-clean
     /// artifact must be NAMED by the checker — the non-vacuous half of the
     /// oracle above (a checker that never fires would pass the clean case
-    /// vacuously). Applied by hand against this test during authoring
-    /// (removed `epsilon` from [`build_gang_pod_artifact`]'s output,
-    /// confirmed the finding contains `gang.epsilon`, reverted) and pinned
-    /// here so the mutation stays executed on every run, not only once.
+    /// vacuously). The mutation removes `epsilon` from
+    /// [`build_gang_pod_artifact`]'s output and runs on every run.
     #[test]
     fn missing_epsilon_is_named_by_the_checker() {
         let mut artifact = serde_json::to_value(clean_pass_artifact()).unwrap();

@@ -341,8 +341,8 @@ fn eager_vs_fused_bf16_fwd_diverges_and_stays_within_the_stated_tolerance() {
 ///
 /// Ships at ModernBERT-large's actual production width
 /// (`intermediate = 2624`, per HuggingFace's published
-/// `answerdotai/ModernBERT-large` `config.json`) — the fused-kernels
-/// contract requires measuring the bf16 bound at production width, not a
+/// `answerdotai/ModernBERT-large` `config.json`) — the kernel guide
+/// (§3.4) requires measuring the bf16 bound at production width, not a
 /// toy size, since a rounding-order divergence's measured magnitude can
 /// depend on how many elements are summed into the loss.
 #[test]

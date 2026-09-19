@@ -22,20 +22,18 @@ under `crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-p6-b3-dense-raw-runs/
 were later stamped with `schema_version`/`git_sha`/`box`/`status`/`producer`
 fields, so the fixtures are no longer byte-identical to them — the fixtures
 keep the bare pre-stamp `Report` shape as originally copied. The producing
-branch has since merged into `main` (the
-FA2 dense arm, #389, merge commit `6c526f9`), and `main`'s
+branch is merged into `main` (merge commit `6c526f9`), and `main`'s
 `crates/jammi-bench/src/report.rs`/`finetune_step.rs` do carry the
 flash-named dispatch-counter fields today. These two files are the REAL shape
-`ab_merge.py`'s `dispatch_pairs`/`fused_proof` broke on (a docs-ci co-sign
-of that branch found `ci/scripts/perf/ab_merge.py::dispatch_pairs()` raises
+`ab_merge.py`'s `dispatch_pairs`/`fused_proof` must handle
+(`ci/scripts/perf/ab_merge.py::dispatch_pairs()` would otherwise raise
 `KeyError` on `attention_block_flash_fused_dispatches`, which has no
 `attention_block_flash_eager_dispatches` sibling — its fallback counter is
 named `attention_block_flash_declined_dispatches` instead) — used here as
 REAL, committed, tracked-input fixtures for
 `test_ab_merge.py::CascadePairFixtureTests` (never a hand-rolled dict
 standing in for what a real `finetune-step` report on that branch actually
-emits), per this crate's own "tracked-input fixtures" implementer-
-acceptance clause.
+emits).
 
 `s128_flash_on_1.json`'s `finetune_step` block (`batch=8, seq=128,
 bf16`) reads `attention_block_flash_fused_dispatches: 840`,

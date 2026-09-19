@@ -134,8 +134,8 @@ impl InferenceSession {
     /// Reads the table's recorded [`ProducingDescriptor`] and reconstructs the
     /// producing verb call from its typed parameters, running it through the
     /// unmodified `BuildingTable::finish` funnel with [`CachePolicy::Bypass`]
-    /// (a recompute always recomputes). A pre-contract table (no recorded
-    /// descriptor) is the typed [`JammiError::NotRecomputable`] — a loud refusal,
+    /// (a recompute always recomputes). A table with no recorded
+    /// descriptor is the typed [`JammiError::NotRecomputable`] — a loud refusal,
     /// never a re-run guessed from columns.
     ///
     /// `cascade` selects the bounded action: [`Cascade::ReportOnly`] recomputes
@@ -248,7 +248,7 @@ impl InferenceSession {
                 Ok((record.table_name, outcome))
             }
             // A versioned table's replay is a full embed of the current source
-            // into a NEW table (D9): value-equivalent, a new chain root.
+            // into a NEW table: value-equivalent, a new chain root.
             ProducingDescriptor::EmbeddingDelta {
                 model_id,
                 task,
@@ -415,9 +415,9 @@ impl InferenceSession {
                 spec_schema_version,
                 base_model_id: _,
                 world_size: _,
-                // #500 U4b: this run's own gang topology at claim time —
-                // recorded on the descriptor, but not itself an input the
-                // recompute arm (K1: retrain) needs to name, since retrain
+                // This run's own gang topology at claim time — recorded on
+                // the descriptor, but not itself an input the recompute arm
+                // (a retrain) needs to name, since retrain
                 // resubmits the SAME spec and lets a fresh claim resolve
                 // its OWN worker/gang topology, never replaying the prior
                 // attempt's recorded one.
@@ -550,14 +550,12 @@ impl InferenceSession {
     ///   fails at the planner inside the verb, naming the missing relation —
     ///   the failure mode of a training set whose rows were projected from a
     ///   session-scoped relation rather than a durable registered source. No
-    ///   producer in this tree names one today: `materialize_projection` (the
-    ///   only [`ProducingDescriptor::TrainingSet`] producer) always reads a
+    ///   producer names one: `materialize_projection` (the only
+    ///   [`ProducingDescriptor::TrainingSet`] producer) always reads a
     ///   durable registered source, and the graph arm samples in memory and
-    ///   never writes a `TrainingSet` table at all
-    ///   (<https://github.com/f-inverse/jammi-ai/issues/538> tracks giving it
-    ///   a table of its own). This refusal stays because the planner error is
-    ///   the honest response to ANY table whose recorded source is not
-    ///   durable, not because one is expected today.
+    ///   never writes a `TrainingSet` table at all. The refusal exists because
+    ///   the planner error is the honest response to ANY table whose recorded
+    ///   source is not durable.
     async fn recompute_training_set(
         self: &Arc<Self>,
         table: &ResultTableRecord,
@@ -619,7 +617,7 @@ impl InferenceSession {
         ))
     }
 
-    /// [`ProducingDescriptor::GraphTrainingSet`] replay (GA9, issue #538):
+    /// [`ProducingDescriptor::GraphTrainingSet`] replay:
     /// re-read the CURRENT node/edge sources and re-sample, through the SAME
     /// shared core ([`crate::fine_tune::worker::materialize_graph_training_set`])
     /// a fresh run uses — never a second, independent re-implementation of
@@ -641,18 +639,17 @@ impl InferenceSession {
     /// sample`, only by the informational `has_declared_supervision`, which
     /// this replay never calls).
     ///
-    /// `task` and `format` ARE recorded (K1: `replay_descriptor`'s match
+    /// `task` and `format` ARE recorded (`replay_descriptor`'s match
     /// names every field, never `task: _, format: _` discarding two that
     /// exist precisely so a replay can check itself) and are asserted equal
     /// to what THIS replay independently derives — `task` is always
     /// `TextEmbedding` (the graph arm's own hardcoded choice, no per-run
-    /// variation), `format` is GA3's own function of `sample.hard_negatives`
-    /// alone — BEFORE any read or write, refusing loudly on a mismatch
-    /// rather than silently trusting today's re-derivation to still agree
-    /// with what the original run recorded (the root-cause class GA3 exists
-    /// to close finding its second home here: a future change to either
-    /// derivation could otherwise silently diverge a replay from its
-    /// original recorded meaning with no signal at all).
+    /// variation), `format` is the graph arm's own function of
+    /// `sample.hard_negatives` alone — BEFORE any read or write, refusing
+    /// loudly on a mismatch rather than silently trusting today's
+    /// re-derivation to still agree with what the original run recorded (a
+    /// change to either derivation would otherwise silently diverge a replay
+    /// from its original recorded meaning with no signal at all).
     #[allow(clippy::too_many_arguments)]
     async fn recompute_graph_training_set(
         self: &Arc<Self>,
@@ -709,7 +706,7 @@ impl InferenceSession {
             dst_column,
             provenance: EdgeProvenance::Declared,
         };
-        // Domain-validity at the decode edge (family D): `f64::from_bits`
+        // Domain-validity at the decode edge: `f64::from_bits`
         // reconstructs ANY bit pattern the persisted sidecar happens to
         // hold, including NaN/Infinity, and `GraphSampleConfig::validate`'s
         // `<= 0.0` checks do not catch that (`NaN <= 0.0` is `false`, so a
@@ -798,7 +795,7 @@ impl InferenceSession {
     }
 
     /// Re-invoke a `TrainingSpec::FineTune` job — the
-    /// [`ProducingDescriptor::FineTune`] replay, which K1 fixes as **retrain**,
+    /// [`ProducingDescriptor::FineTune`] replay, which is a **retrain**,
     /// never a re-derivation from the recorded fields: `spec_canonical` +
     /// `spec_schema_version` decode back into the exact
     /// [`crate::fine_tune::spec::TrainingSpec::FineTune`] the original job ran
@@ -817,10 +814,8 @@ impl InferenceSession {
     /// fine-tuned model's descriptor lives on its `models` row instead. No
     /// production caller of [`InferenceSession::recompute`] can therefore
     /// hand this arm a `ProducingDescriptor::FineTune` today; the arm exists
-    /// so the match stays exhaustive (K7) and so a future model-level
-    /// recompute surface, should one land, replays this variant correctly
-    /// from day one rather than needing this logic written under pressure
-    /// then.
+    /// so the match stays exhaustive and a model-level recompute surface
+    /// replays this variant correctly.
     async fn recompute_fine_tune(
         self: &Arc<Self>,
         table: &ResultTableRecord,
@@ -865,11 +860,11 @@ impl InferenceSession {
             .catalog()
             .resolve_embedding_table(&recipe.source_id, recipe.embedding_table.as_deref())
             .await?;
-        // ONE resolution of the source table's current version (M1), shared
+        // ONE resolution of the source table's current version, shared
         // by every target in the loop below: `read_target_rows` and every
         // `assemble_context_pinned` call read the SAME version, so a
         // version publish racing this recompute can never straddle across
-        // targets, and the schema/mask memo (M3) hits for every target
+        // targets, and the schema/mask memo hits for every target
         // after the first.
         let pin = self.result_store().pin_current_version(table).await?;
         let targets = self.read_target_rows(&pin).await?;
@@ -1338,7 +1333,7 @@ mod tests {
             "score".to_string(),
         ];
         // Table only — this test never reads the rows back, so it routes
-        // through the table-only form (#500 U2c c3b) rather than discarding
+        // through the table-only form rather than discarding
         // an eager `Vec<RecordBatch>` collect it never needed.
         let table = crate::fine_tune::training_set::materialize_projection_table(
             &session,
@@ -1374,7 +1369,7 @@ mod tests {
         );
 
         // The whole `ResultTableRecord` `recompute_training_set` takes is
-        // fetched through the catalog (#551) — never through
+        // fetched through the catalog — never through
         // `TrainingSetTable`, which carries no whole-row accessor.
         let record = session
             .catalog()

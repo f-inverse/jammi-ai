@@ -4,7 +4,7 @@
 //! Each test embeds a small source, EDITS the Parquet file in place (the
 //! registered source re-lists it on the next scan), refreshes, and asserts the
 //! version chain, the deletion mask, the read paths and the typed refusals
-//! the unit contract pins.
+//! the refresh contract pins.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -244,7 +244,7 @@ impl Harness {
     }
 }
 
-/// §6.1 — edit one row of a 10k-row source: exactly one row is inferred, one
+/// Edit one row of a 10k-row source: exactly one row is inferred, one
 /// segment stamped with the new version carries it, the mask holds exactly
 /// `(4242, N-1)`, the new vector finds the key and the old one never does at
 /// the old distance, the key is served once, `row_count` is unchanged.
@@ -310,7 +310,7 @@ async fn edit_one_row_refresh_infers_exactly_one() {
     assert_eq!(h.count_key("4242").await, 1);
 }
 
-/// §6.1 variant — edit a row to empty text: the model refuses it per row, so
+/// Edit a row to empty text: the model refuses it per row, so
 /// the refresh publishes a mask-only version (no fragment, no segment),
 /// `row_count` drops by one, and the key is never served.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -350,7 +350,7 @@ async fn edit_to_empty_text_publishes_a_mask_only_version() {
     assert!(any.iter().all(|(id, _)| id != "42"));
 }
 
-/// §6.2 — delete one key: `deleted == 1`, no new fragment/segment, the mask
+/// Delete one key: `deleted == 1`, no new fragment/segment, the mask
 /// holds `(7, N-1)`; the masked merge never returns it while a direct probe of
 /// segment 0's bundle still does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -402,7 +402,7 @@ async fn delete_one_key() {
     assert!(idx.contains("7"));
 }
 
-/// §6.3(a) — `recompute` of a versioned table yields a NEW single-segment
+/// `recompute` of a versioned table yields a NEW single-segment
 /// table with equal top-k, an artifact digest distinct from every version
 /// identity, and the chain untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -495,7 +495,7 @@ async fn recompute_of_a_versioned_table_is_a_new_table() {
     }
 }
 
-/// §6.6(b) — the current version's manifest vanishes: `recover()` fails the
+/// The current version's manifest vanishes: `recover()` fails the
 /// VERSION row only; `search` and `SELECT` are the typed `VersionUnavailable`;
 /// a peer tenant resolves not-found; `recompute` yields a new table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -614,7 +614,7 @@ async fn current_manifest_loss_is_typed_unavailable_and_recomputable() {
     assert_ne!(out.recomputed[0].recomputed, table);
 }
 
-/// §6.6(a) + §6.12 — a version whose lease expired while parked before its
+/// A version whose lease expired while parked before its
 /// publish: `recover()` fails the version row and reaps its artifacts, leaves
 /// the table `ready` with `current_version` unchanged and searchable; the
 /// parked refresh's publish then misses typed; the next refresh allocates
@@ -706,7 +706,7 @@ async fn expired_version_lease_is_reaped_and_the_table_stays_ready() {
     assert_eq!(report.parent_version, Some(k));
 }
 
-/// §6.13 — a refresh parked after its segment landed and before its publish:
+/// A refresh parked after its segment landed and before its publish:
 /// concurrent `SELECT`/search show exactly the parent version; after the
 /// publish, the new one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -756,7 +756,7 @@ async fn concurrent_reads_see_the_parent_until_publish() {
     );
 }
 
-/// §6.7 — two refreshes on one parent allocate distinct numbers; exactly one
+/// Two refreshes on one parent allocate distinct numbers; exactly one
 /// publishes; the other's publish is `ParentMoved` (the table-row swap's
 /// `current_version` no longer equals the parent it allocated against — the
 /// SAME lost-race classification an allocation miss gets, never `CasFailed`,
@@ -808,21 +808,19 @@ async fn concurrent_refreshes_on_one_parent_publish_exactly_once() {
     );
 }
 
-/// DELTA fix round 2 (audit a98bf51479b523692 F1 / design round a1492adfcf0d0f8e6
-/// item 1c) — a concurrent BASE publish must not fail the whole refresh. Two
+/// A concurrent BASE publish must not fail the whole refresh. Two
 /// sessions on the SAME root/catalog both race `ensure_base_version` on a
 /// never-based table; session 1 is parked right before its own
 /// `publish_base_version` CAS, session 2 (unparked — the arm is one-shot, so
 /// a second refresh passes straight through) publishes the base to
-/// completion, then session 1 is released. Session 1's base-publish CAS now
+/// completion, then session 1 is released. Session 1's base-publish CAS
 /// misses on `current_version` no longer `NULL` — the SAME lost-race shape
 /// `ParentMoved` already names for the allocation and publish-table-row
 /// misses — so `ensure_base_version`'s absorb arm must treat it exactly like
 /// that: absorb, adopt the winner's version 0, and let the refresh proceed
-/// to its own (empty) delta as `NoChange`, never fail the whole refresh.
-/// Before the fix (F1 unified the base-publish miss into `ParentMoved` but
-/// left the absorb arm matching only the old `CasFailed` spelling), this
-/// returns `Err(ParentMoved { .. })`.
+/// to its own (empty) delta as `NoChange`, never fail the whole refresh. An
+/// absorb arm that did not match the base-publish miss's `ParentMoved` would
+/// return `Err(ParentMoved { .. })` here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_base_publish_does_not_fail_the_refresh() {
     use jammi_ai::pipeline::embedding_refresh::refresh_test_hooks::{arm, ParkPoint};
@@ -887,22 +885,21 @@ async fn concurrent_base_publish_does_not_fail_the_refresh() {
     assert_eq!(versions[0].status, "ready");
 }
 
-/// O2 (DELTA fix round 1, audit a25424e2aa5e91337 F2) — two SESSIONS on one
+/// Two SESSIONS on one
 /// catalog: session 1 is at version 0 (having just published the base);
 /// session 2, a SECOND `InferenceSession` opened on the SAME root/catalog,
 /// publishes version 1 adding new keys via its own refresh. Session 1's
 /// DataFusion `ctx` is never re-bound past v0 — `bind_result_table` only
 /// ever rebinds the PUBLISHING session's own `ctx` (`ensure_base_version` /
-/// `after_publish`), never a sibling session's — which is the exact F2
-/// stale-binding shape. Session 1 then refreshes with no further source
-/// edits: before this fix, step 3 read session 1's own stale `ctx.table(..)`
-/// (still v0), so it would classify v1's already-added keys as `Added`
-/// again, re-infer them into a THIRD fragment with no mask entry, and
-/// publish a bogus version 2 with two live physical rows under each of
-/// those `_row_id`s. After the fix, step 3 reads PARENT's own masked
-/// provider (loaded fresh from the catalog's `current_version`, not from
-/// `ctx`), so session 1 sees v1's rows as already current and the refresh is
-/// a genuine `NoChange`.
+/// `after_publish`), never a sibling session's — the stale-binding shape.
+/// Session 1 then refreshes with no further source edits: step 3 reads
+/// PARENT's own masked provider (loaded fresh from the catalog's
+/// `current_version`, not from `ctx`), so session 1 sees v1's rows as already
+/// current and the refresh is a genuine `NoChange`. Reading session 1's own
+/// stale `ctx.table(..)` (still v0) would classify v1's already-added keys as
+/// `Added` again, re-infer them into a THIRD fragment with no mask entry, and
+/// publish a bogus version 2 with two live physical rows under each of those
+/// `_row_id`s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stale_process_binding_does_not_corrupt_a_concurrent_refresh() {
     let h = harness(20).await;
@@ -940,8 +937,8 @@ async fn stale_process_binding_does_not_corrupt_a_concurrent_refresh() {
 
     // No duplicate physical row under any key: the exact live-row count,
     // read through the CURRENT version's OWN masked provider (never
-    // session 1's stale `ctx` — a `SELECT` through `ctx` is a DIFFERENT,
-    // pre-existing staleness class this fix does not close, see
+    // session 1's stale `ctx` — a `SELECT` through `ctx` is a DIFFERENT
+    // staleness class this path does not close, see
     // `ResultStore::bind_result_table`'s doc comment for the full
     // read-class/persist-class residual), must be exactly 25, not 30 (25
     // real rows plus 5 duplicates from a re-inferred fragment).
@@ -966,24 +963,22 @@ async fn stale_process_binding_does_not_corrupt_a_concurrent_refresh() {
     assert_eq!(live, 25, "count_live_rows must be exact, no duplicate rows");
 }
 
-/// DELTA fix round 2 (audit a98bf51479b523692 F3 / design round
-/// a1492adfcf0d0f8e6 "the persisting residual") —
-/// `ResultStore::current_version_provider` is the ONE new read seam the five
-/// persisting producers (neighbor_graph, recompute, context_set,
-/// graph_propagation, context_predictor) now route through instead of a
+/// The five persisting producers (neighbor_graph, recompute, context_set,
+/// graph_propagation, context_predictor) read through the catalog's current
+/// version instead of a
 /// session's registered `jammi.{table}`, precisely so a producer that
 /// resolves its artifact's provenance from a FRESH catalog read (e.g.
 /// `pin_current_version`'s anchor, which reads `table.current_version`)
 /// reads content that agrees with it.
 ///
 /// Same two-session staleness shape as
-/// `stale_process_binding_does_not_corrupt_a_concurrent_refresh` (O2):
+/// `stale_process_binding_does_not_corrupt_a_concurrent_refresh`:
 /// session 1 publishes v0 (20 rows); session 2 (a SECOND `InferenceSession`
 /// on the SAME root/catalog) refreshes to v1, adding 5 rows. Session 1's own
 /// `ctx` is never rebound past v0 (only the PUBLISHING session's own
 /// `bind_result_table` call touches its `ctx`) — a raw SQL scan over session
-/// 1 still serves 20 rows. `current_version_provider`, given session 1's
-/// `ctx` but a freshly re-read record (`current_version = Some(1)`), must
+/// 1 still serves 20 rows. A pinned provider, given session 1's `ctx` but a
+/// freshly re-read record (`current_version = Some(1)`), must
 /// read v1's full 25 rows regardless of session 1's stale registration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn current_version_provider_reads_the_catalog_version_not_the_stale_session() {
@@ -1013,10 +1008,9 @@ async fn current_version_provider_reads_the_catalog_version_not_the_stale_sessio
     let stale_rows: usize = stale_batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(stale_rows, 20, "session 1's own registration is still v0");
 
-    // A FRESH catalog read (current_version = Some(1)) pinned (M1) and read
+    // A FRESH catalog read (current_version = Some(1)) pinned and read
     // through `pinned_provider`, through session 1's OWN `ctx`, must read
-    // v1's 25 rows — never session 1's stale 20. (`current_version_provider`
-    // itself left the public surface with M1 — this is its replacement.)
+    // v1's 25 rows — never session 1's stale 20.
     let fresh_record = h.record().await;
     assert_eq!(fresh_record.current_version, Some(1));
     let pin = h
@@ -1046,28 +1040,23 @@ async fn current_version_provider_reads_the_catalog_version_not_the_stale_sessio
     );
 }
 
-/// DELTA round-4 straddle oracle (`CONTRACT-DELTA-fix3.md`'s Oracles
-/// section): publish a NEW version BETWEEN `pin_current_version` and the
+/// Straddle oracle: publish a NEW version BETWEEN `pin_current_version` and the
 /// pinned read, and assert the persisted anchor AND the pinned read's
 /// content both still name the version pinned at, never a mix where the
 /// anchor names the OLD version while a read straddles onto the NEW one.
 ///
-/// **Correction (round 5, M4/F4):** this test does NOT go RED against the
-/// pre-fix shape, and the earlier docstring's claim that it did was false —
-/// the round-5 audit measured it. It threads ONE record snapshot
-/// (`h.record()`, taken once, before the race) through both the anchor and
-/// the read: even the pre-fix `current_version_identity`/
-/// `current_version_provider` pair, called on that SAME frozen record,
-/// would resolve the SAME version number for both legs (a version's
-/// content is immutable once published), so old and new code are
-/// indistinguishable in this exact scenario. What THIS test verifies —
-/// correctly, and still worth keeping — is `PinnedSource`'s own invariant:
+/// **Scope:** this test threads ONE record snapshot (`h.record()`, taken
+/// once, before the race) through both the anchor and the read, so ANY
+/// anchor/read pair called on that SAME frozen record resolves the SAME
+/// version number for both legs (a version's content is immutable once
+/// published) — it cannot tell a pinned resolution from two unpinned ones.
+/// What it verifies is `PinnedSource`'s own invariant:
 /// a resolution taken once stays fixed even if the catalog's
 /// `current_version` moves later. The divergence-PRODUCING input (two
 /// SEPARATE resolutions, one early and one late, straddling the race) is
 /// built in
 /// `old_two_call_shape_straddles_a_publish_race_pin_current_version_does_not`
-/// below, which is the actual M4 root-cause oracle.
+/// below, which is the root-cause oracle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pin_current_version_survives_a_publish_race_between_pin_and_read() {
     use datafusion::prelude::{col, lit};
@@ -1165,41 +1154,26 @@ async fn pin_current_version_survives_a_publish_race_between_pin_and_read() {
     );
 }
 
-/// DELTA round-5 M4 — the ROOT-CAUSE divergence oracle. The round-4 oracle
-/// above threads ONE record snapshot through both legs, which is exactly
-/// the case where any anchor/read pair — pre-fix or post-fix — agrees, so
-/// it proves nothing about the straddle (round-5 audit, F4). The actual
-/// divergence-producing input needs TWO INDEPENDENT resolutions straddling
-/// a publish: an anchor taken EARLY, a read taken LATE, off a record
-/// re-fetched after the race — this is what a pre-`PinnedSource` producer
-/// naturally did (compute the anchor, do other work, read the rows), and it
-/// is also exactly the shape M2 found live at `context_predictor.rs:812`
-/// and `:1537` (a caller holding one pin and calling the unpinned twin,
-/// which resolves a second one).
+/// The ROOT-CAUSE divergence oracle. The straddle oracle above threads ONE
+/// record snapshot through both legs, which is exactly the case where any
+/// anchor/read pair agrees, so it proves nothing about the straddle. The
+/// divergence-producing input needs TWO INDEPENDENT resolutions straddling a
+/// publish: an anchor taken EARLY, a read taken LATE, off a record re-fetched
+/// after the race — what a producer without `PinnedSource` naturally does
+/// (compute the anchor, do other work, read the rows), and the shape of a
+/// caller holding one pin and calling an unpinned twin, which resolves a
+/// second one.
 ///
-/// The pre-fix mechanism is reconstructed BY HAND, in the CURRENT tree, from
-/// the still-public primitives its two legs were built from — not against
-/// `ebb1c9e6`, which predates `PinnedSource` and where the round-4 oracle
-/// cannot even compile:
-/// - the anchor leg: `result_digest_anchor` computed the SAME value this
-///   test now gets from `pin_current_version(record).input_anchor()` for
-///   this call shape — the round-5 shape routed through
-///   `pin_current_version` internally for a versioned table, so calling it
-///   directly here is byte-identical. `result_digest_anchor` itself was
-///   REMOVED in round 6 (M1): it returned a bare `InputAnchor` with the
-///   resolution that produced it discarded, so a caller held an anchor with
-///   no way to get the matching content back without a second, independent
-///   resolve — precisely the shape this test's LATE resolution below
-///   reconstructs on purpose. Getting the EARLY anchor from
-///   `pin_current_version` instead does not change what this test proves:
-///   the divergence this oracle catches is between the EARLY resolution and
-///   the LATE one, never between two ways of asking for the early one.
+/// The two-call mechanism is reconstructed BY HAND from public primitives:
+/// - the anchor leg: `pin_current_version(record).input_anchor()` taken
+///   EARLY. The divergence this oracle catches is between the EARLY
+///   resolution and the LATE one, never between two ways of asking for the
+///   early one.
 /// - the read leg: `resolve_version_manifest` + `build_masked_provider` —
-///   literally `current_version_provider`'s old body, still public because
-///   `embedding_refresh.rs`'s delta/compaction producers legitimately
-///   thread ONE `resolve_version_manifest` call to both their anchor and
-///   their read (round 5's M9 fold). This test is what happens when the
-///   two calls are NOT threaded from the same resolution.
+///   public because `embedding_refresh.rs`'s delta/compaction producers
+///   legitimately thread ONE `resolve_version_manifest` call to both their
+///   anchor and their read. This test is what happens when the two calls are
+///   NOT threaded from the same resolution.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn old_two_call_shape_straddles_a_publish_race_pin_current_version_does_not() {
     use datafusion::prelude::{col, lit};
@@ -1210,7 +1184,7 @@ async fn old_two_call_shape_straddles_a_publish_race_pin_current_version_does_no
     assert_eq!(h.record().await.current_version, Some(0));
     let v0_vector = h.vector_of("0").await.expect("row 0 has a v0 vector");
 
-    // EARLY resolution: the anchor, and — for the fix's own control — a
+    // EARLY resolution: the anchor, and — as the pinned control — a
     // `PinnedSource` from the SAME record snapshot.
     let early_record = h.record().await;
     let early_anchor = h
@@ -1273,7 +1247,7 @@ async fn old_two_call_shape_straddles_a_publish_race_pin_current_version_does_no
     // it correctly (one resolution, not two).
     assert_ne!(
         early_anchor.anchor.0, late_manifest.identity,
-        "the old two-call shape (anchor resolved early, read resolved late) straddled the \
+        "the unpinned two-call shape (anchor resolved early, read resolved late) straddled the \
          publish race: the anchor names the pre-race identity while the independently-resolved \
          read already serves the post-race version"
     );
@@ -1314,22 +1288,20 @@ async fn old_two_call_shape_straddles_a_publish_race_pin_current_version_does_no
     assert_eq!(
         pinned_vectors[0], v0_vector,
         "pin_current_version + pinned_provider must still serve v0's content even read AFTER \
-         the race, unlike the old two-call shape above"
+         the race, unlike the unpinned two-call shape above"
     );
 }
 
-/// O2 (DELTA fix round 1, audit a25424e2aa5e91337 F2/V2) — the compaction
-/// arm: the MORE DANGEROUS half of the same defect. Session 1 publishes
+/// The compaction arm: the MORE DANGEROUS half of the stale-binding shape. Session 1 publishes
 /// version 0; session 2 (a second `InferenceSession` on the SAME
 /// root/catalog) refreshes to version 1, adding new rows. Session 1's `ctx`
-/// is never rebound past v0. Session 1 then COMPACTS: before this fix,
-/// `compact_embeddings` rewrote the live rows it is about to republish by
-/// scanning `ctx.sql("SELECT * FROM \"jammi.{t}\"")` over session 1's stale
-/// v0 binding, so the compacted fragment would carry ONLY v0's rows —
-/// silently and PERMANENTLY discarding every row session 2 added, while the
-/// K7 chain records the result as a legitimate compaction of v1. After the
-/// fix, compaction reads through v1's OWN masked provider (loaded fresh from
-/// the catalog, never `ctx`), so nothing is lost.
+/// is never rebound past v0. Session 1 then COMPACTS: compaction reads
+/// through v1's OWN masked provider (loaded fresh from the catalog, never
+/// `ctx`), so nothing is lost. Scanning `ctx.sql("SELECT * FROM
+/// \"jammi.{t}\"")` over session 1's stale v0 binding instead would carry
+/// ONLY v0's rows into the compacted fragment — silently and PERMANENTLY
+/// discarding every row session 2 added, while the version identity chain
+/// records the result as a legitimate compaction of v1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stale_process_binding_does_not_lose_rows_on_compaction() {
     let h = harness(20).await;
@@ -1376,7 +1348,7 @@ async fn stale_process_binding_does_not_lose_rows_on_compaction() {
     assert_eq!(live, 25, "no row lost by the compaction");
 }
 
-/// §6.8 — the model changed under the table (its content digest moved): the
+/// The model changed under the table (its content digest moved): the
 /// refresh is `DefinitionDrift` at step 0, before any base publish — no version
 /// row, `next_version` unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1451,7 +1423,7 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-/// §6.9 — restart parity: after a refresh, a reopened session serves the
+/// Restart parity: after a refresh, a reopened session serves the
 /// identical search results and `SELECT` output; the version rows are intact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_serves_the_refreshed_version() {
@@ -1536,7 +1508,7 @@ async fn restart_serves_the_refreshed_version() {
     drop(source_path);
 }
 
-/// §6.10 — a 4-file source under `execution_threads = 4`, one edit per file:
+/// A 4-file source under `execution_threads = 4`, one edit per file:
 /// every partition's edit is inferred (`inferred_rows == 4`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_partition_refresh_is_complete() {
@@ -1603,7 +1575,7 @@ async fn multi_partition_refresh_is_complete() {
     );
 }
 
-/// §6.11 — K1 reachability: after a refresh `producing_descriptor` is
+/// Descriptor reachability: after a refresh `producing_descriptor` is
 /// `EmbeddingDelta`, and `recompute` dispatches through the new arm.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn producing_descriptor_is_the_delta_after_a_refresh() {
@@ -1635,7 +1607,7 @@ async fn producing_descriptor_is_the_delta_after_a_refresh() {
     assert_ne!(out.recomputed[0].recomputed, h.table);
 }
 
-/// §6.15 — a duplicated source key on an already-versioned table is
+/// A duplicated source key on an already-versioned table is
 /// `NonUniqueKey { Source }` after the complete scan with no new version row;
 /// the initial embed still tolerates it. A parent with two physical rows under
 /// one `_row_id` (constructed) is `NonUniqueKey { Parent }`.
@@ -1739,7 +1711,7 @@ async fn non_unique_keys_are_refused_on_both_scans() {
     );
 }
 
-/// §6.16 — dependents stay fresh: a neighbor graph over T is `Fresh` after a
+/// Dependents stay fresh: a neighbor graph over T is `Fresh` after a
 /// no-edit refresh (which still publishes the base version) and
 /// `Stale { InputAdvanced }` after an edit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1800,7 +1772,7 @@ async fn dependents_stay_fresh_across_a_no_change_refresh() {
     }
 }
 
-/// §6.18 (refresh leg) — the source edited to carry 3 null keys: the refresh
+/// Refresh leg: the source edited to carry 3 null keys: the refresh
 /// of a versioned table is `InvalidKey { id, 3 }`, the model is never
 /// invoked, no building version row is left, `next_version` is unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1835,7 +1807,7 @@ async fn null_keys_refuse_the_refresh_before_any_model_call() {
         .is_empty());
 }
 
-/// §6.22 (embedded leg) — tenant B cannot refresh tenant A's table and a
+/// Embedded leg: tenant B cannot refresh tenant A's table and a
 /// scoped tenant cannot refresh a GLOBAL table (`TenantMismatch`, before the
 /// model load), yet can `SELECT` from the GLOBAL one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1912,7 +1884,7 @@ async fn read_vectors_follows_the_refreshed_version_in_key_order() {
     assert_eq!(vectors, expected);
 }
 
-/// §3.6 — `verify_materialization` on a versioned table: the base check is
+/// `verify_materialization` on a versioned table: the base check is
 /// unchanged, then every fragment digest, the deletes digest and the identity
 /// chain of the CURRENT version are recomputed and compared to the manifest
 /// and the catalog row; a tampered delta fragment is a `Mismatch` naming the
@@ -1968,7 +1940,7 @@ async fn verify_follows_the_refreshed_version() {
     }
 }
 
-/// §6.3(b) — `compact_embeddings` rewrites the live rows as ONE fragment +
+/// `compact_embeddings` rewrites the live rows as ONE fragment +
 /// ONE segment stamped with the new version, no deletes, the same ranking,
 /// an identity distinct from the parent's; `expire_versions(before = N)`
 /// then removes the older rows and every unreferenced fragment / segment /
@@ -2130,21 +2102,19 @@ async fn compact_yields_single_fragment_value_equivalent() {
     }
 }
 
-/// DELTA round-4 M5 oracle: a non-ready current version must refuse
+/// A non-ready current version must refuse
 /// `expire_versions` rather than reap against an unchecked manifest.
 ///
 /// Honest scope note: this black-box path is ALSO refused earlier, by the
-/// pre-existing `refreshable_record` gate at step 0 (`NotRefreshable {
+/// `refreshable_record` gate at step 0 (`NotRefreshable {
 /// CurrentVersionUnavailable }`), so this test proves the CALLER-VISIBLE
 /// property the contract names ("a non-ready current version → refuses,
 /// `reap_expired_version` never runs") but does not, by itself, isolate the
-/// specific `read_version_manifest` → `resolve_version_manifest` swap this
-/// same commit makes at `expire_versions`'s OWN manifest read further down —
-/// that conversion's independent value is closing the narrower TOCTOU race
-/// where the row is still `ready` at `refreshable_record`'s check and only
-/// transitions to non-ready before the later read, which needs a park-point
-/// test hook this commit does not add. Recorded here rather than claimed as
-/// fully isolated.
+/// `resolve_version_manifest` call at `expire_versions`'s OWN manifest read
+/// further down — whose independent value is closing the narrower TOCTOU
+/// race where the row is still `ready` at `refreshable_record`'s check and
+/// only transitions to non-ready before the later read, which would need a
+/// park-point test hook to isolate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expire_versions_refuses_a_non_ready_current_version() {
     let h = harness(20).await;

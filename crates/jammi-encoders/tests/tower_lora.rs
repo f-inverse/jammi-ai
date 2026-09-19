@@ -3,19 +3,20 @@
 //!
 //! Four oracles per tower:
 //!
-//! * **A1 gradient reachability** — with `all-linear` selected, EVERY
+//! * **Gradient reachability** — with `all-linear` selected, EVERY
 //!   trainable `Var` the tower reports gets a `Some`, finite, non-zero
 //!   gradient from one forward+backward, and the site COUNT is the one the
 //!   config predicts. This is a mechanism assertion, not a loss-decrease
-//!   one (esc-037): a loss that happens to go down proves nothing about
+//!   one: a loss that happens to go down proves nothing about
 //!   which parameters were reachable.
-//! * **A2 eval bit-identity** — `builder().lora(frozen())` equals `load()`
+//! * **Eval bit-identity** — `builder().lora(frozen())` equals `load()`
 //!   bit-for-bit, and a `ZerosB` adapter installed on every site equals the
 //!   unadapted tower bit-for-bit.
-//! * **A5 F16** — A1 again with an F16 backbone, so the dtype-following
+//! * **F16** — gradient reachability again with an F16 backbone, so the dtype-following
 //!   masks are exercised at a precision where an `f32::MIN` sentinel would
 //!   have become `-inf`. Driven with the PRODUCTION F32 media batch, which
-//!   is what a front end actually emits; **A5b** pins that an F32 batch and
+//!   is what a front end actually emits; the **input-dtype domain** oracle
+//!   pins that an F32 batch and
 //!   the same batch pre-cast to F16 are bit-identical.
 //! * **Adapter round trip** — train, export, save, rebuild through
 //!   `.adapter(..)`, and the rebuilt tower's eval output is bit-equal to the
@@ -72,8 +73,8 @@ fn htsat_json() -> serde_json::Value {
         .unwrap()
 }
 
-/// The one `all-linear`, `Gaussian`, fixed-seed build config every A1/A5
-/// oracle uses. `rank_pattern` empty, no dropout (a dropout stream would
+/// The one `all-linear`, `Gaussian`, fixed-seed build config every
+/// gradient-reachability oracle uses. `rank_pattern` empty, no dropout (a dropout stream would
 /// add a second source of run-to-run variation this oracle does not need).
 struct LoraFixture {
     targets: Vec<String>,
@@ -214,7 +215,7 @@ fn htsat_batch(device: &Device) -> Tensor {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// A1 / A5: gradient reachability at F32 and F16
+// Gradient reachability at F32 and F16
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Site count the CLIP block stack predicts: four LoRA sites per residual
@@ -364,9 +365,9 @@ fn a1_htsat_every_lora_param_is_reachable_at_f32() {
     htsat_reachability(DType::F32);
 }
 
-/// A5. F16, on CPU. BF16 is deliberately absent: candle-core 0.11's CPU
+/// Gradient reachability at F16, on CPU. BF16 is deliberately absent: candle-core 0.11's CPU
 /// matmul supports only F16/F32/F64, so a CPU bf16 forward cannot run at
-/// all — the bf16 claim this unit makes is about MASK CONSTRUCTION only
+/// all — the bf16 claim is about MASK CONSTRUCTION only
 /// (`clip_text`'s own `causal_mask_at_bf16_uses_the_bf16_minimum` unit
 /// test), never about a CPU forward.
 #[test]
@@ -387,7 +388,7 @@ fn a5_htsat_every_lora_param_is_reachable_at_f16() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// A5b: the media towers' input-dtype domain
+// The media towers' input-dtype domain
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The cast lives at the tower's forward edge, so the two ways a caller can
@@ -396,10 +397,10 @@ fn a5_htsat_every_lora_param_is_reachable_at_f16() {
 ///
 /// Both halves are load-bearing:
 ///
-/// * that the F32 batch is accepted AT ALL is the fix (before the edge cast,
-///   vision raised `dtype mismatch in conv2d` and audio `dtype mismatch in
-///   sub`, so every production front end was locked out of a reduced-
-///   precision backbone);
+/// * that the F32 batch is accepted AT ALL is the edge cast's job (without
+///   it, vision raises `dtype mismatch in conv2d` and audio `dtype mismatch
+///   in sub`, locking every production front end out of a reduced-precision
+///   backbone);
 /// * that it is accepted with the SAME BITS is what makes the edge a cast
 ///   and not a second numeric path — a tower that, say, ran the front end in
 ///   F32 and only narrowed later would pass an "it runs" test and silently
@@ -487,10 +488,10 @@ fn a5b_media_towers_at_f16_accept_an_f32_batch_bit_identically_to_a_pre_cast_one
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// A2: eval bit-identity
+// Eval bit-identity
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A2 (i) and (ii) for all three towers in one place, since the three
+/// Eval bit-identity (i) and (ii) for all three towers in one place, since the three
 /// baselines are the same claim about three different loaders:
 /// `builder(frozen()) == load()`, and `ZerosB` on `all-linear` == unadapted.
 ///
@@ -607,7 +608,7 @@ fn a2_builder_frozen_and_zerosb_adapter_are_bit_identical_to_load() {
     );
 }
 
-/// Negative control for the A2 oracle above: a GAUSSIAN adapter (non-zero
+/// Negative control for the eval bit-identity oracle above: a GAUSSIAN adapter (non-zero
 /// `B`) on the same sites DOES move the output. Without this, "ZerosB
 /// changes nothing" would also pass if the builder silently dropped the
 /// adapter entirely.
@@ -643,10 +644,10 @@ fn a2_control_a_gaussian_adapter_does_change_the_output() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// A7: probe input
+// Probe input
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A7. `AnyEncoder::probe_input` yields a batch each tower's own
+/// `AnyEncoder::probe_input` yields a batch each tower's own
 /// `forward_input` accepts — the smallest VALID one for that variant's
 /// geometry, derived from the encoder itself rather than a caller-side
 /// table.
@@ -711,7 +712,7 @@ fn a7_probe_input_forward_succeeds_on_every_tower() {
     }
 }
 
-/// A7 at a REDUCED-PRECISION backbone — the oracle the F32-only A7 above
+/// Probe input at a REDUCED-PRECISION backbone — the oracle the F32-only one above
 /// could not have failed.
 ///
 /// `probe_input` builds the media batches itself, so the dtype it picks is
@@ -720,14 +721,15 @@ fn a7_probe_input_forward_succeeds_on_every_tower() {
 /// silently get wrong on a reduced-precision backbone. That claim is
 /// asserted directly below (the manufactured pixels/spectrogram must carry
 /// the backbone dtype), which is a stricter check than "the forward runs":
-/// since `forward_input` now casts at each tower's own edge (A5b), a probe
+/// since `forward_input` casts at each tower's own edge (see the input-dtype
+/// domain oracle), a probe
 /// that HAD regressed to a hardcoded `F32` would still forward fine — only
 /// the dtype assertions catch it. All three towers are built through their
 /// BUILDERS at `backbone_dtype = F16` (the only construction path that can
 /// produce a non-F32 backbone).
 ///
-/// BF16 is absent for the same reason A5 omits it: candle-core 0.11's CPU
-/// matmul supports F16/F32/F64 only.
+/// BF16 is absent for the same reason the F16 gradient-reachability oracle
+/// omits it: candle-core 0.11's CPU matmul supports F16/F32/F64 only.
 #[test]
 fn a7_probe_input_forward_succeeds_at_an_f16_backbone() {
     use jammi_encoders::AnyEncoder;
@@ -987,7 +989,7 @@ where
 ///
 /// The `Var` is chosen by SORTED key, not by `HashMap` iteration order: a
 /// `VarMap`'s map has no stable order, and a run-to-run-varying choice would
-/// make the round-trip oracle non-reproducible (family J). `Var::set` writes
+/// make the round-trip oracle non-reproducible. `Var::set` writes
 /// the storage in place, so the tower's own `lora_a`/`lora_b` tensors — which
 /// share that storage — see the new values without rebuilding anything.
 fn perturb_one_var(varmap: &VarMap) -> String {
@@ -1297,7 +1299,7 @@ fn adapter_key_layout_is_exactly_the_checkpoint_shaped_set() {
     assert_eq!(got, want, "htsat_audio adapter key set");
 }
 
-/// D1's fused-QKV claim, measured on the adapter tensors themselves: the
+/// The fused-QKV claim, measured on the adapter tensors themselves: the
 /// OpenCLIP block's `in_proj` is ONE LoRA site over the full `[3*width,
 /// width]` fused projection, not three sites of `[width, width]`. Its
 /// `lora_a` is `[rank, width]` and its `lora_b` is `[3*width, rank]`, so a

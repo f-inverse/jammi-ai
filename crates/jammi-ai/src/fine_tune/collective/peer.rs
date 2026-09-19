@@ -571,7 +571,7 @@ impl<In: Inbound, Out: Outbound> Link<In, Out> {
     }
 }
 
-// ── Wire conversions (K2 on every numeric edge) ─────────────────────────────
+// ── Wire conversions (checked on every numeric edge) ────────────────────────
 
 fn verb_to_wire(verb: Verb) -> RoundVerb {
     match verb {

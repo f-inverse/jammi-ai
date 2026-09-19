@@ -1,5 +1,4 @@
-//! Host physical-memory reader for `[engine] memory_limit`'s `"<n>%"` form
-//! (K2, §9 B6 of contract `feat_500-B-U2c`).
+//! Host physical-memory reader for `[engine] memory_limit`'s `"<n>%"` form.
 //!
 //! [`EngineConfig::memory_limit_bytes`](super::EngineConfig::memory_limit_bytes)
 //! is the ONE reader of `[engine] memory_limit`; when the configured value is

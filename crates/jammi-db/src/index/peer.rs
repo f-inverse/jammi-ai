@@ -440,7 +440,7 @@ impl PeerFailureCounters {
 
 /// How many times [`RendezvousPlacement`] fell back to all-local because its
 /// ring read came back empty or its own row was absent from it — NEVER
-/// silent (RV2): a caller reads this delta to know whether a deployment's
+/// silent: a caller reads this delta to know whether a deployment's
 /// membership is actually working the way `[server] placement = "rendezvous"`
 /// promised, or is quietly behaving like `AllLocal`.
 #[derive(Debug, Default)]
@@ -493,7 +493,7 @@ impl RendezvousMetrics {
 /// no per-reason breakdown at the SQL edge, and adding one (a second
 /// `COUNT(*) ... WHERE result_root_identity <> ...` statement, or a
 /// `CASE`-tagged row the client tallies) would be a SECOND statement this
-/// type's own cost budget (RV6, below) forbids paying on every placed
+/// type's own cost budget (below) forbids paying on every placed
 /// search just to distinguish "excluded for staleness" from "excluded for
 /// a foreign root" — a distinction only human debugging, never placement
 /// correctness, would use. This is deliberately unlike
@@ -513,32 +513,21 @@ impl RendezvousMetrics {
 /// `Catalog::list_gang_members`'s side — one shared predicate, proven
 /// excluding on both callers.
 ///
-/// **Cost (measured, RENDEZVOUS RV6).** One ring read per placed search —
+/// **Cost.** One ring read per placed search —
 /// `crate::store::ResultStore::resolve_search_mode` calls [`Self::plan`]
-/// exactly once above its per-segment loop (RV1) — ONE statement, no
+/// exactly once above its per-segment loop — ONE statement, no
 /// transaction wrapper at all:
 /// `crate::catalog::backend::BackendImpl::query_untransacted` runs it
 /// directly against the pool, never through
 /// `crate::catalog::backend::BackendImpl::transaction`, which on Postgres
 /// pays for `BEGIN` + two `SET TRANSACTION ...` statements + `COMMIT`
-/// around the caller's own query regardless of `read_only` — four extra
-/// round trips this read never needed to pay.
+/// around the caller's own query regardless of `read_only`.
 ///
-/// Measured on the scratch Postgres host, 5 consecutive runs each on a
-/// fresh database with a warmed connection (isolating the query's own cost
-/// from a process's first-connection TCP+auth handshake, which is itself
-/// 3-4 ms and unrelated to either form): **~3.9-5.0 ms at 101 `instances`
-/// rows (51 ring candidates)** — essentially UNCHANGED from the ~4.6 ms
-/// single-sample measurement WITH the transaction wrapper; at this row
-/// count neither form's cost is the wrapper's four extra statements (each
-/// well under 1 ms on localhost) — it is the unavoidable one-round-trip
-/// floor of issuing any statement at all. **~10.2-10.9 ms at 10,101 rows
-/// (5,051 candidates)** — a real but modest ~20-25 % reduction from the
-/// ~13.3 ms single-sample measurement WITH the wrapper (removing 4 round
-/// trips saves a few ms here too), but the wrapper was never the DOMINANT
-/// cost at this scale either: `EXPLAIN (ANALYZE, BUFFERS)` on the exact
-/// rendered query, reproduced with the same 50 % root-matching fixture,
-/// shows
+/// Measured on Postgres with a warmed connection: ~3.9-5.0 ms at 101
+/// `instances` rows (51 ring candidates) — the one-round-trip floor of
+/// issuing any statement at all — and ~10.2-10.9 ms at 10,101 rows (5,051
+/// candidates). `EXPLAIN (ANALYZE, BUFFERS)` on the exact rendered query at
+/// the larger scale, with 50 % of rows sharing the root, shows
 ///
 /// ```text
 /// Seq Scan on instances  (cost=8.30..410.83 rows=5050 width=25)
@@ -552,44 +541,30 @@ impl RendezvousMetrics {
 /// ```
 ///
 /// `idx_instances_seen` (the index on `last_seen_at` alone) is NOT used:
-/// with 50 % of the table sharing this fixture's root identity, a Seq Scan
-/// of the whole (10,101-row) table is genuinely cheaper for Postgres's own
-/// planner than randomly heap-fetching half the rows through an index that
-/// supports only the OTHER conjunct — `idx_instances_seen` has no entry for
-/// `result_root_identity` at all, and the sargable rewrite (RV3) only
-/// changed whether the `last_seen_at` conjunct COULD use an index, not
-/// whether the planner's cost model prefers one here. The scan+filter
-/// itself is 3.262 ms of Postgres's own `EXPLAIN ANALYZE` time; the
-/// remaining ~7 ms of the measured ~10.5 ms median wall-clock figure is the
-/// wire transfer and per-row decode of the 5,051-row RESULT SET back to the
-/// client — proportional to how many candidates the ring actually returns,
-/// not to the query mechanism, and not reducible by removing wrappers or
-/// adding indexes (an index on `result_root_identity` could turn this Seq
-/// Scan into an Index Scan, but that is a schema/migration change this unit
-/// does not make — RV4's own K5 note is that it appends no migration).
+/// with 50 % of the table sharing the root identity, a Seq Scan is cheaper
+/// for the planner than heap-fetching half the rows through an index that
+/// supports only the OTHER conjunct (`idx_instances_seen` has no entry for
+/// `result_root_identity`). The remaining ~7 ms of the wall-clock figure is
+/// wire transfer and per-row decode of the 5,051-row result set —
+/// proportional to how many candidates the ring returns, not to the query
+/// mechanism. An index on `result_root_identity` would turn the Seq Scan
+/// into an Index Scan; the schema has none.
 ///
-/// That 5,051-candidate shape is a deliberately adversarial STRESS fixture
-/// (half of 10,100 synthetic rows sharing one root), never a realistic
-/// ring: a real ring is bounded by one deployment's own live replica count
-/// (single- to low-double-digit in practice), which the 101-row/51-candidate
-/// measurement (~4-5 ms, dominated by the one-round-trip floor, not by row
-/// count) already over-covers. The cost test's bound is therefore stated
-/// relative to the host, not as an absolute budget: at each scale the ring
-/// read may cost at most four times a plain transfer of the same number of
-/// `(instance_id, peer_addr)` rows through the test's own pool in the same
-/// process, plus a
-/// 2 ms floor — an absolute budget calibrated on one host (20 ms, under 2x
-/// over this host's ~10.5 ms) tripped on a shared CI runner at 24.9 ms with
-/// no change to the predicate at all. A regression that makes the predicate
+/// That 5,051-candidate shape is a deliberately adversarial STRESS fixture,
+/// never a realistic ring: a real ring is bounded by one deployment's own
+/// live replica count (single- to low-double-digit in practice). The cost
+/// test's bound is therefore stated relative to the host, not as an absolute
+/// budget: at each scale the ring read may cost at most four times a plain
+/// transfer of the same number of `(instance_id, peer_addr)` rows through the
+/// test's own pool in the same process, plus a 2 ms floor — an absolute budget
+/// does not survive a shared CI runner. A regression that makes the predicate
 /// or the plan expensive per candidate row (an index probe per row or worse)
 /// moves the ring read and not the baseline transfer, and fails the bound by
 /// name; sargability of the liveness conjunct is guarded separately by the
-/// `EXPLAIN` oracle in `catalog/lease.rs`, not by this bound; a fleet that
-/// has accumulated
+/// `EXPLAIN` oracle in `catalog/lease.rs`; a fleet that has accumulated
 /// thousands of long-dead, unpruned `instances` rows still sharing one root
-/// (a real but pathological shape `Catalog::prune_instances` exists to
-/// prevent) moves both, and is an operational fact, not this predicate's
-/// own cost.
+/// (the shape `Catalog::prune_instances` exists to prevent) moves both, and
+/// is an operational fact, not this predicate's own cost.
 #[derive(Clone)]
 pub struct RendezvousPlacement {
     catalog: Arc<Catalog>,
@@ -607,7 +582,7 @@ impl std::fmt::Debug for RendezvousPlacement {
     }
 }
 
-/// The domain tag every RENDEZVOUS placement hash folds under — distinct
+/// The domain tag every rendezvous placement hash folds under — distinct
 /// from [`crate::store::content_hash::CONTENT_HASH_DOMAIN`] and any other
 /// domain this crate ever hashes under (see [`domain_hash`]'s docs).
 pub const PLACEMENT_HASH_DOMAIN: &[u8] = b"jammi.placement.v1";
@@ -625,7 +600,7 @@ fn framed(bytes: &[u8]) -> Vec<u8> {
 
 /// The HRW score of `instance_id` for `(table, segment)`: the big-endian
 /// `u64` of the first 8 bytes of `domain_hash(PLACEMENT_HASH_DOMAIN,
-/// [instance_id, table, segment_id])`. Exported (`pub(crate)`) so the RV5
+/// [instance_id, table, segment_id])`. Exported (`pub(crate)`) so the
 /// minimal-disruption oracle can compute an INDEPENDENT expected ranking
 /// without duplicating this module's own sort.
 pub(crate) fn rendezvous_score(instance_id: &str, table: &str, segment: SegmentId) -> u64 {
@@ -667,7 +642,7 @@ impl RendezvousPlacement {
     /// Rank `ring` (every live member sharing this process's root, INCLUDING
     /// this process) for `(table, segment)`: sort by [`rendezvous_score`]
     /// descending, ties broken by `instance_id` byte order — a pure function
-    /// of the ring's CONTENT, never its encounter order (the RV1/RV5 oracle:
+    /// of the ring's CONTENT, never its encounter order (the oracle:
     /// shuffling `ring` before calling this must not change the output).
     fn rank<'a>(
         table: &str,
@@ -739,7 +714,7 @@ mod rendezvous_tests {
         }
     }
 
-    /// RV1/RV5: the rank is a PURE function of the ring's CONTENT, computed
+    /// The rank is a PURE function of the ring's CONTENT, computed
     /// by an INDEPENDENT second implementation here (this test does its OWN
     /// sort, never calling `RendezvousPlacement::rank`'s sort at all) —
     /// reordering the ring (a SQL `SELECT` with no `ORDER BY` makes no
@@ -791,7 +766,7 @@ mod rendezvous_tests {
         }
     }
 
-    /// RV5: `rendezvous_score`'s exact byte derivation, pinned against a
+    /// `rendezvous_score`'s exact byte derivation, pinned against a
     /// HAND-ROLLED SHA-256 fold that calls neither `domain_hash` nor
     /// `framed` nor `rendezvous_score` itself — every other oracle in this
     /// module (the rank-order-independence test above, the minimal-
@@ -879,7 +854,7 @@ mod rendezvous_tests {
         );
     }
 
-    /// RV5 minimal-disruption: over 100 segments, removing one member of a
+    /// Minimal disruption: over 100 segments, removing one member of a
     /// 3-member ring moves roughly `1/N` of the segments, and EVERY moved
     /// segment was previously owned by the LEAVER (never a segment that
     /// stays with an unrelated owner); adding a 4th member moves roughly
@@ -944,7 +919,7 @@ mod rendezvous_tests {
         }
     }
 
-    /// RV5: `domain_hash` under `PLACEMENT_HASH_DOMAIN` never collides with
+    /// `domain_hash` under `PLACEMENT_HASH_DOMAIN` never collides with
     /// `CONTENT_HASH_DOMAIN` over the same raw bytes, and the placement score
     /// is sensitive to every one of its three determinants (instance, table,
     /// segment) — changing any ONE moves the score.

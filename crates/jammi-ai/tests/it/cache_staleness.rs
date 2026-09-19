@@ -1,22 +1,21 @@
-//! esc-058 fix test (`closes_escape: esc-058`): a warm `ModelCache` must not
+//! A warm `ModelCache` must not
 //! serve a pre-mutation `Arc<LoadedModel>` (stale digest + stale vectors)
 //! after the underlying model directory is mutated in place — the SAME
 //! session, SAME `ModelCache`, SAME `ModelId`, never dropped in between.
 //!
 //! Reuses `pooling_config.rs`'s hermetic `tiny_bert` fixture-copy helpers
 //! (`build_local_model_dir`, `cls_pooling_config`, `mean_pooling_config`) —
-//! the identical mutation `pooling_config.rs:202-263`
-//! (`cls_declared_pooling_differs_from_mean_declared_pooling`, key assertion
-//! at `pooling_config.rs:246-251`) already proves changes the pooled
-//! vectors, so the RED/GREEN assertions below rest on a production-proven
-//! trigger, not a hypothetical one.
+//! the identical mutation `pooling_config.rs`'s
+//! `cls_declared_pooling_differs_from_mean_declared_pooling` already proves
+//! changes the pooled
+//! vectors, so the assertions below rest on a production-proven trigger,
+//! not a hypothetical one.
 //!
-//! Reverting the esc-058 staleness probe (`ModelCache::get_or_load`'s
-//! `probe_freshness` call on its fast path, back to the unconditioned
-//! `cache.entries.get(&id)` hit origin/main shipped) makes
-//! `warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors`'s
-//! post-fix assertions RED: the warm process would keep attesting `D1`/`V1`
-//! after the mutation instead of `D2`/`V2`.
+//! Without the staleness probe (`ModelCache::get_or_load`'s
+//! `probe_freshness` call on its fast path), an unconditioned
+//! `cache.entries.get(&id)` hit would keep attesting `D1`/`V1` after the
+//! mutation instead of `D2`/`V2`, failing
+//! `warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -132,9 +131,8 @@ fn tiny_bert_dir(root: &Path, name: &str, pooling: &serde_json::Value) -> std::p
     dir
 }
 
-/// The esc-058 observable + all four control arms, in one session / one
-/// `ModelCache` / one `ModelId`, exactly as the escape's `symptom_spec`
-/// requires:
+/// The staleness observable + all four control arms, in one session / one
+/// `ModelCache` / one `ModelId`:
 ///
 /// (1) embed `dir` under `ModelCache` → `V1`, `D1` (warm entry cached).
 /// (2) mutate `dir`'s `1_Pooling/config.json` bytes IN PLACE (CLS → mean —
@@ -169,7 +167,7 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
 
     // (2) In-place mutation — dir (and therefore ModelId) never changes.
     //
-    // F-4a: deliberately LENGTH-CHANGING (via `with_length_marker`, not an
+    // Deliberately LENGTH-CHANGING (via `with_length_marker`, not an
     // incidental `to_string` vs `to_string_pretty` formatting difference —
     // both writes here use the SAME compact serializer), and asserted as
     // such below. A straight cls_pooling_config -> mean_pooling_config swap
@@ -185,7 +183,7 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
     assert_ne!(
         bytes_before_mutation.len(),
         mutated_pooling_json.len(),
-        "F-4a: the primary mutation must be byte-length-changing, not merely \
+        "the primary mutation must be byte-length-changing, not merely \
          content-changing — a length-identical mutation's detection would rest \
          entirely on sub-second mtime resolution, never asserted here"
     );
@@ -225,10 +223,9 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
     // (c) V1 vs V2 (cold): finite-safe, strictly-positive-delta divergence.
     assert_finite_and_diverged("V1 vs V2 (cold)", &v1, &v2, DIVERGENCE_TOL);
 
-    // THE oracle: post-fix, the warm replay must match the fresh cold
-    // reading (D2/V2), never the pre-mutation D1/V1. Pre-fix (the fast path
-    // with no staleness probe), `d_warm == d1` and `v_warm == v1` — this
-    // assertion is RED there.
+    // THE oracle: the warm replay must match the fresh cold reading
+    // (D2/V2), never the pre-mutation D1/V1 (a fast path with no staleness
+    // probe would give `d_warm == d1` and `v_warm == v1`).
     assert_eq!(
         d_warm, d2,
         "warm replay after an in-place mutation must record the CURRENT digest \
@@ -254,8 +251,8 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
 
     // (d) No-mutation determinism control: a SEPARATE, UNTOUCHED model dir
     // in the SAME cache must report the SAME digest and BITWISE-IDENTICAL
-    // finite vectors on a warm replay and a cold reading — proving the RED
-    // above cannot be manufactured by ambient nondeterminism (a timestamp,
+    // finite vectors on a warm replay and a cold reading — proving the
+    // divergence above cannot be manufactured by ambient nondeterminism (a timestamp,
     // an unstable fold order, an unseeded RNG) rather than the actual
     // mutation.
     let untouched_dir = tiny_bert_dir(tmp.path(), "untouched_model", &mean_pooling_config());
@@ -305,7 +302,7 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
     assert_finite_and_identical("untouched dir: first load vs cold reading", &vu1, &vu_cold);
 }
 
-/// F-4a diagnostic (NOT a hard gate — `#[ignore]`d): the SAME scenario as
+/// Same-length-mutation diagnostic (NOT a hard gate — `#[ignore]`d): the SAME scenario as
 /// `warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors`, but
 /// with a byte-length-IDENTICAL mutation (a straight
 /// `cls_pooling_config()` ⇄ `mean_pooling_config()` swap — each has exactly
@@ -319,11 +316,11 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
 /// sibling). This test is an honest, explicitly-labelled record of that
 /// residual, not a correctness assertion this crate can guarantee on every
 /// filesystem — it is `#[ignore]`d so a coarse-clock CI runner cannot flake
-/// the gate on an environmental property this fix does not (and cannot)
+/// the gate on an environmental property this crate does not (and cannot)
 /// control. Run it manually (`cargo test -- --ignored`) to observe whether
 /// your local filesystem's mtime resolution happens to catch this case.
 #[tokio::test]
-#[ignore = "F-4a: detection here depends on the filesystem's mtime resolution, not on \
+#[ignore = "detection here depends on the filesystem's mtime resolution, not on \
             anything this crate controls — diagnostic only, never a CI gate"]
 async fn warm_hit_after_same_length_mutation_is_mtime_dependent_diagnostic() {
     let tmp = tempdir().unwrap();
@@ -372,10 +369,10 @@ async fn warm_hit_after_same_length_mutation_is_mtime_dependent_diagnostic() {
     );
 }
 
-// ── F-4b (audit round 62): appearance of a newly-output-affecting file ──
+// ── Appearance of a newly-output-affecting file ──
 
-/// F-4b, the `ModelCache` peer of
-/// `model::backend::candle::digest_fingerprint_audit62_tests::pooling_config_appearing_after_fingerprint_trips_the_probe`:
+/// The `ModelCache` peer of
+/// `model::backend::candle::digest_fingerprint_tests::pooling_config_appearing_after_fingerprint_trips_the_probe`:
 /// `1_Pooling/config.json` APPEARING (not merely changing) between a warm
 /// load and a warm replay — a bare BERT dir gets a `1_Pooling/` directory it
 /// did not have at load time — must trip the staleness probe and reload,
@@ -425,7 +422,7 @@ async fn warm_hit_after_1_pooling_config_appearing_reloads_fresh() {
     assert_ne!(
         d_warm, d1,
         "1_Pooling/config.json appearing after load must change the served \
-         content digest on the next warm hit (F-4b)"
+         content digest on the next warm hit"
     );
     assert_finite_and_diverged(
         "V1 (mean fallback) vs V_warm (CLS, post-appearance)",
@@ -435,7 +432,7 @@ async fn warm_hit_after_1_pooling_config_appearing_reloads_fresh() {
     );
 }
 
-/// F-4b peer: `preprocessor_config.json` APPEARING between a warm load and a
+/// Peer: `preprocessor_config.json` APPEARING between a warm load and a
 /// warm replay must also trip the probe. `tiny_bert` is a plain BERT
 /// text-embedding model — no CLAP audio tower ever reads this file — so
 /// unlike the pooling case there is no pooled-vector divergence to assert;
@@ -477,7 +474,7 @@ async fn warm_hit_after_preprocessor_config_appearing_reloads_fresh() {
     assert_ne!(
         d_warm, d1,
         "preprocessor_config.json appearing after load must change the served \
-         content digest on the next warm hit (F-4b)"
+         content digest on the next warm hit"
     );
 
     // Non-vacuous control: a COLD reading of the post-appearance dir must
@@ -498,31 +495,29 @@ async fn warm_hit_after_preprocessor_config_appearing_reloads_fresh() {
     );
 }
 
-// ── F-3 (audit round 62): GPU permit accounting survives stale eviction \
+// ── GPU permit accounting survives stale eviction \
 //    while a guard is held ──
 
-/// F-3: a stale-fingerprint eviction must NEVER release GPU memory that is
+/// A stale-fingerprint eviction must NEVER release GPU memory that is
 /// still genuinely resident — i.e. still reachable through a `ModelGuard`
-/// that has not been dropped. Reproduces the exact defect: `warm_guard` is
-/// held ACROSS the mutation and the second `get_or_load` (unlike the main
-/// esc-058 test above, which drops its guard before mutating — the realistic
-/// `EmbeddingPipeline::run` shape, but NOT the one that exposes this
-/// accounting bug).
+/// that has not been dropped. `warm_guard` is held ACROSS the mutation and
+/// the second `get_or_load` (unlike the main staleness test above, which
+/// drops its guard before mutating — the realistic `EmbeddingPipeline::run`
+/// shape, but NOT the one that exercises this accounting).
 ///
 /// Budget sized to fit exactly TWO `tiny_bert` weight-file-sized models
 /// (`2 * weights_len`) — tight enough that admission arithmetic is a
 /// deterministic proxy for the scheduler's own internal counters (no
 /// `cfg(test)`-only accessor needed): the moment BOTH the pre-mutation model
 /// (still resident via `warm_guard`) and the freshly-reloaded post-mutation
-/// model are admitted, `available()` must read EXACTLY 0. Pre-fix (a
-/// non-`Arc`-shared permit dropped unconditionally on entry removal),
-/// evicting the stale `CacheEntry` released `warm_guard`'s still-resident
-/// `weights_len` bytes back to the scheduler immediately — `available()`
-/// would read `weights_len` (nonzero) instead of `0`, silently reporting
-/// room that does not physically exist (double-booking).
+/// model are admitted, `available()` must read EXACTLY 0. A non-`Arc`-shared
+/// permit dropped unconditionally on entry removal would release
+/// `warm_guard`'s still-resident `weights_len` bytes back to the scheduler
+/// immediately — `available()` would read `weights_len` instead of `0`,
+/// reporting room that does not physically exist (double-booking).
 ///
-/// **Deliberately NOT a test of item 2's admission-wait fallback (unit-62
-/// design pressure-test).** `2 * weights_len` is the genuine MINIMUM budget
+/// **Deliberately NOT a test of the admission-wait fallback.**
+/// `2 * weights_len` is the genuine MINIMUM budget
 /// this test's own scenario requires — both the pre-mutation model (via
 /// `warm_guard`, held open on purpose) and the freshly-reloaded
 /// post-mutation model must be able to be resident AT THE SAME TIME for the
@@ -532,10 +527,10 @@ async fn warm_hit_after_preprocessor_config_appearing_reloads_fresh() {
 /// wait at all (see `ModelCache::do_load`'s admission loop doc for the
 /// wake-set enumeration). See
 /// `stale_reload_while_guard_live_waits_for_release_under_a_realistic_budget`
-/// below for the item-2-specific coverage: a budget sized to exactly ONE
-/// resident copy (not two), where the SAME "guard held across a stale
-/// reload" shape must WAIT for the guard's release instead of either
-/// double-booking (impossible at 1x) or hard-erroring (item 2's fix).
+/// below for that coverage: a budget sized to exactly ONE resident copy
+/// (not two), where the SAME "guard held across a stale reload" shape must
+/// WAIT for the guard's release instead of either double-booking
+/// (impossible at 1x) or hard-erroring.
 #[tokio::test]
 async fn stale_eviction_never_double_books_gpu_memory_while_guard_held() {
     let tmp = tempdir().unwrap();
@@ -564,7 +559,7 @@ async fn stale_eviction_never_double_books_gpu_memory_while_guard_held() {
     let cache = ModelCache::new(resolver, device_config, Arc::clone(&scheduler));
     let source = ModelSource::local(&dir);
 
-    // (1) Warm the cache and KEEP THE GUARD (the bug-exposing shape).
+    // (1) Warm the cache and KEEP THE GUARD (the shape under test).
     let warm_guard = cache
         .get_or_load(&source, ModelTask::TextEmbedding, None)
         .await
@@ -575,7 +570,7 @@ async fn stale_eviction_never_double_books_gpu_memory_while_guard_held() {
         "after one load, exactly one model's worth of budget should remain"
     );
 
-    // (2) Length-changing in-place mutation (F-4a discipline) — same dir,
+    // (2) Length-changing in-place mutation (see the main test) — same dir,
     // same ModelId.
     let pooling_config_path = dir.join("1_Pooling/config.json");
     let mutated = serde_json::to_string(&with_length_marker(mean_pooling_config())).unwrap();
@@ -598,7 +593,7 @@ async fn stale_eviction_never_double_books_gpu_memory_while_guard_held() {
         0,
         "both the still-guard-held pre-mutation model and the freshly reloaded \
          post-mutation model are genuinely resident; the scheduler must never \
-         report room that does not physically exist (F-3, no double-booking)"
+         report room that does not physically exist (no double-booking)"
     );
 
     // (4) Dropping the pre-mutation guard releases ITS reservation — proving
@@ -618,7 +613,7 @@ async fn stale_eviction_never_double_books_gpu_memory_while_guard_held() {
     // `CacheEntry` is still present in the warm cache — it keeps its own
     // `Arc<GpuPermit>` clone alive so a subsequent `get_or_load` can keep
     // serving it without re-reserving. This is the mirror check of step
-    // (4): proves the fix does not over-release either (no double-release,
+    // (4): proves the accounting does not over-release either (no double-release,
     // no premature drop of memory a still-cached entry legitimately holds).
     drop(reload_guard);
     assert_eq!(
@@ -639,11 +634,11 @@ async fn stale_eviction_never_double_books_gpu_memory_while_guard_held() {
     );
 }
 
-// ── Unit-62 design pressure-test, item 2 (block): double-reservation \
+// ── Double-reservation \
 //    liveness — a stale reload while a guard is live must WAIT, never \
 //    hard-error, under a realistically-sized budget ──
 
-/// Item 2: the stale path (`get_or_load`'s `Ok(false)` arm) evicts the
+/// The stale path (`get_or_load`'s `Ok(false)` arm) evicts the
 /// `CacheEntry` while `warm_guard` still holds a live clone of its
 /// `Arc<GpuPermit>` — the reload that follows transiently needs this
 /// model's budget TWICE (the still-reserved pre-mutation bytes, held open
@@ -656,17 +651,14 @@ async fn stale_eviction_never_double_books_gpu_memory_while_guard_held() {
 /// production sizing, exactly what a single resident copy of this model
 /// needs and no more.
 ///
-/// RED pre-fix (`do_load`'s admission loop hard-errors as soon as
-/// `evict_one` finds nothing — the stale entry is already gone by the time
-/// admission runs, so there is nothing left to evict even though the
-/// request is perfectly satisfiable once `warm_guard` releases): the
-/// spawned reload task resolves almost immediately with
-/// `Err("Cannot acquire GPU memory: nothing to evict")`, regardless of
-/// whether `warm_guard` has been dropped yet — the "must still be pending"
-/// assertion below fails (the task has already completed), and the final
-/// join fails too (`Err`, never `Ok`).
+/// The stale entry is already gone by the time admission runs, so
+/// `evict_one` finds nothing even though the request is satisfiable once
+/// `warm_guard` releases. An admission loop that hard-errored there would
+/// resolve almost immediately with `Err("Cannot acquire GPU memory: nothing
+/// to evict")`, failing both the "must still be pending" assertion and the
+/// final join.
 ///
-/// GREEN post-fix: `do_load` continues waiting in its own dual-notify
+/// `do_load` instead continues waiting in its own dual-notify
 /// admission loop (a permit-release notify plus a guard-idle notify,
 /// registered before each `try_acquire`/`evict_one` pass — see
 /// `ModelCache::do_load`'s admission loop doc for the full wake-set
@@ -726,7 +718,7 @@ async fn stale_reload_while_guard_live_waits_for_release_under_a_realistic_budge
         "the realistic 1x budget is fully reserved by warm_guard alone"
     );
 
-    // (2) Length-changing in-place mutation (F-4a discipline) — trips the
+    // (2) Length-changing in-place mutation (see the main test) — trips the
     // staleness probe on the next call.
     let pooling_config_path = dir.join("1_Pooling/config.json");
     let mutated = serde_json::to_string(&with_length_marker(mean_pooling_config())).unwrap();
@@ -743,12 +735,12 @@ async fn stale_reload_while_guard_live_waits_for_release_under_a_realistic_budge
     });
 
     // (4) The reload must NOT complete yet: `warm_guard` is still held, the
-    // budget cannot admit a second resident copy, and the fixed behavior
-    // waits rather than erroring. A generous 500ms bound — far more than a
+    // budget cannot admit a second resident copy, and admission waits
+    // rather than erroring. A generous 500ms bound — far more than a
     // hermetic tiny_bert resolve+load needs, but nowhere near long enough
-    // to look like a hang — turns a REGRESSION (the pre-fix hard error,
-    // which returns almost immediately) into a fast, clear assertion
-    // failure instead of relying on indefinite blocking to "prove" a wait.
+    // to look like a hang — turns a hard error (which returns almost
+    // immediately) into a fast, clear assertion failure instead of relying
+    // on indefinite blocking to "prove" a wait.
     let still_pending = tokio::time::timeout(Duration::from_millis(500), &mut reload_task).await;
     match still_pending {
         Err(_elapsed) => {
@@ -759,14 +751,13 @@ async fn stale_reload_while_guard_live_waits_for_release_under_a_realistic_budge
             Ok(_guard) => panic!(
                 "the reload completed (Ok) BEFORE warm_guard was dropped, while \
                  the realistic 1x budget could not possibly admit a second \
-                 resident copy — this should be structurally impossible either \
-                 way, fixed or not"
+                 resident copy — this should be structurally impossible"
             ),
             Err(e) => panic!(
                 "the reload completed BEFORE warm_guard was dropped, while the \
                  realistic 1x budget could not possibly admit a second resident \
-                 copy — this can only mean the pre-fix hard error path ran \
-                 instead of waiting (item 2's regression): got Err({e})"
+                 copy — this can only mean admission hard-errored instead of \
+                 waiting: got Err({e})"
             ),
         },
     }
@@ -785,8 +776,8 @@ async fn stale_reload_while_guard_live_waits_for_release_under_a_realistic_budge
             "the reload never completed within 10s after warm_guard's release — \
              a hang would mean do_load's own dual-notify admission loop (see \
              ModelCache::do_load's admission loop doc for the wake-set \
-             enumeration) never woke, which would itself be a distinct \
-             regression from the hard-error bug this test targets"
+             enumeration) never woke — a liveness failure, distinct from the \
+             hard error this test also rules out"
         ),
     };
     match result {
@@ -794,32 +785,29 @@ async fn stale_reload_while_guard_live_waits_for_release_under_a_realistic_budge
         Err(e) => panic!(
             "the reload must succeed once warm_guard's reservation is released \
              — never a hard error on a request that is perfectly satisfiable \
-             once the outgoing guard's memory is actually freed (item 2) — got \
+             once the outgoing guard's memory is actually freed — got \
              Err({e})"
         ),
     }
 }
 
-// ── F-4' (audit round 62, adversarial round 3): a deleted OPTIONAL \
+// ── A deleted OPTIONAL \
 //    candidate must reload fresh, never wedge; a deleted REQUIRED \
 //    candidate keeps the typed refusal, and stays a typed refusal — never \
 //    a permanent wedge into a different failure mode ──
 
-/// F-4' core: `1_Pooling/config.json` is OPTIONAL (the loader has a
+/// `1_Pooling/config.json` is OPTIONAL (the loader has a
 /// documented mean-pooling fallback for its absence). Deleting it from a
 /// LIVE, load-time-CLS-declared model directory must make the next warm
 /// `get_or_load` reload FRESH — new digest, mean-fallback vectors — never a
 /// typed refusal, and never a permanent wedge (two consecutive warm calls
 /// after the deletion must both succeed with stable, matching output).
 ///
-/// Pre-F-4', `ModelFingerprint::probe` collapsed this exact case
-/// (present-at-load, `NotFound`-now) into `Err` regardless of optionality,
-/// and `ModelCache::get_or_load`'s `Err` arm never evicts — so the SAME
-/// unusable `CacheEntry` stayed cached forever, and every subsequent
-/// `get_or_load` on this id re-hit the identical `Err`, even though a cold
-/// reload (bypassing the cache) would have succeeded via the mean fallback
-/// the whole time. RED there: this test's first post-deletion `get_or_load`
-/// would return `Err`, never `Ok`.
+/// `ModelFingerprint::probe` reports this case (present-at-load,
+/// `NotFound`-now) for an optional candidate as stale, not `Err`: collapsed
+/// into `Err`, every subsequent `get_or_load` on this id would refuse, even
+/// though a cold reload (bypassing the cache) succeeds via the mean
+/// fallback.
 #[tokio::test]
 async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedges() {
     let tmp = tempdir().unwrap();
@@ -854,7 +842,7 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
         Err(e) => panic!(
             "an OPTIONAL candidate (1_Pooling/config.json) deleted between load \
              and probe must reload fresh via the mean-pooling fallback, never a \
-             typed refusal (F-4') — got Err({e})"
+             typed refusal — got Err({e})"
         ),
     };
     let d_warm_1 = assert_hashed(
@@ -872,9 +860,9 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
 
     // Non-vacuous control: the post-deletion vectors must match an
     // independent, freshly-resolved model with NO 1_Pooling/ directory at
-    // all — the exact mean-fallback shape `pooling_config.rs:202-263`
-    // (`cls_declared_pooling_differs_from_mean_declared_pooling`, control
-    // (3) at :253-262) already proves matches a mean-declared model.
+    // all — the exact mean-fallback shape `pooling_config.rs`'s
+    // `cls_declared_pooling_differs_from_mean_declared_pooling` (its control
+    // (3)) already proves matches a mean-declared model.
     let reference_dir = tmp.path().join("reference_no_pooling_dir");
     build_local_model_dir(&reference_dir, None);
     let reference_model = cache
@@ -926,7 +914,7 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
         Ok(g) => g,
         Err(e) => panic!(
             "a SECOND warm get_or_load after the optional-candidate reload must \
-             also succeed — never a permanent wedge (F-4') — got Err({e})"
+             also succeed — never a permanent wedge — got Err({e})"
         ),
     };
     let d_warm_2 = assert_hashed(
@@ -941,28 +929,21 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
     );
 }
 
-/// F-4' control, UPDATED for unit-62 design pressure-test item 3
-/// (evict-on-`Err`, wedge elimination): `model.safetensors` is a REQUIRED
-/// candidate — the loader has no fallback for missing weights. Deleting it
-/// must keep the EXISTING typed refusal (K2) behavior on the FIRST
-/// post-deletion call — the probe's own "no longer readable" message.
-/// Calling `get_or_load` TWICE after the deletion must refuse BOTH times
-/// (never silently start succeeding), but the two refusals are no longer
-/// required — nor expected — to be byte-identical: `probe`'s `Err` arm now
-/// evicts the `CacheEntry` before returning (see `ModelFingerprint::probe`'s
+/// Control: `model.safetensors` is a REQUIRED candidate — the loader has no
+/// fallback for missing weights. Deleting it yields the probe's own typed
+/// refusal ("no longer readable") on the FIRST post-deletion call. Calling
+/// `get_or_load` TWICE after the deletion must refuse BOTH times (never
+/// silently start succeeding), but the two refusals are not byte-identical:
+/// `probe`'s `Err` arm evicts the `CacheEntry` before returning (see `ModelFingerprint::probe`'s
 /// arm-(c) doc), so the SECOND call is cold-equivalent — it takes the full
 /// resolve + load path instead of re-probing the identical dead entry, and
 /// hits `ModelResolver::resolve_local`'s OWN typed "no weights found" error
 /// instead of the probe's "no longer readable" one. Same observable
 /// contract (refusal, deterministically, both times), different message —
 /// proving there is no permanent wedge on this identical stale entry.
-///
-/// RED pre-fix (revert item 3's `evict_if_current` call in the `Err` arm):
-/// the entry stays cached after the first `Err`, so the SECOND call
-/// re-probes the SAME entry and re-hits the identical "no longer readable"
-/// message — `msg_2` would equal `msg_1` and `msg_2` would still contain
-/// "no longer readable", both assertions below inverted from what this test
-/// now asserts.
+/// Without the `evict_if_current` call in the `Err` arm, the SECOND call
+/// would re-probe the SAME entry and repeat the "no longer readable"
+/// message.
 #[tokio::test]
 async fn warm_hit_after_required_weights_deleted_evicts_and_second_call_hits_the_load_path() {
     let tmp = tempdir().unwrap();
@@ -994,14 +975,12 @@ async fn warm_hit_after_required_weights_deleted_evicts_and_second_call_hits_the
     };
     assert!(
         msg_1.contains("no longer readable"),
-        "expected the esc-058 staleness-probe's typed refusal message on the \
+        "expected the staleness probe's typed refusal message on the \
          FIRST post-deletion call (the probe itself is what detects the \
          deletion), got: {msg_1}"
     );
 
-    // SECOND, CONSECUTIVE call: the wedge check. Pre-fix, this would hit
-    // the identical still-cached, still-dead entry and re-`Err` with the
-    // SAME probe message forever. Post-fix (item 3), the first call's `Err`
+    // SECOND, CONSECUTIVE call: the wedge check. The first call's `Err`
     // arm evicted the entry, so this call is cold-equivalent — it must
     // still refuse (the weights file is still gone), but via the LOADER's
     // own typed error, never the probe's.
@@ -1027,16 +1006,15 @@ async fn warm_hit_after_required_weights_deleted_evicts_and_second_call_hits_the
     assert_ne!(
         msg_1, msg_2,
         "the two refusals must come from DIFFERENT code paths (probe vs. \
-         cold resolve) — evict-on-Err (item 3) means the second call never \
+         cold resolve) — evict-on-Err means the second call never \
          re-probes the same dead entry, so it never reproduces the FIRST \
          call's exact message; a wedge would keep serving byte-identical \
          messages here forever"
     );
 }
 
-// ── Round 10 (audit round 62, adversarial round 10 — "the terminal class \
-//    closure"): the weights slot's alternate-arm appearance/deletion, at \
-//    the full ModelCache level ──
+// ── The weights slot's alternate-arm appearance/deletion, at the full \
+//    ModelCache level ──
 
 /// (a) appearance, end-to-end: `model.onnx` appears beside an already-loaded
 /// `model.safetensors`. The warm path must NOT silently keep serving the
@@ -1061,10 +1039,9 @@ async fn warm_hit_after_required_weights_deleted_evicts_and_second_call_hits_the
 /// ran rather than the fast path short-circuiting on a stale-but-undetected
 /// probe.
 ///
-/// **Framing correction (unit-62 design pressure-test, item 4a).** The
-/// "persisted record" language above must not be read as the catalog row
+/// **Caveat.** The "persisted record" language above must not be read as the catalog row
 /// being some fixed, identity-pinned fact once written. `Catalog::register_model`
-/// (`model_repo.rs:159-167`) is an UNCONDITIONAL UPSERT on every load:
+/// is an UNCONDITIONAL UPSERT on every load:
 /// `backend`, `task`, and `model_type` are overwritten with
 /// `excluded.<col>` on every `ON CONFLICT`, last-writer-wins — only
 /// `artifact_path` gets the `COALESCE(excluded, existing)` set-but-never-
@@ -1076,16 +1053,12 @@ async fn warm_hit_after_required_weights_deleted_evicts_and_second_call_hits_the
 /// on-disk heuristic, for THIS specific model's second load — a different
 /// sequence (e.g. a load with a different `backend_hint`, which
 /// `try_catalog_lookup` honors over the persisted `backend`) can and does
-/// re-derive a different backend on the very next call. Cache-key
-/// narrower-than-resolve-key (backend_hint mismatch specifically) is one of
-/// unit 65's classes, not something this test's pinning observation
-/// contradicts or resolves.
+/// re-derive a different backend on the very next call; this test neither
+/// relies on nor settles that.
 ///
-/// RED pre-round-10: the weights slot's fingerprint only ever tracked the
-/// SELECTED arm (`model.safetensors`) — `model.onnx` appearing was invisible
-/// to `probe`, which reported fresh forever, so the second call would return
-/// the IDENTICAL `Arc` as the first (this test's `Arc::ptr_eq` assertion
-/// would be `true`, not `false`), silently masking the appearance entirely.
+/// The weights slot's fingerprint tracks the UNSELECTED arms too: tracking
+/// only `model.safetensors` would leave `model.onnx` appearing invisible to
+/// `probe`, and the second call would return the IDENTICAL `Arc`.
 #[tokio::test]
 async fn warm_hit_after_model_onnx_appearing_beside_safetensors_evicts_and_genuinely_reloads() {
     let tmp = tempdir().unwrap();
@@ -1123,7 +1096,7 @@ async fn warm_hit_after_model_onnx_appearing_beside_safetensors_evicts_and_genui
         "model.onnx appearing beside model.safetensors must trip the staleness probe \
          and produce a GENUINELY NEW Arc<LoadedModel> on the next get_or_load — the \
          SAME Arc being handed back (Arc::ptr_eq == true) would mean the appearance \
-         was never detected (the round-10 defect) and the fast path silently kept \
+         was never detected and the fast path silently kept \
          serving the pre-appearance instance forever"
     );
 }
@@ -1135,11 +1108,9 @@ async fn warm_hit_after_model_onnx_appearing_beside_safetensors_evicts_and_genui
 /// alternate. Two consecutive warm calls after the deletion must both
 /// succeed — never wedge, never refuse.
 ///
-/// RED pre-round-10: the weights slot's fingerprint only ever tracked the
-/// SELECTED arm; deleting it fell into the sole "REQUIRED, no fallback"
-/// treatment every weights path had (`optional: false` unconditionally,
-/// with no per-slot alternate-exists carve-out), so this refused instead of
-/// reloading via the alternate a cold resolve would happily use.
+/// A selected weights arm with a surviving alternate is not "REQUIRED, no
+/// fallback": treated as required, this would refuse instead of reloading
+/// via the alternate a cold resolve would happily use.
 #[tokio::test]
 async fn warm_hit_after_selected_weights_arm_deleted_with_alternate_present_reloads_via_alternate_never_refuses(
 ) {
@@ -1156,8 +1127,7 @@ async fn warm_hit_after_selected_weights_arm_deleted_with_alternate_present_relo
     let source = ModelSource::local(&dir);
 
     // An alternate arm (open_clip_model.safetensors) ALSO exists on disk,
-    // byte-identical to model.safetensors — untracked by the pre-round-10
-    // fingerprint (only the SELECTED arm was ever a candidate).
+    // byte-identical to model.safetensors.
     std::fs::copy(
         dir.join("model.safetensors"),
         dir.join("open_clip_model.safetensors"),
@@ -1178,7 +1148,7 @@ async fn warm_hit_after_selected_weights_arm_deleted_with_alternate_present_relo
     // refuse — a cold resolve of this SAME directory would happily pick up
     // open_clip_model.safetensors via resolve_local's own fallback chain.
     //
-    // esc-058 fix-verifier fold-in: `Ok(_)` alone is satisfiable by a bug
+    // `Ok(_)` alone is satisfiable by a bug
     // that silently keeps serving the pre-deletion `Arc` without ever
     // actually reloading (the staleness probe never tripping would look
     // identical to an observer that only checks `Ok`/`Err`) — pin the FIRST
@@ -1207,8 +1177,8 @@ async fn warm_hit_after_selected_weights_arm_deleted_with_alternate_present_relo
                 "attempt #{attempt}: deleting the SELECTED weights arm \
                  (model.safetensors) while an alternate (open_clip_model.safetensors) \
                  still exists must reload via the alternate, never refuse — a cold \
-                 resolve would succeed via resolve_local's own fallback chain (round \
-                 62, adversarial round 10) — got Err({e})"
+                 resolve would succeed via resolve_local's own fallback chain — got \
+                 Err({e})"
             ),
         }
     }

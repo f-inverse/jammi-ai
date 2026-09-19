@@ -2,12 +2,12 @@
 //!
 //! The tests below drive the real `RunRank` rpc over the production
 //! `peer_bind` listener (`start_engine_server_with_peer_bind` /
-//! `start_no_worker_server`): the wire-level K2 edges (`world == 0`,
+//! `start_no_worker_server`): the wire-level edges (`world == 0`,
 //! `rank >= world`, refused before I-GANG runs), ambient admin scope
 //! (refused before any row is even read), every I-GANG determinant
 //! `get_job_for_rank` decides (job not found, not `running`, wrong
 //! claimant, wrong attempt, lease not live, an undecodable `world_size`,
-//! `assign.world != row.world_size`), the world>1 conjunct (#566 — the
+//! `assign.world != row.world_size`), the world>1 conjunct (the
 //! training-set pair, the row's own tenant pinning a strict resolution, and
 //! the sidecar verify — every determinant refusing identically on the wire
 //! and distinctly under `test-hooks`, with an ADMITTING control that
@@ -20,7 +20,7 @@
 //! parks: the body's end is the session's end.
 //!
 //! The held session's arms each have their own rows: `Cancel`
-//! (`Aborted{Cancelled}`), a second `Assign` (`InvalidArgument` — K2), the
+//! (`Aborted{Cancelled}`), a second `Assign` (`InvalidArgument`), the
 //! host's DRAIN (`Aborted{Drain}`, both through the session's own
 //! `HostAdmission` and through the real server shutdown path), the
 //! re-verification tick's three ends (`Refuted` / `Unavailable` /
@@ -329,7 +329,7 @@ async fn materialize_ready_table_for_tenant(
     }
 }
 
-/// The U4b gang oracle's fixture rows, as the `pairs` CSV source the
+/// The in-process gang oracle's fixture rows, as the `pairs` CSV source the
 /// world-2 sessions' rank body trains from.
 fn write_pairs_csv(dir: &std::path::Path) -> String {
     let path = dir.join("gang_service_pairs.csv");
@@ -436,8 +436,8 @@ async fn materialize_training_set_for_tenant(
             .await
             .unwrap();
             // The whole catalog row, fetched through the catalog under the
-            // SAME tenant scope this closure already runs in (#551)
-            // — `TrainingSetTable` carries no whole-row accessor.
+            // SAME tenant scope this closure already runs in —
+            // `TrainingSetTable` carries no whole-row accessor.
             engine_for_scope
                 .catalog()
                 .get_result_table(table.table_name())
@@ -488,8 +488,7 @@ fn null_tenant_row(table: &str) -> jammi_db::catalog::result_repo::CreateResultT
     }
 }
 
-/// Rewrites a ready table's sidecar WITHOUT its `leaves` inventory — the
-/// exact shape a sidecar written before U5b-0's inventory has — so
+/// Rewrites a ready table's sidecar WITHOUT its `leaves` inventory, so
 /// `ResultStore::read_materialization_manifest` reads it as ABSENT
 /// (`Ok(None)`), never as a manifest whose whole artifact is one leaf.
 async fn strip_leaves_from_sidecar(
@@ -820,11 +819,11 @@ pub(crate) fn tenant(n: u8) -> TenantId {
 }
 
 // ---------------------------------------------------------------------------
-// Wire-level K2 edges (`world == 0`, `rank >= world`), decided before
+// Wire-level edges (`world == 0`, `rank >= world`), decided before
 // I-GANG runs.
 // ---------------------------------------------------------------------------
 
-/// Wire-level K2: `world == 0` is refused `INVALID_ARGUMENT`, before I-GANG
+/// Wire-level edge: `world == 0` is refused `INVALID_ARGUMENT`, before I-GANG
 /// (which needs no row read at all here — no `jobs` row could ever satisfy this
 /// wire-level edge).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -842,7 +841,7 @@ async fn run_rank_refuses_world_zero() {
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     // `world == 0` also trips `rank >= world` for every unsigned `rank`
     // (`rank >= 0` is trivially true) — the message, not just the code,
-    // distinguishes which K2 edge actually refused, so a mutation that
+    // distinguishes which edge actually refused, so a mutation that
     // deletes the `world == 0` check specifically (leaving `rank >= world`
     // to catch this exact input by coincidence) still fails this assertion.
     assert!(
@@ -859,7 +858,7 @@ async fn run_rank_refuses_world_zero() {
 /// `jammi_peer_requests_total{rpc}` counter proves (`peer_service.rs`), and
 /// counted at the whole-server [`jammi_server::metrics_layer`] regardless of
 /// how the call is ultimately decided (this one is refused at the wire-level
-/// K2 edge, `world == 0`, before I-GANG ever runs).
+/// edge, `world == 0`, before I-GANG ever runs).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_rank_increments_gang_requests_metric() {
     use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
@@ -889,7 +888,7 @@ async fn run_rank_increments_gang_requests_metric() {
     );
 }
 
-/// Wire-level K2: `rank >= world` is refused `INVALID_ARGUMENT` — the
+/// Wire-level edge: `rank >= world` is refused `INVALID_ARGUMENT` — the
 /// boundary case (`rank == world`), not just a wildly out-of-range one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_rank_refuses_rank_at_world_boundary() {
@@ -945,19 +944,20 @@ async fn run_rank_refuses_a_stream_closed_before_assign() {
 }
 
 // ---------------------------------------------------------------------------
-// I-GANG (the full row predicate) + admit-and-hold (j2', `world_size == 1`)
+// I-GANG (the full row predicate) + admit-and-hold (`world_size == 1`)
 // ---------------------------------------------------------------------------
 
-/// j2', the `world_size == 1` arm: a call satisfying EVERY I-GANG
+/// The `world_size == 1` arm: a call satisfying EVERY I-GANG
 /// determinant — the row is `running`, claimed by the caller's own
 /// `coordinator_instance_id`, at the matching `attempt`, under a live
 /// lease, `world_size == 1` (so the training-set pair is not gated), the
 /// coordinator's own `instances` row fresh — receives `Admitted`, is HELD
 /// under re-verification (at least two ticks pass with no event: the live
-/// row keeps re-verifying), and — with no rank body to run in this unit
-/// (B4) — ends `Aborted{NoBody}` at the park bound (one lease window), the
-/// stream closing after it. The job row is byte-identical before and after
-/// (g2': nothing terminal is written on behalf of a rank). Mutation proof:
+/// row keeps re-verifying), and — a `world_size == 1` session having no
+/// rank body to run — ends `Aborted{NoBody}` at the park bound (one lease
+/// window), the stream closing after it. The job row is byte-identical
+/// before and after (nothing terminal is written on behalf of a rank).
+/// Mutation proof:
 /// a handler that still ends `Unimplemented` fails at `open_rank`; a park
 /// bound of one heartbeat ends before the two-tick floor; any `jobs` write
 /// on the park path flips the row-facts equality.
@@ -1379,7 +1379,7 @@ fn streaming_of(
 /// `PeerEngineServer::gang_last_refusal_reason` off this SAME instance
 /// afterward) paired with the `Status` the RPC returned.
 ///
-/// The world>1 rows (#566): every one starts from the ADMITTING control's
+/// The world>1 rows: every one starts from the ADMITTING control's
 /// own fixture — a genuinely materialized, ready, digest-verifying table
 /// under the job's own tenant, the pair filled by the real CAS — and moves
 /// exactly ONE determinant off it (the pair left unset; the row's tenant
@@ -1541,7 +1541,7 @@ async fn refusal_scenario(
             assign_frame_full("nd-job-lease-dead", attempt, 0, 1, "nd-coord-lease-dead")
         }
         GangRefusalReason::LeaseUndecodable => {
-            // Issue #574's own row fact: `lease_expires_at` text that does
+            // A row fact: `lease_expires_at` text that does
             // not parse as a timestamp — refused the same fixed way
             // `LeaseDead` is, under its own distinguishable variant, never
             // surfaced as `admission_catalog_fault`. Since migration
@@ -2073,7 +2073,7 @@ fn every_gang_refusal_reason() -> Vec<jammi_server::grpc::gang::GangRefusalReaso
 
 /// The ONE non-disclosure oracle. Every I-GANG determinant
 /// (ambient admin scope / not found / not running / wrong claimant / wrong
-/// attempt / lease dead / lease undecodable (#574) / undecodable world_size /
+/// attempt / lease dead / lease undecodable / undecodable world_size /
 /// world mismatch / the world>1 conjunct's seven — pair missing, tenant
 /// undecodable, unresolved under the job's tenant, not ready, sidecar
 /// absent, digest mismatch, this host's store faulting — / coordinator not
@@ -2139,10 +2139,10 @@ async fn run_rank_last_refusal_reason_distinguishes_every_determinant() {
 }
 
 // ---------------------------------------------------------------------------
-// The world>1 conjunct (#566): the named rows, and the admitting control.
+// The world>1 conjunct: the named rows, and the admitting control.
 // ---------------------------------------------------------------------------
 
-/// #566 R2(b), the cross-tenant-denial case the `GANG_LISTENER_ALLOWLIST`
+/// The cross-tenant-denial case the `GANG_LISTENER_ALLOWLIST`
 /// derivation claim stands on: `training_set_location` names a
 /// `result_tables` row that genuinely resolves and verifies — but for
 /// ANOTHER tenant than the one the calling job's row is bound to. Refused
@@ -2171,7 +2171,7 @@ async fn run_rank_refuses_a_training_set_another_tenant_owns() {
     );
 }
 
-/// #566 R2(b), the NULL-tenant variant: `training_set_location` names a
+/// The NULL-tenant variant: `training_set_location` names a
 /// row created with NO tenant scope active (its `tenant_id` is NULL) while
 /// the calling job IS tenant-bound. The strict resolver never matches a
 /// NULL-tenant row for a real tenant (`jammi-db`'s own tests prove it
@@ -2246,8 +2246,8 @@ async fn run_rank_refuses_a_null_tenant_training_set_for_a_tenant_bound_job() {
     );
 }
 
-/// A ready table whose sidecar predates the leaf inventory (no `leaves`)
-/// reads as ABSENT (U5b-0's inventory-aware read) and refuses — never a
+/// A ready table whose sidecar has no leaf inventory (no `leaves`)
+/// reads as ABSENT (the inventory-aware read) and refuses — never a
 /// verify that treats the whole artifact as one leaf. Mutation proof:
 /// a reader that accepts a leaf-less sidecar admits this call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2265,9 +2265,9 @@ async fn run_rank_refuses_world_gt_one_when_the_sidecar_predates_the_leaf_invent
     );
 }
 
-/// The resolution site's own admin-scope guard (#566: "Admin scope: the
-/// resolution site must refuse explicitly before ever calling the strict
-/// resolver, regardless of which table exists"): with a REAL, ready,
+/// The resolution site's own admin-scope guard (the resolution site
+/// refuses admin scope explicitly before ever calling the strict
+/// resolver, regardless of which table exists): with a REAL, ready,
 /// digest-verifying table for tenant B, `resolve_training_set_identity`
 /// for tenant B (i) verifies outside any admin scope — the control proving
 /// the fixture is genuinely admissible — and (ii) refuses
@@ -2317,7 +2317,7 @@ async fn resolution_site_refuses_under_admin_scope_before_the_strict_resolver_ru
     );
 }
 
-/// The world>1 parity row #566 names: the SAME real training set that
+/// The world>1 parity row: the SAME real training set that
 /// admits over the wire is first read back through `get_job_for_rank` on
 /// the fixture's SQLite catalog; the Postgres arm of this producer→consumer
 /// parity is `gang_training_spec_parity.rs`'s (`test_case`-parameterized
@@ -2381,7 +2381,7 @@ async fn run_rank_world_two_own_tenant_training_set_is_admitted_runs_its_body_an
 }
 
 // ---------------------------------------------------------------------------
-// Holder contention (c2', d2'): the lattice over the wire.
+// Holder contention: the lattice over the wire.
 // ---------------------------------------------------------------------------
 
 /// A `JobRun` holder — a loop-claimed job running on this host —
@@ -2657,7 +2657,7 @@ async fn run_rank_cancel_on_an_admitted_stream_ends_cancelled() {
     assert_eq!(row_facts(&server, "job-cancel").await, before);
 }
 
-/// K2: a second `Assign` on an already-admitted stream is a protocol
+/// A second `Assign` on an already-admitted stream is a protocol
 /// violation — the stream ends with `InvalidArgument`, never a second
 /// admission and never an `Aborted` reason; the row untouched. Mutation
 /// proof: an inbound arm that ignores a second `Assign` parks to `NoBody`
@@ -2684,7 +2684,7 @@ async fn run_rank_second_assign_on_an_admitted_stream_is_invalid_argument() {
     assert_eq!(row_facts(&server, "job-second-assign").await, before);
 }
 
-/// K2: an EMPTY `RankControl` frame (`control: None`) on an admitted stream
+/// An EMPTY `RankControl` frame (`control: None`) on an admitted stream
 /// — the one value of the oneof that is neither the session's (`Assign`,
 /// `Cancel`) nor the round protocol's — is a protocol violation: the stream
 /// ends with `InvalidArgument`, the row untouched. This is the refusal arm
@@ -2796,7 +2796,7 @@ async fn run_rank_held_session_ends_drain_on_server_shutdown() {
     }
 }
 
-/// i2', the `Refuted` end: a row fact moving after admission (the job
+/// Re-verification, the `Refuted` end: a row fact moving after admission (the job
 /// flipped off `running`) ends the held session `Aborted{Refuted}` at the
 /// next tick — assembly-scoped, the one end that counts toward the
 /// assembly's attempts (`ReverifyEnd::counts_toward_assembly_attempts`).
@@ -2822,7 +2822,7 @@ async fn run_rank_held_session_ends_refuted_when_the_row_no_longer_holds() {
     );
 }
 
-/// i2', the `Unavailable` end: the catalog not answering at re-verification
+/// Re-verification, the `Unavailable` end: the catalog not answering at re-verification
 /// (the `instances` table dropped after admission, so `fresh_instance`'s
 /// read faults — the same DROP-TABLE technique
 /// `run_rank_fresh_instance_fault_is_unavailable` uses at admission) ends
@@ -2838,7 +2838,7 @@ async fn run_rank_held_session_ends_unavailable_when_the_catalog_faults() {
     assert_eq!(row_facts(&server, "job-unavailable").await, before);
 }
 
-/// i2', the `StoreUnavailable` end: THIS host's object store faulting at
+/// Re-verification, the `StoreUnavailable` end: THIS host's object store faulting at
 /// re-verification — the admitted `world_size == 2` session's training-set
 /// row moved onto a scheme this build compiles no driver for, after
 /// admission — ends the session `Aborted{StoreUnavailable}`: member-scoped,
@@ -2872,7 +2872,7 @@ async fn run_rank_held_session_ends_store_unavailable_when_this_hosts_store_faul
     assert_eq!(row_facts(&server, "job-store-unavail").await, before);
 }
 
-/// i2' at the artifact: a `world_size == 2` session whose training set's
+/// Re-verification at the artifact: a `world_size == 2` session whose training set's
 /// sidecar is stripped of its leaf inventory AFTER admission (reads as
 /// absent) ends `Aborted{Refuted}` — the artifact's fact, assembly-scoped,
 /// never this host's `StoreUnavailable`. Pins the split between "the
@@ -2892,8 +2892,8 @@ async fn run_rank_held_session_ends_refuted_when_the_sidecar_stops_verifying() {
     assert_eq!(row_facts(&server, "job-sidecar-refuted").await, before);
 }
 
-/// The rank body's own pre-collective verify (U5b-1b-i's per-partition
-/// leaf inventory, consumed here): a `world_size == 2` session whose
+/// The rank body's own pre-collective verify (the per-partition leaf
+/// inventory, consumed here): a `world_size == 2` session whose
 /// training set's Parquet bytes were corrupted inside a row group AFTER
 /// the sidecar attested them — a fault the sidecar-level re-verification
 /// tick cannot see (it compares the sidecar's own digest, never the

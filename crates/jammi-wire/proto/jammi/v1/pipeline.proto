@@ -13,8 +13,8 @@ import "jammi/v1/trigger.proto";
 // `BuildNeighborGraph`, `PropagateEmbeddings`, and `AssembleContext` are
 // imperative session methods, not SQL queries, so they live as typed gRPC RPCs
 // alongside CatalogService / EmbeddingService / InferenceService / EvalService
-// rather than on the Flight SQL surface (which carries query/result only, per
-// ADR-01 §3.2). They are substrate primitives — materialising a k-NN graph,
+// rather than on the Flight SQL surface (which carries query/result only).
+// They are substrate primitives — materialising a k-NN graph,
 // propagating features over a declared graph, or pooling a retrieval into a
 // fixed-width context vector — and name no tenant-domain concept.
 //
@@ -246,7 +246,7 @@ message PropagateEdgeSource {
 }
 
 // Propagate an embedding table's features over a declared graph. Mirrors the
-// engine's `propagate_embeddings` binding. The graph is either an S9 similarity
+// engine's `propagate_embeddings` binding. The graph is either a similarity
 // graph (`edge_graph_table`, a `build_neighbor_graph` output) or a registered
 // external edge source (`edge_source`) — exactly one, modelled as a `oneof` so
 // both/neither is a decode error. The optional scalars carry explicit presence
@@ -258,7 +258,7 @@ message PropagateEmbeddingsRequest {
   optional string embedding_table = 2;
   // The graph to propagate over — exactly one arm.
   oneof graph {
-    // An S9 similarity graph (a `build_neighbor_graph` output table name).
+    // A similarity graph (a `build_neighbor_graph` output table name).
     string edge_graph_table = 3;
     // A registered external edge source + its column bindings.
     PropagateEdgeSource edge_source = 4;

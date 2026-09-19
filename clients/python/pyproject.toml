@@ -45,8 +45,8 @@ dependencies = [
 # compiled `jammi-ai-native` dist (importable as `jammi_native`); with it,
 # `jammi.connect("file://…")` resolves the local target to an
 # `EmbeddedBackend` (direct FFI). Without it, the base client is native-free and
-# a `file://` target raises `NoEmbeddedEngineError`. The `==` pin is lockstep
-# (K6): the client and the engine ship at one workspace version, and the
+# a `file://` target raises `NoEmbeddedEngineError`. The `==` pin is lockstep:
+# the client and the engine ship at one workspace version, and the
 # embedded backend drives the engine's wire seam by direct PyO3 — a version skew
 # between the two would desynchronise that seam, so the pin is EXACT, not a floor.
 embedded = ["jammi-ai-native==0.49.1"]

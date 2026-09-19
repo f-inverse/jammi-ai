@@ -654,8 +654,8 @@ mod tests {
     /// it depends on `attn_weights` (not on V) through that same product.
     /// Overwriting every `Var` with a fixed nonzero value (sorted by name for
     /// determinism, since `VarMap`'s backing `HashMap` iteration order is
-    /// not stable) breaks that degeneracy so these tests observe the fix's
-    /// actual behavior instead of an initialization artifact.
+    /// not stable) breaks that degeneracy so these tests observe the training
+    /// arm's actual behavior instead of an initialization artifact.
     fn break_zero_init_symmetry(varmap: &VarMap, device: &Device) {
         let mut entries: Vec<(String, candle_core::Var)> = varmap
             .data()
@@ -677,7 +677,7 @@ mod tests {
         }
     }
 
-    /// RED oracle: under `training = true`, `MultiHeadAttention::forward`
+    /// Oracle: under `training = true`, `MultiHeadAttention::forward`
     /// must use the differentiable softmax composition, so gradient flows
     /// from the loss back through the attention weights to the Q and K
     /// slices of `in_proj_weight`. Reverting that arm to `softmax_last_dim`
@@ -762,7 +762,7 @@ mod tests {
         assert!(
             grads.get(in_proj_weight).is_none(),
             "eval's own LayerNorm kernel must still truncate backward before block 0's \
-             attention runs, matching pre-fix behavior for this tower's eval path"
+             attention runs on this tower's eval path"
         );
 
         // EXCLUDED: `visual.proj` (`crate::contiguous_matmul(&pooled,
@@ -845,8 +845,7 @@ mod tests {
     /// `training_false_backward_has_no_in_proj_gradient_at_all`'s doc — so
     /// the eval half of this assertion holds independent of `ln_1`/`ln_2`'s
     /// own gate; the training=true half is what a dropped propagation line
-    /// actually flips). RED-verified: deleting
-    /// `self.ln_1.set_training(training)` from
+    /// actually flips). Deleting `self.ln_1.set_training(training)` from
     /// `ResidualAttentionBlock::set_training` flips the training=true half
     /// of this test (`ln_1.weight` comes back `None` instead of `Some`)
     /// while every other test in this file stays green.
@@ -948,7 +947,7 @@ mod tests {
         assert_eq!(before_bits, after_bits);
     }
 
-    /// #421 P1-a3, the OpenCLIP-vision leg — same oracle and rationale as
+    /// The OpenCLIP-vision leg — same oracle and rationale as
     /// `crate::bert::tests::
     /// fusible_site_census_is_the_exact_per_forward_seam_call_count`, and the
     /// twin of `crate::clip_text`'s own leg: identical block stack, and

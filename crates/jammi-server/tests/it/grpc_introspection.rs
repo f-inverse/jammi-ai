@@ -35,10 +35,12 @@ use jammi_ai::{Modality, ServerInfo, Session, SourceDescriptor};
 use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
-use jammi_test_utils::{cookbook_fixture, fixture, pg_url_for_tests};
+use jammi_test_utils::{cookbook_fixture, fixture};
 use tonic::transport::Endpoint;
 
-use super::common::grpc::{start_engine_server, start_engine_server_with_broker, EngineServer};
+#[cfg(feature = "live-postgres-tests")]
+use super::common::grpc::start_engine_server_with_broker;
+use super::common::grpc::{start_engine_server, EngineServer};
 
 fn tiny_bert_model_id() -> String {
     format!("local:{}", cookbook_fixture("tiny_bert").display())
@@ -401,7 +403,7 @@ async fn remote_server_info_like_local() {
         "this fixture mounts no trigger, so the event tier is absent"
     );
 
-    // K4: embedded and remote report the IDENTICAL runtime broker fact — the
+    // Embedded and remote report the IDENTICAL runtime broker fact — the
     // test fixture's config defaults to the in-process broker.
     assert_eq!(
         local_info.broker, remote_info.broker,
@@ -416,24 +418,19 @@ async fn remote_server_info_like_local() {
     let _ = server.handle.await;
 }
 
-/// K4, non-default arm: `remote_server_info_like_local` above only exercises
+/// Parity, non-default arm: `remote_server_info_like_local` above only exercises
 /// this fixture's config DEFAULT (`in_memory`) -- a bug that special-cased
 /// the default kind (or a `ServerInfo.broker` wiring that silently ignored
 /// the config and always reported `in_memory`) would still pass it. Here the
 /// embedded session and the remote server are built from the SAME
 /// `[broker.postgres]` config, over a real Postgres database, and both must
 /// report `"postgres"` — proving the runtime broker fact actually reflects
-/// the config on a kind other than the default. Live: requires
-/// `JAMMI_TEST_PG_URL`; skips (never `#[ignore]`) otherwise, matching every
-/// other pg-gated oracle in the workspace.
+/// the config on a kind other than the default, against the live Postgres
+/// at `JAMMI_TEST_PG_URL`.
+#[cfg(feature = "live-postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_server_info_reports_postgres_broker_kind() {
-    let Some(url) = pg_url_for_tests() else {
-        eprintln!(
-            "skipping remote_server_info_reports_postgres_broker_kind: JAMMI_TEST_PG_URL unset"
-        );
-        return;
-    };
+    let url = jammi_test_utils::postgres_url();
     let broker = jammi_db::config::BrokerConfig::Postgres {
         url: Some(jammi_db::config::Secret::from(url)),
         idle_poll_secs: 5,

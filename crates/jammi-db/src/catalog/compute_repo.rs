@@ -1,16 +1,14 @@
-//! The `compute_executors` / `compute_jobs` catalog tables (migration 038,
-//! `docs/plans/67-distributed-training/UNITS.md` § U8b): generic CRUD over a
-//! distributor-neutral compute-cluster registry (B1/K5 — no `ballista` or
-//! any other distributor vocabulary in this module; the Ballista-shaped
+//! The `compute_executors` / `compute_jobs` catalog tables (migration 038):
+//! generic CRUD over a distributor-neutral compute-cluster registry (no
+//! `ballista` or any other distributor vocabulary in this module; the Ballista-shaped
 //! traits over these verbs live in `jammi-ballista`, not here).
 //!
 //! `compute_executors` is BOTH the executor registry (host/ports/capacity/
-//! liveness) AND, via its `devices` column, the placement policy's sole
-//! device authority — [`Catalog::list_compute_executor_devices`] reads it
-//! directly, never through a join on `workers.instance_id` (67 pressure-
-//! round delta 3: an executor process and a `[worker]` process are
-//! different roles that may see different devices, so only the executor's
-//! own registration fact is trustworthy for a placement decision).
+//! liveness) AND, via its `devices` column, the placement policy's sole device authority —
+//! [`Catalog::list_compute_executor_devices`] reads it directly, never through a join on
+//! `workers.instance_id` (an executor process and a `[worker]` process are different roles that may
+//! see different devices, so only the executor's own registration fact is trustworthy for a
+//! placement decision).
 //! `compute_jobs` mirrors job OWNERSHIP AND STATUS only — the execution
 //! graph itself has no serialisation in Ballista 54.1, so a scheduler
 //! restart never revives an in-flight graph from this table; jammi's own
@@ -417,7 +415,7 @@ impl Catalog {
             .await?)
     }
 
-    /// Every compute job, ordered by `job_id` (family J: a fixed order).
+    /// Every compute job, ordered by `job_id` (a fixed order).
     pub async fn list_compute_jobs(&self) -> Result<Vec<ComputeJobRecord>> {
         Ok(self
             .backend()

@@ -250,11 +250,8 @@ fn run_rank_never_calls_map_engine_error() {
 /// `run_rank`'s OWN closing brace, never "the rest of the file".
 #[test]
 fn run_rank_body_span_excludes_neighboring_functions() {
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — decoy fn before run_rank
     let before = "fn before() { map_engine_error(1) }\n";
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — the scanned fn itself
     let target = "fn run_rank() { admission_catalog_fault(1); admission_catalog_fault(2); admission_catalog_fault(3); }\n";
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — decoy fn after run_rank
     let after = "fn after() { map_engine_error(2) }\n";
     let fixture = format!("{before}{target}{after}");
     let masked = mask_non_code(&fixture);
@@ -282,11 +279,9 @@ fn mask_non_code_hides_comments_and_strings_but_not_code() {
     let doc_commented = "/// mentions map_engine_error( in prose\nfn f() {}\n";
     assert!(!mask_non_code(doc_commented).contains("map_engine_error("));
 
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code
     let string_literal = "fn f() { let s = \"map_engine_error(\"; }\n";
     assert!(!mask_non_code(string_literal).contains("map_engine_error("));
 
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code
     let real_call = "fn f() { map_engine_error(e) }\n";
     assert!(mask_non_code(real_call).contains("map_engine_error("));
 }

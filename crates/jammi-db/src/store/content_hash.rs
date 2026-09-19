@@ -58,7 +58,7 @@ impl ContentHash {
     }
 
     /// Decode a stored hex value, refusing anything that is not exactly 64
-    /// lowercase hex characters (K2: a reader never trusts a malformed cell).
+    /// lowercase hex characters (a reader never trusts a malformed cell).
     pub fn from_hex(s: &str) -> Result<Self> {
         if s.len() != 64 || !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
             return Err(JammiError::Schema {
@@ -126,10 +126,9 @@ impl ContentHash {
 ///
 /// Two callers: [`content_hash_row`] (domain [`CONTENT_HASH_DOMAIN`], one
 /// already tag+length+payload-framed part per rendered cell — passed
-/// VERBATIM as this crate's existing per-cell encoding, so extracting this
-/// primitive changes no hash value: `domain_hash(CONTENT_HASH_DOMAIN, parts)`
-/// folds the identical bytes `content_hash_row` folded before this
-/// extraction, in the identical order) and [`crate::index::peer::
+/// VERBATIM as this crate's per-cell encoding:
+/// `domain_hash(CONTENT_HASH_DOMAIN, parts)` folds exactly the bytes the
+/// per-cell encoding produces, in order) and [`crate::index::peer::
 /// RendezvousPlacement`] (domain `b"jammi.placement.v1"`, one length-prefixed
 /// part each for `instance_id`, `table` and the segment id).
 pub fn domain_hash(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
@@ -308,12 +307,10 @@ mod tests {
         );
     }
 
-    /// RENDEZVOUS RV5: `content_hash_row` calling the extracted
-    /// [`domain_hash`] primitive must be byte-identical to the fold it ran
-    /// before the extraction — reimplemented here, independently, exactly as
-    /// the pre-refactor function read (SHA-256 over the domain tag, then
-    /// `[tag][len(bytes) as u64 LE][bytes]` per value, with NO call to
-    /// `domain_hash`), over cases spanning every tag and several
+    /// `content_hash_row`, built on the [`domain_hash`] primitive, is
+    /// byte-identical to an independent fold reimplemented here (SHA-256 over
+    /// the domain tag, then `[tag][len(bytes) as u64 LE][bytes]` per value,
+    /// with NO call to `domain_hash`), over cases spanning every tag and several
     /// boundary-shift pairs.
     #[test]
     fn content_hash_row_is_byte_identical_to_the_pre_extraction_fold() {

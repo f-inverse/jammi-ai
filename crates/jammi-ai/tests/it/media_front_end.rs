@@ -1,4 +1,4 @@
-//! Media front-end parallelization (#421 follow-on): the public
+//! Media front-end parallelization: the public
 //! `arrow_to_images` / `arrow_to_audio` decode loops (serving) and the shared
 //! `decode_*_batch` / `preprocess_*_batch` helpers they and the trainer's
 //! `audio_encoder_input` / `image_encoder_input` both call.
@@ -347,7 +347,7 @@ fn measure_calls<F: FnMut()>(iters: u32, mut call: F) -> CallTimings {
 
 // ─── n = 1 serving-latency measurement (before vs after) ───────────────────
 
-/// The pre-unit sequential per-image write, reproduced here byte-for-byte
+/// A sequential per-image write, reproduced here byte-for-byte
 /// (the parallel writer's per-item math — `image_row` / `preprocess_one_image`
 /// — is the SAME loop body; only the outer loop changed from sequential
 /// `push` to a `par_chunks_mut` write). Used only to produce an honest
@@ -493,15 +493,13 @@ fn n1_image_request_latency_before_vs_after() {
     // A tight 5% bar is a wall-clock, machine-load-sensitive measurement —
     // unsuitable as a hard, always-on assertion in the default suite (flaky
     // under CI contention). It is MEASURED and PRINTED on every run (see
-    // above); the contract's pre-registered bar (the pod's interleaved A/B is
-    // the authoritative ≤5% regression check, over N=100 steps on the real
-    // corpus — this Mac-local n=1 check is a much coarser proxy for it) is
-    // only ASSERTED when explicitly opted into via
-    // `JAMMI_FRONTEND_N1_LATENCY=1`, so a noisy dev machine or CI runner
-    // never reds the default suite on a wall-clock fluke. (This fn never
-    // SKIPS — it always runs and always measures; the env var narrows only
-    // the tight assertion, not reachability, so KO-7's require-gate registry
-    // does not apply here.)
+    // above); the tight bar (a local n=1 check is only a coarse proxy for an
+    // interleaved A/B over N=100 steps on a real corpus) is only ASSERTED
+    // when explicitly opted into via `JAMMI_FRONTEND_N1_LATENCY=1`, so a
+    // noisy dev machine or CI runner never fails the default suite on a
+    // wall-clock fluke. (This fn never SKIPS — it always runs and always
+    // measures; the env var narrows only the tight assertion, not
+    // reachability.)
     //
     // A much LOOSER bar stays ALWAYS-ON, though: n=1 has no parallel work to
     // gain from (exactly one `par_chunks_mut` chunk), so "after" should never

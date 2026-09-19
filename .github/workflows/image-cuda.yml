@@ -32,7 +32,7 @@ permissions:
 
 jobs:
   build:
-    # `github.ref_type != 'tag'` (F1/F3 audit fix, #454 follow-up round 2):
+    # `github.ref_type != 'tag'`:
     # this job `uses:` the LOCAL reusable `_ci-base-image.yml`, whose own
     # `build-and-push` job pushes to GHCR unconditionally -- P6 discovery
     # (`check_gpu_prove_once.py`) therefore tables this job too

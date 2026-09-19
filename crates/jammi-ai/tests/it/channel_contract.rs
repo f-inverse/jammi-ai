@@ -1,9 +1,9 @@
-//! Schema-shape contract between the data-driven channel mechanism
-//! and the legacy provenance output.
+//! Schema-shape contract of the data-driven channel mechanism's provenance
+//! output.
 //!
 //! Locks in the canonical Arrow schema produced when `vector` and
-//! `inference` channels participate, so future refactors that drift the
-//! shape are caught at test time.
+//! `inference` channels participate, so a change that drifts the shape is
+//! caught at test time.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -43,42 +43,13 @@ async fn open_catalog() -> (tempfile::TempDir, Catalog) {
     (dir, catalog)
 }
 
-/// Whether this run opted into golden REGENERATION (`JAMMI_REGENERATE_GOLDENS`
-/// set) — the developer-only escape hatch that rewrites the checked-in golden
-/// and returns before the real byte-identity assertion runs. Unless
-/// `JAMMI_REQUIRE_GOLDEN_ASSERTION` is also set, in which case a regenerate
-/// request is itself a hard failure: CI sets this so an accidental
-/// `JAMMI_REGENERATE_GOLDENS=1` leaking into the CI environment can never
-/// silently take the regenerate-and-skip path instead of actually asserting
-/// against the golden — the same require-gate polarity every other
-/// `JAMMI_REQUIRE_*` skip-guard in this crate uses, applied to a mode flag
-/// instead of a hardware probe.
-// The nested `if`s below are deliberately NOT collapsed with `&&`: KO-7's
-// registry verifier (`ci/scripts/check_kernel_oracles.py::helper_shape_ok`)
-// requires the INNER `if`'s condition to be EXACTLY the `JAMMI_REQUIRE_*`
-// env-read call, with no leading/trailing condition — collapsing this into
-// `if requested && ...is_some()` would fail that shape check.
-#[allow(clippy::collapsible_if)]
-fn regenerate_goldens_requested() -> bool {
-    let requested = std::env::var("JAMMI_REGENERATE_GOLDENS").is_ok();
-    if requested {
-        if std::env::var_os("JAMMI_REQUIRE_GOLDEN_ASSERTION").is_some() {
-            panic!(
-                "JAMMI_REGENERATE_GOLDENS is set but JAMMI_REQUIRE_GOLDEN_ASSERTION forbids the \
-                 regenerate-and-skip path — this run must assert against the checked-in golden, \
-                 never silently rewrite and skip it"
-            );
-        }
-    }
-    requested
-}
-
 /// Canonical merge of `vector` + `inference` channels.
 ///
 /// The output schema is asserted against a checked-in golden so any
 /// drift in field name, dtype, nullability, or ordering surfaces at test
-/// time. To regenerate the golden after an *intentional* shape change,
-/// set `JAMMI_REGENERATE_GOLDENS=1` and re-run this test.
+/// time. After an *intentional* shape change, run this test with
+/// `JAMMI_REGENERATE_GOLDENS=1`: it rewrites the golden and fails, naming the
+/// file to review and commit, so a regeneration can never read as a pass.
 #[tokio::test]
 async fn vector_and_inference_reexpressed_produce_byte_identical_recordbatch() {
     let (_dir, catalog) = open_catalog().await;
@@ -117,10 +88,13 @@ async fn vector_and_inference_reexpressed_produce_byte_identical_recordbatch() {
     let actual = schema_to_canonical_json(&schema);
 
     let golden_path = fixtures_dir().join("golden_provenance_schema.json");
-    if regenerate_goldens_requested() {
+    if std::env::var_os("JAMMI_REGENERATE_GOLDENS").is_some() {
         std::fs::write(&golden_path, &actual).expect("regenerating golden_provenance_schema.json");
-        eprintln!("regenerated golden at {}", golden_path.display());
-        return;
+        panic!(
+            "regenerated {}; review and commit it, then run again without \
+             JAMMI_REGENERATE_GOLDENS",
+            golden_path.display()
+        );
     }
 
     let expected = std::fs::read_to_string(&golden_path).unwrap_or_else(|e| {

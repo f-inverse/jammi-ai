@@ -193,7 +193,7 @@ fn lora_linear_rslora_scaling() {
 /// scaling for the same `(alpha, rank, use_rslora)` triple — both route
 /// through the crate's single `lora_scaling` primitive (see its doc), so a
 /// disagreement here would mean a reload of a saved adapter silently applies
-/// a different scaling than the run that trained it (esc-041).
+/// a different scaling than the run that trained it.
 #[test]
 fn new_and_from_loaded_pin_bit_equal_scaling() {
     let device = cpu();
@@ -420,7 +420,7 @@ fn loading_the_same_adapter_twice_into_one_varmap_is_not_a_collision() {
     );
 }
 
-/// Domain boundary (family D / K2): both constructors must typed-refuse
+/// Domain boundary: both constructors must typed-refuse
 /// `rank == 0` rather than let it reach `alpha / 0`.
 #[test]
 fn rank_zero_is_a_typed_refusal_in_new_and_from_loaded() {

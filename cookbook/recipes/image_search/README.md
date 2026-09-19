@@ -94,8 +94,8 @@ for real numbers.
   is actionable, carrying this architecture's own site vocabulary.
 - The **independently-known improvement number** — tuned retrieval quality
   beating the base by a measured margin — is not this recipe's to claim. It
-  belongs to a real-checkpoint chapter (built from a committed GPU-produced
-  cache; planned under issue #421), which does not exist yet. A recipe running
+  needs a real checkpoint and a committed GPU-produced cache, and no chapter
+  measures it. A recipe running
   a random-weight fixture on a laptop can honestly prove mechanism; it cannot
   prove quality.
 

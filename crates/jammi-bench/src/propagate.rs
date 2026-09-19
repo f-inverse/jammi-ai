@@ -732,7 +732,7 @@ mod tests {
         assert_eq!(tier.digest.first, tier.digest.second);
     }
 
-    /// The teeth, GATE-FAILS direction (RC1: an assertion must be able to fail).
+    /// The teeth, GATE-FAILS direction (an assertion must be able to fail).
     ///
     /// Perturbed propagations — the SAME committed fixture folded through the SAME
     /// real engine path with a regressed propagation *parameter* — must each

@@ -1,117 +1,51 @@
 # Required merge-path clippy lanes — read by `check_lint_surface_closure.py`.
 #
-# The closure half of that gate derives its obligations from `cargo metadata`:
-# a target with a non-empty `required-features` list must have SOME merge-path
-# `cargo clippy -D warnings` lane covering it. That derivation is silent about
-# a crate which declares no such target — `jammi-ai` declares none reaching
-# `cuda`, so deleting its `--features cuda` clippy step from
-# `.github/workflows/ci.yml` leaves the closure half, and every other gate in
-# this repo, green while a whole feature arm stops being linted on the merge
-# path. This registry is the second half: a lane named here MUST exist in the
-# merge-path corpus, whether or not any `required-features` target happens to
-# depend on it. Deleting the step reddens the gate, naming the row.
+# That gate's closure half derives obligations from `cargo metadata`: a target
+# with `required-features` must be covered by some merge-path
+# `cargo clippy -D warnings` lane. It cannot see code gated by a `#[cfg(feature
+# = ...)]` inside a target that needs no feature (a `live-gpu-tests` test in a
+# lib, an `unprivileged-tests` test in `it`). This registry names those
+# surfaces: each row must be matched by a merge-path lane, so deleting the lane
+# reddens the gate naming the row.
 #
 # Format, one lane per line, whitespace-separated:
 #
 #     <crate>  <feature-set>  <target-selection>
 #
-#   crate            a workspace package name; the lane must scope to it
-#                    (`-p <crate>`, or `--workspace` without `--exclude
-#                    <crate>`).
-#   feature-set      comma-separated feature names the lane must activate for
-#                    that crate, resolved through the crate's own `[features]`
-#                    implications (so a lane passing `flash-attn` satisfies a
-#                    `cuda` row when `flash-attn = ["cuda"]`); `-` for "no
-#                    features required". A `!name` entry FORBIDS a feature —
-#                    the lane must leave it off — which is how a narrower lane
-#                    that exists BECAUSE a feature is absent gets a row that
-#                    the wider lane cannot satisfy. `--all-features` is
-#                    expanded to the crate's whole feature set, so it satisfies
-#                    any positive row and fails every negated one.
+#   crate            a workspace package; the lane must scope to it (`-p
+#                    <crate>`, or `--workspace` without `--exclude <crate>`).
+#   feature-set      comma-separated features the lane must activate, resolved
+#                    through the crate's own `[features]` implications; `-` for
+#                    none. `!name` forbids a feature: a surface gated on
+#                    `not(feature = "name")` needs a lane without it.
+#                    `--all-features` satisfies every positive row and fails
+#                    every negated one.
 #   target-selection one of `all-targets`, `tests`, `bins`, `lib`, `examples`,
-#                    `benches` — the target kinds the lane must compile.
-#                    `--all-targets` on the lane satisfies every selection.
+#                    `benches`; `--all-targets` on the lane satisfies any.
 #
-# Only a lane that denies warnings counts (`-- -D warnings` / `--deny
-# warnings`) and only one reachable from a genuinely merge-path-triggered
-# job/step, per `check_execution_surface_reachability.py`'s own trigger and
-# `if:`/`continue-on-error:` honesty. A row satisfied only by `gpu-prove.yml`'s
-# label/dispatch/schedule-triggered lanes is NOT satisfied.
-#
-# A row is credited only by a lane whose HOSTING workflow runs on a PR that
-# touches the row's crate: some `pull_request`-to-main trigger of that
-# workflow must admit `crates/<crate>/**`. A push-to-main-only host
-# (`image-cuda.yml`) and a narrowly `paths:`-filtered one
-# (`pypi-server-cuda.yml`) satisfy nothing here, however merge-path their
-# triggers look.
-#
-# Adding a row is a promise the lane will keep existing; removing one is a
-# deliberate, reviewable narrowing of the lint surface this repo commits to.
-# An empty or missing registry is a FAIL, never a skip.
-#
-# WHAT THIS REGISTRY PROMISES, AND WHAT IT DOES NOT
-#
-# The merge-path corpus holds twelve `cargo clippy ... -D warnings` lanes.
-# `check_lint_surface_closure.py` derives, on every run, which of them are
-# covered by nothing at all: `find_unprotected_lanes` removes each lane in
-# turn from the discovered corpus and re-runs both OTHER closures (`find_
-# gaps` over `cargo metadata`'s own `required-features` targets, and this
-# registry's own `find_missing_required_lanes`) — the identical per-lane
-# sweep this file's own history once did by hand, now automatic and rerun
-# every invocation rather than a one-time snapshot that rots the moment a
-# lane is added, moved, or deleted (#532).
-#
-# Five lanes are the only cover for some `required-features` target, so the
-# `cargo metadata` closure REDs on their loss by itself and needs no row.
-# Five more are rowed below — the three cuda-feature lanes (a cuda lint
-# regression there is invisible until a GPU pod run, off the merge path
-# entirely, the most expensive of the seven to discover) plus `jammi-db`'s
-# `postgres,mysql` lane and `jammi-server`'s `test-hooks` lane: each row
-# states the crate/feature-set/target-selection surface ONLY that lane
-# activates on the merge path, so deleting it un-satisfies the row and
-# `find_missing_required_lanes` REDs.
-#
-# The remaining TWO are not, and cannot be, rowed: `.github/workflows/
-# ci.yml`'s `--workspace --all-targets` lane and its `-p jammi-wire -p
-# jammi-admin -p jammi-client --all-targets` lane both compile `jammi-wire`/
-# `jammi-admin`/`jammi-client` under DEFAULT features with `--all-targets` —
-# genuinely REDUNDANT with each other for closure purposes. Any row the
-# narrower lane would satisfy is, by the same features/selection, ALSO
-# satisfied by the workspace-wide one (and vice versa): deleting either
-# ALONE never un-satisfies a row the other still holds up. `find_unprotected_
-# lanes` is the only mechanism that can name this pair at all — it reports
-# BOTH of them, every run, as the standing (not merely hypothetical) gap
-# they are, precisely because a row cannot close it.
+# Only a lane that denies warnings counts, and only in a job that runs on every
+# pull request touching the row's crate. An empty or missing registry is a FAIL.
 
-# `jammi-ai`'s `cuda` arm: `#[cfg(feature = "cuda")]` items in `src/` and the
-# `#[test] #[cfg(feature = "cuda")]` fns in its `cfg(test)` half (e.g.
-# `crates/jammi-ai/src/fine_tune/adamw.rs`'s device-mismatch tests), which no
-# other merge-path lane compiles at all. Lives in `ci.yml`'s
-# `flash-attn-compile` job (the nvcc lane).
-jammi-ai        cuda             tests
+# Host-resource test features (see `crates/jammi-test-resources`).
+jammi-ai        live-gpu-tests,live-gpu-gang-tests,live-gpu-cluster-tests  all-targets
+jammi-ai        unprivileged-tests                      all-targets
+jammi-db        unprivileged-tests,live-postgres-tests  all-targets
+jammi-db        live-broker-tests,live-s3-tests,live-gcs-tests,live-azure-tests,live-r2-tests  all-targets
+jammi-server    unprivileged-tests,live-postgres-tests  all-targets
+jammi-server    live-gpu-tests                          tests
+jammi-ballista  live-postgres-tests                     tests
+jammi-kernels   live-gpu-tests,flash-attn               all-targets
+jammi-kernels   live-metal-tests                        lib
+jammi-lora      live-gpu-tests                          all-targets
+jammi-bench     live-gpu-tests,flash-attn               all-targets
 
-# `jammi-encoders`' two cuda arms. They differ by more than cost: the
-# `cuda`-only lane is the ONLY one that compiles the
-# `#[cfg(all(feature = "cuda", not(feature = "flash-attn")))]` meta-test, which
-# the `cuda,flash-attn` lane excludes by that test's own cfg. Hence the
-# negation: written as a bare `cuda` row it would be satisfied by the
-# `cuda,flash-attn` lane and would stay green on the very deletion it exists to
-# catch.
-jammi-encoders  cuda,!flash-attn  tests
-jammi-encoders  cuda,flash-attn   tests
+# jammi-encoders gates code on both `flash-attn` and `not(feature =
+# "flash-attn")`, so it needs a lane with and a lane without it.
+jammi-encoders  live-gpu-tests,!flash-attn              all-targets
+jammi-encoders  live-flash-oracle-tests                 all-targets
 
-# `jammi-db`'s `postgres`/`mysql` provider arms: `#[cfg(feature =
-# "postgres")]`/`#[cfg(feature = "mysql")]` code (the SQLx driver adapters
-# and their own `cfg(test)` halves) that no other merge-path lane activates
-# at all -- the workspace-wide default lane (`ci.yml`'s `--workspace
-# --all-targets`) never turns either feature on. Lives in `ci.yml`'s own
-# `Clippy jammi-db postgres,mysql` step (#532).
-jammi-db        postgres,mysql    all-targets
+# The SQLx source-provider adapters.
+jammi-db        postgres,mysql                          all-targets
 
-# `jammi-server`'s `test-hooks` arm: `#[cfg(feature = "test-hooks")]` test
-# scaffolding no other merge-path lane compiles (the workspace-wide default
-# lane never turns it on, and jammi-server's own `--features live-gpu-
-# tests,live-distributed-tests` lane is a DIFFERENT feature combination that
-# does not imply it). Lives in `ci.yml`'s `Clippy jammi-server test-hooks`
-# step (#532).
-jammi-server    test-hooks        tests
+# Test scaffolding compiled only under `test-hooks`.
+jammi-server    test-hooks                              tests

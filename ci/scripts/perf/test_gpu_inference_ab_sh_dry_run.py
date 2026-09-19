@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""Hermetic `--dry-run` smoke test for `gpu_inference_ab.sh` itself (round-1
-adversarial audit advisory): before this test, the shell PRODUCER had ZERO
-automated execution anywhere in this repo's CI — only `gpu_inference_ab.py`
-(the Python merge/table module it drives) and `gpu_inference_ab_git.sh`
-(the git-shape library it sources) had wired test suites; the SHELL SCRIPT
-ITSELF, its arg/env parsing, its `run_cmd` dry-run wrapper, and its own
-control flow through the clone/build/leg/merge pipeline, ran in CI exactly
-zero times. `ci.yml`'s own "zero-execution is RED, not a skip" doctrine
-(the same reasoning `test_ab_merge.py`/`compare_grad_oracle`'s own suites
-were wired in to close) applies here too.
+"""Hermetic `--dry-run` smoke test for `gpu_inference_ab.sh` itself: the
+suites for `gpu_inference_ab.py` (the Python merge/table module it drives)
+and `gpu_inference_ab_git.sh` (the git-shape library it sources) never
+execute the SHELL SCRIPT ITSELF — its arg/env parsing, its `run_cmd`
+dry-run wrapper, and its own control flow through the
+clone/build/leg/merge pipeline. This suite gives it CI execution
+(`ci.yml`'s "zero-execution is RED, not a skip" rule).
 
 `GPU_INFERENCE_AB_DRY_RUN=1` makes the whole pipeline safe to execute
 hermetically: no real `git clone`, no `cargo build`, no `nvidia-smi`, no
@@ -34,11 +31,11 @@ PERF_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(PERF_DIR, "gpu_inference_ab.sh")
 
 sys.path.insert(0, PERF_DIR)
-import gpu_inference_ab  # noqa: E402 -- round-3 adversarial audit B3: the producer-to-comparator round trip needs the REAL parser, never a re-implementation.
+import gpu_inference_ab  # noqa: E402 -- the producer-to-comparator round trip needs the REAL parser, never a re-implementation.
 
 
 def run_dry(out_dir, work_dir, extra_env=None):
-    """`work_dir` is REQUIRED (round-2 adversarial audit advisory): every
+    """`work_dir` is REQUIRED: every
     caller passes an explicit `GPU_INFERENCE_AB_WORK_DIR` (a tempdir the
     caller owns and cleans up), never the script's own default (a sibling
     directory of the checkout, `$(dirname "$REPO_ROOT")/gpu-perf-ab-<ts>`)
@@ -62,20 +59,18 @@ class DryRunSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as out_dir, tempfile.TemporaryDirectory() as work_dir:
             result = run_dry(out_dir, work_dir)
 
-            # round-3 adversarial audit B2 (the auditor's own reproduction):
-            # every real leg is a `DRY_RUN`-outcome stub under
+            # Every real leg is a `DRY_RUN`-outcome stub under
             # GPU_INFERENCE_AB_DRY_RUN=1, NEVER `FAIL` -- "nothing ran"
             # carries no runtime signal about a PR binary at all, so the
             # merge status must be the NEUTRAL INCOMPLETE/75, never the
-            # PR-blame INVALID/1 an earlier (round-2) version of this
-            # routing incorrectly produced. Proven here against the REAL
-            # process exit code, not assumed.
+            # PR-blame INVALID/1. Proven here against the REAL process exit
+            # code, not assumed.
             self.assertEqual(
                 result.returncode,
                 75,
                 f"dry-run's own four stub legs are never 'OK' NOR 'FAIL' (outcome is 'DRY_RUN' -- "
                 f"nothing ran), so the merge status must be the neutral INCOMPLETE/exit 75 "
-                f"deterministically (round-3 adversarial audit B2 correction)\n"
+                f"deterministically\n"
                 f"stdout={result.stdout}\nstderr={result.stderr}",
             )
 
@@ -95,7 +90,7 @@ class DryRunSmokeTests(unittest.TestCase):
             self.assertEqual(sorted(report["missing_legs"]), ["a1", "a2", "b1", "b2"])
             self.assertEqual(report["mode"], "dry-run")
             self.assertIn("nothing ran", report["incomplete_reason"])
-            # issue #335's final unit: GPU_INFERENCE_AB_ENFORCE defaults
+            # GPU_INFERENCE_AB_ENFORCE defaults
             # unset/0 -- the producer must still write a well-formed
             # "enforce" marker (round-trip through the real
             # gpu_inference_ab.py::load_enforce, not re-implemented here).
@@ -124,7 +119,7 @@ class DryRunSmokeTests(unittest.TestCase):
             self.assertEqual(report["status"], "INCOMPLETE", "enforcement never fires on a non-GREEN status")
 
     def test_aa_null_and_enforce_together_hard_fail_exit_2_before_anything_runs(self):
-        """round-4 delta-audit F4: `GPU_INFERENCE_AB_AA_NULL=1` together
+        """`GPU_INFERENCE_AB_AA_NULL=1` together
         with `GPU_INFERENCE_AB_ENFORCE=1` must refuse at the PRODUCER's own
         edge -- exit 2 (a usage error), BEFORE `$RAW_DIR` is even created
         (no `mode`/`enforce`/`pod_id` marker, no leg trace at all) -- strictly
@@ -147,7 +142,7 @@ class DryRunSmokeTests(unittest.TestCase):
             )
 
     def test_dry_run_writes_a_pod_id_marker_the_comparator_reads_back(self):
-        """round-4 delta-audit F3(d): the producer must write `$RAW_DIR/pod_id`
+        """The producer must write `$RAW_DIR/pod_id`
         (`${RUNPOD_POD_ID:-$(hostname)}`) even on a dry run -- a non-empty
         value round-trips through the REAL `gpu_inference_ab.py::load_pod_id`,
         never re-implemented here. `RUNPOD_POD_ID` is unset in this hermetic
@@ -195,7 +190,7 @@ class DryRunSmokeTests(unittest.TestCase):
             self.assertNotIn("nvidia-smi", result.stderr)
 
     def test_dry_run_prints_the_four_legs_in_the_a1_b1_b2_a2_order(self):
-        """round-2 adversarial audit F3: the printed leg-trace sequence
+        """The printed leg-trace sequence
         (`--- a1: `, `--- b1: `, `--- b2: `, `--- a2: `) must appear in
         EXACTLY that order in stdout -- the visible, human-readable half of
         the order binding (the MACHINE-CHECKED half lives in
@@ -217,7 +212,7 @@ class DryRunSmokeTests(unittest.TestCase):
             )
 
     def test_the_real_started_at_files_round_trip_through_the_comparators_own_parser(self):
-        """round-3 adversarial audit B3: the producer-to-comparator round
+        """The producer-to-comparator round
         trip, pinned WITHOUT a GPU -- reads the FOUR REAL `.started_at`
         files `gpu_inference_ab.sh`'s own `run_leg` wrote (real `date
         +%s%N` output, not a Python-constructed fixture), parses EACH one

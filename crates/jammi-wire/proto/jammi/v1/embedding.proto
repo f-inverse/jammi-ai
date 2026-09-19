@@ -7,7 +7,7 @@ import "jammi/v1/inference.proto";
 // EmbeddingService — the wire surface for the engine's embedding compute
 // verbs. These are imperative session methods, not SQL queries, so they live
 // as typed gRPC RPCs alongside InferenceService / TriggerService rather than on
-// the Flight SQL surface (which carries query/result only, per ADR-01 §3.2).
+// the Flight SQL surface (which carries query/result only).
 //
 // The surface is modality-agnostic: one GenerateEmbeddings / EncodeQuery pair
 // keyed by a `Modality` selects the text, image, or audio tower, rather than a

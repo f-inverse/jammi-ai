@@ -26,13 +26,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import compare_grad_oracle as cgo  # noqa: E402
 
 # Every `make_report()` call gets a UNIQUE default `tool` value (a monotonic
-# counter, not a fixed literal) — the class-level fix for "compare a.json
-# a.json passes" (advisory (6), this round's audit): TWO SEPARATE calls
-# (the overwhelmingly common shape below — one for `report_a`, one for
-# `report_b`) now differ by construction, so `_same_producer_violation`'s
-# new same-tool check does NOT spuriously fire on the ~30 existing
-# gradient-math tests in this file, none of which were EVER testing
-# same-producer-ness in the first place. The one test that IS a genuine
+# counter, not a fixed literal): TWO SEPARATE calls (the overwhelmingly
+# common shape below — one for `report_a`, one for `report_b`) differ by
+# construction, so `_same_producer_violation`'s same-tool check does NOT
+# spuriously fire on the gradient-math tests in this file, none of which
+# test same-producer-ness. The one test that IS a genuine
 # same-producer/self-consistency check
 # (`test_compare_reports_identical_dumps_passes_with_cosine_one`, which
 # passes the literal SAME dict object twice) opts in explicitly via
@@ -45,8 +43,8 @@ def make_report(loss, gradients, **overrides):
 
     Fills in a MATCHING, premise-satisfying run-identity/weight-provenance
     envelope by default (`lora_weights_in` set, standard seed/batch/etc.,
-    `batch_token_id_sums` present, every `RUN_IDENTITY_FIELDS` entry) — F3's
-    fix made `compare_reports` check all of these, so a test that only
+    `batch_token_id_sums` present, every `RUN_IDENTITY_FIELDS` entry) —
+    `compare_reports` checks all of these, so a test that only
     cares about the gradient-DIRECTION math (the vast majority below) must
     not ALSO have to hand-build a full premise or it would spuriously fail
     on a premise violation it never meant to test. Pass e.g.
@@ -112,10 +110,10 @@ class DerivationTests(unittest.TestCase):
         self.assertGreaterEqual(deep, -1.0)
 
     def test_derive_cosine_floor_is_non_positive_at_modernbert_large_defaults(self):
-        """F2 REPRODUCTION, pinned as a numeric fact: `main()`'s own
+        """Pinned as a numeric fact: `main()`'s own
         DEFAULT arguments (`--num-layers 28 --hidden-size 1024`) derive a
         floor `~-0.4018` — cited exactly by `derive_cosine_floor`'s own
-        docstring correction. `eps = sqrt(28*1024) * 2**-8 ~= 0.6614`,
+        docstring. `eps = sqrt(28*1024) * 2**-8 ~= 0.6614`,
         `3*eps ~= 1.9843` radians, `cos(1.9843) ~= -0.4018`. A floor this
         far below zero is cleared by an angle up to ~113.7 degrees,
         including an EXACT 90-degree rotation (cosine 0.0) — this is the
@@ -218,7 +216,7 @@ class ComparatorMathTestsMixin:
         self.assertFalse(result["passed"], "a name mismatch must fail even if nothing matched is compared")
 
     def test_compare_reports_gross_defect_fails_the_derived_floor(self):
-        """The lead's own named worst case: a gradient magnitude 3x off on
+        """A named worst case: a gradient magnitude 3x off on
         a shared tensor. This is NOT isotropic bf16 rounding noise -- it
         is a systematic scale error a gradient-DIRECTION oracle catches
         even though every element still points the same SIGN (a naive
@@ -286,7 +284,7 @@ class ComparatorMathTestsMixin:
         """
         floor = cgo.derive_cosine_floor(num_layers=28, hidden_size=1024)
         self.assertLess(floor, 0.0)
-        self.assertGreater(floor, -1.0, "the improved formula must not saturate at -1.0 the way the naive linear-chaining formula did")
+        self.assertGreater(floor, -1.0, "the root-sum-square formula must not saturate at -1.0 the way a linear-chaining formula does")
 
         base = [0.10, -0.20, 0.05, 0.30, -0.15, 0.08, -0.02, 0.22]
         drifted = [v * (3.0 if i % 2 == 0 else 1.0) for i, v in enumerate(base)]
@@ -295,15 +293,14 @@ class ComparatorMathTestsMixin:
 
 
 class PremiseAndWeightChecks(unittest.TestCase):
-    """F3 REGRESSION (audit finding on PR #372): `compare_reports` used to
-    read ONLY `report[...]['gradients'][name]['grad']` — never `weight`,
-    never the run-identity fields, never `batch_token_id_sums` — so two
+    """`compare_reports` reads more than `report[...]['gradients'][name]['grad']`:
+    `weight`, the run-identity fields, and `batch_token_id_sums` too, so two
     dumps taken at DIFFERENT weights (or different batches, or different
-    configs) could still print `PASS`. Every test here constructs exactly
-    ONE premise violation (all else matching) and asserts `passed is
-    False` — the REPRODUCTION from the audit (`weight=[0,0,0,0]` vs
-    `weight=[9,9,9,9]`, no `--lora-weights-in` recorded, identical
-    gradients) is `test_reproduction_zero_vs_nine_weight_with_matching_gradients_is_not_a_pass`
+    configs) never print `PASS`. Every test here constructs exactly ONE
+    premise violation (all else matching) and asserts `passed is False`. The
+    `weight=[0,0,0,0]` vs `weight=[9,9,9,9]` case with no `--lora-weights-in`
+    recorded and identical gradients is
+    `test_reproduction_zero_vs_nine_weight_with_matching_gradients_is_not_a_pass`
     below, driven at `main()` (the real entry point), not `compare_reports`
     called with hand-built literals in isolation.
     """
@@ -319,26 +316,23 @@ class PremiseAndWeightChecks(unittest.TestCase):
         self.assertTrue(result["weight_mismatches"], "the weight mismatch must be reported, not silently absorbed")
 
     def test_weight_tolerance_is_ulp_relative_not_a_fixed_absolute_constant(self):
-        """Advisory (ii), round-2 audit fix on PR #372: the OLD bound was a
-        fixed `1e-4` absolute constant -- loose enough to ALSO pass a
-        SMALLER real content mismatch than the audit's own `0 vs 9`
-        reproduction. This pins the mechanism directly: a `5e-5` per-element
-        delta at magnitude ~1.0 is BELOW the old fixed `1e-4` bound (the old
-        code would have silently PASSED this as "identical weights") but is
-        ~400x the new f32-ULP-relative bound (`WEIGHT_MATCH_ULPS *
-        F32_EPSILON ~= 9.5e-7` at this scale) and must FAIL under the fix.
-        The lead's own measured real-world figure, `1.86e-9`, is the OTHER
-        half of the same lattice cell below: it must still PASS.
+        """A fixed `1e-4` absolute bound would pass real content mismatches
+        smaller than itself. This pins the mechanism directly: a `5e-5`
+        per-element delta at magnitude ~1.0 is BELOW a fixed `1e-4` bound
+        but is ~50x the f32-ULP-relative bound (`WEIGHT_MATCH_ULPS *
+        F32_EPSILON ~= 9.5e-7` at this scale) and must FAIL. The measured
+        real-world figure, `1.86e-9`, is the OTHER half of the same lattice
+        cell below: it must still PASS.
         """
         old_fixed_bound_would_have_passed_this = 5e-5
         self.assertLess(
             old_fixed_bound_would_have_passed_this, 1e-4,
-            "fixture assumption: this delta must be SMALLER than the retired fixed bound",
+            "fixture assumption: this delta must be SMALLER than a fixed 1e-4 bound",
         )
         new_ulp_bound_at_this_scale = cgo.WEIGHT_MATCH_ULPS * cgo.F32_EPSILON  # scale ~1.0
         self.assertGreater(
             old_fixed_bound_would_have_passed_this, new_ulp_bound_at_this_scale,
-            "fixture assumption: this delta must be LARGER than the new ULP-relative bound",
+            "fixture assumption: this delta must be LARGER than the ULP-relative bound",
         )
 
         report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
@@ -346,16 +340,15 @@ class PremiseAndWeightChecks(unittest.TestCase):
         report_a["gradients"]["t"]["weight"] = [1.0, 1.0, 1.0]
         report_b["gradients"]["t"]["weight"] = [1.0 + old_fixed_bound_would_have_passed_this, 1.0, 1.0]
         result = cgo.compare_reports(report_a, report_b, cosine_floor=0.9)
-        self.assertFalse(result["passed"], "a real, smaller-than-1e-4 weight delta must now FAIL")
+        self.assertFalse(result["passed"], "a real, smaller-than-1e-4 weight delta must FAIL")
         self.assertTrue(result["weight_mismatches"])
 
     def test_weight_tolerance_still_passes_the_leads_own_measured_real_run_delta(self):
-        """The other half of the same lattice cell: `1.86e-9` (the lead's
-        OWN measured `max|w_jammi - w_torch|` over 224 tensors on a real
-        A100 run, see `torch_grad_oracle.py`'s PROVENANCE banner) must still
-        clear the new, TIGHTER bound -- the fix must not have overshot into
-        false-failing the exact real measurement that motivated keeping a
-        bound at all.
+        """The other half of the same lattice cell: `1.86e-9` (the measured
+        `max|w_jammi - w_torch|` over 224 tensors on a real A100 run, see
+        `torch_grad_oracle.py`'s PROVENANCE banner) must clear the
+        ULP-relative bound -- the bound must not false-fail a real
+        bit-identical interchange.
         """
         report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
         report_b = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
@@ -398,12 +391,10 @@ class PremiseAndWeightChecks(unittest.TestCase):
             )
 
     def test_run_identity_field_missing_from_both_dumps_fails(self):
-        """ITEM 2 REPRODUCTION: `_premise_violations`'s per-field loop used
-        to `report.get(field)` on BOTH sides, then compare — a field absent
-        from BOTH dumps compared `None == None` and silently PASSED. This is
-        the class-level closure, driven over EVERY `RUN_IDENTITY_FIELDS`
-        entry (not only `batch_token_id_sums`, which already had a
-        correctly-`or`-gated presence check before this round).
+        """A field absent from BOTH dumps must never compare `None == None`
+        and silently PASS (as `report.get(field)` on both sides would).
+        Driven over EVERY `RUN_IDENTITY_FIELDS` entry (`batch_token_id_sums`
+        has its own `or`-gated presence check).
         """
         for field in cgo.RUN_IDENTITY_FIELDS:
             report_a = make_report(0.3, {"t": [1.0, 2.0]})
@@ -421,9 +412,8 @@ class PremiseAndWeightChecks(unittest.TestCase):
             )
 
     def test_run_identity_field_missing_from_one_dump_fails(self):
-        """The one-sided companion of the test above -- was ALREADY caught
-        correctly before this round (`None != <value>`), pinned here per
-        field so the whole `RUN_IDENTITY_FIELDS` tuple has both halves of
+        """The one-sided companion of the test above (`None != <value>`),
+        pinned here per field so the whole `RUN_IDENTITY_FIELDS` tuple has both halves of
         the presence lattice covered, not just the both-missing half.
         """
         for field in cgo.RUN_IDENTITY_FIELDS:
@@ -435,11 +425,10 @@ class PremiseAndWeightChecks(unittest.TestCase):
             self.assertTrue(any(field in v for v in result["premise_violations"]))
 
     def test_run_identity_field_present_but_null_on_both_sides_fails(self):
-        """ROUND-4 AUDIT REPRODUCTION: `field in report` alone treats
-        `{"lora_alpha": null}` as PRESENT -- the equality check then compares
-        `None == None` and silently PASSES, exactly as the both-MISSING case
-        used to before this round's earlier fix (the same class, one
-        presence check deep). REACHABLE: `serde_json` serializes a NaN/inf
+        """`field in report` alone treats `{"lora_alpha": null}` as PRESENT
+        -- the equality check would then compare `None == None` and silently
+        PASS, the same class as the both-MISSING case one presence check
+        deep. REACHABLE: `serde_json` serializes a NaN/inf
         `f64` as JSON `null` (JSON has no NaN/Infinity token), so a NaN
         `lora_alpha` on jammi's side emits precisely this shape -- not a
         contrived fixture.
@@ -484,8 +473,8 @@ class PremiseAndWeightChecks(unittest.TestCase):
     def test_matching_premise_and_matching_weight_passes(self):
         """Positive control: the premise/weight checks above must not
         false-fail a genuinely matching pair — otherwise every test in
-        `ComparatorMathTestsMixin` above (which now also exercises this
-        code path via the updated `make_report` default) would be a false
+        `ComparatorMathTestsMixin` above (which also exercises this code
+        path via the `make_report` default) would be a false
         negative waiting to happen.
         """
         report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
@@ -496,11 +485,10 @@ class PremiseAndWeightChecks(unittest.TestCase):
         self.assertEqual(result["premise_violations"], [])
 
     def test_loss_relative_diff_is_honestly_nan_on_a_nonfinite_loss_never_a_lucky_max(self):
-        """Advisory, round-4 audit fold-in on PR #372: `loss_relative_diff`
-        used `max(abs(loss_a), abs(loss_b), NORM_FLOOR)` -- the same
-        unreliable-with-NaN reduction `_weight_max_violation` was fixed for
-        this round. This field is informational only (never gates
-        `passed`), so the fix is honesty: a nonfinite loss reports
+        """`max(abs(loss_a), abs(loss_b), NORM_FLOOR)` is the same
+        unreliable-with-NaN reduction `_weight_max_violation` guards
+        against. This field is informational only (never gates `passed`),
+        so the contract is honesty: a nonfinite loss reports
         `loss_relative_diff` as `nan`, never a value that happened to fall
         out of a NaN-blind `max()`.
         """
@@ -510,13 +498,11 @@ class PremiseAndWeightChecks(unittest.TestCase):
         self.assertTrue(math.isnan(result["loss_relative_diff"]))
 
     def test_weight_nan_on_one_side_fails_never_reads_as_max_abs_delta_zero(self):
-        """ITEM 3 REPRODUCTION (the auditor's own reproduction, reproduced
-        here as a RED->GREEN test): a NaN weight element on ONE side used to
-        make `delta > tol` compare `False` (NaN comparisons are always
-        `False` in IEEE-754 ordering), so `_weight_max_violation` counted it
-        as "not bad" and `max_delta` could silently read `0.0` via a naive
-        `max(0.0, nan)` reduction — PASS, exit 0, max_abs_delta=0.0. Must now
-        FAIL, and the weight_mismatches entry must name the nonfinite cause
+        """A NaN weight element on ONE side makes `delta > tol` compare
+        `False` (NaN comparisons are always `False` in IEEE-754 ordering), so
+        a tolerance check alone would count it as "not bad" and `max_delta`
+        could silently read `0.0` via a naive `max(0.0, nan)` reduction —
+        PASS, exit 0, max_abs_delta=0.0. Must FAIL, and the weight_mismatches entry must name the nonfinite cause
         explicitly, not report a numeric max_abs_delta at all.
         """
         report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
@@ -576,16 +562,15 @@ class PremiseAndWeightChecks(unittest.TestCase):
 
 
 class BackboneDtypeSpellingNormalizationTests(unittest.TestCase):
-    """B1 REGRESSION (audit finding on PR #372, round 2): jammi's
-    `grad_oracle.rs` has always emitted `backbone_dtype: "f32"`;
-    `torch_grad_oracle.py`, before this fix, emitted torch's bare CLI-flag
-    spelling `"fp32"` straight through — so EVERY jammi-f32-vs-torch-f32
-    comparison (including this oracle's own near-perfect control) was
-    UNRUNNABLE, refused on a spurious SPELLING mismatch despite both sides
-    having run at the identical, actual precision. See
+    """jammi's `grad_oracle.rs` emits `backbone_dtype: "f32"`; torch's bare
+    CLI-flag spelling is `"fp32"`. Without normalization EVERY
+    jammi-f32-vs-torch-f32 comparison against a dump carrying `"fp32"`
+    (including this oracle's own near-perfect control) would be refused on a
+    spurious SPELLING mismatch despite both sides having run at the
+    identical, actual precision. See
     `test_grad_oracle_cross_producer_parity.py` (a SEPARATE file, requires a
-    real cargo build + a real torch venv) for the version of this same
-    finding driven against the REAL emitters, not the fixture dicts below.
+    real cargo build + a real torch venv) for the version driven against the
+    REAL emitters, not the fixture dicts below.
     """
 
     def test_normalize_backbone_dtype_maps_the_one_known_legacy_spelling(self):
@@ -599,10 +584,10 @@ class BackboneDtypeSpellingNormalizationTests(unittest.TestCase):
         self.assertIsNone(cgo.normalize_backbone_dtype(None))
 
     def test_f32_vs_legacy_fp32_spelling_is_not_a_premise_violation(self):
-        """THE B1 REPRODUCTION, driven at `compare_reports`: jammi's `f32`
-        against a LEGACY torch dump's `fp32` (same precision, different
-        spelling) must NOT be flagged — this is the exact scenario that made
-        this oracle's own near-perfect f32-vs-f32 control unrunnable.
+        """Driven at `compare_reports`: jammi's `f32` against a torch dump's
+        `fp32` (same precision, different spelling) must NOT be flagged —
+        otherwise this oracle's own near-perfect f32-vs-f32 control is
+        unrunnable.
         """
         report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0]}, backbone_dtype="f32")
         report_b = make_report(0.3, {"t": [1.0, 2.0, 3.0]}, backbone_dtype="fp32")
@@ -624,10 +609,8 @@ class BackboneDtypeSpellingNormalizationTests(unittest.TestCase):
 
 
 class RunIdentityFieldCanonicalizationLattice(unittest.TestCase):
-    """CLASS-LEVEL closure of the round-2 `backbone_dtype`-only special case
-    (the old `if field == "backbone_dtype":` branch in `_premise_violations`,
-    whose own inline comment said every OTHER `RUN_IDENTITY_FIELDS` entry
-    "is compared as-is"). This class drives `compare_reports` (never a
+    """Every `RUN_IDENTITY_FIELDS` entry goes through the SAME
+    canonicalizer dispatch, never a per-field special case. This class drives `compare_reports` (never a
     helper called with bespoke literals) once PER FIELD in
     `cgo.RUN_IDENTITY_FIELDS`, with two cells per field where a
     representational gap between the two INDEPENDENT producers
@@ -644,13 +627,11 @@ class RunIdentityFieldCanonicalizationLattice(unittest.TestCase):
       already pins for `backbone_dtype` alone).
 
     `target_modules`'s reordered-but-same-set cell
-    (`test_target_modules_reordered_same_set_is_not_a_violation`) is the
-    LIVE INSTANCE this round's dispatch reproduced directly (RED before
-    `normalize_target_modules` is wired into `_premise_violations` via
-    `canonicalize_identity_field`, GREEN after -- see that function's own
-    doc for why a per-field DISPATCH TABLE, not a second inline
-    `if field == ...` special case, is what actually closes the class
-    rather than moving the point fix one field over).
+    (`test_target_modules_reordered_same_set_is_not_a_violation`) depends on
+    `normalize_target_modules` being wired into `_premise_violations` via
+    `canonicalize_identity_field` -- see that function's own doc for why a
+    per-field DISPATCH TABLE, not an inline `if field == ...` special case,
+    covers the whole class of representational gaps.
 
     `seed`/`batch`/`seq`/`lora_rank`/`batched_forward` have NO known
     representational gap to canonicalize away: `grad_oracle.rs`'s
@@ -667,9 +648,9 @@ class RunIdentityFieldCanonicalizationLattice(unittest.TestCase):
     `backbone_dtype`, whose CLI-flag spelling genuinely differs between the
     two stacks' argument vocabularies, or `target_modules`, whose ORDER is
     genuinely uncontrolled). This class still tests these five fields two
-    ways: (1) a MATCHING pair passes (the positive control that this
-    round's changes have not accidentally penalized a correctly-configured
-    comparison), and (2) a fabricated cross-TYPE variant (e.g. a
+    ways: (1) a MATCHING pair passes (the positive control that the
+    canonicalization does not penalize a correctly-configured comparison),
+    and (2) a fabricated cross-TYPE variant (e.g. a
     stringified `seed`) -- which NEITHER real producer ever emits, but
     which this comparator must still correctly REJECT as a genuine premise
     violation rather than silently coerce; registering a canonicalizer for
@@ -685,7 +666,7 @@ class RunIdentityFieldCanonicalizationLattice(unittest.TestCase):
     # ---- target_modules ---------------------------------------------------
 
     def test_target_modules_reordered_same_set_is_not_a_violation(self):
-        """THE REPRODUCTION this round closes: two dumps whose
+        """Two dumps whose
         `target_modules` name the identical SET (`{"Wqkv", "Wo", "Wi"}`) in
         a different order must not be flagged -- order is not a
         semantically meaningful part of jammi's OWN consumer of this list
@@ -753,7 +734,7 @@ class RunIdentityFieldCanonicalizationLattice(unittest.TestCase):
     # ---- seed / batch / seq / lora_rank / batched_forward ------------------
     # No known cross-producer representational gap (see this class's own
     # doc) -- these five fields still get a matching-pair positive control
-    # and a fabricated cross-type negative control each, so an audit can
+    # and a fabricated cross-type negative control each, so a reviewer can
     # verify "safe as-is" by RUNNING the claim, not by reading a comment.
 
     def test_matching_int_and_bool_identity_fields_are_not_violations(self):
@@ -785,7 +766,7 @@ class RunIdentityFieldCanonicalizationLattice(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertTrue(any("batched_forward" in v for v in result["premise_violations"]))
 
-    # ---- lora_alpha (promoted from advisory-only to identity this round) --
+    # ---- lora_alpha ---------------------------------------------------------
 
     def test_lora_alpha_matching_is_not_a_violation(self):
         result = self._result()  # no overrides -- matches by construction
@@ -794,10 +775,9 @@ class RunIdentityFieldCanonicalizationLattice(unittest.TestCase):
         )
 
     def test_lora_alpha_genuinely_different_value_is_still_a_violation(self):
-        """Advisory (6) closure: `lora_alpha` used to be EXCLUDED from
-        `RUN_IDENTITY_FIELDS` on the theory that `max_abs_delta_over_max_signal`
-        "already surfaces" a mismatch -- that field never gates `passed` (see
-        `compare_tensor`'s own doc), so it gated NOTHING. Now identity.
+        """`lora_alpha` is identity: `max_abs_delta_over_max_signal` would
+        surface a mismatch as a magnitude difference, but that field never
+        gates `passed` (see `compare_tensor`'s own doc).
         """
         result = self._result(lora_alpha=8.0)
         self.assertFalse(result["passed"])
@@ -824,19 +804,15 @@ class RunIdentityFieldCanonicalizationLattice(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertTrue(any("checkpoint_weights_size_bytes" in v for v in result["premise_violations"]))
 
-    # ---- completeness meta-test (item 5 of this round's audit) ------------
+    # ---- completeness meta-test ---------------------------------------------
 
     def test_every_run_identity_field_has_a_lattice_cell(self):
-        """CLASS-LEVEL closure of the round-2 hard-coded-field-name gap
-        (this class previously named fields directly in its own methods,
-        disconnected from `cgo.RUN_IDENTITY_FIELDS`): this test iterates
+        """This test iterates
         `cgo.RUN_IDENTITY_FIELDS` (the single source of truth — see that
         tuple's own doc) and fails LOUDLY if a field has been added there
         without a corresponding entry in `_RUN_IDENTITY_FIELD_LATTICE_COVERAGE`
-        below — a NEW identity field that ships with zero lattice coverage
-        is exactly the shape of gap this round's audit named (the round-2
-        fix's `backbone_dtype`-only special case looked complete but
-        silently had none for every other field).
+        below — an identity field that ships with zero lattice coverage
+        looks complete while silently testing nothing.
         """
         missing = [f for f in cgo.RUN_IDENTITY_FIELDS if f not in _RUN_IDENTITY_FIELD_LATTICE_COVERAGE]
         self.assertEqual(
@@ -870,14 +846,12 @@ _RUN_IDENTITY_FIELD_LATTICE_COVERAGE = frozenset({
 
 
 class PerTensorGatingLattice(unittest.TestCase):
-    """B2 REGRESSION (audit finding on PR #372, round 2): `passed` used to
-    consult ONLY the overall concatenated cosine — measured, jammi could
-    zero 55 of 112 real `lora_b` tensors and still PASS at floor 0.7
-    (overall 0.994, diluted by the other 57 agreeing tensors). One test per
-    lattice cell named in the audit's own dispatch; every cell drives
-    `tensor_clears_floor` AND, where noted, the full `compare_reports`
-    entry point — never only the low-level helper in isolation for the
-    cells that are the actual audit-named reproduction.
+    """`passed` consults every matched tensor, not ONLY the overall
+    concatenated cosine — otherwise a dump zeroing 55 of 112 real `lora_b`
+    tensors still PASSes at floor 0.7 (overall 0.994, diluted by the other
+    57 agreeing tensors). One test per lattice cell of `tensor_clears_floor`;
+    where noted, a cell also drives the full `compare_reports` entry point —
+    never only the low-level helper for the dilution case itself.
     """
 
     FLOOR = 0.7
@@ -925,8 +899,8 @@ class PerTensorGatingLattice(unittest.TestCase):
         (an all-zero concatenated vector), which can never clear a floor
         that must itself be `> 0.0` (this comparator's own domain, see
         `floor_domain_violation`), so this already fails via the overall
-        check alone -- pinned here explicitly per the audit's own named
-        lattice cell, not left as an accidental consequence.
+        check alone -- pinned here explicitly as its own lattice cell, not
+        left as an accidental consequence.
         """
         report_a = make_report(0.3, {"a": [0.0, 0.0], "b": [0.0, 0.0, 0.0]})
         report_b = make_report(0.3, {"a": [0.0, 0.0], "b": [0.0, 0.0, 0.0]})
@@ -936,10 +910,9 @@ class PerTensorGatingLattice(unittest.TestCase):
         self.assertFalse(result["passed"], "all-vacuous must never read as a PASS")
 
     def test_one_of_many_zeroed_tensors_fails_the_whole_comparison(self):
-        """THE B2 REPRODUCTION ITSELF, driven at `compare_reports`: models
-        the audit's own measured shape (proportionally: many agreeing
-        tensors, one zeroed on jammi's side only) at a floor the OLD
-        overall-only gate would have passed. Every agreeing tensor is
+        """The dilution case, driven at `compare_reports`: models the
+        measured shape (proportionally: many agreeing tensors, one zeroed on
+        jammi's side only) at a floor an overall-only gate would pass. Every agreeing tensor is
         EXACTLY identical (cosine 1.0) so the overall concatenated cosine
         stays high even with one tensor zeroed on one side — the per-tensor
         gate is the ONLY thing that can catch this.
@@ -962,7 +935,7 @@ class PerTensorGatingLattice(unittest.TestCase):
 
         self.assertGreaterEqual(
             result["overall_cosine_similarity"], self.FLOOR,
-            "fixture must reproduce the audit's own shape: the OLD overall-only gate would PASS here",
+            "fixture must model the dilution shape: an overall-only gate would PASS here",
         )
         self.assertIn("layer.0.lora_b", result["failing_tensor_names"])
         self.assertFalse(result["passed"], "one zeroed tensor among many agreeing ones must still FAIL overall")
@@ -986,9 +959,9 @@ class PerTensorGatingLattice(unittest.TestCase):
 
 
 class MainEntryPointRefusalTests(unittest.TestCase):
-    """Drives `cgo.main()` — the REAL entry point (implementer-acceptance
-    clause 8), never `derive_cosine_floor`/`compare_reports` called
-    directly — for F2's refusal behaviour and F3's premise reproduction.
+    """Drives `cgo.main()` — the REAL entry point, never
+    `derive_cosine_floor`/`compare_reports` called directly — for the
+    floor-refusal behaviour and the weight-premise check.
     """
 
     def setUp(self):
@@ -1016,15 +989,14 @@ class MainEntryPointRefusalTests(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_default_num_layers_hidden_size_refuses_on_an_exactly_orthogonal_pair(self):
-        """THE F2 REPRODUCTION: at `--num-layers 28 --hidden-size 1024`
+        """At `--num-layers 28 --hidden-size 1024`
         (ModernBERT-large, this script's own argparse DEFAULTS -- no flags
         passed here beyond the two file paths), two gradient vectors that
         are EXACTLY ORTHOGONAL (cosine 0.0, `[1,2,3,4]` vs `[4,-3,2,-1]` --
-        the audit's own reproduction pair: `1*4+2*-3+3*2+4*-1 = 4-6+6-4 =
-        0`) must NOT print `PASS`, must NOT return exit 0, and must print
-        no line that is exactly `PASS`. Before this fix, `main()` printed
-        `PASS` here because the derived floor at these defaults is
-        `~-0.402` (see `DerivationTests` above) and `0.0 >= -0.402`.
+        `1*4+2*-3+3*2+4*-1 = 4-6+6-4 = 0`) must NOT print `PASS`, must NOT
+        return exit 0, and must print no line that is exactly `PASS` — the
+        derived floor at these defaults is `~-0.402` (see `DerivationTests`
+        above) and `0.0 >= -0.402` would otherwise read as a pass.
         """
         report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0, 4.0]})
         report_b = make_report(0.3, {"t": [4.0, -3.0, 2.0, -1.0]})
@@ -1051,10 +1023,10 @@ class MainEntryPointRefusalTests(unittest.TestCase):
         self.assertIn("explicit", err, "the refusal message must name that the floor came from --cosine-floor")
 
     def test_explicit_sane_floor_still_catches_the_orthogonal_case(self):
-        """The other half of clause 2's requirement: an explicit, positive,
-        sane floor must still REFUSE-to-report-PASS on a real (here,
-        synthetic-orthogonal) defect -- the fix must not have made the
-        comparator unconditionally refuse; it must still be able to FAIL.
+        """The other half: an explicit, positive, sane floor must still
+        REFUSE-to-report-PASS on a real (here, synthetic-orthogonal) defect
+        -- the comparator must not unconditionally refuse; it must still be
+        able to FAIL.
         """
         report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0, 4.0]})
         report_b = make_report(0.3, {"t": [4.0, -3.0, 2.0, -1.0]})
@@ -1070,8 +1042,8 @@ class MainEntryPointRefusalTests(unittest.TestCase):
     def test_explicit_sane_floor_passes_a_genuinely_matching_pair(self):
         """Positive control for the refusal machinery: a fully
         premise-matching, gradient-identical pair at a sane explicit floor
-        must still print PASS and exit 0 -- the fix must not have made
-        EVERY invocation refuse or fail.
+        must still print PASS and exit 0 -- the refusal machinery must not
+        make EVERY invocation refuse or fail.
         """
         report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0, 4.0]})
         report_b = make_report(0.3, {"t": [1.0, 2.0, 3.0, 4.0]})
@@ -1084,11 +1056,10 @@ class MainEntryPointRefusalTests(unittest.TestCase):
         self.assertIn("PASS", out.splitlines())
 
     def test_reproduction_zero_vs_nine_weight_with_matching_gradients_is_not_a_pass(self):
-        """THE F3 REPRODUCTION, driven at `main()`: two dumps whose
-        gradients are IDENTICAL but whose `weight` arrays are `[0,0,0,0]`
-        vs `[9,9,9,9]` (the audit's own reproduction values), and neither
-        records a loaded `--lora-weights-in` file -- exactly the "omit
-        --lora-weights-in on the torch side" scenario the finding names.
+        """Driven at `main()`: two dumps whose gradients are IDENTICAL but
+        whose `weight` arrays are `[0,0,0,0]` vs `[9,9,9,9]`, and neither
+        records a loaded `--lora-weights-in` file -- the "omit
+        --lora-weights-in on the torch side" scenario.
         Must not print PASS.
         """
         report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0, 4.0]}, lora_weights_in=None)
@@ -1107,15 +1078,12 @@ class MainEntryPointRefusalTests(unittest.TestCase):
 
 
 class CosineFloorDomainLattice(unittest.TestCase):
-    """B3 REGRESSION (audit finding on PR #372, round 2): the previous
-    round's refusal only checked `cosine_floor <= 0.0` — `--cosine-floor
-    1e-30` PASSED a 90-degree defect (a floor that low is barely above
-    zero, still uninformative in practice, but this repo's own domain is
-    `(0.0, 1.0]` so it is technically admissible and NOT itself a bug this
-    lattice re-litigates); `--cosine-floor nan` was NOT refused (`nan <=
-    0.0` is `False`); `--cosine-floor 1.5` was accepted (impossible to ever
-    clear). One test per domain edge named in the audit's own dispatch,
-    every one driving `main()` — the real entry point — never
+    """The floor's valid domain is `(0.0, 1.0]`: `--cosine-floor nan` must be
+    refused (`nan <= 0.0` is `False`), and `--cosine-floor 1.5` must be
+    refused (impossible to ever clear). `--cosine-floor 1e-30` is barely
+    above zero and uninformative in practice, but technically admissible —
+    this lattice does not re-litigate it. One test per domain edge, every
+    one driving `main()` — the real entry point — never
     `floor_domain_violation` asserted on in isolation only.
     """
 
@@ -1202,10 +1170,9 @@ class CosineFloorDomainLattice(unittest.TestCase):
         self.assertEqual(code, cgo.EXIT_PASS, f"stdout={out!r} stderr={err!r}")
 
     def test_just_above_one_floor_refuses_at_main(self):
-        """THE B3 REPRODUCTION: `--cosine-floor 1.0000001` slipped through
-        the OLD `<= 0.0`-only check un-refused — nothing could ever clear
-        it (cosine similarity cannot exceed 1.0), so it would have silently
-        FAILED every comparison forever, never printing PASS again.
+        """`--cosine-floor 1.0000001` must refuse — nothing could ever clear
+        it (cosine similarity cannot exceed 1.0), so it would silently FAIL
+        every comparison forever, never printing PASS.
         """
         path_a, path_b = self._matching_pair_paths()
         code, out, err = self._run_main([path_a, path_b, "--cosine-floor", "1.0000001"])
@@ -1213,7 +1180,7 @@ class CosineFloorDomainLattice(unittest.TestCase):
         self.assertNotIn("PASS", out.splitlines())
 
     def test_one_point_five_floor_refuses_at_main(self):
-        """THE B3 AUDIT'S OWN NAMED REPRODUCTION: `--cosine-floor 1.5`."""
+        """`--cosine-floor 1.5`, well outside the domain."""
         path_a, path_b = self._matching_pair_paths()
         code, out, err = self._run_main([path_a, path_b, "--cosine-floor", "1.5"])
         self.assertEqual(code, cgo.EXIT_REFUSED, f"stdout={out!r} stderr={err!r}")
@@ -1233,14 +1200,14 @@ class CosineFloorDomainLattice(unittest.TestCase):
 
 
 class VacuousTensorClassificationTests(unittest.TestCase):
-    """Lead's live-pod course correction on this PR round (ModernBERT-large,
-    A100, tip e62c8a8): at a fresh `LoraInitMode::ZerosB` init, `dL/dA` is
+    """Observed on a live A100 run (ModernBERT-large, jammi at e62c8a8): at a
+    fresh `LoraInitMode::ZerosB` init, `dL/dA` is
     EXACTLY `0.0` on BOTH stacks for every `lora_a` tensor -- 112 of the
     224 matched tensors in that run. A bare `cosine_similarity() == 0.0`
     for those tensors does not distinguish "these stacks disagree" from
     "neither side has a signal here at all". `is_vacuous_pair`/
     `compare_tensor`'s `vacuous` field/`compare_reports`'s
-    `vacuous_tensor_count` close that gap.
+    `vacuous_tensor_count` make that distinction explicit.
     """
 
     def test_both_sides_exactly_zero_is_vacuous(self):
@@ -1337,12 +1304,11 @@ class VacuousTensorClassificationTests(unittest.TestCase):
 
 
 class SameProducerGuardTests(unittest.TestCase):
-    """ITEM 6 of this round's audit: `compare a.json a.json` (or, more
-    generally, comparing a producer against itself) used to PASS —
-    `compare_reports` never checked that the two dumps came from two
-    INDEPENDENT producers at all. `_same_producer_violation` closes this;
-    every test here constructs two dumps sharing the SAME `tool` value
-    (never relying on `make_report`'s new unique-by-default tool, which is
+    """`compare a.json a.json` (or, more generally, comparing a producer
+    against itself) must not PASS — `_same_producer_violation` checks that
+    the two dumps came from two INDEPENDENT producers. Every test here
+    constructs two dumps sharing the SAME `tool` value (never relying on
+    `make_report`'s unique-by-default tool, which is
     exactly the mechanism that keeps every OTHER test in this file from
     tripping this guard by accident).
     """
@@ -1355,7 +1321,7 @@ class SameProducerGuardTests(unittest.TestCase):
         self.assertTrue(any("same tool" in v for v in result["premise_violations"]))
 
     def test_literal_same_file_compared_to_itself_is_refused_at_main(self):
-        """THE LITERAL REPRODUCTION: `compare_grad_oracle.py a.json a.json`
+        """The literal case: `compare_grad_oracle.py a.json a.json`
         -- driven at `main()`, the real entry point, with the SAME path
         passed twice.
         """
@@ -1408,12 +1374,10 @@ class SameProducerGuardTests(unittest.TestCase):
         )
 
     def test_tool_absent_on_both_sides_is_refused(self):
-        """ROUND-4 AUDIT REPRODUCTION: an earlier draft of
-        `_same_producer_violation`'s own docstring claimed a missing `tool`
-        was already covered elsewhere -- it was not (`tool` is deliberately
-        NOT a `RUN_IDENTITY_FIELDS` member). `compare a.json a.json` on a
-        tool-less dump (or two independently-built tool-less dumps) used to
-        sail through this function entirely unrefused.
+        """A missing `tool` is covered nowhere else (`tool` is deliberately
+        NOT a `RUN_IDENTITY_FIELDS` member), so `compare a.json a.json` on a
+        tool-less dump (or two independently-built tool-less dumps) must be
+        refused here.
         """
         report_a = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
         report_b = make_report(0.3, {"t": [1.0, 2.0, 3.0]})
@@ -1432,7 +1396,7 @@ class SameProducerGuardTests(unittest.TestCase):
         self.assertTrue(any("'tool'" in v for v in result["premise_violations"]))
 
     def test_literal_same_file_with_no_tool_field_is_refused_at_main(self):
-        """THE LEAD'S OWN NAMED REPRODUCTION: `compare a.json a.json` where
+        """`compare a.json a.json` where
         the dump has NO `"tool"` key at all -- driven at `main()`, the real
         entry point.
         """
@@ -1457,8 +1421,8 @@ class SameProducerGuardTests(unittest.TestCase):
     cgo.HAVE_NUMPY,
     "numpy is not importable in this environment -- this class compares the numpy arm "
     "against the pure-Python fallback arm on the SAME divergent inputs; with no numpy, there "
-    "is only one arm to compare, so arm PARITY cannot be exercised here. NOTE (item 4 of this "
-    "round's audit): this repo's CI Guard job (.github/workflows/ci.yml's `guard` matrix, the "
+    "is only one arm to compare, so arm PARITY cannot be exercised here. NOTE: this repo's "
+    "CI Guard job (.github/workflows/ci.yml's `guard` matrix, the "
     "lane that runs this file) installs NO python packages at all before invoking `python3` -- "
     "no actions/setup-python with a requirements file, no `pip install numpy` step anywhere in "
     "that job -- so on a stock ubuntu-latest runner's system python3 this class is expected to "
@@ -1467,9 +1431,8 @@ class SameProducerGuardTests(unittest.TestCase):
     "transitive dependency) -- do not claim CI Guard coverage this class does not actually run.",
 )
 class ArmParityTests(unittest.TestCase):
-    """ITEM 4 of this round's audit: the numpy arm and the pure-Python
-    fallback arm are never asserted equal on the SAME divergent input --
-    the "run twice" pattern other tests use (`ComparatorMathTestsMixin`'s
+    """The numpy arm and the pure-Python fallback arm asserted equal on the
+    SAME divergent input -- the "run twice" pattern other tests use (`ComparatorMathTestsMixin`'s
     two concrete subclasses) each runs the FULL suite under exactly ONE
     arm; neither ever compares the two arms' OUTPUT on the same input
     within a single test. This class does: every test here calls the SAME
@@ -1515,10 +1478,10 @@ class ArmParityTests(unittest.TestCase):
         self.assertFalse(self._numpy_arm(cgo._has_nonfinite, a))
 
     def test_dot_raises_valueerror_on_length_mismatch_in_both_arms(self):
-        """THE REPRODUCTION this closes: `zip(a, b)` in the pure-Python arm
-        used to SILENTLY TRUNCATE to the shorter length on a length
-        mismatch instead of raising -- numpy's own arithmetic raises for a
-        genuine shape mismatch. `_require_same_length` now makes both arms
+        """`zip(a, b)` in the pure-Python arm SILENTLY TRUNCATES to the
+        shorter length on a length mismatch instead of raising -- numpy's
+        own arithmetic raises for a genuine shape mismatch.
+        `_require_same_length` makes both arms
         raise `ValueError` identically, checked BEFORE either arm's own
         branch.
         """
@@ -1578,9 +1541,7 @@ class ComparatorMathTestsWhateverNumpyIsAvailable(ComparatorMathTestsMixin, unit
 class ComparatorMathTestsForcedPureFallback(ComparatorMathTestsMixin, unittest.TestCase):
     """Forces `cgo.HAVE_NUMPY = False` for the duration of each test, so
     the pure-Python fallback path is exercised regardless of whether numpy
-    happens to be importable in the environment running this suite (it is
-    NOT, in the sandbox this round was built in -- see the dispatch
-    verdict's mutation-triage note).
+    happens to be importable in the environment running this suite.
     """
 
     def setUp(self):

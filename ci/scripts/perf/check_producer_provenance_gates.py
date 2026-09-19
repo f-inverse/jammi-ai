@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Two mechanical, grep-shaped static assertions over every tracked producer
-script under `ci/scripts/perf/` — the class two round-N audit findings on
-`perf/unification-p2` named: a dry-run-only test knob left live in a REAL
-run is a bypass, not a fixture, and a cross-check added to two of four
-producers that share the exact same hole is a partial fix, not a closed
+script under `ci/scripts/perf/`: a dry-run-only test knob left live in a
+REAL run is a bypass, not a fixture, and a cross-check present in only some
+of the producers that share the same hole is a partial fix, not a closed
 class.
 
 ## (A) FAKE-knob inertness
 
 Any tracked `.sh` under `ci/scripts/` that references an environment
 variable whose name contains `FAKE` (the shape `stacked_sweep.sh`'s
-`SWEEP_FAKE_BIN_SHA` set, contract C5.2 — a test-only injection knob for
+`SWEEP_FAKE_BIN_SHA` sets — a test-only injection knob for
 exercising the provenance-mismatch refusal path without a GPU or a real
 binary) must ALSO contain an explicit REFUSAL guard: a line that tests the
 knob is set (`-n "${<VAR>...}"`), tests some `*DRY_RUN*` variable `!= "1"`,
@@ -21,18 +20,17 @@ comment) before its own guard, cannot be trusted to be inert in a real run.
 ## (B) Producer parity — every jammi-bench-invoking producer carries the
 `$BIN provenance` cross-check
 
-Unification contract C5.1: "Every shell/Python producer cross-checks `$BIN
-provenance`'s build_sha against the sha it is about to stamp before writing
-a GREEN leg." Mechanically: every tracked `.sh` under `ci/scripts/perf/`
+Every shell/Python producer cross-checks `$BIN provenance`'s build_sha
+against the sha it is about to stamp before writing a GREEN leg.
+Mechanically: every tracked `.sh` under `ci/scripts/perf/`
 whose text names a `jammi-bench` BINARY PATH (a variable assignment ending
 `/jammi-bench` — the shape every producer's own `$BIN`/`$B`/`$JAMMI_BIN`
 takes; never a source-tree reference like `crates/jammi-bench/...`) must
 also contain BOTH `provenance` and `build_sha` somewhere in its text — the
 two tokens the cross-check itself is built from
-(`"$BIN" provenance` / `["build_sha"]`). This is the exact `grep -l
-jammi-bench` / `grep -l provenance` methodology the audit that found the
-gap used — reproduced here as a standing gate, not a one-time hand check,
-so a FIFTH producer landing tomorrow cannot silently reopen the class.
+(`"$BIN" provenance` / `["build_sha"]`). This is the `grep -l
+jammi-bench` / `grep -l provenance` methodology as a standing gate, not a
+one-time hand check, so a new producer cannot silently reopen the class.
 
 Both are deliberately mechanical (name/pattern presence), not a semantic
 understanding of the guard's control flow: grep for the shape, not the
@@ -77,17 +75,15 @@ opens a quote or bracket construct it does not itself close is a genuine,
 common bash shape (a `python3 -c '...'` payload piped across several
 physical lines, a `"$(...)" ` capturing a multi-line command
 substitution), and getting this wrong in either direction is a real,
-exploitable gap — a bug this exact file's differential corpus scan (see
-`self_test`'s `--self-test` arm) found LIVE on two tracked lines
-(`pod_push_stamp.sh`, `test_pod_substrate.sh`: a line that legitimately
-CLOSES a quote OPENED several lines earlier was misread as OPENING a new
-one, so the line's own real trailing comment was never stripped — a
-fail-open that could let arbitrary prose satisfy a guard or a cross-check)
-and three more (`runpod_lib.sh` at two lines, `test_pod_substrate.sh` at a
-third: a `#` inside `$((10#$VAR))` or `${var#pattern}` was misread as a
-comment marker, truncating real code — a false-strip that could hide a
-real guard from this scanner entirely) — five pinned lines in total (see
-the five named cases below).
+exploitable gap. `self_test` pins five tracked lines that exercise both
+directions: two (`pod_push_stamp.sh`, `test_pod_substrate.sh`) where a line
+CLOSES a quote OPENED several lines earlier — misreading it as OPENING a
+new one would leave the line's real trailing comment unstripped, a
+fail-open that lets arbitrary prose satisfy a guard or a cross-check — and
+three (`runpod_lib.sh` at two lines, `test_pod_substrate.sh` at a third)
+where a `#` sits inside `$((10#$VAR))` or `${var#pattern}` — misreading it
+as a comment marker truncates real code, a false-strip that can hide a
+real guard from this scanner entirely.
 
 Two lines the lexer cannot fully resolve on their own are marked
 UNDECIDABLE rather than guessed at: a `#` that is not bash's comment
@@ -140,8 +136,7 @@ real `provenance`/`build_sha` cross-check, or a real `exit` -- forging
 the same class of forgery the trailing-comment fixtures above already pin,
 one layer down, and not specific to `echo`/`printf`: ANY sink whose
 argument is inert is an equally good vehicle for the same forgery, and a
-scanner that closes only the one shape an audit happened to hand-pick
-reopens the identical class the moment a producer author (or an attacker)
+scanner that closes only one hand-picked shape reopens the identical class the moment a producer author (or an attacker)
 reaches for a different inert sink.
 
 `_guard_text` therefore ALSO runs its `code` through
@@ -195,8 +190,7 @@ cases with their expected classification, alongside the general
 corpus-wide agreement check, so a future TRANSCRIPTION regression in
 either implementation — a typo, a dropped case, an off-by-one — shows up
 as a named, attributable failure rather than a silent corpus-wide
-disagreement; it is not, and was never meant to be, an oracle for a
-different CONCEPT of the rules.
+disagreement; it is not an oracle for a different CONCEPT of the rules.
 
 ## (C) `*_DRY_RUN_*` knob admissibility — a second knob shape beyond `*FAKE*`
 
@@ -309,20 +303,15 @@ from pathlib import Path
 from typing import NamedTuple
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-# Fail loud rather than scan-zero-silently: this file lives at
-# `ci/scripts/perf/check_producer_provenance_gates.py`, three directories
-# below the repo root, and every OTHER sibling script under `ci/scripts/
-# perf/` already uses `parents[3]` for exactly this reason (a prior
-# `parents[2]` resolved to `<repo>/ci` instead — `git ls-files <prefix>` run
-# with THAT as `cwd` looks for `ci/scripts/**` under `<repo>/ci/ci/scripts/
-# **`, which never exists, so both `run_gate` and this module's own
-# `self_test`'s "the real tree is clean" end-to-end arm passed VACUOUSLY —
-# zero files scanned, zero findings, reads as PASS). A silent scan-zero is
-# worse than a loud crash: this assertion makes a future re-introduction of
-# that mistake (or a refactor that moves this file another directory deep)
-# fail on the very first line of `main()`/`self_test()` that touches
-# `REPO_ROOT`, not silently downstream as an empty findings list that looks
-# identical to "everything is fine".
+# Fail loud rather than scan-zero-silently: this file lives three
+# directories below the repo root. A wrong `parents[N]` (e.g. `parents[2]`,
+# resolving to `<repo>/ci`) makes `git ls-files ci/scripts/**` look under
+# `<repo>/ci/ci/scripts/**`, which never exists, so both `run_gate` and
+# `self_test`'s "the real tree is clean" arm would pass VACUOUSLY — zero
+# files scanned, zero findings, reads as PASS. This check makes a wrong
+# depth (or a move of this file) fail on the first touch of `REPO_ROOT`
+# instead of surfacing as an empty findings list that looks identical to
+# "everything is fine".
 # An explicit `if`/`raise`, never a bare `assert` -- `assert` is stripped
 # entirely under `python -O`, which would silently disable this exact
 # anti-vacuity guard (the one thing standing between a wrong `parents[N]`
@@ -346,7 +335,7 @@ BIN_ASSIGN_RE = re.compile(r"/jammi-bench(?!/)")
 # (C) — a `<PREFIX>_DRY_RUN_<SUFFIX>` test knob: the producer's OWN
 # `<PREFIX>_DRY_RUN` toggle with a REAL suffix appended (`_EXTRA_REQUESTED_
 # KEY`, `_FAIL_OP`, ...). Requires at least one char after the second
-# underscore so the BARE toggle itself (`PROFILE_421_LEGS_DRY_RUN`,
+# underscore so the BARE toggle itself (`SWEEP_DRY_RUN`,
 # `MANIFEST_DRY_RUN`) never self-matches as its own sub-knob.
 DRY_RUN_KNOB_RE = re.compile(r"\b([A-Z][A-Z0-9_]*_DRY_RUN_[A-Z0-9_]+)\b")
 
@@ -373,9 +362,9 @@ def _tracked_sh_under(repo_root: Path, prefix: str) -> list[Path]:
 # site). Anchored via `Pattern.match(line, pos)` (matches only exactly at
 # `pos`, never scans ahead), so this never independently decides WHETHER a
 # `<<` is a heredoc opener — only what its terminator name is once the lexer
-# has already decided it is one. `_heredoc_aware_block_extent` no longer
-# re-detects heredoc openers at all: it consumes the per-line `in_heredoc_
-# body` spans `_lex_stream` already computed.
+# has already decided it is one. `_heredoc_aware_block_extent` never
+# re-detects heredoc openers: it consumes the per-line `in_heredoc_body`
+# spans `_lex_stream` already computed.
 _HEREDOC_OPEN_AT_RE = re.compile(r"(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
 
 # A `#` is bash's comment marker only when it is the first character of a
@@ -634,7 +623,7 @@ def _lex_stream(lines: list[str]) -> list[_LineLex]:
     correctly across the boundary. A heredoc body (`<<[-]TERM` opener up to
     its bare-`TERM` terminator line) is the one exception: it is lexed with
     a FRESH, throwaway stack per line (matching how `_heredoc_aware_block_
-    extent` now reads it back out via `in_heredoc_body`) so that prose
+    extent` reads it back out via `in_heredoc_body`) so that prose
     inside an embedded script or comment can never leak cross-line quote
     state into the real code that follows the heredoc's close. The heredoc
     opener itself is a TOKEN `_lex_one_line` recognizes off its own
@@ -920,13 +909,11 @@ def _independent_lex_stream(lines: list[str]) -> list[_LineLex]:
     here-string operator -- coded as a TOKEN-DRIVEN scan
     (`_INDEPENDENT_TOKEN_RE.finditer`, jumping from match to match) instead
     of the primary's character-by-character `while i < n` walk. This is
-    NOT a conceptually different or deliberately-simplified lexer -- an
-    earlier version of this docstring claimed one (two plain quote
-    booleans, no frame typing, no `ARITH`/`PARAM` exemption at all), but
-    that variant does not match the code below (which has always tracked
-    `B`/`A`/`P` frames and the `ARITH`/`PARAM` exemption -- see `top in
-    ("A", "P")` below) and, run for real, disagrees with the primary on 21
-    real corpus lines. What this function actually is: a hand-transliterated
+    NOT a conceptually different or deliberately-simplified lexer (a
+    variant with two plain quote booleans, no frame typing and no
+    `ARITH`/`PARAM` exemption disagrees with the primary on real corpus
+    lines; this one tracks `B`/`A`/`P` frames and the `ARITH`/`PARAM`
+    exemption -- see `top in ("A", "P")` below). It is a hand-transliterated
     re-implementation of the SAME rules via a genuinely different
     mechanism (regex-token jumps rather than a per-character `if`/`elif`
     chain), so a TRANSCRIPTION bug in either implementation -- a typo, a
@@ -1200,15 +1187,12 @@ def _if_taken_branch_extent(
     never too LONG: a caller reading "`exit`/read must be found inside this
     window" off a too-short window still fails closed (a real `exit`/read
     past the cut is simply not seen, producing a finding, never a false
-    GREEN) — the opposite of the un-truncated version of this walker, which
-    could run an unresolved heredoc's containment interval all the way to
-    the cap, silently crediting every real line in between. `heredoc_aware=
-    False` (unused by any caller today, kept only because `_guard_block_
-    lines` used it before this fix and a future caller may have a genuine
-    reason to inspect a guard with no heredoc in its body) carries NO such
-    guarantee: a heredoc body's own unmatched `if`/`else` tokens would
-    inflate the depth count and could run this walker past the guard's real
-    `fi`, a known, disclosed gap this module no longer relies on."""
+    GREEN) — an un-truncated walker would instead run an unresolved
+    heredoc's containment interval all the way to the cap, silently
+    crediting every real line in between. `heredoc_aware=False` (no current
+    caller uses it) carries NO such guarantee: a heredoc body's own
+    unmatched `if`/`else` tokens would inflate the depth count and could run
+    this walker past the guard's real `fi`."""
     depth = 0
     end = start_idx
     limit = min(len(lines), start_idx + max_scan)
@@ -1256,9 +1240,8 @@ def _guard_block_lines(lines: list[str], lex: list[_LineLex], start_idx: int) ->
     (`then`) branch of the `if [...]; then ... fi` block whose OWN
     condition line is `lines[start_idx]` — see `_if_taken_branch_extent`
     for the full depth-walk/else-elif-stop rule this delegates to. Bounded
-    at `_GUARD_BLOCK_MAX_SCAN` lines; HEREDOC-AWARE (`heredoc_aware=True`) —
-    an earlier version of this function claimed its callers "never see a
-    heredoc payload at this call site", but that is false: a refusal
+    at `_GUARD_BLOCK_MAX_SCAN` lines; HEREDOC-AWARE (`heredoc_aware=True`),
+    because callers DO see heredoc payloads here: a refusal
     guard's own `then` arm routinely writes a stub script via a heredoc
     (a `fake_bench.sh` stub is exactly this shape), and an `exit` sitting
     inside that heredoc's DATA —
@@ -1361,7 +1344,7 @@ def check_producer_parity(path: Path) -> list[str]:
             f"{path}: names a jammi-bench binary path but is missing {missing} in CODE (a "
             "comment mentioning the token does not count) — every producer that runs a "
             "jammi-bench binary must cross-check `$BIN provenance`'s build_sha before writing "
-            "a GREEN leg (unification contract C5.1)"
+            "a GREEN leg"
         ]
     return []
 
@@ -1717,10 +1700,10 @@ def _self_test_corpus_lexer_agreement(repo_root: Path) -> list[str]:
     if disagreements > 20:
         failures.append(f"... and {disagreements - 20} more disagreements (truncated)")
 
-    # The five real lines pinned by name (differential corpus scan):
-    # two live fail-opens (a closing quote misread as opening one, so a
-    # real trailing comment was never stripped) and three false-strips (a
-    # non-comment `#` misread as a comment marker, truncating real code).
+    # The five real lines pinned by name: two fail-open shapes (a closing
+    # quote misread as opening one leaves a real trailing comment
+    # unstripped) and three false-strip shapes (a non-comment `#` misread
+    # as a comment marker truncates real code).
     # `test_pod_substrate.sh`'s two cases are NOT heredoc bodies: the first
     # is a nested `$(bash -c "…\"\${…}\"…")` command substitution with
     # escaped-quote nesting, followed by a genuine trailing `# tripwire-ok:`
@@ -1729,10 +1712,8 @@ def _self_test_corpus_lexer_agreement(repo_root: Path) -> list[str]:
     # strip-operator false-strip.
     #
     # LOCATED BY TEXT, never by line number: a bare `(path, lineno, …)`
-    # lookup is fragile to any insertion ABOVE the pinned line in an
-    # UNRELATED edit — the exact failure mode that cost this line-pin two
-    # separate CI reds and a 34-citation repo-wide sweep after an earlier,
-    # unrelated fixture grew inside this same file. Each case is instead
+    # lookup breaks on any insertion ABOVE the pinned line in an
+    # UNRELATED edit. Each case is instead
     # asserted to match EXACTLY ONE line's lexed (code, undecidable) shape
     # anywhere in the file — zero matches means the case rotted (the line
     # was edited/removed), more than one means the fixture is no longer
@@ -2132,7 +2113,7 @@ def self_test() -> int:
         # NESTED `$(...)` command substitution embedded in an `echo`
         # argument must NOT be blanked -- the substitution genuinely
         # executes, so this is real code, not prose, and must still
-        # satisfy the cross-check (proves the fix is "blank only content
+        # satisfy the cross-check (proves the rule is "blank only content
         # DIRECTLY inside a sink's own literal, exempt nested `$(...)`",
         # not a blanket "blank everything an echo argument reaches").
         commit_and_check(
@@ -2320,7 +2301,7 @@ def self_test() -> int:
             None,
         )
 
-        # (C) RED — F1, else-arm read: `FOO_DRY_RUN_EVIL`'s only read site
+        # (C) RED — else-arm read: `FOO_DRY_RUN_EVIL`'s only read site
         # sits in the `else` arm of `if [ "$FOO_DRY_RUN" = "1" ]`, which
         # never runs while DRY_RUN=1 (the only time this containment guard
         # is satisfied at all) — a knob read exclusively in the sibling
@@ -2340,7 +2321,7 @@ def self_test() -> int:
             "outside any",
         )
 
-        # (C) RED — F1, elif-arm read: same class, the dead arm is an
+        # (C) RED — elif-arm read: same class, the dead arm is an
         # `elif` rather than a bare `else`.
         commit_and_check(
             "ci/scripts/perf/bad_dry_run_knob_read_in_elif_arm.sh",
@@ -2357,7 +2338,7 @@ def self_test() -> int:
             "outside any",
         )
 
-        # (C) GREEN control — F1 positive control: the same else-arm shape,
+        # (C) GREEN control — positive control: the same else-arm shape,
         # but the knob is read ONLY inside the taken (`then`) branch — an
         # else arm being present at all must not perturb a genuinely
         # contained read.
@@ -2376,7 +2357,7 @@ def self_test() -> int:
             None,
         )
 
-        # (A) RED — F1, dead exit in a dead else arm: `X_FAKE_THING`'s
+        # (A) RED — dead exit in a dead else arm: `X_FAKE_THING`'s
         # refusal guard's `then` arm only `echo`s; the ONLY `exit` in the
         # block lives inside a NESTED `if false; then exit 9; fi` sitting in
         # the guard's OWN `else` arm — an arm that never runs when the
@@ -2399,7 +2380,7 @@ def self_test() -> int:
             "does not `exit`",
         )
 
-        # (A) GREEN control — F1 positive control: the same refusal-guard
+        # (A) GREEN control — positive control: the same refusal-guard
         # shape, `exit` correctly placed in the TAKEN (`then`) arm, with an
         # unrelated `else` arm present — the else arm's mere presence must
         # not stop the block-extent walk from finding the real, taken-arm
@@ -2419,7 +2400,7 @@ def self_test() -> int:
             None,
         )
 
-        # (C) RED — F2, phantom opener inside a heredoc body: the ONLY text
+        # (C) RED — phantom opener inside a heredoc body: the ONLY text
         # matching `if [ "$WUP_DRY_RUN" = "1" ]` sits inside a heredoc
         # payload (a stub script this producer writes out, whose own
         # generated content happens to contain that literal guard shape).
@@ -2444,10 +2425,10 @@ def self_test() -> int:
             "outside any",
         )
 
-        # (C) GREEN control — F2 positive control: a REAL, top-level opener
+        # (C) GREEN control — positive control: a REAL, top-level opener
         # appearing AFTER a heredoc closes must still open a real interval
-        # (proves the fix is the heredoc-body skip specifically, not a
-        # blanket "ignore every opener" regression).
+        # (proves the rule is the heredoc-body skip specifically, not a
+        # blanket "ignore every opener").
         commit_and_check(
             "ci/scripts/perf/good_dry_run_knob_real_opener_after_heredoc.sh",
             (
@@ -2505,8 +2486,8 @@ def self_test() -> int:
         # (C) GREEN control — positive `&&` control: an opener whose
         # condition ANDs the equality test with an unrelated clause must
         # still be credited --
-        # proves the fix is specifically "no `||`, no leading `!`", not a
-        # blanket "reject every compound condition" regression.
+        # proves the rule is specifically "no `||`, no leading `!`", not a
+        # blanket "reject every compound condition".
         commit_and_check(
             "ci/scripts/perf/good_dry_run_knob_opener_and_conjunction.sh",
             (
@@ -2520,7 +2501,7 @@ def self_test() -> int:
             None,
         )
 
-        # (A) RED — F3, `exit` living only inside a heredoc PAYLOAD: the
+        # (A) RED — `exit` living only inside a heredoc PAYLOAD: the
         # refusal guard's `then` arm writes a stub script via a heredoc
         # whose DATA happens to contain the word `exit` -- never a real,
         # executed `exit` statement of THIS script (the stub is written out
@@ -2541,7 +2522,7 @@ def self_test() -> int:
             "does not `exit`",
         )
 
-        # (C) RED — F3, the same heredoc-payload-`exit` shape for mode 2
+        # (C) RED — the same heredoc-payload-`exit` shape for mode 2
         # (preflight refusal): `FOO_DRY_RUN_EVIL` is read for real (`rm -rf`)
         # outside the guard, and the guard's own `then` arm's only `exit`
         # lives inside a heredoc payload it writes out -- data, never a real
@@ -2563,11 +2544,11 @@ def self_test() -> int:
             "outside any",
         )
 
-        # (C) RED — F3, unterminated-heredoc swallow: the heredoc opened
+        # (C) RED — unterminated-heredoc swallow: the heredoc opened
         # inside a `FOO_DRY_RUN = "1"` containment block never finds its
         # terminator (typo'd `NOTEOS` instead of `EOS`) before end of file.
-        # A walker that EXTENDS the containment interval across text it can
-        # no longer resolve would run this interval out to its scan cap,
+        # A walker that EXTENDS the containment interval across text it
+        # cannot resolve would run this interval out to its scan cap,
         # silently swallowing the real `fi` AND the real, top-level read of
         # `FOO_DRY_RUN_EVIL` that follows -- a fail-OPEN. A walker that
         # TRUNCATES the interval the moment the heredoc's resolution
@@ -2588,15 +2569,13 @@ def self_test() -> int:
             "outside any",
         )
 
-    # Non-vacuousness control (the actual bug this round fixes): a wrong
-    # `REPO_ROOT` (previously `parents[2]`, resolving to `<repo>/ci` instead
-    # of `<repo>`) makes `git ls-files ci/scripts/` run with the WRONG `cwd`
+    # Non-vacuousness control: a wrong `REPO_ROOT` (e.g. `parents[2]`,
+    # resolving to `<repo>/ci` instead of `<repo>`) makes `git ls-files ci/scripts/` run with the WRONG `cwd`
     # look for `<repo>/ci/ci/scripts/**`, which never exists — zero files,
     # zero findings, a PASS that enforced nothing. Assert BOTH tracked-file
     # scans this gate depends on see a REAL, nonzero count on the actual
-    # repo tree, so a future regression of `REPO_ROOT` (or of the
-    # `Cargo.toml` guard above being weakened/removed) cannot silently
-    # revert to scanning nothing while still printing PASS.
+    # repo tree, so a wrong `REPO_ROOT` (or a weakened `Cargo.toml` guard
+    # above) cannot silently scan nothing while still printing PASS.
     real_sh_under_scripts = _tracked_sh_under(REPO_ROOT, "ci/scripts/")
     real_sh_under_perf = _tracked_sh_under(REPO_ROOT, "ci/scripts/perf/")
     if not real_sh_under_scripts:
@@ -2610,14 +2589,14 @@ def self_test() -> int:
             "ZERO `.sh` files -- the scan is vacuous (REPO_ROOT is almost certainly wrong)"
         )
 
-    # End-to-end: the REAL tree, both checks, must be clean today.
+    # End-to-end: the REAL tree, both checks, must be clean.
     real_findings = run_gate(PERF_DIR, REPO_ROOT)
     if real_findings:
         failures.append(f"self-test FAILED: real tree is not clean: {real_findings}")
 
     # The full corpus lexer-agreement scan (see its own doc): every
     # tracked line, two independent implementations, zero disagreements —
-    # including the five real lines the differential corpus scan named.
+    # including the five pinned real lines.
     failures += _self_test_corpus_lexer_agreement(REPO_ROOT)
 
     if failures:
@@ -2648,9 +2627,8 @@ def self_test() -> int:
         "opener appearing after a heredoc closes, and a real `&&`-conjoined opener, all GREEN) "
         "all bite on throwaway "
         "fixtures; the real tree is clean; and the lexer agrees with an independently-written "
-        "second implementation on every tracked ci/scripts/ line, including the five real lines "
-        "a differential audit scan found the pre-existing hand-rolled comment stripper "
-        "misreading."
+        "second implementation on every tracked ci/scripts/ line, including the five pinned "
+        "real lines a naive comment stripper misreads."
     )
     return 0
 

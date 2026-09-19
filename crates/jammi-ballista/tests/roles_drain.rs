@@ -1,14 +1,12 @@
-//! `ExecutorRole::drain()` (contract `feat_500-wave4` §9 B6), in its OWN
+//! `ExecutorRole::drain()`, in its OWN
 //! test binary/process: `ballista_executor::executor_server::TERMINATING`
 //! is a crate-wide `static AtomicBool` — once one executor in a process
 //! calls `drain()`, EVERY executor hosted afterward in that SAME process
 //! reports `Terminating` in its heartbeats (read at
 //! `ballista-executor-54.1.0/src/executor_server.rs:317`), so a scheduler
-//! never binds tasks to it again. Verified by reproducing the exact
-//! symptom: this test's assertions passed when this file's one test ran
-//! alone in `tests/it/roles.rs`, then hung (30s timeout, no task ever
-//! bound) the moment `tests/it`'s OTHER role test shared the process with
-//! it — moving it to its own `[[test]]` binary is the fix, not a
+//! never binds tasks to it again. Sharing a process with `tests/it`'s OTHER
+//! role test hangs that test (30s timeout, no task ever bound), so this
+//! test lives in its own `[[test]]` binary — the structural answer, not a
 //! workaround: each Cargo test target is its own OS process.
 
 use std::sync::Arc;
@@ -34,10 +32,9 @@ async fn session() -> Arc<InferenceSession> {
 /// in-flight task to wait for — the no-task arm of the property. The
 /// "survives a running task until it completes" arm needs a deliberately
 /// slow operator to hold `TasksDrainedFuture` pending across the assertion
-/// window; UNCOVERED here (named in this crate's contract file) — every
-/// plan this hermetic suite submits completes near-instantly, so a real one
-/// would need a dedicated slow `ExecutionPlan` fixture, which this unit did
-/// not build given the round's scope.
+/// window and is not covered here: every plan this hermetic suite submits
+/// completes near-instantly, so covering it needs a dedicated slow
+/// `ExecutionPlan` fixture.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn executor_drain_reports_terminating_and_stops_with_no_inflight_work() {
     let session = session().await;

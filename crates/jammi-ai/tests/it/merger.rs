@@ -114,10 +114,9 @@ async fn merged_channel_nullability_round_trips_through_datafusion() {
     }
 }
 
-/// SPEC-01 §9 — a contribution whose array length doesn't match the batch's
-/// row count must surface as a typed `ChannelAssembly` error naming both
-/// counts. SPEC-01 §3.7 phrases this as "has N rows, batch has M"; the
-/// production wording is "has N rows, expected M" (substring match against
+/// A contribution whose array length doesn't match the batch's row count
+/// must surface as a typed `ChannelAssembly` error naming both counts. The
+/// wording is "has N rows, expected M" (substring match against
 /// "has 2 rows" + "expected 3" + the column name pins both sides of the
 /// inequality without depending on the exact connective).
 #[tokio::test]
@@ -153,7 +152,7 @@ async fn length_mismatched_contribution_returns_typed_error() {
     }
 }
 
-/// SPEC-01 §9 — a contribution whose Arrow dtype doesn't match the
+/// A contribution whose Arrow dtype doesn't match the
 /// catalog-declared `ChannelColumnType` must surface as a typed
 /// `ChannelAssembly` error naming the column and both types.
 #[tokio::test]

@@ -953,9 +953,8 @@ fn cases() -> Vec<IsolationCase> {
         // in `jammi-db`'s own test suite; this case drives the LIVE broker tail
         // on a GLOBALLY-registered topic (`TopicDefinition::tenant == None`,
         // one shared `topic.id` across every tenant) — the shape the replay-only
-        // test cannot exercise, and the shape where the tenant leak actually
-        // lived: the live tail used to be keyed by `topic.id` and a
-        // caller-supplied predicate only, with no tenant filter at all.
+        // test cannot exercise: the live tail is keyed by `topic.id` and a
+        // caller-supplied predicate only, with no tenant dimension of its own.
         case!("TriggerService", "Subscribe", CaseKind::Hermetic, None, {
             assert_live_subscribe_tenant_isolated().await;
         }),
@@ -1110,7 +1109,7 @@ fn cases() -> Vec<IsolationCase> {
         // The three incremental-embedding actuators share one step-0 gate: the
         // tenant-scoped table read, then the STRICT tenant pair BEFORE the
         // model load (a peer resolves not-found; a scoped tenant can read a
-        // GLOBAL table but never refresh/compact/expire it). §6.22.
+        // GLOBAL table but never refresh/compact/expire it).
         case!(
             "EmbeddingService",
             "RefreshEmbeddings",
@@ -1317,7 +1316,7 @@ async fn list_topic_ids(sess: &JammiSession, tenant: Option<TenantId>) -> Vec<To
 
 /// Proves the LIVE trigger-stream tail stays tenant-filtered on a GLOBALLY-
 /// registered topic (`TopicDefinition::tenant == None`, one shared `topic.id`
-/// across every tenant) — the exact shape that used to leak, because the
+/// across every tenant) — the shape that can leak, because the
 /// live tail is keyed by `topic.id` + a caller-supplied predicate only, with
 /// no tenant dimension of its own. One `JammiSession` (one shared broker +
 /// backing table, the realistic single-process topology) registers the
@@ -2100,11 +2099,10 @@ async fn assert_reconcile_isolated() {
         .set_modified(backdated)
         .unwrap();
 
-    // RED first: a genuinely UNATTRIBUTED key — its own first path
+    // A genuinely UNATTRIBUTED key — its own first path
     // segment does not even parse as a `TenantSegment` — planted directly at
     // the store root (no tenant prefix at all), so it is store-wide by
-    // definition. Before the fix, tenant B's own SCOPED reconcile listed
-    // this anyway ("garbage is always in scope"); the fixed rule is that
+    // definition. A SCOPED reconcile must not list it as in-scope garbage:
     // ONLY the admin `reconcile_all` pass may ever report it.
     let root = dir.path().join("jammi_db");
     let unattributed = root.join("pre_layout_table.parquet");
@@ -2182,18 +2180,18 @@ async fn assert_reconcile_isolated() {
     );
 }
 
-/// RED first (esc-094 follow-up): a GLOBAL (`tenant_id IS NULL`) `building` row whose
+/// A GLOBAL (`tenant_id IS NULL`) `building` row whose
 /// lease has expired must NEVER be claimed/failed/deleted by a TENANT-scoped
 /// `reconcile(apply=true)` — only the admin `reconcile_all` pass may ever
-/// touch it. Before the fix, the expired-building pre-pass's enumeration
-/// included GLOBAL rows under a non-admin binding (the ordinary
+/// touch it. An expired-building pre-pass that enumerated GLOBAL rows under a
+/// non-admin binding (the ordinary
 /// "`tenant_id = $t OR tenant_id IS NULL`" read-scoping convention, safe for
-/// a read but not for the mutating claim/fail/delete this pre-pass performs),
-/// and `ResultTableCas::expired`'s `Strict` tenant arm renders against the
-/// ROW's OWN tenant — a tautology that can never refuse a GLOBAL row for any
-/// caller — so a tenant-bound caller's reconcile pass would claim (re-stamp
-/// the writer_id), then drive the row to a terminal state and delete its
-/// bytes, entirely outside its own tenant.
+/// a read but not for the mutating claim/fail/delete this pre-pass performs)
+/// would pass `ResultTableCas::expired`'s `Strict` tenant arm, which renders
+/// against the ROW's OWN tenant — a tautology that can never refuse a GLOBAL
+/// row for any caller — so a tenant-bound caller's reconcile pass would claim
+/// (re-stamp the writer_id), then drive the row to a terminal state and
+/// delete its bytes, entirely outside its own tenant.
 #[tokio::test]
 async fn tenant_scoped_reconcile_never_touches_a_global_expired_building_row() {
     use jammi_db::catalog::backend::{SqlValue, TxOptions};
@@ -2811,20 +2809,20 @@ async fn select_ids(session: &JammiSession, tenant: TenantId) -> Vec<i64> {
         .await
 }
 
-/// Result-table SCAN isolation over the real `db.sql` lane (esc-024).
+/// Result-table SCAN isolation over the real `db.sql` lane.
 ///
 /// A result Parquet carries no `tenant_id` column, so the predicate-injection
-/// analyzer never scoped it; it resolved by bare `jammi.{name}` into the one
-/// shared context with no tenant gate, and any correctly-bound tenant naming
-/// another tenant's table scanned its full Parquet. This drives the fix end to
-/// end: two result tables of different verb kinds — an as-of-join spine+facts
+/// analyzer cannot scope it; resolved by bare `jammi.{name}` into the one
+/// shared context with no tenant gate, any correctly-bound tenant naming
+/// another tenant's table would scan its full Parquet. This drives the tenant
+/// gate end to end: two result tables of different verb kinds — an as-of-join spine+facts
 /// table and an embedding `_row_id`+vector table — are materialised under
 /// tenant A through the single `BuildingTable::finish` funnel, plus one GLOBAL
 /// (unscoped) embedding table, then read back over `with_tenant_scoped(T, |s|
 /// s.sql("SELECT count(*) FROM \"jammi.<name>\""))` — the actual Flight `db.sql`
 /// path. The 3-arm control: A reads its own tables (N > 0); the GLOBAL table is
 /// visible to BOTH A and B; B reading A's private tables resolves not-found
-/// (the fix), while an admin read of the same tables returns N (non-vacuity —
+/// (the tenant gate), while an admin read of the same tables returns N (non-vacuity —
 /// the bytes exist and are readable, so B's not-found is a scoping result). The
 /// table-name enumeration under B lists the GLOBAL table but not A's.
 async fn assert_result_table_scan_isolated() {
@@ -2866,7 +2864,7 @@ async fn assert_result_table_scan_isolated() {
     );
 
     // Arm 3 — CROSS-TENANT: tenant B reading A's private tables resolves
-    // not-found (the fix); pre-fix these returned A's N rows (the RED).
+    // not-found; without the tenant gate these would return A's N rows.
     let asof_b = scan_count(&engine, tenant_b(), &asof_a).await;
     let emb_b = scan_count(&engine, tenant_b(), &emb_a).await;
     assert!(
@@ -3195,7 +3193,7 @@ fn every_rpc_is_covered() {
 
 /// The allowlist and the cases partition the wire surface with no gaps and no
 /// overlap: every rpc is accounted for exactly once, and the counts sum to the
-/// descriptor total. This is the arithmetic the final report cites.
+/// descriptor total.
 #[test]
 fn allowlist_and_cases_partition_the_wire_surface() {
     let cases = cases();
@@ -3280,7 +3278,7 @@ fn repo_root() -> std::path::PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// The peer-listener exemption's premise (A6 / commit-2 oracle (d))
+// The peer-listener exemption's premise
 // ---------------------------------------------------------------------------
 
 /// The PUBLIC listener answers `UNIMPLEMENTED` for `/jammi.v1.peer.PeerService/*`:
@@ -3288,7 +3286,7 @@ fn repo_root() -> std::path::PathBuf {
 /// to the public `Routes`, so tonic's router fallback refuses them. This is the
 /// invariant that makes [`PEER_LISTENER_ALLOWLIST`] sound — a tenant-bearing
 /// caller cannot reach the tenant-free owner handler through the public
-/// tenant layer. Holds at base and after: the invariant oracle, not a RED one.
+/// tenant layer. An invariant oracle, not a regression one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_service_is_unimplemented_on_the_public_listener() {
     use jammi_wire::proto::peer::peer_service_client::PeerServiceClient;

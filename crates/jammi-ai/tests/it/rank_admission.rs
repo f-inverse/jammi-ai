@@ -1,4 +1,4 @@
-//! #500: what a deployment admits a rank count for, and where it refuses
+//! What a deployment admits a rank count for, and where it refuses
 //! one.
 //!
 //! Two edges, and the tests here are about which is which.
@@ -11,8 +11,7 @@
 //! particular job asks for — the FLEET's bound, `[distributed]
 //! max_world_size` (the serveable world), never this host's own device
 //! count: a count within the serveable world but beyond this host's devices
-//! submits and is decided by assembly on the claiming coordinator (plan 67
-//! U5b-1b-ii). It is the last point at which refusing costs nothing: past it
+//! submits and is decided by assembly on the claiming coordinator. It is the last point at which refusing costs nothing: past it
 //! the spec is a durable row a worker will claim, fail and retry. Every
 //! refusal here is asserted on two things — the typed error variant, and
 //! that the `jobs` table is unchanged — because a refusal that leaves a
@@ -217,9 +216,8 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
 
     // The control: the SAME two-rank submission with neither
     // single-rank-only mechanism is admitted on the serveable-world-of-two
-    // deployment and does write a row — on ONE device: plan 67 U5b-1b-ii
-    // (d), a count within the serveable world but beyond this host's own
-    // devices submits and is decided by assembly (the coordinator body's
+    // deployment and does write a row — on ONE device: a count within the
+    // serveable world but beyond this host's own devices submits and is decided by assembly (the coordinator body's
     // own oracle, `gang_coordinator.rs`), never refused here. Without this
     // the refusals above could all be a submit edge that refuses everything.
     assert_eq!(
@@ -419,7 +417,7 @@ fn the_admission_rule_reads_the_build_as_data() {
     }
 }
 
-/// Plan 67 U5b-1b-ii (d), the refusing half, at the rule itself: a
+/// The refusing half, at the rule itself: a
 /// `world_size` past the serveable world is refused naming `[distributed]
 /// max_world_size`, and one within it is admitted — decided with NO
 /// catalog in scope at all. `RankAdmission` is three plain values (the
@@ -543,7 +541,7 @@ fn a_context_predictor_spec_has_no_rank_count_to_admit() {
         .expect("a predictor spec has no count, so there is nothing to refuse");
 }
 
-/// #573's context-predictor behavioural oracle: the edge's only admission
+/// The context-predictor behavioural oracle: the edge's only admission
 /// effect for this kind is `ContextPredictorTrainConfig::validate` (the
 /// spec above shows `RankAdmission::admit` is a no-op for it), so this is
 /// the ONE test that can go red if that validation is ever skipped —
@@ -796,7 +794,7 @@ fn scan_submit_source(file: &str, text: &str) -> Vec<SubmitCallSite> {
 /// and the raw byte-delete oracle in `jammi-db` shares: every workspace
 /// member's `src/` (the crates AND the `ci/tools/*` members), every
 /// `build.rs`, every `examples/` and `benches/` target; not `tests/`
-/// directories and not the `ci/fixtures/` tokenizer inputs. `#[cfg(test)]`
+/// directories. `#[cfg(test)]`
 /// items inside those files are skipped by the scanner. The enumerated
 /// universe [`every_submit_job_call_in_production_code_is_the_seam_or_a_reviewed_non_training_site`]
 /// checks against its allow-list. `Catalog::submit_job`/`submit_job_deduped`
@@ -819,19 +817,18 @@ fn submit_call_sites_in_production_code() -> Vec<SubmitCallSite> {
     hits
 }
 
-/// #573 round 3 (N3-seam): every `Catalog::submit_job`/`submit_job_deduped`
+/// Every `Catalog::submit_job`/`submit_job_deduped`
 /// reference in any compiled non-test `.rs` file in the workspace is on this exact,
 /// reviewed allow-list — the universe is derived from a REAL parse of every
 /// tracked file ([`submit_call_sites_in_production_code`]), not from a
-/// hand-picked list of "the three functions round 1 happened to name": a
-/// fourth edge added ANYWHERE in the crate, in a file this test never
-/// named before, still shows up as an entry the allow-list does not
+/// hand-picked list of known functions: a fourth edge added ANYWHERE in the
+/// crate, in a file this test never named, still shows up as an entry the allow-list does not
 /// contain.
 ///
 /// The allow-list, and why each entry is sound:
 ///
-/// - `fine_tune/spec.rs::submit_admitted_training` — the training seam
-///   (#573 round 3): its ONLY caller-visible parameter that can produce a
+/// - `fine_tune/spec.rs::submit_admitted_training` — the training seam:
+///   its ONLY caller-visible parameter that can produce a
 ///   training-kind row is `admitted: &AdmittedTrainingSpec`, a type whose
 ///   single field is private to this module, so the ONLY way any caller —
 ///   in this crate, or across the `jammi-bench` crate boundary, since this
@@ -868,9 +865,7 @@ fn submit_call_sites_in_production_code() -> Vec<SubmitCallSite> {
 /// list does not contain) — makes this test fail, printing the new
 /// `(file, fn)` pair `("crates/jammi-ai/src/jobs.rs",
 /// "submit_training_spec_unadmitted")` as an entry the allow-list does not
-/// authorize. This is exactly the #573 issue text's own fourth-edge
-/// reproducer (`local_session.rs::submit_training_spec_unadmitted`), proven
-/// against THIS oracle rather than the round-1 text scan it superseded.
+/// authorize — a fourth, unadmitted training edge, caught by this oracle.
 /// Run the real scanner over a synthetic fixture and return `fn` names —
 /// what every `submit_shape_*` falsification below asserts on.
 fn submit_shape_fns(src: &str) -> Vec<String> {
@@ -882,19 +877,15 @@ fn submit_shape_fns(src: &str) -> Vec<String> {
 
 #[test]
 fn submit_shape_1_a_method_call_is_found() {
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_1 — not real code in this file
     let src = "async fn f(c: C, p: P) { c.submit_job(p).await.unwrap(); }";
     assert_eq!(submit_shape_fns(src), vec!["f"]);
 }
 
 #[test]
 fn submit_shape_2_a_path_call_is_found_under_any_prefix_and_qualified_self() {
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_2 (bare type path) — not real code in this file
     let bare = "async fn f(c: C, p: P) { Catalog::submit_job(&c, p).await; }";
     let qualified =
-        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_2 (crate-qualified path) — not real code in this file
         "async fn f(c: C, p: P) { crate::db::Catalog::submit_job_deduped(&c, p, None).await; }";
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_2 (qualified self) — not real code in this file
     let qself = "async fn f(c: C, p: P) { <Catalog>::submit_job(&c, p).await; }";
     for (name, src) in [("bare", bare), ("qualified", qualified), ("qself", qself)] {
         assert_eq!(
@@ -907,10 +898,8 @@ fn submit_shape_2_a_path_call_is_found_under_any_prefix_and_qualified_self() {
 
 #[test]
 fn submit_shape_3_a_call_inside_a_macro_invocation_is_found_per_occurrence() {
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_3 (try_join!) — not real code in this file
     let joined = "async fn f(c: C, a: P, b: P) { tokio::try_join!(c.submit_job(a), c.submit_job_deduped(b, None)).unwrap(); }";
     assert_eq!(submit_shape_fns(joined), vec!["f", "f"]);
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_3 (nested group) — not real code in this file
     let nested = "async fn f(c: C, p: P) { assert!(matches!(c.submit_job(p).await, Ok(()))); }";
     assert_eq!(submit_shape_fns(nested), vec!["f"]);
 }
@@ -918,12 +907,9 @@ fn submit_shape_3_a_call_inside_a_macro_invocation_is_found_per_occurrence() {
 #[test]
 fn submit_shape_4_a_path_captured_as_a_value_is_found_wherever_it_appears() {
     let captured =
-        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_4 (fn-item capture) — not real code in this file
         "async fn f(c: C, p: P) { let route = Catalog::submit_job; route(&c, p).await; }";
     let combinator =
-        // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_4 (combinator argument) — not real code in this file
         "fn f(c: C, ps: Vec<P>) { let _ = ps.into_iter().map(Catalog::submit_job_deduped); }";
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_4 (struct field) — not real code in this file
     let field = "fn f() -> Routes { Routes { submit: <Catalog>::submit_job } }";
     for (name, src) in [
         ("captured", captured),
@@ -940,7 +926,6 @@ fn submit_shape_4_a_path_captured_as_a_value_is_found_wherever_it_appears() {
 
 #[test]
 fn submit_shape_controls_a_near_miss_identifier_or_a_string_literal_is_not_a_call() {
-    // kernel-oracles: fn-in-literal reviewed: synthetic source fixture for submit_shape_controls — not real code in this file
     let src = "async fn f(c: C, p: P) { c.submit_jobs(p).await; let _ = submit_job_count(); \
                tracing::warn!(\"submit_job refused\"); format!(\"submit_job_deduped\"); }";
     assert_eq!(submit_shape_fns(src), Vec::<String>::new());
@@ -994,14 +979,13 @@ fn every_submit_job_call_in_production_code_is_the_seam_or_a_reviewed_non_traini
     );
 }
 
-/// #573's context-predictor edge and `submit_fine_tune_spec_deduped` are
-/// NOT on the allow-list above (round 3 shape): both now reach
+/// The context-predictor edge and `submit_fine_tune_spec_deduped` are
+/// NOT on the allow-list above: both reach
 /// `submit_admitted_training` themselves rather than calling
 /// `Catalog::submit_job_deduped` directly, so their OWN admission is pinned
 /// by this behavioural check — each calls
 /// `crate::fine_tune::spec::admit_training_spec` in its own body before
-/// calling the seam, source-verified the same way round 1/2 verified it,
-/// now over the two files whose training-kind row NEVER touches
+/// calling the seam, source-verified over the two files whose training-kind row NEVER touches
 /// `Catalog::submit_job`/`submit_job_deduped` directly at all.
 ///
 /// Mutation (executed and reverted, never shipped): deleting the
@@ -1018,12 +1002,10 @@ fn the_two_seam_calling_edges_admit_before_calling_the_seam() {
     let edges: &[(&str, &str)] = &[
         (
             "crates/jammi-ai/src/session.rs",
-            // kernel-oracles: fn-in-literal reviewed: the edge function's own signature text, searched for verbatim below — not code in this file
             "async fn submit_fine_tune_spec_deduped(",
         ),
         (
             "crates/jammi-ai/src/pipeline/context_predictor.rs",
-            // kernel-oracles: fn-in-literal reviewed: the edge function's own signature text, searched for verbatim below — not code in this file
             "pub(crate) async fn train_context_predictor_deduped(",
         ),
     ];

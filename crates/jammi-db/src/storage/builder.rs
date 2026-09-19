@@ -26,7 +26,7 @@ pub type DynObjectStore = Arc<dyn ObjectStore>;
 /// `models/` refusal — comes into existence. Outside this crate, get a
 /// guarded [`super::object_store_handle::JammiObjectStore`] instead, via
 /// [`super::registry::StorageRegistry::handle_for`] or
-/// [`super::object_store_handle::JammiObjectStore::open`] (#588) — neither
+/// [`super::object_store_handle::JammiObjectStore::open`] — neither
 /// returns or passes the raw driver to caller code.
 pub(crate) fn build_object_store(
     url: &StorageUrl,
@@ -163,7 +163,7 @@ fn build_azure(
     })
 }
 
-// R2 is the S3 driver underneath; W2 keeps it a first-class scheme so the two
+// R2 is the S3 driver underneath, kept a first-class scheme so the two
 // quirks R2 imposes — an account-scoped endpoint and `region = "auto"` — are
 // derived here instead of being a deployer's hand-rolled `S3Config` incantation.
 #[cfg(feature = "storage-r2")]

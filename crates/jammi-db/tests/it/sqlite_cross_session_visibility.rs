@@ -1,53 +1,45 @@
-//! esc-071 RED oracle (`closes_escape: esc-071`) — cross-session catalog read
-//! visibility on ONE SQLite catalog file.
+//! Cross-session catalog read visibility on ONE SQLite catalog file.
 //!
-//! Contract under test (`many readers run alongside one writer`, docs/guide/src/catalog-and-broker.md:158;
-//! two-sessions-per-process supported per `two sessions on the same process see disjoint rows`, docs/guide/src/multi-tenant.md:17,274-276):
-//! on one SQLite catalog file in one
-//! process, a catalog read through ANY engine session must observe every write
-//! another session has already committed — on that pooled connection's Nth
-//! read, not only its first.
+//! Invariant (`many readers run alongside one writer`,
+//! docs/guide/src/catalog-and-broker.md; two sessions per process are
+//! supported, docs/guide/src/multi-tenant.md): on one SQLite catalog file in
+//! one process, a catalog read through ANY engine session observes every
+//! write another session has already committed — on that pooled
+//! connection's Nth read, not only its first.
 //!
-//! The gate this closes: the only pre-existing two-sessions-one-file catalog
-//! test (`tenant_scope.rs:65-125`) is tenant-DISJOINT, so a stale read passes it
-//! vacuously; the single-pool read-after-write coverage in
-//! `fine_tune_job_catalog_crud`, crates/jammi-ai/tests/it/fine_tune.rs:1202-1283
-//! never opens a second pool at all (`backend_sqlite.rs:24-41` builds one pool
-//! per session).
+//! A tenant-DISJOINT two-session test passes a stale read vacuously, and a
+//! single-pool read-after-write test never opens a second pool at all
+//! (`backend_sqlite.rs` builds one pool per session); this file covers the
+//! two-pool, same-tenant case.
 //!
-//! Oracle shape (verbatim from the row's `symptom_spec.observable`): two
-//! `JammiSession`s built by `make_test_session(Sqlite, dir)` on ONE tempdir =>
-//! two `SqliteBackend` pools on `<dir>/catalog.db`, BOTH live for the whole
-//! test. Session B creates training job `j`, then over N = 4 rounds stamps a
-//! round-distinct value (`metrics = {"round": i}`) through the catalog's own
-//! write path; after each write session A calls `get_training_job("j")` and must
-//! observe `round == i`.
+//! Oracle shape: two `JammiSession`s built by `make_test_session(Sqlite, dir)`
+//! on ONE tempdir => two `SqliteBackend` pools on `<dir>/catalog.db`, BOTH
+//! live for the whole test. Session B creates training job `j`, then over
+//! N = 4 rounds stamps a round-distinct value (`metrics = {"round": i}`)
+//! through the catalog's own write path; after each write session A calls
+//! `get_training_job("j")` and must observe `round == i`.
 //!
-//! Failure per the row's `control`: any of (a) `round != i` — including the
-//! exact-one-round lag `i - 1` the python wave reproduced, which the pairwise
-//! distinct round values make impossible to match coincidentally; (b)
-//! absent/not-found; (c) any `Err` at all (never swallowed, retried, or called
-//! inconclusive); (d) panic/timeout. There is no sleep and no retry anywhere in
-//! the assertion path — a value that is only correct after a delay is a
-//! FAILURE, not a pass.
+//! Failure: any of (a) `round != i` — including an exact-one-round lag
+//! `i - 1`, which the pairwise distinct round values make impossible to match
+//! coincidentally; (b) absent/not-found; (c) any `Err` at all (never
+//! swallowed, retried, or called inconclusive); (d) panic/timeout. There is
+//! no sleep and no retry anywhere in the assertion path — a value that is
+//! only correct after a delay is a FAILURE, not a pass.
 //!
-//! Two non-vacuity arms run alongside the assertion, per the row: a SAME-POOL
-//! control (B reads its own write each round — must be `round == i`, proving the
-//! write itself landed) and a FRESH-POOL baseline (a brand-new session's FIRST
-//! read after the same write — must be `round == i`, proving the value is
-//! visible to a cold pool, i.e. the harness is not broken).
+//! Two non-vacuity arms run alongside the assertion: a SAME-POOL control (B
+//! reads its own write each round — must be `round == i`, proving the write
+//! itself landed) and a FRESH-POOL baseline (a brand-new session's FIRST read
+//! after the same write — must be `round == i`, proving the value is visible
+//! to a cold pool, i.e. the harness is not broken).
 //!
 //! Both sessions are unscoped (tenant `NULL`), never a tenant-disjoint pair:
-//! disjoint tenants would make the assertion vacuous, which is exactly the hole
-//! `tenant_scope.rs` leaves.
+//! disjoint tenants would make the assertion vacuous.
 //!
-//! Companion coverage: the reported lag's ACTUAL topology is not this one. The
-//! python wave's writer was a raw CPython `sqlite3` connection — a second SQLite
-//! *library instance* in the process, not a second engine pool — and the
-//! sequential two-library equivalent of the loop below lives in
-//! `esc_073_foreign_sqlite_library.rs`'s stale-read arm. Read the two together:
-//! this file pins the SUPPORTED two-pool topology, that one pins the
-//! out-of-contract two-library one.
+//! Companion coverage: a writer that is a second SQLite *library instance* in
+//! the process (e.g. CPython's `sqlite3` module), not a second engine pool, is
+//! covered by `sqlite_foreign_library.rs`'s stale-read arm. Read the
+//! two together: this file pins the SUPPORTED two-pool topology, that one pins
+//! the out-of-contract two-library one.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -77,21 +69,18 @@ macro_rules! must {
     ($what:expr, $fut:expr) => {
         match tokio::time::timeout(OP_TIMEOUT, $fut).await {
             Ok(v) => v,
-            Err(_) => panic!("esc-071: {} timed out after {OP_TIMEOUT:?}", $what),
+            Err(_) => panic!("visibility: {} timed out after {OP_TIMEOUT:?}", $what),
         }
     };
 }
 
-/// Open a SQLite-backed session on `dir`, or skip (the Postgres arm of
-/// `make_test_session` is the only `None` case, and this file is SQLite-only).
+/// Open a SQLite-backed session on `dir` (this file is SQLite-only).
 async fn session_on(dir: &Path) -> JammiSession {
-    make_test_session(BackendKind::Sqlite, dir)
-        .await
-        .expect("sqlite session on the shared catalog dir")
+    make_test_session(BackendKind::Sqlite, dir).await
 }
 
 /// Read job `job_id` through `catalog` and return the `round` field of its
-/// metrics blob. Every non-observation is a panic, per the row's control: an
+/// metrics blob. Every non-observation is a panic: an
 /// `Err`, a missing row, a `NULL`/unparseable metrics blob, or a blob with no
 /// integer `round` — none of them are ever folded into "inconclusive".
 async fn observed_round(catalog: &Catalog, job_id: &str, who: &str, round: i64) -> i64 {
@@ -100,20 +89,22 @@ async fn observed_round(catalog: &Catalog, job_id: &str, who: &str, round: i64) 
         catalog.get_job(job_id)
     )
     .unwrap_or_else(|err| {
-        panic!("esc-071: {who} read at round {round} failed: {err}");
+        panic!("visibility: {who} read at round {round} failed: {err}");
     });
 
     let raw = record.progress_phase.unwrap_or_else(|| {
-        panic!("esc-071: {who} read at round {round} saw metrics ABSENT (expected round {round})");
+        panic!(
+            "visibility: {who} read at round {round} saw metrics ABSENT (expected round {round})"
+        );
     });
     let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|err| {
-        panic!("esc-071: {who} read at round {round} saw unparseable metrics {raw:?}: {err}");
+        panic!("visibility: {who} read at round {round} saw unparseable metrics {raw:?}: {err}");
     });
     parsed
         .get("round")
         .and_then(serde_json::Value::as_i64)
         .unwrap_or_else(|| {
-            panic!("esc-071: {who} read at round {round} saw metrics without an integer `round`: {raw:?}");
+            panic!("visibility: {who} read at round {round} saw metrics without an integer `round`: {raw:?}");
         })
 }
 
@@ -173,13 +164,13 @@ async fn second_session_observes_every_committed_round() {
     assert_eq!(claimed.job_id, "j");
 
     // Warm session A's pool with a read BEFORE the first round, so the rounds
-    // below are A's 2nd..5th reads — the row's defect is a stale value on the
+    // below are A's 2nd..5th reads — the defect guarded against is a stale value on the
     // 2nd+ read of an already-warm pooled connection, which a cold-pool-only
     // probe cannot see.
     let warm = must!("warm read", catalog_a.get_job("j")).expect("session A warm read");
     assert_eq!(
         warm.status, "running",
-        "esc-071: session A's FIRST read must already observe B's committed claim"
+        "visibility: session A's FIRST read must already observe B's committed claim"
     );
 
     for i in 1..=ROUNDS {
@@ -188,15 +179,15 @@ async fn second_session_observes_every_committed_round() {
             format!("write round {i}"),
             catalog_b.progress_job("j", "worker-b", 1, None, None, Some(&payload))
         )
-        .unwrap_or_else(|err| panic!("esc-071: write of round {i} failed: {err}"));
-        assert!(landed, "esc-071: write of round {i} matched no row");
+        .unwrap_or_else(|err| panic!("visibility: write of round {i} failed: {err}"));
+        assert!(landed, "visibility: write of round {i} matched no row");
 
         // ── Assertion: session A, second live pool, no sleep, no retry. ──
         let seen_a = observed_round(catalog_a, "j", "session A (2nd pool)", i).await;
         assert_eq!(
             seen_a,
             i,
-            "esc-071: session A observed round {seen_a} on a read taken AFTER round {i} \
+            "visibility: session A observed round {seen_a} on a read taken AFTER round {i} \
              committed through session B (a lag of {} round(s))",
             i - seen_a
         );
@@ -205,7 +196,7 @@ async fn second_session_observes_every_committed_round() {
         let seen_b = observed_round(catalog_b, "j", "session B (writer's own pool)", i).await;
         assert_eq!(
             seen_b, i,
-            "esc-071 CONTROL BROKEN: the writing session's own pool did not observe its \
+            "visibility CONTROL BROKEN: the writing session's own pool did not observe its \
              own committed round {i} (saw {seen_b}) — the write path, not cross-session \
              visibility, is at fault"
         );
@@ -216,7 +207,7 @@ async fn second_session_observes_every_committed_round() {
             observed_round(session_c.catalog(), "j", "fresh session C (cold pool)", i).await;
         assert_eq!(
             seen_c, i,
-            "esc-071 HARNESS BROKEN: a brand-new session's FIRST read did not observe \
+            "visibility HARNESS BROKEN: a brand-new session's FIRST read did not observe \
              committed round {i} (saw {seen_c}) — the value is not on disk at all"
         );
         drop(session_c);
@@ -225,14 +216,13 @@ async fn second_session_observes_every_committed_round() {
 
 // ── Mechanism probes ────────────────────────────────────────────────────────
 //
-// The oracle above is the row's `observable` verbatim. These probes widen it
-// along the axes the python r3-repair wave actually touched, so that a GREEN
-// oracle is a MEASURED absence of the defect on those axes rather than an
-// unprobed one. Each probe carries the SAME control as the oracle: any `Err`,
+// These probes widen the oracle above along the axes a stale read could hide
+// on, so that a passing oracle is a MEASURED absence of the defect on those
+// axes rather than an unprobed one. Each probe carries the SAME control as the oracle: any `Err`,
 // absence, or wrong round is a FAILURE, and there is no sleep and no retry.
 
 /// Probe A — a stale value on a *warm pooled connection*, spread across the
-/// whole pool. `SqlitePoolOptions::max_connections(8)` (`backend_sqlite.rs:35`)
+/// whole pool. `SqlitePoolOptions::max_connections(8)` (`backend_sqlite.rs`)
 /// means a session's reads can land on any of eight physical SQLite
 /// connections; the oracle's sequential reads re-use one idle connection, so a
 /// per-connection staleness could hide behind it. Here every one of A's
@@ -260,14 +250,17 @@ async fn probe_every_warm_pooled_connection_observes_the_write() {
             format!("write round {i}"),
             catalog_b.progress_job("j", "worker-b", 1, None, None, Some(&payload))
         )
-        .unwrap_or_else(|err| panic!("esc-071 probe A: write of round {i} failed: {err}"));
-        assert!(landed, "esc-071 probe A: write of round {i} matched no row");
+        .unwrap_or_else(|err| panic!("visibility probe A: write of round {i} failed: {err}"));
+        assert!(
+            landed,
+            "visibility probe A: write of round {i} matched no row"
+        );
 
         let seen = fanout_rounds(catalog_a, FANOUT, i).await;
         for (slot, round) in seen.iter().enumerate() {
             assert_eq!(
                 *round, i,
-                "esc-071 probe A: warm pooled read #{slot} observed round {round} after \
+                "visibility probe A: warm pooled read #{slot} observed round {round} after \
                  round {i} committed through the other session's pool"
             );
         }
@@ -278,7 +271,7 @@ async fn probe_every_warm_pooled_connection_observes_the_write() {
 /// transaction open on another of its pooled connections. A held `BEGIN
 /// DEFERRED` pins a WAL snapshot on ITS connection (correct SQLite semantics);
 /// what this probe answers is whether that snapshot leaks to the session's
-/// OTHER pooled connections, which would be exactly the reported lag.
+/// OTHER pooled connections, which would be exactly a cross-session lag.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn probe_read_beside_a_long_lived_read_transaction_observes_the_write() {
     use jammi_db::catalog::backend::TxOptions;
@@ -330,15 +323,18 @@ async fn probe_read_beside_a_long_lived_read_transaction_observes_the_write() {
             format!("write round {i}"),
             catalog_b.progress_job("j", "worker-b", 1, None, None, Some(&payload))
         )
-        .unwrap_or_else(|err| panic!("esc-071 probe B: write of round {i} failed: {err}"));
-        assert!(landed, "esc-071 probe B: write of round {i} matched no row");
+        .unwrap_or_else(|err| panic!("visibility probe B: write of round {i} failed: {err}"));
+        assert!(
+            landed,
+            "visibility probe B: write of round {i} matched no row"
+        );
 
         // A's read on a DIFFERENT pooled connection, while A's own long-lived
         // read transaction pins an older snapshot elsewhere in the same pool.
         let seen = observed_round(catalog_a, "j", "session A beside a held read tx", i).await;
         assert_eq!(
             seen, i,
-            "esc-071 probe B: a read beside this session's own long-lived read transaction \
+            "visibility probe B: a read beside this session's own long-lived read transaction \
              observed round {seen} after round {i} committed"
         );
     }
@@ -349,13 +345,14 @@ async fn probe_read_beside_a_long_lived_read_transaction_observes_the_write() {
         .expect("held read transaction");
 }
 
-/// Probe C — the python wave's actual write shape: the value is committed by a
-/// connection OUTSIDE either session's pool (`test_conformance.py:968-978`
-/// commits it through a raw `sqlite3` connection it then closes) while the
+/// Probe C — a foreign-connection write: the value is committed by a
+/// connection OUTSIDE either session's pool (as a Python client committing
+/// through a raw `sqlite3` connection it then closes would) while the
 /// reading session's pool stays warm. This is the closest in-Rust analogue: a
 /// standalone `sqlx` connection opened directly on `<dir>/catalog.db` for one
 /// `UPDATE`, then closed — never a member of either pool. (It is still the same
-/// SQLite *library instance*; the two-library case is esc-073's harness.)
+/// SQLite *library instance*; the two-library case is
+/// `sqlite_foreign_library.rs`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn probe_foreign_connection_write_is_observed_by_a_warm_pool() {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
@@ -387,19 +384,19 @@ async fn probe_foreign_connection_write_is_observed_by_a_warm_pool() {
             .bind(&payload)
             .execute(&mut foreign)
             .await
-            .unwrap_or_else(|err| panic!("esc-071 probe C: foreign write of round {i}: {err}"));
+            .unwrap_or_else(|err| panic!("visibility probe C: foreign write of round {i}: {err}"));
         foreign.close().await.expect("close foreign connection");
 
         let seen = observed_round(catalog_a, "j", "session A (warm pool)", i).await;
         assert_eq!(
             seen, i,
-            "esc-071 probe C: warm pool observed round {seen} after a foreign connection \
+            "visibility probe C: warm pool observed round {seen} after a foreign connection \
              committed round {i} to the same catalog file"
         );
         let seen_b = observed_round(catalog_b, "j", "session B (warm pool)", i).await;
         assert_eq!(
             seen_b, i,
-            "esc-071 probe C: the other warm pool observed round {seen_b} after a foreign \
+            "visibility probe C: the other warm pool observed round {seen_b} after a foreign \
              connection committed round {i}"
         );
     }
@@ -476,7 +473,7 @@ async fn fanout_rounds(catalog: &Arc<Catalog>, n: usize, expect_round: i64) -> V
     if expect_round == 0 {
         assert!(
             out.iter().all(|r| *r == 0),
-            "esc-071 probe: warm-up fan-out saw metrics before the first round was written"
+            "visibility probe: warm-up fan-out saw metrics before the first round was written"
         );
     }
     out

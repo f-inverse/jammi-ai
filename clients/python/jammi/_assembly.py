@@ -611,8 +611,7 @@ def build_fine_tune_request(
     ranks that train this job cooperatively; `1` (the default) is a single
     process and leaves the wire field unset — see :func:`_wire_world_size`.
     `cache="use"` is refused, typed (:class:`jammi.errors.InvalidArgument`):
-    model-level cache reuse is not yet supported
-    (<https://github.com/f-inverse/jammi-ai/issues/562>); `cache=None` or
+    model-level cache reuse is not supported; `cache=None` or
     ``"bypass"`` (the default) always trains — see
     :func:`_wire_cache_policy_for_submit_job`.
     """

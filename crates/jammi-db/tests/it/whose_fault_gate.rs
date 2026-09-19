@@ -1,37 +1,31 @@
-//! The whose-fault gate — DIST round 8 (`CONTRACT-DIST-fix5.md`'s M1,
-//! closing the ruling: "wrong attribution is still constructible, and
-//! worse, it is live and pinned").
+//! The whose-fault gate: a caller-fault error is never constructed for an
+//! engine-owned artifact's own corruption.
 //!
 //! **The invariant.** [`jammi_db::error::JammiError::Schema`] is the
 //! CALLER-fault class (`crates/jammi-db/src/error.rs`'s own doc: "a CALLER's
 //! vector is the caller's fault — the schema class"; the wire mapping sends
-//! it out as gRPC `InvalidArgument`). Six prior rounds enforced this
-//! invariant at exactly ONE seam — [`jammi_numerics::query::ValidatedQuery::
-//! require_width`], the downstream, artifact-only width check, which is
-//! structurally incapable of expressing a caller fault because its error
-//! variant carries no [`jammi_numerics::query::QuerySource`] at all — and
-//! each round found the NEXT construction of the caller-fault class that
-//! bypassed that one seam and billed an engine-owned artifact's own
-//! corruption to the caller instead (`crates/jammi-db/src/index/exact.rs`'s
-//! corrupt scan width, `crates/jammi-db/src/index/placed.rs`'s absent
-//! catalog width — both fixed the round this gate was written, alongside
-//! two more of the same shape this gate's own derivation found:
-//! `crates/jammi-db/src/store/vectors.rs`'s shared column-extraction
-//! helpers and `crates/jammi-db/src/store/deletes.rs`'s mask reader, both
-//! billing THIS table's or THIS mask's own stored corruption to the
-//! caller).
+//! it out as gRPC `InvalidArgument`). A single seam cannot enforce this —
+//! [`jammi_numerics::query::ValidatedQuery::require_width`], the downstream,
+//! artifact-only width check, is structurally incapable of expressing a
+//! caller fault (its error variant carries no
+//! [`jammi_numerics::query::QuerySource`] at all), but any OTHER
+//! construction of the caller-fault class can bill an engine-owned
+//! artifact's own corruption to the caller (a corrupt scan width in
+//! `crates/jammi-db/src/index/exact.rs`, an absent catalog width in
+//! `crates/jammi-db/src/index/placed.rs`, `crates/jammi-db/src/store/vectors.rs`'s
+//! shared column-extraction helpers, `crates/jammi-db/src/store/deletes.rs`'s
+//! mask reader are all sites of that shape).
 //!
-//! **What changed here.** The site-by-site sweep is REPLACED, not
-//! supplemented, by a mechanical enumeration of every construction of
+//! **The mechanism.** A mechanical enumeration of every construction of
 //! `JammiError::Schema` across the whole surface the property quantifies
 //! over — `crates/jammi-db/src` and `crates/jammi-numerics/src` — modelled
-//! on the sibling DELTA unit's gate
+//! on the sibling gate
 //! (`crates/jammi-ai/tests/it/pinned_source_gate.rs`): the scanned surface
 //! is derived from `git ls-files` (not a hand-rolled directory walk), a
 //! file `git ls-files` reports tracked that this process cannot then read
 //! is a hard failure naming the file, and every hit the detector finds
-//! TODAY is enumerated in [`ALLOWED`] with its own disclosure note — an
-//! allowlist entry whose site no longer produces that hit is ALSO RED
+//! is enumerated in [`ALLOWED`] with its own review note — an
+//! allowlist entry whose site does not produce that hit ALSO fails
 //! ([`allowlist_entries_still_produce_their_hit`]), so an allowance can
 //! never become permanent slack a later, different site spends.
 //!
@@ -45,7 +39,7 @@
 //!
 //! **Production vs. test.** Every PATTERN match on `JammiError::Schema`
 //! (`match err { JammiError::Schema { .. } => `, `matches!(&err,
-//! JammiError::Schema { .. })`) found across this surface today is inside a
+//! JammiError::Schema { .. })`) found across this surface is inside a
 //! `#[cfg(test)]` item. The detector excludes exactly the byte range each
 //! `#[cfg(test)]` marker's own item spans ([`test_ranges`]) — NOT "from the
 //! first marker to EOF": `crates/jammi-db/src/config/mod.rs` gates an
@@ -78,21 +72,17 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The whole surface this gate's property quantifies over (`CONTRACT-DIST-
-/// fix5.md`, M1: "over `crates/jammi-db/src` and `crates/jammi-numerics/src`").
+/// The whole surface this gate's property quantifies over.
 const SURFACE_DIRS: &[&str] = &["crates/jammi-db/src", "crates/jammi-numerics/src"];
 
 /// Every reviewed production construction of `JammiError::Schema` this
-/// gate's scan finds TODAY, each with its own disclosure note. Keyed on
-/// `(file, enclosing function name, ordinal, occurrence)` — round 10, see
+/// gate's scan finds, each with its own review note. Keyed on
+/// `(file, enclosing function name, ordinal, occurrence)` — see
 /// [`FnRegion`]'s and [`SchemaHit`]'s docs for why: a bare declaration LINE
 /// desyncs from the reviewed function under an edit that only shifts lines
-/// above it (measured stale against PR #521's CI: this whole list drifted
-/// off `crates/jammi-db/src/error.rs` after an unrelated history rewrite
-/// moved its two entries from lines 584/605 to 545/566 with neither
-/// reviewed `fn from` arm itself changing). An entry whose site no longer
-/// produces the hit is RED ([`allowlist_entries_still_produce_their_hit`]);
-/// a hit not in this list is RED
+/// above it. An entry whose site does not produce the hit fails
+/// ([`allowlist_entries_still_produce_their_hit`]); a hit not in this list
+/// fails
 /// ([`every_production_schema_construction_is_reviewed_as_a_caller_fault_entry`]).
 const ALLOWED: &[(&str, &str, usize, usize, &str)] = &[
     (
@@ -100,9 +90,8 @@ const ALLOWED: &[(&str, &str, usize, usize, &str)] = &[
         "from",
         2, // ordinal 2 — the second `fn from` in this file (the first is
         // `impl From<datafusion::error::DataFusionError>`); this one is
-        // `impl From<jammi_numerics::query::QueryValidationError>`, line
-        // 534 today.
-        1, // occurrence 1 (line 545 today) — see the note below.
+        // `impl From<jammi_numerics::query::QueryValidationError>`.
+        1, // occurrence 1 — see the note below.
         "The settled mechanism itself: `QueryValidationError::NonFinite`'s \
          `QuerySource::Caller` arm. This IS the entry — `validate_query` \
          checked the query's own finiteness against nothing but the \
@@ -114,7 +103,7 @@ const ALLOWED: &[(&str, &str, usize, usize, &str)] = &[
         "crates/jammi-db/src/error.rs",
         "from",
         2,
-        2, // occurrence 2 (line 566 today) — same enclosing `fn from`
+        2, // occurrence 2 — same enclosing `fn from`
         // (ordinal 2) as the entry above; a DIFFERENT construction
         // inside it, so `occurrence` (not `ordinal`) is what tells the
         // two apart.
@@ -128,25 +117,24 @@ const ALLOWED: &[(&str, &str, usize, usize, &str)] = &[
     (
         "crates/jammi-db/src/store/content_hash.rs",
         "from_hex",
-        1, // ordinal 1 — the only `from_hex` in this file; line 64 today
+        1, // ordinal 1 — the only `from_hex` in this file
         1,
         "`ContentHash::from_hex`'s length/charset check on the stored \
-         `_content_hash` column's hex text. Reviewed and left CALLER-class \
-         (not re-classified this round): every production caller renders \
+         `_content_hash` column's hex text. Reviewed and left CALLER-class: \
+         every production caller renders \
          this column from a source row's OWN content via \
          `content_hash_row`, which always emits exactly 64 lowercase hex \
          characters by construction (`hasher.finalize()` over a `Sha256`, \
          `hex::encode`) — a malformed value here would mean this crate's \
          own encoder is broken, not a corrupt READ of a stored artifact in \
          the same sense as `exact.rs`'s scan-width class. Not probed \
-         further this round; flagged here for the next sweep rather than \
-         silently cleared.",
+         further; flagged here rather than silently cleared.",
     ),
     (
         "crates/jammi-db/src/store/content_hash.rs",
         "from_hex",
         1,
-        2, // occurrence 2, same `from_hex` — line 72 today
+        2, // occurrence 2, same `from_hex`
         "`ContentHash::from_hex`'s `hex::decode_to_slice` failure arm — \
          same review as occurrence 1 above (length/charset already passed, \
          so this is an internal-consistency check on the same value).",
@@ -154,7 +142,7 @@ const ALLOWED: &[(&str, &str, usize, usize, &str)] = &[
     (
         "crates/jammi-db/src/store/content_hash.rs",
         "cell",
-        1, // ordinal 1 — the only `cell` in this file; line 126 today
+        1, // ordinal 1 — the only `cell` in this file
         1,
         "`cell()`'s unknown-Arrow-type arm inside `content_hash_columns`. \
          Reviewed and left CALLER-class: the module doc states rendering \
@@ -162,15 +150,14 @@ const ALLOWED: &[(&str, &str, usize, usize, &str)] = &[
          and this kernel refuses anything it was NOT told to render \
          first — a wrongly-typed column here is a caller of THIS crate \
          (the UDF) skipping its own contract, not a stored artifact's \
-         drift. Not probed this round whether an end user's SQL can drive \
-         an unrendered column into this kernel; flagged for the next \
-         sweep.",
+         drift. Not probed whether an end user's SQL can drive \
+         an unrendered column into this kernel; flagged here.",
     ),
     (
         "crates/jammi-db/src/store/content_hash.rs",
         "content_hash_columns",
         1, // ordinal 1 — the only `content_hash_columns` in this file
-        1, // occurrence 1 — line 144 today
+        1, // occurrence 1
         "`content_hash_columns`'s empty-column-list guard — an argument- \
          shape check on the kernel's own parameters, not a data read.",
     ),
@@ -178,7 +165,7 @@ const ALLOWED: &[(&str, &str, usize, usize, &str)] = &[
         "crates/jammi-db/src/store/content_hash.rs",
         "content_hash_columns",
         1,
-        2, // occurrence 2 — line 154 today
+        2, // occurrence 2
         "`content_hash_columns`'s row-count-mismatch guard — an \
          argument-shape check across the kernel's own parameters (unequal \
          column lengths), not a data read.",
@@ -188,7 +175,7 @@ const ALLOWED: &[(&str, &str, usize, usize, &str)] = &[
         "materialize_computed_embedding_table",
         1, // ordinal 1 — the only `materialize_computed_embedding_table`
         // in this file
-        1, // occurrence 1 — line 3538 today
+        1, // occurrence 1
         "`materialize_computed_embedding_table`'s reserved-provenance-key \
          guard: refuses the CALLER's own `provenance.params` for carrying \
          a key this call reserves. The caller's own argument, checked at \
@@ -198,7 +185,7 @@ const ALLOWED: &[(&str, &str, usize, usize, &str)] = &[
         "crates/jammi-db/src/store/mod.rs",
         "materialize_computed_embedding_table",
         1,
-        2, // occurrence 2 — line 3551 today
+        2, // occurrence 2
         "`materialize_computed_embedding_table`'s per-row width check \
          against `spec.dimensions` — an explicit parameter the SAME call \
          supplies alongside `rows`, both the caller's own arguments. The \
@@ -208,7 +195,7 @@ const ALLOWED: &[(&str, &str, usize, usize, &str)] = &[
         "crates/jammi-db/src/store/mod.rs",
         "materialize_computed_embedding_table",
         1,
-        3, // occurrence 3 — line 3560 today
+        3, // occurrence 3
         "`materialize_computed_embedding_table`'s non-finite/zero-norm \
          check on the caller's own `rows` before they are normalized and \
          stored — the entry, before anything is written.",
@@ -235,7 +222,7 @@ const ALLOWED: &[(&str, &str, usize, usize, &str)] = &[
         "crates/jammi-db/src/store/schema.rs",
         "embedding_batch_with_null_hash",
         1, // ordinal 1 — the only `embedding_batch_with_null_hash` in this
-        // file; line 48 today
+        // file
         1,
         "`embedding_batch_with_null_hash`'s per-row width check against an \
          explicit `dimensions` parameter the same call receives — the \
@@ -244,11 +231,10 @@ const ALLOWED: &[(&str, &str, usize, usize, &str)] = &[
     (
         "crates/jammi-db/src/store/vectors.rs",
         "into_caller_fault",
-        1, // ordinal 1 — the only `into_caller_fault` in this file; line 65
-        // today
+        1, // ordinal 1 — the only `into_caller_fault` in this file
         1,
-        "`VectorColumnError::into_caller_fault` — the EXPLICIT override \
-         this round's reshape introduced: every extraction helper in this \
+        "`VectorColumnError::into_caller_fault` — the EXPLICIT override: \
+         every extraction helper in this \
          module defaults to the ENGINE class through `?`'s `From` \
          (`crates/jammi-db/src/store/vectors.rs`'s own module doc), and \
          this is the one call `read_keyed_vectors_f32` makes instead of \
@@ -461,17 +447,14 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// One `fn` item found in `masked`: its name, its ORDINAL (round — DELTA
-/// round 10, ported from `crates/jammi-ai/tests/it/pinned_source_gate.rs`'s
-/// `assign_ordinals`: the 1-based count of functions sharing its name in
-/// this file, in declaration order — stable under any edit strictly ABOVE
-/// the site that does not insert/remove a same-named sibling before it,
-/// unlike a declaration line, which desyncs from an unrelated doc-comment
-/// or merge inserting lines above it with the reviewed function itself
-/// untouched), and its own byte span `[start, end)` in `masked` — used to
-/// bind a hit's byte offset to its enclosing function the same way
-/// `pinned_source_gate.rs`'s `session_registration_literal_sites` binds a
-/// whole-file textual hit to its enclosing function.
+/// One `fn` item found in `masked`: its name, its ORDINAL (ported from
+/// `crates/jammi-ai/tests/it/pinned_source_gate.rs`'s `assign_ordinals`: the 1-based count of
+/// functions sharing its name in this file, in declaration order — stable under any edit strictly
+/// ABOVE the site that does not insert/remove a same-named sibling before it, unlike a declaration
+/// line, which desyncs from an unrelated doc-comment or merge inserting lines above it with the
+/// reviewed function itself untouched), and its own byte span `[start, end)` in `masked` — used to
+/// bind a hit's byte offset to its enclosing function the same way `pinned_source_gate.rs`'s
+/// `session_registration_literal_sites` binds a whole-file textual hit to its enclosing function.
 struct FnRegion {
     name: String,
     ordinal: usize,
@@ -509,7 +492,7 @@ fn find_matching_byte(bytes: &[u8], open_idx: usize, open: u8, close: u8) -> Opt
 
 /// Byte offset one past the `>` matching the `<` at `bytes[open_idx]` (a
 /// generic parameter list) — ported from `pinned_source_gate.rs`'s
-/// `find_matching_angle`, including its round-8 fix: a `->` return arrow's
+/// `find_matching_angle`, including its arrow rule: a `->` return arrow's
 /// `>` is never treated as a closing angle bracket, so a closure/`Fn`-trait
 /// bound (`Fn(&str) -> String`) in a function's generic bounds cannot
 /// desync this scan from the parameter list that follows.
@@ -720,16 +703,13 @@ fn schema_construction_offsets(masked: &str) -> Vec<usize> {
 /// masked text's total BYTE length differs from the original's whenever a
 /// multi-byte character appears inside a comment or string before the
 /// point in question. Counting in the wrong string silently shifts the
-/// reported line number without erroring (measured while building this
-/// gate: `crates/jammi-db/src/error.rs`'s and `store/mod.rs`'s hits were
-/// off by one and by eight-to-ten lines respectively before this was
-/// caught).
+/// reported line number without erroring.
 fn line_of(text: &str, at: usize) -> usize {
     text[..at].matches('\n').count() + 1
 }
 
 /// One production construction of `JammiError::Schema`: the file, its
-/// ENCLOSING FUNCTION's name and ordinal (round 10 — see [`FnRegion`]'s
+/// ENCLOSING FUNCTION's name and ordinal (see [`FnRegion`]'s
 /// doc; `("<module-scope>", 0)` for a construction outside any function),
 /// its OCCURRENCE (the 1-based position of this construction among every
 /// `JammiError::Schema` construction inside that same enclosing function,
@@ -794,15 +774,15 @@ fn production_schema_constructions(rel: &str, text: &str) -> Vec<SchemaHit> {
 /// the whole surface is in [`ALLOWED`], and nothing in [`ALLOWED`] is
 /// extraneous — asserted as one equality so a diff names both an
 /// unreviewed new site and a stale allowlist entry in the same failure.
-/// Compared on `(file, name, ordinal, occurrence)` only (round 10 — see
+/// Compared on `(file, name, ordinal, occurrence)` only (see
 /// [`FnRegion`]'s doc for why a declaration line is not a stable key: a
 /// merge or an unrelated doc comment inserted above a reviewed site shifts
 /// its line with no change to the reviewed function itself, desyncing every
 /// allowlist entry below it from the code it was reviewed against — exactly
 /// the failure this gate's own sibling,
-/// `crates/jammi-ai/tests/it/pinned_source_gate.rs`, hit and fixed the same
-/// way; `occurrence`, see [`SchemaHit`]'s doc, is this gate's own addition
-/// on top of that fix, needed because a single function can hold more than
+/// `crates/jammi-ai/tests/it/pinned_source_gate.rs`, also keys around;
+/// `occurrence`, see [`SchemaHit`]'s doc, is this gate's own addition,
+/// needed because a single function can hold more than
 /// one `JammiError::Schema` construction); `line` is dropped before
 /// comparing, kept on each [`SchemaHit`] only so a failure message can show
 /// a human where to look.
@@ -840,13 +820,12 @@ fn every_production_schema_construction_is_reviewed_as_a_caller_fault_entry() {
     );
 }
 
-/// The inverse control, named separately per the contract ("carry an
-/// inverse control that fires when an allowlisted site stops producing its
-/// hit"): every entry in [`ALLOWED`] is a hit AGAINST TODAY'S SCAN, checked
-/// one at a time so a failure names exactly which entry went stale.
-/// Redundant with the equality above by construction, but the contract asks
-/// for this as its own named check, and a per-entry loop gives a clearer
-/// single-entry failure message than a whole-vector diff would.
+/// The inverse control, which fires when an allowlisted site stops producing
+/// its hit: every entry in [`ALLOWED`] is a hit against the current scan,
+/// checked one at a time so a failure names exactly which entry went stale.
+/// Redundant with the equality above by construction, but a per-entry loop
+/// gives a clearer single-entry failure message than a whole-vector diff
+/// would.
 #[test]
 fn allowlist_entries_still_produce_their_hit() {
     let root = repo_root();
@@ -896,7 +875,7 @@ fn the_numerics_crate_never_constructs_the_caller_fault_class() {
 /// `masked`, brace-balance its body, and return the byte offset one past
 /// its closing `}`. Panics naming `rel` if the shape is not "`mod` then a
 /// brace-balanced body" — this gate only knows how to verify that one
-/// shape, the only one `#[cfg(test)]` gates anywhere on this surface today.
+/// shape, the only one `#[cfg(test)]` gates anywhere on this surface.
 /// Byte offset, relative to `s`, of the character one past the bracket
 /// matching `s`'s own first character (which must be `open`) — a plain
 /// depth counter over `s`, which is safe here because `s` is already
@@ -921,7 +900,7 @@ fn balanced_close(s: &str, open: char, close: char) -> Option<usize> {
 /// own), `mod <ident> { ... }`, or `fn <ident>(...) [-> T] { ... }` — that
 /// `from` (a `#[cfg(test)]` attribute's byte offset) gates, and return the
 /// byte offset one past that item's end. These are the two shapes
-/// `#[cfg(test)]` gates anywhere on this surface today (a bare external-file
+/// `#[cfg(test)]` gates anywhere on this surface (a bare external-file
 /// `mod`, or a bare `fn`); anything else is a hard failure naming `rel`
 /// rather than a silent guess.
 fn end_of_next_test_item(rel: &str, masked: &str, from: usize) -> usize {

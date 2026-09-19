@@ -1,14 +1,11 @@
-//! `--arm alloff` kernel-disable control for `finetune-run` (unit 63 H4a's
-//! own flagged gap, closed here — a coverage gap, not a parity gap:
+//! `--arm alloff` kernel-disable control for `finetune-run`, through the
+//! real compiled `jammi-bench finetune-run` CLI entry point:
 //! `finetune_step_kernel_disable.rs`'s cell 10 (the safety property) proves
 //! `finetune-step` refuses to emit a JSON tier when its declared
-//! `JAMMI_KERNELS_DISABLE` intent was dropped/mistyped/partial; H4a shipped
-//! the SAME check inside `finetune_run::run` for `Arm::Alloff` (`--arm
+//! `JAMMI_KERNELS_DISABLE` intent was dropped/mistyped/partial;
+//! `finetune_run::run` carries the SAME check for `Arm::Alloff` (`--arm
 //! alloff requires JAMMI_KERNELS_DISABLE to resolve to exactly
-//! {ALLOFF_KEYS}` — see that function's doc) but never added an integration
-//! test driving it through the real compiled `jammi-bench finetune-run` CLI
-//! entry point the way `finetune_step_kernel_disable.rs` does for
-//! `finetune-step`. This file closes that gap.
+//! {ALLOFF_KEYS}` — see that function's doc), and this file drives it.
 //!
 //! Each case spawns the compiled `jammi-bench` binary as a fresh child
 //! PROCESS (`env!("CARGO_BIN_EXE_jammi-bench")`), never
@@ -21,7 +18,7 @@
 //! process side-steps it entirely.
 //!
 //! `ALLOFF_KEYS` (`finetune_run.rs`) is `attention_block_flash,adamw_step_fused`
-//! verbatim (CONTRACT Frame) — spelled out literally here rather than
+//! verbatim — spelled out literally here rather than
 //! imported, because this crate is `[[bin]]`-only (no `[lib]` target an
 //! integration test could `use jammi_bench::finetune_run::ALLOFF_KEYS`
 //! from), mirroring every other test file in this directory's own
@@ -166,7 +163,7 @@ fn alloff_without_the_env_var_set_invalidates_the_run() {
 /// The PARTIAL-disable variant of the safety property: only ONE of the two
 /// required ALLOFF op keys is named. This is the real-world failure mode a
 /// pure "was anything disabled at all" check would miss — `alloff` is a
-/// SPECIFIC two-op set (CONTRACT Frame), not "at least one kernel disabled".
+/// SPECIFIC two-op set, not "at least one kernel disabled".
 #[test]
 fn alloff_with_only_one_of_the_two_required_ops_invalidates_the_run() {
     let work_dir = tempfile::tempdir().expect("tempdir");
@@ -187,8 +184,8 @@ fn alloff_with_only_one_of_the_two_required_ops_invalidates_the_run() {
 }
 
 /// The OVER-disable variant: BOTH required ops plus an extra, unrelated
-/// real op. `alloff` names an EXACT set (CONTRACT Frame's
-/// `ALLOFF=attention_block_flash,adamw_step_fused`), so a superset must
+/// real op. `alloff` names an EXACT set
+/// (`ALLOFF=attention_block_flash,adamw_step_fused`), so a superset must
 /// also be refused — a merger pairing this leg against a genuine `alloff`
 /// leg elsewhere would otherwise silently compare runs under different
 /// forced-eager conditions.
@@ -326,14 +323,13 @@ fn fused_arm_with_no_flag_and_an_unrelated_ambient_disable_still_succeeds() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// `--expect-kernels-disabled` (issue #421 P1-b(i)) — the eager-twin proof
+// `--expect-kernels-disabled` — the eager-twin proof
 // a forced-eager profile leg needs. Ported from `finetune-step`'s own flag
 // (`finetune_step_kernel_disable.rs`), with THREE checks instead of one:
 // (1) at START this field must equal the process's real
-// `JAMMI_KERNELS_DISABLE` EXACTLY (finding F1: an earlier revision here was
-// a subset check; the "legitimate combined leg on top of `--arm alloff`"
-// premise it rested on cannot occur, since `--arm alloff`'s own arm-level
-// check forces an exact set), (2) at the END `unmatched_disables()` must be
+// `JAMMI_KERNELS_DISABLE` EXACTLY (never a subset check: a "combined leg
+// on top of `--arm alloff`" cannot occur, since `--arm alloff`'s own
+// arm-level check forces an exact set), (2) at the END `unmatched_disables()` must be
 // empty, (3) at the END every named key's `fused` dispatch DELTA over the
 // measured epoch loop must be 0. Each case below drives exactly one of the
 // three, plus the equality semantics and the unchanged-by-default control.
@@ -450,15 +446,12 @@ fn expect_kernels_disabled_refuses_when_the_env_names_a_different_key() {
     );
 }
 
-/// Finding F1's equality fix: `--expect-kernels-disabled` naming ONE key
-/// while `JAMMI_KERNELS_DISABLE` resolves to that key PLUS an extra,
-/// unrelated one must now REFUSE — this used to be accepted (a SUBSET
-/// check, on the premise that an `--arm alloff` leg legitimately combines
-/// its two pinned keys with a claimed chain key), but that premise is false
-/// (`--arm alloff`'s own arm-level check forces an EXACT set, so the
-/// "combined leg" can never exist) and the weaker check let an ambient
-/// extra key through undetected — exactly finding F1's contamination shape,
-/// just with the flag present instead of absent.
+/// Set equality: `--expect-kernels-disabled` naming ONE key while
+/// `JAMMI_KERNELS_DISABLE` resolves to that key PLUS an extra, unrelated
+/// one must REFUSE. A SUBSET check would let an ambient extra key through
+/// undetected — the contamination shape the flag exists to catch — and the
+/// "combined leg" a subset check would allow cannot exist (`--arm alloff`'s
+/// own arm-level check forces an EXACT set).
 #[test]
 fn expect_kernels_disabled_refuses_an_extra_env_key_beyond_the_claim() {
     let work_dir = tempfile::tempdir().expect("tempdir");
@@ -474,7 +467,7 @@ fn expect_kernels_disabled_refuses_an_extra_env_key_beyond_the_claim() {
 
     assert!(
         !output.status.success(),
-        "a SUPERSET JAMMI_KERNELS_DISABLE must now be refused (set-equality semantics) — \
+        "a SUPERSET JAMMI_KERNELS_DISABLE must be refused (set-equality semantics) — \
          stdout={}",
         String::from_utf8_lossy(&output.stdout)
     );
@@ -493,7 +486,7 @@ fn expect_kernels_disabled_refuses_an_extra_env_key_beyond_the_claim() {
 /// `--expect-kernels-disabled ""` equality semantics `finetune_step_kernel_
 /// disable.rs`'s sibling test pins for `finetune-step`, ported to
 /// `finetune-run`'s identical check (mirrors `FinetuneRunParams::
-/// expect_kernels_disabled`'s doc, finding F1: equality, never subset).
+/// expect_kernels_disabled`'s doc: equality, never subset).
 /// `""` claims NOTHING is disabled (`parse_disable_list(Some(""))` is the
 /// empty set); a non-empty ambient `JAMMI_KERNELS_DISABLE` must therefore
 /// refuse. This is the negative control that fails under subset semantics

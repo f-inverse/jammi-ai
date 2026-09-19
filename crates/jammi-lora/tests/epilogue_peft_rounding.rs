@@ -1,4 +1,5 @@
-//! esc-046 (GH#374) — the production-width, REAL-DISPATCH biting oracle.
+//! The fused and eager LoRA epilogues against the PEFT rounding order, at production width,
+//! through the real `LoraLinear::forward` dispatch.
 //! Leg (1) BLINDNESS (a same-build fused-vs-eager A/B is structurally
 //! blind to a defect BOTH arms carry identically) and controls (a) POWER OF
 //! THE COMPARISON, (b) F32-TRUTH DIRECTION, (c) NON-VACUITY AND A
@@ -33,19 +34,14 @@
 //! call) issues the identical `x.matmul(w.t())` and hits the SAME refusal
 //! — so on CPU, EITHER arm's `base_out = base.forward(x)` step fails
 //! before ever reaching either arm's epilogue, for a `BF16` base. A
-//! CPU-hermetic "biting oracle" that actually exercises the bf16
-//! rounding-boundary regime through the REAL, full `LoraLinear::forward`
-//! pipeline (both arms) is therefore not constructible at all — this is a
-//! genuine candle CPU limitation (disclosed, not a defect in this fix),
-//! not something a different fixture choice can route around. `cuBLAS`
-//! supports `BF16` GEMMs natively, so this file runs for real only on
-//! CUDA — `#![cfg(feature = "cuda")]` (never compiled by a plain
-//! `cargo test -p jammi-lora`) plus a runtime `cuda_device()` probe (the
-//! same `JAMMI_REQUIRE_CUDA`-panics-rather-than-skips discipline
-//! `crates/jammi-kernels/tests/cuda_parity.rs`'s own `cuda_device()`
-//! uses, so a broken device acquisition on the pod session this file's
-//! own landing proof runs under reads as FAILED, not as a silently
-//! skipped GREEN).
+//! CPU-hermetic oracle that exercises the bf16 rounding-boundary regime
+//! through the REAL, full `LoraLinear::forward` pipeline (both arms) is
+//! therefore not constructible — a candle CPU limitation no fixture choice
+//! routes around. `cuBLAS` supports `BF16` GEMMs natively, so this test
+//! target requires the `live-gpu-tests` feature (never compiled by a plain
+//! `cargo test -p jammi-lora`) and acquires CUDA device 0 through
+//! `jammi_test_resources::cuda_device`, which panics naming the missing
+//! device.
 //!
 //! THIS file is the one that drives the REAL `LoraLinear::forward` dispatch
 //! (both the fused arm, via [`jammi_kernels::ops::LowRankResidualLinear`],
@@ -69,12 +65,10 @@
 //! production call site in this workspace today). Weight/input amplitudes
 //! are tuned (deterministic trig fixture — the same idiom
 //! `crates/jammi-kernels/src/ops/cast_scale.rs`'s own production-amplitude
-//! tests use, family L: no untracked external generator) so the real GEMM
-//! output lands in the `|base_out| ~ 100` regime esc-046's own lead-measured
-//! reproduction used, and the LoRA delta lands in the `~3` regime that
-//! measurably crosses bf16 rounding boundaries at that amplitude.
-
-#![cfg(feature = "cuda")]
+//! tests use: no untracked external generator) so the real GEMM output
+//! lands in the `|base_out| ~ 100` regime, and the LoRA delta lands in the
+//! `~3` regime that measurably crosses bf16 rounding boundaries at that
+//! amplitude.
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, VarMap};
@@ -84,25 +78,8 @@ const IN_FEATURES: usize = 64;
 const OUT_FEATURES: usize = 4096;
 const RANK: usize = 16;
 const ROWS: usize = 32; // x: (ROWS, IN_FEATURES) -> ROWS * OUT_FEATURES = 131072 output elements.
-const ALPHA: f64 = 32.0; // scaling = ALPHA / RANK = 2.0, matching esc-046's own fixture.
+const ALPHA: f64 = 32.0; // scaling = ALPHA / RANK = 2.0.
 const MIN_DISCRIMINATING: usize = 20;
-
-fn cuda_device() -> Option<Device> {
-    match Device::new_cuda(0) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!(
-                    "esc046_epilogue_biting_oracle: JAMMI_REQUIRE_CUDA is set but no CUDA \
-                     device could be acquired — this is a landing proof, a silent skip here is \
-                     not acceptable: {e}"
-                );
-            }
-            eprintln!("esc046_epilogue_biting_oracle: skipping — no CUDA device available ({e})");
-            None
-        }
-    }
-}
 
 /// Deterministic trig fixture, scaled so the real GEMM output
 /// (`base @ x^T`) lands near `|base_out| ~ 100` — `in_features = 64`
@@ -134,7 +111,7 @@ fn build_x(device: &Device) -> Tensor {
 }
 
 /// `lora_a`/`lora_b` amplitudes tuned so `B(A(x)) * scaling` lands near
-/// `~3` (esc-046's own delta regime): `after_a = A @ x^T` has dimension
+/// `~3` (the delta regime that crosses bf16 rounding boundaries): `after_a = A @ x^T` has dimension
 /// `RANK`, `lora_out = B @ after_a^T` has dimension `OUT_FEATURES` — two
 /// more `sqrt` central-limit factors (`sqrt(IN_FEATURES) = 8`,
 /// `sqrt(RANK) = 4`) on top of the two weight amplitudes and `scaling`.
@@ -219,7 +196,7 @@ impl Fixture {
             .unwrap()
     }
 
-    /// The REJECTED, pre-esc-046 formula: round the scaled delta to
+    /// The REJECTED formula: round the scaled delta to
     /// `bf16` FIRST, then add-and-round again.
     fn mis_ordered(&self) -> Tensor {
         let scaled = (&self.lora_out_f32 * self.scaling).unwrap();
@@ -236,10 +213,8 @@ impl Fixture {
 }
 
 #[test]
-fn fused_and_eager_arms_both_match_the_peft_reference_at_production_width_esc046() {
-    let Some(device) = cuda_device() else {
-        return;
-    };
+fn fused_and_eager_arms_both_match_the_peft_reference_at_production_width() {
+    let device = jammi_test_resources::cuda_device(0);
     let base_weight = build_base_weight(&device).to_dtype(DType::BF16).unwrap();
     let x = build_x(&device).to_dtype(DType::BF16).unwrap();
     let (lora_a, lora_b) = build_lora_ab(&device);
@@ -327,16 +302,16 @@ fn fused_and_eager_arms_both_match_the_peft_reference_at_production_width_esc046
         discriminating >= MIN_DISCRIMINATING,
         "fixture is not discriminating: only {discriminating}/{n} elements separate the \
          once-rounded (PEFT) formula from the round-then-add (rejected) one — this fixture \
-         would read GREEN on a broken build regardless of which arm dispatched"
+         would pass on a broken build regardless of which arm dispatched"
     );
 
     // Control (f) BOTH ARMS ASSERTED SEPARATELY vs the reference, and the
-    // DEFECT leg (post-fix: GREEN, raw bit pattern via the exact
-    // bf16-widened-to-f32 comparison, never a tolerance).
+    // DEFECT leg (raw bit pattern via the exact bf16-widened-to-f32
+    // comparison, never a tolerance).
     let fused_mismatches: Vec<usize> = (0..n).filter(|&i| fused_v[i] != truth_v[i]).collect();
     assert!(
         fused_mismatches.is_empty(),
-        "the FUSED arm does NOT match PEFT's rounding order on {}/{n} elements (esc-046) — \
+        "the FUSED arm does NOT match PEFT's rounding order on {}/{n} elements — \
          first mismatch idx={} base_out={} lora_out={} fused={:?} peft_truth={:?}",
         fused_mismatches.len(),
         fused_mismatches[0],
@@ -348,7 +323,7 @@ fn fused_and_eager_arms_both_match_the_peft_reference_at_production_width_esc046
     let eager_mismatches: Vec<usize> = (0..n).filter(|&i| eager_v[i] != truth_v[i]).collect();
     assert!(
         eager_mismatches.is_empty(),
-        "the EAGER arm does NOT match PEFT's rounding order on {}/{n} elements (esc-046) — \
+        "the EAGER arm does NOT match PEFT's rounding order on {}/{n} elements — \
          first mismatch idx={} base_out={} lora_out={} eager={:?} peft_truth={:?}",
         eager_mismatches.len(),
         eager_mismatches[0],
@@ -378,8 +353,8 @@ fn fused_and_eager_arms_both_match_the_peft_reference_at_production_width_esc046
     assert!(
         fused_vs_mis >= MIN_DISCRIMINATING,
         "control (a) void: the real fused dispatch output and the rejected round-before-add \
-         model must diverge on >= {MIN_DISCRIMINATING} elements for a RED-on-old-code reading \
-         to mean anything; measured {fused_vs_mis}"
+         model must diverge on >= {MIN_DISCRIMINATING} elements for the PEFT \
+         comparison to mean anything; measured {fused_vs_mis}"
     );
 
     // Control (b) F32-TRUTH DIRECTION: on exactly the elements where the

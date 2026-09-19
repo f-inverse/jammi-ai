@@ -104,12 +104,10 @@ pub enum ServerError {
 /// Kubernetes Secret key produces whichever source reads it), **set-malformed**
 /// (present, non-empty, but does not decode to 32 bytes of hex), and
 /// **set-valid**. Unset and set-empty are BOTH treated as absent — audit
-/// signing simply stays unusable until the first `AuditService` write,
-/// exactly as before this check existed; this function does not tighten
-/// that policy for either state. What this closes is set-malformed: that
-/// used to let `jammi-server serve` boot successfully with audit signing
-/// silently dead, discovered only on the first signing attempt deep inside a
-/// request. A set-malformed key now refuses to start.
+/// signing simply stays unusable until the first `AuditService` write; this
+/// function does not tighten that policy for either state. A set-malformed
+/// key refuses to start: booting would leave audit signing silently dead,
+/// discovered only on the first signing attempt deep inside a request.
 ///
 /// For [`SigningKeyConfig::File`], "present" additionally fails CLOSED on
 /// every read error OTHER than the path not existing at all — an
@@ -205,9 +203,7 @@ fn key_shape_error(config: &JammiConfig, trimmed: &str) -> String {
 
 /// Would `trimmed` decode as hex at all — an even count of ASCII hex digits?
 /// A local re-derivation of exactly what [`hex::decode`] would accept
-/// (`jammi-server` carries no non-dev `hex` dependency — a regular
-/// dependency addition is a `Cargo.toml` change, the lead/`docs-ci` shared
-/// class this crate's own code does not touch on its own), used ONLY to pick
+/// (`jammi-server` carries no non-dev `hex` dependency), used ONLY to pick
 /// which safe wording [`key_shape_error`] prints. The actual pass/fail
 /// decision is still [`jammi_db::audit::ensure_master_key_present`]'s, not
 /// this function's — see [`validate_audit_master_key`]'s doc.
@@ -438,8 +434,8 @@ pub struct OssServer {
     /// iff this replica is a segment owner. `None` = no third listener.
     peer_addr: Option<SocketAddr>,
     /// `[ballista]`: which Ballista compute-plane roles this process hosts,
-    /// if any. Unset = today's process, byte-for-byte (contract
-    /// `feat_500-wave4` §2.1).
+    /// if any. Unset = a process that hosts no Ballista role and binds no
+    /// Ballista listener.
     ballista: jammi_db::config::BallistaConfig,
     session: Arc<InferenceSession>,
     session_store: SessionStore,
@@ -632,8 +628,8 @@ impl OssServer {
                 // `[server.limits].max_message_bytes` bounds EVERY listener's
                 // inbound decode, this one included: the same per-service
                 // `max_decoding_message_size` setter `assemble_grpc_chain`
-                // applies to every public service (see `crate::limits`'s N5
-                // rustdoc). Without it tonic's own 4 MiB default would be
+                // applies to every public service (see `crate::limits`'s
+                // "`message_size` counting rule" rustdoc). Without it tonic's own 4 MiB default would be
                 // this listener's cap regardless of the deployment's setting
                 // — a gang round's chunks are sized to the CONFIGURED value.
                 let max_message_bytes: usize =
@@ -657,7 +653,7 @@ impl OssServer {
         };
         // `[ballista]`: the Ballista compute-plane roles, beside the peer
         // listener above. The cluster/job state is ALWAYS catalog-backed
-        // (contract §3 U8b) and the distribution policy is ALWAYS
+        // and the distribution policy is ALWAYS
         // `DevicePlacement` — there is no knob (`roles::host_scheduler`
         // keeps both as constructor arguments only so a bare in-memory
         // cluster stays reachable as a TEST fixture, never a second
@@ -709,7 +705,7 @@ impl OssServer {
         let session = Arc::clone(&self.session);
         let readiness = Arc::clone(&self.readiness);
         let mut grpc = assemble_grpc_chain(self.build_grpc_chain())?.bind().await?;
-        // Hoist the worker guard out of the chain (D3): ownership decides
+        // Hoist the worker guard out of the chain: ownership decides
         // who can DRAIN or RELEASE, and the server's two-mode shutdown needs
         // the guard alive past the gRPC serve future, which the chain would
         // otherwise drop it with.
@@ -830,13 +826,13 @@ pub struct BoundServer {
     executor: Option<jammi_ballista::roles::ExecutorRole>,
     /// The engine session, kept alive past [`OssServer::bind`] so
     /// [`Self::serve_with_signals`] can release its catalog connections
-    /// (including the lease keeper's own, N3) once the serve loop has fully
+    /// (including the lease keeper's own) once the serve loop has fully
     /// drained — the graceful-shutdown release point a `SIGTERM`'d
     /// `jammi-server` needs so a successor process can open the same
     /// SQLite catalog directory immediately, exactly as the embedded
     /// engine's `close()` does.
     session: Arc<InferenceSession>,
-    /// The embedded job worker guard, hoisted out of the chain at bind (D3)
+    /// The embedded job worker guard, hoisted out of the chain at bind
     /// so the two-mode shutdown owns it: `None` when `[worker] enabled =
     /// false`.
     worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
@@ -883,10 +879,7 @@ pub enum ShutdownOutcome {
     /// any, still gets handed back is CONDITIONAL on which determinant
     /// degraded, and a degraded determinant is a state defined by MISSING
     /// evidence — it gets a definite consequence only where the evidence
-    /// actually establishes one (contract `CONTRACT-OPS-fix7.md`, round 7,
-    /// correcting round 6's own conditional, whose second branch asserted a
-    /// confirmed lease state for an arm whose defining property is that the
-    /// lease state is not established):
+    /// actually establishes one:
     ///
     /// * the release call itself errored — nothing further is established;
     ///   whether any lease this instance held was handed back is unknown.
@@ -914,10 +907,9 @@ pub enum ShutdownOutcome {
     ///   expiry path.
     ///
     /// `main` still exits the process at once (exit code 3, distinct from
-    /// [`Self::Released`]'s 0)
-    /// — R6: an `Err` here must never propagate through the normal return
-    /// path, which would hang on a detached trainer past its grace period
-    /// and turn a degraded release into a kill.
+    /// [`Self::Released`]'s 0): an `Err` here must never propagate through
+    /// the normal return path, which would hang on a detached trainer past
+    /// its grace period and turn a degraded release into a kill.
     ReleaseDegraded,
 }
 
@@ -954,12 +946,11 @@ enum ReleaseAttempt {
     ),
 }
 
-/// R6's ONE outcome-evidence helper: the preload-exit early return and the
+/// The ONE outcome-evidence helper: the preload-exit early return and the
 /// main RELEASE arm both call this rather than each constructing
 /// [`ShutdownOutcome::Released`] merely from "the RELEASE signal fired".
 ///
-/// Implements **P-RELEASE** (contract `CONTRACT-OPS-fix3.md`):
-/// [`ShutdownOutcome::Released`] iff EVERY determinant of "this RELEASE
+/// Decides **P-RELEASE**: [`ShutdownOutcome::Released`] iff EVERY determinant of "this RELEASE
 /// handed back every lease this instance held" was both observed and
 /// reports success — [`ShutdownOutcome::ReleaseDegraded`] whenever ANY
 /// determinant is unobserved or reports failure. The determinants:
@@ -1155,7 +1146,7 @@ impl BoundServer {
             "HTTP side-channel listening (/healthz, /readyz, /metrics)"
         );
 
-        // The health side-channel stays up through a DRAIN (D13) — it is
+        // The health side-channel stays up through a DRAIN — it is
         // signalled only at the very end, on its own channel.
         let (health_stop_tx, health_stop_rx) = oneshot::channel::<()>();
         // The peer listener: its own tonic server over the pre-bound
@@ -1166,7 +1157,7 @@ impl BoundServer {
         // `/jammi.v1.*` request. No tenant layer, no gRPC-web framing, no
         // `[server.limits]` stack — its clients are coordinators (I-PEER).
         // It stays up through a DRAIN exactly like the health side-channel
-        // (D13's analogue: a coordinator's fan-out to this owner is never cut
+        // (a coordinator's fan-out to this owner is never cut
         // early) and is signalled only at the very end, on its own oneshot.
         let (peer_stop_tx, peer_stop_rx) = oneshot::channel::<()>();
         let peer_task = peer.map(|(listener, routes, registry)| {
@@ -1228,7 +1219,7 @@ impl BoundServer {
                 // to `Releasing` themselves; the DRAIN arm has no
                 // worker-less entry, so the phase is flipped here).
                 session.host_admission().begin_drain();
-                // W2/R6: the outcome must reflect what THIS arm actually
+                // The outcome must reflect what THIS arm actually
                 // DID, never merely which signal fired. On EITHER exit — a
                 // signal preempting the preload, or the preload itself
                 // erroring — the worker is still stopped and joined (its
@@ -1253,7 +1244,7 @@ impl BoundServer {
                     // The gate is closed, so the loop returns without a
                     // claim; the join orders the row's delete after the
                     // task's own upsert. `worker_joined` is the call's own
-                    // `StopOutcome` (F4b), never `worker.is_some()` — that
+                    // `StopOutcome`, never `worker.is_some()` — that
                     // would read `true` even when the join itself errored
                     // or found nothing left to join.
                     // `[ballista]`: the executor stops admitting tasks the
@@ -1280,21 +1271,18 @@ impl BoundServer {
                     Err(e) => Err(e),
                     Ok(()) => Ok(outcome),
                 };
-                // R6: the tail this early return shares with the main one —
-                // health side-channel, then the PEER listener (previously
-                // skipped here entirely: dropping the sender starts its
-                // graceful shutdown but nothing established it finished
-                // before the session closed — the same divergence class as
-                // the outcome itself), then the session and OTLP. FOLDED,
+                // The tail this early return shares with the main one —
+                // health side-channel, then the PEER listener (dropping its
+                // sender only starts its graceful shutdown; awaiting the task
+                // is what establishes it finished before the session
+                // closes), then the session and OTLP. FOLDED,
                 // never discarded (the main tail's own `result.and(health_
                 // result).and(peer_result)`): no hang risk in folding here —
                 // this exit precedes the worker gate opening, so no job is
                 // claimed and no detached trainer exists to wait on.
                 //
                 // UNREACHABLE AT THE PINNED VERSIONS, established by reading
-                // both crates rather than argued (contract
-                // `CONTRACT-OPS-fix6.md`, round 6, correcting round 5's
-                // `CONTRACT-OPS-fix5.md`): no test drives `health_task` or
+                // both crates: no test drives `health_task` or
                 // `peer_task` to `Err` on this exact preload-exit path
                 // because, at the pinned dependency versions, NEITHER serve
                 // future can return `Err` from a live socket at all — this
@@ -1312,9 +1300,8 @@ impl BoundServer {
                 // which is `future::ready(Ok(svc))`
                 // (`tonic-0.14.5/src/transport/server/mod.rs:841-845,1250`).
                 // Both futures return `Ok(())` on every path, so raw-fd
-                // manipulation or a lowered `RLIMIT_NOFILE` — the routes a
-                // prior round named and declined to build — would not have
-                // produced an `Err` either; the arm is unreachable by
+                // manipulation or a lowered `RLIMIT_NOFILE` would not
+                // produce an `Err` either; the arm is unreachable by
                 // construction, not by a missing fault-injection technique.
                 // The arm itself IS still reached
                 // (`signal_during_preload_exits_without_serving`,
@@ -1438,8 +1425,8 @@ impl BoundServer {
                 // Step 1 already happened: `select!` dropped the drain
                 // sequence, and with it the gRPC serve future — connections
                 // severed. Step 2: the one release mechanism, whose outcome
-                // is constructed only from its own evidence (R6:
-                // [`release_outcome`]) — never surfaced as an `Err` here: a
+                // is constructed only from its own evidence
+                // ([`release_outcome`]) — never surfaced as an `Err` here: a
                 // degraded release still exits the process at once, exactly
                 // like a confirmed one (see [`ShutdownOutcome::
                 // ReleaseDegraded`]'s doc for why propagating it as an `Err`
@@ -1457,8 +1444,7 @@ impl BoundServer {
         };
 
         // `[ballista]`: DRAIN waits for the executor's own in-flight tasks
-        // before stopping it (contract `feat_500-wave4` §9 B6 — never tear
-        // down a running placed gang, the same reason the worker guard
+        // before stopping it (never tear down a running placed gang, the same reason the worker guard
         // above is drained rather than dropped); RELEASE stops it
         // immediately, the same "sever, don't wait" shape RELEASE gives the
         // gRPC surface. The scheduler role always stops AFTER the
@@ -1475,7 +1461,7 @@ impl BoundServer {
         }
 
         // The tail both arms share: stop the health side-channel, release
-        // the catalog (the keeper's own connection included, N3 — a
+        // the catalog (the keeper's own connection included — a
         // successor process can open the same SQLite catalog directory at
         // once), flush telemetry.
         let _ = health_stop_tx.send(());
@@ -1494,7 +1480,7 @@ impl BoundServer {
 
         // Every listener has stopped accepting and finished draining
         // in-flight requests — the graceful-shutdown release point.
-        // `InferenceSession::close` shuts the lease keeper (N3) down and
+        // `InferenceSession::close` shuts the lease keeper down and
         // joins its dedicated thread (closing its own catalog connection)
         // before closing the shared pool, so a `SIGTERM`'d `jammi-server`
         // releases the SQLite `unix-excl` lock exactly as the embedded
@@ -1926,7 +1912,7 @@ pub struct BoundChain {
     incoming: TcpIncoming,
     addr: SocketAddr,
     // The layer-free routes, carried forward so the transport layer stack is
-    // still applied at serve time (G1) rather than baked in at bind.
+    // still applied at serve time rather than baked in at bind.
     routes: tonic::service::Routes,
     mounted: Vec<String>,
     metrics: Arc<MetricsRegistry>,
@@ -1975,7 +1961,7 @@ impl BoundChain {
     /// [`crate::limits::GlobalConcurrencyLimitLayer`] →
     /// [`crate::limits::PerConnectionLimitLayer`] →
     /// [`crate::limits::MethodClassLayer`] — see [`crate::limits`] for the
-    /// full contract and the N4/N5 rationale for this exact position, inside
+    /// full contract and the rationale for this exact position, inside
     /// the gRPC-web layers). Every service mounted via [`AssembledChain::mount`],
     /// engine or downstream, inherits every one of these with no per-service
     /// opt-in — including a downstream's own mounted service, which is
@@ -2009,7 +1995,7 @@ impl BoundChain {
             self.mounted.join(" + "),
             self.addr
         );
-        // The layer stack is deferred to here (G1): holding the post-layer
+        // The layer stack is deferred to here: holding the post-layer
         // `Router<L>` would leak the concrete `Stack<…>` layer types into
         // `BoundChain`. `Routes` is the layer-free accumulation point;
         // `add_routes` attaches it behind the stack at serve time, then serves
@@ -2102,7 +2088,7 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
 
     // `[server.limits].max_message_bytes`, applied to every mounted service
     // below (including Flight SQL) via tonic's own per-service
-    // `max_decoding_message_size` — see `crate::limits`'s N5 rustdoc for why
+    // `max_decoding_message_size` — see `crate::limits`'s `message_size` rustdoc for why
     // this is NOT a tower layer. `u64` -> `usize`: a value that would not fit
     // `usize` (only reachable on a 32-bit target with an absurd config) saturates
     // to `usize::MAX` (effectively unbounded) rather than panicking or silently
@@ -2143,7 +2129,7 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
     }
 
     // Accumulate the services layer-free on a `tonic::service::Routes`. The
-    // transport layer stack is deferred to `AssembledChain::serve` (G1): holding
+    // transport layer stack is deferred to `AssembledChain::serve`: holding
     // the post-`add_service` `Router<L>` would leak the concrete layer-stack type
     // into the seam and cannot grow in place (its `add_service` is by-value with
     // no `Default`). `Routes` is the composition point tonic provides for exactly
@@ -2480,7 +2466,7 @@ mod audit_master_key_tests {
         std::env::remove_var(jammi_db::audit::MASTER_KEY_ENV);
     }
 
-    /// The DECISION this round pins: `JAMMI_AUDIT_MASTER_KEY=""` (exactly what
+    /// `JAMMI_AUDIT_MASTER_KEY=""` (exactly what
     /// `deploy/.env.example` ships as its placeholder, and what an unfilled
     /// Kubernetes Secret key produces) is set-EMPTY, not set-malformed — it
     /// must be treated exactly like the variable being unset, not refuse
@@ -2506,7 +2492,7 @@ mod audit_master_key_tests {
     }
 
     /// `SigningKeyConfig::File`, absent path (ENOENT): allowed to start,
-    /// unchanged from today's "absence is fine" policy — the File-source
+    /// under the same "absence is fine" policy — the File-source
     /// analogue of `absent_key_is_still_allowed_at_startup`.
     #[test]
     fn file_source_absent_path_is_allowed_at_startup() {
@@ -2565,54 +2551,21 @@ mod audit_master_key_tests {
         );
     }
 
-    /// The require-gate polarity every `chmod` permission-fault probe in the
-    /// workspace's test suites shares (esc-089 F1): `probe` performs the
-    /// fault-injection premise check itself and returns `true` if the fault
-    /// was BYPASSED (root, or a mode-ignoring filesystem). A bypass is
-    /// normally a loud, `eprintln`'d skip; under `JAMMI_REQUIRE_POSIX_PERMS=1`
-    /// (the CI lane that is SUPPOSED to run unprivileged with real POSIX
-    /// permission enforcement) a bypass is instead a hard `panic!` — never a
-    /// silent `return`. Each probe file carries its own copy of this wrapper
-    /// in the canonical shape the kernel-oracle registry
-    /// (`ci/kernel-oracle-helpers.txt`) verifies per file.
-    fn chmod_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
-        let bypassed = probe();
-        if bypassed {
-            if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
-                panic!(
-                    "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
-                     permission fault (root, or a mode-ignoring filesystem) — the \
-                     fault-injection premise this test needs does not hold; a silent skip is \
-                     not acceptable here"
-                );
-            }
-            eprintln!("{test_name}: chmod bypassed (root?) — skipping");
-        }
-        bypassed
-    }
-
     /// `SigningKeyConfig::File`, an existing but UNREADABLE file (`0o000`):
-    /// this is the case advisory 2 closes — `std::fs::metadata` still sees
+    /// `std::fs::metadata` still sees
     /// the path (so this is NOT read as absent), and the subsequent read
     /// fails, so the check fails CLOSED (refuses startup) rather than
     /// silently booting with signing dead.
+    #[cfg(all(unix, feature = "unprivileged-tests"))]
     #[test]
     fn file_source_unreadable_file_refuses_startup() {
         use std::os::unix::fs::PermissionsExt;
+        jammi_test_resources::assert_permissions_enforced();
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("audit-master-key");
         std::fs::write(&path, "ab".repeat(32)).expect("write valid key");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
-
-        let bypassed = chmod_bypassed("file_source_unreadable_file_refuses_startup", || {
-            std::fs::read_to_string(&path).is_ok()
-        });
-        if bypassed {
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-                .expect("restore permissions");
-            return;
-        }
 
         let err = validate_audit_master_key(&file_config(&path))
             .expect_err("an unreadable file key must refuse to start, not boot with signing dead");
@@ -2626,167 +2579,90 @@ mod audit_master_key_tests {
     }
 }
 
-/// OPS round 3 (contract `CONTRACT-OPS-fix3.md`) — the non-negotiable test
-/// capacity over `release_outcome`'s predicate: round 2 shipped a predicate
-/// change (the parity-oracle deletion + evidence-based outcome) with ZERO
-/// observing oracle, and the round-3 audit proved it by mutation — forcing
-/// the predicate to `true` and reverting the paired change still left an
-/// 18-of-18 green suite. This module reaches the private `release_outcome`
-/// directly (an in-crate `#[cfg(test)]` table test — no server, no signals,
-/// no tokio runtime needed).
+/// Table test over the private `release_outcome` predicate: an in-crate
+/// `#[cfg(test)]` module, no server, no signals, no tokio runtime.
 ///
-/// **What actually goes RED, measured, not asserted** (contract
-/// `CONTRACT-OPS-fix4.md` M3 — the round-3 audit found this doc previously
-/// overstated its own module's capacity: it claimed "every test below
-/// fails" against the round-2 revert, when the round-4 audit performed that
-/// exact revert and only a minority did). Reverting BOTH arms' predicates to
-/// "success iff the call returned `Ok`" (round 2's predicate) turns every
-/// test that pins a determinant *this* module folds in RED, and leaves every
-/// must-be-`Released` pin and every outer-`Err` pin GREEN — a weaker
-/// predicate can only ever be MORE permissive on the `Ok` arms than a
-/// stronger one, never less, so a "must be `Released`" or "must be
-/// `Degraded`-on-`Err`" pin cannot be falsified by weakening a conjunct on
-/// `Ok`. Only the determinant-pinning tests can, and do, go red under that
-/// revert; see each test's own doc for which determinant it pins. Measured
-/// at this module's current 15 tests: 7 go red, 8 stay green (re-run
-/// yourself before trusting this number — it is a property of the test
-/// count at the time this sentence was written, not a promise about a
-/// future edit to this module).
+/// Weakening the predicate (e.g. to "success iff the call returned `Ok`")
+/// turns every determinant-pinning test RED and leaves every
+/// must-be-`Released` and outer-`Err` pin GREEN: a weaker predicate is only
+/// ever MORE permissive on the `Ok` arms, so only the determinant pins can
+/// falsify it. Each test's doc names the determinant it pins.
 ///
-/// # M1 — the determinant enumeration (contract `CONTRACT-OPS-fix4.md`)
+/// # The determinants and their producer-driven tests
 ///
-/// This table test's oracles construct every determinant as a LITERAL — it
-/// establishes the predicate reads each determinant correctly, never that
-/// any real producer ever emits a failing one. The round-4 audit proved by
-/// mutation that the producer half was entirely unobserved: applying all
-/// four producer-side collapses at once (forcing `stop_witnessed` constant
-/// `true`, re-collapsing the worker's and the session's per-hold `Err` back
-/// into `Observed(HoldRelease::default())`, and folding the keeper's
-/// per-hold `Err` back into `not_required`) left the WHOLE crate's suite
-/// green, counts identical to baseline. The round-5 audit then measured
-/// each of those four collapses SEPARATELY (never combined) and found the
-/// producer half was in fact 1 of 4 observed, and refuted two of this
-/// table's own "NOT producer-driven" claims by execution in ~2 seconds
-/// using a technique already in this test tree — closed below. Every
-/// determinant, enumerated, and where its producer-driven oracle lives or
-/// why one does not exist yet:
+/// These tests construct every determinant as a LITERAL — they establish the
+/// predicate reads each one correctly, never that a real producer emits a
+/// failing one. Where each determinant is driven by a real producer:
 ///
-/// * **P-2B, `HoldReleaseOutcome::Unobserved` (`Worker` arm)** (the keeper's
-///   per-hold pass could not be confirmed to run at all): producer-driven in
-///   `jammi-server`'s `crates/jammi-server/tests/it/liveness.rs`
+/// * **P-2B, `HoldReleaseOutcome::Unobserved` (`Worker` arm)** — the keeper's
+///   per-hold pass could not be confirmed to run:
+///   `crates/jammi-server/tests/it/liveness.rs`
 ///   (`healthz_flips_to_503_within_one_heartbeat_after_the_keeper_thread_dies`)
-///   — the test kills the real keeper thread with
-///   `LeaseKeeper::kill_thread_for_test`, then drives a real DRAIN+RELEASE
-///   through `serve_with_signals`, and asserts the outcome the running
-///   system actually returns is `ReleaseDegraded`. No literal `HoldRelease`
-///   or `HoldReleaseOutcome` is constructed anywhere in that test.
+///   kills the real keeper thread with `LeaseKeeper::kill_thread_for_test`,
+///   drives a real DRAIN+RELEASE through `serve_with_signals`, and asserts
+///   `ReleaseDegraded`.
 /// * **P-2B, `HoldReleaseOutcome::Unobserved` (`SessionOnly` arm)** — a
-///   SEPARATE producer from the bullet above, which drives the `Worker` arm
-///   only: producer-driven in `crates/jammi-ai/tests/it/jobs_shutdown.rs`
-///   (`release_job_leases_is_unobserved_when_the_keeper_thread_is_dead`),
-///   the identical `LeaseKeeper::kill_thread_for_test` technique applied to
-///   `InferenceSession::release_job_leases`'s own collapse.
-/// * **P-2B, `HoldRelease.failed > 0`** (a per-hold release attempt itself
-///   returning `Err` from `Catalog::release_job_lease`): producer-driven in
-///   `crates/jammi-db/tests/it/lease_keeper.rs`
-///   (`release_job_holds_reports_failed_from_a_real_backend_fault`). A prior
-///   round of this doc claimed this was uncoverable — "no fault-injecting
-///   `CatalogBackend` implementation and no reliable way to force one from
-///   outside" — which was FALSE: a schema-level fault (`ALTER TABLE jobs
-///   DROP COLUMN releases`, through the public `SqliteBackend::open` +
-///   `CatalogBackend::transaction`, exactly the pattern
-///   `crates/jammi-db/tests/it/migrations.rs` already uses) makes every
+///   separate producer: `crates/jammi-ai/tests/it/jobs_shutdown.rs`
+///   (`release_job_leases_is_unobserved_when_the_keeper_thread_is_dead`), the
+///   same technique applied to `InferenceSession::release_job_leases`.
+/// * **P-2B, `HoldRelease.failed > 0`** — a per-hold release returning `Err`
+///   from `Catalog::release_job_lease`: `crates/jammi-db/tests/it/lease_keeper.rs`
+///   (`release_job_holds_reports_failed_from_a_real_backend_fault`). A
+///   schema-level fault (`ALTER TABLE jobs DROP COLUMN releases` through the
+///   public `SqliteBackend::open` + `CatalogBackend::transaction`) makes every
 ///   `release_job_lease` `UPDATE` fail at prepare time on the keeper's own
-///   pooled connection, with no new test double. The claim was closed in
-///   prose while the code stayed unobserved; the fix is the test, not the
-///   sentence.
-/// * **P-2B, `HoldRelease.not_required`** (a hold that provably did not need
-///   releasing): producer-driven in
-///   `crates/jammi-db/tests/it/lease_keeper.rs`
-///   (`release_job_holds_flips_lost_and_skips_inline_holds`) — a real
-///   inline-claimed row's hold produces a genuine `Ok(false)` from
-///   `Catalog::release_job_lease`.
-/// * **P-2B totality** (`released + not_required + failed == attempted`,
-///   `HoldRelease::attempted` — M5): whether the production pass's own
-///   `assert_eq!` (`crates/jammi-db/src/catalog/lease_keeper.rs`) can be
-///   bypassed from a test without corrupting the pass is UNCOVERED (R-A) —
-///   no test attempts it; the claim that it cannot is prose, not an
-///   executed falsification. The consumer-side check IS driven with a
-///   literal (`confirms_release_catches_an_undercounted_attempted` in
-///   `crates/jammi-ai/src/fine_tune/worker.rs`), which is what this bullet
-///   can actually stand behind: every iteration of
-///   `release_job_holds_on_thread` increments exactly one of
-///   `released`/`not_required`/`failed` against an `attempted` fixed before
-///   the loop starts, so a producer that reaches the consumer without
-///   panicking cannot emit an inconsistent value — but that is read from
-///   the pass's source, not measured by an attempt to break it.
+///   pooled connection, with no test double.
+/// * **P-2B, `HoldRelease.not_required`** — a hold that provably did not need
+///   releasing: `crates/jammi-db/tests/it/lease_keeper.rs`
+///   (`release_job_holds_flips_lost_and_skips_inline_holds`), a real
+///   inline-claimed row's hold yielding `Ok(false)`.
+/// * **P-2B totality** (`released + not_required + failed == attempted`) —
+///   the consumer-side check is driven with a literal
+///   (`confirms_release_catches_an_undercounted_attempted` in
+///   `crates/jammi-ai/src/fine_tune/worker.rs`). No test attempts to bypass
+///   the production pass's own `assert_eq!`
+///   (`crates/jammi-db/src/catalog/lease_keeper.rs`): every iteration of
+///   `release_job_holds_on_thread` increments exactly one counter against an
+///   `attempted` fixed before the loop, so a producer that reaches the
+///   consumer without panicking cannot emit an inconsistent value — read from
+///   the source, not measured.
 /// * **P-2F, `stop_witnessed == true`** via a genuine abort or join
-///   (`stop_resolved`): producer-driven throughout
-///   `crates/jammi-server/tests/it/serve_shutdown_modes.rs` (e.g. the
-///   sigint-while-draining and abort scenarios) and by the liveness test
-///   above (a `Stopped` loop after the keeper dies still resolves the task).
+///   (`stop_resolved`): throughout `crates/jammi-server/tests/it/serve_shutdown_modes.rs`
+///   and by the liveness test above (a `Stopped` loop after the keeper dies
+///   still resolves the task).
 /// * **P-2F, `stop_witnessed == false`** (2e found nothing to take AND 2f's
-///   own observation fell back to the last-known proxy read): producer-driven
-///   in `crates/jammi-ai/tests/it/jobs_shutdown.rs`
-///   (`a_release_racing_an_in_flight_drain_reads_stop_unwitnessed`) — exactly
-///   "any signal while draining is a RELEASE" (`deploy-server.md`): a DRAIN
-///   (`stop_and_join`, unbounded by design) takes the handle — deterministically,
-///   via a single hand-driven poll rather than a scheduler race — and waits
-///   on an in-flight job the test parks mid-materialization with a real hold
-///   registered (`jammi_db::store::mutable::test_hook`, never a wall clock),
-///   and a concurrent RELEASE loses
-///   the handle race (`stop_resolved == false`) and then times out at 2f
-///   within one heartbeat (`state_witnessed == false`) because the
-///   still-parked loop never transitions. A prior round of this doc claimed
-///   this arm was structurally unreachable; that argument is retracted in
-///   favour of the test — the reasoning was never wrong about the
-///   SINGLE-caller path, only about there being no second caller.
-/// * **Sweep confirmation, `ReleaseSweep.jobs == None`** (the jobs sweep
-///   statement itself returning `Err`): producer-driven in
-///   `crates/jammi-db/tests/it/lease_keeper.rs`
-///   (`release_job_holds_reports_failed_from_a_real_backend_fault`, which
-///   also asserts `Catalog::release_jobs_claimed_by` errors under the same
-///   fault) and end-to-end through a real `EmbeddedWorker::release_and_stop`
-///   in `crates/jammi-ai/tests/it/jobs_shutdown.rs`
+///   observation fell back to the last-known proxy read):
+///   `crates/jammi-ai/tests/it/jobs_shutdown.rs`
+///   (`a_release_racing_an_in_flight_drain_reads_stop_unwitnessed`) — "any
+///   signal while draining is a RELEASE" (`deploy-server.md`): a DRAIN takes
+///   the handle via a single hand-driven poll and waits on a job parked
+///   mid-materialization with a real hold (`jammi_db::store::mutable::test_hook`,
+///   never a wall clock); a concurrent RELEASE loses the handle race
+///   (`stop_resolved == false`) and times out at 2f within one heartbeat
+///   (`state_witnessed == false`).
+/// * **Sweep confirmation, `ReleaseSweep.jobs == None`** — the jobs sweep
+///   statement returning `Err`: `crates/jammi-db/tests/it/lease_keeper.rs`
+///   (`release_job_holds_reports_failed_from_a_real_backend_fault`) and
+///   end-to-end through `EmbeddedWorker::release_and_stop` in
+///   `crates/jammi-ai/tests/it/jobs_shutdown.rs`
 ///   (`release_and_stops_second_sweep_reports_jobs_none_building_some_from_a_real_fault`),
-///   which also confirms `ReleaseSweep.building` is UNAFFECTED by the same
-///   fault (a different table, a different column) — the asymmetric shape
-///   `sweep_confirms_release`'s two conjuncts read independently. Pinned at
-///   the predicate itself by the literal
-///   `a_jobs_only_unconfirmed_second_sweep_degrades` /
-///   `session_only_jobs_only_unconfirmed_sweep_degrades` below: every
-///   PRE-EXISTING unconfirmed-sweep pin in this table used `building ==
-///   None`, so dropping the `jobs` conjunct out of `sweep_confirms_release`
-///   went unnoticed by every test in this file until this round.
-/// * **Sweep confirmation, `ReleaseSweep.building == None`** (the linked
-///   building-table sweep statement itself returning `Err`): producer-driven
-///   ON THE `SessionOnly` ARM ONLY, in `crates/jammi-ai/tests/it/jobs_shutdown.rs`
-///   (`release_job_leases_one_sweep_reports_building_none_jobs_some_from_a_real_fault`
-///   — named `one_sweep`, round 7, because `InferenceSession::release_job_leases`
-///   runs `release_sweep` exactly once; there is no sweep #1 on that path for
-///   this to be "second" after). A round-5 version of this doc declared this
-///   arm "NOT producer-driven ... no OTHER injection point into this
-///   statement is established", reasoning only about the COLUMN
-///   `release_building_tables_of_claimant`'s `UPDATE` WRITES
-///   (`result_tables.lease_expires_at`); that argument is retracted — the
-///   statement also NAMES a second table it reads FROM, `result_tables`
-///   itself, and renaming that table out from under the statement (the same
-///   public `SqliteBackend::open` + `CatalogBackend::transaction` surface
-///   the `jobs`-fault test above uses) faults it while
-///   `release_jobs_claimed_by` — which never touches `result_tables` —
-///   still confirms: the mirror image of the asymmetric shape above.
-///   STILL UNDRIVEN: `EmbeddedWorker::release_and_stop`'s own sweep #2 (2g)
-///   reaching `building == None` from a real backend fault, through a real
-///   worker loop — no test in this tree does that; only the `SessionOnly`
-///   arm's single sweep is producer-driven for this determinant. Covered at
-///   the predicate itself by the literal `an_unconfirmed_second_sweep_degrades`
-///   / `session_only_unconfirmed_sweep_degrades` below.
+///   which also confirms `ReleaseSweep.building` is unaffected by the same
+///   fault. Pinned at the predicate by `a_jobs_only_unconfirmed_second_sweep_degrades`
+///   / `session_only_jobs_only_unconfirmed_sweep_degrades`.
+/// * **Sweep confirmation, `ReleaseSweep.building == None`** — driven on the
+///   `SessionOnly` arm only, in `crates/jammi-ai/tests/it/jobs_shutdown.rs`
+///   (`release_job_leases_one_sweep_reports_building_none_jobs_some_from_a_real_fault`;
+///   `InferenceSession::release_job_leases` runs `release_sweep` exactly
+///   once): renaming `result_tables`, the table the statement reads FROM,
+///   faults it while `release_jobs_claimed_by` still confirms.
+///   `EmbeddedWorker::release_and_stop`'s own sweep #2 (2g) reaching
+///   `building == None` through a real worker loop is not driven by any
+///   test; the predicate is pinned by `an_unconfirmed_second_sweep_degrades`
+///   / `session_only_unconfirmed_sweep_degrades`.
 /// * **Outer `Err`** (`ReleaseAttempt::Worker(Err(_))` /
 ///   `SessionOnly(Err(_))`): a single unconditional match arm with no
-///   conjunct to collapse — a mutation deleting either arm's body is caught
-///   by any test that exercises it at all, so this is lower-value to drive
-///   from a producer; covered by the literal `worker_err_is_degraded` /
-///   `session_only_err_is_degraded` below.
+///   conjunct to collapse, covered by `worker_err_is_degraded` /
+///   `session_only_err_is_degraded`.
 #[cfg(test)]
 mod release_outcome_tests {
     use jammi_ai::fine_tune::worker::{HoldReleaseOutcome, LoopState, ReleaseReport, ReleaseSweep};
@@ -2874,15 +2750,10 @@ mod release_outcome_tests {
     }
 
     // -------------------------------------------------------------------
-    // Contract `CONTRACT-OPS-fix4.md` M2: the `SessionOnly` arm's own P-2B
-    // conjunct (`holds.confirms_release() &&`, folded in this round exactly
-    // like the Worker arm's) had NO oracle — the round-4 audit found
-    // deleting it left `release_outcome_tests` 12/12 green AND the whole
-    // `jammi-server` crate 285/285 green. These pin it, mirroring the two
-    // cases already proven load-bearing on the Worker arm
+    // The `SessionOnly` arm's own P-2B conjunct (`holds.confirms_release()
+    // &&`), pinned by the same two cases that pin it on the Worker arm
     // (`an_unobserved_hold_pass_degrades`, `a_failed_hold_degrades_even_with_
-    // confirmed_sweeps`) rather than adding only the single case the audit
-    // wrote out.
+    // confirmed_sweeps`).
     // -------------------------------------------------------------------
 
     /// The keeper's per-hold pass itself unobserved (a dead keeper) must
@@ -2914,8 +2785,7 @@ mod release_outcome_tests {
     }
 
     /// Sibling check on the OTHER conjunct of the same arm's predicate
-    /// (`sweep_confirms_release`, pre-existing but never pinned for
-    /// `SessionOnly` specifically): an unconfirmed sweep degrades a
+    /// (`sweep_confirms_release`): an unconfirmed sweep degrades a
     /// `SessionOnly` release even with a fully confirmed hold pass.
     #[test]
     fn session_only_unconfirmed_sweep_degrades() {
@@ -2935,8 +2805,7 @@ mod release_outcome_tests {
     }
 
     /// The `SessionOnly` peer of `a_jobs_only_unconfirmed_second_sweep_
-    /// degrades`: the same asymmetric arm (`jobs == None`, `building ==
-    /// Some(_)`) no existing `SessionOnly` pin exercises either.
+    /// degrades`: the asymmetric arm `jobs == None`, `building == Some(_)`.
     #[test]
     fn session_only_jobs_only_unconfirmed_sweep_degrades() {
         let holds = HoldReleaseOutcome::Observed(HoldRelease {
@@ -2955,14 +2824,13 @@ mod release_outcome_tests {
     }
 
     // -------------------------------------------------------------------
-    // The newly folded determinants (P-2B, P-2F, P-EXCLUSION) — each of
-    // these fails against the round-2 predicate ("success iff `Ok`").
+    // The determinants P-2B, P-2F, P-EXCLUSION — each of these fails
+    // against the weakened predicate "success iff `Ok`".
     // -------------------------------------------------------------------
 
     /// P-2B: a per-hold failure degrades the outcome even though the OUTER
-    /// call succeeded and both sweeps confirm — the collapse this round's
-    /// contract closes at the producer (`lease_keeper.rs`), pinned here at
-    /// the predicate that reads it.
+    /// call succeeded and both sweeps confirm — the producer side lives in
+    /// `lease_keeper.rs`; this pins the predicate that reads it.
     #[test]
     fn a_failed_hold_degrades_even_with_confirmed_sweeps() {
         let r = report(
@@ -3045,8 +2913,7 @@ mod release_outcome_tests {
         );
     }
 
-    /// Sweep #2 unconfirmed still degrades — the pre-existing behaviour,
-    /// pinned so this round's changes cannot regress it.
+    /// Sweep #2 unconfirmed degrades.
     #[test]
     fn an_unconfirmed_second_sweep_degrades() {
         let r = report(
@@ -3067,13 +2934,10 @@ mod release_outcome_tests {
         );
     }
 
-    /// `sweep_confirms_release`'s TWO conjuncts fail independently
-    /// (contract `CONTRACT-OPS-fix5.md`, round 5): every existing
-    /// unconfirmed-sweep pin above (and `session_only_unconfirmed_sweep_
-    /// degrades` below) drops `building` and leaves `jobs` `Some`, so
-    /// dropping the `jobs` conjunct out of `sweep_confirms_release`
-    /// entirely went unnoticed. Pinned here on the arm none of those
-    /// exercise: `jobs == None`, `building == Some(_)`.
+    /// `sweep_confirms_release`'s TWO conjuncts fail independently: the
+    /// other unconfirmed-sweep pins drop `building` and leave `jobs` `Some`,
+    /// so only this arm (`jobs == None`, `building == Some(_)`) catches a
+    /// predicate that drops the `jobs` conjunct.
     #[test]
     fn a_jobs_only_unconfirmed_second_sweep_degrades() {
         let r = report(
@@ -3096,9 +2960,7 @@ mod release_outcome_tests {
 
     // -------------------------------------------------------------------
     // False-positive pins: a normal cooperative release and a normal abort
-    // release must both still report `Released` — the contract's own
-    // stop-rule condition (a regression here that only a mutation test
-    // would catch is exactly what ends this unit's wave-1 participation).
+    // release must both still report `Released`.
     // -------------------------------------------------------------------
 
     /// A normal cooperative release: 2e joined the task after observing
@@ -3123,7 +2985,7 @@ mod release_outcome_tests {
     /// (`stop_witnessed = true` via 2e's own certain resolution), a held
     /// lease released, both sweeps confirm — this is
     /// `serve_shutdown_modes::sigint_while_draining_releases_and_returns_
-    /// released_within_two_heartbeats`'s (O1's) own scenario, pinned here
+    /// released_within_two_heartbeats`'s own scenario, pinned here
     /// at the unit level so a predicate regression is caught without the
     /// full server harness.
     #[test]
@@ -3146,8 +3008,7 @@ mod release_outcome_tests {
         );
     }
 
-    /// The falsifier the design round handed forward, demonstrated
-    /// directly: an abort whose in-task guard has not published within one
+    /// An abort whose in-task guard has not published within one
     /// heartbeat (`loop_state` reads a stale `Running`, the fallback proxy
     /// read) must NOT spuriously degrade a release that 2e itself already
     /// resolved with certainty.

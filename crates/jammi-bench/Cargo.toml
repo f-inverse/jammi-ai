@@ -9,8 +9,8 @@ repository.workspace = true
 publish = false
 # Bakes this binary's build-time identity (`JAMMI_BUILD_SHA`/`JAMMI_BUILD_TARGET`/
 # `JAMMI_BUILD_PROFILE`) into compile-time env vars `report::Provenance::baked`
-# reads back with `env!()` — never at run time (unification contract C1; see
-# `build.rs`'s own module doc).
+# reads back with `env!()` — never at run time (see `build.rs`'s own module
+# doc).
 build = "build.rs"
 
 [[bin]]
@@ -33,7 +33,7 @@ jammi-encoders.workspace = true
 # `jammi_kernels::admission::unmatched_disables()` directly — Rust does not
 # let a crate name a transitive dependency's items without its own
 # `[dependencies]` entry, even when that dependency is already linked in via
-# another direct dependency's public API (contract K-aux).
+# another direct dependency's public API.
 jammi-kernels.workspace = true
 candle-core.workspace = true
 candle-nn.workspace = true
@@ -65,9 +65,20 @@ hex.workspace = true
 # the GPU prove-lane builds with it.
 cuda = ["jammi-ai/cuda"]
 # By-name passthrough to `jammi-ai`'s own `flash-attn` feature. Needed so the
-# reporter-scenario producer (`jammi-bench finetune-run`) can compile the
-# fused f16/bf16 dispatch WITH FlashAttention-2 engaged for the reporter's
-# b16·s128 scenario — `ci/scripts/check_flash_attn_closure.py` exempts this
+# `jammi-bench finetune-run` producer can compile the fused f16/bf16 dispatch
+# WITH FlashAttention-2 engaged for its b16·s128 scenario —
+# `ci/scripts/check_flash_attn_closure.py` exempts this
 # crate's `--all-features` selection on the same verified 1:1 idiom as
 # `jammi-encoders`'s own `flash-attn` entry.
 flash-attn = ["jammi-ai/flash-attn"]
+# Compiles the tests that need CUDA device 0: the padded-transport legs, which
+# run this binary on the device and read its report.
+live-gpu-tests = ["cuda"]
+
+[dev-dependencies]
+jammi-test-resources.workspace = true
+
+[[test]]
+name = "finetune_step_padded_cuda"
+path = "tests/finetune_step_padded_cuda.rs"
+required-features = ["live-gpu-tests"]

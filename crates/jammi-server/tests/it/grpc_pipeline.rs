@@ -116,7 +116,7 @@ async fn build_propagate_assemble_over_the_wire() {
         .into_inner();
     assert!(!graph.table_name.is_empty(), "graph table materialised");
 
-    // PropagateEmbeddings over that S9 graph → a new searchable embedding table.
+    // PropagateEmbeddings over that neighbor graph → a new searchable embedding table.
     let propagated = pipeline
         .propagate_embeddings(PropagateEmbeddingsRequest {
             source_id: "patents".into(),

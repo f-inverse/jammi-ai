@@ -1,6 +1,6 @@
 """Conformance: the embed wheel's remote arm IS `jammi-ai`, by construction.
 
-The whole point of the composition (M2 §2) is that the remote surface is
+The whole point of the composition is that the remote surface is
 DEFINED ONCE — in `jammi-ai` — and `jammi-ai`'s remote target delegates to
 it. So these tests assert the construction holds rather than re-listing a
 parallel surface that could drift:
@@ -78,7 +78,7 @@ def test_connect_routes_local_to_the_compiled_engine(tmp_path):
 
 
 def test_base_client_resolves_the_engine_when_the_extra_is_present():
-    """U2: with the `[embedded]` extra installed (this lane carries `jammi_native`),
+    """With the `[embedded]` extra installed (this lane carries `jammi_native`),
     the BASE client's `file://` front door resolves to the in-process engine — the
     base discovers the native backend on its own.
 
@@ -843,8 +843,8 @@ def test_remote_job_matches_the_local_handle_shape():
     """The client's `RemoteJob` carries the SAME handle surface as the
     embedded engine's `Job`: the `job_id` / `kind` / `output_model_id`
     properties, the `status()` / `wait()` / `progress()` / `cancel()`
-    methods, `metrics()` (issue #441), and `acceleration_report()` (esc-075,
-    campaign #443). A remote `wait()` polls `JobStatus` and raises on a
+    methods, `metrics()`, and `acceleration_report()`. A remote `wait()`
+    polls `JobStatus` and raises on a
     failed job with the wire error, mirroring the local handle, so a caller
     treats the two interchangeably."""
     local = jammi_native.Job
@@ -974,7 +974,8 @@ def test_embed_remote_and_client_share_identical_signatures():
     """Because the embed wheel's remote arm IS `jammi.RemoteDatabase`,
     every verb's signature is identical by construction. Asserting it here pins
     the invariant so any future hand-rolled remote class in the embed wheel
-    (which would re-introduce the very drift M2 removes) fails this test."""
+    (which would re-introduce the very drift the composition removes) fails
+    this test."""
     embed_remote = jammi.connect("grpc://127.0.0.1:8081")
     try:
         assert type(embed_remote) is jammi.RemoteDatabase
@@ -988,8 +989,8 @@ def test_embed_remote_and_client_share_identical_signatures():
 
 def test_embedded_database_shares_the_unified_modality_verbs():
     """The embedded `Database` carries the unified `encode_query` /
-    `generate_embeddings` (the `modality=` form), matching the client — and the
-    per-modality names are gone (the deferred Stage-1 unification)."""
+    `generate_embeddings` (the `modality=` form), matching the client — and no
+    per-modality verb (`encode_text_query`, ...) exists."""
     for verb in ("encode_query", "generate_embeddings", "get_server_info"):
         assert _embed_has(verb), verb
     for gone in (
@@ -1032,7 +1033,7 @@ def test_get_server_info_shape_agrees_across_transports(tmp_path):
     the client projects the `jammi.v1.ServerInfo` message field-by-field. Both
     are pinned to the proto's field set here so a forgotten projection (a field
     present in the proto but dropped by one transport) fails — the very
-    embedded-vs-remote drift M2 §2 removes.
+    embedded-vs-remote drift the composition removes.
 
     Hermetic: the embedded side opens a real local engine; the remote side reads
     the generated proto descriptor, never dialing a server.
@@ -1155,7 +1156,7 @@ def test_bad_format_add_source_raises_invalid_argument_on_both_backends(tmp_path
 
 
 def test_jsonl_and_ndjson_add_source_are_accepted_on_both_backends(tmp_path):
-    """Cross-surface parity for #346: `"jsonl"`/`"ndjson"` must be accepted on
+    """Cross-surface parity: `"jsonl"`/`"ndjson"` must be accepted on
     BOTH transports, not just one.
 
     The embedded arm calls the engine's `FileFormat::from_str` directly
@@ -1275,13 +1276,13 @@ def test_cancelled_job_wait_raises_job_cancelled_not_training_error():
 
 
 def test_empty_training_set_refusal_over_recompute_is_invalid_argument_on_both_transports():
-    """Tier B (converter-level) — the K2 refusal of an EMPTY training set, WHEN
-    IT SURFACES OVER THE `Recompute` RPC (`grpc/pipeline.rs:139`,
+    """Tier B (converter-level) — the refusal of an EMPTY training set, WHEN
+    IT SURFACES OVER THE `Recompute` RPC (`jammi_server::grpc::pipeline`,
     `jammi_ai::pipeline::recompute`'s `TrainingSet` replay arm), maps to ONE
     class, `jammi.errors.InvalidArgument`, on both transports.
 
-    This is deliberately scoped to the `Recompute` surface, not "the" K2
-    refusal generally: the SAME typed engine error
+    This is deliberately scoped to the `Recompute` surface, not "the"
+    empty-training-set refusal generally: the SAME typed engine error
     (`JammiError::EmptyTrainingSet`) reaches the caller as a DIFFERENT class,
     `jammi.errors.TrainingError`, when it is instead raised on the fine-tune
     JOB path (`worker.rs::run_spec`'s `materialize_projection` call) — see
@@ -1357,14 +1358,14 @@ def test_empty_training_set_refusal_on_the_job_path_is_training_error_on_both_tr
       * the REMOTE raise-site, `RemoteJob.wait()`
         (`clients/python/jammi/_database.py`), raises
         `jammi.errors.TrainingError(resp.error)` for ANY `status == "failed"`
-        — driven directly here with the K2 message as the stubbed error;
+        — driven directly here with the refusal's message as the stubbed error;
       * the EMBEDDED raise-site, `wait_for_result`
-        (`crates/jammi-python/src/job.rs:380-382`), raises
+        (`crates/jammi-python/src/job.rs`), raises
         `JammiError::FineTune(record.error)` for ANY `JobStatus::Failed` —
         the exact same unconditional wrap the generic
         `test_failed_job_wait_raises_training_error_on_both_raise_sites`
         above already pins with an unrelated message ("boom") — which
-        `jammi_error_class` (`crates/jammi-python/src/error.rs:54`) maps to
+        `jammi_error_class` (`crates/jammi-python/src/error.rs`) maps to
         `TrainingError`. Neither raise-site inspects the failure's original
         cause, so the class the two transports agree on for THIS failure is
         the SAME class already pinned for every OTHER job failure — proven
@@ -1399,8 +1400,8 @@ def test_empty_training_set_refusal_on_the_job_path_is_training_error_on_both_tr
 
     # This is NOT the class the Recompute-RPC-scoped test above pins for the
     # very same underlying refusal — the two surfaces genuinely disagree,
-    # which is exactly why neither test names itself as covering "the" K2
-    # refusal universally.
+    # which is exactly why neither test names itself as covering "the"
+    # empty-training-set refusal universally.
     assert type(info.value) is not jammi.InvalidArgument
 
     # The embedded raise-site binds to THIS class the same way the generic
@@ -1456,14 +1457,10 @@ _METRICS_TEST_TRAINING_PAIRS = (
 )
 
 
-@pytest.mark.skipif(
-    not _METRICS_TEST_TINY_BERT.is_dir() or not _METRICS_TEST_TRAINING_PAIRS.is_file(),
-    reason="local tiny_bert / training_pairs fixtures not present",
-)
 def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
     """`RemoteJob.metrics()` and the embedded `Job.metrics()` agree on the
     SAME three states the catalog's `jobs.result` payload's nested `metrics`
-    field can carry (issue #441, generalised to the `jobs` schema) —
+    field can carry —
     proven against a REAL embedded engine + catalog on one arm,
     not a stub of both:
 
@@ -1486,11 +1483,11 @@ def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
     instances (Python's stdlib `sqlite3` vs. Rust's vendored `sqlx-sqlite`)
     committing to the same `-wal`/`-shm` files at the same instant is not
     always safe, and can crash the interpreter (`Fatal Python error: Bus
-    error`, SIGBUS inside SQLite's own WAL commit path). `esc-073` tracks
-    the underlying engine-side behavior (a crash instead of a typed refusal
-    for an unsupported topology) as a `jammi-db`-scope defect, out of this
-    crate's reach; the shape below structurally excludes this test's
-    exposure to it, rather than merely making it rare.
+    error`, SIGBUS inside SQLite's own WAL commit path) — the engine crashes
+    rather than refusing typed on that unsupported topology, and that
+    behavior lives in `jammi-db`, out of this crate's reach. The shape below
+    structurally excludes this test's exposure to it, rather than merely
+    making it rare.
 
     `Database.close()` (deterministic worker stop + session release) +
     `Database.job(job_id)` (attach-by-id, the embedded peer of
@@ -1535,8 +1532,8 @@ def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
     no equivalent convenience method, though a `RemoteJob` can always
     be constructed directly from a `job_id` (every one of its verbs re-fetches
     state over the wire per call, so it needs no server-side "attach" step).
-    Adding a `RemoteDatabase.job(...)` convenience method is
-    `clients/python` surface, out of this contract's scope.
+    A `RemoteDatabase.job(...)` convenience method would be
+    `clients/python` surface, not this crate's.
     """
     import json
     import sqlite3
@@ -1697,17 +1694,13 @@ def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
     del malformed_job, malformed_db
 
 
-@pytest.mark.skipif(
-    not _METRICS_TEST_TINY_BERT.is_dir() or not _METRICS_TEST_TRAINING_PAIRS.is_file(),
-    reason="local tiny_bert / training_pairs fixtures not present",
-)
 def test_remote_and_embedded_job_acceleration_report_agree_on_all_three_states(
     tmp_path,
 ):
     """`RemoteJob.acceleration_report()` and the embedded
     `Job.acceleration_report()` agree on the SAME three states the
-    catalog's `jobs.acceleration_report` column can carry (esc-075 /
-    campaign #443 K4 follow-up) — VALUE parity, not merely
+    catalog's `jobs.acceleration_report` column can carry — VALUE parity,
+    not merely
     `test_remote_job_matches_the_local_handle_shape`'s method-
     existence check above:
 
@@ -1721,15 +1714,15 @@ def test_remote_and_embedded_job_acceleration_report_agree_on_all_three_states(
         would erase that distinction.
       * present + `{"state": "pending"}` -> the SAME parsed dict on both.
       * present + `{"state": "determined", ...}` -> the SAME parsed dict on
-        both, using the byte-identical JSON text a REAL run's esc-075 probe
+        both, using the byte-identical JSON text a REAL run's acceleration probe
         produced on the embedded side (never a hand-built stand-in) fed
         verbatim to the remote stub — so this proves the two `JSON-decode`
         implementations agree on the real producer's actual output shape, not
         just on a convenient literal.
 
     Same close-before-inject / one-real-job discipline as
-    `test_remote_and_embedded_job_metrics_agree_on_all_three_states`
-    (esc-073) — see that test's docstring for why.
+    `test_remote_and_embedded_job_metrics_agree_on_all_three_states` —
+    see that test's docstring for why.
     """
     import json
     import sqlite3
@@ -1776,7 +1769,7 @@ def test_remote_and_embedded_job_acceleration_report_agree_on_all_three_states(
     job_id = submit_job.job_id
 
     # State "determined": the job's OWN natural post-completion payload — a
-    # REAL esc-075 probe result, not a hand-built stand-in.
+    # REAL acceleration-probe result, not a hand-built stand-in.
     embedded_determined = submit_job.acceleration_report()
     assert isinstance(embedded_determined, dict)
     assert embedded_determined["state"] == "determined"
@@ -1901,7 +1894,7 @@ def test_supports_and_not_supported_on_backend_contract(tmp_path):
     carries the per-connection scoping key (session_id); each raises for the
     other's.
 
-    `close` is NOT among them any more, on either side: it is a SHARED verb both
+    `close` is NOT among them, on either side: it is a SHARED verb both
     backends implement (a channel teardown remote, the catalog-file release
     embedded), so it is asserted as an ordinary member of the Session surface
     here rather than as a capability."""
@@ -1946,12 +1939,11 @@ def test_capability_enum_is_the_closed_four():
     diverge between the transports, no more. Pinned so a fifth is a deliberate
     decision, not a silent addition.
 
-    `close` was the fifth until the embedded arm gained a real `close()` (the
-    catalog-file release the engine's own contract documents and the public
-    client had no way to reach). The enum's charter — "exactly the features that
-    genuinely diverge between the two transports today" — then FORCES its
-    removal: a `Capability` every backend supports is a predicate that never
-    discriminates, and leaving it in would have said the embedded engine lacks a
+    `close` is not one of them: both backends implement it (the embedded arm
+    releases the catalog file), and the enum's charter — "exactly the features
+    that genuinely diverge between the two transports" — excludes it: a
+    `Capability` every backend supports is a predicate that never
+    discriminates, and listing it would say the embedded engine lacks a
     primitive it has. Pinned as an absence, not merely by the set below, in
     `test_supports_and_not_supported_on_backend_contract`."""
     from jammi import Capability
@@ -2111,7 +2103,7 @@ def test_remote_not_found_semantics_survive_the_taxonomy_mapping():
 # ---------------------------------------------------------------------------
 # The base client discovers the native engine as an in-process backend.
 #
-# `jammi` is the BASE (U2): `jammi.connect("file://…")` resolves
+# `jammi` is the BASE: `jammi.connect("file://…")` resolves
 # the local target to an `EmbeddedBackend` (direct FFI) when `jammi_native` is
 # importable — discovering the native engine directly. These tests pin that base
 # front door and the lazy-native discipline (`import jammi` stays native-free;
@@ -2123,8 +2115,8 @@ def test_remote_not_found_semantics_survive_the_taxonomy_mapping():
 def test_client_connect_file_returns_embedded_session_via_the_base_front_door(tmp_path):
     """`jammi.connect("file://…")` — the BASE front door — returns an
     `EmbeddedBackend` that satisfies the `Session` protocol and runs a verb
-    in-process (direct FFI, B4). This is the U2 feature: the base client
-    discovers `jammi_native` as an in-process backend on its own.
+    in-process (direct FFI): the base client discovers `jammi_native` as an
+    in-process backend on its own.
 
     Hermetic: opens a local engine (`file://`), contacts no server."""
     db = jammi.connect(f"file://{tmp_path}")
@@ -2172,7 +2164,7 @@ def test_import_jammi_is_native_free_then_lazily_loads_the_engine(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# §5.5 — the projection shape pin, ANCHORED TO THE PROTO SCHEMA.
+# The projection shape pin, ANCHORED TO THE PROTO SCHEMA.
 #
 # The 20 `_*_to_dict` projections in `jammi._database` decode a wire proto
 # into the client-facing dict. The embedded engine returns the SAME dict shapes
@@ -2184,9 +2176,9 @@ def test_import_jammi_is_native_free_then_lazily_loads_the_engine(tmp_path):
 # then forces the projection (or the declared delta) to change, so the two
 # projection paths, both anchored to the proto, cannot drift from each other.
 #
-# This is the honest FLOOR (§5.5 / K4): true per-VALUE equality on real data is
+# This is the honest FLOOR: true per-VALUE equality on real data is
 # covered by the Rust it-suite (`grpc_remote_session.rs` / `grpc_remote_compute.rs`,
-# the CONSTITUTION K4 anchor) and — for the three eval reports — by the
+# the embedded/remote parity anchor) and — for the three eval reports — by the
 # Rust-serde-GENERATED golden the client's `tests/test_eval_projection.py` locks,
 # not hermetically constructible in Python (the native links no tonic/proto, so
 # there is no in-process Python value-parity oracle to stand up here).

@@ -30,7 +30,7 @@ fn weights_path() -> PathBuf {
 }
 
 /// `tiny_bert_head64` (`hidden_size=64, num_attention_heads=1` — `head_dim
-/// == 64 == ATTENTION_BLOCK_HEAD_DIM`, issue #462): the ONE shape
+/// == 64 == ATTENTION_BLOCK_HEAD_DIM`): the ONE shape
 /// `attention_block_admission_predicate` admits, next to `tiny_bert`'s own
 /// `head_dim = 32/2 = 16` (always refused, a counted eager fallback).
 fn fixture_dir_head64() -> PathBuf {
@@ -157,12 +157,12 @@ fn bert_loads_with_target_modules() {
     );
 }
 
-/// Non-vacuity (#428 P2b round-2 fix): read `tiny_bert`'s OWN safetensors
+/// Non-vacuity: read `tiny_bert`'s OWN safetensors
 /// header rather than merely stating in prose that its LoRA-eligible
 /// sites carry a bias — every test in this file that claims to exercise
 /// the bias-carrying fused site depends on this fixture fact staying
-/// true, and a future fixture regeneration that dropped these biases
-/// would otherwise leave those tests silently exercising the bias-FREE
+/// true, and a fixture regeneration that dropped these biases would
+/// otherwise leave those tests silently exercising the bias-FREE
 /// path while still claiming to prove the bias-carrying one.
 fn assert_tiny_bert_lora_sites_carry_a_bias(
     device: &Device,
@@ -191,9 +191,8 @@ fn build_bert_with_lora_on_biased_sites(
 ) -> Bert {
     // BERT's `query`/`value` sites (like every other linear this encoder
     // builds — `LoraSite::resolve_base`'s own `linear(..)` call) carry a
-    // bias: #428 P2b's fused-with-bias pack applies here directly, not
-    // the eager fallback every prior release forced. Non-vacuity checked
-    // at runtime, not merely stated — see
+    // bias: the fused-with-bias pack applies here directly, not the eager
+    // fallback. Non-vacuity checked at runtime, not merely stated — see
     // `assert_tiny_bert_lora_sites_carry_a_bias`'s own doc.
     assert_tiny_bert_lora_sites_carry_a_bias(device, config, weights);
     let targets: Vec<String> = vec!["query".into(), "value".into()];
@@ -220,10 +219,9 @@ fn build_bert_with_lora_on_biased_sites(
         .expect("build LoRA-targeted BERT on tiny_bert (biased sites)")
 }
 
-/// #428 P2b: BERT's LoRA-eligible sites (`query`/`value`, like every
-/// other linear this encoder builds) carry a bias — the fused LoRA site
-/// now FUSES a biased base instead of taking the eager fallback every
-/// prior release forced (`base_has_no_bias`, DELETED). Counter-threading
+/// BERT's LoRA-eligible sites (`query`/`value`, like every other linear
+/// this encoder builds) carry a bias — the fused LoRA site FUSES a biased
+/// base rather than taking the eager fallback. Counter-threading
 /// (mirrors `modernbert.rs`'s own RoPE/softmax `set_training` gate
 /// tests, `crate::modernbert::DISPATCH_COUNTER_TEST_LOCK` — this
 /// integration-test binary's ONE process-wide dispatch-counter lock,
@@ -231,8 +229,7 @@ fn build_bert_with_lora_on_biased_sites(
 /// training forward must dispatch the fused LoRA site (`fused` advances,
 /// `eager` does not); an eval forward must touch NEITHER counter at all —
 /// `LoraLinear::forward`'s own doc states eval never even reaches
-/// `admit` (the load-bearing rule-9 assertion this test is: a byte
-/// comparison alone would not catch eval accidentally routing through
+/// `admit` (a byte comparison alone would not catch eval accidentally routing through
 /// `admit` with a domain-holds-but-training-false miswiring).
 #[test]
 fn bert_lora_bias_site_counter_threading_gates_the_fused_lora_linear_dispatch_counters() {
@@ -464,21 +461,18 @@ fn hand_composed_reference_forward(
     hidden
 }
 
-/// The eval-bytes half of rule 9 (a counter assertion alone is not
-/// falsifiable against a numerically-silent regression) — K4 pin (#428
-/// P2b round-2 fix): the PRIOR version of this test used
-/// `LoraInitMode::ZerosB`, which makes LoRA's own contribution exactly
-/// zero — comparing against a fully frozen model was TAUTOLOGICAL there
-/// (it passed at main, before #428's fused-with-bias site existed at
-/// all, unconditionally: eval never dispatches the fused site regardless,
-/// and `B == 0` means the adapter adds nothing either way). `Gaussian`
-/// init (seeded, deterministic) gives BOTH `A` and `B` non-zero values,
-/// so this comparison genuinely exercises LoRA's own contribution: the
+/// The eval-bytes half of the counter-threading test above (a counter
+/// assertion alone is not falsifiable against a numerically-silent
+/// regression). `LoraInitMode::ZerosB` would make LoRA's own contribution
+/// exactly zero, so comparing against a fully frozen model would be
+/// TAUTOLOGICAL (eval never dispatches the fused site, and `B == 0` means
+/// the adapter adds nothing either way). `Gaussian` init (seeded, deterministic) gives BOTH `A` and
+/// `B` non-zero values, so this comparison genuinely exercises LoRA's own contribution: the
 /// eval-mode output of a LoRA-wrapped, non-zero-`A`/`B` BERT must equal a
 /// [`hand_composed_reference_forward`] built independently, from plain
 /// tensor ops, off the SAME weights (base `Linear` with bias + `A`/`B` +
 /// scaling, no dropout) — bitwise — after an explicit `is_finite` scan
-/// over both sides (rule F: `NaN == NaN` is `false`, so a bare
+/// over both sides (`NaN == NaN` is `false`, so a bare
 /// `assert_eq!` on non-finite data can pass by both sides independently
 /// producing NaN in the same positions without proving anything).
 #[test]
@@ -491,11 +485,8 @@ fn bert_lora_bias_site_eval_matches_a_hand_composed_eager_reference_at_nonzero_a
     let weights = weights_path();
     assert_tiny_bert_lora_sites_carry_a_bias(&device, &config, &weights);
 
-    // Non-vacuity (round-2 fix, prove-bite finding): `tiny_bert`'s OWN
-    // `query`/`value` biases are all EXACTLY zero (a fact of this
-    // fixture, verified by hand-mutating the eager reference's own bias
-    // argument to `None` and observing NO output change at all — the
-    // fixture's real bias contributes nothing regardless). A bit-exact
+    // Non-vacuity: `tiny_bert`'s OWN `query`/`value` biases are all EXACTLY
+    // zero (dropping the eager reference's bias argument changes nothing). A bit-exact
     // comparison against a hand-composed reference would therefore stop
     // proving the bias's own contribution the moment the ONE differing
     // operand (`Some(bias)` vs a hypothetically dropped one) happened to
@@ -786,14 +777,13 @@ fn bert_forward_pooled_f16_backbone_with_padding() {
 
 /// An all-padding row (`attention_mask` entirely `0` for one batch item)
 /// drives `mean_pool`'s and `weighted_mean_pool`'s divisor to `0` and removes
-/// every real token from `max_pool`'s reduce. On base commit `4acad0f`, the
-/// F32 eps floors (`1e-9` for the divisors, `-1e30` for the max-pool bias)
-/// silently lose their guarantee once cast to F16: `1e-9` underflows to
-/// `0.0` (giving `0 / 0 = NaN` for mean/weighted-mean) and `-1e30` overflows
-/// to `-inf` (max-pool). This test is RED (NaN/-inf) on `4acad0f` and GREEN
-/// on the fix, which floors the divisor at `1.0` (exact in every dtype) and
-/// replaces the max-pool bias with a `where_cond` select against a
-/// dtype-exact finite sentinel.
+/// every real token from `max_pool`'s reduce. F32 eps floors (`1e-9` for the
+/// divisors, `-1e30` for a max-pool bias) lose their guarantee once cast to
+/// F16: `1e-9` underflows to `0.0` (giving `0 / 0 = NaN` for
+/// mean/weighted-mean) and `-1e30` overflows to `-inf` (max-pool). Pooling
+/// therefore floors the divisor at `1.0` (exact in every dtype) and replaces
+/// the max-pool bias with a `where_cond` select against a dtype-exact finite
+/// sentinel; this test fails (NaN/-inf) under the eps-floor form.
 #[test]
 fn bert_forward_pooled_f16_backbone_all_padding_row() {
     let device = Device::Cpu;
@@ -949,11 +939,11 @@ fn bert_rejects_a_weight_source_hit_with_mismatched_geometry() {
     }
 }
 
-/// #460 (C-LN): before this unit, EVERY BERT LayerNorm carried a bias, so
-/// a real BERT training run's `ln` dispatch-counter pair read `0/0`
-/// regardless of how many LayerNorms it actually ran (no `admit()` call
-/// site at all — see `jammi_kernels::ops::layer_norm`'s module doc). This
-/// pins the fix, end to end, on a real (non-LoRA) BERT build: training
+/// EVERY BERT LayerNorm carries a bias, and the biased training LayerNorm
+/// is admitted and counted like the bias-free one (an uncounted biased
+/// path would read `0/0` on the `ln` counter pair however many LayerNorms
+/// ran — see `jammi_kernels::ops::layer_norm`'s module doc). This pins
+/// that end to end on a real (non-LoRA) BERT build: training
 /// must dispatch the fused `layer_norm_fused` key at least once, eval
 /// must never touch it at all.
 #[test]
@@ -995,8 +985,8 @@ fn bert_biased_layer_norm_counter_threading_gates_the_ln_dispatch_counters() {
 
     // Training: every biased LayerNorm in this fixture is F32, contiguous,
     // well within MAX_HIDDEN -- the fused biased kernel's domain holds, so
-    // the fused counter must advance (this is the exact `0/0` bug #460
-    // fixes: before it, this assertion would fail with fused == before).
+    // the fused counter must advance (an uncounted biased path would
+    // leave fused == before).
     bert.set_training(true);
     let before_train = jammi_encoders::ln_dispatch_snapshot();
     let _ = bert
@@ -1026,11 +1016,11 @@ fn bert_biased_layer_norm_counter_threading_gates_the_ln_dispatch_counters() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Attention cascade + GELU seam (issue #462/#463)
+// Attention cascade + GELU seam
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The two-sided counter proof at `tiny_bert_head64` in training mode
-/// (contract R6'/R8'): `attention_block_fused` must dispatch fused and
+/// The two-sided counter proof at `tiny_bert_head64` in training mode:
+/// `attention_block_fused` must dispatch fused and
 /// never eager, `softmax_last_dim_fused` must be ABSORBED — never touched
 /// at all, since the whole-attention-block op folds it in — and
 /// `attention_block_flash` must record a decline every layer (BERT never
@@ -1078,7 +1068,7 @@ fn bert_head64_training_attention_block_and_softmax_two_sided_counters() {
     );
 }
 
-/// The GELU seam's own two-sided counter proof at head64 (issue #463): a
+/// The GELU seam's own two-sided counter proof at head64: a
 /// training forward must dispatch `gelu_erf_fused` and never touch the
 /// eager counter.
 #[test]
@@ -1140,9 +1130,8 @@ fn bert_head16_training_attention_block_counted_eager() {
     );
 }
 
-/// K4 eval pin (contract R6'): eval-mode output and every dispatch counter
-/// this unit touches must be completely unaffected by whether the model was
-/// EVER put into training mode, mirroring
+/// Eval pin: eval-mode output and every dispatch counter these seams touch must be completely
+/// unaffected by whether the model was EVER put into training mode, mirroring
 /// `crate::modernbert::tests::attention_block_eval_output_is_bit_identical_regardless_of_fused_eligibility`.
 #[test]
 fn bert_head64_eval_output_is_bit_identical_regardless_of_fused_eligibility() {
@@ -1203,41 +1192,24 @@ fn bert_head64_eval_output_is_bit_identical_regardless_of_fused_eligibility() {
 }
 
 /// `JAMMI_KERNELS_DISABLE` is a process-wide `OnceLock` — this must run in
-/// a fresh child process (contract R8'): disabling BOTH
-/// `attention_block_fused` and `softmax_last_dim_fused` together must force
-/// EVERY training forward at head64 through the eager composition, on
+/// a fresh child process: disabling BOTH `attention_block_fused` and `softmax_last_dim_fused`
+/// together must force EVERY training forward at head64 through the eager composition, on
 /// BOTH counters.
 #[test]
 fn bert_head64_disabling_attention_block_and_softmax_forces_eager_in_a_fresh_process() {
-    let exe = std::env::current_exe().expect("test binary path");
-    let output = std::process::Command::new(exe)
-        .args([
-            "bert::bert_head64_disabled_attention_block_and_softmax_child_process_body",
-            "--exact",
-            "--nocapture",
-            "--ignored",
-        ])
-        .env(
-            "JAMMI_KERNELS_DISABLE",
-            "attention_block_fused,softmax_last_dim_fused",
-        )
-        .output()
-        .expect("spawn child test binary");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "child process assertion failed: stdout={stdout}\nstderr={}",
-        String::from_utf8_lossy(&output.stderr)
+    let mut child = jammi_test_resources::child_test(
+        "bert::bert_head64_disabled_attention_block_and_softmax_child_process_body",
     );
-    assert!(
-        stdout.contains("1 passed"),
-        "the child process must have actually run (and passed) exactly one test -- \
-         stdout={stdout}"
+    child.env(
+        "JAMMI_KERNELS_DISABLE",
+        "attention_block_fused,softmax_last_dim_fused",
     );
+    jammi_test_resources::child_test_stdout(&mut child);
 }
 
+/// The body [`bert_head64_disabling_attention_block_and_softmax_forces_eager_in_a_fresh_process`] runs in its own process.
 #[test]
-#[ignore]
+#[ignore = "child process of bert_head64_disabling_attention_block_and_softmax_forces_eager_in_a_fresh_process"]
 fn bert_head64_disabled_attention_block_and_softmax_child_process_body() {
     let device = Device::Cpu;
     let mut bert = build_frozen_bert_head64(&device);
@@ -1269,32 +1241,16 @@ fn bert_head64_disabled_attention_block_and_softmax_child_process_body() {
 /// `gelu_erf_fused` alone.
 #[test]
 fn bert_head64_disabling_gelu_erf_fused_forces_eager_in_a_fresh_process() {
-    let exe = std::env::current_exe().expect("test binary path");
-    let output = std::process::Command::new(exe)
-        .args([
-            "bert::bert_head64_disabled_gelu_erf_fused_child_process_body",
-            "--exact",
-            "--nocapture",
-            "--ignored",
-        ])
-        .env("JAMMI_KERNELS_DISABLE", "gelu_erf_fused")
-        .output()
-        .expect("spawn child test binary");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "child process assertion failed: stdout={stdout}\nstderr={}",
-        String::from_utf8_lossy(&output.stderr)
+    let mut child = jammi_test_resources::child_test(
+        "bert::bert_head64_disabled_gelu_erf_fused_child_process_body",
     );
-    assert!(
-        stdout.contains("1 passed"),
-        "the child process must have actually run (and passed) exactly one test -- \
-         stdout={stdout}"
-    );
+    child.env("JAMMI_KERNELS_DISABLE", "gelu_erf_fused");
+    jammi_test_resources::child_test_stdout(&mut child);
 }
 
+/// The body [`bert_head64_disabling_gelu_erf_fused_forces_eager_in_a_fresh_process`] runs in its own process.
 #[test]
-#[ignore]
+#[ignore = "child process of bert_head64_disabling_gelu_erf_fused_forces_eager_in_a_fresh_process"]
 fn bert_head64_disabled_gelu_erf_fused_child_process_body() {
     let device = Device::Cpu;
     let mut bert = build_frozen_bert_head64(&device);
@@ -1314,7 +1270,7 @@ fn bert_head64_disabled_gelu_erf_fused_child_process_body() {
     );
 }
 
-/// #467 F3: `FusibleSiteCensus::lora_sites_wrapped` must count only the
+/// `FusibleSiteCensus::lora_sites_wrapped` must count only the
 /// `Lora` sites whose base is `FrozenBase::Dense` — `LoraLinear::forward`
 /// branches on `self.base` BEFORE it ever reaches `admit()` (that method's
 /// own doc, "the fused site is Dense-ONLY"), so a `Lora` site over a

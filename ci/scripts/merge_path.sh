@@ -6,7 +6,7 @@
 #   bash ci/scripts/merge_path.sh [--only STAGE[,STAGE]] [--skip-pg] [--skip-tests] [--skip-mdbook]
 #
 # Stages, in order:
-#   static   fmt, the four clippy surfaces, rustdoc -D warnings, the guide build
+#   static   fmt, the clippy surfaces the `check` job lints, rustdoc -D warnings, the guide build
 #            (ci.yml `check`, docs.yml `build`)
 #   guards   the guards this change can affect (`ci/guards.toml`), through the
 #            same runner ci.yml's `guard` job calls
@@ -146,6 +146,20 @@ provide_in_image() {
   fi
 }
 
+# ci_step JOB 'STEP NAME' — the `run:` block of that ci.yml step, so a lane
+# this runner shares with CI is written once, in the workflow.
+ci_step() {
+  python3 - "$1" "$2" <<'PY'
+import sys, yaml
+job, name = sys.argv[1], sys.argv[2]
+steps = yaml.safe_load(open('.github/workflows/ci.yml'))['jobs'][job]['steps']
+runs = [st['run'] for st in steps if st.get('name') == name]
+if len(runs) != 1:
+    sys.exit(f"merge_path: ci.yml job {job!r} has {len(runs)} steps named {name!r}")
+print(runs[0])
+PY
+}
+
 # ---------------------------------------------------------------- coverage
 # Which ci.yml jobs this runner covers, printed up front so "green" is never
 # read as "every job".
@@ -164,10 +178,8 @@ PY
 if stage_wanted static; then
   run static "cargo fmt --check" cargo fmt --all -- --check
   run static "clippy workspace" cargo clippy --workspace --all-targets -- -D warnings
-  run static "clippy gated test surfaces (jammi-ai)" \
-    cargo clippy -p jammi-ai --tests --features live-gpu-tests,live-distributed-tests -- -D warnings
-  run static "clippy gated test surfaces (jammi-server)" \
-    cargo clippy -p jammi-server --tests --features test-hooks -- -D warnings
+  run_sh static "clippy feature-gated test surfaces" \
+    "$(ci_step check 'Clippy (feature-gated test surfaces)')"
   # The `postgres`/`mysql` source providers pull `openssl-sys`, whose build
   # script needs OpenSSL headers the CI image deliberately omits; ci.yml
   # installs them for this one lint (its "OpenSSL headers" step says why).
@@ -220,19 +232,15 @@ fi
 # ---------------------------------------------------------------- tests
 if stage_wanted tests && [ "$SKIP_TESTS" = 0 ]; then
   run tests "cargo test --workspace (hermetic lane)" \
-    env JAMMI_REQUIRE_MEDIA_SMOKE=1 cargo test --workspace --exclude jammi-python
+    cargo test --workspace --exclude jammi-python
   run tests "jammi-db test-hooks lane" \
     cargo test -p jammi-db --features test-hooks --test it -- --test-threads=1
   run tests "jammi-encoders golden-parity" \
     cargo test -p jammi-encoders --features golden-parity --test golden_parity
+  run_sh tests "permission-fault tests (unprivileged account)" \
+    "$(ci_step test 'Permission-fault tests (unprivileged account)')"
   if [ -n "${JAMMI_TEST_PG_URL:-}" ]; then
-    export JAMMI_REQUIRE_PG=1
-    run tests "Postgres lane: jammi-db it" \
-      cargo test -p jammi-db --features live-postgres-tests --test it -- --test-threads=1
-    run tests "Postgres lane: jammi-db it + test-hooks" \
-      cargo test -p jammi-db --features live-postgres-tests,test-hooks --test it -- --test-threads=1
-    run tests "Postgres lane: jammi-server introspection" \
-      cargo test -p jammi-server --test it -- introspection --test-threads=1
+    run_sh tests "Postgres lane" "$(ci_step test-pg 'Run Postgres tests')"
   elif [ "$SKIP_PG" = 1 ]; then
     printf 'skip  [tests] Postgres lane (--skip-pg; CI still runs it)\n'
   else

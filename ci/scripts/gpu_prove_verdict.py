@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""GPU-prove verdict consumer (esc-084, issue #454; check-once/fail-loud,
-operator direction 2026-09-03).
+"""GPU-prove verdict consumer (check-once, fail-loud).
 
 **Guarded property**: proof surface == shipped surface, proven ONCE per
 commit and SHARED. Every release-publishing workflow (CUDA and non-CUDA
@@ -12,7 +11,7 @@ statement of why; a publisher gates on the SUMMARY of a prove execution
 already recorded against the commit it is promoting, never on a fresh
 measurement it starts.
 
-## The rule (esc-084 control b, most-recent-measurement-wins, CHECK ONCE)
+## The rule (most-recent-measurement-wins, CHECK ONCE)
 
 For each required arch (the shipped `GENCODE_ARCHES` silicon axis,
 `check_gpu_parity_matrix.py`'s own parser — never a hand-typed list): a
@@ -45,8 +44,7 @@ finish before an older one is rerun. Ties break on run id (higher wins). A
 later red measurement REVOKES an earlier green until a re-run succeeds
 (fail-closed).
 
-Check-once, fail-loud (operator direction, 2026-09-03 — supersedes the
-earlier polling design; nothing here ever starts a prove run, and nothing
+Check-once, fail-loud (nothing here ever starts a prove run, and nothing
 here ever waits for one):
   1. If every required arch's most recent COMPLETED measurement is
      `success`, exit 0 immediately.
@@ -177,7 +175,7 @@ def list_runs(fetch: FetchFn, token: str, repo: str, workflow: str, sha: str) ->
     """Every run of `workflow` at `head_sha == sha`, all pages, explicitly
     sorted by run id descending -- never trusting API order.
 
-    Defense in depth (esc-084 control b): the `head_sha`/workflow-path
+    Defense in depth: the `head_sha`/workflow-path
     query params ask the SERVER to scope the result, but this never TRUSTS
     that scoping blindly -- a returned run whose own `head_sha` disagrees
     with what was asked for, or whose own `path` names a different workflow
@@ -185,7 +183,7 @@ def list_runs(fetch: FetchFn, token: str, repo: str, workflow: str, sha: str) ->
     fixture can never smuggle a foreign commit's or a foreign workflow's
     green measurement into this commit's verdict.
 
-    Advisory A5 fix: `path` must be PRESENT and equal the exact repo-
+    `path` must be PRESENT and equal the exact repo-
     relative path `.github/workflows/<workflow>` -- never `"path" not in r`
     (a record with no `path` key at all is REFUSED, not vacuously
     accepted) and never a bare `endswith` (which a nested path like
@@ -202,7 +200,7 @@ def list_jobs(fetch: FetchFn, token: str, repo: str, run_id: int, filter_mode: s
     """`filter=latest` (the default) -- the latest ATTEMPT of each job in the
     run, so a `gh run rerun <id> --failed` supersedes a stale attempt in
     place rather than leaving a first-attempt failure to be read as a fresh
-    one. `filter_mode="all"` is used by `collect_measurements`'s F5 fallback
+    one. `filter_mode="all"` is used by `collect_measurements`'s fallback
     below -- ONLY when the latest attempt is itself still in progress -- to
     recover that run's own most recent COMPLETED attempt for one arch,
     never to second-guess a completed latest attempt."""
@@ -227,7 +225,7 @@ def collect_measurements(
     never a reason to wait, same as a run whose own `status` is not yet
     `"completed"`).
 
-    F5 audit fix (fail-open window): `filter=latest` returns ONLY the latest
+    Fail-open window: `filter=latest` returns ONLY the latest
     attempt of each job. When that latest attempt is itself still running
     (`completed_at` is `None`), `filter=latest` hides any EARLIER,
     already-COMPLETED attempt of the same arch's job in this SAME run
@@ -256,11 +254,11 @@ def collect_measurements(
             job_id = job.get("id")
             html_url = job.get("html_url") or ""
             if completed_at is None:
-                # F5 fallback: the latest attempt is still in flight -- fetch
+                # Fallback: the latest attempt is still in flight -- fetch
                 # (and cache, once per run) the unfiltered attempt list, and
                 # use THIS run's own most recent completed attempt for this
                 # arch instead. A run whose fallback also finds nothing
-                # completed contributes no measurement, exactly like today.
+                # completed contributes no measurement.
                 if all_jobs_cache is None:
                     all_jobs_cache = list_jobs(fetch, token, repo, run_id, filter_mode="all")
                 completed_attempts = [
@@ -311,7 +309,7 @@ class Verdict:
 
 
 def evaluate(by_arch: dict[str, list[Measurement]], required_arches: list[str]) -> Verdict:
-    # Advisory A6 fix -- an arity floor: `not missing and not failing` is
+    # An arity floor: `not missing and not failing` is
     # vacuously `True` when `required_arches` is empty (`not [] and not
     # {}`), which would report a verdict as PROVEN for a caller that asked
     # about nothing. A caller with zero required arches asked a malformed
@@ -361,7 +359,7 @@ def run(
     out=sys.stdout,
     err=sys.stderr,
 ) -> int:
-    """Check-once, fail-loud (operator direction, 2026-09-03): exactly one
+    """Check-once, fail-loud: exactly one
     lookup, no poll, no deadline, no grace window. An in-progress run at
     this sha is invisible to this check -- it is never a measurement and
     never delays or satisfies the verdict."""

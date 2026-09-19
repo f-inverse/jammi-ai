@@ -190,7 +190,7 @@ pub enum JammiError {
     /// than a silent best-effort:
     ///
     /// - a **pre-contract** table whose catalog `definition_hash IS NULL` — created
-    ///   before the materialization contract landed, so there is no recorded
+    ///   before migration 021 added the materialization summary, so there is no recorded
     ///   [`ProducingDescriptor`](crate::store::manifest::ProducingDescriptor) to
     ///   dispatch a replay on at all;
     /// - a table produced by an [`External`](crate::store::manifest::ProducingDescriptor::External)
@@ -322,7 +322,7 @@ pub enum JammiError {
     },
 
     /// A `NULL` in the key column of a source scanned for embedding /
-    /// inference / refresh: refused typed at the input edge (K2), never
+    /// inference / refresh: refused typed at the input edge, never
     /// skipped and counted, never a stringly Arrow error after model calls.
     /// Raised by the `KeyCheckExec` plan node below the blocking sort, so the
     /// count is exact and the model is invoked zero times.

@@ -49,8 +49,8 @@ ALL_SITES = [
 class NameTranslationTests(unittest.TestCase):
     def test_peft_to_jammi_matches_the_empirically_confirmed_convention(self):
         """`layer.0.Wqkv.lora_a` is not a guess -- it is the LITERAL key
-        this round's own `jammi-bench grad-oracle` CLI run produced against
-        the tiny fixture (see the dispatch verdict). Every OTHER site here
+        a `jammi-bench grad-oracle` CLI run produces against the tiny
+        fixture. Every OTHER site here
         follows the SAME `layer.{n}.{target_name}.lora_[ab]` shape by
         construction (`LoraSite::build`'s `target_name` argument, cited in
         `torch_grad_oracle.py`'s own module doc) -- this test pins the
@@ -127,10 +127,6 @@ class NameTranslationTests(unittest.TestCase):
         self.assertIsNone(tgo.translate_jammi_name_to_peft("layer.3.UnknownSite.lora_a"))
 
 
-@unittest.skipUnless(
-    os.path.isdir(TINY_FIXTURE_DIR),
-    f"committed fixture missing at {TINY_FIXTURE_DIR!r}",
-)
 class CheckpointIdentityTests(unittest.TestCase):
     """`checkpoint_identity` is the class-level fix for `_premise_violations`
     comparing an un-comparable `model_dir` PATH string (see

@@ -1,8 +1,7 @@
-//! esc-075 (campaign #443): the claim-time, per-job acceleration report.
+//! The claim-time, per-job acceleration report.
 //!
 //! This file implements three negative controls as tests, plus the
-//! pending→determined transition and the K4 "one record, two transports"
-//! parity the plan's Part 4 v3 promises:
+//! pending→determined transition and "one record, two transports" parity:
 //!
 //! - **(i)** the SECOND f16 job submitted to the same process — after a prior
 //!   f16 job already burned the process-wide `(op, predicate)` warn dedup —
@@ -19,7 +18,7 @@
 //!   would fail everywhere, not just here.
 //! - The pending→determined transition itself is asserted directly
 //!   (`submission_writes_pending_then_claim_overwrites_with_determined`).
-//! - K4: an embedded-session-submitted job (`session.fine_tune`) and a raw
+//! - One record, two transports: an embedded-session-submitted job (`session.fine_tune`) and a raw
 //!   catalog-submitted job (mimicking a non-embedded transport's write) carry
 //!   the SAME determined-report shape — one record, two transports
 //!   (`embedded_and_raw_transports_produce_the_same_report_shape`).
@@ -47,7 +46,7 @@ use crate::common;
 /// reaches the fused arm"; `modernbert.rs`'s `self.training` branches on
 /// rope/softmax/attention). Plain BERT's biased LayerNorm never reaches the
 /// admission-instrumented path in EITHER mode, so it cannot exercise
-/// esc-075's report at all — this suite needs an architecture the fused path
+/// the acceleration report at all — this suite needs an architecture the fused path
 /// is actually reachable on.
 fn tiny_modernbert_model() -> String {
     "local:".to_string() + common::fixture("tiny_modernbert").to_str().unwrap()
@@ -81,8 +80,7 @@ async fn session_with_training_data() -> (Arc<InferenceSession>, TempDir) {
 }
 
 /// A fast encoder-adapters config (`backbone_dtype` only takes effect on this
-/// arm) at the given precision — the same shape esc-075's own reproduction
-/// used (an f16 fine-tune).
+/// arm) at the given precision.
 fn encoder_adapters_config(backbone_dtype: ComputePrecision) -> FineTuneConfig {
     FineTuneConfig {
         epochs: 1,
@@ -113,7 +111,7 @@ async fn wait_for_terminal(
 
 /// Poll a job to EITHER terminal status (`completed` or `failed`) — used by
 /// the f16 tests below, which care only that the acceleration report was
-/// written (necessarily BEFORE the first training step, esc-075's own
+/// written (necessarily BEFORE the first training step, the report's own
 /// ordering requirement) and not about whether f16's own numerics later
 /// converge or diverge on this tiny fixture over a handful of eager-composed
 /// batches — an orthogonal training-stability question this file does not
@@ -122,7 +120,7 @@ async fn wait_for_terminal(
 /// **Runs the tri-state oracle on the way out** — every job this suite polls
 /// to a terminal state passes [`assert_terminal_report_is_not_pending`] here,
 /// whatever its terminal status and whatever state its report carries, so the
-/// campaign #446 finding-1 property is checked on EVERY terminal row the
+/// never-pending-once-terminal property is checked on EVERY terminal row the
 /// suite produces rather than only on the failure paths that assert it
 /// explicitly. The `job.wait()`-based tests reach the same oracle through
 /// [`terminal_record`].
@@ -166,7 +164,7 @@ async fn terminal_record(
     record
 }
 
-/// esc-075 control (iii): reads a catalog record's `acceleration_report` as a
+/// Control (iii): reads a catalog record's `acceleration_report` as a
 /// determined payload, PANICKING on `None` (a missing report) or on a
 /// `"pending"` marker (a submission-time echo that was never overwritten by a
 /// claimant) — absence is asserted as failure, never as "no misses". Every
@@ -175,7 +173,7 @@ async fn terminal_record(
 /// in the two dedicated negative-control tests below.
 fn expect_determined_report(report_json: Option<&str>) -> serde_json::Value {
     let raw = report_json.expect(
-        "acceleration_report must be Some — esc-075 control (iii): a missing report is a \
+        "acceleration_report must be Some — control (iii): a missing report is a \
          failure, never a clean pass",
     );
     let value: serde_json::Value =
@@ -193,7 +191,7 @@ fn expect_determined_report_fails_closed_on_absence() {
     let result = std::panic::catch_unwind(|| expect_determined_report(None));
     assert!(
         result.is_err(),
-        "esc-075 control (iii): a missing acceleration_report must be asserted as failure"
+        "control (iii): a missing acceleration_report must be asserted as failure"
     );
 }
 
@@ -203,12 +201,12 @@ fn expect_determined_report_fails_closed_on_pending_marker() {
         std::panic::catch_unwind(|| expect_determined_report(Some(r#"{"state":"pending"}"#)));
     assert!(
         result.is_err(),
-        "esc-075 control (iii): a submission-time pending marker must never read as a \
+        "control (iii): a submission-time pending marker must never read as a \
          determined report"
     );
 }
 
-/// esc-075 control (i): the SECOND f16 job in this process — run after a
+/// Control (i): the SECOND f16 job in this process — run after a
 /// first f16 job already fired (and dedup-suppressed) the per-process
 /// `tracing::warn` for `attention_block_fused`'s domain miss — still gets its
 /// OWN, independently-attributed `holds: false` on its OWN record. If the
@@ -217,38 +215,27 @@ fn expect_determined_report_fails_closed_on_pending_marker() {
 /// delta scoped to this job's own probe), the second job would see no new
 /// evidence and could wrongly default to "no misses".
 ///
-/// `attention_block` (not `layer_norm`) is the op under test here: campaign
-/// #443's W2a/W2b (landed in parallel, merged into this branch after this
-/// wave's base commit) widened `layer_norm`/`softmax`/`geglu`/`rope`'s dtype
-/// admission to include F16 — an f16 job on the current tree legitimately
-/// reports `Holds` on those four now, so "f16 ⇒ eager" is a stale premise for
+/// `attention_block` (not `layer_norm`) is the op under test here:
+/// `layer_norm`/`softmax`/`geglu`/`rope` admit F16, so an f16 job legitimately
+/// reports `Holds` on those four and "f16 ⇒ eager" is a false premise for
 /// them. `attention_block_fused`'s domain additionally requires the fixed
 /// `head_dim` its kernel was built for (`jammi_kernels::ops::attention_block::
 /// HEAD_DIM == 64`); `tiny_modernbert`'s `head_dim` (`hidden_size /
 /// num_attention_heads`) is nowhere near 64, so this op declines
 /// REGARDLESS of dtype — a shape-based domain miss, not a dtype-widening
-/// candidate, so this control stays robust to further campaign #443 dtype
-/// widenings.
+/// candidate, so this control stays robust to any further dtype widening.
 ///
-/// (Revision history, kept because a prior version of this doc got the
-/// PREDICATE ORDER wrong and it is worth remembering why: campaign #443 W2d
-/// briefly widened `attention_block_admission_predicate`'s dtype check to
-/// `F32 | BF16 | F16` with NO device split, which made CPU+F16 wrongly
-/// CLEAR the dtype gate — this doc's prior revision predicted that would
-/// make the head_dim check fire next, reason
-/// `head_dim_is_attention_block_fixed_head_dim`. That was itself a real bug
-/// (CPU's `cpu_fwd`, `jammi-kernels::ops::attention_block`, has no `BF16`/
-/// `F16` match arm at all — it only ever supported `F32`), fixed by the
-/// round-2 audit's device-split correction: `BF16`/`F16` are admitted ONLY
-/// when `qkv.device().is_cuda()`; CPU stays `F32`-only, matching `cpu_fwd`'s
-/// real domain. On this CPU-only suite, an f16 job's `qkv` therefore declines
-/// at the DTYPE check itself — reason `dtype_f32_matching_between_qkv_and_
-/// mask_on_cpu` — and the head_dim check below it is never reached. `holds:
-/// false` still never flips; only the verbatim reason key this test reads
-/// back does, and it has now round-tripped back to the dtype reason it
-/// started at, for the correct underlying cause.)
+/// PREDICATE ORDER: `attention_block_admission_predicate` admits `BF16`/`F16`
+/// ONLY when `qkv.device().is_cuda()`; CPU stays `F32`-only, matching
+/// `cpu_fwd`'s real domain (`jammi-kernels::ops::attention_block`'s CPU arm has
+/// no `BF16`/`F16` match arm at all). On this CPU-only suite, an f16 job's
+/// `qkv` therefore declines at the DTYPE check itself — reason
+/// `dtype_f32_matching_between_qkv_and_mask_on_cpu` — and the head_dim check
+/// below it (reason `head_dim_is_attention_block_fixed_head_dim`) is never
+/// reached. A dtype check without the device split would let CPU+F16 clear
+/// the dtype gate and surface the head_dim reason instead.
 ///
-/// Also asserts `layer_norm` (now genuinely admitted at F16) reports
+/// Also asserts `layer_norm` (genuinely admitted at F16) reports
 /// `holds: true` on BOTH jobs — the anti-always-degraded half of this same
 /// control: an implementation that reports `holds: false` unconditionally,
 /// regardless of what actually dispatched, must fail here even though it
@@ -261,7 +248,7 @@ fn expect_determined_report_fails_closed_on_pending_marker() {
 // serializing the whole binary) guard against an unrelated concurrently
 // running test's forward pass also nudging the same counters; that residual
 // is accepted here on the same precedent `inference.rs` already established.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn second_f16_job_in_process_still_reports_its_own_eager_ops() {
     let (session, _dir) = session_with_training_data().await;
@@ -296,7 +283,7 @@ async fn second_f16_job_in_process_still_reports_its_own_eager_ops() {
         serde_json::json!("dtype_f32_matching_between_qkv_and_mask_on_cpu"),
         "job 1's miss reason must be the verbatim predicate key jammi-encoders' own \
          `admit()` call site records — on CPU, attention_block's dtype check admits ONLY \
-         F32 (the round-2 audit's device-split fix: BF16/F16 are CUDA-only, matching \
+         F32 (the device split: BF16/F16 are CUDA-only, matching \
          cpu_fwd's real domain), so an f16 qkv declines at the dtype check itself and the \
          head_dim check below it is never reached, got: {report1}"
     );
@@ -304,8 +291,8 @@ async fn second_f16_job_in_process_still_reports_its_own_eager_ops() {
     assert_eq!(
         ln1["holds"],
         serde_json::json!(true),
-        "job 1 (f16): layer_norm_fused is genuinely admitted at F16 on the current tree \
-         (campaign #443 W2a/W2b widened it) — an always-degraded report would wrongly say \
+        "job 1 (f16): layer_norm_fused is genuinely admitted at F16 \
+         — an always-degraded report would wrongly say \
          false here, got: {report1}"
     );
 
@@ -349,7 +336,7 @@ async fn second_f16_job_in_process_still_reports_its_own_eager_ops() {
     );
 }
 
-/// esc-075 control (ii): a positive control (f32 — this suite is CPU-only;
+/// Control (ii): a positive control (f32 — this suite is CPU-only;
 /// bf16 requires CUDA) reports its ops as `Holds`, so an always-degraded
 /// implementation (one that reports `holds: false` unconditionally) fails
 /// this test even though it would trivially pass control (i) alone.
@@ -361,7 +348,7 @@ async fn second_f16_job_in_process_still_reports_its_own_eager_ops() {
 // serializing the whole binary) guard against an unrelated concurrently
 // running test's forward pass also nudging the same counters; that residual
 // is accepted here on the same precedent `inference.rs` already established.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn f32_positive_control_reports_ops_holds() {
     let (session, _dir) = session_with_training_data().await;
@@ -423,7 +410,7 @@ async fn f32_positive_control_reports_ops_holds() {
 // serializing the whole binary) guard against an unrelated concurrently
 // running test's forward pass also nudging the same counters; that residual
 // is accepted here on the same precedent `inference.rs` already established.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn submission_writes_pending_then_claim_overwrites_with_determined() {
     let (session, _dir) = session_with_training_data().await;
@@ -471,8 +458,8 @@ async fn submission_writes_pending_then_claim_overwrites_with_determined() {
     );
 }
 
-/// K4: "one record, two transports". Transport A is the embedded SDK path
-/// (`session.fine_tune`, `session.rs:1131`); transport B is a raw catalog
+/// "One record, two transports". Transport A is the embedded SDK path
+/// (`session.fine_tune`); transport B is a raw catalog
 /// write mirroring what a non-embedded (e.g. remote/gRPC) submission path
 /// does at its substrate — `submit_job` directly, with a
 /// hand-assembled [`TrainingSpec`] — then relies on the SAME already-running
@@ -488,7 +475,7 @@ async fn submission_writes_pending_then_claim_overwrites_with_determined() {
 // serializing the whole binary) guard against an unrelated concurrently
 // running test's forward pass also nudging the same counters; that residual
 // is accepted here on the same precedent `inference.rs` already established.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn embedded_and_raw_transports_produce_the_same_report_shape() {
     let (session, _dir) = session_with_training_data().await;
@@ -511,7 +498,7 @@ async fn embedded_and_raw_transports_produce_the_same_report_shape() {
     let record_a = terminal_record(
         session.catalog(),
         &job_a.job_id,
-        "K4 transport A (embedded SDK)",
+        "transport A (embedded SDK)",
     )
     .await;
     let report_a = expect_determined_report(record_a.acceleration_report.as_deref());
@@ -536,7 +523,7 @@ async fn embedded_and_raw_transports_produce_the_same_report_shape() {
         cache: jammi_db::store::CachePolicy::Bypass,
     };
     let spec_json = serde_json::to_string(&spec).unwrap();
-    let job_b_id = "esc075-raw-transport-job".to_string();
+    let job_b_id = "accel-report-raw-transport-job".to_string();
     session
         .catalog()
         .submit_job(SubmitJobParams {
@@ -564,7 +551,7 @@ async fn embedded_and_raw_transports_produce_the_same_report_shape() {
     );
     // NOT a strict ops-key-SET equality: `"low_rank_residual_linear"`/
     // `"dropout"` read the heavily-shared `lora_linear_fused` registry key
-    // (advisory 6's documented attribution precondition — every OTHER LoRA
+    // (a documented attribution precondition — every OTHER LoRA
     // test in this `cargo test -p jammi-ai` binary races the SAME counter,
     // and `crates/jammi-ai/tests/it/encoder_adapters.rs`'s plain-BERT LoRA
     // legitimately dispatches it EAGER, `has_bias`, unlike this test's
@@ -575,7 +562,7 @@ async fn embedded_and_raw_transports_produce_the_same_report_shape() {
     // regression. `"layer_norm"` is asserted per-op instead: uncontended in
     // practice (every concurrent CPU test in this suite trains at F32/BF16,
     // never forcing it eager), so its determination is a reliable,
-    // race-free K4 parity signal.
+    // race-free transport-parity signal.
     let ops_a = report_a["ops"].as_object().unwrap();
     let ops_b = report_b["ops"].as_object().unwrap();
     assert!(
@@ -589,22 +576,20 @@ async fn embedded_and_raw_transports_produce_the_same_report_shape() {
     );
 }
 
-/// Phase-4 adversarial-audit finding 3 ("FABRICATED REASON"): the
-/// projection-head arm (`target_modules` empty — `backbone_dtype` never
-/// takes effect there) never builds an encoder to probe at all. Before the
-/// fix, `worker.rs` passed `probe_ok = false` into `flash_report` for this
-/// arm, fabricating `"reason": "probe_forward_failed"` for a probe that was
-/// NEVER attempted. `flash_compiled_device_reason`'s compiled/device
-/// short-circuits are checked FIRST regardless (`"cuda_not_compiled"` on
-/// this CPU-only scoped-gate build — legitimately true, and cheaper to state
-/// than "no probe" when flash could never hold here either way), so THIS
-/// test's own build can only prove the fabricated value is GONE, not that
+/// No fabricated reason: the projection-head arm (`target_modules` empty —
+/// `backbone_dtype` never takes effect there) never builds an encoder to
+/// probe at all, so its report must never claim
+/// `"reason": "probe_forward_failed"` for a probe that was NEVER attempted.
+/// `flash_compiled_device_reason`'s compiled/device short-circuits are checked FIRST regardless
+/// (`"cuda_not_compiled"` on this CPU-only scoped-gate build — legitimately true, and cheaper to
+/// state than "no probe" when flash could never hold here either way), so THIS
+/// test's own build can only prove the fabricated value is ABSENT, not that
 /// the honest `"no_encoder_to_probe_projection_head_arm"` reason is reached
 /// (that needs `cuda` compiled AND a real CUDA device — see
 /// `flash_report_no_probe_attempted`'s doc). `ops` must be empty regardless
 /// (never a fabricated per-op measurement for an arm that built no
 /// dtype-typed encoder).
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn projection_head_arm_reports_no_probe_attempted_not_a_fabricated_failure() {
     let (session, _dir) = session_with_training_data().await;
@@ -656,10 +641,10 @@ async fn projection_head_arm_reports_no_probe_attempted_not_a_fabricated_failure
 
 /// `tiny_bert_head64` (`hidden_size=64, num_attention_heads=1`) — a real BERT
 /// checkpoint, not ModernBERT: BERT's training forward reaches the shared
-/// `attention_cascade::training_attention_cascade` (issue #462) but always
+/// `attention_cascade::training_attention_cascade` but always
 /// supplies `flash: &FlashDecision::Declined { outcome: CapabilityMiss,
-/// reason: "flash_transport_not_wired" }` (`crates/jammi-encoders/src/
-/// bert.rs:418-420` — BERT never wires the encoder-boundary flash transport
+/// reason: "flash_transport_not_wired" }` (`jammi_encoders::bert`'s
+/// `forward_hidden` — BERT never wires the encoder-boundary flash transport
 /// protocol). `head64`, not plain `tiny_bert`, only because the fixture
 /// happens to share the SAME 256-token vocab this suite's `training_pairs.csv`
 /// already tokenizes against (`tests/fixtures/generate_tiny_bert_head64.py`'s
@@ -673,22 +658,21 @@ fn tiny_bert_head64_model() -> String {
             .unwrap()
 }
 
-/// esc-075's `flash` field for a BERT-family job (issue #462/#463
-/// follow-up).
+/// The acceleration report's `flash` field for a BERT-family job.
 ///
 /// **What this test can and cannot prove, stated up front**: on THIS suite's
 /// CPU-only build, [`flash_compiled_device_reason`] (`crates/jammi-ai/src/
 /// fine_tune/worker.rs`) short-circuits on the compiled/device fact BEFORE
 /// the `attention_block_flash` cascade delta — and the probe-capture window
-/// it now reads (`flash_cascade_decline_reason`) — is ever consulted, so this
+/// it reads (`flash_cascade_decline_reason`) — is ever consulted, so this
 /// test can only observe `"cuda_not_compiled"` (no `cuda` feature) or
 /// `"device_is_cpu_or_metal_not_cuda"` (`cuda` feature compiled, but this
 /// session never resolves a real CUDA device), exactly like every OTHER
 /// architecture on the same build. `admit_cascade`
-/// (`crates/jammi-kernels/src/admission.rs:407-457`) now records every
+/// (`jammi_kernels::admission`) records every
 /// decline — including BERT's own `"flash_transport_not_wired"` — into the
 /// SAME thread-local probe-capture sink `admit_inner` uses
-/// (`record_probe_miss`, `admission.rs:421,432,442`), and
+/// (`record_probe_miss`), and
 /// `flash_cascade_decline_reason` reads it back verbatim on a real
 /// CUDA+flash-compiled build; that mechanism is proven directly, without
 /// needing a CUDA device, by
@@ -701,7 +685,7 @@ fn tiny_bert_head64_model() -> String {
 /// through the SAME encoder-adapters path the ModernBERT tests above already
 /// cover, and that this build's device-level reason is never overridden by a
 /// fabricated `"flash_transport_not_wired"` it cannot actually observe.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn bert_family_job_reports_flash_decline_honestly() {
     let (session, _dir) = session_with_training_data().await;
@@ -721,7 +705,7 @@ async fn bert_family_job_reports_flash_decline_honestly() {
                 warmup_steps: 0,
                 lr_schedule: LrSchedule::Constant,
                 // Non-empty target_modules: the encoder-adapters arm, which
-                // DOES build an encoder and run the esc-075 probe (unlike the
+                // DOES build an encoder and run the acceleration probe (unlike the
                 // projection-head arm covered above).
                 target_modules: vec!["query".to_string(), "value".to_string()],
                 backbone_dtype: ComputePrecision::F32,
@@ -794,9 +778,8 @@ fn ops_keys(report: &serde_json::Value) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-/// Campaign #446 finding 2 — the f16 report's missing cast epilogue, and the
-/// process-history-dependent key set behind it. THREE jobs in ONE process
-/// (f16, f16, f32) prove all four halves the finding names:
+/// The f16 report carries its cast epilogue, and the key set does not depend
+/// on process history. THREE jobs in ONE process (f16, f16, f32) prove:
 ///
 /// **(c) the table binds to the REAL registry, measured live.** `cast_scale`
 /// and `cast_add` are not asserted from the table's own say-so: an f16 job's
@@ -804,13 +787,12 @@ fn ops_keys(report: &serde_json::Value) -> std::collections::BTreeSet<String> {
 /// before/after delta on `cast_scale_f16_f32` / `cast_add_f16` — the exact
 /// registry keys the table names for `DtypeClass::F16` — actually moved,
 /// i.e. if some workspace call site really does resolve to those keys
-/// (`"cast_scale_f16_f32"`, `crates/jammi-kernels/src/admission.rs:2077`, and
-/// `"cast_add_f16"`, `crates/jammi-kernels/src/admission.rs:2085`,
+/// (`"cast_scale_f16_f32"` in `jammi_kernels::admission::CAST_SCALE`, and
+/// `"cast_add_f16"` in `jammi_kernels::admission::CAST_ADD`,
 /// both reached from `LowRankResidualLinear::bwd`'s `admit_cast_boundary(&CAST_SCALE, DtypeClass::F16, ..)`/
 /// `admit_cast_boundary(&CAST_ADD, DtypeClass::F16, ..)` calls, during
-/// the probe's backward pass). Before the fix the shipped table named only
-/// `cast_add_bf16`, so an f16 job's report could not contain either key at
-/// any value.
+/// the probe's backward pass). A table naming only `cast_add_bf16` would
+/// leave an f16 job's report unable to contain either key at any value.
 ///
 /// **CPU-runnable vs CUDA-only arms.** This suite is CPU-only, so the F16
 /// cast-boundary keys are the ones proven live here — `low_rank_residual_
@@ -834,11 +816,10 @@ fn ops_keys(report: &serde_json::Value) -> std::collections::BTreeSet<String> {
 /// this: the first job in a fresh process would see a strictly smaller table
 /// than the second.
 ///
-/// **The K4 report-vocabulary change.** No report may carry a dtype-SUFFIXED
-/// key: `"cast_add_bf16"` was a REGISTRY key spelled into the report's
-/// dtype-neutral vocabulary, and its removal in favour of `"cast_add"` is a
-/// consumer-visible surface change asserted here explicitly, not left
-/// implicit.
+/// **Report keys are dtype-neutral.** No report may carry a dtype-SUFFIXED
+/// key: `"cast_add_bf16"` is a REGISTRY key, and the report's vocabulary
+/// names it `"cast_add"` — a consumer-visible surface asserted here
+/// explicitly, not left implicit.
 ///
 /// **The f32 negative control is real, not vacuous.** An f32 backbone takes
 /// `bwd`'s `admit()`-free "nothing to fuse" branch, so `cast_scale`/`cast_add`
@@ -847,7 +828,7 @@ fn ops_keys(report: &serde_json::Value) -> std::collections::BTreeSet<String> {
 /// pass) fails here.
 // `jammi_kernels::admission`'s dispatch registries are process-wide — same
 // `#[serial]` rationale as the other tests in this file.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_deterministic() {
     let (session, _dir) = session_with_training_data().await;
@@ -881,7 +862,7 @@ async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_determinist
     }
 
     // Every realized key must be a candidate for that job's own dtype class —
-    // no fabricated key, and (the direct finding-2 guard) no dtype-suffixed
+    // no fabricated key, and no dtype-suffixed
     // registry key leaking into the report vocabulary.
     for (precision, report) in &reports {
         let candidates = candidate_report_keys(*precision);
@@ -897,8 +878,8 @@ async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_determinist
                 assert!(
                     !key.ends_with(suffix),
                     "report key {key:?} carries a dtype suffix — report keys are dtype-NEUTRAL \
-                     (campaign #446 finding 2's K4 vocabulary change: `cast_add_bf16` became \
-                     `cast_add`, with the registry key resolved from the backbone dtype). \
+                     (`cast_add_bf16` is reported as `cast_add`, with the registry key \
+                     resolved from the backbone dtype). \
                      Report: {report}"
                 );
             }
@@ -919,7 +900,7 @@ async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_determinist
          from the job. first={f16_first} second={f16_second}"
     );
 
-    // (c): the F16 cast-boundary keys the pre-#446 table could not name, and
+    // (c): the F16 cast-boundary keys, and
     // the live proof they bind to real `admit()` sites.
     for (label, report) in [("first", f16_first), ("second", f16_second)] {
         for key in ["cast_scale", "cast_add"] {
@@ -928,14 +909,14 @@ async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_determinist
                 serde_json::json!(true),
                 "the {label} f16 job's report must carry {key:?} as `holds: true` — \
                  LowRankResidualLinear::bwd dispatches its F16 cast-boundary kernels fused on \
-                 CPU (low_rank_residual_linear.rs:814,911). Before campaign #446 the probed-op \
-                 table named only `cast_add_bf16`, so an f16 job's report was structurally \
-                 unable to contain this key at all. Report: {report}"
+                 CPU (via `admit_cast_boundary`); a probed-op table naming only \
+                 `cast_add_bf16` would leave an f16 job's report structurally unable to \
+                 contain this key at all. Report: {report}"
             );
         }
         assert!(
             !ops_keys(report).contains("cast_add_bf16"),
-            "the retired dtype-suffixed report key must be gone. Report: {report}"
+            "the dtype-suffixed registry key must never appear as a report key. Report: {report}"
         );
     }
 
@@ -957,7 +938,7 @@ async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_determinist
          cast_scale/cast_add absence above would be vacuous. Report: {f32_report}"
     );
 
-    // `adamw_step` (campaign #446 scope item 2): the fused multi-tensor AdamW
+    // `adamw_step`: the fused multi-tensor AdamW
     // step admits and dispatches on CPU at F32 — `adamw_step.rs` ships real
     // `cpu_fwd` arms for both `AdamMomentUpdate` (InplaceOp2) and
     // `AdamThetaUpdate` (InplaceOp3), and `jammi_kernels::admission::
@@ -974,8 +955,7 @@ async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_determinist
     // The dtype CLASS the table resolves on is the JOB's BACKBONE dtype — a
     // different axis. Had the row been encoded `DtypeClass::F32`, the two f16
     // reports below would OMIT `adamw_step` while the op demonstrably
-    // dispatched: a silent-eager invisibility on the headline dtype, i.e. a
-    // fresh instance of the very defect this table retired. These two f16
+    // dispatched: a silent-eager invisibility on the headline dtype. These two f16
     // assertions are what make that concrete rather than argued.
     for (precision, report) in &reports {
         assert_eq!(
@@ -989,7 +969,7 @@ async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_determinist
     }
 }
 
-/// Campaign #446 finding 3 — FABRICATED MISS REASONS. Four jobs in ONE
+/// No fabricated miss reasons. Four jobs in ONE
 /// process, all reading the SAME registry key (`attention_block_fused`), at
 /// two DIFFERENT failing predicates:
 ///
@@ -997,24 +977,23 @@ async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_determinist
 ///   `head_dim_is_attention_block_fixed_head_dim` (`tiny_modernbert`'s head
 ///   dim is nowhere near the kernel's fixed 64).
 /// - `f16` on CPU declines at the DTYPE check itself → `dtype_f32_matching_
-///   between_qkv_and_mask_on_cpu` (the round-2 device split: BF16/F16 are
+///   between_qkv_and_mask_on_cpu` (the device split: BF16/F16 are
 ///   CUDA-only, matching `cpu_fwd`'s real domain), so the head-dim check
 ///   below it is never reached.
 ///
-/// **Why the order f32, f16, f32, f32 and not just two jobs.** The pre-fix
-/// `reason_for_registry_key` read the process-lifetime
+/// **Why the order f32, f16, f32, f32 and not just two jobs.** A
+/// `reason_for_registry_key` that read the process-lifetime
 /// `fallback_warnings_emitted()` list and took the most recent entry for the
-/// op. That list is populated INSIDE `warn_fallback_once_with_message`'s
+/// op would be wrong: that list is populated INSIDE `warn_fallback_once_with_message`'s
 /// `seen.insert((op, predicate))` guard (`crates/jammi-kernels/src/
 /// admission.rs`), so it records each `(op, predicate)` pair AT MOST ONCE per
-/// process. Jobs 1 and 2 therefore each push a fresh pair and read back
-/// correctly even pre-fix; job 3 is where it breaks: its `head_dim` pair is
-/// already in `seen`, nothing is pushed, and the most recent entry for
-/// `attention_block_fused` is still job 2's `dtype_...` — a different
+/// process. Jobs 1 and 2 each push a fresh pair and would read back
+/// correctly under that reading; job 3 is where it breaks: its `head_dim`
+/// pair is already in `seen`, nothing is pushed, and the most recent entry
+/// for `attention_block_fused` is still job 2's `dtype_...` — a different
 /// predicate, for a different dtype, persisted durably as THIS job's reason.
-/// Job 3 is the deterministic RED. (Verified by running this test against the
-/// unmodified `worker.rs`: job 3 reported `dtype_f32_matching_between_qkv_and_
-/// mask_on_cpu` for an f32 backbone.)
+/// Job 3 is the deterministic catch (it would report
+/// `dtype_f32_matching_between_qkv_and_mask_on_cpu` for an f32 backbone).
 ///
 /// Job 4 is the SAME-predicate repeat (the dedupe case the naive
 /// "before/after window over `fallback_warnings_emitted()`" fix cannot serve
@@ -1026,7 +1005,7 @@ async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_determinist
 /// determination, only about the verbatim key attached to it.
 // `jammi_kernels::admission`'s dispatch registries and its warn-dedup set are
 // process-wide — same `#[serial]` rationale as the other tests in this file.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn each_job_reports_its_own_miss_predicate_not_the_most_recent_different_one() {
     const HEAD_DIM_MISS: &str = "head_dim_is_attention_block_fixed_head_dim";
@@ -1075,27 +1054,25 @@ async fn each_job_reports_its_own_miss_predicate_not_the_most_recent_different_o
             serde_json::json!(expected_reason),
             "{label}: the miss reason must be the verbatim predicate key THIS job's own probe \
              window recorded, never the most recent DIFFERENT predicate some earlier job left \
-             in the process-lifetime warn list (campaign #446 finding 3), and never a \
+             in the process-lifetime warn list, and never a \
              placeholder for a miss that really did record a predicate. Report: {report}"
         );
     }
 }
 
-/// Phase-4 adversarial-audit finding 4 ("PENDING-FOREVER"), `ContextPredictor`
-/// half: this job kind never routes through `run_fine_tune_blocking`'s
-/// measuring probe at all (`run_spec`'s `ContextPredictor` arm calls
-/// `InferenceSession::run_context_predictor_training` directly). Before the
-/// fix, its `acceleration_report` stayed at the submission-time
-/// `{"state":"pending"}` marker FOREVER, even past this job's terminal
-/// status — which the tri-state contract's own definition of "pending"
-/// (no claimant has computed a determination YET) does not describe once the
-/// job is done. The self-describing `{"state":"not_applicable",
-/// "reason":"context_predictor"}` marker must land instead, regardless of
-/// whether the predictor training itself succeeds (this test's own tiny
+/// Never pending forever, `ContextPredictor` half: this job kind never routes through
+/// `run_fine_tune_blocking`'s measuring probe at all (`run_spec`'s `ContextPredictor` arm calls
+/// `InferenceSession::run_context_predictor_training` directly), so its
+/// `acceleration_report` must not stay at the submission-time
+/// `{"state":"pending"}` marker past this job's terminal status — the
+/// tri-state contract's own definition of "pending" (no claimant has computed
+/// a determination YET) does not describe a job that is done. The self-describing
+/// `{"state":"not_applicable", "reason":"context_predictor"}` marker must land instead, regardless
+/// of whether the predictor training itself succeeds (this test's own tiny
 /// synthetic dataset is not tuned to guarantee that — `wait_for_any_terminal`
 /// accepts either outcome, since the marker is written BEFORE training even
 /// starts).
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn context_predictor_job_reports_not_applicable_acceleration() {
     use arrow::array::{ArrayRef, Float64Array, StringArray};
@@ -1175,7 +1152,7 @@ async fn context_predictor_job_reports_not_applicable_acceleration() {
         .unwrap();
 
     let predictor_spec = ContextPredictorTrainConfig {
-        model_id: "esc075-ctx-predictor".to_string(),
+        model_id: "accel-report-ctx-predictor".to_string(),
         architecture: ContextArchitecture::Cnp,
         key_column: "_row_id".to_string(),
         task_column: "task".to_string(),
@@ -1202,7 +1179,7 @@ async fn context_predictor_job_reports_not_applicable_acceleration() {
         .unwrap();
     let record = wait_for_any_terminal(session.catalog(), &job.job_id).await;
     let report_json = record.acceleration_report.as_deref().expect(
-        "esc-075 control (iii): a missing report is a failure — a ContextPredictor job must \
+        "control (iii): a missing report is a failure — a ContextPredictor job must \
          still carry a self-describing terminal marker, never the submission-time pending \
          marker forever",
     );
@@ -1216,15 +1193,14 @@ async fn context_predictor_job_reports_not_applicable_acceleration() {
     assert_eq!(report["reason"], serde_json::json!("context_predictor"));
 }
 
-/// Phase-4 adversarial-audit finding 4 ("PENDING-FOREVER"), pre-device-
-/// resolution-failure half: a job that fails in `run_claimed_job` BEFORE
-/// `run_spec`/`run_fine_tune_blocking` are ever reached (an undeserialisable
-/// `training_spec`) never runs the measuring probe either. Before the fix,
-/// its `acceleration_report` stayed at the submission-time
-/// `{"state":"pending"}` marker forever past this job's terminal `failed`
-/// status. The self-describing `{"state":"undetermined",
+/// Never pending forever, pre-device-resolution-failure half: a job that
+/// fails in `run_claimed_job` BEFORE `run_spec`/`run_fine_tune_blocking` are
+/// ever reached (an undeserialisable `training_spec`) never runs the
+/// measuring probe either, so its `acceleration_report` must not stay at the
+/// submission-time `{"state":"pending"}` marker past this job's terminal
+/// `failed` status. The self-describing `{"state":"undetermined",
 /// "reason":"failed_before_device_resolution"}` marker must land instead.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn pre_device_resolution_failure_reports_undetermined_acceleration() {
     let (session, _dir) = session_with_training_data().await;
@@ -1251,7 +1227,7 @@ async fn pre_device_resolution_failure_reports_undetermined_acceleration() {
     // fails in `run_claimed_job` before `run_spec`/`run_fine_tune_blocking`
     // (and therefore the device resolution + measuring probe) are ever
     // reached.
-    let job_id = "esc075-pre-device-resolution-failure".to_string();
+    let job_id = "accel-report-pre-device-resolution-failure".to_string();
     let seed_model_ref = seed_record
         .model_ref
         .clone()
@@ -1278,7 +1254,7 @@ async fn pre_device_resolution_failure_reports_undetermined_acceleration() {
         record.status
     );
     let report_json = record.acceleration_report.as_deref().expect(
-        "esc-075 control (iii): a missing report is a failure — a pre-device-resolution \
+        "control (iii): a missing report is a failure — a pre-device-resolution \
          failure must still carry a self-describing terminal marker, never the submission-time \
          pending marker forever",
     );
@@ -1304,7 +1280,7 @@ async fn pre_device_resolution_failure_reports_undetermined_acceleration() {
 /// property to be the whole oracle.
 const TERMINAL_REPORT_STATES: [&str; 3] = ["determined", "not_applicable", "undetermined"];
 
-/// The tri-state oracle for campaign #446 finding 1: once a job's status is
+/// The tri-state oracle: once a job's status is
 /// TERMINAL, its `acceleration_report` may never still read
 /// `{"state":"pending"}` — "pending" asserts that no claimant has computed a
 /// determination YET, and "yet" is false the moment the row can no longer
@@ -1313,7 +1289,7 @@ const TERMINAL_REPORT_STATES: [&str; 3] = ["determined", "not_applicable", "unde
 /// **Runs on EVERY terminal row this suite produces**, not only the failure
 /// paths: [`wait_for_any_terminal`] and [`terminal_record`] are the only two
 /// ways this file reads a terminal record, and both call this. That matters
-/// because the finding is not failure-specific — a job that runs to
+/// because the hazard is not failure-specific — a job that runs to
 /// `completed` while its probe report write is swallowed
 /// (`worker.rs`'s `persist_acceleration_report` logs and continues on a
 /// lease-guard miss or a catalog error) reaches the same forbidden state by a
@@ -1335,7 +1311,7 @@ fn assert_terminal_report_is_not_pending(
     );
     let raw = record.acceleration_report.as_deref().unwrap_or_else(|| {
         panic!(
-            "{label}: esc-075 control (iii) — a missing report is a FAILURE, never read as \
+            "{label}: control (iii) — a missing report is a FAILURE, never read as \
              \"no misses\""
         )
     });
@@ -1345,7 +1321,7 @@ fn assert_terminal_report_is_not_pending(
         report["state"],
         serde_json::json!("pending"),
         "{label}: a terminal job must never still carry the submission-time pending marker \
-         (campaign #446 finding 1) — got: {report}"
+         — got: {report}"
     );
     let state = report["state"].as_str().unwrap_or_else(|| {
         panic!("{label}: a terminal report's `state` must be a string, got: {report}")
@@ -1381,7 +1357,7 @@ fn assert_terminal_report_is_undetermined(
     report
 }
 
-/// Campaign #446 finding 1, worker side — the tri-state oracle driven through
+/// Terminal ⇒ not pending, worker side — the tri-state oracle driven through
 /// the PUBLIC surface (submit → force the failure → read the durable record),
 /// for every failure path between the claim and the acceleration probe that a
 /// CPU-only, in-process suite can actually force.
@@ -1396,7 +1372,7 @@ fn assert_terminal_report_is_undetermined(
 /// rather than pass — the failure mode is loud, not silent.
 ///
 /// Paths covered here (numbering matches `FineTuneWorker::run_claimed_job`'s
-/// own audit table):
+/// own numbered failure-path list):
 /// - **4 — base-model load error (missing artifact).** A raw job whose
 ///   `training_spec` names a `local:` path that does not exist; the FK target
 ///   is a real model row (minted by the seed job) so the failure lands where
@@ -1428,7 +1404,7 @@ fn assert_terminal_report_is_undetermined(
 ///   reset to `pending`).
 // `jammi_kernels::admission`'s dispatch registries are process-wide — same
 // `#[serial]` rationale as the other tests in this file.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
     let (session, _dir) = session_with_training_data().await;
@@ -1474,16 +1450,16 @@ async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
 
     let cases = [
         (
-            "esc446-f1-missing-artifact",
+            "accel-report-missing-artifact",
             spec_for(
                 "training",
-                "local:/nonexistent/esc446/f1/no-such-checkpoint",
+                "local:/nonexistent/accel-report/no-such-checkpoint",
             ),
             "path 4 (base-model artifact missing)",
         ),
         (
-            "esc446-f1-unknown-source",
-            spec_for("no_such_table_esc446", &tiny_modernbert_model()),
+            "accel-report-unknown-source",
+            spec_for("no_such_table_accel_report", &tiny_modernbert_model()),
             "path 3 (source SQL / loader reconstruction)",
         ),
     ];
@@ -1523,12 +1499,10 @@ async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
     }
 }
 
-/// Campaign #446 finding 1, the **SUCCESS half** — the gap the round-1
-/// adversarial audit named in this file's own oracle: every existing caller
-/// of [`assert_terminal_report_is_not_pending`] was a FAILURE path, so
-/// "terminal ⇒ not pending" was only ever proven for jobs that died before
-/// the probe. A job can reach the same forbidden state by SUCCEEDING:
-/// `worker.rs`'s `persist_acceleration_report` logs and SWALLOWS both a
+/// Terminal ⇒ not pending, the **SUCCESS half**: the failure-path callers of
+/// [`assert_terminal_report_is_not_pending`] prove "terminal ⇒ not pending"
+/// only for jobs that died before the probe. A job can reach the same forbidden state by
+/// SUCCEEDING: `worker.rs`'s `persist_acceleration_report` logs and SWALLOWS both a
 /// lease-guard miss (`Ok(false)`) and a catalog error (`Err`), by design —
 /// "this attempt's eventual finalize/fail is governed entirely by the
 /// training loop that follows, unaffected by whether this write landed". A
@@ -1579,12 +1553,12 @@ async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
 ///   the swallowed write and not by the finalize itself.
 // `jammi_kernels::admission`'s dispatch registries are process-wide — same
 // `#[serial]` rationale as the other tests in this file.
-#[serial(esc075_acceleration_report)]
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
     /// The `claimed_by` identity the raw legs below claim under — a real
     /// lease holder, just not an `EmbeddedWorker`.
-    const WORKER: &str = "esc446-f1-success-path-worker";
+    const WORKER: &str = "accel-report-success-path-worker";
     /// A determined payload of the shape `build_acceleration_report_json`
     /// produces. Only its `"state"` is load-bearing here: what is under test
     /// is WHETHER the write lands, not what it measures.
@@ -1700,10 +1674,10 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
                 job_id,
                 instance_id: WORKER,
                 attempts,
-                result: r#"{"kind":"model","model_id":"esc446-f1-no-such-output-model","artifact_path":"esc446-f1/unused/","metrics":null}"#,
-                output_model_id: "esc446-f1-no-such-output-model",
+                result: r#"{"kind":"model","model_id":"accel-report-no-such-output-model","artifact_path":"accel-report/unused/","metrics":null}"#,
+                output_model_id: "accel-report-no-such-output-model",
                 output_model_version: 1,
-                artifact_path: "esc446-f1/unused/",
+                artifact_path: "accel-report/unused/",
                 epoch_checkpoints: &[],
             })
             .await
@@ -1711,7 +1685,7 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
     };
 
     // ── Leg 2: the swallowed probe write, then a successful finalize ──────
-    let swallowed = "esc446-f1-swallowed-report-write";
+    let swallowed = "accel-report-swallowed-report-write";
     let claimed = claim(swallowed).await;
     // THE SWALLOWED WRITE. `persist_acceleration_report` calls exactly this,
     // and logs-and-continues on the `false` it returns. A stale attempt is
@@ -1763,7 +1737,7 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
     );
 
     // ── Leg 3: the mechanism trace — same shape, correct attempt ──────────
-    let landed_ok = "esc446-f1-report-write-landed";
+    let landed_ok = "accel-report-report-write-landed";
     let claimed = claim(landed_ok).await;
     let landed = session
         .catalog()
@@ -1793,30 +1767,26 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
     );
 }
 
-/// A7 (issue #421): a MEDIA encoder-adapters job's acceleration report is a
-/// real measurement, not a probe failure.
+/// A MEDIA encoder-adapters job's acceleration report is a real measurement,
+/// not a probe failure.
 ///
-/// RED at this unit's base commit, on BOTH assertions. `probe_acceleration`
-/// used to hand-build a `[1, 4]` token-id batch and call
-/// `AnyEncoder::forward` on it — which, on an audio (or vision) tower, is a
-/// modality mismatch that returns `Err`. The probe closure then degraded to
-/// `probe_ok = false`, so `ops` came back EMPTY and `flash.reason` came back
-/// `"probe_forward_failed"`: a job whose real training forward is perfectly
-/// healthy was recorded, durably and per-job, as having failed its
-/// acceleration probe. That is a fabricated negative — the exact
-/// never-fabricate contract esc-075 exists to hold — and it is invisible
-/// unless a test asserts the media arm specifically, because every BERT-family
-/// job in this file passes either way.
+/// A probe that hand-built a `[1, 4]` token-id batch and called
+/// `AnyEncoder::forward` on it would hit a modality mismatch (`Err`) on an
+/// audio (or vision) tower, degrade to `probe_ok = false`, and record EMPTY
+/// `ops` plus `flash.reason = "probe_forward_failed"` for a job whose real
+/// training forward is perfectly healthy — a fabricated negative, invisible
+/// unless a test asserts the media arm specifically, because every
+/// BERT-family job in this file passes either way.
 ///
-/// The fix is `AnyEncoder::probe_input`: the encoder builds the smallest
-/// shape-VALID batch for its own geometry, so the probe drives a real forward
-/// on every variant.
+/// `AnyEncoder::probe_input` has the encoder build the smallest shape-VALID
+/// batch for its own geometry, so the probe drives a real forward on every
+/// variant.
 ///
 /// The two assertions are independent: `ops` non-empty proves the forward
 /// actually reached instrumented kernels, and the `flash` reason proves the
-/// report never labels this job with the failure sentinel. A build that
-/// silently reverted to a token-only probe fails both.
-#[serial(esc075_acceleration_report)]
+/// report never labels this job with the failure sentinel. A token-only
+/// probe fails both.
+#[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn media_encoder_adapters_job_probes_its_own_modality() {
     let dir = TempDir::new().unwrap();
@@ -1864,7 +1834,7 @@ async fn media_encoder_adapters_job_probes_its_own_modality() {
                 validation_fraction: 0.0,
                 early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
                 // Non-empty target_modules: the encoder-adapters arm, the only
-                // one that builds an encoder and runs the esc-075 probe.
+                // one that builds an encoder and runs the acceleration probe.
                 target_modules: vec!["query".to_string(), "value".to_string()],
                 backbone_dtype: ComputePrecision::F32,
                 ..Default::default()

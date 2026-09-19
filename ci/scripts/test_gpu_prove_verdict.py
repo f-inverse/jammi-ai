@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Tests for `gpu_prove_verdict.py` (esc-084, issue #454; check-once/
-fail-loud, operator direction 2026-09-03).
+"""Tests for `gpu_prove_verdict.py` (check-once, fail-loud).
 
 Pure Python, no network: every test drives the real `run()`/`evaluate()`/
 `list_runs()`/`collect_measurements()` entry points against an injected fake
 `fetch` — never a hand-rolled stand-in for the verdict logic itself.
 
-Covers esc-084 control (b): every degenerate record DENIES, individually;
+Covers: every degenerate record DENIES, individually;
 the positive record set PASSES and prints run/job ids per arch; the
 recency/revocation rule (a later red measurement revokes an earlier green,
 by `completed_at` with a run-id tiebreak); check-once semantics (an
@@ -45,13 +44,12 @@ def job(arch: str, conclusion, completed_at, job_id: int = 1, html_url: str = "h
     }
 
 
-# Advisory A5 fix: `list_runs` now requires `path` to be PRESENT and equal
-# the exact `.github/workflows/<workflow>` path, so `run_obj`'s default
-# stamps a REAL, correct path -- exactly what every production API record
-# carries -- so every pre-existing fixture keeps passing that filter
-# without having to spell it out. `path=None` explicitly (rather than
-# omitted) reproduces the "no `path` key at all" degenerate case A5 adds a
-# test for; any other string reproduces a wrong/nested path.
+# `list_runs` requires `path` to be PRESENT and equal to the exact
+# `.github/workflows/<workflow>` path, so `run_obj`'s default stamps a REAL,
+# correct path -- exactly what every production API record carries -- and a
+# fixture passes that filter without spelling it out. `path=None`
+# explicitly (rather than omitted) reproduces the "no `path` key at all"
+# degenerate case; any other string reproduces a wrong/nested path.
 _DEFAULT_PATH = object()
 
 
@@ -110,7 +108,7 @@ def _run_once(world: World, arches=ARCHES, **kwargs):
 
 
 class DegenerateRecordsDenyEachOwnTest(unittest.TestCase):
-    """esc-084 control (b): every degenerate record DENIES, each its own
+    """Every degenerate record DENIES, each its own
     test. All-success control lives in PositiveCaseTest below."""
 
     def _good_jobs(self, run_id=1):
@@ -214,7 +212,7 @@ class DegenerateRecordsDenyEachOwnTest(unittest.TestCase):
         w = World()
         # A run reported at our query URL but whose OWN head_sha field
         # disagrees -- must never be trusted even though the query param
-        # asked the server to scope by head_sha (esc-084 control b).
+        # asked the server to scope by head_sha.
         w.runs = [run_obj(1, sha="b" * 40)]
         w.jobs_by_run = self._good_jobs(1)
         rc, _, err = _run_once(w)
@@ -228,8 +226,7 @@ class DegenerateRecordsDenyEachOwnTest(unittest.TestCase):
         self.assertEqual(rc, 1)
 
     def test_run_with_no_path_key_at_all_is_dropped(self):
-        # Advisory A5 fix: `"path" not in r` used to be a VACUOUS accept --
-        # a run record missing the `path` key entirely must be REFUSED, not
+        # A run record missing the `path` key entirely is REFUSED, not
         # trusted just because it also carries the right head_sha.
         w = World()
         w.runs = [run_obj(1, path=None)]
@@ -238,9 +235,9 @@ class DegenerateRecordsDenyEachOwnTest(unittest.TestCase):
         self.assertEqual(rc, 1, "a run record with no path key at all must never supply a measurement")
 
     def test_run_with_nested_path_is_dropped(self):
-        # Advisory A5 fix: `endswith` used to accept a path like
-        # `vendor/.github/workflows/<workflow>` -- the match must be EXACT
-        # equality against `.github/workflows/<workflow>`, not a suffix.
+        # A path like `vendor/.github/workflows/<workflow>` is refused --
+        # the match is EXACT equality against `.github/workflows/<workflow>`,
+        # not a suffix.
         w = World()
         w.runs = [run_obj(1, path=f"vendor/.github/workflows/{WORKFLOW}")]
         w.jobs_by_run = self._good_jobs(1)
@@ -261,7 +258,7 @@ class DegenerateRecordsDenyEachOwnTest(unittest.TestCase):
         self.assertEqual(rc, 0)
 
     def test_latest_attempt_fails_in_same_run_denies(self):
-        # BLOCK B6 audit fix (esc-084 control b): the DENY direction of the
+        # The DENY direction of the
         # SAME filter=latest semantics the PASS-direction test above
         # covers -- "the arch's latest attempt failed after an earlier
         # attempt succeeded within the same run" MUST deny. The fake
@@ -295,7 +292,7 @@ class DegenerateRecordsDenyEachOwnTest(unittest.TestCase):
         self.assertEqual(rc, 1, "the consumer must read ONLY the filter=latest view, never the all-attempts one")
 
     def test_list_jobs_requests_filter_latest(self):
-        # BLOCK B6 audit fix: a direct assertion that `list_jobs` requests
+        # A direct assertion that `list_jobs` requests
         # `?filter=latest` -- the fake records the URL it was actually
         # called with, rather than inferring the semantics from behavior.
         w = World()
@@ -310,10 +307,10 @@ class DegenerateRecordsDenyEachOwnTest(unittest.TestCase):
         )
 
     def test_zero_required_arches_denies_never_vacuous(self):
-        # Advisory A6 fix: `evaluate(by_arch, [])` used to return `ok=True`
-        # (`not [] and not {}` is vacuously True) -- a caller with zero
-        # required arches asked a malformed question and must be denied,
-        # never silently treated as "everything proven".
+        # `evaluate(by_arch, [])` must not return `ok=True` (`not [] and
+        # not {}` is vacuously True) -- a caller with zero required arches
+        # asked a malformed question and is denied, never silently treated
+        # as "everything proven".
         with self.assertRaises(gpv.VerdictError):
             gpv.evaluate({}, [])
         w = World()
@@ -352,7 +349,7 @@ class DegenerateRecordsDenyEachOwnTest(unittest.TestCase):
 
 
 class RunningLatestAttemptFallsBackToRunCompletedAttemptTest(unittest.TestCase):
-    """F5 audit fixture (BLOCK B6b): `filter=latest` hides an earlier,
+    """`filter=latest` hides an earlier,
     already-COMPLETED attempt of the same run entirely whenever the arch's
     latest attempt is itself still in progress -- a red completed attempt
     sitting right behind an in-flight rerun must still deny; a green
@@ -457,7 +454,7 @@ class PositiveCaseTest(unittest.TestCase):
 
 
 class RevocationAndRecencyTest(unittest.TestCase):
-    """esc-084 control (b): recency by completed_at with a run-id tiebreak;
+    """Recency by completed_at with a run-id tiebreak;
     a later red measurement revokes an earlier green."""
 
     def test_later_completed_run_revokes_an_earlier_green(self):

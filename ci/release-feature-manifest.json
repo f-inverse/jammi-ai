@@ -115,12 +115,12 @@
     "manifest-only move.",
     "",
     "#507: the three CPU families (`cpu-tarball`, `cpu-wheel`, `cpu-image`)",
-    "live under `lanes` too, alongside the three CUDA families above — ONE",
+    "live under `lanes` too, alongside the three CUDA families above \u2014 ONE",
     "closed set, ONE key (`lanes`), never a second top-level section split by",
     "GPU-vs-CPU. A CPU family carries NO `capabilities` block: it reaches",
     "neither `cuda` nor `flash-attn`, so it has no capability surface to",
     "declare (`check_release_manifest.py` enforces `capabilities` present iff",
-    "`cargo_features` names `cuda` or `flash-attn`, forbidden otherwise —",
+    "`cargo_features` names `cuda` or `flash-attn`, forbidden otherwise \u2014",
     "SYNTACTIC there; `check_flash_attn_closure.py` re-derives the same fact",
     "from the real feature graph and skips a lane with no `capabilities`",
     "block by rule). Every build site for a CPU family reads its",
@@ -131,7 +131,7 @@
     "smoke builds `kube-smoke.yml:114`/`compose-smoke.yml:107`). No gate examines",
     "whether a workflow scalar (a `build-args:` value, a `--features=`/`-F`",
     "invocation, a `workflow_call`/composite-action input default, or any",
-    "other shape) reads one of these sites rather than a literal — that is a",
+    "other shape) reads one of these sites rather than a literal \u2014 that is a",
     "stated residual, tracked on #507.",
     "`crates/jammi-db/tests/it/shipped_feature_exposure.rs` covers the",
     "manifest half (all six families present under `lanes`, the generated",
@@ -303,7 +303,7 @@
   },
   "prove_lane": {
     "_doc": [
-      "Proof surface == shipped surface (esc-081): the DECLARED set of",
+      "Proof surface == shipped surface: the DECLARED set of",
       "`(crate, kind)` pairs `ci/scripts/runpod_gpu_prove.sh` must invoke on a",
       "real device. `kind` is one of `release` (a `cargo build --release`/",
       "`cargo run --release` invocation), `test` (a `cargo test` invocation",
@@ -311,8 +311,8 @@
       "`default` (a `cargo test` invocation with NO `--features` flag at all",
       "-- canonicalizes to an empty feature list). `ci/scripts/",
       "prove_surface.py` computes, for a declared pair, `expected(crate,",
-      "kind) = (this file's own `lanes.cu12-tarball.cargo_features` ∩",
-      "crate's OWN `[features]` table keys) ∪ (this entry's `prove_only`,",
+      "kind) = (this file's own `lanes.cu12-tarball.cargo_features` \u2229",
+      "crate's OWN `[features]` table keys) \u222a (this entry's `prove_only`,",
       "iff kind == test)` -- read hermetically via stdlib `tomllib`, never a",
       "second hardcoded copy of a crate's feature list. `check_flash_attn_",
       "closure.py` asserts SET EQUALITY between THIS declared pair set and",
@@ -327,20 +327,54 @@
     ],
     "crates": {
       "jammi-server": {
-        "kinds": ["release", "test"],
-        "prove_only": ["live-gpu-tests"]
+        "kinds": [
+          "release",
+          "test"
+        ],
+        "prove_only": [
+          "live-gpu-tests"
+        ]
       },
       "jammi-ai": {
-        "kinds": ["test"],
-        "prove_only": ["live-gpu-tests"]
+        "kinds": [
+          "test"
+        ],
+        "prove_only": [
+          "live-gpu-tests"
+        ]
       },
       "jammi-bench": {
-        "kinds": ["release"],
-        "prove_only": []
+        "kinds": [
+          "release",
+          "test"
+        ],
+        "prove_only": [
+          "live-gpu-tests"
+        ]
       },
       "jammi-kernels": {
-        "kinds": ["default", "test"],
-        "prove_only": []
+        "kinds": [
+          "test"
+        ],
+        "prove_only": [
+          "live-gpu-tests"
+        ]
+      },
+      "jammi-encoders": {
+        "kinds": [
+          "test"
+        ],
+        "prove_only": [
+          "live-gpu-tests"
+        ]
+      },
+      "jammi-lora": {
+        "kinds": [
+          "test"
+        ],
+        "prove_only": [
+          "live-gpu-tests"
+        ]
       }
     }
   },

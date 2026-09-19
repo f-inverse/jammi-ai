@@ -148,7 +148,7 @@ rails.measure("arxiv.tier04.reg_pred_std", pred_std)
 ```{python}
 # | echo: false
 # The bidirectional win: the predictor fits (≈ 2018.4, real spread) — the
-# previously-impossible regression-conformal workflow now runs.
+# regression-conformal workflow runs.
 assert pred_std > 0.05
 assert 2016 < cal_mean < 2021 and 2016 < test_mean < 2021
 ```

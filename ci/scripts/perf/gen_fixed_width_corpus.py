@@ -13,11 +13,10 @@ heldout_pairs.jsonl` fixture uses, so this generator's output is a drop-in
 and drops `negative_*`; this generator still emits `negative_*` so the file
 is valid for `Objective::Triplet` too).
 
-WIDTH GUARANTEE (CONTRACT `scratchpad/contract-356-profile.md` v3,
-"Width pinning"): every leg using this generator needs every text to
+WIDTH GUARANTEE: every leg using this generator needs every text to
 tokenize to MORE than `--min-wordpieces W` wordpieces, so that truncating
 at `--max-seq-length W` makes EVERY row's contribution to a batch exactly
-`W` wide (the contract's own width-pinning argument) -- a batch can only
+`W` wide (width pinning) -- a batch can only
 be narrower than `W` if EVERY row in it independently failed to reach the
 cap, which this generator makes false for every row it emits.
 
@@ -47,7 +46,7 @@ run's output is always a literal line-prefix of a larger `--rows` run's
 output at the same `(min_wordpieces, seed)`, since later rows' draws never
 affect earlier ones.
 
-BPE VOCABULARIES (issue #421: the CLIP-text tower): the WIDTH GUARANTEE
+BPE VOCABULARIES (the CLIP-text tower): the WIDTH GUARANTEE
 above survives a byte-level BPE tokenizer unchanged, for the same reason it
 survives wordpiece -- a BPE merge never spans the whitespace boundary
 between two words, so `k` space-separated words tokenize to AT LEAST `k`
@@ -64,7 +63,7 @@ would fail it on words it merely splits differently -- a refusal that says
 nothing about the width guarantee. Pass it only with a wordpiece
 `tokenizer.json`.
 
-HELD-OUT SPLIT (issue #421 P1-b(iv)): `--heldout-rows N` additionally emits
+HELD-OUT SPLIT: `--heldout-rows N` additionally emits
 `heldout_ids.txt` (TAB-separated `anchor_id\tpositive_id\tnegative_id`, the
 SCORING ORDER `finetune-run --heldout-ids` reads) and
 `heldout_triplets.jsonl` (the same row schema as `--out`) in `--out`'s own

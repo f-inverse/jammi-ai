@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# stacked_sweep.sh -- the committed, parameterised producer for the P6 Stage
-# B "stacked" throughput sweep: jammi-fused STACKED (FA2 dense attention arm
+# stacked_sweep.sh -- the committed, parameterised producer for the
+# "stacked" throughput sweep: jammi-fused STACKED (FA2 dense attention arm
 # + the fused AdamW step, both admitted together under
 # JAMMI_KERNELS_STRICT=1) vs an ALL-OFF eager baseline (the same two ops
 # forced eager) vs the PyTorch/PEFT sdpa reference, across 8 batch/seq
@@ -58,7 +58,7 @@
 #                           (if fabricated-empty) files. Never touches the
 #                           lock, the GPU, or the network; never claims a
 #                           real number.
-#   SWEEP_FAKE_BIN_SHA      unification contract C5.2: under SWEEP_DRY_RUN=1
+#   SWEEP_FAKE_BIN_SHA      under SWEEP_DRY_RUN=1
 #                           ONLY, injects a fake `jammi-bench provenance`
 #                           build_sha so the provenance-mismatch refusal
 #                           path is exercisable without a GPU or a real
@@ -69,12 +69,12 @@
 #                           fabricated provenance answer through this knob.
 #   SWEEP_BOX               physical/pod box tag (e.g. `a100c`) stamped
 #                           mechanically into every raw leg's `box` field
-#                           (unification contract C5.3's `stamp_leg()`) and
+#                           (`stamp_leg()`) and
 #                           into env.json. Required unless SWEEP_DRY_RUN=1
 #                           (then defaults to a `dry-run-box` placeholder).
 #
-# Stale-build note: this script, like finetune_ab.sh (which no longer
-# switches git refs within its own run either -- every leg there runs off
+# Stale-build note: this script, like finetune_ab.sh (which does not
+# switch git refs within its own run either -- every leg there runs off
 # ONE binary, built once, see that script's own header), only ever measures
 # the ONE <sha> the caller already checked out before invoking it -- there
 # is no in-script ref switch for cargo's fingerprint to get confused by. It
@@ -192,7 +192,7 @@ SWEEP_LOCK="${SWEEP_LOCK:-/root/TIMING_IN_PROGRESS}"
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$WORKTREE/target}"
 TORCH_PY="${TORCH_PY:-$(cd "$WORKTREE/.." && pwd)/.venv-torch-ref/bin/python3}"
 
-# --- SWEEP_FAKE_BIN_SHA is a DRY-RUN-ONLY test knob (contract C5.2): it
+# --- SWEEP_FAKE_BIN_SHA is a DRY-RUN-ONLY test knob: it
 # exists to exercise the provenance-mismatch refusal path below without a
 # GPU or a real build, never to let a REAL run supply its own answer to the
 # question that check exists to ask. Checked here, before ANY other
@@ -201,7 +201,7 @@ TORCH_PY="${TORCH_PY:-$(cd "$WORKTREE/.." && pwd)/.venv-torch-ref/bin/python3}"
 # inert unless SWEEP_DRY_RUN=1, and a real run with it set REFUSES outright
 # rather than silently ignoring it.
 if [ -n "${SWEEP_FAKE_BIN_SHA:-}" ] && [ "$SWEEP_DRY_RUN" != "1" ]; then
-  echo "::error::SWEEP_FAKE_BIN_SHA is set but SWEEP_DRY_RUN != 1 -- this is a dry-run-only test knob (contract C5.2) for exercising the '\$BIN provenance' mismatch refusal without a real binary; a REAL run may never inject its own provenance answer. Refusing." >&2
+  echo "::error::SWEEP_FAKE_BIN_SHA is set but SWEEP_DRY_RUN != 1 -- this is a dry-run-only test knob for exercising the '\$BIN provenance' mismatch refusal without a real binary; a REAL run may never inject its own provenance answer. Refusing." >&2
   exit 2
 fi
 
@@ -233,7 +233,7 @@ if [ -z "${SWEEP_BOX:-}" ]; then
   if [ "$SWEEP_DRY_RUN" = "1" ]; then
     SWEEP_BOX="dry-run-box"
   else
-    echo "::error::SWEEP_BOX must name the physical/pod box this run measures on (stamped into every raw leg mechanically, contract C5.3)" >&2
+    echo "::error::SWEEP_BOX must name the physical/pod box this run measures on (stamped into every raw leg mechanically)" >&2
     exit 2
   fi
 fi
@@ -336,7 +336,7 @@ if [ "$SWEEP_DRY_RUN" != "1" ]; then
   fi
 fi
 
-# --- provenance cross-check (unification contract C5.1): refuse BEFORE any
+# --- provenance cross-check: refuse BEFORE any
 # leg runs if the binary's own baked identity does not match the sha this
 # invocation claims to prove. `unknown`/a `-dirty` suffix can never equal a
 # 40-hex `$SHA` (already validated above), so a single string-equality
@@ -347,7 +347,7 @@ fi
 # path that can inject a fake answer here. Under SWEEP_DRY_RUN=1 with no
 # injected SWEEP_FAKE_BIN_SHA there is no real binary to query
 # (SWEEP_SKIP_BUILD may also be set) -- the refusal path is instead
-# exercised via SWEEP_FAKE_BIN_SHA (contract C5.2), so the check is skipped
+# exercised via SWEEP_FAKE_BIN_SHA, so the check is skipped
 # only in that one dry-run-and-no-fake-sha case.
 BIN_PROV_SHA=""
 if [ "$SWEEP_DRY_RUN" = "1" ]; then
@@ -451,12 +451,12 @@ ALLOFF_SORTED = sorted(["attention_block_flash", "adamw_step_fused"])
 
 
 def stamp_leg(full_tag, tier, producer_kind, status):
-    """Unification contract C5.3: mechanically writes the artifact schema
+    """Mechanically writes the artifact schema
     (rules (a)-(f): schema_version/git_sha/box/producer/status) PLUS the v2
     identity stamp (leg_schema_version, identity{tier,producer_kind,
     leg_shape:"raw"}) into the RAW leg file this summarize stage just
-    folded a number from -- replacing the hand-applied stamp every
-    previously-committed stacked raw leg carried (CV4). A dry-run stub
+    folded a number from, so no raw leg depends on a hand-applied stamp.
+    A dry-run stub
     (`{"tool":"dry-run",...}`) or an unparsable/missing raw file is left
     untouched -- there is nothing real to stamp."""
     path = out_dir / f"{full_tag}.json"

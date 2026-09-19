@@ -238,8 +238,8 @@ async fn publish_to_unregistered_topic_is_not_found() {
 
 #[tokio::test]
 async fn consumer_recreate_resumes_engine_offsets_with_no_loss() {
-    // Track T1 — JetStream consumer-recreate + resume, the test that
-    // demonstrates the replay/live seam bug and its fix on a real broker.
+    // JetStream consumer-recreate + resume: the replay/live seam on a real
+    // broker.
     //
     // The engine `_offset` is ABSOLUTE: it is seeded from `MAX(_offset)` on the
     // durable backing table, so after a restart (or for any topic whose early
@@ -255,15 +255,15 @@ async fn consumer_recreate_resumes_engine_offsets_with_no_loss() {
     // ENGINE-OFFSET space, exactly what the engine subscribe seam passes.
     // Every engine offset `> last_seen` must resume with NO LOSS.
     //
-    // Before the seam fix this FAILS HARD: `JetStreamBroker::subscribe` mapped
-    // the engine offset onto `DeliverPolicy::ByStartSequence { start_sequence }`,
-    // conflating the engine `_offset` (`~BASE`) with the stream sequence
-    // (`~K`). `ByStartSequence { last_seen + 1 }` asks for a stream sequence far
-    // beyond the stream's head, so the consumer receives NOTHING and the resume
-    // loop times out — total loss of the resumed suffix. After the fix
-    // `subscribe(Some(_))` over-delivers from the earliest retained event
-    // (`DeliverAll`) and the consumer dedups by engine `_offset`, so the
-    // remaining `[last_seen+1 .. BASE+N)` resumes with no loss.
+    // A `JetStreamBroker::subscribe` that mapped the engine offset onto
+    // `DeliverPolicy::ByStartSequence { start_sequence }` would conflate the
+    // engine `_offset` (`~BASE`) with the stream sequence (`~K`):
+    // `ByStartSequence { last_seen + 1 }` asks for a stream sequence far beyond
+    // the stream's head, so the consumer receives NOTHING and the resume loop
+    // times out — total loss of the resumed suffix. `subscribe(Some(_))`
+    // therefore over-delivers from the earliest retained event (`DeliverAll`)
+    // and the consumer dedups by engine `_offset`, so the remaining
+    // `[last_seen+1 .. BASE+N)` resumes with no loss.
     let broker = open_broker().await;
     let topic = make_topic("live.consumer_recreate_resume");
     broker.register_topic(&topic).await.unwrap();

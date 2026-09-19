@@ -1,19 +1,10 @@
-"""The ONE ancestry rule shared by every gate that judges whether a
-committed artifact's own build-ref is still reachable from HEAD (#530).
+"""The one ancestry rule shared by every gate that judges whether a
+committed artifact's own build-ref is still reachable from HEAD.
 
-Before this module, `check_cuda_run_artifacts.py::check_ancestry` (the
-`merged_as` rescue for a branch tip rewritten -- rebased or squash-merged
--- before its own landing) and `check_pod_build_timings.py::check_ancestry`
-were two independently-typed copies of the SAME rule, and the second had
-NOT been given the rescue the first already carried: on the audited head,
-7 of 111 committed cuda-run artifacts needed the rescue to pass at all (two
-of the landings are 2-parent merge commits; the tips were rebased before
-merge, not squashed), and a pod-build-timings artifact produced the exact
-same way would have been refused by the timings gate for a reason the
-artifact gate already accepted. Importing the SAME function from ONE
-module makes that drift structurally impossible to reintroduce: there is
-no second copy left to independently edit, and no diff oracle standing in
-for the DRY invariant itself.
+`check_cuda_run_artifacts.py` and `check_pod_build_timings.py` both import
+`check_ancestry` from here, so the two gates cannot disagree: a branch tip
+rewritten before landing (rebased, or merged as a 2-parent merge of a
+rebased tip) passes both through the same `merged_as` rescue, or neither.
 
 PROPERTY (the one anchor model): PASS when `git_sha` is an ancestor of
 HEAD, OR -- for a branch tip that was rewritten before landing, so
@@ -35,12 +26,10 @@ from pathlib import Path
 
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
-# Same class as the CI incident that hit `check_arch_validation_freshness.py`
-# (run 33230050451, main, "Guard (arch validation freshness self-test)"):
 # `shutil.rmtree` during a `tempfile.TemporaryDirectory`'s teardown can hit
 # `OSError: [Errno 39] Directory not empty: '.git'` -- a race between tempdir
-# cleanup and a background `git maintenance`/`gc --auto` process a scratch-
-# repo `git init`/`add`/`commit`/`clone` call can spawn. `-c gc.auto=0 -c
+# cleanup and a background `git maintenance`/`gc --auto` process a throwaway
+# repo's `git init`/`add`/`commit`/`clone` call can spawn. `-c gc.auto=0 -c
 # gc.autoDetach=false -c maintenance.auto=false` kills the background writer
 # AT THE SOURCE for every git invocation this module makes.
 _GIT_NO_BACKGROUND_MAINTENANCE = ("-c", "gc.auto=0", "-c", "gc.autoDetach=false", "-c", "maintenance.auto=false")

@@ -10,47 +10,22 @@
 //!
 //! ## The op-keyed dispatch-counter registry
 //!
-//! [`device_is_supported`] and [`admission_mode`] are the CANONICAL home for
-//! two predicates every fused op's call site needs (moved here from
-//! `jammi-encoders::layer_norm` by the C6 commit, which found them
-//! duplicated/reached-through-`crate::layer_norm::` by every one of C2-C5's
-//! four ops): `jammi-encoders` re-exports both names from `crate::layer_norm`
-//! so its existing call sites (`crate::layer_norm::admission_mode()`, etc.)
-//! keep compiling unchanged.
+//! [`device_is_supported`] and [`admission_mode`] are the canonical home for
+//! two predicates every fused op's call site needs; `jammi-encoders`
+//! re-exports both from `crate::layer_norm`.
 //!
-//! [`counters_for`] generalizes the OTHER half of the duplication: C2-C5
-//! each hand-declared their own `pub(crate) static X_DISPATCH_COUNTERS:
-//! DispatchCounters = DispatchCounters::new();` in their own module, one per
-//! op. A NEW fused op (this crate's or a downstream crate's) does not need
-//! to repeat that — it calls `counters_for("its_op_name")` and gets back a
-//! `&'static DispatchCounters` looked up (or, on first use, lazily created
-//! and leaked) from ONE process-wide, op-keyed table. This is additive: the
-//! four existing per-op statics are left as they are (a live, working,
-//! independently-tested mechanism — migrating them is a separate, higher-
-//! blast-radius change this commit does not make), but every op added after
-//! this one — starting with the LoRA epilogue's `"lora_epilogue"` counters —
-//! uses the registry instead of adding a fifth hand-declared static.
-//!
-//! **Update (contract K-aux):** the four C2-C5 statics named above
-//! (`LN_DISPATCH_COUNTERS`, `ROPE_DISPATCH_COUNTERS`,
-//! `SOFTMAX_DISPATCH_COUNTERS`, `GEGLU_DISPATCH_COUNTERS`) have SINCE been
-//! migrated onto this registry themselves — each is now a
-//! `LazyLock<&'static DispatchCounters>` that calls `counters_for(..)`
-//! under the hood: `LN_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/layer_norm.rs:129`;
-//! `ROPE_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:181`;
-//! `SOFTMAX_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:195`;
-//! `GEGLU_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:1388`
-//! (`ATTENTION_BLOCK_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:588`
-//! is a fifth, added the same way rather than as a sixth hand-declared static).
-//! The paragraph above is kept for its historical rationale (why the
-//! registry exists at all), not as a description of the current state —
-//! there are no hand-declared `DispatchCounters::new()` statics left
-//! outside this module's own tests and `admit`'s registry-population path
-//! (`grep -rn 'DispatchCounters::new()' crates/`, confirmed at this
-//! contract's tip). What matters for [`admit`]'s `JAMMI_KERNELS_DISABLE`
-//! (below) is unaffected either way: every one of these call sites passes
-//! its op name through `admit` itself, so the disable list covers it
-//! regardless of how its counters are stored.
+//! [`counters_for`] is the one process-wide, op-keyed table of dispatch
+//! counters: a fused op (this crate's or a downstream crate's) calls
+//! `counters_for("its_op_name")` and gets back a `&'static DispatchCounters`,
+//! lazily created and leaked on first use. The named per-op handles
+//! (`LN_DISPATCH_COUNTERS` in `jammi-encoders`' `layer_norm.rs`;
+//! `ROPE_DISPATCH_COUNTERS`, `SOFTMAX_DISPATCH_COUNTERS`,
+//! `GEGLU_DISPATCH_COUNTERS` and `ATTENTION_BLOCK_DISPATCH_COUNTERS` in its
+//! `modernbert.rs`) are `LazyLock<&'static DispatchCounters>` views onto this
+//! registry; no hand-declared `DispatchCounters::new()` static exists outside
+//! this module's own tests and `admit`'s registry-population path. Every call
+//! site passes its op name through [`admit`], so the `JAMMI_KERNELS_DISABLE`
+//! list below covers it regardless of how its counters are stored.
 //!
 //! ## `JAMMI_KERNELS_DISABLE` — forcing the eager arm without a second build
 //!
@@ -67,7 +42,7 @@
 //! ### one alone is a silent no-op
 //!
 //! Not every op key named in [`admit`]'s call graph reaches [`admit`] on
-//! every run — `"attention_block_fused"` (`modernbert.rs:930`) SUBSUMES the
+//! every run — `"attention_block_fused"` (`forward_training_attention`) SUBSUMES the
 //! RoPE and softmax steps on the training path: when it dispatches Fused,
 //! `AttentionBlockFused` performs rotate-half AND masked-softmax internally
 //! as one `CustomOp3`, and neither `"rope_fused"` nor
@@ -85,33 +60,32 @@
 //! unmatched rather than silently accepted).
 //!
 //! **Live standalone** (reachable directly, own call site, own predicate —
-//! each call site now passes the typed [`ProbedOp`] const the line cited
-//! below names in its own registry, per #546 F3's typed migration, rather
-//! than this literal string):
-//! `"layer_norm_fused"` (`jammi-encoders/src/layer_norm.rs:130`),
-//! `"geglu_fused"` (`jammi-encoders/src/modernbert.rs:1389`),
-//! `"lora_linear_fused"` (`jammi-lora/src/lora_linear.rs:227`), and
-//! `"attention_block_fused"` (`jammi-encoders/src/attention_cascade.rs:400`) itself.
+//! each call site passes the typed [`ProbedOp`] const for its key rather
+//! than the literal string): `"layer_norm_fused"` (`jammi-encoders`'
+//! `layer_norm.rs`), `"geglu_fused"` (`jammi-encoders`' `modernbert.rs`),
+//! `"lora_linear_fused"` (`jammi-lora`'s `lora_linear.rs`), and
+//! `"attention_block_fused"` (`jammi-encoders`' `attention_cascade.rs`) itself.
 //!
 //! **Subsumed** (reachable ONLY when `"attention_block_fused"` is ALSO
 //! disabled, forcing `forward_training_attention` into
 //! `forward_eager_training_attention_composition` — the composition that
 //! calls `RotaryEmbedding::apply_training` and `softmax_apply_training`,
 //! each of which independently calls [`admit`] with its own op key):
-//! `"rope_fused"` (`modernbert.rs:478`), `"softmax_last_dim_fused"`
-//! (`modernbert.rs:1188`).
+//! `"rope_fused"` and `"softmax_last_dim_fused"` (both in `jammi-encoders`'
+//! `modernbert.rs`).
 //!
 //! **Subsumed by `"lora_linear_fused"`** (reachable ONLY when
-//! `"lora_linear_fused"` (`jammi-lora/src/lora_linear.rs:227`) itself
+//! `"lora_linear_fused"` itself
 //! admits Fused — `crate::ops::LowRankResidualLinear::bwd` is the sole
 //! call site that ever passes either key to [`admit`], and
 //! `LowRankResidualLinear` is only constructed on the branch where
 //! `lora_linear_fused` already admitted; see `ops::cast_scale`'s
-//! module doc's "cast-boundary lever"): `"cast_scale_bf16_f32"` and
-//! `"cast_add_bf16"` (`ops/low_rank_residual_linear.rs`'s
-//! `admit_cast_boundary`, called at its B1/B3 sites). Each ALSO has its
-//! own runtime dtype gate above the `admit` call (`grad_res`/`base_dtype`
-//! must be `BF16`, not merely `lora_linear_fused` admitting) — a
+//! module doc's "cast-boundary lever"): `"cast_scale_bf16_f32"`,
+//! `"cast_scale_f16_f32"`, `"cast_add_bf16"` and `"cast_add_f16"`
+//! (`ops/low_rank_residual_linear.rs`'s `admit_cast_boundary`, called at
+//! the cast-scale and cast-add sites of `bwd`). Each ALSO has its own
+//! runtime dtype gate above the `admit` call (`grad_res`/`base_dtype` must
+//! be `BF16` or `F16`, not merely `lora_linear_fused` admitting) — a
 //! `JAMMI_KERNELS_DISABLE=cast_scale_bf16_f32`-only run on a checkpoint
 //! where `lora_linear_fused` never admits, OR where the base/grad_res
 //! dtype is `F32` (nothing to fuse, see that op's own module doc), is
@@ -120,12 +94,11 @@
 //! **Registered but permanently dead** (never passed to [`admit`] in
 //! today's call graph — see the "safety property" section below):
 //! `"lora_epilogue"` and `"lora_dropout"` (`counters_for("lora_epilogue")` /
-//! `counters_for("lora_dropout")`, `lora_linear.rs:36,65`); both
-//! stand-alone call sites they used to guard were superseded by
-//! `crate::ops::LowRankResidualLinear`'s single fused-site `CustomOp3`,
-//! which reuses their `cpu_fwd`/`cuda_fwd` directly, bypassing `admit`
-//! entirely (`lora_dropout_counters`'s and `lora_epilogue_counters`'s own
-//! doc comments at those lines). These always read `{fused: 0, eager: 0}`
+//! `counters_for("lora_dropout")` in `jammi-lora`'s `lora_linear.rs`): the
+//! epilogue and dropout run inside `crate::ops::LowRankResidualLinear`'s
+//! single fused-site `CustomOp3`, which reuses their `cpu_fwd`/`cuda_fwd`
+//! directly and bypasses `admit` (see `lora_dropout_counters`'s and
+//! `lora_epilogue_counters`'s own docs). These always read `{fused: 0, eager: 0}`
 //! and, if named in `JAMMI_KERNELS_DISABLE`, always come back from
 //! [`unmatched_disables`] as an INVALID run — a real, present-in-the-
 //! registry op name that nonetheless never fires, not a synthetic example.
@@ -154,10 +127,9 @@
 //! isolates the RoPE kernel.
 //!
 //! A run naming ONLY `softmax_last_dim_fused` (without also disabling
-//! `attention_block_fused`) is the exact "one-build A/B" this module used
-//! to advertise for that op alone — it is now understood to be
-//! non-functional on any checkpoint where `attention_block_fused` admits,
-//! and [`unmatched_disables`] reports it, rather than accepting it.
+//! `attention_block_fused`) is non-functional on any checkpoint where
+//! `attention_block_fused` admits, and [`unmatched_disables`] reports it
+//! rather than accepting it.
 //!
 //! ### The safety property: a typo must never read as a successful forced-eager run
 //!
@@ -192,61 +164,42 @@ use strum::VariantArray;
 use crate::error::{KernelError, Result};
 
 // ─────────────────────────────────────────────────────────────────────────
-// Cascade admission: `PredicateOutcome` (P6 stage B, contract v4 §3.3)
+// Cascade admission: `PredicateOutcome`
 // ─────────────────────────────────────────────────────────────────────────
 //
-// **Scope, corrected by the lead mid-round (P6 Stage B v4 pressure-test,
-// 2026-08-25): the 17 pre-existing two-arm predicates (LayerNorm, RoPE,
-// softmax, GeGLU, the whole fused attention block, the LoRA site — one
-// `bool`-valued `fn ..._admission_predicate` each, listed in this crate's
-// own module doc above) are NOT migrated onto [`PredicateOutcome`] and
-// keep calling [`admit`] with a plain `bool`, UNCHANGED, byte-for-byte.**
-// The original plan (this section's own first draft) reclassified every
-// domain check as `DomainMiss` — a decline that never errors even under
-// `Strict`. That is wrong for those 17: `Strict` mode's entire purpose
-// (`AdmissionMode`'s own doc: "so 'fell back everywhere' can never pass as
-// a green measurement of the fused path") is to make a two-arm op's
-// predicate failure a HARD error in a controlled bench/capability lane —
-// silently reclassifying every one of those failures as a never-erroring
-// `DomainMiss` would quietly defang that property for six ops nobody asked
-// to change. [`PredicateOutcome`] is introduced ONLY for a genuine THREE-
-// (or more-) arm cascade — today: `attention_block_flash` (P6's flash
-// attention arm) → `attention_block_fused` (the existing block arm) →
-// eager — where a decline does NOT mean "the raw eager composition ran"
-// the way a two-arm op's `false` always has: it means "try the NEXT
-// admission-gated arm", which [`admit`] itself has no way to express with
-// a bare `bool`. [`admit_cascade`] is that new, narrowly-scoped entry
-// point; [`admit`] (the 17 existing call sites) is untouched.
+// The two-arm predicates (LayerNorm, RoPE, softmax, GeGLU, the fused
+// attention block, the LoRA site — one `bool`-valued
+// `fn ..._admission_predicate` each) call [`admit`] with a plain `bool`.
+// They must not be reclassified as a never-erroring `DomainMiss`: `Strict`
+// mode's purpose (`AdmissionMode`'s own doc: "so 'fell back everywhere' can
+// never pass as a green measurement of the fused path") is to make a two-arm
+// op's predicate failure a HARD error in a controlled bench/capability lane.
+// [`PredicateOutcome`] exists ONLY for a genuine three- (or more-) arm
+// cascade — `attention_block_flash` → `attention_block_fused` → eager —
+// where a decline does NOT mean "the raw eager composition ran" but "try the
+// NEXT admission-gated arm", which [`admit`] cannot express with a bare
+// `bool`. [`admit_cascade`] is that entry point.
 //
-// The pre-existing 10-cell `JAMMI_KERNELS_DISABLE` lattice (this module's
-// own `lattice_cell_01`..`_10` tests, `crates/jammi-bench/tests/
-// finetune_step_kernel_disable.rs`) exercises `admit`/`admit_inner`
-// exclusively and is untouched by this section — its behaviour is
-// BYTE-IDENTICAL before and after this addition (no test in that lattice
-// was edited to add this feature).
+// The `JAMMI_KERNELS_DISABLE` lattice (this module's `lattice_cell_01`..`_10`
+// tests, `crates/jammi-bench/tests/finetune_step_kernel_disable.rs`)
+// exercises `admit`/`admit_inner` exclusively.
 //
-// **HELD, per the lead's P6 Stage B v5 pressure-test correction: the
-// `JAMMI_KERNELS_DISABLE=attention_block_flash` lattice cell (contract v4
-// §3.3's L11) and `ab_merge.py`'s bench-side "absorber class" semantics are
-// deliberately NOT implemented here.** [`admit_cascade`]'s disabled branch
-// below records the decline in `declined` (not `eager` — see
-// [`CascadeDispatchCounters`]'s doc), which means a leg that intentionally
-// disables `attention_block_flash` reads `declined > 0` exactly like a
-// genuine domain/capability miss would — indistinguishable from the bench
-// side without a "fire-without-counting" signal that does not exist yet. A
-// numerics design v2 is being dispatched specifically to resolve this (a
-// public fire-without-counting entry point plus an `ab_merge.py` exemption
-// admitting `eager > 0` on a disabled pair, with an absorber CASCADE
-// `attention_block_flash ⊃ attention_block_fused ⊃ {rope_fused,
-// softmax_last_dim_fused}` rather than a flat disabled-op class) — do not
-// build on top of the mechanism below for that specific lattice cell until
-// it lands.
+// **Limitation: disabling `attention_block_flash` is not distinguishable
+// from a domain/capability miss.** [`admit_cascade`]'s disabled branch
+// records the decline in `declined` (not `eager` — see
+// [`CascadeDispatchCounters`]'s doc), so a leg that intentionally disables
+// `attention_block_flash` reads `declined > 0` exactly like a genuine miss.
+// Telling them apart needs a "fire-without-counting" signal and a bench-side
+// absorber CASCADE (`attention_block_flash ⊃ attention_block_fused ⊃
+// {rope_fused, softmax_last_dim_fused}`) in `ab_merge.py`, neither of which
+// exists; do not build a `JAMMI_KERNELS_DISABLE=attention_block_flash`
+// lattice cell on the mechanism below.
 
 /// The outcome of a CASCADE arm's own domain/capability predicate — see
 /// this module's "Cascade admission" section above for why this exists
-/// ONLY for a genuine multi-arm chain (today: `attention_block_flash` →
-/// `attention_block_fused` → eager) and not for the 17 pre-existing
-/// two-arm ops, which keep calling [`admit`] with a plain `bool`.
+/// ONLY for a genuine multi-arm chain (`attention_block_flash` →
+/// `attention_block_fused` → eager) and not for the two-arm ops, which
+/// call [`admit`] with a plain `bool`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PredicateOutcome {
     /// The predicate holds: dispatch to THIS arm.
@@ -264,8 +217,8 @@ pub enum PredicateOutcome {
     /// string (never collapsed into one generic "capability" text, so a
     /// probe/report reader can tell them apart): the feature was not
     /// compiled; the GPU architecture does not match; the device is not
-    /// CUDA at all; or — the fourth class, added for the `attention_block_flash`
-    /// cascade's BERT/DistilBERT callers — **the CALLING FORWARD has not
+    /// CUDA at all; or — for the `attention_block_flash` cascade's
+    /// BERT/DistilBERT callers — **the CALLING FORWARD has not
     /// wired this arm's transport protocol** (reason string
     /// `flash_transport_not_wired`): the arm's DEVICE and BUILD are both
     /// capable, but the caller's own forward function has not implemented
@@ -365,7 +318,7 @@ fn cascade_registry() -> &'static Mutex<HashMap<&'static str, &'static CascadeDi
 /// `"all"` wildcard) — a thin, PUBLIC wrapper over the same private
 /// `disabled_ops`/`fired_disables` plumbing [`admit`] itself uses,
 /// exposed so a caller can skip an EXPENSIVE predicate computation (e.g. a
-/// device-side mask reduction + D2H sync, P6 stage B's `flash_d2h_syncs`)
+/// device-side mask reduction + D2H sync, counted by `flash_d2h_syncs`)
 /// entirely when the op is disabled, rather than computing it and then
 /// discarding the result inside [`admit_cascade`]. Calling this and then
 /// [`admit_cascade`] is safe and not double-counted: this function reads
@@ -395,9 +348,8 @@ pub fn op_disabled(op: &'static str) -> bool {
 ///
 /// **Every decline also records `(op, predicate)` into the SAME
 /// probe-capture window `admit_inner` uses** (`record_probe_miss`, this
-/// module's "probe-window capture sink" section) — a channel this function
-/// used to leave closed, recording declines as counter increments only.
-/// The disabled branch records [`DISABLED_PREDICATE_KEY`]; `DomainMiss` and
+/// module's "probe-window capture sink" section), not only a counter
+/// increment. The disabled branch records [`DISABLED_PREDICATE_KEY`]; `DomainMiss` and
 /// `CapabilityMiss` record `predicate_name`, `CapabilityMiss` BEFORE the
 /// `mode` match so a `Strict`-mode hard error still lands an entry (mirrors
 /// `admit_inner`'s own placement). A caller with an armed
@@ -415,9 +367,8 @@ pub fn admit_cascade(
     let op = op.dtype_neutral_key();
     if op_is_disabled(disabled_ops(), fired_disables(), op) {
         counters.declined.fetch_add(1, Ordering::Relaxed);
-        // Campaign #446 finding 3's channel, closed here too (audit round,
-        // item 3): the SAME probe-capture window `admit_inner` records
-        // into, independent of `warn_disabled_once`'s log-once dedupe.
+        // The SAME probe-capture window `admit_inner` records into,
+        // independent of `warn_disabled_once`'s log-once dedupe.
         record_probe_miss(op, DISABLED_PREDICATE_KEY);
         warn_disabled_once(op);
         return Ok(CascadeOutcome::Declined);
@@ -489,7 +440,7 @@ impl ComputeCapability {
 /// failure on an actual CUDA device (feature on, driver call errors) also
 /// degrades to `None` — the safe default under uncertainty is "capability
 /// not established", which every call site treats as "does not meet the
-/// minimum" and falls back accordingly (family D: default to the side that
+/// minimum" and falls back accordingly (defaulting to the side that
 /// cannot silently compute a wrong number).
 ///
 /// This reads the compute capability off the CONTEXT candle's own
@@ -660,7 +611,7 @@ pub fn fallback_warnings_emitted() -> Vec<FallbackWarning> {
 }
 
 // =============================================================================
-// The probe-window capture sink (campaign #446 finding 3)
+// The probe-window capture sink
 // =============================================================================
 //
 // [`fallback_warnings_emitted`] above is a LOG-ONCE record: every entry is
@@ -680,21 +631,17 @@ pub fn fallback_warnings_emitted() -> Vec<FallbackWarning> {
 // records `(op, predicate)` here, whatever the log-once dedupe decides (which
 // stays exactly as it is, for logging).
 //
-// **`admit_cascade`'s decline path uses this SAME sink (audit round,
-// jammi-kernels item 3).** `admit_cascade` used to record a decline as a
-// counter increment only — `probe_capture_reason_for` had no entry for a
-// cascade op at all, so a caller (e.g. `jammi-ai`'s esc-075 probe) could see
-// `attention_block_flash`'s `declined` counter move but never learn WHY.
-// Every one of `admit_cascade`'s three decline shapes (disabled,
-// `DomainMiss`, `CapabilityMiss` — including the `Strict`+`CapabilityMiss`
-// hard-error case, recorded BEFORE the mode match for the same reason
-// `admit_inner` records before ITS mode match) now calls
-// [`record_probe_miss`] with the identical `(op, predicate)` shape, so
+// **`admit_cascade`'s decline path uses this SAME sink.** Every one of its
+// three decline shapes (disabled, `DomainMiss`, `CapabilityMiss` — including
+// the `Strict`+`CapabilityMiss` hard-error case, recorded BEFORE the mode
+// match for the same reason `admit_inner` records before ITS mode match)
+// calls [`record_probe_miss`] with the identical `(op, predicate)` shape, so a
+// caller (e.g. `jammi-ai`'s fine-tune acceleration-report probe) that sees
+// `attention_block_flash`'s `declined` counter move also learns WHY:
 // `probe_capture_reason_for("attention_block_flash")` reads
 // `flash_transport_not_wired` for a BERT-family forward exactly the way it
-// reads a two-arm op's predicate name. The counters this closes NOTHING
-// about: `CascadeDispatchCounters`'s `fused`/`declined` fields are
-// unchanged, byte-identical to before this addition.
+// reads a two-arm op's predicate name. `CascadeDispatchCounters`'s
+// `fused`/`declined` fields are independent of the sink.
 
 /// The predicate key `warn_disabled_once` logs and the sink records for a
 /// `JAMMI_KERNELS_DISABLE`-forced eager arm. Hoisted to a `const` so the two
@@ -723,17 +670,17 @@ thread_local! {
 
     /// The identity of the window currently armed on this thread, or
     /// [`NO_WINDOW`] when unarmed — the token a [`ProbeCaptureGuard`] checks
-    /// itself against before it restores anything (campaign #446 round-1
-    /// advisory: nested windows finished OUT OF ORDER would otherwise
-    /// misattribute entries; see [`ProbeCaptureGuard::restore`]).
+    /// itself against before it restores anything (nested windows finished
+    /// OUT OF ORDER would otherwise misattribute entries; see
+    /// [`ProbeCaptureGuard::restore`]).
     ///
     /// Read and written ONLY by `probe_capture_begin`/`ProbeCaptureGuard` —
-    /// never by `record_probe_miss`, so the armed and unarmed hot paths are
-    /// byte-for-byte what they were.
+    /// never by `record_probe_miss`, so neither the armed nor the unarmed
+    /// hot path pays for it.
     static ARMED_WINDOW: Cell<u64> = const { Cell::new(NO_WINDOW) };
 
     /// This thread's monotonic window-token source. Per-thread and
-    /// deterministic (never an RNG, family J): tokens are only ever compared
+    /// deterministic (never an RNG): tokens are only ever compared
     /// for equality against a guard armed on the SAME thread, so two threads
     /// minting the same number is not a collision.
     static NEXT_WINDOW_TOKEN: Cell<u64> = const { Cell::new(FIRST_WINDOW) };
@@ -759,7 +706,7 @@ const OUT_OF_ORDER_WINDOW: &str =
 /// Records `(op, predicate)` into this thread's armed probe window, if one is
 /// armed. A no-op (and non-allocating) otherwise.
 ///
-/// **Bounded by DISTINCT pairs, not by miss COUNT** (family E: bound the term
+/// **Bounded by DISTINCT pairs, not by miss COUNT** (bound the term
 /// that grows). The number of miss EVENTS in a window is caller-controlled —
 /// it scales with the probed model's layer count, which comes from the job
 /// spec. The number of DISTINCT `(op, predicate)` pairs does not: both fields
@@ -799,8 +746,8 @@ pub fn probe_capture_is_armed() -> bool {
 /// this does not change what gets logged).
 ///
 /// **Thread-locality is a real constraint on the caller.** The window
-/// captures only misses raised on the arming thread. `jammi-ai`'s esc-075
-/// probe satisfies this: `run_fine_tune_blocking` runs inside one
+/// captures only misses raised on the arming thread. `jammi-ai`'s fine-tune
+/// acceleration-report probe satisfies this: `run_fine_tune_blocking` runs inside one
 /// `tokio::task::spawn_blocking` closure, and the probe's encoder forward,
 /// `Tensor::backward()` graph walk and `AdamW::step` are all synchronous
 /// calls on that single thread — candle's own intra-kernel parallelism sits
@@ -888,11 +835,10 @@ impl ProbeCaptureGuard {
     /// and is still live. Restoring here would take the INNER window's
     /// entries (the sink holds the innermost window, not this guard's) and
     /// then overwrite the sink with this guard's `previous`, destroying the
-    /// inner window outright: two misattributions in one move. The advisory
-    /// that prompted this is not reachable today — `jammi-ai`'s esc-075 probe
-    /// is the only caller and never nests — so this is a REFUSAL that makes
-    /// the shape impossible to introduce silently, not a recovery from a live
-    /// bug. The sink is deliberately left untouched on refusal: the inner
+    /// inner window outright: two misattributions in one move. No current
+    /// caller nests (`jammi-ai`'s fine-tune acceleration-report probe is the
+    /// only one), so this is a REFUSAL that makes the shape impossible to
+    /// introduce silently, not a recovery from a live bug. The sink is deliberately left untouched on refusal: the inner
     /// window keeps its own entries and its own guard still restores
     /// correctly.
     fn restore(&mut self) -> Option<Vec<ProbeMiss>> {
@@ -1000,8 +946,8 @@ fn warn_fallback_once_with_message(op: &'static str, predicate: &'static str, me
 /// `(op, predicate)` pair — the log-once-per-process WARN naming the op AND
 /// the failed predicate. Used for a genuine domain-predicate failure; see
 /// `warn_disabled_once` for the `JAMMI_KERNELS_DISABLE` path's own,
-/// differently-worded message (advisory: the disabled path is not a
-/// predicate failure and must not read as one in the log).
+/// differently-worded message (the disabled path is not a predicate
+/// failure and must not read as one in the log).
 pub fn warn_fallback_once(op: &'static str, predicate: &'static str) {
     warn_fallback_once_with_message(
         op,
@@ -1027,14 +973,12 @@ pub fn warn_fallback_once(op: &'static str, predicate: &'static str) {
 /// `JAMMI_KERNELS_DISABLE` are the SAME grammar (a caller states the SAME
 /// disable list two ways — one via the env var this process reads, one via
 /// an argv claim about what it expects that env var to carry), so there is
-/// exactly ONE parser for it. A round-3 audit found `--expect-kernels-disabled`
-/// had grown a SECOND, divergent parser that collected into a `Vec` with no
-/// dedup: `JAMMI_KERNELS_DISABLE=op --expect-kernels-disabled op,op` then
-/// compared `disabled_ops_requested()`'s deduplicated `["op"]` against the
-/// duplicate-preserving `["op", "op"]` and hard-failed a VALID leg, blaming
-/// a dropped env var that was never dropped. Both parsers reading through
-/// this one function makes that class of divergence structurally
-/// impossible, not just untested.
+/// exactly ONE parser for it. A second parser that collected into a `Vec`
+/// with no dedup would compare `disabled_ops_requested()`'s deduplicated
+/// `["op"]` against a duplicate-preserving `["op", "op"]` for
+/// `JAMMI_KERNELS_DISABLE=op --expect-kernels-disabled op,op` and hard-fail a
+/// VALID leg, blaming a dropped env var that was never dropped. One shared
+/// function makes that divergence structurally impossible.
 ///
 /// Pure/no I/O — split out from `disabled_ops` so the parsing edge
 /// cases are unit-testable with literal inputs, independent of the
@@ -1151,7 +1095,7 @@ fn op_is_disabled(
     true
 }
 
-/// `requested` entries absent from `fired`, sorted (family J: `HashSet`
+/// `requested` entries absent from `fired`, sorted (a `HashSet`'s
 /// iteration order is not a fold order this codebase relies on for a
 /// durable artifact — a caller that logs/serializes this list needs a
 /// deterministic order, not whatever the default hasher's bucket layout
@@ -1185,7 +1129,7 @@ pub fn unmatched_disables() -> Vec<String> {
 }
 
 /// The `JAMMI_KERNELS_DISABLE` entries requested this process, sorted
-/// (family J — see `compute_unmatched`'s doc for why a `HashSet`'s
+/// (see `compute_unmatched`'s doc for why a `HashSet`'s
 /// iteration order is never a durable-artifact fold order). The
 /// REQUESTED half of the `requested`/`fired` pair a caller building a
 /// durable run record (`jammi-bench`'s `FinetuneStepTier`) is expected to
@@ -1308,7 +1252,7 @@ fn admit_inner(
         // forced eager while every OTHER op passing through this same
         // function is still strictly proven fused.
         counters.record(DispatchOutcome::Eager);
-        // Campaign #446 finding 3: the probe window records EVERY miss,
+        // The probe window records EVERY miss,
         // independent of `warn_disabled_once`'s log-once dedupe below — a
         // repeat of an already-warned `(op, predicate)` pair still belongs to
         // the job whose window is armed right now.
@@ -1365,7 +1309,7 @@ fn admit_inner(
 /// decision this function has always made.
 ///
 /// `op` is a [`ProbedOp`] — never a bare string — so a call site is bound to
-/// [`PROBED_OPS`] at compile time (#546): a dtype-ambiguous op
+/// [`PROBED_OPS`] at compile time: a dtype-ambiguous op
 /// ([`CAST_SCALE`]/[`CAST_ADD`]) cannot resolve here (see
 /// [`ProbedOp::dtype_neutral_key`]'s own panic doc) and must go through
 /// `jammi-kernels`' own dtype-aware cast-boundary entry point instead — this
@@ -1421,16 +1365,16 @@ pub(crate) fn admit_by_key(
 /// back) is switched on by the `JAMMI_KERNELS_STRICT` environment variable,
 /// read once per process — the bench tier and a `gpu_capability`-style lane
 /// are the intended callers, set before the process starts so "fell back
-/// everywhere" can never read as a green measurement of the fused path (K2,
-/// scope decision 6 of the fused-kernels plan). `Fallback` (the default) is
+/// everywhere" can never read as a green measurement of the fused path.
+/// `Fallback` (the default) is
 /// what every ordinary training run uses.
 ///
 /// ONE env var governs strictness uniformly across every fused kernel every
 /// crate in this workspace dispatches through `admit`, rather than one env
-/// var per op or per crate — moved here (from `jammi-encoders::layer_norm`,
-/// where C2-C5 all reached it via `crate::layer_norm::admission_mode()`) so
-/// a crate with no dependency on `jammi-encoders` at all (`jammi-lora`) can
-/// read the exact same switch.
+/// var per op or per crate — it lives here (re-exported by
+/// `jammi-encoders` as `crate::layer_norm::admission_mode()`) so a crate
+/// with no dependency on `jammi-encoders` at all (`jammi-lora`) reads the
+/// exact same switch.
 pub fn admission_mode() -> AdmissionMode {
     static MODE: OnceLock<AdmissionMode> = OnceLock::new();
     *MODE.get_or_init(|| {
@@ -1459,7 +1403,7 @@ pub fn admission_mode() -> AdmissionMode {
 /// fallback clean. `ops::DropoutFused` (a UNARY `CustomOp1`, reached only
 /// through `apply1`, never through this predicate) is the one exception in
 /// this crate — see its module doc's "Metal: a device-scoped deterministic
-/// host fallback" section (issue #433) — but that does not change this
+/// host fallback" section — but that does not change this
 /// function's answer for `apply2`/`apply3`'s own device set, which stays
 /// CPU/CUDA-only until one of those ops grows a real `metal_fwd` too.
 ///
@@ -1469,17 +1413,14 @@ pub fn admission_mode() -> AdmissionMode {
 /// crate's own `cuda` feature is OFF (e.g. some other crate in the same
 /// workspace build enabled `candle-core/cuda` via feature unification,
 /// without going through this crate's `cuda` feature) would still fail
-/// SAFELY today — but `cfg!(feature = "cuda")` makes that structurally
+/// SAFELY — but `cfg!(feature = "cuda")` makes that structurally
 /// impossible rather than merely unreached, at zero runtime cost (the whole
 /// expression folds to a compile-time constant).
 ///
-/// Moved here from `jammi-encoders::layer_norm::device_is_supported` (the
-/// C6 commit): that crate now re-exports this function under its old path
-/// so `crate::layer_norm::device_is_supported(..)` call sites in
-/// `jammi-encoders` (including `crate::modernbert`'s RoPE/softmax/GeGLU
-/// admission predicates) keep compiling unchanged, and `jammi-lora` — which
-/// has no dependency on `jammi-encoders` at all — reaches the identical,
-/// once-audited clause directly.
+/// `jammi-encoders` re-exports this as `crate::layer_norm::device_is_supported`
+/// (used by `crate::modernbert`'s RoPE/softmax/GeGLU admission predicates),
+/// and `jammi-lora` — which has no dependency on `jammi-encoders` — reaches
+/// the identical clause directly.
 pub fn device_is_supported(d: &Device) -> bool {
     d.is_cpu() || (cfg!(feature = "cuda") && d.is_cuda())
 }
@@ -1496,8 +1437,8 @@ pub fn device_is_supported(d: &Device) -> bool {
 /// whenever the LOCAL crate's own feature is off, regardless of what this
 /// constant says. `FLASH_COMPILED` is therefore useful ONLY for a predicate
 /// that decides fused-vs-eager without ever naming a `crate::flash` type
-/// directly (P6 Stage B's `attention_block_flash` admission predicate,
-/// `jammi-encoders`, is exactly such a caller today — it holds row
+/// directly (the `attention_block_flash` admission predicate in
+/// `jammi-encoders` is such a caller — it holds row
 /// `lengths`, not a constructed `crate::flash::CuSeqlens`, for precisely
 /// this reason). Workspace feature unification makes this SOUND: `cfg!`
 /// resolves to how THIS crate was actually compiled for the whole build
@@ -1564,24 +1505,17 @@ fn parse_gencode_sms(sms: &str) -> Vec<ComputeCapability> {
 /// is not "built" in any sense a caller should trust — this mirrors
 /// [`FLASH_COMPILED`]'s own "truthful in every cfg" contract (a plain,
 /// unconditionally-compiled accessor whose ANSWER still reflects the real
-/// feature state, M3 plan v2 delta 3) rather than [`CUDA_COMPILED`]-style
-/// blind trust in a string that may not correspond to anything this build
-/// actually produced.
+/// feature state) rather than [`CUDA_COMPILED`]-style blind trust in a
+/// string that may not correspond to anything this build actually produced.
 ///
-/// `admitted != compiled` in general (M3 plan D4). ROUND-2 AUDIT FINDING
-/// C: an earlier revision of this crate had NO type distinguishing
-/// "compiled" from "validated" at all — `crate::flash::check_arch` and
-/// every fence site in `jammi-encoders`/`jammi-bench` read THIS function
-/// directly as their admission set, so any arch added to `build.rs`'s
-/// `GENCODE_ARCHES` was ADMITTED the moment it compiled, with zero pod
-/// evidence required (the auditor proved this concretely by adding a
-/// hypothetical `sm_100` entry and watching the entire hermetic battery
-/// stay green). This function is now DELIBERATELY not an enforcement
-/// point: it answers ONLY "did `build.rs` compile a cubin for this arch",
-/// which is necessary but not sufficient for admission — no fence site
-/// reads it directly anymore. [`flash_validated_arches`] (below) is the
-/// actual enforcement point every fence reads; it is asserted (by a
-/// hermetic test) to be a SUBSET of what this function returns.
+/// `admitted != compiled`. This function is deliberately NOT an
+/// enforcement point: it answers ONLY "did `build.rs` compile a cubin for
+/// this arch", which is necessary but not sufficient for admission. If fence
+/// sites read it, any arch added to `build.rs`'s `GENCODE_ARCHES` would be
+/// ADMITTED the moment it compiled, with no GPU evidence (a hypothetical
+/// `sm_100` entry leaves every hermetic test green). No fence site reads it;
+/// [`flash_validated_arches`] (below) is the enforcement point every fence
+/// reads, asserted by a hermetic test to be a SUBSET of what this returns.
 pub fn flash_built_arches() -> &'static [ComputeCapability] {
     static ARCHES: LazyLock<Vec<ComputeCapability>> =
         LazyLock::new(|| parse_gencode_sms(env!("JAMMI_FLASH_GENCODE_SMS")));
@@ -1592,26 +1526,25 @@ pub fn flash_built_arches() -> &'static [ComputeCapability] {
     }
 }
 
-/// The SUBSET of [`flash_built_arches`] with an actual green per-arch pod
+/// The SUBSET of [`flash_built_arches`] with an actual green per-arch GPU
 /// parity leg — parsed from `JAMMI_FLASH_VALIDATED_SMS` (`build.rs`'s
 /// `VALIDATED_SMS` const, emitted the SAME unconditional way as
 /// `JAMMI_FLASH_GENCODE_SMS` — see that emission's own doc comment).
 ///
-/// **THIS is the actual admission gate** (round-2 audit finding C):
+/// **THIS is the actual admission gate**:
 /// `crate::flash::check_arch`, `jammi-encoders::modernbert`'s
 /// `flash_arch_ok`, and `jammi-bench`'s `flash_capable_cuda` all read
 /// THIS function, not [`flash_built_arches`] — a device outside this set
 /// is refused even if its arch IS compiled (`FlashError::Arch` /
-/// `"arch_in_flash_validated_set"`), because "compiled" alone was proven
-/// (by the round-2 audit's own `sm_100` experiment) to be an insufficient
-/// admission criterion on its own. Same `FLASH_COMPILED`-gated `&[]`
-/// degrade as [`flash_built_arches`], for the same reason (M3 plan v2
-/// delta 3's "truthful in every cfg" contract).
+/// `"arch_in_flash_validated_set"`), because "compiled" alone is an
+/// insufficient admission criterion. Same `FLASH_COMPILED`-gated `&[]`
+/// degrade as [`flash_built_arches`], for the same "truthful in every cfg"
+/// reason.
 ///
 /// Widening this set is its OWN, separately-reviewable commit — never
 /// bundled with a `GENCODE_ARCHES` addition in the same diff — because
-/// widening it is exactly the step that MUST be gated on a green pod
-/// parity artifact actually landing (`build.rs::VALIDATED_SMS`'s own doc;
+/// widening it is exactly the step that MUST be gated on a committed green
+/// GPU parity artifact (`build.rs::VALIDATED_SMS`'s own doc;
 /// `third_party/flash-attention/VENDORED.md`'s "Supported archs" per-arch
 /// table names the evidence for each currently-validated entry).
 pub fn flash_validated_arches() -> &'static [ComputeCapability] {
@@ -1626,8 +1559,7 @@ pub fn flash_validated_arches() -> &'static [ComputeCapability] {
 
 /// The op-keyed dispatch-counter registry: one process-wide table from an
 /// op's name to its `DispatchCounters`. See the module doc's "op-keyed
-/// dispatch-counter registry" section for why this exists alongside (not
-/// instead of) the four hand-declared per-op statics C2-C5 already shipped.
+/// dispatch-counter registry" section.
 ///
 /// Looks up `op`'s counters, creating (and leaking — a `'static` handle,
 /// same lifetime class as a hand-declared `static`, is the whole point) a
@@ -1662,7 +1594,7 @@ fn registry() -> &'static Mutex<HashMap<&'static str, &'static DispatchCounters>
 /// WITHOUT needing to know each op's name ahead of time (unlike a
 /// per-op `*_dispatch_snapshot()` function, which does). `BTreeMap` (not
 /// `HashMap`): a deterministic iteration order for anything that logs or
-/// serializes this snapshot (family J — hashmap iteration order is not a
+/// serializes this snapshot (hashmap iteration order is not a
 /// fold order this codebase relies on for a durable artifact).
 ///
 /// Only reflects ops that have been looked up via [`counters_for`] at
@@ -1680,18 +1612,15 @@ pub fn snapshot_all() -> std::collections::BTreeMap<&'static str, DispatchSnapsh
 }
 
 // =============================================================================
-// The probed-op table (campaign #446 finding 2)
+// The probed-op table
 // =============================================================================
 //
 // ONE static fact about which ops a per-job acceleration report / capability
 // probe can attribute to a real dispatch decision, and under which registry
-// key. Before this table the same facts were hand-encoded in five unsynced
-// places (`crates/jammi-ai/src/fine_tune/worker.rs`'s
-// `PROBED_ACCELERATION_OPS` + its `AdmissionProbeSnapshot` struct fields +
-// its `two_arm` match, and `crates/jammi-ai/tests/gpu_capability/
-// capability_surface.rs`'s `TWO_ARM_OPS` + `KNOWN_NO_DISPATCH_SITE_OPS`),
-// which is exactly how the f16 cast-epilogue keys came to be missing from
-// the shipped report on the headline dtype.
+// key. Consumers (`jammi-ai`'s fine-tune worker and its GPU capability
+// tests) read this table rather than keeping their own op lists: separate
+// hand-maintained copies drift, and a drifted copy silently drops keys (such
+// as the f16 cast-epilogue keys) from the report on the headline dtype.
 //
 // **Why not `snapshot_all`.** `snapshot_all()` reflects only ops that have
 // been looked up via `counters_for` AT LEAST ONCE in this process (its own
@@ -1699,7 +1628,7 @@ pub fn snapshot_all() -> std::collections::BTreeMap<&'static str, DispatchSnapsh
 // job that happens to run first in a fresh process would report a strictly
 // smaller `ops` key set than the identical job running second. A durable
 // per-job artifact whose SHAPE depends on what else the process did is not a
-// measurement (family F). This table is a compile-time constant instead, so
+// measurement. This table is a compile-time constant instead, so
 // the candidate key set is a pure function of the job's dtype class.
 
 /// The dtype family a [`ProbedOp`]'s registry key is resolved under.
@@ -1785,7 +1714,7 @@ pub enum ProbedOpKind {
 /// A same-crate forgery inside `jammi-kernels` itself remains syntactically
 /// POSSIBLE (`#[non_exhaustive]`/field-privacy sealing has no effect within
 /// the defining crate), and nothing here closes it — because nothing needs
-/// to. **#546 K1 update:** a real, hash-affecting fold now exists
+/// to. The one hash-affecting fold
 /// (`jammi_db::store::manifest::MaterializationEnv::kernel_admission_profile`,
 /// written by `jammi-ai`'s fine-tune worker from
 /// [`render_kernel_admission_profile`]'s return value), but it is BY
@@ -1886,7 +1815,7 @@ impl ProbedOp {
 
     /// Every registry key this op can dispatch under, across all dtype
     /// classes — the enumeration a "is this table's key set closed over the
-    /// workspace's real call sites" audit reads.
+    /// workspace's real call sites" check reads.
     pub fn all_registry_keys(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.registry.iter().map(|&(_, key)| key)
     }
@@ -1903,7 +1832,7 @@ impl ProbedOp {
     ///
     /// # Panics
     /// If `self.registry` branches by a CONCRETE dtype class (`CAST_SCALE`/
-    /// `CAST_ADD` today, `probed_ops_resolve_to_at_most_one_registry_key_per_dtype_class`
+    /// `CAST_ADD`; `probed_ops_resolve_to_at_most_one_registry_key_per_dtype_class`
     /// pins there are no others) — those two ops resolve through the
     /// dtype-aware entry point instead
     /// (`jammi_kernels::ops::low_rank_residual_linear`'s `admit_cast_boundary`),
@@ -1933,20 +1862,20 @@ impl ProbedOp {
 ///
 /// | report key | kind | registry key(s) | call site |
 /// |---|---|---|---|
-/// | `layer_norm` | TwoArm | `layer_norm_fused` | `layer_norm_fused`, `crates/jammi-encoders/src/layer_norm.rs:130` |
-/// | `rope` | TwoArm | `rope_fused` | `rope_fused`, `crates/jammi-encoders/src/modernbert.rs:182` |
-/// | `softmax` | TwoArm | `softmax_last_dim_fused` | `softmax_last_dim_fused`, `crates/jammi-encoders/src/attention_cascade.rs:405` |
-/// | `geglu` | TwoArm | `geglu_fused` | `geglu_fused`, `crates/jammi-encoders/src/modernbert.rs:1389` |
-/// | `gelu_erf` | TwoArm | `gelu_erf_fused` | `gelu_erf_fused`, `crates/jammi-kernels/src/ops/gelu_erf.rs`'s `GeluErfFused::name()`; the `admit()` CALL SITE is `crates/jammi-encoders/src/activations.rs`'s `gelu_erf(x, training)`, reachable on every training-mode erf-GELU call for a head_dim-agnostic BERT-family MLP — `BertIntermediate::forward` (`bert.rs:296`) and `DistilBertFfn::forward` (`distilbert.rs:211`) both call it. |
-/// | `attention_block` | TwoArm | `attention_block_fused` | `attention_block_fused`, `crates/jammi-encoders/src/attention_cascade.rs:400` |
-/// | `dropout` | TwoArm | `lora_linear_fused` | `lora_linear_fused`, `crates/jammi-lora/src/lora_linear.rs:227` (`admit` call site's own counters accessor; the typed call site itself is `lora_linear.rs:1079`, passing `&LOW_RANK_RESIDUAL_LINEAR`) |
-/// | `low_rank_residual_linear` | TwoArm | `lora_linear_fused` | `lora_linear_fused`, `crates/jammi-lora/src/lora_linear.rs:227` (same call site as the row above) |
-/// | `cast_scale` | TwoArm | bf16 → `cast_scale_bf16_f32`, f16 → `cast_scale_f16_f32` | `cast_scale_bf16_f32`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1046`; `cast_scale_f16_f32`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1047` (both call sites are typed, `&CAST_SCALE` plus a `DtypeClass`, via `admit_cast_boundary`) |
-/// | `cast_add` | TwoArm | bf16 → `cast_add_bf16`, f16 → `cast_add_f16` | `cast_add_bf16`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1153`; `cast_add_f16`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1153` (both call sites are typed, `&CAST_ADD` plus a `DtypeClass`, via `admit_cast_boundary`) |
-/// | `adamw_step` | TwoArm | `adamw_step_fused` | `adamw_step_fused`, `crates/jammi-ai/src/fine_tune/adamw.rs:34` (`admit`, `crates/jammi-ai/src/fine_tune/adamw.rs:258`) |
-/// | `mem_efficient_attention` | Cascade | `mem_efficient_attention` | `mem_efficient_attention`, `crates/jammi-encoders/src/attention_cascade.rs:864` |
-/// | `rope_positions` | InternalSubkernel(`attention_block_flash`) | — | `rope_positions`, `crates/jammi-kernels/src/ops/flash_attention.rs:645` |
-/// | `scaled_cast_add` | InternalSubkernel(`low_rank_residual_linear`) | — | `ScaledCastAdd`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:953` (CPU), `ScaledCastAdd`, `crates/jammi-kernels/src/cuda/low_rank_residual_linear.rs:142` (CUDA) |
+/// | `layer_norm` | TwoArm | `layer_norm_fused` | `&LAYER_NORM`, `crates/jammi-encoders/src/layer_norm.rs` |
+/// | `rope` | TwoArm | `rope_fused` | `&ROPE`, `crates/jammi-encoders/src/modernbert.rs` (`RotaryEmbedding::apply_training`) |
+/// | `softmax` | TwoArm | `softmax_last_dim_fused` | `&SOFTMAX`, `crates/jammi-encoders/src/attention_cascade.rs` |
+/// | `geglu` | TwoArm | `geglu_fused` | `&GEGLU`, `crates/jammi-encoders/src/modernbert.rs` |
+/// | `gelu_erf` | TwoArm | `gelu_erf_fused` | `&GELU_ERF`, `crates/jammi-encoders/src/activations.rs`'s `gelu_erf(x, training)` (op name: `crates/jammi-kernels/src/ops/gelu_erf.rs`'s `GeluErfFused::name()`), reachable on every training-mode erf-GELU call for a head_dim-agnostic BERT-family MLP — `BertIntermediate::forward` and `DistilBertFfn::forward` both call it |
+/// | `attention_block` | TwoArm | `attention_block_fused` | `&ATTENTION_BLOCK`, `crates/jammi-encoders/src/attention_cascade.rs` |
+/// | `dropout` | TwoArm | `lora_linear_fused` | `&LOW_RANK_RESIDUAL_LINEAR`, `crates/jammi-lora/src/lora_linear.rs` (`LoraLinear::forward`; counters via `lora_linear_fused_counters`) |
+/// | `low_rank_residual_linear` | TwoArm | `lora_linear_fused` | same call site as the row above |
+/// | `cast_scale` | TwoArm | bf16 → `cast_scale_bf16_f32`, f16 → `cast_scale_f16_f32` | `&CAST_SCALE` plus a `DtypeClass`, via `admit_cast_boundary` in `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs`'s `bwd` |
+/// | `cast_add` | TwoArm | bf16 → `cast_add_bf16`, f16 → `cast_add_f16` | `&CAST_ADD` plus a `DtypeClass`, via `admit_cast_boundary` in the same `bwd` |
+/// | `adamw_step` | TwoArm | `adamw_step_fused` | `&ADAMW_STEP`, `crates/jammi-ai/src/fine_tune/adamw.rs` |
+/// | `mem_efficient_attention` | Cascade | `mem_efficient_attention` | `&MEM_EFFICIENT_ATTENTION`, `crates/jammi-encoders/src/attention_cascade.rs` |
+/// | `rope_positions` | InternalSubkernel(`attention_block_flash`) | — | `crates/jammi-kernels/src/ops/flash_attention.rs` (`FlashVarlenAttentionRope`) |
+/// | `scaled_cast_add` | InternalSubkernel(`low_rank_residual_linear`) | — | `ScaledCastAdd` in `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs` (CPU) and `crates/jammi-kernels/src/cuda/low_rank_residual_linear.rs` (CUDA) |
 ///
 /// **`adamw_step`: the optimizer's dtype DOMAIN is not a dtype CLASS.**
 /// `adamw_step_fused`'s own admission predicate requires
@@ -1955,7 +1884,7 @@ impl ProbedOp {
 /// `dtype_f32`), and `crates/jammi-kernels/src/ops/adamw_step.rs`'s module
 /// doc names `F32` as the op's only implemented dtype. It is tempting to
 /// encode that as `(DtypeClass::F32, "adamw_step_fused")`. **That would be
-/// wrong**, and wrong in exactly finding 2's own shape.
+/// wrong**: it would drop a dispatching op from a report.
 ///
 /// [`DtypeClass`] selects on the JOB'S BACKBONE dtype — it is what a caller
 /// resolves a registry key WITH (`crates/jammi-ai/src/fine_tune/worker.rs`'s
@@ -1976,27 +1905,25 @@ impl ProbedOp {
 /// failure would be reported as `holds: false` with the verbatim `dtype_f32`
 /// key, never as an absent row.
 ///
-/// **`attention_block_flash` IS a row** (#546, reversing this
-/// constant's own earlier "deliberately not a row" exclusion): every
-/// `admit`/`admit_cascade` call site now takes this typed `&'static ProbedOp`
-/// rather than a bare `&'static str`, so a cascade with no row would have no
-/// value any call site could pass — the exclusion could not survive that
-/// migration. This changes nothing about REPORTING: `probed_report_keys`
-/// (`crates/jammi-ai/src/fine_tune/worker.rs`) still filters to
+/// **`attention_block_flash` IS a row**: every `admit`/`admit_cascade` call
+/// site takes a typed `&'static ProbedOp` rather than a bare `&'static str`,
+/// so a cascade with no row would have no value any call site could pass.
+/// That does not make it a REPORTED op: `probed_report_keys`
+/// (`crates/jammi-ai/src/fine_tune/worker.rs`) filters to
 /// [`ProbedOpKind::TwoArm`] only, so a `Cascade` row (this one, and
-/// `mem_efficient_attention`) never populates the esc-075 report's `ops` map
-/// — the flash cascade still surfaces ONLY through that report's dedicated
-/// `flash` field, and `ci/release-feature-manifest.json` still declares it
-/// as `flash_compiled`/`flash_dtypes`, never as a `fused_op_admission`
-/// entry. Being a PROBED_OPS row and being an esc-075 `ops`-map entry are
-/// now two independent facts, not one merged into the other by omission.
+/// `mem_efficient_attention`) never populates the acceleration report's `ops`
+/// map — the flash cascade surfaces ONLY through that report's dedicated
+/// `flash` field, and `ci/release-feature-manifest.json` declares it as
+/// `flash_compiled`/`flash_dtypes`, never as a `fused_op_admission` entry.
+/// Being a PROBED_OPS row and being an `ops`-map entry are two independent
+/// facts.
 ///
-/// **Registry keys that exist but are deliberately NOT rows** (each read at
-/// the cited call site during this population, and excluded for a stated
-/// reason — an omission with no reason is how finding 2 happened):
+/// **Registry keys that exist but are deliberately NOT rows** (each excluded
+/// for a stated reason — an omission with no reason is how a key goes
+/// missing from a report):
 ///
-/// - `lora_dropout` (`crates/jammi-lora/src/lora_linear.rs:37`) and
-///   `lora_epilogue` (`:66`) — registry entries with NO `admit()` call site
+/// - `lora_dropout` and `lora_epilogue` (`crates/jammi-lora/src/lora_linear.rs`'s
+///   `lora_dropout_counters`/`lora_epilogue_counters`) — registry entries with NO `admit()` call site
 ///   anywhere: both are documented as "permanently `{fused: 0, eager: 0}`",
 ///   superseded by `lora_linear_fused`, and kept only for snapshot-schema
 ///   compatibility. A row for either would put a permanently-unmoving
@@ -2012,16 +1939,16 @@ impl ProbedOp {
 /// pass). They have no key for any probe to read a delta from; their
 /// execution is proven by the PARENT dispatching fused, and must never be
 /// claimed as an independent admission.
-/// #546's compiler-anchored binding: every one of these is the SAME value
+/// The compiler-anchored binding: every one of these is the SAME value
 /// [`PROBED_OPS`] is built from below, and every production `admit`/
 /// `admit_cascade` call site across `jammi-kernels`/`jammi-encoders`/
 /// `jammi-lora`/`jammi-ai` passes one of these named consts (never a bare
 /// string) — a NEW admission-gated call site therefore either references an
 /// EXISTING row (correctly, since the row already exists) or has no const to
 /// reference at all, which does not compile until a new row (and const) is
-/// added here. That is the completeness proof `PROBED_OPS`'s own doc used to
-/// call merely "hand-populated": the table and the call sites are now the
-/// SAME memory, not two things a reviewer keeps in sync by re-reading source.
+/// added here. That is the completeness proof: the table and the call sites
+/// are the SAME memory, not two things a reviewer keeps in sync by
+/// re-reading source.
 pub const LAYER_NORM: ProbedOp = ProbedOp::new(
     "layer_norm",
     ProbedOpKind::TwoArm,
@@ -2055,7 +1982,7 @@ pub const ATTENTION_BLOCK: ProbedOp = ProbedOp::new(
 /// The `dropout` REPORT row — same dispatch decision as
 /// [`LOW_RANK_RESIDUAL_LINEAR`] (both are `lora_linear_fused`, one dispatch,
 /// two report keys per this table's own row-provenance doc). No call site
-/// admits under this const directly; it exists for the esc-075 report's
+/// admits under this const directly; it exists for the acceleration report's
 /// `ops.dropout` key.
 pub const DROPOUT: ProbedOp = ProbedOp::new(
     "dropout",
@@ -2100,7 +2027,7 @@ pub const MEM_EFFICIENT_ATTENTION: ProbedOp = ProbedOp::new(
     &[(DtypeClass::Any, "mem_efficient_attention")],
 );
 /// See this constant's sibling doc paragraph above ("`attention_block_flash`
-/// IS a row") for why this row exists at all (#546).
+/// IS a row") for why this row exists at all.
 pub const ATTENTION_BLOCK_FLASH: ProbedOp = ProbedOp::new(
     "attention_block_flash",
     ProbedOpKind::Cascade,
@@ -2145,23 +2072,20 @@ pub fn probed_op(report_key: &str) -> Option<&'static ProbedOp> {
 }
 
 // =============================================================================
-// #546 K1: the CLOSED enum identity (third attempt, by construction)
+// The CLOSED enum identity
 // =============================================================================
 //
-// The first two attempts (`scratchpad/issue-546.md`'s 2026-09-17 comment;
-// this crate's own git history) tried to prove "no forged `ProbedOp` folds
-// into a durable hash" with an ENUMERATING oracle over an OPEN type: a `syn`
-// scan of every construction shape in this crate. That oracle was blocked
-// three times with executed bypasses (UFCS, macro invocations, `use ... as`
-// aliases, a mutated copy behind a non-`Type::Path` return type, and the
-// honest residual — a `transmute`/raw-pointer cast a syntax-only scan cannot
-// resolve). [`ProbedOpId`] answers the closing question instead: make the
-// determinant BY CONSTRUCTION, so the fold never takes a [`ProbedOp`] value
-// at all — there is nothing for a forged row to enter.
+// "No forged `ProbedOp` folds into a durable hash" cannot be proven by an
+// ENUMERATING oracle over an OPEN type: a `syn` scan of construction shapes is
+// bypassed by UFCS, macro invocations, `use ... as` aliases, a mutated copy
+// behind a non-`Type::Path` return type, and ultimately a
+// `transmute`/raw-pointer cast no syntax-only scan can resolve. [`ProbedOpId`]
+// makes the determinant closed BY CONSTRUCTION instead: the fold never takes
+// a [`ProbedOp`] value at all, so there is nothing for a forged row to enter.
 
 /// The CLOSED set of admission-relevant ops — one variant per [`PROBED_OPS`]
-/// row. This is the identity a durable, hash-affecting fold reads (K1/K2),
-/// replacing the open `PROBED_OPS` table/string-keyed enumeration as the
+/// row. This is the identity a durable, hash-affecting fold reads, rather
+/// than the open `PROBED_OPS` table/string-keyed enumeration, as the
 /// enumeration boundary for anything that must be provably COMPLETE over
 /// every admission-gated op this crate knows about.
 ///
@@ -2176,7 +2100,7 @@ pub fn probed_op(report_key: &str) -> Option<&'static ProbedOp> {
 /// here without adding its arm to [`Self::row`] — `cargo build` refuses with
 /// `error[E0004]: non-exhaustive patterns` (a `match` with no wildcard arm),
 /// not a runtime gap an oracle has to notice. `probed_op_id_variants_cover_every_probed_ops_row`
-/// (this module's own tests) is the executed proof that today's 15 variants
+/// (this module's own tests) is the executed proof that the 15 variants
 /// and [`PROBED_OPS`]'s 15 rows name the exact same set — not merely that
 /// `row()` compiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, strum::VariantArray)]
@@ -2208,8 +2132,8 @@ impl ProbedOpId {
     /// `jammi_db::catalog::status::JobStatus::ALL` already use. Declaration
     /// order matches [`Ord`]'s derived order (both come from the same
     /// variant list), so folding [`Self::ALL`] in order is the "sorted by
-    /// variant order" the profile string (K2) needs — never a `HashMap`/
-    /// `HashSet` iteration order (family J).
+    /// variant order" the profile string needs — never a `HashMap`/
+    /// `HashSet` iteration order.
     pub const ALL: &'static [Self] = <Self as VariantArray>::VARIANTS;
 
     /// This variant's [`PROBED_OPS`] row.
@@ -2242,17 +2166,18 @@ impl ProbedOpId {
 }
 
 // =============================================================================
-// #546 K2' (pressure-round fold, 2026-09-17: the observed-outcome K2 above
-// was DELETED, not demoted — see `ProbedOpId`'s own doc for the executed
-// reasons: `Catalog::probe_model_by_definition` computes a `DefinitionHash`
-// BEFORE the work to look up whether it already exists, so a profile
-// knowable only AFTER training makes that lookup impossible for the very
-// run it would describe; the counter registry is also process-global and
-// `counters_for(..).record(..)` is `pub`, so an observed-outcome fold was
-// never sealed the way K1's row identity is).
+// The kernel-admission profile: ex ante facts only
 // =============================================================================
 //
-// K2' folds only EX ANTE facts — known before training runs, and every one
+// The profile never folds OBSERVED dispatch outcomes:
+// `Catalog::probe_model_by_definition` computes a `DefinitionHash` BEFORE the
+// work, to look up whether it already exists, so a profile knowable only
+// AFTER training would make that lookup impossible for the very run it
+// describes; and the counter registry is process-global with a `pub`
+// `counters_for(..).record(..)`, so an observed-outcome fold could never be
+// sealed the way [`ProbedOpId`]'s row identity is.
+//
+// The profile folds only EX ANTE facts — known before training runs, and every one
 // BY CONSTRUCTION: [`BUILD_FACTS`] (this crate's own compiled feature set),
 // [`admission_mode`], the caller's disabled-op set, and the job's
 // [`DtypeClass`]. None of these require observing a single `admit` call.
@@ -2278,7 +2203,7 @@ pub const BUILD_FACTS: &[(&str, bool)] = &[
     ("metal", cfg!(feature = "metal")),
 ];
 
-/// Renders the #546 K2' canonical kernel-admission profile string — the
+/// Renders the canonical kernel-admission profile string — the
 /// value `jammi_db::store::manifest::MaterializationEnv::with_kernel_admission_profile`
 /// receives (`jammi-db` cannot depend on this crate, so the caller —
 /// `jammi-ai`'s fine-tune worker — calls this and hands the resulting
@@ -2290,7 +2215,7 @@ pub const BUILD_FACTS: &[(&str, bool)] = &[
 /// value `ops::low_rank_residual_linear::admit_cast_boundary`'s
 /// `registry_keys_for(dtype)` resolves a real dispatch against, and the
 /// SAME value `jammi-ai`'s own `probe_acceleration`/`dtype_class_of`
-/// resolves the esc-075 report's dtype class from. It is NEVER a loaded
+/// resolves the acceleration report's dtype class from. It is NEVER a loaded
 /// model's own `compute_precision()` (the base model's ON-DISK weight
 /// dtype) — a DIFFERENT axis entirely: `jammi-lora` trains its adapters at
 /// single precision (f32) regardless of `backbone_dtype`, and the base model
@@ -2298,8 +2223,8 @@ pub const BUILD_FACTS: &[(&str, bool)] = &[
 /// to bf16/f16 — passing the loaded model's own precision here instead
 /// makes an f16-backbone CPU job render the f32 dtype class: every
 /// `cast_scale`/`cast_add` line then reads `n/a`, and
-/// `JAMMI_KERNELS_DISABLE=cast_scale_f16_f32` never moved that job's
-/// `DefinitionHash` at all).
+/// `JAMMI_KERNELS_DISABLE=cast_scale_f16_f32` never moves that job's
+/// `DefinitionHash` at all.
 ///
 /// # Panics
 /// If `dtype` is [`DtypeClass::Any`] — that variant is a TABLE-ENTRY class
@@ -2307,7 +2232,7 @@ pub const BUILD_FACTS: &[(&str, bool)] = &[
 /// JOB's own dtype: no real job ever declares `backbone_dtype: Any`, and a
 /// caller with no concrete dtype in hand must not silently render a
 /// profile at all (every `n/a`/`enabled` line would be a confident-wrong
-/// guess, family D) — it must resolve a real dtype first.
+/// guess) — it must resolve a real dtype first.
 ///
 /// One line per [`ProbedOpId`] variant, in [`ProbedOpId::ALL`]'s
 /// declaration order: `report_key=<disabled|enabled|n/a>`. The predicate
@@ -2315,14 +2240,13 @@ pub const BUILD_FACTS: &[(&str, bool)] = &[
 /// at `dtype`, never a dtype-blind approximation: `op.registry_keys_for(dtype).next()`
 /// — the SAME resolution `ops::low_rank_residual_linear::admit_cast_boundary`
 /// uses to pick the one real registry key `admit_by_key`/`op_is_disabled`
-/// then check `disabled` against (closing round audit finding: an earlier
-/// revision checked [`ProbedOp::all_registry_keys`] — EVERY dtype's key —
-/// which collapsed a real determinant, since `disabled=[cast_scale_bf16_f32]`
-/// and `disabled=[cast_scale_f16_f32]` rendered byte-identically at
-/// `dtype=Bf16` despite disabling DIFFERENT real dispatches, and a build
-/// with `cast_scale_bf16_f32` disabled moved the rendered string — and
-/// therefore the published `DefinitionHash` — even for an f32 job that
-/// can never dispatch that key at all):
+/// then check `disabled` against. Checking [`ProbedOp::all_registry_keys`]
+/// (EVERY dtype's key) instead would collapse a real determinant —
+/// `disabled=[cast_scale_bf16_f32]` and `disabled=[cast_scale_f16_f32]`
+/// would render byte-identically at `dtype=Bf16` despite disabling
+/// DIFFERENT real dispatches — and disabling `cast_scale_bf16_f32` would
+/// move the rendered string, and therefore the published `DefinitionHash`,
+/// even for an f32 job that can never dispatch that key:
 ///
 /// - **`n/a`**: this row has NO registry key for `dtype`
 ///   (`registry_keys_for(dtype).next()` is `None`) — [`CAST_SCALE`]/
@@ -2355,11 +2279,11 @@ pub const BUILD_FACTS: &[(&str, bool)] = &[
 /// **This function's signature takes no [`ProbedOp`] value** — only
 /// `dtype`, `mode`, and `disabled` (plain data). The profile is a total
 /// function of [`ProbedOpId::ALL`]'s closed enumeration, never of a
-/// `ProbedOp` a caller happens to be holding (K1): there is no expression
+/// `ProbedOp` a caller happens to be holding: there is no expression
 /// in this fold that could ever be handed a same-crate-forged row, even if
 /// one existed.
 ///
-/// Deterministic for fixed inputs (family J): variant order and
+/// Deterministic for fixed inputs: variant order and
 /// [`BUILD_FACTS`] order are compile-time fixed, and `dtype`/`mode`/
 /// `disabled` are plain, caller-supplied data — the same three arguments
 /// always render the same string, regardless of process history or any
@@ -2445,61 +2369,24 @@ mod tests {
         assert!(!ComputeCapability::new(0, 0).meets_minimum());
     }
 
-    /// Panics if `JAMMI_REQUIRE_FLASH` is set, since a caller in that lane
-    /// must not be allowed to silently skip the flash-arm assertions.
-    #[cfg(test)]
-    fn require_flash_compiled_or_skip(test_name: &str) {
-        if std::env::var_os("JAMMI_REQUIRE_FLASH").is_some() {
-            panic!(
-                "{test_name}: JAMMI_REQUIRE_FLASH is set but this build's jammi-kernels was \
-                 compiled without the flash-attn feature (FLASH_COMPILED=false) -- this lane \
-                 must run the real flash arm, not skip it"
-            );
-        }
+    /// Without `flash-attn` no flash kernel is compiled, so no arch is built.
+    #[cfg(not(feature = "flash-attn"))]
+    #[test]
+    fn flash_built_arches_is_empty_without_flash_attn() {
+        let arches = flash_built_arches();
+        assert!(
+            arches.is_empty(),
+            "flash-attn not compiled: flash_built_arches() must be empty, not {arches:?}"
+        );
     }
 
-    /// The `flash_built_arches()` ACCESSOR's own behavior under this crate's
-    /// default (no `flash-attn`) test build: `arches.is_empty()` here proves
-    /// only that the `FLASH_COMPILED` gate degrades correctly (M3 plan v2
-    /// delta 3) — it does NOT, by itself, prove `GENCODE_ARCHES` still pins
-    /// the intended sm80/86/89/90 set, because the early `return` below
-    /// skips the pinned-set assertion entirely whenever this crate's own
-    /// `flash-attn` feature is off (every hermetic default-feature lane,
-    /// which is every lane this agent's own local run and most of CI take).
-    /// A round-2 audit (mutant: `GENCODE_ARCHES` rewritten to
-    /// `sm_70/sm_80/sm_86` — a REGRESSION, dropping a pre-Ampere floor
-    /// violation in AND dropping 89/90) proved this test alone stayed GREEN
-    /// against that mutant in the hermetic lane: an earlier revision of
-    /// this doc comment claimed this test was what pins the set "in every
-    /// hermetic CI/laptop run" — that claim was WRONG. The actual hermetic
-    /// pin, which DOES run (and DOES go red on that exact mutant) in every
-    /// feature configuration including this crate's default build, is
-    /// [`gencode_smss_env_var_matches_the_pinned_build_rs_set`] below — see
-    /// that test's own doc for why `env!()` makes it possible.
-    ///
-    /// Panics rather than silently letting this test skip its
-    /// exact-pinned-arch-set assertions when `JAMMI_REQUIRE_FLASH` is set
-    /// but this build was not compiled with the `flash-attn` feature
-    /// (`FLASH_COMPILED == false`) — mirrors `jammi_encoders::modernbert`'s
-    /// own `flash_compiled_or_skip` gate (same env var, same "this lane
-    /// must run the real flash arm, not skip it" rationale), narrowed here
-    /// to the feature-compilation check alone via
-    /// [`require_flash_compiled_or_skip`]: this test has no device to
-    /// probe, `flash_built_arches()` is a pure compile-time accessor, so
-    /// there is no arch-membership half to check.
+    /// With `flash-attn`, the built set is exactly sm80/86/89/90, every one of
+    /// them Ampere-or-newer. [`gencode_smss_env_var_matches_the_pinned_build_rs_set`]
+    /// pins the same set in every build.
+    #[cfg(feature = "flash-attn")]
     #[test]
-    fn flash_built_arches_degrades_to_empty_without_flash_compiled() {
+    fn flash_built_arches_is_the_pinned_set_with_flash_attn() {
         let arches = flash_built_arches();
-        if !FLASH_COMPILED {
-            assert!(
-                arches.is_empty(),
-                "flash-attn not compiled: flash_built_arches() must be empty, not {arches:?}"
-            );
-            require_flash_compiled_or_skip(
-                "flash_built_arches_degrades_to_empty_without_flash_compiled",
-            );
-            return;
-        }
         let want = [
             ComputeCapability::new(8, 0),
             ComputeCapability::new(8, 6),
@@ -2513,15 +2400,10 @@ mod tests {
                 "{arch:?} must meet MIN_CUDA_COMPUTE_CAP -- every compiled arch is Ampere-or-newer"
             );
         }
-        assert_eq!(
-            arches.iter().min().copied(),
-            Some(ComputeCapability::new(8, 0)),
-            "sm80 is the true floor of the compiled set"
-        );
     }
 
-    /// THE hermetic pin on `build.rs::GENCODE_ARCHES` — round-2 audit
-    /// finding F1's fix. `env!("JAMMI_FLASH_GENCODE_SMS")` reads the REAL
+    /// THE hermetic pin on `build.rs::GENCODE_ARCHES`.
+    /// `env!("JAMMI_FLASH_GENCODE_SMS")` reads the REAL
     /// value `build.rs`'s `main()` emitted for THIS crate's OWN
     /// compilation, and `main()` emits it UNCONDITIONALLY (every feature
     /// configuration, not only under `flash-attn` — see that emission's
@@ -2530,13 +2412,11 @@ mod tests {
     /// [`flash_built_arches_degrades_to_empty_without_flash_compiled`]'s
     /// early-return above (which the `flash_built_arches()` ACCESSOR's own
     /// `FLASH_COMPILED` gate short-circuits before ever comparing against
-    /// `want` in that same lane). Verified against the audit's own mutant
-    /// (`GENCODE_ARCHES` rewritten to a pre-Ampere-inclusive,
-    /// 89/90-dropping `sm_70/sm_80/sm_86` set): this test goes RED against
-    /// that mutant in a scratch copy — the ONLY one of the three sites the
-    /// audit named (this test, `build_rs_unit.rs`'s parse tests,
-    /// `flash/mod.rs`'s pin) that actually catches it in a lane this repo's
-    /// hermetic gate runs.
+    /// `want` in that same lane). Rewriting `GENCODE_ARCHES` to a
+    /// pre-Ampere-inclusive, 89/90-dropping `sm_70/sm_80/sm_86` set fails
+    /// this test; of the three pins (this test, `build_rs_unit.rs`'s parse
+    /// tests, `flash/mod.rs`'s pin) it is the one that catches that in the
+    /// hermetic lane.
     #[test]
     fn gencode_smss_env_var_matches_the_pinned_build_rs_set() {
         assert_eq!(env!("JAMMI_FLASH_GENCODE_SMS"), "80,86,89,90");
@@ -2561,7 +2441,7 @@ mod tests {
         );
     }
 
-    /// Round-2 audit finding C's own hermetic pin: reads
+    /// The hermetic pin on `build.rs::VALIDATED_SMS`: reads
     /// `env!("JAMMI_FLASH_VALIDATED_SMS")` directly (the value
     /// `build.rs::VALIDATED_SMS` produces via `main`'s unconditional
     /// emission — see [`flash_validated_arches`]'s own doc), so this runs,
@@ -2574,19 +2454,15 @@ mod tests {
     ///    validated arch that was somehow never even compiled would be an
     ///    impossible, self-contradictory state.
     /// 2. Validated matches its OWN pinned value exactly.
-    /// 3. TODAY's additional invariant: validated == compiled (every
-    ///    currently-compiled arch also has a green pod parity leg, per
-    ///    the lead's own pod-run confirmation for this PR's four arches).
-    ///    This is NOT a permanent guarantee — a future `-gencode` addition
-    ///    to `GENCODE_ARCHES` legitimately breaks it (the arch stays
-    ///    compiled-but-unvalidated until its OWN artifact lands) — but
-    ///    it IS what makes the auditor's own `sm_100` mutant (add a
-    ///    `-gencode` entry, update `GENCODE_ARCHES`'s own pin, but do
-    ///    NOT touch `VALIDATED_SMS`) go RED here: `compiled` grows to 5
-    ///    entries, `validated` stays at 4, and property 3's equality
-    ///    assertion fails — proving admission cannot silently follow a
-    ///    `GENCODE_ARCHES`-only edit anymore. Verified directly against
-    ///    the auditor's exact mutant in a scratch copy (see hand-off).
+    /// 3. validated == compiled for the current set (every compiled arch
+    ///    has a green GPU parity leg; see `VENDORED.md`'s per-arch table).
+    ///    A new `-gencode` addition to `GENCODE_ARCHES` legitimately breaks
+    ///    this (the arch stays compiled-but-unvalidated until its own
+    ///    artifact is committed), and that is the point: adding an
+    ///    `sm_100` entry and updating `GENCODE_ARCHES`'s own pin without
+    ///    touching `VALIDATED_SMS` grows `compiled` to 5 entries while
+    ///    `validated` stays at 4, so this equality fails — admission cannot
+    ///    silently follow a `GENCODE_ARCHES`-only edit.
     #[test]
     fn flash_validated_arches_env_var_is_a_pinned_subset_of_compiled() {
         assert_eq!(env!("JAMMI_FLASH_VALIDATED_SMS"), "80,86,89,90");
@@ -2608,11 +2484,10 @@ mod tests {
         }
         assert_eq!(
             compiled, validated,
-            "TODAY's invariant: every currently compiled arch is ALSO validated (per the lead's \
-             own pod-run confirmation for sm80/86/89/90). A compiled arch with no matching \
-             VALIDATED_SMS entry means build.rs::GENCODE_ARCHES grew without its own validation \
-             entry landing in the SAME commit -- see build.rs::VALIDATED_SMS's own doc for the \
-             M3 plan D4 obligation this enforces (round-2 audit finding C)"
+            "every compiled arch must also be validated (sm80/86/89/90 each have a green GPU \
+             parity leg). A compiled arch with no matching VALIDATED_SMS entry means \
+             build.rs::GENCODE_ARCHES grew without its own validation entry in the SAME commit \
+             -- see build.rs::VALIDATED_SMS's own doc for the obligation this enforces"
         );
     }
 
@@ -2712,14 +2587,12 @@ mod tests {
     /// this drives BOTH `admit_inner` arms itself (through a dedicated,
     /// test-unique op name, so this assertion is independent of whichever
     /// other test happens to run first/concurrently) and asserts the two
-    /// recorded messages differ. Replaces
-    /// `disabled_path_warn_message_is_distinct_from_a_genuine_predicate_failure`
-    /// (removed): that test proved the same property via a thread-local
-    /// `tracing::subscriber::set_default` guard racing `tracing`'s
-    /// process-global callsite `Interest` cache against every sibling test
-    /// reaching the same callsite concurrently — flaky under
-    /// `cargo test --test-threads=N` (8/200 runs observed failing in the
-    /// phase-4 audit). `fallback_warnings_emitted()` has no such race.
+    /// recorded messages differ. It reads `fallback_warnings_emitted()`
+    /// rather than a thread-local `tracing::subscriber::set_default` guard:
+    /// the guard races `tracing`'s process-global callsite `Interest` cache
+    /// against every sibling test reaching the same callsite concurrently,
+    /// and fails intermittently under `cargo test --test-threads=N` (8 of
+    /// 200 runs). `fallback_warnings_emitted()` has no such race.
     #[test]
     fn fallback_warning_messages_are_distinct_between_the_disabled_and_predicate_failure_paths() {
         let op = "fallback_warning_distinctness_op";
@@ -2814,57 +2687,9 @@ mod tests {
         assert!(!FLASH_COMPILED || CUDA_COMPILED);
     }
 
-    /// Acquire a Metal device for [`device_is_supported_rejects_metal`]'s
-    /// own `metal`-feature-only leg, or `None` to skip — unless
-    /// `JAMMI_REQUIRE_METAL` is set, in which case a device-acquisition
-    /// failure PANICS. Wraps `Device::new_metal(0)` in
-    /// `std::panic::catch_unwind`, mirroring `tests/metal_parity.rs`'s own
-    /// `metal_device_or_skip`: on at least one real GH `macos-14` runner
-    /// `Device::new_metal(0)` does not merely return `Err` on a
-    /// missing/broken device — an `objc2` class lookup inside
-    /// candle-metal-kernels' `residency_set.rs:18`
-    /// (`MTLResidencySetDescriptor`) can PANIC instead, a probe-time
-    /// failure mode a bare `Result` cannot model. Catching that panic here
-    /// is sound for the same reason `tests/metal_parity.rs`'s own doc
-    /// gives: the probe owns no lock and mutates no shared state before
-    /// failing, so unwinding out of it leaves nothing poisoned to clean
-    /// up. Both failure shapes (a returned `Err`, or a caught panic) fold
-    /// into the same skip/require decision below.
-    #[cfg(all(test, feature = "metal"))]
-    fn metal_device_or_skip(test_name: &str) -> Option<Device> {
-        let outcome: std::result::Result<Device, String> =
-            match std::panic::catch_unwind(|| Device::new_metal(0)) {
-                Ok(Ok(d)) => Ok(d),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(payload) => {
-                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                        (*s).to_string()
-                    } else if let Some(s) = payload.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "<non-string panic payload>".to_string()
-                    };
-                    Err(format!("Device::new_metal(0) panicked: {msg}"))
-                }
-            };
-        match outcome {
-            Ok(d) => Some(d),
-            Err(msg) => {
-                if std::env::var_os("JAMMI_REQUIRE_METAL").is_some() {
-                    panic!(
-                        "{test_name}: JAMMI_REQUIRE_METAL is set but no Metal device is \
-                         available: {msg}"
-                    );
-                }
-                eprintln!(
-                    "{test_name}: no Metal device available in this build/host -- skipping the \
-                     Metal leg"
-                );
-                None
-            }
-        }
-    }
-
+    // A build with `metal` on can only construct a real Metal device, which
+    // needs a Metal host; without `metal`, candle's unit `MetalDevice` stands in.
+    #[cfg(any(not(feature = "metal"), feature = "live-metal-tests"))]
     #[test]
     fn device_is_supported_rejects_metal() {
         // `device_is_supported` must reject `Device::Metal` STRUCTURALLY —
@@ -2872,17 +2697,15 @@ mod tests {
         // own body (see its doc: this crate's `apply2`/`apply3` sites have
         // no `metal_fwd`, regardless of whether candle-core itself was
         // compiled with Metal support). This crate's own `metal` feature
-        // (added for issue #433, gating ONLY `tests/metal_parity.rs` and
-        // `ops::DropoutFused`'s UNARY `metal_fwd`) changes what
+        // (gating ONLY the Metal tests and `ops::DropoutFused`'s UNARY
+        // `metal_fwd`) changes what
         // `candle_core::MetalDevice` even IS at compile time — a real,
         // non-unit struct when active, the dummy unit struct otherwise —
         // so constructing a value of it (not `device_is_supported` itself)
         // is the one place that legitimately needs a `cfg` branch. Mirrors
         // `jammi_encoders::layer_norm::tests::device_is_supported_rejects_metal`.
         #[cfg(feature = "metal")]
-        let Some(metal) = metal_device_or_skip("device_is_supported_rejects_metal") else {
-            return;
-        };
+        let metal = jammi_test_resources::metal_device();
         #[cfg(not(feature = "metal"))]
         let metal = Device::Metal(candle_core::MetalDevice);
         assert!(!device_is_supported(&metal));
@@ -2890,25 +2713,29 @@ mod tests {
         assert!(device_is_supported(&Device::Cpu));
     }
 
+    /// `admission_mode` memoizes into a process-wide `OnceLock`, so the default
+    /// is observed in a fresh process with `JAMMI_KERNELS_STRICT` removed.
     #[test]
     fn admission_mode_defaults_to_fallback_without_the_env_var() {
-        // `admission_mode` memoizes into a process-wide `OnceLock`, so this
-        // only asserts the DEFAULT value observed by a fresh process (no
-        // other test in this binary sets `JAMMI_KERNELS_STRICT` before this
-        // one runs — `cargo test`'s default per-test-thread model still
-        // shares one process-wide env and one `OnceLock`, so this is a
-        // documentation-level assertion about the default, not a hermetic
-        // unit test of the env-var branch itself).
-        if std::env::var_os("JAMMI_KERNELS_STRICT").is_none() {
-            assert_eq!(admission_mode(), AdmissionMode::Fallback);
-        }
+        let mut child = jammi_test_resources::child_test(
+            "admission::tests::admission_mode_default_child_process_body",
+        );
+        child.env_remove("JAMMI_KERNELS_STRICT");
+        jammi_test_resources::child_test_stdout(&mut child);
     }
 
-    /// Round-2 mutants triage (`cargo mutants`: `replace admission_mode ->
-    /// AdmissionMode with Default::default()` MISSED): nothing in this
-    /// crate OR `jammi-bench`'s real-CLI tests previously exercised
-    /// `admission_mode()` actually reading `Strict` from a genuine
-    /// `JAMMI_KERNELS_STRICT` env var — `jammi_encoders::layer_norm`'s
+    /// The body [`admission_mode_defaults_to_fallback_without_the_env_var`] runs in its own process.
+    #[test]
+    #[ignore = "child process of admission_mode_defaults_to_fallback_without_the_env_var"]
+    fn admission_mode_default_child_process_body() {
+        assert_eq!(admission_mode(), AdmissionMode::Fallback);
+    }
+
+    /// Kills the `cargo mutants` mutant `replace admission_mode ->
+    /// AdmissionMode with Default::default()`: nothing else in this crate
+    /// OR `jammi-bench`'s real-CLI tests exercises `admission_mode()`
+    /// actually reading `Strict` from a genuine `JAMMI_KERNELS_STRICT` env
+    /// var — `jammi_encoders::layer_norm`'s
     /// `strict_mode_errors_instead_of_falling_back_on_a_failed_predicate`
     /// explicitly bypasses this function (calls `admit` with a literal
     /// `AdmissionMode::Strict` instead, citing the exact same `OnceLock`
@@ -2917,7 +2744,7 @@ mod tests {
     /// Strict from Fallback (disable-wins-over-Strict cells aside). A
     /// mutant that made `admission_mode()` always return `Fallback` would
     /// silently turn Strict mode into a no-op everywhere in a real binary
-    /// and nothing would have caught it.
+    /// and nothing else would catch it.
     ///
     /// Spawns the ALREADY-COMPILED test binary as a fresh CHILD process
     /// with the env var set and `--exact` targeting ONLY
@@ -2927,52 +2754,21 @@ mod tests {
     /// `JAMMI_KERNELS_DISABLE`.
     #[test]
     fn admission_mode_reads_strict_from_the_real_env_var_in_a_fresh_process() {
-        let exe = std::env::current_exe().expect("test binary path");
-        let output = std::process::Command::new(exe)
-            .args([
-                "admission::tests::admission_mode_child_process_body",
-                "--exact",
-                "--nocapture",
-            ])
-            .env("JAMMI_KERNELS_STRICT", "1")
-            .env("ADMISSION_MODE_CHILD", "1")
-            .output()
-            .expect("spawn child test binary");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "child process assertion failed: stdout={stdout}\nstderr={}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        // Non-vacuity: `cargo test`'s libtest harness exits 0 on a filter
-        // that matches ZERO tests (a typo'd `--exact` path, or a module
-        // rename that silently stops matching, would make this test
-        // "pass" having run NOTHING). Asserting the child actually ran and
-        // passed exactly the one test it was told to run is what makes
-        // `output.status.success()` alone mean what this test claims it
-        // means.
-        assert!(
-            stdout.contains("1 passed"),
-            "the child process must have actually run (and passed) exactly one test — \
-             stdout={stdout}"
-        );
+        let mut child =
+            jammi_test_resources::child_test("admission::tests::admission_mode_child_process_body");
+        child.env("JAMMI_KERNELS_STRICT", "1");
+        jammi_test_resources::child_test_stdout(&mut child);
     }
 
-    /// Only meaningful inside the child process
-    /// [`admission_mode_reads_strict_from_the_real_env_var_in_a_fresh_process`]
-    /// spawns (guarded on `ADMISSION_MODE_CHILD`, the same pattern
-    /// `admission_mode_defaults_to_fallback_without_the_env_var` uses for
-    /// the unset case) — a no-op pass when run directly by the ordinary
-    /// test harness.
+    /// The body [`admission_mode_reads_strict_from_the_real_env_var_in_a_fresh_process`] runs in its own process.
     #[test]
+    #[ignore = "child process of admission_mode_reads_strict_from_the_real_env_var_in_a_fresh_process"]
     fn admission_mode_child_process_body() {
-        if std::env::var_os("ADMISSION_MODE_CHILD").is_some() {
-            assert_eq!(
-                admission_mode(),
-                AdmissionMode::Strict,
-                "JAMMI_KERNELS_STRICT=1 in a fresh process must read as Strict"
-            );
-        }
+        assert_eq!(
+            admission_mode(),
+            AdmissionMode::Strict,
+            "JAMMI_KERNELS_STRICT=1 in a fresh process must read as Strict"
+        );
     }
 
     #[test]
@@ -3026,7 +2822,7 @@ mod tests {
         assert_eq!(b.snapshot(), DispatchSnapshot { fused: 0, eager: 1 });
     }
 
-    // ---- JAMMI_KERNELS_DISABLE: the contract K-aux lattice ----------------
+    // ---- JAMMI_KERNELS_DISABLE: the disable lattice ------------------------
     //
     // Cells 1-8 drive `admit_inner` directly with a literal `disabled: bool`
     // (see `admit_inner`'s and `op_is_disabled`'s docs for why: this makes
@@ -3313,8 +3109,8 @@ mod tests {
         // op, so with `disabled_ops()` empty (the unset/empty-string case
         // `parse_disable_list`'s tests below cover directly), the real,
         // process-wide `admit`'s behaviour is `admit_inner` with
-        // `disabled = false` for every call — EXACTLY this function's
-        // pre-K-aux two-outcome shape. Guarded the same way
+        // `disabled = false` for every call — EXACTLY the two-outcome
+        // decision without a disable list. Guarded the same way
         // `admission_mode_defaults_to_fallback_without_the_env_var` is:
         // only meaningful if the real env var happens to be unset for
         // this test run (see `op_is_disabled`'s doc for why an in-process
@@ -3657,10 +3453,9 @@ mod tests {
         assert_eq!(counters.snapshot().fused, 1);
     }
 
-    /// Audit round, item 3: `admit_cascade`'s decline path used to be a
-    /// counter-increment-only channel — `probe_capture_reason_for` had no
-    /// entry for a cascade op at all, however armed the window was.
-    /// Mirrors `armed_window_records_a_miss_even_when_the_log_once_dedupe_
+    /// `admit_cascade`'s decline path records into the probe window, not
+    /// only its counters, so `probe_capture_reason_for` has an entry for a
+    /// cascade op. Mirrors `armed_window_records_a_miss_even_when_the_log_once_dedupe_
     /// suppresses_it`'s shape for `admit_inner`, one level up: window OPEN
     /// -> a `DomainMiss` decline -> the reason is readable afterward;
     /// window CLOSED -> a later decline records nowhere (the same "hot
@@ -3891,10 +3686,10 @@ mod tests {
     }
 
     /// A report key must be dtype-NEUTRAL and unique. The `!key.ends_with`
-    /// checks are the direct regression guard on finding 2's root cause: the
-    /// shipped table spelled a bf16-specific REGISTRY key (`cast_add_bf16`)
-    /// into the report's dtype-neutral vocabulary, which is what made the f16
-    /// job's report structurally unable to name its own cast epilogue.
+    /// checks guard against spelling a bf16-specific REGISTRY key (e.g.
+    /// `cast_add_bf16`) into the report's dtype-neutral vocabulary, which
+    /// makes an f16 job's report structurally unable to name its own cast
+    /// epilogue.
     #[test]
     fn probed_ops_report_keys_are_dtype_neutral_and_unique() {
         let mut seen = HashSet::new();
@@ -3908,7 +3703,7 @@ mod tests {
                 assert!(
                     !op.report_key.ends_with(suffix),
                     "PROBED_OPS report key {:?} carries a dtype suffix {suffix:?} — report keys \
-                     are dtype-neutral (campaign #446 finding 2); the dtype lives in the \
+                     are dtype-neutral; the dtype lives in the \
                      `registry` column, resolved at probe time",
                     op.report_key
                 );
@@ -4048,9 +3843,8 @@ mod tests {
     /// An armed window records the miss AND survives the log-once dedupe: the
     /// SAME `(op, predicate)` pair captured twice, in two successive windows,
     /// even though `fallback_warnings_emitted()` records it only the first
-    /// time. This is finding 3's whole mechanism in one test — the second
-    /// window is exactly the case a before/after diff of the warn list
-    /// reports as empty.
+    /// time. The second window is exactly the case a before/after diff of
+    /// the warn list reports as empty.
     #[test]
     fn armed_window_records_a_miss_even_when_the_log_once_dedupe_suppresses_it() {
         let counters = DispatchCounters::new();
@@ -4105,7 +3899,7 @@ mod tests {
 
     /// Distinct pairs only, in first-occurrence order: the sink is bounded by
     /// the workspace's finite `(op, predicate)` cardinality, not by the
-    /// caller-controlled number of miss EVENTS (family E). Ten misses over
+    /// caller-controlled number of miss EVENTS. Ten misses over
     /// two pairs yield two entries.
     #[test]
     fn armed_window_deduplicates_pairs_and_keeps_first_occurrence_order() {
@@ -4285,13 +4079,13 @@ mod tests {
         .expect("the properly nested shape must not panic");
     }
 
-    /// Campaign #446 round-1 advisory: a window finished OUT OF ORDER (an
+    /// A window finished OUT OF ORDER (an
     /// outer guard finished while an inner one is still armed) must be
     /// REFUSED, loudly, rather than handing the inner window's entries to the
     /// outer probe and destroying the inner window in the same move.
     ///
-    /// Not reachable from today's callers — `jammi-ai`'s esc-075 probe is the
-    /// only one and never nests — so this test constructs the shape directly.
+    /// No current caller nests (`jammi-ai`'s fine-tune acceleration-report
+    /// probe is the only one), so this test constructs the shape directly.
     /// It runs on its OWN thread for two reasons: the sink is thread-local,
     /// and the refusal deliberately leaves this thread's sink ARMED (the
     /// fail-safe: it touches nothing), which must not leak into a sibling
@@ -4409,13 +4203,13 @@ mod tests {
                 .into_iter()
                 .any(|(op, _, _)| op == "probe_sink_strict_op"),
             "control: the warn list genuinely has no entry for this op, so the assertion above \
-             is not passing through the old channel by accident"
+             is not passing through the warn-list channel by accident"
         );
     }
 
     /// `all_registry_keys` is the every-dtype enumeration (distinct from
     /// `registry_keys_for`): a "does this table's key set cover the
-    /// workspace's real call sites" audit reads it, and it must not collapse
+    /// workspace's real call sites" check reads it, and it must not collapse
     /// the two 16-bit keys into one.
     #[test]
     fn all_registry_keys_enumerates_every_dtype_variant() {
@@ -4427,22 +4221,21 @@ mod tests {
     }
 
     // =========================================================================
-    // #546 K1/K2': `ProbedOpId`, `ProbedOpId::row`, `render_kernel_admission_profile`
+    // `ProbedOpId`, `ProbedOpId::row`, `render_kernel_admission_profile`
     // =========================================================================
 
-    /// K1's completeness oracle: [`ProbedOpId::ALL`] and [`PROBED_OPS`] name
+    /// The completeness oracle: [`ProbedOpId::ALL`] and [`PROBED_OPS`] name
     /// the EXACT same set of rows — not merely that [`ProbedOpId::row`]
     /// compiles for every variant (the compiler already forces that; this
     /// is the OTHER direction, that no [`PROBED_OPS`] row is missing a
     /// variant).
     ///
-    /// Mutation executed for this contract (K1's stop-rule mutation,
-    /// reverted before commit): adding a sixteenth `ProbedOpId` variant
+    /// Adding a sixteenth `ProbedOpId` variant
     /// (`Bogus`) without a matching arm in [`ProbedOpId::row`] fails
     /// `cargo build -p jammi-kernels` with `error[E0004]: non-exhaustive
     /// patterns: \`ProbedOpId::Bogus\` not covered` — the totality property
     /// is therefore enforced by the compiler, not by this test (this test
-    /// instead pins the SEPARATE property that today's 15 variants and 15
+    /// instead pins the SEPARATE property that the 15 variants and 15
     /// rows already agree).
     #[test]
     fn probed_op_id_variants_cover_every_probed_ops_row() {
@@ -4464,8 +4257,7 @@ mod tests {
         );
     }
 
-    /// Every [`ProbedOpId`] variant's `report_key` is unique (K1's other
-    /// named oracle) — a duplicate would let two variants silently collapse
+    /// Every [`ProbedOpId`] variant's `report_key` is unique — a duplicate would let two variants silently collapse
     /// onto the same profile-string line.
     #[test]
     fn probed_op_id_report_keys_are_unique() {
@@ -4479,10 +4271,10 @@ mod tests {
         }
     }
 
-    /// [`ProbedOpId::ALL`] is in DECLARATION order (K2's "sorted by variant
-    /// order" requirement) — pinned against the literal expected sequence,
+    /// [`ProbedOpId::ALL`] is in DECLARATION order (the profile string's
+    /// "sorted by variant order" requirement) — pinned against the literal expected sequence,
     /// not merely "some order", since a profile string's byte content is a
-    /// determinism property (family J).
+    /// determinism property.
     #[test]
     fn probed_op_id_all_is_in_declaration_order() {
         let keys: Vec<&str> = ProbedOpId::ALL
@@ -4511,7 +4303,7 @@ mod tests {
         );
     }
 
-    /// K2'(a)'s dtype-neutral facts: [`BUILD_FACTS`] and `admission_mode`/
+    /// The profile's dtype-neutral facts: [`BUILD_FACTS`] and `admission_mode`/
     /// `dtype_class` all appear, and toggling the disabled set changes
     /// exactly the named variant's own line (never another's).
     #[test]
@@ -4620,7 +4412,7 @@ mod tests {
 
     /// A dtype-branching row ([`CAST_SCALE`]) gets exactly ONE line, keyed
     /// by `report_key` — never [`ProbedOp::dtype_neutral_key`] (which would
-    /// panic for this row; K1's totality is stated over the row, not over a
+    /// panic for this row; totality is stated over the row, not over a
     /// dtype-neutral key).
     #[test]
     fn render_kernel_admission_profile_never_panics_on_a_dtype_branching_row() {
@@ -4678,7 +4470,7 @@ mod tests {
     /// on an F32 job) and never `disabled` (nothing was actually named).
     /// Also proves an F32 job's `JAMMI_KERNELS_DISABLE=cast_scale_bf16_f32`
     /// does NOT move `cast_scale`'s own line (it is `n/a` either way) —
-    /// the over-discrimination half of the closing-audit finding.
+    /// a dtype-blind check would over-discriminate here.
     #[test]
     fn render_kernel_admission_profile_f32_renders_n_a_for_cast_rows() {
         let bare = render_kernel_admission_profile(DtypeClass::F32, AdmissionMode::Fallback, &[]);
@@ -4733,9 +4525,9 @@ mod tests {
         assert!(profile.contains("dtype_class=F16"));
     }
 
-    /// Determinism (K2'(c)): the same three arguments always render the
-    /// same string — no `HashMap`/`HashSet` iteration order anywhere in the
-    /// fold (family J).
+    /// Determinism: the same three arguments always render the same
+    /// string — no `HashMap`/`HashSet` iteration order anywhere in the
+    /// fold.
     #[test]
     fn render_kernel_admission_profile_is_deterministic() {
         let disabled = vec!["geglu_fused".to_string(), "adamw_step_fused".to_string()];

@@ -59,8 +59,7 @@ pub use lora_linear::{
 };
 #[cfg(feature = "candle")]
 pub use save_load::{load_adapter, save_adapter};
-// The layer_id collision guard (audit advisory, post-4aa1303 round): a
-// standalone, whole-run structural check over every name that will
+// The layer_id collision guard: a standalone, whole-run structural check over every name that will
 // construct a `DropoutMasks` — see `seeded::assert_no_layer_id_collisions`'s
 // own doc for the call-site contract and why this lives here rather than
 // being threaded through `LoraLinear::new`'s per-layer construction.

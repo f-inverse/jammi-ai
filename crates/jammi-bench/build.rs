@@ -1,6 +1,6 @@
 //! Bakes this binary's build-time identity into compile-time environment
 //! variables the crate reads back with `env!()` — never `std::env::var()` at
-//! run time (unification contract C1). Three literals, `cargo:rustc-env`'d
+//! run time. Three literals, `cargo:rustc-env`'d
 //! once per build:
 //!
 //!   - `JAMMI_BUILD_SHA` — `<sha>`, `<sha>-dirty`, or `"unknown"`.
@@ -15,7 +15,7 @@
 //! through, never trusted verbatim); otherwise a build-time `git rev-parse
 //! HEAD` against this crate's own directory, with dirtiness folded in;
 //! otherwise the literal `"unknown"`. This is domain validation at the
-//! INPUT edge (K2): the binary itself never re-validates `JAMMI_BUILD_SHA`
+//! INPUT edge: the binary itself never re-validates `JAMMI_BUILD_SHA`
 //! at run time, because by the time it runs there is nothing left to
 //! validate — the value baked here is a `'static` compile-time literal.
 //!
@@ -24,21 +24,20 @@
 //! `JAMMI_BUILD_SHA` in the process environment, or a fresh `cwd`, changes
 //! NOTHING about an already-built binary's reported identity.
 //!
-//! Round-2 audit (advisory A1) — the CONSEQUENCE a valid override has: a
-//! caller-supplied `JAMMI_BUILD_SHA` that passes the 40-lowercase-hex shape
-//! check is baked VERBATIM, with NO `-dirty` suffix EVER appended — dirtiness
-//! is a fact this file establishes only through its OWN `git status` read,
-//! which the override path skips entirely. This is contract-sanctioned (C1.1
-//! names exactly this precedence, and C16.3's planned server image
-//! `JAMMI_BUILD_SHA=${{ github.sha }}` relies on it — a CI checkout of a
+//! The CONSEQUENCE a valid override has: a caller-supplied
+//! `JAMMI_BUILD_SHA` that passes the 40-lowercase-hex shape check is baked
+//! VERBATIM, with NO `-dirty` suffix EVER appended — dirtiness is a fact this
+//! file establishes only through its OWN `git status` read, which the
+//! override path skips entirely. That precedence is deliberate: an image
+//! build passing `JAMMI_BUILD_SHA=${{ github.sha }}` is a CI checkout of a
 //! specific, known-clean sha, where "was the checkout tree itself dirty" is
-//! not a question that sha can answer). The consequence: an override sha
-//! that DISAGREES with what `git` would have resolved (a stale/wrong value a
-//! caller passed by mistake) is baked with no cross-check against git AT
-//! ALL, clean or dirty — a phase-2 producer's `provenance.build_sha == $SHA`
-//! comparison (contract C5.1) is what has to catch that mismatch, not this
-//! file; `build.rs` only ever answers "is the value I was GIVEN shaped like
-//! a sha", never "is the value I was given TRUE".
+//! not a question that sha can answer. So an override sha that DISAGREES with
+//! what `git` would have resolved (a stale/wrong value a caller passed by
+//! mistake) is baked with no cross-check against git AT ALL, clean or dirty
+//! — a consumer's own `provenance.build_sha == $SHA` comparison is what has
+//! to catch that mismatch, not this file; `build.rs` only ever answers "is
+//! the value I was GIVEN shaped like a sha", never "is the value I was given
+//! TRUE".
 //!
 //! Git worktrees: `.git` is a FILE (not a directory) inside a linked
 //! worktree (`git worktree add`), so the literal path
@@ -54,10 +53,10 @@
 //! second watch to catch `git commit` on a branch, which touches the ref
 //! file, not `HEAD`).
 //!
-//! ## The `-dirty` staleness bug this file fixes (round-2 audit, B2)
+//! ## Why the tracked source is watched too
 //!
-//! Watching ONLY `.git/HEAD` and the branch ref (as this file did before
-//! this fix) is necessary but not sufficient: Cargo reruns a build script
+//! Watching ONLY `.git/HEAD` and the branch ref is necessary but not
+//! sufficient: Cargo reruns a build script
 //! exactly when one of its declared `rerun-if-changed` targets changes (or
 //! on a fresh build) — it does NOT rerun the build script merely because
 //! the CRATE itself is being recompiled. Editing a tracked file
@@ -65,15 +64,13 @@
 //! `jammi-bench` (the source changed), but touches neither `.git/HEAD` nor
 //! the branch ref — so `build.rs` does NOT rerun, and the binary bakes
 //! whatever `build_sha` the LAST build script invocation computed, which
-//! can be the CLEAN value from before the edit. Reproduced (audit probe
-//! rows 3/4): same tree, same commit, two builds — one via a forced
-//! build-script rerun (env var toggle), one via only a tracked-source edit
-//! — produced `<sha>-dirty` and bare `<sha>` respectively. A phase-2
-//! producer's `provenance.build_sha == $SHA` cross-check (contract C5.1/
-//! C6.4) would PASS on a binary built from an edited, uncommitted tree —
-//! the exact stale-binary hazard the unit exists to close.
+//! can be the CLEAN value from before the edit: same tree, same commit, two
+//! builds — one via a forced build-script rerun (env var toggle), one via
+//! only a tracked-source edit — produce `<sha>-dirty` and bare `<sha>`
+//! respectively, and a `provenance.build_sha == $SHA` cross-check would
+//! PASS on a binary built from an edited, uncommitted tree.
 //!
-//! Fix: ALSO watch the tracked SOURCE the dirtiness computation itself
+//! So this file ALSO watches the tracked SOURCE the dirtiness computation itself
 //! depends on — the workspace's `crates/` directory (recursive; Cargo
 //! resolves a directory `rerun-if-changed` target by walking it for the
 //! most-recently-modified file — an mtime `stat()` walk, not a content
@@ -84,18 +81,18 @@
 //! watch is emitted unconditionally, even in the git-less tarball case
 //! where `git_build_sha` itself returns `None`.
 //!
-//! **What `-dirty` means, exactly (round-3 audit advisory 2).** The
+//! **What `-dirty` means, exactly.** The
 //! dirtiness QUERY (`git_build_sha`'s own `git status`) is pathspec-
 //! restricted to `:/crates`, `:/Cargo.lock`, `:/Cargo.toml` — the SAME
 //! three targets the watch above names, not the whole repository. The two
 //! scopes are kept identical DELIBERATELY: if the query covered more than
-//! the watch (the whole repo, as an earlier revision of this file did), a
+//! the watch (the whole repo, say), a
 //! dirty file OUTSIDE the watched set (a `docs/` edit, say) would bake
 //! `-dirty` on THAT build, but committing that same edit later touches
 //! nothing the watch covers — no rerun happens, and the now-STALE
 //! `-dirty` marker survives past the point the tree actually went clean
-//! (the SAME staleness SHAPE the retrigger bug above has, just running in
-//! the opposite direction: falsely dirty instead of falsely clean). So:
+//! (the SAME staleness SHAPE as a missing source watch, just in the
+//! opposite direction: falsely dirty instead of falsely clean). So:
 //! `-dirty` means "this binary's own build-relevant tree — `crates/`,
 //! `Cargo.lock`, `Cargo.toml` — has an uncommitted change to a TRACKED
 //! file", never "the whole monorepo checkout is dirty" and never "an
@@ -104,8 +101,7 @@
 //! `provenance_baked.rs`'s `edited_tracked_file_forces_dirty_on_rebuild`
 //! test is the regression proof: a scratch probe crate is built once
 //! (clean), a tracked file is edited WITHOUT committing, the SAME crate is
-//! rebuilt, and the second build's baked sha MUST carry `-dirty` — this is
-//! the auditor's probe rows 3/4 turned into a standing CI assertion.
+//! rebuilt, and the second build's baked sha MUST carry `-dirty`.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -116,7 +112,7 @@ use std::process::Command;
 /// stricter than "looks like a sha": a shallow-checkout or `pull_request`
 /// merge-ref sha would still pass this shape check (it IS 40 hex chars) —
 /// this function proves shape only, never provenance; see this file's
-/// module doc for why no CI job in this unit relies on that distinction.
+/// module doc for why nothing here relies on that distinction.
 pub(crate) fn is_40_lowercase_hex(s: &str) -> bool {
     s.len() == 40
         && s.bytes()
@@ -172,7 +168,7 @@ pub(crate) fn workspace_root(manifest_dir: &str) -> PathBuf {
 /// be run (fail-closed — see this function's `dirty` binding: a `git
 /// status` failure must never be silently read as "clean").
 fn git_build_sha(manifest_dir: &str) -> Option<String> {
-    // Watch `.git/HEAD` (worktree-correct path — P7) so a checkout moves
+    // Watch `.git/HEAD` (worktree-correct path) so a checkout moves
     // the fingerprint.
     if let Some(head_path) = git_output(manifest_dir, &["rev-parse", "--git-path", "HEAD"]) {
         println!("cargo:rerun-if-changed={head_path}");
@@ -195,24 +191,22 @@ fn git_build_sha(manifest_dir: &str) -> Option<String> {
     }
 
     // Dirtiness: TRACKED paths only (`--untracked-files=no`) — untracked
-    // scratch (this tree's own `?? scratchpad/`, or any agent's temp
-    // output) must never dirty a build; only uncommitted changes to
-    // tracked files do. Round-2 audit (advisory A2): the earlier form
-    // (`git_output(..).is_some()`) collapsed a FAILED `git status`
-    // invocation into "clean" — indistinguishable from "ran and found
-    // nothing dirty". Run the command directly here so a failed exit
-    // status propagates `None` all the way out to `"unknown"` instead of
-    // being silently read as clean, the same fail-closed posture the sha
-    // resolution above already takes.
+    // scratch (any untracked temp output) must never dirty a build; only
+    // uncommitted changes to tracked files do. The command runs directly
+    // here, not through `git_output(..).is_some()`, which would collapse a
+    // FAILED `git status` invocation into "clean" — indistinguishable from
+    // "ran and found nothing dirty". A failed exit status propagates `None`
+    // all the way out to `"unknown"` instead, the same fail-closed posture
+    // the sha resolution above already takes.
     //
-    // Round-3 audit (advisory 2): the QUERY is pathspec-restricted to
+    // The QUERY is pathspec-restricted to
     // EXACTLY what `main()`'s `rerun-if-changed` WATCHES — `:/crates`,
     // `:/Cargo.lock`, `:/Cargo.toml` (the `:/` magic pathspec means "from
     // the top of the working tree", so this resolves correctly regardless
-    // of `cwd` = `manifest_dir`, a nested subdirectory). Before this fix
-    // the query covered the WHOLE repo (no pathspec) while the watch
-    // covered only this narrower set — the two scopes disagreeing is
-    // itself a staleness hazard in the OTHER direction from B2: a dirty
+    // of `cwd` = `manifest_dir`, a nested subdirectory). A query over the
+    // WHOLE repo (no pathspec) while the watch covers only this narrower
+    // set would be a staleness hazard in the OTHER direction from a missing
+    // source watch: a dirty
     // file OUTSIDE `crates/`/`Cargo.lock`/`Cargo.toml` (a `docs/` edit,
     // say) would bake `-dirty` on ITS OWN build, but committing that same
     // edit later would never trigger a rerun (nothing the watch covers
@@ -244,9 +238,9 @@ fn git_build_sha(manifest_dir: &str) -> Option<String> {
     Some(if dirty { format!("{sha}-dirty") } else { sha })
 }
 
-/// Read `var`, falling back to `"unknown"` when it is unset OR empty —
-/// round-2 audit (advisory A3): `unwrap_or_default()` used to bake `""`,
-/// which `report::assert_identity_fields_present` could not tell apart from
+/// Read `var`, falling back to `"unknown"` when it is unset OR empty — a
+/// baked `""` is something `report::assert_identity_fields_present` cannot
+/// tell apart from
 /// a genuine value (a `NonNull` field is only checked for JSON `null`, and
 /// `""` is not `null`). Cargo always sets `TARGET`/`PROFILE` for a real
 /// build-script invocation, so this fallback only ever fires under a
@@ -266,7 +260,7 @@ fn main() {
 
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
 
-    // The B2 fix: watch the tracked SOURCE the dirtiness computation reads,
+    // Watch the tracked SOURCE the dirtiness computation reads,
     // not only the git-ref plumbing below — see this file's module doc.
     // Emitted UNCONDITIONALLY (before any `git` call), so it holds even in
     // the git-less tarball case.

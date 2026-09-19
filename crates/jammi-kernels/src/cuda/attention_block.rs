@@ -1,6 +1,5 @@
-//! CUDA forward for [`crate::ops::AttentionBlockFused`] — the composed
-//! interior the op contract's Tier 0 build order describes: NO new `.cu`
-//! kernel. Every step below is either `BackendStorage::copy_strided_src`/
+//! CUDA forward for [`crate::ops::AttentionBlockFused`] — a composed
+//! interior (the op module doc's "Tier 0"): NO new `.cu` kernel. Every step below is either `BackendStorage::copy_strided_src`/
 //! `affine`/`matmul`/`binary_impl`/`to_dtype` (candle's OWN generic storage
 //! kernels — the same ones `Tensor::contiguous()`/`Tensor::matmul`/
 //! `Tensor + Tensor`/`Tensor::to_dtype` already issue) or a DIRECT call
@@ -37,14 +36,14 @@
 //! and no `broadcast_as`/`binary_impl::<Add>` combination step in this
 //! file at all: `SoftmaxLastDimFused::cuda_fwd` already implements the
 //! general `[batch|1, 1, seq|1, seq]`-broadcasts-onto-`[batch, heads, seq,
-//! seq]` class this op's own `mask` domain now matches exactly (see
+//! seq]` class this op's own `mask` domain matches exactly (see
 //! `crate::ops::attention_block::check_mask`'s doc) — reusing that
 //! broadcast logic rather than re-deriving it here.
 //!
 //! This file compiles only under the `cuda` feature and mirrors
 //! `crate::cuda::rope`/`crate::cuda::softmax`/`LowRankResidualLinear`'s
 //! CUDA glue idioms; `tests/cuda_parity.rs`'s `attention_block_*` legs are
-//! its landing proof.
+//! its GPU parity proof.
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CudaStorage, CustomOp2, CustomOp3, DType, Error, Layout, Result, Shape};
@@ -66,16 +65,16 @@ fn alloc_scratch(device: &CudaDevice, dtype: DType, n: usize) -> Result<CudaStor
             let s = unsafe { device.alloc::<half::bf16>(n) }?;
             Ok(CudaStorage::wrap_cuda_slice(s, device.clone()))
         }
-        // campaign #443 D1: `F16` is sound here for the SAME reason `BF16`
+        // `F16` is sound here for the SAME reason `BF16`
         // is — this file allocates no fused `.cu` kernel of its own (module
         // doc's opening line); every compute step is either candle's own
         // generic storage op (`copy_strided_src`/`matmul`/`affine`, all
         // dtype-generic on the CUDA backend) or a direct call into
         // `RopeFused`/`SoftmaxLastDimFused`'s OWN `cuda_fwd`, both of which
-        // now carry real `F16` dispatch arms (`crate::cuda::rope`'s
+        // carry real `F16` dispatch arms (`crate::cuda::rope`'s
         // `DType::F16` arm, `rope_f16.cu`; `crate::cuda::softmax`'s
-        // `(DType::F16, DType::F16)` arm, `softmax_f16.cu` — campaign #443
-        // W2b). Widening this scratch allocator is what makes the dtype
+        // `(DType::F16, DType::F16)` arm, `softmax_f16.cu`). This scratch
+        // allocator's `F16` arm is what makes the dtype
         // check below able to admit `F16` at all: without an `F16` arm
         // here, `gather_bhsd`'s `alloc_scratch` call would itself refuse
         // before the RoPE/softmax calls are ever reached.
@@ -175,7 +174,7 @@ pub(crate) fn cuda_fwd(
             op: name,
         });
     }
-    // campaign #443 D1: `F16` joins `BF16` here — see `alloc_scratch`'s own
+    // `F16` is admitted alongside `BF16` — see `alloc_scratch`'s own
     // doc for why this composition's domain follows its callees' compiled
     // dispatch arms, not a kernel this file owns.
     if !matches!(s1.dtype(), DType::F32 | DType::BF16 | DType::F16) {

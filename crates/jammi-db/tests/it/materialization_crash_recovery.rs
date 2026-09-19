@@ -11,14 +11,12 @@
 //! the producing descriptor, so it must reap that row to `failed`, never promote
 //! it manifest-less.
 //!
-//! Mechanics mirror `mutable_crash_recovery.rs`: the parent respawns the test
-//! binary with `JAMMI_TEST_MATERIALIZATION_CHECKPOINT` set; the child drives
-//! `finish`, whose test-hook fires after the lease renew and the Parquet is durable
-//! and before the manifest write, writes the ready file, and parks. The parent
-//! `SIGKILL`s, restarts on the same dir, runs `recover()`, and asserts the row
-//! is `failed` and the bytes reaped.
-//!
-//! Gated behind `feature = "test-hooks"` (the SIGKILL harness, SQLite only).
+//! The parent runs [`manifestless_parquet_child`] in its own process with
+//! `JAMMI_TEST_MATERIALIZATION_CHECKPOINT` set; the child drives `finish`, whose
+//! test hook fires after the lease renew and the durable Parquet and before the
+//! manifest write, and parks. The parent `SIGKILL`s it, restarts on the same
+//! directory, runs `recover()`, and asserts the row is `failed` and the bytes
+//! reaped. SQLite only; compiled under `test-hooks`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,13 +30,11 @@ use jammi_db::session::JammiSession;
 use jammi_db::store::manifest::{
     ComputeDevice, InputAnchor, MaterializationEnv, ProducingDescriptor,
 };
-use jammi_db::store::mutable::test_hook::{MATERIALIZATION_CHECKPOINT_ENV, READY_FILE_ENV};
+use jammi_db::store::mutable::test_hook::MATERIALIZATION_CHECKPOINT_ENV;
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::ResultStore;
 
 use crate::common;
-
-const CHILD_MARKER_ENV: &str = "JAMMI_TEST_CRASH_CHILD";
 
 /// The lease the child's store holds its building row under: short, so the
 /// parent's recovery after the SIGKILL reclaims it within seconds.
@@ -50,41 +46,11 @@ fn short_lease() -> jammi_db::catalog::lease::LeaseIntervals {
     .intervals()
     .unwrap()
 }
-const ARTIFACT_DIR_ENV: &str = "JAMMI_TEST_ARTIFACT_DIR";
 const TABLE_SOURCE: &str = "crash_docs";
 const DIMS: usize = 4;
 
-/// Require-gate (KO-7) for the SIGKILL-harness "am I the respawned child"
-/// dispatch this file's own crash-recovery test checks first:
-/// [`CHILD_MARKER_ENV`] is set ONLY by this file's OWN `Command::env(
-/// CHILD_MARKER_ENV, "1")` call, which spawns a fresh child process that
-/// re-invokes this exact test by name — there is no live external resource
-/// to require here (the dispatch is deterministic, never
-/// availability-dependent). The gate exists to close KO-7's "unrun-is-RED"
-/// concern for a DIFFERENT, real failure mode: a leaked/persistent
-/// `JAMMI_TEST_CRASH_CHILD` in the process environment (e.g. exported by a
-/// prior debug session, or a CI step that forgot to scope it) would make
-/// the TOP-LEVEL `cargo test` invocation itself silently take this branch,
-/// run only [`child_workload`], and never exercise the real SIGKILL +
-/// recovery assertions below it — a green run that proved nothing. A lane
-/// that wants to assert this can never silently happen sets
-/// `JAMMI_REQUIRE_CRASH_RECOVERY_HARNESS`; ordinary runs — including this
-/// harness's own legitimate spawned-child re-invocation, which inherits the
-/// parent process's environment and so would ALSO inherit this var were a
-/// lane to set it globally — leave it unset.
-fn crash_recovery_child_dispatch_require_gate(test_name: &str) {
-    if std::env::var_os("JAMMI_REQUIRE_CRASH_RECOVERY_HARNESS").is_some() {
-        panic!(
-            "{test_name}: JAMMI_REQUIRE_CRASH_RECOVERY_HARNESS is set but this invocation is \
-             dispatching into the SIGKILL-harness CHILD branch (JAMMI_TEST_CRASH_CHILD is set) \
-             -- this lane must prove the PARENT-role spawn/kill/recover assertions actually run, \
-             never silently take the child-only branch"
-        );
-    }
-}
-
 async fn child_workload() {
-    let dir = std::env::var(ARTIFACT_DIR_ENV).expect("child needs artifact dir");
+    let dir = std::env::var(common::ARTIFACT_DIR_ENV).expect("child needs artifact dir");
     let dir = PathBuf::from(dir);
     let session = JammiSession::new(common::test_config(&dir))
         .await
@@ -173,60 +139,20 @@ async fn child_workload() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "child process of manifestless_parquet_is_reaped_under_sigkill"]
+async fn manifestless_parquet_child() {
+    child_workload().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manifestless_parquet_is_reaped_under_sigkill() {
-    const NAME: &str =
-        "materialization_crash_recovery::manifestless_parquet_is_reaped_under_sigkill";
-    if std::env::var(CHILD_MARKER_ENV).is_ok() {
-        crash_recovery_child_dispatch_require_gate(
-            "materialization_crash_recovery::manifestless_parquet_is_reaped_under_sigkill",
-        );
-        child_workload().await;
-        return;
-    }
-
     let dir = tempfile::tempdir().unwrap();
-    let ready_file = dir.path().join("ready");
-    let exe = std::env::current_exe().expect("current_exe for child spawn");
-
-    let mut child = tokio::process::Command::new(&exe)
-        .args(["--exact", "--nocapture", NAME])
-        .env(CHILD_MARKER_ENV, "1")
-        .env(ARTIFACT_DIR_ENV, dir.path())
-        .env(READY_FILE_ENV, &ready_file)
-        .env(MATERIALIZATION_CHECKPOINT_ENV, "1")
-        .spawn()
-        .expect("spawn child test process");
-
-    let pid = child.id().expect("child pid available") as i32;
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if tokio::fs::try_exists(&ready_file)
-            .await
-            .expect("try_exists ready file")
-        {
-            break;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill().await;
-            panic!("child never reached the materialization checkpoint within 30s");
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            panic!("child exited before the materialization checkpoint: {status:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // SAFETY: `pid` is the child we just spawned; `SIGKILL` is unconditional and
-    // synchronous. No allocator or thread state is touched.
-    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
-    assert_eq!(
-        rc,
-        0,
-        "libc::kill failed: {}",
-        std::io::Error::last_os_error()
-    );
-    let _ = child.wait().await;
+    common::kill_child_at_checkpoint(
+        "materialization_crash_recovery::manifestless_parquet_child",
+        dir.path(),
+        (MATERIALIZATION_CHECKPOINT_ENV, "1"),
+    )
+    .await;
 
     // Restart on the same dir. The dead child's row is `building` under a
     // lease that is still live for a few seconds: recovery must leave it

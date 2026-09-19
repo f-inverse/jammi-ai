@@ -7,17 +7,15 @@
 //! for the two FK-backed ones (`jobs.model_ref`, `eval_runs.model_id`).
 //! A pk-keyed scan would silently miss the two name-keyed edges, so each is
 //! exercised directly. DELETE is strictly tenant-scoped — a tenant touches only a
-//! row it owns. The two `jobs` edges are additionally age-gated (N9): a
+//! row it owns. The two `jobs` edges are additionally age-gated: a
 //! `[jobs] retention_days`-aged terminal row stops blocking, while a
 //! non-terminal row blocks indefinitely and a young terminal row still blocks.
 //!
 //! Every test is parameterised over [`BackendKind`] via `test_case` + `cfg_attr`.
 //! The SQLite lane is always generated; the Postgres lane is generated only when
-//! the `live-postgres-tests` feature is on, and skips at runtime when
-//! `JAMMI_TEST_PG_URL` is unset (an early return, never `#[ignore]`). The
-//! Postgres lane is where the contract bites hardest: the four-edge scan runs
-//! under PG `Serializable` and still surfaces the typed `ModelReferenced` rather
-//! than a raw FK error. On the Postgres lane that one catalog DB is shared across
+//! the `live-postgres-tests` feature is on. The Postgres lane is where the
+//! contract bites hardest: the four-edge scan runs under PG `Serializable` and
+//! still surfaces the typed `ModelReferenced` rather than a raw FK error. On the Postgres lane that one catalog DB is shared across
 //! the whole run, so each test first clears the referential tables via
 //! [`reset_catalog`]; CI's `test-pg` job runs the lane with `--test-threads=1`,
 //! so the reset-then-populate sequence cannot race a sibling test.
@@ -33,30 +31,24 @@ use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::error::JammiError;
 use jammi_db::model_task::ModelTask;
+use jammi_db::session::JammiSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::TenantId;
 use jammi_test_utils::make_test_session;
 use tempfile::tempdir;
 use test_case::test_case;
 
-/// The Postgres lane returns `None` when `JAMMI_TEST_PG_URL` is unset so the
-/// test can early-return rather than `#[ignore]`'ing (CLAUDE.md forbids
-/// `#[ignore]`). Yields the base (unscoped) catalog, with the shared referential
-/// tables cleared so the four-edge scan and the partial-index checks see only
-/// this test's rows.
-macro_rules! lifecycle_catalog {
-    ($backend:expr, $dir:expr) => {{
-        let session = match make_test_session($backend, $dir).await {
-            Some(s) => s,
-            None => {
-                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
-                return;
-            }
-        };
-        let catalog = std::sync::Arc::clone(session.catalog());
-        reset_catalog(&catalog).await;
-        (session, catalog)
-    }};
+/// A session on `backend` and its base (unscoped) catalog, with the shared
+/// referential tables cleared so the four-edge scan and the partial-index
+/// checks see only this test's rows.
+async fn lifecycle_catalog(
+    backend: BackendKind,
+    dir: &std::path::Path,
+) -> (JammiSession, std::sync::Arc<Catalog>) {
+    let session = make_test_session(backend, dir).await;
+    let catalog = std::sync::Arc::clone(session.catalog());
+    reset_catalog(&catalog).await;
+    (session, catalog)
 }
 
 fn tenant_a() -> TenantId {
@@ -149,7 +141,7 @@ async fn submit_referencing_job(
 }
 
 /// Force `jobs.status` and `jobs.updated_at` directly (bypassing every
-/// lease guard) so the retention age-predicate (N9) can be exercised without
+/// lease guard) so the retention age-predicate can be exercised without
 /// a claim/finish/fail dance for every fixture row. `days_ago` ages
 /// `updated_at`; `status` is written byte-for-byte (`"queued"`, `"running"`,
 /// `"completed"`, `"failed"`, or any other string a caller wants to probe).
@@ -183,7 +175,7 @@ async fn force_job_age(cat: &Catalog, job_id: &str, status: &str, days_ago: i64)
 #[tokio::test]
 async fn delete_unreferenced_model_succeeds(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     cat.register_model(register_params("acme/embed-mini"))
@@ -206,7 +198,7 @@ async fn delete_unreferenced_model_succeeds(backend: BackendKind) {
 #[tokio::test]
 async fn delete_blocked_by_result_table_name_edge(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     cat.register_model(register_params("acme/embed-mini"))
@@ -259,7 +251,7 @@ async fn delete_blocked_by_result_table_name_edge(backend: BackendKind) {
 #[tokio::test]
 async fn delete_blocked_by_job_output_name_edge(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     // A base model the job's FK points at, and the output model whose NAME
@@ -295,7 +287,7 @@ async fn delete_blocked_by_job_output_name_edge(backend: BackendKind) {
 #[tokio::test]
 async fn delete_blocked_by_job_model_ref_pk_edge(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     cat.register_model(register_params("acme/base"))
@@ -322,7 +314,7 @@ async fn delete_blocked_by_job_model_ref_pk_edge(backend: BackendKind) {
 /// `ModelSource` string an `embedding`/`infer` kind resolves its model
 /// against) is a blocking edge like `result_tables.model_id`: a running
 /// job still reading the model blocks its delete via the typed scan, and
-/// the same N9 age gate lifts the block once the job is terminal and past
+/// the same age gate lifts the block once the job is terminal and past
 /// the retention window.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
@@ -331,7 +323,7 @@ async fn delete_blocked_by_job_model_source_name_edge_until_terminal_and_aged(
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     cat.register_model(register_params("acme/embed-src"))
@@ -369,7 +361,7 @@ async fn delete_blocked_by_job_model_source_name_edge_until_terminal_and_aged(
         .expect("a terminal model_source job past the retention window must not block");
 }
 
-/// N9: a TERMINAL `jobs` row past `retention_days` does not block — the
+/// A TERMINAL `jobs` row past `retention_days` does not block — the
 /// referential predicate is age-gated, not sweep-dependent (`prune_jobs`
 /// never has to run first for the delete to succeed).
 #[test_case(BackendKind::Sqlite ; "sqlite")]
@@ -377,7 +369,7 @@ async fn delete_blocked_by_job_model_source_name_edge_until_terminal_and_aged(
 #[tokio::test]
 async fn delete_unblocked_by_a_terminal_job_past_the_retention_window(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     cat.register_model(register_params("acme/base"))
@@ -392,14 +384,14 @@ async fn delete_unblocked_by_a_terminal_job_past_the_retention_window(backend: B
         .expect("a terminal job past the retention window must not block delete");
 }
 
-/// N9: a NON-TERMINAL `jobs` row blocks indefinitely, regardless of age — the
+/// A NON-TERMINAL `jobs` row blocks indefinitely, regardless of age — the
 /// age gate only ever lifts a TERMINAL row's block.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn delete_still_blocked_by_an_old_non_terminal_job(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     cat.register_model(register_params("acme/base"))
@@ -422,14 +414,14 @@ async fn delete_still_blocked_by_an_old_non_terminal_job(backend: BackendKind) {
     }
 }
 
-/// N9: a YOUNG terminal `jobs` row (inside the retention window) still
+/// A YOUNG terminal `jobs` row (inside the retention window) still
 /// blocks — the gate is on age, not merely on `status`.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn delete_still_blocked_by_a_young_terminal_job(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     cat.register_model(register_params("acme/base"))
@@ -459,7 +451,7 @@ async fn delete_still_blocked_by_a_young_terminal_job(backend: BackendKind) {
 #[tokio::test]
 async fn delete_blocked_by_eval_run_pk_edge(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     cat.register_model(register_params("acme/embed-mini"))
@@ -505,7 +497,7 @@ async fn delete_blocked_by_eval_run_pk_edge(backend: BackendKind) {
 async fn delete_blocked_under_volume(backend: BackendKind) {
     const N: usize = 1000;
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     register_source(&cat, "src").await;
@@ -600,7 +592,7 @@ async fn delete_blocked_under_volume(backend: BackendKind) {
 #[tokio::test]
 async fn cross_tenant_delete_is_not_found(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat_a = base.pinned_to_tenant(Some(tenant_a()));
     let cat_b = base.pinned_to_tenant(Some(tenant_b()));
 
@@ -629,7 +621,7 @@ async fn cross_tenant_delete_is_not_found(backend: BackendKind) {
 #[tokio::test]
 async fn delete_absent_with_if_exists_is_noop(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     cat.delete_model("acme/never-registered", None, true, 30)
@@ -643,7 +635,7 @@ async fn delete_absent_with_if_exists_is_noop(backend: BackendKind) {
 #[tokio::test]
 async fn delete_absent_without_if_exists_is_not_found(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let (_session, base) = lifecycle_catalog(backend, dir.path()).await;
     let cat = base.pinned_to_tenant(Some(tenant_a()));
 
     let err = cat

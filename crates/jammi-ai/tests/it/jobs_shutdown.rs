@@ -1,17 +1,17 @@
-//! OPS (#482): the two shutdown modes on the LIBRARY — DRAIN
+//! The two shutdown modes on the LIBRARY — DRAIN
 //! (`EmbeddedWorker::stop_and_join`) and RELEASE (`release_and_stop`) —
 //! with every arm of the RELEASE mechanism pinned against the loop's own
 //! rendezvous points (`loop_test_hooks`, `claim_test_hooks`, the compute and
 //! materialization parks), never against a wall clock:
 //!
-//! * R5(a): a claim parked before COMMIT commits on unpark and self-releases;
-//! * R5(a'): a stop during the idle sleep leaves the row `queued`;
-//! * R5(b): the claim→hold prologue self-releases under `Releasing`;
-//! * R5(c): the timeout arm's row is recovered by arm 1a, never `failed`;
-//! * R5(d): `run_now` never changes `in_flight` and an inline
+//! * (a): a claim parked before COMMIT commits on unpark and self-releases;
+//! * (a'): a stop during the idle sleep leaves the row `queued`;
+//! * (b): the claim→hold prologue self-releases under `Releasing`;
+//! * (c): the timeout arm's row is recovered by arm 1a, never `failed`;
+//! * (d): `run_now` never changes `in_flight` and an inline
 //!   materialization survives a RELEASE with its lease live;
 //! * a compute job released mid-materialization resumes on the successor
-//!   without a `BackOff` (the escape `esc-110` fix on the RELEASE path);
+//!   without a `BackOff`;
 //! * a released training job is never finalized by the abandoned thread and
 //!   its `_resume` manifest epoch never advances.
 
@@ -296,11 +296,11 @@ async fn stop_and_join_returns_within_idle_poll_when_idle() {
 }
 
 // ---------------------------------------------------------------------------
-// O2 — a cancelled `stop_and_join` must not detach the loop task
+// A cancelled `stop_and_join` must not detach the loop task
 // ---------------------------------------------------------------------------
 
-/// F1's embedded (non-server) arm. `stop_and_join` awaits the in-flight
-/// job's own terminal `LoopState` for however long that job takes (D4) —
+/// The embedded (non-server) arm. `stop_and_join` awaits the in-flight
+/// job's own terminal `LoopState` for however long that job takes —
 /// exactly the shape a `tokio::select!`/`tokio::time::timeout` can cancel
 /// mid-await, the way `runtime.rs`'s RELEASE arm cancels a DRAIN's
 /// `stop_and_join` when a second signal races it. Cancelling it here (via
@@ -362,7 +362,7 @@ async fn dropping_the_guard_after_a_cancelled_stop_and_join_aborts_the_task() {
          return cooperatively"
     );
 
-    // R8/F7: wait for the abandoned training thread to actually RETURN
+    // Wait for the abandoned training thread to actually RETURN
     // before reading the row -- the loop task's own `LoopState` (observed
     // above) says nothing about the `spawn_blocking` trainer it detached
     // from; reading the row immediately after the abort would assert "no
@@ -409,7 +409,7 @@ async fn dropping_the_guard_after_a_cancelled_stop_and_join_aborts_the_task() {
 async fn release_and_stop_leaves_running_with_null_lease_and_no_new_bundle() {
     let (session, _dir) = session(FAST_TIMING).await;
     let handle = session.enqueue(fine_tune(20_000), 0).await.unwrap();
-    // #527: armed BEFORE `spawn_worker` claims and starts the run, so the
+    // Armed BEFORE `spawn_worker` claims and starts the run, so the
     // trainer's fire (inside `save_resume_checkpoint`, the instant its
     // `put_resume_checkpoint` write lands) can never race ahead of the arm.
     let bundle_landed = loop_test_hooks::arm_observed(
@@ -610,7 +610,7 @@ async fn release_mid_materialization_resumes_on_the_successor_without_backoff() 
 // RELEASE — the four claim-window arms
 // ---------------------------------------------------------------------------
 
-/// R5(a): the loop is parked INSIDE `claim_next`, before COMMIT, with
+/// (a): the loop is parked INSIDE `claim_next`, before COMMIT, with
 /// `in_flight == 0`. RELEASE must not abort: it waits, and the claim —
 /// unparked exactly when RELEASE reaches 2e (the `ReleaseAt2e` rendezvous,
 /// never a wall clock: an unpark after the SQLite `database is locked` log
@@ -678,7 +678,7 @@ async fn release_with_the_loop_paused_inside_claim_next_does_not_abort() {
     );
 }
 
-/// R5(a'): the stop lands while the loop is in its idle sleep; the job is
+/// (a'): the stop lands while the loop is in its idle sleep; the job is
 /// submitted after the sleep began. The loop exits at its pre-claim check
 /// (the sleep is interruptible) and the row is untouched: `queued`,
 /// `attempts 0`, `releases 0`.
@@ -705,7 +705,7 @@ async fn release_before_the_loop_reaches_claim_next_leaves_the_row_untouched() {
     assert!(row.claimed_by.is_none());
 }
 
-/// R5(b): the loop is parked in the claim→hold prologue (after COMMIT,
+/// (b): the loop is parked in the claim→hold prologue (after COMMIT,
 /// before the hold). RELEASE waits (no abort), the prologue is unparked at
 /// 2e, and the hold helper self-releases under `Releasing`: the row ends
 /// `running`/lease NULL/`releases 1`, nothing dispatched (no training
@@ -786,13 +786,13 @@ async fn release_with_the_loop_paused_in_the_claim_to_hold_prologue_self_release
 }
 
 // ---------------------------------------------------------------------------
-// P7 (#525, #500 wave 5 group E1) — the release barrier's blast radius
+// The release barrier's blast radius
 // equals the release's, not the releasing entry point's own worker.
 // ---------------------------------------------------------------------------
 
-/// P7(b): the loop's OWN `EmbeddedWorker` never calls `release_and_stop` at
+/// The loop's OWN `EmbeddedWorker` never calls `release_and_stop` at
 /// all here — `InferenceSession::release_job_leases` (the "no loop to stop"
-/// sibling, `session.rs:439`, the shape `runtime.rs`/`database.rs` use on
+/// sibling, the shape `runtime.rs`/`database.rs` use on
 /// their `worker.is_none()` arm) is called directly while a REAL, live loop
 /// on the SAME session is parked in the claim→hold prologue
 /// (`register_job_hold_or_release`, before the hold is registered, phase
@@ -883,7 +883,7 @@ async fn release_job_leases_reaches_a_live_foreign_loops_prologue_and_self_relea
     session.close().await;
 }
 
-/// P7(a): the session's single claim-loop slot is STRUCTURAL — a second
+/// The session's single claim-loop slot is STRUCTURAL — a second
 /// `EmbeddedWorker::spawn_worker` on a session that already has one live is
 /// refused with a typed [`JammiError::FineTune`], never a second claim
 /// loop. The first worker's row/loop are entirely untouched by the refused
@@ -951,7 +951,7 @@ async fn a_second_spawn_on_the_same_session_is_refused_structurally() {
     session.close().await;
 }
 
-/// P7 delta (pressure round): the slot is held until `release_and_stop`
+/// The slot is held until `release_and_stop`
 /// COMPLETES, not until the guard is dropped — a successor spawn is
 /// admitted the instant `release_and_stop` returns, with the FIRST guard's
 /// value still alive (not yet dropped). The successor belongs to a NEW
@@ -1029,8 +1029,7 @@ async fn release_and_stop_completing_frees_the_slot_for_a_successor_not_stopped_
     session.close().await;
 }
 
-/// Fix round (`CONTRACT-RELEASE-SPIN.md`, design-pass fold, P1 — safety):
-/// the loop's top-of-iteration gate refuses a new `claim_next` on the phase
+/// Safety: the loop's top-of-iteration gate refuses a new `claim_next` on the phase
 /// read ALONE (`phase() != Running`), independent of `stop_requested()`.
 /// Gate-direct: `WorkerShared::set_phase_for_test` (test-hooks only)
 /// constructs the phase-flipped-without-a-stop shape no real
@@ -1042,10 +1041,10 @@ async fn release_and_stop_completing_frees_the_slot_for_a_successor_not_stopped_
 /// phase flips — is witnessed over more than the single row a self-release
 /// would otherwise leave touched.
 ///
-/// RED at `main` (fe5ac560) is a LIVENESS failure, not a value mismatch: the
-/// pre-fix gate reads only `stop_requested()`, which this test never sets,
-/// so the loop free-spins claiming and self-releasing forever and the
-/// bounded wait below times out.
+/// A gate that read only `stop_requested()` (which this test never sets)
+/// fails this as a LIVENESS failure, not a value mismatch: the loop
+/// free-spins claiming and self-releasing forever and the bounded wait
+/// below times out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn release_gate_refuses_every_claim_when_phase_flips_without_a_stop() {
     let (session, _dir) = session(DEFAULT_TIMING).await;
@@ -1057,7 +1056,7 @@ async fn release_gate_refuses_every_claim_when_phase_flips_without_a_stop() {
     // yet, so its release epoch is 0 — the gate-direct construction below
     // deliberately bypasses `try_claim_loop` entirely (no generation, no
     // slot), so there is no live epoch to read; this test is about the
-    // PHASE read alone (P1), never the epoch.
+    // PHASE read alone, never the epoch.
     let shared = WorkerShared::new(
         Arc::clone(session.host_admission()),
         session.instance_id().to_string(),
@@ -1107,22 +1106,20 @@ async fn release_gate_refuses_every_claim_when_phase_flips_without_a_stop() {
     }
 }
 
-/// Fix round companion (`CONTRACT-RELEASE-SPIN.md`, design-pass fold, P2 —
-/// wakeup/latency): every phase setter requests the stop in the SAME
+/// Wakeup/latency companion of the test above: every phase setter requests the stop in the SAME
 /// statement pair as the phase flip — `begin_drain` (`:2417-2424`) and
 /// `release_and_stop`'s 2a (`:2585`) — so exit latency after a flip is
 /// bounded by the in-flight job, never by `idle_poll`. A check over the
-/// two setters that exist, PLUS one pre-existing oracle that already reddens
-/// on `release_and_stop`'s unpaired shape (reverting a setter's pairing CAN
-/// be observable, unlike this doc once claimed): reverting the 2a stop
-/// alone (keeping the phase flip) leaves an idle-sleeping loop unwoken, so
+/// two setters that exist, PLUS one other oracle that fails on
+/// `release_and_stop`'s unpaired shape: reverting the 2a stop alone
+/// (keeping the phase flip) leaves an idle-sleeping loop unwoken, so
 /// `release_before_the_loop_reaches_claim_next_leaves_the_row_untouched`
 /// (`:660`) waits out the idle poll instead of being interrupted and its
 /// `elapsed() < 3 s` bound fails. `begin_drain`'s OWN pairing has no such
 /// witness in this suite — `stop_and_join`, the only DRAIN entry point under
 /// test, requests its own stop directly (`:2472-2473`) and never calls
 /// `begin_drain`, so reverting `begin_drain`'s stop alone stays unobservable
-/// from outside without the SAME gate-direct construction P1 already uses
+/// from outside without the SAME gate-direct construction the test above uses
 /// (measured: `stop_and_join_returns_within_idle_poll_when_idle`, `:271`,
 /// stays green under that mutation).
 ///
@@ -1215,13 +1212,11 @@ async fn every_phase_setter_pairs_the_stop_in_the_same_statement_group() {
     }
 }
 
-/// Fix round 1 REVISED (audit BLOCK at `c75452b0`; `CONTRACT-RELEASE-SPIN.md`
-/// P1'): the audit's own falsification of the fold's wide property — the
-/// loop's top-of-iteration gate is read ONCE, then `reclaim_expired_jobs` is
-/// awaited, then `claim_next` runs, so a RELEASE that lands during that
-/// reclaim round trip still finds the now-stale top-of-iteration read
-/// `Running` and would initiate one claim if nothing re-read the gate
-/// afterward. `WorkerShared::admits_claim` is now re-read, with no `.await`
+/// The loop's top-of-iteration gate is read ONCE, then
+/// `reclaim_expired_jobs` is awaited, then `claim_next` runs, so a RELEASE
+/// that lands during that reclaim round trip still finds the now-stale
+/// top-of-iteration read `Running` and would initiate one claim if nothing
+/// re-read the gate afterward. `WorkerShared::admits_claim` is re-read, with no `.await`
 /// between that second read and `claim_next` itself, immediately after
 /// `reclaim_expired_jobs` returns — this test parks the loop at exactly
 /// that instant (`loop_test_hooks::arm_after_reclaim`, keyed by
@@ -1229,13 +1224,12 @@ async fn every_phase_setter_pairs_the_stop_in_the_same_statement_group() {
 /// phase-and-stop pair) to completion while the loop is parked there, then
 /// releases the park.
 ///
-/// RED at `c75452b0` (before the second read existed): the parked
-/// iteration, once released, falls straight through to `claim_next` with no
-/// gate check in between — `claim_next_calls` grows by one and the row is
-/// claimed-and-self-released by `register_job_hold_or_release`'s `Releasing`
-/// arm (`(attempts, releases) == (1, 1)`, `running`) — the SAME numeric
-/// signature as the genuine, tolerated race, but reached through the
-/// reclaim window the fold's property claimed was already closed, not
+/// Without the second read, the parked iteration, once released, falls
+/// straight through to `claim_next` with no gate check in between —
+/// `claim_next_calls` grows by one and the row is claimed-and-self-released
+/// by `register_job_hold_or_release`'s `Releasing` arm (`(attempts,
+/// releases) == (1, 1)`, `running`) — the SAME numeric signature as the
+/// genuine, tolerated race, but reached through the reclaim window, not
 /// through a claim whose COMMIT preceded 2a.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn release_landing_during_the_reclaim_window_is_caught_by_the_second_gate_read() {
@@ -1274,7 +1268,7 @@ async fn release_landing_during_the_reclaim_window_is_caught_by_the_second_gate_
     assert!(row.claimed_by.is_none(), "{row:?}");
 }
 
-/// R5(c): the prologue park is held PAST the heartbeat bound, so 2e's wait
+/// (c): the prologue park is held PAST the heartbeat bound, so 2e's wait
 /// times out and RELEASE takes its abort arm — the ONLY path where the loop
 /// is aborted with `in_flight == 0`. The loop reports `Aborted`; no hold was
 /// ever registered (`holds == Observed(HoldRelease::default())`); the row the abort left is the
@@ -1365,7 +1359,7 @@ async fn release_timeout_arm_leaves_the_honest_row_recovered_by_arm_1a() {
     assert_ne!(successor.status, JobStatus::Failed.to_string());
 }
 
-/// R5(d): an inline `run_now` (parked before dispatch) is not the loop's:
+/// (d): an inline `run_now` (parked before dispatch) is not the loop's:
 /// `in_flight` reads 0 throughout a concurrent RELEASE and the inline row
 /// keeps its live lease and `releases 0`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1424,13 +1418,12 @@ async fn run_now_under_release_and_stop_does_not_change_in_flight() {
 }
 
 // ---------------------------------------------------------------------------
-// R3 (round-2 REFINE, #482) -- the pair that actually differs
+// The pair that actually differs
 // ---------------------------------------------------------------------------
 
-/// The deleted `release_write_is_identical_on_library_and_server` compared
-/// two calls that funnel into the SAME function (`release_and_stop` on both
-/// arms) and so had zero true-positive capacity. The doc's own claim
-/// (`OPS-COMPUTE-TIER-OPERABILITY.md`, "Library") is STATEMENT identity
+/// Comparing two calls that funnel into the SAME function
+/// (`release_and_stop` on both arms) has zero true-positive capacity. The
+/// library's claim is STATEMENT identity
 /// between `EmbeddedWorker::release_and_stop` (2a-2c, 2e-2h -- 2d folded into 2a) and
 /// `InferenceSession::release_job_leases` (2b+2c) -- the pair that
 /// genuinely differs, since one drives a real loop task through 2a/2d-2h
@@ -1582,9 +1575,8 @@ async fn release_and_stop_report_matches_release_job_leases_on_the_pair_that_act
     leases_session.close().await;
 }
 
-/// Producer-driven P-2F "false" arm (contract `CONTRACT-OPS-fix5.md`,
-/// round 5): `stop_witnessed == false` requires BOTH `stop_resolved ==
-/// false` (this call's own `TakenHandle::take` lost the race — the handle
+/// Producer-driven `stop_witnessed == false` arm: `stop_witnessed == false` requires BOTH
+/// `stop_resolved == false` (this call's own `TakenHandle::take` lost the race — the handle
 /// was already taken) AND `state_witnessed == false` (the terminal-state
 /// watch fell back to the proxy read within one heartbeat). This is exactly
 /// "any signal while draining is a RELEASE" (`deploy-server.md`): a DRAIN
@@ -1676,9 +1668,8 @@ async fn a_release_racing_an_in_flight_drain_reads_stop_unwitnessed() {
 }
 
 /// Producer-driven `HoldReleaseOutcome::Unobserved` on the SESSION arm
-/// (contract `CONTRACT-OPS-fix5.md`, round 5): `runtime.rs`'s M1 table cites
-/// only `jammi-server`'s `liveness.rs` `healthz_flips_to_503_...` test for
-/// this determinant, and that test drives the WORKER arm
+/// `runtime.rs`'s determinant table cites only `jammi-server`'s `liveness.rs`
+/// `healthz_flips_to_503_...` test for this determinant, and that test drives the WORKER arm
 /// (`EmbeddedWorker::release_and_stop`) only -- `InferenceSession::
 /// release_job_leases`'s identical `Err => Unobserved` collapse has no
 /// producer-driven oracle of its own. This drives it with the SAME
@@ -1709,8 +1700,8 @@ async fn release_job_leases_is_unobserved_when_the_keeper_thread_is_dead() {
     );
 }
 
-/// Producer-driven `ReleaseSweep { jobs: None, building: Some(_) }`
-/// (contract `CONTRACT-OPS-fix5.md`, round 5): every existing sweep test
+/// Producer-driven `ReleaseSweep { jobs: None, building: Some(_) }`: every
+/// other sweep test
 /// that reaches an unconfirmed `ReleaseSweep` drops the `building` sweep
 /// (a linked building table); none drives the `jobs` sweep statement's own
 /// `Err` arm while `building` still confirms. This forces exactly that
@@ -1765,12 +1756,9 @@ async fn release_and_stops_second_sweep_reports_jobs_none_building_some_from_a_r
 }
 
 /// Producer-driven `ReleaseSweep { jobs: Some(_), building: None }` — the
-/// mirror image of the test above (contract `CONTRACT-OPS-fix6.md`, round
-/// 6, correcting round 5): the round-5 enumeration declared this arm "NOT
-/// producer-driven ... no OTHER injection point into this statement is
-/// established", reasoning only about the COLUMN
+/// mirror image of the test above. Beyond the COLUMN
 /// `release_building_tables_of_claimant`'s `UPDATE` WRITES
-/// (`result_tables.lease_expires_at`). That statement also NAMES a second
+/// (`result_tables.lease_expires_at`), that statement also NAMES a second
 /// table it reads FROM, `result_tables` itself, and a fault on that table
 /// is separable from the `jobs.releases` fault above because
 /// `release_jobs_claimed_by` never touches `result_tables`. `ALTER TABLE
@@ -1782,12 +1770,12 @@ async fn release_and_stops_second_sweep_reports_jobs_none_building_some_from_a_r
 /// `release_sweep` directly, and the statement runs (and can fault) with
 /// nothing claimed.
 ///
-/// Named `one_sweep`, never `second_sweep` (round 7): `release_job_leases`
+/// Named `one_sweep`, never `second_sweep`: `release_job_leases`
 /// runs `release_sweep` exactly ONCE — there is no sweep #1 on this path to
 /// be "second" after — so this drives `ReleaseSweep.building == None` on
 /// the `SessionOnly` arm only. `EmbeddedWorker::release_and_stop`'s own
 /// sweep #2 (2g) reaching `building == None` from a real backend fault has
-/// no producer in this tree; that gap is still open.
+/// no producer-driven oracle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn release_job_leases_one_sweep_reports_building_none_jobs_some_from_a_real_fault() {
     use jammi_db::catalog::backend::{BackendImpl, TxOptions};
@@ -1828,7 +1816,7 @@ async fn release_job_leases_one_sweep_reports_building_none_jobs_some_from_a_rea
     );
 }
 
-/// R5(d)'s sibling: an inline `run_now` materialization (its `ResultTable`
+/// (d)'s sibling: an inline `run_now` materialization (its `ResultTable`
 /// hold on the shared keeper, adopted under the SAME `writer_id` the loop's
 /// tables use, parked inside `finish`) survives a RELEASE: its building
 /// lease stays live and is advanced by the keeper's next renewal, and after

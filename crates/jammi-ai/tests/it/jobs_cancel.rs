@@ -414,7 +414,7 @@ async fn enqueue_derives_the_model_links_like_the_dedicated_entry_points() {
     assert_eq!(row.model_source, None);
 }
 
-/// #485: a training kind's branch of `JobWorker::run_claimed_job` must
+/// A training kind's branch of `JobWorker::run_claimed_job` must
 /// thread `jobs.cancel_requested` into `run_spec` alongside the lease-lost
 /// flag, so `CancelJob`/`JobHandle::cancel` on a real training job stops the
 /// run rather than being recorded on the row while the run trains to
@@ -432,7 +432,7 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
     let dir = tempfile::TempDir::new().unwrap();
     let mut config = common::test_config(dir.path());
     // A short heartbeat (1s, with a real >2x lease margin) so the watcher
-    // this unit adds polls `cancel_requested` promptly — the SAME cadence
+    // polls `cancel_requested` promptly — the SAME cadence
     // the lease keeper itself renews at, per `spawn_cancel_request_watcher`'s
     // doc.
     config.lease = jammi_db::config::LeaseConfig {
@@ -511,9 +511,9 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
     });
 
     // Sanity gate: the run must still be in flight when the cancel lands, or
-    // this test cannot distinguish "the fix works" from "the run happened to
-    // finish and complete anyway" — a large `epochs` makes this vanishingly
-    // unlikely; if it fires, the fix is to raise `epochs` further, never to
+    // this test cannot distinguish "the cancel stopped it" from "the run
+    // happened to finish and complete anyway" — a large `epochs` makes this
+    // vanishingly unlikely; if it fires, raise `epochs` further, never
     // delete the gate.
     assert!(
         !run.is_finished(),
@@ -521,7 +521,7 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
          cancel -- raise `epochs` further so this genuinely races a live training run"
     );
 
-    // #527/#567/#578: arm the observed-event rendezvous BEFORE requesting
+    // Arm the observed-event rendezvous BEFORE requesting
     // the cancel, so the watcher's fire can never race ahead of the arm.
     let cancel_observed = arm_observed(&handle.job_id, Event::CancelObserved);
 
@@ -539,7 +539,7 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
     // wall-clock guess at its poll cadence (the SAME cadence the lease
     // keeper renews at, so a busy test binary's scheduler delay can push an
     // observation arbitrarily far past any fixed bound a parallel run
-    // happens to pick — #567/#578's flake). A generous 60s backstop: firing
+    // happens to pick). A generous 60s backstop: firing
     // means the machine is wedged or starved, not that this property is
     // false.
     tokio::time::timeout(Duration::from_secs(60), cancel_observed.wait_fired())
@@ -581,7 +581,7 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
     );
 }
 
-/// #485: a bare `JoinHandle` for the cancel-request watcher only DETACHES
+/// A bare `JoinHandle` for the cancel-request watcher only DETACHES
 /// its task when dropped — it does not stop it — so `EmbeddedWorker::drop`
 /// must abort the watcher explicitly (`CancelWatcherGuard`'s abort-on-drop):
 /// without that, aborting the loop task while a training job's
@@ -605,15 +605,15 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
 /// finished within about one poll interval of the abort, and that the
 /// per-attempt catalog handle's strong count returns all the way to zero —
 /// its pre-attempt value, since nothing outside this attempt ever held a
-/// clone of it. Before the fix, the watcher's own clone pins that count at
-/// (at least) one forever and `AbortHandle::is_finished()` never becomes
+/// clone of it. A leaked watcher's own clone would pin that count at (at
+/// least) one forever and `AbortHandle::is_finished()` would never become
 /// `true`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_run_claimed_jobs_future_leaves_no_leaked_cancel_watcher_or_catalog_handle() {
     let dir = tempfile::TempDir::new().unwrap();
     let mut config = common::test_config(dir.path());
     // Short heartbeat (matching the sibling cancel test above): bounds how
-    // long the watcher-finished poll below needs to wait even if the fix
+    // long the watcher-finished poll below needs to wait even if teardown
     // relied on the watcher's own next tick rather than `abort()` alone.
     config.lease = jammi_db::config::LeaseConfig {
         duration_secs: 30,
@@ -725,7 +725,7 @@ async fn a_dropped_run_claimed_jobs_future_leaves_no_leaked_cancel_watcher_or_ca
         assert!(
             tokio::time::Instant::now() < deadline,
             "the cancel-request watcher was not aborted within 5s of its owning future being \
-             dropped -- BLOCK B1: `CancelWatcherGuard::drop` must abort it unconditionally"
+             dropped -- `CancelWatcherGuard::drop` must abort it unconditionally"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -748,7 +748,7 @@ async fn a_dropped_run_claimed_jobs_future_leaves_no_leaked_cancel_watcher_or_ca
     }
 }
 
-/// #485: `run_claimed_job`'s shared `cancel`
+/// `run_claimed_job`'s shared `cancel`
 /// flag has two writers — the lease keeper's own renewal (a genuine lease
 /// loss) and `spawn_cancel_request_watcher` observing `jobs.cancel_requested`
 /// (an operator's `CancelJob`) — and the `Cancelled` arm tells them apart
@@ -803,7 +803,7 @@ async fn a_lease_loss_on_the_owning_worker_lands_the_lease_lost_outcome_never_th
         ..Default::default()
     };
     // Captured BEFORE `config` moves into `InferenceSession::new` below --
-    // the derived bail bound (#527, further down) reads these.
+    // the derived bail bound (further down) reads these.
     let lease_secs = config.lease.duration_secs;
     let heartbeat_secs = config.lease.heartbeat_secs;
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
@@ -873,8 +873,9 @@ async fn a_lease_loss_on_the_owning_worker_lands_the_lease_lost_outcome_never_th
     });
 
     // Sanity gate, mirroring every other lease-loss drive in this suite: the
-    // run must still be in flight, or this test cannot distinguish "the fix
-    // works" from "the run happened to finish on its own first".
+    // run must still be in flight, or this test cannot distinguish "the
+    // lease loss stopped it" from "the run happened to finish on its own
+    // first".
     assert!(
         !run.is_finished(),
         "the spawned run_claimed_job task already completed before the test could kill the \
@@ -886,7 +887,7 @@ async fn a_lease_loss_on_the_owning_worker_lands_the_lease_lost_outcome_never_th
     // write to `jobs` — the row is never touched by this step at all.
     session.lease_keeper().kill_thread_for_test();
 
-    // #527: no discrete watcher tick to rendezvous on here (unlike the
+    // No discrete watcher tick to rendezvous on here (unlike the
     // cancel-request test above) -- `hold.lost_flag()` is flipped by the
     // lease keeper's own CONTINUOUS renewal-miss check, not a single
     // observable event this crate's test hooks can key on. DERIVED instead

@@ -4,11 +4,9 @@ name: Cookbook book
 # checked against the engine at HEAD: build the HEAD embed wheel, verify the API
 # reference matches it, lint, run the shared-lib unit tests, the no-deferral /
 # citation guards, and — the forward half of the engine<->cookbook co-evolution
-# loop (constitution-cited #351 review origin) — a SCOPED, fail-closed quarto
-# render of exactly the chapters this diff could move. This is a mechanized
-# floor under the lead-dispatched phase 6.5 (cookbook-emit) re-emit, which stays
-# discipline (F10-unreliable: it only fires if a human/agent remembers to
-# dispatch it); this job runs on every PR, no dispatch required.
+# loop — a SCOPED, fail-closed quarto render of exactly the chapters this diff
+# could move. It runs on every PR, so chapter re-execution never depends on
+# someone remembering to run it.
 #
 # Still deliberately NOT a full-book render: `ci/scripts/select_render_chapters.py`
 # classifies every chapter (LIVE_COMPUTE / LIVE_COMPUTE_NEEDS_SERVER /
@@ -22,7 +20,7 @@ name: Cookbook book
 # cost-bounded instead of reverting to "render everything". No skip flag, no
 # continue-on-error on the render step: a flaky chapter under this gate is a
 # chapter bug to fix, not a gate to soften. The engine's own SDK-recipes smoke
-# (cookbook.yml) and it/cookbook.rs are separate and unchanged.
+# (cookbook.yml) and it/cookbook.rs are separate.
 #
 # A grpc:// chapter needs a running `jammi-server`, and that is a LANE
 # CAPABILITY this job provisions, not a chapter property that excludes it: the
@@ -33,13 +31,13 @@ name: Cookbook book
 # `cookbook-render.yml` does. The marginal cost is minutes of `cargo build
 # --release -p jammi-server` against the same sccache this job already warms,
 # and only on a diff that selects such a chapter. Excluding those chapters
-# instead is what let a touched grpc:// chapter merge having executed NOWHERE:
-# the nightly renders the PRE-merge base, so it proves the chapter as it was,
+# would let a touched grpc:// chapter merge having executed NOWHERE: the
+# nightly renders the PRE-merge base, so it proves the chapter as it was,
 # never as the diff leaves it.
 #
 # The return half — chapter-coverage accounting (which chapters a merged PR's
-# diff SHOULD have moved, closing the loop the other direction) — is built
-# separately on cookbook/chapter-coverage-gate; together the two mechanize the
+# diff SHOULD have moved, closing the loop the other direction) — is the
+# "Chapter-coverage gate" step below; together the two mechanize the
 # co-evolution doctrine end to end.
 
 on:
@@ -57,7 +55,7 @@ permissions:
   contents: read
 
 env:
-  # The determinism regime (K0 §3): jammi_cookbook also sets these on import, but
+  # The determinism regime: jammi_cookbook also sets these on import, but
   # pinning them in the job env covers anything that reads them first.
   OMP_NUM_THREADS: "1"
   OPENBLAS_NUM_THREADS: "1"
@@ -100,8 +98,8 @@ jobs:
       # (exit 128) — the checkout is owned by a different user than the
       # container's git, and the safe.directory `actions/checkout` sets is
       # not visible here (same trap as ci.yml's build-sha step and
-      # dep-dag.yml's freshness step; CI run 33447230854 died on the
-      # selector's own `git fetch` exactly this way).
+      # dep-dag.yml's freshness step; without it the selector's own
+      # `git fetch` dies exactly this way).
       - name: Mark the checkout safe for git (container UID != checkout UID)
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
@@ -167,8 +165,8 @@ jobs:
           . "$GITHUB_WORKSPACE/.venv/bin/activate"
           python scripts/check_api_reference.py
 
-      # The RETURN half of the engine<->cookbook co-evolution loop (#351
-      # review doctrine): check_api_reference.py above guards that a shipped
+      # The RETURN half of the engine<->cookbook co-evolution loop:
+      # check_api_reference.py above guards that a shipped
       # surface's signature hasn't drifted out from under a chapter; this
       # guards that every shipped surface HAS a chapter (or a reviewed,
       # dated deferral) exercising it in the first place, so a new public
@@ -204,14 +202,12 @@ jobs:
       # Render exactly the selected set with the PR wheel already installed
       # above — the chapter asserts against a frozen golden ARE the check; a
       # nonzero `quarto render` (an assertion failure, an artifact-shape
-      # mismatch, a live-compute call that now behaves differently) fails this
+      # mismatch, a live-compute call that behaves differently) fails this
       # step, and this step carries no `continue-on-error` and no skip flag: a
       # flaky chapter here is a chapter bug to fix, not a gate to soften.
-      # Cost today: one LIVE_COMPUTE chapter (compute-precision.qmd, a
-      # CPU-only local-BERT generate_embeddings call) — its own render span in
-      # the nightly full-book run (cookbook-render.yml, 2026-08-31 run
-      # 33385889616, chapter [29/32]) measured ~3.5s
-      # (2026-08-31T11:37:32.564Z -> 11:37:36.018Z, next-chapter-start delta).
+      # Cost: one LIVE_COMPUTE chapter (compute-precision.qmd, a CPU-only
+      # local-BERT generate_embeddings call) — its own render span in the
+      # nightly full-book run (cookbook-render.yml) measures ~3.5s.
       # This step pays that render cost once more, plus this job's own
       # already-paid-for cold-start (wheel install, jammi_cookbook import) —
       # low seconds, not minutes. The selector is what keeps this O(affected)

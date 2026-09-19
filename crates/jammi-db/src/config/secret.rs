@@ -169,9 +169,8 @@ impl Secret {
 /// persisted `crate::storage::config` credential fields
 /// (`S3Config::secret_access_key`, `R2Config::secret_access_key`,
 /// `GcsConfig::service_account_json`, `AzureConfig::{account_key,
-/// sas_token, client_secret}`), whose whole point is to round-trip through
-/// the catalog's `sources.options` JSON exactly as before this type
-/// existed. Every other place a `Secret` sits in the config has no
+/// sas_token, client_secret}`), whose whole point is to round-trip through the catalog's
+/// `sources.options` JSON as plain strings. Every other place a `Secret` sits in the config has no
 /// `serialize_with` at all — a container can leak a `Secret` field only by
 /// naming this function explicitly, field by field, never by deriving
 /// `Serialize` over a struct that happens to contain one. Never call this

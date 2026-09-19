@@ -465,9 +465,8 @@ enforced by a dedicated CI gate, `cookbook-one-way` /
      `ci/scripts/check_cookbook_session_lifecycle.py`, a guard in
      `ci/guards.toml` (`cookbook session lifecycle` and its self-test). It walks every
      `with tempfile.TemporaryDirectory() as X:` statement's real AST extent (no
-     line or indentation heuristics — this replaces an earlier regex/indent
-     gate an audit found unsound on five shapes; the module's own docstring
-     names them) and flags a `jammi.connect(...)` call tainted by `X` unless
+     line or indentation heuristics — a regex/indent gate is unsound on five
+     shapes the module's own docstring names) and flags a `jammi.connect(...)` call tainted by `X` unless
      that call is *itself* a with-item — of the same statement or of a `with`
      nested inside it — whose context manager is the connect call directly.
      Crediting only that shape is what makes the gate sound on every exit path
@@ -652,9 +651,9 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   Trust the array order, not the `schema.rs` constant order. On Postgres, `run`
   takes a transaction-scoped advisory lock (`SELECT pg_advisory_xact_lock($1)`,
   keyed by `JAMMI_MIGRATION_LOCK_KEY`) as its FIRST statement, before it reads
-  the `applied_migrations` ledger or runs any DDL — closing a race where two
-  fresh replicas booting together both saw an empty ledger and one lost with
-  SQLSTATE `42P07`/`23505` (esc-093, #479); the lock is released on commit or
+  the `applied_migrations` ledger or runs any DDL — without it, two
+  fresh replicas booting together both see an empty ledger and one loses with
+  SQLSTATE `42P07`/`23505`; the lock is released on commit or
   rollback (PgBouncer transaction-pooling safe). SQLite needs no equivalent —
   its `BEGIN IMMEDIATE` write transaction already serialises the one process
   that may hold the file. Migration `027_result_table_lease`
@@ -665,7 +664,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `037_jobs_assembly_failures_next_after`, asserted on both backends by
   `tests/it/migrations.rs::migration_038_is_ordered_after_035_and_037_and_creates_compute_tables`)
   — the catalog-backed cluster state `jammi-ballista`'s scheduler role reads/
-  writes [§2.8f]: distributor-neutral (B1/K5), no `ballista` in any
+  writes [§2.8f]: distributor-neutral, no `ballista` in any
   identifier. `compute_executors` (`executor_id` PK, `instance_id`,
   `host`/`port`/`grpc_port`, `task_slots`/`available_slots`, `status`,
   `heartbeat_at`, `metadata`, and **`devices`** — JSON `[{kind, ordinal}]`,
@@ -701,7 +700,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   which column refused a write. Existing rows are normalised first (a
   nine-digit ISO fraction truncates to six; Postgres's own pre-039
   `timestamptz`-cast-to-text/`CAST(CURRENT_TIMESTAMP AS TEXT)` rendering
-  casts directly). `now_sortable()` (nine fraction digits) is deleted;
+  casts directly).
   `catalog::lease::canonical_stamp_now`/`pg_canonical_stamp` are the ONE
   writer on either backend, MigrationSql::PerBackend (this is the first
   migration whose SQLite/Postgres DDL text cannot be unified — a trigger
@@ -734,7 +733,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   (`config::LeaseConfig`, `#[serde(deny_unknown_fields)]`); `[worker]` carries
   `enabled`/`kinds`/`idle_poll_secs` and refuses (no alias) the former
   `lease_duration_secs`/`heartbeat_interval_secs` keys. `[distributed]
-  max_world_size = 1` (`config::DistributedConfig`, 67 U5b-1b-ii) loads
+  max_world_size = 1` (`config::DistributedConfig`) loads
   INDEPENDENTLY of `[worker]`'s own per-host rank count — the widest `Peer`
   gang any coordinator on this deployment may admit ACROSS FLEET MEMBERS,
   refused at load when `0` (never cross-checked against `[worker]` by
@@ -986,7 +985,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   — the merge is already exact.
   `ProducingDescriptor::NeighborGraph::index_storage_precision`
   (`crates/jammi-db/src/store/manifest.rs`) folds the source table's precision
-  into the K7 materialization identity when the index-assisted driver ran
+  into the materialization identity when the index-assisted driver ran
   (`None` when `exact = true`, which never touches the index).
 - **`AnnSearchExec`** (`crates/jammi-ai/src/operator/ann_search_exec.rs`) and
   **`QueryBuilder`** (`crates/jammi-ai/src/query/builder.rs`) are the DataFusion
@@ -1850,8 +1849,7 @@ three things to the artifact's content digest:
    never the anchor).
 
 Beside the digest — never in place of it — the manifest carries a **keyed leaf
-inventory** (`leaves: Vec<LeafDigest>`, `LeafKey`, `crates/jammi-db/src/store/manifest.rs`;
-plan 67 unit U5b-0): for a result table one leaf per Parquet row group, keyed by its
+inventory** (`leaves: Vec<LeafDigest>`, `LeafKey`, `crates/jammi-db/src/store/manifest.rs`): for a result table one leaf per Parquet row group, keyed by its
 index and byte range as the footer locates it (`parquet_leaves`, the SHA-256 of exactly
 that range); for a model bundle one leaf per file keyed by NAME (the bundle manifest's own
 sha256, so adding a file changes no existing leaf and `combined_hash` stays the bundle's
@@ -2029,11 +2027,11 @@ field (e.g. `crates/jammi-wire/proto/jammi/v1/pipeline.proto`). `SubmitJobReques
 declaring a second wire vocabulary for the identical concept;
 `crates/jammi-ai/src/wire/training.rs`'s `lora_common_from_proto` decodes it and returns it
 alongside `TrainingCommon` (never folded into that type — only the `FineTune` decode arm
-threads it onto `TrainingSpec::FineTune.cache`). Model-level cache reuse is not yet
+threads it onto `TrainingSpec::FineTune.cache`). Model-level cache reuse is not
 supported for `TrainingSpec::FineTune`: `Use` is refused, typed, by `admit_training_spec`
 — the one admission every durable submit edge for a training spec applies before a `jobs`
 row is written (`InferenceSession::submit_fine_tune_spec_deduped`, `InferenceSession::enqueue`,
-and `train_context_predictor_deduped`; <https://github.com/f-inverse/jammi-ai/issues/562>)
+and `train_context_predictor_deduped`)
 rather than probed against a recorded materialization, a different mechanism from the
 *result-table* `probe_cache_record` path the producers above use.
 
@@ -2045,12 +2043,11 @@ to probe or record) and `lora_common_from_proto` refuses `cache = USE` for `Grap
 with a typed `InvalidArgument` at decode — the one place that can still see both the kind
 and the requested value, mirroring the `ContextPredictor` `world_size` refusal in the same
 module. On the column-source kind, `cache = Use` is refused later, at submit, for the
-reason above (https://github.com/f-inverse/jammi-ai/issues/562). `Bypass`/unset is
+reason above. `Bypass`/unset is
 unaffected on either kind: every fine-tune
-job always trains, exactly as it did before this field existed. A stray `cache` key found
+job always trains. A stray `cache` key found
 under `graph_fine_tune` in a persisted `jobs.spec` row is silently dropped at deserialize
-rather than refused, since the type has nowhere to decode it onto (a hard error on unknown
-keys is a separate persisted-row reshape, https://github.com/f-inverse/jammi-ai/issues/548).
+rather than refused, since the type has nowhere to decode it onto.
 The Python client still carries `cache=` as a kwarg on both `fine_tune` and
 `fine_tune_graph` (beside `world_size`, on both transports); both are refused, not
 silently dropped.
@@ -2082,7 +2079,7 @@ not a host or machine identity, so two invocations reporting the same ordinal ar
 numerically interchangeable, including across two different physical hosts that both
 happen to enumerate a GPU at ordinal `0`. This field is recorded for every FineTune run
 but is not consulted by any reuse decision (`cache = Use` on `FineTune` is refused
-before training runs, https://github.com/f-inverse/jammi-ai/issues/562); should a future
+before training runs); should a future
 reuse mechanism read it, treating same-ordinal
 invocations as interchangeable is sound where accelerators are interchangeable, not a
 guarantee across heterogeneous hardware, which would need a real per-host or per-device
@@ -2311,10 +2308,10 @@ staleness→recompute loop — that is the platform's, not the engine's
   GEMM tile instantiation the same literal `shortName`, so keying on `shortName` alone
   collapses distinct instantiations into one anonymous row; the demangled-name key is a
   strict, sum-preserving refinement (a bucket can only split, never merge two old buckets
-  into fewer new ones). **Census reports produced before 2026-09-07 carry the pre-fix,
-  collapsed `Kernel2`/`magma_sgemmEx_kernel` rows in `by_kernel_and_grid`** — their
+  into fewer new ones). **A census report keyed on `shortName` alone carries collapsed
+  `Kernel2`/`magma_sgemmEx_kernel` rows in `by_kernel_and_grid`** — its
   `by_kernel_name` totals and every other top-line number (`gpu_kernel_us_per_step`,
-  wall/front/busy per step) are unaffected; only the per-instantiation breakdown was
+  wall/front/busy per step) are unaffected; only the per-instantiation breakdown is
   coarser.
 - **The three cross-modal towers and their LoRA sites** — each tower has its own
   builder (`ClipText::builder`, `OpenClipVisionTransformer::builder`,
@@ -2491,10 +2488,10 @@ staleness→recompute loop — that is the platform's, not the engine's
   `jammi-lora`, `jammi-encoders`, or `jammi-ai`), so nothing structurally
   stops a future call site in one of those other crates from reintroducing
   `QMatMul::forward`/`apply_op1_no_bwd` on a quantized weight — that half of
-  the class stays review-enforced, not mechanically closed. `esc-037`'s
-  other named entry points (`candle_nn::ops::softmax_last_dim`'s remaining
-  eval call site, `candle_nn::ops::sdpa`) are untouched by this op and stay
-  open/latent respectively (that row's own notes).
+  the class stays review-enforced, not mechanically closed. The class's
+  other entry points (`candle_nn::ops::softmax_last_dim`'s remaining
+  eval call site, `candle_nn::ops::sdpa`) are untouched by this op: the first
+  is still reachable, the second latent.
 - **QLoRA (fine-tuning over a quantized base)** —
   `crates/jammi-ai/src/fine_tune/worker.rs` (`build_encoder_adapters`): a
   GGUF base artifact (`model.gguf` present, `model.safetensors` absent — the
@@ -2519,7 +2516,7 @@ staleness→recompute loop — that is the platform's, not the engine's
   `LoraBuildConfig` struct): borrowed-ref, `Copy`, stack-built per call.
   `should_apply_lora` uses **suffix** match (`ends_with`); `effective_rank` uses
   **substring** match (`contains`) — *different semantics, do not conflate*.
-  `LoraBuildConfig::frozen()` is the no-LoRA default. Two seeds, split (plan 67 U4b):
+  `LoraBuildConfig::frozen()` is the no-LoRA default. Two seeds, split:
   `seed` keys the A/B init draw, `dropout_seed` the mask draw — every tower site
   (`LoraSite::wrap` and the BERT family's own builders) calls
   `LoraLinear::new_with_base_seeded(.., seed, dropout_seed, ..)`; a gang's ranks share
@@ -2609,13 +2606,13 @@ staleness→recompute loop — that is the platform's, not the engine's
   ascending levels, …). `seed` defaults to `DEFAULT_FINE_TUNE_SEED = 42` — a constant,
   never entropy.
 - **`JobWorker` / `TrainingJob`** — `crates/jammi-ai/src/fine_tune/worker.rs` (the
-  `JobWorker` struct, renamed from `TrainingWorker`: it dispatches every compiled job
+  `JobWorker` struct: it dispatches every compiled job
   kind, training and compute alike, not only the three training kinds),
   `crates/jammi-ai/src/fine_tune/training_job.rs` (the `TrainingJob` struct): the claim
   loop that owns a training kind's lifecycle and the poll/wait handle a training verb
   returns. See §3.5 for the full submit → claim → train → finalize path and
   §2.7/`docs/guide/src/operability.md` for the `jobs`/`instances`/`workers` schema
-  (migration 029) and lease keeper every job kind now shares.
+  (migration 029) and lease keeper every job kind shares.
 
 ### 2.6a Fused training kernels (`jammi-kernels`)
 
@@ -2623,7 +2620,8 @@ Companion guides: `docs/maintainer/cuda-kernel-guide.md` (writing and proving a
 kernel: roofline method, the oracle rules, the benchmarking protocol),
 `docs/maintainer/fine-tune-performance-guide.md` (the fine-tune performance track
 end to end: the tape-tax diagnosis, each lever's design and measured effect, bf16
-rounding placement, the esc-045 metric finding, and the measurement checklists),
+rounding placement, why a single-step bf16 gradient cosine cannot judge fidelity, and the
+measurement checklists),
 and `docs/maintainer/pod-build-guide.md` (the ops manual for the pod build
 substrate every lever above was measured on: seed/clone/push-stamp/timing-lock
 procedures, exact commands and failure recovery, and the tree-state invariant
@@ -2702,10 +2700,10 @@ outcome through the shared mechanism:
   tensor reaches `apply2`/`apply3` is what keeps the fallback clean). Also
   gates on `MIN_CUDA_COMPUTE_CAP = (8, 0)` via `ComputeCapability::meets_minimum`
   / `probe_cuda_compute_capability` (bf16 tensor cores need Ampere+).
-- **Per-op dispatch counters, two mechanisms, additive.** C2–C5 (LayerNorm,
-  RoPE, softmax, GeGLU) each hand-declared their own `pub(crate) static
-  X_DISPATCH_COUNTERS: DispatchCounters` — left as-is, live and tested. Every
-  op after that (starting with the LoRA epilogue) calls
+- **Per-op dispatch counters, two mechanisms, additive.** LayerNorm,
+  RoPE, softmax and GeGLU each hand-declare their own `pub(crate) static
+  X_DISPATCH_COUNTERS: DispatchCounters`, live and tested. Every
+  other op (starting with the LoRA epilogue) calls
   `counters_for("its_op_name")` (`admission.rs`), a process-wide, op-keyed
   `HashMap<&'static str, &'static DispatchCounters>` that creates-and-leaks a
   fresh `DispatchCounters` the first time an op name is seen and hands back the
@@ -2762,20 +2760,16 @@ two independently-maintained ones.
 feature-gated oracle suites — `tests/parity.rs`
 (`#![cfg(feature = "parity-test")]`) and `tests/golden_parity.rs`
 (`#![cfg(feature = "golden-parity")]`) — and `jammi-kernels/tests/cuda_parity.rs`
-is `required-features = ["cuda"]` (`Cargo.toml`), gated on `JAMMI_REQUIRE_CUDA`
-for hard-fail-vs-skip semantics on a device-acquisition failure.
-`--features golden-parity` IS wired into CI's hermetic `test` job
+is `required-features = ["live-gpu-tests"]`: it is compiled only where CUDA
+device 0 exists, and fails naming the device when it cannot be opened.
+`--features golden-parity` runs in CI's hermetic `test` job
 (`.github/workflows/ci.yml`): its oracle is a committed PyTorch dump
 (`cookbook/fixtures/htsat_clap_tiny/goldens.safetensors`, a tracked binary),
-never a network call or a torch install, so it needs no pod. **No CI workflow
-passes `--features parity-test`, and no CI runner has a GPU to build
-`--features cuda` against (disclosed gap)** — those two lanes run only from a
-pod session (`ci/scripts/gpu-dev.sh`), by a human or an agent driving one.
-Wiring any parity/golden/cuda lane into a required CI check is a **human
-gate edit** (constitution: an executable gate is human-amend-only, tightening
-only); `golden-parity` is wired into the hermetic `test` job under that
-rule, `parity-test`/`cuda` are not — this guide states the gap honestly
-rather than implying a green check exists where none runs today.
+never a network call or a torch install. `parity-test` needs a PyTorch
+environment and `live-gpu-tests` a GPU, which no hosted runner has: CI lints
+the `live-gpu-tests` surfaces (the `flash-attn-compile` job), and they run on
+RunPod through `ci/scripts/runpod_gpu_prove.sh` (`gpu-prove.yml`) or a pod
+session (`ci/scripts/gpu-dev.sh`).
 
 **Numerics doctrine: reproduce-the-reference rounding decisions, not
 "whatever's convenient."** Each op's bf16 rounding order is a researched,
@@ -2824,8 +2818,8 @@ disclosed choice against a named upstream reference, not this crate's own
   not an enum policy, so it gets its own doctrine.** Folds `1/sqrt(head_dim)`
   into the fused softmax op (`scale * scores + mask`, applied strictly before
   the mask add — see `ops/softmax.rs`'s module doc's "scale semantics"
-  section), replacing the `Op::Affine` node ModernBERT's training arm used to
-  retain per layer. The field is PRIVATE (unlike `fully_masked`, whose
+  section), so ModernBERT's training arm retains no separate `Op::Affine`
+  node per layer. The field is PRIVATE (unlike `fully_masked`, whose
   `FullyMaskedPolicy` has no invalid inhabitant): the only way to set it is
   `SoftmaxLastDimFused::with_scale(scale: f32) -> Result<Self, KernelError>`,
   which refuses non-finite or non-positive `scale` (`KernelError::InvalidScale`
@@ -2858,37 +2852,32 @@ script's own header for the full env-var surface (`MODEL_DIR`,
 every leg — jammi-eager INCLUDED — runs off the SAME tip binary, built ONCE
 at the start (`build_binary()`, `--features cuda,jammi-encoders/flash-attn`).
 jammi-eager is the tip binary with every fused op forced eager via
-`JAMMI_KERNELS_DISABLE=$JAMMI_EAGER_DISABLE_OP_KEYS` (TEN op keys — F4
-adversarial-audit fold-in added `mem_efficient_attention`, a live per-layer
-`admit_cascade`/once-per-forward `op_disabled` site, and issue #463 added
+`JAMMI_KERNELS_DISABLE=$JAMMI_EAGER_DISABLE_OP_KEYS` (TEN op keys, including
+`mem_efficient_attention`, a live per-layer
+`admit_cascade`/once-per-forward `op_disabled` site, and
 `gelu_erf_fused`, a live standalone `admit` site in
 `crate::activations::gelu_erf` —
-`ci/scripts/perf/test_finetune_ab_disable_op_keys.py` sweeps for both
-mechanically against the real call graph, catching an eleventh addition the
-same way) under `JAMMI_KERNELS_STRICT=1` (disable wins over Strict) plus
+`ci/scripts/perf/test_finetune_ab_disable_op_keys.py` sweeps the set
+mechanically against the real call graph, so an eleventh key cannot be
+missed) under `JAMMI_KERNELS_STRICT=1` (disable wins over Strict) plus
 `--expect-kernels-disabled` as a negative control — never "the pre-fusion
 commit", and never a second build. Both `jammi-fused` legs ALSO pass
-`--expect-kernels-disabled ""` (F5) — an empty expectation, hard-failing on
+`--expect-kernels-disabled ""` — an empty expectation, hard-failing on
 any ambient `JAMMI_KERNELS_DISABLE` leaking into the process. **Order-balanced
-bar legs:** the two legs the #352 throughput bar gates on (jammi-fused,
+bar legs:** the two legs the throughput bar gates on (jammi-fused,
 torch-sdpa) each run TWICE per config in a fixed A,B,B,A interleaving
 (mirrors `gpu_inference_ab.sh`'s own documented drift rationale), gated by a
-`TWO_RUN_PROTOCOL_MARKER` file the script writes before any leg runs (F2) —
+`TWO_RUN_PROTOCOL_MARKER` file the script writes before any leg runs —
 when present, `ab_merge.py` requires all four bar legs and refuses
 (`INVALID`) a genuinely MISSING one, rather than silently degrading to the
-single-pair estimator an absent marker (a legacy `raw_dir`) still does.
+single-pair estimator an absent marker (an older `raw_dir`) selects.
 `ab_merge.py` computes the MIN of the two resulting pair ratios (the
 estimator least favourable to jammi) as the bar ratio, reports
 `INDETERMINATE` — never PASS/FAIL — when the two pair ratios disagree too
 much relative to the 0.9 bar, and separately cross-checks `jammi-fused` vs
 `jammi-fused-2` (and the torch-sdpa pair) for premise drift ACROSS the two
-runs (F3), independent of the same-run premise checks each pair already
-gets. **`JAMMI_REQUIRE_CUDA`** governs
-the separate `cuda_parity` suite (`crates/jammi-kernels/tests/cuda_parity.rs`,
-`required-features = ["cuda"]`): unset, a CUDA-acquisition failure on a
-GPU-less build reads as skip; set (the pod session's actual landing proof), it
-panics instead — so a broken device acquisition on the pod cannot silently
-read as passed-by-skipping.
+runs, independent of the same-run premise checks each pair already
+gets.
 
 ### 2.6b The training-set loader: committed order, the session memory pool, and the residency bound (`jammi-db` + `jammi-ai/fine_tune`)
 
@@ -2918,18 +2907,18 @@ plans no `SortExec` regardless of which path bound the table:
 (`crates/jammi-db/src/store/mod.rs`) is where that declaration is actually read back
 off the table's `.materialization.json` sidecar; it can legitimately fail to declare one —
 no sidecar at all (a pre-migration-021 table), the sidecar present but UNREADABLE (an
-object-store error, or a body that fails to parse as the manifest JSON — #500 U2c closing
-round, A4/P-B6), or a sidecar whose descriptor is not a `TrainingSet` variant — and all
-three arms now `warn!`, naming the table and the reason, before returning `Ok(None)`:
+object-store error, or a body that fails to parse as the manifest JSON), or a sidecar
+whose descriptor is not a `TrainingSet` variant — and all
+three arms `warn!`, naming the table and the reason, before returning `Ok(None)`:
 registration still succeeds (the reader's explicit `ORDER BY` clause still sorts the read
-correctly), only the `SortExec`-free plan is lost for that one row, and the silent fallback
-no longer stays silent: `registration_warns_when_a_training_sets_sidecar_is_absent`
+correctly), only the `SortExec`-free plan is lost for that one row, and the fallback is
+never silent: `registration_warns_when_a_training_sets_sidecar_is_absent`
 (`crates/jammi-db/tests/it/materialization.rs`) and
 `registration_warns_when_a_training_sets_sidecar_is_unreadable`
-(`crates/jammi-db/tests/it/materialization.rs`). Before the unreadable arm was added,
-the read error propagated out of `training_set_registration_sort_order` via `?`, which made
-`bind_result_table` return `Err` WITHOUT ever calling `register_table` at all — the row
-never entered the session's schema, not merely lost its ordering hint.
+(`crates/jammi-db/tests/it/materialization.rs`). The unreadable arm must not propagate
+the read error via `?`: that would make `bind_result_table` return `Err` WITHOUT ever
+calling `register_table` — the row would never enter the session's schema, not merely lose
+its ordering hint.
 **Cost, unconditionally paid:** `read_materialization_manifest` issues one object-store GET
 (plus a body read, when the object exists) per `TrainingSet` row, every time
 `bind_result_table` runs for that row — never cached — which means `load_existing_tables`
@@ -3007,7 +2996,7 @@ mutable provider's own scan above — and it is single-partition. See `ts_sessio
 `the_writers_single_partition_derivation_plans_one_sort_and_no_merge` is FILE-backed
 rather than `MemTable`-backed.
 
-**A pinned/versioned result table is NOT this universe (#500 U2c closing round, A3).** A
+**A pinned/versioned result table is NOT this universe.** A
 VERSIONED result table's provider is `build_masked_provider`
 (`crates/jammi-db/src/store/mod.rs`): one `ListingTable` per manifest fragment,
 combined by `MaskedTableProvider`'s `scan` (`crates/jammi-db/src/store/masked_provider.rs`)
@@ -3037,7 +3026,7 @@ this stream keeps, `PerRank(PartitionSpec)` for training or `All { batch }` for 
 `StreamConfig`'s `new` (`crates/jammi-ai/src/fine_tune/stream.rs`) refuses a zero
 prefetch depth (typed); production trains at `PRODUCTION_PREFETCH_DEPTH`
 (`crates/jammi-ai/src/fine_tune/stream.rs`, `= 2`) — a named constant, the regression
-pin for a `prefetch = 2` deadlock an earlier design hit, never a literal at the call site:
+pin for a `prefetch = 2` deadlock, never a literal at the call site:
 `StreamConfig::new` (`crates/jammi-ai/src/fine_tune/worker.rs`). `open`
 (`crates/jammi-ai/src/fine_tune/stream.rs`) runs ONE bounded-memory pre-pass over its
 whole window BEFORE the first training step — a schema check plus, for a numeric target, a
@@ -3190,7 +3179,7 @@ the copies disagreed.
   catalog record's stored `config_json` over disk and the fine-tune worker follows the
   same order, so a job and a serve of the same catalog row can never classify the same
   model differently.
-- **The esc-058 fingerprint arms consume this module without changing their BYTES** —
+- **The fingerprint arms consume this module without changing their BYTES** —
   `crates/jammi-ai/src/model/backend/candle.rs` (the config and weights fingerprint
   arms); a test pins the fingerprint/digest on the tiny fixtures across the extraction.
 
@@ -3209,8 +3198,8 @@ the copies disagreed.
   machinery (`backend::candle::all_candidate_paths`) stats known names only,
   never sniffs by extension, so a quantized checkpoint must be named exactly
   `model.gguf`. **Precedence is FROZEN:** `model.safetensors` (or
-  `open_clip_model.safetensors`) wins, byte-for-byte, exactly as before this
-  format existed — for a local directory, an HF Hub repo, AND a QLoRA
+  `open_clip_model.safetensors`) wins, byte-for-byte, over `model.gguf`
+  — for a local directory, an HF Hub repo, AND a QLoRA
   fine-tune's own base-artifact resolution (§2.6) alike. Only when neither
   is present does `model.gguf` enter the picture. A directory or repo
   carrying some OTHER `*.gguf` filename is a typed refusal naming every such
@@ -3378,14 +3367,13 @@ describing a removed surface.
 
 - **`ServiceTier` / `TierSet`** — `crates/jammi-server/src/tiers.rs` (the `ServiceTier`
   enum and `TierSet` struct). `Core` (always mounted — session/embedding/inference/
-  pipeline + mutable-table/channel/audit + job submission + `GetServerInfo`; this is
-  where durable job submission/status live now, not a `Train` tier), `Event`
-  (`TriggerService`), `Eval` (`EvalService`) — `OPTIONAL = [Eval, Event]`; the `train`
-  cargo feature and `Train` tier are removed with no shim (#485): `services =
+  pipeline + mutable-table/channel/audit + job submission + `GetServerInfo`; durable job
+  submission/status live here, not in a tier of their own), `Event`
+  (`TriggerService`), `Eval` (`EvalService`) — `OPTIONAL = [Eval, Event]`; there is no
+  `train` tier or cargo feature: `services =
   ["train"]` is a startup error naming the unknown tier. `TierSet::resolve` is
-  infallible (`ServiceTier::compiled_in` and `TierError::FeatureNotCompiled` are gone —
-  every tier is core-compiled, so there is nothing left to reject); `TierSet::all` (was
-  `all_compiled`) is `Self::resolve(ServiceTier::OPTIONAL)`. `TierSet::as_wire` is
+  infallible — every tier is core-compiled, so there is nothing to reject; `TierSet::all`
+  is `Self::resolve(ServiceTier::OPTIONAL)`. `TierSet::as_wire` is
   **sorted alphabetically** — the `ServerInfo.services` handshake. **Invariant:
   advertised (`as_wire`) == mounted.** Whether a process *runs* the job claim loop it
   accepts is the separate `[worker] enabled` runtime key (§3.5,
@@ -3394,7 +3382,7 @@ describing a removed surface.
   `OssServer` struct and `serve_grpc_chain` fn). Single Tonic chain shared by production
   and tests. Mounts Flight SQL + `CatalogService` + `JobService` always; engine-backed
   services when `engine.is_some()`; tier-gated `Eval`/`Trigger`. `ChainParts::worker`
-  (renamed from `ChainParts::train_worker`) spawns the embedded `JobWorker` claim loop
+  spawns the embedded `JobWorker` claim loop
   iff `[worker] enabled`. **`OssServer::new` calls `InferenceSession::open` (not
   `new`)** so the `annotate` UDTF is registered for Flight SQL.
 - **Session/tenant boundary** — `crates/jammi-server/src/grpc/session.rs`:
@@ -3427,7 +3415,7 @@ describing a removed surface.
   **Invariant: faithful errors** — each `Status` carries the full structured detail so the
   client reconstructs the exact variant.
 
-### 2.8a GangService — multi-host gang admission (I-GANG) and `HostAdmission`
+### 2.8a GangService — multi-host gang admission and `HostAdmission`
 
 The coordinator-to-member admission seam for a multi-host training run.
 Proto: `crates/jammi-wire/proto/jammi/v1/gang.proto`, `service GangService`
@@ -3444,8 +3432,8 @@ inbound decode cap, the same per-service setter the public chain applies
 
 **Two observables, split at admission.** BEFORE admission every determinant
 is the call's own result — `Err(Status)`: the ONE fixed `FailedPrecondition`
-for every I-GANG determinant (rung 5 below), `Unavailable` for a catalog fault
-or a busy slot, `InvalidArgument` for the wire K2 edges — and no stream
+for every job-row determinant (rung 5 below), `Unavailable` for a catalog fault
+or a busy slot, `InvalidArgument` for the wire range edges — and no stream
 exists. AFTER admission the call has returned `Ok(stream)`, so every later
 outcome is delivered IN the stream: `Admitted`, then exactly one
 `Aborted{reason}`, or — for a protocol violation on the admitted stream — a
@@ -3457,12 +3445,12 @@ pre-admission refusal never does.
 rung its own status, and NOTHING on this host is touched before the decision
 is complete:
 
-1. **Wire K2** (`gang.rs`, before any row read): `world == 0` →
+1. **Wire range checks** (`gang.rs`, before any row read): `world == 0` →
    `InvalidArgument("world must be greater than zero")`; `rank >= world` →
    `InvalidArgument("rank must be less than world")`.
-2. **Ambient admin scope.** `TenantBinding::is_admin_scope()` — I-GANG
-   refuses ambient admin scope outright, before any row is read.
-3. **I-GANG, the row predicate.** `Catalog::get_job_for_rank(job_id)`
+2. **Ambient admin scope.** `TenantBinding::is_admin_scope()` — gang
+   admission refuses ambient admin scope outright, before any row is read.
+3. **The job row is the capability: the row predicate.** `Catalog::get_job_for_rank(job_id)`
    (`crates/jammi-db/src/catalog/jobs_repo.rs`, primary-key-only, no tenant
    predicate, never admin scope) returns the row by primary key alone — it
    decides nothing itself, returns `Ok(None)` only when no job with that id
@@ -3479,8 +3467,7 @@ is complete:
    a malformed value is `LeaseFact::Undecodable` — refused under its own
    `GangRefusalReason::LeaseUndecodable`, the SAME fixed status as every
    other determinant — rather than surfacing as a genuine read fault on one
-   backend and a live-lease row fact on the other,
-   <https://github.com/f-inverse/jammi-ai/issues/574>);
+   backend and a live-lease row fact on the other);
    `WorldSizeFact::Undecodable` is itself a refusal — a ROW FACT, never a
    fault of the read, so it never maps through `admission_catalog_fault`;
    `assign.world != row.world_size` is itself a refusal — the lattice is
@@ -3500,8 +3487,8 @@ is complete:
    (tenant_id IS NULL AND $t IS NULL)`, an explicit tenant argument, no
    admin arm — never the relaxed `get_result_table`, whose `OR tenant_id IS
    NULL` would hand a real tenant every GLOBAL row of the same name) must
-   find a row with `status = 'ready'`; then the sidecar verify (K4,
-   verify-at-read): `ResultStore::read_materialization_manifest` of the
+   find a row with `status = 'ready'`; then the sidecar verify
+   (verify-at-read): `ResultStore::read_materialization_manifest` of the
    row's `parquet_path` must return a manifest whose `artifact` equals
    `training_set_ref` — a sidecar predating the leaf inventory reads as
    ABSENT and refuses; a mismatching or undecodable one refuses; this host's
@@ -3519,7 +3506,7 @@ is complete:
    (`Catalog::upsert_instance` never writes the database clock here), so a
    value that does not parse reads as not-fresh — a row fact, joining the
    same "absent OR stale" class `fresh_instance` already collapses to one
-   answer, never a fault (issue #574); absent or stale otherwise still
+   answer, never a fault; absent or stale otherwise still
    refuses.
 6. Every refusal in rungs 2–5 is the SAME status and message —
    `FailedPrecondition("gang admission refused")` — regardless of which
@@ -3570,7 +3557,7 @@ gauge `jammi_worker_jobs_in_flight` is `1` iff the holder is `JobRun`.
 session takes four — the rank body's end and the park bound are exclusive:
 
 - **inbound** — `Cancel` ends the session `Aborted{Cancelled}`; a second
-  `Assign` is the K2 protocol violation, a status trailer
+  `Assign` is a protocol violation, a status trailer
   (`InvalidArgument`), never a second admission; every other frame goes
   through `HeldSession::dispatch_round_frame`, the ONE site the round
   protocol is wired at: a round frame (`RoundInbox::is_round_frame` —
@@ -3692,7 +3679,7 @@ choke point every writer of them funnels through.
   `CHECK` — a row with `peer_addr` set and `result_root` NULL is
   representable and simply never a member): `NULL`/`NULL` means "this
   process never joins a gang" — every library/CLI process, and every server
-  that never sets `[server] peer_advertise`. Four K5 pin sites: the const
+  that never sets `[server] peer_advertise`. Four migration pin sites: the const
   list (`catalog/migrations.rs`), `EXPECTED_MIGRATION_NAMES`
   (`tests/it/migrations.rs`), the ordered-after oracle
   (`migration_035_is_ordered_after_034_and_adds_instances_peer_addr_result_root`,
@@ -3706,8 +3693,7 @@ choke point every writer of them funnels through.
   Option<MemberRoot>`, plus a `worker: Mutex<Option<WorkerFacts>>` cell
   that is the claim-loop half, owned exclusively by `JobWorker`/
   `EmbeddedWorker` (`fine_tune/worker.rs`): `run_until` sets it only AFTER
-  its FIRST `upsert_worker` call SUCCEEDS (P-Y4, contract
-  `feat_500-C-U5b-1a` §12 — a failed first upsert must leave the cell
+  its FIRST `upsert_worker` call SUCCEEDS (a failed first upsert must leave the cell
   `None`, never a fact the row does not carry, so a keeper reregister
   racing a still-failing loop start never writes a `workers` row the real
   upsert never itself managed to write), every LATER `set_worker_state`
@@ -3718,14 +3704,11 @@ choke point every writer of them funnels through.
   `Display` only) and is the SAME type the peer listener uses
   (`index::peer` re-exports it) — the peer and gang listeners can never
   drift into two address types. `PeerAddr::parse` refuses an UNBRACKETED
-  IPv6 literal (P-Y4): a bracketed IPv6 host (`[::1]:9000`), an IPv4
+  IPv6 literal: a bracketed IPv6 host (`[::1]:9000`), an IPv4
   literal, or a DNS hostname are accepted; `2001:db8::1:9000` is refused
   (ambiguous which colon separates host from port).
 - **`MembershipConfig::validate` and `InstanceRegistration::from_config`**
-  (`catalog/instance.rs`, contract §10, the round-3 excision — the
-  design history through rounds 1–3, incl. the pure-validate/materialize
-  split and the `artifact_dir`-is-a-local-path fix, is filed as unit
-  U5b-1a-A2, `docs/plans/67-distributed-training/README.md`). The member
+  (`catalog/instance.rs`). The member
   row's root is the byte-for-byte output of
   `JammiConfig::resolved_result_root()`, carried VERBATIM: `MembershipConfig::
   validate(&JammiConfig) -> Result<Option<MembershipConfig>>` checks only
@@ -3743,14 +3726,14 @@ choke point every writer of them funnels through.
   arbitrary string in the `instances.result_root` column. **The membership
   path performs NO
   interpretation of the root at all, and the gang-membership listing verb
-  does not even read it** (P-Y1, contract §12, the round-5 excision): no
+  does not even read it**: no
   URL parse, no scheme handling, no symlink resolution, no case folding, no
   byte comparison. The row still carries the configured spelling verbatim —
   two spellings of one physical location (`gcs://b/p` vs `gs://b/p`, a
   trailing `/`, a case difference) are two DIFFERENT STRINGS in that
   column — but `list_gang_members`'s admission predicate does not consult
-  it at all in this unit; root identity across spellings, and any
-  membership predicate built on it, is unit U5b-1a-A2's question. The only
+  it at all; root identity across spellings is not decided anywhere, and no
+  membership predicate is built on it. The only
   refusal on this path is the non-UTF-8 refusal already inside
   `resolved_result_root` (a non-UTF-8 `artifact_dir`,
   the default arm's only failure mode). `JammiConfig::load_from` calls
@@ -3775,7 +3758,7 @@ choke point every writer of them funnels through.
   one); `Some` iff the row is present, fresh under
   `instance_liveness_margin(lease)`, and `peer_addr` is non-NULL.
   `list_gang_members(GangListing { kind, self_instance, lease })` (no root
-  field, P-Y1) is an `instances JOIN workers` listing: excludes the caller
+  field) is an `instances JOIN workers` listing: excludes the caller
   itself, excludes `workers.state != 'claiming'` (an INNER join — no
   `workers` row is excluded too, since a member is a fleet worker with a
   claim-loop slot, not merely a live process), excludes a `kinds` token
@@ -3844,7 +3827,7 @@ as they do on the blocking pool — both in `train_fine_tune` (§2.8d), and the
 `BlockingCall::spawn_blocking` that enters a `Peer` member's
 `run_fine_tune_blocking` in `run_member_rank`, the rank body (§2.8e); tests
 mint theirs with
-`spawn_thread`/`spawn_scoped` (U4b's gang oracles run each rank on such a
+`spawn_thread`/`spawn_scoped` (the local-gang oracles run each rank on such a
 thread). The compile-time claim has an executed oracle:
 four doctests on `BlockingCall`'s own docs
 (`crates/jammi-ai/src/fine_tune/collective/mod.rs`; `cargo test -p jammi-ai
@@ -3881,7 +3864,7 @@ arms on the frozen frames: `RankControl` (coordinator → member) gains
 ElementType }`, `optional agreement`). `ElementType` is `F32`/`F16`/`BF16`;
 `RoundVerb`'s `UNSPECIFIED` and every value outside the set are refused
 naming both sides, never defaulted. Every numeric field is range-checked by
-its reader before use (K2: `world`, `root < world`, every count and dim as a
+its reader before use (`world`, `root < world`, every count and dim as a
 `usize` with an overflow-checked element product, `chunk_count`, `index <
 chunk_count`, the reassembled byte length against the bound the descriptor
 implies). Nothing declared before is renamed or removed; the api-freeze
@@ -3983,7 +3966,7 @@ reason and folds nothing.
 
 ### 2.8d The coordinator body — topology, membership → assignment → dispatch → assembly
 
-Plan 67 U5b-1b-ii. Where a claimed training job's ranks run is decided ONCE,
+Where a claimed training job's ranks run is decided ONCE,
 in `JobWorker::run_spec` (`crates/jammi-ai/src/fine_tune/worker.rs`), by
 `TopologyDecision::decide(world_size, local_ranks)` from the job's own
 identity-relevant `TrainingCommon::world_size` and this host's `[worker]
@@ -4020,7 +4003,7 @@ order: (1) the write-once CAS of the training-set identity pair —
 `Catalog::materialize_or_reuse_training_set(job, worker, attempt, sidecar
 digest, table name)`; a `Moved` claim exits with NO write of any kind; (2) the
 scaler — computed inside every rank's own `TrainingLoop::run` from the
-training set's targets (the K3 pass), nothing crosses the wire; the
+training set's targets, nothing crosses the wire; the
 pre-dispatch gates (the cancel flag → `Cancelled`; the host's phase not
 `Running` → `Drain`); (3) membership — `Catalog::list_gang_members(GangListing
 { kind, self_instance, root: this process's own MemberRoot, lease })`: the
@@ -4035,7 +4018,7 @@ then the installed `MemberDialer` (`HostAdmission::member_dialer`, the
 engine's one transport seam; `jammi-server` installs `gang_rounds::GangDialer`
 over `dial_member` beside the gang listener in `OssServer::bind`) with the
 `Assign { job_id, attempt, rank, world, coordinator_instance_id }`; a member
-that does not admit (`Unavailable` for a busy slot, an I-GANG refusal, a
+that does not admit (`Unavailable` for a busy slot, a job-row refusal, a
 transport error) ends THIS attempt (every session admitted so far is ended)
 and the NEXT attempt re-lists; (6) `Peer::coordinator(links, device,
 max_message_bytes).with_timeout([worker] rank_timeout_secs)` and the run as
@@ -4078,7 +4061,7 @@ settled by the released-vs-failed split (`lease_settlement`, a total match
 over `CoordinatorEnd` — DESIGN.md §4 "Failure and release"): a member's
 `Aborted{Drain}` hands the lease back at once (`Catalog::release_job_lease`
 — `releases + 1`, lease NULL, the row claimable within one idle poll: a
-rolling restart of the peer tier costs zero net attempts, OPS D10); every
+rolling restart of the peer tier costs zero net attempts); every
 other mid-run gang fault (a member's `Aborted` for any other reason, a
 dropped stream, a rank silent past `[worker] rank_timeout_secs`, a peer's
 round fault) leaves the lease to EXPIRE — reclaim arm 1a requeues the row
@@ -4103,8 +4086,8 @@ session ended cooperatively (`Peer::end_members` → `Cancel`, the stream
 close) — and the body classifies the end from the links (`MemberAborted` /
 `LinkFault`). The `Peer` is built for the attempt and dropped with it, so a
 fault retires exactly the attempt it belongs to (the actuator rule: the
-engine ships the actuator, never the control loop). OPS D6 holds by the slot
-discipline: a member's slot is `Rank` for its whole session and a peer never
+engine ships the actuator, never the control loop). Ending a session never aborts a
+claim transaction, by the slot discipline: a member's slot is `Rank` for its whole session and a peer never
 claims while it holds a rank (`HostAdmission`), so ending a session never
 aborts a claim transaction anywhere. The successor attempt resumes from the
 job-level resume checkpoint (`{job_id}/_resume/`, rank 0's epoch-boundary
@@ -4129,7 +4112,7 @@ advisory in the distributed lane. The oracles:
 serveable world on a one-device host reaches assembly and lands
 `ShortListed`, cooled, released; the `Moved` CAS arm writes nothing; a
 `local_ranks = 2` job fans out through the real `run_spec` and publishes bytes
-equal to a U4b-shaped `LocalGang` run of the same fixture),
+equal to a `LocalGang` run of the same fixture),
 `crates/jammi-server/tests/it/gang_coordinator.rs` (through the REAL
 `GangServer::run_rank` on the production `peer_bind` listener: a member
 whose slot is busy answers `Unavailable` — the attempt ends `Unavailable`,
@@ -4142,7 +4125,7 @@ oracle over every `CoordinatorEnd`.
 
 ### 2.8e The rank body and the runner roles — the single-writer rule as types
 
-Plan 67 U5b-1b-iii. DESIGN.md §4's single-writer rule — the lease holder is
+The single-writer rule (`docs/plans/67-distributed-training/DESIGN.md` §4) — the lease holder is
 the ONE writer of a job's row, its durable checkpoints and its published
 artifact; every other rank of a gang writes nothing durable — is stated as
 two types in `crates/jammi-ai/src/fine_tune/role.rs`: `LeaseHolder`
@@ -4171,7 +4154,7 @@ The trainer's own durable writes carry the same gate:
 unset — rank 0 the loop claimer, the pre-role default; a role that
 contradicts the rank is refused at `build`), and `save_resume_checkpoint` /
 `save_epoch_checkpoint` write only for a holder — in the trainer, never in
-the store, which stays role-agnostic. **K4**: `W == 1` is the `LoopClaimer`
+the store, which stays role-agnostic. `W == 1` is the `LoopClaimer`
 on every arm and never enters the coordinator body
 (`crates/jammi-ai/tests/it/gang_coordinator.rs`, the pinned single-rank
 row; the `test-hooks` records `training_test_hooks::lease_holders_for` /
@@ -4244,7 +4227,7 @@ with the rest of the workspace, no cargo feature — a process's role is
   containing a `GangExec` must be single-partition (one gang mechanism,
   never a multi-partition fan-out); a stage whose required device kind (an
   `InferenceExec`'s or a `GangExec`'s stamped `device_kind`) differs from this executor's own
-  `InferenceSession::compute_device()` is refused typed (K7 device
+  `InferenceSession::compute_device()` is refused typed (device
   pinning), never silently run on the wrong device.
 - **Roles** (`roles.rs`): `host_scheduler`/`host_executor` build a
   `SchedulerRole`/`ExecutorRole` served on jammi's own shutdown — never
@@ -4270,7 +4253,7 @@ with the rest of the workspace, no cargo feature — a process's role is
   `Active` status and a `heartbeat_at` within `executor_liveness_window()`,
   derived at run time from Ballista's own default executor timeout — a row a SIGKILLed executor left
   behind stops admitting plans after the window, a `Terminating` one at
-  once) — `JammiExecutionEngine`'s own device-pinning refusal above (K7)
+  once) — `JammiExecutionEngine`'s own device-pinning refusal above
   is the second line, never a silent mis-run.
 - **`CatalogClusterState`/`CatalogJobState`** (`cluster.rs`) — the
   catalog-backed `ballista_scheduler::cluster::{ClusterState, JobState}`
@@ -4335,10 +4318,10 @@ net attempts, never a re-claim.
 executor role's `PlacedGangRunner`) — (i) takes this host's job slot
 through `HostAdmission::probe_claim` (a host already holding a rank, a
 loop-claimed job, or another placement refuses typed BEFORE any row write,
-OPS D6); (ii) `transfer_claim`s the row from the descriptor's submitter to
+); (ii) `transfer_claim`s the row from the descriptor's submitter to
 this instance at the SAME `attempts`; (iii) runs `run_claimed_job_under`
 VERBATIM as `LeaseHolder::Coordinator` — the SAME body a `Peer` gang's own
-claimant runs — so the published bytes are U5b's (K4); (iv) maps the
+claimant runs — so the published bytes are the same as a `Peer` gang's; (iv) maps the
 body's `AttemptEnd` to `PlacedOutcome`
 (`Trained`/`Failed`; `LeftForReclaim` is a typed `Err`, so the Ballista task
 itself ends in error and Ballista's own `task_max_failures = 0` never
@@ -4475,8 +4458,7 @@ own handle type; a compute verb submitted through `InferenceSession::enqueue` ge
 generalised `jammi_ai::jobs::JobHandle` instead — both name a row in the same table).
 **No in-memory state crosses submit→claim — the spec is the only carrier.**
 
-**Worker pickup:** `JobWorker::run_until` (`crates/jammi-ai/src/fine_tune/worker.rs`,
-renamed from `TrainingWorker`) each tick: `Catalog::reclaim_expired_jobs` → `Catalog::
+**Worker pickup:** `JobWorker::run_until` (`crates/jammi-ai/src/fine_tune/worker.rs`) each tick: `Catalog::reclaim_expired_jobs` → `Catalog::
 claim_next` (takes a lease over `[worker] kinds`, `FOR UPDATE SKIP LOCKED` on Postgres) →
 `run_claimed_job`: deserialize spec, pin catalog to the job's tenant, register the claim
 with the process's shared `LeaseKeeper` (one dedicated OS thread, its own runtime and
@@ -5240,7 +5222,7 @@ auto-available to every encoder.)
   (`crates/jammi-server/src/runtime.rs`); reorder and gRPC-Web error handling breaks (raw gRPC
   unaffected).
 - **`TraceContextLayer` sits between `MetricsLayer` and the gRPC-Web layers, on every
-  listener path (#486).** `MetricsLayer` → `TraceContextLayer` → `GrpcWebTrailersLayer` →
+  listener path.** `MetricsLayer` → `TraceContextLayer` → `GrpcWebTrailersLayer` →
   `GrpcWebLayer` → … (`crates/jammi-server/src/runtime.rs`, both
   `BoundChain::serve_with_shutdown` and `AssembledChain::into_layered_axum_router`). It opens
   one span per request and continues an incoming W3C `traceparent` via
@@ -5513,7 +5495,7 @@ list): `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, `pyproject.toml`, `clients/py
 `packaging/server-cu12/pyproject.toml`. On merge, **prove before tagging**: dispatch
 `.github/workflows/gpu-prove.yml` on the commit to be released (`--ref main` at the tip, or on the
 pushed tag once it exists) and wait for all four shipped arches to go green — **EVERY** release
-publishing job (#454 follow-up, all-or-nothing: not only the CUDA lanes) gates on that recorded
+publishing job (all-or-nothing: not only the CUDA lanes) gates on that recorded
 verdict rather than proving anything themselves (`ci/scripts/gpu_prove_verdict.py`, consumed via
 `_gpu-proof-required.yml`); a red leg is re-run by hand (`gh run rerun <run_id> --failed`) in that
 same prove run. The verdict check is CHECK-ONCE and FAIL-LOUD — no poll, no deadline: a tag push on a

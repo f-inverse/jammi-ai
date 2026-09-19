@@ -289,7 +289,7 @@ preload_models = [
 # estimated bytes ONE query may load locally for segments it does not own,
 # when their owners are unreachable -- the last rung of the placed-search
 # failure ladder (see "Beyond one node" in reference-topologies.md). Unset
-# (the default) = unbounded, today's behaviour. It is NOT a memory cap: the
+# (the default) = unbounded. It is NOT a memory cap: the
 # segment cache never evicts, earlier queries' loads are invisible to the
 # check (each query loads afresh and frees on completion; the on-disk copy of
 # a remote bundle persists), distinct remote segments accumulate on disk, and

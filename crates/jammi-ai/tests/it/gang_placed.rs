@@ -1,11 +1,12 @@
-//! Plan 67 wave 4, GANG unit — the `Placed` arm of a claim, `run_placed_gang`
-//! and the two seams (contract `feat_500-wave4` §2.3/§9), driven through the
+//! The `Placed` arm of a claim, `run_placed_gang` and its two seams (the
+//! submitter and the executor), driven through the
 //! REAL claim → `run_claimed_job` → `run_claimed_job_under` path over two
 //! HERMETIC sessions sharing one catalog (the shape two `jammi-server`
 //! replicas take — `gang_chaos.rs`'s own pattern, jammi-ai's own version:
 //! the executor's `Peer`-shaped spec is placed with its OWN `[worker]
 //! local_ranks = 2`, so it completes as a `Local` gang, entirely in-process
-//! — no real gang listener / `MemberDialer` is needed to prove K4, exactly
+//! — no real gang listener / `MemberDialer` is needed to prove byte
+//! equality with the local reference, exactly
 //! the same substitution `gang_coordinator.rs`'s own "local fan-out" oracle
 //! makes for the identical reason).
 //!
@@ -210,7 +211,7 @@ impl PlacedGangSubmitter for TransferThenFailSubmitter {
     }
 }
 
-/// p1 (RED at base: the `Placed` arm/`note_placed` hook does not exist):
+/// p1:
 /// with a submitter installed, a `world_size = 2` job takes the `Placed`
 /// arm and NEVER reaches [`JobWorker::coordinate`] — `note_placed` fires,
 /// `coordinator_ends_for` stays empty.
@@ -236,11 +237,11 @@ async fn p1_a_world_size_two_job_takes_the_placed_arm_and_not_coordinate() {
     );
 }
 
-/// p2 (RED at base): the stub submitter drives a REAL `run_placed_gang` on a
+/// p2: the stub submitter drives a REAL `run_placed_gang` on a
 /// second session; the transfer moves `claimed_by`, `attempts`/`releases`
 /// unchanged; the executor session's body runs the coordinator through its
-/// OWN `Local{2}` gang; the job completes with the SAME artifact bytes (K4)
-/// as the wave-3 `Local` fan-out reference.
+/// OWN `Local{2}` gang; the job completes with the SAME artifact bytes as
+/// the `Local` fan-out reference.
 #[tokio::test(flavor = "multi_thread")]
 async fn p2_the_stub_submitter_drives_a_real_run_placed_gang_to_the_same_bytes() {
     let (submitter, executor, _dir) = fleet().await;
@@ -270,7 +271,7 @@ async fn p2_the_stub_submitter_drives_a_real_run_placed_gang_to_the_same_bytes()
     assert!(!published.is_empty());
     assert_eq!(
         published, reference,
-        "a placed gang's published bytes equal the Local reference (K4)"
+        "a placed gang's published bytes equal the Local reference"
     );
 
     // p3: the submitter wrote NOTHING (no terminal write; `HandedOff`); its
@@ -305,8 +306,8 @@ async fn p3_the_submitters_slot_is_free_after_a_placed_attempt_ends() {
 
 /// p4: a stream fault BEFORE any transfer (the row still `claimed_by` the
 /// submitter) → `Abandoned` — the row is `running`, no terminal write, no
-/// error recorded; the next reclaim/claim spends the attempt (wave 3 §8's
-/// shape) — asserted here on the row facts a fresh reclaim would act on.
+/// error recorded; the next reclaim/claim spends the attempt — asserted
+/// here on the row facts a fresh reclaim would act on.
 #[tokio::test(flavor = "multi_thread")]
 async fn p4_a_stream_fault_before_transfer_leaves_the_row_running_for_the_submitter() {
     let (submitter, _executor, _dir) = fleet().await;
@@ -437,8 +438,8 @@ async fn p6_run_placed_gang_refuses_a_stale_attempt_and_a_second_launch() {
 }
 
 /// p7: `run_placed_gang` on a host already holding a rank refuses typed
-/// BEFORE `transfer_claim` — the row's `claimed_by` is unchanged (wave 3c
-/// §4's fixture: a rank taken directly on the admission cell).
+/// BEFORE `transfer_claim` — the row's `claimed_by` is unchanged (the
+/// fixture takes a rank directly on the admission cell).
 #[tokio::test(flavor = "multi_thread")]
 async fn p7_run_placed_gang_refuses_a_host_already_holding_a_rank_before_any_transfer() {
     let (submitter, executor, _dir) = fleet().await;
@@ -474,12 +475,12 @@ async fn p7_run_placed_gang_refuses_a_host_already_holding_a_rank_before_any_tra
     drop(busy_rank);
 }
 
-/// p9 (contract §9 B6, "refuse what's new" for EVERY entry): a host that
-/// has begun a DRAIN refuses a placed gang BEFORE any transfer — the row
-/// stays the submitter's, so a successor (never this terminating process)
-/// runs it. Mutation: drop `probe_claim`'s phase check and this reds (the
-/// holder is `Free`, so the CAS would admit and `transfer_claim` would move
-/// the row onto a process inside its termination grace).
+/// p9 ("refuse what's new" for EVERY entry): a host that has begun a DRAIN
+/// refuses a placed gang BEFORE any transfer — the row stays the
+/// submitter's, so a successor (never this terminating process) runs it.
+/// Without `probe_claim`'s phase check the holder is `Free`, so the CAS
+/// would admit and `transfer_claim` would move the row onto a process
+/// inside its termination grace.
 #[tokio::test(flavor = "multi_thread")]
 async fn p9_run_placed_gang_refuses_a_draining_host_before_any_transfer() {
     let (submitter, executor, _dir) = fleet().await;
@@ -549,8 +550,8 @@ async fn p8_a_placed_run_never_re_submits_even_with_a_submitter_installed_on_its
     assert_eq!(after.status, "completed", "{after:?}");
 }
 
-/// The heartbeat-keying claim `WorkerJobError::HandedOff`'s own doc names
-/// (item 4): `Catalog::heartbeat_job` is keyed on `claimed_by`, so a stale
+/// The heartbeat-keying claim `WorkerJobError::HandedOff`'s own doc names:
+/// `Catalog::heartbeat_job` is keyed on `claimed_by`, so a stale
 /// holder's heartbeat after a hand-off can never resurrect the new holder's
 /// lease.
 #[tokio::test(flavor = "multi_thread")]
@@ -592,8 +593,7 @@ async fn the_submitters_heartbeat_after_hand_off_never_resurrects_the_executors_
     );
 }
 
-/// #500 wave 5 group E1, P7 pressure-round fix (adversarial-audit finding on
-/// `register_job_hold_or_release`): `run_placed_gang` takes its claim
+/// `run_placed_gang` takes its claim
 /// (`probe_claim`), snapshots its `WorkerShared` birth release-epoch in the
 /// SAME synchronous step, then makes two catalog round trips
 /// (`Catalog::transfer_claim`, `Catalog::get_job`) before the hold is
@@ -606,19 +606,12 @@ async fn the_submitters_heartbeat_after_hand_off_never_resurrects_the_executors_
 /// instant) and find nothing of this job's; the epoch comparison alone is
 /// what catches it.
 ///
-/// Mutation (executed): in `JobWorker::run_placed_gang`, changing the final
-/// `WorkerShared::for_single_run(admission, worker.worker_id.clone(),
-/// claim_epoch)` call to ignore `claim_epoch` and read
-/// `admission.release_epoch()` live at that call site instead (the pre-fix
-/// shape, which reads the epoch only after both catalog round trips) reds
-/// this test: `run_placed_gang` returns `Ok(PlacedOutcome::Trained { .. })`
-/// instead of the expected `Err`, because by the time of that live read the
-/// RELEASE has already landed and is folded into the very value compared
-/// against itself, so `released_since_birth` reads `false` and the claim
-/// dispatches straight through the RELEASE. First line of the red output:
-/// `a claim that raced RELEASE must self-release, never dispatch: called
-/// \`Result::expect_err\` on an \`Ok\` value: Trained { artifact_digest: ...
-/// }`.
+/// The epoch compared is the one snapshotted with the claim
+/// (`WorkerShared::for_single_run(.., claim_epoch)`). Reading
+/// `admission.release_epoch()` live after both catalog round trips would
+/// fold the RELEASE into the very value compared against itself:
+/// `released_since_birth` would read `false` and the claim would dispatch
+/// straight through the RELEASE (`Ok(PlacedOutcome::Trained { .. })`).
 #[tokio::test(flavor = "multi_thread")]
 async fn release_landing_between_probe_claim_and_transfer_self_releases_a_placed_gang() {
     let (submitter, executor, _dir) = fleet().await;
@@ -687,36 +680,19 @@ async fn release_landing_between_probe_claim_and_transfer_self_releases_a_placed
     assert_eq!(after.releases, 1, "{after:?}");
 }
 
-/// #500 wave 5 group E1, P7 pressure-round fix, round 2 (adversarial-audit
-/// finding on round 1's own fix above): round 1 read
-/// `HostAdmission::release_epoch` immediately AFTER `probe_claim()`
-/// returned — two separate, non-atomic operations, so a RELEASE landing
-/// between `probe_claim`'s own internal phase read (which commits the
-/// claim while the phase is still `Running`) and the epoch read
-/// afterwards is caught by neither: `probe_claim` already admitted, and
-/// the epoch read already carries the RELEASE's bump, so
-/// `released_since_birth` compares the post-release epoch against itself
-/// and reads `false` — the placed gang would dispatch on a releasing
-/// host. The fix reads the epoch BEFORE `probe_claim()` runs at all, so
-/// any RELEASE landing in the (now benign) gap between the read and
-/// `probe_claim()` is instead refused by `probe_claim`'s own phase check:
-/// a release visible enough to have bumped the epoch has, a fortiori,
-/// already flipped the phase (`HostAdmission::begin_release` orders the
-/// phase flip strictly before the epoch bump). Parked here, immediately
-/// after the epoch read and before `probe_claim` itself runs.
+/// `run_placed_gang` reads `HostAdmission::release_epoch` BEFORE
+/// `probe_claim()` runs, so a RELEASE landing in the gap between the read
+/// and `probe_claim()` is refused by `probe_claim`'s own phase check: a
+/// release visible enough to have bumped the epoch has already flipped the
+/// phase (`HostAdmission::begin_release` orders the phase flip strictly
+/// before the epoch bump). Parked here, immediately after the epoch read
+/// and before `probe_claim` itself runs.
 ///
-/// Mutation (executed): swapped `run_placed_gang`'s epoch read and its
-/// `probe_claim()` call back to their pre-fix order — `probe_claim()`
-/// first, this same park point second, the epoch read last, exactly the
-/// shape the finding names — and reran this test: it reds because the
-/// epoch read now captures the ALREADY-bumped value (the claim committed
-/// while `Running`, then the park lets the RELEASE land, then the epoch
-/// is read only after), so `released_since_birth` never sees a
-/// difference and the claim dispatches straight through the RELEASE.
-/// First line of the red output (the test's own `expect_err` message,
-/// executed): `a claim raced by RELEASE before probe_claim must never
-/// dispatch: Trained { artifact_digest:
-/// "1a24c580af994b80e26d0ce0df69fedefbac297b95338844070d0a6c9d046887" }`.
+/// The reverse order is unsound: `probe_claim` commits the claim while the
+/// phase is still `Running`, the RELEASE lands, and an epoch read taken
+/// afterwards already carries its bump — `released_since_birth` compares
+/// the post-release epoch against itself, reads `false`, and the placed
+/// gang dispatches on a releasing host.
 #[tokio::test(flavor = "multi_thread")]
 async fn release_landing_between_the_epoch_read_and_probe_claim_is_still_refused() {
     let (submitter, executor, _dir) = fleet().await;

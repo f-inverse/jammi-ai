@@ -53,6 +53,10 @@ paths = ["ci/**", "crates/jammi-kernels/**"]
 probe = "python3 -c 'import yaml'"
 provide = "python3 -m pip install --user --quiet 'PyYAML==6.*'"
 
+[need.actionlint]
+probe = "command -v actionlint"
+provide = "bash ci/scripts/install_actionlint.sh"
+
 [need.safetensors]
 probe = "python3 -c 'import safetensors'"
 provide = "python3 -m pip install --user --quiet safetensors"
@@ -72,6 +76,21 @@ provide = "yum install -y -q rsync"
 [need.tmux]
 probe = "command -v tmux"
 provide = "yum install -y -q tmux"
+
+[need.flock]
+probe = "command -v flock"
+provide = "yum install -y -q util-linux"
+
+[need.shasum]
+probe = "command -v shasum"
+provide = "yum install -y -q perl-Digest-SHA"
+
+# A locale whose collation differs from C's byte order. A here-string, not
+# a pipe: under the runner's pipefail, `grep -q` exiting early SIGPIPEs
+# `locale -a` and reads as absent.
+[need.en-us-locale]
+probe = "grep -qixE 'en_US[.]utf-?8' <<< \"$(locale -a)\""
+provide = "yum install -y -q glibc-langpack-en"
 
 # `cargo metadata --frozen` reads the registry; it never builds.
 [need.cargo-registry]
@@ -116,19 +135,14 @@ run = "python3 ci/scripts/check_doc_parity.py"
 why = "Every enum the docs enumerate lists exactly the variants the code has."
 
 [[guard]]
+name = "no run-time test skips"
+run = "bash ci/scripts/check_no_require_flags.sh"
+why = "No test reads green when its resource is missing: none reads a JAMMI_REQUIRE_* flag, because none has a skip for one to guard."
+
+[[guard]]
 name = "GPU parity matrix"
 run = "python3 ci/scripts/check_gpu_parity_matrix.py"
 why = "Every shipped (architecture × verb) cell is covered by a GPU parity test, structurally excluded, or named as pending."
-
-[[guard]]
-name = "kernel oracle standard"
-run = "python3 ci/scripts/check_kernel_oracles.py"
-why = "A test that skips without its hardware fails instead when that hardware is required: an unrun oracle is red, never green."
-
-[[guard]]
-name = "kernel oracle standard suite"
-run = "python3 ci/scripts/test_check_kernel_oracles.py"
-why = "The kernel-oracle guard fires on each skip shape it names."
 
 [[guard]]
 name = "engine dep-direction"
@@ -307,7 +321,7 @@ name = "gpu-dev lifecycle safety"
 run = "bash ci/scripts/test_gpu_dev_lifecycle.sh"
 why = "The pod tooling tracks a pod from the moment it is created and never terminates one it did not create."
 when = ["rig"]
-needs = ["ssh-keygen", "jq"]
+needs = ["ssh-keygen", "jq", "tmux", "flock"]
 
 [[guard]]
 name = "runpod cluster primitives"
@@ -318,10 +332,10 @@ needs = ["ssh-keygen", "jq"]
 
 [[guard]]
 name = "pod build substrate"
-run = "JAMMI_REQUIRE_LOCK_TEST=1 bash ci/scripts/test_pod_substrate.sh"
+run = "bash ci/scripts/test_pod_substrate.sh"
 why = "A pod's build environment, its seed-cache key manifest and its pushed-tree stamp are what the pod lanes assume."
 when = ["rig"]
-needs = ["cargo-registry", "jq", "rsync", "tmux"]
+needs = ["cargo-registry", "jq", "rsync", "tmux", "flock", "shasum", "en-us-locale"]
 
 [[guard]]
 name = "pod build timings"
@@ -527,3 +541,19 @@ run = "python3 ci/scripts/perf/test_gen_fixed_length_audio_corpus.py"
 why = "The fixed-length audio corpus is deterministic and of the length it claims."
 when = ["perf"]
 
+
+[[guard]]
+name = "distributed legs"
+run = "python3 ci/scripts/check_distributed_legs.py --self-test && python3 ci/scripts/check_distributed_legs.py"
+why = "Every distributed test runs in exactly one leg of distributed.yml; none is compiled and never run."
+
+[[guard]]
+name = "workflow validity"
+run = "bash ci/scripts/check_workflows.sh"
+why = "Every workflow parses as GitHub parses it: jobs, needs, expressions and action inputs resolve."
+needs = ["actionlint"]
+
+[[guard]]
+name = "GPU test placement"
+run = "python3 ci/scripts/check_gpu_test_placement.py --self-test && python3 ci/scripts/check_gpu_test_placement.py"
+why = "Every GPU test is in a GPU-only target or a `gpu` module the GPU lane selects; no CPU test runs on a GPU host."

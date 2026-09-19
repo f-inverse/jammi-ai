@@ -36,7 +36,7 @@ Methods compared (all LoRA, ModernBERT-base, same subset + same golden):
 * ``graph_declared`` — ``fine_tune_graph(edge_provenance="declared")`` over the
   declared citation graph, for contrast.
 
-Determinism contract (K0 §3): committed subset ids, pinned ModernBERT + dtype,
+Determinism contract: committed subset ids, pinned ModernBERT + dtype,
 single-threaded BLAS (applied by importing jammi_cookbook), the pair/triplet mining
 seeded from ``determinism.SEED``, the recall fold a pure numpy routine, metrics
 asserted to tolerances downstream.

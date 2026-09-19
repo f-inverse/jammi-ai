@@ -1,8 +1,6 @@
 use crate::common;
 
-use jammi_db::catalog::backend::{BackendImpl, BackendKind};
-use jammi_db::catalog::backend_postgres::PostgresBackend;
-use jammi_db::catalog::backend_sqlite::SqliteBackend;
+use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::config::StoragePrecision;
@@ -12,50 +10,16 @@ use jammi_db::{
     session::JammiSession,
     source::{FileFormat, SourceConnection, SourceType},
 };
-use jammi_test_utils::{make_test_session, unique_suffix};
+use jammi_test_utils::{make_test_session, open_backend, unique_suffix};
 use tempfile::tempdir;
 use test_case::test_case;
-
-/// Fetch a backend-parameterized session, skipping the test (with a warning,
-/// never `#[ignore]`) when the Postgres arm has no `JAMMI_TEST_PG_URL`.
-macro_rules! session_or_skip {
-    ($backend:expr, $dir:expr) => {
-        match make_test_session($backend, $dir.path()).await {
-            Some(s) => s,
-            None => {
-                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
-                return;
-            }
-        }
-    };
-}
-
-/// Build a raw catalog backend on `backend`, without wrapping it in a
-/// session — used only by the one test that needs a caller-customized
-/// [`jammi_db::config::JammiConfig`] (a non-default `engine.batch_size`)
-/// alongside the backend choice.
-async fn build_backend(backend: BackendKind, dir: &std::path::Path) -> Option<BackendImpl> {
-    match backend {
-        BackendKind::Sqlite => {
-            let b = SqliteBackend::open(&dir.join("catalog.db")).await.unwrap();
-            Some(BackendImpl::Sqlite(b))
-        }
-        BackendKind::Postgres => {
-            let url = jammi_test_utils::pg_url_for_tests()?;
-            let pg = PostgresBackend::open_with_options(&url, 8, None)
-                .await
-                .unwrap();
-            Some(BackendImpl::Postgres(pg))
-        }
-    }
-}
 
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn register_and_query_multiple_formats(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     // Backend-unique source ids: the Postgres lane shares one `sources` table
     // across the whole test run, and `add_source` hard-errors on a duplicate
@@ -118,7 +82,7 @@ async fn register_and_query_multiple_formats(backend: BackendKind) {
 #[tokio::test]
 async fn query_with_filter_and_order(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
     let patents_id = format!("patents_{}", unique_suffix());
 
     session
@@ -165,7 +129,7 @@ async fn source_persists_across_sessions(backend: BackendKind) {
     let persist_id = format!("persist_{}", unique_suffix());
 
     {
-        let session = session_or_skip!(backend, dir);
+        let session = make_test_session(backend, dir.path()).await;
         session
             .add_source(
                 &persist_id,
@@ -181,7 +145,7 @@ async fn source_persists_across_sessions(backend: BackendKind) {
     }
 
     {
-        let session = session_or_skip!(backend, dir);
+        let session = make_test_session(backend, dir.path()).await;
         let sources = session.catalog().list_sources().await.unwrap();
         assert!(sources.iter().any(|s| s.source_id == persist_id));
     }
@@ -192,7 +156,7 @@ async fn source_persists_across_sessions(backend: BackendKind) {
 #[tokio::test]
 async fn source_crud_list_and_remove(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     let suffix = unique_suffix();
     let src_a = format!("src_a_{suffix}");
@@ -267,7 +231,7 @@ async fn remove_source_refuses_and_touches_nothing_with_a_live_building_table(
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     let suffix = unique_suffix();
     let source_id = format!("busy_src_{suffix}");
@@ -406,13 +370,7 @@ async fn remove_source_refuses_and_touches_nothing_with_a_live_building_table(
 #[tokio::test]
 async fn session_respects_config_batch_size(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let backend_impl = match build_backend(backend, dir.path()).await {
-        Some(b) => b,
-        None => {
-            eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
-            return;
-        }
-    };
+    let backend_impl = open_backend(backend, dir.path()).await;
     let mut config = common::test_config(dir.path());
     config.engine.batch_size = 2;
 
@@ -446,7 +404,7 @@ async fn session_respects_config_batch_size(backend: BackendKind) {
 #[tokio::test]
 async fn register_and_query_jsonl_file_source(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     // A 2-row newline-delimited JSON fixture, written directly into the
     // test's tempdir (this format has no shared fixture under
@@ -489,7 +447,7 @@ async fn register_and_query_jsonl_file_source(backend: BackendKind) {
 #[tokio::test]
 async fn directory_source_with_jsonl_format_excludes_json_named_file(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     // A directory holding both a `.jsonl` file (2 rows) and a `.json`-named
     // file (3 rows, same schema) — the jsonl-format directory listing must
@@ -535,15 +493,14 @@ async fn directory_source_with_only_ndjson_files_registered_as_jsonl_falls_back_
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     // A directory holding ONLY `.ndjson`-named files: `.jsonl` (jsonl's
     // default extension) has zero matches, so the adaptive fallback tries
     // `.ndjson` next and finds this directory's 2 rows — `.ndjson` has no
     // wire/CLI surface of its own, so this fallback is the only reachable
-    // path onto it. Registration SUCCEEDS and the rows are queryable, not an
-    // error (the enshrined "zero matches" test this replaces predates the
-    // adaptive fallback the lead specified).
+    // path onto it. Registration SUCCEEDS and the rows are queryable, not a
+    // "zero matches" error.
     let listing_dir = dir.path().join("ndjson_only");
     std::fs::create_dir_all(&listing_dir).unwrap();
     std::fs::write(listing_dir.join("a.ndjson"), "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
@@ -580,7 +537,7 @@ async fn directory_source_with_neither_jsonl_nor_ndjson_is_a_loud_error_naming_b
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     // Neither `.jsonl` nor its `.ndjson` fallback has any match — the typed
     // error must name BOTH extensions tried, not just the first.
@@ -626,7 +583,7 @@ async fn directory_source_with_both_jsonl_and_ndjson_prefers_jsonl_and_ignores_n
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     // A directory holding BOTH a `.jsonl` file (2 rows) and an `.ndjson` file
     // (3 rows): `.jsonl` has a non-empty match, so the adaptive fallback never
@@ -676,7 +633,7 @@ async fn directory_with_a_zero_byte_jsonl_and_a_real_ndjson_falls_back_and_serve
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     // A directory holding a 0-byte `.jsonl` file (extension matches, but the
     // size-`> 0` filter drops it — zero USABLE `.jsonl` matches) and a real
@@ -721,7 +678,7 @@ async fn directory_with_a_zero_byte_jsonl_and_a_real_ndjson_falls_back_and_serve
 #[tokio::test]
 async fn single_file_ndjson_url_with_no_override_falls_back_and_serves_rows(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     // The adaptive fallback applies to a SINGLE-FILE url too, not only a
     // directory listing: a lone `.ndjson` file, registered as `jsonl` with
@@ -757,7 +714,7 @@ async fn single_file_ndjson_url_with_no_override_falls_back_and_serves_rows(back
     );
 }
 
-/// Zero-match guard test group (`closes_escape: esc-036-directory-source-silently-lists-zero-files`).
+/// Zero-match guard test group: a directory source never silently lists zero files.
 ///
 /// A directory/file source whose listing extension mismatches its actual
 /// files must never silently resolve to a schema-less, row-less table with
@@ -772,7 +729,7 @@ async fn single_file_ndjson_url_with_no_override_falls_back_and_serves_rows(back
 #[tokio::test]
 async fn single_file_source_with_zero_extension_match_is_a_loud_error(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     // A `.json`-named file registered as `jsonl` (default `.jsonl` extension,
     // with an explicit `file_extension` override so the adaptive `.ndjson`
@@ -823,7 +780,7 @@ async fn single_zero_byte_jsonl_file_is_a_loud_error_not_a_silent_empty_table(
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     // `touch events.jsonl` / an interrupted export: the file exists, its
     // extension matches, but it carries 0 bytes and therefore no schema.
@@ -866,7 +823,7 @@ async fn directory_of_only_zero_byte_jsonl_files_is_a_loud_error_not_a_silent_em
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     // Same as the single-file case above, but for the directory listing arm:
     // a directory whose only `.jsonl`-extension file is 0 bytes must resolve
@@ -907,7 +864,7 @@ async fn directory_of_only_zero_byte_jsonl_files_is_a_loud_error_not_a_silent_em
 #[tokio::test]
 async fn zero_match_guard_also_fires_on_a_non_jsonl_format(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     // The zero-match guard sits ABOVE the per-format branch in
     // `create_listing_table` and must fire for every format, not just
@@ -947,7 +904,7 @@ async fn explicit_extension_override_bypasses_the_adaptive_fallback_and_serves_o
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     // A directory holding BOTH a `.jsonl` file (2 rows) and an `.ndjson` file
     // (3 rows), with an EXPLICIT `.ndjson` override. The adaptive fallback
@@ -998,7 +955,7 @@ async fn explicit_extension_override_bypasses_the_adaptive_fallback_and_serves_o
 #[tokio::test]
 async fn empty_file_extension_override_is_a_typed_refusal(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     let fixture_path = dir.path().join("events.jsonl");
     std::fs::write(&fixture_path, "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
@@ -1027,7 +984,7 @@ async fn empty_file_extension_override_is_a_typed_refusal(backend: BackendKind) 
 #[tokio::test]
 async fn file_extension_override_without_a_leading_dot_is_a_typed_refusal(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     let fixture_path = dir.path().join("events.jsonl");
     std::fs::write(&fixture_path, "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
@@ -1067,7 +1024,7 @@ async fn adaptive_extension_is_pinned_at_registration_and_survives_a_later_exten
     let listing_dir = dir.path().join("flip_corpus");
 
     {
-        let session = session_or_skip!(backend, dir);
+        let session = make_test_session(backend, dir.path()).await;
         std::fs::create_dir_all(&listing_dir).unwrap();
         // Only `.ndjson` present at registration: the adaptive fallback
         // resolves to `.ndjson`, and THAT is the extension that must get
@@ -1096,7 +1053,7 @@ async fn adaptive_extension_is_pinned_at_registration_and_survives_a_later_exten
         );
     }
 
-    // The auditor's exact repro: AFTER registration, add a `.jsonl` file to
+    // AFTER registration, add a `.jsonl` file to
     // the SAME directory. Without pinning, a re-derived adaptive resolution
     // on the next reload would find `.jsonl` non-empty and silently switch
     // to it — this reload would then serve only the NEW file's 1 row
@@ -1104,7 +1061,7 @@ async fn adaptive_extension_is_pinned_at_registration_and_survives_a_later_exten
     // no error and no signal anything changed.
     std::fs::write(listing_dir.join("b.jsonl"), "{\"id\": 3}\n").unwrap();
 
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
     let results = session
         .sql(&format!("SELECT id FROM {source_id}.public.flip_corpus"))
         .await
@@ -1146,7 +1103,7 @@ async fn jsonl_arm_pin_survives_a_files_swapped_to_ndjson_and_reload_fails_loudl
     let listing_dir = dir.path().join("jsonl_pin_corpus");
 
     {
-        let session = session_or_skip!(backend, dir);
+        let session = make_test_session(backend, dir.path()).await;
         std::fs::create_dir_all(&listing_dir).unwrap();
         // Only `.jsonl` present at registration: the adaptive fallback
         // resolves to `.jsonl` — the FIRST-tried extension — and THAT must
@@ -1190,7 +1147,7 @@ async fn jsonl_arm_pin_survives_a_files_swapped_to_ndjson_and_reload_fails_loudl
     std::fs::remove_file(listing_dir.join("a.jsonl")).unwrap();
     std::fs::write(listing_dir.join("b.ndjson"), "{\"id\": 99}\n").unwrap();
 
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
     let result = session
         .sql(&format!(
             "SELECT id FROM {source_id}.public.jsonl_pin_corpus"
@@ -1212,7 +1169,7 @@ async fn reload_survives_a_source_whose_files_vanished_after_registration(backen
     let fixture_path = dir.path().join("events.jsonl");
 
     {
-        let session = session_or_skip!(backend, dir);
+        let session = make_test_session(backend, dir.path()).await;
         std::fs::write(&fixture_path, "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
         session
             .add_source(
@@ -1243,7 +1200,7 @@ async fn reload_survives_a_source_whose_files_vanished_after_registration(backen
     // per-source `if let Err(e) = ... { warn!; continue; }` guard) rather than
     // failing the whole session open — one vanished source's files must not
     // make every OTHER source, or the session itself, unreachable.
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
 
     // The catalog row survives (reload only skips DataFusion registration on
     // failure, it never deletes the persisted source) …
@@ -1271,7 +1228,7 @@ async fn session_tenant_defaults_to_none_and_with_tenant_sets_it(backend: Backen
     use std::str::FromStr;
 
     let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
+    let session = make_test_session(backend, dir.path()).await;
     assert!(
         session.tenant().is_none(),
         "fresh session has no tenant scope"

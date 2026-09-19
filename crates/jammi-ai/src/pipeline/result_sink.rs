@@ -20,9 +20,9 @@ pub struct ResultSink<'a> {
     building: Option<&'a BuildingTable>,
     is_embedding: bool,
     checkpoint_interval: usize,
-    /// RS8 (#540 RANGESPLIT): counts batches as THIS SINK receives them from
+    /// Counts batches as THIS SINK receives them from
     /// its caller's `collect(inference_exec.execute(0, ..))` — never the
-    /// count `InferenceRunner::run_chunks` originally emitted per partition.
+    /// count `InferenceRunner::run_chunks` emitted per partition upstream.
     /// At `InferenceConfig::partitions == 1` (the default) those two counts
     /// coincide, since nothing sits between `InferenceExec` and this sink.
     /// At `partitions > 1`, `execute(0, ..)`'s stream is a
@@ -33,7 +33,7 @@ pub struct ResultSink<'a> {
     /// rather than concatenating) — measured directly against an
     /// independently-collected merged batch count by
     /// `tests/it/rangesplit.rs`'s
-    /// `rs8_checkpoint_counts_the_merged_batches_under_partitions_two`,
+    /// `checkpoint_counts_the_merged_batches_under_partitions_two`,
     /// whose three-source-batch fixture (one 3-row file scanned under
     /// `engine.batch_size = 1`, so each row is its own batch) measures a
     /// non-trivial merged count of 3 across 2 partitions (asserted

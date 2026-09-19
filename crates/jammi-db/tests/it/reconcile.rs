@@ -115,33 +115,6 @@ fn backdate_dir(dir: &std::path::Path, by: Duration) {
     }
 }
 
-/// The require-gate polarity every `chmod` permission-fault probe in the
-/// workspace's test suites shares (esc-089 F1;
-/// `crates/jammi-db/src/store/artifact.rs::chmod_bypassed` is the canonical
-/// copy this one mirrors byte-for-byte in polarity and message): `probe`
-/// performs the fault-injection premise check itself and returns `true` if
-/// the fault was BYPASSED (root, or a mode-ignoring filesystem). A bypass is
-/// normally a loud, `eprintln`'d skip; under `JAMMI_REQUIRE_POSIX_PERMS=1`
-/// (the CI lane that is SUPPOSED to run unprivileged with real POSIX
-/// permission enforcement) a bypass is instead a hard `panic!` — never a
-/// silent `return`. Each probe file carries its own copy of this wrapper in
-/// the canonical shape the kernel-oracle registry
-/// (`ci/kernel-oracle-helpers.txt`) verifies per file.
-fn chmod_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
-    let bypassed = probe();
-    if bypassed {
-        if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
-            panic!(
-                "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
-                 permission fault (root, or a mode-ignoring filesystem) — the fault-injection \
-                 premise this test needs does not hold; a silent skip is not acceptable here"
-            );
-        }
-        eprintln!("{test_name}: chmod bypassed (root?) — skipping");
-    }
-    bypassed
-}
-
 /// The lease-duration floor `apply=true` must respect. This test never
 /// actually waits for expiry — it only checks the synchronous config
 /// guard — so a short-but-valid whole-second pair
@@ -174,7 +147,7 @@ async fn create_building_embedding_with_parquet(
 /// catalog row's own `dimensions` column is `catalog_dims` — independent of
 /// the Parquet's PHYSICAL vector width, which is always [`DIMS`] here. Lets a
 /// test manufacture the degenerate `dimensions == 0` / `NULL` catalog state
-/// (esc-484) without needing a real zero-width vector column, which nothing
+/// without needing a real zero-width vector column, which nothing
 /// downstream of `classify_expired_row`'s `dimensions == 0` early return ever
 /// reads.
 async fn create_building_embedding_with_parquet_and_catalog_dims(
@@ -235,14 +208,11 @@ async fn create_building_embedding_with_parquet_and_catalog_dims(
 
 // ─── report-count correctness: the expired-building pre-pass reports
 //     EVERY byte it reclaims (or, under a dry-run, would reclaim) EXACTLY
-//     ONCE — never zero, never twice. Before this fix (a2bea619's "double-
-//     counted" rationale, which moved the pre-pass BEFORE the listing so a
-//     key it deleted could never appear in `listed` at all) `apply=true`
-//     reaped the row's Parquet but reported it in NO field: `orphans` was
-//     empty and `bytes_reclaimed` was `0` for a pass that had just reclaimed
-//     real bytes. RED against aa117dbf (pasted below) proves the old
-//     oracle pinned exactly that silence, not a real absence of double
-//     counting. ─────────────────────────────────────────────────────────────
+//     ONCE — never zero, never twice. The pre-pass runs BEFORE the listing,
+//     so a key it deleted never appears in `listed`; it must therefore
+//     credit what it reaps itself, or an `apply=true` pass that reclaimed
+//     real bytes would report empty `orphans` and `bytes_reclaimed == 0`.
+//     ─────────────────────────────────────────────────────────────────────
 
 /// Build a `building` row whose lease has expired with a valid Parquet but
 /// no manifest sidecar (a torn write before the `building -> ready` flip) —
@@ -251,7 +221,7 @@ async fn create_building_embedding_with_parquet_and_catalog_dims(
 /// Backdated so the SAME object would also qualify as a past-grace orphan
 /// candidate through the ordinary object→row arm if it were ever (wrongly)
 /// re-listed there — the condition that would double-count it absent the
-/// `reaped` set this fix introduces. Returns the table name and the
+/// `reaped` set. Returns the table name and the
 /// Parquet's local filesystem path.
 async fn torn_building_row_fixture(
     store: &ResultStore,
@@ -370,10 +340,10 @@ fn segment_sidecar_files(
     out
 }
 
-// ─── #484 design revision: a promotion is not a reclaim. The promote arm's
-//     rebuild still purges the row's CURRENT segment set and rewrites, at
-//     most, a single fresh segment 0 — but a stale sibling the rebuild
-//     deletes and does not rewrite is now reported NOWHERE this pass, in
+// ─── A promotion is not a reclaim. The promote arm's rebuild purges the
+//     row's CURRENT segment set and rewrites, at most, a single fresh
+//     segment 0 — but a stale sibling the rebuild deletes and does not
+//     rewrite is reported NOWHERE this pass, in
 //     EITHER mode: it is the promotion's own bookkeeping, never a reclaim
 //     this pass credits or previews. A LATER pass, once such bytes truly
 //     survive on disk unreferenced and past grace (the rebuild-fails-after-
@@ -506,7 +476,7 @@ async fn promote_of_a_stale_second_segment_reports_nothing_this_pass() {
     );
 }
 
-/// #484 design revision, second half: when a promotion's rebuild fails
+/// When a promotion's rebuild fails
 /// AFTER `purge_segments` has run, the purged keys are excluded from THIS
 /// pass's accounting the same way a successful promotion's are — but a key
 /// `purge_segments` itself FAILS to delete (manufactured here with an
@@ -522,18 +492,19 @@ async fn promote_of_a_stale_second_segment_reports_nothing_this_pass() {
 /// under the SAME permission denial leaves a dangling `index_segments` row
 /// for a fresh segment `0` — at the SAME `index_path` the ORIGINAL segment
 /// `0` used, so the ORIGINAL (unwritten-over, since the write also failed)
-/// segment `0` bytes stay legitimately referenced/protected forever after,
-/// an existing `append_segment` non-atomicity this fix neither causes nor
-/// remedies: the catalog row now claims the FRESH row_count (5, the whole
-/// rebuilt table) for bytes that are still the OLD 2-row bundle underneath,
-/// and no reconcile pass detects the desync (`required_row_objects_present`
-/// checks presence only, never the persisted `row_count` against the
-/// bundle's own actual count) — ledgered, not fixed here, as esc-102.
+/// segment `0` bytes stay legitimately referenced/protected forever after.
+/// This is an `append_segment` non-atomicity: the catalog row claims the
+/// FRESH row_count (5, the whole rebuilt table) for bytes that are still the
+/// OLD 2-row bundle underneath, and no reconcile pass detects the desync
+/// (`required_row_objects_present` checks presence only, never the persisted
+/// `row_count` against the bundle's own actual count).
 /// Segment `1`'s catalog row has no such replacement — it is
 /// genuinely unreferenced once its row is purged — so it, alone, is what a
 /// later pass reclaims.
+#[cfg(feature = "unprivileged-tests")]
 #[tokio::test]
 async fn rebuild_failure_after_the_purge_defers_seg1_reclaim_to_a_later_pass() {
+    jammi_test_resources::assert_permissions_enforced();
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
@@ -580,18 +551,6 @@ async fn rebuild_failure_after_the_purge_defers_seg1_reclaim_to_a_later_pass() {
     let probe_path = table_dir.join(".chmod-probe");
     std::fs::write(&probe_path, b"probe").unwrap();
     std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-    // PROBE: root (and a mode-ignoring filesystem) bypasses chmod — under
-    // which the real-delete-failure premise this test needs never holds
-    // (every delete below would silently succeed instead of hitting EACCES).
-    let bypassed = chmod_bypassed(
-        "rebuild_failure_after_the_purge_defers_seg1_reclaim_to_a_later_pass",
-        || std::fs::remove_file(&probe_path).is_ok(),
-    );
-    if bypassed {
-        let _ = std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o755));
-        return;
-    }
 
     let first = store
         .reconcile(ReconcileOptions {
@@ -787,7 +746,7 @@ async fn promote_over_a_zero_row_parquet_reports_nothing_this_pass() {
     );
 }
 
-/// esc-484 follow-up: a `dimensions == 0` catalog row is the SAME early
+/// A `dimensions == 0` catalog row is the SAME early
 /// return `rebuild_index_from_parquet` itself takes — `purge_segments` is
 /// never even called, so the row's WHOLE current segment set is left
 /// exactly where it is. `classify_expired_row`'s `keeps` gate must mirror
@@ -1033,7 +992,7 @@ async fn classify_expired_row_never_collapses_reap_promote_and_untouched() {
     );
 }
 
-/// esc-484 item "manifest vanished between classify and perform": a row
+/// Manifest vanished between classify and perform: a row
 /// genuinely classified `Promote` (valid Parquet AND manifest sidecar both
 /// present at classify time) whose manifest sidecar is deleted out from
 /// under `reconcile_expired_building_row` in the exact window between that
@@ -1099,7 +1058,7 @@ async fn manifest_vanished_between_classify_and_perform_re_classifies_to_reap() 
     );
 }
 
-/// #484 design revision item 3: a Parquet that vanishes in the window
+/// A Parquet that vanishes in the window
 /// between `classify_expired_row`'s own `exists()` check and its single read
 /// of the Parquet's bytes (`storage::reader::validate_and_count_parquet_rows`)
 /// must re-classify to `Reap` — the identical outcome a torn/invalid Parquet
@@ -1166,15 +1125,15 @@ async fn parquet_vanished_during_the_classify_window_reaps_never_aborts_the_pass
          yield a manifest-less promotion: {report:?}"
     );
 
-    // esc-484: the Parquet vanished before `delete_if_exists`
+    // The Parquet vanished before `delete_if_exists`
     // ever ran against it — this call removed NOTHING, so it must appear in
     // NO report field (never `orphans`, never counted into
     // `bytes_reclaimed`), while the manifest sidecar (still genuinely
     // present at delete time) is a REAL deletion this pass performed and
-    // must be the ONLY thing credited. A pre-fix build maps the vanished
-    // Parquet's `NotFound` into a false `Deleted`-equivalent credit here,
-    // reporting `bytes_reclaimed` inflated by the Parquet's listed size on
-    // top of the manifest's — this assertion is RED against that build.
+    // must be the ONLY thing credited. Mapping the vanished Parquet's
+    // `NotFound` into a `Deleted`-equivalent credit would inflate
+    // `bytes_reclaimed` by the Parquet's listed size on top of the
+    // manifest's, which this assertion refuses.
     assert!(
         !report.orphans.iter().any(|k| k.ends_with(".parquet")),
         "a Parquet this pass never actually deleted must never appear in `orphans`: {report:?}"
@@ -1193,7 +1152,7 @@ async fn parquet_vanished_during_the_classify_window_reaps_never_aborts_the_pass
     );
 }
 
-/// esc-484 advisory: a further race window opens between the manifest
+/// A further race window opens between the manifest
 /// re-read succeeding (the claim is already held) and the post-claim
 /// row-count read (`storage::reader::count_parquet_rows`, at `mod.rs`'s
 /// `Promote` arm) — the Parquet can still vanish out from under an
@@ -1258,7 +1217,7 @@ async fn parquet_vanished_after_claim_before_post_claim_row_count_re_classifies_
          never abort the pass or yield a row-count-less promotion: {report:?}"
     );
 
-    // esc-484, same accounting the classify-window sibling
+    // Same accounting the classify-window sibling
     // pins above: the Parquet vanished before `delete_if_exists` ever ran
     // against it, so this call removed NOTHING and must appear in NO report
     // field (never `orphans`, never counted into `bytes_reclaimed`), while
@@ -1282,7 +1241,7 @@ async fn parquet_vanished_after_claim_before_post_claim_row_count_re_classifies_
     );
 }
 
-/// esc-484 item (c): a catalog `index_segments` row whose `index_path` does
+/// A catalog `index_segments` row whose `index_path` does
 /// not even parse as a [`jammi_db::storage::StorageUrl`] is corruption —
 /// `purge_segments` must hard-error rather than silently skip past it,
 /// so the caller (here, `abort`) learns loudly that this table's segment
@@ -1326,15 +1285,17 @@ async fn purge_segments_errors_on_an_unparseable_index_path() {
     );
 }
 
-/// esc-484 item (c): a REAL `delete_if_exists` I/O failure (never a mere
+/// A REAL `delete_if_exists` I/O failure (never a mere
 /// 404) during `abort`'s byte cleanup must surface as ONE aggregated error
 /// naming every key that failed to delete — not a silent `Ok(())` over a
 /// half-cleaned row. Manufactured with an unwritable table directory
 /// (`chmod 555`), which makes `unlink` fail with `EACCES` for every object
 /// underneath, rather than any storage-failure test hook (none exists for
 /// this path today).
+#[cfg(feature = "unprivileged-tests")]
 #[tokio::test]
 async fn abort_aggregates_a_real_delete_failure_into_one_error() {
+    jammi_test_resources::assert_permissions_enforced();
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
@@ -1365,18 +1326,6 @@ async fn abort_aggregates_a_real_delete_failure_into_one_error() {
     let probe_path = table_dir.join(".chmod-probe");
     std::fs::write(&probe_path, b"probe").unwrap();
     std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-    // PROBE: root (and a mode-ignoring filesystem) bypasses chmod — under
-    // which `abort`'s byte cleanup would silently succeed instead of hitting
-    // the real EACCES this test's premise needs.
-    let bypassed = chmod_bypassed(
-        "abort_aggregates_a_real_delete_failure_into_one_error",
-        || std::fs::remove_file(&probe_path).is_ok(),
-    );
-    if bypassed {
-        let _ = std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o755));
-        return;
-    }
 
     let result = info.abort().await;
 
@@ -1475,21 +1424,10 @@ async fn pre_pass_deleted_table_is_not_double_counted() {
         "the pre-pass must have deleted the torn row's Parquet"
     );
 
-    // The RED oracle this replaces asserted the exact opposite of both of
-    // the following — pasted verbatim from the pre-fix test body:
-    //   assert!(
-    //       !report.orphans.iter().any(|o| o.ends_with(&parquet_key)),
-    //       "a pre-pass-deleted key must not double-count as this pass's own orphan: {report:?}"
-    //   );
-    //   assert_eq!(
-    //       report.bytes_reclaimed, 0,
-    //       "the pre-pass's own delete must not be double-counted in bytes_reclaimed: {report:?}"
-    //   );
-    // Reproduced at aa117dbf: apply=true reaped 1 object of `true_size`
-    // bytes and reported `orphans: []`, `bytes_reclaimed: 0` — the reap was
-    // real, the report was silent. The honest oracle: apply reports the
-    // reaped key exactly once, with its true size — the SAME key and size
-    // the preceding dry-run already reported on the identical state.
+    // Apply reports the reaped key exactly once, with its true size — the
+    // SAME key and size the preceding dry-run reported on the identical
+    // state. A silent report (`orphans: []`, `bytes_reclaimed: 0`) over a
+    // real reap is the failure this pins.
     assert!(
         apply.orphans.iter().any(|o| o.ends_with(&parquet_key)),
         "apply must report the key it actually reaped, exactly once: {apply:?}"
@@ -1554,8 +1492,8 @@ async fn dry_run_previews_exactly_what_apply_reclaims() {
     // manifest sidecar present — the PROMOTE state. Never reaped in EITHER
     // mode: recovery promotes it (apply); dry-run previews the same
     // classification and protects its objects. Backdated past grace, so the
-    // fix under test — not a coincidental age match — is what keeps it out
-    // of `orphans`.
+    // promote classification — not a coincidental age match — is what keeps
+    // it out of `orphans`.
     let (promote_table, promote_parquet) =
         promotable_building_row_fixture(&store, &catalog, "docs-promote").await;
     let promote_key = std::path::Path::new(&promote_parquet)
@@ -1604,11 +1542,10 @@ async fn dry_run_previews_exactly_what_apply_reclaims() {
         "{dry:?}"
     );
 
-    // The promote state: RED-first against be106f0c — before this fix, a
-    // dry-run's pre-pass reported nothing special for a would-be-promoted
-    // row (no protection), so its backdated Parquet fell through to the
-    // ordinary age-gated orphan arm and was reported here. The honest
-    // oracle: it must never appear, in either list.
+    // The promote state: a dry-run's pre-pass protects a would-be-promoted
+    // row; without that protection its backdated Parquet would fall through
+    // to the ordinary age-gated orphan arm and be reported here. It must
+    // never appear, in either list.
     assert!(
         !dry.orphans.iter().any(|o| o.ends_with(&promote_key)),
         "a would-be-promoted row's Parquet must never be previewed as an orphan: {dry:?}"
@@ -1655,13 +1592,11 @@ async fn dry_run_previews_exactly_what_apply_reclaims() {
         .await
         .unwrap();
 
-    // RED-first: at aa117dbf, `dry.orphans`/`dry.bytes_reclaimed` under-
-    // reported relative to `apply`'s on two counts at once — the pre-pass
-    // silence this test's sibling above pins directly, and the ready-row
-    // arm's `!apply` branch keeping a would-be-failed row's objects in
-    // `still_ready` (so a dry-run never previewed them as reclaimable at
-    // all, even though the matching `apply` pass deletes them). Every field
-    // but `applied` must agree.
+    // A dry-run can under-report relative to `apply` on two counts — the
+    // pre-pass silence this test's sibling above pins directly, and the
+    // ready-row arm's `!apply` branch keeping a would-be-failed row's objects
+    // in `still_ready` (never previewed as reclaimable, though the matching
+    // `apply` pass deletes them). Every field but `applied` must agree.
     assert_eq!(dry.scope, apply.scope);
     assert_eq!(dry.rows_failed, apply.rows_failed, "{dry:?} vs {apply:?}");
     assert_eq!(
@@ -1863,7 +1798,7 @@ async fn missing_object_fails_the_row_and_is_reaped_past_grace() {
         report.rows_failed.contains(&record.table_name),
         "missing sidecar must fail the row: {report:?}"
     );
-    // At grace=0 every orphan candidate (now including the Parquet + rowmap +
+    // At grace=0 every orphan candidate (including the Parquet + rowmap +
     // manifest siblings, since the row is no longer `ready`) is reclaimed.
     assert!(
         !report.orphans.is_empty(),
@@ -1956,11 +1891,10 @@ async fn unattributed_key_never_deleted_regardless_of_grace() {
     assert!(root.join("pre_layout_table.parquet").exists());
 }
 
-/// RED first: the SAME stray key as above, but seen through the
+/// The SAME stray key as above, but seen through the
 /// SCOPED arm (`ResultStore::reconcile`, even on an unscoped/GLOBAL store —
 /// scoped is scoped regardless of which tenant) — must report NOTHING for
-/// it. Before the fix this failed: a scoped pass listed every unattributed
-/// key store-wide.
+/// it: a scoped pass never lists unattributed keys store-wide.
 #[tokio::test]
 async fn scoped_reconcile_never_reports_unattributed_keys() {
     let dir = tempdir().unwrap();
@@ -2119,13 +2053,12 @@ async fn tenant_scoped_reconcile_never_touches_another_tenants_prefix() {
 // ─── a scoped pass reports NOTHING it cannot act on: a GLOBAL ready row
 //     with a missing required object is invisible to a tenant-scoped
 //     dry-run AND apply alike — only an admin (`all=true`) pass ever
-//     touches it. RED before the fix: `list_result_tables_by_status` (an
-//     ordinary READ — GLOBAL visible to every tenant, like any other read on
-//     this table) fed straight into the row->object CAS below it, so a
-//     tenant-scoped dry-run REPORTED the GLOBAL row in `rows_failed` while
-//     the matching `apply` pass's `fail_ready_result_table` CAS (`Strict` on
-//     the caller's own tenant) missed it entirely — dry-run and apply
-//     disagreed on the identical state. ─────────────────────────────────────
+//     touches it. `list_result_tables_by_status` is an ordinary READ
+//     (GLOBAL visible to every tenant); feeding it straight into the
+//     row->object CAS would make a tenant-scoped dry-run REPORT the GLOBAL
+//     row in `rows_failed` while the matching `apply` pass's
+//     `fail_ready_result_table` CAS (`Strict` on the caller's own tenant)
+//     misses it — dry-run and apply disagreeing on the identical state. ────
 
 #[tokio::test]
 async fn scoped_pass_reports_nothing_for_a_global_row_it_cannot_act_on() {
@@ -2319,7 +2252,7 @@ async fn running_jobs_artifact_prefix_survives_and_is_never_unattributed() {
         .exists());
 }
 
-// ─── RED first: a `models` row names a prefix whose `manifest.json`
+// ─── A `models` row names a prefix whose `manifest.json`
 //     is absent — the row is still live, so the prefix is NEVER reclaimed
 //     through the orphan arm, at any grace or `apply`; it is reported as
 //     `damaged` instead (row present, manifest absent) ────────────────────
@@ -2465,11 +2398,9 @@ async fn register_single_row_on_a_global_prefix(
 /// `artifact_path` is a shape no production writer ever builds) a live
 /// row's `artifact_path` EQUALS exactly, one level ABOVE the stray file
 /// itself (which is therefore a strict DESCENDANT of it, never equal to
-/// it). Before this round, such a file fell straight through to the
-/// ordinary age-gated orphan arm regardless of the job's reference status
-/// (`reconcile.rs`'s own long-standing comment: "a valid manifest exists
-/// but does not name this key: falls through to the orphan-candidate arm
-/// below"). The up-front attribution set (`matched_artifact_prefix`) still
+/// it). Such a file falls through to the ordinary age-gated orphan arm
+/// ("a valid manifest exists but does not name this key"). The up-front
+/// attribution set (`matched_artifact_prefix`) still
 /// correctly identifies the ENCLOSING prefix as referenced — this case is
 /// not about the admin-scoped scan at all — but ONLY the reap-site's fresh
 /// `prefix_is_referenced` consult (called unconditionally for every
@@ -3124,7 +3055,7 @@ async fn a_resume_checkpoint_prefix_is_never_referenced_even_under_the_containme
 /// `delete_unreferenced_prefix` refuses with a typed `Referenced { count: 1
 /// }`, bytes intact.
 ///
-/// RED against the full-ancestor form of the predicate
+/// Fails against the full-ancestor form of the predicate
 /// (`artifact_path = $1 OR $1 LIKE artifact_path || '/%'`): the unretained
 /// checkpoint's prefix is a syntactic descendant of the served row's
 /// `artifact_path`, so that predicate reports it referenced and the delete
@@ -3139,10 +3070,7 @@ async fn an_unretained_epoch_checkpoint_under_a_live_served_attempt_is_reclaimab
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let Some(session) = jammi_test_utils::make_test_session(backend, dir.path()).await else {
-        eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let session = jammi_test_utils::make_test_session(backend, dir.path()).await;
     let catalog = Arc::clone(session.catalog());
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
         .unwrap()

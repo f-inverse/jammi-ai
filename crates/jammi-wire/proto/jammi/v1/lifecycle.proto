@@ -6,7 +6,7 @@ import "google/protobuf/empty.proto";
 
 // LifecycleService — the platform on/off + bootstrap + auth boundary.
 //
-// CONTRACT ONLY. These rpcs are defined here so a candle-free client
+// Interface only. These rpcs are defined here so a candle-free client
 // (`jammi-admin` / the `jammi` CLI) can CALL them against a server that
 // implements them, without pulling any implementation dependency. The OSS
 // engine mounts NO implementation of this service: an OSS `jammi-server`

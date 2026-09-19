@@ -494,7 +494,7 @@ async fn rows(ctx: &SessionContext, sql: &str) -> Vec<(String, String)> {
     out
 }
 
-/// §6.20 — `COUNT(*)` and `SELECT vector` (which project no key) exclude
+/// `COUNT(*)` and `SELECT vector` (which project no key) exclude
 /// masked rows; `LIMIT 10` returns 10 LIVE rows; every re-embedded key is
 /// served from its newest fragment; the deleted keys never appear.
 #[tokio::test]
@@ -643,7 +643,7 @@ async fn never_refreshed_table_has_no_mask_in_its_plan() {
     );
 }
 
-/// D14(i): a current version whose manifest is definitively absent binds to
+/// A current version whose manifest is definitively absent binds to
 /// the placeholder — planning succeeds, every scan and the ANN path are the
 /// typed `VersionUnavailable { table, version }`.
 #[tokio::test]
@@ -681,7 +681,7 @@ async fn unresolvable_current_version_is_typed_unavailable() {
     }
 }
 
-/// §6.19 — an object vanishing mid-scan surfaces as the typed
+/// An object vanishing mid-scan surfaces as the typed
 /// `Storage(Io { NotFound })` naming the fragment, never a partial count.
 #[cfg(feature = "test-hooks")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

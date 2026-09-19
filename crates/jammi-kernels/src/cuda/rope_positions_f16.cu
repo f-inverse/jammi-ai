@@ -3,14 +3,14 @@
 // when the `cuda` feature is active (see ../../build.rs); the pinned build
 // flags (sm_80 baseline, no -use_fast_math) live there, not here.
 //
-// DELIBERATE DUPLICATION (campaign #443 W2b/W2c contract) — see
+// DELIBERATE DUPLICATION — see
 // `layer_norm_f16.cu`'s identical note. This is a SEPARATE translation unit
 // from `rope_positions.cu` (a separate PTX module, `PTX_ROPE_POSITIONS_F16`
-// in `../mod.rs`), so that file (and the `rope_common.cuh` header it
-// shares with `rope.cu`) stay byte-untouched — provable by `git diff`. This
+// in `../mod.rs`), so nothing here can perturb that file (or the
+// `rope_common.cuh` header it shares with `rope.cu`). This
 // file carries its OWN copy of `rope_rotate` (mirroring `rope_f16.cu`'s
-// identical choice) rather than `#include`-ing `rope_common.cuh`: no shared
-// `.cuh` for the new f16 files, even where the bf16 sibling uses one.
+// identical choice) rather than `#include`-ing `rope_common.cuh`: the f16
+// translation units never share a `.cuh`, even where the bf16 sibling uses one.
 //
 // Domain, indexing (V slot pass-through, dense/ragged dual-arm reuse via
 // `seq`) and the accumulation regime are all IDENTICAL to

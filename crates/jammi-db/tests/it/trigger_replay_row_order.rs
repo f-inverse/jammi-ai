@@ -1,33 +1,27 @@
-//! Escape row esc-101-trigger-replay-reorders-intra-batch-rows:
-//! **replayed batches reorder rows within a publish**.
+//! Replay preserves row order within one publish.
 //!
-//! Symptom: every row of one `publish_scoped` call shares the same
-//! `_offset` (see `topic.rs`'s doc on `OFFSET_COLUMN`); before this fix
-//! `source/mutable.rs`'s `fetch_scan_after_batch` rendered
-//! `ORDER BY "_offset" ASC` with no tiebreak, so a backend is free to return
-//! same-`_offset` rows in any order it likes -- there is no `_row_idx`
-//! tiebreak keeping `Subscriber::group_replay_batches`'s reassembled batch in
-//! the order the rows were originally published in.
+//! Every row of one `publish_scoped` call shares the same `_offset` (see
+//! `topic.rs`'s doc on `OFFSET_COLUMN`), and an `ORDER BY "_offset"` alone lets
+//! a backend return same-`_offset` rows in any order. `source/mutable.rs`'s
+//! `fetch_scan_after_batch` therefore also orders by every `def.primary_key`
+//! column that is not the order column itself -- for a topic's backing table
+//! (`PRIMARY KEY (_offset, _row_idx)`, `order_column = _offset`) that is
+//! `ORDER BY _offset, _row_idx`, which pins the order
+//! `Subscriber::group_replay_batches` reassembles to the publish order.
 //!
-//! Fix (this commit): the `ORDER BY` clause also lists every
-//! `def.primary_key` column that is not the order column itself -- for a
-//! topic's backing table (`PRIMARY KEY (_offset, _row_idx)`,
-//! `order_column = _offset`) that emits `ORDER BY _offset, _row_idx`,
-//! pinning intra-batch row order exactly.
-//!
-//! Parameterised over both backends per the parity suite's require-gate
-//! shape (`recovery.rs`): SQLite always runs; Postgres runs when
-//! `JAMMI_TEST_PG_URL` is set (`JAMMI_REQUIRE_PG` turns an unset URL into a
-//! hard failure rather than a silent skip).
+//! Parameterised over both backends: SQLite always runs; Postgres runs under
+//! `live-postgres-tests`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use jammi_db::catalog::backend::{BackendImpl, BackendKind};
+#[cfg(feature = "live-postgres-tests")]
+use jammi_db::catalog::backend::BackendImpl;
+use jammi_db::catalog::backend::BackendKind;
+#[cfg(feature = "live-postgres-tests")]
 use jammi_db::catalog::backend_postgres::PostgresBackend;
-use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::catalog::topic_repo::TopicRepo;
 use jammi_db::catalog::Catalog;
 use jammi_db::source::mutable::MutableTableRegistry;
@@ -50,24 +44,7 @@ fn topic_schema() -> SchemaRef {
 #[tokio::test]
 async fn intra_batch_row_order_survives_replay(backend: BackendKind) {
     let dir = tempfile::tempdir().unwrap();
-    let backend_impl = match backend {
-        BackendKind::Sqlite => {
-            let sqlite = SqliteBackend::open(&dir.path().join("catalog.db"))
-                .await
-                .unwrap();
-            BackendImpl::Sqlite(sqlite)
-        }
-        BackendKind::Postgres => {
-            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                return;
-            };
-            let pg = PostgresBackend::open_with_options(&url, 8, None)
-                .await
-                .unwrap();
-            BackendImpl::Postgres(pg)
-        }
-    };
+    let backend_impl = jammi_test_utils::open_backend(backend, dir.path()).await;
     backend_impl.migrate().await.unwrap();
 
     let tenant_binding = TenantBinding::unscoped();
@@ -96,7 +73,7 @@ async fn intra_batch_row_order_survives_replay(backend: BackendKind) {
 
     let topic = TopicDefinition {
         id: TopicId::new(),
-        name: format!("esc_101.row_order.{}", jammi_test_utils::unique_suffix()),
+        name: format!("trigger.row_order.{}", jammi_test_utils::unique_suffix()),
         schema: topic_schema(),
         tenant: None,
         broker_metadata: BTreeMap::new(),
@@ -141,13 +118,13 @@ async fn intra_batch_row_order_survives_replay(backend: BackendKind) {
     );
 }
 
-/// The first attempt at this escape row found insertion order preserved
-/// even WITHOUT the tiebreak, because a fresh single-batch `INSERT` has no
-/// reason to physically reorder on either backend. This test constructs
-/// the way Postgres ACTUALLY reorders rows: it physically relocates an
-/// EARLY row (`_row_idx = 0`) of an already-published batch, WITHOUT
-/// changing its logical `_row_idx` or any column value, then replays and
-/// asserts the logical (publish) order still comes back exactly.
+/// A fresh single-batch `INSERT` has no reason to physically reorder on either
+/// backend, so the test above passes even without the `_row_idx` tiebreak.
+/// This test constructs the way Postgres ACTUALLY reorders rows: it physically
+/// relocates an EARLY row (`_row_idx = 0`) of an already-published batch,
+/// WITHOUT changing its logical `_row_idx` or any column value, then replays
+/// and asserts the logical (publish) order still comes back exactly. Without
+/// the tiebreak, row 0 comes back LAST, at the physical end of the heap.
 ///
 /// The physical relocation itself is a `DELETE` + re-`INSERT` in one
 /// writable-CTE statement (`WITH moved AS (DELETE ... RETURNING *) INSERT
@@ -159,44 +136,12 @@ async fn intra_batch_row_order_survives_replay(backend: BackendKind) {
 /// for a table nobody has vacuumed since its initial bulk insert is, in
 /// practice, past the still-live original rows.
 ///
-/// RED (captured against this commit's own worktree by temporarily
-/// reverting the `ORDER BY` in `source/mutable.rs::fetch_scan_after_batch`
-/// to `order_col` only, real Postgres, `cargo test -p jammi-db --test it
-/// --features live-postgres-tests intra_batch_row_order_survives_update_churn`;
-/// thread id, a run-specific value, elided):
-///
-/// ```text
-/// thread 'esc_101_intra_batch_row_order::intra_batch_row_order_survives_update_churn_on_an_early_row_postgres' panicked at `assert_eq!`, crates/jammi-db/tests/it/esc_101_intra_batch_row_order.rs:295:5:
-/// assertion `left == right` failed: intra-batch row order must survive an UPDATE that
-/// physically reorders a row on Postgres's heap -- the ORDER BY _offset, _row_idx tiebreak
-/// must pin logical order regardless of physical row placement
-///   left: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-///          25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-///          47, 48, 49, 0]
-///  right: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-///          24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-///          46, 47, 48, 49]
-/// ```
-///
-/// Row 0 (the relocated row) came back LAST, at the physical end of the
-/// heap -- reproducing the symptom the ORDER BY `_row_idx` tiebreak (this
-/// commit's fix, currently in place and left untouched by this test) exists
-/// to prevent. GREEN below with the fix restored. SQLite was not attempted
-/// for this reproduction: SQLite's b-tree storage is organized by rowid/PK,
-/// so a delete-then-reinsert is far more likely to reuse the same rowid
-/// region or otherwise preserve scan order, and is not expected to reorder
-/// the same way -- not claimed as evidence here; the escape row's
-/// evidence is the Postgres run above.
+/// Postgres-only: SQLite's b-tree storage is organized by rowid/PK, so a
+/// delete-then-reinsert does not relocate a row in scan order the same way.
+#[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn intra_batch_row_order_survives_update_churn_on_an_early_row_postgres() {
-    let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-        eprintln!(
-            "skipping intra_batch_row_order_survives_update_churn_on_an_early_row_postgres: \
-             JAMMI_TEST_PG_URL unset"
-        );
-        return;
-    };
-    let pg = PostgresBackend::open_with_options(&url, 8, None)
+    let pg = PostgresBackend::open_with_options(&jammi_test_utils::postgres_url(), 8, None)
         .await
         .unwrap();
     let backend_impl = BackendImpl::Postgres(pg);
@@ -226,7 +171,7 @@ async fn intra_batch_row_order_survives_update_churn_on_an_early_row_postgres() 
 
     let topic = TopicDefinition {
         id: TopicId::new(),
-        name: format!("esc_101.update_churn.{}", jammi_test_utils::unique_suffix()),
+        name: format!("trigger.update_churn.{}", jammi_test_utils::unique_suffix()),
         schema: topic_schema(),
         tenant: None,
         broker_metadata: BTreeMap::new(),

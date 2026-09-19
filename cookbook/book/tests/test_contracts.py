@@ -1,4 +1,4 @@
-"""Unit tests for the artifact-contract registry (K0 §1)."""
+"""Unit tests for the artifact-contract registry."""
 
 from __future__ import annotations
 

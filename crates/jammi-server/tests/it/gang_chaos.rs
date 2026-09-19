@@ -1,4 +1,4 @@
-//! Plan 67 U5b-2 — the coordinator's failure path, hermetically, over a
+//! The coordinator's failure path, hermetically, over a
 //! two-HOST loopback fleet: a coordinator engine (its own `InferenceSession`
 //! with the production `GangDialer` installed) and a member engine (its own
 //! `InferenceSession`, mounting the REAL `GangServer::run_rank` on its own
@@ -16,17 +16,17 @@
 //! body's end is read back through `training_test_hooks::rank_outcomes_for`
 //! (recorded whether or not its session lived to emit it).
 //!
-//! Every row pins DESIGN.md §4 "Failure and release" over the real
+//! Every row pins the gang's failure-and-release rules over the real
 //! machinery: the coordinator's round deadline and its links' typed record
 //! are the watchdog; a retired attempt writes NOTHING terminal (the row
 //! stays `running`); the released-vs-failed split settles the lease —
-//! `Aborted{Drain}` releases (`releases + 1`, OPS D10), every other gang
+//! `Aborted{Drain}` releases (`releases + 1`), every other gang
 //! fault leaves it to expire so the successor's claim spends the attempt
 //! (`attempts + 1`, `releases` unchanged); the successor attempt over a
 //! fresh gang completes, publishing bytes EQUAL to an uninterrupted
 //! `LocalGang` run of the same fixture — one model, from the checkpoint.
 //!
-//! The rows, each with its executed mutation in the unit's contract:
+//! The rows:
 //! - the member's stream drops mid-round (its gang runtime is dropped) →
 //!   `LinkFault`, attempt spent, reclaimed by a new gang after the lease;
 //! - the member goes silent past `[worker] rank_timeout_secs` (its rank
@@ -37,7 +37,7 @@
 //!   next attempt over a fresh member completes — zero net attempts;
 //! - split brain: attempt 1's coordinator loses its lease (its keeper dies)
 //!   while its rank 1 is held; the successor's `RunRank` at attempt 2
-//!   supersedes the elder hold (U5a-2's fence), the elder attempt is
+//!   supersedes the elder hold (the attempt fence), the elder attempt is
 //!   refuted and writes nothing, attempt 2 completes with `attempts == 2`.
 
 #![cfg(feature = "test-hooks")]
@@ -357,7 +357,7 @@ impl Member {
         self.runtime = Some(Self::serve(&self.session, std_listener));
     }
 
-    /// The member's host DRAINs (68 OPS): the phase leaves `Running`, so
+    /// The member's host DRAINs: the phase leaves `Running`, so
     /// every held rank ends `Aborted{Drain}` and the claim loop's `workers`
     /// row leaves `claiming` (the loop would delete it once it exited; no
     /// coordinator lists a draining host).
@@ -603,10 +603,7 @@ fn assert_retired(after: &Row, attempt: i32, released: bool) {
     assert_eq!(after.error, None, "no terminal write: {after:?}");
     assert_eq!(after.attempts, attempt, "attempts move only at a claim");
     if released {
-        assert_eq!(
-            after.releases, 1,
-            "Released: the lease is handed back (OPS D10)"
-        );
+        assert_eq!(after.releases, 1, "Released: the lease is handed back");
         assert_eq!(after.lease_expires_at, None, "Released: lease NULL");
     } else {
         assert_eq!(
@@ -814,7 +811,7 @@ async fn a_member_silent_past_the_rank_timeout_retires_the_attempt_spent_and_a_n
 /// and RELEASES the lease first (`releases + 1`, lease NULL): the row is
 /// claimable at once — the next attempt lands within one poll, never a
 /// lease window — over a fresh member, and completes. Net attempts: zero
-/// (`attempts - releases == 1` at completion) — OPS D10.
+/// (`attempts - releases == 1` at completion).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_member_aborted_drain_mid_round_releases_the_lease_and_the_next_attempt_completes_at_once(
 ) {
@@ -895,7 +892,7 @@ async fn a_member_aborted_drain_mid_round_releases_the_lease_and_the_next_attemp
 /// loses its lease (its keeper dies) while its rank 1 is held and stalled;
 /// the lease expires, a SECOND coordinator reclaims and claims attempt 2 and
 /// dials the same member, whose `RunRank` at the greater attempt takes the
-/// slot from the elder hold (U5a-2's fence); the elder session is refuted
+/// slot from the elder hold (the attempt fence); the elder session is refuted
 /// at its next tick, so the stale coordinator's round ends and its attempt
 /// writes NOTHING (its outcome is a moved claim; its terminal arm is the
 /// lease-lost one); attempt 2 completes with `attempts == 2` — the fence

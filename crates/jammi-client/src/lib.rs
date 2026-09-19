@@ -166,8 +166,8 @@ impl DataClient {
     /// Execute a SQL query over the Flight SQL lane and collect the terminal
     /// batches.
     ///
-    /// `sql` does not ride a typed gRPC verb — per ADR-01 §3.2 the Flight SQL
-    /// surface carries query/result. So this opens a [`FlightSqlServiceClient`]
+    /// `sql` does not ride a typed gRPC verb — the Flight SQL surface
+    /// carries query/result. So this opens a [`FlightSqlServiceClient`]
     /// over the *same* tonic channel the typed-RPC verbs use, stamps the
     /// [`SESSION_HEADER`] with [`Self::session_id`] — the identical id
     /// `bind_tenant` bound the tenant scope against — so the server's
@@ -487,7 +487,7 @@ impl DataClient {
 
     /// Run metrics recorded for a fine-tune job, as the raw JSON blob text
     /// nested inside the wire's terminal `JobStatus.model.metrics_json`
-    /// (issue #441) — the same blob the embedded `TrainingJob`'s
+    /// — the same blob the embedded `TrainingJob`'s
     /// catalog-backed metrics read returns. `None` for a job that has not
     /// yet recorded any metrics (still queued or running before its first
     /// stamp); this crate carries no `serde_json` dependency, so the caller
@@ -503,9 +503,9 @@ impl DataClient {
 
     /// GPU-acceleration determination for a fine-tune job, as the raw,
     /// self-describing JSON blob text the catalog's `jobs.
-    /// acceleration_report` column carries (esc-075) — the same blob the
-    /// embedded catalog-backed record read returns. `None` for a legacy row
-    /// predating the column (SQL `NULL`); otherwise a `"state"`-keyed object
+    /// acceleration_report` column carries — the same blob the
+    /// embedded catalog-backed record read returns. `None` for a row whose
+    /// column is SQL `NULL`; otherwise a `"state"`-keyed object
     /// whose vocabulary is owned by the payload's producer (e.g. `"pending"`
     /// before a determination exists, `"determined"` once one does) and
     /// documented there, not enumerated here. This crate carries no
@@ -989,7 +989,7 @@ fn hits_to_batch(resp: SearchResponse, select: &[String]) -> Result<Vec<RecordBa
     Ok(vec![batch])
 }
 
-/// #485: `wait_job`/`subscribe` must send NO
+/// `wait_job`/`subscribe` must send NO
 /// `grpc-timeout` header at all (the server's `[server.limits]
 /// wait_timeout_secs` budget bounds the stream instead — see
 /// `jammi_server::limits`'s module doc's "Streaming-path exemption" section);

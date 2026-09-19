@@ -1,6 +1,6 @@
 //! Shared, tenant-scoped graph-neighbourhood provider: the one bounded,
 //! target-anchored neighbour gather both the fine-tune hard-negative guard
-//! (S11) and declared-edge context assembly (S16-G) walk.
+//! and declared-edge context assembly walk.
 //!
 //! # The one bounded-expansion core
 //!
@@ -142,7 +142,7 @@ impl Adjacency {
         self.edges.get(node).map_or(&[], Vec::as_slice)
     }
 
-    /// A byte estimate for this adjacency's resident set (GA7, issue #538):
+    /// A byte estimate for this adjacency's resident set:
     /// every key id plus every neighbour id's own bytes, PLUS each
     /// `String`'s and each `HashMap`/`Vec` slot's real struct overhead
     /// (`std::mem::size_of::<String>()`/`size_of::<usize>()` — a MEASURED
@@ -246,7 +246,7 @@ pub const DEFAULT_HOP_CAP: usize = 3;
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum EdgeSourceRef {
-    /// An S9 `neighbor_graph` result table (`src`/`dst`/`rank`/`similarity`).
+    /// A `neighbor_graph` result table (`src`/`dst`/`rank`/`similarity`).
     /// `similarity` carries the edge weight; edges are untyped.
     NeighborGraph {
         /// The registered result-table name (resolved as `jammi.{name}`).
@@ -381,7 +381,7 @@ impl EdgeGather {
 }
 
 /// One loaded edge row, normalised to string endpoints plus optional type and
-/// weight — the shape both load paths (S9 table, registered source) produce and
+/// weight — the shape both load paths (`neighbor_graph` table, registered source) produce and
 /// [`build_adjacency`] consumes.
 struct EdgeRow {
     src: String,
@@ -444,7 +444,7 @@ impl InferenceSession {
     /// what an edge means).
     ///
     /// `label_source_id` / `label_key_column` / `label_column` name the labelled
-    /// relation joined to both endpoints (the same eval surface R1/R2 use); both
+    /// relation joined to both endpoints; both
     /// the edge scan and the label scan run under tenant scope. Untyped edges are
     /// bucketed under `"(untyped)"`. An edge whose endpoints are not both labelled
     /// is skipped (it carries no agreement signal).
@@ -529,7 +529,7 @@ impl InferenceSession {
         Ok(map)
     }
 
-    /// Load an S9 `neighbor_graph` result table's edges. The relation is
+    /// Load a `neighbor_graph` result table's edges. The relation is
     /// registered as `jammi.{table_name}` (bare reference so a hyphenated name
     /// is not re-split on the dot); columns `src`/`dst` are the endpoints,
     /// `similarity` the weight.
@@ -688,7 +688,7 @@ fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArr
 }
 
 /// Downcast a batch column to a `Float64Array`, accepting either `Float64` (the
-/// cast registered-source weight) or `Float32` (the S9 `similarity`). `None`
+/// cast registered-source weight) or `Float32` (the `neighbor_graph` `similarity`). `None`
 /// when the column is absent.
 fn f64_column(batch: &RecordBatch, name: &str) -> Result<Option<Float64Array>> {
     let Some(col) = batch.column_by_name(name) else {

@@ -1,15 +1,13 @@
 //! `CatalogClusterState` / `CatalogJobState` — the catalog-backed
-//! `ballista_scheduler::cluster::{ClusterState, JobState}` implementations
-//! (design contract `feat_500-wave4.md` §3; `docs/plans/67-distributed-training/
-//! UNITS.md` § U8b). Every table verb these two types call is generic,
-//! distributor-neutral CRUD in `jammi_db::catalog::compute_repo` (B1) — this
-//! module is the ONLY place Ballista's own `ClusterState`/`JobState`
-//! vocabulary meets it.
+//! `ballista_scheduler::cluster::{ClusterState, JobState}` implementations.
+//! Every table verb these two types call is generic, distributor-neutral
+//! CRUD in `jammi_db::catalog::compute_repo` — this module is the ONLY place
+//! Ballista's own `ClusterState`/`JobState` vocabulary meets it.
 //!
-//! **Execution graphs are never persisted** (README r43: Ballista 54.1 has
-//! no execution-graph serialisation). `compute_jobs` mirrors OWNERSHIP and
+//! **Execution graphs are never persisted** (Ballista 54.1 has no
+//! execution-graph serialisation). `compute_jobs` mirrors OWNERSHIP and
 //! STATUS text only. A scheduler restart therefore keeps executor
-//! registrations and job status rows readable (oracle b1) but starts with an
+//! registrations and job status rows readable but starts with an
 //! EMPTY in-memory graph map: [`CatalogJobState::get_execution_graph`]
 //! answers `None` for a job this process's memory never built, even though
 //! [`CatalogJobState::get_job_status`] still answers the row's status — the
@@ -101,23 +99,23 @@ pub fn executor_is_live(
 }
 
 /// The catalog-backed [`ClusterState`]. Registrations, slots, and heartbeats
-/// live in `compute_executors` (B1/K5); the ONE thing kept only in this
+/// live in `compute_executors`; the ONE thing kept only in this
 /// process's memory is the executor-heartbeat CACHE the trait's own
 /// `executor_heartbeats`/`get_executor_heartbeat` require to be synchronous.
 ///
 /// **Heartbeat cache staleness.** The cache is seeded from the catalog's
 /// committed `heartbeat_at`/`status` at [`Self::init`] and refreshed
 /// write-through by every [`Self::save_executor_heartbeat`] THIS process
-/// handles. A second scheduler process sharing the same catalog (contract
-/// §3, oracle b2) never receives the first scheduler's executors'
+/// handles. A second scheduler process sharing the same catalog never
+/// receives the first scheduler's executors'
 /// heartbeats directly — its cache reflects only what its OWN `init` read
 /// plus whatever heartbeats land on IT — so `executor_heartbeats()` on a
 /// standby scheduler can read stale relative to the catalog's own row. The
 /// consequence for `expire_dead_executors` (which reads this cache, never
 /// the catalog): a standby scheduler's liveness view of an executor it does
 /// not itself serve is only as fresh as its last `init`, an inherent
-/// property of the active/standby split (contract §3, README r43), not a
-/// bug this cache should paper over with an unbounded background poll.
+/// property of the active/standby split, not a bug this cache should paper
+/// over with an unbounded background poll.
 pub struct CatalogClusterState {
     catalog: Arc<Catalog>,
     heartbeats: StdRwLock<HashMap<String, ExecutorHeartbeat>>,
@@ -232,7 +230,7 @@ impl ClusterState for CatalogClusterState {
         let bound = match distribution {
             // Neither built-in is ever selected by `jammi-server` (there is
             // no knob: `roles::host_scheduler` always installs
-            // `Custom(DevicePlacement)`, contract §9 B1/§3) — these two arms
+            // `Custom(DevicePlacement)`) — these two arms
             // exist only so `ClusterState`'s generic contract is complete
             // and testable; unlike `Custom`, they never reserve a catalog
             // slot (no CAS), so they are not safe under a shared catalog and
@@ -257,9 +255,9 @@ impl ClusterState for CatalogClusterState {
         // (`remove_executor` deletes its row) and THEN unbinds the slots it
         // had reserved on it. Slots on a row that no longer exists have
         // nothing to return to: they are dropped here, not refused, so the
-        // rest of the batch (a live executor's slots) is still returned. CI
-        // run 35127543679 hit the refusal ("adjust_compute_slots: no row
-        // for executor_id") on exactly that ordering.
+        // rest of the batch (a live executor's slots) is still returned.
+        // Refusing would fail the whole unbind with "adjust_compute_slots:
+        // no row for executor_id" on exactly that ordering.
         let registered: std::collections::HashSet<String> = self
             .catalog
             .list_compute_executors()
@@ -491,8 +489,8 @@ fn unix_seconds_now() -> u64 {
 }
 
 /// The catalog-backed [`JobState`]: ownership and status text live in
-/// `compute_jobs` (B1); the execution graph — which Ballista 54.1 cannot
-/// serialize (README r43) — lives ONLY in this process's own memory, exactly
+/// `compute_jobs`; the execution graph — which Ballista 54.1 cannot
+/// serialize — lives ONLY in this process's own memory, exactly
 /// like [`ballista_scheduler::cluster::memory::InMemoryJobState`]'s own
 /// `completed_jobs`/`running_jobs` maps.
 ///
@@ -500,13 +498,10 @@ fn unix_seconds_now() -> u64 {
 /// in-memory, never touching the catalog — the same shape
 /// `InMemoryJobState::accept_job` itself uses (it is a `DashMap` insert with
 /// no persistence at all); a job that fails before `submit_job` is recorded
-/// by `fail_unscheduled_job` (async, so it CAN reach the catalog). This
-/// deviates from a literal reading of UNITS §U8b's own summary ("accept_job/
-/// submit_job/save_job/get_execution_graph … mirror put_compute_job"): the
+/// by `fail_unscheduled_job` (async, so it CAN reach the catalog). The
 /// trait's `accept_job` is a SYNC method, and `InMemoryJobState`'s own
 /// `accept_job` (`ballista-scheduler-54.1.0/src/cluster/memory.rs:483-488`)
-/// never persists either, so mirroring its actual behavior — not the
-/// summary's gloss — is the shape this type ships.
+/// never persists either; this type mirrors that behavior.
 pub struct CatalogJobState {
     catalog: Arc<Catalog>,
     scheduler: String,
@@ -565,14 +560,14 @@ impl CatalogJobState {
 }
 
 /// Reconstruct a minimal [`JobStatus`] from a catalog row when this
-/// process's memory has no graph for the job (contract §3: a restarted
-/// scheduler answers `get_job_status` from the row even though
+/// process's memory has no graph for the job (a restarted scheduler
+/// answers `get_job_status` from the row even though
 /// `get_execution_graph` is `None`). The inner message carries only what the
 /// row itself has — `queued_at` decodes the decimal string
 /// [`CatalogJobState::submit_job`] stamped, `started_at`/partition/error
 /// detail are not reconstructable from a status-only row and are left at
-/// their zero/empty default (README r43's own named limitation: this is why
-/// `ballista-scheduler`'s REST introspection surface stays off, A10).
+/// their zero/empty default (this limitation is why
+/// `ballista-scheduler`'s REST introspection surface stays off).
 fn record_to_job_status(rec: &ComputeJobRecord) -> JobStatus {
     let queued_at: u64 = rec.queued_at.parse().unwrap_or(0);
     let status = match rec.status.as_str() {
@@ -792,7 +787,7 @@ impl JobState for CatalogJobState {
     }
 
     async fn try_acquire_job(&self, job_id: &JobId) -> BallistaResult<Option<ExecutionGraphBox>> {
-        // Active/standby (contract §3): "acquire" only ever succeeds against
+        // Active/standby: "acquire" only ever succeeds against
         // a graph THIS process's own memory already holds — there is no
         // serialized graph to revive from another scheduler's ownership, so
         // acquiring a job this process never itself submitted always misses,

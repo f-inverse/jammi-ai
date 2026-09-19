@@ -21,8 +21,8 @@
 //!
 //! Nothing here is gated. A step time is a property of `code x device x box`,
 //! and this tier is meant to run on a rented GPU whose model is not pinned —
-//! exactly the condition under which the previous absolute GPU floor
-//! false-failed and was removed. It **records**, tagged with the device that
+//! exactly the condition under which an absolute GPU floor false-fails. It
+//! **records**, tagged with the device that
 //! produced it, so two runs on the *same* box (a parent commit and a change) can
 //! be compared as a ratio. That within-run A/B is the only comparison a
 //! heterogeneous fleet supports.
@@ -68,7 +68,7 @@ use sha2::{Digest, Sha256};
 /// either silently disable clipping ([`clip_gradients`]'s own `<= 0.0`
 /// convention, which reads a "clip on" row as clipped when it silently was
 /// not) or propagate a non-finite coefficient into every gradient. A step
-/// this contract measures must be the step it claims to measure, so a bad
+/// this tier measures must be the step it claims to measure, so a bad
 /// explicit value is refused rather than folded into the "absent" no-op
 /// path.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -101,9 +101,9 @@ fn validate_max_grad_norm(v: f32) -> Result<f32, InvalidMaxGradNorm> {
 
 /// A `--row-lengths` value that does not name a valid right-padded batch for
 /// this run's `(batch, seq)` -- either the count does not match `batch`, or
-/// some row's length is outside `1..=seq` (`0` is a REFUSAL in the B3-padded
-/// arm's own guard inventory; `> seq` cannot describe a real padded row of a
-/// `[batch, seq]` mask at all). A step this contract measures must be the
+/// some row's length is outside `1..=seq` (`0` is a REFUSAL in the padded
+/// flash arm's own guard inventory; `> seq` cannot describe a real padded row of a
+/// `[batch, seq]` mask at all). A step this tier measures must be the
 /// step it claims to measure, so a bad explicit value is refused rather than
 /// silently building a mask that does not mean what the caller intended.
 #[derive(Debug, Clone, PartialEq)]
@@ -139,8 +139,8 @@ fn validate_row_lengths(
         .find(|&(_, &l)| l == 0 || l > seq)
     {
         return Err(InvalidRowLengths(format!(
-            "row {row}'s length {bad} is outside 1..={seq} -- 0 is a refusal in the B3-padded \
-             arm's own guard inventory (every row needs at least one real token), and a length \
+            "row {row}'s length {bad} is outside 1..={seq} -- 0 is a refusal in the padded \
+             flash arm's own guard inventory (every row needs at least one real token), and a length \
              above --seq {seq} cannot describe a real row of a [batch, seq] mask"
         )));
     }
@@ -157,10 +157,9 @@ static CLIP_INVOCATIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot the clip-invocation counter. `run()` takes one BEFORE its
 /// untimed pre-step and one after the loop, and emits the delta on the
-/// report (PR #381 audit B2: the counted fact was previously
-/// `#[cfg(test)]`-readable only, so the emitted row carried the
-/// `max_grad_norm` REQUEST but nothing counted); the invocation-count tests
-/// below read the same delta around their own `run` call.
+/// report, so the emitted row carries a counted fact rather than only the
+/// `max_grad_norm` REQUEST; the invocation-count tests below read the same
+/// delta around their own `run` call.
 fn clip_invocations_snapshot() -> u64 {
     CLIP_INVOCATIONS.load(Ordering::Relaxed)
 }
@@ -168,12 +167,10 @@ fn clip_invocations_snapshot() -> u64 {
 /// Attention-base op keys whose presence in `JAMMI_KERNELS_DISABLE`
 /// (`kernels_disabled_requested`) means the OPERATOR asked for the eager
 /// attention arm: the fused whole-attention-block CustomOp's admit key
-/// (`"attention_block_fused"` — the C-ATTN unit's addition, the literal
-/// key `jammi_encoders::modernbert`'s `admit(..., "attention_block_fused",
-/// ...)` call site checks against `JAMMI_KERNELS_DISABLE`, now shared by
-/// BERT/DistilBERT's tensor-state-admitted attention block too), its
-/// legacy shorthand (`"attention_block"`, kept for callers already using
-/// it), the FA2 cascade key that absorbs it on the flash branch, or the
+/// (`"attention_block_fused"` — the literal key `jammi_encoders::modernbert`'s
+/// `admit(..., "attention_block_fused", ...)` call site checks against
+/// `JAMMI_KERNELS_DISABLE`, shared by BERT/DistilBERT's tensor-state-admitted
+/// attention block), its shorthand (`"attention_block"`), the FA2 cascade key that absorbs it on the flash branch, or the
 /// `"all"` wildcard (`jammi_kernels::admission`'s module doc).
 const ATTENTION_DISABLE_KEYS: [&str; 4] = [
     "attention_block",
@@ -190,13 +187,13 @@ const ATTENTION_DISABLE_KEYS: [&str; 4] = [
 /// `kernels_disabled_requested`, else `"fused"`.
 ///
 /// Deliberately NOT derived from the `attention_block_*_dispatches`
-/// counters (PR #381 re-audit, class-A): those read EAGER whenever the
+/// counters: those read EAGER whenever the
 /// fused predicate declines BY DOMAIN — `head_dim != 64`, `seq > 4096`, a
 /// dtype/contiguity/mask arm (`jammi_encoders::modernbert`'s predicate;
 /// `report.rs`'s `attention_block_eager_dispatches` doc calls that reading
 /// by-design) — so a legitimate jammi-fused leg on a non-64 `head_dim`
-/// checkpoint would have read `"eager"`, mismatched torch's `"fused"`, and
-/// INVALIDated the row over a MEASUREMENT, not a premise. Whether the fused
+/// checkpoint would read `"eager"`, mismatch torch's `"fused"`, and
+/// INVALIDate the row over a MEASUREMENT, not a premise. Whether the fused
 /// arm actually ran stays where it already lives: `fused_proof` and the
 /// counters themselves. An identity field describes what was asked for;
 /// a domain decline is a datum about the checkpoint, never an identity
@@ -222,13 +219,18 @@ pub(crate) fn attention_arm(kernels_disabled_requested: &[String]) -> &'static s
 /// so the reported figure is activation and workspace growth. On a shared GPU it would over-report, so the field
 /// is documented as device-total-minus-baseline rather than as a process
 /// measurement.
-fn device_memory_used_bytes() -> Option<u64> {
+fn nvidia_smi_memory_used() -> Option<u64> {
     let out = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
         .output()
         .ok()?;
-    String::from_utf8(out.stdout)
-        .ok()?
+    parse_memory_used(&String::from_utf8(out.stdout).ok()?)
+}
+
+/// The first line of `nvidia-smi --query-gpu=memory.used
+/// --format=csv,noheader,nounits` (MiB), in bytes.
+fn parse_memory_used(stdout: &str) -> Option<u64> {
+    stdout
         .lines()
         .next()?
         .trim()
@@ -236,6 +238,11 @@ fn device_memory_used_bytes() -> Option<u64> {
         .ok()
         .map(|mib| mib * 1024 * 1024)
 }
+
+/// Where a run reads total device memory in use, in bytes; `None` when the host
+/// cannot say (no GPU, no `nvidia-smi`), and `peak_vram_bytes` is then reported
+/// as not measured.
+type DeviceMemoryProbe = fn() -> Option<u64>;
 
 /// Sample device memory on a background thread for the duration of the measured
 /// steps, so the reported peak is the real high-water mark rather than whatever
@@ -247,14 +254,14 @@ struct VramSampler {
 }
 
 impl VramSampler {
-    fn start() -> Option<Self> {
-        device_memory_used_bytes()?;
+    fn start(probe: DeviceMemoryProbe) -> Option<Self> {
+        probe()?;
         let peak = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let (p, s) = (Arc::clone(&peak), Arc::clone(&stop));
         let handle = std::thread::spawn(move || {
             while !s.load(Ordering::Relaxed) {
-                if let Some(used) = device_memory_used_bytes() {
+                if let Some(used) = probe() {
                     p.fetch_max(used, Ordering::Relaxed);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -322,12 +329,11 @@ pub struct FinetuneStepParams {
     /// trainer does (`ctx.optimizer.set_learning_rate` →
     /// [`jammi_ai::fine_tune::optimizer::clip_and_step`], which is
     /// `clip_gradients` then `optimizer.step`). `None` (the default) skips
-    /// clipping entirely and is bit-identical to this tier's behaviour before
-    /// this field existed.
+    /// clipping entirely.
     ///
     /// This exists because the shipped trainer's default config
-    /// (`max_grad_norm = 1.0`) always clips: skipping it, as this tier did
-    /// before, measures a step the product never runs — `clip_gradients`
+    /// (`max_grad_norm = 1.0`) always clips: a row without clipping
+    /// measures a step the product never runs — `clip_gradients`
     /// runs entirely on device (`4n + 4` device ops for `n` trainable
     /// `Var`s: the squared-sum fold, the coefficient, and a
     /// `broadcast_mul` rescale per `Var`; zero `to_scalar`/`to_vec` calls),
@@ -351,22 +357,22 @@ pub struct FinetuneStepParams {
     /// request it was TOLD to expect at all, at any point.
     pub expect_kernels_disabled: Option<Vec<String>>,
     /// Per-row REAL (non-pad) lengths for a genuinely right-padded batch —
-    /// `lengths.len() == batch`, each `1 <= lengths[b] <= seq` (the B3-padded
-    /// flash arm's own guard inventory, contract v4 item 1: `total == 0`
+    /// `lengths.len() == batch`, each `1 <= lengths[b] <= seq` (the padded
+    /// flash arm's own guard inventory: `total == 0`
     /// -- every row length 0 -- is a REFUSAL in the ragged arm, and pooling
     /// needs at least one real token per row regardless). `None` (the
-    /// default) is this tier's ORIGINAL, UNCHANGED behaviour: an all-ones
+    /// default) is the dense leg: an all-ones
     /// dense mask built by [`Tensor::ones`], `step_once` calling
     /// `encoder.forward` (never `forward_with_lengths`) — see
     /// [`crate::report::FinetuneStepTier::row_lengths`]'s own doc for why
     /// this is the field's dense-leg IDENTITY value too (`[seq; batch]`),
     /// not merely a param default. `Some(lengths)` builds a genuine
     /// right-padded mask (row `b`'s first `lengths[b]` positions `1`, the
-    /// rest `0` -- RIGHT padding, the prefix shape `jammi_encoders`' B3-
-    /// padded flash arm validates -- see `build_fixture`'s `prefix_mask`)
+    /// rest `0` -- RIGHT padding, the prefix shape `jammi_encoders`' padded
+    /// flash arm validates -- see `build_fixture`'s `prefix_mask`)
     /// and routes every forward through
     /// [`jammi_encoders::ModernBert::forward_with_lengths`]'s trusted-
-    /// lengths path P (contract v4 §3.7), the one production entry point
+    /// lengths path, the one production entry point
     /// that can reach the padded transport this leg exists to measure.
     /// `lengths` is a TRUST boundary exactly as `forward_with_lengths`'
     /// own doc describes: this tier does not re-derive lengths from a
@@ -476,12 +482,10 @@ fn build_fixture(
         },
     )?;
 
-    // `params.row_lengths` is `None` on every pre-existing call site (the
-    // ORIGINAL dense-only behaviour, bit-identical, never routed through
-    // `prefix_mask`): the mask stays the all-ones `Tensor::ones` this fixture
-    // always built, and `step_once` (called with `row_lengths: None`, see
-    // `run()`'s call sites) keeps calling `encoder.forward` -- never
-    // `forward_with_lengths` -- exactly as before this field existed.
+    // `params.row_lengths == None` is the dense leg (never routed through
+    // `prefix_mask`): the mask is the all-ones `Tensor::ones`, and
+    // `step_once` (called with `row_lengths: None`, see `run()`'s call
+    // sites) calls `encoder.forward` -- never `forward_with_lengths`.
     let mask = match &params.row_lengths {
         None => Tensor::ones((params.batch, params.seq), DType::U32, &device)?,
         Some(lengths) => prefix_mask(lengths, params.seq, &device)?,
@@ -562,11 +566,9 @@ fn step_once(
     trainable: &[Var],
     max_grad_norm: Option<f32>,
     // `Some(lengths)` routes THIS call through `ModernBert::forward_with_lengths`
-    // (path P, contract v4 §3.7) building a genuine right-padded prefix mask from
+    // (the trusted-lengths path) with a genuine right-padded prefix mask built from
     // `lengths` instead of the dense all-ones mask `build_fixture` otherwise builds —
-    // see `FinetuneStepParams::row_lengths`'s own doc. `None` (every existing call
-    // site before this change) is bit-identical to this function's behaviour before
-    // `row_lengths` existed.
+    // see `FinetuneStepParams::row_lengths`'s own doc. `None` is the dense step.
     row_lengths: Option<&[usize]>,
 ) -> Result<f32, Box<dyn std::error::Error>> {
     let (a, p, n) = if batched_forward {
@@ -616,8 +618,7 @@ fn step_once(
     // before the optimizer step (trainer.rs's `process_batch_loss` runs
     // `scaled_loss.backward()` then, at the accumulation boundary,
     // `clip_and_step` — clip_gradients then `optimizer.step` — never the
-    // reverse). `None` skips this block entirely: bit-identical to the step
-    // this function measured before `max_grad_norm` existed.
+    // reverse). `None` skips this block entirely.
     if let Some(max_norm) = max_grad_norm {
         // `ClipOutcome` is `#[must_use]`: this tier asked for a clip over a
         // non-empty `trainable` with a validated `max_norm > 0`, so the ONLY
@@ -661,12 +662,19 @@ fn step_once(
 /// before this function returns, and
 /// `jammi_kernels::admission::unmatched_disables`'s doc): that is a typo
 /// in the disable list, not evidence the forced-eager arm ran, and must
-/// never be reported as a datum (contract K-aux). Also returns `Err`,
+/// never be reported as a datum. Also returns `Err`,
 /// FIRST — before any device, checkpoint, or tensor work — when
 /// `params.expect_kernels_disabled` is `Some` and does not match what this
 /// process's `JAMMI_KERNELS_DISABLE` actually resolved to — see
 /// `FinetuneStepParams::expect_kernels_disabled`'s doc.
 pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std::error::Error>> {
+    run_with(params, nvidia_smi_memory_used)
+}
+
+fn run_with(
+    params: &FinetuneStepParams,
+    device_memory: DeviceMemoryProbe,
+) -> Result<FinetuneStepTier, Box<dyn std::error::Error>> {
     // Validate FIRST, before any device, checkpoint, or tensor work — a bad
     // explicit `--max-grad-norm` is a caller error, not something worth
     // paying for a build + warmup + measured steps to discover.
@@ -681,7 +689,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         validate_row_lengths(lengths, params.batch, params.seq)?;
     }
 
-    // `--expect-kernels-disabled` (contract K-aux, round 2 advisory): the
+    // `--expect-kernels-disabled`: the
     // binary controls its own argv, so a caller that names its intended
     // `JAMMI_KERNELS_DISABLE` set on the SAME command line gets a hard
     // error instead of having to notice, after the fact, that the
@@ -701,9 +709,8 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     // a build + warmup + measured steps that were never going to produce a
     // valid report.
     //
-    // THE UNLABELED-LEG CONTRACT (folded into #421's follow-ups, re-audit
-    // advisory): the SAME contract `finetune-run`'s own `--expect-
-    // kernels-disabled` carries — a leg that never passes this flag at
+    // THE UNLABELED LEG: the SAME rule `finetune-run`'s own `--expect-
+    // kernels-disabled` follows — a leg that never passes this flag at
     // all gets NO refusal and NO claim from `run()` about what
     // `JAMMI_KERNELS_DISABLE` actually resolved to this process. This is
     // deliberate, never an oversight: a caller with no intended disable
@@ -718,7 +725,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     //
     //   - BINARY-ENFORCED (this check, `--expect-kernels-disabled` always
     //     passed, even as the empty string on a fused/control leg —
-    //     `finetune_ab.sh:582`'s own convention): a mismatch refuses
+    //     `finetune_ab.sh`'s own convention): a mismatch refuses
     //     BEFORE any step runs, per the doc above.
     //   - POST-HOC SCRIPT PREDICATE (no `--expect-kernels-disabled` on
     //     the command line at all; the calling script reads the emitted
@@ -737,11 +744,11 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     // and never reads `kernels_disabled_requested`/`kernels_disabled_fired`
     // back off the report — makes no claim about the disable set at all,
     // exactly like passing `--expect-kernels-disabled` never happened;
-    // that is this function's own contract working as designed, not a
+    // that is this function working as designed, not a
     // gap in it. The gap (if any) lives in the CALLING SCRIPT, and is
     // exactly what `check_producer_provenance_gates.py`'s own FAKE-knob-
     // inertness class of check exists to catch for OTHER test-only
-    // env-var knobs — this contract is orthogonal to that one.
+    // env-var knobs — this rule is orthogonal to that one.
     if let Some(expected) = &params.expect_kernels_disabled {
         let mut expected_sorted = expected.clone();
         expected_sorted.sort();
@@ -764,9 +771,9 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
 
     // Base-checkpoint CONTENT identity — computed BEFORE `build_fixture`
     // loads the model, off the exact bytes this run reads, so it can never
-    // drift from what the model actually built from (round-4 audit
-    // fold-in on PR #372: the SAME mechanism `grad_oracle.rs`'s `run()`
-    // uses, see this module's doc's determinant table).
+    // drift from what the model actually built from (the SAME mechanism
+    // `grad_oracle.rs`'s `run()` uses, see this module's doc's determinant
+    // table).
     let (checkpoint_config_sha256, _config_len) =
         sha256_and_len(&params.model_dir.join("config.json"))?;
     let (checkpoint_weights_sha256, checkpoint_weights_size_bytes) =
@@ -778,8 +785,8 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     // handle, so this is a fresh `Vec` over the identical underlying
     // storage, not a second fixture) — `step_once` needs it to look up each
     // `Var`'s gradient in the `GradStore` when `params.max_grad_norm` is
-    // `Some`. NAME-SORTED, never `VarMap::all_vars()`'s raw `HashMap` order
-    // (PR #381 audit B3, the esc-182 class): `clip_gradients` folds the
+    // `Some`. NAME-SORTED, never `VarMap::all_vars()`'s raw `HashMap` order:
+    // `clip_gradients` folds the
     // global norm left-to-right over THIS slice, so its order decides the
     // last bits of `total_norm` and of every clipped gradient — and
     // therefore of every clip-on `losses` entry this tier emits. A raw
@@ -796,13 +803,11 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     // down, which are taken AFTER the pre-step.
     //
     // `peak_vram_bytes` is measured via `nvidia-smi --query-gpu=memory.used`
-    // (`device_memory_used_bytes` above), which is a DRIVER-level allocator
+    // (`nvidia_smi_memory_used` above), which is a DRIVER-level allocator
     // POOL high-water mark, not live-allocated bytes — it does NOT shrink
     // back down between steps (the same convention
     // `crates/jammi-kernels/artifacts/cuda-runs/2026-08-24-p1-softmax-fold-
-    // bf8e807-a100-sxm4.json` (unification contract C8: this RECORD moved
-    // here from its original pre-schema location under `crates/jammi-bench/`)
-    // reasons about in 32 MiB pool blocks). For a monotone pool high-water, "baseline" means "before any
+    // bf8e807-a100-sxm4.json` reasons about in 32 MiB pool blocks). For a monotone pool high-water, "baseline" means "before any
     // of this run's allocation happened" — i.e. right after the model,
     // optimizer, and fixture tensors are built (`build_fixture` above) but
     // before the untimed pre-step drives the pool up. If this baseline were
@@ -817,19 +822,19 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     // stacks' baselines are deliberately taken at different points in their
     // respective step sequences in order to stay comparable under
     // `vram_delta(comparable)`.
-    let vram_baseline = device_memory_used_bytes().unwrap_or(0);
-    let sampler = VramSampler::start();
+    let vram_baseline = device_memory().unwrap_or(0);
+    let sampler = VramSampler::start(device_memory);
 
     // ONE untimed step, BEFORE the timed loop — mirrors
     // `torch_finetune_step.py`'s own untimed `_step_once` pre-step (see that
     // file's `run()` for the identical reasoning), so BOTH stacks discard
     // the SAME "update 0" before the officially reported `--warmup` step 0
-    // begins. Without this, jammi's `losses[k]` was the loss after
-    // `warmup+k` total optimizer updates while torch's `losses[k]` was the
-    // loss after `warmup+k+1` updates (one update ahead) — `loss_first` was
-    // the worst case, since `LoraInitMode::ZerosB` makes the LoRA delta
-    // identically zero at construction, so jammi's un-fixed `loss_first` was
-    // the PRISTINE (zero-optimizer-update) loss while torch's was already
+    // begins. Without it, jammi's `losses[k]` would be the loss after
+    // `warmup+k` total optimizer updates while torch's `losses[k]` is the
+    // loss after `warmup+k+1` updates (one update ahead) — worst at
+    // `loss_first`, since `LoraInitMode::ZerosB` makes the LoRA delta
+    // identically zero at construction, so jammi's `loss_first` would be
+    // the PRISTINE (zero-optimizer-update) loss while torch's is already
     // one update in. With this pre-step, both stacks' `losses[k]` is the
     // loss after `warmup+k+1` total updates — see
     // `finetune_step_loss_first_is_the_post_pre_step_update` below, which
@@ -867,21 +872,21 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     // around the step loop, so this run's dispatch count is isolated
     // from anything an earlier tier in the same process invocation did.
     let ln_dispatch_before = jammi_encoders::ln_dispatch_snapshot();
-    // Same mechanism, for the C3 fused RoPE kernel.
+    // Same mechanism, for the fused RoPE kernel.
     let rope_dispatch_before = jammi_encoders::rope_dispatch_snapshot();
-    // Same mechanism, for the C4 fused masked-softmax kernel.
+    // Same mechanism, for the fused masked-softmax kernel.
     let softmax_dispatch_before = jammi_encoders::softmax_dispatch_snapshot();
-    // Same mechanism, for the C5 fused GeGLU kernel.
+    // Same mechanism, for the fused GeGLU kernel.
     let geglu_dispatch_before = jammi_encoders::geglu_dispatch_snapshot();
-    // Same mechanism, for the C-MLP fused GELU-erf activation kernel
+    // Same mechanism, for the fused GELU-erf activation kernel
     // (BERT's/DistilBERT's FFN, admit key `gelu_erf_fused`). No
     // `jammi_encoders`-side snapshot wrapper exists for this one (unlike
     // the ops above): the process-wide registry is read directly, the
     // same shape `adamw_dispatch_before` below already uses.
     let gelu_dispatch_before = jammi_kernels::admission::counters_for("gelu_erf_fused").snapshot();
-    // Same mechanism, for the C6 fused LoRA-site epilogue.
+    // Same mechanism, for the fused LoRA-site epilogue.
     let lora_epilogue_dispatch_before = jammi_lora::lora_epilogue_dispatch_snapshot();
-    // Same mechanism, for the P2 fused LoRA SITE (base matmul + dropout +
+    // Same mechanism, for the fused LoRA SITE (base matmul + dropout +
     // both LoRA GEMMs + epilogue, one CustomOp3) — see
     // `jammi_lora::lora_linear_fused_dispatch_snapshot`'s doc for why
     // `lora_epilogue_*` above legitimately reads zero on a run where this
@@ -896,8 +901,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     // report doc for how that forced-eager run is validated end-to-end).
     let adamw_dispatch_before =
         jammi_kernels::admission::counters_for("adamw_step_fused").snapshot();
-    // Same mechanism, for the FlashAttention-2 dense cascade (P6 Stage B
-    // B3-dense) — a THREE-outcome snapshot (`fused`/`eager`/`declined`,
+    // Same mechanism, for the FlashAttention-2 dense cascade — a THREE-outcome snapshot (`fused`/`eager`/`declined`,
     // `jammi_kernels::admission::CascadeDispatchSnapshot`), not the
     // two-outcome shape the ops above use — see
     // `jammi_encoders::attention_block_flash_dispatch_snapshot`'s own doc.
@@ -910,8 +914,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         let t0 = Instant::now();
         // See `step_once`'s own doc for the loss-value placement convention
         // (PRE-update loss of this call's batch) and for the clip's
-        // placement (after backward, before the optimizer step) — unchanged
-        // by this refactor, just no longer duplicated inline here.
+        // placement (after backward, before the optimizer step).
         let loss_val = step_once(
             &mut encoder,
             &mut opt,
@@ -942,7 +945,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     let attention_block_flash_dispatch_after =
         jammi_encoders::attention_block_flash_dispatch_snapshot();
 
-    // `JAMMI_KERNELS_DISABLE` safety property (contract K-aux): a
+    // `JAMMI_KERNELS_DISABLE` safety property: a
     // disable-list entry that never actually disabled a live `admit` call
     // this run is a typo, not a forced-eager measurement — this run is
     // INVALID, not a datum with a plausible-looking JSON tier. Checked at
@@ -959,15 +962,13 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         .into());
     }
 
-    // The RESOLVED disable state, for the report artifact (contract K-aux,
-    // round 2 / B3): `requested` is what `JAMMI_KERNELS_DISABLE` named this
+    // The RESOLVED disable state, for the report artifact: `requested` is what `JAMMI_KERNELS_DISABLE` named this
     // process (sorted, empty when unset); `fired` is which of those entries
     // actually disabled a live dispatch this run (a strict subset once
     // `unmatched_kernel_disables` is empty, per the check just above).
     // Recorded even on an ordinary undisabled run (both empty), rather than
-    // only on a forced-eager one: an omitted pair would read as "this
-    // report predates the field", which is false — every report from this
-    // build carries an opinion on which arm it measured. This is what lets
+    // only on a forced-eager one: every report carries an opinion on which
+    // arm it measured. This is what lets
     // a downstream A/B harness catch the "env var silently dropped" failure
     // mode `unmatched_disables` does NOT cover: a run whose
     // `JAMMI_KERNELS_DISABLE` never reached this process at all (a var-NAME
@@ -1007,16 +1008,15 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         // field doc: this tier has no `--margin` CLI flag, and the ONE call
         // site that uses this constant (`triplet_loss(&a, &p, &n, 0.3)`,
         // below) is not parameterized by it either — this field exists so
-        // the VALUE is emitted for the leg-premise check, not so the run
-        // itself becomes configurable this round.
+        // the VALUE is emitted for the leg-premise check; the run itself is
+        // not configurable on it.
         margin: 0.3,
         target_modules: params.target_modules.clone(),
         batched_forward: params.batched_forward,
         max_grad_norm: params.max_grad_norm,
-        // IDENTITY (contract v4 §1's item 1, K7 audit: 17 -> 18 entries):
-        // the per-row lengths this leg actually fed the encoder -- the
+        // IDENTITY: the per-row lengths this leg actually fed the encoder -- the
         // REQUESTED value when `--row-lengths` was supplied, or, on the
-        // ORIGINAL dense default (`params.row_lengths == None`), the value
+        // dense default (`params.row_lengths == None`), the value
         // that describes the all-ones mask `build_fixture` built:
         // `[seq; batch]` (every row's real length equals `seq`, the SAME
         // discriminator `jammi_encoders`' `CompactedBatch::is_dense` uses:
@@ -1103,8 +1103,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
         // The SAME function `report::Provenance::baked` calls for
         // `report.provenance.build_features` — never a second,
-        // independently-drifting computation (unification contract C2.2;
-        // see that function's own doc for why this tier ALSO carries its
+        // independently-drifting computation (see that function's own doc for why this tier ALSO carries its
         // own echo rather than relying solely on the `Report` wrapper).
         build_features: crate::report::build_features(),
         kernels_disabled_requested,
@@ -1119,8 +1118,8 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
             None => Measurement::not_yet_measured("bytes"),
         },
     };
-    // K7-completeness, enforced on every real run (unification contract
-    // C3.1) — see `report::assert_identity_fields_present`'s own doc.
+    // Identity-field completeness, enforced on every real run — see
+    // `report::assert_identity_fields_present`'s own doc.
     let value = serde_json::to_value(&tier).expect("serialize FinetuneStepTier for self-check");
     crate::report::assert_identity_fields_present(&value, FinetuneStepTier::IDENTITY_FIELDS);
     Ok(tier)
@@ -1412,10 +1411,10 @@ mod tests {
     /// order, which is NOT stable across separate `VarMap` instances — std's
     /// `HashMap` reseeds its hasher per construction, so two freshly-built
     /// `VarMap`s from the identical seed/config produce their vars in
-    /// different orders (confirmed empirically: an earlier draft of this
-    /// test compared `all_vars()`'s raw order directly and false-failed on
-    /// every second run — the underlying per-parameter values were bit-
-    /// identical, just concatenated in a different sequence). Reading via
+    /// different orders (confirmed empirically: comparing `all_vars()`'s raw
+    /// order directly false-fails on every second run — the underlying
+    /// per-parameter values are bit-identical, just concatenated in a
+    /// different sequence). Reading via
     /// [`candle_nn::VarMap::data`] and sorting by name removes that
     /// ordering as a variable, so a mismatch here is a real trajectory
     /// difference, not a HashMap artifact.
@@ -1436,12 +1435,10 @@ mod tests {
     }
 
     /// Absent `--max-grad-norm`: two runs from the same seed take the same
-    /// trajectory bit-for-bit. This is the oracle for "bit-identical to
-    /// before this commit" — the absent path never calls `clip_gradients`
-    /// (see `clip_gradients_never_invoked_when_max_grad_norm_absent` above),
-    /// so its op sequence is unchanged by this commit; this test pins that
-    /// the resulting parameters are actually deterministic, not merely that
-    /// the code looks unchanged on inspection.
+    /// trajectory bit-for-bit. The absent path never calls `clip_gradients`
+    /// (see `clip_gradients_never_invoked_when_max_grad_norm_absent` above);
+    /// this test pins that the resulting parameters are actually
+    /// deterministic.
     #[test]
     fn absent_max_grad_norm_is_deterministic_across_runs() {
         let a = train_two_steps_and_flatten_params(None);
@@ -1543,11 +1540,11 @@ mod tests {
         (trainable, grads, total_sq.sqrt())
     }
 
-    /// The ACTIVE clip arm, against the host reference (PR #381 advisory:
-    /// this module's other clip tests run at `max_norm = 1e9` — where the
-    /// coefficient clamps to exactly `1.0` and the rescale is a bit-exact
-    /// no-op — or with the flag absent, so none of them ever exercised a
-    /// coefficient strictly below `1.0` through the bench's own fixture).
+    /// The ACTIVE clip arm, against the host reference (this module's other
+    /// clip tests run at `max_norm = 1e9` — where the coefficient clamps to
+    /// exactly `1.0` and the rescale is a bit-exact no-op — or with the flag
+    /// absent, so none of them exercises a coefficient strictly below `1.0`
+    /// through the bench's own fixture).
     /// Picks `max_norm = total_norm / 2` off the host-side norm so `coef ≈
     /// 0.5`, runs the PRODUCTION `clip_gradients` over the name-sorted
     /// `Var`s exactly as `step_once` does, and checks every clipped element
@@ -1634,123 +1631,105 @@ mod tests {
     /// norm, so a fixture whose norm ever drops below this fails loudly
     /// instead of silently testing the clamp-to-1.0 no-op arm).
     const CROSS_PROCESS_MAX_NORM: f32 = 1e-3;
-    const CROSS_PROCESS_CHILD_ENV: &str = "JAMMI_BENCH_CLIP_DETERMINISM_CHILD";
 
-    /// PR #381 audit B3 — the cross-PROCESS determinism proof the PR body
-    /// called "not yet run": two separate invocations of this test binary,
-    /// same seed, `--max-grad-norm` active (coefficient strictly below
-    /// `1.0`, asserted), must emit bit-identical `losses`. This is the
-    /// esc-182 class made observable at the bench's own CLI-shaped entry
-    /// point (`run()`): `clip_gradients` folds the global norm in the
-    /// order its `trainable` slice arrives, and a raw `VarMap::all_vars()`
-    /// order is re-randomised per process by `HashMap`'s hasher seed — so
-    /// with `all_vars()` at `build_fixture`/`run` (as before this round)
-    /// the last bits of every clipped gradient, and therefore of every
-    /// loss after the first, differed between two launches of the same
+    /// The cross-PROCESS determinism proof: two separate invocations of this
+    /// test binary, same seed, `--max-grad-norm` active (coefficient strictly
+    /// below `1.0`, asserted), must emit bit-identical `losses`, observed at
+    /// the bench's own CLI-shaped entry point (`run()`): `clip_gradients`
+    /// folds the global norm in the order its `trainable` slice arrives, and
+    /// a raw `VarMap::all_vars()` order is re-randomised per process by
+    /// `HashMap`'s hasher seed — so `all_vars()` at `build_fixture`/`run`
+    /// would make the last bits of every clipped gradient, and therefore of
+    /// every loss after the first, differ between two launches of the same
     /// command. A single-process test cannot see this (one process, one
-    /// hasher seed); this one re-executes itself as two child processes
-    /// (`std::env::current_exe()`, filtered `--exact` to this test, with
-    /// `CROSS_PROCESS_CHILD_ENV` set) and compares what they printed.
+    /// hasher seed); this one runs [`clip_on_losses_child`] as two child
+    /// processes and compares what they printed.
     /// Also checks the counted fact: `clip_invocations == steps + warmup
     /// + 1` in each child.
+    const CROSS_PROCESS_STEPS: usize = 3;
+    const CROSS_PROCESS_WARMUP: usize = 1;
+
+    /// One launch of the clipped run: proves the clip is active, runs the real
+    /// entry point, and prints the loss bits for the parent to compare.
+    #[test]
+    #[ignore = "child process of clip_on_losses_are_bit_identical_across_processes"]
+    fn clip_on_losses_child() {
+        const STEPS: usize = CROSS_PROCESS_STEPS;
+        const WARMUP: usize = CROSS_PROCESS_WARMUP;
+        let params = clip_tiny_params(Some(CROSS_PROCESS_MAX_NORM), STEPS, WARMUP);
+        let (_, _, host_norm) = first_step_grads_and_host_norm(&params);
+        assert!(
+            host_norm > (CROSS_PROCESS_MAX_NORM as f64) * 2.0,
+            "child: first-step grad norm {host_norm} is not comfortably above \
+             CROSS_PROCESS_MAX_NORM {CROSS_PROCESS_MAX_NORM} — the clip would not bite"
+        );
+        let tier = run(&params).expect("child run");
+        let bits: Vec<String> = tier
+            .losses
+            .iter()
+            .map(|l| format!("{:08x}", l.to_bits()))
+            .collect();
+        println!("CLIP_DETERMINISM_LOSSES {}", bits.join(","));
+        println!("CLIP_DETERMINISM_INVOCATIONS {}", tier.clip_invocations);
+        println!("CLIP_DETERMINISM_ATTENTION_ARM {}", tier.attention_arm);
+    }
+
     #[test]
     fn clip_on_losses_are_bit_identical_across_processes() {
-        const STEPS: usize = 3;
-        const WARMUP: usize = 1;
-        // Round KO-7 gating: this is a self-re-exec harness, not a
-        // capability-gated skip — every real CI run of the PARENT role
-        // (below) spawns two CHILD-role invocations of this exact fn
-        // (`CROSS_PROCESS_CHILD_ENV` set) and neither role's assertions are
-        // ever bypassed, so there is no missing-resource condition here for
-        // a `JAMMI_REQUIRE_*` hatch to meaningfully gate — fabricating one
-        // that could never fire would itself be a vacuous control. The
-        // if/else below (no early `return`) removes the KO-7-recognized
-        // skip shape at its source instead.
-        if std::env::var_os(CROSS_PROCESS_CHILD_ENV).is_some() {
-            // CHILD: prove the clip is active, run the real entry point,
-            // print the loss bits for the parent to compare.
-            let params = clip_tiny_params(Some(CROSS_PROCESS_MAX_NORM), STEPS, WARMUP);
-            let (_, _, host_norm) = first_step_grads_and_host_norm(&params);
-            assert!(
-                host_norm > (CROSS_PROCESS_MAX_NORM as f64) * 2.0,
-                "child: first-step grad norm {host_norm} is not comfortably above \
-                 CROSS_PROCESS_MAX_NORM {CROSS_PROCESS_MAX_NORM} — the clip would not bite"
+        const STEPS: usize = CROSS_PROCESS_STEPS;
+        const WARMUP: usize = CROSS_PROCESS_WARMUP;
+        // libtest's name for the child is its module path WITHOUT the
+        // crate prefix (`finetune_step::tests::…`).
+        let (_, module) = module_path!()
+            .split_once("::")
+            .expect("module_path has a crate prefix");
+        let child = format!("{module}::clip_on_losses_child");
+        let run_child = |label: &str| -> (String, String, String) {
+            let stdout = jammi_test_resources::child_test_stdout(
+                &mut jammi_test_resources::child_test(&child),
             );
-            let tier = run(&params).expect("child run");
-            let bits: Vec<String> = tier
-                .losses
-                .iter()
-                .map(|l| format!("{:08x}", l.to_bits()))
-                .collect();
-            println!("CLIP_DETERMINISM_LOSSES {}", bits.join(","));
-            println!("CLIP_DETERMINISM_INVOCATIONS {}", tier.clip_invocations);
-            println!("CLIP_DETERMINISM_ATTENTION_ARM {}", tier.attention_arm);
-        } else {
-            let exe = std::env::current_exe().expect("current_exe");
-            // libtest's name for this fn is the module path WITHOUT the crate
-            // prefix (`finetune_step::tests::…`), which `module_path!()` carries.
-            let (_, module) = module_path!()
-                .split_once("::")
-                .expect("module_path has a crate prefix");
-            let name = format!("{module}::clip_on_losses_are_bit_identical_across_processes");
-            let run_child = |label: &str| -> (String, String, String) {
-                let out = std::process::Command::new(&exe)
-                    .args(["--exact", &name, "--nocapture", "--test-threads=1"])
-                    .env(CROSS_PROCESS_CHILD_ENV, "1")
-                    .output()
-                    .expect("spawn child test process");
-                let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-                assert!(
-                    out.status.success(),
-                    "child {label} failed ({:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
-                    out.status
-                );
-                // libtest prints `test <name> ... ` WITHOUT a newline before the
-                // test body's own first `println!` under `--nocapture`, so the
-                // first marker sits mid-line: match by substring, not prefix.
-                let grab = |key: &str| -> String {
-                    stdout
-                        .lines()
-                        .find_map(|l| l.split_once(key).map(|(_, v)| v.trim().to_string()))
-                        .unwrap_or_else(|| {
-                            panic!("child {label} printed no `{key}` line:\n{stdout}")
-                        })
-                };
-                (
-                    grab("CLIP_DETERMINISM_LOSSES "),
-                    grab("CLIP_DETERMINISM_INVOCATIONS "),
-                    grab("CLIP_DETERMINISM_ATTENTION_ARM "),
-                )
+            // libtest prints `test <name> ... ` WITHOUT a newline before the
+            // test body's own first `println!` under `--nocapture`, so the
+            // first marker sits mid-line: match by substring, not prefix.
+            let grab = |key: &str| -> String {
+                stdout
+                    .lines()
+                    .find_map(|l| l.split_once(key).map(|(_, v)| v.trim().to_string()))
+                    .unwrap_or_else(|| panic!("child {label} printed no `{key}` line:\n{stdout}"))
             };
-            let (losses_a, invocations_a, arm_a) = run_child("A");
-            let (losses_b, invocations_b, arm_b) = run_child("B");
-            assert_eq!(
-                losses_a.split(',').count(),
-                STEPS,
-                "child A must report one loss per measured step: {losses_a}"
-            );
-            assert_eq!(
-                losses_a, losses_b,
-                "same seed, same --max-grad-norm, two processes: clip-on losses must be \
-                 bit-identical (A={losses_a} B={losses_b}) — a mismatch is the esc-182 \
-                 HashMap-order class"
-            );
-            assert_eq!(
-                invocations_a,
-                (STEPS + WARMUP + 1).to_string(),
-                "clip_invocations must count pre-step + warmup + measured"
-            );
-            assert_eq!(invocations_a, invocations_b);
-            assert_eq!(
-                arm_a, arm_b,
-                "attention_arm must be a function of the run, not the process"
-            );
-            assert!(
-                ["fused", "eager"].contains(&arm_a.as_str()),
-                "a single-arm run must read fused or eager, got {arm_a}"
-            );
-        }
+            (
+                grab("CLIP_DETERMINISM_LOSSES "),
+                grab("CLIP_DETERMINISM_INVOCATIONS "),
+                grab("CLIP_DETERMINISM_ATTENTION_ARM "),
+            )
+        };
+        let (losses_a, invocations_a, arm_a) = run_child("A");
+        let (losses_b, invocations_b, arm_b) = run_child("B");
+        assert_eq!(
+            losses_a.split(',').count(),
+            STEPS,
+            "child A must report one loss per measured step: {losses_a}"
+        );
+        assert_eq!(
+            losses_a, losses_b,
+            "same seed, same --max-grad-norm, two processes: clip-on losses must be \
+             bit-identical (A={losses_a} B={losses_b}) — a mismatch means the clip folds \
+             its norm in a per-process HashMap order"
+        );
+        assert_eq!(
+            invocations_a,
+            (STEPS + WARMUP + 1).to_string(),
+            "clip_invocations must count pre-step + warmup + measured"
+        );
+        assert_eq!(invocations_a, invocations_b);
+        assert_eq!(
+            arm_a, arm_b,
+            "attention_arm must be a function of the run, not the process"
+        );
+        assert!(
+            ["fused", "eager"].contains(&arm_a.as_str()),
+            "a single-arm run must read fused or eager, got {arm_a}"
+        );
     }
 
     /// The `attention_arm` derivation, pinned (see the tier field's doc):
@@ -1770,16 +1749,14 @@ mod tests {
         );
     }
 
-    /// C-ATTN unit (campaign #462/#463): `ATTENTION_DISABLE_KEYS` gains the
-    /// fused whole-attention-block kernel's OWN admit key
-    /// (`"attention_block_fused"` — what `jammi_encoders`' `admit(..)` call
-    /// site actually checks against `JAMMI_KERNELS_DISABLE`, distinct from
-    /// the legacy `"attention_block"` shorthand this const already carried),
-    /// so `attention_arm` must record `"eager"` when THAT key — not just its
-    /// legacy shorthand — is the one requested. RED at base: this key was
-    /// absent from `ATTENTION_DISABLE_KEYS`, so `JAMMI_KERNELS_DISABLE=attention_block_fused`
-    /// read back as `"fused"` here even though it disables the fused
-    /// whole-attention-block kernel by name.
+    /// `ATTENTION_DISABLE_KEYS` carries the fused whole-attention-block
+    /// kernel's OWN admit key (`"attention_block_fused"` — what
+    /// `jammi_encoders`' `admit(..)` call site actually checks against
+    /// `JAMMI_KERNELS_DISABLE`, distinct from the `"attention_block"`
+    /// shorthand), so `attention_arm` must record `"eager"` when THAT key —
+    /// not just its shorthand — is the one requested. Without it,
+    /// `JAMMI_KERNELS_DISABLE=attention_block_fused` would read back as
+    /// `"fused"` even though it disables the fused kernel by name.
     #[test]
     fn attention_arm_reads_eager_for_the_fused_kernels_own_admit_key() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
@@ -1812,13 +1789,12 @@ mod tests {
                 attention_arm(&tier.kernels_disabled_requested),
                 "attention_arm must be the resolved JAMMI_KERNELS_DISABLE request"
             );
-            // THE CLASS-A REPRODUCTION (PR #381 re-audit): this fixture has
-            // `head_dim = 16`, so the fused attention-block predicate
-            // DECLINES BY DOMAIN and the counters read eager — yet nothing
-            // was disabled, so the leg the operator asked for is the fused
-            // one and must read "fused" (a counter-derived value read
-            // "eager" here and would have INVALIDated a real non-64-head_dim
-            // A/B row against torch-sdpa).
+            // This fixture has `head_dim = 16`, so the fused attention-block
+            // predicate DECLINES BY DOMAIN and the counters read eager — yet
+            // nothing was disabled, so the leg the operator asked for is the
+            // fused one and must read "fused" (a counter-derived value would
+            // read "eager" here and INVALIDate a real non-64-head_dim A/B row
+            // against torch-sdpa).
             assert!(tier.kernels_disabled_requested.is_empty());
             assert_eq!(tier.attention_arm, "fused");
             assert!(
@@ -1853,11 +1829,10 @@ mod tests {
             // 3, deliberately NOT 2: `step_once`'s batched arm computes the
             // negative group's row offset as `2 * b`. At `b == 2`,
             // `2 * b == 2 + b == 4` — a mutation of that `*` to `+` is
-            // undetectable by ANY test using `batch: 2` (cargo-mutants
-            // caught exactly this: `replace * with + in step_once`
-            // survived until this fixture moved off `b == 2` — see
+            // undetectable by ANY test using `batch: 2` (the cargo-mutants
+            // mutant `replace * with + in step_once` survives there — see
             // `crates/jammi-bench/src/grad_oracle.rs`'s identical fixture
-            // note for the sibling tier where this was first caught).
+            // note for the sibling tier).
             batch: 3,
             seq: 8,
             steps: 2,
@@ -1893,10 +1868,7 @@ mod tests {
     /// SAME per-counter totals. If `run()` reported the raw "after"
     /// snapshot instead of `after - before`, the second call's totals would
     /// include the first call's dispatches too and come out roughly double
-    /// — this test reddens the moment that subtraction is removed (the
-    /// acceptance gap this test closes: deleting the before/after snapshot
-    /// pair and reporting the bare "after" counters previously had no test
-    /// noticing).
+    /// — this test reddens the moment that subtraction is removed.
     #[test]
     fn finetune_step_counters_are_a_snapshot_delta_not_a_running_total() {
         // `cargo test` runs this crate's tests on multiple threads by
@@ -2048,7 +2020,7 @@ mod tests {
         );
     }
 
-    /// B1 fix pin: `run()` must execute exactly ONE untimed optimizer update
+    /// `run()` must execute exactly ONE untimed optimizer update
     /// (the pre-step) BEFORE its timed loop starts recording, so
     /// `tier.losses[0]` is the loss after `warmup+1` total optimizer
     /// updates, never the PRISTINE (zero-update) loss. `LoraInitMode::ZerosB`
@@ -2058,7 +2030,7 @@ mod tests {
     /// pristine and post-one-update losses are computed from a materially
     /// different forward, not just numerically close.
     ///
-    /// Drives the REAL `run()` entry point (clause 8: never `step_once` in
+    /// Drives the REAL `run()` entry point (never `step_once` in
     /// isolation as the code path under test) and compares its `losses[0]`
     /// against an INDEPENDENT oracle: a SEPARATE fixture built via the same
     /// `build_fixture` construction `run()` itself uses, then stepped by
@@ -2128,22 +2100,19 @@ mod tests {
              trajectories line up on the same absolute update index"
         );
         // Explicitly distinguish from the PRISTINE (zero-update) loss,
-        // pinning that the recorded value is NOT the pre-B1-fix placement
-        // (loss_first used to be exactly this value).
+        // which is what `loss_first` reads without the pre-step.
         assert_ne!(
             tier.losses[0], pristine_loss,
             "losses[0] equals the PRISTINE (zero-optimizer-update) loss — \
-             looks like the B1 regression re-appeared: run() is no longer \
-             executing its untimed pre-step before recording starts"
+             run() is not executing its untimed pre-step before recording starts"
         );
     }
 
-    /// MUTATION-TRIAGE test (cargo-mutants caught `build_fixture`'s literal
-    /// `lr: 2e-4` field being DELETED from the `ParamsAdamW` struct-update
+    /// Mutation test (the cargo-mutants mutant that DELETES `build_fixture`'s
+    /// literal `lr: 2e-4` field from the `ParamsAdamW` struct-update
     /// expression, silently falling back to `..Default::default()`'s `lr =
-    /// 0.001` — 5x larger — completely undetected): no existing test reads
-    /// the optimizer's actual learning rate; every test so far only
-    /// compares LOSS VALUES produced by build_fixture, either against a
+    /// 0.001` — 5x larger): no other test reads the optimizer's actual
+    /// learning rate; every other test only compares LOSS VALUES produced by build_fixture, either against a
     /// SECOND independent build_fixture call (self-consistent even if BOTH
     /// silently used the wrong Default lr) or against a qualitative "not
     /// near margin" bound loose enough not to notice a 5x rate change.
@@ -2231,8 +2200,8 @@ mod tests {
         );
     }
 
-    /// MUTATION-TRIAGE test (cargo-mutants caught TWO of THREE comparison-
-    /// operator mutations in `build_fixture`'s `(params.lora_dropout >
+    /// Mutation test (TWO of the THREE cargo-mutants comparison-operator
+    /// mutants of `build_fixture`'s `(params.lora_dropout >
     /// 0.0).then_some(...)` boundary: `>` -> `==` and `>` -> `<`, both of
     /// which WRONGLY disable dropout for any POSITIVE `lora_dropout`
     /// value): builds two otherwise-identical fixtures differing ONLY in
@@ -2247,12 +2216,11 @@ mod tests {
     /// so the WHOLE LoRA term is `0` regardless of what dropout did to the
     /// `A^T` intermediate. This means the loss `step_once`'s FIRST call
     /// ever returns (the PRE-update loss of a pristine `B`) is
-    /// mathematically INDEPENDENT of dropout — confirmed empirically: an
-    /// earlier draft of this test compared FIRST-call losses directly and
-    /// they were bit-identical (`0.26643285` both) even on the
-    /// UN-mutated, correctly-dropout-engaging code, which is why this
-    /// draft takes a pre-step first (mirrors `run()`'s own untimed
-    /// pre-step reasoning, see `finetune_step_loss_first_is_the_post_pre_step_update`).
+    /// mathematically INDEPENDENT of dropout — FIRST-call losses are
+    /// bit-identical (`0.26643285` both) even on correctly-dropout-engaging
+    /// code, which is why this test takes a pre-step first (mirrors `run()`'s
+    /// own untimed pre-step reasoning, see
+    /// `finetune_step_loss_first_is_the_post_pre_step_update`).
     /// After one update, `lora_b != 0`, so the SECOND call's forward DOES
     /// depend on dropout: `seed makes the A/B init and the dropout mask a
     /// pure function of the run` (`lora_linear.rs`'s own doc), so a
@@ -2321,10 +2289,10 @@ mod tests {
         );
     }
 
-    /// MUTATION-TRIAGE test (cargo-mutants caught FIVE distinct arithmetic
-    /// mutations inside `triplet_loss` itself — `a * p` -> `a + p`, `a *
-    /// n` -> `a + n`, `neg - pos` -> `neg + pos`/`neg / pos`, `+ margin` ->
-    /// `* margin` — ALL undetected): every other test that exercises
+    /// Mutation test (FIVE distinct cargo-mutants arithmetic mutants inside
+    /// `triplet_loss` itself — `a * p` -> `a + p`, `a * n` -> `a + n`,
+    /// `neg - pos` -> `neg + pos`/`neg / pos`, `+ margin` -> `* margin`):
+    /// every other test that exercises
     /// `triplet_loss` does so only through `build_fixture`/`run`, either
     /// comparing losses against a SECOND independent call to the SAME
     /// (possibly identically-mutated) function, or checking a loose "not
@@ -2357,10 +2325,10 @@ mod tests {
         );
     }
 
-    /// MUTATION-TRIAGE test (cargo-mutants caught THREE arithmetic
-    /// mutations inside `synthetic_ids`'s own LCG step — `1 + (...)` ->
-    /// `1 * (...)`, `>> 33` -> `<< 33`, and the `vocab - 1` subtraction ->
-    /// `vocab / 1` — ALL undetected): the existing
+    /// Mutation test (THREE cargo-mutants arithmetic mutants inside
+    /// `synthetic_ids`'s own LCG step — `1 + (...)` -> `1 * (...)`,
+    /// `>> 33` -> `<< 33`, and the `vocab - 1` subtraction -> `vocab / 1`):
+    /// the
     /// `finetune_step_synthetic_batch_offset_is_seed_plus_group_index_not_seed_times_group_index`
     /// test only pins the BLOCK-OFFSET arithmetic (`seed + i`) via a
     /// degeneracy signature, never the LCG's OWN internal formula, and
@@ -2378,9 +2346,9 @@ mod tests {
         assert_eq!(got, vec![6, 1, 6, 8, 7]);
     }
 
-    /// MUTATION-TRIAGE test (cargo-mutants caught `device_name`'s whole
-    /// function body being replaced with `String::new()`/`"xyzzy".into()`):
-    /// no existing test reads `FinetuneStepTier::device_name`'s actual
+    /// Mutation test (the cargo-mutants mutants replacing `device_name`'s
+    /// whole function body with `String::new()`/`"xyzzy".into()`): no other
+    /// test reads `FinetuneStepTier::device_name`'s actual
     /// VALUE — only the pinned-key-set test in `report.rs` checks the key
     /// EXISTS, and that test constructs a literal fixture value rather
     /// than reading `device_name`'s real return.
@@ -2390,9 +2358,9 @@ mod tests {
         assert_eq!(tier.device_name, "cpu");
     }
 
-    /// MUTATION-TRIAGE test (cargo-mutants caught `run()`'s
-    /// `s_per_step_mean` division `sum/len` surviving as `sum%len`/
-    /// `sum*len`): wall-clock timings are real and non-reproducible, so
+    /// Mutation test (the cargo-mutants mutants turning `run()`'s
+    /// `s_per_step_mean` division `sum/len` into `sum%len`/`sum*len`):
+    /// wall-clock timings are real and non-reproducible, so
     /// this cannot hand-check an EXACT value — instead it pins a
     /// MATHEMATICAL INVARIANT that holds regardless of the actual
     /// timings: the mean of N positive reals is NEVER greater than their
@@ -2419,9 +2387,9 @@ mod tests {
         );
     }
 
-    /// MUTATION-TRIAGE test (cargo-mutants caught `run()`'s `steps_per_s =
-    /// 1.0/p50` and `triplets_per_s = batch/p50` divisions surviving as
-    /// `%`/`*`): pins the ALGEBRAIC IDENTITY each derived rate must
+    /// Mutation test (the cargo-mutants mutants turning `run()`'s
+    /// `steps_per_s = 1.0/p50` and `triplets_per_s = batch/p50` divisions
+    /// into `%`/`*`): pins the ALGEBRAIC IDENTITY each derived rate must
     /// satisfy (`rate * p50 == numerator`) rather than a raw wall-clock
     /// value, so this holds regardless of the actual (non-reproducible)
     /// timing.
@@ -2450,8 +2418,8 @@ mod tests {
         );
     }
 
-    /// MUTATION-TRIAGE test (cargo-mutants caught `build_fixture`'s
-    /// `params.seed + i` block-offset arithmetic surviving as `seed * i`):
+    /// Mutation test (the cargo-mutants mutant turning `build_fixture`'s
+    /// `params.seed + i` block-offset arithmetic into `seed * i`):
     /// at `seed == 0`, the CORRECT `seed + i` gives three DISTINCT synthetic
     /// seeds (0, 1, 2) for anchor/positive/negative, while the mutant
     /// `seed * i` collapses ALL THREE to seed `0` (`0*0 = 0*1 = 0*2 = 0`),
@@ -2480,10 +2448,10 @@ mod tests {
         }
     }
 
-    /// MUTATION-TRIAGE test (cargo-mutants caught `step_once`'s batched
+    /// Mutation test (the cargo-mutants mutants turning `step_once`'s batched
     /// arm's `all.narrow(0, 2 * batch, batch)` — the negative group's row
-    /// offset — surviving as `2 + batch`/`2 / batch`, even after
-    /// `tiny_params()` moved off the degenerate `batch == 2` case: at
+    /// offset — into `2 + batch`/`2 / batch`, which survive even off the
+    /// degenerate `batch == 2` case: at
     /// `batch == 3` a wrong offset picks an OVERLAPPING-but-different
     /// slice, not an out-of-bounds or obviously-degenerate one, so
     /// `finetune_step_synthetic_batch_offset_is_seed_plus_group_index_not_seed_times_group_index`'s
@@ -2542,35 +2510,27 @@ mod tests {
         }
     }
 
-    /// F1 REGRESSION (audit finding on PR #372): `peak_vram_bytes` is
-    /// `VramSampler::finish`'s `peak.saturating_sub(baseline)`
-    /// (`finetune_step.rs:276` at the time of writing). `saturating_sub`
+    /// `peak_vram_bytes` is `VramSampler::finish`'s
+    /// `peak.saturating_sub(baseline)`. `saturating_sub`
     /// FLOORS at zero rather than wrapping — so if `baseline` is ever
     /// captured AT (or above) the run's own high-water mark, the reported
     /// delta collapses to zero even though the run legitimately allocated
     /// many GB. This pins the arithmetic directly, independent of
     /// `nvidia-smi`/a real GPU (`VramSampler`'s fields are plain atomics
     /// this test constructs directly, bypassing `start()`'s `nvidia-smi`
-    /// precheck), using magnitudes drawn from a real A100 measurement of
-    /// `main`'s (pre-regression) convention (b8-s512-d0.05,
-    /// `peak_vram_bytes` = 14.98 GB) so the test is anchored to a
+    /// precheck), using magnitudes drawn from a real A100 measurement
+    /// (b8-s512-d0.05, `peak_vram_bytes` = 14.98 GB) so the test is anchored to a
     /// production-scale number, not an arbitrary toy pair.
     ///
-    /// This test cannot, by itself, prove `run()` captures `vram_baseline`
-    /// BEFORE the untimed pre-step (that ordering fix has no CPU-observable
-    /// effect: this box has no `nvidia-smi`, so `VramSampler::start()`
-    /// returns `None` and `run()`'s `peak_vram_bytes` is
-    /// `Measurement::not_yet_measured` regardless of ordering — see
-    /// `finetune_step_peak_vram_bytes_is_not_yet_measured_off_gpu` below).
-    /// The pod check that closes that gap is named in the PR's hand-off.
+    /// That `run()` takes the baseline BEFORE the untimed pre-step has no
+    /// effect a CPU host can observe; this pins the arithmetic it relies on.
     #[test]
     fn vram_sampler_finish_reports_true_delta_not_floored_by_a_baseline_at_the_peak() {
         const GIB: u64 = 1024 * 1024 * 1024;
         // `baseline`: model + optimizer resident, BEFORE any of this run's
-        // allocation (the F1-fixed convention). `delta_bytes`: the exact
-        // real-measurement magnitude for b8-s512-d0.05 (peak_vram_bytes =
-        // 14.98 GB, tip 2c1a68d) so the asserted delta is traceable to a
-        // live pod number, not an invented one.
+        // allocation. `delta_bytes`: the exact real-measurement magnitude for
+        // b8-s512-d0.05 (peak_vram_bytes = 14.98 GB) so the asserted delta is
+        // traceable to a real measurement, not an invented one.
         let baseline = 3 * GIB;
         let delta_bytes = 14_980_000_000_u64;
         let peak = baseline + delta_bytes;
@@ -2588,11 +2548,11 @@ mod tests {
         );
         assert!(
             m.value.unwrap() > 1.0e10,
-            "expected a multi-GB delta (this pins the F1 class: a baseline mistakenly \
-             captured AT the peak would floor this to ~0 via saturating_sub)"
+            "expected a multi-GB delta (a baseline mistakenly captured AT the peak \
+             would floor this to ~0 via saturating_sub)"
         );
 
-        // The bug this finding describes, reproduced in the arithmetic
+        // The failure mode, reproduced in the arithmetic
         // alone: a baseline captured AT (or above) the peak — i.e. AFTER
         // the pool has already been driven to its high-water mark by an
         // untimed pre-step — floors to zero via `saturating_sub`, silently,
@@ -2606,130 +2566,45 @@ mod tests {
         assert_eq!(
             collapsed.value,
             Some(0.0),
-            "sanity: this is the exact failure mode F1 describes — a same-or-later baseline \
-             silently reports zero, never an error, which is precisely why the CALL-SITE \
-             ordering in run() (fixed by this PR round) matters and cannot be caught by this \
-             arithmetic test alone"
+            "sanity: a same-or-later baseline silently reports zero, never an error, which \
+             is precisely why the CALL-SITE ordering in run() matters and cannot be caught by \
+             this arithmetic test alone"
         );
     }
 
-    /// Whether THIS box can drive `VramSampler` at all — the SAME probe
-    /// `VramSampler::start()` gates on (`device_memory_used_bytes()`, an
-    /// `nvidia-smi --query-gpu=memory.used` call), so the two lattice-cell
-    /// tests below branch on exactly what `run()` branches on, never on a
-    /// proxy (a CUDA feature flag, a hostname). `JAMMI_REQUIRE_CUDA` is the
-    /// RED-on-demand hatch the crate's other device-gated tests use
-    /// (`jammi-ai`'s `cuda_device`): with it set, the arm a box CANNOT
-    /// observe is a hard failure, never a skip.
-    fn vram_probe_present() -> bool {
-        device_memory_used_bytes().is_some()
-    }
-
-    /// Registered KO-7 require-gate helper (`ci/kernel-oracle-helpers.txt`)
-    /// for the NO-`nvidia-smi` lattice cell below: a lane that specifically
-    /// wants to prove the off-GPU `peak_vram_bytes` arm sets
-    /// `JAMMI_REQUIRE_NO_GPU_VRAM_ARM` — if that lane's box unexpectedly
-    /// HAS `nvidia-smi` (so the arm cannot be observed), this is a hard
-    /// failure, never a silent skip.
-    fn vram_off_gpu_arm_require_gate() {
-        if std::env::var_os("JAMMI_REQUIRE_NO_GPU_VRAM_ARM").is_some() {
-            panic!(
-                "finetune_step_peak_vram_bytes_is_not_yet_measured_off_gpu: \
-                 JAMMI_REQUIRE_NO_GPU_VRAM_ARM is set but nvidia-smi is present on this box -- \
-                 the off-GPU peak_vram_bytes arm cannot be proven here; a silent skip is not \
-                 acceptable"
-            );
-        }
-    }
-
-    /// Registered KO-7 require-gate helper (`ci/kernel-oracle-helpers.txt`)
-    /// for the WITH-`nvidia-smi` lattice cell below — same
-    /// `JAMMI_REQUIRE_CUDA` RED-on-demand hatch the crate's other
-    /// device-gated tests use, extracted into its own fn so its call site
-    /// is a registrable, reviewed require-gate rather than an inline
-    /// `assert!` KO-7 cannot recognize as a gate.
-    fn vram_on_gpu_arm_require_gate() {
-        if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-            panic!(
-                "finetune_step_peak_vram_bytes_is_measured_on_a_box_with_nvidia_smi: \
-                 JAMMI_REQUIRE_CUDA is set but nvidia-smi is not usable on this box -- the \
-                 on-GPU peak_vram_bytes arm cannot be proven here; a silent skip is not \
-                 acceptable"
-            );
-        }
-    }
-
-    /// Lattice-cell arm for `run()`'s `peak_vram_bytes`, NO-`nvidia-smi`
-    /// box (every CI lane): `VramSampler::start()` returns `None` (its
-    /// first `device_memory_used_bytes()` call fails), so `run()`'s `match
-    /// sampler { None => ... }` arm executes — pinned so a future change
-    /// that panics or fabricates a value in the absent-GPU arm reddens
-    /// immediately. On a box WITH `nvidia-smi` this arm is unobservable:
-    /// the test says so and returns (the sibling
-    /// `finetune_step_peak_vram_bytes_is_measured_on_a_box_with_nvidia_smi`
-    /// asserts that box's arm), and — before PR #381's fix round — asserted
-    /// `None` unconditionally, so it FAILED on every GPU box
-    /// (`Some(0.0) != None`; seen on a100b at `main` 6d07b20 and at every
-    /// PR tip since: the pod's `finetune_step::tests` leg could never be
-    /// green, which is exactly what blocked #381's cuda-run artifact).
+    /// A host that cannot report device memory: `peak_vram_bytes` is the
+    /// not-yet-measured sentinel, never a fabricated `0.0`.
     #[test]
-    fn finetune_step_peak_vram_bytes_is_not_yet_measured_off_gpu() {
-        if vram_probe_present() {
-            vram_off_gpu_arm_require_gate();
-            eprintln!(
-                "finetune_step_peak_vram_bytes_is_not_yet_measured_off_gpu: nvidia-smi is present \
-                 on this box, so the no-GPU arm is unobservable here — see the sibling \
-                 `..._is_measured_on_a_box_with_nvidia_smi` test for this box's arm"
-            );
-            return;
-        }
-        let tier = run(&tiny_params()).expect("finetune-step run");
-        assert_eq!(
-            tier.peak_vram_bytes.value, None,
-            "no nvidia-smi on this box => VramSampler::start() returns None => \
-             peak_vram_bytes must be the not-yet-measured sentinel, never a fabricated 0.0"
-        );
+    fn peak_vram_bytes_is_not_measured_without_a_device_memory_probe() {
+        let tier = run_with(&tiny_params(), || None).expect("finetune-step run");
+        assert_eq!(tier.peak_vram_bytes.value, None);
         assert_eq!(tier.peak_vram_bytes.unit, "bytes");
     }
 
-    /// The OTHER lattice-cell arm: a box WITH `nvidia-smi` (a pod).
-    /// `VramSampler::start()` returns `Some`, the sampler runs for the
-    /// whole warmup+measured loop, and `run()`'s `Some(sampler) =>
-    /// sampler.finish(vram_baseline)` arm emits a MEASURED, finite,
-    /// non-negative device-total-minus-baseline delta — `Some(0.0)` is the
-    /// honest reading for this CPU-resident tiny model (nothing of it lives
-    /// on the device; the pool high-water never moves), never the
-    /// not-yet-measured sentinel. Off a GPU box this arm is unobservable:
-    /// with `JAMMI_REQUIRE_CUDA` set that is a hard failure (the
-    /// RED-on-demand hatch, so a pod job that meant to prove this arm can
-    /// never silently skip it); otherwise the test says so and returns.
+    /// A host that reports device memory: the sampler runs for the whole
+    /// warmup and measured loop and `peak_vram_bytes` is a measured, finite,
+    /// non-negative high-water above the baseline. The probe here reports a
+    /// constant, as a device does for a model that is not resident on it, so
+    /// the delta is exactly zero.
     #[test]
-    fn finetune_step_peak_vram_bytes_is_measured_on_a_box_with_nvidia_smi() {
-        if !vram_probe_present() {
-            vram_on_gpu_arm_require_gate();
-            eprintln!(
-                "finetune_step_peak_vram_bytes_is_measured_on_a_box_with_nvidia_smi: no nvidia-smi \
-                 on this box, so the on-GPU arm is unobservable here — see the sibling \
-                 `..._is_not_yet_measured_off_gpu` test for this box's arm"
-            );
-            return;
-        }
-        let tier = run(&tiny_params()).expect("finetune-step run");
-        let v = tier
-            .peak_vram_bytes
-            .value
-            .expect("nvidia-smi present => VramSampler ran => peak_vram_bytes must be measured");
-        assert!(
-            v.is_finite() && v >= 0.0,
-            "measured peak_vram_bytes must be a finite non-negative delta, got {v}"
-        );
+    fn peak_vram_bytes_is_the_high_water_above_the_baseline_with_a_probe() {
+        let tier =
+            run_with(&tiny_params(), || Some(3 * 1024 * 1024 * 1024)).expect("finetune-step run");
+        assert_eq!(tier.peak_vram_bytes.value, Some(0.0));
         assert_eq!(tier.peak_vram_bytes.unit, "bytes");
     }
 
-    // ─── row_lengths / padded-fixture knob (contract v4 §1 item 1) ──────────
+    #[test]
+    fn nvidia_smi_memory_used_is_read_in_mib() {
+        assert_eq!(parse_memory_used("40536\n"), Some(40536 * 1024 * 1024));
+        assert_eq!(parse_memory_used(" 7 \n81920\n"), Some(7 * 1024 * 1024));
+        assert_eq!(parse_memory_used(""), None);
+        assert_eq!(parse_memory_used("[N/A]\n"), None);
+    }
 
-    /// A4 (dense invariance): the DEFAULT (`row_lengths: None`, every
-    /// existing call site before this field existed) reports the dense-leg
+    // ─── row_lengths / padded-fixture knob ──────────────────────────────────
+
+    /// Dense invariance: the DEFAULT (`row_lengths: None`) reports the dense-leg
     /// IDENTITY value `[seq; batch]` -- see `FinetuneStepTier::row_lengths`'s
     /// own doc for why this is the field's dense value, not merely the param
     /// default. `tiny_params()` is `batch: 3, seq: 8`.
@@ -2739,12 +2614,10 @@ mod tests {
         assert_eq!(tier.row_lengths, vec![8, 8, 8]);
     }
 
-    /// A4, the other half: every OTHER field on a dense (`row_lengths: None`)
-    /// leg is untouched by this field's addition -- two runs of the
-    /// identical dense params still agree bit-for-bit on `losses` (the same
-    /// property `clip_on_losses_are_bit_identical_across_processes` already
-    /// pins for the clip fields; this is the row_lengths-era re-proof that
-    /// adding the field did not perturb the dense call path at all).
+    /// Dense invariance, the other half: two runs of the identical dense
+    /// (`row_lengths: None`) params agree bit-for-bit on `losses` (the same
+    /// property `clip_on_losses_are_bit_identical_across_processes` pins for
+    /// the clip fields).
     #[test]
     fn row_lengths_absent_does_not_perturb_the_dense_leg() {
         let params = FinetuneStepParams {
@@ -2773,7 +2646,7 @@ mod tests {
         );
     }
 
-    /// `validate_row_lengths` refuses a zero-length row (the B3-padded arm's
+    /// `validate_row_lengths` refuses a zero-length row (the padded flash arm's
     /// own guard inventory: `total == 0` -- every row length 0 -- is a
     /// REFUSAL, never a silently-accepted empty row).
     #[test]

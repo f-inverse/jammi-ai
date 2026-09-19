@@ -1,19 +1,19 @@
 name: GPU perf A/B (RunPod)
 
-# Runs issue #335's within-run GPU perf A/B on a real NVIDIA A100 (sm_80) via
+# Runs the within-run GPU inference perf A/B on a real NVIDIA A100 (sm_80) via
 # an ephemeral RunPod pod — `ci/scripts/perf/gpu_inference_ab.sh` driving
 # `jammi-bench gpu-inference-scale` across two simultaneously-resident
 # clones (parent-HEAD + PR, or parent-vs-parent under `--aa-null`), merged
 # (leg-premise refusal + primary-endpoint ratio + PRE-REGISTERED advisory
 # classification, derived from the committed `ci/artifacts/gpu-perf-aa-null/`
-# campaign) by `ci/scripts/perf/gpu_inference_ab.py`.
+# runs) by `ci/scripts/perf/gpu_inference_ab.py`.
 #
-# TWO MODES (issue #335's final unit — see `gpu_inference_ab.sh`'s own "TWO
+# TWO MODES (see `gpu_inference_ab.sh`'s own "TWO
 # MODES" doc for the full rationale): this workflow's `enforce`
 # `workflow_dispatch` input (default `false`) is the ONLY way a run of this
 # workflow ever gates on the measured ratio. Non-enforcing (the default,
 # EVERY label-triggered PR run, and any dispatch that leaves `enforce`
-# unset/`false`) stays recording-only, exactly as before — it uploads the
+# unset/`false`) stays recording-only — it uploads the
 # merged report as an artifact for a human to read, is not itself a required
 # merge-path check, and grants no such status. Enforcing (`workflow_dispatch`
 # with `enforce: true`, deliberately invoked, never a label default, and
@@ -31,9 +31,8 @@ name: GPU perf A/B (RunPod)
 # Off the merge path, same discipline gpu-prove.yml/gpu-howwell.yml's own
 # headers state — GPU minutes cost money and A100 capacity is intermittent.
 # Fires on: the `run-gpu-perf-ab` PR label (opt-in per PR) and manual
-# dispatch ONLY — NO schedule (mirrors gpu-howwell.yml's own v1 posture: a
-# standing nightly A/B is a later decision, not this workflow's own
-# default).
+# dispatch ONLY — NO schedule (same posture as gpu-howwell.yml: the A/B is
+# operator-triggered, never a standing nightly run).
 #
 # Merge-path CI checks only ever validate COMMITTED artifacts (this
 # workflow itself, and the RunPod run it drives, never sit on that path,
@@ -44,12 +43,12 @@ on:
   workflow_dispatch:
     inputs:
       aa_null:
-        description: "Run the --aa-null empirical-null instrument (build the PARENT sha twice, from two independent clones, instead of parent-vs-PR) — the D6 evidence-gathering mode. 'true' or 'false' (default false: the normal parent-vs-PR A/B)."
+        description: "Run the --aa-null empirical-null instrument (build the PARENT sha twice, from two independent clones, instead of parent-vs-PR) — the empirical-null evidence-gathering mode. 'true' or 'false' (default false: the normal parent-vs-PR A/B)."
         required: false
         type: string
         default: "false"
       enforce:
-        description: "Enforce the pre-registered advisory band (issue #335's final unit): a GREEN-premise run whose ratio falls outside ci/scripts/perf/gpu_inference_ab.py::PRE_REGISTERED_ADVISORY_BAND refuses (exit 1). 'true' or 'false' (default false: non-enforcing, recording-only — the SAME posture every label-triggered PR run always keeps, opted into deliberately here, never by default)."
+        description: "Enforce the pre-registered advisory band: a GREEN-premise run whose ratio falls outside ci/scripts/perf/gpu_inference_ab.py::PRE_REGISTERED_ADVISORY_BAND refuses (exit 1). 'true' or 'false' (default false: non-enforcing, recording-only — the SAME posture every label-triggered PR run always keeps, opted into deliberately here, never by default)."
         required: false
         type: boolean
         default: false
@@ -86,7 +85,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # round-4 delta-audit F4: aa_null and enforce are mutually exclusive
+      # aa_null and enforce are mutually exclusive
       # (no PR exists under --aa-null to enforce against; the null band
       # itself was derived from exactly this shape of run). Guarded HERE,
       # at the workflow's own edge, before renting/building anything --
@@ -107,7 +106,7 @@ jobs:
           GIT_REPO: https://github.com/${{ github.repository }}.git
           GIT_REF: ${{ github.head_ref || github.ref_name }}
           GPU_PERF_AB_AA_NULL: ${{ github.event.inputs.aa_null == 'true' && '1' || '0' }}
-          # issue #335's final unit: enforcement is opt-in and dispatch-only
+          # Enforcement is opt-in and dispatch-only
           # by construction — the `github.event_name == 'workflow_dispatch'`
           # guard means a label-triggered `pull_request` event can NEVER
           # produce '1' here even if `github.event.inputs.enforce` somehow

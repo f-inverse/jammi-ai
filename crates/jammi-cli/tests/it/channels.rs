@@ -2,7 +2,7 @@
 //!
 //! Each test spawns a hermetic `jammi-server` (default SQLite catalog +
 //! in-memory broker) and drives the `jammi` CLI against it with `--target`.
-//! Channels are global (per SPEC-01 §11) so these tests do not bind a tenant.
+//! Channels are global, so these tests do not bind a tenant.
 
 use crate::server_harness::TestServer;
 

@@ -12,7 +12,7 @@
 //! dedicated request AND response message on its own service (e.g.
 //! `PipelineService::BuildNeighborGraph`) rather than going through
 //! `SubmitJobResponse`, so this service's `JobStatus`/`WaitJob` never has a
-//! compute-kind row to answer for over the wire (K4: the synchronous
+//! compute-kind row to answer for over the wire (the synchronous
 //! response is still byte-identical to what a `jobs` row of the same kind
 //! would resolve to, since both paths run through the same
 //! `execute_compute` dispatcher).
@@ -211,11 +211,11 @@ impl JobService for JobServer {
             let mut record = first;
             loop {
                 // Derived from `JobStatus::is_terminal` (the ONE terminality
-                // predicate, `status.rs:70-72`) via a round-trip parse,
+                // predicate) via a round-trip parse,
                 // rather than a per-status literal compare — a future
                 // terminal status joining the vocabulary ends the stream
                 // with a one-line edit, not a hunt for every literal
-                // compare (G6).
+                // compare.
                 if record
                     .status
                     .parse::<jammi_db::catalog::status::JobStatus>()
@@ -437,8 +437,7 @@ fn job_status_response_from_record(
 /// [`job_status_response_from_record`] reads, but relaying `output_model_id`
 /// verbatim (the catalog column, empty until stamped) rather than resolving
 /// it: this listing answers "has the output row landed yet", not "what will
-/// this job's model be called" (mirrors the former `ListTrainingJobs`
-/// contract, generalised to every kind).
+/// this job's model be called", for every kind.
 fn job_summary_from_record(record: JobRecord) -> pb::JobSummary {
     pb::JobSummary {
         job_id: record.job_id,

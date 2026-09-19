@@ -36,9 +36,9 @@ message RpcStatus {
 //
 // The standard gRPC code set is insufficient to distinguish the engine's
 // failure modes — `invalid_argument` alone collapses Source / Model / Tenant /
-// Config / Schema / Eval into one code — so a typed detail payload is the
-// ADR-01 §5.3-sanctioned mechanism for "structured error information when the
-// standard gRPC code set is insufficient". A typed `oneof` (not a
+// Config / Schema / Eval into one code — so a typed detail payload carries
+// the structured error information the standard code set cannot. A typed
+// `oneof` (not a
 // `google.rpc.Any`) keeps it type-driven: each engine variant reachable on the
 // embedding/search verb surface has its own message carrying exactly the
 // fields needed to reconstruct it.
@@ -221,8 +221,8 @@ message DependencyCycleError {
 }
 
 // `JammiError::NotRecomputable { table }`. A `recompute` was asked to
-// re-produce a table the engine has no faithful replay for (a pre-contract
-// table with no recorded descriptor, or an `External`-producer table).
+// re-produce a table the engine has no faithful replay for (a table with no
+// recorded descriptor, or an `External`-producer table).
 message NotRecomputableError {
   string table = 1;
 }

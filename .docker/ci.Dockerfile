@@ -8,11 +8,11 @@
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
-# Platform SQLite runtime (`/lib64/libsqlite3.so.0`). The esc-073 harness
-# (`crates/jammi-db/tests/it/esc_073_foreign_sqlite_library.rs`) `dlopen`s it to
+# Platform SQLite runtime (`/lib64/libsqlite3.so.0`). The foreign-SQLite-library
+# harness (`crates/jammi-db/tests/it/sqlite_foreign_library.rs`) `dlopen`s it to
 # get a SECOND SQLite library instance in one process alongside the statically
 # bundled `libsqlite3-sys`; with no platform library the harness has nothing to
-# collide with and reports itself vacuous. The base image happens to carry
+# collide with and fails naming it. The base image happens to carry
 # `sqlite-libs` today, but NO package in it requires that package, so a base
 # rebuild could drop it and silently hollow out the harness. Named explicitly
 # here instead of inherited by luck (a no-op when already present).
@@ -23,7 +23,7 @@ RUN yum install -y sqlite-libs \
 # `[need.*]` tables). The guard runner provides a missing need at run time, so
 # an image built before a need was declared still works; baking them here
 # keeps a CI run off the package mirrors.
-RUN yum install -y jq openssh-clients rsync tmux \
+RUN yum install -y jq openssh-clients rsync tmux util-linux perl-Digest-SHA glibc-langpack-en \
     && yum clean all
 
 # PyYAML: a declared prerequisite of `ci/scripts/check_execution_surface_
@@ -49,7 +49,7 @@ RUN yum install -y jq openssh-clients rsync tmux \
 # without this comment claiming a stdlib guarantee that does not exist.
 # The real guard against that drift is downstream: the `import yaml` gate
 # prerequisite check (`_pyyaml_prerequisite_rc()`) fails loud, by name, the
-# instant a rebuilt image no longer has PyYAML importable -- it is what
+# instant a rebuilt image lacks an importable PyYAML -- it is what
 # actually protects the gates, not an assumption about this RUN line.
 RUN python3 -m ensurepip --upgrade \
     && python3 -m pip install --no-cache-dir 'PyYAML==6.*' safetensors

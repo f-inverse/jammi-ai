@@ -313,7 +313,7 @@ impl AnalyzerRule for TenantScopeAnalyzerRule {
 
 #[cfg(test)]
 mod tests {
-    //! SPEC-03 §12 #8 — `TenantScopeAnalyzerRule` predicate-injection invariants.
+    //! `TenantScopeAnalyzerRule` predicate-injection invariants.
     //!
     //! Each test builds a `LogicalPlan` via `LogicalPlanBuilder` against a
     //! `LogicalTableSource` carrying a `tenant_id` column, runs the rule's

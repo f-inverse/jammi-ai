@@ -18,7 +18,7 @@
 //! test observes the transition recovery performs, never just an end state a
 //! live-lease skip could leave vacuously.
 //!
-//! The lease-ownership half (esc-094, issue #479): a `building` row is owned by
+//! The lease-ownership half: a `building` row is owned by
 //! its writer under a heartbeated lease, recovery touches only rows whose lease
 //! is absent or expired, and every transition on a building row is a
 //! compare-and-set naming the owner. The two-writer oracles
@@ -42,8 +42,8 @@
 //!
 //! Every test is parameterised over [`BackendKind`] via `test_case`: the SQLite
 //! lane runs on the hermetic `cargo test` lane, the Postgres lane is generated
-//! under the `live-postgres-tests` feature and skips at runtime when
-//! `JAMMI_TEST_PG_URL` is unset (CI's "Test (Postgres)" job runs it). The
+//! under the `live-postgres-tests` feature (CI's "Test (Postgres)" job runs
+//! it). The
 //! Postgres lane shares one catalog DB across the run, so each test first clears
 //! `result_tables` (CI runs that lane `--test-threads=1`, so the
 //! reset-then-populate cannot race a sibling — important because `recover()` is
@@ -58,8 +58,6 @@ use arrow::array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use bytes::Bytes;
 use datafusion::prelude::SessionContext;
 use jammi_db::catalog::backend::{BackendImpl, BackendKind, SqlValue, TxOptions};
-use jammi_db::catalog::backend_postgres::PostgresBackend;
-use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::catalog::result_repo::{
     Owner, ResultTableCas, ResultTableKind, ResultTableRecord, TenantArm,
 };
@@ -80,7 +78,7 @@ use jammi_db::store::{BuildingTable, ResultStore};
 #[cfg(feature = "test-hooks")]
 use jammi_db::tenant_scope::TenantBinding;
 use jammi_db::TenantId;
-use jammi_test_utils::{abandon_building, pg_url_for_tests};
+use jammi_test_utils::{abandon_building, open_backend};
 use tempfile::tempdir;
 use test_case::test_case;
 
@@ -92,26 +90,6 @@ fn tenant_a() -> TenantId {
 
 fn tenant_b() -> TenantId {
     TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b").unwrap()
-}
-
-/// Build a catalog backend of `kind`, or `None` for the Postgres lane when
-/// `JAMMI_TEST_PG_URL` is unset (early-return rather than `#[ignore]`, which
-/// CLAUDE.md forbids). The SQLite catalog lives at `<dir>/catalog.db`; both
-/// backends keep result-table Parquet under `<dir>/jammi_db`.
-async fn open_backend(kind: BackendKind, dir: &Path) -> Option<BackendImpl> {
-    match kind {
-        BackendKind::Sqlite => {
-            let backend = SqliteBackend::open(&dir.join("catalog.db")).await.unwrap();
-            Some(BackendImpl::Sqlite(backend))
-        }
-        BackendKind::Postgres => {
-            let url = pg_url_for_tests()?;
-            let pg = PostgresBackend::open_with_options(&url, 8, None)
-                .await
-                .expect("open postgres backend");
-            Some(BackendImpl::Postgres(pg))
-        }
-    }
 }
 
 /// Clear `result_tables` so a cross-tenant `recover()` scan sees only the rows
@@ -401,10 +379,7 @@ fn walk_parquet(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 #[tokio::test]
 async fn building_with_missing_bytes_fails(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = result_store(dir.path(), Arc::clone(&catalog));
 
@@ -460,10 +435,7 @@ async fn building_with_missing_bytes_fails(kind: BackendKind) {
 #[tokio::test]
 async fn building_with_torn_parquet_fails_and_reaps(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = result_store(dir.path(), Arc::clone(&catalog));
 
@@ -516,10 +488,7 @@ async fn building_with_torn_parquet_fails_and_reaps(kind: BackendKind) {
 #[tokio::test]
 async fn building_with_valid_parquet_promotes_with_true_count(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = result_store(dir.path(), Arc::clone(&catalog));
 
@@ -609,10 +578,7 @@ async fn building_with_valid_parquet_promotes_with_true_count(kind: BackendKind)
 #[tokio::test]
 async fn partial_but_valid_parquet_promotes_with_footer_count(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = result_store(dir.path(), Arc::clone(&catalog));
 
@@ -643,10 +609,7 @@ async fn partial_but_valid_parquet_promotes_with_footer_count(kind: BackendKind)
 #[tokio::test]
 async fn ready_with_missing_bytes_not_loaded(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = result_store(dir.path(), Arc::clone(&catalog));
 
@@ -683,10 +646,7 @@ async fn ready_with_missing_bytes_not_loaded(kind: BackendKind) {
 #[tokio::test]
 async fn recover_is_idempotent(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = result_store(dir.path(), Arc::clone(&catalog));
 
@@ -723,10 +683,7 @@ async fn recover_is_idempotent(kind: BackendKind) {
 #[tokio::test]
 async fn recover_reconciles_every_tenant(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     // Unscoped (GLOBAL) catalog — the shape a startup recovery session has.
     let global = fresh_catalog(backend).await;
 
@@ -829,7 +786,7 @@ async fn recover_reconciles_every_tenant(kind: BackendKind) {
 }
 
 // =====================================================================
-//  esc-094 — lease ownership. A `building` row belongs to its writer under
+//  Lease ownership. A `building` row belongs to its writer under
 //  a heartbeated lease; recovery touches only rows whose lease is absent or
 //  expired; every building-row transition is a CAS naming the owner.
 // =====================================================================
@@ -846,10 +803,7 @@ async fn recover_reconciles_every_tenant(kind: BackendKind) {
 #[tokio::test]
 async fn expired_lease_building_row_is_reaped(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = result_store(dir.path(), Arc::clone(&catalog));
 
@@ -899,7 +853,7 @@ fn global_sibling(catalog: &Catalog) -> Arc<Catalog> {
     Arc::new(catalog.pinned_to_tenant(None))
 }
 
-/// W2 (esc-094): a live writer parked between its lease renew and the manifest
+/// The materialization window: a live writer parked between its lease renew and the manifest
 /// write — Parquet valid, no manifest, row `building` — survives a peer
 /// session's `recover()`: status, bytes, and segments untouched; released, it
 /// completes with the true row count. ONE arm is cross-tenant: the writer is
@@ -916,10 +870,7 @@ async fn live_writer_survives_peer_recover_w2(kind: BackendKind) {
     use jammi_db::store::mutable::test_hook::{arm, MaterializationPoint};
 
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let global = fresh_catalog(backend).await;
     let cat_a = Arc::new(global.pinned_to_tenant(Some(tenant_a())));
     let cat_b = Arc::new(global.pinned_to_tenant(Some(tenant_b())));
@@ -947,7 +898,7 @@ async fn live_writer_survives_peer_recover_w2(kind: BackendKind) {
         .await
         .expect("writer A must reach the materialization point");
 
-    // Positive preconditions: A is exactly in the W2 window.
+    // Positive preconditions: A is exactly in the materialization window.
     let building_rows =
         TenantBinding::admin_scope(cat_a.list_result_tables_by_status(ResultTableStatus::Building))
             .await
@@ -1030,7 +981,7 @@ async fn live_writer_survives_peer_recover_w2(kind: BackendKind) {
     assert_eq!(select_count(&ctx_a, &table_name).await, N);
 }
 
-/// U2 (esc-094 follow-up): the SAME two-writer shape as W2, but the peer
+/// The SAME two-writer shape as the materialization-window test, but the peer
 /// runs `reconcile(apply=true)` instead of the startup `recover()` sweep — a
 /// live-lease `building` row's bytes must survive a reconcile pass exactly as
 /// they survive recovery. `own_seg` scoping means the peer must reconcile
@@ -1049,10 +1000,7 @@ async fn live_writer_survives_peer_reconcile_apply_u2(kind: BackendKind) {
     use jammi_db::store::ReconcileOptions;
 
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let global = fresh_catalog(backend).await;
     let cat_a = Arc::new(global.pinned_to_tenant(Some(tenant_a())));
     let store_a = long_lease_store(dir.path(), Arc::clone(&cat_a));
@@ -1127,14 +1075,13 @@ async fn live_writer_survives_peer_reconcile_apply_u2(kind: BackendKind) {
     assert_eq!(rec.row_count, N);
 }
 
-/// U2b (esc-094 follow-up, RED first): an EXPIRED-lease `building` row is
-/// reconciled through the RECOVERY arm — claimed (its `writer_id` changes)
-/// BEFORE its bytes go — never through the orphan arm with no claim/CAS at
-/// all. Before this fix, `reconcile`'s orphan loop reaped such a row's
-/// Parquet/sidecar objects directly (no claim, no CAS), so a stalled original
-/// writer's later `renew`/`promote` would have raced a promote over deleted
-/// bytes; this pins that the row is claimed first (fencing the stale writer)
-/// and the stale writer's own subsequent CAS is refused.
+/// An EXPIRED-lease `building` row is reconciled through the RECOVERY arm —
+/// claimed (its `writer_id` changes) BEFORE its bytes go — never through the
+/// orphan arm with no claim/CAS at all. An orphan loop that reaped such a
+/// row's Parquet/sidecar objects directly (no claim, no CAS) would let a
+/// stalled original writer's later `renew`/`promote` race a promote over
+/// deleted bytes; this pins that the row is claimed first (fencing the stale
+/// writer) and the stale writer's own subsequent CAS is refused.
 #[cfg(feature = "test-hooks")]
 #[cfg_attr(test, test_case(BackendKind::Sqlite ; "sqlite"))]
 #[cfg_attr(
@@ -1146,10 +1093,7 @@ async fn expired_lease_building_row_is_claimed_before_reconcile_reaps_it_u2b(kin
     use jammi_db::store::ReconcileOptions;
 
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = long_lease_store(dir.path(), Arc::clone(&catalog));
 
@@ -1209,7 +1153,7 @@ async fn expired_lease_building_row_is_claimed_before_reconcile_reaps_it_u2b(kin
     );
 }
 
-/// RED first: `reconcile`'s claim of an expired-lease
+/// `reconcile`'s claim of an expired-lease
 /// row must NEVER re-stamp the SAME `writer_id` a lapsed writer in THIS
 /// SAME session still holds — that would leave the lapsed writer's own
 /// `Owner::Writer(self.writer_id)` CAS still matching post-claim (no fence
@@ -1229,10 +1173,7 @@ async fn reconcile_claim_never_reuses_this_sessions_own_writer_id(kind: BackendK
     use jammi_db::store::ReconcileOptions;
 
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     // ONE store: the writer that lapses AND the session that reconciles it
     // are the SAME `ResultStore`, so a fix that only fences a DIFFERENT
@@ -1294,7 +1235,7 @@ async fn reconcile_claim_never_reuses_this_sessions_own_writer_id(kind: BackendK
     );
 }
 
-/// W1 (esc-094): a live writer parked right after `create_table` — row
+/// The table-created window: a live writer parked right after `create_table` — row
 /// `building`, no bytes yet — survives a peer's `recover()` (which would
 /// otherwise take the missing-bytes arm and fail it); released, it completes.
 #[cfg(feature = "test-hooks")]
@@ -1308,10 +1249,7 @@ async fn live_writer_survives_peer_recover_w1(kind: BackendKind) {
     use jammi_db::store::mutable::test_hook::{arm, MaterializationPoint};
 
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store_a = result_store(dir.path(), Arc::clone(&catalog));
     let store_b = result_store(dir.path(), global_sibling(&catalog));
@@ -1376,10 +1314,7 @@ async fn live_writer_survives_peer_recover_w1(kind: BackendKind) {
 #[tokio::test]
 async fn zero_rows_row_gone_deletes_nothing(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = long_lease_store(dir.path(), Arc::clone(&catalog));
 
@@ -1409,10 +1344,7 @@ async fn zero_rows_row_gone_deletes_nothing(kind: BackendKind) {
 #[tokio::test]
 async fn strict_tenant_predicate_on_promote(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = long_lease_store(dir.path(), Arc::clone(&catalog));
 
@@ -1482,10 +1414,7 @@ async fn strict_tenant_predicate_on_promote(kind: BackendKind) {
 #[tokio::test]
 async fn zero_rows_reaped_row_is_cas_failed(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = result_store(dir.path(), Arc::clone(&catalog));
 
@@ -1528,10 +1457,7 @@ async fn zero_rows_reaped_row_is_cas_failed(kind: BackendKind) {
 #[tokio::test]
 async fn zero_rows_recovery_promoted_row_is_cas_failed_ready(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = result_store(dir.path(), Arc::clone(&catalog));
 
@@ -1580,10 +1506,7 @@ async fn zero_rows_recovery_promoted_row_is_cas_failed_ready(kind: BackendKind) 
 #[tokio::test]
 async fn zero_rows_claimed_row_is_lease_lost_and_deletes_nothing(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = long_lease_store(dir.path(), Arc::clone(&catalog));
     let recoverer = result_store(dir.path(), global_sibling(&catalog));
@@ -1654,10 +1577,7 @@ async fn zero_rows_claimed_row_is_lease_lost_and_deletes_nothing(kind: BackendKi
 #[tokio::test]
 async fn abort_deletes_only_after_its_own_cas(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = result_store(dir.path(), Arc::clone(&catalog));
 
@@ -1691,10 +1611,7 @@ async fn abort_deletes_only_after_its_own_cas(kind: BackendKind) {
 #[tokio::test]
 async fn drop_without_finish_marks_failed_or_expires(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = result_store(dir.path(), Arc::clone(&catalog));
 
@@ -1737,10 +1654,7 @@ async fn drop_without_finish_marks_failed_or_expires(kind: BackendKind) {
 #[tokio::test]
 async fn remove_source_refuses_live_building_row(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = result_store(dir.path(), Arc::clone(&catalog));
 
@@ -1790,10 +1704,7 @@ async fn remove_source_refuses_live_building_row(kind: BackendKind) {
 #[tokio::test]
 async fn source_busy_rolls_back_the_whole_delete_not_only_the_busy_row(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = result_store(dir.path(), Arc::clone(&catalog));
 
@@ -1859,10 +1770,7 @@ async fn source_busy_rolls_back_the_whole_delete_not_only_the_busy_row(kind: Bac
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_recoverers_race_on_one_expired_row(kind: BackendKind) {
     let dir = tempdir().unwrap();
-    let Some(backend) = open_backend(kind, dir.path()).await else {
-        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    let backend = open_backend(kind, dir.path()).await;
     let catalog = fresh_catalog(backend).await;
     let store = result_store(dir.path(), Arc::clone(&catalog));
 

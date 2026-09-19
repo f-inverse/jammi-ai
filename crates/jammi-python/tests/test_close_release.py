@@ -1,4 +1,4 @@
-"""`close(release=True)` is the embedded engine's RELEASE mode (#482).
+"""`close(release=True)` is the embedded engine's RELEASE mode.
 
 `close()` (the default, DRAIN) lets the in-flight training job finish before
 the catalog is released — `test_close_releases_catalog.py` and
@@ -37,11 +37,6 @@ _ROOT = Path(__file__).resolve().parents[3]
 _TINY_BERT = _ROOT / "cookbook" / "fixtures" / "tiny_bert"
 _TRAINING_PAIRS = _ROOT / "tests" / "fixtures" / "training_pairs.csv"
 
-pytestmark = pytest.mark.skipif(
-    not _TINY_BERT.is_dir() or not _TRAINING_PAIRS.is_file(),
-    reason="local tiny_bert / training_pairs fixtures not present",
-)
-
 # The successor: opens the released directory with the DEFAULT config (a
 # claiming worker, 1 s idle poll), waits for ITS OWN worker to actually claim
 # the released row, then RELEASES it again and exits. It reports nothing —
@@ -49,7 +44,7 @@ pytestmark = pytest.mark.skipif(
 #
 # `job.status()` cannot tell "claimed by the original instance" from "claimed
 # by this successor" -- a release never changes `status` away from
-# `"running"` (D9/D11: no status is invented for a release), and the row can
+# `"running"` (no status is invented for a release), and the row can
 # also reach `"completed"` on its own within a few seconds once tiny-bert's
 # early stopping converges the run, well inside any fixed sleep bound. The
 # reliable, mechanism-grounded signal is `acceleration_report`
@@ -57,7 +52,7 @@ pytestmark = pytest.mark.skipif(
 # released row is reclaimed by `reclaim_expired_jobs`' arm 1a, which resets
 # `acceleration_report` to the `"pending"` marker for the NEW attempt before
 # `claim_next` claims it (`crates/jammi-db/src/catalog/jobs_repo.rs`, the
-# comment beside `ACCELERATION_REPORT_PENDING` in arm 1a). R7: the reliable
+# comment beside `ACCELERATION_REPORT_PENDING` in arm 1a). The reliable
 # key is the successor's OWN attempt number, read absolutely rather than
 # differentially against a snapshot — `record_acceleration_report`'s guard
 # pins `attempts = $6` (`jobs_repo.rs`), so once THIS successor's reclaim
@@ -161,7 +156,7 @@ def test_close_release_true_leaves_the_job_claimable(
     db.close()
 
     # A successor process claims it within one idle poll and releases again;
-    # `attempts + 1` (R7) is the expected attempt number ITS OWN claim (and
+    # `attempts + 1` is the expected attempt number ITS OWN claim (and
     # the acceleration probe it runs under that claim) will carry.
     proc = subprocess.run(
         [

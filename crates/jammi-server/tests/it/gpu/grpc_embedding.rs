@@ -13,37 +13,22 @@
 //! matches the corpus the same model produced.
 //!
 //! This is the release gate for the CUDA server artifacts: a GPU build whose
-//! *served* topology is unproven on a GPU must not ship — the class of failure
-//! in issue #277 (a CUDA artifact that fails to load / serve on a device) is
-//! invisible until a user hits it.
+//! *served* topology is unproven on a GPU must not ship — a CUDA artifact that
+//! fails to load or serve on a device is otherwise invisible until a user hits
+//! it.
 //!
 //! ## Gating
 //!
 //! The module is compiled only under the `live-gpu-tests` cargo feature (its
-//! `mod` line in `main.rs` is `#[cfg(feature = "live-gpu-tests")]`), and a
-//! meaningful run also needs the `cuda` feature and a visible GPU. The GPU
-//! session pins `require_gpu = true`, so on a CUDA host a test that reached the
-//! wire calls *did* run on the GPU. Without a usable GPU the session fails to
-//! construct, so the test skips with a `tracing::warn` (never a failure) and the
-//! CPU / GPU-less lane runs it as a no-op — UNLESS `JAMMI_REQUIRE_CUDA` is set,
-//! in which case that same `InferenceSession::new` failure is a hard panic
-//! carrying the underlying error instead of a silent skip, per the repo-wide
-//! `JAMMI_REQUIRE_CUDA` opt-in-panic idiom (`jammi-kernels/tests/cuda_parity.rs`,
-//! `grpc_remote_session_gpu.rs`'s `start_gpu_engine_server`, ...). This is the
-//! prove lane's own suite (`runpod_gpu_prove.sh`); a pod run that meant to prove
-//! this leg can opt in to a hard RED rather than a silently green no-op. Live
-//! run:
+//! `mod` line in `main.rs` is `#[cfg(feature = "live-gpu-tests")]`) and needs
+//! the `cuda` feature and CUDA device 0. The session pins `require_gpu = true`,
+//! so every wire call runs on the GPU; on a host without that device,
+//! `InferenceSession::new` fails and the test panics naming CUDA device 0 and
+//! the underlying error.
 //!
 //! ```text
 //! cargo test -p jammi-server --features cuda,live-gpu-tests --test it \
 //!   grpc_embedding_gpu -- --nocapture --test-threads=1
-//! ```
-//!
-//! Hard-fail (rather than silently skip) off a GPU host:
-//!
-//! ```text
-//! JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-server --features cuda,live-gpu-tests \
-//!   --test it grpc_embedding_gpu -- --nocapture --test-threads=1
 //! ```
 
 use std::net::SocketAddr;
@@ -64,7 +49,7 @@ use jammi_test_utils::{cookbook_fixture, fixture, test_config};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
-use super::common::grpc::{catalog_client, channel};
+use crate::common::grpc::{catalog_client, channel};
 
 fn tiny_bert_model_id() -> String {
     format!("local:{}", cookbook_fixture("tiny_bert").display())
@@ -75,43 +60,29 @@ fn patents_url() -> String {
 }
 
 /// Spin up an in-process gRPC server whose `InferenceSession` is pinned to the
-/// first CUDA device (`gpu.device = 0`, `require_gpu = true`). Returns `None`
-/// — a clean skip — when no usable GPU opens (a CPU build, or a GPU-less host),
-/// so the suite is a no-op off a CUDA host rather than a failure. A returned
-/// `Some` guarantees the session was constructed on the GPU, so every wire call
-/// against it runs the real CUDA served path.
-async fn start_gpu_embedding_server() -> Option<(
+/// first CUDA device (`gpu.device = 0`, `require_gpu = true`), so every wire
+/// call against it runs the real CUDA served path.
+async fn start_gpu_embedding_server() -> (
     SocketAddr,
     oneshot::Sender<()>,
     TempDir,
     tokio::task::JoinHandle<()>,
-)> {
+) {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut cfg = test_config(dir.path());
     cfg.gpu.device = 0;
     cfg.gpu.require_gpu = true;
 
-    let session = match InferenceSession::new(cfg).await {
-        Ok(session) => Arc::new(session),
-        Err(err) => {
-            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
-                panic!(
-                    "grpc_embedding_gpu: JAMMI_REQUIRE_CUDA is set but \
-                     InferenceSession::new failed — refusing to silently skip: {err}"
-                );
-            }
-            tracing::warn!(
-                "SKIP grpc_embedding_gpu: no usable CUDA device — build with \
-                 `--features cuda,live-gpu-tests` on a GPU host to run it ({err})"
-            );
-            return None;
-        }
-    };
+    let session = Arc::new(
+        InferenceSession::new(cfg)
+            .await
+            .expect("a session pinned to CUDA device 0 (require_gpu = true)"),
+    );
 
     let store = SessionStore::new();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let chain = jammi_server::runtime::GrpcChain {
-        addr: super::common::grpc::ephemeral_addr(),
+        addr: crate::common::grpc::ephemeral_addr(),
         flight_ctx: session.context().clone(),
         flight_binding: session.tenant_binding_arc(),
         store: store.clone(),
@@ -123,9 +94,9 @@ async fn start_gpu_embedding_server() -> Option<(
         admin_authorizer: None,
         limits: jammi_db::config::LimitsConfig::default(),
     };
-    let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
+    let (addr, handle) = crate::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
 
-    Some((addr, shutdown_tx, dir, handle))
+    (addr, shutdown_tx, dir, handle)
 }
 
 /// The served GPU path end-to-end: register a corpus, embed it (TEXT tower on
@@ -135,9 +106,7 @@ async fn start_gpu_embedding_server() -> Option<(
 /// the same wire verbs a `grpc://` client calls, running on real silicon.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn text_embeddings_served_over_the_wire_on_gpu() {
-    let Some((addr, shutdown, _dir, handle)) = start_gpu_embedding_server().await else {
-        return;
-    };
+    let (addr, shutdown, _dir, handle) = start_gpu_embedding_server().await;
     let model_id = tiny_bert_model_id();
     let mut client = EmbeddingServiceClient::new(channel(addr).await);
 

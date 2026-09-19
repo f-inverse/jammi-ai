@@ -1,4 +1,4 @@
-//! RED, end-to-end proof of #486's OTLP mechanism: a real (in-process,
+//! End-to-end proof of the OTLP mechanism: a real (in-process,
 //! loopback) tonic stub implementing
 //! `opentelemetry.proto.collector.trace.v1.TraceService` receives exactly
 //! one exported span per opened `tracing::Span`, carrying the configured

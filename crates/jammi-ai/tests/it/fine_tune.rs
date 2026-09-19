@@ -218,7 +218,7 @@ fn contract_lr_schedule_is_monotonic_after_warmup() {
 
 // ─── Fine-tune end-to-end with tiny_bert: real training + inference ──────────
 //
-// Covers UAT 1-4, 17. Runs the full pipeline: fine_tune with real model
+// Runs the full pipeline: fine_tune with real model
 // encoding → adapter saved → fine-tuned model loaded → produces embeddings.
 // Uses local tiny_bert fixture — no network access needed.
 
@@ -276,10 +276,10 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
         .await
         .unwrap();
 
-    // UAT 1: job_id is set
+    // job_id is set
     assert!(!job.job_id.is_empty());
 
-    // UAT 3: model_id follows jammi:fine-tuned:{id} pattern (invariant 2)
+    // model_id follows the jammi:fine-tuned:{id} pattern
     assert!(
         job.model_id().starts_with("jammi:fine-tuned:"),
         "model_id should have jammi:fine-tuned: prefix, got '{}'",
@@ -289,7 +289,7 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
     // Wait for completion
     job.wait().await.unwrap();
 
-    // UAT 4: job status transitions queued → running → completed
+    // Job status transitions queued → running → completed
     let record = session.catalog().get_job(&job.job_id).await.unwrap();
     assert_eq!(record.status, "completed");
     assert!(!record.created_at.is_empty(), "created_at should be set");
@@ -298,7 +298,7 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
         "a completed job records its result"
     );
 
-    // UAT 3: fine-tuned model registered in catalog with artifact_path
+    // Fine-tuned model registered in catalog with artifact_path
     let models = session.catalog().list_models().await.unwrap();
     let ft_models: Vec<_> = models
         .iter()
@@ -314,7 +314,7 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
         .as_deref()
         .expect("Fine-tuned model should have artifact_path set");
 
-    // UAT 2: adapter weights published to the artifact store under the recorded
+    // Adapter weights published to the artifact store under the recorded
     // per-attempt prefix. Fetch the bundle (an in-place read for the default
     // `file://` root) and assert the adapter file is present and non-empty.
     let prefix_url = jammi_db::storage::StorageUrl::parse(artifact_prefix).unwrap();
@@ -330,7 +330,7 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
         "Adapter file should not be empty"
     );
 
-    // UAT 3 continued: fine-tuned model produces embeddings (real inference)
+    // The fine-tuned model produces embeddings (real inference)
     let ft_model_id = &ft_models[0].model_id;
     // The model_id in catalog is "jammi:fine-tuned:{uuid}::1", but encode_query
     // needs the name part. Extract the name (everything before ::).
@@ -363,10 +363,10 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
     );
 }
 
-/// esc-089: a fine-tuned BERT-family model must serve the SAME adapted model
+/// A fine-tuned BERT-family model must serve the SAME adapted model
 /// across a cold restart — a SECOND `InferenceSession` opened over the SAME
-/// on-disk catalog + artifact store, exactly as `tower_adapters.rs`'s own
-/// esc-089 tests do for the three cross-modal towers (see that file's doc for
+/// on-disk catalog + artifact store, exactly as `tower_adapters.rs`'s
+/// cold-restart tests do for the three cross-modal towers (see that file's doc for
 /// what "cold restart" simulates and what the assertions catch: a silent
 /// fall-back to the unadapted base would make the cold embedding equal the
 /// base model's, not the warm fine-tuned one).
@@ -470,7 +470,7 @@ async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
     }
 
     const PROBE: &str = "quantum computing";
-    common::assert_esc089_cold_restart_controls(common::Esc089ColdRestartControls {
+    common::assert_cold_restart_controls(common::ColdRestartControls {
         session_root: dir.path(),
         warm_session: &session,
         cold_session: &cold_session,
@@ -485,22 +485,22 @@ async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
     .await;
 }
 
-// ─── Per-epoch adapter checkpoints (unit 348) ──────────────────────────────
+// ─── Per-epoch adapter checkpoints ─────────────────────────────────────────
 //
-// Round-2 reshape (F3): `keep_last_n_checkpoints` is DISABLED BY DEFAULT.
+// `keep_last_n_checkpoints` is DISABLED BY DEFAULT.
 // `epoch_checkpoints_default_off_writes_nothing` below is the load-bearing
 // no-regression oracle every OTHER test in this file (and every caller that
-// predates this feature) implicitly relies on: a run that never sets the
+// never opts in) implicitly relies on: a run that never sets the
 // field must write exactly zero epoch-checkpoint bytes and register exactly
 // zero epoch rows. `epoch_checkpoints_registered_and_loadable_when_enabled`
 // then drives the OPT-IN path with `Some(n)` where `n >= epochs`, pinning the
 // documented "no separate keep-all sentinel — ask for a cap at least as
 // large as the epoch count" equivalence.
 
-/// THE no-regression oracle (unit 348 F3): a DEFAULT run — `keep_last_n_
+/// THE no-regression oracle: a DEFAULT run — `keep_last_n_
 /// checkpoints` never set — writes ZERO epoch-checkpoint bytes and registers
-/// ZERO epoch-checkpoint catalog rows. Every caller that predates this
-/// feature, and every caller that never opts in, gets exactly this behavior.
+/// ZERO epoch-checkpoint catalog rows. Every caller that never opts in gets
+/// exactly this behavior.
 #[tokio::test(flavor = "multi_thread")]
 async fn epoch_checkpoints_default_off_writes_nothing() {
     let (session, dir) = session_with_training_data().await;
@@ -1193,8 +1193,8 @@ async fn audio_projection_head_fine_tune_changes_embeddings() {
     );
 }
 
-// UAT 6 (QLoRA): Invalid methods are now unrepresentable at the type level
-// via `FineTuneMethod` enum. No runtime test needed.
+// Invalid fine-tune methods (QLoRA included) are unrepresentable at the type
+// level via the `FineTuneMethod` enum, so no runtime test covers them.
 
 // ─── Fine-tune catalog CRUD ─────────────────────────────────────────────────
 
@@ -1352,21 +1352,19 @@ fn lora_backward_step_changes_weights() {
 
 // ─── Divergence detection: NaN loss triggers job failure ────────────────────
 //
-// UAT 5. The training loop should fail with "diverged" after 3 consecutive
+// The training loop should fail with "diverged" after 3 consecutive
 // batches with NaN or >100 loss. Tests with precomputed NaN-embedding
 // batches.
 //
-// esc-040 de-pin: the real CoSENT objective (pairwise ordering — see
+// The CoSENT objective (pairwise ordering — see
 // `cosent_loss` in `trainer.rs`) is NaN-in-*scores*-safe by construction: a
 // score only ever participates in a `<` comparison building the valid-pair
 // mask, and any comparison touching NaN is IEEE-754 `false`, so a NaN score
 // is masked out (never a valid pair) rather than propagating — for *any*
-// batch size, not just this test's single-row batch. The previous fixture
-// put NaN in `scores` and relied on the OLD (buggy, plain-MSE) `cosent_loss`
-// computing `(cos - NaN)²` directly on every row with no pairwise masking;
-// that premise no longer holds. NaN in the *embeddings* still propagates
-// (it corrupts the cosine similarity itself, upstream of the pairwise mask),
-// so that is what now exercises the divergence path.
+// batch size. A NaN in `scores` therefore cannot drive divergence; NaN in the
+// *embeddings* does propagate (it corrupts the cosine similarity itself,
+// upstream of the pairwise mask), so that is what exercises the divergence
+// path.
 #[tokio::test(flavor = "multi_thread")]
 async fn training_divergence_detection() {
     use candle_nn::VarMap;
@@ -1478,7 +1476,7 @@ async fn training_divergence_detection() {
 
 // ─── Early stopping: patience exhaustion stops training ─────────────────────
 //
-// UAT 7. With patience=1, training should stop well before max epochs because
+// With patience=1, training should stop well before max epochs because
 // validation loss never improves. Uses precomputed batches:
 // - Training batches: score=1.0 with identical embeddings → low loss
 // - Validation batches: score=0.0 with identical embeddings → high loss
@@ -1940,10 +1938,10 @@ async fn durable_job_runs_on_separately_started_worker() {
 // worker-b (a reclaim + re-claim) before worker-a runs. worker-a then runs its
 // (now stale) claim to completion — a 1-epoch tiny_bert run finishes well inside
 // the 10s heartbeat interval, so the cancel flag never fires and worker-a
-// reaches finalize believing it succeeded. Post-fix its finalize CAS fails and
-// the job stays `running` (owned by worker-b). Pre-fix worker-a finalized
-// unconditionally, so the job would (wrongly) be `completed` by the worker that
-// lost the lease — this test fails against that code and passes against the CAS.
+// reaches finalize believing it succeeded. Its finalize CAS fails and the job
+// stays `running` (owned by worker-b). A worker-a that finalized
+// unconditionally would leave the job (wrongly) `completed` by the worker that
+// lost the lease — this test fails against that shape and passes against the CAS.
 
 #[tokio::test(flavor = "multi_thread")]
 async fn worker_that_lost_lease_does_not_finalize() {
@@ -2441,7 +2439,7 @@ async fn loser_prefix_is_never_the_committed_artifact() {
 }
 
 // ─── A cancelled-mid-run attempt's already-written epoch checkpoints are
-//     reclaimed — existence proven BEFORE reclaim (unit 348, F1/F2) ─────────
+//     reclaimed — existence proven BEFORE reclaim ─────────────────────────
 //
 // The top-level artifact prefix's `delete_artifact_prefix` reads and deletes
 // only ITS OWN `manifest.json`'s files — it never reaches into the nested
@@ -2519,7 +2517,7 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
                 batch_size: 8,
                 lora_rank: 4,
                 warmup_steps: 0,
-                // Opt in (round-2 F3: disabled by default) — without this,
+                // Opt in (disabled by default) — without this,
                 // no epoch checkpoint is ever written and the whole test is
                 // vacuous by construction. `n >= epochs` retains everything
                 // this run reaches before it is cancelled.
@@ -2585,7 +2583,7 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
     assert!(
         epoch0_manifest.exists(),
         "epoch_0's checkpoint bytes must exist BEFORE the reclaim — the load-bearing existence \
-         proof a vacuous version of this test skipped"
+         proof; without it the reclaim assertions below are vacuous"
     );
 
     // Sanity gate: the spawned `run_claimed_job` task must NOT have returned
@@ -2682,7 +2680,7 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
 }
 
 // ─── Winner-path prune leak: a persistently-failed mid-run prune is reclaimed
-//     at finalize, and the failure is never silent (unit 348 F2) ──────────────
+//     at finalize, and the failure is never silent ───────────────────────────
 //
 // A REAL, non-cancelled winning run with `keep_last_n_checkpoints = Some(1)`
 // over 3 epochs: epoch_0's on-disk directory is made undeletable (real
@@ -2713,43 +2711,7 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
 // tokio's separate blocking pool, but the warn under test fires from
 // `publish_and_finalize`, back on the single async thread, not from inside
 // that closure).
-/// The require-gate polarity every `chmod` permission-fault probe in this
-/// suite shares (esc-089 F1): `probe` performs the fault-injection premise
-/// check itself — "can this process still read/write through a chmod'd
-/// path?" — and returns `true` if the fault was BYPASSED (root, or a
-/// mode-ignoring filesystem). A bypass is normally a loud, `eprintln`'d skip:
-/// the fault-injection premise the caller needs simply does not hold on this
-/// host. But under `JAMMI_REQUIRE_POSIX_PERMS=1` (the CI lane that is
-/// SUPPOSED to run unprivileged with real POSIX permission enforcement) a
-/// bypass is instead a hard `panic!` — silently returning `true` in that lane
-/// would let a permission-fault regression go completely uncaught.
-///
-/// This is a thin local wrapper of the same canonical shape carried by every
-/// other `chmod`/permission-fault probe in this crate (`ci/kernel-oracle-
-/// helpers.txt`'s KO-7 registry is `(file, fn)`-scoped: a shared helper
-/// defined in `common/mod.rs` cannot be registered for a call site in a
-/// DIFFERENT file, so each file that needs this polarity carries its own
-/// copy rather than delegating).
-///
-/// Returns `true` if the caller must restore permissions and skip; `false` if
-/// the fault was genuinely injected and the test should proceed.
-#[cfg(unix)]
-fn chmod_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
-    let bypassed = probe();
-    if bypassed {
-        if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
-            panic!(
-                "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
-                 permission fault (root, or a mode-ignoring filesystem) — the fault-injection \
-                 premise this test needs does not hold; a silent skip is not acceptable here"
-            );
-        }
-        eprintln!("{test_name}: chmod bypassed (root?) — skipping");
-    }
-    bypassed
-}
-
-#[cfg(unix)]
+#[cfg(all(unix, feature = "unprivileged-tests"))]
 #[tokio::test]
 async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
     use std::io;
@@ -2760,6 +2722,7 @@ async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
     use jammi_ai::fine_tune::worker::JobWorker;
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::fmt::MakeWriter;
+    jammi_test_resources::assert_permissions_enforced();
 
     #[derive(Clone)]
     struct BufferWriter(Arc<Mutex<Vec<u8>>>);
@@ -2873,29 +2836,6 @@ async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-    // PROBE the injection before relying on it: root (and mode-ignoring
-    // filesystems) can delete through a 0o555 directory, so the failed-prune
-    // premise never exists there — skip loudly (the environment-conditional
-    // convention this batch applies in candle.rs's device_tests too). The
-    // run is aborted rather than awaited: nothing below is meaningful
-    // without the injected fault.
-    let probe = epoch0_dir.join(".root_probe");
-    let bypassed = chmod_bypassed(
-        "finalize_reclaims_a_persistently_failed_prune_and_warns",
-        || {
-            let ok = std::fs::write(&probe, b"x").is_ok();
-            if ok {
-                let _ = std::fs::remove_file(&probe);
-            }
-            ok
-        },
-    );
-    if bypassed {
-        let _ = std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o755));
-        handle.abort();
-        return;
-    }
-
     // Let the run finish naturally (no cancellation this time — this is the
     // WINNER path). Bounded wait.
     tokio::time::timeout(Duration::from_secs(60), handle)
@@ -2978,19 +2918,19 @@ async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
 
 // ─── Reclaim: a zombie loser running AFTER the winner cannot corrupt the commit ─
 //
-// The audit's exact ordering, and the one `loser_prefix_is_never_the_committed_
+// The ordering `loser_prefix_is_never_the_committed_
 // artifact` does NOT exercise: the WINNER runs and completes FIRST, THEN the
 // stale (zombie) loser runs to completion. The loser still holds an old claim
 // (its lease expired and was reclaimed), so when it finishes it registers its
 // own model row and runs its finalize. With the served path committed by an
-// unguarded last-writer-wins `register_model` (the pre-fix shape) the zombie's
+// unguarded last-writer-wins `register_model` the zombie's
 // late register would overwrite the committed `artifact_path` with its own
 // prefix, and its CAS-loss branch would then delete that prefix's bytes —
 // leaving the completed model pointing at deleted bytes (a `manifest.json
 // NotFound` on reload) and, separately, regressing the job's status back to
 // `running` via the unguarded run-start status write.
 //
-// Post-fix: the served path is committed solely by the winner's lease-guarded
+// The served path is committed solely by the winner's lease-guarded
 // finalize CAS, never by `register_model`; the zombie's finalize matches zero
 // rows and commits nothing, so it only GC's its OWN (never-committed) prefix;
 // and every job-row write the zombie makes is lease-guarded, so the terminal

@@ -1,4 +1,4 @@
-//! Issue #421 A3/A4: LoRA adapters trained INSIDE the three cross-modal
+//! LoRA adapters trained INSIDE the three cross-modal
 //! towers — the OpenCLIP text tower, the OpenCLIP vision tower and the
 //! HTSAT-Swin CLAP audio tower — round-trip through the real worker and are
 //! actually applied when the fine-tuned model is served.
@@ -7,7 +7,7 @@
 //!
 //! A "the fine-tune ran" assertion is vacuous on its own: a run that trained
 //! the WRONG tower, or whose adapter serving silently discarded, still
-//! completes and still writes an `adapter_config.json`. Each A3 test therefore
+//! completes and still writes an `adapter_config.json`. Each positive test therefore
 //! pins three independent facts:
 //!
 //! 1. **Identity** — the saved adapter is
@@ -34,14 +34,14 @@
 //! No test-only production hook is needed for any of this: every input the
 //! serving path builds is reproducible from public API.
 //!
-//! # A4 — the refusals
+//! # The refusals
 //!
-//! The negative tests pin the K2 boundary this unit installs: an unsupported
-//! `model_type` (RED at base — the worker's `_ => BERT` arm coerced it and
-//! trained), an unsupported `(family, task)` pair, a cross-family adapter at
-//! load time, the two task/column-shape mismatches, and — the freeze fix
-//! round's addition — a `target_modules` list that selects NO site on the
-//! tower the dispatch picked, on two towers with disjoint site vocabularies.
+//! The negative tests pin the typed-refusal boundary: (a) an unsupported
+//! `model_type` (never coerced to BERT and trained), (b) an unsupported
+//! `(family, task)` pair, (c) a cross-family adapter at load time, (d) the two
+//! task/column-shape mismatches, and (e) a `target_modules` list that selects
+//! NO site on the tower the dispatch picked, on two towers with disjoint site
+//! vocabularies.
 //! Beside them sits the audio front end's mel-bin guard, which pins the
 //! trainer to the SAME refusal the serving audio path already made.
 //!
@@ -261,7 +261,7 @@ fn assert_differs(base: &[f32], tuned: &[f32], label: &str) {
 }
 
 // =============================================================================
-// A3 (text): the OpenCLIP TEXT tower
+// The OpenCLIP TEXT tower
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread")]
@@ -366,7 +366,7 @@ async fn open_clip_text_tower_adapter_trains_and_serves() {
 }
 
 // =============================================================================
-// esc-089: a fine-tuned model must serve the SAME adapted tower across a cold
+// A fine-tuned model must serve the SAME adapted tower across a cold
 // restart. A "cold restart" here is a SECOND `InferenceSession` opened over
 // the SAME on-disk catalog + artifact store (`storage_precision.rs`'s own
 // precedent for simulating a restart without actually re-execing the process:
@@ -459,7 +459,7 @@ async fn open_clip_text_tower_adapter_serves_cold_after_restart() {
         "open_clip text (cold vs warm)",
     );
 
-    common::assert_esc089_cold_restart_controls(common::Esc089ColdRestartControls {
+    common::assert_cold_restart_controls(common::ColdRestartControls {
         session_root: dir.path(),
         warm_session: &session,
         cold_session: &cold_session,
@@ -475,13 +475,13 @@ async fn open_clip_text_tower_adapter_serves_cold_after_restart() {
 }
 
 // =============================================================================
-// A3 (image): the OpenCLIP VISION tower
+// The OpenCLIP VISION tower
 // =============================================================================
 
 /// Every image in the corpus, grouped by shape family (the `img_{family}_{n}`
 /// naming), so a triplet's positive is a same-family sibling and its negative
 /// belongs to another family. Deterministic (`BTreeMap`, sorted read) —
-/// family J: no unseeded RNG anywhere in the fixture construction.
+/// no unseeded RNG anywhere in the fixture construction.
 fn image_corpus_by_family() -> std::collections::BTreeMap<String, Vec<Vec<u8>>> {
     let dir = common::cookbook_fixture("tiny_image_corpus");
     let mut names: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -606,15 +606,13 @@ fn write_image_triplets_with_one_corrupt_cell(dir: &Path) -> PathBuf {
 /// [`jammi_ai::inference::adapter::BackendOutput::all_rows_or_err`] in
 /// production. A corrupt item in a projection-head training group must fail
 /// the job, never silently train the head on the all-zero placeholder
-/// `forward_image_embedding` substitutes for that row's decode failure —
-/// verified by temporarily reverting `all_rows_or_err`'s body to the blind
-/// `&self.float_outputs[0]` read: `job.wait()` still returns an `Err` (the
+/// `forward_image_embedding` substitutes for that row's decode failure. The
+/// message assertion is what makes this non-vacuous: with a blind
+/// `&self.float_outputs[0]` read, `job.wait()` still returns an `Err` (the
 /// all-zero placeholder trains the head into a NaN loss within a few steps,
-/// tripping the trainer's own "Training diverged" divergence guard), but its
-/// message is the divergence guard's ("Training diverged: loss was NaN or
-/// >100 for 3 consecutive batches"), not the corrupt row's own decode
-/// failure — so this test's message assertion below goes RED, even though
-/// `expect_err` alone would still pass.
+/// tripping the trainer's own divergence guard), but its message is the
+/// divergence guard's ("Training diverged: loss was NaN or >100 for 3
+/// consecutive batches"), not the corrupt row's own decode failure.
 #[tokio::test(flavor = "multi_thread")]
 async fn project_frozen_embedding_refuses_a_corrupt_group_item_instead_of_training_it() {
     let dir = TempDir::new().unwrap();
@@ -758,7 +756,7 @@ async fn open_clip_vision_tower_adapter_trains_and_serves() {
     assert_bit_equal(&tuned_embedding, &reference, "open_clip vision");
 }
 
-/// esc-089, the vision-tower peer of
+/// The vision-tower peer of
 /// `open_clip_text_tower_adapter_serves_cold_after_restart`: see that test's
 /// doc for what "cold restart" means here and what the assertions catch.
 #[tokio::test(flavor = "multi_thread")]
@@ -841,7 +839,7 @@ async fn open_clip_vision_tower_adapter_serves_cold_after_restart() {
     );
 
     let probe_bytes = Arc::new(probe_bytes);
-    common::assert_esc089_cold_restart_controls(common::Esc089ColdRestartControls {
+    common::assert_cold_restart_controls(common::ColdRestartControls {
         session_root: dir.path(),
         warm_session: &session,
         cold_session: &cold_session,
@@ -857,7 +855,7 @@ async fn open_clip_vision_tower_adapter_serves_cold_after_restart() {
 }
 
 // =============================================================================
-// A3 (audio): the HTSAT-Swin CLAP audio tower
+// The HTSAT-Swin CLAP audio tower
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread")]
@@ -954,7 +952,7 @@ async fn clap_audio_tower_adapter_trains_and_serves() {
     assert_bit_equal(&tuned_embedding, &reference, "clap audio");
 }
 
-/// esc-089, the audio-tower peer of
+/// The audio-tower peer of
 /// `open_clip_text_tower_adapter_serves_cold_after_restart`: see that test's
 /// doc for what "cold restart" means here and what the assertions catch.
 #[tokio::test(flavor = "multi_thread")]
@@ -1037,7 +1035,7 @@ async fn clap_audio_tower_adapter_serves_cold_after_restart() {
     );
 
     let probe_bytes = Arc::new(probe_bytes);
-    common::assert_esc089_cold_restart_controls(common::Esc089ColdRestartControls {
+    common::assert_cold_restart_controls(common::ColdRestartControls {
         session_root: dir.path(),
         warm_session: &session,
         cold_session: &cold_session,
@@ -1053,15 +1051,14 @@ async fn clap_audio_tower_adapter_serves_cold_after_restart() {
 }
 
 // =============================================================================
-// A4 — the refusals
+// The refusals
 // =============================================================================
 
-/// A4(a). RED at base: the worker's `_ => BERT` arm coerced any config that
-/// deserialized as a `BertConfig` — a `tiny_bert` directory whose `model_type`
-/// says `gpt2` does — and trained a BERT tower over it, publishing an adapter
-/// that claimed the architecture `gpt2`. There is no GPT-2 loader in this
-/// crate; the only honest answer is a typed refusal naming the model_type and
-/// the supported set.
+/// (a). Any config that deserializes as a `BertConfig` — a `tiny_bert`
+/// directory whose `model_type` says `gpt2` does — must not be coerced to a
+/// BERT tower and trained, publishing an adapter that claims the architecture
+/// `gpt2`. There is no GPT-2 loader in this crate; the only honest answer is
+/// a typed refusal naming the model_type and the supported set.
 #[tokio::test(flavor = "multi_thread")]
 async fn unsupported_model_type_refuses_instead_of_coercing_to_bert() {
     let dir = TempDir::new().unwrap();
@@ -1086,8 +1083,8 @@ async fn unsupported_model_type_refuses_instead_of_coercing_to_bert() {
         .unwrap();
 
     // A byte-for-byte `tiny_bert` copy with ONE field changed. Everything else
-    // still parses as a `BertConfig`, which is precisely why the old default
-    // arm trained happily.
+    // still parses as a `BertConfig`, which is precisely why a catch-all
+    // default arm would train happily.
     let model_dir = dir.path().join("gpt2_flavoured_bert");
     std::fs::create_dir_all(&model_dir).unwrap();
     let fixture = common::cookbook_fixture("tiny_bert");
@@ -1130,21 +1127,20 @@ async fn unsupported_model_type_refuses_instead_of_coercing_to_bert() {
     );
 }
 
-/// A4(a'). The COMPLEMENT of the refusal above, and the divergence W2c closed:
-/// a `tiny_bert` copy whose `config.json` OMITS `model_type` entirely (the
-/// older sentence-transformers / hand-written bare-export shape) must be ONE
-/// architecture to BOTH readers.
+/// (a'). The COMPLEMENT of the refusal above: a `tiny_bert` copy whose `config.json` OMITS
+/// `model_type` entirely (the older sentence-transformers / hand-written bare-export shape) must be
+/// ONE architecture to BOTH readers.
 ///
-/// RED at W2b: `EncoderFamily::from_config` answered `None` for an absent key,
-/// so the fine-tune worker refused this directory outright while the serving
-/// loader's own `unwrap_or("bert")` was simultaneously loading the identical
-/// bytes as BERT — training and serving disagreeing on one file, which is the
-/// single thing `model::arch` exists to prevent.
+/// If `EncoderFamily::from_config` answered `None` for an absent key, the
+/// fine-tune worker would refuse this directory outright while the serving
+/// loader's own `unwrap_or("bert")` loads the identical bytes as BERT —
+/// training and serving disagreeing on one file, which is the single thing
+/// `model::arch` exists to prevent.
 ///
 /// One deterministic assertion per side of that seam:
 ///
 /// * SERVING — the embedding is bit-identical to the unmodified fixture's for
-///   the same probe (K4: deleting a key the loader only reads to pick an arm
+///   the same probe (deleting a key the loader only reads to pick an arm
 ///   changes no loaded byte; an equality that would also hold if BOTH sides
 ///   silently failed is ruled out by the two `expect`s, either of which fires
 ///   first on a refusal).
@@ -1254,7 +1250,7 @@ async fn an_absent_model_type_trains_and_serves_as_bert() {
     }
 }
 
-/// A4(b). The OpenCLIP checkpoint has no audio tower; an `audio_embedding`
+/// (b). The OpenCLIP checkpoint has no audio tower; an `audio_embedding`
 /// encoder-adapters job over it is a `(family, task)` refusal, not a silently
 /// mis-routed text or vision build.
 #[tokio::test(flavor = "multi_thread")]
@@ -1303,7 +1299,7 @@ async fn open_clip_base_with_audio_task_refuses() {
     );
 }
 
-/// A4(c). A hand-written adapter claiming `clap_audio_model` installed on a
+/// (c). A hand-written adapter claiming `clap_audio_model` installed on a
 /// BERT base: the load seam must refuse on the FAMILY mismatch rather than
 /// resolve the adapter and silently serve the unadapted base.
 ///
@@ -1388,7 +1384,7 @@ async fn cross_family_adapter_refuses_at_load() {
     );
 }
 
-/// A4(d), arm 1: an image task over TEXT triplet columns. The columns are
+/// (d), arm 1: an image task over TEXT triplet columns. The columns are
 /// strings, so there is nothing to decode; the refusal must name the task.
 #[tokio::test(flavor = "multi_thread")]
 async fn image_task_on_text_triplets_refuses_naming_the_task() {
@@ -1435,7 +1431,7 @@ async fn image_task_on_text_triplets_refuses_naming_the_task() {
     );
 }
 
-/// A4(d), arm 2: a TEXT task over BINARY triplet columns. The mirror image —
+/// (d), arm 2: a TEXT task over BINARY triplet columns. The mirror image —
 /// and the message must point the caller at the media tasks by name rather
 /// than dying on an opaque UTF-8 cast failure.
 #[tokio::test(flavor = "multi_thread")]
@@ -1485,7 +1481,7 @@ async fn text_task_on_binary_triplets_refuses_naming_the_media_tasks() {
     );
 }
 
-/// A4(e), arm 1: a `target_modules` list that selects NOTHING on the tower the
+/// (e), arm 1: a `target_modules` list that selects NOTHING on the tower the
 /// job's `(family, task)` picked must FAIL the job.
 ///
 /// `q_proj` is a real selector on plenty of decoder checkpoints and on nothing
@@ -1493,17 +1489,14 @@ async fn text_task_on_binary_triplets_refuses_naming_the_media_tasks() {
 /// `c_proj` — exactly the plausible-but-wrong string an operator carries over
 /// from another architecture's recipe.
 ///
-/// RED at 5bf8abdb, and not by a missing symbol: `build_encoder_adapters` never
-/// consulted `trainable_params()` there, `optimizer::clip_and_step` treats an
-/// EMPTY trainable set as the one unambiguously benign reading and does not
-/// even warn, so the job ran its epoch over an empty `GradStore`, published an
-/// `adapter.safetensors` with no A/B tensors and reported SUCCESS — `job.wait()`
-/// returned `Ok`, so this test's `expect_err` panics there. Traced to the
-/// mechanism rather than asserted: with the new `trainable_params().is_empty()`
-/// refusal removed at this tip, both arms fail exactly that way
-/// (`expect_err(..): ()`), which is the base behaviour restored.
+/// `optimizer::clip_and_step` treats an EMPTY trainable set as the one
+/// unambiguously benign reading and does not even warn, so without
+/// `build_encoder_adapters`'s `trainable_params().is_empty()` refusal the job
+/// would run its epoch over an empty `GradStore`, publish an
+/// `adapter.safetensors` with no A/B tensors and report SUCCESS — both arms'
+/// `expect_err` would panic (`expect_err(..): ()`).
 ///
-/// The message assertion is the non-vacuous half (family F): "the job failed"
+/// The message assertion is the non-vacuous half: "the job failed"
 /// alone would also pass on a decode error, an OOM, or a missing fixture, so
 /// the text must carry this tower's OWN site vocabulary — `in_proj` and
 /// `c_proj`, which no other tower in this workspace offers.
@@ -1553,7 +1546,7 @@ async fn unmatched_target_modules_refuse_instead_of_training_nothing() {
     );
 }
 
-/// A4(e), arm 2: the same refusal on a BERT-family tower, whose site
+/// (e), arm 2: the same refusal on a BERT-family tower, whose site
 /// vocabulary is the DOTTED checkpoint path (`attention.self.query`, …) rather
 /// than the short suffix form the guide's recipe table shows. A caller who
 /// reads the message must be able to paste a name straight out of it, so the
@@ -1561,7 +1554,8 @@ async fn unmatched_target_modules_refuse_instead_of_training_nothing() {
 /// "value"]` form works only because `should_apply_lora` also accepts a
 /// suffix.
 ///
-/// RED at 5bf8abdb for the identical reason as arm 1: the job succeeded there.
+/// Without the refusal the job would succeed, for the identical reason as
+/// arm 1.
 #[tokio::test(flavor = "multi_thread")]
 async fn unmatched_target_modules_on_bert_name_the_dotted_site_paths() {
     let dir = TempDir::new().unwrap();
@@ -1702,9 +1696,9 @@ async fn audio_training_refuses_a_mel_bin_mismatch_like_serving_does() {
 // .to_vec()` directly) is caught here too, not just at the unit level.
 // =============================================================================
 
-/// Verified by temporarily reverting `session.rs::encode_image_query` to
-/// `output.float_outputs[0].to_vec()` (the blind read): this test
-/// goes RED (`Ok([0.0; dim])` instead of the `Err` asserted below).
+/// A blind `output.float_outputs[0].to_vec()` read in
+/// `session.rs::encode_image_query` would return `Ok([0.0; dim])` instead of
+/// the `Err` asserted below.
 #[tokio::test(flavor = "multi_thread")]
 async fn encode_image_query_on_corrupt_bytes_refuses_never_a_zero_vector() {
     let dir = TempDir::new().unwrap();
@@ -1726,8 +1720,8 @@ async fn encode_image_query_on_corrupt_bytes_refuses_never_a_zero_vector() {
 }
 
 /// Peer of the image case above, over the HTSAT-Swin CLAP audio tower.
-/// Verified by temporarily reverting `session.rs::encode_audio_query` the
-/// same way: RED (`Ok([0.0; dim])`) instead of the expected `Err`.
+/// A blind read in `session.rs::encode_audio_query` would likewise return
+/// `Ok([0.0; dim])` instead of the expected `Err`.
 #[tokio::test(flavor = "multi_thread")]
 async fn encode_audio_query_on_corrupt_bytes_refuses_never_a_zero_vector() {
     let dir = TempDir::new().unwrap();
@@ -1748,13 +1742,11 @@ async fn encode_audio_query_on_corrupt_bytes_refuses_never_a_zero_vector() {
     );
 }
 
-/// The text peer: `encode_text_query` read
-/// `output.float_outputs[0][..dim].to_vec()` directly, so an empty/null text
-/// query returned a ZERO VECTOR even though `forward_embedding` marks an
-/// empty text row's OWN status `false` (`"Empty or null text input"`) exactly
-/// like a corrupt image/audio row. Verified by temporarily reverting
-/// `encode_text_query` to that blind read: RED (`Ok([0.0; dim])`) instead of
-/// the `Err` this test asserts.
+/// The text peer: `forward_embedding` marks an empty text row's OWN status
+/// `false` (`"Empty or null text input"`) exactly like a corrupt image/audio
+/// row, so an `encode_text_query` that read
+/// `output.float_outputs[0][..dim].to_vec()` directly would return a ZERO
+/// VECTOR (`Ok([0.0; dim])`) instead of the `Err` this test asserts.
 #[tokio::test(flavor = "multi_thread")]
 async fn encode_text_query_on_empty_text_refuses_never_a_zero_vector() {
     let dir = TempDir::new().unwrap();

@@ -26,11 +26,6 @@ _ROOT = Path(__file__).resolve().parents[3]
 _TINY_BERT = _ROOT / "cookbook" / "fixtures" / "tiny_bert"
 _TRAINING_PAIRS = _ROOT / "tests" / "fixtures" / "training_pairs.csv"
 
-pytestmark = pytest.mark.skipif(
-    not _TINY_BERT.is_dir() or not _TRAINING_PAIRS.is_file(),
-    reason="local tiny_bert / training_pairs fixtures not present",
-)
-
 
 def _connect(tmp_path: Path):
     db = jammi.connect(f"file://{tmp_path}")
@@ -67,14 +62,14 @@ def test_embedded_fine_tune_runs_through_the_shared_assembly(tmp_path: Path) -> 
 
 
 def test_embedded_fine_tune_metrics_surfaces_val_loss_run_summary(tmp_path: Path) -> None:
-    """`Job.metrics()` (#441): the completed job's run summary, sourced
+    """`Job.metrics()`: the completed job's run summary, sourced
     straight from the catalog's tagged `jobs.result` payload's nested
     `metrics` field via the same embedded session the job ran on — proving
     the built binding, not a log.
 
     Engine-not-platform check: `metrics()` returns generic training telemetry
     (loss/step/timing) with no consumer-specific field — the same shape any
-    fine-tuning caller reaches for (B1-clean).
+    fine-tuning caller reaches for.
     """
     db = _connect(tmp_path)
     db.add_source("training", url=str(_TRAINING_PAIRS), format="csv")
@@ -105,7 +100,7 @@ def test_embedded_fine_tune_metrics_surfaces_val_loss_run_summary(tmp_path: Path
     assert metrics["started_at"]
     assert metrics["completed_at"]
 
-    # Per-epoch loss curves (issue #441) — asserted against the shape
+    # Per-epoch loss curves — asserted against the shape
     # `TrainingLoop::run` actually emits (`crates/jammi-ai/src/fine_tune/
     # trainer.rs`): a list of `{"epoch": int, "loss": float}` rows, one per
     # epoch actually run, never a bare `[epoch, loss]` pair (the wrong shape
@@ -130,11 +125,10 @@ def test_embedded_fine_tune_metrics_surfaces_val_loss_run_summary(tmp_path: Path
 
 
 def test_embedded_fine_tune_acceleration_report_four_states(tmp_path: Path) -> None:
-    """`Job.acceleration_report()` (campaign #443): the catalog's
+    """`Job.acceleration_report()`: the catalog's
     `jobs.acceleration_report` column, decoded the same way
-    `metrics()` decodes its column (issue #441) but preserving THIS column's
-    own two-state contract (`JobRecord::acceleration_report`'s doc,
-    migration 026, generalised to the `jobs` schema) rather
+    `metrics()` decodes its column but preserving THIS column's
+    own two-state contract (`JobRecord::acceleration_report`'s doc) rather
     than `metrics()`'s "absent means `{}`" default —
     proven against a REAL embedded engine + catalog on all four states:
 
@@ -143,20 +137,19 @@ def test_embedded_fine_tune_acceleration_report_four_states(tmp_path: Path) -> N
         recorded a determination.
       * the claiming worker's `{"state": "determined", ...}` payload, from a
         REAL run that actually claimed the job and probed its device/dtype/
-        kernel-admission (esc-075) — not a hand-built stand-in, so this
+        kernel-admission — not a hand-built stand-in, so this
         exercises the real producer path, not just the read side.
       * SQL `NULL` (a row this code never touched) -> Python `None`, never
         silently coerced to `{}` or read as any particular acceleration
         state.
       * present + unparseable JSON -> `jammi.errors.BackendError`, mirroring
         `metrics()`'s malformed-blob idiom exactly: a data-integrity fault,
-        never silently folded into the `None`/"absent" case (K4 follow-up —
-        this state was missing from the original three-state coverage).
+        never silently folded into the `None`/"absent" case.
 
     Reuses ONE real fine-tune run for all four reads with the SAME
     close-before-inject discipline `test_conformance.py`'s
     `test_remote_and_embedded_job_metrics_agree_on_all_three_states`
-    documents (esc-073): a raw `sqlite3` seed write never overlaps a live
+    documents: a raw `sqlite3` seed write never overlaps a live
     engine connection on the same WAL file, which otherwise reproduces a hard
     interpreter crash. `jammi.EmbeddedBackend` has no `job`/`close`
     convenience (asymmetric with the remote client — see that test's
@@ -207,7 +200,7 @@ def test_embedded_fine_tune_acceleration_report_four_states(tmp_path: Path) -> N
     job_id = submit_job.job_id
 
     # State 1: determined — the job's OWN natural post-completion state. The
-    # esc-075 report-computation runs synchronously right after device
+    # acceleration-report computation runs synchronously right after device
     # resolution, before the training loop's first step, so a completed run's
     # row is `"determined"` for its whole lifetime — never read here as the
     # submission-time `"pending"` marker.

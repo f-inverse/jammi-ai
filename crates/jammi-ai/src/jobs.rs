@@ -80,15 +80,12 @@ use crate::session::InferenceSession;
 /// mirrors into `jobs.kind` — see `crate::fine_tune::worker::is_compute_kind`
 /// for the vocabulary this must stay in sync with.
 ///
-/// Every variant now carries its own `cache` (item 3): item 2/K4 routes
-/// EVERY embedded synchronous compute verb through
-/// [`InferenceSession::run_now`], including the three ([`Self::NeighborGraph`],
-/// [`Self::Propagate`]) whose materializer still opts into the
-/// definition-hash cache probe under [`CachePolicy::Use`] — N1's "the
-/// NeighborGraph/Propagate cache probe stays" wording — so the caller's
-/// cache policy has to survive the trip through `jobs.spec` and back, not be
-/// silently forced to [`CachePolicy::Bypass`] the way the pre-item-3
-/// `execute_compute` did for every compute kind.
+/// Every variant carries its own `cache`: EVERY embedded synchronous compute
+/// verb routes through [`InferenceSession::run_now`], including the ones
+/// ([`Self::NeighborGraph`], [`Self::Propagate`]) whose materializer opts
+/// into the definition-hash cache probe under [`CachePolicy::Use`] — so the
+/// caller's cache policy has to survive the trip through `jobs.spec` and
+/// back, never be silently forced to [`CachePolicy::Bypass`].
 ///
 /// `#[serde(deny_unknown_fields)]`: a `jobs.spec` row is always
 /// engine-written from a decoded spec, so an unknown key can only arrive
@@ -240,8 +237,7 @@ impl ComputeSpec {
 /// (`crate::fine_tune::worker::JobWorker::run_claimed_compute_job` and
 /// the training claim paths cited above) already fold that error into a
 /// failure record keyed by the job's own id (`jobs.job_id` is the row's
-/// primary key), so the typed error is never anonymous in practice — see
-/// <https://github.com/f-inverse/jammi-ai/issues/548>.
+/// primary key), so the typed error is never anonymous in practice.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum JobSpec {
@@ -565,10 +561,9 @@ pub enum JobResult {
         metrics: Option<String>,
         /// Shares [`Self::Table::cache_outcome`]'s
         /// `"computed"`/`"reused:{name}"` vocabulary, but every training
-        /// kind always records `"computed"` today: model-level cache reuse
-        /// is not yet supported (`TrainingSpec::FineTune`'s own `cache`
-        /// field refuses `Use` at submit; see
-        /// <https://github.com/f-inverse/jammi-ai/issues/562>).
+        /// kind always records `"computed"`: there is no model-level cache
+        /// reuse (`TrainingSpec::FineTune`'s own `cache` field refuses `Use`
+        /// at submit).
         cache_outcome: String,
     },
     /// A compute kind's result table.
@@ -579,7 +574,7 @@ pub enum JobResult {
     },
 }
 
-/// N1's per-attempt disposition: what a claimed job's worker does BEFORE it
+/// The per-attempt disposition: what a claimed job's worker does BEFORE it
 /// ever calls [`execute_compute`], on every attempt after the first.
 pub(crate) enum PartialResultDisposition {
     /// A prior attempt's table is `ready` — the job is done; finish it with
@@ -597,7 +592,7 @@ pub(crate) enum PartialResultDisposition {
     BackOff,
 }
 
-/// N1: on attempt `N > 1`, read `jobs.partial_result` and dispatch on that
+/// On attempt `N > 1`, read `jobs.partial_result` and dispatch on that
 /// table's status BEFORE running the producer's normal (materialize-anew)
 /// path — `attempt == 1` (every [`InferenceSession::run_now`] inline job;
 /// a queued job's first claim) always falls straight through, since there
@@ -637,7 +632,7 @@ pub(crate) async fn dispatch_partial_result(
     let Some(record) = catalog.get_result_table(table_name).await? else {
         // The row vanished (e.g. a prior fail+delete already reaped it) —
         // nothing to adopt; the column still names it, so clear it or this
-        // attempt's own `create_result_table` CAS is superseded (esc-110).
+        // attempt's own `create_result_table` CAS is superseded.
         clear_stale_partial_result(catalog, job_id, instance_id, attempt, table_name).await;
         return Ok(PartialResultDisposition::MaterializeAnew);
     };
@@ -685,8 +680,8 @@ pub(crate) async fn dispatch_partial_result(
 /// Clear the predecessor's `partial_result` before THIS attempt
 /// materializes anew, so its own `create_result_table` CAS (`… AND
 /// partial_result IS NULL`) can land. Without this every attempt >= 2 that
-/// reached a `MaterializeAnew` arm was superseded by its own predecessor's
-/// stale pointer and the job landed `failed` (escape `esc-110`).
+/// reaches a `MaterializeAnew` arm is superseded by its own predecessor's
+/// stale pointer and the job lands `failed`.
 /// Attempt-guarded like every jobs CAS (`Catalog::clear_partial_result`);
 /// 0 rows = a peer already cleared it or superseded this attempt, which the
 /// existing `JobAttemptSuperseded` path then reports. Best-effort: an error
@@ -720,7 +715,7 @@ async fn clear_stale_partial_result(
 /// [`crate::fine_tune::worker::JobWorker`] for a queued one) owns the
 /// claim/lease/finish around this call, and threads `job_attempt` (the
 /// claim's own identity) into every producer so the result table's
-/// `partial_result` CAS lands under the correct attempt (N1, N11/esc-107).
+/// `partial_result` CAS lands under the correct attempt.
 /// `catalog` is the handle scoped to the job's tenant (the worker's
 /// tenant-pinned handle; `run_now`'s caller-scoped one): the one read this
 /// function performs is the pre-dispatch cancel checkpoint
@@ -734,11 +729,11 @@ async fn clear_stale_partial_result(
 /// which calls back into this function; dispatching to the wrapper here
 /// would recurse forever. A claimed compute job and a direct `run_now`
 /// embedded call both bottom out at the SAME `*_materialize` call, so they
-/// materialise byte-identical tables (K4).
+/// materialise byte-identical tables.
 ///
-/// Every kind's [`CachePolicy`] rides in its own `spec` field (item 3):
+/// Every kind's [`CachePolicy`] rides in its own `spec` field:
 /// [`ComputeSpec::NeighborGraph`] and [`ComputeSpec::Propagate`] are pinned
-/// (N1's withdrawn-unpinned-sentence) and genuinely honour `Use`; the other
+/// and genuinely honour `Use`; the other
 /// kinds are unpinned, so `Use` is an honest miss for them, but the caller's
 /// policy is never silently overridden here.
 pub async fn execute_compute(
@@ -1028,7 +1023,7 @@ impl InferenceSession {
         // typed refusals, nothing enqueued on any of them.
         //
         // For a training kind this function builds no `SubmitJobParams` of
-        // its own (#573 round 3, N3-seam):
+        // its own:
         // [`crate::fine_tune::spec::submit_admitted_training`] is the ONE
         // place that construction happens, so this arm submits through it
         // rather than the `submit_job` call below. It writes the
@@ -1036,9 +1031,8 @@ impl InferenceSession {
         // `spec` (the `JobSpec`) — which is a byte-identical but SEPARATE
         // value (see `JobSpec`'s own doc on the two independent shapes; the
         // byte-pin tests are what makes this substitution sound). A compute
-        // kind is untouched by N3 (scoped to training kinds only) and keeps
-        // building `SubmitJobParams` from `spec`'s own `JobSpec::Serialize`
-        // exactly as before.
+        // kind builds `SubmitJobParams` from `spec`'s own
+        // `JobSpec::Serialize`.
         let job_id = uuid::Uuid::new_v4().to_string();
         let kind = spec.kind();
         match spec.as_training_spec() {
@@ -1091,14 +1085,14 @@ impl InferenceSession {
     /// [`crate::fine_tune::worker::JobWorker`]'s poll loop, since
     /// `claim_next` filters on `execution = 'queued'`), claims it by id,
     /// runs it through [`execute_compute`] under a keeper-registered lease
-    /// (N3 — no heartbeat task), and finishes the row before returning the
+    /// (no heartbeat task), and finishes the row before returning the
     /// terminal [`JobResult`] directly — no worker needed. Every embedded
     /// synchronous compute verb ([`InferenceSession::build_neighbor_graph`],
     /// [`InferenceSession::propagate_embeddings`],
     /// [`InferenceSession::asof_join`]) is reachable through this same
     /// path, so a `run_now` call and a queued-and-claimed compute job of the
     /// same kind execute byte-identical code and their terminal payloads
-    /// match (K4).
+    /// match.
     ///
     /// The returned `Ok` is exactly "the row is `completed` with this
     /// result": the finish is the same attempt-guarded compare-and-set the
@@ -1145,7 +1139,7 @@ impl InferenceSession {
             });
         // `run_now` always submits a BRAND NEW `job_id` (never reused across
         // calls), so `claimed.attempts` is always 1 here — there is no
-        // N1 partial_result to dispatch on (an inline job has no requeue
+        // partial_result to dispatch on (an inline job has no requeue
         // arm; it is a fresh row every time). `execute_compute` still runs
         // through the normal producer path with the real `JobAttempt` this
         // claim just won, so `create_table`'s `partial_result` CAS is
@@ -1186,9 +1180,8 @@ impl InferenceSession {
                 Ok(job_result)
             }
             Err(e) => {
-                // #485: a swallowed `Err` here (the old `.ok()`) could leave
-                // this inline row `running` for the process lifetime — this
-                // function never retries and nothing else finalizes an
+                // A swallowed `Err` here could leave this inline row `running` for the process
+                // lifetime — this function never retries and nothing else finalizes an
                 // inline row's lease, so a lost write here is not "left for
                 // reclaim" the way a queued job's would be. `Ok(false)` is
                 // the benign race (a peer somehow holds this attempt's
@@ -1402,16 +1395,14 @@ mod tests {
         assert_eq!(back.kind(), "fine_tune");
     }
 
-    /// The untagged-collapse case (#548), through `JobSpec` this time (not
-    /// `TrainingSpec` directly): a stray `cache` key hand-edited under a
-    /// `graph_fine_tune` row is refused with a typed error naming the
-    /// field, never `"data did not match any variant of untagged enum"` —
-    /// the message a `#[serde(untagged)]` `JobSpec` (this type's form
-    /// before #548) produces when every inner deserializer it tries in turn
-    /// fails. RED: dropping `deny_unknown_fields` from `JobSpec`'s own
-    /// `#[serde(tag = "kind", ...)]` attribute turns this red — the stray
-    /// `cache` key decodes silently instead of refusing, and
-    /// `expect_err` panics.
+    /// The untagged-collapse case, through `JobSpec` (not `TrainingSpec`
+    /// directly): a stray `cache` key hand-edited under a `graph_fine_tune`
+    /// row is refused with a typed error naming the field, never `"data did
+    /// not match any variant of untagged enum"` — the message a
+    /// `#[serde(untagged)]` enum produces when every inner deserializer it
+    /// tries in turn fails. Without `deny_unknown_fields` on `JobSpec`'s own
+    /// `#[serde(tag = "kind", ...)]` attribute the stray `cache` key would
+    /// decode silently and `expect_err` would panic.
     #[test]
     fn a_stray_field_under_a_declared_kind_is_refused_through_job_spec_naming_the_field() {
         let original: JobSpec = crate::fine_tune::spec::TrainingSpec::GraphFineTune {
@@ -1461,8 +1452,7 @@ mod tests {
     /// The same stray-field refusal on a COMPUTE kind (not just a training
     /// one, above): `deny_unknown_fields` covers every one of `JobSpec`'s
     /// eight variants at once, since it is ONE derive over the whole flat
-    /// enum, not per-variant. RED: dropping `deny_unknown_fields` from
-    /// `JobSpec`'s attribute turns this red the same way.
+    /// enum, not per-variant.
     #[test]
     fn a_stray_field_under_a_compute_kind_is_refused_naming_the_field() {
         let mut value = serde_json::to_value(JobSpec::NeighborGraph {
@@ -1489,12 +1479,9 @@ mod tests {
     /// refuses a stray field at depth 1 (directly under `kind`) — a stray
     /// field nested inside `common` (depth 2, `TrainingCommon`'s own shape)
     /// is a SEPARATE struct with its own `deny_unknown_fields` requirement.
-    /// Before this unit's `TrainingCommon` gained the attribute, a fixture
-    /// exactly like this one decoded clean with the nested key silently
-    /// dropped — the round-2 finding this test pins. RED: removing
-    /// `#[serde(deny_unknown_fields)]` from `TrainingCommon`
-    /// (`crate::fine_tune::spec::TrainingCommon`) turns this red — the
-    /// `expect_err` panics because the nested stray key decodes silently.
+    /// Without `#[serde(deny_unknown_fields)]` on
+    /// `crate::fine_tune::spec::TrainingCommon`, a fixture exactly like this
+    /// one decodes clean with the nested key silently dropped.
     #[test]
     fn a_stray_field_nested_inside_common_is_refused_not_silently_dropped() {
         let mut value = serde_json::to_value(JobSpec::FineTune {
@@ -1527,7 +1514,7 @@ mod tests {
         );
     }
 
-    /// N4 oracle (i) — BYTE PIN: `JobSpec`'s serialization of a value is
+    /// BYTE PIN: `JobSpec`'s serialization of a value is
     /// byte-identical to the corresponding `TrainingSpec`/`ComputeSpec`
     /// variant's own serialization of the same logical value, for every
     /// one of the eight compiled kinds — the property the type's own doc
@@ -1535,12 +1522,10 @@ mod tests {
     /// written directly through whichever of those two types the kind
     /// belongs to"), which is what lets the two production training-claim
     /// sites and the one compute-claim site keep reading `TrainingSpec`/
-    /// `ComputeSpec` directly with no awareness `JobSpec` exists. RED:
-    /// nesting `JobSpec` under `#[serde(tag = "kind", content = "content")]`
-    /// (serde's "adjacent" enum representation) turns every training-kind
-    /// row of this test red — `common` moves to `.content.common`,
-    /// desynchronising the two serializations this test compares byte for
-    /// byte.
+    /// `ComputeSpec` directly with no awareness `JobSpec` exists. Serde's
+    /// "adjacent" enum representation (`#[serde(tag = "kind", content =
+    /// "content")]`) would move `common` to `.content.common`, desynchronising
+    /// the two serializations this test compares byte for byte.
     #[test]
     fn job_spec_byte_pins_every_compiled_kind_against_its_own_type() {
         use crate::fine_tune::spec::TrainingSpec;
@@ -1743,8 +1728,8 @@ mod tests {
 
     /// A `NeighborGraph`/`AsofJoin` compute spec's param structs
     /// (`BuildNeighborGraph`, `AsofJoinSpec`) round-trip too, not just
-    /// `PropagateRequest` — the contract's "param structs gain
-    /// Serialize/Deserialize" covers all of them.
+    /// `PropagateRequest` — every compute kind's param struct is
+    /// Serialize/Deserialize.
     #[test]
     fn neighbor_graph_and_asof_join_specs_round_trip() {
         let ng = ComputeSpec::NeighborGraph {

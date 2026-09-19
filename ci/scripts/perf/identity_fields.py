@@ -18,8 +18,7 @@ own test suites pin per field.
 
 Stdlib-only, no jammi-bench/torch/numpy dependency — importable from either
 comparator with zero extra setup, and directly by
-`test_compare_grad_oracle.py`/`test_ab_merge.py`/a future shared lattice
-test.
+`test_compare_grad_oracle.py`/`test_ab_merge.py`.
 """
 
 from __future__ import annotations
@@ -28,16 +27,15 @@ import itertools
 import math
 import struct
 
-# B1 audit finding on PR #372: jammi's OWN CLI/interchange vocabulary
+# jammi's OWN CLI/interchange vocabulary
 # (`crates/jammi-bench/src/main.rs`'s `--backbone-dtype` choices,
 # `grad_oracle.rs`'s `format!("{:?}", ComputePrecision::F32).to_lowercase()`)
-# is `f32`/`f16`/`bf16` -- picked as the CANONICAL spelling both comparators
-# normalize to, since it is already the spelling used across every jammi
-# entry point AND the weight-interchange file's own naming convention. Both
+# is `f32`/`f16`/`bf16` -- the CANONICAL spelling both comparators normalize
+# to, since it is the spelling used across every jammi entry point AND the
+# weight-interchange file's own naming convention. Both
 # `torch_grad_oracle.py`'s `run()` and `torch_finetune_step.py`'s `report`
-# emit jammi's canonical spelling directly for a NEW dump; this map exists
-# for LEGACY dumps only -- an older producer, or any external one, that
-# still carries torch's bare CLI-flag spelling `fp32`.
+# emit jammi's canonical spelling directly; this map covers a dump from any
+# other producer that carries torch's bare CLI-flag spelling `fp32`.
 LEGACY_BACKBONE_DTYPE_SPELLINGS = {
     "fp32": "f32",
 }
@@ -88,19 +86,16 @@ def normalize_target_modules(value):
 class _NotRepresentableAsF32:
     """Sentinel `_round_trip_f32` returns instead of a canonicalized
     `float` when the raw input cannot be trusted to describe a legitimate
-    premise value in the engine's own `f32` storage — advisory (adversarial
-    audit): an EARLIER version of this function let `struct.pack('<f',
-    ...)` raise a bare `OverflowError` straight out of the comparator for
-    any FINITE value outside `f32`'s representable range (e.g. `1e40`),
-    crashing the WHOLE merge over one malformed field the same class of
-    bug F1 fixed for `bar_ratio_classification` — never caught per-config,
-    never even a violation, just a hard crash. This sentinel turns that
-    into an ORDINARY, catchable REFUSAL instead: `canonicalize_identity_field`
-    returns it like any other value, `leg_premise_violations`/
-    `generic_leg_premise_violations` compare it exactly like a real float
-    (`va != vb`), and its own `__repr__` names the reason directly in the
-    printed violation ("field X differs: jammi=<not representable as the
-    engine's f32: 1e+40> torch=0.05").
+    premise value in the engine's own `f32` storage. A bare
+    `struct.pack('<f', ...)` raises `OverflowError` for any FINITE value
+    outside `f32`'s representable range (e.g. `1e40`), which would crash the
+    WHOLE merge over one malformed field rather than refuse one config. This
+    sentinel turns that into an ORDINARY, catchable REFUSAL instead:
+    `canonicalize_identity_field` returns it like any other value,
+    `leg_premise_violations`/`generic_leg_premise_violations` compare it
+    exactly like a real float (`va != vb`), and its own `__repr__` names the
+    reason directly in the printed violation ("field X differs:
+    jammi=<not representable as the engine's f32: 1e+40> torch=0.05").
 
     Covers BOTH the finite-but-out-of-range case (`OverflowError`) and the
     non-finite cases (`inf`/`-inf`/`nan`) — the latter pack into `f32`
@@ -122,7 +117,7 @@ class _NotRepresentableAsF32:
     value — never let two garbage values silently "cancel out" into an
     accidental match.
 
-    Advisory (ii), round-2 adversarial audit: `__repr__` is INSTANCE-UNIQUE
+    `__repr__` is INSTANCE-UNIQUE
     (a per-instance sequence number folded in), not merely a function of
     `raw`. This is not cosmetic: `finetune_run_leg_identity_violations`
     (`ab_merge.py`, the cross-seed identity check) groups displayed values
@@ -200,7 +195,7 @@ def normalize_f32_stored_field(value):
     gap between the two sides to narrow for either field, and adding a
     canonicalizer for them would WIDEN what counts as a match (silently
     accepting an f32-rounded value on ONE side against a genuine f64 value
-    on the other, when today neither producer ever produces that gap) --
+    on the other, when neither producer ever produces that gap) --
     exactly the "narrows only the representational gap, never widens what
     counts as a match" discipline this module's own doc states.
 
@@ -219,16 +214,14 @@ def normalize_f32_stored_field(value):
 
 
 # THE finetune-step identity set — the ONE declaration every consumer
-# derives from (PR #381 audit B1: `ab_merge.py` used to carry its own
-# hand-kept 14-tuple, which lacked `max_grad_norm`, so a clip-ON jammi leg
-# merged against a clip-OFF torch leg and printed PASS; the lead's class
-# probe found the attention implementation absent from it for the same
-# reason — "a knob that changes what the step computes is not an identity
-# field" was the class, not one missing name). The rule for membership: a
+# derives from; no consumer keeps its own copy. The rule for membership: a
 # field is IDENTITY when two legs differing in it are computing a DIFFERENT
-# step, so their throughput/loss numbers are not comparable at all. It is
-# NOT a place for provenance (recorded, never compared — torch's raw
-# `attn_implementation` string, jammi's dispatch counters) or measurement.
+# step, so their throughput/loss numbers are not comparable at all — any
+# knob that changes what the step computes belongs here (a clip-ON leg
+# against a clip-OFF leg, or an eager-attention leg against a fused one,
+# must never merge to a PASS). It is NOT a place for provenance (recorded,
+# never compared — torch's raw `attn_implementation` string, jammi's
+# dispatch counters) or measurement.
 #
 # Both producers MUST emit every name here, at the level `ab_merge.py`'s
 # `leg_identity_fields` reads it from:
@@ -258,8 +251,8 @@ FINETUNE_IDENTITY_FIELDS = (
     "checkpoint_config_sha256",
     "checkpoint_weights_sha256",
     "checkpoint_weights_size_bytes",
-    # The gradient clip's on/off + bound for this row: `null` (clip OFF —
-    # the step the tier measured before the flag existed) or the positive
+    # The gradient clip's on/off + bound for this row: `null` (clip OFF)
+    # or the positive
     # finite `max_norm` the PRODUCTION `clip_gradients` ran with (jammi:
     # `--max-grad-norm`; torch: `--max-grad-norm` →
     # `torch.nn.utils.clip_grad_norm_`). Two legs differing here run a
@@ -283,10 +276,9 @@ FINETUNE_IDENTITY_FIELDS = (
     #     counters: those read eager whenever the fused predicate DECLINES
     #     BY DOMAIN (`head_dim != 64`, `seq > 4096`, dtype/contiguity/mask
     #     arms — documented as by-design in `report.rs`), so a legitimate
-    #     jammi-fused leg on a non-64-head_dim checkpoint would have read
-    #     "eager", mismatched torch's "fused", and INVALIDated the row over a
-    #     MEASUREMENT. Whether the fused arm actually ran stays where it
-    #     already lives (`ab_merge.fused_proof` + the counters); an identity
+    #     jammi-fused leg on a non-64-head_dim checkpoint would read
+    #     "eager", mismatch torch's "fused", and INVALIDate the row over a
+    #     MEASUREMENT. Whether the fused arm actually ran lives (`ab_merge.fused_proof` + the counters); an identity
     #     field describes what was asked for.
     # This is the "two references, never mixed" rule (eager ↔ eager is the
     # semantic reference, sdpa ↔ fused the throughput one) made a CHECKED
@@ -308,40 +300,35 @@ FINETUNE_IDENTITY_FIELDS = (
     "row_lengths",
 )
 
-# THE encode-step identity set (unit-62 E6, docs-ci domain) — mirrors
+# THE encode-step identity set — mirrors
 # `crates/jammi-bench/src/report.rs`'s `EncodeStepTier::IDENTITY_FIELDS`
-# EXACTLY (that const's own doc names this file's `ENCODE_IDENTITY_FIELDS`
-# as its pinned mirror; `test_identity_fields_subset.py` pins the cardinality
-# on BOTH sides and REDs on a drift on either one). Grown 13 -> 15 (round-3
-# audit F-5'/lead ruling): `checkpoint_pooling_sha256` (NullMeans — "no
-# 1_Pooling/config.json in this model dir") and `device_requested` appended
-# after the original 13, position-stable rather than re-ordered, mirroring
-# the Rust const's own append order exactly.
+# EXACTLY, in the Rust const's own order (that const's own doc names this
+# file's `ENCODE_IDENTITY_FIELDS` as its pinned mirror;
+# `test_identity_fields_subset.py` pins the cardinality on BOTH sides and
+# fails on a drift on either one). `checkpoint_pooling_sha256` is NullMeans
+# ("no 1_Pooling/config.json in this model dir").
 #
 # UNLIKE `FINETUNE_IDENTITY_FIELDS` above, this tuple is NOT a subset of a
 # larger Rust const that also folds in provenance/dispatch facts —
 # `EncodeStepTier` keeps its provenance (`device_name`,
 # `kernels_disabled_requested`, `kernels_disabled_fired`, `flash_compiled`,
 # `build_features`, `chunk_size`, `attention_arm`) in its OWN, entirely
-# DISJOINT `PROVENANCE_FIELDS` const (unit-62 CONTRACT.md §E3 — a deliberate
-# design choice, not the `FinetuneStepTier`/`REPORT_IDENTITY_FIELDS`
-# superset-folding shape carried above). `ENCODE_IDENTITY_FIELDS` is
+# DISJOINT `PROVENANCE_FIELDS` const (a deliberate design choice, not the
+# `FinetuneStepTier`/`REPORT_IDENTITY_FIELDS` superset-folding shape carried
+# above). `ENCODE_IDENTITY_FIELDS` is
 # therefore compared for SET EQUALITY against
 # `EncodeStepTier::IDENTITY_FIELDS`, never a subset check — see
 # `test_identity_fields_subset.py`'s own `EncodeStepIdentityFieldsTests` for
 # the mechanical assertion.
 #
-# `attention_arm` is FORBIDDEN here (v2 reshape 3 of the unit-62 plan): a
-# dispatched arm is a POST-HOC fact, never knowable before compute, so it can
+# `attention_arm` is FORBIDDEN here: a dispatched arm is a POST-HOC fact, never knowable before compute, so it can
 # never be a memoization key (K7's own `definition_of`); it is also constant
 # on this eval-only surface by construction (fused attention arms are
 # training-only), which would make it a false determinant even if it were
 # admitted. This module carries no `ENCODE_PROVENANCE_FIELDS` tuple — unlike
-# the Rust side, this file's own existing convention has never declared a
-# standalone provenance tuple for the finetune tier either (provenance is
-# documented prose in `ab_merge.py`'s determinant table, never a
-# machine-compared Python list here), so the encode mirror follows that same
-# convention rather than inventing a new one.
+# the Rust side, this file declares no standalone provenance tuple for any
+# tier (provenance is documented prose in `ab_merge.py`'s determinant table,
+# never a machine-compared Python list here).
 ENCODE_IDENTITY_FIELDS = (
     "seed",
     "batch",
@@ -356,9 +343,6 @@ ENCODE_IDENTITY_FIELDS = (
     "normalize",
     "warmup",
     "iters_measured",
-    # Round-3 audit additions (F-5'(b)/lead ruling), appended
-    # position-stable rather than re-ordered into the original 13 — mirrors
-    # `EncodeStepTier::IDENTITY_FIELDS`'s own append order exactly.
     "checkpoint_pooling_sha256",
     "device_requested",
 )
@@ -366,15 +350,14 @@ ENCODE_IDENTITY_FIELDS = (
 
 # Identity fields for which a JSON `null` is a legitimate VALUE (compared as
 # such, `null == null` matches) rather than the "present-but-unverifiable"
-# state `ab_merge.leg_identity_fields` otherwise folds into MISSING (the
-# round-4 PR #372 rule: `serde_json` writes a NaN `f64` as `null`, so a null
-# numeric identity field is normally a producer that could not state its
+# state `ab_merge.leg_identity_fields` otherwise folds into MISSING
+# (`serde_json` writes a NaN `f64` as `null`, so a null numeric identity field is normally a producer that could not state its
 # premise). `max_grad_norm` is the exception BY CONSTRUCTION: both producers
 # validate a supplied value as finite and `> 0.0` before running (jammi's
 # `validate_max_grad_norm`, torch's `parse_args` check), so NaN can never
 # reach the report — `null` there means exactly one thing, clip OFF. A key
 # that is ABSENT entirely is still MISSING for these fields too (a producer
-# built before the field existed cannot state its premise).
+# that does not emit the field cannot state its premise).
 FINETUNE_NULL_IS_A_VALUE_FIELDS = frozenset({"max_grad_norm"})
 
 
@@ -402,13 +385,13 @@ IDENTITY_FIELD_CANONICALIZERS = {
 }
 
 
-# THE finetune-run identity set (unit 63, H4/H4a docs-ci mirror) — mirrors
+# THE finetune-run identity set — mirrors
 # `crates/jammi-bench/src/report.rs`'s `FinetuneRunTier::IDENTITY_FIELDS`
 # EXACTLY, verbatim in the SAME order that const's own source lists them
 # (order is not semantically load-bearing for a set-equality check, but
 # keeping it identical makes a side-by-side diff against the Rust const
-# trivial for a human reviewer). Like `ENCODE_IDENTITY_FIELDS` above (unit
-# 62's E3/E6 shape) and UNLIKE `FINETUNE_IDENTITY_FIELDS`'s superset-folding
+# trivial for a human reviewer). Like `ENCODE_IDENTITY_FIELDS` above and
+# UNLIKE `FINETUNE_IDENTITY_FIELDS`'s superset-folding
 # shape, `FinetuneRunTier` keeps its provenance (`arm`, `device_name`,
 # `kernels_disabled_requested`, `kernels_disabled_fired`, `flash_compiled`,
 # `build_features`, `attention_arm`, `split_rule`, `batched_forward`,
@@ -425,57 +408,45 @@ IDENTITY_FIELD_CANONICALIZERS = {
 # const is extracted directly by the test suite's regex scan rather than
 # duplicated into a second Python list nobody would keep in sync.
 #
-# Issue #356 P1 item 5 (bench, `bench/356-finetune-run-distilbert` @
-# e845bb1f): `FinetuneRunTier` grew `layers_to_transform: Option<Vec<usize>>`
-# -- `--layers-to-transform`'s own resolved value, IDENTITY (not
-# provenance) for the exact reason `target_modules` itself is: a
-# `Some([..])` leg wraps a DIFFERENT set of linears than a `None` leg at
+# `layers_to_transform` (`--layers-to-transform`'s own resolved value) is
+# IDENTITY (not provenance) for the exact reason `target_modules` itself is:
+# a `Some([..])` leg wraps a DIFFERENT set of linears than a `None` leg at
 # the identical `target_modules`, so two legs agreeing on every other field
 # but disagreeing here are not comparable. `Nullable::NullMeans("no
 # restriction -- every layer matching target_modules gets a LoRA adapter")`
 # on the Rust const -- `None` IS a meaningful, distinct value (every layer),
 # never "unknown"/"not yet measured" -- so `layers_to_transform` is also a
-# `FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS` member, mirrored below. Grows this
-# set 32 -> 33; inserted at the SAME position the Rust const lists it
-# (immediately after `target_modules`) so the two stay a trivial
-# side-by-side diff.
+# `FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS` member, mirrored below.
 #
-# Unit-63 adversarial-audit finding 5 (identity-completeness) reshaped this
-# set from its original 35 entries to 32 (further grown to 33 above):
-#   (a) `heldout_pairs_sha256` ADDED — sha256 of the `--heldout-jsonl` file's
-#       own bytes, MEASURED at load; the held-out fixture's TEXT is a total
-#       determinant of every per-example loss `d_i` and was hashed nowhere
-#       before this fix (only the id ORDER, via `heldout_ids_sha256`, was
-#       anchored).
-#   (b) `dataset_sha256` RENAMED to `train_pairs_file_sha256` — the old name
-#       collided with the committed fixture manifest's OWN `dataset_sha256`
-#       (a Merkle digest over per-pair content hashes, built off-process),
-#       a DIFFERENT quantity under the SAME spelling, so neither anchored
-#       the other. The new name states exactly what it hashes: the
-#       `--train-jsonl` file's own raw bytes, measured off the file this
-#       run actually read.
-#   (c) `split_rule`/`batched_forward` MOVED to provenance, `split_seed`
-#       DROPPED entirely — none of the three could vary independently of an
-#       already-admitted field or a build-time constant: `split_rule` is a
-#       hardcoded literal, `batched_forward` is always `true`, and
-#       `split_seed` was a pure, literal duplicate of `seed` (`split()`
-#       takes no separate seed parameter). `heldout_batch_partition_sha256`
-#       is KEPT despite also being a pure function of already-identity
-#       inputs (held-out ids + `batch`) — see `FinetuneRunTier`'s own doc
-#       for why it earns its slot (a genuine cross-arm equality guard
-#       against the partitioning ALGORITHM diverging, not a redundant echo
-#       of inputs).
-#   (d) `steps_measured` MOVED to provenance (advisory) — a MEASURED
-#       OUTCOME of running (cumulative optimizer steps), not a premise the
-#       run was configured under.
-# Net: 35 − 4 (split_rule, split_seed, batched_forward, steps_measured) + 1
-# (heldout_pairs_sha256) = 32.
+# Membership notes for fields a reader might expect elsewhere:
+#   * `heldout_pairs_sha256` — sha256 of the `--heldout-jsonl` file's own
+#     bytes, MEASURED at load; the held-out fixture's TEXT is a total
+#     determinant of every per-example loss `d_i`, which the id ORDER alone
+#     (`heldout_ids_sha256`) does not anchor.
+#   * `train_pairs_file_sha256` — the `--train-jsonl` file's own raw bytes,
+#     measured off the file this run actually read. Deliberately NOT named
+#     `dataset_sha256`: the committed fixture manifest's own `dataset_sha256`
+#     is a DIFFERENT quantity (a Merkle digest over per-pair content hashes,
+#     built off-process), and the same spelling for both would anchor
+#     neither.
+#   * `split_rule`/`batched_forward` are provenance and there is no
+#     `split_seed` — none of the three can vary independently of an
+#     admitted field or a build-time constant: `split_rule` is a hardcoded
+#     literal, `batched_forward` is always `true`, and `split()` takes no
+#     seed of its own beyond `seed`. `heldout_batch_partition_sha256` is
+#     KEPT despite also being a pure function of identity inputs (held-out
+#     ids + `batch`) — see `FinetuneRunTier`'s own doc for why it earns its
+#     slot (a genuine cross-arm equality guard against the partitioning
+#     ALGORITHM diverging, not a redundant echo of inputs).
+#   * `steps_measured` is provenance — a MEASURED OUTCOME of running
+#     (cumulative optimizer steps), not a premise the run was configured
+#     under.
 FINETUNE_RUN_IDENTITY_FIELDS = (
-    # FinetuneStepTier's 18, minus attention_arm and (finding 5(c))
-    # `batched_forward`/`steps_measured` (15 entries) — carried over by
-    # name, same order as the Rust const's own leading block.
+    # FinetuneStepTier's fields minus attention_arm, `batched_forward`
+    # and `steps_measured` — same order as the Rust const's own leading
+    # block.
     "seed",
-    # Issue #421 P1-b: `--task`, the TOWER selector (`text_embedding` /
+    # `--task`, the TOWER selector (`text_embedding` /
     # `image_embedding` / `audio_embedding`). Same position as the Rust
     # const's own listing, immediately after `seed`.
     "task",
@@ -484,13 +455,13 @@ FINETUNE_RUN_IDENTITY_FIELDS = (
     "lora_rank",
     "lora_alpha",
     "lora_dropout",
-    # Issue #421 P1-b: `--lora-init` (`zeros_b` / `gaussian`). Same
+    # `--lora-init` (`zeros_b` / `gaussian`). Same
     # position as the Rust const's own listing, immediately after
     # `lora_dropout`.
     "lora_init",
     "margin",
     "target_modules",
-    # #356 P1 item 5 addition (see module doc above) -- same position as
+    # See the doc above this tuple -- same position as
     # the Rust const's own listing, immediately after `target_modules`.
     "layers_to_transform",
     "backbone_dtype",
@@ -500,9 +471,7 @@ FINETUNE_RUN_IDENTITY_FIELDS = (
     "max_grad_norm",
     "warmup",
     "row_lengths",
-    # New (18 entries in CONTRACT H4 v1/v2, minus `split_rule`/`split_seed`,
-    # `dataset_sha256` renamed to `train_pairs_file_sha256`, plus
-    # `heldout_pairs_sha256` added — finding 5(a)/(b)/(c)).
+    # The full-run fields a single step does not have.
     "epochs",
     "lr",
     "schedule",
@@ -511,7 +480,7 @@ FINETUNE_RUN_IDENTITY_FIELDS = (
     "grad_accum",
     "validation_fraction",
     "train_pairs_file_sha256",
-    # Issue #421 P1-b: the media corpus CONTENT digests, in the Rust
+    # The media corpus CONTENT digests, in the Rust
     # const's own positions (each immediately after the MANIFEST digest it
     # completes).
     "train_media_sha256",
@@ -541,14 +510,14 @@ FINETUNE_RUN_IDENTITY_FIELDS = (
 #                        multi-epoch run")
 #   * `layers_to_transform` — NullMeans("no restriction -- every layer
 #                        matching target_modules gets a LoRA adapter") --
-#                        #356 P1 item 5 addition (see this module's own
-#                        FINETUNE_RUN_IDENTITY_FIELDS doc above); `None` is
-#                        the meaningful "all layers" value, never "unknown".
+#                        see FINETUNE_RUN_IDENTITY_FIELDS's own doc above;
+#                        `None` is the meaningful "all layers" value, never
+#                        "unknown".
 #   * `train_media_sha256`/`heldout_media_sha256` — NullMeans("text task —
 #                        the {train,held-out} corpus content IS the
 #                        manifest, digested by
-#                        {train_pairs_file_sha256,heldout_pairs_sha256}");
-#                        issue #421 P1-b. `None` is the meaningful "this
+#                        {train_pairs_file_sha256,heldout_pairs_sha256}").
+#                        `None` is the meaningful "this
 #                        leg has no media corpus" value on a text task,
 #                        never "not measured": on a MEDIA task the manifest
 #                        digests name PATHS only, so the content digest is
@@ -572,29 +541,26 @@ FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS = frozenset(
 )
 
 
-# THE gpu-inference identity set (issue #335, D4/K7-completeness) — mirrors
+# THE gpu-inference identity set — mirrors
 # `crates/jammi-bench/src/report.rs`'s `GpuInferenceTier::IDENTITY_FIELDS`
 # EXACTLY, in the SAME order that const's own source lists them.
 # `test_identity_fields_subset.py`'s own `GpuInferenceIdentityFieldsSubsetTests`
-# pins the cardinality on BOTH sides and REDs on a drift on either one.
+# pins the cardinality on BOTH sides and fails on a drift on either one.
 #
-# Grown 9 -> 12 (round-1 adversarial audit B1, identity completeness):
-# `row_count` (closes the "manufactured-2x attack" -- `p50_ms` moves
-# LINEARLY with row_count, so two legs at a different row count are not
-# comparable regardless of anything else they agree on), `iters` (was
-# already EMITTED pre-#335 but never admitted to identity -- a differently-
-# sized measured sample is not the same measurement), and `corpus_sha256`
-# (a sha256 content hash over every committed sentence plus
-# `corpus_seed`/`row_count` -- closes the residual gap those two SCALARS
-# alone cannot: a PR that merely rewords a committed sentence, holding both
-# scalars fixed, moves neither one).
+# `row_count` is identity because `p50_ms` moves LINEARLY with it (two legs
+# at a different row count could manufacture a 2x "win"); `iters` because a
+# differently-sized measured sample is not the same measurement; and
+# `corpus_sha256` (a sha256 content hash over every committed sentence plus
+# `corpus_seed`/`row_count`) closes the gap those two SCALARS alone cannot:
+# a change that merely rewords a committed sentence, holding both scalars
+# fixed, moves neither one.
 #
 # UNLIKE `FINETUNE_IDENTITY_FIELDS`, and LIKE `ENCODE_IDENTITY_FIELDS`, this
 # tuple is NOT a subset of a larger Rust const that also folds in
 # provenance/dispatch facts -- `GpuInferenceTier` keeps its provenance
 # (`device_name`, `kernels_disabled_requested`, `flash_compiled`,
 # `build_features`) in its OWN, entirely DISJOINT `PROVENANCE_FIELDS` const
-# (the SAME E3 disjoint shape `ENCODE_IDENTITY_FIELDS` follows, never
+# (the SAME disjoint shape `ENCODE_IDENTITY_FIELDS` follows, never
 # `FINETUNE_IDENTITY_FIELDS`'s superset-folding one). `GPU_INFERENCE_IDENTITY_FIELDS`
 # is therefore compared for SET EQUALITY against `GpuInferenceTier::IDENTITY_FIELDS`,
 # never a subset check.
@@ -625,8 +591,8 @@ def canonicalize_identity_field(field, value):
     """Apply `field`'s registered canonicalizer (see
     `IDENTITY_FIELD_CANONICALIZERS`'s own table), or return `value`
     unchanged if none is registered. The SINGLE dispatch point every
-    identity-field comparison in this directory calls -- closing a future
-    representational gap for a NEW field means registering one function in
+    identity-field comparison in this directory calls -- closing a
+    representational gap for another field means registering one function in
     the table above, not writing a new `if field == ...` branch inline at
     each call site.
     """

@@ -8,9 +8,8 @@ name: Release Binaries
 #
 # Three asset families ship, each split into a build leg (runs on every ref,
 # artifact-only, never consults the verdict) and a promote leg (tag-only,
-# gated on the shared GPU-prove verdict — #454 follow-up, operator
-# direction: every release publisher gates on the prove verdict,
-# all-or-nothing, not only the CUDA lanes):
+# gated on the shared GPU-prove verdict — every release publisher gates on
+# the prove verdict, all-or-nothing, not only the CUDA lanes):
 #   - the CPU `jammi` CLI (`build` matrix: x86_64-linux + aarch64-linux +
 #     aarch64-darwin builds it, `promote-binaries` matrix uploads it),
 #   - the CPU `jammi-server` tarball (`server-cpu` matrix builds it,
@@ -43,10 +42,10 @@ name: Release Binaries
 # reaches it first. This workflow's binary legs and `crates.yml`'s
 # `github-release` job all run `gh release create … || true` before they touch
 # the release, so the first creates it and the rest no-op on the "already exists"
-# error. This removes the ordering dependency on `crates.yml` (whose
+# error. So there is no ordering dependency on `crates.yml` (whose
 # `github-release` job only runs after publishing every crate, minutes later):
-# a tag push no longer fails with "release not found" while the publish is in
-# flight. The upload retry is kept as a backstop for transient API hiccups.
+# a tag push never fails with "release not found" while the publish is in
+# flight. The upload retry is a backstop for transient API hiccups.
 
 on:
   push:
@@ -138,7 +137,7 @@ jobs:
           # (glibc 2.28 floor) as the x86_64 leg above -- resolved to the
           # SAME base digest the x86_64 leg uses (`resolve-base`), so both
           # halves of one release build on one toolchain. `+fp16` applies
-          # unconditionally from `.cargo/config.toml` (E-1).
+          # unconditionally from `.cargo/config.toml`.
           - target: aarch64-unknown-linux-gnu
             runs-on: ubuntu-24.04-arm
             container: ${{ needs.resolve-base.outputs.image }}
@@ -205,8 +204,8 @@ jobs:
     name: Promote ${{ matrix.target }} to the release
     # build → proof → promote: attaches to the release ONLY on a `v*` tag ref
     # (push or dispatch-on-tag) whose commit's GPU-prove verdict is green
-    # (#454 follow-up, operator direction: every release publisher gates on
-    # the prove verdict, all-or-nothing, not only the CUDA lanes). `build`
+    # (every release publisher gates on the prove verdict, all-or-nothing,
+    # not only the CUDA lanes). `build`
     # above already exercises the packaging loop on every dispatch as an
     # artifact-only rehearsal; a branch dispatch never reaches this job at
     # all (the `if:` requires a tag ref) — there is no release to promote
@@ -297,7 +296,7 @@ jobs:
           deny-warnings: false
 
       # `ci/release-feature-manifest.json`'s `cpu-tarball` lane is the single
-      # source of truth for this lane's cargo feature list (#507) — read
+      # source of truth for this lane's cargo feature list — read
       # here rather than restating it, same idiom as `server-cu12-build`
       # below. `jq` is not guaranteed present in the CI base image (not a
       # `dnf install` its own Dockerfile carries), so this step installs it
@@ -337,8 +336,8 @@ jobs:
     name: Promote jammi-server (CPU, ${{ matrix.target }}) to the release
     # build → proof → promote: uploads to the release ONLY on a `v*` tag ref
     # (push or dispatch-on-tag) whose commit's GPU-prove verdict is green
-    # (#454 follow-up, operator direction: every release publisher gates on
-    # the prove verdict, all-or-nothing, not only the CUDA lanes). The `if:`
+    # (every release publisher gates on the prove verdict, all-or-nothing,
+    # not only the CUDA lanes). The `if:`
     # is a PURE conjunction (no `||`) — no non-tag branch-dispatch escape
     # hatch: `server-cpu` above already exercises the packaging loop on
     # every dispatch as an artifact-only rehearsal.
@@ -399,15 +398,11 @@ jobs:
   # from the binary's own transitive `DT_NEEDED` closure plus a measured
   # floor of dlopen-only members (`libnvrtc-builtins`, which `libnvrtc.so.12`
   # never links, only `dlopen`s — see that script's own module doc for the
-  # `readelf -d` measurement), never a hand-kept list of names: a HAND LIST
-  # shipped here once, and a derivation arm existed, was EXCISED (#535) after
-  # the hermetic suite sourcing it reported green with `libnccl` and
-  # `libnvrtc-builtins` missing from the stage directory, and its
-  # loader-verification arm was separately EXCISED (#534) after four measured
-  # defects made it unsound. Both are fixed in `bundle_cuda_libs.sh` and its
-  # suite; the derivation, the RPATH/RUNPATH assertion, and the real-loader
-  # verification below are what actually run here now — see that script's
-  # module doc for the full argument. The driver's own libraries
+  # `readelf -d` measurement), never a hand-kept list of names (a hand list
+  # can pass a green suite with `libnccl` and `libnvrtc-builtins` missing
+  # from the stage directory). The derivation, the RPATH/RUNPATH assertion,
+  # and the real-loader verification below are what run here — see that
+  # script's module doc for the full argument. The driver's own libraries
   # (`libcuda.so.1`, `libnvidia-*`) are deliberately NOT bundled — they must
   # match the host's driver. A GPU-less runner is fine — nothing runs the
   # binary here; the loader-verification step below only asks the loader
@@ -450,8 +445,7 @@ jobs:
 
       # `ci/release-feature-manifest.json` is the single source of truth for
       # this lane's cargo feature list (`cu12-tarball`) — read here rather
-      # than restating it, so a manifest edit (e.g. W2d landing FA2 fp16)
-      # moves this build in the same unit with no separate edit to keep in
+      # than restating it, so a manifest edit moves this build in the same unit with no separate edit to keep in
       # sync. `jq` is not guaranteed present in the CUDA CI base image (it
       # is not a `dnf install` this Dockerfile carries), so this step
       # installs it on demand rather than assuming it — cheap (a single
@@ -469,7 +463,7 @@ jobs:
           fi
           echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
 
-      # `flash-attn` (now in the manifest's cu12-tarball feature list) needs
+      # `flash-attn` (in the manifest's cu12-tarball feature list) needs
       # the vendored CUTLASS submodule at build time (`build.rs::
       # build_flash_attn`). Scoped to this job's own checkout only — same
       # rationale ci.yml's `flash-attn-compile` job documents: independent,
@@ -506,27 +500,25 @@ jobs:
           esac
           # ONE variable for both the asset name's triple and the
           # assert's expected arch -- a second hardcoded `x86_64` here
-          # previously could drift from the asset name's triple with no
-          # gate to catch it.
+          # could drift from the asset name's triple with no gate to catch
+          # it.
           triple=x86_64-unknown-linux-gnu
           arch=${triple%%-*}
           asset="jammi-server-cu12-${version}-${triple}.tar.gz"
 
-          # Class closure (#482): this tarball's own name asserts
-          # x86_64-unknown-linux-gnu; nothing checked that the just-built
-          # binary's own ELF machine actually is x86_64 before it shipped
-          # under that name. The CPU server leg above gets this for free
-          # via `package_release_bin.sh`'s S4 assert -- this leg is bespoke
-          # (CUDA lib bundling + launcher assembly) and never went through
-          # that script, so it calls the same shared `assert_elf_machine.sh`
-          # directly.
+          # This tarball's own name asserts x86_64-unknown-linux-gnu, so the
+          # just-built binary's ELF machine must be x86_64 before it ships
+          # under that name. The CPU server leg above gets this via
+          # `package_release_bin.sh`'s ELF-machine assert -- this leg is
+          # bespoke (CUDA lib bundling + launcher assembly) and never goes
+          # through that script, so it calls the same shared
+          # `assert_elf_machine.sh` directly.
           bash ci/scripts/assert_elf_machine.sh target/release/jammi-server "$arch"
 
           # Container-native path, deliberately OUTSIDE $GITHUB_WORKSPACE:
           # a `container:` job's workspace is bind-mounted in from the
           # runner HOST (a different filesystem/device than the container's
-          # own writable layer), and the jail arm below (F6, #534's chroot
-          # half) needs to `cp -al` (hardlink) this multi-GB stage into the
+          # own writable layer), and the jail arm below needs to `cp -al` (hardlink) this multi-GB stage into the
           # jail — a hardlink cannot cross that boundary. `/root` is this
           # container's own filesystem and this job already runs as root
           # (the `dnf install` above needs no `sudo`).
@@ -535,7 +527,7 @@ jobs:
           strip target/release/jammi-server
           cp target/release/jammi-server "${stage}/bin-jammi-server"
 
-          # DERIVED staging (#535/#534, both fixed): source the script rather
+          # DERIVED staging: source the script rather
           # than exec it, so this shell keeps `bundle_needed_sonames` and
           # `bundle_verify_loader_resolution` in scope for the loader
           # verification right below — the release lane's own `set -euo
@@ -554,7 +546,7 @@ jobs:
           bundle_main target/release/jammi-server "${stage}/lib"
 
           # Loader verification, arm 1a — DETECTION, the release lane's own
-          # real execution; arm 1b right below is the jail (#534's chroot
+          # real execution; arm 1b right below is the jail (the chroot
           # half), and `ci/scripts/test_bundle_cuda_libs.sh` is arm 1c, the
           # hermetic fixture-parse half for both; see `bundle_cuda_libs.sh`'s
           # module doc. Runs the REAL loader against the REAL stage, in this
@@ -567,9 +559,8 @@ jobs:
           # 1b, the launcher, or the tarball are ever built.
           loader_report="$(LD_LIBRARY_PATH="${stage}/lib" ldd target/release/jammi-server 2>&1 || true)"
           # Captured verbatim for `ci/scripts/fixtures/cu12_loader_report_real.txt`
-          # (T4(3)'s own real-report fixture; see that file's own header) —
-          # uploaded as a workflow artifact below so the lead can commit it
-          # in place of the provisional placeholder without renting a pod:
+          # (the real-report fixture) — uploaded as a workflow artifact below
+          # so a maintainer can refresh that fixture without renting a pod:
           # this container already has the toolkit and no driver, which is
           # exactly the shape the shipped arm sees on a release. Written
           # BEFORE the verify call so a failing verify still leaves the
@@ -578,9 +569,9 @@ jobs:
           # shellcheck disable=SC2046
           bundle_verify_loader_resolution "${stage}/lib" "$loader_report" $(bundle_needed_sonames target/release/jammi-server)
 
-          # Loader verification, arm 1b — THE JAIL (#534's chroot half —
-          # see `ci/scripts/jail_trace.py`'s own module doc for the
-          # measured reasons). Arm
+          # Loader verification, arm 1b — THE JAIL (the chroot half — see
+          # `ci/scripts/jail_trace.py`'s own module doc for the measured
+          # reasons). Arm
           # 1a above can only DETECT a host copy that would have satisfied a
           # bundled member; this arm HIDES every host copy so none CAN, by
           # running a TOLERANT `LD_TRACE_LOADED_OBJECTS` trace inside a real
@@ -657,7 +648,7 @@ jobs:
             echo "::error::jail_trace.py exited ${jail_rc}, neither the success (0) nor either named failure (2, 3) code — treating as a defect." >&2
             exit 1
           fi
-          # F6: the report and the measured DT_NEEDED set it must be judged
+          # The report and the measured DT_NEEDED set it must be judged
           # against are captured TOGETHER, from the SAME lane run, as one
           # fixture — a later drift between a hand-kept BINARY_NEEDED and
           # what this run actually measured can never desync the two halves
@@ -683,7 +674,7 @@ jobs:
           LAUNCH
           chmod +x "${stage}/jammi-server"
 
-          # `-C`, not a bare `tar -czf "$asset" "$stage"`: `$stage` is now an
+          # `-C`, not a bare `tar -czf "$asset" "$stage"`: `$stage` is an
           # absolute, container-native path (`/root/...`), and taring it
           # directly would embed that absolute path in the archive rather
           # than the relative `jammi-server-cu12/...` layout the launcher
@@ -702,15 +693,15 @@ jobs:
           name: jammi-server-cu12-tarball
           path: ${{ steps.package.outputs.asset }}
 
-      # F6: the real loader-report fixture, captured where the arm actually
+      # The real loader-report fixture, captured where the arm actually
       # runs (this container: toolkit present, driver absent) rather than a
       # rented pod. Runs on EVERY dispatch/tag push, same as the tarball
       # itself; `workflow_dispatch` on a branch ref already runs this leg
       # artifact-only with no release touched (`server-cu12-promote` below
-      # requires a `v*` tag — see this workflow's own module doc), so the
-      # lead dispatches on a branch, downloads this artifact, and commits its
-      # content over `ci/scripts/fixtures/cu12_loader_report_real.txt`'s
-      # `captured: pending` placeholder. No pod rental for this fixture.
+      # requires a `v*` tag — see this workflow's own module doc), so a
+      # maintainer refreshes `ci/scripts/fixtures/cu12_loader_report_real.txt`
+      # by dispatching on a branch and committing this artifact's content.
+      # No pod rental for this fixture.
       #
       # `if: always()` — the file is written to
       # disk BEFORE arm 1a's verify call, so a FAILING verify (or a failing
@@ -724,11 +715,10 @@ jobs:
           name: cu12-loader-report
           path: cu12_loader_report_real.txt
 
-      # The jail's own real report (arm 1b, #534's chroot half), same
-      # rationale as the artifact above: the lead dispatches on a
-      # branch, downloads this artifact, and commits its content over
-      # `ci/scripts/fixtures/cu12_jail_report_real.txt`'s `captured: pending`
-      # placeholder. No pod rental for this fixture either. `if: always()`
+      # The jail's own real report (arm 1b, the chroot half), same
+      # rationale as the artifact above: a maintainer refreshes
+      # `ci/scripts/fixtures/cu12_jail_report_real.txt` by dispatching on a
+      # branch and committing this artifact's content. No pod rental for this fixture either. `if: always()`
       # for the identical reason — the file is written before `bundle_
       # verify_jail_report` runs, so a failing verify still uploads it for
       # diagnosis; if the trace itself never produced a report at all (a
@@ -777,7 +767,7 @@ jobs:
       # dispatch) — the shared release-upload action decides which, and owns
       # the idempotent `gh release create` + bounded retry. This job only
       # ever reaches here on a tag ref (the `if:` above), so the branch-
-      # dispatch arm is inert but kept for the action's own uniform contract.
+      # dispatch arm is inert here; the action keeps one uniform contract.
       - uses: ./.github/actions/release-upload
         with:
           asset: ${{ needs.server-cu12-build.outputs.asset }}

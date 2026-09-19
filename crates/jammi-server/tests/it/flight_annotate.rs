@@ -1,4 +1,4 @@
-//! S7 — compound retrieval + inference in one Flight SQL round-trip.
+//! Compound retrieval + inference in one Flight SQL round-trip.
 //!
 //! The `annotate` table function exposes model inference as a SQL relation, so
 //! a remote caller runs `scan → inference` (and any `join`/`filter`/`select`

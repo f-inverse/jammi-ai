@@ -289,7 +289,7 @@ async fn streamed_top_k_is_bit_identical_to_naive_collect() {
 /// each iteration) bounds peak memory to `O(k + batch_rows·d)`; this test
 /// pins that the bounded path *runs to completion at scale*. A hard
 /// binding-tier RSS assertion (15M rows + a negative control proving the old
-/// collect-all path breaches a ceiling) is deferred to the out-of-process W1
+/// collect-all path breaches a ceiling) belongs in an out-of-process
 /// bench harness, where an RSS number can be measured reliably rather than
 /// flakily in-process.
 #[tokio::test]

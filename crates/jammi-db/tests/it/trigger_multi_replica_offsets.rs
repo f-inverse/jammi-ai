@@ -107,7 +107,7 @@ async fn two_replica_publishers_assign_gap_free_offsets() {
 
     let topic = TopicDefinition {
         id: TopicId::new(),
-        name: "esc_099.multi_replica".to_string(),
+        name: "trigger.multi_replica".to_string(),
         schema: topic_schema(),
         tenant: None,
         broker_metadata: BTreeMap::new(),

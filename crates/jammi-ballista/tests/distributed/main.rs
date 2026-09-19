@@ -1,6 +1,7 @@
-//! The three(+)-process Ballista lane (contract `feat_500-wave4` §2.5, §7,
-//! §9; acceptance (a3)-(a5), (b1)-(b6)). `required-features =
-//! ["live-distributed-tests"]` (`Cargo.toml`); needs, on top of that:
+//! The three(+)-process Ballista lane: placed embedding and gang jobs, byte
+//! parity with in-process execution, executor and scheduler death, and
+//! standby schedulers. `required-features = ["live-distributed-tests"]`
+//! (`Cargo.toml`); needs, on top of that:
 //!
 //! 1. `cargo build -p jammi-server --bin jammi-server --features
 //!    storage-s3` into the SAME `CARGO_TARGET_DIR` this test binary is
@@ -13,12 +14,11 @@
 //! A test fails naming the first of these variables that is unset
 //! ([`jammi_test_utils::DistributedBackends::from_env`]).
 //!
-//! **Uncovered** (named here and in this crate's contract file, never a
-//! silent skip in the exit code CI reads): acceptance (a3)'s "both
+//! **Not read through Ballista's API**: the embedding test's "both
 //! executors executed at least one task of the job" is read from the
-//! SCHEDULER PROCESS's OWN captured log (a `tracing::info!` line this unit
-//! added at the one call site `DevicePlacement::bind_tasks` actually binds a
-//! task, `crates/jammi-ballista/src/placement.rs`) rather than through
+//! SCHEDULER PROCESS's OWN captured log (the `tracing::info!` line at the
+//! one call site `DevicePlacement::bind_tasks` actually binds a task,
+//! `crates/jammi-ballista/src/placement.rs`) rather than through
 //! Ballista's `SchedulerGrpcClient::get_job_status`: the public
 //! `ballista_core::execution_plans::execute_physical_plan` a client-side
 //! `submit_physical_plan` caller uses never returns or exposes the
@@ -26,8 +26,7 @@
 //! `ballista-core-54.1.0/src/execution_plans/distributed_query.rs:332-405` —
 //! the job id lives only in a private `Arc<Mutex<Option<JobId>>>` the
 //! function never returns), so a caller outside the scheduler process has no
-//! `job_id` to poll `get_job_status` with. The log-line determinant is the
-//! honest substitute: it is the SAME fact (which executor a stage/partition
+//! `job_id` to poll `get_job_status` with. The log line carries the SAME fact (which executor a stage/partition
 //! bound to), read from the one process that actually knows it.
 
 mod harness;
@@ -50,16 +49,15 @@ use jammi_test_utils::DistributedBackends;
 
 /// The deepest (leaf) plan node's own partition count — the scan stage's,
 /// regardless of how many `CoalescePartitionsExec`/operator nodes wrap it
-/// (contract §2.5: `InferenceExec(SortExec(KeyCheckExec(
-/// CoalescePartitionsExec(scan))))`). Re-anchored for #540 RANGESPLIT: at
-/// the default `InferenceConfig::partitions == 1` (this lane's own
+/// (`InferenceExec(SortExec(KeyCheckExec(CoalescePartitionsExec(scan))))`).
+/// At the default `InferenceConfig::partitions == 1` (this lane's own
 /// session default, never configured otherwise), `wrap_with_split_and_merge`
 /// (`jammi_ai::operator::inference_exec`) inserts no `OrdinalSplitExec`/
 /// `SortPreservingMergeExec` and coalesces `InferenceExec`'s input to one
 /// partition ONLY IF it was not already one — for `build_embedding_plan`
 /// specifically, its input already went through `operator::ordered_input`
-/// (coalesce + sort), so that coalesce is a no-op and this test's own shape
-/// assertion stands as written, unchanged.
+/// (coalesce + sort), so that coalesce is a no-op and the leaf keeps the
+/// scan's partition count.
 ///
 /// `OrdinalSplitExec` (`partitions > 1`, which this lane never configures)
 /// has NO wire form at all — not distributable in v1. See `jammi_ballista::
@@ -76,8 +74,8 @@ fn leaf_partition_count(plan: &Arc<dyn ExecutionPlan>) -> usize {
     }
 }
 
-/// Arrow IPC (stream format) bytes of one batch — the byte-comparison unit
-/// contract §2.5 names ("compare the Arrow IPC bytes of the batches").
+/// Arrow IPC (stream format) bytes of one batch — the unit the parity
+/// assertions compare.
 fn ipc_bytes(batch: &RecordBatch) -> Vec<u8> {
     let mut buf = Vec::new();
     {
@@ -125,8 +123,8 @@ fn drop_column(batch: &RecordBatch, name: &str) -> RecordBatch {
 
 /// Build the standard 3-process ballista fleet: `lane-1` hosts the
 /// scheduler + an executor and is the ONLY process whose `[worker] kinds`
-/// includes `fine_tune` (LANE brief item 1's determinant, confirmed against
-/// `jammi_db::catalog::jobs_repo::Catalog::list_gang_members`, which admits
+/// includes `fine_tune` (`jammi_db::catalog::jobs_repo::Catalog::list_gang_members`
+/// admits
 /// a candidate only when its `workers.kinds` token set contains the job's
 /// own kind); `lane-2`/`lane-3` host executors only and list
 /// `context_predictor`, so they are fleet MEMBERS (`[worker] enabled =
@@ -234,7 +232,7 @@ async fn await_fleet_registered(
     ids
 }
 
-// ─── (a3) ────────────────────────────────────────────────────────────────
+// ─── an embedding plan across two executors ──────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn embedding_job_across_two_executors_matches_in_process() {
@@ -249,7 +247,7 @@ async fn embedding_job_across_two_executors_matches_in_process() {
     // executing this exact plan without this override:
     // `leaf_partition_count` read 1, not 2, even at 300 rows/file) —
     // dropping the threshold makes the two-file source scan with one
-    // partition per file, the non-vacuous shape oracle (a3) needs.
+    // partition per file, the shape that makes this test non-vacuous.
     session
         .sql("SET datafusion.optimizer.repartition_file_min_size = 1")
         .await
@@ -286,11 +284,11 @@ async fn embedding_job_across_two_executors_matches_in_process() {
     let scan_partitions = leaf_partition_count(&plan);
     assert!(
         scan_partitions >= 2,
-        "the two-file source's scan stage must have >= 2 partitions for oracle (a3) to be \
+        "the two-file source's scan stage must have >= 2 partitions for this test to be \
          non-vacuous, got {scan_partitions}"
     );
 
-    // In-process, on the harness session — the K4 baseline.
+    // In-process, on the harness session — the parity baseline.
     let task_ctx = session.context().task_ctx();
     let in_process = datafusion::physical_plan::collect(plan.clone(), task_ctx)
         .await
@@ -341,12 +339,12 @@ async fn embedding_job_across_two_executors_matches_in_process() {
         ipc_bytes(&in_process),
         ipc_bytes(&placed),
         "the plan collected through Ballista must be Arrow-IPC-byte-identical to the same \
-         plan collected in-process (K4)"
+         plan collected in-process"
     );
 
-    // (ii): both non-submitter executors actually ran a task of this job —
-    // read from the SCHEDULER process's own log (this module's Uncovered
-    // note explains why not through get_job_status).
+    // Both non-submitter executors actually ran a task of this job — read
+    // from the SCHEDULER process's own log (the module doc explains why not
+    // through get_job_status).
     let scheduler_log = fleet.log_contents(fleet.label(0));
     assert!(
         scheduler_log.contains(&lane2_id),
@@ -360,7 +358,7 @@ async fn embedding_job_across_two_executors_matches_in_process() {
     drop(fleet);
 }
 
-// ─── (a4) / (b5) ───────────────────────────────────────────────────────────
+// ─── a placed gang, and its parity with an unplaced gang ───────────────────
 
 /// Standard fleet + a submitted `world_size = 2` gang fine-tune, polled to
 /// `running`. Returns `(fleet, job_id, expected_model, claimant_instance_id)`.
@@ -385,9 +383,9 @@ async fn submit_and_await_placed_claim(
     // The PLACED claim, never the first one: the scheduler-role process
     // (lane-1) claims the row itself and holds it `running` under its own
     // id until the executor's `run_placed_gang` transfers it. A wait that
-    // returned on any claimant caught that pre-transfer state on a slower
-    // runner (CI run 35131688738: claimant == lane-1, 1.8 s in), so the
-    // predicate is the transfer itself; a placement that never transfers
+    // returned on any claimant would catch that pre-transfer state on a
+    // slower runner (claimant == lane-1), so the predicate is the transfer
+    // itself; a placement that never transfers
     // ends here as a timeout with the fleet's diagnostics.
     let submitter_id = instance_id_of_label(session, fleet.label(0)).await;
     let record = harness::await_job(
@@ -423,8 +421,7 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
     let lane3_id = instance_id_of_label(&session, fleet.label(2)).await;
     assert_ne!(
         claimant, lane1_id,
-        "the placed gang must never be bound back to the submitter's own executor (contract \
-         §9 B1)"
+        "the placed gang must never be bound back to the submitter's own executor"
     );
     assert!(
         claimant == lane2_id || claimant == lane3_id,
@@ -460,13 +457,13 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
         &mut fleet,
         &lane1_label,
         "run_placed_gang: submitter HandedOff",
-        "the HandedOff arm this unit's `tracing::info!` line names",
+        "the HandedOff arm's `tracing::info!` line",
     )
     .await;
 
-    // K4 (b5): the placed run's artifact bytes equal a SECOND fleet's
-    // wave-3-path run (no `[ballista]` at all — process 1 coordinates
-    // locally), same base model / config / device kind (CPU).
+    // The placed run's artifact bytes equal a SECOND fleet's unplaced run
+    // (no `[ballista]` at all — process 1 coordinates locally), same base
+    // model / config / device kind (CPU).
     let plain_result_root = backends.unique_result_root(&format!("{TEST}-plain"));
     let plain_source = harness::unique_source_name(&format!("{TEST}-plain"));
     harness::add_training_source(&session, &plain_source).await;
@@ -532,15 +529,15 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
         jammi_ai::fine_tune::worker::adapter_files_digest(plain_local.dir()).unwrap();
     assert_eq!(
         placed_digest, plain_digest,
-        "the placed run's adapter artifact must be byte-identical to the wave-3-path run's \
-         (K4, per device kind — both CPU)"
+        "the placed run's adapter artifact must be byte-identical to the unplaced run's \
+         (per device kind — both CPU)"
     );
 
     drop(fleet);
     drop(plain_fleet);
 }
 
-// ─── (a5) / half of (b6) ───────────────────────────────────────────────────
+// ─── a killed placed executor, then reclaim ────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_completes() {
@@ -552,17 +549,17 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
     let source = harness::unique_source_name(TEST);
     harness::add_training_source(&session, &source).await;
 
-    // The SAME 3-process fleet a4 uses (proven: lane-0 is the ONLY
+    // The SAME 3-process fleet the placed-gang test uses (lane-0 is the ONLY
     // `fine_tune`-kind claimant/submitter, deterministically placed onto
     // lane-1 or lane-2). A SECOND, independent `fine_tune`-kind bidder is
     // spawned LATE — only AFTER the first claim+placement has already
     // resolved — so it plays no part in that race and stays free the whole
-    // time. This two-step spawn is load-bearing, executed: a bidder present
-    // from t=0 raced lane-0 for the INITIAL claim and, when it won, ran the
-    // whole gang in-process (no scheduler role of its own installs a
+    // time. This two-step spawn is load-bearing: a bidder present from t=0
+    // races lane-0 for the INITIAL claim and, when it wins, runs the whole
+    // gang in-process (no scheduler role of its own installs a
     // `PlacedGangSubmitter` — `roles::host_scheduler`'s doc), never
-    // exercising the placed path a5 needs; a SECOND SCHEDULER able to place
-    // independently (a scheduler hosting no executor) reds a different way —
+    // exercising the placed path this test needs; a SECOND SCHEDULER able to place
+    // independently (a scheduler hosting no executor) fails a different way —
     // Ballista's OWN task binder gates on ITS OWN executor-heartbeat CACHE
     // (`ballista-scheduler-54.1.0/src/state/executor_manager.rs:117-121`'s
     // `get_alive_executors`), which a second scheduler never populates for
@@ -570,7 +567,7 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
     // State`'s own documented heartbeat-cache-staleness caveat) — observed
     // as "There are no alive executors to bind tasks" forever. The reclaimer
     // that actually works has NO ballista role of its own: on reclaiming it
-    // runs the recovered gang in-process (the wave-3 `Peer` path, dialing
+    // runs the recovered gang in-process (the unplaced `Peer` path, dialing
     // lane-0 as rank 1 — `Holder::Awaiting` admits a rank exactly like
     // `Free`, so lane-0's OWN still-blocked placed attempt never conflicts).
     let (mut fleet, job_id, expected_model, claimant) = submit_and_await_placed_claim(
@@ -616,7 +613,8 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
     let killed_label = harness::label_of(&session, &claimant).await;
 
     // Record the distinct `claimed_by` transitions we observe, polling every
-    // 300ms — the honest subset at this poll rate (contract §7 (a5)).
+    // 300ms — a subset of the true transitions: a faster flip between two
+    // polls is never observed.
     let mut observed: Vec<String> = vec![lane0_id.clone(), claimant.clone()];
     let mut killed = false;
     // The successor re-runs the whole job from scratch, so this wait is
@@ -672,7 +670,7 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
         "a survivor, never the killed executor, completed the job; observed: {observed:?}"
     );
     // The successor is either the late-joining reclaimer (running the
-    // recovered gang in-process, the wave-3 `Peer` path — it installs no
+    // recovered gang in-process, the unplaced `Peer` path — it installs no
     // `PlacedGangSubmitter` of its own) or lane-0 itself once its own
     // placed attempt's stream finally errors (Ballista's own heartbeat
     // timeout) and its NEXT poll re-claims the still-expired row — either
@@ -711,7 +709,7 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
     drop(fleet);
 }
 
-// ─── (b1) ───────────────────────────────────────────────────────────────
+// ─── a scheduler restart ─────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
@@ -732,20 +730,18 @@ async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
     let lane1_label = fleet.label(0).to_string();
 
     // SIGKILL and respawn the scheduler process (lane-1) at the SAME
-    // `scheduler_bind` port. `instance_id` (`instance_id`,
-    // crates/jammi-ai/src/session.rs:509) is minted at session
-    // construction, never externally supplied, so the replacement is a fresh
-    // instance — this oracle's own assertions below need only the OTHER
-    // executors' registrations and a NEW job's completion, which the
-    // shared catalog carries regardless (this unit's contract file states
-    // this deviation from a literal "same instance id" reading).
+    // `scheduler_bind` port. `instance_id` (`InferenceSession::instance_id`)
+    // is minted at session construction, never externally supplied, so the
+    // replacement is a fresh instance — the assertions below need only the
+    // OTHER executors' registrations and a NEW job's completion, which the
+    // shared catalog carries regardless of the replacement's id.
     fleet.kill9(&lane1_label);
     fleet.respawn(&backends, &result_root, &lane1_label);
 
     // Read back the two untouched executors' registrations, through the
     // harness session's OWN catalog — the same shared store the
-    // replacement scheduler itself reads (contract §7 (b1) offers this as
-    // an alternative to a `SchedulerGrpcClient` call).
+    // replacement scheduler itself reads, rather than a
+    // `SchedulerGrpcClient` call.
     let ok = harness::await_condition(Duration::from_secs(30), || {
         futures::executor::block_on(async {
             session
@@ -767,8 +763,8 @@ async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
     // The replacement's OWN gRPC listener needs a moment to bind — `respawn`
     // only waits out a port-reuse race, never the new process's own startup
     // (Postgres connect + migrate check + tonic bind). A raw TCP connect
-    // probe is the honest readiness check (a `submit_physical_plan` before
-    // this reds with `ConnectionRefused`, executed).
+    // probe is the readiness check (a `submit_physical_plan` before the
+    // listener binds fails with `ConnectionRefused`).
     let ready = harness::await_condition(Duration::from_secs(30), || {
         std::net::TcpStream::connect(format!("127.0.0.1:{scheduler_port}")).is_ok()
     })
@@ -808,9 +804,9 @@ async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
     // A raw TCP connect succeeding is not sufficient readiness — the
     // replacement's own tonic server can accept the TCP handshake into its
     // backlog moments before its gRPC service is actually registered and
-    // serving (executed: a bare readiness probe still saw one
+    // serving (a bare readiness probe can still be followed by one
     // `ConnectionRefused` from `submit_physical_plan` itself). Retry the
-    // real submission a few times with a short backoff, the honest
+    // real submission a few times with a short backoff, a bounded
     // "still starting up" tolerance — never silently swallowing a REAL
     // failure past this bounded window.
     let submit_deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -836,8 +832,8 @@ async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
             // executors hold a long-lived gRPC connection to the OLD
             // scheduler process and must independently notice it dropped
             // and reconnect to the replacement before a task can bind (the
-            // same executor-heartbeat-cache mechanism `(b2)`'s own doc
-            // names, `ballista-scheduler-54.1.0/src/state/executor_manager.
+            // same executor-heartbeat-cache mechanism the two-scheduler
+            // test's comment names, `ballista-scheduler-54.1.0/src/state/executor_manager.
             // rs:117-121`) — bounded by the SAME outer `submit_deadline`,
             // never an unbounded retry.
             Err(_) if std::time::Instant::now() < submit_deadline => continue,
@@ -866,7 +862,7 @@ async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
     drop(fleet);
 }
 
-// ─── (b2) ───────────────────────────────────────────────────────────────
+// ─── two schedulers over one catalog ─────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
@@ -881,13 +877,14 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
     // dynamic re-read of another process's later write (unlike a plan
     // submitted whole via `submit_physical_plan`, whose scan already
     // carries concrete file paths — no source-name lookup on the
-    // executor at all). Executed: registering AFTER `Fleet::spawn` reds
-    // with "Source '…' not found" on the claiming executor.
+    // executor at all). Registering AFTER `Fleet::spawn` fails with
+    // "Source '…' not found" on the claiming executor.
     let source = harness::unique_source_name(TEST);
     harness::add_training_source(&session, &source).await;
 
     // Scheduler 4 hosts its OWN local executor too (`SchedulerAndExecutor`).
-    // A scheduler 4 hosting no executor of its own reds every submission with Ballista's OWN "There are no
+    // A scheduler 4 hosting no executor of its own fails every submission
+    // with Ballista's OWN "There are no
     // alive executors to bind tasks" (`ballista-scheduler-54.1.0/src/state/
     // executor_manager.rs:117-121`'s `get_alive_executors`, gated on THIS
     // scheduler's own executor-HEARTBEAT cache — never the raw
@@ -896,12 +893,12 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
     // (scheduler 1), so scheduler 4 never learns they are alive, no
     // matter how long a plan submitted to it waits (this is the concrete
     // shape of `CatalogClusterState`'s own documented heartbeat-cache-
-    // staleness caveat, contract §3: "a standby scheduler's liveness view
-    // of an executor it does not itself serve is only as fresh as its
-    // last init"). Scheduler 4 therefore serves its OWN job on its OWN
-    // local executor — still "two schedulers over one shared catalog,
-    // each independently able to serve a job" (contract §7 (b2)), never
-    // a claim that Ballista binds a task ACROSS two live schedulers.
+    // staleness caveat: a standby scheduler's liveness view of an executor
+    // it does not itself serve is only as fresh as its last init).
+    // Scheduler 4 therefore serves its OWN job on its OWN local executor —
+    // two schedulers over one shared catalog, each independently able to
+    // serve a job, never a claim that Ballista binds a task ACROSS two live
+    // schedulers.
     let (mut specs, scheduler1_port) = standard_fleet_specs();
     let scheduler4_port = harness::free_port();
     let scheduler4_idx = specs.len();
@@ -1020,7 +1017,7 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
     drop(fleet);
 }
 
-// ─── (b3) ───────────────────────────────────────────────────────────────
+// ─── device-kind refusal ─────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
@@ -1039,7 +1036,7 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
     .await;
     let scheduler_url = format!("http://127.0.0.1:{scheduler_port}");
 
-    // KIND MATCH (LANE pressure-round correction): a GangExec's required
+    // KIND MATCH: a GangExec's required
     // kind is its OWN descriptor's stamp, never "is this node type
     // GPU-shaped" — a dummy descriptor (never actually run) stamped `Cuda`
     // is refused on this all-CPU cluster (no registered executor lists a
@@ -1054,11 +1051,10 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
         device_kind: jammi_db::store::manifest::ComputeDeviceKind::Cuda,
     }));
     // The device check is a fast, purely client-side catalog read before
-    // any RPC (contract §3/§9): a 20s timeout is generous headroom, never
-    // load-bearing for a passing run, but turns an unexpected fall-through
-    // to a real submission (this crate's own regression class: see the
-    // codec's `try_encode_udf`/`try_decode_udf` fix this unit's pass added)
-    // into a fast, diagnosable failure instead of the test hanging.
+    // any RPC: a 20s timeout is generous headroom, never load-bearing for a
+    // passing run, but turns an unexpected fall-through to a real submission
+    // (e.g. a plan the codec's `try_encode_udf`/`try_decode_udf` cannot
+    // carry) into a fast, diagnosable failure instead of the test hanging.
     let result = tokio::time::timeout(
         Duration::from_secs(20),
         submit_physical_plan(&session, &scheduler_url, gang_plan),
@@ -1087,7 +1083,7 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
 
     // A CPU InferenceExec plan (the harness session's own device kind) is
     // accepted and actually runs.
-    let source_name = harness::unique_source_name("two_files_b3");
+    let source_name = harness::unique_source_name("two_files_device_kind");
     let url = harness::write_two_file_source(dir.path());
     session
         .add_source(
@@ -1124,7 +1120,7 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
     drop(fleet);
 }
 
-// ─── (b4) ───────────────────────────────────────────────────────────────
+// ─── device inventory ───────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn list_workers_and_compute_executor_devices_report_registered_devices() {

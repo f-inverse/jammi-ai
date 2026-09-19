@@ -1137,7 +1137,7 @@ async fn idle_drain_wall_clock(cfg: JammiConfig) -> (Duration, ShutdownOutcome) 
 /// time plus under a second: the catalog pool close sweeps the connection
 /// whose return lands during the close instead of waiting out its ceiling
 /// on it. Exactly one return is in flight at the close here (the worker
-/// join's `workers` row delete), so the single-pass barrier leaked it on
+/// join's `workers` row delete), which a single-pass barrier would leak on
 /// every run. Runs against the live Postgres at `JAMMI_TEST_PG_URL`.
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

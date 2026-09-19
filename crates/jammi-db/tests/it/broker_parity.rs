@@ -1,4 +1,4 @@
-//! Cross-driver parity suite (contract item 2).
+//! Cross-driver trigger-broker parity suite.
 //!
 //! Parameterised over [`Arm::InMemory`] (always), [`Arm::Postgres`]
 //! (`live-postgres-tests`, against `JAMMI_TEST_PG_URL`), and
@@ -1219,13 +1219,12 @@ async fn postgres_suppressed_notify_recovers_via_idle_tick() {
 /// subscribe time (this client has already consumed every row below `N`)
 /// must still never deliver an engine offset below `N`, even after this
 /// subscriber's own broadcast receiver lags and self-heals via its own
-/// chunked replay. Regression for #490: `last_yielded` used to seed as
-/// `None` whenever the replay window was empty (`from_offset` was only
-/// consulted to compute the replay window itself, never carried forward as
-/// a floor), so a lag taken before this subscriber ever yielded anything
-/// reseeded its own lag-replay cursor from `-1` — the ENTIRE backing table
-/// — and the live-recv admission check (`last_yielded.is_none_or(...)`)
-/// admitted any offset at all once that reseed replayed past `N`.
+/// chunked replay. `from_offset` therefore seeds `last_yielded` as a floor
+/// even when the replay window is empty: seeded as `None`, a lag taken before
+/// this subscriber ever yielded anything would reseed its lag-replay cursor
+/// from `-1` — the ENTIRE backing table — and the live-recv admission check
+/// (`last_yielded.is_none_or(...)`) would admit any offset at all once that
+/// reseed replayed past `N`.
 #[test_case(Arm::InMemory ; "in_memory")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[cfg_attr(feature = "live-broker-tests", test_case(Arm::JetStream ; "jetstream"))]
@@ -1247,8 +1246,7 @@ async fn from_offset_lower_bound_holds_after_lag_replay(arm: Arm) {
 
     // Resume strictly after it: "deliver me offset >= 10". The replay
     // window for this call is empty (nothing at or above offset 10 exists
-    // yet), so `last_yielded` has nothing to seed from except the floor
-    // this fix introduces.
+    // yet), so `last_yielded` has nothing to seed from except the floor.
     let mut sub = h
         .subscriber
         .subscribe(
@@ -1262,8 +1260,7 @@ async fn from_offset_lower_bound_holds_after_lag_replay(arm: Arm) {
     // Fan out more than the tail's broadcast capacity (256) WITHOUT polling
     // `sub`, so its own receiver overflows and its next `recv()` observes
     // `RecvError::Lagged`, forcing this subscriber's own lag-replay path —
-    // the SAME path that used to reseed from `-1` when `last_yielded` was
-    // `None`.
+    // the path that would reseed from `-1` if `last_yielded` were `None`.
     for i in 100..500i64 {
         h.publisher
             .publish_scoped(&topic, None, batch_of(&[i]))

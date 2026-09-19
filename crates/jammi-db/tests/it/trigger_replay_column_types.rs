@@ -1,25 +1,17 @@
-//! Escape row esc-100-trigger-replay-folds-declared-column-types:
-//! **`register_topic` accepts column types publish/replay cannot handle**.
+//! Every column type `register_topic` accepts survives publish and replay.
 //!
-//! Symptom: `topic_repo.rs` accepts 13 Arrow column types (Boolean,
-//! Int8/16/32/64, UInt8/16/32/64, Float32/64, Utf8, Binary), but before this
-//! fix the backing-table REPLAY path (`source/mutable.rs`'s
-//! `fetch_scan_after_batch`) folded every integer width into `Int64Array` and
-//! every non-numeric/non-boolean/non-text type (including `Binary`) into
-//! `StringArray`. `Subscriber::group_replay_batches` then slices those
-//! wrongly-typed columns and calls `RecordBatch::try_new` against the
-//! topic's DECLARED schema (`Int32`, `Binary`, …) -- a hard schema/array
-//! `DataType` mismatch that `try_new` refuses, independent of which backend
-//! is under test (SQLite is enough to reproduce it; no Postgres round-trip
-//! required).
+//! `topic_repo.rs` accepts 13 Arrow column types (Boolean, Int8/16/32/64,
+//! UInt8/16/32/64, Float32/64, Utf8, Binary). The backing-table replay path
+//! (`source/mutable.rs`'s `fetch_scan_after_batch`, and `provider.rs`'s general
+//! mutable-table scan) must decode each width-faithfully into the EXACT Arrow
+//! array the schema declares: `Subscriber::group_replay_batches` rebuilds the
+//! batch with `RecordBatch::try_new` against the topic's DECLARED schema, which
+//! refuses any array whose `DataType` differs (an `Int64Array` for an `Int32`
+//! column, a `StringArray` for a `Binary` one). The fault is backend-independent,
+//! so SQLite is enough to exercise it.
 //!
-//! Control: an `Int64`/`Utf8`-only topic (the two types the fold happened to
-//! decode into) round-trips fine -- already covered by every other test in
+//! Control: an `Int64`/`Utf8`-only topic round-trips in every other test in
 //! `trigger.rs`.
-//!
-//! Fix (this commit): `fetch_scan_after_batch` (and `provider.rs`'s general
-//! mutable-table scan) decode width-faithfully per `DataType` and build the
-//! EXACT Arrow array the schema declares.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -87,7 +79,7 @@ async fn every_accepted_type_round_trips_through_replay() {
     // pins the actual catalog round-trip, not just the in-memory shape.
     let topic = TopicDefinition {
         id: TopicId::new(),
-        name: "esc_100.every_type".to_string(),
+        name: "trigger.every_type".to_string(),
         schema: topic_schema(),
         tenant: None,
         broker_metadata: BTreeMap::new(),
@@ -214,7 +206,7 @@ async fn uint64_above_i64_max_is_refused_at_publish() {
     )]));
     let topic = TopicDefinition {
         id: TopicId::new(),
-        name: "esc_100.uint64_overflow".to_string(),
+        name: "trigger.uint64_overflow".to_string(),
         schema: Arc::clone(&schema),
         tenant: None,
         broker_metadata: BTreeMap::new(),

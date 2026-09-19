@@ -4,8 +4,8 @@
 //! to in-process execution, and `stop()` closes both ports within 5s.
 //!
 //! Shape mirrors `ballista-54.1.0/tests/physical_plan_submission.rs`'s
-//! `should_execute_submitted_physical_plan_across_shuffle_stages` (the
-//! reference client usage the brief names), substituting jammi's own
+//! `should_execute_submitted_physical_plan_across_shuffle_stages` (Ballista's
+//! reference client usage), substituting jammi's own
 //! `host_scheduler`/`host_executor`/`submit_physical_plan` for that test's
 //! `setup_test_cluster`/raw `execute_physical_plan` call.
 

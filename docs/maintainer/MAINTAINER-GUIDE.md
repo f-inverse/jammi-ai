@@ -67,19 +67,20 @@ edges, by design — not a discrepancy.
 <!-- BEGIN GENERATED: dep-dag -->
 ```
 jammi-admin -> jammi-db, jammi-wire
-jammi-ai -> jammi-ai, jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics, jammi-test-utils, jammi-wire
+jammi-ai -> jammi-ai, jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics, jammi-test-resources, jammi-test-utils, jammi-wire
 jammi-ballista -> jammi-ai, jammi-db, jammi-test-utils, jammi-wire
-jammi-bench -> jammi-ai, jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics
+jammi-bench -> jammi-ai, jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics, jammi-test-resources
 jammi-cli -> jammi-admin, jammi-db
 jammi-client -> jammi-admin, jammi-db, jammi-wire
-jammi-db -> jammi-numerics, jammi-test-utils
-jammi-encoders -> jammi-kernels, jammi-lora, jammi-numerics
-jammi-kernels
-jammi-lora -> jammi-kernels, jammi-numerics
+jammi-db -> jammi-numerics, jammi-test-resources, jammi-test-utils
+jammi-encoders -> jammi-kernels, jammi-lora, jammi-numerics, jammi-test-resources
+jammi-kernels -> jammi-test-resources
+jammi-lora -> jammi-kernels, jammi-numerics, jammi-test-resources
 jammi-numerics
 jammi-python -> jammi-ai, jammi-db
-jammi-server -> jammi-admin, jammi-ai, jammi-ballista, jammi-client, jammi-db, jammi-numerics, jammi-test-utils, jammi-wire
-jammi-test-utils -> jammi-db
+jammi-server -> jammi-admin, jammi-ai, jammi-ballista, jammi-client, jammi-db, jammi-numerics, jammi-test-resources, jammi-test-utils, jammi-wire
+jammi-test-resources
+jammi-test-utils -> jammi-db, jammi-test-resources
 jammi-wire -> jammi-db, jammi-lora, jammi-numerics
 probed-ops-index -> jammi-kernels
 symbol-index

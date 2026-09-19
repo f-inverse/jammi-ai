@@ -523,6 +523,13 @@ def _synth_log(lines: list[str]) -> str:
 _SCRIPT_LAYOUT = [(g, t) for g, t in prove_surface.script_layout() if g != "device"]
 
 
+def _groups_before(stop: str) -> list[str]:
+    """The prove script's groups that run before `stop`, in run order -- what
+    a leg that ended at `stop` had already closed."""
+    names = [g for g, _ in _SCRIPT_LAYOUT]
+    return names[: names.index(stop)]
+
+
 def _healthy_lines() -> list[str]:
     manifest = prove_surface.load_manifest()
     lines = ["##[group]device", "name, compute_cap, driver_version", "NVIDIA A100 80GB PCIe, 8.0, 570.195.03", "CUDA_COMPUTE_CAP=80", "##[endgroup]"]
@@ -590,7 +597,8 @@ def _healthy_synth_log_with_runner_preamble() -> str:
 def _cut_synth_log() -> str:
     lines = ["##[group]device", "name, compute_cap, driver_version", "NVIDIA A100 80GB PCIe, 8.0, 570.195.03", "CUDA_COMPUTE_CAP=80", "##[endgroup]"]
     lines += ["PROVE_SHA=" + "b" * 40]
-    for name in ("capability-surface-build", "capability-surface-proof", "served-client-server-proof"):
+    closed = _groups_before("engine-core-sweep")
+    for name in closed:
         lines.append(f"##[group]{name}")
         lines.append(f"PROVE_GROUP_RC name={name} rc=0")
         lines.append("##[endgroup]")
@@ -601,7 +609,8 @@ def _cut_synth_log() -> str:
     # output on a genuine ssh-status-124 cut with no PROVE_EXIT reached) --
     # without this evidence in the log, `budget-cut` cannot be auto-derived
     # at all (the producer refuses to guess).
-    lines.append('=== GPU prove: BUDGET (RP_TIMEOUT=6000s) cut group "engine-core-sweep"; groups: [capability-surface-build:0,capability-surface-proof:0,served-client-server-proof:0] ===')
+    rcs = ",".join(f"{name}:0" for name in closed)
+    lines.append(f'=== GPU prove: BUDGET (RP_TIMEOUT=6000s) cut group "engine-core-sweep"; groups: [{rcs}] ===')
     return _synth_log(lines)
 
 
@@ -623,7 +632,7 @@ def _log_incomplete_synth_log() -> str:
     # genuine outcome to guess at.
     lines = ["##[group]device", "name, compute_cap, driver_version", "NVIDIA A100 80GB PCIe, 8.0, 570.195.03", "CUDA_COMPUTE_CAP=80", "##[endgroup]"]
     lines += ["PROVE_SHA=" + "d" * 40]
-    for name in ("capability-surface-build", "capability-surface-proof", "served-client-server-proof", "engine-core-sweep", "kernels-default"):
+    for name in _groups_before("kernels-cuda"):
         lines.append(f"##[group]{name}")
         lines.append(f"PROVE_GROUP_RC name={name} rc=0")
         lines.append("##[endgroup]")

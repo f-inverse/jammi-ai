@@ -154,8 +154,9 @@ def remote():
 # the rail
 # --------------------------------------------------------------------------- #
 
-# Process-wide baseline for the `pytest_sessionfinish` sweep below: every handle `jammi.observe()` reports registered ANYWHERE
-# in this process during the run, and every handle it reports unregistered.
+# Process-wide baseline for the `pytest_sessionfinish` sweep below: every handle
+# `jammi.observe()` reports registered ANYWHERE in this process during the run,
+# and every handle it reports unregistered.
 # Module globals, not fixture state — `pytest_sessionstart` fires before
 # `pytest_collection`, so subscribing there sees even a module-import-time
 # `jammi.connect(...)` (a construction the per-test `_no_leaked_sessions`

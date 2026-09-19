@@ -75,8 +75,9 @@ import jammi_cookbook  # noqa: F401  # applies the determinism env on import
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "channels"
 
 # The four headline failure modes of the channel registry and the gRPC status
-# code each maps to under the typed taxonomy (never Internal-for-everything). The emit asserts the measured wire code equals the
-# expected one live; a deviation is recorded, never silently rewritten.
+# code each maps to under the typed taxonomy (never Internal-for-everything). The
+# emit asserts the measured wire code equals the expected one live; a deviation
+# is recorded, never silently rewritten.
 _EXPECTED_WIRE = {
     "duplicate": "ALREADY_EXISTS",
     "unknown": "NOT_FOUND",

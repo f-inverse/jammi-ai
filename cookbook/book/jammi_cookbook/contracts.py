@@ -733,8 +733,8 @@ ARTIFACTS: dict[str, Artifact] = {
         kind="model_id",
         filename="channels_taxonomy.json",
         produced_by="channels",
-        note="The provenance + parity record for the channel error taxonomy: the failure modes ran on "
-        "BOTH the embedded engine and a live remote grpc:// jammi-server; the wire "
+        note="The provenance + parity record for the channel error taxonomy: the failure modes "
+        "ran on BOTH the embedded engine and a live remote grpc:// jammi-server; the wire "
         "StatusCode was measured on the grpc:// transport (where the codes exist), the "
         "embedded normalized error CLASS the cross-transport companion, asserted remote "
         "== embedded class for every mode. Records the measured (mode → wire code) "

@@ -383,8 +383,8 @@ impl TrainingSetSpec<'_> {
             .map_err(manifest_to_jammi)
     }
 
-    /// Reject a projection that cannot carry a total order (family D:
-    /// validate at the edge, before anything is planned).
+    /// Reject a projection that cannot carry a total order (validated at
+    /// the edge, before anything is planned).
     ///
     /// An empty projection has no order key at all; a blank name resolves to
     /// nothing; a repeated name projects two identically-named fields, which

@@ -1188,7 +1188,7 @@ impl GangService for GangServer {
 mod tests {
     use super::*;
 
-    /// i2' at the classification: the three re-verification ends are
+    /// The re-verification classification: the three re-verification ends are
     /// pairwise distinct on the wire reason, on their scope, and on the
     /// count rule — never two ends that differ only in name.
     #[test]

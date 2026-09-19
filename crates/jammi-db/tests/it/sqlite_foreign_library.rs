@@ -73,13 +73,13 @@ use jammi_db::catalog::Catalog;
 use jammi_test_utils::child::{Capture, Completeness, DrainedChild, Epoch};
 
 /// Env var carrying the child's role. Absent ⇒ this process is the parent.
-const ROLE_ENV: &str = "JAMMI_ESC073_ROLE";
+const ROLE_ENV: &str = "JAMMI_FOREIGN_SQLITE_ROLE";
 
 /// Env var carrying the exact `--exact` path this process was invoked with,
 /// so [`Role::Grandchild`]'s body can reuse it when spawning its own
 /// grandchild — the parent's `run_child` sets this on every spawn, unused by
 /// every role except `Grandchild`.
-const SELF_EXACT_ENV: &str = "JAMMI_ESC073_SELF_EXACT";
+const SELF_EXACT_ENV: &str = "JAMMI_FOREIGN_SQLITE_SELF_EXACT";
 
 /// The [`ROLE_ENV`] value [`Role::Grandchild`]'s body spawns its OWN child
 /// with (the "grandchild-of-grandchild") — deliberately NOT a [`Role`]
@@ -99,7 +99,7 @@ const GRANDCHILD_CHILD_ROLE_VALUE: &str = "sleeper";
 /// [`run_grandchild_of_grandchild`] runs — set by [`run_grandchild`] and read
 /// by [`Role::Grandchild`]'s own body (which forwards it onto its spawn) and
 /// then by the grandchild-of-grandchild itself.
-const GRANDCHILD_MODE_ENV: &str = "JAMMI_ESC073_GRANDCHILD_MODE";
+const GRANDCHILD_MODE_ENV: &str = "JAMMI_FOREIGN_SQLITE_GRANDCHILD_MODE";
 
 /// [`GRANDCHILD_MODE_ENV`] value: a continuous writer, one line every 10 ms
 /// for 3 s. The reader threads in `jammi_test_utils::child` are poll-based
@@ -138,7 +138,7 @@ const GRANDCHILD_SENTINEL: &str = "[child] GRANDCHILD-DONE";
 /// the same shape [`GRANDCHILD_MODE_ENV`] already uses, so the
 /// retention-cap oracle can flood well past `DEFAULT_HEAD_CAP +
 /// DEFAULT_TAIL_CAP` (8 MiB) without a new role.
-const FLOOD_LINES_ENV: &str = "JAMMI_ESC073_FLOOD_LINES";
+const FLOOD_LINES_ENV: &str = "JAMMI_FOREIGN_SQLITE_FLOOD_LINES";
 
 /// Attempt budget per arm. The parent stops at the first reproduction, so a
 /// deterministic mechanism costs one attempt and a rare one still gets 40.
@@ -255,11 +255,10 @@ impl Role {
         }
     }
 
-    /// Parses a role env value, panicking on anything unrecognized (the
-    /// seam's own `dispatch_child` sets this precedent, `:420-433`): an
-    /// unknown role text is a harness bug — a typo in a role literal, or a
-    /// stale value from an old harness — not a "fall through to the parent"
-    /// case. Call sites read the env var first and only call `parse` when it
+    /// Parses a role env value, panicking on anything unrecognized (as
+    /// `sqlite_single_process_seam.rs`'s `dispatch_child` does): an unknown
+    /// role text is a harness bug — a typo in a role literal — not a "fall
+    /// through to the parent" case. Call sites read the env var first and only call `parse` when it
     /// is present (`.ok().map(|r| Role::parse(&r))`), so an ABSENT env var
     /// still takes the parent path unchanged. The grandchild's own sleeper
     /// sub-mode is checked (and dispatched) BEFORE this ever runs — see
@@ -642,12 +641,12 @@ fn seed_probe(rt: &tokio::runtime::Runtime, catalog: &Catalog) {
     rt.block_on(backend.transaction(TxOptions::default(), |tx| {
         Box::pin(async move {
             tx.execute(
-                "CREATE TABLE IF NOT EXISTS esc073_probe (id INTEGER PRIMARY KEY, v TEXT)",
+                "CREATE TABLE IF NOT EXISTS foreign_probe (id INTEGER PRIMARY KEY, v TEXT)",
                 &[],
             )
             .await?;
             tx.execute(
-                "INSERT OR REPLACE INTO esc073_probe (id, v) VALUES (1, 'seed')",
+                "INSERT OR REPLACE INTO foreign_probe (id, v) VALUES (1, 'seed')",
                 &[],
             )
             .await?;
@@ -668,7 +667,7 @@ fn engine_write(
     rt.block_on(backend.transaction(TxOptions::default(), move |tx| {
         Box::pin(async move {
             tx.execute(
-                "UPDATE esc073_probe SET v = $1 WHERE id = 1",
+                "UPDATE foreign_probe SET v = $1 WHERE id = 1",
                 &[SqlValue::TextOwned(value)],
             )
             .await?;
@@ -689,7 +688,7 @@ fn engine_read(rt: &tokio::runtime::Runtime, catalog: &Catalog) -> Result<Option
         },
         |tx| {
             Box::pin(async move {
-                tx.query_opt("SELECT v FROM esc073_probe WHERE id = 1", &[], |r| {
+                tx.query_opt("SELECT v FROM foreign_probe WHERE id = 1", &[], |r| {
                     r.get::<String>("v")
                 })
                 .await
@@ -704,8 +703,7 @@ fn engine_read(rt: &tokio::runtime::Runtime, catalog: &Catalog) -> Result<Option
 /// immediately before `backend.transaction(...)` and cleared after it
 /// returns. The main thread reads both, right before joining the task, to
 /// name a stall inside a synchronous foreign C call without the load task
-/// itself printing anything (see the "Phase markers" section of the W2
-/// design: load tasks emit NO new lines).
+/// itself printing anything (load tasks emit no phase markers).
 struct LoadTaskHandle {
     join: tokio::task::JoinHandle<()>,
     iterations: Arc<AtomicU64>,
@@ -740,13 +738,13 @@ fn spawn_engine_load(
                             Box::pin(async move {
                                 let _ = tx
                                     .query_opt(
-                                        "SELECT v FROM esc073_probe WHERE id = 1",
+                                        "SELECT v FROM foreign_probe WHERE id = 1",
                                         &[],
                                         |r| r.get::<String>("v"),
                                     )
                                     .await?;
                                 tx.execute(
-                                    "UPDATE esc073_probe SET v = $1 WHERE id = 1",
+                                    "UPDATE foreign_probe SET v = $1 WHERE id = 1",
                                     &[SqlValue::TextOwned(value)],
                                 )
                                 .await?;
@@ -1019,7 +1017,7 @@ fn child_main(role: Role) -> ! {
             // has to observe.
             let keeper = if role == Role::Keeper {
                 let k = lib.open(&db_path).expect("keeper foreign connection");
-                let (rc, msg) = k.exec("SELECT count(*) FROM esc073_probe");
+                let (rc, msg) = k.exec("SELECT count(*) FROM foreign_probe");
                 if rc != 0 {
                     tripped(format!(
                         "the foreign instance's FIRST read could not see the table the engine \
@@ -1049,7 +1047,7 @@ fn child_main(role: Role) -> ! {
                 };
                 let _ = conn.exec("PRAGMA busy_timeout = 5000");
                 let (rc, msg) = conn.exec(&format!(
-                    "UPDATE esc073_probe SET v = 'foreign-{i}' WHERE id = 1"
+                    "UPDATE foreign_probe SET v = 'foreign-{i}' WHERE id = 1"
                 ));
                 if rc != 0 {
                     refusals += 1;
@@ -1091,7 +1089,7 @@ fn child_main(role: Role) -> ! {
                 };
                 let _ = conn.exec("PRAGMA busy_timeout = 5000");
                 let (rc, msg) = conn.exec(&format!(
-                    "UPDATE esc073_probe SET v = '{foreign_value}' \
+                    "UPDATE foreign_probe SET v = '{foreign_value}' \
                      WHERE id = 1 AND v = '{engine_value}'"
                 ));
                 if rc != 0 {
@@ -1154,7 +1152,7 @@ fn child_main(role: Role) -> ! {
                 };
                 eprintln!("[child] phase: churn {i} write");
                 let (rc, msg) = conn.exec(&format!(
-                    "UPDATE esc073_probe SET v = 'foreign-churn-{i}' WHERE id = 1"
+                    "UPDATE foreign_probe SET v = 'foreign-churn-{i}' WHERE id = 1"
                 ));
                 if rc != 0 {
                     refusals += 1;
@@ -1170,7 +1168,7 @@ fn child_main(role: Role) -> ! {
                     );
                 }
                 eprintln!("[child] phase: churn {i} read");
-                let (rc, msg) = conn.exec("SELECT count(*) FROM esc073_probe");
+                let (rc, msg) = conn.exec("SELECT count(*) FROM foreign_probe");
                 if rc != 0 {
                     refusals += 1;
                     eprintln!("[child] foreign read refused rc={rc} msg={msg:?} (acceptable)");
@@ -1205,15 +1203,11 @@ fn child_main(role: Role) -> ! {
         );
         if let Err(join_err) = rt.block_on(task.join) {
             // A panicked load task must fail the attempt, not vanish behind
-            // a clean-looking exit 0: route it through the EXISTING
-            // `EXIT_TRIPPED`/`Attempt::Tripped` arm (no new `Attempt`
-            // variant) by printing and exiting BEFORE the terminal line is
-            // ever reached. `terminus_satisfied`'s `EngineArm` check only
-            // requires the terminal line's presence, so silently dropping
-            // this `JoinError` (as before) would leave `Attempt::Survived`
-            // even though a background worker crashed — this line is what
-            // the parent's `has_tripped_line`/`classify` and
-            // `Summary::is_clean()` already score as a failure.
+            // a clean-looking exit 0: `terminus_satisfied`'s `EngineArm`
+            // check only requires the terminal line's presence, so a dropped
+            // `JoinError` would score `Attempt::Survived`. Exiting through
+            // `EXIT_TRIPPED` BEFORE the terminal line makes the parent's
+            // `classify` and `Summary::is_clean()` score it as a failure.
             tripped(format!("load task {n} panicked: {join_err}"));
         }
     }
@@ -1414,12 +1408,11 @@ fn incompleteness_reason(cap: &Capture) -> Option<String> {
 /// - a signal death (`status.signal()`) → [`Attempt::Signal`];
 /// - `cap.hung` → [`Attempt::Hung`].
 fn classify(cap: &Capture, role: Role) -> Attempt {
-    // `hung` is now `true` iff `wait_bounded` issued a `kill()` and the
-    // reaped status is a signal death or a reap give-up — a genuine
-    // self-inflicted crash (a signal death `wait_bounded` never killed for)
-    // is `hung == false`, and falls through to the `status.signal()` check
-    // below unaffected: this ordering (hung, then signal) already routes a
-    // self-signalled child to `Attempt::Signal`, not `Attempt::Hung`.
+    // `hung` is `true` iff `wait_bounded` issued a `kill()` and the reaped
+    // status is a signal death or a reap give-up. A self-inflicted crash (a
+    // signal death `wait_bounded` never killed for) is `hung == false` and
+    // falls through to the `status.signal()` check, so this ordering (hung,
+    // then signal) routes it to `Attempt::Signal`, not `Attempt::Hung`.
     if cap.hung {
         return Attempt::Hung;
     }
@@ -1505,10 +1498,10 @@ impl Summary {
         self.signals.is_empty() && self.tripped == 0 && self.stale == 0 && self.corrupt == 0
     }
 
-    /// The contract this row actually carries for an out-of-contract topology:
-    /// no process-fatal signal, and — post-seam — no damaged database file
-    /// either. A typed error or a stale read is the acceptable residual and is
-    /// recorded, not failed.
+    /// What the engine guarantees for this out-of-contract topology: no
+    /// process-fatal signal and, with the `unix-excl` seam in place, no damaged
+    /// database file. A typed error or a stale read is the acceptable residual
+    /// and is recorded, not failed.
     fn is_signal_free_and_uncorrupted(&self) -> bool {
         self.signals.is_empty() && self.corrupt == 0
     }
@@ -1578,8 +1571,8 @@ fn run_flood(test_name: &str, ceiling: Duration, lines: u32) -> (Attempt, Captur
     (attempt, cap)
 }
 
-/// Render both of a [`Capture`]'s streams (stdout then stderr, matching the
-/// pre-drain harness's own `log` shape) for a panic/failure message. Prefers
+/// Render both of a [`Capture`]'s streams (stdout then stderr) for a
+/// panic/failure message. Prefers
 /// `Capture::render_stdout`/`render_stderr` over the free `render` function:
 /// they always use the head-retention cap the capture was actually built
 /// with, so they cannot be called with a mismatched cap.
@@ -1758,8 +1751,7 @@ fn drive_with(role: Role, test_name: &str, stop_at_first_failure: bool) -> Summa
 /// fatal signal is not.
 #[test]
 fn foreign_library_write_cycle_never_kills_the_process() {
-    let name =
-        "esc_073_foreign_sqlite_library::foreign_library_write_cycle_never_kills_the_process";
+    let name = "sqlite_foreign_library::foreign_library_write_cycle_never_kills_the_process";
     dispatch_if_child();
     let s = drive(Role::Collide, name);
     assert!(
@@ -1782,8 +1774,7 @@ fn foreign_library_write_cycle_never_kills_the_process() {
 /// incompatibility instead.
 #[test]
 fn keeper_connection_suppresses_the_close_time_checkpoint() {
-    let name =
-        "esc_073_foreign_sqlite_library::keeper_connection_suppresses_the_close_time_checkpoint";
+    let name = "sqlite_foreign_library::keeper_connection_suppresses_the_close_time_checkpoint";
     dispatch_if_child();
     let s = drive(Role::Keeper, name);
     assert!(
@@ -1808,7 +1799,7 @@ fn keeper_connection_suppresses_the_close_time_checkpoint() {
 /// hang.
 #[test]
 fn engine_pool_churn_under_a_live_foreign_connection_never_kills_the_process() {
-    let name = "esc_073_foreign_sqlite_library::\
+    let name = "sqlite_foreign_library::\
                 engine_pool_churn_under_a_live_foreign_connection_never_kills_the_process";
     dispatch_if_child();
     let s = drive(Role::EngineChurn, name);
@@ -1827,7 +1818,7 @@ fn engine_pool_churn_under_a_live_foreign_connection_never_kills_the_process() {
 /// looks for what the other just committed.
 ///
 /// This is the arm that connects this file to
-/// `esc_071_cross_session_visibility.rs`: a lone foreign open/write/close
+/// `sqlite_cross_session_visibility.rs`: a lone foreign open/write/close
 /// makes a committed value invisible with no race in sight, so a
 /// read-visibility lag seen from Python is a property of the
 /// two-library-instances-one-file topology, not of engine pooling.
@@ -1852,7 +1843,7 @@ fn engine_pool_churn_under_a_live_foreign_connection_never_kills_the_process() {
 /// driven (not stopped at the first hit) so the census is a rate.
 #[test]
 fn the_stale_read_topology_neither_signals_nor_corrupts_the_file() {
-    let name = "esc_073_foreign_sqlite_library::\
+    let name = "sqlite_foreign_library::\
                 the_stale_read_topology_neither_signals_nor_corrupts_the_file";
     dispatch_if_child();
     let s = drive_all(Role::StaleRead, name);
@@ -1910,7 +1901,7 @@ fn role_parse_panics_on_unrecognized_text() {
 /// test in this file, so a future refactor that changes which test name is
 /// reused cannot silently drop the guard.
 const GUARD_TEST: &str =
-    "esc_073_foreign_sqlite_library::foreign_library_write_cycle_never_kills_the_process";
+    "sqlite_foreign_library::foreign_library_write_cycle_never_kills_the_process";
 
 /// [`Role::Flood`] must be classified `Survived`, with every one of its 4 MiB
 /// of flood bytes retained (asserted on the RAW `Capture::stderr`, never the
@@ -2064,8 +2055,8 @@ fn wedge_role_is_hung_with_its_last_phase_marker() {
 /// GRANDCHILD_SENTINEL` regardless of how many of the 300 repeats got
 /// captured before the settle gave up (terminus-satisfied). That combination
 /// — untrustworthy AND terminus-satisfied at once — is deliberate and
-/// load-bearing: a distinct one-off "heartbeat" line there (an earlier draft
-/// of this test used one) would leave the terminus permanently unsatisfied,
+/// load-bearing: a distinct one-off "heartbeat" line there would leave the
+/// terminus permanently unsatisfied,
 /// and a `classify` that checked terminus BEFORE the trust gate would still
 /// (coincidentally) return `Incomplete` via its terminus-failed fallback
 /// branch — the two orderings would be indistinguishable to this test, an

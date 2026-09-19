@@ -335,7 +335,7 @@ async fn check_body_at_exactly_the_cap_never_claims_truncation() {
     );
     // The early-break cap logic still fires at exactly the cap (it cannot
     // cheaply tell "ended here" from "more was coming"), so the marker is
-    // still appended — the fix is the WORDING, which must stay true either
+    // still appended — what matters is the WORDING, which must stay true either
     // way: "capped", never "truncated".
     assert!(
         err.contains(&format!(

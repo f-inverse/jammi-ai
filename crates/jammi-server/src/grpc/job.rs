@@ -211,7 +211,7 @@ impl JobService for JobServer {
             let mut record = first;
             loop {
                 // Derived from `JobStatus::is_terminal` (the ONE terminality
-                // predicate, `status.rs:70-72`) via a round-trip parse,
+                // predicate) via a round-trip parse,
                 // rather than a per-status literal compare — a future
                 // terminal status joining the vocabulary ends the stream
                 // with a one-line edit, not a hunt for every literal

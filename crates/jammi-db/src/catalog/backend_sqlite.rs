@@ -109,7 +109,7 @@ use super::backend::{classify, BackendError, BackendKind, CatalogBackend, Transa
 /// value is passed to SQLite verbatim as a VFS name.
 ///
 /// It exists so the seam can be falsified: the foreign-library harness
-/// (`tests/it/esc_073_foreign_sqlite_library.rs`) run with
+/// (`tests/it/sqlite_foreign_library.rs`) run with
 /// `JAMMI_SQLITE_VFS=default` must observe the crash the seam prevents.
 /// Engaging it logs a `WARN`. It is a test/diagnostic knob and is never set in
 /// production.

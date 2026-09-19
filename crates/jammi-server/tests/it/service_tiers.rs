@@ -1,6 +1,6 @@
 //! Service-tier mounting, end-to-end over the wire.
 //!
-//! These pin the S8 contract that capability matches deployment:
+//! These pin the contract that capability matches deployment:
 //!
 //! * A **serve-only** deployment (core tier only) advertises `services =
 //!   ["core"]` and mounts no eval verbs; reaching `EvalService` is a truthful

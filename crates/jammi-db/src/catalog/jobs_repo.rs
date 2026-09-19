@@ -292,7 +292,7 @@ pub enum AssemblyOutcome {
     ShortListed,
     /// No coordinator body exists to run this attempt at all.
     NoBody,
-    /// The host is draining (68 OPS) and refuses new assembly.
+    /// The host is draining and refuses new assembly.
     Drain,
     /// The job was cancelled before assembly completed.
     Cancelled,

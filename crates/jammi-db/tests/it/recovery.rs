@@ -853,7 +853,7 @@ fn global_sibling(catalog: &Catalog) -> Arc<Catalog> {
     Arc::new(catalog.pinned_to_tenant(None))
 }
 
-/// W2 (the materialization window): a live writer parked between its lease renew and the manifest
+/// The materialization window: a live writer parked between its lease renew and the manifest
 /// write — Parquet valid, no manifest, row `building` — survives a peer
 /// session's `recover()`: status, bytes, and segments untouched; released, it
 /// completes with the true row count. ONE arm is cross-tenant: the writer is
@@ -898,7 +898,7 @@ async fn live_writer_survives_peer_recover_w2(kind: BackendKind) {
         .await
         .expect("writer A must reach the materialization point");
 
-    // Positive preconditions: A is exactly in the W2 window.
+    // Positive preconditions: A is exactly in the materialization window.
     let building_rows =
         TenantBinding::admin_scope(cat_a.list_result_tables_by_status(ResultTableStatus::Building))
             .await
@@ -981,7 +981,7 @@ async fn live_writer_survives_peer_recover_w2(kind: BackendKind) {
     assert_eq!(select_count(&ctx_a, &table_name).await, N);
 }
 
-/// The SAME two-writer shape as W2, but the peer
+/// The SAME two-writer shape as the materialization-window test, but the peer
 /// runs `reconcile(apply=true)` instead of the startup `recover()` sweep — a
 /// live-lease `building` row's bytes must survive a reconcile pass exactly as
 /// they survive recovery. `own_seg` scoping means the peer must reconcile
@@ -1235,7 +1235,7 @@ async fn reconcile_claim_never_reuses_this_sessions_own_writer_id(kind: BackendK
     );
 }
 
-/// W1 (the table-created window): a live writer parked right after `create_table` — row
+/// The table-created window: a live writer parked right after `create_table` — row
 /// `building`, no bytes yet — survives a peer's `recover()` (which would
 /// otherwise take the missing-bytes arm and fail it); released, it completes.
 #[cfg(feature = "test-hooks")]

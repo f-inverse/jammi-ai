@@ -277,7 +277,7 @@ async fn asof_join_exec_round_trips() {
 // `block_in_place` (the codec's decode-time catalog re-read, `codec.rs`'s
 // `block_on_catalog`) requires a MULTI-THREADED runtime — a real precondition
 // this crate documents rather than papers over; every jammi-server process
-// runs one, so this is the honest test shape, not a workaround.
+// runs one, so this test runs on one too.
 #[tokio::test(flavor = "multi_thread")]
 async fn ann_search_exec_round_trips() {
     let session = session().await;

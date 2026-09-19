@@ -27,7 +27,7 @@ use tempfile::tempdir;
 /// current counter, then write it back incremented. This is the minimal shape
 /// that deadlocks two concurrent `BEGIN DEFERRED` transactions on WAL — both
 /// snapshot-read the row, then both try to upgrade to a writer. With the
-/// IMMEDIATE write-lock fix the second transaction blocks on `busy_timeout` and
+/// write lock taken at `BEGIN IMMEDIATE` the second transaction blocks on `busy_timeout` and
 /// proceeds once the first commits.
 async fn read_then_write(catalog: &Catalog) -> Result<(), BackendError> {
     let backend = catalog.backend_arc();
@@ -57,9 +57,9 @@ async fn read_then_write(catalog: &Catalog) -> Result<(), BackendError> {
 /// training worker's polling loop puts on the catalog when a foreground write
 /// lands at the same moment.
 ///
-/// Without the write-lock-at-BEGIN fix this reliably fails with `(code: 5)
+/// Without the write lock taken at BEGIN this reliably fails with `(code: 5)
 /// database is locked` (`SQLITE_BUSY_SNAPSHOT`), which `busy_timeout` cannot
-/// resolve. With the fix every transaction commits.
+/// resolve. With it every transaction commits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_read_then_write_does_not_deadlock() {
     let dir = tempdir().unwrap();
@@ -207,7 +207,7 @@ async fn cancelled_write_transaction_does_not_poison_pool() {
     }
 
     // The pool is not poisoned: a fresh write transaction reusing the cycled
-    // connections opens and commits cleanly. Before the fix this fails with
+    // connections opens and commits cleanly. A poisoned pool fails this with
     // `cannot start a transaction within a transaction`.
     let backend = catalog.backend_arc();
     backend
@@ -265,7 +265,7 @@ async fn cancelled_write_transaction_does_not_poison_pool() {
 /// Many short-deadline `timeout`s race steady writers against one catalog on a
 /// multi-thread runtime — the deadlines are spread across microseconds so some
 /// land squarely in the begin window. After each round a fresh write must still
-/// commit; before the fix this panics within a few rounds.
+/// commit; a leaked `BEGIN` makes this panic within a few rounds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn begin_window_cancellation_does_not_poison_pool() {
     let dir = tempdir().unwrap();
@@ -334,9 +334,9 @@ async fn begin_window_cancellation_does_not_poison_pool() {
             handle.await.expect("writer task panicked");
         }
 
-        // The pool survived the round: a fresh write opens and commits. Before
-        // the fix this fails with `InvalidSavePointStatement` or `database is
-        // locked` once a poisoned connection is recycled.
+        // The pool survived the round: a fresh write opens and commits. A
+        // recycled poisoned connection fails this with
+        // `InvalidSavePointStatement` or `database is locked`.
         backend
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {

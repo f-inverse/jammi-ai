@@ -697,7 +697,7 @@ pub struct ExampleLoss {
 /// therefore a property of *(model, partition)* and not a property of the
 /// example set alone, [`Self::batch_partition_sha256`] and
 /// [`Self::in_batch_negatives_per_example`] are recorded ON THIS STRUCT
-/// (v2 delta 9) rather than left to be inferred from the held-out split
+/// rather than left to be inferred from the held-out split
 /// alone — a `HeldOutLoss` from a re-partitioned run is NOT directly
 /// comparable to one from this run even over the identical example ids, and
 /// the two hashes make that non-comparability checkable rather than silent.
@@ -863,7 +863,7 @@ mod held_out_loss_tests {
     }
 
     /// `batch_partition_sha256` and `in_batch_negatives_per_example` live ON
-    /// `HeldOutLoss` (v2 delta 9) and survive the wire round-trip alongside
+    /// `HeldOutLoss` and survive the wire round-trip alongside
     /// the per-example data — the property-of-(model, partition) fields are
     /// not dropped or defaulted away.
     #[test]
@@ -965,7 +965,7 @@ mod validation_tests {
             .expect("the shipped default must remain valid");
     }
 
-    /// Unit 348: `keep_last_n_checkpoints = 0` is ambiguous ("keep nothing"
+    /// `keep_last_n_checkpoints = 0` is ambiguous ("keep nothing"
     /// vs "the caller meant to omit the field") and is refused, not
     /// silently coerced to `None`.
     #[test]

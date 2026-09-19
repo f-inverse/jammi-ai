@@ -386,7 +386,7 @@ fn decode_ann_search(
     // — no boxed value survives that hop, so `unwrap_jammi` finds nothing to
     // destructure and falls to `JammiError::DataFusion(e)`, which
     // `jammi-server/src/grpc/wire.rs`'s classifier's catch-all
-    // (`other => (Code::Internal, ..)`, `wire.rs:311`) maps to `Internal`,
+    // (`other => (Code::Internal, ..)` in `map_engine_error`) maps to `Internal`,
     // never `InvalidArgument`, regardless of which typed variant was boxed
     // here. The caller-class path for a REMOTE client is the coordinator's
     // own `QueryBuilder::new` check, which runs before any plan is ever

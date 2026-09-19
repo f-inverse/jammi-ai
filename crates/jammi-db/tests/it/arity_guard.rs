@@ -1,4 +1,4 @@
-//! RV1's arity guard: `ResultStore::resolve_search_mode` treats a
+//! The placement arity guard: `ResultStore::resolve_search_mode` treats a
 //! `SegmentPlacement::plan` reply whose length disagrees with the requested
 //! segment count as a placement fault (`JammiError::Catalog`, naming both
 //! counts) — never a silent zip that serves a subset of segments as if it
@@ -20,7 +20,7 @@ use jammi_db::store::{BuildingTable, ResultStore};
 use tempfile::tempdir;
 
 /// A placement that always returns a single, hard-coded, EMPTY owner list —
-/// deliberately shorter than any multi-segment request — to force RV1's
+/// deliberately shorter than any multi-segment request — to force the
 /// arity guard.
 #[derive(Debug, Default)]
 struct ShortAnswerPlacement;

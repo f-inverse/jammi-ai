@@ -436,7 +436,7 @@ pub enum ModelContentDigestUnavailableReason {
 /// `walks_per_node`, `hard_negatives` and `exclude_hops` widen from
 /// `GraphSampleConfig`'s `usize` to `u64` for a hash fold whose width does
 /// not depend on the compiling target; `return_p`/`in_out_q` fold as
-/// `f64::to_bits()`, never the `f64` itself (family J).
+/// `f64::to_bits()`, never the `f64` itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphSampleFields {
     /// Seed for the walk/negative RNG.
@@ -776,7 +776,7 @@ pub enum ProducingDescriptor {
     /// [`Self::FineTune::spec_canonical`]'s opaque JSON already accommodate.
     /// `return_p`/`in_out_q` fold as their IEEE-754 bit patterns
     /// (`f64::to_bits`) rather than the `f64` itself — a fixed, exact,
-    /// byte-stable fold (family J), never a float compared/hashed directly.
+    /// byte-stable fold, never a float compared/hashed directly.
     GraphTrainingSet {
         /// Catalog source holding the node text.
         node_source: String,

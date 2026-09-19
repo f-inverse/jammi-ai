@@ -4,7 +4,7 @@
 //! `docs/guide/src/catalog-and-broker.md`'s SQLite row states the contract:
 //! one process per catalog file; sharing it corrupts the WAL. On the platform
 //! default VFS (the foreign-library harness,
-//! `esc_073_foreign_sqlite_library.rs`, demonstrates both):
+//! `sqlite_foreign_library.rs`, demonstrates both):
 //!
 //! * a second *process* can open the file and race the engine into a
 //!   corrupt WAL, and
@@ -48,12 +48,12 @@
 //!
 //! ## Re-demonstrating the failure the seam prevents
 //!
-//! Every arm of `esc_073_foreign_sqlite_library.rs` and this file's mechanism
+//! Every arm of `sqlite_foreign_library.rs` and this file's mechanism
 //! probe run on the platform default VFS when `JAMMI_SQLITE_VFS=default` is
 //! set, without touching the source:
 //!
 //! ```text
-//! JAMMI_SQLITE_VFS=default cargo test -p jammi-db --test it esc_073 -- --nocapture
+//! JAMMI_SQLITE_VFS=default cargo test -p jammi-db --test it sqlite_foreign_library -- --nocapture
 //! ```
 //!
 //! [`BackendError::Unavailable`]: jammi_db::catalog::backend::BackendError::Unavailable

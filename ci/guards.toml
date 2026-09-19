@@ -552,3 +552,8 @@ name = "workflow validity"
 run = "bash ci/scripts/check_workflows.sh"
 why = "Every workflow parses as GitHub parses it: jobs, needs, expressions and action inputs resolve."
 needs = ["actionlint"]
+
+[[guard]]
+name = "GPU test placement"
+run = "python3 ci/scripts/check_gpu_test_placement.py --self-test && python3 ci/scripts/check_gpu_test_placement.py"
+why = "Every GPU test is in a GPU-only target or a `gpu` module the GPU lane selects; no CPU test runs on a GPU host."

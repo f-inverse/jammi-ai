@@ -1001,28 +1001,32 @@ mod deterministic_passthrough {
     use super::*;
 
     #[cfg(feature = "live-gpu-tests")]
-    #[test]
-    fn cfg_deterministic_flows_through_construction_unmodified() {
-        let cuda = jammi_test_resources::cuda_device(0);
-        let dev = cuda.as_cuda_device().unwrap().clone();
-        for det in [true, false] {
-            let cu_seqlens = crate::flash::CuSeqlens::from_lengths(&[8usize], &dev).unwrap();
-            let cfg = crate::flash::VarlenConfig {
-                softmax_scale: 0.125,
-                window: None,
-                deterministic: det,
-            };
-            // The SAME construction `flash_attention_varlen` performs.
-            let op = FlashVarlenAttention {
-                cu_seqlens,
-                num_heads: 1,
-                cfg,
-                lse: Saved::empty(),
-            };
-            assert_eq!(
-                op.cfg.deterministic, det,
-                "the op must store exactly what the caller passed — never overriding it"
-            );
+    mod gpu {
+        use super::*;
+
+        #[test]
+        fn cfg_deterministic_flows_through_construction_unmodified() {
+            let cuda = jammi_test_resources::cuda_device(0);
+            let dev = cuda.as_cuda_device().unwrap().clone();
+            for det in [true, false] {
+                let cu_seqlens = crate::flash::CuSeqlens::from_lengths(&[8usize], &dev).unwrap();
+                let cfg = crate::flash::VarlenConfig {
+                    softmax_scale: 0.125,
+                    window: None,
+                    deterministic: det,
+                };
+                // The SAME construction `flash_attention_varlen` performs.
+                let op = FlashVarlenAttention {
+                    cu_seqlens,
+                    num_heads: 1,
+                    cfg,
+                    lse: Saved::empty(),
+                };
+                assert_eq!(
+                    op.cfg.deterministic, det,
+                    "the op must store exactly what the caller passed — never overriding it"
+                );
+            }
         }
     }
 }
@@ -1070,109 +1074,113 @@ mod fused_rope_matches_two_op_composition {
     }
 
     #[cfg(feature = "live-gpu-tests")]
-    #[test]
-    fn fused_rope_matches_two_op_composition_bit_identical_fwd_and_bwd_cuda() {
-        let cuda = jammi_test_resources::cuda_device(0);
-        let dev = cuda.as_cuda_device().unwrap().clone();
-        let (batch, seq, h, d) = (2usize, 8usize, 2usize, HEAD_DIM);
-        let total = batch * seq;
-        let n = total * 3 * h * d;
-        // Non-trivial, non-symmetric, distinct-per-element data.
-        let xv: Vec<f32> = (0..n).map(|k| (k as f32 * 0.037).sin() * 3.0).collect();
-        let qkv_bf16 = Tensor::from_vec(xv, (total, 3, h, d), &cuda)
-            .unwrap()
-            .to_dtype(DType::BF16)
-            .unwrap();
-        let qkv_var = Var::from_tensor(&qkv_bf16).unwrap();
-        let (cos, sin) = rope_table(seq, d, &cuda);
-        let lengths = vec![seq; batch];
-        let cu_seqlens_a = CuSeqlens::from_lengths(&lengths, &dev).unwrap();
-        let cu_seqlens_b = CuSeqlens::from_lengths(&lengths, &dev).unwrap();
-        let cfg = VarlenConfig {
-            softmax_scale: 1.0 / (d as f32).sqrt(),
-            window: None,
-            deterministic: true,
-        };
+    mod gpu {
+        use super::*;
 
-        // Path A: the two-op composition — rotate via a TRACKED
-        // `RopePositionsFused` apply, then `flash_attention_varlen` on the
-        // already-rotated buffer.
-        let qkv_rot_a = crate::ops::apply3(
-            qkv_var.as_tensor(),
-            &cos,
-            &sin,
-            crate::ops::RopePositionsFused::new(seq, false),
-        )
-        .unwrap();
-        let o_a = flash_attention_varlen(&qkv_rot_a, &cu_seqlens_a, &cfg).unwrap();
-
-        // Path B: the fused rotate-then-attend op.
-        let o_b = flash_attention_varlen_with_rope(
-            qkv_var.as_tensor(),
-            &cos,
-            &sin,
-            seq,
-            &cu_seqlens_b,
-            &cfg,
-        )
-        .unwrap();
-
-        let to_f32_vec = |t: &Tensor| -> Vec<f32> {
-            t.flatten_all()
+        #[test]
+        fn fused_rope_matches_two_op_composition_bit_identical_fwd_and_bwd_cuda() {
+            let cuda = jammi_test_resources::cuda_device(0);
+            let dev = cuda.as_cuda_device().unwrap().clone();
+            let (batch, seq, h, d) = (2usize, 8usize, 2usize, HEAD_DIM);
+            let total = batch * seq;
+            let n = total * 3 * h * d;
+            // Non-trivial, non-symmetric, distinct-per-element data.
+            let xv: Vec<f32> = (0..n).map(|k| (k as f32 * 0.037).sin() * 3.0).collect();
+            let qkv_bf16 = Tensor::from_vec(xv, (total, 3, h, d), &cuda)
                 .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let qkv_var = Var::from_tensor(&qkv_bf16).unwrap();
+            let (cos, sin) = rope_table(seq, d, &cuda);
+            let lengths = vec![seq; batch];
+            let cu_seqlens_a = CuSeqlens::from_lengths(&lengths, &dev).unwrap();
+            let cu_seqlens_b = CuSeqlens::from_lengths(&lengths, &dev).unwrap();
+            let cfg = VarlenConfig {
+                softmax_scale: 1.0 / (d as f32).sqrt(),
+                window: None,
+                deterministic: true,
+            };
+
+            // Path A: the two-op composition — rotate via a TRACKED
+            // `RopePositionsFused` apply, then `flash_attention_varlen` on the
+            // already-rotated buffer.
+            let qkv_rot_a = crate::ops::apply3(
+                qkv_var.as_tensor(),
+                &cos,
+                &sin,
+                crate::ops::RopePositionsFused::new(seq, false),
+            )
+            .unwrap();
+            let o_a = flash_attention_varlen(&qkv_rot_a, &cu_seqlens_a, &cfg).unwrap();
+
+            // Path B: the fused rotate-then-attend op.
+            let o_b = flash_attention_varlen_with_rope(
+                qkv_var.as_tensor(),
+                &cos,
+                &sin,
+                seq,
+                &cu_seqlens_b,
+                &cfg,
+            )
+            .unwrap();
+
+            let to_f32_vec = |t: &Tensor| -> Vec<f32> {
+                t.flatten_all()
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap()
+            };
+            let o_a_v = to_f32_vec(&o_a);
+            let o_b_v = to_f32_vec(&o_b);
+            assert!(
+                o_a_v.iter().chain(o_b_v.iter()).all(|v| v.is_finite()),
+                "forward outputs must be finite before comparing"
+            );
+            assert_eq!(
+                o_a_v, o_b_v,
+                "flash_attention_varlen_with_rope's forward output must be bit-identical to the \
+                 two-op composition it replaces"
+            );
+
+            let loss_a = o_a
                 .to_dtype(DType::F32)
                 .unwrap()
-                .to_vec1()
+                .sqr()
                 .unwrap()
-        };
-        let o_a_v = to_f32_vec(&o_a);
-        let o_b_v = to_f32_vec(&o_b);
-        assert!(
-            o_a_v.iter().chain(o_b_v.iter()).all(|v| v.is_finite()),
-            "forward outputs must be finite before comparing"
-        );
-        assert_eq!(
-            o_a_v, o_b_v,
-            "flash_attention_varlen_with_rope's forward output must be bit-identical to the \
-             two-op composition it replaces"
-        );
-
-        let loss_a = o_a
-            .to_dtype(DType::F32)
-            .unwrap()
-            .sqr()
-            .unwrap()
-            .sum_all()
-            .unwrap();
-        let loss_b = o_b
-            .to_dtype(DType::F32)
-            .unwrap()
-            .sqr()
-            .unwrap()
-            .sum_all()
-            .unwrap();
-        let grads_a = loss_a.backward().unwrap();
-        let grads_b = loss_b.backward().unwrap();
-        let dqkv_a = grads_a
-            .get(qkv_var.as_tensor())
-            .expect("path A: qkv must have a gradient");
-        let dqkv_b = grads_b
-            .get(qkv_var.as_tensor())
-            .expect("path B: qkv must have a gradient");
-        let dqkv_a_v = to_f32_vec(dqkv_a);
-        let dqkv_b_v = to_f32_vec(dqkv_b);
-        assert!(
-            dqkv_a_v
-                .iter()
-                .chain(dqkv_b_v.iter())
-                .all(|v| v.is_finite()),
-            "gradients must be finite before comparing"
-        );
-        assert_eq!(
-            dqkv_a_v, dqkv_b_v,
-            "flash_attention_varlen_with_rope's dqkv must be bit-identical to the two-op \
-             composition's own dqkv"
-        );
+                .sum_all()
+                .unwrap();
+            let loss_b = o_b
+                .to_dtype(DType::F32)
+                .unwrap()
+                .sqr()
+                .unwrap()
+                .sum_all()
+                .unwrap();
+            let grads_a = loss_a.backward().unwrap();
+            let grads_b = loss_b.backward().unwrap();
+            let dqkv_a = grads_a
+                .get(qkv_var.as_tensor())
+                .expect("path A: qkv must have a gradient");
+            let dqkv_b = grads_b
+                .get(qkv_var.as_tensor())
+                .expect("path B: qkv must have a gradient");
+            let dqkv_a_v = to_f32_vec(dqkv_a);
+            let dqkv_b_v = to_f32_vec(dqkv_b);
+            assert!(
+                dqkv_a_v
+                    .iter()
+                    .chain(dqkv_b_v.iter())
+                    .all(|v| v.is_finite()),
+                "gradients must be finite before comparing"
+            );
+            assert_eq!(
+                dqkv_a_v, dqkv_b_v,
+                "flash_attention_varlen_with_rope's dqkv must be bit-identical to the two-op \
+                 composition's own dqkv"
+            );
+        }
     }
 }
 

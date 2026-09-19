@@ -426,217 +426,6 @@ fn relative_l1_error(a: &[f32], b: &[f32]) -> f64 {
     num / den
 }
 
-/// PER-ARCH, MEASURED composition-invariance floor for the `bf16`-CUDA
-/// alone-vs-padded-batch [`relative_l1_error`] on real rows (does the SAME
-/// dtype/device arm agree with itself across the alone vs padded-batch
-/// composition). Measured by `measure_gpu_floors_print_only` (8
-/// compositions x 88 row-measurements per arch; logs in
-/// `docs/plans/62-embedding-surface/measurements/gpu-floors-*.txt`):
-///
-/// | arch (compute cap) | alone_vs_batch mean      | alone_vs_batch max        |
-/// |---------------------|---------------------------|-----------------------------|
-/// | a100 sm80 (8,0)      | `0e0`                     | `0e0` (EXACT)               |
-/// | h100 sm90 (9,0)      | `0e0`                     | `0e0` (EXACT)               |
-/// | a40  sm86 (8,6)      | `0e0`                     | `0e0` (EXACT)               |
-/// | l40s sm89 (8,9)      | `1.1805235731113235e-3`   | `4.118649354617619e-3`      |
-///
-/// **Exact-arches class (sm80/sm86/sm90, [`EXACT_ARCH_COMPOSITION_FLOOR`]).**
-/// 264 row-measurements (3 arches x 88 each) came back EXACTLY `0.0`,
-/// zero flakiness -- the same bit-exact-zero this file's own module doc
-/// predicts from `MASKED_LOGIT` underflow (a pad weight's contribution to
-/// the value-weighted sum is `0.0 * finite == 0.0` exactly). The floor is
-/// set to `1e-5`: the weakest red control separation measured on this
-/// class (the window-radius control's own min, `7.508231757090548e-4`)
-/// clears the ASSERTED THRESHOLD (`floor * RED_CONTROL_SEPARATION_MULTIPLE`
-/// = `1e-5 * 5.0 = 5e-5`), never the bare floor, by `~15.0x`
-/// (`7.508231757090548e-4 / 5e-5 ~= 15.0x`), and the floor is infinitely
-/// above the measured `0.0` -- a `0.0` floor itself would admit no float
-/// slop at all, including benign FMA/ordering differences on a future,
-/// architecturally-identical but as-yet-unmeasured exact-arch SKU.
-///
-/// **sm89 (L40S, [`SM89_COMPOSITION_FLOOR`]) genuinely diverges** --
-/// the same "Ada-class is not one behavior" A40-pass/L40S-fail pattern as
-/// (`lora_linear_dx_abs_floor`, `crates/jammi-kernels/tests/cuda_parity.rs`):
-/// a different cuBLAS/cuDNN kernel selection on this SKU, not flakiness.
-/// Derivation (measure, then margin, then round to a clean value):
-/// ```text
-/// measured max (l40s):
-///   4.118649354617619e-3
-/// margin (~2% headroom over the measured max -- kept modest rather than
-/// `lora_linear_dx_abs_floor`'s 1.5x precedent, because a larger margin
-/// here would further erode the row-length red control's own
-/// composition-scoped separation documented in the admissibility note
-/// below):
-///   4.118649354617619e-3 * 1.02 = 4.2010263...e-3
-/// rounded to a clean value -- `4.2e-3` sits just BELOW that product, so
-/// the realized margin is `4.2e-3 / 4.118649354617619e-3 ~= 1.0197x`
-/// (~1.97% headroom, a hair under 2%): still finite, positive headroom
-/// over the measured max:
-///   4.2e-3
-/// ```
-///
-/// **Admissibility scoping (shape, never tune).** The window-radius red
-/// control's own measured minimum separation on sm89,
-/// `1.139471768897301e-3`, is SMALLER than [`SM89_COMPOSITION_FLOOR`]
-/// (`4.2e-3`) -- the control cannot separate above the floor on this arch
-/// at all, so it is INADMISSIBLE there and
-/// [`pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda`]
-/// refuses to run on sm89, panicking with the reason (never silently
-/// green).
-///
-/// The row-length control's admissibility on sm89 is stated the same way
-/// the window control's already is above: the GATING STATISTIC vs the
-/// ASSERTED THRESHOLD (`floor * RED_CONTROL_SEPARATION_MULTIPLE`), never
-/// a raw max-over-floor ratio (the cross-composition MAX over the bare
-/// floor, `6.881763611768685e-2 / 4.2e-3 ~= 16.4x`, is the wrong pair of
-/// numbers). The gating test
-/// ([`pooled_embedding_red_control_row_length_off_by_one_bf16_cuda`])
-/// exercises composition 0; its measured ratio, `6.881763611768685e-2`,
-/// clears the asserted threshold
-/// (`SM89_COMPOSITION_FLOOR * RED_CONTROL_SEPARATION_MULTIPLE` =
-/// `4.2e-3 * 5.0 = 2.1e-2`) by `~3.28x`
-/// (`6.881763611768685e-2 / 2.1e-2 ~= 3.28x`).
-///
-/// This clearance is COMPOSITION-SCOPED on sm89, not universal, and this
-/// doc says so plainly rather than implying every composition clears:
-/// the full 8-composition row-length ratio set measured on the L40S (cited
-/// verbatim from
-/// `docs/plans/62-embedding-surface/measurements/gpu-floors-l40s.txt`),
-/// compositions 0..7 in order, is `6.881763611768685e-2,
-/// 6.881763611768685e-2, 6.9996589149257556e-3, 6.881763611768685e-2,
-/// 4.2952616000474945e-2, 5.418507501917013e-3, 6.881763611768685e-2,
-/// 1.0134661986953957e-2`. Compositions 2 (`6.9996589149257556e-3`), 5
-/// (`5.418507501917013e-3`), AND 7 (`1.0134661986953957e-2`) all measure
-/// BELOW the `2.1e-2` threshold on sm89 -- the row-length control is
-/// therefore admissible on sm89 ONLY for the fixture composition the
-/// gating test actually exercises (composition 0), not for every
-/// composition this arch was measured at; a future change to the gating
-/// test's fixture composition would need to re-check this scoping, never
-/// assume it carries over unchanged.
-///
-/// On the exact-arches class the row-length control IS universal
-/// (unlike sm89): even its weakest measured composition there
-/// (composition 5, `5.483950988976972e-3` -- a100/h100/a40, same
-/// artifact directory) clears
-/// [`EXACT_ARCH_COMPOSITION_FLOOR`]'s asserted threshold
-/// (`1e-5 * 5.0 = 5e-5`) by `~109.7x`
-/// (`5.483950988976972e-3 / 5e-5 ~= 109.7x`); the gating composition
-/// (composition 0, `6.881763611768685e-2`) clears it by `~1376x`.
-///
-/// Detected at runtime via
-/// `jammi_kernels::admission::probe_cuda_compute_capability` /
-/// `ComputeCapability`, the SAME per-arch idiom
-/// `crates/jammi-kernels/tests/cuda_parity.rs`'s `lora_linear_dx_abs_floor`
-/// uses (`ComputeCapability::new(major, minor)` equality match). An arch
-/// this table has not measured (including a probe failure or a non-CUDA
-/// device) returns `f64::NAN` deliberately -- [`require_measured_floor`]
-/// turns that into a loud, named panic rather than a silent guess (an
-/// untested arch must fail loud, never silently borrow a floor it was
-/// never shown to need).
-#[cfg(feature = "live-gpu-tests")]
-const EXACT_ARCH_COMPOSITION_FLOOR: f64 = 1e-5;
-
-/// See [`gpu_composition_floor`]'s doc for the full sm89 derivation
-/// (measured max `4.118649354617619e-3`, `1.02x` margin, rounded to a
-/// clean `4.2e-3`).
-#[cfg(feature = "live-gpu-tests")]
-const SM89_COMPOSITION_FLOOR: f64 = 4.2e-3;
-
-/// Arch-conditional lookup for [`EXACT_ARCH_COMPOSITION_FLOOR`] /
-/// [`SM89_COMPOSITION_FLOOR`] -- see [`EXACT_ARCH_COMPOSITION_FLOOR`]'s own
-/// doc for the full measured values, margin arithmetic, and admissibility
-/// scoping. Mirrors
-/// `crates/jammi-kernels/tests/cuda_parity.rs`'s `lora_linear_dx_abs_floor`
-/// arch-detection idiom exactly (`probe_cuda_compute_capability` +
-/// `ComputeCapability::new(major, minor)` equality match), except an
-/// UNRECOGNISED capability here returns `f64::NAN` rather than a
-/// tight-but-untested default: this oracle already has a dedicated
-/// NaN-panic guard ([`require_measured_floor`]) built for exactly this
-/// "arch outside the measured set" case, so the lookup fails loud through
-/// that mechanism instead of silently reusing a bound derived from
-/// different hardware.
-///
-/// **Recorded residual: capability-only key, not `(arch, build)`.** This
-/// lookup keys SOLELY on driver-probed compute capability
-/// (`ComputeCapability::new(major, minor)`), a coarser key than the
-/// repository's own per-`(arch, build)` determinism rule used
-/// elsewhere. Only ONE SKU per capability class is measured -- a100 sm80
-/// `(8,0)`, h100 sm90 `(9,0)`, a40 sm86 `(8,6)`, l40s sm89 `(8,9)`, per
-/// `docs/plans/62-embedding-surface/measurements/README.md` -- so an
-/// unmeasured SKU that merely REPORTS the same capability (e.g. a
-/// different sm89 card) inherits its whole class's floor without ever
-/// having been measured itself. This is a stated residual, not a silent
-/// gap: capability is a coarser key than the repo's `(arch, build)`
-/// determinism unit, and closing it needs per-SKU measurement or a
-/// documented argument that capability alone suffices.
-#[cfg(feature = "live-gpu-tests")]
-fn gpu_composition_floor(device: &Device) -> f64 {
-    use jammi_kernels::admission::{probe_cuda_compute_capability, ComputeCapability};
-    match probe_cuda_compute_capability(device) {
-        Some(cap) if cap == ComputeCapability::new(8, 9) => SM89_COMPOSITION_FLOOR,
-        Some(cap)
-            if cap == ComputeCapability::new(8, 0)
-                || cap == ComputeCapability::new(8, 6)
-                || cap == ComputeCapability::new(9, 0) =>
-        {
-            EXACT_ARCH_COMPOSITION_FLOOR
-        }
-        // Every other probed capability (including a probe failure or
-        // non-CUDA device) is outside the measured set: fail loud via
-        // `require_measured_floor`, never guess.
-        _ => f64::NAN,
-    }
-}
-
-/// Arch-CONSISTENT, MEASURED dtype-rounding drift bound for each
-/// `bf16`-CUDA arm's [`relative_l1_error`] against the independently
-/// computed `f32`-CPU truth (`ratio_alone_vs_truth`, `ratio_batch_vs_truth`)
-/// -- a DIFFERENT quantity from [`gpu_composition_floor`]'s
-/// composition-invariance floor: "does bf16 agree with itself across
-/// compositions" and "does bf16 agree with f32 truth" can diverge
-/// independently -- two bf16 arms can drift IDENTICALLY away from truth (a
-/// real dtype-rounding regression) while still agreeing with EACH OTHER,
-/// which would pass a composition-invariance-only check vacuously.
-/// Measured by `measure_gpu_floors_print_only`: a100, h100 and a40 all
-/// report IDENTICAL values, `alone_vs_truth mean=3.5208168455960124e-3`
-/// `max=4.222114077112533e-3` (`batch_vs_truth` identical to
-/// `alone_vs_truth`); l40s measures
-/// `alone_vs_truth mean=3.597633555417087e-3` `max=4.233727028564512e-3` --
-/// the cross-arch worst max across all four.
-///
-/// ONE bound serves every arch here (unlike [`gpu_composition_floor`],
-/// which splits arch-conditionally): the dtype-rounding noise this bound
-/// governs (`bf16` round-to-nearest storage error) is a property of the
-/// dtype/kernel choice, not the GEMM reduction-order divergence that made
-/// the composition floor arch-split -- measured evidence bears this out.
-/// Reproducibly, from the numbers above: the MAX spread between l40s and
-/// the three identical arches is
-/// `(4.233727028564512e-3 - 4.222114077112533e-3) /
-/// 4.222114077112533e-3 ~= 0.275%`, and the MEAN spread is
-/// `(3.597633555417087e-3 - 3.5208168455960124e-3) /
-/// 3.5208168455960124e-3 ~= 2.18%` -- both well under the composition
-/// floor's `0` vs `4.1e-3` split (an effectively-infinite relative
-/// spread, since the exact-arches side is exactly `0.0`).
-///
-/// Derivation (the margin convention of `crates/jammi-kernels/tests/cuda_parity.rs`'s
-/// `lora_linear_dx_abs_floor` sibling comment: "`dx_bound_margin`'s sibling
-/// comment used `2.0x` against a measured `1.34x` need"; `2.0x` chosen over
-/// this file's own tighter `1.02x` composition-floor margin because this
-/// bound has no red-control separation ceiling pushing back against a
-/// generous margin):
-/// ```text
-/// cross-arch max (l40s):
-///   4.233727028564512e-3
-/// margin (2.0x):
-///   4.233727028564512e-3 * 2.0 = 8.467454057129024e-3
-/// rounded UP to a clean value (never round down past the margin):
-///   1e-2
-/// ```
-/// giving `~2.36x` headroom over the measured cross-arch worst case
-/// (`1e-2 / 4.233727028564512e-3 ~= 2.362x`).
-#[cfg(feature = "live-gpu-tests")]
-const GPU_TRUTH_DRIFT_BOUND: f64 = 1e-2;
-
 /// Refuses to let an unmeasured floor value (identified by `floor_name`)
 /// silently gate a real assertion: `NaN` fails every ordered comparison
 /// (the "`NaN > c` is `false`" trap, applied deliberately here in the
@@ -663,175 +452,6 @@ fn require_measured_floor(test_name: &str, floor_name: &str, floor: f64) {
              CUDA leg can assert anything; see that constant's own doc"
         );
     }
-}
-
-#[test]
-#[cfg(feature = "live-gpu-tests")]
-fn pooled_embedding_alone_matches_padded_batch_real_row_bf16_cuda() {
-    let test_name = "pooled_embedding_alone_matches_padded_batch_real_row_bf16_cuda";
-    let device = jammi_test_resources::cuda_device(0);
-    let composition_floor = gpu_composition_floor(&device);
-    require_measured_floor(test_name, "gpu_composition_floor", composition_floor);
-    require_measured_floor(test_name, "GPU_TRUTH_DRIFT_BOUND", GPU_TRUTH_DRIFT_BOUND);
-    let config = load_config();
-    let encoder = build_encoder(&device, DType::BF16, &config);
-    let fixture = build_fixture(&device);
-    let pooled_batch = encoder
-        .forward(&fixture.ids_padded, &fixture.mask_padded)
-        .expect("padded batch forward (bf16 cuda)");
-    let pooled_batch: Vec<Vec<f32>> = pooled_batch
-        .to_dtype(DType::F32)
-        .unwrap()
-        .to_vec2()
-        .unwrap();
-
-    // f32-truth anchor: the CPU f32 forward of each row's alone
-    // composition, independent of the CUDA bf16 arm under test.
-    let truth_encoder = build_encoder(&Device::Cpu, DType::F32, &config);
-
-    for (b, row) in fixture.rows.iter().enumerate() {
-        let alone_bf16 = pooled_alone(&encoder, &device, row);
-        let truth = pooled_alone(&truth_encoder, &Device::Cpu, row);
-        let ratio_alone_vs_truth = relative_l1_error(&alone_bf16, &truth);
-        let ratio_batch_vs_truth = relative_l1_error(&pooled_batch[b], &truth);
-        let ratio_alone_vs_batch = relative_l1_error(&alone_bf16, &pooled_batch[b]);
-        eprintln!(
-            "row={b} alone_vs_truth={ratio_alone_vs_truth:e} batch_vs_truth={ratio_batch_vs_truth:e} \
-             alone_vs_batch={ratio_alone_vs_batch:e} (composition floor \
-             {composition_floor:e}, drift bound {GPU_TRUTH_DRIFT_BOUND:e})"
-        );
-        // Truth-tracking control: each bf16 arm -- alone AND
-        // batch, independently -- must itself stay within
-        // `GPU_TRUTH_DRIFT_BOUND` of the f32-CPU truth. Without these two
-        // asserts, two bf16 arms that drift IDENTICALLY away from truth
-        // would still agree with each other and pass the alone-vs-batch
-        // assertion below, hiding a real dtype-rounding regression inside a
-        // cancelling agreement.
-        assert!(
-            ratio_alone_vs_truth.is_finite() && ratio_alone_vs_truth < GPU_TRUTH_DRIFT_BOUND,
-            "row {b}: bf16 alone-vs-f32-truth relative_l1_error {ratio_alone_vs_truth:e} exceeds \
-             the measured dtype-rounding drift bound {GPU_TRUTH_DRIFT_BOUND:e}"
-        );
-        assert!(
-            ratio_batch_vs_truth.is_finite() && ratio_batch_vs_truth < GPU_TRUTH_DRIFT_BOUND,
-            "row {b}: bf16 batch-vs-f32-truth relative_l1_error {ratio_batch_vs_truth:e} exceeds \
-             the measured dtype-rounding drift bound {GPU_TRUTH_DRIFT_BOUND:e}"
-        );
-        assert!(
-            ratio_alone_vs_batch.is_finite() && ratio_alone_vs_batch < composition_floor,
-            "row {b}: bf16 alone-vs-batch relative_l1_error {ratio_alone_vs_batch:e} exceeds the \
-             measured per-arch composition floor {composition_floor:e}"
-        );
-    }
-}
-
-#[test]
-#[cfg(feature = "live-gpu-tests")]
-fn pooled_embedding_red_control_row_length_off_by_one_bf16_cuda() {
-    let test_name = "pooled_embedding_red_control_row_length_off_by_one_bf16_cuda";
-    let device = jammi_test_resources::cuda_device(0);
-    let composition_floor = gpu_composition_floor(&device);
-    require_measured_floor(test_name, "gpu_composition_floor", composition_floor);
-    let config = load_config();
-    let encoder = build_encoder(&device, DType::BF16, &config);
-    let fixture = build_fixture(&device);
-
-    let mut mask_mut = vec![0u32; fixture.batch * fixture.seq];
-    for (b, row) in fixture.rows.iter().enumerate() {
-        let take = if b == 0 { row.len() - 1 } else { row.len() };
-        for i in 0..take {
-            mask_mut[b * fixture.seq + i] = 1;
-        }
-    }
-    let mask_mut = Tensor::from_vec(mask_mut, (fixture.batch, fixture.seq), &device).unwrap();
-    let pooled_batch_mut = encoder
-        .forward(&fixture.ids_padded, &mask_mut)
-        .expect("mutated-length padded batch forward (bf16 cuda)");
-    let pooled_batch_mut: Vec<Vec<f32>> = pooled_batch_mut
-        .to_dtype(DType::F32)
-        .unwrap()
-        .to_vec2()
-        .unwrap();
-
-    let alone0 = pooled_alone(&encoder, &device, &fixture.rows[0]);
-    let ratio = relative_l1_error(&alone0, &pooled_batch_mut[0]);
-    // Row-length control is conjunctive with the window-radius control on
-    // every arch it runs on, but its admissibility is
-    // COMPOSITION-SCOPED on sm89: this composition-0 fixture's measured
-    // ratio (`6.881763611768685e-2`) clears the asserted threshold
-    // `SM89_COMPOSITION_FLOOR * 5.0` (`2.1e-2`) by `~3.28x`, but
-    // compositions 2, 5, and 7 measure BELOW that same threshold on sm89
-    // and would not pass this exact assert if this test built one of THEM
-    // instead -- see `gpu_composition_floor`'s own doc for the full
-    // per-composition measurements and the scoping statement.
-    assert!(
-        ratio.is_finite() && ratio > composition_floor * 5.0,
-        "row_lengths off-by-one control failed to separate above the measured bf16 floor \
-         (ratio={ratio:e}, required > {:e})",
-        composition_floor * 5.0,
-    );
-}
-
-#[test]
-#[cfg(feature = "live-gpu-tests")]
-fn pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda() {
-    let test_name = "pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda";
-    let device = jammi_test_resources::cuda_device(0);
-    // On sm89 (L40S) bf16 composition noise (SM89_COMPOSITION_FLOOR, 4.2e-3)
-    // exceeds this control's separation (measured minimum 1.14e-3): a one-token
-    // window change cannot be told from noise there, so the control has no
-    // power on that arch and the sm89 lane does not run it. The row-length
-    // control above does separate on sm89.
-    use jammi_kernels::admission::{probe_cuda_compute_capability, ComputeCapability};
-    assert_ne!(
-        probe_cuda_compute_capability(&device),
-        Some(ComputeCapability::new(8, 9)),
-        "the window-radius red control cannot separate from sm89's bf16 composition noise; \
-         run it on an exact-arch device (sm80/86/90)"
-    );
-    let composition_floor = gpu_composition_floor(&device);
-    require_measured_floor(test_name, "gpu_composition_floor", composition_floor);
-    let config = load_config();
-    let fixture = build_fixture(&device);
-
-    let mut mutant_config = config.clone();
-    mutant_config.local_attention = config.local_attention + 2;
-    assert_eq!(mutant_config.half_window(), config.half_window() + 1);
-
-    let long_idx = fixture
-        .lengths
-        .iter()
-        .enumerate()
-        .max_by_key(|&(_, &len)| len)
-        .map(|(i, _)| i)
-        .expect("fixture is non-empty");
-    let long_len = fixture.lengths[long_idx];
-    assert!(long_len >= mutant_config.half_window() + 2);
-    assert!(long_len >= config.half_window() + 2);
-
-    let encoder = build_encoder(&device, DType::BF16, &config);
-    let encoder_mut = build_encoder(&device, DType::BF16, &mutant_config);
-
-    let alone_long = pooled_alone(&encoder, &device, &fixture.rows[long_idx]);
-    let pooled_batch_mut = encoder_mut
-        .forward(&fixture.ids_padded, &fixture.mask_padded)
-        .expect("mutant-window padded batch forward (bf16 cuda)");
-    let pooled_batch_mut: Vec<Vec<f32>> = pooled_batch_mut
-        .to_dtype(DType::F32)
-        .unwrap()
-        .to_vec2()
-        .unwrap();
-
-    let ratio = relative_l1_error(&alone_long, &pooled_batch_mut[long_idx]);
-    // On the exact-arch class this control's own measured min separation (`7.508231757090548e-4`)
-    // clears `EXACT_ARCH_COMPOSITION_FLOOR * 5.0` (`5e-5`) by `~15x` -- see
-    // `gpu_composition_floor`'s own doc.
-    assert!(
-        ratio.is_finite() && ratio > composition_floor * 5.0,
-        "window radius off-by-one control failed to separate above the measured bf16 floor \
-         (ratio={ratio:e}, required > {:e})",
-        composition_floor * 5.0,
-    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -961,371 +581,748 @@ fn require_measured_floor_panics_on_unmeasured_nan() {
 // max, explicit mean) `mean_max` in `src/modernbert.rs` uses.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// The 8 batch compositions this measurement sweeps, all built from the
-/// SAME 16-row pool [`build_fixture`] returns (same token content, same
-/// per-row lengths) -- only which rows participate and in what order/total
-/// batch size varies, so any divergence measured here traces to composition
-/// (operand shape), never to content drift between compositions.
 #[cfg(feature = "live-gpu-tests")]
-const MEASUREMENT_COMPOSITION_SWEEP: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+mod gpu {
+    use super::*;
 
-/// Maps a `composition_id` (`0..8`, [`MEASUREMENT_COMPOSITION_SWEEP`]) to
-/// the row indices (into [`build_fixture`]'s 16-row pool) that compose that
-/// batch: full set, both halves, even/odd interleave, full-reversed-order,
-/// and two overlapping three-quarter windows -- eight structurally distinct
-/// `(batch, seq)` operand shapes and orderings from one fixed content pool.
-#[cfg(feature = "live-gpu-tests")]
-fn composition_row_indices(composition_id: usize, n: usize) -> Vec<usize> {
-    match composition_id {
-        0 => (0..n).collect(),
-        1 => (0..n / 2).collect(),
-        2 => (n / 2..n).collect(),
-        3 => (0..n).step_by(2).collect(),
-        4 => (1..n).step_by(2).collect(),
-        5 => (0..n).rev().collect(),
-        6 => (0..(n * 3 / 4)).collect(),
-        7 => (n / 4..n).collect(),
-        other => panic!("composition_row_indices: unknown composition_id {other} (expected 0..8)"),
-    }
-}
+    /// PER-ARCH, MEASURED composition-invariance floor for the `bf16`-CUDA
+    /// alone-vs-padded-batch [`relative_l1_error`] on real rows (does the SAME
+    /// dtype/device arm agree with itself across the alone vs padded-batch
+    /// composition). Measured by `measure_gpu_floors_print_only` (8
+    /// compositions x 88 row-measurements per arch; logs in
+    /// `docs/plans/62-embedding-surface/measurements/gpu-floors-*.txt`):
+    ///
+    /// | arch (compute cap) | alone_vs_batch mean      | alone_vs_batch max        |
+    /// |---------------------|---------------------------|-----------------------------|
+    /// | a100 sm80 (8,0)      | `0e0`                     | `0e0` (EXACT)               |
+    /// | h100 sm90 (9,0)      | `0e0`                     | `0e0` (EXACT)               |
+    /// | a40  sm86 (8,6)      | `0e0`                     | `0e0` (EXACT)               |
+    /// | l40s sm89 (8,9)      | `1.1805235731113235e-3`   | `4.118649354617619e-3`      |
+    ///
+    /// **Exact-arches class (sm80/sm86/sm90, [`EXACT_ARCH_COMPOSITION_FLOOR`]).**
+    /// 264 row-measurements (3 arches x 88 each) came back EXACTLY `0.0`,
+    /// zero flakiness -- the same bit-exact-zero this file's own module doc
+    /// predicts from `MASKED_LOGIT` underflow (a pad weight's contribution to
+    /// the value-weighted sum is `0.0 * finite == 0.0` exactly). The floor is
+    /// set to `1e-5`: the weakest red control separation measured on this
+    /// class (the window-radius control's own min, `7.508231757090548e-4`)
+    /// clears the ASSERTED THRESHOLD (`floor * RED_CONTROL_SEPARATION_MULTIPLE`
+    /// = `1e-5 * 5.0 = 5e-5`), never the bare floor, by `~15.0x`
+    /// (`7.508231757090548e-4 / 5e-5 ~= 15.0x`), and the floor is infinitely
+    /// above the measured `0.0` -- a `0.0` floor itself would admit no float
+    /// slop at all, including benign FMA/ordering differences on a future,
+    /// architecturally-identical but as-yet-unmeasured exact-arch SKU.
+    ///
+    /// **sm89 (L40S, [`SM89_COMPOSITION_FLOOR`]) genuinely diverges** --
+    /// the same "Ada-class is not one behavior" A40-pass/L40S-fail pattern as
+    /// (`lora_linear_dx_abs_floor`, `crates/jammi-kernels/tests/cuda_parity.rs`):
+    /// a different cuBLAS/cuDNN kernel selection on this SKU, not flakiness.
+    /// Derivation (measure, then margin, then round to a clean value):
+    /// ```text
+    /// measured max (l40s):
+    ///   4.118649354617619e-3
+    /// margin (~2% headroom over the measured max -- kept modest rather than
+    /// `lora_linear_dx_abs_floor`'s 1.5x precedent, because a larger margin
+    /// here would further erode the row-length red control's own
+    /// composition-scoped separation documented in the admissibility note
+    /// below):
+    ///   4.118649354617619e-3 * 1.02 = 4.2010263...e-3
+    /// rounded to a clean value -- `4.2e-3` sits just BELOW that product, so
+    /// the realized margin is `4.2e-3 / 4.118649354617619e-3 ~= 1.0197x`
+    /// (~1.97% headroom, a hair under 2%): still finite, positive headroom
+    /// over the measured max:
+    ///   4.2e-3
+    /// ```
+    ///
+    /// **Admissibility scoping (shape, never tune).** The window-radius red
+    /// control's own measured minimum separation on sm89,
+    /// `1.139471768897301e-3`, is SMALLER than [`SM89_COMPOSITION_FLOOR`]
+    /// (`4.2e-3`) -- the control cannot separate above the floor on this arch
+    /// at all, so it is INADMISSIBLE there and
+    /// [`pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda`]
+    /// refuses to run on sm89, panicking with the reason (never silently
+    /// green).
+    ///
+    /// The row-length control's admissibility on sm89 is stated the same way
+    /// the window control's already is above: the GATING STATISTIC vs the
+    /// ASSERTED THRESHOLD (`floor * RED_CONTROL_SEPARATION_MULTIPLE`), never
+    /// a raw max-over-floor ratio (the cross-composition MAX over the bare
+    /// floor, `6.881763611768685e-2 / 4.2e-3 ~= 16.4x`, is the wrong pair of
+    /// numbers). The gating test
+    /// ([`pooled_embedding_red_control_row_length_off_by_one_bf16_cuda`])
+    /// exercises composition 0; its measured ratio, `6.881763611768685e-2`,
+    /// clears the asserted threshold
+    /// (`SM89_COMPOSITION_FLOOR * RED_CONTROL_SEPARATION_MULTIPLE` =
+    /// `4.2e-3 * 5.0 = 2.1e-2`) by `~3.28x`
+    /// (`6.881763611768685e-2 / 2.1e-2 ~= 3.28x`).
+    ///
+    /// This clearance is COMPOSITION-SCOPED on sm89, not universal, and this
+    /// doc says so plainly rather than implying every composition clears:
+    /// the full 8-composition row-length ratio set measured on the L40S (cited
+    /// verbatim from
+    /// `docs/plans/62-embedding-surface/measurements/gpu-floors-l40s.txt`),
+    /// compositions 0..7 in order, is `6.881763611768685e-2,
+    /// 6.881763611768685e-2, 6.9996589149257556e-3, 6.881763611768685e-2,
+    /// 4.2952616000474945e-2, 5.418507501917013e-3, 6.881763611768685e-2,
+    /// 1.0134661986953957e-2`. Compositions 2 (`6.9996589149257556e-3`), 5
+    /// (`5.418507501917013e-3`), AND 7 (`1.0134661986953957e-2`) all measure
+    /// BELOW the `2.1e-2` threshold on sm89 -- the row-length control is
+    /// therefore admissible on sm89 ONLY for the fixture composition the
+    /// gating test actually exercises (composition 0), not for every
+    /// composition this arch was measured at; a future change to the gating
+    /// test's fixture composition would need to re-check this scoping, never
+    /// assume it carries over unchanged.
+    ///
+    /// On the exact-arches class the row-length control IS universal
+    /// (unlike sm89): even its weakest measured composition there
+    /// (composition 5, `5.483950988976972e-3` -- a100/h100/a40, same
+    /// artifact directory) clears
+    /// [`EXACT_ARCH_COMPOSITION_FLOOR`]'s asserted threshold
+    /// (`1e-5 * 5.0 = 5e-5`) by `~109.7x`
+    /// (`5.483950988976972e-3 / 5e-5 ~= 109.7x`); the gating composition
+    /// (composition 0, `6.881763611768685e-2`) clears it by `~1376x`.
+    ///
+    /// Detected at runtime via
+    /// `jammi_kernels::admission::probe_cuda_compute_capability` /
+    /// `ComputeCapability`, the SAME per-arch idiom
+    /// `crates/jammi-kernels/tests/cuda_parity.rs`'s `lora_linear_dx_abs_floor`
+    /// uses (`ComputeCapability::new(major, minor)` equality match). An arch
+    /// this table has not measured (including a probe failure or a non-CUDA
+    /// device) returns `f64::NAN` deliberately -- [`require_measured_floor`]
+    /// turns that into a loud, named panic rather than a silent guess (an
+    /// untested arch must fail loud, never silently borrow a floor it was
+    /// never shown to need).
+    const EXACT_ARCH_COMPOSITION_FLOOR: f64 = 1e-5;
 
-/// Builds one composed padded batch (rows/lengths + device tensors) from a
-/// subset of `base`'s row pool, in the given order -- reuses
-/// [`build_fixture`]'s row content/lengths verbatim (no re-derivation) so
-/// every composition draws from the identical content this file's gating
-/// tests already exercise.
-#[cfg(feature = "live-gpu-tests")]
-fn build_composition(
-    device: &Device,
-    base: &Fixture,
-    row_indices: &[usize],
-) -> (Vec<Vec<u32>>, Vec<usize>, Tensor, Tensor) {
-    let seq = base.seq;
-    let batch = row_indices.len();
-    assert!(batch > 0, "build_composition: empty composition");
-    let mut ids_padded = vec![0u32; batch * seq];
-    let mut mask_padded = vec![0u32; batch * seq];
-    let mut rows = Vec::with_capacity(batch);
-    let mut lengths = Vec::with_capacity(batch);
-    for (slot, &idx) in row_indices.iter().enumerate() {
-        let row = &base.rows[idx];
-        for (i, &t) in row.iter().enumerate() {
-            ids_padded[slot * seq + i] = t;
-            mask_padded[slot * seq + i] = 1;
+    /// See [`gpu_composition_floor`]'s doc for the full sm89 derivation
+    /// (measured max `4.118649354617619e-3`, `1.02x` margin, rounded to a
+    /// clean `4.2e-3`).
+    const SM89_COMPOSITION_FLOOR: f64 = 4.2e-3;
+
+    /// Arch-conditional lookup for [`EXACT_ARCH_COMPOSITION_FLOOR`] /
+    /// [`SM89_COMPOSITION_FLOOR`] -- see [`EXACT_ARCH_COMPOSITION_FLOOR`]'s own
+    /// doc for the full measured values, margin arithmetic, and admissibility
+    /// scoping. Mirrors
+    /// `crates/jammi-kernels/tests/cuda_parity.rs`'s `lora_linear_dx_abs_floor`
+    /// arch-detection idiom exactly (`probe_cuda_compute_capability` +
+    /// `ComputeCapability::new(major, minor)` equality match), except an
+    /// UNRECOGNISED capability here returns `f64::NAN` rather than a
+    /// tight-but-untested default: this oracle already has a dedicated
+    /// NaN-panic guard ([`require_measured_floor`]) built for exactly this
+    /// "arch outside the measured set" case, so the lookup fails loud through
+    /// that mechanism instead of silently reusing a bound derived from
+    /// different hardware.
+    ///
+    /// **Recorded residual: capability-only key, not `(arch, build)`.** This
+    /// lookup keys SOLELY on driver-probed compute capability
+    /// (`ComputeCapability::new(major, minor)`), a coarser key than the
+    /// repository's own per-`(arch, build)` determinism rule used
+    /// elsewhere. Only ONE SKU per capability class is measured -- a100 sm80
+    /// `(8,0)`, h100 sm90 `(9,0)`, a40 sm86 `(8,6)`, l40s sm89 `(8,9)`, per
+    /// `docs/plans/62-embedding-surface/measurements/README.md` -- so an
+    /// unmeasured SKU that merely REPORTS the same capability (e.g. a
+    /// different sm89 card) inherits its whole class's floor without ever
+    /// having been measured itself. This is a stated residual, not a silent
+    /// gap: capability is a coarser key than the repo's `(arch, build)`
+    /// determinism unit, and closing it needs per-SKU measurement or a
+    /// documented argument that capability alone suffices.
+    fn gpu_composition_floor(device: &Device) -> f64 {
+        use jammi_kernels::admission::{probe_cuda_compute_capability, ComputeCapability};
+        match probe_cuda_compute_capability(device) {
+            Some(cap) if cap == ComputeCapability::new(8, 9) => SM89_COMPOSITION_FLOOR,
+            Some(cap)
+                if cap == ComputeCapability::new(8, 0)
+                    || cap == ComputeCapability::new(8, 6)
+                    || cap == ComputeCapability::new(9, 0) =>
+            {
+                EXACT_ARCH_COMPOSITION_FLOOR
+            }
+            // Every other probed capability (including a probe failure or
+            // non-CUDA device) is outside the measured set: fail loud via
+            // `require_measured_floor`, never guess.
+            _ => f64::NAN,
         }
-        rows.push(row.clone());
-        lengths.push(base.lengths[idx]);
-    }
-    let ids = Tensor::from_vec(ids_padded, (batch, seq), device).unwrap();
-    let mask = Tensor::from_vec(mask_padded, (batch, seq), device).unwrap();
-    (rows, lengths, ids, mask)
-}
-
-/// `total_cmp`-folded max over `values` -- the same fixed fold-order/tie-break
-/// discipline `mean_max` in `src/modernbert.rs` uses, re-derived
-/// here since this file does not import that module's private helper (see
-/// this file's own module doc on why it re-derives its small helpers).
-#[cfg(feature = "live-gpu-tests")]
-fn measurement_max(values: &[f64]) -> f64 {
-    values.iter().copied().fold(f64::NEG_INFINITY, |a, b| {
-        if b.total_cmp(&a).is_gt() {
-            b
-        } else {
-            a
-        }
-    })
-}
-
-/// `(mean, total_cmp-folded max)` over `values`. Panics on an empty slice --
-/// a measurement sweep that produced zero data points is itself a defect in
-/// this test, not a `0.0`/`NaN` result to silently propagate.
-#[cfg(feature = "live-gpu-tests")]
-fn measurement_mean_max(values: &[f64]) -> (f64, f64) {
-    assert!(!values.is_empty(), "measurement_mean_max: empty slice");
-    let sum: f64 = values.iter().sum();
-    let mean = sum / values.len() as f64;
-    (mean, measurement_max(values))
-}
-
-/// MEASUREMENT-ONLY, print-only, `#[ignore]`d by default (see this test's
-/// own attribute for the exact rationale) -- computes and prints, for every
-/// row of every composition in [`MEASUREMENT_COMPOSITION_SWEEP`], the exact
-/// three ratios the gating `bf16`-CUDA tests above assert
-/// (`ratio_alone_vs_truth`, `ratio_batch_vs_truth`, `ratio_alone_vs_batch`,
-/// via the identical [`relative_l1_error`] function those tests call), plus
-/// each composition's own red-control separations
-/// (row_lengths off-by-one, window radius off-by-one), so the
-/// conjunctive-control admissibility check the module doc requires can be
-/// derived from THIS SAME run rather than a second invocation. Asserts
-/// ONLY finiteness on every printed ratio: a `NaN`/`inf` measurement is
-/// itself a RED finding here (this test's job is to report reality, not
-/// pass), never silently dropped or averaged away.
-///
-/// It runs only on request: `#[cfg(feature = "live-gpu-tests")]` keeps it
-/// out of a plain `cargo test -p jammi-encoders` build, and `#[ignore]`
-/// keeps it out of a `live-gpu-tests` run unless `--ignored` (or
-/// `--include-ignored`) is passed.
-///
-/// Invocation: `cargo test -p jammi-encoders --features live-gpu-tests
-/// --test it measure_gpu_floors -- --ignored --nocapture`; device 0 is
-/// acquired through `jammi_test_resources::cuda_device`, which panics
-/// naming the missing device.
-///
-/// **Producer self-identification.** Before any per-row line, this test
-/// prints ONE `HEADER` line carrying `compute_capability` (via
-/// `jammi_kernels::admission::probe_cuda_compute_capability`, the same
-/// probe [`gpu_composition_floor`] gates dispatch on), `device_name` (via
-/// the sibling `probe_cuda_device_name`, the CUDA driver's own device-name
-/// string when this build/arch can query it), and
-/// `jammi_encoders_version` (`env!("CARGO_PKG_VERSION")`) -- so a captured
-/// log substantiates, from the file alone, which arch/build produced it,
-/// rather than relying on an out-of-band host label. Every per-row/
-/// per-composition line after it keeps the pre-existing byte-stable
-/// format unchanged (downstream tooling greps those lines).
-#[test]
-#[cfg(feature = "live-gpu-tests")]
-#[ignore = "measurement-only: prints ratios for GPU floor derivation, asserts nothing beyond finiteness"]
-fn measure_gpu_floors_print_only() {
-    let test_name = "measure_gpu_floors_print_only";
-    let device = jammi_test_resources::cuda_device(0);
-
-    // Producer self-identification: printed ONCE, before any per-row line,
-    // so a captured log substantiates which arch/build produced it rather
-    // than relying on the invoking human to remember which host they ran
-    // on. Uses the SAME probes
-    // `gpu_composition_floor` gates dispatch on
-    // (`probe_cuda_compute_capability`) plus its sibling
-    // (`probe_cuda_device_name`) -- see both functions' docs in
-    // `jammi_kernels::admission` for the "reads the CONTEXT candle already
-    // holds, never binds a fresh one" rationale shared by both probes, and
-    // for why a probe failure collapses to `"unknown"` here rather than a
-    // panic (this line is identification metadata for a measurement run,
-    // not an admission predicate: report reality, never guess
-    // a wrong device). Every subsequent per-row/per-composition line below
-    // keeps its existing byte-stable format unchanged.
-    {
-        use jammi_kernels::admission::{probe_cuda_compute_capability, probe_cuda_device_name};
-        let compute_capability = probe_cuda_compute_capability(&device)
-            .map(|cap| format!("{}.{}", cap.major, cap.minor))
-            .unwrap_or_else(|| "unknown".to_string());
-        let device_name = probe_cuda_device_name(&device).unwrap_or_else(|| "unknown".to_string());
-        eprintln!(
-            "{test_name}: HEADER compute_capability={compute_capability} \
-             device_name={device_name} jammi_encoders_version={}",
-            env!("CARGO_PKG_VERSION"),
-        );
     }
 
-    let config = load_config();
-    let encoder = build_encoder(&device, DType::BF16, &config);
-    let truth_encoder = build_encoder(&Device::Cpu, DType::F32, &config);
-    let base = build_fixture(&device);
+    /// Arch-CONSISTENT, MEASURED dtype-rounding drift bound for each
+    /// `bf16`-CUDA arm's [`relative_l1_error`] against the independently
+    /// computed `f32`-CPU truth (`ratio_alone_vs_truth`, `ratio_batch_vs_truth`)
+    /// -- a DIFFERENT quantity from [`gpu_composition_floor`]'s
+    /// composition-invariance floor: "does bf16 agree with itself across
+    /// compositions" and "does bf16 agree with f32 truth" can diverge
+    /// independently -- two bf16 arms can drift IDENTICALLY away from truth (a
+    /// real dtype-rounding regression) while still agreeing with EACH OTHER,
+    /// which would pass a composition-invariance-only check vacuously.
+    /// Measured by `measure_gpu_floors_print_only`: a100, h100 and a40 all
+    /// report IDENTICAL values, `alone_vs_truth mean=3.5208168455960124e-3`
+    /// `max=4.222114077112533e-3` (`batch_vs_truth` identical to
+    /// `alone_vs_truth`); l40s measures
+    /// `alone_vs_truth mean=3.597633555417087e-3` `max=4.233727028564512e-3` --
+    /// the cross-arch worst max across all four.
+    ///
+    /// ONE bound serves every arch here (unlike [`gpu_composition_floor`],
+    /// which splits arch-conditionally): the dtype-rounding noise this bound
+    /// governs (`bf16` round-to-nearest storage error) is a property of the
+    /// dtype/kernel choice, not the GEMM reduction-order divergence that made
+    /// the composition floor arch-split -- measured evidence bears this out.
+    /// Reproducibly, from the numbers above: the MAX spread between l40s and
+    /// the three identical arches is
+    /// `(4.233727028564512e-3 - 4.222114077112533e-3) /
+    /// 4.222114077112533e-3 ~= 0.275%`, and the MEAN spread is
+    /// `(3.597633555417087e-3 - 3.5208168455960124e-3) /
+    /// 3.5208168455960124e-3 ~= 2.18%` -- both well under the composition
+    /// floor's `0` vs `4.1e-3` split (an effectively-infinite relative
+    /// spread, since the exact-arches side is exactly `0.0`).
+    ///
+    /// Derivation (the margin convention of `crates/jammi-kernels/tests/cuda_parity.rs`'s
+    /// `lora_linear_dx_abs_floor` sibling comment: "`dx_bound_margin`'s sibling
+    /// comment used `2.0x` against a measured `1.34x` need"; `2.0x` chosen over
+    /// this file's own tighter `1.02x` composition-floor margin because this
+    /// bound has no red-control separation ceiling pushing back against a
+    /// generous margin):
+    /// ```text
+    /// cross-arch max (l40s):
+    ///   4.233727028564512e-3
+    /// margin (2.0x):
+    ///   4.233727028564512e-3 * 2.0 = 8.467454057129024e-3
+    /// rounded UP to a clean value (never round down past the margin):
+    ///   1e-2
+    /// ```
+    /// giving `~2.36x` headroom over the measured cross-arch worst case
+    /// (`1e-2 / 4.233727028564512e-3 ~= 2.362x`).
+    const GPU_TRUTH_DRIFT_BOUND: f64 = 1e-2;
 
-    let mut all_alone_vs_truth: Vec<f64> = Vec::new();
-    let mut all_batch_vs_truth: Vec<f64> = Vec::new();
-    let mut all_alone_vs_batch: Vec<f64> = Vec::new();
-    let mut all_row_len_control: Vec<f64> = Vec::new();
-    let mut all_window_control: Vec<f64> = Vec::new();
-
-    for &composition_id in MEASUREMENT_COMPOSITION_SWEEP.iter() {
-        let indices = composition_row_indices(composition_id, base.rows.len());
-        let (rows, lengths, ids, mask) = build_composition(&device, &base, &indices);
+    #[test]
+    fn pooled_embedding_alone_matches_padded_batch_real_row_bf16_cuda() {
+        let test_name = "pooled_embedding_alone_matches_padded_batch_real_row_bf16_cuda";
+        let device = jammi_test_resources::cuda_device(0);
+        let composition_floor = gpu_composition_floor(&device);
+        require_measured_floor(test_name, "gpu_composition_floor", composition_floor);
+        require_measured_floor(test_name, "GPU_TRUTH_DRIFT_BOUND", GPU_TRUTH_DRIFT_BOUND);
+        let config = load_config();
+        let encoder = build_encoder(&device, DType::BF16, &config);
+        let fixture = build_fixture(&device);
         let pooled_batch = encoder
-            .forward(&ids, &mask)
-            .expect("measurement composition forward (bf16 cuda)");
+            .forward(&fixture.ids_padded, &fixture.mask_padded)
+            .expect("padded batch forward (bf16 cuda)");
         let pooled_batch: Vec<Vec<f32>> = pooled_batch
             .to_dtype(DType::F32)
             .unwrap()
             .to_vec2()
             .unwrap();
 
-        let mut comp_alone_vs_truth = Vec::with_capacity(rows.len());
-        let mut comp_batch_vs_truth = Vec::with_capacity(rows.len());
-        let mut comp_alone_vs_batch = Vec::with_capacity(rows.len());
+        // f32-truth anchor: the CPU f32 forward of each row's alone
+        // composition, independent of the CUDA bf16 arm under test.
+        let truth_encoder = build_encoder(&Device::Cpu, DType::F32, &config);
 
-        for (slot, row) in rows.iter().enumerate() {
+        for (b, row) in fixture.rows.iter().enumerate() {
             let alone_bf16 = pooled_alone(&encoder, &device, row);
             let truth = pooled_alone(&truth_encoder, &Device::Cpu, row);
             let ratio_alone_vs_truth = relative_l1_error(&alone_bf16, &truth);
-            let ratio_batch_vs_truth = relative_l1_error(&pooled_batch[slot], &truth);
-            let ratio_alone_vs_batch = relative_l1_error(&alone_bf16, &pooled_batch[slot]);
+            let ratio_batch_vs_truth = relative_l1_error(&pooled_batch[b], &truth);
+            let ratio_alone_vs_batch = relative_l1_error(&alone_bf16, &pooled_batch[b]);
             eprintln!(
-                "{test_name}: composition={composition_id} row_slot={slot} len={} \
-                 alone_vs_truth={ratio_alone_vs_truth:e} batch_vs_truth={ratio_batch_vs_truth:e} \
-                 alone_vs_batch={ratio_alone_vs_batch:e}",
-                lengths[slot],
+                "row={b} alone_vs_truth={ratio_alone_vs_truth:e} batch_vs_truth={ratio_batch_vs_truth:e} \
+                 alone_vs_batch={ratio_alone_vs_batch:e} (composition floor \
+                 {composition_floor:e}, drift bound {GPU_TRUTH_DRIFT_BOUND:e})"
+            );
+            // Truth-tracking control: each bf16 arm -- alone AND
+            // batch, independently -- must itself stay within
+            // `GPU_TRUTH_DRIFT_BOUND` of the f32-CPU truth. Without these two
+            // asserts, two bf16 arms that drift IDENTICALLY away from truth
+            // would still agree with each other and pass the alone-vs-batch
+            // assertion below, hiding a real dtype-rounding regression inside a
+            // cancelling agreement.
+            assert!(
+                ratio_alone_vs_truth.is_finite() && ratio_alone_vs_truth < GPU_TRUTH_DRIFT_BOUND,
+                "row {b}: bf16 alone-vs-f32-truth relative_l1_error {ratio_alone_vs_truth:e} exceeds \
+                 the measured dtype-rounding drift bound {GPU_TRUTH_DRIFT_BOUND:e}"
             );
             assert!(
-                ratio_alone_vs_truth.is_finite(),
-                "{test_name}: composition={composition_id} row_slot={slot} ratio_alone_vs_truth \
-                 is non-finite ({ratio_alone_vs_truth}) -- a NaN/inf measurement is a RED \
-                 finding, not usable data"
+                ratio_batch_vs_truth.is_finite() && ratio_batch_vs_truth < GPU_TRUTH_DRIFT_BOUND,
+                "row {b}: bf16 batch-vs-f32-truth relative_l1_error {ratio_batch_vs_truth:e} exceeds \
+                 the measured dtype-rounding drift bound {GPU_TRUTH_DRIFT_BOUND:e}"
             );
             assert!(
-                ratio_batch_vs_truth.is_finite(),
-                "{test_name}: composition={composition_id} row_slot={slot} ratio_batch_vs_truth \
-                 is non-finite ({ratio_batch_vs_truth}) -- a NaN/inf measurement is a RED \
-                 finding, not usable data"
+                ratio_alone_vs_batch.is_finite() && ratio_alone_vs_batch < composition_floor,
+                "row {b}: bf16 alone-vs-batch relative_l1_error {ratio_alone_vs_batch:e} exceeds the \
+                 measured per-arch composition floor {composition_floor:e}"
             );
-            assert!(
-                ratio_alone_vs_batch.is_finite(),
-                "{test_name}: composition={composition_id} row_slot={slot} ratio_alone_vs_batch \
-                 is non-finite ({ratio_alone_vs_batch}) -- a NaN/inf measurement is a RED \
-                 finding, not usable data"
-            );
-            comp_alone_vs_truth.push(ratio_alone_vs_truth);
-            comp_batch_vs_truth.push(ratio_batch_vs_truth);
-            comp_alone_vs_batch.push(ratio_alone_vs_batch);
         }
+    }
 
-        let comp_max_alone_vs_truth = measurement_max(&comp_alone_vs_truth);
-        let comp_max_batch_vs_truth = measurement_max(&comp_batch_vs_truth);
-        let comp_max_alone_vs_batch = measurement_max(&comp_alone_vs_batch);
-        eprintln!(
-            "{test_name}: composition={composition_id} MAX OVER {} ROWS: \
-             max_alone_vs_truth={comp_max_alone_vs_truth:e} \
-             max_batch_vs_truth={comp_max_batch_vs_truth:e} \
-             max_alone_vs_batch={comp_max_alone_vs_batch:e}",
-            rows.len(),
-        );
+    #[test]
+    fn pooled_embedding_red_control_row_length_off_by_one_bf16_cuda() {
+        let test_name = "pooled_embedding_red_control_row_length_off_by_one_bf16_cuda";
+        let device = jammi_test_resources::cuda_device(0);
+        let composition_floor = gpu_composition_floor(&device);
+        require_measured_floor(test_name, "gpu_composition_floor", composition_floor);
+        let config = load_config();
+        let encoder = build_encoder(&device, DType::BF16, &config);
+        let fixture = build_fixture(&device);
 
-        all_alone_vs_truth.extend_from_slice(&comp_alone_vs_truth);
-        all_batch_vs_truth.extend_from_slice(&comp_batch_vs_truth);
-        all_alone_vs_batch.extend_from_slice(&comp_alone_vs_batch);
-
-        // Red control 1 (row_lengths off-by-one), THIS composition's own
-        // slot 0: same construction as
-        // `pooled_embedding_red_control_row_length_off_by_one_bf16_cuda`
-        // above, scoped to this composition's batch.
-        let mut mask_mut = vec![0u32; lengths.len() * base.seq];
-        let mut ids_mut = vec![0u32; lengths.len() * base.seq];
-        for (slot, (row, &len)) in rows.iter().zip(lengths.iter()).enumerate() {
-            let take = if slot == 0 {
-                len.saturating_sub(1)
-            } else {
-                len
-            };
-            for (i, &t) in row.iter().enumerate() {
-                ids_mut[slot * base.seq + i] = t;
-            }
+        let mut mask_mut = vec![0u32; fixture.batch * fixture.seq];
+        for (b, row) in fixture.rows.iter().enumerate() {
+            let take = if b == 0 { row.len() - 1 } else { row.len() };
             for i in 0..take {
-                mask_mut[slot * base.seq + i] = 1;
+                mask_mut[b * fixture.seq + i] = 1;
             }
         }
-        let ids_mut_t = Tensor::from_vec(ids_mut, (lengths.len(), base.seq), &device).unwrap();
-        let mask_mut_t = Tensor::from_vec(mask_mut, (lengths.len(), base.seq), &device).unwrap();
+        let mask_mut = Tensor::from_vec(mask_mut, (fixture.batch, fixture.seq), &device).unwrap();
         let pooled_batch_mut = encoder
-            .forward(&ids_mut_t, &mask_mut_t)
-            .expect("row-length control forward (bf16 cuda)");
+            .forward(&fixture.ids_padded, &mask_mut)
+            .expect("mutated-length padded batch forward (bf16 cuda)");
         let pooled_batch_mut: Vec<Vec<f32>> = pooled_batch_mut
             .to_dtype(DType::F32)
             .unwrap()
             .to_vec2()
             .unwrap();
-        let alone0 = pooled_alone(&encoder, &device, &rows[0]);
-        let row_len_ratio = relative_l1_error(&alone0, &pooled_batch_mut[0]);
-        eprintln!(
-            "{test_name}: composition={composition_id} RED_CONTROL row_length_off_by_one \
-             ratio={row_len_ratio:e}"
-        );
-        assert!(
-            row_len_ratio.is_finite(),
-            "{test_name}: composition={composition_id} row_length_off_by_one control ratio is \
-             non-finite ({row_len_ratio}) -- a RED finding, not usable data"
-        );
-        all_row_len_control.push(row_len_ratio);
 
-        // Red control 2 (window radius off-by-one), THIS composition's
-        // longest row -- checked premise mirrors the gating control's own
-        // (a composition whose longest row cannot bind the window under
-        // BOTH configs is SKIPPED here, printed as such, rather than
-        // silently counted as a pass).
+        let alone0 = pooled_alone(&encoder, &device, &fixture.rows[0]);
+        let ratio = relative_l1_error(&alone0, &pooled_batch_mut[0]);
+        // Row-length control is conjunctive with the window-radius control on
+        // every arch it runs on, but its admissibility is
+        // COMPOSITION-SCOPED on sm89: this composition-0 fixture's measured
+        // ratio (`6.881763611768685e-2`) clears the asserted threshold
+        // `SM89_COMPOSITION_FLOOR * 5.0` (`2.1e-2`) by `~3.28x`, but
+        // compositions 2, 5, and 7 measure BELOW that same threshold on sm89
+        // and would not pass this exact assert if this test built one of THEM
+        // instead -- see `gpu_composition_floor`'s own doc for the full
+        // per-composition measurements and the scoping statement.
+        assert!(
+            ratio.is_finite() && ratio > composition_floor * 5.0,
+            "row_lengths off-by-one control failed to separate above the measured bf16 floor \
+             (ratio={ratio:e}, required > {:e})",
+            composition_floor * 5.0,
+        );
+    }
+
+    #[test]
+    fn pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda() {
+        let test_name = "pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda";
+        let device = jammi_test_resources::cuda_device(0);
+        // On sm89 (L40S) bf16 composition noise (SM89_COMPOSITION_FLOOR, 4.2e-3)
+        // exceeds this control's separation (measured minimum 1.14e-3): a one-token
+        // window change cannot be told from noise there, so the control has no
+        // power on that arch and the sm89 lane does not run it. The row-length
+        // control above does separate on sm89.
+        use jammi_kernels::admission::{probe_cuda_compute_capability, ComputeCapability};
+        assert_ne!(
+            probe_cuda_compute_capability(&device),
+            Some(ComputeCapability::new(8, 9)),
+            "the window-radius red control cannot separate from sm89's bf16 composition noise; \
+             run it on an exact-arch device (sm80/86/90)"
+        );
+        let composition_floor = gpu_composition_floor(&device);
+        require_measured_floor(test_name, "gpu_composition_floor", composition_floor);
+        let config = load_config();
+        let fixture = build_fixture(&device);
+
         let mut mutant_config = config.clone();
         mutant_config.local_attention = config.local_attention + 2;
-        assert_eq!(
-            mutant_config.half_window(),
-            config.half_window() + 1,
-            "checked premise: the mutant config must actually change half_window by exactly 1"
-        );
-        let (long_slot, &long_len) = lengths
+        assert_eq!(mutant_config.half_window(), config.half_window() + 1);
+
+        let long_idx = fixture
+            .lengths
             .iter()
             .enumerate()
             .max_by_key(|&(_, &len)| len)
-            .expect("composition is non-empty");
-        if long_len >= mutant_config.half_window() + 2 && long_len >= config.half_window() + 2 {
-            let encoder_mut = build_encoder(&device, DType::BF16, &mutant_config);
-            let alone_long = pooled_alone(&encoder, &device, &rows[long_slot]);
-            let pooled_batch_mut_window = encoder_mut
+            .map(|(i, _)| i)
+            .expect("fixture is non-empty");
+        let long_len = fixture.lengths[long_idx];
+        assert!(long_len >= mutant_config.half_window() + 2);
+        assert!(long_len >= config.half_window() + 2);
+
+        let encoder = build_encoder(&device, DType::BF16, &config);
+        let encoder_mut = build_encoder(&device, DType::BF16, &mutant_config);
+
+        let alone_long = pooled_alone(&encoder, &device, &fixture.rows[long_idx]);
+        let pooled_batch_mut = encoder_mut
+            .forward(&fixture.ids_padded, &fixture.mask_padded)
+            .expect("mutant-window padded batch forward (bf16 cuda)");
+        let pooled_batch_mut: Vec<Vec<f32>> = pooled_batch_mut
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec2()
+            .unwrap();
+
+        let ratio = relative_l1_error(&alone_long, &pooled_batch_mut[long_idx]);
+        // On the exact-arch class this control's own measured min separation (`7.508231757090548e-4`)
+        // clears `EXACT_ARCH_COMPOSITION_FLOOR * 5.0` (`5e-5`) by `~15x` -- see
+        // `gpu_composition_floor`'s own doc.
+        assert!(
+            ratio.is_finite() && ratio > composition_floor * 5.0,
+            "window radius off-by-one control failed to separate above the measured bf16 floor \
+             (ratio={ratio:e}, required > {:e})",
+            composition_floor * 5.0,
+        );
+    }
+
+    /// The 8 batch compositions this measurement sweeps, all built from the
+    /// SAME 16-row pool [`build_fixture`] returns (same token content, same
+    /// per-row lengths) -- only which rows participate and in what order/total
+    /// batch size varies, so any divergence measured here traces to composition
+    /// (operand shape), never to content drift between compositions.
+    const MEASUREMENT_COMPOSITION_SWEEP: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+    /// Maps a `composition_id` (`0..8`, [`MEASUREMENT_COMPOSITION_SWEEP`]) to
+    /// the row indices (into [`build_fixture`]'s 16-row pool) that compose that
+    /// batch: full set, both halves, even/odd interleave, full-reversed-order,
+    /// and two overlapping three-quarter windows -- eight structurally distinct
+    /// `(batch, seq)` operand shapes and orderings from one fixed content pool.
+    fn composition_row_indices(composition_id: usize, n: usize) -> Vec<usize> {
+        match composition_id {
+            0 => (0..n).collect(),
+            1 => (0..n / 2).collect(),
+            2 => (n / 2..n).collect(),
+            3 => (0..n).step_by(2).collect(),
+            4 => (1..n).step_by(2).collect(),
+            5 => (0..n).rev().collect(),
+            6 => (0..(n * 3 / 4)).collect(),
+            7 => (n / 4..n).collect(),
+            other => {
+                panic!("composition_row_indices: unknown composition_id {other} (expected 0..8)")
+            }
+        }
+    }
+
+    /// Builds one composed padded batch (rows/lengths + device tensors) from a
+    /// subset of `base`'s row pool, in the given order -- reuses
+    /// [`build_fixture`]'s row content/lengths verbatim (no re-derivation) so
+    /// every composition draws from the identical content this file's gating
+    /// tests already exercise.
+    fn build_composition(
+        device: &Device,
+        base: &Fixture,
+        row_indices: &[usize],
+    ) -> (Vec<Vec<u32>>, Vec<usize>, Tensor, Tensor) {
+        let seq = base.seq;
+        let batch = row_indices.len();
+        assert!(batch > 0, "build_composition: empty composition");
+        let mut ids_padded = vec![0u32; batch * seq];
+        let mut mask_padded = vec![0u32; batch * seq];
+        let mut rows = Vec::with_capacity(batch);
+        let mut lengths = Vec::with_capacity(batch);
+        for (slot, &idx) in row_indices.iter().enumerate() {
+            let row = &base.rows[idx];
+            for (i, &t) in row.iter().enumerate() {
+                ids_padded[slot * seq + i] = t;
+                mask_padded[slot * seq + i] = 1;
+            }
+            rows.push(row.clone());
+            lengths.push(base.lengths[idx]);
+        }
+        let ids = Tensor::from_vec(ids_padded, (batch, seq), device).unwrap();
+        let mask = Tensor::from_vec(mask_padded, (batch, seq), device).unwrap();
+        (rows, lengths, ids, mask)
+    }
+
+    /// `total_cmp`-folded max over `values` -- the same fixed fold-order/tie-break
+    /// discipline `mean_max` in `src/modernbert.rs` uses, re-derived
+    /// here since this file does not import that module's private helper (see
+    /// this file's own module doc on why it re-derives its small helpers).
+    fn measurement_max(values: &[f64]) -> f64 {
+        values.iter().copied().fold(f64::NEG_INFINITY, |a, b| {
+            if b.total_cmp(&a).is_gt() {
+                b
+            } else {
+                a
+            }
+        })
+    }
+
+    /// `(mean, total_cmp-folded max)` over `values`. Panics on an empty slice --
+    /// a measurement sweep that produced zero data points is itself a defect in
+    /// this test, not a `0.0`/`NaN` result to silently propagate.
+    fn measurement_mean_max(values: &[f64]) -> (f64, f64) {
+        assert!(!values.is_empty(), "measurement_mean_max: empty slice");
+        let sum: f64 = values.iter().sum();
+        let mean = sum / values.len() as f64;
+        (mean, measurement_max(values))
+    }
+
+    /// MEASUREMENT-ONLY, print-only, `#[ignore]`d by default (see this test's
+    /// own attribute for the exact rationale) -- computes and prints, for every
+    /// row of every composition in [`MEASUREMENT_COMPOSITION_SWEEP`], the exact
+    /// three ratios the gating `bf16`-CUDA tests above assert
+    /// (`ratio_alone_vs_truth`, `ratio_batch_vs_truth`, `ratio_alone_vs_batch`,
+    /// via the identical [`relative_l1_error`] function those tests call), plus
+    /// each composition's own red-control separations
+    /// (row_lengths off-by-one, window radius off-by-one), so the
+    /// conjunctive-control admissibility check the module doc requires can be
+    /// derived from THIS SAME run rather than a second invocation. Asserts
+    /// ONLY finiteness on every printed ratio: a `NaN`/`inf` measurement is
+    /// itself a RED finding here (this test's job is to report reality, not
+    /// pass), never silently dropped or averaged away.
+    ///
+    /// It runs only on request: `#[cfg(feature = "live-gpu-tests")]` keeps it
+    /// out of a plain `cargo test -p jammi-encoders` build, and `#[ignore]`
+    /// keeps it out of a `live-gpu-tests` run unless `--ignored` (or
+    /// `--include-ignored`) is passed.
+    ///
+    /// Invocation: `cargo test -p jammi-encoders --features live-gpu-tests
+    /// --test it measure_gpu_floors -- --ignored --nocapture`; device 0 is
+    /// acquired through `jammi_test_resources::cuda_device`, which panics
+    /// naming the missing device.
+    ///
+    /// **Producer self-identification.** Before any per-row line, this test
+    /// prints ONE `HEADER` line carrying `compute_capability` (via
+    /// `jammi_kernels::admission::probe_cuda_compute_capability`, the same
+    /// probe [`gpu_composition_floor`] gates dispatch on), `device_name` (via
+    /// the sibling `probe_cuda_device_name`, the CUDA driver's own device-name
+    /// string when this build/arch can query it), and
+    /// `jammi_encoders_version` (`env!("CARGO_PKG_VERSION")`) -- so a captured
+    /// log substantiates, from the file alone, which arch/build produced it,
+    /// rather than relying on an out-of-band host label. Every per-row/
+    /// per-composition line after it keeps the pre-existing byte-stable
+    /// format unchanged (downstream tooling greps those lines).
+    #[test]
+    #[ignore = "measurement-only: prints ratios for GPU floor derivation, asserts nothing beyond finiteness"]
+    fn measure_gpu_floors_print_only() {
+        let test_name = "measure_gpu_floors_print_only";
+        let device = jammi_test_resources::cuda_device(0);
+
+        // Producer self-identification: printed ONCE, before any per-row line,
+        // so a captured log substantiates which arch/build produced it rather
+        // than relying on the invoking human to remember which host they ran
+        // on. Uses the SAME probes
+        // `gpu_composition_floor` gates dispatch on
+        // (`probe_cuda_compute_capability`) plus its sibling
+        // (`probe_cuda_device_name`) -- see both functions' docs in
+        // `jammi_kernels::admission` for the "reads the CONTEXT candle already
+        // holds, never binds a fresh one" rationale shared by both probes, and
+        // for why a probe failure collapses to `"unknown"` here rather than a
+        // panic (this line is identification metadata for a measurement run,
+        // not an admission predicate: report reality, never guess
+        // a wrong device). Every subsequent per-row/per-composition line below
+        // keeps its existing byte-stable format unchanged.
+        {
+            use jammi_kernels::admission::{probe_cuda_compute_capability, probe_cuda_device_name};
+            let compute_capability = probe_cuda_compute_capability(&device)
+                .map(|cap| format!("{}.{}", cap.major, cap.minor))
+                .unwrap_or_else(|| "unknown".to_string());
+            let device_name =
+                probe_cuda_device_name(&device).unwrap_or_else(|| "unknown".to_string());
+            eprintln!(
+                "{test_name}: HEADER compute_capability={compute_capability} \
+                 device_name={device_name} jammi_encoders_version={}",
+                env!("CARGO_PKG_VERSION"),
+            );
+        }
+
+        let config = load_config();
+        let encoder = build_encoder(&device, DType::BF16, &config);
+        let truth_encoder = build_encoder(&Device::Cpu, DType::F32, &config);
+        let base = build_fixture(&device);
+
+        let mut all_alone_vs_truth: Vec<f64> = Vec::new();
+        let mut all_batch_vs_truth: Vec<f64> = Vec::new();
+        let mut all_alone_vs_batch: Vec<f64> = Vec::new();
+        let mut all_row_len_control: Vec<f64> = Vec::new();
+        let mut all_window_control: Vec<f64> = Vec::new();
+
+        for &composition_id in MEASUREMENT_COMPOSITION_SWEEP.iter() {
+            let indices = composition_row_indices(composition_id, base.rows.len());
+            let (rows, lengths, ids, mask) = build_composition(&device, &base, &indices);
+            let pooled_batch = encoder
                 .forward(&ids, &mask)
-                .expect("window control forward (bf16 cuda)");
-            let pooled_batch_mut_window: Vec<Vec<f32>> = pooled_batch_mut_window
+                .expect("measurement composition forward (bf16 cuda)");
+            let pooled_batch: Vec<Vec<f32>> = pooled_batch
                 .to_dtype(DType::F32)
                 .unwrap()
                 .to_vec2()
                 .unwrap();
-            let window_ratio = relative_l1_error(&alone_long, &pooled_batch_mut_window[long_slot]);
+
+            let mut comp_alone_vs_truth = Vec::with_capacity(rows.len());
+            let mut comp_batch_vs_truth = Vec::with_capacity(rows.len());
+            let mut comp_alone_vs_batch = Vec::with_capacity(rows.len());
+
+            for (slot, row) in rows.iter().enumerate() {
+                let alone_bf16 = pooled_alone(&encoder, &device, row);
+                let truth = pooled_alone(&truth_encoder, &Device::Cpu, row);
+                let ratio_alone_vs_truth = relative_l1_error(&alone_bf16, &truth);
+                let ratio_batch_vs_truth = relative_l1_error(&pooled_batch[slot], &truth);
+                let ratio_alone_vs_batch = relative_l1_error(&alone_bf16, &pooled_batch[slot]);
+                eprintln!(
+                    "{test_name}: composition={composition_id} row_slot={slot} len={} \
+                     alone_vs_truth={ratio_alone_vs_truth:e} batch_vs_truth={ratio_batch_vs_truth:e} \
+                     alone_vs_batch={ratio_alone_vs_batch:e}",
+                    lengths[slot],
+                );
+                assert!(
+                    ratio_alone_vs_truth.is_finite(),
+                    "{test_name}: composition={composition_id} row_slot={slot} ratio_alone_vs_truth \
+                     is non-finite ({ratio_alone_vs_truth}) -- a NaN/inf measurement is a RED \
+                     finding, not usable data"
+                );
+                assert!(
+                    ratio_batch_vs_truth.is_finite(),
+                    "{test_name}: composition={composition_id} row_slot={slot} ratio_batch_vs_truth \
+                     is non-finite ({ratio_batch_vs_truth}) -- a NaN/inf measurement is a RED \
+                     finding, not usable data"
+                );
+                assert!(
+                    ratio_alone_vs_batch.is_finite(),
+                    "{test_name}: composition={composition_id} row_slot={slot} ratio_alone_vs_batch \
+                     is non-finite ({ratio_alone_vs_batch}) -- a NaN/inf measurement is a RED \
+                     finding, not usable data"
+                );
+                comp_alone_vs_truth.push(ratio_alone_vs_truth);
+                comp_batch_vs_truth.push(ratio_batch_vs_truth);
+                comp_alone_vs_batch.push(ratio_alone_vs_batch);
+            }
+
+            let comp_max_alone_vs_truth = measurement_max(&comp_alone_vs_truth);
+            let comp_max_batch_vs_truth = measurement_max(&comp_batch_vs_truth);
+            let comp_max_alone_vs_batch = measurement_max(&comp_alone_vs_batch);
             eprintln!(
-                "{test_name}: composition={composition_id} RED_CONTROL window_radius_off_by_one \
-                 row_slot={long_slot} len={long_len} ratio={window_ratio:e}"
+                "{test_name}: composition={composition_id} MAX OVER {} ROWS: \
+                 max_alone_vs_truth={comp_max_alone_vs_truth:e} \
+                 max_batch_vs_truth={comp_max_batch_vs_truth:e} \
+                 max_alone_vs_batch={comp_max_alone_vs_batch:e}",
+                rows.len(),
+            );
+
+            all_alone_vs_truth.extend_from_slice(&comp_alone_vs_truth);
+            all_batch_vs_truth.extend_from_slice(&comp_batch_vs_truth);
+            all_alone_vs_batch.extend_from_slice(&comp_alone_vs_batch);
+
+            // Red control 1 (row_lengths off-by-one), THIS composition's own
+            // slot 0: same construction as
+            // `pooled_embedding_red_control_row_length_off_by_one_bf16_cuda`
+            // above, scoped to this composition's batch.
+            let mut mask_mut = vec![0u32; lengths.len() * base.seq];
+            let mut ids_mut = vec![0u32; lengths.len() * base.seq];
+            for (slot, (row, &len)) in rows.iter().zip(lengths.iter()).enumerate() {
+                let take = if slot == 0 {
+                    len.saturating_sub(1)
+                } else {
+                    len
+                };
+                for (i, &t) in row.iter().enumerate() {
+                    ids_mut[slot * base.seq + i] = t;
+                }
+                for i in 0..take {
+                    mask_mut[slot * base.seq + i] = 1;
+                }
+            }
+            let ids_mut_t = Tensor::from_vec(ids_mut, (lengths.len(), base.seq), &device).unwrap();
+            let mask_mut_t =
+                Tensor::from_vec(mask_mut, (lengths.len(), base.seq), &device).unwrap();
+            let pooled_batch_mut = encoder
+                .forward(&ids_mut_t, &mask_mut_t)
+                .expect("row-length control forward (bf16 cuda)");
+            let pooled_batch_mut: Vec<Vec<f32>> = pooled_batch_mut
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_vec2()
+                .unwrap();
+            let alone0 = pooled_alone(&encoder, &device, &rows[0]);
+            let row_len_ratio = relative_l1_error(&alone0, &pooled_batch_mut[0]);
+            eprintln!(
+                "{test_name}: composition={composition_id} RED_CONTROL row_length_off_by_one \
+                 ratio={row_len_ratio:e}"
             );
             assert!(
-                window_ratio.is_finite(),
-                "{test_name}: composition={composition_id} window_radius_off_by_one control \
-                 ratio is non-finite ({window_ratio}) -- a RED finding, not usable data"
+                row_len_ratio.is_finite(),
+                "{test_name}: composition={composition_id} row_length_off_by_one control ratio is \
+                 non-finite ({row_len_ratio}) -- a RED finding, not usable data"
             );
-            all_window_control.push(window_ratio);
+            all_row_len_control.push(row_len_ratio);
+
+            // Red control 2 (window radius off-by-one), THIS composition's
+            // longest row -- checked premise mirrors the gating control's own
+            // (a composition whose longest row cannot bind the window under
+            // BOTH configs is SKIPPED here, printed as such, rather than
+            // silently counted as a pass).
+            let mut mutant_config = config.clone();
+            mutant_config.local_attention = config.local_attention + 2;
+            assert_eq!(
+                mutant_config.half_window(),
+                config.half_window() + 1,
+                "checked premise: the mutant config must actually change half_window by exactly 1"
+            );
+            let (long_slot, &long_len) = lengths
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, &len)| len)
+                .expect("composition is non-empty");
+            if long_len >= mutant_config.half_window() + 2 && long_len >= config.half_window() + 2 {
+                let encoder_mut = build_encoder(&device, DType::BF16, &mutant_config);
+                let alone_long = pooled_alone(&encoder, &device, &rows[long_slot]);
+                let pooled_batch_mut_window = encoder_mut
+                    .forward(&ids, &mask)
+                    .expect("window control forward (bf16 cuda)");
+                let pooled_batch_mut_window: Vec<Vec<f32>> = pooled_batch_mut_window
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .to_vec2()
+                    .unwrap();
+                let window_ratio =
+                    relative_l1_error(&alone_long, &pooled_batch_mut_window[long_slot]);
+                eprintln!(
+                    "{test_name}: composition={composition_id} RED_CONTROL window_radius_off_by_one \
+                     row_slot={long_slot} len={long_len} ratio={window_ratio:e}"
+                );
+                assert!(
+                    window_ratio.is_finite(),
+                    "{test_name}: composition={composition_id} window_radius_off_by_one control \
+                     ratio is non-finite ({window_ratio}) -- a RED finding, not usable data"
+                );
+                all_window_control.push(window_ratio);
+            } else {
+                eprintln!(
+                    "{test_name}: composition={composition_id} RED_CONTROL window_radius_off_by_one \
+                     SKIPPED -- longest row (len={long_len}) does not clear half_window+2 for both \
+                     configs in this composition (window_threshold original={}, mutant={})",
+                    config.half_window() + 2,
+                    mutant_config.half_window() + 2,
+                );
+            }
+        }
+
+        let (mean_a2t, max_a2t) = measurement_mean_max(&all_alone_vs_truth);
+        let (mean_b2t, max_b2t) = measurement_mean_max(&all_batch_vs_truth);
+        let (mean_a2b, max_a2b) = measurement_mean_max(&all_alone_vs_batch);
+        eprintln!(
+            "{test_name}: OVERALL OVER {} COMPOSITIONS / {} ROW-MEASUREMENTS: \
+             alone_vs_truth mean={mean_a2t:e} max={max_a2t:e} | batch_vs_truth mean={mean_b2t:e} \
+             max={max_b2t:e} | alone_vs_batch mean={mean_a2b:e} max={max_a2b:e} \
+             (these bound GPU_TRUTH_DRIFT_BOUND [alone_vs_truth/batch_vs_truth] and \
+             gpu_composition_floor [alone_vs_batch] respectively)",
+            MEASUREMENT_COMPOSITION_SWEEP.len(),
+            all_alone_vs_truth.len(),
+        );
+        if all_row_len_control.is_empty() {
+            eprintln!("{test_name}: row_length_off_by_one control produced ZERO measurements");
         } else {
+            let (mean_rl, max_rl) = measurement_mean_max(&all_row_len_control);
             eprintln!(
-                "{test_name}: composition={composition_id} RED_CONTROL window_radius_off_by_one \
-                 SKIPPED -- longest row (len={long_len}) does not clear half_window+2 for both \
-                 configs in this composition (window_threshold original={}, mutant={})",
-                config.half_window() + 2,
-                mutant_config.half_window() + 2,
+                "{test_name}: OVERALL row_length_off_by_one control OVER {} COMPOSITIONS: \
+                 mean={mean_rl:e} max={max_rl:e}",
+                all_row_len_control.len(),
             );
         }
-    }
+        if all_window_control.is_empty() {
+            eprintln!(
+                "{test_name}: window_radius_off_by_one control had ZERO admissible compositions -- \
+                 see per-composition SKIPPED lines above"
+            );
+        } else {
+            let (mean_w, max_w) = measurement_mean_max(&all_window_control);
+            eprintln!(
+                "{test_name}: OVERALL window_radius_off_by_one control OVER {} COMPOSITIONS: \
+                 mean={mean_w:e} max={max_w:e}",
+                all_window_control.len(),
+            );
+        }
 
-    let (mean_a2t, max_a2t) = measurement_mean_max(&all_alone_vs_truth);
-    let (mean_b2t, max_b2t) = measurement_mean_max(&all_batch_vs_truth);
-    let (mean_a2b, max_a2b) = measurement_mean_max(&all_alone_vs_batch);
-    eprintln!(
-        "{test_name}: OVERALL OVER {} COMPOSITIONS / {} ROW-MEASUREMENTS: \
-         alone_vs_truth mean={mean_a2t:e} max={max_a2t:e} | batch_vs_truth mean={mean_b2t:e} \
-         max={max_b2t:e} | alone_vs_batch mean={mean_a2b:e} max={max_a2b:e} \
-         (these bound GPU_TRUTH_DRIFT_BOUND [alone_vs_truth/batch_vs_truth] and \
-         gpu_composition_floor [alone_vs_batch] respectively)",
-        MEASUREMENT_COMPOSITION_SWEEP.len(),
-        all_alone_vs_truth.len(),
-    );
-    if all_row_len_control.is_empty() {
-        eprintln!("{test_name}: row_length_off_by_one control produced ZERO measurements");
-    } else {
-        let (mean_rl, max_rl) = measurement_mean_max(&all_row_len_control);
         eprintln!(
-            "{test_name}: OVERALL row_length_off_by_one control OVER {} COMPOSITIONS: \
-             mean={mean_rl:e} max={max_rl:e}",
-            all_row_len_control.len(),
+            "{test_name}: measurement complete -- these numbers are the derivation input for \
+             gpu_composition_floor's EXACT_ARCH_COMPOSITION_FLOOR / SM89_COMPOSITION_FLOOR and \
+             GPU_TRUTH_DRIFT_BOUND; folding them into those constants (with safety-margin \
+             arithmetic documented there) is a separate change, not this test -- this test \
+             asserts finiteness only and gates nothing"
         );
     }
-    if all_window_control.is_empty() {
-        eprintln!(
-            "{test_name}: window_radius_off_by_one control had ZERO admissible compositions -- \
-             see per-composition SKIPPED lines above"
-        );
-    } else {
-        let (mean_w, max_w) = measurement_mean_max(&all_window_control);
-        eprintln!(
-            "{test_name}: OVERALL window_radius_off_by_one control OVER {} COMPOSITIONS: \
-             mean={mean_w:e} max={max_w:e}",
-            all_window_control.len(),
-        );
-    }
-
-    eprintln!(
-        "{test_name}: measurement complete -- these numbers are the derivation input for \
-         gpu_composition_floor's EXACT_ARCH_COMPOSITION_FLOOR / SM89_COMPOSITION_FLOOR and \
-         GPU_TRUTH_DRIFT_BOUND; folding them into those constants (with safety-margin \
-         arithmetic documented there) is a separate change, not this test -- this test \
-         asserts finiteness only and gates nothing"
-    );
 }

@@ -257,24 +257,27 @@ fn cpu_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero() {
     assert_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero(&Device::Cpu);
 }
 
-/// The CUDA leg — compiled only under `live-gpu-tests`: proves
-/// `crate::cuda::layer_norm::cuda_bwd_dgamma`'s `rows == 0, hidden != 0`
-/// fast path returns a `[hidden]`-shaped, all-zero `dgamma`, matching
-/// `cpu_fwd` exactly.
 #[cfg(feature = "live-gpu-tests")]
-#[test]
-fn cuda_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero() {
-    let device = jammi_test_resources::cuda_device(0);
-    assert_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero(&device);
-}
+mod gpu {
+    use super::*;
 
-/// The CUDA leg — compiled only under `live-gpu-tests`: proves
-/// `crate::cuda::{dropout,layer_norm,softmax,attention_block}`'s glue
-/// refuses the SAME fixtures the CPU leg above does, rather than silently
-/// admitting them through a zero-element fast path.
-#[cfg(feature = "live-gpu-tests")]
-#[test]
-fn cuda_refuses_empty_non_contiguous_admission_across_representative_ops() {
-    let device = jammi_test_resources::cuda_device(0);
-    assert_class_refuses_empty_non_contiguous_admission(&device);
+    /// The CUDA leg — compiled only under `live-gpu-tests`: proves
+    /// `crate::cuda::layer_norm::cuda_bwd_dgamma`'s `rows == 0, hidden != 0`
+    /// fast path returns a `[hidden]`-shaped, all-zero `dgamma`, matching
+    /// `cpu_fwd` exactly.
+    #[test]
+    fn cuda_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero() {
+        let device = jammi_test_resources::cuda_device(0);
+        assert_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero(&device);
+    }
+
+    /// The CUDA leg — compiled only under `live-gpu-tests`: proves
+    /// `crate::cuda::{dropout,layer_norm,softmax,attention_block}`'s glue
+    /// refuses the SAME fixtures the CPU leg above does, rather than silently
+    /// admitting them through a zero-element fast path.
+    #[test]
+    fn cuda_refuses_empty_non_contiguous_admission_across_representative_ops() {
+        let device = jammi_test_resources::cuda_device(0);
+        assert_class_refuses_empty_non_contiguous_admission(&device);
+    }
 }

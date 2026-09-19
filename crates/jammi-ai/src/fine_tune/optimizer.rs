@@ -1477,71 +1477,6 @@ mod tests {
         assert_eq!(clipped_f32.dtype(), DType::F32);
     }
 
-    /// The SAME oracle body on CUDA, plus CPU/CUDA BIT-identity of the
-    /// clipped gradients in this finite cell. Why bit-identity is the right
-    /// expectation and not a tolerance: every partial sum in the fixture is
-    /// an exactly-representable integer, so the per-`Var` `sum_all` and the
-    /// fold are exact on both backends regardless of their reduction order;
-    /// `sqrt`/`div` are correctly rounded on both (nvcc's default
-    /// `-prec-sqrt=true`/`-prec-div=true`; candle-kernels does not build with
-    /// `-use_fast_math`); `affine(1.0, 1e-6)` is `x * 1.0 + 1e-6`, where
-    /// `x * 1.0` is exact, so an FMA contraction on the GPU rounds once to
-    /// the same value the CPU's two ops produce; `Tensor::full` materializing
-    /// `max_norm` is a pure memory fill (`const_set`, no arithmetic — the
-    /// SAME bit pattern on both backends) and `minimum(1.0)` are exact; and
-    /// the final `broadcast_mul` is one rounding per element on both.
-    ///
-    /// The NaN cell is a DELIBERATE CPU≠CUDA divergence, not covered by the
-    /// identity assertion: candle-core-0.11.0 `src/op.rs:460` implements
-    /// `Minimum` as `if v1 > v2 { v2 } else { v1 }` — a NaN `v1` fails the
-    /// comparison and is returned, so on CPU a NaN coefficient stays NaN and
-    /// poisons EVERY gradient — while candle-kernels-0.11.0
-    /// `src/cuda_utils.cuh:144` implements it as `fminf`, IEEE `minNum`,
-    /// which returns the non-NaN operand: on CUDA the coefficient clamps to
-    /// `1.0` and only the gradient that was already NaN stays NaN. Neither
-    /// arm changes what `refuse_nonfinite_norm` sees — `total_norm` itself is
-    /// NaN on both, computed before the clamp — so the typed refusal is
-    /// device-independent ON A CADENCE STEP. OFF cadence, `clip_and_step`
-    /// skips `refuse_nonfinite_norm` and DOES consume the rescaled store:
-    /// `optimizer.step` runs over it, so on CPU every parameter is poisoned
-    /// at once while on CUDA only the already-NaN gradient's parameter is
-    /// — a real CPU≠CUDA divergence in the parameters until the next
-    /// cadence point (step 1, every `check_every_n_steps`, or the last
-    /// step) refuses the norm, with `TrainingLoop::refuse_nonfinite_params`'
-    /// epoch-boundary read as the backstop that keeps either arm out of a
-    /// checkpoint. `nan_gradient_poisons_every_gradient_through_the_cpu_
-    /// minimum` pins the CPU arm; this leg pins the CUDA arm.
-    #[cfg(feature = "live-gpu-tests")]
-    #[test]
-    fn multi_var_clip_matches_host_reference_on_cuda_and_is_bit_identical_to_cpu() {
-        let cuda = jammi_test_resources::cuda_device(0);
-        let after_cuda = assert_multi_var_clip_matches_host(&cuda);
-        let after_cpu = assert_multi_var_clip_matches_host(&Device::Cpu);
-        for (i, (c, g)) in after_cuda.iter().zip(&after_cpu).enumerate() {
-            let c_bits: Vec<u32> = c.iter().map(|x| x.to_bits()).collect();
-            let g_bits: Vec<u32> = g.iter().map(|x| x.to_bits()).collect();
-            assert_eq!(
-                c_bits, g_bits,
-                "Var {i}: CUDA-clipped gradient must be bit-identical to the CPU-clipped one \
-                 in the finite cell (cuda {c:?} vs cpu {g:?})"
-            );
-        }
-
-        // The NaN cell's CUDA arm: `fminf(NaN, 1.0) == 1.0`, so the finite
-        // Var's gradient passes through UNCHANGED (bit-identical to before)
-        // while `total_norm` is still NaN for the refusal to see.
-        let (vars, mut grads, before) = one_nan_var_one_finite_var(&cuda);
-        let total_norm = clip_gradients(&vars, &mut grads, 1.0)
-            .unwrap()
-            .unwrap_clipped();
-        assert!(total_norm.to_scalar::<f32>().unwrap().is_nan());
-        let finite_after: Vec<f32> = grads.get(vars[1].as_tensor()).unwrap().to_vec1().unwrap();
-        assert_eq!(
-            finite_after, before,
-            "CUDA's fminf clamps a NaN coefficient to 1.0: the finite gradient is untouched"
-        );
-    }
-
     /// Two `Var`s: the first with an all-NaN gradient, the second with a
     /// finite one (`2.0` × 3). Returns the finite gradient's pre-clip values.
     fn one_nan_var_one_finite_var(device: &Device) -> (Vec<Var>, GradStore, Vec<f32>) {
@@ -1626,64 +1561,6 @@ mod tests {
             sync_read_count(),
             before,
             "clip_gradients must not perform any device→host read"
-        );
-    }
-
-    /// The CUDA leg of the same structural-proxy claim: `SYNC_READ_COUNT` is the only way a
-    /// test can observe "no device→host read happened" on ANY backend — there
-    /// is no CUDA stream a `#[test]` can inspect directly — so this counts
-    /// `to_scalar`/`to_vec` calls through the exact SAME structural proxy
-    /// [`clip_gradients_never_reads_the_norm_back`] uses, on a real CUDA
-    /// device, across the FULL timed path (`clip_and_step`, not a bare
-    /// `clip_gradients`): a bare clip (0 reads), an OFF-cadence `clip_and_
-    /// step` (0 reads — the cadence gate must suppress the read entirely,
-    /// not merely skip acting on it), and an ON-cadence `clip_and_step`
-    /// (EXACTLY 1 read — [`refuse_nonfinite_norm`] is the only permitted
-    /// device→host call on this path, never zero and never more than one
-    /// per cadence-gated step).
-    #[cfg(feature = "live-gpu-tests")]
-    #[test]
-    #[serial(grad_clip_sync_read_count)]
-    fn clip_gradients_never_reads_the_norm_back_on_cuda() {
-        let cuda = jammi_test_resources::cuda_device(0);
-
-        // Bare clip_gradients: 0 reads.
-        let before = sync_read_count();
-        let (vars, mut grads, _before) = four_vars_with_grads(&cuda);
-        let _norm_on_device = clip_gradients(&vars, &mut grads, 1.0)
-            .unwrap()
-            .unwrap_clipped();
-        assert_eq!(
-            sync_read_count(),
-            before,
-            "CUDA: clip_gradients must not perform any device→host read"
-        );
-
-        // OFF-cadence clip_and_step: still 0 reads, even with a fresh
-        // GradStore and a real AdamW step riding along.
-        let (vars2, mut grads2, _before2) = four_vars_with_grads(&cuda);
-        let mut optimizer = AdamW::new(vars2.clone(), params_adamw(0.1)).unwrap();
-        let before_off = sync_read_count();
-        clip_and_step(&mut optimizer, &vars2, &mut grads2, 1.0, 10, 3, false).unwrap();
-        assert_eq!(
-            sync_read_count(),
-            before_off,
-            "CUDA: an off-cadence clip_and_step must not read the norm back at all"
-        );
-
-        // ON-cadence clip_and_step: EXACTLY 1 read (refuse_nonfinite_norm),
-        // never more.
-        let (vars3, mut grads3, _before3) = four_vars_with_grads(&cuda);
-        let mut optimizer3 = AdamW::new(vars3.clone(), params_adamw(0.1)).unwrap();
-        let before_on = sync_read_count();
-        clip_and_step(&mut optimizer3, &vars3, &mut grads3, 1.0, 10, 10, false).unwrap();
-        assert_eq!(
-            sync_read_count(),
-            before_on + 1,
-            "CUDA: an on-cadence clip_and_step must read the norm back EXACTLY once, through \
-             refuse_nonfinite_norm — never zero (the finite check would be silently skipped) \
-             and never more than one (a second sync would defeat the whole optimization this \
-             module exists for)"
         );
     }
 
@@ -2125,5 +2002,131 @@ mod tests {
             after[0].to_bits(),
             expected_old.to_bits()
         );
+    }
+
+    #[cfg(feature = "live-gpu-tests")]
+    mod gpu {
+        use super::*;
+
+        /// The SAME oracle body on CUDA, plus CPU/CUDA BIT-identity of the
+        /// clipped gradients in this finite cell. Why bit-identity is the right
+        /// expectation and not a tolerance: every partial sum in the fixture is
+        /// an exactly-representable integer, so the per-`Var` `sum_all` and the
+        /// fold are exact on both backends regardless of their reduction order;
+        /// `sqrt`/`div` are correctly rounded on both (nvcc's default
+        /// `-prec-sqrt=true`/`-prec-div=true`; candle-kernels does not build with
+        /// `-use_fast_math`); `affine(1.0, 1e-6)` is `x * 1.0 + 1e-6`, where
+        /// `x * 1.0` is exact, so an FMA contraction on the GPU rounds once to
+        /// the same value the CPU's two ops produce; `Tensor::full` materializing
+        /// `max_norm` is a pure memory fill (`const_set`, no arithmetic — the
+        /// SAME bit pattern on both backends) and `minimum(1.0)` are exact; and
+        /// the final `broadcast_mul` is one rounding per element on both.
+        ///
+        /// The NaN cell is a DELIBERATE CPU≠CUDA divergence, not covered by the
+        /// identity assertion: candle-core-0.11.0 `src/op.rs:460` implements
+        /// `Minimum` as `if v1 > v2 { v2 } else { v1 }` — a NaN `v1` fails the
+        /// comparison and is returned, so on CPU a NaN coefficient stays NaN and
+        /// poisons EVERY gradient — while candle-kernels-0.11.0
+        /// `src/cuda_utils.cuh:144` implements it as `fminf`, IEEE `minNum`,
+        /// which returns the non-NaN operand: on CUDA the coefficient clamps to
+        /// `1.0` and only the gradient that was already NaN stays NaN. Neither
+        /// arm changes what `refuse_nonfinite_norm` sees — `total_norm` itself is
+        /// NaN on both, computed before the clamp — so the typed refusal is
+        /// device-independent ON A CADENCE STEP. OFF cadence, `clip_and_step`
+        /// skips `refuse_nonfinite_norm` and DOES consume the rescaled store:
+        /// `optimizer.step` runs over it, so on CPU every parameter is poisoned
+        /// at once while on CUDA only the already-NaN gradient's parameter is
+        /// — a real CPU≠CUDA divergence in the parameters until the next
+        /// cadence point (step 1, every `check_every_n_steps`, or the last
+        /// step) refuses the norm, with `TrainingLoop::refuse_nonfinite_params`'
+        /// epoch-boundary read as the backstop that keeps either arm out of a
+        /// checkpoint. `nan_gradient_poisons_every_gradient_through_the_cpu_
+        /// minimum` pins the CPU arm; this leg pins the CUDA arm.
+        #[test]
+        fn multi_var_clip_matches_host_reference_on_cuda_and_is_bit_identical_to_cpu() {
+            let cuda = jammi_test_resources::cuda_device(0);
+            let after_cuda = assert_multi_var_clip_matches_host(&cuda);
+            let after_cpu = assert_multi_var_clip_matches_host(&Device::Cpu);
+            for (i, (c, g)) in after_cuda.iter().zip(&after_cpu).enumerate() {
+                let c_bits: Vec<u32> = c.iter().map(|x| x.to_bits()).collect();
+                let g_bits: Vec<u32> = g.iter().map(|x| x.to_bits()).collect();
+                assert_eq!(
+                    c_bits, g_bits,
+                    "Var {i}: CUDA-clipped gradient must be bit-identical to the CPU-clipped one \
+                     in the finite cell (cuda {c:?} vs cpu {g:?})"
+                );
+            }
+
+            // The NaN cell's CUDA arm: `fminf(NaN, 1.0) == 1.0`, so the finite
+            // Var's gradient passes through UNCHANGED (bit-identical to before)
+            // while `total_norm` is still NaN for the refusal to see.
+            let (vars, mut grads, before) = one_nan_var_one_finite_var(&cuda);
+            let total_norm = clip_gradients(&vars, &mut grads, 1.0)
+                .unwrap()
+                .unwrap_clipped();
+            assert!(total_norm.to_scalar::<f32>().unwrap().is_nan());
+            let finite_after: Vec<f32> = grads.get(vars[1].as_tensor()).unwrap().to_vec1().unwrap();
+            assert_eq!(
+                finite_after, before,
+                "CUDA's fminf clamps a NaN coefficient to 1.0: the finite gradient is untouched"
+            );
+        }
+
+        /// The CUDA leg of the same structural-proxy claim: `SYNC_READ_COUNT` is the only way a
+        /// test can observe "no device→host read happened" on ANY backend — there
+        /// is no CUDA stream a `#[test]` can inspect directly — so this counts
+        /// `to_scalar`/`to_vec` calls through the exact SAME structural proxy
+        /// [`clip_gradients_never_reads_the_norm_back`] uses, on a real CUDA
+        /// device, across the FULL timed path (`clip_and_step`, not a bare
+        /// `clip_gradients`): a bare clip (0 reads), an OFF-cadence `clip_and_
+        /// step` (0 reads — the cadence gate must suppress the read entirely,
+        /// not merely skip acting on it), and an ON-cadence `clip_and_step`
+        /// (EXACTLY 1 read — [`refuse_nonfinite_norm`] is the only permitted
+        /// device→host call on this path, never zero and never more than one
+        /// per cadence-gated step).
+        #[test]
+        #[serial(grad_clip_sync_read_count)]
+        fn clip_gradients_never_reads_the_norm_back_on_cuda() {
+            let cuda = jammi_test_resources::cuda_device(0);
+
+            // Bare clip_gradients: 0 reads.
+            let before = sync_read_count();
+            let (vars, mut grads, _before) = four_vars_with_grads(&cuda);
+            let _norm_on_device = clip_gradients(&vars, &mut grads, 1.0)
+                .unwrap()
+                .unwrap_clipped();
+            assert_eq!(
+                sync_read_count(),
+                before,
+                "CUDA: clip_gradients must not perform any device→host read"
+            );
+
+            // OFF-cadence clip_and_step: still 0 reads, even with a fresh
+            // GradStore and a real AdamW step riding along.
+            let (vars2, mut grads2, _before2) = four_vars_with_grads(&cuda);
+            let mut optimizer = AdamW::new(vars2.clone(), params_adamw(0.1)).unwrap();
+            let before_off = sync_read_count();
+            clip_and_step(&mut optimizer, &vars2, &mut grads2, 1.0, 10, 3, false).unwrap();
+            assert_eq!(
+                sync_read_count(),
+                before_off,
+                "CUDA: an off-cadence clip_and_step must not read the norm back at all"
+            );
+
+            // ON-cadence clip_and_step: EXACTLY 1 read (refuse_nonfinite_norm),
+            // never more.
+            let (vars3, mut grads3, _before3) = four_vars_with_grads(&cuda);
+            let mut optimizer3 = AdamW::new(vars3.clone(), params_adamw(0.1)).unwrap();
+            let before_on = sync_read_count();
+            clip_and_step(&mut optimizer3, &vars3, &mut grads3, 1.0, 10, 10, false).unwrap();
+            assert_eq!(
+                sync_read_count(),
+                before_on + 1,
+                "CUDA: an on-cadence clip_and_step must read the norm back EXACTLY once, through \
+                 refuse_nonfinite_norm — never zero (the finite check would be silently skipped) \
+                 and never more than one (a second sync would defeat the whole optimization this \
+                 module exists for)"
+            );
+        }
     }
 }

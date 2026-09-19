@@ -49,7 +49,7 @@ use jammi_test_utils::{cookbook_fixture, fixture, test_config};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
-use super::common::grpc::{catalog_client, channel};
+use crate::common::grpc::{catalog_client, channel};
 
 fn tiny_bert_model_id() -> String {
     format!("local:{}", cookbook_fixture("tiny_bert").display())
@@ -82,7 +82,7 @@ async fn start_gpu_embedding_server() -> (
     let store = SessionStore::new();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let chain = jammi_server::runtime::GrpcChain {
-        addr: super::common::grpc::ephemeral_addr(),
+        addr: crate::common::grpc::ephemeral_addr(),
         flight_ctx: session.context().clone(),
         flight_binding: session.tenant_binding_arc(),
         store: store.clone(),
@@ -94,7 +94,7 @@ async fn start_gpu_embedding_server() -> (
         admin_authorizer: None,
         limits: jammi_db::config::LimitsConfig::default(),
     };
-    let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
+    let (addr, handle) = crate::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
 
     (addr, shutdown_tx, dir, handle)
 }

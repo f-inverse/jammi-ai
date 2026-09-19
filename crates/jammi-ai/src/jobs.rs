@@ -237,8 +237,7 @@ impl ComputeSpec {
 /// (`crate::fine_tune::worker::JobWorker::run_claimed_compute_job` and
 /// the training claim paths cited above) already fold that error into a
 /// failure record keyed by the job's own id (`jobs.job_id` is the row's
-/// primary key), so the typed error is never anonymous in practice — see
-/// <https://github.com/f-inverse/jammi-ai/issues/548>.
+/// primary key), so the typed error is never anonymous in practice.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum JobSpec {
@@ -562,10 +561,9 @@ pub enum JobResult {
         metrics: Option<String>,
         /// Shares [`Self::Table::cache_outcome`]'s
         /// `"computed"`/`"reused:{name}"` vocabulary, but every training
-        /// kind always records `"computed"` today: model-level cache reuse
-        /// is not yet supported (`TrainingSpec::FineTune`'s own `cache`
-        /// field refuses `Use` at submit; see
-        /// <https://github.com/f-inverse/jammi-ai/issues/562>).
+        /// kind always records `"computed"`: there is no model-level cache
+        /// reuse (`TrainingSpec::FineTune`'s own `cache` field refuses `Use`
+        /// at submit).
         cache_outcome: String,
     },
     /// A compute kind's result table.
@@ -1730,8 +1728,8 @@ mod tests {
 
     /// A `NeighborGraph`/`AsofJoin` compute spec's param structs
     /// (`BuildNeighborGraph`, `AsofJoinSpec`) round-trip too, not just
-    /// `PropagateRequest` — the contract's "param structs gain
-    /// Serialize/Deserialize" covers all of them.
+    /// `PropagateRequest` — every compute kind's param struct is
+    /// Serialize/Deserialize.
     #[test]
     fn neighbor_graph_and_asof_join_specs_round_trip() {
         let ng = ComputeSpec::NeighborGraph {

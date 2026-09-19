@@ -329,7 +329,7 @@ pub async fn assert_deleted_adapter_refuses_by_name(
     }
 }
 
-/// Named-field parameter bundle for [`assert_esc089_cold_restart_controls`].
+/// Named-field parameter bundle for [`assert_cold_restart_controls`].
 ///
 /// A positional signature would hold three same-typed `&[f32]`
 /// (`v_base`/`v_warm`/`v_cold`) and two same-typed `&ServeFn`
@@ -339,7 +339,7 @@ pub async fn assert_deleted_adapter_refuses_by_name(
 /// params-struct convention for a naturally-wide argument list (see
 /// `crates/jammi-ai/src/fine_tune/worker.rs`'s `ModelRegistration`) rather
 /// than `#[allow(clippy::too_many_arguments)]`.
-pub struct Esc089ColdRestartControls<'a> {
+pub struct ColdRestartControls<'a> {
     /// The session's on-disk root, needed to locate and delete
     /// `adapter.safetensors` for the negative control.
     pub session_root: &'a Path,
@@ -370,8 +370,8 @@ pub struct Esc089ColdRestartControls<'a> {
 /// already-completed cold-restart round trip. Called identically by
 /// `tower_adapters.rs`'s three cross-modal `*_serves_cold_after_restart`
 /// tests and `fine_tune.rs`'s BERT-family peer.
-pub async fn assert_esc089_cold_restart_controls(controls: Esc089ColdRestartControls<'_>) {
-    let Esc089ColdRestartControls {
+pub async fn assert_cold_restart_controls(controls: ColdRestartControls<'_>) {
+    let ColdRestartControls {
         session_root,
         warm_session,
         cold_session,

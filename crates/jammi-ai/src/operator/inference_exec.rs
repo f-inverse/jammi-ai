@@ -341,8 +341,8 @@ impl ExecutionPlan for InferenceExec {
     /// `OrdinalSplitExec` and this node whenever it judges that repartitioning
     /// "benefits" — defeating the point of the split. Without this override
     /// (`vec![true]`), 60 of the 120-cell grid's cells fail
-    /// (`tests/it/rangesplit.rs`'s `rs1_nothing_between_split_and_
-    /// inference_across_the_grid`); the exact count shifts with which
+    /// (`tests/it/rangesplit.rs`'s
+    /// `nothing_between_split_and_inference_across_the_grid`); the exact count shifts with which
     /// optimizer passes fire.
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         vec![false]
@@ -433,7 +433,7 @@ impl ExecutionPlan for InferenceExec {
 /// `pipeline::embedding_refresh::infer_delta` all call this rather than
 /// each repeating the wrap/merge logic — the "four roots" invariant holds
 /// because all four share this one function, and is checked live by
-/// `tests/it/rangesplit.rs`'s `rs5_source_oracle` (a `syn`-based scan of
+/// `tests/it/rangesplit.rs`'s `split_merge_source_oracle` (a `syn`-based scan of
 /// every `InferenceExecBuilder::new` call site in this crate).
 pub fn wrap_with_split_and_merge(
     input: Arc<dyn ExecutionPlan>,

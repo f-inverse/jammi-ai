@@ -66,7 +66,7 @@ async fn definition_hash_for(dir: &Path) -> DefinitionHash {
     let descriptor = ProducingDescriptor::Embedding {
         model_id,
         task: ModelTask::TextEmbedding,
-        source_id: "esc057_source".to_string(),
+        source_id: "content_digest_source".to_string(),
         columns: vec!["text".to_string()],
         key_column: "id".to_string(),
         dimensions: DIMENSIONS,
@@ -145,10 +145,10 @@ async fn preprocessor_config_presence_and_mutation_change_the_definition_hash() 
 }
 
 /// (a3) The `config.json` peer of (a): mutating `config.json`'s bytes in
-/// place under a constant `model_id` must change `definition_hash`. Phase-5
-/// oracle fold-in — every OTHER digest slot (`1_Pooling/config.json`,
-/// `preprocessor_config.json`, tokenizer, weights, adapter pair) already has
-/// a dedicated byte-mutation oracle; `config.json` itself did not. The
+/// place under a constant `model_id` must change `definition_hash`. Every
+/// OTHER digest slot (`1_Pooling/config.json`, `preprocessor_config.json`,
+/// tokenizer, weights, adapter pair) has its own byte-mutation oracle; this
+/// is `config.json`'s. The
 /// mutation (a trailing newline appended to the file, identical technique to
 /// `tokenizer_bytes_mutation_changes_the_definition_hash` below) is a
 /// byte-level change that stays valid, parseable JSON, so the model still
@@ -294,7 +294,7 @@ async fn byte_identical_model_dirs_produce_the_identical_content_digest() {
 /// treats the adapter as present-but-inert (no projection/distribution head
 /// keys to wire up) and loads exactly like the unadapted base model
 /// numerically; only the adapter FILES' presence/bytes are under test here,
-/// mirroring `model::backend::candle::digest_fingerprint_audit62_tests`'
+/// mirroring `model::backend::candle::digest_fingerprint_tests`'
 /// `write_projection_adapter` (an independent copy: this crate cannot
 /// construct `jammi_ai::fine_tune::target::ProjectionHeadConfig` directly —
 /// two of its fields are `pub(crate)` to `jammi_ai` — so the adapter's

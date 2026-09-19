@@ -1,20 +1,19 @@
-//! UAT-CP9 workflows A/B/C — three third-tenant compositions that
+//! Workflows A/B/C — three third-tenant compositions that
 //! exercise the substrate primitives in concert.
 //!
-//! - Workflow A (Phase 1 + 2): search-attribution chain — multiple
+//! - Workflow A (provenance channels + mutable tables): search-attribution chain — multiple
 //!   retrievers contribute provenance channels, mutable companion table
 //!   holds ranking state across retrieval rounds.
-//! - Workflow B (Phase 1 + 2 + 3): feature-store SCD — two tenants
+//! - Workflow B (mutable tables + tenant scope): feature-store SCD — two tenants
 //!   maintain slowly-changing dimensions in mutable companion tables,
 //!   tenant scope isolates writes and reads.
-//! - Workflow C (Phase 2 + 3 + 4): CDC pipeline — two tenants publish
+//! - Workflow C (mutable tables + tenant scope + triggers): CDC pipeline — two tenants publish
 //!   change events to topics, subscribers filter by predicate, the
 //!   backing table holds the durable log.
 //!
 //! All three tests are hermetic — no model download, no network. The
-//! vocabulary is engine-neutral (papers, products, orders) so SPEC's
-//! discipline-test passes ("would a user who has never heard of
-//! AccuRisk/Lace care?").
+//! vocabulary is engine-neutral (papers, products, orders): each workflow is
+//! one a user who has never heard of any particular consumer would reach for.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -38,7 +37,7 @@ fn tenant_y() -> TenantId {
     TenantId::from_str("018f5a0e-c4c8-7e10-9c4f-bbbbbbbbbb02").unwrap()
 }
 
-/// UAT Workflow A — search-attribution chain (Phase 1 + 2).
+/// Workflow A — search-attribution chain.
 ///
 /// Three retrievers (`vector`, `bm25`, `citation_graph`) contribute
 /// provenance to a result set. A mutable companion table `ranking_state`
@@ -53,7 +52,7 @@ async fn uat_workflow_a_search_attribution_chain() {
         .await
         .unwrap();
 
-    // Phase 1: `bm25` is a seeded lexical channel (like `vector`), so only the
+    // Channels: `bm25` is a seeded lexical channel (like `vector`), so only the
     // genuinely custom `citation_graph` channel needs registering.
     session
         .catalog()
@@ -75,7 +74,7 @@ async fn uat_workflow_a_search_attribution_chain() {
         .await
         .unwrap();
 
-    // Phase 2: mutable table holds the latest best ranker per paper.
+    // Mutable table holds the latest best ranker per paper.
     let schema = Arc::new(Schema::new(vec![
         Field::new("paper_id", DataType::Utf8, false),
         Field::new("round", DataType::Int64, false),
@@ -100,7 +99,7 @@ async fn uat_workflow_a_search_attribution_chain() {
         .await
         .unwrap();
 
-    // Phase 1 merge: a single source batch with two channel contributions.
+    // Channel merge: a single source batch with two channel contributions.
     let source_schema = Arc::new(Schema::new(vec![
         Field::new("_row_id", DataType::Utf8, false),
         Field::new("_source_id", DataType::Utf8, false),
@@ -174,8 +173,7 @@ async fn uat_workflow_a_search_attribution_chain() {
     assert_eq!(count, 3);
 }
 
-/// UAT Workflow B — feature-store SCD with tenant isolation
-/// (Phase 1 + 2 + 3).
+/// Workflow B — feature-store SCD with tenant isolation.
 ///
 /// Two tenants maintain product feature snapshots in a `item_dimensions`
 /// mutable companion table. Each tenant's writes are scoped, reads are
@@ -242,8 +240,7 @@ async fn uat_workflow_b_feature_store_scd_isolates_two_tenants() {
     assert_eq!(n_y, 1, "Tenant Y sees its 1 row");
 }
 
-/// UAT Workflow C — CDC pipeline with tenant + predicate isolation
-/// (Phase 2 + 3 + 4).
+/// Workflow C — CDC pipeline with tenant + predicate isolation.
 ///
 /// Two tenants register `cdc_orders` topics independently (catalog
 /// `UNIQUE (name, tenant_id)` permits same name across tenants).

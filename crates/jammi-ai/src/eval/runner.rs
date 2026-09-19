@@ -180,7 +180,7 @@ impl<'a> EvalRunner<'a> {
             );
 
             // Multi-K recall reuses the numerics kernel — extended, not
-            // re-implemented — at the fixed J9 cutoffs.
+            // re-implemented — at the fixed `PER_QUERY_RECALL_KS` cutoffs.
             per_query_recalls.push(RetrievalMetrics::recall_at_ks(
                 &retrieved_ids,
                 &query.judgments,

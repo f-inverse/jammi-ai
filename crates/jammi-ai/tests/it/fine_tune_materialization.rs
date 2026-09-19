@@ -43,7 +43,7 @@ use crate::fine_tune::{session_with_training_data, tiny_bert_model};
 /// happen) — a test that needs a PUBLISHED artifact cannot adopt that
 /// tolerance, since a failed job publishes nothing to read back at all.
 ///
-/// This is still the right input for THIS suite's own oracle: the K2' fold
+/// This is still the right input for THIS suite's own oracle: the kernel-admission-profile fold
 /// under test (`render_kernel_admission_profile`'s `dtype` argument) reads
 /// `common.config.backbone_dtype` UNCONDITIONALLY of which arm trains — so
 /// `backbone_dtype: F16` here is exactly the value production's own fold
@@ -80,8 +80,8 @@ fn spec_with_backbone_dtype(
     }
 }
 
-/// [`spec_with_backbone_dtype`] at `F32` — every test in this file that
-/// predates the K2' backbone-dtype leg keeps this exact call, unchanged.
+/// [`spec_with_backbone_dtype`] at `F32` — the spec for every test in this
+/// file that does not vary the backbone dtype.
 fn spec_with_cache(cache: CachePolicy) -> TrainingSpec {
     spec_with_backbone_dtype(cache, jammi_numerics::ComputePrecision::F32)
 }
@@ -354,7 +354,7 @@ async fn every_published_object_sits_flat_under_its_own_row() {
     );
 }
 
-// ─── #546 K2': the ex-ante kernel-admission profile, end to end ──────────────
+// ─── The ex-ante kernel-admission profile, end to end ─────────────────────────
 //
 // Oracle (b): a fine-tune under `JAMMI_KERNELS_DISABLE` naming one op vs a
 // run with nothing disabled must produce DIFFERENT `DefinitionHash`es, and
@@ -553,7 +553,7 @@ async fn kernel_admission_profile_names_a_real_disabled_op_and_moves_the_definit
     );
 }
 
-/// #546's own oracle: a REAL `F16`-backbone fine-tune
+/// A REAL `F16`-backbone fine-tune
 /// (`spec_with_backbone_dtype` — see its own doc for why this stays on the
 /// plain arm rather than the encoder-adapters arm `acceleration_report.rs`
 /// uses) has its `DefinitionHash` MOVE under
@@ -562,11 +562,9 @@ async fn kernel_admission_profile_names_a_real_disabled_op_and_moves_the_definit
 /// (`Bf16`→`cast_scale_bf16_f32`, `F16`→`cast_scale_f16_f32`). The SAME
 /// disabled entry on an `F32` job (which resolves NO key under
 /// `cast_scale` at all — `n/a`) must NOT move that job's hash: the
-/// over-discrimination half of the same finding. This is item 2 of the
-/// re-audit's own directive; a `Bf16` leg was not asked for and is not
-/// added here (`validate_backbone_precision` is not even reached on the
-/// plain arm this suite trains on, so a `Bf16` leg here would prove
-/// nothing about that refusal either way).
+/// over-discrimination half. There is no `Bf16` leg: `validate_backbone_precision`
+/// is not reached on the plain arm this suite trains on, so a `Bf16` leg here
+/// would prove nothing about that refusal either way.
 #[tokio::test(flavor = "multi_thread")]
 async fn kernel_admission_profile_f16_backbone_moves_the_hash_under_its_own_cast_key() {
     let f16 = jammi_numerics::ComputePrecision::F16;
@@ -634,8 +632,8 @@ async fn kernel_admission_profile_two_identical_env_children_match() {
 /// An INERT `JAMMI_KERNELS_DISABLE` entry — a key that names no real
 /// [`jammi_kernels::admission::ProbedOpId`] row's resolved key at all —
 /// must render the SAME profile (and therefore the same `DefinitionHash`)
-/// as nothing disabled. This is the over-discrimination control the
-/// closing-audit block's own finding named: a disabled-set entry must only
+/// as nothing disabled. This is the over-discrimination control: a
+/// disabled-set entry must only
 /// ever move the line(s) it actually resolves against, never every line
 /// unconditionally.
 #[tokio::test(flavor = "multi_thread")]

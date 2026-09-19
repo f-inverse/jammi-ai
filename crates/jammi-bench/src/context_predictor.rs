@@ -799,7 +799,7 @@ mod tests {
         );
     }
 
-    /// The teeth, GATE-FAILS direction (RC1: an assertion must be able to fail).
+    /// The teeth, GATE-FAILS direction (an assertion must be able to fail).
     ///
     /// A perturbed serve — the SAME committed weights loaded under a regressed
     /// config — produces a different predict digest, proving the gate catches the
@@ -860,7 +860,7 @@ mod tests {
     }
 
     /// The committed throughput baseline gates with teeth: a run at the baseline
-    /// clears the gate, a run past the threshold fails it (RC1). Asserts the
+    /// clears the gate, a run past the threshold fails it. Asserts the
     /// committed baseline is a well-formed, generously-thresholded same-box
     /// reference without re-measuring the (slow) CPU training in the test lane.
     #[test]

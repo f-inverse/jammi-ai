@@ -148,24 +148,24 @@
 //!
 //! | field | class | jammi emit site | torch emit site |
 //! |---|---|---|---|
-//! | `seed` | identity | `grad_oracle.rs:GradOracleReport::seed` field, `run()`'s report literal | `"seed": args.seed` (`torch_grad_oracle.py:538`) |
-//! | `batch` | identity | `run()`'s report literal | `"batch": args.batch` (`torch_grad_oracle.py:532`) |
-//! | `seq` | identity | `run()`'s report literal | `"seq": args.seq` (`torch_grad_oracle.py:533`) |
-//! | `lora_rank` | identity | `run()`'s report literal | `"lora_rank": args.lora_rank` (`torch_grad_oracle.py:534`) |
-//! | `lora_alpha` | identity | `run()`'s report literal | `"lora_alpha": args.lora_alpha` (`torch_grad_oracle.py:535`) |
-//! | `target_modules` | identity | `run()`'s report literal | `"target_modules": [t.strip()` (`torch_grad_oracle.py:536`) |
-//! | `batched_forward` | identity | `run()`'s report literal | `"batched_forward": args.batched_forward` (`torch_grad_oracle.py:537`) |
-//! | `backbone_dtype` | identity | `run()`'s report literal (`format!("{:?}", ..).to_lowercase()`) | `translate_dtype_flag_to_jammi_spelling(args.dtype)` (`torch_grad_oracle.py:531`) |
-//! | `checkpoint_config_sha256` | identity | `sha256_and_len(&model_dir.join("config.json"))` — called in `run()` before the forward, via the SAME shared streaming implementation `finetune_step.rs` also uses: `pub(crate) fn sha256_and_len` (`finetune_step.rs:1158`) | `checkpoint_identity_fields = checkpoint_identity(args.model_dir)` (`torch_grad_oracle.py:413`) — `checkpoint_identity` is a bare alias for the real, streaming implementation torch_finetune_step.py's own `checkpoint_identity` function provides (see the two field citations directly below) |
-//! | `checkpoint_weights_sha256` | identity | `sha256_and_len(&weights)` | `"checkpoint_weights_sha256": weights_sha256` (`torch_finetune_step.py:685`) |
-//! | `checkpoint_weights_size_bytes` | identity | `sha256_and_len`'s byte-length return | `"checkpoint_weights_size_bytes": weights_len` (`torch_finetune_step.py:686`) |
+//! | `seed` | identity | `GradOracleReport::seed` field, `run()`'s report literal | `"seed": args.seed` (`torch_grad_oracle.py`'s report literal) |
+//! | `batch` | identity | `run()`'s report literal | `"batch": args.batch` (`torch_grad_oracle.py`'s report literal) |
+//! | `seq` | identity | `run()`'s report literal | `"seq": args.seq` (`torch_grad_oracle.py`'s report literal) |
+//! | `lora_rank` | identity | `run()`'s report literal | `"lora_rank": args.lora_rank` (`torch_grad_oracle.py`'s report literal) |
+//! | `lora_alpha` | identity | `run()`'s report literal | `"lora_alpha": args.lora_alpha` (`torch_grad_oracle.py`'s report literal) |
+//! | `target_modules` | identity | `run()`'s report literal | `"target_modules": [t.strip()` (`torch_grad_oracle.py`'s report literal) |
+//! | `batched_forward` | identity | `run()`'s report literal | `"batched_forward": args.batched_forward` (`torch_grad_oracle.py`'s report literal) |
+//! | `backbone_dtype` | identity | `run()`'s report literal (`format!("{:?}", ..).to_lowercase()`) | `translate_dtype_flag_to_jammi_spelling(args.dtype)` (`torch_grad_oracle.py`'s report literal) |
+//! | `checkpoint_config_sha256` | identity | `sha256_and_len(&model_dir.join("config.json"))` — called in `run()` before the forward, via the SAME shared streaming implementation `finetune_step.rs` also uses: `pub(crate) fn sha256_and_len` (`finetune_step.rs`) | `checkpoint_identity_fields = checkpoint_identity(args.model_dir)` (`torch_grad_oracle.py`'s `main`) — `checkpoint_identity` is a bare alias for the real, streaming implementation torch_finetune_step.py's own `checkpoint_identity` function provides (see the two field citations directly below) |
+//! | `checkpoint_weights_sha256` | identity | `sha256_and_len(&weights)` | `"checkpoint_weights_sha256": weights_sha256` (`torch_finetune_step.py`'s `checkpoint_identity`) |
+//! | `checkpoint_weights_size_bytes` | identity | `sha256_and_len`'s byte-length return | `"checkpoint_weights_size_bytes": weights_len` (`torch_finetune_step.py`'s `checkpoint_identity`) |
 //! | `lora_weights_in` (presence, not value) | identity (checked separately — `_premise_violations`'s `lora_weights_in` loop, not `RUN_IDENTITY_FIELDS`) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `batch_token_id_sums` | identity (checked separately, `or`-gated presence) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `model_dir` | provenance (human debugging only — a path string is not comparable across two boxes; superseded by the two checksum fields above) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
-//! | `device` / `device_name` | provenance | `run()`'s report literal (`device_name` reuses `finetune_step::device_name`) | `"provenance": tfs.provenance(device, fast_path_globals)` (`torch_grad_oracle.py:507`) |
+//! | `device` / `device_name` | provenance | `run()`'s report literal (`device_name` reuses `finetune_step::device_name`) | `"provenance": tfs.provenance(device, fast_path_globals)` (`torch_grad_oracle.py`'s report literal) |
 //! | `git_rev` (jammi) / `provenance.git_rev` (torch) | provenance | `tip_sha()`, called in `run()`'s report literal | `torch_finetune_step.py`'s `git_rev()`, via `provenance()` |
 //! | torch/transformers/peft versions | provenance (jammi has no equivalent — no torch/transformers/peft dependency) | n/a | same call site as the `device` row directly above (`torch_grad_oracle.py`'s `provenance` field) |
-//! | `attn_requested` / `attn_implementation` | provenance (jammi has no `--attn` lever; its own analog is the MEASUREMENT dispatch counters below) | n/a | `"attn_requested": args.attn` (`torch_grad_oracle.py:516`), `"attn_implementation": resolved_attn_implementation` (`torch_grad_oracle.py:517`), resolved in `run()` mirroring the identical pattern `torch_finetune_step.py`'s own `run()` already established (see `ab_merge.py`'s determinant table for that file's own citations of this exact pair) |
+//! | `attn_requested` / `attn_implementation` | provenance (jammi has no `--attn` lever; its own analog is the MEASUREMENT dispatch counters below) | n/a | `"attn_requested": args.attn`, `"attn_implementation": resolved_attn_implementation` (`torch_grad_oracle.py`'s report literal), resolved in `run()` mirroring the identical pattern `torch_finetune_step.py`'s own `run()` already established (see `ab_merge.py`'s determinant table for that file's own citations of this exact pair) |
 //! | `lora_dropout` | identity, but UNCONDITIONALLY forced to `0.0` by both producers so it can never legitimately differ — excluded from `RUN_IDENTITY_FIELDS` on that basis, not compared | `run()`'s report literal (hardcoded `0.0`) | `torch_grad_oracle.py`'s report literal (hardcoded `0.0`) |
 //! | `trainable_tensor_count` | measurement (redundant with the tensor NAME SET, which `compare_reports`'s `only_in_a`/`only_in_b` already checks structurally) | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
 //! | `loss` / `gradients` / per-tensor `weight` | measurement — the oracle's actual output | `run()`'s report literal | `torch_grad_oracle.py`'s report literal |
@@ -769,8 +769,8 @@ mod tests {
         second_params.lora_weights_in = Some(weights_path.clone());
         let second = run(&second_params).expect("second grad-oracle run");
 
-        // MUTATION-TRIAGE (cargo-mutants caught `path_display` surviving
-        // as `None`/`Some(String::new())`/`Some("xyzzy".into())`): pin the
+        // Mutation check (the cargo-mutants mutants replacing `path_display`
+        // with `None`/`Some(String::new())`/`Some("xyzzy".into())`): pin the
         // reported provenance strings against the ACTUAL paths passed in,
         // not just "some Option came back".
         let weights_path_str = weights_path.display().to_string();
@@ -883,9 +883,9 @@ mod tests {
         let _ = std::fs::remove_file(&weights_path);
     }
 
-    /// MUTATION-TRIAGE test (cargo-mutants caught `run()`'s `params.seed +
-    /// i` block-offset arithmetic surviving as `seed - i`/`seed * i`): the
-    /// three earlier tests above only assert "finite", "nonzero", and
+    /// Mutation test (the cargo-mutants mutants turning `run()`'s
+    /// `params.seed + i` block-offset arithmetic into `seed - i`/`seed * i`):
+    /// the three tests above only assert "finite", "nonzero", and
     /// "round-trips against ITSELF" -- none of them pin `seed + i`
     /// SPECIFICALLY, since a self-consistent-but-wrong formula still
     /// passes all of them. This test recomputes `synthetic_ids(.., seed +
@@ -929,9 +929,9 @@ mod tests {
         }
     }
 
-    /// MUTATION-TRIAGE test (cargo-mutants caught the batched arm's `all
-    /// .narrow(0, 2 * b, b)` — the negative group's row offset — surviving
-    /// as `2 + b`/`2 / b`): batched (one joined forward, split by
+    /// Mutation test (the cargo-mutants mutants turning the batched arm's
+    /// `all.narrow(0, 2 * b, b)` — the negative group's row offset — into
+    /// `2 + b`/`2 / b`): batched (one joined forward, split by
     /// `narrow`) and per-group (three separate forwards) MUST produce the
     /// identical loss/gradients for the SAME weights and the SAME
     /// synthetic batch — ModernBERT's per-row attention mask means no row

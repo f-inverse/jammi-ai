@@ -77,7 +77,7 @@ fn arrow_to_images_utf8view_matches_utf8_on_valid_paths() {
     }
 }
 
-/// The bad-path control the spec pins: a `Utf8View` column with one invalid
+/// The bad-path control: a `Utf8View` column with one invalid
 /// path must fail the WHOLE call, exactly like `Utf8` does — never degrade to
 /// a per-row error/None while `Utf8` stays whole-call.
 #[test]

@@ -164,7 +164,7 @@ pub fn build_prefix_columns(
     // the unit oracle `build_prefix_columns_refuses_a_key_that_cannot_cast_to_utf8`
     // below, and the end-to-end oracle
     // `crates/jammi-ai/tests/it/rangesplit.rs`'s
-    // `rs4_struct_key_through_annotate_is_a_typed_refusal_naming_the_key`).
+    // `struct_key_through_annotate_is_a_typed_refusal_naming_the_key`).
     let row_ids: ArrayRef = if keys.data_type() == &DataType::Utf8 {
         Arc::clone(keys)
     } else {

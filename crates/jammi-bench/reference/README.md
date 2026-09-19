@@ -214,12 +214,11 @@ flag; build a distribution/trajectory-equivalence test instead.
 ## Peak VRAM: two fields, two different jammi mappings — read before comparing
 
 `finetune_step.rs`'s `VramSampler` polls whole-device memory via `nvidia-smi`
-(`device_memory_used_bytes`, finetune_step.rs:225) on a background thread
-every 25ms (`std::thread::sleep`, finetune_step.rs:260) over the ENTIRE step
-loop (warmup + measured), then subtracts a baseline snapshot
-(`peak.saturating_sub(baseline)`, finetune_step.rs:276) read once, right
-after the model+optimizer are built (before the loop starts) — see
-`vram_baseline`, finetune_step.rs:821.
+(`nvidia_smi_memory_used`) on a background thread every 25ms
+(`VramSampler::start`) over the ENTIRE step loop (warmup + measured), then
+subtracts a baseline snapshot (`peak.saturating_sub(baseline)`,
+`VramSampler::finish`) read once, right after the model+optimizer are built
+(before the loop starts) — see `vram_baseline` in `run_with`.
 
 **Sampling point matters.** Polling `torch.cuda.memory_allocated()` once per
 step, at the same point the clock stops — i.e. AFTER `backward()` +

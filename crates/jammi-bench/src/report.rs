@@ -1428,9 +1428,9 @@ pub struct FinetuneStepTier {
     /// value per element of [`steps_measured`](Self::steps_measured), same
     /// length. Each entry is read once, from the same loss tensor
     /// `opt.step` for that iteration backpropagated through
-    /// (`finetune_step.rs`'s existing post-`opt.step` `.to_scalar()` read,
-    /// which exists to force the CUDA queue to completion before the clock
-    /// stops — no second device-to-host read was added to get this field).
+    /// (`finetune_step.rs`'s post-`opt.step` `.to_scalar()` read, which
+    /// exists to force the CUDA queue to completion before the clock stops —
+    /// this field costs no second device-to-host read).
     /// Reading the tensor AFTER `opt.step` only decides when the host
     /// blocks; the loss value itself was computed by the forward BEFORE
     /// that step's optimizer update, so `losses[i]` is the PRE-update loss
@@ -1796,7 +1796,8 @@ impl FinetuneStepTier {
     /// is the SUPERSET side of the subset check.
     /// The 18 comparison entries, plus five identity-completeness additions the
     /// comparison tuple omits BY DESIGN (provenance never compared
-    /// cross-producer — see `ab_merge.py:47-55`'s provenance rows): `device_name`,
+    /// cross-producer — see the provenance rows of `ab_merge.py`'s module-doc
+    /// determinant table): `device_name`,
     /// `kernels_disabled_requested`, `kernels_disabled_fired`,
     /// `flash_compiled`, `build_features`.
     ///

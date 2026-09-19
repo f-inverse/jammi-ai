@@ -1656,7 +1656,7 @@ mod f3_prime_tests {
 // ── Single-flight: a registered waiter never loses its wakeup ──
 
 #[cfg(test)]
-mod single_flight_advisory_tests {
+mod single_flight_tests {
     use super::*;
     use std::time::Duration;
 
@@ -1678,7 +1678,7 @@ mod single_flight_advisory_tests {
         let cache_dir = tempfile::tempdir().unwrap().keep();
         Arc::new(
             ArtifactStore::with_root(
-                StorageUrl::memory("single-flight-advisory-test-artifacts"),
+                StorageUrl::memory("single-flight-test-artifacts"),
                 StorageRegistry::new(),
                 cache_dir,
             )
@@ -2120,7 +2120,7 @@ mod admission_wake_tests {
     /// The final `tokio::time::timeout` turns such a hang into a clear, fast
     /// assertion failure instead of wedging CI, the same bound the
     /// single-flight lost-wakeup test
-    /// (`single_flight_advisory_tests::registered_waiter_always_wakes_even_if_notify_races_the_pause`)
+    /// (`single_flight_tests::registered_waiter_always_wakes_even_if_notify_races_the_pause`)
     /// uses.
     #[tokio::test]
     async fn plain_lru_eviction_wakes_once_the_blocking_guard_drops_even_with_no_permit_release() {
@@ -2238,13 +2238,11 @@ mod admission_wake_tests {
     }
 }
 
-// ── The load-bookkeeping write is an ALLOWLIST of the generic rows it may complete, fails CLOSED
-// on a catalog
-//    read error, and never overwrites a row a terminal producer already owns
-//    ──
+// The load-bookkeeping write is an ALLOWLIST of the generic rows it may complete, fails CLOSED
+// on a catalog read error, and never overwrites a row a terminal producer already owns.
 
 #[cfg(test)]
-mod esc_089_bookkeeping_tests {
+mod load_bookkeeping_tests {
     use super::*;
 
     use jammi_db::catalog::model_repo::RegisterModelParams;
@@ -2266,7 +2264,7 @@ mod esc_089_bookkeeping_tests {
         let cache_dir = tempfile::tempdir().unwrap().keep();
         Arc::new(
             ArtifactStore::with_root(
-                StorageUrl::memory("esc-089-test-artifacts"),
+                StorageUrl::memory("load-bookkeeping-test-artifacts"),
                 StorageRegistry::new(),
                 cache_dir,
             )
@@ -2337,9 +2335,9 @@ mod esc_089_bookkeeping_tests {
                 model_type: "open_clip",
                 backend: "candle",
                 task: ModelTask::ImageEmbedding,
-                base_model_id: Some("audit-owned-base"),
-                artifact_path: Some("/audit/owned/artifact/prefix"),
-                config_json: Some("{\"audit\":true}"),
+                base_model_id: Some("producer-owned-base"),
+                artifact_path: Some("/producer/owned/artifact/prefix"),
+                config_json: Some("{\"producer_owned\":true}"),
             })
             .await
             .unwrap();

@@ -1,9 +1,9 @@
 //! The file universe every source-enumerating oracle quantifies over, in one
 //! place: "every `.rs` file cargo compiles that is not a test target". Two
 //! oracles in two crates (`jammi-ai`'s submit-seam oracle, `jammi-db`'s raw
-//! byte-delete oracle) each once carried their own copy of this filter; a
-//! copy drifts, and a universe narrower than what cargo compiles lets the
-//! exact defect an enumerating gate exists to catch pass green.
+//! byte-delete oracle) share this one filter: a copy drifts, and a universe
+//! narrower than what cargo compiles lets the exact defect an enumerating gate
+//! exists to catch pass green.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -50,13 +50,8 @@ pub fn tracked_rs_files(root: &Path, dir: &str) -> Vec<String> {
 /// (`cargo clippy --workspace --all-targets` builds them, so a hand-built
 /// call placed in one compiles). Excluded: a crate's top-level `tests/`
 /// directory (its integration-test targets — `#[cfg(test)]` items inside
-/// compiled files are the scanner's own concern) and the `ci/fixtures/`
-/// tokenizer inputs, which are parsed by a checker's fixtures and never
-/// compiled.
+/// compiled files are the scanner's own concern).
 pub fn is_compiled_non_test_source(rel: &str) -> bool {
-    if rel.starts_with("ci/fixtures/") {
-        return false;
-    }
     // A crate's integration-test targets live in ITS top-level `tests/`
     // (`crates/<c>/tests/**`, `ci/tools/<t>/tests/**`). A `tests` component
     // deeper down (`examples/tests/main.rs`, `src/x/tests/mod.rs`) is a
@@ -89,7 +84,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_universe_admits_every_compiled_shape_and_refuses_test_targets_and_fixtures() {
+    fn the_universe_admits_every_compiled_shape_and_refuses_test_targets() {
         for admitted in [
             "crates/jammi-db/src/store/mod.rs",
             "crates/jammi-kernels/build.rs",
@@ -107,7 +102,6 @@ mod tests {
         for refused in [
             "crates/jammi-ai/tests/it/rank_admission.rs",
             "crates/jammi-db/tests/it/models_delete_call_sites.rs",
-            "ci/fixtures/kernel-oracle-tokenizer/chars.rs",
             "ci/tools/symbol-index/tests/smoke.rs",
         ] {
             assert!(

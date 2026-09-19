@@ -134,8 +134,8 @@ impl InferenceSession {
     /// Reads the table's recorded [`ProducingDescriptor`] and reconstructs the
     /// producing verb call from its typed parameters, running it through the
     /// unmodified `BuildingTable::finish` funnel with [`CachePolicy::Bypass`]
-    /// (a recompute always recomputes). A pre-contract table (no recorded
-    /// descriptor) is the typed [`JammiError::NotRecomputable`] — a loud refusal,
+    /// (a recompute always recomputes). A table with no recorded
+    /// descriptor is the typed [`JammiError::NotRecomputable`] — a loud refusal,
     /// never a re-run guessed from columns.
     ///
     /// `cascade` selects the bounded action: [`Cascade::ReportOnly`] recomputes
@@ -550,14 +550,12 @@ impl InferenceSession {
     ///   fails at the planner inside the verb, naming the missing relation —
     ///   the failure mode of a training set whose rows were projected from a
     ///   session-scoped relation rather than a durable registered source. No
-    ///   producer in this tree names one today: `materialize_projection` (the
-    ///   only [`ProducingDescriptor::TrainingSet`] producer) always reads a
+    ///   producer names one: `materialize_projection` (the only
+    ///   [`ProducingDescriptor::TrainingSet`] producer) always reads a
     ///   durable registered source, and the graph arm samples in memory and
-    ///   never writes a `TrainingSet` table at all
-    ///   (<https://github.com/f-inverse/jammi-ai/issues/538> tracks giving it
-    ///   a table of its own). This refusal stays because the planner error is
-    ///   the honest response to ANY table whose recorded source is not
-    ///   durable, not because one is expected today.
+    ///   never writes a `TrainingSet` table at all. The refusal exists because
+    ///   the planner error is the honest response to ANY table whose recorded
+    ///   source is not durable.
     async fn recompute_training_set(
         self: &Arc<Self>,
         table: &ResultTableRecord,

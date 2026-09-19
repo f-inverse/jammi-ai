@@ -1247,7 +1247,7 @@ async fn old_two_call_shape_straddles_a_publish_race_pin_current_version_does_no
     // it correctly (one resolution, not two).
     assert_ne!(
         early_anchor.anchor.0, late_manifest.identity,
-        "the old two-call shape (anchor resolved early, read resolved late) straddled the \
+        "the unpinned two-call shape (anchor resolved early, read resolved late) straddled the \
          publish race: the anchor names the pre-race identity while the independently-resolved \
          read already serves the post-race version"
     );
@@ -1288,7 +1288,7 @@ async fn old_two_call_shape_straddles_a_publish_race_pin_current_version_does_no
     assert_eq!(
         pinned_vectors[0], v0_vector,
         "pin_current_version + pinned_provider must still serve v0's content even read AFTER \
-         the race, unlike the old two-call shape above"
+         the race, unlike the unpinned two-call shape above"
     );
 }
 
@@ -2106,7 +2106,7 @@ async fn compact_yields_single_fragment_value_equivalent() {
 /// `expire_versions` rather than reap against an unchecked manifest.
 ///
 /// Honest scope note: this black-box path is ALSO refused earlier, by the
-/// pre-existing `refreshable_record` gate at step 0 (`NotRefreshable {
+/// `refreshable_record` gate at step 0 (`NotRefreshable {
 /// CurrentVersionUnavailable }`), so this test proves the CALLER-VISIBLE
 /// property the contract names ("a non-ready current version → refuses,
 /// `reap_expired_version` never runs") but does not, by itself, isolate the

@@ -989,8 +989,8 @@ def test_embed_remote_and_client_share_identical_signatures():
 
 def test_embedded_database_shares_the_unified_modality_verbs():
     """The embedded `Database` carries the unified `encode_query` /
-    `generate_embeddings` (the `modality=` form), matching the client — and the
-    per-modality names are gone (the deferred Stage-1 unification)."""
+    `generate_embeddings` (the `modality=` form), matching the client — and no
+    per-modality verb (`encode_text_query`, ...) exists."""
     for verb in ("encode_query", "generate_embeddings", "get_server_info"):
         assert _embed_has(verb), verb
     for gone in (
@@ -1277,7 +1277,7 @@ def test_cancelled_job_wait_raises_job_cancelled_not_training_error():
 
 def test_empty_training_set_refusal_over_recompute_is_invalid_argument_on_both_transports():
     """Tier B (converter-level) — the refusal of an EMPTY training set, WHEN
-    IT SURFACES OVER THE `Recompute` RPC (`grpc/pipeline.rs:139`,
+    IT SURFACES OVER THE `Recompute` RPC (`jammi_server::grpc::pipeline`,
     `jammi_ai::pipeline::recompute`'s `TrainingSet` replay arm), maps to ONE
     class, `jammi.errors.InvalidArgument`, on both transports.
 
@@ -1360,12 +1360,12 @@ def test_empty_training_set_refusal_on_the_job_path_is_training_error_on_both_tr
         `jammi.errors.TrainingError(resp.error)` for ANY `status == "failed"`
         — driven directly here with the refusal's message as the stubbed error;
       * the EMBEDDED raise-site, `wait_for_result`
-        (`crates/jammi-python/src/job.rs:380-382`), raises
+        (`crates/jammi-python/src/job.rs`), raises
         `JammiError::FineTune(record.error)` for ANY `JobStatus::Failed` —
         the exact same unconditional wrap the generic
         `test_failed_job_wait_raises_training_error_on_both_raise_sites`
         above already pins with an unrelated message ("boom") — which
-        `jammi_error_class` (`crates/jammi-python/src/error.rs:54`) maps to
+        `jammi_error_class` (`crates/jammi-python/src/error.rs`) maps to
         `TrainingError`. Neither raise-site inspects the failure's original
         cause, so the class the two transports agree on for THIS failure is
         the SAME class already pinned for every OTHER job failure — proven

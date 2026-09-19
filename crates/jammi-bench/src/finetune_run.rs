@@ -2113,7 +2113,7 @@ fn run_impl(
         let mut training_loop = builder.build()?;
 
         if epoch_idx == 0 && probe_at_init {
-            // Amendment 2026-08-29b, item 1(a): anchor the series at the
+            // Anchor the series at the
             // UNTRAINED model — one `evaluate_held_out` call on the
             // train-probe batch BEFORE this run's first `run()` leg (LoRA
             // init is `ZerosB`, so this is deterministic from `(seed,
@@ -2163,7 +2163,7 @@ fn run_impl(
             last_held_out = Some(held_out);
         }
 
-        // Amendment 2026-08-29b, item 1(b): probe EVERY epoch (never only
+        // Probe EVERY epoch (never only
         // the first/final) — the producer emits the RAW series, a
         // downstream merger derives the "learning happened" premise from
         // it (`init_probe - final_probe > floor`).
@@ -2720,14 +2720,14 @@ mod tests {
             // > 0.0).then_some(..)` — `0.0` maps to `None`), so the mask
             // channel `init_probe_does_not_perturb_..._bitwise`'s own doc
             // names ("draws no dropout mask and so touches no RNG stream")
-            // was ABSENT, not merely idle: deleting the
-            // `with_dropout_disabled` bracket entirely could not have turned
-            // this test red, because there was no dropout stream left for a
+            // would be ABSENT, not merely idle: deleting the
+            // `with_dropout_disabled` bracket entirely could not turn
+            // this test red, because there would be no dropout stream for a
             // broken bracket to leave un-disabled. `0.05` matches the
             // CLI's own `--lora-dropout` default
             // (`FinetuneRunArgs`'s `default_value_t = 0.05`), making the
             // channel live — see
-            // `dropout_forward_counter_is_live_at_the_campaigns_lora_dropout_and_held_still_under_eval_mode`
+            // `dropout_forward_counter_is_live_at_the_default_lora_dropout_and_held_still_under_eval_mode`
             // below for the committed proof that the channel is Some and
             // that toggling training mode is what actually gates it (the
             // falsifiable mechanism `with_dropout_disabled` relies on).
@@ -2789,8 +2789,8 @@ mod tests {
     /// channel the pin protects is structurally absent there, which is why
     /// the params use `0.05`.
     #[test]
-    fn dropout_forward_counter_is_live_at_the_campaigns_lora_dropout_and_held_still_under_eval_mode(
-    ) {
+    fn dropout_forward_counter_is_live_at_the_default_lora_dropout_and_held_still_under_eval_mode()
+    {
         let varmap = VarMap::new();
         let (mut encoder, _adapter_cfg) = build_encoder_adapters(
             &checkpoint_of(&tiny_bert_model_dir()),

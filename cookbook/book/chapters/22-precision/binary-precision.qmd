@@ -323,7 +323,7 @@ assert abs(vec_bytes_binary / vec_bytes_f32 - 1 / 32) < 1e-9, (
 # live measurement (usearch_bytes minus the exact analytic vec_bytes term) and
 # inherits whatever cross-platform HNSW-build variance binary_usearch/f32_usearch
 # themselves carry — it is NOT platform-invariant, and a bare `<=` against it
-# is not either (jammi-ai#442): on Linux x86_64 CI it held with room to spare;
+# is not either: on Linux x86_64 CI it held with room to spare;
 # on arm64 macOS, the SAME corpus and SAME graph-construction knobs measured
 # binary_overhead=221,416 > f32_overhead=216,112 — a real ~5.3KB crossover, not
 # a fluke, reproducible every render on this platform. Since vec_bytes_binary is
@@ -368,12 +368,12 @@ macOS it happens to land a few KB above it — a few KB of alignment padding is 
 `f32`'s ~3KB-per-node vector footprint, but not against `Binary`'s ~96-byte one, so the same
 absolute noise can flip the sign of the comparison. That is a real, honest, platform-dependent
 difference in *how the sidecar is built*, not a violation of the topology-independence claim —
-which is why the invariant this chapter holds `Binary` to is now a **bounded inequality** (never
+which is why the invariant this chapter holds `Binary` to is a **bounded inequality** (never
 worse than `f32` by more than the platform-noise allowance already reviewed for
 `binary_usearch_bytes`), not a bare, zero-tolerance one. The vector payload really does shrink by
 exactly the 1-bit-vs-32-bit packing ratio, on every platform, by construction — and for a corpus
-this size, the (roughly platform-stable) fixed link overhead is large enough relative to the (now
-tiny) binary vector payload that the *whole file*'s ratio lands well short of 32×. **"Binary
+this size, the (roughly platform-stable) fixed link overhead is large enough relative to the (tiny)
+binary vector payload that the *whole file*'s ratio lands well short of 32×. **"Binary
 shrinks the graph 32×" is only true of the vector payload; the sidecar file a deployment actually
 keeps memory-resident shrinks by the measured, smaller factor above.**
 

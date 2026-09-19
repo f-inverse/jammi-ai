@@ -5,8 +5,8 @@
 `FromStr` directly, unmediated by any Python dict — see
 `jammi.EmbeddedBackend.add_source`). A token accepted by the engine but
 missing from this dict makes the remote arm reject a format the embedded arm
-accepts: the exact cross-surface-parity break #346 introduced for
-`"jsonl"`/`"ndjson"` before this file's `_FILE_FORMAT` fix. These tests pin
+accepts — a cross-surface-parity break (e.g. for `"jsonl"`/`"ndjson"`).
+These tests pin
 the dict itself (so a future new engine token is caught here, not only by a
 slower native-build conformance test) and the two failure/success shapes of
 `add_source`'s client-side validation seam — which runs and raises (or

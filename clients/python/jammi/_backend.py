@@ -76,8 +76,8 @@ class Backend(Protocol):
     """The transport a :class:`Session` runs its verbs over.
 
     A `Session` holds a `Backend`; `connect()` builds the backend for a target
-    (a gRPC channel today; an in-process engine handle once the embedded backend
-    lands behind this seam) and wraps it. The seam is the transport-level
+    (a gRPC channel for a remote target, an in-process engine handle for a
+    local one) and wraps it. The seam is the transport-level
     lifecycle a session delegates: releasing the underlying resource.
     """
 

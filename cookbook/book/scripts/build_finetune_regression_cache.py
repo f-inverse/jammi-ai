@@ -7,11 +7,11 @@ large-offset / low-relative-variance target) from its title+abstract via
 `db.fine_tune(task="regression")`. Two honest, non-circular findings:
 
 1. **The high-offset target fits WITHOUT collapse.** A raw mean-squared head on a
-   target offset to ~2018 collapses (the documented pre-0.26.2 failure: predicted
-   std ~= 0.001, mean ~= 2163 — see chapters/04-predict/predict.qmd). v0.29.0 trains
-   the head against a *data-derived z-scored* target and de-standardizes at serve,
-   so the served `predicted_std` is a real, non-collapsed spread and `predicted_mean`
-   tracks the true year range. This chapter MEASURES that it now fits at all.
+   target offset to ~2018 collapses (predicted std ~= 0.001, mean ~= 2163 — see
+   chapters/04-predict/predict.qmd). The engine trains the head against a
+   *data-derived z-scored* target and de-standardizes at serve, so the served
+   `predicted_std` is a real, non-collapsed spread and `predicted_mean` tracks the
+   true year range. This chapter MEASURES that it fits at all.
 2. **Which objective wins on this target.** `beta_nll` (the default), `gaussian_nll`,
    `crps`, and `pinball` are genuinely distinct objectives; the winner (lowest
    held-out RMSE-in-years) is unknown until measured. That is the chapter's verdict.
@@ -30,7 +30,7 @@ each objective as a short LoRA fine-tune, infer the held-out test, and fold the 
 Emits `artifacts/finetune_regression/` (per-loss rows + golden_metrics.json +
 checksums).
 
-Determinism (K0 §3): committed subset ids, pinned ModernBERT + dtype, single-threaded
+Determinism: committed subset ids, pinned ModernBERT + dtype, single-threaded
 BLAS (applied by importing jammi_cookbook), `seed` passed to every fine-tune and
 recorded, the train/test split a deterministic seeded shuffle, the metric folds pure
 numpy, metrics asserted to tolerances downstream.

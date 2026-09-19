@@ -1,4 +1,4 @@
-"""Cache-backed checks on the committed retrieval / search vertical (B1).
+"""Cache-backed checks on the committed retrieval / search vertical.
 
 These run on CPU against the committed cache (no GPU, no recompute) and assert the
 vertical's load-bearing invariants: every retriever's recall@10 / nDCG@10 row exists

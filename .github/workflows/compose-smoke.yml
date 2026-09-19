@@ -13,7 +13,7 @@ name: Compose smoke (Shape B)
 # and test the binary itself, and a Docker + Postgres + JetStream stack on
 # every push to every branch is runner-minute cost with no incremental
 # coverage over the already-cached-build case. It runs on every push to
-# `main` (catches a regression the moment it lands), nightly (catches drift
+# `main` (catches a regression the moment it merges), nightly (catches drift
 # with no code change at all — a base-image CVE fix, a dependency bump), and
 # on demand
 # (`workflow_dispatch`, the pre-merge proof a human runs against a PR branch
@@ -98,8 +98,8 @@ jobs:
 
       # `ci/release-feature-manifest.json`'s `cpu-image` lane is the single
       # source of truth for this build's cargo feature list (fed into the
-      # Dockerfile's `CARGO_FEATURES` build-arg, required — no default —
-      # since #507) — read here, same idiom as server-image.yml.
+      # Dockerfile's `CARGO_FEATURES` build-arg, required — no default)
+      # — read here, same idiom as server-image.yml.
       - name: Read release feature list (ci/release-feature-manifest.json)
         id: manifest
         run: |
@@ -123,7 +123,7 @@ jobs:
           # No `platforms` input -- native (the default, per this action's
           # own doc): each leg's own runner arch is what buildx builds, so
           # the arm64 leg loads a real arm64 image, never an emulated one
-          # (E10 -- `load: true` is single-platform by design).
+          # (`load: true` is single-platform by design).
           # The docker exporter (what `load: true` uses) cannot carry
           # attestations on a stock daemon — belt-and-braces: build-push-
           # action already omits default provenance when `load: true`, and

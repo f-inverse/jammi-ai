@@ -18,9 +18,8 @@ measurement (a live fine-tune submitted over the remote `grpc://` client, its pe
 acceleration report read back through `pending` — byte-exact and stable, against a live server
 configured not to claim — → `determined` under a claiming successor process that opens the same
 catalog, both dtypes' outcomes asserted)
-+ the honest arc (real GPU-only facts — FlashAttention-2's own `f16` admission, and a real
-memory limit that was root-caused and closed, not fabricated shut — cited rather than
-recomputed here).
++ the GPU-only facts (FlashAttention-2's own `f16` admission, and bounded training memory at
+the measured shapes — cited rather than recomputed here).
 
 ## A third precision knob — and the first one this book cannot fully render
 
@@ -64,7 +63,7 @@ CUDA server produces, are reported honestly as measured elsewhere, exactly the w
 The live cells below spin up a real `jammi-server` subprocess and drive it over `grpc://` with
 the engine's own public `tiny_modernbert` fixture (hidden size 32, one layer) — the same
 GPU-free, hermetic ModernBERT-architecture stand-in [the model-catalog chapter](lifecycle.qmd)
-trains against. The facts this campaign measured on real hardware, cited further down, were
+trains against. The facts measured on real hardware, cited further down, were
 gathered against the real checkpoint that motivated this work — ModernBERT-large
 [@warner2024modernbert], `head_dim = 64` — which this render does not download or train; the two
 are never conflated below.
@@ -260,36 +259,26 @@ is an **explicit written state**, not an empty column: an unset report is `None`
 just-submitted job is never `None` — the tri-state is `None` / `pending` / `determined`, and the
 cell below pins the middle one exactly.
 
-**What this section used to concede, and what changed.** Until recently the server this chapter
-started was necessarily an all-in-one deployment: mounting the `train` tier is what makes
-`fine_tune` callable at all, and that same tier ran the claiming worker *inside the very process
-that accepted the submission*. Between the submit RPC returning and the status RPC landing, that
-worker's claim loop could already have claimed the job, resolved the device and replaced the
-marker with a `"determined"` report — a genuine race, not a flake, and one a slower (2-vCPU)
-render machine lost more often than a fast one. So this section asserted the race-free fact
-(never `None`) plus *whichever of the two legal live states it caught*, byte-exactly inside that
-state's own branch. That two-branch form was the honest previous state, and it is worth saying
-why: it never loosened an assertion, it conceded only the **choice** between two assertions,
-because a state the chapter could not deterministically observe is a state it must not claim to
-have measured.
-
-What changed is not a code path — it is **configuration**. `WorkerConfig::enabled`
+In an all-in-one server the claiming worker runs *inside the very process that accepted the
+submission*: between the submit RPC returning and a status RPC landing, that worker's claim loop
+can already have claimed the job, resolved the device and replaced the marker with a
+`"determined"` report — a genuine race, not a flake. A state the chapter cannot
+deterministically observe is a state it must not claim to have measured, so this section removes
+the race by **configuration**, not a code path. `WorkerConfig::enabled`
 (`crates/jammi-db/src/config/mod.rs`) is a runtime setting that answers exactly one question: does
 THIS process run the claim loop? With `[worker] enabled = false` (or the
 environment override `JAMMI_WORKER__ENABLED=false`) the process still mounts and serves the
 training surface and still accepts submissions — it simply never claims, and submitted jobs stay
-`queued`. Submission and claiming, previously welded together by the tier mount, are separable by
-a deployment knob; and because it is one key read by whatever arm decides whether to spawn the
-loop, the same knob is honored identically by a server over the wire and by the embedded,
-in-process arm — not two settings that have to be kept in agreement. The race below is therefore
-not *widened*, it is **removed**: with no claimant in the process, `pending` is not a window to be
-caught, it is the job's steady state. The two-branch concession is deleted rather than loosened,
-and what replaces it is strictly stronger — one byte-exact dict and one byte-exact status string,
-asserted on **every** poll of a multi-poll window that outlasts a claiming worker's own idle poll.
+`queued`. Submission and claiming are separable by a deployment knob; and because it is one key
+read by whatever arm decides whether to spawn the loop, the same knob is honored identically by a server over the wire and by the embedded,
+in-process arm — not two settings that have to be kept in agreement. The race is therefore not
+*widened*, it is **removed**: with no claimant in the process, `pending` is not a window to be
+caught, it is the job's steady state. The cell below asserts one byte-exact dict and one
+byte-exact status string on **every** poll of a multi-poll window that outlasts a claiming
+worker's own idle poll.
 
-Sleeping is precisely what the previous version refused to do, so it is worth being exact about
-why it is correct here. A sleep that widens a race window is a way of *making a flaky assertion
-pass*; a sleep that spans more than the interval a claimant would have woken on is a way of
+The cell sleeps, so it is worth being exact about why that is correct here. A sleep that widens
+a race window is a way of *making a flaky assertion pass*; a sleep that spans more than the interval a claimant would have woken on is a way of
 *demonstrating that nothing claims*. The first hides a state the chapter cannot observe; the
 second measures one it can. `WorkerConfig`'s default `idle_poll_secs = 1` — the interval an idle
 worker polls for a queued job on — is the number that has to be exceeded, and the span below
@@ -363,7 +352,7 @@ On Postgres the same knob composes differently and better: a multi-process catal
 which is the deployment shape the flag exists for. The strict sequencing here is SQLite's
 constraint showing through, not the flag's.
 
-What survives the process boundary is the queue itself. Server B is today's ordinary all-in-one —
+What survives the process boundary is the queue itself. Server B is the ordinary all-in-one —
 no override, `enabled` at its default `true` — and it claims a job it never accepted, submitted
 by a process that no longer exists, because the job lives in the catalog rather than in either
 server's memory. On SQLite that is the rule in general: a queued job is claimed by the next
@@ -440,7 +429,7 @@ forward pass **plus one backward and one optimizer step**, which is what makes t
 optimizer kernels below observable at all — each `{"holds": bool, "reason": str}`. `holds: true`
 means the SAME dispatch registry the kernel's own admission gate maintains actually recorded a
 fused hit for THIS job; `holds: false` carries the exact domain-check `reason` key the admission
-predicate itself produced, never a re-derived one — and, since campaign #446, read out of *this
+predicate itself produced, never a re-derived one — read out of *this
 job's own probe window* rather than a process-lifetime warning list, so a repeated miss can never
 be attributed some other job's predicate.
 
@@ -491,14 +480,11 @@ print(f"\n  attributed ops: {len(report_f16['ops'])}   Hold: {n_hold}   "
 ```
 
 - **`layer_norm` / `rope` / `softmax` / `geglu` / `dropout` / `low_rank_residual_linear` →
-  `Hold`, `domain_ok`.** All six now hold for `F16` on CPU. The last two are the most recently
-  widened: both report keys read the SAME `lora_linear_fused` registry — the LoRA-epilogue fused
-  kernel — whose admission predicate used to accept only a `(F32, F32)` or `(BF16, BF16)`
-  base/LoRA dtype pair; a `(F16, F16)` arm now exists too
-  (`crates/jammi-lora/src/lora_linear.rs`'s `lora_linear_admission_predicate`, its declined-pair
-  reason renamed from the old bf16-only `base_dtype_f32_or_bf16_matched` to
-  `base_dtype_f32_bf16_or_f16_matched` — a string that no longer exists in this codebase, because
-  the two-member domain it named no longer exists either). Every one of these six kernels is
+  `Hold`, `domain_ok`.** All six hold for `F16` on CPU. The last two both read the SAME
+  `lora_linear_fused` registry — the LoRA-epilogue fused kernel — whose admission predicate
+  accepts a matched `(F32, F32)`, `(BF16, BF16)` or `(F16, F16)` base/LoRA dtype pair
+  (`crates/jammi-lora/src/lora_linear.rs`'s `lora_linear_admission_predicate`, declined-pair
+  reason `base_dtype_f32_bf16_or_f16_matched`). Every one of these six kernels is
   dtype-domain-gated with a portable CPU implementation alongside its CUDA one — the *numeric*
   benefit (one rounding point instead of several) is real on CPU too, even though the *wall-clock*
   benefit is a CUDA-only property. A CPU render `Hold`ing these is therefore not a mistake; it is
@@ -511,11 +497,10 @@ print(f"\n  attributed ops: {len(report_f16['ops'])}   Hold: {n_hold}   "
   structurally different, admission-free branch and these keys are simply absent from its report,
   not `Miss`ing. They are the reason this chapter's probe runs a backward and an optimizer step
   rather than a forward pass alone: a forward-only probe could not honestly claim to have measured
-  either. That these appear here **at all** on an `f16` job is itself recent: the probed-op table
-  used to hard-code the `bf16` registry keys, so an `f16` job's cast epilogue dispatched for real
-  and was then reported as nothing at all — a silent-eager blind spot on the headline dtype,
-  closed by making the report key dtype-neutral and resolving the registry key from the job's own
-  backbone dtype.
+  either. They appear on an `f16` job **at all** because the report key is dtype-neutral and the
+  registry key is resolved from the job's own backbone dtype: a probed-op table hard-coding the
+  `bf16` registry keys would report an `f16` job's real, fused cast epilogue as nothing at all — a
+  silent-eager blind spot on the headline dtype.
 - **`adamw_step` → `Hold`, `domain_ok`.** The fused multi-tensor AdamW step — the optimizer, not
   the model. Worth stating plainly because it is the one op whose domain is on a *different axis*
   than everything else in this list: its own predicate requires `theta`/`first_moment`/
@@ -636,12 +621,11 @@ that is what this render's own CI machine can offer. What follows is reported, n
 chapter's own cells make, re-run once against a real NVIDIA A100 80GB with a
 `cuda,flash-attn`-featured `jammi-server`, to close the one gap a CPU-only render structurally
 cannot close; the stability and memory findings that follow it are this capability's own
-dedicated probe, measured earlier at the reporter's real target shape. Both are cited by fact,
+dedicated probe, measured at the production target shape. Both are cited by fact,
 never transcribed as a headline this render invented.
 
-**The stability probe: `f16` inside the `bf16`-calibrated band.** Before shipping `f16` fused
-kernels, the engine measured whether raw `f16` forward/backward is even numerically stable at
-all, relative to the reduced-precision dtype already known-good (`bf16`). Three seeds
+**The stability probe: `f16` inside the `bf16`-calibrated band.** The probe measures whether
+raw `f16` forward/backward is even numerically stable at all, relative to the reduced-precision dtype already known-good (`bf16`). Three seeds
 (`{2, 3, 4}`), three dtypes (`f16` / `bf16` / `f32`), the same small fine-tune shape (batch 2,
 sequence 128, 3 epochs, fully eager), scored on the held-out `held_out_example_mean` at the final
 epoch:
@@ -660,50 +644,36 @@ same epoch) — 3-of-3 seeds pass. `f16` is therefore numerically admitted for t
 probed shape: not "as good as `bf16`" on any single seed (seed 2 and 3 both show `f16` *further*
 from `f32` than `bf16` is), but inside the same acceptance band `bf16` itself has to clear.
 
-**The eager-vs-fused memory story, and a real fix.** The reporter's own target shape — batch 16,
-sequence 128, ModernBERT-large [@warner2024modernbert] — could not run `f16` fine-tuning **at
-all** on an 80GB A100: it OOM'd in the backward pass, while the identical shape at `bf16`/`f32`
-completed. The confound was real: under the disabled-fusion arm, `f16` declines every fused
-kernel (the very `Miss`es this chapter's live cells show above) and runs the fully-eager
-composition, while `bf16`/`f32` ran mostly fused — so the eager composition's own memory profile
-was never isolated from the *dtype*. Root cause, once isolated: `cudarc` (and candle's own CUDA
-backend) carries no caching allocator — every distinct tensor shape a training loop ever requests
-is a fresh `cuMemAlloc`, so a loop whose per-step shapes are drawn from an unbounded set grows the
-allocator's reserved footprint with the **count of distinct shapes ever seen**, independent of
-dtype. The fix bucketed each batch's natural tokenizer-padded width up to the nearest
-power-of-two (a bounded, 5-rung ladder at `max_seq_length=128`), at the trainer's own
-batch-construction seam — never inside `jammi-encoders`' eager arithmetic, where padding an
-activation inside a mean/variance reduction would corrupt the math. Post-fix: the reporter's
-exact scenario (`f16`, batch 16, sequence 128) **completes**, `steps_measured` at the full
-expected count, peak memory **44.3 GB, flat** after the initial ramp (1 Hz `nvidia-smi`
-sampling) — bounded, not the pre-fix unbounded 0→49 GB→78 GB growth trajectory that OOM'd.
-`bf16`/`f32` complete at the same shape too, with finite, comparable losses.
+**Bounded training memory: shape bucketing, training-only.** At batch 16, sequence 128,
+ModernBERT-large [@warner2024modernbert] on an 80GB A100, `f16` fine-tuning **completes**,
+`steps_measured` at the full expected count, peak memory **44.3 GB, flat** after the initial ramp
+(1 Hz `nvidia-smi` sampling); `bf16`/`f32` complete at the same shape too, with finite, comparable
+losses. What keeps it bounded: `cudarc` (and candle's own CUDA backend) carries no caching
+allocator — every distinct tensor shape a training loop ever requests is a fresh `cuMemAlloc`, so
+a loop whose per-step shapes are drawn from an unbounded set grows the allocator's reserved
+footprint with the **count of distinct shapes ever seen**, independent of dtype; at this shape an
+unbucketed `f16` run grows 0→49 GB→78 GB and OOMs in the backward pass. (`f16` exposes it first
+because under the disabled-fusion arm it declines every fused kernel — the very `Miss`es this
+chapter's live cells show above — and runs the fully-eager composition.) The trainer therefore
+buckets each batch's natural tokenizer-padded width up to the nearest power of two (a bounded,
+5-rung ladder at `max_seq_length=128`) at its own batch-construction seam — never inside
+`jammi-encoders`' eager arithmetic, where padding an activation inside a mean/variance reduction
+would corrupt the math.
 
-**A second, campaign-induced limit at batch 8, sequence 512 — root-caused and closed.** The
-stress shape OOM'd too, both `bf16` and `f16`, under the disabled-fusion arm, on legs the
-pre-bucketing baseline ran clean — an early-step, not gradual, ramp to roughly 63 GB. This looked
-like a second, independent memory ceiling; it was not. The actual mechanism was in the bucketing
-fix itself: `evaluate_held_out`'s eval pass reused the SAME bucket-UP-to-the-nearest-power-of-two
-padding the training-step fix above introduces, so a real held-out batch whose natural width was
-321 tokens got rounded up to the 512 rung — `max_seq_length`'s own cap — a roughly 2.5×
-softmax-intermediate blow-up relative to its true width. This was a defect the bucketing fix
-introduced on the EVAL path, not a pre-existing eager-attention ceiling, and — being
-dtype-independent — it explains why `bf16`, not only `f16`, was affected. The fix:
-`encode_texts` now dispatches on `self.training_mode` — bucket-up padding stays on the
-training-step path (unbounded per-step shape churn is the growth mechanism the first fix above
-targets), while `evaluate` / `evaluate_held_out` use a `tokenize_natural_width` sibling instead,
-matching the tokenizer's own natural per-batch width, exactly as it behaved before the bucketing
-fix existed. Re-measured on the pod after the fix: `batch 8, sequence 512` now **completes** for
-both `bf16` and `f16`, under both the fused and the disabled-fusion arm, with a full 1 Hz memory
-trace — stable around **60.4 GB peak**, no OOM. The honest arc: a real limit existed, its root
-cause was a second-order effect of this campaign's own first fix (never a pre-existing
-eager-attention ceiling), and it is closed — not reported as still open.
+**The eval pass keeps its natural width.** `encode_texts` dispatches on `self.training_mode`:
+bucket-up padding stays on the training-step path, while `evaluate` / `evaluate_held_out` use a
+`tokenize_natural_width` sibling matching the tokenizer's own natural per-batch width. Bucketing
+the eval pass too would round a real held-out batch whose natural width is 321 tokens up to the
+512 rung — `max_seq_length`'s own cap — a roughly 2.5× softmax-intermediate blow-up that OOMs
+`bf16` and `f16` alike (it is dtype-independent) at batch 8, sequence 512, in an early-step ramp
+to roughly 63 GB. With natural-width eval, `batch 8, sequence 512` **completes** for both `bf16`
+and `f16`, under both the fused and the disabled-fusion arm, with a full 1 Hz memory trace —
+stable around **60.4 GB peak**, no OOM.
 
 **FlashAttention-2's own admission gate, measured Holding on real hardware.** `flash`'s cascade
 (all five gates must pass, in order): the `flash-attn` cargo feature was compiled in; the
 resolved device is CUDA; that device's compute-capability major/minor is in the validated set
-`{80, 86, 89, 90}`; the tensor's dtype is `BF16` **or** `F16` (this capability's own widening —
-the gate used to accept `BF16` alone); and `head_dim` is exactly the one dimension the vendored
+`{80, 86, 89, 90}`; the tensor's dtype is `BF16` **or** `F16`; and `head_dim` is exactly the one dimension the vendored
 kernel was compiled for (`64`). ModernBERT-large clears the shape gate by construction
 (`1024 / 16 = 64`). This is not a code-reading inference: submitting the exact same `f16`
 fine-tune this chapter's live cells submit — same call, same corpus, same
@@ -722,7 +692,7 @@ with `jammi-server` built `--features cuda,flash-attn`, returns
 ```
 
 — `flash.holds: true` on `f16`, the same `domain_ok` reason a `bf16` job on the same hardware
-gets. Two new translation units back this (`flash_fwd_hdim64_fp16_sm80.cu` /
+gets. Two translation units back this (`flash_fwd_hdim64_fp16_sm80.cu` /
 `flash_bwd_hdim64_fp16_sm80.cu`, upstream FlashAttention-2's own most-tested dtype
 [@dao2022flashattention]), and the engine's own `flash_torch_parity_f16.rs` oracle proves the
 kernel bit-for-bit against a `torch` reference — this live submission is the admission-gate
@@ -730,7 +700,7 @@ proof; that oracle is the numerics proof, and the two are deliberately separate 
 
 Two honest observations about what a GPU report for this job looks like. First, on real A100
 hardware the LoRA epilogue genuinely dispatches fused at `f16` — the engine's own committed
-A/B provenance for the reporter's own checkpoint — ModernBERT-large, not this render's tiny
+A/B provenance for the production checkpoint — ModernBERT-large, not this render's tiny
 fixture — records `lora_linear_fused` firing on every training forward of an `f16` run with
 **zero** eager fallbacks: all sixteen committed legs of that `f16` sweep report
 `lora_linear_fused_dispatches = 13104` against `lora_linear_eager_dispatches = 0`
@@ -751,17 +721,14 @@ honest "no independent signal", never a smoothed-over claim.
 
 - **On a CUDA device of compute capability ≥ 8.0, prefer `bf16`.** It needs no loss-scaling
   [@micikevicius2018mixedprecision], preserves `f32`'s exponent range
-  [@kalamkar2019bfloat16], and every fused kernel this campaign shipped already accepted it
-  before `f16` joined.
+  [@kalamkar2019bfloat16], and every fused kernel accepts it.
 - **`f16` is the right choice off that floor** — a pre-Ampere CUDA device, or (uniquely) CPU,
   where `bf16` is refused outright (measured above) rather than merely slower. The stability
   probe backs this: at the probed shape, `f16` sits inside the same acceptance band `bf16` itself
   calibrates, 3 of 3 seeds, no late-epoch divergence.
-- **`f16` at the reporter's own shape (batch 16, sequence 128) now runs, bounded, at 44.3 GB,
-  and the batch 8, sequence 512 stress shape now runs too, at ~60.4 GB.** Both were real fixes,
-  not workarounds — the second one root-caused to this campaign's own bucketing fix leaking onto
-  the eval path, not a pre-existing eager-attention ceiling. Both OOMs this campaign started from
-  are closed.
+- **`f16` at batch 16, sequence 128 runs, bounded, at 44.3 GB, and the batch 8, sequence 512
+  stress shape runs too, at ~60.4 GB.** Both rest on the trainer's shape bucketing being
+  training-only (above).
 
 ## Bridge note
 
@@ -777,13 +744,12 @@ honest "no independent signal", never a smoothed-over claim.
 > first accepted — which also makes the queue's survival across a process boundary a measured
 > fact rather than a design claim. On this render's CPU-only server every `ops` entry this chapter
 > measured is real (the nine named primitives genuinely `Hold` — a portable, dtype-only domain
-> check `f16` now clears everywhere it is dtype-eligible, including the backward-pass cast
+> check `f16` clears everywhere it is dtype-eligible, including the backward-pass cast
 > boundary its report key names dtype-neutrally and the `f32`-domain optimizer step — while
 > `attention_block`'s per-device dtype gate genuinely `Miss`es, for the reason this chapter names
 > exactly), and `flash` is always
 > the honest compiled-away floor. The numbers only a real CUDA server can produce —
-> FlashAttention-2's own `f16` admission actually `Hold`ing, and the memory story's honest arc (a
-> real limit, root-caused to this campaign's own earlier fix leaking onto the eval path, and
-> closed at both measured shapes) — are reported as measured on real A100 hardware, cited rather
+> FlashAttention-2's own `f16` admission actually `Hold`ing, and bounded training memory at both
+> measured shapes — are reported as measured on real A100 hardware, cited rather
 > than recomputed, the same honesty contract [the preceding chapter](compute-precision.qmd)
 > already keeps for `bf16`.

@@ -146,10 +146,9 @@ jobs:
       # learns to watch `.git/HEAD` at all — no LATER commit, however real,
       # would ever trigger a rebuild, and the "build-sha hermeticity" step
       # two down would fail for the wrong reason (a stale first-build cache,
-      # not a real hermeticity gap). CI run 32995714545 hit the same trap one
-      # step earlier still: the F3 step's own `git commit` died with this
-      # exact fatal before printing anything, never a genuine `before`/
-      # `after` mismatch. The safe.directory mark is set ONCE for every job
+      # not a real hermeticity gap), and that step's own `git commit` would
+      # die with the same fatal before printing anything, never a genuine
+      # `before`/`after` mismatch. The safe.directory mark is set ONCE for every job
       # by `./.github/actions/setup-rust-ci` (right after checkout, above),
       # never as a per-job step.
 
@@ -196,7 +195,7 @@ jobs:
 
       # The `test-hooks` lane: the named result-table lifecycle points
       # (`store/mutable/test_hook.rs`) are compiled only under this feature, so
-      # the esc-094 two-writer oracles (`tests/it/recovery.rs::
+      # the two-writer oracles (`tests/it/recovery.rs::
       # live_writer_survives_peer_recover_*`, a live writer parked at a point
       # while a peer session's `recover()` sweeps beside it) and the two SIGKILL
       # crash harnesses (`materialization_crash_recovery.rs`,
@@ -371,9 +370,9 @@ jobs:
       # the actual checkout from inside `cargo test -p jammi-bench`'s own
       # process would be the wrong layer for it). Runs directly in THIS
       # job's own ephemeral `actions/checkout@v4` clone — never pushed,
-      # discarded when the job ends, so an empty commit here is harmless;
-      # round-3 audit fix: the preceding step is named "Run tests"
-      # (`cargo test --workspace --exclude jammi-python`, :93-94), which
+      # discarded when the job ends, so an empty commit here is harmless.
+      # The "Run tests" step above
+      # (`cargo test --workspace --exclude jammi-python`)
       # already built `jammi-bench` as part of that workspace test run and
       # warmed this job's target dir, so the rebuild below only re-runs
       # `build.rs` + relinks jammi-bench's own binary, not a full workspace
@@ -383,7 +382,7 @@ jobs:
       # `runtime_env_and_cwd_are_inert` (an ALREADY-BUILT binary must not
       # react to anything at run time) — this step is the third leg: a REAL
       # new commit, on a REBUILD, must move the baked sha to match it. This
-      # is ALSO the one place this whole unit exercises a real
+      # is ALSO the one place CI exercises a real
       # `actions/checkout@v4` DETACHED HEAD (`crates/jammi-bench/build.rs`'s
       # module doc names this state explicitly): the checkout has no branch
       # ref file to watch, so the commit below rewrites `.git/HEAD` itself —
@@ -392,8 +391,8 @@ jobs:
       # (a scratch repo, not this real checkout), so a regression here is
       # caught long before a real CI run.
       #
-      # The `sleep 1` between reading `A` and the commit guards state (f)
-      # from the class this step belongs to: cargo's `rerun-if-changed`
+      # The `sleep 1` between reading `A` and the commit guards against a
+      # timing false reading: cargo's `rerun-if-changed`
       # staleness check compares the watched file's mtime against its own
       # fingerprint stamp, and on a coarse (1s-granularity) filesystem an
       # empty commit landing in the SAME second as the prior build could
@@ -460,10 +459,10 @@ jobs:
       # Not every test in that suite needs a device. The manifest↔PROBED_OPS
       # cross-check is a pure data comparison between
       # `ci/release-feature-manifest.json` and the in-crate `PROBED_OPS`
-      # table, and is deliberately NOT GPU-gated — but `--no-run` above meant
-      # it compiled on every PR and EXECUTED on none of them, so its proof
-      # arrived only on the GPU-host lane, after merge. That gap is not
-      # covered by anything else: `check_release_manifest.py` is an
+      # table, and is deliberately NOT GPU-gated — `--no-run` above only
+      # compiles it, so without this step it would execute only on the
+      # GPU-host lane, after merge. Nothing else covers it:
+      # `check_release_manifest.py` is an
       # internal-consistency floor over the manifest ALONE (the three lanes
       # agree, every op sits in exactly one category, every sub-kernel's
       # parent/launch-site citation resolves), so a bogus op present in all
@@ -488,10 +487,9 @@ jobs:
 
       - name: Run live tests
         env:
-          # esc-096: live, up through `HubSource`'s token fallback chain
-          # (`[models] hub_token` > `HF_TOKEN` > the cache's own `token`
-          # file) — hf-hub 0.5 itself never reads this variable, so before
-          # `HubSource` existed this line authenticated nothing.
+          # Read by `HubSource`'s token fallback chain (`[models] hub_token`
+          # > `HF_TOKEN` > the cache's own `token` file) — hf-hub 0.5 itself
+          # never reads this variable.
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         # Same `jammi-python` exclusion as the hermetic lane: the cdylib
         # plus integration test need libpython on the linker path, which
@@ -548,13 +546,12 @@ jobs:
   # does NOT prove the kernels are numerically correct — no test in this job
   # runs on a GPU. `tests/flash_smoke.rs` (16 cases) and the `flash::` unit
   # tests (17 cases) are the only lane that checks output values, and they
-  # currently run nowhere in CI; they exist only as ad-hoc `JAMMI_REQUIRE_
-  # CUDA=1 cargo test -p jammi-kernels --features flash-attn --test
-  # flash_smoke` pod sessions (see the P6 stage-A artifact commit). Closing
-  # THAT gap needs a self-hosted GPU runner wired into the merge path the way
-  # `gpu-prove.yml` proves the release lane today (off the merge path,
-  # dispatched by hand) — out of scope here; do not read a green run of this
-  # job as evidence the kernels compute the right numbers.
+  # run nowhere in CI; they run as ad-hoc `JAMMI_REQUIRE_CUDA=1 cargo test
+  # -p jammi-kernels --features flash-attn --test flash_smoke` pod sessions.
+  # Running them on the merge path needs a self-hosted GPU runner (the way
+  # `gpu-prove.yml` proves the release lane: off the merge path, dispatched
+  # by hand) — do not read a green run of this job as evidence the kernels
+  # compute the right numbers.
   #
   # `cargo check` (not `cargo build`) is enough: build scripts run in full —
   # unconditionally compiled AND executed — for `cargo check` exactly as for
@@ -590,7 +587,7 @@ jobs:
   # wrapper ~5 s, so the `nvcc` stage alone is ~80 s. Add checkout, a shallow
   # CUTLASS submodule clone, the CUDA-image pull, and the rest of the crate's
   # own `cuda`-feature PTX build (`build_cuda`, 7 kernel files, also
-  # nvcc-driven). Measured on job 103688700438: steps 1-8 (checkout through
+  # nvcc-driven). Measured: steps 1-8 (checkout through
   # the two `jammi-encoders` clippy arms) take 13m26s, the `jammi-ai
   # --features cuda` step 5m50s, and the job 19m20s in total. It runs on every
   # PR here (no `paths:` filter, matching every other job in this file: a
@@ -604,8 +601,7 @@ jobs:
   # under `crates/jammi-kernels/build.rs`, `crates/jammi-kernels/src/flash/**`,
   # `crates/jammi-kernels/third_party/**`, `crates/jammi-kernels/Cargo.toml`,
   # and `.gitmodules` — EVERY one of those five paths, since missing any is
-  # worse than no filter (it looks like coverage and isn't) — left to the
-  # maintainer to decide, not applied unilaterally here.
+  # worse than no filter (it looks like coverage and isn't).
   flash-attn-compile:
     name: Clippy (flash-attn / CUTLASS, nvcc — no GPU)
     runs-on: ubuntu-latest
@@ -662,32 +658,25 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
 
-      # `JAMMI_FLASH_MEASURE_RSS=1` is deliberately NOT set on this step
-      # (round-2 audit finding B): `build.rs::build_flash_attn` now PANICS
+      # `JAMMI_FLASH_MEASURE_RSS=1` is deliberately NOT set on this step:
+      # `build.rs::build_flash_attn` PANICS
       # when that var is set but `/usr/bin/time` does not exist on disk (an
       # explicit request that would otherwise silently measure nothing --
       # see that gate's own doc), and this crate's own CI image
-      # (`ghcr.io/f-inverse/jammi-ai-ci-cuda`) does not install GNU `time`
-      # today. Installing it is a Dockerfile change, out of THIS crate's
-      # scope. Per-TU wall times are visible in this step's own log
-      # regardless (build.rs prints them to its own stderr
-      # UNCONDITIONALLY now, not gated on this env var, precisely so this
-      # lane gets wall-time visibility without needing RSS measurement at
-      # all) -- a future maintainer who adds `time` to the CI image can
-      # flip this env var on here for real peak-RSS numbers.
-      # esc-059: this step used to be a bare `cargo check` (no `--tests`/
-      # `--all-targets`, so it never even reached `jammi-kernels`'s own
-      # `cuda`-required `tests/cuda_parity.rs`) and `check` never runs
-      # clippy's lints at all. `flash-attn` forwards to `cuda`
+      # (`ghcr.io/f-inverse/jammi-ai-ci-cuda`) does not install GNU `time`.
+      # Per-TU wall times are visible in this step's own log regardless
+      # (build.rs prints them to its own stderr UNCONDITIONALLY, not gated
+      # on this env var, so this lane gets wall-time visibility without RSS
+      # measurement) -- adding `time` to the CI image lets this env var be
+      # set here for real peak-RSS numbers.
+      # `clippy`, not `check`: `check` never runs clippy's lints, and
+      # `--all-targets` reaches `jammi-kernels`'s own `cuda`-required
+      # `tests/cuda_parity.rs`. `flash-attn` forwards to `cuda`
       # (crates/jammi-kernels/Cargo.toml), so `--features flash-attn
-      # --all-targets` is the SAME feature surface a `runpod_gpu_prove.sh`
-      # GPU-pod clippy line used to exercise (`cargo clippy -p jammi-kernels
-      # --all-targets --features cuda -- -D warnings`) before esc-081
-      # removed it from that script entirely (the prove lane never needed a
-      # GPU to run clippy — that lane was `gpu-prove.yml`'s
-      # `workflow_dispatch`/`pull_request: types: [labeled]`/nightly-cron
-      # trigger anyway, never a lane that fires on every PR). This step is
-      # now the ONLY place this exact invocation runs: hermetic,
+      # --all-targets` covers the `cargo clippy -p jammi-kernels
+      # --all-targets --features cuda -- -D warnings` surface without a GPU
+      # (the prove lane does not lint). This step is the ONLY place this
+      # exact invocation runs: hermetic,
       # always-required, no GPU needed (same nvcc/CUTLASS toolchain this
       # job's image already has). `ci/scripts/check_lint_surface_closure.py`
       # asserts this coverage holds mechanically, not just by this comment's
@@ -695,8 +684,8 @@ jobs:
       - name: Clippy jammi-kernels --features flash-attn --all-targets (nvcc, no GPU)
         run: cargo clippy -p jammi-kernels --features flash-attn --all-targets -- -D warnings
 
-      # The encoders `forward_flash_dense_attention` call site (P6 Stage B
-      # B3-dense) is otherwise compiled by no CI job at all — this crate's
+      # The encoders `forward_flash_dense_attention` call site is otherwise
+      # compiled by no CI job at all — this crate's
       # ordinary `check`/`clippy` jobs never build with `--features
       # flash-attn`, so a break in that call site would only surface on the
       # next GPU pod run. Same image, same job (CUTLASS submodule already
@@ -710,7 +699,7 @@ jobs:
       # VRAM probe in `modernbert.rs` (`FLASH_ORACLE_SWEEP_SEEDS`,
       # `run_flash_oracle_shape_sweep`, `flash_oracle_wqkv_lora_b`, …) are
       # ALL `#[cfg(feature = "cuda")]` inside `mod tests`, so `flash-attn`
-      # alone compiled only the production call site, never the harness
+      # alone compiles only the production call site, never the harness
       # that actually proves it. `cuda` here means "compile with the CUDA
       # feature chain enabled" (`build_cuda`'s PTX build via `nvcc`, the
       # same as the kernels step immediately above) — it does NOT need a
@@ -719,16 +708,14 @@ jobs:
       # compiles `#[cfg(test)] mod tests` content at all, feature-gated or
       # not, so without it this step would stay silently green even with
       # `cuda` enabled.
-      # esc-059: `cargo check` never runs clippy's lints; swapped for
-      # `cargo clippy -- -D warnings` over the identical feature/target
-      # surface (`--tests`, unchanged) so a lint regression in this
-      # call-site's `#[cfg(feature = "cuda")]` test harness cannot land on
-      # main invisibly again.
+      # `cargo clippy -- -D warnings`, not `cargo check` (which never runs
+      # clippy's lints), so a lint regression in this call-site's
+      # `#[cfg(feature = "cuda")]` test harness cannot land on main
+      # invisibly.
       - name: Clippy jammi-encoders --features cuda,flash-attn (nvcc, no GPU)
         run: cargo clippy -p jammi-encoders --features cuda,flash-attn --tests -- -D warnings
 
-      # round-5 audit NF-2 (kernel-oracle-standard): the step immediately
-      # above is the ONLY CI lane that compiles jammi-encoders' `#[cfg(feature
+      # The step immediately above is the ONLY CI lane that compiles jammi-encoders' `#[cfg(feature
       # = "cuda")] mod tests` module — but a test whose own attribute reads
       # `#[cfg(all(feature = "cuda", not(feature = "flash-attn")))]` (the
       # cuda-only, NOT-flash-attn meta-test verifying `flash_compiled_or_skip`
@@ -736,17 +723,15 @@ jobs:
       # with `flash-attn`) is, BY ITS OWN CFG, excluded from a `cuda,flash-attn`
       # build — that lane enables `flash-attn`, so `not(feature = "flash-attn")`
       # is false there. Without this second lane, that one test is compiled by
-      # ZERO CI jobs (the cfg-blind gap this audit round closed: KO-7's own
-      # gate, which only sees SOURCE TEXT, PASSes a test that no lane actually
-      # builds — a syntax break in it would first surface on a GPU pod run,
-      # not here). Same job/image/toolchain as the step above (no extra setup
+      # ZERO CI jobs (the KO-7 gate only sees SOURCE TEXT, so it PASSes a
+      # test that no lane actually builds — a syntax break in it would first
+      # surface on a GPU pod run, not here). Same job/image/toolchain as the step above (no extra setup
       # cost); `--tests` is required for the same reason noted there (plain
       # `cargo check` never compiles `#[cfg(test)] mod tests` content at all).
-      # Verified on a100b (numerics owner, cited in this lane's introducing
-      # commit): `cargo test -p jammi-encoders --features cuda --no-run --list`
+      # `cargo test -p jammi-encoders --features cuda --no-run --list`
       # includes `flash_compiled_or_skip_panics_under_require_flash_when_not_compiled`
       # under this exact feature set, confirming this lane compiles it.
-      # esc-059: same swap, same reasoning as the two steps above.
+      # `clippy`, not `check`, for the same reason as the two steps above.
       - name: Clippy jammi-encoders --features cuda (nvcc, no GPU) — covers the NOT(flash-attn) meta-test
         run: cargo clippy -p jammi-encoders --features cuda --tests -- -D warnings
 
@@ -831,26 +816,21 @@ jobs:
       - name: Clippy jammi-ai --features cuda (nvcc, no GPU)
         run: cargo clippy -p jammi-ai --features cuda --tests -- -D warnings
 
-  # esc-059's silicon-axis twin — CLOSED FOR COMPILE/LINT SURFACE ONLY, NOT
+  # The Metal (silicon-axis) lint surface — COMPILE/LINT ONLY, NOT
   # EXECUTION. `jammi-kernels`'s `metal_parity` test target
   # (`required-features = ["metal"]`), `jammi-ai`'s `metal_quantized_gpu`
   # test target (same), and `jammi-lora`'s `metal_dropout_position` test
-  # target (same) were all compiled under NO merge-path `cargo clippy
-  # -D warnings` lane — exactly the `check_lint_surface_closure.py` gap this
-  # branch introduced — so this job's three `clippy` steps close that gap
-  # and run on every PR for free.
+  # target (same) are compiled under no other merge-path `cargo clippy
+  # -D warnings` lane (the `check_lint_surface_closure.py` requirement), so
+  # this job's three `clippy` steps cover them on every PR.
   #
-  # Measured fact (PR #435, job 99546809214's backtrace): a GH-hosted
-  # `macos-14` runner CANNOT construct a candle 0.11 Metal device.
+  # Measured fact: a GH-hosted `macos-14` runner CANNOT construct a candle
+  # 0.11 Metal device.
   # `Device::new_metal(0)` PANICS there — objc2 class lookup fails on
   # `MTLResidencySetDescriptor`, a class GH's hosted macOS image's Metal
   # framework does not expose. This is not a flaky/slow lane, it is a
   # hard, reproducible panic on every invocation — so this job runs NO
-  # execution step and MUST NOT claim one. An earlier revision of this job
-  # ran `cargo test ... --test metal_parity`/`--test metal_quantized_gpu`
-  # here and asserted "real, working Metal device" / "suites measured
-  # green"; both claims were false on this runner and are corrected by
-  # this comment and the removal of those two steps.
+  # execution step and MUST NOT claim one.
   #
   # No `./.github/actions/setup-rust-ci`: that composite has no `rustflags`
   # of its own at all (mold and the aarch64 `+fp16` floor live entirely in
@@ -873,9 +853,9 @@ jobs:
   # step visible in the log, not to change what would happen without it.
   #
   # Cost/runtime: macOS minutes bill at 10x the Linux rate on GitHub-hosted
-  # runners — this job's three remaining steps (three clippy compiles) are a
-  # real, ongoing per-PR cost the operator is choosing to pay in exchange
-  # for closing the lint-coverage gap above; if that trade is ever judged
+  # runners — this job's three steps (three clippy compiles) are a real,
+  # ongoing per-PR cost paid in exchange for the lint coverage above; if
+  # that trade is ever judged
   # not worth it, scope this job to changes under
   # `crates/jammi-kernels/src/ops/**`, `crates/jammi-kernels/tests/
   # metal_parity.rs`, `crates/jammi-ai/tests/metal_quantized_gpu.rs`,
@@ -884,19 +864,16 @@ jobs:
   # path-filter alternative above) rather than dropping the lane — a
   # silently unfiltered lane that is deleted looks like it was never
   # needed; a silently-added filter that misses a path looks like coverage
-  # and isn't (worse than none), so this is left to the maintainer to
-  # decide, not applied unilaterally here.
+  # and isn't (worse than none).
   #
   # Execution proof (compile+lint only here — no GH-hosted runner can
   # construct a Metal device, see above): suites measured green on LOCAL
-  # Apple-Silicon hardware and recorded in PR #435 — jammi-ai 4/4
-  # (`metal_quantized_gpu`), jammi-kernels 8/8 (`metal_parity`, byte-exact).
-  # `jammi-lora`'s `metal_dropout_position` has no equivalent local-execution
-  # record cited here — this job closes its compile/lint surface only, same
-  # as it did for the other two targets before any execution record existed
-  # for them. A recurring, always-on execution lane for this surface
-  # requires a self-hosted Apple-silicon runner; provisioning one is an
-  # operator decision, not applied unilaterally here.
+  # Apple-Silicon hardware — jammi-ai 4/4 (`metal_quantized_gpu`),
+  # jammi-kernels 8/8 (`metal_parity`, byte-exact). `jammi-lora`'s
+  # `metal_dropout_position` has no equivalent local-execution record — this
+  # job covers its compile/lint surface only. A recurring, always-on
+  # execution lane for this surface requires a self-hosted Apple-silicon
+  # runner.
   test-metal:
     name: Test (Metal, macos-14)
     runs-on: macos-14
@@ -982,7 +959,7 @@ jobs:
       # itself, so the advisory check reads the current database, not a stale
       # snapshot — and knowingly-carried advisories live as documented exceptions
       # in `deny.toml`, never a blanket silence. The TOOL's own version is
-      # pinned (#511) — deny.toml's own config shape asserts this major
+      # pinned — deny.toml's own config shape asserts this major
       # version's schema behavior; an unpinned `cargo install` could silently
       # pick up a newer cargo-deny release that reads the SAME file
       # differently, which is a different risk from the advisory DB's own
@@ -1098,9 +1075,9 @@ jobs:
       # ls-files` (`crates/jammi-db/tests/it/whose_fault_gate.rs`'s
       # `tracked_rs_files`), which hits "fatal: detected dubious ownership"
       # (exit 128) without the safe.directory mark
-      # `./.github/actions/setup-rust-ci` sets once for every job (above) —
-      # measured against PR #521's CI run, where this job's whole
-      # `whose_fault_gate` suite failed at that one shared line.
+      # `./.github/actions/setup-rust-ci` sets once for every job (above);
+      # without it this job's whole `whose_fault_gate` suite fails at that
+      # one shared line.
 
       - name: Install and start nats-server (with JetStream)
         # GHA `services:` cannot override the upstream image's CMD to pass
@@ -1198,9 +1175,9 @@ jobs:
       # ls-files` (`crates/jammi-db/tests/it/whose_fault_gate.rs`'s
       # `tracked_rs_files`), which hits "fatal: detected dubious ownership"
       # (exit 128) without the safe.directory mark
-      # `./.github/actions/setup-rust-ci` sets once for every job (above) —
-      # measured against PR #521's CI run, where this job's whole
-      # `whose_fault_gate` suite failed at that one shared line.
+      # `./.github/actions/setup-rust-ci` sets once for every job (above);
+      # without it this job's whole `whose_fault_gate` suite fails at that
+      # one shared line.
 
       - name: Run Postgres-gated tests
         env:
@@ -1216,7 +1193,7 @@ jobs:
         # `--test-threads=1` keeps that contract; the suite is small.
         run: |
           cargo test -p jammi-db --features live-postgres-tests --test it -- --test-threads=1
-          # The same suite with the test-hooks points compiled in: the esc-094
+          # The same suite with the test-hooks points compiled in: the
           # two-writer oracles' Postgres arms and the SIGKILL crash harnesses.
           cargo test -p jammi-db --features live-postgres-tests,test-hooks --test it -- --test-threads=1
 
@@ -1224,7 +1201,7 @@ jobs:
         env:
           JAMMI_TEST_PG_URL: postgres://jammi:jammi@postgres:5432/jammi_test
           JAMMI_REQUIRE_PG: "1"
-        # K4: `remote_server_info_reports_postgres_broker_kind` proves the
+        # `remote_server_info_reports_postgres_broker_kind` proves the
         # non-default `[broker.postgres]` config round-trips through
         # `ServerInfo.broker` over the wire — the only lane that exercises it.
         # Same shared-catalog contract as the jammi-db step above: one DB,
@@ -1318,9 +1295,8 @@ jobs:
   # ARMv8.0 hosts (e.g. Raspberry Pi 4) are the trade this floor makes: not
   # supported for aarch64-linux artifacts of this workspace.
   #
-  # This job had never actually EXECUTED on a real aarch64-linux runner
-  # anywhere in this tree before it existed -- every other proof was a
-  # static check or a throwaway probe already deleted. Every assertion
+  # This is the one job that EXECUTES the stanza on a real aarch64-linux
+  # runner -- every other proof is a static check. Every assertion
   # below always runs -- no conditional skip arm: a job whose oracle step
   # can quietly no-op is exactly the unexecuted-oracle shape this job
   # exists to close, so it may not itself have one. Two readers of the
@@ -1335,16 +1311,15 @@ jobs:
   # No `container:` (unlike `check`/`test`, which run inside the CI base
   # image): that image's `:latest` tag only becomes the arm64-carrying
   # multi-arch index on a push to `main` (`_ci-base-image.yml`'s own rule),
-  # so a `container:` pull here would fail on THIS PR's own pre-merge run --
-  # the exact platform-mismatch failure the deleted probe hit against the
-  # devcontainer, before this repo's own `latest` had moved. The toolchain is
+  # so a `container:` pull here would hit a platform mismatch on any PR run
+  # before that image's `latest` carries an arm64 entry. The toolchain is
   # installed directly instead, the same mechanism `release-binaries.yml`'s
   # macOS leg (also a bare, container-less runner) already uses:
   # `rust_pin.sh` resolves `rust-toolchain.toml`'s pin into a step output,
   # and `dtolnay/rust-toolchain` (SHA-pinned) installs exactly that channel,
   # native to the runner's own arch, no cross-target request.
   #
-  # Cost: cold (first run after this job lands, or after any cache eviction)
+  # Cost: cold (after any cache eviction)
   # is a real native-arm64 build of `jammi-numerics` and its dependency set
   # (nalgebra/rand/rand_distr/statrs -- no candle, no gemm, no CUDA) --
   # measured a couple of minutes end to end including the toolchain install,
@@ -1359,11 +1334,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # This job runs BARE (no `container:`) on purpose: the CI image's
-      # `:latest` tag carries no arm64 entry in its manifest INDEX until
-      # THIS PR's `image.yml` run actually publishes one (the multi-arch
-      # index this PR introduces) -- there is no arm64 container image for
-      # it to run inside yet. That makes mold a HARD REQUIREMENT of this
+      # This job runs BARE (no `container:`) on purpose (see the job
+      # comment above), so no CI image supplies mold. That makes mold a
+      # HARD REQUIREMENT of this
       # job, not an optimization: the two readers below exist to prove that
       # `.cargo/config.toml`'s `[target.aarch64-unknown-linux-gnu]`
       # `rustflags` (mold linker + the `+fp16` compile floor) reaches a
@@ -1472,7 +1445,8 @@ jobs:
   # so this job runs in the CI image (`./.github/actions/setup-rust-ci` for
   # the sccache GHA-cache backend), and is aggregated by the required
   # `ci-summary` below so a red gate blocks a merge without any
-  # branch-protection wiring. No `paths:` filter (the #245 trap) — this job
+  # branch-protection wiring. No `paths:` filter (a filtered-out required
+  # check hangs unrelated PRs) — this job
   # always runs, on every PR and push.
   symbol-index-gates:
     name: Guard (symbol-index gates)

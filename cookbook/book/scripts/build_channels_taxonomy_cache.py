@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Emit the channel error-taxonomy cache (§3.8) — CPU, dual-transport, hermetic.
+"""Emit the channel error-taxonomy cache — CPU, dual-transport, hermetic.
 
-The engine↔cookbook validator for the `§3.8` channel error taxonomy (engine
-`#193`): each evidence-channel failure maps to its **correct typed gRPC status
+The engine↔cookbook validator for the channel error taxonomy: each
+evidence-channel failure maps to its **correct typed gRPC status
 code** on the wire, instead of the `Internal`-for-everything that a thin
 catch-all would produce. The channel registry verbs (`register_channel` /
 `add_channel_columns` / `list_channels`) are on BOTH the embedded `jammi`
@@ -24,8 +24,9 @@ It drives each failure mode on BOTH transports and freezes the matrix:
 A genuine **internal/DB fault** (`INTERNAL`) is the documented RESIDUAL of the
 taxonomy: there is no honest, hermetic way to induce a real storage fault from
 the public surface, so it is recorded as the documented residual and NOT
-fabricated — the whole point of `#193` is that a failure with a *known* cause no
-longer collapses to `Internal`, so the cookbook does not manufacture one.
+fabricated — the whole point of the typed taxonomy is that a failure with a
+*known* cause never collapses to `Internal`, so the cookbook does not manufacture
+one.
 
 Each failure mode's measured cell is the `(wire_code, embedded_error_class)`
 pair. The two transports raise different Python exception TYPES by construction:
@@ -74,8 +75,7 @@ import jammi_cookbook  # noqa: F401  # applies the determinism env on import
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "channels"
 
 # The four headline failure modes of the channel registry and the gRPC status
-# code each maps to under `#193` (the typed taxonomy that replaced
-# Internal-for-everything). The emit asserts the measured wire code equals the
+# code each maps to under the typed taxonomy (never Internal-for-everything). The emit asserts the measured wire code equals the
 # expected one live; a deviation is recorded, never silently rewritten.
 _EXPECTED_WIRE = {
     "duplicate": "ALREADY_EXISTS",
@@ -348,7 +348,7 @@ def emit(server_bin: str) -> None:
         expected_wire = _EXPECTED_WIRE[mode]
         if measured_wire != expected_wire:
             deviations.append(
-                f"{mode}: measured wire {measured_wire} != #193-intended {expected_wire}"
+                f"{mode}: measured wire {measured_wire} != intended {expected_wire}"
             )
         # the embedded companion carries the same normalized class (no wire code).
         assert embedded_matrix[mode]["error_class"] == _EXPECTED_CLASS[mode], (
@@ -358,10 +358,10 @@ def emit(server_bin: str) -> None:
     if deviations:
         # Surface a candidate engine finding loudly — never rewrite the code to pass.
         raise AssertionError(
-            "channel taxonomy DEVIATION from #193 intent (record as an engine finding, "
+            "channel taxonomy DEVIATION from the intended codes (record as an engine finding, "
             "do NOT fake the code):\n  " + "\n  ".join(deviations)
         )
-    print("== each failure mode maps to its #193-intended wire code ==", flush=True)
+    print("== each failure mode maps to its intended wire code ==", flush=True)
 
     # --- the live remote == embedded class parity --------------------------- #
     parity = [_parity(mode, embedded_matrix[mode], remote_matrix[mode]) for mode in _MODES]
@@ -428,7 +428,7 @@ def emit(server_bin: str) -> None:
         ),
         "taxonomy": {mode: remote_matrix[mode]["wire_code"] for mode in _MODES},
         "expected_taxonomy": _EXPECTED_WIRE,
-        "deviations": deviations,  # empty == every mode maps as #193 intended
+        "deviations": deviations,  # empty == every mode maps as intended
         "transports": [
             "embedded (file://, in-process — the error-class companion)",
             "remote (grpc://, live jammi-server — the typed wire codes)",
@@ -473,13 +473,13 @@ def emit(server_bin: str) -> None:
         print(
             f"  {mode:16s} → {remote_matrix[mode]['wire_code']:20s} "
             f"(embedded class {embedded_matrix[mode]['error_class']!r}, "
-            f"#193-intended {_EXPECTED_WIRE[mode]})",
+            f"intended {_EXPECTED_WIRE[mode]})",
             flush=True,
         )
     print(f"  client-side dtype guard (ValueError, never the wire): "
           f"both={client_dtype_guard_both_client_side}", flush=True)
     print(f"  parity: remote == embedded class for all {len(parity)} modes", flush=True)
-    print(f"  deviations from #193: {deviations or 'none — every mode maps as intended'}",
+    print(f"  deviations from intended: {deviations or 'none — every mode maps as intended'}",
           flush=True)
     print("\nemitted cache:", flush=True)
     for f in sorted(ARTIFACTS.glob("*")):

@@ -72,12 +72,11 @@ an error, and the last two deliberately indistinguishable so the verb is not an
 existence oracle for a peer tenant's table names. This emit asserts a non-empty
 answer of exactly one segment, so that fan-in never silently reads as a pass.
 
-What this script no longer does — and the reason is worth keeping, because it is
-the shortcut a reader will reach for the moment a catalog file is in sight — is
-open a raw CPython `sqlite3` handle on `catalog.db`. Beside a live embedded
-engine that is out of contract, and since the esc-073 seam
-(`crates/jammi-db/src/catalog/backend_sqlite.rs` module docs) *deterministically*
-wrong: the engine's pool opens through the `unix-excl` VFS with a HEAP-resident
+What this script deliberately does NOT do — and the reason is worth keeping,
+because it is the shortcut a reader will reach for the moment a catalog file is
+in sight — is open a raw CPython `sqlite3` handle on `catalog.db`. Beside a live
+embedded engine that is out of contract, and *deterministically* wrong
+(`crates/jammi-db/src/catalog/backend_sqlite.rs` module docs): the engine's pool opens through the `unix-excl` VFS with a HEAP-resident
 wal-index and no `-shm` file, so CPython's separately-linked `libsqlite3` — a
 second SQLite **library instance in the same process** — cannot see the engine's
 locks or its wal-index. Its reads can be stale, and its `sqlite3_close` believes
@@ -87,7 +86,7 @@ around it: nothing in this emit opens the catalog file at all.
 
 `close()` is still called, once, for the ordinary reason a handle is closed — the
 engine's own lifecycle, before the temporary artifact directory goes away. It is
-no longer a precondition for reading anything. The close remains an AWAITED
+not a precondition for reading anything. The close remains an AWAITED
 release (`Session.close()` on both arms; the embedded arm's delegates to
 `PyDatabase::close`, `crates/jammi-python/src/database.rs`): it stops the training
 worker, then awaits `CatalogBackend::close`, which drains the pool and waits out

@@ -1,4 +1,4 @@
-"""Hermetic unit tests for the loaders (K2) — no network.
+"""Hermetic unit tests for the dataset loaders — no network.
 
 The full download+register path is exercised by the executable ``datasets``
 chapter in CI (checksum-gated, cache-backed). These tests cover the pure logic:

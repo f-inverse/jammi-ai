@@ -111,9 +111,8 @@ def connect(
     `authorization: Bearer <token>` to every call on both TLS and plaintext
     transports — the bearer rides the channel, not each verb. The bearer covers
     both transports: the typed gRPC verbs on the channel credentials, and
-    :meth:`RemoteDatabase.sql` (the Flight SQL lane) per call. Server-side
-    enforcement of the BYO-auth seam over Flight is tracked at
-    https://github.com/f-inverse/jammi-ai/issues/220 (§5.8 — external; the
+    :meth:`RemoteDatabase.sql` (the Flight SQL lane) per call. Whether the
+    bearer is enforced is decided server-side by the server's tenant resolver, which covers the Flight lane and the typed verbs alike (the
     EMBEDDED `sql` runs in-process over the native DataFusion engine and carries
     no channel to authenticate). Credentials are meaningless on a `file://`
     target — an in-process engine has no channel — so a local target opened

@@ -28,9 +28,9 @@ members = [
 # default-members; `--workspace` builds every member regardless).
 # ci/tools/probed-ops-index is the same CI-only shape, one dump of
 # jammi-kernels' own PROBED_OPS constant for
-# ci/scripts/perf/test_finetune_ab_disable_op_keys.py (wave-5 identity's
-# typed-op migration retired that script's own text scan of admit()/
-# admit_cascade() call sites — see this crate's own Cargo.toml description).
+# ci/scripts/perf/test_finetune_ab_disable_op_keys.py, which reads the typed op
+# list from it instead of scanning admit()/admit_cascade() call sites as text
+# (see this crate's own Cargo.toml description).
 default-members = [
     "crates/jammi-db",
     "crates/jammi-numerics",
@@ -104,8 +104,8 @@ datafusion-proto = "54"
 # Ballista 54.1 — jammi's compute-plane dependency line. Its own transitive
 # deps (`arrow-flight 58.3`, `datafusion 54`, `datafusion-proto 54`,
 # `object_store 0.13.2`, `prost 0.14`, `tonic 0.14`) match the workspace's
-# exactly, so `deny.toml`'s multiple-version bans hold with no line bump
-# (contract `feat_500-wave4` §1). `default-features = false` on the
+# exactly, so `deny.toml`'s multiple-version bans hold with no line bump.
+# `default-features = false` on the
 # scheduler/executor crates: no `rest-api`/`keda-scaler` surface, no CLI
 # binaries — jammi hosts both roles itself (`jammi_ballista::roles`).
 ballista-core = "54.1"
@@ -148,7 +148,7 @@ object_store = { version = "0.13", default-features = false }
 candle-core = "0.11"
 candle-nn = "0.11"
 # candle-transformers is consumed only by jammi-encoders dev-dependencies
-# (parity-test feature) — it is no longer in any production dep tree.
+# (parity-test feature) — it is in no production dep tree.
 candle-transformers = "0.11"
 # bf16/f16 storage type — the same crate candle-core itself depends on
 # (jammi-kernels' CustomOp CPU arms read/write `CpuStorage::BF16` directly).
@@ -176,8 +176,8 @@ usearch = "2.25"
 tantivy = "0.26"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-# The media front end's per-item decode/preprocess parallelization (#421
-# follow-on): candle's private thread pool is never installed, so rayon's
+# The media front end's per-item decode/preprocess parallelization:
+# candle's private thread pool is never installed, so rayon's
 # GLOBAL pool is the one pool the process runs media-batch work on. Pinned to
 # the version already unified across the resolved tree (Cargo.lock).
 rayon = "1.11"
@@ -237,18 +237,17 @@ serde = { version = "1", features = ["derive"] }
 # Python's json.loads parses correctly rounded, so without this feature the
 # embedded (Rust-parsed) and remote (Python-parsed) reads of one identical
 # metrics blob can disagree by 1 ulp — a cross-surface parity defect, not a
-# test nicety. Proven by CI run 33447230995's bit-identity failure
-# (0.42201741678374155 -> 0.4220174167837415) and a minimal two-arm repro.
+# test nicety (example: 0.42201741678374155 re-parses as 0.4220174167837415).
 # `preserve_order`: a `serde_json::Map` keeps INSERTION order (indexmap) instead
 # of sorting keys (BTreeMap). Declared here so the semantic is a workspace
-# decision, not an accident of the graph. Measured fact before this line
-# (`cargo tree <scope> -e features -i serde_json`): `--workspace` builds and
-# `-p jammi-server` resolved it ON (substrait 0.63, a hard dependency via
-# datafusion-substrait 54 -> datafusion-flight-sql-server, enables it) while
-# `-p jammi-db`, `-p jammi-ai`, `-p jammi-cli` and `-p jammi-python` (the
-# maturin wheel) resolved it OFF — so the shipped CLI/wheel and the tested
-# binaries disagreed on map order. With the declaration every scope resolves
-# it ON, one-directionally. Persisted/hashed JSON does not
+# decision, not an accident of the graph: substrait 0.63 (a hard dependency via
+# datafusion-substrait 54 -> datafusion-flight-sql-server) enables it, so
+# without this declaration `--workspace` and `-p jammi-server` resolve it ON
+# while `-p jammi-db`, `-p jammi-ai`, `-p jammi-cli` and `-p jammi-python` (the
+# maturin wheel) resolve it OFF, and the shipped CLI/wheel and the tested
+# binaries disagree on map order (`cargo tree <scope> -e features -i
+# serde_json`). Declared here, every scope resolves it ON. Persisted/hashed
+# JSON does not
 # depend on it either way (`manifest.rs canonicalize_json` and
 # `audit/record.rs canonicalize_value` sort before insert; the classifier's
 # `all_scores_json` and eval `metrics_json` sort explicitly); a producer that
@@ -258,7 +257,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
 toml = "0.8"
 # Path-carrying deserialization errors for the jammi-db layered config
-# loader (esc-095): a `deny_unknown_fields` refusal or a type mismatch
+# loader: a `deny_unknown_fields` refusal or a type mismatch
 # reports the dotted struct path, which the env-namespace layer turns
 # into the offending `JAMMI_*` variable name(s).
 serde_path_to_error = "0.1"
@@ -266,7 +265,7 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-# Vendor-neutral OTLP trace export (#486), behind `jammi-ai`'s `telemetry-otlp`
+# Vendor-neutral OTLP trace export, behind `jammi-ai`'s `telemetry-otlp`
 # feature. One tonic: `opentelemetry-otlp`'s `grpc-tonic` transport pins tonic
 # `^0.14.1` / prost `^0.14`, matching this workspace's own `tonic = "0.14"` /
 # `prost = "0.14"` pins exactly, so enabling it adds no second tonic build.
@@ -285,12 +284,12 @@ seahash = "4"
 bytemuck = "1"
 hf-hub = { version = "0.5", default-features = false, features = ["tokio", "ureq", "rustls-tls"] }
 thiserror = "2"
-# Enum-inventory-by-construction (#550): `VariantArray`'s derive reads the
+# Enum-inventory-by-construction: `VariantArray`'s derive reads the
 # enum's own variant list at macro-expansion time and emits a `VARIANTS`
 # array from it, so a hand-maintained `ALL`/`VARIANTS` array can never drift
 # from the variant list the way a hand-written match's ARM SET can stay
-# exhaustive while its separately hand-typed array literal goes stale (the
-# defect #550 names). `derive` is the only feature: no `Display`/`EnumString`
+# exhaustive while its separately hand-typed array literal goes stale.
+# `derive` is the only feature: no `Display`/`EnumString`
 # macros are pulled in, since every enum here already hand-writes
 # `Display`/`FromStr` for its SQL/wire string form, deliberately decoupled
 # from the Rust variant identifier (`ResultTableKind::NeighborGraph` <->
@@ -299,7 +298,7 @@ strum = { version = "0.26", default-features = false, features = ["derive"] }
 directories = "6"
 url = "2"
 async-trait = "0.1"
-# Audit-record signing (J2): HMAC-SHA256 over the canonical serialization,
+# Audit-record signing: HMAC-SHA256 over the canonical serialization,
 # per-tenant key derived via HKDF-SHA256 from JAMMI_AUDIT_MASTER_KEY.
 hmac = "0.12"
 sha2 = "0.10"

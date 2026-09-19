@@ -7,7 +7,7 @@ PROTO_ROOT := ../../crates/jammi-wire/proto
 OUT_DIR    := jammi/_generated
 
 # Every jammi.v1 service proto. Compiling the whole tree (not just the
-# embedding + catalog verbs `connect` exposes today) keeps the generated
+# embedding + catalog verbs `connect` exposes) keeps the generated
 # surface a faithful mirror of the npm client and lets the client grow new
 # verbs without a Makefile edit — the proto stays the single source.
 PROTO_FILES := \

@@ -15,7 +15,7 @@ name: Server Image
 #     EmbeddingService) — it is never gated on a tag.
 #   * the CUDA image `jammi-ai-server-cu12` (`:latest`, `:vX.Y.Z`, …) —
 #     GPU-accelerated inference, same tag scheme as the CPU image, published
-#     on the same `v*` tags. CUDA lives only on the server image (M2 §1, §5d).
+#     on the same `v*` tags. CUDA lives only on the server image.
 #     GPU *runtime* is not testable in CI (no GPU on CI runners), so a
 #     build-only `pull_request` job (below) proves the CUDA Dockerfile compiles
 #     before a tag; the build succeeding is the gate.
@@ -64,7 +64,7 @@ jobs:
   # `:latest` is republished mid-run (see `.github/actions/resolve-ci-image`
   # and `_ci-base-image.yml`'s own header for why nothing writes the repo
   # variable itself). `cu12-only` legs still resolve `image` (unused by
-  # them) because this is one job per workflow, not one per image (U4) --
+  # them) because this is one job per workflow, not one per image --
   # cheap, and keeps the resolver invocation count at exactly two reads.
   resolve-base:
     name: Resolve CI base images
@@ -93,21 +93,20 @@ jobs:
 
   # CPU image, main-branch arm: pushed from the default branch (`latest` +
   # sha) via a `workflow_dispatch` run on `main` only -- this workflow
-  # carries NO `push: branches:` trigger (F8 audit fix: unlike `image.yml`/
+  # carries NO `push: branches:` trigger (unlike `image.yml`/
   # `image-cuda.yml`, which do), so this arm never fires automatically on a
   # mere merge; it is a manual `:latest`/`:sha-...` refresh. This arm is
   # UNGATED: it never promotes a `v*`/semver tag (see `build-and-push`
-  # below for that) — the GPU-prove gate (#454 follow-up) applies to a
+  # below for that) — the GPU-prove gate applies to a
   # RELEASE tag, not to this manual refresh. Never runs on pull_request
   # (PRs must not push to GHCR).
   #
   # Matrixed over arch (native runner per arch, no QEMU -- same shape
   # `_ci-base-image.yml` uses). Each leg pushes ONLY its own immutable
-  # `sha-<sha>-<arch>` tag (S2); `merge-cpu-main` below is the ONLY job that
-  # ever moves the real `latest`/`sha-<sha>` tags this arm has always
-  # published.
+  # `sha-<sha>-<arch>` tag; `merge-cpu-main` below is the ONLY job that
+  # ever moves the real `latest`/`sha-<sha>` tags this arm publishes.
   build-and-push-main:
-    # `&& github.ref_type != 'tag'` (F3 audit fix, #454 follow-up round 2):
+    # `&& github.ref_type != 'tag'`:
     # a `gate_kind='none'` row must structurally PROVE it can never fire on
     # a release tag ref, never merely happen to never mention one --
     # `check_gpu_prove_once.py`'s P3 rule pins this exact conjunct.
@@ -139,8 +138,8 @@ jobs:
 
       # `ci/release-feature-manifest.json`'s `cpu-image` lane is the single
       # source of truth for this build's cargo feature list (fed into the
-      # Dockerfile's `CARGO_FEATURES` build-arg, required — no default —
-      # since #507) — read here rather than hardcoding it a second time,
+      # Dockerfile's `CARGO_FEATURES` build-arg, required — no default)
+      # — read here rather than hardcoding it a second time,
       # same idiom as the CUDA jobs' own `manifest` step below.
       - name: Read release feature list (ci/release-feature-manifest.json)
         id: manifest
@@ -157,7 +156,7 @@ jobs:
         id: publish
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # S2: the leg pushes ONLY its own immutable `sha-<sha>-<arch>` tag
+          # The leg pushes ONLY its own immutable `sha-<sha>-<arch>` tag
           # -- never `latest`, never a bare `sha-<sha>` -- so `merge-cpu-
           # main` below is the ONLY job that ever moves a real
           # (consumer-facing) tag.
@@ -223,10 +222,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      # Re-run metadata-action with the ORIGINAL (unsuffixed) tag rule this
-      # arm has always published, so `latest` still moves exactly the way
-      # it did before per-arch legs existed -- now naming a multi-arch
-      # index instead of a single-arch image.
+      # Re-run metadata-action with the unsuffixed tag rule this arm
+      # publishes, so `latest` moves the same way a single-arch push would
+      # move it -- naming the multi-arch index.
       - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         id: meta
         with:
@@ -293,7 +291,7 @@ jobs:
 
           docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
 
-          # V4: re-read the IMMUTABLE `sha-<sha>` tag, not a mutable tag off
+          # Re-read the IMMUTABLE `sha-<sha>` tag, not a mutable tag off
           # $TAGS -- the digest this step attests, and the digest the
           # attestation checks below verify, must be the one the merge
           # itself just wrote, not whatever a later push re-points a
@@ -350,11 +348,10 @@ jobs:
           subject-digest: ${{ steps.merge.outputs.digest }}
           push-to-registry: true
 
-      # BLOCK 3 (#482): every OTHER push job in this workflow runs both
-      # checks below against its own pushed digest; this merge job attested
-      # the merged index above but never verified it -- the exact
-      # "attested, not verified" gap `deploy-server.md`'s "on every push
-      # job" claim requires closed.
+      # Every push job in this workflow runs both checks below against its
+      # own pushed digest; this merge job verifies the merged index it
+      # attested above, so `deploy-server.md`'s "on every push job" claim
+      # holds with no "attested, not verified" gap.
       - name: Assert BuildKit provenance + SBOM are in the image index
         shell: bash
         env:
@@ -369,14 +366,13 @@ jobs:
 
   # CPU image, tag arm: pushed from `v*` tag refs (semver tags) only — a tag
   # push, or a recovery dispatch run on the tag — behind the shared
-  # GPU-prove verdict (#454 follow-up, operator direction: every release
-  # publisher gates on the prove verdict, all-or-nothing, not only the CUDA
-  # lanes). Split from the main-branch arm above so the ungated manual
+  # GPU-prove verdict (every release publisher gates on the prove verdict,
+  # all-or-nothing, not only the CUDA lanes). Split from the main-branch arm above so the ungated manual
   # `:latest` refresh is never blocked by, or conflated with, a
   # release-tag promotion's gate.
   #
   # Matrixed over arch, same shape as `build-and-push-main` above. Each leg
-  # pushes ONLY its own immutable `sha-<sha>-<arch>` tag (S2); `merge-cpu-
+  # pushes ONLY its own immutable `sha-<sha>-<arch>` tag; `merge-cpu-
   # tag` below is the ONLY job that ever moves the real semver/`sha-<sha>`
   # tags this arm publishes.
   build-and-push:
@@ -547,7 +543,7 @@ jobs:
 
           docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
 
-          # V4: re-read the IMMUTABLE `sha-<sha>` tag, not a mutable tag off
+          # Re-read the IMMUTABLE `sha-<sha>` tag, not a mutable tag off
           # $TAGS -- the digest this step attests, and the digest the
           # attestation checks below verify, must be the one the merge
           # itself just wrote, not whatever a later push re-points a
@@ -603,11 +599,10 @@ jobs:
           subject-digest: ${{ steps.merge.outputs.digest }}
           push-to-registry: true
 
-      # BLOCK 3 (#482): every OTHER push job in this workflow runs both
-      # checks below against its own pushed digest; this merge job attested
-      # the merged index above but never verified it -- the exact
-      # "attested, not verified" gap `deploy-server.md`'s "on every push
-      # job" claim requires closed.
+      # Every push job in this workflow runs both checks below against its
+      # own pushed digest; this merge job verifies the merged index it
+      # attested above, so `deploy-server.md`'s "on every push job" claim
+      # holds with no "attested, not verified" gap.
       - name: Assert BuildKit provenance + SBOM are in the image index
         shell: bash
         env:
@@ -624,16 +619,15 @@ jobs:
   # `runtime-selfcontained` stage (baked config + encoder) from the
   # dispatched ref and pushes `:selfcontained` + a `:sha-<sha>` tag.
   # Independent of the tag-triggered generic publish above. Reads the SAME
-  # `cpu-image` manifest lane the generic CPU image does (#507: the
+  # `cpu-image` manifest lane the generic CPU image does (the
   # Dockerfile's CPU builder stage requires `CARGO_FEATURES` — no default —
   # so every job that reaches it, including this one, must pass it); it
   # builds from the CPU `builder` stage, not `builder-cuda`, so it never
   # carries a CUDA feature.
   build-and-push-selfcontained:
-    # `&& github.ref_type != 'tag'` (F3 audit fix, #454 follow-up round 2):
-    # closes a real leak an adversarial audit found here -- without a ref-
-    # type restriction, a workflow_dispatch run against a `v*` tag ref with
-    # `selfcontained=true` pushed this image entirely ungated (this row is
+    # `&& github.ref_type != 'tag'`: without a ref-type restriction, a
+    # workflow_dispatch run against a `v*` tag ref with
+    # `selfcontained=true` would push this image entirely ungated (this row is
     # gate_kind='none' by design, so it never even had a GPU-prove verdict
     # to bypass). `check_gpu_prove_once.py`'s P3 rule pins the exact
     # conjunct `github.ref_type != 'tag'` on every gate_kind='none' row.
@@ -675,7 +669,7 @@ jobs:
             RUNTIME_VARIANT=runtime-selfcontained
             BASE_IMAGE=${{ needs.resolve-base.outputs.image }}
             CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
-          # S5: Cloudflare Containers (this variant's runtime) is amd64-only
+          # Cloudflare Containers (this variant's runtime) is amd64-only
           # -- no arm leg, no merge job, no row. Explicit, never implicit
           # native-runner behavior, so a future runner-arch change fails
           # loudly instead of silently shipping an arm64 image nothing can
@@ -755,7 +749,7 @@ jobs:
         with:
           # Deliberately NOT `submodules: recursive` — a targeted init below
           # keeps the scope auditable, same idiom as ci.yml's `flash-attn-
-          # compile` job and the other CUDA release lanes this wave touches.
+          # compile` job and the other CUDA release lanes.
           submodules: false
 
       # `ci/release-feature-manifest.json`'s `cu12-image` lane is the single
@@ -774,7 +768,7 @@ jobs:
           fi
           echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
 
-      # `flash-attn` (now in the manifest's cu12-image feature list) needs
+      # `flash-attn` (in the manifest's cu12-image feature list) needs
       # the vendored CUTLASS submodule in the build CONTEXT: `docker/build-
       # push-action` builds from the local checkout (context: "."), not a
       # fresh `git clone` inside the container, so the submodule must be
@@ -795,8 +789,8 @@ jobs:
             RUNTIME_VARIANT=runtime-cuda
             CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
             BASE_IMAGE_CUDA=${{ needs.resolve-base.outputs.image_cuda }}
-          # S5/T7: the CUDA runtime base has no arm64 build (no NVIDIA GPU
-          # target for it -- see the brief's verified facts); explicit, same
+          # The CUDA runtime base has no arm64 build (no NVIDIA GPU target
+          # for it); explicit, same
           # loud-failure property as the self-contained image above.
           platforms: linux/amd64
           push: "true"
@@ -863,7 +857,7 @@ jobs:
             RUNTIME_VARIANT=runtime-cuda
             CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
             BASE_IMAGE_CUDA=${{ needs.resolve-base.outputs.image_cuda }}
-          # T7: same explicit-amd64 rule as the pushing CUDA leg above --
+          # Same explicit-amd64 rule as the pushing CUDA leg above --
           # this build-only verification stays byte-identical in platform
           # coverage to what actually ships.
           platforms: linux/amd64

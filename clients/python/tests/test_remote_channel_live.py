@@ -16,7 +16,7 @@ results equal the embedded engine's:
   * **tenant scoping over the wire:** a channel registered under tenant A is
     invisible to tenant B (and B may register the same id without collision);
     an unbound connection sees only the global (NULL-tenant) seed channels —
-    the #170 tenant-qualification property, now driven through the client.
+    the tenant-qualification property, driven through the client.
 
 The `live_server` fixture is module-scoped, so its catalog state persists across
 tests in this module. Each parity test therefore scopes BOTH transports to a
@@ -207,7 +207,7 @@ def test_redeclare_column_same_dtype_rejected_on_both(live_server, tmp_path):
 
 
 def test_tenant_scoping_over_the_wire_matches_embedded(live_server, tmp_path):
-    """The #170 tenant-qualification property, driven through the client:
+    """The tenant-qualification property, driven through the client:
     a channel registered under tenant A is invisible to tenant B; B may register
     the same id without collision; an unbound connection sees only the global
     seed channels. The remote client propagates tenant scope identically to the

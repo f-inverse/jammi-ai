@@ -1,4 +1,4 @@
-"""Dataset loaders — Air Routes and ogbn-arxiv (K2).
+"""Dataset loaders — Air Routes and ogbn-arxiv.
 
 Both datasets are publicly redistributable and are fetched on demand, never
 committed in full: only the small committed subset artifacts (``artifacts/``) and

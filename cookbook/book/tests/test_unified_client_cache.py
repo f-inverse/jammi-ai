@@ -1,4 +1,4 @@
-"""Cache-backed checks for the unified-client surface (U1/U2) — CPU, hermetic.
+"""Cache-backed checks for the unified-client surface — CPU, hermetic.
 
 These re-derive the chapter's load-bearing surface facts LIVE (no server socket,
 no GPU, no upstream recompute) and assert they equal the committed
@@ -183,8 +183,8 @@ def test_capability_enum_is_the_closed_four():
     `unified_client.json` in one move would satisfy the equality above on its
     own. This is the independent oracle that catches it.
 
-    `CLOSE` is pinned as an ABSENCE for the same reason it left: both transports
-    now carry `close()` (the embedded arm's releases the catalog file — an
+    `CLOSE` is pinned as an ABSENCE because it does not diverge: both transports
+    carry `close()` (the embedded arm's releases the catalog file — an
     awaited event, not a drop; see
     `crates/jammi-db/src/catalog/backend_sqlite.rs`), so a flag every backend
     sets would be a predicate that never discriminates. Re-adding it has to be a

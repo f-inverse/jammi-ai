@@ -208,8 +208,7 @@ product, not a Jammi consumer — the engine names no consumer.)
 ## The verified citation map
 
 Every citation below was **independently verified** (author / year / venue)
-against the primary source during this chapter's pressure-test — not trusted from
-the hand-off spec. Each is backed by a `references.bib` entry, and a test
+against the primary source — not trusted from a secondary summary. Each is backed by a `references.bib` entry, and a test
 (`tests/test_citation_map.py`) asserts that every row's Jammi call is a verb that
 actually exists in the grounded API reference and that no `@cite` dangles. The
 table renders from the same `citation_map` data the test checks, so the rendered
@@ -251,13 +250,12 @@ print(f"citation map: {len(CITATION_MAP)} rows, every reference resolved, "
       f"every Jammi call exists on the pinned engine ✓")
 ```
 
-### Verification notes — what the pressure-test corrected
+### Verification notes — three citations that are easy to get wrong
 
-Researching each citation against the primary source surfaced three precision
-fixes the hand-off spec's representative table got loose on; the `references.bib`
+Three citations in this map are commonly given loosely; the `references.bib`
 entries carry the verified facts:
 
-- **APPNP authorship.** The spec attributed it to "Klicpera 2019". The author
+- **APPNP authorship.** It is often attributed to "Klicpera 2019". The author
   Johannes **Klicpera later changed his name to Johannes Gasteiger**; the canonical
   attribution is **Gasteiger, Bojchevski & Günnemann, ICLR 2019** ("Predict then
   Propagate", arXiv 2018). The bib cites Gasteiger with the name-change noted.
@@ -267,8 +265,8 @@ entries carry the verified facts:
 - **Angelopoulos & Bates 2021 and TabPFN 2022 are arXiv-year citations with later
   formal venues.** Angelopoulos & Bates (arXiv 2021) was published in *Foundations
   and Trends in ML* 16(4), **2023**; TabPFN (Hollmann et al., arXiv 2022) was
-  published at **ICLR 2023**. Both are cited by their arXiv year (matching the
-  spec) with the formal venue recorded in the bib `note`.
+  published at **ICLR 2023**. Both are cited by their arXiv year with the formal
+  venue recorded in the bib `note`.
 
 The remaining canon held exactly as cited: SGC (Wu et al., ICML 2019), node2vec
 (Grover & Leskovec, KDD 2016), GraphSAGE (Hamilton et al., NeurIPS 2017), CNP

@@ -1,10 +1,10 @@
 name: Image (CI base, CPU)
 
-# Builds the CPU CI base image (jammi-ai-ci) -- now a linux/amd64 + linux/arm64
+# Builds the CPU CI base image (jammi-ai-ci) -- a linux/amd64 + linux/arm64
 # multi-arch index -- that the CPU workflows run inside. Thin caller of the
 # shared _ci-base-image reusable. Rebuilds on a change to its own Dockerfile,
-# the pinned toolchain, or the reusable itself (narrowed from `.docker/**` so a
-# CUDA-only Dockerfile change no longer needlessly rebuilds the CPU base).
+# the pinned toolchain, or the reusable itself (not all of `.docker/**`, so a
+# CUDA-only Dockerfile change does not rebuild the CPU base).
 
 on:
   push:
@@ -30,7 +30,7 @@ permissions:
 
 jobs:
   build:
-    # `github.ref_type != 'tag'` (F1/F3 audit fix, #454 follow-up round 2):
+    # `github.ref_type != 'tag'`:
     # this job `uses:` the LOCAL reusable `_ci-base-image.yml`, whose own
     # `build-and-push` job pushes to GHCR unconditionally -- P6 discovery
     # (`check_gpu_prove_once.py`) therefore tables this job too

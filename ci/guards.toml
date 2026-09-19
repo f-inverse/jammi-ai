@@ -8,6 +8,8 @@
 #   when   scopes (below); omitted = runs on every change. A scoped guard runs
 #          when a changed path matches its scope, and always on a push to main.
 #   needs  host requirements (below) the runner provides before running
+#   lane   the lane (below) that selects it; omitted = the CI image's lane,
+#          which CI's `guard` job and `ci/dev.sh` run
 #
 # Adding a guard: it must hold a property of the product or of the machinery
 # that ships and measures it, and it must have been seen to fail for the reason
@@ -47,6 +49,18 @@ paths = ["ci/**", ".github/**", ".cargo/**", "Cargo.lock", "**/Cargo.toml"]
 [scope.kernels]
 paths = ["ci/**", "crates/jammi-kernels/**"]
 
+# ----------------------------------------------------------------- lanes
+
+# A lane is a host offering what no command can install. Its guards are
+# selected by `run_guards.py --lane NAME` and by no other run, so a guard is
+# never selected where its host is absent; where it is selected, a missing
+# need fails the run naming it. Hermeticity is the CI image's lane's: another
+# lane's guards use what their host is for — here, a workspace build and a
+# PyTorch run.
+
+[lane.torch-host]
+host = "a checkout with a cargo toolchain and the PyTorch reference venv: TORCH_VENV, default .venv-torch-ref"
+
 # ----------------------------------------------------------------- needs
 
 [need.pyyaml]
@@ -82,6 +96,17 @@ provide = "yum install -y -q binutils"
 [need.linux-root]
 probe = "test \"$(uname -s)\" = Linux && test \"$(id -u)\" = 0"
 provide = "echo 'run inside the CI image: ci/dev.sh python3 ci/scripts/run_guards.py' >&2; false"
+
+# A Rust toolchain that builds the workspace. Nothing provides it.
+[need.cargo]
+probe = "command -v cargo"
+provide = "echo 'install the toolchain rust-toolchain.toml pins (rustup), or run inside the CI image through ci/dev.sh' >&2; false"
+
+# The venv the PyTorch reference producers run in. Nothing provides it: it is
+# a multi-gigabyte install, made once per host.
+[need.torch-venv]
+probe = "python3 ci/scripts/perf/torch_venv.py"
+provide = "echo 'provision it, and name it in TORCH_VENV unless it is .venv-torch-ref: uv venv .venv-torch-ref && uv pip install --python .venv-torch-ref/bin/python3 torch transformers peft safetensors' >&2; false"
 
 [need.jq]
 probe = "command -v jq"
@@ -475,6 +500,22 @@ run = "python3 ci/scripts/perf/test_compare_grad_oracle.py"
 why = "The Jammi-vs-PyTorch gradient comparator refuses legs that did not run the same problem."
 when = ["perf"]
 needs = ["numpy"]
+
+[[guard]]
+name = "grad oracle cross-producer parity"
+run = "python3 ci/scripts/perf/test_grad_oracle_cross_producer_parity.py"
+why = "The gradient dumps the real Jammi and PyTorch producers write agree on the identity fields, dtype spelling and tensor names the comparator matches them on."
+when = ["perf"]
+needs = ["cargo", "torch-venv"]
+lane = "torch-host"
+
+[[guard]]
+name = "torch_finetune_step dry run"
+run = "python3 ci/scripts/perf/test_torch_finetune_step_dry_run.py"
+why = "Every identity field the PyTorch fine-tune reference declares non-null is non-null in a report it really writes."
+when = ["perf"]
+needs = ["torch-venv"]
+lane = "torch-host"
 
 [[guard]]
 name = "ab_merge"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """`run_guards.py`'s suite: the parser's refusals, path selection, need
-provisioning, and the committed guard list itself."""
+provisioning, lanes, and the committed guard list itself."""
 
 from __future__ import annotations
 
@@ -20,6 +20,13 @@ paths = ["ci/**", "**/Cargo.toml"]
 probe = "true"
 provide = "true"
 
+[need.rig-host]
+probe = "true"
+provide = "false"
+
+[lane.elsewhere]
+host = "a host the CI image is not"
+
 [[guard]]
 name = "always"
 run = "true"
@@ -31,6 +38,21 @@ run = "true"
 why = "w"
 when = ["rig"]
 needs = ["tool"]
+
+[[guard]]
+name = "elsewhere always"
+run = "true"
+why = "w"
+lane = "elsewhere"
+needs = ["rig-host"]
+
+[[guard]]
+name = "elsewhere scoped"
+run = "true"
+why = "w"
+lane = "elsewhere"
+when = ["rig"]
+needs = ["rig-host"]
 """
 
 
@@ -45,9 +67,13 @@ class Parse(unittest.TestCase):
 
     def test_reads_a_well_formed_list(self):
         parsed = rg.parse_guard_list(LIST)
-        self.assertEqual(names(parsed.guards), ["always", "scoped"])
+        self.assertEqual(
+            names(parsed.guards), ["always", "scoped", "elsewhere always", "elsewhere scoped"]
+        )
         self.assertEqual(parsed.guards[1].when, ("rig",))
         self.assertEqual(parsed.needs["tool"].provide, "true")
+        self.assertEqual([g.lane for g in parsed.guards], [None, None, "elsewhere", "elsewhere"])
+        self.assertEqual(parsed.lanes, {"elsewhere": "a host the CI image is not"})
 
     def test_refuses_an_unknown_field(self):
         self.refused(LIST + '\n[[guard]]\nname="x"\nrun="true"\nwhy="w"\nadvisory=true\n', "unknown.*advisory")
@@ -65,6 +91,18 @@ class Parse(unittest.TestCase):
     def test_refuses_an_unused_scope_and_need(self):
         self.refused(LIST.replace('when = ["rig"]\n', ""), "scope 'rig' is used by no guard")
         self.refused(LIST.replace('needs = ["tool"]\n', ""), "need 'tool' is used by no guard")
+
+    def test_refuses_an_unknown_and_an_unused_lane(self):
+        self.refused(LIST.replace('lane = "elsewhere"\nneeds', 'lane = "elsewher"\nneeds', 1), "unknown lane 'elsewher'")
+        self.refused(
+            LIST + '\n[lane.nowhere]\nhost = "h"\n', "lane 'nowhere' is used by no guard"
+        )
+
+    def test_refuses_a_lane_guard_that_needs_nothing_of_its_host(self):
+        self.refused(
+            LIST + '\n[[guard]]\nname="x"\nrun="true"\nwhy="w"\nlane="elsewhere"\n',
+            "lane 'elsewhere' but no needs",
+        )
 
     def test_refuses_a_glob_it_cannot_honour(self):
         self.refused(LIST.replace('"ci/**"', '"!ci/**"'), "unsupported path glob")
@@ -95,8 +133,8 @@ class Globs(unittest.TestCase):
 class Select(unittest.TestCase):
     parsed = rg.parse_guard_list(LIST)
 
-    def selected(self, changed) -> list[str]:
-        return names(rg.select(self.parsed, None if changed is None else frozenset(changed)))
+    def selected(self, changed, lane=None) -> list[str]:
+        return names(rg.select(self.parsed, None if changed is None else frozenset(changed), lane))
 
     def test_an_unknown_change_runs_everything(self):
         self.assertEqual(self.selected(None), ["always", "scoped"])
@@ -111,9 +149,19 @@ class Select(unittest.TestCase):
             narrowed = rg.parse_guard_list(LIST.replace('"ci/**", ', ""))
             self.assertEqual(names(rg.select(narrowed, frozenset([path]))), ["always", "scoped"])
 
+    def test_a_lane_selects_its_own_guards_and_no_other_lane_does(self):
+        self.assertEqual(self.selected(None, "elsewhere"), ["elsewhere always", "elsewhere scoped"])
+        self.assertEqual(self.selected(["crates/jammi-db/src/lib.rs"], "elsewhere"), ["elsewhere always"])
+        for changed in (None, list(rg.SELF_PATHS), ["crates/jammi-db/Cargo.toml"]):
+            self.assertNotIn("elsewhere always", self.selected(changed))
+
+    def test_the_needs_of_another_lane_are_never_provided(self):
+        in_lane = rg.select(self.parsed, None)
+        self.assertEqual([n.name for n in rg.needs_of(self.parsed, in_lane)], ["tool"])
+
     def test_needs_are_those_of_the_selection_once_each(self):
         twice = rg.parse_guard_list(LIST + '\n[[guard]]\nname="third"\nrun="true"\nwhy="w"\nneeds=["tool"]\n')
-        self.assertEqual([n.name for n in rg.needs_of(twice, twice.guards)], ["tool"])
+        self.assertEqual([n.name for n in rg.needs_of(twice, twice.guards)], ["tool", "rig-host"])
         self.assertEqual(rg.needs_of(twice, twice.guards[:1]), ())
 
 
@@ -125,8 +173,9 @@ class Execute(unittest.TestCase):
         with self.subTest("provide succeeds but the need is still absent"):
             self.assertIn("'n' is absent", rg.provide(rg.Need("n", probe="false", provide="true")))
         with self.subTest("provide fails"):
-            why = rg.provide(rg.Need("n", probe="false", provide="echo no-yum-here; exit 1"))
-            self.assertIn("no-yum-here", why)
+            why = rg.provide(rg.Need("n", probe="echo what-is-missing; false", provide="echo no-yum-here; exit 1"))
+            for expected in ("what-is-missing", "no-yum-here"):
+                self.assertIn(expected, why)
 
     def test_a_guard_passes_or_fails_by_its_exit_status(self):
         guard = lambda run: rg.Guard("g", run, "the property", (), ())  # noqa: E731
@@ -152,6 +201,9 @@ class CommittedList(unittest.TestCase):
             self.assertTrue(scripts, f"{guard.name}: `run` names no script")
             for script in scripts:
                 self.assertTrue((rg.REPO_ROOT / script).is_file(), f"{guard.name}: {script} does not exist")
+
+    def test_an_undeclared_lane_is_refused(self):
+        self.assertEqual(rg.main(["--list", "--lane", "no-such-lane"]), 2)
 
     def test_the_paths_that_rerun_everything_exist(self):
         for path in rg.SELF_PATHS:

@@ -669,7 +669,9 @@ jobs:
   # check uses too: `ci/dev.sh python3 ci/scripts/run_guards.py --base origin/main`.
   # On a pull request only the guards the change can affect run; a push to
   # main runs them all. The runner provides what a selected guard declares it
-  # needs, so nothing is installed here.
+  # needs, so nothing is installed here. This job is the CI image's lane: a
+  # guard that declares another lane needs a host no command can make of this
+  # one, and only a run on that host selects it.
   guard:
     name: Guards
     runs-on: ubuntu-latest
@@ -957,8 +959,8 @@ jobs:
       # is derived from the real `PROBED_OPS` table through
       # `ci/tools/probed-ops-index` and the admit/admit_cascade call-site
       # census through `ci/tools/symbol-index` — both real `cargo run`s, so
-      # this suite builds workspace crates, which a guard in `ci/guards.toml`
-      # never does.
+      # this suite builds workspace crates, which no guard the `guard` job
+      # selects does.
       - name: Assert the eager-disable key sweep derives from the real PROBED_OPS table
         if: ${{ !cancelled() }}
         run: python3 ci/scripts/perf/test_finetune_ab_disable_op_keys.py

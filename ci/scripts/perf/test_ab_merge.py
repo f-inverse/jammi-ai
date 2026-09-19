@@ -1803,52 +1803,31 @@ class EmptyRawDirTests(unittest.TestCase):
         self.assertEqual(rc, 1)
 
 
-class TorchIdentityFieldsAgainstADryRunDumpTests(unittest.TestCase):
-    """`torch_finetune_step.py::TORCH_IDENTITY_FIELDS`
-    must actually be present, and non-null where NOT declared nullable, in the
-    JSON this producer emits.
+class TorchIdentityFieldsInProducerSourceTests(unittest.TestCase):
+    """Every `torch_finetune_step.py::TORCH_IDENTITY_FIELDS` entry is a key
+    the producer actually emits, read off its source with stdlib `ast` (no
+    torch). Whether each emitted VALUE is non-null is a run-time fact, held by
+    `test_torch_finetune_step_dry_run.py` on a host with a torch venv.
 
-    ONE REQUIRED leg + one best-effort leg — deliberately NOT symmetric,
-    because `torch_finetune_step.py`'s own module doc already states this
-    script is "never invoked from CI" (a human/CI *operator* runs it BY HAND
-    on a rented GPU pod, next to `jammi-bench finetune-step`); wiring a real
-    `--dry-run` execution into automated CI would reverse that deliberate
-    design decision, not merely wire a test in. So:
-
-    - `test_static_source_covers_every_declared_field` is the REQUIRED,
-      ALWAYS-RUNNING oracle (stdlib-only `ast`, no torch needed — this is
-      what actually executes in the `guard` matrix leg, a plain shallow
-      checkout with no Python ML stack). It is scoped to exactly the THREE
-      places this producer actually assembles emitted JSON —
-      `provenance()`'s own `info = {...}` dict, `checkpoint_identity()`'s own
-      return dict (the `**checkpoint_identity_fields` unpack inside the
-      `finetune_step` block — an unpack is not a literal string key `ast.Dict.
-      keys` sees, so its SOURCE function is walked directly instead), and the
-      ONE `report = {...}` literal inside `run()` (identified structurally,
-      by the dict literal that carries BOTH a `"finetune_step"` AND a
-      `"provenance"` key, so a future rename cannot silently re-target the
-      wrong dict) — never every `ast.Dict` in the module. Collecting keys
-      from EVERY dict in the module would be vacuous: it also sweeps in
-      `TORCH_IDENTITY_FIELDS_NULL_MEANS` (the classification
-      table declared two lines below `TORCH_IDENTITY_FIELDS` itself, whose
-      keys are the SAME field names) — a field declared in
-      `TORCH_IDENTITY_FIELDS` and named ONLY in `NULL_MEANS`, never actually
-      assigned anywhere the producer emits, would pass. Mutation check:
-      add `"max_grad_norm"` to `TORCH_IDENTITY_FIELDS` and to
-      `TORCH_IDENTITY_FIELDS_NULL_MEANS` ONLY (never to `provenance()`'s or
-      `run()`'s own dict literals) — this leg goes RED.
-    - `test_real_dry_run_dump_names_every_field` is a best-effort SUPPLEMENT,
-      not the enforcement mechanism: it actually spawns
-      `torch_finetune_step.py --dry-run` and checks every `NonNull` entry is
-      `is not None` (never mere presence) and every `TORCH_IDENTITY_FIELDS_
-      NULL_MEANS` entry is at least present — but it SKIPS, never RED,
-      when `torch`/`transformers`/`peft` are not importable (this
-      environment, and the plain `guard` matrix leg, never have them). This
-      is intentional, not a zero-execution violation of the "zero-execution
-      is RED, not a skip" convention (`.github/workflows/ci.yml` guard
-      matrix's own doc): that convention governs REQUIRED gates: this leg
-      was never wired as one — the static leg above is, and it has no skip
-      path at all.
+    The scan is scoped to exactly the THREE places this producer assembles
+    emitted JSON —
+    `provenance()`'s own `info = {...}` dict, `checkpoint_identity()`'s own
+    return dict (the `**checkpoint_identity_fields` unpack inside the
+    `finetune_step` block — an unpack is not a literal string key `ast.Dict.
+    keys` sees, so its SOURCE function is walked directly instead), and the
+    ONE `report = {...}` literal inside `run()` (identified structurally,
+    by the dict literal that carries BOTH a `"finetune_step"` AND a
+    `"provenance"` key, so a rename cannot silently re-target the
+    wrong dict) — never every `ast.Dict` in the module. Collecting keys
+    from EVERY dict in the module would be vacuous: it also sweeps in
+    `TORCH_IDENTITY_FIELDS_NULL_MEANS` (the classification
+    table declared two lines below `TORCH_IDENTITY_FIELDS` itself, whose
+    keys are the SAME field names) — a field declared in
+    `TORCH_IDENTITY_FIELDS` and named ONLY in `NULL_MEANS`, never actually
+    assigned anywhere the producer emits, would pass. Mutation check:
+    add `"max_grad_norm"` to `TORCH_IDENTITY_FIELDS` and to
+    `TORCH_IDENTITY_FIELDS_NULL_MEANS` ONLY (never to `provenance()`'s or
+    `run()`'s own dict literals) — this test goes RED.
     """
 
     TORCH_SCRIPT = os.path.join(
@@ -1958,81 +1937,6 @@ class TorchIdentityFieldsAgainstADryRunDumpTests(unittest.TestCase):
             f"TORCH_IDENTITY_FIELDS names field(s) that never appear as a key in provenance()'s own "
             f"dict or the report={{...}} literal inside run(): {missing} — declaring a field in "
             f"TORCH_IDENTITY_FIELDS_NULL_MEANS does NOT count as emitting it",
-        )
-
-    def test_real_dry_run_dump_names_every_field(self):
-        try:
-            import torch  # noqa: F401
-            import transformers  # noqa: F401
-            import peft  # noqa: F401
-        except ImportError:
-            self.skipTest(
-                "torch/transformers/peft not installed in this environment — best-effort "
-                "supplement, never the enforcement mechanism (see class doc); "
-                "test_static_source_covers_every_declared_field is the REQUIRED oracle and does "
-                "not skip"
-            )
-
-        sys.path.insert(0, os.path.dirname(os.path.abspath(self.TORCH_SCRIPT)))
-        import torch_finetune_step as tfs  # noqa: E402
-
-        with tempfile.TemporaryDirectory() as tmp_dir, tempfile.TemporaryDirectory() as out_dir:
-            out_path = os.path.join(out_dir, "dry_run.json")
-            rc = tfs.main(
-                [
-                    "--dry-run",
-                    "--batch",
-                    "2",
-                    "--seq",
-                    "6",
-                    "--steps",
-                    "1",
-                    "--warmup",
-                    "0",
-                    "--out",
-                    out_path,
-                ]
-            )
-            self.assertEqual(rc, 0)
-            with open(out_path) as fh:
-                dump = json.load(fh)
-
-        def _resolve(field):
-            """Checks ALL THREE blocks (`provenance`/`args`/`finetune_step`)
-            rather than stopping at the FIRST block that merely CONTAINS
-            `field` — stopping early would let a `null` in an EARLIER block
-            mask a genuine non-null value in a LATER one, and would collapse
-            "absent from every block" onto "present-but-null in the one
-            block that has it". It returns and returns a per-block status dict
-            (`"absent"` / `"null"` / `"present"`) alongside the verdict, so
-            a failure names exactly where the field stood in EACH block.
-            """
-            per_block = {}
-            satisfied = False
-            for block_name in ("provenance", "args", "finetune_step"):
-                block = dump.get(block_name, {})
-                if not isinstance(block, dict) or field not in block:
-                    per_block[block_name] = "absent"
-                    continue
-                if block[field] is None:
-                    per_block[block_name] = "null"
-                else:
-                    per_block[block_name] = "present"
-                    satisfied = True
-            if not satisfied and field in tfs.TORCH_IDENTITY_FIELDS_NULL_MEANS:
-                # A NullMeans field is satisfied by PRESENCE alone (even a
-                # null value) in at least one block — null is the declared
-                # state, not a finding.
-                satisfied = any(status != "absent" for status in per_block.values())
-            return satisfied, per_block
-
-        results = {f: _resolve(f) for f in tfs.TORCH_IDENTITY_FIELDS}
-        missing = {f: blocks for f, (ok, blocks) in results.items() if not ok}
-        self.assertFalse(
-            missing,
-            f"TORCH_IDENTITY_FIELDS entries unsatisfied in a real --dry-run dump — per-field, "
-            f"per-block status (absent/null/present) across provenance/args/finetune_step: "
-            f"{missing}",
         )
 
 

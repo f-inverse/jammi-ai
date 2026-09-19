@@ -21,6 +21,16 @@ workspace ships every publishable crate at the same
   `i`-th row of whichever batch it arrived in. An `annotate` over a multi-batch input, or a
   `batch_size` that does not divide `[engine] batch_size`, forwards different row groups than
   before, so its vectors may differ in the last bits. `batch_size = 0` was treated as `1`.
+- **`[engine] execution_threads` bounds all of the engine's CPU parallelism (#611).** It sized
+  DataFusion's partitions only; it now also sizes the forwards a CPU device admits at once
+  (which read the OS core count) and the process-wide rayon pool that CPU tensor math and
+  media preprocessing run on, which `jammi-server` and the Python engine size at startup
+  through the new `jammi_ai::concurrency::init_cpu_pool`. `EngineConfig::execution_threads`
+  is a `NonZeroUsize` (`0` is refused at load). `GpuScheduler::for_device` and
+  `DeviceSchedulers::for_devices` take the budget; `GpuScheduler::cpu(threads)` is the CPU
+  device; `GpuScheduler::new_unlimited` no longer reads the host's core count;
+  `DeviceSchedulers::unlimited` is removed. A Rust process embedding the engine as a library
+  owns its rayon pool and sizes it itself.
 - **A cancelled job ends `cancelled`, not `failed` (#515).** `cancelled` is a terminal job
   status. A cancel on a job no worker has claimed ends it at once, with no attempt spent; a
   running job is flagged and its executor ends it `cancelled` at its next checkpoint. `wait()`

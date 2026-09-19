@@ -717,8 +717,14 @@ pub enum SigningKeyConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EngineConfig {
-    /// Number of DataFusion execution threads. Default: available CPU count.
-    pub execution_threads: usize,
+    /// The engine's CPU parallelism budget, the one setting that bounds all of
+    /// it: DataFusion's partitions, the forwards a CPU device admits at once,
+    /// and the process-wide pool candle's CPU math and the media front ends
+    /// run on (which a binary sizes from this at startup; a process embedding
+    /// the engine as a library owns that pool itself). Default: the CPU count
+    /// the OS reports — set it where a container is allotted fewer cores than
+    /// it can see.
+    pub execution_threads: std::num::NonZeroUsize,
     /// Maximum memory for the query engine: `"<n>%"` (1-100) of host
     /// physical memory, `"<n>GB"`/`"<n>MB"`/`"<n>KB"` (binary units), or
     /// `"<n>"` (bytes). Default: `"75%"`. Parsed by
@@ -2872,10 +2878,8 @@ impl Default for LoggingConfig {
     }
 }
 
-fn num_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+fn num_cpus() -> std::num::NonZeroUsize {
+    std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::MIN)
 }
 
 // --- Loading ---

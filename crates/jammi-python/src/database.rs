@@ -113,6 +113,9 @@ impl PyDatabase {
         config: JammiConfig,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, JammiError> {
+        // This process is the engine's host: size the process-wide CPU pool
+        // from the same budget the session is about to take.
+        jammi_ai::concurrency::init_cpu_pool(config.engine.execution_threads)?;
         let session = runtime.block_on(InferenceSession::open(config))?;
         // Spawn the embedded training worker on the shared runtime, if this
         // process is configured to run one. The spawn must happen inside the

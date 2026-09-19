@@ -101,7 +101,8 @@ fn unique_source() -> String {
 
 async fn open_session(root: &Path, threads: usize) -> Arc<InferenceSession> {
     let mut config = common::test_config(root);
-    config.engine.execution_threads = threads;
+    config.engine.execution_threads =
+        std::num::NonZeroUsize::new(threads).expect("a positive thread count");
     Arc::new(InferenceSession::new(config).await.unwrap())
 }
 

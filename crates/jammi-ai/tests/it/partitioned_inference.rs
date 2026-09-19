@@ -521,7 +521,8 @@ async fn a_session_planned_query_keeps_the_nodes_own_fan_out() {
             let mut cfg = common::test_config(dir.path());
             cfg.inference.partitions = n;
             cfg.inference.batch_size = BATCH_SIZE;
-            cfg.engine.execution_threads = t;
+            cfg.engine.execution_threads =
+                std::num::NonZeroUsize::new(t).expect("a positive thread count");
             let session = InferenceSession::open(cfg).await.unwrap();
             session
                 .add_source(
@@ -721,7 +722,8 @@ async fn the_written_bytes_are_identical_at_every_fan_out() {
         std::fs::create_dir_all(&artifact_dir).unwrap();
         let mut cfg = common::test_config(&artifact_dir);
         cfg.inference.partitions = partitions;
-        cfg.engine.execution_threads = 4;
+        cfg.engine.execution_threads =
+            std::num::NonZeroUsize::new(4).expect("a positive thread count");
         let session = Arc::new(InferenceSession::new(cfg).await.unwrap());
         session
             .add_source(

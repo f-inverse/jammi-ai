@@ -921,8 +921,9 @@ async fn read_back_re_applies_the_committed_order_across_row_groups() {
     let dir = TempDir::new().unwrap();
 
     let mut config = common::test_config(dir.path());
-    config.engine.execution_threads = 4;
-    let partitions = config.engine.execution_threads;
+    config.engine.execution_threads =
+        std::num::NonZeroUsize::new(4).expect("a positive thread count");
+    let partitions = config.engine.execution_threads.get();
     assert!(
         partitions > 1,
         "a scan cannot interleave at one partition, so the control below would \

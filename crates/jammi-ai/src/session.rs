@@ -351,6 +351,7 @@ impl InferenceSession {
         let schedulers = crate::concurrency::DeviceSchedulers::for_devices(
             &device_config.devices,
             device_config.memory_fraction,
+            inner.config().engine.execution_threads,
         )?;
         let model_cache = Arc::new(ModelCache::with_device_schedulers(
             resolver,

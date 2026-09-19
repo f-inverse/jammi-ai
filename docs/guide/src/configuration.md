@@ -43,7 +43,13 @@ timing invariants) `load_from` runs afterward.
 artifact_dir = "/path/to/artifacts"
 
 [engine]
-# Number of DataFusion execution threads. Default: number of CPUs.
+# The engine's CPU parallelism budget — the one setting that bounds all of it:
+# the query engine's partitions, the model forwards a CPU device runs at once,
+# and the process-wide pool CPU tensor math and media preprocessing run on
+# (`jammi-server` and the Python engine size that pool from this at startup; a
+# Rust process embedding the engine as a library owns the pool itself).
+# Default: the CPU count the OS reports. Set it where a container is allotted
+# fewer cores than it can see — the engine cannot detect that from inside.
 execution_threads = 8
 # Memory limit for the query engine's DataFusion session: this becomes the
 # byte size of a `GreedyMemoryPool` every plan and every engine-side memory

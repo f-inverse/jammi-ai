@@ -125,7 +125,8 @@ async fn graph_session_with_partitions(
 ) -> (Arc<InferenceSession>, TempDir) {
     let dir = TempDir::new().unwrap();
     let mut config: JammiConfig = common::test_config(dir.path());
-    config.engine.execution_threads = target_partitions;
+    config.engine.execution_threads =
+        std::num::NonZeroUsize::new(target_partitions).expect("a positive thread count");
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
     session.register_query_functions();
     if let Some(t) = tenant {

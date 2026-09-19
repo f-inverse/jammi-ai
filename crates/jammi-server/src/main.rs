@@ -147,6 +147,12 @@ async fn serve(args: ServeArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Before any engine work: the process-wide CPU pool takes its size once.
+    if let Err(e) = jammi_ai::concurrency::init_cpu_pool(config.engine.execution_threads) {
+        eprintln!("jammi-server: {e}");
+        return ExitCode::FAILURE;
+    }
+
     let server = match OssServer::new(config).await {
         Ok(s) => s,
         Err(e) => {

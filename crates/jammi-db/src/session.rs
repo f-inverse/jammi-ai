@@ -189,7 +189,7 @@ impl JammiSession {
         signing_key_store: Arc<dyn SigningKeyStore>,
     ) -> Result<Self> {
         let session_config = SessionConfig::new()
-            .with_target_partitions(config.engine.execution_threads)
+            .with_target_partitions(config.engine.execution_threads.get())
             .with_batch_size(config.engine.batch_size);
 
         // `[engine] memory_limit` becomes THIS session's memory pool — the

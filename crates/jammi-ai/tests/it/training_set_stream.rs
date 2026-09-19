@@ -110,7 +110,8 @@ async fn drain_ok(
 async fn p1_the_loader_derived_state_plans_with_no_sort_and_no_merge() {
     let dir = TempDir::new().unwrap();
     let mut config = common::test_config(dir.path());
-    config.engine.execution_threads = 4;
+    config.engine.execution_threads =
+        std::num::NonZeroUsize::new(4).expect("a positive thread count");
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
     let fixture = common::multi_row_group_pairs(&session, dir.path(), true).await;
 
@@ -156,7 +157,8 @@ async fn p6i_w1_stream_concatenation_matches_read_back_sql_at_various_partition_
     for execution_threads in [1usize, 4] {
         let dir = TempDir::new().unwrap();
         let mut config = common::test_config(dir.path());
-        config.engine.execution_threads = execution_threads;
+        config.engine.execution_threads =
+            std::num::NonZeroUsize::new(execution_threads).expect("a positive thread count");
         let session = Arc::new(InferenceSession::new(config).await.unwrap());
         let fixture =
             common::multi_row_group_pairs(&session, dir.path(), execution_threads > 1).await;

@@ -61,7 +61,8 @@ async fn session_with_threads(dir: &TempDir, sub: &str, threads: usize) -> Arc<I
     let artifact_dir = dir.path().join(sub);
     std::fs::create_dir_all(&artifact_dir).unwrap();
     let mut config = common::test_config(&artifact_dir);
-    config.engine.execution_threads = threads;
+    config.engine.execution_threads =
+        std::num::NonZeroUsize::new(threads).expect("a positive thread count");
     Arc::new(InferenceSession::new(config).await.unwrap())
 }
 

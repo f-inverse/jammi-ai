@@ -3732,6 +3732,26 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
                    catalog at reload time is a deliberate refresh of that source's own tables.",
     },
     ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/storage/read_view.rs",
+        function: "register_read_view",
+        ordinal: 1,
+        allowed: 1,
+        property: "register_object_store(..) keyed by the URL's own scheme+authority, binding a \
+                   read-only view of the driver `StorageRegistry::driver_for` caches for that key -- \
+                   two calls for one URL rebind a view of the identical driver, and DataFusion's \
+                   `register_object_store` cannot error on either call; the one registration \
+                   function the source and the result-table scan paths both call. Executed by \
+                   `store::tests::register_object_store_twice_for_one_url_rebinds_the_same_driver_and_errors_on_neither`.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/storage/read_view.rs",
+        function: "register_local_read_view",
+        ordinal: 1,
+        allowed: 1,
+        property: "register_object_store(..) for the fixed `file://` root, once per session build: a \
+                   read-only view of a `LocalFileSystem`, identical on every call.",
+    },
+    ReviewedRegistrationSite {
         file: "crates/jammi-db/src/store/mod.rs",
         function: "bind_result_table",
         ordinal: 1,
@@ -4922,6 +4942,23 @@ const FINE_TUNE_REACHABLE_SITES: &[ReviewedRegistrationSite] = &[
                    source_id, ..) keyed by the data source's own stable identifier, called once \
                    per configured source at session build/reload time -- never per fine_tune call, \
                    reachable via the same session-construction path as `build` above.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/storage/read_view.rs",
+        function: "register_read_view",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: an idempotent rebind of a \
+                   read-only view of the cached driver for a URL's scheme+authority -- reachable \
+                   through the result-table provider the training-set materialization builds.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/storage/read_view.rs",
+        function: "register_local_read_view",
+        ordinal: 1,
+        allowed: 1,
+        property: "already reviewed at REGISTRATION_VERB_SITES's own entry: the fixed `file://` \
+                   read-only view, bound once per session build.",
     },
     ReviewedRegistrationSite {
         file: "crates/jammi-db/src/store/mod.rs",

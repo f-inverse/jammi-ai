@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# Mocks-only, no-network regression suite for the 2026-08-25 pod-lifecycle
-# incident (ledger rows 279-289), where the repo's own tooling terminated all
-# four dev pods in one night, plus the mechanism defects three follow-up
-# audit rounds found in this suite's own first pass. Covers the fixes that
-# closed all of it:
+# Mocks-only, no-network regression suite for the dev-pod lifecycle: the
+# repo's own tooling must never terminate a pod it does not own, and must
+# never leak one it rented. Covers:
 #
 #   (1) RP_POD_CREATED must be set the MOMENT a pod id comes back from the
 #       deploy mutation — not at SSH-up, minutes later — or an EXIT trap
@@ -20,14 +18,13 @@
 #       AND >0), never misattributed to RP_TTL_HOURS.
 #   (5) `down` verifies a recorded pod id against the account's own live pod
 #       list by ID + this tooling's own "<prefix>-ttl<digits>" NAME SHAPE —
-#       never an exact TTL number, which two earlier attempts both tried and
-#       both had to be removed (see rp_pod_verify's own doc in
-#       runpod_lib.sh: v1's exact-TTL match refused to release a
-#       genuinely-owned pod when the session's meta predated TTL tracking;
-#       v2's `RP_TTL_HOURS=<H>` override "remedy" was found INERT on every
-#       input, since the session meta is always loaded before any override
-#       is read). A refusal KEEPS the local record and names only the
-#       RunPod console as the manual path.
+#       never an exact TTL number (see rp_pod_verify's own doc in
+#       runpod_lib.sh: an exact-TTL match refuses to release a genuinely
+#       owned pod whose session meta carries no TTL, and an
+#       `RP_TTL_HOURS=<H>` override is INERT on every input, since the
+#       session meta is always loaded before any override is read). A
+#       refusal KEEPS the local record and names only the RunPod console as
+#       the manual path.
 #   (6) `down` CONFIRMS a terminate took, rather than trusting
 #       `rp_terminate`'s own thrown-away result: it re-queries the account
 #       and forgets the local record only once the id is confirmed absent;
@@ -61,13 +58,12 @@
 #       writes into RP_WORK regardless of whether a pod is ever actually
 #       deployed.
 #
-# There is deliberately no "pause the sweep for one pod" feature (an earlier
-# version of this branch shipped `hold`/`unhold`, backed by a `podEditJob`
-# rename mutation that does not exist in RunPod's public schema —
-# `PodEditJobInput` has no `name` field and two other required fields this
-# tooling never had reason to send). rp_sweep's own age-based judgement
-# (finding: past-deadline terminates, within-deadline does not) is still
-# covered below.
+# There is deliberately no "pause the sweep for one pod" feature: the
+# `podEditJob` rename mutation it would need does not exist in RunPod's
+# public schema — `PodEditJobInput` has no `name` field and two other
+# required fields this tooling has no reason to send. rp_sweep's own
+# age-based judgement (past-deadline terminates, within-deadline does not)
+# is covered below.
 #
 # Every network-facing call (`curl`, i.e. every RunPod GraphQL request, AND
 # every REST v2 request the cluster primitives make via `_rp_rest`) is
@@ -80,7 +76,7 @@
 # `-X METHOD URL -o file`), defaulting every REST route to a harmless empty
 # list so a fixture that never mentions clusters at all is unaffected by
 # their existence (`gpu-dev.sh reap`'s own regressions below are exactly
-# this: `rp_cluster_sweep` now runs alongside `rp_sweep`, sees an empty
+# this: `rp_cluster_sweep` runs alongside `rp_sweep`, sees an empty
 # account, and stays green). `ci/scripts/test_runpod_cluster_lib.sh` is the
 # suite that actually exercises the cluster primitives' own behavior.
 # `ssh` is never mocked — every fixture that needs an "unreachable pod"
@@ -281,11 +277,10 @@ EOF
   chmod 600 "$RP_SESSION_ROOT/$1/meta"
 }
 
-# A legacy meta -- no RP_TTL_HOURS line at all, exactly what an `up` on base
-# (before RP_TTL_HOURS was added to rp_session_save) would have written.
-# `down` no longer looks at RP_TTL_HOURS AT ALL (see rp_pod_verify's own
-# doc), so this fixture now proves that residual case is trivially fine
-# rather than exercising any special-case handling. $1=session $2=podId
+# A meta with no RP_TTL_HOURS line at all. `down` does not look at
+# RP_TTL_HOURS AT ALL (see rp_pod_verify's own doc), so this fixture proves
+# that case is trivially fine rather than exercising any special-case
+# handling. $1=session $2=podId
 write_meta_legacy() {
   mkdir -p "$RP_SESSION_ROOT/$1"
   cat > "$RP_SESSION_ROOT/$1/meta" <<EOF
@@ -306,7 +301,7 @@ iso_from_epoch() { # $1=epoch seconds -- portable across GNU and BSD `date`
 echo "=== gpu-dev lifecycle safety: mocks-only regression suite ==="
 
 # ═════════════════════════════════════════════════════════════════════════
-# Group 0 — rp_cleanup's RP_POD_CREATED gate (function-level; finding 2's
+# Group 0 — rp_cleanup's RP_POD_CREATED gate (function-level; property (2)'s
 # actual mechanism). Sanity-checks that the harness can detect a termination
 # at all (case A) before trusting the "no termination" assertions elsewhere.
 # ═════════════════════════════════════════════════════════════════════════
@@ -330,9 +325,9 @@ echo "=== gpu-dev lifecycle safety: mocks-only regression suite ==="
   : > "$G0_LOG"; RP_POD_ID="podB"; RP_POD_CREATED=0; RP_KEEP=0
   rp_cleanup
   if grep -q "^podB$" "$G0_LOG"; then
-    record FAIL "group0-uncreated-pod-not-terminated (finding 2 mechanism)"
+    record FAIL "group0-uncreated-pod-not-terminated (property 2 mechanism)"
   else
-    record PASS "group0-uncreated-pod-not-terminated (finding 2 mechanism)"
+    record PASS "group0-uncreated-pod-not-terminated (property 2 mechanism)"
   fi
 
   : > "$G0_LOG"; RP_POD_ID="podC"; RP_POD_CREATED=1; RP_KEEP=1
@@ -347,7 +342,7 @@ echo "=== gpu-dev lifecycle safety: mocks-only regression suite ==="
 # ═════════════════════════════════════════════════════════════════════════
 # Group 1 — CLI-level: a read-only subcommand (`logs`) against an unreachable
 # recorded session must exit non-zero and must never issue podTerminate
-# (finding 2, driven through the real gpu-dev.sh dispatch).
+# (property (2), driven through the real gpu-dev.sh dispatch).
 # ═════════════════════════════════════════════════════════════════════════
 SESSION_RO="ro-fail"
 write_meta "$SESSION_RO" "pod-unrelated-1" "8"
@@ -355,28 +350,28 @@ reset_log
 bash "$DIR/gpu-dev.sh" logs "$SESSION_RO" >"$SANDBOX/out-ro.log" 2>&1
 rc=$?
 if [ "$rc" -eq 0 ]; then
-  bad "finding-2: 'logs' against an unreachable session should exit non-zero (got 0)"
+  bad "read-only subcommand: 'logs' against an unreachable session should exit non-zero (got 0)"
 else
-  ok "finding-2: 'logs' against an unreachable session exits non-zero (rc=$rc)"
+  ok "read-only subcommand: 'logs' against an unreachable session exits non-zero (rc=$rc)"
 fi
 if log_has "podTerminate"; then
-  bad "finding-2: 'logs' against an unreachable session issued podTerminate (regression)"
+  bad "read-only subcommand: 'logs' against an unreachable session issued podTerminate (regression)"
 else
-  ok "finding-2: 'logs' against an unreachable session issued no podTerminate"
+  ok "read-only subcommand: 'logs' against an unreachable session issued no podTerminate"
 fi
 if grep -q "did not create it" "$SANDBOX/out-ro.log"; then
-  ok "finding-2: cleanup reports it did not create the pod"
+  ok "read-only subcommand: cleanup reports it did not create the pod"
 else
-  bad "finding-2: expected the 'did not create it' notice in cleanup output"
+  bad "read-only subcommand: expected the 'did not create it' notice in cleanup output"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
 # Group 1b — CLI-level: an EXIT trap firing DURING the SSH-readiness wait
 # (Ctrl-C, a cancelled CI run's SIGTERM) must still terminate the pod THIS
-# invocation just rented (finding 1). Every deploy candidate is mocked as an
-# immediate success with no reachable ports, so `shell` enters the
-# reachability loop's own `sleep 10` — the exact window the audit reproduced
-# the leak in — without ever needing a real SSH attempt.
+# invocation just rented (property (1)). Every deploy candidate is mocked as
+# an immediate success with no reachable ports, so `shell` enters the
+# reachability loop's own `sleep 10` — the window in which a pod leaks —
+# without ever needing a real SSH attempt.
 # ═════════════════════════════════════════════════════════════════════════
 echo '{"data":{"podFindAndDeployOnDemand":{"id":"pod-leak-test"}}}' > "$SANDBOX/deploy-leak-test.json"
 export MOCK_DEPLOY_RESPONSE="$SANDBOX/deploy-leak-test.json"
@@ -403,9 +398,9 @@ wait "$LEAK_PID" 2>/dev/null
 # same logged line, not an exact-match on a bare id that is never logged.
 term_count="$(grep -c "podTerminate.*pod-leak-test" "$CALL_LOG")"
 if [ "$term_count" = "1" ]; then
-  ok "finding-1: SIGTERM during the SSH-readiness wait terminates the freshly rented pod exactly once"
+  ok "shell: SIGTERM during the SSH-readiness wait terminates the freshly rented pod exactly once"
 else
-  bad "finding-1: expected exactly one podTerminate for pod-leak-test after SIGTERM during the SSH wait (got ${term_count}); output: $(cat "$SANDBOX/out-sigterm.log")"
+  bad "shell: expected exactly one podTerminate for pod-leak-test after SIGTERM during the SSH wait (got ${term_count}); output: $(cat "$SANDBOX/out-sigterm.log")"
 fi
 unset MOCK_DEPLOY_RESPONSE
 
@@ -420,15 +415,14 @@ unset MOCK_DEPLOY_RESPONSE
 # temp dir, and `rp_init` (called before anything is rented) writes into
 # RP_WORK unconditionally.
 #
-# Strengthened (round-2 audit on #388): a100's session dir is PRE-SEEDED
-# with its own real keypair below, exactly like a genuine `up`/`attach`
-# session already would have. Without this, rp_init's own
-# `[ -f "$RP_SSH_KEY" ] || ssh-keygen ...` would REUSE an already-missing-
-# turned-present key path only on the SECOND run — on an EMPTY a100 dir (the
-# original version of this fixture) `ssh-keygen` would run whether or not
-# the bug reproduced, so "a new file appeared" was not actually pinned to
-# the bug. Pre-seeding removes that false-negative risk: any key material
-# written into a100's dir by THIS run can only be an overwrite.
+# a100's session dir is PRE-SEEDED with its own real keypair below, exactly
+# like a genuine `up`/`attach` session already would have. Without this,
+# rp_init's own `[ -f "$RP_SSH_KEY" ] || ssh-keygen ...` would REUSE an
+# already-missing-turned-present key path only on the SECOND run — on an
+# EMPTY a100 dir `ssh-keygen` would run whether or not the bug reproduced,
+# so "a new file appeared" would not be pinned to the bug. Pre-seeding
+# removes that false-negative risk: any key material written into a100's
+# dir by THIS run can only be an overwrite.
 #
 # The direct, positive signal for "RP_WORK resolved to a temp dir" comes
 # from TMPDIR: runpod_lib.sh's own `mktemp -d "${TMPDIR:-/tmp}/jammi-gpu-dev.XXXXXX"`
@@ -441,11 +435,11 @@ unset MOCK_DEPLOY_RESPONSE
 # `ssh-keygen` call at all).
 #
 # The deploy itself is mocked as a SUCCESS (`podFindAndDeployOnDemand`
-# returns a real id, same shape as finding 1's own fixture above) rather
+# returns a real id, same shape as Group 1b's own fixture above) rather
 # than a no-capacity refusal, so this exercises the actual pod-rental path,
 # not merely the pre-flight one — and since no fixture in this suite mocks
 # a reachable SSH server (see this file's own header doc), the invocation is
-# SIGTERM'd once the deploy call lands, exactly like finding 1's fixture.
+# SIGTERM'd once the deploy call lands, exactly like Group 1b's fixture.
 # ═════════════════════════════════════════════════════════════════════════
 SESSION_LIVE_A100="a100"
 write_meta "$SESSION_LIVE_A100" "pod-live-a100" "72"
@@ -473,13 +467,12 @@ while ! log_has "podFindAndDeployOnDemand" && [ "$SECONDS" -lt "$deadline" ]; do
 # after the process has exited: rp_cleanup's own EXIT trap `rm -rf`s a
 # throwaway RP_WORK on the way out (correct behaviour for a real throwaway
 # pod), so inspecting the watch dir post-exit would always find it already
-# deleted regardless of whether the fix actually took effect — the earlier
-# version of this assertion did exactly that and failed even against the
-# FIXED code.
+# deleted regardless of whether the isolation actually took effect, and the
+# assertion would fail even against correct code.
 if find "$TMPWATCH" -name 'id_ed25519' 2>/dev/null | grep -q .; then
-  ok "finding(shell-session-isolation): RP_WORK resolved to a fresh \$TMPDIR temp dir (a new keypair was generated there)"
+  ok "shell-session-isolation: RP_WORK resolved to a fresh \$TMPDIR temp dir (a new keypair was generated there)"
 else
-  bad "finding(shell-session-isolation): expected a NEW keypair under \$TMPDIR (RP_WORK never resolved to a throwaway temp dir); watch dir contents: $(ls -A "$TMPWATCH" 2>/dev/null)"
+  bad "shell-session-isolation: expected a NEW keypair under \$TMPDIR (RP_WORK never resolved to a throwaway temp dir); watch dir contents: $(ls -A "$TMPWATCH" 2>/dev/null)"
 fi
 
 sleep 0.5
@@ -494,29 +487,29 @@ after_meta_sum="$(cat "$RP_SESSION_ROOT/$SESSION_LIVE_A100/meta")"
 after_key_sum="$(cat "$RP_SESSION_ROOT/$SESSION_LIVE_A100/id_ed25519")"
 
 if log_has "podTerminate.*pod-shell-isolation"; then
-  ok "finding(shell-session-isolation): the freshly rented throwaway pod was terminated on SIGTERM"
+  ok "shell-session-isolation: the freshly rented throwaway pod was terminated on SIGTERM"
 else
-  bad "finding(shell-session-isolation): expected a podTerminate for pod-shell-isolation after SIGTERM; output: $(cat "$SANDBOX/out-shell-isolation.log")"
+  bad "shell-session-isolation: expected a podTerminate for pod-shell-isolation after SIGTERM; output: $(cat "$SANDBOX/out-shell-isolation.log")"
 fi
 if [ "$before_listing" = "$after_listing" ]; then
-  ok "finding(shell-session-isolation): the live a100 session dir's listing is unchanged (pre-seeded keypair, no new/overwritten file)"
+  ok "shell-session-isolation: the live a100 session dir's listing is unchanged (pre-seeded keypair, no new/overwritten file)"
 else
-  bad "finding(shell-session-isolation): the live a100 session dir's listing changed (before=[$before_listing] after=[$after_listing]) — an inherited exported RP_SESSION leaked into shell's throwaway RP_WORK"
+  bad "shell-session-isolation: the live a100 session dir's listing changed (before=[$before_listing] after=[$after_listing]) — an inherited exported RP_SESSION leaked into shell's throwaway RP_WORK"
 fi
 if [ "$before_meta_sum" = "$after_meta_sum" ]; then
-  ok "finding(shell-session-isolation): the live a100 session's meta content is byte-identical after shell exits"
+  ok "shell-session-isolation: the live a100 session's meta content is byte-identical after shell exits"
 else
-  bad "finding(shell-session-isolation): the live a100 session's meta content changed (regression!)"
+  bad "shell-session-isolation: the live a100 session's meta content changed (regression!)"
 fi
 if [ "$before_key_sum" = "$after_key_sum" ]; then
-  ok "finding(shell-session-isolation): the live a100 session's pre-seeded keypair is byte-identical after shell exits"
+  ok "shell-session-isolation: the live a100 session's pre-seeded keypair is byte-identical after shell exits"
 else
-  bad "finding(shell-session-isolation): the live a100 session's pre-seeded keypair changed (regression!)"
+  bad "shell-session-isolation: the live a100 session's pre-seeded keypair changed (regression!)"
 fi
 unset MOCK_DEPLOY_RESPONSE
 
 # ═════════════════════════════════════════════════════════════════════════
-# Group 1d — CLI-level: a failed `mktemp -d` (round-3 audit advisory) must
+# Group 1d — CLI-level: a failed `mktemp -d` must
 # abort the invocation outright, not fall through with RP_WORK unset/empty
 # — every later use (the ssh key path, the meta path, the pod deploy
 # itself) would then operate on a garbage or empty path instead of failing
@@ -529,15 +522,15 @@ reset_log
 TMPDIR="$SANDBOX/no-such-tmpdir-$$" bash "$DIR/gpu-dev.sh" shell a100 --ref abcdef1234567890 \
   >"$SANDBOX/out-mktemp-fail.log" 2>&1
 rc=$?
-[ "$rc" -eq 2 ] && ok "finding(mktemp-failure): an unwritable/nonexistent \$TMPDIR exits 2" \
-  || bad "finding(mktemp-failure): expected exit 2 for an unwritable \$TMPDIR (got $rc); $(cat "$SANDBOX/out-mktemp-fail.log")"
+[ "$rc" -eq 2 ] && ok "mktemp-failure: an unwritable/nonexistent \$TMPDIR exits 2" \
+  || bad "mktemp-failure: expected exit 2 for an unwritable \$TMPDIR (got $rc); $(cat "$SANDBOX/out-mktemp-fail.log")"
 grep -q "could not create a temp work dir" "$SANDBOX/out-mktemp-fail.log" \
-  && ok "finding(mktemp-failure): the refusal names the real cause (could not create a temp work dir)" \
-  || bad "finding(mktemp-failure): expected a 'could not create a temp work dir' message ($(cat "$SANDBOX/out-mktemp-fail.log"))"
+  && ok "mktemp-failure: the refusal names the real cause (could not create a temp work dir)" \
+  || bad "mktemp-failure: expected a 'could not create a temp work dir' message ($(cat "$SANDBOX/out-mktemp-fail.log"))"
 if log_has "podFindAndDeployOnDemand"; then
-  bad "finding(mktemp-failure): a failed mktemp must issue NO deploy call (regression!)"
+  bad "mktemp-failure: a failed mktemp must issue NO deploy call (regression!)"
 else
-  ok "finding(mktemp-failure): a failed mktemp issues no deploy call"
+  ok "mktemp-failure: a failed mktemp issues no deploy call"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -567,8 +560,7 @@ fi
 
   # An ABSENT id is its own return code (3), never folded into the
   # present-but-mismatched code (1): `down` treats them completely
-  # differently — absent is normal cleanup (round-4 audit advisory), not a
-  # refusal — and needs rp_pod_verify to tell them apart.
+  # differently — absent is normal cleanup, not a refusal — and needs rp_pod_verify to tell them apart.
   echo '{"data":{"myself":{"pods":[]}}}' > "$SANDBOX/acct3.json"
   MOCK_RESPONSE_FILE="$SANDBOX/acct3.json"
   rp_pod_verify "pod-x" >/dev/null 2>&1
@@ -579,17 +571,17 @@ fi
   rp_pod_verify "pod-x" >/dev/null 2>&1
   [ $? -eq 2 ] && record PASS "group2-verify-query-failure-refused" || record FAIL "group2-verify-query-failure-refused"
 
-  # THE pipeline-status fix's own reproduction: rp_gql (curl) itself exits 3
+  # The pipeline-status case: rp_gql (curl) itself exits 3
   # while STILL printing a COMPLETE body that lists the pod (a network
   # hiccup after the response was already fully received, or any transport
   # that reports a non-zero exit alongside a good body). This suite runs
-  # under `set -uo pipefail` (inherited from the top of this file), so
-  # BEFORE the fix — `rp_gql ... | python3 -c ...` piped directly — the
-  # pipeline's own exit status would be curl's 3 regardless of what python
+  # under `set -uo pipefail` (inherited from the top of this file), so with
+  # `rp_gql ... | python3 -c ...` piped directly the pipeline's own exit
+  # status would be curl's 3 regardless of what python
   # found, aliasing with rp_pod_verify's OWN semantic code 3 ("id ABSENT,
   # down forgets the record") even though the body actually shows the pod
   # PRESENT and correctly shaped. Must return 2 ("could not query"), never
-  # 3 — the fixed function captures the body with its own `||` gate before
+  # 3 — the function captures the body with its own `||` gate before
   # ever handing it to the parser, so a curl failure can never reach python
   # at all, regardless of what curl printed alongside it.
   rp_gql() { cat "$MOCK_RESPONSE_FILE"; return 3; }
@@ -601,7 +593,7 @@ fi
 )
 
 # ═════════════════════════════════════════════════════════════════════════
-# Group 2c — rp_pod_gone semantics (function-level; finding 6's actual
+# Group 2c — rp_pod_gone semantics (function-level; property (6)'s actual
 # confirmation primitive).
 # ═════════════════════════════════════════════════════════════════════════
 (
@@ -630,67 +622,67 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # Group 2b — CLI-level: an invalid RP_DEV_TTL_HOURS must be reported under
 # its OWN name, not misattributed to RP_TTL_HOURS. Covers BOTH the
-# digit-shape check (round-2 audit finding 4) and the >0 check (round-3
-# audit finding 2: "0" is all-digit and slips past a digit-only pattern).
+# digit-shape check and the >0 check ("0" is all-digit and slips past a
+# digit-only pattern).
 # ═════════════════════════════════════════════════════════════════════════
 reset_log
 RP_DEV_TTL_HOURS=not-a-number bash "$DIR/gpu-dev.sh" up a100 >"$SANDBOX/out-bad-dev-ttl.log" 2>&1
 rc=$?
-[ "$rc" -eq 2 ] && ok "finding-4: an invalid (non-numeric) RP_DEV_TTL_HOURS exits 2" \
-  || bad "finding-4: expected exit 2 for a non-numeric RP_DEV_TTL_HOURS (got $rc)"
+[ "$rc" -eq 2 ] && ok "RP_DEV_TTL_HOURS: an invalid (non-numeric) RP_DEV_TTL_HOURS exits 2" \
+  || bad "RP_DEV_TTL_HOURS: expected exit 2 for a non-numeric RP_DEV_TTL_HOURS (got $rc)"
 grep -q "RP_DEV_TTL_HOURS must be a positive integer" "$SANDBOX/out-bad-dev-ttl.log" \
-  && ok "finding-4: the non-numeric validation error names RP_DEV_TTL_HOURS, not RP_TTL_HOURS" \
-  || bad "finding-4: expected the error to name RP_DEV_TTL_HOURS ($(cat "$SANDBOX/out-bad-dev-ttl.log"))"
+  && ok "RP_DEV_TTL_HOURS: the non-numeric validation error names RP_DEV_TTL_HOURS, not RP_TTL_HOURS" \
+  || bad "RP_DEV_TTL_HOURS: expected the error to name RP_DEV_TTL_HOURS ($(cat "$SANDBOX/out-bad-dev-ttl.log"))"
 if grep -q "RP_TTL_HOURS must be" "$SANDBOX/out-bad-dev-ttl.log"; then
-  bad "finding-4: the non-numeric error must not misattribute to RP_TTL_HOURS (regression!)"
+  bad "RP_DEV_TTL_HOURS: the non-numeric error must not misattribute to RP_TTL_HOURS (regression!)"
 else
-  ok "finding-4: the non-numeric error does not misattribute to RP_TTL_HOURS"
+  ok "RP_DEV_TTL_HOURS: the non-numeric error does not misattribute to RP_TTL_HOURS"
 fi
 
 reset_log
 RP_DEV_TTL_HOURS=0 bash "$DIR/gpu-dev.sh" up a100 >"$SANDBOX/out-zero-dev-ttl.log" 2>&1
 rc=$?
-[ "$rc" -eq 2 ] && ok "finding-2(round-3): RP_DEV_TTL_HOURS=0 exits 2" \
-  || bad "finding-2(round-3): expected exit 2 for RP_DEV_TTL_HOURS=0 (got $rc)"
+[ "$rc" -eq 2 ] && ok "RP_DEV_TTL_HOURS: RP_DEV_TTL_HOURS=0 exits 2" \
+  || bad "RP_DEV_TTL_HOURS: expected exit 2 for RP_DEV_TTL_HOURS=0 (got $rc)"
 grep -q "RP_DEV_TTL_HOURS must be > 0" "$SANDBOX/out-zero-dev-ttl.log" \
-  && ok "finding-2(round-3): the >0 validation error names RP_DEV_TTL_HOURS, not RP_TTL_HOURS" \
-  || bad "finding-2(round-3): expected 'RP_DEV_TTL_HOURS must be > 0' ($(cat "$SANDBOX/out-zero-dev-ttl.log"))"
+  && ok "RP_DEV_TTL_HOURS: the >0 validation error names RP_DEV_TTL_HOURS, not RP_TTL_HOURS" \
+  || bad "RP_DEV_TTL_HOURS: expected 'RP_DEV_TTL_HOURS must be > 0' ($(cat "$SANDBOX/out-zero-dev-ttl.log"))"
 if grep -q "RP_TTL_HOURS must be" "$SANDBOX/out-zero-dev-ttl.log"; then
-  bad "finding-2(round-3): the >0 error must not misattribute to RP_TTL_HOURS (regression!)"
+  bad "RP_DEV_TTL_HOURS: the >0 error must not misattribute to RP_TTL_HOURS (regression!)"
 else
-  ok "finding-2(round-3): the >0 error does not misattribute to RP_TTL_HOURS"
+  ok "RP_DEV_TTL_HOURS: the >0 error does not misattribute to RP_TTL_HOURS"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
 # Group 3 — CLI-level: `up` refuses a session alias that already has a
 # recorded pod unless --replace, and --replace must not inherit the dead
-# session's own RP_TTL_HOURS/RP_IMAGE (finding 3, driven through gpu-dev.sh).
+# session's own RP_TTL_HOURS/RP_IMAGE (property (3), driven through gpu-dev.sh).
 # ═════════════════════════════════════════════════════════════════════════
 SESSION_UP="up-stale"
 write_meta "$SESSION_UP" "pod-stale-1" "8"
 reset_log
 RP_SESSION="$SESSION_UP" bash "$DIR/gpu-dev.sh" up a100 >"$SANDBOX/out-up-refuse.log" 2>&1
 rc=$?
-[ "$rc" -eq 2 ] && ok "finding-3(up): refuses (exit 2) an alias with a recorded-but-unreachable pod" \
-  || bad "finding-3(up): expected exit 2 refusing an existing alias (got $rc)"
+[ "$rc" -eq 2 ] && ok "up: refuses (exit 2) an alias with a recorded-but-unreachable pod" \
+  || bad "up: expected exit 2 refusing an existing alias (got $rc)"
 # Pin the MESSAGE, not just the exit code — exit 2 is also gpu-dev.sh's
 # generic bad-usage code, so a passing assertion on rc alone could mask an
 # argument-parsing mistake in this very test producing the "right" exit code
 # for the wrong reason.
 grep -q "already has a recorded pod" "$SANDBOX/out-up-refuse.log" \
-  && ok "finding-3(up): refusal names the recorded pod (not a usage error)" \
-  || bad "finding-3(up): expected the 'already has a recorded pod' refusal text ($(cat "$SANDBOX/out-up-refuse.log"))"
+  && ok "up: refusal names the recorded pod (not a usage error)" \
+  || bad "up: expected the 'already has a recorded pod' refusal text ($(cat "$SANDBOX/out-up-refuse.log"))"
 if log_has "podFindAndDeployOnDemand"; then
-  bad "finding-3(up): refusal path must issue no deploy call at all (regression)"
+  bad "up: refusal path must issue no deploy call at all (regression)"
 else
-  ok "finding-3(up): refusal path issued no network call"
+  ok "up: refusal path issued no network call"
 fi
 # The refusal message must tell the operator to replay with the ARCH `up`
 # actually takes positionally, not the session name — `up <session-name>`
 # parses the session name AS an arch and fails differently.
 grep -q -- "up a100 --replace" "$SANDBOX/out-up-refuse.log" \
-  && ok "finding-3(up): refusal names the arch ('up a100 --replace'), not the session, in its --replace suggestion" \
-  || bad "finding-3(up): expected 'up a100 --replace' (arch, not session) in the refusal text ($(cat "$SANDBOX/out-up-refuse.log"))"
+  && ok "up: refusal names the arch ('up a100 --replace'), not the session, in its --replace suggestion" \
+  || bad "up: expected 'up a100 --replace' (arch, not session) in the refusal text ($(cat "$SANDBOX/out-up-refuse.log"))"
 
 # `--replace` bypasses the refusal and reaches the real deploy path. Every
 # candidate is mocked as SUPPLY_CONSTRAINT so rp_deploy_live's SSH-readiness
@@ -705,42 +697,42 @@ reset_log
 RP_SESSION="$SESSION_UP" bash "$DIR/gpu-dev.sh" up a100 --replace --ref abcdef1234567890 \
   >"$SANDBOX/out-up-replace.log" 2>&1
 rc=$?
-[ "$rc" -eq 75 ] && ok "finding-3(up --replace): bypasses the refusal and reaches deploy (rc=75, no capacity)" \
-  || bad "finding-3(up --replace): expected rc=75 once it reaches the (mocked, no-capacity) deploy path (got $rc)"
+[ "$rc" -eq 75 ] && ok "up --replace: bypasses the refusal and reaches deploy (rc=75, no capacity)" \
+  || bad "up --replace: expected rc=75 once it reaches the (mocked, no-capacity) deploy path (got $rc)"
 log_has "podFindAndDeployOnDemand" \
-  && ok "finding-3(up --replace): a deploy call was actually made" \
-  || bad "finding-3(up --replace): expected a deploy call after --replace"
+  && ok "up --replace: a deploy call was actually made" \
+  || bad "up --replace: expected a deploy call after --replace"
 grep -q -- "--replace: overwriting session" "$SANDBOX/out-up-replace.log" \
-  && ok "finding-3(up --replace): prints the overwrite warning" \
-  || bad "finding-3(up --replace): expected the overwrite warning in output"
+  && ok "up --replace: prints the overwrite warning" \
+  || bad "up --replace: expected the overwrite warning in output"
 # The dead session's own meta recorded RP_TTL_HOURS=8. `up` (with no
 # RP_TTL_HOURS set by this test's own environment) computes the 72h dev
 # default BEFORE rp_session_load can dot-source the dead meta and clobber it
-# — this is the exact "jammi-gpu-ttl8 / sleep 28800 on --replace over an 8h
-# meta" defect the audit reproduced. Both the pod's NAME and its in-pod
+# — otherwise --replace over an 8h meta deploys "jammi-gpu-ttl8 / sleep
+# 28800". Both the pod's NAME and its in-pod
 # watchdog's sleep duration must reflect 72h, never the dead session's 8h.
 if grep -q '"name": "jammi-gpu-ttl72"' "$CALL_LOG"; then
-  ok "finding-3(up --replace): deploy payload name is jammi-gpu-ttl72 (the dev default), not the dead session's jammi-gpu-ttl8"
+  ok "up --replace: deploy payload name is jammi-gpu-ttl72 (the dev default), not the dead session's jammi-gpu-ttl8"
 else
-  bad "finding-3(up --replace): expected the deploy payload name to be jammi-gpu-ttl72; log: $(cat "$CALL_LOG")"
+  bad "up --replace: expected the deploy payload name to be jammi-gpu-ttl72; log: $(cat "$CALL_LOG")"
 fi
 if grep -q "sleep 259200" "$CALL_LOG"; then
-  ok "finding-3(up --replace): deploy payload watchdog uses sleep 259200 (72h), not the dead session's 8h"
+  ok "up --replace: deploy payload watchdog uses sleep 259200 (72h), not the dead session's 8h"
 else
-  bad "finding-3(up --replace): expected 'sleep 259200' (72h) in the deploy payload; log: $(cat "$CALL_LOG")"
+  bad "up --replace: expected 'sleep 259200' (72h) in the deploy payload; log: $(cat "$CALL_LOG")"
 fi
 unset MOCK_DEPLOY_RESPONSE
 
 # ═════════════════════════════════════════════════════════════════════════
-# Group 3b — CLI-level: `down` verifies by id + name SHAPE only (finding 5)
+# Group 3b — CLI-level: `down` verifies by id + name SHAPE only (property (5))
 # and confirms a terminate actually took before forgetting the local record
-# (finding 6), driven through the real gpu-dev.sh dispatch.
+# (property (6)), driven through the real gpu-dev.sh dispatch.
 # ═════════════════════════════════════════════════════════════════════════
 
-# A legacy (no-TTL) meta for a genuinely-owned pod: verifies, terminates,
-# and the SECOND account query (post-terminate) shows the id gone —
-# confirmed, so the local record is forgotten. Proves TTL-in-meta is now
-# irrelevant end to end, not just at the rp_pod_verify layer.
+# A no-TTL meta for a genuinely-owned pod: verifies, terminates, and the
+# SECOND account query (post-terminate) shows the id gone — confirmed, so
+# the local record is forgotten. Proves TTL-in-meta is irrelevant end to
+# end, not just at the rp_pod_verify layer.
 SESSION_DOWN_OK="down-ok"
 write_meta_legacy "$SESSION_DOWN_OK" "pod-ok"
 echo '{"data":{"myself":{"pods":[{"id":"pod-ok","name":"jammi-gpu-ttl8"}]}}}' > "$SANDBOX/acct-down-ok-1.json"
@@ -752,16 +744,16 @@ bash "$DIR/gpu-dev.sh" down "$SESSION_DOWN_OK" >"$SANDBOX/out-down-ok.log" 2>&1
 rc=$?
 term_count_ok="$(grep -c "podTerminate.*pod-ok" "$CALL_LOG")"
 [ "$term_count_ok" = "1" ] && [ "$rc" -eq 0 ] \
-  && ok "finding-5/6(down): a verified, confirmed terminate succeeds exactly once (legacy meta, no TTL line)" \
-  || bad "finding-5/6(down): expected exactly one confirmed podTerminate for pod-ok (got count=${term_count_ok} rc=${rc}); $(cat "$SANDBOX/out-down-ok.log")"
+  && ok "down: a verified, confirmed terminate succeeds exactly once (meta with no TTL line)" \
+  || bad "down: expected exactly one confirmed podTerminate for pod-ok (got count=${term_count_ok} rc=${rc}); $(cat "$SANDBOX/out-down-ok.log")"
 [ -f "$RP_SESSION_ROOT/$SESSION_DOWN_OK/meta" ] \
-  && bad "finding-6(down): the local record should be forgotten after a CONFIRMED terminate" \
-  || ok "finding-6(down): the local record is forgotten after a confirmed terminate"
+  && bad "down: the local record should be forgotten after a CONFIRMED terminate" \
+  || ok "down: the local record is forgotten after a confirmed terminate"
 
 # The recorded id is real and the account name IS this tooling's shape, but
 # the NUMBER differs from what the session's own meta recorded (8 vs 72) —
-# the TTL never gated release even before this round; this pins that the id
-# alone (once name-shaped) is enough, regardless of the specific number.
+# this pins that the id alone (once name-shaped) is enough, regardless of
+# the specific number.
 SESSION_DOWN_TTL_DIFFERS="down-ttl-differs"
 write_meta "$SESSION_DOWN_TTL_DIFFERS" "pod-ttl-differs" "8"
 echo '{"data":{"myself":{"pods":[{"id":"pod-ttl-differs","name":"jammi-gpu-ttl72"}]}}}' > "$SANDBOX/acct-ttl-differs-1.json"
@@ -772,14 +764,14 @@ export MOCK_ACCOUNT_RESPONSE_2="$SANDBOX/acct-ttl-differs-2.json"
 bash "$DIR/gpu-dev.sh" down "$SESSION_DOWN_TTL_DIFFERS" >"$SANDBOX/out-down-ttl-differs.log" 2>&1
 term_count_differs="$(grep -c "podTerminate.*pod-ttl-differs" "$CALL_LOG")"
 [ "$term_count_differs" = "1" ] \
-  && ok "finding-5(down): a differing TTL NUMBER (meta ttl8, account ttl72, same id) still terminates — the id is authoritative" \
-  || bad "finding-5(down): expected exactly one podTerminate for pod-ttl-differs despite the differing TTL number (got ${term_count_differs}); $(cat "$SANDBOX/out-down-ttl-differs.log")"
+  && ok "down: a differing TTL NUMBER (meta ttl8, account ttl72, same id) still terminates — the id is authoritative" \
+  || bad "down: expected exactly one podTerminate for pod-ttl-differs despite the differing TTL number (got ${term_count_differs}); $(cat "$SANDBOX/out-down-ttl-differs.log")"
 
 # A recorded id absent from the account entirely is NOT a refusal — it is
 # the ordinary shape of "this pod already ended on its own" (its own
 # deadline, or the sweep), the single most common way a session's pod goes
 # away. `down` must forget the record and exit 0, not get stuck refusing
-# forever until someone remembers `up --replace` (round-4 audit advisory).
+# forever until someone remembers `up --replace`.
 SESSION_DOWN_GONE="down-gone-already"
 write_meta "$SESSION_DOWN_GONE" "pod-gone-already" "8"
 echo '{"data":{"myself":{"pods":[]}}}' > "$SANDBOX/acct-down-gone-1.json"
@@ -788,18 +780,18 @@ export MOCK_ACCOUNT_RESPONSE_1="$SANDBOX/acct-down-gone-1.json"
 bash "$DIR/gpu-dev.sh" down "$SESSION_DOWN_GONE" >"$SANDBOX/out-down-gone.log" 2>&1
 rc=$?
 if log_has "podTerminate"; then
-  bad "finding(round-4, down): an already-absent id must never attempt a terminate (nothing to release; regression!)"
+  bad "down: an already-absent id must never attempt a terminate (nothing to release; regression!)"
 else
-  ok "finding(round-4, down): an already-absent id issues no terminate call (nothing to release)"
+  ok "down: an already-absent id issues no terminate call (nothing to release)"
 fi
-[ "$rc" -eq 0 ] && ok "finding(round-4, down): an already-absent id exits 0 (not a refusal)" \
-  || bad "finding(round-4, down): expected exit 0 for an already-absent id (got $rc)"
+[ "$rc" -eq 0 ] && ok "down: an already-absent id exits 0 (not a refusal)" \
+  || bad "down: expected exit 0 for an already-absent id (got $rc)"
 grep -q "is gone from the account" "$SANDBOX/out-down-gone.log" \
-  && ok "finding(round-4, down): an already-absent id prints the gone-from-account message" \
-  || bad "finding(round-4, down): expected the 'is gone from the account' message ($(cat "$SANDBOX/out-down-gone.log"))"
+  && ok "down: an already-absent id prints the gone-from-account message" \
+  || bad "down: expected the 'is gone from the account' message ($(cat "$SANDBOX/out-down-gone.log"))"
 [ -f "$RP_SESSION_ROOT/$SESSION_DOWN_GONE/meta" ] \
-  && bad "finding(round-4, down): the local record should be forgotten once the id is confirmed absent (regression!)" \
-  || ok "finding(round-4, down): the local record is forgotten once the id is confirmed absent"
+  && bad "down: the local record should be forgotten once the id is confirmed absent (regression!)" \
+  || ok "down: the local record is forgotten once the id is confirmed absent"
 
 # The recorded id IS present, but its account name is not this tooling's
 # shape at all (some entirely unrelated pod happens to share the id space —
@@ -812,13 +804,13 @@ reset_log; reset_account_seq
 export MOCK_ACCOUNT_RESPONSE_1="$SANDBOX/acct-down-unshaped-1.json"
 bash "$DIR/gpu-dev.sh" down "$SESSION_DOWN_UNSHAPED" >"$SANDBOX/out-down-unshaped.log" 2>&1
 if log_has "podTerminate"; then
-  bad "finding-5(down): a non-tooling-shaped name must refuse to terminate (regression!)"
+  bad "down: a non-tooling-shaped name must refuse to terminate (regression!)"
 else
-  ok "finding-5(down): a non-tooling-shaped name refused to terminate"
+  ok "down: a non-tooling-shaped name refused to terminate"
 fi
 [ -f "$RP_SESSION_ROOT/$SESSION_DOWN_UNSHAPED/meta" ] \
-  && ok "finding-5(down): the local record is KEPT after a non-shaped-name refusal" \
-  || bad "finding-5(down): the local record must survive a non-shaped-name refusal (regression!)"
+  && ok "down: the local record is KEPT after a non-shaped-name refusal" \
+  || bad "down: the local record must survive a non-shaped-name refusal (regression!)"
 
 # The account query ITSELF fails (a GraphQL `errors` body — e.g. rate
 # limiting), never reaching a pod list at all: rp_pod_verify's own code 2
@@ -834,22 +826,22 @@ reset_log; reset_account_seq
 export MOCK_ACCOUNT_RESPONSE_1="$SANDBOX/acct-down-query-fail-1.json"
 bash "$DIR/gpu-dev.sh" down "$SESSION_DOWN_QUERY_FAIL" >"$SANDBOX/out-down-query-fail.log" 2>&1
 rc=$?
-[ "$rc" -eq 1 ] && ok "finding(query-failure, down): a failed account query exits 1 (refuses)" \
-  || bad "finding(query-failure, down): expected exit 1 for a failed account query (got $rc)"
+[ "$rc" -eq 1 ] && ok "query-failure, down: a failed account query exits 1 (refuses)" \
+  || bad "query-failure, down: expected exit 1 for a failed account query (got $rc)"
 if log_has "podTerminate"; then
-  bad "finding(query-failure, down): a failed account query must never issue podTerminate (regression!)"
+  bad "query-failure, down: a failed account query must never issue podTerminate (regression!)"
 else
-  ok "finding(query-failure, down): a failed account query issues no podTerminate"
+  ok "query-failure, down: a failed account query issues no podTerminate"
 fi
 [ -f "$RP_SESSION_ROOT/$SESSION_DOWN_QUERY_FAIL/meta" ] \
-  && ok "finding(query-failure, down): the local record is KEPT after a query-failure refusal" \
-  || bad "finding(query-failure, down): the local record must survive a query-failure refusal (regression!)"
+  && ok "query-failure, down: the local record is KEPT after a query-failure refusal" \
+  || bad "query-failure, down: the local record must survive a query-failure refusal (regression!)"
 
 # Verified (id + shape match), but the SECOND account query — the
 # post-terminate confirmation — still shows the pod present: the terminate
 # was attempted but is NOT confirmed (a rejected mutation, most likely).
 # Must keep the local record and exit 1 asking for a retry, never both leak
-# the pod AND destroy the record (finding 6).
+# the pod AND destroy the record (property (6)).
 SESSION_DOWN_REJECTED="down-terminate-rejected"
 write_meta "$SESSION_DOWN_REJECTED" "pod-reject" "8"
 echo '{"data":{"myself":{"pods":[{"id":"pod-reject","name":"jammi-gpu-ttl8"}]}}}' > "$SANDBOX/acct-reject-1.json"
@@ -861,39 +853,39 @@ bash "$DIR/gpu-dev.sh" down "$SESSION_DOWN_REJECTED" >"$SANDBOX/out-down-rejecte
 rc=$?
 term_count_rejected="$(grep -c "podTerminate.*pod-reject" "$CALL_LOG")"
 [ "$term_count_rejected" = "1" ] \
-  && ok "finding-6(down): a terminate IS attempted even when not later confirmed" \
-  || bad "finding-6(down): expected the terminate to still be attempted once (got ${term_count_rejected})"
-[ "$rc" -eq 1 ] && ok "finding-6(down): an unconfirmed terminate exits 1" \
-  || bad "finding-6(down): expected exit 1 for an unconfirmed terminate (got $rc)"
+  && ok "down: a terminate IS attempted even when not later confirmed" \
+  || bad "down: expected the terminate to still be attempted once (got ${term_count_rejected})"
+[ "$rc" -eq 1 ] && ok "down: an unconfirmed terminate exits 1" \
+  || bad "down: expected exit 1 for an unconfirmed terminate (got $rc)"
 grep -q "terminate not confirmed" "$SANDBOX/out-down-rejected.log" \
-  && ok "finding-6(down): an unconfirmed terminate names itself, not a generic verification refusal" \
-  || bad "finding-6(down): expected a 'terminate not confirmed' message ($(cat "$SANDBOX/out-down-rejected.log"))"
+  && ok "down: an unconfirmed terminate names itself, not a generic verification refusal" \
+  || bad "down: expected a 'terminate not confirmed' message ($(cat "$SANDBOX/out-down-rejected.log"))"
 [ -f "$RP_SESSION_ROOT/$SESSION_DOWN_REJECTED/meta" ] \
-  && ok "finding-6(down): the local record is KEPT when the terminate is not confirmed (no leak-and-destroy)" \
-  || bad "finding-6(down): the local record must survive an unconfirmed terminate (regression!)"
+  && ok "down: the local record is KEPT when the terminate is not confirmed (no leak-and-destroy)" \
+  || bad "down: the local record must survive an unconfirmed terminate (regression!)"
 
 # Neither real refusal path (non-shaped name, unconfirmed terminate)
-# suggests `reap <hours>` (account-wide, never a per-pod remedy) or the
-# removed, INERT RP_TTL_HOURS=<H> override. The already-gone case above is
-# deliberately NOT checked here — it is not a refusal, so it never had
-# either suggestion to begin with.
+# suggests `reap <hours>` (account-wide, never a per-pod remedy) or an
+# RP_TTL_HOURS=<H> override (INERT). The already-gone case above is
+# deliberately NOT checked here — it is not a refusal, so it carries
+# neither suggestion.
 if grep -q -- "reap <hours>" "$SANDBOX/out-down-unshaped.log" "$SANDBOX/out-down-rejected.log"; then
-  bad "finding: down's refusal must not suggest 'reap <hours>' as a per-pod remedy (it is account-wide; regression!)"
+  bad "down: the refusal must not suggest 'reap <hours>' as a per-pod remedy (it is account-wide; regression!)"
 else
-  ok "finding: down's refusal does not suggest reap as a per-pod remedy"
+  ok "down: the refusal does not suggest reap as a per-pod remedy"
 fi
 if grep -q -- "RP_TTL_HOURS=<H>" "$SANDBOX/out-down-unshaped.log" "$SANDBOX/out-down-rejected.log"; then
-  bad "finding: down's refusal must not promise the removed, inert RP_TTL_HOURS=<H> override (regression!)"
+  bad "down: the refusal must not promise an RP_TTL_HOURS=<H> override (it is inert) (regression!)"
 else
-  ok "finding: down's refusal does not promise the removed RP_TTL_HOURS=<H> override"
+  ok "down: the refusal does not promise an RP_TTL_HOURS=<H> override"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
 # Group 3c — CLI-level: an exported RP_SESSION must never silently OUTRANK
 # an explicit positional session argument for down/attach/run/logs/push/pull
-# (round-2 audit on #388, reproduced: `RP_SESSION=a100 gpu-dev.sh down l40s`
-# terminated pod-a100 and forgot ITS record, never touching l40s — the
-# positional the caller actually typed was discarded outright). Two live
+# (the failure shape: `RP_SESSION=a100 gpu-dev.sh down l40s` terminating
+# pod-a100 and forgetting ITS record, never touching l40s — the positional
+# the caller actually typed discarded outright). Two live
 # sessions are recorded so a wrong pick is directly observable (the WRONG
 # one's pod would be terminated, not merely "a" pod).
 # ═════════════════════════════════════════════════════════════════════════
@@ -909,28 +901,28 @@ reset_log; reset_account_seq
 RP_SESSION="$SESSION_CONFLICT_A" bash "$DIR/gpu-dev.sh" down "$SESSION_CONFLICT_L" \
   >"$SANDBOX/out-conflict-refuse.log" 2>&1
 rc=$?
-[ "$rc" -eq 2 ] && ok "finding(session-conflict): a differing positional vs exported RP_SESSION exits 2" \
-  || bad "finding(session-conflict): expected exit 2 for a differing positional vs RP_SESSION (got $rc); $(cat "$SANDBOX/out-conflict-refuse.log")"
+[ "$rc" -eq 2 ] && ok "session-conflict: a differing positional vs exported RP_SESSION exits 2" \
+  || bad "session-conflict: expected exit 2 for a differing positional vs RP_SESSION (got $rc); $(cat "$SANDBOX/out-conflict-refuse.log")"
 grep -q "conflicting session" "$SANDBOX/out-conflict-refuse.log" \
-  && ok "finding(session-conflict): the refusal names itself, not a generic usage error" \
-  || bad "finding(session-conflict): expected a 'conflicting session' message ($(cat "$SANDBOX/out-conflict-refuse.log"))"
+  && ok "session-conflict: the refusal names itself, not a generic usage error" \
+  || bad "session-conflict: expected a 'conflicting session' message ($(cat "$SANDBOX/out-conflict-refuse.log"))"
 grep -q -- "'${SESSION_CONFLICT_L}'" "$SANDBOX/out-conflict-refuse.log" \
   && grep -q -- "RP_SESSION='${SESSION_CONFLICT_A}'" "$SANDBOX/out-conflict-refuse.log" \
-  && ok "finding(session-conflict): the refusal names BOTH the positional and the exported RP_SESSION" \
-  || bad "finding(session-conflict): expected both '${SESSION_CONFLICT_L}' and RP_SESSION='${SESSION_CONFLICT_A}' named ($(cat "$SANDBOX/out-conflict-refuse.log"))"
+  && ok "session-conflict: the refusal names BOTH the positional and the exported RP_SESSION" \
+  || bad "session-conflict: expected both '${SESSION_CONFLICT_L}' and RP_SESSION='${SESSION_CONFLICT_A}' named ($(cat "$SANDBOX/out-conflict-refuse.log"))"
 if log_has "podTerminate"; then
-  bad "finding(session-conflict): a conflicting session must issue NO podTerminate (regression!)"
+  bad "session-conflict: a conflicting session must issue NO podTerminate (regression!)"
 else
-  ok "finding(session-conflict): a conflicting session issues no podTerminate"
+  ok "session-conflict: a conflicting session issues no podTerminate"
 fi
 if log_has "myself{"; then
-  bad "finding(session-conflict): a conflicting session must issue NO account query at all — resolved before anything is rented (regression!)"
+  bad "session-conflict: a conflicting session must issue NO account query at all — resolved before anything is rented (regression!)"
 else
-  ok "finding(session-conflict): a conflicting session issues no account query"
+  ok "session-conflict: a conflicting session issues no account query"
 fi
 [ -f "$RP_SESSION_ROOT/$SESSION_CONFLICT_A/meta" ] && [ -f "$RP_SESSION_ROOT/$SESSION_CONFLICT_L/meta" ] \
-  && ok "finding(session-conflict): BOTH local records survive the refusal" \
-  || bad "finding(session-conflict): both records must survive the refusal (regression!)"
+  && ok "session-conflict: BOTH local records survive the refusal" \
+  || bad "session-conflict: both records must survive the refusal (regression!)"
 
 # The SAME positional and exported RP_SESSION (no conflict): acts on it
 # normally, exactly like the pre-existing down tests above.
@@ -945,23 +937,23 @@ RP_SESSION="$SESSION_CONFLICT_A" bash "$DIR/gpu-dev.sh" down "$SESSION_CONFLICT_
 rc=$?
 term_count_match="$(grep -c "podTerminate.*pod-conflict-a100" "$CALL_LOG")"
 [ "$term_count_match" = "1" ] && [ "$rc" -eq 0 ] \
-  && ok "finding(session-conflict): a MATCHING positional and RP_SESSION acts normally (terminates pod-conflict-a100)" \
-  || bad "finding(session-conflict): expected exactly one confirmed terminate for a matching positional/RP_SESSION (got count=${term_count_match} rc=${rc}); $(cat "$SANDBOX/out-conflict-match.log")"
+  && ok "session-conflict: a MATCHING positional and RP_SESSION acts normally (terminates pod-conflict-a100)" \
+  || bad "session-conflict: expected exactly one confirmed terminate for a matching positional/RP_SESSION (got count=${term_count_match} rc=${rc}); $(cat "$SANDBOX/out-conflict-match.log")"
 if log_has "podTerminate.*pod-conflict-l40s"; then
-  bad "finding(session-conflict): a matching down on a100 must never touch l40s's pod (regression!)"
+  bad "session-conflict: a matching down on a100 must never touch l40s's pod (regression!)"
 else
-  ok "finding(session-conflict): a matching down on a100 never touches l40s's pod"
+  ok "session-conflict: a matching down on a100 never touches l40s's pod"
 fi
 [ -f "$RP_SESSION_ROOT/$SESSION_CONFLICT_L/meta" ] \
-  && ok "finding(session-conflict): l40s's record is untouched by a matching down on a100" \
-  || bad "finding(session-conflict): l40s's record must survive a matching down on a100 (regression!)"
+  && ok "session-conflict: l40s's record is untouched by a matching down on a100" \
+  || bad "session-conflict: l40s's record must survive a matching down on a100 (regression!)"
 
 # ═════════════════════════════════════════════════════════════════════════
 # Group 3d — CLI-level: RP_SESSION is validated as a CONTAINMENT blacklist
 # (empty/'.'/'..' /a '/' anywhere / a leading '-'), not a character
 # whitelist, at the point RP_WORK is derived from it — a traversing value
 # must be refused BEFORE rp_cleanup's or rp_session_forget's unconditional
-# `rm -rf "$RP_WORK"` could ever act on it (round-2 audit on #388). `down`
+# `rm -rf "$RP_WORK"` could ever act on it. `down`
 # (with NO positional, so RP_SESSION alone resolves SESSION) is the driving
 # subcommand here — a NAMED-session verb, unlike `ls`/`reap`, which never
 # apply this check at all (see Group 3e below).
@@ -980,52 +972,52 @@ echo "sentinel" > "$TRAVERSAL_TARGET/sentinel.txt"
 RP_SESSION="../$(basename "$TRAVERSAL_TARGET")" bash "$DIR/gpu-dev.sh" down \
   >"$SANDBOX/out-traversal.log" 2>&1
 rc=$?
-[ "$rc" -eq 2 ] && ok "finding(RP_SESSION-blacklist): a '..'-containing RP_SESSION exits 2" \
-  || bad "finding(RP_SESSION-blacklist): expected exit 2 for a traversing RP_SESSION (got $rc); $(cat "$SANDBOX/out-traversal.log")"
+[ "$rc" -eq 2 ] && ok "RP_SESSION-blacklist: a '..'-containing RP_SESSION exits 2" \
+  || bad "RP_SESSION-blacklist: expected exit 2 for a traversing RP_SESSION (got $rc); $(cat "$SANDBOX/out-traversal.log")"
 grep -q "RP_SESSION may" "$SANDBOX/out-traversal.log" \
-  && ok "finding(RP_SESSION-blacklist): the refusal names the session-name rule" \
-  || bad "finding(RP_SESSION-blacklist): expected an 'RP_SESSION may ...' refusal text ($(cat "$SANDBOX/out-traversal.log"))"
+  && ok "RP_SESSION-blacklist: the refusal names the session-name rule" \
+  || bad "RP_SESSION-blacklist: expected an 'RP_SESSION may ...' refusal text ($(cat "$SANDBOX/out-traversal.log"))"
 [ -f "$TRAVERSAL_TARGET/sentinel.txt" ] \
-  && ok "finding(RP_SESSION-blacklist): the out-of-root target directory is untouched" \
-  || bad "finding(RP_SESSION-blacklist): the out-of-root target must survive (regression — rm -rf escaped RP_SESSION_ROOT!)"
+  && ok "RP_SESSION-blacklist: the out-of-root target directory is untouched" \
+  || bad "RP_SESSION-blacklist: the out-of-root target must survive (regression — rm -rf escaped RP_SESSION_ROOT!)"
 # A bare '..' (no leading slash) must refuse the same way.
 RP_SESSION=".." bash "$DIR/gpu-dev.sh" down >"$SANDBOX/out-dotdot.log" 2>&1
-[ $? -eq 2 ] && ok "finding(RP_SESSION-blacklist): a bare '..' exits 2" \
-  || bad "finding(RP_SESSION-blacklist): expected exit 2 for a bare '..' ($(cat "$SANDBOX/out-dotdot.log"))"
+[ $? -eq 2 ] && ok "RP_SESSION-blacklist: a bare '..' exits 2" \
+  || bad "RP_SESSION-blacklist: expected exit 2 for a bare '..' ($(cat "$SANDBOX/out-dotdot.log"))"
 # A slash anywhere (no traversal, but still a multi-segment path) refuses.
 RP_SESSION="a100/evil" bash "$DIR/gpu-dev.sh" down >"$SANDBOX/out-slash.log" 2>&1
-[ $? -eq 2 ] && ok "finding(RP_SESSION-blacklist): an embedded '/' (no '..') also exits 2" \
-  || bad "finding(RP_SESSION-blacklist): expected exit 2 for an embedded '/' ($(cat "$SANDBOX/out-slash.log"))"
+[ $? -eq 2 ] && ok "RP_SESSION-blacklist: an embedded '/' (no '..') also exits 2" \
+  || bad "RP_SESSION-blacklist: expected exit 2 for an embedded '/' ($(cat "$SANDBOX/out-slash.log"))"
 # A leading '-' refuses (reads as an option to any tool it is later passed
 # to positionally).
 RP_SESSION="-x" bash "$DIR/gpu-dev.sh" down >"$SANDBOX/out-dash.log" 2>&1
-[ $? -eq 2 ] && ok "finding(RP_SESSION-blacklist): a leading '-' exits 2" \
-  || bad "finding(RP_SESSION-blacklist): expected exit 2 for a leading '-' ($(cat "$SANDBOX/out-dash.log"))"
-# THE round-3 regression itself: a DOTTED session name (not the whole name
+[ $? -eq 2 ] && ok "RP_SESSION-blacklist: a leading '-' exits 2" \
+  || bad "RP_SESSION-blacklist: expected exit 2 for a leading '-' ($(cat "$SANDBOX/out-dash.log"))"
+# A DOTTED session name (not the whole name
 # being '.'/'..') is accepted, not refused. No recorded pod for it, so
 # `down` simply reports that and exits 0 -- the point is that it reaches
 # THAT far at all, rather than refusing at the RP_SESSION gate.
 RP_SESSION="a100.2" bash "$DIR/gpu-dev.sh" down >"$SANDBOX/out-dotted.log" 2>&1
 rc=$?
-[ "$rc" -eq 0 ] && ok "finding(RP_SESSION-blacklist): a dotted session name ('a100.2') is accepted, not refused" \
-  || bad "finding(RP_SESSION-blacklist): a dotted session name must be accepted (got rc=$rc); $(cat "$SANDBOX/out-dotted.log")"
+[ "$rc" -eq 0 ] && ok "RP_SESSION-blacklist: a dotted session name ('a100.2') is accepted, not refused" \
+  || bad "RP_SESSION-blacklist: a dotted session name must be accepted (got rc=$rc); $(cat "$SANDBOX/out-dotted.log")"
 grep -q "RP_SESSION may" "$SANDBOX/out-dotted.log" \
-  && bad "finding(RP_SESSION-blacklist): a dotted session name must NOT trigger the RP_SESSION refusal (regression to the whitelist!)" \
-  || ok "finding(RP_SESSION-blacklist): a dotted session name triggers no RP_SESSION refusal"
+  && bad "RP_SESSION-blacklist: a dotted session name must NOT trigger the RP_SESSION refusal (regression to the whitelist!)" \
+  || ok "RP_SESSION-blacklist: a dotted session name triggers no RP_SESSION refusal"
 # An ordinary session name (letters, digits, hyphen, underscore) is
 # unaffected — pinned directly here alongside the blacklist shapes.
 RP_SESSION="a100-2" bash "$DIR/gpu-dev.sh" down >"$SANDBOX/out-ordinary.log" 2>&1
-[ $? -eq 0 ] && ok "finding(RP_SESSION-blacklist): an ordinary [A-Za-z0-9_-] session name is still accepted" \
-  || bad "finding(RP_SESSION-blacklist): an ordinary session name must still work ($(cat "$SANDBOX/out-ordinary.log"))"
+[ $? -eq 0 ] && ok "RP_SESSION-blacklist: an ordinary [A-Za-z0-9_-] session name is still accepted" \
+  || bad "RP_SESSION-blacklist: an ordinary session name must still work ($(cat "$SANDBOX/out-ordinary.log"))"
 
 # ═════════════════════════════════════════════════════════════════════════
 # Group 3d-2 — CLI-level: --tree/--wave/RP_SESSION and `target`'s positional
 # tree name are all refused when they carry a character outside the
 # allowlist. Every one of these values is embedded in REMOTE shell text and
-# (for wave/tree) in the active-wave claim write, so a `%` reached the pod's
-# own printf FORMAT position (`--wave '%d'` wrote `WAVE=0`, silently
-# claiming a wave nobody asked for) and a `"` closed that format string
-# outright. Refusal happens before any path derives from the value and
+# (for wave/tree) in the active-wave claim write, so an unchecked `%` reaches
+# the pod's own printf FORMAT position (`--wave '%d'` writes `WAVE=0`,
+# silently claiming a wave nobody asked for) and a `"` closes that format
+# string outright. Refusal happens before any path derives from the value and
 # before any ssh is attempted, so these need no pod and no mock.
 # ═════════════════════════════════════════════════════════════════════════
 name_refused() { # $1=label $2..=argv for gpu-dev.sh
@@ -1034,9 +1026,9 @@ name_refused() { # $1=label $2..=argv for gpu-dev.sh
   bash "$DIR/gpu-dev.sh" "$@" >"$log" 2>&1
   local rc=$?
   if [ "$rc" -eq 2 ] && grep -q "may contain only letters\|may not start with" "$log"; then
-    ok "finding(name-allowlist): ${label} refused (exit 2) with a rule-naming error"
+    ok "name-allowlist: ${label} refused (exit 2) with a rule-naming error"
   else
-    bad "finding(name-allowlist): ${label} must be refused with exit 2 and a rule-naming error (got rc=$rc): $(cat "$log")"
+    bad "name-allowlist: ${label} must be refused with exit 2 and a rule-naming error (got rc=$rc): $(cat "$log")"
   fi
 }
 name_refused "--tree '%d'"       run a100 --tree '%d' true
@@ -1048,23 +1040,22 @@ name_refused '--wave with a quote' run a100 --wave 'a"b' true
 name_refused '--wave $(...)'     run a100 --wave 'a$(id)b' true
 name_refused "target's positional tree name" target a100 'ev$(id)il'
 RP_SESSION='%d' bash "$DIR/gpu-dev.sh" down >"$SANDBOX/out-name-sess.log" 2>&1
-[ $? -eq 2 ] && ok "finding(name-allowlist): RP_SESSION='%d' refused (exit 2)" \
-  || bad "finding(name-allowlist): RP_SESSION='%d' must be refused ($(cat "$SANDBOX/out-name-sess.log"))"
+[ $? -eq 2 ] && ok "name-allowlist: RP_SESSION='%d' refused (exit 2)" \
+  || bad "name-allowlist: RP_SESSION='%d' must be refused ($(cat "$SANDBOX/out-name-sess.log"))"
 # Positive control, same shapes the repo actually uses: a legal name must
 # never trip the rule. (`run` has no pod here and fails later for its own
 # reasons; what is pinned is that it gets PAST the name gate.)
 bash "$DIR/gpu-dev.sh" run a100 --tree w4b --wave 'fix.443' true >"$SANDBOX/out-name-legal.log" 2>&1
 grep -q "may contain only letters\|--tree may\|--wave may" "$SANDBOX/out-name-legal.log" \
-  && bad "finding(name-allowlist): a legal --tree/--wave ('w4b'/'fix.443') must NOT be refused ($(cat "$SANDBOX/out-name-legal.log"))" \
-  || ok "finding(name-allowlist): legal dotted/alphanumeric --tree and --wave values pass the gate"
+  && bad "name-allowlist: a legal --tree/--wave ('w4b'/'fix.443') must NOT be refused ($(cat "$SANDBOX/out-name-legal.log"))" \
+  || ok "name-allowlist: legal dotted/alphanumeric --tree and --wave values pass the gate"
 
 # ═════════════════════════════════════════════════════════════════════════
 # Group 3e — CLI-level: a dotted session name works END TO END, not merely
 # past the RP_SESSION gate — `down bench.1` actually releases ITS pod
-# (round-3 audit's own reproduction: a live pod under a dotted session name
-# was stranded for its full deadline because every verb refused against
-# it). Same pattern as the pre-existing "down-ok" fixture above, just with
-# a dotted session name.
+# (otherwise a live pod under a dotted session name is stranded for its full
+# deadline because every verb refuses against it). Same pattern as the
+# "down-ok" fixture above, just with a dotted session name.
 # ═════════════════════════════════════════════════════════════════════════
 SESSION_DOTTED="bench.1"
 write_meta_legacy "$SESSION_DOTTED" "pod-bench-1"
@@ -1077,11 +1068,11 @@ bash "$DIR/gpu-dev.sh" down "$SESSION_DOTTED" >"$SANDBOX/out-down-dotted.log" 2>
 rc=$?
 term_count_dotted="$(grep -c "podTerminate.*pod-bench-1" "$CALL_LOG")"
 [ "$term_count_dotted" = "1" ] && [ "$rc" -eq 0 ] \
-  && ok "finding(dotted-session-e2e): 'down bench.1' releases its pod end to end" \
-  || bad "finding(dotted-session-e2e): expected exactly one confirmed terminate for pod-bench-1 (got count=${term_count_dotted} rc=${rc}); $(cat "$SANDBOX/out-down-dotted.log")"
+  && ok "dotted-session-e2e: 'down bench.1' releases its pod end to end" \
+  || bad "dotted-session-e2e: expected exactly one confirmed terminate for pod-bench-1 (got count=${term_count_dotted} rc=${rc}); $(cat "$SANDBOX/out-down-dotted.log")"
 [ -f "$RP_SESSION_ROOT/$SESSION_DOTTED/meta" ] \
-  && bad "finding(dotted-session-e2e): bench.1's local record should be forgotten after a confirmed terminate" \
-  || ok "finding(dotted-session-e2e): bench.1's local record is forgotten after a confirmed terminate"
+  && bad "dotted-session-e2e: bench.1's local record should be forgotten after a confirmed terminate" \
+  || ok "dotted-session-e2e: bench.1's local record is forgotten after a confirmed terminate"
 
 # ═════════════════════════════════════════════════════════════════════════
 # Group 3f — CLI-level: the RP_SESSION gate never applies to `ls`/`reap`
@@ -1090,23 +1081,23 @@ term_count_dotted="$(grep -c "podTerminate.*pod-bench-1" "$CALL_LOG")"
 # a traversal shape — must leave both `ls` and `reap` completely unaffected.
 # ═════════════════════════════════════════════════════════════════════════
 RP_SESSION="a100.2" bash "$DIR/gpu-dev.sh" ls >"$SANDBOX/out-ls-dotted.log" 2>&1
-[ $? -eq 0 ] && ok "finding(ls-reap-exempt): 'ls' works under RP_SESSION=a100.2" \
-  || bad "finding(ls-reap-exempt): 'ls' must work under RP_SESSION=a100.2 ($(cat "$SANDBOX/out-ls-dotted.log"))"
+[ $? -eq 0 ] && ok "ls-reap-exempt: 'ls' works under RP_SESSION=a100.2" \
+  || bad "ls-reap-exempt: 'ls' must work under RP_SESSION=a100.2 ($(cat "$SANDBOX/out-ls-dotted.log"))"
 RP_SESSION="../evil" bash "$DIR/gpu-dev.sh" ls >"$SANDBOX/out-ls-traversal.log" 2>&1
-[ $? -eq 0 ] && ok "finding(ls-reap-exempt): 'ls' is unaffected even by a traversal-shaped RP_SESSION" \
-  || bad "finding(ls-reap-exempt): 'ls' must be unaffected by a traversal-shaped RP_SESSION ($(cat "$SANDBOX/out-ls-traversal.log"))"
+[ $? -eq 0 ] && ok "ls-reap-exempt: 'ls' is unaffected even by a traversal-shaped RP_SESSION" \
+  || bad "ls-reap-exempt: 'ls' must be unaffected by a traversal-shaped RP_SESSION ($(cat "$SANDBOX/out-ls-traversal.log"))"
 
 echo '{"data":{"myself":{"pods":[]}}}' > "$SANDBOX/acct-reap-dotted.json"
 reset_log; reset_account_seq
 export MOCK_ACCOUNT_RESPONSE_1="$SANDBOX/acct-reap-dotted.json"
 RP_SESSION="a100.2" bash "$DIR/gpu-dev.sh" reap >"$SANDBOX/out-reap-dotted.log" 2>&1
 rc=$?
-[ "$rc" -eq 0 ] && ok "finding(ls-reap-exempt): 'reap' works under RP_SESSION=a100.2" \
-  || bad "finding(ls-reap-exempt): 'reap' must work under RP_SESSION=a100.2 (got rc=$rc); $(cat "$SANDBOX/out-reap-dotted.log")"
+[ "$rc" -eq 0 ] && ok "ls-reap-exempt: 'reap' works under RP_SESSION=a100.2" \
+  || bad "ls-reap-exempt: 'reap' must work under RP_SESSION=a100.2 (got rc=$rc); $(cat "$SANDBOX/out-reap-dotted.log")"
 if log_has "podTerminate"; then
-  bad "finding(ls-reap-exempt): 'reap' against an empty account must terminate nothing (regression!)"
+  bad "ls-reap-exempt: 'reap' against an empty account must terminate nothing (regression!)"
 else
-  ok "finding(ls-reap-exempt): 'reap' against an empty account terminates nothing"
+  ok "ls-reap-exempt: 'reap' against an empty account terminates nothing"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1149,8 +1140,7 @@ JSON
 )
 
 # ═════════════════════════════════════════════════════════════════════════
-# Group 4b — rp_sweep's override validation (function-level; round-4 audit
-# BLOCK). "0" and "00" are all-digit (no non-digit character), so the
+# Group 4b — rp_sweep's override validation (function-level). "0" and "00" are all-digit (no non-digit character), so the
 # digit-shape check alone lets them through; Python's `if override:` is then
 # true for the STRING "0" exactly as it is for "8", giving `limit = 0` —
 # every RUNNING pod's age is "past-deadline-0s", so `reap 0` mass-terminates
@@ -1163,8 +1153,8 @@ JSON
   source "$DIR/runpod_lib.sh"
   G4B_TERM="$SANDBOX/g4b-terminate.log"; : > "$G4B_TERM"
   rp_terminate() { echo "$1" >> "$G4B_TERM"; }
-  # The validation must reject BEFORE any account query — a query the fix
-  # doesn't even need should never be reached on a rejected override.
+  # The validation must reject BEFORE any account query — a query the
+  # validation does not need is never reached on a rejected override.
   rp_gql() { echo "SHOULD_NOT_BE_CALLED" >> "$SANDBOX/g4b-query.log"; echo '{}'; }
 
   : > "$G4B_TERM"; : > "$SANDBOX/g4b-query.log"
@@ -1184,7 +1174,7 @@ JSON
     || record PASS "group4b-reap-double-zero-terminates-nothing"
 
   # Positive control: `reap 1` (a REAL positive override) must still work —
-  # this fix must not have broken force-reap itself, only the zero case.
+  # the validation refuses only the zero case, never force-reap itself.
   # Two pods: one 4h old (past a 1h force-reap ceiling) and one 20m old
   # (well within it) — only the 4h one is swept.
   rp_gql() { cat "$SANDBOX/g4b-account.json"; }
@@ -1214,12 +1204,12 @@ JSON
 # ═════════════════════════════════════════════════════════════════════════
 # Group 4c — rp_sweep (function-level, where Group 4/4b already drive the
 # pod sweep): a pod with NO usable `createdAt` is rc=1, naming the pod id,
-# never a silent `continue` back to a green summary — round-4 audit P-M1a,
-# mirroring rp_cluster_sweep's own pre-existing UNAGEABLE handling. Function-
-# level oracle for this same class also lives in test_runpod_cluster_lib.sh
-# Group 11 (via the mocks-only curl stub); this one drives the SAME rp_sweep
-# through THIS suite's own rp_gql-override harness, confirming the fix
-# holds under both mocking styles.
+# never a silent `continue` back to a green summary — mirroring
+# rp_cluster_sweep's own UNAGEABLE handling. A function-level oracle for this
+# same class also lives in test_runpod_cluster_lib.sh Group 11 (via the
+# mocks-only curl stub); this one drives the SAME rp_sweep through THIS
+# suite's own rp_gql-override harness, confirming the behavior holds under
+# both mocking styles.
 # ═════════════════════════════════════════════════════════════════════════
 (
   export RUNPOD_API_KEY="dummy-key"
@@ -1251,7 +1241,7 @@ JSON
 
 # ═════════════════════════════════════════════════════════════════════════
 # Group 5 — RP_SSHO must pin every connection to the tooling's own key via
-# IdentitiesOnly=yes (2026-08-26 incident, ledger row 328): without it, an
+# IdentitiesOnly=yes: without it, an
 # ssh-agent holding many identities offers all of them before RP_SSH_KEY,
 # and the reachability probe in rp_deploy_live can exhaust the pod's own
 # MaxAuthTries before RP_SSH_KEY is ever tried — reading a perfectly
@@ -1303,7 +1293,7 @@ while kill -0 "$G6_PID" 2>/dev/null && [ "$SECONDS" -lt "$g6_deadline" ]; do sle
 if kill -0 "$G6_PID" 2>/dev/null; then
   kill -KILL "$G6_PID" 2>/dev/null
   wait "$G6_PID" 2>/dev/null
-  bad "finding(RP_SSH_WAIT_SECS): 'shell' with RP_SSH_WAIT_SECS=2 did not exit within 20s (regression to a fixed-iteration budget?); output: $(cat "$SANDBOX/out-wait-secs.log")"
+  bad "RP_SSH_WAIT_SECS: 'shell' with RP_SSH_WAIT_SECS=2 did not exit within 20s (regression to a fixed-iteration budget?); output: $(cat "$SANDBOX/out-wait-secs.log")"
 else
   wait "$G6_PID" 2>/dev/null
   g6_rc=$?
@@ -1312,15 +1302,15 @@ else
   # <15 proves it is bounded by RP_SSH_WAIT_SECS, not the old ~240s budget —
   # a wide ceiling since this also carries process start/CLI-parse overhead.
   if [ "$g6_elapsed" -ge 2 ] && [ "$g6_elapsed" -lt 15 ]; then
-    ok "finding(RP_SSH_WAIT_SECS): the reachability poll's wall-clock deadline is honoured (${g6_elapsed}s for a 2s budget)"
+    ok "RP_SSH_WAIT_SECS: the reachability poll's wall-clock deadline is honoured (${g6_elapsed}s for a 2s budget)"
   else
-    bad "finding(RP_SSH_WAIT_SECS): expected roughly 2-15s elapsed for RP_SSH_WAIT_SECS=2 (got ${g6_elapsed}s, rc=${g6_rc}); output: $(cat "$SANDBOX/out-wait-secs.log")"
+    bad "RP_SSH_WAIT_SECS: expected roughly 2-15s elapsed for RP_SSH_WAIT_SECS=2 (got ${g6_elapsed}s, rc=${g6_rc}); output: $(cat "$SANDBOX/out-wait-secs.log")"
   fi
-  [ "$g6_rc" -eq 75 ] && ok "finding(RP_SSH_WAIT_SECS): exhausting the deadline with no reachable candidate returns 75 (neutral skip)" \
-    || bad "finding(RP_SSH_WAIT_SECS): expected exit 75 once the deadline is exhausted (got $g6_rc)"
+  [ "$g6_rc" -eq 75 ] && ok "RP_SSH_WAIT_SECS: exhausting the deadline with no reachable candidate returns 75 (neutral skip)" \
+    || bad "RP_SSH_WAIT_SECS: expected exit 75 once the deadline is exhausted (got $g6_rc)"
   grep -q "never became reachable within 2s" "$SANDBOX/out-wait-secs.log" \
-    && ok "finding(RP_SSH_WAIT_SECS): the refusal names the actual budget (2s), not a hard-coded '4m'" \
-    || bad "finding(RP_SSH_WAIT_SECS): expected 'never became reachable within 2s' in output ($(cat "$SANDBOX/out-wait-secs.log"))"
+    && ok "RP_SSH_WAIT_SECS: the refusal names the actual budget (2s), not a hard-coded '4m'" \
+    || bad "RP_SSH_WAIT_SECS: expected 'never became reachable within 2s' in output ($(cat "$SANDBOX/out-wait-secs.log"))"
 fi
 unset MOCK_DEPLOY_RESPONSE
 
@@ -1479,14 +1469,14 @@ else
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
-# Group 8 — round-N adversarial-audit findings B1/B2/B3: state-lattice and
-# honesty defects the mocked-ssh Group 7 tests above cannot construct on
+# Group 8 — state-lattice and honesty properties the mocked-ssh Group 7
+# tests above cannot construct on
 # their own (they drive rp_wait_poll's own rc contract with CANNED
 # responses; they never run the ACTUAL remote-check-script text, or a real
 # hung ssh, end to end).
 # ═════════════════════════════════════════════════════════════════════════
 
-# --- 8a (B1): a HUNG ssh — not rc=255, an ACTUAL sleep past the local
+# --- 8a: a HUNG ssh — not rc=255, an ACTUAL sleep past the local
 # bound — must still be a LOUD, counted transport failure, never a silent
 # indefinite wait. This is the load-bearing case: `-oServerAliveInterval`/
 # `-oBatchMode` cannot be exercised by a bare bash stub (it is not real
@@ -1515,17 +1505,17 @@ RP_WAIT_SSH_BOUND_SECS=2 RP_WAIT_INTERVAL_SECS=1 RP_WAIT_MAX_TRANSPORT_FAILS=2 \
 g8a_rc=$?
 g8a_elapsed=$((SECONDS - G8A_START))
 if [ "$g8a_rc" -eq 2 ] && grep -q "TRANSPORT FAILURE" "$SANDBOX/out-g8a.log"; then
-  ok "wait-seed(B1): a HUNG ssh (sleeps past the local bound, never returns) is still a loud, counted transport failure — never silent"
+  ok "wait-seed: a HUNG ssh (sleeps past the local bound, never returns) is still a loud, counted transport failure — never silent"
 else
-  bad "wait-seed(B1): expected rc=2 + TRANSPORT FAILURE against a hung ssh (got rc=$g8a_rc, ${g8a_elapsed}s elapsed): $(cat "$SANDBOX/out-g8a.log")"
+  bad "wait-seed: expected rc=2 + TRANSPORT FAILURE against a hung ssh (got rc=$g8a_rc, ${g8a_elapsed}s elapsed): $(cat "$SANDBOX/out-g8a.log")"
 fi
 # Bounded well under the 9999s sleep: 2 hung polls * (RP_WAIT_SSH_BOUND_SECS
 # + up to 1s TERM->KILL grace) is at most ~6s: proves the hang is actually
 # KILLED, not merely outlasted by the overall --timeout.
 if [ "$g8a_elapsed" -lt 30 ]; then
-  ok "wait-seed(B1): the hung polls were actually bounded/killed locally (${g8a_elapsed}s, not the 9999s the stub sleeps for)"
+  ok "wait-seed: the hung polls were actually bounded/killed locally (${g8a_elapsed}s, not the 9999s the stub sleeps for)"
 else
-  bad "wait-seed(B1): took ${g8a_elapsed}s — the local bound did not actually kill the hung ssh"
+  bad "wait-seed: took ${g8a_elapsed}s — the local bound did not actually kill the hung ssh"
 fi
 
 # The remaining Group 8 legs run REAL tmux/flock locally (never over ssh —
@@ -1544,7 +1534,7 @@ if command -v tmux >/dev/null 2>&1 && command -v flock >/dev/null 2>&1; then
     G8_SANDBOX="$SANDBOX/g8"
     mkdir -p "$G8_SANDBOX"
 
-    # --- 8b (B2): BOTH markers present at once (no live session) — a
+    # --- 8b: BOTH markers present at once (no live session) — a
     # pathological/inconsistent state — must read FAILED, not COMPLETE:
     # rp_seed_wait_script checks FAILED unconditionally first.
     PFX="$G8_SANDBOX/seed-both"
@@ -1560,7 +1550,7 @@ if command -v tmux >/dev/null 2>&1 && command -v flock >/dev/null 2>&1; then
       record FAIL "g8b-both-markers-present-reads-FAILED-not-COMPLETE (rc=$rc_both out=$out_both)"
     fi
 
-    # --- 8c (B2): a COMPLETE marker alongside a LIVE session — the narrow
+    # --- 8c: a COMPLETE marker alongside a LIVE session — the narrow
     # --reseed race window — must read RUNNING (keep polling), never
     # SUCCESS.
     PFX2="$G8_SANDBOX/seed-live"
@@ -1578,12 +1568,12 @@ if command -v tmux >/dev/null 2>&1 && command -v flock >/dev/null 2>&1; then
       record FAIL "g8c-complete-marker-plus-live-session-reads-RUNNING-not-SUCCESS (rc=$rc_live out=$out_live)"
     fi
 
-    # --- 8d (B3): rc=0 — a real successful job, driven through the ACTUAL
+    # --- 8d: rc=0 — a real successful job, driven through the ACTUAL
     # wrapper the way `run` builds it, then read back by rp_job_wait_script.
     TREED="$G8_SANDBOX/tree-ok"; mkdir -p "$TREED"
     wrap_ok="$(rp_job_wrapper_with_marker_lines "$TREED" "$TREED/.target" "true" "tokOK" "0" "wave-g8" "ok-tree")"
     # The wrapper's own generated text hardcodes /root/.jammi-active-wave
-    # (esc-077-class one-pod-per-wave claim); substituted here to a
+    # (the one-pod-per-wave claim); substituted here to a
     # SANDBOXED path — same idiom 8f already uses for /root/.jammi-timing.lock
     # — so this test never touches the real /root on the machine running it.
     wrap_ok="${wrap_ok//\/root\/.jammi-active-wave/$TREED/.jammi-active-wave}"
@@ -1599,7 +1589,7 @@ if command -v tmux >/dev/null 2>&1 && command -v flock >/dev/null 2>&1; then
       record FAIL "g8d-wrapper-rc0-reads-SUCCESS (job_ok_rc=$job_ok_rc rc_ok=$rc_ok out=$out_ok)"
     fi
 
-    # --- 8e (B3): rc!=0 — a real failing job.
+    # --- 8e: rc!=0 — a real failing job.
     TREEF="$G8_SANDBOX/tree-fail"; mkdir -p "$TREEF"
     # A bare `exit 3` — deliberately the PATHOLOGICAL job shape (a caller
     # CAN type `gpu-dev.sh run a100 exit 1`; JOB is `"$*"` verbatim), the
@@ -1620,7 +1610,7 @@ if command -v tmux >/dev/null 2>&1 && command -v flock >/dev/null 2>&1; then
       record FAIL "g8e-wrapper-rc3-reads-FAILED-naming-the-real-rc (job_fail_rc=$job_fail_rc rc_fail=$rc_fail out=$out_fail)"
     fi
 
-    # --- 8f (B3): flock refusal (rc=75) — hold the SAME timing lock
+    # --- 8f: flock refusal (rc=75) — hold the SAME timing lock
     # externally (a real, separate flock holder) before running the
     # timing=1 wrapper, proving the refusal is distinct from a job that
     # merely happens to exit 75 on its own.
@@ -1648,7 +1638,7 @@ if command -v tmux >/dev/null 2>&1 && command -v flock >/dev/null 2>&1; then
       record FAIL "g8f-wrapper-lock-refused-reads-REFUSED-distinctly-from-a-real-rc75-job (job_lock_rc=$job_lock_rc rc_lock=$rc_lock out=$out_lock)"
     fi
 
-    # --- 8g (B3): a STALE .jammi.log with NO .jammi.exit marker and no
+    # --- 8g: a STALE .jammi.log with NO .jammi.exit marker and no
     # live session — the exact false-SUCCESS shape the old "does a log file
     # exist" check had — must read "no evidence", never SUCCESS.
     TREES="$G8_SANDBOX/tree-stale"; mkdir -p "$TREES"
@@ -1663,7 +1653,7 @@ if command -v tmux >/dev/null 2>&1 && command -v flock >/dev/null 2>&1; then
     fi
   )
 else
-  skip "Group 8 (B1/B2/B3 state-lattice legs): tmux and/or flock not found on this host"
+  skip "Group 8 (state-lattice legs): tmux and/or flock not found on this host"
 fi
 
 # ── tally ────────────────────────────────────────────────────────────────
@@ -1677,7 +1667,7 @@ while IFS=: read -r status name; do
 done < "$RESULTS"
 
 # ═════════════════════════════════════════════════════════════════════════
-# Group 9 (esc-077) — `run` refuses a job whose CARGO_TARGET_DIR never went
+# Group 9 (target preflight) — `run` refuses a job whose CARGO_TARGET_DIR never went
 # through the seed-clone substrate. Two layers: (9a) a hermetic, no-ssh unit
 # test of the state-classification TEXT itself (rp_target_preflight_lines,
 # runpod_lib.sh) against real local fixture directories — the SSH-mocked
@@ -1776,7 +1766,7 @@ while IFS=: read -r status name; do
 done < "$G9A_RESULTS"
 
 # --- 9b-9e: `run`'s own dispatch, over the SAME WAITBIN ssh-stub Group 7
-# builds above (call order: #1 require_pod liveness, #2 the esc-077
+# builds above (call order: #1 require_pod liveness, #2 the target
 # preflight — SKIPPED entirely under RP_ALLOW_COLD_TARGET=1 — #3 the real
 # job-launch heredoc, reached only when the preflight allows it).
 G9_SESSION="g9run"; write_meta "$G9_SESSION" "pod-g9run" "8"
@@ -1784,7 +1774,7 @@ G9_SESSION="g9run"; write_meta "$G9_SESSION" "pod-g9run" "8"
 # --- 9b: MISSING target dir -> refuse (exit 1), remedy named -------------
 G9B_DIR="$SANDBOX/g9b-ssh"; mkdir -p "$G9B_DIR"
 write_ssh_resp "$G9B_DIR" 1 0                                  # require_pod liveness
-write_ssh_resp "$G9B_DIR" 2 0 "GPU_DEV_TARGET_STATE=MISSING"   # esc-077 preflight
+write_ssh_resp "$G9B_DIR" 2 0 "GPU_DEV_TARGET_STATE=MISSING"   # target preflight
 rm -f "$SANDBOX/g9b-counter"
 MOCK_SSH_CALL_COUNTER="$SANDBOX/g9b-counter" MOCK_SSH_RESPONSES_DIR="$G9B_DIR" \
   PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
@@ -1794,9 +1784,9 @@ if [ "$g9b_rc" -ne 0 ] && grep -q "does not exist on the pod" "$SANDBOX/out-g9b.
   && grep -q "target ${G9_SESSION} jammi-ai --with-cutlass" "$SANDBOX/out-g9b.log" \
   && grep -q "RP_ALLOW_COLD_TARGET=1" "$SANDBOX/out-g9b.log" \
   && [ "$(cat "$SANDBOX/g9b-counter")" = "2" ]; then
-  ok "run (esc-077): refuses a MISSING target dir (exit $g9b_rc), naming the target remedy and the override, never reaching the job-launch call"
+  ok "run (target preflight): refuses a MISSING target dir (exit $g9b_rc), naming the target remedy and the override, never reaching the job-launch call"
 else
-  bad "run (esc-077): expected a named MISSING refusal + exactly 2 ssh calls (got rc=$g9b_rc, calls=$(cat "$SANDBOX/g9b-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9b.log")"
+  bad "run (target preflight): expected a named MISSING refusal + exactly 2 ssh calls (got rc=$g9b_rc, calls=$(cat "$SANDBOX/g9b-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9b.log")"
 fi
 
 # --- 9c: existing-but-UNMARKED target dir -> refuse (exit 1), with the
@@ -1813,16 +1803,16 @@ if [ "$g9c_rc" -ne 0 ] && grep -q "no seed-clone marker" "$SANDBOX/out-g9c.log" 
   && grep -q "target ${G9_SESSION} jammi-ai --with-cutlass" "$SANDBOX/out-g9c.log" \
   && grep -q "RP_ALLOW_COLD_TARGET=1" "$SANDBOX/out-g9c.log" \
   && [ "$(cat "$SANDBOX/g9c-counter")" = "2" ]; then
-  ok "run (esc-077): refuses a COLD unmarked target dir (exit $g9c_rc), naming the clone remedy, never reaching the job-launch call"
+  ok "run (target preflight): refuses a COLD unmarked target dir (exit $g9c_rc), naming the clone remedy, never reaching the job-launch call"
 else
-  bad "run (esc-077): expected a named UNMARKED_COLD refusal + exactly 2 ssh calls (got rc=$g9c_rc, calls=$(cat "$SANDBOX/g9c-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9c.log")"
+  bad "run (target preflight): expected a named UNMARKED_COLD refusal + exactly 2 ssh calls (got rc=$g9c_rc, calls=$(cat "$SANDBOX/g9c-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9c.log")"
 fi
 
 # --- 9c-2: a WARM unmarked dir (one that predates the marker scheme) is
 # refused with the CORRECT diagnosis (not "you would pay a cold build") and
 # with a remedy that can actually execute. The clone remedy cannot: it
-# refuses to write over an existing destination, which left the operator
-# with no runnable move at all.
+# refuses to write over an existing destination, which would leave the
+# operator with no runnable move at all.
 G9C2_DIR="$SANDBOX/g9c2-ssh"; mkdir -p "$G9C2_DIR"
 write_ssh_resp "$G9C2_DIR" 1 0
 write_ssh_resp "$G9C2_DIR" 2 0 "GPU_DEV_TARGET_STATE=UNMARKED_WARM"
@@ -1836,18 +1826,18 @@ if [ "$g9c2_rc" -ne 0 ] \
   && grep -q "NOT a cold-build refusal" "$SANDBOX/out-g9c2.log" \
   && grep -q "target ${G9_SESSION} jammi-ai --adopt" "$SANDBOX/out-g9c2.log" \
   && [ "$(cat "$SANDBOX/g9c2-counter")" = "2" ]; then
-  ok "run (esc-077): refuses a WARM unmarked target dir with the provenance diagnosis and the executable --adopt remedy, never claiming a cold build"
+  ok "run (target preflight): refuses a WARM unmarked target dir with the provenance diagnosis and the executable --adopt remedy, never claiming a cold build"
 else
-  bad "run (esc-077): expected a WARM-specific refusal naming --adopt (got rc=$g9c2_rc, calls=$(cat "$SANDBOX/g9c2-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9c2.log")"
+  bad "run (target preflight): expected a WARM-specific refusal naming --adopt (got rc=$g9c2_rc, calls=$(cat "$SANDBOX/g9c2-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9c2.log")"
 fi
 grep -q "COLD full workspace build" "$SANDBOX/out-g9c2.log" \
-  && bad "run (esc-077): the WARM refusal must NOT claim a cold full workspace build — that was the false diagnosis" \
-  || ok "run (esc-077): the WARM refusal makes no cold-build claim about a dir that is warm"
+  && bad "run (target preflight): the WARM refusal must NOT claim a cold full workspace build — that was the false diagnosis" \
+  || ok "run (target preflight): the WARM refusal makes no cold-build claim about a dir that is warm"
 
-# --- 9d: a marked clone (OK) -> proceeds past esc-077 into the NEW
+# --- 9d: a marked clone (OK) -> proceeds past the target preflight into the
 # concurrency preflight (call #3, CLEAR here) -> the real job-launch call
-# (#4). This call count grew by one now that the one-pod-per-wave
-# concurrency preflight also runs by default (RP_ALLOW_CONCURRENT unset).
+# (#4). The one-pod-per-wave concurrency preflight runs by default
+# (RP_ALLOW_CONCURRENT unset).
 G9D_DIR="$SANDBOX/g9d-ssh"; mkdir -p "$G9D_DIR"
 write_ssh_resp "$G9D_DIR" 1 0
 write_ssh_resp "$G9D_DIR" 2 0 "GPU_DEV_TARGET_STATE=OK"
@@ -1858,9 +1848,9 @@ MOCK_SSH_CALL_COUNTER="$SANDBOX/g9d-counter" MOCK_SSH_RESPONSES_DIR="$G9D_DIR" \
   PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
   >"$SANDBOX/out-g9d.log" 2>&1
 if [ "$(cat "$SANDBOX/g9d-counter")" = "4" ] && grep -q "detached" "$SANDBOX/out-g9d.log"; then
-  ok "run (esc-077): a marked (OK) clone + a CLEAR concurrency check proceeds to the real job-launch call"
+  ok "run (target preflight): a marked (OK) clone + a CLEAR concurrency check proceeds to the real job-launch call"
 else
-  bad "run (esc-077): expected exactly 4 ssh calls (target preflight OK -> concurrency preflight CLEAR -> job launch) (got calls=$(cat "$SANDBOX/g9d-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9d.log")"
+  bad "run (target preflight): expected exactly 4 ssh calls (target preflight OK -> concurrency preflight CLEAR -> job launch) (got calls=$(cat "$SANDBOX/g9d-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9d.log")"
 fi
 
 # --- 9e: RP_ALLOW_COLD_TARGET=1 skips ONLY the target preflight — the
@@ -1868,23 +1858,21 @@ fi
 # gates it) -------------------------------------------------------------
 G9E_DIR="$SANDBOX/g9e-ssh"; mkdir -p "$G9E_DIR"
 write_ssh_resp "$G9E_DIR" 1 0
-write_ssh_resp "$G9E_DIR" 2 0 "GPU_DEV_CONCURRENCY_STATE=CLEAR"  # the concurrency preflight, now #2
-write_ssh_resp "$G9E_DIR" 3 0 "started"                          # the job-launch call, now #3
+write_ssh_resp "$G9E_DIR" 2 0 "GPU_DEV_CONCURRENCY_STATE=CLEAR"  # the concurrency preflight, #2
+write_ssh_resp "$G9E_DIR" 3 0 "started"                          # the job-launch call, #3
 rm -f "$SANDBOX/g9e-counter"
 MOCK_SSH_CALL_COUNTER="$SANDBOX/g9e-counter" MOCK_SSH_RESPONSES_DIR="$G9E_DIR" \
   RP_ALLOW_COLD_TARGET=1 \
   PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
   >"$SANDBOX/out-g9e.log" 2>&1
 if [ "$(cat "$SANDBOX/g9e-counter")" = "3" ] && grep -q "detached" "$SANDBOX/out-g9e.log"; then
-  ok "run (esc-077): RP_ALLOW_COLD_TARGET=1 skips ONLY the target preflight (liveness + concurrency preflight + job launch = 3 calls)"
+  ok "run (target preflight): RP_ALLOW_COLD_TARGET=1 skips ONLY the target preflight (liveness + concurrency preflight + job launch = 3 calls)"
 else
-  bad "run (esc-077): expected RP_ALLOW_COLD_TARGET=1 to skip straight to the concurrency preflight then job launch (3 total calls) (got calls=$(cat "$SANDBOX/g9e-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9e.log")"
+  bad "run (target preflight): expected RP_ALLOW_COLD_TARGET=1 to skip straight to the concurrency preflight then job launch (3 total calls) (got calls=$(cat "$SANDBOX/g9e-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9e.log")"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
-# Group 10 (one-pod-per-wave, WAVE-scoped, same class as esc-077) —
-# operator-directed refinement of the original tree-scoped gate: `run`
-# refuses only when a LIVE job belongs to a DIFFERENT wave; a wave's own
+# Group 10 (one-pod-per-wave, WAVE-scoped) — `run` refuses only when a LIVE job belongs to a DIFFERENT wave; a wave's own
 # sub-units may share a pod across DIFFERENT trees under the SAME wave id.
 # ═════════════════════════════════════════════════════════════════════════
 
@@ -1977,14 +1965,14 @@ STUB
     record FAIL "rp_concurrency_preflight_lines: expected CLEAR for no sessions (got: $out)"
   fi
 
-  # Stale-claim handling (explicit regression pin, item 4): a claim FILE
+  # Stale-claim handling (explicit regression pin): a claim FILE
   # naming a totally different wave sits on disk, but NO tmux session is
   # actually alive (the wrapper's own cleanup was interrupted — SIGKILL/
   # pod death — before it could `rm -f` the claim). tmux liveness is
   # checked FIRST and is the PRIMARY signal here: with no live OTHER
   # session at all, this must read CLEAR regardless of what the stale file
-  # says — failing OPEN on staleness, per this campaign's own instruction,
-  # rather than refusing forever on an orphaned file no process will ever
+  # says — failing OPEN on staleness, deliberately, rather than refusing
+  # forever on an orphaned file no process will ever
   # clean up again.
   claim othertree wave-B
   out="$(run_preflight "jammi-mywork" "wave-A")"
@@ -1996,8 +1984,8 @@ STUB
 
   # --- Own-session exclusion must be a LITERAL, whole-line match ---------
   # A tree name legitimately contains regex metacharacters (rp_tree_name_check
-  # refuses only ''/'.'/'..'/'/'-leading-'-'; `bench.1`-shaped names are real,
-  # and `--tree 'fix.443'` reproduced this). Read as a BRE, the own-session
+  # refuses only ''/'.'/'..'/'/'-leading-'-'; `bench.1`- and
+  # `fix.443`-shaped names are real). Read as a BRE, the own-session
   # pattern deletes OTHER sessions from the list the gate is scanning, so the
   # gate reports CLEAR while a different wave is genuinely running: it fails
   # OPEN. These cases drive the generated text DIRECTLY, so they hold for the
@@ -2016,12 +2004,12 @@ STUB
   # `.` — a BRE `jammi-fix.443` also matches the live `jammi-fixX443`.
   metachar_case 'jammi-fix.443' $'jammi-seed\njammi-fixX443\njammi-fix.443\n' 'jammi-fixX443'
   # `*` — a BRE `jammi-w*` matches `jammi-www` (and NOT the literal own name),
-  # so the old form excluded the OTHER session and then reported OUR OWN
+  # so a BRE match excludes the OTHER session and then reports OUR OWN
   # session as the contending one.
   metachar_case 'jammi-w*' $'jammi-seed\njammi-www\njammi-w*\n' 'jammi-www'
   # `[` — an unbalanced bracket is an INVALID BRE: grep exits 2 printing
-  # nothing, so `other` came back empty and every session on the pod
-  # vanished from the gate's view at once.
+  # nothing, so `other` comes back empty and every session on the pod
+  # vanishes from the gate's view at once.
   metachar_case 'jammi-a[b' $'jammi-seed\njammi-other\njammi-a[b\n' 'jammi-other'
   # Prefix collision (regression pin for the `-x` whole-line anchor, which
   # `-F` must not silently drop): `jammi-abc` may never exclude `jammi-abcd`.
@@ -2086,7 +2074,7 @@ done < "$G10A_RESULTS"
 
 # --- 10b-10e: `run`'s own dispatch, SSH-mocked (call order: #1 liveness,
 # #2 target preflight OK, #3 concurrency preflight, #4 job launch — unless
-# an override skips a step). The concurrency-preflight response is now
+# an override skips a step). The concurrency-preflight response is
 # `GPU_DEV_CONCURRENCY_STATE=<CLEAR|BUSY:<wave>:<session>>`.
 
 # --- 10b: cross-wave refuses, naming the wave -----------------------------
@@ -2129,7 +2117,7 @@ fi
 G10D_DIR="$SANDBOX/g10d-ssh"; mkdir -p "$G10D_DIR"
 write_ssh_resp "$G10D_DIR" 1 0
 write_ssh_resp "$G10D_DIR" 2 0 "GPU_DEV_TARGET_STATE=OK"
-write_ssh_resp "$G10D_DIR" 3 0 "started"                       # the job-launch call, now #3
+write_ssh_resp "$G10D_DIR" 3 0 "started"                       # the job-launch call, #3
 rm -f "$SANDBOX/g10d-counter"
 MOCK_SSH_CALL_COUNTER="$SANDBOX/g10d-counter" MOCK_SSH_RESPONSES_DIR="$G10D_DIR" \
   RP_ALLOW_CONCURRENT=1 \
@@ -2142,8 +2130,7 @@ else
 fi
 
 # --- 10e: default-wave (unset --wave/RP_WAVE) resolves to the TREE name —
-# a regression pin on 8515cbb9's tree-scoped semantics: a caller who opts
-# into NOTHING new must still get exactly the old behavior. Uses a
+# a caller who passes no wave gets tree-scoped semantics exactly. Uses a
 # CAPTURING ssh stub (distinct from WAITBIN, which discards its stdin) so
 # the test can inspect the ACTUAL text `run` generated for the concurrency
 # preflight — proving the embedded own-wave value really is the tree name
@@ -2178,7 +2165,7 @@ MOCK_SSH_CALL_COUNTER="$SANDBOX/g10e-counter" MOCK_SSH_RESPONSES_DIR="$G10E_DIR"
   PATH="$G10E_CAPTUREBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
   >"$SANDBOX/out-g10e.log" 2>&1
 if [ -f "$G10E_CAPTURE_DIR/3" ] && grep -qF "= 'jammi-ai'" "$G10E_CAPTURE_DIR/3"; then
-  ok "run (one-pod-per-wave): default --wave/RP_WAVE resolves to the tree name ('jammi-ai') -- 8515cbb9's tree-scoped default is preserved exactly"
+  ok "run (one-pod-per-wave): default --wave/RP_WAVE resolves to the tree name ('jammi-ai') -- the tree-scoped default"
 else
   bad "run (one-pod-per-wave): expected the concurrency preflight's generated text to compare against wave 'jammi-ai' by default: $(cat "$G10E_CAPTURE_DIR/3" 2>/dev/null || echo '<no call #3 captured>')"
 fi
@@ -2188,16 +2175,14 @@ fi
 # rp_job_wrapper_with_marker_lines substitution. An unquoted heredoc body
 # also performs COMMAND SUBSTITUTION on backticks, so a backticked word in
 # the body's own PROSE (a comment reading "first `run` for this
-# tree/session") was executed ON THE LAPTOP on every single `run`: bash
-# printed "gpu-dev.sh: line <n>: run: command not found" to stderr and
-# spliced the word out of the text that actually reached the pod. Observed
-# live during the sm_86/89/90 proof run. Harmless in that one instance only
-# because the substituted word happened to name no real command — the
-# defect is live command substitution over arbitrary prose, which is a
-# property of the heredoc, not of which word sat inside the backticks.
-# Asserted on the EMITTED text (capture #4, the job-launch call), not on
-# the source file: escaping in the source is the fix, but "the backtick
-# survives to the pod" is the invariant.
+# tree/session") would execute ON THE LAPTOP on every single `run`: bash
+# prints "gpu-dev.sh: line <n>: run: command not found" to stderr and
+# splices the word out of the text that actually reaches the pod. The
+# defect is live command substitution over arbitrary prose, a property of
+# the heredoc, not of which word sits inside the backticks. Asserted on the
+# EMITTED text (capture #4, the job-launch call), not on the source file:
+# escaping in the source is the mechanism, but "the backtick survives to
+# the pod" is the invariant.
 if [ -f "$G10E_CAPTURE_DIR/4" ] \
   && grep -qF 'first `run` for this tree/session' "$G10E_CAPTURE_DIR/4" \
   && ! grep -q 'command not found' "$SANDBOX/out-g10e.log"; then
@@ -2207,15 +2192,14 @@ else
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
-# Group 11 (deployment-gap fix, folded into esc-077) — `target` must ship
-# THIS checkout's OWN pod-side scripts before executing them, never rely on
-# the pod's bootstrapped /root/jammi-ai copies (which predate esc-077 on
-# any pod booted before this PR merges, and would regress the same way any
-# time the pod tree lags the caller). rsync's own wire protocol cannot be
+# Group 11 (target ships its scripts) — `target` must ship THIS checkout's
+# OWN pod-side scripts before executing them, never rely on the pod's
+# bootstrapped /root/jammi-ai copies (which lag the caller whenever the pod
+# was booted from an older tree). rsync's own wire protocol cannot be
 # answered by the canned-text `ssh` stub the rest of this suite uses (it is
 # a real bidirectional handshake, not a single request/response) — instead
 # a fake `rsync` binary on PATH records its OWN argv, which is exactly the
-# observable this fix is about: did `target` ship this checkout's LOCAL
+# observable that matters: did `target` ship this checkout's LOCAL
 # file paths, not merely "did some rsync happen".
 # ═════════════════════════════════════════════════════════════════════════
 G11_SESSION="g11target"; write_meta "$G11_SESSION" "pod-g11target" "8"
@@ -2243,14 +2227,14 @@ if grep -qF "$DIR/pod_target_clone.sh" "$G11_RSYNC_CALLS" \
   && grep -qF "$DIR/pod_provision_cutlass.sh" "$G11_RSYNC_CALLS" \
   && grep -qF "$DIR/pod_push_stamp.sh" "$G11_RSYNC_CALLS" \
   && grep -qF "/root/.jammi-caller-scripts/" "$G11_RSYNC_CALLS"; then
-  ok "target (deployment-gap fix): stages THIS checkout's own 4 pod-side scripts (never the pod's bootstrapped /root/jammi-ai copies) before executing them"
+  ok "target: stages THIS checkout's own 4 pod-side scripts (never the pod's bootstrapped /root/jammi-ai copies) before executing them"
 else
-  bad "target (deployment-gap fix): expected an rsync call shipping this checkout's own pod_target_clone.sh/pod_seed_target.sh/pod_provision_cutlass.sh/pod_push_stamp.sh to /root/.jammi-caller-scripts/ (rc=$g11_rc); rsync calls: $(cat "$G11_RSYNC_CALLS" 2>/dev/null); out: $(cat "$SANDBOX/out-g11.log")"
+  bad "target: expected an rsync call shipping this checkout's own pod_target_clone.sh/pod_seed_target.sh/pod_provision_cutlass.sh/pod_push_stamp.sh to /root/.jammi-caller-scripts/ (rc=$g11_rc); rsync calls: $(cat "$G11_RSYNC_CALLS" 2>/dev/null); out: $(cat "$SANDBOX/out-g11.log")"
 fi
 if [ "$g11_rc" -eq 0 ] && [ "$(cat "$SANDBOX/g11-counter" 2>/dev/null)" = "2" ]; then
-  ok "target (deployment-gap fix): the staging rsync precedes the clone call, which still runs (exactly 2 ssh calls: liveness + clone)"
+  ok "target: the staging rsync precedes the clone call, which still runs (exactly 2 ssh calls: liveness + clone)"
 else
-  bad "target (deployment-gap fix): expected rc=0 and exactly 2 ssh calls after staging (got rc=$g11_rc, calls=$(cat "$SANDBOX/g11-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g11.log")"
+  bad "target: expected rc=0 and exactly 2 ssh calls after staging (got rc=$g11_rc, calls=$(cat "$SANDBOX/g11-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g11.log")"
 fi
 
 # --- 11b: --with-cutlass ALSO executes from the staged copy, not
@@ -2267,16 +2251,16 @@ MOCK_SSH_CALL_COUNTER="$SANDBOX/g11b-counter" MOCK_SSH_RESPONSES_DIR="$G11B_DIR"
 g11b_rc=$?
 if [ "$g11b_rc" -eq 0 ] && [ "$(cat "$SANDBOX/g11b-counter" 2>/dev/null)" = "3" ] \
   && grep -qF "$DIR/pod_provision_cutlass.sh" "$G11_RSYNC_CALLS"; then
-  ok "target --with-cutlass (deployment-gap fix): also stages + runs pod_provision_cutlass.sh from the staged copy (3 ssh calls: liveness + clone + cutlass)"
+  ok "target --with-cutlass: also stages + runs pod_provision_cutlass.sh from the staged copy (3 ssh calls: liveness + clone + cutlass)"
 else
-  bad "target --with-cutlass (deployment-gap fix): expected rc=0, exactly 3 ssh calls, and a staged pod_provision_cutlass.sh (got rc=$g11b_rc, calls=$(cat "$SANDBOX/g11b-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g11b.log")"
+  bad "target --with-cutlass: expected rc=0, exactly 3 ssh calls, and a staged pod_provision_cutlass.sh (got rc=$g11b_rc, calls=$(cat "$SANDBOX/g11b-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g11b.log")"
 fi
 
 # --- 11c: `target --adopt` — the executable remedy `run`'s UNMARKED_WARM
 # refusal names — stages the same scripts and then invokes pod_target_clone.sh
 # with --adopt against THIS tree's own target dir. It must never attempt a
 # clone: the dir it is being pointed at already exists, which a clone
-# refuses outright (that refusal is what left the operator stuck).
+# refuses outright.
 G11C_CAPTUREBIN="$SANDBOX/g11c-capturebin"; mkdir -p "$G11C_CAPTUREBIN"
 G11C_CAPTURE_DIR="$SANDBOX/g11c-capture"; mkdir -p "$G11C_CAPTURE_DIR"
 cat > "$G11C_CAPTUREBIN/ssh" <<STUB

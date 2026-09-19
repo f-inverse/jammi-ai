@@ -1197,35 +1197,19 @@ fn bert_head64_eval_output_is_bit_identical_regardless_of_fused_eligibility() {
 /// BOTH counters.
 #[test]
 fn bert_head64_disabling_attention_block_and_softmax_forces_eager_in_a_fresh_process() {
-    let exe = std::env::current_exe().expect("test binary path");
-    let output = std::process::Command::new(exe)
-        .args([
-            "bert::bert_head64_disabled_attention_block_and_softmax_child_process_body",
-            "--exact",
-            "--nocapture",
-            "--ignored",
-        ])
-        .env(
-            "JAMMI_KERNELS_DISABLE",
-            "attention_block_fused,softmax_last_dim_fused",
-        )
-        .output()
-        .expect("spawn child test binary");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "child process assertion failed: stdout={stdout}\nstderr={}",
-        String::from_utf8_lossy(&output.stderr)
+    let mut child = jammi_test_resources::child_test(
+        "bert::bert_head64_disabled_attention_block_and_softmax_child_process_body",
     );
-    assert!(
-        stdout.contains("1 passed"),
-        "the child process must have actually run (and passed) exactly one test -- \
-         stdout={stdout}"
+    child.env(
+        "JAMMI_KERNELS_DISABLE",
+        "attention_block_fused,softmax_last_dim_fused",
     );
+    jammi_test_resources::child_test_stdout(&mut child);
 }
 
+/// The body [`bert_head64_disabling_attention_block_and_softmax_forces_eager_in_a_fresh_process`] runs in its own process.
 #[test]
-#[ignore]
+#[ignore = "child process of bert_head64_disabling_attention_block_and_softmax_forces_eager_in_a_fresh_process"]
 fn bert_head64_disabled_attention_block_and_softmax_child_process_body() {
     let device = Device::Cpu;
     let mut bert = build_frozen_bert_head64(&device);
@@ -1257,32 +1241,16 @@ fn bert_head64_disabled_attention_block_and_softmax_child_process_body() {
 /// `gelu_erf_fused` alone.
 #[test]
 fn bert_head64_disabling_gelu_erf_fused_forces_eager_in_a_fresh_process() {
-    let exe = std::env::current_exe().expect("test binary path");
-    let output = std::process::Command::new(exe)
-        .args([
-            "bert::bert_head64_disabled_gelu_erf_fused_child_process_body",
-            "--exact",
-            "--nocapture",
-            "--ignored",
-        ])
-        .env("JAMMI_KERNELS_DISABLE", "gelu_erf_fused")
-        .output()
-        .expect("spawn child test binary");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "child process assertion failed: stdout={stdout}\nstderr={}",
-        String::from_utf8_lossy(&output.stderr)
+    let mut child = jammi_test_resources::child_test(
+        "bert::bert_head64_disabled_gelu_erf_fused_child_process_body",
     );
-    assert!(
-        stdout.contains("1 passed"),
-        "the child process must have actually run (and passed) exactly one test -- \
-         stdout={stdout}"
-    );
+    child.env("JAMMI_KERNELS_DISABLE", "gelu_erf_fused");
+    jammi_test_resources::child_test_stdout(&mut child);
 }
 
+/// The body [`bert_head64_disabling_gelu_erf_fused_forces_eager_in_a_fresh_process`] runs in its own process.
 #[test]
-#[ignore]
+#[ignore = "child process of bert_head64_disabling_gelu_erf_fused_forces_eager_in_a_fresh_process"]
 fn bert_head64_disabled_gelu_erf_fused_child_process_body() {
     let device = Device::Cpu;
     let mut bert = build_frozen_bert_head64(&device);

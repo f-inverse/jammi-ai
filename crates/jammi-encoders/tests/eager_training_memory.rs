@@ -890,10 +890,6 @@ fn total_drop_mib(outcome: &LegOutcome) -> Option<f64> {
     Some(trace[0] - trace[trace.len() - 1])
 }
 
-#[test]
-#[ignore = "esc-076 pre-fix RED reproduction (unbucketed eager growth) -- \
-            run explicitly by fix-verifier with --ignored, not part of the \
-            default green suite; see this fn's own doc"]
 /// The [`VARIABLE_SHAPE_SEQS`] cycle that runs out of memory unbucketed,
 /// with each step's raw length first truncated to
 /// [`VARIABLE_SHAPE_BUCKET_CAP`] (`REFERENCE_SEQ`, as the trainer's

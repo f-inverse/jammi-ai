@@ -2713,18 +2713,22 @@ mod tests {
         assert!(device_is_supported(&Device::Cpu));
     }
 
+    /// `admission_mode` memoizes into a process-wide `OnceLock`, so the default
+    /// is observed in a fresh process with `JAMMI_KERNELS_STRICT` removed.
     #[test]
     fn admission_mode_defaults_to_fallback_without_the_env_var() {
-        // `admission_mode` memoizes into a process-wide `OnceLock`, so this
-        // only asserts the DEFAULT value observed by a fresh process (no
-        // other test in this binary sets `JAMMI_KERNELS_STRICT` before this
-        // one runs — `cargo test`'s default per-test-thread model still
-        // shares one process-wide env and one `OnceLock`, so this is a
-        // documentation-level assertion about the default, not a hermetic
-        // unit test of the env-var branch itself).
-        if std::env::var_os("JAMMI_KERNELS_STRICT").is_none() {
-            assert_eq!(admission_mode(), AdmissionMode::Fallback);
-        }
+        let mut child = jammi_test_resources::child_test(
+            "admission::tests::admission_mode_default_child_process_body",
+        );
+        child.env_remove("JAMMI_KERNELS_STRICT");
+        jammi_test_resources::child_test_stdout(&mut child);
+    }
+
+    /// The body [`admission_mode_defaults_to_fallback_without_the_env_var`] runs in its own process.
+    #[test]
+    #[ignore = "child process of admission_mode_defaults_to_fallback_without_the_env_var"]
+    fn admission_mode_default_child_process_body() {
+        assert_eq!(admission_mode(), AdmissionMode::Fallback);
     }
 
     /// Kills the `cargo mutants` mutant `replace admission_mode ->
@@ -2750,52 +2754,21 @@ mod tests {
     /// `JAMMI_KERNELS_DISABLE`.
     #[test]
     fn admission_mode_reads_strict_from_the_real_env_var_in_a_fresh_process() {
-        let exe = std::env::current_exe().expect("test binary path");
-        let output = std::process::Command::new(exe)
-            .args([
-                "admission::tests::admission_mode_child_process_body",
-                "--exact",
-                "--nocapture",
-            ])
-            .env("JAMMI_KERNELS_STRICT", "1")
-            .env("ADMISSION_MODE_CHILD", "1")
-            .output()
-            .expect("spawn child test binary");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "child process assertion failed: stdout={stdout}\nstderr={}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        // Non-vacuity: `cargo test`'s libtest harness exits 0 on a filter
-        // that matches ZERO tests (a typo'd `--exact` path, or a module
-        // rename that silently stops matching, would make this test
-        // "pass" having run NOTHING). Asserting the child actually ran and
-        // passed exactly the one test it was told to run is what makes
-        // `output.status.success()` alone mean what this test claims it
-        // means.
-        assert!(
-            stdout.contains("1 passed"),
-            "the child process must have actually run (and passed) exactly one test — \
-             stdout={stdout}"
-        );
+        let mut child =
+            jammi_test_resources::child_test("admission::tests::admission_mode_child_process_body");
+        child.env("JAMMI_KERNELS_STRICT", "1");
+        jammi_test_resources::child_test_stdout(&mut child);
     }
 
-    /// Only meaningful inside the child process
-    /// [`admission_mode_reads_strict_from_the_real_env_var_in_a_fresh_process`]
-    /// spawns (guarded on `ADMISSION_MODE_CHILD`, the same pattern
-    /// `admission_mode_defaults_to_fallback_without_the_env_var` uses for
-    /// the unset case) — a no-op pass when run directly by the ordinary
-    /// test harness.
+    /// The body [`admission_mode_reads_strict_from_the_real_env_var_in_a_fresh_process`] runs in its own process.
     #[test]
+    #[ignore = "child process of admission_mode_reads_strict_from_the_real_env_var_in_a_fresh_process"]
     fn admission_mode_child_process_body() {
-        if std::env::var_os("ADMISSION_MODE_CHILD").is_some() {
-            assert_eq!(
-                admission_mode(),
-                AdmissionMode::Strict,
-                "JAMMI_KERNELS_STRICT=1 in a fresh process must read as Strict"
-            );
-        }
+        assert_eq!(
+            admission_mode(),
+            AdmissionMode::Strict,
+            "JAMMI_KERNELS_STRICT=1 in a fresh process must read as Strict"
+        );
     }
 
     #[test]

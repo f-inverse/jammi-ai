@@ -2167,87 +2167,49 @@ mod tests {
     /// in this binary for who initializes the `OnceLock` first.
     #[test]
     fn layer_norm_forward_biased_strict_mode_surfaces_a_typed_error_in_a_fresh_process() {
-        let exe = std::env::current_exe().expect("test binary path");
-        let output = std::process::Command::new(exe)
-            .args([
-                "layer_norm::tests::layer_norm_forward_biased_strict_mode_child_process_body",
-                "--exact",
-                "--nocapture",
-            ])
-            .env("JAMMI_KERNELS_STRICT", "1")
-            .env("LN_FORWARD_STRICT_CHILD", "1")
-            .output()
-            .expect("spawn child test binary");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "child process assertion failed: stdout={stdout}\nstderr={}",
-            String::from_utf8_lossy(&output.stderr)
+        let mut child = jammi_test_resources::child_test(
+            "layer_norm::tests::layer_norm_forward_biased_strict_mode_child_process_body",
         );
-        // Non-vacuity: a filter matching zero tests still exits
-        // 0 — assert the child actually ran (and passed) exactly the one
-        // test it was told to run.
-        assert!(
-            stdout.contains("1 passed"),
-            "the child process must have actually run (and passed) exactly one test -- \
-             stdout={stdout}"
-        );
+        child.env("JAMMI_KERNELS_STRICT", "1");
+        jammi_test_resources::child_test_stdout(&mut child);
     }
 
-    /// Only meaningful inside the child process the test above spawns
-    /// (`LN_FORWARD_STRICT_CHILD` set) — a silent no-op otherwise, so a
-    /// stray direct `cargo test` run of this exact name (without the real
-    /// `JAMMI_KERNELS_STRICT=1` env var already having won the `OnceLock`
-    /// race) never produces a false pass OR a false fail.
+    /// The body [`layer_norm_forward_biased_strict_mode_surfaces_a_typed_error_in_a_fresh_process`] runs in its own process.
     #[test]
+    #[ignore = "child process of layer_norm_forward_biased_strict_mode_surfaces_a_typed_error_in_a_fresh_process"]
     fn layer_norm_forward_biased_strict_mode_child_process_body() {
-        // Positive-condition guard, no early `return` — mirrors
-        // `jammi_kernels::admission::tests::admission_mode_child_process_body`'s
-        // exact idiom (a stray direct run of this exact test name outside
-        // the child process above is then simply a no-op assertion-free
-        // pass, never a false failure).
-        if std::env::var_os("LN_FORWARD_STRICT_CHILD").is_some() {
-            // The sole test running in this spawned child process (no real
-            // contention), but the assertion at `forward_fused_or_fallback`'s
-            // own `admit()` call site is unconditional — it does
-            // not know this process holds no other test, only whether this
-            // thread holds the lock.
-            let _lock = crate::test_support::seam_counter_lock();
-            let device = Device::Cpu;
-            let hidden = 8;
-            let x = Tensor::from_slice(&[0.1f32; 8], (1, hidden), &device).unwrap();
-            let weight = Tensor::from_slice(&[1.0f32; 8], (hidden,), &device).unwrap();
-            // Mismatched dtype vs x/weight (bf16 bias against an F32
-            // x/weight pair) fails the fused domain predicate
-            // (`dtype_f32_bf16_or_f16_matching_between_x_and_bias`); in
-            // Strict mode that failure must surface as a typed error
-            // through `forward()` itself rather than silently falling
-            // back to `slow()`.
-            let bias_bf16 =
-                Tensor::from_slice(&[bf16::from_f32(0.2); 8], (hidden,), &device).unwrap();
-            let (holds, predicate) = fused_admission_predicate_biased(&x, &weight, &bias_bf16);
-            assert!(!holds, "fixture must actually fail the domain: {predicate}");
+        let _lock = crate::test_support::seam_counter_lock();
+        let device = Device::Cpu;
+        let hidden = 8;
+        let x = Tensor::from_slice(&[0.1f32; 8], (1, hidden), &device).unwrap();
+        let weight = Tensor::from_slice(&[1.0f32; 8], (hidden,), &device).unwrap();
+        // Mismatched dtype vs x/weight (bf16 bias against an F32
+        // x/weight pair) fails the fused domain predicate
+        // (`dtype_f32_bf16_or_f16_matching_between_x_and_bias`); in
+        // Strict mode that failure must surface as a typed error
+        // through `forward()` itself rather than silently falling
+        // back to `slow()`.
+        let bias_bf16 = Tensor::from_slice(&[bf16::from_f32(0.2); 8], (hidden,), &device).unwrap();
+        let (holds, predicate) = fused_admission_predicate_biased(&x, &weight, &bias_bf16);
+        assert!(!holds, "fixture must actually fail the domain: {predicate}");
 
-            let mut ln = LayerNorm {
-                weight,
-                bias: Some(bias_bf16),
-                eps: 1e-5,
-                training: true,
-            };
-            ln.set_training(true);
-            let err = ln
-                .forward(&x)
-                .expect_err("Strict mode must error on a failed predicate, not silently fall back");
-            assert!(
-                matches!(
-                    err,
-                    EncoderError::Kernel(
-                        jammi_kernels::error::KernelError::StrictModeFallback { .. }
-                    )
-                ),
-                "expected a typed StrictModeFallback wrapped in EncoderError::Kernel, got {err:?}"
-            );
-        }
+        let mut ln = LayerNorm {
+            weight,
+            bias: Some(bias_bf16),
+            eps: 1e-5,
+            training: true,
+        };
+        ln.set_training(true);
+        let err = ln
+            .forward(&x)
+            .expect_err("Strict mode must error on a failed predicate, not silently fall back");
+        assert!(
+            matches!(
+                err,
+                EncoderError::Kernel(jammi_kernels::error::KernelError::StrictModeFallback { .. })
+            ),
+            "expected a typed StrictModeFallback wrapped in EncoderError::Kernel, got {err:?}"
+        );
     }
 
     /// The admission/counter key this crate dispatches a fused path under

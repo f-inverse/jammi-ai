@@ -92,10 +92,10 @@ mod length_and_domain_tests {
     use super::*;
     use crate::query::{validate_query, QuerySource, ValidatedQuery};
 
-    /// A test query validated with no width in hand — so the kernel's own
-    /// width assert is the line under test.
+    /// A test query validated at the literal's own width — so against a
+    /// vector of another width the kernel's own assert is the line under test.
     fn vq(v: &[f32]) -> ValidatedQuery {
-        validate_query(v.to_vec(), None, QuerySource::Caller).unwrap()
+        validate_query(v.to_vec(), v.len(), QuerySource::Caller).unwrap()
     }
 
     /// A length mismatch is REFUSED, in every build profile. The loop reads

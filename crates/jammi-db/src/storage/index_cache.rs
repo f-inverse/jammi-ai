@@ -177,10 +177,11 @@ mod tests {
     use super::*;
     use crate::index::{validate_query, QuerySource, ValidatedQuery};
 
-    /// A test query: validated (finite) with no width in hand — the index or
-    /// scan it meets enforces the width.
+    /// A test query validated at the literal's own width — the width of the
+    /// vectors the test puts it against; an index or scan of another width
+    /// refuses it as its own artifact's mismatch.
     fn vq(v: &[f32]) -> ValidatedQuery {
-        validate_query(v.to_vec(), None, QuerySource::Caller).unwrap()
+        validate_query(v.to_vec(), v.len(), QuerySource::Caller).unwrap()
     }
 
     use crate::index::sidecar::SidecarIndex;

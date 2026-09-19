@@ -334,6 +334,10 @@ impl<'a> NeighborGraphPipeline<'a> {
             .await
             .map_err(JammiError::from)?;
 
+        // Every node vector is a STORED query; the table's force-local
+        // authority (this build never fans out) is what each is checked
+        // against before any driver reads it.
+        let width = self.result_store.query_width_local(ctx, table).await?;
         let mut nodes = Vec::new();
         for batch in &batches {
             let row_ids = read_row_id_column(batch, &table.table_name)?;
@@ -344,7 +348,6 @@ impl<'a> NeighborGraphPipeline<'a> {
                 "vector",
                 &mut vectors,
             )?;
-            let width = table.dimensions().map(std::num::NonZeroUsize::get);
             for (i, vector) in vectors.into_iter().enumerate() {
                 let vector = validate_query(
                     vector,
@@ -675,7 +678,7 @@ mod emit_edges_tests {
     fn node(id: &str) -> Node {
         Node {
             row_id: id.into(),
-            vector: validate_query(vec![1.0, 0.0], None, QuerySource::Caller).unwrap(),
+            vector: validate_query(vec![1.0, 0.0], 2, QuerySource::Caller).unwrap(),
         }
     }
 

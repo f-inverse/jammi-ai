@@ -158,7 +158,7 @@ impl HardNegativeMiner {
         // backend error string or a panic.
         let anchor_query = validate_query(
             anchor.embedding.clone(),
-            Some(self.index.dimensions()),
+            self.index.dimensions(),
             QuerySource::Caller,
         )?;
         let neighbours = self.index.search(&anchor_query, fetch)?;
@@ -202,7 +202,7 @@ impl HardNegativeMiner {
                 // Read back from the miner's own index: STORED provenance.
                 let vector = validate_query(
                     vector,
-                    Some(self.index.dimensions()),
+                    self.index.dimensions(),
                     QuerySource::Stored {
                         table: "hard-negative candidates".into(),
                     },

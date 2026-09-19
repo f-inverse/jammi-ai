@@ -733,7 +733,7 @@ mod tests {
     #[test]
     fn query_finiteness_refusal_codes_follow_provenance() {
         use jammi_db::index::{validate_query, QuerySource};
-        let caller: JammiError = validate_query(vec![f32::NAN], None, QuerySource::Caller)
+        let caller: JammiError = validate_query(vec![f32::NAN], 1, QuerySource::Caller)
             .unwrap_err()
             .into();
         let status = map_engine_error(caller);
@@ -746,7 +746,7 @@ mod tests {
         ));
         let stored: JammiError = validate_query(
             vec![f32::NAN],
-            None,
+            1,
             QuerySource::Stored {
                 table: "docs_embeddings".into(),
             },

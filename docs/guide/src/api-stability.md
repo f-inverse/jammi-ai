@@ -170,15 +170,26 @@ Breaking changes to this surface in the current release:
   `query_vector` field), and `jammi_ai::pipeline::neighbor_graph::Node`'s
   `vector` field accept for a query vector.
   `jammi_db::index::segment::verify_query_width` (a free `pub fn`) is
-  **removed** with no replacement — its check is now
-  `ValidatedQuery::require_width`/`require_authority_width`, methods on the
-  type itself, not a function a caller could import.
-  Construct a `ValidatedQuery` with `jammi_db::index::validate_query(values,
-  expected_width, source)` (re-exported from `jammi_numerics::query`, along
-  with the new `jammi_numerics::query::QueryValidationError` error type),
-  where `source` is a `jammi_db::index::QuerySource::{Caller, Stored {
-  table }}`. Its inherent methods are `as_slice`, `into_inner`, `source`, and
-  the two width checks below.
+  **removed** with no replacement — its check is
+  `ValidatedQuery::require_width`, a method on the type itself, not a
+  function a caller could import.
+  A query has two checked states (both re-exported from
+  `jammi_numerics::query` by `jammi_db::index`, along with the
+  `QueryValidationError` error type): `FiniteQuery::new(values, source)`
+  checks finiteness and yields a width-UNCHECKED query that exposes no
+  component, length or slice and that no consumer accepts;
+  `FiniteQuery::against_authority(width)` is its one transition to a
+  `ValidatedQuery`; and `validate_query(values, width, source)` composes the
+  two for an entry that holds its authority up front. `width` is a `usize`,
+  never optional — there is no width-less path to a `ValidatedQuery`.
+  `source` is a `jammi_db::index::QuerySource::{Caller, Stored { table }}`.
+  `ValidatedQuery`'s inherent methods are `as_slice`, `into_inner`, `source`
+  and `require_width`. The width authority for a result table is
+  `jammi_db::store::ResultStore::{query_width, query_width_local}` (the
+  catalog's recorded width; for a row that records none, the width of the
+  index or scan a search of the table reads —
+  `PlacedIndex::query_width`, `SegmentedIndex::dimensions`,
+  `jammi_db::index::exact::scan_width`).
   `exact_vector_search` also gained a `catalog_dimensions: Option<usize>`
   parameter (a cross-check against the scan's own width; `None` when there is
   none on record). `jammi_db::index::peer::{SegmentSearchRequest,
@@ -200,30 +211,21 @@ Breaking changes to this surface in the current release:
   `enum` has no variant for (`ProtoEnumDecode::Unknown`) are no longer
   collapsed into one `None` — a caller that only needs "did this decode"
   calls the new `.known() -> Option<T>` to get the old behaviour back.
-- **Whose-fault a downstream width check assigns no longer depends on the
-  query's own provenance.** `ValidatedQuery::require_width` now takes an
-  `artifact: impl Into<String>` and returns a new error variant,
+- **Whose fault a width mismatch is depends on where it is found, and the
+  types decide which check that is.** `FiniteQuery::against_authority` is
+  the ENTRY check: it attributes a mismatch by the query's own provenance
+  (`QueryValidationError::Width { source, .. }` — `JammiError::Schema` for a
+  caller's vector, `IncompatibleFormat` naming the table for a stored one).
+  `ValidatedQuery::require_width` is the DOWNSTREAM check: it takes an
+  `artifact: impl Into<String>` and returns
   `QueryValidationError::ArtifactMismatch { artifact, expected, actual }`,
   which carries no `QuerySource` at all — a mismatch it finds is always
-  attributed to the named artifact, never the caller, because by the time a
-  query reaches any consumer an entry has already checked it once against an
-  authority it had in hand. FOUR call sites still attribute by the query's
-  own provenance (the placement entry's Mixed shape — one call site
-  covering both the all-remote branch and the branch with at least one
-  resident local segment — the placement entry's all-local shape,
-  `exact_vector_search`'s no-catalog-width fallback, and
-  `ResultStore::search_vectors_local`'s `Some(index)` branch, the
-  FORCE-LOCAL twin of the all-local shape), each checking a query with no
-  width in hand against the only authority available to that call; all
-  four use the new
-  `ValidatedQuery::require_authority_width` instead, which keeps the OLD
-  `require_width` behaviour under a name that says why it is different.
-  (Re-derive this count with
-  `grep -rn 'require_authority_width(' crates/*/src | grep -v query.rs`
-  rather than trusting this sentence.)
-  `QuerySource::source()` on `QueryValidationError` now returns
-  `Option<&QuerySource>` (`None` for `ArtifactMismatch`) rather than
-  `&QuerySource` unconditionally. `QuerySource` has exactly two variants,
+  attributed to the named artifact, never the caller. A `ValidatedQuery` has
+  no method that can express a caller fault and a `FiniteQuery` reaches no
+  consumer, so no search entry can skip the authority check or blame the
+  caller for an artifact's drift.
+  `QueryValidationError::source()` returns `Option<&QuerySource>` (`None`
+  for `ArtifactMismatch`). `QuerySource` has exactly two variants,
   `Caller` and `Stored` — the states a query's own provenance can actually
   be; an artifact mismatch is the dedicated `ArtifactMismatch` error variant
   above. `JammiError::Schema`

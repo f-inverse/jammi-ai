@@ -518,11 +518,7 @@ mod reader_class_allow_list {
             "edge_scan_sql",
             1,
         ),
-        (
-            "crates/jammi-db/src/index/exact.rs",
-            "exact_vector_search",
-            1,
-        ),
+        ("crates/jammi-db/src/index/exact.rs", "vector_scan", 1),
         ("crates/jammi-bench/src/search_rss.rs", "scan_only_drain", 1),
         (
             "crates/jammi-bench/src/search_rss.rs",

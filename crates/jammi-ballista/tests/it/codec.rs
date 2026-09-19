@@ -349,15 +349,18 @@ async fn ann_search_exec_round_trips() {
         .await
         .unwrap()
         .unwrap();
+    // A query-by-example vector: its provenance is part of what round-trips.
     let query = jammi_db::index::validate_query(
         vec![0.1, 0.2, 0.3, 0.4],
-        None,
-        jammi_db::index::QuerySource::Caller,
+        4,
+        jammi_db::index::QuerySource::Stored {
+            table: table_name.clone(),
+        },
     )
     .unwrap();
     let node = jammi_ai::operator::ann_search_exec::AnnSearchExec::new(
         table,
-        query,
+        query.clone(),
         5,
         Some(8),
         session.result_store(),
@@ -378,7 +381,7 @@ async fn ann_search_exec_round_trips() {
     assert_eq!(decoded.table().table_name, table_name);
     assert_eq!(decoded.k(), 5);
     assert_eq!(decoded.oversample_override(), Some(8));
-    assert_eq!(decoded.query_vector().as_slice(), &[0.1, 0.2, 0.3, 0.4]);
+    assert_eq!(decoded.query_vector(), &query);
 }
 
 /// `MaskExec` (a masked result-table scan) is the named v1 cut: neither
@@ -621,6 +624,7 @@ async fn ann_search_decode_refuses_another_tenants_table_and_a_tenant_free_read_
             query_vector: vec![0.1, 0.2, 0.3, 0.4],
             k: 5,
             oversample_override: None,
+            query_stored_table: None,
         };
         let mut buf = Vec::new();
         buf.extend_from_slice(&MAGIC);
@@ -715,26 +719,39 @@ async fn ann_search_decode_checks_width_against_the_catalog_authority_it_holds()
 
     // A 3-wide query against a table whose catalog width is 4 — no real
     // encoder would ever build this; it stands in for a peer that skipped
-    // its own `QueryBuilder::new` check.
-    let msg = pb::AnnSearchExecNode {
-        table_name: table_name.clone(),
-        tenant_id: None,
-        query_vector: vec![0.1, 0.2, 0.3],
-        k: 5,
-        oversample_override: None,
-    };
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&MAGIC);
-    buf.push(NodeTag::AnnSearch as u8);
-    msg.encode(&mut buf).unwrap();
+    // its own `QueryBuilder::new` check. The provenance it was encoded with
+    // decides the class on THIS process exactly as it would have there.
+    let refused =
+        |query_stored_table: Option<String>| {
+            let msg = pb::AnnSearchExecNode {
+                table_name: table_name.clone(),
+                tenant_id: None,
+                query_vector: vec![0.1, 0.2, 0.3],
+                k: 5,
+                oversample_override: None,
+                query_stored_table,
+            };
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&MAGIC);
+            buf.push(NodeTag::AnnSearch as u8);
+            msg.encode(&mut buf).unwrap();
+            let codec = JammiCodec::new(&session);
+            let ctx = session.context().task_ctx();
+            JammiError::from(codec.try_decode(&buf, &[], &ctx).expect_err(
+                "a 3-wide query against a catalog width of 4 must be refused at decode",
+            ))
+        };
 
-    let codec = JammiCodec::new(&session);
-    let ctx = session.context().task_ctx();
-    let err = codec
-        .try_decode(&buf, &[], &ctx)
-        .expect_err("a 3-wide query against a catalog width of 4 must be refused at decode");
+    let stored = refused(Some("docs_embeddings".into()));
+    assert!(
+        matches!(
+            &stored,
+            JammiError::IncompatibleFormat { artifact, .. } if artifact == "docs_embeddings.vector"
+        ),
+        "a stored query's width fault is its own table's, never the caller's — got {stored:?}"
+    );
 
-    let classified = JammiError::from(err);
+    let classified = refused(None);
     assert!(
         matches!(classified, JammiError::Schema { .. }),
         "expected the caller-fault Schema class (gRPC InvalidArgument), got {classified:?}"

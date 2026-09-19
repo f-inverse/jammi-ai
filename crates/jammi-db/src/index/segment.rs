@@ -147,9 +147,8 @@ pub fn search_unit(
     exact: &ExactLookup<'_>,
 ) -> Result<Vec<(String, f32)>> {
     // The index enforces the width itself inside `search`; checked here too
-    // so the `width == 0` early return cannot skip it. Downstream of the
-    // entry (`validate_query`'s own check, or the placement entry's
-    // `require_authority_width`), so a mismatch against this segment's OWN
+    // so the `width == 0` early return cannot skip it. `query` has already
+    // matched its authority, so a mismatch against this segment's OWN
     // declared width is that segment's drift, never the caller's —
     // `require_width` cannot express otherwise.
     query.require_width(index.dimensions(), format!("segment {}", segment.0))?;
@@ -364,11 +363,10 @@ impl SegmentedIndex {
     /// The embedding width every segment in this set was built at — read off
     /// the first segment. `new`/`new_masked` require at least one segment
     /// (never an empty set), so this is always available once a
-    /// `SegmentedIndex` exists; it is the set's own authority for a query
-    /// whose `expected_width` was deferred at construction (no catalog width
-    /// on record), the all-local twin of `exact_vector_search`'s
-    /// no-catalog-width fallback one layer up.
-    pub(crate) fn dimensions(&self) -> usize {
+    /// `SegmentedIndex` exists; it is the authority an entry validates a
+    /// query against when it searches this set and no catalog width is on
+    /// record.
+    pub fn dimensions(&self) -> usize {
         self.segments[0].index.dimensions()
     }
 
@@ -617,10 +615,11 @@ mod tests {
     use crate::config::AnnIndexConfig;
     use crate::index::{validate_query, QuerySource};
 
-    /// A test query: validated (finite) with no width in hand — the index or
-    /// scan it meets enforces the width.
+    /// A test query validated at the literal's own width — the width of the
+    /// vectors the test puts it against; an index or scan of another width
+    /// refuses it as its own artifact's mismatch.
     fn vq(v: &[f32]) -> ValidatedQuery {
-        validate_query(v.to_vec(), None, QuerySource::Caller).unwrap()
+        validate_query(v.to_vec(), v.len(), QuerySource::Caller).unwrap()
     }
 
     use crate::index::VectorIndex;

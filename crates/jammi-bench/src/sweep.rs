@@ -125,7 +125,7 @@ pub async fn run(
             exact_vector_search(
                 &ctx,
                 CORPUS_TABLE,
-                &validate_query(q.to_vec(), None, QuerySource::Caller)?,
+                &validate_query(q.to_vec(), dim, QuerySource::Caller)?,
                 max_k,
                 None,
             )
@@ -235,7 +235,7 @@ pub async fn run(
                 retrieve_then_rescore(&loaded, q, k, oversample.max(1))
             } else {
                 loaded.search(
-                    &validate_query(q.to_vec(), Some(loaded.dimensions()), QuerySource::Caller)?,
+                    &validate_query(q.to_vec(), loaded.dimensions(), QuerySource::Caller)?,
                     k,
                 )
             }
@@ -276,7 +276,7 @@ fn recall_and_qps(
 ) -> Result<(BTreeMap<usize, Measurement>, f64), Box<dyn std::error::Error>> {
     recall_and_qps_with(queries, exact, |q, k| {
         index.search(
-            &validate_query(q.to_vec(), Some(index.dimensions()), QuerySource::Caller)?,
+            &validate_query(q.to_vec(), index.dimensions(), QuerySource::Caller)?,
             k,
         )
     })

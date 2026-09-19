@@ -24,16 +24,26 @@
 //!   (its `list_index_segments` read can race a concurrent
 //!   `purge_segments`/append); the bundle's stamped precision not matching
 //!   the requested one (the segment cache's strict load); the query's width
-//!   not matching the loaded segment's own width (the coordinator
-//!   authoritatively enforces width against ITS OWN index or catalog row
-//!   before any fan-out, so a mismatch reported BY AN OWNER can only be this
-//!   owner's segment drifting from that authority — never the caller's
-//!   fault); an `ExactRescore` row id this owner's segment does not index
+//!   not matching a loaded segment's own width (see "The wire query" below);
+//!   an `ExactRescore` row id this owner's segment does not index
 //!   (this owner reloads its segment per RPC, so a rebuild between phases can
 //!   move ids out from under it); and a precision/phase enum raw value this
 //!   build's generated `enum` has no variant for but is non-zero (a value a
 //!   NEWER coordinator knows and this owner does not — rolling-upgrade
 //!   version skew, not malformation).
+//!
+//! **The wire query.** The vector a request carries arrives as a
+//! [`jammi_db::index::FiniteQuery`]: finiteness is checked at the edge, with
+//! nothing but the request consulted, so a non-finite component is the
+//! request's own malformation. Its WIDTH has no catalog authority here — an
+//! owner reads no `result_tables` row (I-PEER) — so the only width an owner
+//! holds is its own segments', and the query becomes a
+//! [`jammi_db::index::ValidatedQuery`] against the first requested segment it
+//! loads ([`admit_query`]). The coordinator validated the query against the
+//! table's authority (its catalog row, or its own resident segment) before
+//! any fan-out, so a disagreement found HERE — with that first segment or
+//! any later one — is this owner's segment drifting from that authority:
+//! own-data, `FAILED_PRECONDITION`, never the caller's fault.
 //!
 //! It then runs the same pure kernels a single node runs
 //! ([`jammi_db::index::segment::search_unit`] / [`rescore`]) per segment and
@@ -53,7 +63,9 @@ use jammi_db::config::StoragePrecision;
 use jammi_db::error::JammiError;
 use jammi_db::index::segment::{rescore, search_unit};
 use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::{validate_query, QuerySource, SegmentId, SegmentSearchPhase};
+use jammi_db::index::{
+    FiniteQuery, QuerySource, QueryValidationError, SegmentId, SegmentSearchPhase, ValidatedQuery,
+};
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::ResultStore;
 use jammi_wire::peer::{phase_from_proto, precision_from_proto, ProtoEnumDecode};
@@ -115,6 +127,54 @@ impl PeerServer {
                 other => map_engine_error(other),
             })
     }
+
+    /// Run `each` over every requested segment in request order, loading
+    /// each through [`Self::load`] and holding one at a time. The wire query
+    /// is admitted against the FIRST segment loaded ([`admit_query`]) and
+    /// width-checked against every one before `each` sees it, so a width
+    /// disagreement is own-data and never reaches a kernel.
+    async fn over_segments<P, T>(
+        store: &ResultStore,
+        table_name: &str,
+        segments: &[IndexSegment],
+        precision: StoragePrecision,
+        query: FiniteQuery,
+        requested: Vec<(i64, P)>,
+        each: impl Fn(i64, P, &SidecarIndex, &ValidatedQuery) -> Result<T, Status>,
+    ) -> Result<Vec<T>, Status> {
+        let load = |id: i64| async move {
+            Self::load(
+                store,
+                table_name,
+                segment(table_name, segments, id)?,
+                precision,
+            )
+            .await
+        };
+        let checked = |id: i64, payload: P, index: &SidecarIndex, query: &ValidatedQuery| {
+            verify_query_width(table_name, id, query, index)?;
+            each(id, payload, index, query)
+        };
+        let mut requested = requested.into_iter();
+        let Some((first_id, first_payload)) = requested.next() else {
+            return Err(none_named(table_name));
+        };
+        let first = load(first_id).await?;
+        let query = admit_query(table_name, first_id, query, &first)?;
+        let mut out = Vec::with_capacity(requested.len() + 1);
+        out.push(checked(first_id, first_payload, &first, &query)?);
+        drop(first);
+        for (id, payload) in requested {
+            out.push(checked(id, payload, &load(id).await?, &query)?);
+        }
+        Ok(out)
+    }
+}
+
+/// A request that names no segment — request malformation,
+/// `INVALID_ARGUMENT`.
+fn none_named(table_name: &str) -> Status {
+    Status::invalid_argument(format!("no segment of table '{table_name}' was named"))
 }
 
 /// Every requested id must be named once and at least one must be named
@@ -130,9 +190,7 @@ fn verify_membership(
     segments: &[IndexSegment],
 ) -> Result<(), Status> {
     if requested.is_empty() {
-        return Err(Status::invalid_argument(format!(
-            "no segment of table '{table_name}' was named"
-        )));
+        return Err(none_named(table_name));
     }
     let mut seen = std::collections::BTreeSet::new();
     for id in requested {
@@ -150,29 +208,59 @@ fn verify_membership(
     Ok(())
 }
 
+/// The request's vector as a [`FiniteQuery`] — the owner's edge. A
+/// non-finite component is `INVALID_ARGUMENT` (a coordinator that sent it
+/// missed its own check), never a torn bundle.
+fn finite_query(values: Vec<f32>) -> Result<FiniteQuery, Status> {
+    FiniteQuery::new(values, QuerySource::Caller).map_err(|e| map_engine_error(e.into()))
+}
+
+/// A width disagreement between the wire query and one of this owner's
+/// segments — own-data, `FAILED_PRECONDITION` (see the module docs' "The
+/// wire query"), whichever check found it.
+fn width_drift(table_name: &str, segment_id: i64, e: QueryValidationError) -> Status {
+    match e {
+        QueryValidationError::Width {
+            expected, actual, ..
+        }
+        | QueryValidationError::ArtifactMismatch {
+            expected, actual, ..
+        } => Status::failed_precondition(format!(
+            "query has width {actual} but segment {table_name}/{segment_id} has width {expected}"
+        )),
+        non_finite @ QueryValidationError::NonFinite { .. } => {
+            map_engine_error(JammiError::from(non_finite))
+        }
+    }
+}
+
+/// The wire query's one transition at this owner: checked against the first
+/// requested segment it loaded — the only width an owner holds.
+fn admit_query(
+    table_name: &str,
+    segment_id: i64,
+    query: FiniteQuery,
+    first: &SidecarIndex,
+) -> Result<ValidatedQuery, Status> {
+    query
+        .against_authority(first.dimensions())
+        .map_err(|e| width_drift(table_name, segment_id, e))
+}
+
 /// The query must be exactly as wide as the segment it is searched against:
 /// a longer query would index past the stored vector in `cosine_distance`
 /// (a panic), a shorter one would be silently scored over a prefix. Checked
-/// BEFORE any kernel runs, against the loaded segment's own width. The
-/// coordinator authoritatively enforces width against its own local index or
-/// the catalog's recorded `dimensions` before ANY fan-out, so a mismatch
-/// reported BY AN OWNER can only mean this owner's segment has drifted from
-/// that authority — own-data, `FAILED_PRECONDITION`, never the caller's
-/// fault.
+/// BEFORE any kernel runs, against the loaded segment's own width, so a
+/// mismatch is never mistaken for a torn bundle.
 fn verify_query_width(
     table_name: &str,
     segment_id: i64,
-    query: &[f32],
+    query: &ValidatedQuery,
     index: &SidecarIndex,
 ) -> Result<(), Status> {
-    if query.len() != index.dimensions() {
-        return Err(Status::failed_precondition(format!(
-            "query has width {} but segment {table_name}/{segment_id} has width {}",
-            query.len(),
-            index.dimensions()
-        )));
-    }
-    Ok(())
+    query
+        .require_width(index.dimensions(), format!("segment {segment_id}"))
+        .map_err(|e| width_drift(table_name, segment_id, e))
 }
 
 /// Every row id an `ExactRescore` names must be named once (request
@@ -279,35 +367,31 @@ impl PeerService for PeerServer {
         let phase = decode_phase(req.phase)?;
         let width = usize::try_from(req.width)
             .map_err(|_| Status::invalid_argument("width does not fit usize"))?;
-        // The wire vector becomes a `ValidatedQuery` HERE, at the owner's
-        // edge, as a CALLER's vector: a non-finite component is
-        // `INVALID_ARGUMENT` (a coordinator that sent it missed its own check),
-        // never a torn bundle. The width is enforced per segment below.
-        let query = validate_query(req.query.clone(), None, QuerySource::Caller)
-            .map_err(|e| map_engine_error(JammiError::from(e)))?;
+        let finite = finite_query(req.query)?;
         let store = self.session.result_store();
         let segments = self.segments_of(&store, &req.table_name).await?;
         verify_membership(&req.table_name, &req.segment_ids, &segments)?;
-
-        let mut units = Vec::with_capacity(req.segment_ids.len());
-        for id in req.segment_ids {
-            let index = Self::load(
-                &store,
-                &req.table_name,
-                segment(&req.table_name, &segments, id)?,
-                precision,
-            )
-            .await?;
-            verify_query_width(&req.table_name, id, &query, &index)?;
-            let unit = search_unit(SegmentId(id), &index, &query, width, phase, &|row_id| {
-                index.get_exact(row_id)
-            })
-            .map_err(|e| torn(&req.table_name, id, e))?;
-            units.push(SegmentUnit {
-                segment_id: id,
-                hits: hits(unit),
-            });
-        }
+        let table_name = req.table_name.as_str();
+        let requested = req.segment_ids.iter().map(|id| (*id, ())).collect();
+        let units = Self::over_segments(
+            &store,
+            table_name,
+            &segments,
+            precision,
+            finite,
+            requested,
+            |id, (), index, query| {
+                search_unit(SegmentId(id), index, query, width, phase, &|row_id| {
+                    index.get_exact(row_id)
+                })
+                .map(|unit| SegmentUnit {
+                    segment_id: id,
+                    hits: hits(unit),
+                })
+                .map_err(|e| torn(table_name, id, e))
+            },
+        )
+        .await?;
         Ok(Response::new(SegmentSearchResponse { units }))
     }
 
@@ -318,8 +402,7 @@ impl PeerService for PeerServer {
     ) -> Result<Response<ExactRescoreResponse>, Status> {
         let req = request.into_inner();
         let precision = decode_precision(req.storage_precision)?;
-        let query = validate_query(req.query.clone(), None, QuerySource::Caller)
-            .map_err(|e| map_engine_error(JammiError::from(e)))?;
+        let finite = finite_query(req.query)?;
         let store = self.session.result_store();
         let segments = self.segments_of(&store, &req.table_name).await?;
         let requested: Vec<i64> = req
@@ -328,29 +411,35 @@ impl PeerService for PeerServer {
             .map(|g| g.segment_id)
             .collect();
         verify_membership(&req.table_name, &requested, &segments)?;
-
-        let mut out = Vec::new();
-        for group in req.row_ids_by_segment {
-            let id = group.segment_id;
-            let index = Self::load(
-                &store,
-                &req.table_name,
-                segment(&req.table_name, &segments, id)?,
-                precision,
-            )
-            .await?;
-            verify_query_width(&req.table_name, id, &query, &index)?;
-            verify_row_ids(&req.table_name, id, &group.row_ids, &index)?;
-            let candidates = group.row_ids.into_iter().map(|r| (r, 0.0f32)).collect();
-            let rescored = rescore(
-                SegmentId(id),
-                candidates,
-                &|row_id| index.get_exact(row_id),
-                &query,
-            )
-            .map_err(|e| torn(&req.table_name, id, e))?;
-            out.extend(rescored);
-        }
+        let table_name = req.table_name.as_str();
+        let requested = req
+            .row_ids_by_segment
+            .into_iter()
+            .map(|g| (g.segment_id, g.row_ids))
+            .collect();
+        let out: Vec<(String, f32)> = Self::over_segments(
+            &store,
+            table_name,
+            &segments,
+            precision,
+            finite,
+            requested,
+            |id, row_ids: Vec<String>, index, query| {
+                verify_row_ids(table_name, id, &row_ids, index)?;
+                let candidates = row_ids.into_iter().map(|r| (r, 0.0f32)).collect();
+                rescore(
+                    SegmentId(id),
+                    candidates,
+                    &|row_id| index.get_exact(row_id),
+                    query,
+                )
+                .map_err(|e| torn(table_name, id, e))
+            },
+        )
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
         Ok(Response::new(ExactRescoreResponse { hits: hits(out) }))
     }
 }

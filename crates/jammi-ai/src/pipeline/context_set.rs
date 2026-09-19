@@ -411,11 +411,15 @@ impl InferenceSession {
         exclude_self: bool,
     ) -> Result<Vec<String>> {
         let fetch_k = if exclude_self { k.saturating_add(1) } else { k };
-        // The request's vector is the CALLER's; validated here (finite, and
-        // as wide as the catalog records when it does) before any search.
+        // The request's vector is the CALLER's; validated here against the
+        // table's authority before any search.
+        let width = self
+            .result_store()
+            .query_width(self.context(), table)
+            .await?;
         let query = jammi_db::index::validate_query(
             query.to_vec(),
-            table.dimensions().map(std::num::NonZeroUsize::get),
+            width,
             jammi_db::index::QuerySource::Caller,
         )?;
         let neighbours = self

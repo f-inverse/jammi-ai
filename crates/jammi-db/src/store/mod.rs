@@ -1438,12 +1438,12 @@ impl PinnedSource {
     }
 }
 
-/// The catalog row's recorded width, as the cross-check
+/// The catalog row's recorded width — the authority a query over the table
+/// is validated against ([`ResultStore::query_width`]) and the cross-check
 /// [`crate::index::exact::exact_vector_search`] runs against the scan's own
-/// `FixedSizeList` width. `dimensions` is `Option<i32>` catalog metadata;
-/// `None` (a pre-column row, or a non-embedding table) means "nothing to
-/// cross-check", never a pass-through of the query width itself — the scan
-/// width is enforced on the query regardless.
+/// `FixedSizeList` width. `None` (a row that records none, or a
+/// non-embedding table) means "nothing recorded", never a pass-through of
+/// the query width itself.
 fn catalog_width(table: &ResultTableRecord) -> Option<usize> {
     table.dimensions().map(std::num::NonZeroUsize::get)
 }
@@ -3301,24 +3301,6 @@ impl ResultStore {
         match self.resolve_search_mode_local(table).await? {
             Some(index) => {
                 let oversample = self.ann.resolve_oversample(None, table.oversample);
-                // The authority this call checks against is a catalog width
-                // when the table has one, and this loaded index's own width
-                // otherwise — exactly `search_final_placed`'s AllLocal arm's
-                // resolution (`placed.rs`), one layer up: this is that arm's
-                // FORCE-LOCAL twin, going straight to `SegmentedIndex::
-                // search_final` rather than through `PlacedIndex`, checked
-                // unconditionally the same way regardless of which authority
-                // it resolves to. With a catalog width on record this
-                // re-checks what the caller's own construction-time check
-                // (`QueryBuilder::new`'s Caller arm, the eval runner's
-                // per-query entry) already verified — redundant for a
-                // Caller-provenance query but not for a Stored-provenance one
-                // (the documented construction-time exception,
-                // `jammi_numerics::query`'s module doc), which defers even
-                // with an authority in hand; without a catalog width, nothing
-                // upstream ever had an authority to check against at all.
-                let authority = catalog_width(table).unwrap_or_else(|| index.dimensions());
-                query.require_authority_width(authority)?;
                 index.search_final(query, k, oversample)
             }
             None => {
@@ -3331,6 +3313,44 @@ impl ResultStore {
                 )
                 .await
             }
+        }
+    }
+
+    /// The width a query over `table` is validated against on the PLACED
+    /// lane ([`Self::search_vectors`], the `Search` plan node) — the
+    /// AUTHORITY an entry hands [`crate::index::FiniteQuery::against_authority`]
+    /// before any search: the catalog's recorded width; for a table whose
+    /// row records none, the width of the artifact a placed search of it
+    /// reads ([`PlacedIndex::query_width`], else the Parquet scan's own
+    /// width when the table has no index).
+    pub async fn query_width(
+        &self,
+        ctx: &SessionContext,
+        table: &ResultTableRecord,
+    ) -> Result<usize> {
+        match catalog_width(table) {
+            Some(width) => Ok(width),
+            None => match self.resolve_search_mode(table).await? {
+                Some(index) => index.query_width(),
+                None => crate::index::exact::scan_width(ctx, &table.table_name).await,
+            },
+        }
+    }
+
+    /// [`Self::query_width`]'s FORCE-LOCAL twin, for an entry that searches
+    /// through [`Self::search_vectors_local`]: without a recorded catalog
+    /// width, the locally loaded segment set's own width, else the scan's.
+    pub async fn query_width_local(
+        &self,
+        ctx: &SessionContext,
+        table: &ResultTableRecord,
+    ) -> Result<usize> {
+        match catalog_width(table) {
+            Some(width) => Ok(width),
+            None => match self.resolve_search_mode_local(table).await? {
+                Some(index) => Ok(index.dimensions()),
+                None => crate::index::exact::scan_width(ctx, &table.table_name).await,
+            },
         }
     }
 

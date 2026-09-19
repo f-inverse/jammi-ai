@@ -79,14 +79,20 @@ workspace ships every publishable crate at the same
   `vector` field accept for a query vector.
   `jammi_db::index::segment::verify_query_width` (a free `pub fn`) is
   **removed** with no replacement — its check is now
-  `ValidatedQuery::require_width` / `require_authority_width`, methods on
-  the type itself.
-  Construct one with `jammi_db::index::validate_query(values, expected_width,
-  source)` (re-exported from `jammi_numerics::query`, along with the new
-  `jammi_numerics::query::QueryValidationError` error type), where `source`
-  is a `jammi_db::index::QuerySource::{Caller, Stored { table }}`. Its
-  inherent methods are `as_slice`, `into_inner`, `source`, and the two width
-  checks below.
+  `ValidatedQuery::require_width`, a method on the type itself.
+  A query is built in two checked states (#519), re-exported by
+  `jammi_db::index` from `jammi_numerics::query` along with the new
+  `QueryValidationError`: `FiniteQuery::new(values, source)` (finite, width
+  unchecked, accepted by no consumer), then
+  `FiniteQuery::against_authority(width)` to a `ValidatedQuery`;
+  `validate_query(values, width, source)` composes the two. `width` is a
+  `usize` — there is no width-less path to a `ValidatedQuery`. `source` is a
+  `jammi_db::index::QuerySource::{Caller, Stored { table }}`.
+  `ValidatedQuery`'s inherent methods are `as_slice`, `into_inner`, `source`
+  and `require_width`. An entry over a result table gets its width authority
+  from the new `ResultStore::{query_width, query_width_local}`
+  (`PlacedIndex::query_width`, the now-`pub` `SegmentedIndex::dimensions`
+  and `index::exact::scan_width` are the per-artifact widths behind them).
   `exact_vector_search` also gained a `catalog_dimensions: Option<usize>`
   parameter — a cross-check against the scan's own width; pass `None` when
   there is none on record. `jammi_db::index::peer::{SegmentSearchRequest,
@@ -108,18 +114,19 @@ workspace ships every publishable crate at the same
   are no longer collapsed into one `None`; call the new `.known() ->
   Option<T>` for the old behaviour.
 - **A downstream width check never attributes to the caller, regardless of
-  the query's own provenance (#482).** `ValidatedQuery::require_width` now
-  takes an `artifact: impl Into<String>` and does not read the query's
-  `QuerySource` at all — every call downstream of an entry an authority has
-  already checked (an index's declared dimensions, a scan's width, a stored
-  vector's own length) is engine-fault by construction. TWO entries still
-  attribute by the query's own provenance (the placement entry's all-remote
-  shape, and `exact_vector_search`'s no-catalog-width fallback) and use the
-  new `ValidatedQuery::require_authority_width`, the old `require_width`
-  behaviour under a name that says why it is different. `QuerySource`
-  gained a third variant, `Artifact { name }`, which `require_width` reports
-  instead of borrowing `Stored` for a query it did not read from that
-  table — an exhaustive match on `QuerySource` needs a new arm.
+  the query's own provenance (#482, #519).** `ValidatedQuery::require_width`
+  takes an `artifact: impl Into<String>`, does not read the query's
+  `QuerySource` at all, and returns the new
+  `QueryValidationError::ArtifactMismatch` — every check downstream of the
+  entry (an index's declared dimensions, a scan's width, a stored vector's
+  own length) is engine-fault by construction. The ENTRY check is
+  `FiniteQuery::against_authority`, the only width check that attributes by
+  the query's provenance; a `ValidatedQuery` cannot express a caller fault
+  and a `FiniteQuery` reaches no consumer. `QueryValidationError::source()`
+  returns `Option<&QuerySource>` (`None` for `ArtifactMismatch`). The
+  Ballista `AnnSearchExecNode` carries the query's provenance
+  (`query_stored_table`), so an executor re-validates a shipped query with
+  the class its coordinator would have used.
 - **`jammi_db::store::ResultStore::result_digest_anchor` is removed with no
   replacement (#482).** It resolved a result table's current version and
   then discarded the resolution, returning a bare `InputAnchor` a caller

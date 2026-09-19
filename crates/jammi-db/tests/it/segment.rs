@@ -18,7 +18,7 @@ use jammi_db::catalog::Catalog;
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::error::JammiError;
 use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::VectorIndex;
+use jammi_db::index::{validate_query, QuerySource, VectorIndex};
 use jammi_db::model_task::ModelTask;
 use jammi_db::store::{BuildingTable, ResultStore};
 use jammi_numerics::distance::cosine_distance;
@@ -290,17 +290,11 @@ async fn search_vectors_over_two_int8_segments_equals_brute_force() {
     }
 }
 
-// `search_vectors_local`'s `Some(index)` branch checks the query against an
-// authority (a catalog width when the table has one, else the loaded
-// index's own width) before calling `SegmentedIndex::search_final` —
-// exactly `search_final_placed`'s AllLocal arm's resolution, one layer up:
-// this is that arm's FORCE-LOCAL twin. This test builds a table with NO
-// catalog width on record (`dimensions: None` at `create_table`, below), so
-// the loaded index's own width (here `4`, from `built_index`) is the only
-// authority available; the catalog-width-present shape is deliberately not
-// this test (it is exercised by
-// `search_vectors_over_two_int8_segments_equals_brute_force` above, whose
-// queries all match the segments' width).
+// The force-local entry's authority for a table with NO catalog width on
+// record (`dimensions: None` at `create_table`, below) is the loaded segment
+// set's own width (here `4`, from `built_index`) — so a wrong-width caller
+// query is the CALLER class at the entry, and the conforming one serves.
+// The catalog-width-present shape is the sibling test below.
 #[tokio::test]
 async fn search_vectors_local_with_no_catalog_width_attributes_a_wrong_width_query_to_the_caller() {
     let dir = tempdir().unwrap();
@@ -335,11 +329,15 @@ async fn search_vectors_local_with_no_catalog_width_attributes_a_wrong_width_que
     let record = record_of(&store, &table).await;
     assert_eq!(record.dimensions_raw(), None, "no catalog width on record");
 
+    // Both lanes resolve the same authority: the segment set's own width.
+    let width = store.query_width_local(&ctx, &record).await.unwrap();
+    assert_eq!(width, 4);
+    assert_eq!(store.query_width(&ctx, &record).await.unwrap(), 4);
+
     // A genuine caller mistake: the segment is 4-wide, this query is 2.
-    let err = store
-        .search_vectors_local(&ctx, &record, &vq(&[1.0, 0.0]), 3)
-        .await
-        .expect_err("a wrong-width query must be refused, not silently truncated or padded");
+    let err: JammiError = validate_query(vec![1.0, 0.0], width, QuerySource::Caller)
+        .expect_err("a wrong-width query must be refused, not silently truncated or padded")
+        .into();
     assert!(
         matches!(&err, JammiError::Schema { .. }),
         "a genuine caller width mistake with no catalog width on record must still be the \
@@ -347,43 +345,23 @@ async fn search_vectors_local_with_no_catalog_width_attributes_a_wrong_width_que
          {err:?}"
     );
 
-    // The conforming query still serves.
+    // The conforming query serves.
+    let query = validate_query(vec![1.0, 0.0, 0.0, 0.1], width, QuerySource::Caller).unwrap();
     let hits = store
-        .search_vectors_local(&ctx, &record, &vq(&[1.0, 0.0, 0.0, 0.1]), 1)
+        .search_vectors_local(&ctx, &record, &query, 1)
         .await
         .unwrap();
     assert_eq!(hits[0].0, "a");
 }
 
-// `search_vectors_local`'s new (unconditional) authority check also runs
-// with a catalog width ON record, exercising the arm the prior fix added:
-// before it, this branch skipped `require_authority_width` whenever
-// `catalog_width(table)` was `Some`, so a Stored-provenance query — which
-// defers even with an authority in hand (the documented construction-time
-// exception, `jammi_numerics::query`'s module doc) — reached this call
-// still unchecked and met `search_final`'s downstream, artifact-only
-// `require_width` first, which names the SEGMENT ("segment 0.vector") as
-// the disagreeing artifact.
-//
-// This test deliberately excludes two shapes already covered elsewhere:
-// a Caller-provenance query with a catalog width (already checked at
-// construction, so this call's re-check is redundant-but-harmless — no
-// behavioural difference to assert; `search_vectors_over_two_int8_segments_
-// equals_brute_force` above exercises that path with matching widths) and
-// the no-catalog-width case (the sibling test immediately above this one).
-//
-// Per `jammi_numerics::query`'s own module doc, a Stored-provenance width
-// mismatch is ALWAYS the artifact class regardless of which check catches
-// it (`require_width` or `require_authority_width` — neither can express a
-// caller fault for `Stored`), so this is NOT a `Schema` (caller-class)
-// refusal: what the unconditional check decides is WHICH artifact gets
-// named — the query's own Stored-provenance table, never the downstream
-// SEGMENT the query happened to meet — pinpointing the actual corrupt source rather
-// than an innocent segment that merely disagreed with it.
+// With a catalog width ON record, that width is the authority, and WHICH
+// artifact a width fault names is decided by where it is found. A
+// Stored-provenance query refused at the entry names its OWN table
+// (`src_docs.vector`) — a stored vector's fault is never the caller's, so
+// this is the artifact class, not `Schema`. A query that matched some other
+// authority and then meets this table's segment is that SEGMENT's fault.
 #[tokio::test]
-async fn search_vectors_local_with_a_catalog_width_still_checks_a_deferred_stored_query() {
-    use jammi_db::index::{validate_query, QuerySource};
-
+async fn a_width_fault_names_the_artifact_it_was_found_against() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store = store(dir.path(), catalog, StoragePrecision::F32);
@@ -416,20 +394,19 @@ async fn search_vectors_local_with_a_catalog_width_still_checks_a_deferred_store
     let record = record_of(&store, &table).await;
     assert_eq!(record.dimensions_raw(), Some(4), "catalog width on record");
 
-    // Stored provenance, deferred at construction despite the authority
-    // being in hand (the documented exception) — wrong width (2 vs 4).
-    let query = validate_query(
+    let width = store.query_width_local(&ctx, &record).await.unwrap();
+    assert_eq!(width, 4, "the recorded catalog width is the authority");
+
+    // Stored provenance, wrong width (2 vs 4), refused at the entry.
+    let err: JammiError = validate_query(
         vec![1.0, 0.0],
-        None,
+        width,
         QuerySource::Stored {
             table: "src_docs".into(),
         },
     )
-    .unwrap();
-    let err = store
-        .search_vectors_local(&ctx, &record, &query, 3)
-        .await
-        .expect_err("a wrong-width Stored query must be refused, never a search result");
+    .expect_err("a wrong-width Stored query must be refused, never a search result")
+    .into();
     assert!(
         matches!(
             &err,
@@ -437,7 +414,21 @@ async fn search_vectors_local_with_a_catalog_width_still_checks_a_deferred_store
                 if artifact == "src_docs.vector" && found == "2 dimensions" && supported == "4 dimensions"
         ),
         "expected the artifact class naming the query's OWN Stored-provenance table \
-         ('src_docs.vector'), not the segment it happens to meet downstream — got {err:?}"
+         ('src_docs.vector') — got {err:?}"
+    );
+
+    // A query that matched a 2-wide authority elsewhere meets this table's
+    // 4-wide segment: the segment's own check, the segment's own name.
+    let err = store
+        .search_vectors_local(&ctx, &record, &vq(&[1.0, 0.0]), 3)
+        .await
+        .expect_err("a validated query of another width must be refused by the segment");
+    assert!(
+        matches!(
+            &err,
+            JammiError::IncompatibleFormat { artifact, .. } if artifact.starts_with("segment")
+        ),
+        "expected the artifact class naming the segment — got {err:?}"
     );
 }
 

@@ -978,7 +978,7 @@ mod tests {
             table_name: "t".into(),
             segment_ids: vec![SegmentId(3)],
             storage_precision: StoragePrecision::F32,
-            query: crate::index::validate_query(vec![1.0], None, crate::index::QuerySource::Caller)
+            query: crate::index::validate_query(vec![1.0], 1, crate::index::QuerySource::Caller)
                 .unwrap(),
             width: 1,
             phase: SegmentSearchPhase::Final,

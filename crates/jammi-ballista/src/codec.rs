@@ -63,7 +63,7 @@ use jammi_ai::pipeline::asof::exec::AsofJoinExec;
 use jammi_ai::pipeline::asof::spec::AsofJoinSpec;
 use jammi_ai::session::InferenceSession;
 use jammi_db::error::JammiError;
-use jammi_db::index::{validate_query, QuerySource};
+use jammi_db::index::{FiniteQuery, QuerySource};
 use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_db::TenantId;
 
@@ -123,7 +123,8 @@ impl JammiCodec {
     }
 }
 
-/// Run an async catalog call from this synchronous trait-method call site.
+/// Run an async catalog-backed call (a row re-read, the width authority a
+/// row resolves to) from this synchronous trait-method call site.
 /// `PhysicalExtensionCodec::try_decode` is not async (a fixed DataFusion/
 /// Ballista trait signature), so a catalog re-read on decode must block the
 /// calling worker thread. Requires a MULTI-THREADED tokio runtime (`Handle::
@@ -391,6 +392,10 @@ fn encode_ann_search(exec: &AnnSearchExec, buf: &mut Vec<u8>) -> DfResult<()> {
         query_vector: exec.query_vector().as_slice().to_vec(),
         k: exec.k() as u64,
         oversample_override: exec.oversample_override().map(|o| o as u64),
+        query_stored_table: match exec.query_vector().source() {
+            QuerySource::Caller => None,
+            QuerySource::Stored { table } => Some(table.clone()),
+        },
     };
     buf.extend_from_slice(&MAGIC);
     buf.push(NodeTag::AnnSearch as u8);
@@ -430,38 +435,49 @@ fn decode_ann_search(
     // shipped; every check in this function is decode-time defense in depth
     // for a peer that skipped it, recoverable in-process but not over the
     // wire.
+    let typed = |e: JammiError| DataFusionError::External(Box::new(e));
+    let typed_lookup = |e: Error| match e {
+        Error::Catalog(j) => typed(j),
+        other => other.into_df_error(),
+    };
     let tenant: Option<TenantId> = msg
         .tenant_id
         .map(TenantId::try_from)
         .transpose()
-        .map_err(|e: JammiError| DataFusionError::External(Box::new(e)))?;
+        .map_err(typed)?;
     let table = block_on_catalog(
         session
             .catalog()
             .get_result_table_for_tenant(&msg.table_name, tenant),
     )
-    .map_err(|e| match e {
-        Error::Catalog(j) => DataFusionError::External(Box::new(j)),
-        other => other.into_df_error(),
-    })?
+    .map_err(typed_lookup)?
     .ok_or_else(|| {
-        DataFusionError::External(Box::new(JammiError::Other(format!(
+        typed(JammiError::Other(format!(
             "result table '{}' not found",
             msg.table_name
-        ))))
+        )))
     })?;
-    // The catalog width is already in hand (`table` above) — pass it as the
-    // authority, exactly the pattern `QueryBuilder::new`'s Caller arm and
-    // every other production entry uses. A mismatch is boxed as the
-    // `JammiError` the width-validation `From` impl classifies it into
-    // (`Schema` for a Caller-provenance width fault) — recoverable
-    // in-process exactly as described above.
-    let query = validate_query(
-        msg.query_vector,
-        table.dimensions().map(std::num::NonZeroUsize::get),
-        QuerySource::Caller,
+    // A decoded query is a fresh entry on THIS process: it is re-validated
+    // with the provenance it was encoded with, against the same authority
+    // every entry over this table uses (`ResultStore::query_width` — the
+    // live catalog row's recorded width, else the artifact a search of it
+    // reads). A refusal is boxed as the `JammiError` the validation `From`
+    // impl classifies it into (`Schema` for a caller's vector, the table's
+    // corrupt-artifact class for a stored one) — recoverable in-process
+    // exactly as described above.
+    let source = msg
+        .query_stored_table
+        .map_or(QuerySource::Caller, |table| QuerySource::Stored { table });
+    let query = FiniteQuery::new(msg.query_vector, source).map_err(|e| typed(e.into()))?;
+    let width = block_on_catalog(
+        session
+            .result_store()
+            .query_width(session.context(), &table),
     )
-    .map_err(|e| DataFusionError::External(Box::new(JammiError::from(e))))?;
+    .map_err(typed_lookup)?;
+    let query = query
+        .against_authority(width)
+        .map_err(|e| typed(e.into()))?;
     let node = AnnSearchExec::new(
         table,
         query,
@@ -470,7 +486,7 @@ fn decode_ann_search(
         session.result_store(),
         session.context().clone(),
     )
-    .map_err(|e: JammiError| DataFusionError::External(Box::new(e)))?;
+    .map_err(typed)?;
     Ok(Arc::new(node))
 }
 

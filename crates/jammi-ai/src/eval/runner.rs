@@ -132,6 +132,11 @@ impl<'a> EvalRunner<'a> {
         // per-query record carries the multi-cutoff vector J7 re-aggregates.
         let mut per_query_recalls: Vec<Vec<(usize, f64)>> = Vec::new();
         let mut per_query_distances: Vec<f64> = Vec::new();
+        // The authority every query of this run is checked against — eval's
+        // FORCE-LOCAL lane, resolved once for the whole loop.
+        let query_width = result_store
+            .query_width_local(self.session.context(), &table)
+            .await?;
         for query in &golden.queries {
             let query_vec = match &query.input {
                 super::golden::QueryInput::Text(text) => {
@@ -146,20 +151,12 @@ impl<'a> EvalRunner<'a> {
             };
 
             // The encoder's output for this query is the query the run
-            // supplied — checked against the AUTHORITY here (the resolved
-            // table's recorded width), the same pattern `QueryBuilder::new`
-            // uses for a Caller-provenance query. The table is already in
-            // hand at this entry, so the authority is not deferred to
-            // whatever artifact `search_vectors_local` happens to meet
-            // first: deferring here would mean a genuine model/table width
-            // mismatch is discovered downstream, against an artifact, and
-            // `require_width` (unlike this entry-time check) cannot express
-            // a caller fault — a user width mistake would be reported as
-            // the table being corrupt instead of the caller's request being
-            // wrong.
+            // supplied — a CALLER's vector, checked against the table's
+            // authority, so a model/table width mismatch is the run's own
+            // request being wrong, never the table reported as corrupt.
             let query_vec = jammi_db::index::validate_query(
                 query_vec,
-                table.dimensions().map(std::num::NonZeroUsize::get),
+                query_width,
                 jammi_db::index::QuerySource::Caller,
             )?;
             // FORCE-LOCAL: eval is a batch per-query loop; it loads every

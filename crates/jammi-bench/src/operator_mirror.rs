@@ -38,14 +38,9 @@ pub fn retrieve_then_rescore(
     oversample: usize,
 ) -> Result<Vec<(String, f32)>> {
     let candidate_k = k.saturating_mul(oversample).max(k);
-    // `index` is already in hand — its own width is the authority this
-    // query is checked against, rather than deferring to `index.search`'s
-    // own downstream, artifact-only check.
-    let query = validate_query(
-        query.to_vec(),
-        Some(index.dimensions()),
-        QuerySource::Caller,
-    )?;
+    // `index` is the only artifact this harness searches — its own width
+    // is the authority the query is checked against.
+    let query = validate_query(query.to_vec(), index.dimensions(), QuerySource::Caller)?;
     let candidates = index.search(&query, candidate_k)?;
 
     let mut rescored: Vec<(String, f32)> = Vec::with_capacity(candidates.len());

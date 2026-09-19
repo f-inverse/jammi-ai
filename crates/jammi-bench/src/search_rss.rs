@@ -46,7 +46,7 @@ use futures::TryStreamExt;
 use tempfile::tempdir;
 use tokio::process::Command;
 
-use jammi_db::index::exact::exact_vector_search;
+use jammi_db::index::exact::{exact_vector_search, scan_width};
 use jammi_db::index::{validate_query, QuerySource};
 use jammi_db::store::vectors::extend_with_fixed_size_list_f32;
 use jammi_numerics::distance::cosine_distance;
@@ -228,7 +228,10 @@ async fn naive_collect_all_search(
         extend_with_fixed_size_list_f32(&batch, table_name, "vector", &mut vectors)?;
     }
 
-    let query = validate_query(query.to_vec(), None, QuerySource::Caller)?;
+    // The corpus scan is the only artifact this harness reads — its own
+    // width is the authority the query is checked against.
+    let width = scan_width(ctx, table_name).await?;
+    let query = validate_query(query.to_vec(), width, QuerySource::Caller)?;
     // The kernel's own `assert!` is not a guard a caller can rely on: this
     // harness reaches `cosine_distance` directly, with nothing else in the
     // path enforcing that the scanned width matches the query — checked here,
@@ -295,7 +298,11 @@ pub async fn measure_once(
                     exact_vector_search(
                         &ctx,
                         table,
-                        &validate_query(query.to_vec(), None, QuerySource::Caller)?,
+                        &validate_query(
+                            query.to_vec(),
+                            scan_width(&ctx, table).await?,
+                            QuerySource::Caller,
+                        )?,
                         K,
                         None,
                     )

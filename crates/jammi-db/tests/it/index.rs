@@ -298,24 +298,39 @@ const FOUR_ROWS: [(&str, [f32; 4]); 4] = [
     ("opp", [-1.0, 0.0, 0.0, 0.0]),
 ];
 
-// A wrong-width query on the NO-INDEX exact path is a typed `Schema`
-// error, never a panic. The width comes from the scan schema's
-// `FixedSizeList` length (the authority on this path), so it holds even with
-// no catalog width in hand (`None`).
+// A wrong-width query on the NO-INDEX exact path is a typed refusal, never
+// a panic, and WHICH class it is follows where it is found. With no catalog
+// width in hand the scan schema's `FixedSizeList` length is the authority
+// (`scan_width`): a caller's vector refused against it at the entry is the
+// caller's `Schema`. A query that matched some OTHER authority and then
+// meets the scan is the scan's own artifact mismatch.
 #[tokio::test]
 async fn exact_search_refuses_a_wrong_width_query_typed_not_panic() {
+    use jammi_db::index::exact::scan_width;
+    use jammi_db::index::{validate_query, QuerySource};
+
     let dir = tempdir().unwrap();
     let ctx = exact_table(dir.path(), "exact_width", &FOUR_ROWS).await;
+    let authority = scan_width(&ctx, "exact_width").await.unwrap();
+    assert_eq!(authority, 4);
     for width in [5usize, 3, 0] {
-        let q = vq(&vec![1.0f32; width]);
-        let err = exact_vector_search(&ctx, "exact_width", &q, 4, None)
-            .await
-            .expect_err("a wrong-width query must be refused, not panic");
+        let err: jammi_db::error::JammiError =
+            validate_query(vec![1.0f32; width], authority, QuerySource::Caller)
+                .expect_err("a wrong-width query must be refused at the entry")
+                .into();
         assert!(
             matches!(err, jammi_db::error::JammiError::Schema { .. }),
             "width {width}: {err:?}"
         );
         assert!(err.to_string().contains("4"), "{err}");
+
+        let err = exact_vector_search(&ctx, "exact_width", &vq(&vec![1.0f32; width]), 4, None)
+            .await
+            .expect_err("a wrong-width query must be refused, not panic");
+        assert!(
+            matches!(&err, jammi_db::error::JammiError::IncompatibleFormat { artifact, .. } if artifact.contains("exact_width")),
+            "width {width}: {err:?}"
+        );
     }
     // The catalog width is a CROSS-CHECK against the scan: a disagreement is
     // its own typed, table-named error.
@@ -460,13 +475,13 @@ async fn exact_search_refuses_a_corrupt_stored_row_at_the_sink() {
 fn provenance_decides_the_error_class() {
     use jammi_db::error::JammiError;
     use jammi_db::index::{validate_query, QuerySource};
-    let caller: JammiError = validate_query(vec![f32::NAN, 0.0], None, QuerySource::Caller)
+    let caller: JammiError = validate_query(vec![f32::NAN, 0.0], 2, QuerySource::Caller)
         .unwrap_err()
         .into();
     assert!(matches!(caller, JammiError::Schema { .. }), "{caller:?}");
     let stored: JammiError = validate_query(
         vec![f32::NAN, 0.0],
-        None,
+        2,
         QuerySource::Stored {
             table: "docs_embeddings".into(),
         },

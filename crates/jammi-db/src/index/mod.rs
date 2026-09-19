@@ -12,7 +12,7 @@ pub use peer::{
 pub use placed::{PlacedIndex, SegmentSource};
 
 pub use jammi_numerics::query::{
-    validate_query, QuerySource, QueryValidationError, ValidatedQuery,
+    validate_query, FiniteQuery, QuerySource, QueryValidationError, ValidatedQuery,
 };
 pub use segment::{SegmentId, SegmentedIndex, DEFAULT_SEGMENT_OVERFETCH_FACTOR};
 

@@ -1653,7 +1653,7 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
         // calls (`TrainingSetTable::sql_relation`,
         // `session.rs::infer_ordered_read_back_sql`,
         // `graph_propagation.rs::edge_scan_sql`,
-        // `index/exact.rs::exact_vector_search`, plus `jammi-bench`'s
+        // `index/exact.rs::vector_scan`, plus `jammi-bench`'s
         // `propagate.rs`/`search_rss.rs`/`corpus.rs`, which this gate's
         // `SURFACE_DIRS` does not scan) instead of hand-building the quoted
         // string itself. This is the ONE reviewed construction site the

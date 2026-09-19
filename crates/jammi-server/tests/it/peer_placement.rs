@@ -48,7 +48,7 @@ use jammi_db::index::peer::{
     SegmentPlacement, SegmentSearchRequest as DomainSegmentSearchRequest, SegmentUnit,
 };
 use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::{validate_query, QuerySource, SegmentId, VectorIndex};
+use jammi_db::index::{validate_query, QuerySource, SegmentId, ValidatedQuery, VectorIndex};
 use jammi_db::model_task::ModelTask;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::StorageUrl;
@@ -443,6 +443,18 @@ async fn placed_search_over_two_instances_equals_all_local_and_brute_force() {
     let _ = b.handle.await;
 }
 
+/// A caller's vector through the placed lane's ENTRY over `record`:
+/// validated against the table's authority (`ResultStore::query_width`), the
+/// way `QueryBuilder::new` and the context-set lane obtain their query.
+async fn entry_query(
+    a: &InferenceSession,
+    record: &ResultTableRecord,
+    v: &[f32],
+) -> Result<ValidatedQuery, JammiError> {
+    let width = a.result_store().query_width(a.context(), record).await?;
+    Ok(validate_query(v.to_vec(), width, QuerySource::Caller)?)
+}
+
 // ---------------------------------------------------------------------------
 // A caller's width fault never traverses the ladder
 // ---------------------------------------------------------------------------
@@ -452,8 +464,9 @@ async fn placed_search_over_two_instances_equals_all_local_and_brute_force() {
 /// served by B — the observable that no fan-out happened — and neither
 /// panicking:
 ///
-///  * the placed entry on a 4-wide BINARY table, the case that panics at the
-///    coordinator without the entry check: `pack_threshold_bits` takes
+///  * the placed lane's entry (`ResultStore::query_width`, the authority
+///    every query over the table is validated against) on a 4-wide BINARY
+///    table, the case that panics at the coordinator without the entry check: `pack_threshold_bits` takes
 ///    `ceil(len/8)` bytes, so an over-long query passes usearch untouched,
 ///    and the fault surfaces only inside `cosine_distance` — after the owner
 ///    has refused it (`Refused`), the retry has failed, and the local-load
@@ -475,11 +488,10 @@ async fn a_caller_width_fault_is_refused_before_any_fan_out() {
     let served_before = served(&b, "SegmentSearch");
     let counters_before = snapshot(&store);
 
-    let placed = store.resolve_search_mode(&record).await.unwrap().unwrap();
-    let err = placed
-        .search_final_placed(&vq(&[1.0, 0.0, 0.0, 0.0, 0.0]), 3, 4)
+    let err = entry_query(&a, &record, &[1.0, 0.0, 0.0, 0.0, 0.0])
         .await
         .expect_err("a 5-wide query on a 4-wide Binary table must be a typed refusal");
+    assert!(matches!(&err, JammiError::Schema { .. }), "{err:?}");
     let text = err.to_string();
     assert!(
         text.contains("5 dimensions") && text.contains("4 dimensions"),
@@ -553,7 +565,7 @@ async fn a_caller_width_fault_is_refused_before_any_fan_out() {
 /// The shape with no local segment: nothing at the coordinator holds an index,
 /// so every width and finiteness check must happen at the ENTRY, from the
 /// catalog. A NaN component through the public `Search` verb and a
-/// wrong-width query at the placed entry (against a recorded width) are each
+/// wrong-width query at the placed lane's entry (against a recorded width) are each
 /// a CALLER-class refusal; a table with NO width on record is the ENGINE's
 /// own gap in the row it owns. Every arm is a
 /// typed refusal with ZERO `SegmentSearch` served and every ladder counter at
@@ -586,14 +598,9 @@ async fn all_remote_placement_refuses_a_caller_fault_before_any_fan_out() {
     let (table_nodims, record_nodims) = two_segment_table(&store, "src_remote_nodims", None).await;
     placement.set(&record_nodims.table_name, 0, vec![owner.clone()]);
     placement.set(&record_nodims.table_name, 1, vec![owner.clone()]);
-    let err = store
-        .resolve_search_mode(&record_nodims)
+    let err = entry_query(&a, &record_nodims, &[1.0, 0.0, 0.0, 0.0])
         .await
-        .unwrap()
-        .unwrap()
-        .search_final_placed(&vq(&[1.0, 0.0, 0.0, 0.0]), 3, 4)
-        .await
-        .expect_err("no width on record and no local segment → refuse, never fan out");
+        .expect_err("no width on record and no local segment → no authority, never a fan-out");
     // An ABSENT catalog width is the engine's own gap in the row it owns —
     // never anything the caller supplied — so this is the engine class.
     assert!(
@@ -605,12 +612,7 @@ async fn all_remote_placement_refuses_a_caller_fault_before_any_fan_out() {
     let (table_w, record_w) = two_segment_table(&store, "src_remote_width", Some(4)).await;
     placement.set(&record_w.table_name, 0, vec![owner.clone()]);
     placement.set(&record_w.table_name, 1, vec![owner.clone()]);
-    let err = store
-        .resolve_search_mode(&record_w)
-        .await
-        .unwrap()
-        .unwrap()
-        .search_final_placed(&vq(&[1.0, 0.0, 0.0, 0.0, 0.0]), 3, 4)
+    let err = entry_query(&a, &record_w, &[1.0, 0.0, 0.0, 0.0, 0.0])
         .await
         .expect_err("a 5-wide query against a recorded 4 is refused before fan-out");
     assert!(matches!(&err, JammiError::Schema { .. }), "{err:?}");
@@ -629,12 +631,15 @@ async fn all_remote_placement_refuses_a_caller_fault_before_any_fan_out() {
         );
     }
     // The honest all-remote search on the same table still fans out.
+    let conforming = entry_query(&a, &record_w, &[1.0, 0.0, 0.0, 0.0])
+        .await
+        .unwrap();
     let hits = store
         .resolve_search_mode(&record_w)
         .await
         .unwrap()
         .unwrap()
-        .search_final_placed(&vq(&[1.0, 0.0, 0.0, 0.0]), 3, 4)
+        .search_final_placed(&conforming, 3, 4)
         .await
         .expect("a conforming all-remote search serves");
     assert_eq!(hits.len(), 3);
@@ -1356,7 +1361,7 @@ async fn stored_width_drift_answered_by_an_owner_ladders_to_a_named_refusal() {
     let counters_before = snapshot(&store);
     let stored_query = validate_query(
         vec![1.0, 0.0, 0.0, 0.0],
-        None,
+        placed.query_width().unwrap(),
         QuerySource::Stored {
             table: record.table_name.clone(),
         },

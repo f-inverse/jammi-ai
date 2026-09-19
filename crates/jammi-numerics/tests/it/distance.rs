@@ -1,7 +1,7 @@
 use jammi_numerics::query::{validate_query, QuerySource, ValidatedQuery};
 
 fn vq(v: &[f32]) -> ValidatedQuery {
-    validate_query(v.to_vec(), None, QuerySource::Caller).unwrap()
+    validate_query(v.to_vec(), v.len(), QuerySource::Caller).unwrap()
 }
 use approx::assert_abs_diff_eq;
 use jammi_numerics::distance::{cosine_distance, cosine_similarity, vector_norm};

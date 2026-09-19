@@ -321,17 +321,16 @@ STABLE_IDS: tuple[str, ...] = (
 )
 
 # The subset this script mechanically enforces today. `KO-3` lives in
-# `check_cuda_run_artifacts.py` (the `oracle_separation` artifact block) and
-# `KO-4` lives in `check_doc_numbers_have_producers.py` (the floor-cites-a-
-# producer trigger) — both documented here for completeness, neither
-# re-implemented in this file (one definition per rule). Bound to the guide's
+# `check_cuda_run_artifacts.py` (the `oracle_separation` artifact block) —
+# documented here for completeness, not re-implemented in this file (one
+# definition per rule). Bound to the guide's
 # per-id "mechanical"/"auditor-only" labels by `check_doc_parity.py`'s
 # `KernelOracleMechanicalIds`/`KernelOracleAuditorOnlyIds` bindings (round-2
 # audit item 7) — these constants are not dead weight; a stale label drift
 # between this file and the guide's prose now reds the doc-parity gate.
 MECHANICAL_HERE_IDS = ("KO-2", "KO-5", "KO-7")
-MECHANICAL_ELSEWHERE_IDS = ("KO-3", "KO-4")
-AUDITOR_ONLY_IDS = ("KO-1", "KO-6", "KO-8")
+MECHANICAL_ELSEWHERE_IDS = ("KO-3",)
+AUDITOR_ONLY_IDS = ("KO-1", "KO-4", "KO-6", "KO-8")
 
 
 class OracleError(Exception):

@@ -2,9 +2,7 @@
 """Hermetic `unittest` suite for `check_kernel_oracles.py` — drives the real
 pure functions (`find_fns`, `check_ko7`, `check_ko2`, `check_ko5`,
 `reconcile_ops`, `shipped_ops_from_sources`, marker parsing) against
-in-memory synthetic Rust source strings, never the real checkout — mirrors
-`test_check_ci_guard_wiring.py`'s "drive the real entry points against
-throwaway fixtures" shape for this repo's `test_*.py` gate-suite convention.
+in-memory synthetic Rust source strings, never the real checkout.
 
 Run: `python3 ci/scripts/test_check_kernel_oracles.py`
 """

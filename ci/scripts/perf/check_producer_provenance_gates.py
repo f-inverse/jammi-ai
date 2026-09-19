@@ -35,8 +35,8 @@ gap used — reproduced here as a standing gate, not a one-time hand check,
 so a FIFTH producer landing tomorrow cannot silently reopen the class.
 
 Both are deliberately mechanical (name/pattern presence), not a semantic
-understanding of the guard's control flow — the same "grep for the shape,
-not the meaning" stance `check_ci_guard_wiring.py`'s own module doc states.
+understanding of the guard's control flow: grep for the shape, not the
+meaning.
 
 Disclosed, NOT-hidden scope gap: (B)'s scope trigger fires only on a
 LITERAL `/jammi-bench` PATH assignment appearing in the SAME file — a file

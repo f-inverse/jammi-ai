@@ -15,9 +15,8 @@ lane consumes its already-recorded verdict instead of invoking it a second
 time — see the allowlist's own notes) carries a byte-identical twin of
 several of those same tuples.
 
-`check_ci_guard_wiring.py` (the gate this one supersedes-in-part for this
-class) answers ONE question: does a script's NAME appear in SOME workflow's
-run body? That question has no notion of `on:` triggers at all — a tuple
+"Does this invocation appear in SOME workflow's run body?" is the wrong
+question: it has no notion of `on:` triggers at all — a tuple
 wired only into a dispatch/label/schedule-only workflow satisfies it while
 NOTHING on the actual merge path ever runs it. That is exactly the esc-050 /
 esc-051 escape shape: `pod_seed_target.sh:859`'s
@@ -257,13 +256,10 @@ correct).
 ## Rule 2 — registry completeness
 
 The tuple registry is DERIVED, never hand-maintained: `discover_all_tuples`
-walks every TRACKED file (`git ls-files`, matching `check_ci_guard_wiring.py`
-and `check_doc_numbers_have_producers.py`'s own tracked-only precedent — a
-CI checkout can only ever see what git tracks) under `ci/scripts/` —
-recursively, so a future sibling script (e.g. a nested
-`ci/scripts/pods/pod_seed_target_v2.sh`) cannot silently join the class
-unregistered the way F6/F7 (`check_ci_guard_wiring.py`'s own module doc)
-already had to fix once for a hand-picked, non-recursive glob — and extracts
+walks every TRACKED file (`git ls-files` — a CI checkout can only ever see
+what git tracks) under `ci/scripts/` — recursively, so a future sibling
+script (e.g. a nested `ci/scripts/pods/pod_seed_target_v2.sh`) cannot
+silently join the class unregistered — and extracts
 every line-shaped `cargo (build|test|clippy|check|run) ...` invocation,
 after (a) blanking full-line comments, (b) joining a physical line ending
 in a bare trailing backslash with its continuation (so a `--features`
@@ -307,14 +303,11 @@ is already exercised, non-exactly but functionally, by the ordinary
 workspace test job; registering it here would be a different, broader gate
 than the one the retrospective asked for.
 
-`ci/scripts/` only, deliberately (documented, not silently narrow, the
-SAME "never widen inside another rule's fix" discipline
-`check_ci_guard_wiring.py`'s own module doc names for its two prefix roots):
+`ci/scripts/` only, deliberately (documented, not silently narrow):
 every tuple `esc-050`/`esc-051` named lives there today
 (`pod_seed_target.sh`, `runpod_gpu_prove.sh`). If the class is later found
 occupying another root, that is a follow-up PR's job to widen this
-constant, exactly as `check_ci_guard_wiring.py`'s `tracked_test_suites`
-needed two follow-up rounds (F6, F7) to stop hand-picking roots.
+constant.
 
 Two paths under `ci/scripts/` are excluded from discovery
 (`_DISCOVERY_EXCLUDED_RELPATHS`): this gate's OWN source file (its
@@ -364,9 +357,7 @@ row whose tuple text is still gated AND has become REACHABLE on the merge
 path (someone wired an exact-matching invocation into a qualifying
 job/step) is not rot — its subject is very much alive — but the waiver
 itself is now unnecessary. Flagged separately so the allowlist cannot
-silently accumulate rows nobody needs anymore, mirroring the only-shrinks
-discipline `check_doc_numbers_have_producers.py`'s own allowlist already
-enforces for a different artifact class.
+silently accumulate rows nobody needs anymore.
 
 ## Honest residual — CUDA tuples force a written choice
 

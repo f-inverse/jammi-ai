@@ -6,10 +6,7 @@ in that module's own doc and in `gpu_inference_ab.sh`'s own `--aa-null`
 section. Every file here is a merged `gpu_inference_ab.py::build_report`
 output, produced by the committed producer (`ci/scripts/perf/gpu_inference_ab.sh`)
 run with `GPU_INFERENCE_AB_AA_NULL=1` — never hand-edited after the fact
-(committed artifacts are append-only evidence, the same discipline
-`ci/scripts/perf/check_citations.py`'s own "Committed artifacts are
-append-only evidence" section documents for this repo's other artifact
-families). The machine-readable classification (which file is `primary`
+(committed artifacts are append-only evidence). The machine-readable classification (which file is `primary`
 vs `aux`, and why) lives in this directory's own `manifest.json`, checked
 against a real re-derivation of the band by `ci/scripts/check_aa_null_band.py`
 — see "Band derivation" below.
@@ -230,7 +227,7 @@ derived from the three **primary** runs' own SIX adjacent-pair ratios above
 (`sxm4-r1`: `a1/b1`, `b2/a2`; `sxm4-r2`: `a1/b1`, `b2/a2`; `pcie-p3`:
 `a1/b1`, `b2/a2`) — mechanically checked against these same five committed
 files by `ci/scripts/check_aa_null_band.py`, driven off this directory's own
-`manifest.json` classification, wired into `ci.yml`'s Guard matrix (never
+`manifest.json` classification, a guard in `ci/guards.toml` (never
 merely asserted in prose):
 
 - The single largest `|log deviation|` from 1.0 among the six primary pair

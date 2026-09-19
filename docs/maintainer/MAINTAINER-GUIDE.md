@@ -462,9 +462,8 @@ enforced by a dedicated CI gate, `cookbook-one-way` /
      `cookbook/recipes/*/example.py`, `cookbook/quickstart/quickstart.py`, and
      every executed `python` cell of a `.qmd` chapter) have no test harness to
      hang a runtime observer on, so this half is a static AST gate instead —
-     `ci/scripts/check_cookbook_session_lifecycle.py`, wired into `ci.yml`'s
-     `guard` matrix (`cookbook session-lifecycle gate` /
-     `cookbook session-lifecycle gate (self-test)`). It walks every
+     `ci/scripts/check_cookbook_session_lifecycle.py`, a guard in
+     `ci/guards.toml` (`cookbook session lifecycle` and its self-test). It walks every
      `with tempfile.TemporaryDirectory() as X:` statement's real AST extent (no
      line or indentation heuristics — this replaces an earlier regex/indent
      gate an audit found unsound on five shapes; the module's own docstring
@@ -2536,7 +2535,7 @@ staleness→recompute loop — that is the platform's, not the engine's
   (the `should_apply_lora` fn) takes `layer_idx: Option<usize>`, the single authority for
   both halves of the selection. `None` means the site belongs to no numbered repeating
   unit (a CLAP `audio_projection.linear{1,2}` head, say). PEFT's own
-  `check_target_module_exists` (`peft/src/peft/tuners/tuners_utils.py:2353-2389`)
+  `check_target_module_exists` (`peft/src/peft/tuners/tuners_utils.py`)
   extracts the index with `re.match(r".*?\.[^.]*\.(?P<idx>\d+)\.", key)` — the FIRST
   numbered segment — and sets `target_module_found = False` when there is none, and this
   function follows that rule exactly: `(None, Some(filter))` → `false` (a caller's
@@ -3420,9 +3419,9 @@ describing a removed surface.
   Result<(), Status>`, unlike the `async_trait` `TenantResolver`): a local
   metadata check, not an I/O round-trip. `CatalogServer::new`'s 4th parameter,
   threaded from `GrpcChain.admin_authorizer: Option<Arc<dyn AdminAuthorizer>>`
-  (`runtime.rs:414`'s `build_grpc_chain` — the OSS binary's shipped default,
+  (`runtime.rs`'s `build_grpc_chain` — the OSS binary's shipped default,
   `None` — and `:1020`'s `assemble_grpc_chain` exhaustive destructure;
-  `flight.rs:56`'s `serve_flight_with_catalog_service` passes `None`). Shipped
+  `flight.rs`'s `serve_flight_with_catalog_service` passes `None`). Shipped
   default `None` refuses EVERY `all = true` request with `PERMISSION_DENIED`
   naming `security.md`; `all = false` never consults it. **Gated verb only —
   gRPC-only by construction** (`Reconcile` has no Flight SQL analogue), unlike
@@ -4307,9 +4306,9 @@ worker.rs`: `PlacedGangSubmitter` (installed by the scheduler role) and
 `PlacedGangRunner` (installed by the executor role) — `jammi-ai` never
 depends on `jammi-ballista`.
 
-**The submitting host's holder.** `Holder` (`worker.rs:327`) gains
+**The submitting host's holder.** `Holder` (`worker.rs`) gains
 `Awaiting { job_id, attempt }` beside `Free`/`ClaimProbe`/`JobRun`/`Rank`
-(`worker.rs:346`): a claimant that is submitting a `GangDescriptor` (the move precedes the submit) or is
+(`worker.rs`): a claimant that is submitting a `GangDescriptor` (the move precedes the submit) or is
 awaiting its stream runs no compute for that attempt, so it can still serve
 a `RunRank` session for some OTHER attempt — `HostAdmission::
 try_hold_rank` admits out of `Awaiting` exactly as it does out of `Free`; a
@@ -5457,8 +5456,8 @@ graphs don't exhaust runner disk) → `test-clients` (clients + the **two candle
 `test-pg`, `guard` and `symbol-index-gates` jobs above plus `docs.yml`'s build, read from the
 workflow files at run time (never a copied list) and run in one process: `static` (fmt, the
 four clippy surfaces, rustdoc `-D warnings`, the guide build — a missing `mdbook` FAILS unless
-`--skip-mdbook`) → `guards` (every `ci.yml` guard-matrix command, stdin closed, every `${{ }}`
-expression expanded from the checkout or a hard stop) → `index` (`symbol-index-gates`' steps,
+`--skip-mdbook`) → `guards` (the guards in `ci/guards.toml` this change can affect, through
+`ci/scripts/run_guards.py` — the runner `ci.yml`'s `guard` job calls) → `index` (`symbol-index-gates`' steps,
 each `run:` block executed WHOLE) → `tests` (the hermetic lane, the `test-hooks` lane,
 golden-parity, and the Postgres lane against `JAMMI_TEST_PG_URL` — a missing database FAILS the
 stage unless `--skip-pg` is passed, because a silently skipped lane is how a shared-database

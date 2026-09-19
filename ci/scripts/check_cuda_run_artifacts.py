@@ -113,9 +113,8 @@ must carry:
       below.
 
       Letter assignment: this rule and (g) above each originally called
-      themselves "rule (g)" (an accidental collision, KO-3 first). (h) is
-      taken repo-wide by `ci/scripts/check_perf_claims.py`'s own "rule
-      (h)" (the claim-value binding gate), so the v2 leg-identity rule is
+      themselves "rule (g)" (an accidental collision, KO-3 first). (h) was
+      a since-removed gate's letter, so the v2 leg-identity rule is
       deliberately lettered (i). The letter is comment/self-test-label
       prose only — no gate, allowlist, or error message parses it.
   (j) `producer.source_sha256`, when present, is re-hashed HERE — every
@@ -221,11 +220,8 @@ indistinguishable from a genuine one without checking first. Before any
 per-file work, `run_gate` calls `git rev-parse --is-shallow-repository` and,
 if shallow, raises ONE explicit failure ("shallow checkout — ancestry cannot
 be evaluated; use fetch-depth: 0") instead of N misleading per-file findings
-that would look like real drift. `.github/workflows/ci.yml`'s `guard` job
-gives ONLY this matrix leg `fetch-depth: 0` (a full clone; this repository's
-`.git` is small — see the PR that added this check for the measured size —
-negligible next to the Rust build jobs elsewhere in this workflow); every
-other leg stays at the normal shallow default.
+that would look like real drift. `ci/guards.toml` declares this guard's `full-history` need, which the
+runner provides by deepening a shallow checkout.
 
 Run: `python3 ci/scripts/check_cuda_run_artifacts.py`
 Self-test (RED cases for every rule above, on a throwaway `git init`'d
@@ -928,8 +924,8 @@ def check_oracle_separation(data: dict) -> list[str]:
 # ancestor of HEAD" (this rule's first revision) skipped it entirely for
 # exactly the artifacts whose measured tip was rewritten on landing.
 #
-# LETTER: (a)-(j) are taken (see the module doc; (h) is taken repo-wide by
-# check_perf_claims.py and the v2 leg-identity rule took (i) after an
+# LETTER: (a)-(j) are taken (see the module doc; (h) was a since-removed
+# gate's letter and the v2 leg-identity rule took (i) after an
 # accidental collision with KO-3's (g)). This one is (k). As with every
 # other letter here, it is comment/self-test-label prose only — no gate,
 # allowlist, or error message parses it.
@@ -1936,7 +1932,7 @@ def check_none_allowlist_history(
 # rule (i) — leg identity on self-declaring v2 legs (unification contract C6,
 # phase 2). NOTE: this is a SEPARATE, unrelated mechanism from rule (g)
 # above (KO-3 `oracle_separation`) — see the module docstring's letter-
-# assignment note ((h) is `check_perf_claims.py`'s rule, so this one is
+# assignment note ((h) was a since-removed gate's letter, so this one is
 # (i); the letter is read by no gate, allowlist, or error message).
 #
 # A v2 leg is ANY JSON object, anywhere in a `cuda-runs/**` tree,

@@ -450,8 +450,8 @@ def _job_level_uses_is_reviewed_nonpublishing(job_node: dict) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Line-level helpers (comment-vs-code, the same rule check_ci_guard_wiring.py
-# and check_execution_surface_reachability.py both already apply).
+# Line-level helpers (comment-vs-code, the same rule
+# check_execution_surface_reachability.py applies).
 # --------------------------------------------------------------------------- #
 def _strip_trailing_comment(line: str) -> str:
     """Blank a line from its first UNQUOTED `#` onward, when that `#` is
@@ -1098,7 +1098,7 @@ def derive_renting_drivers(
 def load_script_texts(repo_root: Path = REPO_ROOT) -> dict[str, str]:
     """Every TRACKED `ci/scripts/**` file's text, keyed by repo-relative
     path (`git ls-files`, the same enumeration `check_execution_surface_
-    reachability.py` and `check_ci_guard_wiring.py` already use — a script
+    reachability.py` uses — a script
     CI's own checkout would not have is not a lane)."""
     out = subprocess.run(
         ["git", "ls-files", "ci/scripts"],

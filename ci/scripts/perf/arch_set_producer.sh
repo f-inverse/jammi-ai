@@ -70,7 +70,8 @@ for line in open(f"{out}/legs.tsv"):
 producer_leg = next(l for l in legs if l["name"] == "producer")
 green = all(l["status"] == "ok" for l in legs) and producer_leg["passed"] == 1
 tag = re.sub(r"[^a-z0-9]+", "-", name.lower().replace("nvidia", "")).strip("-")
-date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+now = datetime.now(timezone.utc)
+date = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 art = {
     "schema_version": 1,
     "unit": f"arch-set-{tag}",
@@ -90,11 +91,11 @@ art = {
     "producer_script": "ci/scripts/perf/arch_set_producer.sh",
     "prove_run": prove_run,
     "legs": legs,
-    "note": "Per-arch flash validation at this commit: the producer test on this device, plus "
-            "the whole live-flash-oracle-tests suite where the device has >= 79 GiB. The arch's "
-            "kernel, encoder, engine and served suites ran in prove_run at the same commit.",
+    "note": "Per-arch flash validation: the producer test on this device, plus the whole "
+            "live-flash-oracle-tests suite where the device has >= 79 GiB. The arch's kernel, "
+            "encoder, engine and served suites ran in prove_run.",
 }
-path = f"{out}/{date}-arch-set-{sha[:7]}-{tag}.json"
+path = f"{out}/{now:%Y-%m-%d}-arch-set-{sha[:7]}-{tag}.json"
 json.dump(art, open(path, "w"), indent=1)
 print("wrote", path, art["status"])
 PY
